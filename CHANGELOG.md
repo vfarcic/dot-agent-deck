@@ -1,5 +1,36 @@
 # Changelog
 
+## [0.50.1] - 2026-11-16
+
+### Added
+
+- **Star Reminder in the Desktop App**
+  The desktop app now asks about once every 10 launches whether you would like to star the dot-agent-deck repository, as the TUI already does. Until now someone who used only the desktop app was never asked.
+  The **Enjoying dot-agent-deck?** dialog offers **Star** (`s`), which opens the repository page in your browser and stops the reminder, **Later** (`l` or `Esc`), which asks again after another 10 launches, and **Don't ask again** (`d`). While it is open you can also say "star the repo", "remind me later" or "don't ask again". The reminder is shared with the TUI on the same machine: launches of either count, and a choice made in one holds in the other, so you are never asked twice, and if you already chose **Don't ask again** in the TUI the desktop app never asks.
+  See [Desktop app → The star reminder](https://agent-deck.devopstoolkit.ai/docs/desktop/index.md#the-star-reminder).
+- **Add a daemon from the desktop app's Dashboard**
+  The desktop app can show the agents of several machines on one Dashboard, but until now the only way to add another machine was **Settings → Daemons**, where a new user had no reason to look. Adding a daemon is now offered where people look for it.
+  The **Daemon** selector at the top left of the Dashboard ends with **Add a daemon…**, however many daemons you have. On a fresh install, the **No agents are running yet** note also offers **Add a daemon**, and keeps offering it only while this machine is the only daemon you have added. With voice control on, saying "add a deck" or "add a daemon" does the same. All three open the form Settings uses, in a dialog over the screen you are on: fill in the host, press **Add this daemon**, and the daemon is added and shown on the Dashboard, just as when you add it from Settings. **Cancel** or `Escape` closes the dialog without adding anything. The **No agents are running yet** note is also reworded in plainer language.
+  This is a desktop app feature, because the TUI attaches to one daemon at a time. From a terminal, `dot-agent-deck remote add <name> <user@host>` registers a host, and the app lists it too.
+  See [Daemons → Watch a daemon on another machine](https://agent-deck.devopstoolkit.ai/docs/desktop/daemons.md#watch-a-daemon-on-another-machine).
+- **Readable desktop app text at 100% zoom**
+  The desktop app's own text (labels, rows, buttons, dialogs, cards) is now sized from the agent output in its terminal panes, so it is readable at the default 100% zoom. Before, most of it was about 70% of the terminal's size, and zooming in could not fix that because zoom enlarges the terminal too.
+  Ordinary text is now at least the size of the agent output and headings are larger. Secondary text, such as field and tab labels, badges, timestamps and key caps, is a step or two smaller, and no text is set below 11px. The **Close agent** button in an agent pane's header now matches the controls beside it instead of being oversized.
+  The Dashboard's row of counters at the top is now one button. It shows the number of agents and, only when something needs you, how many need input, how many failed and how many daemons are not answering. Hover over it or click it to see every count, or say "show the counters" with voice on. A daemon with no agents now shows **No agents are running yet** as one line across its section, with its **New agent** button, instead of a large card, and that note no longer offers **Open daemons**, which opened the Daemons screen for whichever daemon was selected rather than that one. With experimental features on, the **Open daemons** button at the top of the Dashboard and the rail's **Daemons** entry still lead there.
+  With experimental features on, an agent's screen no longer shows **ATT**, **MODEL** and **USAGE**, and the Daemons screen no longer shows **ATTEMPT**: the daemon reports none of them, so they only ever showed a dash.
+  See [The Dashboard](https://agent-deck.devopstoolkit.ai/docs/desktop/dashboard.md).
+
+### Fixed
+
+- **Reconnect in the desktop app reconnects only its own daemon**
+  With several daemons on the desktop app's Dashboard, pressing **Reconnect** on one daemon's section, or on its banner, reconnected every daemon instead. The other daemons' sections dropped their agent lists while that ran, and the daemon whose button was pressed was not actually reconnected unless it was the selected one. **Reconnect** now reconnects that daemon only and leaves the other sections as they are, the same way the TUI's reconnect touches only the daemon it is attached to. **Refresh** at the top of the Dashboard still reconnects every daemon.
+  See [Daemons → Start a daemon from the app](https://agent-deck.devopstoolkit.ai/docs/desktop/daemons.md#start-a-daemon-from-the-app).
+- **A config folder linked to a missing folder holds the doorbell off**
+  When the deck's config folder, such as `~/.config/dot-agent-deck` or `~/.config` itself, is a link to a folder that is no longer there (moved, or on a drive that isn't mounted), the deck now treats its `config.toml` as a config it can't use: it holds the doorbell off for both Claude Code and Codex for the agents it starts, and the deck log names the folder, instead of turning the doorbell on as if there were no config at all. A config folder that doesn't exist yet, as on a first run, still means the defaults. `DOT_AGENT_DECK_DOORBELL_CLAUDE` and `DOT_AGENT_DECK_DOORBELL_CODEX` still win over it.
+  Closing a dispatched unit no longer deletes other git worktrees inside its worktree, such as ones its agents created under a git-ignored `.worktrees/`, along with their uncommitted work. The unit's worktree is now kept, as it is when it has uncommitted changes. `dot-agent-deck close` reports it as `kept: holds other worktrees` and names each nested worktree (`--json` gives the verdict `kept-holds-worktrees` and a `nested_worktrees` list). The close confirmations in the TUI and the desktop app warn `Holds other worktrees, so it is KEPT:` and list them before you answer. Remove those worktrees first (`git worktree remove <path>`), then the unit's. `dot-agent-deck worktree reclaim` also keeps such a worktree now, and says why. See [Closing Agents](https://agent-deck.devopstoolkit.ai/docs/closing-agents.md#worktrees).
+
+
+
 ## [0.50.0] - 2026-11-14
 
 ### Changed
