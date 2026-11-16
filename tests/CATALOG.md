@@ -13223,6 +13223,28 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Platform coverage:** linux.
 - **Cost:** one cheap model turn.
 
+##### inbox/claude/051 — A doorbell hook commits only what the transcript shows Claude took (issue #2341).
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), real hook CLI children and the real `inbox witness` they start, a session transcript the test writes as Claude Code records one, a 15 s ack-wait (a 10 s witness window).
+- **Agent:** none (synthetic Claude parent; no credential).
+- **Asserts:** with `transcript_path` naming an existing transcript, the real prompt hook prints the task's block as before, and the task stays Fetched for 1.5 s; it is Acknowledged with one delivery only after the transcript gains a `hook_additional_context` attachment carrying that context. A second task whose prompt is blocked (the transcript gains only Claude's `system` entry for a blocked prompt) stays Fetched; once the witness gives up, a later doorbell hands it over as `delivery 1.2` with the possible-repeat line, still Fetched until the transcript records that context, then Acknowledged with two deliveries.
+- **Does not assert:** a real Claude Code's transcript or a real blocking hook (`inbox/claude/053`); a payload with no transcript, which commits what it printed (`inbox/claude/019`).
+- **Platform coverage:** mac+linux.
+
+##### inbox/claude/052 — A native wake commits once the transcript holds its prompt (issue #2341).
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), a real Claude waiter and prompt hook CLI children, the real `inbox witness`, a session transcript the test writes.
+- **Agent:** none (synthetic Claude parent; no credential).
+- **Asserts:** the waiter's notification, submitted through the prompt hook with `transcript_path` naming an existing transcript, prints nothing and commits nothing at once: the task stays Fetched for 1.5 s, and is Acknowledged with one delivery after the transcript gains a `user` entry holding the prompt.
+- **Does not assert:** a payload with no transcript, which commits at once (`inbox/claude/016`).
+- **Platform coverage:** mac+linux.
+
+##### inbox/claude/053 — Live: a doorbell prompt another hook blocks is not acknowledged, and is handed over again (issue #2341).
+- **Layer:** L2 lane 2 (`tests/e2e_inbox_claude_live.rs`), the real TUI in a PTY, in the `claude-blocking-hook` fixture: a project `.claude/settings.json` whose own `UserPromptSubmit` hook blocks the first prompt carrying a deck doorbell line and leaves a marker. The scratch pane's armed waiter is killed, so the doorbell is the wake path.
+- **Agent:** Claude Code (Haiku).
+- **Asserts:** the doorbell rings and the project hook blocks its prompt (the marker); for 30 seconds, longer than the transcript witness watches, the task is not acknowledged and the sentinel is not written. After a short prompt typed into the pane, Haiku writes the sentinel exactly once and the task is acknowledged with two deliveries.
+- **Does not assert:** which route hands the task over again (the doorbell, the waiter armed at the turn's end, or a fetch Haiku runs); the deck's card while the blocked prompt leaves it reading busy.
+- **Platform coverage:** linux.
+- **Cost:** one or two cheap model turns.
+
 
 ##### inbox/claude/023 — A raw exact commit needs the attempt's receipt.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), a raw `inbox_committed` sent to the hook socket by the scripted Claude parent itself (inside the agent's process tree), real waiter and hook CLI children, real spool.
