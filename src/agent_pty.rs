@@ -1036,8 +1036,10 @@ pub struct AgentPty {
     /// or after it.
     #[cfg(target_os = "linux")]
     pub opened: Option<u64>,
-    /// PRD #1790: the absolute folder the child was started in, resolved as
-    /// the PTY library resolves it ([`effective_launch_dir`]): the spawn's
+    /// PRD #1790: the absolute folder the child was started in: for a
+    /// prepared start, the path it asked for and was verified against (not
+    /// the descriptor alias it entered through on Linux); otherwise resolved
+    /// as the PTY library resolves it ([`effective_launch_dir`]): the spawn's
     /// cwd, or with none (or one that is not a directory) the child's `HOME`.
     /// Not the registry's `cwd` metadata, which keeps only what the caller
     /// gave. `None` when it could not be resolved.
@@ -1979,10 +1981,21 @@ fn spawn_with_dir(
         None => cmd.env_remove(crate::platform::paths::DOT_AGENT_DECK_EXE),
     }
 
+    // PRD #1790: the folder a launch record keeps. For a prepared start it is
+    // the path the start asked for and was verified against, as an absolute
+    // path: the cwd below is only how the child enters it (on Linux a
+    // `/proc/self/fd/N` alias of this process's descriptor, which names
+    // nothing once that descriptor is closed or the daemon restarts).
+    #[allow(unused_mut)]
+    let mut prepared_launch_dir: Option<String> = None;
     // Issue #1233 item 2: as late as the parent can decide it. See `spawn_in`.
     #[cfg(unix)]
     if let Some(dir) = verified_dir {
         let cwd = prepared_spawn_cwd(opts.cwd, dir)?;
+        prepared_launch_dir = opts
+            .cwd
+            .and_then(|path| std::path::absolute(path).ok())
+            .map(|path| path.to_string_lossy().into_owned());
         // Probe the program against the held descriptor where the child enters
         // it (Linux), and by pathname where the child does too.
         #[cfg(target_os = "linux")]
@@ -1998,7 +2011,7 @@ fn spawn_with_dir(
     }
 
     let argv = cmd.get_argv().clone();
-    let launch_dir = effective_launch_dir(&cmd);
+    let launch_dir = prepared_launch_dir.or_else(|| effective_launch_dir(&cmd));
     let child = pair
         .slave
         .spawn_command(cmd)
@@ -11062,6 +11075,13 @@ impl AgentPtyRegistry {
         drop(inner);
     }
 
+    /// TEST: the agent ids of the spawns the registry holds a reservation
+    /// for (forked or forking, not yet published).
+    #[cfg(test)]
+    pub(crate) fn reserved_ids_for_test(&self) -> Vec<String> {
+        self.inner.lock().pending_spawns.keys().cloned().collect()
+    }
+
     /// TEST: the environment generation `agent_id` was spawned with.
     #[cfg(test)]
     pub(crate) fn spawn_env_of_for_test(&self, agent_id: &str) -> Option<Vec<(String, String)>> {
@@ -15311,6 +15331,10 @@ impl AgentPtyRegistry {
         if let Some(work) = &work {
             self.work
                 .attempt_started(work, &id, journal_pane.as_deref(), journal_role.as_deref());
+        } else {
+            // PRD #1790: no attempt starts, so the session reports held for
+            // the reservation go with it, in the lock hold that ends it.
+            self.work.spawn_abandoned(&id);
         }
         // Signal *after* releasing the lock would be cleaner, but we still
         // hold `inner` here. Notify is cheap and a spurious wake-up is

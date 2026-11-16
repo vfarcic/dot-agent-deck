@@ -21,17 +21,26 @@
 //!
 //! **Retention follows the journal's.** A record is removed only by
 //! [`prune`], which the daemon runs after each journal compaction round, and
-//! only when a complete read of the journal no longer holds the record's
-//! work **and** the record is older than [`PRUNE_GRACE`]. A read is complete
-//! when it was not truncated and skipped no line it could not understand: a
-//! line of a newer schema, or of a kind this build does not know, may name a
-//! work this build cannot see, so it cannot show a work is gone. So no record
-//! goes while a read of the journal could still hold its work; the grace
-//! covers a record written while its work's `opened` was still queued for the
+//! only when a journal read the caller judged complete no longer holds the
+//! record's work **and** the record is older than [`PRUNE_GRACE`]. The
+//! daemon's judgement is `work_tracking::launch_read_incomplete`: a read
+//! that was truncated, or that skipped a line of a newer schema or of a kind
+//! this build does not know (either may name a work this build cannot see),
+//! removes no record. A line the reader skipped as unparsable, too long or
+//! torn does not stop a prune. So a record is not removed while the
+//! journal read it is compared against holds its work; the grace covers a record written while its work's `opened` was still queued for the
 //! journal's writer, or written after the read the prune compares against. A
 //! work the journal never recorded (its event dropped from a full queue, or a
 //! journal that could not open) has its record removed once the grace has
 //! passed, since no restore can find that work either.
+//!
+//! **One listing looks at most [`MAX_LISTED`] directory entries.** A reader
+//! whose listing stopped there says so ([`LaunchRead::truncated`]), and
+//! [`read_all`] then answers an error rather than a partial set, so its
+//! caller is not handed part of the store as if it were the whole.
+//! [`prune`] lists the store in windows of that size, the next call
+//! starting where the last stopped ([`PruneWindow`]), so successive calls
+//! move through the store instead of repeating its first window.
 //!
 //! **What the reader checks, and what a consumer still must.** [`read_all`]
 //! returns a record only when its `v` is [`SCHEMA_VERSION`] and its file
@@ -54,6 +63,7 @@
 use std::collections::HashSet;
 use std::io::{self, Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -86,7 +96,7 @@ const NONCE_HEX: usize = 16;
 const MAX_PENDING_REMOVED: usize = 256;
 
 /// The most directory entries one listing looks at.
-const MAX_LISTED: usize = 65_536;
+pub const MAX_LISTED: usize = 65_536;
 
 const EXTENSION: &str = ".json";
 
@@ -137,6 +147,24 @@ pub struct PruneReport {
     pub skipped_truncated: bool,
     /// Crash-left temporary files of runs no longer live that it removed.
     pub pending_removed: usize,
+    /// The store held more entries than this call's window looked at; the
+    /// next call ([`PruneWindow`]) starts after them.
+    pub listing_truncated: bool,
+}
+
+/// Where the next [`prune`] call's listing starts, in directory order, so
+/// that a store larger than one listing ([`MAX_LISTED`]) is cleaned over
+/// successive calls instead of the same first window each time. Back at the
+/// start once a listing reaches the end. Entries removed meanwhile can shift
+/// a few later ones before the window; they are reached on the next pass.
+#[derive(Debug, Default)]
+pub struct PruneWindow(AtomicUsize);
+
+impl PruneWindow {
+    /// A window at the start of the store.
+    pub const fn new() -> Self {
+        Self(AtomicUsize::new(0))
+    }
 }
 
 /// What [`read_all_with_stats`] read.
@@ -146,6 +174,10 @@ pub struct LaunchRead {
     /// Files skipped: unreadable, unparsable, too large, of another schema
     /// version, or whose name is not the one their `attempt` names.
     pub skipped: usize,
+    /// The listing stopped at [`MAX_LISTED`] entries with more left, so
+    /// `records` and `skipped` cover only the entries it reached: a record
+    /// missing from `records` may still be in the store.
+    pub truncated: bool,
 }
 
 /// The file name of `attempt`'s record: `<run>-<agent>.json`. `None` when the
@@ -216,60 +248,108 @@ pub fn write(state_dir: &Path, record: &LaunchRecord) -> io::Result<()> {
     result
 }
 
-/// Every valid record under `state_dir`, in no particular order. A missing
-/// directory is no records; a file that cannot be read or parsed, whose `v`
-/// is not [`SCHEMA_VERSION`], or whose name is not its attempt's
-/// ([`file_name`]) is skipped with a `warn!`, so one bad file does not hide
-/// the rest. See the module docs for what a consumer must still check.
+/// The valid records under `state_dir`, in no particular order, when one
+/// listing reached every entry of the store; an error (`Other`) when the
+/// store holds more entries than one listing looks at ([`MAX_LISTED`]), since
+/// the set would then be partial ([`read_all_with_stats`] answers the part
+/// it read, flagged). A missing directory is no records; a file that cannot
+/// be read or parsed, whose `v` is not [`SCHEMA_VERSION`], or whose name is
+/// not its attempt's ([`file_name`]) is skipped with a `warn!`, so one bad
+/// file does not hide the rest. See the module docs for what a consumer must
+/// still check.
 pub fn read_all(state_dir: &Path) -> io::Result<Vec<LaunchRecord>> {
-    Ok(read_all_with_stats(state_dir)?.records)
+    read_all_limited(state_dir, MAX_LISTED)
 }
 
-/// [`read_all`], counting what it skipped.
+/// [`read_all`] with the listing's size passed in.
+fn read_all_limited(state_dir: &Path, limit: usize) -> io::Result<Vec<LaunchRecord>> {
+    let read = read_limited(state_dir, limit)?;
+    if read.truncated {
+        return Err(io::Error::other(format!(
+            "the launch-record store holds more than {limit} entries; the listing is incomplete"
+        )));
+    }
+    Ok(read.records)
+}
+
+/// [`read_all`], counting what it skipped, and answering the part it read
+/// when the listing was cut short ([`LaunchRead::truncated`]).
 pub fn read_all_with_stats(state_dir: &Path) -> io::Result<LaunchRead> {
-    let (named, skipped) = read_named(state_dir)?;
+    read_limited(state_dir, MAX_LISTED)
+}
+
+/// [`read_all_with_stats`] with the listing's size passed in.
+fn read_limited(state_dir: &Path, limit: usize) -> io::Result<LaunchRead> {
+    let dir = match open_dir(state_dir, false) {
+        Ok(dir) => dir,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(LaunchRead::default()),
+        Err(e) => return Err(e),
+    };
+    let listing = list_names(&dir, 0, limit)?;
+    let (named, skipped) = read_named(&dir, &listing.names);
     Ok(LaunchRead {
         records: named.into_iter().map(|(_, record)| record).collect(),
         skipped,
+        truncated: listing.truncated,
     })
 }
 
-/// The names in the store's directory, at most [`MAX_LISTED`].
-fn list_names(dir: &TrustedDir) -> io::Result<Vec<String>> {
+/// One listing of the store's directory.
+struct Listing {
+    /// The UTF-8 names among the entries it looked at.
+    names: Vec<String>,
+    /// More entries followed the last one it looked at.
+    truncated: bool,
+}
+
+/// The entries of `dir` in directory order past the first `skip`, at most
+/// `limit` of them. A name that is not UTF-8 takes its place in the count
+/// and is not answered.
+fn list_names(dir: &TrustedDir, skip: usize, limit: usize) -> io::Result<Listing> {
     let mut stream = dir.stream()?;
     let mut names = Vec::new();
+    let (mut position, mut looked) = (0usize, 0usize);
     while let Some(name) = stream.next_name() {
-        if names.len() >= MAX_LISTED {
-            break;
+        let name = name?;
+        position += 1;
+        if position <= skip {
+            continue;
         }
-        if let Some(name) = name?.to_str() {
+        if looked >= limit {
+            return Ok(Listing {
+                names,
+                truncated: true,
+            });
+        }
+        looked += 1;
+        if let Some(name) = name.to_str() {
             names.push(name.to_string());
         }
     }
-    Ok(names)
+    Ok(Listing {
+        names,
+        truncated: false,
+    })
 }
 
-fn read_named(state_dir: &Path) -> io::Result<(Vec<(String, LaunchRecord)>, usize)> {
-    let dir = match open_dir(state_dir, false) {
-        Ok(dir) => dir,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
-        Err(e) => return Err(e),
-    };
+/// The valid records among `names`, with their names, and how many record
+/// names it skipped.
+fn read_named(dir: &TrustedDir, names: &[String]) -> (Vec<(String, LaunchRecord)>, usize) {
     let mut records = Vec::new();
     let mut skipped = 0;
-    for name in list_names(&dir)? {
-        if !is_record_name(&name) {
+    for name in names {
+        if !is_record_name(name) {
             continue;
         }
-        match read_one(&dir, &name) {
-            Ok(record) => records.push((name, record)),
+        match read_one(dir, name) {
+            Ok(record) => records.push((name.clone(), record)),
             Err(error) => {
                 skipped += 1;
                 warn!(%name, %error, "launch records: skipped a record");
             }
         }
     }
-    Ok((records, skipped))
+    (records, skipped)
 }
 
 fn read_one(dir: &TrustedDir, name: &str) -> io::Result<LaunchRecord> {
@@ -299,19 +379,46 @@ fn read_one(dir: &TrustedDir, name: &str) -> io::Result<LaunchRecord> {
     Ok(record)
 }
 
-/// Remove the records whose work `journal_works` (the works of a complete
-/// journal read) does not hold, once they are at least [`PRUNE_GRACE`] older
-/// than `now_ms`. `incomplete` says the read was not complete (truncated, or
-/// it skipped a line it could not understand), and then no record is removed.
-/// Either way, the temporary files a crash left behind ([`write`]) are
-/// removed, at most [`MAX_PENDING_REMOVED`] a call, when `run_is_live` says
-/// the run their name carries is not live. See the module docs.
+/// Among the entries of this call's listing window ([`PruneWindow`], at
+/// most [`MAX_LISTED`] entries), remove the records whose work
+/// `journal_works` (the works of a journal read) does not hold, once they are
+/// at least [`PRUNE_GRACE`] older than `now_ms`. `incomplete` says the
+/// caller judged that read incomplete, and then no record is removed. Either
+/// way, the temporary files a crash left behind ([`write`]) in the window
+/// are removed, at most [`MAX_PENDING_REMOVED`] a call, when `run_is_live`
+/// says the run their name carries is not live. A record is removed only on
+/// what was seen (the record, and its work's absence from the journal read),
+/// never on an entry's absence from the listing, so a window that did not
+/// reach the end of the store only means fewer entries were looked at this
+/// call ([`PruneReport::listing_truncated`]). See the module docs.
 pub fn prune(
     state_dir: &Path,
     journal_works: &HashSet<WorkId>,
     incomplete: bool,
     now_ms: u64,
     run_is_live: impl Fn(&str) -> bool,
+    window: &PruneWindow,
+) -> io::Result<PruneReport> {
+    prune_limited(
+        state_dir,
+        journal_works,
+        incomplete,
+        now_ms,
+        run_is_live,
+        window,
+        MAX_LISTED,
+    )
+}
+
+/// [`prune`] with the window's size passed in.
+fn prune_limited(
+    state_dir: &Path,
+    journal_works: &HashSet<WorkId>,
+    incomplete: bool,
+    now_ms: u64,
+    run_is_live: impl Fn(&str) -> bool,
+    window: &PruneWindow,
+    limit: usize,
 ) -> io::Result<PruneReport> {
     let mut report = PruneReport::default();
     let dir = match open_dir(state_dir, false) {
@@ -319,17 +426,29 @@ pub fn prune(
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(report),
         Err(e) => return Err(e),
     };
-    for name in list_names(&dir)? {
+    let mut start = window.0.load(Ordering::Relaxed);
+    let mut listing = list_names(&dir, start, limit)?;
+    if start > 0 && listing.names.is_empty() && !listing.truncated {
+        // The store shrank below the window's start: begin again.
+        start = 0;
+        listing = list_names(&dir, 0, limit)?;
+    }
+    report.listing_truncated = listing.truncated;
+    window.0.store(
+        if listing.truncated { start + limit } else { 0 },
+        Ordering::Relaxed,
+    );
+    for name in &listing.names {
         if report.pending_removed >= MAX_PENDING_REMOVED {
             break;
         }
-        let Some(run) = pending_run(&name) else {
+        let Some(run) = pending_run(name) else {
             continue;
         };
         if run_is_live(run) {
             continue;
         }
-        match dir.remove_file(&name) {
+        match dir.remove_file(name) {
             Ok(()) => report.pending_removed += 1,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(error) => warn!(%name, %error, "launch records: could not remove a temporary file"),
@@ -338,7 +457,7 @@ pub fn prune(
     if incomplete {
         report.skipped_truncated = true;
     } else {
-        let (records, _) = read_named(state_dir)?;
+        let (records, _) = read_named(&dir, &listing.names);
         let grace = u64::try_from(PRUNE_GRACE.as_millis()).unwrap_or(u64::MAX);
         let cutoff = now_ms.saturating_sub(grace);
         for (name, record) in records {
@@ -483,11 +602,27 @@ mod tests {
         let journal: HashSet<WorkId> = [kept_work].into_iter().collect();
 
         // A truncated read removes nothing, whatever the age.
-        let report = prune(state.path(), &journal, true, now, |_| true).unwrap();
+        let report = prune(
+            state.path(),
+            &journal,
+            true,
+            now,
+            |_| true,
+            &PruneWindow::new(),
+        )
+        .unwrap();
         assert!(report.skipped_truncated);
         assert_eq!(read_all(state.path()).unwrap().len(), 3);
 
-        let report = prune(state.path(), &journal, false, now, |_| true).unwrap();
+        let report = prune(
+            state.path(),
+            &journal,
+            false,
+            now,
+            |_| true,
+            &PruneWindow::new(),
+        )
+        .unwrap();
         assert_eq!((report.removed, report.kept), (1, 2));
         let mut left: Vec<String> = read_all(state.path())
             .unwrap()
@@ -548,7 +683,15 @@ mod tests {
             std::fs::write(dir.join(name), b"{\"v\":1,").unwrap();
         }
         let is_live = |run: &str| run == "liverun";
-        let report = prune(state.path(), &HashSet::new(), true, 0, is_live).unwrap();
+        let report = prune(
+            state.path(),
+            &HashSet::new(),
+            true,
+            0,
+            is_live,
+            &PruneWindow::new(),
+        )
+        .unwrap();
         assert_eq!(report.pending_removed, 1);
         assert!(
             !dir.join(dead).exists(),
@@ -588,5 +731,85 @@ mod tests {
     fn a_file_name_is_one_plain_component() {
         let attempt = AttemptId::new("0123abcd", 12).unwrap();
         assert_eq!(file_name(&attempt).as_deref(), Some("0123abcd-12.json"));
+    }
+
+    /// F5: a listing cut short at its limit says so: the stats read flags
+    /// `truncated` and answers the part it read, `read_all` answers an
+    /// error instead of a partial set, and a store that fits is complete.
+    #[test]
+    fn a_listing_past_its_limit_says_it_is_incomplete() {
+        let state = tempfile::tempdir().unwrap();
+        let w = work();
+        for agent in 1..=5 {
+            write(state.path(), &record(&w, agent, agent)).unwrap();
+        }
+        let partial = read_limited(state.path(), 3).unwrap();
+        assert!(partial.truncated);
+        assert_eq!((partial.records.len(), partial.skipped), (3, 0));
+        assert!(read_all_limited(state.path(), 3).is_err());
+        let whole = read_limited(state.path(), 5).unwrap();
+        assert!(!whole.truncated, "exactly the limit is complete");
+        assert_eq!(whole.records.len(), 5);
+        assert_eq!(read_all_limited(state.path(), 5).unwrap().len(), 5);
+        assert_eq!(read_all(state.path()).unwrap().len(), 5);
+    }
+
+    /// F5: successive windows of a capped listing cover every entry once.
+    #[test]
+    fn successive_windows_cover_the_whole_store() {
+        let state = tempfile::tempdir().unwrap();
+        let w = work();
+        for agent in 1..=7 {
+            write(state.path(), &record(&w, agent, agent)).unwrap();
+        }
+        let dir = open_dir(state.path(), false).unwrap();
+        let mut seen = Vec::new();
+        let mut skip = 0;
+        loop {
+            let listing = list_names(&dir, skip, 3).unwrap();
+            seen.extend(listing.names);
+            if !listing.truncated {
+                break;
+            }
+            skip += 3;
+        }
+        seen.sort();
+        let mut all = list_names(&dir, 0, usize::MAX).unwrap().names;
+        all.sort();
+        assert_eq!(seen, all);
+        assert_eq!(all.len(), 7);
+    }
+
+    /// F5: pending cleanup makes progress across capped listings. With 100
+    /// records that stay (the journal holds their work) and one crash-left
+    /// temporary file of a dead run, a prune whose window is two entries
+    /// wide reports its listing truncated and, over successive calls,
+    /// reaches and removes the temporary file; no record is removed. (A
+    /// prune that listed the same first window every call would reach it
+    /// only if the directory happened to list it first.)
+    #[test]
+    fn pending_cleanup_advances_past_a_capped_listing() {
+        let state = tempfile::tempdir().unwrap();
+        let w = work();
+        for agent in 1..=100 {
+            write(state.path(), &record(&w, agent, 0)).unwrap();
+        }
+        let dir = state.path().join(DIR_NAME);
+        let dead = ".pending-0123456789abcdef-deadrun-4.json";
+        std::fs::write(dir.join(dead), b"{").unwrap();
+        let journal: HashSet<WorkId> = [w].into_iter().collect();
+        let window = PruneWindow::new();
+        let mut truncated_seen = false;
+        let mut calls = 0;
+        while dir.join(dead).exists() {
+            assert!(calls < 60, "the temporary file was never reached");
+            let report =
+                prune_limited(state.path(), &journal, false, 0, |_| false, &window, 2).unwrap();
+            truncated_seen |= report.listing_truncated;
+            assert_eq!(report.removed, 0);
+            calls += 1;
+        }
+        assert!(truncated_seen);
+        assert_eq!(read_all(state.path()).unwrap().len(), 100);
     }
 }

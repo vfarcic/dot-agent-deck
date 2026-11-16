@@ -12,24 +12,43 @@
 //!
 //! What [`save`] guarantees, and only when it answers `Ok`:
 //!
+//! - **By its owner and mode bits, no other account can write the worktree
+//!   root** (Unix; an ACL is not seen). Before it creates or changes
+//!   anything, the save refuses a worktree root that is
+//!   owned by another account, writable by other, or writable by a group
+//!   that is not this account's private group
+//!   ([`crate::orchestrator_context::project_root_refusal`]), and one that
+//!   is not a git checkout. That is the trust boundary the rest relies on:
+//!   git below is asked by pathname, and an account that could rename
+//!   entries of the worktree root could swap `.dot-agent-deck` for another
+//!   directory while git looks and put it back before the file is created.
+//!   Such an account can already change the worktree's source, so the save
+//!   does not try to bind git's lookup to the directory it holds; it
+//!   refuses a worktree where another account has that access.
 //! - **The directory is the one it checked.** `.dot-agent-deck` is opened
 //!   once, without following a symlink, owned by this account and with group
 //!   and other write cleared on the held descriptor (or refused)
 //!   ([`crate::orchestrator_context::open_held_context_dir`]); every file
-//!   below is created relative to that descriptor.
+//!   below is created relative to that descriptor. A save refused for its
+//!   worktree root, or because the worktree is not a git checkout, has not
+//!   created or re-permissioned it.
 //! - **Git ignores the file, as git itself reports it, before any task byte
 //!   exists.** It adds `.dot-agent-deck/` to the clone's `info/exclude`
 //!   (issue #329's mechanism) and, when `.dot-agent-deck/` holds no
 //!   `.gitignore`, creates one containing `*`, which a negation in a tracked
 //!   `.gitignore` above it cannot override; an existing `.gitignore` there is
-//!   never changed. Then it asks git (`git check-ignore -q`, whose exit status
-//!   is the verdict, and `git ls-files`) whether the task's path is ignored
-//!   and untracked, and writes nothing when it is not: a worktree whose own
-//!   rules re-include the file, or that is not a git checkout, gets no file
-//!   and a warning. Git is asked by pathname; the held directory is then
-//!   checked to still be the one at that path before the file is created.
-//!   That holds for git's rules as they are at the save, not against a
-//!   `.gitignore` edited afterwards.
+//!   never changed, and one that is not a regular file is refused. Then it
+//!   asks git (`git check-ignore -q`, whose exit status is the verdict:
+//!   0 ignored, 1 not; and `git ls-files --error-unmatch`: 0 tracked, 1 not)
+//!   whether the task's path is ignored and untracked, and writes nothing
+//!   when it is not, or when either answers anything else: a worktree whose
+//!   own rules re-include the file gets no file and a warning. Each git call
+//!   runs for at most [`GIT_DEADLINE`]; past it the call's process group is
+//!   killed and the child reaped, and the save fails, so the dispatch goes
+//!   on without a saved task. The held directory is then checked to still
+//!   be the one at that path before the file is created. That holds for
+//!   git's rules as they are at the save, not against a `.gitignore` edited
+//!   afterwards.
 //! - **Never overwritten.** The file is created `O_EXCL`, owner-only. Each
 //!   dispatch mints a new work id, so a later dispatch into the same worktree
 //!   writes a new file; a file already there for the same work id is kept
@@ -40,14 +59,20 @@
 //!   the `inbox-message-*` files it minted) both leave it alone. It goes with
 //!   the worktree.
 //!
+//! Off Unix the worktree root's owner and mode are not judged and the
+//! directory operations are path operations
+//! ([`crate::orchestrator_context::HeldContextDir`]).
+//!
 //! A reader that acts on a saved task opens it the same way (no symlink
 //! followed, owned by the user, not writable by others); the work journal's
 //! maintainer page lists what else a restore must check.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 
-use crate::orchestrator_context::{CONTEXT_DIR_NAME, GitExcludeOutcome, HeldContextDir};
+use crate::orchestrator_context::{CONTEXT_DIR_NAME, HeldContextDir};
 use crate::work_journal::WorkId;
 
 /// The prefix of every saved task's file name.
@@ -58,6 +83,12 @@ const IGNORE_FILE: &str = ".gitignore";
 
 /// What that ignore file holds: everything in the directory, itself included.
 const IGNORE_ALL: &str = "*\n";
+
+/// How long one git call of a [`save`] may run before it is killed. Both
+/// calls read a few small files and normally answer in milliseconds, so
+/// reaching it means git is blocked (a FIFO among its inputs, a hung
+/// filesystem), not slow.
+pub const GIT_DEADLINE: Duration = Duration::from_secs(10);
 
 /// The file name of `work`'s saved task: `dispatch-task-<work id>.md`.
 pub fn file_name(work: &WorkId) -> String {
@@ -74,16 +105,27 @@ pub fn is_task_file_name(name: &str) -> bool {
 /// Save `task` as `work`'s dispatched task in `worktree`, only once git
 /// ignores it there. Answers the file's path. See the module docs.
 pub fn save(worktree: &Path, work: &WorkId, task: &str) -> io::Result<PathBuf> {
+    save_with(worktree, work, task, &crate::git_env::git_at, GIT_DEADLINE)
+}
+
+/// [`save`] with the git command (`git(dir)`, a `git` to run in `dir`) and
+/// each call's deadline passed in, so a test can stand in a git that hangs.
+fn save_with(
+    worktree: &Path,
+    work: &WorkId,
+    task: &str,
+    git: &dyn Fn(&Path) -> Command,
+    deadline: Duration,
+) -> io::Result<PathBuf> {
     let name = file_name(work);
     let held = crate::orchestrator_context::open_held_context_dir(worktree)?;
-    if held.ensure_git_excludes()? == GitExcludeOutcome::NotAGitRepo {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "the worktree is not a git checkout, so the task file could not be kept out of a commit",
-        ));
-    }
     ensure_ignore_file(&held)?;
-    ensure_ignored(worktree, &format!("{CONTEXT_DIR_NAME}/{name}"))?;
+    ensure_ignored(
+        worktree,
+        &format!("{CONTEXT_DIR_NAME}/{name}"),
+        git,
+        deadline,
+    )?;
     if !held.unchanged() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -109,14 +151,31 @@ pub fn save(worktree: &Path, work: &WorkId, task: &str) -> io::Result<PathBuf> {
 }
 
 /// Create `.dot-agent-deck/.gitignore` holding `*` when the directory has no
-/// entry of that name; an existing one, whatever it holds, is left as it is.
+/// entry of that name; an existing regular file, whatever it holds, is left
+/// as it is, and an existing entry of any other kind (a FIFO, a symlink, a
+/// directory) is refused, since git would block on or follow it.
 fn ensure_ignore_file(held: &HeldContextDir) -> io::Result<()> {
-    if held.has_entry(IGNORE_FILE) {
-        return Ok(());
+    match held.is_regular_file(IGNORE_FILE)? {
+        Some(true) => return Ok(()),
+        Some(false) => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{CONTEXT_DIR_NAME}/{IGNORE_FILE} is not a regular file"),
+            ));
+        }
+        None => {}
     }
     let mut file = match held.create_new(IGNORE_FILE) {
         Ok(file) => file,
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            return match held.is_regular_file(IGNORE_FILE)? {
+                Some(true) => Ok(()),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("{CONTEXT_DIR_NAME}/{IGNORE_FILE} is not a regular file"),
+                )),
+            };
+        }
         Err(e) => return Err(e),
     };
     let written = file
@@ -131,15 +190,19 @@ fn ensure_ignore_file(held: &HeldContextDir) -> io::Result<()> {
 }
 
 /// `Ok` only when git, run in `worktree`, says `relative` is ignored
-/// (`check-ignore -q`'s exit status: 0 ignored, 1 not) and not tracked
-/// (`ls-files --error-unmatch` fails).
-fn ensure_ignored(worktree: &Path, relative: &str) -> io::Result<()> {
-    let ignored = crate::git_env::git_at(worktree)
-        .args(["check-ignore", "-q", "--", relative])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()?;
+/// (`check-ignore -q` exits 0; 1 is "not ignored") and not tracked
+/// (`ls-files --error-unmatch` exits 1, its "did not match"; 0 is
+/// "tracked"). Any other exit, a signal, or a call past `deadline` is an
+/// error, never read as either answer.
+fn ensure_ignored(
+    worktree: &Path,
+    relative: &str,
+    git: &dyn Fn(&Path) -> Command,
+    deadline: Duration,
+) -> io::Result<()> {
+    let mut check = git(worktree);
+    check.args(["check-ignore", "-q", "--", relative]);
+    let ignored = status_within(check, deadline)?;
     match ignored.code() {
         Some(0) => {}
         Some(1) => {
@@ -156,31 +219,87 @@ fn ensure_ignored(worktree: &Path, relative: &str) -> io::Result<()> {
             )));
         }
     }
-    let tracked = crate::git_env::git_at(worktree)
-        .args(["ls-files", "--error-unmatch", "--", relative])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()?;
-    if tracked.success() {
-        return Err(io::Error::new(
+    let mut listed = git(worktree);
+    listed.args(["ls-files", "--error-unmatch", "--", relative]);
+    let tracked = status_within(listed, deadline)?;
+    match tracked.code() {
+        Some(1) => Ok(()),
+        Some(0) => Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!("{relative} is tracked by git in this worktree"),
-        ));
+        )),
+        _ => Err(io::Error::other(format!(
+            "git could not say whether {relative} is tracked ({tracked})"
+        ))),
     }
-    Ok(())
+}
+
+/// Run `cmd`, with no stdin and its output discarded, to its exit, or kill
+/// it once `deadline` has passed: on Unix its whole process group (it is
+/// given one of its own), and the child is reaped before this answers
+/// `TimedOut`. The group is signalled while the child is still unreaped, so
+/// its id cannot have been reissued.
+fn status_within(mut cmd: Command, deadline: Duration) -> io::Result<ExitStatus> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        cmd.process_group(0);
+    }
+    let mut child = cmd.spawn()?;
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= deadline {
+            #[cfg(unix)]
+            if let Ok(group) = libc::pid_t::try_from(child.id()) {
+                // SAFETY: `kill` has no memory preconditions. The child is
+                // not reaped yet (`try_wait` above answered `None`), so its
+                // id, which is its group's, is still this command's.
+                unsafe {
+                    libc::kill(-group, libc::SIGKILL);
+                }
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("git did not answer within {deadline:?} and was killed"),
+            ));
+        }
+        std::thread::sleep((deadline - elapsed).min(Duration::from_millis(5)));
+    }
 }
 
 /// [`save`] off the async runtime, logging a failure instead of answering
 /// it: a dispatch whose task could not be saved still runs, it just cannot be
-/// handed its task back after a restart.
+/// handed its task back after a restart. Returns within about two
+/// [`GIT_DEADLINE`]s of git time plus the file operations.
 pub async fn save_or_warn(worktree: &Path, work: Option<&WorkId>, task: &str) {
+    save_or_warn_with(worktree, work, task, crate::git_env::git_at, GIT_DEADLINE).await;
+}
+
+/// [`save_or_warn`] with [`save_with`]'s seams.
+async fn save_or_warn_with(
+    worktree: &Path,
+    work: Option<&WorkId>,
+    task: &str,
+    git: impl Fn(&Path) -> Command + Send + 'static,
+    deadline: Duration,
+) {
     let Some(work) = work.cloned() else {
         return;
     };
     let (dir, text) = (worktree.to_path_buf(), task.to_string());
-    let saved =
-        tokio::task::spawn_blocking(move || save(&dir, &work, &text).map_err(|e| (work, e))).await;
+    let saved = tokio::task::spawn_blocking(move || {
+        save_with(&dir, &work, &text, &git, deadline).map_err(|e| (work, e))
+    })
+    .await;
     match saved {
         Ok(Ok(_)) => {}
         Ok(Err((work, error))) => tracing::warn!(
@@ -262,6 +381,13 @@ mod tests {
                 .unwrap();
             assert!(out.status.success(), "git {args:?}: {out:?}");
         };
+        // Owner-only write, whatever the umask: the root check refuses a
+        // root another account could write.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&repo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         git(&["init", "-q", "-b", "main"]);
         std::fs::write(repo.join("README"), "x\n").unwrap();
         if let Some(rules) = gitignore {
@@ -351,6 +477,11 @@ mod tests {
             .output()
             .unwrap();
         assert!(out.status.success(), "{out:?}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&linked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         let w = work();
         save(&linked, &w, "TASK").unwrap();
         let relative = format!("{CONTEXT_DIR_NAME}/{}", file_name(&w));
@@ -414,5 +545,234 @@ mod tests {
         let error = save(&repo, &w, "TASK").unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
         assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+    }
+
+    /// A stand-in for git: `sh -c <script>`, the git arguments reaching the
+    /// script as `$1`, `$2`, ...
+    fn fake_git(script: &'static str) -> impl Fn(&Path) -> Command + Send + 'static {
+        move |dir: &Path| {
+            let mut cmd = Command::new("/bin/sh");
+            cmd.current_dir(dir).args(["-c", script, "sh"]);
+            cmd
+        }
+    }
+
+    /// F2: a git that never answers is killed at the deadline and reaped:
+    /// the save fails `TimedOut` within a bound, writes no task, and the
+    /// process it started is gone (not a zombie).
+    #[cfg(unix)]
+    #[test]
+    fn a_hanging_git_is_killed_and_reaped_at_the_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = repo(root.path(), None);
+        let pid_file = root.path().join("git.pid");
+        let script: &'static str = Box::leak(
+            format!("echo $$ > '{}'; exec sleep 30", pid_file.display()).into_boxed_str(),
+        );
+        let w = work();
+        let started = Instant::now();
+        let error = save_with(
+            &repo,
+            &w,
+            "TASK",
+            &fake_git(script),
+            Duration::from_millis(300),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(!task_path(&repo, &w).exists());
+        let pid: libc::pid_t = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // SAFETY: signal 0 probes only; `pid` is a number, not memory.
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(!alive, "the timed-out git is still there (or unreaped)");
+    }
+
+    /// F2: the dispatch path's save returns within its bound when git
+    /// hangs, so the caller goes on to spawn the unit.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_dispatch_save_returns_when_git_hangs() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = repo(root.path(), None);
+        let w = work();
+        let started = Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            save_or_warn_with(
+                &repo,
+                Some(&w),
+                "TASK",
+                fake_git("exec sleep 30"),
+                Duration::from_millis(300),
+            ),
+        )
+        .await
+        .expect("the save did not return within its bound");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(!task_path(&repo, &w).exists());
+    }
+
+    /// F2 control: a git that answers at once ("ignored", "not tracked")
+    /// is not cut short by the deadline, and the task is saved.
+    #[cfg(unix)]
+    #[test]
+    fn a_git_that_answers_saves_within_the_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = repo(root.path(), None);
+        let w = work();
+        let git =
+            fake_git(r#"case "$1" in check-ignore) exit 0;; ls-files) exit 1;; esac; exit 2"#);
+        let saved = save_with(&repo, &w, "TASK", &git, Duration::from_secs(10)).unwrap();
+        assert_eq!(std::fs::read_to_string(saved).unwrap(), "TASK");
+    }
+
+    /// F2: `ls-files --error-unmatch` failing for any reason but its "did
+    /// not match" (exit 1) is a git error, not proof the task is untracked,
+    /// and nothing is written; its exit 0 means tracked.
+    #[cfg(unix)]
+    #[test]
+    fn a_git_error_is_not_read_as_untracked() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = repo(root.path(), None);
+        for (script, kind) in [
+            (
+                r#"case "$1" in check-ignore) exit 0;; esac; exit 128"#,
+                io::ErrorKind::Other,
+            ),
+            (
+                r#"case "$1" in check-ignore) exit 0;; esac; exit 0"#,
+                io::ErrorKind::PermissionDenied,
+            ),
+            (
+                r#"case "$1" in check-ignore) exit 128;; esac; exit 1"#,
+                io::ErrorKind::Other,
+            ),
+        ] {
+            let w = work();
+            let error = save_with(
+                &repo,
+                &w,
+                "TASK",
+                &fake_git(script),
+                Duration::from_secs(10),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), kind, "{script}: {error}");
+            assert!(!task_path(&repo, &w).exists(), "{script}");
+        }
+    }
+
+    /// F2: an existing `.dot-agent-deck/.gitignore` that is a FIFO (git
+    /// would block opening it once a tracked rule re-includes the
+    /// directory) is refused before git runs, and no task is written.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_ignore_file_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = repo(root.path(), Some("!.dot-agent-deck/\n"));
+        let dir = repo.join(CONTEXT_DIR_NAME);
+        std::fs::create_dir(&dir).unwrap();
+        let fifo = std::ffi::CString::new(dir.join(".gitignore").to_str().unwrap()).unwrap();
+        // SAFETY: a NUL-terminated path; `mkfifo` reads nothing else.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let w = work();
+        let started = Instant::now();
+        let error = save(&repo, &w, "TASK").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(!task_path(&repo, &w).exists());
+    }
+
+    /// F3: the decision on the worktree root's owner and mode.
+    #[test]
+    fn only_a_root_this_account_alone_can_write_is_accepted() {
+        let (me, other, private, shared) = (1000, 1001, 1000, 100);
+        let refusal = crate::orchestrator_context::project_root_refusal;
+        assert_eq!(refusal(me, shared, 0o755, me, Some(private)), None);
+        assert_eq!(refusal(me, shared, 0o700, me, None), None);
+        // The user's private group may write (what `umask 002` gives).
+        assert_eq!(refusal(me, private, 0o775, me, Some(private)), None);
+        // Any other group may not, nor a group when no private group exists.
+        assert!(refusal(me, shared, 0o775, me, Some(private)).is_some());
+        assert!(refusal(me, private, 0o775, me, None).is_some());
+        // Other write, or another owner, is refused whatever the group.
+        assert!(refusal(me, private, 0o757, me, Some(private)).is_some());
+        assert!(refusal(other, shared, 0o755, me, Some(private)).is_some());
+    }
+
+    /// F3: a worktree root every account can write is refused before
+    /// anything is created: no `.dot-agent-deck`, no exclude rule, no task.
+    /// The same root at 0755 is saved into.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_other_accounts_can_write_is_refused_and_nothing_is_written() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let repo = repo(root.path(), None);
+        let exclude = repo.join(".git/info/exclude");
+        let exclude_before = std::fs::read(&exclude).ok();
+        std::fs::set_permissions(&repo, std::fs::Permissions::from_mode(0o757)).unwrap();
+        let w = work();
+        let error = save(&repo, &w, "TASK").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+        assert!(!repo.join(CONTEXT_DIR_NAME).exists(), "nothing created");
+        assert_eq!(std::fs::read(&exclude).ok(), exclude_before);
+        // Control: owner-only write is accepted.
+        std::fs::set_permissions(&repo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        save(&repo, &w, "TASK").unwrap();
+        assert!(task_path(&repo, &w).exists());
+    }
+
+    /// F3: a group-writable worktree root is refused unless its group is
+    /// this account's private group, and nothing is written when refused.
+    #[cfg(unix)]
+    #[test]
+    fn a_group_writable_root_is_saved_into_only_for_the_private_group() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let root = tempfile::tempdir().unwrap();
+        let repo = repo(root.path(), None);
+        std::fs::set_permissions(&repo, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let gid = std::fs::metadata(&repo).unwrap().gid();
+        let private = crate::platform::paths::effective_private_group() == Some(gid);
+        let w = work();
+        let saved = save(&repo, &w, "TASK");
+        if private {
+            saved.unwrap();
+        } else {
+            assert_eq!(saved.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+            assert!(!repo.join(CONTEXT_DIR_NAME).exists(), "nothing created");
+        }
+    }
+
+    /// F6: a save refused because the worktree is not a git checkout
+    /// leaves an existing `.dot-agent-deck` exactly as it was, 0777
+    /// included, since eligibility is settled before the directory is
+    /// opened or repaired.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_save_leaves_the_directory_mode_as_it_was() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("not-a-checkout");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::set_permissions(&project, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let dir = project.join(CONTEXT_DIR_NAME);
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let w = work();
+        let error = save(&project, &w, "TASK").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error}");
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o777, "a refused save changed the directory's mode");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
     }
 }

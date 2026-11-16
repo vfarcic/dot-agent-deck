@@ -524,8 +524,9 @@ pub enum Event {
     /// PRD #1790: the agent session an attempt is in, as its hooks reported
     /// it. Written when the attempt's session id first becomes known and
     /// again each time it changes (a `/clear`, a new conversation), never for
-    /// an unchanged one, and at most
-    /// [`crate::work_tracking::MAX_SESSION_LINES`] times plus one at the
+    /// an unchanged one: up to [`crate::work_tracking::MAX_SESSION_LINES`]
+    /// times as it changes, then at most once per flush round
+    /// ([`crate::work_tracking::SESSION_FLUSH_EVERY`]), and once at the
     /// attempt's end. An attempt's lines in `seq` order give its sessions in
     /// order, and the one to resume is [`latest_session_of`]'s, not the last
     /// in the reader's wall-clock order. Additive under `v:1`: a reader that

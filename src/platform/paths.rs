@@ -1698,6 +1698,17 @@ fn private_group(uid: u32) -> Option<u32> {
     .then_some(gid)
 }
 
+/// The effective user's private group ([`private_group`] of `geteuid`): the
+/// one group whose write permission a directory that only this account may
+/// change can carry, under the same policy [`TrustedWriters`] states. Its
+/// caller outside this module: the dispatched-task save's check of the
+/// worktree root (`orchestrator_context::open_held_context_dir`, PRD #1790).
+#[cfg(unix)]
+pub(crate) fn effective_private_group() -> Option<u32> {
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    private_group(unsafe { libc::geteuid() })
+}
+
 /// Whether a group is the private group of the account `user` (`uid`): it
 /// carries the account's name, no supplementary member (`supplementary`, from
 /// `getgrgid`) but the account, and no account but it and root has it as a

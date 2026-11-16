@@ -787,6 +787,16 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         journal.start_recovery_in_background();
         drop(crate::work_tracking::spawn_compaction(journal.clone()));
         pty_registry.work().install(journal);
+        // PRD #1790: an agent's latest session id that the tracker held back
+        // (past the per-attempt line cap, or refused by the session quota)
+        // reaches the journal while the attempt lives, not only at its end.
+        let flushed = Arc::downgrade(&pty_registry);
+        drop(crate::work_tracking::spawn_session_flush(move || {
+            flushed
+                .upgrade()
+                .map(|registry| registry.work().flush_held_sessions())
+                .is_some()
+        }));
         pty_registry.install_inbox(hub);
     }
     let inbox_ticker = pty_registry.inbox().spawn_ticker();

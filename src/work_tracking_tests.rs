@@ -1596,8 +1596,9 @@ fn held_sessions_go_with_an_abandoned_spawn_and_precede_an_early_end() {
 }
 
 /// PRD #1790 (A3): a producer flapping between two ids writes at most
-/// [`MAX_SESSION_LINES`] lines while the attempt lives, and one more when it
-/// ends, so the attempt's last line is still its latest id.
+/// [`MAX_SESSION_LINES`] lines while the attempt lives and no flush round
+/// runs, and one more when it ends, so the attempt's last line is still its
+/// latest id.
 #[test]
 fn a_flapping_session_is_bounded_and_its_latest_id_is_kept() {
     let state = crate::test_temp::tempdir().unwrap();
@@ -1902,4 +1903,368 @@ async fn a_spawn_without_a_folder_records_the_home_it_started_in() {
         "the registry's cwd is what the caller gave"
     );
     registry.shutdown_all();
+}
+
+/// The latest `attempt_session` of `attempt` that a daemon started after
+/// this one would read from `state`'s journal on disk.
+fn latest_on_disk(state: &Path, attempt: &AttemptId) -> Option<String> {
+    let read = read_journal(state).unwrap();
+    crate::work_journal::latest_session_of(&read.lines, attempt).map(|(s, _)| s.to_string())
+}
+
+/// PRD #1790 (F1): an attempt whose session changed more often than
+/// [`MAX_SESSION_LINES`] and is still live has its latest id on disk after
+/// one [`WorkTracker::flush_held_sessions`] round, without ending: the
+/// daemon dropped after that round leaves a journal whose latest session
+/// for the attempt is the newest id. A round with nothing new held writes
+/// nothing.
+#[test]
+fn a_live_attempts_latest_session_survives_a_restart() {
+    let state = crate::test_temp::tempdir().unwrap();
+    let tracker = tracker(state.path());
+    let work = tracker
+        .resolve_spawn(None, Some("p"), None, None)
+        .kept()
+        .unwrap();
+    let claude = AgentType::ClaudeCode;
+    tracker.attempt_started(&work, "9", Some("p"), None);
+    let changes = MAX_SESSION_LINES + 2;
+    for n in 0..changes {
+        tracker.session_seen("9", Some("p"), &format!("s-{n}"), &claude, false);
+        tracker.journal().unwrap().flush();
+    }
+    let attempt = AttemptId::new("run1", 9).unwrap();
+    let newest = format!("s-{}", changes - 1);
+    assert_eq!(
+        latest_on_disk(state.path(), &attempt),
+        Some(format!("s-{}", MAX_SESSION_LINES - 1)),
+        "precondition: past the cap the newest id is held, not written at once"
+    );
+    assert_eq!(tracker.flush_held_sessions(), 1);
+    assert_eq!(tracker.flush_held_sessions(), 0, "nothing new is held");
+    // An id reported again after the round is not written again.
+    tracker.session_seen("9", Some("p"), &newest, &claude, false);
+    assert_eq!(tracker.flush_held_sessions(), 0);
+    tracker.drain(Duration::from_secs(5));
+    drop(tracker);
+    assert_eq!(latest_on_disk(state.path(), &attempt), Some(newest));
+    let read = read_journal(state.path()).unwrap();
+    assert_eq!(sessions_of(&read.lines, &work).len(), MAX_SESSION_LINES + 1);
+    assert!(
+        !kinds_of(&read.lines, &work).contains(&"attempt_ended"),
+        "the attempt was not ended"
+    );
+}
+
+/// PRD #1790 (F1): a live attempt's first session report, refused by the
+/// journal's session quota while the queue is full of other attempts'
+/// session events, and followed by no further hook, is on disk once the
+/// queue has drained and a [`WorkTracker::flush_held_sessions`] round ran.
+#[test]
+fn a_quota_refused_session_is_written_once_the_queue_drains() {
+    let state = crate::test_temp::tempdir().unwrap();
+    let gate = crate::work_journal::WriterGate::closed();
+    let journal = WorkJournal::try_open_with(
+        state.path(),
+        "run1",
+        &DeckId::generate(),
+        JournalOptions {
+            home: PathBuf::from("/home/someone"),
+            queue_capacity: 8,
+            hooks: crate::work_journal::TestHooks {
+                gate: Some(Arc::clone(&gate)),
+                ..Default::default()
+            },
+            ..JournalOptions::default()
+        },
+    )
+    .unwrap();
+    let tracker = WorkTracker::default();
+    tracker.install(journal);
+    let claude = AgentType::ClaudeCode;
+    let start = |agent: &str| {
+        let pane = format!("p{agent}");
+        let work = tracker
+            .resolve_spawn(None, Some(&pane), None, None)
+            .kept()
+            .unwrap();
+        tracker.attempt_started(&work, agent, Some(&pane), None);
+        work
+    };
+    let quiet = start("1");
+    let _busy = start("2");
+    // The writer waits at the gate; attempt 2's ids take the whole quota.
+    let quota = 8 / crate::work_journal::SESSION_QUEUE_SHARE;
+    for n in 0..quota {
+        tracker.session_seen("2", Some("p2"), &format!("b-{n}"), &claude, false);
+    }
+    // Attempt 1's one and only report is refused by the quota and held.
+    tracker.session_seen("1", Some("p1"), "s-only", &claude, false);
+    gate.open();
+    tracker.journal().unwrap().flush();
+    let attempt = AttemptId::new("run1", 1).unwrap();
+    assert_eq!(
+        latest_on_disk(state.path(), &attempt),
+        None,
+        "precondition: the quota refused the report"
+    );
+    assert_eq!(tracker.flush_held_sessions(), 1);
+    tracker.drain(Duration::from_secs(5));
+    drop(tracker);
+    assert_eq!(
+        latest_on_disk(state.path(), &attempt),
+        Some("s-only".to_string())
+    );
+    let read = read_journal(state.path()).unwrap();
+    assert_eq!(
+        sessions_of(&read.lines, &quiet),
+        [("run1/1".to_string(), "s-only".to_string())]
+    );
+}
+
+/// PRD #1790 (F1): the daemon's periodic round runs the flush every
+/// [`SESSION_FLUSH_EVERY`], not before, and stops once its closure says the
+/// registry is gone.
+#[tokio::test(start_paused = true)]
+async fn the_session_flush_runs_every_round_until_the_registry_is_gone() {
+    let rounds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = Arc::clone(&rounds);
+    let task =
+        spawn_session_flush(move || counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2);
+    let load = || rounds.load(std::sync::atomic::Ordering::SeqCst);
+    tokio::time::sleep(SESSION_FLUSH_EVERY / 2).await;
+    assert_eq!(load(), 0, "no round before the first interval");
+    tokio::time::sleep(SESSION_FLUSH_EVERY).await;
+    assert_eq!(load(), 1);
+    tokio::time::sleep(SESSION_FLUSH_EVERY * 4).await;
+    assert_eq!(load(), 3, "it stopped once the closure answered false");
+    task.await.unwrap();
+}
+
+/// Spawn `cat` on `pane` through `registry` on a blocking thread, paused
+/// after its fork and before it publishes; answers the reserved generation's
+/// id, the release, and the spawn's handle.
+async fn reserved_spawn(
+    registry: &Arc<AgentPtyRegistry>,
+    pane: &str,
+) -> (
+    String,
+    std::sync::mpsc::Sender<()>,
+    tokio::task::JoinHandle<std::thread::Result<Result<String, crate::agent_pty::AgentPtyError>>>,
+) {
+    let (forked, publish) = registry.pause_next_publish_for_test();
+    let spawning = tokio::task::spawn_blocking({
+        let registry = Arc::clone(registry);
+        let pane = pane.to_string();
+        move || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                registry.spawn_agent(SpawnOptions {
+                    command: Some("cat"),
+                    env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane)],
+                    ..SpawnOptions::default()
+                })
+            }))
+        }
+    });
+    tokio::task::spawn_blocking(move || {
+        forked
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the child never forked")
+    })
+    .await
+    .unwrap();
+    let ids = registry.reserved_ids_for_test();
+    assert_eq!(ids.len(), 1, "{ids:?}");
+    (ids[0].clone(), publish, spawning)
+}
+
+/// PRD #1790 (F1): a session reported through the registry for a reserved
+/// generation is held, and the registry's own reservation exits drop it in
+/// the lock hold that ends the reservation: the post-fork refusal
+/// (`abandon_locked`, here a shutdown latched while the spawn was paused)
+/// and the reservation's `Drop` (a panic before publication). Each is read
+/// from the tracker's book after the spawn returned; a published control
+/// writes the held id instead.
+#[tokio::test]
+async fn the_registry_drops_held_sessions_with_every_unpublished_reservation() {
+    let claude = AgentType::ClaudeCode;
+
+    // The reservation's `Drop`: a panic between the fork and publication.
+    let state = crate::test_temp::tempdir().unwrap();
+    let registry = Arc::new(AgentPtyRegistry::new());
+    registry.work().install(journal(state.path(), "run1"));
+    registry.inject_fault_for_test(
+        crate::agent_pty::FAULT_SPAWN_BEFORE_PUBLISH,
+        crate::agent_pty::TestFault::Panic("injected"),
+    );
+    let (id, publish, spawning) = reserved_spawn(&registry, "held-drop").await;
+    registry.session_seen(&id, Some("held-drop"), "s-dropped", &claude);
+    assert_eq!(registry.work().book_sizes().early_sessions, 1);
+    publish.send(()).unwrap();
+    assert!(spawning.await.unwrap().is_err(), "the fault did not fire");
+    assert_eq!(registry.work().book_sizes().early_sessions, 0, "Drop");
+    registry.shutdown_all();
+
+    // `abandon_locked`: the shutdown latch refuses the publication.
+    let state = crate::test_temp::tempdir().unwrap();
+    let registry = Arc::new(AgentPtyRegistry::new());
+    registry.work().install(journal(state.path(), "run1"));
+    let (id, publish, spawning) = reserved_spawn(&registry, "held-abandon").await;
+    registry.session_seen(&id, Some("held-abandon"), "s-abandoned", &claude);
+    assert_eq!(registry.work().book_sizes().early_sessions, 1);
+    registry.shutdown_all();
+    publish.send(()).unwrap();
+    assert!(
+        spawning.await.unwrap().unwrap().is_err(),
+        "the latched shutdown did not refuse it"
+    );
+    assert_eq!(
+        registry.work().book_sizes().early_sessions,
+        0,
+        "abandon_locked"
+    );
+    assert!(read_journal(state.path()).unwrap().lines.iter().all(
+        |l| !matches!(&l.event, Event::AttemptSession { session, .. } if session == "s-abandoned")
+    ));
+
+    // Control: the same spawn published writes the held id after its start.
+    let state = crate::test_temp::tempdir().unwrap();
+    let registry = Arc::new(AgentPtyRegistry::new());
+    registry.work().install(journal(state.path(), "run1"));
+    let (id, publish, spawning) = reserved_spawn(&registry, "held-kept").await;
+    registry.session_seen(&id, Some("held-kept"), "s-kept", &claude);
+    publish.send(()).unwrap();
+    assert_eq!(spawning.await.unwrap().unwrap().unwrap(), id);
+    assert_eq!(registry.work().book_sizes().early_sessions, 0);
+    registry.work().drain(Duration::from_secs(5));
+    let attempt = AttemptId::new("run1", id.parse().unwrap()).unwrap();
+    assert_eq!(
+        latest_on_disk(state.path(), &attempt),
+        Some("s-kept".to_string())
+    );
+    registry.shutdown_all();
+}
+
+/// PRD #1790 (F1): the early-session book is bounded by the registry's
+/// reservations, not by a count of its own: every reserved generation keeps
+/// its first id (more of them than the 64 the book used to cap at), and the
+/// call the registry makes when a reservation ends without an attempt (an
+/// abandoned spawn, or one published serving no work) removes its entry.
+#[test]
+fn every_reserved_generation_keeps_its_first_session_until_its_reservation_ends() {
+    let state = crate::test_temp::tempdir().unwrap();
+    let tracker = tracker(state.path());
+    let claude = AgentType::ClaudeCode;
+    for n in 0..100 {
+        tracker.session_seen(&format!("{}", 100 + n), Some("p"), "s-first", &claude, true);
+    }
+    assert_eq!(tracker.book_sizes().early_sessions, 100);
+    let work = tracker
+        .resolve_spawn(None, Some("p"), None, None)
+        .kept()
+        .unwrap();
+    tracker.attempt_started(&work, "199", Some("p"), None);
+    let read = lines(&tracker, state.path());
+    assert_eq!(
+        sessions_of(&read, &work),
+        [("run1/199".to_string(), "s-first".to_string())],
+        "the last of them still wrote its first id"
+    );
+    for n in 0..99 {
+        tracker.spawn_abandoned(&format!("{}", 100 + n));
+    }
+    assert_eq!(tracker.book_sizes().early_sessions, 0);
+}
+
+/// PRD #1790 (F4): a prepared start (entered through its verified
+/// directory's descriptor, on Linux as a `/proc/self/fd/N` alias) records
+/// the path it was verified against. Read after the verified handle is
+/// dropped, the record's folder is that path, which still names the
+/// directory, and no descriptor alias.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_prepared_start_records_the_verified_path_not_its_descriptor() {
+    let state = crate::test_temp::tempdir().unwrap();
+    let root = crate::test_temp::tempdir().unwrap();
+    let dir = root.path().join("prepared");
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.to_string_lossy().into_owned();
+    let registry = Arc::new(AgentPtyRegistry::new());
+    registry.work().install(journal(state.path(), "run1"));
+    let verified = crate::project_resolve::VerifiedProjectDir::open(&dir).unwrap();
+    registry
+        .spawn_agent_in(
+            SpawnOptions {
+                command: Some("cat"),
+                cwd: Some(&path),
+                env: vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "prepared-lr".to_string(),
+                )],
+                ..SpawnOptions::default()
+            },
+            &verified,
+        )
+        .expect("the prepared start is served");
+    drop(verified);
+    let records = crate::launch_records::read_all(state.path()).unwrap();
+    assert_eq!(records.len(), 1, "{records:?}");
+    let recorded = records[0].cwd.as_deref().expect("a folder is recorded");
+    assert_eq!(recorded, path);
+    assert!(!recorded.starts_with("/proc/"), "{recorded}");
+    assert!(std::path::Path::new(recorded).is_dir());
+    registry.shutdown_all();
+}
+
+/// PRD #1790: the launch-record prune's liveness test is the journal's own
+/// [`WorkJournal::run_is_live`], read from real run locks: this journal's
+/// run and a run whose lock another open journal holds are live, so their
+/// crash-left temporary files stay; a run whose lock file exists but is
+/// free, and a run with no lock file, are not, so theirs go.
+#[test]
+fn pending_cleanup_reads_real_held_free_and_missing_run_locks() {
+    let state = crate::test_temp::tempdir().unwrap();
+    let tracker = tracker(state.path());
+    let held = journal(state.path(), "run2");
+    let journal_dir = state.path().join(crate::work_journal::DIR_NAME);
+    std::fs::write(journal_dir.join("run-run3.lock"), b"").unwrap();
+    assert!(!journal_dir.join("run-run4.lock").exists());
+    let own = tracker.journal().unwrap();
+    assert!(own.run_is_live("run1"), "this journal's own run");
+    assert!(own.run_is_live("run2"), "a lock another journal holds");
+    assert!(!own.run_is_live("run3"), "a free lock");
+    assert!(!own.run_is_live("run4"), "no lock file");
+    let work = tracker.mint().unwrap();
+    crate::launch_records::write(
+        state.path(),
+        &crate::launch_records::LaunchRecord {
+            v: crate::launch_records::SCHEMA_VERSION,
+            work,
+            attempt: AttemptId::new("run1", 1).unwrap(),
+            command: None,
+            shell: None,
+            agent_type: None,
+            cwd: None,
+            name: None,
+            role: None,
+            orchestration: None,
+            orchestration_id: None,
+            ts_ms: crate::launch_records::now_ms(),
+        },
+    )
+    .unwrap();
+    let records = state.path().join(crate::launch_records::DIR_NAME);
+    let pending = |run: &str| records.join(format!(".pending-0123456789abcdef-{run}-4.json"));
+    for run in ["run1", "run2", "run3", "run4"] {
+        std::fs::write(pending(run), b"{").unwrap();
+    }
+    prune_launch_records(own);
+    assert!(pending("run1").exists(), "this run's own temporary file");
+    assert!(pending("run2").exists(), "a held run's temporary file");
+    assert!(
+        !pending("run3").exists(),
+        "a free-lock run's temporary file"
+    );
+    assert!(!pending("run4").exists(), "a lockless run's temporary file");
+    drop(held);
 }
