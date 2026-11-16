@@ -2272,13 +2272,12 @@ struct UiState {
     form_button_rects: Vec<(Action, Rect)>,
     /// Star-prompt state for the "star the repo" reminder dialog.
     star_prompt_state: config::StarPromptState,
-    /// Config generation state — tracks directories where user chose "Never".
-    config_gen_state: config::ConfigGenState,
-    /// Pane ID + cwd for the pending config-gen modal prompt. PRD #1666 part 2
+    /// The pane of the pending config-gen modal prompt. PRD #1666 part 2
     /// (G-fix6): the pane id with the daemon process its card was learned
-    /// from, so the request is posted there or nowhere.
-    config_gen_target: Option<(crate::pane::BoundPane, String)>,
-    /// Selected option index in the config-gen modal (0=Yes, 1=No, 2=Never).
+    /// from, so the request is posted there or nowhere. PRD #2119: no
+    /// directory — the daemon composes the request for the pane's own.
+    config_gen_target: Option<crate::pane::BoundPane>,
+    /// Selected option index in the config-gen modal (0=Yes, 1=No).
     config_gen_selected: usize,
     /// Selected option in quit confirm modal (0=Detach, 1=Stop, 2=Cancel).
     /// PRD #92 F1 widened this from 2 to 3 options; Detach remains the
@@ -2733,7 +2732,6 @@ impl UiState {
             drawn_pane_rects: Vec::new(),
             last_click: None,
             star_prompt_state: config::StarPromptState::default(),
-            config_gen_state: config::ConfigGenState::load(),
             config_gen_target: None,
             config_gen_selected: 0,
             quit_confirm_selected: 0,
@@ -5659,9 +5657,6 @@ pub enum Action {
     /// PRD #80 M5: config-gen `[No]` — dismiss the prompt for now (clears the
     /// target, returns to Normal).
     ConfigGenDismiss,
-    /// PRD #80 M5: config-gen `[Never]` — suppress the prompt for this
-    /// directory and return to Normal.
-    ConfigGenSuppress,
     /// PRD #80 M5: star-prompt `[Star]` — open the repo URL and stop asking
     /// (== `s`).
     StarConfirm,
@@ -5720,9 +5715,9 @@ pub enum Action {
     /// variant (it owns a `ModeConfig`/`OrchestrationConfig`), so storing it
     /// inline would bloat every `Action` value (`clippy::large_enum_variant`).
     SpawnPane(Box<NewPaneRequest>),
+    /// PRD #2119: ask the daemon to send the configuration request to `pane`.
     SendConfigGenPrompt {
         pane: crate::pane::BoundPane,
-        cwd: String,
     },
     RequestConfigGen,
     /// PRD #92 F2 (PRD #18 follow-through): the user pressed `y` or `n` on a
@@ -8217,37 +8212,24 @@ fn handle_config_gen_prompt_key(key: KeyEvent, ui: &mut UiState) -> Action {
             Action::Continue
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            if ui.config_gen_selected < 2 {
+            if ui.config_gen_selected < 1 {
                 ui.config_gen_selected += 1;
             }
             Action::Continue
         }
         KeyCode::Enter => match ui.config_gen_selected {
             0 => {
-                // Yes — send prompt and focus pane.
+                // Yes — ask the daemon to send the request, and focus the pane.
                 ui.mode = UiMode::Normal;
-                if let Some((pane, cwd)) = ui.config_gen_target.take() {
-                    return Action::SendConfigGenPrompt { pane, cwd };
+                if let Some(pane) = ui.config_gen_target.take() {
+                    return Action::SendConfigGenPrompt { pane };
                 }
-                Action::Continue
-            }
-            1 => {
-                // No — dismiss for now, hint stays on card.
-                ui.config_gen_target = None;
-                ui.mode = UiMode::Normal;
                 Action::Continue
             }
             _ => {
-                // Never — suppress hint permanently for this directory.
-                if let Some((_, ref cwd)) = ui.config_gen_target {
-                    ui.config_gen_state.suppress_dir(cwd);
-                }
+                // No — dismiss; the user can ask again at any time.
                 ui.config_gen_target = None;
                 ui.mode = UiMode::Normal;
-                ui.status_message = Some((
-                    "Config prompt suppressed for this directory.".to_string(),
-                    std::time::Instant::now(),
-                ));
                 Action::Continue
             }
         },
@@ -11363,31 +11345,30 @@ fn perform_stop_and_quit(ui: &mut UiState, pane: &dyn PaneController) -> Flow {
     }
 }
 
-/// PRD #80 M5: send the config-gen prompt to `pane_id`, focus it for execution,
-/// and surface the outcome. Shared by the `Action::SendConfigGenPrompt` arm
-/// (Enter-on-Yes via the key handler) and `Action::ConfigGenConfirm` (the
-/// `[Yes]` button).
+/// PRD #80 M5: ask the daemon to send the config-gen request to `card`'s pane,
+/// focus it for execution, and surface the outcome. Shared by the
+/// `Action::SendConfigGenPrompt` arm (Enter-on-Yes via the key handler) and
+/// `Action::ConfigGenConfirm` (the `[Yes]` button).
+///
+/// PRD #2119: the daemon composes the request for the pane's own directory
+/// ([`PaneController::generate_config`]); this client sends no prompt. A
+/// daemon too old to generate one is told apart and named
+/// ([`crate::config_gen::CONFIG_GEN_UPGRADE_MESSAGE`]), and nothing else is
+/// sent in its place — no request composed here, no generic inbox post.
 fn send_config_gen_prompt(
     card: &crate::pane::BoundPane,
-    cwd: &str,
     ui: &mut UiState,
     pane: &dyn PaneController,
     tab_manager: &mut TabManager,
 ) {
     let pane_id = card.pane_id.as_str();
-    let prompt = crate::config_gen::config_gen_prompt(cwd);
     // PRD #1666 S5: the request is a message in the agent's inbox, not text
     // typed into its pane; the agent takes it the way it takes any other.
-    // PRD #1666 part 2 (G-fix6): posted on the daemon process the selected
-    // card was learned from, so a detached or never-attached card posts nothing
-    // to a restarted daemon's agent under the same pane id.
-    match pane.post_message(
-        card,
-        "configuration request",
-        &prompt,
-        crate::inbox_hub::PostOrigin::ConfigGen,
-    ) {
-        Ok(_) => {
+    // PRD #1666 part 2 (G-fix6): asked of the daemon process the selected card
+    // was learned from, so a detached or never-attached card sends nothing to
+    // a restarted daemon's agent under the same pane id.
+    let message = match pane.generate_config(card) {
+        Ok(crate::daemon_client::GatedQuery::Answered(_)) => {
             // Focus the pane so the user can watch the agent take it.
             if let Some(tab_idx) = tab_manager.tab_index_for_pane(pane_id) {
                 // PRD #83: snapshot the SOURCE tab's focus before leaving it,
@@ -11405,18 +11386,14 @@ fn send_config_gen_prompt(
             }
             let _ = pane.focus_pane(pane_id);
             ui.mode = UiMode::PaneInput;
-            ui.status_message = Some((
-                "Config request sent to the agent's inbox.".to_string(),
-                std::time::Instant::now(),
-            ));
+            crate::config_gen::CONFIG_GEN_SENT_MESSAGE.to_string()
         }
-        Err(e) => {
-            ui.status_message = Some((
-                format!("Failed to send config prompt: {e}"),
-                std::time::Instant::now(),
-            ));
+        Ok(crate::daemon_client::GatedQuery::Unsupported) => {
+            crate::config_gen::CONFIG_GEN_UPGRADE_MESSAGE.to_string()
         }
-    }
+        Err(e) => crate::config_gen::config_gen_failed_message(&e),
+    };
+    ui.status_message = Some((message, std::time::Instant::now()));
 }
 
 /// PRD #80 M6: commit a rename for the selected card — push `new_name` to the
@@ -12068,12 +12045,14 @@ fn dispatch_action(
             }
         }
         Action::RequestConfigGen => {
+            // PRD #2119: the card's own directory is not needed here — the
+            // daemon composes the request for the directory it holds for the
+            // pane, and refuses when it knows none.
             if let Some(sid) = selected_id
                 && let Some(session) = snapshot.sessions.get(sid)
                 && let Some(card) = session.bound_pane()
-                && let Some(ref cwd) = session.cwd
             {
-                ui.config_gen_target = Some((card, cwd.clone()));
+                ui.config_gen_target = Some(card);
                 ui.config_gen_selected = 0;
                 ui.mode = UiMode::ConfigGenPrompt;
             } else {
@@ -12645,8 +12624,8 @@ fn dispatch_action(
                 } // close else (non-orchestration path)
             }
         }
-        Action::SendConfigGenPrompt { pane: card, cwd } => {
-            send_config_gen_prompt(&card, &cwd, ui, pane, tab_manager);
+        Action::SendConfigGenPrompt { pane: card } => {
+            send_config_gen_prompt(&card, ui, pane, tab_manager);
         }
         // ===== PRD #80 M5: modal button actions =====
         // quit-confirm [Stop]: resolve like Enter-on-Stop — straight to
@@ -12676,26 +12655,14 @@ fn dispatch_action(
         // config-gen [Yes]: send the prompt to the pending target pane.
         Action::ConfigGenConfirm => {
             ui.mode = UiMode::Normal;
-            if let Some((card, cwd)) = ui.config_gen_target.take() {
-                send_config_gen_prompt(&card, &cwd, ui, pane, tab_manager);
+            if let Some(card) = ui.config_gen_target.take() {
+                send_config_gen_prompt(&card, ui, pane, tab_manager);
             }
         }
-        // config-gen [No]: dismiss for now (hint stays on the card).
+        // config-gen [No]: dismiss; the user can ask again at any time.
         Action::ConfigGenDismiss => {
             ui.config_gen_target = None;
             ui.mode = UiMode::Normal;
-        }
-        // config-gen [Never]: suppress the prompt for this directory.
-        Action::ConfigGenSuppress => {
-            if let Some((_, ref cwd)) = ui.config_gen_target {
-                ui.config_gen_state.suppress_dir(cwd);
-            }
-            ui.config_gen_target = None;
-            ui.mode = UiMode::Normal;
-            ui.status_message = Some((
-                "Config prompt suppressed for this directory.".to_string(),
-                std::time::Instant::now(),
-            ));
         }
         // star-prompt [Star]: open the repo and stop asking (== `s`).
         Action::StarConfirm => {
@@ -21237,7 +21204,7 @@ const STOP_CONFIRM: ConfirmLayout = ConfirmLayout {
     first_choice: 4,
 };
 const CONFIG_GEN_CONFIRM: ConfirmLayout = ConfirmLayout {
-    rows: 14,
+    rows: 12,
     first_choice: 5,
 };
 
@@ -21906,7 +21873,6 @@ fn render_config_gen_prompt(frame: &mut Frame, area: Rect, selected: usize) -> C
     let options = [
         ("Yes", "generate config for this project"),
         ("No", "skip for now"),
-        ("Never", "never ask for this directory"),
     ];
 
     let mut text = vec![
@@ -21932,11 +21898,10 @@ fn render_config_gen_prompt(frame: &mut Frame, area: Rect, selected: usize) -> C
         ));
     }
 
+    // PRD #2119: Yes / No only. The dialog opens only when asked for, so a
+    // "Never" choice and an automatic-prompt hint had nothing to switch off.
+    // Two rows follow the choices: a gap, and the button row below.
     text.push(Line::from(""));
-    text.push(Line::styled(
-        "  Disable: dot-agent-deck config set auto_config_prompt false",
-        text_primary(),
-    ));
     text.push(Line::from(""));
     text.push(Line::styled(
         "  Up/Down: navigate  Enter: confirm  Esc: cancel",
@@ -21960,7 +21925,6 @@ fn render_config_gen_prompt(frame: &mut Frame, area: Rect, selected: usize) -> C
     let buttons = [
         Button::new("Yes", "", Action::ConfigGenConfirm, true),
         Button::new("No", "", Action::ConfigGenDismiss, true),
-        Button::new("Never", "", Action::ConfigGenSuppress, true),
     ];
     let btn_row = Rect {
         x: popup_area.x + 1,
@@ -43248,10 +43212,7 @@ mod tests {
         let mut ui = default_ui();
         ui.mode = UiMode::ConfigGenPrompt;
         ui.config_gen_selected = 0; // Yes
-        ui.config_gen_target = Some((
-            crate::pane::BoundPane::held_by_controller("pane-1"),
-            "/my/project".to_string(),
-        ));
+        ui.config_gen_target = Some(crate::pane::BoundPane::held_by_controller("pane-1"));
 
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         let result = handle_config_gen_prompt_key(enter, &mut ui);
@@ -43259,8 +43220,7 @@ mod tests {
         assert_eq!(ui.mode, UiMode::Normal);
         assert!(ui.config_gen_target.is_none());
         assert!(
-            matches!(result, Action::SendConfigGenPrompt { ref pane, ref cwd }
-                if pane.pane_id == "pane-1" && cwd == "/my/project")
+            matches!(result, Action::SendConfigGenPrompt { ref pane } if pane.pane_id == "pane-1")
         );
     }
 
@@ -43269,10 +43229,7 @@ mod tests {
         let mut ui = default_ui();
         ui.mode = UiMode::ConfigGenPrompt;
         ui.config_gen_selected = 1; // No
-        ui.config_gen_target = Some((
-            crate::pane::BoundPane::held_by_controller("pane-1"),
-            "/my/project".to_string(),
-        ));
+        ui.config_gen_target = Some(crate::pane::BoundPane::held_by_controller("pane-1"));
 
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         let result = handle_config_gen_prompt_key(enter, &mut ui);
@@ -43280,40 +43237,10 @@ mod tests {
         assert_eq!(ui.mode, UiMode::Normal);
         assert!(ui.config_gen_target.is_none());
         assert!(matches!(result, Action::Continue));
+        assert!(ui.status_message.is_none(), "No says nothing");
     }
 
-    #[test]
-    fn config_gen_prompt_enter_on_never_suppresses_dir() {
-        // Picking "Never" calls suppress_dir() → save(), which reads
-        // DOT_AGENT_DECK_CONFIG_GEN_STATE. Hold the shared lock and point at
-        // a temp path so we don't race against other tests touching the same
-        // env var, and don't pollute the real home dir.
-        let _guard = crate::config::CONFIG_GEN_STATE_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("config-gen-state.json");
-        // Drop guard restores the env var even if an assertion below panics.
-        let _env_restore = crate::config::ConfigGenStateEnvGuard::set(path.to_str().unwrap());
-
-        let mut ui = default_ui();
-        ui.mode = UiMode::ConfigGenPrompt;
-        ui.config_gen_selected = 2; // Never
-        ui.config_gen_target = Some((
-            crate::pane::BoundPane::held_by_controller("pane-1"),
-            "/my/project".to_string(),
-        ));
-
-        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-        let result = handle_config_gen_prompt_key(enter, &mut ui);
-
-        assert_eq!(ui.mode, UiMode::Normal);
-        assert!(ui.config_gen_target.is_none());
-        assert!(ui.config_gen_state.is_suppressed("/my/project"));
-        assert!(matches!(result, Action::Continue));
-        assert!(ui.status_message.is_some());
-    }
-
+    /// PRD #2119: the dialog offers Yes and No only, so Down stops at No.
     #[test]
     fn config_gen_prompt_arrow_navigation() {
         let mut ui = default_ui();
@@ -43324,26 +43251,20 @@ mod tests {
         handle_config_gen_prompt_key(down, &mut ui);
         assert_eq!(ui.config_gen_selected, 1);
 
-        handle_config_gen_prompt_key(down, &mut ui);
-        assert_eq!(ui.config_gen_selected, 2);
-
         // Can't go past last
         handle_config_gen_prompt_key(down, &mut ui);
-        assert_eq!(ui.config_gen_selected, 2);
+        assert_eq!(ui.config_gen_selected, 1);
 
         let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
         handle_config_gen_prompt_key(up, &mut ui);
-        assert_eq!(ui.config_gen_selected, 1);
+        assert_eq!(ui.config_gen_selected, 0);
     }
 
     #[test]
     fn config_gen_prompt_esc_dismisses() {
         let mut ui = default_ui();
         ui.mode = UiMode::ConfigGenPrompt;
-        ui.config_gen_target = Some((
-            crate::pane::BoundPane::held_by_controller("pane-1"),
-            "/my/project".to_string(),
-        ));
+        ui.config_gen_target = Some(crate::pane::BoundPane::held_by_controller("pane-1"));
 
         let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
         let result = handle_config_gen_prompt_key(esc, &mut ui);
@@ -49477,13 +49398,13 @@ mod tests {
                 hidden: 1,
                 later: None,
             },
-            // [Yes] [No] [Never] paints over No; Never is still shown.
+            // [Yes] [No] paints over No (PRD #2119: no Never below it).
             Case {
                 mode: UiMode::ConfigGenPrompt,
                 small: (80, 14),
-                labels: &["Yes", "No", "Never"],
+                labels: &["Yes", "No"],
                 hidden: 1,
-                later: Some(2),
+                later: None,
             },
         ];
         for Case {
@@ -49762,14 +49683,13 @@ mod tests {
             Action::ConfirmCloseSelected => "[Close]",
             Action::ConfigGenConfirm => "[Yes]",
             Action::ConfigGenDismiss => "[No]",
-            Action::ConfigGenSuppress => "[Never]",
             other => panic!("a confirmation button fires {other:?}"),
         };
         let dialogs: [(UiMode, &[&str], usize); 4] = [
             (UiMode::QuitConfirm, &["Detach", "Stop", "Cancel"], 3),
             (UiMode::CloseConfirm, &["Cancel", "Close"], 2),
             (UiMode::StopConfirm, &["No", "Yes"], 0),
-            (UiMode::ConfigGenPrompt, &["Yes", "No", "Never"], 3),
+            (UiMode::ConfigGenPrompt, &["Yes", "No"], 2),
         ];
         let footers: [(bool, &[_]); 4] =
             [(false, &[]), (true, &[]), (false, &notice), (true, &notice)];

@@ -592,6 +592,23 @@ pub trait PaneController: Send + Sync {
     ) -> Result<String, PaneError> {
         Err(PaneError::NotAvailable)
     }
+    /// PRD #2119: ask the daemon to post the configuration-generation request
+    /// to `pane`'s inbox — the daemon composes it for the pane's own working
+    /// directory — bound to the agent the pane holds now, and only on the
+    /// daemon process `pane` was learned from ([`BoundPane`]), as
+    /// [`Self::post_message`] is. Answers the message id, or
+    /// [`GatedQuery::Unsupported`] when the daemon does not generate configs
+    /// (an older daemon), in which case nothing was sent and the caller says
+    /// the daemon needs upgrading. The default has no daemon behind it and
+    /// refuses; the daemon-backed `EmbeddedPaneController` overrides it.
+    ///
+    /// [`GatedQuery::Unsupported`]: crate::daemon_client::GatedQuery::Unsupported
+    fn generate_config(
+        &self,
+        _pane: &BoundPane,
+    ) -> Result<crate::daemon_client::GatedQuery<String>, PaneError> {
+        Err(PaneError::NotAvailable)
+    }
     /// PRD #1885: the attached daemon's trust state of orchestration
     /// `orchestration` of the project config in `dir` — whether its commands
     /// and prompts are approved as they now read, the text to show, and the

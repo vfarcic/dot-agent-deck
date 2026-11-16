@@ -5532,6 +5532,33 @@ impl PaneController for EmbeddedPaneController {
         }
     }
 
+    fn generate_config(&self, pane: &BoundPane) -> Result<GatedQuery<String>, PaneError> {
+        // PRD #2119: bound exactly as `post_message` binds a post — to the
+        // process the card was learned from, naming the agent this controller
+        // attached only when that attach is the card's own (PR #1817).
+        let pane_id = pane.pane_id.as_str();
+        let client = self.held_client(pane);
+        let agent_id = match self.local_pane_for(pane) {
+            LocalPaneFor::Card => self.pane_attachment(pane_id).map(|a| a.agent_id),
+            LocalPaneFor::Other | LocalPaneFor::None => None,
+        };
+        let reply = self.runtime.block_on(async move {
+            tokio::time::timeout(
+                POST_MESSAGE_TIMEOUT,
+                client.generate_config(pane_id, agent_id.as_deref()),
+            )
+            .await
+        });
+        match reply {
+            Ok(Ok(answer)) => Ok(answer),
+            Ok(Err(e)) => Err(PaneError::CommandFailed(format!("generate-config: {e}"))),
+            Err(_) => Err(PaneError::CommandFailed(format!(
+                "generate-config timed out after {}ms",
+                POST_MESSAGE_TIMEOUT.as_millis()
+            ))),
+        }
+    }
+
     fn project_trust_state(
         &self,
         dir: &str,
@@ -7953,6 +7980,9 @@ mod incarnation_binding_tests {
                         crate::inbox_hub::PostOrigin::ConfigGen
                     )
                 )
+            }),
+            ("generate", "generate-config", |c, card| {
+                format!("{:?}", c.generate_config(card))
             }),
             ("press", "inbox-retry", |c, card| {
                 c.inbox_action_sender()

@@ -2383,6 +2383,50 @@ impl DaemonClient {
             .ok_or_else(|| ClientError::Server("post-message answered no message id".into()))
     }
 
+    /// PRD #2119 — ask the daemon to post the configuration-generation request
+    /// to `pane_id`'s inbox, bound to `expected_agent_id` when given. The
+    /// daemon composes the request for the pane's working directory as it
+    /// knows it; the caller sends no prompt. Answers the message id.
+    ///
+    /// **Withholds unless the daemon advertises
+    /// [`crate::daemon_protocol::CAP_GENERATE_CONFIG`]**, answering
+    /// [`GatedQuery::Unsupported`] without sending anything: an older daemon
+    /// has no such verb, and the caller says it needs upgrading
+    /// ([`crate::config_gen::CONFIG_GEN_UPGRADE_MESSAGE`]) rather than
+    /// composing the request itself.
+    pub async fn generate_config(
+        &self,
+        pane_id: &str,
+        expected_agent_id: Option<&str>,
+    ) -> Result<GatedQuery<String>, ClientError> {
+        if !self
+            .capabilities()
+            .await?
+            .supports(crate::daemon_protocol::CAP_GENERATE_CONFIG)
+        {
+            return Ok(GatedQuery::Unsupported);
+        }
+        let (mut rd, mut wr) = self.admitted_connect().await?;
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::GenerateConfig {
+                pane_id: pane_id.to_string(),
+                expected_agent_id: expected_agent_id.map(str::to_string),
+            },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error
+                    .unwrap_or_else(|| "generate-config failed".into()),
+            ));
+        }
+        resp.id
+            .map(GatedQuery::Answered)
+            .ok_or_else(|| ClientError::Server("generate-config answered no message id".into()))
+    }
+
     /// PRD #1666 S3 — the inbox of `pane_id`, or of the whole deck with no
     /// pane: every message, live and recent history.
     ///
@@ -10034,7 +10078,7 @@ pub(crate) mod restart_fixture {
                 ])
             }
             "start-agent" => AttachResponse::with_id("1".into()),
-            "post-message" => AttachResponse::with_id("m-1".into()),
+            "post-message" | "generate-config" => AttachResponse::with_id("m-1".into()),
             "attach-stream" | "resize" => {
                 let mut reply = AttachResponse::ok();
                 reply.viewer = Some("v1".into());

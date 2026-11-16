@@ -1316,19 +1316,21 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 
 #### dashboard/config-gen
 
-##### dashboard/config-gen/001 — `g` on a card opens the Generate Config dialog with options Yes / No / Never.
-- **Layer:** L2.
+##### dashboard/config-gen/001 — A TUI attached to a daemon without config generation explains that the daemon must be upgraded.
+- **Layer:** L1 (requires a config-generation action/result rendering seam).
 - **Agent:** none.
-- **Asserts:** dialog region appears; arrow keys move between Yes / No / Never; `Enter` on No dismisses without side effects.
-- **Does not assert:** what Yes injects into the agent (covered by `orchestration/delegate/*` for delegate-driven prompt injection, and elsewhere if a non-orchestration path emerges).
+- **Asserts:** confirming generation shows the shared upgrade message and posts no locally composed fallback prompt.
+- **Implementation:** pending a harness seam that drives the production config-generation action through a controller returning Unsupported and renders the resulting frame; the existing dialog renderer cannot exercise this send/result path.
+- **Does not assert:** successful delivery (covered by `inbox/route/007`) or the shared-client capability gate (`daemon/config-gen/004`).
 - **Platform coverage:** mac+linux.
 
-##### dashboard/config-gen/002 — Picking Never adds the cwd to the suppression list and the prompt does not re-open for that directory.
-- **Layer:** L2.
+##### dashboard/config-gen/002 — Existing disabled automatic-prompt settings and recorded Never state remain readable.
+- **Layer:** pure-data, fast tier.
 - **Agent:** none.
-- **Asserts:** after Never, re-opening the new-pane flow for the same cwd does not surface the auto-prompt.
-- **Does not assert:** filesystem path of the suppression list (an implementation detail).
-- **Platform coverage:** mac+linux.
+- **Asserts:** a config containing `auto_config_prompt = false` and a persisted JSON state recording a suppressed directory both deserialize and retain their values.
+- **Test:** `config_gen_002_legacy_settings_and_never_state_still_load` in `tests/render_modal_buttons.rs`.
+- **Does not assert:** automatic dialog opening or suppression behavior; the dialog is requested manually.
+- **Platform coverage:** mac+linux+windows.
 
 ### Statuses
 
@@ -2290,6 +2292,40 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 - **Agent:** synthetic Codex events.
 - **Asserts:** after a history-only `SessionStart` and 51 later events omitting `live_target`, the session remains `Writable::HistoryOnly` rather than falling back to Live when the first event leaves the 50-entry journal.
 - **Does not assert:** reconnect serialization (covered by `session/live/010`) or card rendering (`dashboard/pane/009`).
+- **Platform coverage:** mac+linux+windows.
+
+#### daemon/config-gen
+
+##### daemon/config-gen/001 — Hello advertises config generation without changing the protocol version.
+- **Layer:** protocol, fast tier.
+- **Agent:** none.
+- **Asserts:** the in-process daemon advertises `generate-config` alongside `inbox` and retains protocol version 12.
+- **Test:** `config_gen_001_hello_advertises_generation_without_version_bump` in `tests/daemon_protocol.rs`.
+- **Does not assert:** message delivery (`daemon/config-gen/002`).
+- **Platform coverage:** mac+linux.
+
+##### daemon/config-gen/002 — The daemon composes the exact config request for the selected pane's own directory.
+- **Layer:** protocol, fast tier.
+- **Agent:** none (in-process daemon with cat panes).
+- **Asserts:** one request reaches the target's current agent; its complete body equals `config_gen_prompt` for the daemon's target cwd, and another pane receives nothing.
+- **Test:** `config_gen_002_daemon_posts_exact_prompt_for_target_cwd` in `tests/daemon_protocol.rs`.
+- **Does not assert:** real-model compliance or UI confirmation (`inbox/route/007`).
+- **Platform coverage:** mac+linux.
+
+##### daemon/config-gen/003 — A missing or replaced config-generation target is refused.
+- **Layer:** protocol, fast tier.
+- **Agent:** none (in-process daemon with cat panes).
+- **Asserts:** an unknown pane and a request retaining a replaced agent's identity are refused without posting a message to the replacement.
+- **Test:** `config_gen_003_missing_or_replaced_target_receives_nothing` in `tests/daemon_protocol.rs`.
+- **Does not assert:** user-facing refusal wording.
+- **Platform coverage:** mac+linux.
+
+##### daemon/config-gen/004 — The shared client withholds config generation without the advertised capability.
+- **Layer:** protocol/client, fast tier.
+- **Agent:** none.
+- **Asserts:** absent, empty, and generic-inbox-only capability sets return Unsupported without connecting to the daemon.
+- **Test:** `config_gen_004_client_withholds_generation_from_older_daemon` in `tests/config_generation.rs`.
+- **Does not assert:** TUI status rendering (`dashboard/config-gen/001`).
 - **Platform coverage:** mac+linux+windows.
 
 #### daemon/status
@@ -8383,14 +8419,14 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 ##### mouse/modal/001 — Modal dialog buttons fire their action like the keyboard.
 - **Layer:** L2.
 - **Agent:** none (synthetic card for config-gen; fixture `schedules.toml` via `DOT_AGENT_DECK_SCHEDULES` for the Schedules manager).
-- **Asserts:** quit-confirm `[Cancel]` dismisses (app stays), config-gen `[Never]` sets the "Config prompt suppressed" status, help `[Close]` closes the overlay, and the "Schedules" manager dialog's `[Delete]` button surfaces the definition-only delete-confirmation (`Delete schedule '<name>'?`) like pressing `d` (PRD #127 finding #4 — modal mouse parity).
+- **Asserts:** quit-confirm `[Cancel]` dismisses (app stays), config-gen offers Yes/No without Never or the obsolete automatic-prompt hint and `[No]` dismisses without preventing another manual request, help `[Close]` closes the overlay, and the "Schedules" manager dialog's `[Delete]` button surfaces the definition-only delete-confirmation (`Delete schedule '<name>'?`) like pressing `d` (PRD #127 finding #4 — modal mouse parity).
 - **Does not assert:** the destructive quit-confirm `[Detach]`/`[Stop]` (process-exit, keyboard-tested) or the star-prompt (not deterministically triggerable); the manager dialog's other clickable actions — `[Add]`/`[Edit]`/`[Run now]` — which the coder must also wire (and whose click outcomes are deferred).
 - **Platform coverage:** mac+linux.
 
 ##### mouse/modal/002 — Each modal renders explicit buttons alongside its existing selection list / hint.
 - **Layer:** L1.
 - **Agent:** none.
-- **Asserts:** quit-confirm `[Detach] [Stop] [Cancel]`, config-gen `[Yes] [No] [Never]`, star `[Star] [Snooze] [Dismiss]`, and help `[Close]` render while the existing list / hint text is still present (additive).
+- **Asserts:** quit-confirm `[Detach] [Stop] [Cancel]`, config-gen `[Yes] [No]`, star `[Star] [Snooze] [Dismiss]`, and help `[Close]` render with explanatory content; config-gen contains neither Never nor the inert automatic-prompt hint and has an insta snapshot.
 - **Does not assert:** click outcomes (covered by `mouse/modal/001`).
 - **Platform coverage:** mac+linux+windows.
 
@@ -14361,10 +14397,10 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
 
-##### inbox/route/007 — Request configuration generation from a live synthetic card through the real TUI and accept the dialog. One bound configuration prompt must be queued without typed content; after Idle its pane fetches and renders the instructions.
+##### inbox/route/007 — Confirm config generation in the attached TUI and also request it through the daemon verb; both deliver the exact prompt for the target directory.
 - **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
 - **Agent:** none.
-- **Asserts:** Request configuration generation from a live synthetic card through the real TUI and accept the dialog. One bound configuration prompt must be queued without typed content; after Idle its pane fetches and renders the instructions.
+- **Asserts:** confirming Yes in the real TUI and calling the daemon's `generate-config` verb each queue one bound message with a complete body equal to `config_gen_prompt` for the daemon-reported target cwd; after Idle its pane fetches the instructions without typed prompt content.
 - **Test:** `route_007_tui_config_generation_posts_bound_message` in `tests/e2e_inbox_route.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
 - **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.

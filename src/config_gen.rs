@@ -60,6 +60,30 @@ pub fn config_gen_prompt(dir: &str) -> String {
         .replace("{roles}", &roles_section)
 }
 
+/// PRD #2119: the subject of the configuration request the daemon posts to an
+/// agent's inbox ([`crate::daemon_protocol::AttachRequest::GenerateConfig`]).
+pub const CONFIG_GEN_SUBJECT: &str = "configuration request";
+
+/// PRD #2119: what a client says once the daemon has posted the configuration
+/// request. One string, so the TUI and the desktop app say the same thing.
+pub const CONFIG_GEN_SENT_MESSAGE: &str = "Config request sent to the agent's inbox.";
+
+/// PRD #2119: what a client says when the daemon does not advertise
+/// [`crate::daemon_protocol::CAP_GENERATE_CONFIG`]. Neither client composes the
+/// request itself instead, so both say this, in these words.
+pub const CONFIG_GEN_UPGRADE_MESSAGE: &str =
+    "This daemon is too old to generate a config. Upgrade the daemon to use Generate config.";
+
+/// PRD #2119: the start of what a client says when the request was refused or
+/// could not be sent; [`config_gen_failed_message`] appends the reason.
+pub const CONFIG_GEN_FAILED_PREFIX: &str = "Failed to send config prompt";
+
+/// PRD #2119: [`CONFIG_GEN_FAILED_PREFIX`] followed by `reason`, the one
+/// failure message both clients show.
+pub fn config_gen_failed_message(reason: &dyn std::fmt::Display) -> String {
+    format!("{CONFIG_GEN_FAILED_PREFIX}: {reason}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
