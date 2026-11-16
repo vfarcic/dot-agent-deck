@@ -295,7 +295,7 @@ Otherwise **ask how many to dispatch, recommending 1–2.** That is deliberately
 
 Ask **which** PRDs too, unless the runner already named them. Relative priority among PRDs is theirs to judge and is not legible from the queue.
 
-**When the runner already answered, there is nothing to ask.** If they gave a count ("pick 3 PRDs"), do not ask how many; if they named the PRDs, or told you to pick, do not ask which. Then go on to step 6 and dispatch, and report the PRDs you picked, with the reason for each pick and each PRD's shape from step 7. A count above 1–2 is the runner's to choose: mention the load in that report (the two reasons above), not in a question that holds up the dispatch. **The shape is never one of this step's questions** — step 7 chooses it and reports it, so do not add it to a prompt that asks how many or which.
+**When the runner already answered, there is nothing to ask.** If they gave a count ("pick 3 PRDs"), do not ask how many; if they named the PRDs, or told you to pick, do not ask which. This skips only the questions they already answered: a `dispatch-base` refusal carried forward from step 0b is still theirs to answer before the first dispatch. Then go on to step 6 and dispatch, and report the PRDs you picked, with the reason for each pick and each PRD's shape from step 7. A count above 1–2 is the runner's to choose: mention the load in that report (the two reasons above), not in a question that holds up the dispatch. **The shape is never one of this step's questions** — step 7 chooses it and reports it, so do not add it to a prompt that asks how many or which.
 
 ## Step 6 — Claim, then name
 
