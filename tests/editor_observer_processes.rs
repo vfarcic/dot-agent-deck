@@ -771,7 +771,7 @@ fn probe_072_a_native_install_binds_through_its_path_symlink() {
     assert!(h.observer.bound_agent().is_none());
 }
 
-/// Scenario: Publish a liability, then have `A` start a helper copy that holds itself where a helper is partway through its `execve(2)`, running the helper copy with no argv published yet, while the child scan runs. The scan makes no record of it in that state; once the helper publishes its Claude-shaped argv the scan records it `Owned`, and its `Armed` invocation on IPC consumes the liability rather than being kept `NotConsumed(Unattributed)`.
+/// Scenario: Have `A` start a helper copy that holds itself where a helper is partway through its `execve(2)`, running the helper copy with no argv published yet, then publish a liability so the child scan runs. The scan makes no record of it in that state; once the helper publishes its Claude-shaped argv the scan records it `Owned`, and its `Armed` invocation on IPC consumes the liability rather than being kept `NotConsumed(Unattributed)`.
 #[spec("inbox/probe/072")]
 #[test]
 fn probe_072_a_helper_seen_mid_exec_is_attributed_once_its_argv_is_published() {
@@ -788,33 +788,21 @@ fn probe_072_a_helper_seen_mid_exec_is_attributed_once_its_argv_is_published() {
     // SAFETY: `getuid(2)` has no failure mode.
     let uid = unsafe { libc::getuid() };
     let export = format!("/tmp/claude-{uid}/claude-prompt-mid-exec.md");
-    let go = bin.path().join("go");
-    let c = std::ffi::CString::new(go.as_os_str().as_encoded_bytes()).unwrap();
-    // SAFETY: a NUL-terminated path.
-    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
     let this = std::env::current_exe().unwrap();
+    // `A` starts the helper at once. Nothing is published yet, so no scan
+    // runs until the helper holds itself with no argv: a scan between its
+    // `execve(2)` and its hold would see the argv it was started with.
     let h = Harness::start_with_helper(&this, |helper| {
-        // `A` waits for the test to publish, then starts the helper.
         Some(vec![
             agent_exe.clone().into(),
             "-c".into(),
-            format!("read x < \"$0\"; {HOLD_MID_EXEC}=\"$1\" \"$2\" \"$3\" & wait").into(),
-            go.clone().into(),
+            format!("{HOLD_MID_EXEC}=\"$0\" \"$1\" \"$2\" & wait").into(),
             hold.clone().into(),
             helper.into(),
             export.clone().into(),
         ])
     });
-    assert_eq!(h.observer.control(G, ControlOp::Publish), Ok(1));
-    assert_eq!(h.observer.permission(), Permission::Armable);
     let a = h.started[0].id();
-    OpenOptions::new()
-        .write(true)
-        .open(&go)
-        .unwrap()
-        .write_all(b"go\n")
-        .unwrap();
-
     let helper_id = std::fs::read_link(h.instance.helper()).unwrap_or(h.instance.helper().into());
     let mut helper = None;
     assert!(
@@ -835,6 +823,9 @@ fn probe_072_a_helper_seen_mid_exec_is_attributed_once_its_argv_is_published() {
     let helper = helper.unwrap();
     let key = key_of(helper);
     let input = h.observer.input();
+    assert!(input.record(key).is_none(), "no scan ran before the hold");
+    assert_eq!(h.observer.control(G, ControlOp::Publish), Ok(1));
+    assert_eq!(h.observer.permission(), Permission::Armable);
     // A liability is published, so a scan runs every `SCAN_PERIOD`.
     std::thread::sleep(SCAN_PERIOD * 20);
     assert!(

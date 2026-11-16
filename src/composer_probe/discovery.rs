@@ -808,6 +808,25 @@ fn still_accepted(
     }
 }
 
+/// The argv in a `/proc/<pid>/cmdline` read. No bytes at all is no argv:
+/// the process is partway through its `execve(2)`, or exiting, and [`find`]
+/// passes over it. A started process reads at least its `argv[0]`'s NUL,
+/// so one started with an empty `argv[0]`, or with none (Linux gives it an
+/// empty one), has an argv of one empty word.
+#[cfg(target_os = "linux")]
+fn argv_of(cmdline: &[u8]) -> Vec<OsString> {
+    use std::os::unix::ffi::OsStrExt;
+    if cmdline.is_empty() {
+        return Vec::new();
+    }
+    cmdline
+        .strip_suffix(&[0])
+        .unwrap_or(cmdline)
+        .split(|b| *b == 0)
+        .map(|a| OsStr::from_bytes(a).to_os_string())
+        .collect()
+}
+
 /// `/proc` as a walk reads it.
 #[cfg(target_os = "linux")]
 #[derive(Default)]
@@ -851,17 +870,7 @@ impl Procs for LinuxProcs {
             .take(128 << 10)
             .read_to_end(&mut cmdline)
             .ok()?;
-        if cmdline.last() == Some(&0) {
-            cmdline.pop();
-        }
-        let argv = if cmdline.is_empty() {
-            Vec::new()
-        } else {
-            cmdline
-                .split(|b| *b == 0)
-                .map(|a| OsStr::from_bytes(a).to_os_string())
-                .collect()
-        };
+        let argv = argv_of(&cmdline);
         let uid = std::fs::read(format!("/proc/{pid}/status"))
             .ok()
             .and_then(|status| super::instance::status_uid(&status));
@@ -1116,6 +1125,32 @@ mod tests {
             .add(12, 10, PYTHON, "python3", &["python3", "/bin/launcher"])
             .add(13, 12, NATIVE, "codex", &["codex", "--fixture"]);
         assert_eq!(find(&mut t, 10, 100, &walk(&pin)).map(|c| c.pid), Some(13));
+
+        // A launcher started with an empty `argv[0]` has started: the walk
+        // goes below it.
+        let mut t = Table::default();
+        t.add(10, 1, OWN, "dot-agent-deck", &wrap)
+            .add(12, 10, PYTHON, "python3", &[""])
+            .add(13, 12, NATIVE, "codex", &["codex", "--fixture"]);
+        assert_eq!(find(&mut t, 10, 100, &walk(&pin)).map(|c| c.pid), Some(13));
+    }
+
+    /// Scenario: `/proc/<pid>/cmdline` reads are turned into argv: no bytes is no argv (a process partway through its `execve(2)`), a lone NUL is one empty word (a process started with an empty `argv[0]`), and NUL-separated words are those words with or without the trailing NUL.
+    #[cfg(target_os = "linux")]
+    #[spec("inbox/probe/035")]
+    #[test]
+    fn probe_035_a_cmdline_with_no_bytes_is_no_argv_and_a_lone_nul_is_one_word() {
+        let words = |w: &[&str]| w.iter().map(OsString::from).collect::<Vec<_>>();
+        assert_eq!(argv_of(b""), Vec::<OsString>::new());
+        assert_eq!(argv_of(b"\0"), words(&[""]));
+        assert_eq!(
+            argv_of(b"codex\0app-server\0"),
+            words(&["codex", "app-server"])
+        );
+        assert_eq!(
+            argv_of(b"codex\0app-server"),
+            words(&["codex", "app-server"])
+        );
     }
 
     /// Scenario: An npm-shaped Codex: the wrapper's child runs the pinned script under the pinned interpreter with the wrapped arguments (the #2002 pair on one side only), and spawns the native. The native is attested through the entrypoint; the same native under another script, or the script under another interpreter, is an executable mismatch.
