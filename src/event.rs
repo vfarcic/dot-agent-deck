@@ -504,6 +504,17 @@ pub const DELIVERY_NOTICE_METADATA_KEY: &str = "delivery_notice";
 /// map, so a consumer that does not know the key ignores it.
 pub const STATUS_REASON_METADATA_KEY: &str = "status_reason";
 
+/// `AgentEvent.metadata` key marking an event the DAEMON authored from the
+/// status an agent writes to its terminal (OSC 7501, PRD #211,
+/// [`crate::status_osc`]) rather than from one of the agent's hooks. Its one
+/// effect is on `working`, a `Thinking` that moves only a card that is not
+/// already busy and keeps the active tool ([`AgentEvent::is_status_signal`]).
+/// Daemon-owned: the hook socket strips it from every producer frame.
+pub const STATUS_SIGNAL_METADATA_KEY: &str = "status_signal";
+
+/// The one [`STATUS_SIGNAL_METADATA_KEY`] value: the OSC 7501 reader.
+pub const STATUS_SIGNAL_METADATA_VALUE: &str = "osc7501";
+
 /// `AgentEvent.metadata` key marking the `Thinking` event the DAEMON authors
 /// when a message it reported not delivered ([`DELIVERY_NOTICE_METADATA_KEY`])
 /// was acknowledged after all (PRD #1666 long-turn delivery). It lifts the
@@ -1543,6 +1554,14 @@ impl AgentEvent {
                 .metadata
                 .get(DELIVERY_NOTICE_CLEARED_METADATA_KEY)
                 .is_some_and(|v| v == DELIVERY_NOTICE_CLEARED_METADATA_VALUE)
+    }
+
+    /// PRD #211: whether the daemon built this event from the agent's OSC 7501
+    /// terminal status ([`STATUS_SIGNAL_METADATA_KEY`]).
+    pub fn is_status_signal(&self) -> bool {
+        self.metadata
+            .get(STATUS_SIGNAL_METADATA_KEY)
+            .is_some_and(|v| v == STATUS_SIGNAL_METADATA_VALUE)
     }
 
     pub fn is_quota_block_lift(&self) -> bool {

@@ -15360,14 +15360,26 @@ impl AppState {
                 .metadata
                 .get(crate::event::SUBAGENT_ID_METADATA_KEY)
                 .is_some_and(|answered| release_subagent_wait(session, answered)),
-            // PRD #211: Antigravity reports one busy state — its terminal
-            // status says `working` from the prompt to the turn's end, between
-            // tool calls too — so its model calls read as Working, as that
-            // signal does, rather than flickering to Thinking between tools.
-            EventType::Thinking if event.agent_type == AgentType::Antigravity => {
-                session.status = SessionStatus::Working;
-                session.active_tool = None;
-                true
+            // PRD #211: an agent's terminal status (OSC 7501) says `working`
+            // from the prompt to the turn's end, between tool calls too, so it
+            // cannot tell Thinking from Working. Its hooks can, and they are
+            // the finer account: `working` starts a turn on a card that is not
+            // busy (Idle, Needs Input, Error) — a turn the hooks did not
+            // report, such as one after a permission answer — shows it as
+            // Thinking, as every agent's prompt does, and keeps a tool the
+            // hooks reported running. It never repaints a busy card.
+            EventType::Thinking if event.is_status_signal() => {
+                let starts_turn = matches!(
+                    session.status,
+                    SessionStatus::Idle
+                        | SessionStatus::Waiting
+                        | SessionStatus::WaitingForInput
+                        | SessionStatus::Error
+                );
+                if starts_turn {
+                    session.status = SessionStatus::Thinking;
+                }
+                starts_turn
             }
             EventType::Thinking => {
                 session.status = SessionStatus::Thinking;
@@ -23542,18 +23554,58 @@ mod tests {
         assert_eq!(state.sessions["gen-q"].status_reason(), None);
     }
 
-    /// PRD #211: Antigravity's model calls read as Working, the one busy state
-    /// its terminal status reports; every other agent's still read Thinking.
+    /// PRD #211: Antigravity's model calls read as Thinking, as every agent's
+    /// do; its terminal `working` starts a turn as Thinking only on a card that
+    /// is not busy, keeps the active tool, and never repaints Working.
     #[test]
-    fn an_antigravity_turn_reads_working_and_others_thinking() {
+    fn an_antigravity_turn_reads_thinking_and_its_terminal_working_never_repaints_busy() {
+        let signal = |secs| {
+            let mut event = quota_event(EventType::Thinking, secs);
+            event.agent_type = AgentType::Antigravity;
+            event.tool_name = None;
+            event.metadata.insert(
+                crate::event::STATUS_SIGNAL_METADATA_KEY.to_string(),
+                crate::event::STATUS_SIGNAL_METADATA_VALUE.to_string(),
+            );
+            event
+        };
         let mut state = AppState::default();
         state.register_pane("pane-q".to_string());
         state.apply_event(quota_event(EventType::SessionStart, 1));
         let mut thinking = quota_event(EventType::Thinking, 2);
         thinking.agent_type = AgentType::Antigravity;
         state.apply_event(thinking);
-        assert_eq!(state.sessions["gen-q"].status, SessionStatus::Working);
-        state.apply_event(quota_event(EventType::Thinking, 3));
+        assert_eq!(state.sessions["gen-q"].status, SessionStatus::Thinking);
+
+        let mut tool = quota_event(EventType::ToolStart, 3);
+        tool.agent_type = AgentType::Antigravity;
+        tool.tool_name = Some("run_command".to_string());
+        tool.tool_detail = Some("echo hi".to_string());
+        state.apply_event(tool);
+        assert!(signal(4).is_status_signal());
+        state.apply_event(signal(4));
+        let card = &state.sessions["gen-q"];
+        assert_eq!(card.status, SessionStatus::Working);
+        assert_eq!(
+            card.active_tool.as_ref().map(|t| t.name.as_str()),
+            Some("run_command")
+        );
+
+        state.apply_event(quota_event(EventType::PermissionRequest, 5));
+        assert_eq!(
+            state.sessions["gen-q"].status,
+            SessionStatus::WaitingForInput
+        );
+        state.apply_event(signal(6));
+        assert_eq!(state.sessions["gen-q"].status, SessionStatus::Thinking);
+
+        for (secs, from) in [(7, EventType::Idle), (9, EventType::Error)] {
+            state.apply_event(quota_event(from, secs));
+            state.apply_event(signal(secs + 1));
+            assert_eq!(state.sessions["gen-q"].status, SessionStatus::Thinking);
+        }
+        // A hook-less Thinking that is not a terminal signal is every agent's.
+        state.apply_event(quota_event(EventType::Thinking, 11));
         assert_eq!(state.sessions["gen-q"].status, SessionStatus::Thinking);
     }
 

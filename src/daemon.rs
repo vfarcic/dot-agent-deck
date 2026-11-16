@@ -3175,6 +3175,11 @@ fn admit_producer_event(event: &mut AgentEvent) {
     event
         .metadata
         .remove(crate::event::DELIVERY_NOTICE_CLEARED_METADATA_KEY);
+    // PRD #211: nor does a producer say its frame is the agent's terminal
+    // status; the OSC reader is the daemon's own.
+    event
+        .metadata
+        .remove(crate::event::STATUS_SIGNAL_METADATA_KEY);
     // PRD #1666 S6: nor does a producer say a prompt is the deck's own
     // message; the raw-event ingress stamps that after this, and no other
     // ingress does.
@@ -3607,8 +3612,9 @@ async fn run_status_osc_monitor(
 /// the pane's card), and applied only while the generation that wrote it still
 /// holds the pane.
 ///
-/// `agy` reports one busy state, so `working` is a `Thinking` that
-/// [`crate::state::AppState::apply_event`] shows as Working for it. A Needs
+/// Every update is marked [`crate::event::STATUS_SIGNAL_METADATA_KEY`]: `working`
+/// is a `Thinking` that [`crate::state::AppState::apply_event`] applies only to
+/// a card that is not already busy, keeping its active tool. A Needs
 /// Input is a `PermissionRequest` with no question: the agent's message rides
 /// as [`crate::event::STATUS_REASON_METADATA_KEY`], which the card shows.
 async fn report_status_update(
@@ -3634,7 +3640,10 @@ async fn report_status_update(
             .or_else(|| state.pane_session_id(pane_id))
             .unwrap_or_else(|| pane_id.clone())
     };
-    let mut metadata = std::collections::HashMap::new();
+    let mut metadata = std::collections::HashMap::from([(
+        crate::event::STATUS_SIGNAL_METADATA_KEY.to_string(),
+        crate::event::STATUS_SIGNAL_METADATA_VALUE.to_string(),
+    )]);
     if let Some(reason) = reason {
         metadata.insert(crate::event::STATUS_REASON_METADATA_KEY.to_string(), reason);
     }
