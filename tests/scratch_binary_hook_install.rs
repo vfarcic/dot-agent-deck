@@ -62,6 +62,245 @@ fn durable_file_name() -> String {
     )
 }
 
+const AGY_USER_HOOK: &str = r#"{ "enabled": false, "PreInvocation": [{"type":"command","command":"printf user"}], "number": 1e+02 }"#;
+
+fn antigravity_hooks(fixture: &Fixture) -> PathBuf {
+    fixture.home().join(".gemini/config/hooks.json")
+}
+
+fn seed_antigravity(fixture: &Fixture, body: Option<&str>) {
+    use std::os::unix::fs::PermissionsExt;
+    let agy = fixture.path().join("emptybin/agy");
+    std::fs::write(&agy, "#!/bin/sh\nprintf '1.5.9\\n'\n").unwrap();
+    std::fs::set_permissions(agy, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if let Some(body) = body {
+        let path = antigravity_hooks(fixture);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+}
+
+fn installed_antigravity(fixture: &Fixture, deck: &Path) -> serde_json::Value {
+    let out = fixture.run(deck, &["hooks", "install", "--agent", "antigravity"]);
+    assert!(
+        out.status.success(),
+        "Antigravity hooks install must succeed: {}",
+        combined(&out)
+    );
+    let body = std::fs::read_to_string(antigravity_hooks(fixture))
+        .expect("hooks install must create ~/.gemini/config/hooks.json");
+    serde_json::from_str(&body).expect("installed hooks are valid JSON")
+}
+
+/// Scenario: Install Antigravity hooks alongside a deliberately formatted user hook and a disabled deck hook, then reinstall after the agent rewrites the JSON. The five events retain their measured shape, the disabled switch and user bytes survive, and uninstall removes just the deck key.
+#[spec("hooks/install/028")]
+#[test]
+fn install_028_antigravity_preserves_user_hooks_disabled_switch_and_reinstalls() {
+    let fixture = Fixture::new();
+    let scratch = fixture.scratch_deck();
+    seed_antigravity(
+        &fixture,
+        Some(&format!(
+            r#"{{"user-hook":{AGY_USER_HOOK},"dot-agent-deck":{{"enabled":false}}}}"#
+        )),
+    );
+    let first = installed_antigravity(&fixture, &scratch);
+    assert_eq!(
+        first.as_object().unwrap().len(),
+        2,
+        "one named deck hook alongside the user hook: {first}"
+    );
+    let ours = &first["dot-agent-deck"];
+    assert_eq!(
+        ours["enabled"], false,
+        "never re-enable a user-disabled hook"
+    );
+    let mut commands = Vec::new();
+    commands_in(ours, &mut commands);
+    assert_eq!(commands.len(), 5, "exactly five event handlers: {ours}");
+    for event in ["SessionStart", "PreInvocation", "Stop"] {
+        assert_eq!(
+            ours[event].as_array().unwrap().len(),
+            1,
+            "flat {event}: {ours}"
+        );
+        assert_eq!(ours[event][0]["type"], "command");
+        assert!(
+            ours[event][0]["command"]
+                .as_str()
+                .unwrap()
+                .ends_with(" hook --agent antigravity")
+        );
+    }
+    for event in ["PreToolUse", "PostToolUse"] {
+        assert_eq!(ours[event].as_array().unwrap().len(), 1);
+        assert_eq!(ours[event][0]["matcher"], "*");
+        assert_eq!(ours[event][0]["hooks"].as_array().unwrap().len(), 1);
+        assert_eq!(ours[event][0]["hooks"][0]["type"], "command");
+    }
+    let path = antigravity_hooks(&fixture);
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .contains(AGY_USER_HOOK),
+        "install must preserve the user's raw JSON value bytes"
+    );
+    // agy's /hooks serializes the file itself: whitespace cannot identify our hook.
+    std::fs::write(&path, serde_json::to_string_pretty(&first).unwrap()).unwrap();
+    let rewritten_user = std::fs::read_to_string(&path)
+        .unwrap()
+        .split_once("\"user-hook\": ")
+        .unwrap()
+        .1
+        .trim_end()
+        .strip_suffix('}')
+        .unwrap()
+        .trim_end()
+        .to_owned();
+    assert_eq!(
+        installed_antigravity(&fixture, &scratch),
+        first,
+        "reinstall is structurally idempotent after /hooks rewrites"
+    );
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .contains(&rewritten_user)
+    );
+    let out = fixture.run(&scratch, &["hooks", "uninstall", "--agent", "antigravity"]);
+    assert!(out.status.success(), "uninstall: {}", combined(&out));
+    let remaining: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+        remaining,
+        serde_json::json!({"user-hook":first["user-hook"]})
+    );
+    assert!(
+        std::fs::read_to_string(path)
+            .unwrap()
+            .contains(&rewritten_user),
+        "uninstall preserves user bytes too"
+    );
+}
+
+/// Scenario: Ask the installer to update a malformed Antigravity hooks file. It reports an error, leaves the original bytes in place and saves a byte-identical backup beside it.
+#[spec("hooks/install/029")]
+#[test]
+fn install_029_antigravity_malformed_json_is_backed_up_and_left_untouched() {
+    let fixture = Fixture::new();
+    let scratch = fixture.scratch_deck();
+    let invalid = b"{\n  \"user-hook\": [broken json\n";
+    seed_antigravity(&fixture, Some(std::str::from_utf8(invalid).unwrap()));
+    let out = fixture.run(&scratch, &["hooks", "install", "--agent", "antigravity"]);
+    assert!(
+        !out.status.success(),
+        "invalid JSON must be reported as an install failure"
+    );
+    let path = antigravity_hooks(&fixture);
+    assert_eq!(std::fs::read(&path).unwrap(), invalid);
+    let backups: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p != &path)
+        .collect();
+    assert!(
+        backups
+            .iter()
+            .any(|p| std::fs::read(p).is_ok_and(|b| b == invalid)),
+        "malformed hooks must have a byte-identical backup; output: {}; sibling files: {backups:?}",
+        combined(&out)
+    );
+}
+
+/// Scenario: Install from a path containing spaces and a quote, then execute each written handler through sh in the global hooks directory with no deck pane environment. Shared App and IDE hooks exit successfully with an empty response, or allow for PreToolUse, and create no daemon or inbox state.
+#[spec("hooks/install/030")]
+#[test]
+fn install_030_antigravity_shell_quoted_hooks_do_nothing_outside_a_deck_pane() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let fixture = Fixture::new();
+    let deck = fixture.path().join("Agent's Deck/bin/dot-agent-deck");
+    fixture.copy_deck_to(&deck);
+    seed_antigravity(&fixture, None);
+    let doc = installed_antigravity(&fixture, &deck);
+    for event in [
+        "SessionStart",
+        "PreInvocation",
+        "PreToolUse",
+        "PostToolUse",
+        "Stop",
+    ] {
+        let handler = if event.ends_with("ToolUse") {
+            &doc["dot-agent-deck"][event][0]["hooks"][0]
+        } else {
+            &doc["dot-agent-deck"][event][0]
+        };
+        let command = handler["command"].as_str().unwrap();
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", command])
+            .env_clear()
+            .env("HOME", fixture.home())
+            .env("PATH", "/usr/bin:/bin")
+            .current_dir(antigravity_hooks(&fixture).parent().unwrap())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let payload = serde_json::json!({"hookEventName":event,"conversationId":"app-outside-deck","cwd":fixture.path(),"workspacePaths":[fixture.path()],"invocationNum":0,"executionNum":0,"terminationReason":"NO_TOOL_CALL","toolCall":{"name":"run_command","args":{"CommandLine":"true"}}});
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.to_string().as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "shared {event} hook must exit 0 outside a pane: {}",
+            combined(&out)
+        );
+        let response: serde_json::Value = serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|_| panic!("{event} hook must return JSON: {}", combined(&out)));
+        assert_eq!(
+            response,
+            if event == "PreToolUse" {
+                serde_json::json!({"decision":"allow"})
+            } else {
+                serde_json::json!({})
+            }
+        );
+    }
+    assert!(
+        !fixture.path().join(".dot-agent-deck").exists(),
+        "outside-deck hooks must not start a daemon or create project inbox state"
+    );
+}
+
+/// Scenario: Start the deck daemon in an empty HOME, first without agy and then with an executable agy on PATH. Its automatic hook installer skips the absent agent and installs the detected agent's named global hook even without a pre-existing Gemini folder.
+#[spec("hooks/install/031")]
+#[test]
+fn install_031_antigravity_startup_uses_the_agy_path_guard() {
+    let fixture = Fixture::new();
+    let scratch = fixture.scratch_deck();
+    fixture.automatic_install(&scratch, &fixture.path().join("emptybin"));
+    assert!(!antigravity_hooks(&fixture).exists());
+    seed_antigravity(&fixture, None);
+    let log = fixture.automatic_install(&scratch, &fixture.path().join("emptybin"));
+    let body = std::fs::read_to_string(antigravity_hooks(&fixture)).unwrap_or_else(|e| {
+        panic!("startup must detect agy on PATH and create its global hooks: {e}; {log}")
+    });
+    let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        doc["dot-agent-deck"].is_object(),
+        "named hook missing: {doc}"
+    );
+    assert!(
+        doc["dot-agent-deck"].get("enabled").is_none(),
+        "fresh install leaves enabled to agy's default"
+    );
+}
+
 /// An isolated `HOME` plus a deck binary living somewhere that is neither the
 /// canonical `~/.local/bin` install target nor on the child's `PATH`.
 struct Fixture {

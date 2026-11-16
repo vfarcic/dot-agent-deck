@@ -3695,6 +3695,30 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** the 1.x TUI half (`dot-agent-deck-tui.js` and its `tui.json` entry), covered by the unit tests `opencode_every_layout_installs_the_same_files` and `opencode_alternating_generations_rewrite_nothing`; a machine with no global root, where 1.x keeps the legacy fan-out until the next install (unit-tested in `opencode_a_legacy_only_machine_converges_on_the_global_root`); a real OpenCode 1.x.
 - **Platform coverage:** mac+linux.
 
+##### hooks/install/028 — Antigravity hook installation preserves user content and disabled state through reinstall and uninstall.
+- **Layer:** fast-tier CLI subprocess against isolated HOME (`tests/scratch_binary_hook_install.rs`), mac+linux, as hooks/install/007.
+- **Agent:** offline `agy` PATH stub; no credentials.
+- **Asserts:** exactly one named deck key in `~/.gemini/config/hooks.json`, five measured event arrays with wildcard tool matchers, raw user value bytes and `enabled:false` preserved, structurally idempotent reinstall after an agent rewrite, uninstall removes just the deck key.
+- **Does not assert:** real agent invocation (antigravity/live/001–002).
+
+##### hooks/install/029 — Malformed Antigravity hook JSON is backed up and left untouched.
+- **Layer:** fast-tier CLI subprocess against isolated HOME (`tests/scratch_binary_hook_install.rs`), mac+linux.
+- **Agent:** offline `agy` PATH stub.
+- **Asserts:** install errors, original bytes remain, a byte-identical backup exists beside hooks.json.
+- **Does not assert:** unreadable files or disk exhaustion.
+
+##### hooks/install/030 — Shell-quoted Antigravity hooks safely run outside a deck pane.
+- **Layer:** fast-tier CLI subprocess plus sh execution in the global config directory (`tests/scratch_binary_hook_install.rs`), mac+linux.
+- **Agent:** offline `agy` PATH stub and real hook CLI.
+- **Asserts:** a deck path containing spaces and a quote runs through sh for each of the five installed handlers, with exit 0 and `{}` or PreToolUse's allow response when no pane env exists; no project daemon/inbox state appears.
+- **Does not assert:** hook delivery inside a deck pane (antigravity/inbox/*).
+
+##### hooks/install/031 — Automatic startup detects Antigravity through agy on PATH.
+- **Layer:** fast-tier daemon subprocess against isolated HOME (`tests/scratch_binary_hook_install.rs`), mac+linux, as hooks/install/015.
+- **Agent:** offline `agy` PATH stub, absent then present.
+- **Asserts:** absent agy writes no Gemini hook file; detected agy receives a named global hook without a pre-existing Gemini folder; a fresh key leaves enabled unspecified.
+- **Does not assert:** startup TUI notices or a real agy invocation.
+
 ##### hooks/install/027 — Switching OpenCode between 1.x and 2.x rewrites no plugin file, and `--standalone` follows the version (PRD #2050).
 - **Layer:** as `hooks/install/025`, three scheduled tasks fired in turn.
 - **Agent:** the same stand-in, replaced by a new file between spawns (1.x, then 2.x, then 1.x), as an installer replaces the binary, so a version cache keyed on the file sees each change.
@@ -7886,6 +7910,20 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Does not assert:** exact model phrasing or token usage.
 - **Platform coverage:** mac+linux (real-agent tier is local-only).
 - **Cost note:** one minimal mini-model availability probe plus one short interactive directory-listing/file-write turn.
+
+#### antigravity/live
+
+##### antigravity/live/001 — A real attached Antigravity writes a sentinel with visible Working and Idle status.
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_antigravity_live.rs`), mac+linux; developer credentials required.
+- **Agent:** real interactive `agy`, default `gemini-3.8-flash-low`, overridable with `DOT_AGENT_DECK_ANTIGRAVITY_TEST_MODEL`; availability probes that same model.
+- **Asserts:** isolated token copy (mode 600) or `GEMINI_API_KEY`, seeded onboarding and workspace trust reach the real composer; a prompt typed through the attached TUI creates a unique sentinel with the requested content and the Antigravity card shows its submitted prompt and goes Working then Idle.
+- **Does not assert:** the installer (hooks/install/028–031), permissions, quota exhaustion or real subagents.
+
+##### antigravity/live/002 — A real Antigravity worker receives a delegated task and reports completion.
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_antigravity_live.rs`), mac+linux; developer credentials required.
+- **Agent:** real interactive `agy` worker on the same cheap model as 001; synthetic orchestration start role runs the real inbox CLI.
+- **Asserts:** delegation before the worker's first prompt reaches real Antigravity through the production wake/delivery path, creates a unique sentinel, and a real worker-run `work-done --task-id` reaches the orchestrator as a framed untrusted report with the task id.
+- **Does not assert:** a real orchestrator model or multi-worker scheduling.
 
 #### antigravity/inbox
 

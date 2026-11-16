@@ -4747,6 +4747,11 @@ pub fn install_credential_redaction() {
         if let Some(key) = openai_api_key() {
             ambient.push(key);
         }
+        if let Ok(key) = std::env::var("GEMINI_API_KEY")
+            && !key.trim().is_empty()
+        {
+            ambient.push(key);
+        }
         {
             let mut store = lock_diagnostic_redactions();
             store.append(&mut ambient);
@@ -6232,12 +6237,14 @@ pub const OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
 /// because a live test's credential has to reach the process that needs it, and
 /// the deck lazy-spawns the daemon that spawns the agent. The reasoning for each
 /// entry is at the use site.
-pub(crate) const INHERIT_PASS: [&str; 2] = ["PATH", ANTHROPIC_API_KEY_ENV];
+pub(crate) const INHERIT_PASS: [&str; 3] = ["PATH", ANTHROPIC_API_KEY_ENV, "GEMINI_API_KEY"];
 
 /// The agent credential variables [`TuiDeckBuilder::without_agent_credentials`]
-/// keeps out of a deck's environment: the one [`INHERIT_PASS`] carries across
-/// `env_clear`, and the OpenAI key a `with_env` could add back.
-pub const AGENT_CREDENTIAL_ENV: [&str; 2] = [ANTHROPIC_API_KEY_ENV, OPENAI_API_KEY_ENV];
+/// keeps out of a deck's environment: the Anthropic and Gemini keys
+/// [`INHERIT_PASS`] carries across `env_clear`, and the OpenAI key a
+/// `with_env` could add back.
+pub const AGENT_CREDENTIAL_ENV: [&str; 3] =
+    [ANTHROPIC_API_KEY_ENV, OPENAI_API_KEY_ENV, "GEMINI_API_KEY"];
 
 /// The ambient OpenAI API key, or `None` when unset, empty or whitespace-only.
 /// Same trim rule and same secret discipline as [`anthropic_api_key`]: returned
