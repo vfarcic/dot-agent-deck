@@ -23,7 +23,7 @@ The review is titled **Review project commands** and shows:
 - **Orchestration:** its name.
 - **State:** `not approved before`, or `changed since you approved it`.
 - For each role: its name, then `command`, `agent` (when the role sets one), `start` (`true` on the role the orchestration starts with), `clear` (`true` when the role's agent is restarted before each task, `false` when it keeps running between tasks), `description` and `prompt` (the role's `prompt_template`), in full. A role whose text changed since your approval is marked `changed`, and one your approval did not have is marked `new`.
-- **Deck:** in the desktop app, the deck the orchestration would start on. The approval is recorded on that deck and the orchestration starts there. If you switch to another deck while the review is open, the review closes and nothing starts. If you switch before pressing **Approve and start**, nothing is approved either. If you switch after pressing it, the approval may already be recorded on the deck you started from, and the app tells you the `dot-agent-deck trust revoke` command to run on that deck's host to undo it.
+- **Daemon:** in the desktop app, the daemon the orchestration would start on. The approval is recorded on that daemon and the orchestration starts there. If you switch to another daemon while the review is open, the review closes and nothing starts. If you switch before pressing **Approve and start**, nothing is approved either. If you switch after pressing it, the approval may already be recorded on the daemon you started from, and the app tells you the `dot-agent-deck trust revoke` command to run on that daemon's host to undo it.
 - **Removed since you approved it:** the roles your approval had that the file no longer defines.
 
 **TUI:**
@@ -32,7 +32,7 @@ The review is titled **Review project commands** and shows:
 
 **Desktop:**
 
-![The desktop app's Review project commands dialog over the agent dashboard, showing the same review: Deck: Local daemon, the project /home/dev/demo-project, orchestration team, State changed since you approved it, the orchestrator, coder (changed) and tester (new) roles with their command, start, clear, description and prompt, Removed since you approved it: reviewer, and the Cancel and Approve and start buttons](/img/project-trust-desktop.png)
+![The desktop app's Review project commands dialog over the agent dashboard, showing the same review: Daemon: Local daemon, the project /home/dev/demo-project, orchestration team, State changed since you approved it, the orchestrator, coder (changed) and tester (new) roles with their command, start, clear, description and prompt, Removed since you approved it: reviewer, and the Cancel and Approve and start buttons](/img/project-trust-desktop.png)
 
 Read the commands and prompts as what they are: commands that will run as you, and instructions your agents will follow. Characters that could hide or disguise text, such as terminal control sequences, are shown as escapes (for example `\u{1b}`) rather than obeyed, in both clients, on the command line and in the refusal messages described below.
 
@@ -82,7 +82,7 @@ If the orchestration is not approved as its file now reads, the attempt is refus
 The deck shows the same **Review project commands** review, led by a sentence saying the deck refused to start the orchestration and an **Asked by:** line naming what tried to start it, such as `dispatch`, `delegate`, `pane restart` or `scheduled task 'nightly'`. It waits while another dialog is open, and for a moment after it appears it ignores keys (in the TUI, until you pause typing), so typing you were in the middle of cannot answer it.
 
 - **TUI:** the review opens over the dashboard or the pane you are typing in, with the footer `a approve · Esc deny · ↑↓ scroll`. `a` (or a click on `a approve`) approves exactly the text shown, and the status line says `Approved orchestration 'team'. It starts when dispatch tries again.`. `Esc` (or a click on `Esc deny`) declines it. You return to where you were.
-- **Desktop app:** the dialog names the deck that asked (**Deck:**) and offers **Deny** and **Approve**. With **All decks** selected it shows the requests of every deck the app watches; with one deck selected, that deck's. With [voice control](desktop/voice.md#approving-project-commands) on, "approve" approves, and "cancel" or "close" denies.
+- **Desktop app:** the dialog names the daemon that asked (**Daemon:**) and offers **Deny** and **Approve**. With **All daemons** selected it shows the requests of every daemon the app watches; with one daemon selected, that daemon's. With [voice control](desktop/voice.md#approving-project-commands) on, "approve" approves, and "cancel" or "close" denies.
 
 Approving records the approval exactly as the New Agent form and `trust approve` do. It starts nothing itself: the attempt that was refused starts when it is tried again. An agent that ran `dispatch` or `delegate` is told to retry once you approve; a schedule runs at its next fire, or now with `dot-agent-deck schedule run-now --name <name>`.
 

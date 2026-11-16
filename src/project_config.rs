@@ -121,9 +121,10 @@ pub struct ProjectConfig {
     ///
     /// * `0` — **detector disabled**. No idle watch is armed for this
     ///   orchestration's delegations, so a silent worker is never reported and
-    ///   no timer is created. `0` does NOT mean "report immediately": that
-    ///   raced the worker's own dispatch and reported every worker as stuck
-    ///   before it had a chance to answer.
+    ///   no timer is created. Other reports about a delegation, such as issue
+    ///   #714's blocked-worker notice, are unaffected (issue #2230). `0` does
+    ///   NOT mean "report immediately": that raced the worker's own dispatch
+    ///   and reported every worker as stuck before it had a chance to answer.
     /// * `1` ..=
     ///   [`MAX_WORKER_RESPONSE_TIMEOUT_MINUTES`](crate::state::MAX_WORKER_RESPONSE_TIMEOUT_MINUTES)
     ///   (7 days) — honored as written.

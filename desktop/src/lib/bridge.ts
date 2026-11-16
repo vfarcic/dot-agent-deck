@@ -3542,7 +3542,7 @@ class FixtureDeckBridge implements DeckBridge {
    */
   async renameDeck(): Promise<DesktopSettingsDto> {
     await Promise.resolve();
-    throw new Error("Browser preview — it has no deck list, so a daemon cannot be renamed here.");
+    throw new Error("Browser preview — it has no list of daemons, so a daemon cannot be renamed here.");
   }
 
   /** The preview has no deck list to derive against, so it suggests nothing. */
@@ -5514,7 +5514,7 @@ export class TauriDeckBridge implements DeckBridge {
     try {
       raw = await invoke<DesktopSettingsDto>("desktop_rename_deck", { deck, name });
     } catch (cause) {
-      // The deck changed since this window loaded it: nothing was renamed, and
+      // The daemon changed since this window loaded it: nothing was renamed, and
       // the crate hands back the list as it is so the window can show it.
       const partial = partialSettingsSave(cause);
       if (!partial) throw cause;

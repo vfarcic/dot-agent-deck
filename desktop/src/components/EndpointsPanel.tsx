@@ -450,7 +450,7 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
             <>
               <TextRow
                 id={`deck-name-${selected.id}`}
-                label="Deck name"
+                label="Daemon name"
                 value={renameValue}
                 placeholder={endpointAddress(selected)}
                 problem={nameRefusal}

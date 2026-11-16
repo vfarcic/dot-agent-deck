@@ -922,7 +922,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       spawnedAtMs: paneShownAgent.spawnedAtMs,
       inputBlocked: paneInput.readOnly
         ? (paneInput.notice ?? "its terminal cannot take input.")
-        : (!paneDeckAttachable || heldPaneAgent ? "its deck is not answering." : undefined),
+        : (!paneDeckAttachable || heldPaneAgent ? "its daemon is not answering." : undefined),
       /* The pull request browser is drawn over the pane, so its prompt is
          not on screen either (PRD #1401). */
       terminalHidden: paneTab !== "terminal" || prBrowser !== undefined || undefined,
@@ -3005,7 +3005,7 @@ function ShellSettings({ runtime, settings, open, onClose, addDaemonOpen = false
     if (!runtimeRename) return undefined;
     return (id: string, name: string) => {
       const deck = shownDocument.current.endpoints?.remote.find((row) => row.id === id);
-      if (!deck) return Promise.reject(new Error("That deck is no longer in the deck list."));
+      if (!deck) return Promise.reject(new Error("That daemon is no longer listed."));
       return apply ? apply(() => runtimeRename(deck, name)) : runtimeRename(deck, name);
     };
   }, [runtimeRename, apply]);

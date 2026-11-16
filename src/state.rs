@@ -2822,7 +2822,9 @@ pub const MAX_WORKER_RESPONSE_TIMEOUT_MS: u64 = MAX_WORKER_RESPONSE_TIMEOUT_MINU
 /// PRD #126 M1 audit (finding 4) — bounds, for BOTH sources:
 ///
 /// * **`0` means "detector disabled"**, explicitly and for either source. The
-///   caller arms nothing, so a disabled detector costs no record and no task.
+///   caller spawns no idle watch, so a disabled detector costs no task; the
+///   delegation's record is still armed, for issue #714's blocked-worker notice
+///   (issue #2230).
 ///   It used to mean "fire immediately", which raced the worker's own dispatch
 ///   and reported every worker as stuck before it could answer.
 /// * A non-zero value outside
@@ -4087,10 +4089,8 @@ fn retire_undelivered_idle_worker_record(
 /// PRD #126: take the resolved timeout, capture the orchestrator's identity, arm the
 /// registry record and spawn its watch — the whole "this worker now owes a
 /// work-done" step of one delegate target. Split out of `handle_delegate` so the
-/// three ways it legitimately does nothing stay legible:
+/// two ways it legitimately arms nothing stay legible:
 ///
-/// * **the detector is disabled** (`0` from either source, PRD #126 M1 audit
-///   finding 4) — no record, no task, nothing to cancel later;
 /// * **the orchestrator has no live registry agent** — there is then no identity
 ///   to bind delivery to, and a later prompt could only be routed by pane-id
 ///   string, which is exactly the cross-orchestration mis-delivery audit finding
@@ -4105,8 +4105,18 @@ fn retire_undelivered_idle_worker_record(
 /// which PRD #140's routing identity does not carry (see
 /// [`AppState::orchestration_cwd_of`]).
 ///
+/// **A disabled detector (`0` from either source, PRD #126 M1 audit finding 4)
+/// still arms the record; it only spawns no watch** (issue #2230). The record is
+/// the delegation's bookkeeping, not just the timer's: issue #714's
+/// blocked-worker notice is claimed from it
+/// ([`AgentPtyRegistry::spawn_worker_blocked_notice`]), and that report has no
+/// setting of its own, so turning the idle-worker report off must not silence it.
+/// With no watch, nothing ever reports the delegation as idle; the record goes
+/// the way every record goes — retired by its task's `work-done`, superseded by
+/// the next delegate, or swept when either pane closes or exits.
+///
 /// Returns the armed record's generation (`Some(seq)`) when a
-/// watch was armed, `None` on any of the three no-op paths above. The caller
+/// record was armed, `None` on either no-op path above. The caller
 /// threads this into `dispatch_one_owned`, which uses it to bind the eventual
 /// worker agent id onto this same record once that identity resolves — see
 /// [`AgentPtyRegistry::bind_delegation_worker_agent_id`].
@@ -4118,14 +4128,6 @@ fn arm_idle_worker_watch_for_delegation(
     orchestration: Option<&OrchestrationIdentity>,
     timeout: Option<std::time::Duration>,
 ) -> Option<u64> {
-    let Some(timeout) = timeout else {
-        tracing::debug!(
-            pane_id = %worker_pane_id,
-            role = %role,
-            "idle-worker detector disabled; no watch armed for this delegation"
-        );
-        return None;
-    };
     let Some(orchestrator_agent_id) = registry.pane_current_agent_id(orchestrator_pane_id) else {
         warn!(
             pane_id = %orchestrator_pane_id,
@@ -4156,12 +4158,19 @@ fn arm_idle_worker_watch_for_delegation(
     // so the watch never sees the delegation as "written with no wait"; the
     // `PointerQueueClock` the caller builds next ends the mark on every path.
     registry.queue_delegation_pointer_write(worker_pane_id, seq);
-    arm_idle_worker_watch(
-        Arc::clone(registry),
-        worker_pane_id.to_string(),
-        armed,
-        timeout,
-    );
+    match timeout {
+        Some(timeout) => arm_idle_worker_watch(
+            Arc::clone(registry),
+            worker_pane_id.to_string(),
+            armed,
+            timeout,
+        ),
+        None => tracing::debug!(
+            pane_id = %worker_pane_id,
+            role = %role,
+            "idle-worker detector disabled; delegation recorded without an idle watch"
+        ),
+    }
     Some(seq)
 }
 
@@ -11907,9 +11916,11 @@ impl AppState {
             // worker, not one aggregated report per delegate.
             //
             // The timeout is resolved HERE rather than inside the watch task so
-            // a disabled detector (`0`, PRD #126 M1 audit finding 4) arms no
-            // record and spawns no task at all, and so the orchestrator's
-            // registry identity is captured while the delegate is still live.
+            // a disabled detector (`0`, PRD #126 M1 audit finding 4) spawns no
+            // task at all, and so the orchestrator's registry identity is
+            // captured while the delegate is still live. The record itself is
+            // armed either way: issue #714's blocked-worker notice is claimed
+            // from it (issue #2230).
             //
             // Issue #448: which is exactly why the commission ledger was armed
             // separately, above — "the detector is off" and "nobody delegated"

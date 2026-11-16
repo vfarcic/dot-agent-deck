@@ -391,7 +391,7 @@ describe("useDesktopSettings save outcomes and rename refusal", () => {
       ...DEFAULT_DESKTOP_SETTINGS,
       endpoints: { remote: [{ id: "deck0000000000aa", host: "other-host", port: 22, name: "other" }], selection: "local" },
     };
-    const refusal = new PartialSettingsSaveError("That deck changed since this window loaded it.", disk);
+    const refusal = new PartialSettingsSaveError("That daemon changed since this window loaded it.", disk);
     let pending!: Promise<DesktopSettingsDto>;
     act(() => { pending = result.current.apply!(() => Promise.reject(refusal)); });
 

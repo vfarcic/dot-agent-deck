@@ -48,13 +48,13 @@ export const REVIEW_CHANGED = "Nothing was approved: the project commands on scr
 /** What voice's approve answers when something is drawn over the review. */
 export const REVIEW_COVERED = "Nothing was approved: something is open over the project commands review.";
 /** Shown in the dialog while an approval is on its way to the deck. */
-export const APPROVAL_IN_FLIGHT_NOTE = "The approval has been sent to the deck. Cancel now and nothing starts, but the deck may still record the approval.";
+export const APPROVAL_IN_FLIGHT_NOTE = "The approval has been sent to the daemon. Cancel now and nothing starts, but the daemon may still record the approval.";
 /**
  * Said when the Runs screen's review closes because the selected deck changed
  * under it before Approve and start was pressed. Once it was pressed the
  * approval may already be on the deck: `reviewDeckChangedNotice` says that.
  */
-export const REVIEW_DECK_CHANGED = "The project commands review was closed because the selected deck changed. Nothing was approved or started.";
+export const REVIEW_DECK_CHANGED = "The project commands review was closed because the selected daemon changed. Nothing was approved or started.";
 
 /**
  * Issue #2330 — a review the deck ASKED for: it refused to start an
@@ -96,7 +96,7 @@ export function requestAnsweredElsewhereNotice(orchestration: string): string {
 }
 
 /** The deck a review is for, as the dialog labels it. */
-export const DECK_LABEL = "Deck";
+export const DECK_LABEL = "Daemon";
 /** A role's `start` flag, in the TUI prompt's words (`src/trust_prompt.rs`). */
 export const START_LABEL = "start";
 export const START_TRUE = "true — the orchestration starts with this role";
@@ -240,10 +240,10 @@ export function reviewToken(review: Pick<ShownReview, "id" | "view">): string {
  */
 export function reviewDeckChangedNotice(review: Pick<ShownReview, "busy" | "deckName"> & { view: Pick<ProjectTrustView, "project" | "orchestration"> }): { message: string; detail?: string } {
   if (!review.busy) return { message: REVIEW_DECK_CHANGED };
-  const deck = review.deckName === undefined ? "the deck it was sent to" : `deck ${review.deckName}`;
+  const deck = review.deckName === undefined ? "the daemon it was sent to" : `daemon ${review.deckName}`;
   return {
-    message: `The project commands review was closed because the selected deck changed. Nothing was started, but the approval already sent may still be recorded on ${deck}`,
-    detail: `to undo it, run dot-agent-deck trust revoke ${review.view.project} --orchestration ${review.view.orchestration} on that deck's host`,
+    message: `The project commands review was closed because the selected daemon changed. Nothing was started, but the approval already sent may still be recorded on ${deck}`,
+    detail: `to undo it, run dot-agent-deck trust revoke ${review.view.project} --orchestration ${review.view.orchestration} on that daemon's host`,
   };
 }
 

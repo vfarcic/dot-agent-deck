@@ -294,7 +294,7 @@ pub(crate) async fn desktop_approve_project_trust(
 /// The refusal for a deck that raises no in-deck approval requests: it is
 /// older than this app, so it never asked, and there is nothing to decline.
 const NO_TRUST_REQUESTS: &str =
-    "This deck's daemon raises no approval requests, so there is nothing to decline.";
+    "This daemon raises no approval requests, so there is nothing to decline.";
 
 /// [`desktop_deny_trust_request`] minus the webview.
 pub(crate) async fn deny_trust_request_on(
