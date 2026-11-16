@@ -6644,6 +6644,14 @@ without depending on the config struct API.
 - **Does not assert:** live delegate/work-done routing across the reattach (that is `orchestration/route/001` and the `src/state.rs` routing unit tests); PTY attach or scrollback replay of the rebuilt panes; the same-cwd spawn warning (`orchestration/guard/001`); the on-disk snapshot restore branch.
 - **Platform coverage:** linux+mac (the suite is `#![cfg(unix)]` — the mock attach servers bind Unix-domain sockets; Windows port tracked by #164).
 
+##### orchestration/route/003 — An Antigravity orchestration role receives its first delegate after OSC idle and returns its work-done report.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_antigravity_inbox.rs`), attached TUI, real daemon, PTYs, hook and work-done CLIs.
+- **Agent:** none; the shared Antigravity replay stand-in and existing routing orchestrator stand-in.
+- **Asserts:** the configured Antigravity role receives no input before idle, through the launch auth signal and a pending permission; the idle doorbell carries no task bytes, its hook displays the delegated task in the role pane, and the worker's task-scoped work-done reaches its orchestrator with Untrusted framing.
+- **Does not assert:** a model deciding to delegate or perform the work, or multi-tab isolation (route/001).
+- **Platform coverage:** mac+linux.
+
 #### orchestration/orphan
 
 ##### orchestration/orphan/001 — The daemon MARKS hook events from an orchestration role pane it holds no role for, and that mark reaches the card (issue #770).
@@ -7878,6 +7886,32 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Does not assert:** exact model phrasing or token usage.
 - **Platform coverage:** mac+linux (real-agent tier is local-only).
 - **Cost note:** one minimal mini-model availability probe plus one short interactive directory-listing/file-write turn.
+
+#### antigravity/inbox
+
+##### antigravity/inbox/001 — First-prompt doorbell uses Antigravity's nested system-message envelope and re-entry takes no second delivery.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_antigravity_inbox.rs`), real PTY, daemon and hook CLI.
+- **Agent:** none; the shared captured-hook replay stand-in `tests/fixtures/antigravity/agy`.
+- **Asserts:** an OSC-idle pane receives its first doorbell before SessionStart; PreInvocation returns exactly `injectSteps[].systemMessage.systemMessage` with framed content; invocation 1 with the same input leaves later mail queued and the original receipt committed once.
+- **Does not assert:** a real model interpreting the system message.
+- **Platform coverage:** mac+linux.
+
+##### antigravity/inbox/002 — A busy Antigravity receives pending mail at ordinary Stop using decision continue.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_antigravity_inbox.rs`), real PTY, daemon and hook CLI.
+- **Agent:** none; captured Antigravity hook replay.
+- **Asserts:** SessionStart announces turn-end wake; ordinary Stop returns exactly `decision: continue` and the framed reason, commits the delivery once, and an empty re-entered Stop injects nothing; no doorbell input during hand-over.
+- **Does not assert:** Antigravity's own ten-continuation limit or a real model.
+- **Platform coverage:** mac+linux.
+
+##### antigravity/inbox/003 — Error Stop retains mail for the next ordinary Stop.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_antigravity_inbox.rs`), real PTY, daemon and hook CLI.
+- **Agent:** none; captured Antigravity hook replay.
+- **Asserts:** ERROR prints no hand-over and leaves the task queued; a subsequent NO_TOOL_CALL Stop returns continue with that same framed task and commits its receipt once.
+- **Does not assert:** network error recovery by a real model.
+- **Platform coverage:** mac+linux.
 
 #### antigravity/status
 
@@ -11420,6 +11454,7 @@ S-21 re-oracles the attached draft/no-cap and empty-navigation functions in `tes
 - **Platform coverage:** mac+linux.
 
 ##### inbox/doorbell/053 — The activation table decides each agent from its facts, rule by rule, and every recorded release conforms to its agent's facts.
+- **Antigravity:** the shipped table includes Antigravity, and measured release 1.5.9 is Go through both the activation table and the generation verdict (`doorbell_053_antigravity_measured_release_admits_a_doorbell`).
 - **Gate removal (gaterm):** until PRD #1666 part 3's `gaterm` unit the table decided each release from a record of its own and held every release without one as `unmeasured_release` (SC-00). The deck now types into every release of Claude Code and Codex on that agent's facts; the per-release records are conformance inputs (`RECORDED_RELEASES`). The edited assertions are listed in that unit's report; `docs/develop/doorbell-admission.md` says what an unrecorded release is trusted on.
 - **Layer:** Fast (`tests/doorbell_activation_table.rs`, `tests/editor_probe_permission.rs`), pure (`src/doorbell_activation.rs`, `src/composer_probe/mod.rs`).
 - **Agent:** none.

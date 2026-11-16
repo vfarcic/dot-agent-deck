@@ -7,20 +7,44 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+import select
+import tty
+import termios
+import re
 
 
+if "--version" in sys.argv:
+    print("Antigravity CLI 1.5.9")
+    sys.exit(0)
 root = Path.cwd()
 sequences = json.loads((root / "osc7501-sequences.json").read_text())["sequences"]
 (root / "replay-ready").touch()
+tty.setraw(0, termios.TCSANOW)
+(root / "replay-pid").write_text(str(os.getpid()))
+capture = (root / "input.bytes").open("ab", buffering=0)
+line = bytearray()
+state = "booting"
+
+
+def redraw():
+    width = os.get_terminal_size(0).columns
+    content = line.decode(errors="replace") if line else "Auto mode: edits & safe commands auto-approved (shift+tab to cycle)"
+    sys.stdout.write("\033[2J\033[HAntigravity CLI 1.5.9\r\nGemini 3.8 Flash (Low)\r\n"
+                     + ((root / "delivered.txt").read_text().replace("\n", "\r\n") + "\r\n" if (root / "delivered.txt").exists() else "")
+                     + "─" * width + "\r\n> " + content + "\r\n"
+                     + "─" * width + "\r\n? for shortcuts\r\n")
+    sys.stdout.flush()
 
 
 def replay(action):
+    global state
     if "hook" in action:
         payload = json.loads((root / action["hook"]).read_text())
         # The capture's workspace is sanitized; retain its measured event shape
         # but point it at this test's real isolated workspace.
         payload["cwd"] = str(root)
         payload["workspacePaths"] = [str(root)]
+        payload.update(action.get("payload", {}))
         agent = action.get("agent", "antigravity")
         if agent == "claude-code":
             payload = {
@@ -35,7 +59,15 @@ def replay(action):
             input=json.dumps(payload), text=True, capture_output=True, check=False,
         )
         with (root / "hook-replay.log").open("a") as log:
-            log.write(f'{action["hook"]}: exit={result.returncode}\n{result.stderr}\n')
+            log.write(f'{action["hook"]}: exit={result.returncode}\n{result.stdout}\n{result.stderr}\n')
+        if "tag" in action:
+            result_path = root / (action["tag"] + ".json")
+            temporary = result_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps({
+                "code": result.returncode, "stdout": result.stdout, "stderr": result.stderr,
+            }))
+            temporary.replace(result_path)
+        return result.stdout
     elif "osc" in action:
         sequence = next(
             item for item in sequences
@@ -45,14 +77,64 @@ def replay(action):
         )
         sys.stdout.write(sequence["bytes"])
         sys.stdout.flush()
+        state = action["osc"]
+        with (root / "osc-history.jsonl").open("a") as history:
+            history.write(json.dumps(action) + "\n")
     elif "pause_ms" in action:
         time.sleep(action["pause_ms"] / 1000)
     else:
         raise ValueError(action)
 
 
+def submitted(value):
+    if not re.match(r"^\([a-z]{6}\) dot-agent-deck: message ", value):
+        return
+    with (root / "submitted.jsonl").open("a") as log:
+        log.write(json.dumps({"line": value, "state": state}) + "\n")
+    replay({"hook": "session-start.json"})
+    stdout = replay({"hook": "pre-invocation.json", "payload": {"lastUserInput": value}, "tag": "doorbell-answer"})
+    try:
+        blocks = json.loads(stdout)["injectSteps"][0]["systemMessage"]["systemMessage"]
+    except (ValueError, KeyError, IndexError, TypeError):
+        return
+    (root / "delivered.txt").write_text(blocks)
+    sys.stdout.write("\r\n" + blocks.replace("\n", "\r\n") + "\r\n")
+    sys.stdout.flush()
+    if (root / "complete-delegate").exists():
+        task = re.search(r"\[dot-agent-deck message (m-[^ ]+) delivery ", blocks)
+        if task:
+            result = subprocess.run([
+                os.environ["AGY_TEST_DECK_BIN"], "work-done", "--task-id", task[1],
+                "--task", "AGY-ROLE-REPORT-e871: delegated work complete",
+            ], text=True, capture_output=True, check=False)
+            (root / "completion.json").write_text(json.dumps({
+                "code": result.returncode, "stdout": result.stdout, "stderr": result.stderr,
+            }))
+
+
+redraw()
 step = 0
 while True:
+    if select.select([0], [], [], 0.01)[0]:
+        chunk = os.read(0, 4096)
+        if not chunk:
+            break
+        capture.write(chunk)
+        with (root / "input-history.jsonl").open("a") as history:
+            history.write(json.dumps({"state": state, "bytes": list(chunk)}) + "\n")
+        for c in chunk:
+            if c == 13:
+                value = line.decode(errors="replace")
+                line.clear()
+                submitted(value)
+            elif c == 21:
+                line.clear()
+            elif c in (8, 127):
+                if line:
+                    line.pop()
+            elif c >= 32:
+                line.append(c)
+        redraw()
     request = root / f"request-{step}.json"
     if not request.exists():
         time.sleep(0.01)
