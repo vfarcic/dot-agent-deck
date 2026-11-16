@@ -640,7 +640,7 @@ impl DeckRef<'_> {
 pub enum AddDeckError {
     #[error("A remote named '{name}' already exists.")]
     DuplicateName { name: String },
-    #[error("A daemon with id '{id}' already exists.")]
+    #[error("A remote with id '{id}' already exists.")]
     DuplicateId { id: String },
     #[error("Invalid remote name: {0}.")]
     InvalidName(#[from] DeckNameError),

@@ -232,7 +232,7 @@ The dialog ends with one of the titles in the [remote table above](#upgrade-a-re
 
 In **Settings → Daemons**, the **Daemon** row shows each remote daemon's address beside its name. To rename one, choose it, change **Daemon name**, and press **Rename**. The new name is saved to `remotes.toml`, so the CLI uses it straight away: `dot-agent-deck connect <new name>`.
 
-If the daemon was changed somewhere else since the app showed it, for example renamed with the CLI, nothing is renamed: the app says so and shows the list as it is now, and you can rename it again from there. If it was removed, for example with `dot-agent-deck remote remove`, the app says the daemon is no longer in the deck list and drops it from the list.
+If the daemon was changed somewhere else since the app showed it, for example renamed with the CLI, nothing is renamed: the app says so and shows the list as it is now, and you can rename it again from there. If it was removed, for example with `dot-agent-deck remote remove`, the app says the daemon is no longer listed and drops it from the list.
 
 ## Remove a remote daemon
 
