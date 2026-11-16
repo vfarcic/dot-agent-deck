@@ -1,12 +1,11 @@
 {
   "mcpServers": {
-    "honeycomb": {
+    "github": {
       "type": "http",
-      "url": "https://mcp.honeycomb.io/mcp"
-    },
-    "dash0": {
-      "type": "http",
-      "url": "https://api.us-west-2.aws.dash0.com/mcp"
+      "url": "https://api.githubcopilot.com/mcp/",
+      "headers": {
+        "Authorization": "Bearer ${GITHUB_TOKEN}"
+      }
     }
   }
 }
