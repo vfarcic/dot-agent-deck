@@ -193,7 +193,7 @@ describe("EndpointsPanel", () => {
     fireEvent.change(screen.getByLabelText("Host"), { target: { value: "build-box" } });
 
     await waitFor(() => expect(defaultDeckName).toHaveBeenCalledWith("build-box", undefined));
-    expect(screen.getByLabelText("Deck name")).toHaveValue("build");
+    expect(screen.getByLabelText("Daemon name")).toHaveValue("build");
     expect(onSave).not.toHaveBeenCalled();
     fireEvent.click(screen.getByTestId("save-new-deck"));
 
@@ -222,8 +222,8 @@ describe("EndpointsPanel", () => {
     fireEvent.change(screen.getByLabelText("User"), { target: { value: "deploy" } });
     fireEvent.change(screen.getByLabelText("Host"), { target: { value: "build-box" } });
     await waitFor(() => expect(defaultDeckName).toHaveBeenCalledWith("build-box", "deploy"));
-    expect(screen.getByLabelText("Deck name")).toHaveValue("deploy-build-box");
-    fireEvent.change(screen.getByLabelText("Deck name"), { target: { value: "production" } });
+    expect(screen.getByLabelText("Daemon name")).toHaveValue("deploy-build-box");
+    fireEvent.change(screen.getByLabelText("Daemon name"), { target: { value: "production" } });
     fireEvent.click(screen.getByTestId("save-new-deck"));
 
     await waitFor(() => expect(onSave).toHaveBeenCalled());
@@ -238,10 +238,10 @@ describe("EndpointsPanel", () => {
     fireEvent.click(screen.getByTestId("add-deck"));
     fireEvent.change(screen.getByLabelText("Host"), { target: { value: "build-box" } });
     await waitFor(() => expect(defaultDeckName).toHaveBeenCalledWith("build-box", undefined));
-    fireEvent.change(screen.getByLabelText("Deck name"), { target: { value: "mine" } });
+    fireEvent.change(screen.getByLabelText("Daemon name"), { target: { value: "mine" } });
 
     await act(async () => { suggestion.resolve("build-box"); });
-    expect(screen.getByLabelText("Deck name")).toHaveValue("mine");
+    expect(screen.getByLabelText("Daemon name")).toHaveValue("mine");
     expect(screen.getByTestId("save-new-deck")).toBeEnabled();
   });
 
@@ -253,20 +253,20 @@ describe("EndpointsPanel", () => {
     renderPanel({}, { defaultDeckName: vi.fn(async () => ""), checkDeckName });
     fireEvent.click(screen.getByTestId("add-deck"));
     fireEvent.change(screen.getByLabelText("Host"), { target: { value: "build-box" } });
-    fireEvent.change(screen.getByLabelText("Deck name"), { target: { value: "old" } });
+    fireEvent.change(screen.getByLabelText("Daemon name"), { target: { value: "old" } });
     await waitFor(() => expect(checkDeckName).toHaveBeenCalledWith("old", undefined));
-    fireEvent.change(screen.getByLabelText("Deck name"), { target: { value: "new" } });
+    fireEvent.change(screen.getByLabelText("Daemon name"), { target: { value: "new" } });
     await waitFor(() => expect(checkDeckName).toHaveBeenCalledWith("new", undefined));
 
-    await act(async () => { newCheck.resolve("A deck named 'new' already exists."); });
-    expect(screen.getByRole("alert")).toHaveTextContent("A deck named 'new' already exists.");
+    await act(async () => { newCheck.resolve("A daemon named 'new' already exists."); });
+    expect(screen.getByRole("alert")).toHaveTextContent("A daemon named 'new' already exists.");
     expect(screen.getByTestId("save-new-deck")).toBeDisabled();
     await act(async () => { oldCheck.resolve(null); });
-    expect(screen.getByRole("alert")).toHaveTextContent("A deck named 'new' already exists.");
+    expect(screen.getByRole("alert")).toHaveTextContent("A daemon named 'new' already exists.");
     expect(screen.getByTestId("save-new-deck")).toBeDisabled();
   });
 
-  /// Scenario: While Add this daemon re-checks the name, the Deck name field is locked, so the name saved is the one checked and on screen.
+  /// Scenario: While Add this daemon re-checks the name, the Daemon name field is locked, so the name saved is the one checked and on screen.
   it("locks the draft name while confirming, so the checked name is the one saved", async () => {
     const confirmCheck = deferred<string | null>();
     let checks = 0;
@@ -277,14 +277,14 @@ describe("EndpointsPanel", () => {
     const { onSave } = renderPanel({}, { defaultDeckName: vi.fn(async () => ""), checkDeckName });
     fireEvent.click(screen.getByTestId("add-deck"));
     fireEvent.change(screen.getByLabelText("Host"), { target: { value: "build-box" } });
-    fireEvent.change(screen.getByLabelText("Deck name"), { target: { value: "mine" } });
+    fireEvent.change(screen.getByLabelText("Daemon name"), { target: { value: "mine" } });
     await waitFor(() => expect(checkDeckName).toHaveBeenCalledWith("mine", undefined));
     await waitFor(() => expect(screen.getByTestId("save-new-deck")).toBeEnabled());
     fireEvent.click(screen.getByTestId("save-new-deck"));
     await waitFor(() => expect(checkDeckName).toHaveBeenCalledTimes(2));
 
     // The check is in flight: the name it is checking cannot be edited under it.
-    expect(screen.getByLabelText("Deck name")).toBeDisabled();
+    expect(screen.getByLabelText("Daemon name")).toBeDisabled();
     expect(screen.getByTestId("save-new-deck")).toBeDisabled();
 
     await act(async () => { confirmCheck.resolve(null); });
@@ -300,7 +300,7 @@ describe("EndpointsPanel", () => {
     const checkDeckName = vi.fn(async (name: string) => {
       if (name !== "mine") return null;
       checks += 1;
-      return checks >= 3 ? "A deck named 'mine' already exists." : null;
+      return checks >= 3 ? "A daemon named 'mine' already exists." : null;
     });
     const { onSave, update } = renderPanel({}, {
       defaultDeckName: vi.fn(async () => "build-box"), checkDeckName,
@@ -309,7 +309,7 @@ describe("EndpointsPanel", () => {
     fireEvent.click(screen.getByTestId("add-deck"));
     fireEvent.change(screen.getByLabelText("Host"), { target: { value: "build-box" } });
     fireEvent.change(screen.getByLabelText("User"), { target: { value: "deploy" } });
-    fireEvent.change(screen.getByLabelText("Deck name"), { target: { value: "mine" } });
+    fireEvent.change(screen.getByLabelText("Daemon name"), { target: { value: "mine" } });
     await waitFor(() => expect(checkDeckName).toHaveBeenCalledWith("mine", undefined));
     fireEvent.click(screen.getByTestId("save-new-deck"));
     await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
@@ -318,10 +318,10 @@ describe("EndpointsPanel", () => {
       update(disk, "The deck list changed while saving.");
       save.resolve({ saved: false, disk });
     });
-    await waitFor(() => expect(document.querySelector("p.settings-hint[role=alert]")).toHaveTextContent("A deck named 'mine' already exists."));
+    await waitFor(() => expect(document.querySelector("p.settings-hint[role=alert]")).toHaveTextContent("A daemon named 'mine' already exists."));
     expect(screen.getByLabelText("Host")).toHaveValue("build-box");
     expect(screen.getByLabelText("User")).toHaveValue("deploy");
-    expect(screen.getByLabelText("Deck name")).toHaveValue("mine");
+    expect(screen.getByLabelText("Daemon name")).toHaveValue("mine");
     expect(screen.getByTestId("save-new-deck")).toBeDisabled();
     expect(document.querySelector("p.settings-error[role=alert]")).toHaveTextContent("The deck list changed while saving.");
   });
@@ -331,7 +331,7 @@ describe("EndpointsPanel", () => {
     renderPanel({}, { defaultDeckName: vi.fn(async () => "build-box"), checkDeckName: vi.fn(async () => null) });
     fireEvent.click(screen.getByTestId("add-deck"));
     fireEvent.change(screen.getByLabelText("Host"), { target: { value: "build-box" } });
-    await waitFor(() => expect(screen.getByLabelText("Deck name")).toHaveValue("build-box"));
+    await waitFor(() => expect(screen.getByLabelText("Daemon name")).toHaveValue("build-box"));
     fireEvent.click(screen.getByTestId("save-new-deck"));
     await waitFor(() => expect(screen.queryByTestId("save-new-deck")).toBeNull());
   });
@@ -341,9 +341,9 @@ describe("EndpointsPanel", () => {
     const { onSave } = renderPanel({}, { defaultDeckName: vi.fn(async () => "build") });
     fireEvent.click(screen.getByTestId("add-deck"));
     fireEvent.change(screen.getByLabelText("Host"), { target: { value: "build-box" } });
-    await waitFor(() => expect(screen.getByLabelText("Deck name")).toHaveValue("build"));
+    await waitFor(() => expect(screen.getByLabelText("Daemon name")).toHaveValue("build"));
 
-    fireEvent.change(screen.getByLabelText("Deck name"), { target: { value: "" } });
+    fireEvent.change(screen.getByLabelText("Daemon name"), { target: { value: "" } });
     expect(screen.getByTestId("save-new-deck")).toBeEnabled();
     fireEvent.click(screen.getByTestId("save-new-deck"));
 
@@ -356,18 +356,18 @@ describe("EndpointsPanel", () => {
   /// Scenario: Invalid and already-taken names show the library's refusal and cannot be saved.
   it("blocks a new deck name when the shared name check refuses it", async () => {
     const checkDeckName = vi.fn(async (name: string) => name === "taken"
-      ? "A deck named 'taken' already exists."
-      : "Invalid deck name: a deck name must start with an ASCII letter or digit.");
+      ? "A daemon named 'taken' already exists."
+      : "Invalid daemon name: a name must start with an ASCII letter or digit.");
     const { onSave } = renderPanel({}, { defaultDeckName: vi.fn(async () => "build-box"), checkDeckName });
     fireEvent.click(screen.getByTestId("add-deck"));
     fireEvent.change(screen.getByLabelText("Host"), { target: { value: "build-box" } });
-    await waitFor(() => expect(screen.getByLabelText("Deck name")).toHaveValue("build-box"));
+    await waitFor(() => expect(screen.getByLabelText("Daemon name")).toHaveValue("build-box"));
 
     for (const [name, refusal] of [
-      ["-bad", "Invalid deck name: a deck name must start with an ASCII letter or digit."],
-      ["taken", "A deck named 'taken' already exists."],
+      ["-bad", "Invalid daemon name: a name must start with an ASCII letter or digit."],
+      ["taken", "A daemon named 'taken' already exists."],
     ]) {
-      fireEvent.change(screen.getByLabelText("Deck name"), { target: { value: name } });
+      fireEvent.change(screen.getByLabelText("Daemon name"), { target: { value: name } });
       await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(refusal));
       expect(screen.getByTestId("save-new-deck")).toBeDisabled();
       expect(onSave).not.toHaveBeenCalled();
@@ -565,7 +565,7 @@ describe("EndpointsPanel", () => {
     const renameDeck = vi.fn(async () => next);
     const { onSave, update } = renderPanel({ endpoints: { remote: [row], selection: row.id } }, { renameDeck });
 
-    fireEvent.change(screen.getByLabelText("Deck name"), { target: { value: "production" } });
+    fireEvent.change(screen.getByLabelText("Daemon name"), { target: { value: "production" } });
     fireEvent.click(screen.getByTestId("rename-deck"));
     await waitFor(() => expect(renameDeck).toHaveBeenCalledWith(row.id, "production"));
     update(next);
@@ -578,12 +578,12 @@ describe("EndpointsPanel", () => {
   /// Scenario: A name refused for a selected deck shows the shared validation message before Rename can be pressed.
   it("pre-validates a rename with the selected deck id", async () => {
     const row = { ...deck(), name: "build" };
-    const refusal = "A deck named 'taken' already exists.";
+    const refusal = "A daemon named 'taken' already exists.";
     const checkDeckName = vi.fn(async () => refusal);
     const renameDeck = vi.fn(async () => DEFAULT_DESKTOP_SETTINGS);
     renderPanel({ endpoints: { remote: [row], selection: row.id } }, { checkDeckName, renameDeck });
 
-    fireEvent.change(screen.getByLabelText("Deck name"), { target: { value: "taken" } });
+    fireEvent.change(screen.getByLabelText("Daemon name"), { target: { value: "taken" } });
 
     await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(refusal));
     expect(checkDeckName).toHaveBeenCalledWith("taken", row.id);
@@ -594,12 +594,12 @@ describe("EndpointsPanel", () => {
   /// Scenario: A refused rename shows the bridge's exact sentence and leaves the stored deck selected.
   it("shows a rename refusal without changing the selected deck", async () => {
     const row = { ...deck(), name: "build" };
-    const renameDeck = vi.fn(async (): Promise<DesktopSettingsDto> => { throw "A deck named 'taken' already exists."; });
+    const renameDeck = vi.fn(async (): Promise<DesktopSettingsDto> => { throw "A daemon named 'taken' already exists."; });
     const { onSave } = renderPanel({ endpoints: { remote: [row], selection: row.id } }, { renameDeck });
-    fireEvent.change(screen.getByLabelText("Deck name"), { target: { value: "taken" } });
+    fireEvent.change(screen.getByLabelText("Daemon name"), { target: { value: "taken" } });
     fireEvent.click(screen.getByTestId("rename-deck"));
 
-    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("A deck named 'taken' already exists."));
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("A daemon named 'taken' already exists."));
     expect(screen.getByTestId(`deck-choice-${row.id}`).querySelector("input")).toBeChecked();
     expect(onSave).not.toHaveBeenCalled();
   });
@@ -610,16 +610,16 @@ describe("EndpointsPanel", () => {
     const replacement = deck({ host: "other-host", name: "other" });
     const disk = { ...DEFAULT_DESKTOP_SETTINGS, endpoints: { remote: [replacement], selection: row.id } };
     const renameDeck = vi.fn(async (): Promise<DesktopSettingsDto> => {
-      throw new Error("That deck changed since this window loaded it.");
+      throw new Error("That daemon changed since this window loaded it.");
     });
     const { update } = renderPanel({ endpoints: { remote: [row], selection: row.id } }, { renameDeck });
-    fireEvent.change(screen.getByLabelText("Deck name"), { target: { value: "production" } });
+    fireEvent.change(screen.getByLabelText("Daemon name"), { target: { value: "production" } });
     fireEvent.click(screen.getByTestId("rename-deck"));
-    await waitFor(() => expect(document.querySelector("p.settings-hint[role=alert]")).toHaveTextContent("That deck changed since this window loaded it."));
+    await waitFor(() => expect(document.querySelector("p.settings-hint[role=alert]")).toHaveTextContent("That daemon changed since this window loaded it."));
     update(disk);
 
     expect(screen.getByLabelText("Host")).toHaveValue("other-host");
-    expect(screen.getByLabelText("Deck name")).toHaveValue("other");
+    expect(screen.getByLabelText("Daemon name")).toHaveValue("other");
     expect(screen.getByTestId(`deck-choice-${row.id}`)).toHaveTextContent("other");
   });
 
@@ -629,16 +629,16 @@ describe("EndpointsPanel", () => {
     const other = deck({ id: "deck0000000000bb", host: "ci-box", name: "ci" });
     const disk = { ...DEFAULT_DESKTOP_SETTINGS, endpoints: { remote: [other], selection: "local" } };
     const renameDeck = vi.fn(async (): Promise<DesktopSettingsDto> => {
-      throw new Error("That deck is no longer in the deck list.");
+      throw new Error("That daemon is no longer listed.");
     });
     const { update } = renderPanel({ endpoints: { remote: [row, other], selection: row.id } }, { renameDeck });
-    fireEvent.change(screen.getByLabelText("Deck name"), { target: { value: "production" } });
+    fireEvent.change(screen.getByLabelText("Daemon name"), { target: { value: "production" } });
     fireEvent.click(screen.getByTestId("rename-deck"));
     await waitFor(() => expect(renameDeck).toHaveBeenCalled());
     update(disk);
 
     expect(screen.queryByTestId(`deck-choice-${row.id}`)).toBeNull();
-    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("That deck is no longer in the deck list."));
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("That daemon is no longer listed."));
     // Choosing another deck retires the sentence: it was about the row that went.
     fireEvent.click(screen.getByTestId(`deck-choice-${other.id}`).querySelector("input")!);
     expect(screen.queryByRole("alert")).toBeNull();

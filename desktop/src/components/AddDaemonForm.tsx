@@ -328,12 +328,12 @@ export function useNewDaemon(settings: DesktopSettingsDto, onSave: SettingsPanel
   };
 }
 
-/** The draft's **Deck name** row, pre-filled and checked as it is typed (issue #1426). */
+/** The draft's **Daemon name** row, pre-filled and checked as it is typed (issue #1426). */
 export function DaemonNameRow({ id, form }: { id: string; form: NewDaemon }) {
   return (
     <TextRow
       id={`deck-name-${id}`}
-      label="Deck name"
+      label="Daemon name"
       value={form.name}
       placeholder="derived from the address"
       problem={form.refusal}

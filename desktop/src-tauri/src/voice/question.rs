@@ -1008,7 +1008,7 @@ pub fn report_outcome(
         AnswerReport::Withheld => AnswerOutcome {
             kind: "withheld",
             code: None,
-            sentence: "This deck cannot answer questions by voice — update the deck to use it. Nothing was sent."
+            sentence: "This daemon cannot answer questions by voice — upgrade the daemon to use it. Nothing was sent."
                 .to_string(),
         },
         AnswerReport::Superseded => AnswerOutcome {
@@ -1114,7 +1114,7 @@ pub fn refusal_outcome(
         AnswerRefusal::Unconfirmed => return unconfirmed_outcome(agent, Some("unconfirmed")),
         AnswerRefusal::Unknown => (
             "unknown",
-            "The deck refused that answer — nothing was sent.".to_string(),
+            "The daemon refused that answer — nothing was sent.".to_string(),
         ),
     };
     AnswerOutcome {

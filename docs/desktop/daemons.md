@@ -26,21 +26,21 @@ The app reaches a remote daemon through an ssh tunnel, using the `ssh` program o
    - say "add a deck" or "add a daemon" with [voice control](voice.md) on;
    - open **Settings** in the rail, choose **Daemons** and press **Add a daemon**.
 
-   Fill in the fields (below), check the **Deck name** the app suggests or type your own, and press **Add this daemon**. The daemon is added and chosen, and the Dashboard shows it; from then on, changes to its fields are saved in **Settings → Daemons** as you make them. From the Dashboard the form opens in a dialog over the screen you were on: **Cancel**, `Escape` or a click outside closes it without adding anything. If you registered the host with `dot-agent-deck remote add` while the app was open, restart the app to see it; it is then already listed.
+   Fill in the fields (below), check the **Daemon name** the app suggests or type your own, and press **Add this daemon**. The daemon is added and chosen, and the Dashboard shows it; from then on, changes to its fields are saved in **Settings → Daemons** as you make them. From the Dashboard the form opens in a dialog over the screen you were on: **Cancel**, `Escape` or a click outside closes it without adding anything. If you registered the host with `dot-agent-deck remote add` while the app was open, restart the app to see it; it is then already listed.
 
-   ![The Add a daemon dialog over the empty Dashboard: Deck name, Host filled in as build-box, User as dev, Port 22, Key file, Jump host and Daemon socket, with Cancel and Add this daemon](/img/add-daemon-desktop.png)
+   ![The Add a daemon dialog over the empty Dashboard: Daemon name, Host filled in as build-box, User as dev, Port 22, Key file, Jump host and Daemon socket, with Cancel and Add this daemon](/img/add-daemon-desktop.png)
 4. **Press Test connection.** It is in **Settings → Daemons**: open **Settings** in the rail, choose **Daemons**, and choose the daemon you added (it is already chosen when you added it there). **Test connection** checks the daemon and, when **Daemon socket** is empty, finds the socket path on the host and saves it.
 5. **Choose the daemon** in the Dashboard's **Daemon** selector, or choose **All daemons**.
 
 **Check it worked:** **Test connection** reports `<daemon> answered and is compatible with this app.`, and on the Dashboard the daemon's section lists its agents (or **No agents are running yet**) instead of a title such as **Daemon disconnected**.
 
-![Settings → Daemons with a remote daemon named build, its address build-box beside the name, chosen in the Daemon row beside All daemons and This machine; below it the Deck name field reads build with a Rename button, Host is filled in, the other fields show their placeholders, and Test connection is not yet pressed](/img/settings-daemons-desktop.png)
+![Settings → Daemons with a remote daemon named build, its address build-box beside the name, chosen in the Daemon row beside All daemons and This machine; below it the Daemon name field reads build with a Rename button, Host is filled in, the other fields show their placeholders, and Test connection is not yet pressed](/img/settings-daemons-desktop.png)
 
 A remote daemon has these fields:
 
 | Field | What it is | Required |
 | --- | --- | --- |
-| **Deck name** | What the app calls the daemon, and the name `dot-agent-deck connect <name>` takes. The app suggests one from the host and user. | No, empty takes the suggested name |
+| **Daemon name** | What the app calls the daemon, and the name `dot-agent-deck connect <name>` takes. The app suggests one from the host and user. | No, empty takes the suggested name |
 | **Host** | The host name or address to ssh to. | Yes |
 | **User** | The ssh user. Empty takes it from your ssh config. | No |
 | **Port** | The ssh port, 1 to 65535. | No, `22` by default |
@@ -48,7 +48,7 @@ A remote daemon has these fields:
 | **Jump host** | The name of a `Host` block in your `~/.ssh/config` to connect through (`ssh -J`). The jump host's own address, user and key stay in that config. | No |
 | **Daemon socket** | The path of the daemon's attach socket on the host. Leave it empty: **Test connection** finds it and fills it in. | No |
 
-A field whose value the app refuses (a character ssh would misread, a key path that is not absolute) shows the problem under it, and **Test connection** stays disabled until it is fixed. A **Deck name** the app cannot use, such as one another daemon already has, is refused with the reason under the field; a daemon you were adding stays on screen so you can pick another name.
+A field whose value the app refuses (a character ssh would misread, a key path that is not absolute) shows the problem under it, and **Test connection** stays disabled until it is fixed. A **Daemon name** the app cannot use, such as one another daemon already has, is refused with the reason under the field; a daemon you were adding stays on screen so you can pick another name.
 
 ## Test connection
 
@@ -230,7 +230,7 @@ The dialog ends with one of the titles in the [remote table above](#upgrade-a-re
 
 ## Rename a remote daemon
 
-In **Settings → Daemons**, the **Daemon** row shows each remote daemon's address beside its name. To rename one, choose it, change **Deck name**, and press **Rename**. The new name is saved to `remotes.toml`, so the CLI uses it straight away: `dot-agent-deck connect <new name>`.
+In **Settings → Daemons**, the **Daemon** row shows each remote daemon's address beside its name. To rename one, choose it, change **Daemon name**, and press **Rename**. The new name is saved to `remotes.toml`, so the CLI uses it straight away: `dot-agent-deck connect <new name>`.
 
 If the daemon was changed somewhere else since the app showed it, for example renamed with the CLI, nothing is renamed: the app says so and shows the list as it is now, and you can rename it again from there. If it was removed, for example with `dot-agent-deck remote remove`, the app says the daemon is no longer in the deck list and drops it from the list.
 

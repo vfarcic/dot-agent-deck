@@ -937,8 +937,8 @@ describe("ControlDeck", () => {
     expect(notice.message).not.toContain("Nothing was approved");
     const toast = screen.getByTestId("toast");
     expect(toast).toHaveTextContent("Nothing was started");
-    expect(toast).toHaveTextContent(`the approval already sent may still be recorded on deck ${deck}`);
-    expect(toast).toHaveTextContent("dot-agent-deck trust revoke /home/dev/code/deck --orchestration dot-agent-deck on that deck's host");
+    expect(toast).toHaveTextContent(`the approval already sent may still be recorded on daemon ${deck}`);
+    expect(toast).toHaveTextContent("dot-agent-deck trust revoke /home/dev/code/deck --orchestration dot-agent-deck on that daemon's host");
     expect(toast).not.toHaveTextContent("Nothing was approved");
     expect(screen.queryByText(REVIEW_DECK_CHANGED)).toBeNull();
     await act(async () => { release({ ...review, state: "approved" }); await Promise.resolve(); });

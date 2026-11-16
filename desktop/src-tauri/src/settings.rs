@@ -10782,7 +10782,7 @@ level = 1.0
         assert!(!failure.decks_saved());
         assert_eq!(
             failure.public(),
-            "A deck named 'lab' already exists. It was not added; choose another name."
+            "A daemon named 'lab' already exists. It was not added; choose another name."
         );
         assert_eq!(std::fs::read_to_string(&remotes).unwrap(), taken);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), document_before);

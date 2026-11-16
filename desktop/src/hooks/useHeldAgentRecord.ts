@@ -1,7 +1,7 @@
 /**
  * Issue #1143 — the last agent record an open pane's deck gave, kept for
  * exactly as long as that pane is open, so the pane can still be a pane while
- * its deck is not answering.
+ * its daemon is not answering.
  *
  * # The gap this closes
  *
