@@ -49,6 +49,8 @@ desktopScenario("antigravity-needs-input", async (page) => {
   await expect(tile).toBeVisible();
   await expect(tile.getByTestId("status-reason-1")).toHaveText("Approve Bash: rm -f probe.txt");
   await expect(tile.getByText("needs input", { exact: true })).toBeVisible();
+  await expect(tile.getByTestId("question-badge-1")).toBeVisible();
+  await expect(tile.getByTestId("question-badge-1")).toContainText("QUESTION");
   await expect(tile.locator(".xterm-rows")).toContainText("Esc to cancel");
 });
 

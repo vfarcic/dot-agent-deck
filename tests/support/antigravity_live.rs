@@ -37,13 +37,22 @@ fn token_redactions(value: &Value, out: &mut Vec<String>) {
 
 pub fn seed_home(home: &Path, fixture: &Path) -> std::io::Result<()> {
     let source = host_token();
+    seed_home_with_credentials(home, fixture, &source, gemini_key().as_deref())
+}
+
+fn seed_home_with_credentials(
+    home: &Path,
+    fixture: &Path,
+    source: &Path,
+    key: Option<&str>,
+) -> std::io::Result<()> {
     let target = home.join(TOKEN);
     std::fs::create_dir_all(target.parent().unwrap())?;
     std::fs::set_permissions(
         target.parent().unwrap(),
         std::fs::Permissions::from_mode(0o700),
     )?;
-    if std::fs::symlink_metadata(&source).is_ok_and(|m| m.file_type().is_file() && m.len() > 0) {
+    if std::fs::symlink_metadata(source).is_ok_and(|m| m.file_type().is_file() && m.len() > 0) {
         let bytes = std::fs::read(source)?;
         // Register before a copy or a diagnostic can expose a token value.
         let mut redactions = vec![String::from_utf8_lossy(&bytes).into_owned()];
@@ -61,7 +70,7 @@ pub fn seed_home(home: &Path, fixture: &Path) -> std::io::Result<()> {
             std::fs::metadata(&target)?.permissions().mode() & 0o777,
             0o600
         );
-    } else if gemini_key().is_none() {
+    } else if key.is_none() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "Antigravity token unavailable; sign in or set GEMINI_API_KEY",
@@ -140,4 +149,52 @@ pub fn check_antigravity_available() -> Result<(), String> {
     }
     eprintln!("Antigravity model under test: {model}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Scenario: Seed isolated Antigravity homes with a dummy API key alone and with a dummy OAuth token. The key-only home must select Gemini, while the OAuth home keeps the subscription provider and copies its token privately.
+    #[test]
+    fn antigravity_seed_selects_gemini_only_for_key_authentication() {
+        let root = common::race_safe_tempdir();
+        let source = root.path().join("host-token");
+        let key_home = root.path().join("key-home");
+        seed_home_with_credentials(&key_home, root.path(), &source, Some("dummy-key")).unwrap();
+        let key_settings: Value = serde_json::from_slice(
+            &std::fs::read(key_home.join(".gemini/antigravity-cli/settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            key_settings["modelProvider"], "gemini",
+            "key-only authentication must activate the Gemini provider"
+        );
+        assert!(!key_home.join(TOKEN).exists());
+
+        std::fs::write(&source, "dummy-oauth-token").unwrap();
+        let oauth_home = root.path().join("oauth-home");
+        seed_home_with_credentials(&oauth_home, root.path(), &source, Some("dummy-key")).unwrap();
+        let oauth_settings: Value = serde_json::from_slice(
+            &std::fs::read(oauth_home.join(".gemini/antigravity-cli/settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(oauth_settings.get("modelProvider").is_none());
+        assert_eq!(
+            std::fs::read(oauth_home.join(TOKEN)).unwrap(),
+            b"dummy-oauth-token"
+        );
+        assert_eq!(
+            std::fs::metadata(oauth_home.join(TOKEN))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            key_settings["trustedWorkspaces"],
+            oauth_settings["trustedWorkspaces"]
+        );
+    }
 }
