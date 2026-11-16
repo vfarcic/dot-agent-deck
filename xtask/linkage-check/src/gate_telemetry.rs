@@ -325,6 +325,9 @@ pub(crate) struct RunInfo {
 pub(crate) struct CommandResult {
     pub(crate) exit_code: Option<i32>,
     pub(crate) passed: bool,
+    /// How many files the command reformatted, for the formatting step that
+    /// writes (issue #2074); `None` for every other command.
+    pub(crate) files_reformatted: Option<usize>,
 }
 
 /// Records a run's spans while it runs. Recording is a few vector pushes, so it
@@ -418,6 +421,9 @@ impl RunTrace {
         ];
         if let Some(code) = result.exit_code {
             attributes.push(("gates.command.exit_code", Value::Int(i64::from(code))));
+        }
+        if let Some(files) = result.files_reformatted {
+            attributes.push(("gates.command.files_reformatted", Value::Int(files as i64)));
         }
         self.commands.push(Span {
             trace_id: self.trace_id,
@@ -1012,10 +1018,12 @@ mod tests {
         let passed = CommandResult {
             exit_code: Some(0),
             passed: true,
+            files_reformatted: None,
         };
         let failed = CommandResult {
             exit_code: Some(101),
             passed: false,
+            files_reformatted: None,
         };
         trace.command("cargo fmt --check".into(), "local", Instant::now(), passed);
         trace.command("cargo test-fast".into(), "rwx", Instant::now(), failed);
@@ -1082,6 +1090,7 @@ mod tests {
         let result = CommandResult {
             exit_code: None,
             passed: true,
+            files_reformatted: None,
         };
         trace.command("true".into(), "local", Instant::now(), result);
         let spans = trace.finish();
@@ -1091,6 +1100,7 @@ mod tests {
         );
         assert_eq!(spans[0].attr("gates.failed_command"), None);
         assert_eq!(spans[1].attr("gates.command.exit_code"), None);
+        assert_eq!(spans[1].attr("gates.command.files_reformatted"), None);
         assert!(spans.iter().all(|s| !s.error));
         let json = String::from_utf8(encode_json(&Batch {
             resource: Vec::new(),
@@ -1185,6 +1195,35 @@ mod tests {
         assert_eq!(*memory.0.lock().unwrap(), [Batch { resource, spans }]);
     }
 
+    /// Issue #2074: the formatting step that writes records how many files it
+    /// rewrote, zero included, so a run where it changed nothing is told apart
+    /// from one where it did.
+    #[test]
+    fn the_formatting_step_records_how_many_files_it_reformatted() {
+        let mut trace = RunTrace::start(Began::now(), info());
+        for files in [0, 2] {
+            trace.command(
+                "cargo fmt -- -l".into(),
+                "local",
+                Instant::now(),
+                CommandResult {
+                    exit_code: Some(0),
+                    passed: true,
+                    files_reformatted: Some(files),
+                },
+            );
+        }
+        let spans = trace.finish();
+        assert_eq!(
+            spans[1].attr("gates.command.files_reformatted"),
+            Some(&Value::Int(0))
+        );
+        assert_eq!(
+            spans[2].attr("gates.command.files_reformatted"),
+            Some(&Value::Int(2))
+        );
+    }
+
     #[test]
     fn the_json_body_is_otlp_json() {
         let mut trace = RunTrace::start(Began::now(), info());
@@ -1195,6 +1234,7 @@ mod tests {
             CommandResult {
                 exit_code: Some(1),
                 passed: false,
+                files_reformatted: None,
             },
         );
         let spans = trace.finish();
