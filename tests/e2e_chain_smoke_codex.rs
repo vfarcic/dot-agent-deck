@@ -129,7 +129,6 @@ fn evidence(deck: &common::TuiDeck, agent: &str) -> String {
 /// Scenario: Open an orchestration in the attached TUI whose worker is interactive Codex (the cheap test model), started directly in its pane; a test-owned client attached to the worker answers Codex's cursor position queries as the desktop app's terminal would (a disclosed stand-in for a desktop, not coverage of the desktop's own answers). The user focuses the worker, types a draft into its input box and deletes it. The scripted orchestrator then runs the real `dot-agent-deck delegate`: the deck checks the touched box, finds it empty, rings, and Codex appends one uniquely named line to a sentinel file the test created with `O_EXCL`. The file must hold exactly that one line and the inbox must report the task acknowledged with one delivery, with the check's empty read logged before the ring.
 #[spec("chain-smoke/codex/001")]
 #[test]
-#[ignore = "quarantined: vfarcic, #2337"]
 fn codex_001_touched_box_checked_then_delegate_delivered_once() {
     use std::io::Write as _;
     skip_unless!(codex_installed::checkable());

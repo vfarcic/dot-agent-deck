@@ -159,6 +159,15 @@ pub enum Hosted {
     /// `-c` options, none of which sets a key binding. `env python3` then
     /// finds that other interpreter on the `PATH` the launcher handed it.
     LauncherPath,
+    /// npm Codex 0.169.0's `codex.js` under Node 23.11 or later (issue
+    /// #2337): the genuine script `execve`s a native in place instead of
+    /// spawning it, so the native runs at the entrypoint's PID with no
+    /// entrypoint above it. The native is the copy inside the script's own
+    /// package (`npm/vendor/<kind>`), as npm nests Codex's platform package.
+    InPlace,
+    /// The same in-place `execve`, of the native beside the package
+    /// (`<kind>` next to `npm/`, npm's hoisted shape): outside the package.
+    InPlaceOutside,
 }
 
 impl Hosted {
@@ -168,7 +177,14 @@ impl Hosted {
             Self::OtherScript => "other-script",
             Self::OtherInterpreter => "other-interpreter",
             Self::LauncherPath => "launcher-path",
+            Self::InPlace => "in-place",
+            Self::InPlaceOutside => "in-place-outside",
         }
+    }
+
+    /// Whether the entrypoint `execve`s its native in place.
+    pub fn in_place(self) -> bool {
+        matches!(self, Self::InPlace | Self::InPlaceOutside)
     }
 }
 
@@ -449,7 +465,14 @@ impl Fixture {
             seed_codex_trust(&daemon, &pane, &daemon.home.join(codex_home));
             pane
         });
-        let native = daemon.home.join("native");
+        // An npm-shaped install lives in a `node_modules`, as npm puts a
+        // package (issue #2337): its package is `node_modules/npm`, and the
+        // native copy beside it is outside that package.
+        let native = daemon.home.join(if hosted.is_some() {
+            "node_modules"
+        } else {
+            "native"
+        });
         fs::create_dir(&native).unwrap();
         let exe = native.join(kind);
         fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
@@ -542,9 +565,26 @@ impl Fixture {
                 fs::create_dir_all(package.join(dir)).unwrap();
             }
             let entry = include_str!("discovery_npm_entry.py");
+            fs::write(package.join("package.json"), "{\"name\":\"npm\"}\n").unwrap();
             executable(&package.join("lib").join("entry.py"), entry);
             executable(&package.join("other").join("entry.py"), entry);
             std::os::unix::fs::symlink("../lib/entry.py", package.join("bin").join(kind)).unwrap();
+            if hosted == Some(Hosted::InPlace) {
+                // The native inside the package, with the files the native
+                // fixture reads beside its own executable.
+                let vendor = package.join("vendor");
+                fs::create_dir(&vendor).unwrap();
+                fs::copy(&exe, vendor.join(kind)).unwrap();
+                fs::set_permissions(vendor.join(kind), fs::Permissions::from_mode(0o700)).unwrap();
+                for name in [
+                    "composer.py",
+                    "composer_external_edit.py",
+                    "editor",
+                    "broker",
+                ] {
+                    fs::copy(native.join(name), vendor.join(name)).unwrap();
+                }
+            }
             // What `/usr/bin/env python3` runs on the spawn PATH, copied to
             // another inode for the other-interpreter control.
             let python = fs::canonicalize("/usr/bin/python3").expect("the hosts' /usr/bin/python3");
@@ -761,7 +801,7 @@ impl Fixture {
         let expected = if self.launcher.is_some_and(|l| l.lookalike) {
             self.exe.parent().unwrap().join("lookalike").join(self.kind)
         } else {
-            self.exe.clone()
+            self.launched_executable()
         };
         assert_eq!(ready["exe"], json!(expected), "native exec acknowledgement");
         assert_eq!(ready["generation"], self.generation);
@@ -775,6 +815,21 @@ impl Fixture {
 
     pub fn native_executable(&self) -> &Path {
         &self.exe
+    }
+
+    /// The native executable the pane's agent runs: the copy inside the npm
+    /// package for [`Hosted::InPlace`], else [`Self::native_executable`].
+    pub fn launched_executable(&self) -> PathBuf {
+        if self.hosted == Some(Hosted::InPlace) {
+            self.exe
+                .parent()
+                .unwrap()
+                .join("npm")
+                .join("vendor")
+                .join(self.kind)
+        } else {
+            self.exe.clone()
+        }
     }
 
     fn wait_screen(&self) {
