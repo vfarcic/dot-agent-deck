@@ -76,7 +76,9 @@
 //! bounded, and takes the first process named as an agent (its `argv[0]`'s
 //! or its executable's basename is `claude` or `codex`). Below the deck's own
 //! `wrap` it passes over a child still running the deck's executable (forked,
-//! not yet `exec`'d) and the wrapper's `codex app-server` trust probe.
+//! not yet `exec`'d) and the wrapper's `codex app-server` trust probe. A
+//! process with no argv yet, one partway through its `execve(2)`, is not
+//! taken: a later walk reads it once it has one.
 //!
 //! **Validation** ([`validate`]), after the candidate is found, reads it again
 //! and refuses, in this order, a candidate that exited, one that left the
@@ -625,6 +627,14 @@ pub fn find(
         if proc.gone() {
             continue;
         }
+        if proc.argv.is_empty() {
+            // Partway through its `execve(2)`: it already runs its new
+            // executable but has no argv yet, so nothing below can say what
+            // it is (the wrapper's trust probe runs the genuine Codex, and
+            // only its `app-server` tells it apart). A later walk reads it
+            // with its argv (issue #2243).
+            continue;
+        }
         if node.below_wrapper.is_some()
             && (proc.exe == walk.own_exe || proc.argv.iter().any(|arg| arg == "app-server"))
         {
@@ -1079,6 +1089,33 @@ mod tests {
         );
         let pin = native_pin();
         assert_eq!(find(&mut t, 10, 100, &walk(&pin)), None);
+    }
+
+    /// Scenario: The deck's wrapper runs its `codex app-server` trust probe, and a walk reads it partway through its `execve(2)`: it already runs the genuine Codex but has no argv yet, so nothing says it is the probe. It isn't taken for the agent; once its argv is published it is passed over as the probe, and the native the launcher then starts is found.
+    #[spec("inbox/probe/035")]
+    #[test]
+    fn probe_035_the_walk_passes_over_a_process_still_in_its_exec() {
+        let wrap = [
+            "dot-agent-deck",
+            "wrap",
+            "--agent",
+            "codex",
+            "--",
+            "launcher",
+        ];
+        let pin = native_pin();
+        let mut t = Table::default();
+        t.add(10, 1, OWN, "dot-agent-deck", &wrap)
+            .add(11, 10, NATIVE, "codex", &[]);
+        assert_eq!(
+            find(&mut t, 10, 100, &walk(&pin)),
+            None,
+            "no argv yet: not a candidate"
+        );
+        t.add(11, 10, NATIVE, "codex", &["codex", "app-server"])
+            .add(12, 10, PYTHON, "python3", &["python3", "/bin/launcher"])
+            .add(13, 12, NATIVE, "codex", &["codex", "--fixture"]);
+        assert_eq!(find(&mut t, 10, 100, &walk(&pin)).map(|c| c.pid), Some(13));
     }
 
     /// Scenario: An npm-shaped Codex: the wrapper's child runs the pinned script under the pinned interpreter with the wrapped arguments (the #2002 pair on one side only), and spawns the native. The native is attested through the entrypoint; the same native under another script, or the script under another interpreter, is an executable mismatch.
