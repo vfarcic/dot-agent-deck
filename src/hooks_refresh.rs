@@ -342,6 +342,91 @@ pub const UPDATE_WITH: &str = "To have them run this copy, run:";
 /// What follows that command.
 pub const RESTART_AFTER: &str = "Then restart the affected agents.";
 
+/// Issue #1973: whether the daemon repairs `agent`'s hooks before starting one
+/// of its agents ([`repair_before_spawn`]): an agent with a startup install
+/// whose hook config can be read back, other than OpenCode, whose plugin is
+/// rewritten before every start anyway (PRD #1666 §11). Today: Claude Code,
+/// Codex and Devin.
+pub fn repairs_before_spawn(agent: &AgentType) -> bool {
+    let spec = crate::agent_registry::spec(agent);
+    *agent != AgentType::OpenCode
+        && spec.configured_pins.is_some()
+        && spec.refresh_install.is_some()
+}
+
+/// Issue #1973: run `agent`'s startup install just before the daemon starts
+/// one of its agents, but only when its hooks need it
+/// ([`pins_need_repair`]): they name no deck at all, which is what an agent
+/// set up after the deck started has, or a deck copy that is gone. Hooks that
+/// already name a usable deck are not touched, so the deck does not write the
+/// agent's config, which is the user's file, every time an agent starts.
+///
+/// What the install could not write is logged, as the startup install logs
+/// it: the agent still starts, and `dot-agent-deck hooks refresh` names the
+/// cause. Blocking (it reads, and may write, the agent's config): call it off
+/// the executor.
+pub fn repair_before_spawn(agent: &AgentType) -> Option<InstallAttempt> {
+    if !repairs_before_spawn(agent) {
+        return None;
+    }
+    let spec = crate::agent_registry::spec(agent);
+    repair_with(
+        agent,
+        spec.configured_pins?,
+        spec.refresh_install?,
+        crate::platform::paths::pin_is_repairable,
+    )
+}
+
+/// [`repair_before_spawn`] with the config read, the install and the pin
+/// check injected. `None` when no repair was needed, so nothing ran.
+fn repair_with(
+    agent: &AgentType,
+    read: impl FnOnce() -> Option<Vec<HookPin>>,
+    install: impl FnOnce() -> InstallAttempt,
+    repairable: impl Fn(&str) -> bool,
+) -> Option<InstallAttempt> {
+    let pins = read();
+    if !pins_need_repair(pins.as_deref(), repairable) {
+        return None;
+    }
+    let name = crate::hook_binary::agent_display_name(agent);
+    tracing::info!(
+        agent = name,
+        ?pins,
+        "hooks: repairing the agent's hooks before it starts (issue #1973)"
+    );
+    let attempt = install();
+    if let InstallAttempt::Ran { failed } = &attempt
+        && !failed.is_empty()
+    {
+        tracing::warn!(
+            agent = name,
+            ?failed,
+            "hooks: could not repair the agent's hooks before it started, so its status may \
+             not arrive; `dot-agent-deck hooks refresh` reports why"
+        );
+    }
+    Some(attempt)
+}
+
+/// Issue #1973: whether hooks pinned to `pins` need the startup install run
+/// again before an agent starts. `Some` with no pins means the config names no
+/// deck, so the agent would report nothing; a pin `repairable` accepts is one
+/// the install replaces (a copy that is gone, or a bare or relative name).
+/// `None`, a config that could not be read or an agent not installed here,
+/// is left alone: the install would refuse the first and skip the second.
+pub(crate) fn pins_need_repair(
+    pins: Option<&[HookPin]>,
+    repairable: impl Fn(&str) -> bool,
+) -> bool {
+    match pins {
+        None => false,
+        Some([]) => true,
+        Some(pins) => pins.iter().any(|pin| repairable(&pin.binary)),
+    }
+}
+
 /// `items` as English: `a`, `a and b`, `a, b and c`.
 fn and_list(items: &[&str]) -> String {
     match items {
@@ -675,5 +760,101 @@ mod tests {
         let read: RefreshReport = serde_json::from_str(newer).unwrap();
         assert!(!read.ok);
         assert_eq!(read.lines[0].command.as_deref(), Some("y"));
+    }
+
+    fn pin(binary: &str) -> HookPin {
+        HookPin {
+            agent: AgentType::ClaudeCode,
+            config: PathBuf::from("/home/u/.claude/settings.json"),
+            binary: binary.into(),
+        }
+    }
+
+    /// Issue #1973: only hooks that name no deck, or a copy the install
+    /// replaces, are repaired before an agent starts; a config that could not
+    /// be read, and hooks that name a usable deck, are left alone.
+    #[test]
+    fn hooks_are_repaired_before_a_start_only_when_they_need_it() {
+        const GONE: &str = "/home/u/removed/dot-agent-deck";
+        let repairable = |binary: &str| binary == GONE;
+        assert!(
+            !pins_need_repair(None, repairable),
+            "an unreadable config, or an agent not installed here, is left to the startup install"
+        );
+        assert!(
+            pins_need_repair(Some(&[]), repairable),
+            "hooks that name no deck report nothing, so they are installed"
+        );
+        assert!(
+            !pins_need_repair(Some(&[pin(THIS)]), repairable),
+            "hooks that name a usable deck are not rewritten on every start"
+        );
+        assert!(pins_need_repair(Some(&[pin(GONE)]), repairable));
+        assert!(
+            pins_need_repair(Some(&[pin(THIS), pin(GONE)]), repairable),
+            "one pin to a deleted copy is enough"
+        );
+    }
+
+    /// Issue #1973: the install runs exactly when the pins need it, and its
+    /// outcome, a refusal included, is what the repair returns.
+    #[test]
+    fn the_repair_runs_the_install_only_when_the_pins_need_it() {
+        use std::cell::Cell;
+        let ran = Cell::new(0);
+        let install = || {
+            ran.set(ran.get() + 1);
+            InstallAttempt::Ran {
+                failed: vec!["settings.json is not valid JSON".into()],
+            }
+        };
+        let never = |_: &str| false;
+
+        assert_eq!(
+            repair_with(
+                &AgentType::ClaudeCode,
+                || Some(vec![pin(THIS)]),
+                install,
+                never
+            ),
+            None
+        );
+        assert_eq!(ran.get(), 0, "usable hooks must not run the install");
+
+        assert_eq!(
+            repair_with(&AgentType::ClaudeCode, || None, install, never),
+            None
+        );
+        assert_eq!(
+            ran.get(),
+            0,
+            "an unreadable config must not run the install"
+        );
+
+        assert_eq!(
+            repair_with(&AgentType::ClaudeCode, || Some(Vec::new()), install, never),
+            Some(InstallAttempt::Ran {
+                failed: vec!["settings.json is not valid JSON".into()]
+            })
+        );
+        assert_eq!(
+            ran.get(),
+            1,
+            "hooks naming no deck must run the install once"
+        );
+    }
+
+    /// Issue #1973 and CLAUDE.md rule 20: every agent with a startup install
+    /// and a readable hook config is repaired before it starts, except
+    /// OpenCode, whose plugin is rewritten before every start already.
+    #[test]
+    fn the_agents_repaired_before_a_start_are_claude_codex_and_devin() {
+        for agent in [AgentType::ClaudeCode, AgentType::Codex, AgentType::Devin] {
+            assert!(repairs_before_spawn(&agent), "{agent:?}");
+        }
+        for agent in [AgentType::OpenCode, AgentType::Pi, AgentType::None] {
+            assert!(!repairs_before_spawn(&agent), "{agent:?}");
+            assert_eq!(repair_before_spawn(&agent), None, "{agent:?}");
+        }
     }
 }
