@@ -680,7 +680,12 @@ pub async fn refuse_unless_approved(
     task_name: &str,
     notifier: &dyn Notifier,
 ) -> Result<(), SpawnError> {
-    let Some(refusal) = approval_refusal(config_dir, orchestration, task_name).await else {
+    // Issue #2330: what a client's review says asked for the approval. Every
+    // caller of this is a scheduled task (a fire, Run now, an issue dispatch).
+    let asked_by = format!("scheduled task '{task_name}'");
+    let Some(refusal) =
+        approval_refusal_asked_by(config_dir, orchestration, task_name, &asked_by).await
+    else {
         return Ok(());
     };
     notifier.notify(NotifyEvent::NotApproved {
@@ -698,6 +703,17 @@ pub async fn approval_refusal(
     config_dir: &Path,
     orchestration: &crate::project_config::OrchestrationConfig,
     path: &str,
+) -> Option<String> {
+    approval_refusal_asked_by(config_dir, orchestration, path, path).await
+}
+
+/// [`approval_refusal`], naming `asked_by` as what tried to start it in the
+/// in-deck approval request it raises (issue #2330).
+pub async fn approval_refusal_asked_by(
+    config_dir: &Path,
+    orchestration: &crate::project_config::OrchestrationConfig,
+    path: &str,
+    asked_by: &str,
 ) -> Option<String> {
     let (dir, orch) = (config_dir.to_path_buf(), orchestration.clone());
     let check = match tokio::task::spawn_blocking(move || {
@@ -718,7 +734,9 @@ pub async fn approval_refusal(
         }
     };
     crate::project_trust::log_refusal(path, &check);
-    check.refusal()
+    // Issue #2330: in the serving daemon, ask the attached clients for the
+    // approval, and say so.
+    crate::trust_requests::refusal_for(&check, asked_by)
 }
 
 async fn spawn_with_unit(

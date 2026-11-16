@@ -239,6 +239,7 @@ mod test_pty_wait;
 // PRD #1885: `dot-agent-deck trust list | approve | revoke`.
 pub mod trust_cli;
 pub mod trust_prompt;
+pub mod trust_requests;
 pub mod turn_reply;
 pub mod ui;
 // Issue #2094: what the deck sets for an agent in a pane another agent drives.

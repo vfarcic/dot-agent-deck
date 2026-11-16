@@ -2,7 +2,7 @@
 
 A project's `.dot-agent-deck.toml` decides which commands the deck runs for an orchestration and which instructions it gives the agents in it. A repository you clone, or a change someone pushes to one you already use, can change that file, so the deck shows you what an orchestration would run before it runs it for the first time, and again whenever that changes. You approve it once, and the deck remembers the approval until the text changes.
 
-This page covers both clients and the command line: what the review shows, how to answer it, what is remembered, what happens to work that runs while you are away, and what the review does not cover.
+This page covers both clients and the command line: what the review shows, how to answer it, what is remembered, what happens to work that starts an orchestration on its own, and what the review does not cover.
 
 ## When the deck asks
 
@@ -12,6 +12,8 @@ The deck asks before it starts an orchestration that you have never approved, or
 - **Desktop app:** when you press **Activate orchestration** in the [New agent](desktop/new-agent.md) dialog, or start an orchestration from the experimental deck screen.
 
 An orchestration you approved, whose text has not changed, starts with no question, as it did before. Nothing from the orchestration starts while the review is open.
+
+The deck also opens the review on its own when something other than you tries to start an orchestration that is not approved, such as an agent's `dispatch` or a schedule firing ([Work that starts an orchestration on its own](#work-that-starts-an-orchestration-on-its-own)).
 
 ## What the review shows
 
@@ -64,20 +66,44 @@ An orchestration without a `name` is remembered under the name of the project's 
 
 Approvals are kept per user, on the machine the daemon runs on, in `project-trust/approvals.json` in the deck's state directory (`~/.local/state/dot-agent-deck/` unless `XDG_STATE_HOME` or `DOT_AGENT_DECK_STATE_DIR` moves it; see [Configuration → Environment variables](configuration.md#paths-and-endpoints)). For a [remote](remote-environments.md) daemon, that is the remote host.
 
-## Work that runs while you are away
+## Work that starts an orchestration on its own
 
-Some work starts an orchestration, or a role of one, without you in front of a client. That work never shows the review; if the orchestration is not approved as it now reads, it is refused and nothing from it starts:
+Some work starts an orchestration, or a role of one, without you choosing it in a client:
 
 - a schedule firing, and **Run now**, for a schedule that opens an orchestration ([Schedules](scheduled-tasks.md));
 - a scheduled issue dispatch, before the issue's worktree runs any setup;
 - `dot-agent-deck dispatch` when it starts an orchestration, before the unit's worktree runs any setup ([Dispatcher Mode](dispatcher-mode.md));
 - an orchestrator's `delegate`, `pane restart` and `pane spawn` ([Orchestration](orchestration.md#commands)). An orchestration you started from a current client was approved then, so for it these are refused when its file changed since.
 
-Each refusal says which orchestration and project, whether it was never approved or what changed, and the command that approves it:
+If the orchestration is not approved as its file now reads, the attempt is refused and nothing from it starts. The deck then asks you for the approval in the TUI and the desktop app attached to it, so you can approve without leaving the deck, and the attempt goes through when it is tried again.
+
+### Answering the deck's request
+
+The deck shows the same **Review project commands** review, led by a sentence saying the deck refused to start the orchestration and an **Asked by:** line naming what tried to start it, such as `dispatch`, `delegate`, `pane restart` or `scheduled task 'nightly'`. It waits while another dialog is open, and for a moment after it appears it ignores keys (in the TUI, until you pause typing), so typing you were in the middle of cannot answer it.
+
+- **TUI:** the review opens over the dashboard or the pane you are typing in, with the footer `a approve · Esc deny · ↑↓ scroll`. `a` (or a click on `a approve`) approves exactly the text shown, and the status line says `Approved orchestration 'team'. It starts when dispatch tries again.`. `Esc` (or a click on `Esc deny`) declines it. You return to where you were.
+- **Desktop app:** the dialog names the deck that asked (**Deck:**) and offers **Deny** and **Approve**. With **All decks** selected it shows the requests of every deck the app watches; with one deck selected, that deck's. With [voice control](desktop/voice.md#approving-project-commands) on, "approve" approves, and "cancel" or "close" denies.
+
+Approving records the approval exactly as the New Agent form and `trust approve` do. It starts nothing itself: the attempt that was refused starts when it is tried again. An agent that ran `dispatch` or `delegate` is told to retry once you approve; a schedule runs at its next fire, or now with `dot-agent-deck schedule run-now --name <name>`.
+
+**Deny** refuses the attempt, and its retries, with a message saying you declined it in the deck. The deck does not ask about that exact text again until the daemon restarts, so a schedule that fires every few minutes does not bring the review back each time. You can still approve it from the New Agent form or with `trust approve`, and a change to the file asks again.
+
+- **Once per change:** a retry while the review is waiting for your answer is refused the same way and opens no second review. After you approve, nothing asks again until the text changes.
+- **Answered once, closed everywhere:** answer in one client, and the review closes in the others, which say `The approval request for orchestration 'team' was answered elsewhere.`. Approving with `trust approve`, or changing the file, also closes it within a few seconds.
+- **No client attached:** the request waits, and the review appears the next time a TUI or desktop app attaches to that deck.
+- **A restart forgets it:** the deck keeps waiting requests and your declines in memory only. Restarting the daemon drops them; the next attempt asks again. Approvals are kept on disk and survive a restart, as before.
+
+A TUI or desktop app from an older release shows no request; approve with the command the refusal prints.
+
+### The refusal
+
+Each refusal says which orchestration and project, whether it was never approved or what changed, that the approval was requested in the deck, and the command that approves it from a terminal:
 
 ```text
-orchestration 'team' of project /home/you/code/demo was never approved, so nothing from it was started. Review and approve it from a terminal outside the deck with: dot-agent-deck trust approve /home/you/code/demo --orchestration team
+orchestration 'team' of project /home/you/code/demo was never approved, so nothing from it was started. Its approval was requested in the deck: the user can review it in the dot-agent-deck TUI or desktop app attached to this deck, and once it is approved the same attempt, retried, starts it. Or approve it from a terminal outside the deck with: dot-agent-deck trust approve /home/you/code/demo --orchestration team
 ```
+
+After you deny it, the refusal says `… was never approved and the user declined it in the deck, so nothing from it was started. To start it, approve it from the deck's New Agent form or from a terminal outside the deck with: …`.
 
 Where you see it:
 
@@ -85,9 +111,9 @@ Where you see it:
 - **A schedule:** `dot-agent-deck schedule list` prints `last fire refused at <time>: <message>` beneath the schedule, and the TUI's Schedules manager shows its status as `refused` and the message beneath the list while the schedule is selected ([The TUI's Schedules manager](scheduled-tasks.md#the-tuis-schedules-manager)).
 - **The daemon log**, at warning level ([Troubleshooting → Logs](troubleshooting.md#logs-and-diagnostics)).
 
-Run the command it names from a terminal outside the deck, check the text it prints, and approve. The next fire, or the orchestrator's next try, then runs.
+Approve from the review in the deck, or run the command it names from a terminal outside the deck, check the text it prints, and approve. The next fire, or the orchestrator's next try, then runs.
 
-A scheduled issue dispatch reuses the issue's existing branch, `agent/issue-<n>`, when an earlier dispatch left one in the schedule's clone. If that branch's `.dot-agent-deck.toml` differs from the approved one on the default branch, the issue is refused without an approve command, because approving the branch's version would replace the default branch's approval:
+A scheduled issue dispatch reuses the issue's existing branch, `agent/issue-<n>`, when an earlier dispatch left one in the schedule's clone. If that branch's `.dot-agent-deck.toml` differs from the approved one on the default branch, the issue is refused without an approve command and opens no review, because approving the branch's version would replace the default branch's approval:
 
 ```text
 orchestration 'team' on the existing issue branch agent/issue-7 in /home/you/work/issues changed since you approved it (roles: coder (changed)): that branch's .dot-agent-deck.toml differs from the approved one, so nothing was started. Approving the branch's version would replace the default branch's approval, so bring the branch's .dot-agent-deck.toml back in line with the default branch, or, if its work is abandoned, delete the branch with: git -C /home/you/work/issues branch -D agent/issue-7 — the next fire then dispatches the issue fresh. Issues on the default branch keep dispatching.
@@ -119,7 +145,7 @@ Run these from a terminal **outside** the deck, on the machine the daemon runs o
 
 `--yes` approves without asking, for scripts, and still prints what it approved. Without a terminal to ask on and without `--yes`, `approve` approves nothing and exits non-zero. If the file changes between printing and your answer, nothing is approved and you are told to run it again.
 
-`trust approve` refuses to run inside a pane the deck started, `--yes` included, and says `run it from a terminal outside the deck`, so that an agent working in a deck pane does not approve its own commands with it ([the limits](#what-the-review-does-not-cover) say what this does not stop). Approve from the review in the TUI or the desktop app, or from a terminal of your own. `list` and `revoke` work anywhere.
+`trust approve` refuses to run inside a pane the deck started, `--yes` included, and says `run it from a terminal outside the deck`, so that an agent working in a deck pane does not approve its own commands with it ([the limits](#what-the-review-does-not-cover) say what this does not stop). Approve from the review in the TUI or the desktop app, including the one the deck opens when it refuses work ([Answering the deck's request](#answering-the-decks-request)), or from a terminal of your own. `list` and `revoke` work anywhere.
 
 ## Restoring a saved workspace
 
@@ -163,8 +189,10 @@ The review is about the commands and instructions in a project's `.dot-agent-dec
 | The review comes back every time you open one orchestration from a worktree | The worktree's file says something other than what you approved in the main checkout. | Review the difference, then approve it, or bring the file in line with the main checkout. |
 | An issue dispatch is refused because `the existing issue branch agent/issue-<n>` differs from the approved one | An earlier dispatch left that branch, and its `.dot-agent-deck.toml` changed. | Bring that branch's file back in line with the default branch, or delete the branch with the `git` command in the message; the next fire dispatches the issue again. |
 | A cancelled restore is offered again every time the TUI starts | An orchestration you did not approve stays in your saved workspace. | Approve it, or run `dot-agent-deck snapshot clear` to drop the saved workspace. |
-| A schedule's status is `refused`, or `schedule list` says `last fire refused` | The orchestration was never approved, or its file changed. | Run the command in the message from a terminal outside the deck, then `schedule run-now`. |
-| An orchestrator says `delegate` or `pane restart` was refused as not approved | The orchestration's file changed after you started it. | Review the change, then approve with the command in the message, or revert the file. |
+| A schedule's status is `refused`, or `schedule list` says `last fire refused` | The orchestration was never approved, or its file changed. | Approve from the review the deck opened in a client, or run the command in the message from a terminal outside the deck, then `schedule run-now`. |
+| An orchestrator says `delegate` or `pane restart` was refused as not approved | The orchestration's file changed after you started it. | Review the change in the review the deck opened and approve it, or approve with the command in the message, or revert the file. |
+| The deck refused work but no review appeared | No TUI or desktop app is attached to that deck, the desktop app is not watching that deck, you declined this text since the daemon started, or the client is from an older release. | Attach a client (the review appears then), select **All decks** or that deck in the desktop app, or approve with the command in the refusal. |
+| A refusal says `the user declined it in the deck` | You denied the review for this text. | Approve it from the New Agent form or with `trust approve` if you meant to allow it; restarting the daemon also lets the deck ask again. |
 | The TUI's status line says an orchestration's `instructions were not sent to its coordinator again` | The orchestration's file changed after you opened it, and the change is not approved. | Approve with the command in the message, or revert the file. If it says the roles changed, open the orchestration again. |
 | A saved orchestration tab did not come back, and the TUI printed `was not restored` when you quit | Its project's file no longer defines it as saved. | Open it again from the New Agent form. |
 | `trust approve` says `run it from a terminal outside the deck` | You ran it in a deck pane. | Run it in a terminal of your own, or approve from the review in a client. |

@@ -27,6 +27,7 @@ import type { HandoffEdge,
   AgentBlocked,
   AgentInbox,
   HookBinaryNotice,
+  TrustRequest,
   AuthoringKind,
   AgentSession,
   AgentTarget,
@@ -136,6 +137,8 @@ export interface DesktopSnapshotDto {
     disconnectedReason?: DisconnectedReason;
     /** Issue #1637 — the daemon's hook-binary notices; omitted by the crate when there are none. */
     hookBinaryNotices?: HookBinaryNotice[];
+    /** Issue #2330 — the deck's pending in-deck approval requests, escaped; omitted by the crate when there are none. */
+    trustRequests?: TrustRequest[];
     /** PRD #1666 part 2 (G-fix7c) — the daemon process whose listing a connected snapshot carries; omitted when it named none. */
     incarnation?: string;
   };
@@ -2326,6 +2329,13 @@ export interface DeckBridge {
    */
   approveProjectTrust(target: ProjectTrustTarget, digest: string): Promise<ProjectTrust>;
   /**
+   * Issue #2330 — decline the in-deck approval request `id` of the deck
+   * `deckId` names, about the text `digest` names. The deck closes it in every client and does not ask about
+   * that exact text again until it restarts. A request another client already
+   * answered is no error. Optional so a test double need not serve it.
+   */
+  denyTrustRequest?(deckId: string, id: number, digest: string): Promise<void>;
+  /**
    * PRD #2174 — whether this launch of the app shows the star reminder. The
    * crate counts one launch per app process however often it is asked, in the
    * reminder state the TUI shares. Optional so a test double need not serve
@@ -3078,6 +3088,9 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
       // Issue #1637: without this the live app never shows a notice, whatever
       // the daemon reported — only the fixture, which skips this mapping, did.
       ...(dto.connection.hookBinaryNotices?.length ? { hookBinaryNotices: dto.connection.hookBinaryNotices } : {}),
+      // Issue #2330: the requests that open the review on their own, only
+      // from a connected deck (a deck that is not connected cannot be answered).
+      ...(dto.connection.status === "connected" && dto.connection.trustRequests?.length ? { trustRequests: dto.connection.trustRequests } : {}),
       // PRD #1666 part 2 (G-fix7c): which process this listing is, so a
       // restart that leaves no agent behind is still seen as one.
       ...(dto.connection.status === "connected" && dto.connection.incarnation ? { incarnation: dto.connection.incarnation } : {}),
@@ -4019,6 +4032,12 @@ class FixtureDeckBridge implements DeckBridge {
 
   async approveProjectTrust(target: ProjectTrustTarget): Promise<ProjectTrust> {
     return this.projectTrustState(target);
+  }
+
+  /** Issue #2330 — the preview raises no approval requests, so declining one changes nothing. */
+  async denyTrustRequest(deckId: string): Promise<void> {
+    await Promise.resolve();
+    this.connectedDeck(deckId);
   }
 
   /**
@@ -5984,6 +6003,12 @@ export class TauriDeckBridge implements DeckBridge {
   async approveProjectTrust(target: ProjectTrustTarget, digest: string): Promise<ProjectTrust> {
     const invoke = await this.getInvoke();
     return invoke<ProjectTrust>("desktop_approve_project_trust", { deckId: target.deckId ?? null, path: target.path, orchestration: target.orchestration, digest });
+  }
+
+  /** Issue #2330. */
+  async denyTrustRequest(deckId: string, id: number, digest: string): Promise<void> {
+    const invoke = await this.getInvoke();
+    await invoke<null>("desktop_deny_trust_request", { deckId, id, digest });
   }
 
   async starPromptLaunch(): Promise<boolean> {

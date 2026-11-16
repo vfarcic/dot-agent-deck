@@ -1517,7 +1517,13 @@ async fn refuse_unapproved_worktree(
                 .and_then(|c| crate::project_config::default_orchestration(c, clone_dir))
             {
                 Some(clone_chosen) => {
-                    crate::spawn::approval_refusal(clone_dir, clone_chosen.config, task_name).await
+                    crate::spawn::approval_refusal_asked_by(
+                        clone_dir,
+                        clone_chosen.config,
+                        task_name,
+                        &format!("scheduled task '{task_name}'"),
+                    )
+                    .await
                 }
                 None => None,
             };

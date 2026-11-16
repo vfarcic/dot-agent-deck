@@ -2684,3 +2684,313 @@ fn escape_001_refusals_carry_no_raw_terminal_controls() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// config-trust/request: the deck asks for the approval itself (issue #2330)
+// ---------------------------------------------------------------------------
+
+/// The footer of a review the deck opened on its own.
+const REQUEST_FOOTER: &str = "a approve · Esc deny · ↑↓ scroll";
+
+/// The daemon's pending in-deck approval requests, read from a `Hello` on
+/// `attach` as a client attaching now would read them.
+fn pending_trust_requests(attach: &Path) -> Vec<dot_agent_deck::daemon_protocol::TrustRequest> {
+    common::attach_request_on(
+        attach,
+        &dot_agent_deck::daemon_protocol::AttachRequest::Hello {
+            client_version: dot_agent_deck::daemon_protocol::PROTOCOL_VERSION,
+            client_build_version: None,
+            follow_on: false,
+        },
+    )
+    .ok()
+    .and_then(|resp| resp.trust_requests)
+    .map(|list| list.requests)
+    .unwrap_or_default()
+}
+
+/// Let a review the deck opened on its own arm its keys
+/// ([`dot_agent_deck::trust_prompt::REQUEST_KEYS_ARM`]), asserting it stays
+/// open meanwhile.
+fn let_the_request_arm(deck: &TuiDeck) {
+    deck.wait_until_grid_then_hold(
+        "the deck's review, while its keys arm",
+        dot_agent_deck::trust_prompt::REQUEST_KEYS_ARM + Duration::from_millis(300),
+        |grid| grid.contains(REQUEST_FOOTER),
+    );
+}
+
+/// Scenario: From a plain pane in a never-approved project, run `dispatch
+/// <unit> --orchestration trust-orch`. The TUI opens `Review project commands`
+/// on its own, saying the deck asked and that `dispatch` asked, with `a
+/// approve · Esc deny`; the refusal in the caller's inbox says the approval was
+/// requested in the deck. A retry while it is open raises no second request.
+/// Pressing `a` approves (the status line says so, `trust list` reads it
+/// current, the daemon lists no request), and the retried dispatch starts the
+/// orchestration in the unit's worktree.
+#[spec("config-trust/request/001")]
+#[test]
+fn request_001_a_refused_dispatch_is_approved_inside_the_deck_and_the_retry_starts() {
+    let deck = TuiDeck::builder()
+        .without_trust_preapproval()
+        .impersonating_pane_signals()
+        .with_pty_size(160, 50)
+        .launch_with_fixture("config-trust");
+    deck.wait_for_string("No active agents");
+    common::commit_fixture_repo(deck.workdir());
+    let caller = open_caller(&deck);
+    let dispatch = |unit: &str| {
+        agent_verb(
+            &deck,
+            &caller,
+            &[
+                "dispatch",
+                unit,
+                "--task",
+                "TRUST-REQUEST-TASK",
+                "--orchestration",
+                ORCH,
+            ],
+        )
+    };
+    let attach = deck.attach_socket_path();
+
+    let refused_wt = dispatch_worktree_of(&deck, "request-refused");
+    let _g1 = SiblingWorktreeGuard(refused_wt.clone());
+    let out = dispatch("request-refused");
+    let requested = common::wait_until(common::load_scaled(Duration::from_secs(15)), || {
+        inbox_view::count_containing(attach, &caller, "requested in the deck") > 0
+    });
+    let inbox = inbox_view::text(attach, &caller);
+    assert!(
+        requested,
+        "the refusal must say the approval was requested in the deck.\nCLI: {}\nInbox:\n{inbox}",
+        describe(&out)
+    );
+    assert_refusal(&inbox, deck.workdir(), "never approved");
+
+    // The grid, not the byte stream: the review may be drawn before this wait.
+    deck.wait_until_grid("the review the deck opened on its own", |grid| {
+        [
+            PROMPT_TITLE,
+            "The deck refused to start this orchestration",
+            "Asked by: dispatch",
+            "Orchestration: trust-orch",
+        ]
+        .iter()
+        .all(|needle| grid.contains(needle))
+    });
+    deck.wait_for_string(REQUEST_FOOTER);
+
+    // A retry while the review is open asks nothing new.
+    let _retry = dispatch("request-retried");
+    let _g2 = SiblingWorktreeGuard(dispatch_worktree_of(&deck, "request-retried"));
+    assert!(
+        common::wait_until(common::load_scaled(Duration::from_secs(15)), || {
+            inbox_view::count_containing(attach, &caller, "requested in the deck") > 1
+        }),
+        "the retry is refused the same way.\nInbox:\n{}",
+        inbox_view::text(attach, &caller)
+    );
+    let pending = pending_trust_requests(attach);
+    assert_eq!(
+        pending.len(),
+        1,
+        "a retry while the request is pending raises no second one: {pending:?}"
+    );
+
+    let_the_request_arm(&deck);
+    deck.send_keys(b"a");
+    deck.wait_for_string("Approved orchestration 'trust-orch'");
+    deck.wait_for_absence(REQUEST_FOOTER);
+    assert!(
+        common::wait_until(common::load_scaled(Duration::from_secs(10)), || {
+            pending_trust_requests(attach).is_empty()
+        }),
+        "approving closes the request: {:?}",
+        pending_trust_requests(attach)
+    );
+    let listed = text(&deck.run_deck_cli(deck.workdir(), &["trust", "list"]));
+    assert!(
+        listed
+            .lines()
+            .any(|l| l.contains(ORCH) && state_word(l) == Some("current")),
+        "the approval made in the deck is the stored one:\n{listed}"
+    );
+
+    let unit_wt = dispatch_worktree_of(&deck, "request-approved");
+    let _g3 = SiblingWorktreeGuard(unit_wt.clone());
+    let out = dispatch("request-approved");
+    assert!(
+        out.status.success(),
+        "the retried dispatch runs: {}",
+        describe(&out)
+    );
+    let unit_name = unit_wt
+        .file_name()
+        .expect("worktree has a name")
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        common::wait_until(common::load_scaled(Duration::from_secs(20)), || {
+            role_records(attach).iter().any(|r| {
+                r.cwd
+                    .as_deref()
+                    .and_then(|cwd| Path::new(cwd).file_name().map(|n| n == unit_name.as_str()))
+                    .unwrap_or(false)
+            })
+        }),
+        "the retried dispatch's roles must run in {}",
+        unit_wt.display()
+    );
+}
+
+/// Scenario: A never-approved `dispatch --orchestration` opens the review on
+/// its own, and `Esc` declines it. The status line says it was declined, the daemon lists no
+/// request, and a retried dispatch is refused saying the user declined it in
+/// the deck, with no review opening again.
+#[spec("config-trust/request/002")]
+#[test]
+fn request_002_denying_in_the_deck_refuses_the_retry_without_asking_again() {
+    let deck = TuiDeck::builder()
+        .without_trust_preapproval()
+        .impersonating_pane_signals()
+        .with_pty_size(160, 50)
+        .launch_with_fixture("config-trust");
+    deck.wait_for_string("No active agents");
+    common::commit_fixture_repo(deck.workdir());
+    let caller = open_caller(&deck);
+    let dispatch = |unit: &str| {
+        agent_verb(
+            &deck,
+            &caller,
+            &[
+                "dispatch",
+                unit,
+                "--task",
+                "TRUST-DENY-TASK",
+                "--orchestration",
+                ORCH,
+            ],
+        )
+    };
+    let attach = deck.attach_socket_path();
+    let _g1 = SiblingWorktreeGuard(dispatch_worktree_of(&deck, "deny-first"));
+    let _g2 = SiblingWorktreeGuard(dispatch_worktree_of(&deck, "deny-retry"));
+
+    let _ = dispatch("deny-first");
+    deck.wait_for_string(REQUEST_FOOTER);
+    let_the_request_arm(&deck);
+    deck.send_keys(b"\x1b");
+    deck.wait_for_string("Declined orchestration 'trust-orch'");
+    deck.wait_for_absence(REQUEST_FOOTER);
+    assert!(
+        common::wait_until(common::load_scaled(Duration::from_secs(10)), || {
+            pending_trust_requests(attach).is_empty()
+        }),
+        "declining closes the request"
+    );
+
+    let _ = dispatch("deny-retry");
+    assert!(
+        common::wait_until(common::load_scaled(Duration::from_secs(15)), || {
+            inbox_view::count_containing(attach, &caller, "declined it in the deck") > 0
+        }),
+        "the retry must be refused as declined.\nInbox:\n{}",
+        inbox_view::text(attach, &caller)
+    );
+    assert!(
+        pending_trust_requests(attach).is_empty(),
+        "a declined text raises no new request"
+    );
+    // No review opens for a declined text.
+    deck.wait_until_grid_then_hold(
+        "no review for a declined text",
+        Duration::from_millis(500),
+        |grid| !grid.contains(PROMPT_TITLE),
+    );
+    assert!(
+        role_records(attach).is_empty(),
+        "nothing started from the declined orchestration"
+    );
+}
+
+/// Scenario: With no client attached, a schedule's run-now into a
+/// never-approved orchestration is refused and the request stays pending in
+/// the daemon. A TUI attaching afterwards opens the review, naming the
+/// scheduled task that asked. Another client then declines the request over
+/// the attach socket, and the TUI's review closes saying it was answered
+/// elsewhere.
+#[spec("config-trust/request/003")]
+#[test]
+fn request_003_a_request_raised_with_no_client_opens_when_one_attaches() {
+    let scratch = common::race_safe_tempdir();
+    let project = scratch.path().join("request-project");
+    std::fs::create_dir_all(&project).expect("create project");
+    write_trust_config(&project, CODER_COMMAND, false);
+    let toml = format!(
+        "[[scheduled_tasks]]\n\
+         name = \"request-sched\"\n\
+         cron = \"0 0 1 1 *\"\n\
+         working_dir = \"{}\"\n\
+         command = \"cat\"\n\
+         prompt = \"TRUST-REQUEST-SCHED\"\n\
+         enabled = true\n",
+        toml_str(&project.to_string_lossy())
+    );
+    let daemon = common::spawn_daemon_serve_untrusted(Some(&toml), "0", &[]);
+    daemon.run_now("request-sched").expect("run-now");
+    assert!(
+        common::wait_until(common::load_scaled(Duration::from_secs(15)), || {
+            pending_trust_requests(&daemon.attach_socket).len() == 1
+        }),
+        "the refused fire leaves one request pending with no client attached: {:?}",
+        pending_trust_requests(&daemon.attach_socket)
+    );
+    let listed = text(&daemon.run_schedule_cli(&["list"]));
+    assert!(
+        listed.contains("requested in the deck"),
+        "the recorded refusal says the approval was requested in the deck:\n{listed}"
+    );
+
+    let deck = TuiDeck::builder()
+        .with_pty_size(160, 50)
+        .with_env(
+            "DOT_AGENT_DECK_ATTACH_SOCKET",
+            daemon.attach_socket.to_string_lossy().to_string(),
+        )
+        .with_env(
+            "DOT_AGENT_DECK_SOCKET",
+            daemon.hook_socket.to_string_lossy().to_string(),
+        )
+        .launch_with_fixture("minimal");
+    // The grid, not the byte stream: the review may be drawn before this wait.
+    deck.wait_until_grid("the review the deck opened on its own", |grid| {
+        [
+            PROMPT_TITLE,
+            "Asked by: scheduled task 'request-sched'",
+            "Orchestration: trust-orch",
+        ]
+        .iter()
+        .all(|needle| grid.contains(needle))
+    });
+    deck.wait_for_string(REQUEST_FOOTER);
+
+    // Another client answers first.
+    let pending = pending_trust_requests(&daemon.attach_socket);
+    let resp = common::attach_request_on(
+        &daemon.attach_socket,
+        &dot_agent_deck::daemon_protocol::AttachRequest::DenyTrustRequest {
+            id: pending[0].id,
+            digest: pending[0].digest.clone(),
+        },
+    )
+    .expect("deny over the attach socket");
+    assert!(resp.ok, "the deny is served: {:?}", resp.error);
+    deck.wait_for_string("was answered elsewhere");
+    deck.wait_for_absence(REQUEST_FOOTER);
+    assert!(
+        daemon.agent_records().is_empty(),
+        "nothing started from the declined orchestration"
+    );
+}

@@ -17975,7 +17975,7 @@ mod tests {
     /// included — whose control has a voice row, with that row. `docs/develop/voice-first-design.md`
     /// section 5 has the rule; the labels left out on purpose are listed there
     /// with their reasons.
-    const CONTROL_LABELS: [ControlLabel; 31] = [
+    const CONTROL_LABELS: [ControlLabel; 33] = [
         // PRD #2174 — the star reminder's three buttons, each its own row.
         // Shown at startup over the dashboard, never over the New agent form.
         ControlLabel {
@@ -18010,11 +18010,27 @@ mod tests {
             over_the_form: true,
         },
         ControlLabel {
-            source: "cancelProjectCommands: onCancel })}>Cancel</button>",
+            source: "cancelProjectCommands: onCancel })}>{asked === undefined ? CANCEL : DENY}</button>",
             file: PROJECT_TRUST_DIALOG_TSX,
             said: "Cancel",
             row: "close",
             over_the_form: true,
+        },
+        // Issue #2330 — the same dialog opened by the deck's own request:
+        // Approve is the approve row, and Deny is `close`, which declines it.
+        ControlLabel {
+            source: "export const APPROVE = \"Approve\";",
+            file: PROJECT_TRUST_TS,
+            said: "Approve",
+            row: "approve_project_commands",
+            over_the_form: false,
+        },
+        ControlLabel {
+            source: "export const DENY = \"Deny\";",
+            file: PROJECT_TRUST_TS,
+            said: "Deny",
+            row: "close",
+            over_the_form: false,
         },
         ControlLabel {
             source: "\"Activate orchestration\"",
@@ -18439,6 +18455,10 @@ mod tests {
             ("star_repo", "star the repo"),
             ("remind_star_later", "remind me later"),
             ("dismiss_star_prompt", "don't ask again"),
+            // Issue #2330 — a review the deck asked for: its Approve and Deny.
+            ("approve_project_commands", "approve"),
+            ("close", "deny it"),
+            ("close", "decline"),
         ] {
             // A description wraps across lines, so compare word runs.
             let description = spoken_words(&table().row(row).expect("present").description);

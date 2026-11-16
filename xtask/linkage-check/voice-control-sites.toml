@@ -119,6 +119,12 @@ reason = "Dismisses the toast with the star reminder's sentence (thanks, or wher
 [[site]]
 file = "desktop/src/App.tsx"
 handler = "onClick"
+code = "onDismissTrust"
+reason = "Dismisses the toast saying what an in-deck approval request's review did (approved, declined, answered elsewhere): a dismissal. The review's Approve and Deny go through `approveProjectCommands` and `cancelProjectCommands` (issue #2330)."
+
+[[site]]
+file = "desktop/src/App.tsx"
+handler = "onClick"
 code = "onClose"
 reason = "Events drawer close X: a dismissal (the drawer's opening half is VOICE_ACTIONS.toggleEvidenceDrawer)."
 

@@ -1952,6 +1952,12 @@ pub struct AppState {
     /// from `Hello` and replaced by each `HookBinaryNotice` broadcast. Drawn as
     /// one dashboard footer row while non-empty.
     pub hook_binary_notices: Vec<crate::hook_binary::HookBinaryNotice>,
+    /// Issue #2330, a client's side: the attached daemon's pending in-deck
+    /// approval requests, seeded from `Hello` on every (re)subscription and
+    /// replaced by each newer `TrustRequests` broadcast. `None` while the
+    /// daemon has not said it raises any (an older daemon, or before the first
+    /// seed); the TUI then shows none.
+    pub trust_requests: Option<crate::daemon_protocol::TrustRequestList>,
     /// PRD #1666 part 2 (`lifecycle/handshake/011`), a client's side: the
     /// daemon now answering at this TUI's endpoint speaks another attach
     /// protocol, found when the event subscriber reconnected
@@ -4615,6 +4621,22 @@ enum AppliedEvent {
 }
 
 impl AppState {
+    /// Issue #2330: apply a `TrustRequests` broadcast. A list older than the
+    /// one held (by revision) is dropped, so two broadcasts received out of
+    /// order leave the newer. Taken when none is held yet too: only a daemon
+    /// that raises requests broadcasts one, so a `Hello` seed that timed out
+    /// does not hide a request raised afterwards.
+    pub fn apply_trust_requests(&mut self, list: crate::daemon_protocol::TrustRequestList) {
+        if self
+            .trust_requests
+            .as_ref()
+            .is_some_and(|held| held.revision > list.revision)
+        {
+            return;
+        }
+        self.trust_requests = Some(list);
+    }
+
     /// The status of the session currently bound to `pane_id`, read the way
     /// [`Self::pane_session_id`] picks that session.
     fn pane_status(&self, pane_id: &str) -> Option<SessionStatus> {
@@ -5621,7 +5643,9 @@ impl ProjectConfigs {
     pub(crate) fn trust_refusal(&self, path: &str, dir: &str, name: &str) -> Option<String> {
         let check = self.trust_check(dir, name)?;
         crate::project_trust::log_refusal(path, &check);
-        check.refusal()
+        // Issue #2330: in the serving daemon, ask the attached clients for
+        // the approval, and say so.
+        crate::trust_requests::refusal_for(&check, path)
     }
 
     /// PRD #1885: [`Self::trust_refusal`] for a `delegate` sent from
@@ -5634,7 +5658,7 @@ impl ProjectConfigs {
         name: &str,
     ) -> Option<String> {
         let check = self.trust_check(dir, name)?;
-        let refusal = check.refusal()?;
+        let refusal = crate::trust_requests::refusal_for(&check, "delegate")?;
         warn!(
             pane_id = %escape_id_for_log(caller_pane),
             orchestration = %escape_id_for_log(name),

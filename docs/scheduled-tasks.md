@@ -259,19 +259,19 @@ For more detail, see [Troubleshooting](troubleshooting.md#enabling-debug-logs).
 
 ### Runs refused as not approved
 
-A run that would start an orchestration, from its schedule, **Run now** or an issue dispatch, starts nothing when you have not approved that orchestration as its `.dot-agent-deck.toml` now reads: never approved, or its roles changed since. A run never asks; nobody is there to answer. Instead:
+A run that would start an orchestration, from its schedule, **Run now** or an issue dispatch, starts nothing when you have not approved that orchestration as its `.dot-agent-deck.toml` now reads: never approved, or its roles changed since. Instead, the deck asks you to approve it in the TUI and the desktop app attached to it, with the same **Review project commands** review the New Agent form shows, naming the scheduled task that asked. If no client is attached, the review appears when one attaches. Approve there, and the next fire, or `dot-agent-deck schedule run-now --name <name>`, starts it ([Answering the deck's request](project-trust.md#answering-the-decks-request)). If you deny it, the schedule's runs are refused without asking again until the text changes or the daemon restarts. The refusal is also reported:
 
 - `dot-agent-deck schedule list` prints `last fire refused at <time>: <message>` beneath the schedule;
 - the TUI's [Schedules manager](#the-tuis-schedules-manager) shows the status `refused`, and the message while the schedule is selected;
 - the daemon log has the same message.
 
-The message names the orchestration, the project and the command that approves it, such as `dot-agent-deck trust approve /home/you/code/demo --orchestration team`. Run it from a terminal outside the deck, read what it prints, approve, then `dot-agent-deck schedule run-now --name <name>`. For an issue-dispatch schedule, the project is the schedule's clone, so its very first run clones the repository and is then refused: approve the clone with the command that refusal prints. See [Approving Project Commands](project-trust.md).
+The message names the orchestration, the project and the command that approves it, such as `dot-agent-deck trust approve /home/you/code/demo --orchestration team`. Instead of the review in a client, you can run it from a terminal outside the deck, read what it prints, approve, then `dot-agent-deck schedule run-now --name <name>`. For an issue-dispatch schedule, the project is the schedule's clone, so its very first run clones the repository and is then refused: approve the clone with the command that refusal prints. See [Approving Project Commands](project-trust.md).
 
 ### Symptoms
 
 | Symptom | Cause | What to do |
 |---|---|---|
-| `schedule list` says `last fire refused`, or the Schedules manager says `refused` | The orchestration the run opens is not approved, or its roles changed. | Run the approve command in the message; see [Runs refused as not approved](#runs-refused-as-not-approved). |
+| `schedule list` says `last fire refused`, or the Schedules manager says `refused` | The orchestration the run opens is not approved, or its roles changed. | Approve from the review the deck opens in a client, or run the approve command in the message; see [Runs refused as not approved](#runs-refused-as-not-approved). |
 | `schedule add` fails with `invalid cron expression: …` | The cron expression does not parse. | Fix it using [Cron syntax](#cron-syntax). |
 | `schedule add` fails with `--command is required: …` | A plain schedule has no `--command`. | Pass `--command`. |
 | `schedule add` fails with `a schedule named "<name>" already exists; …` | Names are unique. | Use `schedule update`, or another name. |

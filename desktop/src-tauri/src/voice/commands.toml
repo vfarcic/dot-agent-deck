@@ -540,7 +540,9 @@ overview. Closing the Host popover is THIS one too: close host (the accessible n
 X button), close host info, close resource usage, hide resource usage, close the host figures — a
 request to CLOSE or HIDE the Host figures is never `show_host_metrics`. Closing the dashboard's counters
 is THIS one too: close the counters, hide the counters, close the stats, hide the stats, close the counts —
-a request to CLOSE or HIDE the counters is never `show_dashboard_counters`. In the agent pane with typing off,
+a request to CLOSE or HIDE the counters is never `show_dashboard_counters`. On a Review project commands dialog the deck
+opened on its own (it asks who refused to start the orchestration), deny, deny it and decline are THIS one too: closing it
+declines that request, as its Deny button does. In the agent pane with typing off,
 the whole phrases "close agent", "close this agent" and "close the agent" ask for its stop
 confirmation (`stop_agent`), not this view-only command. Elsewhere "close the agent", and on
 the agent screen "close the agent screen", "close the agent
@@ -2119,7 +2121,9 @@ meaning     = "whole"
 [[commands]]
 id          = "approve_project_commands"
 description = """Approve the project commands and prompts the Review project commands dialog shows,
-and start the orchestration it was opened for — the voice form of its Approve and start button. Use
+and start the orchestration it was opened for — the voice form of its Approve and start button, and of
+the Approve button of a review the deck opened on its own after refusing to start an orchestration,
+which starts nothing: the refused attempt starts when it is retried. Use
 for approve and start, approve, approve it, approve them, approve the commands, approve these
 commands, approve project commands, approve the project commands and start, or I approve. It
 approves exactly the text on screen and nothing else, and runs only while that review is open; with
@@ -2129,7 +2133,7 @@ mind, close this — is `close`, which approves and starts nothing. A start that
 invoke      = "approveProjectCommands"
 screens     = ["deck", "overview"]
 unavailable_hint = "approving project commands works while the Review project commands dialog is open"
-report      = "Approved the project commands. Starting the orchestration."
+report      = "Approved the project commands."
 asks_to     = "approve the project commands on screen and start the orchestration"
 try_saying  = "approve and start"
 must_name   = ["approve"]

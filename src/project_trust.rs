@@ -641,6 +641,52 @@ pub fn refusal_text(
     ))
 }
 
+/// Issue #2330: the refusal when the serving daemon has asked the attached
+/// clients for the approval ([`crate::trust_requests`]). Names the
+/// orchestration, the project and the state as [`refusal_text`] does, says the
+/// approval was requested in the deck and to retry once it is approved, and
+/// still names the CLI command for a user with no client attached. Escaped for
+/// display, as [`refusal_text`] is.
+pub fn requested_refusal_text(check: &TrustCheck) -> String {
+    let Some(state) = verdict_phrase(&check.verdict) else {
+        return String::new();
+    };
+    crate::untrusted_text::escape_control_and_bidi(&format!(
+        "orchestration '{}' of project {} {state}, so nothing from it was started. {} \
+         Or approve it from a terminal outside the deck with: {}",
+        check.orchestration,
+        check.project.display(),
+        REQUESTED_IN_DECK,
+        approve_command(&check.config_dir, &check.orchestration)
+    ))
+}
+
+/// Issue #2330: what [`requested_refusal_text`] says the caller should do.
+pub const REQUESTED_IN_DECK: &str = "Its approval was requested in the deck: the user can review \
+     it in the dot-agent-deck TUI or desktop app attached to this deck, and once it is approved \
+     the same attempt, retried, starts it.";
+
+/// Issue #2330: what [`declined_refusal_text`] says of the user's answer.
+pub const DECLINED_IN_DECK: &str = "the user declined it in the deck";
+
+/// Issue #2330: the refusal when the user declined this exact text in a
+/// client since the daemon started. It is not asked again until the text
+/// changes; the New Agent form and the CLI command can still approve it.
+/// Escaped for display, as [`refusal_text`] is.
+pub fn declined_refusal_text(check: &TrustCheck) -> String {
+    let Some(state) = verdict_phrase(&check.verdict) else {
+        return String::new();
+    };
+    crate::untrusted_text::escape_control_and_bidi(&format!(
+        "orchestration '{}' of project {} {state} and {DECLINED_IN_DECK}, so nothing from it \
+         was started. To start it, approve it from the deck's New Agent form or from a \
+         terminal outside the deck with: {}",
+        check.orchestration,
+        check.project.display(),
+        approve_command(&check.config_dir, &check.orchestration)
+    ))
+}
+
 /// What a refusal says of `verdict` — `was never approved`, or `changed since
 /// you approved it (roles: …)` naming each changed role — or `None` when it
 /// is approved. Not escaped: the caller escapes the sentence it builds.

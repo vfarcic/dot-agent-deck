@@ -56,6 +56,45 @@ export const APPROVAL_IN_FLIGHT_NOTE = "The approval has been sent to the deck. 
  */
 export const REVIEW_DECK_CHANGED = "The project commands review was closed because the selected deck changed. Nothing was approved or started.";
 
+/**
+ * Issue #2330 — a review the deck ASKED for: it refused to start an
+ * orchestration (an agent's dispatch, a restart, a schedule firing) because it
+ * is not approved as its config now reads, and every attached client shows the
+ * review. Approving records the approval and starts nothing here: the refused
+ * attempt starts when whoever made it tries again. Deny declines it.
+ */
+/** The sentence such a review starts with, the TUI's. */
+export const REQUEST_INTRO = "The deck refused to start this orchestration because it is not approved as its config now reads. Approve it to let the same attempt start when it is retried.";
+/** The label of what asked, the TUI's. */
+export const ASKED_BY_LABEL = "Asked by";
+/** The approve button of a review the deck asked for (the TUI's `a approve`). */
+export const APPROVE = "Approve";
+/** The decline button of a review the deck asked for (the TUI's `Esc deny`). */
+export const DENY = "Deny";
+/** The cancel button of a review the user opened. */
+export const CANCEL = "Cancel";
+/**
+ * How long a review the deck opened on its own ignores `Esc` after it is
+ * drawn, so a key the user was already typing elsewhere cannot answer it — the
+ * star reminder's guard, and the TUI's (`REQUEST_KEYS_ARM`).
+ */
+export const REQUEST_KEYS_ARM_MS = 400;
+
+/** What the app says once a request's text is approved, the TUI's status line. */
+export function requestApprovedNotice(orchestration: string, askedBy: string): string {
+  return `Approved orchestration '${orchestration}'. It starts when ${askedBy} tries again.`;
+}
+
+/** What the app says once a request is declined, the TUI's status line. */
+export function requestDeniedNotice(orchestration: string): string {
+  return `Declined orchestration '${orchestration}'. The deck will not ask about this text again until it restarts.`;
+}
+
+/** What the app says when a request's review closes because another client, the CLI or a config change settled it, the TUI's status line. */
+export function requestAnsweredElsewhereNotice(orchestration: string): string {
+  return `The approval request for orchestration '${orchestration}' was answered elsewhere.`;
+}
+
 /** The deck a review is for, as the dialog labels it. */
 export const DECK_LABEL = "Deck";
 /** A role's `start` flag, in the TUI prompt's words (`src/trust_prompt.rs`). */
@@ -152,6 +191,18 @@ export type TrustCheck = { kind: "approved" } | { kind: "review" } | { kind: "re
 /** What starts once the shown text is approved: given the deck's view of what it approved. */
 export type ApprovedStart = (approved: ProjectTrustView) => Promise<void> | void;
 
+/** Issue #2330 — the deck's own request a review answers: its number on that deck, and what asked. */
+export interface ReviewRequest {
+  id: number;
+  askedBy: string;
+}
+
+/** How a review is shown: the deck's name, and the deck's request when the deck asked for it. */
+export interface ReviewDisplay {
+  deckName?: string;
+  request?: ReviewRequest;
+}
+
 /** The review on screen: what it shows, and what approving it starts. */
 export interface ShownReview {
   /** This review's own number, never reused: what an approval is bound to. */
@@ -159,6 +210,8 @@ export interface ShownReview {
   target: ProjectTrustTarget;
   /** The deck's name, shown so the user knows which deck they approve on. */
   deckName?: string;
+  /** Issue #2330 — set when the deck asked for this review: Deny declines the request, and approving starts nothing. */
+  request?: ReviewRequest;
   view: ProjectTrustView;
   start: ApprovedStart;
   busy: boolean;
@@ -277,7 +330,7 @@ export function useProjectTrustReview(runtime: ProjectTrustRuntime) {
     if (mounted.current) setShown(next);
   }, []);
 
-  const check = useCallback(async (target: ProjectTrustTarget, start: ApprovedStart, display?: { deckName?: string }): Promise<TrustCheck> => {
+  const check = useCallback(async (target: ProjectTrustTarget, start: ApprovedStart, display?: ReviewDisplay): Promise<TrustCheck> => {
     if (!runtime.projectTrustState || !runtime.approveProjectTrust) return { kind: "refused", reason: RUNTIME_CANNOT_REVIEW };
     let answer: ProjectTrust;
     try {
@@ -290,7 +343,7 @@ export function useProjectTrustReview(runtime: ProjectTrustRuntime) {
     if (!mounted.current) return { kind: "refused", reason: RUNTIME_CANNOT_REVIEW };
     const { kind: _kind, ...view } = answer;
     reviewsShown += 1;
-    show({ id: reviewsShown, target, ...(display?.deckName === undefined ? {} : { deckName: display.deckName }), view, start, busy: false });
+    show({ id: reviewsShown, target, ...(display?.deckName === undefined ? {} : { deckName: display.deckName }), ...(display?.request === undefined ? {} : { request: display.request }), view, start, busy: false });
     return { kind: "review" };
   }, [runtime, show]);
 

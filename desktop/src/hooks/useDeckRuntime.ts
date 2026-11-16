@@ -457,6 +457,9 @@ export function useDeckRuntime(): DeckRuntimeState {
   // launching screen's to say, not the global toast's.
   const projectTrustState = useCallback((target: ProjectTrustTarget) => bridge.projectTrustState(target), [bridge]);
   const approveProjectTrust = useCallback((target: ProjectTrustTarget, digest: string) => bridge.approveProjectTrust(target, digest), [bridge]);
+  // Issue #2330: declining a request the deck raised. A bridge without it
+  // leaves it absent, and the app shows no request.
+  const denyTrustRequest = useMemo(() => (typeof bridge.denyTrustRequest === "function" ? (deckId: string, id: number, digest: string) => bridge.denyTrustRequest!(deckId, id, digest) : undefined), [bridge]);
   // PRD #2174: the star reminder. A bridge without the calls (some test
   // doubles) leaves both absent, and the app never shows the reminder.
   const starPromptLaunch = useMemo(() => (typeof bridge.starPromptLaunch === "function" ? () => bridge.starPromptLaunch!() : undefined), [bridge]);
@@ -565,6 +568,7 @@ export function useDeckRuntime(): DeckRuntimeState {
     newAgentOrchestrations,
     projectTrustState,
     approveProjectTrust,
+    ...(denyTrustRequest ? { denyTrustRequest } : {}),
     ...(starPromptLaunch ? { starPromptLaunch } : {}),
     ...(starPromptChoose ? { starPromptChoose } : {}),
     getSettings,

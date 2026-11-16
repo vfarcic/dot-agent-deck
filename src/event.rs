@@ -3188,6 +3188,19 @@ pub enum BroadcastMsg {
     /// [`crate::agent_pty::AgentRecord::input_held`] it does not read either.
     #[serde(rename = "input_held")]
     InputHeld(InputHeldUpdate),
+    /// Issue #2330: the daemon's pending in-deck approval requests changed —
+    /// one was raised by a refused start, answered in a client, or settled
+    /// because the orchestration was approved or its text changed. Carries the
+    /// whole list, which replaces what a client holds when its revision is
+    /// newer.
+    ///
+    /// No [`crate::daemon_protocol::PROTOCOL_VERSION`] bump, for
+    /// [`Self::HookBinaryNotice`]'s reason: every client that can attach to
+    /// this protocol version reads an unknown kind as [`Self::Unknown`]. A
+    /// client acts on it only from a daemon that advertises
+    /// [`crate::daemon_protocol::CAP_TRUST_REQUESTS`].
+    #[serde(rename = "trust_requests")]
+    TrustRequests(crate::daemon_protocol::TrustRequestList),
     /// A `kind` tag this build has never heard of (issue #801 item 3, applied
     /// by PRD #741 M8).
     ///

@@ -939,6 +939,78 @@ pub const CAP_LAST_COMMAND: &str = "last-command";
 /// `#[cfg]`-gated.
 pub const CAP_PROJECT_TRUST: &str = "project-trust";
 
+/// Capability string for issue #2330's in-deck approval requests: this daemon
+/// raises a [`TrustRequest`] when it refuses to start an orchestration that is
+/// not approved as its config now reads, reports the pending ones on
+/// [`AttachResponse::trust_requests`] and in
+/// [`crate::event::BroadcastMsg::TrustRequests`], and serves
+/// [`AttachRequest::DenyTrustRequest`]. Approving one is the existing
+/// [`AttachRequest::ApproveProjectTrust`], so a daemon advertising this also
+/// advertises [`CAP_PROJECT_TRUST`].
+///
+/// **A client shows a request only from a daemon that advertises this, and
+/// withholds `DenyTrustRequest` from one that does not** (CLAUDE.md rule 18,
+/// second rung), so no [`PROTOCOL_VERSION`] bump. The reply field is additive
+/// and optional, and the broadcast is a new `kind` an older client decodes as
+/// [`crate::event::BroadcastMsg::Unknown`] (issue #1637's precedent). Held by
+/// [`crate::daemon_client::DaemonClient::deny_trust_request`]. Advertised on
+/// every platform: neither the raise nor the dispatch arm is `#[cfg]`-gated.
+pub const CAP_TRUST_REQUESTS: &str = "trust-requests";
+
+/// Issue #2330: one pending in-deck approval request — an attempt to start
+/// `orchestration` of `project` was refused because its text (the one
+/// `digest` names) is not the approved text, and the daemon asks a client to
+/// show the review. A client reads the text to show with
+/// [`AttachRequest::ProjectTrustState`] on `config_dir` and `orchestration`,
+/// approves with [`AttachRequest::ApproveProjectTrust`], and declines with
+/// [`AttachRequest::DenyTrustRequest`] naming `id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrustRequest {
+    /// The request's number in this daemon's lifetime, never reused.
+    pub id: u64,
+    /// The project identity the approval is kept under.
+    pub project: String,
+    /// The directory the refused attempt read the config from.
+    pub config_dir: String,
+    /// The name the approval is kept under (what the review shows).
+    pub orchestration: String,
+    /// The digest of the refused text.
+    pub digest: String,
+    /// What tried to start it — `dispatch`, a schedule's name, `delegate`,
+    /// `pane restart`, … — escaped and bounded by the daemon.
+    pub asked_by: String,
+}
+
+/// Issue #2330: every pending [`TrustRequest`], oldest first. `revision` moves
+/// on every change, so a client that receives two lists out of order keeps
+/// the newer one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrustRequestList {
+    pub revision: u64,
+    #[serde(default)]
+    pub requests: Vec<TrustRequest>,
+}
+
+/// The most requests a client takes from one list, whatever a daemon sends
+/// ([`crate::trust_requests::MAX_PENDING_REQUESTS`] is the daemon's own cap).
+pub const MAX_TRUST_REQUESTS_SHOWN: usize = 32;
+
+impl TrustRequestList {
+    /// The list as a client keeps it: at most [`MAX_TRUST_REQUESTS_SHOWN`]
+    /// requests, each label escaped, so a remote or older daemon's list
+    /// reaches the screen only through this.
+    pub fn sanitized(mut self) -> Self {
+        self.requests.truncate(MAX_TRUST_REQUESTS_SHOWN);
+        for request in &mut self.requests {
+            request.asked_by = crate::untrusted_text::escape_control_and_bidi(&request.asked_by)
+                .chars()
+                .take(crate::trust_requests::MAX_ASKED_BY_CHARS)
+                .collect();
+        }
+        self
+    }
+}
+
 /// Capability string for [`AttachRequest::PostMessage`] (PRD #1666): a client
 /// hands a deck-generated message — a seed, an orchestrator's role context, the
 /// configuration prompt — to the daemon's inbox instead of typing it into the
@@ -1379,6 +1451,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_ADDRESSED_MESSAGE_AGENT,
     CAP_KEEP_WORKTREE,
     CAP_PROJECT_TRUST,
+    CAP_TRUST_REQUESTS,
 ];
 #[cfg(not(unix))]
 pub const DAEMON_CAPABILITIES: &[&str] = &[
@@ -1406,6 +1479,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_ADDRESSED_MESSAGE_AGENT,
     CAP_KEEP_WORKTREE,
     CAP_PROJECT_TRUST,
+    CAP_TRUST_REQUESTS,
 ];
 
 // ---------------------------------------------------------------------------
@@ -3159,6 +3233,20 @@ pub enum AttachRequest {
         orchestration: String,
         digest: String,
     },
+    /// Issue #2330: the user declined in-deck approval request `id`
+    /// ([`TrustRequest`]), shown with text `digest`. A request with that id
+    /// whose text is another (a restarted daemon numbers anew) is not declined. The daemon closes it in every client and refuses
+    /// that exact text again, saying the user declined it, until it restarts.
+    /// The reply carries the list as it stands after it on
+    /// [`AttachResponse::trust_requests`]; a request already answered (by
+    /// another client) or settled is no error.
+    ///
+    /// **Withheld unless the daemon advertises [`CAP_TRUST_REQUESTS`]**: an
+    /// older daemon has no such variant.
+    DenyTrustRequest {
+        id: u64,
+        digest: String,
+    },
     /// PRD #1666: post a deck-generated message to `pane_id`'s inbox, bound to
     /// `expected_agent_id` (the pane's live agent when omitted). The reply
     /// carries the message id on [`AttachResponse::id`]; a refusal (no such
@@ -4094,6 +4182,16 @@ pub struct AttachResponse {
     /// reporting nothing to show.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hook_binary_notices: Option<Vec<crate::hook_binary::HookBinaryNotice>>,
+    /// Issue #2330: the daemon's pending in-deck approval requests. Set on the
+    /// [`AttachRequest::Hello`], [`AttachRequest::SubscribeEventsWithSnapshot`]
+    /// and [`AttachRequest::DenyTrustRequest`] replies of a daemon that
+    /// advertises [`CAP_TRUST_REQUESTS`], so a client attaching after a refusal
+    /// still shows it; a change mid-session arrives as
+    /// [`crate::event::BroadcastMsg::TrustRequests`].
+    ///
+    /// Additive and optional, so no [`PROTOCOL_VERSION`] bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_requests: Option<TrustRequestList>,
     /// Issue #887: this daemon's registered-schedule revision
     /// ([`crate::scheduler::Scheduler::revision`]), populated on the
     /// [`AttachRequest::ListAgents`] reply.
@@ -7978,6 +8076,9 @@ async fn handle_connection(
                 resp = resp.with_running_agents(summary);
             }
             resp.hook_binary_notices = Some(state.read().await.hook_binaries.notices());
+            // Issue #2330: the requests pending now, so a client that attaches
+            // after a refusal shows it.
+            resp.trust_requests = crate::trust_requests::list();
             write_resp(&mut stream, &resp).await?;
             // PRD #1589 (review on PR #1681): serve one more request on this
             // connection, so the verb a client gates on this reply reaches
@@ -8435,7 +8536,15 @@ async fn handle_connection(
                                     orchestration = %orchestration,
                                     "a client approved the orchestration's commands and prompts"
                                 );
-                                trust_view_now(&dir, &orchestration)
+                                let view = trust_view_now(&dir, &orchestration)?;
+                                // Issue #2330: close the in-deck request for
+                                // this text in every client.
+                                crate::trust_requests::note_approved(
+                                    std::path::Path::new(&view.project),
+                                    &view.orchestration,
+                                    &digest,
+                                );
+                                Ok(view)
                             }
                             crate::project_trust::ApproveOutcome::Stale => {
                                 Err(crate::project_trust::TrustError::Config(format!(
@@ -8447,6 +8556,21 @@ async fn handle_connection(
                         }
                     })
                     .await,
+                ),
+            };
+            write_resp(&mut stream, &resp).await?
+        }
+        // Issue #2330: the user declined an in-deck approval request.
+        AttachRequest::DenyTrustRequest { id, digest } => {
+            let (_, list) = crate::trust_requests::deny(id, &digest);
+            let resp = match list {
+                Some(list) => {
+                    let mut resp = AttachResponse::ok();
+                    resp.trust_requests = Some(list);
+                    resp
+                }
+                None => AttachResponse::err(
+                    "deny-trust-request: this daemon raises no approval requests",
                 ),
             };
             write_resp(&mut stream, &resp).await?
@@ -9715,6 +9839,10 @@ async fn handle_subscribe_events_with_snapshot(
     // Issue #1637: read under the same guard as the receiver, so a notice
     // change is either in this reply or on the stream.
     resp.hook_binary_notices = Some(notices);
+    // Issue #2330: read after the receiver opened, so a change is in this
+    // reply, on the stream, or both; every list carries its revision and a
+    // client keeps the newest.
+    resp.trust_requests = crate::trust_requests::list();
     forward_event_stream(stream, rx, &resp).await
 }
 

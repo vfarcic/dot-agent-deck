@@ -1645,6 +1645,24 @@ describe("TauriDeckBridge", () => {
   });
 
   /**
+   * Scenario (issue #2330): a connected deck's live snapshot lists an in-deck
+   * approval request. `mapDesktopSnapshot` carries it onto the connection the
+   * review opens from; a snapshot without requests, and one from a deck that
+   * is not connected, carry none.
+   */
+  it("carries a connected deck's approval requests onto the mapped connection", async () => {
+    const { mapDesktopSnapshot } = await import("./bridge");
+    const request = { id: 4, project: "/srv/demo", configDir: "/srv/demo", orchestration: "team", digest: "ab12", askedBy: "dispatch" };
+    const withRequest = structuredClone(snapshot);
+    withRequest.connection.trustRequests = [request];
+    expect(mapDesktopSnapshot(withRequest).connection.trustRequests).toEqual([request]);
+    expect(mapDesktopSnapshot(snapshot).connection.trustRequests).toBeUndefined();
+    const away = structuredClone(withRequest);
+    away.connection.status = "disconnected";
+    expect(mapDesktopSnapshot(away).connection.trustRequests).toBeUndefined();
+  });
+
+  /**
    * The M8 audit's prompt finding, at the seam that closes it. The deck renders
    * `task` straight into a DOM text node, so the bridge — not the tile — makes
    * it a display copy: sanitised of controls and bidi overrides, and clamped to

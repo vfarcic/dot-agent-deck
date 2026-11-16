@@ -1521,6 +1521,24 @@ pub enum GatedQuery<T> {
     Unsupported,
 }
 
+/// Issue #2330: the pending in-deck approval requests a `Hello` (or
+/// snapshot) reply carries, sanitized, or `None` when the daemon does not
+/// advertise [`crate::daemon_protocol::CAP_TRUST_REQUESTS`] — a client shows
+/// requests only from a daemon that says it raises them.
+pub fn trust_requests_of(
+    resp: &AttachResponse,
+) -> Option<crate::daemon_protocol::TrustRequestList> {
+    if !DaemonCapabilities::from_hello(resp).supports(crate::daemon_protocol::CAP_TRUST_REQUESTS) {
+        return None;
+    }
+    Some(
+        resp.trust_requests
+            .clone()
+            .map(crate::daemon_protocol::TrustRequestList::sanitized)
+            .unwrap_or_default(),
+    )
+}
+
 /// PRD #1885: the answer of a trust request, or its refusal.
 fn project_trust_answer(
     resp: AttachResponse,
@@ -2884,6 +2902,71 @@ impl DaemonClient {
         )
         .await?;
         project_trust_answer(resp, "approve-project-trust")
+    }
+
+    /// Issue #2330 — the daemon's pending in-deck approval requests, from one
+    /// `Hello` exchange. `Ok(None)` from a daemon that does not advertise
+    /// [`crate::daemon_protocol::CAP_TRUST_REQUESTS`], which raises none; a
+    /// client then shows none.
+    pub async fn trust_requests(
+        &self,
+    ) -> Result<Option<crate::daemon_protocol::TrustRequestList>, ClientError> {
+        let (mut rd, mut wr) = self.connect().await?;
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::Hello {
+                client_version: crate::daemon_protocol::PROTOCOL_VERSION,
+                client_build_version: None,
+                follow_on: false,
+            },
+        )
+        .await?;
+        Ok(trust_requests_of(&resp))
+    }
+
+    /// Issue #2330 — the user declined in-deck approval request `id`, shown with
+    /// text `digest` (the daemon declines nothing when the request it holds
+    /// under `id` carries other text). Answers
+    /// the list as it stands after it. A request another client already
+    /// answered is no error.
+    ///
+    /// **Withholds unless the daemon advertises
+    /// [`crate::daemon_protocol::CAP_TRUST_REQUESTS`]**, answering
+    /// [`GatedQuery::Unsupported`] without sending anything.
+    pub async fn deny_trust_request(
+        &self,
+        id: u64,
+        digest: &str,
+    ) -> Result<GatedQuery<crate::daemon_protocol::TrustRequestList>, ClientError> {
+        if !self
+            .capabilities()
+            .await?
+            .supports(crate::daemon_protocol::CAP_TRUST_REQUESTS)
+        {
+            return Ok(GatedQuery::Unsupported);
+        }
+        let (mut rd, mut wr) = self.admitted_connect().await?;
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::DenyTrustRequest {
+                id,
+                digest: digest.to_string(),
+            },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error
+                    .unwrap_or_else(|| "deny-trust-request failed".into()),
+            ));
+        }
+        Ok(GatedQuery::Answered(
+            resp.trust_requests
+                .map(crate::daemon_protocol::TrustRequestList::sanitized)
+                .unwrap_or_default(),
+        ))
     }
 
     /// PRD #819 M6: prepare a launch — the only project verb that writes.
@@ -4448,6 +4531,12 @@ impl EventSubscription {
                                     notices: crate::hook_binary::sanitize_notices(&payload.notices),
                                 },
                             )));
+                        }
+                        // Issue #2330: requests carry daemon-composed labels
+                        // bound for a dialog; bounded and escaped here, as
+                        // `trust_requests_of` does for `Hello`.
+                        Ok(BroadcastMsg::TrustRequests(list)) => {
+                            return Ok(Some(BroadcastMsg::TrustRequests(list.sanitized())));
                         }
                         Ok(msg) => return Ok(Some(msg)),
                         Err(e) => {
