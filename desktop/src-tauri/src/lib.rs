@@ -7081,6 +7081,7 @@ pub fn run() {
             desktop_new_agent_orchestrations,
             trust_review::desktop_project_trust_state,
             trust_review::desktop_approve_project_trust,
+            trust_review::desktop_deny_trust_request,
             star_prompt::desktop_star_prompt_launch,
             star_prompt::desktop_star_prompt_choose,
             desktop_list_directories,

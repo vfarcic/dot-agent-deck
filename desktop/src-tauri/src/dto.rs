@@ -470,6 +470,12 @@ pub struct DesktopConnection {
     /// this app and the TUI show the same words. Omitted when empty.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub hook_binary_notices: Vec<HookBinaryNoticeDto>,
+    /// Issue #2330: the deck's pending in-deck approval requests — each an
+    /// orchestration the deck refused to start because it is not approved as
+    /// its config now reads — from the daemon's `Hello` reply, oldest first.
+    /// Only from a daemon that advertises `trust-requests`. Omitted when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub trust_requests: Vec<TrustRequestDto>,
     /// PRD #1666 part 2 (G-fix7c): on a connected snapshot, the daemon process
     /// whose `ListAgents` reply its agents are — the same value each
     /// [`DesktopAgent::incarnation`] carries, stated once for the deck so that
@@ -539,6 +545,55 @@ impl HookBinaryNoticeDto {
             remedy,
             command,
         }
+    }
+}
+
+/// The longest digest a [`TrustRequestDto`] carries: the daemon's is a SHA-256
+/// in lowercase hex, 64 characters; anything longer is not one.
+const TRUST_REQUEST_DIGEST_MAX_CHARS: usize = 128;
+
+/// One pending in-deck approval request as the webview reads it (issue #2330).
+/// The webview opens the review for it with `desktop_project_trust_state` on
+/// `config_dir` and `orchestration`, approves with
+/// `desktop_approve_project_trust`, and declines with
+/// `desktop_deny_trust_request` naming `id`.
+///
+/// Every string is escaped (`untrusted_text::escape_control_and_bidi`, the
+/// review's own escaping), since a remote deck's daemon composed them; a
+/// well-formed path or name is unchanged by it, so the review it opens is for
+/// the text the deck refused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrustRequestDto {
+    /// The request's number in its daemon's lifetime.
+    pub id: u64,
+    /// The project the approval is kept under.
+    pub project: String,
+    /// The directory the refused attempt read the config from.
+    pub config_dir: String,
+    pub orchestration: String,
+    /// The digest of the refused text, lowercase hex.
+    pub digest: String,
+    /// What tried to start it (`dispatch`, a schedule's name, …).
+    pub asked_by: String,
+}
+
+impl TrustRequestDto {
+    /// The request as the webview shows it, or `None` for one whose digest is
+    /// not a digest (which a well-formed daemon never sends).
+    pub(crate) fn new(request: &dot_agent_deck::daemon_protocol::TrustRequest) -> Option<Self> {
+        let escape = dot_agent_deck::untrusted_text::escape_control_and_bidi;
+        let digest_ok = !request.digest.is_empty()
+            && request.digest.chars().count() <= TRUST_REQUEST_DIGEST_MAX_CHARS
+            && request.digest.chars().all(|c| c.is_ascii_hexdigit());
+        digest_ok.then(|| Self {
+            id: request.id,
+            project: escape(&request.project),
+            config_dir: escape(&request.config_dir),
+            orchestration: escape(&request.orchestration),
+            digest: request.digest.clone(),
+            asked_by: escape(&request.asked_by),
+        })
     }
 }
 
@@ -3417,6 +3472,7 @@ pub(crate) fn disconnected_snapshot(
             upgrade_offer: dot_agent_deck::daemon_upgrade::UpgradeOffer::Unknown,
             disconnected_reason: None,
             hook_binary_notices: Vec::new(),
+            trust_requests: Vec::new(),
             incarnation: Incarnation::default(),
         },
         agents: Vec::new(),

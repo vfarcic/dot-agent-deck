@@ -4386,8 +4386,16 @@ async fn run_daemon_serve_cli(
         refresh_state,
         daemon.event_tx.clone(),
     ));
+    // Issue #2330: this daemon asks its attached clients for an
+    // orchestration's approval when it refuses to start one, and closes a
+    // request once it is approved elsewhere or its text changes. Here rather
+    // than in `run_daemon_with`, for the reason the pin refresh above is: an
+    // in-process test daemon shares this process's one hub.
+    dot_agent_deck::trust_requests::install(daemon.event_tx.clone());
+    let trust_sweep = tokio::spawn(dot_agent_deck::trust_requests::run_sweep());
     let result = run_daemon_with(&path, daemon).await;
     pin_refresh.abort();
+    trust_sweep.abort();
     if let Err(e) = result {
         eprintln!("Daemon error: {e}");
         return ExitCode::FAILURE;

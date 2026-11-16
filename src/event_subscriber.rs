@@ -114,6 +114,7 @@ pub async fn run(client: DaemonClient, state: SharedState, config: SubscriberCon
             // Reset backoff on a successful subscribe (and resync).
             delay = config.initial_delay;
             seed_hook_binary_notices(&client, &state).await;
+            seed_trust_requests(&client, &state).await;
             loop {
                 match sub.next_event().await {
                     Ok(Some(BroadcastMsg::Event(event))) => {
@@ -162,6 +163,11 @@ pub async fn run(client: DaemonClient, state: SharedState, config: SubscriberCon
                     // The whole list replaces what the dashboard footer shows.
                     Ok(Some(BroadcastMsg::HookBinaryNotice(payload))) => {
                         state.write().await.hook_binary_notices = payload.notices;
+                    }
+                    // Issue #2330: the daemon's in-deck approval requests
+                    // changed. The render loop shows the review for one.
+                    Ok(Some(BroadcastMsg::TrustRequests(list))) => {
+                        state.write().await.apply_trust_requests(list);
                     }
                     // PRD #741 M8 (issue #801 item 3): a `kind` tag this
                     // build does not know, from a newer daemon. Ignored
@@ -312,6 +318,20 @@ const HOOK_NOTICE_SEED_TIMEOUT: Duration = Duration::from_secs(2);
 /// omits the field (one that predates the notices, or has none) and a `Hello`
 /// that fails or does not answer in time both leave no notice, since the list
 /// held may be a previous daemon's.
+/// Issue #2330: seed the in-deck approval requests from one `Hello`, after
+/// the stream is open, so a request raised before it is in the seed and one
+/// raised after it is on the stream. The seed replaces what is held whatever
+/// its revision: after a reconnect it may be a restarted daemon counting from
+/// zero. A daemon that does not answer in time, or does not raise requests,
+/// leaves none shown.
+async fn seed_trust_requests(client: &DaemonClient, state: &SharedState) {
+    let list = match tokio::time::timeout(HOOK_NOTICE_SEED_TIMEOUT, client.trust_requests()).await {
+        Ok(Ok(list)) => list,
+        Ok(Err(_)) | Err(_) => None,
+    };
+    state.write().await.trust_requests = list;
+}
+
 async fn seed_hook_binary_notices(client: &DaemonClient, state: &SharedState) {
     let notices =
         match tokio::time::timeout(HOOK_NOTICE_SEED_TIMEOUT, client.hook_binary_notices()).await {

@@ -73,6 +73,43 @@ pub const CHANGED_WHILE_OPENING: &str = "Orchestration not started: its config c
 pub const OLDER_DAEMON_NOTE: &str =
     "The deck daemon is older than this TUI and cannot show the review prompt.";
 
+/// Issue #2330: the sentence a review opened by the deck's own request starts
+/// with. The desktop app shows the same words (`desktop/src/lib/projectTrust.ts`).
+pub const REQUEST_INTRO: &str = "The deck refused to start this orchestration because it is \
+     not approved as its config now reads. Approve it to let the same attempt start when it is \
+     retried.";
+
+/// Issue #2330: the label of what asked for the approval.
+pub const ASKED_BY_LABEL: &str = "Asked by";
+
+/// Issue #2330: how long a review the deck opened on its own ignores keys
+/// after it appears, so typing already under way cannot answer it. The star
+/// reminder's guard (`STAR_KEYS_ARM_MS` in `desktop/src/lib/starPrompt.ts`).
+pub const REQUEST_KEYS_ARM: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// Issue #2330: the status line after approving a request.
+pub fn request_approved_message(orchestration: &str, asked_by: &str) -> String {
+    escape_control_and_bidi(&format!(
+        "Approved orchestration '{orchestration}'. It starts when {asked_by} tries again."
+    ))
+}
+
+/// Issue #2330: the status line after denying a request.
+pub fn request_denied_message(orchestration: &str) -> String {
+    escape_control_and_bidi(&format!(
+        "Declined orchestration '{orchestration}'. The deck will not ask about this text again \
+         until it restarts."
+    ))
+}
+
+/// Issue #2330: the status line when a request's review closes because it was
+/// answered in another client, approved elsewhere, or its text changed.
+pub fn request_answered_elsewhere_message(orchestration: &str) -> String {
+    escape_control_and_bidi(&format!(
+        "The approval request for orchestration '{orchestration}' was answered elsewhere."
+    ))
+}
+
 /// What approving does: open the chosen orchestration, or restore a saved one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptAction {
@@ -80,11 +117,18 @@ pub enum PromptAction {
     Start,
     /// From session restore.
     Restore,
+    /// Issue #2330: from the deck's own request, after it refused to start
+    /// the orchestration. Approving records the approval and starts nothing;
+    /// `Esc` declines it.
+    Request,
 }
 
 /// The cancel key and what it does, as the footer shows it. A click on it
 /// cancels, as `Esc` does.
 pub const CANCEL_LABEL: &str = "Esc cancel";
+
+/// Issue #2330: the cancel key of a request's review, which declines it.
+pub const DENY_LABEL: &str = "Esc deny";
 
 /// What separates the footer's items.
 const FOOTER_SEPARATOR: &str = " · ";
@@ -95,14 +139,24 @@ impl PromptAction {
         match self {
             PromptAction::Start => "a approve and start",
             PromptAction::Restore => "a approve and restore",
+            PromptAction::Request => "a approve",
+        }
+    }
+
+    /// The cancel key and what it does, as the footer shows it.
+    pub fn cancel_label(self) -> &'static str {
+        match self {
+            PromptAction::Start | PromptAction::Restore => CANCEL_LABEL,
+            PromptAction::Request => DENY_LABEL,
         }
     }
 
     /// The footer: `a approve and start · Esc cancel · ↑↓ scroll`.
     pub fn footer(self) -> String {
         format!(
-            "{}{FOOTER_SEPARATOR}{CANCEL_LABEL}{FOOTER_SEPARATOR}↑↓ scroll",
-            self.approve_label()
+            "{}{FOOTER_SEPARATOR}{}{FOOTER_SEPARATOR}↑↓ scroll",
+            self.approve_label(),
+            self.cancel_label()
         )
     }
 }
@@ -381,7 +435,24 @@ fn push_text(
 /// `new`), command, agent, `start` and `clear` flags, description and prompt
 /// text, then any role the approval had that the orchestration no longer has.
 pub fn body_lines(view: &ProjectTrustView, width: usize) -> Vec<Line<'static>> {
+    body_lines_asked(view, None, width)
+}
+
+/// [`body_lines`], led — for a review the deck asked for (issue #2330) — by
+/// [`REQUEST_INTRO`] and what asked (`asked_by`).
+pub fn body_lines_asked(
+    view: &ProjectTrustView,
+    asked_by: Option<&str>,
+    width: usize,
+) -> Vec<Line<'static>> {
     let mut out = Vec::new();
+    if let Some(asked_by) = asked_by {
+        for row in crate::upgrade_dialog::wrap(REQUEST_INTRO, width.max(8)) {
+            out.push(Line::styled(row, mark_style()));
+        }
+        push_field(&mut out, 0, ASKED_BY_LABEL, asked_by, width);
+        out.push(Line::from(""));
+    }
     push_field(&mut out, 0, "Project", &view.project, width);
     if view.config_dir != view.project {
         push_field(&mut out, 0, "Config in", &view.config_dir, width);
@@ -520,9 +591,22 @@ pub fn render(
     action: PromptAction,
     scroll: usize,
 ) -> PromptLayout {
+    render_asked(frame, area, view, None, action, scroll)
+}
+
+/// [`render`], for a review the deck asked for (issue #2330): its body is led
+/// by [`REQUEST_INTRO`] and `asked_by` ([`body_lines_asked`]).
+pub fn render_asked(
+    frame: &mut Frame,
+    area: Rect,
+    view: &ProjectTrustView,
+    asked_by: Option<&str>,
+    action: PromptAction,
+    scroll: usize,
+) -> PromptLayout {
     let popup_width = area.width.saturating_sub(4).clamp(1, MAX_WIDTH);
     let text_width = usize::from(popup_width.saturating_sub(4));
-    let lines = body_lines(view, text_width);
+    let lines = body_lines_asked(view, asked_by, text_width);
     // The body, a blank row and the footer, plus the border.
     let wanted = lines.len().saturating_add(2 + 2);
     let popup_height = u16::try_from(wanted)
@@ -596,7 +680,7 @@ pub fn render(
     let approve = footer.and_then(|(area, _)| label_rect(area, 0, approve_label));
     let cancel = footer.and_then(|(area, _)| {
         let offset = approve_label.chars().count() + FOOTER_SEPARATOR.chars().count();
-        label_rect(area, offset, CANCEL_LABEL)
+        label_rect(area, offset, action.cancel_label())
     });
     PromptLayout {
         inner,
@@ -616,13 +700,26 @@ pub fn render_to_buffer(
     width: u16,
     height: u16,
 ) -> Buffer {
+    render_asked_to_buffer(view, None, action, scroll, width, height)
+}
+
+/// L1 entry point for a review the deck asked for (issue #2330): as
+/// [`render_to_buffer`], led by `asked_by`.
+pub fn render_asked_to_buffer(
+    view: &ProjectTrustView,
+    asked_by: Option<&str>,
+    action: PromptAction,
+    scroll: impl Into<usize>,
+    width: u16,
+    height: u16,
+) -> Buffer {
     let scroll = scroll.into();
     let backend = ratatui::backend::TestBackend::new(width, height);
     let mut terminal = ratatui::Terminal::new(backend).expect("a test terminal");
     terminal
         .draw(|frame| {
             let area = frame.area();
-            render(frame, area, view, action, scroll);
+            render_asked(frame, area, view, asked_by, action, scroll);
         })
         .expect("draw the trust prompt");
     terminal.backend().buffer().clone()

@@ -291,6 +291,46 @@ pub(crate) async fn desktop_approve_project_trust(
     approve_project_trust_on(&state, deck_id.as_deref(), &path, &orchestration, &digest).await
 }
 
+/// The refusal for a deck that raises no in-deck approval requests: it is
+/// older than this app, so it never asked, and there is nothing to decline.
+const NO_TRUST_REQUESTS: &str =
+    "This deck's daemon raises no approval requests, so there is nothing to decline.";
+
+/// [`desktop_deny_trust_request`] minus the webview.
+pub(crate) async fn deny_trust_request_on(
+    state: &DesktopState,
+    deck_id: &str,
+    id: u64,
+) -> Result<(), String> {
+    let daemon = review_daemon(state, Some(deck_id)).await?;
+    let answer = crate::daemon_bridge::bounded_reply(
+        "DenyTrustRequest",
+        daemon.client.deny_trust_request(id),
+    )
+    .await?;
+    match answer {
+        GatedQuery::Answered(_) => Ok(()),
+        GatedQuery::Unsupported => Err(NO_TRUST_REQUESTS.into()),
+    }
+}
+
+/// Issue #2330: the user declined in-deck approval request `id` of the deck
+/// `deck_id` names — its review's **Deny**, `Esc` or voice's `close`. The deck
+/// closes the request in every client and refuses that exact text again,
+/// saying the user declined it, until it restarts. A request another client
+/// already answered is no error. Withheld from a deck that does not advertise
+/// `trust-requests`, which is refused here in [`NO_TRUST_REQUESTS`]'s words.
+#[tauri::command]
+pub(crate) async fn desktop_deny_trust_request(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    deck_id: String,
+    id: u64,
+) -> Result<(), String> {
+    crate::ensure_main_webview(&webview)?;
+    deny_trust_request_on(&state, &deck_id, id).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,12 +358,53 @@ mod tests {
             ("clear label", dot_agent_deck::trust_prompt::CLEAR_LABEL),
             ("clear = true", dot_agent_deck::trust_prompt::CLEAR_TRUE),
             ("clear = false", dot_agent_deck::trust_prompt::CLEAR_FALSE),
+            // Issue #2330: a review the deck asked for.
+            ("request intro", dot_agent_deck::trust_prompt::REQUEST_INTRO),
+            (
+                "asked-by label",
+                dot_agent_deck::trust_prompt::ASKED_BY_LABEL,
+            ),
         ] {
             assert!(
                 words.contains(&format!("\"{word}\"")),
                 "projectTrust.ts must carry the TUI's {what} word {word:?}"
             );
         }
+    }
+
+    /// Issue #2330: the three sentences a request's review leaves behind are
+    /// the TUI's status lines. `projectTrust.ts` writes each as a template
+    /// literal over `orchestration` and `askedBy`, so the TUI's sentence with
+    /// those placeholders put in must appear there verbatim; the key guard is
+    /// the TUI's too.
+    #[test]
+    fn a_requests_notices_use_the_tui_status_lines() {
+        let words = include_str!("../../src/lib/projectTrust.ts");
+        let (name, asker) = ("${orchestration}", "${askedBy}");
+        for (what, sentence) in [
+            (
+                "approved",
+                dot_agent_deck::trust_prompt::request_approved_message(name, asker),
+            ),
+            (
+                "declined",
+                dot_agent_deck::trust_prompt::request_denied_message(name),
+            ),
+            (
+                "answered elsewhere",
+                dot_agent_deck::trust_prompt::request_answered_elsewhere_message(name),
+            ),
+        ] {
+            assert!(
+                words.contains(&format!("`{sentence}`")),
+                "projectTrust.ts must carry the TUI's {what} line {sentence:?}"
+            );
+        }
+        let arm_ms = dot_agent_deck::trust_prompt::REQUEST_KEYS_ARM.as_millis();
+        assert!(
+            words.contains(&format!("REQUEST_KEYS_ARM_MS = {arm_ms};")),
+            "projectTrust.ts must ignore keys for the TUI's {arm_ms} ms"
+        );
     }
 
     /// Stand-ins with the crate view's field names, which the macro reads by

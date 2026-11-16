@@ -1286,12 +1286,10 @@ impl EmbeddedPaneController {
     /// PRD #1885: run one trust request on the daemon answering now, bounded
     /// by [`TRUST_REQUEST_TIMEOUT`]. Blocks the calling (UI) thread, as a pane
     /// start does: the prompt it feeds opens only once the answer is in.
-    fn trust_request(
+    fn trust_request<T>(
         &self,
-        request: impl std::future::Future<
-            Output = Result<GatedQuery<crate::project_trust::ProjectTrustView>, ClientError>,
-        >,
-    ) -> Result<GatedQuery<crate::project_trust::ProjectTrustView>, String> {
+        request: impl std::future::Future<Output = Result<GatedQuery<T>, ClientError>>,
+    ) -> Result<GatedQuery<T>, String> {
         match self
             .runtime
             .block_on(async move { tokio::time::timeout(TRUST_REQUEST_TIMEOUT, request).await })
@@ -5564,6 +5562,17 @@ impl PaneController for EmbeddedPaneController {
             client
                 .approve_project_trust(&dir, &orchestration, &digest)
                 .await
+        })
+    }
+
+    fn deny_trust_request(
+        &self,
+        id: u64,
+    ) -> Result<GatedQuery<crate::daemon_protocol::TrustRequestList>, String> {
+        let client = self.client.clone();
+        self.trust_request(async move {
+            let client = client.bound_to_current().await?;
+            client.deny_trust_request(id).await
         })
     }
 

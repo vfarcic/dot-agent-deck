@@ -67,6 +67,9 @@ pub(crate) struct HandshakeInfo {
     pub(crate) wire_stop: bool,
     /// Issue #1637: the daemon's hook-binary notices, from the same reply.
     pub(crate) hook_binary_notices: Vec<crate::dto::HookBinaryNoticeDto>,
+    /// Issue #2330: the daemon's pending in-deck approval requests, from the
+    /// same reply.
+    pub(crate) trust_requests: Vec<crate::dto::TrustRequestDto>,
 }
 
 /// An established link to one deck: the handshake that classified it, and a
@@ -1342,7 +1345,26 @@ fn classify_handshake(
             && dot_agent_deck::daemon_client::DaemonCapabilities::from_hello(response)
                 .supports(dot_agent_deck::daemon_protocol::CAP_STOP_DAEMON),
         hook_binary_notices: hook_binary_notices(response),
+        trust_requests: trust_requests(response),
     }
+}
+
+/// Issue #2330: the pending approval requests a `Hello` reply carries, for the
+/// webview. None from a refused handshake, or from a daemon that does not
+/// advertise `trust-requests` (`trust_requests_of` decides, and bounds and
+/// escapes the list).
+fn trust_requests(response: &AttachResponse) -> Vec<crate::dto::TrustRequestDto> {
+    if !response.ok {
+        return Vec::new();
+    }
+    dot_agent_deck::daemon_client::trust_requests_of(response)
+        .map(|list| {
+            list.requests
+                .iter()
+                .filter_map(crate::dto::TrustRequestDto::new)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Issue #1637: the notices a `Hello` reply carries, for the webview. None from
@@ -1440,6 +1462,7 @@ fn connection_from_handshake(endpoint: &Endpoint, handshake: HandshakeInfo) -> D
         // A daemon answered the handshake, so this is no disconnected deck.
         disconnected_reason: None,
         hook_binary_notices: handshake.hook_binary_notices,
+        trust_requests: handshake.trust_requests,
         // A handshake lists nothing; `connected_snapshot` names the process
         // whose listing the snapshot carries.
         incarnation: dot_agent_deck::daemon_client::Incarnation::default(),
@@ -4276,6 +4299,7 @@ mod tests {
                     listing_options: false,
                     wire_stop: false,
                     hook_binary_notices: Vec::new(),
+                    trust_requests: Vec::new(),
                 },
             );
             assert_eq!(connection.daemon_version.as_deref(), daemon_version);
@@ -4361,6 +4385,83 @@ mod tests {
         );
     }
 
+    /// Issue #2330. Scenario: a daemon advertising `trust-requests` lists one
+    /// pending approval request on its `Hello` reply, with a bidi override in
+    /// what asked. The deck's connection carries it camelCased for the
+    /// webview, the label escaped and the path unchanged; a request whose
+    /// digest is not hex is dropped; a refused handshake, and a daemon that
+    /// does not advertise the capability, carry none, and an empty list is
+    /// omitted from the wire.
+    #[test]
+    fn the_connection_carries_the_trust_requests_from_the_handshake() {
+        use dot_agent_deck::daemon_protocol::{TrustRequest, TrustRequestList};
+        let request = |id: u64, digest: &str| TrustRequest {
+            id,
+            project: "/srv/demo".into(),
+            config_dir: "/srv/demo-wt".into(),
+            orchestration: "team".into(),
+            digest: digest.into(),
+            asked_by: "dispatch \u{202e}evil".into(),
+        };
+        let mut response = AttachResponse::hello(PROTOCOL_VERSION).with_capabilities();
+        response.build_version = Some(dot_agent_deck::build_id::local_build_id());
+        response.trust_requests = Some(TrustRequestList {
+            revision: 3,
+            requests: vec![request(7, "ab12"), request(8, "not a digest")],
+        });
+        let local = || Endpoint::Local(LocalEndpoint::at("/tmp/attach.sock"));
+        let build = dot_agent_deck::build_id::local_build_id();
+        let connection =
+            connection_from_handshake(&local(), classify_handshake_for_test(&response, &build));
+        let wire = serde_json::to_value(&connection).unwrap();
+        let requests = wire["trustRequests"].as_array().expect("on the wire");
+        assert_eq!(requests.len(), 1, "the request with no digest is dropped");
+        assert_eq!(requests[0]["id"], 7);
+        assert_eq!(requests[0]["project"], "/srv/demo");
+        assert_eq!(requests[0]["configDir"], "/srv/demo-wt");
+        assert_eq!(requests[0]["orchestration"], "team");
+        assert_eq!(requests[0]["digest"], "ab12");
+        let asked_by = requests[0]["askedBy"].as_str().unwrap();
+        assert!(asked_by.starts_with("dispatch "), "{asked_by}");
+        assert!(!asked_by.contains('\u{202e}'), "escaped: {asked_by}");
+
+        let mut refused = response.clone();
+        refused.ok = false;
+        refused.error = Some("no".into());
+        assert!(
+            classify_handshake_for_test(&refused, &build)
+                .trust_requests
+                .is_empty()
+        );
+
+        let mut older = response.clone();
+        older.capabilities = Some(
+            dot_agent_deck::daemon_protocol::DAEMON_CAPABILITIES
+                .iter()
+                .filter(|cap| **cap != dot_agent_deck::daemon_protocol::CAP_TRUST_REQUESTS)
+                .map(|cap| cap.to_string())
+                .collect(),
+        );
+        assert!(
+            classify_handshake_for_test(&older, &build)
+                .trust_requests
+                .is_empty(),
+            "a daemon that does not advertise the capability raises none"
+        );
+
+        let mut none = response;
+        none.trust_requests = Some(TrustRequestList::default());
+        let connection =
+            connection_from_handshake(&local(), classify_handshake_for_test(&none, &build));
+        assert!(
+            serde_json::to_value(&connection)
+                .unwrap()
+                .get("trustRequests")
+                .is_none(),
+            "omitted when nothing is pending"
+        );
+    }
+
     /// The revalidation backstop, at the predicate rather than through a
     /// five-second sleep. A link is fresh the instant it is taken and stale once
     /// [`HANDSHAKE_REVALIDATE_INTERVAL`] has passed, so a held classification is
@@ -4385,6 +4486,7 @@ mod tests {
                     listing_options: false,
                     wire_stop: false,
                     hook_binary_notices: Vec::new(),
+                    trust_requests: Vec::new(),
                 },
             ),
             _transport: tokio::runtime::Runtime::new()

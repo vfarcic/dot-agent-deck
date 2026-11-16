@@ -152,6 +152,10 @@ pub(crate) enum FetchReason {
     /// the `Hello` reply, so the refresh that answers this re-reads it as well
     /// as the list ([`AgentView::take_handshake_due`]).
     HookBinaryNotice,
+    /// The daemon's pending in-deck approval requests changed (issue #2330).
+    /// Like the hook-binary notices they ride the `Hello` reply, so the refresh
+    /// that answers this re-reads it ([`AgentView::take_handshake_due`]).
+    TrustRequests,
     /// A broadcast whose `kind` this build does not know (PRD #741 M8, issue
     /// #801 item 3).
     ///
@@ -315,6 +319,13 @@ impl AgentView {
             BroadcastMsg::HookBinaryNotice(_) => {
                 self.handshake_due = true;
                 self.mark(FetchReason::HookBinaryNotice);
+            }
+            // Issue #2330: the pending approval requests ride the `Hello`
+            // reply too, so the review a deck asks for reaches the webview
+            // through the same re-read.
+            BroadcastMsg::TrustRequests(_) => {
+                self.handshake_due = true;
+                self.mark(FetchReason::TrustRequests);
             }
             // PRD #741 M8 (issue #801 item 3): a broadcast kind this build does
             // not know. It marks a fetch for the same reason the two above do —
@@ -1069,6 +1080,23 @@ mod tests {
         view.apply(&BroadcastMsg::HookBinaryNotice(Default::default()));
 
         assert_eq!(view.needs_fetch(now), Some(FetchReason::HookBinaryNotice));
+        assert!(view.take_handshake_due());
+        assert!(!view.take_handshake_due(), "taken once");
+    }
+
+    /// Scenario: the daemon pushes a changed list of in-deck approval requests.
+    /// The view marks a fetch due and asks for the handshake to be re-read
+    /// once, because the list lives on the `Hello` reply (issue #2330).
+    #[test]
+    fn a_trust_request_list_marks_a_fetch_and_a_handshake_re_read() {
+        let now = Instant::now();
+        let mut view = AgentView::default();
+        view.install(listing(vec![record("7", "pane-7")]), now);
+        assert!(!view.take_handshake_due());
+
+        view.apply(&BroadcastMsg::TrustRequests(Default::default()));
+
+        assert_eq!(view.needs_fetch(now), Some(FetchReason::TrustRequests));
         assert!(view.take_handshake_due());
         assert!(!view.take_handshake_due(), "taken once");
     }

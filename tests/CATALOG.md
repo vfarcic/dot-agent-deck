@@ -465,6 +465,31 @@ Tier vocabulary (issue #502, CLAUDE.md rule 5): L1 tests run in the fast tier, `
 - **Does not assert:** `dispatch --single` or `--command` (not gated).
 - **Platform coverage:** mac+linux.
 
+#### config-trust/request
+
+The deck asks for the approval itself when it refuses to start an unapproved orchestration (issue #2330).
+
+##### config-trust/request/001 — A refused `dispatch --orchestration` opens the review in the TUI; approving there lets the retried dispatch start.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`), real `dispatch` CLI from a plain pane against the real `daemon serve`.
+- **Agent:** stand-ins.
+- **Asserts:** the refusal in the caller's inbox says `requested in the deck` and names the approve command; the TUI opens `Review project commands` on its own, led by the deck's sentence and `Asked by: dispatch`, with the footer `a approve · Esc deny · ↑↓ scroll`; a retry while it is open is refused the same way and the daemon lists one request; `a` approves (status `Approved orchestration 'trust-orch'`, `trust list` reads `current`, no request listed) and the next dispatch runs its roles in the unit's worktree.
+- **Does not assert:** the key guard's timing (`ui.rs` `request_tui_001`); the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/request/002 — Denying the deck's request refuses the retry as declined, without asking again.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`).
+- **Agent:** stand-ins.
+- **Asserts:** `Esc` on the review the refused dispatch opened says `Declined orchestration 'trust-orch'` and leaves no request; the retried dispatch is refused with `declined it in the deck`, raises no request, opens no review and starts nothing.
+- **Does not assert:** that a daemon restart forgets the denial (memory-only by construction, `trust_requests` unit tests).
+- **Platform coverage:** mac+linux.
+
+##### config-trust/request/003 — A request raised with no client attached opens when a TUI attaches, and closes when another client answers it.
+- **Layer:** L2 headless `daemon serve` + `RunNow`, then a PTY-attached TUI, lane 1 (`tests/e2e_config_trust.rs`); the other client is a raw `DenyTrustRequest` on the attach socket.
+- **Agent:** stand-ins.
+- **Asserts:** the refused run-now leaves one pending request and `schedule list` says `requested in the deck`; the TUI attaching afterwards opens the review with `Asked by: scheduled task 'request-sched'`; after another client denies it the review closes with `was answered elsewhere` and nothing started.
+- **Does not assert:** two TUIs side by side; the desktop app (its vitest and Playwright specs).
+- **Platform coverage:** mac+linux.
+
 #### config-trust/rearm
 
 ##### config-trust/rearm/001 — A warm reattach never re-arms the orchestrator with changed, unapproved instructions.
@@ -490,6 +515,13 @@ Tier vocabulary (issue #502, CLAUDE.md rule 5): L1 tests run in the fast tier, `
 - **Agent:** real interactive Claude Code on Haiku (`--allowedTools Bash Read`), credentials imported, work dir trusted.
 - **Asserts:** Ctrl+n on a never-approved project shows `Review project commands` with the role's `claude …` command and nothing running; `a` starts the agent, which creates the uniquely named sentinel `config_trust_live_5e81c3.txt` its prompt asks for.
 - **Does not assert:** the agent's wording.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/live/002 — A refused `delegate` is approved in the deck's own review, and the retry reaches a real agent.
+- **Layer:** L2 PTY-attached, **lane 2** (`tests/e2e_config_trust_live.rs`), real `delegate` CLI from the coordinator's pane identity.
+- **Agent:** stand-in coordinator (`cat`); real interactive Claude Code on Haiku as the worker (`--allowedTools Bash Read`), credentials imported, work dir trusted.
+- **Asserts:** after the worker's description changes on disk, the delegate is refused with `requested in the deck`; the TUI opens `Review project commands` with `Asked by: delegate` and the new text; `a` approves (`Approved orchestration 'trust-request-live'`); the retried delegate is accepted and the real worker creates `config_trust_request_live_9d27a4.txt`.
+- **Does not assert:** the worker's wording; the desktop app.
 - **Platform coverage:** mac+linux.
 
 ### Work journal (PRD #1889)

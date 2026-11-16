@@ -390,6 +390,30 @@ export interface ConnectionView {
    * thing. Absent when there is nothing to show.
    */
   hookBinaryNotices?: HookBinaryNotice[];
+  /**
+   * Issue #2330 — the deck's pending in-deck approval requests: orchestrations
+   * it refused to start (an agent's dispatch, a restart, a schedule firing)
+   * because they are not approved as their config now reads, oldest first.
+   * Every string is escaped by the bridge. Absent when nothing is pending, and
+   * from a deck too old to raise them.
+   */
+  trustRequests?: TrustRequest[];
+}
+
+/**
+ * Issue #2330 — one pending in-deck approval request. The review for it is
+ * the New agent form's, for `orchestration` of the config in `configDir`;
+ * `id` is its number on its deck, which declining it names.
+ */
+export interface TrustRequest {
+  id: number;
+  project: string;
+  configDir: string;
+  orchestration: string;
+  /** The digest of the text the deck refused. */
+  digest: string;
+  /** What tried to start it: `dispatch`, a schedule's name, `pane restart`, … */
+  askedBy: string;
 }
 
 /**
@@ -1731,6 +1755,12 @@ export interface DeckRuntimeState {
    */
   projectTrustState?: (target: import("./lib/projectTrust").ProjectTrustTarget) => Promise<import("./lib/projectTrust").ProjectTrust>;
   approveProjectTrust?: (target: import("./lib/projectTrust").ProjectTrustTarget, digest: string) => Promise<import("./lib/projectTrust").ProjectTrust>;
+  /**
+   * Issue #2330 — decline the in-deck approval request `id` of the deck
+   * `deckId` names. Optional for the reason the two above are; a runtime
+   * without it shows no request.
+   */
+  denyTrustRequest?: (deckId: string, id: number) => Promise<void>;
   /**
    * PRD #2174 — whether this launch shows the star reminder, and the user's
    * choice in it. Optional for the reason the two above are; a runtime

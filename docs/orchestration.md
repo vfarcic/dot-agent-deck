@@ -420,7 +420,7 @@ The orchestrator can delegate one task to several roles at once (`--to reviewer 
 
 ### Commands
 
-These commands work only from a pane the deck started, which sets `DOT_AGENT_DECK_PANE_ID` and the other variables they need. Run anywhere else, `delegate`, `work-done`, `pane restart` and `pane spawn` print `Error: DOT_AGENT_DECK_PANE_ID environment variable not set.` and exit non-zero; `ack` prints a message and exits 0. `delegate`, `pane restart` and `pane spawn` are further limited to the orchestrator's pane, and are refused, starting nothing, when the orchestration's roles changed in `.dot-agent-deck.toml` since you approved them; the message names the `dot-agent-deck trust approve` command to run from a terminal outside the deck ([Approving Project Commands](project-trust.md#work-that-runs-while-you-are-away)).
+These commands work only from a pane the deck started, which sets `DOT_AGENT_DECK_PANE_ID` and the other variables they need. Run anywhere else, `delegate`, `work-done`, `pane restart` and `pane spawn` print `Error: DOT_AGENT_DECK_PANE_ID environment variable not set.` and exit non-zero; `ack` prints a message and exits 0. `delegate`, `pane restart` and `pane spawn` are further limited to the orchestrator's pane, and are refused, starting nothing, when the orchestration's roles changed in `.dot-agent-deck.toml` since you approved them; the deck opens **Review project commands** in the TUI and the desktop app attached to it so you can approve the change there, and the message also names the `dot-agent-deck trust approve` command to run from a terminal outside the deck ([Approving Project Commands](project-trust.md#work-that-starts-an-orchestration-on-its-own)).
 
 | Command | Who runs it | What it does |
 |---|---|---|

@@ -288,6 +288,16 @@ export function useOverlayStackEmpty(): boolean {
   return useSyncExternalStore(subscribeToStack, () => ordered().length === 0);
 }
 
+/**
+ * Issue #2330 — whether no overlay is open at all, read NOW rather than at the
+ * last render: for an effect that opens a dialog on its own, so that an
+ * overlay put on the stack earlier in the same commit (the star reminder,
+ * coming up at the same moment) holds it back.
+ */
+export function overlayStackIsEmpty(): boolean {
+  return ordered().length === 0;
+}
+
 /** How to close the topmost open overlay, when it registered one (see `Fenced`). */
 export function topmostOverlayClose(): OverlayClose | undefined {
   return ordered().at(-1)?.close;
