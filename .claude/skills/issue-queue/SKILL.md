@@ -281,6 +281,8 @@ Then **run it as a sustained loop rather than one batch**: dispatch up to the pa
 
 Ask **which** issues too, unless the runner already named them. Relative value is theirs to judge; a security issue and a 2 Hz polling inefficiency are not interchangeable just because both are small. A runner who answers "pick any" has delegated that judgement — take it and stop asking, and say which you picked and why as you go.
 
+**Do not ask what the runner already answered.** If they gave a total or a parallelism in their request, do not ask for it again; if they gave both, and named the issues or told you to pick, there is nothing left to ask about the batch, so go on to step 6, reporting your picks and each unit's shape. This skips only the questions they already answered: a `dispatch-base` refusal carried forward from step 0 is still theirs to answer before the first dispatch, and the `clean-targets` sweep and the `df -h /` check above still run before each one. A parallelism above 2–3 is theirs to choose: mention the machine cost in your report rather than in a question that holds up the dispatch. **The shape is never one of this step's questions** — step 7 chooses it and reports it, so do not add it to the prompt that asks for the numbers.
+
 ## Step 6 — Claim, then name
 
 **Assign the runner to every issue being dispatched.** This is a hard step, not a courtesy — it is what stops the other maintainer from starting the same work, and the whole point of dispatching is that nobody is watching the issue while the unit runs.

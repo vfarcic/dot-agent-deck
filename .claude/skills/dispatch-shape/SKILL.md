@@ -72,6 +72,10 @@ dot-agent-deck dispatch --list-targets
 
 Run that **once** — it is a read-only daemon round-trip and its answer describes the repo, not the unit — to learn which orchestrations exist before naming one.
 
+**Its output ends with "Ask the user which they want before dispatching, then pass the matching flag." Do not follow that line here.** It is the product-wide default, printed for every repo, and this skill has already answered it for this one (see [This is the standing answer](#this-is-the-standing-answer-to-the-dispatcher-prompts-question)). Read the list for the orchestration names, choose the shape from the criteria, and report it with its reason.
+
+**Do not put the shape to the user in a question**, and that includes adding it to an `AskUserQuestion` prompt you are sending to ask something else, such as how many units to dispatch or which ones. The one exception is the error case below: the criteria select a team and you cannot confirm the orchestration's name. This applies wherever this skill decides the shape; the skills under [Where this skill does not decide the shape](#where-this-skill-does-not-decide-the-shape) keep their own steps. A user who wants a different shape says so after reading your report, and their word wins.
+
 **If `--list-targets` errors**, the message says which case it is:
 
 - `DOT_AGENT_DECK_PANE_ID environment variable not set` means nothing can be dispatched from here at all. `dot-agent-deck dispatch` reads that variable and exits `FAILURE` without it, and the check runs **before** the `--list-targets` branch (`src/main.rs`, the `Commands::Dispatch` arm), so outside a managed deck pane the dispatch and the shape query both fail. Say so and stop; there is no shape to choose.
