@@ -1036,6 +1036,43 @@ pub struct AgentPty {
     /// or after it.
     #[cfg(target_os = "linux")]
     pub opened: Option<u64>,
+    /// PRD #1790: the absolute folder the child was started in, resolved as
+    /// the PTY library resolves it ([`effective_launch_dir`]): the spawn's
+    /// cwd, or with none (or one that is not a directory) the child's `HOME`.
+    /// Not the registry's `cwd` metadata, which keeps only what the caller
+    /// gave. `None` when it could not be resolved.
+    pub launch_dir: Option<String>,
+}
+
+/// PRD #1790: the folder `cmd`'s child starts in, as an absolute path,
+/// resolved the way `portable-pty` 0.8 resolves it when it spawns: its cwd
+/// when that is a directory; otherwise, on Unix, the `HOME` the child gets
+/// (the env overlay's, else the inherited one), else the account's home from
+/// the user database, else `/`. Elsewhere only a cwd that is a directory.
+pub(crate) fn effective_launch_dir(cmd: &CommandBuilder) -> Option<String> {
+    let cwd = cmd
+        .get_cwd()
+        .map(std::path::PathBuf::from)
+        .filter(|dir| dir.is_dir());
+    #[cfg(unix)]
+    let dir = cwd.or_else(|| {
+        Some(
+            cmd.get_env("HOME")
+                .and_then(std::ffi::OsStr::to_str)
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    // SAFETY: `getuid` has no preconditions and cannot fail.
+                    crate::platform::paths::passwd_home(unsafe { libc::getuid() })
+                        .map(std::path::PathBuf::from)
+                })
+                .unwrap_or_else(|| std::path::PathBuf::from("/")),
+        )
+    });
+    #[cfg(not(unix))]
+    let dir = cwd;
+    std::path::absolute(dir?)
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned())
 }
 
 /// PRD #92 F8: hardcoded grace window between SIGTERM and the SIGKILL
@@ -1961,6 +1998,7 @@ fn spawn_with_dir(
     }
 
     let argv = cmd.get_argv().clone();
+    let launch_dir = effective_launch_dir(&cmd);
     let child = pair
         .slave
         .spawn_command(cmd)
@@ -2026,6 +2064,7 @@ fn spawn_with_dir(
         argv,
         #[cfg(target_os = "linux")]
         opened,
+        launch_dir,
     })
 }
 
@@ -10240,7 +10279,13 @@ impl<'a> SpawnReservation<'a> {
     /// The start was refused after the fork: give up the reservation and undo
     /// the binding, while the caller holds the registry lock.
     fn abandon_locked(mut self, inner: &mut RegistryInner) {
+        let id = self.id.clone();
         self.give_up(inner);
+        // PRD #1790: the session reports held for the generation it never
+        // published go with it, in the same lock hold.
+        if let Some(id) = id {
+            self.registry.work.spawn_abandoned(&id);
+        }
     }
 
     fn give_up(&mut self, inner: &mut RegistryInner) {
@@ -10285,7 +10330,12 @@ impl Drop for SpawnReservation<'_> {
                 .inner
                 .lock_in_drop(crate::lock_rank::OnPoison::Skip)
             {
+                let id = self.id.clone();
                 self.give_up(&mut inner);
+                // PRD #1790: as in `abandon_locked`.
+                if let Some(id) = id {
+                    self.registry.work.spawn_abandoned(&id);
+                }
             }
             self.registry.release_abandoned_turns();
         }
@@ -10988,6 +11038,28 @@ impl AgentPtyRegistry {
     /// installs its run's journal ([`crate::work_tracking::WorkTracker::install`]).
     pub fn work(&self) -> &crate::work_tracking::WorkTracker {
         &self.work
+    }
+
+    /// PRD #1790: generation `agent_id`'s hooks report agent session
+    /// `session` ([`crate::work_tracking::WorkTracker::session_seen`]).
+    /// Decided under the registry lock, so a generation whose spawn is
+    /// reserved and not yet published has the id held for its start, and
+    /// neither its publication (which writes the held ids) nor its
+    /// abandonment (which drops them) can fall between the check and the
+    /// hold.
+    pub fn session_seen(
+        &self,
+        agent_id: &str,
+        pane: Option<&str>,
+        session: &str,
+        agent: &crate::event::AgentType,
+    ) {
+        let inner = self.inner.lock();
+        let reserved =
+            !inner.agents.contains_key(agent_id) && inner.pending_spawns.contains_key(agent_id);
+        self.work
+            .session_seen(agent_id, pane, session, agent, reserved);
+        drop(inner);
     }
 
     /// TEST: the environment generation `agent_id` was spawned with.
@@ -14972,6 +15044,7 @@ impl AgentPtyRegistry {
             argv,
             #[cfg(target_os = "linux")]
             opened,
+            launch_dir,
         } = pty;
         // PRD #1666 part 3 (Q84): what the deck executed, for the observer's
         // binding of `A`.
@@ -15124,7 +15197,7 @@ impl AgentPtyRegistry {
                 spawn_command.clone(),
                 overlay_value(&captured_env, "SHELL").map(str::to_string),
                 spawn_agent_type.clone(),
-                cwd_stored.clone(),
+                launch_dir,
                 display_name.clone(),
                 tab_membership.clone(),
             )

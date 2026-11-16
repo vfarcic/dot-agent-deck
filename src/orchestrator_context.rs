@@ -3582,6 +3582,91 @@ pub fn ensure_git_excludes_context_dir(
     ensure_git_excludes_in(&open_project_dir(project_dir)?)
 }
 
+/// PRD #1790: a project's (a dispatched worktree's) `.dot-agent-deck`, opened
+/// with the same discipline as an orchestrator-context publish and held, for
+/// a writer that is not a publish ([`crate::dispatch_task`]).
+///
+/// [`open_held_context_dir`] resolves the project pathname once, creates
+/// `.dot-agent-deck` relative to it when missing (`0o700`), opens it once
+/// without following a symlink (`O_NOFOLLOW | O_DIRECTORY`), refuses one
+/// owned by another account (Unix), and clears group and other write on the
+/// held descriptor, refusing when that fails
+/// ([`ensure_context_dir_owner_writable_only`]). Every create and removal
+/// below is relative to that descriptor; off Unix they are path operations,
+/// the narrower guarantee [`open_context_dir`] states.
+pub(crate) struct HeldContextDir {
+    project: ProjectDirGuard,
+    dir: ContextDir,
+}
+
+impl std::fmt::Debug for HeldContextDir {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeldContextDir")
+            .field("dir", &self.dir)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Open `project_dir`'s `.dot-agent-deck` as a [`HeldContextDir`]. A refusal
+/// (a symlink, another account's directory, group or other write that could
+/// not be cleared) is `PermissionDenied`.
+pub(crate) fn open_held_context_dir(
+    project_dir: &std::path::Path,
+) -> std::io::Result<HeldContextDir> {
+    let project = open_project_dir(project_dir)?;
+    let dir = open_publish_dir_in(&project, project_dir).map_err(|e| match e {
+        ContextPublishError::ContextDirUnusable(e) => e,
+        other => std::io::Error::new(std::io::ErrorKind::PermissionDenied, other.to_string()),
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let owner = dir.guard.metadata()?.uid();
+        // SAFETY: `geteuid` has no preconditions and cannot fail.
+        if owner != unsafe { libc::geteuid() } {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("{CONTEXT_DIR_NAME} is owned by another account"),
+            ));
+        }
+    }
+    Ok(HeldContextDir { project, dir })
+}
+
+impl HeldContextDir {
+    /// The directory's pathname (what a written file is announced under).
+    pub(crate) fn path(&self) -> &std::path::Path {
+        self.dir.path()
+    }
+
+    /// Whether the pathname still names the held directory.
+    pub(crate) fn unchanged(&self) -> bool {
+        self.dir.unchanged()
+    }
+
+    /// Whether an entry `name` exists in the held directory (not followed).
+    pub(crate) fn has_entry(&self, name: &str) -> bool {
+        self.dir.identity_of(name).is_some()
+    }
+
+    /// Create `name` in the held directory, owner-only, refusing an existing
+    /// entry and never following a symlink.
+    pub(crate) fn create_new(&self, name: &str) -> std::io::Result<std::fs::File> {
+        self.dir.create_new(name)
+    }
+
+    /// Remove the entry `name` of the held directory.
+    pub(crate) fn remove(&self, name: &str) -> std::io::Result<()> {
+        self.dir.unlink(name)
+    }
+
+    /// The project's git exclude, written relative to the held project
+    /// descriptor ([`ensure_git_excludes_in`]).
+    pub(crate) fn ensure_git_excludes(&self) -> std::io::Result<GitExcludeOutcome> {
+        ensure_git_excludes_in(&self.project)
+    }
+}
+
 /// Whether `existing` already carries a rule for the context directory, in any
 /// of its spellings.
 fn exclude_has_context_rule(existing: &str) -> bool {

@@ -76,7 +76,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -113,6 +113,12 @@ pub const ENV_WORK_ID: &str = "DOT_AGENT_DECK_WORK_ID";
 
 /// Events the writer queue holds; a full queue drops the event.
 pub const QUEUE_CAPACITY: usize = 4096;
+
+/// PRD #1790: at most this share of the writer queue (one part in this many)
+/// may hold `attempt_session` events handed over by
+/// [`WorkJournal::record_session`]; past it a session event is refused, so a
+/// burst of session changes cannot fill the queue that lifecycle events need.
+pub const SESSION_QUEUE_SHARE: usize = 4;
 
 /// A run starts a new segment when the current one would pass this size.
 pub const SEGMENT_MAX_BYTES: u64 = 8 * 1024 * 1024;
@@ -518,9 +524,12 @@ pub enum Event {
     /// PRD #1790: the agent session an attempt is in, as its hooks reported
     /// it. Written when the attempt's session id first becomes known and
     /// again each time it changes (a `/clear`, a new conversation), never for
-    /// an unchanged one, so an attempt's lines read in order give its
-    /// sessions in order and the last is the one to resume. Additive under
-    /// `v:1`: a reader that predates it skips the kind.
+    /// an unchanged one, and at most
+    /// [`crate::work_tracking::MAX_SESSION_LINES`] times plus one at the
+    /// attempt's end. An attempt's lines in `seq` order give its sessions in
+    /// order, and the one to resume is [`latest_session_of`]'s, not the last
+    /// in the reader's wall-clock order. Additive under `v:1`: a reader that
+    /// predates it skips the kind.
     AttemptSession {
         work: WorkId,
         attempt: AttemptId,
@@ -602,6 +611,36 @@ impl Line {
     fn order_key(&self) -> (u64, &str, u64) {
         (self.ts_ms, self.run.as_str(), self.seq)
     }
+}
+
+/// PRD #1790: the session `attempt` is in, as its latest `attempt_session`
+/// line among `lines` (a read from [`read_journal`] or [`WorkJournal::read`])
+/// says, with the agent type it was reported for; `None` when it has none.
+///
+/// "Latest" is the line with the highest `seq` written by the attempt's own
+/// run, not the last in the reader's order: the reader merges lines by wall
+/// clock first (`ts_ms`), which a clock stepped backwards between two session
+/// changes would reverse, while one run's `seq` only grows. Every consumer
+/// that wants an attempt's current session goes through this, not through
+/// the order of the read.
+pub fn latest_session_of<'a>(
+    lines: &'a [Line],
+    attempt: &AttemptId,
+) -> Option<(&'a str, &'a crate::event::AgentType)> {
+    lines
+        .iter()
+        .filter(|line| line.run == attempt.run())
+        .filter_map(|line| match &line.event {
+            Event::AttemptSession {
+                attempt: a,
+                session,
+                agent,
+                ..
+            } if a == attempt => Some((line.seq, session.as_str(), agent)),
+            _ => None,
+        })
+        .max_by_key(|(seq, _, _)| *seq)
+        .map(|(_, session, agent)| (session, agent))
 }
 
 // ---------------------------------------------------------------------------
@@ -1516,6 +1555,9 @@ enum Cmd {
         event: Event,
         ts_ms: u64,
         reply: Option<mpsc::Sender<Result<u64, RecordError>>>,
+        /// It holds a place in the session quota
+        /// ([`WorkJournal::record_session`]), which the writer gives back.
+        quota: bool,
     },
     /// Answered once everything queued before it is written.
     Flush(mpsc::Sender<()>),
@@ -1557,6 +1599,8 @@ struct Writer {
     rotate_sync_fault: Option<Arc<AtomicU64>>,
     #[cfg(test)]
     rotate_remove_fault: Option<Arc<AtomicU64>>,
+    /// Session events queued under the quota ([`Store::queued_sessions`]).
+    queued_sessions: Arc<AtomicUsize>,
     /// Released when the writer ends, after everything is written.
     _lock: File,
     /// Dropped last, so the handle's last drop can wait for the lock's release.
@@ -1571,7 +1615,11 @@ impl Writer {
                     event,
                     ts_ms,
                     reply,
+                    quota,
                 } => {
+                    if quota {
+                        self.queued_sessions.fetch_sub(1, Ordering::AcqRel);
+                    }
                     #[cfg(test)]
                     if let Some(gate) = &self.gate {
                         gate.pass();
@@ -1863,6 +1911,11 @@ struct Store {
     current: Arc<AtomicU64>,
     /// Events dropped because the queue was full or the writer gone.
     dropped: AtomicU64,
+    /// PRD #1790: `attempt_session` events queued under the session quota
+    /// and not yet taken by the writer.
+    queued_sessions: Arc<AtomicUsize>,
+    /// The most the quota lets queue at once ([`SESSION_QUEUE_SHARE`]).
+    session_quota: usize,
     /// When a drop was last logged.
     last_drop_warn: Mutex<Option<Instant>>,
 }
@@ -2065,6 +2118,7 @@ impl WorkJournal {
         dir.sync()?;
         let homes = HomeSpellings::of(&options.home);
         let current = Arc::new(AtomicU64::new(0));
+        let queued_sessions = Arc::new(AtomicUsize::new(0));
         let (tx, rx) = mpsc::sync_channel(options.queue_capacity.max(1));
         let (done, writer_done) = mpsc::channel();
         let writer = Writer {
@@ -2089,6 +2143,7 @@ impl WorkJournal {
             rotate_sync_fault: options.hooks.rotate_sync_fault.clone(),
             #[cfg(test)]
             rotate_remove_fault: options.hooks.rotate_remove_fault.clone(),
+            queued_sessions: Arc::clone(&queued_sessions),
             _lock: lock,
             _done: done,
         };
@@ -2107,6 +2162,8 @@ impl WorkJournal {
                     writer_done: Mutex::new(writer_done),
                     current,
                     dropped: AtomicU64::new(0),
+                    queued_sessions,
+                    session_quota: (options.queue_capacity / SESSION_QUEUE_SHARE).max(1),
                     last_drop_warn: Mutex::new(None),
                 }),
                 disabled: None,
@@ -2173,6 +2230,27 @@ impl WorkJournal {
         &self.shared.path
     }
 
+    /// PRD #1790: whether run `run` may still be writing: this journal's
+    /// own run, or one whose `run-<run>.lock` in the journal's directory is
+    /// held. A lock that cannot be judged, or a disabled journal, counts as
+    /// live; a run with no lock file is not.
+    pub fn run_is_live(&self, run: &str) -> bool {
+        if run == self.shared.run {
+            return true;
+        }
+        let Some(store) = &self.shared.store else {
+            return true;
+        };
+        if !valid_component(run) {
+            return true;
+        }
+        match store.dir.open_regular(lock_name(run)) {
+            Ok(file) => !matches!(crate::platform::lock::try_lock_file(&file), Ok(true)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+            Err(_) => true,
+        }
+    }
+
     /// The state directory the journal lives under (the parent of
     /// [`Self::dir`]), where the stores that follow its retention keep their
     /// files ([`crate::launch_records`]).
@@ -2225,11 +2303,55 @@ impl WorkJournal {
             event,
             ts_ms: now_ms(),
             reply: None,
+            quota: false,
         };
         let queued = store.tx().is_some_and(|tx| tx.try_send(cmd).is_ok());
         if !queued {
             store.note_drop();
         }
+    }
+
+    /// PRD #1790: [`Self::record`] for an `attempt_session` event, under the
+    /// session quota: at most a [`SESSION_QUEUE_SHARE`]th of the queue holds
+    /// such events at once, so session churn leaves the rest to lifecycle
+    /// events. `false` when it was not queued (the quota or the queue was
+    /// full, or there is no writer), so the caller can hold the id and
+    /// write it later.
+    pub fn record_session(&self, event: Event) -> bool {
+        let Some(store) = &self.shared.store else {
+            return false;
+        };
+        let mut queued = store.queued_sessions.load(Ordering::Acquire);
+        let taken = loop {
+            if queued >= store.session_quota {
+                break false;
+            }
+            match store.queued_sessions.compare_exchange_weak(
+                queued,
+                queued + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break true,
+                Err(now) => queued = now,
+            }
+        };
+        if !taken {
+            store.note_drop();
+            return false;
+        }
+        let cmd = Cmd::Record {
+            event,
+            ts_ms: now_ms(),
+            reply: None,
+            quota: true,
+        };
+        let queued = store.tx().is_some_and(|tx| tx.try_send(cmd).is_ok());
+        if !queued {
+            store.queued_sessions.fetch_sub(1, Ordering::AcqRel);
+            store.note_drop();
+        }
+        queued
     }
 
     /// Write `event` and wait for it, answering the line's `seq` or why it
@@ -2245,6 +2367,7 @@ impl WorkJournal {
                 event,
                 ts_ms: now_ms(),
                 reply: Some(reply),
+                quota: false,
             })
             .map_err(|_| RecordError::Stopped)?;
         answer.recv().unwrap_or(Err(RecordError::Stopped))

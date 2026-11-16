@@ -1266,6 +1266,11 @@ mod tests {
             ".claude",
             "a test HOME's ~/.claude, not the checkout's",
         ),
+        (
+            "src/dispatch_task.rs",
+            "ls-files",
+            "a git subcommand run in a dispatched worktree (or a test's tempdir repository), not a path in the checkout",
+        ),
     ];
 
     /// What a scanned file's literal reads the checkout on behalf of.

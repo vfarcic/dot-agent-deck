@@ -2415,14 +2415,14 @@ where
     // The session is the attempt's once the apply made it the pane's current
     // hook session: a report the state refused, or one about a conversation
     // the pane has moved past, records nothing. The tracker writes it only
-    // when it changed. Under this lock, so sessions reach the journal in the
-    // order the state applied them; the tracker takes only its leaf mutex.
+    // when it changed, and holds one from a generation not yet published
+    // for its start. Under this lock, so sessions reach the journal in the
+    // order the state applied them; it takes the registry's lock and the
+    // tracker's leaf mutex, as the apply above already reads the registry.
     if let Some((pane, generation, session, agent_type)) = session_report
         && state.pane_hook_session_id(&pane).as_deref() == Some(session.as_str())
     {
-        registry
-            .work()
-            .session_seen(&generation, Some(&pane), &session, &agent_type);
+        registry.session_seen(&generation, Some(&pane), &session, &agent_type);
     }
     // Stamped on the frame that changed the aggregate, and on every shell frame
     // of a pane that reports its own turns — the client's cue that the frame
@@ -19140,6 +19140,130 @@ mod hook_provenance_audit_tests {
             "a Thinking reported before publication was lost and the first \
              turn did not count"
         );
+    }
+
+    /// PRD #1790 (R1): an agent reports its session (a proven SessionStart
+    /// naming its own generation) after its child is forked and before the
+    /// deck publishes it, and never reports again. Read back from disk after
+    /// the daemon's journal is drained, as a restarted daemon would read it,
+    /// the attempt's session is that id, written right after its start.
+    #[tokio::test]
+    async fn a_session_reported_before_publication_is_recorded() {
+        let temp = crate::test_temp::tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        std::fs::create_dir(&state_dir).unwrap();
+        let identity = temp.path().join("identity");
+        let script = temp.path().join("reserved-agent.sh");
+        crate::test_isolation::write_script(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' \"$DOT_AGENT_DECK_AGENT_ID\" > \"$TURN_TEST_IDENTITY\"\nexec /bin/cat\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let registry = Arc::new(AgentPtyRegistry::new());
+        registry.work().install(
+            crate::work_journal::WorkJournal::try_open_with(
+                &state_dir,
+                "run1",
+                &crate::deck_identity::DeckId::generate(),
+                crate::work_journal::JournalOptions::default(),
+            )
+            .unwrap(),
+        );
+        let (forked, publish) = registry.pause_next_publish_for_test();
+        let spawning = tokio::task::spawn_blocking({
+            let registry = registry.clone();
+            let identity = identity.clone();
+            move || {
+                registry.spawn_agent(SpawnOptions {
+                    command: Some(script.to_str().unwrap()),
+                    env: vec![
+                        (DOT_AGENT_DECK_PANE_ID.into(), "early-session".into()),
+                        (
+                            "TURN_TEST_IDENTITY".into(),
+                            identity.to_string_lossy().into_owned(),
+                        ),
+                    ],
+                    agent_type: Some(crate::event::AgentType::ClaudeCode),
+                    ..Default::default()
+                })
+            }
+        });
+        reached(forked, "the child never forked").await;
+        let agent = tokio::task::spawn_blocking(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Ok(text) = std::fs::read_to_string(&identity)
+                    && text.ends_with('\n')
+                {
+                    break text.trim().to_string();
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the child never wrote its id"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        })
+        .await
+        .unwrap();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let (event_tx, _) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+        assert!(
+            registry.agent_writer(&agent).is_none(),
+            "precondition: the agent is not published yet"
+        );
+        let mut payload = line(
+            "claude-real-session-1",
+            Some("early-session"),
+            Some(&agent),
+            "session_start",
+            None,
+        );
+        payload["agent_type"] = "claude_code".into();
+        ingest_event_unless(
+            &state,
+            &event_tx,
+            &registry,
+            event_of(payload),
+            false,
+            None,
+            |_| false,
+        )
+        .await;
+        assert_eq!(
+            state
+                .read()
+                .await
+                .pane_hook_session_id("early-session")
+                .as_deref(),
+            Some("claude-real-session-1"),
+            "precondition: the state took the report"
+        );
+        publish.send(()).unwrap();
+        let published = spawning.await.unwrap().expect("the spawn publishes");
+        assert_eq!(published, agent);
+        // No second report. What a restarted daemon reads:
+        registry.work().drain(Duration::from_secs(5));
+        let read = crate::work_journal::read_journal(&state_dir).unwrap();
+        registry.shutdown_all();
+        let attempt = crate::work_journal::AttemptId::new("run1", agent.parse().unwrap()).unwrap();
+        assert_eq!(
+            crate::work_journal::latest_session_of(&read.lines, &attempt).map(|(s, _)| s),
+            Some("claude-real-session-1"),
+            "a session reported before publication was lost"
+        );
+        let kinds: Vec<&str> = read
+            .lines
+            .iter()
+            .filter(|l| match &l.event {
+                crate::work_journal::Event::AttemptStarted { attempt: a, .. }
+                | crate::work_journal::Event::AttemptSession { attempt: a, .. } => *a == attempt,
+                _ => false,
+            })
+            .map(|l| l.event.kind())
+            .collect();
+        assert_eq!(kinds, ["attempt_started", "attempt_session"]);
     }
 
     /// Scenario: Agent A is sent keys, and its PTY takes them, but the deck

@@ -629,6 +629,64 @@ fn the_reader_returns_attempt_sessions_in_order() {
     );
 }
 
+/// PRD #1790 (R4): an attempt's latest session is its `attempt_session` line
+/// with the highest `seq` from its own run, even when the clock stepped
+/// backwards so the reader's wall-clock order puts it first; a line of
+/// another run naming the same attempt does not count.
+#[test]
+fn the_latest_session_follows_seq_not_the_wall_clock() {
+    let state = state();
+    let session = |run: &str, seq: u64, ts: u64, id: &str| {
+        encoded(&line(
+            run,
+            seq,
+            ts,
+            Event::AttemptSession {
+                work: work(1),
+                attempt: attempt("r1", 2),
+                session: id.into(),
+                agent: crate::event::AgentType::ClaudeCode,
+            },
+        ))
+    };
+    plant(
+        state.path(),
+        "run-r1.jsonl",
+        &[
+            encoded(&line("r1", 1, 900, started(work(1), "r1", 2))),
+            session("r1", 2, 1000, "s-old"),
+            // The clock stepped back between the two changes.
+            session("r1", 3, 500, "s-new"),
+        ],
+        "",
+    );
+    plant(
+        state.path(),
+        "run-r2.jsonl",
+        &[session("r2", 99, 2000, "s-foreign")],
+        "",
+    );
+    let read = read_journal(state.path()).unwrap();
+    let in_read_order: Vec<&str> = read
+        .lines
+        .iter()
+        .filter_map(|l| match &l.event {
+            Event::AttemptSession { session, .. } => Some(session.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        in_read_order,
+        ["s-new", "s-old", "s-foreign"],
+        "precondition: the reader orders by wall clock"
+    );
+    assert_eq!(
+        latest_session_of(&read.lines, &attempt("r1", 2)),
+        Some(("s-new", &crate::event::AgentType::ClaudeCode))
+    );
+    assert_eq!(latest_session_of(&read.lines, &attempt("r1", 3)), None);
+}
+
 #[test]
 fn a_line_over_4096_bytes_is_refused() {
     let big = "b".repeat(MAX_STRING_BYTES);

@@ -60,6 +60,18 @@ const MAX_RETIRED_TASKS: usize = 64;
 /// Bounded: the oldest goes first.
 const MAX_SETTLED_TASKS: usize = 4096;
 
+/// PRD #1790: the most `attempt_session` lines one attempt writes as its
+/// session id changes. Past it the latest id is held, not written, and
+/// written once more when the attempt ends ([`WorkTracker::attempt_ended`]),
+/// so an attempt writes at most one line more than this, and a producer that
+/// flaps between ids cannot grow the journal without bound.
+pub const MAX_SESSION_LINES: usize = 32;
+
+/// PRD #1790: the most reserved generations whose early session reports are
+/// held at once ([`WorkTracker::session_seen`]); a report for another one is
+/// not held.
+const MAX_EARLY_SESSION_GENERATIONS: usize = 64;
+
 /// PRD #1790: whether `session`, reported by an agent of type `agent` on
 /// `pane`, names a session the agent could be resumed into. Pi's hooks report
 /// a synthetic `<pane>-session` id that is not Pi's own, so it is not one; an
@@ -209,10 +221,31 @@ struct Book {
     spawning: HashMap<WorkId, usize>,
     /// Dispatched unit id -> its work.
     units: HashMap<String, UnitWork>,
-    /// Live attempt (registry agent id) -> the session id last written for
-    /// it as `attempt_session` (PRD #1790), so an unchanged id is not written
-    /// again. Retired with the attempt.
-    sessions: HashMap<String, String>,
+    /// Live attempt (registry agent id) -> what it wrote as
+    /// `attempt_session` (PRD #1790): the last id, so an unchanged id is not
+    /// written again, how many lines it wrote ([`MAX_SESSION_LINES`]) and the
+    /// latest id it holds back. Retired with the attempt.
+    sessions: HashMap<String, SessionBook>,
+    /// Reserved generation (registry agent id, its spawn not yet published)
+    /// -> the session ids its hooks reported, in order, held until its
+    /// attempt starts ([`WorkTracker::attempt_started`] writes them right
+    /// after its `attempt_started`) or dropped when its spawn is abandoned
+    /// ([`WorkTracker::spawn_abandoned`]). At most
+    /// [`MAX_EARLY_SESSION_GENERATIONS`] generations, each at most
+    /// [`MAX_SESSION_LINES`] ids, the newest kept.
+    early_sessions: HashMap<String, VecDeque<(String, AgentType)>>,
+}
+
+/// What one live attempt wrote as `attempt_session` (PRD #1790).
+#[derive(Default)]
+struct SessionBook {
+    /// The id last written.
+    last: Option<String>,
+    /// How many `attempt_session` lines it wrote.
+    written: usize,
+    /// The latest id, when it is not the one last written: past the cap, or
+    /// refused by the journal's session quota. Written when the attempt ends.
+    held: Option<(String, AgentType)>,
 }
 
 impl Book {
@@ -310,6 +343,7 @@ pub(crate) struct BookSizes {
     pub units: usize,
     pub spawning: usize,
     pub sessions: usize,
+    pub early_sessions: usize,
 }
 
 /// What a spawn minted, so a spawn that publishes nothing can forget it.
@@ -584,6 +618,7 @@ impl WorkTracker {
             units: book.units.len(),
             spawning: book.spawning.len(),
             sessions: book.sessions.len(),
+            early_sessions: book.early_sessions.len(),
         }
     }
 
@@ -664,34 +699,116 @@ impl WorkTracker {
             agent,
             role: role.and_then(|r| journal.plain(r)),
         });
+        // PRD #1790: the sessions its hooks reported before it was
+        // published, in order, right after its start.
+        for (session, agent_type) in book.early_sessions.remove(agent_id).unwrap_or_default() {
+            Self::note_session(journal, book, agent_id, work, &attempt, session, agent_type);
+        }
         match book.early_ends.remove(agent_id) {
-            Some(end) => journal.record(Event::AttemptEnded {
-                work: work.clone(),
-                attempt,
-                how: end.how,
-                code: end.code,
-                cause: end.cause,
-            }),
+            Some(end) => {
+                Self::flush_held_session(journal, book, agent_id, work, &attempt);
+                journal.record(Event::AttemptEnded {
+                    work: work.clone(),
+                    attempt,
+                    how: end.how,
+                    code: end.code,
+                    cause: end.cause,
+                });
+            }
             None => {
                 book.attempts.insert(agent_id.to_string(), work.clone());
             }
         }
     }
 
+    /// PRD #1790: the spawn that reserved generation `agent_id` was
+    /// abandoned before it published it: the session reports held for it
+    /// go. The registry calls it under its lock, in the same hold that gives
+    /// the reservation up.
+    pub fn spawn_abandoned(&self, agent_id: &str) {
+        self.book().early_sessions.remove(agent_id);
+    }
+
+    /// Write `session` for live attempt `agent_id` unless it is the id last
+    /// written; past [`MAX_SESSION_LINES`], or when the journal's session
+    /// quota refuses it, hold it instead, for [`Self::flush_held_session`].
+    fn note_session(
+        journal: &WorkJournal,
+        book: &mut Book,
+        agent_id: &str,
+        work: &WorkId,
+        attempt: &crate::work_journal::AttemptId,
+        session: String,
+        agent: AgentType,
+    ) {
+        let entry = book.sessions.entry(agent_id.to_string()).or_default();
+        if entry.last.as_deref() == Some(session.as_str()) {
+            entry.held = None;
+            return;
+        }
+        if entry.written >= MAX_SESSION_LINES {
+            entry.held = Some((session, agent));
+            return;
+        }
+        let event = Event::AttemptSession {
+            work: work.clone(),
+            attempt: attempt.clone(),
+            session: session.clone(),
+            agent: agent.clone(),
+        };
+        if journal.record_session(event) {
+            entry.last = Some(session);
+            entry.written += 1;
+            entry.held = None;
+        } else {
+            entry.held = Some((session, agent));
+        }
+    }
+
+    /// Retire live attempt `agent_id`'s session book, writing the id it held
+    /// back, if any, so the attempt's last `attempt_session` line is its
+    /// latest id. Outside the session quota: one line per attempt.
+    fn flush_held_session(
+        journal: &WorkJournal,
+        book: &mut Book,
+        agent_id: &str,
+        work: &WorkId,
+        attempt: &crate::work_journal::AttemptId,
+    ) {
+        if let Some(SessionBook {
+            held: Some((session, agent)),
+            ..
+        }) = book.sessions.remove(agent_id)
+        {
+            journal.record(Event::AttemptSession {
+                work: work.clone(),
+                attempt: attempt.clone(),
+                session,
+                agent,
+            });
+        }
+    }
+
     /// PRD #1790: generation `agent_id`'s hooks report it is in agent session
-    /// `session`. Writes `attempt_session` the first time the attempt's id is
-    /// seen and each time it changes, never for an unchanged one, and nothing
-    /// for an attempt this run is not serving (one not started yet, or
-    /// already ended), for an id the redaction rule refuses, or for an id
-    /// that names no resumable session ([`is_resumable_session`]). Takes only
-    /// the book's leaf mutex and queues the event, so it may be called under
-    /// the state's lock that applied the hook.
+    /// `session`. For a live attempt, writes `attempt_session` the first time
+    /// the attempt's id is seen and each time it changes, never for an
+    /// unchanged one, at most [`MAX_SESSION_LINES`] times, holding the latest
+    /// past that for the attempt's end. For a generation whose spawn is
+    /// `reserved` (forked, not yet published) the id is held, in order, and
+    /// written right after the attempt's `attempt_started`. Nothing for an
+    /// attempt this run is not serving otherwise (one already ended), for an
+    /// id the redaction rule refuses, or for an id that names no resumable
+    /// session ([`is_resumable_session`]). Takes only the book's leaf mutex
+    /// and queues the event, so it may be called under the state's lock that
+    /// applied the hook, and under the registry's (which is how `reserved`
+    /// is decided: [`crate::agent_pty::AgentPtyRegistry::session_seen`]).
     pub fn session_seen(
         &self,
         agent_id: &str,
         pane: Option<&str>,
         session: &str,
         agent: &AgentType,
+        reserved: bool,
     ) {
         let Some(journal) = self.journal() else {
             return;
@@ -709,24 +826,34 @@ impl WorkTracker {
         let Some(plain) = journal.plain(session) else {
             return;
         };
-        let mut book = self.book();
-        let Some(work) = book.attempts.get(agent_id).cloned() else {
+        let mut guard = self.book();
+        let book = &mut *guard;
+        if let Some(work) = book.attempts.get(agent_id).cloned() {
+            Self::note_session(
+                journal,
+                book,
+                agent_id,
+                &work,
+                &attempt,
+                plain,
+                agent.clone(),
+            );
             return;
-        };
-        if book
-            .sessions
-            .get(agent_id)
-            .is_some_and(|last| *last == plain)
+        }
+        if !reserved
+            || (!book.early_sessions.contains_key(agent_id)
+                && book.early_sessions.len() >= MAX_EARLY_SESSION_GENERATIONS)
         {
             return;
         }
-        book.sessions.insert(agent_id.to_string(), plain.clone());
-        journal.record(Event::AttemptSession {
-            work,
-            attempt,
-            session: plain,
-            agent: agent.clone(),
-        });
+        let held = book.early_sessions.entry(agent_id.to_string()).or_default();
+        if held.back().is_some_and(|(last, _)| *last == plain) {
+            return;
+        }
+        held.push_back((plain, agent.clone()));
+        while held.len() > MAX_SESSION_LINES {
+            held.pop_front();
+        }
     }
 
     /// PRD #1790: write how generation `agent_id`, serving `work`, was
@@ -800,16 +927,20 @@ impl WorkTracker {
         else {
             return;
         };
-        let mut book = self.book();
-        book.sessions.remove(agent_id);
+        let mut guard = self.book();
+        let book = &mut *guard;
         // A task bound to this generation can no longer be worked by it.
         book.retire_tasks(|_, task| task.worker_agent == agent_id);
         let Some(work) = book.attempts.remove(agent_id) else {
+            book.sessions.remove(agent_id);
             if book.early_ends.len() < MAX_EARLY_ENDS {
                 book.early_ends.insert(agent_id.to_string(), end);
             }
             return;
         };
+        // PRD #1790: the latest session id, when it was held back, before
+        // the end.
+        Self::flush_held_session(journal, book, agent_id, &work, &attempt);
         journal.record(Event::AttemptEnded {
             work,
             attempt,
@@ -1372,17 +1503,26 @@ pub fn prune_launch_records(journal: &WorkJournal) {
     match crate::launch_records::prune(
         state_dir,
         &works,
-        // A line of a newer schema may hold a work this build cannot see, so
-        // such a read cannot show a work is gone either.
-        read.stats.truncated || read.stats.newer_version > 0,
+        // A line of a newer schema, or of a kind this build does not know,
+        // may hold a work this build cannot see, so such a read cannot show
+        // a work is gone either.
+        launch_read_incomplete(&read.stats),
         crate::launch_records::now_ms(),
+        |run| journal.run_is_live(run),
     ) {
-        Ok(report) if report.removed > 0 => {
+        Ok(report) if report.removed > 0 || report.pending_removed > 0 => {
             tracing::info!(?report, "launch records: pruned");
         }
         Ok(_) => {}
         Err(error) => tracing::warn!(%error, "launch records: could not prune"),
     }
+}
+
+/// PRD #1790: a journal read whose absence of a work proves nothing: it was
+/// truncated, or skipped a line of a newer schema or an unknown kind, any of
+/// which may hold the work.
+pub(crate) fn launch_read_incomplete(stats: &crate::work_journal::ReadStats) -> bool {
+    stats.truncated || stats.newer_version > 0 || stats.unknown_kind > 0
 }
 
 /// What a committed report was about.

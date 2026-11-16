@@ -1509,8 +1509,11 @@ fn sessions_of(read: &[Line], work: &WorkId) -> Vec<(String, String)> {
 }
 
 /// PRD #1790: an attempt's session id is written when it first appears and
-/// each time it changes, never again while it is unchanged; an attempt that is
-/// not live writes nothing, and the dedupe is retired with the attempt.
+/// each time it changes, never again while it is unchanged; an id reported by
+/// a generation whose spawn is reserved and not yet published is held and
+/// written, in order, right after its `attempt_started`, while one for a
+/// generation this run is not starting is not; an attempt that has ended
+/// writes nothing, and the book is retired with the attempt.
 #[test]
 fn a_session_is_written_when_it_appears_and_when_it_changes_only() {
     let state = crate::test_temp::tempdir().unwrap();
@@ -1520,32 +1523,197 @@ fn a_session_is_written_when_it_appears_and_when_it_changes_only() {
         .kept()
         .unwrap();
     let claude = AgentType::ClaudeCode;
-    // Before its start, the attempt is not this run's to write for.
-    tracker.session_seen("7", Some("p"), "s-early", &claude);
+    // Not reserved and not started: nothing to hold it for.
+    tracker.session_seen("6", Some("p"), "s-stray", &claude, false);
+    // Reserved, before its start: held, in order, deduplicated.
+    for session in ["s-0", "s-0", "s-early"] {
+        tracker.session_seen("7", Some("p"), session, &claude, true);
+    }
+    assert_eq!(tracker.book_sizes().early_sessions, 1);
     tracker.attempt_started(&work, "7", Some("p"), None);
-    for session in ["s-1", "s-1", "s-2", "s-2", "s-1"] {
-        tracker.session_seen("7", Some("p"), session, &claude);
+    assert_eq!(
+        tracker.book_sizes().early_sessions,
+        0,
+        "drained at its start"
+    );
+    for session in ["s-early", "s-1", "s-1", "s-2", "s-2", "s-1"] {
+        tracker.session_seen("7", Some("p"), session, &claude, false);
     }
     // A path-like id is refused by the redaction rule, not written.
-    tracker.session_seen("7", Some("p"), "/home/someone/x", &claude);
+    tracker.session_seen("7", Some("p"), "/home/someone/x", &claude, false);
     assert_eq!(tracker.book_sizes().sessions, 1);
     tracker.attempt_ended("7", worker_end());
     assert_eq!(tracker.book_sizes().sessions, 0, "retired with its attempt");
     // After its end, nothing more is written for it.
-    tracker.session_seen("7", Some("p"), "s-3", &claude);
+    tracker.session_seen("7", Some("p"), "s-3", &claude, false);
     let read = lines(&tracker, state.path());
+    let s = |id: &str| ("run1/7".to_string(), id.to_string());
     assert_eq!(
         sessions_of(&read, &work),
-        [
-            ("run1/7".to_string(), "s-1".to_string()),
-            ("run1/7".to_string(), "s-2".to_string()),
-            ("run1/7".to_string(), "s-1".to_string()),
-        ]
+        [s("s-0"), s("s-early"), s("s-1"), s("s-2"), s("s-1")]
     );
+    // The held ids follow the attempt's start.
+    let kinds = kinds_of(&read, &work);
+    let started = kinds.iter().position(|k| *k == "attempt_started").unwrap();
+    let first_session = kinds.iter().position(|k| *k == "attempt_session").unwrap();
+    assert!(started < first_session, "{kinds:?}");
     assert!(read.iter().all(|l| match &l.event {
         Event::AttemptSession { agent, .. } => *agent == AgentType::ClaudeCode,
         _ => true,
     }));
+}
+
+/// PRD #1790 (R1): the ids held for a reserved generation go when its spawn
+/// is abandoned, and an end that arrived before its start still follows the
+/// held ids.
+#[test]
+fn held_sessions_go_with_an_abandoned_spawn_and_precede_an_early_end() {
+    let state = crate::test_temp::tempdir().unwrap();
+    let tracker = tracker(state.path());
+    let work = tracker
+        .resolve_spawn(None, Some("p"), None, None)
+        .kept()
+        .unwrap();
+    let claude = AgentType::ClaudeCode;
+    tracker.session_seen("4", Some("p"), "s-abandoned", &claude, true);
+    tracker.spawn_abandoned("4");
+    assert_eq!(tracker.book_sizes().early_sessions, 0);
+    tracker.session_seen("5", Some("p"), "s-five", &claude, true);
+    tracker.attempt_ended("5", worker_end());
+    tracker.attempt_started(&work, "5", Some("p"), None);
+    let read = lines(&tracker, state.path());
+    assert_eq!(
+        sessions_of(&read, &work),
+        [("run1/5".to_string(), "s-five".to_string())]
+    );
+    let kinds = kinds_of(&read, &work);
+    assert_eq!(
+        &kinds[kinds.len() - 3..],
+        ["attempt_started", "attempt_session", "attempt_ended"]
+    );
+    let sizes = tracker.book_sizes();
+    assert_eq!((sizes.sessions, sizes.early_sessions), (0, 0));
+}
+
+/// PRD #1790 (A3): a producer flapping between two ids writes at most
+/// [`MAX_SESSION_LINES`] lines while the attempt lives, and one more when it
+/// ends, so the attempt's last line is still its latest id.
+#[test]
+fn a_flapping_session_is_bounded_and_its_latest_id_is_kept() {
+    let state = crate::test_temp::tempdir().unwrap();
+    let tracker = tracker(state.path());
+    let work = tracker
+        .resolve_spawn(None, Some("p"), None, None)
+        .kept()
+        .unwrap();
+    let claude = AgentType::ClaudeCode;
+    tracker.attempt_started(&work, "9", Some("p"), None);
+    let flaps = 10 * MAX_SESSION_LINES;
+    for n in 0..flaps {
+        let id = if n % 2 == 0 { "s-a" } else { "s-b" };
+        tracker.session_seen("9", Some("p"), id, &claude, false);
+    }
+    // The last flap reported `s-b`; then one new id arrives past the cap.
+    tracker.session_seen("9", Some("p"), "s-last", &claude, false);
+    let live = sessions_of(&lines(&tracker, state.path()), &work);
+    assert_eq!(live.len(), MAX_SESSION_LINES, "bounded while it lives");
+    tracker.attempt_ended("9", worker_end());
+    let read = lines(&tracker, state.path());
+    let all = sessions_of(&read, &work);
+    assert_eq!(all.len(), MAX_SESSION_LINES + 1);
+    assert_eq!(all.last().unwrap().1, "s-last", "the latest id is written");
+    assert_eq!(
+        crate::work_journal::latest_session_of(&read, &AttemptId::new("run1", 9).unwrap())
+            .map(|(session, _)| session),
+        Some("s-last")
+    );
+    // A held id equal to the last one written is not written again.
+    let other = tracker
+        .resolve_spawn(None, Some("q"), None, None)
+        .kept()
+        .unwrap();
+    tracker.attempt_started(&other, "10", Some("q"), None);
+    for n in 0..(MAX_SESSION_LINES + 1) {
+        tracker.session_seen("10", Some("q"), &format!("s-{n}"), &claude, false);
+    }
+    tracker.session_seen(
+        "10",
+        Some("q"),
+        &format!("s-{}", MAX_SESSION_LINES - 1),
+        &claude,
+        false,
+    );
+    tracker.attempt_ended("10", worker_end());
+    let read = lines(&tracker, state.path());
+    assert_eq!(sessions_of(&read, &other).len(), MAX_SESSION_LINES);
+}
+
+/// PRD #1790 (A3): `attempt_session` events take at most a share of the
+/// journal's writer queue, so lifecycle events still find room while a
+/// session id churns; an id the quota refused is held and written when the
+/// attempt ends.
+#[test]
+fn session_churn_cannot_fill_the_writer_queue() {
+    let state = crate::test_temp::tempdir().unwrap();
+    let gate = crate::work_journal::WriterGate::closed();
+    let journal = WorkJournal::try_open_with(
+        state.path(),
+        "run1",
+        &DeckId::generate(),
+        JournalOptions {
+            home: PathBuf::from("/home/someone"),
+            queue_capacity: 16,
+            hooks: crate::work_journal::TestHooks {
+                gate: Some(Arc::clone(&gate)),
+                ..Default::default()
+            },
+            ..JournalOptions::default()
+        },
+    )
+    .unwrap();
+    let tracker = WorkTracker::default();
+    tracker.install(journal);
+    let claude = AgentType::ClaudeCode;
+    let start = |agent: u64| {
+        let pane = format!("p{agent}");
+        let work = tracker
+            .resolve_spawn(None, Some(&pane), None, None)
+            .kept()
+            .unwrap();
+        tracker.attempt_started(&work, &agent.to_string(), Some(&pane), None);
+        work
+    };
+    // The writer is held: its first event waits at the gate, the rest queue.
+    let churning = start(0);
+    for n in 0..10 {
+        tracker.session_seen("0", Some("p0"), &format!("s-{n}"), &claude, false);
+    }
+    // Five more launches, ten lifecycle events: the queue still has room.
+    let others: Vec<WorkId> = (1..=5).map(start).collect();
+    gate.open();
+    tracker.journal().unwrap().flush();
+    for agent in 0..=5u64 {
+        tracker.attempt_ended(&agent.to_string(), worker_end());
+    }
+    let read = lines(&tracker, state.path());
+    for work in &others {
+        let kinds = kinds_of(&read, work);
+        assert_eq!(
+            kinds,
+            ["opened", "attempt_started", "attempt_ended"],
+            "a lifecycle event was crowded out"
+        );
+    }
+    let sessions = sessions_of(&read, &churning);
+    assert!(
+        sessions.len() <= 16 / crate::work_journal::SESSION_QUEUE_SHARE + 1,
+        "{sessions:?}"
+    );
+    assert_eq!(
+        sessions.last().unwrap().1,
+        "s-9",
+        "the latest id is written at the end"
+    );
 }
 
 /// PRD #1790: Pi's synthetic `<pane>-session` id is not a session Pi could be
@@ -1583,8 +1751,8 @@ fn a_synthetic_pi_session_is_not_written() {
         .kept()
         .unwrap();
     tracker.attempt_started(&work, "3", Some("p"), None);
-    tracker.session_seen("3", Some("p"), "p-session", &AgentType::Pi);
-    tracker.session_seen("3", Some("p"), "ses_abc", &AgentType::OpenCode);
+    tracker.session_seen("3", Some("p"), "p-session", &AgentType::Pi, false);
+    tracker.session_seen("3", Some("p"), "ses_abc", &AgentType::OpenCode, false);
     let read = lines(&tracker, state.path());
     assert_eq!(
         sessions_of(&read, &work),
@@ -1642,5 +1810,96 @@ async fn a_spawn_records_how_it_was_launched() {
     assert_eq!(record.role.as_deref(), Some("coder"));
     assert_eq!(record.orchestration.as_deref(), Some("tdd"));
     assert_eq!(record.orchestration_id.as_deref(), Some("orch-7"));
+    registry.shutdown_all();
+}
+
+/// PRD #1790 (R5): a journal read that skipped a line of a kind this build
+/// does not know cannot show that a work is gone, since that line may be the
+/// one naming it, so no launch record is pruned on it; with the line gone,
+/// the old record of a forgotten work is.
+#[test]
+fn launch_records_are_kept_while_the_read_skipped_an_unknown_kind() {
+    let state = crate::test_temp::tempdir().unwrap();
+    let tracker = tracker(state.path());
+    let journal = tracker.journal().unwrap();
+    let work = tracker.mint().unwrap();
+    let record = crate::launch_records::LaunchRecord {
+        v: crate::launch_records::SCHEMA_VERSION,
+        work: work.clone(),
+        attempt: AttemptId::new("r9", 1).unwrap(),
+        command: Some("cat".into()),
+        shell: None,
+        agent_type: None,
+        cwd: Some("/abs".into()),
+        name: None,
+        role: None,
+        orchestration: None,
+        orchestration_id: None,
+        ts_ms: 0,
+    };
+    crate::launch_records::write(state.path(), &record).unwrap();
+    let planted = state
+        .path()
+        .join(crate::work_journal::DIR_NAME)
+        .join("run-r9.jsonl");
+    std::fs::write(
+        &planted,
+        format!(
+            "{{\"v\":1,\"seq\":1,\"ts_ms\":1,\"run\":\"r9\",\"kind\":\"some_future_kind\",\"work\":\"{work}\"}}\n"
+        ),
+    )
+    .unwrap();
+    let read = journal.read().unwrap();
+    assert_eq!(read.stats.unknown_kind, 1, "precondition: {:?}", read.stats);
+    assert!(launch_read_incomplete(&read.stats));
+    prune_launch_records(journal);
+    assert_eq!(
+        crate::launch_records::read_all(state.path()).unwrap(),
+        vec![record]
+    );
+    // Control: once no line the read cannot understand is left, it goes.
+    std::fs::remove_file(&planted).unwrap();
+    prune_launch_records(journal);
+    assert!(
+        crate::launch_records::read_all(state.path())
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// PRD #1790 (R2): a spawn that gives no folder starts in the child's `HOME`,
+/// here an env overlay's, and its launch record keeps that folder as an
+/// absolute path, while the registry's own `cwd` stays what the caller gave
+/// (nothing).
+#[tokio::test]
+async fn a_spawn_without_a_folder_records_the_home_it_started_in() {
+    let state = crate::test_temp::tempdir().unwrap();
+    let home = crate::test_temp::tempdir().unwrap();
+    let registry = Arc::new(AgentPtyRegistry::new());
+    registry.work().install(journal(state.path(), "run1"));
+    let home_text = home.path().to_string_lossy().into_owned();
+    let agent = registry
+        .spawn_agent(SpawnOptions {
+            command: Some("cat"),
+            cwd: None,
+            env: vec![
+                (DOT_AGENT_DECK_PANE_ID.to_string(), "home-pane".to_string()),
+                ("HOME".to_string(), home_text.clone()),
+            ],
+            ..SpawnOptions::default()
+        })
+        .expect("spawn");
+    let records = crate::launch_records::read_all(state.path()).unwrap();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].cwd.as_deref(), Some(home_text.as_str()));
+    let listed = registry
+        .agent_records()
+        .into_iter()
+        .find(|r| r.id == agent)
+        .expect("the agent is listed");
+    assert_eq!(
+        listed.cwd, None,
+        "the registry's cwd is what the caller gave"
+    );
     registry.shutdown_all();
 }

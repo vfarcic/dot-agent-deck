@@ -1374,7 +1374,7 @@ async fn dispatch_one_issue(
     let prompt = substitute_issue_number(prompt_template, issue);
     // PRD #1790: the task as dispatched, saved beside the worktree under the
     // issue's work id, so a restore can hand it back.
-    crate::dispatch_task::save_or_warn(&paths.worktree_dir, issue_work.as_ref(), &prompt);
+    crate::dispatch_task::save_or_warn(&paths.worktree_dir, issue_work.as_ref(), &prompt).await;
     let req = SpawnRequest {
         work_id: issue_work.clone(),
         task_name: task_name.to_string(),

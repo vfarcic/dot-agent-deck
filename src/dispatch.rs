@@ -1116,7 +1116,7 @@ pub async fn handle_dispatch(
     );
     // PRD #1790: the task as the dispatcher gave it, saved beside the
     // worktree under the unit's work id, so a restore can hand it back.
-    crate::dispatch_task::save_or_warn(&paths.worktree_dir, work_id.as_ref(), task);
+    crate::dispatch_task::save_or_warn(&paths.worktree_dir, work_id.as_ref(), task).await;
     let req = SpawnRequest {
         work_id: work_id.clone(),
         task_name: format!("dispatch-{name}"),
