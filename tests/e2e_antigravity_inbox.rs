@@ -292,7 +292,7 @@ fn antigravity_inbox_003_error_does_not_take_pending_mail() {
     agy.committed_once(&id);
 }
 
-/// Scenario: Delegate from an orchestration to its Antigravity role before its first prompt, holding launch auth and then a permission dialog. Neither accepts input; once OSC reports idle, the role receives and displays its task through the doorbell and its real work-done CLI sends the report back to the orchestrator.
+/// Scenario: Delegate from an orchestration to its Antigravity role before its first prompt, holding launch auth and then a permission dialog. Neither accepts input; once OSC reports idle, the role displays its task in the pane scrollback through the doorbell and its real work-done CLI sends the report back to the orchestrator.
 #[spec("orchestration/route/003")]
 #[test]
 fn route_003_antigravity_role_waits_for_idle_and_reports_work_done() {
@@ -320,12 +320,16 @@ fn route_003_antigravity_role_waits_for_idle_and_reports_work_done() {
         !String::from_utf8_lossy(&inbox::bytes(&agy.pane)).contains(TASK),
         "task content must travel through the hook"
     );
+    // The framed work-done instructions can push the task above a 40-row
+    // viewport. Check what the pane displayed, retaining its scrollback.
     assert!(
-        common::wait_until(Duration::from_secs(10), || inbox::screen(
-            &agy.deck, &agy.pane
-        )
-        .contains(TASK)),
-        "role must visibly receive its delegated task: {}",
+        common::wait_for_pane_text_on(
+            agy.deck.attach_socket_path(),
+            &agy.pane.agent,
+            TASK,
+            Duration::from_secs(10)
+        ),
+        "role must visibly receive its delegated task in pane scrollback: {}",
         agy.diagnostic()
     );
     assert!(common::wait_for_path(

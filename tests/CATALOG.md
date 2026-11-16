@@ -6672,7 +6672,7 @@ without depending on the config struct API.
 
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_antigravity_inbox.rs`), attached TUI, real daemon, PTYs, hook and work-done CLIs.
 - **Agent:** none; the shared Antigravity replay stand-in and existing routing orchestrator stand-in.
-- **Asserts:** the configured Antigravity role receives no input before idle, through the launch auth signal and a pending permission; the idle doorbell carries no task bytes, its hook displays the delegated task in the role pane, and the worker's task-scoped work-done reaches its orchestrator with Untrusted framing.
+- **Asserts:** the configured Antigravity role receives no input before idle, through the launch auth signal and a pending permission; the idle doorbell carries no task bytes, its hook displays the delegated task in the role pane's PTY scrollback (even when the work-done footer pushes it above the viewport), and the worker's task-scoped work-done reaches its orchestrator with Untrusted framing.
 - **Does not assert:** a model deciding to delegate or perform the work, or multi-tab isolation (route/001).
 - **Platform coverage:** mac+linux.
 

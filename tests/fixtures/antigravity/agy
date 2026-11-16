@@ -11,6 +11,8 @@ import select
 import tty
 import termios
 import re
+import signal
+import textwrap
 
 
 if "--version" in sys.argv:
@@ -24,15 +26,29 @@ tty.setraw(0, termios.TCSANOW)
 capture = (root / "input.bytes").open("ab", buffering=0)
 line = bytearray()
 state = "booting"
+placeholder = True
 
 
 def redraw():
     width = os.get_terminal_size(0).columns
-    content = line.decode(errors="replace") if line else "Auto mode: edits & safe commands auto-approved (shift+tab to cycle)"
-    sys.stdout.write("\033[2J\033[HAntigravity CLI 1.5.9\r\nGemini 3.8 Flash (Low)\r\n"
+    content = line.decode(errors="replace")
+    hint = "Auto mode: edits & safe commands auto-approved (shift+tab to cycle)"
+    rows = textwrap.wrap(content or (hint if placeholder else ""), width=max(1, width - 2)) or [""]
+    composer = "\r\n  ".join(rows)
+    if not line and placeholder:
+        composer = "\033[90m" + composer + "\033[0m"
+    # Real agy leaves its offset header with LF alone. The scanner must see
+    # that row depart, rather than relying on a CR or a top-left stand-in.
+    sys.stdout.write("\033[2J\033[3J\033[H\033[2;19HAntigravity CLI 1.5.9\n"
+                     + "\r                  Gemini 3.8 Flash (Low)\r\n"
                      + ((root / "delivered.txt").read_text().replace("\n", "\r\n") + "\r\n" if (root / "delivered.txt").exists() else "")
-                     + "─" * width + "\r\n> " + content + "\r\n"
-                     + "─" * width + "\r\n? for shortcuts\r\n")
+                     + "─" * width + "\r\n> " + composer + "\r\n"
+                     + "─" * width + "\r\n\033[90m? for shortcuts\033[0m")
+    # Move back from the footer to the composer, including wrapped input.
+    # Placeholder text is not input: its cursor stays just after `> `.
+    cursor_col = min(width, 3 + len(rows[-1])) if line else 3
+    cursor_up = 2 if line else len(rows) + 1
+    sys.stdout.write(f"\033[{cursor_up}A\033[{cursor_col}G")
     sys.stdout.flush()
 
 
@@ -112,6 +128,7 @@ def submitted(value):
             }))
 
 
+signal.signal(signal.SIGWINCH, lambda _signal, _frame: redraw())
 redraw()
 step = 0
 while True:
@@ -126,13 +143,19 @@ while True:
             if c == 13:
                 value = line.decode(errors="replace")
                 line.clear()
+                placeholder = True
                 submitted(value)
             elif c == 21:
                 line.clear()
+                placeholder = False
             elif c in (8, 127):
+                placeholder = False
+                while line and line[-1] & 0xC0 == 0x80:
+                    line.pop()
                 if line:
                     line.pop()
             elif c >= 32:
+                placeholder = False
                 line.append(c)
         redraw()
     request = root / f"request-{step}.json"

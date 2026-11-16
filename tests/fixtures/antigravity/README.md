@@ -25,3 +25,9 @@ Hook payloads, hook outputs and OSC 7501 status sequences captured from a real A
 | `output-pre-invocation-inject-steps.json` | a `PreInvocation` output `agy` honoured: the nested `systemMessage` object reached the model | written by the probe, behaviour captured |
 | `output-pre-invocation-inject-steps-rejected.json` | the string form of `systemMessage`, which `agy` rejected (`failed to unmarshal result … via protojson`) and ignored | written by the probe, behaviour captured |
 | `osc7501-sequences.json` | every distinct OSC 7501 sequence `agy` wrote (`sequences`, with the exact bytes and the decoded `msg`), and the order they came in for each scenario (`scenarios`) | captured; `scenarios` transcribed from the driver's event log |
+
+## Synthetic terminal geometry
+
+The executable `agy` stand-in replays these hooks and OSC sequences without calling a model. Its composer follows the geometry measured on real `agy` 1.5.9 at 80 and 175 columns: the header starts at zero-based row 1, column 18 and leaves that row with a bare LF; the `> ` composer sits between two full-width `─` rules; its placeholder and `? for shortcuts` footer use brightblack. The cursor stays after the input text, or just after `> ` when empty, rather than below the footer. Long input word-wraps with a two-cell continuation indent, Ctrl+U leaves a blank composer without restoring the hint, and one DEL removes one character. Resize triggers a redraw beginning with `ESC[2J ESC[3J ESC[H`.
+
+The stand-in omits the account banner, logo and mode announcement, and renders injected hook text into the PTY for delivery assertions. `delivered.txt` also records that text for diagnostics; `orchestration/route/003` checks the pane's PTY scrollback so a long work-done footer cannot hide an otherwise displayed task from the assertion.
