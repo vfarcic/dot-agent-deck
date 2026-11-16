@@ -473,7 +473,9 @@ PATH=${HOME}/.local/bin:${HOME}/.opencode/bin:${HOME}/.local/share/devbox/global
 EOF
 [ "$USE_VALS_FLAG" = 1 ] && echo 'USE_VALS=true' >> "$HOME/.config/environment.d/999-dad-box.conf"
 [ "$RELAY_FLAG" = 1 ] && echo "OTEL_EXPORTER_OTLP_ENDPOINT=$RELAY_ENDPOINT" >> "$HOME/.config/environment.d/999-dad-box.conf"
-[ "$REMOTE_EXEC_FLAG" = 1 ] && printf 'DAD_REMOTE_EXEC=rwx\nOTEL_RESOURCE_ATTRIBUTES=%s\n' "$REXEC_ATTR" >> "$HOME/.config/environment.d/999-dad-box.conf"
+# The label is appended to whatever an earlier environment.d file set, not put in its place.
+# shellcheck disable=SC2016  # written literally, expanded by systemd's environment.d parser
+[ "$REMOTE_EXEC_FLAG" = 1 ] && printf 'DAD_REMOTE_EXEC=rwx\nOTEL_RESOURCE_ATTRIBUTES=${OTEL_RESOURCE_ATTRIBUTES:+${OTEL_RESOURCE_ATTRIBUTES},}%s\n' "$REXEC_ATTR" >> "$HOME/.config/environment.d/999-dad-box.conf"
 # The user manager reads environment.d only when it starts, and linger started
 # it before this file existed: apply the same PATH to the running manager too.
 systemctl --user set-environment "PATH=$HOME/.local/bin:$HOME/.opencode/bin:$HOME/.local/share/devbox/global/default/.devbox/nix/profile/default/bin:/nix/var/nix/profiles/default/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" || echo "  warning: could not update the running systemd --user manager (applies at next login)"
@@ -489,7 +491,8 @@ elif [ "$(systemctl --user show-environment 2>/dev/null | sed -n 's/^OTEL_EXPORT
   # operator set in the manager some other way.
   systemctl --user unset-environment OTEL_EXPORTER_OTLP_ENDPOINT || true
 fi
-MANAGER_ATTRS="$(systemctl --user show-environment 2>/dev/null | sed -n 's/^OTEL_RESOURCE_ATTRIBUTES=//p')"
+# An unreachable manager reads as no attributes, as the warnings around it do, rather than stopping the run.
+MANAGER_ATTRS="$({ systemctl --user show-environment 2>/dev/null || true; } | sed -n 's/^OTEL_RESOURCE_ATTRIBUTES=//p')"
 if [ "$REMOTE_EXEC_FLAG" = 1 ]; then
   systemctl --user set-environment DAD_REMOTE_EXEC=rwx || echo "  warning: could not set DAD_REMOTE_EXEC in the running systemd --user manager (applies at next login)"
   case ",$MANAGER_ATTRS," in
@@ -501,10 +504,17 @@ else
     # Off: clear only the value this script writes, as for the relay endpoint.
     systemctl --user unset-environment DAD_REMOTE_EXEC || true
   fi
-  # Likewise the label: only while it is the manager's whole value.
-  if [ "$MANAGER_ATTRS" = "$REXEC_ATTR" ]; then
-    systemctl --user unset-environment OTEL_RESOURCE_ATTRIBUTES || true
-  fi
+  # Likewise the label: remove only that pair, keeping any others.
+  case ",$MANAGER_ATTRS," in
+    *",$REXEC_ATTR,"*)
+      REST="$(printf '%s' "$MANAGER_ATTRS" | tr ',' '\n' | grep -vxF "$REXEC_ATTR" | paste -sd, - || true)"
+      if [ -n "$REST" ]; then
+        systemctl --user set-environment "OTEL_RESOURCE_ATTRIBUTES=$REST" || true
+      else
+        systemctl --user unset-environment OTEL_RESOURCE_ATTRIBUTES || true
+      fi
+      ;;
+  esac
 fi
 # shellcheck source=/dev/null
 eval "$(awk -v po="$PATH_OPEN" -v pc="$PATH_CLOSE" '$0 == po { on = 1 } on { print } $0 == pc { on = 0 }' "$HOME/.bashrc")"
