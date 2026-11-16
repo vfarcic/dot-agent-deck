@@ -1402,7 +1402,7 @@ mod tests {
             matches!(&error, ApplyError::DuplicateName { name } if name == "prod"),
             "{error:?}"
         );
-        assert_eq!(error.to_string(), "A deck named 'prod' already exists.");
+        assert_eq!(error.to_string(), "A daemon named 'prod' already exists.");
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             before,
@@ -1491,7 +1491,7 @@ mod tests {
         assert!(matches!(error, RenameDeckError::Changed), "{error:?}");
         assert_eq!(
             error.to_string(),
-            "That deck changed since this window loaded it, so it was not renamed. It is \
+            "That daemon changed since this window loaded it, so it was not renamed. It is \
              shown as it is now; try again."
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), replacement);
@@ -1583,7 +1583,7 @@ mod tests {
 
     /// Scenario: the window shows `prod`; in a terminal `remote remove prod`
     /// takes it out of the deck list. Renaming it from the window is refused
-    /// with "no longer in the deck list", writes nothing, and — like a deck
+    /// with "no longer listed", writes nothing, and — like a deck
     /// that changed — is a refusal after which the window is handed the list
     /// as it is on disk, so the removed row does not stay on screen.
     #[test]
@@ -1595,10 +1595,7 @@ mod tests {
         let error = rename(&path, &shown, "production").unwrap_err();
 
         assert!(matches!(error, RenameDeckError::NotFound), "{error:?}");
-        assert_eq!(
-            error.to_string(),
-            "That deck is no longer in the deck list."
-        );
+        assert_eq!(error.to_string(), "That daemon is no longer listed.");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
         assert!(
             refusal_shows_disk(&error),
@@ -1624,15 +1621,15 @@ mod tests {
         let duplicate = rename(&path, &prod, "staging").unwrap_err();
         assert_eq!(
             duplicate.to_string(),
-            "A deck named 'staging' already exists."
+            "A daemon named 'staging' already exists."
         );
         let invalid = rename(&path, &prod, "my deck").unwrap_err();
         assert!(
-            invalid.to_string().starts_with("Invalid deck name: "),
+            invalid.to_string().starts_with("Invalid daemon name: "),
             "{invalid}"
         );
         let gone = rename(&path, &row("n-gone", "gone.example"), "x").unwrap_err();
-        assert_eq!(gone.to_string(), "That deck is no longer in the deck list.");
+        assert_eq!(gone.to_string(), "That daemon is no longer listed.");
     }
 
     #[test]
@@ -1643,7 +1640,7 @@ mod tests {
         assert_eq!(check_name(&path, "lab", None).unwrap(), None);
         assert_eq!(
             check_name(&path, "prod", None).unwrap().as_deref(),
-            Some("A deck named 'prod' already exists.")
+            Some("A daemon named 'prod' already exists.")
         );
         assert_eq!(
             check_name(&path, "prod", Some(&prod)).unwrap(),

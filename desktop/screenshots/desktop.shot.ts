@@ -184,7 +184,7 @@ desktopScenario("settings-daemons", async (page) => {
       appearance: { mode: "dark" },
       zoom: { level: 1 },
       // Issue #1426: a named deck, so the chooser shows the name with the
-      // address beside it and the Deck name field is filled in.
+      // address beside it and the Daemon name field is filled in.
       endpoints: { remote: [{ host: "build-box", id: "deck0000000000aa", name: "build", port: 22 }], selection: "deck0000000000aa" },
     }));
   });
@@ -193,7 +193,7 @@ desktopScenario("settings-daemons", async (page) => {
   await page.getByTestId("settings-section-decks").click();
   await expect(page.getByTestId("settings-panel-decks")).toBeVisible();
   await expect(page.getByTestId("deck-choice-deck0000000000aa")).toContainText("build-box");
-  await expect(page.getByLabel("Deck name")).toHaveValue("build");
+  await expect(page.getByLabel("Daemon name")).toHaveValue("build");
 });
 
 // PRD #2274 — desktop-only: the TUI attaches to one daemon at a time. The

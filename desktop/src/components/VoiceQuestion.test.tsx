@@ -538,7 +538,7 @@ describe("answering an agent's question by voice", () => {
       { kind: "refused", code: "channel_gone", sentence: "The agent stopped waiting for that answer — nothing was sent." },
       { kind: "refused", code: "always_not_confirmed", sentence: "Always allow was not confirmed — nothing was sent." },
       { kind: "refused", code: "write_failed", sentence: "Couldn't send the answer: pane closed." },
-      { kind: "withheld", sentence: "This deck cannot answer questions by voice — update the deck to use it. Nothing was sent." },
+      { kind: "withheld", sentence: "This daemon cannot answer questions by voice — upgrade the daemon to use it. Nothing was sent." },
       SENT,
     ];
     for (const outcome of refusals) {
@@ -575,9 +575,9 @@ describe("answering an agent's question by voice", () => {
     expect(questionLost(aim, { ...now, deck: "remote" })?.code).toBe("deck");
     /* Issue #1726: the pane stopping taking input calls it off; one that
        already did when the answer was begun is the deck's to take or refuse. */
-    const blocked = { ...pane(), inputBlocked: "its deck is not answering." };
+    const blocked = { ...pane(), inputBlocked: "its daemon is not answering." };
     expect(questionLost(aim, { ...now, pane: blocked })?.code).toBe("blocked");
-    expect(questionLost({ ...aim, inputBlocked: "its deck is not answering." }, { ...now, pane: blocked })).toBeUndefined();
+    expect(questionLost({ ...aim, inputBlocked: "its daemon is not answering." }, { ...now, pane: blocked })).toBeUndefined();
     /* The question leaving with it is the question's reason (PR #1764 review). */
     expect(questionLost(aim, { ...now, pane: { ...blocked, question: undefined } })?.code).toBe("question");
     /* The same id registered again is another question (audit A4). */
@@ -781,7 +781,7 @@ describe("answering an agent's question by voice", () => {
   it("question/desktop/034: a countdown is called off when its deck stops answering", async () => {
     const voice = microphone();
     const { rt, sendVoiceAnswer } = runtime(voice, () => SENT);
-    const blocked = { ...pane(), inputBlocked: "its deck is not answering." };
+    const blocked = { ...pane(), inputBlocked: "its daemon is not answering." };
     const view = render(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={pane()} selectedDeckId="local" />);
     await turnOnVoice();
     await speak(voice, "yes");
@@ -790,7 +790,7 @@ describe("answering an agent's question by voice", () => {
     view.rerender(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={blocked} selectedDeckId="local" />);
     await flush();
     expect(screen.queryByTestId("voice-question")).toBeNull();
-    expect(screen.getByTestId("voice-report")).toHaveTextContent("Nothing was sent — the pane stopped taking input: its deck is not answering.");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Nothing was sent — the pane stopped taking input: its daemon is not answering.");
     await waitOut(VOICE_DICTATION_SEND_MS * 2);
     expect(sendVoiceAnswer).not.toHaveBeenCalled();
   });
@@ -812,7 +812,7 @@ describe("answering an agent's question by voice", () => {
     await waitOut(VOICE_DICTATION_SEND_MS);
     expect(sendVoiceAnswer).toHaveBeenCalledTimes(1);
 
-    view.rerender(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={{ ...pane(), question: undefined, inputBlocked: "its deck is not answering." }} selectedDeckId="local" />);
+    view.rerender(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={{ ...pane(), question: undefined, inputBlocked: "its daemon is not answering." }} selectedDeckId="local" />);
     await flush();
     expect(cancelVoiceAnswer).not.toHaveBeenCalled();
     deliver?.(SENT);
@@ -838,7 +838,7 @@ describe("answering an agent's question by voice", () => {
       await new Promise<void>((resolve) => { release = resolve; });
       return questionAnswers("yes");
     });
-    const blocked = { ...pane(), inputBlocked: "its deck is not answering." };
+    const blocked = { ...pane(), inputBlocked: "its daemon is not answering." };
     const view = render(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={pane()} selectedDeckId="local" />);
     await turnOnVoice();
     await speak(voice, "red");

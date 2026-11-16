@@ -353,7 +353,7 @@ const VOICE_CHOICE_AGENT_REPLACED = "The agent you chose was replaced after the 
  * replacement, and refused the same way.
  */
 const VOICE_CHOICE_AGENT_GONE = "The agent you chose is gone since the choice was offered, so nothing ran. Say the command again.";
-export const VOICE_CHOICE_DECK_MOVED_ON = "The selected deck changed after the choice was offered, so nothing ran. Say the command again.";
+export const VOICE_CHOICE_DECK_MOVED_ON = "The selected daemon changed after the choice was offered, so nothing ran. Say the command again.";
 export const VOICE_CHOICE_SCREEN_MOVED_ON = "You moved to another screen after the choice was offered, so nothing ran. Say the command again here.";
 export const VOICE_CHOICE_DIALOG_MOVED_ON = "The New agent dialog changed after the choice was offered, so nothing ran. Say the command again.";
 

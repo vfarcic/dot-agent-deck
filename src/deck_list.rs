@@ -110,14 +110,14 @@ pub fn timestamp_now() -> String {
 /// Why a name is not a valid deck name.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum DeckNameError {
-    #[error("a deck name cannot be empty")]
+    #[error("a name cannot be empty")]
     Empty,
-    #[error("a deck name is at most {MAX_DECK_NAME_BYTES} bytes; got {len}")]
+    #[error("a name is at most {MAX_DECK_NAME_BYTES} bytes; got {len}")]
     TooLong { len: usize },
-    #[error("a deck name must start with an ASCII letter or digit")]
+    #[error("a name must start with an ASCII letter or digit")]
     BadStart,
     #[error(
-        "a deck name is ASCII letters, digits, '.', '-' and '_'; found byte 0x{byte:02x} at offset {offset}"
+        "a name is ASCII letters, digits, '.', '-' and '_'; found byte 0x{byte:02x} at offset {offset}"
     )]
     ForbiddenByte { offset: usize, byte: u8 },
 }
@@ -640,7 +640,7 @@ impl DeckRef<'_> {
 pub enum AddDeckError {
     #[error("A remote named '{name}' already exists.")]
     DuplicateName { name: String },
-    #[error("A deck with id '{id}' already exists.")]
+    #[error("A remote with id '{id}' already exists.")]
     DuplicateId { id: String },
     #[error("Invalid remote name: {0}.")]
     InvalidName(#[from] DeckNameError),
@@ -1119,18 +1119,18 @@ pub fn remove(path: &Path, which: DeckRef<'_>) -> Result<Option<RemoteEntry>, Re
 /// can name the registry's path and is for a log.
 #[derive(Debug, Error)]
 pub enum RenameDeckError {
-    #[error("That deck is no longer in the deck list.")]
+    #[error("That daemon is no longer listed.")]
     NotFound,
     /// The row found is not the deck the caller was looking at — see
     /// [`rename`]'s `is_expected`.
     #[error(
-        "That deck changed since this window loaded it, so it was not renamed. It is shown as it \
+        "That daemon changed since this window loaded it, so it was not renamed. It is shown as it \
          is now; try again."
     )]
     Changed,
-    #[error("A deck named '{name}' already exists.")]
+    #[error("A daemon named '{name}' already exists.")]
     DuplicateName { name: String },
-    #[error("Invalid deck name: {0}.")]
+    #[error("Invalid daemon name: {0}.")]
     InvalidName(#[from] DeckNameError),
     #[error(transparent)]
     Config(#[from] RemoteConfigError),
@@ -2569,7 +2569,10 @@ added_at = "2026-01-01T00:00:00+00:00"
             matches!(&error, RenameDeckError::DuplicateName { name } if name == "staging"),
             "{error:?}"
         );
-        assert_eq!(error.to_string(), "A deck named 'staging' already exists.");
+        assert_eq!(
+            error.to_string(),
+            "A daemon named 'staging' already exists."
+        );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
     }
 
