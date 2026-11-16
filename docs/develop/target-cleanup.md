@@ -60,4 +60,6 @@ It runs on macOS and Linux and needs `lsof` (`scripts/box/bootstrap.sh` installs
 
 **Why not a systemd timer.** The orphan reaper runs on a timer (`scripts/install-reaper-timer.sh`), but a timer is Linux-only, and this command is Rust, so a timer would also have to build the `xtask` binary first. A tree grows while something builds in it, and on this repository that is mostly dispatched units and the `rust-analyzer` sessions beside them, so the loop is where the sweep pays most. Trees built outside a loop are covered by `/tag-release`'s cleanup.
 
+**What a dev box runs on a timer instead.** `scripts/box/bootstrap.sh` installs `dad-box-cleanup` (`scripts/box/user/dad-box-cleanup.sh`), a shell script a user timer runs every 30 minutes. It does not remove `target/` trees; it trims what grows inside one between sweeps: test binaries in `target/*/deps` older than six hours that no process is running, the `incremental` cache of a worktree with no build running and no `target/` write for an hour, and scratchpad files over 100 MB on `/tmp` that nothing holds open. It logs each run to `~/.local/state/dad-box-cleanup.log`.
+
 **What it costs.** Incremental build time in a reclaimed worktree: its next build starts cold. The idle and size thresholds keep that to trees nothing has written to for two hours, or any idle tree once the disk is short.

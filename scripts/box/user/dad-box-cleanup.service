@@ -1,0 +1,8 @@
+[Unit]
+Description=Trim stale dot-agent-deck build output and scratch copies on this box
+
+[Service]
+Type=oneshot
+Nice=15
+IOSchedulingClass=idle
+ExecStart=%h/.local/bin/dad-box-cleanup

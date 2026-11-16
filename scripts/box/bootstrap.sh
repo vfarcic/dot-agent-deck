@@ -16,7 +16,7 @@
 # Layers, each assuming the one before:
 #   1. apt: docker (Docker's repo), auditd, build-essential, nodejs/npm (runtime for npm-distributed agents);
 #      with --use-vals google-cloud-cli (Google's repo), with --desktop xvfb and the driver tier's runtime packages
-#   2. system: sysctl tuning, 8 GB swap, linger, the mem-sampler timer
+#   2. system: sysctl tuning, 8 GB swap, linger, the mem-sampler timer, the dad-box-cleanup user timer
 #   3. nix + devbox, then `devbox global` from devbox-global.json
 #   4. PATH (and, with --use-vals, USE_VALS; with --relay, OTEL_EXPORTER_OTLP_ENDPOINT;
 #      with --remote-exec, DAD_REMOTE_EXEC)
@@ -315,6 +315,23 @@ done
 [ "$changed" -eq 1 ] && sudo systemctl daemon-reload
 sudo systemctl enable --now mem-sampler.timer >/dev/null 2>&1
 echo "sysctl, swap, linger, mem-sampler: done"
+
+# dad-box-cleanup (user/ beside this script): every 30 minutes, trims stale test
+# binaries and incremental caches of idle dot-agent-deck worktrees and large
+# scratchpad copies on /tmp, skipping anything a process is using.
+CLEANUP_UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+mkdir -p "$HOME/.local/bin" "$CLEANUP_UNIT_DIR"
+install -m 0755 "$HERE/user/dad-box-cleanup.sh" "$HOME/.local/bin/dad-box-cleanup"
+changed=0
+for u in dad-box-cleanup.service dad-box-cleanup.timer; do
+  cmp -s "$HERE/user/$u" "$CLEANUP_UNIT_DIR/$u" || { install -m 0644 "$HERE/user/$u" "$CLEANUP_UNIT_DIR/$u"; changed=1; }
+done
+[ "$changed" -eq 1 ] && { systemctl --user daemon-reload || true; }
+if systemctl --user enable --now dad-box-cleanup.timer >/dev/null 2>&1; then
+  echo "dad-box-cleanup timer: $(systemctl --user is-active dad-box-cleanup.timer 2>/dev/null || true)"
+else
+  echo "  warning: could not enable dad-box-cleanup.timer in the systemd --user manager; run: systemctl --user enable --now dad-box-cleanup.timer"
+fi
 
 # -------- 3. nix + devbox ----------------------------------------------------
 
