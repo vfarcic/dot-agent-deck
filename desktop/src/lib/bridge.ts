@@ -3130,7 +3130,7 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
  * reachable from the URL — the previous inline `||` chain had to be edited in
  * lockstep with the fixture and was not.
  */
-const FIXTURE_STATES: readonly FixtureState[] = ["connected", "crowded", "disconnected", "error", "empty", "fleet", "docs", "docs-pr", "docs-fleet", "voice-pages", "upgrade", "upgrade-error", "hook-notice", "docs-question", "docs-restart"];
+const FIXTURE_STATES: readonly FixtureState[] = ["connected", "crowded", "disconnected", "error", "empty", "fleet", "docs", "docs-pr", "docs-fleet", "voice-pages", "upgrade", "upgrade-error", "hook-notice", "docs-question", "docs-restart", "docs-antigravity"];
 
 class FixtureDeckBridge implements DeckBridge {
   readonly mode = "fixture" as const;

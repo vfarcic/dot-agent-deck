@@ -48,7 +48,7 @@ export const FIXTURE_UNREACHABLE_DAEMON_ID = "ci@runner-7";
 export const FIXTURE_PENDING_DAEMON_ID = "ops@edge-3";
 
 /** Which scenario `createFixtureFleet` builds; selected by `?state=`. */
-export type FixtureState = "connected" | "disconnected" | "error" | "empty" | "crowded" | "fleet" | "docs" | "docs-pr" | "docs-fleet" | "voice-pages" | "upgrade" | "upgrade-error" | "hook-notice" | "docs-question" | "docs-restart";
+export type FixtureState = "connected" | "disconnected" | "error" | "empty" | "crowded" | "fleet" | "docs" | "docs-pr" | "docs-fleet" | "voice-pages" | "upgrade" | "upgrade-error" | "hook-notice" | "docs-question" | "docs-restart" | "docs-antigravity";
 
 /**
  * PRD #1487 M5 — the versions the `upgrade` scenarios play: this app's, and the
@@ -1298,6 +1298,29 @@ function hookNoticeFleet(): DeckSnapshot[] {
 }
 
 export function createFixtureSnapshot(state: FixtureState = "connected"): DeckSnapshot {
+  if (state === "docs-antigravity") {
+    const snapshot = createFixtureSnapshot("docs");
+    return {
+      ...snapshot,
+      repo: "demo-project",
+      worktree: "/workspace/demo-project",
+      agents: [{
+        ...crowdedAgent({ id: "1", displayName: "probe", role: "Antigravity", cli: "agy", status: "needs_input", cwd: "/workspace/demo-project", toolCount: 0, upForMinutes: 0, quietForMinutes: 0, tab: { kind: "dashboard" } }),
+        model: "",
+        statusReason: "Approve Bash: rm -f probe.txt",
+        // The same permission menu replayed by tests/fixtures/antigravity/agy.
+        transcript: [
+          "\u001b[2J\u001b[HApprove Bash: rm -f probe.txt",
+          "  1. Yes, run command",
+          "  2. Yes, and always allow in this conversation for commands that start with 'rm -f probe.txt'",
+          "  3. Yes, and always allow for commands that start with 'rm -f probe.txt' (Persist to settings.json)",
+          "  4. No, cancel",
+          "Esc to cancel",
+          "",
+        ].join("\r\n"),
+      }],
+    };
+  }
   if (state === "docs-pr") {
     const snapshot = createFixtureSnapshot("docs");
     return {

@@ -46,6 +46,15 @@ The first five statuses come from each agent's hooks, plugin or extension, and h
 - For Claude Code, Error and Blocked need the `StopFailure` hook, which the deck installs only when `claude --version` reports 2.1.78 or newer. After upgrading Claude Code to 2.1.78 or newer, run `dot-agent-deck hooks install` (or restart the daemon) to add it.
 - For Claude Code, the question and its options need the `PermissionRequest` hook, which the deck installs only when `claude --version` reports 2.1.136 or newer. Older versions still show **Needs Input**, without the question. After upgrading, run `dot-agent-deck hooks install` (or restart the daemon) to add it.
 - An Antigravity card follows `agy`'s hook and `agy`'s own status report. It shows **Idle** once `agy`'s input box is up, **Thinking** while the model works, **Working** with the tool while one runs, **Needs Input** while `agy` waits for a permission, a sign-in or a folder-trust answer, **Error** when a turn fails, and **Idle** again when the turn ends or you interrupt it (in the desktop app: **idle**, **running**, **needs input**, **error**). Next to **Needs Input** and **Error** the card shows `agy`'s own words, such as `Approve Bash: rm -f probe.txt` or `Sign in required`: in the TUI under `Dir:`, in the desktop app on the agent's tile. **Needs Input** and an interrupted turn need `agy` to be the pane's command, or the role to declare `agent = "agy"`; an `agy` started from a shell inside a pane shows neither. The deck reads no usage limit from `agy`, so an Antigravity card never shows **Blocked**; a turn that fails shows **Error** with `agy`'s message. See [Installation → Antigravity CLI](installation.md#antigravity-cli).
+
+  **TUI:**
+
+  ![Antigravity TUI card showing Needs Input and Approve Bash: rm -f probe.txt beneath Dir, beside the permission menu.](/img/antigravity-needs-input-tui.png)
+
+  **Desktop:**
+
+  ![Antigravity desktop tile showing needs input and the permission reason Approve Bash: rm -f probe.txt.](/img/antigravity-needs-input-desktop.png)
+
 - Pi's dialogs are known through behaviour Pi does not document, checked with Pi 0.87.1; a later Pi release may stop it working. Whether Devin reports its multiple-choice questions has not been checked.
 - On OpenCode 2, a form asked in `opencode mini`, or one with a question that appears only after another is answered, a hidden field or a field OpenCode fills in from elsewhere, shows **Needs Input** and is answered in OpenCode's pane; in `mini` the card says `answer this form in OpenCode: <the form's title>`. See [OpenCode 1.x and 2.x](installation.md#opencode-1x-and-2x).
 - OpenCode reaching Anthropic through an Anthropic "credit balance is too low" error does not turn the card Blocked; that error carries no marker the deck can read.
