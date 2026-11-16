@@ -189,6 +189,7 @@ The deck learns each agent's status (Thinking, Working, Needs Input, and so on) 
 | OpenCode | `$XDG_CONFIG_HOME/opencode` (default `~/.config/opencode`, also when `XDG_CONFIG_HOME` is empty or not an absolute path), `~/.opencode` or `$OPENCODE_CONFIG_DIR` exists; and every time the deck starts an OpenCode agent, even on a machine where OpenCode has never run | The plugin file `plugin/dot-agent-deck.js` in `$XDG_CONFIG_HOME/opencode`, which the deck creates if it is missing, and in `$OPENCODE_CONFIG_DIR` when that exists; `dot-agent-deck-tui.js` and `plugins/dot-agent-deck-tui/` for OpenCode's interface. See [OpenCode 1.x and 2.x](#opencode-1x-and-2x). |
 | Codex | `codex` is on the daemon's `PATH` | Hooks in `$CODEX_HOME/hooks.json` (default `~/.codex`), and trust for those hooks. |
 | Devin | `devin` is on the daemon's `PATH` | Hook entries in `$XDG_CONFIG_HOME/devin/config.json` (default `~/.config/devin/config.json`). |
+| Antigravity | `agy` is on the daemon's `PATH` | One hook named `dot-agent-deck` in `~/.gemini/config/hooks.json`, a file the Antigravity app and IDE read too. The hook does nothing in an `agy` started outside the deck. See [Antigravity CLI](#antigravity-cli). |
 | Pi | Every time the deck starts a Pi pane | A bundled extension; nothing to install. |
 
 The hooks call the installed binary by its absolute path, so moving or deleting the binary breaks them until you reinstall them.
@@ -208,11 +209,12 @@ dot-agent-deck hooks install                    # Claude Code (the default)
 dot-agent-deck hooks install --agent opencode
 dot-agent-deck hooks install --agent codex
 dot-agent-deck hooks install --agent devin
+dot-agent-deck hooks install --agent antigravity
 ```
 
-`--agent` accepts `claude-code` (default), `opencode`, `codex` and `devin`; Pi has no hooks to install.
+`--agent` accepts `claude-code` (default), `opencode`, `codex`, `devin` and `antigravity`; Pi has no hooks to install.
 
-Unlike the automatic install, `hooks install` writes the configuration even when the agent's directory does not exist yet. On success it prints what it installed, for example `Installed hooks: SessionStart, SessionEnd, …` and `Settings file: /home/you/.claude/settings.json` for Claude Code, or `Trusted hooks: <n>` for Codex, followed by a note naming any of the deck's hooks you have turned off in Codex's `/hooks` list ([Codex events not showing](troubleshooting.md#codex-events-not-showing)). On failure it prints `Failed to install <agent> hooks: <reason>` and exits non-zero. `dot-agent-deck hooks uninstall --agent <agent>` removes them.
+Unlike the automatic install, `hooks install` writes the configuration even when the agent's directory does not exist yet. On success it prints what it installed, for example `Installed hooks: SessionStart, SessionEnd, …` and `Settings file: /home/you/.claude/settings.json` for Claude Code, or `Trusted hooks: <n>` for Codex, followed by a note naming any of the deck's hooks you have turned off in Codex's `/hooks` list ([Codex events not showing](troubleshooting.md#codex-events-not-showing)), or `Installed hook `dot-agent-deck`: SessionStart, PreInvocation, PreToolUse, PostToolUse, Stop` and `Hooks file: …` for Antigravity. On failure it prints `Failed to install <agent> hooks: <reason>` and exits non-zero. `dot-agent-deck hooks uninstall --agent <agent>` removes them.
 
 `dot-agent-deck hooks refresh` does what starting the deck does, for every agent at once: it updates each installed agent's hooks to the copy you run it from, leaving hooks that call another installed copy of the same or a newer release as they are. Like starting the deck, and unlike `hooks install`, it leaves alone an agent it does not find installed. It then says what each agent's hooks call, for example `Claude Code and Codex hooks now run this copy (v0.48.0). Restart agents that were already running so they use them.` When it left an agent's hooks on another copy that is older, or whose version it could not read, it names that copy, prints the `hooks install --agent <agent>` command that moves them to the copy you ran, and exits non-zero. When it could not update an installed agent's hooks at all, for example because the agent's settings file is not valid JSON, which it leaves as it was, or cannot be written, it says `<agent>'s hooks could not be updated: <reason>.`, prints that agent's `hooks install --agent <agent>` command, and exits non-zero; fix what the reason names (the install command says it again), then run the command. An upgrade of the CLI from the TUI, `dot-agent-deck upgrade` or the desktop app runs it for you ([After upgrading](#after-upgrading)); `--json` prints the same report as JSON.
 
@@ -264,6 +266,27 @@ If an OpenCode 2 agent runs on the shared service anyway, its card says `Add --s
 **A message that arrives on OpenCode 2's home screen.** When a deck message opens a new session from OpenCode 2's home screen while you have unsent text there, the text moves into the new session's prompt, so you do not lose it.
 
 **Going back from OpenCode 2 to 1.x.** OpenCode 1.x cannot open the data OpenCode 2 has used, and stops with `Database is not empty and has no session table`. This is OpenCode's behaviour, with or without the deck; see OpenCode's documentation before you downgrade.
+
+### Antigravity CLI
+
+The deck works with Google's [Antigravity CLI](https://antigravity.google/docs/getting-started?tab=cli) (`agy`), its successor to Gemini CLI, on macOS and Linux. An Antigravity agent gets a card with its own badge, the statuses in [Session Statuses](session-management.md#which-agents-report-which-status), deck messages and delegated tasks, in the TUI and the desktop app alike. Gemini CLI itself is not supported.
+
+**Install it and sign in once yourself.** The deck starts `agy` but neither installs it nor signs in for you.
+
+1. Install it with Google's installer, `curl -fsSL https://antigravity.google/cli/install.sh | bash`, which puts `agy` in `~/.local/bin`. It must be on the `PATH` of the account the deck's daemon runs as.
+2. Run `agy` yourself in a terminal, outside the deck, and complete its first-run screens: the colour scheme and display choices, Google's terms, and the sign-in with your Google account, an API key or Gemini Enterprise, as [Google's guide](https://antigravity.google/docs/getting-started?tab=cli) describes.
+3. Start the deck, or run `dot-agent-deck hooks install --agent antigravity` if it is already running. The daemon installs the hook by itself at start when `agy` is on its `PATH`.
+
+`agy` asks once per folder whether you trust it. The first time the deck starts `agy` in a folder you have not trusted, its card shows **Needs Input** with `Trust this folder?`; answer it in the agent's pane.
+
+**What is different from the other agents:**
+
+- **Start `agy` as the agent's command.** The deck reads `agy`'s own status report, which is what shows **Needs Input** and an interrupted turn, only in a pane whose command is `agy` (such as `agy`, `agy --model <model>` or `/path/to/agy`) or whose role declares `agent = "agy"` ([Declaring the agent behind a launcher command](orchestration.md#declaring-the-agent-behind-a-launcher-command)). An `agy` you start from a shell inside a pane reports through its hook only: its card shows **Thinking**, **Working**, **Idle** and **Error**, but not **Needs Input**.
+- **Its first hook runs with your first prompt.** `agy` starts its session when you send it its first prompt, not when it opens. Until then, in a pane started as above, the card shows **Idle** once `agy`'s input box is up, with no prompt or tool on it.
+- **Its reason is on the card.** When `agy` waits for a permission or a sign-in, or a turn ends in an error, the card shows `agy`'s own words for it, for example `Approve Bash: rm -f probe.txt` or `Sign in required`: in the TUI under `Dir:`, in the desktop app on the agent's tile.
+- **Turning the hook off.** `agy`'s `/hooks` command lists the deck's hook as `dot-agent-deck`. Turning it off there turns off the card's prompt and tool detail and the deck's message hand-over, and the deck leaves it off when it reinstalls the hook. Turn it on again in `/hooks`.
+
+**Google's terms for automating `agy`.** Google's [Antigravity FAQ](https://antigravity.google/docs/faq#can-i-use-antigravity-cli-headless-mode-in-third-party-coding-agents-or-automate-account-switching) says that "wrapping `agy` inside third-party coding agents or applications, or automating account rotation, is not supported under consumer plans", and, for using [third-party software with an Antigravity login](https://antigravity.google/docs/faq#why-cant-i-use-third-party-software-such-as-claude-code-openclaw-or-opencode-with-my-antigravity-login), recommends a Gemini Enterprise or Google AI Studio API key. The deck runs the `agy` you installed, signed in as you chose. Read Google's FAQ and terms and decide which sign-in to use.
 
 ## Desktop app
 
@@ -605,7 +628,7 @@ dot-agent-deck daemon stop --force   # stops managed agents and strands live orc
 
 ```bash
 dot-agent-deck daemon stop                     # add --force if it refuses and you accept losing the agents
-for agent in claude-code opencode codex devin; do
+for agent in claude-code opencode codex devin antigravity; do
   dot-agent-deck hooks uninstall --agent "$agent"
 done
 brew uninstall dot-agent-deck                  # Homebrew; or delete the downloaded binary, or `nix profile remove`

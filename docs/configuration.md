@@ -71,20 +71,21 @@ dot-agent-deck config set bell.on_idle true            # also ring when an agent
 
 Restart the TUI for a change to take effect.
 
-## Turn the doorbell off for Claude Code or Codex
+## Turn the doorbell off for Claude Code, Codex or Antigravity
 
-The deck types a doorbell line into an idle Claude Code or Codex to tell it a message is waiting, and checks the agent's input box before it does where it can ([Delivery in the TUI and desktop app](orchestration.md#delivery-in-the-tui-and-desktop-app)). It does that for every release of each agent. A pre-release build, one whose version carries a suffix such as `-beta.1` or `-alpha.1`, gets neither: the deck can't read its version, so that agent's messages arrive through its own wake-up and hooks or at your next prompt ([`unknown_release`](troubleshooting.md#a-card-says-waiting-for-the-agent-to-fetch-it-send-it-a-prompt)). If an agent update makes the doorbell misbehave, turn it off for that agent in `config.toml` on the daemon's host:
+The deck types a doorbell line into an idle Claude Code, Codex or Antigravity to tell it a message is waiting, and checks the agent's input box before it does where it can ([Delivery in the TUI and desktop app](orchestration.md#delivery-in-the-tui-and-desktop-app)). It does that for every release of each agent. A pre-release build, one whose version carries a suffix such as `-beta.1` or `-alpha.1`, gets neither: the deck can't read its version, so that agent's messages arrive through its own wake-up and hooks or at your next prompt ([`unknown_release`](troubleshooting.md#a-card-says-waiting-for-the-agent-to-fetch-it-send-it-a-prompt)). If an agent update makes the doorbell misbehave, turn it off for that agent in `config.toml` on the daemon's host:
 
 ```bash
 dot-agent-deck config set doorbell.claude false   # no doorbell or input-box check for Claude Code
 dot-agent-deck config set doorbell.codex false    # no doorbell or input-box check for Codex
+dot-agent-deck config set doorbell.antigravity false   # no doorbell for Antigravity
 ```
 
 Use the config key, and with the desktop app especially: the daemon reads the file each time it starts an agent, so the key works for a daemon that is already running and for one the app started.
 
-`DOT_AGENT_DECK_DOORBELL_CLAUDE` and `DOT_AGENT_DECK_DOORBELL_CODEX` win over the file: `0`, `false` or `off` turn the doorbell off, `1`, `true` or `on` turn it on. The daemon reads them from its own environment, the one it was started with, so a variable works only when it is set where the daemon starts, for example `DOT_AGENT_DECK_DOORBELL_CLAUDE=0 dot-agent-deck` while no daemon is running. A daemon that is already running keeps its environment and never sees a variable you export in a shell afterwards ([Recycling the daemon](troubleshooting.md#recycling-the-daemon)), and a daemon the desktop app starts when you open the app from the Dock, Finder or an application menu doesn't get variables exported in your shell profile.
+`DOT_AGENT_DECK_DOORBELL_CLAUDE`, `DOT_AGENT_DECK_DOORBELL_CODEX` and `DOT_AGENT_DECK_DOORBELL_ANTIGRAVITY` win over the file: `0`, `false` or `off` turn the doorbell off, `1`, `true` or `on` turn it on. The daemon reads them from its own environment, the one it was started with, so a variable works only when it is set where the daemon starts, for example `DOT_AGENT_DECK_DOORBELL_CLAUDE=0 dot-agent-deck` while no daemon is running. A daemon that is already running keeps its environment and never sees a variable you export in a shell afterwards ([Recycling the daemon](troubleshooting.md#recycling-the-daemon)), and a daemon the desktop app starts when you open the app from the Dock, Finder or an application menu doesn't get variables exported in your shell profile.
 
-For a daemon run as a service, `daemon install` saves these two variables from the installing shell on Linux and macOS: for example, `DOT_AGENT_DECK_DOORBELL_CLAUDE=0 dot-agent-deck daemon install`. Reinstall to update or remove saved overrides; a running service keeps its old environment until its next start (on macOS, the next login). Saved variables still win over the config keys ([Run the Daemon as a Service](daemon-service.md#what-the-service-changes)).
+For a daemon run as a service, `daemon install` saves these three variables from the installing shell on Linux and macOS: for example, `DOT_AGENT_DECK_DOORBELL_CLAUDE=0 dot-agent-deck daemon install`. Reinstall to update or remove saved overrides; a running service keeps its old environment until its next start (on macOS, the next login). Saved variables still win over the config keys ([Run the Daemon as a Service](daemon-service.md#what-the-service-changes)).
 
 A change applies to agents started after it, in the TUI and the desktop app alike: restart an agent from the deck, once it has taken its messages, to apply it. With the doorbell off, the agent's messages arrive through its own wake-up and hooks or at your next prompt, and its card says `waiting for the agent to fetch it. Send it a prompt.` when nothing else delivers them ([Turn the doorbell off for an agent](orchestration.md#turn-the-doorbell-off-for-an-agent)).
 
@@ -102,8 +103,9 @@ A change applies to agents started after it, in the TUI and the desktop app alik
 | `bell.on_idle` | boolean | `false` | Bell on idle |
 | `bell.on_error` | boolean | `true` | Bell on error or blocked |
 | `notifications.question_after_minutes` | integer | `10` | Minutes an agent's question waits before the TUI's one [notification](session-management.md#when-a-question-waits) for it; `0` turns it off |
-| `doorbell.claude` | boolean | `true` | [Doorbell and input-box check](#turn-the-doorbell-off-for-claude-code-or-codex) for Claude Code |
-| `doorbell.codex` | boolean | `true` | [Doorbell](#turn-the-doorbell-off-for-claude-code-or-codex) for Codex |
+| `doorbell.claude` | boolean | `true` | [Doorbell and input-box check](#turn-the-doorbell-off-for-claude-code-codex-or-antigravity) for Claude Code |
+| `doorbell.codex` | boolean | `true` | [Doorbell](#turn-the-doorbell-off-for-claude-code-codex-or-antigravity) for Codex |
+| `doorbell.antigravity` | boolean | `true` | [Doorbell](#turn-the-doorbell-off-for-claude-code-codex-or-antigravity) for Antigravity |
 
 The file is TOML, and you can edit it by hand:
 
@@ -121,6 +123,7 @@ on_error = true
 [doorbell]
 claude = true
 codex = true
+antigravity = true
 
 [notifications]
 question_after_minutes = 10
