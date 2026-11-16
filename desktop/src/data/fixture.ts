@@ -1308,6 +1308,24 @@ export function createFixtureSnapshot(state: FixtureState = "connected"): DeckSn
         ...crowdedAgent({ id: "1", displayName: "probe", role: "Antigravity", cli: "agy", status: "needs_input", cwd: "/workspace/demo-project", toolCount: 0, upForMinutes: 0, quietForMinutes: 0, tab: { kind: "dashboard" } }),
         model: "",
         statusReason: "Approve Bash: rm -f probe.txt",
+        pendingQuestion: {
+          id: "q-antigravity-permission",
+          kind: "permission",
+          channel: "keys",
+          questions: [{
+            prompt: "Approve Bash: rm -f probe.txt",
+            multiSelect: false,
+            options: [
+              { index: 1, label: "Yes, run command", role: "allow_once", answerable: true },
+              { index: 2, label: "Yes, and always allow in this conversation for commands that start with 'rm -f probe.txt'", role: "allow_always", answerable: true, scope: "this conversation" },
+              { index: 3, label: "Yes, and always allow for commands that start with 'rm -f probe.txt' (Persist to settings.json)", role: "allow_always", answerable: true, scope: "settings.json" },
+              { index: 4, label: "No, cancel", role: "deny", answerable: true },
+            ],
+          }],
+          tool: { name: "Bash", detail: "rm -f probe.txt" },
+          answerable: true,
+          raisedAtMs: Date.now(),
+        },
         // The same permission menu replayed by tests/fixtures/antigravity/agy.
         transcript: [
           "\u001b[2J\u001b[HApprove Bash: rm -f probe.txt",

@@ -52,6 +52,7 @@ fn seed_home_with_credentials(
         target.parent().unwrap(),
         std::fs::Permissions::from_mode(0o700),
     )?;
+    let mut settings = json!({"trustedWorkspaces":[fixture, fixture.canonicalize()?]});
     if std::fs::symlink_metadata(source).is_ok_and(|m| m.file_type().is_file() && m.len() > 0) {
         let bytes = std::fs::read(source)?;
         // Register before a copy or a diagnostic can expose a token value.
@@ -75,6 +76,8 @@ fn seed_home_with_credentials(
             std::io::ErrorKind::NotFound,
             "Antigravity token unavailable; sign in or set GEMINI_API_KEY",
         ));
+    } else {
+        settings["modelProvider"] = json!("gemini");
     }
     let cli = home.join(".gemini/antigravity-cli");
     std::fs::create_dir_all(cli.join("cache"))?;
@@ -82,10 +85,7 @@ fn seed_home_with_credentials(
         cli.join("cache/onboarding.json"),
         br#"{"onboardingComplete":true,"consumerOnboardingComplete":true}"#,
     )?;
-    std::fs::write(
-        cli.join("settings.json"),
-        json!({"trustedWorkspaces":[fixture, fixture.canonicalize()?]}).to_string(),
-    )?;
+    std::fs::write(cli.join("settings.json"), settings.to_string())?;
     Ok(())
 }
 
