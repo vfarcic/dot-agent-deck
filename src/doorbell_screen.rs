@@ -259,10 +259,10 @@ pub struct ScreenProfile {
     /// Whether a frame, read straight off the parser's screen, ties itself
     /// to the two widths of the current width's pair (the even width `2k`
     /// and `2k + 1`) without telling them apart. The evidence state counts
-    /// it, once the terminal has had both widths, only while nothing has
-    /// reached the parser's last column since the parser started
-    /// ([`crate::evidence_state`]): a frame that keeps out of that column
-    /// reads the same whichever of the two widths it was drawn for.
+    /// it, once the terminal has had both widths, only while the bytes since
+    /// the parser started read the same at both widths
+    /// ([`crate::evidence_state`]), so the screen is the agent's whichever of
+    /// the two it drew for.
     pub pair_witness: fn(&vt100::Screen) -> bool,
     /// The narrowest pane the measurements cover; a narrower one refuses.
     pub min_cols: u16,

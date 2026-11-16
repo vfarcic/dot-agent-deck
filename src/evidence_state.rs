@@ -30,19 +30,19 @@
 //! in the same place at the widths `2k` and `2k + 1`, so once the terminal
 //! has had both (a nudge's one-column shrink of an odd width is enough) the
 //! logo cannot say which of the two a frame was drawn for. It then counts as
-//! the profile's *pair witness*, and only while nothing has reached the
-//! parser's last column since the parser started: a frame drawn with
-//! absolute cursor moves, as Codex's are, that keeps out of that column
-//! lands every cell in the same place in a terminal of either width, with
-//! nothing wrapped and no cursor move clamped, so the screen the parser
-//! holds is the one the agent drew, whichever width it drew for. A frame
-//! drawn for `2k + 1` that writes in its column `2k - 1` or beyond, read at
-//! `2k`, reaches the parser's last column, as does a frame drawn for `2k`
-//! that runs past its own edge, read at `2k + 1`. Each byte is checked as it
-//! is parsed, and the first that reaches the last column ends the pair
-//! witness: a Pending state stays Pending, and a state Clean on the pair
-//! witness returns to Pending unless a width witness shows by then
-//! (`inbox/doorbell/044`).
+//! the profile's *pair witness*, and only while the bytes read the same at
+//! both widths: alongside the parser, a twin parser at the pair's other width
+//! reads every byte the parser reads from the same marker, and after each
+//! push the two screens are compared ([`readings_agree`]: every cell of the
+//! columns both widths have, the row wraps and the cursor, and nothing in the
+//! wider one's last column). While they agree, the screen the parser holds is
+//! the one the agent drew whichever of the two widths it drew for, since a
+//! terminal of either width would show it the same. The first push after
+//! which they differ ends the pair witness until the next layout edge: a
+//! Pending state stays Pending, and a state Clean on the pair witness
+//! returns to Pending unless a width witness shows by then
+//! (`inbox/doorbell/044`). Frames are read only between pushes, so readings
+//! that differ only inside a push are never read.
 //!
 //! Nothing turns Dirty into Clean because time passed. An agent that redraws
 //! nothing after an edge stays Dirty.
@@ -76,50 +76,31 @@ fn within_budget(rows: u16, cols: u16) -> bool {
     u32::from(rows.max(1)) * u32::from(cols.max(1)) <= EVIDENCE_CELLS_MAX
 }
 
-/// Feed `bytes` to `parser` up to `limit`, as [`crate::vt_work::MeteredParser::feed_byte`]
-/// does, and while `clear` is `Some(true)` check after each byte whether it
-/// reached the parser's last column ([`last_column_reached`]), turning it
-/// `Some(false)` if so. The index of the first byte refused, if one was.
-fn feed_watched<'a>(
-    parser: &mut crate::vt_work::MeteredParser,
-    bytes: impl IntoIterator<Item = &'a u8>,
-    limit: u64,
-    clear: &mut Option<bool>,
-) -> Option<usize> {
-    bytes.into_iter().position(|&b| {
-        if !parser.feed_byte(b, limit) {
-            return true;
-        }
-        if *clear == Some(true) && last_column_reached(parser.screen()) {
-            *clear = Some(false);
-        }
-        false
+/// Whether two parsers that read the same bytes at the two widths of a pair
+/// (`2k` and `2k + 1`) hold the same screen: the same cell (character,
+/// attributes, wide halves) in every column both widths have, the same row
+/// wraps, the same cursor position, and nothing in the wider one's last
+/// column, which the narrower one does not have.
+fn readings_agree(a: &vt100::Screen, b: &vt100::Screen) -> bool {
+    let (rows, a_cols) = crate::vt_grid::size(a);
+    let (b_rows, b_cols) = crate::vt_grid::size(b);
+    if rows != b_rows || a.cursor_position() != b.cursor_position() {
+        return false;
+    }
+    let shared = a_cols.min(b_cols);
+    let (wide, wide_cols) = if a_cols > b_cols {
+        (a, a_cols)
+    } else {
+        (b, b_cols)
+    };
+    (0..rows).all(|r| {
+        a.row_wrapped(r) == b.row_wrapped(r)
+            && (0..shared).all(|c| a.cell(r, c) == b.cell(r, c))
+            && (wide_cols == shared
+                || wide
+                    .cell(r, wide_cols - 1)
+                    .is_none_or(|c| !c.has_contents() && !c.is_wide_continuation()))
     })
-}
-
-/// Whether the byte just parsed may have put something in the parser's last
-/// column: that cell on the cursor's row holds something (a character, a
-/// written blank or the second half of a wide one), or the cursor's row or
-/// the row above it ran on to the next row, which only printing past the
-/// last column does. Writing a cell leaves the cursor on its row, so checked
-/// after every byte this sees each write that lands in the last column, a
-/// write past the edge included, since the parser clamps a cursor move
-/// there and wraps a run of text there.
-///
-/// It does not see a wide character printed with the cursor already in the
-/// empty last column: the parser moves it to the next row without marking a
-/// wrap. Only a drawing that writes in that column does that, and Codex's
-/// frames keep out of their own last column (its composer wraps at
-/// `cols - 2`, measured on 0.169.0 at 90 columns, and its logo is centred).
-fn last_column_reached(screen: &vt100::Screen) -> bool {
-    let (_, cols) = crate::vt_grid::size(screen);
-    let (row, _) = screen.cursor_position();
-    let last = cols.saturating_sub(1);
-    screen
-        .cell(row, last)
-        .is_some_and(|c| c.has_contents() || c.is_wide_continuation())
-        || screen.row_wrapped(row)
-        || (row > 0 && screen.row_wrapped(row - 1))
 }
 
 /// What moved the layout.
@@ -224,15 +205,18 @@ pub struct EvidenceState {
     /// Every width the terminal has had, for the witness.
     widths: WidthsSeen,
     /// While the parser runs at a width whose pair partner the terminal has
-    /// also had (`2k` and `2k + 1`): whether nothing has reached the
-    /// parser's last column since it started ([`last_column_reached`]), the
-    /// condition under which the profile's pair witness counts. `None` when
-    /// the pair is not in question, or once the state is Clean on a width
-    /// witness.
-    edge_clear: Option<bool>,
+    /// also had (`2k` and `2k + 1`): whether the twin, reading the same bytes
+    /// at the partner width, has held the same screen as the parser after
+    /// every push since both started ([`readings_agree`]), the condition
+    /// under which the profile's pair witness counts. `None` when the pair is
+    /// not in question, or once the state is Clean on a width witness.
+    pair_agree: Option<bool>,
+    /// The twin parser at the pair partner's width, while `pair_agree` is
+    /// `Some(true)`.
+    twin: Option<crate::vt_work::MeteredParser>,
     /// The Pending status a Clean resting on the pair witness came from:
-    /// the state returns to it if the parser's last column is reached and
-    /// no width witness shows. `None` when Clean rests on a width witness.
+    /// the state returns to it once the twin's reading differs and no width
+    /// witness shows. `None` when Clean rests on a width witness.
     pair_held: Option<EvidenceStatus>,
     /// While Dirty: the last bytes pushed, one fewer than the marker, so a
     /// marker split across two pushes is still found.
@@ -276,7 +260,8 @@ impl EvidenceState {
             status,
             parser,
             widths: WidthsSeen::of([cols]),
-            edge_clear: None,
+            pair_agree: None,
+            twin: None,
             pair_held: None,
             tail: Vec::new(),
         }
@@ -301,7 +286,7 @@ impl EvidenceState {
     }
 
     /// Whether the state is Clean on the profile's pair witness, which
-    /// holds only while the parser's last column stays clear.
+    /// holds only while the twin reads the same screen.
     pub fn pair_held(&self) -> bool {
         self.pair_held.is_some()
     }
@@ -417,14 +402,10 @@ impl EvidenceState {
                 let marker_seq = base - carried as u64 + at as u64;
                 let mut parser = crate::vt_work::MeteredParser::new(self.rows, self.cols, 0);
                 let modes = modes_at(at.saturating_sub(carried));
-                self.edge_clear = self.widths.had(self.cols ^ 1).then_some(true);
-                self.pair_held = None;
-                let fed = feed_watched(
-                    &mut parser,
-                    modes.iter().chain(&window[at..]),
-                    EVIDENCE_WORK_PER_PUSH,
-                    &mut self.edge_clear,
-                );
+                let fed = modes
+                    .iter()
+                    .chain(&window[at..])
+                    .position(|&b| !parser.feed_byte(b, EVIDENCE_WORK_PER_PUSH));
                 if let Some(refused) = fed {
                     // The refused byte's place in the stream: the preamble
                     // is the deck's own and has none, so it is charged to
@@ -439,6 +420,7 @@ impl EvidenceState {
                     );
                 }
                 self.parser = Some(parser);
+                self.start_twin(modes.iter().chain(&window[at..]));
                 self.out_seq = base + bytes.len() as u64;
                 let edge_seq = match self.status {
                     EvidenceStatus::Dirty { edge_seq, .. } => edge_seq,
@@ -466,8 +448,13 @@ impl EvidenceState {
         self.out_seq += bytes.len() as u64;
         let parser = self.parser.as_mut()?;
         let limit = parser.spent().saturating_add(EVIDENCE_WORK_PER_PUSH);
-        let refused = feed_watched(parser, bytes, limit, &mut self.edge_clear)?;
+        let Some(refused) = bytes.iter().position(|&b| !parser.feed_byte(b, limit)) else {
+            self.feed_twin(bytes);
+            return None;
+        };
         self.parser = None;
+        self.twin = None;
+        self.pair_agree = None;
         self.pair_held = None;
         Some(self.transition(
             EvidenceStatus::WorkOverBudget {
@@ -475,6 +462,47 @@ impl EvidenceState {
             },
             None,
         ))
+    }
+
+    /// Start the twin at the pair partner's width, when the terminal has had
+    /// both widths of the current one's pair, and feed it what the parser
+    /// was just started on.
+    fn start_twin<'a>(&mut self, bytes: impl IntoIterator<Item = &'a u8>) {
+        self.twin = None;
+        self.pair_held = None;
+        let partner = self.cols ^ 1;
+        self.pair_agree = self.widths.had(partner).then_some(true);
+        if self.pair_agree.is_none() {
+            return;
+        }
+        if partner == 0 || !within_budget(self.rows, partner) {
+            self.pair_agree = Some(false);
+            return;
+        }
+        self.twin = Some(crate::vt_work::MeteredParser::new(self.rows, partner, 0));
+        self.feed_twin(bytes);
+    }
+
+    /// Feed the twin the bytes the parser just took, then compare the two
+    /// readings: the first push after which they differ, or the twin's work
+    /// bound refuses a byte, drops the twin and spends the pair witness until
+    /// the next edge. Frames are read between pushes, so a reading that
+    /// differs only inside a push is never read.
+    fn feed_twin<'a>(&mut self, bytes: impl IntoIterator<Item = &'a u8>) {
+        let Some(twin) = self.twin.as_mut() else {
+            return;
+        };
+        let limit = twin.spent().saturating_add(EVIDENCE_WORK_PER_PUSH);
+        let refused = bytes.into_iter().any(|&b| !twin.feed_byte(b, limit));
+        let agree = !refused
+            && self
+                .parser
+                .as_ref()
+                .is_some_and(|parser| readings_agree(parser.screen(), twin.screen()));
+        if !agree {
+            self.twin = None;
+            self.pair_agree = Some(false);
+        }
     }
 
     fn check_witness(
@@ -485,32 +513,36 @@ impl EvidenceState {
     ) -> Option<Transition> {
         let parser = self.parser.as_ref()?;
         if (profile.width_witness)(parser.screen(), &self.widths) {
-            self.edge_clear = None;
+            self.pair_agree = None;
+            self.twin = None;
             self.pair_held = None;
             return self.transition(EvidenceStatus::Clean { since_seq }, marker_seq);
         }
-        if self.edge_clear == Some(true) && (profile.pair_witness)(parser.screen()) {
+        if self.pair_agree == Some(true) && (profile.pair_witness)(parser.screen()) {
             self.pair_held = Some(self.status);
             return self.transition(EvidenceStatus::Clean { since_seq }, marker_seq);
         }
         None
     }
 
-    /// After a push to a state Clean on the pair witness: once the parser's
-    /// last column has been reached, the frame no longer reads the same for
-    /// both widths of the pair, so the state stays Clean only on a width
-    /// witness and otherwise returns to the Pending it came from.
+    /// After a push to a state Clean on the pair witness: a width witness
+    /// now makes it Clean on that witness, dropping the twin; otherwise it
+    /// stays Clean while the two readings agree, and once they have differed
+    /// the frame no longer reads the same for both widths of the pair, so it
+    /// returns to the Pending it came from.
     fn recheck_pair(&mut self, profile: &ScreenProfile) -> Option<Transition> {
         let pending = self.pair_held?;
-        if self.edge_clear == Some(true) {
+        let parser = self.parser.as_ref()?;
+        if (profile.width_witness)(parser.screen(), &self.widths) {
+            self.pair_held = None;
+            self.pair_agree = None;
+            self.twin = None;
+            return None;
+        }
+        if self.pair_agree == Some(true) {
             return None;
         }
         self.pair_held = None;
-        let parser = self.parser.as_ref()?;
-        if (profile.width_witness)(parser.screen(), &self.widths) {
-            self.edge_clear = None;
-            return None;
-        }
         self.transition(pending, None)
     }
 
@@ -523,7 +555,8 @@ impl EvidenceState {
         self.widths.record(cols);
         self.profile?;
         self.parser = None;
-        self.edge_clear = None;
+        self.pair_agree = None;
+        self.twin = None;
         self.pair_held = None;
         self.tail.clear();
         let to = if within_budget(rows, cols) {
@@ -550,7 +583,8 @@ impl EvidenceState {
         self.profile = Some(profile);
         self.layout_epoch += 1;
         self.parser = None;
-        self.edge_clear = None;
+        self.pair_agree = None;
+        self.twin = None;
         self.pair_held = None;
         self.tail.clear();
         let to = if within_budget(self.rows, self.cols) {
@@ -577,7 +611,8 @@ impl EvidenceState {
         self.layout_epoch += 1;
         self.profile?;
         self.parser = None;
-        self.edge_clear = None;
+        self.pair_agree = None;
+        self.twin = None;
         self.pair_held = None;
         self.tail.clear();
         self.transition(

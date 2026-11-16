@@ -290,7 +290,7 @@ fn doorbell_044_a_redraw_for_a_wider_terminal_stays_pending() {
     assert!(clean(&state));
 }
 
-/// Scenario: Codex's start-up logo sits at the same column for the two widths 2k and 2k + 1. Move a terminal from 201 to 200 columns (the even width), and another from 200 to 201 (the odd width), and push a logo drawn for each width that writes nothing in the terminal's last column: every one turns the state Clean on the pair witness (issue #2124), since a frame that keeps out of that column reads the same at either width. A terminal that has only ever been 200 or only ever 201 columns wide is Clean on its own logo as a width witness, and one moved from 200 to 198, a width that does not share the logo's column, refuses the 200-column logo and takes its own.
+/// Scenario: Codex's start-up logo sits at the same column for the two widths 2k and 2k + 1. Move a terminal from 201 to 200 columns (the even width), and another from 200 to 201 (the odd width), and push a logo drawn for each width: every one turns the state Clean on the pair witness (issue #2124), since it reads the same at either width. A terminal that has only ever been 200 or only ever 201 columns wide is Clean on its own logo as a width witness, and one moved from 200 to 198, a width that does not share the logo's column, refuses the 200-column logo and takes its own.
 #[spec("inbox/doorbell/044")]
 #[test]
 fn doorbell_044_a_logo_two_adjacent_widths_share_is_clean_on_the_pair_witness() {
@@ -340,40 +340,42 @@ fn doorbell_044_a_fresh_codex_at_117_columns_after_116_is_clean_on_its_logo() {
     }
 }
 
-/// Scenario: With the terminal having had both 200 and 201 columns, push Codex's logo together with a write that reaches the terminal's last column, which a frame for the other width of the pair would put somewhere else: at 200 columns, a frame drawn for 201 with text up to its column 199, a character at its column 200 that the parser clamps into column 199, and a wide character ending in column 199; at 201 columns, a frame drawn for 200 with a row running past its own edge. Each stays pending, and so does a later logo that keeps out of the column: the pair witness is spent until the next layout edge. A width witness, Codex's padded turn row drawn for the width in force, still turns it Clean.
+/// Scenario: With the terminal having had both 200 and 201 columns, push Codex's logo together with writes that a terminal 200 wide and one 201 wide would show differently: a character at column 200 (clamped into column 199 at 200 wide), a wide character from column 199 (which only the wider terminal fits there), a move past the edge followed by a move back, an erase to the end of the row and a character (Qodo's review of the first version, which only watched the last column), and text across 201 columns. Each stays pending, at 200 and at 201 columns, and so does a later logo that reads the same at both: the pair witness is spent until the next layout edge. A width witness, Codex's padded turn row drawn for the width in force, still turns it Clean.
 #[spec("inbox/doorbell/044")]
 #[test]
-fn doorbell_044_a_logo_with_the_last_column_reached_stays_pending() {
-    let wide = |cols: usize| format!("\x1b[30;1H{}", "x".repeat(cols));
-    let cases: [(u16, u16, String); 4] = [
-        (201, 200, wide(200)),
-        (201, 200, "\x1b[30;201Hx".to_string()),
-        (201, 200, "\x1b[30;199H\u{4e2d}".to_string()),
-        (200, 201, wide(201)),
+fn doorbell_044_a_logo_that_reads_differently_at_the_two_widths_stays_pending() {
+    let across = |cols: usize| format!("\x1b[30;1H{}", "x".repeat(cols));
+    let writes = [
+        "\x1b[30;201Hx".to_string(),
+        "\x1b[30;200H\u{4e2d}".to_string(),
+        "\x1b[30;201H\x1b[D\x1b[KX".to_string(),
+        across(201),
     ];
-    for (spawned, now, reach) in cases {
-        let mut state = EvidenceState::new(Some(&CODEX_PROFILE), 50, spawned);
-        state.edge(EdgeReason::Resize, 50, now);
-        let mut frame = codex_logo(now);
-        frame.extend_from_slice(reach.as_bytes());
-        frame.extend_from_slice(b"\x1b[47;3H");
-        state.push(&frame, |_| Vec::new());
-        assert!(
-            pending_after_edge(&state),
-            "{spawned} → {now}, {reach:?}: {:?}",
-            state.status()
-        );
-        state.push(&codex_logo(now), |_| Vec::new());
-        assert!(pending_after_edge(&state), "{spawned} → {now}, {reach:?}");
-        state.push(&codex_turn(now), |_| Vec::new());
-        assert!(clean(&state) && !state.pair_held(), "{spawned} → {now}");
+    for (spawned, now) in [(201, 200), (200, 201)] {
+        for write in &writes {
+            let mut state = EvidenceState::new(Some(&CODEX_PROFILE), 50, spawned);
+            state.edge(EdgeReason::Resize, 50, now);
+            let mut frame = codex_logo(now);
+            frame.extend_from_slice(write.as_bytes());
+            frame.extend_from_slice(b"\x1b[47;3H");
+            state.push(&frame, |_| Vec::new());
+            assert!(
+                pending_after_edge(&state),
+                "{spawned} → {now}, {write:?}: {:?}",
+                state.status()
+            );
+            state.push(&codex_logo(now), |_| Vec::new());
+            assert!(pending_after_edge(&state), "{spawned} → {now}, {write:?}");
+            state.push(&codex_turn(now), |_| Vec::new());
+            assert!(clean(&state) && !state.pair_held(), "{spawned} → {now}");
+        }
     }
 }
 
-/// Scenario: Turn a 201-to-200-column Codex state Clean on its logo (the pair witness), then push a write that reaches the last column: the state returns to pending, so a frame read there no longer stands. A second state, Clean on the logo the same way, gets Codex's padded turn row drawn for 200 columns, which also reaches the last column but is a width witness: it stays Clean, now on the width witness.
+/// Scenario: Turn a 201-to-200-column Codex state Clean on its logo (the pair witness), push a write both widths show alike and see it stay Clean, then push a move past the edge, a move back, an erase to the end of the row and a character, which the two widths place in different columns: the state returns to pending, so a frame read there no longer stands. A second state, Clean on the logo the same way, gets Codex's padded turn row drawn for 200 columns, a width witness: it stays Clean, now on the width witness.
 #[spec("inbox/doorbell/044")]
 #[test]
-fn doorbell_044_clean_on_the_pair_witness_ends_when_the_last_column_is_reached() {
+fn doorbell_044_clean_on_the_pair_witness_ends_when_the_readings_differ() {
     let mut state = EvidenceState::new(Some(&CODEX_PROFILE), 50, 201);
     state.edge(EdgeReason::Resize, 50, 200);
     state.push(&codex_logo(200), |_| Vec::new());
@@ -381,9 +383,9 @@ fn doorbell_044_clean_on_the_pair_witness_ends_when_the_last_column_is_reached()
     state.push(b"\x1b[47;3Hhello", |_| Vec::new());
     assert!(
         clean(&state) && state.pair_held(),
-        "a write left of the column"
+        "a write both widths show alike"
     );
-    state.push(b"\x1b[30;201Hx\x1b[47;3H", |_| Vec::new());
+    state.push(b"\x1b[30;201H\x1b[D\x1b[KX\x1b[47;8H", |_| Vec::new());
     assert!(pending_after_edge(&state), "{:?}", state.status());
     assert!(!state.pair_held());
     assert!(state.clean_frame().is_none());
