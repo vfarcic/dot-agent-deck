@@ -91,6 +91,10 @@ pub enum StatusUpdate {
     Error(Option<String>),
     /// Needs Input, with what the agent is waiting on when it said.
     NeedsInput(Option<String>),
+    /// Needs Input on a permission prompt (`blocked:kind=permission`), with
+    /// the agent's question when it gave one: the daemon may offer that
+    /// question's menu to be answered ([`crate::question::antigravity_permission`]).
+    Permission(Option<String>),
 }
 
 impl OscSignal {
@@ -105,6 +109,9 @@ impl OscSignal {
             OscState::Working => StatusUpdate::Working,
             OscState::Idle | OscState::Done => StatusUpdate::Idle,
             OscState::Error => StatusUpdate::Error(self.msg.clone()),
+            OscState::Blocked if self.kind.as_deref() == Some("permission") => {
+                StatusUpdate::Permission(self.msg.clone())
+            }
             OscState::Blocked => StatusUpdate::NeedsInput(self.msg.clone()),
         }
     }
@@ -418,7 +425,7 @@ mod tests {
         );
         assert_eq!(
             signals[0].update(),
-            StatusUpdate::NeedsInput(Some("Approve Bash: rm -f probe.txt".into()))
+            StatusUpdate::Permission(Some("Approve Bash: rm -f probe.txt".into()))
         );
         assert_eq!(signals[1].update(), StatusUpdate::Idle);
     }
@@ -585,7 +592,7 @@ mod tests {
                 &signal(OscState::Blocked, Some("permission")),
                 Instant::now()
             ),
-            Some(StatusUpdate::NeedsInput(Some("Sign in required".into())))
+            Some(StatusUpdate::Permission(Some("Sign in required".into())))
         );
     }
 }

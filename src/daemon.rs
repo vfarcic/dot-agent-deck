@@ -3615,8 +3615,11 @@ async fn run_status_osc_monitor(
 /// Every update is marked [`crate::event::STATUS_SIGNAL_METADATA_KEY`]: `working`
 /// is a `Thinking` that [`crate::state::AppState::apply_event`] applies only to
 /// a card that is not already busy, keeping its active tool. A Needs
-/// Input is a `PermissionRequest` with no question: the agent's message rides
-/// as [`crate::event::STATUS_REASON_METADATA_KEY`], which the card shows.
+/// Input is a `PermissionRequest`: the agent's message rides as
+/// [`crate::event::STATUS_REASON_METADATA_KEY`], which the card shows, and a
+/// permission prompt whose menu the agent's tables know also carries that
+/// menu as the pending question ([`crate::question::antigravity_permission`]).
+/// A repeat of the prompt already pending keeps its question id.
 async fn report_status_update(
     state: &SharedState,
     event_tx: &broadcast::Sender<BroadcastMsg>,
@@ -3627,18 +3630,52 @@ async fn report_status_update(
 ) {
     use crate::event::EventType;
     use crate::status_osc::StatusUpdate;
-    let (event_type, reason) = match update {
-        StatusUpdate::Working => (EventType::Thinking, None),
-        StatusUpdate::Idle => (EventType::Idle, None),
-        StatusUpdate::Error(message) => (EventType::Error, message),
-        StatusUpdate::NeedsInput(message) => (EventType::PermissionRequest, message),
+    let (event_type, reason, permission) = match update {
+        StatusUpdate::Working => (EventType::Thinking, None, false),
+        StatusUpdate::Idle => (EventType::Idle, None, false),
+        StatusUpdate::Error(message) => (EventType::Error, message, false),
+        StatusUpdate::NeedsInput(message) => (EventType::PermissionRequest, message, false),
+        StatusUpdate::Permission(message) => (EventType::PermissionRequest, message, true),
     };
-    let session_id = {
+    let (session_id, pending_id) = {
         let state = state.read().await;
-        state
+        let session_id = state
             .pane_hook_session_id(pane_id)
             .or_else(|| state.pane_session_id(pane_id))
-            .unwrap_or_else(|| pane_id.clone())
+            .unwrap_or_else(|| pane_id.clone());
+        let pending_id = reason.as_deref().and_then(|prompt| {
+            state
+                .pending_question_for(agent_id, Some(pane_id))
+                .map(|(_, question)| question)
+                .filter(|question| {
+                    question
+                        .questions
+                        .first()
+                        .is_some_and(|q| q.prompt == prompt)
+                })
+                .map(|question| question.id)
+        });
+        (session_id, pending_id)
+    };
+    let question = match (permission, agent_type, reason.as_deref()) {
+        (true, crate::event::AgentType::Antigravity, Some(prompt)) => {
+            // The version of the `agy` on the daemon's PATH, cached across
+            // prompts like the hook's probe for Codex and Devin: a version
+            // the tables do not cover lists the menu keyboard-only.
+            let version = tokio::task::spawn_blocking(|| {
+                crate::hook::question_agent_version(&crate::event::AgentType::Antigravity)
+            })
+            .await
+            .ok()
+            .flatten();
+            crate::question::antigravity_permission(
+                pending_id.unwrap_or_else(crate::question::mint_question_id),
+                prompt,
+                chrono::Utc::now().timestamp_millis(),
+                version,
+            )
+        }
+        _ => None,
     };
     let mut metadata = std::collections::HashMap::from([(
         crate::event::STATUS_SIGNAL_METADATA_KEY.to_string(),
@@ -3647,7 +3684,7 @@ async fn report_status_update(
     if let Some(reason) = reason {
         metadata.insert(crate::event::STATUS_REASON_METADATA_KEY.to_string(), reason);
     }
-    let event = AgentEvent {
+    let mut event = AgentEvent {
         session_id,
         agent_type: agent_type.clone(),
         event_type,
@@ -3665,6 +3702,9 @@ async fn report_status_update(
         background: None,
         background_revision: None,
     };
+    if let Some(question) = &question {
+        event.set_question(question);
+    }
     let ingested = ingest_event_unless(state, event_tx, registry, event, false, None, |_| {
         registry.pane_current_agent_id(pane_id).as_deref() != Some(agent_id.as_str())
     })

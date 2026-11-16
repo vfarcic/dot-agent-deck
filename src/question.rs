@@ -1581,6 +1581,112 @@ pub fn devin_permission_request(
 }
 
 // ---------------------------------------------------------------------------
+// Producers: Antigravity (its OSC 7501 permission signal)
+// ---------------------------------------------------------------------------
+
+/// The OSC message prefix of an Antigravity command approval, before the
+/// command [measured on `agy` 1.5.9].
+const ANTIGRAVITY_COMMAND_PROMPT: &str = "Approve Bash: ";
+/// The OSC message prefix of an Antigravity file-write approval, before the
+/// path [measured on `agy` 1.5.9]. A write that overwrites an existing file
+/// draws the same creation menu [observed].
+const ANTIGRAVITY_WRITE_PROMPT: &str = "Approve Edit: Write: ";
+
+/// PRD #211: an Antigravity `blocked:kind=permission` signal's message → a
+/// [`QuestionKind::Permission`] answered by keys from
+/// [`crate::agent_registry::ANTIGRAVITY_QUESTIONS`]. `None` for any other
+/// prompt — its folder-trust dialog, or a tool whose menu was not measured —
+/// which then stays a Needs Input card with its message and no answers.
+///
+/// The signal carries the question only; the options come from the measured
+/// table. `Approve Bash: <command>` gets the command menu, whose "always"
+/// options name the command as the prefix `agy` draws for it; those two are
+/// answerable only when the command is one the deck can be sure `agy` shows
+/// whole ([`antigravity_prefix`]), and keyboard-only otherwise.
+/// `Approve Edit: Write: <path>` gets the two-option file-creation menu.
+pub fn antigravity_permission(
+    id: String,
+    prompt: &str,
+    raised_at_ms: i64,
+    version: Option<(u64, u64, u64)>,
+) -> Option<PendingQuestion> {
+    let tables = agent_tables(&AgentType::Antigravity);
+    let (menu, tool, detail) = match prompt.strip_prefix(ANTIGRAVITY_COMMAND_PROMPT) {
+        Some(command) => (MenuKind::Permission, "Bash", command),
+        None => (
+            MenuKind::FileCreation,
+            "Write",
+            prompt.strip_prefix(ANTIGRAVITY_WRITE_PROMPT)?,
+        ),
+    };
+    if detail.is_empty() {
+        return None;
+    }
+    let mut options = table_options(
+        tables,
+        menu,
+        version,
+        AnswerChannel::Keys,
+        1,
+        &|_| true,
+        &|s: &str| s.replace("{detail}", detail),
+    );
+    // Two "always" options with two scopes: each keeps its own filled
+    // template, and both go keyboard-only together when the prefix cannot be
+    // trusted or either confirmation cannot be shown whole.
+    let always_confirmable = antigravity_prefix(detail).is_some()
+        && options
+            .iter()
+            .filter(|o| o.role == OptionRole::AllowAlways)
+            .all(|o| o.scope.as_deref().is_some_and(scope_shown_whole));
+    if !always_confirmable {
+        settle_always_scope(&mut options, None);
+    }
+    Some(PendingQuestion {
+        id,
+        kind: QuestionKind::Permission,
+        questions: vec![Question {
+            prompt: prompt.to_string(),
+            header: None,
+            options,
+            multi_select: false,
+        }],
+        raised_at_ms,
+        tool: Some(QuestionTool {
+            name: tool.to_string(),
+            detail: Some(detail.to_string()),
+            use_id: None,
+        }),
+        channel: channel_for(tables, version, AnswerChannel::Keys),
+        subagent_id: None,
+        revision: None,
+        answer_queued: false,
+    })
+}
+
+/// PRD #211 (audit A2, Antigravity): the prefix `agy`'s "always allow"
+/// options grant, when the deck can be sure of it — `command` itself.
+///
+/// Measured on 1.5.9, every one-command line drew the whole command as the
+/// prefix (`rm -f probe.txt` → `commands that start with 'rm -f probe.txt'`).
+/// What `agy` draws for a pipeline, a chain, a quoted argument or a
+/// substitution was not measured, and the deck sees only the signal's
+/// message — whitespace collapsed and cut at
+/// [`crate::status_osc::MAX_MESSAGE_CHARS`] — so anything but a plain
+/// command of words is `None`, and the "always" options are keyboard-only.
+pub fn antigravity_prefix(command: &str) -> Option<&str> {
+    let plain = !command.is_empty()
+        && command.trim() == command
+        && command.chars().count()
+            < crate::status_osc::MAX_MESSAGE_CHARS - ANTIGRAVITY_COMMAND_PROMPT.len()
+        && command
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || " -_./=:@%+~".contains(c))
+        && !command.contains("  ");
+    plain.then_some(command)
+}
+
+// ---------------------------------------------------------------------------
 // Producers: OpenCode (the plugin's `await-answer` child)
 // ---------------------------------------------------------------------------
 
@@ -2163,6 +2269,15 @@ pub fn answer_keys(
         QuestionKind::Permission | QuestionKind::Plan => {
             let menu = if question.kind == QuestionKind::Plan {
                 MenuKind::Plan
+            } else if *agent == AgentType::Antigravity
+                && question
+                    .tool
+                    .as_ref()
+                    .is_some_and(|tool| tool.name == "Write")
+            {
+                // PRD #211: the file-write approval's own menu
+                // ([`antigravity_permission`]).
+                MenuKind::FileCreation
             } else {
                 MenuKind::Permission
             };
@@ -2179,14 +2294,21 @@ pub fn answer_keys(
             if !option.answerable() {
                 return Err(AnswerRefusal::KeyboardOnly);
             }
-            // Each answerable role appears once in a keyed menu (the table
-            // tests pin it), so the chosen option's role names its entry.
-            let keys = tables
-                .menu(menu)
-                .iter()
-                .find(|entry| entry.role == option.role && entry.keys.is_some())
-                .and_then(|entry| entry.keys)
-                .ok_or(AnswerRefusal::Unsupported)?;
+            // A keyed role that appears once in its menu names its entry. One
+            // that appears more than once (Antigravity's two "always"
+            // options) is told apart by place: those menus filter nothing
+            // out, so the option's index is its entry's place from 1.
+            let entries = tables.menu(menu);
+            let keyed = |entry: &&TableOption| entry.role == option.role && entry.keys.is_some();
+            let keys = match entries.iter().filter(keyed).count() {
+                1 => entries.iter().find(keyed),
+                _ => (option.index as usize)
+                    .checked_sub(1)
+                    .and_then(|place| entries.get(place))
+                    .filter(keyed),
+            }
+            .and_then(|entry| entry.keys)
+            .ok_or(AnswerRefusal::Unsupported)?;
             Ok(vec![keys.to_string()])
         }
         QuestionKind::Choice => {
@@ -3507,5 +3629,97 @@ mod tests {
             serde_json::from_value(serde_json::json!({"ok": false, "error": "malformed request"}))
                 .unwrap();
         assert_eq!(older.answer_refusal, None);
+    }
+
+    /// PRD #211: an Antigravity command approval's message gets the measured
+    /// four-option menu, with the command filled into both "always" labels
+    /// and their confirmations, and each answer types its own digit.
+    #[test]
+    fn antigravity_command_approval_offers_its_measured_menu_and_digits() {
+        let q = antigravity_permission(
+            "q-agy".into(),
+            "Approve Bash: rm -f probe.txt",
+            1,
+            Some((1, 5, 9)),
+        )
+        .expect("a command approval");
+        assert_eq!(q.kind, QuestionKind::Permission);
+        assert_eq!(q.channel, AnswerChannel::Keys);
+        assert_eq!(q.tool.as_ref().unwrap().name, "Bash");
+        let options = &q.questions[0].options;
+        let labels: Vec<&str> = options.iter().map(|o| o.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "Yes, run command",
+                "Yes, and always allow in this conversation for commands that start with 'rm -f probe.txt'",
+                "Yes, and always allow for commands that start with 'rm -f probe.txt' (Persist to settings.json)",
+                "No, cancel",
+            ]
+        );
+        assert!(options.iter().all(QuestionOption::answerable));
+        for (index, digit) in [(1, "1"), (2, "2"), (3, "3"), (4, "4")] {
+            let resolved = q
+                .validate(&[answer(0, &[index], None)], true)
+                .expect("answerable");
+            assert_eq!(
+                answer_keys(&AgentType::Antigravity, &q, &resolved),
+                Ok(vec![digit.to_string()]),
+                "option {index}"
+            );
+        }
+        assert_eq!(
+            q.validate(&[answer(0, &[3], None)], false),
+            Err(AnswerRefusal::AlwaysNotConfirmed)
+        );
+    }
+
+    /// PRD #211: a file write gets the two-option creation menu, whose deny
+    /// is `2`, not the command menu's `4`.
+    #[test]
+    fn antigravity_file_write_offers_the_creation_menu() {
+        let q = antigravity_permission("q-w".into(), "Approve Edit: Write: /work/a.txt", 1, None)
+            .expect("a write approval");
+        let options = &q.questions[0].options;
+        assert_eq!(options.len(), 2);
+        assert_eq!(options[1].label, "No, deny creation");
+        let deny = q.validate(&[answer(0, &[2], None)], false).unwrap();
+        assert_eq!(
+            answer_keys(&AgentType::Antigravity, &q, &deny),
+            Ok(vec!["2".to_string()])
+        );
+    }
+
+    /// PRD #211: what was not measured is not offered — the folder-trust
+    /// dialog and other tools raise no question, a command whose prefix the
+    /// deck cannot be sure of keeps its "always" options keyboard-only, and
+    /// a newer `agy` than the tables cover is answered at the keyboard.
+    #[test]
+    fn antigravity_unmeasured_prompts_are_not_answered() {
+        for prompt in [
+            "Trust this folder?",
+            "Approve WebFetch: https://x",
+            "Approve Bash: ",
+        ] {
+            assert!(
+                antigravity_permission("q".into(), prompt, 1, None).is_none(),
+                "{prompt}"
+            );
+        }
+        let chained = antigravity_permission(
+            "q".into(),
+            "Approve Bash: rm -f a.txt && rm -f b.txt",
+            1,
+            None,
+        )
+        .unwrap();
+        let options = &chained.questions[0].options;
+        assert!(options[0].answerable() && options[3].answerable());
+        assert!(options[1].keyboard_only && options[2].keyboard_only);
+        assert!(options[1].scope.is_none());
+        let newer =
+            antigravity_permission("q".into(), "Approve Bash: ls", 1, Some((1, 6, 0))).unwrap();
+        assert_eq!(newer.channel, AnswerChannel::Unsupported);
+        assert!(!newer.has_answerable_option());
     }
 }

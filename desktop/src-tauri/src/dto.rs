@@ -1088,6 +1088,15 @@ pub struct DesktopDeleteCharKey {
     pub bytes: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_literal_write_chars: Option<u32>,
+    /// PRD #211: the most deletes in one write, when the agent drops some
+    /// from a larger burst (Antigravity: one); absent where a whole burst is
+    /// exact.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_presses_per_write: Option<u32>,
+    /// PRD #211: how long to wait between two writes of one deletion; absent
+    /// where no pause is needed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pause_between_writes_ms: Option<u32>,
 }
 
 /// PRD #1631: the webview's view of the daemon's
@@ -2296,6 +2305,10 @@ const PROMPT_KEY_DELETE_CHAR: [&str; 2] = ["\x7f", "\x08"];
 const PROMPT_KEY_INTERRUPT_BUDGET_MS: u64 = 2_000;
 /// PRD #1541: the most a clear may pause in total between its writes.
 const PROMPT_KEY_CLEAR_BUDGET_MS: u64 = 3_000;
+/// PRD #211: the longest pause a deletion may take between two of its writes.
+/// Antigravity's measured 20 ms, with room for a slower agent; past this a
+/// "scratch that" of a long dictation would take minutes.
+const PROMPT_KEY_DELETE_PAUSE_MAX_MS: u32 = 100;
 /// PRD #1541: how many times the panel presses the clear key, by rule — a
 /// mirror of `VOICE_CLEAR_PRESSES` in `desktop/src/components/VoiceControlPanel.tsx`,
 /// which a clear's pause budget is computed against; the two must move
@@ -2365,6 +2378,14 @@ pub(crate) fn map_prompt_keys(
     if clear_pause > PROMPT_KEY_CLEAR_BUDGET_MS {
         return None;
     }
+    if keys.delete_char.max_presses_per_write == Some(0)
+        || keys
+            .delete_char
+            .pause_between_writes_ms
+            .is_some_and(|pause| pause > PROMPT_KEY_DELETE_PAUSE_MAX_MS)
+    {
+        return None;
+    }
     Some(DesktopPromptKeys {
         interrupt: keys
             .interrupt
@@ -2383,6 +2404,8 @@ pub(crate) fn map_prompt_keys(
         delete_char: DesktopDeleteCharKey {
             bytes: keys.delete_char.bytes.to_string(),
             max_literal_write_chars: keys.delete_char.max_literal_write_chars,
+            max_presses_per_write: keys.delete_char.max_presses_per_write,
+            pause_between_writes_ms: keys.delete_char.pause_between_writes_ms,
         },
     })
 }
@@ -4791,6 +4814,30 @@ mod tests {
             })
         );
         assert_eq!(value["promptKeys"]["deleteChar"]["bytes"], "\u{7f}");
+    }
+
+    /// PRD #211: Antigravity's paced deletes reach the webview — one delete
+    /// per write, 20 ms apart — and a pace past the bound, or a zero cap,
+    /// drops the whole set rather than reaching the panel.
+    #[test]
+    fn delete_pacing_is_copied_within_its_bounds() {
+        let keys = registry_keys(AgentType::Antigravity);
+        let mapped = serde_json::to_value(map_prompt_keys(&keys).unwrap()).unwrap();
+        assert_eq!(
+            mapped["deleteChar"],
+            serde_json::json!({"bytes": "\u{7f}", "maxPressesPerWrite": 1, "pauseBetweenWritesMs": 20})
+        );
+        let mut slow = keys.clone();
+        slow.delete_char.pause_between_writes_ms = Some(PROMPT_KEY_DELETE_PAUSE_MAX_MS + 1);
+        assert_eq!(map_prompt_keys(&slow), None);
+        let mut zero = keys;
+        zero.delete_char.max_presses_per_write = Some(0);
+        assert_eq!(map_prompt_keys(&zero), None);
+        let codex =
+            serde_json::to_value(map_prompt_keys(&registry_keys(AgentType::Codex)).unwrap())
+                .unwrap();
+        assert!(codex["deleteChar"].get("maxPressesPerWrite").is_none());
+        assert!(codex["deleteChar"].get("pauseBetweenWritesMs").is_none());
     }
 
     /// PRD #1541: a record the daemon served no keys for has none in the

@@ -15773,7 +15773,12 @@ fn question_cleared_by(question: &crate::question::PendingQuestion, event: &Agen
     let event_subagent = event.metadata.get(crate::event::SUBAGENT_ID_METADATA_KEY);
     match event.event_type {
         _ if ends_a_call(event) => call_ended(question, event),
-        EventType::Thinking => event.user_prompt.is_some() && event_subagent.is_none(),
+        // A prompt, or the agent's own terminal status saying it is working
+        // again (PRD #211: Antigravity's OSC 7501 `working` after its
+        // permission prompt is answered — no hook reports that answer).
+        EventType::Thinking => {
+            (event.user_prompt.is_some() || event.is_status_signal()) && event_subagent.is_none()
+        }
         EventType::Idle | EventType::SessionStart | EventType::Error | EventType::QuotaBlocked => {
             event_subagent.is_none()
         }

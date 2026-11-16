@@ -463,7 +463,7 @@ pub(crate) fn hook_payload_event(agent: &str, input: &str) -> Option<AgentEvent>
 /// Question payloads do not carry the agent's version. Cache the version of
 /// their PATH-resolved command across hook processes, invalidating it when the
 /// executable changes. This measures PATH, not a running process.
-fn question_agent_version(agent: &AgentType) -> Option<(u64, u64, u64)> {
+pub(crate) fn question_agent_version(agent: &AgentType) -> Option<(u64, u64, u64)> {
     let program = crate::agent_registry::spec(agent).default_command?;
     let line = question_version_line(program)?;
     line.split_whitespace().find_map(|word| {

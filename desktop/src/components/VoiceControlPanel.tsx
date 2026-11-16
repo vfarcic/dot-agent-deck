@@ -704,6 +704,7 @@ const PROMPT_EMPTIED = {
   interrupted: "the agent was interrupted after the last dictation",
   replaced: "the agent in this pane was replaced",
   failed: "a write to the prompt failed",
+  partway: "removing dictated words stopped partway through",
   scratched: "every dictation since the prompt was last sent has been removed",
   clicked: "the agent's terminal was clicked after the last dictation, which may have moved its cursor",
 } as const;
@@ -4521,7 +4522,12 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       return;
     }
     const revision = record.revision;
-    const deletes = run.keys.deleteChar.bytes.repeat(last.length);
+    const { bytes: del, maxPressesPerWrite, pauseBetweenWritesMs } = run.keys.deleteChar;
+    /* PRD #211 — an agent that drops deletes from a burst (Antigravity) is
+       served a per-write cap and a pause, and gets its deletes that way. */
+    const perWrite = Math.max(1, maxPressesPerWrite ?? last.length);
+    /* How many of the deletes' writes have gone out. */
+    let landed = 0;
     reportRefused(`Removing ${quoted(last)} from ${run.label}'s prompt…`);
     runPromptCommand(run, async function* () {
       if (record.revision !== revision) throw new PaneMoved(record.why);
@@ -4529,25 +4535,34 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       const why = record.why;
       record.writes.pop();
       if (record.writes.length === 0) record.why = PROMPT_EMPTIED.scratched;
-      let landed = false;
       try {
-        yield deletes;
-        landed = true;
+        for (let left = last.length; left > 0; left -= perWrite) {
+          if (landed > 0 && pauseBetweenWritesMs) yield pauseBetweenWritesMs;
+          yield del.repeat(Math.min(left, perWrite));
+          /* Resumed only once that write has settled: delivered. */
+          landed += 1;
+        }
       } finally {
         /* Called off before the deletes went out (PR #1558 review): the
            prompt is as it was, so its record is too, and a later "scratch
            that" still removes the write. Put back before the line moves on,
            so a dictation queued behind lands on top of it. */
-        if (!landed && record.revision === revision) {
+        if (landed === 0 && record.revision === revision) {
           record.writes.push(lastWrite);
           record.why = why;
         }
       }
-    }, () => `Removed ${quoted(last)} from ${run.label}'s prompt.`, (why) => `Nothing was removed — ${why}.`, {
+    }, () => `Removed ${quoted(last)} from ${run.label}'s prompt.`, (why) => (landed > 0 ? `Stopped removing ${quoted(last)} partway — ${why}.` : `Nothing was removed — ${why}.`), {
       holds: () => (record.revision === revision ? undefined : record.why),
-      /* Called off, nothing was deleted and the record says so already; only
-         a write that failed leaves the prompt unknown. */
-      onFail: (cause) => { if (!(cause instanceof PaneMoved)) resetPrompt(run.aim, false, PROMPT_EMPTIED.failed); },
+      partway: `removing ${quoted(last)} from ${run.label}'s prompt stopped partway through its deletes`,
+      /* Called off before any delete went out, nothing was deleted and the
+         record says so already. A write that failed, or a paced deletion
+         stopped partway, leaves part of the words behind: the prompt is
+         unknown. */
+      onFail: (cause) => {
+        if (!(cause instanceof PaneMoved)) resetPrompt(run.aim, false, PROMPT_EMPTIED.failed);
+        else if (landed > 0) resetPrompt(run.aim, false, PROMPT_EMPTIED.partway);
+      },
     });
   }, [promptCommand, reportRefused, resetPrompt, runPromptCommand]);
 

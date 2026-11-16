@@ -872,8 +872,11 @@ export interface PromptKeys {
    * The key that deletes one character, and the longest single write (in
    * characters) the agent keeps as typed text — absent where no limit was
    * observed. Voice applies its own 800-character ceiling on top (PRD #1541).
+   * Never more than `maxPressesPerWrite` deletes in one write, when present,
+   * and `pauseBetweenWritesMs` between two writes of one deletion, when
+   * present (Antigravity drops deletes from a larger burst, PRD #211).
    */
-  deleteChar: { bytes: string; maxLiteralWriteChars?: number };
+  deleteChar: { bytes: string; maxLiteralWriteChars?: number; maxPressesPerWrite?: number; pauseBetweenWritesMs?: number };
 }
 
 /**
