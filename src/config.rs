@@ -42,6 +42,10 @@ pub const CONFIG_KEYS: &[(&str, &str)] = &[
         "Type the doorbell into Codex (default: true)",
     ),
     (
+        "doorbell.antigravity",
+        "Type the doorbell into Antigravity (default: true)",
+    ),
+    (
         "host_metrics.disk_free_warn_percent",
         "Host disk shows a warning below this % free (default: 15)",
     ),
@@ -187,13 +191,14 @@ impl NotificationsConfig {
 /// agent: the deck types nothing into it and installs no input-box check, and
 /// its messages arrive by its hooks, native wake or `inbox fetch`. The daemon
 /// reads it when it starts an agent ([`crate::doorbell_switch`]), where
-/// `DOT_AGENT_DECK_DOORBELL_CLAUDE` / `DOT_AGENT_DECK_DOORBELL_CODEX` win over
-/// it.
+/// `DOT_AGENT_DECK_DOORBELL_CLAUDE` / `DOT_AGENT_DECK_DOORBELL_CODEX` /
+/// `DOT_AGENT_DECK_DOORBELL_ANTIGRAVITY` win over it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DoorbellConfig {
     pub claude: bool,
     pub codex: bool,
+    pub antigravity: bool,
 }
 
 impl Default for DoorbellConfig {
@@ -201,6 +206,7 @@ impl Default for DoorbellConfig {
         Self {
             claude: true,
             codex: true,
+            antigravity: true,
         }
     }
 }
@@ -481,6 +487,7 @@ impl DashboardConfig {
             "bell.on_error" => Ok(self.bell.on_error.to_string()),
             "doorbell.claude" => Ok(self.doorbell.claude.to_string()),
             "doorbell.codex" => Ok(self.doorbell.codex.to_string()),
+            "doorbell.antigravity" => Ok(self.doorbell.antigravity.to_string()),
             "notifications.question_after_minutes" => {
                 Ok(self.notifications.question_after_minutes.to_string())
             }
@@ -543,6 +550,10 @@ impl DashboardConfig {
             }
             "doorbell.codex" => {
                 self.doorbell.codex = parse_bool(value)?;
+                Ok(())
+            }
+            "doorbell.antigravity" => {
+                self.doorbell.antigravity = parse_bool(value)?;
                 Ok(())
             }
             "notifications.question_after_minutes" => {
@@ -4405,6 +4416,7 @@ timeout_secs = 600
         dc.bell.on_error = !dc.bell.on_error;
         dc.doorbell.claude = !dc.doorbell.claude;
         dc.doorbell.codex = !dc.doorbell.codex;
+        dc.doorbell.antigravity = !dc.doorbell.antigravity;
         for (key, expected) in [
             ("default_command", dc.default_command.clone()),
             ("bell.enabled", dc.bell.enabled.to_string()),
@@ -4416,6 +4428,7 @@ timeout_secs = 600
             ("bell.on_error", dc.bell.on_error.to_string()),
             ("doorbell.claude", dc.doorbell.claude.to_string()),
             ("doorbell.codex", dc.doorbell.codex.to_string()),
+            ("doorbell.antigravity", dc.doorbell.antigravity.to_string()),
         ] {
             assert_eq!(dc.get_field(key), Ok(expected), "{key}");
         }

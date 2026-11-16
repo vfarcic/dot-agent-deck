@@ -564,6 +564,7 @@ mod tests {
                 DoorbellSwitch {
                     claude: false,
                     codex: true,
+                    antigravity: true,
                 },
                 vec![AgentType::ClaudeCode],
             ),
@@ -571,6 +572,7 @@ mod tests {
                 DoorbellSwitch {
                     claude: true,
                     codex: false,
+                    antigravity: true,
                 },
                 vec![AgentType::Codex],
             ),
@@ -578,6 +580,7 @@ mod tests {
                 DoorbellSwitch {
                     claude: false,
                     codex: false,
+                    antigravity: true,
                 },
                 vec![AgentType::ClaudeCode, AgentType::Codex],
             ),
