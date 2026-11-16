@@ -558,10 +558,14 @@ const TRUST_REQUEST_DIGEST_MAX_CHARS: usize = 128;
 /// `desktop_approve_project_trust`, and declines with
 /// `desktop_deny_trust_request` naming `id`.
 ///
-/// Every string is escaped (`untrusted_text::escape_control_and_bidi`, the
-/// review's own escaping), since a remote deck's daemon composed them; a
-/// well-formed path or name is unchanged by it, so the review it opens is for
-/// the text the deck refused.
+/// `project` and `asked_by` are display text and are escaped
+/// (`untrusted_text::escape_control_and_bidi`, the review's own escaping),
+/// since a remote deck's daemon composed them. `config_dir` and
+/// `orchestration` are NOT: they are identifiers the webview sends back to
+/// open and approve the review, and an escaped one names another directory or
+/// orchestration, so a request about a name with a bidi character could never
+/// be reviewed. The webview never renders them; what it shows of the
+/// orchestration is the review's own, escaped, view.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TrustRequestDto {
@@ -569,8 +573,10 @@ pub struct TrustRequestDto {
     pub id: u64,
     /// The project the approval is kept under.
     pub project: String,
-    /// The directory the refused attempt read the config from.
+    /// The directory the refused attempt read the config from, verbatim: an
+    /// identifier, never shown.
     pub config_dir: String,
+    /// The orchestration's name, verbatim: an identifier, never shown.
     pub orchestration: String,
     /// The digest of the refused text, lowercase hex.
     pub digest: String,
@@ -589,8 +595,8 @@ impl TrustRequestDto {
         digest_ok.then(|| Self {
             id: request.id,
             project: escape(&request.project),
-            config_dir: escape(&request.config_dir),
-            orchestration: escape(&request.orchestration),
+            config_dir: request.config_dir.clone(),
+            orchestration: request.orchestration.clone(),
             digest: request.digest.clone(),
             asked_by: escape(&request.asked_by),
         })

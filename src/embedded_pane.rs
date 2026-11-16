@@ -5568,11 +5568,13 @@ impl PaneController for EmbeddedPaneController {
     fn deny_trust_request(
         &self,
         id: u64,
+        digest: &str,
     ) -> Result<GatedQuery<crate::daemon_protocol::TrustRequestList>, String> {
         let client = self.client.clone();
+        let digest = digest.to_string();
         self.trust_request(async move {
             let client = client.bound_to_current().await?;
-            client.deny_trust_request(id).await
+            client.deny_trust_request(id, &digest).await
         })
     }
 

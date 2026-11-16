@@ -37,13 +37,26 @@ import {
  * when a later snapshot still lists it. A request is known by its deck, its
  * number there and the digest of the text it is about; a deck whose daemon
  * restarted (another process answers for it) has forgotten what it asked and
- * what was declined, so its requests are new ones.
+ * what was declined, so its requests are new ones. A request whose review
+ * could not be read is asked about again {@link TRUST_REQUEST_RETRY_MS}
+ * later, and the reason is said once.
+ *
+ * A request's `configDir` and `orchestration` are identifiers, sent back to
+ * the deck verbatim and never shown: what the dialog and the notices name is
+ * the review's own, escaped, view.
  */
 
 /** The runtime calls the flow needs. A runtime without `denyTrustRequest` shows no request. */
 export type TrustRequestRuntime = ProjectTrustRuntime & {
-  denyTrustRequest?: (deckId: string, id: number) => Promise<void>;
+  denyTrustRequest?: (deckId: string, id: number, digest: string) => Promise<void>;
 };
+
+/**
+ * How long a request whose review could not be read (the deck did not answer,
+ * or the read timed out) waits before the app asks again — the TUI's
+ * `TRUST_REQUEST_RETRY_AFTER`. Neither on every render nor never.
+ */
+export const TRUST_REQUEST_RETRY_MS = 5_000;
 
 /** A sentence the flow leaves behind, for the shell's toast. */
 export interface TrustRequestNotice {
@@ -98,6 +111,12 @@ export function useTrustRequests(runtime: TrustRequestRuntime, fleet: DeckFleet,
   const open = useRef<OpenRequest | undefined>(undefined);
   /* Whether a request's review is being asked for: the deck has not answered yet. */
   const [opening, setOpening] = useState(false);
+  /* Requests whose review could not be read, and when each may be asked
+     about again; a tick that re-runs the opener once the back-off is over. */
+  const retryAt = useRef(new Map<string, number>());
+  const [retryTick, setRetryTick] = useState(0);
+  const retryTimer = useRef<number | undefined>(undefined);
+  useEffect(() => () => window.clearTimeout(retryTimer.current), []);
   const canDeny = runtime.denyTrustRequest !== undefined;
 
   /* The next request opens once nothing is open and no review is on screen
@@ -107,23 +126,34 @@ export function useTrustRequests(runtime: TrustRequestRuntime, fleet: DeckFleet,
     /* `free` is as of the render; an overlay that came up in this same commit
        (the star reminder, say) is on the stack already, and holds it back. */
     if (!canDeny || !free || opening || shown || !overlayStackIsEmpty()) return;
-    const next = pendingTrustRequests(fleet).find((candidate) => !handled.current.has(candidate.key));
+    const now = Date.now();
+    const next = pendingTrustRequests(fleet).find((candidate) => !handled.current.has(candidate.key) && (retryAt.current.get(candidate.key) ?? 0) <= now);
     if (!next) return;
     handled.current.add(next.key);
     const { request, deckId } = next;
     open.current = { key: next.key, deckId, request };
     setOpening(true);
     /* Approving starts nothing: the refused attempt starts when it is retried. */
-    const approved = () => report({ message: requestApprovedNotice(request.orchestration, request.askedBy) });
+    const approved = (view: { orchestration: string }) => report({ message: requestApprovedNotice(view.orchestration, request.askedBy) });
     void check({ deckId, path: request.configDir, orchestration: request.orchestration }, approved, { deckName: next.deckName, request: { id: request.id, askedBy: request.askedBy } })
       .then((answer) => {
         if (answer.kind !== "review" && open.current?.key === next.key) open.current = undefined;
         /* The deck answered it approved: nothing to ask. A review that could
-           not be asked for says why, and is not asked for again. */
-        if (answer.kind === "refused") report({ message: answer.reason });
+           not be read is asked about again after the back-off, and says why
+           the first time only. */
+        if (answer.kind !== "refused") {
+          retryAt.current.delete(next.key);
+          return;
+        }
+        handled.current.delete(next.key);
+        const first = !retryAt.current.has(next.key);
+        retryAt.current.set(next.key, Date.now() + TRUST_REQUEST_RETRY_MS);
+        if (first) report({ message: answer.reason });
+        window.clearTimeout(retryTimer.current);
+        retryTimer.current = window.setTimeout(() => setRetryTick((tick) => tick + 1), TRUST_REQUEST_RETRY_MS);
       })
       .finally(() => setOpening(false));
-  }, [canDeny, check, fleet, free, opening, report, shown]);
+  }, [canDeny, check, fleet, free, opening, report, retryTick, shown]);
 
   /* A request's review closes when its deck no longer lists it: another
      client answered it, it was approved from the CLI, or its text changed. A
@@ -161,7 +191,7 @@ export function useTrustRequests(runtime: TrustRequestRuntime, fleet: DeckFleet,
     cancel();
     const denyRequest = runtime.denyTrustRequest;
     if (!denyRequest) return;
-    void denyRequest(asked.deckId, asked.request.id).then(
+    void denyRequest(asked.deckId, asked.request.id, asked.request.digest).then(
       () => report({ message: requestDeniedNotice(current.view.orchestration) }),
       (cause: unknown) => {
         /* Not declined, so it may open again once nothing is open. */

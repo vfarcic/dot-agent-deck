@@ -2925,7 +2925,9 @@ impl DaemonClient {
         Ok(trust_requests_of(&resp))
     }
 
-    /// Issue #2330 — the user declined in-deck approval request `id`. Answers
+    /// Issue #2330 — the user declined in-deck approval request `id`, shown with
+    /// text `digest` (the daemon declines nothing when the request it holds
+    /// under `id` carries other text). Answers
     /// the list as it stands after it. A request another client already
     /// answered is no error.
     ///
@@ -2935,6 +2937,7 @@ impl DaemonClient {
     pub async fn deny_trust_request(
         &self,
         id: u64,
+        digest: &str,
     ) -> Result<GatedQuery<crate::daemon_protocol::TrustRequestList>, ClientError> {
         if !self
             .capabilities()
@@ -2944,7 +2947,15 @@ impl DaemonClient {
             return Ok(GatedQuery::Unsupported);
         }
         let (mut rd, mut wr) = self.admitted_connect().await?;
-        let resp = issue_command(&mut rd, &mut wr, &AttachRequest::DenyTrustRequest { id }).await?;
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::DenyTrustRequest {
+                id,
+                digest: digest.to_string(),
+            },
+        )
+        .await?;
         if !resp.ok {
             return Err(ClientError::Server(
                 resp.error

@@ -301,11 +301,18 @@ pub(crate) async fn deny_trust_request_on(
     state: &DesktopState,
     deck_id: &str,
     id: u64,
+    digest: &str,
 ) -> Result<(), String> {
+    if digest.is_empty()
+        || digest.chars().count() > DIGEST_MAX_CHARS
+        || !digest.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        return Err("the decline names no digest of the text the deck asked about".into());
+    }
     let daemon = review_daemon(state, Some(deck_id)).await?;
     let answer = crate::daemon_bridge::bounded_reply(
         "DenyTrustRequest",
-        daemon.client.deny_trust_request(id),
+        daemon.client.deny_trust_request(id, digest),
     )
     .await?;
     match answer {
@@ -315,7 +322,9 @@ pub(crate) async fn deny_trust_request_on(
 }
 
 /// Issue #2330: the user declined in-deck approval request `id` of the deck
-/// `deck_id` names — its review's **Deny**, `Esc` or voice's `close`. The deck
+/// `deck_id` names, about the text `digest` names (the deck declines only
+/// when the request it holds under `id` is about that text: after a restart
+/// the same number can name another one) — its review's **Deny**, `Esc` or voice's `close`. The deck
 /// closes the request in every client and refuses that exact text again,
 /// saying the user declined it, until it restarts. A request another client
 /// already answered is no error. Withheld from a deck that does not advertise
@@ -326,9 +335,10 @@ pub(crate) async fn desktop_deny_trust_request(
     state: State<'_, DesktopState>,
     deck_id: String,
     id: u64,
+    digest: String,
 ) -> Result<(), String> {
     crate::ensure_main_webview(&webview)?;
-    deny_trust_request_on(&state, &deck_id, id).await
+    deny_trust_request_on(&state, &deck_id, id, &digest).await
 }
 
 #[cfg(test)]
@@ -507,6 +517,20 @@ mod tests {
         assert!(reason.contains("--orchestration review"), "{reason}");
         assert!(reason.contains("nothing was started"), "{reason}");
         assert!(!reason.contains('\u{1b}'), "{reason}");
+    }
+
+    /// Issue #2330: a decline whose digest is not one is refused before any
+    /// deck is contacted.
+    #[tokio::test]
+    async fn a_decline_without_a_real_digest_is_refused_before_any_deck() {
+        let state = DesktopState::default();
+        for digest in ["", "not-hex!", &"a".repeat(DIGEST_MAX_CHARS + 1)] {
+            assert_eq!(
+                deny_trust_request_on(&state, "deck-nowhere", 4, digest).await,
+                Err("the decline names no digest of the text the deck asked about".to_string()),
+                "{digest:?}"
+            );
+        }
     }
 
     /// A digest that is not one is refused before any deck is contacted.

@@ -4387,8 +4387,10 @@ mod tests {
 
     /// Issue #2330. Scenario: a daemon advertising `trust-requests` lists one
     /// pending approval request on its `Hello` reply, with a bidi override in
-    /// what asked. The deck's connection carries it camelCased for the
-    /// webview, the label escaped and the path unchanged; a request whose
+    /// what asked and in the config directory. The deck's connection carries
+    /// it camelCased for the webview, the label escaped and the directory and
+    /// name verbatim, since the webview sends them back to open the review;
+    /// a request whose
     /// digest is not hex is dropped; a refused handshake, and a daemon that
     /// does not advertise the capability, carry none, and an empty list is
     /// omitted from the wire.
@@ -4398,7 +4400,7 @@ mod tests {
         let request = |id: u64, digest: &str| TrustRequest {
             id,
             project: "/srv/demo".into(),
-            config_dir: "/srv/demo-wt".into(),
+            config_dir: "/srv/demo\u{202e}wt".into(),
             orchestration: "team".into(),
             digest: digest.into(),
             asked_by: "dispatch \u{202e}evil".into(),
@@ -4418,7 +4420,10 @@ mod tests {
         assert_eq!(requests.len(), 1, "the request with no digest is dropped");
         assert_eq!(requests[0]["id"], 7);
         assert_eq!(requests[0]["project"], "/srv/demo");
-        assert_eq!(requests[0]["configDir"], "/srv/demo-wt");
+        assert_eq!(
+            requests[0]["configDir"], "/srv/demo\u{202e}wt",
+            "an identifier, sent back verbatim"
+        );
         assert_eq!(requests[0]["orchestration"], "team");
         assert_eq!(requests[0]["digest"], "ab12");
         let asked_by = requests[0]["askedBy"].as_str().unwrap();

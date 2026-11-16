@@ -626,7 +626,7 @@ pub trait PaneController: Send + Sync {
         Ok(crate::daemon_client::GatedQuery::Unsupported)
     }
     /// Issue #2330: the user declined the attached daemon's in-deck approval
-    /// request `id`. [`GatedQuery::Unsupported`] when the daemon raises no
+    /// request `id`, shown with text `digest`. [`GatedQuery::Unsupported`] when the daemon raises no
     /// requests, which is also the default for a controller with no daemon
     /// behind it.
     ///
@@ -634,6 +634,7 @@ pub trait PaneController: Send + Sync {
     fn deny_trust_request(
         &self,
         _id: u64,
+        _digest: &str,
     ) -> Result<crate::daemon_client::GatedQuery<crate::daemon_protocol::TrustRequestList>, String>
     {
         Ok(crate::daemon_client::GatedQuery::Unsupported)

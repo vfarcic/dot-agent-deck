@@ -2330,11 +2330,11 @@ export interface DeckBridge {
   approveProjectTrust(target: ProjectTrustTarget, digest: string): Promise<ProjectTrust>;
   /**
    * Issue #2330 — decline the in-deck approval request `id` of the deck
-   * `deckId` names. The deck closes it in every client and does not ask about
+   * `deckId` names, about the text `digest` names. The deck closes it in every client and does not ask about
    * that exact text again until it restarts. A request another client already
    * answered is no error. Optional so a test double need not serve it.
    */
-  denyTrustRequest?(deckId: string, id: number): Promise<void>;
+  denyTrustRequest?(deckId: string, id: number, digest: string): Promise<void>;
   /**
    * PRD #2174 — whether this launch of the app shows the star reminder. The
    * crate counts one launch per app process however often it is asked, in the
@@ -6006,9 +6006,9 @@ export class TauriDeckBridge implements DeckBridge {
   }
 
   /** Issue #2330. */
-  async denyTrustRequest(deckId: string, id: number): Promise<void> {
+  async denyTrustRequest(deckId: string, id: number, digest: string): Promise<void> {
     const invoke = await this.getInvoke();
-    await invoke<null>("desktop_deny_trust_request", { deckId, id });
+    await invoke<null>("desktop_deny_trust_request", { deckId, id, digest });
   }
 
   async starPromptLaunch(): Promise<boolean> {

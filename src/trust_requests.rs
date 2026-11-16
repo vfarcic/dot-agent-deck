@@ -184,9 +184,15 @@ impl TrustRequestHub {
         (Raised::Pending, true)
     }
 
-    /// The user declined request `id`: close it, and remember its text.
-    pub fn deny(&mut self, id: u64) -> Denied {
-        let Some(at) = self.pending.iter().position(|r| r.id == id) else {
+    /// The user declined request `id`, shown with text `digest`: close it, and
+    /// remember its text. A request whose text is not `digest` is not the one
+    /// the user saw (a restarted daemon numbers anew), so nothing is declined.
+    pub fn deny(&mut self, id: u64, digest: &str) -> Denied {
+        let Some(at) = self
+            .pending
+            .iter()
+            .position(|r| r.id == id && r.digest == digest)
+        else {
             return Denied::Unknown;
         };
         let request = self.pending.remove(at);
@@ -202,15 +208,18 @@ impl TrustRequestHub {
     }
 
     /// `project`'s `orchestration` was approved as text `digest` (by a client,
-    /// or found approved by a check): close its pending request and forget any
-    /// denial of the same orchestration. Answers whether the list changed.
+    /// or found approved by a check): close its pending request and forget a
+    /// denial of that same text. A denial of another text of the orchestration
+    /// stays — the user declined that text, and approving a different one (a
+    /// linked worktree's, say) does not answer it. Answers whether the list
+    /// changed.
     pub fn settle_approved(&mut self, project: &str, orchestration: &str, digest: &str) -> bool {
         let key = RequestKey {
             project: project.to_string(),
             orchestration: orchestration.to_string(),
             digest: digest.to_string(),
         };
-        self.denied.retain(|d| !d.same_orchestration(&key));
+        self.denied.retain(|d| *d != key);
         let before = self.pending.len();
         self.pending.retain(|r| RequestKey::of_request(r) != key);
         let changed = self.pending.len() != before;
@@ -339,12 +348,12 @@ pub fn note_approved(project: &Path, orchestration: &str, digest: &str) {
 /// The user declined request `id` in a client (`DenyTrustRequest`). Answers
 /// what that did and the list as it stands after it (`None` outside a serving
 /// daemon).
-pub fn deny(id: u64) -> (Denied, Option<TrustRequestList>) {
+pub fn deny(id: u64, digest: &str) -> (Denied, Option<TrustRequestList>) {
     let mut served = served();
     if served.tx.is_none() {
         return (Denied::Unknown, None);
     }
-    let denied = served.hub.deny(id);
+    let denied = served.hub.deny(id, digest);
     if denied == Denied::Declined {
         tracing::info!(
             request = id,
@@ -356,8 +365,10 @@ pub fn deny(id: u64) -> (Denied, Option<TrustRequestList>) {
 }
 
 /// Which of `pending` no longer needs an answer: approved since it was raised
-/// (from the CLI, or another path), its config now reads other text, or it no
-/// longer reads at all. Blocking — reads the store and the configs.
+/// (from the CLI, or another path), its config now reads other text, or the
+/// config or the orchestration is gone. A store that cannot be read right now
+/// settles nothing: the request stays until a read answers. Blocking — reads
+/// the store and the configs.
 pub fn stale_requests_blocking(
     store: &crate::project_trust::TrustStore,
     pending: &[TrustRequest],
@@ -371,6 +382,7 @@ pub fn stale_requests_blocking(
                 &request.orchestration,
             ) {
                 Ok(check) => check.verdict.is_approved() || check.digest() != request.digest,
+                Err(crate::project_trust::TrustError::Store(_)) => false,
                 Err(_) => true,
             }
         })
@@ -474,11 +486,16 @@ mod tests {
         hub.raise(&c, "dispatch");
         let id = hub.list().requests[0].id;
         let rev = hub.list().revision;
-        assert_eq!(hub.deny(id), Denied::Declined);
+        assert_eq!(
+            hub.deny(id, "another text"),
+            Denied::Unknown,
+            "a deny of text the request does not carry declines nothing"
+        );
+        assert_eq!(hub.deny(id, &c.digest()), Denied::Declined);
         assert!(hub.list().requests.is_empty());
         assert!(hub.list().revision > rev);
         assert_eq!(
-            hub.deny(id),
+            hub.deny(id, &c.digest()),
             Denied::Unknown,
             "a second answer finds nothing"
         );
@@ -502,7 +519,10 @@ mod tests {
         assert!(!hub.settle_approved("/p", "team", &c.digest()));
         hub.raise(&c, "dispatch");
         let id = hub.list().requests[0].id;
-        hub.deny(id);
+        hub.deny(id, &c.digest());
+        // Approving ANOTHER text of the orchestration leaves this denial.
+        hub.settle_approved("/p", "team", "other-digest");
+        assert_eq!(hub.raise(&c, "dispatch").0, Raised::Declined);
         hub.settle_approved("/p", "team", &c.digest());
         // Approved, then revoked: the old denial no longer holds.
         assert_eq!(hub.raise(&c, "dispatch"), (Raised::Pending, true));
@@ -569,7 +589,7 @@ mod tests {
         assert!(refusal_for(&c, "dispatch").is_some());
         assert!(rx.try_recv().is_err(), "a retry broadcasts nothing");
 
-        let (denied, after) = deny(sent.requests[0].id);
+        let (denied, after) = deny(sent.requests[0].id, &c.digest());
         assert_eq!(denied, Denied::Declined);
         assert!(after.expect("served").requests.is_empty());
         assert!(matches!(rx.try_recv(), Ok(BroadcastMsg::TrustRequests(_))));
@@ -643,10 +663,14 @@ mod tests {
     #[test]
     fn the_wire_spells_the_verb_the_broadcast_and_the_list() {
         use crate::daemon_protocol::AttachRequest;
-        let deny = serde_json::to_value(AttachRequest::DenyTrustRequest { id: 3 }).unwrap();
+        let deny = serde_json::to_value(AttachRequest::DenyTrustRequest {
+            id: 3,
+            digest: "d".into(),
+        })
+        .unwrap();
         assert_eq!(
             deny,
-            serde_json::json!({"op": "deny-trust-request", "id": 3})
+            serde_json::json!({"op": "deny-trust-request", "id": 3, "digest": "d"})
         );
         let list = TrustRequestList {
             revision: 4,

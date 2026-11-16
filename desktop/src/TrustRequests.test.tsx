@@ -20,7 +20,7 @@ import {
   type ProjectTrust,
   type ProjectTrustTarget,
 } from "./lib/projectTrust";
-import { pendingTrustRequests, type TrustRequestRuntime } from "./lib/trustRequests";
+import { pendingTrustRequests, TRUST_REQUEST_RETRY_MS, type TrustRequestRuntime } from "./lib/trustRequests";
 import { TrustRequestGate } from "./components/TrustRequestGate";
 import type { DeckFleet, DeckRuntimeState, DeckSnapshot, TrustRequest } from "./types";
 
@@ -139,7 +139,7 @@ describe("an in-deck approval request", () => {
     expect(runtime.projectTrustState).toHaveBeenCalledOnce();
   });
 
-  /** Scenario: the user clicks Deny. The deck that asked is told, by the request's number, and the review closes with the TUI's sentence. */
+  /** Scenario: the user clicks Deny. The deck that asked is told, by the request's number and the digest of its text, and the review closes with the TUI's sentence. */
   it("denies on Deny", async () => {
     const runtime = runtimeOf();
     const onNotice = vi.fn();
@@ -147,7 +147,7 @@ describe("an in-deck approval request", () => {
     fireEvent.click(within(await screen.findByTestId("project-trust-dialog")).getByRole("button", { name: DENY }));
     expect(screen.queryByTestId("project-trust-dialog")).toBeNull();
     await waitFor(() => expect(onNotice).toHaveBeenCalledExactlyOnceWith({ message: requestDeniedNotice("team") }));
-    expect(runtime.denyTrustRequest).toHaveBeenCalledExactlyOnceWith(REMOTE, 9);
+    expect(runtime.denyTrustRequest).toHaveBeenCalledExactlyOnceWith(REMOTE, 9, "ab12");
     expect(runtime.approveProjectTrust).not.toHaveBeenCalled();
   });
 
@@ -164,7 +164,7 @@ describe("an in-deck approval request", () => {
     expect(runtime.denyTrustRequest).not.toHaveBeenCalled();
     expect(runtime.approveProjectTrust).not.toHaveBeenCalled();
     fireEvent.keyDown(dialog, { key: "Escape" });
-    await waitFor(() => expect(runtime.denyTrustRequest).toHaveBeenCalledExactlyOnceWith(LOCAL, 2));
+    await waitFor(() => expect(runtime.denyTrustRequest).toHaveBeenCalledExactlyOnceWith(LOCAL, 2, "ab12"));
     expect(screen.queryByTestId("project-trust-dialog")).toBeNull();
   });
 
@@ -218,7 +218,7 @@ describe("an in-deck approval request", () => {
     await waitFor(() => expect(runtime.approveProjectTrust).toHaveBeenCalledExactlyOnceWith({ deckId: LOCAL, path: "/srv/demo", orchestration: "team" }, "ab12"));
     await waitFor(() => expect(screen.getByTestId("project-trust-orchestration")).toHaveTextContent("other"));
     act(() => { topmostOverlayClose()?.(); });
-    await waitFor(() => expect(runtime.denyTrustRequest).toHaveBeenCalledExactlyOnceWith(LOCAL, 2));
+    await waitFor(() => expect(runtime.denyTrustRequest).toHaveBeenCalledExactlyOnceWith(LOCAL, 2, "cd34"));
     expect(screen.queryByTestId("project-trust-dialog")).toBeNull();
   });
 
@@ -242,6 +242,56 @@ describe("an in-deck approval request", () => {
     await waitFor(() => expect(runtime.denyTrustRequest).toHaveBeenCalledOnce());
     rerender(<Gate runtime={runtime} fleet={[deck(LOCAL, [request(1)], "process-b")]} onNotice={vi.fn()} />);
     expect(await screen.findByTestId("project-trust-dialog")).toBeVisible();
+  });
+
+  /** Scenario: the deck does not answer when the app reads a request's review. No review opens and the app says why once; it does not ask again at once, and asks again after the back-off, when the review opens. */
+  it("asks again after a back-off when the review cannot be read", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      let fail = true;
+      const runtime = runtimeOf({
+        projectTrustState: vi.fn(async (target: ProjectTrustTarget) => {
+          if (fail) throw new Error("timed out");
+          return review(target);
+        }),
+      });
+      const onNotice = vi.fn();
+      const fleet = [deck(LOCAL, [request(1)])];
+      const { rerender } = render(<Gate runtime={runtime} fleet={fleet} onNotice={onNotice} />);
+      await waitFor(() => expect(onNotice).toHaveBeenCalledOnce());
+      expect(onNotice.mock.calls[0]?.[0].message).toContain("timed out");
+      expect(screen.queryByTestId("project-trust-dialog")).toBeNull();
+      // A later snapshot inside the back-off asks nothing.
+      rerender(<Gate runtime={runtime} fleet={[deck(LOCAL, [request(1)])]} onNotice={onNotice} />);
+      await act(async () => { await Promise.resolve(); });
+      expect(runtime.projectTrustState).toHaveBeenCalledOnce();
+      // A second failure after the back-off is not said again.
+      await act(async () => { vi.advanceTimersByTime(TRUST_REQUEST_RETRY_MS); });
+      await waitFor(() => expect(runtime.projectTrustState).toHaveBeenCalledTimes(2));
+      expect(onNotice).toHaveBeenCalledOnce();
+      fail = false;
+      await act(async () => { vi.advanceTimersByTime(TRUST_REQUEST_RETRY_MS); });
+      expect(await screen.findByTestId("project-trust-dialog")).toBeVisible();
+      expect(runtime.projectTrustState).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /** Scenario: a request names an orchestration with a bidi override in its name and directory. The review is read with the name and directory exactly as the deck sent them, and the approved sentence names the orchestration as the review shows it, escaped. */
+  it("opens the review with the request's identifiers verbatim and names the reviewed orchestration", async () => {
+    const shownName = "te\\u{202e}am";
+    const runtime = runtimeOf({
+      projectTrustState: vi.fn(async (target: ProjectTrustTarget) => ({ ...review(target), orchestration: shownName })),
+      approveProjectTrust: vi.fn(async (target: ProjectTrustTarget) => ({ ...review(target, "approved"), orchestration: shownName })),
+    });
+    const onNotice = vi.fn();
+    render(<Gate runtime={runtime} fleet={[deck(LOCAL, [request(1, { orchestration: "te\u202eam", configDir: "/srv/de\u202emo" })])]} onNotice={onNotice} />);
+    const dialog = await screen.findByTestId("project-trust-dialog");
+    expect(runtime.projectTrustState).toHaveBeenCalledExactlyOnceWith({ deckId: LOCAL, path: "/srv/de\u202emo", orchestration: "te\u202eam" });
+    expect(within(dialog).getByTestId("project-trust-orchestration")).toHaveTextContent(shownName);
+    fireEvent.click(within(dialog).getByRole("button", { name: APPROVE }));
+    await waitFor(() => expect(onNotice).toHaveBeenCalledExactlyOnceWith({ message: requestApprovedNotice(shownName, "dispatch") }));
   });
 });
 
@@ -291,6 +341,6 @@ describe("an in-deck approval request in the app", () => {
     render(<DeckShell runtime={runtime} initialView={{ kind: "deck" }} />);
     fireEvent.click(within(await screen.findByTestId("project-trust-dialog")).getByRole("button", { name: DENY }));
     expect(await screen.findByTestId("trust-request-toast")).toHaveTextContent(requestDeniedNotice("team"));
-    expect(runtime.denyTrustRequest).toHaveBeenCalledExactlyOnceWith(REMOTE, 7);
+    expect(runtime.denyTrustRequest).toHaveBeenCalledExactlyOnceWith(REMOTE, 7, "ab12");
   });
 });

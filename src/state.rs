@@ -4623,14 +4623,18 @@ enum AppliedEvent {
 impl AppState {
     /// Issue #2330: apply a `TrustRequests` broadcast. A list older than the
     /// one held (by revision) is dropped, so two broadcasts received out of
-    /// order leave the newer; nothing is taken from a daemon this state has not
-    /// seen advertise requests.
+    /// order leave the newer. Taken when none is held yet too: only a daemon
+    /// that raises requests broadcasts one, so a `Hello` seed that timed out
+    /// does not hide a request raised afterwards.
     pub fn apply_trust_requests(&mut self, list: crate::daemon_protocol::TrustRequestList) {
-        match &self.trust_requests {
-            Some(held) if held.revision > list.revision => {}
-            Some(_) => self.trust_requests = Some(list),
-            None => {}
+        if self
+            .trust_requests
+            .as_ref()
+            .is_some_and(|held| held.revision > list.revision)
+        {
+            return;
         }
+        self.trust_requests = Some(list);
     }
 
     /// The status of the session currently bound to `pane_id`, read the way

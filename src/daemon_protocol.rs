@@ -3234,7 +3234,8 @@ pub enum AttachRequest {
         digest: String,
     },
     /// Issue #2330: the user declined in-deck approval request `id`
-    /// ([`TrustRequest`]). The daemon closes it in every client and refuses
+    /// ([`TrustRequest`]), shown with text `digest`. A request with that id
+    /// whose text is another (a restarted daemon numbers anew) is not declined. The daemon closes it in every client and refuses
     /// that exact text again, saying the user declined it, until it restarts.
     /// The reply carries the list as it stands after it on
     /// [`AttachResponse::trust_requests`]; a request already answered (by
@@ -3244,6 +3245,7 @@ pub enum AttachRequest {
     /// older daemon has no such variant.
     DenyTrustRequest {
         id: u64,
+        digest: String,
     },
     /// PRD #1666: post a deck-generated message to `pane_id`'s inbox, bound to
     /// `expected_agent_id` (the pane's live agent when omitted). The reply
@@ -8559,8 +8561,8 @@ async fn handle_connection(
             write_resp(&mut stream, &resp).await?
         }
         // Issue #2330: the user declined an in-deck approval request.
-        AttachRequest::DenyTrustRequest { id } => {
-            let (_, list) = crate::trust_requests::deny(id);
+        AttachRequest::DenyTrustRequest { id, digest } => {
+            let (_, list) = crate::trust_requests::deny(id, &digest);
             let resp = match list {
                 Some(list) => {
                     let mut resp = AttachResponse::ok();

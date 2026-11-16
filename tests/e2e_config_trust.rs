@@ -2977,10 +2977,13 @@ fn request_003_a_request_raised_with_no_client_opens_when_one_attaches() {
     deck.wait_for_string(REQUEST_FOOTER);
 
     // Another client answers first.
-    let id = pending_trust_requests(&daemon.attach_socket)[0].id;
+    let pending = pending_trust_requests(&daemon.attach_socket);
     let resp = common::attach_request_on(
         &daemon.attach_socket,
-        &dot_agent_deck::daemon_protocol::AttachRequest::DenyTrustRequest { id },
+        &dot_agent_deck::daemon_protocol::AttachRequest::DenyTrustRequest {
+            id: pending[0].id,
+            digest: pending[0].digest.clone(),
+        },
     )
     .expect("deny over the attach socket");
     assert!(resp.ok, "the deny is served: {:?}", resp.error);

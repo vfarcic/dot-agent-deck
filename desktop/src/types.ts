@@ -403,16 +403,20 @@ export interface ConnectionView {
 /**
  * Issue #2330 — one pending in-deck approval request. The review for it is
  * the New agent form's, for `orchestration` of the config in `configDir`;
- * `id` is its number on its deck, which declining it names.
+ * `id` and `digest` are its number on its deck and the text it is about,
+ * which declining it names.
  */
 export interface TrustRequest {
   id: number;
+  /** Escaped, for display. */
   project: string;
+  /** Verbatim: an identifier the review is opened with, never shown. */
   configDir: string;
+  /** Verbatim: an identifier the review is opened with, never shown — the review's own view names it on screen. */
   orchestration: string;
   /** The digest of the text the deck refused. */
   digest: string;
-  /** What tried to start it: `dispatch`, a schedule's name, `pane restart`, … */
+  /** What tried to start it: `dispatch`, a schedule's name, `pane restart`, … Escaped, for display. */
   askedBy: string;
 }
 
@@ -1757,10 +1761,11 @@ export interface DeckRuntimeState {
   approveProjectTrust?: (target: import("./lib/projectTrust").ProjectTrustTarget, digest: string) => Promise<import("./lib/projectTrust").ProjectTrust>;
   /**
    * Issue #2330 — decline the in-deck approval request `id` of the deck
-   * `deckId` names. Optional for the reason the two above are; a runtime
+   * `deckId` names, about the text `digest` names (the deck declines only
+   * when its request `id` is about that text). Optional for the reason the two above are; a runtime
    * without it shows no request.
    */
-  denyTrustRequest?: (deckId: string, id: number) => Promise<void>;
+  denyTrustRequest?: (deckId: string, id: number, digest: string) => Promise<void>;
   /**
    * PRD #2174 — whether this launch shows the star reminder, and the user's
    * choice in it. Optional for the reason the two above are; a runtime

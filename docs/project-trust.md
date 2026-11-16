@@ -79,7 +79,7 @@ If the orchestration is not approved as its file now reads, the attempt is refus
 
 ### Answering the deck's request
 
-The deck shows the same **Review project commands** review, led by a sentence saying the deck refused to start the orchestration and an **Asked by:** line naming what tried to start it, such as `dispatch`, `delegate`, `pane restart` or `scheduled task 'nightly'`. It waits while another dialog is open, and for a moment after it appears it ignores keys, so typing you were in the middle of cannot answer it.
+The deck shows the same **Review project commands** review, led by a sentence saying the deck refused to start the orchestration and an **Asked by:** line naming what tried to start it, such as `dispatch`, `delegate`, `pane restart` or `scheduled task 'nightly'`. It waits while another dialog is open, and for a moment after it appears it ignores keys (in the TUI, until you pause typing), so typing you were in the middle of cannot answer it.
 
 - **TUI:** the review opens over the dashboard or the pane you are typing in, with the footer `a approve · Esc deny · ↑↓ scroll`. `a` (or a click on `a approve`) approves exactly the text shown, and the status line says `Approved orchestration 'team'. It starts when dispatch tries again.`. `Esc` (or a click on `Esc deny`) declines it. You return to where you were.
 - **Desktop app:** the dialog names the deck that asked (**Deck:**) and offers **Deny** and **Approve**. With **All decks** selected it shows the requests of every deck the app watches; with one deck selected, that deck's. With [voice control](desktop/voice.md#approving-project-commands) on, "approve" approves, and "cancel" or "close" denies.

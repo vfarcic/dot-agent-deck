@@ -156,7 +156,7 @@ test.describe("An in-deck approval request (issue #2330)", () => {
     await dialog.getByRole("button", { name: "Deny", exact: true }).click();
     await expect(dialog).toBeHidden();
     await expect(page.getByTestId("trust-request-toast")).toContainText("Declined orchestration 'team'. The deck will not ask about this text again until it restarts.");
-    expect(await calls(page, "desktop_deny_trust_request")).toEqual([{ deckId: REMOTE, id: 4 }]);
+    expect(await calls(page, "desktop_deny_trust_request")).toEqual([{ deckId: REMOTE, id: 4, digest: "ab12" }]);
     expect(await calls(page, "desktop_approve_project_trust")).toEqual([]);
   });
 
@@ -167,7 +167,7 @@ test.describe("An in-deck approval request (issue #2330)", () => {
     await expect(dialog).toHaveAttribute("data-keys-ready", "true");
     await page.keyboard.press("Escape");
     await expect(dialog).toBeHidden();
-    expect(await calls(page, "desktop_deny_trust_request")).toEqual([{ deckId: REMOTE, id: 4 }]);
+    expect(await calls(page, "desktop_deny_trust_request")).toEqual([{ deckId: REMOTE, id: 4, digest: "ab12" }]);
   });
 
   /** Scenario: the request is answered in the TUI while the review is open, so the deck's next snapshot no longer lists it. The review closes on its own, the app says it was answered elsewhere, and nothing is sent. */

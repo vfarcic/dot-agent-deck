@@ -1858,11 +1858,13 @@ enum TrustPromptPurpose {
     /// The startup restore held this saved orchestration back.
     Restore(PendingTrustRestore),
     /// Issue #2330: the attached daemon refused to start this orchestration
-    /// and asked for its approval (request `id`, raised by `asked_by`).
-    /// Approving records the approval and starts nothing; `Esc` declines the
-    /// request. `return_to` is the mode the deck was in when it opened.
+    /// and asked for its approval (request `id` about text `digest`, raised
+    /// by `asked_by`). Approving records the approval and starts nothing;
+    /// `Esc` declines the request. `return_to` is the mode the deck was in
+    /// when it opened.
     Request {
         id: u64,
+        digest: String,
         asked_by: String,
         return_to: UiMode,
     },
@@ -1881,8 +1883,10 @@ struct TrustPromptState {
     /// it scrolls the review. `None` until a frame has drawn it.
     drawn_inner: Option<Rect>,
     purpose: TrustPromptPurpose,
-    /// When it opened: a review the deck opened on its own ignores keys for
-    /// [`crate::trust_prompt::REQUEST_KEYS_ARM`] after it (issue #2330).
+    /// When it opened, or last took a key while unarmed: a review the deck
+    /// opened on its own ignores keys until
+    /// [`crate::trust_prompt::REQUEST_KEYS_ARM`] has passed with none
+    /// (issue #2330).
     opened_at: std::time::Instant,
 }
 
@@ -1905,16 +1909,22 @@ impl TrustPromptState {
 
     /// The request this review answers, when the deck asked (issue #2330).
     fn request_id(&self) -> Option<u64> {
-        match self.purpose {
-            TrustPromptPurpose::Request { id, .. } => Some(id),
+        self.request_key().map(|(id, _)| id)
+    }
+
+    /// The request this review answers and the text it is about.
+    fn request_key(&self) -> Option<(u64, &str)> {
+        match &self.purpose {
+            TrustPromptPurpose::Request { id, digest, .. } => Some((*id, digest)),
             _ => None,
         }
     }
 
     /// Whether a key reaching it now is ignored: a review the deck opened on
-    /// its own answers nothing for [`crate::trust_prompt::REQUEST_KEYS_ARM`]
-    /// after it opened, so a key already being typed in a pane cannot answer
-    /// it (issue #2330).
+    /// its own answers nothing until [`crate::trust_prompt::REQUEST_KEYS_ARM`]
+    /// has passed since it opened or since the last key it ignored, so typing
+    /// that was under way in a pane when it appeared — however long it goes
+    /// on — cannot answer it (issue #2330).
     fn keys_unarmed(&self) -> bool {
         self.request_id().is_some()
             && self.opened_at.elapsed() < crate::trust_prompt::REQUEST_KEYS_ARM
@@ -1965,11 +1975,16 @@ struct UiState {
     /// Issue #2330: the attached daemon's approval requests this TUI has
     /// already opened a review for (or found needing none), so each is shown
     /// once ([`poll_trust_requests`]).
-    trust_requests_seen: std::collections::BTreeSet<u64>,
+    /// Keyed by request id and digest: a restarted daemon numbers anew.
+    trust_requests_seen: std::collections::BTreeSet<(u64, String)>,
+    /// Issue #2330: no request's review opens before this — set when a review
+    /// could not be read or a decline was not recorded, so the request is
+    /// tried again shortly rather than on every frame.
+    trust_request_retry_at: Option<std::time::Instant>,
     /// Issue #2330: requests the user declined whose answer is not yet sent
     /// to the daemon, with the orchestration's name for the status line.
     /// [`poll_trust_requests`] sends them.
-    trust_request_denials: Vec<(u64, String)>,
+    trust_request_denials: Vec<(u64, String, String)>,
     /// PRD #1666 part 2 (G-fix7e): where this frame drew the restart notice's
     /// rows, if it drew them ([`render_bottom_bar`]), so a modal overlay is
     /// laid out above them rather than over them ([`overlay_area`]).
@@ -2662,6 +2677,7 @@ impl UiState {
             pending_trust_restores: std::collections::VecDeque::new(),
             declined_trust_restores: Vec::new(),
             trust_requests_seen: std::collections::BTreeSet::new(),
+            trust_request_retry_at: None,
             trust_request_denials: Vec::new(),
             restart_notice_area: None,
             confirm_choices_drawn: None,
@@ -8078,10 +8094,15 @@ fn cancel_trust_prompt(ui: &mut UiState) {
         // Issue #2330: declining the deck's request. The answer goes to the
         // daemon from the render loop ([`poll_trust_requests`]), which says
         // so on the status line.
-        TrustPromptPurpose::Request { id, return_to, .. } => {
+        TrustPromptPurpose::Request {
+            id,
+            digest,
+            return_to,
+            ..
+        } => {
             ui.mode = return_to;
             ui.trust_request_denials
-                .push((id, prompt.view.orchestration.clone()));
+                .push((id, digest, prompt.view.orchestration.clone()));
             return;
         }
         TrustPromptPurpose::Open { .. } => {
@@ -8131,6 +8152,9 @@ fn handle_trust_prompt_key(key: KeyEvent, ui: &mut UiState) -> Action {
     // Issue #2330: a review the deck opened on its own takes no key until it
     // has been on screen a moment.
     if prompt.keys_unarmed() {
+        // Each ignored key restarts the wait, so a stream of typing never
+        // reaches a key that answers.
+        prompt.opened_at = std::time::Instant::now();
         return Action::Continue;
     }
     match key.code {
@@ -13661,12 +13685,18 @@ fn open_next_trust_restore(ui: &mut UiState) {
 /// daemon as the New Agent form's is. A request whose orchestration reads as
 /// approved by then opens nothing.
 fn poll_trust_requests(ui: &mut UiState, snapshot: &AppState, pane: &dyn PaneController) {
-    for (id, orchestration) in std::mem::take(&mut ui.trust_request_denials) {
-        let message = match pane.deny_trust_request(id) {
+    for (id, digest, orchestration) in std::mem::take(&mut ui.trust_request_denials) {
+        let message = match pane.deny_trust_request(id, &digest) {
             Ok(_) => crate::trust_prompt::request_denied_message(&orchestration),
-            Err(e) => crate::untrusted_text::escape_control_and_bidi(&format!(
-                "Orchestration '{orchestration}': the deck did not record the decline: {e}"
-            )),
+            Err(e) => {
+                // Not declined: the request may open again, shortly.
+                ui.trust_requests_seen.remove(&(id, digest));
+                ui.trust_request_retry_at =
+                    Some(std::time::Instant::now() + TRUST_REQUEST_RETRY_AFTER);
+                crate::untrusted_text::escape_control_and_bidi(&format!(
+                    "Orchestration '{orchestration}': the deck did not record the decline: {e}"
+                ))
+            }
         };
         ui.status_message = Some((message, std::time::Instant::now()));
     }
@@ -13674,9 +13704,13 @@ fn poll_trust_requests(ui: &mut UiState, snapshot: &AppState, pane: &dyn PaneCon
         return;
     };
     if let Some(prompt) = ui.trust_prompt.as_ref()
-        && let Some(id) = prompt.request_id()
+        && let Some((id, digest)) = prompt.request_key()
     {
-        if !list.requests.iter().any(|request| request.id == id) {
+        if !list
+            .requests
+            .iter()
+            .any(|request| request.id == id && request.digest == digest)
+        {
             let Some(prompt) = ui.trust_prompt.take() else {
                 return;
             };
@@ -13690,24 +13724,30 @@ fn poll_trust_requests(ui: &mut UiState, snapshot: &AppState, pane: &dyn PaneCon
         }
         return;
     }
+    // Forget what the daemon no longer lists, so the set stays as small as
+    // the list.
+    ui.trust_requests_seen.retain(|(id, digest)| {
+        list.requests
+            .iter()
+            .any(|request| request.id == *id && request.digest == *digest)
+    });
     if ui.trust_prompt.is_some()
         || !ui.pending_trust_restores.is_empty()
         || !matches!(ui.mode, UiMode::Normal | UiMode::PaneInput)
+        || ui
+            .trust_request_retry_at
+            .is_some_and(|at| std::time::Instant::now() < at)
     {
         return;
     }
-    // Forget what the daemon no longer lists, so the set stays as small as
-    // the list.
-    ui.trust_requests_seen
-        .retain(|seen| list.requests.iter().any(|request| request.id == *seen));
-    let Some(request) = list
-        .requests
-        .iter()
-        .find(|request| !ui.trust_requests_seen.contains(&request.id))
-    else {
+    let Some(request) = list.requests.iter().find(|request| {
+        !ui.trust_requests_seen
+            .contains(&(request.id, request.digest.clone()))
+    }) else {
         return;
     };
-    ui.trust_requests_seen.insert(request.id);
+    let key = (request.id, request.digest.clone());
+    ui.trust_requests_seen.insert(key.clone());
     match pane.project_trust_state(&request.config_dir, &request.orchestration) {
         Ok(crate::daemon_client::GatedQuery::Answered(view)) if view.state != "approved" => {
             let return_to = ui.mode;
@@ -13716,6 +13756,7 @@ fn poll_trust_requests(ui: &mut UiState, snapshot: &AppState, pane: &dyn PaneCon
                 view,
                 TrustPromptPurpose::Request {
                     id: request.id,
+                    digest: request.digest.clone(),
                     asked_by: request.asked_by.clone(),
                     return_to,
                 },
@@ -13723,6 +13764,9 @@ fn poll_trust_requests(ui: &mut UiState, snapshot: &AppState, pane: &dyn PaneCon
         }
         Ok(_) => {}
         Err(e) => {
+            // Not shown: try it again shortly rather than never.
+            ui.trust_requests_seen.remove(&key);
+            ui.trust_request_retry_at = Some(std::time::Instant::now() + TRUST_REQUEST_RETRY_AFTER);
             // The daemon's error can quote the config: shown, never obeyed.
             ui.status_message = Some((
                 crate::untrusted_text::escape_control_and_bidi(&format!(
@@ -13734,6 +13778,10 @@ fn poll_trust_requests(ui: &mut UiState, snapshot: &AppState, pane: &dyn PaneCon
         }
     }
 }
+
+/// Issue #2330: how long after a review could not be read, or a decline was
+/// not recorded, before a request's review is tried again.
+const TRUST_REQUEST_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// PRD #89 M2b.3 — re-resolve the `OrchestrationConfig` for a snapshot's
 /// orchestration metadata on the daemon-empty restore path.
@@ -44330,6 +44378,8 @@ mod tests {
         >,
         /// Issue #2330: every request id declined through it.
         denials: std::sync::Mutex<Vec<u64>>,
+        /// Issue #2330: when set, what reading the trust state answers.
+        read_error: std::sync::Mutex<Option<String>>,
         inner: CapturingPaneController,
     }
 
@@ -44347,6 +44397,7 @@ mod tests {
                 approvals: std::sync::Mutex::new(Vec::new()),
                 approve_answer: std::sync::Mutex::new(None),
                 denials: std::sync::Mutex::new(Vec::new()),
+                read_error: std::sync::Mutex::new(None),
                 inner: CapturingPaneController::new(),
             }
         }
@@ -44396,6 +44447,9 @@ mod tests {
             _orchestration: &str,
         ) -> Result<crate::daemon_client::GatedQuery<crate::project_trust::ProjectTrustView>, String>
         {
+            if let Some(e) = self.read_error.lock().unwrap().clone() {
+                return Err(e);
+            }
             let mut view = self.view.clone();
             if *self.approved.lock().unwrap() {
                 view.state = "approved".to_string();
@@ -44428,6 +44482,7 @@ mod tests {
         fn deny_trust_request(
             &self,
             id: u64,
+            _digest: &str,
         ) -> Result<
             crate::daemon_client::GatedQuery<crate::daemon_protocol::TrustRequestList>,
             String,
@@ -44648,6 +44703,87 @@ mod tests {
             "{shown}"
         );
         assert!(find_in_rows(&rows, "Esc deny").is_some(), "{shown}");
+    }
+
+    /// Scenario: A request's review opens while the user is typing in a pane.
+    /// However long the typing goes on, no key answers it: each one restarts
+    /// the wait, and only a key after a pause approves.
+    #[test]
+    fn request_tui_006_a_stream_of_typing_never_answers_the_review() {
+        let tmp = tempdir().expect("tempdir");
+        let config = make_orchestration("review");
+        let pc = Arc::new(TrustingPaneController::new(tmp.path(), &config));
+        let mut ui = default_ui();
+        ui.mode = UiMode::PaneInput;
+        poll_trust_requests(&mut ui, &requesting(&pc.view, 4, 1), pc.as_ref());
+        let a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        // Typing that began before the review was armed: almost a full arm
+        // window passes between keys, and none of them answers.
+        for _ in 0..5 {
+            let prompt = ui.trust_prompt.as_mut().expect("open");
+            prompt.opened_at -= crate::trust_prompt::REQUEST_KEYS_ARM / 2;
+            assert!(matches!(
+                handle_trust_prompt_key(a, &mut ui),
+                Action::Continue
+            ));
+        }
+        assert_eq!(ui.mode, UiMode::TrustPrompt);
+        arm(&mut ui);
+        assert!(matches!(
+            handle_trust_prompt_key(a, &mut ui),
+            Action::ApproveProjectTrust
+        ));
+    }
+
+    /// Scenario: The daemon cannot answer for a request's review. It does not
+    /// open, the status line says why, and once the back-off has passed the
+    /// same request opens.
+    #[test]
+    fn request_tui_007_a_review_that_could_not_be_read_is_tried_again() {
+        let tmp = tempdir().expect("tempdir");
+        let config = make_orchestration("review");
+        let pc = Arc::new(TrustingPaneController::new(tmp.path(), &config));
+        let mut ui = default_ui();
+        let snapshot = requesting(&pc.view, 6, 1);
+        *pc.read_error.lock().unwrap() = Some("the deck did not answer".into());
+        poll_trust_requests(&mut ui, &snapshot, pc.as_ref());
+        assert!(ui.trust_prompt.is_none());
+        assert!(
+            ui.status_message
+                .as_ref()
+                .is_some_and(|(m, _)| m.contains("could not be read"))
+        );
+        *pc.read_error.lock().unwrap() = None;
+        poll_trust_requests(&mut ui, &snapshot, pc.as_ref());
+        assert!(ui.trust_prompt.is_none(), "not on every frame");
+        ui.trust_request_retry_at =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        poll_trust_requests(&mut ui, &snapshot, pc.as_ref());
+        assert_eq!(
+            ui.trust_prompt.as_ref().and_then(|p| p.request_id()),
+            Some(6)
+        );
+    }
+
+    /// Scenario: The review of request 2 is open when the daemon (restarted)
+    /// lists a request 2 about other text. The open review is not that one, so
+    /// it closes as answered elsewhere rather than let `Esc` decline text the
+    /// user never saw.
+    #[test]
+    fn request_tui_008_the_same_id_with_other_text_is_another_request() {
+        let tmp = tempdir().expect("tempdir");
+        let config = make_orchestration("review");
+        let pc = Arc::new(TrustingPaneController::new(tmp.path(), &config));
+        let mut ui = default_ui();
+        poll_trust_requests(&mut ui, &requesting(&pc.view, 2, 1), pc.as_ref());
+        assert_eq!(ui.mode, UiMode::TrustPrompt);
+        let mut other = requesting(&pc.view, 2, 1);
+        if let Some(list) = other.trust_requests.as_mut() {
+            list.requests[0].digest = "another-digest".into();
+        }
+        poll_trust_requests(&mut ui, &other, pc.as_ref());
+        assert!(ui.trust_prompt.is_none());
+        assert!(pc.denials.lock().unwrap().is_empty());
     }
 
     fn dispatch_against(
