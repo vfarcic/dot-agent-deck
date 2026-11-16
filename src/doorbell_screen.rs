@@ -256,6 +256,14 @@ pub struct ScreenProfile {
     /// Whether a frame, read straight off the parser's screen, ties itself to
     /// the terminal's width, given every width the terminal has had.
     pub width_witness: fn(&vt100::Screen, &WidthsSeen) -> bool,
+    /// Whether a frame, read straight off the parser's screen, ties itself
+    /// to the two widths of the current width's pair (the even width `2k`
+    /// and `2k + 1`) without telling them apart. The evidence state counts
+    /// it, once the terminal has had both widths, only while nothing has
+    /// reached the parser's last column since the parser started
+    /// ([`crate::evidence_state`]): a frame that keeps out of that column
+    /// reads the same whichever of the two widths it was drawn for.
+    pub pair_witness: fn(&vt100::Screen) -> bool,
     /// The narrowest pane the measurements cover; a narrower one refuses.
     pub min_cols: u16,
     /// How the agent ends a wait for a cursor position report, which decides
@@ -605,12 +613,10 @@ fn codex_transcript_user_line(grid: &Grid, line: &str) -> bool {
 /// width the generation's terminal has had). Either a padded edge row
 /// ([`padded_edge_row`]) of a shape Codex pads to the edge: a dialog's
 /// highlighted choice (`›` bold and inverse, then `N.`), or the dim
-/// `Worked for …` row under a finished turn, every cell dim. Or, before the
-/// first prompt, Codex's logo centred with its top row starting at column
-/// `cols / 2 - 5` (measured at eleven widths from 90 to 200 on 0.160.0 and
-/// 0.164.0); that formula puts the logo of the two widths `2k` and `2k + 1`
-/// in the same place, so the logo counts only while the terminal has never
-/// had the other one of the pair.
+/// `Worked for …` row under a finished turn, every cell dim. Or Codex's
+/// start-up logo ([`codex_logo`]) while the terminal has never had the other
+/// width of the pair that draws it in the same place; once it has, the logo
+/// is the profile's pair witness instead.
 fn codex_width_witness(screen: &vt100::Screen, seen: &WidthsSeen) -> bool {
     let (rows, cols) = crate::vt_grid::size(screen);
     let edge_row = (0..rows).any(|r| {
@@ -626,6 +632,17 @@ fn codex_width_witness(screen: &vt100::Screen, seen: &WidthsSeen) -> bool {
     if edge_row {
         return true;
     }
+    codex_logo(screen) && !seen.had(cols ^ 1)
+}
+
+/// Codex's logo before the first prompt, centred with its top row starting
+/// at column `cols / 2 - 5` (measured at eleven widths from 90 to 200 on
+/// 0.160.0 and 0.164.0). That formula puts the logo of the two widths `2k`
+/// and `2k + 1` in the same place, so it ties a frame to the pair, not to
+/// one width of it: Codex's width witness while the terminal has had only
+/// one width of the pair, and its pair witness after that.
+fn codex_logo(screen: &vt100::Screen) -> bool {
+    let (rows, cols) = crate::vt_grid::size(screen);
     let braille = |r: u16, c: u16| {
         screen.cell(r, c).is_some_and(|cell| {
             cell.contents()
@@ -639,7 +656,12 @@ fn codex_width_witness(screen: &vt100::Screen, seen: &WidthsSeen) -> bool {
     else {
         return false;
     };
-    (cols / 2).checked_sub(5) == Some(first) && !seen.had(cols ^ 1)
+    (cols / 2).checked_sub(5) == Some(first)
+}
+
+/// A profile with no sign that two widths draw alike.
+fn no_pair_witness(_screen: &vt100::Screen) -> bool {
+    false
 }
 
 /// Codex 0.160.0 and 0.164.0: alternate screen; after a resize Codex waits
@@ -655,6 +677,7 @@ pub static CODEX_PROFILE: ScreenProfile = ScreenProfile {
     transcript_user_line: codex_transcript_user_line,
     redraw_marker: b"\x1b[?2026h\x1b[1;1H\x1b[J",
     width_witness: codex_width_witness,
+    pair_witness: codex_logo,
     min_cols: 80,
     // P-WE: every production CPR wait in `codex-rs/tui` ends before the next
     // `?2026h` its own control flow writes (M-WE checks it on the binaries).
@@ -959,6 +982,7 @@ pub static CLAUDE_PROFILE: ScreenProfile = ScreenProfile {
     transcript_user_line: claude_transcript_user_line,
     redraw_marker: b"\x1b[2J\x1b[H",
     width_witness: claude_width_witness,
+    pair_witness: no_pair_witness,
     min_cols: 80,
     cpr_wait_end: crate::composer_probe::query_ledger::CprWaitEnd::Counted,
     // A full redraw within 9 ms of each of the 10 resizes and 10 nudges
@@ -1106,6 +1130,7 @@ pub static STANDIN_PROFILE: ScreenProfile = ScreenProfile {
     transcript_user_line: standin_transcript_user_line,
     redraw_marker: b"\x1b[2J\x1b[H",
     width_witness: standin_width_witness,
+    pair_witness: no_pair_witness,
     min_cols: 40,
     cpr_wait_end: crate::composer_probe::query_ledger::CprWaitEnd::Counted,
     // The stand-in's contract: it reads its size between 25 ms waits for
@@ -1134,6 +1159,7 @@ pub static STANDIN_CPR_PROFILE: ScreenProfile = ScreenProfile {
     transcript_user_line: standin_transcript_user_line,
     redraw_marker: b"\x1b[2J\x1b[H",
     width_witness: standin_width_witness,
+    pair_witness: no_pair_witness,
     min_cols: 40,
     cpr_wait_end: crate::composer_probe::query_ledger::CprWaitEnd::Counted,
     redraw: crate::composer_probe::query_wait::RedrawTiming {

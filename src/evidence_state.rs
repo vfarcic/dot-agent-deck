@@ -19,13 +19,30 @@
 //! drawn for this width. The tested scope (`inbox/doorbell/044`): Claude
 //! Code's rule and Codex's padded choice and turn rows drawn one or twenty
 //! columns too wide stay pending whole, cut at any byte and pushed a byte at a
-//! time, and Codex's start-up logo stays pending after a move between the two
-//! widths that draw it alike. A row drawn in pieces with a cursor move at the
+//! time. A row drawn in pieces with a cursor move at the
 //! new edge (off the row, or back along it) is not always refused
 //! (`src/doorbell_screen.rs`, on the padded row, says when); every measured
 //! redraw drew its rows in one run. A generation starts the same way from its first byte at the spawn geometry,
 //! needing the witness but no marker. A nudge whose restore fails leaves the
 //! width unknown until the next successful resize.
+//!
+//! **Two widths that draw alike** (issue #2124). Codex's start-up logo sits
+//! in the same place at the widths `2k` and `2k + 1`, so once the terminal
+//! has had both (a nudge's one-column shrink of an odd width is enough) the
+//! logo cannot say which of the two a frame was drawn for. It then counts as
+//! the profile's *pair witness*, and only while nothing has reached the
+//! parser's last column since the parser started: a frame drawn with
+//! absolute cursor moves, as Codex's are, that keeps out of that column
+//! lands every cell in the same place in a terminal of either width, with
+//! nothing wrapped and no cursor move clamped, so the screen the parser
+//! holds is the one the agent drew, whichever width it drew for. A frame
+//! drawn for `2k + 1` that writes in its column `2k - 1` or beyond, read at
+//! `2k`, reaches the parser's last column, as does a frame drawn for `2k`
+//! that runs past its own edge, read at `2k + 1`. Each byte is checked as it
+//! is parsed, and the first that reaches the last column ends the pair
+//! witness: a Pending state stays Pending, and a state Clean on the pair
+//! witness returns to Pending unless a width witness shows by then
+//! (`inbox/doorbell/044`).
 //!
 //! Nothing turns Dirty into Clean because time passed. An agent that redraws
 //! nothing after an edge stays Dirty.
@@ -57,6 +74,52 @@ pub const EVIDENCE_WORK_PER_PUSH: u64 = crate::release_scanner::SCANNER_WORK_PER
 
 fn within_budget(rows: u16, cols: u16) -> bool {
     u32::from(rows.max(1)) * u32::from(cols.max(1)) <= EVIDENCE_CELLS_MAX
+}
+
+/// Feed `bytes` to `parser` up to `limit`, as [`crate::vt_work::MeteredParser::feed_byte`]
+/// does, and while `clear` is `Some(true)` check after each byte whether it
+/// reached the parser's last column ([`last_column_reached`]), turning it
+/// `Some(false)` if so. The index of the first byte refused, if one was.
+fn feed_watched<'a>(
+    parser: &mut crate::vt_work::MeteredParser,
+    bytes: impl IntoIterator<Item = &'a u8>,
+    limit: u64,
+    clear: &mut Option<bool>,
+) -> Option<usize> {
+    bytes.into_iter().position(|&b| {
+        if !parser.feed_byte(b, limit) {
+            return true;
+        }
+        if *clear == Some(true) && last_column_reached(parser.screen()) {
+            *clear = Some(false);
+        }
+        false
+    })
+}
+
+/// Whether the byte just parsed may have put something in the parser's last
+/// column: that cell on the cursor's row holds something (a character, a
+/// written blank or the second half of a wide one), or the cursor's row or
+/// the row above it ran on to the next row, which only printing past the
+/// last column does. Writing a cell leaves the cursor on its row, so checked
+/// after every byte this sees each write that lands in the last column, a
+/// write past the edge included, since the parser clamps a cursor move
+/// there and wraps a run of text there.
+///
+/// It does not see a wide character printed with the cursor already in the
+/// empty last column: the parser moves it to the next row without marking a
+/// wrap. Only a drawing that writes in that column does that, and Codex's
+/// frames keep out of their own last column (its composer wraps at
+/// `cols - 2`, measured on 0.169.0 at 90 columns, and its logo is centred).
+fn last_column_reached(screen: &vt100::Screen) -> bool {
+    let (_, cols) = crate::vt_grid::size(screen);
+    let (row, _) = screen.cursor_position();
+    let last = cols.saturating_sub(1);
+    screen
+        .cell(row, last)
+        .is_some_and(|c| c.has_contents() || c.is_wide_continuation())
+        || screen.row_wrapped(row)
+        || (row > 0 && screen.row_wrapped(row - 1))
 }
 
 /// What moved the layout.
@@ -160,6 +223,17 @@ pub struct EvidenceState {
     parser: Option<crate::vt_work::MeteredParser>,
     /// Every width the terminal has had, for the witness.
     widths: WidthsSeen,
+    /// While the parser runs at a width whose pair partner the terminal has
+    /// also had (`2k` and `2k + 1`): whether nothing has reached the
+    /// parser's last column since it started ([`last_column_reached`]), the
+    /// condition under which the profile's pair witness counts. `None` when
+    /// the pair is not in question, or once the state is Clean on a width
+    /// witness.
+    edge_clear: Option<bool>,
+    /// The Pending status a Clean resting on the pair witness came from:
+    /// the state returns to it if the parser's last column is reached and
+    /// no width witness shows. `None` when Clean rests on a width witness.
+    pair_held: Option<EvidenceStatus>,
     /// While Dirty: the last bytes pushed, one fewer than the marker, so a
     /// marker split across two pushes is still found.
     tail: Vec<u8>,
@@ -202,6 +276,8 @@ impl EvidenceState {
             status,
             parser,
             widths: WidthsSeen::of([cols]),
+            edge_clear: None,
+            pair_held: None,
             tail: Vec::new(),
         }
     }
@@ -222,6 +298,12 @@ impl EvidenceState {
     /// a width witness reads ([`WidthsSeen`]), for a diagnosis line.
     pub fn widths(&self) -> (u16, Vec<u16>) {
         (self.cols, self.widths.list())
+    }
+
+    /// Whether the state is Clean on the profile's pair witness, which
+    /// holds only while the parser's last column stays clear.
+    pub fn pair_held(&self) -> bool {
+        self.pair_held.is_some()
     }
 
     pub fn layout_epoch(&self) -> u64 {
@@ -312,7 +394,12 @@ impl EvidenceState {
                 }
                 self.check_witness(profile, since_seq, None)
             }
-            EvidenceStatus::Clean { .. } => self.feed(bytes).flatten(),
+            EvidenceStatus::Clean { .. } => {
+                if let Some(over) = self.feed(bytes) {
+                    return over;
+                }
+                self.recheck_pair(profile)
+            }
             EvidenceStatus::Dirty { .. } => {
                 let marker = profile.redraw_marker;
                 let mut window = std::mem::take(&mut self.tail);
@@ -330,10 +417,14 @@ impl EvidenceState {
                 let marker_seq = base - carried as u64 + at as u64;
                 let mut parser = crate::vt_work::MeteredParser::new(self.rows, self.cols, 0);
                 let modes = modes_at(at.saturating_sub(carried));
-                let fed = modes
-                    .iter()
-                    .chain(&window[at..])
-                    .position(|&b| !parser.feed_byte(b, EVIDENCE_WORK_PER_PUSH));
+                self.edge_clear = self.widths.had(self.cols ^ 1).then_some(true);
+                self.pair_held = None;
+                let fed = feed_watched(
+                    &mut parser,
+                    modes.iter().chain(&window[at..]),
+                    EVIDENCE_WORK_PER_PUSH,
+                    &mut self.edge_clear,
+                );
                 if let Some(refused) = fed {
                     // The refused byte's place in the stream: the preamble
                     // is the deck's own and has none, so it is charged to
@@ -375,8 +466,9 @@ impl EvidenceState {
         self.out_seq += bytes.len() as u64;
         let parser = self.parser.as_mut()?;
         let limit = parser.spent().saturating_add(EVIDENCE_WORK_PER_PUSH);
-        let refused = bytes.iter().position(|&b| !parser.feed_byte(b, limit))?;
+        let refused = feed_watched(parser, bytes, limit, &mut self.edge_clear)?;
         self.parser = None;
+        self.pair_held = None;
         Some(self.transition(
             EvidenceStatus::WorkOverBudget {
                 since_seq: base + refused as u64,
@@ -393,9 +485,33 @@ impl EvidenceState {
     ) -> Option<Transition> {
         let parser = self.parser.as_ref()?;
         if (profile.width_witness)(parser.screen(), &self.widths) {
+            self.edge_clear = None;
+            self.pair_held = None;
+            return self.transition(EvidenceStatus::Clean { since_seq }, marker_seq);
+        }
+        if self.edge_clear == Some(true) && (profile.pair_witness)(parser.screen()) {
+            self.pair_held = Some(self.status);
             return self.transition(EvidenceStatus::Clean { since_seq }, marker_seq);
         }
         None
+    }
+
+    /// After a push to a state Clean on the pair witness: once the parser's
+    /// last column has been reached, the frame no longer reads the same for
+    /// both widths of the pair, so the state stays Clean only on a width
+    /// witness and otherwise returns to the Pending it came from.
+    fn recheck_pair(&mut self, profile: &ScreenProfile) -> Option<Transition> {
+        let pending = self.pair_held?;
+        if self.edge_clear == Some(true) {
+            return None;
+        }
+        self.pair_held = None;
+        let parser = self.parser.as_ref()?;
+        if (profile.width_witness)(parser.screen(), &self.widths) {
+            self.edge_clear = None;
+            return None;
+        }
+        self.transition(pending, None)
     }
 
     /// A successful layout ioctl to `rows` × `cols`, at this place in the
@@ -407,6 +523,8 @@ impl EvidenceState {
         self.widths.record(cols);
         self.profile?;
         self.parser = None;
+        self.edge_clear = None;
+        self.pair_held = None;
         self.tail.clear();
         let to = if within_budget(rows, cols) {
             EvidenceStatus::Dirty {
@@ -432,6 +550,8 @@ impl EvidenceState {
         self.profile = Some(profile);
         self.layout_epoch += 1;
         self.parser = None;
+        self.edge_clear = None;
+        self.pair_held = None;
         self.tail.clear();
         let to = if within_budget(self.rows, self.cols) {
             EvidenceStatus::Dirty {
@@ -457,6 +577,8 @@ impl EvidenceState {
         self.layout_epoch += 1;
         self.profile?;
         self.parser = None;
+        self.edge_clear = None;
+        self.pair_held = None;
         self.tail.clear();
         self.transition(
             EvidenceStatus::GeometryUnknown {

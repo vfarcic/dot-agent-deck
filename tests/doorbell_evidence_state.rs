@@ -290,17 +290,17 @@ fn doorbell_044_a_redraw_for_a_wider_terminal_stays_pending() {
     assert!(clean(&state));
 }
 
-/// Scenario: Codex's start-up logo sits at the same column for the two widths 2k and 2k + 1. Move a terminal from 201 to 200 columns (the even width), and another from 200 to 201 (the odd width), and push a logo drawn for each width: every one stays pending, since the terminal has had both widths of the pair. A terminal that has only ever been 200 or only ever 201 columns wide is Clean on its own logo, and one moved from 200 to 198, a width that does not share the logo's column, refuses the 200-column logo and takes its own.
+/// Scenario: Codex's start-up logo sits at the same column for the two widths 2k and 2k + 1. Move a terminal from 201 to 200 columns (the even width), and another from 200 to 201 (the odd width), and push a logo drawn for each width that writes nothing in the terminal's last column: every one turns the state Clean on the pair witness (issue #2124), since a frame that keeps out of that column reads the same at either width. A terminal that has only ever been 200 or only ever 201 columns wide is Clean on its own logo as a width witness, and one moved from 200 to 198, a width that does not share the logo's column, refuses the 200-column logo and takes its own.
 #[spec("inbox/doorbell/044")]
 #[test]
-fn doorbell_044_a_logo_two_adjacent_widths_share_stays_pending() {
+fn doorbell_044_a_logo_two_adjacent_widths_share_is_clean_on_the_pair_witness() {
     for (spawned, now) in [(201, 200), (200, 201)] {
         for drawn in [spawned, now] {
             let mut state = EvidenceState::new(Some(&CODEX_PROFILE), 50, spawned);
             state.edge(EdgeReason::Resize, 50, now);
             state.push(&codex_logo(drawn), |_| Vec::new());
             assert!(
-                pending_after_edge(&state),
+                clean(&state) && state.pair_held(),
                 "{spawned} → {now}, drawn for {drawn}: {:?}",
                 state.status()
             );
@@ -310,6 +310,7 @@ fn doorbell_044_a_logo_two_adjacent_widths_share_stays_pending() {
         let mut state = EvidenceState::new(Some(&CODEX_PROFILE), 50, cols);
         state.push(&codex_logo(cols), |_| Vec::new());
         assert!(clean(&state), "only ever {cols} wide");
+        assert!(!state.pair_held(), "only ever {cols} wide");
     }
     let mut state = EvidenceState::new(Some(&CODEX_PROFILE), 50, 200);
     state.edge(EdgeReason::Resize, 50, 198);
@@ -317,6 +318,121 @@ fn doorbell_044_a_logo_two_adjacent_widths_share_stays_pending() {
     assert!(pending_after_edge(&state));
     state.push(&codex_logo(198), |_| Vec::new());
     assert!(clean(&state));
+    assert!(!state.pair_held());
+}
+
+/// Scenario: Reproduce issue #2124's pane: a Codex generation started at 180 columns whose pane went to 117, then 116, then 117 again, as an orchestration's layout can, and push Codex's start-up logo drawn for 117 columns. The state is Clean on the pair witness, where before it stayed pending until the agent's first prompt. The same holds with the pane left at 116 after 117.
+#[spec("inbox/doorbell/044")]
+#[test]
+fn doorbell_044_a_fresh_codex_at_117_columns_after_116_is_clean_on_its_logo() {
+    for (path, now) in [([117, 116, 117], 117), ([116, 117, 116], 116)] {
+        let mut state = EvidenceState::new(Some(&CODEX_PROFILE), 50, 180);
+        for cols in path {
+            state.edge(EdgeReason::Resize, 50, cols);
+        }
+        assert_eq!(state.widths(), (now, vec![116, 117, 180]));
+        state.push(&codex_logo(now), |_| Vec::new());
+        assert!(
+            clean(&state) && state.pair_held(),
+            "{path:?}: {:?}",
+            state.status()
+        );
+    }
+}
+
+/// Scenario: With the terminal having had both 200 and 201 columns, push Codex's logo together with a write that reaches the terminal's last column, which a frame for the other width of the pair would put somewhere else: at 200 columns, a frame drawn for 201 with text up to its column 199, a character at its column 200 that the parser clamps into column 199, and a wide character ending in column 199; at 201 columns, a frame drawn for 200 with a row running past its own edge. Each stays pending, and so does a later logo that keeps out of the column: the pair witness is spent until the next layout edge. A width witness, Codex's padded turn row drawn for the width in force, still turns it Clean.
+#[spec("inbox/doorbell/044")]
+#[test]
+fn doorbell_044_a_logo_with_the_last_column_reached_stays_pending() {
+    let wide = |cols: usize| format!("\x1b[30;1H{}", "x".repeat(cols));
+    let cases: [(u16, u16, String); 4] = [
+        (201, 200, wide(200)),
+        (201, 200, "\x1b[30;201Hx".to_string()),
+        (201, 200, "\x1b[30;199H\u{4e2d}".to_string()),
+        (200, 201, wide(201)),
+    ];
+    for (spawned, now, reach) in cases {
+        let mut state = EvidenceState::new(Some(&CODEX_PROFILE), 50, spawned);
+        state.edge(EdgeReason::Resize, 50, now);
+        let mut frame = codex_logo(now);
+        frame.extend_from_slice(reach.as_bytes());
+        frame.extend_from_slice(b"\x1b[47;3H");
+        state.push(&frame, |_| Vec::new());
+        assert!(
+            pending_after_edge(&state),
+            "{spawned} → {now}, {reach:?}: {:?}",
+            state.status()
+        );
+        state.push(&codex_logo(now), |_| Vec::new());
+        assert!(pending_after_edge(&state), "{spawned} → {now}, {reach:?}");
+        state.push(&codex_turn(now), |_| Vec::new());
+        assert!(clean(&state) && !state.pair_held(), "{spawned} → {now}");
+    }
+}
+
+/// Scenario: Turn a 201-to-200-column Codex state Clean on its logo (the pair witness), then push a write that reaches the last column: the state returns to pending, so a frame read there no longer stands. A second state, Clean on the logo the same way, gets Codex's padded turn row drawn for 200 columns, which also reaches the last column but is a width witness: it stays Clean, now on the width witness.
+#[spec("inbox/doorbell/044")]
+#[test]
+fn doorbell_044_clean_on_the_pair_witness_ends_when_the_last_column_is_reached() {
+    let mut state = EvidenceState::new(Some(&CODEX_PROFILE), 50, 201);
+    state.edge(EdgeReason::Resize, 50, 200);
+    state.push(&codex_logo(200), |_| Vec::new());
+    assert!(clean(&state) && state.pair_held());
+    state.push(b"\x1b[47;3Hhello", |_| Vec::new());
+    assert!(
+        clean(&state) && state.pair_held(),
+        "a write left of the column"
+    );
+    state.push(b"\x1b[30;201Hx\x1b[47;3H", |_| Vec::new());
+    assert!(pending_after_edge(&state), "{:?}", state.status());
+    assert!(!state.pair_held());
+    assert!(state.clean_frame().is_none());
+
+    let mut state = EvidenceState::new(Some(&CODEX_PROFILE), 50, 201);
+    state.edge(EdgeReason::Resize, 50, 200);
+    state.push(&codex_logo(200), |_| Vec::new());
+    assert!(clean(&state) && state.pair_held());
+    state.push(&codex_turn(200), |_| Vec::new());
+    assert!(clean(&state), "{:?}", state.status());
+    assert!(!state.pair_held());
+}
+
+/// Scenario: Replay each of Codex 0.164.0's recorded redraws after an edge to an even width W (its ten resizes, to 160, 120, 100, 90, 180, 140, 110, 170, 130 and 200 columns, and its ten nudges' restores to 200), from the edge to the next one, through two evidence states that have both had W and W + 1: one now W columns wide, the width the redraw was drawn for, and one now W + 1 wide, reading the same bytes one column wider. Both end Clean on the pair witness, and every row reads the same in both.
+#[spec("inbox/doorbell/044")]
+#[test]
+fn doorbell_044_recorded_redraws_read_the_same_at_both_widths_of_the_pair() {
+    let run = run("codex-0.164.0-layout-start-50x200");
+    let mut seen = 0;
+    for (i, &(off, rows, w)) in run.edges.iter().enumerate() {
+        let end = run.edges.get(i + 1).map(|e| e.0).unwrap_or(run.bytes.len());
+        // Edges to an even width only: each recorded nudge shrinks to 199
+        // columns and is restored four bytes later.
+        if w % 2 != 0 {
+            continue;
+        }
+        let read = |spawned: u16, now: u16| {
+            let mut state = EvidenceState::new(Some(&CODEX_PROFILE), rows, spawned);
+            state.edge(EdgeReason::Resize, rows, now);
+            let mut pos = off;
+            run.feed(&mut state, &mut pos, end);
+            assert!(
+                clean(&state) && state.pair_held(),
+                "resize to {w}, read at {now}: {:?}",
+                state.status()
+            );
+            state.clean_frame().unwrap()
+        };
+        let (drawn, wider) = (read(w + 1, w), read(w, w + 1));
+        for r in 0..rows {
+            assert_eq!(
+                drawn.text_from(r, 0),
+                wider.text_from(r, 0),
+                "resize to {w}, row {r}"
+            );
+        }
+        seen += 1;
+    }
+    assert_eq!(seen, 20);
 }
 
 /// Scenario: Push redraws whose rows reach the right edge without being a witness: for Codex, plain text exactly as wide as the terminal, plain text padded to the edge, the dim turn row's words run to the edge with no padding, and a numbered choice padded to the edge but not highlighted; for Claude Code, a row of other characters across the width and a rule with one cell broken. Each leaves the state pending, and still pending after a carriage return or a cursor move ends the row; a real witness pushed after them turns it Clean.
@@ -663,7 +779,7 @@ fn doorbell_044_claude_2_1_310_edges_end_clean_however_cut() {
     );
 }
 
-/// Scenario: Start a Codex generation's evidence state at 180 columns and resize its pane to 117, then 116, then 117 again, as an orchestration's split can (the revcxact review's MEDIUM-2). The widths the state reports for a diagnosis line are the current 117 and every width it has had, 116 and 117 among them, which is what refuses Codex's logo as a width witness.
+/// Scenario: Start a Codex generation's evidence state at 180 columns and resize its pane to 117, then 116, then 117 again, as an orchestration's split can (the revcxact review's MEDIUM-2). The widths the state reports for a diagnosis line are the current 117 and every width it has had, 116 and 117 among them, which is what makes Codex's logo the pair witness rather than a width witness.
 #[spec("inbox/doorbell/044")]
 #[test]
 fn doorbell_044_the_state_reports_every_width_its_pane_has_had() {
