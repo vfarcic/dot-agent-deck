@@ -227,6 +227,7 @@ fn agent_cli_name(agent: &AgentType) -> Option<&'static str> {
         AgentType::OpenCode => Some("opencode"),
         AgentType::Codex => Some("codex"),
         AgentType::Devin => Some("devin"),
+        AgentType::Antigravity => Some("antigravity"),
         _ => None,
     }
 }

@@ -14,11 +14,14 @@ compile_error!(
 );
 
 // Shared by the per-agent hook-config adapters (`codex_hooks_manage`,
-// `devin_hooks_manage`); nothing outside the crate calls it.
+// `devin_hooks_manage`, `antigravity_hooks_manage`); nothing outside the
+// crate calls it.
 mod agent_hook_config;
 pub mod agent_notice;
 pub mod agent_pty;
 pub mod agent_registry;
+// PRD #211: the Antigravity CLI's hook installer.
+pub mod antigravity_hooks_manage;
 pub mod attach_recovery;
 pub mod authoring_seeds;
 pub mod bounded_read;

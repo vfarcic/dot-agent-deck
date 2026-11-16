@@ -710,6 +710,12 @@ fn devin_install() -> Result<(), String> {
 fn devin_uninstall() -> Result<(), String> {
     crate::devin_hooks_manage::uninstall()
 }
+fn antigravity_install() -> Result<(), String> {
+    crate::antigravity_hooks_manage::install()
+}
+fn antigravity_uninstall() -> Result<(), String> {
+    crate::antigravity_hooks_manage::uninstall()
+}
 /// PRD #20 §4.2.1: `dot-agent-deck hooks install --agent codex` — write the deck's
 /// `hooks.json` into the active Codex home and record scoped, hash-pinned trust
 /// for exactly those entries. The trust step is best-effort (it needs `codex` on
@@ -1283,9 +1289,10 @@ pub static DEVIN: AgentSpec = AgentSpec {
 /// to its terminal ([`AgentSpec::status_osc7501`]): no hook reports a
 /// permission prompt or an interrupted turn. The doorbell types into it under
 /// its measured screen profile ([`crate::doorbell_screen::ANTIGRAVITY_PROFILE`])
-/// once that status reads Idle. Its hook installer, refresh and question
-/// tables are wired by later PRD #211 tasks, so each is left at its inert
-/// default until then.
+/// once that status reads Idle. Its hook installer
+/// ([`crate::antigravity_hooks_manage`]) owns one named hook in `agy`'s global
+/// `~/.gemini/config/hooks.json`. Its question tables are wired by a later
+/// PRD #211 task, so they are left at their inert default until then.
 pub static ANTIGRAVITY: AgentSpec = AgentSpec {
     agent_type: AgentType::Antigravity,
     label: "Antigravity",
@@ -1296,14 +1303,12 @@ pub static ANTIGRAVITY: AgentSpec = AgentSpec {
     // (LightGreen), Pi (LightCyan), Codex (LightYellow) or Devin (LightBlue),
     // and never the neutral DarkGray reserved for the "No agent" placeholder.
     badge_color: Color::LightRed,
-    // PRD #211: wired in a later task.
-    hook_install: None,
-    hook_uninstall: None,
+    hook_install: Some(antigravity_install),
+    hook_uninstall: Some(antigravity_uninstall),
     materialize: None,
-    // PRD #211: wired in a later task.
-    startup_auto_install: None,
-    configured_pins: None,
-    refresh_install: None,
+    startup_auto_install: Some(crate::antigravity_hooks_manage::auto_install),
+    configured_pins: Some(crate::antigravity_hooks_manage::configured_pins),
+    refresh_install: Some(crate::antigravity_hooks_manage::refresh_install),
     // PRD #211: wired in a later task (measured on 1.5.9: one ESC interrupts
     // a turn, Ctrl+U empties a one-line prompt, one DEL removes one
     // character; Ctrl+C quits on a second press, so it is never sent). The
@@ -1640,6 +1645,12 @@ mod tests {
             spec(&AgentType::Codex).startup_auto_install.is_some(),
             "Codex installs its native hooks + scoped trust at startup, \
              command-agnostically (PRD #20 §4.2.1)"
+        );
+        assert!(
+            spec(&AgentType::Antigravity).startup_auto_install.is_some()
+                && spec(&AgentType::Antigravity).hook_install.is_some()
+                && spec(&AgentType::Antigravity).hook_uninstall.is_some(),
+            "Antigravity installs its named global hook at startup and on request (PRD #211)"
         );
         assert!(
             spec(&AgentType::None).startup_auto_install.is_none(),
