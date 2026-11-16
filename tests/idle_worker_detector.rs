@@ -1122,7 +1122,7 @@ fn idle_worker_003_zero_disables_the_detector_from_either_source() {
         let after_env_zero = harness.wait_for_snapshot(|_| true, Duration::ZERO).await;
         assert!(
             !idle_mentions_role(&after_env_zero, "env-zero-worker"),
-            "the millisecond seam set to 0 must DISABLE the detector (no record, no timer), \
+            "the millisecond seam set to 0 must DISABLE the detector (no timer), \
              not fire immediately; snapshot = {after_env_zero:?}"
         );
 
@@ -3220,4 +3220,111 @@ async fn waiting_episodes_end_and_reopen(debounce: Duration) -> Result<(), Late>
         "exactly five waiting notices may reach the orchestrator; snapshot = {settled:?}"
     );
     Ok(())
+}
+
+/// The daemon-authored opening clause of `compose_worker_blocked_notice`
+/// (issue #714), spelled out rather than imported so a rewording fails here.
+const BLOCKED_NEEDLE: &str =
+    "delegated worker blocked by a provider usage limit (dot-agent-deck daemon report)";
+
+/// Issue #2230: `role`'s worker reports a provider usage limit through the
+/// daemon's real hook ingestion, tagged with its registry agent id.
+async fn report_quota_block(harness: &IdleHarness, role: &str) {
+    let agent_id = harness.worker_agent_ids[role].clone();
+    let mut event = worker_hook_event(
+        role,
+        &format!("session-{role}"),
+        "quota_blocked",
+        Some(&agent_id),
+    );
+    event
+        .metadata
+        .insert("quota_blocked_kind".to_string(), "usage_limit".to_string());
+    harness.ingest(event).await;
+}
+
+/// Issue #2230: wait until `role`'s worker has acknowledged its task, which is
+/// after the daemon bound the delegation to that worker.
+async fn wait_for_task_acknowledged(harness: &IdleHarness, role: &str) {
+    let pane = worker_pane(role);
+    let agent = harness.worker_agent_ids[role].clone();
+    let deadline = tokio::time::Instant::now() + common::child_boot_budget();
+    while !task_acknowledged_by(&harness.registry, &pane, &agent) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{role}'s worker never acknowledged its task"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Every blocked-worker notice in `inbox` that names `role`'s worker pane.
+fn blocked_notices_for(inbox: &str, role: &str) -> usize {
+    let pane = worker_pane(role);
+    inbox
+        .split(['\r', '\n'])
+        .filter(|line| line.contains(BLOCKED_NEEDLE) && line.contains(&pane))
+        .count()
+}
+
+/// Scenario: In an orchestration whose config sets `worker_response_timeout_minutes = 0`, delegate to one worker with the millisecond seam unset and to another with the seam at `0`; each acknowledges its task and then reports a provider usage limit (`quota_blocked`) through the daemon's real hook ingestion. The orchestrator's inbox must receive one blocked-worker notice for each, and no idle-worker prompt for either, so turning the idle report off leaves the blocked report on.
+#[spec("scheduler/idle-worker/033")]
+#[test]
+fn idle_worker_033_the_blocked_report_survives_a_disabled_idle_timeout() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _env = EnvGuard::set(None);
+    runtime().block_on(async {
+        let roles = ["file-zero-worker", "env-zero-worker"];
+        let harness = IdleHarness::new(
+            &roles,
+            Some("worker_response_timeout_minutes = 0\n\n[[orchestrations]]\nname = \"unused\"\nroles = []\n"),
+        )
+        .await;
+        for role in roles {
+            harness.manage_worker_pane(role).await;
+            harness.worker_event(role, "session_start").await;
+        }
+
+        // The config's own `0`, with the millisecond seam unset.
+        harness.delegate(&["file-zero-worker"]).await;
+        wait_for_task_acknowledged(&harness, "file-zero-worker").await;
+        report_quota_block(&harness, "file-zero-worker").await;
+        let inbox = harness
+            .wait_for_snapshot(
+                |inbox| blocked_notices_for(inbox, "file-zero-worker") >= 1,
+                common::child_boot_budget(),
+            )
+            .await;
+        assert_eq!(
+            blocked_notices_for(&inbox, "file-zero-worker"),
+            1,
+            "worker_response_timeout_minutes = 0 must not silence the blocked-worker report; \
+             inbox = {inbox:?}"
+        );
+
+        // The millisecond seam at `0`, through `env_override` because this
+        // runtime's threads are live (issue #1516).
+        let _timeout = env_override::override_for_tests(TIMEOUT_ENV, Some("0"));
+        harness.delegate(&["env-zero-worker"]).await;
+        wait_for_task_acknowledged(&harness, "env-zero-worker").await;
+        report_quota_block(&harness, "env-zero-worker").await;
+        let inbox = harness
+            .wait_for_snapshot(
+                |inbox| blocked_notices_for(inbox, "env-zero-worker") >= 1,
+                common::child_boot_budget(),
+            )
+            .await;
+        assert_eq!(
+            blocked_notices_for(&inbox, "env-zero-worker"),
+            1,
+            "{TIMEOUT_ENV}=0 must not silence the blocked-worker report; inbox = {inbox:?}"
+        );
+
+        // The idle report stays off: no watch ran for either delegation.
+        assert_eq!(
+            idle_count(&inbox),
+            0,
+            "a disabled timeout must still produce no idle-worker prompt; inbox = {inbox:?}"
+        );
+    });
 }

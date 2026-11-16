@@ -260,7 +260,7 @@ describe("AddDaemonDialog", () => {
       </SettingsBridgeProvider>,
     );
     fireEvent.change(screen.getByLabelText("Host"), { target: { value: "build-box" } });
-    fireEvent.change(screen.getByLabelText("Deck name"), { target: { value: "build" } });
+    fireEvent.change(screen.getByLabelText("Daemon name"), { target: { value: "build" } });
     await act(async () => { answer(null); await Promise.resolve(); });
     fireEvent.click(screen.getByTestId("add-daemon-save"));
     expect(checkDeckName).toHaveBeenCalledTimes(2);

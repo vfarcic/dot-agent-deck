@@ -3634,7 +3634,7 @@ describe("desktop settings (PRD 803)", () => {
     };
     invoke.mockImplementation(async (command: string) => {
       if (command === "desktop_rename_deck") {
-        throw { message: "That deck changed since this window loaded it.", written: disk };
+        throw { message: "That daemon changed since this window loaded it.", written: disk };
       }
       return { ok: true };
     });
@@ -3643,7 +3643,7 @@ describe("desktop settings (PRD 803)", () => {
     const cause = await bridge.renameDeck(deck, "production").catch((error: unknown) => error);
     expect(invoke).toHaveBeenCalledWith("desktop_rename_deck", { deck, name: "production" });
     expect(cause).toBeInstanceOf(PartialSettingsSaveError);
-    expect((cause as InstanceType<typeof PartialSettingsSaveError>).message).toBe("That deck changed since this window loaded it.");
+    expect((cause as InstanceType<typeof PartialSettingsSaveError>).message).toBe("That daemon changed since this window loaded it.");
     expect((cause as InstanceType<typeof PartialSettingsSaveError>).written.endpoints?.remote).toEqual(disk.endpoints.remote);
     await bridge.dispose();
   });
