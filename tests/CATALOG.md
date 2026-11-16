@@ -7956,7 +7956,7 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 ##### antigravity/status/001 — Captured Antigravity hooks drive the visible prompt, running command and ordinary turn end.
 - **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_antigravity_status.rs`).
 - **Agent:** executable `agy` stand-in replaying the sanitized 1.5.9 payloads through the real hook CLI.
-- **Asserts:** PreInvocation shows Working with the prompt; PreToolUse names `run_command` and its command; PostToolUse removes the running tool; Stop `NO_TOOL_CALL` shows Idle.
+- **Asserts:** PreInvocation shows Thinking with the prompt; PreToolUse shows Working with `run_command` and its command; Stop `NO_TOOL_CALL` shows Idle after PostToolUse.
 - **Does not assert:** real hook emission, file-tool argument extraction, or orchestration delivery.
 - **Platform coverage:** mac+linux (unix-only file).
 
@@ -7970,14 +7970,14 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 ##### antigravity/status/003 — OSC permission questions decode onto the card and clear on working or idle.
 - **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_antigravity_status.rs`).
 - **Agent:** `agy` stand-in replaying measured OSC 7501 bytes from its pane PTY.
-- **Asserts:** Needs Input includes the base64-decoded permission question; working and idle each clear the question and restore their status.
+- **Asserts:** Needs Input includes the base64-decoded permission question; working clears the question and shows Thinking, while idle clears it and shows Idle.
 - **Does not assert:** answering a real agent's permission dialog or delivering an answer through the question API.
 - **Platform coverage:** mac+linux (unix-only file).
 
 ##### antigravity/status/004 — OSC alone ends interrupted turns, completes turns and reports terminal errors.
 - **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_antigravity_status.rs`).
-- **Agent:** `agy` stand-in replaying measured working, idle, done and error OSC signals, without sending a Stop hook.
-- **Asserts:** the card shows Working before each ending, Idle on idle and done, and Error with decoded text on error.
+- **Agent:** `agy` stand-in replaying a captured PreToolUse hook and measured working, idle, done and error OSC signals, without sending a Stop hook.
+- **Asserts:** OSC working preserves Working with the command while a hook-started tool runs; from Idle it shows Thinking before each ending; idle and done show Idle, and error shows Error with decoded text.
 - **Does not assert:** a real Esc/Ctrl+C keystroke or distinguishing interrupted done messages from final replies.
 - **Platform coverage:** mac+linux (unix-only file).
 

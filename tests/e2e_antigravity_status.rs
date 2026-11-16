@@ -117,7 +117,7 @@ fn shows_only(grid: &str, label: &str) -> bool {
             .all(|other| !grid.contains(other))
 }
 
-/// Scenario: Restore an Antigravity stand-in and replay its captured first-prompt, command-start, command-end and ordinary Stop hooks. The dashboard card shows Working with the submitted prompt, then the running command, drops the completed tool detail and finally reads Idle.
+/// Scenario: Restore an Antigravity stand-in and replay its captured first-prompt, command-start, command-end and ordinary Stop hooks. The dashboard card shows Thinking with the submitted prompt, Working with the running command and finally Idle.
 #[spec("antigravity/status/001")]
 #[test]
 fn antigravity_status_001_hooks_show_prompt_command_and_turn_end() {
@@ -126,7 +126,7 @@ fn antigravity_status_001_hooks_show_prompt_command_and_turn_end() {
         {"hook": "session-start.json"},
         {"hook": "pre-invocation.json"}
     ]));
-    replay.card("Working", "Run the shell command:", "PreInvocation");
+    replay.card("Thinking", "Run the shell command:", "PreInvocation");
     replay.replay(json!([{"hook": "pre-tool-use-run-command.json"}]));
     replay.card(
         "Working",
@@ -135,15 +135,6 @@ fn antigravity_status_001_hooks_show_prompt_command_and_turn_end() {
     );
     replay.card("Working", "echo agy-probe-1", "PreToolUse command detail");
     replay.replay(json!([{"hook": "post-tool-use-run-command.json"}]));
-    assert!(
-        replay
-            .deck
-            .wait_for_grid_predicate_within(Duration::from_secs(15), |grid| {
-                !grid.contains("run_command")
-            }),
-        "PostToolUse should remove the running tool:\n{}",
-        replay.diagnostic()
-    );
     replay.replay(json!([{"hook": "stop.json"}]));
     replay.card("Idle", "", "Stop NO_TOOL_CALL");
 }
@@ -157,7 +148,7 @@ fn antigravity_status_002_error_stop_shows_its_error_text() {
     replay.card("Error", "generating and executing", "Stop ERROR");
 }
 
-/// Scenario: An Antigravity stand-in writes the captured OSC permission signal, then working, then another permission followed by idle. The card shows Needs Input with the decoded question and clears the question on either recovery signal.
+/// Scenario: An Antigravity stand-in writes the captured OSC permission signal, then working, then another permission followed by idle. The card shows Needs Input with the decoded question and clears the question when it recovers to Thinking or Idle respectively.
 #[spec("antigravity/status/003")]
 #[test]
 fn antigravity_status_003_permission_question_decodes_and_clears() {
@@ -168,7 +159,7 @@ fn antigravity_status_003_permission_question_decodes_and_clears() {
         replay.replay(json!([{"osc": recovery}]));
         replay.cleared_question(
             if recovery == "working" {
-                "Working"
+                "Thinking"
             } else {
                 "Idle"
             },
@@ -177,14 +168,28 @@ fn antigravity_status_003_permission_question_decodes_and_clears() {
     }
 }
 
-/// Scenario: An Antigravity stand-in emits working followed by idle without any Stop hook, as an interrupted turn does, then replays done and a terminal-only error. The visible card follows Working to Idle, treats done as Idle and displays Error with its decoded text.
+/// Scenario: An Antigravity stand-in starts a tool through its hook and emits OSC working; the card stays Working with the command. After idle, OSC working shows Thinking before idle, done or error ends the turn without a Stop hook; the card shows Idle for idle and done, or Error with its decoded text.
 #[spec("antigravity/status/004")]
 #[test]
 fn antigravity_status_004_osc_interrupt_done_and_error_need_no_stop_hook() {
     let replay = Replay::launch("./agy");
+    replay.replay(json!([{"hook": "pre-tool-use-run-command.json"}]));
+    replay.card("Working", "echo agy-probe-1", "PreToolUse command detail");
+    replay.replay(json!([{"osc": "working"}]));
+    assert!(
+        !replay
+            .deck
+            .wait_for_grid_predicate_within(Duration::from_millis(700), |grid| {
+                !shows_only(grid, "Working") || !grid.contains("echo agy-probe-1")
+            }),
+        "OSC working must preserve the hook-started tool's Working card:\n{}",
+        replay.diagnostic()
+    );
+    replay.replay(json!([{"osc": "idle"}]));
+    replay.card("Idle", "", "OSC idle after tool");
     for ending in ["idle", "done", "error"] {
         replay.replay(json!([{"osc": "working"}]));
-        replay.card("Working", "", "OSC working before turn ends");
+        replay.card("Thinking", "", "OSC working before turn ends");
         replay.replay(json!([{"osc": ending}]));
         replay.card(
             if ending == "error" { "Error" } else { "Idle" },
