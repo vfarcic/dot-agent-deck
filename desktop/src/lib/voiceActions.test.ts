@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { approvedProjectTrust } from "../test/projectTrust";
 import { agentDomKey } from "../components/AgentOverview";
 import { createFixtureSnapshot } from "../data/fixture";
-import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, type DesktopSettingsDto, type VoiceResultDto, type VoiceStatusDto } from "./bridge";
+import { DEFAULT_DESKTOP_SETTINGS, DEFAULT_VOICE_SETTINGS, fixtureDesktopFeatures, type DesktopSettingsDto, type VoiceResultDto, type VoiceStatusDto } from "./bridge";
 import type { DeckActionResult, DeckRuntimeState } from "../types";
 
 type RegistryEntry = {
@@ -321,6 +321,111 @@ describe("VOICE_ACTIONS", () => {
       expect(screen.queryByRole("alertdialog", { name: "Generate .dot-agent-deck.toml" })).not.toBeInTheDocument();
       expect(notice.closest("[inert], [aria-hidden='true']")).toBeNull();
     });
+  });
+
+  /// Scenario: Send from an agent pane, dismiss the pending question with No, and send again. The newer success stays visible when the older request subsequently fails.
+  it("desktop/config-gen/002: the latest pane result survives an older failure", async () => {
+    type GenerationResult = Awaited<ReturnType<NonNullable<DeckRuntimeState["generateConfig"]>>>;
+    const pending: Array<(result: GenerationResult) => void> = [];
+    const generateConfig = vi.fn(() => new Promise<GenerationResult>((resolve) => { pending.push(resolve); }));
+    const deck = runtime({ snapshot: generationSnapshot(), generateConfig });
+    render(createElement(DeckShell, { runtime: deck, initialView: { kind: "overview" } }));
+    fireEvent.click(screen.getAllByRole("button", { name: /^Open .* agent$/ })[0]);
+    const open = () => fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByRole("button", { name: /Generate config/i }));
+    open();
+    fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Yes" }));
+    fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "No" }));
+    open();
+    fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Yes" }));
+    expect(generateConfig).toHaveBeenCalledTimes(2);
+    const sent = "Config request sent to the agent's inbox.";
+    const failed = "Failed to send config prompt: older request failed";
+    await act(async () => pending[1]({ outcome: "sent", message: sent, messageId: "m-new" }));
+    expect(within(screen.getByTestId("agent-pane-overlay")).getByText(sent)).toBeVisible();
+    await act(async () => pending[0]({ outcome: "failed", message: failed }));
+
+    const pane = within(screen.getByTestId("agent-pane-overlay"));
+    expect(pane.queryByText(failed)).not.toBeInTheDocument();
+    expect(pane.getByText(sent)).toBeVisible();
+  });
+
+  /// Scenario: Start a request from the pane or dashboard and dismiss its pending question, then reopen the same agent ID after its daemon restarts. A late success for the old incarnation must not appear in the successor's pane.
+  it.each(["pane", "overview"] as const)("desktop/config-gen/002: a late %s notice cannot belong to a reused agent ID", async (entry) => {
+    type GenerationResult = Awaited<ReturnType<NonNullable<DeckRuntimeState["generateConfig"]>>>;
+    let settle!: (result: GenerationResult) => void;
+    const generateConfig = vi.fn(() => new Promise<GenerationResult>((resolve) => { settle = resolve; }));
+    const snapshot = generationSnapshot();
+    const deck = runtime({ snapshot, generateConfig });
+    const view = render(createElement(DeckShell, { runtime: deck, initialView: { kind: "overview" } }));
+    if (entry === "pane") fireEvent.click(screen.getAllByRole("button", { name: /^Open .* agent$/ })[0]);
+    const surface = entry === "pane" ? within(screen.getByTestId("agent-pane-overlay")) : screen;
+    fireEvent.click(surface.getAllByRole("button", { name: /Generate config/i })[0]);
+    fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Yes" }));
+    fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "No" }));
+    if (entry === "pane") {
+      fireEvent.keyDown(document.body, { key: "Escape" });
+      await waitFor(() => expect(screen.queryByTestId("agent-pane-overlay")).toBeNull());
+    }
+    const successor = { ...snapshot, agents: snapshot.agents.map((agent) => ({ ...agent, incarnation: "successor-process" })) };
+    const successorRuntime = { ...deck, snapshot: successor, fleet: [successor] };
+    view.rerender(createElement(DeckShell, { runtime: successorRuntime, initialView: { kind: "overview" } }));
+    fireEvent.click(screen.getAllByRole("button", { name: /^Open .* agent$/ })[0]);
+    expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
+    expect(generateConfig).toHaveBeenCalledExactlyOnceWith(snapshot.connection.deckId, snapshot.agents[0].id, snapshot.agents[0].paneId, "config-fixture-process");
+    const sent = "Config request sent to the agent's inbox.";
+    await act(async () => settle({ outcome: "sent", message: sent, messageId: "m-predecessor" }));
+
+    expect(within(screen.getByTestId("agent-pane-overlay")).queryByText(sent)).not.toBeInTheDocument();
+  });
+
+  /// Scenario: While viewing one agent, say generate config for another agent still on the dashboard. The pane explains how to generate for the agent on screen, without opening a confirmation or sending anything.
+  it("desktop/config-gen/003: a named other agent in a pane gets stop-style guidance", async () => {
+    const said = "generate config with filter-voice-agent-2";
+    const snapshot = generationSnapshot();
+    const { deck, resolveVoice } = renderDashboardVoice(said, "overview", {
+      kind: "dispatch", transcript: said, action: "generate_config", invoke: "confirmGenerateConfig",
+      params: [{ name: "agent", kind: "agent_ref", spoken: "filter-voice-agent-2", value: snapshot.agents[1].id, label: "filter-voice-agent-2" }],
+      sentence: "Confirm generating config — nothing has been sent yet.",
+    });
+    fireEvent.click(screen.getAllByRole("button", { name: /^Open .* agent$/ })[0]);
+    await speakDashboardCommand(resolveVoice);
+
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(deck.generateConfig).not.toHaveBeenCalled();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("To generate config for this agent, say 'generate config' or press Generate config.");
+    expect(screen.queryByText("That agent is not on the dashboard any more, so nothing was sent.")).not.toBeInTheDocument();
+  });
+
+  /// Scenario: With on-screen names withheld, a bare generate config dispatch has no agent parameter. It opens the viewed agent's neutral confirmation, and Yes sends only to that pane's captured process.
+  it("desktop/config-gen/003: a nameless pane dispatch confirms the viewed agent", async () => {
+    const privateSettings: DesktopSettingsDto = { ...DEFAULT_DESKTOP_SETTINGS, voice: { ...DEFAULT_VOICE_SETTINGS, labels: "withheld" } };
+    const { deck, resolveVoice } = renderDashboardVoice("generate config", "overview", {
+      kind: "dispatch", transcript: "generate config", action: "generate_config", invoke: "confirmGenerateConfig", params: [],
+      sentence: "Confirm generating config — nothing has been sent yet.",
+    }, { getSettings: vi.fn(async () => ({ settings: privateSettings })) });
+    fireEvent.click(screen.getAllByRole("button", { name: /^Open .* agent$/ })[0]);
+    await speakDashboardCommand(resolveVoice);
+    const dialog = screen.getByRole("alertdialog", { name: "Generate .dot-agent-deck.toml" });
+    expect(deck.generateConfig).not.toHaveBeenCalled();
+    await act(async () => fireEvent.click(within(dialog).getByRole("button", { name: "Yes" })));
+    const agent = deck.snapshot.agents[0];
+    expect(deck.generateConfig).toHaveBeenCalledExactlyOnceWith(deck.snapshot.connection.deckId, agent.id, agent.paneId, agent.incarnation);
+    expect(within(screen.getByTestId("agent-pane-overlay")).getByText("Config request sent to the agent's inbox.")).toBeVisible();
+  });
+
+  /// Scenario: A delayed voice answer names an agent that has left the dashboard. The existing gone-agent sentence remains visible, and no confirmation or request is sent.
+  it("desktop/config-gen/003: a truly gone dashboard target keeps the gone refusal", async () => {
+    const said = "generate config with the removed agent";
+    const { deck, resolveVoice } = renderDashboardVoice(said, "overview", {
+      kind: "dispatch", transcript: said, action: "generate_config", invoke: "confirmGenerateConfig",
+      params: [{ name: "agent", kind: "agent_ref", spoken: "removed agent", value: "removed-agent", label: "removed agent" }],
+      sentence: "Confirm generating config — nothing has been sent yet.",
+    });
+    await speakDashboardCommand(resolveVoice);
+
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("That agent is not on the dashboard any more, so nothing was sent.");
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(deck.generateConfig).not.toHaveBeenCalled();
   });
 
   /// Scenario: Confirm a config request from the dashboard, dismiss its busy question with No, and open another agent. A late successful send must keep that second pane visible.

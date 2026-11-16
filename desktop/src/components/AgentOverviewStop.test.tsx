@@ -67,6 +67,26 @@ describe("desktop/config-gen/002: generating configuration from an agent", () =>
     return { generateConfig, rt: { ...runtime(vi.fn()), generateConfig } };
   };
 
+  /// Scenario: Send a config request, dismiss its pending question with No, and send again for the same agent. The second request succeeds before the first fails, and its success notice must stay visible.
+  it("keeps the latest overview result when an older request fails late", async () => {
+    const pending: Array<(result: GenerationResult) => void> = [];
+    const generateConfig = vi.fn(() => new Promise<GenerationResult>((resolve) => { pending.push(resolve); }));
+    render(<AgentOverview runtime={{ ...runtime(vi.fn()), generateConfig }} onNavigate={vi.fn()} />);
+    open();
+    fireEvent.click(within(confirmation()!).getByRole("button", { name: "Yes" }));
+    fireEvent.click(within(confirmation()!).getByRole("button", { name: "No" }));
+    open();
+    fireEvent.click(within(confirmation()!).getByRole("button", { name: "Yes" }));
+    expect(generateConfig).toHaveBeenCalledTimes(2);
+
+    await act(async () => pending[1]({ outcome: "sent", message: sent, messageId: "m-new" }));
+    expect(screen.getByText(sent)).toBeVisible();
+    await act(async () => pending[0]({ outcome: "failed", message: failed }));
+
+    expect(screen.queryByText(failed)).not.toBeInTheDocument();
+    expect(screen.getByText(sent)).toBeVisible();
+  });
+
   /** Scenario: Ask the remote planner to generate a project config. The neutral confirmation uses the TUI's title and explanation and only Yes/No; No closes it without sending or opening the agent. */
   it("offers a neutral Yes/No confirmation and No sends nothing", () => {
     const { rt, generateConfig } = generation();

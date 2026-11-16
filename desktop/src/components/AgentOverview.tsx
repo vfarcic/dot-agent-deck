@@ -933,13 +933,27 @@ export const GENERATE_BEHIND_NEW_AGENT = "The New agent dialog is open — close
 /** Prefix of the failure sentence, the TUI's (`daemon_client::CONFIG_GEN_FAILED_PREFIX`), for a request the app itself could not hand over. */
 const GENERATE_CONFIG_FAILED_PREFIX = "Failed to send config prompt";
 
+/** The pane-side reply to a voice request, in a pane, that names an agent other than the one shown. */
+export const GENERATE_FOR_THIS_AGENT = "To generate config for this agent, say 'generate config' or press Generate config.";
+
+/**
+ * PR #2362 review — the latest Generate config attempt per agent (deck and id),
+ * shared by the dashboard row and the pane because both report into the same
+ * pane notice. Each Yes takes the next token for its agent, and only the
+ * attempt still holding the latest one is reported: an older request that
+ * settles after a newer one cannot overwrite the newer result.
+ */
+const latestGeneration = new Map<string, number>();
+
 /**
  * PRD #2119 — the Generate config confirmation shared by the dashboard row and
  * the agent's pane. The binding — deck, agent, pane and the daemon process that
  * listed it — is captured HERE, when the question opens, so a Yes pressed after
  * the row refreshed from a successor process still names the agent the user was
  * asked about, and the daemon refuses it if that process is gone. `onAnswer`
- * hears every outcome, a failure to reach the app's backend included.
+ * hears every outcome of the latest attempt for that agent, a failure to reach
+ * the app's backend included; an attempt superseded by a newer Yes for the same
+ * agent is not reported.
  */
 export function generateConfigConfirmation(agent: Pick<OverviewAgent, "daemonId" | "id" | "paneId" | "incarnation">, paneId: string, generateConfig: NonNullable<DeckRuntimeState["generateConfig"]>, onAnswer: (result: GenerateConfigResult) => void): ConfirmState {
   const { daemonId, id, incarnation } = agent;
@@ -951,13 +965,16 @@ export function generateConfigConfirmation(agent: Pick<OverviewAgent, "daemonId"
     cancelLabel: "No",
     neutral: true,
     action: async () => {
+      const key = `${daemonId}\u0000${id}`;
+      const attempt = (latestGeneration.get(key) ?? 0) + 1;
+      latestGeneration.set(key, attempt);
       let result: GenerateConfigResult;
       try {
         result = await generateConfig(daemonId, id, paneId, incarnation);
       } catch (cause) {
         result = { outcome: "failed", message: `${GENERATE_CONFIG_FAILED_PREFIX}: ${cause instanceof Error ? cause.message : String(cause)}` };
       }
-      onAnswer(result);
+      if (latestGeneration.get(key) === attempt) onAnswer(result);
     },
   };
 }
@@ -1001,7 +1018,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
    * screen shows the sentence there, where it is not behind the pane; without
    * this prop the sentence is shown on this screen.
    */
-  onConfigRequestSent?: (target: { deckId: string; agentId: string }, message: string) => void;
+  onConfigRequestSent?: (target: { deckId: string; agentId: string; incarnation?: string }, message: string) => void;
   settings?: DesktopSettingsState;
   onNavigate: (view: DeckView) => void;
   /**
@@ -1260,7 +1277,8 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       if (shownConfirm.current === question) {
         onNavigate({ kind: "agent", deckId: agent.daemonId, agentId: agent.id, from: "overview", ...(agent.incarnation ? { incarnation: agent.incarnation } : {}) });
       }
-      if (onConfigRequestSent) onConfigRequestSent({ deckId: agent.daemonId, agentId: agent.id }, result.message);
+      /* The process the question was asked about, so the pane shows it only for that incarnation. */
+      if (onConfigRequestSent) onConfigRequestSent({ deckId: agent.daemonId, agentId: agent.id, ...(agent.incarnation ? { incarnation: agent.incarnation } : {}) }, result.message);
       else setGenerationNotice(result.message);
     });
     setConfirm(question);

@@ -34,7 +34,7 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { AgentOverview, CONFIRMATION_ALREADY_OPEN, DASHBOARD_COVERED, GENERATE_CONFIG_NO_PANE, GENERATE_CONFIRMATION_ALREADY_OPEN, GENERATE_TARGET_GONE, GENERATE_TARGET_RESTARTED, generateConfigConfirmation, modalOpen, STOP_TARGET_GONE, STOP_TARGET_RESTARTED, stopAgentConfirmation, toOverviewAgent } from "./components/AgentOverview";
+import { AgentOverview, CONFIRMATION_ALREADY_OPEN, DASHBOARD_COVERED, GENERATE_CONFIG_NO_PANE, GENERATE_CONFIRMATION_ALREADY_OPEN, GENERATE_FOR_THIS_AGENT, GENERATE_TARGET_GONE, GENERATE_TARGET_RESTARTED, generateConfigConfirmation, modalOpen, STOP_TARGET_GONE, STOP_TARGET_RESTARTED, stopAgentConfirmation, toOverviewAgent } from "./components/AgentOverview";
 import { KEEP_WORKTREE_SUFFIX, worktreePreview, type WorktreeKeptEntry } from "./lib/worktreeClose";
 import { KeptWorktreeText } from "./components/KeptWorktreeText";
 import { NavigationRail, type RailContext } from "./components/NavigationRail";
@@ -388,8 +388,8 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   useEffect(() => {
     setAgentStopConfirm((current) => current?.ownerView === agentView ? current : undefined);
   }, [agentView]);
-  /** PRD #2119 — Generate config's outcome for one agent, shown in that agent's pane while it is open. */
-  const [paneConfigNotice, setPaneConfigNotice] = useState<{ deckId: string; agentId: string; message: string }>(); // voice-registry-exempt: the sentence reporting what a Generate config request did, shown in the pane
+  /** PRD #2119 — Generate config's outcome for one agent, shown in that agent's pane while it is open — and only for the process (incarnation) it was asked of. */
+  const [paneConfigNotice, setPaneConfigNotice] = useState<{ deckId: string; agentId: string; incarnation?: string; message: string }>(); // voice-registry-exempt: the sentence reporting what a Generate config request did, shown in the pane
   useEffect(() => {
     setPaneConfigNotice((current) => current && agentView && current.deckId === agentView.deckId && current.agentId === agentView.agentId ? current : undefined);
   }, [agentView]);
@@ -998,10 +998,17 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   const confirmPaneGenerate = useCallback((target: VoiceDispatchTarget): string | undefined => {
     if (confirmationOpen) return GENERATE_CONFIRMATION_ALREADY_OPEN;
     if (overlayAbove(document.querySelector(".agent-pane-overlay"))) return "Close what is open over the agent first. Nothing was sent.";
-    if (!agentView || !paneAgent || !paneDeckAttachable || !generateConfig || target.deckId !== agentView.deckId || target.agentId !== agentView.agentId) return GENERATE_TARGET_GONE;
+    if (!agentView || !paneAgent || !paneDeckAttachable || !generateConfig) return GENERATE_TARGET_GONE;
+    if (target.deckId !== agentView.deckId || target.agentId !== agentView.agentId) {
+      /* Another agent named in a pane: like a named stop there, it gets the
+         pane's own phrase rather than a confirmation for someone not on
+         screen. Only an agent truly gone keeps the gone refusal. */
+      const present = fleetNow.current.some((deck) => deck.connection.deckId === target.deckId && deck.agents.some((agent) => agent.id === target.agentId));
+      return present ? GENERATE_FOR_THIS_AGENT : GENERATE_TARGET_GONE;
+    }
     if ("incarnation" in target && !sameIncarnation(target.incarnation, paneAgent.incarnation)) return GENERATE_TARGET_RESTARTED;
     if (!paneAgent.paneId) return GENERATE_CONFIG_NO_PANE;
-    const subject = { deckId: agentView.deckId, agentId: agentView.agentId };
+    const subject = { deckId: agentView.deckId, agentId: agentView.agentId, ...(paneAgent.incarnation ? { incarnation: paneAgent.incarnation } : {}) };
     setPaneConfigNotice(undefined);
     const question = generateConfigConfirmation(toOverviewAgent(paneAgent), paneAgent.paneId, generateConfig, (result) => setPaneConfigNotice({ ...subject, message: result.message }));
     setAgentStopConfirm({ ...question, ownerView: agentView });
@@ -1013,10 +1020,10 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   } : undefined;
   const paneGenerateConfig = agentView ? {
     ...(agentGenerateContext ? { context: agentGenerateContext } : {}),
-    ...(paneConfigNotice && paneConfigNotice.deckId === agentView.deckId && paneConfigNotice.agentId === agentView.agentId ? { notice: paneConfigNotice.message } : {}),
+    ...(paneConfigNotice && paneAgent && paneConfigNotice.deckId === agentView.deckId && paneConfigNotice.agentId === agentView.agentId && sameIncarnation(paneConfigNotice.incarnation, paneAgent.incarnation) ? { notice: paneConfigNotice.message } : {}),
   } : undefined;
-  /* The overview's row sent the request and opened this agent's pane: say so in the pane. */
-  const configRequestSent = useCallback((target: { deckId: string; agentId: string }, message: string) => setPaneConfigNotice({ ...target, message }), []);
+  /* The overview's row sent the request and opened this agent's pane: say so in the pane, for the process it was sent to. */
+  const configRequestSent = useCallback((target: { deckId: string; agentId: string; incarnation?: string }, message: string) => setPaneConfigNotice({ ...target, message }), []);
 
   /**
    * PRD #1497 decisions 1–3 of 2026-10-09 — reading: the Settings switch, and

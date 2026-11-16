@@ -15664,15 +15664,15 @@ These desktop Rust and Vitest tests live outside the root Rust spec scanner, as 
 - **Layer:** Vitest, rendered React components with an injected runtime.
 - **Agent:** none.
 - **Tests:** `desktop/config-gen/002: …` in `desktop/src/components/AgentOverviewStop.test.tsx` and `desktop/src/lib/voiceActions.test.ts`.
-- **Asserts:** action on the overview row and open agent pane; TUI title and explanation; Yes/No only without destructive styling; No sends nothing; Yes preserves the captured binding, focuses the sent target and shows success; unsupported/failure show their shared text without claiming success; dismissing a pending generation and opening another agent preserves the user's navigation when success arrives late, both from the overview and from an already-open pane.
+- **Asserts:** action on the overview row and open agent pane; TUI title and explanation; Yes/No only without destructive styling; No sends nothing; Yes preserves the captured binding, focuses the sent target and shows success; unsupported/failure show their shared text without claiming success; dismissing a pending generation and opening another agent preserves the user's navigation when success arrives late, both from the overview and from an already-open pane; an older failure cannot overwrite a newer success on either entry path; a late result for an old incarnation cannot appear in a reused agent ID's successor pane.
 - **Does not assert:** Tauri transport (covered by desktop/config-gen/001), real agents or a TUI-style desktop command-key layer (none exists).
 - **Platform coverage:** mac+linux+windows.
 
 ##### desktop/config-gen/003 — Voice and clicking open the same Generate config confirmation.
-- **Layer:** fast-tier Rust voice-table test and Vitest shell/registry tests.
+- **Layer:** fast-tier Rust voice-table/outcome tests and Vitest shell/registry tests.
 - **Agent:** none (synthetic voice resolution).
-- **Tests:** `voice_table_config_gen_003_generation_is_agent_targeted_and_only_asks` in `desktop/src-tauri/src/voice/table.rs`; `desktop/config-gen/003: …` and the literal registry classification test in `desktop/src/lib/voiceActions.test.ts`.
-- **Asserts:** `generate_config` names `confirmGenerateConfig`, is agent-targeted on overview/agent screens and advertises “generate config”; the registry is voice-enabled; both the control and voice dispatch open the Yes/No confirmation without sending work.
+- **Tests:** `voice_table_config_gen_003_generation_is_agent_targeted_and_only_asks` in `desktop/src-tauri/src/voice/table.rs`; `voice_outcome_config_gen_003_named_pane_requests_give_stop_style_guidance` and `voice_outcome_config_gen_003_private_names_allow_only_the_viewed_agent` in `desktop/src-tauri/src/voice/outcome.rs`; `desktop/config-gen/003: …` and the literal registry classification test in `desktop/src/lib/voiceActions.test.ts`.
+- **Asserts:** `generate_config` names `confirmGenerateConfig`, is agent-targeted on overview/agent screens and advertises “generate config”; the registry is voice-enabled; both the control and voice dispatch open the Yes/No confirmation without sending work; naming another live agent in a pane gives stop-style guidance without confirming or sending; with names withheld, a bare pane request dispatches with no parameters and confirms the viewed process, while the dashboard still requires a target and explicit names cannot silently target the viewed agent.
 - **Does not assert:** real microphone capture, transcription or model intent classification.
 - **Platform coverage:** mac+linux+windows.
 
