@@ -1332,6 +1332,14 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 - **Does not assert:** automatic dialog opening or suppression behavior; the dialog is requested manually.
 - **Platform coverage:** mac+linux+windows.
 
+##### dashboard/config-gen/003 — A REAL interactive Haiku agent, asked from its card with `g` and Yes, proposes a config, waits for approval, and writes a `.dot-agent-deck.toml` that `validate` accepts (issue #2119, CLAUDE.md rule 4's real-usage bar).
+- **Layer:** L2 PTY-attached, lane 2 (the real `dot-agent-deck` binary in the vt100 `TuiDeck` harness with its lazy daemon). Runtime-skipped when the `claude` CLI or credentials are absent; `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1` turns that skip into a failure. Runs on a developer's machine and nowhere in CI (CLAUDE.md rule 5).
+- **Agent:** one REAL interactive Claude Code pane pinned to Haiku (`claude --model claude-haiku-4-5-20251001 --allowedTools Bash Read Write Edit Glob Grep`, no `-p`), started over the attach socket (`StartAgent`) in the `config-gen-live` fixture, a two-file project (Makefile and README) with no `.dot-agent-deck.toml` whose only agent launcher is the uniquely named Makefile target `deck-agent-7f3a2c`. Credentials imported into the per-test HOME; `with_claude_trust_workdir()` pre-trusts the work dir.
+- **Asserts:** with the agent's pane opened (`1`, then Ctrl+D back to command mode), pressing `g` on the selected card and Enter on Yes posts one `configuration request` message, bound to the agent, whose body is the daemon-composed `config_gen_prompt` for the agent's cwd; the agent acknowledges it and ends its turn without writing the file (the prompt's present-then-wait step); Yes leaves the TUI typing into the agent's pane, and the approval typed there leads to a `.dot-agent-deck.toml` with an `[[orchestrations]]` table that the real `dot-agent-deck validate` accepts; the agent named `deck-agent-7f3a2c` in its proposal or in the file.
+- **Test:** `config_gen_003_a_real_agent_generates_a_valid_config_after_approval` in `tests/e2e_config_generation_live.rs`.
+- **Does not assert:** the exact roles or prose the model proposes; the message wire shape and the stand-in delivery (`inbox/route/007`); the verb and its capability gate (`daemon/config-gen/*`); the upgrade message on an older daemon (`dashboard/config-gen/001`); the desktop's Generate affordance.
+- **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", feature = "e2e-live", unix))]` — the attach helpers it drives are Unix-domain-socket only).
+
 ### Statuses
 
 #### status/transition

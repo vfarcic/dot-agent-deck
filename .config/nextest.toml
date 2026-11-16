@@ -300,6 +300,16 @@ slow-timeout = { period = "60s", terminate-after = 40 }
 filter = 'test(codex_hooks_001_real_interactive_turn_reaches_idle_without_exit)'
 slow-timeout = { period = "60s", terminate-after = 8 }
 
+# Issue #2119: `dashboard/config-gen/003` drives a real interactive Haiku through
+# boot (bounded at 180s), a project-analysis turn and a write turn (each bounded
+# at 300s), so its phase bounds sum past the default 3 x 60s window, and being
+# killed there loses the failure message naming the phase that was slow.
+# 14 x 60s matches the deck lifetime the test sets (840s). Scoped by name; still
+# bounded. The filter tracks the test function name: update it with any rename.
+[[profile.default.overrides]]
+filter = 'test(config_gen_003_a_real_agent_generates_a_valid_config_after_approval)'
+slow-timeout = { period = "60s", terminate-after = 14 }
+
 # Issue #1381: the two real-OpenCode `clear = true` delegates in
 # `tests/e2e_delegate_respawn_readiness.rs` wait in phases whose own bounds sum
 # well past the default 3 x 60s kill window. Being killed there costs each
