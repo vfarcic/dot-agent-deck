@@ -620,6 +620,118 @@ impl OneShotInjection {
     }
 }
 
+/// Issue #2341: what Claude Code's prompt hook leaves to the transcript
+/// witness ([`crate::inbox_witness`]): where the transcript ended when the
+/// hook started, and the once-waiter attempts the prompt itself carries.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct Witness {
+    pub mark: crate::inbox_witness::TranscriptMark,
+    pub native: Vec<InboxAttemptRef>,
+    /// The prompt's shared receipts budget, for a commit made at once when
+    /// no witness can be started.
+    pub receipts_by: std::time::Instant,
+}
+
+#[cfg(unix)]
+impl Witness {
+    /// Start a witness for the prompt's own attempts, with no doorbell batch
+    /// of the hook's. If none could be started they are committed now, as a
+    /// hook with no transcript commits them. Nothing to do without any.
+    pub fn start_alone(self) {
+        if self.native.is_empty() {
+            return;
+        }
+        let plan = crate::inbox_witness::Plan {
+            transcript: self.mark,
+            within_ms: duration_ms(crate::inbox_witness::WITNESS_MAX),
+            batch: None,
+            cut: false,
+            degraded: None,
+            native: self.native.clone(),
+        };
+        if crate::inbox_witness::spawn(&plan, None).is_err() {
+            commit_exact(
+                self.native,
+                crate::event::InboxOneShotSender::ClaudeHooks,
+                self.receipts_by,
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+fn duration_ms(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(unix)]
+impl OneShotInjection {
+    /// Issue #2341: [`Self::print`] for Claude Code's prompt hook when the
+    /// session transcript can witness what Claude took. The blocks are
+    /// written as `print` writes them, but committed only by the witness this
+    /// starts, which takes over the hook's receipt connection; the prompt's
+    /// own once-waiter attempts go to the same witness. If no witness can be
+    /// started, what was written whole is committed at once, as `print`
+    /// commits it.
+    pub fn print_witnessed(self, witness: Witness) -> crate::inbox_oneshot::Ran {
+        self.print_witnessed_to(raw_stdout(), &pinned_spool(), witness)
+    }
+
+    fn print_witnessed_to(
+        mut self,
+        stdout: std::io::Result<std::fs::File>,
+        pinned: &crate::inbox_oneshot::Pinned,
+        witness: Witness,
+    ) -> crate::inbox_oneshot::Ran {
+        use crate::inbox_oneshot::Witnessed;
+        let Ok(mut stdout) = stdout else {
+            witness.start_alone();
+            return self
+                .batch
+                .decline(&mut self.connection, crate::inbox_oneshot::Receiver::Hook);
+        };
+        let texts: Vec<&str> = (0..self.batch.len())
+            .map(|i| self.batch.text(i).unwrap_or_default())
+            .collect();
+        let parts = self.envelope.parts(&self.framing, &texts);
+        let pieces = parts.pieces();
+        let pending = match self.batch.run_witnessed(
+            &mut self.connection,
+            pinned,
+            self.grant_ttl,
+            &mut stdout,
+            &pieces,
+        ) {
+            Witnessed::Reported(ran) => {
+                witness.start_alone();
+                return ran;
+            }
+            Witnessed::Pending(pending) => pending,
+        };
+        if let Ok((stream, cut)) = self.connection.hand_off() {
+            let plan = crate::inbox_witness::Plan {
+                transcript: witness.mark.clone(),
+                within_ms: duration_ms(crate::inbox_witness::window(self.grant_ttl)),
+                batch: Some(self.batch.deferred_report(&pending.outputs)),
+                cut,
+                degraded: pending.degraded.clone(),
+                native: witness.native.clone(),
+            };
+            if crate::inbox_witness::spawn(&plan, Some(stream)).is_ok() {
+                return pending.ran();
+            }
+            self.connection.take_back();
+        }
+        commit_exact(
+            witness.native,
+            crate::event::InboxOneShotSender::ClaudeHooks,
+            witness.receipts_by,
+        );
+        self.batch.commit_now(&mut self.connection, pinned, pending)
+    }
+}
+
 /// This process's stdout as the descriptor itself, with no buffer between a
 /// write and the pipe.
 #[cfg(unix)]
@@ -735,7 +847,19 @@ pub fn commit_delivered(
     sender: crate::event::InboxOneShotSender,
     receipts_by: std::time::Instant,
 ) {
-    let attempts = delivered(prompt);
+    commit_exact(delivered(prompt), sender, receipts_by);
+}
+
+/// Commit `attempts`, exact attempts the agent's context is known to carry,
+/// for this pane's agent ([`commit_attempts_by`]) by `receipts_by`: what
+/// [`commit_delivered`] does with a prompt's, and the transcript witness
+/// with those it found (issue #2341). Outside a deck pane or without a
+/// token nothing is sent.
+pub fn commit_exact(
+    attempts: Vec<InboxAttemptRef>,
+    sender: crate::event::InboxOneShotSender,
+    receipts_by: std::time::Instant,
+) {
     if attempts.is_empty() {
         return;
     }

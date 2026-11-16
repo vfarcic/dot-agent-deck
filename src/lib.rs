@@ -127,6 +127,7 @@ pub mod inbox_receipt;
 pub mod inbox_receiver;
 pub mod inbox_spills;
 pub mod inbox_watcher;
+pub mod inbox_witness;
 pub mod ingress_ledger;
 pub mod init;
 pub mod injected_prompt;
