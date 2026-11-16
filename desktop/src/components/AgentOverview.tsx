@@ -1482,9 +1482,17 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   const [confirm, setConfirm] = useState<ConfirmState>();
   /* The confirmation on screen as of the last render, read by an answer that
      arrives after it: a Generate config the user dismissed with No must not
-     take them to its agent when its request settles late. */
+     take them to its agent when its request settles late. `undefined` once
+     this screen is gone, as `ConfirmDialog`'s own `shown` is: a request still
+     pending when the user navigated away (voice "open daemons", say) must not
+     take them back, and a reopened dashboard is a new instance whose
+     confirmations are not this one's. */
   const shownConfirm = useRef<ConfirmState | undefined>(confirm);
   shownConfirm.current = confirm;
+  useEffect(() => {
+    shownConfirm.current = confirm;
+    return () => { shownConfirm.current = undefined; };
+  }, [confirm]);
   /** PRD #1487 M5 — the Upgrade dialog, for the deck whose card it was pressed on. */
   const [upgrade, setUpgrade] = useState<UpgradeTarget>();
   /** Issue #1753 — Upgrade on the Local daemon section: the CLI, the daemon, or both. */

@@ -122,7 +122,7 @@ function expectOneRegistryDispatch(actionId?: string) {
 
 // Exercise the actual shell, voice panel and registry. Only the microphone
 // and remote intent answer are synthetic, as in VoiceControlPanel.test.tsx.
-function renderDashboardVoice(said: string, initial: "deck" | "overview" = "overview", outcome?: VoiceResultDto["outcome"]) {
+function renderDashboardVoice(said: string, initial: "deck" | "overview" = "overview", outcome?: VoiceResultDto["outcome"], overrides: Partial<DeckRuntimeState> = {}) {
   let started = false;
   let delivered = false;
   const status = (state: VoiceStatusDto["state"]): VoiceStatusDto => ({
@@ -146,6 +146,7 @@ function renderDashboardVoice(said: string, initial: "deck" | "overview" = "over
     voiceStart: vi.fn(async () => { started = true; return status("recording"); }),
     voiceStop: vi.fn(async () => ({ outcome: { kind: "heard" as const, transcript: said, sentence: `Heard: ${said}.` }, transcribeMs: null, backend: "remote" as const, audioMs: 1240 })),
     voiceCancel: vi.fn(async () => status("idle")),
+    ...overrides,
   });
   render(createElement(DeckShell, { runtime: deck, initialView: { kind: initial } }));
   return { deck, resolveVoice };
@@ -342,6 +343,30 @@ describe("VOICE_ACTIONS", () => {
 
     expect(within(screen.getByTestId("agent-pane-overlay")).getByRole("heading")).toHaveTextContent(heading!);
     expect(generateConfig).toHaveBeenCalledTimes(1);
+  });
+
+  /// Scenario: Confirm a config request from the dashboard, then say open daemons while the request is pending. The dashboard and its question disappear, and a late successful send leaves the Daemons screen visible without reopening the agent.
+  it("desktop/config-gen/002: voice navigation survives an unmounted overview send", async () => {
+    let settle!: (result: { outcome: "sent"; messageId: string; message: string }) => void;
+    const generateConfig = vi.fn(() => new Promise<{ outcome: "sent"; messageId: string; message: string }>((resolve) => { settle = resolve; }));
+    const { resolveVoice } = renderDashboardVoice("open daemons", "overview", {
+      kind: "dispatch", transcript: "open daemons", action: "open_deck", invoke: "openDeck", params: [], sentence: "Opening daemons.",
+    }, { snapshot: generationSnapshot(), generateConfig });
+    fireEvent.click(screen.getAllByRole("button", { name: /Generate config/i })[0]);
+    fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Yes" }));
+    expect(generateConfig).toHaveBeenCalledTimes(1);
+
+    await speakDashboardCommand(resolveVoice);
+    await waitFor(() => expect(screen.getByTestId("agent-tile-planner")).toBeVisible());
+    expect(screen.queryByTestId("overview-table-region")).not.toBeInTheDocument();
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
+
+    await act(async () => settle({ outcome: "sent", messageId: "m-late", message: "Config request sent to the agent's inbox." }));
+
+    expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
+    expect(screen.getByTestId("agent-tile-planner")).toBeVisible();
+    expect(screen.queryByTestId("overview-table-region")).not.toBeInTheDocument();
   });
 
   /// Scenario: Start generation from an open agent pane, dismiss the busy question, close the pane, and open another agent. A late successful result leaves that second pane visible and does not show the first agent's result there.

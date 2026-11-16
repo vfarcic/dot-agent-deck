@@ -48,8 +48,11 @@ pub enum ClientError {
     SocketMissing(PathBuf),
     #[error("malformed daemon response: {0}")]
     Malformed(String),
-    /// PRD #1487: the daemon did not answer within the bound, before the
-    /// request itself was sent — see [`DaemonClient::restart_daemon`].
+    /// PRD #1487: the daemon did not answer within the bound. Whether the
+    /// request had reached it depends on the operation: for
+    /// [`DaemonClient::restart_daemon`] the bound runs out before the
+    /// request is sent, while config generation's bounds can run out after
+    /// the daemon received it.
     #[error("no answer from the daemon within {0:?}")]
     TimedOut(std::time::Duration),
     /// PRD #1487: the request was sent, or may have been, and then no answer
