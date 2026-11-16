@@ -542,21 +542,16 @@ fn claude_053_live_a_blocked_doorbell_prompt_is_not_acknowledged_and_is_handed_o
             .unwrap_or(Value::Null)
     };
     let sentinel = claude.deck.workdir().join(name);
-    let until = std::time::Instant::now() + Duration::from_secs(30);
-    while std::time::Instant::now() < until {
-        assert_ne!(
-            message()["state"],
-            "acknowledged",
-            "a blocked prompt must not acknowledge the task; {}",
-            claude.evidence()
-        );
-        assert!(
-            !sentinel.exists(),
-            "Haiku never saw the task; {}",
-            claude.evidence()
-        );
-        std::thread::sleep(Duration::from_millis(500));
-    }
+    // Longer than the witness watches: neither an acknowledgement nor the
+    // sentinel may appear while the blocked prompt is all Haiku was sent.
+    let leaked = common::wait_until(Duration::from_secs(30), || {
+        message()["state"] == "acknowledged" || sentinel.exists()
+    });
+    assert!(
+        !leaked,
+        "a blocked prompt must not acknowledge the task, and Haiku never saw it; {}",
+        claude.evidence()
+    );
     claude
         .deck
         .send_keys(b"Check for new messages and do what they say.");

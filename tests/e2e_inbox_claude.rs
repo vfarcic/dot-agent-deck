@@ -1462,15 +1462,16 @@ fn hook_context_entry(context: &str) -> Value {
 
 /// Issue #2341: `id` stays `expected` for all of `duration`.
 fn stays(daemon: &impl Endpoint, pane: &Pane, id: &str, expected: &str, duration: Duration) {
-    let until = std::time::Instant::now() + duration;
-    while std::time::Instant::now() < until {
-        let state = message_of(daemon, pane, id)["state"].to_string();
-        assert!(
-            state.to_ascii_lowercase().contains(expected),
-            "message {id} must stay {expected}, is {state}"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    let state = RefCell::new(String::new());
+    let left = common::wait_until(duration, || {
+        *state.borrow_mut() = message_of(daemon, pane, id)["state"].to_string();
+        !state.borrow().to_ascii_lowercase().contains(expected)
+    });
+    assert!(
+        !left,
+        "message {id} must stay {expected}, is {}",
+        state.borrow()
+    );
 }
 
 /// Scenario: Claude Code's hook payload names a session transcript that exists. The real prompt hook answers a doorbell with the task's block as before, but the task is not acknowledged by that write: it stays fetched until the transcript gains the hook's context as Claude records a prompt it took, and then it is acknowledged with one delivery. A second task's prompt is blocked: the transcript gains only the system entry Claude writes for a blocked prompt. That task is never acknowledged; once the witness gives up, the next doorbell hands it over again marked as a possible repeat, and the transcript recording that one acknowledges it, with two deliveries.
@@ -1530,13 +1531,11 @@ fn claude_051_a_doorbell_hook_commits_only_what_the_transcript_shows_claude_took
             tries.set(tries.get() + 1);
             let out = doorbell(&format!("again-{}", tries.get()), &blocked);
             let printed = out["stdout"].as_str().unwrap_or_default();
-            if printed.contains(&repeat_line) {
+            let handed = printed.contains(&repeat_line);
+            if handed {
                 *repeat.borrow_mut() = context(&out, "UserPromptSubmit");
-                true
-            } else {
-                std::thread::sleep(Duration::from_millis(500));
-                false
             }
+            handed
         }),
         "the blocked task is handed over again, marked"
     );
