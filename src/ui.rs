@@ -11369,7 +11369,7 @@ fn send_config_gen_prompt(
     // a restarted daemon's agent under the same pane id.
     let message = match pane.generate_config(card) {
         Ok(crate::daemon_client::GatedQuery::Answered(_)) => {
-            // Focus the pane so the user can watch the agent take it.
+            // Open and focus the pane so the user can watch the agent take it.
             if let Some(tab_idx) = tab_manager.tab_index_for_pane(pane_id) {
                 // PRD #83: snapshot the SOURCE tab's focus before leaving it,
                 // mirroring `switch_tab_with_focus` (capture-out → switch_to →
@@ -11384,8 +11384,30 @@ fn send_config_gen_prompt(
                 // PRD #84 M4: the destination tab's panes are sized by the
                 // pre-draw `resize_panes_to_layout` on the next frame.
             }
-            let _ = pane.focus_pane(pane_id);
-            ui.mode = UiMode::PaneInput;
+            // PRD #2119: a card whose pane is not open in this TUI — a
+            // daemon-spawned or foreign pane that never went through startup
+            // hydration — is attached first and the focus retried, exactly as
+            // `1` (`focus_deck`) and Enter (`Action::Focus`) open one, bound to
+            // the daemon process the card was learned from. PaneInput is
+            // entered only once a pane is focused: when none can be, the mode
+            // the caller left (the dashboard's) stands and the sent sentence
+            // is still shown, because the request WAS posted. Unlike those two
+            // paths, a pane that cannot be focused is never read as a stale
+            // card to delete — the daemon just accepted a request for it.
+            let mut focus = pane.focus_card(card);
+            if let Err(PaneError::CommandFailed(_)) = focus
+                && pane.try_hydrate_pane(card)
+            {
+                focus = pane.focus_card(card);
+            }
+            match focus {
+                Ok(()) => ui.mode = UiMode::PaneInput,
+                Err(error) => tracing::debug!(
+                    pane_id = %pane_id,
+                    error = %error,
+                    "config request sent, but its pane could not be opened here"
+                ),
+            }
             crate::config_gen::CONFIG_GEN_SENT_MESSAGE.to_string()
         }
         Ok(crate::daemon_client::GatedQuery::Unsupported) => {
@@ -37174,6 +37196,8 @@ mod tests {
         next: std::sync::Mutex<u32>,
         focused: std::sync::Mutex<Vec<String>>,
         closed: std::sync::Mutex<Vec<String>>,
+        config_requests: std::sync::Mutex<Vec<crate::pane::BoundPane>>,
+        posted_messages: std::sync::Mutex<Vec<String>>,
     }
     impl OpenTabPC {
         fn new() -> Self {
@@ -37181,10 +37205,31 @@ mod tests {
                 next: std::sync::Mutex::new(0),
                 focused: std::sync::Mutex::new(Vec::new()),
                 closed: std::sync::Mutex::new(Vec::new()),
+                config_requests: std::sync::Mutex::new(Vec::new()),
+                posted_messages: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
     impl crate::pane::PaneController for OpenTabPC {
+        fn generate_config(
+            &self,
+            card: &crate::pane::BoundPane,
+        ) -> Result<crate::daemon_client::GatedQuery<String>, PaneError> {
+            self.config_requests.lock().unwrap().push(card.clone());
+            Ok(crate::daemon_client::GatedQuery::Unsupported)
+        }
+
+        fn post_message(
+            &self,
+            _card: &crate::pane::BoundPane,
+            _subject: &str,
+            body: &str,
+            _origin: crate::inbox_hub::PostOrigin,
+        ) -> Result<String, PaneError> {
+            self.posted_messages.lock().unwrap().push(body.to_owned());
+            Ok("unexpected-fallback".into())
+        }
+
         fn create_pane(
             &self,
             _cmd: Option<&str>,
@@ -50030,6 +50075,72 @@ mod tests {
                 Some("s-first"),
                 "Enter targets the new agent"
             );
+        }
+    }
+
+    /// Scenario: Open Generate config for an agent on an older daemon and confirm Yes by mouse or keyboard. The status line explains that the daemon needs upgrading, nothing is posted through the generic inbox fallback, and the deck stays out of typing mode.
+    #[spec("dashboard/config-gen/001")]
+    #[test]
+    fn config_gen_001_older_daemon_shows_upgrade_without_posting_a_fallback() {
+        for keyboard in [false, true] {
+            let mut snapshot = AppState::default();
+            let incarnation =
+                crate::daemon_client::Incarnation::from(Some("listed-process".into()));
+            snapshot.learn_stream_incarnation(incarnation.clone());
+            let sid = snapshot.insert_placeholder_session_learned(
+                "selected-pane".into(),
+                None,
+                None,
+                Some("selected-agent".into()),
+                incarnation,
+            );
+            let state: SharedState = Arc::new(tokio::sync::RwLock::new(snapshot.clone()));
+            let pc = Arc::new(OpenTabPC::new());
+            let mut tab_manager = TabManager::new(pc.clone());
+            let mut ui = default_ui();
+            dispatch_action(
+                Action::RequestConfigGen,
+                &mut ui,
+                &*pc,
+                &state,
+                &mut tab_manager,
+                &snapshot,
+                &[],
+                Some(&sid),
+                Rect::new(0, 0, 180, 24),
+            );
+            assert_eq!(ui.mode, UiMode::ConfigGenPrompt);
+            let confirm = if keyboard {
+                handle_config_gen_prompt_key(
+                    KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    &mut ui,
+                )
+            } else {
+                Action::ConfigGenConfirm
+            };
+            dispatch_action(
+                confirm,
+                &mut ui,
+                &*pc,
+                &state,
+                &mut tab_manager,
+                &snapshot,
+                &[],
+                Some(&sid),
+                Rect::new(0, 0, 180, 24),
+            );
+            assert_eq!(
+                glossary_status_text(&ui),
+                Some(crate::config_gen::CONFIG_GEN_UPGRADE_MESSAGE)
+            );
+            assert!(glossary_status_row(&state, &mut ui).contains("Upgrade"));
+            assert_ne!(ui.mode, UiMode::PaneInput);
+            assert_eq!(pc.config_requests.lock().unwrap().len(), 1);
+            assert!(
+                pc.posted_messages.lock().unwrap().is_empty(),
+                "an older daemon must receive no locally composed fallback"
+            );
+            assert!(pc.focused.lock().unwrap().is_empty());
         }
     }
 

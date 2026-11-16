@@ -48,6 +48,7 @@ import type { HandoffEdge,
   EvidenceItem,
   HostMetricsReport,
   InboxActionResult,
+  GenerateConfigResult,
   InboxActionVerb,
   InboxAttentionItem,
   NewAgentOptions,
@@ -2376,6 +2377,13 @@ export interface DeckBridge {
    * answers `stale` to the second of two clients acting at once.
    */
   inboxAction?(target: AgentTarget, item: { paneId: string; messageId: string; revision: number }, verb: InboxActionVerb): Promise<InboxActionResult>;
+  /**
+   * PRD #2119 — Generate config (`desktop_generate_config`): the daemon that
+   * owns the agent posts the configuration request to its inbox, bound to the
+   * daemon process that listed it. Optional: a bridge without it offers no
+   * control.
+   */
+  generateConfig?(deckId: string, agentId: string, paneId: string, incarnation?: string): Promise<GenerateConfigResult>;
   dispose(): Promise<void>;
 }
 
@@ -3131,6 +3139,13 @@ class FixtureDeckBridge implements DeckBridge {
    */
   async inboxAction(): Promise<InboxActionResult> {
     return { outcome: "applied" };
+  }
+  /**
+   * PRD #2119: the preview answers Generate config as a daemon that posted the
+   * request would, with the sentence the app shows for it. Nothing is sent.
+   */
+  async generateConfig(): Promise<GenerateConfigResult> {
+    return { outcome: "sent", messageId: "m-fixture-config", message: "Config request sent to the agent's inbox." };
   }
   /**
    * The whole fixture fleet, selected deck first (PRD #742 M4). One entry for
@@ -5869,6 +5884,12 @@ export class TauriDeckBridge implements DeckBridge {
     // Issue #1240: `options` only when given, so a PRD #1223 listing is the
     // same invoke it always was.
     return invoke<DeckDirectoryListing>("desktop_list_directories", { deckId, path: path ?? null, ...(options ? { options } : {}) });
+  }
+
+  /** PRD #2119: the deck, pane, agent and process the confirmation captured, untouched. */
+  async generateConfig(deckId: string, agentId: string, paneId: string, incarnation?: string): Promise<GenerateConfigResult> {
+    const invoke = await this.getInvoke();
+    return invoke<GenerateConfigResult>("desktop_generate_config", { deckId, agentId, paneId, incarnation: incarnation ?? null });
   }
 
   async inboxAction(target: AgentTarget, item: { paneId: string; messageId: string; revision: number }, verb: InboxActionVerb): Promise<InboxActionResult> {

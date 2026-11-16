@@ -164,6 +164,15 @@ export type InboxActionVerb = "retry" | "cancel";
 /** PRD #1666 §2: the daemon's answer to Retry or Cancel. */
 export type InboxActionResult = { outcome: string };
 /**
+ * PRD #2119 — the answer to Generate config: `sent` once the agent's daemon
+ * posted the configuration request to its inbox, `unsupported` from a daemon
+ * too old to compose one (nothing was sent), or `failed`. `message` is the
+ * sentence to show, the same one the TUI shows for that outcome.
+ */
+export type GenerateConfigResult =
+  | { outcome: "sent"; messageId: string; message: string }
+  | { outcome: "unsupported" | "failed"; message: string };
+/**
  * Issue #1678: the background work an agent left running after its turn ended,
  * as the DAEMON counts it — commands still running in their own session and
  * subagents started and not yet stopped. Present only with at least one count
@@ -1676,6 +1685,13 @@ export interface DeckRuntimeState {
   decideUpgrade?: (upgradeId: string, questionId: number, choice: import("./lib/upgrade").UpgradeChoice) => Promise<void>;
   /** PRD #1666 §6.4: Retry or Cancel one listed deck message; absent where no daemon can answer. */
   inboxAction?: (target: AgentTarget, item: { paneId: string; messageId: string; revision: number }, verb: InboxActionVerb) => Promise<InboxActionResult>;
+  /**
+   * PRD #2119 — ask agent `agentId` in pane `paneId`, on the deck `deckId`
+   * names and as the daemon process `incarnation` that listed it, to generate
+   * the project's `.dot-agent-deck.toml`. Absent where no daemon can answer, and
+   * the screens then offer no Generate config.
+   */
+  generateConfig?: (deckId: string, agentId: string, paneId: string, incarnation?: string) => Promise<GenerateConfigResult>;
   sendTerminalInput: (target: AgentTarget, data: string, precondition?: () => boolean) => Promise<void>;
   resizeTerminal: (target: AgentTarget, cols: number, rows: number) => Promise<void>;
   /**

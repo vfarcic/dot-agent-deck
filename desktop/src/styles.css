@@ -705,6 +705,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .agent-inbox-attention-answer { display: block; margin-top: 3px; color: var(--ink); }
 /* Issue #1933: the notice says how the agent's pane ended, its exit code last,
    so it wraps rather than being cut, as the TUI card wraps it. */
+.agent-identity p.agent-config-notice, .agent-config-notice { color: var(--teal-deep); font-size: var(--text-sm); white-space: normal; overflow-wrap: anywhere; }
 .agent-identity p.agent-delivery-notice, .agent-delivery-notice { color: var(--red); font-family: "JetBrains Mono", monospace; font-size: var(--text-sm); white-space: normal; overflow-wrap: anywhere; }
 /* Issue #1678: background work still running after the turn ended. Ink rather
    than --muted, as the TUI draws it in its primary text colour: it is a reading
@@ -1809,6 +1810,8 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    the page's 16px default beside them. */
 .agent-stop-control { height: 26px; display: flex; align-items: center; gap: 5px; padding: 0 8px; font-size: var(--text-base); font-weight: 650; border: 1px solid currentColor; border-radius: 4px; color: var(--red); background: transparent; cursor: pointer; white-space: nowrap; }
 .agent-stop-control:hover, .agent-stop-control:focus-visible { background: var(--red-soft); }
+.agent-generate-config-control { height: 26px; display: flex; align-items: center; gap: 5px; padding: 0 8px; font-size: var(--text-base); font-weight: 650; border: 1px solid var(--line-strong); border-radius: 4px; color: var(--ink); background: transparent; cursor: pointer; white-space: nowrap; }
+.agent-generate-config-control:hover, .agent-generate-config-control:focus-visible { background: var(--paper-sunken); }
 /* The overview's entry control. `margin-left: auto` puts it at the end of the
    name cell rather than beside the name, so a long display name is still
    clamped by its own `text-overflow` and the control never moves. */
@@ -1816,6 +1819,9 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .overview-open-agent:hover, .overview-open-agent:focus-visible, .overview-row.is-openable:hover .overview-open-agent { color: var(--teal); border-color: var(--teal-focus); background: var(--teal-soft); }
 .overview-stop-agent { flex: 0 0 auto; width: 20px; height: 20px; display: grid; place-items: center; border: 1px solid transparent; border-radius: 4px; color: var(--faint); background: transparent; cursor: pointer; }
 .overview-stop-agent:hover, .overview-stop-agent:focus-visible { color: var(--red); border-color: currentColor; }
+/* PRD #2119 — Generate config beside it: the same small control, in the neutral accent rather than the stop's red. */
+.overview-generate-config { flex: 0 0 auto; width: 20px; height: 20px; display: grid; place-items: center; border: 1px solid transparent; border-radius: 4px; color: var(--faint); background: transparent; cursor: pointer; }
+.overview-generate-config:hover, .overview-generate-config:focus-visible { color: var(--teal); border-color: currentColor; }
 .overview-close-orchestration { margin-left: 6px; }
 /* A click anywhere on the row opens the pane too, so the row reads as one
    target: a pointer over all of it, and while it is hovered the control lights

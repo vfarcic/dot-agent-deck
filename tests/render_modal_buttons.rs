@@ -24,6 +24,9 @@ use dot_agent_deck::ui::{
 };
 use spec::spec;
 
+#[path = "../src/test_temp.rs"]
+mod test_temp;
+
 /// Scenario: Read an existing config with automatic config prompts disabled and an existing JSON state file recording a Never choice. Both deserialize successfully and retain their stored values even though the manual dialog now offers Yes/No.
 #[spec("dashboard/config-gen/002")]
 #[test]
@@ -31,7 +34,7 @@ fn config_gen_002_legacy_settings_and_never_state_still_load() {
     let config: dot_agent_deck::config::DashboardConfig =
         toml::from_str("auto_config_prompt = false\n").expect("legacy config must load");
     assert!(!config.auto_config_prompt);
-    let directory = tempfile::tempdir().unwrap();
+    let directory = test_temp::tempdir().unwrap();
     let path = directory.path().join("config-gen-state.json");
     std::fs::write(&path, r#"{"suppressed_dirs":["/legacy/project"]}"#).unwrap();
     let state: dot_agent_deck::config::ConfigGenState =

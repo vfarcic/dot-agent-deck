@@ -3711,6 +3711,165 @@ pub(crate) fn ensure_desktop_orchestration_platform_supported(
 #[cfg(test)]
 mod tests {
 
+    /// Two daemons on the dashboard: the selected one differs from the owner.
+    #[cfg(unix)]
+    fn config_gen_fleet(selected: Endpoint, owner: Endpoint) -> impl Drop {
+        struct Restore(Option<AppliedSelection>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                *APPLIED_SELECTION.write().unwrap() = self.0.take();
+            }
+        }
+        let previous = APPLIED_SELECTION
+            .write()
+            .unwrap()
+            .replace(AppliedSelection {
+                selected: SelectedDeck {
+                    endpoint: selected.clone(),
+                    fallback: None,
+                    all_decks: false,
+                },
+                observed: vec![selected, owner],
+                ..AppliedSelection::default()
+            });
+        Restore(previous)
+    }
+
+    /// Invoke the actual command from the main webview on Tauri's mock runtime.
+    #[cfg(unix)]
+    fn config_gen_ipc(
+        state: crate::terminal::DesktopState,
+        deck_id: &str,
+        incarnation: &str,
+    ) -> serde_json::Value {
+        use tauri::ipc::{CallbackFn, InvokeBody};
+        use tauri::test::{INVOKE_KEY, get_ipc_response, mock_builder};
+        use tauri::webview::InvokeRequest;
+        let app = mock_builder()
+            .manage(state)
+            .invoke_handler(tauri::generate_handler![crate::desktop_generate_config])
+            .build(crate::app_context())
+            .expect("a mock app");
+        let main = tauri::WebviewWindowBuilder::new(
+            &app,
+            crate::pr_browser::MAIN_WEBVIEW_LABEL,
+            tauri::WebviewUrl::default(),
+        )
+        .build()
+        .expect("the main webview");
+        get_ipc_response(&main, InvokeRequest {
+            cmd: "desktop_generate_config".into(), callback: CallbackFn(0), error: CallbackFn(1),
+            url: "tauri://localhost".parse().unwrap(),
+            body: InvokeBody::Json(serde_json::json!({
+                "deckId": deck_id, "agentId": "1", "paneId": "pane-1", "incarnation": incarnation,
+            })),
+            headers: Default::default(), invoke_key: INVOKE_KEY.to_string(),
+        }).expect("the command returns a named outcome").deserialize().unwrap()
+    }
+
+    /// Scenario: Generate config through Tauri IPC for an agent whose daemon differs from the selected daemon. The owner alone receives the captured pane/agent request; sent, old-daemon and failed answers return the shared user-visible sentence, with no generic fallback on an old daemon.
+    #[cfg(unix)]
+    #[test]
+    fn config_gen_001_desktop_routes_to_the_owner_and_maps_every_outcome() {
+        use crate::restart_binding_tests::RestartingDeck;
+        use dot_agent_deck::config_gen::{
+            CONFIG_GEN_SENT_MESSAGE, CONFIG_GEN_UPGRADE_MESSAGE, config_gen_failed_message,
+        };
+        use dot_agent_deck::daemon_client::ClientError;
+        use dot_agent_deck::daemon_protocol::AttachResponse;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let _selection = runtime.block_on(SELECTION_LOCK.lock());
+        let (selected, owner) = {
+            let _entered = runtime.enter();
+            (
+                RestartingDeck::start("config-selected", "selected-a"),
+                RestartingDeck::start("config-owner", "owner-a"),
+            )
+        };
+        let _fleet = config_gen_fleet(selected.endpoint(), owner.endpoint());
+        let wire = deck_wire_id(&owner.endpoint());
+        for outcome in ["sent", "unsupported", "failed"] {
+            owner.config_generation(
+                outcome != "unsupported",
+                (outcome == "failed").then(|| AttachResponse::err("target refused")),
+            );
+            let answer = config_gen_ipc(crate::terminal::DesktopState::default(), &wire, "owner-a");
+            assert_eq!(answer["outcome"], outcome);
+            let expected = match outcome {
+                "sent" => CONFIG_GEN_SENT_MESSAGE.to_string(),
+                "unsupported" => CONFIG_GEN_UPGRADE_MESSAGE.to_string(),
+                _ => config_gen_failed_message(&ClientError::Server("target refused".into())),
+            };
+            assert_eq!(answer["message"], expected);
+            assert_eq!(
+                answer["messageId"].as_str(),
+                (outcome == "sent").then_some("m-config")
+            );
+            assert!(
+                selected.received_by("selected-a").is_empty(),
+                "the selected daemon must not receive the owner's action"
+            );
+            let requests = owner.config_requests();
+            if outcome == "unsupported" {
+                assert!(requests.is_empty());
+            } else {
+                assert_eq!(requests.len(), 1);
+                assert_eq!(requests[0]["pane_id"], "pane-1");
+                assert_eq!(requests[0]["expected_agent_id"], "1");
+            }
+            assert!(
+                !owner
+                    .received_by("owner-a")
+                    .iter()
+                    .any(|op| op == "post-message"),
+                "generation must never fall back to a generic inbox post"
+            );
+        }
+    }
+
+    /// Scenario: A confirmation was opened on daemon process A, then the daemon restarts and reuses the agent id on process B. Confirming through Tauri shows the shared failure sentence and sends B nothing; a confirmation captured from B succeeds as a control.
+    #[cfg(unix)]
+    #[test]
+    fn config_gen_001_desktop_refuses_a_restarted_target() {
+        use crate::restart_binding_tests::RestartingDeck;
+        use dot_agent_deck::daemon_client::AGENT_GONE_AFTER_RESTART;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let _selection = runtime.block_on(SELECTION_LOCK.lock());
+        let (selected, owner) = {
+            let _entered = runtime.enter();
+            (
+                RestartingDeck::start("config-selected", "selected-a"),
+                RestartingDeck::start("config-restart", "owner-a"),
+            )
+        };
+        let _fleet = config_gen_fleet(selected.endpoint(), owner.endpoint());
+        let state = crate::terminal::DesktopState::default();
+        runtime
+            .block_on(state.daemon.trusted(&owner.endpoint()))
+            .expect("the original daemon is trusted");
+        owner.restart_as("owner-b");
+        let wire = deck_wire_id(&owner.endpoint());
+        let answer = config_gen_ipc(state, &wire, "owner-a");
+        assert_eq!(answer["outcome"], "failed");
+        assert_eq!(
+            answer["message"],
+            dot_agent_deck::config_gen::config_gen_failed_message(&AGENT_GONE_AFTER_RESTART)
+        );
+        assert!(owner.received_by("owner-b").is_empty());
+        let answer = config_gen_ipc(crate::terminal::DesktopState::default(), &wire, "owner-b");
+        assert_eq!(answer["outcome"], "sent");
+        assert_eq!(owner.config_requests().len(), 1);
+        assert!(selected.received_by("selected-a").is_empty());
+    }
+
     /// Scenario (PRD #1258 M4): a daemon's host answer reaches the webview as
     /// the camelCase `hostMetrics` shape, with absent readings omitted rather
     /// than zeroed, the daemon's health levels passed through beside their

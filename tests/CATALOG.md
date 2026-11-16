@@ -1317,10 +1317,10 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 #### dashboard/config-gen
 
 ##### dashboard/config-gen/001 — A TUI attached to a daemon without config generation explains that the daemon must be upgraded.
-- **Layer:** L1 (requires a config-generation action/result rendering seam).
+- **Layer:** L1, in-process action dispatch and rendered status row.
 - **Agent:** none.
 - **Asserts:** confirming generation shows the shared upgrade message and posts no locally composed fallback prompt.
-- **Implementation:** pending a harness seam that drives the production config-generation action through a controller returning Unsupported and renders the resulting frame; the existing dialog renderer cannot exercise this send/result path.
+- **Test:** `config_gen_001_older_daemon_shows_upgrade_without_posting_a_fallback` in `src/ui.rs`; drives both mouse Yes and keyboard Enter through production dispatch with an Unsupported controller and checks the rendered upgrade notice, no generic inbox post, no focus and no typing mode.
 - **Does not assert:** successful delivery (covered by `inbox/route/007`) or the shared-client capability gate (`daemon/config-gen/004`).
 - **Platform coverage:** mac+linux.
 
@@ -15645,6 +15645,36 @@ These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[
 - **Asserts:** both daemons give their agent the same id (required, not assumed); with All Decks selected the window shows two connected sections, each holding only its own deck's row, with both lamps connected and the deck counter at `2/2`; after the far daemon is stopped, its section stays, reads disconnected with a disconnected lamp and lists no agents, while the local deck keeps exactly its own row and its connected lamp, and the counter reads `1/2`.
 - **Does not assert:** three or more decks, a deck waiting to report, an unconfigured deck-list row, a deck coming back, New agent or a pane on the far deck, or a far deck on another machine; the far deck shares this machine's filesystem, so it says nothing about a window rendering a far host's paths.
 - **Platform coverage:** Linux WebKitGTK only. Needs a system `sshd` (`DAD_DRIVER_SSHD`) and `libnss_wrapper.so` (`DAD_DRIVER_NSS_WRAPPER`); the scenario fails naming whichever is missing.
+
+## Desktop configuration generation scenarios
+
+These desktop Rust and Vitest tests live outside the root Rust spec scanner, as do the native desktop scenarios below.
+
+#### desktop/config-gen
+
+##### desktop/config-gen/001 — Generation reaches the selected agent's owning daemon and preserves each outcome.
+- **Layer:** fast-tier Rust socket tests and Vitest bridge tests.
+- **Agent:** none (scripted daemon).
+- **Tests:** `config_gen_001_desktop_routes_to_the_owner_and_maps_every_outcome` and `config_gen_001_desktop_refuses_a_restarted_target` in `desktop/src-tauri/src/dto.rs`; `desktop/config-gen/001: …` in `desktop/src/lib/bridgeIncarnation.test.ts`.
+- **Asserts:** a named agent's request carries its pane and expected agent identity to its owning daemon even when another daemon is selected; sent, unsupported and failed outcomes use the shared crate strings; an old daemon receives no fallback and a successor process receives no acting request; IPC carries deck, agent, pane and incarnation.
+- **Does not assert:** real agents or native webview rendering.
+- **Platform coverage:** Rust socket test on Unix; Vitest on mac+linux+windows.
+
+##### desktop/config-gen/002 — Generate config uses a neutral Yes/No confirmation and shows the result.
+- **Layer:** Vitest, rendered React components with an injected runtime.
+- **Agent:** none.
+- **Tests:** `desktop/config-gen/002: …` in `desktop/src/components/AgentOverviewStop.test.tsx` and `desktop/src/lib/voiceActions.test.ts`.
+- **Asserts:** action on the overview row and open agent pane; TUI title and explanation; Yes/No only without destructive styling; No sends nothing; Yes preserves the captured binding, focuses the sent target and shows success; unsupported/failure show their shared text without claiming success.
+- **Does not assert:** Tauri transport (covered by desktop/config-gen/001), real agents or a TUI-style desktop command-key layer (none exists).
+- **Platform coverage:** mac+linux+windows.
+
+##### desktop/config-gen/003 — Voice and clicking open the same Generate config confirmation.
+- **Layer:** fast-tier Rust voice-table test and Vitest shell/registry tests.
+- **Agent:** none (synthetic voice resolution).
+- **Tests:** `voice_table_config_gen_003_generation_is_agent_targeted_and_only_asks` in `desktop/src-tauri/src/voice/table.rs`; `desktop/config-gen/003: …` and the literal registry classification test in `desktop/src/lib/voiceActions.test.ts`.
+- **Asserts:** `generate_config` names `confirmGenerateConfig`, is agent-targeted on overview/agent screens and advertises “generate config”; the registry is voice-enabled; both the control and voice dispatch open the Yes/No confirmation without sending work.
+- **Does not assert:** real microphone capture, transcription or model intent classification.
+- **Platform coverage:** mac+linux+windows.
 
 ## Desktop native network scenarios
 

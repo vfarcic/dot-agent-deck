@@ -17975,7 +17975,7 @@ mod tests {
     /// included — whose control has a voice row, with that row. `docs/develop/voice-first-design.md`
     /// section 5 has the rule; the labels left out on purpose are listed there
     /// with their reasons.
-    const CONTROL_LABELS: [ControlLabel; 33] = [
+    const CONTROL_LABELS: [ControlLabel; 35] = [
         // PRD #2174 — the star reminder's three buttons, each its own row.
         // Shown at startup over the dashboard, never over the New agent form.
         ControlLabel {
@@ -18223,6 +18223,22 @@ mod tests {
             row: "close",
             over_the_form: false,
         },
+        // PRD #2119 — Generate config on a dashboard row ("Generate config
+        // with <name> agent") and in the open pane ("Generate config").
+        ControlLabel {
+            source: "aria-label={`Generate config with ${name} agent`}",
+            file: AGENT_OVERVIEW_TSX,
+            said: "Generate config with tester agent",
+            row: "generate_config",
+            over_the_form: false,
+        },
+        ControlLabel {
+            source: "<FileCog size={14} aria-hidden=\"true\" /> Generate config</button>",
+            file: AGENT_TILE_TSX,
+            said: "Generate config",
+            row: "generate_config",
+            over_the_form: false,
+        },
     ];
 
     /// The label rule as a property: each control's label is still in its
@@ -18457,6 +18473,8 @@ mod tests {
             ("dismiss_star_prompt", "don't ask again"),
             // Issue #2330 — a review the deck asked for: its Approve and Deny.
             ("approve_project_commands", "approve"),
+            // PRD #2119 — the Generate config button's words.
+            ("generate_config", "generate config"),
             ("close", "deny it"),
             ("close", "decline"),
         ] {

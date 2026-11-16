@@ -543,6 +543,16 @@ export type VoiceActionContext = {
   confirmStopAgent: (target: VoiceDispatchTarget) => string | undefined;
   confirmCloseOrchestration: (target: VoiceDispatchTarget) => string | undefined;
   /**
+   * PRD #2119 — an agent's Generate config: OPEN the neutral Yes/No
+   * confirmation for the agent an `agent_ref` resolved to (the dashboard row's
+   * control), or for the open pane's agent (the pane's control). Like the two
+   * stops it only asks: the request is sent by the confirmation's Yes, pressed
+   * by the user, bound to the agent as it was when the question opened.
+   * Answers `undefined` when it opened the confirmation, or the sentence
+   * saying why it did not.
+   */
+  confirmGenerateConfig: (target: VoiceDispatchTarget) => string | undefined;
+  /**
    * PRD #1401 — open GitHub's page for one agent's pull request in the app's
    * own browser, over the screen. Answers `undefined` when it opened, or the
    * sentence saying why not (the agent has no pull request, or none the app
@@ -1363,6 +1373,19 @@ export const VOICE_ACTIONS = {
     },
   },
 
+  /* PRD #2119 — Generate config, by voice or by an agent's own control on
+     the dashboard row and in its pane. It only OPENS the confirmation; the
+     request goes when the user presses Yes. */
+  confirmGenerateConfig: {
+    label: "Ask to generate the project's config with one agent",
+    voice: true,
+    needs: ["confirmGenerateConfig", "reportRefused"],
+    run: (context: Pick<VoiceActionContext, "confirmGenerateConfig" | "reportRefused">, target: VoiceDispatchTarget) => {
+      const refused = context.confirmGenerateConfig(target);
+      if (refused !== undefined) context.reportRefused(refused);
+    },
+  },
+
   confirmCloseOrchestration: {
     label: "Ask to close an orchestration on the dashboard",
     voice: true,
@@ -1717,7 +1740,7 @@ export type PullRequestContext = Pick<VoiceActionContext, "openPullRequest" | "o
  * dialog for; a dispatch of `openNewAgent` there is refused against its
  * `needs`, the way the overview refuses a deck overlay.
  */
-export type VoiceOverviewContext = Pick<VoiceActionContext, "openNewAgent" | "closeNewAgent" | "openDirectory" | "goToParentDirectory" | "useThisDirectory" | "filterDirectories" | "clearDirectoryFilter" | NewAgentFormMember | "confirmStopAgent" | "confirmCloseOrchestration" | "scrollDashboard" | "revealAgent" | "showHostMetrics" | "closeHostMetrics" | "showDashboardCounters" | "closeDashboardCounters">;
+export type VoiceOverviewContext = Pick<VoiceActionContext, "openNewAgent" | "closeNewAgent" | "openDirectory" | "goToParentDirectory" | "useThisDirectory" | "filterDirectories" | "clearDirectoryFilter" | NewAgentFormMember | "confirmStopAgent" | "confirmCloseOrchestration" | "confirmGenerateConfig" | "scrollDashboard" | "revealAgent" | "showHostMetrics" | "closeHostMetrics" | "showDashboardCounters" | "closeDashboardCounters">;
 
 /** The New agent form's members, served — like the browser's — from the dialog's slot. */
 export type NewAgentFormMember = "chooseNewAgentDeck" | "chooseNewAgentMode" | "chooseNewAgentType" | "nameNewAgent" | "setNewAgentCommand" | "startNewAgent" | "discardNewAgent";

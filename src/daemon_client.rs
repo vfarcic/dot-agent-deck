@@ -116,6 +116,26 @@ pub const KEEP_WORKTREE_UNSUPPORTED: &str = "the running deck daemon cannot keep
 /// desktop say the same thing (CLAUDE.md rule 22).
 pub const AGENT_GONE_AFTER_RESTART: &str = "that agent is gone (the deck restarted)";
 
+/// PRD #2119: what a client says once the daemon has posted the configuration
+/// request. One string, so the TUI and the desktop app say the same thing.
+pub const CONFIG_GEN_SENT_MESSAGE: &str = "Config request sent to the agent's inbox.";
+
+/// PRD #2119: what a client says when the daemon does not advertise
+/// [`crate::daemon_protocol::CAP_GENERATE_CONFIG`]. Neither client composes the
+/// request itself instead, so both say this, in these words.
+pub const CONFIG_GEN_UPGRADE_MESSAGE: &str =
+    "This daemon is too old to generate a config. Upgrade the daemon to use Generate config.";
+
+/// PRD #2119: the start of what a client says when the request was refused or
+/// could not be sent; [`config_gen_failed_message`] appends the reason.
+pub const CONFIG_GEN_FAILED_PREFIX: &str = "Failed to send config prompt";
+
+/// PRD #2119: [`CONFIG_GEN_FAILED_PREFIX`] followed by `reason`, the one
+/// failure message both clients show.
+pub fn config_gen_failed_message(reason: &dyn std::fmt::Display) -> String {
+    format!("{CONFIG_GEN_FAILED_PREFIX}: {reason}")
+}
+
 /// PRD #1666 part 2 (G-fix5): what both clients say when an action aimed at an
 /// agent is refused because the deck did not say which daemon process it is
 /// ([`ClientError::DaemonUnnamed`]).

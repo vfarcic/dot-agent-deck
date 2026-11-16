@@ -64,25 +64,15 @@ pub fn config_gen_prompt(dir: &str) -> String {
 /// agent's inbox ([`crate::daemon_protocol::AttachRequest::GenerateConfig`]).
 pub const CONFIG_GEN_SUBJECT: &str = "configuration request";
 
-/// PRD #2119: what a client says once the daemon has posted the configuration
-/// request. One string, so the TUI and the desktop app say the same thing.
-pub const CONFIG_GEN_SENT_MESSAGE: &str = "Config request sent to the agent's inbox.";
-
-/// PRD #2119: what a client says when the daemon does not advertise
-/// [`crate::daemon_protocol::CAP_GENERATE_CONFIG`]. Neither client composes the
-/// request itself instead, so both say this, in these words.
-pub const CONFIG_GEN_UPGRADE_MESSAGE: &str =
-    "This daemon is too old to generate a config. Upgrade the daemon to use Generate config.";
-
-/// PRD #2119: the start of what a client says when the request was refused or
-/// could not be sent; [`config_gen_failed_message`] appends the reason.
-pub const CONFIG_GEN_FAILED_PREFIX: &str = "Failed to send config prompt";
-
-/// PRD #2119: [`CONFIG_GEN_FAILED_PREFIX`] followed by `reason`, the one
-/// failure message both clients show.
-pub fn config_gen_failed_message(reason: &dyn std::fmt::Display) -> String {
-    format!("{CONFIG_GEN_FAILED_PREFIX}: {reason}")
-}
+/// PRD #2119: the sentences a client shows for each outcome of
+/// [`crate::daemon_client::DaemonClient::generate_config`]. They live beside
+/// that call in `daemon_client`, which the desktop app may reach (this module,
+/// which composes the request for a directory, is the daemon's), and are
+/// re-exported here for the TUI.
+pub use crate::daemon_client::{
+    CONFIG_GEN_FAILED_PREFIX, CONFIG_GEN_SENT_MESSAGE, CONFIG_GEN_UPGRADE_MESSAGE,
+    config_gen_failed_message,
+};
 
 #[cfg(test)]
 mod tests {

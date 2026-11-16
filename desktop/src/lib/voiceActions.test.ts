@@ -81,6 +81,7 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
     clearError: vi.fn(),
     ...approvedProjectTrust(),
     runAction: vi.fn(async () => ({ ok: true }) as DeckActionResult),
+    generateConfig: vi.fn(async () => ({ outcome: "sent", messageId: "m-config", message: "Config request sent to the agent's inbox." })),
     sendTerminalInput: vi.fn(async () => undefined),
     resizeTerminal: vi.fn(async () => undefined),
     setShownTerminals: vi.fn(async () => undefined),
@@ -96,6 +97,12 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
 
 function renderDeck(overrides: Partial<DeckRuntimeState> = {}) {
   return render(createElement(DeckShell, { runtime: runtime(overrides), initialView: { kind: "deck" } }));
+}
+
+function generationSnapshot() {
+  const snapshot = createFixtureSnapshot("connected");
+  snapshot.agents = snapshot.agents.map((agent) => ({ ...agent, incarnation: "config-fixture-process", paneId: `pane-${agent.id}` }));
+  return snapshot;
 }
 
 function openPalette() {
@@ -127,7 +134,7 @@ function renderDashboardVoice(said: string, initial: "deck" | "overview" = "over
       invoke: "clearDashboardFilter", params: [], sentence: "Showing all agents.",
     }, resolveMs: null, backend: "stub",
   }));
-  const snapshot = createFixtureSnapshot("connected");
+  const snapshot = outcome?.kind === "dispatch" && outcome.action === "generate_config" ? generationSnapshot() : createFixtureSnapshot("connected");
   snapshot.agents = snapshot.agents.map((agent, at) => ({ ...agent, displayName: `filter-voice-agent-${at + 1}`, agentType: at === 0 ? "codex" : "claude_code" }));
   const deck = runtime({
     snapshot,
@@ -187,6 +194,7 @@ describe("VOICE_ACTIONS", () => {
     const { VOICE_ACTIONS } = await vi.importActual<{ VOICE_ACTIONS: Record<string, RegistryEntry> }>("./voiceActions");
     const voiceActionIds = [
       "openAgent",
+      "confirmGenerateConfig",
       "openOverview",
       "filterDashboard",
       "clearDashboardFilter",
@@ -251,6 +259,57 @@ describe("VOICE_ACTIONS", () => {
         `${actionId} cannot be both voice-enabled and excluded from voice`,
       ).toBe(false);
     }
+  });
+
+  /// Scenario: Say generate config for a dashboard agent. The real voice dispatch opens the same Yes/No confirmation as the agent's control and sends nothing until Yes is pressed.
+  it("desktop/config-gen/003: generate config opens the shared confirmation by voice", async () => {
+    const { deck, resolveVoice } = renderDashboardVoice("generate config", "overview", {
+      kind: "dispatch", transcript: "generate config", action: "generate_config", invoke: "confirmGenerateConfig",
+      params: [{ name: "agent", kind: "agent_ref", spoken: "first agent", value: "planner", label: "planner" }],
+      sentence: "Confirm generating config — nothing has been sent yet.",
+    });
+    registryDispatch.mockClear();
+    await speakDashboardCommand(resolveVoice);
+    const dialog = await screen.findByRole("alertdialog", { name: "Generate .dot-agent-deck.toml" });
+    expect(within(dialog).getByRole("button", { name: "Yes" })).toBeVisible();
+    expect(within(dialog).getByRole("button", { name: "No" })).toBeVisible();
+    expectOneRegistryDispatch("confirmGenerateConfig");
+    expect(deck.runAction).not.toHaveBeenCalled();
+    expect(deck.generateConfig).not.toHaveBeenCalled();
+  });
+
+  /// Scenario: Click Generate config on an agent. It crosses the same voice registry entry once and opens a confirmation without sending work.
+  it("desktop/config-gen/003: the agent control uses the voice registry", () => {
+    const deck = runtime({ snapshot: generationSnapshot() });
+    render(createElement(DeckShell, { runtime: deck, initialView: { kind: "overview" } }));
+    registryDispatch.mockClear();
+    fireEvent.click(screen.getAllByRole("button", { name: /Generate config/i })[0]);
+    expectOneRegistryDispatch("confirmGenerateConfig");
+    expect(screen.getByRole("alertdialog", { name: "Generate .dot-agent-deck.toml" })).toBeVisible();
+    expect(deck.runAction).not.toHaveBeenCalled();
+    expect(deck.generateConfig).not.toHaveBeenCalled();
+  });
+
+  /// Scenario: Open an agent's full-window pane from the dashboard and press Generate config in its header. The same voice registry entry opens the neutral Yes/No confirmation; after Yes, the agent pane stays visible and the success sentence is shown outside any inert background.
+  it("desktop/config-gen/002: the open agent pane offers the same confirmation", async () => {
+    const deck = runtime({ snapshot: generationSnapshot() });
+    render(createElement(DeckShell, { runtime: deck, initialView: { kind: "overview" } }));
+    fireEvent.click(screen.getAllByRole("button", { name: /^Open .* agent$/ })[0]);
+    const pane = await screen.findByTestId("agent-pane-overlay");
+    registryDispatch.mockClear();
+    fireEvent.click(within(pane).getByRole("button", { name: /Generate config/i }));
+    expectOneRegistryDispatch("confirmGenerateConfig");
+    const dialog = screen.getByRole("alertdialog", { name: "Generate .dot-agent-deck.toml" });
+    expect(dialog.querySelector(".danger, .danger-icon")).toBeNull();
+    expect(within(dialog).getAllByRole("button").map((button) => button.textContent).sort()).toEqual(["No", "Yes"]);
+    expect(deck.runAction).not.toHaveBeenCalled();
+    expect(deck.generateConfig).not.toHaveBeenCalled();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Yes" }));
+    const notice = await screen.findByText("Config request sent to the agent's inbox.");
+    expect(deck.generateConfig).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
+    expect(notice).toBeVisible();
+    expect(notice.closest("[inert], [aria-hidden='true']")).toBeNull();
   });
 
   /// Scenario: each clear phrase is heard while a text filter hides every agent except one. The actual voice dispatch restores the full dashboard and removes its active-filter controls.

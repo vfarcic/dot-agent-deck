@@ -4,12 +4,15 @@ use dot_agent_deck::daemon_client::{DaemonClient, GatedQuery};
 use dot_agent_deck::daemon_protocol::{AttachResponse, CAP_INBOX};
 use spec::spec;
 
+#[path = "../src/test_temp.rs"]
+mod test_temp;
+
 /// Scenario: A daemon's Hello advertises generic inbox delivery but no config-generation capability, or carries no capability list. Asking the shared client to generate config returns Unsupported without opening another connection or sending any request.
 #[spec("daemon/config-gen/004")]
 #[tokio::test]
 async fn config_gen_004_client_withholds_generation_from_older_daemon() {
     for capabilities in [None, Some(vec![CAP_INBOX.to_string()]), Some(vec![])] {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = test_temp::tempdir().unwrap();
         // There is deliberately no listener: a network attempt would fail,
         // rather than returning the unsupported outcome used by both clients.
         let client =

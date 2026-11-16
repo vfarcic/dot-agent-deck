@@ -299,6 +299,12 @@ reason = "Dismisses the dashboard's Stop daemon result notice (issue #1073): a d
 [[site]]
 file = "desktop/src/components/AgentOverview.tsx"
 handler = "onClick"
+code = "() => setGenerationNotice(undefined)"
+reason = "Dismisses the dashboard's Generate config result notice (PRD #2119): a dismissal."
+
+[[site]]
+file = "desktop/src/components/AgentOverview.tsx"
+handler = "onClick"
 code = "onUpgrade"
 reason = "A daemon card's Upgrade: the daemon upgrade flow, kept off voice because it restarts a daemon and its agents."
 
