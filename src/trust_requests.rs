@@ -28,6 +28,14 @@
 //!   again. Approvals stay in the approval store and survive restarts as before.
 //! - **No client attached:** the request stays pending; a client learns of it
 //!   from its next `Hello` (or `SubscribeEventsWithSnapshot`) reply.
+//! - **The refused agents are told the answer** (issue #2348). An agent whose
+//!   `dispatch`, `delegate`, `pane restart` or `pane spawn` was refused is
+//!   recorded against the request ([`RefusedCaller`]), and when the request
+//!   closes each of them is sent one deck notice through its inbox: approved,
+//!   retry now; declined; or closed unanswered because the config changed
+//!   ([`Answer`]). The approval still starts nothing: the refused request may
+//!   be stale by then, so the agent decides whether to retry. A caller that is
+//!   gone by then is skipped, and a schedule (no agent) is told nothing.
 //!
 //! # Only the serving daemon raises requests
 //!
@@ -36,9 +44,9 @@
 //! `daemon serve` does. Everywhere else — the TUI, the CLI, an in-process test
 //! daemon — [`refusal_for`] answers the PRD #1885 refusal unchanged.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::broadcast;
@@ -60,6 +68,10 @@ pub const MAX_DENIALS: usize = 256;
 /// The longest [`TrustRequest::asked_by`] label kept, in characters.
 pub const MAX_ASKED_BY_CHARS: usize = 128;
 
+/// The most refused callers recorded against one request (issue #2348). Past
+/// it, a further caller is refused as usual but not told the answer.
+pub const MAX_WAITING_CALLERS: usize = 64;
+
 /// How often the serving daemon re-checks pending requests against the
 /// approval store and the configs ([`run_sweep`]): an approval made from the
 /// CLI, or a config edited since, closes the request in every client within
@@ -75,7 +87,7 @@ pub struct RequestKey {
 }
 
 impl RequestKey {
-    fn of(check: &TrustCheck) -> Self {
+    pub fn of(check: &TrustCheck) -> Self {
         RequestKey {
             project: check.project.display().to_string(),
             orchestration: check.orchestration.clone(),
@@ -117,6 +129,66 @@ pub enum Denied {
     Unknown,
 }
 
+/// Issue #2348: an agent whose attempt was refused for an unapproved
+/// orchestration, told the answer when its request closes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefusedCaller {
+    /// The caller's pane.
+    pub pane_id: String,
+    /// The agent that held the pane when it was refused: a notice is posted
+    /// to that agent only, so a pane that changed hands is skipped.
+    pub agent_id: String,
+    /// What it ran — `dispatch`, `delegate`, `pane restart`, `pane spawn` —
+    /// named in the notice ("Retry your dispatch now").
+    pub verb: String,
+}
+
+impl RefusedCaller {
+    pub fn new(
+        pane_id: impl Into<String>,
+        agent_id: impl Into<String>,
+        verb: impl Into<String>,
+    ) -> Self {
+        Self {
+            pane_id: pane_id.into(),
+            agent_id: agent_id.into(),
+            verb: verb.into(),
+        }
+    }
+
+    fn same_agent(&self, other: &RefusedCaller) -> bool {
+        self.pane_id == other.pane_id && self.agent_id == other.agent_id
+    }
+}
+
+/// Issue #2348: how a request closed, as its refused callers are told.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answer {
+    /// Approved — in a client, from `trust approve`, or found approved by a
+    /// later check. The caller may retry now.
+    Approved,
+    /// The user declined it in a client.
+    Declined,
+    /// Closed without an answer: the config now reads other text that
+    /// nobody is being asked about, or no longer names the orchestration.
+    /// A retry asks again.
+    Withdrawn,
+}
+
+/// Issue #2348: one deck notice to one refused caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallerNotice {
+    pub pane_id: String,
+    pub agent_id: String,
+    pub answer: Answer,
+    pub subject: &'static str,
+    pub body: String,
+}
+
+/// Where the serving daemon posts [`CallerNotice`]s ([`inbox_sink`] in
+/// `daemon serve`). Called off the hub's lock.
+pub type NoticeSink = Arc<dyn Fn(CallerNotice) + Send + Sync>;
+
 /// The pending requests and the remembered denials of one daemon.
 #[derive(Debug, Default)]
 pub struct TrustRequestHub {
@@ -125,6 +197,12 @@ pub struct TrustRequestHub {
     pending: Vec<TrustRequest>,
     /// Oldest first, so the cap forgets the oldest.
     denied: Vec<RequestKey>,
+    /// Issue #2348: the callers each pending request (by id) refused, in the
+    /// order they were refused.
+    waiting: BTreeMap<u64, Vec<RefusedCaller>>,
+    /// Issue #2348: notices owed by the changes made since the last
+    /// [`Self::take_notices`].
+    outbox: Vec<CallerNotice>,
 }
 
 impl TrustRequestHub {
@@ -140,32 +218,116 @@ impl TrustRequestHub {
         self.revision = self.revision.wrapping_add(1);
     }
 
+    /// Issue #2348: the notices owed since the last call, oldest first.
+    pub fn take_notices(&mut self) -> Vec<CallerNotice> {
+        std::mem::take(&mut self.outbox)
+    }
+
+    /// Whether `caller` is recorded against the pending request for `key`.
+    pub fn is_waiting(&self, key: &RequestKey, caller: &RefusedCaller) -> bool {
+        self.pending
+            .iter()
+            .find(|r| RequestKey::of_request(r) == *key)
+            .and_then(|r| self.waiting.get(&r.id))
+            .is_some_and(|callers| callers.contains(caller))
+    }
+
+    /// Record `caller` against request `id`, once per agent and verb.
+    fn record_caller(&mut self, id: u64, caller: &RefusedCaller) {
+        let callers = self.waiting.entry(id).or_default();
+        if callers.contains(caller) || callers.len() >= MAX_WAITING_CALLERS {
+            return;
+        }
+        callers.push(caller.clone());
+    }
+
+    /// `request` closed with `answer`: owe each of its callers but `except`
+    /// one notice, naming every verb that agent was refused.
+    fn told(&mut self, request: &TrustRequest, answer: Answer, except: Option<&RefusedCaller>) {
+        let callers = self.waiting.remove(&request.id).unwrap_or_default();
+        let mut agents: Vec<(RefusedCaller, Vec<String>)> = Vec::new();
+        for caller in callers {
+            if except.is_some_and(|e| e.same_agent(&caller)) {
+                continue;
+            }
+            match agents.iter_mut().find(|(a, _)| a.same_agent(&caller)) {
+                Some((_, verbs)) => verbs.push(caller.verb),
+                None => {
+                    let verb = caller.verb.clone();
+                    agents.push((caller, vec![verb]));
+                }
+            }
+        }
+        for (caller, verbs) in agents {
+            let (subject, body) = crate::project_trust::request_answer_notice(
+                &request.project,
+                &request.orchestration,
+                &verbs,
+                answer,
+            );
+            self.outbox.push(CallerNotice {
+                pane_id: caller.pane_id,
+                agent_id: caller.agent_id,
+                answer,
+                subject,
+                body,
+            });
+        }
+    }
+
     /// Raise a request for `check`'s text, refused while `asked_by` (what
     /// tried to start it: `dispatch`, a schedule's name, `pane restart`, …).
     /// Answers what the refusal should say, and whether the list changed.
     pub fn raise(&mut self, check: &TrustCheck, asked_by: &str) -> (Raised, bool) {
+        self.raise_for(check, asked_by, None)
+    }
+
+    /// [`Self::raise`], recording `caller` — the agent refused, when an agent
+    /// was — so it is told the answer when the request closes (issue #2348).
+    pub fn raise_for(
+        &mut self,
+        check: &TrustCheck,
+        asked_by: &str,
+        caller: Option<&RefusedCaller>,
+    ) -> (Raised, bool) {
         let key = RequestKey::of(check);
         if self.denied.contains(&key) {
             return (Raised::Declined, false);
         }
-        if self
+        if let Some(id) = self
             .pending
             .iter()
-            .any(|r| RequestKey::of_request(r) == key)
+            .find(|r| RequestKey::of_request(r) == key)
+            .map(|r| r.id)
         {
+            if let Some(caller) = caller {
+                self.record_caller(id, caller);
+            }
             return (Raised::Pending, false);
         }
         // A pending request for an older text of the same orchestration can no
-        // longer be approved as shown; this one takes its place.
-        let before = self.pending.len();
-        self.pending
-            .retain(|r| !RequestKey::of_request(r).same_orchestration(&key));
-        let replaced = self.pending.len() != before;
+        // longer be approved as shown; this one takes its place, and so do the
+        // callers waiting on it, since their retry reads the config as it now
+        // is (issue #2348).
+        let (replaced_requests, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending)
+            .into_iter()
+            .partition(|r| RequestKey::of_request(r).same_orchestration(&key));
+        self.pending = kept;
+        let replaced = !replaced_requests.is_empty();
         if self.pending.len() >= MAX_PENDING_REQUESTS {
             if replaced {
                 self.changed();
+                // Nothing takes their place: their callers are told the
+                // request closed unanswered, and a retry asks again.
+                for old in &replaced_requests {
+                    self.told(old, Answer::Withdrawn, None);
+                }
             }
             return (Raised::Full, replaced);
+        }
+        let mut carried: Vec<RefusedCaller> = Vec::new();
+        for old in &replaced_requests {
+            carried.extend(self.waiting.remove(&old.id).unwrap_or_default());
         }
         self.next_id = self.next_id.wrapping_add(1);
         let asked_by: String = crate::untrusted_text::escape_control_and_bidi(asked_by)
@@ -180,6 +342,13 @@ impl TrustRequestHub {
             digest: key.digest,
             asked_by,
         });
+        let id = self.next_id;
+        for old in carried {
+            self.record_caller(id, &old);
+        }
+        if let Some(caller) = caller {
+            self.record_caller(id, caller);
+        }
         self.changed();
         (Raised::Pending, true)
     }
@@ -203,6 +372,7 @@ impl TrustRequestHub {
             }
             self.denied.push(key);
         }
+        self.told(&request, Answer::Declined, None);
         self.changed();
         Denied::Declined
     }
@@ -214,27 +384,51 @@ impl TrustRequestHub {
     /// linked worktree's, say) does not answer it. Answers whether the list
     /// changed.
     pub fn settle_approved(&mut self, project: &str, orchestration: &str, digest: &str) -> bool {
+        self.settle_approved_except(project, orchestration, digest, None)
+    }
+
+    /// [`Self::settle_approved`], telling every caller the request refused
+    /// that it was approved — but `except`, the caller whose own attempt just
+    /// found it approved and is already starting it (issue #2348).
+    pub fn settle_approved_except(
+        &mut self,
+        project: &str,
+        orchestration: &str,
+        digest: &str,
+        except: Option<&RefusedCaller>,
+    ) -> bool {
         let key = RequestKey {
             project: project.to_string(),
             orchestration: orchestration.to_string(),
             digest: digest.to_string(),
         };
         self.denied.retain(|d| *d != key);
-        let before = self.pending.len();
-        self.pending.retain(|r| RequestKey::of_request(r) != key);
-        let changed = self.pending.len() != before;
+        let (closed, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending)
+            .into_iter()
+            .partition(|r| RequestKey::of_request(r) == key);
+        self.pending = kept;
+        for request in &closed {
+            self.told(request, Answer::Approved, except);
+        }
+        let changed = !closed.is_empty();
         if changed {
             self.changed();
         }
         changed
     }
 
-    /// Drop the pending requests `stale` names (by id). Answers whether the
+    /// Drop the pending requests `stale` names (by id), each closed with the
+    /// answer it names ([`stale_requests_blocking`]). Answers whether the
     /// list changed.
-    pub fn drop_requests(&mut self, stale: &BTreeSet<u64>) -> bool {
-        let before = self.pending.len();
-        self.pending.retain(|r| !stale.contains(&r.id));
-        let changed = self.pending.len() != before;
+    pub fn drop_requests(&mut self, stale: &BTreeMap<u64, Answer>) -> bool {
+        let (closed, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending)
+            .into_iter()
+            .partition(|r| stale.contains_key(&r.id));
+        self.pending = kept;
+        for request in &closed {
+            self.told(request, stale[&request.id], None);
+        }
+        let changed = !closed.is_empty();
         if changed {
             self.changed();
         }
@@ -247,6 +441,8 @@ impl TrustRequestHub {
 struct Served {
     hub: TrustRequestHub,
     tx: Option<broadcast::Sender<BroadcastMsg>>,
+    /// Issue #2348: where the refused callers' notices go.
+    sink: Option<NoticeSink>,
 }
 
 static SERVED: Mutex<Served> = Mutex::new(Served {
@@ -255,8 +451,11 @@ static SERVED: Mutex<Served> = Mutex::new(Served {
         revision: 0,
         pending: Vec::new(),
         denied: Vec::new(),
+        waiting: BTreeMap::new(),
+        outbox: Vec::new(),
     },
     tx: None,
+    sink: None,
 });
 
 fn served() -> std::sync::MutexGuard<'static, Served> {
@@ -274,10 +473,69 @@ fn broadcast(served: &Served) {
     }
 }
 
-/// `daemon serve`: raise requests from here on, and broadcast every change of
-/// them on `tx`.
-pub fn install(tx: broadcast::Sender<BroadcastMsg>) {
-    served().tx = Some(tx);
+/// `daemon serve`: raise requests from here on, broadcast every change of
+/// them on `tx`, and post each refused caller's notice through `sink`.
+pub fn install(tx: broadcast::Sender<BroadcastMsg>, sink: Option<NoticeSink>) {
+    let mut served = served();
+    served.tx = Some(tx);
+    served.sink = sink;
+}
+
+/// Take the notices `served`'s last change owes, with the sink to post them
+/// through; post them with [`deliver`] once the hub's lock is released.
+fn owed(served: &mut Served) -> Option<(NoticeSink, Vec<CallerNotice>)> {
+    let notices = served.hub.take_notices();
+    if notices.is_empty() {
+        return None;
+    }
+    Some((served.sink.clone()?, notices))
+}
+
+/// Post `owed`'s notices: on the blocking pool when a runtime is running (a
+/// post may save a body to disk, and callers may hold the deck's state), and
+/// in place otherwise.
+fn deliver(owed: Option<(NoticeSink, Vec<CallerNotice>)>) {
+    let Some((sink, notices)) = owed else {
+        return;
+    };
+    let post = move || {
+        for notice in notices {
+            sink(notice);
+        }
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn_blocking(post);
+        }
+        Err(_) => post(),
+    }
+}
+
+/// Issue #2348: the serving daemon's sink — post each notice to its caller's
+/// inbox as a deck notice, only while the agent it names still holds its
+/// pane. A caller that is gone is skipped.
+pub fn inbox_sink(registry: std::sync::Weak<crate::agent_pty::AgentPtyRegistry>) -> NoticeSink {
+    Arc::new(move |notice: CallerNotice| {
+        let Some(registry) = registry.upgrade() else {
+            return;
+        };
+        let to = crate::inbox::Recipient::bound(&notice.pane_id, &notice.agent_id);
+        match crate::inbox_hub::post_notice_to_live(&registry, to, notice.subject, notice.body) {
+            Ok(id) => tracing::info!(
+                pane_id = %crate::config_validation::escape_id_for_log(&notice.pane_id),
+                message_id = %id,
+                answer = ?notice.answer,
+                "trust request: told a refused caller the answer"
+            ),
+            Err(error) => tracing::info!(
+                pane_id = %crate::config_validation::escape_id_for_log(&notice.pane_id),
+                %error,
+                answer = ?notice.answer,
+                "trust request: a refused caller was not told the answer (it is gone, or its \
+                 inbox refused the notice)"
+            ),
+        }
+    })
 }
 
 /// Whether this process raises requests (it is a serving daemon).
@@ -298,7 +556,14 @@ pub fn list() -> Option<TrustRequestList> {
 /// ([`TrustRequestHub::raise`]) and the refusal says so — or says the user
 /// declined it — and an approved one closes any request pending for its text.
 /// Elsewhere, [`TrustCheck::refusal`] unchanged.
-pub fn refusal_for(check: &TrustCheck, asked_by: &str) -> Option<String> {
+///
+/// `caller` is the agent that tried, when an agent did (issue #2348): it is
+/// recorded against the request and told the answer when the request closes.
+pub fn refusal_for(
+    check: &TrustCheck,
+    asked_by: &str,
+    caller: Option<&RefusedCaller>,
+) -> Option<String> {
     let mut served = served();
     if served.tx.is_none() {
         return check.refusal();
@@ -312,19 +577,28 @@ pub fn refusal_for(check: &TrustCheck, asked_by: &str) -> Option<String> {
         let project = check.project.display().to_string();
         if served
             .hub
-            .settle_approved(&project, &check.orchestration, &digest)
+            .settle_approved_except(&project, &check.orchestration, &digest, caller)
         {
             broadcast(&served);
         }
+        let owed = owed(&mut served);
+        drop(served);
+        deliver(owed);
         return None;
     }
-    let (raised, changed) = served.hub.raise(check, asked_by);
+    let (raised, changed) = served.hub.raise_for(check, asked_by, caller);
     if changed {
         broadcast(&served);
     }
+    // Issue #2348: the refusal promises a notice only to a caller the hub
+    // recorded (and has somewhere to post it).
+    let told = served.sink.is_some()
+        && caller.is_some_and(|caller| served.hub.is_waiting(&RequestKey::of(check), caller));
+    let owed = owed(&mut served);
     drop(served);
+    deliver(owed);
     Some(match raised {
-        Raised::Pending => crate::project_trust::requested_refusal_text(check),
+        Raised::Pending => crate::project_trust::requested_refusal_text(check, told),
         Raised::Declined => crate::project_trust::declined_refusal_text(check),
         Raised::Full => check.refusal()?,
     })
@@ -343,6 +617,9 @@ pub fn note_approved(project: &Path, orchestration: &str, digest: &str) {
     {
         broadcast(&served);
     }
+    let owed = owed(&mut served);
+    drop(served);
+    deliver(owed);
 }
 
 /// The user declined request `id` in a client (`DenyTrustRequest`). Answers
@@ -361,32 +638,39 @@ pub fn deny(id: u64, digest: &str) -> (Denied, Option<TrustRequestList>) {
         );
         broadcast(&served);
     }
-    (denied, Some(served.hub.list()))
+    let list = served.hub.list();
+    let owed = owed(&mut served);
+    drop(served);
+    deliver(owed);
+    (denied, Some(list))
 }
 
-/// Which of `pending` no longer needs an answer: approved since it was raised
-/// (from the CLI, or another path), its config now reads other text, or the
-/// config or the orchestration is gone. A store that cannot be read right now
-/// settles nothing: the request stays until a read answers. Blocking — reads
-/// the store and the configs.
+/// Which of `pending` no longer needs an answer, and how each closed:
+/// approved since it was raised (from the CLI, or another path) is
+/// [`Answer::Approved`]; its config now reading other text, or the config or
+/// the orchestration being gone, is [`Answer::Withdrawn`]. A store that cannot
+/// be read right now settles nothing: the request stays until a read answers.
+/// Blocking — reads the store and the configs.
 pub fn stale_requests_blocking(
     store: &crate::project_trust::TrustStore,
     pending: &[TrustRequest],
-) -> BTreeSet<u64> {
+) -> BTreeMap<u64, Answer> {
     pending
         .iter()
-        .filter(|request| {
-            match crate::project_trust::inspect(
+        .filter_map(|request| {
+            let answer = match crate::project_trust::inspect(
                 store,
                 Path::new(&request.config_dir),
                 &request.orchestration,
             ) {
-                Ok(check) => check.verdict.is_approved() || check.digest() != request.digest,
-                Err(crate::project_trust::TrustError::Store(_)) => false,
-                Err(_) => true,
-            }
+                Ok(check) if check.verdict.is_approved() => Answer::Approved,
+                Ok(check) if check.digest() != request.digest => Answer::Withdrawn,
+                Ok(_) => return None,
+                Err(crate::project_trust::TrustError::Store(_)) => return None,
+                Err(_) => Answer::Withdrawn,
+            };
+            Some((request.id, answer))
         })
-        .map(|request| request.id)
         .collect()
 }
 
@@ -421,6 +705,9 @@ pub async fn run_sweep() {
         if served.hub.drop_requests(&stale) {
             broadcast(&served);
         }
+        let owed = owed(&mut served);
+        drop(served);
+        deliver(owed);
     }
 }
 
@@ -564,16 +851,16 @@ mod tests {
     fn the_served_hub_raises_broadcasts_and_words_the_refusal() {
         let c = check("/served-hub-test", "team", "claude");
         assert_eq!(
-            refusal_for(&c, "dispatch"),
+            refusal_for(&c, "dispatch", None),
             c.refusal(),
             "an unserved process refuses as PRD #1885 did"
         );
         assert!(list().is_none());
         let (tx, mut rx) = broadcast::channel(8);
-        install(tx);
+        install(tx, None);
         assert!(is_served());
 
-        let refusal = refusal_for(&c, "dispatch").expect("refused");
+        let refusal = refusal_for(&c, "dispatch", None).expect("refused");
         assert!(refusal.contains("requested in the deck"), "{refusal}");
         assert!(
             refusal.contains("dot-agent-deck trust approve"),
@@ -586,14 +873,14 @@ mod tests {
         assert_eq!(sent.requests.len(), 1);
         assert_eq!(list().expect("served").requests, sent.requests);
         // The retry: same refusal, nothing broadcast.
-        assert!(refusal_for(&c, "dispatch").is_some());
+        assert!(refusal_for(&c, "dispatch", None).is_some());
         assert!(rx.try_recv().is_err(), "a retry broadcasts nothing");
 
         let (denied, after) = deny(sent.requests[0].id, &c.digest());
         assert_eq!(denied, Denied::Declined);
         assert!(after.expect("served").requests.is_empty());
         assert!(matches!(rx.try_recv(), Ok(BroadcastMsg::TrustRequests(_))));
-        let refusal = refusal_for(&c, "schedule").expect("refused");
+        let refusal = refusal_for(&c, "schedule", None).expect("refused");
         assert!(
             refusal.contains(crate::project_trust::DECLINED_IN_DECK),
             "{refusal}"
@@ -603,9 +890,9 @@ mod tests {
         // Approved text: no refusal, and the denial is forgotten.
         let mut approved = c.clone();
         approved.verdict = TrustVerdict::Approved;
-        assert_eq!(refusal_for(&approved, "dispatch"), None);
+        assert_eq!(refusal_for(&approved, "dispatch", None), None);
         assert!(
-            refusal_for(&c, "dispatch")
+            refusal_for(&c, "dispatch", None)
                 .expect("refused")
                 .contains("requested in the deck")
         );
@@ -645,19 +932,22 @@ mod tests {
         config("cat --edited");
         assert_eq!(
             stale_requests_blocking(&store, &pending),
-            BTreeSet::from([pending[0].id]),
+            BTreeMap::from([(pending[0].id, Answer::Withdrawn)]),
             "other text: approving this request could not record it"
         );
         config("cat");
         crate::project_trust::approve_all_for_test(&dir);
         assert_eq!(
             stale_requests_blocking(&store, &pending),
-            BTreeSet::from([pending[0].id]),
+            BTreeMap::from([(pending[0].id, Answer::Approved)]),
             "approved elsewhere"
         );
         let mut gone = pending.clone();
         gone[0].config_dir = tmp.path().join("missing").display().to_string();
-        assert_eq!(stale_requests_blocking(&store, &gone).len(), 1);
+        assert_eq!(
+            stale_requests_blocking(&store, &gone),
+            BTreeMap::from([(pending[0].id, Answer::Withdrawn)])
+        );
     }
 
     #[test]
@@ -731,15 +1021,221 @@ mod tests {
         assert!(crate::daemon_protocol::DAEMON_CAPABILITIES.contains(&CAP_TRUST_REQUESTS));
     }
 
+    fn caller(pane: &str, agent: &str, verb: &str) -> RefusedCaller {
+        RefusedCaller::new(pane, agent, verb)
+    }
+
+    /// Issue #2348: every agent refused for a request is told once when it is
+    /// approved, naming each verb it was refused; a schedule (no caller) is
+    /// told nothing, and a second settle tells no one again.
+    #[test]
+    fn an_approval_tells_each_refused_caller_once() {
+        let mut hub = TrustRequestHub::default();
+        let c = check("/p", "team", "claude");
+        let dispatcher = caller("1", "agent-a", "dispatch");
+        hub.raise_for(&c, "dispatch", Some(&dispatcher));
+        hub.raise_for(&c, "dispatch", Some(&dispatcher));
+        hub.raise_for(
+            &c,
+            "pane spawn",
+            Some(&caller("1", "agent-a", "pane spawn")),
+        );
+        hub.raise_for(&c, "delegate", Some(&caller("2", "agent-b", "delegate")));
+        hub.raise_for(&c, "scheduled task 'nightly'", None);
+        assert!(hub.is_waiting(&RequestKey::of(&c), &dispatcher));
+        assert!(hub.take_notices().is_empty(), "nothing is owed yet");
+
+        assert!(hub.settle_approved("/p", "team", &c.digest()));
+        let notices = hub.take_notices();
+        assert_eq!(notices.len(), 2, "one per agent: {notices:?}");
+        assert_eq!(
+            (notices[0].pane_id.as_str(), notices[0].agent_id.as_str()),
+            ("1", "agent-a")
+        );
+        assert!(notices.iter().all(|n| n.answer == Answer::Approved));
+        assert_eq!(notices[0].subject, "orchestration approved");
+        assert!(
+            notices[0]
+                .body
+                .contains("Retry your dispatch and pane spawn now"),
+            "{}",
+            notices[0].body
+        );
+        assert!(
+            notices[0]
+                .body
+                .contains("'team' of project /p was approved")
+        );
+        assert!(notices[1].body.contains("Retry your delegate now"));
+        assert!(!hub.settle_approved("/p", "team", &c.digest()));
+        assert!(hub.take_notices().is_empty(), "told once per answer");
+        assert!(!hub.is_waiting(&RequestKey::of(&c), &dispatcher));
+    }
+
+    #[test]
+    fn a_denial_tells_the_refused_callers_it_was_declined() {
+        let mut hub = TrustRequestHub::default();
+        let c = check("/p", "team", "claude");
+        hub.raise_for(&c, "dispatch", Some(&caller("1", "agent-a", "dispatch")));
+        let id = hub.list().requests[0].id;
+        assert_eq!(hub.deny(id, "another text"), Denied::Unknown);
+        assert!(hub.take_notices().is_empty());
+        assert_eq!(hub.deny(id, &c.digest()), Denied::Declined);
+        let notices = hub.take_notices();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].answer, Answer::Declined);
+        assert_eq!(notices[0].subject, "orchestration declined");
+        assert!(
+            notices[0]
+                .body
+                .contains(crate::project_trust::DECLINED_IN_DECK),
+            "{}",
+            notices[0].body
+        );
+        assert!(notices[0].body.contains("do not retry"));
+        // A declined text records no caller: the refusal already says so.
+        hub.raise_for(&c, "dispatch", Some(&caller("1", "agent-a", "dispatch")));
+        hub.settle_approved("/p", "team", &c.digest());
+        assert!(hub.take_notices().is_empty());
+    }
+
+    /// The sweep closes a request approved from the CLI as approved, and one
+    /// whose config changed as closed unanswered; each caller is told.
+    #[test]
+    fn the_sweep_tells_the_callers_how_each_request_closed() {
+        let mut hub = TrustRequestHub::default();
+        let a = check("/p", "team", "claude");
+        let b = check("/q", "team", "claude");
+        hub.raise_for(&a, "dispatch", Some(&caller("1", "agent-a", "dispatch")));
+        hub.raise_for(
+            &b,
+            "pane restart",
+            Some(&caller("2", "agent-b", "pane restart")),
+        );
+        let ids: Vec<u64> = hub.list().requests.iter().map(|r| r.id).collect();
+        assert!(hub.drop_requests(&BTreeMap::from([
+            (ids[0], Answer::Approved),
+            (ids[1], Answer::Withdrawn),
+        ])));
+        let notices = hub.take_notices();
+        assert_eq!(notices.len(), 2);
+        assert_eq!(notices[0].answer, Answer::Approved);
+        assert_eq!(notices[1].answer, Answer::Withdrawn);
+        assert_eq!(notices[1].subject, "approval request closed");
+        assert!(
+            notices[1].body.contains("Retry your pane restart"),
+            "{}",
+            notices[1].body
+        );
+    }
+
+    /// A new text of the orchestration takes the old request's place, and
+    /// its callers with it: their retry reads the config as it now reads.
+    #[test]
+    fn a_replacing_request_keeps_the_callers_waiting_on_the_old_one() {
+        let mut hub = TrustRequestHub::default();
+        let old = check("/p", "team", "claude");
+        let new = check("/p", "team", "claude --model haiku");
+        hub.raise_for(&old, "dispatch", Some(&caller("1", "agent-a", "dispatch")));
+        hub.raise_for(&new, "delegate", Some(&caller("2", "agent-b", "delegate")));
+        assert!(hub.take_notices().is_empty(), "replacing tells no one");
+        hub.settle_approved("/p", "team", &new.digest());
+        let told: Vec<String> = hub.take_notices().into_iter().map(|n| n.pane_id).collect();
+        assert_eq!(told, ["1", "2"]);
+    }
+
+    /// The caller whose own retry found the text approved is already starting
+    /// it, so it is not told to retry; the others are.
+    #[test]
+    fn the_caller_that_found_it_approved_is_not_told_to_retry() {
+        let mut hub = TrustRequestHub::default();
+        let c = check("/p", "team", "claude");
+        let a = caller("1", "agent-a", "dispatch");
+        hub.raise_for(&c, "dispatch", Some(&a));
+        hub.raise_for(&c, "delegate", Some(&caller("2", "agent-b", "delegate")));
+        hub.settle_approved_except("/p", "team", &c.digest(), Some(&a));
+        let told: Vec<String> = hub.take_notices().into_iter().map(|n| n.pane_id).collect();
+        assert_eq!(told, ["2"]);
+    }
+
+    #[test]
+    fn the_callers_of_one_request_are_bounded() {
+        let mut hub = TrustRequestHub::default();
+        let c = check("/p", "team", "claude");
+        for n in 0..MAX_WAITING_CALLERS + 10 {
+            hub.raise_for(
+                &c,
+                "dispatch",
+                Some(&caller(&n.to_string(), "a", "dispatch")),
+            );
+        }
+        hub.settle_approved("/p", "team", &c.digest());
+        assert_eq!(hub.take_notices().len(), MAX_WAITING_CALLERS);
+    }
+
+    /// Issue #2348 through the served hub: the refusal promises the caller a
+    /// notice only when one will be sent, and the sink receives it once the
+    /// request is answered — approved by a client (`note_approved`) or
+    /// declined (`deny`). (nextest runs each test in its own process.)
+    #[test]
+    fn the_served_hub_posts_the_answer_to_the_refused_caller() {
+        let (tx, _rx) = broadcast::channel(8);
+        let got: Arc<Mutex<Vec<CallerNotice>>> = Arc::default();
+        let sink_got = Arc::clone(&got);
+        install(
+            tx,
+            Some(Arc::new(move |n: CallerNotice| {
+                sink_got.lock().unwrap().push(n)
+            })),
+        );
+        let c = check("/served-notice-test", "team", "claude");
+        let a = caller("7", "agent-7", "dispatch");
+
+        let schedule = refusal_for(&c, "scheduled task 'nightly'", None).expect("refused");
+        assert!(
+            schedule.contains(crate::project_trust::REQUESTED_RETRY),
+            "{schedule}"
+        );
+        assert!(!schedule.contains(crate::project_trust::REQUESTED_WILL_TELL));
+        let refusal = refusal_for(&c, "dispatch", Some(&a)).expect("refused");
+        assert!(
+            refusal.contains(crate::project_trust::REQUESTED_WILL_TELL),
+            "{refusal}"
+        );
+        assert!(refusal.contains("requested in the deck"), "{refusal}");
+        assert!(got.lock().unwrap().is_empty());
+
+        note_approved(&c.project, &c.orchestration, &c.digest());
+        let notices = std::mem::take(&mut *got.lock().unwrap());
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert_eq!(notices[0].pane_id, "7");
+        assert_eq!(notices[0].agent_id, "agent-7");
+        assert_eq!(notices[0].answer, Answer::Approved);
+
+        let edited = check("/served-notice-test", "team", "claude --edited");
+        refusal_for(
+            &edited,
+            "delegate",
+            Some(&caller("8", "agent-8", "delegate")),
+        );
+        let id = list().expect("served").requests[0].id;
+        deny(id, &edited.digest());
+        let notices = std::mem::take(&mut *got.lock().unwrap());
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert_eq!(notices[0].answer, Answer::Declined);
+        served().tx = None;
+        served().sink = None;
+    }
+
     #[test]
     fn dropping_requests_moves_the_revision_only_when_one_went() {
         let mut hub = TrustRequestHub::default();
         hub.raise(&check("/p", "team", "claude"), "dispatch");
         let id = hub.list().requests[0].id;
         let rev = hub.list().revision;
-        assert!(!hub.drop_requests(&BTreeSet::from([id + 100])));
+        assert!(!hub.drop_requests(&BTreeMap::from([(id + 100, Answer::Withdrawn)])));
         assert_eq!(hub.list().revision, rev);
-        assert!(hub.drop_requests(&BTreeSet::from([id])));
+        assert!(hub.drop_requests(&BTreeMap::from([(id, Answer::Withdrawn)])));
         assert!(hub.list().revision > rev);
         assert!(hub.list().requests.is_empty());
     }
