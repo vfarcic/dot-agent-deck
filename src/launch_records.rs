@@ -117,8 +117,18 @@ pub struct LaunchRecord {
     pub shell: Option<String>,
     /// The agent the command runs, when the spawn said.
     pub agent_type: Option<AgentType>,
-    /// The folder it started in, as an absolute path.
+    /// The folder it started in, as an absolute path. `None` when it could
+    /// not be resolved, which includes a prepared start whose directory had
+    /// been moved away ([`Self::cwd_moved_from`]).
     pub cwd: Option<String>,
+    /// For a prepared start only: the absolute path it asked for, when the
+    /// directory it was verified against and entered was no longer at that
+    /// path at launch and no other path naming that directory could be
+    /// found. `cwd` is then `None`: this path names a different directory,
+    /// or nothing, and a restore must not start the agent there. Absent from
+    /// the file otherwise (a record written before it existed reads `None`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd_moved_from: Option<String>,
     /// The pane's display name.
     pub name: Option<String>,
     /// Its role, for a role pane of an orchestration.
@@ -499,6 +509,7 @@ mod tests {
             shell: None,
             agent_type: Some(AgentType::ClaudeCode),
             cwd: Some("/abs/folder".into()),
+            cwd_moved_from: None,
             name: Some("A name with spaces".into()),
             role: Some("coder".into()),
             orchestration: Some("tdd".into()),

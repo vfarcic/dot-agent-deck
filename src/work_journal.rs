@@ -2388,6 +2388,36 @@ impl WorkJournal {
         }
     }
 
+    /// PRD #1790: [`Self::record`] for an orderly shutdown's last events:
+    /// outside the session quota, and waiting for queue room until
+    /// `deadline` instead of dropping the event at once. `true` when it was
+    /// queued (or there is no writer to queue it for, as for
+    /// [`Self::flush_within`]); `false` when the deadline passed first.
+    pub fn record_within(&self, event: Event, deadline: Instant) -> bool {
+        let Some(tx) = self.shared.store.as_ref().and_then(Store::tx) else {
+            return true;
+        };
+        let mut cmd = Cmd::Record {
+            event,
+            ts_ms: now_ms(),
+            reply: None,
+            quota: false,
+        };
+        loop {
+            match tx.try_send(cmd) {
+                Ok(()) => return true,
+                Err(TrySendError::Disconnected(_)) => return true,
+                Err(TrySendError::Full(back)) => {
+                    if Instant::now() >= deadline {
+                        return false;
+                    }
+                    cmd = back;
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+    }
+
     /// [`Self::flush`], waiting at most `bound`; `true` when it drained.
     pub fn flush_within(&self, bound: Duration) -> bool {
         let Some(tx) = self.shared.store.as_ref().and_then(Store::tx) else {

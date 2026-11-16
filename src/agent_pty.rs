@@ -1037,13 +1037,80 @@ pub struct AgentPty {
     #[cfg(target_os = "linux")]
     pub opened: Option<u64>,
     /// PRD #1790: the absolute folder the child was started in: for a
-    /// prepared start, the path it asked for and was verified against (not
-    /// the descriptor alias it entered through on Linux); otherwise resolved
+    /// prepared start, a path naming the verified directory it entered
+    /// ([`prepared_launch_folder`]: the path it asked for while that still
+    /// names it, never the descriptor alias it entered through on Linux);
+    /// otherwise resolved
     /// as the PTY library resolves it ([`effective_launch_dir`]): the spawn's
     /// cwd, or with none (or one that is not a directory) the child's `HOME`.
     /// Not the registry's `cwd` metadata, which keeps only what the caller
-    /// gave. `None` when it could not be resolved.
+    /// gave. `None` when it could not be resolved, and for a prepared start
+    /// whose directory was moved away from the path it asked for to where
+    /// no path can be found for it ([`Self::launch_dir_moved_from`]).
     pub launch_dir: Option<String>,
+    /// PRD #1790: for a prepared start whose verified directory no longer
+    /// sat at the path it asked for when the child entered it, and whose
+    /// current path could not be resolved ([`prepared_launch_folder`]), that
+    /// requested path, which names some other directory or nothing. `None`
+    /// otherwise.
+    pub launch_dir_moved_from: Option<String>,
+}
+
+/// PRD #1790: where a prepared start's launch record says its child started.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PreparedLaunchFolder {
+    /// An absolute path that, when it was checked, named the verified
+    /// directory itself (no final symlink followed).
+    At(String),
+    /// The verified directory was no longer at the requested path (this
+    /// absolute path), and no path naming it could be resolved.
+    MovedFrom(String),
+}
+
+/// PRD #1790: the absolute path that names `dir`, the verified directory a
+/// prepared start's child enters, for its launch record. The requested path
+/// when it still names `dir` (compared by `(dev, ino)`, the final component
+/// not followed); otherwise the path the system reports for the held
+/// descriptor (Linux: `/proc/self/fd/N`'s link), taken only once its own
+/// `(dev, ino)`, read the same way, is `dir`'s. Neither: the directory was
+/// moved, or removed, from the path the start asked for, and the record
+/// says so ([`PreparedLaunchFolder::MovedFrom`]) instead of naming the
+/// replacement the child never entered. `None` for a start with no path.
+#[cfg(unix)]
+pub(crate) fn prepared_launch_folder(
+    requested: Option<&str>,
+    dir: &crate::project_resolve::VerifiedProjectDir,
+) -> Option<PreparedLaunchFolder> {
+    let requested = std::path::absolute(requested?).ok()?;
+    let names_dir = |path: &std::path::Path| {
+        std::fs::symlink_metadata(path)
+            .ok()
+            .filter(std::fs::Metadata::is_dir)
+            .as_ref()
+            .and_then(crate::prep_token::inode_identity)
+            == Some(dir.identity())
+    };
+    if names_dir(&requested) {
+        return Some(PreparedLaunchFolder::At(
+            requested.to_string_lossy().into_owned(),
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::{AsFd as _, AsRawFd as _};
+        let via_fd = format!("/proc/self/fd/{}", dir.as_fd().as_raw_fd());
+        if let Ok(current) = std::fs::read_link(&via_fd)
+            && current.is_absolute()
+            && names_dir(&current)
+        {
+            return Some(PreparedLaunchFolder::At(
+                current.to_string_lossy().into_owned(),
+            ));
+        }
+    }
+    Some(PreparedLaunchFolder::MovedFrom(
+        requested.to_string_lossy().into_owned(),
+    ))
 }
 
 /// PRD #1790: the folder `cmd`'s child starts in, as an absolute path,
@@ -1982,20 +2049,18 @@ fn spawn_with_dir(
     }
 
     // PRD #1790: the folder a launch record keeps. For a prepared start it is
-    // the path the start asked for and was verified against, as an absolute
-    // path: the cwd below is only how the child enters it (on Linux a
-    // `/proc/self/fd/N` alias of this process's descriptor, which names
-    // nothing once that descriptor is closed or the daemon restarts).
+    // a path that names the verified directory the child enters, normally
+    // the one the start asked for ([`prepared_launch_folder`]): the cwd below
+    // is only how the child enters it (on Linux a `/proc/self/fd/N` alias of
+    // this process's descriptor, which names nothing once that descriptor is
+    // closed or the daemon restarts).
     #[allow(unused_mut)]
-    let mut prepared_launch_dir: Option<String> = None;
+    let mut prepared_launch: Option<Option<PreparedLaunchFolder>> = None;
     // Issue #1233 item 2: as late as the parent can decide it. See `spawn_in`.
     #[cfg(unix)]
     if let Some(dir) = verified_dir {
         let cwd = prepared_spawn_cwd(opts.cwd, dir)?;
-        prepared_launch_dir = opts
-            .cwd
-            .and_then(|path| std::path::absolute(path).ok())
-            .map(|path| path.to_string_lossy().into_owned());
+        prepared_launch = Some(prepared_launch_folder(opts.cwd, dir));
         // Probe the program against the held descriptor where the child enters
         // it (Linux), and by pathname where the child does too.
         #[cfg(target_os = "linux")]
@@ -2011,7 +2076,12 @@ fn spawn_with_dir(
     }
 
     let argv = cmd.get_argv().clone();
-    let launch_dir = prepared_launch_dir.or_else(|| effective_launch_dir(&cmd));
+    let (launch_dir, launch_dir_moved_from) = match prepared_launch {
+        Some(Some(PreparedLaunchFolder::At(path))) => (Some(path), None),
+        Some(Some(PreparedLaunchFolder::MovedFrom(path))) => (None, Some(path)),
+        Some(None) => (None, None),
+        None => (effective_launch_dir(&cmd), None),
+    };
     let child = pair
         .slave
         .spawn_command(cmd)
@@ -2078,6 +2148,7 @@ fn spawn_with_dir(
         #[cfg(target_os = "linux")]
         opened,
         launch_dir,
+        launch_dir_moved_from,
     })
 }
 
@@ -15065,6 +15136,7 @@ impl AgentPtyRegistry {
             #[cfg(target_os = "linux")]
             opened,
             launch_dir,
+            launch_dir_moved_from,
         } = pty;
         // PRD #1666 part 3 (Q84): what the deck executed, for the observer's
         // binding of `A`.
@@ -15218,6 +15290,7 @@ impl AgentPtyRegistry {
                 overlay_value(&captured_env, "SHELL").map(str::to_string),
                 spawn_agent_type.clone(),
                 launch_dir,
+                launch_dir_moved_from,
                 display_name.clone(),
                 tab_membership.clone(),
             )
@@ -15343,8 +15416,10 @@ impl AgentPtyRegistry {
         drop(inner);
         // PRD #1790: how this attempt was launched, kept across a restart
         // (file I/O, so after the registry lock is released).
-        if let (Some(work), Some((command, shell, agent_type, cwd, name, membership))) =
-            (&work, &launch_record)
+        if let (
+            Some(work),
+            Some((command, shell, agent_type, cwd, cwd_moved_from, name, membership)),
+        ) = (&work, &launch_record)
         {
             self.work.launch_recorded(
                 work,
@@ -15354,6 +15429,7 @@ impl AgentPtyRegistry {
                     shell: shell.as_deref(),
                     agent_type: agent_type.as_ref(),
                     cwd: cwd.as_deref(),
+                    cwd_moved_from: cwd_moved_from.as_deref(),
                     name: name.as_deref(),
                     membership: membership.as_ref(),
                 },
@@ -24621,6 +24697,10 @@ mod spawn_tests {
 
         let path = dir.to_str().expect("utf-8 tempdir");
         let pty = spawn_in(marker_writer(path), &verified).expect("spawn should succeed");
+        // PRD #1790 (G2): the folder the launch record gets is where the
+        // directory the child entered now is, not the replacement.
+        let launch_dir = pty.launch_dir.clone();
+        let moved_from = pty.launch_dir_moved_from.clone();
         let mut child = pty.child;
         let status = child.wait().expect("wait should succeed");
         assert!(status.success(), "the marker writer failed: {status:?}");
@@ -24634,6 +24714,52 @@ mod spawn_tests {
             !dir.join("marker").exists(),
             "the child ran in the replacement at the verified path"
         );
+        let recorded = launch_dir.expect("a moved directory that still exists has a path");
+        assert_eq!(
+            std::fs::canonicalize(&recorded).unwrap(),
+            std::fs::canonicalize(&old).unwrap(),
+            "the launch folder must be where the child ran, not the replacement at {path}"
+        );
+        assert_eq!(moved_from, None);
+    }
+
+    /// PRD #1790 (G2): the launch folder of a prepared start names the
+    /// verified directory: the requested path while it still names it;
+    /// after a rename-and-replace, the directory's current path (Linux, from
+    /// its descriptor); and once the directory is gone, no folder, only the
+    /// path it was moved from, never the replacement standing there.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_prepared_launch_folder_follows_the_verified_directory_not_its_path() {
+        let root = tempfile::tempdir().expect("create tempdir");
+        let dir = root.path().join("d");
+        std::fs::create_dir(&dir).expect("create the project dir");
+        let path = dir.to_str().expect("utf-8 tempdir");
+        let verified = crate::project_resolve::VerifiedProjectDir::open(&dir).expect("open");
+        assert_eq!(
+            prepared_launch_folder(Some(path), &verified),
+            Some(PreparedLaunchFolder::At(path.to_string())),
+            "an unmoved directory keeps the path the start asked for"
+        );
+        drop(verified);
+
+        let (verified, old) = verify_then_replace(&dir);
+        let real_old = std::fs::canonicalize(&old).unwrap();
+        assert_eq!(
+            prepared_launch_folder(Some(path), &verified),
+            Some(PreparedLaunchFolder::At(
+                real_old.to_string_lossy().into_owned()
+            )),
+            "a moved directory is recorded where it now is"
+        );
+
+        std::fs::remove_dir(&old).expect("remove the verified directory");
+        assert_eq!(
+            prepared_launch_folder(Some(path), &verified),
+            Some(PreparedLaunchFolder::MovedFrom(path.to_string())),
+            "a directory with no path left is recorded as moved, not as the replacement"
+        );
+        assert_eq!(prepared_launch_folder(None, &verified), None);
     }
 
     /// Issue #1233 review (PR #1407): a prepared start whose program is a

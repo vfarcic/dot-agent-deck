@@ -62,19 +62,21 @@ const MAX_SETTLED_TASKS: usize = 4096;
 
 /// PRD #1790: the most `attempt_session` lines one attempt writes as soon as
 /// its session id changes. Past it the latest id is held, not written at
-/// once: [`WorkTracker::flush_held_sessions`] writes it at its next round
-/// (every [`SESSION_FLUSH_EVERY`] in the daemon, [`spawn_session_flush`]),
-/// one line per attempt per round however often the id changed in between,
-/// and the attempt's end writes it too ([`WorkTracker::attempt_ended`]). So
-/// a producer that flaps between ids writes at most this many lines, then at
-/// most one per round, then one at its end.
+/// once: [`WorkTracker::flush_held_sessions`] writes it at its first round
+/// that finds room in the session quota (every [`SESSION_FLUSH_EVERY`] in
+/// the daemon, [`spawn_session_flush`]), one line per attempt per round
+/// however often the id changed in between, and the attempt's end writes it
+/// too ([`WorkTracker::attempt_ended`]), as does an orderly shutdown
+/// ([`WorkTracker::drain`]). So a producer that flaps between ids writes at
+/// most this many lines, then at most one per round, then one at its end.
 pub const MAX_SESSION_LINES: usize = 32;
 
 /// PRD #1790: how often the daemon writes the session ids its tracker holds
 /// back ([`spawn_session_flush`]): one refused by the journal's session
 /// quota, or one past [`MAX_SESSION_LINES`]. An id the tracker holds reaches
-/// the journal's queue at the next round after it was reported, while the
-/// daemon runs.
+/// the journal's queue at the first round after it was reported that finds
+/// room in the session quota, while the daemon runs, and at an orderly
+/// shutdown ([`WorkTracker::drain`]).
 pub const SESSION_FLUSH_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// PRD #1790: whether `session`, reported by an agent of type `agent` on
@@ -98,6 +100,10 @@ pub struct LaunchDetails<'a> {
     pub shell: Option<&'a str>,
     pub agent_type: Option<&'a AgentType>,
     pub cwd: Option<&'a str>,
+    /// The path a prepared start asked for, when its verified directory
+    /// had been moved from it and could not be found
+    /// ([`crate::launch_records::LaunchRecord::cwd_moved_from`]).
+    pub cwd_moved_from: Option<&'a str>,
     pub name: Option<&'a str>,
     pub membership: Option<&'a TabMembership>,
 }
@@ -253,8 +259,10 @@ struct SessionBook {
     /// How many `attempt_session` lines it wrote.
     written: usize,
     /// The latest id, when it is not the one last written: past the cap, or
-    /// refused by the journal's session quota. Written at the next
-    /// [`WorkTracker::flush_held_sessions`] round, or when the attempt ends.
+    /// refused by the journal's session quota. Written at the first
+    /// [`WorkTracker::flush_held_sessions`] round that finds quota room, at
+    /// an orderly shutdown's [`WorkTracker::drain`], or when the attempt
+    /// ends.
     held: Option<(String, AgentType)>,
 }
 
@@ -455,16 +463,76 @@ impl WorkTracker {
         }
     }
 
-    /// Wait at most `bound` for the journal's writer to write what it was
-    /// handed (a graceful shutdown).
+    /// An orderly shutdown's journal barrier, within `bound` in all: first
+    /// hand every live attempt's held-back session id
+    /// ([`Self::flush_held_sessions`]'s, which no later round will write)
+    /// to the writer, outside the session quota and waiting for queue room
+    /// rather than dropping it, then wait for the writer to write what it
+    /// was handed. So a graceful stop leaves each live attempt's latest
+    /// reported id on disk without relying on the next periodic round or on
+    /// the attempt's end, which a PTY reader detached at shutdown may never
+    /// reach. A session reported after this call is not covered.
     pub fn drain(&self, bound: std::time::Duration) {
-        if let Some(journal) = self.journal()
-            && !journal.flush_within(bound)
-        {
+        let Some(journal) = self.journal() else {
+            return;
+        };
+        let deadline = std::time::Instant::now() + bound;
+        let unsent = self.hand_over_held_sessions(journal, deadline);
+        if unsent > 0 {
+            tracing::warn!(
+                unsent,
+                "work journal: could not queue every held session id before shutdown"
+            );
+        }
+        if !journal.flush_within(deadline.saturating_duration_since(std::time::Instant::now())) {
             tracing::warn!(
                 "work journal: the writer did not drain before shutdown; its last events may be missing"
             );
         }
+    }
+
+    /// [`Self::drain`]'s first half: queue each live attempt's held session
+    /// id with [`WorkJournal::record_within`] until `deadline`, under the
+    /// book's lock so a session reported meanwhile is queued after it, not
+    /// before. The journal's writer never takes the book, so waiting for its
+    /// queue under the lock cannot deadlock. Answers how many held ids it
+    /// could not queue (kept held).
+    fn hand_over_held_sessions(
+        &self,
+        journal: &WorkJournal,
+        deadline: std::time::Instant,
+    ) -> usize {
+        let mut guard = self.book();
+        let book = &mut *guard;
+        let mut unsent = 0;
+        for (agent_id, entry) in &mut book.sessions {
+            let Some((session, agent)) = entry.held.take() else {
+                continue;
+            };
+            let (Some(work), Some(attempt)) = (
+                book.attempts.get(agent_id),
+                agent_id
+                    .parse::<u64>()
+                    .ok()
+                    .and_then(|agent| journal.attempt_id(agent)),
+            ) else {
+                entry.held = Some((session, agent));
+                continue;
+            };
+            let event = Event::AttemptSession {
+                work: work.clone(),
+                attempt,
+                session: session.clone(),
+                agent: agent.clone(),
+            };
+            if journal.record_within(event, deadline) {
+                entry.last = Some(session);
+            } else {
+                entry.held = Some((session, agent));
+                unsent += 1;
+            }
+        }
+        unsent
     }
 
     /// The run's journal, once installed.
@@ -789,7 +857,7 @@ impl WorkTracker {
     /// attempt to end or for another hook, and the writer writes and syncs
     /// it from there. A daemon that dies before that round, or before the
     /// writer took the line, loses that id, and the journal keeps the one
-    /// before it.
+    /// before it. An orderly shutdown writes it at [`Self::drain`].
     pub fn flush_held_sessions(&self) -> usize {
         let Some(journal) = self.journal() else {
             return 0;
@@ -963,6 +1031,7 @@ impl WorkTracker {
             shell: launch.shell.map(str::to_string),
             agent_type: launch.agent_type.cloned(),
             cwd,
+            cwd_moved_from: launch.cwd_moved_from.map(str::to_string),
             name: launch.name.map(str::to_string),
             role,
             orchestration,

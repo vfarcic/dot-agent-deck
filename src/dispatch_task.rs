@@ -12,19 +12,36 @@
 //!
 //! What [`save`] guarantees, and only when it answers `Ok`:
 //!
-//! - **By its owner and mode bits, no other account can write the worktree
-//!   root** (Unix; an ACL is not seen). Before it creates or changes
-//!   anything, the save refuses a worktree root that is
+//! - **By owner and mode bits, no other account can write the worktree
+//!   root or redirect its path** (Unix; an ACL is not seen). Before it
+//!   creates or changes anything, the save refuses a worktree root that is
 //!   owned by another account, writable by other, or writable by a group
 //!   that is not this account's private group
-//!   ([`crate::orchestrator_context::project_root_refusal`]), and one that
-//!   is not a git checkout. That is the trust boundary the rest relies on:
-//!   git below is asked by pathname, and an account that could rename
-//!   entries of the worktree root could swap `.dot-agent-deck` for another
-//!   directory while git looks and put it back before the file is created.
-//!   Such an account can already change the worktree's source, so the save
-//!   does not try to bind git's lookup to the directory it holds; it
-//!   refuses a worktree where another account has that access.
+//!   ([`crate::orchestrator_context::project_root_refusal`]); a worktree
+//!   path that another account could make name a different directory
+//!   ([`crate::orchestrator_context::resolve_trusted_dir_path`], below); and
+//!   a worktree that is not a git checkout. That is the trust boundary the
+//!   rest relies on: git below is asked by pathname, and an account that
+//!   could rename entries of the worktree root could swap `.dot-agent-deck`
+//!   for another directory while git looks and put it back before the file
+//!   is created; one that could rename entries of any directory above it
+//!   could do the same to the whole worktree. Such an account can already
+//!   change the worktree's source, or move it, so the save does not try to
+//!   bind git's lookup to the directory it holds; it refuses a worktree
+//!   where another account has that access.
+//! - **The path check** resolves the worktree's path as the kernel does,
+//!   from `/`, following each symlink, and judges every directory and
+//!   symlink on the way, `/` included, the way OpenSSH's `StrictModes` does:
+//!   each is owned by this account or root; a directory another account
+//!   can write (other write, or group write for a group that is not this
+//!   account's private group) has the sticky bit, and the entry below it on
+//!   the path is owned by this account, since the sticky bit only stops an
+//!   account renaming entries it does not own. So a worktree under `/tmp`
+//!   (`1777`, root's) in a directory of this account's own is accepted, and
+//!   one in a non-sticky `0777` directory, or reached through a symlink
+//!   placed in one, is refused. The resolved path, which goes through no
+//!   symlink, must name the worktree root the save holds open, and is where
+//!   git runs.
 //! - **The directory is the one it checked.** `.dot-agent-deck` is opened
 //!   once, without following a symlink, owned by this account and with group
 //!   and other write cleared on the held descriptor (or refused)
@@ -121,7 +138,7 @@ fn save_with(
     let held = crate::orchestrator_context::open_held_context_dir(worktree)?;
     ensure_ignore_file(&held)?;
     ensure_ignored(
-        worktree,
+        held.project_path(),
         &format!("{CONTEXT_DIR_NAME}/{name}"),
         git,
         deadline,
@@ -707,6 +724,127 @@ mod tests {
         // Other write, or another owner, is refused whatever the group.
         assert!(refusal(me, private, 0o757, me, Some(private)).is_some());
         assert!(refusal(other, shared, 0o755, me, Some(private)).is_some());
+    }
+
+    /// G1: the decision on each entry met while resolving the worktree's
+    /// path: owned by this account or root; a directory others can write
+    /// only with the sticky bit; an entry of such a directory owned by this
+    /// account; the private group's write is this account's own.
+    #[test]
+    fn only_a_path_other_accounts_cannot_redirect_is_accepted() {
+        use crate::orchestrator_context::{PathEntry, path_entry_refusal as refusal};
+        let (me, other, private, shared) = (1000, 1001, 1000, 100);
+        let dir = |uid, gid, mode| PathEntry {
+            uid,
+            gid,
+            mode,
+            dir: true,
+        };
+        let link = |uid| PathEntry {
+            uid,
+            gid: shared,
+            mode: 0o777,
+            dir: false,
+        };
+        let slash = dir(0, 0, 0o755);
+        // An ordinary path: `/`, `/home`, the user's own directories.
+        assert_eq!(refusal(None, slash, me, Some(private)), None);
+        assert_eq!(refusal(Some(slash), dir(0, 0, 0o755), me, None), None);
+        assert_eq!(refusal(Some(slash), dir(me, shared, 0o755), me, None), None);
+        assert_eq!(refusal(Some(slash), link(me), me, None), None);
+        assert_eq!(refusal(Some(slash), link(0), me, None), None);
+        // The private group may write; any other group, or other, may not
+        // without the sticky bit.
+        assert_eq!(
+            refusal(Some(slash), dir(me, private, 0o775), me, Some(private)),
+            None
+        );
+        assert!(refusal(Some(slash), dir(me, private, 0o775), me, None).is_some());
+        assert!(refusal(Some(slash), dir(0, shared, 0o775), me, Some(private)).is_some());
+        assert!(refusal(Some(slash), dir(0, 0, 0o777), me, None).is_some());
+        assert!(
+            refusal(None, dir(0, 0, 0o777), me, None).is_some(),
+            "`/` too"
+        );
+        // Another account's directory or symlink, whatever its mode.
+        assert!(refusal(Some(slash), dir(other, shared, 0o755), me, None).is_some());
+        assert!(refusal(Some(slash), link(other), me, None).is_some());
+        // A sticky shared directory is accepted, and then its entry on the
+        // path must be this account's own.
+        let tmp = dir(0, 0, 0o1777);
+        assert_eq!(refusal(Some(slash), tmp, me, None), None);
+        assert_eq!(refusal(Some(tmp), dir(me, shared, 0o700), me, None), None);
+        assert_eq!(refusal(Some(tmp), link(me), me, None), None);
+        assert!(refusal(Some(tmp), dir(0, 0, 0o755), me, None).is_some());
+        assert!(refusal(Some(tmp), link(0), me, None).is_some());
+        assert!(refusal(Some(tmp), dir(other, other, 0o700), me, None).is_some());
+    }
+
+    /// G1 (reviewer finding 1, auditor A1): a worktree whose parent every
+    /// account can write, without the sticky bit, is refused before
+    /// anything is created, since another account could rename the whole
+    /// worktree aside while git looks; the same parent with the sticky bit
+    /// (as `/tmp`) is saved into, and so is an ordinary parent only this
+    /// account writes.
+    #[cfg(unix)]
+    #[test]
+    fn a_worktree_under_a_shared_parent_is_saved_only_when_the_parent_is_sticky() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let shared = root.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        let repo = repo(&shared, None);
+        let exclude = repo.join(".git/info/exclude");
+        let exclude_before = std::fs::read(&exclude).ok();
+        let mode = |bits| std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(bits));
+        mode(0o777).unwrap();
+        let w = work();
+        let error = save(&repo, &w, "TASK").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+        assert!(error.to_string().contains("shared"), "{error}");
+        assert!(!repo.join(CONTEXT_DIR_NAME).exists(), "nothing created");
+        assert_eq!(
+            std::fs::read(&exclude).ok(),
+            exclude_before,
+            "nothing changed"
+        );
+        mode(0o1777).unwrap();
+        save(&repo, &w, "TASK").unwrap();
+        assert!(task_path(&repo, &w).exists(), "a sticky parent is accepted");
+        mode(0o755).unwrap();
+        let w2 = work();
+        save(&repo, &w2, "TASK").unwrap();
+        assert!(
+            task_path(&repo, &w2).exists(),
+            "an ordinary parent is accepted"
+        );
+    }
+
+    /// G1: a worktree named through a symlink that sits in a directory every
+    /// account can write is refused (that account could point the link at
+    /// another checkout while git looks); the same link in a directory only
+    /// this account writes is followed, and the task is saved in the
+    /// checkout it names.
+    #[cfg(unix)]
+    #[test]
+    fn a_worktree_path_through_a_shared_symlink_is_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let repo = repo(root.path(), None);
+        let shared = root.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+        std::os::unix::fs::symlink(&repo, shared.join("link")).unwrap();
+        let w = work();
+        let error = save(&shared.join("link"), &w, "TASK").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+        assert!(!repo.join(CONTEXT_DIR_NAME).exists(), "nothing created");
+        let own = root.path().join("own");
+        std::fs::create_dir(&own).unwrap();
+        std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(&repo, own.join("link")).unwrap();
+        save(&own.join("link"), &w, "TASK").unwrap();
+        assert!(task_path(&repo, &w).exists());
     }
 
     /// F3: a worktree root every account can write is refused before

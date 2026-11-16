@@ -3588,8 +3588,10 @@ pub fn ensure_git_excludes_context_dir(
 ///
 /// [`open_held_context_dir`] resolves the project pathname once and, before
 /// it creates or changes anything, refuses a project directory another
-/// account could write ([`project_root_refusal`], Unix) and one that is not a
-/// git checkout. Only then does it add `.dot-agent-deck/` to the clone's
+/// account could write ([`project_root_refusal`], Unix), a project path
+/// another account could redirect through a directory or symlink on the way
+/// to it ([`resolve_trusted_dir_path`], Unix), and one that is not a git
+/// checkout. Only then does it add `.dot-agent-deck/` to the clone's
 /// exclude, create `.dot-agent-deck` relative to the project when missing
 /// (`0o700`), open it once without following a symlink
 /// (`O_NOFOLLOW | O_DIRECTORY`), refuse one owned by another account (Unix),
@@ -3600,14 +3602,206 @@ pub fn ensure_git_excludes_context_dir(
 /// project directory's owner and mode are not judged.
 pub(crate) struct HeldContextDir {
     dir: ContextDir,
+    /// The project directory's path as [`resolve_trusted_dir_path`]
+    /// resolved it: absolute, through no symlink, and naming the held
+    /// project directory when checked (off Unix, the path as given).
+    project: std::path::PathBuf,
 }
 
 impl std::fmt::Debug for HeldContextDir {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HeldContextDir")
             .field("dir", &self.dir)
+            .field("project", &self.project)
             .finish_non_exhaustive()
     }
+}
+
+/// The owner, group, permission bits and kind of one entry on a path, as
+/// [`path_entry_refusal`] judges it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) struct PathEntry {
+    pub uid: u32,
+    pub gid: u32,
+    /// Permission bits (`0o7777`), the sticky bit included.
+    pub mode: u32,
+    /// A directory (not a symlink to one).
+    pub dir: bool,
+}
+
+impl PathEntry {
+    /// Whether an account other than the owner, and other than `euid`
+    /// through its private group (`private_group`, the same exception
+    /// [`project_root_refusal`] makes), may write the entry: other write,
+    /// or group write for any other group.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    fn others_may_write(self, private_group: Option<u32>) -> bool {
+        self.mode & 0o002 != 0 || (self.mode & 0o020 != 0 && private_group != Some(self.gid))
+    }
+
+    #[cfg_attr(not(unix), allow(dead_code))]
+    fn is_sticky(self) -> bool {
+        self.mode & 0o1000 != 0
+    }
+}
+
+/// PRD #1790: why `entry`, reached in directory `parent` (`None` for `/`)
+/// while resolving a path, lets an account other than `euid` and root
+/// replace what that path names, or `None` when it does not. The policy is
+/// OpenSSH's `StrictModes`, with the private-group exception
+/// [`project_root_refusal`] makes:
+///
+/// - the entry, directory or symlink, is owned by `euid` or by root: only
+///   they can change a directory's mode or a symlink's target;
+/// - a directory another account may write ([`PathEntry::others_may_write`])
+///   has the sticky bit, without which that account can rename any entry
+///   in it, the next component included;
+/// - an entry in such a sticky directory is owned by `euid`: the sticky bit
+///   stops an account from renaming an entry only when it does not own the
+///   entry, and the check above already refused every owner but `euid` and
+///   root, so this refuses root's entries there as well (the stricter
+///   reading, as nothing a dispatch creates sits under a root-owned entry
+///   of a sticky directory).
+///
+/// Pure, so every branch is testable without root. Mode bits only: an ACL
+/// granting another account write is not seen.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn path_entry_refusal(
+    parent: Option<PathEntry>,
+    entry: PathEntry,
+    euid: u32,
+    private_group: Option<u32>,
+) -> Option<&'static str> {
+    if entry.uid != euid && entry.uid != 0 {
+        return Some("is owned by another account");
+    }
+    if parent.is_some_and(|parent| parent.others_may_write(private_group)) && entry.uid != euid {
+        return Some("is in a directory other accounts can write and is not owned by this account");
+    }
+    if entry.dir && entry.others_may_write(private_group) && !entry.is_sticky() {
+        return Some("is a directory other accounts can write, without the sticky bit");
+    }
+    None
+}
+
+/// PRD #1790: resolve `path` the way the kernel does, from `/`, one
+/// component at a time, following each symlink (at most 40), and judge every
+/// entry consulted on the way, `/`, the final directory, and every symlink
+/// included, with [`path_entry_refusal`]. `Ok` answers the path it resolved
+/// to: absolute and through no symlink, every directory of which, by owner
+/// and mode, only `euid` and root can rename entries of (or the sticky bit
+/// stops other accounts from renaming the next one), so no other account
+/// can make that path name a different directory. `Err` is the refusal's
+/// reason, naming the entry. A relative `path` is made absolute against the
+/// current directory first.
+///
+/// The walk reads each entry by pathname (`lstat`, never following), top
+/// down: an entry's parent was judged first, and only `euid` or root can
+/// rename entries of a judged directory, so the entry read is the one the
+/// path names, unless `euid` or root changes it meanwhile. A caller that
+/// holds the final directory open compares its identity with the answer's
+/// ([`open_held_context_dir`]). A component that cannot be read is refused.
+/// `private_group` is asked at most once, and only when an entry is group
+/// writable.
+#[cfg(unix)]
+pub(crate) fn resolve_trusted_dir_path(
+    path: &std::path::Path,
+    euid: u32,
+    private_group: &dyn Fn() -> Option<u32>,
+) -> Result<std::path::PathBuf, String> {
+    use std::collections::VecDeque;
+    use std::ffi::OsString;
+    use std::os::unix::fs::MetadataExt as _;
+    use std::path::{Component, PathBuf};
+
+    const MAX_SYMLINK_HOPS: usize = 40;
+
+    fn push_front(pending: &mut VecDeque<OsString>, path: &std::path::Path) {
+        let parts: Vec<OsString> = path
+            .components()
+            .filter_map(|component| match component {
+                Component::Normal(name) => Some(name.to_os_string()),
+                Component::ParentDir => Some(OsString::from("..")),
+                Component::RootDir | Component::CurDir | Component::Prefix(_) => None,
+            })
+            .collect();
+        for part in parts.into_iter().rev() {
+            pending.push_front(part);
+        }
+    }
+
+    let path = std::path::absolute(path)
+        .map_err(|e| format!("`{}` cannot be made absolute ({e})", path.display()))?;
+    let private = std::cell::OnceCell::new();
+    let entry_of = |meta: &std::fs::Metadata| PathEntry {
+        uid: meta.uid(),
+        gid: meta.gid(),
+        mode: meta.mode() & 0o7777,
+        dir: meta.is_dir(),
+    };
+    let judge = |at: &std::path::Path, parent: Option<PathEntry>, entry: PathEntry| {
+        let group_writable =
+            entry.mode & 0o020 != 0 || parent.is_some_and(|parent| parent.mode & 0o020 != 0);
+        let private = if group_writable {
+            *private.get_or_init(private_group)
+        } else {
+            None
+        };
+        match path_entry_refusal(parent, entry, euid, private) {
+            Some(why) => Err(format!("`{}` {why}", at.display())),
+            None => Ok(()),
+        }
+    };
+    let lstat = |at: &std::path::Path| {
+        std::fs::symlink_metadata(at)
+            .map_err(|e| format!("`{}` cannot be read ({e})", at.display()))
+    };
+
+    let root = PathBuf::from("/");
+    let root_entry = entry_of(&lstat(&root)?);
+    judge(&root, None, root_entry)?;
+    // `chain` holds the resolved directories from `/` down to `current`.
+    let mut chain = vec![(root.clone(), root_entry)];
+    let mut pending = VecDeque::new();
+    push_front(&mut pending, &path);
+    let mut hops = 0;
+    while let Some(name) = pending.pop_front() {
+        if name == ".." {
+            // Every directory in `chain` was reached through no symlink, so
+            // its parent in the chain is its real one.
+            if chain.len() > 1 {
+                chain.pop();
+            }
+            continue;
+        }
+        let (current, parent) = chain.last().cloned().expect("`/` is never popped");
+        let at = current.join(&name);
+        let meta = lstat(&at)?;
+        let entry = entry_of(&meta);
+        judge(&at, Some(parent), entry)?;
+        if meta.file_type().is_symlink() {
+            hops += 1;
+            if hops > MAX_SYMLINK_HOPS {
+                return Err(format!(
+                    "`{}` goes through too many symlinks",
+                    path.display()
+                ));
+            }
+            let target = std::fs::read_link(&at)
+                .map_err(|e| format!("`{}` cannot be read ({e})", at.display()))?;
+            if target.is_absolute() {
+                chain.truncate(1);
+            }
+            push_front(&mut pending, &target);
+            continue;
+        }
+        if !meta.is_dir() {
+            return Err(format!("`{}` is not a directory", at.display()));
+        }
+        chain.push((at, entry));
+    }
+    Ok(chain.pop().expect("`/` is never popped").0)
 }
 
 /// Why a project directory owned by `uid` with group `gid` and permission
@@ -3647,11 +3841,12 @@ pub(crate) fn project_root_refusal(
 }
 
 /// Open `project_dir`'s `.dot-agent-deck` as a [`HeldContextDir`]. A refusal
-/// (a project directory another account can write, a symlink, another
+/// (a project directory another account can write, a project path another
+/// account could redirect ([`resolve_trusted_dir_path`]), a symlink, another
 /// account's directory, group or other write that could not be cleared) is
 /// `PermissionDenied`; a project that is not a git checkout is `NotFound`.
-/// The project directory's refusal and the checkout's come before anything
-/// is created or changed; the later ones come after the exclude rule was
+/// The project directory's and its path's refusals and the checkout's come
+/// before anything is created or changed; the later ones come after the exclude rule was
 /// added and `.dot-agent-deck` created, but before any repair of a directory
 /// another account owns.
 pub(crate) fn open_held_context_dir(
@@ -3678,6 +3873,35 @@ pub(crate) fn open_held_context_dir(
             ));
         }
     }
+    #[cfg(unix)]
+    let resolved = {
+        use std::os::unix::fs::MetadataExt as _;
+        let meta = project.metadata()?;
+        // SAFETY: `geteuid` has no preconditions and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        let refused = |why: String| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("the project path is not one only this account controls: {why}"),
+            )
+        };
+        let resolved = resolve_trusted_dir_path(
+            project_dir,
+            euid,
+            &crate::platform::paths::effective_private_group,
+        )
+        .map_err(refused)?;
+        let named = std::fs::symlink_metadata(&resolved).map_err(|e| refused(e.to_string()))?;
+        if (named.dev(), named.ino()) != (meta.dev(), meta.ino()) {
+            return Err(refused(format!(
+                "`{}` no longer names the project directory that was opened",
+                resolved.display()
+            )));
+        }
+        resolved
+    };
+    #[cfg(not(unix))]
+    let resolved = project_dir.to_path_buf();
     if ensure_git_excludes_in(&project)? == GitExcludeOutcome::NotAGitRepo {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -3709,10 +3933,20 @@ pub(crate) fn open_held_context_dir(
         path: context_dir_of(project_dir),
         guard: std::sync::Arc::new(guard),
     };
-    Ok(HeldContextDir { dir })
+    Ok(HeldContextDir {
+        dir,
+        project: resolved,
+    })
 }
 
 impl HeldContextDir {
+    /// The project directory's path as the open checked it
+    /// ([`resolve_trusted_dir_path`]): what a pathname-based lookup in the
+    /// project (git's) should be run in, rather than the path as given.
+    pub(crate) fn project_path(&self) -> &std::path::Path {
+        &self.project
+    }
+
     /// The directory's pathname (what a written file is announced under).
     pub(crate) fn path(&self) -> &std::path::Path {
         self.dir.path()

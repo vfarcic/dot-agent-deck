@@ -1832,6 +1832,7 @@ fn launch_records_are_kept_while_the_read_skipped_an_unknown_kind() {
         shell: None,
         agent_type: None,
         cwd: Some("/abs".into()),
+        cwd_moved_from: None,
         name: None,
         role: None,
         orchestration: None,
@@ -2216,6 +2217,114 @@ async fn a_prepared_start_records_the_verified_path_not_its_descriptor() {
     registry.shutdown_all();
 }
 
+/// PRD #1790 (G2): a prepared start whose verified directory was renamed
+/// away, with a fresh directory put at its path, before the spawn: the
+/// child runs in the verified directory (its marker lands there), and the
+/// persisted launch record names that directory where it now is, not the
+/// replacement at the requested path.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_prepared_start_whose_directory_moved_records_where_the_child_ran() {
+    let state = crate::test_temp::tempdir().unwrap();
+    let root = crate::test_temp::tempdir().unwrap();
+    let dir = root.path().join("prepared");
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.to_string_lossy().into_owned();
+    let registry = Arc::new(AgentPtyRegistry::new());
+    registry.work().install(journal(state.path(), "run1"));
+    let verified = crate::project_resolve::VerifiedProjectDir::open(&dir).unwrap();
+    let moved = root.path().join("prepared.moved");
+    std::fs::rename(&dir, &moved).unwrap();
+    std::fs::create_dir(&dir).unwrap();
+    registry
+        .spawn_agent_in(
+            SpawnOptions {
+                command: Some("echo x > marker; exec cat"),
+                cwd: Some(&path),
+                env: vec![
+                    (DOT_AGENT_DECK_PANE_ID.to_string(), "moved-lr".to_string()),
+                    ("SHELL".to_string(), "/bin/sh".to_string()),
+                ],
+                ..SpawnOptions::default()
+            },
+            &verified,
+        )
+        .expect("the prepared start is served");
+    drop(verified);
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !moved.join("marker").exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the child never wrote its marker in the verified directory"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        !dir.join("marker").exists(),
+        "the child ran in the replacement"
+    );
+    let records = crate::launch_records::read_all(state.path()).unwrap();
+    assert_eq!(records.len(), 1, "{records:?}");
+    let recorded = records[0].cwd.as_deref().expect("a folder is recorded");
+    assert_eq!(
+        std::fs::canonicalize(recorded).unwrap(),
+        std::fs::canonicalize(&moved).unwrap(),
+        "the record names where the child ran, not the replacement at {path}"
+    );
+    assert_eq!(records[0].cwd_moved_from, None);
+    registry.shutdown_all();
+}
+
+/// PRD #1790 (G3): an orderly shutdown writes a live attempt's held-back
+/// session id itself. Past [`MAX_SESSION_LINES`] the newest id is held;
+/// the agent's PTY reader is held before it ends the attempt (the exit
+/// telemetry seam), and the daemon shuts down gracefully before any
+/// periodic round. The journal on disk then names the newest id, with no
+/// `attempt_ended` written by the held reader.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_graceful_shutdown_writes_the_held_session_before_its_drain() {
+    let state = crate::test_temp::tempdir().unwrap();
+    let registry = Arc::new(AgentPtyRegistry::new());
+    registry.work().install(journal(state.path(), "run1"));
+    let pane = "held-at-shutdown";
+    let agent = registry
+        .spawn_agent(SpawnOptions {
+            command: Some("cat"),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.to_string())],
+            ..SpawnOptions::default()
+        })
+        .expect("spawn");
+    let claude = AgentType::ClaudeCode;
+    let changes = MAX_SESSION_LINES + 1;
+    for n in 0..changes {
+        registry.session_seen(&agent, Some(pane), &format!("s-{n}"), &claude);
+    }
+    let attempt = AttemptId::new("run1", agent.parse().unwrap()).unwrap();
+    registry.work().journal().unwrap().flush();
+    assert_eq!(
+        latest_on_disk(state.path(), &attempt),
+        Some(format!("s-{}", MAX_SESSION_LINES - 1)),
+        "precondition: past the cap the newest id is held, not written"
+    );
+    let (_reached, release) = registry.hold_exit_telemetry_for_test(&agent);
+    let stopping = Arc::clone(&registry);
+    tokio::task::spawn_blocking(move || stopping.shutdown_all_graceful(Duration::from_secs(2)))
+        .await
+        .unwrap();
+    let read = read_journal(state.path()).unwrap();
+    assert!(
+        !read.lines.iter().any(|l| l.event.kind() == "attempt_ended"),
+        "the held reader ended the attempt, so this did not test the shutdown"
+    );
+    assert_eq!(
+        latest_on_disk(state.path(), &attempt),
+        Some(format!("s-{}", changes - 1)),
+        "the graceful shutdown did not write the held session id"
+    );
+    drop(release);
+}
+
 /// PRD #1790: the launch-record prune's liveness test is the journal's own
 /// [`WorkJournal::run_is_live`], read from real run locks: this journal's
 /// run and a run whose lock another open journal holds are live, so their
@@ -2245,6 +2354,7 @@ fn pending_cleanup_reads_real_held_free_and_missing_run_locks() {
             shell: None,
             agent_type: None,
             cwd: None,
+            cwd_moved_from: None,
             name: None,
             role: None,
             orchestration: None,
