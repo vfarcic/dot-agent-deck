@@ -1400,8 +1400,13 @@ pub static ANTIGRAVITY: AgentSpec = AgentSpec {
     // observed, so the literal-write field carries the per-write cap a
     // client that bursts its deletes must stay within
     // ([`DeleteCharKey::max_literal_write_chars`]). Ctrl+C quits on a second
-    // press, so it is never sent. The doorbell does not read these: it
-    // submits with CR and withdraws with the delete key its facts verify.
+    // press, so it is never sent. The doorbell submits with CR; to withdraw
+    // its own line it reads the delete pacing and, because a doorbell
+    // line's paced deletes outlast its deadline, presses Ctrl+U once for
+    // the one logical line instead (re-measured 2026-11-17: one press
+    // emptied a 166-character line wrapped onto two rows at 143 columns, a
+    // press on the empty composer drew nothing, and two in one write did
+    // what one did).
     prompt_keys: Some(PromptKeys {
         interrupt: Cow::Borrowed(&SINGLE_ESC),
         clear: ClearKey {

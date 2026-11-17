@@ -880,19 +880,14 @@ impl AgentPtyRegistry {
         {
             txn.allow_gap_withdrawal();
         }
-        // PRD #211: a withdrawal's deletes go at the agent's served pace
-        // (Antigravity drops some of a burst), one job per write.
-        if let Some(delete) = generation
+        // PRD #211: a withdrawal presses the agent's served keys at their
+        // served pace (`Txn::serve_keys`).
+        if let Some(keys) = generation
             .agent
             .as_ref()
             .and_then(|agent| crate::agent_registry::spec(agent).prompt_keys.as_ref())
-            .map(|keys| &keys.delete_char)
-            && let Some(per_write) = delete.max_presses_per_write
         {
-            txn.pace_deletes(
-                per_write as usize,
-                Duration::from_millis(u64::from(delete.pause_between_writes_ms.unwrap_or(0))),
-            );
+            txn.serve_keys(keys);
         }
         if generation.doorbell.counter().exhausted() {
             // That was the generation's last attempt number (Q18): from now
@@ -1176,7 +1171,12 @@ impl AgentPtyRegistry {
                     let bytes = match next {
                         txn::Job::Line(text) => text.into_bytes(),
                         txn::Job::Cr => b"\r".to_vec(),
-                        txn::Job::Deletes(n) => vec![0x7f; n],
+                        txn::Job::Deletes(n) => match txn.withdraw_key() {
+                            txn::WithdrawKey::Delete => vec![0x7f; n],
+                            // `Txn::serve_keys` chooses the clear key only
+                            // where it is Ctrl+U.
+                            txn::WithdrawKey::Clear => vec![0x15; n],
+                        },
                     };
                     tracing::debug!(
                         target: "doorbell",

@@ -2099,4 +2099,48 @@ pub(crate) mod antigravity_tests {
         assert!(composer.cursor_at_end, "the cursor at the composer's start");
         assert!(!composer.placeholder && !composer.hidden && !composer.selection);
     }
+
+    /// Real `agy` 1.5.9's output, 143 × 40, measured 2026-11-17
+    /// (`tests/fixtures/antigravity/composer-after-clear.bin`): its ready
+    /// screen in Auto mode with the start-up mode notice up, a 166-character
+    /// doorbell line typed in one write and echoed whole on two rows, then
+    /// ONE Ctrl+U, sent by the measurement. It is the frame the doorbell's
+    /// clear withdrawal (`doorbell_txn::Txn::clear_lines`) is confirmed on.
+    pub(crate) const CLEAR: &[u8] =
+        include_bytes!("../tests/fixtures/antigravity/composer-after-clear.bin");
+    /// Where the line had been echoed whole, before the Ctrl+U.
+    pub(crate) const CLEAR_TYPED: usize = 5072;
+    pub(crate) const CLEAR_LINE: &str = "(oomimg) dot-agent-deck: message m-cj3oiiqh-3213cd9b5291441a waiting, run: /var/tmp/agy-measure-no7iLg/deck-under-test-0123456789abcdefghij/dot-agent-deck inbox fetch";
+
+    /// PRD #211: one Ctrl+U empties the whole logical line, both of its
+    /// wrapped rows, and leaves the frame paced deletes leave: a bare `>`
+    /// with the cursor at its start, no mode hint, `? for shortcuts` back
+    /// under the box.
+    #[test]
+    fn antigravity_one_clear_empties_a_wrapped_line() {
+        let agy = &ANTIGRAVITY_PROFILE;
+        assert_eq!(CLEAR_LINE.chars().count(), 166);
+        let typed = Grid::parse(&CLEAR[..CLEAR_TYPED], 40, 143);
+        assert_eq!(agy.holds(&typed, CLEAR_LINE), Some(ComposerText::Exact));
+        let rows = super::frame(agy, &typed, 0, true, None);
+        assert!(
+            rows.composer.is_some_and(|c| c.text == CLEAR_LINE),
+            "one logical line, wrapped onto two rows"
+        );
+
+        let cleared = Grid::parse(CLEAR, 40, 143);
+        assert!(agy.empty_and_ready(&cleared));
+        assert!(!agy.placeholder_empty(&cleared), "no hint comes back");
+        let read = super::frame(agy, &cleared, 0, true, None);
+        assert_eq!(read.dialog, None);
+        let composer = read.composer.as_ref().expect("the ready composer");
+        assert_eq!(composer.text, "", "nothing of either row is left");
+        assert!(composer.cursor_at_end, "the cursor at the composer's start");
+        assert!(!composer.placeholder && !composer.hidden && !composer.selection);
+        let paced = super::frame(agy, &Grid::parse(PACED_DELETES, 40, 143), 0, true, None);
+        assert_eq!(
+            paced.composer, read.composer,
+            "the frame paced deletes leave"
+        );
+    }
 }

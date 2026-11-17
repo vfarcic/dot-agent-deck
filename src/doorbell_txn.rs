@@ -738,7 +738,9 @@ pub enum Job {
     Line(String),
     /// The Enter.
     Cr,
-    /// This many delete keys, in one job.
+    /// This many presses of the withdrawal's key, in one job: the delete
+    /// key, or, where the transaction chose it (PRD #211,
+    /// [`Txn::withdraw_key`]), the agent's clear key.
     Deletes(usize),
 }
 
@@ -963,7 +965,40 @@ pub enum Phase {
 enum JobKind {
     Line,
     Cr,
+    /// A withdrawal's presses, of the delete key or the clear key.
     Deletes,
+}
+
+/// PRD #211: the key a withdrawal presses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WithdrawKey {
+    /// One delete per character the agent took.
+    Delete,
+    /// The agent's clear key, which empties one logical line per press
+    /// ([`Txn::clear_lines`]).
+    Clear,
+}
+
+/// How a withdrawal's presses go out: `total` presses of `key`, at most
+/// `per_write` to a job, `gap` apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Presses {
+    key: WithdrawKey,
+    total: usize,
+    per_write: usize,
+    gap: Duration,
+}
+
+impl Presses {
+    /// Whether every job of these presses can start before `deadline`,
+    /// the first at `now`.
+    fn fit(&self, now: Instant, deadline: Instant) -> bool {
+        let writes = self.total.div_ceil(self.per_write);
+        let needs = self
+            .gap
+            .saturating_mul(u32::try_from(writes.saturating_sub(1)).unwrap_or(u32::MAX));
+        now + needs < deadline
+    }
 }
 
 /// The transaction's one job on the writer (plan §2.3): its own from the
@@ -1043,7 +1078,13 @@ pub struct Txn<'c> {
     /// deletes per write, this long apart ([`Self::pace_deletes`]); `None`
     /// sends a withdrawal's deletes in one job.
     delete_pace: Option<(usize, Duration)>,
-    /// The deletes of the current withdrawal the agent has taken so far, and
+    /// PRD #211: the agent's served clear key, set by [`Self::clear_lines`]:
+    /// presses per logical line, at most this many to a write, this long
+    /// apart. `None` withdraws with deletes only.
+    clear: Option<(usize, usize, Duration)>,
+    /// The current withdrawal's presses, once its final seam chose them.
+    presses: Option<Presses>,
+    /// The presses of the current withdrawal the agent has taken so far, and
     /// how many the job in flight carries.
     deleted: usize,
     delete_job: usize,
@@ -1152,6 +1193,8 @@ pub fn admit<'c>(
         gap_allowed: false,
         gap: false,
         delete_pace: None,
+        clear: None,
+        presses: None,
         deleted: 0,
         delete_job: 0,
     })
@@ -1201,7 +1244,8 @@ impl<'c> Txn<'c> {
     /// PRD #211: allow this attempt one recovery from a misrendered echo.
     /// When the echo fails and the composer shows exactly the deck's own
     /// line with only spaces inserted ([`whitespace_gap`]), the line is
-    /// withdrawn with one delete per character the deck typed, instead of
+    /// withdrawn, with one delete per character the deck typed or with the
+    /// agent's clear key ([`Self::clear_lines`]), instead of
     /// the attempt ending `Unresolved(EchoMismatch)`; the doorbell then
     /// rings again. The driver allows it for an agent whose render is
     /// measured to fall out of step with a buffer that took every byte, and
@@ -1221,6 +1265,56 @@ impl<'c> Txn<'c> {
     /// unresolved; one the deadline still cuts short ends unresolved too.
     pub fn pace_deletes(&mut self, per_write: usize, gap: Duration) {
         self.delete_pace = Some((per_write.max(1), gap));
+    }
+
+    /// PRD #211: withdraw a line the composer holds as ONE logical line,
+    /// and nothing else, with the agent's clear key instead of deletes:
+    /// `per_line` presses, at most `per_write` to a write (`None`: all in
+    /// one), `gap` apart. Both recognisers already require the composer to
+    /// hold exactly the deck's own text, so emptying the line removes only
+    /// that. Measured on `agy` 1.5.9
+    /// (`tests/fixtures/antigravity/composer-after-clear.bin`): one Ctrl+U
+    /// emptied a 166-character line wrapped onto two rows.
+    /// A withdrawal whose presses the deadline cannot fit falls back to the
+    /// deletes, paced or not, when those fit. A withdrawal with a kept
+    /// newline is two logical lines, a count not measured, so it deletes.
+    pub fn clear_lines(&mut self, per_line: usize, per_write: Option<usize>, gap: Duration) {
+        let per_line = per_line.max(1);
+        self.clear = Some((per_line, per_write.unwrap_or(per_line).max(1), gap));
+    }
+
+    /// PRD #211: withdraw with the agent's served keys (`keys`, from
+    /// [`crate::agent_registry`]). An agent whose deletes must be paced
+    /// (Antigravity drops some of a burst) has them paced as served
+    /// ([`Self::pace_deletes`]); paced, a doorbell line's deletes outlast the
+    /// deadline, so such an agent also withdraws a one-line composer with
+    /// its clear key ([`Self::clear_lines`]), one press, where that key is
+    /// Ctrl+U and empties a logical line per press. The other agents'
+    /// deletes are measured exact in one burst, and they keep them.
+    pub fn serve_keys(&mut self, keys: &crate::agent_registry::PromptKeys) {
+        let ms = |pause: Option<u32>| Duration::from_millis(u64::from(pause.unwrap_or(0)));
+        let Some(per_write) = keys.delete_char.max_presses_per_write else {
+            return;
+        };
+        self.pace_deletes(
+            per_write as usize,
+            ms(keys.delete_char.pause_between_writes_ms),
+        );
+        if keys.clear.presses == crate::agent_registry::ClearPresses::PerLine
+            && keys.clear.bytes == "\x15"
+        {
+            self.clear_lines(
+                1,
+                keys.clear.max_presses_per_write.map(|n| n as usize),
+                ms(keys.clear.pause_between_writes_ms),
+            );
+        }
+    }
+
+    /// The key a [`Job::Deletes`] presses: the one the current withdrawal's
+    /// final seam chose, the delete key until one did.
+    pub fn withdraw_key(&self) -> WithdrawKey {
+        self.presses.map_or(WithdrawKey::Delete, |p| p.key)
     }
 
     /// The attempt started the misrendered-echo withdrawal
@@ -2007,24 +2101,17 @@ impl<'c> Txn<'c> {
                 if view != Some(deletes) {
                     return self.suspend_and_pause(cause, now);
                 }
-                // Paced, a withdrawal the deadline would cut short is not
-                // started: it would leave part of the line in the box.
-                if let Some((per_write, gap)) = self.delete_pace {
-                    let writes = deletes.div_ceil(per_write);
-                    let needs = gap.saturating_mul(
-                        u32::try_from(writes.saturating_sub(1)).unwrap_or(u32::MAX),
-                    );
-                    if now + needs >= self.deadline {
-                        self.note_unresolved(
-                            "try_deletes: the paced deletes do not fit the deadline",
-                        );
-                        // Nothing was withdrawn: the next ring may try again.
-                        self.gap = false;
-                        return self.suspend_and_pause(cause, now);
-                    }
-                }
+                // A withdrawal the deadline would cut short is not started:
+                // it would leave part of the line in the box.
+                let Some(presses) = self.choose_presses(deletes, now) else {
+                    self.note_unresolved("try_deletes: no withdrawal fits the deadline");
+                    // Nothing was withdrawn: the next ring may try again.
+                    self.gap = false;
+                    return self.suspend_and_pause(cause, now);
+                };
+                self.presses = Some(presses);
                 self.deleted = 0;
-                self.enqueue_deletes(deletes, now)
+                self.enqueue_deletes(now)
             }
             SeamVerdict::Layout => self.edge(now),
             SeamVerdict::Closed => self.retired(now),
@@ -2034,13 +2121,45 @@ impl<'c> Txn<'c> {
         }
     }
 
-    /// Queue the next of a withdrawal's `deletes` that are left: all of them
-    /// in one job, or, paced, the agent's per-write share.
-    fn enqueue_deletes(&mut self, deletes: usize, now: Instant) -> Vec<Action> {
-        let left = deletes - self.deleted;
-        self.delete_job = self
-            .delete_pace
-            .map_or(left, |(per_write, _)| per_write.min(left));
+    /// The presses that withdraw the recognised `deletes` characters, the
+    /// first job at `now`: the clear key's, when one is set
+    /// ([`Self::clear_lines`]), the composer holds one logical line and
+    /// they fit the deadline; else the deletes, paced as served
+    /// ([`Self::pace_deletes`]), when they fit; else none.
+    fn choose_presses(&self, deletes: usize, now: Instant) -> Option<Presses> {
+        let one_line = self
+            .frame
+            .composer
+            .as_ref()
+            .is_some_and(|c| !c.text.contains('\n'));
+        let clear = self
+            .clear
+            .filter(|_| one_line)
+            .map(|(per_line, per_write, gap)| Presses {
+                key: WithdrawKey::Clear,
+                total: per_line,
+                per_write,
+                gap,
+            });
+        let (per_write, gap) = self.delete_pace.unwrap_or((deletes.max(1), Duration::ZERO));
+        let delete = Presses {
+            key: WithdrawKey::Delete,
+            total: deletes,
+            per_write,
+            gap,
+        };
+        clear
+            .into_iter()
+            .chain(std::iter::once(delete))
+            .find(|p| p.fit(now, self.deadline))
+    }
+
+    /// Queue the next of the withdrawal's presses that are left: all of them
+    /// in one job, or, paced, the key's per-write share.
+    fn enqueue_deletes(&mut self, now: Instant) -> Vec<Action> {
+        let presses = self.presses.expect("a withdrawal chose its presses");
+        let left = presses.total - self.deleted;
+        self.delete_job = presses.per_write.min(left);
         self.enqueue(
             JobKind::Deletes,
             Job::Deletes(self.delete_job),
@@ -2052,17 +2171,16 @@ impl<'c> Txn<'c> {
     /// A delete job ended with `accepted` of its deletes taken: on to the
     /// next, once the pace allows, or, all taken, to the confirmation.
     fn deletes_ended(&mut self, accepted: usize, ok: bool, now: Instant) -> Vec<Action> {
-        let (deletes, _) = self.withdrawal.expect("a delete job has its withdrawal");
+        let presses = self.presses.expect("a delete job has its presses");
         if !ok || accepted != self.delete_job {
             return self.suspend_and_pause(Cause::WithdrawalStalled, now);
         }
         self.deleted += accepted;
-        if self.deleted == deletes {
+        if self.deleted == presses.total {
             self.enter(Phase::ConfirmWithdrawn, now);
             return self.confirm_withdrawn(now);
         }
-        let gap = self.delete_pace.map_or(Duration::ZERO, |(_, gap)| gap);
-        let at = now + gap;
+        let at = now + presses.gap;
         self.enter(Phase::DeletePace(at), now);
         vec![Action::WakeAt(at.min(self.deadline))]
     }
@@ -2074,10 +2192,10 @@ impl<'c> Txn<'c> {
         if now < at && now < self.deadline {
             return vec![Action::WakeAt(at.min(self.deadline))];
         }
-        let (deletes, cause) = self.withdrawal.expect("a paced withdrawal has its deletes");
+        let (_, cause) = self.withdrawal.expect("a paced withdrawal has its deletes");
         match self.seam(seam, false, now) {
             SeamVerdict::Contended(at) => vec![Action::WakeAt(at)],
-            SeamVerdict::Pass(_) => self.enqueue_deletes(deletes, now),
+            SeamVerdict::Pass(_) => self.enqueue_deletes(now),
             SeamVerdict::Layout => vec![Action::WakeAt(self.next_wake(now))],
             SeamVerdict::Closed => self.retired(now),
             SeamVerdict::Expired => self.end(End::Expire, now),
@@ -2093,9 +2211,12 @@ impl<'c> Txn<'c> {
     /// The misrendered-echo withdrawal of a profile with no measured
     /// placeholder (Antigravity's hint is not redrawn by every clear) is
     /// confirmed by a blank composer instead, cursor at its start, nothing
-    /// hidden: it deleted one character per byte the agent took, so
-    /// anything the deletes left would be the line's own start, `(` and its
-    /// token, which the composer draws.
+    /// hidden: it deleted one character per byte the agent took, or cleared
+    /// the one logical line the agent holds, so anything a press the agent
+    /// did not act on left would be the line's own start, `(` and its
+    /// token, which the composer draws. A composer still holding text is
+    /// never confirmed: the attempt ends unresolved at the deadline, the
+    /// cell suspended.
     fn confirm_withdrawn(&mut self, now: Instant) -> Vec<Action> {
         if self.frame.clean {
             self.epoch = self.frame.epoch;
@@ -2324,6 +2445,16 @@ mod gap_withdrawal_tests {
     /// Admit one attempt on `bell`, allowing the gap withdrawal as the driver
     /// does: only when the last ring that wrote did not use it.
     fn admit_on(bell: &GenerationDoorbell, caps: Caps, now: Instant) -> Txn<'_> {
+        admit_naming(bell, caps, now, "dot-agent-deck")
+    }
+
+    /// [`admit_on`], the line naming `command` for `inbox fetch`.
+    fn admit_naming<'b>(
+        bell: &'b GenerationDoorbell,
+        caps: Caps,
+        now: Instant,
+        command: &str,
+    ) -> Txn<'b> {
         let admission = Admission {
             activation: Ok(()),
             mode: Ok(()),
@@ -2335,7 +2466,7 @@ mod gap_withdrawal_tests {
             settling: false,
             submit_route: true,
             still_admitted: true,
-            command: "dot-agent-deck".to_string(),
+            command: command.to_string(),
         };
         let mut draws = [3u8, 1, 4, 1, 5, 9, 2, 6].into_iter().cycle();
         let mut txn = admit(
@@ -2729,5 +2860,190 @@ mod gap_withdrawal_tests {
         let outcome = released(&retry.on(Event::Tick, &mut seam, retry.deadline()));
         assert_eq!(outcome, Some(Outcome::Unresolved(Cause::EchoMismatch)));
         assert!(!retry.gap_withdrew());
+    }
+
+    /// Admit an attempt whose line is `chars` characters long, its command
+    /// word a deep install path, with Antigravity's served keys as the
+    /// driver serves them ([`Txn::serve_keys`]).
+    fn admit_antigravity(bell: &GenerationDoorbell, now: Instant, chars: usize) -> Txn<'_> {
+        let short = admit_naming(&generation(), caps(false), now, "d")
+            .line()
+            .chars()
+            .count();
+        let command = format!("/{}", "v".repeat(chars - short - 1) + "d");
+        let mut txn = admit_naming(bell, caps(false), now, &command);
+        assert_eq!(txn.line().chars().count(), chars);
+        txn.serve_keys(
+            crate::agent_registry::spec(&crate::event::AgentType::Antigravity)
+                .prompt_keys
+                .as_ref()
+                .expect("Antigravity's keys"),
+        );
+        txn
+    }
+
+    /// The composer real `agy` 1.5.9 drew after one Ctrl+U of a wrapped
+    /// doorbell line (`doorbell_screen`'s `CLEAR` capture), read by its own
+    /// profile.
+    fn real_agy_after_clear() -> Frame {
+        use crate::doorbell_screen::{ANTIGRAVITY_PROFILE, Grid, frame};
+        let grid = Grid::parse(crate::doorbell_screen::antigravity_tests::CLEAR, 40, 143);
+        frame(&ANTIGRAVITY_PROFILE, &grid, 0, true, None)
+    }
+
+    /// PRD #211: with Antigravity's served keys, the misrendered echo of a
+    /// 170-character line, whose deletes at the served 20 ms pace could not
+    /// start before the deadline, is withdrawn with ONE Ctrl+U, in one job,
+    /// and confirmed on the blank composer real `agy` drew after it.
+    /// Nothing is deleted and nothing is submitted.
+    #[test]
+    fn a_clear_withdrawal_of_a_long_gap_line_fits_the_deadline_on_the_real_frame() {
+        let bell = generation();
+        let t0 = Instant::now();
+        let mut txn = admit_antigravity(&bell, t0, 170);
+        let line = txn.line().to_string();
+        let (_, gap) = txn.delete_pace.expect("the served deletes are paced");
+        let writes = u32::try_from(line.chars().count()).unwrap();
+        assert!(
+            ECHO_WAIT + gap * (writes - 1) >= TXN_MAX,
+            "the paced deletes would fit: the case this test is about is gone"
+        );
+        let mut seam = OneFrame(composer("", true));
+        let (actions, jobs) =
+            type_then_show(&mut txn, &mut seam, composer(&gapped(&line), false), t0);
+        assert_eq!(enqueued(&actions), vec![Job::Deletes(1)], "one press");
+        assert_eq!(txn.withdraw_key(), WithdrawKey::Clear, "of the clear key");
+        let (outcome, more) = run_out_to(
+            &mut txn,
+            &mut seam,
+            actions,
+            t0 + ECHO_WAIT,
+            real_agy_after_clear(),
+        );
+        assert_eq!(outcome, Outcome::Withdrawn);
+        assert!(txn.gap_withdrew());
+        assert_eq!(jobs, vec![Job::Line(line), Job::Deletes(1)]);
+        assert_eq!(more, vec![Job::Deletes(1)], "one clear, then no Enter");
+        assert!(matches!(
+            bell.cell().load(),
+            Latch::Resolved(_, Resolution::Withdrawn)
+        ));
+    }
+
+    /// PRD #211: the agent leaves text in the composer after the measured
+    /// press (here the line's second row): the withdrawal is not confirmed,
+    /// no second press or delete is sent, and at the deadline the attempt
+    /// ends unresolved with the cell suspended.
+    #[test]
+    fn a_leftover_after_the_clear_is_not_confirmed() {
+        let bell = generation();
+        let t0 = Instant::now();
+        let mut txn = admit_antigravity(&bell, t0, 170);
+        let line = txn.line().to_string();
+        let mut seam = OneFrame(composer("", true));
+        let (actions, jobs) =
+            type_then_show(&mut txn, &mut seam, composer(&gapped(&line), false), t0);
+        assert_eq!(enqueued(&actions), vec![Job::Deletes(1)]);
+        let leftover: String = line.chars().skip(140).collect();
+        let (outcome, more) = run_out_to(
+            &mut txn,
+            &mut seam,
+            actions,
+            t0 + ECHO_WAIT,
+            composer(&leftover, false),
+        );
+        assert_eq!(outcome, Outcome::Unresolved(Cause::Deadline));
+        assert!(bell.cell().load().suspended());
+        assert_eq!(jobs, vec![Job::Line(line), Job::Deletes(1)]);
+        assert_eq!(more, vec![Job::Deletes(1)], "nothing after the one press");
+    }
+
+    /// PRD #211: with the clear key served, a composer holding anything but
+    /// the deck's own line (a foreign character in the gap) still gets no
+    /// press of any key and stays suspended.
+    #[test]
+    fn with_the_clear_key_foreign_text_still_gets_nothing() {
+        let bell = generation();
+        let t0 = Instant::now();
+        let mut txn = admit_antigravity(&bell, t0, 170);
+        let line = txn.line().to_string();
+        let foreign = gapped(&line).replacen("       ", "   x   ", 1);
+        let mut seam = OneFrame(composer("", true));
+        let (actions, mut jobs) =
+            type_then_show(&mut txn, &mut seam, composer(&foreign, false), t0);
+        assert_eq!(txn.phase(), Phase::Pause(Cause::EchoMismatch));
+        assert!(bell.cell().load().suspended());
+        let (outcome, more) = run_out(&mut txn, &mut seam, actions, t0 + ECHO_WAIT);
+        jobs.extend(more);
+        assert_eq!(outcome, Outcome::Unresolved(Cause::EchoMismatch));
+        assert!(!txn.gap_withdrew());
+        assert_eq!(jobs, vec![Job::Line(line)], "no press, no Enter");
+    }
+
+    /// PRD #211: a clear the deadline cannot fit (here paced so slowly that
+    /// its two presses cannot both start) falls back to the deletes when
+    /// those fit; when neither fits, nothing is sent.
+    #[test]
+    fn a_clear_that_cannot_fit_falls_back_to_deletes_that_do() {
+        let slow = Duration::from_secs(5);
+        let bell = generation();
+        let t0 = Instant::now();
+        let mut txn = admit_on(&bell, caps(false), t0);
+        txn.clear_lines(2, Some(1), slow);
+        let line = txn.line().to_string();
+        let mut seam = OneFrame(composer("", true));
+        let (actions, _) = type_then_show(&mut txn, &mut seam, composer(&gapped(&line), false), t0);
+        assert_eq!(enqueued(&actions), vec![Job::Deletes(line.chars().count())]);
+        assert_eq!(txn.withdraw_key(), WithdrawKey::Delete);
+        let (outcome, _) = run_out(&mut txn, &mut seam, actions, t0 + ECHO_WAIT);
+        assert_eq!(outcome, Outcome::Withdrawn);
+
+        let bell = generation();
+        let mut txn = admit_on(&bell, caps(false), t0);
+        txn.clear_lines(2, Some(1), slow);
+        txn.pace_deletes(1, slow);
+        let line = txn.line().to_string();
+        let mut seam = OneFrame(composer("", true));
+        let (actions, jobs) =
+            type_then_show(&mut txn, &mut seam, composer(&gapped(&line), false), t0);
+        assert_eq!(jobs, vec![Job::Line(line)], "no press");
+        let (outcome, more) = run_out(&mut txn, &mut seam, actions, t0 + ECHO_WAIT);
+        assert_eq!(outcome, Outcome::Unresolved(Cause::EchoMismatch));
+        assert!(more.is_empty(), "{more:?}");
+    }
+
+    /// PRD #211: a strict withdrawal of a composer holding exactly the
+    /// deck's line, with the clear key served, presses it once too; a
+    /// composer that kept a newline is two logical lines, a press count not
+    /// measured, and is deleted character by character.
+    #[test]
+    fn a_strict_withdrawal_clears_one_line_and_deletes_a_kept_newline() {
+        let bell = generation();
+        let t0 = Instant::now();
+        let mut txn = admit_on(&bell, caps(true), t0);
+        txn.clear_lines(1, None, Duration::ZERO);
+        let line = txn.line().to_string();
+        txn.accepted = line.chars().count();
+        txn.frame = composer(&line, false);
+        let mut seam = OneFrame(composer(&line, false));
+        let actions = txn.unresolve(Cause::EchoMismatch, &mut seam, t0);
+        assert_eq!(enqueued(&actions), vec![Job::Deletes(1)]);
+        assert_eq!(txn.withdraw_key(), WithdrawKey::Clear);
+
+        let bell = generation();
+        let mut txn = admit_on(&bell, caps(true), t0);
+        txn.clear_lines(1, None, Duration::ZERO);
+        let line = txn.line().to_string();
+        txn.accepted = line.chars().count();
+        txn.after_cr = true;
+        let kept = format!("{line}\n");
+        txn.frame = composer(&kept, false);
+        let mut seam = OneFrame(composer(&kept, false));
+        let actions = txn.unresolve(Cause::NoSubmitEvidence, &mut seam, t0);
+        assert_eq!(
+            enqueued(&actions),
+            vec![Job::Deletes(line.chars().count() + 1)]
+        );
+        assert_eq!(txn.withdraw_key(), WithdrawKey::Delete);
     }
 }
