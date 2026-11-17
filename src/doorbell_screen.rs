@@ -2060,16 +2060,21 @@ pub(crate) mod antigravity_tests {
     }
 
     /// Real `agy` 1.5.9's output, 143 × 40, measured 2026-11-17: its ready
-    /// screen in Auto mode, a 145-character doorbell line typed in one write,
-    /// then one DEL per write, 20 ms apart, for each of its characters
-    /// (`tests/fixtures/antigravity/composer-after-paced-deletes.bin`).
+    /// screen in Auto mode, a 145-character doorbell line typed in one write
+    /// and echoed whole (not misrendered), then one DEL per write, 20 ms
+    /// apart, for each of its characters, sent by the measurement, not by a
+    /// doorbell transaction
+    /// (`tests/fixtures/antigravity/composer-after-paced-deletes.bin`). It
+    /// shows what `agy` draws once such deletes took the whole line; the
+    /// deck's own withdrawal of a line that long at that pace does not fit a
+    /// transaction's deadline and is not started.
     pub(crate) const PACED_DELETES: &[u8] =
         include_bytes!("../tests/fixtures/antigravity/composer-after-paced-deletes.bin");
     /// Where the line had been echoed whole, before the first DEL.
     pub(crate) const PACED_DELETES_TYPED: usize = 4954;
     pub(crate) const PACED_DELETES_LINE: &str = "(oomimg) dot-agent-deck: message m-cj3oiiqh-3213cd9b5291441a waiting, run: /var/tmp/agy-measure-vESMu6/deck-under-test/dot-agent-deck inbox fetch";
 
-    /// PRD #211: after the deck's paced deletes `agy` draws a bare `>` with
+    /// PRD #211: after paced deletes of the whole line `agy` draws a bare `>` with
     /// the cursor at its start and `? for shortcuts` back under it — no
     /// mode hint, even in Auto mode, whose hint the ready screen showed. The
     /// frame the doorbell reads is that blank composer, no placeholder, no

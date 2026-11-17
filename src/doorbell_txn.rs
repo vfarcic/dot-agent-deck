@@ -2660,7 +2660,7 @@ mod gap_withdrawal_tests {
         assert!(more.is_empty(), "{more:?}");
     }
 
-    /// PRD #211: what real `agy` 1.5.9 drew after the deck's paced deletes
+    /// PRD #211: what real `agy` 1.5.9 drew after paced deletes of the line
     /// (`doorbell_screen`'s `PACED_DELETES` capture), read by its own profile,
     /// confirms the gap withdrawal: Antigravity has no measured placeholder,
     /// and the composer it leaves is blank with the cursor at its start.
