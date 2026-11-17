@@ -176,6 +176,10 @@ impl Agy {
 
     fn ring_next_turn(&self) -> String {
         self.replay(json!([{"osc":"idle"}]));
+        self.delivery()
+    }
+
+    fn delivery(&self) -> String {
         assert!(
             common::wait_for_path(
                 &self.deck.workdir().join("doorbell-answer.json"),
@@ -188,6 +192,41 @@ impl Agy {
             .as_str()
             .unwrap()
             .into()
+    }
+
+    fn visibly_delivered_once(&self, id: &str, body: &str) {
+        let stdout = self.delivery();
+        let answer: Value = serde_json::from_str(&stdout).expect("doorbell PreInvocation JSON");
+        framed(
+            answer["injectSteps"][0]["systemMessage"]["systemMessage"]
+                .as_str()
+                .expect("nested system message"),
+            id,
+            body,
+        );
+        assert!(
+            common::wait_for_pane_text_on(
+                self.deck.attach_socket_path(),
+                &self.pane.agent,
+                body,
+                Duration::from_secs(10)
+            ),
+            "delegated task must be visible in the worker pane: {}",
+            self.diagnostic()
+        );
+        self.committed_once(id);
+        assert!(
+            !common::wait_until(Duration::from_secs(1), || {
+                std::fs::read_to_string(self.deck.workdir().join("submitted.jsonl"))
+                    .unwrap_or_default()
+                    .lines()
+                    .count()
+                    != 1
+            }),
+            "idle worker must receive exactly one doorbell: {}",
+            self.diagnostic()
+        );
+        self.committed_once(id);
     }
 }
 
@@ -388,6 +427,74 @@ fn antigravity_inbox_004_misrendered_echo_is_withdrawn_and_retried_once() {
         agy.diagnostic()
     );
     agy.committed_once(&id);
+}
+
+/// Scenario: A person answers a permission dialog in an Antigravity worker through the deck's attached input path and the turn finishes Idle. A task queued afterwards appears in the worker pane exactly once, without another manual keystroke.
+#[spec("antigravity/inbox/005")]
+#[test]
+fn antigravity_inbox_005_human_permission_answer_does_not_disable_later_doorbells() {
+    let (agy, _) = Agy::start(false);
+    agy.replay(json!([
+        {"permission_menu":true},
+        {"osc":"blocked", "kind":"permission"}
+    ]));
+    assert!(common::wait_for_pane_text_on(
+        agy.deck.attach_socket_path(),
+        &agy.pane.agent,
+        "1. Yes, run command",
+        Duration::from_secs(10)
+    ));
+    let _person = inbox::input(&agy.deck, &agy.pane, "1");
+    assert!(
+        common::wait_for_pane_text_on(
+            agy.deck.attach_socket_path(),
+            &agy.pane.agent,
+            "AGY-PERMISSION-ANSWER-1",
+            Duration::from_secs(10)
+        ),
+        "person's answer must clear the dialog and restore the composer: {}",
+        agy.diagnostic()
+    );
+    assert!(common::wait_until(Duration::from_secs(10), || {
+        std::fs::read_to_string(agy.deck.workdir().join("osc-history.jsonl")).is_ok_and(|history| {
+            history
+                .lines()
+                .last()
+                .is_some_and(|line| serde_json::from_str::<Value>(line).unwrap()["osc"] == "idle")
+        })
+    }));
+    let body = "AGY-AFTER-HUMAN-ANSWER-c872";
+    let id = inbox::enqueue(&agy.deck, &agy.pane, body);
+    agy.visibly_delivered_once(&id, body);
+}
+
+/// Scenario: A task queued while a genuine numbered permission menu is visible is not typed into that menu, even with an idle status signal. When the menu clears, numbered task output above an empty ready composer does not prevent the task from appearing in the worker pane exactly once.
+#[spec("antigravity/inbox/006")]
+#[test]
+fn antigravity_inbox_006_numbered_output_allows_delivery_but_permission_menu_holds_it() {
+    let (agy, _) = Agy::start(false);
+    agy.replay(json!([{"permission_menu":true}, {"osc":"idle"}]));
+    assert!(common::wait_for_pane_text_on(
+        agy.deck.attach_socket_path(),
+        &agy.pane.agent,
+        "1. Yes, run command",
+        Duration::from_secs(10)
+    ));
+    let body = "AGY-NUMBERED-OUTPUT-45fd";
+    let id = inbox::enqueue(&agy.deck, &agy.pane, body);
+    agy.no_input("while the numbered permission menu is visible despite idle");
+    inbox::state(&agy.deck, &agy.pane, &id, "queued");
+    agy.replay(json!([
+        {"output":"1. fix the lint gate\n2. verify the delegated operation"},
+        {"redraw_composer":true}
+    ]));
+    assert!(common::wait_for_pane_text_on(
+        agy.deck.attach_socket_path(),
+        &agy.pane.agent,
+        "1. fix the lint gate",
+        Duration::from_secs(10)
+    ));
+    agy.visibly_delivered_once(&id, body);
 }
 
 /// Scenario: Subscribe to an Antigravity pane's completed replies: a workspace transcript publishes nothing, while a plain Stop with a sanitized transcript in its conversation's HOME directory publishes its final text once. A Stop handed queued mail returns continue without publishing an interim reply, and the final continued Stop publishes the new reply once.

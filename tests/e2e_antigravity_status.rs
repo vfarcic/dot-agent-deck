@@ -11,7 +11,7 @@ use common::TuiDeck;
 use serde_json::{Value, json};
 use spec::spec;
 use std::cell::Cell;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const QUESTION: &str = "Approve Bash: rm -f probe.txt";
 const LABELS: [&str; 7] = [
@@ -593,15 +593,15 @@ fn antigravity_status_005_launch_auth_transient_is_hidden_but_persistent_auth_is
         {"pause_ms": 60},
         {"osc": "idle"}
     ]));
-    let until = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < until {
-        let grid = replay.deck.snapshot_grid();
-        assert!(
-            !grid.contains("Needs Input") && !grid.contains("Blocked"),
-            "the measured 60 ms launch auth transient must not flash Blocked:\n{grid}"
-        );
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    assert!(
+        !replay
+            .deck
+            .wait_for_grid_predicate_within(Duration::from_secs(2), |grid| {
+                grid.contains("Needs Input") || grid.contains("Blocked")
+            }),
+        "the measured 60 ms launch auth transient must not flash Blocked:\n{}",
+        replay.deck.snapshot_grid()
+    );
     replay.card("Idle", "", "authenticated launch ready");
     replay.replay(json!([{"osc": "blocked", "kind": "auth"}]));
     replay.card(

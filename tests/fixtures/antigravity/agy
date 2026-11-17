@@ -32,6 +32,7 @@ permission_menu = None
 permission_prompt = ""
 misrender_next_echo = False
 misrendering_echo = False
+output_text = ""
 
 
 def redraw():
@@ -87,6 +88,7 @@ def redraw():
     # that row depart, rather than relying on a CR or a top-left stand-in.
     sys.stdout.write("\033[2J\033[3J\033[H\033[2;19HAntigravity CLI 1.5.9\n"
                      + "\r                  Gemini 3.8 Flash (Low)\r\n"
+                     + (output_text.replace("\n", "\r\n") + "\r\n" if output_text else "")
                      + ((root / "delivered.txt").read_text().replace("\n", "\r\n") + "\r\n" if (root / "delivered.txt").exists() else "")
                      + "─" * width + "\r\n> " + composer + "\r\n"
                      + "─" * width + "\r\n\033[90m? for shortcuts\033[0m")
@@ -99,7 +101,7 @@ def redraw():
 
 
 def replay(action):
-    global state, permission_menu, permission_prompt, misrender_next_echo
+    global state, permission_menu, permission_prompt, misrender_next_echo, output_text
     if "hook" in action:
         payload = json.loads((root / action["hook"]).read_text())
         # The capture's workspace is sanitized; retain its measured event shape
@@ -157,6 +159,9 @@ def replay(action):
         misrender_next_echo = True
     elif "redraw_composer" in action:
         permission_menu = None
+        redraw()
+    elif "output" in action:
+        output_text = action["output"]
         redraw()
     elif "permission_menu" in action:
         permission_menu = action["permission_menu"]

@@ -7966,6 +7966,22 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Does not assert:** the cause of the real agent's intermittent render desynchronisation or a real model's response.
 - **Platform coverage:** mac+linux.
 
+##### antigravity/inbox/005 — Human permission answers leave later idle doorbells usable.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_antigravity_inbox.rs`), attached input, real PTY, daemon and hook CLI.
+- **Agent:** captured-hook Antigravity stand-in.
+- **Asserts:** a person answers a visible permission menu through the deck input path; after the turn ends Idle, a subsequently queued task visibly reaches the worker exactly once, with one doorbell submission and one acknowledged receipt delivery.
+- **Does not assert:** real model permission handling or a genuine model's turn timing.
+- **Platform coverage:** mac+linux.
+
+##### antigravity/inbox/006 — Numbered output permits delivery while a real permission menu blocks it.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_antigravity_inbox.rs`), real PTY, daemon and hook CLI.
+- **Agent:** captured-hook Antigravity stand-in with numbered task output above the ready composer.
+- **Asserts:** a visible numbered permission menu holds pending mail despite idle; clearing it to numbered scrollback/output above an empty composer permits visible delivery exactly once.
+- **Does not assert:** real model output rendering or permission acceptance.
+- **Platform coverage:** mac+linux.
+
 #### antigravity/status
 
 ##### antigravity/status/001 — Captured Antigravity hooks drive the visible prompt, running command and ordinary turn end.
