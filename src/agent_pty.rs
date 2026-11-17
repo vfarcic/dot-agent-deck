@@ -37142,3 +37142,287 @@ mod shell_agent_session_tests {
         assert_eq!(release(&bus), None);
     }
 }
+
+#[cfg(test)]
+mod paced_withdrawal_tests {
+    //! PRD #211 (audit suggestion 3): a doorbell transaction's paced
+    //! withdrawal ([`crate::doorbell_txn::Txn::pace_deletes`]) on the real
+    //! pane writer, through a PTY writer that, as `agy` was measured to,
+    //! loses deletes sent in one burst.
+    use super::*;
+    use crate::doorbell_txn::{
+        Action, Admission, Caps, ComposerView, ECHO_WAIT, Event, Frame, Job, Outcome, Seam,
+        SeamRead,
+    };
+
+    /// The pane's PTY writer as `agy` takes it: a write holding several
+    /// deletes reaches the agent as one of them, the rest dropped though the
+    /// PTY took them. Each write's bytes are recorded.
+    struct BurstDropper {
+        inner: Box<dyn std::io::Write + Send>,
+        writes: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl std::io::Write for BurstDropper {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.writes.lock().unwrap().push(buf.to_vec());
+            if buf.iter().filter(|&&b| b == 0x7f).count() > 1 {
+                self.inner.write_all(&[0x7f])?;
+            } else {
+                self.inner.write_all(buf)?;
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    /// The composer as the agent holds it once `typed` reached it: the line
+    /// misrendered with `agy`'s seven-column gap until a delete went in, then
+    /// what the deletes left.
+    struct Composer {
+        typed: std::path::PathBuf,
+        line: String,
+    }
+
+    impl Seam for Composer {
+        fn read(&mut self) -> Option<SeamRead> {
+            let typed = std::fs::read(&self.typed).unwrap_or_default();
+            let deletes = typed.iter().filter(|&&b| b == 0x7f).count();
+            let count = self.line.chars().count();
+            let text: String = if typed.is_empty() {
+                String::new()
+            } else if deletes == 0 {
+                let at = self.line.char_indices().nth(35).unwrap().0;
+                format!("{}       {}", &self.line[..at], &self.line[at..])
+            } else {
+                self.line
+                    .chars()
+                    .take(count.saturating_sub(deletes))
+                    .collect()
+            };
+            Some(SeamRead {
+                watermark: 0,
+                job_mark: 0,
+                frame: Frame {
+                    epoch: 0,
+                    clean: true,
+                    composer: Some(ComposerView {
+                        placeholder: text.is_empty() && typed.is_empty(),
+                        text,
+                        cursor_at_end: true,
+                        selection: false,
+                        hidden: false,
+                    }),
+                    ..Frame::default()
+                },
+                mode: Ok(()),
+                open: true,
+            })
+        }
+    }
+
+    /// Ring once on a raw `cat` pane whose writer is a [`BurstDropper`],
+    /// the misrendered echo withdrawn at `pace` (`None`: in one burst), on a
+    /// clock of the test's own from admission. Returns the outcome, each
+    /// write the PTY was handed, and the bytes that reached the agent.
+    async fn ring(pace: Option<Duration>) -> (Outcome, Vec<Vec<u8>>, Vec<u8>) {
+        let dir = tempfile::tempdir().unwrap();
+        let typed = dir.path().join("typed");
+        std::fs::write(&typed, b"").unwrap();
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let command = format!("stty raw -echo && exec cat > '{}'", typed.display());
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some(&command),
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "pane-paced-withdrawal".to_string(),
+                )]),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the pane");
+        let doorbell = registry.generation_doorbell(&id).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while doorbell.unwrapped_mode().is_err() {
+            assert!(Instant::now() < deadline, "the pane never went raw");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let real = registry
+            .replace_agent_writer_for_test(&id, Box::new(std::io::sink()))
+            .await;
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let _sink = registry
+            .replace_agent_writer_for_test(
+                &id,
+                Box::new(BurstDropper {
+                    inner: real,
+                    writes: Arc::clone(&writes),
+                }),
+            )
+            .await;
+        let bell = crate::doorbell_generation::GenerationDoorbell::new(false, None);
+        let t0 = Instant::now();
+        let admission = Admission {
+            activation: Ok(()),
+            mode: Ok(()),
+            ledger_idle: true,
+            watermark: 0,
+            job_mark: 0,
+            frame: Frame {
+                epoch: 0,
+                clean: true,
+                composer: Some(ComposerView {
+                    text: String::new(),
+                    cursor_at_end: true,
+                    placeholder: true,
+                    selection: false,
+                    hidden: false,
+                }),
+                ..Frame::default()
+            },
+            nudge_in_flight: false,
+            settling: false,
+            submit_route: true,
+            still_admitted: true,
+            command: "dot-agent-deck".to_string(),
+        };
+        let mut draws = [3u8, 1, 4, 1, 5, 9, 2, 6].into_iter().cycle();
+        let caps = Caps {
+            delete_key: true,
+            placeholder: false,
+            hook_route: true,
+            transcript_route: false,
+            staged_head: None,
+        };
+        let mut txn = crate::doorbell_txn::admit(
+            &admission,
+            bell.counter(),
+            bell.ring(),
+            bell.cell(),
+            || draws.next().unwrap(),
+            &crate::inbox::MessageId::parse("m-k3xzq2ab-0f3c9a71d2e4b850").unwrap(),
+            caps,
+            t0,
+        )
+        .expect("admitted");
+        txn.allow_gap_withdrawal();
+        if let Some(pace) = pace {
+            txn.pace_deletes(1, pace);
+        }
+        let mut seam = Composer {
+            typed: typed.clone(),
+            line: txn.line().to_string(),
+        };
+        let writer = registry.agent_writer(&id).expect("the pane's writer");
+        let mut now = t0;
+        let mut actions = txn.start(&mut seam, now);
+        let outcome = loop {
+            if let Some(outcome) = actions.iter().find_map(|a| match a {
+                Action::Release(outcome) => Some(*outcome),
+                _ => None,
+            }) {
+                break outcome;
+            }
+            let queued = actions.iter().find_map(|a| match a {
+                Action::Enqueue(job, claim) => Some((job.clone(), Arc::clone(claim))),
+                _ => None,
+            });
+            let wake = actions.iter().find_map(|a| match a {
+                Action::WakeAt(at) => Some(*at),
+                _ => None,
+            });
+            actions = match queued {
+                Some((job, claim)) => {
+                    let bytes = match &job {
+                        Job::Line(text) => text.clone().into_bytes(),
+                        Job::Cr => b"\r".to_vec(),
+                        Job::Deletes(n) => vec![0x7f; *n],
+                    };
+                    let expected = std::fs::metadata(&typed).unwrap().len() as usize
+                        + match &job {
+                            Job::Deletes(_) if pace.is_none() => 1,
+                            _ => bytes.len(),
+                        };
+                    let mut queued = writer
+                        .lock()
+                        .await
+                        .queue_ring_job(
+                            bytes,
+                            claim,
+                            crate::composer_probe::epoch::DeckJobId::ring(txn.attempt()),
+                        )
+                        .expect("the writer thread runs");
+                    let (accepted, ok) = queued.done().await.expect("the job ran");
+                    // What the agent took is on file before the next look.
+                    let until = Instant::now() + Duration::from_secs(5);
+                    while (std::fs::metadata(&typed).unwrap().len() as usize) < expected {
+                        assert!(Instant::now() < until, "the bytes never reached the agent");
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                    txn.on(Event::JobStarted, &mut seam, now);
+                    if matches!(job, Job::Line(_)) {
+                        // The echo is judged once its wait is over.
+                        let ended = txn.on(Event::JobEnded { accepted, ok }, &mut seam, now);
+                        assert!(
+                            ended.iter().all(|a| !matches!(a, Action::Release(_))),
+                            "{ended:?}"
+                        );
+                        now = t0 + ECHO_WAIT;
+                        let frame = seam.read().unwrap().frame;
+                        txn.on(Event::Frame(frame), &mut seam, now)
+                    } else {
+                        txn.on(Event::JobEnded { accepted, ok }, &mut seam, now)
+                    }
+                }
+                None => {
+                    now = wake.map_or(now + Duration::from_millis(10), |at| at.max(now));
+                    let frame = seam.read().unwrap().frame;
+                    txn.on(Event::Frame(frame), &mut seam, now)
+                }
+            };
+        };
+        let reached = std::fs::read(&typed).unwrap();
+        registry.shutdown_all();
+        let writes = writes.lock().unwrap().clone();
+        (outcome, writes, reached)
+    }
+
+    /// Scenario: the deck types its doorbell line into a pane whose agent
+    /// draws it with a seven-column gap, and whose PTY writer loses all but
+    /// one delete of a write that holds several, as `agy` was measured to.
+    /// Withdrawn at a pace of one delete per write, every delete is its own
+    /// write on the real pane writer, every one reaches the agent, and the
+    /// blank composer confirms the withdrawal. Sent in one burst, the same
+    /// withdrawal leaves the line in the box and the attempt unresolved.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn paced_withdrawal_deletes_each_reach_an_agent_that_drops_a_burst() {
+        let (outcome, writes, reached) = ring(Some(Duration::from_millis(5))).await;
+        assert_eq!(outcome, Outcome::Withdrawn, "{writes:?}");
+        let line = &writes[0];
+        assert!(line.starts_with(b"(") && !line.contains(&0x7f));
+        let deletes = &writes[1..];
+        assert_eq!(
+            deletes.len(),
+            String::from_utf8_lossy(line).chars().count(),
+            "one write per character typed"
+        );
+        assert!(deletes.iter().all(|write| write == &[0x7f]), "{deletes:?}");
+        assert_eq!(
+            reached.iter().filter(|&&b| b == 0x7f).count(),
+            deletes.len(),
+            "every delete reached the agent"
+        );
+        assert!(!reached.contains(&b'\r'), "nothing was submitted");
+
+        let (outcome, writes, reached) = ring(None).await;
+        assert!(
+            matches!(outcome, Outcome::Unresolved(_)),
+            "a burst the agent drops is not confirmed: {outcome:?}"
+        );
+        assert_eq!(writes.len(), 2, "the line, then every delete in one write");
+        assert_eq!(reached.iter().filter(|&&b| b == 0x7f).count(), 1);
+    }
+}

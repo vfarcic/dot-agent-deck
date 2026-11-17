@@ -948,6 +948,9 @@ pub enum Phase {
     /// Deletes wait for their seam, then the placeholder.
     Withdrawing,
     DeleteJob,
+    /// PRD #211: a paced withdrawal's next deletes wait until then
+    /// ([`Txn::pace_deletes`]).
+    DeletePace(Instant),
     ConfirmWithdrawn,
     /// `Unresolved`, the cell suspended; late evidence or a strict
     /// withdrawal can still resolve it until the deadline.
@@ -1036,6 +1039,14 @@ pub struct Txn<'c> {
     /// The current withdrawal is that one: its recogniser is
     /// [`Self::gap_view`], not [`Self::strict`].
     gap: bool,
+    /// PRD #211: the agent's served delete pacing — at most this many
+    /// deletes per write, this long apart ([`Self::pace_deletes`]); `None`
+    /// sends a withdrawal's deletes in one job.
+    delete_pace: Option<(usize, Duration)>,
+    /// The deletes of the current withdrawal the agent has taken so far, and
+    /// how many the job in flight carries.
+    deleted: usize,
+    delete_job: usize,
 }
 
 /// PRD #211: `shown` is `typed` with only spaces inserted into it — every
@@ -1140,6 +1151,9 @@ pub fn admit<'c>(
         unresolved_at: None,
         gap_allowed: false,
         gap: false,
+        delete_pace: None,
+        deleted: 0,
+        delete_job: 0,
     })
 }
 
@@ -1195,6 +1209,18 @@ impl<'c> Txn<'c> {
     /// misrendered echo stays suspended.
     pub fn allow_gap_withdrawal(&mut self) {
         self.gap_allowed = true;
+    }
+
+    /// PRD #211: send a withdrawal's deletes at most `per_write` to a write,
+    /// `gap` apart, as the agent's served keys ask (Antigravity drops some of
+    /// a burst: [`crate::agent_registry::DeleteCharKey::max_presses_per_write`]).
+    /// Each write is a job of its own on the writer, under this transaction's
+    /// ownership and its seam's checks, and none starts after the deadline. A
+    /// paced withdrawal whose writes cannot all start before the deadline is
+    /// not started at all, so the line stays whole and the attempt
+    /// unresolved; one the deadline still cuts short ends unresolved too.
+    pub fn pace_deletes(&mut self, per_write: usize, gap: Duration) {
+        self.delete_pace = Some((per_write.max(1), gap));
     }
 
     /// The attempt started the misrendered-echo withdrawal
@@ -1326,18 +1352,12 @@ impl<'c> Txn<'c> {
             (Phase::Confirm, _) => self.confirm(seam, now),
             (Phase::Withdrawing, _) => self.try_deletes(seam, now),
             (Phase::DeleteJob, Event::JobEnded { accepted, ok }) => {
-                let (deletes, cause) = self.withdrawal.expect("a delete job has its withdrawal");
-                let _ = cause;
-                if ok && accepted == deletes {
-                    self.enter(Phase::ConfirmWithdrawn, now);
-                    self.confirm_withdrawn(now)
-                } else {
-                    self.suspend_and_pause(Cause::WithdrawalStalled, now)
-                }
+                self.deletes_ended(accepted, ok, now)
             }
             (Phase::DeleteJob, Event::JobStalled) => {
                 self.suspend_and_pause(Cause::WithdrawalStalled, now)
             }
+            (Phase::DeletePace(at), _) => self.next_deletes(at, seam, now),
             (Phase::ConfirmWithdrawn, _) => self.confirm_withdrawn(now),
             (Phase::Pause(cause), _) => self.pause(cause, seam, now),
             _ => vec![Action::WakeAt(self.next_wake(now))],
@@ -1987,14 +2007,78 @@ impl<'c> Txn<'c> {
                 if view != Some(deletes) {
                     return self.suspend_and_pause(cause, now);
                 }
-                self.enqueue(
-                    JobKind::Deletes,
-                    Job::Deletes(deletes),
-                    Phase::DeleteJob,
-                    now,
-                )
+                // Paced, a withdrawal the deadline would cut short is not
+                // started: it would leave part of the line in the box.
+                if let Some((per_write, gap)) = self.delete_pace {
+                    let writes = deletes.div_ceil(per_write);
+                    let needs = gap.saturating_mul(
+                        u32::try_from(writes.saturating_sub(1)).unwrap_or(u32::MAX),
+                    );
+                    if now + needs >= self.deadline {
+                        self.note_unresolved(
+                            "try_deletes: the paced deletes do not fit the deadline",
+                        );
+                        // Nothing was withdrawn: the next ring may try again.
+                        self.gap = false;
+                        return self.suspend_and_pause(cause, now);
+                    }
+                }
+                self.deleted = 0;
+                self.enqueue_deletes(deletes, now)
             }
             SeamVerdict::Layout => self.edge(now),
+            SeamVerdict::Closed => self.retired(now),
+            SeamVerdict::Expired => self.end(End::Expire, now),
+            SeamVerdict::Mode(_) => self.suspend_and_pause(Cause::ModeChanged, now),
+            SeamVerdict::Human | SeamVerdict::JobMark => self.suspend_and_pause(cause, now),
+        }
+    }
+
+    /// Queue the next of a withdrawal's `deletes` that are left: all of them
+    /// in one job, or, paced, the agent's per-write share.
+    fn enqueue_deletes(&mut self, deletes: usize, now: Instant) -> Vec<Action> {
+        let left = deletes - self.deleted;
+        self.delete_job = self
+            .delete_pace
+            .map_or(left, |(per_write, _)| per_write.min(left));
+        self.enqueue(
+            JobKind::Deletes,
+            Job::Deletes(self.delete_job),
+            Phase::DeleteJob,
+            now,
+        )
+    }
+
+    /// A delete job ended with `accepted` of its deletes taken: on to the
+    /// next, once the pace allows, or, all taken, to the confirmation.
+    fn deletes_ended(&mut self, accepted: usize, ok: bool, now: Instant) -> Vec<Action> {
+        let (deletes, _) = self.withdrawal.expect("a delete job has its withdrawal");
+        if !ok || accepted != self.delete_job {
+            return self.suspend_and_pause(Cause::WithdrawalStalled, now);
+        }
+        self.deleted += accepted;
+        if self.deleted == deletes {
+            self.enter(Phase::ConfirmWithdrawn, now);
+            return self.confirm_withdrawn(now);
+        }
+        let gap = self.delete_pace.map_or(Duration::ZERO, |(_, gap)| gap);
+        let at = now + gap;
+        self.enter(Phase::DeletePace(at), now);
+        vec![Action::WakeAt(at.min(self.deadline))]
+    }
+
+    /// A paced withdrawal's next deletes, once their moment came: checked by
+    /// the seam as every job is, but not by the recogniser that started the
+    /// withdrawal, which reads the whole line the deletes are now removing.
+    fn next_deletes(&mut self, at: Instant, seam: &mut dyn Seam, now: Instant) -> Vec<Action> {
+        if now < at && now < self.deadline {
+            return vec![Action::WakeAt(at.min(self.deadline))];
+        }
+        let (deletes, cause) = self.withdrawal.expect("a paced withdrawal has its deletes");
+        match self.seam(seam, false, now) {
+            SeamVerdict::Contended(at) => vec![Action::WakeAt(at)],
+            SeamVerdict::Pass(_) => self.enqueue_deletes(deletes, now),
+            SeamVerdict::Layout => vec![Action::WakeAt(self.next_wake(now))],
             SeamVerdict::Closed => self.retired(now),
             SeamVerdict::Expired => self.end(End::Expire, now),
             SeamVerdict::Mode(_) => self.suspend_and_pause(Cause::ModeChanged, now),
@@ -2459,6 +2543,121 @@ mod gap_withdrawal_tests {
         assert_eq!(enqueued(&actions), vec![Job::Deletes(line.chars().count())]);
         let (outcome, _) = run_out(&mut txn, &mut seam, actions, t0 + ECHO_WAIT);
         assert_eq!(outcome, Outcome::Withdrawn);
+    }
+
+    /// PRD #211: a paced withdrawal ([`Txn::pace_deletes`]) sends one delete
+    /// per job, the next only once the pace allows and its seam passes, and
+    /// is confirmed once every delete is in. Here at a 5 ms pace, which the
+    /// deadline leaves room for.
+    #[test]
+    fn a_paced_gap_withdrawal_sends_one_delete_per_job_at_its_pace() {
+        const PACE: Duration = Duration::from_millis(5);
+        let bell = generation();
+        let t0 = Instant::now();
+        let mut txn = admit_on(&bell, caps(false), t0);
+        txn.pace_deletes(1, PACE);
+        let line = txn.line().to_string();
+        let count = line.chars().count();
+        let mut seam = OneFrame(composer("", true));
+        let (mut actions, _) =
+            type_then_show(&mut txn, &mut seam, composer(&gapped(&line), false), t0);
+        let mut now = t0 + ECHO_WAIT;
+        let mut deleted = 0;
+        loop {
+            assert_eq!(
+                enqueued(&actions),
+                vec![Job::Deletes(1)],
+                "one delete per job ({deleted} in)"
+            );
+            txn.on(Event::JobStarted, &mut seam, now);
+            deleted += 1;
+            let left: String = line.chars().take(count - deleted).collect();
+            seam.0 = composer(&left, false);
+            actions = txn.on(
+                Event::JobEnded {
+                    accepted: 1,
+                    ok: true,
+                },
+                &mut seam,
+                now,
+            );
+            if deleted == count {
+                break;
+            }
+            assert_eq!(enqueued(&actions), vec![], "the next waits for its pace");
+            let early = txn.on(Event::Frame(seam.0.clone()), &mut seam, now + PACE / 2);
+            assert_eq!(enqueued(&early), vec![], "not before its pace");
+            now += PACE;
+            actions = txn.on(Event::Frame(seam.0.clone()), &mut seam, now);
+        }
+        assert_eq!(released(&actions), None);
+        seam.0 = composer("", false);
+        let (outcome, more) = run_out(&mut txn, &mut seam, actions, now);
+        assert_eq!(outcome, Outcome::Withdrawn);
+        assert!(more.is_empty(), "nothing after the last delete: {more:?}");
+    }
+
+    /// PRD #211: the agent drops a delete of a paced withdrawal (its job
+    /// ends with nothing taken): the withdrawal stops there, unresolved,
+    /// and nothing more is sent.
+    #[test]
+    fn a_paced_delete_the_agent_did_not_take_stops_the_withdrawal() {
+        let bell = generation();
+        let t0 = Instant::now();
+        let mut txn = admit_on(&bell, caps(false), t0);
+        txn.pace_deletes(1, Duration::from_millis(5));
+        let line = txn.line().to_string();
+        let mut seam = OneFrame(composer("", true));
+        let (actions, _) = type_then_show(&mut txn, &mut seam, composer(&gapped(&line), false), t0);
+        assert_eq!(enqueued(&actions), vec![Job::Deletes(1)]);
+        let now = t0 + ECHO_WAIT;
+        txn.on(Event::JobStarted, &mut seam, now);
+        let actions = txn.on(
+            Event::JobEnded {
+                accepted: 0,
+                ok: true,
+            },
+            &mut seam,
+            now,
+        );
+        assert_eq!(enqueued(&actions), vec![]);
+        let (outcome, more) = run_out(&mut txn, &mut seam, actions, now);
+        assert_eq!(outcome, Outcome::Unresolved(Cause::WithdrawalStalled));
+        assert!(more.is_empty(), "{more:?}");
+    }
+
+    /// PRD #211: at Antigravity's served pace, 20 ms per delete, the deck's
+    /// whole line takes longer to delete than the deadline leaves once the
+    /// echo wait is over, so the withdrawal is not started: no delete is
+    /// sent, the line stays whole, and the attempt ends unresolved.
+    #[test]
+    fn a_paced_withdrawal_the_deadline_cannot_fit_is_not_started() {
+        let pace = crate::agent_registry::spec(&crate::event::AgentType::Antigravity)
+            .prompt_keys
+            .as_ref()
+            .map(|keys| &keys.delete_char)
+            .expect("Antigravity's keys");
+        let (per_write, gap) = (
+            pace.max_presses_per_write.expect("paced") as usize,
+            Duration::from_millis(u64::from(pace.pause_between_writes_ms.unwrap())),
+        );
+        let bell = generation();
+        let t0 = Instant::now();
+        let mut txn = admit_on(&bell, caps(false), t0);
+        txn.pace_deletes(per_write, gap);
+        let line = txn.line().to_string();
+        let writes = u32::try_from(line.chars().count().div_ceil(per_write)).unwrap();
+        assert!(
+            ECHO_WAIT + gap * (writes - 1) >= TXN_MAX,
+            "the line's paced deletes would fit: the case this test is about is gone"
+        );
+        let mut seam = OneFrame(composer("", true));
+        let (actions, jobs) =
+            type_then_show(&mut txn, &mut seam, composer(&gapped(&line), false), t0);
+        assert_eq!(jobs, vec![Job::Line(line)], "no delete was sent");
+        let (outcome, more) = run_out(&mut txn, &mut seam, actions, t0 + ECHO_WAIT);
+        assert_eq!(outcome, Outcome::Unresolved(Cause::EchoMismatch));
+        assert!(more.is_empty(), "{more:?}");
     }
 
     /// PRD #211: what real `agy` 1.5.9 drew after the deck's paced deletes
