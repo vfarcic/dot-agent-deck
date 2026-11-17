@@ -278,11 +278,6 @@ export function approveShownReview(declared: string | undefined): string | undef
   return published.approve();
 }
 
-/** Whether a review is on screen (for the shell's voice context). */
-export function reviewIsShown(): boolean {
-  return published !== undefined;
-}
-
 /** Publish the review on screen; answers the unpublish, which only takes back its own. */
 export function publishReview(review: PublishedReview): () => void {
   published = review;

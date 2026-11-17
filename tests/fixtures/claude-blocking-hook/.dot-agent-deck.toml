@@ -1,0 +1,3 @@
+# Minimal fixture for the TUI testing harness. No modes / orchestrations —
+# the harness uses this to launch the deck with no project-config side
+# effects so synthetic-event tests can assert on a known starting state.

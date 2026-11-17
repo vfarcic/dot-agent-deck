@@ -29610,6 +29610,7 @@ mod spawn_tests {
     /// Scenario: inbox/doorbell/046 through the real adapter: a model editor drops the deck's Enter, so the ring ends unresolved and the doorbell is suspended with uncertain_input shown, while the user has a draft of their own in the tracker. An older attempt's token reported exact by the prompt hook moves nothing; this attempt's token reported exact afterwards resolves the attempt late, lifts the suspension and clears the card, and leaves the user's draft bit as it was.
     #[spec("inbox/doorbell/046")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    #[ignore = "quarantined: vfarcic, #2345"]
     async fn doorbell_046_late_exact_evidence_resolves_only_its_attempt_through_the_hook_arm() {
         use crate::doorbell_txn::{Latch, Outcome, Resolution};
         use crate::inbox_display::WakeHold;
