@@ -44,6 +44,29 @@
 //! below leave open: a process that can set the entrypoint's `PATH` controls
 //! its environment, and so its `NODE_OPTIONS`, which nothing compares.
 //!
+//! **An entrypoint that replaces itself** (issue #2337): npm Codex's
+//! `codex.js` from 0.169.0 `execve`s the native in place where the
+//! interpreter has `process.execve` (Node 23.11 and later), so no entrypoint
+//! is left above the native, which runs at the PID the interpreter had. When
+//! the pinned script lives in an installed package (the directory right
+//! below the last `node_modules` on its path, symlinks followed, holding a
+//! `package.json`), the pin also carries that directory, read at spawn. A
+//! candidate whose running executable is a file inside it, named as the
+//! expected agent, is attested, while the script's path still holds the
+//! pinned file. It is the pinned file's own package that ships the
+//! executable, so this compares the native with the installation the pin
+//! names, where the route below an entrypoint compares it with nothing; what
+//! it gives up is the process tie, as the native pin's route does: any
+//! process below the PTY child running that file is the agent, as any
+//! process running a native pin's inode is. "Inside" is read from
+//! `/proc/<pid>/exe`'s target, which the kernel writes, and that path must
+//! hold the running executable now, as the daemon sees it, so a deleted
+//! file, one replaced since, or one another mount namespace placed there
+//! isn't inside. A native npm placed elsewhere (a project install's hoisted
+//! `node_modules/@openai/codex-linux-x64`, a pnpm store) is outside the
+//! package and stays refused; so is any executable a script in no package
+//! `exec`s.
+//!
 //! **What holds for the hosted route, and what doesn't.** The entrypoint's
 //! executable is the interpreter's, so it says nothing about which script
 //! the interpreter read. Validation therefore also requires the script's
@@ -64,6 +87,9 @@
 //!   the script's choice at run time (npm's `codex.js` resolves a platform
 //!   package, which npm may hoist), so there is no spawn-time fact to pin it
 //!   to, and a writer of the package's directory can replace it.
+//! - An executable inside the pinned package is compared with the package's
+//!   directory, not with a file identity: a writer of that directory can put
+//!   another executable there, as one can replace the native above.
 //!
 //! Code the attested processes load from elsewhere, or through their
 //! environment, is not compared at all: the modules `codex.js` requires
@@ -83,9 +109,10 @@
 //! **Validation** ([`validate`]), after the candidate is found, reads it again
 //! and refuses, in this order, a candidate that exited, one that left the
 //! parent it was found under (or whose ancestry to the PTY child changed),
-//! one another user owns, and one whose executable is neither the pin nor a
-//! child of a still-attested entrypoint whose script path still holds the
-//! pinned file. Lifecycle and owner refusals come before an executable
+//! one another user owns, and one whose executable is neither the pin, nor a
+//! child of a still-attested entrypoint, nor a file inside the pinned
+//! package, the last two only while the script path still holds the pinned
+//! file. Lifecycle and owner refusals come before an executable
 //! mismatch, and a kind claim only changes which pin is expected, never what
 //! attests the candidate. [`validate_held`] then reads the candidate again
 //! before and after the pidfd poll: both reads must see the executable
@@ -121,6 +148,11 @@ pub struct Pin {
     pub exe: FileId,
     /// When the file is an interpreter-hosted script: its interpreter.
     pub hosted: Option<Hosted>,
+    /// When the file is an interpreter-hosted script installed as a
+    /// package's file: that package's directory, symlinks followed, as it
+    /// was at spawn ([`package_of`]). A candidate running an executable
+    /// inside it is attested in place (issue #2337).
+    pub package: Option<PathBuf>,
 }
 
 /// A pinned script's interpreter, from its shebang line.
@@ -172,8 +204,8 @@ impl Pins {
 pub enum Refusal {
     /// The expected agent's name resolved nothing at spawn.
     NotResolved(ProbeAgent),
-    /// The candidate's executable is neither the pin nor a native below an
-    /// attested entrypoint.
+    /// The candidate's executable is neither the pin, nor a native below an
+    /// attested entrypoint, nor a file inside the pinned script's package.
     Differs(ProbeAgent),
     /// The candidate isn't below the parent it was found under any more.
     LeftParent,
@@ -318,6 +350,7 @@ pub fn pin_program(program: &OsStr, path: Option<&OsStr>) -> Option<Pin> {
             exe: executable_id(&found)?,
             path: found,
             hosted: None,
+            package: None,
         }),
     }
 }
@@ -341,11 +374,50 @@ fn pin_opened(found: PathBuf, file: std::fs::File, path: Option<&OsStr>) -> Opti
         .read_to_end(&mut head)
         .ok()
         .and_then(|_| hosted_by(&head, path));
+    let package = hosted.as_ref().and_then(|_| package_of(&found, exe));
     Some(Pin {
         path: found,
         exe,
         hosted,
+        package,
     })
+}
+
+/// The installed package that holds the script at `found`, which was pinned
+/// as `exe`: the directory right below the last `node_modules` on the
+/// script's path with symlinks followed (`node_modules/<name>` or
+/// `node_modules/@scope/<name>`), holding a `package.json`. `None` when the
+/// script isn't inside such a directory, or when the path no longer leads to
+/// the pinned file. Read at spawn, with the pin; nothing reads it again.
+///
+/// The last `node_modules` is the script's own package, never an ancestor
+/// one: an npm global install nests its dependencies inside it
+/// (`@openai/codex/node_modules/@openai/codex-linux-x64`), and a directory
+/// that merely holds a `package.json`, such as a home directory, is never a
+/// package here.
+fn package_of(found: &Path, exe: FileId) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Component;
+    let real = std::fs::canonicalize(found).ok()?;
+    if executable_id(&real) != Some(exe) {
+        return None;
+    }
+    let parts: Vec<Component<'_>> = real.components().collect();
+    let modules = parts
+        .iter()
+        .rposition(|part| part.as_os_str() == "node_modules")?;
+    let name = parts.get(modules + 1)?;
+    let end = if name.as_os_str().as_bytes().starts_with(b"@") {
+        modules + 3
+    } else {
+        modules + 2
+    };
+    // The script is a file inside the package, not the package itself.
+    if parts.len() <= end {
+        return None;
+    }
+    let root: PathBuf = parts[..end].iter().collect();
+    root.join("package.json").is_file().then_some(root)
 }
 
 /// Where `program` is found with `path`, as [`pin_program`] says; with
@@ -438,6 +510,9 @@ pub struct Proc {
     pub exe: Option<FileId>,
     /// `/proc/<pid>/exe`'s target's file name, ` (deleted)` taken off.
     pub exe_name: Option<OsString>,
+    /// `/proc/<pid>/exe`'s target, when it is an absolute path to a file
+    /// that wasn't deleted: where the running executable was opened.
+    pub exe_path: Option<PathBuf>,
     pub argv: Vec<OsString>,
     pub uid: Option<u32>,
 }
@@ -683,6 +758,9 @@ pub enum Attested {
     Pinned,
     /// It is the native child of an attested entrypoint.
     BelowEntry,
+    /// Its executable is a file inside the pinned script's package: the
+    /// entrypoint replaced itself with it in place (issue #2337).
+    InPackage,
 }
 
 /// What [`validate`] accepted: how the candidate is attested, and the
@@ -756,7 +834,46 @@ pub fn validate(
             exe,
         });
     }
+    if let Some(package) = &pin.package
+        && in_package(procs, &proc, exe, package, agent)
+        && procs.file(&pin.path) == Some(pin.exe)
+    {
+        return Ok(Accepted {
+            how: Attested::InPackage,
+            exe,
+        });
+    }
     Err(Refusal::Differs(agent))
+}
+
+/// Whether `proc`, running `exe`, runs a file inside `package` named as
+/// `agent` (the module doc's issue #2337 paragraph): its executable's path
+/// is below `package`, its file name is one of `agent`'s names, and that
+/// path holds `exe` now, as this process sees it. A deleted or replaced
+/// executable, or one another mount namespace shows at that path, holds
+/// another file there and is refused.
+fn in_package(
+    procs: &mut impl Procs,
+    proc: &Proc,
+    exe: FileId,
+    package: &Path,
+    agent: ProbeAgent,
+) -> bool {
+    use std::path::Component;
+    let Some(at) = &proc.exe_path else {
+        return false;
+    };
+    let named = at
+        .file_name()
+        .is_some_and(|name| names_of(agent).iter().any(|n| name == *n));
+    named
+        && at.is_absolute()
+        && at
+            .components()
+            .all(|part| !matches!(part, Component::ParentDir | Component::CurDir))
+        && at.starts_with(package)
+        && at != package
+        && procs.file(at) == Some(exe)
 }
 
 /// [`validate`], then `candidate` read again around the pidfd poll that
@@ -855,15 +972,19 @@ impl Procs for LinuxProcs {
                 dev: m.dev(),
                 ino: m.ino(),
             });
-        let exe_name = std::fs::read_link(format!("/proc/{pid}/exe"))
-            .ok()
-            .and_then(|target| {
-                let bytes = target.as_os_str().as_bytes();
-                let bytes = bytes.strip_suffix(DELETED).unwrap_or(bytes);
-                Path::new(OsStr::from_bytes(bytes))
-                    .file_name()
-                    .map(OsStr::to_os_string)
-            });
+        let link = std::fs::read_link(format!("/proc/{pid}/exe")).ok();
+        let exe_name = link.as_ref().and_then(|target| {
+            let bytes = target.as_os_str().as_bytes();
+            let bytes = bytes.strip_suffix(DELETED).unwrap_or(bytes);
+            Path::new(OsStr::from_bytes(bytes))
+                .file_name()
+                .map(OsStr::to_os_string)
+        });
+        // A deleted executable's target only names where it was: nothing
+        // there is the running file.
+        let exe_path = link.filter(|target| {
+            target.is_absolute() && !target.as_os_str().as_bytes().ends_with(DELETED)
+        });
         let mut cmdline = Vec::new();
         std::fs::File::open(format!("/proc/{pid}/cmdline"))
             .ok()?
@@ -880,6 +1001,7 @@ impl Procs for LinuxProcs {
             state,
             exe,
             exe_name,
+            exe_path,
             argv,
             uid,
         })
@@ -968,6 +1090,7 @@ mod tests {
                     state: b'S',
                     exe: Some(exe),
                     exe_name: Some(name.into()),
+                    exe_path: None,
                     argv: argv.iter().map(OsString::from).collect(),
                     uid: Some(UID),
                 },
@@ -1015,6 +1138,7 @@ mod tests {
             path: "/opt/agent/codex".into(),
             exe: NATIVE,
             hosted: None,
+            package: None,
         }
     }
 
@@ -1026,6 +1150,7 @@ mod tests {
                 interpreter: PYTHON,
                 prefix: vec!["python3".into()],
             }),
+            package: None,
         }
     }
 
@@ -1210,6 +1335,162 @@ mod tests {
             } else {
                 assert_eq!(got, Err(Refusal::Differs(ProbeAgent::Codex)));
             }
+        }
+    }
+
+    /// Scenario: An npm global install of Codex: `bin/codex` on the PATH is a symlink to the package's `#!/usr/bin/env node` script. The pin carries the package's directory, found from the script's real path (`…/node_modules/@openai/codex`); a script in no `node_modules` (even below a directory holding a `package.json`), a package directory with no `package.json`, and a native pin carry none.
+    #[spec("inbox/probe/035")]
+    #[test]
+    fn probe_035_a_hosted_pin_carries_its_scripts_package() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::copy("/bin/sh", root.join("node")).unwrap();
+        let path = std::env::join_paths([root.join("bin"), root.clone()]).unwrap();
+        let package = root.join("lib/node_modules/@openai/codex");
+        std::fs::create_dir_all(package.join("bin")).unwrap();
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::write(package.join("package.json"), "{}").unwrap();
+        write_executable(
+            &package.join("bin/codex.js"),
+            b"#!/usr/bin/env node\n// codex.js\n",
+        );
+        symlink(
+            "../lib/node_modules/@openai/codex/bin/codex.js",
+            root.join("bin/codex"),
+        )
+        .unwrap();
+        let pin = pin_program(OsStr::new("codex"), Some(&path)).expect("pinned");
+        assert_eq!(pin.path, root.join("bin/codex"), "the path as found");
+        assert_eq!(pin.package, Some(package.clone()), "the scoped package");
+
+        std::fs::remove_file(package.join("package.json")).unwrap();
+        let pin = pin_program(OsStr::new("codex"), Some(&path)).expect("pinned");
+        assert!(pin.hosted.is_some());
+        assert_eq!(
+            pin.package, None,
+            "a package directory holds its package.json"
+        );
+
+        let unscoped = root.join("u/node_modules/codex");
+        std::fs::create_dir_all(unscoped.join("bin")).unwrap();
+        std::fs::write(unscoped.join("package.json"), "{}").unwrap();
+        write_executable(&unscoped.join("bin/codex"), b"#!/usr/bin/env node\n");
+        let pin = pin_program(
+            unscoped.join("bin/codex").as_os_str(),
+            Some(root.as_os_str()),
+        )
+        .expect("pinned");
+        assert_eq!(pin.package, Some(unscoped), "an unscoped package");
+
+        let home = root.join("home");
+        std::fs::create_dir_all(home.join("bin")).unwrap();
+        std::fs::write(home.join("package.json"), "{}").unwrap();
+        write_executable(&home.join("bin/codex"), b"#!/usr/bin/env node\n");
+        let pin = pin_program(home.join("bin/codex").as_os_str(), Some(root.as_os_str()))
+            .expect("pinned");
+        assert!(pin.hosted.is_some());
+        assert_eq!(pin.package, None, "a script in no node_modules");
+
+        let native = root.join("n/node_modules/codex/bin/codex");
+        std::fs::create_dir_all(native.parent().unwrap()).unwrap();
+        std::fs::write(root.join("n/node_modules/codex/package.json"), "{}").unwrap();
+        std::fs::copy("/bin/sh", &native).unwrap();
+        let pin = pin_program(native.as_os_str(), None).expect("pinned");
+        assert_eq!(
+            (pin.hosted, pin.package),
+            (None, None),
+            "a native pin hosts nothing"
+        );
+    }
+
+    /// Scenario: npm Codex 0.169.0 under Node 23.11 or later: the wrapper's child ran the pinned script, and the script `execve`d the native in place, so the native is the wrapper's own child with no entrypoint above it (issue #2337). A native inside the pinned script's package binds; a native beside the package (npm's hoisted shape), one named as another tool, one whose path no longer holds the running file, a deleted one, a path that climbs out with `..`, a script replaced since the pin and a pin with no package are each refused as an executable mismatch.
+    #[spec("inbox/probe/035")]
+    #[test]
+    fn probe_035_an_entrypoint_that_execs_in_place_binds_only_inside_its_package() {
+        let package = PathBuf::from("/npm/lib/node_modules/@openai/codex");
+        let inside = package.join("node_modules/@openai/codex-linux-x64/vendor/t/bin/codex");
+        let pin = Pin {
+            package: Some(package.clone()),
+            ..npm_pin()
+        };
+        let attempt = |pin: &Pin, at: Option<&str>, holds: FileId, script: FileId| {
+            let mut t = Table::default();
+            t.add(
+                10,
+                1,
+                OWN,
+                "dot-agent-deck",
+                &["deck", "wrap", "--agent", "codex", "--", "codex", "--x"],
+            )
+            .add(11, 10, NATIVE, "codex", &["/somewhere/codex", "--x"]);
+            t.procs.get_mut(&11).unwrap().exe_path = at.map(PathBuf::from);
+            if let Some(at) = at {
+                t.files.insert(at.into(), holds);
+            }
+            t.files.insert(pin.path.clone(), script);
+            let c = find(&mut t, 10, 100, &walk(pin)).expect("the native");
+            assert_eq!(
+                (c.pid, c.entry.clone()),
+                (11, None),
+                "in the entrypoint's place"
+            );
+            validate(&mut t, &c, ProbeAgent::Codex, pin, UID, false).map(|a| a.how)
+        };
+        let inside = inside.to_str().unwrap();
+        assert_eq!(
+            attempt(&pin, Some(inside), NATIVE, SCRIPT),
+            Ok(Attested::InPackage),
+            "the native the pinned script's package ships"
+        );
+        let refused = Err(Refusal::Differs(ProbeAgent::Codex));
+        let rg = package.join("node_modules/@openai/codex-linux-x64/vendor/t/path/rg");
+        for (pin, at, holds, script, why) in [
+            (
+                &pin,
+                Some("/npm/lib/node_modules/@openai/codex-linux-x64/vendor/t/bin/codex"),
+                NATIVE,
+                SCRIPT,
+                "beside the package, hoisted",
+            ),
+            (
+                &pin,
+                Some(rg.to_str().unwrap()),
+                NATIVE,
+                SCRIPT,
+                "another tool",
+            ),
+            (
+                &pin,
+                Some(inside),
+                COPY,
+                SCRIPT,
+                "the path holds another file",
+            ),
+            (&pin, None, NATIVE, SCRIPT, "deleted"),
+            (
+                &pin,
+                Some("/npm/lib/node_modules/@openai/codex/../../../../elsewhere/codex"),
+                NATIVE,
+                SCRIPT,
+                "a path that climbs out",
+            ),
+            (
+                &pin,
+                Some(inside),
+                NATIVE,
+                COPY,
+                "the script replaced since the pin",
+            ),
+            (
+                &npm_pin(),
+                Some(inside),
+                NATIVE,
+                SCRIPT,
+                "no package pinned",
+            ),
+        ] {
+            assert_eq!(attempt(pin, at, holds, script), refused, "{why}");
         }
     }
 
@@ -1579,6 +1860,7 @@ mod tests {
             path: "/sbin/init".into(),
             exe: init.exe.unwrap_or(NATIVE),
             hosted: None,
+            package: None,
         };
         assert_eq!(
             validate(

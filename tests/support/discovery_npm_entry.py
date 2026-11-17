@@ -7,6 +7,12 @@ the native Codex binary as its child, passing its own arguments through.
 Python stands in for node, which the test hosts are not guaranteed to have.
 The native binary is not on the PATH the pane is spawned with: only this
 script is. No daemon protocol injection.
+
+The `in-place` variants stand in for `codex.js` from 0.169.0 under Node 23.11
+or later (issue #2337), which replaces itself with the native through
+`process.execve` instead of spawning it: `in-place` with the native inside
+this package (`vendor/`), as npm nests Codex's platform package, and
+`in-place-outside` with the native beside the package, npm's hoisted shape.
 """
 import json
 import os
@@ -17,9 +23,10 @@ import time
 
 package = Path(__file__).resolve().parent.parent
 kind = os.environ['DAD_LIVE_SEGMENTS_KIND']
-# Beside the package, as npm's platform package is: never resolved by name.
-native = package.parent / kind
 variant = os.environ['DAD_HOSTED_VARIANT']
+# Beside the package, as npm's hoisted platform package is, or inside it:
+# never resolved by name.
+native = package / 'vendor' / kind if variant == 'in-place' else package.parent / kind
 args = sys.argv[1:]
 genuine = package / 'lib' / 'entry.py'
 other_script = package / 'other' / 'entry.py'
@@ -71,5 +78,8 @@ if not probe:
 env = dict(os.environ)
 env['CODEX_MANAGED_BY_NPM'] = '1'
 env['CODEX_MANAGED_PACKAGE_ROOT'] = str(package)
+if variant in ('in-place', 'in-place-outside'):
+    # `process.execve(binaryPath, [binaryPath, ...process.argv.slice(2)], env)`
+    os.execve(str(native), [str(native), *args], env)
 child = subprocess.Popen([str(native), *args], env=env)
 sys.exit(child.wait())
