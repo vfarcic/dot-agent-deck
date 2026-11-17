@@ -921,6 +921,7 @@ async fn probe_010_an_answer_holding_a_candidate_is_refused_while_a_liability_is
         question_id: "q".into(),
         revision: None,
         reservation: None,
+        screen: None,
         pause: None,
     };
     rig.liability();
@@ -965,6 +966,7 @@ fn answer_gate() -> AnswerGate {
         question_id: "q".into(),
         revision: None,
         reservation: None,
+        screen: None,
         pause: None,
     }
 }

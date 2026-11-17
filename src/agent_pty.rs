@@ -2146,15 +2146,59 @@ struct AgentBusState {
     /// PRD #211: the OSC 7501 status reader, and the agent it reads for: on
     /// from the spawn for a generation spawned as an agent whose registry
     /// entry switches it on
-    /// ([`crate::agent_registry::AgentSpec::status_osc7501`]), or from the
-    /// first of that agent's own hooks attested to the generation, for one
-    /// started from a shell in the pane ([`AgentBus::read_status_osc_for`]).
-    /// `None` for every other, which then scans nothing.
+    /// ([`crate::agent_registry::AgentSpec::status_osc7501`]), or, for one
+    /// started from a shell in the pane, while a session of that agent its
+    /// own hooks attested to the generation is the one active there
+    /// ([`AgentBus::shell_agent_hook`]). `None` for every other, which then
+    /// scans nothing.
     status_osc: Option<(AgentType, crate::status_osc::Osc7501Scanner)>,
     /// PRD #211: the status sequences read and not yet handed over, in byte
     /// order. Only the reader thread pushes, and it takes them after each
     /// push, so they leave in the order the agent wrote them.
     status_signals: Vec<crate::status_osc::OscSignal>,
+    /// PRD #211 (second review, finding 4): moves each time the reader is
+    /// turned on or off. A signal read under one value is not applied once
+    /// the reader has moved past it ([`AgentPtyRegistry::status_reader_epoch`]).
+    status_epoch: u64,
+    /// PRD #211 (second review, findings 3 and 4): in a generation spawned as
+    /// no agent — a shell — the session of an OSC 7501 agent whose own hooks
+    /// named it, and what its own header said. `None` while none is.
+    shell_session: Option<ShellAgentSession>,
+    /// How many bytes the generation has written, and that count at the last
+    /// hook of an agent's own the shell's generation was named in: a new
+    /// session's header is read from the bytes after it.
+    output_total: u64,
+    shell_mark: u64,
+    /// The terminal's size, for the scan of a new session's header.
+    size: (u16, u16),
+}
+
+/// PRD #211 (second review, findings 3 and 4): an OSC 7501 agent's session
+/// running in a shell's generation, as its own attested hooks named it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShellAgentSession {
+    agent: AgentType,
+    session_id: String,
+    /// The release this session's own header showed, read from the output
+    /// written since the previous hook of an agent's own in the shell; `None`
+    /// when none was read there.
+    release: Option<semver::Version>,
+}
+
+/// PRD #211 (second review, findings 3 and 4): what an agent's own hook did
+/// to the OSC 7501 reader of a shell's generation
+/// ([`AgentPtyRegistry::note_own_agent_hook`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShellReaderChange {
+    /// A new session of an agent that reports through OSC 7501: its reader is
+    /// on, fresh, with the release its own header showed.
+    Started {
+        agent: AgentType,
+        release: Option<semver::Version>,
+    },
+    /// The session read ended, or another agent's session became active: the
+    /// reader is off and what it had read is dropped.
+    Ended,
 }
 
 impl AgentBusState {
@@ -2228,6 +2272,11 @@ impl AgentBus {
                 output_hook,
                 status_osc: None,
                 status_signals: Vec::new(),
+                status_epoch: 0,
+                shell_session: None,
+                output_total: 0,
+                shell_mark: 0,
+                size: (rows, cols),
             }),
             label: String::new(),
             #[cfg(test)]
@@ -2263,33 +2312,128 @@ impl AgentBus {
         bus
     }
 
-    /// PRD #211 (review): read `agent`'s OSC 7501 status from here on, for a
-    /// generation that agent's own hooks named. Nothing for an agent that
-    /// reports none, or while the reader is already on. Whether it turned on.
-    fn read_status_osc_for(&self, agent: &AgentType) -> bool {
-        let Some(osc) = crate::agent_registry::spec(agent).status_osc7501 else {
-            return false;
-        };
+    /// PRD #211 (second review, findings 3 and 4): a hook of `agent`'s own,
+    /// for its session `session_id`, attested to this generation — spawned as
+    /// no agent, a shell — named its pane (`ends`: the hook ends that
+    /// session). The OSC 7501 reader follows the agent session active in the
+    /// shell:
+    ///
+    /// - a new session of an agent that reports through OSC 7501 turns a
+    ///   fresh reader on for it, drops whatever the previous one read, and
+    ///   reads that session's release off its own header, in the bytes written
+    ///   since the previous hook of an agent's own here;
+    /// - its end, or any other agent's hook, turns the reader off and drops
+    ///   what it read.
+    ///
+    /// The reader is never turned on by the pane's output itself.
+    fn shell_agent_hook(
+        &self,
+        agent: &AgentType,
+        session_id: &str,
+        ends: bool,
+    ) -> Option<ShellReaderChange> {
+        let osc = crate::agent_registry::spec(agent).status_osc7501;
         let mut state = self.state.lock().unwrap();
-        if state.status_osc.is_some() {
-            return false;
+        let state = &mut *state;
+        let same = state
+            .shell_session
+            .as_ref()
+            .map(|session| session.agent == *agent && session.session_id == session_id);
+        let change = match (osc, same) {
+            (Some(_), Some(true)) if !ends => None,
+            (Some(osc), _) if !ends => {
+                let release = Self::header_since_mark(state, agent);
+                state.status_osc = Some((
+                    agent.clone(),
+                    crate::status_osc::Osc7501Scanner::new(osc.app),
+                ));
+                state.status_signals.clear();
+                state.status_epoch += 1;
+                state.shell_session = Some(ShellAgentSession {
+                    agent: agent.clone(),
+                    session_id: session_id.to_string(),
+                    release: release.clone(),
+                });
+                Some(ShellReaderChange::Started {
+                    agent: agent.clone(),
+                    release,
+                })
+            }
+            (Some(_), Some(false) | None) => None,
+            (_, Some(_)) => {
+                state.status_osc = None;
+                state.status_signals.clear();
+                state.status_epoch += 1;
+                state.shell_session = None;
+                Some(ShellReaderChange::Ended)
+            }
+            (None, None) => None,
+        };
+        state.shell_mark = state.output_total;
+        change
+    }
+
+    /// The release of `agent` a header in the bytes written since the shell's
+    /// last hook of an agent's own shows, read by a fresh, bounded scanner;
+    /// `None` when the ring no longer holds where they start, or they show no
+    /// such header, or two.
+    fn header_since_mark(state: &AgentBusState, agent: &AgentType) -> Option<semver::Version> {
+        let fresh = state.output_total.saturating_sub(state.shell_mark);
+        let held = state.scrollback.len() as u64;
+        if fresh == 0 || fresh > held {
+            return None;
         }
-        state.status_osc = Some((
-            agent.clone(),
-            crate::status_osc::Osc7501Scanner::new(osc.app),
-        ));
-        true
+        let start = (held - fresh) as usize;
+        let take = (fresh.min(crate::release_scanner::RELEASE_WINDOW_BYTES)) as usize;
+        let bytes: Vec<u8> = state
+            .scrollback
+            .range(start..start + take)
+            .copied()
+            .collect();
+        let (rows, cols) = state.size;
+        let mut scanner = crate::release_scanner::ReleaseScanner::new(
+            rows,
+            cols,
+            crate::release_scanner::HEADER_RECOGNISERS,
+        )
+        .ok()?;
+        scanner.feed(&bytes);
+        match scanner.latch() {
+            crate::release_scanner::ScanLatch::Latched {
+                agent: seen,
+                release,
+                ..
+            } if seen == agent && scanner.over_budget().is_none() => Some(release.clone()),
+            _ => None,
+        }
+    }
+
+    /// PRD #211 (second review, finding 3): the release of `agent` the
+    /// session read in this shell's generation drew in its own header.
+    fn shell_release_for(&self, agent: &AgentType) -> crate::doorbell_activation::LatchedRelease {
+        let state = self.state.lock().unwrap();
+        match &state.shell_session {
+            Some(ShellAgentSession {
+                agent: running,
+                release: Some(release),
+                ..
+            }) if running == agent => {
+                crate::doorbell_activation::LatchedRelease::Known(release.clone())
+            }
+            _ => crate::doorbell_activation::LatchedRelease::Unseen,
+        }
     }
 
     /// PRD #211: the OSC 7501 status sequences read since the last call, in
     /// the order the agent wrote them, with the agent the reader reads for.
-    fn take_status_signals(&self) -> Option<(AgentType, Vec<crate::status_osc::OscSignal>)> {
+    fn take_status_signals(&self) -> Option<(AgentType, Vec<crate::status_osc::OscSignal>, u64)> {
         let mut state = self.state.lock().unwrap();
         let signals = std::mem::take(&mut state.status_signals);
+        let epoch = state.status_epoch;
         state
             .status_osc
             .as_ref()
-            .map(|(agent, _)| (agent.clone(), signals))
+            .map(|(agent, _)| (agent.clone(), signals, epoch))
     }
 
     /// PRD #1666 part 3 (Q35-14b): the generation's release for `agent`, as
@@ -2394,6 +2538,7 @@ impl AgentBus {
             }
             None => false,
         };
+        state.output_total += arc.len() as u64;
         for &b in arc.iter() {
             state.scrollback.push_back(b);
         }
@@ -2609,6 +2754,7 @@ impl AgentBus {
             .evidence
             .edge(crate::evidence_state::EdgeReason::Resize, rows, cols);
         let release = state.release.resize(rows, cols);
+        state.size = (rows, cols);
         let epoch = state.evidence.layout_epoch();
         drop(state);
         if let Some(event) = release {
@@ -2658,6 +2804,9 @@ impl AgentBus {
             Ok(()) => state.release.resize(rows, cols),
             Err(_) => None,
         };
+        if result.is_ok() {
+            state.size = (rows, cols);
+        }
         let epoch = state.evidence.layout_epoch();
         drop(state);
         if let Some(event) = release {
@@ -3258,7 +3407,7 @@ fn pump_reader(
         // the order they were written.
         if cost.status_signals {
             let seen_at = Instant::now();
-            if let (Some(registry), Some(pane), Some((agent, signals))) = (
+            if let (Some(registry), Some(pane), Some((agent, signals, epoch))) = (
                 registry.upgrade(),
                 pane_id_env.as_deref(),
                 bus.take_status_signals(),
@@ -3269,6 +3418,7 @@ fn pump_reader(
                     agent_type: agent,
                     signals,
                     seen_at,
+                    epoch,
                 });
             }
         }
@@ -5763,6 +5913,16 @@ impl PaneWriter {
             // An answer is never a reply to a query: it passes no fence.
             |_, _| false,
             |frame| {
+                // PRD #211 (audit B3): a key authorised by the screen it was
+                // checked against is not held for later, when that screen
+                // may be gone.
+                if frame
+                    .answer
+                    .as_ref()
+                    .is_some_and(|answer| answer.gate.screen.is_some())
+                {
+                    return false;
+                }
                 // As a person's held frame: in flight and its epoch moved
                 // from acceptance. Q16-1: whether the planner cuts it is
                 // decided again here, in the same hold of the epoch's lock
@@ -5805,6 +5965,18 @@ impl PaneWriter {
                 }
                 queued();
                 return Ok(AnswerWrite::Full);
+            }
+            Admission::Refused(frame)
+                if frame
+                    .answer
+                    .as_ref()
+                    .is_some_and(|answer| answer.gate.screen.is_some()) =>
+            {
+                if let Some(ticket) = frame.ticket {
+                    ticket.refuse(ANSWER_SCREEN_NOT_HELD);
+                }
+                queued();
+                return Ok(AnswerWrite::NotDeferred);
             }
             Admission::Refused(frame) => {
                 // Q16-1: a liability went out after the read above.
@@ -7868,10 +8040,35 @@ pub(crate) struct AnswerGate {
     /// it and written the keys or not, or when they are dropped unwritten.
     /// So it outlives a handler that stopped waiting for them.
     reservation: Option<AnswerReservation>,
+    /// PRD #211 (audit B3): for a key whose authority is that the agent's
+    /// screen showed the menu it answers, the frame that check read. The key
+    /// is written only while no output has changed that frame since; it is
+    /// never held behind a fence ([`PaneWriter::write_answer`]).
+    screen: Option<ScreenWitness>,
     /// Test seam: the PTY thread stops here before its check — see
     /// [`QuestionAnswers::arm_barrier`] and [`ANSWER_KEY_ON_PTY_THREAD`].
     #[cfg(test)]
     pause: Option<QuestionBarrier>,
+}
+
+/// PRD #211 (audit B3): the agent's screen as one answer's check read it — a
+/// Clean frame of the generation's evidence state, marked where it stood in
+/// the output and the layout ([`crate::evidence_state::FrameMark`]).
+/// PRD #211 (audit B3): whether a screen's rows show what an answer's key
+/// answers ([`AgentPtyRegistry::write_answer_keys`]).
+pub(crate) type ScreenPredicate<'a> = dyn Fn(&[String]) -> bool + Send + Sync + 'a;
+
+pub(crate) struct ScreenWitness {
+    bus: Arc<AgentBus>,
+    mark: crate::evidence_state::FrameMark,
+}
+
+impl ScreenWitness {
+    /// Whether the frame the check read is still the screen: Clean, the same
+    /// layout, no output taken since.
+    fn holds(&self) -> bool {
+        self.bus.frame_unchanged(self.mark)
+    }
 }
 
 impl AnswerGate {
@@ -7888,11 +8085,15 @@ impl AnswerGate {
             .unwrap()
             .get(&self.pane_id)
             .is_some_and(|seen| seen.id == self.question_id && seen.revision == self.revision)
+            && self.screen.as_ref().is_none_or(ScreenWitness::holds)
     }
 }
 
 /// How [`PaneWriter::write_answer`] ended when the PTY thread did not fail.
 pub(crate) enum AnswerWrite {
+    /// PRD #211 (audit B3): a fence held the pane's input, and a key whose
+    /// authority is the screen it was checked against is not held.
+    NotDeferred,
     /// The keys are written; the human-input sequence number they were
     /// committed at.
     Written(u64),
@@ -8010,6 +8211,12 @@ impl KeyNotWritten {
 /// PRD #1666 part 3 (Q35-16, core §4.3): why a voice answer whose keys hold a
 /// Ctrl+G candidate is refused while a check is open or a liability is out.
 pub(crate) const ANSWER_HOLDS_CTRL_G: &str = "the answer contains a key the deck can't hold safely";
+
+/// PRD #211 (audit B3): an answer checked against the agent's screen that the
+/// deck could not type while that screen stood: the screen changed, or the
+/// pane's input was held.
+pub(crate) const ANSWER_SCREEN_NOT_HELD: &str =
+    "the agent's screen changed after the deck checked the menu, so the answer was not typed";
 
 /// The error a PTY thread reports for an answer whose [`AnswerGate`] no longer
 /// held — told apart from a failed write by its type.
@@ -8268,6 +8475,7 @@ impl QuestionAnswers {
             question_id: question_id.to_string(),
             revision,
             reservation: None,
+            screen: None,
             #[cfg(test)]
             pause: self
                 .barriers
@@ -10732,6 +10940,9 @@ pub struct StatusSignals {
     pub signals: Vec<crate::status_osc::OscSignal>,
     /// When the reader read them.
     pub seen_at: Instant,
+    /// The reader's epoch when it read them
+    /// ([`AgentPtyRegistry::status_reader_epoch`]).
+    pub epoch: u64,
 }
 
 /// PRD #211: the daemon's sink for [`StatusSignals`], installed via
@@ -10981,6 +11192,7 @@ impl AgentPtyRegistry {
         question_id: &str,
         revision: Option<u64>,
         keys: &[u8],
+        screen: Option<&ScreenPredicate<'_>>,
         revalidate: impl FnOnce() -> Fut,
         held: impl FnOnce() -> HeldFut,
     ) -> Result<KeyWritten, KeyNotWritten>
@@ -11019,12 +11231,29 @@ impl AgentPtyRegistry {
                 SettlementOutcome::Superseded,
             );
         }
+        // PRD #211 (audit B3): the screen this key's authority rests on, read
+        // here under the writer and the lifecycle, and carried to the PTY
+        // thread's last check before the write.
+        let witness = match screen {
+            Some(shows) => match self.screen_witness(agent_id) {
+                Some((rows, witness)) if shows(&rows) => Some(witness),
+                _ => {
+                    return refuse(
+                        ticket,
+                        ANSWER_SCREEN_NOT_HELD,
+                        SettlementOutcome::Superseded,
+                    );
+                }
+            },
+            None => None,
+        };
         self.question_answers
             .barrier("answer_keys:revalidated")
             .await;
         let mut gate = self
             .question_answers
             .answer_gate(pane_id, question_id, revision);
+        gate.screen = witness;
         gate.reservation =
             Some(
                 self.question_answers
@@ -11044,6 +11273,7 @@ impl AgentPtyRegistry {
                 ));
             }
             Ok(AnswerWrite::Refused) => return Err(failed(ANSWER_HOLDS_CTRL_G)),
+            Ok(AnswerWrite::NotDeferred) => return Err(failed(ANSWER_SCREEN_NOT_HELD)),
             Ok(AnswerWrite::Full) => return Err(failed(ANSWER_INPUT_FULL)),
             Ok(AnswerWrite::Exited) => {
                 return Err(KeyNotWritten::now(
@@ -13401,38 +13631,45 @@ impl AgentPtyRegistry {
             .is_some_and(|latest| latest > at)
     }
 
-    /// PRD #211 (review): an event of `agent`'s own hooks, attested to
-    /// generation `agent_id`, named pane `pane_id`: read `agent`'s OSC 7501
-    /// status from that generation's output from here on, as for one spawned
-    /// as it. That covers an agent started from a shell in the pane. Only
-    /// while the generation still speaks for the pane, and only for one
-    /// spawned as no agent or as this one; the reader never turns on from
-    /// the pane's output itself. Whether it turned on.
-    pub fn read_status_osc_from_own_hooks(
+    /// PRD #211 (second review, findings 3 and 4): an event of `agent`'s own
+    /// hooks, for its session `session_id`, attested to generation
+    /// `agent_id`, named pane `pane_id` (`ends`: it ends that session). In a
+    /// generation spawned as no agent — a shell — the OSC 7501 reader follows
+    /// the agent session active there ([`AgentBus::shell_agent_hook`]): on,
+    /// fresh, for a new session of an agent that reports that way, with the
+    /// release its own header showed; off, with what it read dropped, at that
+    /// session's end or at any other agent's hook. Only while the generation
+    /// still speaks for the pane. A generation spawned as an agent keeps the
+    /// reader its spawn gave it. What changed, if anything.
+    pub fn note_own_agent_hook(
         &self,
         pane_id: &str,
         agent_id: &str,
         agent: &AgentType,
-    ) -> bool {
-        crate::agent_registry::spec(agent).status_osc7501.is_some() && {
-            let bus = {
-                let inner = self.inner.lock();
-                let Some(record) = inner.agents.get(agent_id) else {
-                    return false;
-                };
-                if record.pane_id_env.as_deref() != Some(pane_id)
-                    || !Self::generation_speaks_for_pane(&inner, agent_id, record, pane_id)
-                    || record
-                        .spawn_agent_type
-                        .as_ref()
-                        .is_some_and(|spawned| spawned != agent)
-                {
-                    return false;
-                }
-                Arc::clone(&record.bus)
-            };
-            bus.read_status_osc_for(agent)
-        }
+        session_id: &str,
+        ends: bool,
+    ) -> Option<ShellReaderChange> {
+        let bus = {
+            let inner = self.inner.lock();
+            let record = inner.agents.get(agent_id)?;
+            if record.pane_id_env.as_deref() != Some(pane_id)
+                || !Self::generation_speaks_for_pane(&inner, agent_id, record, pane_id)
+                || record.spawn_agent_type.is_some()
+            {
+                return None;
+            }
+            Arc::clone(&record.bus)
+        };
+        bus.shell_agent_hook(agent, session_id, ends)
+    }
+
+    /// PRD #211 (second review, finding 4): generation `agent_id`'s OSC 7501
+    /// reader epoch, which moves each time its reader is turned on or off;
+    /// `None` when the registry holds no such generation.
+    pub fn status_reader_epoch(&self, agent_id: &str) -> Option<u64> {
+        let bus = self.generation_bus(agent_id)?;
+        let epoch = bus.state.lock().unwrap().status_epoch;
+        Some(epoch)
     }
 
     /// PRD #211 (audit suggestion): the release of `agent` that generation
@@ -13443,10 +13680,17 @@ impl AgentPtyRegistry {
         agent_id: &str,
         agent: &AgentType,
     ) -> Option<crate::doorbell_activation::LatchedRelease> {
-        let bus = {
+        let (bus, shell) = {
             let inner = self.inner.lock();
-            Arc::clone(&inner.agents.get(agent_id)?.bus)
+            let record = inner.agents.get(agent_id)?;
+            (Arc::clone(&record.bus), record.spawn_agent_type.is_none())
         };
+        // PRD #211 (second review, finding 3): in a shell, the release is the
+        // one the agent session running there now drew, never the
+        // generation's first header.
+        if shell {
+            return Some(bus.shell_release_for(agent));
+        }
         let release = bus.state.lock().unwrap().release.latched_for(agent);
         Some(release)
     }
@@ -13462,6 +13706,18 @@ impl AgentPtyRegistry {
         };
         let grid = bus.clean_frame()?;
         Some((0..grid.rows).map(|row| grid.text_from(row, 0)).collect())
+    }
+
+    /// PRD #211 (audit B3): [`Self::screen_rows`], with the witness of the
+    /// frame they were read from.
+    pub(crate) fn screen_witness(&self, agent_id: &str) -> Option<(Vec<String>, ScreenWitness)> {
+        let bus = {
+            let inner = self.inner.lock();
+            Arc::clone(&inner.agents.get(agent_id)?.bus)
+        };
+        let (grid, mark) = bus.clean_frame_marked()?;
+        let rows = (0..grid.rows).map(|row| grid.text_from(row, 0)).collect();
+        Some((rows, ScreenWitness { bus, mark }))
     }
 
     /// `agent_id`'s release capture ([`AgentBus::release`]).
@@ -14804,10 +15060,11 @@ impl AgentPtyRegistry {
         // to on every pane the deck starts, whatever the pane's command, so
         // one started from a shell there reports it too. The daemon reads it
         // from a generation spawned as that agent ([`AgentBus::spawned_as`]),
-        // or once that agent's own hooks name the generation
-        // ([`Self::read_status_osc_from_own_hooks`]). The variable is the
-        // agent's own opt-in: no other program reads it, and the sequences an
-        // unread pane carries are an OSC every terminal ignores.
+        // or, in a shell, while that agent's own hooks name a session of it
+        // there ([`Self::note_own_agent_hook`]). The variable is Antigravity's
+        // own opt-in (`AGY_CLI_OSC7501`), and the sequences a pane carries
+        // that the deck does not read are an OSC that vt100 and the deck's
+        // clients ignore.
         for osc in crate::agent_registry::ALL
             .iter()
             .filter_map(|spec| spec.status_osc7501)
@@ -36513,5 +36770,135 @@ mod spawn_tests {
         );
 
         registry.shutdown_all();
+    }
+}
+
+/// PRD #211 (second review, findings 3 and 4): an OSC 7501 agent started from
+/// a shell — its reader and its release follow the agent session its own
+/// hooks name.
+#[cfg(test)]
+mod shell_agent_session_tests {
+    use super::*;
+
+    /// `agy`'s start-up header for `release`, drawn from the top-left cell as
+    /// measured on 1.5.9.
+    fn header(release: &str) -> Vec<u8> {
+        format!(
+            "\x1b[H\x1b[J\n\x1b[6C\u{2584}\u{2580}\u{2580}\u{2584}\x1b[m        \x1b[94;1mAntigravity CLI {release}\x1b[m\n\x1b[34D\u{2580}\r\n"
+        )
+        .into_bytes()
+    }
+
+    const PERMISSION: &[u8] = b"\x1b]7501;state=blocked:kind=permission:app=antigravity:msg=QXBwcm92ZSBCYXNoOiBybSAtZiBwcm9iZS50eHQ=\x07";
+
+    fn release(bus: &AgentBus) -> Option<String> {
+        match bus.shell_release_for(&AgentType::Antigravity) {
+            crate::doorbell_activation::LatchedRelease::Known(v) => Some(v.to_string()),
+            _ => None,
+        }
+    }
+
+    fn reads_osc(bus: &AgentBus) -> bool {
+        bus.push(PERMISSION.to_vec());
+        bus.take_status_signals()
+            .is_some_and(|(_, signals, _)| !signals.is_empty())
+    }
+
+    /// Scenario: in one shell, `agy` 1.5.9 runs a session, exits, and
+    /// another `agy` that draws 1.6.0 starts a new session; then a third
+    /// whose header is not read. Each session's release is its own header's,
+    /// and the third's is unknown rather than the first's.
+    #[test]
+    fn each_shell_agy_session_has_its_own_release() {
+        let bus = AgentBus::new();
+        bus.push(b"$ agy\r\n".to_vec());
+        bus.push(header("1.5.9"));
+        assert!(matches!(
+            bus.shell_agent_hook(&AgentType::Antigravity, "conv-1", false),
+            Some(ShellReaderChange::Started { .. })
+        ));
+        assert_eq!(release(&bus).as_deref(), Some("1.5.9"));
+        // Later hooks of the same session change nothing.
+        assert_eq!(
+            bus.shell_agent_hook(&AgentType::Antigravity, "conv-1", false),
+            None
+        );
+        bus.push(b"bye\r\n$ agy\r\n".to_vec());
+        bus.push(header("1.6.0"));
+        bus.shell_agent_hook(&AgentType::Antigravity, "conv-2", false);
+        assert_eq!(
+            release(&bus).as_deref(),
+            Some("1.6.0"),
+            "the second agy's release is its own header's"
+        );
+        bus.push(b"bye\r\n$ agy\r\n  no header here\r\n".to_vec());
+        bus.shell_agent_hook(&AgentType::Antigravity, "conv-3", false);
+        assert_eq!(
+            release(&bus),
+            None,
+            "an agy whose header was not read inherits no earlier release"
+        );
+    }
+
+    /// Scenario: in one shell, another agent's hooks report first, then `agy`
+    /// starts and its session's hooks arrive. Its reader turns on and its
+    /// release is read from its own header.
+    #[test]
+    fn agy_after_another_agent_in_the_shell_is_read() {
+        let bus = AgentBus::new();
+        assert_eq!(
+            bus.shell_agent_hook(&AgentType::ClaudeCode, "claude-1", false),
+            None
+        );
+        assert!(!reads_osc(&bus), "no reader before agy's own hook");
+        bus.push(b"$ agy\r\n".to_vec());
+        bus.push(header("1.5.9"));
+        bus.shell_agent_hook(&AgentType::Antigravity, "conv-1", false);
+        assert_eq!(release(&bus).as_deref(), Some("1.5.9"));
+        assert!(reads_osc(&bus));
+    }
+
+    /// Scenario: in one shell, `agy` runs a session, then another agent's
+    /// hook reports, then the pane writes a permission OSC 7501 sequence.
+    /// The reader is off: the sequence is not read, the epoch moved, and no
+    /// release is held. The same holds after the session's own end.
+    #[test]
+    fn the_shell_reader_stops_at_another_agents_hook_and_at_the_end() {
+        let bus = AgentBus::new();
+        bus.push(header("1.5.9"));
+        bus.shell_agent_hook(&AgentType::Antigravity, "conv-1", false);
+        let on = bus.state.lock().unwrap().status_epoch;
+        // Read, not yet handed over, when the other agent's hook lands.
+        bus.push(PERMISSION.to_vec());
+        assert_eq!(
+            bus.shell_agent_hook(&AgentType::ClaudeCode, "claude-1", false),
+            Some(ShellReaderChange::Ended)
+        );
+        assert!(
+            bus.take_status_signals().is_none(),
+            "what it read is dropped"
+        );
+        assert!(!reads_osc(&bus), "a sequence after another agent's hook");
+        assert_ne!(bus.state.lock().unwrap().status_epoch, on);
+        assert_eq!(release(&bus), None);
+
+        bus.push(header("1.5.9"));
+        bus.shell_agent_hook(&AgentType::Antigravity, "conv-2", false);
+        assert!(reads_osc(&bus));
+        assert_eq!(
+            bus.shell_agent_hook(&AgentType::Antigravity, "conv-2", true),
+            Some(ShellReaderChange::Ended)
+        );
+        assert!(!reads_osc(&bus), "a sequence after the session's end");
+    }
+
+    /// Scenario: a shell pane whose output carries an OSC 7501 sequence
+    /// before any agent's hook named it: nothing is read.
+    #[test]
+    fn shell_output_before_any_hook_is_not_read() {
+        let bus = AgentBus::new();
+        bus.push(header("1.5.9"));
+        assert!(!reads_osc(&bus));
+        assert_eq!(release(&bus), None);
     }
 }

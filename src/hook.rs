@@ -299,7 +299,7 @@ fn handle_antigravity_hook() -> ExitCode {
         let reply = (!turn_goes_on)
             .then(|| antigravity_turn_reply(&input))
             .flatten();
-        let report = |announce: Option<String>| {
+        let report = |announce: Option<String>, ingested: bool| {
             // Issue #318: present this pane's hook capability token.
             let token = crate::hook_provenance::token_from_env();
             if let Ok(json) = crate::event::agent_event_line(&event, token.as_deref())
@@ -307,22 +307,26 @@ fn handle_antigravity_hook() -> ExitCode {
             {
                 let _ = match announce {
                     Some(announce) => send_lines_and_drain(&format!("{announce}\n{json}")),
+                    None if ingested => send_lines_and_drain(&json),
                     None => send_to_socket(&json),
                 };
             }
         };
-        // A `PreToolUse` is reported before `agy` has its answer, so the call
-        // reaches the daemon before the permission prompt `agy` raises for it
-        // once it does (its OSC 7501 signal is bound to that call).
+        // A `PreToolUse` is reported before `agy` has its answer, and the
+        // answer waits until the daemon has ingested it — it closes the
+        // connection once the line is handled, within `SIGNAL_ACK_TIMEOUT` —
+        // so the call is the daemon's before the permission prompt `agy`
+        // raises for it once it has its answer (second review, finding 2: its
+        // OSC 7501 signal is bound to that call).
         let report_first = event.event_type == crate::event::EventType::ToolStart;
         if report_first && !turn_goes_on {
-            report(announce.take());
+            report(announce.take(), true);
         }
         if !answered {
             print_antigravity_answer(&input);
         }
         if !report_first && !turn_goes_on {
-            report(announce);
+            report(announce, false);
         }
         return ExitCode::SUCCESS;
     }
@@ -345,20 +349,32 @@ const ANTIGRAVITY_TRANSCRIPT_TAIL_BYTES: u64 = 256 * 1024;
 /// turn's last step when `Stop` runs, measured on `agy` 1.5.9: one JSON object
 /// per line, the reply being a `"source":"MODEL"`, `"type":"PLANNER_RESPONSE"`
 /// step whose `content` is its text. `None` when the transcript cannot say:
-/// unreadable, its last line not such a step (a tool call, a system message),
-/// or longer than [`ANTIGRAVITY_TRANSCRIPT_TAIL_BYTES`].
+/// not `agy`'s own transcript of this conversation
+/// ([`antigravity_transcript_of`]), unreadable, its last line not such a step
+/// (a tool call, a system message), or longer than
+/// [`ANTIGRAVITY_TRANSCRIPT_TAIL_BYTES`].
 fn antigravity_turn_reply(input: &str) -> Option<crate::daemon_protocol::FinalReply> {
+    let home = std::env::var_os("HOME")?;
+    antigravity_turn_reply_in(input, std::path::Path::new(&home))
+}
+
+/// [`antigravity_turn_reply`] for a user whose home is `home`.
+fn antigravity_turn_reply_in(
+    input: &str,
+    home: &std::path::Path,
+) -> Option<crate::daemon_protocol::FinalReply> {
     let payload: Value = serde_json::from_str(input).ok()?;
     if payload.get("hookEventName").and_then(Value::as_str) != Some("Stop")
         || payload.get("terminationReason").and_then(Value::as_str) != Some("NO_TOOL_CALL")
     {
         return None;
     }
-    let path = std::path::Path::new(payload.get("transcriptPath")?.as_str()?);
-    if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
-        return None;
-    }
-    let text = antigravity_transcript_reply(&last_line_of(path)?)?;
+    let file = antigravity_transcript_of(
+        home,
+        payload.get("conversationId")?.as_str()?,
+        payload.get("transcriptPath")?.as_str()?,
+    )?;
+    let text = antigravity_transcript_reply(&last_line_of(file)?)?;
     Some(crate::turn_reply::normalize(
         crate::daemon_protocol::FinalReply {
             turn_id: None,
@@ -368,12 +384,99 @@ fn antigravity_turn_reply(input: &str) -> Option<crate::daemon_protocol::FinalRe
     ))
 }
 
-/// The last non-empty line of the regular file at `path`, read from at most
-/// its last [`ANTIGRAVITY_TRANSCRIPT_TAIL_BYTES`]; `None` when that tail holds
-/// no whole line.
-fn last_line_of(path: &std::path::Path) -> Option<String> {
+/// PRD #211 (second review, finding 7; audit B2, S2): where `agy` keeps a
+/// conversation's full transcript, under the user's home, as measured on
+/// 1.5.9: `.gemini/antigravity-cli/brain/<conversationId>/` then these.
+const ANTIGRAVITY_TRANSCRIPT_LAYOUT: [&str; 4] = [".gemini", "antigravity-cli", "brain", ""];
+const ANTIGRAVITY_TRANSCRIPT_TAIL: [&str; 3] =
+    [".system_generated", "logs", "transcript_full.jsonl"];
+
+/// PRD #211 (second review, finding 7; audit B2, S2): the transcript `agy`
+/// keeps of conversation `conversation`, opened for reading, when `path` —
+/// the payload's `transcriptPath` — names exactly that file under `home`:
+/// `<home>/.gemini/antigravity-cli/brain/<conversation>/.system_generated/
+/// logs/transcript_full.jsonl`, written as an absolute path with no `.` or
+/// `..`. Every directory below `home` and the file itself are opened one by
+/// one relative to the one before, refusing a symbolic link at each step, and
+/// the file without blocking: it must be a regular file, so a named pipe
+/// there cannot hold the hook. `None` otherwise, and on any platform without
+/// those opens.
+#[cfg(unix)]
+fn antigravity_transcript_of(
+    home: &std::path::Path,
+    conversation: &str,
+    path: &str,
+) -> Option<std::fs::File> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    use std::os::unix::ffi::OsStrExt as _;
+    let well_formed = !conversation.is_empty()
+        && conversation.len() <= 128
+        && conversation
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if !well_formed || !home.is_absolute() {
+        return None;
+    }
+    let components: Vec<&str> = ANTIGRAVITY_TRANSCRIPT_LAYOUT
+        .iter()
+        .map(|part| if part.is_empty() { conversation } else { part })
+        .chain(ANTIGRAVITY_TRANSCRIPT_TAIL)
+        .collect();
+    let mut expected = home.to_path_buf();
+    expected.extend(&components);
+    if std::path::Path::new(path) != expected
+        || std::path::Path::new(path).components().any(|c| {
+            !matches!(
+                c,
+                std::path::Component::RootDir | std::path::Component::Normal(_)
+            )
+        })
+    {
+        return None;
+    }
+    let open_at = |dir: Option<&OwnedFd>, name: &std::ffi::OsStr, flags| -> Option<OwnedFd> {
+        let name = std::ffi::CString::new(name.as_bytes()).ok()?;
+        let at = dir.map_or(libc::AT_FDCWD, |dir| dir.as_raw_fd());
+        // SAFETY: `name` is a NUL-terminated string that outlives the call,
+        // and `at` is a descriptor this function owns or `AT_FDCWD`.
+        let fd = unsafe { libc::openat(at, name.as_ptr(), flags | libc::O_CLOEXEC) };
+        // SAFETY: a descriptor `openat` just returned, owned by nothing else.
+        (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) })
+    };
+    // The home directory itself may be reached through a link (`/home` on
+    // some systems is one); nothing below it may.
+    let mut dir = open_at(None, home.as_os_str(), libc::O_RDONLY | libc::O_DIRECTORY)?;
+    let (file_name, dirs) = components.split_last()?;
+    for part in dirs {
+        dir = open_at(
+            Some(&dir),
+            std::ffi::OsStr::new(part),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+        )?;
+    }
+    let file = open_at(
+        Some(&dir),
+        std::ffi::OsStr::new(file_name),
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+    )?;
+    let file = std::fs::File::from(file);
+    file.metadata().ok()?.is_file().then_some(file)
+}
+
+#[cfg(not(unix))]
+fn antigravity_transcript_of(
+    _home: &std::path::Path,
+    _conversation: &str,
+    _path: &str,
+) -> Option<std::fs::File> {
+    None
+}
+
+/// The last non-empty line of `file`, a regular file, read from at most its
+/// last [`ANTIGRAVITY_TRANSCRIPT_TAIL_BYTES`]; `None` when that tail holds no
+/// whole line.
+fn last_line_of(mut file: std::fs::File) -> Option<String> {
     use std::io::{Read as _, Seek as _};
-    let mut file = std::fs::File::open(path).ok()?;
     let metadata = file.metadata().ok()?;
     if !metadata.is_file() {
         return None;
@@ -4291,79 +4394,205 @@ mod tests {
     /// transcript that is not one, claim no reply.
     #[test]
     fn antigravity_turn_reply_is_the_transcripts_last_model_response() {
-        let dir = tempfile::tempdir().unwrap();
-        let stop = |transcript: &std::path::Path, base: &str| {
-            let mut payload: Value = serde_json::from_str(&agy(base)).unwrap();
-            payload["transcriptPath"] = Value::from(transcript.to_str().unwrap());
-            payload.to_string()
-        };
-        let copy = |fixture: &str| {
-            let path = dir.path().join(fixture);
-            std::fs::write(&path, agy(fixture)).unwrap();
-            path
-        };
-        let tools = copy("transcript-full-tool-turn.jsonl");
-        let reply = antigravity_turn_reply(&stop(&tools, "stop.json")).expect("a reply");
+        let home = tempfile::tempdir().unwrap();
+        let conversation = "00000000-0000-4000-8000-000000000001";
+        let logs = agy_transcript_dir(home.path(), conversation);
+        let transcript = logs.join("transcript_full.jsonl");
+        let stop = |base: &str| agy_stop_naming(base, conversation, &transcript);
+        let reply_of = |input: &str| antigravity_turn_reply_in(input, home.path());
+        let write = |body: &str| std::fs::write(&transcript, body).unwrap();
+        write(&agy("transcript-full-tool-turn.jsonl"));
+        let reply = reply_of(&stop("stop.json")).expect("a reply");
         assert_eq!(
             reply.text,
             "The command successfully printed `agy-probe-77`, DONE-77."
         );
         assert!(!reply.failed);
-        let continued = copy("transcript-full-after-continue.jsonl");
+        write(&agy("transcript-full-after-continue.jsonl"));
         assert_eq!(
-            antigravity_turn_reply(&stop(&continued, "stop.json"))
-                .unwrap()
-                .text,
+            reply_of(&stop("stop.json")).unwrap().text,
             "CONTINUED-REPLY-8812",
             "the reply is what the turn ended on, after its continue"
         );
         assert_eq!(
-            antigravity_turn_reply(&stop(&tools, "stop-error.json")),
+            reply_of(&stop("stop-error.json")),
             None,
             "an ERROR Stop is not a finished turn"
         );
-        assert_eq!(antigravity_turn_reply(&agy("pre-invocation.json")), None);
+        assert_eq!(reply_of(&agy("pre-invocation.json")), None);
 
         // The transcript ends on a tool call or a system message: no reply.
         let lines: Vec<&str> = agy("transcript-full-tool-turn.jsonl")
             .leak()
             .lines()
             .collect();
-        let cut = dir.path().join("cut.jsonl");
-        std::fs::write(&cut, lines[..2].join("\n")).unwrap();
-        assert_eq!(antigravity_turn_reply(&stop(&cut, "stop.json")), None);
+        write(&lines[..2].join("\n"));
+        assert_eq!(reply_of(&stop("stop.json")), None);
         let continued_lines: Vec<String> = agy("transcript-full-after-continue.jsonl")
             .lines()
             .map(str::to_owned)
             .collect();
-        std::fs::write(&cut, continued_lines[..5].join("\n")).unwrap();
-        assert_eq!(antigravity_turn_reply(&stop(&cut, "stop.json")), None);
-        // Not a transcript, or not there.
-        let other = dir.path().join("transcript.txt");
-        std::fs::copy(&tools, &other).unwrap();
-        assert_eq!(antigravity_turn_reply(&stop(&other, "stop.json")), None);
-        assert_eq!(
-            antigravity_turn_reply(&stop(&dir.path().join("gone.jsonl"), "stop.json")),
-            None
+        write(&continued_lines[..5].join("\n"));
+        assert_eq!(reply_of(&stop("stop.json")), None);
+        // A partial final line, and a final line that is not UTF-8.
+        write(&format!(
+            "{}\n{{\"source\":\"MODEL\",\"type\":\"PLANN",
+            lines[5]
+        ));
+        assert_eq!(reply_of(&stop("stop.json")), None);
+        let mut invalid = format!("{}\n", lines[5]).into_bytes();
+        invalid.extend_from_slice(
+            b"{\"source\":\"MODEL\",\"type\":\"PLANNER_RESPONSE\",\"content\":\"\xff\xfe\"}\n",
         );
+        std::fs::write(&transcript, &invalid).unwrap();
+        assert!(
+            reply_of(&stop("stop.json")).is_none_or(|reply| !reply.text.contains("DONE-77")),
+            "an invalid last line claims no earlier reply"
+        );
+        // Not there.
+        std::fs::remove_file(&transcript).unwrap();
+        assert_eq!(reply_of(&stop("stop.json")), None);
         // A long conversation is read from its end only, and a last line
         // longer than that tail claims nothing.
-        let long = dir.path().join("long.jsonl");
         let filler = format!("{}\n", "x".repeat(1024));
         let mut body = filler.repeat(1024);
         body.push_str(lines[5]);
         body.push('\n');
-        std::fs::write(&long, &body).unwrap();
+        write(&body);
         assert_eq!(
-            antigravity_turn_reply(&stop(&long, "stop.json"))
-                .unwrap()
-                .text,
+            reply_of(&stop("stop.json")).unwrap().text,
             "The command successfully printed `agy-probe-77`, DONE-77."
         );
         let huge = serde_json::json!({"source":"MODEL","type":"PLANNER_RESPONSE",
             "content":"y".repeat(ANTIGRAVITY_TRANSCRIPT_TAIL_BYTES as usize)});
-        std::fs::write(&long, format!("{filler}{huge}\n")).unwrap();
-        assert_eq!(antigravity_turn_reply(&stop(&long, "stop.json")), None);
+        write(&format!("{filler}{huge}\n"));
+        assert_eq!(reply_of(&stop("stop.json")), None);
+    }
+
+    /// `<home>/.gemini/antigravity-cli/brain/<conversation>/.system_generated/logs`,
+    /// created.
+    fn agy_transcript_dir(home: &std::path::Path, conversation: &str) -> std::path::PathBuf {
+        let logs = home
+            .join(".gemini/antigravity-cli/brain")
+            .join(conversation)
+            .join(".system_generated/logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        logs
+    }
+
+    /// The `base` fixture's payload naming `conversation` and `transcript`.
+    fn agy_stop_naming(base: &str, conversation: &str, transcript: &std::path::Path) -> String {
+        let mut payload: Value = serde_json::from_str(&agy(base)).unwrap();
+        payload["conversationId"] = Value::from(conversation);
+        payload["transcriptPath"] = Value::from(transcript.to_str().unwrap());
+        payload.to_string()
+    }
+
+    /// Scenario: a `Stop` names a transcript that is not `agy`'s own file for
+    /// the payload's conversation — a link to a file elsewhere, a relative
+    /// path, one climbing out with `..`, another conversation's transcript, a
+    /// file outside the home's layout, or a directory on the way that is a
+    /// link — each holding a model reply. None of them is read as the turn's
+    /// reply.
+    #[cfg(unix)]
+    #[test]
+    fn antigravity_turn_reply_reads_only_agys_own_transcript() {
+        let home = tempfile::tempdir().unwrap();
+        let conversation = "00000000-0000-4000-8000-000000000001";
+        let logs = agy_transcript_dir(home.path(), conversation);
+        let own = logs.join("transcript_full.jsonl");
+        let body = agy("transcript-full-tool-turn.jsonl");
+        let reply_of = |transcript: &std::path::Path, conversation: &str| {
+            antigravity_turn_reply_in(
+                &agy_stop_naming("stop.json", conversation, transcript),
+                home.path(),
+            )
+        };
+        // The control: agy's own file is read.
+        std::fs::write(&own, &body).unwrap();
+        assert!(reply_of(&own, conversation).is_some());
+
+        // A link at the transcript's own name, to a file outside the layout.
+        let outside = home.path().join("outside.txt");
+        std::fs::write(&outside, &body).unwrap();
+        std::fs::remove_file(&own).unwrap();
+        std::os::unix::fs::symlink(&outside, &own).unwrap();
+        assert_eq!(reply_of(&own, conversation), None, "a linked transcript");
+        std::fs::remove_file(&own).unwrap();
+        std::fs::write(&own, &body).unwrap();
+
+        // Relative, and climbing with `..` to the same file.
+        let relative = own.strip_prefix("/").unwrap();
+        assert_eq!(reply_of(relative, conversation), None, "a relative path");
+        let climbing = logs.join("../logs/transcript_full.jsonl");
+        assert_eq!(reply_of(&climbing, conversation), None, "a path with ..");
+
+        // Another conversation's transcript, named by this one's payload.
+        let other = "00000000-0000-4000-8000-000000000002";
+        let other_file = agy_transcript_dir(home.path(), other).join("transcript_full.jsonl");
+        std::fs::write(&other_file, &body).unwrap();
+        assert_eq!(
+            reply_of(&other_file, conversation),
+            None,
+            "another conversation's"
+        );
+        // A conversation id that is not one component.
+        assert_eq!(
+            reply_of(&own, "../brain"),
+            None,
+            "a traversing conversation id"
+        );
+        // A file elsewhere under the home.
+        let stray = home.path().join("transcript_full.jsonl");
+        std::fs::write(&stray, &body).unwrap();
+        assert_eq!(reply_of(&stray, conversation), None, "outside agy's layout");
+
+        // A directory on the way that is a link to one elsewhere.
+        let elsewhere = home.path().join("elsewhere");
+        std::fs::create_dir_all(elsewhere.join(".system_generated/logs")).unwrap();
+        std::fs::write(
+            elsewhere.join(".system_generated/logs/transcript_full.jsonl"),
+            &body,
+        )
+        .unwrap();
+        let linked = "00000000-0000-4000-8000-000000000003";
+        std::os::unix::fs::symlink(
+            &elsewhere,
+            home.path()
+                .join(".gemini/antigravity-cli/brain")
+                .join(linked),
+        )
+        .unwrap();
+        let through_link = home
+            .path()
+            .join(".gemini/antigravity-cli/brain")
+            .join(linked)
+            .join(".system_generated/logs/transcript_full.jsonl");
+        assert_eq!(reply_of(&through_link, linked), None, "a linked directory");
+    }
+
+    /// Scenario: `agy`'s transcript path holds a named pipe with no writer.
+    /// The `Stop` hook's reply read gives up at once instead of waiting for a
+    /// writer, so the hook goes on to answer `agy`.
+    #[cfg(unix)]
+    #[test]
+    fn antigravity_turn_reply_does_not_wait_on_a_fifo() {
+        let home = tempfile::tempdir().unwrap();
+        let conversation = "00000000-0000-4000-8000-000000000001";
+        let fifo = agy_transcript_dir(home.path(), conversation).join("transcript_full.jsonl");
+        let name = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: a NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let input = agy_stop_naming("stop.json", conversation, &fifo);
+        let home_path = home.path().to_path_buf();
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(antigravity_turn_reply_in(&input, &home_path));
+        });
+        let reply = finished
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the reply read waited on a pipe with no writer");
+        assert_eq!(reply, None);
     }
 
     /// PRD #211: `agy` honours a `Stop` continue at `executionNum` 0–9 and

@@ -9462,7 +9462,10 @@ pub(crate) async fn answer_question_tokened_at(
             // terminal signal, which anything writing to the pane can forge, so
             // its digits are typed only while the pane's screen shows the menu
             // they answer — checked here, and again under the writer lock just
-            // before the key goes in.
+            // before the key goes in. A grant's check there marks the frame it
+            // read, and the PTY thread writes the key only while no output has
+            // changed it since (audit B3). This is a consistency check of what
+            // the screen shows, not proof that `agy` drew it.
             let menu_shown = || {
                 agent_type != crate::event::AgentType::Antigravity
                     || registry.screen_rows(agent_id).is_some_and(|rows| {
@@ -9496,6 +9499,15 @@ pub(crate) async fn answer_question_tokened_at(
                         .await
                         .set_answer_queued(pane, &question.id, revision, true);
                 };
+                // PRD #211 (audit B3): a grant is typed only into the screen
+                // its check read; the frame's witness goes with the key to the
+                // PTY thread, and the key is not held for later. The deny is
+                // not: it grants nothing.
+                let grant_screen =
+                    |rows: &[String]| crate::question::antigravity_menu_shown(&question, rows);
+                let screen: Option<&crate::agent_pty::ScreenPredicate<'_>> =
+                    (agent_type == crate::event::AgentType::Antigravity && !denied)
+                        .then_some(&grant_screen);
                 match registry
                     .write_answer_keys(
                         agent_id,
@@ -9503,6 +9515,7 @@ pub(crate) async fn answer_question_tokened_at(
                         &question.id,
                         revision,
                         key.as_bytes(),
+                        screen,
                         still_ours,
                         queued,
                     )
@@ -17205,6 +17218,148 @@ mod question_answer_tests {
             !fx.screen_shows_within("p2311", ANSWER_KEY_GAP * 2).await,
             "the second key must not reach a question that changed"
         );
+    }
+
+    /// PRD #211 (audit B3): an Antigravity stand-in that draws `question`'s
+    /// menu as a Clean frame, then, once `go` exists, replaces its screen
+    /// with no hook and echoes what it is sent.
+    async fn antigravity_menu_fixture(
+        question: &PendingQuestion,
+        dir: &std::path::Path,
+    ) -> (Fixture, std::path::PathBuf) {
+        let go = dir.join("go");
+        let mut frame = String::from("\x1b[2J\x1b[H");
+        if let Some(detail) = question.tool.as_ref().and_then(|t| t.detail.as_deref()) {
+            frame.push_str(&format!("{detail}\r\n"));
+        }
+        for option in &question.questions[0].options {
+            frame.push_str(&format!("{}. {}\r\n", option.index, option.label));
+        }
+        frame.push_str(&format!("{}\r\n", "\u{2500}".repeat(80)));
+        let script = dir.join("agy-menu.sh");
+        std::fs::write(
+            &script,
+            "printf '%s' \"$AGY_FRAME\"\nwhile [ ! -e \"$AGY_GO\" ]; do sleep 0.02; done\nprintf '\\033[2J\\033[Hchanged\\r\\n'\nexec cat\n",
+        )
+        .unwrap();
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let command = format!("/bin/sh {}", script.display());
+        let agent_id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some(&command),
+                env: vec![
+                    (DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string()),
+                    ("AGY_FRAME".to_string(), frame),
+                    ("AGY_GO".to_string(), go.display().to_string()),
+                ],
+                agent_type: Some(AgentType::Antigravity),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the stand-in agent");
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        state.write().await.register_pane(PANE.to_string());
+        let (event_tx, _rx) = broadcast::channel(64);
+        let fx = Fixture {
+            registry,
+            state,
+            event_tx,
+            agent_id,
+        };
+        let mut start = fx.event(EventType::SessionStart);
+        start.agent_type = AgentType::Antigravity;
+        fx.state.write().await.apply_event(start);
+        let label = question.questions[0].options[0].label.clone();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !fx
+            .registry
+            .screen_rows(&fx.agent_id)
+            .is_some_and(|rows| rows.iter().any(|row| row.contains(&label)))
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the stand-in's menu never read as a Clean screen"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let mut ask = fx.event(EventType::PermissionRequest);
+        ask.agent_type = AgentType::Antigravity;
+        ask.set_question(question);
+        crate::daemon::ingest_event(&fx.state, &fx.event_tx, &fx.registry, ask).await;
+        (fx, go)
+    }
+
+    fn antigravity_command_question() -> PendingQuestion {
+        crate::question::antigravity_permission(
+            "q-agy-screen".into(),
+            "Approve Bash: rm -f probe.txt",
+            Some(&crate::question::AntigravityCall {
+                tool: "run_command",
+                use_id: Some("call-1"),
+                subject: "rm -f probe.txt",
+            }),
+            1,
+            Some((1, 5, 9)),
+        )
+        .expect("a bound question")
+    }
+
+    /// Scenario: an Antigravity permission menu is on the pane's screen and
+    /// the deck has checked it, under the writer and the question lifecycle,
+    /// before typing a grant. Before the key reaches the terminal the screen
+    /// changes with no hook; the grant is then refused and no answer byte
+    /// reaches the pane. With no change, the same grant is typed.
+    #[tokio::test]
+    async fn an_antigravity_grant_is_not_typed_into_a_screen_that_changed_after_its_check() {
+        for change in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let question = antigravity_command_question();
+            let grant = question.questions[0].options[0].index;
+            let (fx, go) = antigravity_menu_fixture(&question, dir.path()).await;
+            let (reached, resume) = fx
+                .registry
+                .question_answers()
+                .arm_barrier("answer_keys:revalidated");
+            let answering = fx.answer_task("q-agy-screen", vec![one(0, grant)], false);
+            reached.await.expect("the grant's screen was checked");
+            if change {
+                std::fs::write(&go, b"").unwrap();
+                assert!(
+                    fx.screen_shows_within("changed", Duration::from_secs(5))
+                        .await,
+                    "the stand-in replaced its screen"
+                );
+                // Let the reader take the redraw into the evidence state.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            resume.send(()).unwrap();
+            let outcome = answering.await.unwrap();
+            let typed = fx
+                .screen_shows_within(&format!("changed\r\n{grant}"), Duration::from_millis(500))
+                .await;
+            if change {
+                assert!(
+                    matches!(outcome, Err(AnswerRefusal::WriteFailed { .. })),
+                    "a grant into a changed screen: {outcome:?}"
+                );
+                assert!(!typed, "an answer byte reached the changed screen");
+                let bytes = fx.registry.snapshot(&fx.agent_id).unwrap();
+                assert!(
+                    !String::from_utf8_lossy(&bytes)
+                        .rsplit("changed")
+                        .next()
+                        .unwrap_or_default()
+                        .contains(&grant.to_string()),
+                    "no answer byte followed the change"
+                );
+            } else {
+                assert_eq!(
+                    outcome,
+                    Ok(()),
+                    "the grant into the screen it was checked against"
+                );
+            }
+        }
     }
 
     fn one(question_index: u32, option: u32) -> QuestionAnswer {

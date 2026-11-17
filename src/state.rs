@@ -854,6 +854,35 @@ struct AntigravityCallRecord {
     prompted: bool,
 }
 
+/// PRD #211 (audit B1): the longest Antigravity tool name or call id a call
+/// record keeps. `agy`'s are a few dozen bytes.
+const ANTIGRAVITY_CALL_FIELD_MAX_BYTES: usize = 256;
+
+/// PRD #211 (second review, finding 1): what an Antigravity event does to its
+/// pane's call record once it is admitted as the pane owner's
+/// ([`AppState::antigravity_call_change`]).
+#[derive(Debug)]
+struct AntigravityCallChange {
+    pane_id: String,
+    /// The generation that sent it: the event's own, or its token's.
+    agent_id: String,
+    kind: CallChangeKind,
+}
+
+#[derive(Debug)]
+enum CallChangeKind {
+    /// A `PreToolUse` started this call.
+    Start(AntigravityCallRecord),
+    /// A `PostToolUse` ended the call with this id (any, for `None`).
+    End(Option<String>),
+    /// A permission prompt bound to the call is up.
+    Prompted,
+    /// The agent is at work again.
+    Resumed,
+    /// The turn ended or was interrupted.
+    TurnOver,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ActiveTool {
     pub name: String,
@@ -8601,6 +8630,7 @@ impl AppState {
                 "waiting_superseded_sessions",
                 self.waiting_superseded_sessions.len(),
             ),
+            ("antigravity_calls", self.antigravity_calls.len()),
         ]
     }
 
@@ -11447,6 +11477,8 @@ impl AppState {
         self.pane_role_map.remove(pane_id);
         self.pane_cwd_map.remove(pane_id);
         self.orchestrator_pane_ids.remove(pane_id);
+        // PRD #211 (audit B1): a call record is its pane's generation's.
+        self.antigravity_calls.remove(pane_id);
         // Issue #447 (Qodo, #1347): the waiting watch's history is about THIS
         // pane's conversations, so a pane reusing the id must not inherit it.
         self.waiting_superseded_sessions.remove(pane_id);
@@ -11499,6 +11531,7 @@ impl AppState {
         }
         // PRD #1666 part 2 (G-fix7f): and the cards still waiting to be drawn.
         self.retire_held_placeholders(pane_id);
+        self.retire_antigravity_calls();
         n
     }
 
@@ -13468,12 +13501,18 @@ impl AppState {
         attested_agent: Option<&str>,
     ) -> AppliedEvent {
         self.applied_unproven = false;
-        self.track_antigravity_call(&mut event);
+        let call_change = self.antigravity_call_change(&mut event, attested_agent);
         let pane_id = event.pane_id.clone();
         let doorbell_view_before = pane_id.as_deref().map(|pane| self.doorbell_view(pane));
         self.applied_background = None;
         let surfaced_inbox = take_surfaced_inbox(&mut event);
         let applied = self.apply_event_unsettled(event, attested_agent);
+        if let Some(change) = call_change
+            && applied != AppliedEvent::Rejected
+            && !self.applied_unproven
+        {
+            self.apply_antigravity_call_change(change);
+        }
         if let (Some(pane_id), Some(before)) = (&pane_id, doorbell_view_before)
             && self.doorbell_view(pane_id) != before
         {
@@ -13500,6 +13539,7 @@ impl AppState {
         if self.applied_unproven {
             self.enforce_unproven_journal_budget();
         }
+        self.retire_antigravity_calls();
         applied
     }
 
@@ -13583,58 +13623,133 @@ impl AppState {
         true
     }
 
-    /// PRD #211 (audit, CWE-345): keep [`Self::antigravity_calls`] in step with
-    /// an Antigravity event, and — in the daemon — refuse a permission question
-    /// the daemon built from an OSC 7501 prompt unless, under this same lock,
-    /// it is still bound to the pane's outstanding call: the same generation,
-    /// call id and command or path. A `PostToolUse` that landed between the
-    /// daemon building the question and applying it leaves the prompt a plain
-    /// Needs Input, answered at the keyboard.
-    fn track_antigravity_call(&mut self, event: &mut AgentEvent) {
-        if event.agent_type != AgentType::Antigravity {
-            return;
+    /// PRD #211 (audit, CWE-345): what an Antigravity event will do to its
+    /// pane's call record ([`Self::antigravity_calls`]) if it is admitted, read
+    /// before admission — and, in the daemon, the refusal of a permission
+    /// question the daemon built from an OSC 7501 prompt unless, under this
+    /// same lock, it is still bound to the pane's outstanding call: the same
+    /// generation, call id and command or path. A `PostToolUse` that landed
+    /// between the daemon building the question and applying it leaves the
+    /// prompt a plain Needs Input, answered at the keyboard.
+    ///
+    /// Nothing is recorded here: the change is applied by
+    /// [`Self::apply_antigravity_call_change`] only once the event is admitted
+    /// as its pane's owner's (second review, finding 1; audit B1).
+    fn antigravity_call_change(
+        &self,
+        event: &mut AgentEvent,
+        attested_agent: Option<&str>,
+    ) -> Option<AntigravityCallChange> {
+        if event.agent_type != AgentType::Antigravity || self.agent_ownership.is_none() {
+            return None;
         }
-        let Some(pane_id) = event.pane_id.clone() else {
-            return;
-        };
+        let pane_id = event.pane_id.clone()?;
+        let agent_id = event
+            .agent_id
+            .clone()
+            .or_else(|| attested_agent.map(str::to_string))?;
         let signal = event.is_status_signal();
-        let use_id = || event.metadata.get("tool_use_id").cloned();
-        match event.event_type {
+        let use_id = event.metadata.get("tool_use_id").cloned();
+        let kind = match event.event_type {
             EventType::ToolStart if !signal && !event.is_from_subagent() => {
-                let record = AntigravityCallRecord {
-                    agent_id: event.agent_id.clone(),
-                    tool: event.tool_name.clone().unwrap_or_default(),
-                    use_id: use_id(),
-                    subject: event
-                        .metadata
-                        .get(crate::event::TOOL_SUBJECT_METADATA_KEY)
-                        .cloned(),
-                    prompted: false,
-                };
-                self.antigravity_calls.insert(pane_id, record);
+                let tool = event.tool_name.clone().unwrap_or_default();
+                let subject = event
+                    .metadata
+                    .get(crate::event::TOOL_SUBJECT_METADATA_KEY)
+                    .cloned();
+                // Bounded here, at the daemon's ingest, whatever the producer
+                // sent: an over-long field records a call nothing is answered
+                // on, which a later event of the generation still ends.
+                let bounded = tool.len() <= ANTIGRAVITY_CALL_FIELD_MAX_BYTES
+                    && use_id
+                        .as_ref()
+                        .is_none_or(|id| id.len() <= ANTIGRAVITY_CALL_FIELD_MAX_BYTES)
+                    && subject.as_ref().is_none_or(|subject| {
+                        subject.len() <= crate::event::TOOL_SUBJECT_MAX_BYTES
+                    });
+                CallChangeKind::Start(if bounded {
+                    AntigravityCallRecord {
+                        agent_id: Some(agent_id.clone()),
+                        tool,
+                        use_id,
+                        subject,
+                        prompted: false,
+                    }
+                } else {
+                    AntigravityCallRecord {
+                        agent_id: Some(agent_id.clone()),
+                        tool: String::new(),
+                        use_id: None,
+                        subject: None,
+                        prompted: false,
+                    }
+                })
             }
             EventType::ToolEnd if !signal && !event.is_from_subagent() => {
-                let ended = use_id();
+                CallChangeKind::End(use_id)
+            }
+            EventType::PermissionRequest if signal => {
+                let question = event.question()?;
+                if self.antigravity_question_bound(event, &question) {
+                    CallChangeKind::Prompted
+                } else {
+                    event.metadata.remove(crate::event::QUESTION_METADATA_KEY);
+                    return None;
+                }
+            }
+            // The agent at work again after its prompt: the prompt is over.
+            EventType::Thinking if signal => CallChangeKind::Resumed,
+            // A turn that ended or was interrupted ends its calls with it:
+            // `agy` reports a denied or cancelled call by no hook at all.
+            EventType::Idle
+            | EventType::Error
+            | EventType::SessionStart
+            | EventType::SessionEnd => CallChangeKind::TurnOver,
+            _ => return None,
+        };
+        Some(AntigravityCallChange {
+            pane_id,
+            agent_id,
+            kind,
+        })
+    }
+
+    /// PRD #211 (second review, finding 1; audit B1): apply `change`, read off
+    /// an event that was admitted as its pane's owner's — not refused, and not
+    /// an outside agent's — to the pane's call record. Every change names the
+    /// generation that made it, and touches only that generation's record; a
+    /// record of any other generation is stale once the pane's owner reports,
+    /// and goes.
+    fn apply_antigravity_call_change(&mut self, change: AntigravityCallChange) {
+        let AntigravityCallChange {
+            pane_id,
+            agent_id,
+            kind,
+        } = change;
+        if self
+            .antigravity_calls
+            .get(&pane_id)
+            .is_some_and(|record| record.agent_id.as_deref() != Some(agent_id.as_str()))
+        {
+            self.antigravity_calls.remove(&pane_id);
+        }
+        match kind {
+            CallChangeKind::Start(record) => {
+                self.antigravity_calls.insert(pane_id, record);
+            }
+            CallChangeKind::End(ended) => {
                 if self.antigravity_calls.get(&pane_id).is_some_and(|record| {
                     record.use_id.is_none() || ended.is_none() || record.use_id == ended
                 }) {
                     self.antigravity_calls.remove(&pane_id);
                 }
             }
-            EventType::PermissionRequest if signal => {
-                let Some(question) = event.question() else {
-                    return;
-                };
-                if self.antigravity_question_bound(event, &question) {
-                    if let Some(record) = self.antigravity_calls.get_mut(&pane_id) {
-                        record.prompted = true;
-                    }
-                } else if self.agent_ownership.is_some() {
-                    event.metadata.remove(crate::event::QUESTION_METADATA_KEY);
+            CallChangeKind::Prompted => {
+                if let Some(record) = self.antigravity_calls.get_mut(&pane_id) {
+                    record.prompted = true;
                 }
             }
-            // The agent at work again after its prompt: the prompt is over.
-            EventType::Thinking if signal => {
+            CallChangeKind::Resumed => {
                 if self
                     .antigravity_calls
                     .get(&pane_id)
@@ -13643,16 +13758,26 @@ impl AppState {
                     self.antigravity_calls.remove(&pane_id);
                 }
             }
-            // A turn that ended or was interrupted ends its calls with it:
-            // `agy` reports a denied or cancelled call by no hook at all.
-            EventType::Idle
-            | EventType::Error
-            | EventType::SessionStart
-            | EventType::SessionEnd => {
+            CallChangeKind::TurnOver => {
                 self.antigravity_calls.remove(&pane_id);
             }
-            _ => {}
         }
+    }
+
+    /// PRD #211 (second review, finding 1; audit B1): a call record outlives
+    /// neither its pane's card nor its generation's — a pane close, an end, a
+    /// retire or an eviction takes it with it.
+    fn retire_antigravity_calls(&mut self) {
+        if self.antigravity_calls.is_empty() {
+            return;
+        }
+        let sessions = &self.sessions;
+        self.antigravity_calls.retain(|pane_id, record| {
+            sessions.values().any(|session| {
+                session.pane_id.as_deref() == Some(pane_id.as_str())
+                    && session.agent_id == record.agent_id
+            })
+        });
     }
 
     /// The body of [`Self::apply_event_reporting`], before the unproven-session
@@ -26616,6 +26741,111 @@ mod tests {
         // cancelled call reports no PostToolUse.
         state.apply_event(agy_pre_tool_use("agy-1", "rm -f probe.txt"));
         state.apply_event(agy_signal(EventType::Idle, "agy-1"));
+        assert!(state.antigravity_call("agy-pane", "agy-1").is_none());
+    }
+
+    /// Scenario: the pane's current generation `agy-2` has a call outstanding
+    /// when the generation it replaced, `agy-1`, sends a late `PreToolUse`, a
+    /// `PostToolUse`, an `Idle` and a `SessionEnd`. Each is refused, and the
+    /// current generation's call is still the one a permission prompt binds
+    /// to. Its own `PostToolUse` then ends it, and a card's removal takes a
+    /// fresh one with it.
+    #[test]
+    fn antigravity_call_survives_a_displaced_generations_events() {
+        let mut state = AppState::default();
+        let _ownership = install_ownership(&mut state, StubOwnership::owning("agy-pane", "agy-2"));
+        state.register_pane("agy-pane".to_string());
+        state.apply_event(agy_event(EventType::SessionStart, "agy-2"));
+        state.apply_event(agy_pre_tool_use("agy-2", "rm -f probe.txt"));
+        let current = |state: &AppState| {
+            state
+                .antigravity_call("agy-pane", "agy-2")
+                .map(|call| call.subject.to_string())
+        };
+        assert_eq!(current(&state).as_deref(), Some("rm -f probe.txt"));
+
+        let mut late_start = agy_pre_tool_use("agy-1", "echo stale");
+        late_start.session_id = "agy-old".to_string();
+        let mut late_end = agy_pre_tool_use("agy-1", "rm -f probe.txt");
+        late_end.session_id = "agy-old".to_string();
+        late_end.event_type = EventType::ToolEnd;
+        late_end.metadata.remove("tool_use_id");
+        let mut late_idle = agy_event(EventType::Idle, "agy-1");
+        late_idle.session_id = "agy-old".to_string();
+        let mut late_end_session = agy_event(EventType::SessionEnd, "agy-1");
+        late_end_session.session_id = "agy-old".to_string();
+        for late in [late_start, late_end, late_idle, late_end_session] {
+            let kind = late.event_type.clone();
+            state.apply_event(late);
+            assert_eq!(
+                current(&state).as_deref(),
+                Some("rm -f probe.txt"),
+                "a displaced generation's {kind:?} moved the current call"
+            );
+            assert!(state.antigravity_call("agy-pane", "agy-1").is_none());
+        }
+
+        let mut post = agy_pre_tool_use("agy-2", "rm -f probe.txt");
+        post.event_type = EventType::ToolEnd;
+        state.apply_event(post);
+        assert!(current(&state).is_none());
+
+        state.apply_event(agy_pre_tool_use("agy-2", "rm -f probe.txt"));
+        assert!(current(&state).is_some());
+        state.remove_sessions_for_pane("agy-pane");
+        assert_eq!(
+            state.antigravity_calls.len(),
+            0,
+            "a call outlived its pane's card"
+        );
+    }
+
+    /// Scenario: many Antigravity `PreToolUse` events arrive from outside the
+    /// deck, each naming a pane of its own that no deck agent holds, with
+    /// over-long fields. None is admitted as a pane owner's, so no call record
+    /// is kept for any of them, and the outside cards stay within their budget.
+    #[test]
+    fn antigravity_calls_keep_nothing_for_outside_tool_starts() {
+        let mut state = AppState::default();
+        let _ownership = install_ownership(&mut state, StubOwnership::default());
+        for index in 0..MAX_UNPROVEN_SESSIONS * 3 {
+            let mut start = agy_pre_tool_use(&format!("outside-{index}"), &"x".repeat(8192));
+            start.pane_id = Some(format!("outside-pane-{index}"));
+            start.session_id = format!("outside-session-{index}");
+            start.event_type = EventType::SessionStart;
+            state.apply_event(start.clone());
+            start.event_type = EventType::ToolStart;
+            state.apply_event(start);
+        }
+        assert_eq!(state.antigravity_calls.len(), 0);
+        assert!(state.unproven_session_count() <= MAX_UNPROVEN_SESSIONS);
+    }
+
+    /// Scenario: the pane's own generation reports a `PreToolUse` whose call
+    /// id and command are longer than the daemon keeps. A call is recorded,
+    /// bounded, and no permission prompt can bind to it.
+    #[test]
+    fn antigravity_call_fields_are_bounded_at_ingest() {
+        let mut state = AppState::default();
+        let _ownership = install_ownership(&mut state, StubOwnership::owning("agy-pane", "agy-1"));
+        state.register_pane("agy-pane".to_string());
+        state.apply_event(agy_event(EventType::SessionStart, "agy-1"));
+        let mut start = agy_pre_tool_use("agy-1", "rm -f probe.txt");
+        start
+            .metadata
+            .insert("tool_use_id".to_string(), "i".repeat(64 * 1024));
+        state.apply_event(start);
+        let record = &state.antigravity_calls["agy-pane"];
+        assert!(record.use_id.is_none() && record.subject.is_none());
+        assert!(state.antigravity_call("agy-pane", "agy-1").is_none());
+        let mut start = agy_pre_tool_use(
+            "agy-1",
+            &"y".repeat(crate::event::TOOL_SUBJECT_MAX_BYTES + 1),
+        );
+        start
+            .metadata
+            .insert("tool_use_id".to_string(), "call-2".to_string());
+        state.apply_event(start);
         assert!(state.antigravity_call("agy-pane", "agy-1").is_none());
     }
 }

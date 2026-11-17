@@ -3522,10 +3522,45 @@ async fn run_codex_rollout_monitor(
 /// signal, which the card has to see, is among them.
 pub(crate) const MAX_PENDING_STATUS_SIGNALS: usize = 16;
 
-/// PRD #211 (review): the longest an OSC 7501 signal waits for a hook event of
-/// its generation that was received before the signal was read, and is still
-/// being ingested ([`report_status_update`]).
-const STATUS_SIGNAL_HOOK_WAIT: Duration = Duration::from_millis(500);
+/// PRD #211 (second review, findings 2 and 5): the longest an OSC 7501 signal
+/// stays parked behind a hook event of its generation that was received before
+/// the signal was read and is still being ingested
+/// ([`run_status_osc_monitor`]). Past every bound an ingest waits under — the
+/// predecessor wait, the hook's own acknowledgement deadline — so it is
+/// reached only by an ingest that is stuck.
+const STATUS_SIGNAL_HOOK_WAIT: Duration = Duration::from_secs(10);
+
+/// PRD #211 (second review, finding 5): how often the monitor looks again at
+/// generations whose signals are parked.
+const STATUS_SIGNAL_PARK_TICK: Duration = Duration::from_millis(5);
+
+/// PRD #211 (second review, finding 2): one hook event attested to generation
+/// `owner`, received on a connection accepted at `at`
+/// ([`AgentPtyRegistry::note_hook_receipt`]) and, when this is dropped,
+/// ingested ([`AgentPtyRegistry::note_hook_applied`]) — whether the hook loop
+/// applied it, refused it or stopped reading.
+struct HookReceipt {
+    registry: Arc<AgentPtyRegistry>,
+    owner: String,
+    at: std::time::Instant,
+}
+
+impl HookReceipt {
+    fn note(registry: &Arc<AgentPtyRegistry>, owner: &str, at: std::time::Instant) -> Self {
+        registry.note_hook_receipt(owner, at);
+        Self {
+            registry: Arc::clone(registry),
+            owner: owner.to_string(),
+            at,
+        }
+    }
+}
+
+impl Drop for HookReceipt {
+    fn drop(&mut self) {
+        self.registry.note_hook_applied(&self.owner, self.at);
+    }
+}
 
 /// PRD #211 (audit, CWE-400/770): the most generations with signals waiting.
 /// Reached only by a burst across that many live panes; past it the
@@ -3560,8 +3595,9 @@ pub(crate) struct PendingSignals {
     pub(crate) pane_id: String,
     pub(crate) agent_id: String,
     pub(crate) agent_type: crate::event::AgentType,
-    /// In the order they were written.
-    pub(crate) signals: Vec<(crate::status_osc::OscSignal, std::time::Instant)>,
+    /// In the order they were written, each with the reader epoch it was
+    /// read under.
+    pub(crate) signals: Vec<(crate::status_osc::OscSignal, std::time::Instant, u64)>,
 }
 
 impl StatusSignalQueue {
@@ -3597,10 +3633,13 @@ impl StatusSignalQueue {
                     },
                 )
             });
-            let seen_at = signals.seen_at;
-            waiting
-                .signals
-                .extend(signals.signals.into_iter().map(|signal| (signal, seen_at)));
+            let (seen_at, epoch) = (signals.seen_at, signals.epoch);
+            waiting.signals.extend(
+                signals
+                    .signals
+                    .into_iter()
+                    .map(|signal| (signal, seen_at, epoch)),
+            );
             waiting.agent_type = signals.agent_type;
             let excess = waiting
                 .signals
@@ -3673,9 +3712,19 @@ fn install_status_signal_sink(registry: &Arc<AgentPtyRegistry>) -> Arc<StatusSig
 /// a held signal is shown, every signal already queued is taken in first, so a
 /// busy monitor never shows one whose `idle` was already waiting.
 ///
+/// PRD #211 (second review, findings 2 and 5): a signal read while a hook
+/// event of its generation, received before it, is still being ingested is
+/// PARKED with the rest of that generation's signals, and applied once that
+/// event is in — the `PreToolUse` a permission prompt is bound to among them —
+/// however long its ingest takes, up to [`STATUS_SIGNAL_HOOK_WAIT`]. Nothing
+/// waits inline: while one generation is parked the monitor goes on serving
+/// every other, and looks at the parked ones again every
+/// [`STATUS_SIGNAL_PARK_TICK`].
+///
 /// Each iteration takes what the [`StatusSignalQueue`] holds, which its bounds
 /// cap, and skips the signals of a generation that no longer holds its pane,
-/// dropping any it held back (audit, CWE-400/770).
+/// dropping any it held back or parked (audit, CWE-400/770); a generation
+/// keeps at most [`MAX_PENDING_STATUS_SIGNALS`] parked.
 ///
 /// No internal shutdown signal: aborted in `run_daemon_with`'s cleanup.
 async fn run_status_osc_monitor(
@@ -3684,28 +3733,38 @@ async fn run_status_osc_monitor(
     event_tx: broadcast::Sender<BroadcastMsg>,
     signals: Arc<StatusSignalQueue>,
 ) {
-    use crate::status_osc::AuthSettle;
-    // Only the panes holding a sign-in signal back have an entry.
-    let mut held: std::collections::HashMap<
-        (String, String),
-        (crate::event::AgentType, AuthSettle),
-    > = std::collections::HashMap::new();
+    // Only the generations holding a sign-in signal back, or with signals
+    // parked behind an in-flight hook, have an entry.
+    let mut waiting: std::collections::HashMap<(String, String), WaitingSignals> =
+        std::collections::HashMap::new();
     let current = |(pane_id, agent_id): &(String, String)| {
         registry.pane_current_agent_id(pane_id).as_deref() == Some(agent_id.as_str())
     };
     loop {
-        let due = held
+        let due = waiting
             .values()
-            .filter_map(|(_, settle)| settle.due_at())
+            .filter_map(|entry| entry.settle.due_at())
             .min();
-        match due {
-            Some(at) => {
-                tokio::select! {
-                    () = signals.ready() => {}
-                    () = tokio::time::sleep_until(tokio::time::Instant::from_std(at)) => {}
-                }
+        let parked = waiting.values().any(|entry| !entry.parked.is_empty());
+        let park_tick = async {
+            if parked {
+                tokio::time::sleep(STATUS_SIGNAL_PARK_TICK).await;
+            } else {
+                std::future::pending::<()>().await;
             }
-            None => signals.ready().await,
+        };
+        let settle_due = async {
+            match due {
+                Some(at) => {
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            () = signals.ready() => {}
+            () = settle_due => {}
+            () = park_tick => {}
         }
         let (batches, dropped) = signals.take();
         if dropped > 0 {
@@ -3714,55 +3773,134 @@ async fn run_status_osc_monitor(
                 "status osc: signals arrived faster than they were applied; kept each pane's latest"
             );
         }
-        held.retain(|key, _| current(key));
+        waiting.retain(|key, _| current(key));
+        let mut order: Vec<(String, String)> = Vec::new();
         for batch in batches {
             let key = (batch.pane_id.clone(), batch.agent_id.clone());
             if !current(&key) {
                 continue;
             }
-            let mut settle = held
-                .remove(&key)
-                .map(|(_, settle)| settle)
-                .unwrap_or_default();
-            for (signal, seen_at) in &batch.signals {
-                if let Some(update) = settle.signal(signal, *seen_at) {
+            let entry = waiting
+                .entry(key.clone())
+                .or_insert_with(|| WaitingSignals::new(batch.agent_type.clone()));
+            entry.agent_type = batch.agent_type;
+            entry.parked.extend(batch.signals);
+            let excess = entry
+                .parked
+                .len()
+                .saturating_sub(MAX_PENDING_STATUS_SIGNALS);
+            entry.parked.drain(..excess);
+            order.push(key);
+        }
+        // The generations with nothing new, in any order, after those that
+        // just read something, in the order they read it.
+        for key in waiting.keys() {
+            if !order.contains(key) {
+                order.push(key.clone());
+            }
+        }
+        for key in order {
+            let Some(mut entry) = waiting.remove(&key) else {
+                continue;
+            };
+            let now = std::time::Instant::now();
+            // PRD #211 (second review, finding 4): what the reader read before
+            // it was last turned on or off is not applied, and a sign-in
+            // signal held from then goes with it.
+            let reader = registry.status_reader_epoch(&key.1);
+            if reader != Some(entry.epoch) {
+                entry.settle = crate::status_osc::AuthSettle::default();
+            }
+            entry.parked.retain(|(_, _, epoch)| Some(*epoch) == reader);
+            if let Some(epoch) = reader {
+                entry.epoch = epoch;
+            }
+            while let Some((signal, seen_at, _)) = entry.parked.front() {
+                let seen_at = *seen_at;
+                if registry.hook_in_flight_before(&key.1, seen_at)
+                    && entry
+                        .parked_since
+                        .is_none_or(|since| now.duration_since(since) < STATUS_SIGNAL_HOOK_WAIT)
+                {
+                    entry.parked_since.get_or_insert(now);
+                    break;
+                }
+                if entry
+                    .parked_since
+                    .take()
+                    .is_some_and(|since| now.duration_since(since) >= STATUS_SIGNAL_HOOK_WAIT)
+                {
+                    tracing::warn!(
+                        pane_id = %escape_id_for_log(&key.0),
+                        agent_id = %escape_id_for_log(&key.1),
+                        "status osc: a hook event received before this signal is still being \
+                         ingested; applying the signal without waiting longer"
+                    );
+                }
+                let update = entry.settle.signal(signal, seen_at);
+                entry.parked.pop_front();
+                if let Some(update) = update {
                     report_status_update(
                         &state,
                         &event_tx,
                         &registry,
                         &key,
-                        &batch.agent_type,
+                        &entry.agent_type,
                         update,
-                        *seen_at,
+                        seen_at,
+                        Some(entry.epoch),
                     )
                     .await;
                 }
             }
-            if settle.due_at().is_some() {
-                held.insert(key, (batch.agent_type, settle));
-            }
-        }
-        let now = std::time::Instant::now();
-        let ready: Vec<(String, String)> = held
-            .iter()
-            .filter(|(_, (_, settle))| settle.due_at().is_some_and(|at| at <= now))
-            .map(|(key, _)| key.clone())
-            .collect();
-        for key in ready {
-            if let Some((agent_type, mut settle)) = held.remove(&key)
-                && let Some((update, seen_at)) = settle.poll(now)
+            if entry.parked.is_empty()
+                && entry
+                    .settle
+                    .due_at()
+                    .is_some_and(|at| at <= std::time::Instant::now())
+                && let Some((update, seen_at)) = entry.settle.poll(std::time::Instant::now())
             {
                 report_status_update(
                     &state,
                     &event_tx,
                     &registry,
                     &key,
-                    &agent_type,
+                    &entry.agent_type,
                     update,
                     seen_at,
+                    Some(entry.epoch),
                 )
                 .await;
             }
+            if !entry.parked.is_empty() || entry.settle.due_at().is_some() {
+                waiting.insert(key, entry);
+            }
+        }
+    }
+}
+
+/// PRD #211: one generation's OSC 7501 signals the monitor has not applied
+/// yet — a sign-in signal it holds back, and those parked behind a hook event
+/// still being ingested ([`run_status_osc_monitor`]).
+struct WaitingSignals {
+    agent_type: crate::event::AgentType,
+    settle: crate::status_osc::AuthSettle,
+    /// In the order they were written, each with when it was read.
+    parked: std::collections::VecDeque<(crate::status_osc::OscSignal, std::time::Instant, u64)>,
+    /// The reader epoch the signals applied last were read under.
+    epoch: u64,
+    /// Since when the first of `parked` has waited for a hook event.
+    parked_since: Option<std::time::Instant>,
+}
+
+impl WaitingSignals {
+    fn new(agent_type: crate::event::AgentType) -> Self {
+        Self {
+            agent_type,
+            settle: crate::status_osc::AuthSettle::default(),
+            parked: std::collections::VecDeque::new(),
+            parked_since: None,
+            epoch: 0,
         }
     }
 }
@@ -3803,10 +3941,9 @@ fn pane_agent_release(
 /// signal is dropped rather than applied over that event's status and
 /// question (review: a queued `working` must not turn a newer tool's Working
 /// into Thinking). Asked under the `AppState` write lock, with the rest of
-/// the drop rule. Before that, a hook of the same generation received before
-/// the signal was read and still being ingested is waited for, up to
-/// [`STATUS_SIGNAL_HOOK_WAIT`], so the signal lands after it; nothing else on
-/// this path awaits anything but the locks every event takes.
+/// the drop rule. A hook of the same generation received before the signal
+/// was read and still being ingested is not waited for here: the monitor
+/// parks the signal until that hook is in ([`run_status_osc_monitor`]).
 #[allow(clippy::too_many_arguments)]
 async fn report_status_update(
     state: &SharedState,
@@ -3816,19 +3953,10 @@ async fn report_status_update(
     agent_type: &crate::event::AgentType,
     update: crate::status_osc::StatusUpdate,
     seen_at: std::time::Instant,
+    epoch: Option<u64>,
 ) {
     use crate::event::EventType;
     use crate::status_osc::StatusUpdate;
-    // A hook of this generation accepted before the signal was read is older
-    // evidence the signal must land after: a `PreToolUse` is what a permission
-    // prompt is bound to. Waited for within a bound, since its ingest takes
-    // only the locks every event takes.
-    let deadline = tokio::time::Instant::now() + STATUS_SIGNAL_HOOK_WAIT;
-    while registry.hook_in_flight_before(agent_id, seen_at)
-        && tokio::time::Instant::now() < deadline
-    {
-        tokio::time::sleep(Duration::from_millis(2)).await;
-    }
     let (event_type, reason, permission) = match update {
         StatusUpdate::Working => (EventType::Thinking, None, false),
         StatusUpdate::Idle => (EventType::Idle, None, false),
@@ -3917,6 +4045,11 @@ async fn report_status_update(
     let superseded = std::sync::atomic::AtomicBool::new(false);
     let ingested = ingest_event_unless(state, event_tx, registry, event, false, None, |_| {
         if registry.pane_current_agent_id(pane_id).as_deref() != Some(agent_id.as_str()) {
+            return true;
+        }
+        // PRD #211 (second review, finding 4): read by a reader since turned
+        // off, or turned on afresh for another session.
+        if epoch.is_some_and(|epoch| registry.status_reader_epoch(agent_id) != Some(epoch)) {
             return true;
         }
         let newer = registry.hook_received_after(agent_id, seen_at);
@@ -6714,6 +6847,13 @@ async fn run_hook_loop_with_limits(
                         // turn until this line is handled; an `inbox_announce`
                         // keeps the place for the event after it, and anything
                         // else gives it up. See `crate::hook_event_order`.
+                        // PRD #211 (second review, finding 2): an event
+                        // attested to a generation is received from the moment
+                        // its line is read, before it waits for the events
+                        // ahead of it, so a status signal read meanwhile waits
+                        // for it (`run_status_osc_monitor`). The guard marks it
+                        // ingested whichever way this line's handling ends.
+                        let mut hook_receipt: Option<HookReceipt> = None;
                         let _event_turn = crate::hook_event_order::turn_for_line(
                             &mut event_order_ticket,
                             &line,
@@ -6721,6 +6861,10 @@ async fn run_hook_loop_with_limits(
                             // refuses, or admits unattested, holds nobody's
                             // attested event back.
                             &*pty_registry,
+                            |owner| {
+                                hook_receipt =
+                                    Some(HookReceipt::note(&pty_registry, owner, accepted_at));
+                            },
                         )
                         .await;
                         if let Ok(msg) = serde_json::from_str::<DaemonMessage>(&line) {
@@ -8613,7 +8757,7 @@ async fn run_hook_loop_with_limits(
                             // `None` or the pane id is unknown/absent.
                             // PRD #211 (review): the generation this connection's event is
                             // attested to, whose receipt is noted below and its ingest after.
-                            let mut receipt_owner: Option<String> = None;
+
                             if let Some(ref pane_id) = event.pane_id {
                                 // A SessionStart naming a pane this daemon never
                                 // spawned is always wrong, and silently so: it
@@ -8678,19 +8822,47 @@ async fn run_hook_loop_with_limits(
                                 // own hook, attested by the pane's token, says
                                 // what runs there.
                                 if let Some(owner) = attested_agent.as_deref() {
-                                    receipt_owner = Some(owner.to_string());
-                                    pty_registry.note_hook_receipt(owner, accepted_at);
-                                    if pty_registry.read_status_osc_from_own_hooks(
-                                        pane_id,
-                                        owner,
-                                        &event.agent_type,
-                                    ) {
-                                        info!(
+                                    if hook_receipt
+                                        .as_ref()
+                                        .is_none_or(|receipt| receipt.owner != owner)
+                                    {
+                                        hook_receipt = Some(HookReceipt::note(
+                                            &pty_registry,
+                                            owner,
+                                            accepted_at,
+                                        ));
+                                    }
+                                    let change = (event.agent_type
+                                        != crate::event::AgentType::None)
+                                        .then(|| {
+                                            pty_registry.note_own_agent_hook(
+                                                pane_id,
+                                                owner,
+                                                &event.agent_type,
+                                                &event.session_id,
+                                                event.event_type
+                                                    == crate::event::EventType::SessionEnd,
+                                            )
+                                        })
+                                        .flatten();
+                                    match change {
+                                        Some(crate::agent_pty::ShellReaderChange::Started {
+                                            agent,
+                                            release,
+                                        }) => info!(
+                                            pane_id = %escape_id_for_log(pane_id),
+                                            agent_id = %escape_id_for_log(owner),
+                                            agent_type = ?agent,
+                                            release = ?release.map(|v| v.to_string()),
+                                            "status osc: reading the status of an agent session its own hooks named in the shell"
+                                        ),
+                                        Some(crate::agent_pty::ShellReaderChange::Ended) => info!(
                                             pane_id = %escape_id_for_log(pane_id),
                                             agent_id = %escape_id_for_log(owner),
                                             agent_type = ?event.agent_type,
-                                            "status osc: reading the status of an agent its own hooks named in the pane"
-                                        );
+                                            "status osc: stopped reading the shell's agent status: its session ended or another agent's began"
+                                        ),
+                                        None => {}
                                     }
                                 }
                             }
@@ -8759,9 +8931,7 @@ async fn run_hook_loop_with_limits(
                                 attested_agent,
                             )
                             .await;
-                            if let Some(owner) = receipt_owner {
-                                pty_registry.note_hook_applied(&owner, accepted_at);
-                            }
+                            drop(hook_receipt);
                         } else {
                             // PRD #1666 part 3 (Q87): on a registered composer
                             // connection a line it can't parse, half an
@@ -22343,6 +22513,7 @@ mod status_signal_queue_tests {
             agent_type: AgentType::Antigravity,
             signals,
             seen_at: Instant::now(),
+            epoch: 0,
         }
     }
 
@@ -22378,7 +22549,7 @@ mod status_signal_queue_tests {
             batches[at]
                 .signals
                 .iter()
-                .map(|(signal, _)| signal.clone())
+                .map(|(signal, _, _)| signal.clone())
                 .collect()
         };
         assert_eq!(signals(0), vec![signal(OscState::Idle, None)]);
@@ -22480,6 +22651,7 @@ mod status_signal_order_tests {
                 &AgentType::Antigravity,
                 update,
                 seen_at,
+                None,
             )
             .await;
         }
@@ -22558,43 +22730,295 @@ mod status_signal_order_tests {
         assert_ne!(after_post, crate::state::SessionStatus::WaitingForInput);
         assert!(!deck.question().await);
     }
+}
 
-    /// Scenario: a `PreToolUse` connection is accepted, and the permission
-    /// prompt it leads to is read before that event has been ingested. The
-    /// signal waits for it, lands after it, and is bound to its call.
-    #[tokio::test]
-    async fn a_permission_read_after_its_calls_receipt_waits_for_its_ingest() {
-        let deck = Arc::new(Fixture::start().await);
-        let start = Instant::now();
-        deck.hook("pre-invocation.json", start).await;
-        let accepted = start + Duration::from_millis(1);
-        // Received, not yet ingested.
-        deck.registry.note_hook_receipt(&deck.owner, accepted);
-        let read = accepted + Duration::from_millis(1);
-        let signal = {
-            let deck = Arc::clone(&deck);
-            tokio::spawn(async move {
-                deck.signal(
-                    StatusUpdate::Permission(Some("Approve Bash: echo agy-probe-1".into())),
-                    read,
-                )
+/// PRD #211 (second review, findings 2 and 5): OSC 7501 signals parked behind
+/// a hook event still being ingested, through the real hook loop and the
+/// real status monitor.
+#[cfg(all(test, unix))]
+mod status_signal_park_tests {
+    use super::*;
+    use crate::agent_pty::{DOT_AGENT_DECK_PANE_ID, SpawnOptions, StatusSignals};
+    use crate::event::AgentType;
+    use crate::state::SessionStatus;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::time::{Duration, Instant};
+    use tokio::net::{UnixListener, UnixStream};
+
+    /// `Approve Bash: echo agy-probe-1`, the command of the
+    /// `pre-tool-use-run-command.json` fixture, as `agy` signals its prompt.
+    const PERMISSION: &[u8] = b"\x1b]7501;state=blocked:kind=permission:app=antigravity:msg=QXBwcm92ZSBCYXNoOiBlY2hvIGFneS1wcm9iZS0x\x07";
+    const IDLE: &[u8] = b"\x1b]7501;state=idle:app=antigravity\x07";
+
+    struct Deck {
+        _dir: tempfile::TempDir,
+        sock: std::path::PathBuf,
+        registry: Arc<AgentPtyRegistry>,
+        state: SharedState,
+        signals: Arc<StatusSignalQueue>,
+        /// Each pane and the generation on it.
+        panes: Vec<(String, String)>,
+        tasks: Vec<tokio::task::JoinHandle<()>>,
+        _ownership: Arc<dyn crate::state::AgentOwnership>,
+    }
+
+    impl Deck {
+        async fn start(panes: &[&str]) -> Self {
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let panes: Vec<(String, String)> = panes
+                .iter()
+                .map(|pane| {
+                    let agent = registry
+                        .spawn_agent(SpawnOptions {
+                            command: Some("/bin/cat"),
+                            env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                                DOT_AGENT_DECK_PANE_ID.to_string(),
+                                pane.to_string(),
+                            )]),
+                            agent_type: Some(AgentType::Antigravity),
+                            ..SpawnOptions::default()
+                        })
+                        .expect("spawn stand-in");
+                    (pane.to_string(), agent)
+                })
+                .collect();
+            let mut app = crate::state::AppState::default();
+            let ownership: Arc<dyn crate::state::AgentOwnership> = registry.clone();
+            app.set_agent_ownership(Arc::downgrade(&ownership));
+            let state: SharedState = Arc::new(tokio::sync::RwLock::new(app));
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let sock = dir.path().join("hook.sock");
+            let listener = IpcListener::from_tokio_listener(UnixListener::bind(&sock).unwrap());
+            let (event_tx, _rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+            let signals = Arc::new(StatusSignalQueue::default());
+            let hook_loop = tokio::spawn({
+                let (registry, state, event_tx) =
+                    (registry.clone(), state.clone(), event_tx.clone());
+                let wtr = crate::issue_dispatch_run::new_worktree_registry();
+                async move {
+                    let _ = run_hook_loop(
+                        listener,
+                        state,
+                        event_tx,
+                        registry,
+                        Arc::new(Notify::new()),
+                        wtr,
+                    )
+                    .await;
+                }
+            });
+            let monitor = tokio::spawn(run_status_osc_monitor(
+                registry.clone(),
+                state.clone(),
+                event_tx,
+                Arc::clone(&signals),
+            ));
+            Self {
+                _dir: dir,
+                sock,
+                registry,
+                state,
+                signals,
+                panes,
+                tasks: vec![hook_loop, monitor],
+                _ownership: ownership,
+            }
+        }
+
+        /// Write pane `index`'s generation's `fixture` hook on a connection
+        /// of its own, left open.
+        async fn hook(&self, index: usize, fixture: &str) -> UnixStream {
+            let (pane, agent) = &self.panes[index];
+            let input = std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/antigravity")
+                    .join(fixture),
+            )
+            .unwrap();
+            let mut event = crate::hook::hook_payload_event("antigravity", &input).unwrap();
+            event.session_id = format!("agy-park-{index}");
+            event.pane_id = Some(pane.clone());
+            event.agent_id = Some(agent.clone());
+            let token = self.registry.hook_token_of(agent).expect("pane token");
+            let line = crate::event::agent_event_line(&event, Some(&token)).unwrap();
+            let mut stream = UnixStream::connect(&self.sock).await.unwrap();
+            stream
+                .write_all(format!("{line}\n").as_bytes())
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            stream
+        }
+
+        /// Pane `index`'s reader reading `bytes` now.
+        fn signal(&self, index: usize, bytes: &[u8]) {
+            let (pane, agent) = &self.panes[index];
+            let mut found = Vec::new();
+            crate::status_osc::Osc7501Scanner::new("antigravity").scan(bytes, &mut found);
+            assert!(!found.is_empty());
+            self.signals.push(StatusSignals {
+                pane_id: pane.clone(),
+                agent_id: agent.clone(),
+                agent_type: AgentType::Antigravity,
+                signals: found,
+                seen_at: Instant::now(),
+                epoch: self.registry.status_reader_epoch(agent).unwrap(),
+            });
+        }
+
+        async fn card(&self, index: usize) -> Option<(SessionStatus, bool)> {
+            let (pane, agent) = &self.panes[index];
+            let state = self.state.read().await;
+            let session = state.pane_hook_session_id(pane)?;
+            Some((
+                state.sessions.get(&session)?.status.clone(),
+                state.pending_question_for(agent, Some(pane)).is_some(),
+            ))
+        }
+
+        async fn card_within(
+            &self,
+            index: usize,
+            budget: Duration,
+            wanted: impl Fn(&(SessionStatus, bool)) -> bool,
+        ) -> Option<(SessionStatus, bool)> {
+            let deadline = tokio::time::Instant::now() + budget;
+            loop {
+                let card = self.card(index).await;
+                if card.as_ref().is_some_and(&wanted) || tokio::time::Instant::now() >= deadline {
+                    return card;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+
+        /// Pane `index`'s turn started: its `PreInvocation` applied.
+        async fn thinking(&self, index: usize) {
+            let _start = self.hook(index, "session-start.json").await;
+            let _turn = self.hook(index, "pre-invocation.json").await;
+            let card = self
+                .card_within(index, Duration::from_secs(5), |(status, _)| {
+                    *status == SessionStatus::Thinking
+                })
                 .await;
-            })
-        };
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(
-            !signal.is_finished(),
-            "the signal waits for the call it is bound to"
-        );
-        deck.hook("pre-tool-use-run-command.json", accepted).await;
-        signal.await.unwrap();
+            assert_eq!(card.map(|c| c.0), Some(SessionStatus::Thinking));
+        }
+
+        async fn until_in_flight(&self, index: usize) {
+            let agent = &self.panes[index].1;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !self.registry.hook_in_flight_before(agent, Instant::now()) {
+                assert!(Instant::now() < deadline, "the hook was never received");
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+    }
+
+    impl Drop for Deck {
+        fn drop(&mut self) {
+            for task in &self.tasks {
+                task.abort();
+            }
+            self.registry.shutdown_all();
+        }
+    }
+
+    /// Scenario: an Antigravity `PreToolUse` reaches the hook socket and its
+    /// ingest is held up — the pane's question lifecycle is held for 700 ms —
+    /// while the permission prompt it leads to is read from the terminal. The
+    /// prompt waits for the call however long that takes, then shows Needs
+    /// Input with an answerable question bound to it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_permission_waits_for_its_calls_held_up_ingest() {
+        let deck = Deck::start(&["agy-park-a"]).await;
+        deck.thinking(0).await;
+        let held = deck
+            .registry
+            .question_answers()
+            .lock_lifecycle("agy-park-a")
+            .await;
+        let _call = deck.hook(0, "pre-tool-use-run-command.json").await;
+        deck.until_in_flight(0).await;
+        deck.signal(0, PERMISSION);
+        tokio::time::sleep(Duration::from_millis(700)).await;
         assert_eq!(
-            deck.status().await,
-            crate::state::SessionStatus::WaitingForInput
+            deck.card(0).await,
+            Some((SessionStatus::Thinking, false)),
+            "the prompt was applied ahead of the call it is bound to"
         );
+        drop(held);
+        let card = deck
+            .card_within(0, Duration::from_secs(5), |(_, question)| *question)
+            .await;
+        assert_eq!(
+            card,
+            Some((SessionStatus::WaitingForInput, true)),
+            "the prompt is bound to the call ingested ahead of it"
+        );
+    }
+
+    /// Scenario: a connection to the hook socket opens and sends nothing, so
+    /// an Antigravity `PreToolUse` that arrives after it waits out the
+    /// predecessor wait before it is ingested. The permission prompt read
+    /// meanwhile waits too, and is bound to that call once it is in.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_permission_waits_for_a_call_waiting_on_a_silent_predecessor() {
+        let deck = Deck::start(&["agy-park-b"]).await;
+        deck.thinking(0).await;
+        let _silent = UnixStream::connect(&deck.sock).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let started = Instant::now();
+        let _call = deck.hook(0, "pre-tool-use-run-command.json").await;
+        deck.until_in_flight(0).await;
+        deck.signal(0, PERMISSION);
+        let card = deck
+            .card_within(0, Duration::from_secs(10), |(_, question)| *question)
+            .await;
+        assert_eq!(card, Some((SessionStatus::WaitingForInput, true)));
         assert!(
-            deck.question().await,
-            "the prompt is bound to the PreToolUse ingested ahead of it"
+            started.elapsed() >= Duration::from_millis(500),
+            "the call did not wait behind the silent connection: {:?}",
+            started.elapsed()
         );
+    }
+
+    /// Scenario: one Antigravity pane's `PreToolUse` is held up in its ingest
+    /// with its permission prompt parked behind it, and another pane reports
+    /// `idle` meanwhile. The other pane's card turns Idle promptly; the first
+    /// pane's prompt still lands, bound, once its call is in.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_parked_pane_does_not_hold_back_another_panes_status() {
+        let deck = Deck::start(&["agy-park-c", "agy-park-d"]).await;
+        deck.thinking(0).await;
+        deck.thinking(1).await;
+        let held = deck
+            .registry
+            .question_answers()
+            .lock_lifecycle("agy-park-c")
+            .await;
+        let _call = deck.hook(0, "pre-tool-use-run-command.json").await;
+        deck.until_in_flight(0).await;
+        deck.signal(0, PERMISSION);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let asked = Instant::now();
+        deck.signal(1, IDLE);
+        let other = deck
+            .card_within(1, Duration::from_secs(5), |(status, _)| {
+                *status == SessionStatus::Idle
+            })
+            .await;
+        assert_eq!(other.map(|c| c.0), Some(SessionStatus::Idle));
+        assert!(
+            asked.elapsed() < Duration::from_millis(300),
+            "the other pane waited behind the parked one: {:?}",
+            asked.elapsed()
+        );
+        assert_eq!(deck.card(0).await, Some((SessionStatus::Thinking, false)));
+        drop(held);
+        let card = deck
+            .card_within(0, Duration::from_secs(5), |(_, question)| *question)
+            .await;
+        assert_eq!(card, Some((SessionStatus::WaitingForInput, true)));
     }
 }
