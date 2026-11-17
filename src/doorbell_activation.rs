@@ -809,9 +809,11 @@ pub const ANTIGRAVITY_FACTS: AgentFacts<'static> = AgentFacts {
     // prompt hook reports the line instead.
     transcript_echo: Measurement::Absent,
     // No editor probe, so no check reads a box a person touched empty again.
-    // What does is `agy`'s own prompt hook: a first-call `PreInvocation`
-    // after a person's Enter, with nothing entered since
-    // (`GenerationInput::reconcile_human_submit`).
+    // What does is `agy`'s own report of what the last key did: a first-call
+    // `PreInvocation` after a person's Enter, with nothing entered since
+    // (`GenerationInput::reconcile_human_submit`), or its status leaving a
+    // prompt after a lone digit typed into an untouched box
+    // (`GenerationInput::reconcile_menu_answer`).
     editor_probe: Measurement::Absent,
 };
 

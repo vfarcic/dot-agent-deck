@@ -221,16 +221,14 @@ impl InputEpoch {
         applies
     }
 
-    /// PRD #211 (PR #2370 review, Greptile P1): the agent reported that it
-    /// took a person's submitted prompt, and the last op to enter the box is
-    /// the person's op at `submit`, the one that ended in Enter. The box
-    /// becomes empty through that submit iff that op is still the last one,
-    /// foreign, and the epoch is not exhausted. Whether it applied.
-    pub fn reconcile_human_submit(&mut self, submit: u64) -> bool {
-        let applies = !self.exhausted
-            && self.epoch == submit
-            && self.owner.is_none()
-            && self.last_foreign == submit;
+    /// PRD #211 (PR #2370 review, Greptile P1): the agent's own report says
+    /// what the foreign op at `at` did to the box — took it as a submitted
+    /// prompt, or answered a menu with it — and leaves it empty. The box is
+    /// observed empty again iff that op is still the last one, foreign, and
+    /// the epoch is not exhausted. Whether it applied.
+    pub fn reconcile_last_foreign(&mut self, at: u64) -> bool {
+        let applies =
+            !self.exhausted && self.epoch == at && self.owner.is_none() && self.last_foreign == at;
         if applies {
             self.observed = self.epoch;
         }
@@ -412,6 +410,12 @@ struct State {
     /// submitted it ([`GenerationInput::reconcile_human_submit`]). Stale once
     /// any later op moves the epoch past it.
     human_submit: Option<u64>,
+    /// PRD #211 (PR #2370 review, Greptile P1): the epoch, and when, a lone
+    /// digit moved a box that was untouched just before it: a person's or a
+    /// voice answer's key that may have answered a permission menu
+    /// ([`GenerationInput::reconcile_menu_answer`]). Stale once any later op
+    /// moves the epoch past it.
+    menu_key: Option<(u64, Instant)>,
 }
 
 /// The most explanations [`Live::explained`] banks, and the most unexplained
@@ -1024,6 +1028,7 @@ fn plan_locked(state: &mut State, writer: Writer, bytes: &[u8], plan: Option<Pla
                 Writer::Deck(job) => Some(job),
                 Writer::UnnamedDeck | Writer::Human | Writer::Answer => None,
             };
+            let untouched_before = !state.epoch.touched();
             let moved_to = state.epoch.record(owner);
             if owner.is_none()
                 && let Some(live) = state.live.as_mut()
@@ -1032,6 +1037,9 @@ fn plan_locked(state: &mut State, writer: Writer, bytes: &[u8], plan: Option<Pla
             }
             if writer == Writer::Human && bytes.last() == Some(&b'\r') {
                 state.human_submit = Some(moved_to);
+            }
+            if person && untouched_before && matches!(bytes, [digit] if digit.is_ascii_digit()) {
+                state.menu_key = Some((moved_to, Instant::now()));
             }
             tracing::debug!(
                 target: "composer_probe",
@@ -1173,6 +1181,7 @@ impl GenerationInput {
                 live: None,
                 retired: false,
                 human_submit: None,
+                menu_key: None,
             }),
             moved: tokio::sync::Notify::new(),
             output_offset: AtomicU64::new(0),
@@ -1399,7 +1408,25 @@ impl GenerationInput {
         let Some(submit) = state.human_submit else {
             return false;
         };
-        !state.retired && state.epoch.reconcile_human_submit(submit)
+        !state.retired && state.epoch.reconcile_last_foreign(submit)
+    }
+
+    /// PRD #211 (PR #2370 review, Greptile P1): the agent's own terminal
+    /// status, read at `read_at`, left a permission prompt for a working or
+    /// idle turn. When the last op to enter the box is a lone digit, a
+    /// person's or a voice answer's, written into a box that was untouched
+    /// just before it and before that status was read, the menu took it as
+    /// its answer, and the box is as untouched as it was. Had it reached the
+    /// composer instead, it shows there as the one digit it is, which the
+    /// screen's empty-composer check reads. Refused once retired, when any op
+    /// came after the digit, or when the box was touched before it. Whether
+    /// it applied.
+    pub fn reconcile_menu_answer(&self, read_at: Instant) -> bool {
+        let mut state = self.state.lock_recovering();
+        let Some((key, written_at)) = state.menu_key else {
+            return false;
+        };
+        written_at <= read_at && !state.retired && state.epoch.reconcile_last_foreign(key)
     }
 
     /// Apply a probe's observation (R3 §3.4); refused once retired.
@@ -2722,6 +2749,54 @@ mod tests {
         input.enqueue(Writer::Human, b"\r");
         input.retire();
         assert!(!input.reconcile_human_submit(), "a retired generation");
+    }
+
+    /// PRD #211 (PR #2370 review, Greptile P1): a lone digit, a person's or a
+    /// voice answer's, typed into an untouched box before the agent's status
+    /// left its prompt leaves the box untouched; a digit into a touched box,
+    /// an op after the digit, two digits in one op and a status read before
+    /// the digit was written do not.
+    #[test]
+    fn a_lone_digit_into_an_untouched_box_is_a_menu_answer() {
+        let input = GenerationInput::default();
+        assert!(!input.touched());
+        let before = Instant::now();
+        input.enqueue(Writer::Human, b"1");
+        assert!(input.touched());
+        assert!(
+            !input.reconcile_menu_answer(before),
+            "a status read before the digit"
+        );
+        assert!(input.reconcile_menu_answer(Instant::now()));
+        assert!(!input.touched());
+
+        input.enqueue(Writer::Answer, b"4");
+        assert!(
+            input.reconcile_menu_answer(Instant::now()),
+            "a voice answer"
+        );
+        input.enqueue(Writer::Human, b"12");
+        assert!(!input.reconcile_menu_answer(Instant::now()), "two digits");
+        input.enqueue(Writer::Human, b"1");
+        assert!(
+            !input.reconcile_menu_answer(Instant::now()),
+            "a digit into a touched box"
+        );
+        assert!(input.touched());
+
+        let fresh = GenerationInput::default();
+        fresh.enqueue(Writer::Human, b"1");
+        fresh.enqueue(Writer::Human, b" ");
+        assert!(
+            !fresh.reconcile_menu_answer(Instant::now()),
+            "an op after the digit"
+        );
+        let deck = GenerationInput::default();
+        deck.enqueue(Writer::UnnamedDeck, b"1");
+        assert!(
+            !deck.reconcile_menu_answer(Instant::now()),
+            "the deck's own bytes"
+        );
     }
 
     /// Scenario: Bring the epoch to its last value, record one more op, and offer the probe that owns it an observation. The epoch stays at its last value, the box stays touched, and the observation doesn't apply.

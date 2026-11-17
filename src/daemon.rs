@@ -4166,6 +4166,7 @@ async fn report_status_update(
 ) {
     use crate::event::EventType;
     use crate::status_osc::StatusUpdate;
+    let moves_on = matches!(update, StatusUpdate::Working | StatusUpdate::Idle);
     let (event_type, reason, permission) = match update {
         StatusUpdate::Working => (EventType::Thinking, None, false),
         StatusUpdate::Idle => (EventType::Idle, None, false),
@@ -4178,19 +4179,25 @@ async fn report_status_update(
     // was being ingested when the signal was read is in by now if it was
     // waiting for the lifecycle — not read from the state before it.
     let lifecycle = registry.question_answers().lock_lifecycle(pane_id).await;
-    let (session_id, question) = {
+    let (session_id, question, prompting) = {
         let state = state.read().await;
         let session_id = state
             .pane_hook_session_id(pane_id)
             .or_else(|| state.pane_session_id(pane_id))
             .unwrap_or_else(|| pane_id.clone());
+        // PRD #211 (PR #2370 review, Greptile P1): the card is on a prompt of
+        // this generation's, which this signal may be leaving.
+        let prompting = state.sessions.get(&session_id).is_some_and(|session| {
+            session.agent_id.as_deref() == Some(agent_id.as_str())
+                && session.status == crate::state::SessionStatus::WaitingForInput
+        });
         let question = match (permission, reason.as_deref()) {
             (true, Some(prompt)) => {
                 antigravity_status_question(&state, registry, pane_id, agent_id, agent_type, prompt)
             }
             _ => None,
         };
-        (session_id, question)
+        (session_id, question, prompting)
     };
     let event = status_signal_event(
         session_id,
@@ -4218,6 +4225,14 @@ async fn report_status_update(
         })
         .await;
     drop(lifecycle);
+    // PRD #211 (PR #2370 review, Greptile P1): `agy`'s own status left its
+    // permission prompt for a working or idle turn. A lone digit that is the
+    // last thing typed into its box since it was untouched answered that
+    // menu, so the box is untouched still: Antigravity has no editor probe to
+    // read it empty again.
+    if ingested && moves_on && prompting && *agent_type == crate::event::AgentType::Antigravity {
+        registry.note_menu_answer_taken(agent_id, seen_at);
+    }
     if !ingested {
         tracing::debug!(
             pane_id = %escape_id_for_log(pane_id),
@@ -23434,6 +23449,57 @@ mod status_signal_park_tests {
             "a key after the submit"
         );
         assert!(deck.registry.input_touched(&agent));
+    }
+
+    /// Scenario: two Antigravity panes each show a permission prompt, and a
+    /// person answers each with the digit `1`; one pane's input box was
+    /// untouched before, the other's had a key typed into it. When `agy`
+    /// reports `idle` after the answer, the first box is untouched again and
+    /// the second stays touched.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_digit_answering_a_prompt_leaves_an_untouched_box_untouched() {
+        let deck = Deck::start(&["agy-park-answer", "agy-park-typed"]).await;
+        deck.thinking(0).await;
+        deck.thinking(1).await;
+        let (typed_pane, typed_agent) = deck.panes[1].clone();
+        deck.registry
+            .write_user_bytes(&typed_pane, &typed_agent, b"x")
+            .await
+            .unwrap();
+        for index in 0..2 {
+            deck.signal(index, PERMISSION);
+            let card = deck
+                .card_within(index, Duration::from_secs(5), |(status, _)| {
+                    *status == SessionStatus::WaitingForInput
+                })
+                .await;
+            assert_eq!(card.map(|c| c.0), Some(SessionStatus::WaitingForInput));
+            let (pane, agent) = deck.panes[index].clone();
+            deck.registry
+                .write_user_bytes(&pane, &agent, b"1")
+                .await
+                .unwrap();
+            assert!(deck.registry.input_touched(&agent));
+            deck.signal(index, IDLE);
+            let card = deck
+                .card_within(index, Duration::from_secs(5), |(status, _)| {
+                    *status == SessionStatus::Idle
+                })
+                .await;
+            assert_eq!(card.map(|c| c.0), Some(SessionStatus::Idle));
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while deck.registry.input_touched(&deck.panes[0].1) {
+            assert!(
+                Instant::now() < deadline,
+                "the answer left the untouched box touched"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            deck.registry.input_touched(&typed_agent),
+            "a box touched before the answer stays touched"
+        );
     }
 
     /// Scenario: an Antigravity hook's connection is accepted, then the

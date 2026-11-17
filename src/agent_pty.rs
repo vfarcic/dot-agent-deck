@@ -13635,6 +13635,23 @@ impl AgentPtyRegistry {
         input.is_some_and(|input| input.reconcile_human_submit())
     }
 
+    /// PRD #211 (PR #2370 review, Greptile P1): generation `agent_id`'s own
+    /// terminal status, read at `read_at`, left the permission prompt its card
+    /// showed. When the last op into its box is a lone digit written into a
+    /// box that was untouched just before it, the box stays untouched
+    /// ([`crate::composer_probe::epoch::GenerationInput::reconcile_menu_answer`]).
+    /// Whether it applied; `false` for a generation that is gone.
+    pub fn note_menu_answer_taken(&self, agent_id: &str, read_at: Instant) -> bool {
+        let input = {
+            let inner = self.inner.lock();
+            inner
+                .agents
+                .get(agent_id)
+                .map(|agent| Arc::clone(agent.bus.input()))
+        };
+        input.is_some_and(|input| input.reconcile_menu_answer(read_at))
+    }
+
     /// PRD #1666 part 3 (plan §5.1, Q35-21): the pane's open paste, whether
     /// generation `agent_id`'s box is touched and whether the deck can check
     /// it, and how many of its agent's turns have ended, for the doorbell's
