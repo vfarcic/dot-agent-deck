@@ -19,6 +19,8 @@ A card is marked **Needs you** when its agent stopped, is asking a question in i
 
 With the flag on, the Dashboard's top bar has a **Table | Cards** switch. **Table** is the Dashboard you know. **Cards** shows a grid of cards. The app remembers your choice in this window's storage, so the next time you open the Dashboard it shows the same view.
 
+![The Dashboard's Cards view: an orchestration group of three cards, two of them marked Needs you with their main buttons “Go ahead” and “Yes, behind a flag”, and a standalone agent waiting for input](/img/agent-cards-desktop.png)
+
 In the Cards view:
 
 - Cards are grouped as the daemon groups them: the agents a dispatcher started are one group, with the dispatcher's own card in it; the roles of an orchestration are another; agents in neither are grouped together as standalone. Each group's heading counts its agents and how many need you.

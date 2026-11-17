@@ -1,4 +1,4 @@
-import { createFixtureFleet, DOCS_TRUST_ORCHESTRATION, DOCS_TRUST_REMOVED_ROLES, DOCS_TRUST_ROLES, createFixtureStartedAgent, FIXTURE_RESTART_AFTER_MS, restartedFixtureSnapshot, DEFAULT_PROFILES, FIXTURE_APP_VERSION, FIXTURE_DAEMON_VERSION, FIXTURE_UPGRADE_STEP_MS, FIXTURE_DEFAULT_COMMANDS, FIXTURE_EXPERIMENTAL_DECKS, FIXTURE_HOMES, fixtureAgentRegistry, fixtureDirectoryTree, fixtureProjectOrchestrations, FIXTURE_ROLE_COMMANDS, fixtureVoiceCommands, nextFixtureAgentId, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureQuestion, resolveFixtureVoice, type FixtureState } from "../data/fixture";
+import { createFixtureFleet, docsAgentCards, DOCS_TRUST_ORCHESTRATION, DOCS_TRUST_REMOVED_ROLES, DOCS_TRUST_ROLES, createFixtureStartedAgent, FIXTURE_RESTART_AFTER_MS, restartedFixtureSnapshot, DEFAULT_PROFILES, FIXTURE_APP_VERSION, FIXTURE_DAEMON_VERSION, FIXTURE_UPGRADE_STEP_MS, FIXTURE_DEFAULT_COMMANDS, FIXTURE_EXPERIMENTAL_DECKS, FIXTURE_HOMES, fixtureAgentRegistry, fixtureDirectoryTree, fixtureProjectOrchestrations, FIXTURE_ROLE_COMMANDS, fixtureVoiceCommands, nextFixtureAgentId, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureQuestion, resolveFixtureVoice, type FixtureState } from "../data/fixture";
 import { voicePagesDirectory, voicePagesOrchestrations } from "../data/fixtureCrowded";
 import { actionErrorFrom, LaunchCleanupError, startDaemonErrorFrom } from "./actionError";
 import { PartialSettingsSaveError, partialSettingsSave } from "./settingsError";
@@ -3179,6 +3179,27 @@ class FixtureDeckBridge implements DeckBridge {
    */
   async inboxAction(): Promise<InboxActionResult> {
     return { outcome: "applied" };
+  }
+  /**
+   * PRD #2374 — the `agent-cards` docs scene's card list: served only for
+   * `/?fixture=1&state=docs&experimental=1&cards=1`, so no other fixture
+   * scene shows cards, needs-you bells or row menus. Every other deck and
+   * scene answers as a daemon without cards does.
+   */
+  async agentCards(deckId: string): Promise<AgentCardsSnapshot | null> {
+    const params = new URLSearchParams(window.location.search);
+    if (this.fixtureState !== "docs" || params.get("cards") !== "1" || !fixtureDesktopFeatures().showAgentCards) return null;
+    const cards = docsAgentCards();
+    return cards.deckId === deckId ? cards : null;
+  }
+  /** The preview's cards never change, so there is nothing to push. */
+  async subscribeAgentCards(): Promise<Unsubscribe> {
+    return () => undefined;
+  }
+  /** The preview answers a card action as a daemon that queued it would; nothing changes in the fixture's state. */
+  async invokeCardAction(_target: AgentCardTarget, actionId: string, options: { confirm?: boolean; text?: string; requestId?: string } = {}): Promise<CardActionResult> {
+    if (actionId === "close" || actionId === "close-keep-worktree") return { request_id: options.requestId ?? newCardRequestId(), outcome: "refused", code: "client_side_action", message: "the preview closes no agent" };
+    return { request_id: options.requestId ?? newCardRequestId(), outcome: "sent", message_id: "m-fixture-card" };
   }
   /**
    * The whole fixture fleet, selected deck first (PRD #742 M4). One entry for

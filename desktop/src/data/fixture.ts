@@ -1,5 +1,5 @@
 import type { VoiceCommandDto, VoiceReadingStateDto, VoiceResolvedParamDto, VoiceResultDto, VoiceScreen, VoiceStatusDto, VoiceTranscriptionDto } from "../lib/bridge";
-import type { AgentProfile, AgentSession, AuthoringKind, AgentStatus, AgentTab, AgentTypeId, DaemonOrchestration, DeckDirectoryEntry, DeckSnapshot, EvidenceItem, HostLevel, HostMetricsReport, NewAgentOption, PromptKeys, WorkflowStage } from "../types";
+import type { AgentCardAction, AgentCardEntry, AgentCardsSnapshot, AgentProfile, AgentSession, AuthoringKind, AgentStatus, AgentTab, AgentTypeId, DaemonOrchestration, DeckDirectoryEntry, DeckSnapshot, EvidenceItem, HostLevel, HostMetricsReport, NewAgentOption, PromptKeys, WorkflowStage } from "../types";
 import type { PendingQuestionDto, QuestionResultDto } from "../lib/voiceQuestion";
 import type { ProjectTrustRole } from "../lib/projectTrust";
 import type { SelfCopy, SelfUpgradeApi, SelfUpgradeCheck, SelfUpgradePlan, SelfUpgradeResult } from "../lib/selfUpgrade";
@@ -890,6 +890,89 @@ export const DOCS_PENDING_QUESTION: PendingQuestionDto = {
   // badge reads `QUESTION 12m`.
   raisedAtMs: Date.now() - 12 * 60 * 1000,
 };
+/*
+ * PRD #2374 — the `agent-cards` docs scene: the cards the daemon would send
+ * for the `docs` state's four agents, as one orchestration and one standalone
+ * agent, in the daemon's display order (needs-you first within a group).
+ * Served by the fixture bridge only for `/?fixture=1&state=docs&experimental=1&cards=1`,
+ * so no other fixture scene grows a needs-you bell or a row menu.
+ */
+const DOCS_CARDS_INSTANCE = "docs-cards";
+const DOCS_CARDS_TEAM = { id: "orchestration:docs-checkout", kind: "orchestration", label: "checkout-retry" };
+
+function docsCardAction(id: string, overrides: Partial<AgentCardAction>): AgentCardAction {
+  return {
+    id, label: id, kind: "prompt", prompt: null, text_input: false, confirm: false, confirm_detail: null, icon: null,
+    placement: "card", custom: false, source: "catalog", enabled: true, disabled_reason: null, last_delivery: null, ...overrides,
+  };
+}
+
+function docsDeckActions(): AgentCardAction[] {
+  return [
+    docsCardAction("explain", { label: "Explain", prompt: "Explain in a few sentences what you did and what you need from me, then update your card.", icon: "help-circle" }),
+    docsCardAction("reply", { label: "Reply", text_input: true, source: "deck", placement: "detail", icon: "message-square" }),
+    docsCardAction("open", { label: "Open", kind: "open", source: "deck", placement: "detail", icon: "terminal" }),
+    docsCardAction("close", { label: "Close", kind: "close", confirm: true, source: "deck", placement: "detail", icon: "x" }),
+  ];
+}
+
+function docsCard(agentId: string, name: string, overrides: Partial<AgentCardEntry>): AgentCardEntry {
+  return {
+    key: `docs-pane-${agentId}/${agentId}`, instance_id: DOCS_CARDS_INSTANCE, pane_id: `docs-pane-${agentId}`, agent_id: agentId, agent_type: "claude_code", name,
+    status: "working", needs_you: false, needs_you_reasons: [], group: { id: "standalone", kind: "standalone", label: null }, relations: {},
+    report: null, fields: [], questions: [], actions: docsDeckActions(), primary_action_id: "open",
+    facts: { source: "deck", pull_request: null }, revision: 1, updated_at: "2026-09-01T12:00:00Z", ...overrides,
+  };
+}
+
+const DOCS_REPORTED_AT = "2026-09-01T11:58:00Z";
+
+/** PRD #2374 — the daemon's card list for the `docs` state, as the `agent-cards` docs scene shows it. */
+export function docsAgentCards(): AgentCardsSnapshot {
+  const entries: AgentCardEntry[] = [
+    docsCard("1", "Plan / architecture", {
+      status: "idle", needs_you: true, needs_you_reasons: ["done"], group: DOCS_CARDS_TEAM,
+      relations: { orchestration: { id: "docs-checkout", label: "checkout-retry", role: "planner", is_orchestrator: true } },
+      report: { source: "agent", status: "done", summary: "Retry design is written up and ready for the builder.", published_at: DOCS_REPORTED_AT, revision: 3 },
+      fields: [{ name: "next-step", label: "Next step", description: "What you will do next, or what you are waiting for.", type: "text", icon: "arrow-right", placement: "card", custom: false, source: "agent", value: "Waiting for your go-ahead" }],
+      actions: [docsCardAction("go-ahead", { label: "Go ahead", prompt: "Go ahead.", icon: "play" }), ...docsDeckActions()],
+      primary_action_id: "go-ahead",
+    }),
+    docsCard("3", "Contract review", {
+      status: "working", needs_you: true, needs_you_reasons: ["question"], group: DOCS_CARDS_TEAM,
+      relations: { orchestration: { id: "docs-checkout", label: "checkout-retry", role: "reviewer", is_orchestrator: false } },
+      report: { source: "agent", status: "waiting", summary: "One breaking change in the payment API response.", published_at: DOCS_REPORTED_AT, revision: 2 },
+      fields: [
+        { name: "progress", label: "Progress", description: "What you are doing now, in a few words.", type: "text", icon: "activity", placement: "card", custom: false, source: "agent", value: "Compared v2 and v3 responses" },
+        { name: "pull-request", label: "Pull request", description: "The pull request you opened or are working on.", type: "pull_request", icon: "git-pull-request", placement: "compact", custom: false, source: "agent", value: "#18421" },
+      ],
+      questions: [{ id: "flag", text: "Ship the change behind a version flag?", source: "agent", answered: null, options: [
+        { id: "yes", label: "Yes, behind a flag", action_id: "question/flag/yes" },
+        { id: "no", label: "No, ship it", action_id: "question/flag/no" },
+      ] }],
+      actions: [
+        docsCardAction("question/flag/yes", { label: "Yes, behind a flag", prompt: "Answer to your question \"Ship the change behind a version flag?\": Yes, behind a flag", source: "deck" }),
+        docsCardAction("question/flag/no", { label: "No, ship it", prompt: "Answer to your question \"Ship the change behind a version flag?\": No, ship it", source: "deck" }),
+        ...docsDeckActions(),
+      ],
+      primary_action_id: "question/flag/yes",
+    }),
+    docsCard("2", "Desktop implementation", {
+      agent_type: "codex", status: "working", group: DOCS_CARDS_TEAM,
+      relations: { orchestration: { id: "docs-checkout", label: "checkout-retry", role: "builder", is_orchestrator: false } },
+      report: { source: "agent", status: "working", summary: "Adding the retry button to the checkout view.", published_at: DOCS_REPORTED_AT, revision: 5 },
+      fields: [
+        { name: "progress", label: "Progress", description: "What you are doing now, in a few words.", type: "text", icon: "activity", placement: "card", custom: false, source: "agent", value: "3 of 5 payment states" },
+        { name: "next-step", label: "Next step", description: "What you will do next, or what you are waiting for.", type: "text", icon: "arrow-right", placement: "card", custom: false, source: "agent", value: "Wire it to the payment client" },
+      ],
+    }),
+    docsCard("4", "User-path verification", {
+      agent_type: "opencode", status: "waiting_for_input", needs_you: true, needs_you_reasons: ["native_question"],
+    }),
+  ];
+  return { deckId: FIXTURE_DAEMON_ID, instanceId: DOCS_CARDS_INSTANCE, revision: 12, entries, catalogErrors: [] };
+}
+
 const docsQuestionAgents: AgentSession[] = docsAgents.map((agent) =>
   agent.id === "2"
     ? { ...agent, status: "needs_input", activeTool: "Bash", activeToolDetail: DOCS_QUESTION_COMMAND, transcript: DOCS_QUESTION_TRANSCRIPT, pendingQuestion: DOCS_PENDING_QUESTION }

@@ -63,6 +63,20 @@ desktopScenario("dashboard-filter", async (page) => {
   await expect(page.getByRole("button", { name: "Show all" })).toBeVisible();
 });
 
+// PRD #2374 — desktop-only: the TUI has no cards view. The `docs` state's
+// four agents as the daemon's cards (`docsAgentCards` in the fixture), served
+// only with `cards=1` under the experimental flag, shown through the
+// Dashboard's Table | Cards switch.
+desktopScenario("agent-cards", async (page) => {
+  await page.goto("/?fixture=1&state=docs&experimental=1&cards=1");
+  await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
+  await page.getByTestId("open-overview").click();
+  await page.getByTestId("overview-mode-cards").click();
+  await expect(page.getByTestId("agent-cards-group")).toHaveCount(2);
+  await expect(page.locator("article[data-card-key]")).toHaveCount(4);
+  await expect(page.getByTestId("agent-card-primary").first()).toHaveText("Go ahead");
+});
+
 // PRD #1258 — the same fixed host the TUI `host-metrics` image shows
 // (`HOST_SAMPLE` in `tests/e2e_docs_screenshots.rs`), on the `docs` deck.
 // The host button beside the deck's name, opened: its popover is what the
