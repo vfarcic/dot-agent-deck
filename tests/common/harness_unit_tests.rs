@@ -2843,6 +2843,31 @@ fn opencode_version_parser_reads_both_majors_and_refuses_noise() {
     assert_eq!(parse_opencode_version("ERROR Unrecognized flag"), None);
 }
 
+/// Scenario: Check `DAD_AGENT_BIN` values the way the pre-main pin does: an
+/// absolute path to an existing directory is pinned as given, while a relative
+/// path, a missing directory, a file and a directory inside the checkout are
+/// each refused with a reason naming the variable.
+#[test]
+fn agent_bin_dir_accepts_only_an_absolute_existing_directory() {
+    let root = race_safe_tempdir();
+    assert_eq!(agent_bin_dir(root.path()), Ok(root.path().to_path_buf()));
+    let relative = agent_bin_dir(Path::new("pinned")).unwrap_err();
+    assert!(
+        relative.contains("DAD_AGENT_BIN=pinned is not an absolute path"),
+        "{relative}"
+    );
+    let missing = agent_bin_dir(&root.path().join("absent")).unwrap_err();
+    assert!(missing.contains("is not a directory"), "{missing}");
+    let file = root.path().join("claude");
+    std::fs::write(&file, "").unwrap();
+    let not_dir = agent_bin_dir(&file).unwrap_err();
+    assert!(not_dir.contains("not one executable"), "{not_dir}");
+    // A directory `contain_path` would drop from a deck's PATH is refused, so
+    // the preflight and the pane cannot resolve different agents.
+    let in_checkout = agent_bin_dir(&checkout_root().join("tests")).unwrap_err();
+    assert!(in_checkout.contains("inside the checkout"), "{in_checkout}");
+}
+
 /// Scenario: Resolve the OpenCode test-binary knob against a scratch home and
 /// PATH. `v1` and `v2` name the pinned 1.x and 2.x under the home only once
 /// each file exists, a path names itself, and a bare name is found on PATH;
