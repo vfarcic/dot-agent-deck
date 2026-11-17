@@ -97,7 +97,7 @@ const ZULU = entry("31", "zulu", {
     { name: "progress", label: "Progress", description: "What you are doing now.", type: "text", icon: "activity", placement: "card", custom: false, source: "agent", value: "half way" },
     { name: "details", label: "Details", description: "Anything else.", type: "long_text", icon: null, placement: "detail", custom: false, source: "agent", value: "DETAIL-ONLY-TEXT" },
   ],
-  actions: [action("explain", { label: "Explain", prompt: "Explain what you did." }), action("merge", { label: "Merge it", prompt: LONG_PROMPT }), ...deckActions()],
+  actions: [action("explain", { label: "Explain", prompt: "Explain what you did." }), action("merge", { label: "Merge it", prompt: LONG_PROMPT, prompt_source: "catalog" }), ...deckActions()],
   primary_action_id: "merge",
 });
 /*

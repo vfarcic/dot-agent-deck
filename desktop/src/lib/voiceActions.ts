@@ -603,7 +603,8 @@ export type VoiceActionContext = {
    */
   runCardAction: (target: AgentCardRef, action: { actionId?: string; label?: string; token?: string; review?: boolean }) => string | undefined;
   /** Send `text` as a reply to one card's agent. */
-  replyToAgentCard: (target: AgentCardRef, text: string) => string | undefined;
+  /** Put `text` in the card's reply box for review, or — `sendNow`, the reply box's own Send reply — send it. */
+  replyToAgentCard: (target: AgentCardRef, text: string, sendNow?: boolean) => string | undefined;
   /** The card overlay's confirm step: send the action it is asking about, confirmed. */
   confirmCardAction: () => void;
   /** Open or close one table row's ⋯ menu. */
@@ -1293,8 +1294,8 @@ export const VOICE_ACTIONS = {
     label: "Reply to a card's agent with your own words",
     voice: true,
     needs: ["replyToAgentCard"],
-    run: (context: Pick<VoiceActionContext, "replyToAgentCard"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: AgentCardRef & Pick<VoiceDispatchTarget, "cardReplyText">) => {
-      const refused = target.cardReplyText?.trim() ? context.replyToAgentCard(cardRefOf(target), target.cardReplyText) : CARD_REPLY_UNHEARD;
+    run: (context: Pick<VoiceActionContext, "replyToAgentCard"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: AgentCardRef & Pick<VoiceDispatchTarget, "cardReplyText" | "cardReplySend">) => {
+      const refused = target.cardReplyText?.trim() ? context.replyToAgentCard(cardRefOf(target), target.cardReplyText, target.cardReplySend === true) : CARD_REPLY_UNHEARD;
       if (refused !== undefined) context.reportRefused?.(refused);
     },
   },
@@ -1739,8 +1740,10 @@ export type VoiceDispatchTarget = AgentViewTarget & {
   cardActionToken?: string;
   /** PRD #2374 — open the card at a review step showing the action's exact text instead of sending it (review B8). */
   cardActionReview?: boolean;
-  /** PRD #2374 — the words a `reply_to_agent_card` dispatch sends, the transcript's own. */
+  /** PRD #2374 — the words of a reply: a `reply_to_agent_card` dispatch's (the transcript's own), or the reply box's. */
   cardReplyText?: string;
+  /** PRD #2374 — send the reply now: set only by the reply box's Send reply, which shows the words. A spoken reply opens that box instead. */
+  cardReplySend?: boolean;
   /**
    * The New agent form the utterance was JUDGED against — its deck and chosen
    * directory as declared — or absent when no live form was declared. The

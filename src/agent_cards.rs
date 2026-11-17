@@ -967,6 +967,9 @@ struct Slot {
     /// on. A refresh whose snapshot of the registry was taken before it does
     /// not prune it (review B4).
     epoch: u64,
+    /// How many times this generation has published, a clear included, so
+    /// `report.revision` keeps counting up across a `--clear`.
+    publishes: u64,
 }
 
 impl Slot {
@@ -2025,18 +2028,21 @@ impl CardStore {
 
     /// Store `report` for the generation `agent_id` in `pane_id`, replacing
     /// whatever it published before, and clearing answered questions. The
-    /// deliveries stay: what the user sent outlives the report that offered
-    /// it. The report must already be validated.
+    /// empty report (`card publish --clear`) removes the report, so the card
+    /// reads as if the agent had never published (`report: null`) rather than
+    /// as a fresh Working report. The deliveries stay: what the user sent
+    /// outlives the report that offered it. The report must already be
+    /// validated.
     pub fn publish(&self, pane_id: &str, agent_id: &str, report: AgentReport) {
         let mut inner = self.lock();
         inner.epoch += 1;
         let epoch = inner.epoch;
         let slot = inner.slots.entry(entry_key(pane_id, agent_id)).or_default();
-        let publishes = slot.report.as_ref().map_or(0, |r| r.publishes) + 1;
-        slot.report = Some(StoredReport {
+        slot.publishes += 1;
+        slot.report = (report != AgentReport::default()).then(|| StoredReport {
             report,
             published_at: Utc::now(),
-            publishes,
+            publishes: slot.publishes,
         });
         slot.answered.clear();
         slot.epoch = epoch;
@@ -2165,16 +2171,34 @@ impl CardStore {
     }
 }
 
-/// Map an inbox message state to a card delivery state.
-fn delivery_state(summary: &crate::inbox::MessageSummary) -> (String, Option<String>) {
+/// Map an inbox message state to a card delivery state. `attention` is what
+/// the inbox asks the user to decide about that message, if anything
+/// (`InboxCardNotices.attention`, joined by message id): a message still in
+/// flight that the inbox flags is `uncertain`, with the flag as its detail
+/// (none for the plain `uncertain` flag, which the state already says), so
+/// the card never shows a delivery the inbox warns about as merely queued.
+fn delivery_state(
+    state: crate::inbox::StateName,
+    undeliverable_reason: Option<crate::inbox::UndeliverableReason>,
+    attention: Option<crate::inbox_display::AttentionKind>,
+) -> (String, Option<String>) {
     use crate::inbox::StateName;
-    match summary.state {
-        StateName::Queued | StateName::Fetched | StateName::Claimed => ("queued".into(), None),
+    use crate::inbox_display::AttentionKind;
+    match state {
+        StateName::Queued | StateName::Fetched | StateName::Claimed => match attention {
+            None => ("queued".into(), None),
+            Some(AttentionKind::Uncertain) => ("uncertain".into(), None),
+            Some(kind) => (
+                "uncertain".into(),
+                serde_json::to_value(kind)
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_string)),
+            ),
+        },
         StateName::Acknowledged => ("delivered".into(), None),
         StateName::Undeliverable => (
             "not_delivered".into(),
-            summary
-                .undeliverable_reason
+            undeliverable_reason
                 .and_then(|r| serde_json::to_value(r).ok())
                 .and_then(|v| v.as_str().map(str::to_string)),
         ),
@@ -2246,21 +2270,34 @@ async fn gather(
 }
 
 /// The inbox state of every message a card recorded as delivered, by
-/// message id.
+/// message id, with the inbox's attention flags joined in.
 fn delivery_states(registry: &Arc<AgentPtyRegistry>) -> HashMap<String, (String, Option<String>)> {
-    let wanted: HashSet<String> = {
+    let wanted: HashSet<(String, String)> = {
         let inner = registry.agent_cards().lock();
         inner
             .slots
             .iter()
             .filter(|(_, s)| !s.deliveries.is_empty())
-            .filter_map(|(k, _)| split_key(k).map(|(p, _)| p.to_string()))
+            .filter_map(|(k, _)| split_key(k).map(|(p, a)| (p.to_string(), a.to_string())))
             .collect()
     };
+    let inbox = registry.inbox();
+    let mut attention = HashMap::new();
+    for (pane, agent) in &wanted {
+        for item in inbox.summary(pane, agent).notices.attention {
+            attention.insert(item.message_id, item.kind);
+        }
+    }
+    let panes: HashSet<&String> = wanted.iter().map(|(p, _)| p).collect();
     let mut states = HashMap::new();
-    for pane in wanted {
-        for summary in registry.inbox().list(&pane) {
-            states.insert(summary.id.to_string(), delivery_state(&summary));
+    for pane in panes {
+        for summary in inbox.list(pane) {
+            let id = summary.id.to_string();
+            let flag = attention.get(&id).copied();
+            states.insert(
+                id,
+                delivery_state(summary.state, summary.undeliverable_reason, flag),
+            );
         }
     }
     states
@@ -3455,6 +3492,88 @@ mod tests {
         let e = project(&store);
         assert!(e.action("go").is_none());
         assert_eq!(e.recent_deliveries[0].message_id, "m-1");
+    }
+
+    /// Greptile (PRD #2374 review): a card delivery the inbox flags for the
+    /// user reads `uncertain`, with the flag as its detail, not `queued`; a
+    /// settled message keeps its final state whatever was flagged earlier.
+    #[test]
+    fn a_delivery_the_inbox_flags_is_uncertain_not_queued() {
+        use crate::inbox::{StateName, UndeliverableReason};
+        use crate::inbox_display::AttentionKind;
+        let s = |state: &str, detail: Option<&str>| (state.to_string(), detail.map(str::to_string));
+        for state in [StateName::Queued, StateName::Fetched, StateName::Claimed] {
+            assert_eq!(delivery_state(state, None, None), s("queued", None));
+            assert_eq!(
+                delivery_state(state, None, Some(AttentionKind::Uncertain)),
+                s("uncertain", None)
+            );
+            assert_eq!(
+                delivery_state(state, None, Some(AttentionKind::OutOfAttempts)),
+                s("uncertain", Some("out_of_attempts"))
+            );
+            assert_eq!(
+                delivery_state(state, None, Some(AttentionKind::NotStarted)),
+                s("uncertain", Some("not_started"))
+            );
+            assert_eq!(
+                delivery_state(state, None, Some(AttentionKind::HeldLong)),
+                s("uncertain", Some("held_long"))
+            );
+        }
+        assert_eq!(
+            delivery_state(
+                StateName::Acknowledged,
+                None,
+                Some(AttentionKind::Uncertain)
+            ),
+            s("delivered", None)
+        );
+        assert_eq!(
+            delivery_state(
+                StateName::Undeliverable,
+                Some(UndeliverableReason::AgentExited),
+                Some(AttentionKind::OutOfAttempts)
+            ),
+            s("not_delivered", Some("agent_exited"))
+        );
+    }
+
+    /// Qodo (PRD #2374 review): `card publish --clear` (the empty report)
+    /// returns the card to `report: null`, as if the agent had never
+    /// published, rather than a fresh Working report; the next publish
+    /// keeps counting `report.revision` up.
+    #[test]
+    fn a_cleared_report_reads_as_never_published() {
+        let catalog = resolve(None);
+        let store = CardStore::default();
+        let project = |store: &CardStore| {
+            let inner = store.lock();
+            one(
+                &project_all(&[facts("1", "p1")], &inner.slots, &catalog, &[], "i"),
+                "p1/1",
+            )
+        };
+        let never = project(&store);
+        assert!(never.report.is_none());
+        store.publish(
+            "p1",
+            "1",
+            report(r#"{"status": "waiting", "summary": "Need a decision."}"#),
+        );
+        let published = project(&store);
+        assert_eq!(published.report.as_ref().unwrap().status, "waiting");
+        assert!(published.needs_you);
+
+        store.publish("p1", "1", AgentReport::default());
+        let cleared = project(&store);
+        assert!(cleared.report.is_none(), "{:?}", cleared.report);
+        assert_eq!(cleared.needs_you, never.needs_you);
+        assert_eq!(cleared.needs_you_reasons, never.needs_you_reasons);
+        assert_eq!(cleared.status, never.status);
+
+        store.publish("p1", "1", report(r#"{"summary": "Back."}"#));
+        assert_eq!(project(&store).report.unwrap().revision, 3);
     }
 
     /// Audit F5: an entry keeps a bounded number and size of deliveries,

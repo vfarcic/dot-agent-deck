@@ -1,6 +1,6 @@
 import { BellRing } from "lucide-react";
 
-import { actionLabel, cardStatusLabel, deliverySentence, disabledReasonSentence, exactTextSegments, exactTextString, hasMarkers, MARKER_CLOSE, MARKER_OPEN, markerTitle, resultSentence, type CardResults, fieldValueText, needsYouSentence, placedCardKey, primaryAction, promptPreview, type PlacedCard } from "../lib/agentCards";
+import { actionLabel, cardStatusLabel, deliverySentence, disabledReasonSentence, exactTextSegments, exactTextString, hasMarkers, MARKER_CLOSE, MARKER_OPEN, markerTitle, resultSentence, type CardResults, fieldValueText, needsYouSentence, placedCardKey, primaryAction, primaryNeedsReview, promptPreview, type PlacedCard } from "../lib/agentCards";
 import { DISPLAY_LIMITS, displayIdentity, displayText, displayTitle, domIdentity } from "../lib/displayText";
 import { VOICE_ACTIONS, type VoiceActionContext } from "../lib/voiceActions";
 
@@ -104,7 +104,7 @@ export function AgentCard({ card, controls, results }: { card: PlacedCard; contr
             data-testid="agent-card-primary"
             disabled={!primary.enabled}
             title={primaryTitle}
-            onClick={() => VOICE_ACTIONS.runCardAction.run(controls, { ...cardRef(card), cardActionId: primary.id, cardActionToken: primary.token })}
+            onClick={() => VOICE_ACTIONS.runCardAction.run(controls, { ...cardRef(card), cardActionId: primary.id, cardActionToken: primary.token, ...(primaryNeedsReview(primary) ? { cardActionReview: true } : {}) })}
           >{displayText(actionLabel(entry, primary), DISPLAY_LIMITS.name)}</button>
           {primary.source === "agent" && <span data-testid="agent-card-primary-source"><SourceBadge source="agent" /></span>}
           {primary.prompt && <small className="agent-card-prompt" title={exactTextString(primary.prompt)}>{promptPreview(primary.prompt)}</small>}

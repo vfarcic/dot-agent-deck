@@ -1502,16 +1502,13 @@ fn actions_004_a_card_from_a_replaced_daemon_acts_on_nothing() {
 /// (`DOT_AGENT_DECK_TEST_CARD_ACTION_PAUSE_DIR`).
 const CARD_ACTION_SEAMS: &str = "card-action-seams";
 
-/// Wait until `ok` holds, or fail naming `what`.
-fn wait_until(what: &str, mut ok: impl FnMut() -> bool) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    while !ok() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "timed out waiting for {what}"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
+/// Wait until `ok` holds, or fail naming `what`. The polling itself is the
+/// harness's (`common::wait_until`, Decision 21).
+fn wait_until(what: &str, ok: impl Fn() -> bool) {
+    assert!(
+        common::wait_until(common::load_scaled(Duration::from_secs(20)), ok),
+        "timed out waiting for {what}"
+    );
 }
 
 /// Scenario: One client sends a card action and the daemon holds that
@@ -1558,9 +1555,7 @@ fn actions_005_overlapping_repeats_of_one_request_post_once() {
         wait_until("the first invocation to be held after its claim", || {
             marker("started").exists()
         });
-        for _ in 0..5 {
-            handles.push(send(request.clone()));
-        }
+        handles.extend(std::iter::repeat_with(|| send(request.clone())).take(5));
         wait_until("five repeats waiting on the running request", || {
             joined() == 5
         });

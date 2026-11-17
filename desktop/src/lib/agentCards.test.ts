@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AgentCardEntry, AgentCardsSnapshot } from "../types";
-import { acceptCardsSnapshot, exactTextSegments, exactTextString, placedCardKey, promptPreview, pruneCardResults, reconcileCards, type CardResults, type PlacedCard } from "./agentCards";
+import { acceptCardsSnapshot, deliverySentence, exactTextSegments, exactTextString, placedCardKey, promptPreview, pruneCardResults, reconcileCards, type CardResults, type PlacedCard } from "./agentCards";
 
 /*
  * PRD #2374 review round 1 — the pure halves of the cards' safety fixes: the
@@ -96,5 +96,16 @@ describe("pruneCardResults (F5)", () => {
     const pruned = pruneCardResults(results, [kept]);
     expect(pruned).toEqual({ [placedCardKey(kept)]: { t1: { outcome: "pending" } } });
     expect(pruneCardResults(pruned, [kept])).toBe(pruned);
+  });
+});
+
+describe("deliverySentence (PRD #2374 review: uncertain deliveries)", () => {
+  it("says a delivery the inbox flags is uncertain, and why, in words", () => {
+    expect(deliverySentence({ state: "queued", detail: null })).toBe("Queued for the agent");
+    expect(deliverySentence({ state: "uncertain", detail: null })).toBe("Delivery uncertain");
+    expect(deliverySentence({ state: "uncertain", detail: "out_of_attempts" })).toBe("Delivery uncertain (the deck sent it as many times as it allows; see the agent's inbox)");
+    expect(deliverySentence({ state: "uncertain", detail: "not_started" })).toBe("Delivery uncertain (the agent has not started on it; see the agent's inbox)");
+    expect(deliverySentence({ state: "not_delivered", detail: "agent_exited" })).toBe("Not delivered (the agent exited)");
+    expect(deliverySentence({ state: "uncertain", detail: "some_new_flag" })).toBe("Delivery uncertain (some new flag)");
   });
 });

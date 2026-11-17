@@ -191,9 +191,26 @@ const DELIVERY_STATE: Record<string, string> = {
   not_delivered: "Not delivered",
 };
 
+/**
+ * Why a delivery is uncertain or was not delivered, in words: the inbox's
+ * attention flag or undeliverable reason, as the daemon names it. A detail
+ * this build does not know is shown with its underscores as spaces.
+ */
+const DELIVERY_DETAIL: Record<string, string> = {
+  out_of_attempts: "the deck sent it as many times as it allows; see the agent's inbox",
+  not_started: "the agent has not started on it; see the agent's inbox",
+  held_long: "the agent has had it for an hour without confirming it",
+  agent_exited: "the agent exited",
+  max_deliver: "out of attempts",
+  superseded: "a newer message replaced it",
+  inbox_shut: "the deck was shutting down",
+  cancelled: "cancelled",
+};
+
 export function deliverySentence(delivery: Pick<NonNullable<AgentCardAction["last_delivery"]>, "state" | "detail">): string {
   const state = DELIVERY_STATE[delivery.state] ?? delivery.state;
-  return delivery.detail ? `${state} (${delivery.detail.replace(/_/g, " ")})` : state;
+  if (!delivery.detail) return state;
+  return `${state} (${DELIVERY_DETAIL[delivery.detail] ?? delivery.detail.replace(/_/g, " ")})`;
 }
 
 /** When a delivery happened, as a local clock time; `—` for a time that does not parse. */
@@ -260,13 +277,21 @@ export function actionLabel(entry: AgentCardEntry, action: AgentCardAction): str
  * out, never cut.
  */
 export function promptPreview(prompt: string, max = 60): string {
+  return promptPreviewOf(prompt, max).text;
+}
+
+/**
+ * {@link promptPreview}, and whether it is the whole prompt (every character
+ * shown, as itself or as a marker) or was cut short.
+ */
+export function promptPreviewOf(prompt: string, max = 60): { text: string; whole: boolean } {
   const pieces: string[] = [];
   for (const segment of exactTextSegments(prompt)) {
     if (segment.escaped) pieces.push(segment.shown);
     else for (const char of segment.raw) pieces.push(char === "\n" ? `${MARKER_OPEN}\u21b5${MARKER_CLOSE}` : char);
   }
   const length = (parts: string[]) => parts.reduce((total, part) => total + Array.from(part).length, 0);
-  if (length(pieces) <= max) return pieces.join("");
+  if (length(pieces) <= max) return { text: pieces.join(""), whole: true };
   const kept: string[] = [];
   let used = 0;
   for (const piece of pieces) {
@@ -275,7 +300,31 @@ export function promptPreview(prompt: string, max = 60): string {
     kept.push(piece);
     used += size;
   }
-  return `${kept.join("")}…`;
+  return { text: `${kept.join("")}…`, whole: false };
+}
+
+/**
+ * Who may have written a prompt that is sent without the user reading it
+ * first: only the catalog, the deck's defaults or the user's own (PRD #2374).
+ * The daemon says which (`prompt_source`); anything else — the agent's text,
+ * the answer the deck composes by quoting the agent's question (audit A1),
+ * an absent value — is shown for review first.
+ */
+const SENDABLE_UNREAD: ReadonlySet<string> = new Set(["catalog"]);
+
+/** Whether `action`'s prompt may be sent by a control that did not show all of it. */
+export function sendableUnread(action: Pick<AgentCardAction, "prompt_source">): boolean {
+  return SENDABLE_UNREAD.has(action.prompt_source ?? "");
+}
+
+/**
+ * Whether the compact card's primary button must open the review step rather
+ * than send (PRD #2374 review): its prompt is not the catalog's and the card's
+ * short preview does not show all of it.
+ */
+export function primaryNeedsReview(action: Pick<AgentCardAction, "prompt" | "prompt_source">): boolean {
+  if (action.prompt === null || action.prompt === undefined) return false;
+  return !sendableUnread(action) && !promptPreviewOf(action.prompt).whole;
 }
 
 /**
@@ -376,7 +425,7 @@ export function exactTextString(value: string): string {
  * confirms is what is sent: if the agent changes the action meanwhile, the
  * step says so and sends nothing until the new text was reviewed.
  */
-export type CardOverlayStep = { kind: "confirm"; actionId: string; token: string } | { kind: "reply" };
+export type CardOverlayStep = { kind: "confirm"; actionId: string; token: string } | { kind: "reply"; /** Words to put in the reply box when the step opens (a spoken reply). */ text?: string };
 
 /**
  * The answer to the last press of each action definition on one card, by the

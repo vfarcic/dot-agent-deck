@@ -923,7 +923,8 @@ enum CardAction {
         /// --file.
         #[arg(long = "action", value_name = "NAME", conflicts_with = "clear")]
         actions: Vec<String>,
-        /// Publish an empty card.
+        /// Remove your report: the card shows only what the deck knows, as
+        /// before you first published.
         #[arg(long)]
         clear: bool,
         /// Print the card's key and revision as JSON.

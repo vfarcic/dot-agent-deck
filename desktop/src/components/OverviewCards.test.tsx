@@ -2,6 +2,7 @@ import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureFleet, createFixtureStartedAgent, FIXTURE_DAEMON_ID } from "../data/fixture";
 import { OVERVIEW_MODE_STORAGE_KEY } from "../lib/agentCards";
+import { clearDashboardFilter, setDashboardFilter } from "../lib/dashboardFilter";
 import { DEFAULT_DESKTOP_FEATURES, type AgentCardAction, type AgentCardEntry, type AgentCardsSnapshot, type DeckFleet, type DeckRuntimeState } from "../types";
 import { AgentOverview, agentKey } from "./AgentOverview";
 
@@ -124,7 +125,10 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
 }
 
 beforeEach(() => window.localStorage.clear());
-afterEach(() => window.localStorage.clear());
+afterEach(() => {
+  window.localStorage.clear();
+  act(() => setDashboardFilter(clearDashboardFilter()));
+});
 
 describe("the dashboard's cards (PRD #2374)", () => {
   it("switches to cards, remembers it, and shows the daemon's groups in its order", () => {
@@ -205,6 +209,65 @@ describe("the dashboard's cards (PRD #2374)", () => {
     fireEvent.keyDown(screen.getByTestId("agent-card-overlay"), { key: "Escape" });
     fireEvent.click(coderRow.querySelector("td:last-child") ?? coderRow);
     expect(navigate).toHaveBeenCalledWith(expect.objectContaining({ kind: "agent", agentId: "7" }));
+  });
+
+  /* PRD #2374 review (Greptile P1): Open closes the card, so the pane it
+     opens is not hidden behind the overlay. */
+  it("closes the card when its Open action opens the agent", () => {
+    const navigate = vi.fn();
+    window.localStorage.setItem(OVERVIEW_MODE_STORAGE_KEY, "cards");
+    render(<AgentOverview runtime={runtime()} onNavigate={navigate} />);
+    fireEvent.click(screen.getAllByTestId("agent-card-show")[0]);
+    fireEvent.click(screen.getByTestId("agent-card-action-open"));
+    expect(navigate).toHaveBeenCalledWith(expect.objectContaining({ kind: "agent", agentId: "7" }));
+    expect(screen.queryByTestId("agent-card-overlay")).toBeNull();
+  });
+
+  /* PRD #2374 review (Greptile P2): the dashboard filter shows the cards of
+     the agents it matches, in the daemon's order, and nothing else. */
+  it("applies the dashboard filter to the cards", () => {
+    window.localStorage.setItem(OVERVIEW_MODE_STORAGE_KEY, "cards");
+    render(<AgentOverview runtime={runtime()} onNavigate={vi.fn()} />);
+    const shown = () => screen.getAllByTestId("agent-card-show").map((button) => button.textContent);
+    expect(shown()).toEqual(["coder", "tester", "lone"]);
+    act(() => setDashboardFilter({ ...clearDashboardFilter(), text: "tester" }));
+    expect(shown()).toEqual(["tester"]);
+    act(() => setDashboardFilter({ ...clearDashboardFilter(), text: "o" }));
+    expect(shown()).toEqual(["coder", "lone"]);
+    act(() => setDashboardFilter(clearDashboardFilter()));
+    expect(shown()).toEqual(["coder", "tester", "lone"]);
+  });
+
+  /* PRD #2374 review (Qodo): the compact card shows only the start of a
+     prompt. An agent-written one it cannot show whole opens the review step;
+     one it shows whole, or the catalog's, is sent by the button. */
+  it("reviews an agent-written primary the card cannot show whole, and sends one it can", async () => {
+    const long = "Use the release branch. Then also delete every stale branch on the remote, and force-push.";
+    const agentWritten = (prompt: string, promptSource: string) => entry("7", "coder", {
+      needs_you: true,
+      needs_you_reasons: ["question"],
+      actions: [action("question/base/rel", { label: "release", prompt, source: "agent", prompt_source: promptSource }), ...DECK_ACTIONS],
+      primary_action_id: "question/base/rel",
+    });
+    window.localStorage.setItem(OVERVIEW_MODE_STORAGE_KEY, "cards");
+
+    const reviewed = runtime({ agentCards: { [FIXTURE_DAEMON_ID]: snapshot([agentWritten(long, "agent")]) } });
+    const view = render(<AgentOverview runtime={reviewed} onNavigate={vi.fn()} />);
+    await act(async () => { fireEvent.click(screen.getByTestId("agent-card-primary")); });
+    expect(reviewed.invokeCardAction).not.toHaveBeenCalled();
+    expect(screen.getByTestId("agent-card-confirm").textContent).toContain(long);
+    await act(async () => { fireEvent.click(screen.getByTestId("agent-card-confirm-send")); });
+    expect(reviewed.invokeCardAction).toHaveBeenCalledWith(expect.objectContaining({ agentId: "7" }), "question/base/rel", expect.objectContaining({ actionToken: "tok-question/base/rel" }));
+    view.unmount();
+
+    for (const [prompt, source] of [["Use the release branch.", "agent"], [long, "catalog"]]) {
+      const sent = runtime({ agentCards: { [FIXTURE_DAEMON_ID]: snapshot([agentWritten(prompt, source)]) } });
+      const shown = render(<AgentOverview runtime={sent} onNavigate={vi.fn()} />);
+      await act(async () => { fireEvent.click(screen.getByTestId("agent-card-primary")); });
+      expect(sent.invokeCardAction).toHaveBeenCalledTimes(1);
+      expect(screen.queryByTestId("agent-card-confirm")).toBeNull();
+      shown.unmount();
+    }
   });
 
   it("shows none of it with the flag off", () => {

@@ -37,6 +37,7 @@ import { AGENT_GONE_AFTER_RESTART } from "../lib/agentIdentity";
 import { deckAttentionText } from "../lib/inboxWords";
 import { DeckAttention } from "./DeckAttention";
 import { useAgentCardsView, type AgentCardsView } from "../hooks/useAgentCardsView";
+import type { PlacedCard } from "../lib/agentCards";
 import { OverviewModeSwitch } from "./OverviewModeSwitch";
 import { AgentCardsGrid } from "./AgentCardsGrid";
 import { AgentCardOverlay } from "./AgentCardOverlay";
@@ -1059,7 +1060,8 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   const decks = useMemo(() => fleet.map((deck, at): FleetDeck => {
     const deckAgents = deck.agents.map(toOverviewAgent);
     const groups = groupAgents(deckAgents);
-    const shown = filtering ? groupAgents(filterDashboardAgents(deckAgents, filter, overviewFilterFacts)) : groups;
+    const matchingAgents = filtering ? filterDashboardAgents(deckAgents, filter, overviewFilterFacts) : deckAgents;
+    const shown = filtering ? groupAgents(matchingAgents) : groups;
     return {
       key: fleetMemberKey(deck.connection.deckId, at),
       snapshot: deck,
@@ -1072,6 +1074,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
         return matching ? { group: matching, matching: true } : { group, matching: false };
       }),
       shownCount: shown.reduce((total, group) => total + group.agents.length, 0),
+      matchingAgents,
       counts: countByStatus(deckAgents),
       connected: deck.connection.status === "connected",
     };
@@ -1861,7 +1864,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
               decks={decks.flatMap((deck) => {
                 const deckId = deck.snapshot.connection.deckId;
                 return deck.connected && deckId !== undefined && cards.decksWithCards.has(deckId)
-                  ? [{ deckId, name: deckName(deck.snapshot.connection), cards: cards.placed.filter((card) => card.deckId === deckId) }]
+                  ? [{ deckId, name: deckName(deck.snapshot.connection), cards: cards.placed.filter((card) => card.deckId === deckId && (!filtering || cardMatchesFilter(card, deck.matchingAgents))) }]
                   : [];
               })}
               needsYouOnly={cards.needsYouOnly}
@@ -1963,8 +1966,21 @@ interface FleetDeck {
   sections: OverviewSection[];
   /** How many of {@link agents} the filter shows. */
   shownCount: number;
+  /** The agents the filter shows (all of {@link agents} while none is set): the Cards view shows their cards. */
+  matchingAgents: OverviewAgent[];
   counts: { status: AgentStatus; count: number }[];
   connected: boolean;
+}
+
+/**
+ * Whether the dashboard filter (issue #1496) shows `card`: its agent is one of
+ * the deck's `matching` agents. The filter is applied to the cards as it is to
+ * the table rows, on the same facts; it changes which cards are shown, never
+ * their order or what they say (PRD #2374 review).
+ */
+function cardMatchesFilter(card: PlacedCard, matching: readonly OverviewAgent[]): boolean {
+  return matching.some((agent) => agent.id === card.entry.agent_id
+    && (agent.incarnation === undefined || card.entry.instance_id === "" || card.entry.instance_id === agent.incarnation));
 }
 
 /** One group as the filter leaves it: its matching agents, or a line saying none match. */

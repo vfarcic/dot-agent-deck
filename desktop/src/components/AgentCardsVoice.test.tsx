@@ -291,8 +291,8 @@ describe("desktop/agent-cards/008 — the cards by voice (PRD #2374)", () => {
     expect(invokeCardAction).toHaveBeenCalledWith(expect.objectContaining({ agentId }), "question/plan/ok", expect.objectContaining({ actionToken: "tok-question/plan/ok" }));
   });
 
-  /// Scenario: say "reply to the voice card agent use the release branch". The card's `reply` action is sent with the user's own words as its text.
-  it("desktop/agent-cards/008: a spoken reply sends the user's words", async () => {
+  /// Scenario: say "reply to the voice card agent use the release branch". The card opens with the words in its reply box and nothing is sent; the user changes them and presses Send reply, and the card's `reply` action is sent with exactly the words in the box.
+  it("desktop/agent-cards/008: a spoken reply is put in the reply box for review, and sent only by Send reply", async () => {
     const agentId = createFixtureSnapshot("connected").agents[0].id;
     const transcript = "reply to the voice card agent use the release branch";
     const { invokeCardAction, resolveVoice } = renderSpoken({
@@ -301,11 +301,17 @@ describe("desktop/agent-cards/008 — the cards by voice (PRD #2374)", () => {
         { name: "agent", kind: "agent_ref", spoken: "the voice card agent", value: agentId, label: "voice-card-agent" },
         { name: "reply", kind: "reply_text", spoken: "use the release branch", value: "use the release branch", label: "use the release branch" },
       ],
-      sentence: "Replied to voice-card-agent.",
+      sentence: "Your reply to voice-card-agent is in its card: press Send reply to send it.",
     } as VoiceResultDto["outcome"]);
     await speak(resolveVoice);
-    await waitFor(() => expect(invokeCardAction).toHaveBeenCalledTimes(1));
-    expect(invokeCardAction).toHaveBeenCalledWith(expect.objectContaining({ agentId }), "reply", expect.objectContaining({ text: "use the release branch" }));
+    const box = await waitFor(() => screen.getByTestId("agent-card-reply-text") as HTMLTextAreaElement);
+    await waitFor(() => expect(box.value).toBe("use the release branch"));
+    expect(invokeCardAction).not.toHaveBeenCalled();
     expect(within(document.body).queryByText(/Say what to reply/)).toBeNull();
+    fireEvent.change(box, { target: { value: "use the release branch, not main" } });
+    expect(invokeCardAction).not.toHaveBeenCalled();
+    await act(async () => { fireEvent.click(screen.getByTestId("agent-card-reply-send")); });
+    await waitFor(() => expect(invokeCardAction).toHaveBeenCalledTimes(1));
+    expect(invokeCardAction).toHaveBeenCalledWith(expect.objectContaining({ agentId }), "reply", expect.objectContaining({ text: "use the release branch, not main" }));
   });
 });

@@ -606,6 +606,145 @@ fn merge<T>(base: &mut Vec<T>, user: Vec<T>, name_of: impl Fn(&T) -> &str) {
     }
 }
 
+/// The `[catalog]` tables of a user config that is not valid TOML as a whole:
+/// every line from a table header whose first key is `catalog`
+/// (`[catalog]`, `[[catalog.fields]]`, `[catalog.x]`, …) up to the next header
+/// whose first key is not, so a broken setting in another table does not hide
+/// the catalog. `None` when the file has no such header. Headers are
+/// recognised only outside multi-line strings and multi-line arrays, so a
+/// prompt or a list that holds a `[line]` does not end a table early. A
+/// `catalog` written as root-level dotted keys or an inline table is not
+/// found here; the caller then reports the file and applies the defaults.
+fn catalog_sections(raw: &str) -> Option<String> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Multi {
+        None,
+        Basic,
+        Literal,
+    }
+    let mut multi = Multi::None;
+    let mut depth: i32 = 0;
+    let mut in_catalog = false;
+    let mut found = false;
+    let mut out = String::new();
+    for line in raw.lines() {
+        let trimmed = line.trim_start();
+        // A bare-key header (`[catalog]`) cannot be an array element, so it
+        // also ends an array left open by a typo above it.
+        if multi == Multi::None
+            && trimmed.starts_with('[')
+            && let Some((first, quoted)) = header_first_key(trimmed)
+            && (depth == 0 || !(quoted || is_value_word(&first)))
+        {
+            depth = 0;
+            in_catalog = first == "catalog";
+            found |= in_catalog;
+            if in_catalog {
+                out.push_str(line);
+                out.push('\n');
+            }
+            continue;
+        }
+        // Track multi-line strings and array depth through a value line.
+        let chars: Vec<char> = line.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            let rest = &chars[i..];
+            match multi {
+                Multi::Basic => {
+                    if rest[0] == '\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if rest.starts_with(&['"', '"', '"']) {
+                        multi = Multi::None;
+                        i += 3;
+                        continue;
+                    }
+                }
+                Multi::Literal => {
+                    if rest.starts_with(&['\'', '\'', '\'']) {
+                        multi = Multi::None;
+                        i += 3;
+                        continue;
+                    }
+                }
+                Multi::None => match rest[0] {
+                    '#' => break,
+                    '[' => depth += 1,
+                    ']' => depth = (depth - 1).max(0),
+                    '"' if rest.starts_with(&['"', '"', '"']) => {
+                        multi = Multi::Basic;
+                        i += 3;
+                        continue;
+                    }
+                    '\'' if rest.starts_with(&['\'', '\'', '\'']) => {
+                        multi = Multi::Literal;
+                        i += 3;
+                        continue;
+                    }
+                    '"' => {
+                        i += 1;
+                        while i < chars.len() && chars[i] != '"' {
+                            i += if chars[i] == '\\' { 2 } else { 1 };
+                        }
+                    }
+                    '\'' => {
+                        i += 1;
+                        while i < chars.len() && chars[i] != '\'' {
+                            i += 1;
+                        }
+                    }
+                    _ => {}
+                },
+            }
+            i += 1;
+        }
+        if in_catalog {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    found.then_some(out)
+}
+
+/// Whether a bare word in brackets could be an array element rather than a
+/// key: a number or a boolean.
+fn is_value_word(word: &str) -> bool {
+    matches!(word, "true" | "false" | "inf" | "nan")
+        || word
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '_' || c == '-')
+}
+
+/// The first dotted key of a table header line (`[a.b]` / `[[a.b]]`, with an
+/// optional trailing comment), unquoted, and whether it was quoted; `None`
+/// when the line is not a header.
+fn header_first_key(line: &str) -> Option<(String, bool)> {
+    let line = line.trim();
+    let (open, close) = if line.starts_with("[[") {
+        ("[[", "]]")
+    } else {
+        ("[", "]")
+    };
+    let inner_and_rest = &line[open.len()..];
+    let end = inner_and_rest.find(close)?;
+    let after = inner_and_rest[end + close.len()..].trim_start();
+    if !(after.is_empty() || after.starts_with('#')) {
+        return None;
+    }
+    let inner = inner_and_rest[..end].trim();
+    let (first, quoted) = match inner.chars().next()? {
+        quote @ ('"' | '\'') => {
+            let body = &inner[1..];
+            (body[..body.find(quote)?].to_string(), true)
+        }
+        _ => (inner.split('.').next()?.trim().to_string(), false),
+    };
+    let bare = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+    (quoted || (!first.is_empty() && first.chars().all(bare))).then_some((first, quoted))
+}
+
 /// Resolve the catalog from the user config's raw TOML (`None`: no file).
 ///
 /// Start from the defaults; apply `remove` (a name matching no default is an
@@ -622,11 +761,25 @@ pub fn resolve(user_config_toml: Option<&str>) -> ResolvedCatalog {
         Err(error) => {
             let first_line = error.to_string();
             let first_line = first_line.lines().next().unwrap_or_default().to_string();
-            resolved.errors.push(format!(
-                "catalog: the user config could not be read as TOML, so the deck defaults apply: {}",
-                truncate_chars(&first_line, 200)
-            ));
-            return resolved;
+            let first_line = truncate_chars(&first_line, 200);
+            // A typo elsewhere in the file need not cost the user their
+            // catalog: read the `[catalog…]` tables on their own. Either way
+            // the broken file is reported, so nothing here is silent.
+            match catalog_sections(raw).and_then(|text| toml::from_str::<toml::Table>(&text).ok()) {
+                Some(doc) => {
+                    resolved.errors.push(format!(
+                        "catalog: the user config is not valid TOML ({first_line}); its [catalog] \
+                         tables were read on their own and apply, but fix the file"
+                    ));
+                    doc
+                }
+                None => {
+                    resolved.errors.push(format!(
+                        "catalog: the user config could not be read as TOML, so the deck defaults apply: {first_line}"
+                    ));
+                    return resolved;
+                }
+            }
         }
     };
     let Some(catalog) = document.get("catalog") else {
@@ -953,6 +1106,75 @@ prompt = "p"
         assert_eq!(c.errors.len(), 10, "{joined}");
         // The one valid entry applied, as its first spelling.
         assert_eq!(c.field("ok").unwrap().field_type, FieldType::Number);
+        assert_eq!(names_a(&c), ["go-ahead", "merge", "explain"]);
+    }
+
+    /// PRD #2374 (review finding): a syntax error in another table does not
+    /// hide the catalog. Its `[catalog]` tables are read on their own and
+    /// apply, and the broken file is still reported as a catalog error, so the
+    /// result is never silently different from what the user wrote.
+    #[test]
+    fn a_typo_elsewhere_in_the_config_keeps_the_catalog_and_says_so() {
+        let config = "\
+default_command = \"claude
+[bell]
+enabled = tru
+list = [1, 2
+[catalog]
+remove = [
+  \"merge\", # gone
+]
+
+[[catalog.fields]]
+name = \"risk\"
+description = \"How risky the change is.\"
+type = \"text\"
+
+[[catalog.actions]]
+name = \"ship\"
+description = \"Offer when ready.\"
+prompt = \"\"\"Ship it.
+[not a header]
+Then update your card.\"\"\"
+
+[doorbell]
+claude = nope
+
+[[catalog.actions]]
+name = \"hold\"
+description = 'Offer when it should wait.'
+prompt = '''Hold.
+[[also not a header]]'''
+";
+        let c = resolve(Some(config));
+        assert_eq!(c.errors.len(), 1, "{:?}", c.errors);
+        assert!(
+            c.errors[0].starts_with("catalog: the user config is not valid TOML (")
+                && c.errors[0].ends_with(
+                    "its [catalog] tables were read on their own and apply, but fix the file"
+                ),
+            "{:?}",
+            c.errors
+        );
+        assert_eq!(
+            c.field("risk").unwrap().description,
+            "How risky the change is."
+        );
+        assert_eq!(names_a(&c), ["go-ahead", "explain", "ship", "hold"]);
+        assert_eq!(
+            c.action("ship").unwrap().prompt,
+            "Ship it.\n[not a header]\nThen update your card."
+        );
+        assert_eq!(
+            c.action("hold").unwrap().prompt,
+            "Hold.\n[[also not a header]]"
+        );
+
+        // A broken line inside the catalog itself still falls back to the
+        // defaults, with the error that says so.
+        let c = resolve(Some("x = \"\n[catalog]\nremove = [\"merge\"\n"));
+        assert_eq!(c.errors.len(), 1, "{:?}", c.errors);
+        assert!(c.errors[0].starts_with("catalog: the user config could not be read as TOML"));
         assert_eq!(names_a(&c), ["go-ahead", "merge", "explain"]);
     }
 

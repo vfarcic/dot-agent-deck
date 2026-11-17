@@ -1445,28 +1445,33 @@ fn spawn_deck_watcher(app: &AppHandle, state: &DesktopState, endpoint: Endpoint)
             // subscription is bounded — the event frames that follow are
             // long-lived by design and are read by `spawn_event_reader`.
             // PRD #2374 (review B1): opted into the agent-card doorbells, which
-            // a daemon forwards only to a subscriber that asked.
-            let subscription = match crate::daemon_bridge::bounded_reply(
-                "SubscribeEvents",
-                daemon.client.subscribe_events_with_agent_cards(),
-            )
-            .await
-            {
-                Ok(subscription) => subscription,
-                Err(_) => {
-                    // Could not even subscribe against a link that just said it
-                    // was compatible: drop it rather than retry through it.
-                    view.resubscribed();
-                    // PRD #742 M3: THIS deck's link, not every deck's. A
-                    // subscription that failed says nothing about the other
-                    // machines in the fleet, and dropping their links would make
-                    // one deck's bad moment cost N handshakes.
-                    links.invalidate(&endpoint).await;
-                    emit_unconnected_snapshot(&app, &endpoint, &links).await;
-                    tokio::time::sleep(WATCH_RETRY_DELAY).await;
-                    continue;
+            // a daemon forwards only to a subscriber that asked — and only
+            // while this app shows the cards, so a daemon serving a desktop
+            // with the experimental flag off runs no card watcher for it.
+            let subscribe = async {
+                if dot_agent_deck::features::show_agent_cards() {
+                    daemon.client.subscribe_events_with_agent_cards().await
+                } else {
+                    daemon.client.subscribe_events().await
                 }
             };
+            let subscription =
+                match crate::daemon_bridge::bounded_reply("SubscribeEvents", subscribe).await {
+                    Ok(subscription) => subscription,
+                    Err(_) => {
+                        // Could not even subscribe against a link that just said it
+                        // was compatible: drop it rather than retry through it.
+                        view.resubscribed();
+                        // PRD #742 M3: THIS deck's link, not every deck's. A
+                        // subscription that failed says nothing about the other
+                        // machines in the fleet, and dropping their links would make
+                        // one deck's bad moment cost N handshakes.
+                        links.invalidate(&endpoint).await;
+                        emit_unconnected_snapshot(&app, &endpoint, &links).await;
+                        tokio::time::sleep(WATCH_RETRY_DELAY).await;
+                        continue;
+                    }
+                };
             // A NEW subscription means the fold has a hole in it of unknown
             // size, so everything held is discarded and the first refresh under
             // this stream re-fetches. Called before the first event can arrive.
@@ -1708,8 +1713,9 @@ async fn watch_one_subscription(
         emit_snapshot(app, &snapshot);
         // PRD #2374: the cards ride the same coalesced refresh — re-read on a
         // new subscription, on a card's doorbell and on the reconciliation
-        // tick. A deck whose daemon has no cards emits nothing.
-        if view.take_cards_due() {
+        // tick. A deck whose daemon has no cards emits nothing, and nothing is
+        // read while the experimental flag hides the cards.
+        if view.take_cards_due() && dot_agent_deck::features::show_agent_cards() {
             emit_agent_cards(app, endpoint, links).await;
         }
         last_refresh = Some(tokio::time::Instant::now());
@@ -1774,11 +1780,15 @@ async fn agent_cards_list(
     agent_cards_list_on(&state, &deck_id).await
 }
 
-/// [`agent_cards_list`] minus the webview.
+/// [`agent_cards_list`] minus the webview. `None`, asking no daemon, while
+/// the experimental flag hides the cards.
 async fn agent_cards_list_on(
     state: &DesktopState,
     deck_id: &str,
 ) -> Result<Option<DesktopAgentCards>, String> {
+    if !dot_agent_deck::features::show_agent_cards() {
+        return Ok(None);
+    }
     let scope = crate::dto::DeckScope::resolve(Some(deck_id))?;
     let daemon = state.daemon.trusted(scope.endpoint()).await?;
     daemon.require_compatible()?;
@@ -7339,6 +7349,27 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// PRD #2374 (Qodo review): with the experimental flag off the desktop
+    /// reads no cards — `agent_cards_list` answers `None` without resolving
+    /// the deck or asking its daemon — and with it on the same call goes on
+    /// to the deck (here an unknown one, so it fails there).
+    #[tokio::test]
+    async fn card_reads_wait_for_the_experimental_flag() {
+        let state = DesktopState::default();
+        dot_agent_deck::features::set_for_test(dot_agent_deck::features::Features::test_with(
+            false,
+        ));
+        assert!(matches!(
+            agent_cards_list_on(&state, "no-such-deck").await,
+            Ok(None)
+        ));
+        dot_agent_deck::features::set_for_test(dot_agent_deck::features::Features::test_with(true));
+        assert!(agent_cards_list_on(&state, "no-such-deck").await.is_err());
+        dot_agent_deck::features::set_for_test(dot_agent_deck::features::Features::test_with(
+            false,
+        ));
+    }
 
     /// A reading session whose task runs until aborted, and records being
     /// dropped (aborted) and its ender being called.

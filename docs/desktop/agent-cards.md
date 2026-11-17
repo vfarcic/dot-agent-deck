@@ -11,7 +11,7 @@ A card holds two kinds of information, and the app labels each so you can tell t
 - **What the deck checked.** The agent's status (Working, Waiting for input, Idle, Stopped and the rest), which dispatcher or orchestration it belongs to, and the pull request of its branch. The deck works these out itself. The overlay marks them **deck checked**.
 - **What the agent says.** A short summary, its own status (working, waiting, done or failed), named fields such as its progress or the pull request it opened, questions for you, and actions it suggests. These are the agent's own words and the deck does not check them. They are marked **agent says**.
 
-An agent that has reported nothing yet still has a card, with its deck-checked status and the deck's own actions, and the words "No report from this agent yet."
+An agent that has reported nothing yet still has a card, with its deck-checked status and the deck's own actions, and the words "No report from this agent yet." An agent that clears its card (`dot-agent-deck card publish --clear`) goes back to that.
 
 A card is marked **Needs you** when its agent stopped, is asking a question in its terminal or on its card, says it is waiting for you, done or failed, or is blocked. Hover the mark to see which.
 
@@ -26,7 +26,8 @@ In the Cards view:
 - Cards are grouped as the daemon groups them: the agents a dispatcher started are one group, with the dispatcher's own card in it; the roles of an orchestration are another; agents in neither are grouped together as standalone. Each group's heading counts its agents and how many need you.
 - Within a group, the cards that need you come first. The order is the same everywhere you look at the cards, including the next and previous moves in the card overlay.
 - **Needs you** above the grid shows only the cards that need you. Press it again to see every card.
-- Each card has one main button, the action the agent most needs from you: the answer to its question, an action it suggested, or **Open** when it needs nothing. Under the button is the start of the exact text it sends, and hovering shows all of it. An action the agent wrote itself is marked **agent says**, as are its fields. After you press it, the card says whether the message was sent and, later, whether the agent took it.
+- The Dashboard's filter applies to the cards as it does to the table rows: with a status, kind, agent type, daemon or search text chosen, only the cards of the agents it shows are on screen.
+- Each card has one main button, the action the agent most needs from you: the answer to its question, an action it suggested, or **Open** when it needs nothing. Under the button is the start of the exact text it sends, and hovering shows all of it. An action the agent wrote itself is marked **agent says**, as are its fields. When the agent wrote the text and the card shows only the start of it, the button sends nothing yet: it opens the card at a step showing the whole text, and you send it from there. After you press it, the card says whether the message was sent and, later, whether the agent took it.
 - With several daemons on the Dashboard, each daemon's cards are under its own name. A daemon whose version does not have cards keeps its usual table section.
 
 In the Table view, a row whose card needs you shows a bell next to the agent's name, and the row's **⋯** menu has **Show card**, which opens that agent's card, and the card's main action. The menu shows only the action's name, so choosing it sends nothing yet: it opens the card at a step that shows exactly what the action sends, and you send it from there. Clicking the row itself still opens the agent's terminal, as before.
@@ -42,8 +43,9 @@ The text an action sends is shown exactly as it is sent. Characters you could no
 - An action marked **Asks you to confirm first**, and both ways of closing the agent, show you exactly what will be sent or done and ask before doing it. Closing tells you what is still pending, such as an unanswered question or an open pull request.
 - If the agent changes an action while you are looking at it, the confirm step shows the new text, says it changed, and sends nothing until you confirm you have read it. A button pressed after the agent changed its action is refused, and nothing is sent; look at the card again and press it once more if you still want it.
 - **Reply** opens a box where you write your own message. It is sent to the agent exactly as you typed it.
-- **Open** opens the agent's terminal pane. **Close** closes the agent, and **Close, keep worktree** closes a dispatched agent but keeps its copy of the repository, when it has one.
+- **Open** closes the card and opens the agent's terminal pane. **Close** closes the agent, and **Close, keep worktree** closes a dispatched agent but keeps its copy of the repository, when it has one.
 - Actions that send the agent a message are disabled while the agent is not running, and the overlay says so.
+- What happened to a message you sent reads **Queued for the agent**, **Delivered to the agent**, **Not delivered** with the reason, or **Delivery uncertain** when the deck cannot tell whether the agent got it, or has run out of attempts to send it, or has seen the agent hold it for a long time without starting on it. An uncertain message is also in the agent's inbox, where you can retry or cancel it.
 
 An action is always sent to the agent whose card it is on, and only to that agent, with the text the card showed you. The agent is told that you pressed it on its card; when the text is, or quotes, what the agent itself wrote on the card (an action or answer it worded, or an answer that repeats its question), the agent is told that too, and gets that text marked as untrusted, so it does not take its own words for yours or for a message from the deck. If the agent was replaced (its pane restarted) after you opened its card, or the deck's daemon was restarted, the action is refused rather than sent to whichever agent has its place now.
 
@@ -60,9 +62,9 @@ With voice control on and the cards shown, you can say:
 | "only the ones that need me", "show all cards" | Turns the **Needs you** filter on or off. |
 | "close the card" | Closes the card overlay. |
 | "press go ahead on the coder's card", "answer main to the coder" | Presses that action or answer, named by the label on its button. |
-| "reply to the coder use the main branch" | Sends your words to that agent as a reply. |
+| "reply to the coder use the main branch" | Opens that agent's card with your words in its **Reply** box, for you to read, change and send with **Send reply**. |
 
-Voice sends an action straight away only when its text comes from your catalog. Anything with text the agent wrote opens the card at a step showing exactly what would be sent, and the voice row says so; press **Send** to send it. That includes an action the agent suggested that is not in your catalog and every answer to one of its questions: an answer the agent gave no text of its own sends `Answer to your question "<question>": <answer>`, which repeats the agent's question and answer words. An action that asks you to confirm, and closing an agent, are never done by voice alone either: the card opens at its confirm step and you press the button yourself.
+Voice sends an action straight away only when its text comes from your catalog. Anything with text the agent wrote opens the card at a step showing exactly what would be sent, and the voice row says so; press **Send** to send it. That includes an action the agent suggested that is not in your catalog and every answer to one of its questions: an answer the agent gave no text of its own sends `Answer to your question "<question>": <answer>`, which repeats the agent's question and answer words. An action that asks you to confirm, and closing an agent, are never done by voice alone either: the card opens at its confirm step and you press the button yourself. A spoken reply is not sent by voice alone, as dictating to an agent's terminal types your words without pressing Enter: you see what was heard before it goes.
 
 ## Which agents publish a card
 
@@ -102,6 +104,7 @@ always = false                     # optional: true offers it on every card, sug
 - `description` tells agents when to use the entry. `prompt` is exactly what the action sends to the agent.
 - `placement = "card"` and `"compact"` show a field on the card and in the overlay; `"detail"` only in the overlay.
 - An entry with a mistake (an unknown type, a missing description, a bad name) is skipped and the rest still apply. `dot-agent-deck card catalog` prints a warning for each one.
+- A mistake elsewhere in the file that makes it unreadable, such as a missing quote in another setting, does not cost you the catalog: the deck reads the `[catalog]` tables on their own, uses them, and warns that the file needs fixing. A mistake inside the `[catalog]` tables themselves leaves the defaults in use, with a warning. `dot-agent-deck config set` keeps your `[catalog]` and its comments, and refuses to save over a file it cannot read.
 - The actions **Reply**, **Open**, **Close** and **Close, keep worktree** are the deck's own and cannot be removed or changed.
 - A `[catalog]` table in a project's `.dot-agent-deck.toml` is not used yet. Only the user configuration file's applies.
 - Changes apply to cards agents already published. When you remove an action from the catalog, it disappears from the cards that suggested it only by its catalog name; a card whose agent gave that action its own label and text keeps offering it, marked custom. When you change a field's type, a value an agent already reported is hidden if it does not fit the new type, until the agent reports it again; a value that still fits, such as text in a field you changed to long text, stays.

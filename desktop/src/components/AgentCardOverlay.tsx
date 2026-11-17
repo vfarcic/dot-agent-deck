@@ -37,6 +37,9 @@ export function AgentCardOverlay({ card, lastName, position, count, step, result
   const [reply, setReply] = useState("");
   const cardKey = card ? `${card.deckId}\u0000${card.entry.instance_id}\u0000${card.entry.key}` : undefined;
   useEffect(() => { setReply(""); }, [cardKey]);
+  /* A spoken reply opens this step with its words in the box, to be read,
+     edited and sent by hand. */
+  useEffect(() => { if (step?.kind === "reply" && step.text !== undefined) setReply(step.text); }, [step]);
   const onKeyDown = (event: KeyboardEvent<HTMLElement>) => {
     const target = event.target;
     if (target instanceof Element && target.matches("input, textarea, select, [contenteditable='true']")) {
@@ -199,7 +202,7 @@ export function AgentCardOverlay({ card, lastName, position, count, step, result
                 />
                 <div className="agent-card-reply-buttons">
                   <button type="button" className="button secondary compact" data-testid="agent-card-reply-cancel" onClick={() => VOICE_ACTIONS.showAgentCard.run(controls, cardRef(card))}>Cancel</button>
-                  <button type="button" className="button primary compact" data-testid="agent-card-reply-send" disabled={!replyAction.enabled || reply.trim() === "" || results[replyAction.token]?.outcome === "pending"} onClick={() => VOICE_ACTIONS.replyToAgentCard.run(controls, { ...cardRef(card), cardReplyText: reply })}>Send reply</button>
+                  <button type="button" className="button primary compact" data-testid="agent-card-reply-send" disabled={!replyAction.enabled || reply.trim() === "" || results[replyAction.token]?.outcome === "pending"} onClick={() => VOICE_ACTIONS.replyToAgentCard.run(controls, { ...cardRef(card), cardReplyText: reply, cardReplySend: true })}>Send reply</button>
                 </div>
               </section>
             )}

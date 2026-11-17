@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { actionBySpokenLabel, cardTarget, disabledReasonSentence, placeCards, placedCardKey, pruneCardResults, readOverviewMode, stepCard, writeOverviewMode, type CardOverlayStep, type CardResults, type CardStep, type OverviewMode, type PlacedCard } from "../lib/agentCards";
+import { actionBySpokenLabel, cardTarget, disabledReasonSentence, placeCards, placedCardKey, pruneCardResults, readOverviewMode, sendableUnread, stepCard, writeOverviewMode, type CardOverlayStep, type CardResults, type CardStep, type OverviewMode, type PlacedCard } from "../lib/agentCards";
 import { newCardRequestId } from "../lib/bridge";
 import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
 import type { AgentCardRef, VoiceActionContext } from "../lib/voiceActions";
@@ -18,15 +18,6 @@ export const NO_CARD_NEEDS_YOU = "No other card needs you right now.";
 export const NO_CARDS = "There are no cards to show.";
 /** …when voice named an action whose text the agent wrote: its card opens at the review step instead of sending. */
 export const agentWrittenReview = (label: string, name: string) => `${name} wrote the text of ${label}, so its card is open for you to read it first: press Send to send it.`;
-
-/**
- * Who may have written a prompt that is sent without the user reading it
- * first: only the catalog, the deck's defaults or the user's own (PRD #2374).
- * The daemon says which (`prompt_source`); anything else — the agent's text,
- * the answer the deck composes by quoting the agent's question (audit A1),
- * an absent value — is shown for review first.
- */
-const SENDABLE_UNREAD: ReadonlySet<string> = new Set(["catalog"]);
 
 /** The card members the overview serves, every one of them. */
 export type AgentCardControls = Pick<VoiceActionContext, "setOverviewMode" | "showAgentCard" | "stepAgentCard" | "setNeedsYouFilter" | "closeAgentCard" | "runCardAction" | "replyToAgentCard" | "confirmCardAction" | "toggleOverviewRowMenu">;
@@ -179,6 +170,9 @@ export function useAgentCardsView({ runtime, decks, openAgent }: {
       setRowMenu(undefined);
       if (!action.enabled) return `${displayText(action.label, DISPLAY_LIMITS.name)} is disabled: ${disabledReasonSentence(action.disabled_reason)}.`;
       if (action.kind === "open") {
+        // The card overlay sits above the agent's pane: close it, or the pane
+        // opens hidden behind it (PRD #2374 review).
+        setOpen(undefined);
         openAgent({ deckId: card.deckId, agentId: card.entry.agent_id, ...(card.entry.instance_id ? { incarnation: card.entry.instance_id } : {}) });
         return undefined;
       }
@@ -195,20 +189,28 @@ export function useAgentCardsView({ runtime, decks, openAgent }: {
       // A control that showed the text names the definition it showed (its
       // token). Without one — voice names an action by its label — text the
       // agent wrote is shown at the review step and sent only from there.
-      if (wanted.token === undefined && !SENDABLE_UNREAD.has(action.prompt_source ?? "")) {
+      if (wanted.token === undefined && !sendableUnread(action)) {
         setOpen({ key: placedCardKey(card), name: card.entry.name, step: { kind: "confirm", actionId: action.id, token: action.token } });
         return agentWrittenReview(displayText(action.label, DISPLAY_LIMITS.name), name);
       }
       send(card, action, wanted.token !== undefined ? { token: wanted.token } : {});
       return undefined;
     },
-    replyToAgentCard: (ref, text) => {
+    replyToAgentCard: (ref, text, sendNow) => {
       if (!latest.current.shown) return CARDS_HIDDEN;
       const card = find(ref);
       if (!card) return CARD_GONE;
       const reply = card.entry.actions.find((candidate) => candidate.id === "reply");
       if (!reply) return `${displayText(card.entry.name, DISPLAY_LIMITS.name)}'s card takes no reply.`;
       if (!reply.enabled) return `Reply is disabled: ${disabledReasonSentence(reply.disabled_reason)}.`;
+      // Spoken words are put in the card's reply box for the user to read,
+      // edit and send, as `dictate_to_agent` types into a prompt without
+      // sending it; only the Send reply button, which shows them, sends.
+      if (!sendNow) {
+        setRowMenu(undefined);
+        setOpen({ key: placedCardKey(card), name: card.entry.name, step: { kind: "reply", text } });
+        return undefined;
+      }
       send(card, reply, { text, token: reply.token });
       setOpen((current) => (current && current.key === placedCardKey(card) ? { key: current.key, name: current.name } : current));
       return undefined;

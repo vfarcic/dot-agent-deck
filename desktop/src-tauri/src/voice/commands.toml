@@ -2340,8 +2340,10 @@ must_name   = ["orchestration", "run", "every role", "all roles", "all the roles
 # composed answer included, since it quotes the agent's question and label
 # (audit A1) — an action that asks for confirmation, and both closes, only
 # OPEN the card at its review/confirm step, because voice has no confirm step
-# of its own (PRD #802 D5). `reply_to_agent_card` sends the transcript's own words,
-# never the model's.
+# of its own (PRD #802 D5). `reply_to_agent_card` puts the transcript's own
+# words, never the model's, in the card's reply box and sends nothing: the
+# user reads them and presses Send reply, as `dictate_to_agent` types into a
+# prompt and leaves sending to the user (PRD #2374 review).
 [[commands]]
 id          = "set_overview_mode"
 description = """Switch the agent dashboard between its two views: the table (one row per agent)
@@ -2471,15 +2473,16 @@ try_saying  = "press {action} on {agent}'s card"
 
 [[commands]]
 id          = "reply_to_agent_card"
-description = """Reply to an agent from its card with the user's own words, sent to that agent as
-they are. Use when the user says reply to or tell an agent something from the dashboard — "reply
-to the coder yes go ahead", "tell the tester use the main branch". Set `agent` to the user's words
-for the agent and `reply` to exactly the words to send, as the user said them. Typing into an
-open agent's terminal is `dictate_to_agent`; pressing a card's button is `run_card_action`."""
+description = """Write a reply to an agent from its card with the user's own words: they are put in
+that agent's card reply box, for the user to read and send. Use when the user says reply to or
+tell an agent something from the dashboard — "reply to the coder yes go ahead", "tell the tester
+use the main branch". Set `agent` to the user's words for the agent and `reply` to exactly the
+words to send, as the user said them. Typing into an open agent's terminal is `dictate_to_agent`;
+pressing a card's button is `run_card_action`."""
 invoke      = "replyToAgentCard"
 screens     = ["overview"]
 unavailable_hint = "a card's reply is sent from the agent dashboard"
-report      = "Replied to {agent}."
+report      = "Your reply to {agent} is in its card: press Send reply to send it."
 asks_to     = "reply to an agent from its card with my own words"
 try_saying  = "reply to {agent} go ahead"
 
