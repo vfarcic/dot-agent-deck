@@ -20,6 +20,9 @@ use serde_json::Value;
 use spec::spec;
 
 const SENTINEL: &str = "AGENT_CARD_LIVE_3E91D7_SENTINEL.sentinel";
+/// What the agent's own suggested action creates: its text is the agent's,
+/// so it reaches the agent framed as untrusted (audit S1).
+const SUGGESTED: &str = "AGENT_CARD_LIVE_3E91D7_SUGGESTED.sentinel";
 const PANE_ID: &str = "agent-card-live-pane";
 const WAIT: Duration = Duration::from_secs(150);
 
@@ -78,10 +81,12 @@ fn wait_card(deck: &TuiDeck, key: &str, what: &str, pred: impl Fn(&Value) -> boo
 
 /// Scenario: Start an interactive Haiku in a deck pane under a user catalog
 /// with a `touch-sentinel` action, and tell it to publish a waiting card with
-/// a question that suggests that action. `card list` shows its report; the
-/// user then runs `card act --action touch-sentinel`, and the agent creates
-/// the uniquely named sentinel file, the delivery is recorded as delivered,
-/// its card turns done, and the attached TUI shows it working.
+/// a question, that action and a suggested action of its own. `card list`
+/// shows its report; the user presses the agent's own suggestion and the
+/// agent creates the file it names, then runs `card act --action
+/// touch-sentinel`, and the agent creates the uniquely named sentinel file,
+/// the delivery is recorded as delivered, its card turns done, and the
+/// attached TUI shows it working.
 #[spec("agent-report/live/001")]
 #[test]
 fn live_001_a_real_agent_publishes_its_card_and_acts_on_a_card_action() {
@@ -165,7 +170,9 @@ fn live_001_a_real_agent_publishes_its_card_and_acts_on_a_card_action() {
     deck.wait_until_grid("interactive Haiku typing mode", |grid| {
         grid.lines().any(|line| line.starts_with(" TYPING "))
     });
-    let report = r#"{"status":"waiting","summary":"Waiting for you to choose","questions":[{"id":"go","text":"Create the sentinel?","options":[{"id":"yes","label":"yes"}]}],"actions":[{"name":"touch-sentinel"}]}"#;
+    let report = format!(
+        r#"{{"status":"waiting","summary":"Waiting for you to choose","questions":[{{"id":"go","text":"Create the sentinel?","options":[{{"id":"yes","label":"yes"}}]}}],"actions":[{{"name":"touch-sentinel"}},{{"name":"touch-suggested","label":"Touch suggested","prompt":"Create an empty file named {SUGGESTED} in the current directory with Bash, then stop and wait without doing anything else."}}]}}"#
+    );
     phase("prompting the publish");
     deck.submit_claude_prompt(
         &events,
@@ -190,48 +197,76 @@ fn live_001_a_real_agent_publishes_its_card_and_acts_on_a_card_action() {
         !repo.join(SENTINEL).exists(),
         "no sentinel before the action"
     );
-
-    phase("invoking touch-sentinel");
-    // `card act` names the version of the action the user read and the
-    // daemon process that listed it, both from the card as listed.
-    let token = published["actions"]
-        .as_array()
-        .and_then(|a| a.iter().find(|a| a["id"] == "touch-sentinel"))
-        .and_then(|a| a["token"].as_str())
-        .expect("the listed action's token")
-        .to_string();
+    assert!(
+        !repo.join(SUGGESTED).exists(),
+        "no suggested file before the user chose the suggestion"
+    );
     let instance = published["instance_id"]
         .as_str()
         .expect("the card's instance id")
         .to_string();
-    let out = user_cli(
-        &deck,
-        &[
-            "card",
-            "act",
-            "--entry",
-            &key,
-            "--action",
-            "touch-sentinel",
-            "--token",
-            &token,
-            "--instance",
-            &instance,
-            "--json",
-        ],
-    );
-    assert!(
-        out.status.success(),
-        "card act: {}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let result: Value = serde_json::from_slice(&out.stdout).expect("card act --json");
-    assert_eq!(result["outcome"], "sent", "{result}");
-    let message_id = result["message_id"]
-        .as_str()
-        .expect("message id")
+    let token_of = |id: &str| {
+        published["actions"]
+            .as_array()
+            .and_then(|a| a.iter().find(|a| a["id"] == id))
+            .and_then(|a| a["token"].as_str())
+            .unwrap_or_else(|| panic!("the listed action {id}'s token: {published:#}"))
+            .to_string()
+    };
+    let act = |id: &str| {
+        let token = token_of(id);
+        let out = user_cli(
+            &deck,
+            &[
+                "card",
+                "act",
+                "--entry",
+                &key,
+                "--action",
+                id,
+                "--token",
+                &token,
+                "--instance",
+                &instance,
+                "--json",
+            ],
+        );
+        assert!(
+            out.status.success(),
+            "card act {id}: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let result: Value = serde_json::from_slice(&out.stdout).expect("card act --json");
+        assert_eq!(result["outcome"], "sent", "{result}");
+        result["message_id"]
+            .as_str()
+            .expect("message id")
+            .to_string()
+    };
+
+    // The agent's own suggestion arrives framed as untrusted text the user
+    // chose (audit S1); the agent still does what the user chose.
+    phase("invoking the agent's own suggestion");
+    let suggested = published["actions"]
+        .as_array()
+        .and_then(|a| a.iter().find(|a| a["label"] == "Touch suggested"))
+        .and_then(|a| a["id"].as_str())
+        .expect("the agent's own action")
         .to_string();
+    act(&suggested);
+    phase("waiting for the suggested file");
+    assert!(
+        common::wait_for_path(&repo.join(SUGGESTED), WAIT),
+        "the agent never created {SUGGESTED} in {}\n{}",
+        repo.display(),
+        deck.snapshot_grid()
+    );
+
+    phase("invoking touch-sentinel");
+    // `card act` names the version of the action the user read and the
+    // daemon process that listed it, both from the card as listed.
+    let message_id = act("touch-sentinel");
 
     phase("waiting for the sentinel");
     assert!(
