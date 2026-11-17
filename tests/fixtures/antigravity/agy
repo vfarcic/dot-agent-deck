@@ -30,9 +30,12 @@ state = "booting"
 placeholder = True
 permission_menu = None
 permission_prompt = ""
+misrender_next_echo = False
+misrendering_echo = False
 
 
 def redraw():
+    global misrender_next_echo, misrendering_echo, placeholder
     width = os.get_terminal_size(0).columns
     if permission_menu is not None:
         menu = json.loads((root / "permission-menu.json").read_text())
@@ -45,6 +48,25 @@ def redraw():
         sys.stdout.flush()
         return
     content = line.decode(errors="replace")
+    if misrender_next_echo and re.match(r"^\([a-z]{6}\) dot-agent-deck: message ", content):
+        misrender_next_echo = False
+        misrendering_echo = True
+    if misrendering_echo:
+        if content:
+            # Every input byte was received: only the rendered composer has
+            # the measured seven-column gap, until the deck withdraws it.
+            content = content[:35] + "       " + content[35:]
+            (root / "mismatched-echo.json").write_text(json.dumps({
+                "received": line.decode(), "rendered": content,
+            }))
+        else:
+            misrendering_echo = False
+            placeholder = True
+            submitted_lines = (root / "submitted.jsonl")
+            (root / "echo-withdrawn.json").write_text(json.dumps({
+                "submitted_before_withdrawal": len(submitted_lines.read_text().splitlines())
+                if submitted_lines.exists() else 0,
+            }))
     hint = "Auto mode: edits & safe commands auto-approved (shift+tab to cycle)"
     rows = textwrap.wrap(content or (hint if placeholder else ""), width=max(1, width - 2)) or [""]
     composer = "\r\n  ".join(rows)
@@ -66,7 +88,7 @@ def redraw():
 
 
 def replay(action):
-    global state, permission_menu, permission_prompt
+    global state, permission_menu, permission_prompt, misrender_next_echo
     if "hook" in action:
         payload = json.loads((root / action["hook"]).read_text())
         # The capture's workspace is sanitized; retain its measured event shape
@@ -118,6 +140,8 @@ def replay(action):
         sys.stdout.write(f"\033]7501;state=blocked:kind=permission:app=antigravity:msg={encoded}\007")
         sys.stdout.flush()
         state = "blocked"
+    elif "misrender_echo_once" in action:
+        misrender_next_echo = True
     elif "redraw_composer" in action:
         permission_menu = None
         redraw()

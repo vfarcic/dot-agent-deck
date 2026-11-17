@@ -315,6 +315,81 @@ fn antigravity_inbox_003_error_does_not_take_pending_mail() {
     agy.committed_once(&id);
 }
 
+/// Scenario: Queue mail for an idle Antigravity stand-in whose first doorbell echo has a seven-column gap although every input byte arrived. The deck submits nothing from that mismatched attempt, withdraws its composer text, and later delivers and acknowledges that same message exactly once.
+#[spec("antigravity/inbox/004")]
+#[test]
+fn antigravity_inbox_004_misrendered_echo_is_withdrawn_and_retried_once() {
+    let (agy, _) = Agy::start(false);
+    agy.replay(json!([{"misrender_echo_once":true}]));
+    let id = inbox::enqueue(&agy.deck, &agy.pane, "AGY-ECHO-RECOVER-e286");
+    agy.replay(json!([{"osc":"idle"}]));
+    assert!(
+        common::wait_for_path(
+            &agy.deck.workdir().join("mismatched-echo.json"),
+            Duration::from_secs(20)
+        ),
+        "stand-in must misrender the first doorbell: {}",
+        agy.diagnostic()
+    );
+    assert!(
+        common::wait_for_path(
+            &agy.deck.workdir().join("echo-withdrawn.json"),
+            Duration::from_secs(15)
+        ),
+        "mismatched doorbell echo must be withdrawn without submitting: echo={} input={:?}\n{}",
+        std::fs::read_to_string(agy.deck.workdir().join("mismatched-echo.json")).unwrap(),
+        String::from_utf8_lossy(&inbox::bytes(&agy.pane)),
+        agy.diagnostic()
+    );
+    assert_eq!(
+        agy.result("echo-withdrawn")["submitted_before_withdrawal"],
+        0,
+        "the mismatched attempt must not press Enter"
+    );
+    assert!(
+        common::wait_for_path(
+            &agy.deck.workdir().join("doorbell-answer.json"),
+            Duration::from_secs(35)
+        ),
+        "withdrawn doorbell must retry and deliver its retained mail: {}",
+        agy.diagnostic()
+    );
+    let answer: Value =
+        serde_json::from_str(agy.result("doorbell-answer")["stdout"].as_str().unwrap()).unwrap();
+    framed(
+        answer["injectSteps"][0]["systemMessage"]["systemMessage"]
+            .as_str()
+            .unwrap(),
+        &id,
+        "AGY-ECHO-RECOVER-e286",
+    );
+    agy.committed_once(&id);
+    assert!(
+        common::wait_for_pane_text_on(
+            agy.deck.attach_socket_path(),
+            &agy.pane.agent,
+            "AGY-ECHO-RECOVER-e286",
+            Duration::from_secs(10)
+        ),
+        "recovered mail must be visible in the pane: {}",
+        agy.diagnostic()
+    );
+    // Span several of this fixture's 100 ms ring intervals. Both the input
+    // log and receipt must still show exactly one successful hand-over.
+    assert!(
+        !common::wait_until(Duration::from_secs(1), || {
+            std::fs::read_to_string(agy.deck.workdir().join("submitted.jsonl"))
+                .unwrap_or_default()
+                .lines()
+                .count()
+                != 1
+        }),
+        "recovery must submit exactly one faithful doorbell: {}",
+        agy.diagnostic()
+    );
+    agy.committed_once(&id);
+}
+
 /// Scenario: Subscribe to an Antigravity pane's completed replies and replay a plain Stop with a sanitized transcript; the subscriber receives its final text once. A Stop handed queued mail returns continue without publishing an interim reply, and the final continued Stop publishes the new reply once.
 #[spec("voice/reading-reply/007")]
 #[test]

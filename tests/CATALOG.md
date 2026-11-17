@@ -7958,6 +7958,14 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Does not assert:** network error recovery by a real model.
 - **Platform coverage:** mac+linux.
 
+##### antigravity/inbox/004 — A misrendered doorbell echo is withdrawn and the retained mail is delivered once on retry.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_antigravity_inbox.rs`), real PTY, daemon and hook CLI.
+- **Agent:** captured-hook Antigravity stand-in; its first doorbell echo inserts seven display columns without dropping input bytes.
+- **Asserts:** the mismatched attempt is withdrawn without a submitted line; a later faithful doorbell visibly delivers the retained task, with one submission and one acknowledged receipt delivery.
+- **Does not assert:** the cause of the real agent's intermittent render desynchronisation or a real model's response.
+- **Platform coverage:** mac+linux.
+
 #### antigravity/status
 
 ##### antigravity/status/001 — Captured Antigravity hooks drive the visible prompt, running command and ordinary turn end.
