@@ -162,6 +162,145 @@ fn harness_clears_inherited_deck_endpoints() {
 }
 
 // ---------------------------------------------------------------------------
+// Issue #2132 — `DAD_AGENT_BIN` pins the agent a test runs, whatever PATH said
+// ---------------------------------------------------------------------------
+
+/// Set only on the re-executed child of [`agent_bin_pins_every_lookup`].
+#[cfg(unix)]
+const AGENT_BIN_CHILD_ENV: &str = "DAD_TEST_HARNESS_AGENT_BIN_CHILD";
+
+/// What that child prints once its checks have passed.
+#[cfg(unix)]
+const AGENT_BIN_CHILD_DONE: &str = "harness-agent-bin-child-checked";
+
+/// What the pinned stand-in `claude` prints for `--version`.
+#[cfg(unix)]
+const PINNED_CLAUDE: &str = "9.9.9 (pinned stand-in)";
+
+/// Re-execute this test binary on `name` with `env`, PATH set to `path`.
+#[cfg(unix)]
+fn reexec(name: &str, path: &std::ffi::OsStr, env: &[(&str, &str)]) -> std::process::Output {
+    std::process::Command::new(std::env::current_exe().expect("test binary path"))
+        .args(["--exact", name, "--nocapture", "--test-threads=1"])
+        .env("PATH", path)
+        .envs(env.iter().copied())
+        .output()
+        .expect("re-execute the test binary")
+}
+
+/// Scenario: Put one stand-in `claude` in a directory named by `DAD_AGENT_BIN`
+/// and a different one in a directory first on `PATH`, as `devbox run` puts
+/// `~/.local/bin` first, then start a fresh copy of this test binary. In that
+/// child, `claude --version` run by name, the harness's own `PATH` for a deck
+/// and the agent preflight's lookup must all reach the pinned stand-in.
+#[cfg(unix)]
+#[test]
+fn agent_bin_pins_every_lookup() {
+    if let Some(pinned) = std::env::var_os(AGENT_BIN_CHILD_ENV) {
+        let pinned = std::path::PathBuf::from(pinned);
+        let host = std::env::var_os("PATH").unwrap_or_default();
+        assert_eq!(
+            std::env::split_paths(&host).next().as_deref(),
+            Some(pinned.as_path()),
+            "the pinned directory must be first on this process's PATH before the test body"
+        );
+        assert_eq!(common::agent_bin_pin(), Some(pinned.as_path()));
+        let by_name = std::process::Command::new("claude")
+            .arg("--version")
+            .output()
+            .expect("run claude by name");
+        assert_eq!(
+            String::from_utf8_lossy(&by_name.stdout).trim(),
+            PINNED_CLAUDE,
+            "a lookup by name must reach the pinned `claude`"
+        );
+        // A deck's PATH: the build under test first, the pin next.
+        let deck_path = common::path_with_binary_dir();
+        assert_eq!(
+            std::env::split_paths(&deck_path).nth(1).as_deref(),
+            Some(pinned.as_path()),
+            "the PATH the harness gives a deck must keep the pin ahead of the host's: \
+             {deck_path}"
+        );
+        println!("{AGENT_BIN_CHILD_DONE}");
+        return;
+    }
+
+    let root = common::harness_tempdir().expect("temp dir");
+    let stand_in = |dir: &str, version: &str| {
+        let dir = root.path().join(dir);
+        std::fs::create_dir(&dir).unwrap();
+        let claude = dir.join("claude");
+        std::fs::write(&claude, format!("#!/bin/sh\necho '{version}'\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        dir
+    };
+    let pinned = stand_in("pinned", PINNED_CLAUDE);
+    let first = stand_in("launcher-first", "1.0.0 (whatever PATH had first)");
+    let path = std::env::join_paths(std::iter::once(first).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .unwrap();
+    let name = "agent_bin_pins_every_lookup";
+    let pinned_str = pinned.to_str().expect("UTF-8 temp path");
+    let output = reexec(
+        name,
+        &path,
+        &[
+            (AGENT_BIN_CHILD_ENV, pinned_str),
+            (common::AGENT_BIN_ENV, pinned_str),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "the pin did not hold:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains(AGENT_BIN_CHILD_DONE),
+        "the child did not run {name}:\n{stdout}\n{stderr}"
+    );
+}
+
+/// Scenario: Start a fresh copy of this test binary with `DAD_AGENT_BIN` set to
+/// a relative path, and in that child ask the harness for a temp directory. The
+/// child must fail naming the variable rather than run whatever `PATH` holds.
+#[cfg(unix)]
+#[test]
+fn an_unusable_agent_bin_fails_the_first_harness_call() {
+    if std::env::var_os(AGENT_BIN_CHILD_ENV).is_some() {
+        let _ = common::harness_tempdir();
+        println!("{AGENT_BIN_CHILD_DONE}");
+        return;
+    }
+    let name = "an_unusable_agent_bin_fails_the_first_harness_call";
+    let output = reexec(
+        name,
+        &std::env::var_os("PATH").unwrap_or_default(),
+        &[
+            (AGENT_BIN_CHILD_ENV, "1"),
+            (common::AGENT_BIN_ENV, "relative/pinned"),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success() && !stdout.contains(AGENT_BIN_CHILD_DONE),
+        "a relative DAD_AGENT_BIN must fail the child's first harness call:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("DAD_AGENT_BIN=relative/pinned is not an absolute path")
+            || stderr.contains("DAD_AGENT_BIN=relative/pinned is not an absolute path"),
+        "the failure must name the variable and why:\n{stdout}\n{stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Issue #1473 — clearing the variables does not close the endpoint FALLBACK
 // ---------------------------------------------------------------------------
 //
