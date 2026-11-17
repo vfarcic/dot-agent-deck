@@ -1838,6 +1838,71 @@ where
             .all(|option| shown.contains(&squeeze(&format!("{}. {}", option.index, option.label))))
 }
 
+/// The two rows `agy` 1.5.9 draws around what its command menu asks about:
+/// the one above the command, and the question under it [measured
+/// 2026-11-16 and 2026-11-17].
+const ANTIGRAVITY_COMMAND_FRAME: [&str; 2] = ["Requesting permission for:", "Run this command?"];
+/// The same two rows of its file-creation menu: the heading above the path
+/// and its diff, and the question under them [measured 2026-11-17, for a new
+/// file; the heading of a write that overwrites one was not measured].
+const ANTIGRAVITY_CREATION_FRAME: [&str; 2] = ["Create file", "Allow creation of this file?"];
+
+/// PRD #211 (audit, CWE-345): whether `screen` shows the menu whose deny
+/// `question` would type, checked instead of [`antigravity_menu_shown`] when
+/// the answer is the deny. That one wants the whole command and every label,
+/// which a command `agy` wrapped or cut does not give, while its deny is
+/// exactly the case a grant is withheld for. The deny grants nothing, so it
+/// is typed on less: the menu kind's own two frame rows, in order, each a row
+/// of its own, and under them the deny option at its own digit
+/// (`4. No, cancel`; `2. No, deny creation`), on a row of its own, `agy`'s
+/// `> ` cursor allowed. A screen [`antigravity_menu_shown`] accepts is
+/// accepted too. `false` for a question with no measured menu kind or no
+/// deny.
+pub fn antigravity_deny_shown<I, S>(question: &PendingQuestion, screen: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let screen: Vec<String> = screen
+        .into_iter()
+        .map(|row| row.as_ref().to_string())
+        .collect();
+    if antigravity_menu_shown(question, &screen) {
+        return true;
+    }
+    let Some(menu) = question.questions.first() else {
+        return false;
+    };
+    let frame = if menu.prompt.starts_with(ANTIGRAVITY_COMMAND_PROMPT) {
+        ANTIGRAVITY_COMMAND_FRAME
+    } else if menu.prompt.starts_with(ANTIGRAVITY_WRITE_PROMPT) {
+        ANTIGRAVITY_CREATION_FRAME
+    } else {
+        return false;
+    };
+    let Some(deny) = menu.options.iter().find(|o| o.role == OptionRole::Deny) else {
+        return false;
+    };
+    let deny = format!("{}. {}", deny.index, deny.label);
+    let rows: Vec<&str> = screen.iter().map(|row| row.trim()).collect();
+    let at = |from: usize, wanted: &dyn Fn(&str) -> bool| {
+        rows.iter()
+            .skip(from)
+            .position(|row| wanted(row))
+            .map(|i| from + i)
+    };
+    let Some(top) = at(0, &|row| row == frame[0]) else {
+        return false;
+    };
+    let Some(question_row) = at(top + 1, &|row| row == frame[1]) else {
+        return false;
+    };
+    at(question_row + 1, &|row| {
+        row.strip_prefix('>').map_or(row, str::trim_start) == deny
+    })
+    .is_some()
+}
+
 // ---------------------------------------------------------------------------
 // Producers: OpenCode (the plugin's `await-answer` child)
 // ---------------------------------------------------------------------------
@@ -4022,6 +4087,174 @@ mod tests {
         wrapped.insert(6, head.to_string());
         wrapped.insert(7, format!("     {tail}"));
         assert!(antigravity_menu_shown(&bash_q, wrapped));
+    }
+
+    /// PRD #211: the command menu over a long multi-line command, as `agy`
+    /// wraps it — the command's own rows, then the measured question and
+    /// labels [frame and labels measured on 1.5.9; the wrapping is the
+    /// stand-in's, `tests/e2e_antigravity_status.rs`].
+    fn wrapped_bash_screen(command: &str, width: usize) -> Vec<String> {
+        let mut rows = vec![
+            "Command".to_string(),
+            "\u{2500}".repeat(width),
+            "Requesting permission for:".to_string(),
+        ];
+        for line in command.lines() {
+            let chars: Vec<char> = line.chars().collect();
+            rows.extend(
+                chars
+                    .chunks(width - 3)
+                    .map(|part| format!("   {}", part.iter().collect::<String>())),
+            );
+        }
+        rows.extend([
+            "Run this command?".to_string(),
+            "  1. Yes, run command".to_string(),
+            "  2. Yes, and always allow in this conversation for commands that start with 'rm -f probe.txt'".to_string(),
+            "  3. Yes, and always allow for commands that start with 'rm -f probe.txt' (Persist to settings.json)".to_string(),
+            "  4. No, cancel".to_string(),
+            "  \u{2191}/\u{2193} Navigate \u{b7} tab Amend \u{b7} ctrl+g edit/expand command".to_string(),
+            "esc to cancel".to_string(),
+        ]);
+        rows
+    }
+
+    /// PRD #211: a command too long and too many lines to grant on offers only
+    /// the deny, and `agy` wraps it, so the grant check cannot find it whole.
+    /// The deny is still typed: the command menu's own frame is drawn, and
+    /// `4. No, cancel` under it. The grant check refuses the same screen.
+    #[test]
+    fn antigravity_deny_passes_the_frame_check_for_a_wrapped_command() {
+        let command = format!(
+            "rm -f probe.txt {}\necho hidden-command",
+            "long-command-argument-".repeat(14)
+        );
+        let prompt = signalled(ANTIGRAVITY_COMMAND_PROMPT, &command);
+        let q = antigravity_permission("q".into(), &prompt, Some(&bash(&command)), 1, AGY).unwrap();
+        let screen = wrapped_bash_screen(&command, 80);
+        assert!(!antigravity_menu_shown(&q, &screen), "the grant check");
+        assert!(antigravity_deny_shown(&q, &screen));
+        // The cursor on the deny's row, and a plain short command's whole
+        // menu, read the same.
+        let mut cursor = screen.clone();
+        let deny = cursor.iter().position(|r| r == "  4. No, cancel").unwrap();
+        cursor[deny] = "> 4. No, cancel".to_string();
+        assert!(antigravity_deny_shown(&q, &cursor));
+        let short = antigravity_permission(
+            "q".into(),
+            "Approve Bash: rm -f probe.txt",
+            Some(&bash("rm -f probe.txt")),
+            1,
+            AGY,
+        )
+        .unwrap();
+        assert!(antigravity_deny_shown(
+            &short,
+            bash_screen("rm -f probe.txt")
+        ));
+    }
+
+    /// PRD #211: the creation menu's deny is checked against that menu's own
+    /// measured frame — its heading, the question under the path and its
+    /// diff — and `2. No, deny creation` under them.
+    #[test]
+    fn antigravity_deny_passes_the_frame_check_for_a_file_creation() {
+        let path = format!("/work/{}/probe.txt", "deep-directory".repeat(12));
+        let q = antigravity_permission(
+            "q".into(),
+            &signalled(ANTIGRAVITY_WRITE_PROMPT, &path),
+            Some(&write(&path)),
+            1,
+            AGY,
+        )
+        .unwrap();
+        // A path drawn other than whole (here elided), which the grant check
+        // cannot find.
+        let screen = [
+            "\u{25cf} Edited 1 file (probe.txt) (ctrl+o to expand)",
+            "Create file",
+            &"\u{2500}".repeat(80),
+            "/work/deep-directory\u{2026}/probe.txt  +1",
+            "  1  +  PROBE",
+            "Allow creation of this file?",
+            "> 1. Yes, allow creation",
+            "  2. No, deny creation",
+            "  \u{2191}/\u{2193} Navigate \u{b7} f full diff",
+            "esc to cancel",
+        ];
+        assert!(!antigravity_menu_shown(&q, screen), "the grant check");
+        assert!(antigravity_deny_shown(&q, screen));
+        // The command menu's frame is not this menu's.
+        let command_frame: Vec<&str> = screen
+            .iter()
+            .map(|row| match *row {
+                "Create file" => "Requesting permission for:",
+                "Allow creation of this file?" => "Run this command?",
+                other => other,
+            })
+            .collect();
+        assert!(!antigravity_deny_shown(&q, &command_frame));
+    }
+
+    /// PRD #211 (audit, CWE-345): the deny's frame check is not a label
+    /// search. With either frame row missing, the rows out of order, a frame
+    /// row that is only part of a row, or the deny at another digit, under
+    /// the frame or above it, nothing is typed; nor for a question with no
+    /// measured menu.
+    #[test]
+    fn antigravity_deny_is_refused_without_its_menu_frame() {
+        let command = format!(
+            "rm -f probe.txt {}\necho hidden-command",
+            "long-command-argument-".repeat(14)
+        );
+        let prompt = signalled(ANTIGRAVITY_COMMAND_PROMPT, &command);
+        let q = antigravity_permission("q".into(), &prompt, Some(&bash(&command)), 1, AGY).unwrap();
+        let screen = wrapped_bash_screen(&command, 80);
+        let without = |frame_row: &str| -> Vec<String> {
+            screen.iter().filter(|r| *r != frame_row).cloned().collect()
+        };
+        assert!(!antigravity_deny_shown(
+            &q,
+            without("Requesting permission for:")
+        ));
+        assert!(!antigravity_deny_shown(&q, without("Run this command?")));
+        assert!(!antigravity_deny_shown(&q, ["  4. No, cancel"]));
+        assert!(!antigravity_deny_shown(&q, Vec::<String>::new()));
+
+        let mut swapped = screen.clone();
+        let top = swapped
+            .iter()
+            .position(|r| r == "Requesting permission for:")
+            .unwrap();
+        let question = swapped
+            .iter()
+            .position(|r| r == "Run this command?")
+            .unwrap();
+        swapped.swap(top, question);
+        assert!(!antigravity_deny_shown(&q, &swapped));
+
+        let embedded: Vec<String> = screen
+            .iter()
+            .map(|r| match r.as_str() {
+                "Run this command?" => "   echo Run this command?".to_string(),
+                _ => r.clone(),
+            })
+            .collect();
+        assert!(!antigravity_deny_shown(&q, &embedded));
+
+        let other_digit: Vec<String> = screen
+            .iter()
+            .map(|r| r.replace("4. No, cancel", "3. No, cancel"))
+            .collect();
+        assert!(!antigravity_deny_shown(&q, &other_digit));
+
+        let mut deny_above = without("  4. No, cancel");
+        deny_above.insert(0, "  4. No, cancel".to_string());
+        assert!(!antigravity_deny_shown(&q, &deny_above));
+
+        let mut unmeasured = q.clone();
+        unmeasured.questions[0].prompt = "Trust this folder?".to_string();
+        assert!(!antigravity_deny_shown(&unmeasured, &screen));
     }
 
     /// PRD #211 (audit, CWE-451): the original command decides what can be

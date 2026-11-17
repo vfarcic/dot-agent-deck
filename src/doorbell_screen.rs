@@ -1961,7 +1961,7 @@ mod e2e_only_standin_tests {
 }
 
 #[cfg(test)]
-mod antigravity_tests {
+pub(crate) mod antigravity_tests {
     use super::*;
 
     const PLACEHOLDER: &str = "Auto mode: edits & safe commands auto-approved (shift+tab to cycle)";
@@ -2057,5 +2057,41 @@ mod antigravity_tests {
             Some("antigravity-2026-11")
         );
         assert_eq!(profile("antigravity-2026-11").map(|p| p.id), Some(agy.id));
+    }
+
+    /// Real `agy` 1.5.9's output, 143 × 40, measured 2026-11-17: its ready
+    /// screen in Auto mode, a 145-character doorbell line typed in one write,
+    /// then one DEL per write, 20 ms apart, for each of its characters
+    /// (`tests/fixtures/antigravity/composer-after-paced-deletes.bin`).
+    pub(crate) const PACED_DELETES: &[u8] =
+        include_bytes!("../tests/fixtures/antigravity/composer-after-paced-deletes.bin");
+    /// Where the line had been echoed whole, before the first DEL.
+    pub(crate) const PACED_DELETES_TYPED: usize = 4954;
+    pub(crate) const PACED_DELETES_LINE: &str = "(oomimg) dot-agent-deck: message m-cj3oiiqh-3213cd9b5291441a waiting, run: /var/tmp/agy-measure-vESMu6/deck-under-test/dot-agent-deck inbox fetch";
+
+    /// PRD #211: after the deck's paced deletes `agy` draws a bare `>` with
+    /// the cursor at its start and `? for shortcuts` back under it — no
+    /// mode hint, even in Auto mode, whose hint the ready screen showed. The
+    /// frame the doorbell reads is that blank composer, no placeholder, no
+    /// dialog, which is what a gap withdrawal on a profile with no measured
+    /// placeholder is confirmed by (`doorbell_txn::Txn::confirm_withdrawn`).
+    #[test]
+    fn antigravity_paced_deletes_leave_a_blank_composer() {
+        let agy = &ANTIGRAVITY_PROFILE;
+        let typed = Grid::parse(&PACED_DELETES[..PACED_DELETES_TYPED], 40, 143);
+        assert_eq!(
+            agy.holds(&typed, PACED_DELETES_LINE),
+            Some(ComposerText::Exact)
+        );
+
+        let deleted = Grid::parse(PACED_DELETES, 40, 143);
+        assert!(agy.empty_and_ready(&deleted));
+        assert!(!agy.placeholder_empty(&deleted), "no hint comes back");
+        let read = super::frame(agy, &deleted, 0, true, None);
+        assert_eq!(read.dialog, None);
+        let composer = read.composer.expect("the ready composer");
+        assert_eq!(composer.text, "");
+        assert!(composer.cursor_at_end, "the cursor at the composer's start");
+        assert!(!composer.placeholder && !composer.hidden && !composer.selection);
     }
 }

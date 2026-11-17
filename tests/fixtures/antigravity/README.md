@@ -26,6 +26,7 @@ Hook payloads, hook outputs and OSC 7501 status sequences captured from a real A
 | `output-pre-invocation-inject-steps-rejected.json` | the string form of `systemMessage`, which `agy` rejected (`failed to unmarshal result … via protojson`) and ignored | written by the probe, behaviour captured |
 | `osc7501-sequences.json` | every distinct OSC 7501 sequence `agy` wrote (`sequences`, with the exact bytes and the decoded `msg`), and the order they came in for each scenario (`scenarios`) | captured; `scenarios` transcribed from the driver's event log |
 | `permission-menu.json` | Command permission labels drawn by real interactive `agy` 1.5.9, plus the two-choice file creation menu (also drawn when `write_file` overwrites an existing file); digits 1–3 run a scratch command without Enter, while digit 4 and Esc leave its target untouched; file creation accepts 1 and denies 2 | measured through the daemon attach stream; scratch command filename normalized to the OSC fixture's `probe.txt` |
+| `composer-after-paced-deletes.bin` | real `agy` 1.5.9's raw output at 143 × 40 in Auto mode: the ready screen, a 145-character doorbell line typed in one write (echoed whole by byte 4954), then one DEL per write, 20 ms apart, for each character; it ends on a bare `>` composer with the cursor at its start, no mode hint, and `? for shortcuts` under it | captured byte for byte through a PTY, 2026-11-17; the scratch path in the line is the measurement's own, since deleted |
 
 ## Synthetic terminal geometry
 

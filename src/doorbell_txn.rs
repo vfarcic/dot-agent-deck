@@ -2326,8 +2326,21 @@ mod gap_withdrawal_tests {
     fn run_out(
         txn: &mut Txn<'_>,
         seam: &mut OneFrame,
+        actions: Vec<Action>,
+        now: Instant,
+    ) -> (Outcome, Vec<Job>) {
+        let after = withdrawn_frame(txn);
+        run_out_to(txn, seam, actions, now, after)
+    }
+
+    /// [`run_out`], with `after` the frame the agent draws once it took
+    /// every delete.
+    fn run_out_to(
+        txn: &mut Txn<'_>,
+        seam: &mut OneFrame,
         mut actions: Vec<Action>,
         mut now: Instant,
+        after: Frame,
     ) -> (Outcome, Vec<Job>) {
         let mut jobs = Vec::new();
         loop {
@@ -2341,7 +2354,7 @@ mod gap_withdrawal_tests {
                 Some(Job::Deletes(n)) => {
                     txn.on(Event::JobStarted, seam, now);
                     // The agent took every delete: its composer is empty.
-                    seam.0 = withdrawn_frame(txn);
+                    seam.0 = after.clone();
                     txn.on(
                         Event::JobEnded {
                             accepted: *n,
@@ -2445,6 +2458,30 @@ mod gap_withdrawal_tests {
         let (actions, _) = type_then_show(&mut txn, &mut seam, composer(&gapped(&line), false), t0);
         assert_eq!(enqueued(&actions), vec![Job::Deletes(line.chars().count())]);
         let (outcome, _) = run_out(&mut txn, &mut seam, actions, t0 + ECHO_WAIT);
+        assert_eq!(outcome, Outcome::Withdrawn);
+    }
+
+    /// PRD #211: what real `agy` 1.5.9 drew after the deck's paced deletes
+    /// (`doorbell_screen`'s `PACED_DELETES` capture), read by its own profile,
+    /// confirms the gap withdrawal: Antigravity has no measured placeholder,
+    /// and the composer it leaves is blank with the cursor at its start.
+    #[test]
+    fn real_agy_after_paced_deletes_confirms_the_gap_withdrawal() {
+        use crate::doorbell_screen::{ANTIGRAVITY_PROFILE, Grid, frame};
+        let grid = Grid::parse(
+            crate::doorbell_screen::antigravity_tests::PACED_DELETES,
+            40,
+            143,
+        );
+        let after = frame(&ANTIGRAVITY_PROFILE, &grid, 0, true, None);
+        let bell = generation();
+        let t0 = Instant::now();
+        let mut txn = admit_on(&bell, caps(false), t0);
+        let line = txn.line().to_string();
+        let mut seam = OneFrame(composer("", true));
+        let (actions, _) = type_then_show(&mut txn, &mut seam, composer(&gapped(&line), false), t0);
+        assert_eq!(enqueued(&actions), vec![Job::Deletes(line.chars().count())]);
+        let (outcome, _) = run_out_to(&mut txn, &mut seam, actions, t0 + ECHO_WAIT, after);
         assert_eq!(outcome, Outcome::Withdrawn);
     }
 

@@ -9465,11 +9465,18 @@ pub(crate) async fn answer_question_tokened_at(
             // before the key goes in. A grant's check there marks the frame it
             // read, and the PTY thread writes the key only while no output has
             // changed it since (audit B3). This is a consistency check of what
-            // the screen shows, not proof that `agy` drew it.
+            // the screen shows, not proof that `agy` drew it. The deny is
+            // checked against the menu's own frame and its own row instead,
+            // since a command `agy` wrapped or cut is exactly the one only the
+            // deny is offered for ([`crate::question::antigravity_deny_shown`]).
             let menu_shown = || {
                 agent_type != crate::event::AgentType::Antigravity
                     || registry.screen_rows(agent_id).is_some_and(|rows| {
-                        crate::question::antigravity_menu_shown(&question, rows)
+                        if denied {
+                            crate::question::antigravity_deny_shown(&question, rows)
+                        } else {
+                            crate::question::antigravity_menu_shown(&question, rows)
+                        }
                     })
             };
             if !menu_shown() {
