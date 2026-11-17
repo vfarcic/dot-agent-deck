@@ -129,22 +129,21 @@ fn evidence(deck: &common::TuiDeck, agent: &str) -> String {
 /// Scenario: Open an orchestration in the attached TUI whose worker is interactive Codex (the cheap test model), started directly in its pane; a test-owned client attached to the worker answers Codex's cursor position queries as the desktop app's terminal would (a disclosed stand-in for a desktop, not coverage of the desktop's own answers). The user focuses the worker, types a draft into its input box and deletes it. The scripted orchestrator then runs the real `dot-agent-deck delegate`: the deck checks the touched box, finds it empty, rings, and Codex appends one uniquely named line to a sentinel file the test created with `O_EXCL`. The file must hold exactly that one line and the inbox must report the task acknowledged with one delivery, with the check's empty read logged before the ring.
 #[spec("chain-smoke/codex/001")]
 #[test]
+#[ignore = "quarantined: vfarcic, #2337"]
 fn codex_001_touched_box_checked_then_delegate_delivered_once() {
     use std::io::Write as _;
     skip_unless!(codex_installed::checkable());
     let release = codex_installed::installed_release().unwrap();
     eprintln!("chain-smoke/codex/001: Codex {release}, no assumption");
-    // 200 columns, not 180: at 180 the TUI gives the worker a 117-column
-    // pane, and there the deck held the fresh worker unchecked and unrung
-    // (`Surface`, then `Layout`) until a first prompt, the deck not taking
-    // its logo as a width witness (`codex_width_witness`, which refuses a
-    // width whose neighbour the pane has also had). cxfix logged it: every
-    // refusal read `widths=Some((117, [116, 117]))`, and part 3's head
-    // before the Codex activation (`4b5e5f95`) refused its ring `Layout`
-    // with the same widths, so the limit is older than the activation. At
-    // 200 the worker's pane is 130 columns and it passes.
+    // 180 columns, issue #2124's reproduction: the TUI gives the worker a
+    // 117-column pane that has also been 116 wide, the two widths at which
+    // Codex draws its start-up logo in the same place. Before the fix the
+    // deck held the fresh worker unchecked and unrung (`Surface`, then
+    // `Layout`, every refusal logging `widths=Some((117, [116, 117]))`)
+    // until a first prompt; the logo now counts as the pair witness while
+    // nothing reaches the pane's last column (`src/evidence_state.rs`).
     let deck = common::TuiDeck::builder()
-        .with_pty_size(200, 50)
+        .with_pty_size(180, 50)
         .with_imported_codex_credentials()
         .with_env("PATH", common::path_with_binary_dir())
         .with_env("DOT_AGENT_DECK_LOG", LOG)

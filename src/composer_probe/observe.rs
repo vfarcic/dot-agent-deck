@@ -21,7 +21,9 @@
 //!   (`?2004l`, which an agent writes as it runs its editor), the helper
 //!   copies that are `A`'s own children. A sighting carries no decision,
 //!   claim or numbers ([`scan_observation`]): `Records::observe` refuses
-//!   none of those on a scan, so this adapter is what keeps them out.
+//!   none of those on a scan, so this adapter is what keeps them out. A
+//!   helper copy whose argv isn't published yet, one still inside its
+//!   `execve(2)`, is left to a later pass rather than attributed.
 //! - **The exit**, by the pidfd each record's helper is held by.
 //!
 //! **Settlement** is the records' (core §2.4). An `Armed` decision consumes
@@ -1092,8 +1094,12 @@ impl<P: Page> Seam<P> {
                 .and(Err(Refusal::NoRecord)),
         };
         self.sync();
+        // The record's own attribution and claim, which settle it: the first
+        // a channel brought, which needn't be this invocation's.
+        let kept = evidence.and_then(|e| self.input.record(e.key));
         // cxact: why an invocation's outcome is what it is (the record's
-        // settlement, the daemon's attribution and read); no path or text.
+        // settlement, attribution and claim, the daemon's attribution of this
+        // invocation and its read); no path or text.
         tracing::debug!(
             target: "composer_probe",
             ?decided,
@@ -1102,6 +1108,8 @@ impl<P: Page> Seam<P> {
                 other => format!("{other:?}"),
             }),
             attribution = ?evidence.map(|e| e.attribution),
+            record_attribution = ?kept.map(|r| r.attribution),
+            record_claim = ?kept.and_then(|r| r.claim),
             ?read,
             "editor helper invocation recorded"
         );
@@ -1215,9 +1223,24 @@ impl Bell {
         self.ring();
     }
 
+    /// Ask for a child scan at the next pass without waking the observer
+    /// now: the pass comes one [`SCAN_PERIOD`] later, so a scan that met a
+    /// helper still inside its `execve(2)` looks again then rather than
+    /// spinning while the exec finishes (issue #2243).
+    pub fn scan_later(&self) {
+        self.scan.store(true, Ordering::Release);
+    }
+
     /// Whether a scan was asked for since the last call.
     pub fn take_scan(&self) -> bool {
         self.scan.swap(false, Ordering::AcqRel)
+    }
+
+    /// Whether a scan was asked for and no pass has taken it yet. Only the
+    /// Linux observer scans.
+    #[cfg(target_os = "linux")]
+    fn scan_asked(&self) -> bool {
+        self.scan.load(Ordering::Acquire)
     }
 
     /// The thread to wake.
@@ -1949,6 +1972,23 @@ mod linux {
     fn floor_of(start: u64) -> Option<Instant> {
         let now = Instant::now();
         super::birth_floor(start, ticks_per_sec(), now, boot_now_ns()?)
+    }
+
+    /// Whether `pid`'s argv is published: anything but an empty
+    /// `/proc/<pid>/cmdline`. A process inside `execve(2)` already runs its
+    /// new executable (`/proc/<pid>/exe` names it) before the kernel sets
+    /// its argv, which happens only once the binary and its interpreter are
+    /// mapped. That gap is microseconds on an idle machine and grows with
+    /// the page-ins under io pressure. An exiting process also reads empty
+    /// once its memory is released; it is gone by a later pass. A process
+    /// started with no arguments still reads one byte (Linux gives it an
+    /// empty `argv[0]`), and a read that fails is left to the attestation.
+    fn argv_published(pid: u32) -> bool {
+        use std::io::Read as _;
+        let mut byte = [0u8; 1];
+        !std::fs::File::open(format!("/proc/{pid}/cmdline"))
+            .and_then(|mut file| file.read(&mut byte))
+            .is_ok_and(|read| read == 0)
     }
 
     fn exe_id(pid: u32) -> Option<FileId> {
@@ -3349,6 +3389,7 @@ mod linux {
             let inner = self.lock();
             let count = inner.seam.input().liability_count().unwrap_or(0);
             count > 0
+                || self.bell.scan_asked()
                 || !inner.watch.pins.is_empty()
                 || !inner.watch.exited.is_empty()
                 || !inner.watch.open.is_empty()
@@ -3423,6 +3464,14 @@ mod linux {
                         }
                         continue;
                     }
+                }
+                // A record takes its first attribution and keeps it, so a
+                // helper caught before its exec published its argv would be
+                // kept `NotOwned(Shape)`, and its `Armed` decision would
+                // consume nothing (issue #2243). Look again next pass.
+                if !argv_published(pid) {
+                    self.bell.scan_later();
+                    continue;
                 }
                 if *budget == 0 {
                     return;
