@@ -171,13 +171,17 @@ impl Agy {
             !self.deck.workdir().join("hook-replay.log").exists(),
             "first-prompt readiness must not depend on an earlier hook"
         );
+        self.ring_next_turn()
+    }
+
+    fn ring_next_turn(&self) -> String {
         self.replay(json!([{"osc":"idle"}]));
         assert!(
             common::wait_for_path(
                 &self.deck.workdir().join("doorbell-answer.json"),
                 Duration::from_secs(20)
             ),
-            "idle Antigravity must receive its doorbell before any SessionStart: {}",
+            "idle Antigravity must receive its doorbell: {}",
             self.diagnostic()
         );
         self.result("doorbell-answer")["stdout"]
@@ -236,7 +240,7 @@ fn antigravity_inbox_001_doorbell_uses_nested_injection_without_reentry_delivery
     inbox::state(&agy.deck, &agy.pane, &second, "queued");
 }
 
-/// Scenario: While Antigravity is working, queue a task and replay its ordinary Stop hook. The hook returns a continue decision containing the framed task, commits its receipt once, and a re-entered empty Stop injects nothing without typing into the pane.
+/// Scenario: While Antigravity is working, queue a task and replay its ordinary Stop hook; it continues with the framed task exactly once without typing into the pane. At execution ten, a queued task is retained without a continue response and reaches the next doorbell turn instead.
 #[spec("antigravity/inbox/002")]
 #[test]
 fn antigravity_inbox_002_busy_stop_continues_with_framed_mail_once() {
@@ -265,6 +269,25 @@ fn antigravity_inbox_002_busy_stop_continues_with_framed_mail_once() {
     );
     agy.committed_once(&id);
     agy.no_input("during busy hand-over");
+
+    agy.hook("pre-invocation.json", json!({}), "limit-working");
+    let limited = inbox::enqueue(&agy.deck, &agy.pane, "AGY-LIMIT-RETAINED-e841");
+    let stdout = agy.hook("stop.json", json!({"executionNum":10}), "limit-stop");
+    assert!(
+        stdout.trim().is_empty() || stdout.trim() == "{}",
+        "executionNum 10 cannot continue; queued mail must wait for the next turn: {stdout:?}"
+    );
+    inbox::state(&agy.deck, &agy.pane, &limited, "queued");
+    let stdout = agy.ring_next_turn();
+    let answer: Value = serde_json::from_str(&stdout).expect("next doorbell PreInvocation JSON");
+    framed(
+        answer["injectSteps"][0]["systemMessage"]["systemMessage"]
+            .as_str()
+            .unwrap(),
+        &limited,
+        "AGY-LIMIT-RETAINED-e841",
+    );
+    agy.committed_once(&limited);
 }
 
 /// Scenario: Queue mail while Antigravity works and replay an error Stop. It hands over nothing and leaves the task queued, so the next successful Stop can deliver that same task with a continue decision.

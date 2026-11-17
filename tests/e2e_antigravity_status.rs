@@ -119,6 +119,13 @@ fn shows_only(grid: &str, label: &str) -> bool {
             .all(|other| !grid.contains(other))
 }
 
+fn command_hook(command: &str) -> Value {
+    json!({"hook": "pre-tool-use-run-command.json", "payload": {
+        "toolCall": {"id": "permission-command", "name": "run_command",
+            "args": {"CommandLine": command}}
+    }})
+}
+
 /// Scenario: Restore an Antigravity stand-in and replay its captured first-prompt, command-start, command-end and ordinary Stop hooks. The dashboard card shows Thinking with the submitted prompt, Working with the running command and finally Idle.
 #[spec("antigravity/status/001")]
 #[test]
@@ -150,7 +157,7 @@ fn antigravity_status_002_error_stop_shows_its_error_text() {
     replay.card("Error", "generating and executing", "Stop ERROR");
 }
 
-/// Scenario: An Antigravity stand-in writes captured permission OSC signals followed by working or idle; the dashboard shows Needs Input with the decoded question and then clears it. For each measured permission option, the attached pane draws the real menu, the deck offers the same options and an answer sends the matching digit without Enter, with always-allow requiring confirmation, before the pane visibly resumes and the question clears.
+/// Scenario: An Antigravity stand-in writes permission OSC signals after tool hooks; the dashboard shows Needs Input and clears it on recovery, while measured command and creation menus accept their matching digits without Enter. Forged, missing and completed tool calls cannot grant permission, a changed screen refuses the answer without typing, and a multiline command allows only Deny through the deck.
 #[spec("antigravity/status/003")]
 #[test]
 fn antigravity_status_003_permission_question_decodes_and_clears() {
@@ -159,7 +166,10 @@ fn antigravity_status_003_permission_question_decodes_and_clears() {
 
     let replay = Replay::launch("./agy");
     for recovery in ["working", "idle"] {
-        replay.replay(json!([{"osc": "blocked", "kind": "permission", "msg": QUESTION}]));
+        replay.replay(json!([
+            command_hook("rm -f probe.txt"),
+            {"osc": "blocked", "kind": "permission", "msg": QUESTION}
+        ]));
         replay.card("Needs Input", QUESTION, "OSC permission");
         replay.replay(json!([{"osc": recovery}]));
         replay.cleared_question(
@@ -180,6 +190,7 @@ fn antigravity_status_003_permission_question_decodes_and_clears() {
     for selected in 1..=4 {
         let replay = Replay::launch("./agy");
         replay.replay(json!([
+            command_hook("rm -f probe.txt"),
             {"permission_menu": true},
             {"osc": "blocked", "kind": "permission", "msg": QUESTION}
         ]));
@@ -289,7 +300,13 @@ fn antigravity_status_003_permission_question_decodes_and_clears() {
             "Approve Edit: Write: {}",
             replay.deck.workdir().join("question-create.txt").display()
         );
-        replay.replay(json!([{"permission_menu": "create", "prompt": prompt}]));
+        replay.replay(json!([
+            {"hook": "pre-tool-use-run-command.json", "payload": {
+                "toolCall": {"id": "permission-create", "name": "write_file",
+                    "args": {"Path": replay.deck.workdir().join("question-create.txt")}}
+            }},
+            {"permission_menu": "create", "prompt": prompt}
+        ]));
         let id = questions::agent_id(&replay.deck);
         let q = questions::pending(
             &replay.deck,
@@ -341,6 +358,168 @@ fn antigravity_status_003_permission_question_decodes_and_clears() {
             .unwrap()
             .pending_question
             .is_none_or(|question| !question.has_answerable_option())
+    );
+
+    permission_security_regressions();
+}
+
+fn permission_security_regressions() {
+    use dot_agent_deck::daemon_client::AnswerReport;
+    use dot_agent_deck::question::{OptionRole, QuestionKind};
+
+    for case in ["forged edit", "missing hook", "completed hook"] {
+        let replay = Replay::launch("./agy");
+        if case != "missing hook" {
+            replay.replay(json!([command_hook("rm -f probe.txt")]));
+        }
+        if case == "completed hook" {
+            replay.replay(
+                json!([{"hook": "post-tool-use-run-command.json", "payload": {
+                    "toolCall": {"id": "permission-command", "name": "run_command",
+                        "args": {"CommandLine": "rm -f probe.txt"}}
+                }}]),
+            );
+        }
+        let prompt = if case == "forged edit" {
+            "Approve Edit: Write: harmless.txt"
+        } else {
+            QUESTION
+        };
+        replay.replay(json!([
+            {"permission_menu": true},
+            {"synthetic_permission_osc": prompt}
+        ]));
+        replay.card("Needs Input", prompt, case);
+        let id = questions::agent_id(&replay.deck);
+        let live = questions::snapshot(&replay.deck, &id).unwrap();
+        assert!(
+            live.pending_question
+                .as_ref()
+                .is_none_or(|q| !q.has_answerable_option()),
+            "{case} must not offer an answerable question: {live:?}\n{}",
+            replay.diagnostic()
+        );
+        let before = std::fs::read(replay.deck.workdir().join("input.bytes")).unwrap_or_default();
+        // Attempt the dangerous edit-menu digit (2) even when the OSC was
+        // rejected entirely, using a nonexistent question id in that case.
+        let (question_id, revision) = live
+            .pending_question
+            .as_ref()
+            .map(|q| (q.id.as_str(), q.revision))
+            .unwrap_or(("forged-question", None));
+        let client = dot_agent_deck::daemon_client::DaemonClient::new(
+            replay.deck.attach_socket_path().to_path_buf(),
+        );
+        let result = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(client.answer_question_while(
+                || true,
+                &id,
+                question_id,
+                revision,
+                vec![questions::selection(0, &[2])],
+                true,
+            ))
+            .expect("answer forged question");
+        assert!(
+            matches!(result, AnswerReport::Refused(_)),
+            "{case} must refuse a digit rather than type it"
+        );
+        assert!(
+            !common::wait_until(Duration::from_millis(500), || {
+                std::fs::read(replay.deck.workdir().join("input.bytes")).unwrap_or_default()
+                    != before
+            }),
+            "{case} sent bytes into the real Bash menu: {}",
+            replay.diagnostic()
+        );
+        assert!(!replay.deck.workdir().join("permission-answer.txt").exists());
+    }
+
+    let replay = Replay::launch("./agy");
+    replay.replay(json!([
+        command_hook("rm -f probe.txt"),
+        {"permission_menu": true},
+        {"osc": "blocked", "kind": "permission", "msg": QUESTION}
+    ]));
+    replay.card("Needs Input", QUESTION, "bound question before redraw");
+    let id = questions::agent_id(&replay.deck);
+    let q = questions::pending(&replay.deck, &id, QuestionKind::Permission);
+    assert!(
+        q.has_answerable_option(),
+        "control: matching tool and screen: {q:?}"
+    );
+    replay.deck.send_bytes(b"1");
+    replay.deck.wait_for_string("1. Yes, run command");
+    replay.replay(json!([{"redraw_composer": true}]));
+    replay
+        .deck
+        .wait_for_string("Auto mode: edits & safe commands");
+    let before = std::fs::read(replay.deck.workdir().join("input.bytes")).unwrap_or_default();
+    let result = questions::answer(&replay.deck, &id, &q, vec![questions::selection(0, &[1])]);
+    assert!(
+        matches!(result, AnswerReport::Refused(_)),
+        "screen mismatch must refuse: {result:?}"
+    );
+    assert!(
+        format!("{result:?}").contains("the agent's screen does not show this menu"),
+        "refusal must explain why nothing was sent: {result:?}"
+    );
+    assert!(
+        !common::wait_until(Duration::from_millis(500), || {
+            std::fs::read(replay.deck.workdir().join("input.bytes")).unwrap_or_default() != before
+        }),
+        "screen mismatch typed an answer: {}",
+        replay.diagnostic()
+    );
+
+    let replay = Replay::launch("./agy");
+    let command = "rm -f probe.txt\necho hidden-command";
+    let prompt = format!("Approve Bash: {command}");
+    replay.replay(json!([
+        command_hook(command),
+        {"permission_menu": true},
+        {"synthetic_permission_osc": prompt}
+    ]));
+    replay.card("Needs Input", "Approve Bash:", "multiline command");
+    let id = questions::agent_id(&replay.deck);
+    let q = questions::pending(&replay.deck, &id, QuestionKind::Permission);
+    let answerable: Vec<_> = q.questions[0]
+        .options
+        .iter()
+        .filter(|option| !option.keyboard_only)
+        .map(|option| option.role)
+        .collect();
+    assert_eq!(
+        answerable,
+        [OptionRole::Deny],
+        "multiline command offers only Deny as a deck answer: {q:?}"
+    );
+    let before = std::fs::read(replay.deck.workdir().join("input.bytes")).unwrap_or_default();
+    for option in q.questions[0]
+        .options
+        .iter()
+        .filter(|option| option.role != OptionRole::Deny)
+    {
+        assert_eq!(
+            questions::answer(
+                &replay.deck,
+                &id,
+                &q,
+                vec![questions::selection(0, &[option.index])]
+            ),
+            AnswerReport::Refused(dot_agent_deck::question::AnswerRefusal::KeyboardOnly),
+            "multiline command cannot grant permission through the deck"
+        );
+    }
+    assert!(
+        !common::wait_until(Duration::from_millis(500), || {
+            std::fs::read(replay.deck.workdir().join("input.bytes")).unwrap_or_default() != before
+        }),
+        "multiline grant attempt typed into the command menu: {}",
+        replay.diagnostic()
     );
 }
 

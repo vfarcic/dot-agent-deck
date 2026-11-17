@@ -111,6 +111,16 @@ def replay(action):
             history.write(json.dumps(action) + "\n")
     elif "pause_ms" in action:
         time.sleep(action["pause_ms"] / 1000)
+    elif "synthetic_permission_osc" in action:
+        # Deliberately untrusted text for permission forgery regressions;
+        # measured OSC replays above still come from the captured fixture.
+        encoded = base64.b64encode(action["synthetic_permission_osc"].encode()).decode()
+        sys.stdout.write(f"\033]7501;state=blocked:kind=permission:app=antigravity:msg={encoded}\007")
+        sys.stdout.flush()
+        state = "blocked"
+    elif "redraw_composer" in action:
+        permission_menu = None
+        redraw()
     elif "permission_menu" in action:
         permission_menu = action["permission_menu"]
         menu = json.loads((root / "permission-menu.json").read_text())

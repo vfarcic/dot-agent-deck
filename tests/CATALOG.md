@@ -7946,8 +7946,8 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_antigravity_inbox.rs`), real PTY, daemon and hook CLI.
 - **Agent:** none; captured Antigravity hook replay.
-- **Asserts:** SessionStart announces turn-end wake; ordinary Stop returns exactly `decision: continue` and the framed reason, commits the delivery once, and an empty re-entered Stop injects nothing; no doorbell input during hand-over.
-- **Does not assert:** Antigravity's own ten-continuation limit or a real model.
+- **Asserts:** SessionStart announces turn-end wake; ordinary Stop returns exactly `decision: continue` and the framed reason, commits the delivery once, and an empty re-entered Stop injects nothing; no doorbell input during hand-over. At `executionNum: 10`, Stop prints no continue, leaves mail queued and delivers it on the next doorbell turn.
+- **Does not assert:** a real model reaching the continuation limit.
 - **Platform coverage:** mac+linux.
 
 ##### antigravity/inbox/003 — Error Stop retains mail for the next ordinary Stop.
@@ -7977,7 +7977,7 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 ##### antigravity/status/003 — OSC permission questions show the measured menu, accept its answer keys and clear on recovery.
 - **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_antigravity_status.rs`).
 - **Agent:** `agy` stand-in replaying measured OSC 7501 bytes and the command permission menu measured on real `agy` 1.5.9.
-- **Asserts:** Needs Input includes the decoded question; working and idle clear it. Command permissions offer the four measured labels and roles; each client answer writes its measured digit without Enter and visibly resumes the pane, while both always-allow options require confirmation and describe their scopes. File creation instead offers its measured two choices and sends digit 1 or 2; folder trust is never advertised as an answerable command menu.
+- **Asserts:** Needs Input includes the decoded question; working and idle clear it. Tool-bound command permissions offer the four measured labels and roles; each client answer writes its measured digit without Enter and visibly resumes the pane, while both always-allow options require confirmation and describe their scopes. Tool-bound file creation offers its measured two choices and sends digit 1 or 2; folder trust is not an answerable command menu. Forged edit OSC over a Bash menu, missing PreToolUse and completed PostToolUse offer no answerable question and answering types no bytes; a composer redraw refuses an otherwise valid answer with an explanation. For multiline commands, Deny is the answerable choice and grant attempts are refused without typing.
 - **Does not assert:** real model compliance or remembering a permission in a subsequent turn (`question/live/009` covers real Allow Once).
 - **Platform coverage:** mac+linux (unix-only file).
 
