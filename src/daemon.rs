@@ -4167,6 +4167,10 @@ async fn report_status_update(
     use crate::event::EventType;
     use crate::status_osc::StatusUpdate;
     let moves_on = matches!(update, StatusUpdate::Working | StatusUpdate::Idle);
+    let prompts = matches!(
+        update,
+        StatusUpdate::NeedsInput(_) | StatusUpdate::Permission(_)
+    );
     let (event_type, reason, permission) = match update {
         StatusUpdate::Working => (EventType::Thinking, None, false),
         StatusUpdate::Idle => (EventType::Idle, None, false),
@@ -4225,13 +4229,19 @@ async fn report_status_update(
         })
         .await;
     drop(lifecycle);
-    // PRD #211 (PR #2370 review, Greptile P1): `agy`'s own status left its
-    // permission prompt for a working or idle turn. A lone digit that is the
-    // last thing typed into its box since it was untouched answered that
-    // menu, so the box is untouched still: Antigravity has no editor probe to
-    // read it empty again.
-    if ingested && moves_on && prompting && *agent_type == crate::event::AgentType::Antigravity {
-        registry.note_menu_answer_taken(agent_id, seen_at);
+    // PRD #211 (PR #2370 review, Greptile P1): Antigravity has no editor
+    // probe to read its box empty again, so `agy`'s own status says what the
+    // keys typed at a prompt did. The deck notes when that status first put
+    // the card on a permission prompt or dialog; when it then leaves it for a
+    // working or idle turn, menu keys (digits, Enter, arrows, Escape) that
+    // are all that was entered since the box was untouched answered the
+    // prompt, so the box is untouched still.
+    if *agent_type == crate::event::AgentType::Antigravity {
+        if ingested && prompts {
+            registry.note_prompt_shown(agent_id, seen_at);
+        } else if moves_on {
+            registry.note_menu_answer_taken(agent_id, seen_at, ingested && prompting);
+        }
     }
     if !ingested {
         tracing::debug!(
@@ -23499,6 +23509,56 @@ mod status_signal_park_tests {
         assert!(
             deck.registry.input_touched(&typed_agent),
             "a box touched before the answer stays touched"
+        );
+    }
+
+    /// Scenario: three Antigravity panes with untouched input boxes each show
+    /// a permission prompt; a person answers the first with Enter, the second
+    /// with Down, Down, Enter, and types `y` then Enter into the third. When
+    /// `agy` reports `idle` after the answer, the first two boxes are
+    /// untouched again and the third stays touched.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn menu_keys_answering_a_prompt_leave_an_untouched_box_untouched() {
+        let deck = Deck::start(&["agy-menu-enter", "agy-menu-arrows", "agy-menu-letter"]).await;
+        let answers: [&[&[u8]]; 3] = [&[b"\r"], &[b"\x1b[B", b"\x1b[B", b"\r"], &[b"y", b"\r"]];
+        for (index, keys) in answers.iter().enumerate() {
+            deck.thinking(index).await;
+            deck.signal(index, PERMISSION);
+            let card = deck
+                .card_within(index, Duration::from_secs(5), |(status, _)| {
+                    *status == SessionStatus::WaitingForInput
+                })
+                .await;
+            assert_eq!(card.map(|c| c.0), Some(SessionStatus::WaitingForInput));
+            let (pane, agent) = deck.panes[index].clone();
+            for key in keys.iter() {
+                deck.registry
+                    .write_user_bytes(&pane, &agent, key)
+                    .await
+                    .unwrap();
+            }
+            assert!(deck.registry.input_touched(&agent));
+            deck.signal(index, IDLE);
+            let card = deck
+                .card_within(index, Duration::from_secs(5), |(status, _)| {
+                    *status == SessionStatus::Idle
+                })
+                .await;
+            assert_eq!(card.map(|c| c.0), Some(SessionStatus::Idle));
+        }
+        for index in 0..2 {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while deck.registry.input_touched(&deck.panes[index].1) {
+                assert!(
+                    Instant::now() < deadline,
+                    "the answer left untouched box {index} touched"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        assert!(
+            deck.registry.input_touched(&deck.panes[2].1),
+            "a letter typed at the prompt leaves the box touched"
         );
     }
 

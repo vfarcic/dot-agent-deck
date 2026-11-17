@@ -13635,21 +13635,41 @@ impl AgentPtyRegistry {
         input.is_some_and(|input| input.reconcile_human_submit())
     }
 
+    /// PRD #211 (PR #2370 review): generation `agent_id`'s own terminal
+    /// status, read at `seen_at`, put its card on a permission prompt or
+    /// dialog ([`crate::composer_probe::epoch::GenerationInput::note_prompt_shown`]).
+    pub fn note_prompt_shown(&self, agent_id: &str, seen_at: Instant) {
+        if let Some(input) = self.generation_input(agent_id) {
+            input.note_prompt_shown(seen_at);
+        }
+    }
+
     /// PRD #211 (PR #2370 review, Greptile P1): generation `agent_id`'s own
-    /// terminal status, read at `read_at`, left the permission prompt its card
-    /// showed. When the last op into its box is a lone digit written into a
-    /// box that was untouched just before it, the box stays untouched
+    /// terminal status, read at `read_at`, left a permission prompt or
+    /// dialog; `card_on_prompt` is whether its card was on it. When what was
+    /// entered into its box since it was untouched is the menu keys that
+    /// answered it, the box stays untouched
     /// ([`crate::composer_probe::epoch::GenerationInput::reconcile_menu_answer`]).
     /// Whether it applied; `false` for a generation that is gone.
-    pub fn note_menu_answer_taken(&self, agent_id: &str, read_at: Instant) -> bool {
-        let input = {
-            let inner = self.inner.lock();
-            inner
-                .agents
-                .get(agent_id)
-                .map(|agent| Arc::clone(agent.bus.input()))
-        };
-        input.is_some_and(|input| input.reconcile_menu_answer(read_at))
+    pub fn note_menu_answer_taken(
+        &self,
+        agent_id: &str,
+        read_at: Instant,
+        card_on_prompt: bool,
+    ) -> bool {
+        self.generation_input(agent_id)
+            .is_some_and(|input| input.reconcile_menu_answer(read_at, card_on_prompt))
+    }
+
+    fn generation_input(
+        &self,
+        agent_id: &str,
+    ) -> Option<Arc<crate::composer_probe::epoch::GenerationInput>> {
+        let inner = self.inner.lock();
+        inner
+            .agents
+            .get(agent_id)
+            .map(|agent| Arc::clone(agent.bus.input()))
     }
 
     /// PRD #1666 part 3 (plan §5.1, Q35-21): the pane's open paste, whether
