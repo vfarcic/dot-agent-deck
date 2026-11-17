@@ -71,6 +71,11 @@ pub struct GenerationDoorbell {
     /// A first attempt was admitted: later rings do not wait for the settle
     /// window (plan §4.4).
     first_admitted: AtomicBool,
+    /// PRD #211: the last ring that wrote used the misrendered-echo
+    /// withdrawal ([`crate::doorbell_txn::Txn::allow_gap_withdrawal`]), so
+    /// the next one may not: a second misrendered echo in a row stays
+    /// suspended rather than withdrawing and ringing again.
+    gap_withdrawn: AtomicBool,
     /// The e2e build's stand-in editor's executable and the stand-in profile
     /// selected for this generation, when one was.
     #[cfg(feature = "e2e")]
@@ -111,6 +116,7 @@ impl GenerationDoorbell {
             master: master.and_then(duplicate),
             unwrapped_anchor: OnceLock::new(),
             first_admitted: AtomicBool::new(false),
+            gap_withdrawn: AtomicBool::new(false),
             #[cfg(feature = "e2e")]
             standin: None,
             on_moved: OnceLock::new(),
@@ -316,6 +322,18 @@ impl GenerationDoorbell {
     /// An attempt was admitted.
     pub fn admitted(&self) {
         self.first_admitted.store(true, Ordering::Release);
+    }
+
+    /// PRD #211: the next ring may use the misrendered-echo withdrawal: the
+    /// last ring that wrote did not.
+    pub fn gap_withdrawal_allowed(&self) -> bool {
+        !self.gap_withdrawn.load(Ordering::Acquire)
+    }
+
+    /// A ring that wrote ended; `used` when it started the misrendered-echo
+    /// withdrawal. A ring that wrote nothing leaves this as it was.
+    pub fn ring_wrote(&self, used: bool) {
+        self.gap_withdrawn.store(used, Ordering::Release);
     }
 }
 

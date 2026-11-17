@@ -1030,6 +1030,40 @@ pub struct Txn<'c> {
     /// it is logged at the default level, and the box can hold whatever the
     /// user typed or pasted.
     unresolved_at: Option<String>,
+    /// The driver allowed this attempt the misrendered-echo withdrawal
+    /// ([`Self::allow_gap_withdrawal`]).
+    gap_allowed: bool,
+    /// The current withdrawal is that one: its recogniser is
+    /// [`Self::gap_view`], not [`Self::strict`].
+    gap: bool,
+}
+
+/// PRD #211: `shown` is `typed` with only spaces inserted into it — every
+/// character of `typed` in order, nothing missing, nothing else added, and
+/// nothing before or after it (`shown` starts and ends with `typed`'s first
+/// and last characters) — and is not `typed` itself, which is the exact
+/// echo. This is how the composer draws a line whose every byte the agent
+/// took while its render fell out of step with its buffer (Antigravity's
+/// measured seven-column gap). A newline, a tab or any other character is
+/// not such a gap.
+pub fn whitespace_gap(shown: &str, typed: &str) -> bool {
+    if shown == typed || typed.is_empty() {
+        return false;
+    }
+    if shown.chars().next() != typed.chars().next()
+        || shown.chars().next_back() != typed.chars().next_back()
+    {
+        return false;
+    }
+    let mut rest = typed.chars().peekable();
+    for c in shown.chars() {
+        if rest.peek() == Some(&c) {
+            rest.next();
+        } else if c != ' ' {
+            return false;
+        }
+    }
+    rest.peek().is_none()
 }
 
 /// Step 1 and step 2 (plan §1.1): admit an attempt or say why not. On
@@ -1104,6 +1138,8 @@ pub fn admit<'c>(
         after_cr: false,
         admission_lost: false,
         unresolved_at: None,
+        gap_allowed: false,
+        gap: false,
     })
 }
 
@@ -1146,6 +1182,25 @@ impl<'c> Txn<'c> {
     /// written (diagnosis, as above).
     pub fn admission_was_lost(&self) -> bool {
         self.admission_lost
+    }
+
+    /// PRD #211: allow this attempt one recovery from a misrendered echo.
+    /// When the echo fails and the composer shows exactly the deck's own
+    /// line with only spaces inserted ([`whitespace_gap`]), the line is
+    /// withdrawn with one delete per character the deck typed, instead of
+    /// the attempt ending `Unresolved(EchoMismatch)`; the doorbell then
+    /// rings again. The driver allows it for an agent whose render is
+    /// measured to fall out of step with a buffer that took every byte, and
+    /// never for the ring right after one that used it, so a second
+    /// misrendered echo stays suspended.
+    pub fn allow_gap_withdrawal(&mut self) {
+        self.gap_allowed = true;
+    }
+
+    /// The attempt started the misrendered-echo withdrawal
+    /// ([`Self::allow_gap_withdrawal`]), whatever it ended in.
+    pub fn gap_withdrew(&self) -> bool {
+        self.gap
     }
 
     /// Which step and check last unresolved the attempt (diagnosis only).
@@ -1809,6 +1864,68 @@ impl<'c> Txn<'c> {
                 .is_none_or(|ended| now >= ended + SUBMIT_CONFIRM_WAIT)
     }
 
+    /// PRD #211, the misrendered echo's recogniser: the composer shows the
+    /// whole line the deck typed with only spaces inserted
+    /// ([`whitespace_gap`]), its token head drawn intact, cursor after it,
+    /// nothing highlighted or hidden, no placeholder, no dialog, the layout
+    /// epoch unchanged, and no Enter sent. Returns the deletes to send: one
+    /// per character the deck typed, since the agent's buffer took exactly
+    /// those and only its drawing has the gap. A person's keys since
+    /// admission are refused before this is read (the seam's job mark), and
+    /// any other difference, a missing or foreign character included, is no
+    /// such gap.
+    fn gap_view(&self) -> Option<usize> {
+        if !self.gap_allowed
+            || self.after_cr
+            || self.accepted != self.line.chars().count()
+            || !self.frame.clean
+            || self.frame.epoch != self.epoch
+            || self.frame.dialog.is_some()
+        {
+            return None;
+        }
+        let composer = self.frame.composer.as_ref()?;
+        if composer.selection || composer.placeholder || composer.hidden || !composer.cursor_at_end
+        {
+            return None;
+        }
+        let head: String = self
+            .line
+            .chars()
+            .take(crate::doorbell_screen::TOKEN_HEAD_CHARS)
+            .collect();
+        if !composer.text.starts_with(&head) || !whitespace_gap(&composer.text, &self.line) {
+            return None;
+        }
+        Some(self.line.chars().count())
+    }
+
+    /// The misrendered-echo withdrawal may start now: the profile has a
+    /// delete key, the transaction owns no job on the writer and no Enter
+    /// was ever queued. Its confirmation does not need a measured
+    /// placeholder ([`Self::confirm_withdrawn`]).
+    fn may_gap_withdraw(&self) -> bool {
+        self.caps.delete_key && self.job == Owned::Idle && self.cr_ended_at.is_none()
+    }
+
+    /// Start the misrendered-echo withdrawal, when it applies to an echo
+    /// mismatch on the current frame.
+    fn try_gap_withdrawal(
+        &mut self,
+        cause: Cause,
+        seam: &mut dyn Seam,
+        now: Instant,
+    ) -> Option<Vec<Action>> {
+        if cause != Cause::EchoMismatch || self.withdrawal.is_some() || !self.may_gap_withdraw() {
+            return None;
+        }
+        let deletes = self.gap_view()?;
+        self.gap = true;
+        self.withdrawal = Some((deletes, cause));
+        self.enter(Phase::Withdrawing, now);
+        Some(self.try_deletes(seam, now))
+    }
+
     /// A failure after the first byte: withdraw strictly when it applies,
     /// else `Unresolved(cause)` (plan §1.1, step 4 and 5's failures). The
     /// pause can still withdraw once its job has ended.
@@ -1819,6 +1936,9 @@ impl<'c> Txn<'c> {
             self.withdrawal = Some((deletes, cause));
             self.enter(Phase::Withdrawing, now);
             return self.try_deletes(seam, now);
+        }
+        if let Some(actions) = self.try_gap_withdrawal(cause, seam, now) {
+            return actions;
         }
         self.unresolve_without_withdrawal(cause, now)
     }
@@ -1857,8 +1977,14 @@ impl<'c> Txn<'c> {
         match self.seam(seam, false, now) {
             SeamVerdict::Contended(at) => vec![Action::WakeAt(at)],
             SeamVerdict::Pass(_) => {
-                // A fresh frame, immediately before the deletes.
-                if self.strict() != Some(deletes) {
+                // A fresh frame, immediately before the deletes, read by the
+                // recogniser that started the withdrawal.
+                let view = if self.gap {
+                    self.gap_view()
+                } else {
+                    self.strict()
+                };
+                if view != Some(deletes) {
                     return self.suspend_and_pause(cause, now);
                 }
                 self.enqueue(
@@ -1879,10 +2005,23 @@ impl<'c> Txn<'c> {
     /// `Withdrawn` needs the delete job done in full and then a Clean frame
     /// showing the placeholder. After a layout edge that is the next Clean
     /// frame, at the new epoch (plan §2.2).
+    ///
+    /// The misrendered-echo withdrawal of a profile with no measured
+    /// placeholder (Antigravity's hint is not redrawn by every clear) is
+    /// confirmed by a blank composer instead, cursor at its start, nothing
+    /// hidden: it deleted one character per byte the agent took, so
+    /// anything the deletes left would be the line's own start, `(` and its
+    /// token, which the composer draws.
     fn confirm_withdrawn(&mut self, now: Instant) -> Vec<Action> {
         if self.frame.clean {
             self.epoch = self.frame.epoch;
-            if self.frame.placeholder_empty() {
+            let blank = self.gap
+                && !self.caps.placeholder
+                && self.frame.dialog.is_none()
+                && self.frame.composer.as_ref().is_some_and(|c| {
+                    !c.hidden && !c.selection && c.text.is_empty() && c.cursor_at_end
+                });
+            if self.frame.placeholder_empty() || blank {
                 let _ = self.cell.resolve(self.attempt, Resolution::Withdrawn);
                 return self.release(Outcome::Withdrawn);
             }
@@ -1921,6 +2060,9 @@ impl<'c> Txn<'c> {
             self.withdrawal = Some((deletes, cause));
             self.enter(Phase::Withdrawing, now);
             return self.try_deletes(seam, now);
+        }
+        if let Some(actions) = self.try_gap_withdrawal(cause, seam, now) {
+            return actions;
         }
         vec![Action::WakeAt(self.next_wake(now))]
     }
@@ -2036,4 +2178,320 @@ pub fn seam_until(
         now = (now + SEAM_RETRY).min(deadline);
     }
     None
+}
+
+#[cfg(test)]
+mod gap_withdrawal_tests {
+    //! PRD #211: the misrendered-echo withdrawal ([`Txn::allow_gap_withdrawal`]),
+    //! driven step by step against a seam that shows one frame.
+
+    use super::*;
+    use crate::doorbell_generation::GenerationDoorbell;
+
+    const ID: &str = "m-k3xzq2ab-0f3c9a71d2e4b850";
+
+    struct OneFrame(Frame);
+
+    impl Seam for OneFrame {
+        fn read(&mut self) -> Option<SeamRead> {
+            Some(SeamRead {
+                watermark: 0,
+                job_mark: 0,
+                frame: self.0.clone(),
+                mode: Ok(()),
+                open: true,
+            })
+        }
+    }
+
+    fn composer(text: &str, placeholder: bool) -> Frame {
+        Frame {
+            epoch: 0,
+            clean: true,
+            composer: Some(ComposerView {
+                text: text.to_string(),
+                cursor_at_end: true,
+                placeholder,
+                selection: false,
+                hidden: false,
+            }),
+            ..Frame::default()
+        }
+    }
+
+    fn caps(placeholder: bool) -> Caps {
+        Caps {
+            delete_key: true,
+            placeholder,
+            hook_route: true,
+            transcript_route: false,
+            staged_head: None,
+        }
+    }
+
+    fn generation() -> GenerationDoorbell {
+        GenerationDoorbell::new(
+            false,
+            #[cfg(unix)]
+            None,
+        )
+    }
+
+    /// Admit one attempt on `bell`, allowing the gap withdrawal as the driver
+    /// does: only when the last ring that wrote did not use it.
+    fn admit_on(bell: &GenerationDoorbell, caps: Caps, now: Instant) -> Txn<'_> {
+        let admission = Admission {
+            activation: Ok(()),
+            mode: Ok(()),
+            ledger_idle: true,
+            watermark: 0,
+            job_mark: 0,
+            frame: composer("", true),
+            nudge_in_flight: false,
+            settling: false,
+            submit_route: true,
+            still_admitted: true,
+            command: "dot-agent-deck".to_string(),
+        };
+        let mut draws = [3u8, 1, 4, 1, 5, 9, 2, 6].into_iter().cycle();
+        let mut txn = admit(
+            &admission,
+            bell.counter(),
+            bell.ring(),
+            bell.cell(),
+            || draws.next().unwrap(),
+            &MessageId::parse(ID).unwrap(),
+            caps,
+            now,
+        )
+        .expect("admitted");
+        if bell.gap_withdrawal_allowed() {
+            txn.allow_gap_withdrawal();
+        }
+        txn
+    }
+
+    /// `line` with seven spaces inserted after its 35th character, as `agy`
+    /// drew it.
+    fn gapped(line: &str) -> String {
+        let at = line.char_indices().nth(35).unwrap().0;
+        format!("{}       {}", &line[..at], &line[at..])
+    }
+
+    fn enqueued(actions: &[Action]) -> Vec<Job> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Enqueue(job, _) => Some(job.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn released(actions: &[Action]) -> Option<Outcome> {
+        actions.iter().find_map(|a| match a {
+            Action::Release(outcome) => Some(*outcome),
+            _ => None,
+        })
+    }
+
+    /// Type the whole line, then show `shown` once the echo wait is over.
+    /// Returns what that step asked for and every job queued.
+    fn type_then_show(
+        txn: &mut Txn<'_>,
+        seam: &mut OneFrame,
+        shown: Frame,
+        t0: Instant,
+    ) -> (Vec<Action>, Vec<Job>) {
+        let mut jobs = enqueued(&txn.start(seam, t0));
+        assert_eq!(jobs, vec![Job::Line(txn.line().to_string())]);
+        txn.on(Event::JobStarted, seam, t0);
+        let n = txn.line().len();
+        txn.on(
+            Event::JobEnded {
+                accepted: n,
+                ok: true,
+            },
+            seam,
+            t0,
+        );
+        seam.0 = shown.clone();
+        let actions = txn.on(Event::Frame(shown), seam, t0 + ECHO_WAIT);
+        jobs.extend(enqueued(&actions));
+        (actions, jobs)
+    }
+
+    /// Run the transaction to its end on `seam`'s frame, reporting each queued
+    /// job as written in full; returns the outcome and the jobs.
+    fn run_out(
+        txn: &mut Txn<'_>,
+        seam: &mut OneFrame,
+        mut actions: Vec<Action>,
+        mut now: Instant,
+    ) -> (Outcome, Vec<Job>) {
+        let mut jobs = Vec::new();
+        loop {
+            if let Some(outcome) = released(&actions) {
+                return (outcome, jobs);
+            }
+            let queued = enqueued(&actions);
+            jobs.extend(queued.iter().cloned());
+            now += Duration::from_millis(50);
+            actions = match queued.first() {
+                Some(Job::Deletes(n)) => {
+                    txn.on(Event::JobStarted, seam, now);
+                    // The agent took every delete: its composer is empty.
+                    seam.0 = withdrawn_frame(txn);
+                    txn.on(
+                        Event::JobEnded {
+                            accepted: *n,
+                            ok: true,
+                        },
+                        seam,
+                        now,
+                    )
+                }
+                Some(job) => panic!("unexpected job {job:?}"),
+                None => txn.on(Event::Frame(seam.0.clone()), seam, now),
+            };
+        }
+    }
+
+    /// The composer once the deletes went in: its placeholder for a profile
+    /// with one, else a blank box.
+    fn withdrawn_frame(txn: &Txn<'_>) -> Frame {
+        composer("", txn.caps.placeholder)
+    }
+
+    #[test]
+    fn whitespace_gap_accepts_only_inserted_spaces_inside_the_line() {
+        let typed = "(abcdef) dot-agent-deck: message m-1";
+        assert!(whitespace_gap(&gapped(typed), typed));
+        assert!(whitespace_gap(
+            "(abcdef)  dot-agent-deck: message m-1",
+            typed
+        ));
+        assert!(!whitespace_gap(typed, typed), "the exact echo is no gap");
+        assert!(!whitespace_gap(&format!(" {typed}"), typed), "before it");
+        assert!(!whitespace_gap(&format!("{typed} "), typed), "after it");
+        assert!(
+            !whitespace_gap(&typed.replace("m-1", "m1"), typed),
+            "missing"
+        );
+        assert!(!whitespace_gap(
+            &typed.replace("message", "messagex"),
+            typed
+        ));
+        assert!(!whitespace_gap(&typed.replace(' ', "\n"), typed), "newline");
+        assert!(!whitespace_gap(&typed.replace(": ", ":\t "), typed), "tab");
+        assert!(!whitespace_gap("", typed));
+    }
+
+    #[test]
+    fn a_whitespace_gap_is_withdrawn_by_the_typed_count_and_the_next_ring_submits() {
+        let bell = generation();
+        let t0 = Instant::now();
+        let mut txn = admit_on(&bell, caps(true), t0);
+        let line = txn.line().to_string();
+        let mut seam = OneFrame(composer("", true));
+        let (actions, mut jobs) =
+            type_then_show(&mut txn, &mut seam, composer(&gapped(&line), false), t0);
+        assert_eq!(
+            enqueued(&actions),
+            vec![Job::Deletes(line.chars().count())],
+            "one delete per character the deck typed, at once"
+        );
+        let (outcome, more) = run_out(&mut txn, &mut seam, actions, t0 + ECHO_WAIT);
+        jobs.extend(more);
+        assert_eq!(outcome, Outcome::Withdrawn);
+        assert!(txn.gap_withdrew());
+        assert!(
+            !jobs.contains(&Job::Cr),
+            "a misrendered echo is never submitted"
+        );
+        assert!(matches!(
+            bell.cell().load(),
+            Latch::Resolved(_, Resolution::Withdrawn)
+        ));
+        bell.ring_wrote(txn.gap_withdrew());
+
+        // The retry: the agent now draws the line exactly, and it is
+        // submitted once.
+        let t1 = t0 + TXN_MAX;
+        let mut retry = admit_on(&bell, caps(true), t1);
+        let line = retry.line().to_string();
+        let mut seam = OneFrame(composer("", true));
+        let (_, jobs) = type_then_show(&mut retry, &mut seam, composer(&line, false), t1);
+        assert_eq!(
+            jobs,
+            vec![Job::Line(line), Job::Cr],
+            "typed once, then Enter"
+        );
+        assert!(!retry.gap_withdrew());
+        bell.ring_wrote(retry.gap_withdrew());
+        assert!(
+            bell.gap_withdrawal_allowed(),
+            "a ring without it re-arms it"
+        );
+    }
+
+    #[test]
+    fn without_a_measured_placeholder_a_blank_composer_confirms_the_gap_withdrawal() {
+        let bell = generation();
+        let t0 = Instant::now();
+        let mut txn = admit_on(&bell, caps(false), t0);
+        let line = txn.line().to_string();
+        let mut seam = OneFrame(composer("", true));
+        let (actions, _) = type_then_show(&mut txn, &mut seam, composer(&gapped(&line), false), t0);
+        assert_eq!(enqueued(&actions), vec![Job::Deletes(line.chars().count())]);
+        let (outcome, _) = run_out(&mut txn, &mut seam, actions, t0 + ECHO_WAIT);
+        assert_eq!(outcome, Outcome::Withdrawn);
+    }
+
+    #[test]
+    fn a_foreign_character_stays_suspended_and_nothing_is_deleted() {
+        let bell = generation();
+        let t0 = Instant::now();
+        let mut txn = admit_on(&bell, caps(true), t0);
+        let line = txn.line().to_string();
+        let foreign = gapped(&line).replacen("       ", "   x   ", 1);
+        let mut seam = OneFrame(composer("", true));
+        let (actions, mut jobs) =
+            type_then_show(&mut txn, &mut seam, composer(&foreign, false), t0);
+        assert_eq!(txn.phase(), Phase::Pause(Cause::EchoMismatch));
+        assert!(bell.cell().load().suspended());
+        // The pause runs on to the deadline, deleting nothing.
+        let (outcome, more) = run_out(&mut txn, &mut seam, actions, t0 + ECHO_WAIT);
+        jobs.extend(more);
+        assert_eq!(outcome, Outcome::Unresolved(Cause::EchoMismatch));
+        assert!(!txn.gap_withdrew());
+        assert_eq!(jobs, vec![Job::Line(line)], "no delete, no Enter");
+    }
+
+    #[test]
+    fn a_retry_that_mismatches_again_stays_suspended() {
+        let bell = generation();
+        let t0 = Instant::now();
+        let mut first = admit_on(&bell, caps(true), t0);
+        let line = first.line().to_string();
+        let mut seam = OneFrame(composer("", true));
+        let (actions, _) =
+            type_then_show(&mut first, &mut seam, composer(&gapped(&line), false), t0);
+        let (outcome, _) = run_out(&mut first, &mut seam, actions, t0 + ECHO_WAIT);
+        assert_eq!(outcome, Outcome::Withdrawn);
+        bell.ring_wrote(first.gap_withdrew());
+        assert!(!bell.gap_withdrawal_allowed());
+
+        let t1 = t0 + TXN_MAX;
+        let mut retry = admit_on(&bell, caps(true), t1);
+        let line = retry.line().to_string();
+        let mut seam = OneFrame(composer("", true));
+        let (_, jobs) = type_then_show(&mut retry, &mut seam, composer(&gapped(&line), false), t1);
+        assert_eq!(retry.phase(), Phase::Pause(Cause::EchoMismatch));
+        assert!(bell.cell().load().suspended());
+        assert_eq!(jobs, vec![Job::Line(line)], "no second withdrawal");
+        let outcome = released(&retry.on(Event::Tick, &mut seam, retry.deadline()));
+        assert_eq!(outcome, Some(Outcome::Unresolved(Cause::EchoMismatch)));
+        assert!(!retry.gap_withdrew());
+    }
 }
