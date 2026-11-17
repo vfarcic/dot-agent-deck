@@ -24,7 +24,28 @@ const SENTINEL: &str = "AGENT_CARD_LIVE_3E91D7_SENTINEL.sentinel";
 /// so it reaches the agent framed as untrusted (audit S1).
 const SUGGESTED: &str = "AGENT_CARD_LIVE_3E91D7_SUGGESTED.sentinel";
 const PANE_ID: &str = "agent-card-live-pane";
-const WAIT: Duration = Duration::from_secs(150);
+/// Each phase's own bound. Their sum, with the harness's fixed waits, sets
+/// the deck lifetime below and the nextest override for this binary
+/// (`.config/nextest.toml`):
+///
+/// | phase | bound |
+/// | --- | --- |
+/// | the deck draws `No active agents`, Haiku leaves it, typing mode (harness `WAIT_TIMEOUT` x 3) | 90s |
+/// | Haiku's `SessionStart` | [`START`] 90s |
+/// | Haiku's pane settles | [`SETTLE`] 60s |
+/// | the publish prompt is typed and submitted (`CLAUDE_PROMPT_SUBMIT_BASE` 20s, load-scaled up to x6) | 120s |
+/// | the published card, the suggested file, the sentinel: one agent turn each | 3 x [`TURN`] 120s |
+/// | the delivery recorded and the card done, after the sentinel | [`FOLLOW_UP`] 90s |
+/// | the attached TUI shows the sentinel | [`SHOWN`] 30s |
+/// | **worst case** | **840s** |
+///
+/// The 60s between that and the 900s lifetime is for what has no bound of its
+/// own: spawning the deck and the `card list` / `card act` calls.
+const START: Duration = Duration::from_secs(90);
+const SETTLE: Duration = Duration::from_secs(60);
+const TURN: Duration = Duration::from_secs(120);
+const FOLLOW_UP: Duration = Duration::from_secs(90);
+const SHOWN: Duration = Duration::from_secs(30);
 
 /// Name the phase a timed-out run was in: nextest's timeout kill prints the
 /// captured stderr and nothing else.
@@ -62,9 +83,15 @@ fn card(deck: &TuiDeck, key: &str) -> Option<Value> {
         .cloned()
 }
 
-fn wait_card(deck: &TuiDeck, key: &str, what: &str, pred: impl Fn(&Value) -> bool) -> Value {
+fn wait_card(
+    deck: &TuiDeck,
+    key: &str,
+    what: &str,
+    within: Duration,
+    pred: impl Fn(&Value) -> bool,
+) -> Value {
     let last = RefCell::new(None);
-    let ok = common::wait_until(WAIT, || {
+    let ok = common::wait_until(within, || {
         let found = card(deck, key);
         let hit = found.as_ref().is_some_and(&pred);
         *last.borrow_mut() = found;
@@ -115,9 +142,10 @@ fn live_001_a_real_agent_publishes_its_card_and_acts_on_a_card_action() {
         .with_imported_claude_credentials()
         .with_claude_project_trust(repo.to_string_lossy())
         .with_env("DOT_AGENT_DECK_CONFIG", config.to_string_lossy())
-        // Four real-agent phases outlast the harness's 300s default; the
-        // nextest override for this binary allows nine minutes.
-        .with_env("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "600")
+        // Above the phases' 840s worst case (the table at `START`), at
+        // linkage-check rule 11's 900s ceiling; the nextest override for this
+        // binary kills the test only past it, at 960s.
+        .with_env("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "900")
         .launch_with_fixture("minimal");
     deck.wait_for_string("No active agents");
     phase("starting Haiku");
@@ -146,7 +174,7 @@ fn live_001_a_real_agent_publishes_its_card_and_acts_on_a_card_action() {
     assert!(response.ok, "StartAgent: {response:?}");
     let agent_id = response.id.expect("started Haiku agent id");
     let key = format!("{PANE_ID}/{agent_id}");
-    events.wait_for_session_start_on_pane(PANE_ID, &agent_id, WAIT);
+    events.wait_for_session_start_on_pane(PANE_ID, &agent_id, START);
     deck.wait_for_absence("No active agents");
     deck.send_keys(b"1");
     assert!(
@@ -155,7 +183,7 @@ fn live_001_a_real_agent_publishes_its_card_and_acts_on_a_card_action() {
             std::slice::from_ref(&agent_id),
             Duration::from_millis(1500),
             Duration::from_secs(8),
-            WAIT,
+            SETTLE,
         ),
         "interactive Claude startup must settle before typing:\n{}",
         deck.snapshot_grid()
@@ -184,13 +212,19 @@ fn live_001_a_real_agent_publishes_its_card_and_acts_on_a_card_action() {
     );
 
     phase("waiting for the published card");
-    let published = wait_card(&deck, &key, "showed the agent's waiting report", |e| {
-        e["report"]["status"] == "waiting"
-            && e["questions"][0]["id"] == "go"
-            && e["actions"]
-                .as_array()
-                .is_some_and(|a| a.iter().any(|a| a["id"] == "touch-sentinel"))
-    });
+    let published = wait_card(
+        &deck,
+        &key,
+        "showed the agent's waiting report",
+        TURN,
+        |e| {
+            e["report"]["status"] == "waiting"
+                && e["questions"][0]["id"] == "go"
+                && e["actions"]
+                    .as_array()
+                    .is_some_and(|a| a.iter().any(|a| a["id"] == "touch-sentinel"))
+        },
+    );
     assert_eq!(published["report"]["source"], "agent");
     assert_eq!(published["needs_you"], true);
     assert!(
@@ -257,7 +291,7 @@ fn live_001_a_real_agent_publishes_its_card_and_acts_on_a_card_action() {
     act(&suggested);
     phase("waiting for the suggested file");
     assert!(
-        common::wait_for_path(&repo.join(SUGGESTED), WAIT),
+        common::wait_for_path(&repo.join(SUGGESTED), TURN),
         "the agent never created {SUGGESTED} in {}\n{}",
         repo.display(),
         deck.snapshot_grid()
@@ -270,7 +304,7 @@ fn live_001_a_real_agent_publishes_its_card_and_acts_on_a_card_action() {
 
     phase("waiting for the sentinel");
     assert!(
-        common::wait_for_path(&repo.join(SENTINEL), WAIT),
+        common::wait_for_path(&repo.join(SENTINEL), TURN),
         "the agent never created {SENTINEL} in {}\n{}",
         repo.display(),
         deck.snapshot_grid()
@@ -279,25 +313,31 @@ fn live_001_a_real_agent_publishes_its_card_and_acts_on_a_card_action() {
     // (`recent_deliveries`); the action's prompt also has the agent keep
     // suggesting it, so the action shows the delivery as its own too.
     phase("waiting for delivered and done");
-    let done = wait_card(&deck, &key, "recorded the delivery and turned done", |e| {
-        e["report"]["status"] == "done"
-            && e["recent_deliveries"].as_array().is_some_and(|d| {
-                d.iter().any(|d| {
-                    d["action_id"] == "touch-sentinel"
-                        && d["message_id"] == message_id.as_str()
-                        && d["state"] == "delivered"
+    let done = wait_card(
+        &deck,
+        &key,
+        "recorded the delivery and turned done",
+        FOLLOW_UP,
+        |e| {
+            e["report"]["status"] == "done"
+                && e["recent_deliveries"].as_array().is_some_and(|d| {
+                    d.iter().any(|d| {
+                        d["action_id"] == "touch-sentinel"
+                            && d["message_id"] == message_id.as_str()
+                            && d["state"] == "delivered"
+                    })
                 })
-            })
-            && e["actions"].as_array().is_some_and(|a| {
-                a.iter().any(|a| {
-                    a["id"] == "touch-sentinel"
-                        && a["last_delivery"]["message_id"] == message_id.as_str()
+                && e["actions"].as_array().is_some_and(|a| {
+                    a.iter().any(|a| {
+                        a["id"] == "touch-sentinel"
+                            && a["last_delivery"]["message_id"] == message_id.as_str()
+                    })
                 })
-            })
-    });
+        },
+    );
     assert_eq!(done["report"]["source"], "agent");
     assert!(
-        deck.wait_for_grid_string_within(SENTINEL, WAIT),
+        deck.wait_for_grid_string_within(SENTINEL, SHOWN),
         "the attached TUI must show the agent working on the sentinel:\n{}",
         deck.snapshot_grid()
     );

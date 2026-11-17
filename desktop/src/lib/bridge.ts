@@ -3197,11 +3197,13 @@ class FixtureDeckBridge implements DeckBridge {
    * PRD #2374 — the `agent-cards` docs scene's card list: served only for
    * `/?fixture=1&state=docs&experimental=1&cards=1`, so no other fixture
    * scene shows cards, needs-you bells or row menus. Every other deck and
-   * scene answers as a daemon without cards does.
+   * scene answers as a daemon without cards does. The flag is not read here:
+   * without `experimental=1` the Cards switch never mounts, so nothing
+   * consumes or reads cards (CLAUDE.md rule 9).
    */
   async agentCards(deckId: string): Promise<AgentCardsSnapshot | null> {
     const params = new URLSearchParams(window.location.search);
-    if (this.fixtureState !== "docs" || params.get("cards") !== "1" || !fixtureDesktopFeatures().showAgentCards) return null;
+    if (this.fixtureState !== "docs" || params.get("cards") !== "1") return null;
     const cards = docsAgentCards();
     return cards.deckId === deckId ? cards : null;
   }

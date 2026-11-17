@@ -1866,6 +1866,14 @@ export interface DeckRuntimeState {
    * bridge offers no cards (a render-only test runtime).
    */
   agentCards?: Readonly<Record<string, AgentCardsSnapshot>>;
+  /**
+   * PRD #2374 — start consuming agent cards: the first call asks the backend
+   * for them, after which `agentCards` is pushed and read; later calls do
+   * nothing. Called by the surface that renders the cards when it mounts
+   * (`OverviewModeSwitch`, which exists only while the experimental flag
+   * shows them), so this runtime reads no flag. Absent where `agentCards` is.
+   */
+  consumeAgentCards?: () => void;
   /** PRD #2374 — invoke one action of one card; the daemon resolves, refuses or performs it. */
   invokeCardAction?: (target: AgentCardTarget, actionId: string, options: CardActionOptions) => Promise<CardActionResult>;
   sendTerminalInput: (target: AgentTarget, data: string, precondition?: () => boolean) => Promise<void>;

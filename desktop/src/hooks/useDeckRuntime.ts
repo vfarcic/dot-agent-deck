@@ -16,7 +16,7 @@ import type { UpgradeChoice, UpgradeEvent } from "../lib/upgrade";
 import type { QuestionSelectionDto, QuestionTextSlotDto, VoiceQuestionTarget } from "../lib/voiceQuestion";
 const EMPTY_TERMINAL_DATA: Record<string, TerminalBuffer> = {};
 import { acceptCardsSnapshot, reconcileCards, type CardsConnection } from "../lib/agentCards";
-import { desktopFeaturesOf, type AgentCardsSnapshot, type AgentCardTarget, type AgentTarget, type CardActionOptions, type CleanupWarningEntry, type DeckAction, type DeckFleet, type DeckListingOptions, type DeckRuntimeState, type DeckSnapshot, type DesktopFeatures, type InboxActionVerb, type RuntimeMode, type TerminalBuffer } from "../types";
+import { type AgentCardsSnapshot, type AgentCardTarget, type AgentTarget, type CardActionOptions, type CleanupWarningEntry, type DeckAction, type DeckFleet, type DeckListingOptions, type DeckRuntimeState, type DeckSnapshot, type DesktopFeatures, type InboxActionVerb, type RuntimeMode, type TerminalBuffer } from "../types";
 
 /**
  * The snapshot a runtime starts with, before any deck has answered. Lifted out
@@ -547,21 +547,25 @@ export function useDeckRuntime(): DeckRuntimeState {
     of a subscription can land before this listener exists. A deck whose
     daemon has no cards answers `null` and keeps no key.
 
-    Consumed only while the experimental flag shows the cards — this is their
-    render seam (CLAUDE.md rule 9). The app first tells the bridge it consumes
-    cards (`consumeAgentCards`), which is what makes the deck watchers
-    subscribe to the cards' doorbells and push them; with the flag off it
-    never asks, so no daemon is subscribed to or read for cards at all.
+    Nothing here reads the experimental flag (CLAUDE.md rule 9): cards are
+    consumed only once a surface that renders them asks, through
+    `consumeAgentCards` below. The Table | Cards switch calls it when it
+    mounts, and it is mounted only while the flag shows the cards — its render
+    seam. The first call tells the bridge this webview consumes cards
+    (`bridge.consumeAgentCards`), which is what makes the deck watchers
+    subscribe to the cards' doorbells and push them; only once that request has
+    succeeded does this hook listen for pushes and read. With the flag off
+    nothing calls it, so no daemon is subscribed to or read for cards at all.
   */
-  const cardsShown = desktopFeaturesOf({ desktopFeatures }).showAgentCards;
   const [cardsConsumed, setCardsConsumed] = useState(false);
-  useEffect(() => {
-    if (!cardsShown) return;
-    let active = true;
+  const cardsRequested = useRef(false);
+  const consumeAgentCards = useCallback(() => {
+    if (cardsRequested.current) return;
+    cardsRequested.current = true;
     const ask = typeof bridge.consumeAgentCards === "function" ? bridge.consumeAgentCards() : Promise.resolve();
-    void ask.then(() => { if (active) setCardsConsumed(true); }, () => undefined);
-    return () => { active = false; };
-  }, [bridge, cardsShown]);
+    // A refused request is asked again by the next surface that mounts.
+    void ask.then(() => setCardsConsumed(true), () => { cardsRequested.current = false; });
+  }, [bridge]);
   const [agentCards, setAgentCards] = useState<Readonly<Record<string, AgentCardsSnapshot>>>({});
   const cardsOffered = typeof bridge.agentCards === "function" || typeof bridge.subscribeAgentCards === "function";
   /*
@@ -665,7 +669,7 @@ export function useDeckRuntime(): DeckRuntimeState {
     ...(upgradeDaemon ? { upgradeDaemon } : {}),
     ...(decideUpgrade ? { decideUpgrade } : {}),
     ...(inboxAction ? { inboxAction } : {}),
-    ...(cardsOffered ? { agentCards } : {}),
+    ...(cardsOffered ? { agentCards, consumeAgentCards } : {}),
     ...(invokeCardAction ? { invokeCardAction } : {}),
     sendTerminalInput,
     resizeTerminal,

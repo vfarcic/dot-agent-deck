@@ -1491,19 +1491,23 @@ fn spawn_deck_watcher(app: &AppHandle, state: &DesktopState, endpoint: Endpoint)
             // is already accounted for by the establishment above, so the arm
             // starts from here rather than firing once on a stale edge.
             selection.mark_unchanged();
-            let reader = spawn_event_reader(subscription);
+            let (events, reader) = spawn_event_reader(subscription);
             let ended = watch_one_subscription(
                 &app,
                 &endpoint,
                 &links,
                 &mut view,
-                reader,
+                events,
                 &mut selection,
                 &mut refetch,
                 &mut cards,
                 with_cards,
             )
             .await;
+            // The subscription is left whatever ended it: its reader goes now,
+            // and the daemon connection with it, rather than lingering until
+            // the next event on a deck that may send none (PR #2378 review).
+            drop(reader);
             // PRD #2374: the webview asked for cards while this subscription
             // ran without their doorbells. The link is healthy, so it is kept
             // and the watcher re-subscribes at once, with them.
@@ -1568,15 +1572,51 @@ async fn emit_unconnected_snapshot(app: &AppHandle, endpoint: &Endpoint, links: 
     }
 }
 
-/// Drain one subscription into a channel until it ends.
+/// A source of daemon events the reader drains: an [`EventSubscription`], or
+/// a stand-in in the tests.
+trait EventSource: Send + 'static {
+    fn next_event(
+        &mut self,
+    ) -> impl std::future::Future<Output = std::io::Result<Option<BroadcastMsg>>> + Send;
+}
+
+impl EventSource for EventSubscription {
+    fn next_event(
+        &mut self,
+    ) -> impl std::future::Future<Output = std::io::Result<Option<BroadcastMsg>>> + Send {
+        EventSubscription::next_event(self)
+    }
+}
+
+/// The reader task of one subscription, ended when this is dropped.
+///
+/// PRD #2374 (PR #2378 review): a watcher that leaves a subscription whose
+/// stream has NOT ended — the webview asked for cards, or the selection moved
+/// — used to drop only the channel's receiver. The reader noticed only when
+/// its next `tx.send` failed, so on a quiet deck it stayed blocked in
+/// `next_event` holding the old [`EventSubscription`], and the daemon went on
+/// serving that connection beside its replacement. Aborting the task drops
+/// the subscription at once, which half-closes its socket and ends the
+/// daemon's side of it. Cancelling a partly read frame is safe here because
+/// the subscription is being discarded with it.
+struct EventReader(tauri::async_runtime::JoinHandle<()>);
+
+impl Drop for EventReader {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Drain one subscription into a channel until it ends, or until the returned
+/// [`EventReader`] is dropped.
 ///
 /// A task of its own so nothing can cancel a partially-read frame — see
 /// [`EVENT_QUEUE_DEPTH`].
 fn spawn_event_reader(
-    mut subscription: EventSubscription,
-) -> tokio::sync::mpsc::Receiver<BroadcastMsg> {
+    mut subscription: impl EventSource,
+) -> (tokio::sync::mpsc::Receiver<BroadcastMsg>, EventReader) {
     let (tx, rx) = tokio::sync::mpsc::channel(EVENT_QUEUE_DEPTH);
-    tauri::async_runtime::spawn(async move {
+    let handle = tauri::async_runtime::spawn(async move {
         while let Ok(Some(msg)) = subscription.next_event().await {
             if tx.send(msg).await.is_err() {
                 break;
@@ -1585,7 +1625,7 @@ fn spawn_event_reader(
         // Dropping `tx` here is what tells the refresh loop the stream ended,
         // and it happens after every already-read event has been delivered.
     });
-    rx
+    (rx, EventReader(handle))
 }
 
 /// Why [`watch_one_subscription`] returned (PRD #741 M9).
@@ -1808,8 +1848,9 @@ async fn emit_agent_cards(app: &AppHandle, endpoint: &Endpoint, links: &DaemonLi
     }
 }
 
-/// PRD #2374: the webview consumes agent cards. It calls this once, and only
-/// while it shows them (`desktopFeatures.showAgentCards`, its render seam);
+/// PRD #2374: the webview consumes agent cards. It calls this once, when the
+/// surface that renders them mounts (the dashboard's Table | Cards switch,
+/// which exists only while `desktopFeatures.showAgentCards` shows the cards);
 /// from then on every deck watcher subscribes with the card doorbells and
 /// pushes `desktop://agent-cards`, and [`agent_cards_list`] reads. Before it,
 /// the bridge asks no daemon for cards. The bridge acts on this request and
@@ -7407,6 +7448,51 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// A subscription that never delivers an event, as on a quiet deck, and
+    /// records when it is dropped.
+    struct QuietSubscription(Arc<AtomicBool>);
+
+    impl Drop for QuietSubscription {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl EventSource for QuietSubscription {
+        fn next_event(
+            &mut self,
+        ) -> impl std::future::Future<Output = std::io::Result<Option<BroadcastMsg>>> + Send
+        {
+            std::future::pending()
+        }
+    }
+
+    /// PR #2378 review: a watcher leaving a subscription on a deck that sends
+    /// nothing more ends that subscription's reader, and with it the daemon
+    /// connection, rather than leaving it blocked beside its replacement.
+    /// Dropping the receiver alone, which is all the watcher used to do, does
+    /// not reach a reader parked in `next_event`.
+    #[tokio::test]
+    async fn dropping_the_event_reader_ends_a_quiet_subscription() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (events, reader) = spawn_event_reader(QuietSubscription(Arc::clone(&dropped)));
+        drop(events);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !dropped.load(Ordering::SeqCst),
+            "the receiver alone does not end a reader no event wakes"
+        );
+        drop(reader);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !dropped.load(Ordering::SeqCst) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the subscription outlived its dropped reader"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
 
     /// PRD #2374 (PR #2378 review): the bridge serves cards on the webview's
     /// request and never on the experimental flag. Before `agent_cards_consume`

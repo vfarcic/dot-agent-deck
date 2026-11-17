@@ -421,11 +421,12 @@ describe("desktop/agent-cards — the dashboard renders what the daemon sent (PR
     setItem.mockRestore();
   });
 
-  /// Scenario: render the dashboard with the experimental flag off while the daemon sends cards and the window remembers the Cards view. No Table | Cards switch, cards grid, needs-you marker, row menu or overlay appears, and the table rows still open their agents.
-  it("desktop/agent-cards/007: with showAgentCards off none of the new controls render", () => {
+  /// Scenario: render the dashboard with the experimental flag off while the daemon sends cards and the window remembers the Cards view. No Table | Cards switch, cards grid, needs-you marker, row menu or overlay appears, the dashboard never asks the runtime to consume cards, and the table rows still open their agents; rendered again with the flag on, it consumes them once, on mount.
+  it("desktop/agent-cards/007: with showAgentCards off none of the new controls render and no cards are consumed", () => {
     window.localStorage.setItem(MODE_KEY, "cards");
     const navigate = vi.fn();
-    render(<AgentOverview runtime={runtime({ desktopFeatures: { ...DEFAULT_DESKTOP_FEATURES, showAgentCards: false } })} onNavigate={navigate} />);
+    const consumeOff = vi.fn();
+    const { unmount } = render(<AgentOverview runtime={runtime({ desktopFeatures: { ...DEFAULT_DESKTOP_FEATURES, showAgentCards: false }, consumeAgentCards: consumeOff })} onNavigate={navigate} />);
     expect(screen.queryByTestId("overview-mode-switch")).toBeNull();
     expect(screen.queryByRole("radiogroup", { name: "Dashboard view" })).toBeNull();
     expect(screen.queryByTestId("agent-cards")).toBeNull();
@@ -433,8 +434,21 @@ describe("desktop/agent-cards — the dashboard renders what the daemon sent (PR
     expect(screen.queryAllByTestId("overview-needs-you")).toHaveLength(0);
     expect(screen.queryAllByTestId("overview-row-menu")).toHaveLength(0);
     expect(screen.queryByTestId("agent-card-overlay")).toBeNull();
+    // The runtime reads no flag: what keeps cards unsubscribed and unread is
+    // that nothing rendered asks for them.
+    expect(consumeOff).not.toHaveBeenCalled();
     const row = screen.getByTestId(`overview-agent-${agentKey({ daemonId: FIXTURE_DAEMON_ID, id: ZULU.agent_id })}`);
     fireEvent.click(row.querySelector("td:last-child") ?? row);
     expect(navigate).toHaveBeenCalledWith(expect.objectContaining({ kind: "agent", agentId: ZULU.agent_id }));
+    unmount();
+
+    // The flag on: the switch mounts and consumes, once across re-renders.
+    const consumeOn = vi.fn();
+    const live = runtime({ consumeAgentCards: consumeOn });
+    const { rerender } = render(<AgentOverview runtime={live} onNavigate={navigate} />);
+    expect(screen.getByTestId("overview-mode-switch")).toBeInTheDocument();
+    expect(consumeOn).toHaveBeenCalledTimes(1);
+    rerender(<AgentOverview runtime={live} onNavigate={navigate} />);
+    expect(consumeOn).toHaveBeenCalledTimes(1);
   });
 });

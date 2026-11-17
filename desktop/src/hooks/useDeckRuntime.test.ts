@@ -449,15 +449,21 @@ describe("useDeckRuntime agent cards (PRD #2374)", () => {
 
   /* The order the card calls reach the bridge in. */
   let calls: string[] = [];
-  const features = (showAgentCards: boolean) => {
-    cardsBridge.desktopFeatures = vi.fn(async () => ({ ...DEFAULT_DESKTOP_FEATURES, showAgentCards }));
+  /* The runtime, with cards consumed the way the Cards switch does on mount. */
+  const renderConsuming = () => {
+    const rendered = renderHook(() => useDeckRuntime());
+    act(() => rendered.result.current.consumeAgentCards?.());
+    return rendered;
   };
 
   beforeEach(() => {
     vi.clearAllMocks();
     bridge.onTerminalGeometry.mockReturnValue(() => {});
     calls = [];
-    features(true);
+    // The flag is ON throughout: what keeps cards unread is that nothing
+    // consumed them, not a flag this hook reads (CLAUDE.md rule 9). The
+    // flag-off case is the component's: desktop/agent-cards/007.
+    cardsBridge.desktopFeatures = vi.fn(async () => ({ ...DEFAULT_DESKTOP_FEATURES, showAgentCards: true }));
     cardsBridge.consumeAgentCards = vi.fn(async () => { calls.push("consume"); });
   });
   afterEach(() => {
@@ -468,35 +474,39 @@ describe("useDeckRuntime agent cards (PRD #2374)", () => {
   });
 
   /*
-   * PR #2378 review: the flag gates the cards at the webview's seam, and the
-   * backend consumes cards only on the webview's request. Off: the app never
-   * asks the backend for cards, so no deck watcher subscribes to card
-   * doorbells or pushes cards, and nothing reads them. On: the request comes
-   * first, then the listener and the read.
+   * PR #2378 review: the backend consumes cards only on the webview's
+   * request, and the webview requests them only from the surface that renders
+   * them. Until that surface calls `consumeAgentCards` the hook asks for,
+   * subscribes to and reads nothing, even with the flag on; once called, the
+   * request comes first and exactly once, then the listener and the read.
    */
-  it("with the experimental flag off asks for, subscribes to and reads no cards", async () => {
-    features(false);
+  it("subscribes to and reads no cards until a surface consumes them, even with the flag on", async () => {
     cardsBridge.subscribeAgentCards = vi.fn(async () => () => {});
     cardsBridge.agentCards = vi.fn(async () => null);
     bridge.connect.mockResolvedValue([createFixtureSnapshot("docs-restart")]);
     const { result } = renderHook(() => useDeckRuntime());
-    await waitFor(() => expect(result.current.desktopFeatures?.showAgentCards).toBe(false));
+    await waitFor(() => expect(result.current.desktopFeatures?.showAgentCards).toBe(true));
     await waitFor(() => expect(result.current.snapshot.connection.incarnation).toBe("docs-before"));
     await act(async () => { await Promise.resolve(); });
+    expect(result.current.consumeAgentCards).toBeTypeOf("function");
     expect(cardsBridge.consumeAgentCards).not.toHaveBeenCalled();
     expect(cardsBridge.subscribeAgentCards).not.toHaveBeenCalled();
     expect(cardsBridge.agentCards).not.toHaveBeenCalled();
   });
 
-  it("with the experimental flag on asks the backend for cards before listening and reading", async () => {
+  it("asks the backend for cards once, before listening and reading, however often it is consumed", async () => {
     cardsBridge.subscribeAgentCards = vi.fn(async () => { calls.push("subscribe"); return () => {}; });
     cardsBridge.agentCards = vi.fn(async () => { calls.push("read"); return null; });
     bridge.connect.mockResolvedValue([createFixtureSnapshot("docs-restart")]);
-    renderHook(() => useDeckRuntime());
+    const { result } = renderConsuming();
+    // A second surface mounting, or the same one mounting again.
+    act(() => result.current.consumeAgentCards?.());
     await waitFor(() => expect(calls).toContain("subscribe"));
     await waitFor(() => expect(calls).toContain("read"));
+    act(() => result.current.consumeAgentCards?.());
     expect(calls[0]).toBe("consume");
     expect(calls.filter((call) => call === "consume")).toHaveLength(1);
+    expect(cardsBridge.subscribeAgentCards).toHaveBeenCalledTimes(1);
   });
 
   it("accepts cards only from the connected process, ignores late and older ones, and drops a replaced daemon's", async () => {
@@ -513,7 +523,7 @@ describe("useDeckRuntime agent cards (PRD #2374)", () => {
     });
     cardsBridge.agentCards = vi.fn(() => new Promise<AgentCardsSnapshot | null>((resolve) => { reads.push(resolve); }));
     bridge.connect.mockResolvedValue([createFixtureSnapshot("docs-restart")]);
-    const { result } = renderHook(() => useDeckRuntime());
+    const { result } = renderConsuming();
     await waitFor(() => expect(result.current.snapshot.connection.incarnation).toBe("docs-before"));
     await waitFor(() => expect(reads).toHaveLength(1));
     await waitFor(() => expect(push).toBeDefined());
@@ -554,7 +564,7 @@ describe("useDeckRuntime agent cards (PRD #2374)", () => {
       return () => {};
     });
     bridge.connect.mockResolvedValue([createFixtureSnapshot("docs-restart")]);
-    const { result } = renderHook(() => useDeckRuntime());
+    const { result } = renderConsuming();
     await waitFor(() => expect(push).toBeDefined());
     await waitFor(() => expect(result.current.snapshot.connection.incarnation).toBe("docs-before"));
     act(() => push!(cards("docs-before", 7)));

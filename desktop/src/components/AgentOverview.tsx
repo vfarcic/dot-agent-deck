@@ -1801,7 +1801,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
             </DashboardCounters>
             {newAgentAvailable && <button className="button primary compact" data-testid="overview-new-agent" aria-label="New agent" title="New agent (Ctrl+N / ⌘N)" onClick={() => VOICE_ACTIONS.openNewAgent.run(voiceContext)}><Plus size={14} /><span>New agent</span></button>}
             {openDeck && <button className="button secondary compact" data-testid="overview-open-deck" onClick={openDeck}><SquareTerminal size={14} /><span>Open daemons</span></button>}
-            {cards.shown && <OverviewModeSwitch mode={cards.mode} controls={cards.controls} />}
+            {cards.shown && <OverviewModeSwitch mode={cards.mode} controls={cards.controls} consumeCards={runtime.consumeAgentCards} />}
             <DashboardFilterControls filter={filter} daemons={filterDaemons} />
             {cards.mode === "table" && <OverviewColumnPicker columns={columns} onChange={setColumns} />}
             <button className="button secondary compact" data-testid="overview-refresh" onClick={() => void runtime.reconnect()}><RefreshCw size={14} /><span>Refresh</span></button>

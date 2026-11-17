@@ -1,3 +1,4 @@
+import { useEffect } from "react";
 import { LayoutGrid, LayoutList } from "lucide-react";
 
 import type { OverviewMode } from "../lib/agentCards";
@@ -7,8 +8,17 @@ import { VOICE_ACTIONS, type VoiceActionContext } from "../lib/voiceActions";
  * PRD #2374 — the agent dashboard's Table | Cards switch. Rendered only while
  * the experimental flag shows the cards; each half dispatches through the
  * registry, so "show cards" by voice and a click are one action.
+ *
+ * It is also where the app starts consuming cards: mounting it calls
+ * `consumeCards` (the runtime's `consumeAgentCards`), and until something
+ * does, no daemon is subscribed to or read for cards. So the flag decides it
+ * here, at the render seam, and the runtime underneath reads no flag
+ * (CLAUDE.md rule 9).
  */
-export function OverviewModeSwitch({ mode, controls }: { mode: OverviewMode; controls: Pick<VoiceActionContext, "setOverviewMode"> }) {
+export function OverviewModeSwitch({ mode, controls, consumeCards }: { mode: OverviewMode; controls: Pick<VoiceActionContext, "setOverviewMode">; consumeCards?: () => void }) {
+  useEffect(() => {
+    consumeCards?.();
+  }, [consumeCards]);
   return (
     <div className="overview-mode-switch" role="radiogroup" aria-label="Dashboard view" data-testid="overview-mode-switch">
       <button
