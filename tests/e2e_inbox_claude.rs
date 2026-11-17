@@ -1439,3 +1439,148 @@ fn claude_031_the_deck_answers_its_receipts_and_refuses_what_they_do_not_serve()
     }
     state(&daemon, &pane, &id, "queued");
 }
+
+/// Issue #2341: append one Claude Code transcript entry to `transcript`.
+fn append_entry(transcript: &std::path::Path, entry: Value) {
+    use std::io::Write;
+    let mut line = serde_json::to_vec(&entry).unwrap();
+    line.push(b'\n');
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(transcript)
+        .unwrap()
+        .write_all(&line)
+        .unwrap();
+}
+
+/// Issue #2341: the context a hook added, as Claude Code records a prompt it
+/// took.
+fn hook_context_entry(context: &str) -> Value {
+    json!({"type":"attachment","attachment":{"type":"hook_additional_context",
+        "content":[context],"hookName":"UserPromptSubmit","hookEvent":"UserPromptSubmit"}})
+}
+
+/// Issue #2341: `id` stays `expected` for all of `duration`.
+fn stays(daemon: &impl Endpoint, pane: &Pane, id: &str, expected: &str, duration: Duration) {
+    let state = RefCell::new(String::new());
+    let left = common::wait_until(duration, || {
+        *state.borrow_mut() = message_of(daemon, pane, id)["state"].to_string();
+        !state.borrow().to_ascii_lowercase().contains(expected)
+    });
+    assert!(
+        !left,
+        "message {id} must stay {expected}, is {}",
+        state.borrow()
+    );
+}
+
+/// Scenario: Claude Code's hook payload names a session transcript that exists. The real prompt hook answers a doorbell with the task's block as before, but the task is not acknowledged by that write: it stays fetched until the transcript gains the hook's context as Claude records a prompt it took, and then it is acknowledged with one delivery. A second task's prompt is blocked: the transcript gains only the system entry Claude writes for a blocked prompt. That task is never acknowledged; once the witness gives up, the next doorbell hands it over again marked as a possible repeat, and the transcript recording that one acknowledges it, with two deliveries.
+#[spec("inbox/claude/051")]
+#[test]
+fn claude_051_a_doorbell_hook_commits_only_what_the_transcript_shows_claude_took() {
+    // A 15 s ack-wait gives the witness a 10 s window.
+    let daemon = daemon(&[("DOT_AGENT_DECK_INBOX_ACK_WAIT_MS", "15000")]);
+    let pane = parent_as(&daemon, "claude-witness", None);
+    let transcript = daemon.cwd().join("witness-session.jsonl");
+    std::fs::write(
+        &transcript,
+        b"{\"type\":\"summary\",\"summary\":\"earlier\"}\n",
+    )
+    .unwrap();
+    let doorbell = |tag: &str, id: &str| {
+        let mut hook = payload(&pane, "UserPromptSubmit");
+        hook["prompt"] = json!(fixed_line(id));
+        hook["transcript_path"] = json!(transcript);
+        run_hook(&pane, tag, hook)
+    };
+
+    let id = post(&daemon, &pane, NATIVE_BODY);
+    let out = doorbell("taken", &id);
+    let taken = context(&out, "UserPromptSubmit");
+    assert!(
+        taken.contains(&format!("[dot-agent-deck message {id} delivery 1.1 from "))
+            && taken.contains(NATIVE_BODY),
+        "{taken}"
+    );
+    assert!(!holds_cap_shaped(out["stdout"].as_str().unwrap()), "{out}");
+    stays(&daemon, &pane, &id, "fetched", Duration::from_millis(1500));
+    append_entry(&transcript, hook_context_entry(&taken));
+    state(&daemon, &pane, &id, "acknowledged");
+    assert_eq!(message_of(&daemon, &pane, &id)["deliveries"], 1);
+
+    let blocked = post(&daemon, &pane, &format!("{NATIVE_BODY}-blocked"));
+    let out = doorbell("blocked", &blocked);
+    assert!(
+        context(&out, "UserPromptSubmit").contains(&format!(
+            "[dot-agent-deck message {blocked} delivery 1.1 from "
+        )),
+        "{out}"
+    );
+    append_entry(
+        &transcript,
+        json!({"type":"system","content":format!(
+            "UserPromptSubmit operation blocked by hook:\nblocked by a policy hook\n\nOriginal prompt: {}",
+            fixed_line(&blocked))}),
+    );
+    stays(&daemon, &pane, &blocked, "fetched", Duration::from_secs(3));
+    let repeat_line = format!("This may repeat dot-agent-deck message {blocked}");
+    let repeat = RefCell::new(String::new());
+    let tries = Cell::new(0);
+    assert!(
+        common::wait_until(common::load_scaled(Duration::from_secs(40)), || {
+            tries.set(tries.get() + 1);
+            let out = doorbell(&format!("again-{}", tries.get()), &blocked);
+            let printed = out["stdout"].as_str().unwrap_or_default();
+            let handed = printed.contains(&repeat_line);
+            if handed {
+                *repeat.borrow_mut() = context(&out, "UserPromptSubmit");
+            }
+            handed
+        }),
+        "the blocked task is handed over again, marked"
+    );
+    let repeat = repeat.into_inner();
+    assert!(
+        repeat.contains(&format!(
+            "[dot-agent-deck message {blocked} delivery 1.2 from "
+        )),
+        "{repeat}"
+    );
+    state(&daemon, &pane, &blocked, "fetched");
+    append_entry(&transcript, hook_context_entry(&repeat));
+    state(&daemon, &pane, &blocked, "acknowledged");
+    assert_eq!(message_of(&daemon, &pane, &blocked)["deliveries"], 2);
+}
+
+/// Scenario: Arm a real Claude waiter and queue a task; the waiter wakes Claude with the task's block. The notification is submitted through the real prompt hook with a payload naming an existing session transcript, so the hook commits nothing itself: the task stays fetched until the transcript gains the prompt as a user entry, and is then acknowledged with one delivery.
+#[spec("inbox/claude/052")]
+#[test]
+fn claude_052_a_native_wake_commits_once_the_transcript_holds_its_prompt() {
+    let daemon = daemon(&[]);
+    let pane = parent(&daemon, "claude-native-witness");
+    let transcript = daemon.cwd().join("native-session.jsonl");
+    std::fs::write(
+        &transcript,
+        b"{\"type\":\"summary\",\"summary\":\"earlier\"}\n",
+    )
+    .unwrap();
+    wait(&pane, "wake", "startup");
+    armed(&daemon, &pane, 1);
+    let id = post(&daemon, &pane, NATIVE_BODY);
+    let delivered = result(&pane, "wake");
+    assert_eq!(delivered["code"], 2, "the waiter wakes Claude: {delivered}");
+    let stderr = delivered["stderr"].as_str().unwrap().to_string();
+    let mut hook = notification(&pane, &stderr);
+    hook["transcript_path"] = json!(transcript);
+    let prompt = hook["prompt"].as_str().unwrap().to_string();
+    let out = run_hook(&pane, "notification", hook);
+    assert_eq!(out["stdout"], "", "nothing to hand over: {out}");
+    stays(&daemon, &pane, &id, "fetched", Duration::from_millis(1500));
+    append_entry(
+        &transcript,
+        json!({"type":"user","origin":{"kind":"task-notification"},
+            "message":{"role":"user","content":prompt}}),
+    );
+    state(&daemon, &pane, &id, "acknowledged");
+    assert_eq!(message_of(&daemon, &pane, &id)["deliveries"], 1);
+}
