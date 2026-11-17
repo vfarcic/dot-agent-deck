@@ -80,6 +80,7 @@ Limits:
 
 - **Claude Code:** the deck can answer a question for about 24 days of waiting, the longest Claude Code keeps the deck's hook running; after that, answer it in Claude Code's pane. After upgrading the deck, restart the daemon or run `dot-agent-deck hooks install` so Claude Code's hook gets the longer wait.
 - **Codex, OpenCode, Pi and Antigravity:** the deck sets no limit; it answers the question whenever you do.
+- **An `agy` started from a shell inside a pane:** its card shows the permission prompt, but the deck offers no answers for it, in either client or by voice; answer it in the pane. Start `agy` as the pane's command to answer from the deck.
 - **More than 64 questions waiting at once:** a question past that number still shows **Needs Input**, without the badge or the notification, and is answered in the agent's pane.
 
 ### Work left running after a turn

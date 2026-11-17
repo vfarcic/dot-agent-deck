@@ -4084,16 +4084,35 @@ async fn report_status_updates(
     }
 }
 
-/// PRD #211 (audit suggestion): the release of `agent_type` that generation
-/// `agent_id` drew in its own start-up header, as `(major, minor, patch)`.
-/// `None` when it drew none the release scanner read, or two different ones:
-/// the agent on the daemon's PATH is not evidence of what runs in the pane.
+/// PRD #211 (audit suggestion): the release of `agent_type` whose answer
+/// digits a permission question of generation `agent_id` may offer, as
+/// `(major, minor, patch)`: the one that generation drew in its own start-up
+/// header ([`answer_release`]).
 fn pane_agent_release(
     registry: &AgentPtyRegistry,
     agent_id: &str,
     agent_type: &crate::event::AgentType,
 ) -> Option<(u64, u64, u64)> {
-    match registry.latched_release(agent_id, agent_type)? {
+    answer_release(
+        registry.spawn_agent_type(agent_id).as_ref(),
+        registry.latched_release(agent_id, agent_type),
+    )
+}
+
+/// PRD #211: [`pane_agent_release`] from what the generation was spawned as
+/// and the release it latched. `None`, so every answer is keyboard-only, when
+/// it latched none (no header the release scanner read, or two different
+/// ones: the agent on the daemon's PATH is not evidence of what runs in the
+/// pane), and always for a generation spawned as a shell, whatever its
+/// session latched: an `agy` resumed there (`agy --conversation=<id>`) fires
+/// no `SessionStart` and draws its header where the deck does not read it, so
+/// nothing tells that its release is the one latched before.
+fn answer_release(
+    spawned_as: Option<&crate::event::AgentType>,
+    latched: Option<crate::doorbell_activation::LatchedRelease>,
+) -> Option<(u64, u64, u64)> {
+    spawned_as?;
+    match latched? {
         crate::doorbell_activation::LatchedRelease::Known(version) => {
             Some((version.major, version.minor, version.patch))
         }
@@ -4203,10 +4222,11 @@ async fn report_status_update(
 /// `state`'s lock. Audit (CWE-345/451): the signal says only that a prompt is
 /// up. What it approves, and the menu, come from the call this generation's
 /// own `PreToolUse` reported; the digits are those of the release this pane's
-/// `agy` drew in its header. A repeat of the prompt already pending keeps its
-/// question id. `None`, the prompt answered at the keyboard, for any other
-/// agent and when no such call backs it; with the call but no latched
-/// release, the question is asked with keyboard-only answers.
+/// `agy` drew in its header ([`pane_agent_release`]). A repeat of the prompt
+/// already pending keeps its question id. `None`, the prompt answered at the
+/// keyboard, for any other agent and when no such call backs it; with the
+/// call but no latched release, or in a generation spawned as a shell, the
+/// question is asked with keyboard-only answers.
 fn antigravity_status_question(
     state: &crate::state::AppState,
     registry: &AgentPtyRegistry,
@@ -22808,6 +22828,73 @@ mod held_confirmation_deadline_tests;
 #[cfg(all(test, unix))]
 #[path = "daemon_hook_event_order_tests.rs"]
 mod hook_event_order_tests;
+
+#[cfg(test)]
+mod antigravity_answer_release_tests {
+    //! PRD #211: an Antigravity permission question offers deck answers only
+    //! in a generation spawned as `agy` ([`answer_release`]).
+    use super::*;
+    use crate::doorbell_activation::LatchedRelease;
+    use crate::event::AgentType;
+    use crate::question::{AnswerChannel, AntigravityCall, PendingQuestion};
+
+    fn question(release: Option<(u64, u64, u64)>) -> PendingQuestion {
+        let call = AntigravityCall {
+            tool: "run_command",
+            use_id: Some("call-1"),
+            subject: "echo agy-probe-1",
+        };
+        crate::question::antigravity_permission(
+            "q".into(),
+            "Approve Bash: echo agy-probe-1",
+            Some(&call),
+            1,
+            release,
+        )
+        .expect("the call backs the prompt")
+    }
+
+    fn agy_1_5_9() -> Option<LatchedRelease> {
+        Some(LatchedRelease::Known(semver::Version::new(1, 5, 9)))
+    }
+
+    /// A generation spawned as a shell, whose `agy` session latched release
+    /// 1.5.9, still gets a question whose every option, the grants and Deny
+    /// alike, is answered at the keyboard; a generation spawned as `agy`
+    /// with the same release keeps the options the deck can answer.
+    #[test]
+    fn a_shell_generation_gets_keyboard_only_answers_whatever_release_it_latched() {
+        let shell = question(answer_release(None, agy_1_5_9()));
+        assert_eq!(shell.channel, AnswerChannel::Unsupported);
+        let options = &shell.questions[0].options;
+        assert!(!options.is_empty());
+        assert!(
+            options.iter().all(|o| o.keyboard_only),
+            "every answer keyboard-only in a shell: {options:?}"
+        );
+
+        let spawned = question(answer_release(Some(&AgentType::Antigravity), agy_1_5_9()));
+        assert_eq!(spawned.channel, AnswerChannel::Keys);
+        assert!(
+            spawned.questions[0]
+                .options
+                .iter()
+                .any(|o| !o.keyboard_only),
+            "a generation spawned as agy keeps answerable options"
+        );
+    }
+
+    /// Spawned as `agy` but with no release latched, or two different ones,
+    /// the answers are keyboard-only too.
+    #[test]
+    fn without_a_known_release_the_answers_are_keyboard_only() {
+        let agy = Some(&AgentType::Antigravity);
+        assert_eq!(answer_release(agy, None), None);
+        assert_eq!(answer_release(agy, Some(LatchedRelease::Unseen)), None);
+        assert_eq!(answer_release(agy, Some(LatchedRelease::Conflict)), None);
+        assert_eq!(answer_release(agy, agy_1_5_9()), Some((1, 5, 9)));
+    }
+}
 
 /// PRD #211 (audit, CWE-400/770): the OSC 7501 status queue's bounds.
 #[cfg(test)]

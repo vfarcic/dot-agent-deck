@@ -1171,12 +1171,10 @@ impl AgentPtyRegistry {
                     let bytes = match next {
                         txn::Job::Line(text) => text.into_bytes(),
                         txn::Job::Cr => b"\r".to_vec(),
-                        txn::Job::Deletes(n) => match txn.withdraw_key() {
-                            txn::WithdrawKey::Delete => vec![0x7f; n],
-                            // `Txn::serve_keys` chooses the clear key only
-                            // where it is Ctrl+U.
-                            txn::WithdrawKey::Clear => vec![0x15; n],
-                        },
+                        txn::Job::Deletes(n) => vec![0x7f; n],
+                        // `Txn::serve_keys` sets the clear key only where it
+                        // is Ctrl+U.
+                        txn::Job::Clears(n) => vec![0x15; n],
                     };
                     tracing::debug!(
                         target: "doorbell",

@@ -738,10 +738,13 @@ pub enum Job {
     Line(String),
     /// The Enter.
     Cr,
-    /// This many presses of the withdrawal's key, in one job: the delete
-    /// key, or, where the transaction chose it (PRD #211,
-    /// [`Txn::withdraw_key`]), the agent's clear key.
+    /// This many presses of the delete key, in one job.
     Deletes(usize),
+    /// PRD #211: this many presses of the agent's clear key, in one job,
+    /// where a withdrawal's final seam chose it ([`Txn::clear_lines`],
+    /// [`WithdrawKey::Clear`]). [`Txn::serve_keys`] sets that key only
+    /// where it is Ctrl+U, which empties one logical line per press.
+    Clears(usize),
 }
 
 const JOB_QUEUED: u8 = 0;
@@ -1242,7 +1245,7 @@ impl<'c> Txn<'c> {
     }
 
     /// PRD #211: allow this attempt one recovery from a misrendered echo.
-    /// When the echo fails and the composer shows exactly the deck's own
+    /// When the echo fails and the composer is drawn as the deck's own
     /// line with only spaces inserted ([`whitespace_gap`]), the line is
     /// withdrawn, with one delete per character the deck typed or with the
     /// agent's clear key ([`Self::clear_lines`]), instead of
@@ -1270,9 +1273,14 @@ impl<'c> Txn<'c> {
     /// PRD #211: withdraw a line the composer holds as ONE logical line,
     /// and nothing else, with the agent's clear key instead of deletes:
     /// `per_line` presses, at most `per_write` to a write (`None`: all in
-    /// one), `gap` apart. Both recognisers already require the composer to
-    /// hold exactly the deck's own text, so emptying the line removes only
-    /// that. Measured on `agy` 1.5.9
+    /// one), `gap` apart. Both recognisers already require the rendered
+    /// composer to show only the deck's own text, and the seam's job mark
+    /// that no person's job reached the writer since admission, so emptying
+    /// the line removes what the screen and that ordering say is only the
+    /// deck's. Neither reads the agent's buffer itself, and the clear has
+    /// the same window between its last check and the agent's handling of
+    /// it as the Enter (`docs/develop/doorbell-admission.md`, accepted
+    /// residuals). Measured on `agy` 1.5.9
     /// (`tests/fixtures/antigravity/composer-after-clear.bin`): one Ctrl+U
     /// emptied a 166-character line wrapped onto two rows.
     /// A withdrawal whose presses the deadline cannot fit falls back to the
@@ -1311,8 +1319,8 @@ impl<'c> Txn<'c> {
         }
     }
 
-    /// The key a [`Job::Deletes`] presses: the one the current withdrawal's
-    /// final seam chose, the delete key until one did.
+    /// The key the current withdrawal's final seam chose, the delete key
+    /// until one did: its jobs are [`Job::Deletes`] or [`Job::Clears`].
     pub fn withdraw_key(&self) -> WithdrawKey {
         self.presses.map_or(WithdrawKey::Delete, |p| p.key)
     }
@@ -1983,8 +1991,11 @@ impl<'c> Txn<'c> {
     /// ([`whitespace_gap`]), its token head drawn intact, cursor after it,
     /// nothing highlighted or hidden, no placeholder, no dialog, the layout
     /// epoch unchanged, and no Enter sent. Returns the deletes to send: one
-    /// per character the deck typed, since the agent's buffer took exactly
-    /// those and only its drawing has the gap. A person's keys since
+    /// per character the deck typed, as the PTY accepted every one of them
+    /// and the screen draws them all, with only the gap added. That is the
+    /// rendered screen's word for what the agent's buffer holds, not a read
+    /// of the buffer (the same-uid trust boundary of
+    /// `docs/develop/hook-provenance.md`). A person's keys since
     /// admission are refused before this is read (the seam's job mark), and
     /// any other difference, a missing or foreign character included, is no
     /// such gap.
@@ -2113,6 +2124,14 @@ impl<'c> Txn<'c> {
                 self.deleted = 0;
                 self.enqueue_deletes(now)
             }
+            // The misrendered echo was recognised at the transaction's
+            // epoch: a Clean frame at another one is a relayout the gap was
+            // not read on, so the gap withdrawal is refused rather than
+            // re-read there. A frame that is not Clean is waited out.
+            SeamVerdict::Layout if self.gap && self.frame.clean => {
+                self.note_unresolved("try_deletes: the layout moved before the gap withdrawal");
+                self.suspend_and_pause(cause, now)
+            }
             SeamVerdict::Layout => self.edge(now),
             SeamVerdict::Closed => self.retired(now),
             SeamVerdict::Expired => self.end(End::Expire, now),
@@ -2160,12 +2179,11 @@ impl<'c> Txn<'c> {
         let presses = self.presses.expect("a withdrawal chose its presses");
         let left = presses.total - self.deleted;
         self.delete_job = presses.per_write.min(left);
-        self.enqueue(
-            JobKind::Deletes,
-            Job::Deletes(self.delete_job),
-            Phase::DeleteJob,
-            now,
-        )
+        let job = match presses.key {
+            WithdrawKey::Delete => Job::Deletes(self.delete_job),
+            WithdrawKey::Clear => Job::Clears(self.delete_job),
+        };
+        self.enqueue(JobKind::Deletes, job, Phase::DeleteJob, now)
     }
 
     /// A delete job ended with `accepted` of its deletes taken: on to the
@@ -2395,15 +2413,36 @@ mod gap_withdrawal_tests {
 
     const ID: &str = "m-k3xzq2ab-0f3c9a71d2e4b850";
 
-    struct OneFrame(Frame);
+    /// The seam: the frame it shows (`.0`), and the rest of what its next
+    /// read reports (`.1`), which a test can move between the read that
+    /// recognised the echo and the final read before a job.
+    struct OneFrame(Frame, SeamState);
+
+    /// What a [`OneFrame`] read reports besides its frame.
+    struct SeamState {
+        job_mark: u64,
+        mode: Result<(), &'static str>,
+    }
+
+    impl OneFrame {
+        fn new(frame: Frame) -> Self {
+            Self(
+                frame,
+                SeamState {
+                    job_mark: 0,
+                    mode: Ok(()),
+                },
+            )
+        }
+    }
 
     impl Seam for OneFrame {
         fn read(&mut self) -> Option<SeamRead> {
             Some(SeamRead {
                 watermark: 0,
-                job_mark: 0,
+                job_mark: self.1.job_mark,
                 frame: self.0.clone(),
-                mode: Ok(()),
+                mode: self.1.mode,
                 open: true,
             })
         }
@@ -2566,9 +2605,9 @@ mod gap_withdrawal_tests {
             jobs.extend(queued.iter().cloned());
             now += Duration::from_millis(50);
             actions = match queued.first() {
-                Some(Job::Deletes(n)) => {
+                Some(Job::Deletes(n) | Job::Clears(n)) => {
                     txn.on(Event::JobStarted, seam, now);
-                    // The agent took every delete: its composer is empty.
+                    // The agent took every press: its composer is empty.
                     seam.0 = after.clone();
                     txn.on(
                         Event::JobEnded {
@@ -2621,7 +2660,7 @@ mod gap_withdrawal_tests {
         let t0 = Instant::now();
         let mut txn = admit_on(&bell, caps(true), t0);
         let line = txn.line().to_string();
-        let mut seam = OneFrame(composer("", true));
+        let mut seam = OneFrame::new(composer("", true));
         let (actions, mut jobs) =
             type_then_show(&mut txn, &mut seam, composer(&gapped(&line), false), t0);
         assert_eq!(
@@ -2648,7 +2687,7 @@ mod gap_withdrawal_tests {
         let t1 = t0 + TXN_MAX;
         let mut retry = admit_on(&bell, caps(true), t1);
         let line = retry.line().to_string();
-        let mut seam = OneFrame(composer("", true));
+        let mut seam = OneFrame::new(composer("", true));
         let (_, jobs) = type_then_show(&mut retry, &mut seam, composer(&line, false), t1);
         assert_eq!(
             jobs,
@@ -2669,7 +2708,7 @@ mod gap_withdrawal_tests {
         let t0 = Instant::now();
         let mut txn = admit_on(&bell, caps(false), t0);
         let line = txn.line().to_string();
-        let mut seam = OneFrame(composer("", true));
+        let mut seam = OneFrame::new(composer("", true));
         let (actions, _) = type_then_show(&mut txn, &mut seam, composer(&gapped(&line), false), t0);
         assert_eq!(enqueued(&actions), vec![Job::Deletes(line.chars().count())]);
         let (outcome, _) = run_out(&mut txn, &mut seam, actions, t0 + ECHO_WAIT);
@@ -2689,7 +2728,7 @@ mod gap_withdrawal_tests {
         txn.pace_deletes(1, PACE);
         let line = txn.line().to_string();
         let count = line.chars().count();
-        let mut seam = OneFrame(composer("", true));
+        let mut seam = OneFrame::new(composer("", true));
         let (mut actions, _) =
             type_then_show(&mut txn, &mut seam, composer(&gapped(&line), false), t0);
         let mut now = t0 + ECHO_WAIT;
@@ -2738,7 +2777,7 @@ mod gap_withdrawal_tests {
         let mut txn = admit_on(&bell, caps(false), t0);
         txn.pace_deletes(1, Duration::from_millis(5));
         let line = txn.line().to_string();
-        let mut seam = OneFrame(composer("", true));
+        let mut seam = OneFrame::new(composer("", true));
         let (actions, _) = type_then_show(&mut txn, &mut seam, composer(&gapped(&line), false), t0);
         assert_eq!(enqueued(&actions), vec![Job::Deletes(1)]);
         let now = t0 + ECHO_WAIT;
@@ -2782,7 +2821,7 @@ mod gap_withdrawal_tests {
             ECHO_WAIT + gap * (writes - 1) >= TXN_MAX,
             "the line's paced deletes would fit: the case this test is about is gone"
         );
-        let mut seam = OneFrame(composer("", true));
+        let mut seam = OneFrame::new(composer("", true));
         let (actions, jobs) =
             type_then_show(&mut txn, &mut seam, composer(&gapped(&line), false), t0);
         assert_eq!(jobs, vec![Job::Line(line)], "no delete was sent");
@@ -2808,7 +2847,7 @@ mod gap_withdrawal_tests {
         let t0 = Instant::now();
         let mut txn = admit_on(&bell, caps(false), t0);
         let line = txn.line().to_string();
-        let mut seam = OneFrame(composer("", true));
+        let mut seam = OneFrame::new(composer("", true));
         let (actions, _) = type_then_show(&mut txn, &mut seam, composer(&gapped(&line), false), t0);
         assert_eq!(enqueued(&actions), vec![Job::Deletes(line.chars().count())]);
         let (outcome, _) = run_out_to(&mut txn, &mut seam, actions, t0 + ECHO_WAIT, after);
@@ -2822,7 +2861,7 @@ mod gap_withdrawal_tests {
         let mut txn = admit_on(&bell, caps(true), t0);
         let line = txn.line().to_string();
         let foreign = gapped(&line).replacen("       ", "   x   ", 1);
-        let mut seam = OneFrame(composer("", true));
+        let mut seam = OneFrame::new(composer("", true));
         let (actions, mut jobs) =
             type_then_show(&mut txn, &mut seam, composer(&foreign, false), t0);
         assert_eq!(txn.phase(), Phase::Pause(Cause::EchoMismatch));
@@ -2841,7 +2880,7 @@ mod gap_withdrawal_tests {
         let t0 = Instant::now();
         let mut first = admit_on(&bell, caps(true), t0);
         let line = first.line().to_string();
-        let mut seam = OneFrame(composer("", true));
+        let mut seam = OneFrame::new(composer("", true));
         let (actions, _) =
             type_then_show(&mut first, &mut seam, composer(&gapped(&line), false), t0);
         let (outcome, _) = run_out(&mut first, &mut seam, actions, t0 + ECHO_WAIT);
@@ -2852,7 +2891,7 @@ mod gap_withdrawal_tests {
         let t1 = t0 + TXN_MAX;
         let mut retry = admit_on(&bell, caps(true), t1);
         let line = retry.line().to_string();
-        let mut seam = OneFrame(composer("", true));
+        let mut seam = OneFrame::new(composer("", true));
         let (_, jobs) = type_then_show(&mut retry, &mut seam, composer(&gapped(&line), false), t1);
         assert_eq!(retry.phase(), Phase::Pause(Cause::EchoMismatch));
         assert!(bell.cell().load().suspended());
@@ -2908,10 +2947,10 @@ mod gap_withdrawal_tests {
             ECHO_WAIT + gap * (writes - 1) >= TXN_MAX,
             "the paced deletes would fit: the case this test is about is gone"
         );
-        let mut seam = OneFrame(composer("", true));
+        let mut seam = OneFrame::new(composer("", true));
         let (actions, jobs) =
             type_then_show(&mut txn, &mut seam, composer(&gapped(&line), false), t0);
-        assert_eq!(enqueued(&actions), vec![Job::Deletes(1)], "one press");
+        assert_eq!(enqueued(&actions), vec![Job::Clears(1)], "one press");
         assert_eq!(txn.withdraw_key(), WithdrawKey::Clear, "of the clear key");
         let (outcome, more) = run_out_to(
             &mut txn,
@@ -2922,8 +2961,8 @@ mod gap_withdrawal_tests {
         );
         assert_eq!(outcome, Outcome::Withdrawn);
         assert!(txn.gap_withdrew());
-        assert_eq!(jobs, vec![Job::Line(line), Job::Deletes(1)]);
-        assert_eq!(more, vec![Job::Deletes(1)], "one clear, then no Enter");
+        assert_eq!(jobs, vec![Job::Line(line), Job::Clears(1)]);
+        assert_eq!(more, vec![Job::Clears(1)], "one clear, then no Enter");
         assert!(matches!(
             bell.cell().load(),
             Latch::Resolved(_, Resolution::Withdrawn)
@@ -2940,10 +2979,10 @@ mod gap_withdrawal_tests {
         let t0 = Instant::now();
         let mut txn = admit_antigravity(&bell, t0, 170);
         let line = txn.line().to_string();
-        let mut seam = OneFrame(composer("", true));
+        let mut seam = OneFrame::new(composer("", true));
         let (actions, jobs) =
             type_then_show(&mut txn, &mut seam, composer(&gapped(&line), false), t0);
-        assert_eq!(enqueued(&actions), vec![Job::Deletes(1)]);
+        assert_eq!(enqueued(&actions), vec![Job::Clears(1)]);
         let leftover: String = line.chars().skip(140).collect();
         let (outcome, more) = run_out_to(
             &mut txn,
@@ -2954,8 +2993,8 @@ mod gap_withdrawal_tests {
         );
         assert_eq!(outcome, Outcome::Unresolved(Cause::Deadline));
         assert!(bell.cell().load().suspended());
-        assert_eq!(jobs, vec![Job::Line(line), Job::Deletes(1)]);
-        assert_eq!(more, vec![Job::Deletes(1)], "nothing after the one press");
+        assert_eq!(jobs, vec![Job::Line(line), Job::Clears(1)]);
+        assert_eq!(more, vec![Job::Clears(1)], "nothing after the one press");
     }
 
     /// PRD #211: with the clear key served, a composer holding anything but
@@ -2968,7 +3007,7 @@ mod gap_withdrawal_tests {
         let mut txn = admit_antigravity(&bell, t0, 170);
         let line = txn.line().to_string();
         let foreign = gapped(&line).replacen("       ", "   x   ", 1);
-        let mut seam = OneFrame(composer("", true));
+        let mut seam = OneFrame::new(composer("", true));
         let (actions, mut jobs) =
             type_then_show(&mut txn, &mut seam, composer(&foreign, false), t0);
         assert_eq!(txn.phase(), Phase::Pause(Cause::EchoMismatch));
@@ -2991,7 +3030,7 @@ mod gap_withdrawal_tests {
         let mut txn = admit_on(&bell, caps(false), t0);
         txn.clear_lines(2, Some(1), slow);
         let line = txn.line().to_string();
-        let mut seam = OneFrame(composer("", true));
+        let mut seam = OneFrame::new(composer("", true));
         let (actions, _) = type_then_show(&mut txn, &mut seam, composer(&gapped(&line), false), t0);
         assert_eq!(enqueued(&actions), vec![Job::Deletes(line.chars().count())]);
         assert_eq!(txn.withdraw_key(), WithdrawKey::Delete);
@@ -3003,13 +3042,142 @@ mod gap_withdrawal_tests {
         txn.clear_lines(2, Some(1), slow);
         txn.pace_deletes(1, slow);
         let line = txn.line().to_string();
-        let mut seam = OneFrame(composer("", true));
+        let mut seam = OneFrame::new(composer("", true));
         let (actions, jobs) =
             type_then_show(&mut txn, &mut seam, composer(&gapped(&line), false), t0);
         assert_eq!(jobs, vec![Job::Line(line)], "no press");
         let (outcome, more) = run_out(&mut txn, &mut seam, actions, t0 + ECHO_WAIT);
         assert_eq!(outcome, Outcome::Unresolved(Cause::EchoMismatch));
         assert!(more.is_empty(), "{more:?}");
+    }
+
+    /// The misrendered echo of a 170-character line on Antigravity's
+    /// served keys (so a withdrawal would be one Ctrl+U) is recognised on
+    /// the frame event, but `change` moves what the seam's final read
+    /// before the clear reports; the attempt then runs to its end on what
+    /// the seam shows. Returns the outcome, every job queued, and whether
+    /// the cell was left suspended.
+    fn final_read_changed(change: impl FnOnce(&mut OneFrame, &str)) -> (Outcome, Vec<Job>, bool) {
+        let bell = generation();
+        let t0 = Instant::now();
+        let mut txn = admit_antigravity(&bell, t0, 170);
+        let line = txn.line().to_string();
+        let mut seam = OneFrame::new(composer("", true));
+        let mut jobs = enqueued(&txn.start(&mut seam, t0));
+        txn.on(Event::JobStarted, &mut seam, t0);
+        txn.on(
+            Event::JobEnded {
+                accepted: line.len(),
+                ok: true,
+            },
+            &mut seam,
+            t0,
+        );
+        let shown = composer(&gapped(&line), false);
+        seam.0 = shown.clone();
+        change(&mut seam, &line);
+        let actions = txn.on(Event::Frame(shown), &mut seam, t0 + ECHO_WAIT);
+        // `run_out` reports the jobs `actions` queued as well.
+        let (outcome, more) = run_out(&mut txn, &mut seam, actions, t0 + ECHO_WAIT);
+        jobs.extend(more);
+        let suspended = bell.cell().load().suspended();
+        (outcome, jobs, suspended)
+    }
+
+    /// Assert what [`final_read_changed`] reported is a refused clear: the
+    /// line and nothing after it, no Ctrl+U, delete or Enter, the attempt
+    /// unresolved by its deadline and the cell suspended.
+    fn assert_refused(what: &str, (outcome, jobs, suspended): (Outcome, Vec<Job>, bool)) {
+        assert!(
+            matches!(jobs.as_slice(), [Job::Line(_)]),
+            "{what}: no press and no Enter after the line: {jobs:?}"
+        );
+        assert!(
+            matches!(outcome, Outcome::Unresolved(_)),
+            "{what}: released unresolved by the deadline: {outcome:?}"
+        );
+        assert!(suspended, "{what}: the cell is suspended");
+    }
+
+    /// PRD #211 (review: the final seam of the recovery): the echo was
+    /// recognised as the deck's line misrendered, and then, on the seam's
+    /// final read before the Ctrl+U, a person's job is on the writer (J0
+    /// moved), the composer's text or cursor moved, the input mode is no
+    /// longer usable, or the layout moved to a new epoch. Each one refuses
+    /// the clear: nothing is pressed, nothing is submitted, and the attempt
+    /// ends unresolved at its deadline with the cell suspended.
+    #[test]
+    fn a_change_on_the_final_read_refuses_the_clear() {
+        assert_refused(
+            "job mark moved",
+            final_read_changed(|seam, _| seam.1.job_mark = 1),
+        );
+        assert_refused(
+            "composer text changed",
+            final_read_changed(|seam, line| {
+                seam.0 = composer(&format!("{}x", gapped(line)), false);
+            }),
+        );
+        assert_refused(
+            "cursor moved",
+            final_read_changed(|seam, _| {
+                seam.0.composer.as_mut().unwrap().cursor_at_end = false;
+            }),
+        );
+        assert_refused(
+            "mode changed",
+            final_read_changed(|seam, _| seam.1.mode = Err("the agent left raw mode")),
+        );
+        assert_refused(
+            "layout moved",
+            final_read_changed(|seam, _| seam.0.epoch = 1),
+        );
+        let (outcome, jobs, _) = final_read_changed(|_, _| {});
+        assert_eq!(outcome, Outcome::Withdrawn, "unchanged, it clears");
+        assert!(matches!(jobs.as_slice(), [Job::Line(_), Job::Clears(1)]));
+    }
+
+    /// PRD #211 (review: the final seam of the recovery): a paced gap
+    /// withdrawal's first delete went in, and a person's job reached the
+    /// writer before the next (J0 moved): the next delete's seam refuses
+    /// it, no delete or Enter follows, and the attempt ends unresolved at
+    /// its deadline with the cell suspended.
+    #[test]
+    fn a_paced_withdrawal_stops_when_the_job_mark_moves_between_deletes() {
+        const PACE: Duration = Duration::from_millis(5);
+        let bell = generation();
+        let t0 = Instant::now();
+        let mut txn = admit_on(&bell, caps(false), t0);
+        txn.pace_deletes(1, PACE);
+        let line = txn.line().to_string();
+        let mut seam = OneFrame::new(composer("", true));
+        let (actions, mut jobs) =
+            type_then_show(&mut txn, &mut seam, composer(&gapped(&line), false), t0);
+        assert_eq!(enqueued(&actions), vec![Job::Deletes(1)]);
+        let now = t0 + ECHO_WAIT;
+        txn.on(Event::JobStarted, &mut seam, now);
+        let left: String = line.chars().take(line.chars().count() - 1).collect();
+        seam.0 = composer(&left, false);
+        seam.1.job_mark = 1;
+        let actions = txn.on(
+            Event::JobEnded {
+                accepted: 1,
+                ok: true,
+            },
+            &mut seam,
+            now,
+        );
+        assert_eq!(enqueued(&actions), vec![], "the next waits for its pace");
+        let actions = txn.on(Event::Frame(seam.0.clone()), &mut seam, now + PACE);
+        let (outcome, more) = run_out(&mut txn, &mut seam, actions, now + PACE);
+        jobs.extend(more);
+        assert_eq!(
+            jobs,
+            vec![Job::Line(line), Job::Deletes(1)],
+            "no delete and no Enter after the job mark moved"
+        );
+        assert!(matches!(outcome, Outcome::Unresolved(_)), "{outcome:?}");
+        assert!(bell.cell().load().suspended());
     }
 
     /// PRD #211: a strict withdrawal of a composer holding exactly the
@@ -3025,9 +3193,9 @@ mod gap_withdrawal_tests {
         let line = txn.line().to_string();
         txn.accepted = line.chars().count();
         txn.frame = composer(&line, false);
-        let mut seam = OneFrame(composer(&line, false));
+        let mut seam = OneFrame::new(composer(&line, false));
         let actions = txn.unresolve(Cause::EchoMismatch, &mut seam, t0);
-        assert_eq!(enqueued(&actions), vec![Job::Deletes(1)]);
+        assert_eq!(enqueued(&actions), vec![Job::Clears(1)]);
         assert_eq!(txn.withdraw_key(), WithdrawKey::Clear);
 
         let bell = generation();
@@ -3038,7 +3206,7 @@ mod gap_withdrawal_tests {
         txn.after_cr = true;
         let kept = format!("{line}\n");
         txn.frame = composer(&kept, false);
-        let mut seam = OneFrame(composer(&kept, false));
+        let mut seam = OneFrame::new(composer(&kept, false));
         let actions = txn.unresolve(Cause::NoSubmitEvidence, &mut seam, t0);
         assert_eq!(
             enqueued(&actions),

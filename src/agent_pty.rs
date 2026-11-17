@@ -2338,7 +2338,10 @@ impl AgentBus {
     /// the row [`crate::release_scanner::ANTIGRAVITY_HEADER`] reads, so
     /// [`Self::header_since_mark`] read none. Such a resume is not detected:
     /// it keeps the reader, its epoch and the earlier invocation's release,
-    /// when one was read. This does not authenticate the process.
+    /// when one was read. That release authorises no answer: a permission
+    /// question in a generation spawned as a shell is keyboard-only whatever
+    /// release was latched (`daemon::answer_release`). This does not
+    /// authenticate the process.
     fn shell_agent_hook(
         &self,
         agent: &AgentType,
@@ -37397,10 +37400,11 @@ mod paced_withdrawal_tests {
                         Job::Line(text) => text.clone().into_bytes(),
                         Job::Cr => b"\r".to_vec(),
                         Job::Deletes(n) => vec![0x7f; *n],
+                        Job::Clears(n) => vec![0x15; *n],
                     };
                     let expected = std::fs::metadata(&typed).unwrap().len() as usize
                         + match &job {
-                            Job::Deletes(_) if pace.is_none() => 1,
+                            Job::Deletes(_) | Job::Clears(_) if pace.is_none() => 1,
                             _ => bytes.len(),
                         };
                     let mut queued = writer
@@ -37481,6 +37485,272 @@ mod paced_withdrawal_tests {
         );
         assert_eq!(writes.len(), 2, "the line, then every delete in one write");
         assert_eq!(reached.iter().filter(|&&b| b == 0x7f).count(), 1);
+    }
+
+    /// The composer of an `agy` that takes Ctrl+U, as the pane's PTY got
+    /// it: empty until the line reached it, then the line drawn with the
+    /// seven-column gap, and empty again once a Ctrl+U went in. Its marks
+    /// are the pane's real ingress ledger's.
+    struct ClearingComposer {
+        typed: std::path::PathBuf,
+        line: String,
+        ledger: Arc<crate::ingress_ledger::IngressLedger>,
+    }
+
+    impl Seam for ClearingComposer {
+        fn read(&mut self) -> Option<SeamRead> {
+            let typed = std::fs::read(&self.typed).unwrap_or_default();
+            let text = if typed.is_empty() || typed.contains(&0x15) {
+                String::new()
+            } else {
+                let at = self.line.char_indices().nth(35).unwrap().0;
+                format!("{}       {}", &self.line[..at], &self.line[at..])
+            };
+            let marks = self.ledger.marks();
+            Some(SeamRead {
+                watermark: marks.watermark,
+                job_mark: marks.job_mark,
+                frame: Frame {
+                    epoch: 0,
+                    clean: true,
+                    composer: Some(ComposerView {
+                        placeholder: false,
+                        text,
+                        cursor_at_end: true,
+                        selection: false,
+                        hidden: false,
+                    }),
+                    ..Frame::default()
+                },
+                mode: Ok(()),
+                open: true,
+            })
+        }
+    }
+
+    /// Scenario: the deck rings a raw `cat` pane served Antigravity's keys,
+    /// holding the pane's real writer for the whole transaction as a ring
+    /// does, and the agent draws the typed line with a seven-column gap. A
+    /// person's draft is written to the same pane while the ring holds the
+    /// writer, so it waits behind it. The mismatched echo is withdrawn with
+    /// exactly one Ctrl+U in its own write, no Enter is sent, and once the
+    /// ring releases the writer the person's draft reaches the pane intact,
+    /// after the Ctrl+U.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn a_clear_withdrawal_with_a_human_draft_waiting_sends_one_ctrl_u_then_the_draft() {
+        const DRAFT: &[u8] = b"my own draft, typed while the deck held the pane";
+        let dir = tempfile::tempdir().unwrap();
+        let typed = dir.path().join("typed");
+        std::fs::write(&typed, b"").unwrap();
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let pane = "pane-clear-withdrawal".to_string();
+        let command = format!("stty raw -echo && exec cat > '{}'", typed.display());
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some(&command),
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    pane.clone(),
+                )]),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the pane");
+        let doorbell = registry.generation_doorbell(&id).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while doorbell.unwrapped_mode().is_err() {
+            assert!(Instant::now() < deadline, "the pane never went raw");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let real = registry
+            .replace_agent_writer_for_test(&id, Box::new(std::io::sink()))
+            .await;
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let _sink = registry
+            .replace_agent_writer_for_test(
+                &id,
+                Box::new(BurstDropper {
+                    inner: real,
+                    writes: Arc::clone(&writes),
+                }),
+            )
+            .await;
+        let ledger = registry.ingress_ledger(&id).expect("the pane's ledger");
+        let marks = ledger.marks();
+        let bell = crate::doorbell_generation::GenerationDoorbell::new(false, None);
+        let t0 = Instant::now();
+        let admission = Admission {
+            activation: Ok(()),
+            mode: Ok(()),
+            ledger_idle: true,
+            watermark: marks.watermark,
+            job_mark: marks.job_mark,
+            frame: Frame {
+                epoch: 0,
+                clean: true,
+                composer: Some(ComposerView {
+                    text: String::new(),
+                    cursor_at_end: true,
+                    placeholder: false,
+                    selection: false,
+                    hidden: false,
+                }),
+                ..Frame::default()
+            },
+            nudge_in_flight: false,
+            settling: false,
+            submit_route: true,
+            still_admitted: true,
+            command: "dot-agent-deck".to_string(),
+        };
+        let mut draws = [3u8, 1, 4, 1, 5, 9, 2, 6].into_iter().cycle();
+        let caps = Caps {
+            delete_key: true,
+            placeholder: false,
+            hook_route: true,
+            transcript_route: false,
+            staged_head: None,
+        };
+        let mut txn = crate::doorbell_txn::admit(
+            &admission,
+            bell.counter(),
+            bell.ring(),
+            bell.cell(),
+            || draws.next().unwrap(),
+            &crate::inbox::MessageId::parse("m-k3xzq2ab-0f3c9a71d2e4b850").unwrap(),
+            caps,
+            t0,
+        )
+        .expect("admitted");
+        txn.allow_gap_withdrawal();
+        txn.serve_keys(
+            crate::agent_registry::spec(&crate::event::AgentType::Antigravity)
+                .prompt_keys
+                .as_ref()
+                .expect("Antigravity's keys"),
+        );
+        let mut seam = ClearingComposer {
+            typed: typed.clone(),
+            line: txn.line().to_string(),
+            ledger: Arc::clone(&ledger),
+        };
+        // The ring's hold on the writer, for the whole transaction.
+        let writer = registry.agent_writer(&id).expect("the pane's writer");
+        let held = writer.lock().await;
+        let mut human: Option<tokio::task::JoinHandle<Result<(), &'static str>>> = None;
+        let mut jobs = Vec::new();
+        let mut now = t0;
+        let mut actions = txn.start(&mut seam, now);
+        let outcome = loop {
+            if let Some(outcome) = actions.iter().find_map(|a| match a {
+                Action::Release(outcome) => Some(*outcome),
+                _ => None,
+            }) {
+                break outcome;
+            }
+            assert!(now < t0 + Duration::from_secs(10), "the ring never ended");
+            let queued = actions.iter().find_map(|a| match a {
+                Action::Enqueue(job, claim) => Some((job.clone(), Arc::clone(claim))),
+                _ => None,
+            });
+            let wake = actions.iter().find_map(|a| match a {
+                Action::WakeAt(at) => Some(*at),
+                _ => None,
+            });
+            actions = match queued {
+                Some((job, claim)) => {
+                    jobs.push(job.clone());
+                    let bytes = match &job {
+                        Job::Line(text) => text.clone().into_bytes(),
+                        Job::Cr => b"\r".to_vec(),
+                        Job::Deletes(n) => vec![0x7f; *n],
+                        Job::Clears(n) => vec![0x15; *n],
+                    };
+                    let expected = std::fs::metadata(&typed).unwrap().len() as usize + bytes.len();
+                    let mut queued = held
+                        .queue_ring_job(
+                            bytes,
+                            claim,
+                            crate::composer_probe::epoch::DeckJobId::ring(txn.attempt()),
+                        )
+                        .expect("the writer thread runs");
+                    let (accepted, ok) = queued.done().await.expect("the job ran");
+                    let until = Instant::now() + Duration::from_secs(5);
+                    while (std::fs::metadata(&typed).unwrap().len() as usize) < expected {
+                        assert!(Instant::now() < until, "the bytes never reached the agent");
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                    txn.on(Event::JobStarted, &mut seam, now);
+                    if matches!(job, Job::Line(_)) {
+                        // The person starts typing once the line is in: their
+                        // operation is admitted and waits for the writer the
+                        // ring holds.
+                        human = Some({
+                            let registry = Arc::clone(&registry);
+                            let (pane, id) = (pane.clone(), id.clone());
+                            tokio::spawn(async move {
+                                registry.write_user_bytes(&pane, &id, DRAFT).await
+                            })
+                        });
+                        let until = Instant::now() + Duration::from_secs(5);
+                        while ledger.marks().watermark == marks.watermark {
+                            assert!(Instant::now() < until, "the draft was never admitted");
+                            tokio::time::sleep(Duration::from_millis(2)).await;
+                        }
+                        let ended = txn.on(Event::JobEnded { accepted, ok }, &mut seam, now);
+                        assert!(
+                            ended.iter().all(|a| !matches!(a, Action::Release(_))),
+                            "{ended:?}"
+                        );
+                        now = t0 + ECHO_WAIT;
+                        let frame = seam.read().unwrap().frame;
+                        txn.on(Event::Frame(frame), &mut seam, now)
+                    } else {
+                        txn.on(Event::JobEnded { accepted, ok }, &mut seam, now)
+                    }
+                }
+                None => {
+                    now = wake.map_or(now + Duration::from_millis(10), |at| at.max(now));
+                    let frame = seam.read().unwrap().frame;
+                    txn.on(Event::Frame(frame), &mut seam, now)
+                }
+            };
+        };
+        assert_eq!(outcome, Outcome::Withdrawn, "{jobs:?}");
+        assert!(txn.gap_withdrew());
+        let line = txn.line().to_string();
+        assert_eq!(jobs, vec![Job::Line(line.clone()), Job::Clears(1)]);
+        assert_eq!(
+            std::fs::read(&typed).unwrap(),
+            [line.as_bytes(), b"\x15"].concat(),
+            "nothing of the draft is written while the ring holds the writer"
+        );
+        drop(held);
+        human
+            .expect("the draft was sent")
+            .await
+            .unwrap()
+            .expect("the draft's write");
+        let until = Instant::now() + Duration::from_secs(5);
+        while (std::fs::metadata(&typed).unwrap().len() as usize) < line.len() + 1 + DRAFT.len() {
+            assert!(Instant::now() < until, "the draft never reached the agent");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let reached = std::fs::read(&typed).unwrap();
+        assert_eq!(reached, [line.as_bytes(), b"\x15", DRAFT].concat());
+        assert_eq!(
+            reached.iter().filter(|&&b| b == 0x15).count(),
+            1,
+            "one Ctrl+U"
+        );
+        assert!(!reached.contains(&b'\r'), "no Enter");
+        assert!(!reached.contains(&0x7f), "no delete");
+        let writes = writes.lock().unwrap().clone();
+        assert_eq!(
+            writes,
+            vec![line.into_bytes(), vec![0x15], DRAFT.to_vec()],
+            "the line, one Ctrl+U in its own write, then the draft intact"
+        );
+        registry.shutdown_all();
     }
 }
 
