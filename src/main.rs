@@ -926,6 +926,15 @@ enum InboxAction {
         #[arg(long, hide = true)]
         resumed: bool,
     },
+    /// Confirm a deck message Claude Code's prompt hook handed over once the
+    /// session transcript shows Claude took it (issue #2341). Started by
+    /// that hook, not by hand.
+    #[command(hide = true)]
+    Witness {
+        /// What to watch for, as the hook wrote it.
+        #[arg(long)]
+        plan: String,
+    },
     /// Tell the deck an agent's native inbox component is about to arm. Run
     /// by those components, not by hand.
     #[command(hide = true)]
@@ -2132,6 +2141,7 @@ fn main() -> ExitCode {
                 },
             ),
             InboxAction::Announce { agent } => dot_agent_deck::inbox_cli::announce(&agent),
+            InboxAction::Witness { plan } => dot_agent_deck::inbox_witness::run(&plan),
             InboxAction::Publish { topic, body } => {
                 dot_agent_deck::inbox_cli::publish(&topic, body.text, body.file)
             }

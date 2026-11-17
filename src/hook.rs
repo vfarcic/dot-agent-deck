@@ -602,6 +602,10 @@ fn antigravity_inbox_hooks(
                         crate::inbox_hub::AGENT_FRAMING,
                         &crate::inbox_prompt::Envelope::Inject,
                         event,
+                        // No transcript witness reads Antigravity's session:
+                        // its prompt hook commits what it wrote, as Codex's
+                        // does.
+                        None,
                     )
                 })
                 .map_or(AntigravityInbox::Nothing, AntigravityInbox::Print)
@@ -1004,6 +1008,9 @@ fn claude_inbox_hooks(
         }
         "UserPromptSubmit" => {
             let prompt = payload.get("prompt").and_then(Value::as_str)?;
+            // Issue #2341: Claude can still drop the prompt after this hook
+            // exits, so what it hands over is committed once the session
+            // transcript shows Claude took it.
             deck_prompt_submit(
                 prompt,
                 crate::event::InboxComponent::ClaudeHooks,
@@ -1012,6 +1019,7 @@ fn claude_inbox_hooks(
                     hook_event_name: "UserPromptSubmit".to_string(),
                 },
                 event,
+                crate::inbox_witness::TranscriptMark::of_payload(&payload),
             )
         }
         _ => None,
@@ -1025,6 +1033,10 @@ pub struct HookOutput {
     /// reports its own attempts instead.
     #[cfg(unix)]
     one_shot: Option<crate::inbox_prompt::OneShotInjection>,
+    /// Issue #2341: the transcript witness that commits what Claude took,
+    /// instead of the hand-over committing what it wrote.
+    #[cfg(unix)]
+    witness: Option<crate::inbox_prompt::Witness>,
 }
 
 impl HookOutput {
@@ -1033,6 +1045,8 @@ impl HookOutput {
             stdout,
             #[cfg(unix)]
             one_shot: None,
+            #[cfg(unix)]
+            witness: None,
         }
     }
 
@@ -1051,12 +1065,23 @@ impl HookOutput {
     }
 
     /// Write the output. A one-shot hand-over commits what it wrote in full,
-    /// on each attempt's own cap.
+    /// on each attempt's own cap, or leaves that to its transcript witness.
     fn print(self) {
         #[cfg(unix)]
-        if let Some(one_shot) = self.one_shot {
-            one_shot.print();
-            return;
+        match (self.one_shot, self.witness) {
+            (Some(one_shot), Some(witness)) => {
+                one_shot.print_witnessed(witness);
+                return;
+            }
+            (Some(one_shot), None) => {
+                one_shot.print();
+                return;
+            }
+            (None, Some(witness)) => {
+                witness.start_alone();
+                return;
+            }
+            (None, None) => {}
         }
         let mut out = std::io::stdout();
         let _ = writeln!(out, "{}", self.stdout).and_then(|()| out.flush());
@@ -1151,6 +1176,8 @@ fn codex_inbox_hooks(
             .get("prompt")
             .and_then(Value::as_str)
             .and_then(|prompt| {
+                // Codex's prompt hook still commits what it wrote: no
+                // transcript witness reads Codex's session yet.
                 deck_prompt_submit(
                     prompt,
                     crate::event::InboxComponent::CodexHooks,
@@ -1159,6 +1186,7 @@ fn codex_inbox_hooks(
                         hook_event_name: "UserPromptSubmit".to_string(),
                     },
                     event,
+                    None,
                 )
             })
             .map_or(CodexInbox::Nothing, CodexInbox::Print),
@@ -1198,6 +1226,7 @@ pub fn deck_prompt_submit(
     framing: &str,
     envelope: &crate::inbox_prompt::Envelope,
     event: &mut AgentEvent,
+    transcript: Option<crate::inbox_witness::TranscriptMark>,
 ) -> Option<HookOutput> {
     let ids = crate::inbox_prompt::scan(prompt);
     if ids.is_empty() {
@@ -1207,11 +1236,28 @@ pub fn deck_prompt_submit(
     // (what it leaves out: `prompt_receipts_wait`): the hook blocks the
     // user's prompt while it runs.
     let receipts_by = std::time::Instant::now() + crate::inbox_prompt::prompt_receipts_wait();
-    crate::inbox_prompt::commit_delivered(
-        prompt,
-        crate::inbox_prompt::sender_of(component),
+    // Issue #2341: with a transcript to witness it, what the prompt carries
+    // is committed once Claude has taken the prompt, not now.
+    #[cfg(unix)]
+    let witness = transcript.map(|mark| crate::inbox_prompt::Witness {
+        mark,
+        native: crate::inbox_prompt::delivered(prompt),
         receipts_by,
-    );
+    });
+    // No witness runs off Unix: the one-shots that would hand a block over
+    // are Unix only.
+    #[cfg(not(unix))]
+    let witness: Option<()> = {
+        let _ = transcript;
+        None
+    };
+    if witness.is_none() {
+        crate::inbox_prompt::commit_delivered(
+            prompt,
+            crate::inbox_prompt::sender_of(component),
+            receipts_by,
+        );
+    }
     #[cfg(unix)]
     {
         let ring = crate::inbox_prompt::ring_of(prompt);
@@ -1233,16 +1279,21 @@ pub fn deck_prompt_submit(
             .map(crate::inbox_prompt::OneShotInjection::ids)
             .unwrap_or_default();
         crate::inbox_prompt::mark_event(event, &ids, &fetched);
-        injection.map(|injection| HookOutput {
-            stdout: String::new(),
-            one_shot: Some(injection),
-        })
+        match (injection, witness) {
+            (None, Some(witness)) if witness.native.is_empty() => None,
+            (None, None) => None,
+            (one_shot, witness) => Some(HookOutput {
+                stdout: String::new(),
+                one_shot,
+                witness,
+            }),
+        }
     }
     // The one-shot receivers are Unix only: no body is injected here, so a
     // doorbell does not deliver to Claude Code or Codex on Windows yet.
     #[cfg(not(unix))]
     {
-        let _ = (component, framing, envelope);
+        let _ = (component, framing, envelope, witness);
         crate::inbox_prompt::mark_event(event, &ids, &[]);
         None
     }
