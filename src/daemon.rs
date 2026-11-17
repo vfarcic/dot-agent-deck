@@ -1967,6 +1967,32 @@ async fn ingest_hook_event(
     unproven: bool,
     attested_agent: Option<String>,
 ) {
+    ingest_hook_line(
+        state,
+        event_tx,
+        registry,
+        event,
+        unproven,
+        attested_agent,
+        std::time::Instant::now(),
+    )
+    .await;
+}
+
+/// [`ingest_hook_event`] for an event whose line the hook loop read whole at
+/// `read_at`, before it waited for the events ordered ahead of it. PRD #211
+/// (PR #2370 review P1, audit S2): what an Antigravity hook says about the
+/// keys a person typed is bound to what had been typed by `read_at`, not by
+/// whenever its turn came.
+async fn ingest_hook_line(
+    state: &SharedState,
+    event_tx: &broadcast::Sender<BroadcastMsg>,
+    registry: &Arc<AgentPtyRegistry>,
+    event: AgentEvent,
+    unproven: bool,
+    attested_agent: Option<String>,
+    read_at: std::time::Instant,
+) {
     let untagged_claim = match (&attested_agent, &event.agent_id, &event.pane_id) {
         (Some(owner), None, Some(pane)) => Some((owner.clone(), pane.clone())),
         _ => None,
@@ -1986,18 +2012,36 @@ async fn ingest_hook_event(
         && let Some(owner) = attested_agent.as_deref()
     {
         registry.close_release_window(owner);
-        // PRD #211 (PR #2370 review, Greptile P1): Antigravity has no editor
-        // probe to read its box empty again after a person typed in it, so
-        // its own prompt hook is what does: `PreInvocation` on a turn's first
-        // model call, attested to the generation, says `agy` took a submitted
-        // prompt, and when a person's Enter is the last thing that entered
-        // the box, that submit emptied it. A later call of the same turn, a
-        // `Stop` continue's included, carries no prompt and reaches no
-        // further than this branch.
-        if event.agent_type == crate::event::AgentType::Antigravity && !unproven {
-            registry.note_prompt_taken(owner);
-        }
     }
+    // PRD #211 (PR #2370 review, Greptile P1; review P1; audit S2):
+    // Antigravity has no editor probe to read its box empty again after a
+    // person typed in it, so its own main-session hooks, attested to the
+    // generation and accepted, are among what does. `PreInvocation` on a
+    // turn's first model call says `agy` took a submitted prompt: when a
+    // person's Enter written before this line was read is still the last
+    // thing that entered the box, that submit emptied it. A later call of the
+    // same turn, a `Stop` continue's included, carries no prompt. And that
+    // first call, a call's `PostToolUse` and the turn's `Stop` each say a
+    // permission prompt is no longer up, which settles menu keys typed at it
+    // before this line was read, even when `agy`'s own older status is then
+    // refused for repainting the card this hook moved on.
+    let antigravity_witness = (event.agent_type == crate::event::AgentType::Antigravity
+        && !unproven
+        && !event.is_status_signal()
+        && !event.is_from_subagent())
+    .then(|| attested_agent.clone())
+    .flatten()
+    .map(|owner| {
+        let first_call = event.user_prompt.is_some();
+        let departs = first_call
+            || matches!(
+                event.event_type,
+                crate::event::EventType::ToolEnd
+                    | crate::event::EventType::Idle
+                    | crate::event::EventType::Error
+            );
+        (owner, first_call, departs)
+    });
     let event_type = event.event_type.clone();
     let claimed_pane = event.pane_id.clone();
     // PRD #211 (third review B2): an Antigravity call, which a permission
@@ -2024,6 +2068,18 @@ async fn ingest_hook_event(
         |_| replaced(),
     )
     .await;
+    if ingested && let Some((owner, first_call, departs)) = antigravity_witness {
+        if first_call {
+            registry.note_prompt_taken(&owner, read_at);
+        }
+        if departs {
+            registry.note_menu_answer_taken(
+                &owner,
+                read_at,
+                crate::composer_probe::epoch::Departure::Hook,
+            );
+        }
+    }
     if ingested && let Some((pane_id, agent_id)) = call {
         rebuild_antigravity_permission_question(state, event_tx, registry, &pane_id, &agent_id)
             .await;
@@ -4236,11 +4292,25 @@ async fn report_status_update(
     // working or idle turn, menu keys (digits, Enter, arrows, Escape) that
     // are all that was entered since the box was untouched answered the
     // prompt, so the box is untouched still.
+    //
+    // Review P1: a signal refused only because a newer hook of the same
+    // generation took the card on first is still that generation's report,
+    // read by its current reader after whatever it reads after, so it is as
+    // good a witness that the prompt was left as one applied; the card's
+    // repaint is a separate question. A signal of a generation no longer
+    // holding the pane, or of a reader since turned off, witnesses nothing.
     if *agent_type == crate::event::AgentType::Antigravity {
+        let ordered = ingested || superseded.load(std::sync::atomic::Ordering::Relaxed);
         if ingested && prompts {
             registry.note_prompt_shown(agent_id, seen_at);
-        } else if moves_on {
-            registry.note_menu_answer_taken(agent_id, seen_at, ingested && prompting);
+        } else if moves_on && ordered {
+            registry.note_menu_answer_taken(
+                agent_id,
+                seen_at,
+                crate::composer_probe::epoch::Departure::Status {
+                    card_on_prompt: ingested && prompting,
+                },
+            );
         }
     }
     if !ingested {
@@ -9304,13 +9374,14 @@ async fn run_hook_loop_with_limits(
                                     stamped,
                                 );
                             }
-                            ingest_hook_event(
+                            ingest_hook_line(
                                 &state,
                                 &event_tx,
                                 &pty_registry,
                                 event,
                                 unproven,
                                 attested_agent,
+                                line_read_at,
                             )
                             .await;
                             drop(hook_receipt);
@@ -23455,7 +23526,7 @@ mod status_signal_park_tests {
             .unwrap();
         assert!(deck.registry.input_touched(&agent));
         assert!(
-            !deck.registry.note_prompt_taken(&agent),
+            !deck.registry.note_prompt_taken(&agent, Instant::now()),
             "a key after the submit"
         );
         assert!(deck.registry.input_touched(&agent));
@@ -23560,6 +23631,181 @@ mod status_signal_park_tests {
             deck.registry.input_touched(&deck.panes[2].1),
             "a letter typed at the prompt leaves the box touched"
         );
+    }
+
+    /// Pane `index`'s reader's read of `bytes` now, not yet handed to the
+    /// monitor.
+    fn read_signal(deck: &Deck, index: usize, bytes: &[u8]) -> StatusSignals {
+        let (pane, agent) = &deck.panes[index];
+        let mut found = Vec::new();
+        crate::status_osc::Osc7501Scanner::new("antigravity").scan(bytes, &mut found);
+        assert!(!found.is_empty());
+        StatusSignals {
+            pane_id: pane.clone(),
+            agent_id: agent.clone(),
+            agent_type: AgentType::Antigravity,
+            signals: found,
+            seen_at: Instant::now(),
+            epoch: deck.registry.status_reader_epoch(agent).unwrap(),
+        }
+    }
+
+    async fn until_untouched(deck: &Deck, index: usize, why: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while deck.registry.input_touched(&deck.panes[index].1) {
+            assert!(Instant::now() < deadline, "{why}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Scenario: two Antigravity panes with untouched input boxes each show a
+    /// permission prompt, and a person answers each with `1`. Each pane's
+    /// reader reads `agy`'s `working` next, but before the monitor applies it
+    /// a newer hook of the same generation is applied — the call's
+    /// `PostToolUse` on one pane, the turn's `Stop` on the other — and takes
+    /// the card off Needs Input. The older `working` is then refused for the
+    /// card, and `idle` follows. Both boxes are untouched again, so the next
+    /// queued message may ring.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_answer_overtaken_by_a_newer_hook_leaves_an_untouched_box_untouched() {
+        const WORKING: &[u8] = b"\x1b]7501;state=working:app=antigravity\x07";
+        let deck = Deck::start(&["agy-overtaken-post", "agy-overtaken-stop"]).await;
+        for (index, hook) in ["post-tool-use-run-command.json", "stop.json"]
+            .into_iter()
+            .enumerate()
+        {
+            deck.thinking(index).await;
+            deck.signal(index, PERMISSION);
+            let card = deck
+                .card_within(index, Duration::from_secs(5), |(status, _)| {
+                    *status == SessionStatus::WaitingForInput
+                })
+                .await;
+            assert_eq!(card.map(|c| c.0), Some(SessionStatus::WaitingForInput));
+            let (pane, agent) = deck.panes[index].clone();
+            deck.registry
+                .write_user_bytes(&pane, &agent, b"1")
+                .await
+                .unwrap();
+            assert!(deck.registry.input_touched(&agent));
+            let working = read_signal(&deck, index, WORKING);
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            let _newer = deck.hook(index, hook).await;
+            let card = deck
+                .card_within(index, Duration::from_secs(5), |(status, _)| {
+                    *status != SessionStatus::WaitingForInput
+                })
+                .await;
+            assert_ne!(
+                card.map(|c| c.0),
+                Some(SessionStatus::WaitingForInput),
+                "the newer {hook} did not take the card off the prompt"
+            );
+            deck.signals.push(working);
+            deck.signal(index, IDLE);
+            let card = deck
+                .card_within(index, Duration::from_secs(5), |(status, _)| {
+                    *status == SessionStatus::Idle
+                })
+                .await;
+            assert_eq!(card.map(|c| c.0), Some(SessionStatus::Idle));
+            until_untouched(
+                &deck,
+                index,
+                &format!("an answer overtaken by {hook} left the box touched"),
+            )
+            .await;
+        }
+    }
+
+    /// Scenario: three Antigravity panes with untouched input boxes each show
+    /// a permission prompt. A person presses Enter and Up in one write on the
+    /// first, Enter then Up on the second, and Escape then Up on the third:
+    /// the Up after the key that answered the prompt reaches the composer,
+    /// where it can recall an earlier prompt. `agy` reports `idle` for the
+    /// answer before anything is redrawn. All three boxes stay touched, so a
+    /// queued message does not ring into them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_key_after_the_answering_key_keeps_the_box_touched() {
+        let deck =
+            Deck::start(&["agy-after-enter-up", "agy-enter-then-up", "agy-esc-then-up"]).await;
+        let answers: [&[&[u8]]; 3] = [&[b"\r\x1b[A"], &[b"\r", b"\x1b[A"], &[b"\x1b", b"\x1b[A"]];
+        for (index, keys) in answers.iter().enumerate() {
+            deck.thinking(index).await;
+            deck.signal(index, PERMISSION);
+            let card = deck
+                .card_within(index, Duration::from_secs(5), |(status, _)| {
+                    *status == SessionStatus::WaitingForInput
+                })
+                .await;
+            assert_eq!(card.map(|c| c.0), Some(SessionStatus::WaitingForInput));
+            let (pane, agent) = deck.panes[index].clone();
+            for key in keys.iter() {
+                deck.registry
+                    .write_user_bytes(&pane, &agent, key)
+                    .await
+                    .unwrap();
+            }
+            deck.signal(index, IDLE);
+            let card = deck
+                .card_within(index, Duration::from_secs(5), |(status, _)| {
+                    *status == SessionStatus::Idle
+                })
+                .await;
+            assert_eq!(card.map(|c| c.0), Some(SessionStatus::Idle));
+        }
+        // Give a wrong reset every chance to land before the verdict.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        for index in 0..3 {
+            assert!(
+                deck.registry.input_touched(&deck.panes[index].1),
+                "a key after the answer left box {index} untouched"
+            );
+        }
+    }
+
+    /// Scenario: a person types a line into an Antigravity pane and presses
+    /// Enter. The turn's first-call `PreInvocation` line is read, but its
+    /// ingest is held up; meanwhile the person types another line ending in
+    /// Enter. Once the held-up hook is applied the box stays touched: the
+    /// hook was read before the newer Enter and cannot speak for it. A later
+    /// first-call hook, read after it, can.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_delayed_prompt_hook_leaves_a_newer_enter_touched() {
+        let deck = Deck::start(&["agy-park-delayed-submit"]).await;
+        let (pane, agent) = deck.panes[0].clone();
+        let _start = deck.hook(0, "session-start.json").await;
+        let card = deck
+            .card_within(0, Duration::from_secs(5), |(status, _)| {
+                *status == SessionStatus::Idle
+            })
+            .await;
+        assert!(card.is_some(), "the session never started");
+        deck.registry
+            .write_user_bytes(&pane, &agent, b"say hi\r")
+            .await
+            .unwrap();
+        let held = deck.registry.question_answers().lock_lifecycle(&pane).await;
+        let _first = deck.hook(0, "pre-invocation.json").await;
+        deck.until_in_flight(0).await;
+        deck.registry
+            .write_user_bytes(&pane, &agent, b"and again\r")
+            .await
+            .unwrap();
+        drop(held);
+        let card = deck
+            .card_within(0, Duration::from_secs(5), |(status, _)| {
+                *status == SessionStatus::Thinking
+            })
+            .await;
+        assert_eq!(card.map(|c| c.0), Some(SessionStatus::Thinking));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            deck.registry.input_touched(&agent),
+            "a hook read before the newer Enter untouched the box"
+        );
+        let _next = deck.hook(0, "pre-invocation.json").await;
+        until_untouched(&deck, 0, "a hook read after the Enter left it touched").await;
     }
 
     /// Scenario: an Antigravity hook's connection is accepted, then the

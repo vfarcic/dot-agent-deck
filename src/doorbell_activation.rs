@@ -810,11 +810,13 @@ pub const ANTIGRAVITY_FACTS: AgentFacts<'static> = AgentFacts {
     transcript_echo: Measurement::Absent,
     // No editor probe, so no check reads a box a person touched empty again.
     // What does is `agy`'s own report of what the last key did: a first-call
-    // `PreInvocation` after a person's Enter, with nothing entered since
-    // (`GenerationInput::reconcile_human_submit`), or its status leaving a
-    // prompt after nothing but menu keys (digits, Enter, arrows, Escape) were
-    // typed into a box untouched when the prompt appeared, or a lone digit
-    // into an untouched box (`GenerationInput::reconcile_menu_answer`).
+    // `PreInvocation`, its line read after a person's Enter, with nothing
+    // entered since (`GenerationInput::reconcile_human_submit`), or its
+    // status or a hook of its own saying it left a prompt, read after one run
+    // of menu keys (arrows, then one digit, Enter or lone Escape, and nothing
+    // after it) was typed into a box untouched when the prompt appeared, or a
+    // lone digit into an untouched box
+    // (`GenerationInput::reconcile_menu_answer`).
     editor_probe: Measurement::Absent,
 };
 

@@ -13618,21 +13618,17 @@ impl AgentPtyRegistry {
         input.is_some_and(|input| input.touched())
     }
 
-    /// PRD #211 (PR #2370 review, Greptile P1): generation `agent_id`'s own
-    /// prompt hook, attested to it, reported that the agent took a submitted
-    /// prompt on a turn's first model call. When the last op to enter its box
-    /// is a person's that ended in Enter, the box is untouched again
+    /// PRD #211 (PR #2370 review, Greptile P1 and audit S2): generation
+    /// `agent_id`'s own prompt hook, attested to it and accepted, whose line
+    /// was read at `read_at`, reported that the agent took a submitted prompt
+    /// on a turn's first model call. When the last op to enter its box is a
+    /// person's that ended in Enter, written at or before `read_at`, the box
+    /// is untouched again
     /// ([`crate::composer_probe::epoch::GenerationInput::reconcile_human_submit`]).
     /// Whether it applied; `false` for a generation that is gone.
-    pub fn note_prompt_taken(&self, agent_id: &str) -> bool {
-        let input = {
-            let inner = self.inner.lock();
-            inner
-                .agents
-                .get(agent_id)
-                .map(|agent| Arc::clone(agent.bus.input()))
-        };
-        input.is_some_and(|input| input.reconcile_human_submit())
+    pub fn note_prompt_taken(&self, agent_id: &str, read_at: Instant) -> bool {
+        self.generation_input(agent_id)
+            .is_some_and(|input| input.reconcile_human_submit(read_at))
     }
 
     /// PRD #211 (PR #2370 review): generation `agent_id`'s own terminal
@@ -13644,21 +13640,21 @@ impl AgentPtyRegistry {
         }
     }
 
-    /// PRD #211 (PR #2370 review, Greptile P1): generation `agent_id`'s own
-    /// terminal status, read at `read_at`, left a permission prompt or
-    /// dialog; `card_on_prompt` is whether its card was on it. When what was
-    /// entered into its box since it was untouched is the menu keys that
-    /// answered it, the box stays untouched
+    /// PRD #211 (PR #2370 review, Greptile P1; review P1): a witness of
+    /// generation `agent_id`'s own, read at `read_at`, that it left a
+    /// permission prompt or dialog. When what was entered into its box since
+    /// it was untouched is the menu keys that answered it, the box stays
+    /// untouched
     /// ([`crate::composer_probe::epoch::GenerationInput::reconcile_menu_answer`]).
     /// Whether it applied; `false` for a generation that is gone.
     pub fn note_menu_answer_taken(
         &self,
         agent_id: &str,
         read_at: Instant,
-        card_on_prompt: bool,
+        departure: crate::composer_probe::epoch::Departure,
     ) -> bool {
         self.generation_input(agent_id)
-            .is_some_and(|input| input.reconcile_menu_answer(read_at, card_on_prompt))
+            .is_some_and(|input| input.reconcile_menu_answer(read_at, departure))
     }
 
     fn generation_input(
