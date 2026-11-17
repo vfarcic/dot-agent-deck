@@ -1090,25 +1090,99 @@ fn antigravity_ready(grid: &Grid) -> bool {
     grid.text_from(close + 1, 0).starts_with("? for shortcuts")
 }
 
+/// The rows `agy` 1.5.9 draws around its permission menus' choices: the
+/// command menu's and the file-creation menu's two frame rows (measured
+/// 2026-11-16 and 2026-11-17; the same rows `question::antigravity_deny_shown`
+/// reads).
+const ANTIGRAVITY_MENU_FRAME_ROWS: [&str; 4] = [
+    "Requesting permission for:",
+    "Run this command?",
+    "Create file",
+    "Allow creation of this file?",
+];
+
+/// The hint `agy` 1.5.9 draws on the row under a menu's last choice, in
+/// both measured menus (`↑/↓ Navigate · …`).
+const ANTIGRAVITY_MENU_HINT: &str = "\u{2191}/\u{2193} Navigate";
+
+/// One choice row of an Antigravity menu: `> N. …` for the highlighted one,
+/// `  N. …` for the others. Whether it is highlighted, and its number.
+fn antigravity_choice(text: &str) -> Option<(bool, u32)> {
+    let trimmed = text.trim_start();
+    let (cursor, rest) = match trimmed.strip_prefix("> ") {
+        Some(rest) => (true, rest),
+        None => (false, trimmed),
+    };
+    let digits = rest.chars().take_while(char::is_ascii_digit).count();
+    if digits == 0 || !rest[digits..].starts_with(". ") {
+        return None;
+    }
+    rest[..digits].parse().ok().map(|n| (cursor, n))
+}
+
 /// Antigravity's dialogs. Its start-up dialogs (colour scheme, terms, folder
 /// trust, sign-in) are drawn on the alternate screen, where the main screen
-/// never is (measured on 1.5.9), and its permission prompt lists its choices
-/// as `> 1. …`, where a digit acts at once. None was seen after the ready
-/// composer, so every such screen is unrecognised, and the doorbell types
-/// into none of them.
+/// never is (measured on 1.5.9), and every such screen is unrecognised. Its
+/// permission menus are drawn inline, where a digit acts at once, and are
+/// read by their structure, outside the composer's box (whose text a person
+/// may begin with `1. …`): a row of either measured menu's frame, or a run of
+/// choice rows numbered 1, 2, … on consecutive rows, exactly one of them
+/// highlighted with `> `, framed as both measured menus are, by a question
+/// ending in `?` on the row above or the `↑/↓ Navigate` hint on the row
+/// below. None was seen after the ready composer, so every such screen is
+/// unrecognised, and the doorbell types into none of them.
 fn antigravity_dialog(grid: &Grid) -> Option<Dialog> {
     if grid.alternate_screen {
         return Some(Dialog::Unrecognised);
     }
-    (0..grid.rows)
-        .any(|r| {
-            let text = grid.text_from(r, 0);
-            text.trim_start().strip_prefix("> ").is_some_and(|rest| {
-                let digits = rest.chars().take_while(char::is_ascii_digit).count();
-                digits > 0 && rest[digits..].starts_with('.')
-            })
-        })
-        .then_some(Dialog::Unrecognised)
+    let composer = antigravity_composer(grid).map(|c| {
+        let close = (c.prompt_row + 1..grid.rows)
+            .find(|&r| claude_rule(grid, r))
+            .unwrap_or(c.last_row + 1);
+        c.prompt_row..close
+    });
+    let outside = |r: u16| composer.as_ref().is_none_or(|rows| !rows.contains(&r));
+    let rows: Vec<Option<String>> = (0..grid.rows)
+        .map(|r| outside(r).then(|| grid.text_from(r, 0)))
+        .collect();
+    let row = |r: usize| rows.get(r).and_then(|t| t.as_deref());
+    if rows
+        .iter()
+        .flatten()
+        .any(|text| ANTIGRAVITY_MENU_FRAME_ROWS.contains(&text.trim()))
+    {
+        return Some(Dialog::Unrecognised);
+    }
+    let mut r = 0;
+    while r < rows.len() {
+        if row(r).and_then(antigravity_choice).map(|(_, n)| n) != Some(1) {
+            r += 1;
+            continue;
+        }
+        let first = r;
+        let mut cursors = 0;
+        let mut next = 1;
+        while let Some((cursor, n)) = row(r).and_then(antigravity_choice) {
+            if n != next {
+                break;
+            }
+            cursors += usize::from(cursor);
+            next += 1;
+            r += 1;
+        }
+        let choices = r - first;
+        let asked = first
+            .checked_sub(1)
+            .and_then(row)
+            .is_some_and(|text| text.trim_end().ends_with('?'));
+        let hinted =
+            row(r).is_some_and(|text| text.trim_start().starts_with(ANTIGRAVITY_MENU_HINT));
+        if choices >= 2 && cursors == 1 && (asked || hinted) {
+            return Some(Dialog::Unrecognised);
+        }
+        r = first + 1;
+    }
+    None
 }
 
 /// How Antigravity shows a submitted message in its transcript was not
@@ -1985,6 +2059,103 @@ pub(crate) mod antigravity_tests {
         Grid::parse(bytes.as_bytes(), 30, cols)
     }
 
+    /// The main screen with `rows` drawn from its top, the cursor parked
+    /// under them, as `agy` 1.5.9 draws a permission menu inline.
+    fn menu(rows: &[&str]) -> Grid {
+        let mut bytes = String::from("\x1b[2J\x1b[H");
+        for row in rows {
+            bytes.push_str(row);
+            bytes.push_str("\r\n");
+        }
+        Grid::parse(bytes.as_bytes(), 30, 120)
+    }
+
+    /// PRD #211 (PR #2370 review, Qodo 2): a composer whose text starts like a
+    /// numbered choice, one row or wrapped over two, is a draft, not a
+    /// dialog; so is a numbered list in the transcript above the ready
+    /// composer. The measured menus are dialogs by their structure — the
+    /// file-creation menu, a command menu with its frame rows scrolled away,
+    /// one with the highlight moved to another choice — and so is a frame row
+    /// alone.
+    #[test]
+    fn antigravity_menus_are_read_by_their_structure_not_a_numbered_draft() {
+        let agy = &ANTIGRAVITY_PROFILE;
+        let draft = frame(120, &["> 1. fix the login bug"], "", (7, 23));
+        assert_eq!((agy.dialog)(&draft), None);
+        assert_eq!(
+            agy.holds(&draft, "1. fix the login bug"),
+            Some(ComposerText::Exact)
+        );
+        let wrapped = frame(
+            80,
+            &["> 1. fix the login bug", "  2. then rerun the tests?"],
+            "",
+            (8, 27),
+        );
+        assert_eq!(
+            (agy.dialog)(&wrapped),
+            None,
+            "a draft wrapped over two rows"
+        );
+        let transcript = Grid::parse(
+            format!(
+                "\x1b[2J\x1b[HWhich should I do first?\r\n> 1. fix the login bug\r\n  2. rerun the tests\r\n\x1b[90m{rule}\x1b[m\r\n>\r\n\x1b[90m{rule}\x1b[m\r\n? for shortcuts\x1b[5;3H",
+                rule = "\u{2500}".repeat(120)
+            )
+            .as_bytes(),
+            30,
+            120,
+        );
+        assert!((agy.ready)(&transcript));
+        assert_eq!(
+            (agy.dialog)(&transcript),
+            Some(Dialog::Unrecognised),
+            "a highlighted, numbered run under a question reads as a menu"
+        );
+        let numbered = Grid::parse(
+            format!(
+                "\x1b[2J\x1b[HDone. Next steps:\r\n1. fix the login bug\r\n2. rerun the tests\r\n\x1b[90m{rule}\x1b[m\r\n>\r\n\x1b[90m{rule}\x1b[m\r\n? for shortcuts\x1b[5;3H",
+                rule = "\u{2500}".repeat(120)
+            )
+            .as_bytes(),
+            30,
+            120,
+        );
+        assert_eq!(
+            (agy.dialog)(&numbered),
+            None,
+            "a numbered list with no highlight is not a menu"
+        );
+        assert!(agy.empty_and_ready(&numbered));
+
+        let creation = menu(&[
+            "Create file",
+            &"\u{2500}".repeat(120),
+            "/work/project/probe-create.txt  +1",
+            "  1  +  PROBE",
+            "Allow creation of this file?",
+            "> 1. Yes, allow creation",
+            "  2. No, deny creation",
+            "  \u{2191}/\u{2193} Navigate \u{b7} f full diff",
+            "esc to cancel",
+        ]);
+        assert_eq!((agy.dialog)(&creation), Some(Dialog::Unrecognised));
+        let choices_only = menu(&[
+            "  1. Yes, run command",
+            "  2. Yes, and always allow in this conversation",
+            "  3. Yes, and always allow (Persist to settings.json)",
+            "> 4. No, cancel",
+            "  \u{2191}/\u{2193} Navigate \u{b7} tab Amend \u{b7} ctrl+g edit/expand command",
+        ]);
+        assert_eq!(
+            (agy.dialog)(&choices_only),
+            Some(Dialog::Unrecognised),
+            "the highlight on the last choice, under the hint"
+        );
+        let frame_row = menu(&["Requesting permission for:", "   rm -f probe.txt"]);
+        assert_eq!((agy.dialog)(&frame_row), Some(Dialog::Unrecognised));
+    }
+
     /// PRD #211: the ready composer shows its agent mode's hint, in any
     /// colour, and is empty and ready; a typed line is held exactly while the
     /// cursor follows it; a line `agy` wrapped at a blank with its two-cell
@@ -2040,12 +2211,19 @@ pub(crate) mod antigravity_tests {
         let no_footer = frame(120, &[">"], "", (7, 3));
         assert!(!agy.empty_and_ready(&no_footer));
 
-        let permission = frame(
-            120,
-            &["> 1. Yes, run command", "  4. No, cancel"],
-            "",
-            (30, 1),
-        );
+        let permission = menu(&[
+            "Command",
+            &"\u{2500}".repeat(120),
+            "Requesting permission for:",
+            "   rm -f probe.txt",
+            "Run this command?",
+            "> 1. Yes, run command",
+            "  2. Yes, and always allow in this conversation for commands that start with 'rm -f probe.txt'",
+            "  3. Yes, and always allow for commands that start with 'rm -f probe.txt' (Persist to settings.json)",
+            "  4. No, cancel",
+            "  \u{2191}/\u{2193} Navigate \u{b7} tab Amend \u{b7} ctrl+g edit/expand command",
+            "esc to cancel",
+        ]);
         assert_eq!((agy.dialog)(&permission), Some(Dialog::Unrecognised));
         assert!(!agy.empty_and_ready(&permission));
 

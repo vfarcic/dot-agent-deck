@@ -808,6 +808,10 @@ pub const ANTIGRAVITY_FACTS: AgentFacts<'static> = AgentFacts {
     // How its transcript shows a submitted message was not measured; its
     // prompt hook reports the line instead.
     transcript_echo: Measurement::Absent,
+    // No editor probe, so no check reads a box a person touched empty again.
+    // What does is `agy`'s own prompt hook: a first-call `PreInvocation`
+    // after a person's Enter, with nothing entered since
+    // (`GenerationInput::reconcile_human_submit`).
     editor_probe: Measurement::Absent,
 };
 

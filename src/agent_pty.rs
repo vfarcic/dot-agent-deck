@@ -2081,12 +2081,12 @@ pub struct AgentBus {
     /// The agent the generation was spawned as, whose release alone sets its
     /// input grammar (Q83); `None` keeps it strict.
     spawned_as: Option<AgentType>,
-    /// PRD #211 (review): when the hook loop accepted the latest connection
-    /// carrying an event attested to this generation. An OSC 7501 signal its
+    /// PRD #211 (review): when the hook loop read the line of the latest
+    /// event attested to this generation. An OSC 7501 signal its
     /// reader read before then is older than that event, and is not applied
     /// over it ([`AgentPtyRegistry::hook_received_after`]).
     hook_receipt: Mutex<Option<Instant>>,
-    /// PRD #211 (review): the accept instant of the latest such event the
+    /// PRD #211 (review): the line-read instant of the latest such event the
     /// hook loop has finished ingesting ([`AgentPtyRegistry::note_hook_applied`]).
     hook_applied: Mutex<Option<Instant>>,
 }
@@ -13618,6 +13618,23 @@ impl AgentPtyRegistry {
         input.is_some_and(|input| input.touched())
     }
 
+    /// PRD #211 (PR #2370 review, Greptile P1): generation `agent_id`'s own
+    /// prompt hook, attested to it, reported that the agent took a submitted
+    /// prompt on a turn's first model call. When the last op to enter its box
+    /// is a person's that ended in Enter, the box is untouched again
+    /// ([`crate::composer_probe::epoch::GenerationInput::reconcile_human_submit`]).
+    /// Whether it applied; `false` for a generation that is gone.
+    pub fn note_prompt_taken(&self, agent_id: &str) -> bool {
+        let input = {
+            let inner = self.inner.lock();
+            inner
+                .agents
+                .get(agent_id)
+                .map(|agent| Arc::clone(agent.bus.input()))
+        };
+        input.is_some_and(|input| input.reconcile_human_submit())
+    }
+
     /// PRD #1666 part 3 (plan §5.1, Q35-21): the pane's open paste, whether
     /// generation `agent_id`'s box is touched and whether the deck can check
     /// it, and how many of its agent's turns have ended, for the doorbell's
@@ -13751,9 +13768,8 @@ impl AgentPtyRegistry {
         }
     }
 
-    /// PRD #211 (review): the hook loop accepted, at `at`, a connection
-    /// carrying an event attested to generation `agent_id`. Kept as the
-    /// latest such instant.
+    /// PRD #211 (review): the hook loop read, at `at`, the line of an event
+    /// attested to generation `agent_id`. Kept as the latest such instant.
     pub fn note_hook_receipt(&self, agent_id: &str, at: Instant) {
         let bus = {
             let inner = self.inner.lock();
@@ -13769,7 +13785,7 @@ impl AgentPtyRegistry {
     }
 
     /// PRD #211 (review): the hook loop finished ingesting the event attested
-    /// to generation `agent_id` whose connection it accepted at `at`, whether
+    /// to generation `agent_id` whose line it read at `at`, whether
     /// it applied it or refused it.
     pub fn note_hook_applied(&self, agent_id: &str, at: Instant) {
         let Some(bus) = self.generation_bus(agent_id) else {
@@ -13782,7 +13798,7 @@ impl AgentPtyRegistry {
     }
 
     /// PRD #211 (review): whether a hook event attested to generation
-    /// `agent_id`, accepted at or before `at`, has not been ingested yet. An
+    /// `agent_id`, read at or before `at`, has not been ingested yet. An
     /// OSC 7501 signal read at `at` is newer than that event, and is applied
     /// after it.
     pub fn hook_in_flight_before(&self, agent_id: &str, at: Instant) -> bool {
@@ -37324,7 +37340,11 @@ mod paced_withdrawal_tests {
                 }),
             )
             .await;
-        let bell = crate::doorbell_generation::GenerationDoorbell::new(false, None);
+        let bell = crate::doorbell_generation::GenerationDoorbell::new(
+            false,
+            #[cfg(unix)]
+            None,
+        );
         let t0 = Instant::now();
         let admission = Admission {
             activation: Ok(()),
@@ -37577,7 +37597,11 @@ mod paced_withdrawal_tests {
             .await;
         let ledger = registry.ingress_ledger(&id).expect("the pane's ledger");
         let marks = ledger.marks();
-        let bell = crate::doorbell_generation::GenerationDoorbell::new(false, None);
+        let bell = crate::doorbell_generation::GenerationDoorbell::new(
+            false,
+            #[cfg(unix)]
+            None,
+        );
         let t0 = Instant::now();
         let admission = Admission {
             activation: Ok(()),

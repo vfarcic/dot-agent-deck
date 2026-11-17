@@ -1986,6 +1986,17 @@ async fn ingest_hook_event(
         && let Some(owner) = attested_agent.as_deref()
     {
         registry.close_release_window(owner);
+        // PRD #211 (PR #2370 review, Greptile P1): Antigravity has no editor
+        // probe to read its box empty again after a person typed in it, so
+        // its own prompt hook is what does: `PreInvocation` on a turn's first
+        // model call, attested to the generation, says `agy` took a submitted
+        // prompt, and when a person's Enter is the last thing that entered
+        // the box, that submit emptied it. A later call of the same turn, a
+        // `Stop` continue's included, carries no prompt and reaches no
+        // further than this branch.
+        if event.agent_type == crate::event::AgentType::Antigravity && !unproven {
+            registry.note_prompt_taken(owner);
+        }
     }
     let event_type = event.event_type.clone();
     let claimed_pane = event.pane_id.clone();
@@ -3555,7 +3566,7 @@ const STATUS_SIGNAL_HOOK_WAIT: Duration = Duration::from_secs(10);
 const STATUS_SIGNAL_PARK_TICK: Duration = Duration::from_millis(5);
 
 /// PRD #211 (second review, finding 2): one hook event attested to generation
-/// `owner`, received on a connection accepted at `at`
+/// `owner`, whose line the hook loop read whole at `at`
 /// ([`AgentPtyRegistry::note_hook_receipt`]) and, when this is dropped,
 /// ingested ([`AgentPtyRegistry::note_hook_applied`]) — whether the hook loop
 /// applied it, refused it or stopped reading.
@@ -7005,10 +7016,6 @@ async fn run_hook_loop_with_limits(
                 // Issue #1664: taken here, in accept order, before the task
                 // that may run ahead of an earlier connection's is spawned.
                 let mut event_order_ticket = Some(event_order.admit());
-                // PRD #211 (review): when this connection was accepted, the
-                // receipt-order witness of the event it carries
-                // (`AgentPtyRegistry::note_hook_receipt`).
-                let accepted_at = std::time::Instant::now();
                 let hold_limit = Arc::clone(&hold_limit);
                 let state = state.clone();
                 let event_tx = event_tx.clone();
@@ -7181,6 +7188,15 @@ async fn run_hook_loop_with_limits(
                                 break;
                             }
                         };
+                        // PRD #211 (PR #2370 review, Qodo 1): when this line
+                        // was read whole, the receipt-order witness of the
+                        // event it carries (`AgentPtyRegistry::note_hook_receipt`).
+                        // Not the connection's accept: a producer that
+                        // connects before an OSC 7501 signal is read and
+                        // writes its line after it sent the newer report, and
+                        // an accept-time witness would let that signal be
+                        // applied over it.
+                        let line_read_at = std::time::Instant::now();
                         // Issue #1664: a raw event waits for the events of its
                         // session or pane accepted ahead of it, and holds its
                         // turn until this line is handled; an `inbox_announce`
@@ -7202,7 +7218,7 @@ async fn run_hook_loop_with_limits(
                             &*pty_registry,
                             |owner| {
                                 hook_receipt =
-                                    Some(HookReceipt::note(&pty_registry, owner, accepted_at));
+                                    Some(HookReceipt::note(&pty_registry, owner, line_read_at));
                             },
                         )
                         .await;
@@ -9154,7 +9170,7 @@ async fn run_hook_loop_with_limits(
                                 // PRD #211 (review): an event attested to its
                                 // generation is newer than any OSC 7501 signal
                                 // that generation's reader read before this
-                                // connection was accepted, so that signal is
+                                // event's line was read, so that signal is
                                 // not applied over it. And an agent that
                                 // reports its status that way, started from a
                                 // shell in the pane, is read from here on: its
@@ -9168,7 +9184,7 @@ async fn run_hook_loop_with_limits(
                                         hook_receipt = Some(HookReceipt::note(
                                             &pty_registry,
                                             owner,
-                                            accepted_at,
+                                            line_read_at,
                                         ));
                                     }
                                     let change = (event.agent_type
@@ -23032,9 +23048,9 @@ mod status_signal_order_tests {
             }
         }
 
-        /// The hook loop's part for one Antigravity hook: the connection it
-        /// came on was accepted at `accepted_at`, then the event is applied.
-        async fn hook(&self, fixture: &str, accepted_at: Instant) {
+        /// The hook loop's part for one Antigravity hook: its line was read
+        /// at `read_at`, then the event is applied.
+        async fn hook(&self, fixture: &str, read_at: Instant) {
             let input = std::fs::read_to_string(
                 std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                     .join("tests/fixtures/antigravity")
@@ -23044,9 +23060,9 @@ mod status_signal_order_tests {
             let mut event = crate::hook::hook_payload_event("antigravity", &input).unwrap();
             event.pane_id = Some(PANE.to_string());
             event.agent_id = Some(self.owner.clone());
-            self.registry.note_hook_receipt(&self.owner, accepted_at);
+            self.registry.note_hook_receipt(&self.owner, read_at);
             ingest_event(&self.state, &self.event_tx, &self.registry, event).await;
-            self.registry.note_hook_applied(&self.owner, accepted_at);
+            self.registry.note_hook_applied(&self.owner, read_at);
         }
 
         /// The monitor applying a signal the reader read at `seen_at`.
@@ -23370,6 +23386,114 @@ mod status_signal_park_tests {
             Some((SessionStatus::WaitingForInput, true)),
             "the prompt is bound to the call ingested ahead of it"
         );
+    }
+
+    /// Scenario: a person types a line into an Antigravity pane and presses
+    /// Enter, which leaves its input box touched. A `PreInvocation` of a later
+    /// model call (`invocationNum` 1) leaves it touched; the turn's first
+    /// call's `PreInvocation` on the hook socket makes it untouched again. A
+    /// key typed after that touches it once more, and another taken prompt
+    /// reported then does not undo that.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_prompt_the_agent_took_after_a_persons_enter_untouches_its_box() {
+        let deck = Deck::start(&["agy-park-submit"]).await;
+        let (pane, agent) = deck.panes[0].clone();
+        deck.registry
+            .write_user_bytes(&pane, &agent, b"say hi\r")
+            .await
+            .unwrap();
+        assert!(deck.registry.input_touched(&agent));
+        let _start = deck.hook(0, "session-start.json").await;
+        let _later = deck.hook(0, "pre-invocation-after-continue.json").await;
+        let card = deck
+            .card_within(0, Duration::from_secs(5), |(status, _)| {
+                *status == SessionStatus::Thinking
+            })
+            .await;
+        assert_eq!(card.map(|c| c.0), Some(SessionStatus::Thinking));
+        assert!(
+            deck.registry.input_touched(&agent),
+            "a later call's hook is no submit"
+        );
+        let _first = deck.hook(0, "pre-invocation.json").await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while deck.registry.input_touched(&agent) {
+            assert!(
+                Instant::now() < deadline,
+                "the first call's hook left the box touched"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        deck.registry
+            .write_user_bytes(&pane, &agent, b"x")
+            .await
+            .unwrap();
+        assert!(deck.registry.input_touched(&agent));
+        assert!(
+            !deck.registry.note_prompt_taken(&agent),
+            "a key after the submit"
+        );
+        assert!(deck.registry.input_touched(&agent));
+    }
+
+    /// Scenario: an Antigravity hook's connection is accepted, then the
+    /// pane's reader reads `idle`, then the hook writes its `PreToolUse` line
+    /// and it is applied, and only then does the monitor reach the `idle`.
+    /// The card stays Working: the line was read after the signal, so the
+    /// signal is the older report, whenever the connection was accepted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_signal_read_between_a_hooks_accept_and_its_line_does_not_overwrite_it() {
+        let deck = Deck::start(&["agy-park-late"]).await;
+        deck.thinking(0).await;
+        let (pane, agent) = deck.panes[0].clone();
+        let input = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/antigravity/pre-tool-use-run-command.json"),
+        )
+        .unwrap();
+        let mut event = crate::hook::hook_payload_event("antigravity", &input).unwrap();
+        event.session_id = "agy-park-0".to_string();
+        event.pane_id = Some(pane.clone());
+        event.agent_id = Some(agent.clone());
+        let token = deck.registry.hook_token_of(&agent).expect("pane token");
+        let line = crate::event::agent_event_line(&event, Some(&token)).unwrap();
+        let mut stream = UnixStream::connect(&deck.sock).await.unwrap();
+        // The hook loop accepts the connection while it sends nothing.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut found = Vec::new();
+        crate::status_osc::Osc7501Scanner::new("antigravity").scan(IDLE, &mut found);
+        let read = StatusSignals {
+            pane_id: pane.clone(),
+            agent_id: agent.clone(),
+            agent_type: AgentType::Antigravity,
+            signals: found,
+            seen_at: Instant::now(),
+            epoch: deck.registry.status_reader_epoch(&agent).unwrap(),
+        };
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        stream
+            .write_all(format!("{line}\n").as_bytes())
+            .await
+            .unwrap();
+        stream.flush().await.unwrap();
+        let card = deck
+            .card_within(0, Duration::from_secs(5), |(status, _)| {
+                *status == SessionStatus::Working
+            })
+            .await;
+        assert_eq!(card.map(|c| c.0), Some(SessionStatus::Working));
+        deck.signals.push(read);
+        let card = deck
+            .card_within(0, Duration::from_secs(1), |(status, _)| {
+                *status == SessionStatus::Idle
+            })
+            .await;
+        assert_eq!(
+            card.map(|c| c.0),
+            Some(SessionStatus::Working),
+            "an idle read before the hook's line repainted its card"
+        );
+        drop(stream);
     }
 
     /// Scenario: a connection to the hook socket opens and sends nothing, so

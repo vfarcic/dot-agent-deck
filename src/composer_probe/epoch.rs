@@ -221,6 +221,22 @@ impl InputEpoch {
         applies
     }
 
+    /// PRD #211 (PR #2370 review, Greptile P1): the agent reported that it
+    /// took a person's submitted prompt, and the last op to enter the box is
+    /// the person's op at `submit`, the one that ended in Enter. The box
+    /// becomes empty through that submit iff that op is still the last one,
+    /// foreign, and the epoch is not exhausted. Whether it applied.
+    pub fn reconcile_human_submit(&mut self, submit: u64) -> bool {
+        let applies = !self.exhausted
+            && self.epoch == submit
+            && self.owner.is_none()
+            && self.last_foreign == submit;
+        if applies {
+            self.observed = self.epoch;
+        }
+        applies
+    }
+
     /// PRD #1666 part 3 (Q35-21, R3 §3.5): the ring's `Submitted` (or
     /// placeholder-confirmed `Withdrawn`) reconcile. The box becomes empty
     /// through the ring's last op iff that
@@ -391,6 +407,11 @@ struct State {
     /// Its segments and what they read, attached with the records (Q35-20).
     live: Option<Live>,
     retired: bool,
+    /// PRD #211 (PR #2370 review, Greptile P1): the epoch a person's op
+    /// ending in Enter (`\r`) moved the box to, the op that may have
+    /// submitted it ([`GenerationInput::reconcile_human_submit`]). Stale once
+    /// any later op moves the epoch past it.
+    human_submit: Option<u64>,
 }
 
 /// The most explanations [`Live::explained`] banks, and the most unexplained
@@ -1009,6 +1030,9 @@ fn plan_locked(state: &mut State, writer: Writer, bytes: &[u8], plan: Option<Pla
             {
                 live.last_foreign_op = moved_to;
             }
+            if writer == Writer::Human && bytes.last() == Some(&b'\r') {
+                state.human_submit = Some(moved_to);
+            }
             tracing::debug!(
                 target: "composer_probe",
                 ?writer,
@@ -1148,6 +1172,7 @@ impl GenerationInput {
                 records: None,
                 live: None,
                 retired: false,
+                human_submit: None,
             }),
             moved: tokio::sync::Notify::new(),
             output_offset: AtomicU64::new(0),
@@ -1359,6 +1384,22 @@ impl GenerationInput {
     pub fn reconcile_ring(&self, ring: DeckJobId, admitted_at: u64) -> bool {
         let mut state = self.state.lock_recovering();
         !state.retired && state.epoch.reconcile_ring(ring, admitted_at)
+    }
+
+    /// PRD #211 (PR #2370 review, Greptile P1): the agent's own prompt hook
+    /// reported, on the first model call of a turn, that it took a submitted
+    /// prompt (Antigravity's `PreInvocation`, `invocationNum` 0). When the
+    /// last op to enter the box is a person's that ended in Enter, that Enter
+    /// is the submit the agent took, and the box is empty again
+    /// ([`InputEpoch::reconcile_human_submit`]). Refused once retired, when
+    /// any op came after that one, or when the last op was the deck's or
+    /// ended in anything else. Whether it applied.
+    pub fn reconcile_human_submit(&self) -> bool {
+        let mut state = self.state.lock_recovering();
+        let Some(submit) = state.human_submit else {
+            return false;
+        };
+        !state.retired && state.epoch.reconcile_human_submit(submit)
     }
 
     /// Apply a probe's observation (R3 §3.4); refused once retired.
@@ -2649,6 +2690,39 @@ impl GenerationInput {
 mod tests {
     use super::*;
     use spec::spec;
+
+    /// PRD #211 (PR #2370 review, Greptile P1): a person's op ending in Enter,
+    /// with nothing after it, is the submit the agent's prompt hook speaks
+    /// for, and only that: an op after it, an Enter inside a longer op, a
+    /// voice answer's Enter and the deck's own bytes leave the box touched.
+    #[test]
+    fn only_a_persons_last_enter_is_the_submit_a_prompt_hook_speaks_for() {
+        let input = GenerationInput::default();
+        input.enqueue(Writer::Human, b"hello");
+        assert!(input.touched());
+        assert!(!input.reconcile_human_submit(), "no Enter yet");
+        input.enqueue(Writer::Human, b"\r");
+        assert!(input.touched(), "the Enter alone proves nothing");
+        assert!(input.reconcile_human_submit());
+        assert!(!input.touched(), "the agent took the submit");
+
+        input.enqueue(Writer::Human, b"x");
+        assert!(input.touched());
+        assert!(!input.reconcile_human_submit(), "typed after the submit");
+
+        input.enqueue(Writer::Human, b"a\rb");
+        assert!(!input.reconcile_human_submit(), "text after the Enter");
+        input.enqueue(Writer::Answer, b"\r");
+        assert!(!input.reconcile_human_submit(), "a voice answer's Enter");
+        input.enqueue(Writer::Human, b"y\r");
+        input.enqueue(Writer::UnnamedDeck, b"z");
+        assert!(!input.reconcile_human_submit(), "the deck's bytes after it");
+        assert!(input.touched());
+
+        input.enqueue(Writer::Human, b"\r");
+        input.retire();
+        assert!(!input.reconcile_human_submit(), "a retired generation");
+    }
 
     /// Scenario: Bring the epoch to its last value, record one more op, and offer the probe that owns it an observation. The epoch stays at its last value, the box stays touched, and the observation doesn't apply.
     #[spec("inbox/probe/002")]
