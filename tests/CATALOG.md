@@ -7982,6 +7982,14 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Does not assert:** real model output rendering or permission acceptance.
 - **Platform coverage:** mac+linux.
 
+##### antigravity/inbox/007 — Folder-trust answers leave later delegation usable while a typed draft holds it.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_antigravity_inbox.rs`), attached input, real PTY, daemon and hook CLI.
+- **Agent:** captured-hook Antigravity stand-in with the measured alternate-screen folder-trust dialog and permission OSC.
+- **Asserts:** Enter and Down, Down, Enter dismiss the dialog; subsequently delegated tasks visibly reach the worker once with one acknowledged receipt delivery. A letter typed into an idle composer holds delegated mail without additional input.
+- **Does not assert:** real model trust handling or permission acceptance.
+- **Platform coverage:** mac+linux.
+
 #### antigravity/status
 
 ##### antigravity/status/001 — Captured Antigravity hooks drive the visible prompt, running command and ordinary turn end.

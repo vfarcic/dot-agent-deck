@@ -497,6 +497,56 @@ fn antigravity_inbox_006_numbered_output_allows_delivery_but_permission_menu_hol
     agy.visibly_delivered_once(&id, body);
 }
 
+/// Scenario: A person types a draft into an idle Antigravity worker and pending delegation leaves that draft untouched. In fresh workers they answer the folder-trust dialog with Enter or Down, Down, Enter through attached input; each subsequent delegated task visibly arrives and is acknowledged exactly once.
+#[spec("antigravity/inbox/007")]
+#[test]
+fn antigravity_inbox_007_trust_dialog_answers_allow_delegation_but_a_draft_holds_it() {
+    // Control: genuine composer input must continue to hold the doorbell.
+    {
+        let (agy, orchestrator) = Agy::start(true);
+        agy.replay(json!([{"osc":"idle"}]));
+        let _person = inbox::input(&agy.deck, &agy.pane, "x");
+        assert!(common::wait_for_pane_text_on(
+            agy.deck.attach_socket_path(),
+            &agy.pane.agent,
+            "> x",
+            Duration::from_secs(10)
+        ));
+        let before = inbox::bytes(&agy.pane);
+        let id = route::delegate(&agy.deck, &orchestrator.unwrap(), TASK, false);
+        assert!(
+            !common::wait_until(Duration::from_secs(1), || inbox::bytes(&agy.pane) != before),
+            "delegation must leave the person's draft alone: {}",
+            agy.diagnostic()
+        );
+        inbox::state(&agy.deck, &agy.pane, &id, "queued");
+    }
+    for (answer, label) in [("\r", "Enter"), ("\x1b[B\x1b[B\r", "Down, Down, Enter")] {
+        eprintln!("folder-trust answer case: {label}");
+        let (agy, orchestrator) = Agy::start(true);
+        agy.replay(json!([{"trust_dialog":true}]));
+        assert!(common::wait_for_pane_text_on(
+            agy.deck.attach_socket_path(),
+            &agy.pane.agent,
+            "> Yes, I trust this folder",
+            Duration::from_secs(10)
+        ));
+        let _person = inbox::input(&agy.deck, &agy.pane, answer);
+        assert!(
+            common::wait_for_pane_text_on(
+                agy.deck.attach_socket_path(),
+                &agy.pane.agent,
+                "AGY-FOLDER-TRUSTED",
+                Duration::from_secs(10)
+            ),
+            "{label} must dismiss the trust dialog: {}",
+            agy.diagnostic()
+        );
+        let id = route::delegate(&agy.deck, &orchestrator.unwrap(), TASK, false);
+        agy.visibly_delivered_once(&id, TASK);
+    }
+}
+
 /// Scenario: Subscribe to an Antigravity pane's completed replies: a workspace transcript publishes nothing, while a plain Stop with a sanitized transcript in its conversation's HOME directory publishes its final text once. A Stop handed queued mail returns continue without publishing an interim reply, and the final continued Stop publishes the new reply once.
 #[spec("voice/reading-reply/007")]
 #[test]

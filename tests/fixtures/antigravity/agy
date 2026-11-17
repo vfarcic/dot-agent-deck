@@ -30,6 +30,9 @@ state = "booting"
 placeholder = True
 permission_menu = None
 permission_prompt = ""
+trust_dialog = False
+trust_selected = 0
+trust_escape = bytearray()
 misrender_next_echo = False
 misrendering_echo = False
 output_text = ""
@@ -38,6 +41,17 @@ output_text = ""
 def redraw():
     global misrender_next_echo, misrendering_echo, placeholder
     width = os.get_terminal_size(0).columns
+    if trust_dialog:
+        options = ["Yes, I trust this folder", "No, exit"]
+        choices = "\r\n".join(
+            ("> " if index == trust_selected else "  ") + label
+            for index, label in enumerate(options)
+        )
+        sys.stdout.write("\033[2J\033[HDo you trust the contents of this project?\r\n"
+                         "Antigravity CLI requires permission to read, edit, and execute files here.\r\n"
+                         + choices + "\r\n↑/↓ Navigate · enter Confirm\r\n")
+        sys.stdout.flush()
+        return
     if permission_menu is not None:
         menu = json.loads((root / "permission-menu.json").read_text())
         if permission_menu not in (True, "multiline"):
@@ -101,7 +115,7 @@ def redraw():
 
 
 def replay(action):
-    global state, permission_menu, permission_prompt, misrender_next_echo, output_text
+    global state, permission_menu, permission_prompt, misrender_next_echo, output_text, trust_dialog, trust_selected
     if "hook" in action:
         payload = json.loads((root / action["hook"]).read_text())
         # The capture's workspace is sanitized; retain its measured event shape
@@ -157,6 +171,12 @@ def replay(action):
         state = "blocked"
     elif "misrender_echo_once" in action:
         misrender_next_echo = True
+    elif "trust_dialog" in action:
+        trust_dialog = True
+        trust_selected = 0
+        sys.stdout.write("\033[?1049h")
+        redraw()
+        replay({"osc": "blocked", "kind": "permission", "msg": "Trust this folder?"})
     elif "redraw_composer" in action:
         permission_menu = None
         redraw()
@@ -219,7 +239,18 @@ while True:
         with (root / "input-history.jsonl").open("a") as history:
             history.write(json.dumps({"state": state, "bytes": list(chunk)}) + "\n")
         for c in chunk:
-            if permission_menu is not None:
+            if trust_dialog:
+                if c == 27 or trust_escape:
+                    trust_escape.append(c)
+                    if bytes(trust_escape) in (b"\x1b[A", b"\x1b[B"):
+                        trust_selected = (trust_selected + 1) % 2
+                        trust_escape.clear()
+                elif c == 13 and trust_selected == 0:
+                    trust_dialog = False
+                    sys.stdout.write("\033[?1049l")
+                    (root / "delivered.txt").write_text("AGY-FOLDER-TRUSTED")
+                    replay({"osc": "idle"})
+            elif permission_menu is not None:
                 if c in (49, 50, 51, 52):
                     (root / "permission-answer.txt").write_text(chr(c))
                     permission_menu = None
