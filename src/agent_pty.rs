@@ -4258,14 +4258,13 @@ pub struct AgentRecord {
     /// Issue #1445: once a TUI has re-armed that coordinator and reported it
     /// ([`crate::daemon_protocol::AttachRequest::RecordOrchestratorContext`]),
     /// the newest re-arm's file instead.
-    /// A TUI hydrating the tab re-arms compaction and `/clear` from this file
-    /// instead of the fixed-path mirror, which a later preparation in the same
-    /// project may have overwritten.
+    /// A TUI hydrating the tab re-arms compaction and `/clear` from this file.
     ///
     /// `None` for every other pane, for a start role the daemon has no record
     /// for (a TUI-launched `Ctrl+n` tab, which publishes its own context), and
-    /// from a daemon predating this field — in which case the TUI falls back to
-    /// the mirror exactly as before. Additive optional, so no
+    /// from a daemon predating this field. A tab with none re-arms with no task
+    /// and says so on the TUI's status line (issue #1395); before #1395 it read
+    /// the fixed-path mirror instead. Additive optional, so no
     /// `PROTOCOL_VERSION` bump — same basis as `live` and `crashed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestrator_context_path: Option<String>,
