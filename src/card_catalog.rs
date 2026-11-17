@@ -610,99 +610,51 @@ fn merge<T>(base: &mut Vec<T>, user: Vec<T>, name_of: impl Fn(&T) -> &str) {
 /// every line from a table header whose first key is `catalog`
 /// (`[catalog]`, `[[catalog.fields]]`, `[catalog.x]`, …) up to the next header
 /// whose first key is not, so a broken setting in another table does not hide
-/// the catalog. `None` when the file has no such header. Headers are
-/// recognised only outside multi-line strings and multi-line arrays, so a
-/// prompt or a list that holds a `[line]` does not end a table early. A
-/// `catalog` written as root-level dotted keys or an inline table is not
-/// found here; the caller then reports the file and applies the defaults.
+/// the catalog. `None` when the file has no such header.
+///
+/// The file is split with `toml`'s own lexer (`toml_parser`), not a scanner
+/// of ours, so a string, a multi-line string (closing quote runs and escapes
+/// included) or a comment ends exactly where the real parser ends it, and a
+/// `[line]` inside one is never read as a header. Headers are recognised only
+/// at the start of a line and outside multi-line arrays. A `catalog` written
+/// as root-level dotted keys or an inline table is not found here; the caller
+/// then reports the file and applies the defaults.
 fn catalog_sections(raw: &str) -> Option<String> {
-    #[derive(Clone, Copy, PartialEq)]
-    enum Multi {
-        None,
-        Basic,
-        Literal,
-    }
-    let mut multi = Multi::None;
+    use toml_parser::lexer::TokenKind;
+    let tokens = toml_parser::Source::new(raw).lex().into_vec();
     let mut depth: i32 = 0;
     let mut in_catalog = false;
     let mut found = false;
     let mut out = String::new();
-    for line in raw.lines() {
-        let trimmed = line.trim_start();
+    let mut start = 0;
+    while start < tokens.len() {
+        // One line: up to and including its newline. A multi-line string is
+        // a single token, so a newline inside one never ends a line here.
+        let end = tokens[start..]
+            .iter()
+            .position(|t| matches!(t.kind(), TokenKind::Newline | TokenKind::Eof))
+            .map_or(tokens.len(), |at| start + at + 1);
+        let line = &tokens[start..end];
+        start = end;
         // A bare-key header (`[catalog]`) cannot be an array element, so it
         // also ends an array left open by a typo above it.
-        if multi == Multi::None
-            && trimmed.starts_with('[')
-            && let Some((first, quoted)) = header_first_key(trimmed)
+        if let Some((first, quoted)) = header_first_key(raw, line)
             && (depth == 0 || !(quoted || is_value_word(&first)))
         {
             depth = 0;
             in_catalog = first == "catalog";
             found |= in_catalog;
-            if in_catalog {
-                out.push_str(line);
-                out.push('\n');
-            }
-            continue;
-        }
-        // Track multi-line strings and array depth through a value line.
-        let chars: Vec<char> = line.chars().collect();
-        let mut i = 0;
-        while i < chars.len() {
-            let rest = &chars[i..];
-            match multi {
-                Multi::Basic => {
-                    if rest[0] == '\\' {
-                        i += 2;
-                        continue;
-                    }
-                    if rest.starts_with(&['"', '"', '"']) {
-                        multi = Multi::None;
-                        i += 3;
-                        continue;
-                    }
-                }
-                Multi::Literal => {
-                    if rest.starts_with(&['\'', '\'', '\'']) {
-                        multi = Multi::None;
-                        i += 3;
-                        continue;
-                    }
-                }
-                Multi::None => match rest[0] {
-                    '#' => break,
-                    '[' => depth += 1,
-                    ']' => depth = (depth - 1).max(0),
-                    '"' if rest.starts_with(&['"', '"', '"']) => {
-                        multi = Multi::Basic;
-                        i += 3;
-                        continue;
-                    }
-                    '\'' if rest.starts_with(&['\'', '\'', '\'']) => {
-                        multi = Multi::Literal;
-                        i += 3;
-                        continue;
-                    }
-                    '"' => {
-                        i += 1;
-                        while i < chars.len() && chars[i] != '"' {
-                            i += if chars[i] == '\\' { 2 } else { 1 };
-                        }
-                    }
-                    '\'' => {
-                        i += 1;
-                        while i < chars.len() && chars[i] != '\'' {
-                            i += 1;
-                        }
-                    }
+        } else {
+            for token in line {
+                match token.kind() {
+                    TokenKind::LeftSquareBracket => depth += 1,
+                    TokenKind::RightSquareBracket => depth = (depth - 1).max(0),
                     _ => {}
-                },
+                }
             }
-            i += 1;
         }
-        if in_catalog {
-            out.push_str(line);
-            out.push('\n');
+        if in_catalog && let (Some(first), Some(last)) = (line.first(), line.last()) {
+            out.push_str(&raw[first.span().start()..last.span().end()]);
         }
     }
     found.then_some(out)
@@ -717,32 +669,74 @@ fn is_value_word(word: &str) -> bool {
             .all(|c| c.is_ascii_digit() || c == '_' || c == '-')
 }
 
-/// The first dotted key of a table header line (`[a.b]` / `[[a.b]]`, with an
-/// optional trailing comment), unquoted, and whether it was quoted; `None`
-/// when the line is not a header.
-fn header_first_key(line: &str) -> Option<(String, bool)> {
-    let line = line.trim();
-    let (open, close) = if line.starts_with("[[") {
-        ("[[", "]]")
-    } else {
-        ("[", "]")
-    };
-    let inner_and_rest = &line[open.len()..];
-    let end = inner_and_rest.find(close)?;
-    let after = inner_and_rest[end + close.len()..].trim_start();
-    if !(after.is_empty() || after.starts_with('#')) {
+/// The first dotted key of a line that is a table header (`[a.b]` /
+/// `[[a.b]]`, with an optional trailing comment), unquoted, and whether it was
+/// quoted; `None` when the line is not a header. `line` is one line of
+/// `toml_parser` tokens of `raw`.
+fn header_first_key(raw: &str, line: &[toml_parser::lexer::Token]) -> Option<(String, bool)> {
+    use toml_parser::lexer::TokenKind;
+    let text = |t: &toml_parser::lexer::Token| &raw[t.span().start()..t.span().end()];
+    let mut tokens = line
+        .iter()
+        .filter(|t| t.kind() != TokenKind::Whitespace)
+        .peekable();
+    let open = tokens.next()?;
+    if open.kind() != TokenKind::LeftSquareBracket {
         return None;
     }
-    let inner = inner_and_rest[..end].trim();
-    let (first, quoted) = match inner.chars().next()? {
-        quote @ ('"' | '\'') => {
-            let body = &inner[1..];
-            (body[..body.find(quote)?].to_string(), true)
+    let double = tokens.peek().is_some_and(|t| {
+        t.kind() == TokenKind::LeftSquareBracket && t.span().start() == open.span().end()
+    });
+    if double {
+        tokens.next();
+    }
+    // `key ( . key )*`, where a key is a bare word or a one-line string.
+    let mut first: Option<(String, bool)> = None;
+    let mut want_key = true;
+    let close = loop {
+        let token = tokens.next()?;
+        match (token.kind(), want_key) {
+            (TokenKind::Atom, true) => {
+                let word = text(token);
+                let bare = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+                if !word.chars().all(bare) {
+                    return None;
+                }
+                first.get_or_insert((word.to_string(), false));
+            }
+            (TokenKind::BasicString | TokenKind::LiteralString, true) => {
+                let quoted = text(token);
+                let quote = if token.kind() == TokenKind::BasicString {
+                    '"'
+                } else {
+                    '\''
+                };
+                // An unterminated string stops at the newline.
+                if quoted.len() < 2 || !quoted.ends_with(quote) {
+                    return None;
+                }
+                first.get_or_insert((quoted[1..quoted.len() - 1].to_string(), true));
+            }
+            (TokenKind::Dot, false) => {}
+            (TokenKind::RightSquareBracket, false) => break token,
+            _ => return None,
         }
-        _ => (inner.split('.').next()?.trim().to_string(), false),
+        want_key = !want_key;
     };
-    let bare = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
-    (quoted || (!first.is_empty() && first.chars().all(bare))).then_some((first, quoted))
+    if double {
+        let second = tokens.next()?;
+        if second.kind() != TokenKind::RightSquareBracket
+            || second.span().start() != close.span().end()
+        {
+            return None;
+        }
+    }
+    let mut rest = tokens.map(|t| t.kind());
+    let mut next = rest.next();
+    if next == Some(TokenKind::Comment) {
+        next = rest.next();
+    }
+    matches!(next, None | Some(TokenKind::Newline | TokenKind::Eof)).then_some(first?)
 }
 
 /// Resolve the catalog from the user config's raw TOML (`None`: no file).
@@ -1176,6 +1170,88 @@ prompt = '''Hold.
         assert_eq!(c.errors.len(), 1, "{:?}", c.errors);
         assert!(c.errors[0].starts_with("catalog: the user config could not be read as TOML"));
         assert_eq!(names_a(&c), ["go-ahead", "merge", "explain"]);
+    }
+
+    /// PRD #2374 (review finding, round 5): a multi-line string may close with
+    /// four or five quotes, the extra one or two belonging to its value. The
+    /// fallback must end the string where TOML does, so a `[catalog]` written
+    /// inside a later string stays inert and the defaults apply. Covers the
+    /// reviewer's literal-string reproduction and its basic-string twin.
+    #[test]
+    fn catalog_text_inside_a_string_is_never_read_as_the_catalog() {
+        let literal = "\
+broken = tru
+memo = '''x'''' # ''''
+payload = '''
+[catalog]
+remove = [\"merge\"]
+[not_catalog]
+'''
+";
+        let basic = "\
+broken = tru
+memo = \"\"\"x\"\"\"\" # \"\"\"\"
+payload = \"\"\"
+[catalog]
+remove = [\"merge\"]
+[not_catalog]
+\"\"\"
+";
+        // Five closing quotes, and an escaped quote run inside the value.
+        let basic_five = "\
+broken = tru
+memo = \"\"\"a \\\"\"\" b\"\"\"\"\" # \"\"\"
+payload = \"\"\"
+[catalog]
+remove = [\"merge\"]
+\"\"\"
+";
+        let literal_five = "\
+broken = tru
+memo = '''x''''' # '''
+payload = '''
+[catalog]
+remove = [\"merge\"]
+'''
+";
+        for config in [literal, basic, basic_five, literal_five] {
+            let without_typo = config.replacen("broken = tru\n", "", 1);
+            let doc: toml::Table = toml::from_str(&without_typo).expect("valid once fixed");
+            assert!(doc.get("catalog").is_none(), "{config}");
+            assert_eq!(catalog_sections(config), None, "{config}");
+            let c = resolve(Some(config));
+            assert_eq!(c.errors.len(), 1, "{:?}", c.errors);
+            assert!(
+                c.errors[0].starts_with("catalog: the user config could not be read as TOML"),
+                "{:?}",
+                c.errors
+            );
+            assert_eq!(names_a(&c), ["go-ahead", "merge", "explain"], "{config}");
+        }
+
+        // The same closing runs before, and inside, a real catalog leave it
+        // readable, with the extra quotes kept in the value.
+        let config = "\
+broken = tru
+memo = '''x'''' # ''''
+note = \"\"\"y\"\"\"\"\" # [catalog]
+[catalog]
+remove = [\"merge\"]
+[[catalog.actions]]
+name = \"ship\"
+description = \"Offer when ready.\"
+prompt = \"\"\"Ship \"it\"\"\"\"\"
+[later]
+x = '''
+[catalog]
+remove = [\"explain\"]
+'''
+";
+        let c = resolve(Some(config));
+        assert_eq!(c.errors.len(), 1, "{:?}", c.errors);
+        assert!(c.errors[0].ends_with("but fix the file"), "{:?}", c.errors);
+        assert_eq!(names_a(&c), ["go-ahead", "explain", "ship"]);
+        assert_eq!(c.action("ship").unwrap().prompt, "Ship \"it\"\"");
     }
 
     #[test]

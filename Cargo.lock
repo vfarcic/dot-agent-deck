@@ -1419,6 +1419,7 @@ dependencies = [
  "tokio-test",
  "toml 1.2.1+spec-1.1.0",
  "toml_edit 0.25.19+spec-1.1.0",
+ "toml_parser",
  "tracing",
  "tracing-subscriber",
  "unicode-width",
