@@ -4,6 +4,8 @@
 //! command: its own hooks name it, and the deck then reads its OSC 7501 status.
 
 dot_agent_deck_test_harness::link!();
+#[path = "common/questions.rs"]
+mod questions;
 
 use common::TuiDeck;
 use serde_json::{Value, json};
@@ -115,10 +117,13 @@ fn antigravity_title_shows(grid: &str, status: &str) -> bool {
     })
 }
 
-/// Scenario: Start a plain shell in a deck pane and launch the Antigravity stand-in from its prompt. A permission signal before any hook changes nothing; after its hooks, permission shows Needs Input and idle clears it. Once a Claude-shaped hook takes over the shell, the daemon snapshot identifies Bash with detail echo claude-control as the active tool, and later Antigravity permission and status signals preserve it alongside Working and no foreign question on the card.
+/// Scenario: Start a plain shell in a deck pane and launch the Antigravity stand-in from its prompt; a permission signal before any hook changes nothing. After its hooks, permission shows Needs Input with every option keyboard-only, Allow once and Deny through the client are refused without sending bytes, and idle clears the question. Once a Claude-shaped hook takes over the shell, Bash with detail echo claude-control stays active and Working despite later Antigravity signals, with no foreign question on the card.
 #[spec("antigravity/shell/001")]
 #[test]
 fn antigravity_shell_001_agy_started_from_a_shell_reports_needs_input_and_interrupt() {
+    use dot_agent_deck::daemon_client::AnswerReport;
+    use dot_agent_deck::question::{AnswerChannel, AnswerRefusal, OptionRole, QuestionKind};
+
     let shell = Shell::launch();
     assert_eq!(
         std::fs::read_to_string(shell.deck.workdir().join("osc-env")).unwrap(),
@@ -149,6 +154,46 @@ fn antigravity_shell_001_agy_started_from_a_shell_reports_needs_input_and_interr
         {"osc":"blocked","kind":"permission","msg":QUESTION}
     ]));
     shell.card("Needs Input", QUESTION, "permission prompt");
+    let id = questions::agent_id(&shell.deck);
+    let question = questions::pending(&shell.deck, &id, QuestionKind::Permission);
+    assert_eq!(question.channel, AnswerChannel::Unsupported);
+    assert_eq!(question.questions.len(), 1);
+    let options = &question.questions[0].options;
+    assert_eq!(
+        options.len(),
+        4,
+        "the complete permission menu: {question:?}"
+    );
+    assert!(
+        options.iter().all(|option| option.keyboard_only),
+        "a shell-started agy's grants and Deny must all be keyboard-only: {question:?}"
+    );
+    let input_log = shell.deck.workdir().join("input.bytes");
+    assert!(std::fs::read(&input_log).unwrap().is_empty());
+    for role in [OptionRole::AllowOnce, OptionRole::Deny] {
+        let option = options
+            .iter()
+            .find(|option| option.role == role)
+            .expect("the measured menu must offer Allow once and Deny");
+        assert_eq!(
+            questions::answer(
+                &shell.deck,
+                &id,
+                &question,
+                vec![questions::selection(0, &[option.index])],
+            ),
+            AnswerReport::Refused(AnswerRefusal::KeyboardOnly),
+            "a shell-started agy's {role:?} answer must be refused"
+        );
+        assert!(
+            !common::wait_until(Duration::from_millis(500), || {
+                !std::fs::read(&input_log).unwrap().is_empty()
+            }),
+            "refused {role:?} must send zero bytes to the stand-in:\n{}",
+            shell.diagnostic()
+        );
+        shell.card("Needs Input", QUESTION, "refused client answer");
+    }
     // An Esc at the prompt: agy fires no hook, only its idle signal.
     shell.replay(json!([{"osc":"idle"}]));
     shell.card("Idle", "Dir:", "interrupted");
