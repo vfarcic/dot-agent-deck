@@ -2382,8 +2382,17 @@ export interface DeckBridge {
    */
   inboxAction?(target: AgentTarget, item: { paneId: string; messageId: string; revision: number }, verb: InboxActionVerb): Promise<InboxActionResult>;
   /**
+   * PRD #2374 — tell the app's backend that this webview consumes agent cards
+   * (`agent_cards_consume`), called once and only while the experimental flag
+   * shows them. Until it is called the backend subscribes to no card doorbell,
+   * pushes no cards and `agentCards` answers `null`. Optional: a bridge
+   * without it (the browser preview) needs no request.
+   */
+  consumeAgentCards?(): Promise<void>;
+  /**
    * PRD #2374 — one deck's agent cards (`agent_cards_list`), or `null` when
-   * its daemon does not support cards (show that deck's table only).
+   * its daemon does not support cards (show that deck's table only) or the
+   * webview has not called `consumeAgentCards`.
    * Optional: a bridge without it shows no cards.
    */
   agentCards?(deckId: string): Promise<AgentCardsSnapshot | null>;
@@ -5942,6 +5951,11 @@ export class TauriDeckBridge implements DeckBridge {
     // Issue #1240: `options` only when given, so a PRD #1223 listing is the
     // same invoke it always was.
     return invoke<DeckDirectoryListing>("desktop_list_directories", { deckId, path: path ?? null, ...(options ? { options } : {}) });
+  }
+
+  async consumeAgentCards(): Promise<void> {
+    const invoke = await this.getInvoke();
+    await invoke<null>("agent_cards_consume");
   }
 
   async agentCards(deckId: string): Promise<AgentCardsSnapshot | null> {

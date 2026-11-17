@@ -6026,20 +6026,10 @@ mod tests {
     // Issue #1198 — the app-level experimental surfaces
     // -----------------------------------------------------------------------
 
-    /// Serialises the tests that write the process-global `Features`. Under
-    /// nextest every test is its own process, so this only matters to a plain
-    /// `cargo test`, where they share one — the same shape as the root crate's
-    /// `tests/features.rs`. Nothing else in this crate's tests reads the flag.
-    static FEATURES_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Puts back whatever `Features` a test found, even when it panics.
-    struct RestoreFeatures(dot_agent_deck::features::Features);
-
-    impl Drop for RestoreFeatures {
-        fn drop(&mut self) {
-            dot_agent_deck::features::set_for_test(self.0);
-        }
-    }
+    // The tests that write the process-global `Features` share one lock and
+    // one restoring guard, `crate::features_lock`: under a plain `cargo test`
+    // they run in one process, and this module is not the only one that
+    // writes the flag (`lib.rs`'s card-request test does too).
 
     /// Every gated surface follows the one flag through its own wrapper: all
     /// hidden while it is off — the shipped default — and all shown once it is
@@ -6047,8 +6037,8 @@ mod tests {
     #[test]
     fn desktop_features_follow_the_experimental_flag() {
         use dot_agent_deck::features::{self, Features};
-        let _lock = FEATURES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _restore = RestoreFeatures(features::current());
+        let _lock = crate::features_lock::lock_features();
+        let _restore = crate::features_lock::RestoreFeatures::current();
 
         features::set_for_test(Features::test_with(false));
         assert_eq!(

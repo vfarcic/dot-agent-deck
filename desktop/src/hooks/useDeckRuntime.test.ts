@@ -5,7 +5,7 @@ import { agentKey, boundAgentKey } from "../lib/agentKey";
 import { deckName } from "../lib/displayText";
 import type { DeckBridge } from "../lib/bridge";
 import { LaunchCleanupError } from "../lib/actionError";
-import type { AgentCardsSnapshot, DeckFleet, TerminalChunk } from "../types";
+import { DEFAULT_DESKTOP_FEATURES, type AgentCardsSnapshot, type DeckFleet, type DesktopFeatures, type TerminalChunk } from "../types";
 
 /*
  * A bridge stub rather than `FixtureDeckBridge`, because the state under test
@@ -439,19 +439,64 @@ describe("useDeckRuntime", () => {
  */
 describe("useDeckRuntime agent cards (PRD #2374)", () => {
   type CardsBridge = {
+    desktopFeatures?: () => Promise<DesktopFeatures>;
+    consumeAgentCards?: () => Promise<void>;
     subscribeAgentCards?: (listener: (snapshot: AgentCardsSnapshot) => void) => Promise<() => void>;
     agentCards?: (deckId: string) => Promise<AgentCardsSnapshot | null>;
   };
   const cardsBridge = bridge as unknown as CardsBridge;
   const cards = (instanceId: string, revision: number): AgentCardsSnapshot => ({ deckId: FIXTURE_DAEMON_ID, instanceId, revision, entries: [], catalogErrors: [] });
 
+  /* The order the card calls reach the bridge in. */
+  let calls: string[] = [];
+  const features = (showAgentCards: boolean) => {
+    cardsBridge.desktopFeatures = vi.fn(async () => ({ ...DEFAULT_DESKTOP_FEATURES, showAgentCards }));
+  };
+
   beforeEach(() => {
     vi.clearAllMocks();
     bridge.onTerminalGeometry.mockReturnValue(() => {});
+    calls = [];
+    features(true);
+    cardsBridge.consumeAgentCards = vi.fn(async () => { calls.push("consume"); });
   });
   afterEach(() => {
+    delete cardsBridge.desktopFeatures;
+    delete cardsBridge.consumeAgentCards;
     delete cardsBridge.subscribeAgentCards;
     delete cardsBridge.agentCards;
+  });
+
+  /*
+   * PR #2378 review: the flag gates the cards at the webview's seam, and the
+   * backend consumes cards only on the webview's request. Off: the app never
+   * asks the backend for cards, so no deck watcher subscribes to card
+   * doorbells or pushes cards, and nothing reads them. On: the request comes
+   * first, then the listener and the read.
+   */
+  it("with the experimental flag off asks for, subscribes to and reads no cards", async () => {
+    features(false);
+    cardsBridge.subscribeAgentCards = vi.fn(async () => () => {});
+    cardsBridge.agentCards = vi.fn(async () => null);
+    bridge.connect.mockResolvedValue([createFixtureSnapshot("docs-restart")]);
+    const { result } = renderHook(() => useDeckRuntime());
+    await waitFor(() => expect(result.current.desktopFeatures?.showAgentCards).toBe(false));
+    await waitFor(() => expect(result.current.snapshot.connection.incarnation).toBe("docs-before"));
+    await act(async () => { await Promise.resolve(); });
+    expect(cardsBridge.consumeAgentCards).not.toHaveBeenCalled();
+    expect(cardsBridge.subscribeAgentCards).not.toHaveBeenCalled();
+    expect(cardsBridge.agentCards).not.toHaveBeenCalled();
+  });
+
+  it("with the experimental flag on asks the backend for cards before listening and reading", async () => {
+    cardsBridge.subscribeAgentCards = vi.fn(async () => { calls.push("subscribe"); return () => {}; });
+    cardsBridge.agentCards = vi.fn(async () => { calls.push("read"); return null; });
+    bridge.connect.mockResolvedValue([createFixtureSnapshot("docs-restart")]);
+    renderHook(() => useDeckRuntime());
+    await waitFor(() => expect(calls).toContain("subscribe"));
+    await waitFor(() => expect(calls).toContain("read"));
+    expect(calls[0]).toBe("consume");
+    expect(calls.filter((call) => call === "consume")).toHaveLength(1);
   });
 
   it("accepts cards only from the connected process, ignores late and older ones, and drops a replaced daemon's", async () => {

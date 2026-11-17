@@ -16,7 +16,7 @@ import type { UpgradeChoice, UpgradeEvent } from "../lib/upgrade";
 import type { QuestionSelectionDto, QuestionTextSlotDto, VoiceQuestionTarget } from "../lib/voiceQuestion";
 const EMPTY_TERMINAL_DATA: Record<string, TerminalBuffer> = {};
 import { acceptCardsSnapshot, reconcileCards, type CardsConnection } from "../lib/agentCards";
-import type { AgentCardsSnapshot, AgentCardTarget, AgentTarget, CardActionOptions, CleanupWarningEntry, DeckAction, DeckFleet, DeckListingOptions, DeckRuntimeState, DeckSnapshot, DesktopFeatures, InboxActionVerb, RuntimeMode, TerminalBuffer } from "../types";
+import { desktopFeaturesOf, type AgentCardsSnapshot, type AgentCardTarget, type AgentTarget, type CardActionOptions, type CleanupWarningEntry, type DeckAction, type DeckFleet, type DeckListingOptions, type DeckRuntimeState, type DeckSnapshot, type DesktopFeatures, type InboxActionVerb, type RuntimeMode, type TerminalBuffer } from "../types";
 
 /**
  * The snapshot a runtime starts with, before any deck has answered. Lifted out
@@ -526,16 +526,42 @@ export function useDeckRuntime(): DeckRuntimeState {
     });
   }, [fleet]);
 
+  // Issue #1198: the app's experimental surfaces, asked ONCE per bridge. The
+  // flag is a presentation switch read at startup — changing it means
+  // restarting the app — so there is no re-query to race a navigation with.
+  // A missing method or a refused call leaves this `undefined`, which every
+  // reader takes as all hidden (`desktopFeaturesOf`).
+  const [desktopFeatures, setDesktopFeatures] = useState<DesktopFeatures>();
+  useEffect(() => {
+    let cancelled = false;
+    const ask = typeof bridge.desktopFeatures === "function" ? bridge.desktopFeatures() : undefined;
+    void ask?.then((features) => { if (!cancelled) setDesktopFeatures(features); }, () => undefined);
+    return () => { cancelled = true; };
+  }, [bridge]);
+
   /*
     PRD #2374 — each deck's agent cards, by deck id, exactly as its daemon sent
     them (`desktop://agent-cards`). Pushed by the deck watcher on a new
     subscription, on a card's doorbell and on its reconciliation tick; read
     once more here whenever a deck becomes connected, because the first push
     of a subscription can land before this listener exists. A deck whose
-    daemon has no cards answers `null` and keeps no key. Held whatever the
-    experimental flag says: the flag hides the surfaces that render these,
-    and holding them costs one small map.
+    daemon has no cards answers `null` and keeps no key.
+
+    Consumed only while the experimental flag shows the cards — this is their
+    render seam (CLAUDE.md rule 9). The app first tells the bridge it consumes
+    cards (`consumeAgentCards`), which is what makes the deck watchers
+    subscribe to the cards' doorbells and push them; with the flag off it
+    never asks, so no daemon is subscribed to or read for cards at all.
   */
+  const cardsShown = desktopFeaturesOf({ desktopFeatures }).showAgentCards;
+  const [cardsConsumed, setCardsConsumed] = useState(false);
+  useEffect(() => {
+    if (!cardsShown) return;
+    let active = true;
+    const ask = typeof bridge.consumeAgentCards === "function" ? bridge.consumeAgentCards() : Promise.resolve();
+    void ask.then(() => { if (active) setCardsConsumed(true); }, () => undefined);
+    return () => { active = false; };
+  }, [bridge, cardsShown]);
   const [agentCards, setAgentCards] = useState<Readonly<Record<string, AgentCardsSnapshot>>>({});
   const cardsOffered = typeof bridge.agentCards === "function" || typeof bridge.subscribeAgentCards === "function";
   /*
@@ -553,7 +579,7 @@ export function useDeckRuntime(): DeckRuntimeState {
     setAgentCards((current) => (acceptCardsSnapshot(current[next.deckId], next, cardsConnections.current.get(next.deckId)) ? { ...current, [next.deckId]: next } : current));
   }, []);
   useEffect(() => {
-    if (typeof bridge.subscribeAgentCards !== "function") return;
+    if (!cardsConsumed || typeof bridge.subscribeAgentCards !== "function") return;
     let active = true;
     let unsubscribe: (() => void) | undefined;
     void bridge.subscribeAgentCards((next) => {
@@ -568,7 +594,11 @@ export function useDeckRuntime(): DeckRuntimeState {
       active = false;
       unsubscribe?.();
     };
-  }, [bridge, offerCards]);
+  }, [bridge, cardsConsumed, offerCards]);
+  /* Whether the fleet effect below has read cards since they were consumed:
+     the first pass after consuming reads every connected deck, since the
+     pushes of the subscriptions that request started can beat the listener. */
+  const cardsReadSinceConsumed = useRef(false);
   useEffect(() => {
     const previous = cardsConnections.current;
     const connections = new Map<string, CardsConnection>();
@@ -594,8 +624,13 @@ export function useDeckRuntime(): DeckRuntimeState {
       }
       return next;
     });
-    if (typeof bridge.agentCards !== "function") return;
-    for (const deckId of arrived) {
+    if (!cardsConsumed || typeof bridge.agentCards !== "function") {
+      cardsReadSinceConsumed.current = false;
+      return;
+    }
+    const toRead = cardsReadSinceConsumed.current ? arrived : [...connections].filter(([, connection]) => connection.connected).map(([deckId]) => deckId);
+    cardsReadSinceConsumed.current = true;
+    for (const deckId of toRead) {
       // The read is bound to the connection it was asked under: an answer
       // that lands after the deck reconnected to another process is dropped.
       const askedOf = connections.get(deckId)?.incarnation;
@@ -609,23 +644,10 @@ export function useDeckRuntime(): DeckRuntimeState {
         setAgentCards((current) => (deckId in current ? Object.fromEntries(Object.entries(current).filter(([id]) => id !== deckId)) : current));
       }, () => undefined);
     }
-  }, [bridge, fleet, offerCards]);
+  }, [bridge, cardsConsumed, fleet, offerCards]);
   const invokeCardAction = useMemo(() => (typeof bridge.invokeCardAction === "function"
     ? (target: AgentCardTarget, actionId: string, options: CardActionOptions) => bridge.invokeCardAction!(target, actionId, options)
     : undefined), [bridge]);
-
-  // Issue #1198: the app's experimental surfaces, asked ONCE per bridge. The
-  // flag is a presentation switch read at startup — changing it means
-  // restarting the app — so there is no re-query to race a navigation with.
-  // A missing method or a refused call leaves this `undefined`, which every
-  // reader takes as all hidden (`desktopFeaturesOf`).
-  const [desktopFeatures, setDesktopFeatures] = useState<DesktopFeatures>();
-  useEffect(() => {
-    let cancelled = false;
-    const ask = typeof bridge.desktopFeatures === "function" ? bridge.desktopFeatures() : undefined;
-    void ask?.then((features) => { if (!cancelled) setDesktopFeatures(features); }, () => undefined);
-    return () => { cancelled = true; };
-  }, [bridge]);
 
   return {
     appliedGeometry,

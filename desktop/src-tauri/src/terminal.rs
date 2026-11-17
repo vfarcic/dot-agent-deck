@@ -290,6 +290,18 @@ pub(crate) struct DesktopState {
     /// while the watcher is between subscriptions is still seen. Entries go
     /// with their deck in [`Self::retain_watchers`].
     refetch: Mutex<HashMap<EndpointIdentity, tokio::sync::watch::Sender<u64>>>,
+    /// PRD #2374: whether the webview consumes agent cards. `false` until the
+    /// webview, which shows the cards only while its experimental flag says
+    /// so, calls `agent_cards_consume`; from then on every deck watcher
+    /// subscribes with the card doorbells and pushes cards, and
+    /// `agent_cards_list` reads them. Until then no watcher asks a daemon for
+    /// cards. The bridge decides from this request, never from the flag
+    /// (CLAUDE.md rule 9: the flag gates the render and input seams only).
+    ///
+    /// A [`tokio::sync::watch`] for [`Self::selection`]'s reason: a watcher
+    /// already subscribed without the doorbells observes the request as an
+    /// edge and re-subscribes with them.
+    agent_cards: tokio::sync::watch::Sender<bool>,
     /// PRD #1223 M4: the command each deck last started a plain agent with from
     /// this app, which the New agent form prefills when the deck configures no
     /// `default_command` — the TUI's `last_command`, kept **per deck** because
@@ -386,6 +398,7 @@ impl Default for DesktopState {
             voice_answer_leases: crate::voice::lease::AnswerLeases::default(),
             selection: tokio::sync::watch::Sender::new(0),
             refetch: Mutex::new(HashMap::new()),
+            agent_cards: tokio::sync::watch::Sender::new(false),
             last_commands: Mutex::new(HashMap::new()),
             window_focus: Arc::new(Mutex::new(WindowFocus::default())),
             saved_selections: crate::selection_saves::SavedSelections::default(),
@@ -565,6 +578,26 @@ impl DesktopState {
         if let Some(sender) = self.refetch_senders().get(deck) {
             sender.send_modify(|generation| *generation += 1);
         }
+    }
+
+    /// PRD #2374: the webview consumes agent cards from now on. See
+    /// [`Self::agent_cards`]. Idempotent: a second request moves nothing, so
+    /// no watcher re-subscribes for it.
+    pub(crate) fn consume_agent_cards(&self) {
+        self.agent_cards
+            .send_if_modified(|wanted| !std::mem::replace(wanted, true));
+    }
+
+    /// Whether the webview asked for agent cards ([`Self::consume_agent_cards`]).
+    pub(crate) fn agent_cards_consumed(&self) -> bool {
+        *self.agent_cards.borrow()
+    }
+
+    /// Subscribe a deck watcher to the card request. Taken before its task is
+    /// spawned, like [`Self::refetch_signal`], so a request landing the moment
+    /// after is an edge this receiver observes.
+    pub(crate) fn agent_cards_signal(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.agent_cards.subscribe()
     }
 
     /// Record the command a plain agent was just started with on `deck` (PRD

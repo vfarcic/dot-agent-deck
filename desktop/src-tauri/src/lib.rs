@@ -10,6 +10,10 @@ mod endpoint_test;
 #[cfg(test)]
 mod endpoint_field_parity;
 mod endpoint_tunnels;
+// Tests only: the lock and restoring guard every test that writes the
+// process-global experimental flag shares. No item outside `#[cfg(test)]`.
+#[cfg(test)]
+mod features_lock;
 mod generation;
 // The local deck's address, read in one place so the tests have one seam to move
 // it with instead of the process-wide environment variable (issue #1078).
@@ -1422,6 +1426,10 @@ fn spawn_deck_watcher(app: &AppHandle, state: &DesktopState, endpoint: Endpoint)
     // reason the selection is — a start that lands before the task is first
     // polled must still be an edge the loop observes.
     let mut refetch = state.refetch_signal(&key);
+    // PRD #2374: whether the webview consumes cards, subscribed here for the
+    // selection's reason — a request that lands before the task is first
+    // polled is still an edge the loop observes.
+    let mut cards = state.agent_cards_signal();
     let handle = tauri::async_runtime::spawn(async move {
         // PRD #741 M4(b): the incremental agent list. It belongs to this task
         // and to nothing else — it is only ever correct while this task's
@@ -1446,10 +1454,13 @@ fn spawn_deck_watcher(app: &AppHandle, state: &DesktopState, endpoint: Endpoint)
             // long-lived by design and are read by `spawn_event_reader`.
             // PRD #2374 (review B1): opted into the agent-card doorbells, which
             // a daemon forwards only to a subscriber that asked — and only
-            // while this app shows the cards, so a daemon serving a desktop
-            // with the experimental flag off runs no card watcher for it.
+            // once the webview asked for cards (`agent_cards_consume`), so a
+            // daemon serving a webview that shows none runs no card watcher
+            // for it. Marked seen here: a request that lands from now on is an
+            // edge `watch_one_subscription` re-subscribes on.
+            let with_cards = *cards.borrow_and_update();
             let subscribe = async {
-                if dot_agent_deck::features::show_agent_cards() {
+                if with_cards {
                     daemon.client.subscribe_events_with_agent_cards().await
                 } else {
                     daemon.client.subscribe_events().await
@@ -1489,8 +1500,16 @@ fn spawn_deck_watcher(app: &AppHandle, state: &DesktopState, endpoint: Endpoint)
                 reader,
                 &mut selection,
                 &mut refetch,
+                &mut cards,
+                with_cards,
             )
             .await;
+            // PRD #2374: the webview asked for cards while this subscription
+            // ran without their doorbells. The link is healthy, so it is kept
+            // and the watcher re-subscribes at once, with them.
+            if ended == SubscriptionEnd::CardsRequested {
+                continue;
+            }
             // PRD #741 M4(a): the event stream ended. That is this watcher's
             // long-lived connection to its daemon going away, and a daemon
             // cannot be replaced without the old process dying and taking this
@@ -1582,6 +1601,9 @@ enum SubscriptionEnd {
     /// The user chose a different deck, so this subscription is against the
     /// wrong one.
     SelectionChanged,
+    /// PRD #2374: the webview asked for agent cards and this subscription
+    /// has no card doorbells. Nothing is wrong with the link.
+    CardsRequested,
 }
 
 /// The refresh loop for one subscription: fold what arrives, re-emit at the
@@ -1593,6 +1615,11 @@ enum SubscriptionEnd {
 /// PRD #742 M3: `endpoint` is the deck this subscription is against, and it is
 /// the only deck this call ever names — the fold it fills, the events it stamps
 /// and the snapshot it emits are all that deck's.
+///
+/// PRD #2374: `cards` and `with_cards` are the webview's card request and
+/// whether this subscription was made with the card doorbells; kept as two
+/// plain arguments beside the other signals rather than a struct of one use.
+#[allow(clippy::too_many_arguments)]
 async fn watch_one_subscription(
     app: &AppHandle,
     endpoint: &Endpoint,
@@ -1601,6 +1628,8 @@ async fn watch_one_subscription(
     mut events: tokio::sync::mpsc::Receiver<BroadcastMsg>,
     selection: &mut tokio::sync::watch::Receiver<u64>,
     refetch: &mut tokio::sync::watch::Receiver<u64>,
+    cards: &mut tokio::sync::watch::Receiver<bool>,
+    with_cards: bool,
 ) -> SubscriptionEnd {
     let mut reconcile = tokio::time::interval(RECONCILE_INTERVAL);
     reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1617,6 +1646,10 @@ async fn watch_one_subscription(
     // is aborting this task — so a closed channel cannot complete the arm on
     // every pass and spin the loop.
     let mut refetch_open = true;
+    // PRD #2374: watched only while this subscription has no card doorbells;
+    // cleared, like `refetch_open`, once the sender is gone so a closed
+    // channel cannot spin the loop.
+    let mut cards_open = !with_cards;
 
     let mut last_refresh: Option<tokio::time::Instant> = None;
     loop {
@@ -1638,6 +1671,13 @@ async fn watch_one_subscription(
             changed = refetch.changed(), if refetch_open => match changed {
                 Ok(()) => view.mark_reconcile_due(),
                 Err(_) => refetch_open = false,
+            },
+            // PRD #2374: the webview asked for cards; this subscription has
+            // no doorbells for them, so it is replaced by one that does.
+            changed = cards.changed(), if cards_open => match changed {
+                Ok(()) if *cards.borrow_and_update() => return SubscriptionEnd::CardsRequested,
+                Ok(()) => {}
+                Err(_) => cards_open = false,
             },
             // PRD #741 M9: returns BEFORE the refresh below, deliberately, and
             // the shape is kept — but PRD #742 M3 changed what it buys, so the
@@ -1714,8 +1754,8 @@ async fn watch_one_subscription(
         // PRD #2374: the cards ride the same coalesced refresh — re-read on a
         // new subscription, on a card's doorbell and on the reconciliation
         // tick. A deck whose daemon has no cards emits nothing, and nothing is
-        // read while the experimental flag hides the cards.
-        if view.take_cards_due() && dot_agent_deck::features::show_agent_cards() {
+        // read until the webview asked for cards.
+        if view.take_cards_due() && with_cards {
             emit_agent_cards(app, endpoint, links).await;
         }
         last_refresh = Some(tokio::time::Instant::now());
@@ -1768,8 +1808,25 @@ async fn emit_agent_cards(app: &AppHandle, endpoint: &Endpoint, links: &DaemonLi
     }
 }
 
+/// PRD #2374: the webview consumes agent cards. It calls this once, and only
+/// while it shows them (`desktopFeatures.showAgentCards`, its render seam);
+/// from then on every deck watcher subscribes with the card doorbells and
+/// pushes `desktop://agent-cards`, and [`agent_cards_list`] reads. Before it,
+/// the bridge asks no daemon for cards. The bridge acts on this request and
+/// never reads the experimental flag itself (CLAUDE.md rule 9).
+#[tauri::command]
+async fn agent_cards_consume(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+) -> Result<(), String> {
+    ensure_main_webview(&webview)?;
+    state.consume_agent_cards();
+    Ok(())
+}
+
 /// PRD #2374: the cards of deck `deck_id`, or `None` when its daemon does not
-/// advertise them — the webview then shows that deck's table only.
+/// advertise them, or the webview has not asked for cards — the webview then
+/// shows that deck's table only.
 #[tauri::command]
 async fn agent_cards_list(
     webview: Webview,
@@ -1780,13 +1837,13 @@ async fn agent_cards_list(
     agent_cards_list_on(&state, &deck_id).await
 }
 
-/// [`agent_cards_list`] minus the webview. `None`, asking no daemon, while
-/// the experimental flag hides the cards.
+/// [`agent_cards_list`] minus the webview. `None`, asking no daemon, until
+/// the webview asked for cards ([`agent_cards_consume`]).
 async fn agent_cards_list_on(
     state: &DesktopState,
     deck_id: &str,
 ) -> Result<Option<DesktopAgentCards>, String> {
-    if !dot_agent_deck::features::show_agent_cards() {
+    if !state.agent_cards_consumed() {
         return Ok(None);
     }
     let scope = crate::dto::DeckScope::resolve(Some(deck_id))?;
@@ -7249,6 +7306,7 @@ pub fn run() {
             star_prompt::desktop_star_prompt_choose,
             desktop_list_directories,
             desktop_inbox_action,
+            agent_cards_consume,
             agent_cards_list,
             agent_card_invoke,
             desktop_new_agent_options,
@@ -7350,25 +7408,50 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    /// PRD #2374 (Qodo review): with the experimental flag off the desktop
-    /// reads no cards — `agent_cards_list` answers `None` without resolving
-    /// the deck or asking its daemon — and with it on the same call goes on
-    /// to the deck (here an unknown one, so it fails there).
-    #[tokio::test]
-    async fn card_reads_wait_for_the_experimental_flag() {
+    /// PRD #2374 (PR #2378 review): the bridge serves cards on the webview's
+    /// request and never on the experimental flag. Before `agent_cards_consume`
+    /// `agent_cards_list` answers `None` without resolving the deck or asking
+    /// a daemon — with the flag ON — and the watchers' card signal reads
+    /// false, so none subscribes with card doorbells or pushes cards. After it
+    /// the signal moves (the edge a doorbell-less subscription re-subscribes
+    /// on), a second request moves nothing, and the same call goes on to the
+    /// deck — with the flag OFF (an unknown deck here, so it fails there).
+    ///
+    /// A plain `#[test]` driving its own runtime, so the features lock (a std
+    /// mutex) is held for the whole test without being held across an await.
+    #[test]
+    fn card_reads_follow_the_webview_request_not_the_flag() {
+        use dot_agent_deck::features::{self, Features};
+        let _lock = crate::features_lock::lock_features();
+        let _restore = crate::features_lock::RestoreFeatures::current();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         let state = DesktopState::default();
-        dot_agent_deck::features::set_for_test(dot_agent_deck::features::Features::test_with(
-            false,
-        ));
+        let mut signal = state.agent_cards_signal();
+
+        features::set_for_test(Features::test_with(true));
+        assert!(!*signal.borrow_and_update());
+        assert!(!state.agent_cards_consumed());
         assert!(matches!(
-            agent_cards_list_on(&state, "no-such-deck").await,
+            runtime.block_on(agent_cards_list_on(&state, "no-such-deck")),
             Ok(None)
         ));
-        dot_agent_deck::features::set_for_test(dot_agent_deck::features::Features::test_with(true));
-        assert!(agent_cards_list_on(&state, "no-such-deck").await.is_err());
-        dot_agent_deck::features::set_for_test(dot_agent_deck::features::Features::test_with(
-            false,
-        ));
+
+        state.consume_agent_cards();
+        assert!(signal.has_changed().unwrap());
+        assert!(*signal.borrow_and_update());
+        state.consume_agent_cards();
+        assert!(!signal.has_changed().unwrap());
+
+        features::set_for_test(Features::test_with(false));
+        assert!(state.agent_cards_consumed());
+        assert!(
+            runtime
+                .block_on(agent_cards_list_on(&state, "no-such-deck"))
+                .is_err()
+        );
     }
 
     /// A reading session whose task runs until aborted, and records being
