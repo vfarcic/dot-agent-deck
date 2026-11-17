@@ -321,7 +321,7 @@ impl OrchestrationConfig {
     /// passes — but the display-only fields (`command`, `description`,
     /// `prompt_template`) are left as defaults. Tab rendering, status
     /// tracking, and daemon-side delegation still work; only the
-    /// pre-rendered orchestrator-context.md enrichment is missing.
+    /// pre-rendered orchestrator-context enrichment is missing.
     ///
     /// Roles whose `role_index` had no surviving pane keep a synthetic
     /// `name = "role-{i}"` placeholder so the rendered sidebar doesn't

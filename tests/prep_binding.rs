@@ -14,8 +14,8 @@
 //! daemon-local `PreparationStale` so a passing assertion shows *which* check
 //! fired rather than only that something refused.
 //!
-//! The fixed `orchestrator-context.md` remains a compatibility mirror of the
-//! latest publish. New launches read their own unique file, not that mirror.
+//! Each launch reads its own unique file; issue #1395 retired the fixed
+//! `orchestrator-context.md` that every publish used to refresh beside it.
 //!
 //! **These prove the CHECKER; the WIRING is proved once, next door.** Every case
 //! below calls `revalidate_preparation` directly. That the daemon's
