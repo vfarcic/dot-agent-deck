@@ -131,6 +131,14 @@ Orchestration 'team': its instructions were not sent to its coordinator again, b
 
 The orchestrator keeps running, but without its instructions in its conversation. Approve the change with the command in the message, or revert the file; the next compaction or `/clear` then sends them. If you approve a change that only edits the roles' text, that text is what the orchestrator gets. If the change adds, removes, renames or reorders roles, or moves `start`, the status line says `its roles changed since it was opened. Open it again to use the new roles.`: open the orchestration again from the New Agent form.
 
+The instructions are sent again with the task the orchestration was started with, read from that orchestration's own `orchestrator-context-<id>.md`. When the TUI cannot read that file, it sends them without a task and the status line says why, for example:
+
+```text
+Orchestration 'team': instructions re-sent to its coordinator without a task (this tab does not know its context file)
+```
+
+That happens for an orchestration you opened with `Ctrl+n` and came back to after detaching, or from a second TUI, which never had a task to send; and for any orchestration whose file was deleted, by hand or because it was more than 14 days old. If the orchestrator was working on a task, give it the task again.
+
 The desktop app does not send the orchestrator's instructions again after compaction or `/clear`, so this does not apply there.
 
 ## Manage approvals from the command line
