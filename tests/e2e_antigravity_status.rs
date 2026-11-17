@@ -476,12 +476,14 @@ fn permission_security_regressions() {
     );
 
     let replay = Replay::launch("./agy");
-    let command = "rm -f probe.txt\necho hidden-command";
+    let command = format!(
+        "rm -f probe.txt {}\necho hidden-command",
+        "long-command-argument-".repeat(14)
+    );
     let prompt = format!("Approve Bash: {command}");
     replay.replay(json!([
-        command_hook(command),
-        {"permission_menu": true},
-        {"synthetic_permission_osc": prompt}
+        command_hook(&command),
+        {"permission_menu": "multiline", "prompt": prompt}
     ]));
     replay.card("Needs Input", "Approve Bash:", "multiline command");
     let id = questions::agent_id(&replay.deck);
@@ -520,6 +522,27 @@ fn permission_security_regressions() {
         }),
         "multiline grant attempt typed into the command menu: {}",
         replay.diagnostic()
+    );
+    replay.deck.send_bytes(b"1");
+    replay.deck.wait_for_string("Run this command?");
+    replay.deck.wait_for_string("4. No, cancel");
+    let result = questions::answer(&replay.deck, &id, &q, vec![questions::selection(0, &[4])]);
+    assert_eq!(
+        result,
+        AnswerReport::Answered,
+        "Deny must pass the screen check for a multiline command:\n{}",
+        replay.diagnostic()
+    );
+    replay.deck.wait_for_string("AGY-PERMISSION-ANSWER-4");
+    let captured = std::fs::read(replay.deck.workdir().join("input.bytes")).unwrap();
+    assert_eq!(&captured[before.len()..], b"4", "only digit 4, no Enter");
+    replay.deck.send_bytes(b"\x04");
+    replay.cleared_question("Idle", "multiline Deny");
+    assert!(
+        questions::snapshot(&replay.deck, &id)
+            .unwrap()
+            .pending_question
+            .is_none()
     );
 }
 
@@ -616,4 +639,56 @@ fn antigravity_status_006_other_agent_ignores_osc7501() {
             replay.diagnostic()
         );
     }
+}
+
+/// Scenario: A stand-in shows a command permission question, then sends ToolEnd and SessionEnd hooks with an unrecognized predecessor capability. The current question stays visible and answering Allow Once sends exactly digit 1, clears the prompt and returns the card to Idle.
+#[spec("antigravity/status/007")]
+#[test]
+fn antigravity_status_007_rejected_end_hooks_keep_current_permission_answerable() {
+    use dot_agent_deck::daemon_client::AnswerReport;
+    use dot_agent_deck::question::QuestionKind;
+
+    let replay = Replay::launch("./agy");
+    replay.replay(json!([
+        command_hook("rm -f probe.txt"),
+        {"permission_menu":true},
+        {"osc":"blocked","kind":"permission","msg":QUESTION}
+    ]));
+    replay.card("Needs Input", QUESTION, "current call");
+    let id = questions::agent_id(&replay.deck);
+    let q = questions::pending(&replay.deck, &id, QuestionKind::Permission);
+    for (event, fixture) in [
+        ("PostToolUse", "post-tool-use-run-command.json"),
+        ("SessionEnd", "session-start.json"),
+    ] {
+        replay.replay(json!([{
+            "hook":fixture,
+            "payload":{"hookEventName":event},
+            "env":{"DOT_AGENT_DECK_PANE_CAPABILITY":"0".repeat(64)},
+            "tag":format!("rejected-{event}")
+        }]));
+        assert!(
+            !replay
+                .deck
+                .wait_for_grid_predicate_within(Duration::from_millis(700), |grid| {
+                    !shows_only(grid, "Needs Input") || !grid.contains(QUESTION)
+                }),
+            "rejected {event} must keep the current question visible:\n{}",
+            replay.diagnostic()
+        );
+    }
+    replay.deck.send_bytes(b"1");
+    replay.deck.wait_for_string("1. Yes, run command");
+    let before = std::fs::read(replay.deck.workdir().join("input.bytes")).unwrap_or_default();
+    assert_eq!(
+        questions::answer(&replay.deck, &id, &q, vec![questions::selection(0, &[1])]),
+        AnswerReport::Answered,
+        "rejected end hooks must leave the current call answerable:\n{}",
+        replay.diagnostic()
+    );
+    replay.deck.wait_for_string("AGY-PERMISSION-ANSWER-1");
+    let captured = std::fs::read(replay.deck.workdir().join("input.bytes")).unwrap();
+    assert_eq!(&captured[before.len()..], b"1");
+    replay.deck.send_bytes(b"\x04");
+    replay.cleared_question("Idle", "answer after rejected hooks");
 }

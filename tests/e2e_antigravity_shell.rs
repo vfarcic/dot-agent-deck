@@ -100,7 +100,7 @@ fn antigravity_title_shows(grid: &str, status: &str) -> bool {
     })
 }
 
-/// Scenario: Start a plain shell in a deck pane and launch the Antigravity stand-in from its prompt. A permission signal before any hook changes nothing; once its first prompt's hooks name it, a permission signal shows Needs Input with the decoded question, and an interrupt's idle signal returns the card to Idle.
+/// Scenario: Start a plain shell in a deck pane and launch the Antigravity stand-in from its prompt. A permission signal before any hook changes nothing; after its hooks, permission shows Needs Input and idle clears it. Once a Claude-shaped hook takes over the shell, matching Antigravity permission and status signals preserve Working with the Claude command and no foreign question.
 #[spec("antigravity/shell/001")]
 #[test]
 fn antigravity_shell_001_agy_started_from_a_shell_reports_needs_input_and_interrupt() {
@@ -142,4 +142,39 @@ fn antigravity_shell_001_agy_started_from_a_shell_reports_needs_input_and_interr
         "the interrupted prompt's question must clear:\n{}",
         shell.diagnostic()
     );
+    shell.replay(json!([{"hook":"pre-tool-use-run-command.json", "agent":"claude-code"}]));
+    // The card retains its display name from the Antigravity session; the
+    // new hook's command and Working status are the takeover control.
+    assert!(
+        shell
+            .deck
+            .wait_for_grid_predicate_within(Duration::from_secs(15), |grid| {
+                grid.contains("Working")
+                    && grid.contains("echo claude-control")
+                    && !grid.contains("Needs Input")
+                    && !grid.contains(QUESTION)
+            }),
+        "another agent's hook must take over the shell card:\n{}",
+        shell.diagnostic()
+    );
+    for signal in [
+        json!({"osc":"blocked","kind":"permission","msg":QUESTION}),
+        json!({"osc":"idle"}),
+        json!({"osc":"done","msg":"DONE"}),
+        json!({"osc":"error"}),
+    ] {
+        shell.replay(json!([signal]));
+        assert!(
+            !shell
+                .deck
+                .wait_for_grid_predicate_within(Duration::from_millis(700), |grid| {
+                    !grid.contains("Working")
+                        || !grid.contains("echo claude-control")
+                        || grid.contains("Needs Input")
+                        || grid.contains(QUESTION)
+                }),
+            "Antigravity OSC after Claude took over must be inert:\n{}",
+            shell.diagnostic()
+        );
+    }
 }

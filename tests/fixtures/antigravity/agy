@@ -39,12 +39,23 @@ def redraw():
     width = os.get_terminal_size(0).columns
     if permission_menu is not None:
         menu = json.loads((root / "permission-menu.json").read_text())
-        if permission_menu is not True:
+        if permission_menu not in (True, "multiline"):
             menu = menu[permission_menu]
         options = "\r\n".join(
             f"  {option['key']}. {option['label']}" for option in menu["options"]
         )
-        sys.stdout.write("\033[2J\033[H" + permission_prompt + "\r\n" + options + "\r\nEsc to cancel\r\n")
+        if permission_menu == "multiline":
+            # Measured Command-menu wording, with wrapped command content.
+            command = permission_prompt.removeprefix("Approve Bash: ")
+            rendered = "\r\n".join(
+                "   " + part
+                for line in command.splitlines()
+                for part in textwrap.wrap(line, width=max(1, width - 3))
+            )
+            heading = "Command\r\n" + "─" * width + "\r\nRequesting permission for:\r\n" + rendered + "\r\nRun this command?"
+            sys.stdout.write("\033[2J\033[H" + heading + "\r\n" + options + "\r\n  ↑/↓ Navigate · tab Amend · ctrl+g edit/expand command\r\nesc to cancel\r\n")
+        else:
+            sys.stdout.write("\033[2J\033[H" + permission_prompt + "\r\n" + options + "\r\nEsc to cancel\r\n")
         sys.stdout.flush()
         return
     content = line.decode(errors="replace")
@@ -105,9 +116,11 @@ def replay(action):
                 "tool_name": "Bash",
                 "tool_input": {"command": "echo claude-control"},
             }
+        hook_env = dict(os.environ)
+        hook_env.update(action.get("env", {}))
         result = subprocess.run(
             [os.environ["AGY_TEST_DECK_BIN"], "hook", "--agent", agent],
-            input=json.dumps(payload), text=True, capture_output=True, check=False,
+            input=json.dumps(payload), text=True, capture_output=True, check=False, env=hook_env,
         )
         with (root / "hook-replay.log").open("a") as log:
             log.write(f'{action["hook"]}: exit={result.returncode}\n{result.stdout}\n{result.stderr}\n')
@@ -148,7 +161,7 @@ def replay(action):
     elif "permission_menu" in action:
         permission_menu = action["permission_menu"]
         menu = json.loads((root / "permission-menu.json").read_text())
-        if permission_menu is not True:
+        if permission_menu not in (True, "multiline"):
             menu = menu[permission_menu]
         permission_prompt = action.get("prompt", menu["prompt"])
         redraw()

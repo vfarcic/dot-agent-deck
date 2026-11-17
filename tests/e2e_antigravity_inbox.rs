@@ -390,7 +390,7 @@ fn antigravity_inbox_004_misrendered_echo_is_withdrawn_and_retried_once() {
     agy.committed_once(&id);
 }
 
-/// Scenario: Subscribe to an Antigravity pane's completed replies and replay a plain Stop with a sanitized transcript; the subscriber receives its final text once. A Stop handed queued mail returns continue without publishing an interim reply, and the final continued Stop publishes the new reply once.
+/// Scenario: Subscribe to an Antigravity pane's completed replies: a workspace transcript publishes nothing, while a plain Stop with a sanitized transcript in its conversation's HOME directory publishes its final text once. A Stop handed queued mail returns continue without publishing an interim reply, and the final continued Stop publishes the new reply once.
 #[spec("voice/reading-reply/007")]
 #[test]
 fn reading_reply_007_antigravity_transcript_publishes_only_finished_turns() {
@@ -409,7 +409,11 @@ fn reading_reply_007_antigravity_transcript_publishes_only_finished_turns() {
     else {
         panic!("daemon must advertise turn-replies");
     };
-    let transcript = agy.deck.workdir().join("reading-transcript.jsonl");
+    let conversation = "00000000-0000-4000-8000-000000000001";
+    let transcript = agy.deck.home_dir().join(format!(
+        ".gemini/antigravity-cli/brain/{conversation}/.system_generated/logs/transcript_full.jsonl"
+    ));
+    std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
     let captured = include_str!("fixtures/antigravity/transcript-full-after-continue.jsonl");
     // Retain the measured USER_INPUT/PLANNER_RESPONSE records for the plain
     // turn, without the later SYSTEM_MESSAGE and continued reply.
@@ -419,9 +423,25 @@ fn reading_reply_007_antigravity_transcript_publishes_only_finished_turns() {
     )
     .unwrap();
     agy.hook("pre-invocation.json", json!({}), "reading-plain-start");
+    let outside = agy.deck.workdir().join("reading-transcript.jsonl");
+    std::fs::copy(&transcript, &outside).unwrap();
     agy.hook(
         "stop-before-continue.json",
-        json!({"transcriptPath":transcript}),
+        json!({"transcriptPath":outside,"conversationId":conversation}),
+        "reading-workspace-stop",
+    );
+    runtime.block_on(async {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), replies.next_reply())
+                .await
+                .is_err(),
+            "a workspace transcript must publish no reply"
+        );
+    });
+    agy.hook("pre-invocation.json", json!({}), "reading-valid-start");
+    agy.hook(
+        "stop-before-continue.json",
+        json!({"transcriptPath":transcript,"conversationId":conversation}),
         "reading-plain-stop",
     );
     let plain = runtime.block_on(async {
@@ -448,7 +468,7 @@ fn reading_reply_007_antigravity_transcript_publishes_only_finished_turns() {
     let id = inbox::enqueue(&agy.deck, &agy.pane, "AGY-READING-CONTINUE-78bc");
     let stdout = agy.hook(
         "stop-before-continue.json",
-        json!({"transcriptPath":transcript}),
+        json!({"transcriptPath":transcript,"conversationId":conversation}),
         "reading-continue",
     );
     let answer: Value = serde_json::from_str(&stdout).expect("continue response");
@@ -475,7 +495,7 @@ fn reading_reply_007_antigravity_transcript_publishes_only_finished_turns() {
     );
     agy.hook(
         "stop-after-continue.json",
-        json!({"transcriptPath":transcript}),
+        json!({"transcriptPath":transcript,"conversationId":conversation}),
         "reading-final-stop",
     );
     let continued = runtime.block_on(async {

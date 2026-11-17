@@ -7985,7 +7985,7 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 ##### antigravity/status/003 — OSC permission questions show the measured menu, accept its answer keys and clear on recovery.
 - **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_antigravity_status.rs`).
 - **Agent:** `agy` stand-in replaying measured OSC 7501 bytes and the command permission menu measured on real `agy` 1.5.9.
-- **Asserts:** Needs Input includes the decoded question; working and idle clear it. Tool-bound command permissions offer the four measured labels and roles; each client answer writes its measured digit without Enter and visibly resumes the pane, while both always-allow options require confirmation and describe their scopes. Tool-bound file creation offers its measured two choices and sends digit 1 or 2; folder trust is not an answerable command menu. Forged edit OSC over a Bash menu, missing PreToolUse and completed PostToolUse offer no answerable question and answering types no bytes; a composer redraw refuses an otherwise valid answer with an explanation. For multiline commands, Deny is the answerable choice and grant attempts are refused without typing.
+- **Asserts:** Needs Input includes the decoded question; working and idle clear it. Tool-bound command permissions offer the four measured labels and roles; each client answer writes its measured digit without Enter and visibly resumes the pane, while both always-allow options require confirmation and describe their scopes. Tool-bound file creation offers its measured two choices and sends digit 1 or 2; folder trust is not an answerable command menu. Forged edit OSC over a Bash menu, missing PreToolUse and completed PostToolUse offer no answerable question and answering types no bytes; a composer redraw refuses an otherwise valid answer with an explanation. A long multiline command renders the measured Command-menu wording: grants are refused without typing, while Deny passes the screen check, writes exactly digit 4 and clears the question.
 - **Does not assert:** real model compliance or remembering a permission in a subsequent turn (`question/live/009` covers real Allow Once).
 - **Platform coverage:** mac+linux (unix-only file).
 
@@ -8010,12 +8010,19 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Does not assert:** a real Claude session or every other supported agent.
 - **Platform coverage:** mac+linux (unix-only file).
 
+##### antigravity/status/007 — Rejected end hooks leave the current command permission answerable.
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_antigravity_status.rs`).
+- **Agent:** captured-hook Antigravity stand-in with an unrecognized capability on predecessor-shaped end hooks.
+- **Asserts:** after a current PreToolUse and permission signal, rejected PostToolUse and SessionEnd leave Needs Input with the question visible; Allow Once still sends exactly digit 1 and visibly returns to Idle.
+- **Does not assert:** a genuinely displaced generation's issued capability (`state::tests::antigravity_call_survives_a_displaced_generations_events` covers generation retirement) or a real model.
+- **Platform coverage:** mac+linux (unix-only file).
+
 #### antigravity/shell
 
 ##### antigravity/shell/001 — Antigravity started from a shell in a pane shows Needs Input and an interrupted turn once its hooks name it.
 - **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_antigravity_shell.rs`).
 - **Agent:** `agy` stand-in typed at a plain `sh` pane's prompt, replaying captured hooks and measured OSC 7501 permission and idle signals.
-- **Asserts:** the pane's environment carries `AGY_CLI_OSC7501=on`; a permission signal before any hook shows no Needs Input; after `SessionStart` and `PreInvocation` the Antigravity card shows Thinking, then Needs Input with the decoded question for a hook-bound permission signal, then Idle with the question cleared on an idle signal.
+- **Asserts:** the pane's environment carries `AGY_CLI_OSC7501=on`; a permission signal before any hook shows no Needs Input; after `SessionStart` and `PreInvocation` the Antigravity card shows Thinking, then Needs Input with the decoded question for a hook-bound permission signal, then Idle with the question cleared on an idle signal. Once a Claude-shaped hook takes over the same shell pane, Antigravity permission, idle, done and error signals preserve Working with the Claude command and no foreign question.
 - **Does not assert:** a real `agy`, voice answers in a shell-started pane, or start-up dialogs shown before the first prompt.
 - **Platform coverage:** mac+linux (unix-only file).
 
@@ -10162,7 +10169,7 @@ Since PRD #1666 S5 the deck types nothing into the orchestrator: its idle, waiti
 
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_antigravity_inbox.rs`), production reading subscription, daemon and real hook CLI.
 - **Agent:** captured-hook Antigravity stand-in with a sanitized measured JSONL transcript; no model.
-- **Asserts:** a plain Stop publishes its final reply once with the pane's identity; a Stop handed queued mail returns continue without an interim reply, and the final continued Stop publishes the new final text once with an increasing sequence.
+- **Asserts:** a workspace transcript publishes no reply; a plain Stop with its conversation-matching transcript in the isolated HOME publishes its final reply once with the pane's identity; a Stop handed queued mail returns continue without an interim reply, and the final continued Stop publishes the new final text once with an increasing sequence.
 - **Does not assert:** real Antigravity transcript timing, desktop speech or summaries generated by a model.
 - **Platform coverage:** mac+linux.
 
