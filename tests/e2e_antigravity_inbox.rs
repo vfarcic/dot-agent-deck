@@ -315,6 +315,116 @@ fn antigravity_inbox_003_error_does_not_take_pending_mail() {
     agy.committed_once(&id);
 }
 
+/// Scenario: Subscribe to an Antigravity pane's completed replies and replay a plain Stop with a sanitized transcript; the subscriber receives its final text once. A Stop handed queued mail returns continue without publishing an interim reply, and the final continued Stop publishes the new reply once.
+#[spec("voice/reading-reply/007")]
+#[test]
+fn reading_reply_007_antigravity_transcript_publishes_only_finished_turns() {
+    use dot_agent_deck::daemon_client::{DaemonClient, GatedQuery};
+
+    let (agy, _) = Agy::start(false);
+    agy.hook("session-start.json", json!({}), "reading-start");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let client = DaemonClient::new(agy.deck.attach_socket_path().to_path_buf());
+    let GatedQuery::Answered(mut replies) = runtime
+        .block_on(client.subscribe_turn_replies(&agy.pane.agent))
+        .expect("subscribe to Antigravity reading replies")
+    else {
+        panic!("daemon must advertise turn-replies");
+    };
+    let transcript = agy.deck.workdir().join("reading-transcript.jsonl");
+    let captured = include_str!("fixtures/antigravity/transcript-full-after-continue.jsonl");
+    // Retain the measured USER_INPUT/PLANNER_RESPONSE records for the plain
+    // turn, without the later SYSTEM_MESSAGE and continued reply.
+    std::fs::write(
+        &transcript,
+        captured.lines().take(4).collect::<Vec<_>>().join("\n") + "\n",
+    )
+    .unwrap();
+    agy.hook("pre-invocation.json", json!({}), "reading-plain-start");
+    agy.hook(
+        "stop-before-continue.json",
+        json!({"transcriptPath":transcript}),
+        "reading-plain-stop",
+    );
+    let plain = runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(10), replies.next_reply())
+            .await
+            .expect("plain Stop must publish its transcript reply")
+            .expect("decode plain reply")
+            .expect("reading stream remains live")
+    });
+    assert_eq!(plain.agent_id, agy.pane.agent);
+    assert_eq!(plain.pane_id, agy.pane.id);
+    assert_eq!(plain.reply.text, "FIRST-REPLY-3307");
+    assert!(!plain.reply.failed);
+    runtime.block_on(async {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), replies.next_reply())
+                .await
+                .is_err(),
+            "plain turn reply must arrive once"
+        );
+    });
+
+    agy.hook("pre-invocation.json", json!({}), "reading-busy-start");
+    let id = inbox::enqueue(&agy.deck, &agy.pane, "AGY-READING-CONTINUE-78bc");
+    let stdout = agy.hook(
+        "stop-before-continue.json",
+        json!({"transcriptPath":transcript}),
+        "reading-continue",
+    );
+    let answer: Value = serde_json::from_str(&stdout).expect("continue response");
+    assert_eq!(answer["decision"], "continue");
+    framed(
+        answer["reason"].as_str().unwrap(),
+        &id,
+        "AGY-READING-CONTINUE-78bc",
+    );
+    agy.committed_once(&id);
+    runtime.block_on(async {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), replies.next_reply())
+                .await
+                .is_err(),
+            "a Stop handed a continue must publish no interim reading reply"
+        );
+    });
+    std::fs::write(&transcript, captured).unwrap();
+    agy.hook(
+        "pre-invocation-after-continue.json",
+        json!({}),
+        "reading-reentry",
+    );
+    agy.hook(
+        "stop-after-continue.json",
+        json!({"transcriptPath":transcript}),
+        "reading-final-stop",
+    );
+    let continued = runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(10), replies.next_reply())
+            .await
+            .expect("completed continued turn must publish its final reply")
+            .expect("decode continued reply")
+            .expect("reading stream remains live")
+    });
+    assert_eq!(continued.agent_id, agy.pane.agent);
+    assert_eq!(continued.pane_id, agy.pane.id);
+    assert_eq!(continued.reply.text, "CONTINUED-REPLY-8812");
+    assert!(!continued.reply.failed);
+    assert!(continued.sequence > plain.sequence);
+    runtime.block_on(async {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), replies.next_reply())
+                .await
+                .is_err(),
+            "continued turn reply must arrive once"
+        );
+    });
+}
+
 /// Scenario: Delegate from an orchestration to its Antigravity role before its first prompt, holding launch auth and then a permission dialog. Neither accepts input; once OSC reports idle, the role displays its task in the pane scrollback through the doorbell and its real work-done CLI sends the report back to the orchestrator.
 #[spec("orchestration/route/003")]
 #[test]
