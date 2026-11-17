@@ -88,6 +88,21 @@ impl Shell {
             self.diagnostic()
         );
     }
+
+    fn claude_tool(&self, moment: &str) {
+        let records = common::agent_records_on(self.deck.attach_socket_path());
+        assert_eq!(records.len(), 1, "{moment}: expected one shell card");
+        let active_tool = records[0]
+            .live
+            .as_ref()
+            .and_then(|snapshot| snapshot.active_tool.as_ref());
+        assert_eq!(
+            active_tool.map(|tool| (tool.name.as_str(), tool.detail.as_deref())),
+            Some(("Bash", Some("echo claude-control"))),
+            "{moment}: the daemon snapshot must keep the Claude command active:\n{records:#?}\n{}",
+            self.diagnostic()
+        );
+    }
 }
 
 /// Whether the dashboard has an Antigravity card whose title reads `status`.
@@ -100,7 +115,7 @@ fn antigravity_title_shows(grid: &str, status: &str) -> bool {
     })
 }
 
-/// Scenario: Start a plain shell in a deck pane and launch the Antigravity stand-in from its prompt. A permission signal before any hook changes nothing; after its hooks, permission shows Needs Input and idle clears it. Once a Claude-shaped hook takes over the shell, matching Antigravity permission and status signals preserve Working with the Claude command and no foreign question.
+/// Scenario: Start a plain shell in a deck pane and launch the Antigravity stand-in from its prompt. A permission signal before any hook changes nothing; after its hooks, permission shows Needs Input and idle clears it. Once a Claude-shaped hook takes over the shell, the daemon snapshot identifies Bash with detail echo claude-control as the active tool, and later Antigravity permission and status signals preserve it alongside Working and no foreign question on the card.
 #[spec("antigravity/shell/001")]
 #[test]
 fn antigravity_shell_001_agy_started_from_a_shell_reports_needs_input_and_interrupt() {
@@ -157,6 +172,7 @@ fn antigravity_shell_001_agy_started_from_a_shell_reports_needs_input_and_interr
         "another agent's hook must take over the shell card:\n{}",
         shell.diagnostic()
     );
+    shell.claude_tool("Claude hook takeover");
     for signal in [
         json!({"osc":"blocked","kind":"permission","msg":QUESTION}),
         json!({"osc":"idle"}),
@@ -176,5 +192,6 @@ fn antigravity_shell_001_agy_started_from_a_shell_reports_needs_input_and_interr
             "Antigravity OSC after Claude took over must be inert:\n{}",
             shell.diagnostic()
         );
+        shell.claude_tool("Antigravity OSC after Claude takeover");
     }
 }
