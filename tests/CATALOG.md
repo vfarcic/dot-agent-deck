@@ -7986,8 +7986,16 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_antigravity_inbox.rs`), attached input, real PTY, daemon and hook CLI.
 - **Agent:** captured-hook Antigravity stand-in with the measured alternate-screen folder-trust dialog and permission OSC.
-- **Asserts:** Enter and Down, Down, Enter dismiss the dialog; subsequently delegated tasks visibly reach the worker once with one acknowledged receipt delivery. A letter typed into an idle composer holds delegated mail without additional input.
+- **Asserts:** Enter and Down, Down, Enter dismiss the dialog; subsequently delegated tasks visibly reach the worker once with one acknowledged receipt delivery. A letter typed into an idle composer holds delegated mail without additional input. Enter followed by Up in one attached write recalls history after the idle OSC; that visible draft holds queued delegation without doorbell bytes in the input log.
 - **Does not assert:** real model trust handling or permission acceptance.
+- **Platform coverage:** mac+linux.
+
+##### antigravity/inbox/008 — Tool and Stop hooks before permission-answer status leave later delegation usable.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_antigravity_inbox.rs`), attached input, real PTY, daemon and hook CLI.
+- **Agent:** captured-hook Antigravity stand-in.
+- **Asserts:** after PreToolUse and a visible permission menu, a person answers 1 through attached input; PostToolUse and Stop each precede working then idle OSCs, and a later delegated task visibly reaches the worker exactly once with one acknowledged receipt delivery.
+- **Does not assert:** a real model's scheduling or an OSC read before a newer hook but applied afterwards; the daemon regression covers that ordering directly.
 - **Platform coverage:** mac+linux.
 
 #### antigravity/status

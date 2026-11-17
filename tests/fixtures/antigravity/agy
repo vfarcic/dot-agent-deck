@@ -33,6 +33,9 @@ permission_prompt = ""
 trust_dialog = False
 trust_selected = 0
 trust_escape = bytearray()
+composer_escape = bytearray()
+history_prompt = ""
+answer_hook = None
 misrender_next_echo = False
 misrendering_echo = False
 output_text = ""
@@ -115,7 +118,7 @@ def redraw():
 
 
 def replay(action):
-    global state, permission_menu, permission_prompt, misrender_next_echo, output_text, trust_dialog, trust_selected
+    global state, permission_menu, permission_prompt, misrender_next_echo, output_text, trust_dialog, trust_selected, history_prompt, answer_hook
     if "hook" in action:
         payload = json.loads((root / action["hook"]).read_text())
         # The capture's workspace is sanitized; retain its measured event shape
@@ -174,6 +177,7 @@ def replay(action):
     elif "trust_dialog" in action:
         trust_dialog = True
         trust_selected = 0
+        history_prompt = action.get("history_prompt", "")
         sys.stdout.write("\033[?1049h")
         redraw()
         replay({"osc": "blocked", "kind": "permission", "msg": "Trust this folder?"})
@@ -185,6 +189,7 @@ def replay(action):
         redraw()
     elif "permission_menu" in action:
         permission_menu = action["permission_menu"]
+        answer_hook = action.get("answer_hook")
         menu = json.loads((root / "permission-menu.json").read_text())
         if permission_menu not in (True, "multiline"):
             menu = menu[permission_menu]
@@ -255,8 +260,20 @@ while True:
                     (root / "permission-answer.txt").write_text(chr(c))
                     permission_menu = None
                     (root / "delivered.txt").write_text(f"AGY-PERMISSION-ANSWER-{chr(c)}")
+                    if answer_hook:
+                        replay({"hook": answer_hook, "tag": "answer-hook"})
                     replay({"osc": "working"})
                     replay({"osc": "idle"})
+            elif history_prompt and (c == 27 or composer_escape):
+                composer_escape.append(c)
+                if bytes(composer_escape) == b"\x1b[A":
+                    # A single attached write may answer the dialog and then
+                    # recall history after its idle OSC has left the PTY.
+                    line[:] = history_prompt.encode()
+                    placeholder = False
+                    composer_escape.clear()
+                elif len(composer_escape) >= 3:
+                    composer_escape.clear()
             elif c == 13:
                 value = line.decode(errors="replace")
                 line.clear()

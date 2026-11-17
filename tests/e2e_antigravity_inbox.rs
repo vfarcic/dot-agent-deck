@@ -497,7 +497,7 @@ fn antigravity_inbox_006_numbered_output_allows_delivery_but_permission_menu_hol
     agy.visibly_delivered_once(&id, body);
 }
 
-/// Scenario: A person types a draft into an idle Antigravity worker and pending delegation leaves that draft untouched. In fresh workers they answer the folder-trust dialog with Enter or Down, Down, Enter through attached input; each subsequent delegated task visibly arrives and is acknowledged exactly once.
+/// Scenario: A person types a draft into an idle Antigravity worker, or answers a trust dialog with Enter followed by Up in one write to recall a draft after idle; pending delegation leaves each draft untouched. In fresh workers they answer the folder-trust dialog with Enter or Down, Down, Enter through attached input; each subsequent delegated task visibly arrives and is acknowledged exactly once.
 #[spec("antigravity/inbox/007")]
 #[test]
 fn antigravity_inbox_007_trust_dialog_answers_allow_delegation_but_a_draft_holds_it() {
@@ -517,6 +517,39 @@ fn antigravity_inbox_007_trust_dialog_answers_allow_delegation_but_a_draft_holds
         assert!(
             !common::wait_until(Duration::from_secs(1), || inbox::bytes(&agy.pane) != before),
             "delegation must leave the person's draft alone: {}",
+            agy.diagnostic()
+        );
+        inbox::state(&agy.deck, &agy.pane, &id, "queued");
+    }
+    // Safety control: Up can populate the composer after a prompt answer.
+    {
+        let (agy, orchestrator) = Agy::start(true);
+        let draft = "AGY-RECALLED-HUMAN-DRAFT-5eca";
+        agy.replay(json!([{"trust_dialog":true, "history_prompt":draft}]));
+        assert!(common::wait_for_pane_text_on(
+            agy.deck.attach_socket_path(),
+            &agy.pane.agent,
+            "> Yes, I trust this folder",
+            Duration::from_secs(10)
+        ));
+        let id = route::delegate(&agy.deck, &orchestrator.unwrap(), TASK, false);
+        inbox::state(&agy.deck, &agy.pane, &id, "queued");
+        let _person = inbox::input(&agy.deck, &agy.pane, "\r\x1b[A");
+        assert!(common::wait_for_pane_text_on(
+            agy.deck.attach_socket_path(),
+            &agy.pane.agent,
+            &format!("> {draft}"),
+            Duration::from_secs(10)
+        ));
+        let before = inbox::bytes(&agy.pane);
+        assert_eq!(
+            before, b"\r\x1b[A",
+            "answer and Up share one attached write"
+        );
+        assert!(
+            !common::wait_until(Duration::from_secs(1), || inbox::bytes(&agy.pane) != before),
+            "delegation must leave recalled history alone: input={:?}\n{}",
+            inbox::bytes(&agy.pane),
             agy.diagnostic()
         );
         inbox::state(&agy.deck, &agy.pane, &id, "queued");
@@ -544,6 +577,46 @@ fn antigravity_inbox_007_trust_dialog_answers_allow_delegation_but_a_draft_holds
         );
         let id = route::delegate(&agy.deck, &orchestrator.unwrap(), TASK, false);
         agy.visibly_delivered_once(&id, TASK);
+    }
+}
+
+/// Scenario: A person answers a visible tool permission menu with 1 through attached input. The stand-in posts PostToolUse or Stop through the hook CLI before emitting working then idle; a later delegated task must visibly arrive and be acknowledged exactly once in each case.
+#[spec("antigravity/inbox/008")]
+#[test]
+fn antigravity_inbox_008_hook_before_answer_status_keeps_delegation_usable() {
+    for hook in ["post-tool-use-run-command.json", "stop.json"] {
+        eprintln!("permission departure hook before status: {hook}");
+        let (agy, orchestrator) = Agy::start(true);
+        agy.hook("session-start.json", json!({}), "start");
+        agy.hook(
+            "pre-tool-use-run-command.json",
+            json!({"toolCall": {
+                "id":"call_0000000000000000001", "name":"run_command",
+                "args":{"CommandLine":"rm -f probe.txt"}
+            }}),
+            "tool-start",
+        );
+        agy.replay(json!([
+            {"permission_menu":true, "answer_hook":hook},
+            {"osc":"blocked", "kind":"permission", "msg":"Approve Bash: rm -f probe.txt"}
+        ]));
+        assert!(common::wait_for_pane_text_on(
+            agy.deck.attach_socket_path(),
+            &agy.pane.agent,
+            "1. Yes, run command",
+            Duration::from_secs(10)
+        ));
+        let _person = inbox::input(&agy.deck, &agy.pane, "1");
+        assert!(common::wait_for_pane_text_on(
+            agy.deck.attach_socket_path(),
+            &agy.pane.agent,
+            "AGY-PERMISSION-ANSWER-1",
+            Duration::from_secs(10)
+        ));
+        assert_eq!(agy.result("answer-hook")["code"], 0);
+        let body = format!("AGY-AFTER-HOOK-BEFORE-STATUS-{hook}");
+        let id = route::delegate(&agy.deck, &orchestrator.unwrap(), &body, false);
+        agy.visibly_delivered_once(&id, &body);
     }
 }
 
