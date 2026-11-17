@@ -1704,8 +1704,138 @@ async fn watch_one_subscription(
         }
         let snapshot = snapshot_with(endpoint, links, Some(view)).await;
         emit_snapshot(app, &snapshot);
+        // PRD #2374: the cards ride the same coalesced refresh — re-read on a
+        // new subscription, on a card's doorbell and on the reconciliation
+        // tick. A deck whose daemon has no cards emits nothing.
+        if view.take_cards_due() {
+            emit_agent_cards(app, endpoint, links).await;
+        }
         last_refresh = Some(tokio::time::Instant::now());
     }
+}
+
+/// PRD #2374: the `desktop://agent-cards` payload — one deck's cards as its
+/// daemon computed them. `entries` are passed through as the daemon sent
+/// them: the desktop computes nothing about status, needs-you, actions or
+/// order (CLAUDE.md rule 18).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DesktopAgentCards {
+    deck_id: String,
+    instance_id: String,
+    revision: u64,
+    entries: Vec<dot_agent_deck::agent_cards::AgentCardEntry>,
+    catalog_errors: Vec<String>,
+}
+
+impl DesktopAgentCards {
+    fn new(endpoint: &Endpoint, list: dot_agent_deck::agent_cards::AgentCardList) -> Self {
+        Self {
+            deck_id: crate::dto::deck_wire_id(endpoint),
+            instance_id: list.instance_id,
+            revision: list.revision,
+            entries: list.entries,
+            catalog_errors: list.catalog_errors,
+        }
+    }
+}
+
+/// PRD #2374: read `endpoint`'s cards and emit them; nothing for a deck whose
+/// daemon does not advertise cards, or that did not answer.
+async fn emit_agent_cards(app: &AppHandle, endpoint: &Endpoint, links: &DaemonLinks) {
+    let Ok(daemon) = links.trusted(endpoint).await else {
+        return;
+    };
+    if daemon.require_compatible().is_err() {
+        return;
+    }
+    if let Ok(GatedQuery::Answered(list)) =
+        crate::daemon_bridge::bounded_reply("ListAgentCards", daemon.client.list_agent_cards())
+            .await
+    {
+        let _ = app.emit(
+            "desktop://agent-cards",
+            DesktopAgentCards::new(endpoint, list),
+        );
+    }
+}
+
+/// PRD #2374: the cards of deck `deck_id`, or `None` when its daemon does not
+/// advertise them — the webview then shows that deck's table only.
+#[tauri::command]
+async fn agent_cards_list(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    deck_id: String,
+) -> Result<Option<DesktopAgentCards>, String> {
+    ensure_main_webview(&webview)?;
+    agent_cards_list_on(&state, &deck_id).await
+}
+
+/// [`agent_cards_list`] minus the webview.
+async fn agent_cards_list_on(
+    state: &DesktopState,
+    deck_id: &str,
+) -> Result<Option<DesktopAgentCards>, String> {
+    let scope = crate::dto::DeckScope::resolve(Some(deck_id))?;
+    let daemon = state.daemon.trusted(scope.endpoint()).await?;
+    daemon.require_compatible()?;
+    match crate::daemon_bridge::bounded_reply("ListAgentCards", daemon.client.list_agent_cards())
+        .await?
+    {
+        GatedQuery::Answered(list) => Ok(Some(DesktopAgentCards::new(scope.endpoint(), list))),
+        GatedQuery::Unsupported => Ok(None),
+    }
+}
+
+/// PRD #2374: invoke action `action_id` of the card of agent `agent_id` in
+/// `pane_id` on deck `deck_id`, bound to the daemon process `instance_id`
+/// that listed it, so a successor that numbered an unrelated agent the same
+/// is sent nothing. The answer is the daemon's result as is — a refusal is
+/// `outcome: "refused"` with its code — or `refused` / `unsupported` for a
+/// deck whose daemon has no cards. `request_id` names the press, so a repeat
+/// sends nothing again.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn agent_card_invoke(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    deck_id: String,
+    pane_id: String,
+    agent_id: String,
+    action_id: String,
+    confirm: bool,
+    text: Option<String>,
+    request_id: String,
+    instance_id: Option<String>,
+) -> Result<dot_agent_deck::agent_cards::CardActionResult, String> {
+    ensure_main_webview(&webview)?;
+    let scope = crate::dto::DeckScope::resolve(Some(&deck_id))?;
+    let daemon = state.daemon.trusted(scope.endpoint()).await?;
+    daemon.require_compatible()?;
+    let client = match instance_id {
+        Some(id) => daemon.client.bound_to(Incarnation::from(Some(id))),
+        None => (*daemon.client).clone(),
+    };
+    let answer = client
+        .invoke_card_action(
+            &pane_id,
+            &agent_id,
+            &action_id,
+            &request_id,
+            confirm,
+            text.as_deref(),
+        )
+        .await
+        .map_err(|error| safe_message(error.to_string()))?;
+    Ok(match answer {
+        GatedQuery::Answered(result) => result,
+        GatedQuery::Unsupported => dot_agent_deck::agent_cards::CardActionResult::refused(
+            &request_id,
+            "unsupported",
+            "this deck's daemon does not support agent cards; upgrade it to act on cards",
+        ),
+    })
 }
 
 /// Has the selection moved since this receiver last observed it?
@@ -7086,6 +7216,8 @@ pub fn run() {
             star_prompt::desktop_star_prompt_choose,
             desktop_list_directories,
             desktop_inbox_action,
+            agent_cards_list,
+            agent_card_invoke,
             desktop_new_agent_options,
             desktop_bootstrap,
             desktop_reconnect_deck,

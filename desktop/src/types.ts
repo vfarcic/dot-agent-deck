@@ -690,6 +690,12 @@ export interface DesktopFeatures {
    * tabs, which a live daemon supplies nothing for today. Off leaves Terminal as the only tab.
    */
   showAgentDetails: boolean;
+  /**
+   * PRD #2374 — the overview's agent cards: the Table | Cards switch, the
+   * cards grid, the card overlay, and the table's needs-you marker and row
+   * menu. Off shows the table as it was.
+   */
+  showAgentCards: boolean;
 }
 
 /** Every experimental surface hidden — the shipped default, and what fixture mode answers unless `?experimental=1`. */
@@ -700,7 +706,139 @@ export const DEFAULT_DESKTOP_FEATURES: DesktopFeatures = {
   showOrchestrations: false,
   showAgentProfiles: false,
   showAgentDetails: false,
+  showAgentCards: false,
 };
+
+/*
+ * PRD #2374 — agent cards, exactly as the daemon computed them
+ * (`list-agent-cards`). The desktop computes NOTHING about status, needs-you,
+ * action availability or order: it renders these as received. Keys are the
+ * daemon's snake_case. Everything under `report`, `fields`, `questions` and
+ * an action with `source: "agent"` is another agent's text: render it as
+ * text, never as markup, and label it as the agent's.
+ */
+
+/** Where a card is grouped: by the dispatcher that started it, its orchestration, or neither. */
+export interface AgentCardGroup {
+  id: string;
+  kind: "dispatcher" | "orchestration" | "standalone" | string;
+  label: string | null;
+}
+
+export interface AgentCardRelations {
+  dispatcher?: { key: string; name: string } | null;
+  orchestration?: { id: string; label: string; role: string; is_orchestrator: boolean } | null;
+}
+
+/** What the agent itself last published — the agent's word, not checked by the deck. */
+export interface AgentCardReport {
+  source: "agent";
+  status: "working" | "waiting" | "done" | "failed" | string;
+  summary: string | null;
+  published_at: string;
+  revision: number;
+}
+
+export interface AgentCardField {
+  name: string;
+  label: string;
+  description: string | null;
+  type: "text" | "long_text" | "number" | "boolean" | "url" | "list" | "pull_request" | "issue" | string;
+  icon: string | null;
+  placement: "compact" | "card" | "detail" | string;
+  custom: boolean;
+  source: "agent" | string;
+  value: unknown;
+}
+
+export interface AgentCardQuestion {
+  id: string;
+  text: string;
+  source: "agent" | string;
+  options: { id: string; label: string; action_id: string }[];
+  answered: { option_id: string; action_id: string; at: string } | null;
+}
+
+/** The latest delivery of one prompt action to the agent's inbox. */
+export interface AgentCardDelivery {
+  message_id: string;
+  state: "queued" | "delivered" | "uncertain" | "not_delivered" | string;
+  detail: string | null;
+  at: string;
+}
+
+export interface AgentCardAction {
+  id: string;
+  label: string;
+  kind: "prompt" | "close" | "close_keep_worktree" | "open" | string;
+  /** The exact text a prompt action sends; `null` for `reply` and the deck's own actions. */
+  prompt: string | null;
+  text_input: boolean;
+  confirm: boolean;
+  confirm_detail: string | null;
+  icon: string | null;
+  placement: "compact" | "card" | "detail" | string;
+  custom: boolean;
+  source: "catalog" | "agent" | "deck" | string;
+  enabled: boolean;
+  disabled_reason: string | null;
+  last_delivery: AgentCardDelivery | null;
+}
+
+/** One agent's card. `key` is `<pane_id>/<agent_id>`; across decks key by `(deckId, instance_id, key)`. */
+export interface AgentCardEntry {
+  key: string;
+  instance_id: string;
+  pane_id: string;
+  agent_id: string;
+  agent_type: string | null;
+  name: string;
+  status: string;
+  needs_you: boolean;
+  needs_you_reasons: string[];
+  group: AgentCardGroup;
+  relations: AgentCardRelations;
+  report: AgentCardReport | null;
+  fields: AgentCardField[];
+  questions: AgentCardQuestion[];
+  actions: AgentCardAction[];
+  primary_action_id: string;
+  facts: { source: "deck"; pull_request: unknown | null };
+  revision: number;
+  updated_at: string;
+}
+
+/** One deck's cards (`desktop://agent-cards`, `agent_cards_list`), in the daemon's display order. */
+export interface AgentCardsSnapshot {
+  deckId: string;
+  instanceId: string;
+  revision: number;
+  entries: AgentCardEntry[];
+  catalogErrors: string[];
+}
+
+/** The card the user acted on. */
+export interface AgentCardTarget {
+  deckId: string;
+  instanceId: string;
+  paneId: string;
+  agentId: string;
+}
+
+/**
+ * The daemon's answer to a card action. A refusal is `outcome: "refused"`
+ * with a stable `code` (`confirm_required`, `action_disabled`, `stale_entry`,
+ * `unsupported`, …) and a sentence to show.
+ */
+export interface CardActionResult {
+  request_id: string;
+  outcome: "sent" | "closed" | "refused" | string;
+  message_id?: string;
+  kept_worktree?: string;
+  code?: string;
+  message?: string;
+  entry_revision?: number;
+}
 
 /**
  * The orchestrations the New agent form can offer for one directory on one deck

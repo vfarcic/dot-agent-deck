@@ -44,6 +44,10 @@ import type { HandoffEdge,
   DeckListingOptions,
   DeckSnapshot,
   DesktopFeatures,
+  AgentCardEntry,
+  AgentCardsSnapshot,
+  AgentCardTarget,
+  CardActionResult,
   DisconnectedReason,
   EvidenceItem,
   HostMetricsReport,
@@ -2376,7 +2380,51 @@ export interface DeckBridge {
    * answers `stale` to the second of two clients acting at once.
    */
   inboxAction?(target: AgentTarget, item: { paneId: string; messageId: string; revision: number }, verb: InboxActionVerb): Promise<InboxActionResult>;
+  /**
+   * PRD #2374 — one deck's agent cards (`agent_cards_list`), or `null` when
+   * its daemon does not support cards (show that deck's table only).
+   * Optional: a bridge without it shows no cards.
+   */
+  agentCards?(deckId: string): Promise<AgentCardsSnapshot | null>;
+  /**
+   * PRD #2374 — every deck's cards as each changes (`desktop://agent-cards`),
+   * pushed on connect, on a card's doorbell and every few seconds.
+   */
+  subscribeAgentCards?(listener: (snapshot: AgentCardsSnapshot) => void): Promise<Unsubscribe>;
+  /**
+   * PRD #2374 — invoke one action of one card (`agent_card_invoke`). The
+   * daemon resolves, refuses and performs it; `confirm` only after the user
+   * confirmed an action whose `confirm` is set, `text` only for `reply`.
+   * `requestId` names the press (one is minted when absent), so repeating it
+   * sends nothing again.
+   */
+  invokeCardAction?(target: AgentCardTarget, actionId: string, options?: { confirm?: boolean; text?: string; requestId?: string }): Promise<CardActionResult>;
   dispose(): Promise<void>;
+}
+
+/** PRD #2374 — a fresh id for one card-action press. */
+export function newCardRequestId(): string {
+  const bytes = new Uint8Array(16);
+  globalThis.crypto.getRandomValues(bytes);
+  return `card-${Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("")}`;
+}
+
+/**
+ * PRD #2374 — read a `desktop://agent-cards` / `agent_cards_list` payload,
+ * or `null` when it is not one. Only the envelope is checked: the entries are
+ * the daemon's, rendered as received.
+ */
+export function normalizeAgentCards(value: unknown): AgentCardsSnapshot | null {
+  if (typeof value !== "object" || value === null) return null;
+  const record = value as Record<string, unknown>;
+  if (typeof record.deckId !== "string" || !Array.isArray(record.entries)) return null;
+  return {
+    deckId: record.deckId,
+    instanceId: typeof record.instanceId === "string" ? record.instanceId : "",
+    revision: typeof record.revision === "number" ? record.revision : 0,
+    entries: record.entries as AgentCardEntry[],
+    catalogErrors: Array.isArray(record.catalogErrors) ? record.catalogErrors.filter((e): e is string => typeof e === "string") : [],
+  };
 }
 
 /**
@@ -2402,7 +2450,7 @@ export function normalizeDesktopFeatures(value: unknown): DesktopFeatures {
 export function fixtureDesktopFeatures(search = window.location.search): DesktopFeatures {
   const requested = new URLSearchParams(search).get("experimental")?.trim().toLowerCase();
   if (requested !== "1" && requested !== "true") return { ...DEFAULT_DESKTOP_FEATURES };
-  return { showDeck: true, showProjects: true, showPrompts: true, showOrchestrations: true, showAgentProfiles: true, showAgentDetails: true };
+  return { showDeck: true, showProjects: true, showPrompts: true, showOrchestrations: true, showAgentProfiles: true, showAgentDetails: true, showAgentCards: true };
 }
 
 
@@ -5869,6 +5917,33 @@ export class TauriDeckBridge implements DeckBridge {
     // Issue #1240: `options` only when given, so a PRD #1223 listing is the
     // same invoke it always was.
     return invoke<DeckDirectoryListing>("desktop_list_directories", { deckId, path: path ?? null, ...(options ? { options } : {}) });
+  }
+
+  async agentCards(deckId: string): Promise<AgentCardsSnapshot | null> {
+    const invoke = await this.getInvoke();
+    return normalizeAgentCards(await invoke<unknown>("agent_cards_list", { deckId }));
+  }
+
+  async subscribeAgentCards(listener: (snapshot: AgentCardsSnapshot) => void): Promise<Unsubscribe> {
+    const { listen } = await import("@tauri-apps/api/event");
+    return listen<unknown>("desktop://agent-cards", (event) => {
+      const snapshot = normalizeAgentCards(event.payload);
+      if (snapshot) listener(snapshot);
+    });
+  }
+
+  async invokeCardAction(target: AgentCardTarget, actionId: string, options: { confirm?: boolean; text?: string; requestId?: string } = {}): Promise<CardActionResult> {
+    const invoke = await this.getInvoke();
+    return invoke<CardActionResult>("agent_card_invoke", {
+      deckId: target.deckId,
+      paneId: target.paneId,
+      agentId: target.agentId,
+      actionId,
+      confirm: options.confirm === true,
+      text: options.text ?? null,
+      requestId: options.requestId ?? newCardRequestId(),
+      instanceId: target.instanceId || null,
+    });
   }
 
   async inboxAction(target: AgentTarget, item: { paneId: string; messageId: string; revision: number }, verb: InboxActionVerb): Promise<InboxActionResult> {
