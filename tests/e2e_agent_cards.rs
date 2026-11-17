@@ -51,21 +51,21 @@ fn catalog_config() -> String {
     )
 }
 
-/// The user config the daemon was started with. A deck pane inherits the
-/// daemon's environment, `DOT_AGENT_DECK_CONFIG` included, so the agent's CLI
-/// reads the same file; [`as_agent`] passes it on as the pane would. (Each
-/// test runs in its own process, so one value per process is enough.)
-static AGENT_CONFIG: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-
-/// A headless daemon whose user config is `config`, plus the tempdir holding it.
+/// A headless daemon whose user config is `config`, plus the tempdir holding
+/// it. Only the daemon reads it: the agent's CLI leaves catalog membership to
+/// the daemon (product decision (b)), so [`as_agent`] passes no config.
 fn daemon_with_config(config: &str) -> (common::DaemonProc, tempfile::TempDir) {
     let dir = common::harness_tempdir().expect("config tempdir");
     let path = dir.path().join("config.toml");
     std::fs::write(&path, config).expect("write user config");
-    AGENT_CONFIG.set(path.clone()).expect("one deck per test");
     let path = path.to_string_lossy().into_owned();
     let daemon = inbox::daemon_unbound(&[("DOT_AGENT_DECK_CONFIG", path.as_str())]);
     (daemon, dir)
+}
+
+/// The user config file of a deck started by [`daemon_with_config`].
+fn config_path(dir: &tempfile::TempDir) -> PathBuf {
+    dir.path().join("config.toml")
 }
 
 fn text(bytes: &[u8]) -> String {
@@ -106,18 +106,11 @@ fn cli_with(
 
 /// The CLI as `pane`'s agent runs it.
 fn as_agent(endpoint: &impl Endpoint, pane: &Pane, cwd: &Path, args: &[&str]) -> Output {
-    let config = AGENT_CONFIG
-        .get()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let mut identity = vec![
+    let identity = [
         ("DOT_AGENT_DECK_PANE_ID", pane.id.as_str()),
         ("DOT_AGENT_DECK_AGENT_ID", pane.agent.as_str()),
         ("DOT_AGENT_DECK_PANE_CAPABILITY", pane.token.as_str()),
     ];
-    if !config.is_empty() {
-        identity.push(("DOT_AGENT_DECK_CONFIG", config.as_str()));
-    }
     cli_with(endpoint, cwd, &identity, args)
 }
 
@@ -249,9 +242,47 @@ fn inbox_of(endpoint: &impl Endpoint, pane_id: &str) -> Vec<Value> {
     .collect()
 }
 
-/// `card act` from the user's shell.
-fn act(endpoint: &impl Endpoint, entry: &str, action: &str, extra: &[&str]) -> Output {
-    let mut args = vec!["card", "act", "--entry", entry, "--action", action];
+/// What `card act` names besides the entry and the action: the action's
+/// token and the list's instance, read from `card list` as a user would.
+/// An entry or action the list does not have gets a placeholder token, so
+/// the daemon's own refusal for it is what the test sees.
+fn listed_handle(endpoint: &impl Endpoint, entry: &str, action_id: &str) -> (String, String) {
+    let doc = list(endpoint);
+    let instance = doc["instance_id"].as_str().unwrap().to_string();
+    let token = entry_in(&doc, entry)
+        .and_then(|e| action(&e, action_id).map(|a| a["token"].as_str().unwrap().to_string()))
+        .unwrap_or_else(|| "act-not-listed".to_string());
+    (token, instance)
+}
+
+/// `card act` from the user's shell, with the token and instance the card
+/// list shows now.
+fn act(endpoint: &impl Endpoint, entry: &str, action_id: &str, extra: &[&str]) -> Output {
+    let (token, instance) = listed_handle(endpoint, entry, action_id);
+    act_with(endpoint, entry, action_id, &token, &instance, extra)
+}
+
+/// `card act` from the user's shell, naming exactly `token` and `instance`.
+fn act_with(
+    endpoint: &impl Endpoint,
+    entry: &str,
+    action_id: &str,
+    token: &str,
+    instance: &str,
+    extra: &[&str],
+) -> Output {
+    let mut args = vec![
+        "card",
+        "act",
+        "--entry",
+        entry,
+        "--action",
+        action_id,
+        "--token",
+        token,
+        "--instance",
+        instance,
+    ];
     args.extend_from_slice(extra);
     as_user(endpoint, &args)
 }
@@ -529,7 +560,6 @@ impl UnitDeck {
             ),
         )
         .unwrap();
-        AGENT_CONFIG.set(config.clone()).expect("one deck per test");
         let deck = common::TuiDeck::builder()
             .with_pty_size(200, 55)
             .with_env("DOT_AGENT_DECK_CONFIG", config.to_string_lossy())
@@ -958,7 +988,10 @@ fn state_001_exit_keeps_a_stopped_card_and_close_removes_it() {
             "actions": [{"name": "merge"}]
         }),
     );
-    let subscriber = daemon.subscribe_events();
+    // The desktop's subscription opts into card doorbells; a plain one — an
+    // older client's, the TUI's — is never sent one (review B1).
+    let subscriber = common::EventSub::subscribe_with_agent_cards(daemon.attach_socket());
+    let plain = daemon.subscribe_events();
 
     kill_agent(&pane);
     let e = wait_entry(&daemon, &k, "stopped", |e| e["status"] == "stopped");
@@ -1003,6 +1036,17 @@ fn state_001_exit_keeps_a_stopped_card_and_close_removes_it() {
                 && ev.metadata.get("agent_card_removed").map(String::as_str) == Some("1")
         },
         common::load_scaled(WAIT),
+    );
+    // The opted-in stream already carried the removal; the same broadcast
+    // reached the plain one by now, had it been forwarded there.
+    assert!(
+        plain
+            .try_wait_for(
+                |ev| ev.event_type == EventType::AgentCard,
+                Duration::from_millis(500)
+            )
+            .is_none(),
+        "a subscription that did not opt in is sent no card doorbell"
     );
 }
 
@@ -1127,8 +1171,10 @@ fn actions_001_prompt_actions_reach_only_their_agent() {
     assert_refused(&out, "unknown_action");
 
     // The same request id is answered once.
+    let (explain_token, instance) = listed_handle(&daemon, &k, "explain");
     let request = json!({"op": "invoke-card-action", "pane_id": worker.id,
-        "agent_id": worker.agent, "action_id": "explain", "request_id": "card-repeat-req-1"});
+        "agent_id": worker.agent, "action_id": "explain", "request_id": "card-repeat-req-1",
+        "action_token": explain_token, "instance_id": instance});
     let first = inbox::attach(&daemon, request.clone());
     let second = inbox::attach(&daemon, request);
     assert_eq!(first["card_action"]["outcome"], "sent", "{first}");
@@ -1150,13 +1196,24 @@ fn actions_001_prompt_actions_reach_only_their_agent() {
         &daemon,
         &orch,
         daemon.cwd(),
-        &["card", "act", "--entry", &k, "--action", "explain"],
+        &[
+            "card",
+            "act",
+            "--entry",
+            &k,
+            "--action",
+            "explain",
+            "--token",
+            &explain_token,
+            "--instance",
+            &instance,
+        ],
     );
     assert_refused(&out, "agent_caller");
 
     // A card read before its agent was replaced.
     let fresh = restart_worker(&daemon, &orch, &worker);
-    let out = act(&daemon, &k, "explain", &[]);
+    let out = act_with(&daemon, &k, "explain", &explain_token, &instance, &[]);
     assert_refused(&out, "stale_entry");
     let replayed: Vec<Value> = inbox_of(&daemon, &fresh.id)
         .into_iter()
@@ -1237,4 +1294,244 @@ fn actions_002_close_and_close_keeping_the_worktree() {
             .any(|r| r.id == caller.agent),
         "the dispatcher is untouched"
     );
+}
+
+/// Scenario: A stand-in publishes a custom action and the user reads its
+/// token from `card list`; the agent then republishes the same action id
+/// with other text, and the user's catalog changes a confirm action's prompt.
+/// `card act` with either old token is refused `[stale_action]` and posts
+/// nothing; with the token listed now it sends the new text exactly; and a
+/// later report that drops the action leaves what was sent on the card.
+#[spec("agent-report/actions/003")]
+#[test]
+fn actions_003_a_changed_action_sends_nothing_from_the_old_card() {
+    let (daemon, cfg) = daemon_with_config(&catalog_config());
+    let pane = route::start(&daemon, "card-stale", json!({}));
+    let k = key(&pane);
+    let report = |prompt: &str| json!({"actions": [{"name": "go", "label": "Go ahead", "prompt": prompt}, {"name": "deploy"}]});
+    publish(
+        &daemon,
+        &pane,
+        daemon.cwd(),
+        &report("STALE-PROMPT-A: run the tests."),
+    );
+    let (old_go, instance) = listed_handle(&daemon, &k, "go");
+    let (old_deploy, _) = listed_handle(&daemon, &k, "deploy");
+
+    // The agent swaps the text under the same id after the user read it.
+    publish(
+        &daemon,
+        &pane,
+        daemon.cwd(),
+        &report("STALE-PROMPT-B: something else."),
+    );
+    let before = inbox_of(&daemon, &pane.id).len();
+    let out = act_with(&daemon, &k, "go", &old_go, &instance, &[]);
+    assert_refused(&out, "stale_action");
+    // A raw request that names no token is refused the same way.
+    let raw = inbox::attach(
+        &daemon,
+        json!({"op": "invoke-card-action", "pane_id": pane.id, "agent_id": pane.agent,
+            "action_id": "go", "request_id": "card-no-token-1", "instance_id": instance}),
+    );
+    assert_eq!(raw["card_action"]["code"], "stale_action", "{raw}");
+
+    // The user's catalog changes `deploy`'s prompt after the card was read.
+    let edited = catalog_config().replace(
+        DEPLOY_PROMPT,
+        "DEPLOY-PROMPT-7f3a: deploy it to production now, then update your card.",
+    );
+    std::fs::write(config_path(&cfg), edited).expect("edit the user config");
+    let out = act_with(
+        &daemon,
+        &k,
+        "deploy",
+        &old_deploy,
+        &instance,
+        &["--confirm"],
+    );
+    assert_refused(&out, "stale_action");
+    assert_eq!(
+        inbox_of(&daemon, &pane.id).len(),
+        before,
+        "nothing was posted for a stale action"
+    );
+
+    // The version listed now is sent, exactly.
+    let out = act(&daemon, &k, "go", &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", describe(&out));
+    let id = sent_message_id(&out, "card-stale");
+    let messages = inbox_of(&daemon, &pane.id);
+    let sent = messages.iter().find(|m| m["id"] == id.as_str()).unwrap();
+    assert!(
+        sent["text"]
+            .as_str()
+            .unwrap()
+            .contains("STALE-PROMPT-B: something else.")
+    );
+    assert!(
+        !messages
+            .iter()
+            .any(|m| m["text"].as_str().unwrap_or("").contains("STALE-PROMPT-A")),
+        "the text the agent replaced never reached it"
+    );
+
+    // What was sent outlives the report that offered it.
+    publish(
+        &daemon,
+        &pane,
+        daemon.cwd(),
+        &json!({"summary": "moved on"}),
+    );
+    let e = wait_entry(&daemon, &k, "without go", |e| action(e, "go").is_none());
+    let recent = e["recent_deliveries"]
+        .as_array()
+        .expect("recent deliveries");
+    assert_eq!(recent[0]["action_id"], "go", "{e:#}");
+    assert_eq!(recent[0]["message_id"], id.as_str());
+    assert_eq!(recent[0]["text"], "STALE-PROMPT-B: something else.");
+}
+
+/// Scenario: The user lists a card on one deck daemon, then the deck's
+/// daemon is another process that numbered an agent with the same pane and
+/// agent ids. `card act` with the first daemon's instance id is refused
+/// `[daemon_replaced]` for a prompt action and for a close, and the second
+/// daemon's agent receives nothing and stays.
+#[spec("agent-report/actions/004")]
+#[test]
+fn actions_004_a_card_from_a_replaced_daemon_acts_on_nothing() {
+    let (first, _first_cfg) = daemon_with_config("");
+    let listed = route::start(&first, "card-b3", json!({}));
+    let k = key(&listed);
+    let (explain, instance) = listed_handle(&first, &k, "explain");
+    let (close, _) = listed_handle(&first, &k, "close");
+
+    let (second, _second_cfg) = daemon_with_config("");
+    let successor = route::start(&second, "card-b3", json!({}));
+    assert_eq!(
+        key(&successor),
+        k,
+        "the successor numbers its agent the same, which is the hazard"
+    );
+    let (_, second_instance) = listed_handle(&second, &k, "explain");
+    assert_ne!(second_instance, instance);
+    let before = inbox_of(&second, &successor.id).len();
+
+    let out = act_with(&second, &k, "explain", &explain, &instance, &[]);
+    assert_refused(&out, "daemon_replaced");
+    let out = act_with(&second, &k, "close", &close, &instance, &["--confirm"]);
+    assert_refused(&out, "daemon_replaced");
+    // The daemon refuses another process's card itself, for a sender that
+    // skips the client's binding.
+    let raw = inbox::attach(
+        &second,
+        json!({"op": "invoke-card-action", "pane_id": successor.id, "agent_id": successor.agent,
+            "action_id": "explain", "request_id": "card-b3-raw", "action_token": explain,
+            "instance_id": instance}),
+    );
+    assert_eq!(raw["card_action"]["code"], "daemon_replaced", "{raw}");
+
+    assert_eq!(
+        inbox_of(&second, &successor.id).len(),
+        before,
+        "nothing reached the successor's agent"
+    );
+    assert!(
+        entry_in(&list(&second), &k).is_some(),
+        "the successor's agent was not closed"
+    );
+}
+
+/// Scenario: Six clients send the same card action with the same request
+/// id at the same moment, as a retry of an in-flight press would. Every one
+/// gets the same answer, and the agent's inbox gains exactly one message.
+#[spec("agent-report/actions/005")]
+#[test]
+fn actions_005_overlapping_repeats_of_one_request_post_once() {
+    let (daemon, _cfg) = daemon_with_config("");
+    let pane = route::start(&daemon, "card-race", json!({}));
+    let k = key(&pane);
+    let (token, instance) = listed_handle(&daemon, &k, "explain");
+    let request = json!({"op": "invoke-card-action", "pane_id": pane.id, "agent_id": pane.agent,
+        "action_id": "explain", "request_id": "card-overlap-1", "action_token": token,
+        "instance_id": instance});
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(6));
+    let answers: Vec<Value> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..6)
+            .map(|_| {
+                let barrier = std::sync::Arc::clone(&barrier);
+                let request = request.clone();
+                let daemon = &daemon;
+                scope.spawn(move || {
+                    barrier.wait();
+                    inbox::attach(daemon, request)["card_action"].clone()
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    assert_eq!(answers[0]["outcome"], "sent", "{answers:#?}");
+    for answer in &answers {
+        assert_eq!(answer, &answers[0], "every repeat gets the first answer");
+    }
+    let posted = inbox_of(&daemon, &pane.id)
+        .into_iter()
+        .filter(|m| {
+            m["text"]
+                .as_str()
+                .is_some_and(|t| t.contains(EXPLAIN_PROMPT))
+        })
+        .count();
+    assert_eq!(posted, 1, "one request id posts once");
+}
+
+/// Scenario: A stand-in publishes a card suggesting the catalog's `merge`
+/// and reporting a catalog text field; the user then removes `merge` from
+/// the catalog and redefines the field as a number. Without the agent
+/// publishing again, `card list` stops offering `merge` (no empty prompt is
+/// offered in its place) and stops showing the value that no longer fits,
+/// and `card act` on `merge` is refused `[unknown_action]`, posting nothing.
+#[spec("agent-report/state/002")]
+#[test]
+fn state_002_a_changed_catalog_applies_to_published_cards() {
+    let (daemon, cfg) = daemon_with_config("");
+    let pane = route::start(&daemon, "card-catalog-edit", json!({}));
+    let k = key(&pane);
+    publish(
+        &daemon,
+        &pane,
+        daemon.cwd(),
+        &json!({"fields": [{"name": "progress", "value": "halfway"}], "actions": [{"name": "merge"}]}),
+    );
+    let (merge, instance) = listed_handle(&daemon, &k, "merge");
+    assert_ne!(merge, "act-not-listed");
+
+    std::fs::write(
+        config_path(&cfg),
+        "[catalog]\nremove = [\"merge\"]\n\n[[catalog.fields]]\nname = \"progress\"\ndescription = \"How far along, in percent.\"\ntype = \"number\"\n",
+    )
+    .expect("edit the user config");
+    let e = wait_entry(&daemon, &k, "without merge", |e| {
+        action(e, "merge").is_none()
+    });
+    for a in e["actions"].as_array().unwrap() {
+        if a["kind"] == "prompt" && a["text_input"] == false {
+            assert!(
+                a["prompt"].as_str().is_some_and(|p| !p.is_empty()),
+                "no prompt action without its text: {a}"
+            );
+        }
+    }
+    assert!(
+        !e["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["name"] == "progress"),
+        "a text value under a number type is not shown: {e:#}"
+    );
+    let before = inbox_of(&daemon, &pane.id).len();
+    let out = act_with(&daemon, &k, "merge", &merge, &instance, &[]);
+    assert_refused(&out, "unknown_action");
+    assert_eq!(inbox_of(&daemon, &pane.id).len(), before);
 }

@@ -4890,6 +4890,12 @@ fn hook_line_for_log(line: &str) -> String {
 /// withheld. Every producer serializes the key after the event's identifiers
 /// (`serde_json` writes members in sorted order), so what is logged of such a
 /// line is still the part a diagnostic needs.
+///
+/// PRD #2374 (audit F7): an agent card's report is withheld the same two ways
+/// under [`CARD_REPORT_LINE_KEY`] — a `card_publish` the daemon could not
+/// decode (an unknown key, a wrong value shape) must not copy the agent's
+/// summary, questions or prompts into `deck.log`. What is logged of it is
+/// its identifiers and how many bytes were withheld.
 fn redact_hook_token(line: &str) -> std::borrow::Cow<'_, str> {
     if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(line) {
         withhold_turn_replies(&mut value);
@@ -4899,7 +4905,11 @@ fn redact_hook_token(line: &str) -> std::borrow::Cow<'_, str> {
     if line.contains("\\u") {
         return std::borrow::Cow::Borrowed("<withheld: an unparseable line with a \\u escape>");
     }
-    let (head, withheld) = match line.find(crate::turn_reply::TURN_REPLY_LINE_KEY) {
+    let first = [crate::turn_reply::TURN_REPLY_LINE_KEY, CARD_REPORT_LINE_KEY]
+        .into_iter()
+        .filter_map(|key| line.find(key))
+        .min();
+    let (head, withheld) = match first {
         Some(at) => (&line[..at], Some(line.len() - at)),
         None => (line, None),
     };
@@ -4910,10 +4920,14 @@ fn redact_hook_token(line: &str) -> std::borrow::Cow<'_, str> {
     match withheld {
         None => head,
         Some(bytes) => std::borrow::Cow::Owned(format!(
-            "{head}<withheld: a turn reply and the {bytes} bytes from it on>"
+            "{head}<withheld: a turn reply or card report and the {bytes} bytes from it on>"
         )),
     }
 }
+
+/// The member a `card_publish` line carries an agent's card report under
+/// (PRD #2374): withheld from every log line like a turn reply (audit F7).
+const CARD_REPORT_LINE_KEY: &str = "report";
 
 /// [`redact_hook_token`]'s turn-reply half over a parsed line: every
 /// [`crate::turn_reply::TURN_REPLY_LINE_KEY`] member, at any depth, becomes a
@@ -4923,7 +4937,7 @@ fn withhold_turn_replies(value: &mut serde_json::Value) {
         serde_json::Value::Array(items) => items.iter_mut().for_each(withhold_turn_replies),
         serde_json::Value::Object(map) => {
             for (key, item) in map.iter_mut() {
-                if key == crate::turn_reply::TURN_REPLY_LINE_KEY {
+                if key == crate::turn_reply::TURN_REPLY_LINE_KEY || key == CARD_REPORT_LINE_KEY {
                     *item = serde_json::Value::String(format!(
                         "<withheld: {} bytes>",
                         item.to_string().len()
@@ -11277,6 +11291,87 @@ mod hook_ingestion_tests {
         );
         assert!(
             raw.contains("reply-log-session") && raw.contains("<withheld"),
+            "the diagnostics still name the line and say what was withheld: {raw}"
+        );
+    }
+
+    /// PRD #2374 (audit F7): a `card_publish` the daemon cannot decode — one
+    /// whose report has an unknown key, and one cut off inside the report —
+    /// reaches the malformed-line warning, which names the line but never
+    /// copies the agent's report text into the log.
+    #[tokio::test]
+    async fn hook_diagnostics_never_log_a_card_report() {
+        use std::sync::Mutex;
+
+        #[derive(Clone, Default)]
+        struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for CapturedLog {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+            type Writer = CapturedLog;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        const SENTINEL: &str = "PRIVATE_CARD_SUMMARY_2374_c41d";
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing_subscriber::filter::LevelFilter::DEBUG)
+            .with_ansi(false)
+            .finish();
+        let subscriber_guard = crate::test_isolation::capture_tracing_on_this_thread(subscriber);
+        let fixture = HookLoopFixture::start();
+
+        let unknown_key = serde_json::json!({
+            "message_type": "card_publish", "pane_id": "card-log-pane",
+            "report": {"summary": format!("{SENTINEL} secret plan"), "bogus": 1},
+            "timestamp": "2026-11-17T12:00:00Z",
+        })
+        .to_string();
+        let cut = unknown_key[..unknown_key.find(SENTINEL).unwrap() + SENTINEL.len()].to_owned();
+
+        let mut stream = UnixStream::connect(&fixture.socket)
+            .await
+            .expect("connect hook socket");
+        for line in [&unknown_key, &cut] {
+            stream
+                .write_all(format!("{line}\n").as_bytes())
+                .await
+                .expect("write hook line");
+        }
+        stream
+            .write_all(format!("{}\n", padded_session_start("card-log-sentinel", 0)).as_bytes())
+            .await
+            .expect("write sentinel");
+        stream.flush().await.unwrap();
+        fixture.wait_for_session("card-log-sentinel").await;
+
+        drop(subscriber_guard);
+        fixture.handle.abort();
+        let _ = fixture.handle.await;
+
+        let raw = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            raw.matches("Malformed event:").count() >= 2,
+            "every diagnostic was reached, or this proves nothing: {raw}"
+        );
+        assert!(
+            !raw.contains(SENTINEL) && !raw.contains("secret plan"),
+            "a card report reached the log: {raw}"
+        );
+        assert!(
+            raw.contains("card-log-pane") && raw.contains("<withheld"),
             "the diagnostics still name the line and say what was withheld: {raw}"
         );
     }

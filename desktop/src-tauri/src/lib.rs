@@ -1444,9 +1444,11 @@ fn spawn_deck_watcher(app: &AppHandle, state: &DesktopState, endpoint: Endpoint)
             // `ListAgents` after it. Only the RESP that CONFIRMS the
             // subscription is bounded — the event frames that follow are
             // long-lived by design and are read by `spawn_event_reader`.
+            // PRD #2374 (review B1): opted into the agent-card doorbells, which
+            // a daemon forwards only to a subscriber that asked.
             let subscription = match crate::daemon_bridge::bounded_reply(
                 "SubscribeEvents",
-                daemon.client.subscribe_events(),
+                daemon.client.subscribe_events_with_agent_cards(),
             )
             .await
             {
@@ -1789,12 +1791,14 @@ async fn agent_cards_list_on(
 }
 
 /// PRD #2374: invoke action `action_id` of the card of agent `agent_id` in
-/// `pane_id` on deck `deck_id`, bound to the daemon process `instance_id`
-/// that listed it, so a successor that numbered an unrelated agent the same
-/// is sent nothing. The answer is the daemon's result as is — a refusal is
-/// `outcome: "refused"` with its code — or `refused` / `unsupported` for a
-/// deck whose daemon has no cards. `request_id` names the press, so a repeat
-/// sends nothing again.
+/// `pane_id` on deck `deck_id`. `instance_id` is the daemon process that
+/// listed the card and `action_token` the version of the action the user was
+/// shown; the shared client binds the call to that process, so a successor
+/// that numbered an unrelated agent the same is sent nothing, and the daemon
+/// refuses an action that changed since (`stale_action`). The answer is the
+/// daemon's result as is — a refusal is `outcome: "refused"` with its code —
+/// or `daemon_replaced` / `unsupported`. `request_id` names the press, so a
+/// repeat sends nothing again.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 async fn agent_card_invoke(
@@ -1804,30 +1808,38 @@ async fn agent_card_invoke(
     pane_id: String,
     agent_id: String,
     action_id: String,
+    action_token: String,
     confirm: bool,
     text: Option<String>,
     request_id: String,
-    instance_id: Option<String>,
+    instance_id: String,
 ) -> Result<dot_agent_deck::agent_cards::CardActionResult, String> {
     ensure_main_webview(&webview)?;
     let scope = crate::dto::DeckScope::resolve(Some(&deck_id))?;
     let daemon = state.daemon.trusted(scope.endpoint()).await?;
     daemon.require_compatible()?;
-    let client = match instance_id {
-        Some(id) => daemon.client.bound_to(Incarnation::from(Some(id))),
-        None => (*daemon.client).clone(),
+    let target = dot_agent_deck::agent_cards::CardActionTarget {
+        instance_id,
+        pane_id,
+        agent_id,
+        action_id,
+        action_token,
     };
-    let answer = client
-        .invoke_card_action(
-            &pane_id,
-            &agent_id,
-            &action_id,
-            &request_id,
-            confirm,
-            text.as_deref(),
-        )
+    let answer = match daemon
+        .client
+        .invoke_card_action(&target, &request_id, confirm, text.as_deref())
         .await
-        .map_err(|error| safe_message(error.to_string()))?;
+    {
+        Ok(answer) => answer,
+        Err(ClientError::DaemonRestarted | ClientError::DaemonUnnamed) => {
+            return Ok(dot_agent_deck::agent_cards::CardActionResult::refused(
+                &request_id,
+                dot_agent_deck::agent_cards::CODE_DAEMON_REPLACED,
+                "the deck's daemon was restarted after this card was read; nothing was sent",
+            ));
+        }
+        Err(error) => return Err(safe_message(error.to_string())),
+    };
     Ok(match answer {
         GatedQuery::Answered(result) => result,
         GatedQuery::Unsupported => dot_agent_deck::agent_cards::CardActionResult::refused(

@@ -3926,28 +3926,37 @@ impl DaemonClient {
             .ok_or_else(|| ClientError::Malformed("agent-card-catalog answered no catalog".into()))
     }
 
-    /// PRD #2374: invoke action `action_id` of the card of agent `agent_id`
-    /// in `pane_id`. A refusal is an answered [`crate::agent_cards::CardActionResult`]
-    /// with `outcome: "refused"`. Withheld like [`Self::list_agent_cards`].
+    /// PRD #2374: invoke one action of one card. `target` names the card as
+    /// `card list` showed it — the daemon process that listed it
+    /// (`instance_id`), its pane and agent generation, the action and the
+    /// `token` of the action definition shown — and this method binds the
+    /// connection to that daemon process itself, so no caller can send a
+    /// card's ids to a daemon that replaced it (review B3): a successor is
+    /// sent nothing and the call fails with [`ClientError::DaemonRestarted`].
+    /// The daemon checks the instance and the token again, refusing
+    /// `daemon_replaced` / `stale_action`. A refusal is an answered
+    /// [`crate::agent_cards::CardActionResult`] with `outcome: "refused"`.
+    /// Withheld like [`Self::list_agent_cards`].
     pub async fn invoke_card_action(
         &self,
-        pane_id: &str,
-        agent_id: &str,
-        action_id: &str,
+        target: &crate::agent_cards::CardActionTarget,
         request_id: &str,
         confirm: bool,
         text: Option<&str>,
     ) -> Result<GatedQuery<crate::agent_cards::CardActionResult>, ClientError> {
-        let Some((mut rd, mut wr)) = self.agent_cards_connection().await? else {
+        let bound = self.bound_to(Incarnation::from(Some(target.instance_id.clone())));
+        let Some((mut rd, mut wr)) = bound.agent_cards_connection().await? else {
             return Ok(GatedQuery::Unsupported);
         };
         let resp = issue_command(
             &mut rd,
             &mut wr,
             &AttachRequest::InvokeCardAction {
-                pane_id: pane_id.to_string(),
-                agent_id: agent_id.to_string(),
-                action_id: action_id.to_string(),
+                pane_id: target.pane_id.clone(),
+                agent_id: target.agent_id.clone(),
+                action_id: target.action_id.clone(),
+                action_token: target.action_token.clone(),
+                instance_id: target.instance_id.clone(),
                 request_id: request_id.to_string(),
                 confirm,
                 text: text.map(str::to_string),
@@ -4108,7 +4117,12 @@ impl DaemonClient {
     /// either side drops the socket.
     pub async fn subscribe_events(&self) -> Result<EventSubscription, ClientError> {
         let (mut rd, mut wr, incarnation) = self.admitted_connect_learning().await?;
-        let resp = issue_command(&mut rd, &mut wr, &AttachRequest::SubscribeEvents).await?;
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::SubscribeEvents { agent_cards: false },
+        )
+        .await?;
         if !resp.ok {
             return Err(ClientError::Server(
                 resp.error
@@ -4122,6 +4136,46 @@ impl DaemonClient {
         // subscription down before any events flow. Letting wr live until
         // EventSubscription drops means the daemon sees EOF exactly when
         // the client actually goes away.
+        Ok(EventSubscription {
+            rd,
+            _wr: wr,
+            incarnation,
+        })
+    }
+
+    /// PRD #2374 (review B1): [`Self::subscribe_events`], opted into the
+    /// agent-card doorbells when the daemon advertises
+    /// [`crate::daemon_protocol::CAP_AGENT_CARDS`] — read from the `Hello` on
+    /// the subscription's own connection on a gated or bound handle, and from
+    /// a fresh `Hello` otherwise. Against a daemon that does not, it is the
+    /// plain subscription, byte for byte. Only a client that reads cards asks:
+    /// a doorbell is an event an older reader would apply to a session.
+    pub async fn subscribe_events_with_agent_cards(
+        &self,
+    ) -> Result<EventSubscription, ClientError> {
+        let (mut rd, mut wr, caps, incarnation) = if self.protocol_gate || self.bound.is_some() {
+            let (rd, wr, caps, incarnation) = self.protocol_hello(true).await?;
+            (rd, wr, caps, Some(incarnation))
+        } else {
+            let caps = self.fresh_capabilities().await?;
+            let (rd, wr) = self.connect().await?;
+            (rd, wr, caps, None)
+        };
+        let agent_cards = caps.supports(crate::daemon_protocol::CAP_AGENT_CARDS);
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::SubscribeEvents { agent_cards },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error
+                    .unwrap_or_else(|| "subscribe-events failed".into()),
+            ));
+        }
+        // The write half stays alive with the subscription, for the reason
+        // `subscribe_events` gives.
         Ok(EventSubscription {
             rd,
             _wr: wr,
@@ -5379,9 +5433,13 @@ mod tests {
 
         let client = DaemonClient::new(socket);
         let (mut rd, mut wr) = client.connect().await.expect("connect");
-        let resp = issue_command(&mut rd, &mut wr, &AttachRequest::SubscribeEvents)
-            .await
-            .expect("the scripted daemon answers");
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::SubscribeEvents { agent_cards: false },
+        )
+        .await
+        .expect("the scripted daemon answers");
         assert!(resp.ok);
         wr.flush().await.expect("flush");
 
@@ -6675,6 +6733,35 @@ mod tests {
         });
     }
 
+    /// PRD #2374 (review B3) — `invoke_card_action` binds itself to the
+    /// daemon process that listed the card: against a daemon whose `Hello`
+    /// names another process, nothing follows the `Hello` and the call fails
+    /// as a restarted daemon, so a card read from daemon A can never act on
+    /// whatever daemon B numbered the same.
+    #[cfg(unix)]
+    #[test]
+    fn a_card_action_is_never_sent_to_a_daemon_that_replaced_the_lister() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        runtime.block_on(async {
+            let both = Some(
+                &[
+                    crate::daemon_protocol::CAP_AGENT_CARDS,
+                    crate::daemon_protocol::CAP_HELLO_FOLLOW_ON,
+                ][..],
+            );
+            let (answered, after_hello) = agent_card_request_on(both, 2, "successor").await;
+            assert!(!answered, "the successor's answer is never taken");
+            assert_eq!(after_hello, 0, "the successor is sent nothing");
+            let (answered, after_hello) = agent_card_request_on(both, 2, "test-instance").await;
+            assert!(answered, "the lister itself is asked");
+            assert_eq!(after_hello, 1);
+        });
+    }
+
     /// Run agent-card client method `method` (0 list, 1 catalog, 2 invoke)
     /// against a fake daemon advertising `advertised`; answer whether it was
     /// answered and how many frames followed a Hello on its connection.
@@ -6682,6 +6769,17 @@ mod tests {
     async fn agent_card_request_inner(
         advertised: Option<&'static [&'static str]>,
         method: usize,
+    ) -> (bool, usize) {
+        agent_card_request_on(advertised, method, "test-instance").await
+    }
+
+    /// [`agent_card_request_inner`] against a fake daemon whose `Hello` names
+    /// the process `instance`.
+    #[cfg(unix)]
+    async fn agent_card_request_on(
+        advertised: Option<&'static [&'static str]>,
+        method: usize,
+        instance: &'static str,
     ) -> (bool, usize) {
         let (dir, path, listener) = {
             let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -6709,6 +6807,7 @@ mod tests {
                         AttachResponse {
                             capabilities: advertised
                                 .map(|list| list.iter().map(|cap| cap.to_string()).collect()),
+                            instance_id: Some(instance.to_string()),
                             ..AttachResponse::hello(PROTOCOL_VERSION)
                         }
                     } else {
@@ -6756,7 +6855,18 @@ mod tests {
             ),
             _ => matches!(
                 client
-                    .invoke_card_action("p", "1", "merge", "r", false, None)
+                    .invoke_card_action(
+                        &crate::agent_cards::CardActionTarget {
+                            instance_id: "test-instance".into(),
+                            pane_id: "p".into(),
+                            agent_id: "1".into(),
+                            action_id: "merge".into(),
+                            action_token: "t".into(),
+                        },
+                        "r",
+                        false,
+                        None,
+                    )
                     .await,
                 Ok(GatedQuery::Answered(_))
             ),

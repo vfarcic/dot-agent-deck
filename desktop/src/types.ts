@@ -782,7 +782,29 @@ export interface AgentCardAction {
   source: "catalog" | "agent" | "deck" | string;
   enabled: boolean;
   disabled_reason: string | null;
+  /** The latest delivery of THIS definition of the action (its `token`). */
   last_delivery: AgentCardDelivery | null;
+  /**
+   * The daemon's name for this definition of the action (its label, exact
+   * prompt, confirmation and question). A press sends it, and the daemon
+   * refuses one whose action changed since (`stale_action`), so a press can
+   * only send the text that was shown.
+   */
+  token: string;
+}
+
+/** One action the user invoked on a card: what was sent, exactly, and what became of it. Kept after the report stops offering the action. */
+export interface AgentCardDeliveryRecord {
+  action_id: string;
+  label: string;
+  /** The exact text sent: the action's prompt, or the user's reply. */
+  text: string;
+  token: string;
+  outcome: "sent" | string;
+  message_id: string;
+  state: "queued" | "delivered" | "uncertain" | "not_delivered" | string;
+  detail: string | null;
+  at: string;
 }
 
 /** One agent's card. `key` is `<pane_id>/<agent_id>`; across decks key by `(deckId, instance_id, key)`. */
@@ -804,6 +826,8 @@ export interface AgentCardEntry {
   actions: AgentCardAction[];
   primary_action_id: string;
   facts: { source: "deck"; pull_request: unknown | null };
+  /** The actions invoked on this card, newest first (bounded by the daemon). */
+  recent_deliveries?: AgentCardDeliveryRecord[];
   revision: number;
   updated_at: string;
 }
@@ -815,6 +839,19 @@ export interface AgentCardsSnapshot {
   revision: number;
   entries: AgentCardEntry[];
   catalogErrors: string[];
+}
+
+/**
+ * How one card action is pressed: the `token` of the definition the user was
+ * shown (required — the daemon refuses another), `confirm` only after the
+ * user confirmed an action that asks for it, `text` only for `reply`, and the
+ * press's `requestId` (minted when absent).
+ */
+export interface CardActionOptions {
+  actionToken: string;
+  confirm?: boolean;
+  text?: string;
+  requestId?: string;
 }
 
 /** The card the user acted on. */
@@ -1821,7 +1858,7 @@ export interface DeckRuntimeState {
    */
   agentCards?: Readonly<Record<string, AgentCardsSnapshot>>;
   /** PRD #2374 — invoke one action of one card; the daemon resolves, refuses or performs it. */
-  invokeCardAction?: (target: AgentCardTarget, actionId: string, options?: { confirm?: boolean; text?: string; requestId?: string }) => Promise<CardActionResult>;
+  invokeCardAction?: (target: AgentCardTarget, actionId: string, options: CardActionOptions) => Promise<CardActionResult>;
   sendTerminalInput: (target: AgentTarget, data: string, precondition?: () => boolean) => Promise<void>;
   resizeTerminal: (target: AgentTarget, cols: number, rows: number) => Promise<void>;
   /**

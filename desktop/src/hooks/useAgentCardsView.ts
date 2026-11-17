@@ -1,6 +1,6 @@
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { actionBySpokenLabel, cardTarget, disabledReasonSentence, placeCards, placedCardKey, readOverviewMode, stepCard, writeOverviewMode, type CardOverlayStep, type CardResults, type CardStep, type OverviewMode, type PlacedCard } from "../lib/agentCards";
+import { actionBySpokenLabel, cardTarget, disabledReasonSentence, placeCards, placedCardKey, pruneCardResults, readOverviewMode, stepCard, writeOverviewMode, type CardOverlayStep, type CardResults, type CardStep, type OverviewMode, type PlacedCard } from "../lib/agentCards";
 import { newCardRequestId } from "../lib/bridge";
 import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
 import type { AgentCardRef, VoiceActionContext } from "../lib/voiceActions";
@@ -93,16 +93,30 @@ export function useAgentCardsView({ runtime, decks, openAgent }: {
     setStoredMode(next);
     writeOverviewMode(next);
   }, []);
+  /* The answers of actions no card offers any more go (audit F5); what the
+     daemon delivered stays on the card itself. */
+  useEffect(() => {
+    setResults((current) => pruneCardResults(current, placed));
+  }, [placed]);
   const invoke = runtime.invokeCardAction;
-  const send = useCallback((card: PlacedCard, action: AgentCardAction, options: { confirm?: boolean; text?: string }) => {
+  /* `token` is the version of the action the user was shown — the pressed
+     button's, or the reviewed step's — and the daemon sends nothing for any
+     other (review B2). */
+  const send = useCallback((card: PlacedCard, action: AgentCardAction, options: { confirm?: boolean; text?: string; token?: string }) => {
     const cardKey = placedCardKey(card);
-    const record = (answer: CardResults[string]) => setResults((current) => ({ ...current, [cardKey]: { ...current[cardKey], [action.id]: answer } }));
+    const actionToken = options.token ?? action.token;
+    const record = (answer: CardResults[string]) => setResults((current) => ({ ...current, [cardKey]: { ...current[cardKey], [actionToken]: answer } }));
     if (!invoke) {
       record({ outcome: "failed", message: "this app cannot reach the daemon for card actions" });
       return;
     }
     record({ outcome: "pending" });
-    void invoke(cardTarget(card), action.id, { ...options, requestId: newCardRequestId() }).then(
+    void invoke(cardTarget(card), action.id, {
+      actionToken,
+      ...(options.confirm ? { confirm: true } : {}),
+      ...(options.text !== undefined ? { text: options.text } : {}),
+      requestId: newCardRequestId(),
+    }).then(
       (answer) => record(answer),
       (cause: unknown) => record({ outcome: "failed", message: cause instanceof Error ? cause.message : String(cause) }),
     );
@@ -161,11 +175,13 @@ export function useAgentCardsView({ runtime, decks, openAgent }: {
         setOpen({ key: placedCardKey(card), name: card.entry.name, step: { kind: "reply" } });
         return undefined;
       }
-      if (action.confirm) {
-        setOpen({ key: placedCardKey(card), name: card.entry.name, step: { kind: "confirm", actionId: action.id } });
+      // A confirm action, a close, and any press from a control that showed
+      // only the action's label stop at a step showing exactly what it does.
+      if (action.confirm || wanted.review) {
+        setOpen({ key: placedCardKey(card), name: card.entry.name, step: { kind: "confirm", actionId: action.id, token: action.token } });
         return undefined;
       }
-      send(card, action, {});
+      send(card, action, wanted.token !== undefined ? { token: wanted.token } : {});
       return undefined;
     },
     replyToAgentCard: (ref, text) => {
@@ -175,7 +191,7 @@ export function useAgentCardsView({ runtime, decks, openAgent }: {
       const reply = card.entry.actions.find((candidate) => candidate.id === "reply");
       if (!reply) return `${displayText(card.entry.name, DISPLAY_LIMITS.name)}'s card takes no reply.`;
       if (!reply.enabled) return `Reply is disabled: ${disabledReasonSentence(reply.disabled_reason)}.`;
-      send(card, reply, { text });
+      send(card, reply, { text, token: reply.token });
       setOpen((current) => (current && current.key === placedCardKey(card) ? { key: current.key, name: current.name } : current));
       return undefined;
     },
@@ -186,7 +202,10 @@ export function useAgentCardsView({ runtime, decks, openAgent }: {
       const actionId = current.step.actionId;
       const action = card?.entry.actions.find((candidate) => candidate.id === actionId);
       if (!card || !action || !action.enabled) return;
-      send(card, action, { confirm: true });
+      // The definition reviewed is what is confirmed: a changed action is
+      // shown again for review, never sent on the old approval.
+      if (action.token !== current.step.token) return;
+      send(card, action, { confirm: action.confirm, token: current.step.token });
       setOpen({ key: current.key, name: current.name });
     },
     toggleOverviewRowMenu: (rowKey) => setRowMenu((current) => (current === rowKey ? undefined : rowKey)),

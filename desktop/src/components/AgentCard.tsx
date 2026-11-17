@@ -1,6 +1,6 @@
 import { BellRing } from "lucide-react";
 
-import { actionLabel, cardStatusLabel, deliverySentence, disabledReasonSentence, resultSentence, type CardResults, fieldValueText, multilineText, needsYouSentence, placedCardKey, primaryAction, promptPreview, type PlacedCard } from "../lib/agentCards";
+import { actionLabel, cardStatusLabel, deliverySentence, disabledReasonSentence, exactTextSegments, exactTextString, resultSentence, type CardResults, fieldValueText, needsYouSentence, placedCardKey, primaryAction, promptPreview, type PlacedCard } from "../lib/agentCards";
 import { DISPLAY_LIMITS, displayIdentity, displayText, displayTitle, domIdentity } from "../lib/displayText";
 import { VOICE_ACTIONS, type VoiceActionContext } from "../lib/voiceActions";
 
@@ -12,11 +12,31 @@ export function cardRef(card: PlacedCard): { deckId: string; agentId: string; in
   return { deckId: card.deckId, agentId: card.entry.agent_id, incarnation: card.entry.instance_id };
 }
 
+/** The agent-source label at the head of a card's fields, shown whether or not the card has a summary (review S2). */
+function SourceBadgeRow() {
+  return <div className="agent-card-fields-source" data-testid="agent-card-fields-source"><SourceBadge source="agent" /></div>;
+}
+
 /** A small label saying who a piece of text comes from: the agent's own word, or something the deck checked. */
 export function SourceBadge({ source }: { source: "agent" | "deck" }) {
   return source === "agent"
     ? <span className="card-source is-agent" title="Written by the agent; the deck did not check it">agent says</span>
     : <span className="card-source is-deck" title="Checked by the deck">deck checked</span>;
+}
+
+/**
+ * The exact text a prompt action sends, as it is sent: line breaks kept, and
+ * every invisible or reordering character shown as a marked escape rather
+ * than dropped or applied (audit F3). Rendered as text, never as markup.
+ */
+export function ExactText({ text }: { text: string }) {
+  return (
+    <>
+      {exactTextSegments(text).map((segment, index) => (segment.escaped
+        ? <span key={index} className="exact-text-escape" title="An invisible character, sent as is">{segment.shown}</span>
+        : <span key={index}>{segment.shown}</span>))}
+    </>
+  );
 }
 
 /**
@@ -56,8 +76,9 @@ export function AgentCard({ card, controls, results }: { card: PlacedCard; contr
       </header>
       {summary && <p className="agent-card-summary"><SourceBadge source="agent" /> <span>{summary}</span></p>}
       {entry.report === null && <p className="agent-card-summary is-empty">No report from this agent yet.</p>}
+      {fields.length > 0 && <SourceBadgeRow />}
       {fields.length > 0 && (
-        <dl className="agent-card-fields">
+        <dl className="agent-card-fields" aria-label="Fields the agent reported">
           {fields.map((field) => (
             <div key={field.name} className="agent-card-field" data-field={field.name}>
               <dt title={field.description ? displayTitle(field.description) : undefined}>{displayText(field.label, DISPLAY_LIMITS.name)}</dt>
@@ -74,11 +95,12 @@ export function AgentCard({ card, controls, results }: { card: PlacedCard; contr
             data-testid="agent-card-primary"
             disabled={!primary.enabled}
             title={primaryTitle}
-            onClick={() => VOICE_ACTIONS.runCardAction.run(controls, { ...cardRef(card), cardActionId: primary.id })}
+            onClick={() => VOICE_ACTIONS.runCardAction.run(controls, { ...cardRef(card), cardActionId: primary.id, cardActionToken: primary.token })}
           >{displayText(actionLabel(entry, primary), DISPLAY_LIMITS.name)}</button>
-          {primary.prompt && <small className="agent-card-prompt" title={multilineText(primary.prompt)}>{promptPreview(displayText(primary.prompt, DISPLAY_LIMITS.detail))}</small>}
+          {primary.source === "agent" && <span data-testid="agent-card-primary-source"><SourceBadge source="agent" /></span>}
+          {primary.prompt && <small className="agent-card-prompt" title={exactTextString(primary.prompt)}>{promptPreview(primary.prompt)}</small>}
           {!primary.enabled && <small className="agent-card-disabled">{disabledReasonSentence(primary.disabled_reason)}</small>}
-          {results?.[primary.id] && <small className="agent-card-result" role="status" data-testid="agent-card-result">{displayText(resultSentence(results[primary.id]), DISPLAY_LIMITS.detail)}</small>}
+          {results?.[primary.token] && <small className="agent-card-result" role="status" data-testid="agent-card-result">{displayText(resultSentence(results[primary.token]), DISPLAY_LIMITS.detail)}</small>}
           {primary.last_delivery && <small className="agent-card-delivery">{displayText(deliverySentence(primary.last_delivery), DISPLAY_LIMITS.message)}</small>}
         </div>
       )}

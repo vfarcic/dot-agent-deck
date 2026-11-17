@@ -14372,8 +14372,15 @@ The TUI renders no cards in this slice (the desktop app does; `docs/desktop/agen
 ##### agent-report/state/001 — An exited agent's card stays, stopped; a close removes it.
 - **Layer:** L2 headless, lane 1 (`tests/e2e_agent_cards.rs`).
 - **Agent:** one synthetic routing stand-in whose process is killed outside the deck; no real agent.
-- **Asserts:** after the exit the card stays with `status: "stopped"`, `stopped` first among its needs-you reasons and the report kept; every prompt action is `enabled: false` with `agent_stopped` and `card act` on one exits 1 `[action_disabled]`; `card act --action close --confirm` prints `Closed <name>.`, the card leaves `card list`, and an event subscriber sees an `agent_card` doorbell with `agent_card_removed`.
+- **Asserts:** after the exit the card stays with `status: "stopped"`, `stopped` first among its needs-you reasons and the report kept; every prompt action is `enabled: false` with `agent_stopped` and `card act` on one exits 1 `[action_disabled]`; `card act --action close --confirm` prints `Closed <name>.`, the card leaves `card list`, an event subscriber that opted into card doorbells sees an `agent_card` doorbell with `agent_card_removed`, and a plain subscriber (an older client's, the TUI's) is sent none.
 - **Does not assert:** the doorbell's timing bound or coalescing.
+- **Platform coverage:** mac+linux.
+
+##### agent-report/state/002 — A changed catalog applies to cards already published.
+- **Layer:** L2 headless, lane 1 (`tests/e2e_agent_cards.rs`).
+- **Agent:** one synthetic routing stand-in; no real agent.
+- **Asserts:** after a card suggesting `merge` and reporting `progress` as text, editing the user config to remove `merge` and redefine `progress` as a number makes `card list` stop offering `merge` without the agent publishing again, offer no prompt action without its text, and stop showing the value that no longer fits; `card act` on `merge` with the token listed before is `[unknown_action]` and posts nothing.
+- **Does not assert:** a custom action that collides with a later catalog name (the catalog's definition wins).
 - **Platform coverage:** mac+linux.
 
 #### agent-report/catalog
@@ -14397,8 +14404,29 @@ The TUI renders no cards in this slice (the desktop app does; `docs/desktop/agen
 ##### agent-report/actions/001 — A card's prompt action reaches only its own agent.
 - **Layer:** L2 headless, lane 1 (`tests/e2e_agent_cards.rs`).
 - **Agent:** a two-role synthetic routing team; no real agent.
-- **Asserts:** `card act` on the worker's `merge` prints `Sent to <name>: message m-… (queued).`, the worker's inbox holds that message bound to its generation with subject `card action: Merge it` and the catalog prompt, the orchestrator's inbox is unchanged, and the card's `last_delivery` names the message as `queued`; a confirm action is refused `[confirm_required]` posting nothing and sent with `--confirm`; `reply` needs text and sends it as typed; answering the question records `answered` and drops `question` from the reasons; an unknown action is `[unknown_action]`; a repeated request id is answered with the first result and posts once; `card act` from a pane is `[agent_caller]`; after `pane restart` the old card's key is `[stale_entry]` and nothing reaches the new generation.
+- **Asserts:** `card act` (with the action's token and the list's instance from `card list`) on the worker's `merge` prints `Sent to <name>: message m-… (queued).`, the worker's inbox holds that message bound to its generation with subject `card action: Merge it` and the catalog prompt, the orchestrator's inbox is unchanged, and the card's `last_delivery` names the message as `queued`; a confirm action is refused `[confirm_required]` posting nothing and sent with `--confirm`; `reply` needs text and sends it as typed; answering the question records `answered` and drops `question` from the reasons; an unknown action is `[unknown_action]`; a repeated request id is answered with the first result and posts once; `card act` from a pane is `[agent_caller]`; after `pane restart` the old card's key is `[stale_entry]` and nothing reaches the new generation. The agent's CLI runs without the daemon's user config: the daemon alone decides that `deploy` is a catalog action.
 - **Does not assert:** the agent acting on the message (`agent-report/live/001`).
+- **Platform coverage:** mac+linux.
+
+##### agent-report/actions/003 — A changed action sends nothing from the card the user read.
+- **Layer:** L2 headless, lane 1 (`tests/e2e_agent_cards.rs`).
+- **Agent:** one synthetic routing stand-in; no real agent.
+- **Asserts:** after the agent republishes a custom action's id with other text, `card act` with the token listed before is `[stale_action]`; so is a raw request with no token, and a confirm action whose prompt the user's catalog changed after the list; none of them posts anything; the token listed now sends the new text exactly and the replaced text never reaches the agent; a later report that drops the action leaves the delivery (action, message id, exact text) in the card's `recent_deliveries`.
+- **Does not assert:** the desktop's review step (`desktop` vitest `AgentCardsReview.test.tsx`).
+- **Platform coverage:** mac+linux.
+
+##### agent-report/actions/004 — A card listed by one daemon process acts on nothing under another.
+- **Layer:** L2 headless, lane 1 (`tests/e2e_agent_cards.rs`).
+- **Agent:** two synthetic routing stand-ins under two daemons that number them the same; no real agent.
+- **Asserts:** `card act` against the second daemon with the first daemon's instance id is `[daemon_replaced]` for a prompt action and for `close --confirm`; a raw request naming the first instance is refused `daemon_replaced` by the daemon itself; the second daemon's agent receives nothing and keeps its card.
+- **Does not assert:** a daemon restart on one socket (the client binds by the `Hello`'s instance id either way; `daemon_client` unit test `a_card_action_is_never_sent_to_a_daemon_that_replaced_the_lister`).
+- **Platform coverage:** mac+linux.
+
+##### agent-report/actions/005 — Overlapping repeats of one request post once.
+- **Layer:** L2 headless, lane 1 (`tests/e2e_agent_cards.rs`).
+- **Agent:** one synthetic routing stand-in; no real agent.
+- **Asserts:** six simultaneous `invoke-card-action` requests with one request id all answer the same result, and the agent's inbox gains exactly one message with the action's prompt.
+- **Does not assert:** a deterministic interleaving (the `agent_cards` unit test `one_request_id_runs_once_however_its_repeats_overlap` holds the first run open while the repeat arrives).
 - **Platform coverage:** mac+linux.
 
 ##### agent-report/actions/002 — Close and close-keeping-the-worktree act through the card.

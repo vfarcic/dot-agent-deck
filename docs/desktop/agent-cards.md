@@ -26,23 +26,26 @@ In the Cards view:
 - Cards are grouped as the daemon groups them: the agents a dispatcher started are one group, with the dispatcher's own card in it; the roles of an orchestration are another; agents in neither are grouped together as standalone. Each group's heading counts its agents and how many need you.
 - Within a group, the cards that need you come first. The order is the same everywhere you look at the cards, including the next and previous moves in the card overlay.
 - **Needs you** above the grid shows only the cards that need you. Press it again to see every card.
-- Each card has one main button, the action the agent most needs from you: the answer to its question, an action it suggested, or **Open** when it needs nothing. Under the button is the start of the exact text it sends, and hovering shows all of it. After you press it, the card says whether the message was sent and, later, whether the agent took it.
+- Each card has one main button, the action the agent most needs from you: the answer to its question, an action it suggested, or **Open** when it needs nothing. Under the button is the start of the exact text it sends, and hovering shows all of it. An action the agent wrote itself is marked **agent says**, as are its fields. After you press it, the card says whether the message was sent and, later, whether the agent took it.
 - With several daemons on the Dashboard, each daemon's cards are under its own name. A daemon whose version does not have cards keeps its usual table section.
 
-In the Table view, a row whose card needs you shows a bell next to the agent's name, and the row's **⋯** menu has **Show card**, which opens that agent's card, and the card's main action. Clicking the row itself still opens the agent's terminal, as before.
+In the Table view, a row whose card needs you shows a bell next to the agent's name, and the row's **⋯** menu has **Show card**, which opens that agent's card, and the card's main action. The menu shows only the action's name, so choosing it sends nothing yet: it opens the card at a step that shows exactly what the action sends, and you send it from there. Clicking the row itself still opens the agent's terminal, as before.
 
 ## The card overlay
 
-Click a card's name, or **Show card** in a row's menu, to open the card overlay. It shows everything on the card: the deck's status and pull request, the agent's report and every field, each question with its answers as buttons, and every action with the exact text it sends to the agent, why it is disabled when it is, and what happened to the last time you pressed it.
+Click a card's name, or **Show card** in a row's menu, to open the card overlay. It shows everything on the card: the deck's status and pull request, the agent's report and every field, each question with its answers as buttons, and every action with the exact text it sends to the agent, why it is disabled when it is, and what happened to the last time you pressed it. **Sent from this card** lists the last actions you sent the agent, each with the exact text and whether it was delivered, and keeps them after the agent's card stops offering those actions.
+
+The text an action sends is shown exactly as it is sent. Characters you could not otherwise see, such as a tab or a character that changes the direction of the text around it, are shown as a marked code like `\t` or `\u{202E}`, and nothing is left out.
 
 - **[** and **]**, or the arrow buttons, move to the previous and next card without closing the overlay. **n**, or **Next needing you**, jumps to the next card that needs you. **Escape** or the **×** closes it.
 - The overlay updates while it is open: when the agent publishes a new report or a message is delivered, you see it straight away. If the agent is closed while you look at its card, the overlay says "This agent was closed." and you can move on to the next card.
 - An action marked **Asks you to confirm first**, and both ways of closing the agent, show you exactly what will be sent or done and ask before doing it. Closing tells you what is still pending, such as an unanswered question or an open pull request.
+- If the agent changes an action while you are looking at it, the confirm step shows the new text, says it changed, and sends nothing until you confirm you have read it. A button pressed after the agent changed its action is refused, and nothing is sent; look at the card again and press it once more if you still want it.
 - **Reply** opens a box where you write your own message. It is sent to the agent exactly as you typed it.
 - **Open** opens the agent's terminal pane. **Close** closes the agent, and **Close, keep worktree** closes a dispatched agent but keeps its copy of the repository, when it has one.
 - Actions that send the agent a message are disabled while the agent is not running, and the overlay says so.
 
-An action is always sent to the agent whose card it is on, and only to that agent. If the agent was replaced (its pane restarted) after you opened its card, the action is refused rather than sent to the new one.
+An action is always sent to the agent whose card it is on, and only to that agent, with the text the card showed you. If the agent was replaced (its pane restarted) after you opened its card, or the deck's daemon was restarted, the action is refused rather than sent to whichever agent has its place now.
 
 ## By voice
 
@@ -101,6 +104,7 @@ always = false                     # optional: true offers it on every card, sug
 - An entry with a mistake (an unknown type, a missing description, a bad name) is skipped and the rest still apply. `dot-agent-deck card catalog` prints a warning for each one.
 - The actions **Reply**, **Open**, **Close** and **Close, keep worktree** are the deck's own and cannot be removed or changed.
 - A `[catalog]` table in a project's `.dot-agent-deck.toml` is not used yet. Only the user configuration file's applies.
+- Changes apply to cards agents already published. An action you remove from the catalog leaves every card, including those that suggested it. A field whose type you change is hidden on cards that reported a value of the old type until the agent reports it again.
 
 Agents can also report fields and actions that are not in the catalog. You see them marked **custom**; a custom field shows only in the overlay.
 
@@ -110,4 +114,10 @@ The cards are behind the `experimental` flag. Start the desktop app with `DOT_AG
 
 ## In the TUI
 
-The TUI does not show cards. Its dashboard keeps showing each agent's status as before. From any shell on the machine, `dot-agent-deck card list` prints every card as JSON, with the same status, needs-you reasons and actions the app shows, and `dot-agent-deck card act --entry <pane>/<agent> --action <action>` presses one action, adding `--confirm` for one that asks for confirmation and `--text` for **Reply**. Run `card act` from your own shell, not from an agent's pane: the deck refuses it there, so that one agent does not press another agent's buttons by mistake.
+The TUI does not show cards. Its dashboard keeps showing each agent's status as before. From any shell on the machine, `dot-agent-deck card list` prints every card as JSON, with the same status, needs-you reasons and actions the app shows, and `dot-agent-deck card act` presses one action:
+
+```sh
+dot-agent-deck card act --entry <key> --action <id> --token <token> --instance <instance_id>
+```
+
+Take every value from `card list`: the card's `key`, the action's `id` and `token`, and the list's `instance_id`. The token says which version of the action you read, so if the agent changed the action since, nothing is sent and the command says so; list the cards again. Add `--confirm` for an action that asks for confirmation and `--text` for **Reply**. Run `card act` from your own shell, not from an agent's pane: the deck refuses it there, so that one agent does not press another agent's buttons by mistake.

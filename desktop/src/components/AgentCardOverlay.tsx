@@ -2,11 +2,11 @@ import { useEffect, useState, type KeyboardEvent } from "react";
 import { BellRing, ChevronLeft, ChevronRight, X } from "lucide-react";
 
 import { OVERLAY_LAYER, useInertBackground } from "../hooks/useInertBackground";
-import { actionLabel, cardStatusLabel, deliverySentence, resultSentence, type CardOverlayStep, type CardResults, disabledReasonSentence, fieldValueText, linkOf, multilineText, needsYouSentence, reportStatusLabel, type PlacedCard } from "../lib/agentCards";
+import { actionLabel, cardStatusLabel, deliverySentence, formatClockTime, resultSentence, type CardOverlayStep, type CardResults, disabledReasonSentence, fieldValueText, linkOf, multilineText, needsYouSentence, reportStatusLabel, type PlacedCard } from "../lib/agentCards";
 import { DISPLAY_LIMITS, displayIdentity, displayText, displayTitle, domIdentity } from "../lib/displayText";
 import { VOICE_ACTIONS, type VoiceActionContext } from "../lib/voiceActions";
 import type { AgentCardAction } from "../types";
-import { cardRef, SourceBadge } from "./AgentCard";
+import { cardRef, ExactText, SourceBadge } from "./AgentCard";
 
 /** The members the overlay's controls dispatch through. */
 export type CardOverlayControls = Pick<VoiceActionContext, "showAgentCard" | "stepAgentCard" | "closeAgentCard" | "runCardAction" | "replyToAgentCard" | "confirmCardAction">;
@@ -52,6 +52,9 @@ export function AgentCardOverlay({ card, lastName, position, count, step, result
   const entry = card?.entry;
   const name = entry ? displayIdentity(entry.name, DISPLAY_LIMITS.name, entry.pane_id) : displayText(lastName, DISPLAY_LIMITS.name);
   const confirming = step?.kind === "confirm" && entry ? entry.actions.find((action) => action.id === step.actionId) : undefined;
+  /* The agent changed the action after this step opened: the step shows the
+     new text, sends nothing, and asks for a fresh review (review B2). */
+  const changed = confirming !== undefined && step?.kind === "confirm" && confirming.token !== step.token;
   const replyAction = entry?.actions.find((action) => action.id === "reply");
   const optionIds = new Set(entry?.questions.flatMap((question) => question.options.map((option) => option.action_id)) ?? []);
   const actions = entry?.actions.filter((action) => !optionIds.has(action.id)) ?? [];
@@ -91,13 +94,20 @@ export function AgentCardOverlay({ card, lastName, position, count, step, result
         {entry && card && confirming && (
           <div className="agent-card-confirm" role="alertdialog" aria-labelledby="agent-card-confirm-title" data-testid="agent-card-confirm">
             <h3 id="agent-card-confirm-title">{displayText(actionLabel(entry, confirming), DISPLAY_LIMITS.name)}?</h3>
+            {confirming.source === "agent" && <p className="agent-card-hint"><SourceBadge source="agent" /> The agent wrote this action and its text.</p>}
             {confirming.prompt
-              ? <><p>This sends {name} exactly:</p><blockquote className="agent-card-prompt-text">{multilineText(confirming.prompt)}</blockquote></>
+              ? <><p>This sends {name} exactly:</p><blockquote className="agent-card-prompt-text" data-testid="agent-card-confirm-prompt"><ExactText text={confirming.prompt} /></blockquote></>
               : <p>{confirming.kind === "close_keep_worktree" ? `This closes ${name} and keeps its worktree.` : confirming.kind === "close" ? `This closes ${name}.` : `This runs ${displayText(confirming.label, DISPLAY_LIMITS.name)} on ${name}.`}</p>}
             {confirming.confirm_detail && <p className="agent-card-confirm-detail">{displayText(confirming.confirm_detail, DISPLAY_LIMITS.detail)}</p>}
+            {changed && (
+              <p className="agent-card-changed" role="status" data-testid="agent-card-confirm-changed">
+                The agent changed this action while you were reviewing it. Nothing was sent; review the text above before sending it.
+                {" "}<button type="button" className="button secondary compact" data-testid="agent-card-confirm-review" onClick={() => VOICE_ACTIONS.runCardAction.run(controls, { ...cardRef(card), cardActionId: confirming.id, cardActionReview: true })}>I have reviewed the new text</button>
+              </p>
+            )}
             <div className="agent-card-confirm-buttons">
               <button type="button" className="button secondary" data-testid="agent-card-confirm-cancel" onClick={() => VOICE_ACTIONS.showAgentCard.run(controls, cardRef(card))}>Cancel</button>
-              <button type="button" className={`button ${confirming.kind === "prompt" ? "primary" : "danger"}`} data-testid="agent-card-confirm-send" disabled={!confirming.enabled || results[confirming.id]?.outcome === "pending"} onClick={() => VOICE_ACTIONS.confirmCardAction.run(controls)}>{confirming.kind === "prompt" ? "Send" : displayText(confirming.label, DISPLAY_LIMITS.name)}</button>
+              <button type="button" className={`button ${confirming.kind === "prompt" ? "primary" : "danger"}`} data-testid="agent-card-confirm-send" disabled={!confirming.enabled || changed || results[confirming.token]?.outcome === "pending"} onClick={() => VOICE_ACTIONS.confirmCardAction.run(controls)}>{confirming.kind === "prompt" ? "Send" : displayText(confirming.label, DISPLAY_LIMITS.name)}</button>
             </div>
           </div>
         )}
@@ -144,8 +154,8 @@ export function AgentCardOverlay({ card, lastName, position, count, step, result
                         const chosen = question.answered?.option_id === option.id;
                         return (
                           <div key={option.id} className="agent-card-action">
-                            <button type="button" className={`button ${chosen ? "primary" : "secondary"} compact`} data-testid="agent-card-option" disabled={!action || !action.enabled} title={action && !action.enabled ? `Disabled: ${disabledReasonSentence(action.disabled_reason)}` : undefined} onClick={() => VOICE_ACTIONS.runCardAction.run(controls, { ...cardRef(card), cardActionId: option.action_id })}>{displayText(option.label, DISPLAY_LIMITS.name)}{chosen ? " (answered)" : ""}</button>
-                            {action && <ActionDetails action={action} result={results[action.id]} />}
+                            <button type="button" className={`button ${chosen ? "primary" : "secondary"} compact`} data-testid="agent-card-option" disabled={!action || !action.enabled} title={action && !action.enabled ? `Disabled: ${disabledReasonSentence(action.disabled_reason)}` : undefined} onClick={() => VOICE_ACTIONS.runCardAction.run(controls, { ...cardRef(card), cardActionId: option.action_id, ...(action ? { cardActionToken: action.token } : {}) })}>{displayText(option.label, DISPLAY_LIMITS.name)}{chosen ? " (answered)" : ""}</button>
+                            {action && <ActionDetails action={action} result={results[action.token]} />}
                           </div>
                         );
                       })}
@@ -166,9 +176,9 @@ export function AgentCardOverlay({ card, lastName, position, count, step, result
                       data-testid={`agent-card-action-${domIdentity(action.id)}`}
                       disabled={!action.enabled}
                       title={!action.enabled ? `Disabled: ${disabledReasonSentence(action.disabled_reason)}` : undefined}
-                      onClick={() => VOICE_ACTIONS.runCardAction.run(controls, { ...cardRef(card), cardActionId: action.id })}
+                      onClick={() => VOICE_ACTIONS.runCardAction.run(controls, { ...cardRef(card), cardActionId: action.id, cardActionToken: action.token })}
                     >{displayText(action.label, DISPLAY_LIMITS.name)}{action.source === "agent" && <span className="card-custom" title="Suggested by the agent, not in the catalog">custom</span>}</button>
-                    <ActionDetails action={action} result={results[action.id]} />
+                    <ActionDetails action={action} result={results[action.token]} />
                   </div>
                 ))}
               </div>
@@ -189,8 +199,22 @@ export function AgentCardOverlay({ card, lastName, position, count, step, result
                 />
                 <div className="agent-card-reply-buttons">
                   <button type="button" className="button secondary compact" data-testid="agent-card-reply-cancel" onClick={() => VOICE_ACTIONS.showAgentCard.run(controls, cardRef(card))}>Cancel</button>
-                  <button type="button" className="button primary compact" data-testid="agent-card-reply-send" disabled={!replyAction.enabled || reply.trim() === "" || results.reply?.outcome === "pending"} onClick={() => VOICE_ACTIONS.replyToAgentCard.run(controls, { ...cardRef(card), cardReplyText: reply })}>Send reply</button>
+                  <button type="button" className="button primary compact" data-testid="agent-card-reply-send" disabled={!replyAction.enabled || reply.trim() === "" || results[replyAction.token]?.outcome === "pending"} onClick={() => VOICE_ACTIONS.replyToAgentCard.run(controls, { ...cardRef(card), cardReplyText: reply })}>Send reply</button>
                 </div>
+              </section>
+            )}
+
+            {(entry.recent_deliveries?.length ?? 0) > 0 && (
+              <section className="agent-card-section" aria-label="Sent from this card" data-testid="agent-card-deliveries">
+                <h3>Sent from this card <SourceBadge source="deck" /></h3>
+                <ol className="agent-card-deliveries">
+                  {entry.recent_deliveries!.map((delivery) => (
+                    <li key={delivery.message_id} className="agent-card-delivery-record" data-testid="agent-card-delivery-record" data-action={delivery.action_id}>
+                      <p><strong>{displayText(delivery.label, DISPLAY_LIMITS.name)}</strong>{" · "}<time dateTime={delivery.at}>{formatClockTime(delivery.at)}</time>{" · "}<span data-testid="agent-card-delivery-state">{displayText(deliverySentence(delivery), DISPLAY_LIMITS.message)}</span></p>
+                      <blockquote className="agent-card-prompt-text"><ExactText text={delivery.text} /></blockquote>
+                    </li>
+                  ))}
+                </ol>
               </section>
             )}
 
@@ -211,7 +235,7 @@ export function AgentCardOverlay({ card, lastName, position, count, step, result
 function ActionDetails({ action, result }: { action: AgentCardAction; result: CardResults[string] | undefined }) {
   return (
     <>
-      {action.prompt && <p className="agent-card-prompt-text" data-testid="agent-card-action-prompt">{multilineText(action.prompt)}</p>}
+      {action.prompt && <p className="agent-card-prompt-text" data-testid="agent-card-action-prompt"><ExactText text={action.prompt} /></p>}
       {action.text_input && <p className="agent-card-hint">Sends your own words.</p>}
       {action.kind === "open" && <p className="agent-card-hint">Opens the agent's terminal.</p>}
       {action.confirm && action.enabled && <p className="agent-card-hint">Asks you to confirm first.</p>}

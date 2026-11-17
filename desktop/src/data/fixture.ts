@@ -903,7 +903,7 @@ const DOCS_CARDS_TEAM = { id: "orchestration:docs-checkout", kind: "orchestratio
 function docsCardAction(id: string, overrides: Partial<AgentCardAction>): AgentCardAction {
   return {
     id, label: id, kind: "prompt", prompt: null, text_input: false, confirm: false, confirm_detail: null, icon: null,
-    placement: "card", custom: false, source: "catalog", enabled: true, disabled_reason: null, last_delivery: null, ...overrides,
+    placement: "card", custom: false, source: "catalog", enabled: true, disabled_reason: null, last_delivery: null, token: `docs-${id}`, ...overrides,
   };
 }
 

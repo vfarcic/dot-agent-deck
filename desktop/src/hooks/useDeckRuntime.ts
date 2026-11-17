@@ -15,7 +15,8 @@ import type { VoiceNumberedListDto } from "../lib/voiceNumbers";
 import type { UpgradeChoice, UpgradeEvent } from "../lib/upgrade";
 import type { QuestionSelectionDto, QuestionTextSlotDto, VoiceQuestionTarget } from "../lib/voiceQuestion";
 const EMPTY_TERMINAL_DATA: Record<string, TerminalBuffer> = {};
-import type { AgentCardsSnapshot, AgentCardTarget, AgentTarget, CleanupWarningEntry, DeckAction, DeckFleet, DeckListingOptions, DeckRuntimeState, DeckSnapshot, DesktopFeatures, InboxActionVerb, RuntimeMode, TerminalBuffer } from "../types";
+import { acceptCardsSnapshot, reconcileCards, type CardsConnection } from "../lib/agentCards";
+import type { AgentCardsSnapshot, AgentCardTarget, AgentTarget, CardActionOptions, CleanupWarningEntry, DeckAction, DeckFleet, DeckListingOptions, DeckRuntimeState, DeckSnapshot, DesktopFeatures, InboxActionVerb, RuntimeMode, TerminalBuffer } from "../types";
 
 /**
  * The snapshot a runtime starts with, before any deck has answered. Lifted out
@@ -537,12 +538,28 @@ export function useDeckRuntime(): DeckRuntimeState {
   */
   const [agentCards, setAgentCards] = useState<Readonly<Record<string, AgentCardsSnapshot>>>({});
   const cardsOffered = typeof bridge.agentCards === "function" || typeof bridge.subscribeAgentCards === "function";
+  /*
+    Review B6: every snapshot, pushed or read, is accepted only through
+    `acceptCardsSnapshot` against the deck's CURRENT connection — connected,
+    from the daemon process that connection names, and no older than the
+    revision held from that process. `cardsConnections` is that connection
+    per deck as of the last fleet seen; `cardsPushed` the last push per deck,
+    so a push that arrived before the fleet named its process is taken once
+    the fleet catches up.
+  */
+  const cardsConnections = useRef(new Map<string, CardsConnection>());
+  const cardsPushed = useRef(new Map<string, AgentCardsSnapshot>());
+  const offerCards = useCallback((next: AgentCardsSnapshot) => {
+    setAgentCards((current) => (acceptCardsSnapshot(current[next.deckId], next, cardsConnections.current.get(next.deckId)) ? { ...current, [next.deckId]: next } : current));
+  }, []);
   useEffect(() => {
     if (typeof bridge.subscribeAgentCards !== "function") return;
     let active = true;
     let unsubscribe: (() => void) | undefined;
     void bridge.subscribeAgentCards((next) => {
-      if (active) setAgentCards((current) => ({ ...current, [next.deckId]: next }));
+      if (!active) return;
+      cardsPushed.current.set(next.deckId, next);
+      offerCards(next);
     }).then((stop) => {
       if (active) unsubscribe = stop;
       else stop();
@@ -551,30 +568,50 @@ export function useDeckRuntime(): DeckRuntimeState {
       active = false;
       unsubscribe?.();
     };
-  }, [bridge]);
-  const cardsConnected = useRef(new Set<string>());
+  }, [bridge, offerCards]);
   useEffect(() => {
-    const connected = new Set(fleet.flatMap((deck) => (deck.connection.status === "connected" && deck.connection.deckId !== undefined ? [deck.connection.deckId] : [])));
-    const arrived = [...connected].filter((deckId) => !cardsConnected.current.has(deckId));
-    cardsConnected.current = connected;
-    // A deck that left the fleet, or stopped answering, shows no stale cards.
+    const previous = cardsConnections.current;
+    const connections = new Map<string, CardsConnection>();
+    for (const deck of fleet) {
+      if (deck.connection.deckId === undefined) continue;
+      connections.set(deck.connection.deckId, { connected: deck.connection.status === "connected", ...(deck.connection.incarnation !== undefined ? { incarnation: deck.connection.incarnation } : {}) });
+    }
+    cardsConnections.current = connections;
+    // A deck that newly connected, or whose connection now names another
+    // daemon process although it stayed connected, is read again.
+    const arrived = [...connections].filter(([deckId, connection]) => {
+      if (!connection.connected) return false;
+      const before = previous.get(deckId);
+      return !before?.connected || before.incarnation !== connection.incarnation;
+    }).map(([deckId]) => deckId);
+    for (const deckId of [...cardsPushed.current.keys()]) if (!connections.get(deckId)?.connected) cardsPushed.current.delete(deckId);
+    // A deck that left the fleet, stopped answering or was replaced shows no
+    // stale cards; a push held back for want of the fleet is taken now.
     setAgentCards((current) => {
-      const kept = Object.entries(current).filter(([deckId]) => connected.has(deckId));
-      return kept.length === Object.keys(current).length ? current : Object.fromEntries(kept);
+      let next = reconcileCards(current, connections);
+      for (const [deckId, pushed] of cardsPushed.current) {
+        if (acceptCardsSnapshot(next[deckId], pushed, connections.get(deckId))) next = { ...next, [deckId]: pushed };
+      }
+      return next;
     });
     if (typeof bridge.agentCards !== "function") return;
     for (const deckId of arrived) {
+      // The read is bound to the connection it was asked under: an answer
+      // that lands after the deck reconnected to another process is dropped.
+      const askedOf = connections.get(deckId)?.incarnation;
       void bridge.agentCards(deckId).then((snapshot) => {
-        if (!cardsConnected.current.has(deckId)) return;
-        setAgentCards((current) => {
-          if (snapshot) return current[deckId] && current[deckId].instanceId === snapshot.instanceId && current[deckId].revision > snapshot.revision ? current : { ...current, [deckId]: snapshot };
-          return deckId in current ? Object.fromEntries(Object.entries(current).filter(([id]) => id !== deckId)) : current;
-        });
+        const now = cardsConnections.current.get(deckId);
+        if (!now?.connected || now.incarnation !== askedOf) return;
+        if (snapshot) {
+          offerCards(snapshot);
+          return;
+        }
+        setAgentCards((current) => (deckId in current ? Object.fromEntries(Object.entries(current).filter(([id]) => id !== deckId)) : current));
       }, () => undefined);
     }
-  }, [bridge, fleet]);
+  }, [bridge, fleet, offerCards]);
   const invokeCardAction = useMemo(() => (typeof bridge.invokeCardAction === "function"
-    ? (target: AgentCardTarget, actionId: string, options?: { confirm?: boolean; text?: string; requestId?: string }) => bridge.invokeCardAction!(target, actionId, options)
+    ? (target: AgentCardTarget, actionId: string, options: CardActionOptions) => bridge.invokeCardAction!(target, actionId, options)
     : undefined), [bridge]);
 
   // Issue #1198: the app's experimental surfaces, asked ONCE per bridge. The

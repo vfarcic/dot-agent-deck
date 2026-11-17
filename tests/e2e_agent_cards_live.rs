@@ -192,6 +192,18 @@ fn live_001_a_real_agent_publishes_its_card_and_acts_on_a_card_action() {
     );
 
     phase("invoking touch-sentinel");
+    // `card act` names the version of the action the user read and the
+    // daemon process that listed it, both from the card as listed.
+    let token = published["actions"]
+        .as_array()
+        .and_then(|a| a.iter().find(|a| a["id"] == "touch-sentinel"))
+        .and_then(|a| a["token"].as_str())
+        .expect("the listed action's token")
+        .to_string();
+    let instance = published["instance_id"]
+        .as_str()
+        .expect("the card's instance id")
+        .to_string();
     let out = user_cli(
         &deck,
         &[
@@ -201,6 +213,10 @@ fn live_001_a_real_agent_publishes_its_card_and_acts_on_a_card_action() {
             &key,
             "--action",
             "touch-sentinel",
+            "--token",
+            &token,
+            "--instance",
+            &instance,
             "--json",
         ],
     );
@@ -224,17 +240,23 @@ fn live_001_a_real_agent_publishes_its_card_and_acts_on_a_card_action() {
         repo.display(),
         deck.snapshot_grid()
     );
-    // A publish replaces the whole card, so an action shows its delivery only
-    // while the card still offers it: the action's prompt has the agent keep
-    // suggesting it in its `done` publish.
+    // What was sent stays on the card whatever the agent publishes next
+    // (`recent_deliveries`); the action's prompt also has the agent keep
+    // suggesting it, so the action shows the delivery as its own too.
     phase("waiting for delivered and done");
     let done = wait_card(&deck, &key, "recorded the delivery and turned done", |e| {
         e["report"]["status"] == "done"
+            && e["recent_deliveries"].as_array().is_some_and(|d| {
+                d.iter().any(|d| {
+                    d["action_id"] == "touch-sentinel"
+                        && d["message_id"] == message_id.as_str()
+                        && d["state"] == "delivered"
+                })
+            })
             && e["actions"].as_array().is_some_and(|a| {
                 a.iter().any(|a| {
                     a["id"] == "touch-sentinel"
                         && a["last_delivery"]["message_id"] == message_id.as_str()
-                        && a["last_delivery"]["state"] == "delivered"
                 })
             })
     });

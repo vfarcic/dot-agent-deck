@@ -69,7 +69,7 @@ const INSTANCE = "daemon-instance-voice";
 function action(id: string, overrides: Partial<AgentCardAction> = {}): AgentCardAction {
   return {
     id, label: id, kind: "prompt", prompt: `Do ${id}.`, text_input: false, confirm: false, confirm_detail: null, icon: null,
-    placement: "card", custom: false, source: "catalog", enabled: true, disabled_reason: null, last_delivery: null, ...overrides,
+    placement: "card", custom: false, source: "catalog", enabled: true, disabled_reason: null, last_delivery: null, token: `tok-${id}`, ...overrides,
   };
 }
 

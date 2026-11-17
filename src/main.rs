@@ -940,7 +940,9 @@ enum CardAction {
         json: bool,
     },
     /// Invoke one action of one card (what the desktop app's buttons do). Runs
-    /// from the user's shell, not from an agent's pane.
+    /// from the user's shell, not from an agent's pane. Every value comes from
+    /// `card list`: the card's key, the action's id and token, and the list's
+    /// instance_id.
     Act {
         /// The card, as `card list` keys it: <PANE_ID>/<AGENT_ID>.
         #[arg(long, value_name = "PANE_ID/AGENT_ID")]
@@ -948,6 +950,15 @@ enum CardAction {
         /// The action id, as `card list` shows it.
         #[arg(long, value_name = "ACTION_ID")]
         action: String,
+        /// The action's `token`, as `card list` shows it: the version of the
+        /// action you reviewed. If the agent changed the action since, nothing
+        /// is sent ([stale_action]).
+        #[arg(long, value_name = "TOKEN")]
+        token: String,
+        /// The list's `instance_id`: the deck daemon that listed the card. If
+        /// the daemon was restarted since, nothing is sent ([daemon_replaced]).
+        #[arg(long = "instance", value_name = "INSTANCE_ID")]
+        instance: String,
         /// Confirm an action that asks for confirmation.
         #[arg(long)]
         confirm: bool,
@@ -4268,16 +4279,19 @@ fn run_card_cli(action: CardAction) -> ExitCode {
             actions,
             clear,
             json,
-        } => cli::run_publish(&cli::PublishArgs {
-            file,
-            format: format.as_deref().and_then(cli::ReportFormat::parse),
-            status,
-            summary,
-            fields,
-            actions,
-            clear,
-            json,
-        }),
+        } => cli::run_publish(
+            &cli::PublishArgs {
+                file,
+                format: format.as_deref().and_then(cli::ReportFormat::parse),
+                status,
+                summary,
+                fields,
+                actions,
+                clear,
+                json,
+            },
+            daemon_card_catalog,
+        ),
         CardAction::List => run_card_attach(|client| async move { cli::run_list(&client).await }),
         CardAction::Catalog { json } => {
             run_card_attach(move |client| async move { cli::run_catalog(&client, json).await })
@@ -4285,6 +4299,8 @@ fn run_card_cli(action: CardAction) -> ExitCode {
         CardAction::Act {
             entry,
             action,
+            token,
+            instance,
             confirm,
             text,
             text_file,
@@ -4293,6 +4309,8 @@ fn run_card_cli(action: CardAction) -> ExitCode {
             let args = cli::ActArgs {
                 entry,
                 action,
+                token,
+                instance,
                 confirm,
                 text,
                 text_file,
@@ -4305,6 +4323,22 @@ fn run_card_cli(action: CardAction) -> ExitCode {
         }
     };
     print_cli_output(output)
+}
+
+/// The catalog the running daemon resolves cards with, for typing `card
+/// publish --field` values; `None` when it cannot say.
+#[tokio::main]
+async fn daemon_card_catalog() -> Option<dot_agent_deck::card_catalog::ResolvedCatalog> {
+    let client = DaemonClient::new(client_attach_socket_path());
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.agent_card_catalog(),
+    )
+    .await
+    {
+        Ok(Ok(dot_agent_deck::daemon_client::GatedQuery::Answered(catalog))) => Some(catalog),
+        _ => None,
+    }
 }
 
 /// Run one `card` subcommand against the attach socket. Connect-only, like

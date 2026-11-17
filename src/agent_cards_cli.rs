@@ -143,10 +143,14 @@ pub fn format_of(path: &str, format: Option<ReportFormat>) -> ReportFormat {
 }
 
 /// Build the report `card publish` sends from its arguments, reading
-/// `--file` (or stdin for `-`), and check it against `catalog`.
+/// `--file` (or stdin for `-`), and check what does not depend on a catalog.
+/// Which names are catalog entries, and so what their values must be, is the
+/// daemon's to decide against the catalog it resolves cards with (product
+/// decision (b)): `catalog` is that daemon's catalog when it could be read,
+/// and is used only to type `--field NAME=VALUE` values.
 pub fn build_report(
     args: &PublishArgs,
-    catalog: &ResolvedCatalog,
+    catalog: Option<&ResolvedCatalog>,
     stdin: impl Read,
 ) -> Result<AgentReport, ReportError> {
     let report = if args.clear {
@@ -169,7 +173,7 @@ pub fn build_report(
     } else {
         report_from_flags(args, catalog)?
     };
-    report.validate(catalog)?;
+    report.validate_schema()?;
     Ok(report)
 }
 
@@ -182,7 +186,7 @@ fn invalid(message: impl Into<String>) -> ReportError {
 
 fn report_from_flags(
     args: &PublishArgs,
-    catalog: &ResolvedCatalog,
+    catalog: Option<&ResolvedCatalog>,
 ) -> Result<AgentReport, ReportError> {
     let status = match &args.status {
         None => None,
@@ -197,7 +201,7 @@ fn report_from_flags(
         let Some((name, value)) = raw.split_once('=') else {
             return Err(invalid(format!("--field {raw:?} is not NAME=VALUE")));
         };
-        let field_type = catalog.field(name).map(|f| f.field_type);
+        let field_type = catalog.and_then(|c| c.field(name)).map(|f| f.field_type);
         let value = match field_type {
             Some(FieldType::Number) => {
                 let n: f64 = value
@@ -227,20 +231,16 @@ fn report_from_flags(
             label: None,
         });
     }
-    let mut actions = Vec::new();
-    for name in &args.actions {
-        if catalog.action(name).is_none() {
-            return Err(invalid(format!(
-                "action {name:?} is not in the catalog; suggest a custom action with --file"
-            )));
-        }
-        actions.push(ReportAction {
+    let actions = args
+        .actions
+        .iter()
+        .map(|name| ReportAction {
             name: name.clone(),
             label: None,
             prompt: None,
             confirm: None,
-        });
-    }
+        })
+        .collect();
     Ok(AgentReport {
         status,
         summary: args.summary.clone(),
@@ -332,8 +332,14 @@ pub fn publish_output(sent: crate::hook::Gated, json: bool) -> CliOutput {
     }
 }
 
-/// `card publish`.
-pub fn run_publish(args: &PublishArgs) -> CliOutput {
+/// `card publish`. `daemon_catalog` asks the running daemon for the catalog
+/// it resolves cards with; it is called only when `--field` flags need their
+/// values typed, and answers `None` when the daemon could not say, when every
+/// value is sent as text and the daemon's own check decides.
+pub fn run_publish(
+    args: &PublishArgs,
+    daemon_catalog: impl FnOnce() -> Option<ResolvedCatalog>,
+) -> CliOutput {
     let Some(identity) = pane_identity() else {
         return error(
             "card publish runs inside a dot-agent-deck pane; DOT_AGENT_DECK_PANE_ID is not set.",
@@ -341,8 +347,10 @@ pub fn run_publish(args: &PublishArgs) -> CliOutput {
             EXIT_REFUSED,
         );
     };
-    let catalog = crate::card_catalog::resolve_from_user_config();
-    let report = match build_report(args, &catalog, std::io::stdin()) {
+    let catalog = (args.file.is_none() && !args.clear && !args.fields.is_empty())
+        .then(daemon_catalog)
+        .flatten();
+    let report = match build_report(args, catalog.as_ref(), std::io::stdin()) {
         Ok(report) => report,
         Err(e) => {
             return error(
@@ -422,6 +430,10 @@ pub async fn run_catalog(client: &DaemonClient, json: bool) -> CliOutput {
 pub struct ActArgs {
     pub entry: String,
     pub action: String,
+    /// The action's `token` from `card list`.
+    pub token: String,
+    /// The list's `instance_id`: the daemon process that listed the card.
+    pub instance: String,
     pub confirm: bool,
     pub text: Option<String>,
     pub text_file: Option<String>,
@@ -506,19 +518,24 @@ pub async fn run_act(
         (None, None) => None,
     };
     let request_id = new_request_id();
+    let target = crate::agent_cards::CardActionTarget {
+        instance_id: args.instance.clone(),
+        pane_id: pane_id.to_string(),
+        agent_id: agent_id.to_string(),
+        action_id: args.action.clone(),
+        action_token: args.token.clone(),
+    };
     match client
-        .invoke_card_action(
-            pane_id,
-            agent_id,
-            &args.action,
-            &request_id,
-            args.confirm,
-            text.as_deref(),
-        )
+        .invoke_card_action(&target, &request_id, args.confirm, text.as_deref())
         .await
     {
         Ok(GatedQuery::Answered(result)) => act_output(&result, args.json),
         Ok(GatedQuery::Unsupported) => unsupported("act on cards"),
+        Err(ClientError::DaemonRestarted | ClientError::DaemonUnnamed) => error(
+            "the deck's daemon was restarted after this card was read; list the cards again",
+            crate::agent_cards::CODE_DAEMON_REPLACED,
+            EXIT_REFUSED,
+        ),
         Err(e) => client_error(e),
     }
 }
@@ -540,51 +557,72 @@ mod tests {
             actions: vec!["merge".into()],
             ..PublishArgs::default()
         };
-        let report = build_report(&args, &catalog, std::io::empty()).unwrap();
+        let report = build_report(&args, Some(&catalog), std::io::empty()).unwrap();
         assert_eq!(report.status, Some(ReportStatus::Waiting));
         assert_eq!(report.fields[0].value, serde_json::json!("a=b"));
         assert_eq!(report.fields[1].value, serde_json::json!(42.0));
         assert_eq!(report.actions[0].name, "merge");
-        let bad = PublishArgs {
-            actions: vec!["zap".into()],
-            ..PublishArgs::default()
-        };
-        assert_eq!(
-            build_report(&bad, &catalog, std::io::empty())
-                .unwrap_err()
-                .code,
-            CODE_REPORT_INVALID
-        );
         let list = PublishArgs {
             fields: vec!["links=x".into()],
             ..PublishArgs::default()
         };
-        assert!(build_report(&list, &catalog, std::io::empty()).is_err());
+        assert!(build_report(&list, Some(&catalog), std::io::empty()).is_err());
         let clear = PublishArgs {
             clear: true,
             ..PublishArgs::default()
         };
         assert_eq!(
-            build_report(&clear, &catalog, std::io::empty()).unwrap(),
+            build_report(&clear, Some(&catalog), std::io::empty()).unwrap(),
             AgentReport::default()
         );
     }
 
+    /// Product decision (b): catalog membership is the daemon's to decide.
+    /// The CLI sends a suggestion of a name its own environment does not
+    /// know, a catalog-only suggestion with no label, and a report-typed
+    /// field, refusing only what no catalog could accept.
+    #[test]
+    fn the_cli_leaves_catalog_membership_to_the_daemon() {
+        let flags = PublishArgs {
+            fields: vec!["build-time=42".into()],
+            actions: vec!["ship".into(), "zap".into()],
+            ..PublishArgs::default()
+        };
+        let report = build_report(&flags, None, std::io::empty()).unwrap();
+        assert_eq!(report.fields[0].value, serde_json::json!("42"));
+        assert_eq!(report.actions.len(), 2);
+        let file = PublishArgs {
+            file: Some("-".into()),
+            ..PublishArgs::default()
+        };
+        let raw = r#"{"fields": [{"name": "risk", "value": 3}], "actions": [{"name": "deploy"}]}"#;
+        assert!(build_report(&file, None, raw.as_bytes()).is_ok());
+        let confirm =
+            r#"{"actions": [{"name": "zap", "label": "Zap", "prompt": "p", "confirm": true}]}"#;
+        assert_eq!(
+            build_report(&file, None, confirm.as_bytes())
+                .unwrap_err()
+                .code,
+            CODE_REPORT_INVALID
+        );
+        let reserved = r#"{"actions": [{"name": "close"}]}"#;
+        assert!(build_report(&file, None, reserved.as_bytes()).is_err());
+    }
+
     #[test]
     fn stdin_reads_json_unless_toml_is_asked() {
-        let catalog = resolve(None);
         let args = PublishArgs {
             file: Some("-".into()),
             ..PublishArgs::default()
         };
-        let report = build_report(&args, &catalog, r#"{"summary": "hi"}"#.as_bytes()).unwrap();
+        let report = build_report(&args, None, r#"{"summary": "hi"}"#.as_bytes()).unwrap();
         assert_eq!(report.summary.as_deref(), Some("hi"));
         let args = PublishArgs {
             file: Some("-".into()),
             format: Some(ReportFormat::Toml),
             ..PublishArgs::default()
         };
-        let report = build_report(&args, &catalog, "summary = \"hi\"\n".as_bytes()).unwrap();
+        let report = build_report(&args, None, "summary = \"hi\"\n".as_bytes()).unwrap();
         assert_eq!(report.summary.as_deref(), Some("hi"));
         assert_eq!(format_of("r.toml", None), ReportFormat::Toml);
         assert_eq!(format_of("r.json", None), ReportFormat::Json);

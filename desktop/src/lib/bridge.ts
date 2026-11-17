@@ -47,6 +47,7 @@ import type { HandoffEdge,
   AgentCardEntry,
   AgentCardsSnapshot,
   AgentCardTarget,
+  CardActionOptions,
   CardActionResult,
   DisconnectedReason,
   EvidenceItem,
@@ -2393,12 +2394,15 @@ export interface DeckBridge {
   subscribeAgentCards?(listener: (snapshot: AgentCardsSnapshot) => void): Promise<Unsubscribe>;
   /**
    * PRD #2374 — invoke one action of one card (`agent_card_invoke`). The
-   * daemon resolves, refuses and performs it; `confirm` only after the user
-   * confirmed an action whose `confirm` is set, `text` only for `reply`.
-   * `requestId` names the press (one is minted when absent), so repeating it
-   * sends nothing again.
+   * daemon resolves, refuses and performs it; `actionToken` is the version of
+   * the action the user was shown, and the daemon refuses a changed one
+   * (`stale_action`); `confirm` only after the user confirmed an action whose
+   * `confirm` is set, `text` only for `reply`. `requestId` names the press
+   * (one is minted when absent), so repeating it sends nothing again. The
+   * call is bound to the daemon process that listed the card
+   * (`target.instanceId`): a successor is sent nothing (`daemon_replaced`).
    */
-  invokeCardAction?(target: AgentCardTarget, actionId: string, options?: { confirm?: boolean; text?: string; requestId?: string }): Promise<CardActionResult>;
+  invokeCardAction?(target: AgentCardTarget, actionId: string, options: CardActionOptions): Promise<CardActionResult>;
   dispose(): Promise<void>;
 }
 
@@ -3197,7 +3201,7 @@ class FixtureDeckBridge implements DeckBridge {
     return () => undefined;
   }
   /** The preview answers a card action as a daemon that queued it would; nothing changes in the fixture's state. */
-  async invokeCardAction(_target: AgentCardTarget, actionId: string, options: { confirm?: boolean; text?: string; requestId?: string } = {}): Promise<CardActionResult> {
+  async invokeCardAction(_target: AgentCardTarget, actionId: string, options: CardActionOptions): Promise<CardActionResult> {
     if (actionId === "close" || actionId === "close-keep-worktree") return { request_id: options.requestId ?? newCardRequestId(), outcome: "refused", code: "client_side_action", message: "the preview closes no agent" };
     return { request_id: options.requestId ?? newCardRequestId(), outcome: "sent", message_id: "m-fixture-card" };
   }
@@ -5953,17 +5957,18 @@ export class TauriDeckBridge implements DeckBridge {
     });
   }
 
-  async invokeCardAction(target: AgentCardTarget, actionId: string, options: { confirm?: boolean; text?: string; requestId?: string } = {}): Promise<CardActionResult> {
+  async invokeCardAction(target: AgentCardTarget, actionId: string, options: CardActionOptions): Promise<CardActionResult> {
     const invoke = await this.getInvoke();
     return invoke<CardActionResult>("agent_card_invoke", {
       deckId: target.deckId,
       paneId: target.paneId,
       agentId: target.agentId,
       actionId,
+      actionToken: options.actionToken,
       confirm: options.confirm === true,
       text: options.text ?? null,
       requestId: options.requestId ?? newCardRequestId(),
-      instanceId: target.instanceId || null,
+      instanceId: target.instanceId,
     });
   }
 

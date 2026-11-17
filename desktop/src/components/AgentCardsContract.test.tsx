@@ -41,6 +41,7 @@ function action(id: string, overrides: Partial<AgentCardAction> = {}): AgentCard
     enabled: true,
     disabled_reason: null,
     last_delivery: null,
+    token: `tok-${id}`,
     ...overrides,
   };
 }

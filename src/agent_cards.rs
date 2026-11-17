@@ -65,6 +65,26 @@ pub const MAX_REPLY_TEXT_BYTES: usize = 16 * 1024;
 pub const REQUEST_ID_MEMORY: Duration = Duration::from_secs(10 * 60);
 /// The most request ids remembered at once.
 const MAX_REMEMBERED_REQUESTS: usize = 1024;
+/// The most bytes the remembered request ids and their answers may hold
+/// together, besides their count (audit F4).
+const MAX_REMEMBERED_BYTES: usize = 1024 * 1024;
+/// The longest `request_id` a client may name: `[A-Za-z0-9._:-]`, 1 to 128
+/// bytes. A longer or odd one is refused before anything is remembered.
+pub const MAX_REQUEST_ID_BYTES: usize = 128;
+/// The longest pane id, agent id, action id, action token or instance id an
+/// `invoke-card-action` may carry.
+pub const MAX_REQUEST_FIELD_BYTES: usize = 256;
+/// The longest refusal sentence a result carries.
+const MAX_RESULT_MESSAGE_CHARS: usize = 1000;
+/// How many recent deliveries an entry keeps, newest first (product decision
+/// (a): a delivery's result outlives the report that offered the action).
+pub const MAX_RECENT_DELIVERIES: usize = 16;
+/// The most text (labels and the exact texts sent) an entry's recent
+/// deliveries may hold together; the oldest go first beyond it.
+pub const MAX_RECENT_DELIVERY_BYTES: usize = 64 * 1024;
+/// How many times a refresh gathers again when a publish or a delivery
+/// changed the store while it was gathering (review B4).
+const REFRESH_ATTEMPTS: usize = 3;
 /// At most this many doorbells per entry per second (4 per second).
 const DOORBELL_MIN_GAP: Duration = Duration::from_millis(250);
 /// How often the daemon's watcher recomputes the entries while anyone is
@@ -87,6 +107,20 @@ pub const CODE_CLIENT_SIDE_ACTION: &str = "client_side_action";
 pub const CODE_DELIVERY_REFUSED: &str = "delivery_refused";
 pub const CODE_CLOSE_FAILED: &str = "close_failed";
 pub const CODE_NOT_ATTESTED: &str = "not_attested";
+/// The action's definition changed after the card was read (its prompt, its
+/// label, whether it asks for confirmation, or the question it answers), or
+/// the request named no definition token: nothing was sent. List the cards
+/// again and review the action as it is now (review B2, audit F1).
+pub const CODE_STALE_ACTION: &str = "stale_action";
+/// The request names a daemon process other than the one answering: the
+/// deck's daemon was replaced after the card was read, and its agent ids may
+/// name unrelated agents now (review B3).
+pub const CODE_DAEMON_REPLACED: &str = "daemon_replaced";
+/// The `request_id` or another identifier in the request is missing, too
+/// long or malformed (audit F4).
+pub const CODE_REQUEST_INVALID: &str = "request_invalid";
+/// The `request_id` was already used for a different request (audit F6).
+pub const CODE_REQUEST_REUSED: &str = "request_reused";
 /// The `disabled_reason` of a prompt action whose agent is not running.
 pub const REASON_AGENT_STOPPED: &str = "agent_stopped";
 
@@ -389,6 +423,21 @@ impl AgentReport {
     /// report on the first problem, naming it, rather than dropping parts: a
     /// half-applied card misleads the user.
     pub fn validate(&self, catalog: &ResolvedCatalog) -> Result<(), ReportError> {
+        self.validate_with(Some(catalog))
+    }
+
+    /// The checks that do not depend on any catalog: sizes, counts, name
+    /// syntax, reserved and repeated names, questions, and that no action
+    /// asks for confirmation. What `card publish` checks before sending; the
+    /// daemon decides the rest — which names are catalog entries, the types
+    /// their values must have, and what a custom field or action needs —
+    /// against the catalog it resolves cards with (product decision (b),
+    /// CLAUDE.md rule 18).
+    pub fn validate_schema(&self) -> Result<(), ReportError> {
+        self.validate_with(None)
+    }
+
+    fn validate_with(&self, catalog: Option<&ResolvedCatalog>) -> Result<(), ReportError> {
         match serde_json::to_vec(self) {
             Ok(bytes) if bytes.len() > MAX_REPORT_BYTES => return Err(too_large()),
             Ok(_) => {}
@@ -417,6 +466,9 @@ impl AgentReport {
             if !seen.insert(field.name.as_str()) {
                 return Err(ReportError::invalid(format!("{what} is listed twice")));
             }
+            let Some(catalog) = catalog else {
+                continue;
+            };
             let field_type = match catalog.field(&field.name) {
                 Some(entry) => entry.field_type,
                 None => {
@@ -518,6 +570,14 @@ impl AgentReport {
             if !seen.insert(action.name.as_str()) {
                 return Err(ReportError::invalid(format!("{what} is listed twice")));
             }
+            let Some(catalog) = catalog else {
+                if action.confirm == Some(true) {
+                    return Err(ReportError::invalid(format!(
+                        "{what} cannot ask for confirmation; only the catalog decides that"
+                    )));
+                }
+                continue;
+            };
             if catalog.action(&action.name).is_some() {
                 if action.label.is_some() || action.prompt.is_some() || action.confirm.is_some() {
                     return Err(ReportError::invalid(format!(
@@ -691,8 +751,43 @@ pub struct CardAction {
     pub enabled: bool,
     #[serde(default)]
     pub disabled_reason: Option<String>,
+    /// The latest delivery of THIS definition of the action (its `token`), so
+    /// an action id an agent reused for new text does not show the old
+    /// text's delivery (review S1). Every delivery, of this definition or an
+    /// earlier one, is in the entry's `recent_deliveries`.
     #[serde(default)]
     pub last_delivery: Option<CardDelivery>,
+    /// The daemon's name for this definition of the action: a digest of the
+    /// card, the action id, its kind, label, exact prompt, whether it asks
+    /// for confirmation and, for a question's option, the question and the
+    /// option. An invocation names it, and the daemon refuses one whose
+    /// action changed since (`stale_action`), so a press can only send the
+    /// text the user was shown (review B2, audit F1). Unchanged by anything
+    /// else: a status, a delivery, the close's pending note.
+    #[serde(default)]
+    pub token: String,
+}
+
+/// One action the user invoked on a card, kept on the entry after a later
+/// report stops offering the action (product decision (a)): what was sent,
+/// exactly, and what became of it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CardDeliveryRecord {
+    pub action_id: String,
+    /// The label the action had when it was invoked.
+    pub label: String,
+    /// The exact text sent: the action's prompt, or the user's reply.
+    pub text: String,
+    /// The action definition's `token` when it was invoked.
+    pub token: String,
+    /// `sent`.
+    pub outcome: String,
+    pub message_id: String,
+    /// `queued`, `delivered`, `uncertain` or `not_delivered`.
+    pub state: String,
+    #[serde(default)]
+    pub detail: Option<String>,
+    pub at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -729,6 +824,10 @@ pub struct AgentCardEntry {
     pub actions: Vec<CardAction>,
     pub primary_action_id: String,
     pub facts: CardFacts,
+    /// The actions invoked on this card, newest first, at most
+    /// [`MAX_RECENT_DELIVERIES`] and [`MAX_RECENT_DELIVERY_BYTES`] of text.
+    #[serde(default)]
+    pub recent_deliveries: Vec<CardDeliveryRecord>,
     pub revision: u64,
     pub updated_at: DateTime<Utc>,
 }
@@ -770,13 +869,14 @@ pub struct CardActionResult {
 
 impl CardActionResult {
     pub fn refused(request_id: &str, code: &str, message: impl Into<String>) -> Self {
+        let message: String = message.into();
         CardActionResult {
             request_id: request_id.to_string(),
             outcome: "refused".to_string(),
             message_id: None,
             kept_worktree: None,
             code: Some(code.to_string()),
-            message: Some(message.into()),
+            message: Some(message.chars().take(MAX_RESULT_MESSAGE_CHARS).collect()),
             entry_revision: None,
         }
     }
@@ -784,6 +884,20 @@ impl CardActionResult {
     pub fn is_refused(&self) -> bool {
         self.outcome == "refused"
     }
+}
+
+/// One action of one card, named the way an invocation must name it: the
+/// daemon process that listed the card, the card's pane and agent
+/// generation, the action and the `token` of the definition the user was
+/// shown. Each part comes from `card list` (`instance_id`, `pane_id`,
+/// `agent_id`, the action's `id` and `token`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CardActionTarget {
+    pub instance_id: String,
+    pub pane_id: String,
+    pub agent_id: String,
+    pub action_id: String,
+    pub action_token: String,
 }
 
 /// The key of an agent generation's card.
@@ -805,10 +919,31 @@ pub fn split_key(key: &str) -> Option<(&str, &str)> {
 #[derive(Debug, Clone, Default)]
 struct Slot {
     report: Option<StoredReport>,
-    /// The latest delivery per action id.
-    deliveries: HashMap<String, Delivery>,
+    /// The actions invoked on this card, newest first, bounded by count and
+    /// by bytes (audit F5): every invocation adds one and the oldest go.
+    deliveries: std::collections::VecDeque<CardDeliveryRecord>,
     /// Questions answered since the last publish, by question id.
     answered: HashMap<String, CardAnswered>,
+    /// The store's epoch when this slot was last published to or delivered
+    /// on. A refresh whose snapshot of the registry was taken before it does
+    /// not prune it (review B4).
+    epoch: u64,
+}
+
+impl Slot {
+    /// Record a delivery, newest first, dropping the oldest beyond the
+    /// count and byte bounds.
+    fn push_delivery(&mut self, record: CardDeliveryRecord) {
+        self.deliveries.push_front(record);
+        self.deliveries.truncate(MAX_RECENT_DELIVERIES);
+        let size = |r: &CardDeliveryRecord| r.text.len() + r.label.len() + r.action_id.len();
+        let mut total: usize = self.deliveries.iter().map(size).sum();
+        while total > MAX_RECENT_DELIVERY_BYTES && self.deliveries.len() > 1 {
+            if let Some(oldest) = self.deliveries.pop_back() {
+                total -= size(&oldest);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -816,14 +951,6 @@ struct StoredReport {
     report: AgentReport,
     published_at: DateTime<Utc>,
     publishes: u64,
-}
-
-#[derive(Debug, Clone)]
-struct Delivery {
-    message_id: String,
-    at: DateTime<Utc>,
-    state: String,
-    detail: Option<String>,
 }
 
 /// One agent generation as the deck sees it, gathered before projection.
@@ -933,6 +1060,80 @@ fn plural(n: usize, one: &str, many: &str) -> String {
     }
 }
 
+/// The type a custom field resolves to: the type the report gave it, else
+/// `text`; `None` when the report's type is not one the deck knows (possible
+/// for a field that was a catalog field when published, whose `type` was
+/// ignored then).
+fn custom_field_type(field: &ReportField) -> Option<FieldType> {
+    match field.field_type.as_deref() {
+        None => Some(FieldType::Text),
+        Some(raw) => FieldType::parse(raw),
+    }
+}
+
+/// A custom field's or action's label, when it passes the report rules.
+fn custom_label(label: Option<&str>) -> Option<String> {
+    let label = label?;
+    check_string(label, "label", MAX_REPORT_LABEL_CHARS, false, false).ok()?;
+    Some(label.to_string())
+}
+
+/// A report action not in the catalog, as a custom action: its label and
+/// prompt when both pass the report rules for a custom action, else `None`.
+fn custom_definition(action: &ReportAction) -> Option<(String, String)> {
+    if action.confirm == Some(true) {
+        return None;
+    }
+    let label = custom_label(action.label.as_deref())?;
+    let prompt = action.prompt.as_deref()?;
+    check_string(prompt, "prompt", MAX_PROMPT_CHARS, true, false).ok()?;
+    Some((label, prompt.to_string()))
+}
+
+/// The token of one action definition: what [`CardAction::token`] says.
+fn action_token(
+    instance_id: &str,
+    key: &str,
+    action: &CardAction,
+    question: Option<(&ReportQuestion, &ReportOption)>,
+) -> String {
+    use sha2::{Digest as _, Sha256};
+    #[derive(Serialize)]
+    struct Definition<'a> {
+        instance_id: &'a str,
+        key: &'a str,
+        id: &'a str,
+        kind: &'a str,
+        label: &'a str,
+        prompt: Option<&'a str>,
+        confirm: bool,
+        text_input: bool,
+        question: Option<[&'a str; 4]>,
+    }
+    let bytes = serde_json::to_vec(&Definition {
+        instance_id,
+        key,
+        id: &action.id,
+        kind: &action.kind,
+        label: &action.label,
+        prompt: action.prompt.as_deref(),
+        confirm: action.confirm,
+        text_input: action.text_input,
+        question: question.map(|(q, o)| {
+            [
+                q.id.as_str(),
+                q.text.as_str(),
+                o.id.as_str(),
+                o.label.as_str(),
+            ]
+        }),
+    })
+    .unwrap_or_default();
+    let digest = Sha256::digest(&bytes);
+    let hex: String = digest.iter().take(16).map(|b| format!("{b:02x}")).collect();
+    format!("act-{hex}")
+}
+
 /// Compute one entry (revision and `updated_at` left for the store).
 fn project_entry(
     facts: &AgentFacts,
@@ -1009,11 +1210,18 @@ fn project_entry(
         reasons.push("blocked".into());
     }
 
-    // Fields: catalog fields in catalog order, then custom ones in report order.
+    // Fields: catalog fields in catalog order, then custom ones in report
+    // order. The catalog may have changed since the report was published
+    // (review B7), so each value is checked again against the type it
+    // resolves to NOW, and a value that no longer fits is not shown until
+    // the agent publishes again. A field the catalog dropped is shown as the
+    // agent's own custom field, with the type and label the report gave.
     let mut fields = Vec::new();
     if let Some(r) = report {
         for entry in &catalog.fields {
-            if let Some(f) = r.report.fields.iter().find(|f| f.name == entry.name) {
+            if let Some(f) = r.report.fields.iter().find(|f| f.name == entry.name)
+                && check_value(entry.field_type, &f.value, "value").is_ok()
+            {
                 fields.push(CardField {
                     name: entry.name.clone(),
                     label: entry.label.clone(),
@@ -1031,14 +1239,17 @@ fn project_entry(
             if catalog.field(&f.name).is_some() {
                 continue;
             }
+            let Some(field_type) = custom_field_type(f) else {
+                continue;
+            };
+            if check_value(field_type, &f.value, "value").is_err() {
+                continue;
+            }
             fields.push(CardField {
                 name: f.name.clone(),
-                label: f.label.clone().unwrap_or_else(|| f.name.clone()),
+                label: custom_label(f.label.as_deref()).unwrap_or_else(|| f.name.clone()),
                 description: None,
-                field_type: f
-                    .field_type
-                    .clone()
-                    .unwrap_or_else(|| FieldType::Text.as_str().into()),
+                field_type: field_type.as_str().into(),
                 icon: None,
                 placement: "detail".into(),
                 custom: true,
@@ -1050,15 +1261,6 @@ fn project_entry(
 
     let pull_request = live.and_then(|l| l.pull_request.clone());
     let prompt_enabled = !facts.stopped;
-    let delivery_of = |id: &str| {
-        slot.and_then(|s| s.deliveries.get(id))
-            .map(|d| CardDelivery {
-                message_id: d.message_id.clone(),
-                state: d.state.clone(),
-                detail: d.detail.clone(),
-                at: d.at,
-            })
-    };
     let prompt_action = |id: String,
                          label: String,
                          prompt: Option<String>,
@@ -1068,7 +1270,7 @@ fn project_entry(
                          custom: bool,
                          source: &str,
                          text_input: bool| CardAction {
-        last_delivery: delivery_of(&id),
+        last_delivery: None,
         id,
         label,
         kind: "prompt".into(),
@@ -1082,9 +1284,12 @@ fn project_entry(
         source: source.into(),
         enabled: prompt_enabled,
         disabled_reason: (!prompt_enabled).then(|| REASON_AGENT_STOPPED.to_string()),
+        token: String::new(),
     };
 
     let mut actions: Vec<CardAction> = Vec::new();
+    // The question and option behind each option action, for its token.
+    let mut answers: HashMap<String, (&ReportQuestion, &ReportOption)> = HashMap::new();
     let mut primary_candidates: Vec<String> = Vec::new();
     // 1. Question options.
     if let Some(r) = report {
@@ -1097,6 +1302,7 @@ fn project_entry(
                 if answered.get(&q.id).is_none() {
                     primary_candidates.push(id.clone());
                 }
+                answers.insert(id.clone(), (q, o));
                 actions.push(prompt_action(
                     id,
                     o.label.clone(),
@@ -1143,16 +1349,19 @@ fn project_entry(
             push_catalog(&mut actions, a);
         }
     }
-    // 4. Custom report actions.
+    // 4. Custom report actions. A suggestion the catalog answered when it was
+    // published, and no longer does, carries no label or prompt of its own:
+    // it is not offered until the agent publishes again, rather than being
+    // turned into a custom action with an empty prompt (review B7).
     for suggested in custom_suggested {
+        let Some((label, prompt)) = custom_definition(suggested) else {
+            continue;
+        };
         primary_candidates.push(suggested.name.clone());
         actions.push(prompt_action(
             suggested.name.clone(),
-            suggested
-                .label
-                .clone()
-                .unwrap_or_else(|| suggested.name.clone()),
-            suggested.prompt.clone(),
+            label,
+            Some(prompt),
             None,
             "card",
             false,
@@ -1188,6 +1397,7 @@ fn project_entry(
         source: "deck".into(),
         enabled: true,
         disabled_reason: None,
+        token: String::new(),
     };
     actions.push(deck_action("open", "Open", "open", "terminal", None));
     let pending = {
@@ -1227,6 +1437,23 @@ fn project_entry(
             "archive",
             pending,
         ));
+    }
+
+    // Each definition's token, and the latest delivery OF that definition.
+    let recent_deliveries: Vec<CardDeliveryRecord> = slot
+        .map(|s| s.deliveries.iter().cloned().collect())
+        .unwrap_or_default();
+    for a in &mut actions {
+        a.token = action_token(instance_id, &key, a, answers.get(&a.id).copied());
+        a.last_delivery = recent_deliveries
+            .iter()
+            .find(|d| d.action_id == a.id && d.token == a.token)
+            .map(|d| CardDelivery {
+                message_id: d.message_id.clone(),
+                state: d.state.clone(),
+                detail: d.detail.clone(),
+                at: d.at,
+            });
     }
 
     let primary_action_id = primary_candidates
@@ -1324,6 +1551,7 @@ fn project_entry(
             source: "deck".into(),
             pull_request,
         },
+        recent_deliveries,
         revision: 0,
         updated_at: DateTime::<Utc>::UNIX_EPOCH,
     }
@@ -1396,13 +1624,214 @@ struct Computed {
     doorbell_owed: bool,
 }
 
+/// What an invocation's `request_id` is remembered as: still running, so a
+/// repeat waits for its answer, or answered, so a repeat gets that answer
+/// and nothing is done again (review B5, audit F6).
+enum Remembered {
+    InFlight {
+        fingerprint: [u8; 32],
+        at: Instant,
+        answer: tokio::sync::watch::Receiver<Option<CardActionResult>>,
+    },
+    Done {
+        fingerprint: [u8; 32],
+        at: Instant,
+        result: CardActionResult,
+    },
+}
+
+impl Remembered {
+    fn at(&self) -> Instant {
+        match self {
+            Remembered::InFlight { at, .. } | Remembered::Done { at, .. } => *at,
+        }
+    }
+
+    /// What it holds, besides its key: the answer's own strings.
+    fn bytes(&self) -> usize {
+        match self {
+            Remembered::InFlight { .. } => 0,
+            Remembered::Done { result, .. } => {
+                result.request_id.len()
+                    + result.outcome.len()
+                    + result.message_id.as_ref().map_or(0, String::len)
+                    + result.kept_worktree.as_ref().map_or(0, String::len)
+                    + result.code.as_ref().map_or(0, String::len)
+                    + result.message.as_ref().map_or(0, String::len)
+            }
+        }
+    }
+}
+
+/// What [`CardStore::claim`] answers for a request id.
+enum Claim {
+    /// Nobody has it: run the invocation and send its answer here.
+    Run(tokio::sync::watch::Sender<Option<CardActionResult>>),
+    /// The same request is running: wait for its answer.
+    Wait(tokio::sync::watch::Receiver<Option<CardActionResult>>),
+    /// Answered already (or refused as a reused id).
+    Answered(CardActionResult),
+}
+
 #[derive(Default)]
 struct StoreInner {
     slots: HashMap<String, Slot>,
     computed: HashMap<String, Computed>,
     counter: u64,
-    requests: HashMap<String, (Instant, CardActionResult)>,
+    /// Bumped by every publish and every delivery recorded. A refresh that
+    /// read the registry before a bump does not prune by that reading
+    /// (review B4).
+    epoch: u64,
+    requests: HashMap<String, Remembered>,
     catalog: Option<CachedCatalog>,
+}
+
+impl StoreInner {
+    /// Forget the answers older than [`REQUEST_ID_MEMORY`], and the running
+    /// claims whose invocation went away without answering.
+    fn forget_expired(&mut self, now: Instant) {
+        self.requests.retain(|_, r| match r {
+            Remembered::Done { at, .. } => now.duration_since(*at) < REQUEST_ID_MEMORY,
+            Remembered::InFlight { at, answer, .. } => {
+                now.duration_since(*at) < REQUEST_ID_MEMORY || answer.has_changed().is_ok()
+            }
+        });
+    }
+
+    /// Drop the oldest answers until the remembered ids fit their count and
+    /// byte bounds. A running claim is never dropped.
+    fn make_room(&mut self, incoming: usize) {
+        loop {
+            let bytes: usize = self.requests.iter().map(|(k, r)| k.len() + r.bytes()).sum();
+            if self.requests.len() < MAX_REMEMBERED_REQUESTS
+                && bytes + incoming <= MAX_REMEMBERED_BYTES
+            {
+                return;
+            }
+            let oldest = self
+                .requests
+                .iter()
+                .filter(|(_, r)| matches!(r, Remembered::Done { .. }))
+                .min_by_key(|(_, r)| r.at())
+                .map(|(k, _)| k.clone());
+            match oldest {
+                Some(key) => {
+                    self.requests.remove(&key);
+                }
+                None => return,
+            }
+        }
+    }
+
+    /// Commit one reading of the deck: prune the slots of generations that
+    /// are gone, update delivery states, project every entry, and assign
+    /// revisions and doorbells to the ones that changed.
+    ///
+    /// `read_at` is the store's epoch when the deck was read. A slot
+    /// published to (or delivered on) after it is never pruned by this
+    /// reading, which may predate its agent (review B4); and when `retry` is
+    /// set and the store changed since the reading, nothing is committed and
+    /// `None` asks the caller to read the deck again.
+    #[allow(clippy::too_many_arguments)]
+    fn commit(
+        &mut self,
+        agents: &[AgentFacts],
+        units: &[UnitFacts],
+        states: &HashMap<String, (String, Option<String>)>,
+        catalog: &ResolvedCatalog,
+        instance_id: &str,
+        read_at: u64,
+        retry: bool,
+        now: DateTime<Utc>,
+        instant: Instant,
+    ) -> Option<(AgentCardList, Vec<Doorbell>)> {
+        if retry && self.epoch != read_at {
+            return None;
+        }
+        let mut doorbells = Vec::new();
+        let live: HashSet<String> = agents
+            .iter()
+            .map(|a| entry_key(&a.pane_id, &a.record.id))
+            .collect();
+        // A closed or replaced generation's report and delivery state go
+        // with it — unless the slot changed after the deck was read.
+        self.slots
+            .retain(|k, slot| live.contains(k) || slot.epoch > read_at);
+        for slot in self.slots.values_mut() {
+            for delivery in slot.deliveries.iter_mut() {
+                if let Some((state, detail)) = states.get(&delivery.message_id) {
+                    delivery.state = state.clone();
+                    delivery.detail = detail.clone();
+                }
+            }
+        }
+        let mut entries = project_all(agents, &self.slots, catalog, units, instance_id);
+        let removed: Vec<String> = self
+            .computed
+            .keys()
+            .filter(|k| !live.contains(*k))
+            .cloned()
+            .collect();
+        for key in removed {
+            self.computed.remove(&key);
+            self.counter += 1;
+            doorbells.push(Doorbell {
+                key,
+                revision: self.counter,
+                removed: true,
+            });
+        }
+        for entry in &mut entries {
+            let hash = content_hash(entry);
+            let counter = self.counter;
+            let computed = self.computed.get(&entry.key).cloned();
+            let mut c = match computed {
+                Some(c) if c.hash == hash => c,
+                Some(mut c) => {
+                    c.hash = hash;
+                    c.revision = counter + 1;
+                    c.updated_at = now;
+                    c.doorbell_owed = true;
+                    self.counter += 1;
+                    c
+                }
+                None => {
+                    self.counter += 1;
+                    Computed {
+                        hash,
+                        revision: counter + 1,
+                        updated_at: now,
+                        last_doorbell: None,
+                        doorbell_owed: true,
+                    }
+                }
+            };
+            if c.doorbell_owed
+                && c.last_doorbell
+                    .is_none_or(|at| instant.duration_since(at) >= DOORBELL_MIN_GAP)
+            {
+                c.doorbell_owed = false;
+                c.last_doorbell = Some(instant);
+                doorbells.push(Doorbell {
+                    key: entry.key.clone(),
+                    revision: c.revision,
+                    removed: false,
+                });
+            }
+            entry.revision = c.revision;
+            entry.updated_at = c.updated_at;
+            self.computed.insert(entry.key.clone(), c);
+        }
+        Some((
+            AgentCardList {
+                instance_id: instance_id.to_string(),
+                revision: self.counter,
+                entries,
+                catalog_errors: catalog.errors.clone(),
+            },
+            doorbells,
+        ))
+    }
 }
 
 struct CachedCatalog {
@@ -1410,12 +1839,17 @@ struct CachedCatalog {
     catalog: Arc<ResolvedCatalog>,
 }
 
-/// The daemon's agent-card state: the reports agents published, the delivery
-/// state of card actions, and the revisions of the entries computed from them.
-/// In memory only, like the agents it describes.
+/// The daemon's agent-card state: the reports agents published, the
+/// deliveries of card actions, and the revisions of the entries computed
+/// from them. In memory only, like the agents it describes.
 #[derive(Default)]
 pub struct CardStore {
     inner: Mutex<StoreInner>,
+    /// One turn at a time for everything that reads the deck and commits
+    /// what it read — a refresh — and for everything that changes a slot —
+    /// a publish, a prompt delivery. A refresh's reading and its commit are
+    /// one turn, so a publish can never land between them (review B4).
+    serial: tokio::sync::Mutex<()>,
     broadcast: Mutex<Option<broadcast::Sender<BroadcastMsg>>>,
     worktrees: Mutex<Option<crate::issue_dispatch_run::WorktreeRegistry>>,
 }
@@ -1449,8 +1883,10 @@ impl CardStore {
             .clone()
     }
 
+    /// Whether any event subscriber opted into card doorbells.
     fn subscribed(&self) -> bool {
         self.sender().is_some_and(|tx| tx.receiver_count() > 0)
+            && crate::daemon_protocol::agent_card_subscribers() > 0
     }
 
     /// The resolved catalog, re-read from the user config when the file
@@ -1479,9 +1915,12 @@ impl CardStore {
 
     /// Store `report` for the generation `agent_id` in `pane_id`, replacing
     /// whatever it published before, and clearing answered questions. The
-    /// report must already be validated.
+    /// deliveries stay: what the user sent outlives the report that offered
+    /// it. The report must already be validated.
     pub fn publish(&self, pane_id: &str, agent_id: &str, report: AgentReport) {
         let mut inner = self.lock();
+        inner.epoch += 1;
+        let epoch = inner.epoch;
         let slot = inner.slots.entry(entry_key(pane_id, agent_id)).or_default();
         let publishes = slot.report.as_ref().map_or(0, |r| r.publishes) + 1;
         slot.report = Some(StoredReport {
@@ -1490,62 +1929,84 @@ impl CardStore {
             publishes,
         });
         slot.answered.clear();
+        slot.epoch = epoch;
     }
 
-    fn record_delivery(
-        &self,
-        key: &str,
-        action_id: &str,
-        message_id: &str,
-        answer: Option<(String, String)>,
-    ) {
+    fn record_delivery(&self, key: &str, record: CardDeliveryRecord) {
         let mut inner = self.lock();
+        inner.epoch += 1;
+        let epoch = inner.epoch;
         let slot = inner.slots.entry(key.to_string()).or_default();
-        let at = Utc::now();
-        slot.deliveries.insert(
-            action_id.to_string(),
-            Delivery {
-                message_id: message_id.to_string(),
-                at,
-                state: "queued".into(),
-                detail: None,
-            },
-        );
-        if let Some((question_id, option_id)) = answer {
+        if let Some((question_id, option_id)) = record
+            .action_id
+            .strip_prefix("question/")
+            .and_then(|rest| rest.split_once('/'))
+        {
             slot.answered.insert(
-                question_id,
+                question_id.to_string(),
                 CardAnswered {
-                    option_id,
-                    action_id: action_id.to_string(),
-                    at,
+                    option_id: option_id.to_string(),
+                    action_id: record.action_id.clone(),
+                    at: record.at,
                 },
             );
         }
+        slot.push_delivery(record);
+        slot.epoch = epoch;
     }
 
-    fn remembered(&self, request_id: &str) -> Option<CardActionResult> {
+    /// Claim `request_id` for one invocation, atomically: the first claim
+    /// runs it, a repeat of the same request waits for or reuses its answer,
+    /// and a repeat naming different arguments is refused.
+    fn claim(&self, request_id: &str, fingerprint: [u8; 32]) -> Claim {
         let mut inner = self.lock();
         let now = Instant::now();
-        inner
-            .requests
-            .retain(|_, (at, _)| now.duration_since(*at) < REQUEST_ID_MEMORY);
-        inner.requests.get(request_id).map(|(_, r)| r.clone())
+        inner.forget_expired(now);
+        match inner.requests.get(request_id) {
+            Some(Remembered::InFlight {
+                fingerprint: f,
+                answer,
+                ..
+            }) if *f == fingerprint => return Claim::Wait(answer.clone()),
+            Some(Remembered::Done {
+                fingerprint: f,
+                result,
+                ..
+            }) if *f == fingerprint => return Claim::Answered(result.clone()),
+            Some(_) => {
+                return Claim::Answered(CardActionResult::refused(
+                    request_id,
+                    CODE_REQUEST_REUSED,
+                    "this request id was already used for a different request; nothing was done",
+                ));
+            }
+            None => {}
+        }
+        inner.make_room(request_id.len());
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        inner.requests.insert(
+            request_id.to_string(),
+            Remembered::InFlight {
+                fingerprint,
+                at: now,
+                answer: rx,
+            },
+        );
+        Claim::Run(tx)
     }
 
-    fn remember(&self, result: &CardActionResult) {
+    /// Remember the answer of the invocation that claimed `request_id`.
+    fn finish(&self, request_id: &str, fingerprint: [u8; 32], result: &CardActionResult) {
         let mut inner = self.lock();
-        if inner.requests.len() >= MAX_REMEMBERED_REQUESTS
-            && let Some(oldest) = inner
-                .requests
-                .iter()
-                .min_by_key(|(_, (at, _))| *at)
-                .map(|(k, _)| k.clone())
-        {
-            inner.requests.remove(&oldest);
-        }
-        inner
-            .requests
-            .insert(result.request_id.clone(), (Instant::now(), result.clone()));
+        let done = Remembered::Done {
+            fingerprint,
+            at: Instant::now(),
+            result: result.clone(),
+        };
+        let incoming = request_id.len() + done.bytes();
+        inner.requests.remove(request_id);
+        inner.make_room(incoming);
+        inner.requests.insert(request_id.to_string(), done);
     }
 }
 
@@ -1629,30 +2090,11 @@ async fn gather(
     (agents, units)
 }
 
-/// A doorbell to ring once the store's lock is released.
-struct Doorbell {
-    key: String,
-    revision: u64,
-    removed: bool,
-}
-
-/// Recompute every entry, assign revisions to the ones that changed, ring
-/// their doorbells (at most four per entry per second), and answer the list.
-///
-/// Called by `list-agent-cards`, after a publish and after an action, and by
-/// the daemon's watcher while anyone is subscribed, so a change the deck
-/// notices on its own (a status, an exit, a close) is announced within a
-/// second.
-pub async fn refresh(
-    registry: &Arc<AgentPtyRegistry>,
-    state: &crate::state::SharedState,
-) -> AgentCardList {
-    let store = registry.agent_cards();
-    let catalog = store.catalog();
-    let (agents, units) = gather(registry, state).await;
-    // Delivery states, read before the store's lock.
+/// The inbox state of every message a card recorded as delivered, by
+/// message id.
+fn delivery_states(registry: &Arc<AgentPtyRegistry>) -> HashMap<String, (String, Option<String>)> {
     let wanted: HashSet<String> = {
-        let inner = store.lock();
+        let inner = registry.agent_cards().lock();
         inner
             .slots
             .iter()
@@ -1660,105 +2102,79 @@ pub async fn refresh(
             .filter_map(|(k, _)| split_key(k).map(|(p, _)| p.to_string()))
             .collect()
     };
-    let mut states: HashMap<String, (String, Option<String>)> = HashMap::new();
+    let mut states = HashMap::new();
     for pane in wanted {
         for summary in registry.inbox().list(&pane) {
             states.insert(summary.id.to_string(), delivery_state(&summary));
         }
     }
-    let instance_id = crate::daemon_protocol::try_daemon_instance_id()
+    states
+}
+
+/// A doorbell to ring once the store's lock is released.
+struct Doorbell {
+    key: String,
+    revision: u64,
+    removed: bool,
+}
+
+fn own_instance_id() -> String {
+    crate::daemon_protocol::try_daemon_instance_id()
         .unwrap_or_default()
-        .to_string();
-    let now = Utc::now();
-    let instant = Instant::now();
-    let mut doorbells = Vec::new();
-    let list = {
-        let mut inner = store.lock();
-        let live: HashSet<String> = agents
-            .iter()
-            .map(|a| entry_key(&a.pane_id, &a.record.id))
-            .collect();
-        // A closed or replaced generation's report and delivery state go with it.
-        inner.slots.retain(|k, _| live.contains(k));
-        for slot in inner.slots.values_mut() {
-            for delivery in slot.deliveries.values_mut() {
-                if let Some((state, detail)) = states.get(&delivery.message_id) {
-                    delivery.state = state.clone();
-                    delivery.detail = detail.clone();
-                }
+        .to_string()
+}
+
+/// Recompute every entry, assign revisions to the ones that changed, ring
+/// their doorbells (at most four per entry per second), and answer the list.
+///
+/// Called by `list-agent-cards`, after a publish and after an action, and by
+/// the daemon's watcher while a subscriber opted into card doorbells, so a
+/// change the deck notices on its own (a status, an exit, a close) is
+/// announced within a second.
+pub async fn refresh(
+    registry: &Arc<AgentPtyRegistry>,
+    state: &crate::state::SharedState,
+) -> AgentCardList {
+    let _turn = registry.agent_cards().serial.lock().await;
+    refresh_in_turn(registry, state).await
+}
+
+/// [`refresh`] by a caller that already holds the store's turn.
+async fn refresh_in_turn(
+    registry: &Arc<AgentPtyRegistry>,
+    state: &crate::state::SharedState,
+) -> AgentCardList {
+    let store = registry.agent_cards();
+    let catalog = store.catalog();
+    let instance_id = own_instance_id();
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let read_at = store.lock().epoch;
+        let (agents, units) = gather(registry, state).await;
+        let states = delivery_states(registry);
+        let committed = store.lock().commit(
+            &agents,
+            &units,
+            &states,
+            &catalog,
+            &instance_id,
+            read_at,
+            attempt < REFRESH_ATTEMPTS,
+            Utc::now(),
+            Instant::now(),
+        );
+        let Some((list, doorbells)) = committed else {
+            continue;
+        };
+        if let Some(tx) = store.sender() {
+            for bell in doorbells {
+                // Errs only when nobody is subscribed, which is not a failure.
+                let _ = tx.send(BroadcastMsg::Event(doorbell_event(&bell)));
             }
         }
-        let mut entries = project_all(&agents, &inner.slots, &catalog, &units, &instance_id);
-        let removed: Vec<String> = inner
-            .computed
-            .keys()
-            .filter(|k| !live.contains(*k))
-            .cloned()
-            .collect();
-        for key in removed {
-            inner.computed.remove(&key);
-            inner.counter += 1;
-            doorbells.push(Doorbell {
-                key,
-                revision: inner.counter,
-                removed: true,
-            });
-        }
-        for entry in &mut entries {
-            let hash = content_hash(entry);
-            let counter = inner.counter;
-            let computed = inner.computed.get(&entry.key).cloned();
-            let mut c = match computed {
-                Some(c) if c.hash == hash => c,
-                Some(mut c) => {
-                    c.hash = hash;
-                    c.revision = counter + 1;
-                    c.updated_at = now;
-                    c.doorbell_owed = true;
-                    inner.counter += 1;
-                    c
-                }
-                None => {
-                    inner.counter += 1;
-                    Computed {
-                        hash,
-                        revision: counter + 1,
-                        updated_at: now,
-                        last_doorbell: None,
-                        doorbell_owed: true,
-                    }
-                }
-            };
-            if c.doorbell_owed
-                && c.last_doorbell
-                    .is_none_or(|at| instant.duration_since(at) >= DOORBELL_MIN_GAP)
-            {
-                c.doorbell_owed = false;
-                c.last_doorbell = Some(instant);
-                doorbells.push(Doorbell {
-                    key: entry.key.clone(),
-                    revision: c.revision,
-                    removed: false,
-                });
-            }
-            entry.revision = c.revision;
-            entry.updated_at = c.updated_at;
-            inner.computed.insert(entry.key.clone(), c);
-        }
-        AgentCardList {
-            instance_id,
-            revision: inner.counter,
-            entries,
-            catalog_errors: catalog.errors.clone(),
-        }
-    };
-    if let Some(tx) = store.sender() {
-        for bell in doorbells {
-            // Errs only when nobody is subscribed, which is not a failure.
-            let _ = tx.send(BroadcastMsg::Event(doorbell_event(&bell)));
-        }
+        return list;
     }
-    list
 }
 
 fn doorbell_event(bell: &Doorbell) -> crate::event::AgentEvent {
@@ -1793,9 +2209,15 @@ fn doorbell_event(bell: &Doorbell) -> crate::event::AgentEvent {
     }
 }
 
+/// Whether `msg` is a card doorbell: forwarded only to a subscriber that
+/// opted into them (review B1).
+pub fn is_doorbell(msg: &BroadcastMsg) -> bool {
+    matches!(msg, BroadcastMsg::Event(e) if e.event_type == crate::event::EventType::AgentCard)
+}
+
 /// The daemon's watcher: recompute the entries every [`WATCH_INTERVAL`] while
-/// anyone is subscribed, so every change to an entry rings its doorbell within
-/// a second.
+/// a subscriber opted into card doorbells, so every change to an entry rings
+/// its doorbell within a second.
 pub fn spawn_watcher(
     registry: Arc<AgentPtyRegistry>,
     state: crate::state::SharedState,
@@ -1830,9 +2252,12 @@ pub async fn publish(
     if let Err(error) = report.validate(&catalog) {
         return crate::event::CardPublishReply::refused(error.code, &error.message);
     }
-    store.publish(pane_id, agent_id, report);
     let key = entry_key(pane_id, agent_id);
-    let list = refresh(registry, state).await;
+    let list = {
+        let _turn = store.serial.lock().await;
+        store.publish(pane_id, agent_id, report);
+        refresh_in_turn(registry, state).await
+    };
     let revision = list
         .entries
         .iter()
@@ -1857,6 +2282,10 @@ pub struct CardActionRequest {
     pub pane_id: String,
     pub agent_id: String,
     pub action_id: String,
+    /// The `token` of the action definition the user was shown.
+    pub action_token: String,
+    /// The `instance_id` of the daemon process that listed the card.
+    pub instance_id: String,
     pub request_id: String,
     pub confirm: bool,
     pub text: Option<String>,
@@ -1865,10 +2294,85 @@ pub struct CardActionRequest {
 /// What a close action reports: the worktree kept, if one was.
 pub type CloseOutcome = Result<Option<String>, String>;
 
+fn is_request_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_REQUEST_ID_BYTES
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
+}
+
+/// Refuse a request whose identifiers are malformed or oversized before
+/// anything about it is remembered (audit F4).
+fn check_request(request: &CardActionRequest) -> Result<(), Box<CardActionResult>> {
+    if !is_request_id(&request.request_id) {
+        return Err(Box::new(CardActionResult::refused(
+            "",
+            CODE_REQUEST_INVALID,
+            format!(
+                "the request id must be 1 to {MAX_REQUEST_ID_BYTES} letters, digits, '.', '_', ':' or '-'"
+            ),
+        )));
+    }
+    for (what, value) in [
+        ("pane id", &request.pane_id),
+        ("agent id", &request.agent_id),
+        ("action id", &request.action_id),
+        ("action token", &request.action_token),
+        ("instance id", &request.instance_id),
+    ] {
+        if value.len() > MAX_REQUEST_FIELD_BYTES {
+            return Err(Box::new(CardActionResult::refused(
+                &request.request_id,
+                CODE_REQUEST_INVALID,
+                format!("the {what} is longer than {MAX_REQUEST_FIELD_BYTES} bytes"),
+            )));
+        }
+    }
+    if request
+        .text
+        .as_ref()
+        .is_some_and(|t| t.len() > MAX_REPLY_TEXT_BYTES)
+    {
+        return Err(Box::new(CardActionResult::refused(
+            &request.request_id,
+            CODE_TEXT_REQUIRED,
+            format!(
+                "reply text must be at most {MAX_REPLY_TEXT_BYTES} bytes without control characters"
+            ),
+        )));
+    }
+    Ok(())
+}
+
+/// A digest of everything a request asks for, so a repeat of its id can be
+/// told apart from a different request reusing it.
+fn request_fingerprint(request: &CardActionRequest) -> [u8; 32] {
+    use sha2::{Digest as _, Sha256};
+    let bytes = serde_json::to_vec(&(
+        &request.pane_id,
+        &request.agent_id,
+        &request.action_id,
+        &request.action_token,
+        &request.instance_id,
+        request.confirm,
+        &request.text,
+    ))
+    .unwrap_or_default();
+    Sha256::digest(&bytes).into()
+}
+
 /// Invoke one action of one entry. `close` performs the deck's stop of an
 /// agent id (`keep_worktree` for `close-keep-worktree`); the attach handler
 /// passes its own stop so a card close is the same close the desktop row's
 /// Close sends.
+///
+/// The `request_id` is claimed atomically before anything runs: a repeat of
+/// the same request while the first is still running waits for its answer,
+/// one after it gets that answer for [`REQUEST_ID_MEMORY`], and neither does
+/// anything again (review B5, audit F6). The invocation runs on its own task,
+/// so a client that hangs up neither cancels an effect already under way nor
+/// leaves the id claimed with no answer.
 pub async fn invoke<F, Fut>(
     registry: &Arc<AgentPtyRegistry>,
     state: &crate::state::SharedState,
@@ -1876,16 +2380,56 @@ pub async fn invoke<F, Fut>(
     close: F,
 ) -> CardActionResult
 where
-    F: FnOnce(String, bool) -> Fut,
-    Fut: std::future::Future<Output = CloseOutcome>,
+    F: FnOnce(String, bool) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = CloseOutcome> + Send + 'static,
 {
-    let store = registry.agent_cards();
-    if let Some(first) = store.remembered(&request.request_id) {
-        return first;
+    if let Err(refusal) = check_request(&request) {
+        return *refusal;
     }
-    let result = invoke_once(registry, state, &request, close).await;
-    store.remember(&result);
-    result
+    let fingerprint = request_fingerprint(&request);
+    let rid = request.request_id.clone();
+    let registry = Arc::clone(registry);
+    let state = state.clone();
+    run_once(registry.agent_cards(), &rid, fingerprint, {
+        let registry = Arc::clone(&registry);
+        async move { invoke_once(&registry, &state, &request, close).await }
+    })
+    .await
+}
+
+/// Run `work` for `request_id` unless a request with that id ran or is
+/// running: the claim, the detached run and the answer every repeat gets.
+async fn run_once<W>(
+    store: &CardStore,
+    request_id: &str,
+    fingerprint: [u8; 32],
+    work: W,
+) -> CardActionResult
+where
+    W: std::future::Future<Output = CardActionResult> + Send + 'static,
+{
+    match store.claim(request_id, fingerprint) {
+        Claim::Answered(result) => result,
+        Claim::Wait(mut answer) => match answer.wait_for(Option::is_some).await {
+            Ok(result) => result.clone().unwrap_or_else(|| interrupted(request_id)),
+            Err(_) => interrupted(request_id),
+        },
+        Claim::Run(tx) => {
+            let task = tokio::spawn(work);
+            let result = task.await.unwrap_or_else(|_| interrupted(request_id));
+            store.finish(request_id, fingerprint, &result);
+            let _ = tx.send(Some(result.clone()));
+            result
+        }
+    }
+}
+
+fn interrupted(request_id: &str) -> CardActionResult {
+    CardActionResult::refused(
+        request_id,
+        CODE_DELIVERY_REFUSED,
+        "the deck could not finish this action; list the cards to see whether it took effect",
+    )
 }
 
 async fn invoke_once<F, Fut>(
@@ -1899,8 +2443,19 @@ where
     Fut: std::future::Future<Output = CloseOutcome>,
 {
     let rid = request.request_id.as_str();
+    // The ids a card names are this daemon's: another process may number an
+    // unrelated agent the same (review B3).
+    if request.instance_id != own_instance_id() {
+        return CardActionResult::refused(
+            rid,
+            CODE_DAEMON_REPLACED,
+            "the deck's daemon was restarted after this card was read; list the cards again",
+        );
+    }
     let key = entry_key(&request.pane_id, &request.agent_id);
-    let list = refresh(registry, state).await;
+    let store = registry.agent_cards();
+    let turn = store.serial.lock().await;
+    let list = refresh_in_turn(registry, state).await;
     let Some(entry) = list.entries.iter().find(|e| e.key == key) else {
         let pane_held = list.entries.iter().any(|e| e.pane_id == request.pane_id);
         return if pane_held {
@@ -1923,6 +2478,22 @@ where
             format!("card {key} has no action {}", request.action_id),
         );
     };
+    // The definition the user was shown, and nothing else, is what a press
+    // sends (review B2, audit F1).
+    if request.action_token != action.token {
+        let sentence = if request.action_token.is_empty() {
+            format!(
+                "the request names no version of action {}; list the cards and pass its token",
+                request.action_id
+            )
+        } else {
+            format!(
+                "action {} changed after this card was read, so nothing was sent; list the cards again and review it",
+                request.action_id
+            )
+        };
+        return CardActionResult::refused(rid, CODE_STALE_ACTION, sentence);
+    }
     if action.kind == "open" {
         return CardActionResult::refused(
             rid,
@@ -1955,6 +2526,9 @@ where
     match action.kind.as_str() {
         "close" | "close_keep_worktree" => {
             let keep = action.kind == "close_keep_worktree";
+            // The stop waits for the process; the store's turn is not held
+            // across it, so the cards stay readable meanwhile.
+            drop(turn);
             match close(request.agent_id.clone(), keep).await {
                 Ok(kept) => {
                     let list = refresh(registry, state).await;
@@ -1995,18 +2569,41 @@ where
                     }
                 }
             } else {
-                action.prompt.clone().unwrap_or_default()
+                match action.prompt.clone() {
+                    Some(prompt) if !prompt.trim().is_empty() => prompt,
+                    _ => {
+                        return CardActionResult::refused(
+                            rid,
+                            CODE_ACTION_DISABLED,
+                            format!("{} is disabled: it has no prompt to send", action.label),
+                        );
+                    }
+                }
             };
             let subject = format!("card action: {}", action.label);
-            match post_card_message(registry, &request.pane_id, &request.agent_id, subject, body) {
+            match post_card_message(
+                registry,
+                &request.pane_id,
+                &request.agent_id,
+                subject,
+                body.clone(),
+            ) {
                 Ok(message_id) => {
-                    let answer = request
-                        .action_id
-                        .strip_prefix("question/")
-                        .and_then(|rest| rest.split_once('/'))
-                        .map(|(q, o)| (q.to_string(), o.to_string()));
-                    store_delivery(registry, &key, &request.action_id, &message_id, answer);
-                    let list = refresh(registry, state).await;
+                    store.record_delivery(
+                        &key,
+                        CardDeliveryRecord {
+                            action_id: action.id.clone(),
+                            label: action.label.clone(),
+                            text: body,
+                            token: action.token.clone(),
+                            outcome: "sent".into(),
+                            message_id: message_id.clone(),
+                            state: "queued".into(),
+                            detail: None,
+                            at: Utc::now(),
+                        },
+                    );
+                    let list = refresh_in_turn(registry, state).await;
                     CardActionResult {
                         request_id: rid.to_string(),
                         outcome: "sent".into(),
@@ -2025,18 +2622,6 @@ where
             }
         }
     }
-}
-
-fn store_delivery(
-    registry: &Arc<AgentPtyRegistry>,
-    key: &str,
-    action_id: &str,
-    message_id: &str,
-    answer: Option<(String, String)>,
-) {
-    registry
-        .agent_cards()
-        .record_delivery(key, action_id, message_id, answer);
 }
 
 /// Post a card action's text to the inbox of the agent generation in
@@ -2352,6 +2937,8 @@ mod tests {
             pane_id: "p".into(),
             agent_id: "1".into(),
             action_id: "merge".into(),
+            action_token: "act-1".into(),
+            instance_id: "i".into(),
             request_id: "r".into(),
             confirm: false,
             text: None,
@@ -2382,6 +2969,481 @@ mod tests {
         let ty: crate::event::EventType = serde_json::from_str("\"agent_cardz\"").unwrap();
         assert_eq!(ty, crate::event::EventType::Unknown);
         assert!(crate::daemon_protocol::DAEMON_CAPABILITIES.contains(&"agent-cards"));
+    }
+
+    fn one(entries: &[AgentCardEntry], key: &str) -> AgentCardEntry {
+        entries.iter().find(|e| e.key == key).cloned().unwrap()
+    }
+
+    /// Review B2 / audit F1: an action's token names its definition — the
+    /// text it sends, its label, its confirmation and the question an option
+    /// answers — and nothing else, so an unrelated change to the card keeps
+    /// it and a changed definition never does.
+    #[test]
+    fn an_action_token_changes_with_its_definition_and_nothing_else() {
+        let catalog = resolve(None);
+        let base = r#"{"questions": [{"id": "q", "text": "Which?", "options": [{"id": "a", "label": "A"}]}],
+                       "actions": [{"name": "go", "label": "Go", "prompt": "Run the tests."}]}"#;
+        let token = |json: &str, stopped: bool, instance: &str| {
+            let mut slots = HashMap::new();
+            slots.insert("p1/1".to_string(), slot_with(json));
+            let mut f = facts("1", "p1");
+            f.stopped = stopped;
+            let e = one(&project_all(&[f], &slots, &catalog, &[], instance), "p1/1");
+            (
+                e.action("go").map(|a| a.token.clone()),
+                e.action("question/q/a").unwrap().token.clone(),
+                e.action("close").unwrap().token.clone(),
+            )
+        };
+        let (go, option, close) = token(base, false, "i");
+        assert!(go.as_deref().is_some_and(|t| t.starts_with("act-")));
+        assert_eq!(
+            token(base, false, "i"),
+            (go.clone(), option.clone(), close.clone())
+        );
+        // A status the deck noticed changes no definition.
+        let (stopped_go, _, stopped_close) = token(base, true, "i");
+        assert_eq!(stopped_go, go);
+        assert_eq!(stopped_close, close);
+        // Another prompt or label under the same id is another definition.
+        assert_ne!(
+            token(
+                &base.replace("Run the tests.", "Delete the branch."),
+                false,
+                "i"
+            )
+            .0,
+            go
+        );
+        assert_ne!(token(&base.replace("\"Go\"", "\"Go!\""), false, "i").0, go);
+        // So is the same option under another question.
+        assert_ne!(
+            token(&base.replace("Which?", "Which one?"), false, "i").1,
+            option
+        );
+        // And the same card listed by another daemon process.
+        assert_ne!(token(base, false, "j").2, close);
+    }
+
+    /// Review B7: removing a catalog action a report suggested by name takes
+    /// it off the card (it has no text of its own); a field whose value no
+    /// longer fits the type the catalog now gives it is not shown; a field the
+    /// catalog dropped is shown as the agent's own, with the type it gave.
+    #[test]
+    fn a_changed_catalog_is_applied_to_reports_already_published() {
+        let published = r#"{"fields": [{"name": "progress", "value": "half"}, {"name": "risk", "value": 3, "type": "number"}],
+                            "actions": [{"name": "merge"}, {"name": "zap", "label": "Zap", "prompt": "Do zap."}]}"#;
+        let mut slots = HashMap::new();
+        slots.insert("p1/1".to_string(), slot_with(published));
+        let defaults = resolve(None);
+        // `risk` was published as a catalog field by a user catalog naming it text.
+        let with_risk = resolve(Some(
+            "[[catalog.fields]]\nname = \"risk\"\ndescription = \"d\"\ntype = \"text\"\n",
+        ));
+        let e = one(
+            &project_all(&[facts("1", "p1")], &slots, &defaults, &[], "i"),
+            "p1/1",
+        );
+        assert!(e.action("merge").is_some());
+        assert!(
+            e.fields
+                .iter()
+                .any(|f| f.name == "risk" && f.custom && f.field_type == "number")
+        );
+
+        let removed = resolve(Some("[catalog]\nremove = [\"merge\"]\n"));
+        let e = one(
+            &project_all(&[facts("1", "p1")], &slots, &removed, &[], "i"),
+            "p1/1",
+        );
+        assert!(
+            e.action("merge").is_none(),
+            "no empty custom action: {:?}",
+            e.actions
+        );
+        assert!(
+            e.action("zap")
+                .is_some_and(|a| a.prompt.as_deref() == Some("Do zap."))
+        );
+        assert_ne!(e.primary_action_id, "merge");
+        for a in &e.actions {
+            if a.kind == "prompt" && !a.text_input {
+                assert!(a.prompt.as_deref().is_some_and(|p| !p.is_empty()), "{a:?}");
+            }
+        }
+
+        let e = one(
+            &project_all(&[facts("1", "p1")], &slots, &with_risk, &[], "i"),
+            "p1/1",
+        );
+        assert!(
+            !e.fields.iter().any(|f| f.name == "risk"),
+            "a number is not a text value: {:?}",
+            e.fields
+        );
+        assert!(e.fields.iter().any(|f| f.name == "progress"));
+    }
+
+    /// Product decision (a) and review S1: what was sent stays on the card
+    /// after a new report, newest first; an action shows as its last delivery
+    /// only a delivery of its current definition.
+    #[test]
+    fn deliveries_outlive_the_report_and_belong_to_one_definition() {
+        let catalog = resolve(None);
+        let store = CardStore::default();
+        store.publish(
+            "p1",
+            "1",
+            report(r#"{"actions": [{"name": "go", "label": "Go", "prompt": "One."}]}"#),
+        );
+        let project = |store: &CardStore| {
+            let inner = store.lock();
+            one(
+                &project_all(&[facts("1", "p1")], &inner.slots, &catalog, &[], "i"),
+                "p1/1",
+            )
+        };
+        let first = project(&store).action("go").unwrap().clone();
+        store.record_delivery(
+            "p1/1",
+            CardDeliveryRecord {
+                action_id: "go".into(),
+                label: "Go".into(),
+                text: "One.".into(),
+                token: first.token.clone(),
+                outcome: "sent".into(),
+                message_id: "m-1".into(),
+                state: "queued".into(),
+                detail: None,
+                at: Utc::now(),
+            },
+        );
+        assert_eq!(
+            project(&store)
+                .action("go")
+                .unwrap()
+                .last_delivery
+                .as_ref()
+                .map(|d| d.message_id.as_str()),
+            Some("m-1")
+        );
+        // The same id, another text: not this definition's delivery.
+        store.publish(
+            "p1",
+            "1",
+            report(r#"{"actions": [{"name": "go", "label": "Go", "prompt": "Two."}]}"#),
+        );
+        let e = project(&store);
+        assert!(e.action("go").unwrap().last_delivery.is_none());
+        assert_eq!(e.recent_deliveries.len(), 1);
+        assert_eq!(e.recent_deliveries[0].text, "One.");
+        // A report that no longer offers it keeps the record too.
+        store.publish("p1", "1", AgentReport::default());
+        let e = project(&store);
+        assert!(e.action("go").is_none());
+        assert_eq!(e.recent_deliveries[0].message_id, "m-1");
+    }
+
+    /// Audit F5: an entry keeps a bounded number and size of deliveries,
+    /// however many actions are invoked on it.
+    #[test]
+    fn recent_deliveries_are_bounded_by_count_and_bytes() {
+        let mut slot = Slot::default();
+        let record = |n: usize, text: String| CardDeliveryRecord {
+            action_id: format!("a{n}"),
+            label: "L".into(),
+            text,
+            token: format!("t{n}"),
+            outcome: "sent".into(),
+            message_id: format!("m-{n}"),
+            state: "queued".into(),
+            detail: None,
+            at: Utc::now(),
+        };
+        for n in 0..100 {
+            slot.push_delivery(record(n, "short".into()));
+        }
+        assert_eq!(slot.deliveries.len(), MAX_RECENT_DELIVERIES);
+        assert_eq!(slot.deliveries[0].message_id, "m-99", "newest first");
+        for n in 100..110 {
+            slot.push_delivery(record(n, "x".repeat(MAX_REPLY_TEXT_BYTES)));
+        }
+        let bytes: usize = slot
+            .deliveries
+            .iter()
+            .map(|d| d.text.len() + d.label.len() + d.action_id.len())
+            .sum();
+        assert!(bytes <= MAX_RECENT_DELIVERY_BYTES, "{bytes}");
+        assert_eq!(slot.deliveries[0].message_id, "m-109");
+    }
+
+    /// Review B4: a refresh that read the registry before a new generation
+    /// published (its snapshot has no such agent) neither prunes that
+    /// generation's report nor commits: it asks to read again. Without a
+    /// retry left it still keeps the report.
+    #[test]
+    fn a_stale_reading_never_prunes_a_report_published_after_it() {
+        let catalog = resolve(None);
+        let store = CardStore::default();
+        // A refresh reads the deck: only p1/1 is live.
+        let read_at = store.lock().epoch;
+        let stale = [facts("1", "p1")];
+        // Meanwhile p2/2 spawns and publishes.
+        store.publish("p2", "2", report(r#"{"summary": "fresh"}"#));
+        let now = Utc::now();
+        let instant = Instant::now();
+        let mut inner = store.lock();
+        let retried = inner.commit(
+            &stale,
+            &[],
+            &HashMap::new(),
+            &catalog,
+            "i",
+            read_at,
+            true,
+            now,
+            instant,
+        );
+        assert!(
+            retried.is_none(),
+            "a reading older than a publish is read again"
+        );
+        assert!(inner.slots.contains_key("p2/2"));
+        let (list, _) = inner
+            .commit(
+                &stale,
+                &[],
+                &HashMap::new(),
+                &catalog,
+                "i",
+                read_at,
+                false,
+                now,
+                instant,
+            )
+            .unwrap();
+        assert!(
+            inner.slots.contains_key("p2/2"),
+            "kept by the last attempt too"
+        );
+        assert_eq!(list.entries.len(), 1);
+        // A reading taken after the publish that still lacks p2/2 (it was
+        // closed) prunes it.
+        let read_at = inner.epoch;
+        inner
+            .commit(
+                &stale,
+                &[],
+                &HashMap::new(),
+                &catalog,
+                "i",
+                read_at,
+                true,
+                now,
+                instant,
+            )
+            .unwrap();
+        assert!(!inner.slots.contains_key("p2/2"));
+    }
+
+    /// Review B5 / audit F6: two overlapping invocations with one request id
+    /// run the work once and get the same answer; a later repeat gets it from
+    /// memory; the id reused for a different request is refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_request_id_runs_once_however_its_repeats_overlap() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let store = Arc::new(CardStore::default());
+        let runs = Arc::new(AtomicUsize::new(0));
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let work = {
+            let runs = Arc::clone(&runs);
+            async move {
+                runs.fetch_add(1, Ordering::SeqCst);
+                let _ = released.await;
+                CardActionResult {
+                    request_id: "card-1".into(),
+                    outcome: "sent".into(),
+                    message_id: Some("m-only".into()),
+                    kept_worktree: None,
+                    code: None,
+                    message: None,
+                    entry_revision: Some(1),
+                }
+            }
+        };
+        let first = tokio::spawn({
+            let store = Arc::clone(&store);
+            async move { run_once(&store, "card-1", [1; 32], work).await }
+        });
+        while runs.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        // The repeat arrives while the first is still running.
+        let second = tokio::spawn({
+            let store = Arc::clone(&store);
+            let runs = Arc::clone(&runs);
+            async move {
+                run_once(&store, "card-1", [1; 32], async move {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    CardActionResult::refused("card-1", "x", "a second run")
+                })
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        release.send(()).unwrap();
+        let (a, b) = (first.await.unwrap(), second.await.unwrap());
+        assert_eq!(a, b);
+        assert_eq!(a.message_id.as_deref(), Some("m-only"));
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "the work ran once");
+        let third = run_once(&store, "card-1", [1; 32], async {
+            CardActionResult::refused("card-1", "x", "a third run")
+        })
+        .await;
+        assert_eq!(third, a);
+        let reused = run_once(&store, "card-1", [2; 32], async {
+            CardActionResult::refused("card-1", "x", "never")
+        })
+        .await;
+        assert_eq!(reused.code.as_deref(), Some(CODE_REQUEST_REUSED));
+    }
+
+    /// Audit F4: a request with an oversized or odd request id, or an
+    /// oversized identifier, is refused before anything about it is kept;
+    /// and what is kept stays within its byte budget.
+    #[tokio::test]
+    async fn malformed_request_ids_are_refused_and_never_remembered() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let state: crate::state::SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let request = |request_id: String, pane_id: String| CardActionRequest {
+            pane_id,
+            agent_id: "1".into(),
+            action_id: "merge".into(),
+            action_token: "t".into(),
+            instance_id: own_instance_id(),
+            request_id,
+            confirm: false,
+            text: None,
+        };
+        let close = |_: String, _: bool| async { Ok(None) };
+        for (rid, pane) in [
+            ("x".repeat(8 * 1024 * 1024), "p".to_string()),
+            (String::new(), "p".to_string()),
+            ("card 1".to_string(), "p".to_string()),
+            (
+                "card-ok".to_string(),
+                "p".repeat(MAX_REQUEST_FIELD_BYTES + 1),
+            ),
+        ] {
+            let result = invoke(&registry, &state, request(rid, pane), close).await;
+            assert_eq!(
+                result.code.as_deref(),
+                Some(CODE_REQUEST_INVALID),
+                "{result:?}"
+            );
+            assert!(result.request_id.len() <= MAX_REQUEST_ID_BYTES);
+        }
+        assert!(registry.agent_cards().lock().requests.is_empty());
+        // Well-formed ids are remembered within the budget, however many.
+        for n in 0..(MAX_REMEMBERED_REQUESTS + 10) {
+            let result = invoke(
+                &registry,
+                &state,
+                request(format!("card-{n}"), "p".into()),
+                close,
+            )
+            .await;
+            assert_eq!(result.code.as_deref(), Some(CODE_UNKNOWN_ENTRY));
+        }
+        let inner = registry.agent_cards().lock();
+        assert!(inner.requests.len() <= MAX_REMEMBERED_REQUESTS);
+        let bytes: usize = inner
+            .requests
+            .iter()
+            .map(|(k, r)| k.len() + r.bytes())
+            .sum();
+        assert!(bytes <= MAX_REMEMBERED_BYTES);
+    }
+
+    /// Review B3: an invocation naming another daemon process is refused
+    /// before anything is resolved.
+    #[tokio::test]
+    async fn an_invocation_from_another_daemon_process_is_refused() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let state: crate::state::SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let request = CardActionRequest {
+            pane_id: "p".into(),
+            agent_id: "1".into(),
+            action_id: "merge".into(),
+            action_token: "t".into(),
+            instance_id: "a-daemon-that-was-replaced".into(),
+            request_id: "card-b3".into(),
+            confirm: false,
+            text: None,
+        };
+        let result = invoke(&registry, &state, request, |_: String, _: bool| async {
+            Ok(None)
+        })
+        .await;
+        assert_eq!(result.code.as_deref(), Some(CODE_DAEMON_REPLACED));
+    }
+
+    /// Review B1: a subscription that did not opt in — every subscriber
+    /// older than cards, and the TUI — is never sent a card doorbell, which
+    /// an older reader would apply to a session as activity; one that opted
+    /// in is. The request a client sent before the flag existed still decodes
+    /// and means "no doorbells", and the flag is omitted when off.
+    #[test]
+    fn card_doorbells_reach_only_subscriptions_that_opted_in() {
+        use crate::daemon_protocol::{AttachRequest, event_frame};
+        let bell = BroadcastMsg::Event(doorbell_event(&Doorbell {
+            key: "p1/1".into(),
+            revision: 3,
+            removed: false,
+        }));
+        assert!(is_doorbell(&bell));
+        assert!(
+            event_frame(&bell, false).is_none(),
+            "an un-opted subscriber gets none"
+        );
+        let sent = event_frame(&bell, true).unwrap().unwrap();
+        assert!(String::from_utf8(sent).unwrap().contains("agent_card"));
+        let other: crate::event::AgentEvent = serde_json::from_value(serde_json::json!({
+            "session_id": "s", "agent_type": "claude_code", "event_type": "tool_start",
+            "timestamp": "2026-11-17T12:00:00Z", "metadata": {},
+        }))
+        .unwrap();
+        assert!(event_frame(&BroadcastMsg::Event(other), false).is_some());
+
+        let old: AttachRequest = serde_json::from_str(r#"{"op":"subscribe-events"}"#).unwrap();
+        assert!(matches!(
+            old,
+            AttachRequest::SubscribeEvents { agent_cards: false }
+        ));
+        assert_eq!(
+            serde_json::to_string(&AttachRequest::SubscribeEvents { agent_cards: false }).unwrap(),
+            r#"{"op":"subscribe-events"}"#
+        );
+        let opted: AttachRequest =
+            serde_json::from_str(r#"{"op":"subscribe-events","agent_cards":true}"#).unwrap();
+        assert!(matches!(
+            opted,
+            AttachRequest::SubscribeEvents { agent_cards: true }
+        ));
+        // A request from before the token and instance existed decodes, and
+        // is refused by the daemon rather than failing to parse.
+        let old: AttachRequest = serde_json::from_str(
+            r#"{"op":"invoke-card-action","pane_id":"p","agent_id":"1","action_id":"merge","request_id":"r"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            old,
+            AttachRequest::InvokeCardAction { ref action_token, ref instance_id, .. }
+                if action_token.is_empty() && instance_id.is_empty()
+        ));
     }
 
     #[test]

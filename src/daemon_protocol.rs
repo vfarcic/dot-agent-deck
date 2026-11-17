@@ -2612,7 +2612,21 @@ pub enum AttachRequest {
     /// remote mode opens exactly one of these on startup so its
     /// `AppState` mirrors the daemon's view of live agent activity (agent
     /// type, tool counts, prompts, last-activity timestamps).
-    SubscribeEvents,
+    ///
+    /// PRD #2374 (review B1): `agent_cards` opts this subscription into the
+    /// agent-card doorbells ([`crate::event::EventType::AgentCard`]); without
+    /// it the daemon forwards none. An older reader applies an unknown event
+    /// to a session (activity, hook generation), so a doorbell is not inert
+    /// to it, and only a subscriber that asked receives one. The flag is
+    /// additive — omitted when false, so the request a client sent before it
+    /// existed is byte for byte the same and still means "no doorbells" —
+    /// and sent only to a daemon whose `Hello` advertised
+    /// [`CAP_AGENT_CARDS`] (`DaemonClient::subscribe_events_with_agent_cards`),
+    /// so no [`PROTOCOL_VERSION`] bump.
+    SubscribeEvents {
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        agent_cards: bool,
+    },
     /// Issue #1555: [`Self::SubscribeEvents`], answered with the daemon's agents
     /// as of the instant the subscription opened — the OK `RESP` carries the
     /// same [`AttachResponse::agent_records`] a [`Self::ListAgents`] reply does,
@@ -3395,6 +3409,16 @@ pub enum AttachRequest {
         pane_id: String,
         agent_id: String,
         action_id: String,
+        /// The `token` of the action definition the user was shown, from
+        /// the card list. The daemon refuses a definition that changed since
+        /// as `stale_action` (review B2), and a request without one too.
+        #[serde(default)]
+        action_token: String,
+        /// The `instance_id` of the daemon process that listed the card. The
+        /// daemon refuses another process's as `daemon_replaced`, since its
+        /// agent ids may name unrelated agents (review B3).
+        #[serde(default)]
+        instance_id: String,
         request_id: String,
         /// The user confirmed an action that asks for it.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -8074,6 +8098,8 @@ async fn handle_connection(
             pane_id,
             agent_id,
             action_id,
+            action_token,
+            instance_id,
             request_id,
             confirm,
             text,
@@ -8082,17 +8108,19 @@ async fn handle_connection(
                 pane_id,
                 agent_id,
                 action_id,
+                action_token,
+                instance_id,
                 request_id,
                 confirm,
                 text,
             };
             // A card's close is the same stop the desktop row's Close sends.
-            let close = |id: String, keep: bool| {
+            let close = {
                 let registry = Arc::clone(&registry);
                 let state = state.clone();
                 let event_tx = event_tx.clone();
                 let worktree_registry = worktree_registry.clone();
-                async move {
+                move |id: String, keep: bool| async move {
                     let (outcome, hold) = stop_agent_request(
                         &id,
                         keep,
@@ -8133,10 +8161,10 @@ async fn handle_connection(
             };
             write_resp(&mut stream, &resp).await?
         }
-        AttachRequest::SubscribeEvents => {
+        AttachRequest::SubscribeEvents { agent_cards } => {
             #[cfg(feature = "e2e")]
             crate::doorbell::record_for_test("subscribe-events");
-            handle_subscribe_events(stream, event_tx).await?;
+            handle_subscribe_events(stream, event_tx, agent_cards).await?;
         }
         AttachRequest::SubscribeEventsWithSnapshot => {
             #[cfg(feature = "e2e")]
@@ -9903,12 +9931,44 @@ pub async fn write_resp<W: AsyncWrite + Unpin>(w: &mut W, resp: &AttachResponse)
 /// (see [`AppState::handle_delegate`] /
 /// [`AppState::handle_work_done`]) and the surviving PTY scrollback
 /// makes a separate replay path unnecessary.
+///
+/// PRD #2374 (review B1): agent-card doorbells reach the stream only when
+/// `agent_cards` opted in; while one that did is open, the daemon's card
+/// watcher runs ([`agent_card_subscribers`]).
 async fn handle_subscribe_events(
     stream: IpcStream,
     event_tx: broadcast::Sender<BroadcastMsg>,
+    agent_cards: bool,
 ) -> io::Result<()> {
     let rx = event_tx.subscribe();
-    forward_event_stream(stream, rx, &AttachResponse::ok()).await
+    let _opted_in = agent_cards.then(AgentCardSubscriber::enter);
+    forward_event_stream(stream, rx, &AttachResponse::ok(), agent_cards).await
+}
+
+/// How many open event subscriptions opted into agent-card doorbells.
+static AGENT_CARD_SUBSCRIBERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// PRD #2374: how many open event subscriptions opted into agent-card
+/// doorbells. The card watcher recomputes only while one is open.
+pub fn agent_card_subscribers() -> usize {
+    AGENT_CARD_SUBSCRIBERS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Counts one opted-in subscription for as long as it lives.
+struct AgentCardSubscriber;
+
+impl AgentCardSubscriber {
+    fn enter() -> Self {
+        AGENT_CARD_SUBSCRIBERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        AgentCardSubscriber
+    }
+}
+
+impl Drop for AgentCardSubscriber {
+    fn drop(&mut self) {
+        AGENT_CARD_SUBSCRIBERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// Issue #1555: [`AttachRequest::SubscribeEventsWithSnapshot`]. The receiver is
@@ -9987,7 +10047,7 @@ async fn handle_subscribe_events_with_snapshot(
     // reply, on the stream, or both; every list carries its revision and a
     // client keeps the newest.
     resp.trust_requests = crate::trust_requests::list();
-    forward_event_stream(stream, rx, &resp).await
+    forward_event_stream(stream, rx, &resp, false).await
 }
 
 /// PRD #1497: [`AttachRequest::SubscribeTurnReplies`]. The receiver is opened
@@ -10048,21 +10108,36 @@ pub const TURN_REPLIES_END_AGENT_EXITED: &[u8] = b"agent-exited";
 
 /// The forwarding loop both subscribe handlers share: confirm with `resp`, then
 /// write each broadcast `rx` receives as a `KIND_EVENT` frame until the stream
-/// ends. See [`handle_subscribe_events`].
+/// ends — an agent-card doorbell only when `agent_cards` opted in. See
+/// [`handle_subscribe_events`].
 async fn forward_event_stream(
     stream: IpcStream,
     rx: broadcast::Receiver<BroadcastMsg>,
     resp: &AttachResponse,
+    agent_cards: bool,
 ) -> io::Result<()> {
     forward_broadcast(
         stream,
         rx,
         resp,
         "subscribe-events",
-        |msg| Some(serde_json::to_vec(msg)),
+        |msg| event_frame(msg, agent_cards),
         std::future::pending(),
     )
     .await
+}
+
+/// The `KIND_EVENT` payload of one broadcast on an event subscription, or
+/// `None` for a message it does not carry: an agent-card doorbell on a
+/// subscription that did not opt in (PRD #2374, review B1).
+pub(crate) fn event_frame(
+    msg: &BroadcastMsg,
+    agent_cards: bool,
+) -> Option<serde_json::Result<Vec<u8>>> {
+    if !agent_cards && crate::agent_cards::is_doorbell(msg) {
+        return None;
+    }
+    Some(serde_json::to_vec(msg))
 }
 
 /// Confirm with `resp`, then write each message `rx` receives that `encode`
@@ -14203,12 +14278,15 @@ mod tests {
         // wire shape is just `{"op": "subscribe-events"}`. Older daemons
         // would respond with `expected REQ frame, got kind 0x...` —
         // adding the variant doesn't break the existing dispatch.
-        let req = AttachRequest::SubscribeEvents;
+        let req = AttachRequest::SubscribeEvents { agent_cards: false };
         let json = serde_json::to_string(&req).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["op"], "subscribe-events");
         let back: AttachRequest = serde_json::from_str(&json).unwrap();
-        assert!(matches!(back, AttachRequest::SubscribeEvents));
+        assert!(matches!(
+            back,
+            AttachRequest::SubscribeEvents { agent_cards: false }
+        ));
     }
 
     #[tokio::test]

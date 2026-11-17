@@ -12,7 +12,8 @@ export type RowMenuControls = Pick<VoiceActionContext, "toggleOverviewRowMenu" |
 /**
  * PRD #2374 — a dashboard table row's additions while the cards are shown:
  * the needs-you marker the daemon set, and a ⋯ menu holding **Show card**
- * and the card's primary action. The row's own click still opens the agent;
+ * and the card's primary action — which opens the card at a review step
+ * showing the exact text, never sends from the label. The row's own click still opens the agent;
  * both controls are buttons, which the row's click handler leaves alone.
  */
 export function OverviewRowCard({ card, name, rowKey, open, controls }: {
@@ -60,13 +61,17 @@ export function OverviewRowCard({ card, name, rowKey, open, controls }: {
         {open && (
           <div className="overview-card-menu-list" role="menu" aria-label={`${name} card`}>
             <button type="button" role="menuitem" data-testid="overview-row-show-card" onClick={() => VOICE_ACTIONS.showAgentCard.run(controls, cardRef(card))}>Show card</button>
+            {/* The menu shows only the action's label, so it never sends: it
+                opens the card at a step showing exactly what the action does,
+                and the user sends it from there (review B8, audit F2). */}
             {primary && primary.id !== "open" && (
               <button
                 type="button"
                 role="menuitem"
                 data-testid="overview-row-primary"
                 disabled={!primary.enabled}
-                onClick={() => VOICE_ACTIONS.runCardAction.run(controls, { ...cardRef(card), cardActionId: primary.id })}
+                title="Shows exactly what it sends before anything is sent"
+                onClick={() => VOICE_ACTIONS.runCardAction.run(controls, { ...cardRef(card), cardActionId: primary.id, cardActionReview: true })}
               >{displayText(actionLabel(card.entry, primary), DISPLAY_LIMITS.name)}</button>
             )}
           </div>

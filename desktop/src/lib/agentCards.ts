@@ -52,7 +52,7 @@ export function placedCardKey(card: Pick<PlacedCard, "deckId"> & { entry: Pick<A
   return `${card.deckId}\u0000${card.entry.instance_id}\u0000${card.entry.key}`;
 }
 
-/** What a card action is sent to: this entry, as the daemon process that listed it. */
+/** What a card action is sent to: this entry, as the daemon process that listed it (the action's `token` goes with the press). */
 export function cardTarget(card: PlacedCard): AgentCardTarget {
   return { deckId: card.deckId, instanceId: card.entry.instance_id, paneId: card.entry.pane_id, agentId: card.entry.agent_id };
 }
@@ -191,9 +191,16 @@ const DELIVERY_STATE: Record<string, string> = {
   not_delivered: "Not delivered",
 };
 
-export function deliverySentence(delivery: NonNullable<AgentCardAction["last_delivery"]>): string {
+export function deliverySentence(delivery: Pick<NonNullable<AgentCardAction["last_delivery"]>, "state" | "detail">): string {
   const state = DELIVERY_STATE[delivery.state] ?? delivery.state;
   return delivery.detail ? `${state} (${delivery.detail.replace(/_/g, " ")})` : state;
+}
+
+/** When a delivery happened, as a local clock time; `—` for a time that does not parse. */
+export function formatClockTime(at: string): string {
+  const parsed = new Date(at);
+  if (Number.isNaN(parsed.getTime())) return "—";
+  return parsed.toLocaleTimeString([], { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
 /** A field's value as text: lists joined, booleans in words, everything else as it came. */
@@ -245,10 +252,14 @@ export function actionLabel(entry: AgentCardEntry, action: AgentCardAction): str
   return action.label;
 }
 
-/** The first 60 characters of a prompt, for the card's preview under its primary button. */
+/**
+ * The start of a prompt, for the card's preview under its primary button:
+ * its first `max` characters as shown by {@link exactTextString} (invisible
+ * characters escaped, nothing collapsed), with `…` when there is more.
+ */
 export function promptPreview(prompt: string, max = 60): string {
-  const flat = prompt.replace(/\s+/g, " ").trim();
-  return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`;
+  const shown = Array.from(exactTextString(prompt).replace(/\n/g, "\u21b5"));
+  return shown.length <= max ? shown.join("") : `${shown.slice(0, max - 1).join("")}…`;
 }
 
 /**
@@ -260,11 +271,131 @@ export function multilineText(value: string): string {
   return value.split("\n").map((line) => sanitizeText(line)).join("\n");
 }
 
-/** What the overlay is doing besides showing the card: asking to confirm one action, or taking a reply. */
-export type CardOverlayStep = { kind: "confirm"; actionId: string } | { kind: "reply" };
+/** One piece of a prompt as the user is shown it: the exact characters, and how they are shown. */
+export interface ExactTextSegment {
+  /** The characters sent, exactly. */
+  raw: string;
+  /** What is shown for them: the same text, or a visible escape such as `\t` or `\u{202E}`. */
+  shown: string;
+  /** Whether `shown` is an escape standing for an invisible or reordering character. */
+  escaped: boolean;
+}
 
-/** The answer to the last press of each action on the open card, by action id, as the daemon gave it. */
+/*
+ * The characters a prompt preview shows as visible escapes rather than as
+ * themselves: control characters other than the line break (a tab included),
+ * format characters (bidi overrides and isolates, zero-width characters, the
+ * byte-order mark, the soft hyphen) and the line and paragraph separators.
+ * Shown as themselves they are invisible, or reorder or split the text
+ * around them, so the preview would not show what is sent (audit F3).
+ */
+const INVISIBLE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
+
+/** The visible escape for one invisible character. */
+function escapeOf(char: string): string {
+  if (char === "\t") return "\\t";
+  if (char === "\r") return "\\r";
+  return `\\u{${(char.codePointAt(0) ?? 0).toString(16).toUpperCase().padStart(4, "0")}}`;
+}
+
+/**
+ * A prompt split into what it is and how to show it, so the preview renders
+ * EXACTLY the text that is sent: nothing is dropped, merged or normalised,
+ * line breaks stay line breaks, and every invisible or reordering character is
+ * shown as a visible escape (audit F3). Joining the `raw` parts gives the
+ * prompt back character for character.
+ */
+export function exactTextSegments(value: string): ExactTextSegment[] {
+  const segments: ExactTextSegment[] = [];
+  let plain = "";
+  for (const char of value) {
+    if (char !== "\n" && INVISIBLE.test(char)) {
+      if (plain) segments.push({ raw: plain, shown: plain, escaped: false });
+      plain = "";
+      segments.push({ raw: char, shown: escapeOf(char), escaped: true });
+    } else {
+      plain += char;
+    }
+  }
+  if (plain) segments.push({ raw: plain, shown: plain, escaped: false });
+  return segments;
+}
+
+/** A prompt as one string with its invisible characters escaped, for a hover (`title`), which cannot style them. */
+export function exactTextString(value: string): string {
+  return exactTextSegments(value).map((segment) => segment.shown).join("");
+}
+
+/**
+ * What the overlay is doing besides showing the card: asking to confirm (or,
+ * from the table's menu, to review) one action, or taking a reply. A confirm
+ * step holds the `token` of the definition it shows, so what the user
+ * confirms is what is sent: if the agent changes the action meanwhile, the
+ * step says so and sends nothing until the new text was reviewed.
+ */
+export type CardOverlayStep = { kind: "confirm"; actionId: string; token: string } | { kind: "reply" };
+
+/**
+ * The answer to the last press of each action definition on one card, by the
+ * definition's `token`, as the daemon gave it. Keyed by token, so an action id
+ * the agent reused for new text does not show the old text's answer.
+ */
 export type CardResults = Readonly<Record<string, CardActionResult | { outcome: "pending" } | { outcome: "failed"; message: string }>>;
+
+/** A deck as the cards view needs it: whether it is connected, and the daemon process its connection names. */
+export interface CardsConnection {
+  connected: boolean;
+  incarnation?: string;
+}
+
+/**
+ * Whether `next` may replace `held` as a deck's cards (review B6): only for a
+ * deck in the fleet that is connected, only from the daemon process that
+ * connection names, and never an older revision of that process's cards than
+ * the one held. Pushed snapshots and direct reads both pass through here.
+ */
+export function acceptCardsSnapshot(held: AgentCardsSnapshot | undefined, next: AgentCardsSnapshot, connection: CardsConnection | undefined): boolean {
+  if (!connection?.connected) return false;
+  if (connection.incarnation !== undefined && next.instanceId !== connection.incarnation) return false;
+  return !(held && held.instanceId === next.instanceId && next.revision < held.revision);
+}
+
+/**
+ * The cards still valid for `connections`: a deck that left the fleet or is
+ * not connected keeps none, and neither does one whose connection now names
+ * another daemon process than the one that listed its cards (a daemon
+ * replaced while the deck stayed connected).
+ */
+export function reconcileCards(held: Readonly<Record<string, AgentCardsSnapshot>>, connections: ReadonlyMap<string, CardsConnection>): Readonly<Record<string, AgentCardsSnapshot>> {
+  const kept = Object.entries(held).filter(([deckId, snapshot]) => {
+    const connection = connections.get(deckId);
+    return connection?.connected === true && (connection.incarnation === undefined || connection.incarnation === snapshot.instanceId);
+  });
+  return kept.length === Object.keys(held).length ? held : Object.fromEntries(kept);
+}
+
+/**
+ * The results still worth showing: those of cards still listed, and of action
+ * definitions those cards still offer — so the map is bounded by what is on
+ * screen (audit F5). What the daemon delivered stays on the card itself
+ * (`recent_deliveries`).
+ */
+export function pruneCardResults(results: Readonly<Record<string, CardResults>>, placed: readonly PlacedCard[]): Readonly<Record<string, CardResults>> {
+  const tokens = new Map(placed.map((card) => [placedCardKey(card), new Set(card.entry.actions.map((action) => action.token))]));
+  let changed = false;
+  const next: Record<string, CardResults> = {};
+  for (const [cardKey, byToken] of Object.entries(results)) {
+    const offered = tokens.get(cardKey);
+    if (!offered) {
+      changed = true;
+      continue;
+    }
+    const kept = Object.entries(byToken).filter(([token]) => offered.has(token));
+    if (kept.length !== Object.keys(byToken).length) changed = true;
+    if (kept.length) next[cardKey] = Object.fromEntries(kept);
+  }
+  return changed ? next : results;
+}
 
 /** The sentence for an invoke's answer. */
 export function resultSentence(result: CardResults[string]): string {

@@ -595,9 +595,13 @@ export type VoiceActionContext = {
   /**
    * Press one action of one card: by id from a button, by its label from
    * voice. A prompt action is sent; one that asks for confirmation, a close,
-   * and `reply` open the card's overlay at that step instead.
+   * and `reply` open the card's overlay at that step instead. `token` is the
+   * version of the action the pressed button showed (the daemon refuses a
+   * changed one); `review` opens the overlay at a review step showing the
+   * exact text instead of sending — what a control that shows only a label
+   * asks for (review B8).
    */
-  runCardAction: (target: AgentCardRef, action: { actionId?: string; label?: string }) => string | undefined;
+  runCardAction: (target: AgentCardRef, action: { actionId?: string; label?: string; token?: string; review?: boolean }) => string | undefined;
   /** Send `text` as a reply to one card's agent. */
   replyToAgentCard: (target: AgentCardRef, text: string) => string | undefined;
   /** The card overlay's confirm step: send the action it is asking about, confirmed. */
@@ -1272,10 +1276,15 @@ export const VOICE_ACTIONS = {
     label: "Press one of a card's actions",
     voice: true,
     needs: ["runCardAction"],
-    run: (context: Pick<VoiceActionContext, "runCardAction"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: AgentCardRef & Pick<VoiceDispatchTarget, "cardActionId" | "cardActionLabel">) => {
+    run: (context: Pick<VoiceActionContext, "runCardAction"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: AgentCardRef & Pick<VoiceDispatchTarget, "cardActionId" | "cardActionLabel" | "cardActionToken" | "cardActionReview">) => {
       const refused = target.cardActionId === undefined && target.cardActionLabel === undefined
         ? CARD_ACTION_UNHEARD
-        : context.runCardAction(cardRefOf(target), { ...(target.cardActionId !== undefined ? { actionId: target.cardActionId } : {}), ...(target.cardActionLabel !== undefined ? { label: target.cardActionLabel } : {}) });
+        : context.runCardAction(cardRefOf(target), {
+          ...(target.cardActionId !== undefined ? { actionId: target.cardActionId } : {}),
+          ...(target.cardActionLabel !== undefined ? { label: target.cardActionLabel } : {}),
+          ...(target.cardActionToken !== undefined ? { token: target.cardActionToken } : {}),
+          ...(target.cardActionReview ? { review: true } : {}),
+        });
       if (refused !== undefined) context.reportRefused?.(refused);
     },
   },
@@ -1726,6 +1735,10 @@ export type VoiceDispatchTarget = AgentViewTarget & {
   cardActionId?: string;
   /** PRD #2374 — the card action a `run_card_action` dispatch names, by its label as the user said it. */
   cardActionLabel?: string;
+  /** PRD #2374 — the version (`token`) of the card action the pressed button showed. */
+  cardActionToken?: string;
+  /** PRD #2374 — open the card at a review step showing the action's exact text instead of sending it (review B8). */
+  cardActionReview?: boolean;
   /** PRD #2374 — the words a `reply_to_agent_card` dispatch sends, the transcript's own. */
   cardReplyText?: string;
   /**
