@@ -27990,6 +27990,12 @@ mod spawn_tests {
             Latch::Resolved(_, Resolution::Submitted)
         ));
         editor.control.lock().unwrap().on_enter = OnEnter::SubmitSilently;
+        // The first ring ends on the hook's token, which the model editor
+        // reports before it redraws its emptied composer: on a loaded runner
+        // the second ring could otherwise read the frame still holding the
+        // line and refuse as AwaitingPrompt (main run 44059710599).
+        editor.wait_drawn("");
+        editor.wait_clean();
         let second = editor.ring().await;
         assert_eq!(
             second.outcome,
