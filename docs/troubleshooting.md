@@ -157,7 +157,7 @@ No output means no deck hooks are installed for that agent. Then start an agent 
 
 ### A newly installed agent never changes status
 
-The agent works, but its card stays on a coarse status with no prompt or tool detail. The automatic install at startup writes hooks only for an agent it detects (see the table above): Claude Code and OpenCode by their config directory, Codex, Devin and Antigravity by their command (`agy` for Antigravity) on the daemon's `PATH`. An agent installed after the daemon started, or whose config directory does not exist yet, has no hooks.
+The agent works, but its card stays on a coarse status with no prompt or tool detail. The automatic install writes hooks only for an agent it detects (see the table above): Claude Code and OpenCode by their config directory, Codex, Devin and Antigravity by their command (`agy` for Antigravity) on the daemon's `PATH`. It runs when the deck starts, and again each time the deck starts an agent whose hooks are missing or call a deleted copy of the deck, so an agent set up after the daemon started usually gets its hooks when the deck next starts it ([Agent hooks](installation.md#agent-hooks)). An agent can still be left without them: Claude Code's very first run, before `~/.claude` exists; Codex, Devin or Antigravity when its command is not on the daemon's `PATH`; an agent started through a launcher the deck does not recognise; or a settings file the deck could not write.
 
 1. Install them explicitly: `dot-agent-deck hooks install --agent <claude-code|opencode|codex|devin|antigravity>`.
 2. Restart the agent (close its pane and start it again), because an agent reads its hook configuration when it starts.

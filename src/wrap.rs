@@ -1448,6 +1448,23 @@ fn arm_wrap_self_defense() {
 #[cfg(unix)]
 const CHILD_GROUP_BACKSTOP_POLL: Duration = Duration::from_millis(250);
 
+/// How often the forked backstop re-sweeps for its tag once the child's group
+/// is gone and a sweep found something still carrying it (issue #2132).
+///
+/// That first sweep runs the moment the group goes, which is also the moment
+/// the rest of the pane's tree is coming down: a Codex the wrapper put in a
+/// session of its own, the wrapper's own reaper (a fork of the wrapper, so its
+/// environment carries the tag), a helper still exiting. Each is gone a moment
+/// later. Before this the result of that one sweep was latched, so a reaper
+/// that caught the tree mid-teardown waited out the whole cap with nothing
+/// left to end — measured after `inbox/probe/041`: two daemon-forked reapers
+/// at `ppid` of the user's subreaper, fixture cwd deleted, still waiting 30 s
+/// after the test while no process on the machine carried either tag. A
+/// re-sweep is a `/proc` walk rather than a `killpg(…, 0)`, so it runs at this
+/// slower cadence, not at [`CHILD_GROUP_BACKSTOP_POLL`].
+#[cfg(unix)]
+const CHILD_GROUP_BACKSTOP_RESWEEP: Duration = Duration::from_secs(2);
+
 /// Floor for the forked reaper's fallback close loop: never scan fewer
 /// descriptors than this, whatever `RLIMIT_NOFILE` says. A wrapper holds well
 /// under a dozen (the inner PTY master, the redirected-descriptor pipes, the std
@@ -1715,7 +1732,9 @@ pub(crate) fn arm_child_group_backstop(
 /// was long gone. So group death now triggers one tag sweep instead of an exit —
 /// if nothing carries the tag the reaper still exits immediately, exactly as
 /// before, and if something does the reaper stays to its deadline and ends it
-/// there. The escapee's own cap says it may run until then, so killing it early
+/// there. While it waits it sweeps again every
+/// [`CHILD_GROUP_BACKSTOP_RESWEEP`] and exits once nothing carries the tag
+/// (issue #2132). The escapee's own cap says it may run until then, so killing it early
 /// would be the reaper deciding a question the cap has already answered.
 ///
 /// **What this does not cover.** A `SIGKILL` aimed at the reaper itself leaves
@@ -1758,15 +1777,28 @@ fn child_group_backstop_main(
         let deadline = monotonic_millis().saturating_add(millis_saturating(max_lifetime));
         // Set once the group is gone AND a sweep found an escapee still holding
         // the tag, which is the only reason to keep waiting past group death.
-        // Latched rather than re-tested so the poll loop stays a `killpg(…, 0)`
-        // and never becomes a `/proc` walk four times a second.
+        // While it is unset the poll stays a `killpg(…, 0)`; once it is set the
+        // sweep is repeated every `CHILD_GROUP_BACKSTOP_RESWEEP`, not every
+        // poll, and the reaper exits the first time nothing carries the tag
+        // (issue #2132): an escapee that has gone needs no deadline held for it.
         let mut escapees_pending = false;
+        let mut next_sweep: i64 = 0;
         while monotonic_millis() < deadline {
-            if !escapees_pending && !pid_group_alive(child_pid) {
+            if escapees_pending {
+                if monotonic_millis() >= next_sweep {
+                    if tagged(0) == 0 {
+                        libc::_exit(0);
+                    }
+                    next_sweep = monotonic_millis()
+                        .saturating_add(millis_saturating(CHILD_GROUP_BACKSTOP_RESWEEP));
+                }
+            } else if !pid_group_alive(child_pid) {
                 if tagged(0) == 0 {
                     libc::_exit(0);
                 }
                 escapees_pending = true;
+                next_sweep = monotonic_millis()
+                    .saturating_add(millis_saturating(CHILD_GROUP_BACKSTOP_RESWEEP));
             }
             sleep_millis(millis_saturating(CHILD_GROUP_BACKSTOP_POLL));
         }

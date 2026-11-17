@@ -93,9 +93,9 @@ fn installed_antigravity(fixture: &Fixture, deck: &Path) -> serde_json::Value {
 }
 
 /// Scenario: Install Antigravity hooks alongside a deliberately formatted user hook and a disabled deck hook, then reinstall after the agent rewrites the JSON. The five events retain their measured shape, the disabled switch and user bytes survive, and uninstall removes just the deck key.
-#[spec("hooks/install/028")]
+#[spec("hooks/install/032")]
 #[test]
-fn install_028_antigravity_preserves_user_hooks_disabled_switch_and_reinstalls() {
+fn install_032_antigravity_preserves_user_hooks_disabled_switch_and_reinstalls() {
     let fixture = Fixture::new();
     let scratch = fixture.scratch_deck();
     seed_antigravity(
@@ -184,9 +184,9 @@ fn install_028_antigravity_preserves_user_hooks_disabled_switch_and_reinstalls()
 }
 
 /// Scenario: Ask the installer to update a malformed Antigravity hooks file. It reports an error, leaves the original bytes in place and saves a byte-identical backup beside it.
-#[spec("hooks/install/029")]
+#[spec("hooks/install/033")]
 #[test]
-fn install_029_antigravity_malformed_json_is_backed_up_and_left_untouched() {
+fn install_033_antigravity_malformed_json_is_backed_up_and_left_untouched() {
     let fixture = Fixture::new();
     let scratch = fixture.scratch_deck();
     let invalid = b"{\n  \"user-hook\": [broken json\n";
@@ -213,9 +213,9 @@ fn install_029_antigravity_malformed_json_is_backed_up_and_left_untouched() {
 }
 
 /// Scenario: Install from a path containing spaces and a quote, then execute each written handler through sh in the global hooks directory with no deck pane environment. Shared App and IDE hooks exit successfully with an empty response, or allow for PreToolUse, and create no daemon or inbox state.
-#[spec("hooks/install/030")]
+#[spec("hooks/install/034")]
 #[test]
-fn install_030_antigravity_shell_quoted_hooks_do_nothing_outside_a_deck_pane() {
+fn install_034_antigravity_shell_quoted_hooks_do_nothing_outside_a_deck_pane() {
     use std::io::Write;
     use std::process::Stdio;
     let fixture = Fixture::new();

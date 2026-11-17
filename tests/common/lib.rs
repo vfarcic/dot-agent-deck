@@ -8174,6 +8174,8 @@ pub fn import_devin_credentials(test_home: &Path) -> std::io::Result<Vec<String>
 /// `check_*_available()` helpers — extracted so the BoolNot trait
 /// from M2 can be retired (M3.1 auditor Nit 5).
 fn cli_invocable(bin: &str) -> bool {
+    // Issue #2132: a preflight can run before anything else in the harness.
+    assert_agent_bin_pin_usable();
     std::process::Command::new(bin)
         .arg("--version")
         .stdin(std::process::Stdio::null())
@@ -8237,6 +8239,10 @@ pub fn require_real_e2e() -> bool {
 /// checked out, including ones predating this marker.
 #[doc(hidden)]
 pub fn _skip_if_err(result: Result<(), String>) -> bool {
+    // Issue #2132: a `DAD_AGENT_BIN` the constructor refused must not turn into
+    // a skip, or into a pass on whatever agent `PATH` held, in a test whose
+    // preflight runs an agent by name before any other harness call.
+    assert_agent_bin_pin_usable();
     // Issue #502/#785 audit S1. The narrowest choke point that covers every
     // runtime credential preflight: `skip_unless!` is what wraps each
     // `check_*_available` call, so a test that gates on a credential passes
@@ -10096,6 +10102,135 @@ pub unsafe fn detach_before_main() {
     let _ = CLEARED_BEFORE_MAIN.set(leaked);
 }
 
+/// Issue #2132: names a directory of agent executables (`claude`, `codex`,
+/// `opencode`, `pi`, or links to them) that a test run must use before any
+/// other copy on `PATH`. Set it on the command that runs the tests:
+/// `DAD_AGENT_BIN=~/pinned cargo test-e2e-live <filter>`.
+///
+/// It exists because `PATH` order is not the caller's to decide: `devbox run`
+/// puts `~/.local/bin` first inside every devbox layer (`devbox.json`'s
+/// `init_hook`), so a `PATH` prefix set before `devbox run -- cargo …`, or
+/// before a launcher such as `devbox run codex-big` starts the agent that runs
+/// the tests, is put second. An ordinary variable survives those launchers
+/// where a `PATH` prefix does not (`docs/develop/local-run.md` measured the
+/// same for `DAD_DEV_BIN`), and [`pin_agent_bin_before_main`] applies it inside
+/// the test process, after every launcher has had its turn.
+pub const AGENT_BIN_ENV: &str = "DAD_AGENT_BIN";
+
+/// The directory [`pin_agent_bin_before_main`] put first on this process's
+/// `PATH`, or why it refused [`AGENT_BIN_ENV`]'s value. Unset when the
+/// variable was not set.
+static AGENT_BIN_PIN: OnceLock<Result<PathBuf, String>> = OnceLock::new();
+
+/// Issue #2132: put [`AGENT_BIN_ENV`]'s directory first on this test process's
+/// `PATH`, before `main`.
+///
+/// One change to the process's own `PATH` is what makes the pin hold for every
+/// lookup at once. The harness and the test files read `PATH` in many places —
+/// the credential preflights run `claude --version` and `codex login status`
+/// by name, the `--version` readers that print the release under test, every
+/// deck's environment (`INHERIT_PASS`), [`path_with_binary_dir`], and the
+/// `PATH`s the test files build themselves — and the agent a deck spawns
+/// resolves on the deck's `PATH`, so the release the deck latches from the
+/// agent's header is the pinned one too.
+///
+/// A value that is empty or only whitespace is treated as unset. One that is
+/// not an absolute path to an existing directory changes nothing here and is
+/// recorded instead, so that [`assert_agent_bin_pin_usable`] fails the test at
+/// its first harness call or agent preflight: a pin that silently fell back to
+/// `PATH` order would run the very release it was set to avoid.
+///
+/// Called from the constructor [`link!`] defines in each test binary, after
+/// [`detach_before_main`]. Prints nothing: stderr is not promised to be usable
+/// before `main`.
+///
+/// # Safety
+///
+/// Call it only from a pre-main constructor, before any thread exists: it
+/// writes the process environment.
+#[doc(hidden)]
+pub unsafe fn pin_agent_bin_before_main() {
+    let Some(raw) = std::env::var_os(AGENT_BIN_ENV) else {
+        return;
+    };
+    if raw.to_string_lossy().trim().is_empty() {
+        return;
+    }
+    let pin = agent_bin_dir(Path::new(&raw));
+    if let Ok(dir) = &pin {
+        let host = std::env::var_os("PATH").unwrap_or_default();
+        let joined =
+            std::env::join_paths(std::iter::once(dir.clone()).chain(std::env::split_paths(&host)));
+        match joined {
+            // SAFETY: a constructor runs before `main`, so no other thread
+            // exists and nothing can observe the environment mid-write (see
+            // `detach_before_main`).
+            Ok(path) => unsafe { std::env::set_var("PATH", path) },
+            Err(e) => {
+                let _ = AGENT_BIN_PIN.set(Err(format!(
+                    "{AGENT_BIN_ENV}={} cannot be put on PATH: {e}",
+                    dir.display()
+                )));
+                return;
+            }
+        }
+    }
+    let _ = AGENT_BIN_PIN.set(pin);
+}
+
+/// [`pin_agent_bin_before_main`]'s check of [`AGENT_BIN_ENV`]'s value: an
+/// absolute path to an existing directory, returned as given (not
+/// canonicalized, so a pin directory of links resolves each link the way the
+/// spawned agent's `PATH` lookup will).
+pub(crate) fn agent_bin_dir(raw: &Path) -> Result<PathBuf, String> {
+    if !raw.is_absolute() {
+        return Err(format!(
+            "{AGENT_BIN_ENV}={} is not an absolute path; name the directory that holds the \
+             agent executables to run, e.g. {AGENT_BIN_ENV}=$HOME/pinned",
+            raw.display()
+        ));
+    }
+    if !raw.is_dir() {
+        return Err(format!(
+            "{AGENT_BIN_ENV}={} is not a directory; it names the directory that holds the \
+             agent executables to run (`claude`, `codex`, …), not one executable",
+            raw.display()
+        ));
+    }
+    // `contain_path` drops these from every `PATH` the harness gives a deck, so
+    // a pin there would reach the preflight but not the pane: the preflight
+    // would check one agent while the pane ran another.
+    if is_inside_checkout(&resolved_entry(raw)) || is_deck_telemetry_shim_dir(raw) {
+        return Err(format!(
+            "{AGENT_BIN_ENV}={} is inside the checkout or a deck's telemetry shim directory, \
+             which the harness keeps out of every deck's PATH, so the agent a pane runs would \
+             not be the pinned one; put the pin directory outside the checkout",
+            raw.display()
+        ));
+    }
+    Ok(raw.to_path_buf())
+}
+
+/// The directory [`AGENT_BIN_ENV`] pinned first on this process's `PATH`, when
+/// it was set and usable.
+pub fn agent_bin_pin() -> Option<&'static Path> {
+    match AGENT_BIN_PIN.get() {
+        Some(Ok(dir)) => Some(dir.as_path()),
+        _ => None,
+    }
+}
+
+/// Panic when [`AGENT_BIN_ENV`] was set to a value [`pin_agent_bin_before_main`]
+/// refused. Not a skip, even without `DOT_AGENT_DECK_REQUIRE_REAL_E2E`: the
+/// variable is set only by someone asking for a particular agent release, and
+/// running whatever `PATH` holds instead would answer a question they did not
+/// ask.
+pub fn assert_agent_bin_pin_usable() {
+    if let Some(Err(why)) = AGENT_BIN_PIN.get() {
+        panic!("{why}");
+    }
+}
+
 /// Issue #668: the wrapped-agent lifetime bound, in a file small enough for the
 /// test binaries that deliberately do NOT link this harness to
 /// `#[path]`-include on their own. For a binary that links this harness, the
@@ -10139,7 +10274,8 @@ pub mod child_lifetime_bound;
 /// root, so `common::…` and `crate::common::…` paths read as they did when the
 /// harness was a module. It imports [`skip_unless!`] there, where test bodies
 /// call it unqualified. And it defines, **inside the test binary**, the
-/// pre-main constructor that runs [`detach_before_main`] (issue #1473) and
+/// pre-main constructor that runs [`detach_before_main`] (issue #1473),
+/// [`pin_agent_bin_before_main`] (issue #2132) and
 /// [`child_lifetime_bound::pin_before_main`] (issue #678), and hands this
 /// crate the compile-time values only the test crate can see
 /// ([`register_test_crate`]).
@@ -10175,6 +10311,7 @@ macro_rules! link {
                 // exists yet — the condition both functions document.
                 unsafe {
                     $crate::detach_before_main();
+                    $crate::pin_agent_bin_before_main();
                     $crate::child_lifetime_bound::pin_before_main();
                 }
                 $crate::register_test_crate(
@@ -10204,6 +10341,7 @@ ctor::declarative::ctor! {
         // SAFETY: a pre-main constructor, so no other thread exists yet.
         unsafe {
             detach_before_main();
+            pin_agent_bin_before_main();
             child_lifetime_bound::pin_before_main();
         }
         // Cargo builds no `dot-agent-deck` binary for this crate's own tests
@@ -11739,6 +11877,9 @@ pub fn harness_temp_root() -> &'static Path {
             // through, so a binary that names this crate without `link!` fails
             // here, before it can spawn anything.
             assert_linked_before_main();
+            // Issue #2132: a `DAD_AGENT_BIN` the constructor refused fails here,
+            // before the test runs an agent `PATH` order chose instead.
+            assert_agent_bin_pin_usable();
             // Issue #701: this is the choke point every harness temp dir passes
             // through, including headless tests that never obtain a grid, so it
             // is where the panic hook — and with it the load baseline — gets

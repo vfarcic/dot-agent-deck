@@ -3685,7 +3685,7 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Layer:** L2 headless e2e (`tests/e2e_daemon_plugin_refresh.rs`), the real `daemon serve` from `common::spawn_daemon_serve` with a durable `~/.local/bin/dot-agent-deck` in an isolated HOME; no TUI is started.
 - **Agent:** none; a stand-in `opencode` script, run as a scheduled task's command through `RunNow`, records each plugin's `BINARY_PATH` the moment it starts, or that the plugin is absent. It answers `--version` with `1.18.35` and exits without recording, because the deck probes `<opencode> --version` before each OpenCode spawn and ahead of the per-spawn install (PRD #2050); a stand-in that recorded on that probe would record the stale pins.
 - **Asserts:** with no OpenCode folder at daemon start, no plugin is written; after both layouts (`~/.config/opencode`, `~/.opencode`) are created holding a plugin pinned to a deleted copy of the deck, the scheduled OpenCode agent finds the global root's plugin pinned to the daemon's `~/.local/bin/dot-agent-deck` as it starts, and no deck plugin left in `~/.opencode/plugin/`: since PRD #2050 the deck removes its legacy copy once the global root holds the module.
-- **Does not assert:** a plugin folder the deck cannot write, and the card notice that follows (`inbox/boundary/025`); a plugin pinned to another live install, which is kept (`inbox/boundary/025`); the plugin template's integration level (`inbox/boundary/025`); the daemon's startup install (`hooks/install/009`); Claude Code's hooks, which the daemon installs only when it starts (decision on issue #190); a real OpenCode.
+- **Does not assert:** a plugin folder the deck cannot write, and the card notice that follows (`inbox/boundary/025`); a plugin pinned to another live install, which is kept (`inbox/boundary/025`); the plugin template's integration level (`inbox/boundary/025`); the daemon's startup install (`hooks/install/009`); Claude Code's hooks, which the daemon repairs before an agent starts only when they need it (`hooks/install/028`–`030`); a real OpenCode.
 - **Platform coverage:** mac+linux.
 
 ##### hooks/install/025 — An OpenCode 2.x agent starts with the deck's 2.x layout and `--standalone` (PRD #2050).
@@ -3702,19 +3702,19 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** the 1.x TUI half (`dot-agent-deck-tui.js` and its `tui.json` entry), covered by the unit tests `opencode_every_layout_installs_the_same_files` and `opencode_alternating_generations_rewrite_nothing`; a machine with no global root, where 1.x keeps the legacy fan-out until the next install (unit-tested in `opencode_a_legacy_only_machine_converges_on_the_global_root`); a real OpenCode 1.x.
 - **Platform coverage:** mac+linux.
 
-##### hooks/install/028 — Antigravity hook installation preserves user content and disabled state through reinstall and uninstall.
+##### hooks/install/032 — Antigravity hook installation preserves user content and disabled state through reinstall and uninstall.
 - **Layer:** fast-tier CLI subprocess against isolated HOME (`tests/scratch_binary_hook_install.rs`), mac+linux, as hooks/install/007.
 - **Agent:** offline `agy` PATH stub; no credentials.
 - **Asserts:** exactly one named deck key in `~/.gemini/config/hooks.json`, five measured event arrays with wildcard tool matchers, raw user value bytes and `enabled:false` preserved, structurally idempotent reinstall after an agent rewrite, uninstall removes just the deck key.
 - **Does not assert:** real agent invocation (antigravity/live/001–002).
 
-##### hooks/install/029 — Malformed Antigravity hook JSON is backed up and left untouched.
+##### hooks/install/033 — Malformed Antigravity hook JSON is backed up and left untouched.
 - **Layer:** fast-tier CLI subprocess against isolated HOME (`tests/scratch_binary_hook_install.rs`), mac+linux.
 - **Agent:** offline `agy` PATH stub.
 - **Asserts:** install errors, original bytes remain, a byte-identical backup exists beside hooks.json.
 - **Does not assert:** unreadable files or disk exhaustion.
 
-##### hooks/install/030 — Shell-quoted Antigravity hooks safely run outside a deck pane.
+##### hooks/install/034 — Shell-quoted Antigravity hooks safely run outside a deck pane.
 - **Layer:** fast-tier CLI subprocess plus sh execution in the global config directory (`tests/scratch_binary_hook_install.rs`), mac+linux.
 - **Agent:** offline `agy` PATH stub and real hook CLI.
 - **Asserts:** a deck path containing spaces and a quote runs through sh for each of the five installed handlers, with exit 0 and `{}` or PreToolUse's allow response when no pane env exists; no project daemon/inbox state appears.
@@ -3731,6 +3731,27 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Agent:** the same stand-in, replaced by a new file between spawns (1.x, then 2.x, then 1.x), as an installer replaces the binary, so a version cache keyed on the file sees each change.
 - **Asserts:** each agent starts with the files `hooks/install/025`/`026` define, which are the same for both versions; the server module (`~/.config/opencode/plugin/dot-agent-deck.js`) and the 2.x TUI half keep the same bytes, inode and mtime from the first 1.x spawn through the 2.x spawn and back to 1.x, because OpenCode 2 reloads its plugins whenever the module file changes; `--standalone` is on the 2.x agent's argv once and on neither 1.x agent's.
 - **Does not assert:** the 1.x TUI half and `tui.json` across the switch (unit-tested in `opencode_alternating_generations_rewrite_nothing`); that a real OpenCode 2 reloads on a rewrite; an in-place rewrite of the binary that keeps size, mtime and inode; a version change between two spawns of the same running agent; a daemon of another template revision (`an_older_deck_never_downgrades_a_newer_template`).
+- **Platform coverage:** mac+linux.
+
+##### hooks/install/028 — A Claude Code agent a headless daemon starts from a scheduled task starts with the deck's hooks, even when Claude Code was set up after the daemon started, and hooks that already name the deck are not rewritten (issue #1973).
+- **Layer:** L2 headless e2e, lane 1 (`tests/e2e_daemon_hook_repair.rs`), the real `daemon serve` from `common::spawn_daemon_serve_with_env` with a durable `~/.local/bin/dot-agent-deck` in an isolated HOME and no `~/.claude` when it starts; no TUI is started.
+- **Agent:** none; a stand-in `claude`, first on the daemon's `PATH` and run as a scheduled task's command through `RunNow`, answers `--version` and exits, and otherwise copies `~/.claude/settings.json` (or `absent`) the moment it starts.
+- **Asserts:** with no `~/.claude` at daemon start no `settings.json` is written; after `~/.claude` is created, the first scheduled Claude Code agent starts with deck hook commands that all run the daemon's `~/.local/bin/dot-agent-deck`; a second scheduled start sees the same file and leaves its bytes, inode and mtime unchanged.
+- **Does not assert:** a real Claude Code reading the hooks; Codex and Devin, which take the same path (unit-tested in `hooks_refresh::tests::the_agents_repaired_before_a_start_are_claude_codex_and_devin` and `agent_pty::spawn_tests::a_claude_code_or_devin_spawn_asks_for_its_hooks_to_be_repaired`); a settings file the deck cannot write, which is logged (unit-tested in `hooks_refresh::tests::the_repair_runs_the_install_only_when_the_pins_need_it`); a launcher command with no declared agent type, which is not checked.
+- **Platform coverage:** mac+linux.
+
+##### hooks/install/029 — A Claude Code agent whose hooks name a deleted copy of the deck starts with them repaired, keeping the user's own hooks and settings (issue #1973).
+- **Layer:** as `hooks/install/028`.
+- **Agent:** as `hooks/install/028`.
+- **Asserts:** after the daemon started, `~/.claude/settings.json` is seeded with a deck `Stop` hook pinned to a deleted copy, a hook of the user's own and an unrelated `theme` setting; as the scheduled Claude Code agent starts, every deck hook runs the daemon's `~/.local/bin/dot-agent-deck`, the deleted copy is named nowhere, and the user's hook and setting are still there.
+- **Does not assert:** a pin to another live install, which the per-start check leaves alone (unit-tested in `hooks_refresh::tests::hooks_are_repaired_before_a_start_only_when_they_need_it`); the installer's own rules for which entries it owns (`hooks/install/001`–`003`).
+- **Platform coverage:** mac+linux.
+
+##### hooks/install/030 — A Claude Code agent whose `settings.json` is not valid JSON still starts, the file is left as it was, and the deck logs the refused repair (issue #1973).
+- **Layer:** as `hooks/install/028`, with the daemon's `DOT_AGENT_DECK_LOG` pointed at a file in the scratch directory.
+- **Agent:** as `hooks/install/028`.
+- **Asserts:** after the daemon started, `~/.claude/settings.json` is seeded with text that is not valid JSON; the scheduled Claude Code stand-in starts and sees that text unchanged, the file still holds it afterwards, and the deck's log has a line saying Claude Code's hooks could not be repaired before it started, and names the settings file.
+- **Does not assert:** the wording `hooks refresh` prints for the same file (`hooks/install/019`); a file the deck cannot read for permissions, which takes the same path.
 - **Platform coverage:** mac+linux.
 
 #### hooks/opencode-real
@@ -7924,7 +7945,7 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_antigravity_live.rs`), mac+linux; developer credentials required.
 - **Agent:** real interactive `agy`, default `gemini-3.8-flash-low`, overridable with `DOT_AGENT_DECK_ANTIGRAVITY_TEST_MODEL`; availability probes that same model.
 - **Asserts:** isolated token copy (mode 600) or `GEMINI_API_KEY`, seeded onboarding and workspace trust reach the real composer; a prompt typed through the attached TUI creates a unique sentinel with the requested content and the Antigravity card shows its submitted prompt and goes Working then Idle.
-- **Does not assert:** the installer (hooks/install/028–031), permissions, quota exhaustion or real subagents.
+- **Does not assert:** the installer (hooks/install/031–034), permissions, quota exhaustion or real subagents.
 
 ##### antigravity/live/002 — A real Antigravity worker receives a delegated task and reports completion.
 - **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_antigravity_live.rs`), mac+linux; developer credentials required.

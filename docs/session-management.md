@@ -137,7 +137,7 @@ In the TUI, a line under `Dir:` says which limit was hit and, when the provider 
 
 When a worker in an [orchestration](orchestration.md) that still owes a `work-done` turns Blocked, the daemon sends its orchestrator a one-time report, so the orchestrator can reassign the task or notify you; see [Idle Workers & Notifications](idle-workers-and-notifications.md).
 
-If Blocked never appears for Claude Code or OpenCode, the hook or plugin that reports it may not be installed. The deck installs them at startup only into configuration directories that already exist (`~/.claude`; `~/.config/opencode`, `$XDG_CONFIG_HOME/opencode` or `~/.opencode`). If the agent had never run on this machine when the deck started, run `dot-agent-deck hooks install` or `dot-agent-deck hooks install --agent opencode`, then restart the agent. On a remote host, run the same commands there.
+If Blocked never appears for Claude Code or OpenCode, the hook or plugin that reports it may not be installed. The deck installs them when it starts, and again before it starts a Claude Code or OpenCode agent: OpenCode's plugin every time, Claude Code's hooks when they are missing or call a deleted copy of the deck. Claude Code's are written only once `~/.claude` exists, so if Claude Code had never run on this machine, restart the agent and its next start gets them. If Blocked still never appears, run `dot-agent-deck hooks refresh`, which says what it could not install, then restart the agent. On a remote host, run the same commands there.
 
 ## Message delivery
 
