@@ -923,12 +923,27 @@ fn exercise_prompt_keys(
     assert_running(deck, agent_id, "the clear");
 
     // Interrupt: the list stops growing and the agent keeps running.
-    submit(
-        &mut writer,
-        "Write the numbers from 1 to 600 as a numbered list, each followed by one full sentence \
-         about that number. Do not use any tools and do not stop early.",
-        "Write the numbers",
-    );
+    // Flash can refuse a 600-item repetitive counting request. A practical
+    // gardening guide supplies benign, varied content while still streaming
+    // long enough to interrupt after the first five numbered items.
+    let (long_task, task_marker, last_item) = if launch.name == "voicekeys-antigravity" {
+        (
+            "Write a beginner gardening guide as a numbered list of 120 useful tips, numbered 1. \
+             through 120. Cover soil, watering, sunlight, seeds, vegetables, herbs, flowers, \
+             containers, compost and seasonal care. Give two short practical sentences per tip. \
+             Start directly with item 1. and write the guide in your reply without using tools.",
+            "Write a beginner gardening guide",
+            120,
+        )
+    } else {
+        (
+            "Write the numbers from 1 to 600 as a numbered list, each followed by one full sentence \
+             about that number. Do not use any tools and do not stop early.",
+            "Write the numbers",
+            600,
+        )
+    };
+    submit(&mut writer, long_task, task_marker);
     assert!(
         deck.wait_for_grid_predicate_within(
             Duration::from_secs(120),
@@ -955,7 +970,7 @@ fn exercise_prompt_keys(
     );
     let reached = reached.get();
     assert!(
-        reached < 600,
+        reached < last_item,
         "the turn finished rather than being interrupted:\n{}",
         deck.snapshot_grid()
     );
@@ -1026,7 +1041,7 @@ fn prompt_voice_keys_005_opencode_honours_the_served_keys() {
     exercise_prompt_keys(&launch, &deck, &agent_id, &keys, SENTINEL);
 }
 
-/// Scenario: Open genuine interactive Antigravity on the cheap Flash model with credentials and onboarding seeded into an isolated HOME, dismissing its first-run announcement even when it arrives after the composer. Write the keys served by the daemon through the desktop's attach stream, respecting its delete cap and pause: delete removes exactly the draft tail, clear empties the draft, interrupt stops a visibly streaming turn, and the next turn reports the fixture sentinel with the agent still running.
+/// Scenario: Open genuine interactive Antigravity on the cheap Flash model with credentials and onboarding seeded into an isolated HOME, dismissing its first-run announcement even when it arrives after the composer. Write the keys served by the daemon through the desktop's attach stream, respecting its delete cap and pause: delete removes exactly the draft tail, clear empties the draft, interrupt stops a visibly streaming beginner gardening guide, and the next turn reports the fixture sentinel with the agent still running.
 #[spec("prompt/voice-keys/006")]
 #[test]
 fn prompt_voice_keys_006_antigravity_honours_the_served_keys() {
