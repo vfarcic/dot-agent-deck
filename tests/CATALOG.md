@@ -14340,6 +14340,83 @@ The desktop half of answering by voice. These tests live in the desktop crate (`
 - **Does not assert:** a terminal showing the notification, or the TUI's main loop writing it (`question/live/007`).
 - **Platform coverage:** mac+linux.
 
+### Agent cards (PRD #2374)
+
+The TUI renders no cards in this slice (the desktop app does; `docs/desktop/agent-cards.md` names the gap), so the lane-1 tests drive the feature as the `card` CLI and the desktop's daemon requests do, and the desktop's own rendering is covered by `desktop/agent-cards/*`.
+
+#### agent-report/cli
+
+##### agent-report/cli/001 — An agent's published card is listed with what the deck computed.
+- **Layer:** L2 headless, lane 1 (`tests/e2e_agent_cards.rs`).
+- **Agent:** two synthetic routing stand-ins; no real agent.
+- **Asserts:** `card publish --file` from a pane (waiting status, a catalog and a custom field, a question, a custom action) exits 0 printing `Card published (revision N).`; `card list` shows the card with `report.source == "agent"`, reasons `["question","waiting"]`, the catalog field's resolved label/type/placement and the custom field's `custom`/`detail` defaults, the question's option actions with the deck-composed prompt, the always-offered `explain`, the custom action and the deck actions in the contract's order, `close-keep-worktree` omitted without a worktree, and `primary_action_id` on the first option; the second pane's card has `report: null`; `--json` prints the key and a higher revision.
+- **Does not assert:** the desktop's rendering (`desktop/agent-cards/*`), or bounds beyond the ones `agent-report/cli/003` refuses.
+- **Platform coverage:** mac+linux.
+
+##### agent-report/cli/002 — Card updates replace the card and wake no one.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_agent_cards.rs`).
+- **Agent:** synthetic routing stand-ins as dispatcher and dispatched single unit; no real agent.
+- **Asserts:** five `card publish --summary` runs from a dispatched unit each raise the revision; `card list` shows only the last summary with `report.revision == 5`, grouped under the dispatcher with the dispatcher's own card in the same group; the dispatcher's inbox gains nothing; the unit's `work-done --done` is then accepted and is the dispatcher inbox's only new message.
+- **Does not assert:** the work-done update budget's own limit (`dispatch/return/*`).
+- **Platform coverage:** mac+linux.
+
+##### agent-report/cli/003 — Unauthenticated or invalid card publishes are refused.
+- **Layer:** L2 headless, lane 1 (`tests/e2e_agent_cards.rs`).
+- **Agent:** a two-role synthetic routing team; no real agent.
+- **Asserts:** `card publish` exits 1 with one `Error: … [code]` line for no pane id (`not_in_pane`), no token (`missing_token`), another pane's token (`token_names_another_pane`), a current token under another agent id (`token_names_another_agent`), an over-long summary or an unknown status (`report_invalid`), and a restarted pane's previous token (`unknown_token`); none of these changes any card, and the restarted pane's new generation has a fresh card with no report.
+- **Does not assert:** an old daemon's `unsupported` answer (`agent-report/protocol/002`'s stub territory) or the 64 KiB input bound.
+- **Platform coverage:** mac+linux.
+
+#### agent-report/state
+
+##### agent-report/state/001 — An exited agent's card stays, stopped; a close removes it.
+- **Layer:** L2 headless, lane 1 (`tests/e2e_agent_cards.rs`).
+- **Agent:** one synthetic routing stand-in whose process is killed outside the deck; no real agent.
+- **Asserts:** after the exit the card stays with `status: "stopped"`, `stopped` first among its needs-you reasons and the report kept; every prompt action is `enabled: false` with `agent_stopped` and `card act` on one exits 1 `[action_disabled]`; `card act --action close --confirm` prints `Closed <name>.`, the card leaves `card list`, and an event subscriber sees an `agent_card` doorbell with `agent_card_removed`.
+- **Does not assert:** the doorbell's timing bound or coalescing.
+- **Platform coverage:** mac+linux.
+
+#### agent-report/catalog
+
+##### agent-report/catalog/001 — The catalog merges the user's entries over the defaults and validates reports.
+- **Layer:** L1/fast unit (`tests/agent_card_catalog.rs`).
+- **Agent:** none.
+- **Asserts:** with no user config the defaults resolve in the contract's order and types; a user entry with a default's name replaces it whole, a new name is appended in file order and `remove` drops a default; each bad entry (unknown `remove` name, unknown type or placement, bad name, missing description or action prompt, unknown key, reserved name, duplicate) is one error naming it while the rest applies; an unparseable file yields the defaults and one error; a report with a custom field passes, and mistyped, reserved, over-long, multi-line-summary, unknown-key, 33-field and 9-option reports are refused `report_invalid`, naming what is wrong.
+- **Does not assert:** the daemon re-reading the config or the dispatch text in a dispatched task (`agent-report/catalog/002`).
+- **Platform coverage:** mac+linux.
+
+##### agent-report/catalog/002 — The resolved catalog prints and travels with both dispatch shapes.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_agent_cards.rs`).
+- **Agent:** synthetic routing stand-ins as dispatcher, single unit and one-role team; no real agent.
+- **Asserts:** with a user config adding field `risk` and action `ship` and removing `merge`, `card catalog` prints the agent-card block with `risk`/`ship`, the defaults, no `merge` and no always-offered `explain`; `--json` lists the same names in order with `ship` from the user and the config path read; the single unit's seeded task and the team's published orchestrator context file both contain the block `card catalog` printed, verbatim.
+- **Does not assert:** a project-level `[catalog]` (ignored in this slice).
+- **Platform coverage:** mac+linux.
+
+#### agent-report/actions
+
+##### agent-report/actions/001 — A card's prompt action reaches only its own agent.
+- **Layer:** L2 headless, lane 1 (`tests/e2e_agent_cards.rs`).
+- **Agent:** a two-role synthetic routing team; no real agent.
+- **Asserts:** `card act` on the worker's `merge` prints `Sent to <name>: message m-… (queued).`, the worker's inbox holds that message bound to its generation with subject `card action: Merge it` and the catalog prompt, the orchestrator's inbox is unchanged, and the card's `last_delivery` names the message as `queued`; a confirm action is refused `[confirm_required]` posting nothing and sent with `--confirm`; `reply` needs text and sends it as typed; answering the question records `answered` and drops `question` from the reasons; an unknown action is `[unknown_action]`; a repeated request id is answered with the first result and posts once; `card act` from a pane is `[agent_caller]`; after `pane restart` the old card's key is `[stale_entry]` and nothing reaches the new generation.
+- **Does not assert:** the agent acting on the message (`agent-report/live/001`).
+- **Platform coverage:** mac+linux.
+
+##### agent-report/actions/002 — Close and close-keeping-the-worktree act through the card.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_agent_cards.rs`).
+- **Agent:** synthetic routing stand-ins as dispatcher and two dispatched single units; no real agent.
+- **Asserts:** a unit with a worktree offers `close-keep-worktree` with `confirm: true`; `close` without `--confirm` is `[confirm_required]` and the card stays; `close-keep-worktree --confirm` prints `Closed <name>, kept its worktree at <path>.`, the card goes and the directory stays; `open` is `[client_side_action]`; `close --confirm` prints `Closed <name>.`, the card goes and the agent leaves `ListAgents`, while the dispatcher stays.
+- **Does not assert:** `confirm_detail`'s pending-work wording.
+- **Platform coverage:** mac+linux.
+
+#### agent-report/live
+
+##### agent-report/live/001 — A real agent publishes its card and acts on a card action.
+- **Layer:** L2 PTY-attached, lane 2 (real agent) (`tests/e2e_agent_cards_live.rs`).
+- **Agent:** Claude Code (interactive Haiku; onboarding and trust seeded, `--allowedTools Bash Read Write`).
+- **Asserts:** told to publish a waiting card with a question that suggests the user catalog's `touch-sentinel` action, the agent's card appears in `card list` with that report; `card act --action touch-sentinel` sends the prompt, the agent creates the uniquely named sentinel file, the action's `last_delivery` reaches `delivered`, the card's report turns `done`, and the attached TUI shows the sentinel's name in the agent's pane.
+- **Does not assert:** the desktop app's cards with a real agent (no native-driver test in this slice).
+- **Platform coverage:** mac+linux.
+
 ### Docs cross-reference skips
 
 Per Decision 27, documented user-facing behaviors that are deliberately not catalogued at M1:
@@ -15632,6 +15709,58 @@ PRD #1666 part 3, round 5: where the deck keeps a worker's report, or a dispatch
 - **Asserts:** with claim gating enabled, deck A dispatches permanent issue #2 of `vfarcic/dot-agent-deck-tests`, filtered by its dedicated `agent-dispatch-two-deck-test` label and `max_per_run = 1`; live GitHub readbacks show `agent-deck/claimed` and a trusted-author claim matching A's actual account id, machine digest and task through production claim parsing. A must create that record during this run or edit the same comment id with a changed body; an unchanged old claim cannot satisfy the assertion. Readbacks use the captured `GITHUB_TOKEN` with scrubbed environment, isolated HOME/config and github.com pinned. Deck B uses a distinct schedule and skips with a claimed-by reason naming that record's task, machine digest and account, creates no worktree, executes no agent and writes no own B record. A's next fire skips its existing worktree without adding an agent.
 - **Does not assert:** half-TTL refresh (covered by `scheduler/dispatch/036`), strictly increasing GitHub `updated_at`, real-agent work, simultaneous claim races, PTY rendering or cross-host execution. Fixture caveat: serialize invocations sharing the fixture, including concurrent invocations on one host. Immediate reruns require the same account and host; a record from another host or account remains foreign until its TTL elapses. Stable schedule names let same-account consecutive runs on one host reclaim without removing the permanent claim label or comments. The configured claim TTL is 3 hours. Unrelated, invalid or expired foreign claim records are not counted as A's own record.
 - **Platform coverage:** mac+linux; requires `gh` and `GITHUB_TOKEN`. Missing prerequisites use the shared runtime SKIP policy and fail with `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1`.
+
+## Desktop agent cards (webview)
+
+The desktop half of PRD #2374's agent cards. These are Vitest + Testing Library tests in the webview (`cd desktop && pnpm test`), outside the Rust `#[spec]` scanner, so they are named here by test title (`desktop/agent-cards/00N: …`), as in `question/desktop`. 001–007 are in `desktop/src/components/AgentCardsContract.test.tsx` and render the real `AgentOverview`; 008 is in `desktop/src/components/AgentCardsVoice.test.tsx` and renders the real `DeckShell` with only the microphone and the resolved voice answer synthetic. The fixtures contradict what a client would compute (a `working` agent the daemon marks needs-you with reason `done`, a `waiting_for_input` one it does not mark, a prompt action disabled `agent_stopped` on a running agent, a primary that is not the first action, entries in neither alphabetical nor needs-you-first order, one group appearing twice), so a view that recomputed status, needs-you, enablement or order fails. **Agent:** none. **Platform coverage:** jsdom on Node; CI runs them in `desktop-web`'s vitest (or the RWX counterpart).
+
+##### desktop/agent-cards/001 — The Cards grid groups consecutive entries by `group.id`, with the daemon's counts.
+- **Test:** vitest `desktop/agent-cards/001: …` in `desktop/src/components/AgentCardsContract.test.tsx`.
+- **Layer:** desktop component (jsdom), real `AgentOverview` against a daemon card list.
+- **Asserts:** one group section per run of consecutive entries sharing a `group.id`, so the dispatcher's group appears twice when the daemon orders a member last; each section's label, kind and `N agents · M need you` (singular forms included); each group's card names in the daemon's order; the toolbar's total `5 agents · 3 need you`.
+- **Does not assert:** the daemon's grouping or ordering (`agent-report/cli/002` covers the dispatcher group); several decks' grids.
+
+##### desktop/agent-cards/002 — Cards keep the daemon's order, status and needs-you; the Needs you filter hides the rest.
+- **Test:** vitest `desktop/agent-cards/002: …` in `desktop/src/components/AgentCardsContract.test.tsx`.
+- **Layer:** desktop component (jsdom).
+- **Asserts:** cards render in the received order, and a new list reorders them with no client sort; each card shows the deck-checked status words (`Working`, `Waiting for input`, `Thinking`, `Stopped`) and the Needs you marker exactly where the daemon set `needs_you`, even against the agent's own report; the summary and `card`-placed fields show, a `detail` field does not; an unreported agent reads "No report from this agent yet."; the Needs you filter (`aria-pressed`) keeps only the daemon-marked cards, in order, while the group count stays the whole group's.
+- **Does not assert:** the hover text of the needs-you reasons; the CSS grid's responsive layout.
+
+##### desktop/agent-cards/003 — The primary action sends the daemon's action, shows its prompt, and asks first when it must.
+- **Test:** vitest `desktop/agent-cards/003: …` in `desktop/src/components/AgentCardsContract.test.tsx`.
+- **Layer:** desktop component (jsdom), `invokeCardAction` stubbed.
+- **Asserts:** the primary button is the daemon's `primary_action_id` (not the first action) and shows its label, with the prompt beneath cut to 60 characters and whole in its `title`; pressing it calls `invokeCardAction` once with `{deckId, instanceId, paneId, agentId}`, that action id, a request id and no `confirm`, and the answer shows under the card; a primary the daemon disabled on a running agent is a disabled button naming "the agent is not running" and sends nothing; a `confirm` primary opens the overlay's confirm step with the exact prompt and `confirm_detail`, and only that step's Send invokes it, with `confirm: true`.
+- **Does not assert:** what the daemon does with the request (`agent-report/actions/001`); delivery-state words.
+
+##### desktop/agent-cards/004 — The overlay navigates in display order, updates live, and survives its agent closing.
+- **Test:** vitest `desktop/agent-cards/004: …` in `desktop/src/components/AgentCardsContract.test.tsx`.
+- **Layer:** desktop component (jsdom).
+- **Asserts:** opened from a card at `2 of 5`; `]` / `[` and the Next card / Previous card buttons walk the daemon's order with wrap-around; `n` and Next card that needs you land only on daemon-marked cards; the overlay lists every action's full prompt, `detail` fields, the needs-you reasons and the `agent says` / `deck checked` labels; a new list with the same key re-renders the open card (new summary and status); a list without its key shows "This agent was closed." under the old name and navigation still moves on; Escape closes it.
+- **Does not assert:** the full-screen layout under 640 px (CSS); focus handling.
+
+##### desktop/agent-cards/005 — Table rows carry the daemon's needs-you marker and a menu that shows the card.
+- **Test:** vitest `desktop/agent-cards/005: …` in `desktop/src/components/AgentCardsContract.test.tsx`.
+- **Layer:** desktop component (jsdom), Table view.
+- **Asserts:** `overview-needs-you` appears on exactly the rows whose entry has `needs_you`, whatever their status; the row's ⋯ menu opens without navigating, holds Show card and the daemon's primary action by label (no primary item when it is `open`); Show card opens that entry's overlay, which then walks the daemon's order; clicking the row itself still opens the agent.
+- **Does not assert:** the menu's keyboard dismissal beyond Escape; the row primary's send (covered by 003's path).
+
+##### desktop/agent-cards/006 — The view is remembered per client, and a broken storage falls back to the table.
+- **Test:** vitest `desktop/agent-cards/006: …` in `desktop/src/components/AgentCardsContract.test.tsx`.
+- **Layer:** desktop component (jsdom).
+- **Asserts:** the default is Table; choosing Cards writes `cards` under `dot-agent-deck.overview.mode`, and a fresh render comes back in Cards; choosing Table writes `table`; with `localStorage.getItem` throwing, the dashboard renders the Table without an error; with `setItem` throwing too, switching to Cards still works for the session.
+- **Does not assert:** storage shared across windows or app restarts (jsdom only).
+
+##### desktop/agent-cards/007 — With `showAgentCards` off, none of the new controls render.
+- **Test:** vitest `desktop/agent-cards/007: …` in `desktop/src/components/AgentCardsContract.test.tsx`.
+- **Layer:** desktop component (jsdom).
+- **Asserts:** with the daemon sending cards and Cards remembered, the flag off shows no Table | Cards switch, grid, Needs you filter, row needs-you marker, row menu or overlay, and a row click still opens the agent.
+- **Does not assert:** the voice rows' flag gate (the crate's `hidden_by_flag`, in the desktop crate's tests).
+
+##### desktop/agent-cards/008 — Every new card control is reachable by voice, and a spoken confirm action only opens its confirm step.
+- **Test:** vitest `desktop/agent-cards/008: …` (five tests) in `desktop/src/components/AgentCardsVoice.test.tsx`.
+- **Layer:** desktop component (jsdom), real `DeckShell`, voice panel and dispatch seam; the resolved answer is shaped as the crate sends it (`card_action` and `reply_text` param kinds).
+- **Asserts:** each of `setOverviewMode`, `showAgentCard`, `nextAgentCard`, `previousAgentCard`, `nextNeedsYouCard`, `toggleNeedsYouFilter`, `closeAgentCard`, `runCardAction` and `replyToAgentCard` is `voice: true` with no `no_voice`, and exactly one `commands.toml` row invokes it, with the contract's row id, `screens = ["overview"]` and its param names and kinds; `confirmCardAction` and `toggleOverviewRowMenu` carry a `no_voice` reason and no row. A spoken `run_card_action` naming a `confirm` action, or Close, opens that card's overlay at its confirm step (exact prompt and pending detail) and sends nothing; one naming a plain prompt action sends exactly that action of that card, unconfirmed; a spoken `reply_to_agent_card` sends `reply` with the user's words.
+- **Does not assert:** the model's choice of row or the crate's param resolution (the desktop crate's voice tests); real speech.
 
 ## Desktop native driver scenarios
 

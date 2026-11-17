@@ -74,6 +74,7 @@ export function placeCards(decks: readonly { deckId: string | undefined; connect
 
 /** One group as the grid shows it: consecutive cards sharing a `group.id`, and their counts. */
 export interface CardGroup {
+  /** Unique among the groups `groupCards` returns: the run's place, the deck and the `group.id`. */
   key: string;
   label: string;
   kind: string;
@@ -98,11 +99,17 @@ function groupLabel(entry: AgentCardEntry): string {
  */
 export function groupCards(cards: readonly PlacedCard[], needsYouOnly: boolean): CardGroup[] {
   const groups: CardGroup[] = [];
+  let lastId: string | undefined;
   for (const card of cards) {
-    // The deck is part of the key: two daemons' groups never merge.
-    const key = `${card.deckId}\u0000${card.entry.group.id}`;
+    // The deck is part of the id: two daemons' groups never merge.
+    const id = `${card.deckId}\u0000${card.entry.group.id}`;
     const last = groups[groups.length - 1];
-    const group: CardGroup = last !== undefined && last.key === key ? last : { key, label: groupLabel(card.entry), kind: card.entry.group.kind, cards: [], needYou: 0, total: 0 };
+    // The same group may come round again later in the daemon's order (a run
+    // of its members, another group, then more of them): that is a second
+    // group on screen, so the run's place is part of its key, which React
+    // needs unique among the grid's groups.
+    const group: CardGroup = last !== undefined && lastId === id ? last : { key: `${groups.length}\u0000${id}`, label: groupLabel(card.entry), kind: card.entry.group.kind, cards: [], needYou: 0, total: 0 };
+    lastId = id;
     if (group !== last) groups.push(group);
     group.total += 1;
     if (card.entry.needs_you) group.needYou += 1;
