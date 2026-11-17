@@ -59,10 +59,10 @@ With voice control on and the cards shown, you can say:
 | "next one that needs me" | Jumps to the next card that needs you. |
 | "only the ones that need me", "show all cards" | Turns the **Needs you** filter on or off. |
 | "close the card" | Closes the card overlay. |
-| "press go ahead on the coder's card" | Presses that action, named by the label on its button. |
+| "press go ahead on the coder's card", "answer main to the coder" | Presses that action or answer, named by the label on its button. |
 | "reply to the coder use the main branch" | Sends your words to that agent as a reply. |
 
-An action that asks you to confirm, and closing an agent, are never done by voice alone: the card opens at its confirm step and you press the button yourself.
+Voice sends an action straight away only when you could know its text without looking: an action from your catalog, or an answer to a question when the agent gave that answer no text of its own, which sends `Answer to your question "<question>": <answer>`. Anything whose text the agent wrote, such as an action the agent suggested that is not in your catalog or an answer the agent gave its own text, opens the card at a step showing exactly what would be sent, and the voice row says so; press **Send** to send it. An action that asks you to confirm, and closing an agent, are never done by voice alone either: the card opens at its confirm step and you press the button yourself.
 
 ## Which agents publish a card
 

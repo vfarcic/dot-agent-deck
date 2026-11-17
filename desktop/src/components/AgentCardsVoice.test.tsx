@@ -32,8 +32,10 @@ import { DeckShell } from "../App";
  *    resolved answer synthetic. The answer is shaped as the crate sends it:
  *    the action's param is of kind `card_action` and the reply's of kind
  *    `reply_text` (`desktop/src-tauri/src/voice/table.rs`). A confirm action,
- *    and a close, open the card's confirm step and send nothing; a plain
- *    prompt action is sent; a reply sends the user's words.
+ *    and a close, open the card's confirm step and send nothing; so does an
+ *    action or answer whose text the agent wrote (`prompt_source: "agent"`),
+ *    at the review step; a catalog prompt action and an answer the deck
+ *    composed are sent; a reply sends the user's words.
  */
 
 const commandsSource = readFileSync(resolve("src-tauri/src/voice/commands.toml"), "utf8");
@@ -68,7 +70,7 @@ const INSTANCE = "daemon-instance-voice";
 
 function action(id: string, overrides: Partial<AgentCardAction> = {}): AgentCardAction {
   return {
-    id, label: id, kind: "prompt", prompt: `Do ${id}.`, text_input: false, confirm: false, confirm_detail: null, icon: null,
+    id, label: id, kind: "prompt", prompt: `Do ${id}.`, prompt_source: "catalog", text_input: false, confirm: false, confirm_detail: null, icon: null,
     placement: "card", custom: false, source: "catalog", enabled: true, disabled_reason: null, last_delivery: null, token: `tok-${id}`, ...overrides,
   };
 }
@@ -78,13 +80,22 @@ function cardFor(agentId: string, name: string): AgentCardEntry {
     key: `pane-${agentId}/${agentId}`, instance_id: INSTANCE, pane_id: `pane-${agentId}`, agent_id: agentId, agent_type: "claude_code", name,
     status: "working", needs_you: true, needs_you_reasons: ["waiting"], group: { id: "standalone", kind: "standalone", label: null }, relations: {},
     report: { source: "agent", status: "waiting", summary: "Ready to merge", published_at: "2026-11-17T00:00:00Z", revision: 1 },
-    fields: [], questions: [],
+    fields: [],
+    questions: [{ id: "base", text: "Which base branch?", source: "agent", answered: null, options: [
+      { id: "main", label: "main", action_id: "question/base/main" },
+      { id: "rel", label: "Release branch", action_id: "question/base/rel" },
+    ] }],
     actions: [
+      // As the daemon projects them: both options are offered by the agent;
+      // the deck composed `main`'s text, the agent wrote `rel`'s own.
+      action("question/base/main", { label: "main", prompt: "Answer to your question \"Which base branch?\": main", source: "agent", prompt_source: "deck" }),
+      action("question/base/rel", { label: "Release branch", prompt: "Use the release branch.", source: "agent", prompt_source: "agent" }),
       action("merge", { label: "Merge it", prompt: "Merge it, following this project's own merge procedure, then update your card.", confirm: true, confirm_detail: "Still pending: open pull request #7." }),
       action("go-ahead", { label: "Go ahead", prompt: "Go ahead." }),
-      action("reply", { label: "Reply", prompt: null, text_input: true, source: "deck", placement: "detail" }),
-      action("open", { label: "Open", kind: "open", prompt: null, source: "deck", placement: "detail" }),
-      action("close", { label: "Close", kind: "close", prompt: null, confirm: true, source: "deck", placement: "detail" }),
+      action("rerun", { label: "Re-run tests", prompt: "Re-run the failing tests and update your card.", custom: true, source: "agent", prompt_source: "agent" }),
+      action("reply", { label: "Reply", prompt: null, prompt_source: null, text_input: true, source: "deck", placement: "detail" }),
+      action("open", { label: "Open", kind: "open", prompt: null, prompt_source: null, source: "deck", placement: "detail" }),
+      action("close", { label: "Close", kind: "close", prompt: null, prompt_source: null, confirm: true, source: "deck", placement: "detail" }),
     ],
     primary_action_id: "go-ahead", facts: { source: "deck", pull_request: null }, revision: 3, updated_at: "2026-11-17T00:00:00Z",
   };
@@ -214,14 +225,49 @@ describe("desktop/agent-cards/008 — the cards by voice (PRD #2374)", () => {
     expect(invokeCardAction).not.toHaveBeenCalled();
   });
 
-  /// Scenario: say "press go ahead on the voice card agent's card", a prompt action that needs no confirmation. Exactly that action of that card is sent once, unconfirmed.
-  it("desktop/agent-cards/008: a spoken prompt action is sent to that card's agent", async () => {
+  /// Scenario: say "press go ahead on the voice card agent's card", a catalog prompt action that needs no confirmation. Exactly that action of that card is sent once, unconfirmed.
+  it("desktop/agent-cards/008: a spoken catalog prompt action is sent to that card's agent", async () => {
     const agentId = createFixtureSnapshot("connected").agents[0].id;
     const { invokeCardAction, resolveVoice } = renderSpoken(runCardAction(agentId, "Go ahead", "press go ahead on the voice card agent's card"));
     await speak(resolveVoice);
     await waitFor(() => expect(invokeCardAction).toHaveBeenCalledTimes(1));
     expect(invokeCardAction).toHaveBeenCalledWith({ deckId: FIXTURE_DAEMON_ID, instanceId: INSTANCE, paneId: `pane-${agentId}`, agentId }, "go-ahead", expect.objectContaining({ requestId: expect.any(String) }));
     expect((invokeCardAction.mock.calls[0][2] as { confirm?: boolean }).confirm).not.toBe(true);
+  });
+
+  /// Scenario: say "press re-run tests on the voice card agent's card", an action whose text the agent wrote. The card's overlay opens at its review step showing that exact text, the voice row says why, and nothing is sent until Send is pressed, which sends it once.
+  it("desktop/agent-cards/008: a spoken action the agent wrote opens its review step and sends nothing", async () => {
+    const agentId = createFixtureSnapshot("connected").agents[0].id;
+    const { card, invokeCardAction, resolveVoice } = renderSpoken(runCardAction(agentId, "Re-run tests", "press re-run tests on the voice card agent's card"));
+    await speak(resolveVoice);
+    await waitFor(() => expect(screen.getByTestId("agent-card-confirm")).toBeInTheDocument());
+    expect(screen.getByTestId("agent-card-overlay").getAttribute("data-card-key")).toBe(card.key);
+    expect(screen.getByTestId("agent-card-confirm").textContent).toContain("Re-run the failing tests and update your card.");
+    expect(await screen.findByText("voice-card-agent wrote the text of Re-run tests, so its card is open for you to read it first: press Send to send it.")).toBeInTheDocument();
+    expect(invokeCardAction).not.toHaveBeenCalled();
+    await act(async () => { fireEvent.click(screen.getByTestId("agent-card-confirm-send")); });
+    await waitFor(() => expect(invokeCardAction).toHaveBeenCalledTimes(1));
+    expect(invokeCardAction).toHaveBeenCalledWith(expect.objectContaining({ agentId }), "rerun", expect.objectContaining({ actionToken: "tok-rerun" }));
+  });
+
+  /// Scenario: say "answer release branch to the voice card agent", a question option carrying its own prompt the agent wrote. The card's overlay opens at its review step showing that prompt, and nothing is sent.
+  it("desktop/agent-cards/008: a spoken answer whose text the agent wrote opens its review step and sends nothing", async () => {
+    const { card, invokeCardAction, resolveVoice } = renderSpoken(runCardAction(createFixtureSnapshot("connected").agents[0].id, "Release branch", "answer release branch to the voice card agent"));
+    await speak(resolveVoice);
+    await waitFor(() => expect(screen.getByTestId("agent-card-confirm")).toBeInTheDocument());
+    expect(screen.getByTestId("agent-card-overlay").getAttribute("data-card-key")).toBe(card.key);
+    expect(screen.getByTestId("agent-card-confirm").textContent).toContain("Use the release branch.");
+    expect(invokeCardAction).not.toHaveBeenCalled();
+  });
+
+  /// Scenario: say "answer main to the voice card agent", a question option with no prompt of its own, whose answer text the deck composes. That answer is sent once, unconfirmed.
+  it("desktop/agent-cards/008: a spoken answer the deck composed is sent to that card's agent", async () => {
+    const agentId = createFixtureSnapshot("connected").agents[0].id;
+    const { invokeCardAction, resolveVoice } = renderSpoken(runCardAction(agentId, "main", "answer main to the voice card agent"));
+    await speak(resolveVoice);
+    await waitFor(() => expect(invokeCardAction).toHaveBeenCalledTimes(1));
+    expect(invokeCardAction).toHaveBeenCalledWith(expect.objectContaining({ agentId }), "question/base/main", expect.objectContaining({ requestId: expect.any(String) }));
+    expect(screen.queryByTestId("agent-card-confirm")).toBeNull();
   });
 
   /// Scenario: say "reply to the voice card agent use the release branch". The card's `reply` action is sent with the user's own words as its text.

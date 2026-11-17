@@ -902,14 +902,14 @@ const DOCS_CARDS_TEAM = { id: "orchestration:docs-checkout", kind: "orchestratio
 
 function docsCardAction(id: string, overrides: Partial<AgentCardAction>): AgentCardAction {
   return {
-    id, label: id, kind: "prompt", prompt: null, text_input: false, confirm: false, confirm_detail: null, icon: null,
+    id, label: id, kind: "prompt", prompt: null, prompt_source: null, text_input: false, confirm: false, confirm_detail: null, icon: null,
     placement: "card", custom: false, source: "catalog", enabled: true, disabled_reason: null, last_delivery: null, token: `docs-${id}`, ...overrides,
   };
 }
 
 function docsDeckActions(): AgentCardAction[] {
   return [
-    docsCardAction("explain", { label: "Explain", prompt: "Explain in a few sentences what you did and what you need from me, then update your card.", icon: "help-circle" }),
+    docsCardAction("explain", { label: "Explain", prompt: "Explain in a few sentences what you did and what you need from me, then update your card.", prompt_source: "catalog", icon: "help-circle" }),
     docsCardAction("reply", { label: "Reply", text_input: true, source: "deck", placement: "detail", icon: "message-square" }),
     docsCardAction("open", { label: "Open", kind: "open", source: "deck", placement: "detail", icon: "terminal" }),
     docsCardAction("close", { label: "Close", kind: "close", confirm: true, source: "deck", placement: "detail", icon: "x" }),
@@ -935,7 +935,7 @@ export function docsAgentCards(): AgentCardsSnapshot {
       relations: { orchestration: { id: "docs-checkout", label: "checkout-retry", role: "planner", is_orchestrator: true } },
       report: { source: "agent", status: "done", summary: "Retry design is written up and ready for the builder.", published_at: DOCS_REPORTED_AT, revision: 3 },
       fields: [{ name: "next-step", label: "Next step", description: "What you will do next, or what you are waiting for.", type: "text", icon: "arrow-right", placement: "card", custom: false, source: "agent", value: "Waiting for your go-ahead" }],
-      actions: [docsCardAction("go-ahead", { label: "Go ahead", prompt: "Go ahead.", icon: "play" }), ...docsDeckActions()],
+      actions: [docsCardAction("go-ahead", { label: "Go ahead", prompt: "Go ahead.", prompt_source: "catalog", icon: "play" }), ...docsDeckActions()],
       primary_action_id: "go-ahead",
     }),
     docsCard("3", "Contract review", {
@@ -950,9 +950,11 @@ export function docsAgentCards(): AgentCardsSnapshot {
         { id: "yes", label: "Yes, behind a flag", action_id: "question/flag/yes" },
         { id: "no", label: "No, ship it", action_id: "question/flag/no" },
       ] }],
+      // As the daemon projects a question's options: offered by the agent
+      // (`source`), with the answer text the deck composed (`prompt_source`).
       actions: [
-        docsCardAction("question/flag/yes", { label: "Yes, behind a flag", prompt: "Answer to your question \"Ship the change behind a version flag?\": Yes, behind a flag", source: "deck" }),
-        docsCardAction("question/flag/no", { label: "No, ship it", prompt: "Answer to your question \"Ship the change behind a version flag?\": No, ship it", source: "deck" }),
+        docsCardAction("question/flag/yes", { label: "Yes, behind a flag", prompt: "Answer to your question \"Ship the change behind a version flag?\": Yes, behind a flag", source: "agent", prompt_source: "deck" }),
+        docsCardAction("question/flag/no", { label: "No, ship it", prompt: "Answer to your question \"Ship the change behind a version flag?\": No, ship it", source: "agent", prompt_source: "deck" }),
         ...docsDeckActions(),
       ],
       primary_action_id: "question/flag/yes",

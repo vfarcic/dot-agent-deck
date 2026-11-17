@@ -16,6 +16,16 @@ export const NO_CARD_OPEN = "No card is open.";
 export const NO_CARD_NEEDS_YOU = "No other card needs you right now.";
 /** …when there are no cards to move between. */
 export const NO_CARDS = "There are no cards to show.";
+/** …when voice named an action whose text the agent wrote: its card opens at the review step instead of sending. */
+export const agentWrittenReview = (label: string, name: string) => `${name} wrote the text of ${label}, so its card is open for you to read it first: press Send to send it.`;
+
+/**
+ * Who may have written a prompt that is sent without the user reading it
+ * first: the catalog's text and the answer the deck composes (PRD #2374). The
+ * daemon says which (`prompt_source`); anything else, an absent value
+ * included, is treated as the agent's.
+ */
+const SENDABLE_UNREAD: ReadonlySet<string> = new Set(["catalog", "deck"]);
 
 /** The card members the overview serves, every one of them. */
 export type AgentCardControls = Pick<VoiceActionContext, "setOverviewMode" | "showAgentCard" | "stepAgentCard" | "setNeedsYouFilter" | "closeAgentCard" | "runCardAction" | "replyToAgentCard" | "confirmCardAction" | "toggleOverviewRowMenu">;
@@ -180,6 +190,13 @@ export function useAgentCardsView({ runtime, decks, openAgent }: {
       if (action.confirm || wanted.review) {
         setOpen({ key: placedCardKey(card), name: card.entry.name, step: { kind: "confirm", actionId: action.id, token: action.token } });
         return undefined;
+      }
+      // A control that showed the text names the definition it showed (its
+      // token). Without one — voice names an action by its label — text the
+      // agent wrote is shown at the review step and sent only from there.
+      if (wanted.token === undefined && !SENDABLE_UNREAD.has(action.prompt_source ?? "")) {
+        setOpen({ key: placedCardKey(card), name: card.entry.name, step: { kind: "confirm", actionId: action.id, token: action.token } });
+        return agentWrittenReview(displayText(action.label, DISPLAY_LIMITS.name), name);
       }
       send(card, action, wanted.token !== undefined ? { token: wanted.token } : {});
       return undefined;

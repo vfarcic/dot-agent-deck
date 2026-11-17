@@ -773,6 +773,14 @@ export interface AgentCardAction {
   kind: "prompt" | "close" | "close_keep_worktree" | "open" | string;
   /** The exact text a prompt action sends; `null` for `reply` and the deck's own actions. */
   prompt: string | null;
+  /**
+   * Who wrote the exact text of `prompt`, as the daemon decides it: `catalog`
+   * (a catalog action), `agent` (a custom action's or a question option's own
+   * prompt) or `deck` (the answer text the deck composes for an option);
+   * `null` when there is no prompt. Voice sends only a `catalog` or `deck`
+   * prompt directly; any other value, or none, opens the review step.
+   */
+  prompt_source?: "catalog" | "agent" | "deck" | string | null;
   text_input: boolean;
   confirm: boolean;
   confirm_detail: string | null;

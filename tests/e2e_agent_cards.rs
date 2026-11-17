@@ -469,9 +469,21 @@ fn cli_001_publish_then_list_shows_the_card() {
         action(&e, "question/base/rel").unwrap()["prompt"],
         "Use the release branch."
     );
+    // Who wrote each prompt's text: the deck composed `main`'s answer, the
+    // agent wrote `rel`'s own prompt; both options are offered by the agent.
+    assert_eq!(
+        action(&e, "question/base/main").unwrap()["prompt_source"],
+        "deck"
+    );
+    assert_eq!(
+        action(&e, "question/base/rel").unwrap()["prompt_source"],
+        "agent"
+    );
+    assert_eq!(action(&e, "question/base/main").unwrap()["source"], "agent");
     let explain = action(&e, "explain").unwrap();
     assert_eq!(explain["source"], "catalog");
     assert_eq!(explain["prompt"], EXPLAIN_PROMPT);
+    assert_eq!(explain["prompt_source"], "catalog");
     let rerun = action(&e, "rerun").unwrap();
     assert_eq!(rerun["custom"], true);
     assert_eq!(rerun["source"], "agent");
@@ -480,12 +492,14 @@ fn cli_001_publish_then_list_shows_the_card() {
         rerun["prompt"],
         "Re-run the failing tests and update your card."
     );
+    assert_eq!(rerun["prompt_source"], "agent");
     assert_eq!(rerun["confirm"], false);
     let reply = action(&e, "reply").unwrap();
     assert_eq!(reply["kind"], "prompt");
     assert_eq!(reply["text_input"], true);
     assert_eq!(reply["prompt"], Value::Null);
     assert_eq!(reply["source"], "deck");
+    assert_eq!(reply["prompt_source"], Value::Null);
     assert_eq!(action(&e, "open").unwrap()["kind"], "open");
     let close = action(&e, "close").unwrap();
     assert_eq!(close["kind"], "close");

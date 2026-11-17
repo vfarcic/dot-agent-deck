@@ -738,6 +738,18 @@ pub struct CardAction {
     /// text is sent as is) and for the deck's other actions.
     #[serde(default)]
     pub prompt: Option<String>,
+    /// Who wrote the exact text of `prompt`: `catalog` (a catalog action's
+    /// prompt, the deck's defaults or the user's own catalog), `agent` (a
+    /// custom action's prompt, or a question option's own prompt, as the
+    /// agent reported it) or `deck` (the answer the deck composes for an
+    /// option that carries no prompt of its own). `null` when `prompt` is.
+    /// A client sends an `agent` prompt only from a control that showed the
+    /// user its text; voice, which names an action by its label, opens the
+    /// card's review step for it instead. `source` says who offered the
+    /// action, which for a question option is the agent even when the deck
+    /// wrote its text.
+    #[serde(default)]
+    pub prompt_source: Option<String>,
     pub text_input: bool,
     pub confirm: bool,
     #[serde(default)]
@@ -758,9 +770,9 @@ pub struct CardAction {
     #[serde(default)]
     pub last_delivery: Option<CardDelivery>,
     /// The daemon's name for this definition of the action: a digest of the
-    /// card, the action id, its kind, label, exact prompt, whether it asks
-    /// for confirmation and, for a question's option, the question and the
-    /// option. An invocation names it, and the daemon refuses one whose
+    /// card, the action id, its kind, label, exact prompt and who wrote it,
+    /// whether it asks for confirmation and, for a question's option, the
+    /// question and the option. An invocation names it, and the daemon refuses one whose
     /// action changed since (`stale_action`), so a press can only send the
     /// text the user was shown (review B2, audit F1). Unchanged by anything
     /// else: a status, a delivery, the close's pending note.
@@ -1106,6 +1118,7 @@ fn action_token(
         kind: &'a str,
         label: &'a str,
         prompt: Option<&'a str>,
+        prompt_source: Option<&'a str>,
         confirm: bool,
         text_input: bool,
         question: Option<[&'a str; 4]>,
@@ -1117,6 +1130,7 @@ fn action_token(
         kind: &action.kind,
         label: &action.label,
         prompt: action.prompt.as_deref(),
+        prompt_source: action.prompt_source.as_deref(),
         confirm: action.confirm,
         text_input: action.text_input,
         question: question.map(|(q, o)| {
@@ -1274,6 +1288,7 @@ fn project_entry(
         id,
         label,
         kind: "prompt".into(),
+        prompt_source: prompt.is_some().then(|| source.to_string()),
         prompt,
         text_input,
         confirm,
@@ -1296,14 +1311,19 @@ fn project_entry(
         for q in &r.report.questions {
             for o in &q.options {
                 let id = format!("question/{}/{}", q.id, o.id);
-                let prompt = o.prompt.clone().unwrap_or_else(|| {
-                    format!("Answer to your question \"{}\": {}", q.text, o.label)
-                });
+                // The agent's own text for this answer, or the deck's.
+                let (prompt, prompt_source) = match &o.prompt {
+                    Some(own) => (own.clone(), "agent"),
+                    None => (
+                        format!("Answer to your question \"{}\": {}", q.text, o.label),
+                        "deck",
+                    ),
+                };
                 if answered.get(&q.id).is_none() {
                     primary_candidates.push(id.clone());
                 }
                 answers.insert(id.clone(), (q, o));
-                actions.push(prompt_action(
+                let mut option = prompt_action(
                     id,
                     o.label.clone(),
                     Some(prompt),
@@ -1313,7 +1333,9 @@ fn project_entry(
                     false,
                     "agent",
                     false,
-                ));
+                );
+                option.prompt_source = Some(prompt_source.into());
+                actions.push(option);
             }
         }
     }
@@ -1388,6 +1410,7 @@ fn project_entry(
         label: label.into(),
         kind: kind.into(),
         prompt: None,
+        prompt_source: None,
         text_input: false,
         confirm: kind != "open",
         confirm_detail,
@@ -2867,6 +2890,15 @@ mod tests {
             e.action("question/base/main").unwrap().prompt.as_deref(),
             Some("Answer to your question \"Which?\": main")
         );
+        // Who wrote each prompt's text: the deck composed the answer, the
+        // catalog holds `merge`, the agent wrote `zap`; `reply` has none.
+        let written_by = |id: &str| e.action(id).unwrap().prompt_source.clone();
+        assert_eq!(written_by("question/base/main").as_deref(), Some("deck"));
+        assert_eq!(e.action("question/base/main").unwrap().source, "agent");
+        assert_eq!(written_by("merge").as_deref(), Some("catalog"));
+        assert_eq!(written_by("zap").as_deref(), Some("agent"));
+        assert_eq!(written_by("reply"), None);
+        assert_eq!(written_by("close"), None);
         assert_eq!(e.primary_action_id, "question/base/main");
         assert!(e.action("zap").unwrap().custom);
         assert_eq!(
