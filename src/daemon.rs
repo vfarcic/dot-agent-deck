@@ -3600,6 +3600,12 @@ pub(crate) struct StatusSignalQueue {
     /// Test seam: how many times [`run_status_osc_monitor`] has woken.
     #[cfg(test)]
     wakes: std::sync::atomic::AtomicU64,
+    /// Test seam: how many [`StatusApply`] tasks are running.
+    #[cfg(test)]
+    applies_running: std::sync::atomic::AtomicUsize,
+    /// Test seam: how many [`StatusApply`] tasks have been spawned.
+    #[cfg(test)]
+    applies_spawned: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Default)]
@@ -3739,21 +3745,26 @@ fn install_status_signal_sink(registry: &Arc<AgentPtyRegistry>) -> Arc<StatusSig
 /// event of its generation, received before it, is still being ingested is
 /// PARKED with the rest of that generation's signals, and applied once that
 /// event is in — the `PreToolUse` a permission prompt is bound to among them —
-/// however long its ingest takes, up to [`STATUS_SIGNAL_HOOK_WAIT`]. Nothing
-/// waits inline: while one generation is parked the monitor goes on serving
-/// every other, and looks at the parked ones again every
+/// however long its ingest takes, up to [`STATUS_SIGNAL_HOOK_WAIT`], and past
+/// it is applied anyway. While one generation is parked the monitor goes on
+/// serving every other, and looks at the parked ones again every
 /// [`STATUS_SIGNAL_PARK_TICK`].
 ///
-/// PRD #211 (third review B2, audit S3): past that wait the signal is applied
-/// by a task of its own, which waits for the pane's question lifecycle there,
-/// and the generation's later signals wait for that task, in order; the
-/// monitor does not. What a permission prompt asks is worked out under that
-/// lifecycle, at the apply ([`report_status_update`]), and a call that lands
-/// after its prompt was applied without one gets the question then
+/// PRD #211 (third review B2, audit S3; fourth review): the monitor applies
+/// no signal itself. The signals of a generation it lets through are applied
+/// by a task of that generation's ([`StatusApply`]), which waits for the
+/// pane's question lifecycle, and the generation's later signals wait for that
+/// task, in order. So a pane whose lifecycle is held — by a hook received
+/// before the signal, after it, or none — holds up its own status, not
+/// another pane's; the state lock, which every apply takes, is shared. The
+/// task is cancelled with its generation's entry. What a permission prompt
+/// asks is worked out under that lifecycle, at the apply
+/// ([`report_status_update`]), and a call that lands after its prompt was
+/// applied without one gets the question then
 /// ([`rebuild_antigravity_permission_question`]). A held sign-in signal whose
 /// moment has come is not looked at while its generation has signals parked
-/// or a late apply running, so the monitor never wakes for it in a loop
-/// (audit suggestion 1).
+/// or an apply running, so the monitor never wakes for it in a loop (audit
+/// suggestion 1).
 ///
 /// Each iteration takes what the [`StatusSignalQueue`] holds, which its bounds
 /// cap, and skips the signals of a generation that no longer holds its pane,
@@ -3776,7 +3787,8 @@ async fn run_status_osc_monitor(
     };
     loop {
         // A held sign-in signal is due only where it can be applied now: not
-        // behind parked signals or a late apply, which the park tick serves.
+        // behind parked signals or an apply still running, which the park
+        // tick serves.
         let due = waiting
             .values()
             .filter(|entry| entry.parked.is_empty() && !entry.applying())
@@ -3853,13 +3865,17 @@ async fn run_status_osc_monitor(
             let reader = registry.status_reader_epoch(&key.1);
             if reader != Some(entry.epoch) {
                 entry.settle = crate::status_osc::AuthSettle::default();
+                // Fourth review: an apply of what the old reader read is
+                // cancelled, so the new reader's signals do not wait for it.
+                entry.apply = None;
             }
             entry.parked.retain(|(_, _, epoch)| Some(*epoch) == reader);
             if let Some(epoch) = reader {
                 entry.epoch = epoch;
             }
-            // Third review B2: a late apply of this generation still waiting
-            // for its pane holds the rest back, so they land in order.
+            // Third review B2, fourth review: an apply of this generation
+            // still running holds the rest back, so they land in order.
+            let mut ready: Vec<(crate::status_osc::StatusUpdate, std::time::Instant)> = Vec::new();
             while !entry.applying()
                 && let Some((signal, seen_at, _)) = entry.parked.front()
             {
@@ -3881,51 +3897,17 @@ async fn run_status_osc_monitor(
                 let Some(update) = update else {
                     continue;
                 };
+                ready.push((update, seen_at));
                 if timed_out {
                     tracing::warn!(
                         pane_id = %escape_id_for_log(&key.0),
                         agent_id = %escape_id_for_log(&key.1),
                         "status osc: a hook event received before this signal is still being \
-                         ingested; applying the signal on its own task without waiting longer"
+                         ingested; applying the signal without waiting longer"
                     );
-                    // Third review B2, audit S3: that hook may be waiting on
-                    // the pane's lifecycle, which the apply needs too, so the
-                    // monitor does not wait for it.
-                    entry.late = Some(tokio::spawn({
-                        let (state, event_tx, registry, key) = (
-                            state.clone(),
-                            event_tx.clone(),
-                            Arc::clone(&registry),
-                            key.clone(),
-                        );
-                        let (agent_type, epoch) = (entry.agent_type.clone(), entry.epoch);
-                        async move {
-                            report_status_update(
-                                &state,
-                                &event_tx,
-                                &registry,
-                                &key,
-                                &agent_type,
-                                update,
-                                seen_at,
-                                Some(epoch),
-                            )
-                            .await;
-                        }
-                    }));
+                    // The signals after it are looked at again once it is in.
                     break;
                 }
-                report_status_update(
-                    &state,
-                    &event_tx,
-                    &registry,
-                    &key,
-                    &entry.agent_type,
-                    update,
-                    seen_at,
-                    Some(entry.epoch),
-                )
-                .await;
             }
             if entry.parked.is_empty()
                 && !entry.applying()
@@ -3933,19 +3915,23 @@ async fn run_status_osc_monitor(
                     .settle
                     .due_at()
                     .is_some_and(|at| at <= std::time::Instant::now())
-                && let Some((update, seen_at)) = entry.settle.poll(std::time::Instant::now())
+                && let Some(held) = entry.settle.poll(std::time::Instant::now())
             {
-                report_status_update(
-                    &state,
-                    &event_tx,
-                    &registry,
-                    &key,
-                    &entry.agent_type,
-                    update,
-                    seen_at,
-                    Some(entry.epoch),
-                )
-                .await;
+                ready.push(held);
+            }
+            if !ready.is_empty() {
+                entry.apply = Some(StatusApply::spawn(
+                    &signals,
+                    report_status_updates(
+                        state.clone(),
+                        event_tx.clone(),
+                        Arc::clone(&registry),
+                        key.clone(),
+                        entry.agent_type.clone(),
+                        ready,
+                        entry.epoch,
+                    ),
+                ));
             }
             if !entry.parked.is_empty() || entry.settle.due_at().is_some() || entry.applying() {
                 waiting.insert(key, entry);
@@ -3955,8 +3941,9 @@ async fn run_status_osc_monitor(
 }
 
 /// PRD #211: one generation's OSC 7501 signals the monitor has not applied
-/// yet — a sign-in signal it holds back, and those parked behind a hook event
-/// still being ingested ([`run_status_osc_monitor`]).
+/// yet — a sign-in signal it holds back, those parked behind a hook event
+/// still being ingested, and the apply of those it let through
+/// ([`run_status_osc_monitor`]).
 struct WaitingSignals {
     agent_type: crate::event::AgentType,
     settle: crate::status_osc::AuthSettle,
@@ -3966,9 +3953,9 @@ struct WaitingSignals {
     epoch: u64,
     /// Since when the first of `parked` has waited for a hook event.
     parked_since: Option<std::time::Instant>,
-    /// Third review B2: a signal applied past [`STATUS_SIGNAL_HOOK_WAIT`],
-    /// on its own task.
-    late: Option<tokio::task::JoinHandle<()>>,
+    /// Fourth review: the apply of this generation's signals let through
+    /// last, on a task of its own. Cancelled when the entry is dropped.
+    apply: Option<StatusApply>,
 }
 
 impl WaitingSignals {
@@ -3979,13 +3966,121 @@ impl WaitingSignals {
             parked: std::collections::VecDeque::new(),
             parked_since: None,
             epoch: 0,
-            late: None,
+            apply: None,
         }
     }
 
-    /// Whether a late apply of this generation's is still running.
+    /// Whether an apply of this generation's is still running.
     fn applying(&self) -> bool {
-        self.late.as_ref().is_some_and(|late| !late.is_finished())
+        self.apply.as_ref().is_some_and(StatusApply::running)
+    }
+}
+
+/// PRD #211 (fourth review): the task applying some of one generation's OSC
+/// 7501 signals ([`report_status_updates`]), owned by that generation's
+/// [`WaitingSignals`]. Dropping it aborts the task: a generation that no
+/// longer holds its pane (`waiting.retain`), a reader turned on or off afresh
+/// (an epoch change) and the monitor's own abort each cancel an apply still
+/// waiting for its pane's lifecycle, rather than leave it waiting with the
+/// daemon's state. An abort cannot cut one event's apply in half: what an
+/// event changes is applied under the `AppState` write lock with no wait in
+/// between ([`ingest_event_core`]); the updates after it are not applied.
+struct StatusApply {
+    task: tokio::task::JoinHandle<()>,
+    done: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl StatusApply {
+    /// Run `apply`, then mark it done and wake the monitor, which then looks
+    /// again at what waited behind it.
+    fn spawn(
+        signals: &Arc<StatusSignalQueue>,
+        apply: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Self {
+        #[cfg(test)]
+        let running = StatusApplyRunning::new(signals);
+        let signals = Arc::clone(signals);
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        Self {
+            task: tokio::spawn({
+                let done = Arc::clone(&done);
+                async move {
+                    #[cfg(test)]
+                    let _running = running;
+                    apply.await;
+                    done.store(true, std::sync::atomic::Ordering::Release);
+                    signals.ready.notify_one();
+                }
+            }),
+            done,
+        }
+    }
+
+    fn running(&self) -> bool {
+        !self.done.load(std::sync::atomic::Ordering::Acquire) && !self.task.is_finished()
+    }
+}
+
+impl Drop for StatusApply {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Test seam: counts a [`StatusApply`] task as running from its spawn until
+/// its future is dropped, finished or aborted.
+#[cfg(test)]
+struct StatusApplyRunning(Arc<StatusSignalQueue>);
+
+#[cfg(test)]
+impl StatusApplyRunning {
+    fn new(signals: &Arc<StatusSignalQueue>) -> Self {
+        signals
+            .applies_spawned
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        signals
+            .applies_running
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(Arc::clone(signals))
+    }
+}
+
+#[cfg(test)]
+impl Drop for StatusApplyRunning {
+    fn drop(&mut self) {
+        self.0
+            .applies_running
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// PRD #211 (fourth review): apply `updates`, the signals of generation `key`
+/// that the monitor let through, in the order they were read, each with
+/// [`report_status_update`]. Run on a task of its own ([`StatusApply`]), since
+/// each waits for the pane's question lifecycle, which a hook event's ingest
+/// holds, among others: the monitor goes on serving every other generation
+/// meanwhile.
+async fn report_status_updates(
+    state: SharedState,
+    event_tx: broadcast::Sender<BroadcastMsg>,
+    registry: Arc<AgentPtyRegistry>,
+    key: (String, String),
+    agent_type: crate::event::AgentType,
+    updates: Vec<(crate::status_osc::StatusUpdate, std::time::Instant)>,
+    epoch: u64,
+) {
+    for (update, seen_at) in updates {
+        report_status_update(
+            &state,
+            &event_tx,
+            &registry,
+            &key,
+            &agent_type,
+            update,
+            seen_at,
+            Some(epoch),
+        )
+        .await;
     }
 }
 
@@ -4110,7 +4205,8 @@ async fn report_status_update(
 /// own `PreToolUse` reported; the digits are those of the release this pane's
 /// `agy` drew in its header. A repeat of the prompt already pending keeps its
 /// question id. `None`, the prompt answered at the keyboard, for any other
-/// agent, and when no such call or release backs it.
+/// agent and when no such call backs it; with the call but no latched
+/// release, the question is asked with keyboard-only answers.
 fn antigravity_status_question(
     state: &crate::state::AppState,
     registry: &AgentPtyRegistry,
@@ -22989,6 +23085,12 @@ mod status_signal_park_tests {
 
     impl Deck {
         async fn start(panes: &[&str]) -> Self {
+            Self::start_as(panes, Some(AgentType::Antigravity)).await
+        }
+
+        /// `start`, each pane's generation spawned as `agent_type` (`None`:
+        /// a shell, whose reader its agent's own hooks turn on).
+        async fn start_as(panes: &[&str], agent_type: Option<AgentType>) -> Self {
             let registry = Arc::new(AgentPtyRegistry::new());
             let panes: Vec<(String, String)> = panes
                 .iter()
@@ -23000,7 +23102,7 @@ mod status_signal_park_tests {
                                 DOT_AGENT_DECK_PANE_ID.to_string(),
                                 pane.to_string(),
                             )]),
-                            agent_type: Some(AgentType::Antigravity),
+                            agent_type: agent_type.clone(),
                             ..SpawnOptions::default()
                         })
                         .expect("spawn stand-in");
@@ -23419,5 +23521,273 @@ mod status_signal_park_tests {
             .card_within(0, Duration::from_secs(5), |(_, question)| *question)
             .await;
         assert_eq!(card, Some((SessionStatus::WaitingForInput, true)));
+    }
+
+    impl Deck {
+        fn applies(&self) -> (usize, usize) {
+            (
+                self.signals
+                    .applies_spawned
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                self.signals
+                    .applies_running
+                    .load(std::sync::atomic::Ordering::SeqCst),
+            )
+        }
+
+        /// Wait until `wanted` holds of [`Self::applies`], panicking after 5 s.
+        async fn applies_until(&self, wanted: impl Fn((usize, usize)) -> bool, what: &str) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !wanted(self.applies()) {
+                assert!(
+                    Instant::now() < deadline,
+                    "{what}: (spawned, running) = {:?}",
+                    self.applies()
+                );
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+
+        /// The status-signal events pane `index`'s card applied, oldest first.
+        async fn signal_events(&self, index: usize) -> Vec<crate::event::EventType> {
+            let pane = &self.panes[index].0;
+            let state = self.state.read().await;
+            let Some(session) = state.pane_hook_session_id(pane) else {
+                return Vec::new();
+            };
+            state
+                .sessions
+                .get(&session)
+                .map_or_else(Vec::new, |session| {
+                    session
+                        .recent_events
+                        .iter()
+                        .filter(|event| event.is_status_signal())
+                        .map(|event| event.event_type.clone())
+                        .collect()
+                })
+        }
+    }
+
+    /// Scenario: one Antigravity pane's question lifecycle is held with no hook
+    /// of its in flight, and it reports `idle` — once on its own, once with a
+    /// hook of its generation received after the signal. Another pane reports
+    /// `idle` meanwhile and its card turns Idle promptly, while the first
+    /// pane's card does not move until the hold ends: then it turns Idle, or,
+    /// with the later hook in, stays on that hook's Thinking.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_held_pane_holds_up_only_its_own_status() {
+        for later_hook in [false, true] {
+            let deck = Deck::start(&["agy-hold-a", "agy-hold-b"]).await;
+            deck.thinking(0).await;
+            deck.thinking(1).await;
+            let held = deck
+                .registry
+                .question_answers()
+                .lock_lifecycle("agy-hold-a")
+                .await;
+            assert!(
+                !deck
+                    .registry
+                    .hook_in_flight_before(&deck.panes[0].1, Instant::now())
+            );
+            deck.signal(0, IDLE);
+            let _later = if later_hook {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let hook = deck.hook(0, "pre-invocation.json").await;
+                deck.until_in_flight(0).await;
+                Some(hook)
+            } else {
+                None
+            };
+            // The first pane's apply is under way, waiting for its pane.
+            deck.applies_until(|(_, running)| running >= 1, "its apply never started")
+                .await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let asked = Instant::now();
+            deck.signal(1, IDLE);
+            let other = deck
+                .card_within(1, Duration::from_secs(5), |(status, _)| {
+                    *status == SessionStatus::Idle
+                })
+                .await;
+            assert_eq!(
+                other.map(|c| c.0),
+                Some(SessionStatus::Idle),
+                "{later_hook}"
+            );
+            assert!(
+                asked.elapsed() < Duration::from_millis(300),
+                "the other pane waited behind the held one ({later_hook}): {:?}",
+                asked.elapsed()
+            );
+            assert_eq!(
+                deck.card(0).await,
+                Some((SessionStatus::Thinking, false)),
+                "{later_hook}"
+            );
+            drop(held);
+            deck.applies_until(|(_, running)| running == 0, "its apply never ended")
+                .await;
+            let wanted = if later_hook {
+                SessionStatus::Thinking
+            } else {
+                SessionStatus::Idle
+            };
+            let card = deck
+                .card_within(0, Duration::from_secs(5), |(status, _)| *status == wanted)
+                .await;
+            assert_eq!(card.map(|c| c.0), Some(wanted), "{later_hook}");
+            if later_hook {
+                assert!(
+                    !deck
+                        .registry
+                        .hook_in_flight_before(&deck.panes[0].1, Instant::now()),
+                    "the later hook is in"
+                );
+                assert!(
+                    !deck
+                        .signal_events(0)
+                        .await
+                        .contains(&crate::event::EventType::Idle),
+                    "the signal read before the later hook was applied over it"
+                );
+            }
+        }
+    }
+
+    /// Scenario: an Antigravity pane's question lifecycle is held while it
+    /// reports `idle`, so that apply waits; then the pane's agent closes. The
+    /// waiting apply is cancelled while the lifecycle is still held, and once
+    /// the hold ends the card has applied nothing from it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_waiting_apply_is_cancelled_when_its_generation_goes() {
+        let deck = Deck::start(&["agy-cancel-a"]).await;
+        deck.thinking(0).await;
+        let held = deck
+            .registry
+            .question_answers()
+            .lock_lifecycle("agy-cancel-a")
+            .await;
+        deck.signal(0, IDLE);
+        deck.applies_until(|(_, running)| running == 1, "its apply never started")
+            .await;
+        deck.registry.close_agent(&deck.panes[0].1).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while deck
+            .registry
+            .pane_current_agent_id("agy-cancel-a")
+            .is_some()
+        {
+            assert!(Instant::now() < deadline, "the agent never went");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        deck.applies_until(|(_, running)| running == 0, "the apply was not cancelled")
+            .await;
+        drop(held);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !deck
+                .signal_events(0)
+                .await
+                .contains(&crate::event::EventType::Idle),
+            "the gone generation's signal was applied"
+        );
+    }
+
+    /// Scenario: in a shell pane, `agy`'s own hooks turn the status reader on,
+    /// and with the pane's question lifecycle held it reports `idle`, so that
+    /// apply waits. A new `agy` invocation then starts there and its prompt
+    /// is read. The old apply is cancelled and the new one starts while the
+    /// lifecycle is still held, so it waits for nothing of the old reader's;
+    /// once the hold ends the card shows the new prompt and never the old
+    /// `idle`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_waiting_apply_is_cancelled_when_its_reader_restarts() {
+        let deck = Deck::start_as(&["agy-cancel-b"], None).await;
+        deck.thinking(0).await;
+        let (pane, agent) = deck.panes[0].clone();
+        let first = deck.registry.status_reader_epoch(&agent);
+        let held = deck
+            .registry
+            .question_answers()
+            .lock_lifecycle("agy-cancel-b")
+            .await;
+        deck.signal(0, IDLE);
+        deck.applies_until(|applies| applies == (1, 1), "its apply never started")
+            .await;
+        assert!(
+            deck.registry
+                .note_own_agent_hook(
+                    &pane,
+                    &agent,
+                    &AgentType::Antigravity,
+                    "agy-park-0",
+                    false,
+                    true,
+                )
+                .is_some(),
+            "the new invocation turned a fresh reader on"
+        );
+        assert_ne!(deck.registry.status_reader_epoch(&agent), first);
+        deck.signal(0, OTHER_PERMISSION);
+        deck.applies_until(
+            |applies| applies == (2, 1),
+            "the new reader's apply waited for the old one",
+        )
+        .await;
+        drop(held);
+        let card = deck
+            .card_within(0, Duration::from_secs(5), |(status, _)| {
+                *status == SessionStatus::WaitingForInput
+            })
+            .await;
+        assert_eq!(card.map(|c| c.0), Some(SessionStatus::WaitingForInput));
+        assert_eq!(
+            deck.signal_events(0).await,
+            vec![crate::event::EventType::PermissionRequest],
+            "the old reader's signal was applied"
+        );
+    }
+
+    /// Scenario: an Antigravity pane's `PreToolUse` is held up in its ingest
+    /// past the 10 s its permission prompt waits, so the prompt's apply goes
+    /// ahead and waits for the pane; the pane then reports `idle`. Once the
+    /// hold ends the call is in, the prompt lands with its question, and the
+    /// `idle` lands after it: the card ends Idle.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_later_idle_lands_after_the_late_prompt_ahead_of_it() {
+        let deck = Deck::start(&["agy-order-a"]).await;
+        deck.thinking(0).await;
+        let held = deck
+            .registry
+            .question_answers()
+            .lock_lifecycle("agy-order-a")
+            .await;
+        let _call = deck.hook(0, "pre-tool-use-run-command.json").await;
+        deck.until_in_flight(0).await;
+        deck.signal(0, PERMISSION);
+        tokio::time::sleep(STATUS_SIGNAL_HOOK_WAIT + Duration::from_millis(500)).await;
+        deck.applies_until(|(_, running)| running == 1, "the late prompt's apply")
+            .await;
+        deck.signal(0, IDLE);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(deck.applies(), (1, 1), "the idle went ahead of the prompt");
+        assert_eq!(deck.card(0).await, Some((SessionStatus::Thinking, false)));
+        drop(held);
+        let card = deck
+            .card_within(0, Duration::from_secs(5), |(status, _)| {
+                *status == SessionStatus::Idle
+            })
+            .await;
+        assert_eq!(card.map(|c| c.0), Some(SessionStatus::Idle));
+        assert_eq!(
+            deck.signal_events(0).await,
+            vec![
+                crate::event::EventType::PermissionRequest,
+                crate::event::EventType::Idle
+            ],
+            "the prompt and the idle after it, in that order"
+        );
     }
 }

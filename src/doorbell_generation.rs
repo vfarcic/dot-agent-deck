@@ -283,8 +283,10 @@ impl GenerationDoorbell {
     /// PRD #211 (audit B3): whether the pane's PTY master has room for a
     /// write now, asked without waiting (`poll` with a zero timeout). A
     /// screen-witnessed answer key is written only after this says yes, so
-    /// its one-byte `write(2)` does not wait for the agent to read while the
-    /// output lock is held. `false` with no master to ask, or on any error.
+    /// its one-byte `write(2)` is not started on a master already full while
+    /// the output lock is held. The room is not reserved: a write that blocks
+    /// after it is the accepted limit `agent_pty::write_witnessed` names.
+    /// `false` with no master to ask, or on any error.
     pub fn master_has_room(&self) -> bool {
         #[cfg(unix)]
         {

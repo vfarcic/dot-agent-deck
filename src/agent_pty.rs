@@ -2323,13 +2323,22 @@ impl AgentBus {
     ///   reads that invocation's release off its own header, in the bytes
     ///   written since the previous hook of an agent's own here — unknown
     ///   when none was drawn there. A new session is a new invocation, and so
-    ///   is every `SessionStart`, even of a session already running here: an
-    ///   `agy` resuming the conversation an earlier one ran (audit B3c). So is
-    ///   a header of another release drawn since the session's previous hook;
+    ///   is every `SessionStart`, even of a session already running here
+    ///   (audit B3c). So is a header of another release drawn since the
+    ///   session's previous hook, when no different header is there with it;
     /// - its end, or any other agent's hook, turns the reader off and drops
     ///   what it read.
     ///
     /// The reader is never turned on by the pane's output itself.
+    ///
+    /// Fourth audit, suggestion 3 (measured on `agy` 1.5.9): an `agy` resumed
+    /// with `--conversation=<id>` fires no `SessionStart` and its first hook
+    /// reports the same session id. It redraws its header, as the exiting
+    /// `agy` reprints its own, but in the captured shell run neither was on
+    /// the row [`crate::release_scanner::ANTIGRAVITY_HEADER`] reads, so
+    /// [`Self::header_since_mark`] read none. Such a resume is not detected:
+    /// it keeps the reader, its epoch and the earlier invocation's release,
+    /// when one was read. This does not authenticate the process.
     fn shell_agent_hook(
         &self,
         agent: &AgentType,
@@ -7526,15 +7535,23 @@ impl Tracking<'_> {
 /// `write(2)` in one hold of the output lock ([`AgentBus::commit_if_frame_unchanged`]),
 /// so no output the reader takes and no resize can land between them.
 ///
-/// Nothing here waits: the lock is only tried, and the byte is written only
-/// when the PTY master reports room for it
-/// ([`crate::doorbell_generation::GenerationDoorbell::master_has_room`]), so
-/// the one-byte write does not wait for the agent to read while every output
-/// push waits on the lock. Any of those failing, a key of more than one byte,
-/// or a pane with no master to ask writes nothing and reports
-/// [`AnswerScreenNotHeld`]; nothing is retried against a frame that may have
-/// moved. What this cannot see is output the agent wrote that the reader has
-/// not taken in yet.
+/// The output lock is only tried, and the byte is written only when the PTY
+/// master reports room for it
+/// ([`crate::doorbell_generation::GenerationDoorbell::master_has_room`]): this
+/// does not wait for the lock, for a frame that moved or for room. A held
+/// lock, a moved frame, no room, a key of more than one byte, a pane with no
+/// master to ask, and a `write(2)` interrupted (`EINTR`) or refused for room
+/// (`EAGAIN`) all write nothing and report [`AnswerScreenNotHeld`]
+/// ([`commit_answer_byte`]); none of them is tried again.
+///
+/// Accepted availability limit (fourth audit, suggestion 1): the master stays
+/// a blocking descriptor — the reader shares its file description, so its
+/// `O_NONBLOCK` is not toggled here — and room reported by `poll` is not
+/// reserved. A one-byte `write(2)` that blocks after `POLLOUT` (the master's
+/// output stopped in between, as `TCOOFF` does) blocks with the output lock
+/// held, so the reader, the screen queries and a resize of this pane wait
+/// until it returns. What this cannot see is output the agent wrote that the
+/// reader has not taken in yet.
 fn write_witnessed(
     w: &mut (dyn std::io::Write + Send),
     buf: &[u8],
@@ -7563,14 +7580,7 @@ fn write_witnessed(
         if !has_room() {
             return None;
         }
-        // `Interrupted` took nothing, and the frame cannot move while the
-        // lock is held, so writing again checks against the same frame.
-        loop {
-            match w.write(buf) {
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                other => return Some(other),
-            }
-        }
+        Some(commit_answer_byte(w, buf))
     });
     let n = match wrote.flatten() {
         None | Some(Ok(0)) => return not_held(),
@@ -7593,6 +7603,25 @@ fn write_witnessed(
         accepted: n,
         result: Ok(()),
         flushed: None,
+    }
+}
+
+/// PRD #211 (fourth audit, suggestion 1): the one `write(2)` of a
+/// screen-witnessed answer key, under the output lock
+/// ([`write_witnessed`]). A write interrupted by a signal (`EINTR`) or refused
+/// for room (`EAGAIN`) took nothing and is not tried again under the lock:
+/// `Ok(0)`, which refuses the answer as written nothing.
+fn commit_answer_byte(w: &mut (dyn std::io::Write + Send), buf: &[u8]) -> std::io::Result<usize> {
+    match w.write(buf) {
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+            ) =>
+        {
+            Ok(0)
+        }
+        other => other,
     }
 }
 
@@ -8231,7 +8260,8 @@ pub(crate) enum AnswerWrite {
     NotDeferred,
     /// PRD #211 (audit B3): at its commit, a screen-witnessed key found the
     /// frame its check read moved, the output lock taken, or the PTY with no
-    /// room: nothing was written ([`write_witnessed`]).
+    /// room, or its `write(2)` was interrupted or refused for room: nothing
+    /// was written ([`write_witnessed`]).
     ScreenMoved,
     /// The keys are written; the human-input sequence number they were
     /// committed at.
@@ -37022,15 +37052,16 @@ mod shell_agent_session_tests {
     }
 
     /// Scenario: in one shell, `agy` 1.5.9 runs conversation C and exits with
-    /// no hook; a newer `agy` then resumes C, drawing 1.6.0, and its
-    /// `SessionStart` arrives under the same conversation id. Its release is
-    /// its own header's and its reader is a fresh one, so what the old reader
-    /// read is dropped. A third resume of C whose header is not read is
-    /// unknown rather than 1.6.0. A later hook of a resumed session with a
+    /// no hook; a newer `agy` then runs C again, drawing 1.6.0, and a
+    /// `SessionStart` arrives under the same conversation id (a real `agy`
+    /// 1.5.9 resumed with `--conversation` fires none). Its
+    /// release is its own header's and its reader is a fresh one, so what
+    /// the old reader read is dropped. A third start of C whose header is not
+    /// read is unknown rather than 1.6.0. A later hook of the session with a
     /// header of another release drawn since is a new invocation too, while
     /// one with no new header changes nothing.
     #[test]
-    fn a_resumed_shell_agy_conversation_inherits_no_release() {
+    fn a_session_start_under_the_same_shell_agy_conversation_inherits_no_release() {
         let bus = AgentBus::new();
         bus.push(b"$ agy\r\n".to_vec());
         bus.push(header("1.5.9"));
@@ -37078,6 +37109,32 @@ mod shell_agent_session_tests {
             None
         );
         assert_eq!(release(&bus).as_deref(), Some("1.6.1"));
+    }
+
+    /// Scenario: in one shell, `agy` 1.5.9 runs conversation C, and prints
+    /// its resume command and its header again; a header of the same release
+    /// is then drawn where the deck reads one, and the next hook of C, with no
+    /// `SessionStart`, arrives. A header of the release already read is no
+    /// new invocation: the reader, its epoch and the release 1.5.9 stay.
+    #[test]
+    fn a_same_release_header_under_the_same_session_keeps_the_reader() {
+        let bus = AgentBus::new();
+        bus.push(b"$ agy\r\n".to_vec());
+        bus.push(header("1.5.9"));
+        bus.shell_agent_hook(&AgentType::Antigravity, "conv-c", false, true);
+        let epoch = bus.state.lock().unwrap().status_epoch;
+        // The exit: the resume command, then the header reprinted, no clear.
+        bus.push(
+            b"\r\nResume with -c (or command below):\r\nagy --conversation=conv-c\r\n\n\x1b[6C\xe2\x96\x84\x1b[m        \x1b[94;1mAntigravity CLI 1.5.9\x1b[m\r\n$ agy --conversation=conv-c\r\n"
+                .to_vec(),
+        );
+        bus.push(header("1.5.9"));
+        assert_eq!(
+            bus.shell_agent_hook(&AgentType::Antigravity, "conv-c", false, false),
+            None
+        );
+        assert_eq!(bus.state.lock().unwrap().status_epoch, epoch);
+        assert_eq!(release(&bus).as_deref(), Some("1.5.9"));
     }
 
     /// Scenario: in one shell, another agent's hooks report first, then `agy`
@@ -37424,5 +37481,76 @@ mod paced_withdrawal_tests {
         );
         assert_eq!(writes.len(), 2, "the line, then every delete in one write");
         assert_eq!(reached.iter().filter(|&&b| b == 0x7f).count(), 1);
+    }
+}
+
+/// PRD #211 (fourth audit, suggestion 1): the one-byte commit of a
+/// screen-witnessed answer key ([`commit_answer_byte`]).
+#[cfg(test)]
+mod answer_byte_tests {
+    use super::commit_answer_byte;
+    use std::io::{Error, ErrorKind, Write};
+
+    /// A writer that fails its first `failures.len()` writes with those
+    /// kinds, then takes everything, counting each call.
+    struct Scripted {
+        failures: Vec<ErrorKind>,
+        calls: usize,
+        taken: Vec<u8>,
+    }
+
+    impl Write for Scripted {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.calls += 1;
+            if let Some(kind) = (!self.failures.is_empty()).then(|| self.failures.remove(0)) {
+                return Err(Error::from(kind));
+            }
+            self.taken.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Scenario: the one `write(2)` of an answer key is interrupted by a
+    /// signal, or refused for room. The key is not written and the write is
+    /// not tried again: the commit reports nothing written, which refuses the
+    /// answer.
+    #[test]
+    fn an_interrupted_or_full_commit_refuses_the_answer_without_retrying() {
+        for kind in [ErrorKind::Interrupted, ErrorKind::WouldBlock] {
+            let mut w = Scripted {
+                failures: vec![kind],
+                calls: 0,
+                taken: Vec::new(),
+            };
+            let wrote = commit_answer_byte(&mut w, b"1");
+            assert_eq!(wrote.ok(), Some(0), "{kind:?}");
+            assert_eq!(w.calls, 1, "{kind:?}: tried again under the lock");
+            assert!(w.taken.is_empty(), "{kind:?}");
+        }
+    }
+
+    /// Scenario: the commit's write succeeds, or fails for another reason. The
+    /// byte is written once, or the error is reported as it is.
+    #[test]
+    fn a_commit_writes_the_byte_once_or_reports_its_error() {
+        let mut w = Scripted {
+            failures: Vec::new(),
+            calls: 0,
+            taken: Vec::new(),
+        };
+        assert_eq!(commit_answer_byte(&mut w, b"1").ok(), Some(1));
+        assert_eq!((w.calls, w.taken.as_slice()), (1, b"1".as_slice()));
+        let mut w = Scripted {
+            failures: vec![ErrorKind::BrokenPipe],
+            calls: 0,
+            taken: Vec::new(),
+        };
+        let wrote = commit_answer_byte(&mut w, b"1");
+        assert_eq!(wrote.map_err(|e| e.kind()), Err(ErrorKind::BrokenPipe));
+        assert_eq!(w.calls, 1);
     }
 }
