@@ -9065,6 +9065,8 @@ async fn run_hook_loop_with_limits(
                                                 &event.session_id,
                                                 event.event_type
                                                     == crate::event::EventType::SessionEnd,
+                                                event.event_type
+                                                    == crate::event::EventType::SessionStart,
                                             )
                                         })
                                         .flatten();

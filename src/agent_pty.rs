@@ -2315,13 +2315,17 @@ impl AgentBus {
     /// PRD #211 (second review, findings 3 and 4): a hook of `agent`'s own,
     /// for its session `session_id`, attested to this generation — spawned as
     /// no agent, a shell — named its pane (`ends`: the hook ends that
-    /// session). The OSC 7501 reader follows the agent session active in the
-    /// shell:
+    /// session; `starts`: it is the session's `SessionStart`). The OSC 7501
+    /// reader follows the agent invocation active in the shell:
     ///
-    /// - a new session of an agent that reports through OSC 7501 turns a
+    /// - a new invocation of an agent that reports through OSC 7501 turns a
     ///   fresh reader on for it, drops whatever the previous one read, and
-    ///   reads that session's release off its own header, in the bytes written
-    ///   since the previous hook of an agent's own here;
+    ///   reads that invocation's release off its own header, in the bytes
+    ///   written since the previous hook of an agent's own here — unknown
+    ///   when none was drawn there. A new session is a new invocation, and so
+    ///   is every `SessionStart`, even of a session already running here: an
+    ///   `agy` resuming the conversation an earlier one ran (audit B3c). So is
+    ///   a header of another release drawn since the session's previous hook;
     /// - its end, or any other agent's hook, turns the reader off and drops
     ///   what it read.
     ///
@@ -2331,14 +2335,28 @@ impl AgentBus {
         agent: &AgentType,
         session_id: &str,
         ends: bool,
+        starts: bool,
     ) -> Option<ShellReaderChange> {
         let osc = crate::agent_registry::spec(agent).status_osc7501;
         let mut state = self.state.lock().unwrap();
         let state = &mut *state;
-        let same = state
+        let mut same = state
             .shell_session
             .as_ref()
             .map(|session| session.agent == *agent && session.session_id == session_id);
+        if same == Some(true) && osc.is_some() && !ends {
+            // Audit B3c: a new invocation of the same session is read afresh.
+            let restarted = starts
+                || Self::header_since_mark(state, agent).is_some_and(|drawn| {
+                    state
+                        .shell_session
+                        .as_ref()
+                        .is_none_or(|session| session.release.as_ref() != Some(&drawn))
+                });
+            if restarted {
+                same = Some(false);
+            }
+        }
         let change = match (osc, same) {
             (Some(_), Some(true)) if !ends => None,
             (Some(osc), _) if !ends => {
@@ -13773,7 +13791,9 @@ impl AgentPtyRegistry {
 
     /// PRD #211 (second review, findings 3 and 4): an event of `agent`'s own
     /// hooks, for its session `session_id`, attested to generation
-    /// `agent_id`, named pane `pane_id` (`ends`: it ends that session). In a
+    /// `agent_id`, named pane `pane_id` (`ends`: it ends that session;
+    /// `starts`: it is a `SessionStart`, which starts a new invocation even of
+    /// a session already running there). In a
     /// generation spawned as no agent — a shell — the OSC 7501 reader follows
     /// the agent session active there ([`AgentBus::shell_agent_hook`]): on,
     /// fresh, for a new session of an agent that reports that way, with the
@@ -13788,6 +13808,7 @@ impl AgentPtyRegistry {
         agent: &AgentType,
         session_id: &str,
         ends: bool,
+        starts: bool,
     ) -> Option<ShellReaderChange> {
         let bus = {
             let inner = self.inner.lock();
@@ -13800,7 +13821,7 @@ impl AgentPtyRegistry {
             }
             Arc::clone(&record.bus)
         };
-        bus.shell_agent_hook(agent, session_id, ends)
+        bus.shell_agent_hook(agent, session_id, ends, starts)
     }
 
     /// PRD #211 (second review, finding 4): generation `agent_id`'s OSC 7501
@@ -36974,30 +36995,89 @@ mod shell_agent_session_tests {
         bus.push(b"$ agy\r\n".to_vec());
         bus.push(header("1.5.9"));
         assert!(matches!(
-            bus.shell_agent_hook(&AgentType::Antigravity, "conv-1", false),
+            bus.shell_agent_hook(&AgentType::Antigravity, "conv-1", false, false),
             Some(ShellReaderChange::Started { .. })
         ));
         assert_eq!(release(&bus).as_deref(), Some("1.5.9"));
         // Later hooks of the same session change nothing.
         assert_eq!(
-            bus.shell_agent_hook(&AgentType::Antigravity, "conv-1", false),
+            bus.shell_agent_hook(&AgentType::Antigravity, "conv-1", false, false),
             None
         );
         bus.push(b"bye\r\n$ agy\r\n".to_vec());
         bus.push(header("1.6.0"));
-        bus.shell_agent_hook(&AgentType::Antigravity, "conv-2", false);
+        bus.shell_agent_hook(&AgentType::Antigravity, "conv-2", false, false);
         assert_eq!(
             release(&bus).as_deref(),
             Some("1.6.0"),
             "the second agy's release is its own header's"
         );
         bus.push(b"bye\r\n$ agy\r\n  no header here\r\n".to_vec());
-        bus.shell_agent_hook(&AgentType::Antigravity, "conv-3", false);
+        bus.shell_agent_hook(&AgentType::Antigravity, "conv-3", false, false);
         assert_eq!(
             release(&bus),
             None,
             "an agy whose header was not read inherits no earlier release"
         );
+    }
+
+    /// Scenario: in one shell, `agy` 1.5.9 runs conversation C and exits with
+    /// no hook; a newer `agy` then resumes C, drawing 1.6.0, and its
+    /// `SessionStart` arrives under the same conversation id. Its release is
+    /// its own header's and its reader is a fresh one, so what the old reader
+    /// read is dropped. A third resume of C whose header is not read is
+    /// unknown rather than 1.6.0. A later hook of a resumed session with a
+    /// header of another release drawn since is a new invocation too, while
+    /// one with no new header changes nothing.
+    #[test]
+    fn a_resumed_shell_agy_conversation_inherits_no_release() {
+        let bus = AgentBus::new();
+        bus.push(b"$ agy\r\n".to_vec());
+        bus.push(header("1.5.9"));
+        bus.shell_agent_hook(&AgentType::Antigravity, "conv-c", false, true);
+        assert_eq!(release(&bus).as_deref(), Some("1.5.9"));
+        let first_epoch = bus.state.lock().unwrap().status_epoch;
+        // Read by the 1.5.9 reader, not handed over, when the resume lands.
+        bus.push(PERMISSION.to_vec());
+        bus.push(b"$ agy --conversation=conv-c\r\n".to_vec());
+        bus.push(header("1.6.0"));
+        assert!(matches!(
+            bus.shell_agent_hook(&AgentType::Antigravity, "conv-c", false, true),
+            Some(ShellReaderChange::Started { .. })
+        ));
+        assert_eq!(
+            release(&bus).as_deref(),
+            Some("1.6.0"),
+            "the resumed conversation's release is its own header's"
+        );
+        assert_ne!(bus.state.lock().unwrap().status_epoch, first_epoch);
+        assert!(
+            bus.take_status_signals()
+                .is_some_and(|(_, signals, _)| signals.is_empty()),
+            "what the earlier invocation's reader read is dropped"
+        );
+
+        bus.push(b"$ agy --conversation=conv-c\r\n  no header here\r\n".to_vec());
+        bus.shell_agent_hook(&AgentType::Antigravity, "conv-c", false, true);
+        assert_eq!(
+            release(&bus),
+            None,
+            "a resume whose header was not read is unknown, not the previous release"
+        );
+
+        // No `SessionStart`: a header of another release is new startup
+        // evidence; none at all is the same invocation.
+        bus.push(header("1.6.1"));
+        assert!(matches!(
+            bus.shell_agent_hook(&AgentType::Antigravity, "conv-c", false, false),
+            Some(ShellReaderChange::Started { .. })
+        ));
+        assert_eq!(release(&bus).as_deref(), Some("1.6.1"));
+        assert_eq!(
+            bus.shell_agent_hook(&AgentType::Antigravity, "conv-c", false, false),
+            None
+        );
+        assert_eq!(release(&bus).as_deref(), Some("1.6.1"));
     }
 
     /// Scenario: in one shell, another agent's hooks report first, then `agy`
@@ -37007,13 +37087,13 @@ mod shell_agent_session_tests {
     fn agy_after_another_agent_in_the_shell_is_read() {
         let bus = AgentBus::new();
         assert_eq!(
-            bus.shell_agent_hook(&AgentType::ClaudeCode, "claude-1", false),
+            bus.shell_agent_hook(&AgentType::ClaudeCode, "claude-1", false, false),
             None
         );
         assert!(!reads_osc(&bus), "no reader before agy's own hook");
         bus.push(b"$ agy\r\n".to_vec());
         bus.push(header("1.5.9"));
-        bus.shell_agent_hook(&AgentType::Antigravity, "conv-1", false);
+        bus.shell_agent_hook(&AgentType::Antigravity, "conv-1", false, false);
         assert_eq!(release(&bus).as_deref(), Some("1.5.9"));
         assert!(reads_osc(&bus));
     }
@@ -37026,12 +37106,12 @@ mod shell_agent_session_tests {
     fn the_shell_reader_stops_at_another_agents_hook_and_at_the_end() {
         let bus = AgentBus::new();
         bus.push(header("1.5.9"));
-        bus.shell_agent_hook(&AgentType::Antigravity, "conv-1", false);
+        bus.shell_agent_hook(&AgentType::Antigravity, "conv-1", false, false);
         let on = bus.state.lock().unwrap().status_epoch;
         // Read, not yet handed over, when the other agent's hook lands.
         bus.push(PERMISSION.to_vec());
         assert_eq!(
-            bus.shell_agent_hook(&AgentType::ClaudeCode, "claude-1", false),
+            bus.shell_agent_hook(&AgentType::ClaudeCode, "claude-1", false, false),
             Some(ShellReaderChange::Ended)
         );
         assert!(
@@ -37043,10 +37123,10 @@ mod shell_agent_session_tests {
         assert_eq!(release(&bus), None);
 
         bus.push(header("1.5.9"));
-        bus.shell_agent_hook(&AgentType::Antigravity, "conv-2", false);
+        bus.shell_agent_hook(&AgentType::Antigravity, "conv-2", false, false);
         assert!(reads_osc(&bus));
         assert_eq!(
-            bus.shell_agent_hook(&AgentType::Antigravity, "conv-2", true),
+            bus.shell_agent_hook(&AgentType::Antigravity, "conv-2", true, false),
             Some(ShellReaderChange::Ended)
         );
         assert!(!reads_osc(&bus), "a sequence after the session's end");
