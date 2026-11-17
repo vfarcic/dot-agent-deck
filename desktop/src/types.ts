@@ -1814,6 +1814,14 @@ export interface DeckRuntimeState {
   decideUpgrade?: (upgradeId: string, questionId: number, choice: import("./lib/upgrade").UpgradeChoice) => Promise<void>;
   /** PRD #1666 §6.4: Retry or Cancel one listed deck message; absent where no daemon can answer. */
   inboxAction?: (target: AgentTarget, item: { paneId: string; messageId: string; revision: number }, verb: InboxActionVerb) => Promise<InboxActionResult>;
+  /**
+   * PRD #2374 — each deck's agent cards, by deck id, as its daemon last sent
+   * them. A deck whose daemon has no cards has no key here. Absent where the
+   * bridge offers no cards (a render-only test runtime).
+   */
+  agentCards?: Readonly<Record<string, AgentCardsSnapshot>>;
+  /** PRD #2374 — invoke one action of one card; the daemon resolves, refuses or performs it. */
+  invokeCardAction?: (target: AgentCardTarget, actionId: string, options?: { confirm?: boolean; text?: string; requestId?: string }) => Promise<CardActionResult>;
   sendTerminalInput: (target: AgentTarget, data: string, precondition?: () => boolean) => Promise<void>;
   resizeTerminal: (target: AgentTarget, cols: number, rows: number) => Promise<void>;
   /**

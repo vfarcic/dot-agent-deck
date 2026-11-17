@@ -36,6 +36,11 @@ import { sameIncarnation } from "../lib/agentKey";
 import { AGENT_GONE_AFTER_RESTART } from "../lib/agentIdentity";
 import { deckAttentionText } from "../lib/inboxWords";
 import { DeckAttention } from "./DeckAttention";
+import { useAgentCardsView, type AgentCardsView } from "../hooks/useAgentCardsView";
+import { OverviewModeSwitch } from "./OverviewModeSwitch";
+import { AgentCardsGrid } from "./AgentCardsGrid";
+import { AgentCardOverlay } from "./AgentCardOverlay";
+import { OverviewRowCard } from "./OverviewRowMenu";
 
 /**
  * The honest subset of `AgentSession`: every field a daemon genuinely reports
@@ -705,6 +710,8 @@ const StopControlsContext = createContext<OverviewStopControls | undefined>(unde
  * dialog covers the rows.
  */
 const RowNumbersContext = createContext<ReadonlyMap<string, number> | undefined>(undefined);
+/** PRD #2374 — the cards view, while the experimental flag shows it: each row's needs-you marker and ⋯ menu read it. */
+const RowCardsContext = createContext<AgentCardsView | undefined>(undefined);
 
 /** Overlap kept between two screens of a spoken scroll, so the row at the edge stays in sight (issue #1492). */
 const DASHBOARD_SCROLL_OVERLAP = 48;
@@ -1317,6 +1324,9 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
          published only while it is open. */
       ...(newAgent ? {} : { showDashboardCounters }),
       ...(countersOpen ? { closeDashboardCounters: () => setCountersOpen(false) } : {}),
+      /* PRD #2374 — the cards' members, only while the flag shows the cards;
+         `closeAgentCard` only while a card is open. */
+      ...(cards.shown ? cards.voice : {}),
     };
     voiceChannel.current = newAgent
       ? { closeNewAgent: () => newAgentClose.current?.(), ...directoryMoves }
@@ -1381,6 +1391,17 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   const openAgent = useCallback((agent: OverviewAgent) => {
     VOICE_ACTIONS.openAgent.run(voiceContext, { deckId: agent.daemonId, agentId: agent.id, from: "overview", incarnation: agent.incarnation });
   }, [voiceContext]);
+  /*
+    PRD #2374 — the agent cards, behind the experimental flag: the Table |
+    Cards switch, the cards grid, the card overlay and the table's needs-you
+    marker and row menu. A card's `open` action opens the agent exactly as a
+    row does.
+  */
+  const cardDeckList = useMemo(() => decks.map((deck) => ({ deckId: deck.snapshot.connection.deckId, connected: deck.connected })), [decks]);
+  const openCardAgent = useCallback((target: { deckId: string; agentId: string; incarnation?: string }) => {
+    VOICE_ACTIONS.openAgent.run(voiceContext, { ...target, from: "overview" });
+  }, [voiceContext]);
+  const cards = useAgentCardsView({ runtime, decks: cardDeckList, openAgent: openCardAgent });
   const [confirm, setConfirm] = useState<ConfirmState>();
   /** PRD #1487 M5 — the Upgrade dialog, for the deck whose card it was pressed on. */
   const [upgrade, setUpgrade] = useState<UpgradeTarget>();
@@ -1777,8 +1798,9 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
             </DashboardCounters>
             {newAgentAvailable && <button className="button primary compact" data-testid="overview-new-agent" aria-label="New agent" title="New agent (Ctrl+N / ⌘N)" onClick={() => VOICE_ACTIONS.openNewAgent.run(voiceContext)}><Plus size={14} /><span>New agent</span></button>}
             {openDeck && <button className="button secondary compact" data-testid="overview-open-deck" onClick={openDeck}><SquareTerminal size={14} /><span>Open daemons</span></button>}
+            {cards.shown && <OverviewModeSwitch mode={cards.mode} controls={cards.controls} />}
             <DashboardFilterControls filter={filter} daemons={filterDaemons} />
-            <OverviewColumnPicker columns={columns} onChange={setColumns} />
+            {cards.mode === "table" && <OverviewColumnPicker columns={columns} onChange={setColumns} />}
             <button className="button secondary compact" data-testid="overview-refresh" onClick={() => void runtime.reconnect()}><RefreshCw size={14} /><span>Refresh</span></button>
           </div>
           <DeckAttention text={deckAttention} />
@@ -1834,7 +1856,22 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
             `.map`, and `DaemonBody` below took a `fleetSize` for its note
             density and nothing else.
           */}
-          {decks.map((deck) => (
+          {cards.mode === "cards" && (
+            <AgentCardsGrid
+              decks={decks.flatMap((deck) => {
+                const deckId = deck.snapshot.connection.deckId;
+                return deck.connected && deckId !== undefined && cards.decksWithCards.has(deckId)
+                  ? [{ deckId, name: deckName(deck.snapshot.connection), cards: cards.placed.filter((card) => card.deckId === deckId) }]
+                  : [];
+              })}
+              needsYouOnly={cards.needsYouOnly}
+              controls={cards.controls}
+              results={cards.resultsFor}
+            />
+          )}
+          {/* PRD #2374 — in the Cards view, a deck whose daemon has no cards
+              (or that is not answering) keeps its own section as before. */}
+          {decks.filter((deck) => cards.mode === "table" || !deck.connected || deck.snapshot.connection.deckId === undefined || !cards.decksWithCards.has(deck.snapshot.connection.deckId)).map((deck) => (
             <DeckGroup
               /*
                 PRD #742 M5: the KEY, not the label. `socketPath` is
@@ -1879,6 +1916,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
           ))}
         </section>
       </main>
+      {cards.overlay && <AgentCardOverlay {...cards.overlay} controls={cards.controls} />}
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}
       {upgrade && <UpgradeDialog target={upgrade} runtime={runtime} onClose={() => setUpgrade(undefined)} />}
       {localUpgrade && <LocalUpgradeFlow {...localUpgrade} runtime={runtime} onClose={() => { setLocalUpgrade(undefined); selfUpgrade?.onClosed?.(); }} />}
@@ -1911,7 +1949,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       )}
     </div>
   );
-  return <OpenAgentContext.Provider value={openAgent}><StopControlsContext.Provider value={stopControls}><RowNumbersContext.Provider value={rowNumbers}>{overviewScreen}</RowNumbersContext.Provider></StopControlsContext.Provider></OpenAgentContext.Provider>;
+  return <OpenAgentContext.Provider value={openAgent}><StopControlsContext.Provider value={stopControls}><RowNumbersContext.Provider value={rowNumbers}><RowCardsContext.Provider value={cards.shown ? cards : undefined}>{overviewScreen}</RowCardsContext.Provider></RowNumbersContext.Provider></StopControlsContext.Provider></OpenAgentContext.Provider>;
 }
 
 /** One deck of the fleet, as {@link AgentOverview} prepares it for rendering. */
@@ -2902,6 +2940,7 @@ function OverviewRow({ agent, hoistedCwd, now, columns }: { agent: OverviewAgent
                 onClick={() => stopControls.stopAgent(agent)}
               ><CircleStop size={12} /></button>
             )}
+            {rowCard && rowCards && <OverviewRowCard card={rowCard} name={name} rowKey={agentDomKey(agent)} open={rowCards.rowMenu === agentDomKey(agent)} controls={rowCards.controls} />}
           </td>
         );
       case "lastActivityMs":
@@ -3022,6 +3061,9 @@ function OverviewRow({ agent, hoistedCwd, now, columns }: { agent: OverviewAgent
   /* PR #1451 round 3, change 3 — the number this row shows while voice is
      on, first in the row and first in its accessible name. */
   const number = useContext(RowNumbersContext)?.get(agentKey(agent));
+  /* PRD #2374 — this row's card, while the cards are shown. */
+  const rowCards = useContext(RowCardsContext);
+  const rowCard = rowCards?.cardFor(agent.daemonId, agent.id, agent.incarnation);
   const openFromRow = openAgent && ((event: MouseEvent<HTMLTableRowElement>) => {
     if (clickLandedOnRowControl(event) || clickFinishedSelection(event.currentTarget)) return;
     openAgent(agent);

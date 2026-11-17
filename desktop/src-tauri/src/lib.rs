@@ -3654,10 +3654,20 @@ async fn desktop_voice_resolve(
         voice::Transcript::new(utterance),
         settings.labels,
         // Issue #1198: the deck is an experimental surface, so voice neither
-        // offers nor dispatches the way there while it is hidden.
-        dot_agent_deck::features::show_desktop_deck(),
+        // offers nor dispatches the way there while it is hidden; PRD #2374:
+        // nor the agent cards' rows while the cards are.
+        voice_flag_gates(),
     )
     .await
+}
+
+/// The experimental surfaces voice is gated on, each read through its own
+/// wrapper (CLAUDE.md rule 9) at the command seams that offer and dispatch.
+fn voice_flag_gates() -> voice::FlagGates {
+    voice::FlagGates {
+        show_deck: dot_agent_deck::features::show_desktop_deck(),
+        show_agent_cards: dot_agent_deck::features::show_agent_cards(),
+    }
 }
 
 /// The webview-declared pieces [`desktop_voice_resolve`] resolves an utterance
@@ -3686,7 +3696,7 @@ async fn resolve_declared_utterance(
     declared: VoiceDeclaration<'_>,
     transcript: voice::Transcript,
     labels: crate::settings::LabelSharing,
-    show_deck: bool,
+    show_deck: impl Into<voice::FlagGates>,
 ) -> Result<voice::VoiceResult, String> {
     let mut decks = voice_decks(observed, declared.deck_step, agents_deck);
     // PRD #1195 M3: the decks the Deck selector lists, as the webview sent
@@ -5026,8 +5036,9 @@ async fn desktop_voice_commands(
             .unwrap_or_default()
             .labels,
         // Issue #1198: the list marks the deck's row unavailable while the deck
-        // is hidden, for the same reason the resolver refuses it.
-        dot_agent_deck::features::show_desktop_deck(),
+        // is hidden, for the same reason the resolver refuses it; PRD #2374:
+        // and the card rows while the cards are.
+        voice_flag_gates(),
     ))
 }
 

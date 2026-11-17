@@ -407,8 +407,8 @@ pub use resolver::{
     IntentAnswer, IntentError, IntentRequest, IntentResolver, StubResolver, resolver_for,
 };
 pub use schema::{
-    AnnotatedCommand, AnnotatedParam, LABELS_WITHHELD_HINT, TOOL_INSTRUCTIONS, TOOL_NAME, annotate,
-    annotate_for, annotate_with, needs_labels, tool_schema,
+    AnnotatedCommand, AnnotatedParam, FlagGates, LABELS_WITHHELD_HINT, TOOL_INSTRUCTIONS,
+    TOOL_NAME, annotate, annotate_for, annotate_with, needs_labels, tool_schema,
 };
 pub use table::{
     CommandRow, CommandTable, NO_MATCH_ACTION, ParamKind, ParamSpec, Requirement, Screen, table,

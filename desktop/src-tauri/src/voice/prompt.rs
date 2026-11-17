@@ -751,6 +751,15 @@ pub(crate) mod tests {
                 "dismiss_star_prompt".to_string(),
                 "stop_agent".to_string(),
                 "close_orchestration".to_string(),
+                "set_overview_mode".to_string(),
+                "show_agent_card".to_string(),
+                "next_agent_card".to_string(),
+                "previous_agent_card".to_string(),
+                "next_needs_you_card".to_string(),
+                "filter_needs_you_cards".to_string(),
+                "close_agent_card".to_string(),
+                "run_card_action".to_string(),
+                "reply_to_agent_card".to_string(),
                 "none".to_string(),
             ]
         );
@@ -782,6 +791,11 @@ pub(crate) mod tests {
                 "mode".to_string(),
                 "command".to_string(),
                 "orchestration".to_string(),
+                // PRD #2374's card rows, at the end of the table.
+                "view".to_string(),
+                "needs_you".to_string(),
+                "action".to_string(),
+                "reply".to_string(),
             ]
         );
     }

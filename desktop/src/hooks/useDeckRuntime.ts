@@ -15,7 +15,7 @@ import type { VoiceNumberedListDto } from "../lib/voiceNumbers";
 import type { UpgradeChoice, UpgradeEvent } from "../lib/upgrade";
 import type { QuestionSelectionDto, QuestionTextSlotDto, VoiceQuestionTarget } from "../lib/voiceQuestion";
 const EMPTY_TERMINAL_DATA: Record<string, TerminalBuffer> = {};
-import type { AgentTarget, CleanupWarningEntry, DeckAction, DeckFleet, DeckListingOptions, DeckRuntimeState, DeckSnapshot, DesktopFeatures, InboxActionVerb, RuntimeMode, TerminalBuffer } from "../types";
+import type { AgentCardsSnapshot, AgentCardTarget, AgentTarget, CleanupWarningEntry, DeckAction, DeckFleet, DeckListingOptions, DeckRuntimeState, DeckSnapshot, DesktopFeatures, InboxActionVerb, RuntimeMode, TerminalBuffer } from "../types";
 
 /**
  * The snapshot a runtime starts with, before any deck has answered. Lifted out
@@ -525,6 +525,58 @@ export function useDeckRuntime(): DeckRuntimeState {
     });
   }, [fleet]);
 
+  /*
+    PRD #2374 — each deck's agent cards, by deck id, exactly as its daemon sent
+    them (`desktop://agent-cards`). Pushed by the deck watcher on a new
+    subscription, on a card's doorbell and on its reconciliation tick; read
+    once more here whenever a deck becomes connected, because the first push
+    of a subscription can land before this listener exists. A deck whose
+    daemon has no cards answers `null` and keeps no key. Held whatever the
+    experimental flag says: the flag hides the surfaces that render these,
+    and holding them costs one small map.
+  */
+  const [agentCards, setAgentCards] = useState<Readonly<Record<string, AgentCardsSnapshot>>>({});
+  const cardsOffered = typeof bridge.agentCards === "function" || typeof bridge.subscribeAgentCards === "function";
+  useEffect(() => {
+    if (typeof bridge.subscribeAgentCards !== "function") return;
+    let active = true;
+    let unsubscribe: (() => void) | undefined;
+    void bridge.subscribeAgentCards((next) => {
+      if (active) setAgentCards((current) => ({ ...current, [next.deckId]: next }));
+    }).then((stop) => {
+      if (active) unsubscribe = stop;
+      else stop();
+    }, () => undefined);
+    return () => {
+      active = false;
+      unsubscribe?.();
+    };
+  }, [bridge]);
+  const cardsConnected = useRef(new Set<string>());
+  useEffect(() => {
+    const connected = new Set(fleet.flatMap((deck) => (deck.connection.status === "connected" && deck.connection.deckId !== undefined ? [deck.connection.deckId] : [])));
+    const arrived = [...connected].filter((deckId) => !cardsConnected.current.has(deckId));
+    cardsConnected.current = connected;
+    // A deck that left the fleet, or stopped answering, shows no stale cards.
+    setAgentCards((current) => {
+      const kept = Object.entries(current).filter(([deckId]) => connected.has(deckId));
+      return kept.length === Object.keys(current).length ? current : Object.fromEntries(kept);
+    });
+    if (typeof bridge.agentCards !== "function") return;
+    for (const deckId of arrived) {
+      void bridge.agentCards(deckId).then((snapshot) => {
+        if (!cardsConnected.current.has(deckId)) return;
+        setAgentCards((current) => {
+          if (snapshot) return current[deckId] && current[deckId].instanceId === snapshot.instanceId && current[deckId].revision > snapshot.revision ? current : { ...current, [deckId]: snapshot };
+          return deckId in current ? Object.fromEntries(Object.entries(current).filter(([id]) => id !== deckId)) : current;
+        });
+      }, () => undefined);
+    }
+  }, [bridge, fleet]);
+  const invokeCardAction = useMemo(() => (typeof bridge.invokeCardAction === "function"
+    ? (target: AgentCardTarget, actionId: string, options?: { confirm?: boolean; text?: string; requestId?: string }) => bridge.invokeCardAction!(target, actionId, options)
+    : undefined), [bridge]);
+
   // Issue #1198: the app's experimental surfaces, asked ONCE per bridge. The
   // flag is a presentation switch read at startup — changing it means
   // restarting the app — so there is no re-query to race a navigation with.
@@ -554,6 +606,8 @@ export function useDeckRuntime(): DeckRuntimeState {
     ...(upgradeDaemon ? { upgradeDaemon } : {}),
     ...(decideUpgrade ? { decideUpgrade } : {}),
     ...(inboxAction ? { inboxAction } : {}),
+    ...(cardsOffered ? { agentCards } : {}),
+    ...(invokeCardAction ? { invokeCardAction } : {}),
     sendTerminalInput,
     resizeTerminal,
     previewWorktreeClose,

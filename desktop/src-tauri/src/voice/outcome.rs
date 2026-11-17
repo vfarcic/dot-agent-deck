@@ -55,7 +55,7 @@ use super::filter::grounded_filter_text;
 use super::meaning::{Ballot, MeaningRequest, MeaningVerdict, Place, Strictness, every_action};
 use super::resolver::{IntentAnswer, IntentError, IntentRequest, IntentResolver};
 use super::schema::{
-    DECK_HIDDEN_HINT, LABELS_WITHHELD_HINT, annotate_for, hidden_by_flag, needs_labels,
+    FlagGates, LABELS_WITHHELD_HINT, annotate_for, flag_hidden_hint, hidden_by_flag, needs_labels,
 };
 use super::table::{CommandRow, CommandTable, ParamKind, Requirement, Screen, spoken_words};
 use super::{
@@ -786,12 +786,14 @@ impl VoiceOutcome {
     /// #1223, audit finding A1) — [`VoiceOutcome::unavailable`]'s shape with
     /// [`LABELS_WITHHELD_HINT`] in place of the row's own hint.
     /// Issue #1198 — a pick of the row whose screen the experimental flag
-    /// hides, refused with [`DECK_HIDDEN_HINT`] rather than dispatched.
+    /// hides, refused with [`super::schema::DECK_HIDDEN_HINT`] (or the cards' hint) rather than dispatched.
     fn hidden_by_flag(transcript: Transcript, row: &CommandRow) -> Self {
+        // PRD #2374: the agent cards' rows carry the cards' hint.
+        let hint = flag_hidden_hint(row);
         Self::Unavailable {
-            sentence: format!("Not here — {DECK_HIDDEN_HINT}."),
+            sentence: format!("Not here — {hint}."),
             action: row.id.clone(),
-            hint: DECK_HIDDEN_HINT.to_string(),
+            hint: hint.to_string(),
             transcript,
         }
     }
@@ -967,7 +969,7 @@ pub async fn handle_utterance(
 /// # `show_deck` (issue #1198)
 ///
 /// `false` while the experimental flag hides the deck: the row that goes there
-/// is offered `callable: false` with [`DECK_HIDDEN_HINT`], and picked anyway it
+/// is offered `callable: false` with [`super::schema::DECK_HIDDEN_HINT`], and picked anyway it
 /// is [`VoiceOutcome::Unavailable`] with that hint. Held to the transcript
 /// first, like every row, so a pick the user did not ask for is still answered
 /// as that. `desktop_voice_resolve` passes `features::show_desktop_deck()`.
@@ -982,8 +984,9 @@ pub async fn handle_utterance_with(
     new_agent: Option<&VoiceNewAgent>,
     transcript: Transcript,
     labels: LabelSharing,
-    show_deck: bool,
+    show_deck: impl Into<FlagGates>,
 ) -> VoiceResult {
+    let show_deck: FlagGates = show_deck.into();
     handle_utterance_with_dictation(
         resolver,
         table,
@@ -1020,8 +1023,9 @@ pub async fn handle_utterance_with_dictation(
     dictation: Option<&VoiceDictationTarget>,
     transcript: Transcript,
     labels: LabelSharing,
-    show_deck: bool,
+    show_deck: impl Into<FlagGates>,
 ) -> VoiceResult {
+    let show_deck: FlagGates = show_deck.into();
     handle_utterance_with_modes(
         resolver,
         table,
@@ -1063,8 +1067,9 @@ pub async fn handle_utterance_with_modes(
     reading: VoiceReadingState,
     transcript: Transcript,
     labels: LabelSharing,
-    show_deck: bool,
+    show_deck: impl Into<FlagGates>,
 ) -> VoiceResult {
+    let show_deck: FlagGates = show_deck.into();
     let backend = resolver.backend_name();
     let finish = |outcome, resolve_ms| VoiceResult {
         outcome,
@@ -1172,8 +1177,9 @@ async fn after_local_intercepts(
     new_agent: Option<&VoiceNewAgent>,
     transcript: Transcript,
     labels: LabelSharing,
-    show_deck: bool,
+    show_deck: impl Into<FlagGates>,
 ) -> VoiceResult {
+    let show_deck: FlagGates = show_deck.into();
     let withheld = labels == LabelSharing::Withheld;
     let backend = resolver.backend_name();
     let result = |outcome, resolve_ms| VoiceResult {
@@ -1340,7 +1346,7 @@ struct Picked<'p> {
     new_agent: Option<&'p VoiceNewAgent>,
     transcript: &'p Transcript,
     withheld: bool,
-    show_deck: bool,
+    show_deck: FlagGates,
     answer: &'p IntentAnswer,
     row: &'p CommandRow,
 }
@@ -2897,6 +2903,28 @@ fn resolve_param(
             .and_then(|found| heard_facet(found, spec.kind, transcript, decks)),
         ParamKind::AgentStatus => choice_param(resolve_dashboard_status(spoken))
             .and_then(|found| heard_facet(found, spec.kind, transcript, decks)),
+        // PRD #2374 — the dashboard's view and the cards' Needs you filter:
+        // the app's own closed sets, each held to the transcript by its names
+        // as a dashboard facet is, so a view or state nobody said is refused.
+        ParamKind::OverviewMode => choice_param(resolve_fixed(spoken, &OVERVIEW_MODES))
+            .and_then(|found| heard_facet(found, spec.kind, transcript, decks)),
+        ParamKind::NeedsYouFilter => choice_param(resolve_fixed(spoken, &NEEDS_YOU_FILTER))
+            .and_then(|found| heard_facet(found, spec.kind, transcript, decks)),
+        // PRD #2374 — a card action's label, held to the user's words as the
+        // directory filter is; the webview matches it against the card's own
+        // actions and refuses in words when none or several match.
+        ParamKind::CardAction => match grounded_filter_text(transcript.text(), spoken) {
+            Some(text) => Ok(param(text.clone(), text)),
+            None => Err(Unmet::NoMatch),
+        },
+        // PRD #2374 — a reply to a card's agent: the transcript's own slice,
+        // and only when the model's words are in it, as for the Command field.
+        // What reaches the agent is what the user said, never the model's
+        // retelling of it.
+        ParamKind::ReplyText => match grounded_command_text(transcript.text(), spoken) {
+            Some(text) => Ok(param(text.clone(), text)),
+            None => Err(Unmet::NoMatch),
+        },
         ParamKind::AgentTypeRef if row.id == FILTER_DASHBOARD_ROW => {
             choice_param(resolve_known_agent_type(spoken))
                 .and_then(|found| heard_facet(found, spec.kind, transcript, decks))
@@ -4031,7 +4059,7 @@ fn redirect_targets<'t>(
     table: &'t CommandTable,
     row: &CommandRow,
     text: &str,
-    show_deck: bool,
+    show_deck: FlagGates,
 ) -> Vec<&'t CommandRow> {
     let mut targets = Vec::new();
     if row.id == OPEN_DECK_ROW || row.id == OPEN_PR_ROW || hidden_by_flag(row, show_deck) {
@@ -4202,6 +4230,14 @@ impl ParamKind {
             }
             ParamKind::AgentKind => "I could not tell which kind of agent you meant",
             ParamKind::AgentStatus => "I could not tell which status you meant",
+            ParamKind::OverviewMode => "I could not tell whether you wanted the table or the cards",
+            ParamKind::NeedsYouFilter => {
+                "I could not tell whether to show only the cards that need you or every card"
+            }
+            ParamKind::CardAction => {
+                "I could not tell which of the card's actions you meant, so nothing was sent"
+            }
+            ParamKind::ReplyText => "I could not tell what to reply, so nothing was sent",
         }
     }
 
@@ -4265,6 +4301,17 @@ impl ParamKind {
             ParamKind::AgentStatus => {
                 format!("no agent status matches \u{201c}{spoken}\u{201d}")
             }
+            ParamKind::OverviewMode => {
+                format!("no view of the dashboard matches \u{201c}{spoken}\u{201d}")
+            }
+            ParamKind::NeedsYouFilter => {
+                format!("\u{201c}{spoken}\u{201d} is not on or off for the Needs you filter")
+            }
+            // The model's words, quoted beside what was heard, as for the
+            // filter box: nothing was sent to the agent.
+            ParamKind::CardAction | ParamKind::ReplyText => {
+                format!("you did not say \u{201c}{spoken}\u{201d}, so nothing was sent")
+            }
         }
     }
 
@@ -4322,6 +4369,20 @@ impl ParamKind {
             ParamKind::AgentStatus => {
                 format!("\u{201c}{spoken}\u{201d} matches more than one status: {listed}")
             }
+            ParamKind::OverviewMode => {
+                format!("\u{201c}{spoken}\u{201d} matches more than one view: {listed}")
+            }
+            ParamKind::NeedsYouFilter => {
+                format!("\u{201c}{spoken}\u{201d} could be on or off: {listed}")
+            }
+            // Unreachable: words held to the transcript are accepted or
+            // refused, never chosen between.
+            ParamKind::CardAction => {
+                format!("\u{201c}{spoken}\u{201d} could be more than one action: {listed}")
+            }
+            ParamKind::ReplyText => {
+                format!("\u{201c}{spoken}\u{201d} could be more than one reply: {listed}")
+            }
         }
     }
 
@@ -4340,6 +4401,10 @@ impl ParamKind {
             ParamKind::CommandText => "command",
             ParamKind::AgentKind => "kind",
             ParamKind::AgentStatus => "status",
+            ParamKind::OverviewMode => "view",
+            ParamKind::NeedsYouFilter => "filter",
+            ParamKind::CardAction => "action",
+            ParamKind::ReplyText => "reply",
         }
     }
 }
@@ -5975,6 +6040,45 @@ pub(super) fn agent_type_names(choice: &VoiceChoice) -> Vec<String> {
     names
 }
 
+/// PRD #2374 — the agent dashboard's two views: the id the webview's
+/// `overviewMode` holds, the label a report names it by ("Showing the
+/// cards."), and the names a user calls each by.
+const OVERVIEW_MODES: [(&str, &str, &[&str]); 2] = [
+    (
+        "table",
+        "the table",
+        &["table", "list", "rows", "table view", "list view"],
+    ),
+    (
+        "cards",
+        "the cards",
+        &["cards", "card", "card view", "cards view", "grid"],
+    ),
+];
+
+/// PRD #2374 — the cards' Needs you filter: `on` shows only the cards that
+/// need the user, `off` every card. The names are what the user says about
+/// the state, not the filter's own name ("needs you"), which both share.
+const NEEDS_YOU_FILTER: [(&str, &str, &[&str]); 2] = [
+    (
+        "on",
+        "only the cards that need you",
+        &[
+            "on",
+            "only",
+            "just",
+            "need me",
+            "needs me",
+            "need my attention",
+        ],
+    ),
+    (
+        "off",
+        "every card",
+        &["off", "all", "every", "everything", "clear", "remove"],
+    ),
+];
+
 /// The agent dashboard filter's kinds (issue #1496): the id the frontend's
 /// `DashboardFilter.kinds` holds, the label its filter line shows, and the
 /// names a user calls each by. A mode is its mode tab's name, so
@@ -6096,6 +6200,8 @@ fn facet_heard(kind: ParamKind, value: &str, transcript: &str, decks: &[VoiceDec
     };
     let names: Vec<String> = match kind {
         ParamKind::AgentKind => of_set(&DASHBOARD_KINDS),
+        ParamKind::OverviewMode => of_set(&OVERVIEW_MODES),
+        ParamKind::NeedsYouFilter => of_set(&NEEDS_YOU_FILTER),
         // Issue #1757: a status is heard in the transcript's STATE words, where
         // "waiting for input" is the one word for Needs input
         // ([`state_word_sequence`]). Read word by word, its first word would
@@ -6763,6 +6869,7 @@ fn word_subset(reference_words: &BTreeSet<String>, name: &str) -> bool {
 mod tests {
     use super::*;
 
+    use crate::voice::schema::DECK_HIDDEN_HINT;
     /// The labels of an ambiguous resolver answer, or `None` for any other —
     /// what the assertions written before PRD #1261 carried candidates as.
     trait AmbiguousLabels {

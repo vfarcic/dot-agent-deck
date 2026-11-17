@@ -198,6 +198,15 @@ const OPEN_DECK_INVOKE: keyof typeof VOICE_ACTIONS = "openDeck";
 const SWITCH_DECK_INVOKE: keyof typeof VOICE_ACTIONS = "switchDeck";
 /** Issue #1496 — the one entry whose params are the dashboard filter's facets. */
 const FILTER_DASHBOARD_INVOKE: keyof typeof VOICE_ACTIONS = "filterDashboard";
+/**
+ * PRD #2374 — the agent cards' registry entries. While the experimental flag
+ * hides the cards, a dispatch of any of them is refused here, as `open_deck`'s
+ * is while the deck is hidden; the crate already offers their rows
+ * `callable: false` (`voice::schema::hidden_by_flag`).
+ */
+const AGENT_CARD_INVOKES: ReadonlySet<string> = new Set<keyof typeof VOICE_ACTIONS>(["setOverviewMode", "showAgentCard", "nextAgentCard", "previousAgentCard", "nextNeedsYouCard", "toggleNeedsYouFilter", "closeAgentCard", "runCardAction", "replyToAgentCard"]);
+const RUN_CARD_ACTION_INVOKE: keyof typeof VOICE_ACTIONS = "runCardAction";
+const REPLY_TO_AGENT_CARD_INVOKE: keyof typeof VOICE_ACTIONS = "replyToAgentCard";
 /** The Settings sheet as `SettingsSheet` renders it, for asking the fence's stack whether anything is drawn over it. */
 const SETTINGS_PANEL = "[data-testid='settings-panel']";
 
@@ -1166,6 +1175,10 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
        named by one member's agent id on the selected deck, whose agents Rust
        resolved it against. */
     const namedOrchestration = outcome.params.find((param) => param.kind === "orchestration_ref");
+    /* PRD #2374 — the cards' two closed sets, resolved Rust-side: the view
+       (`table` or `cards`) and the Needs you filter (`on` or `off`). */
+    const namedOverviewMode = outcome.params.find((param) => param.kind === "overview_mode");
+    const namedNeedsYouFilter = outcome.params.find((param) => param.kind === "needs_you_filter");
     const target: VoiceDispatchTarget = {
       /* The dictation pair targets the pane on SCREEN — its row declares no
          agent param and is `screens = ["agent"]`, so `agentView` is defined
@@ -1212,6 +1225,13 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       ...(declaredForm ? { declaredForm: { deckId: declaredForm.deckId, path: declaredForm.path } } : {}),
       ...(namedOrchestration ? { orchestrationAgentId: namedOrchestration.value, ...("incarnation" in namedOrchestration ? { orchestrationIncarnation: namedOrchestration.incarnation } : {}) } : {}),
       ...(outcome.invoke === FILTER_DASHBOARD_INVOKE ? { dashboardFilter: dashboardFilterFromParams(outcome.params) } : {}),
+      ...(namedOverviewMode && (namedOverviewMode.value === "table" || namedOverviewMode.value === "cards") ? { overviewMode: namedOverviewMode.value } : {}),
+      ...(namedNeedsYouFilter && (namedNeedsYouFilter.value === "on" || namedNeedsYouFilter.value === "off") ? { needsYouOnly: namedNeedsYouFilter.value === "on" } : {}),
+      /* The action's label as the user said it (a `filter_text`, held to the
+         transcript), and a reply's words (a `command_text`: the transcript's
+         own slice), each for its own row only. */
+      ...(outcome.invoke === RUN_CARD_ACTION_INVOKE && filterText ? { cardActionLabel: filterText.value } : {}),
+      ...(outcome.invoke === REPLY_TO_AGENT_CARD_INVOKE && commandText ? { cardReplyText: commandText.value } : {}),
     };
     let moved = false;
     const context: VoiceDispatchContext = {
@@ -1300,6 +1320,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
        the dispatch seam, for an answer that arrives anyway. Refused like any
        dispatch the host cannot serve, so the report says nothing ran. */
     if (outcome.invoke === OPEN_DECK_INVOKE && !features.showDeck) return undefined;
+    if (AGENT_CARD_INVOKES.has(outcome.invoke) && !features.showAgentCards) return undefined;
     /* PR #1451 round 3, change 4 — voice acts only on what is on screen. An
        answer naming an item a paged list shows on another page (an agent
        tile on the Daemons screen's page 2, resolved by Rust against the whole
@@ -1314,7 +1335,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     if (!dispatchVoiceAction(outcome.invoke, context, target)) return undefined;
     // voice-registry-exempt: the Undo beside a voice report, restoring exactly the view that dispatch replaced
     return moved ? { undo: () => setView(previous) } : {};
-  }, [agentView, base, closeAgent, confirmationOpen, confirmPaneStop, dialogLayerUp, features.showDeck, onPrBrowserPage, overlaysOpen.settings, paneAgent, prBrowser, prBrowserHost, pullRequestContext, railContext, readPager, screen, selectedDeckId, setOverlay, view]);
+  }, [agentView, base, closeAgent, confirmationOpen, confirmPaneStop, dialogLayerUp, features.showAgentCards, features.showDeck, onPrBrowserPage, overlaysOpen.settings, paneAgent, prBrowser, prBrowserHost, pullRequestContext, railContext, readPager, screen, selectedDeckId, setOverlay, view]);
   /** PRD #1223 — what the directory browser shows, read at declaration time. */
   const readDirectories = useCallback(() => newAgentVoice.current?.directories, []);
   /** PRD #1223 — what the New agent dialog shows besides its browser, while it is open. */

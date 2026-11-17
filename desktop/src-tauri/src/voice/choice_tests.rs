@@ -21,6 +21,12 @@ fn candidate(kind: ParamKind, value: &str, label: &str) -> ResolvedParam {
             ParamKind::AgentKind | ParamKind::AgentStatus => {
                 panic!("a dashboard filter facet is optional, so it is never offered")
             }
+            ParamKind::OverviewMode | ParamKind::NeedsYouFilter => {
+                panic!("a closed set of the app's own words is never offered as a choice")
+            }
+            ParamKind::CardAction | ParamKind::ReplyText => {
+                panic!("words held to the transcript are never offered as a choice")
+            }
         }
         .to_string(),
         kind,

@@ -861,6 +861,15 @@ mod tests {
                 "dismiss_star_prompt",
                 "stop_agent",
                 "close_orchestration",
+                "set_overview_mode",
+                "show_agent_card",
+                "next_agent_card",
+                "previous_agent_card",
+                "next_needs_you_card",
+                "filter_needs_you_cards",
+                "close_agent_card",
+                "run_card_action",
+                "reply_to_agent_card",
                 "none"
             ]
         );

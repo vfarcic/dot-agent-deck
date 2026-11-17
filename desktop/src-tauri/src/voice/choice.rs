@@ -72,7 +72,11 @@ fn kind_nouns(kind: ParamKind) -> &'static [&'static str] {
         | ParamKind::FilterText
         | ParamKind::CommandText
         | ParamKind::AgentKind
-        | ParamKind::AgentStatus => &[],
+        | ParamKind::AgentStatus
+        | ParamKind::OverviewMode
+        | ParamKind::NeedsYouFilter
+        | ParamKind::CardAction
+        | ParamKind::ReplyText => &[],
     }
 }
 
@@ -559,7 +563,11 @@ fn by_name(
         | ParamKind::FilterText
         | ParamKind::CommandText
         | ParamKind::AgentKind
-        | ParamKind::AgentStatus => Found::None,
+        | ParamKind::AgentStatus
+        | ParamKind::OverviewMode
+        | ParamKind::NeedsYouFilter
+        | ParamKind::CardAction
+        | ParamKind::ReplyText => Found::None,
     };
     match found {
         Found::One(value) => match offered.iter().find(|candidate| candidate.value == value) {
@@ -650,7 +658,11 @@ pub(super) fn names_of(kind: ParamKind, value: &str, live: &ChoiceLive) -> Vec<S
         | ParamKind::FilterText
         | ParamKind::CommandText
         | ParamKind::AgentKind
-        | ParamKind::AgentStatus => None,
+        | ParamKind::AgentStatus
+        | ParamKind::OverviewMode
+        | ParamKind::NeedsYouFilter
+        | ParamKind::CardAction
+        | ParamKind::ReplyText => None,
     };
     names.unwrap_or_default()
 }
@@ -737,7 +749,11 @@ fn names_something(
         | ParamKind::FilterText
         | ParamKind::CommandText
         | ParamKind::AgentKind
-        | ParamKind::AgentStatus => false,
+        | ParamKind::AgentStatus
+        | ParamKind::OverviewMode
+        | ParamKind::NeedsYouFilter
+        | ParamKind::CardAction
+        | ParamKind::ReplyText => false,
     }
 }
 
@@ -762,7 +778,11 @@ fn still_live(candidate: &ResolvedParam, live: &ChoiceLive) -> ChoiceAnswer {
         | ParamKind::FilterText
         | ParamKind::CommandText
         | ParamKind::AgentKind
-        | ParamKind::AgentStatus => false,
+        | ParamKind::AgentStatus
+        | ParamKind::OverviewMode
+        | ParamKind::NeedsYouFilter
+        | ParamKind::CardAction
+        | ParamKind::ReplyText => false,
     };
     if present {
         ChoiceAnswer::Selected(candidate.clone())

@@ -1,6 +1,7 @@
 import type { DeckView } from "../types";
 import type { VoiceDeckIdentityDto } from "./bridge";
 import { clearDashboardFilter, setDashboardFilter, type DashboardFilter } from "./dashboardFilter";
+import type { CardStep, OverviewMode } from "./agentCards";
 
 /**
  * PRD #802 M2 — the frontend action registry, and the app's one dispatch seam
@@ -575,7 +576,38 @@ export type VoiceActionContext = {
   closePullRequest: () => Promise<string | undefined>;
   /** PRD #1401 — the browser toolbar's Back: one step back in the page's history. */
   pullRequestBack: () => void;
+  /*
+   * PRD #2374 — the agent dashboard's cards, served by the OVERVIEW. Each
+   * answers `undefined` when it happened, or the sentence saying why not; none
+   * computes anything about a card — they show, move between and act on what
+   * the daemon sent.
+   */
+  /** Show the dashboard as its table or as cards (remembered per window). */
+  setOverviewMode: (mode: OverviewMode) => string | undefined;
+  /** Open one agent's card in the card overlay. */
+  showAgentCard: (target: AgentCardRef) => string | undefined;
+  /** Move the open card overlay one card on or back, or to the next card that needs the user. */
+  stepAgentCard: (step: CardStep) => string | undefined;
+  /** Show only the cards that need the user, or every card. */
+  setNeedsYouFilter: (on: boolean) => string | undefined;
+  /** Close the card overlay. Published only while it is open, so `closeTopmost` can read its presence. */
+  closeAgentCard: () => string | undefined;
+  /**
+   * Press one action of one card: by id from a button, by its label from
+   * voice. A prompt action is sent; one that asks for confirmation, a close,
+   * and `reply` open the card's overlay at that step instead.
+   */
+  runCardAction: (target: AgentCardRef, action: { actionId?: string; label?: string }) => string | undefined;
+  /** Send `text` as a reply to one card's agent. */
+  replyToAgentCard: (target: AgentCardRef, text: string) => string | undefined;
+  /** The card overlay's confirm step: send the action it is asking about, confirmed. */
+  confirmCardAction: () => void;
+  /** Open or close one table row's ⋯ menu. */
+  toggleOverviewRowMenu: (rowKey: string) => void;
 };
+
+/** PRD #2374 — one card, named the way the dashboard's agents are: deck, agent id and the daemon process that listed it. */
+export type AgentCardRef = { deckId: string; agentId: string; incarnation?: string };
 
 /**
  * One registry entry.
@@ -621,6 +653,17 @@ export const PULL_REQUEST_HANDED_OFF = "Opened it in your browser.";
 export const PULL_REQUEST_CLOSING = "Closing the pull request…";
 /** …and once it has: `close`'s own `report` in `commands.toml`, said when it is true. */
 export const PULL_REQUEST_CLOSED = "Closed.";
+
+/** PRD #2374 — what a card row says when the words named no mode, filter, action or reply it can use. */
+export const CARD_MODE_UNHEARD = "Say whether you want the table or the cards.";
+export const CARD_FILTER_UNHEARD = "Say whether you want only the cards that need you, or every card.";
+export const CARD_ACTION_UNHEARD = "Say which of the card's actions to press, by the label on its button.";
+export const CARD_REPLY_UNHEARD = "Say what to reply.";
+
+/** The card a target names: its deck, agent and, where known, the daemon process that listed it. */
+function cardRefOf(target: AgentCardRef): AgentCardRef {
+  return { deckId: target.deckId, agentId: target.agentId, ...(target.incarnation !== undefined ? { incarnation: target.incarnation } : {}) };
+}
 
 export const VOICE_ACTIONS = {
   // -- the ones the command table names today -----------------------------
@@ -1146,6 +1189,121 @@ export const VOICE_ACTIONS = {
     run: (context: Pick<VoiceActionContext, "showDashboardCounters">) => context.showDashboardCounters(),
   },
 
+  /* PRD #2374 — the dashboard's agent cards. Every control of the cards view
+     dispatches through one of these; none sends anything unasked: a prompt
+     action sends exactly the prompt the card shows, one that asks for
+     confirmation (and both closes) only opens the card at its confirm step,
+     because voice has no confirm step of its own (PRD #802 D5). The rows are
+     withheld while the experimental flag hides the cards
+     (`voice::schema::hidden_by_flag`), and `App.tsx` refuses them at dispatch
+     as it refuses `open_deck`. `reportRefused` is read through `?.` for
+     `showHostMetrics`' reason: a button serves no voice surface. */
+  setOverviewMode: {
+    label: "Show the agent dashboard as a table or as cards",
+    voice: true,
+    needs: ["setOverviewMode"],
+    run: (context: Pick<VoiceActionContext, "setOverviewMode"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target?: Pick<VoiceDispatchTarget, "overviewMode">) => {
+      const refused = target?.overviewMode ? context.setOverviewMode(target.overviewMode) : CARD_MODE_UNHEARD;
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  showAgentCard: {
+    label: "Open one agent's card",
+    voice: true,
+    needs: ["showAgentCard"],
+    run: (context: Pick<VoiceActionContext, "showAgentCard"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: AgentCardRef) => {
+      const refused = context.showAgentCard(cardRefOf(target));
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  nextAgentCard: {
+    label: "Show the next card in the card overlay",
+    voice: true,
+    needs: ["stepAgentCard"],
+    run: (context: Pick<VoiceActionContext, "stepAgentCard"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.stepAgentCard("next");
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  previousAgentCard: {
+    label: "Show the previous card in the card overlay",
+    voice: true,
+    needs: ["stepAgentCard"],
+    run: (context: Pick<VoiceActionContext, "stepAgentCard"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.stepAgentCard("previous");
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  nextNeedsYouCard: {
+    label: "Show the next card that needs you",
+    voice: true,
+    needs: ["stepAgentCard"],
+    run: (context: Pick<VoiceActionContext, "stepAgentCard"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.stepAgentCard("needs-you");
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  toggleNeedsYouFilter: {
+    label: "Show only the cards that need you, or every card",
+    voice: true,
+    needs: ["setNeedsYouFilter"],
+    run: (context: Pick<VoiceActionContext, "setNeedsYouFilter"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target?: Pick<VoiceDispatchTarget, "needsYouOnly">) => {
+      const refused = target?.needsYouOnly === undefined ? CARD_FILTER_UNHEARD : context.setNeedsYouFilter(target.needsYouOnly);
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  closeAgentCard: {
+    label: "Close the card overlay",
+    voice: true,
+    needs: ["closeAgentCard"],
+    run: (context: Pick<VoiceActionContext, "closeAgentCard"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.closeAgentCard();
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  runCardAction: {
+    label: "Press one of a card's actions",
+    voice: true,
+    needs: ["runCardAction"],
+    run: (context: Pick<VoiceActionContext, "runCardAction"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: AgentCardRef & Pick<VoiceDispatchTarget, "cardActionId" | "cardActionLabel">) => {
+      const refused = target.cardActionId === undefined && target.cardActionLabel === undefined
+        ? CARD_ACTION_UNHEARD
+        : context.runCardAction(cardRefOf(target), { ...(target.cardActionId !== undefined ? { actionId: target.cardActionId } : {}), ...(target.cardActionLabel !== undefined ? { label: target.cardActionLabel } : {}) });
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  replyToAgentCard: {
+    label: "Reply to a card's agent with your own words",
+    voice: true,
+    needs: ["replyToAgentCard"],
+    run: (context: Pick<VoiceActionContext, "replyToAgentCard"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: AgentCardRef & Pick<VoiceDispatchTarget, "cardReplyText">) => {
+      const refused = target.cardReplyText?.trim() ? context.replyToAgentCard(cardRefOf(target), target.cardReplyText) : CARD_REPLY_UNHEARD;
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  confirmCardAction: {
+    label: "Send the card action the overlay is asking you to confirm",
+    no_voice: "the confirm step of a card action that asks for confirmation, and of both closes; voice has no confirm-before-acting step yet (PRD #802 D5), so `run_card_action` on such an action opens this step on screen and stops — the press that sends it is the user's own, by hand",
+    needs: ["confirmCardAction"],
+    run: (context: Pick<VoiceActionContext, "confirmCardAction">) => context.confirmCardAction(),
+  },
+
+  toggleOverviewRowMenu: {
+    label: "Open or close a dashboard row's menu",
+    no_voice: "each item it holds is reachable by its own voice command — `show_agent_card` and `run_card_action` — so a spoken door to the menu itself would open a list the user then has to point at",
+    needs: ["toggleOverviewRowMenu"],
+    run: (context: Pick<VoiceActionContext, "toggleOverviewRowMenu">, rowKey: string) => context.toggleOverviewRowMenu(rowKey),
+  },
+
   /* PRD #1223 — the three `requires`-gated rows: the New agent dialog's
      directory browser. None starts anything — the dialog's Start is still the
      only thing that does — so none is in PRD #802 D5's confirmation set. The
@@ -1560,6 +1718,16 @@ export type VoiceDispatchTarget = AgentViewTarget & {
    * its resolved facets (issue #1496).
    */
   dashboardFilter?: DashboardFilter;
+  /** PRD #2374 — the dashboard view a `set_overview_mode` dispatch asks for. */
+  overviewMode?: OverviewMode;
+  /** PRD #2374 — whether a `filter_needs_you_cards` dispatch asks for only the cards that need the user. */
+  needsYouOnly?: boolean;
+  /** PRD #2374 — the card action a button presses, by the daemon's id. */
+  cardActionId?: string;
+  /** PRD #2374 — the card action a `run_card_action` dispatch names, by its label as the user said it. */
+  cardActionLabel?: string;
+  /** PRD #2374 — the words a `reply_to_agent_card` dispatch sends, the transcript's own. */
+  cardReplyText?: string;
   /**
    * The New agent form the utterance was JUDGED against — its deck and chosen
    * directory as declared — or absent when no live form was declared. The
@@ -1717,7 +1885,10 @@ export type PullRequestContext = Pick<VoiceActionContext, "openPullRequest" | "o
  * dialog for; a dispatch of `openNewAgent` there is refused against its
  * `needs`, the way the overview refuses a deck overlay.
  */
-export type VoiceOverviewContext = Pick<VoiceActionContext, "openNewAgent" | "closeNewAgent" | "openDirectory" | "goToParentDirectory" | "useThisDirectory" | "filterDirectories" | "clearDirectoryFilter" | NewAgentFormMember | "confirmStopAgent" | "confirmCloseOrchestration" | "scrollDashboard" | "revealAgent" | "showHostMetrics" | "closeHostMetrics" | "showDashboardCounters" | "closeDashboardCounters">;
+export type VoiceOverviewContext = Pick<VoiceActionContext, "openNewAgent" | "closeNewAgent" | "openDirectory" | "goToParentDirectory" | "useThisDirectory" | "filterDirectories" | "clearDirectoryFilter" | NewAgentFormMember | "confirmStopAgent" | "confirmCloseOrchestration" | "scrollDashboard" | "revealAgent" | "showHostMetrics" | "closeHostMetrics" | "showDashboardCounters" | "closeDashboardCounters" | AgentCardMember>;
+
+/** PRD #2374 — the agent cards' members, served by the overview. */
+export type AgentCardMember = "setOverviewMode" | "showAgentCard" | "stepAgentCard" | "setNeedsYouFilter" | "closeAgentCard" | "runCardAction" | "replyToAgentCard" | "confirmCardAction" | "toggleOverviewRowMenu";
 
 /** The New agent form's members, served — like the browser's — from the dialog's slot. */
 export type NewAgentFormMember = "chooseNewAgentDeck" | "chooseNewAgentMode" | "chooseNewAgentType" | "nameNewAgent" | "setNewAgentCommand" | "startNewAgent" | "discardNewAgent";

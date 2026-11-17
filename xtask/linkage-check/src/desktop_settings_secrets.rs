@@ -697,7 +697,7 @@ const PINNED_TS_FIELDS: [(&str, &str, &str); 33] = [
 /// the role-order key moved to `ORCHESTRATION_STORAGE_KEY`. The old one stays
 /// pinned as `LEGACY_WORKFLOW_STORAGE_KEY` because `App.tsx` still reads it once,
 /// to migrate a saved order, and then removes it.
-const PINNED_STORAGE_KEYS: [(&str, &str, bool); 7] = [
+const PINNED_STORAGE_KEYS: [(&str, &str, bool); 8] = [
     (
         "FIXTURE_SETTINGS_KEY",
         "dot-agent-deck.desktop-settings",
@@ -737,6 +737,16 @@ const PINNED_STORAGE_KEYS: [(&str, &str, bool); 7] = [
         "DASHBOARD_FILTER_STORAGE_KEY",
         "dot-agent-deck.desktop.dashboard-filter.v1",
         true,
+    ),
+    // PRD #2374 — the agent dashboard's Table | Cards choice, remembered per
+    // window as the column choice is: it describes this display, holds one of
+    // two fixed words, and no credential or project content. Unscoped because
+    // the PRD names the key exactly; a fixture preview sharing it with a live
+    // window shares a view choice and nothing else.
+    (
+        "OVERVIEW_MODE_STORAGE_KEY",
+        "dot-agent-deck.overview.mode",
+        false,
     ),
 ];
 

@@ -237,15 +237,79 @@ const OPEN_DECK_INVOKE: &str = "openDeck";
 
 /// Whether the experimental flag hides the screen this row goes to (issue
 /// #1198): the deck, for the row that invokes `openDeck`, while `show_deck` is
-/// false.
+/// false — and, since PRD #2374, the agent cards, for their rows, while
+/// `show_agent_cards` is false.
 ///
-/// `show_deck` is an argument rather than a read of the flag here, so the
+/// The flags are an argument rather than a read of the flag here, so the
 /// command seams in `lib.rs` are where `features::show_desktop_deck()` is
 /// called (CLAUDE.md rule 9: gate at the seam) and this stays a pure function
 /// of what it is handed. It is a presentation gate: it decides what voice
 /// OFFERS and what it refuses, and changes nothing about what any row does.
-pub fn hidden_by_flag(row: &super::table::CommandRow, show_deck: bool) -> bool {
-    !show_deck && row.invoke == OPEN_DECK_INVOKE
+pub fn hidden_by_flag(row: &super::table::CommandRow, flags: impl Into<FlagGates>) -> bool {
+    let flags = flags.into();
+    (!flags.show_deck && row.invoke == OPEN_DECK_INVOKE)
+        || (!flags.show_agent_cards && is_agent_card_row(row))
+}
+
+/// The experimental surfaces voice is gated on, as the command seams in
+/// `lib.rs` read them (CLAUDE.md rule 9: each through its own wrapper,
+/// `features::show_desktop_deck()` and `features::show_agent_cards()`).
+///
+/// A bare `bool` converts to both at once — what a test means by "the
+/// experimental flag on" or "off", since both wrappers read that one flag
+/// today. A surface that graduates keeps its field until the field is deleted
+/// with its wrapper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlagGates {
+    /// The Daemons screen (issue #1198): `open_deck`'s row.
+    pub show_deck: bool,
+    /// The agent dashboard's cards (PRD #2374): the card rows.
+    pub show_agent_cards: bool,
+}
+
+impl From<bool> for FlagGates {
+    fn from(shown: bool) -> Self {
+        Self {
+            show_deck: shown,
+            show_agent_cards: shown,
+        }
+    }
+}
+
+/// PRD #2374 — the hint for a row the experimental flag hides: the cards' for
+/// a card row, the deck's otherwise.
+pub fn flag_hidden_hint(row: &super::table::CommandRow) -> &'static str {
+    if is_agent_card_row(row) {
+        CARDS_HIDDEN_HINT
+    } else {
+        DECK_HIDDEN_HINT
+    }
+}
+
+/// PRD #2374 — the hint for a card row while the experimental flag hides the
+/// cards, for the same two readers as [`DECK_HIDDEN_HINT`].
+pub const CARDS_HIDDEN_HINT: &str = "agent cards are an experimental view, and this app shows them \
+    only while the experimental flag is on";
+
+/// PRD #2374 — the registry entries the agent cards' rows invoke
+/// (`desktop/src/lib/voiceActions.ts`), hidden while
+/// [`FlagGates::show_agent_cards`] is false. A presentation gate, like the
+/// deck's: it decides what voice offers and refuses, and nothing about what a
+/// row does.
+const AGENT_CARD_INVOKES: [&str; 9] = [
+    "setOverviewMode",
+    "showAgentCard",
+    "nextAgentCard",
+    "previousAgentCard",
+    "nextNeedsYouCard",
+    "toggleNeedsYouFilter",
+    "closeAgentCard",
+    "runCardAction",
+    "replyToAgentCard",
+];
+
+fn is_agent_card_row(row: &super::table::CommandRow) -> bool {
+    AGENT_CARD_INVOKES.contains(&row.invoke.as_str())
 }
 
 /// [`annotate_with`], and then — when the voice settings withhold labels —
@@ -260,8 +324,9 @@ pub fn annotate_for(
     directories: Option<&VoiceDirectories>,
     new_agent: Option<&VoiceNewAgent>,
     labels: crate::settings::LabelSharing,
-    show_deck: bool,
+    show_deck: impl Into<FlagGates>,
 ) -> Vec<AnnotatedCommand> {
+    let show_deck = show_deck.into();
     let mut commands = annotate_with(table, screen, directories, new_agent);
     for (command, row) in commands.iter_mut().zip(table.rows()) {
         if labels == crate::settings::LabelSharing::Withheld && needs_labels(row) {
@@ -270,7 +335,7 @@ pub fn annotate_for(
         }
         if hidden_by_flag(row, show_deck) {
             command.callable = false;
-            command.unavailable_hint = DECK_HIDDEN_HINT.to_string();
+            command.unavailable_hint = flag_hidden_hint(row).to_string();
         }
     }
     commands
@@ -427,6 +492,15 @@ mod tests {
                 "dismiss_star_prompt".to_string(),
                 "stop_agent".to_string(),
                 "close_orchestration".to_string(),
+                "set_overview_mode".to_string(),
+                "show_agent_card".to_string(),
+                "next_agent_card".to_string(),
+                "previous_agent_card".to_string(),
+                "next_needs_you_card".to_string(),
+                "filter_needs_you_cards".to_string(),
+                "close_agent_card".to_string(),
+                "run_card_action".to_string(),
+                "reply_to_agent_card".to_string(),
                 "none".to_string(),
             ]
         );
@@ -527,6 +601,15 @@ mod tests {
                 "dismiss_star_prompt",
                 "stop_agent",
                 "close_orchestration",
+                "set_overview_mode",
+                "show_agent_card",
+                "next_agent_card",
+                "previous_agent_card",
+                "next_needs_you_card",
+                "filter_needs_you_cards",
+                "close_agent_card",
+                "run_card_action",
+                "reply_to_agent_card",
                 "none"
             ]
         );
@@ -748,6 +831,15 @@ mod tests {
                 ("dismiss_star_prompt".to_string(), true),
                 ("stop_agent".to_string(), false),
                 ("close_orchestration".to_string(), false),
+                ("set_overview_mode".to_string(), false),
+                ("show_agent_card".to_string(), false),
+                ("next_agent_card".to_string(), false),
+                ("previous_agent_card".to_string(), false),
+                ("next_needs_you_card".to_string(), false),
+                ("filter_needs_you_cards".to_string(), false),
+                ("close_agent_card".to_string(), false),
+                ("run_card_action".to_string(), false),
+                ("reply_to_agent_card".to_string(), false),
             ]
         );
         assert_eq!(
@@ -816,6 +908,16 @@ mod tests {
                 // closed (#1260), and each only opens a confirmation.
                 ("stop_agent".to_string(), true),
                 ("close_orchestration".to_string(), true),
+                // PRD #2374: the agent cards, on the dashboard only.
+                ("set_overview_mode".to_string(), true),
+                ("show_agent_card".to_string(), true),
+                ("next_agent_card".to_string(), true),
+                ("previous_agent_card".to_string(), true),
+                ("next_needs_you_card".to_string(), true),
+                ("filter_needs_you_cards".to_string(), true),
+                ("close_agent_card".to_string(), true),
+                ("run_card_action".to_string(), true),
+                ("reply_to_agent_card".to_string(), true),
             ]
         );
         assert_eq!(
@@ -877,6 +979,15 @@ mod tests {
                 ("dismiss_star_prompt".to_string(), true),
                 ("stop_agent".to_string(), true),
                 ("close_orchestration".to_string(), false),
+                ("set_overview_mode".to_string(), false),
+                ("show_agent_card".to_string(), false),
+                ("next_agent_card".to_string(), false),
+                ("previous_agent_card".to_string(), false),
+                ("next_needs_you_card".to_string(), false),
+                ("filter_needs_you_cards".to_string(), false),
+                ("close_agent_card".to_string(), false),
+                ("run_card_action".to_string(), false),
+                ("reply_to_agent_card".to_string(), false),
             ]
         );
     }
@@ -999,7 +1110,10 @@ mod tests {
             None,
             None,
             LabelSharing::Shared,
-            false,
+            FlagGates {
+                show_deck: false,
+                show_agent_cards: true,
+            },
         );
         for (hidden, plain) in hidden.iter().zip(&plain) {
             if hidden.id == "open_deck" {
@@ -1023,6 +1137,58 @@ mod tests {
             true,
         );
         assert_eq!(shown, plain);
+    }
+
+    /// Scenario: annotate the shipped table for the overview with the agent
+    /// cards hidden, the deck shown (PRD #2374). Hidden, each card row turns
+    /// unavailable and carries the cards' reason; every other row reads
+    /// exactly as the unannotated table does, so the deck's row is untouched.
+    #[test]
+    fn voice_schema_withholds_the_card_rows_while_the_cards_are_hidden() {
+        use crate::settings::LabelSharing;
+        let card_rows = [
+            "set_overview_mode",
+            "show_agent_card",
+            "next_agent_card",
+            "previous_agent_card",
+            "next_needs_you_card",
+            "filter_needs_you_cards",
+            "close_agent_card",
+            "run_card_action",
+            "reply_to_agent_card",
+        ];
+        let plain = annotate(table(), Screen::Overview);
+        let hidden = annotate_for(
+            table(),
+            Screen::Overview,
+            None,
+            None,
+            LabelSharing::Shared,
+            FlagGates {
+                show_deck: true,
+                show_agent_cards: false,
+            },
+        );
+        let mut withheld = Vec::new();
+        for (hidden, plain) in hidden.iter().zip(&plain) {
+            if card_rows.contains(&hidden.id.as_str()) {
+                assert!(
+                    plain.callable,
+                    "the overview offers `{}` when shown",
+                    hidden.id
+                );
+                assert!(!hidden.callable, "`{}` offered while hidden", hidden.id);
+                assert_eq!(hidden.unavailable_hint, CARDS_HIDDEN_HINT);
+                withheld.push(hidden.id.as_str());
+            } else {
+                assert_eq!(
+                    hidden, plain,
+                    "`{}` changed with the cards hidden",
+                    hidden.id
+                );
+            }
+        }
+        assert_eq!(withheld, card_rows);
     }
 
     #[test]
