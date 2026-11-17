@@ -2710,6 +2710,7 @@ fn log_evidence_transition(transition: &crate::evidence_state::Transition, cause
         layout_epoch = transition.layout_epoch,
         out_seq = transition.out_seq,
         marker_seq = transition.marker_seq,
+        basis = transition.basis.map(crate::evidence_state::CleanBasis::as_str),
         "pane layout evidence"
     );
 }
@@ -26868,7 +26869,17 @@ mod spawn_tests {
     #[test]
     fn doorbell_055_the_latch_does_not_wait_for_clean_evidence() {
         use crate::evidence_state::{EdgeReason, EvidenceStatus};
-        let profile = Some(&crate::doorbell_screen::CODEX_PROFILE);
+        // Codex's witnesses alone (issue #2262): with the agreement rule a
+        // terminal that has had one width is Clean from its first byte, and
+        // this test needs a header read before any Clean frame.
+        static WITNESS_ONLY: std::sync::OnceLock<crate::doorbell_screen::ScreenProfile> =
+            std::sync::OnceLock::new();
+        let profile = Some(
+            WITNESS_ONLY.get_or_init(|| crate::doorbell_screen::ScreenProfile {
+                agreement: false,
+                ..crate::doorbell_screen::CODEX_PROFILE
+            }),
+        );
         // (l) never Clean.
         let bus = AgentBus::for_generation("g-l", profile, 24, 80);
         bus.push(codex_header("0.164.0"));

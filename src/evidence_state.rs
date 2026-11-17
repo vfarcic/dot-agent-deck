@@ -44,6 +44,29 @@
 //! (`inbox/doorbell/044`). Frames are read only between pushes, so readings
 //! that differ only inside a push are never read.
 //!
+//! **Every width the terminal has had** (issue #2262). A profile that opts in
+//! ([`ScreenProfile::agreement`], Codex's) can turn Clean with no witness at
+//! all: while a twin parser at **every other width the terminal has had in
+//! this generation** reads the same screen as the parser after every push
+//! since the parser started, the screen the parser holds is the one the
+//! agent drew, whichever of those widths it drew for. Codex in a pane under
+//! 32 rows draws no logo before its first prompt, and so no witness, which
+//! left it unread until a prompt. The rule rests on the premise
+//! [`WidthsSeen`] states: whatever writes to the pane's terminal draws for a
+//! size it read from that terminal, and every size the terminal has had is
+//! recorded here, the spawn's (the PTY is opened at it before the agent
+//! starts) and each resize's and nudge's (recorded under the lock the ioctl
+//! runs under). It compares widths at one row count, so it holds only while
+//! the terminal has had one row count in the generation: a frame drawn for
+//! another height is not compared with anything, and a generation whose row
+//! count ever changed needs a witness, as before. It is bounded too: past
+//! [`AGREEMENT_TWINS_MAX`] other widths, or a twin over the cell or work
+//! budget, it does not apply. A terminal that has only ever had one width
+//! needs no twin. As with the pair witness, the first push after which any
+//! reading differs ends the rule until the next layout edge, and a state
+//! Clean on it returns to the Pending it came from; a width witness makes it
+//! Clean on that witness and drops the twins.
+//!
 //! Nothing turns Dirty into Clean because time passed. An agent that redraws
 //! nothing after an edge stays Dirty.
 //!
@@ -72,15 +95,40 @@ pub const EVIDENCE_CELLS_MAX: u32 = crate::release_scanner::SCANNER_CELLS_MAX;
 /// dearest cost per unit measured (`src/agent_pty_scanner_budget.rs`).
 pub const EVIDENCE_WORK_PER_PUSH: u64 = crate::release_scanner::SCANNER_WORK_PER_PUSH;
 
+/// The most widths besides the one in force that the agreement rule reads
+/// the same bytes at, one twin parser each (issue #2262). A generation whose
+/// terminal has had more is never Clean on agreement.
+pub const AGREEMENT_TWINS_MAX: usize = 4;
+
 fn within_budget(rows: u16, cols: u16) -> bool {
     u32::from(rows.max(1)) * u32::from(cols.max(1)) <= EVIDENCE_CELLS_MAX
 }
 
-/// Whether two parsers that read the same bytes at the two widths of a pair
-/// (`2k` and `2k + 1`) hold the same screen: the same cell (character,
-/// attributes, wide halves) in every column both widths have, the same row
-/// wraps, the same cursor position, and nothing in the wider one's last
-/// column, which the narrower one does not have.
+/// What a Clean state rests on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleanBasis {
+    /// The profile's width witness.
+    Witness,
+    /// The profile's pair witness, while the pair partner's twin agrees.
+    Pair,
+    /// No witness: every other width the terminal has had reads the same.
+    Agreement,
+}
+
+impl CleanBasis {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CleanBasis::Witness => "witness",
+            CleanBasis::Pair => "pair",
+            CleanBasis::Agreement => "agreement",
+        }
+    }
+}
+
+/// Whether two parsers that read the same bytes at two widths hold the same
+/// screen: the same cell (character, attributes, wide halves) in every
+/// column both widths have, the same row wraps, the same cursor position,
+/// and nothing in the columns only the wider one has.
 fn readings_agree(a: &vt100::Screen, b: &vt100::Screen) -> bool {
     let (rows, a_cols) = crate::vt_grid::size(a);
     let (b_rows, b_cols) = crate::vt_grid::size(b);
@@ -96,10 +144,10 @@ fn readings_agree(a: &vt100::Screen, b: &vt100::Screen) -> bool {
     (0..rows).all(|r| {
         a.row_wrapped(r) == b.row_wrapped(r)
             && (0..shared).all(|c| a.cell(r, c) == b.cell(r, c))
-            && (wide_cols == shared
-                || wide
-                    .cell(r, wide_cols - 1)
-                    .is_none_or(|c| !c.has_contents() && !c.is_wide_continuation()))
+            && (shared..wide_cols).all(|c| {
+                wide.cell(r, c)
+                    .is_none_or(|c| !c.has_contents() && !c.is_wide_continuation())
+            })
     })
 }
 
@@ -182,6 +230,8 @@ pub struct Transition {
     /// The stream offset of the redraw marker that started the parser, when
     /// this transition began from one.
     pub marker_seq: Option<u64>,
+    /// What the state is Clean on after it, `None` when it isn't Clean.
+    pub basis: Option<CleanBasis>,
 }
 
 /// Where a Clean frame stood when it was read (R-D-U2-01): its layout epoch
@@ -205,19 +255,32 @@ pub struct EvidenceState {
     /// Every width the terminal has had, for the witness.
     widths: WidthsSeen,
     /// While the parser runs at a width whose pair partner the terminal has
-    /// also had (`2k` and `2k + 1`): whether the twin, reading the same bytes
-    /// at the partner width, has held the same screen as the parser after
-    /// every push since both started ([`readings_agree`]), the condition
-    /// under which the profile's pair witness counts. `None` when the pair is
-    /// not in question, or once the state is Clean on a width witness.
+    /// also had (`2k` and `2k + 1`): whether the partner's twin, reading the
+    /// same bytes at the partner width, has held the same screen as the
+    /// parser after every push since both started ([`readings_agree`]), the
+    /// condition under which the profile's pair witness counts. `None` when
+    /// the pair is not in question, or once the state is Clean on a width
+    /// witness.
     pair_agree: Option<bool>,
-    /// The twin parser at the pair partner's width, while `pair_agree` is
-    /// `Some(true)`.
-    twin: Option<crate::vt_work::MeteredParser>,
-    /// The Pending status a Clean resting on the pair witness came from:
-    /// the state returns to it once the twin's reading differs and no width
-    /// witness shows. `None` when Clean rests on a width witness.
-    pair_held: Option<EvidenceStatus>,
+    /// While the parser runs: whether the agreement rule holds, that is the
+    /// profile opts in, the terminal has had one row count, every other width
+    /// it has had has a twin (at most [`AGREEMENT_TWINS_MAX`]), and every twin
+    /// has held the same screen as the parser after every push since both
+    /// started. `false` once any of that fails, until the next edge.
+    all_agree: bool,
+    /// The twin parsers, each at another width the terminal has had, reading
+    /// every byte the parser reads: every such width while `all_agree`, or
+    /// only the pair partner's while `pair_agree` is `Some(true)`.
+    twins: Vec<(u16, crate::vt_work::MeteredParser)>,
+    /// The Pending status a Clean resting on the pair witness or on agreement
+    /// came from, and which of the two: the state returns to it once a
+    /// reading it rests on differs and no width witness shows. `None` when
+    /// Clean rests on a width witness.
+    held: Option<(EvidenceStatus, CleanBasis)>,
+    /// The terminal has had more than one row count in this generation, so
+    /// the agreement rule, which compares widths at one row count, does not
+    /// apply.
+    rows_changed: bool,
     /// While Dirty: the last bytes pushed, one fewer than the marker, so a
     /// marker split across two pushes is still found.
     tail: Vec<u8>,
@@ -251,7 +314,7 @@ impl EvidenceState {
             ),
             None => (EvidenceStatus::Unprofiled, None),
         };
-        Self {
+        let mut state = Self {
             profile,
             rows,
             cols,
@@ -261,10 +324,16 @@ impl EvidenceState {
             parser,
             widths: WidthsSeen::of([cols]),
             pair_agree: None,
-            twin: None,
-            pair_held: None,
+            all_agree: false,
+            twins: Vec::new(),
+            held: None,
+            rows_changed: false,
             tail: Vec::new(),
+        };
+        if state.parser.is_some() {
+            state.start_twins();
         }
+        state
     }
 
     /// The cells the evidence parser holds now (0 with none running).
@@ -288,7 +357,17 @@ impl EvidenceState {
     /// Whether the state is Clean on the profile's pair witness, which
     /// holds only while the twin reads the same screen.
     pub fn pair_held(&self) -> bool {
-        self.pair_held.is_some()
+        matches!(self.held, Some((_, CleanBasis::Pair)))
+    }
+
+    /// What the state is Clean on, `None` while it is not Clean.
+    pub fn clean_basis(&self) -> Option<CleanBasis> {
+        match self.status {
+            EvidenceStatus::Clean { .. } => {
+                Some(self.held.map_or(CleanBasis::Witness, |(_, basis)| basis))
+            }
+            _ => None,
+        }
     }
 
     pub fn layout_epoch(&self) -> u64 {
@@ -350,6 +429,7 @@ impl EvidenceState {
             layout_epoch: self.layout_epoch,
             out_seq: self.out_seq,
             marker_seq,
+            basis: self.clean_basis(),
         })
     }
 
@@ -383,7 +463,7 @@ impl EvidenceState {
                 if let Some(over) = self.feed(bytes) {
                     return over;
                 }
-                self.recheck_pair(profile)
+                self.recheck_held(profile)
             }
             EvidenceStatus::Dirty { .. } => {
                 let marker = profile.redraw_marker;
@@ -420,7 +500,8 @@ impl EvidenceState {
                     );
                 }
                 self.parser = Some(parser);
-                self.start_twin(modes.iter().chain(&window[at..]));
+                self.start_twins();
+                self.feed_twins(&[&modes, &window[at..]]);
                 self.out_seq = base + bytes.len() as u64;
                 let edge_seq = match self.status {
                     EvidenceStatus::Dirty { edge_seq, .. } => edge_seq,
@@ -449,13 +530,11 @@ impl EvidenceState {
         let parser = self.parser.as_mut()?;
         let limit = parser.spent().saturating_add(EVIDENCE_WORK_PER_PUSH);
         let Some(refused) = bytes.iter().position(|&b| !parser.feed_byte(b, limit)) else {
-            self.feed_twin(bytes);
+            self.feed_twins(&[bytes]);
             return None;
         };
         self.parser = None;
-        self.twin = None;
-        self.pair_agree = None;
-        self.pair_held = None;
+        self.drop_twins();
         Some(self.transition(
             EvidenceStatus::WorkOverBudget {
                 since_seq: base + refused as u64,
@@ -464,45 +543,94 @@ impl EvidenceState {
         ))
     }
 
-    /// Start the twin at the pair partner's width, when the terminal has had
-    /// both widths of the current one's pair, and feed it what the parser
-    /// was just started on.
-    fn start_twin<'a>(&mut self, bytes: impl IntoIterator<Item = &'a u8>) {
-        self.twin = None;
-        self.pair_held = None;
-        let partner = self.cols ^ 1;
-        self.pair_agree = self.widths.had(partner).then_some(true);
-        if self.pair_agree.is_none() {
-            return;
-        }
-        if partner == 0 || !within_budget(self.rows, partner) {
-            self.pair_agree = Some(false);
-            return;
-        }
-        self.twin = Some(crate::vt_work::MeteredParser::new(self.rows, partner, 0));
-        self.feed_twin(bytes);
+    /// Drop every twin and what rests on them.
+    fn drop_twins(&mut self) {
+        self.twins.clear();
+        self.pair_agree = None;
+        self.all_agree = false;
+        self.held = None;
     }
 
-    /// Feed the twin the bytes the parser just took, then compare the two
-    /// readings: the first push after which they differ, or the twin's work
-    /// bound refuses a byte, drops the twin and spends the pair witness until
-    /// the next edge. Frames are read between pushes, so a reading that
-    /// differs only inside a push is never read.
-    fn feed_twin<'a>(&mut self, bytes: impl IntoIterator<Item = &'a u8>) {
-        let Some(twin) = self.twin.as_mut() else {
-            return;
+    /// Start the twins for a parser just started at the width in force: one
+    /// at every other width the terminal has had, while the agreement rule
+    /// can apply ([`ScreenProfile::agreement`], one row count, at most
+    /// [`AGREEMENT_TWINS_MAX`] other widths, each within the cell budget);
+    /// otherwise one at the pair partner's width when the terminal has had
+    /// it; otherwise none. The caller feeds them what the parser was started
+    /// on.
+    fn start_twins(&mut self) {
+        self.drop_twins();
+        let partner = self.cols ^ 1;
+        self.pair_agree = self.widths.had(partner).then_some(true);
+        let others: Vec<u16> = self
+            .widths
+            .list()
+            .into_iter()
+            .filter(|&w| w != self.cols)
+            .collect();
+        self.all_agree = self.profile.is_some_and(|p| p.agreement)
+            && !self.rows_changed
+            && others.len() <= AGREEMENT_TWINS_MAX
+            && others
+                .iter()
+                .all(|&w| w != 0 && within_budget(self.rows, w));
+        let wanted = if self.all_agree {
+            others
+        } else if self.pair_agree.is_some() {
+            vec![partner]
+        } else {
+            Vec::new()
         };
-        let limit = twin.spent().saturating_add(EVIDENCE_WORK_PER_PUSH);
-        let refused = bytes.into_iter().any(|&b| !twin.feed_byte(b, limit));
-        let agree = !refused
-            && self
-                .parser
-                .as_ref()
-                .is_some_and(|parser| readings_agree(parser.screen(), twin.screen()));
-        if !agree {
-            self.twin = None;
+        for w in wanted {
+            if w == 0 || !within_budget(self.rows, w) {
+                // Only the partner reaches here: the agreement rule has
+                // checked its own widths.
+                self.pair_agree = Some(false);
+                continue;
+            }
+            self.twins
+                .push((w, crate::vt_work::MeteredParser::new(self.rows, w, 0)));
+        }
+    }
+
+    /// Feed every twin the bytes the parser just took, then compare each
+    /// reading with the parser's: a twin whose reading differs after this
+    /// push, or whose work bound refuses a byte, spends what rests on it
+    /// until the next edge (the agreement rule, and the pair witness when it
+    /// is the partner's). Twins nothing rests on any more are dropped. Frames
+    /// are read between pushes, so a reading that differs only inside a push
+    /// is never read.
+    fn feed_twins(&mut self, parts: &[&[u8]]) {
+        if self.twins.is_empty() {
+            return;
+        }
+        let partner = self.cols ^ 1;
+        let parser = self.parser.as_ref();
+        let mut partner_failed = false;
+        let mut any_failed = false;
+        for (w, twin) in &mut self.twins {
+            let limit = twin.spent().saturating_add(EVIDENCE_WORK_PER_PUSH);
+            let refused = parts
+                .iter()
+                .flat_map(|part| part.iter())
+                .any(|&b| !twin.feed_byte(b, limit));
+            let agree =
+                !refused && parser.is_some_and(|p| readings_agree(p.screen(), twin.screen()));
+            if !agree {
+                any_failed = true;
+                partner_failed |= *w == partner;
+            }
+        }
+        if any_failed {
+            self.all_agree = false;
+        }
+        if partner_failed {
             self.pair_agree = Some(false);
         }
+        let keep_all = self.all_agree;
+        let keep_partner = self.pair_agree == Some(true);
+        self.twins
+            .retain(|(w, _)| keep_all || (keep_partner && *w == partner));
     }
 
     fn check_witness(
@@ -513,51 +641,60 @@ impl EvidenceState {
     ) -> Option<Transition> {
         let parser = self.parser.as_ref()?;
         if (profile.width_witness)(parser.screen(), &self.widths) {
-            self.pair_agree = None;
-            self.twin = None;
-            self.pair_held = None;
+            self.drop_twins();
             return self.transition(EvidenceStatus::Clean { since_seq }, marker_seq);
         }
-        if self.pair_agree == Some(true) && (profile.pair_witness)(parser.screen()) {
-            self.pair_held = Some(self.status);
-            return self.transition(EvidenceStatus::Clean { since_seq }, marker_seq);
-        }
-        None
+        let basis = if self.pair_agree == Some(true) && (profile.pair_witness)(parser.screen()) {
+            CleanBasis::Pair
+        } else if self.all_agree {
+            CleanBasis::Agreement
+        } else {
+            return None;
+        };
+        self.held = Some((self.status, basis));
+        self.transition(EvidenceStatus::Clean { since_seq }, marker_seq)
     }
 
-    /// After a push to a state Clean on the pair witness: a width witness
-    /// now makes it Clean on that witness, dropping the twin; otherwise it
-    /// stays Clean while the two readings agree, and once they have differed
-    /// the frame no longer reads the same for both widths of the pair, so it
-    /// returns to the Pending it came from.
-    fn recheck_pair(&mut self, profile: &ScreenProfile) -> Option<Transition> {
-        let pending = self.pair_held?;
+    /// After a push to a state Clean on the pair witness or on agreement: a
+    /// width witness now makes it Clean on that witness, dropping the twins.
+    /// Otherwise it stays Clean on the pair witness while the partner's
+    /// reading agrees, or on agreement while every reading does (the pair
+    /// witness first, as [`Self::check_witness`] takes it); once what it
+    /// rests on has differed, the frame no longer reads the same at the
+    /// widths it might have been drawn for, so it returns to the Pending it
+    /// came from.
+    fn recheck_held(&mut self, profile: &ScreenProfile) -> Option<Transition> {
+        let (pending, basis) = self.held?;
         let parser = self.parser.as_ref()?;
         if (profile.width_witness)(parser.screen(), &self.widths) {
-            self.pair_held = None;
-            self.pair_agree = None;
-            self.twin = None;
+            self.drop_twins();
             return None;
         }
-        if self.pair_agree == Some(true) {
+        let pair = self.pair_agree == Some(true)
+            && (basis == CleanBasis::Pair || (profile.pair_witness)(parser.screen()));
+        if pair {
+            self.held = Some((pending, CleanBasis::Pair));
             return None;
         }
-        self.pair_held = None;
+        if self.all_agree {
+            self.held = Some((pending, CleanBasis::Agreement));
+            return None;
+        }
+        self.held = None;
         self.transition(pending, None)
     }
 
     /// A successful layout ioctl to `rows` × `cols`, at this place in the
     /// stream.
     pub fn edge(&mut self, reason: EdgeReason, rows: u16, cols: u16) -> Option<Transition> {
+        self.rows_changed |= rows != self.rows;
         self.rows = rows;
         self.cols = cols;
         self.layout_epoch += 1;
         self.widths.record(cols);
         self.profile?;
         self.parser = None;
-        self.pair_agree = None;
-        self.twin = None;
-        self.pair_held = None;
+        self.drop_twins();
         self.tail.clear();
         let to = if within_budget(rows, cols) {
             EvidenceStatus::Dirty {
@@ -583,9 +720,7 @@ impl EvidenceState {
         self.profile = Some(profile);
         self.layout_epoch += 1;
         self.parser = None;
-        self.pair_agree = None;
-        self.twin = None;
-        self.pair_held = None;
+        self.drop_twins();
         self.tail.clear();
         let to = if within_budget(self.rows, self.cols) {
             EvidenceStatus::Dirty {
@@ -611,9 +746,7 @@ impl EvidenceState {
         self.layout_epoch += 1;
         self.profile?;
         self.parser = None;
-        self.pair_agree = None;
-        self.twin = None;
-        self.pair_held = None;
+        self.drop_twins();
         self.tail.clear();
         self.transition(
             EvidenceStatus::GeometryUnknown {

@@ -979,10 +979,10 @@ fn codex_028_launcher_output_is_no_readiness() {
     holds(&deck, &launcher, "awaiting_prompt");
 }
 
-/// Scenario: A fresh measured Codex 0.164.0 starts at 24 × 80, where Codex draws no logo before its first prompt, so its start-up frame carries no width witness and the deck cannot read it as Clean. A queued task gets no byte through the settle window and beyond, and the card shows the hold, that the agent may be waiting at a prompt, rather than the deck typing into a frame it could not prove.
+/// Scenario: A fresh measured Codex 0.164.0 starts at 24 × 80, where Codex draws no logo before its first prompt, so its start-up frame carries no width witness. Its pane has only ever had one width, so the deck reads that frame as Clean on agreement (issue #2262) rather than holding it until a prompt: a queued task gets no byte before the settle window, then the token head, the rest of the line and one Enter, and Codex's prompt hook hands the task over.
 #[spec("inbox/codex/028")]
 #[test]
-fn codex_028_a_small_fresh_codex_without_a_width_witness_is_held_visibly() {
+fn codex_028_a_small_fresh_codex_without_a_width_witness_is_rung() {
     let deck = Deck::new();
     let codex = deck.codex_with(
         "codex-028-small",
@@ -994,14 +994,14 @@ fn codex_028_a_small_fresh_codex_without_a_width_witness_is_held_visibly() {
     );
     deck.latched(&codex, MEASURED);
     let id = enqueue(&deck.daemon, &codex.pane, BODY);
-    held(
-        &deck,
-        &codex,
-        &id,
-        MEASURED_SETTLE + Duration::from_secs(4),
-        "no width witness",
+    let line = delivered(&deck, &codex, &id);
+    assert_eq!(codex.typed(), format!("{line}\r"));
+    let inputs = codex.inputs();
+    assert_eq!(inputs[0].1, head(&line), "{inputs:?}");
+    assert!(
+        inputs[0].0 >= deck.anchor(&codex) + MEASURED_SETTLE.as_nanos() as u64,
+        "no byte before the settle window"
     );
-    holds(&deck, &codex, "awaiting_prompt");
 }
 
 /// The daemon's environment for Q35-27's tests: the composer probe's lines
