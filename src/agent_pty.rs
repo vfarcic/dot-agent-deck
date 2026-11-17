@@ -8428,6 +8428,9 @@ pub struct AgentPtyRegistry {
         { crate::lock_rank::LEAF },
         crate::dispatched_units::DispatchedUnits,
     >,
+    /// PRD #2374: the agent cards' reports, delivery state and revisions.
+    /// See [`crate::agent_cards`].
+    agent_cards: crate::agent_cards::CardStore,
     /// Issue #424 (reviewer blocker 3 / auditor MEDIUM): where a daemon-side
     /// delivery failure is REPORTED, so the report is durable state on the
     /// pane's card rather than bytes typed into the agent's input buffer.
@@ -10722,6 +10725,7 @@ impl AgentPtyRegistry {
             dispatched_units: crate::lock_rank::RankedMutex::new(
                 crate::dispatched_units::DispatchedUnits::default(),
             ),
+            agent_cards: crate::agent_cards::CardStore::default(),
             delivery_notice_sink: Mutex::new(None),
             delegations: crate::lock_rank::RankedMutex::new(DelegationTracker::default()),
             delegation_seq: AtomicU64::new(1),
@@ -20384,6 +20388,11 @@ impl AgentPtyRegistry {
     /// PRD #1589: the record of dispatched units. Held only for pure reads and
     /// updates of [`crate::dispatched_units::DispatchedUnits`]; never across an
     /// await or while taking the registry lock.
+    /// PRD #2374: the agent cards' store.
+    pub fn agent_cards(&self) -> &crate::agent_cards::CardStore {
+        &self.agent_cards
+    }
+
     pub fn dispatched_units(
         &self,
     ) -> crate::lock_rank::RankedGuard<

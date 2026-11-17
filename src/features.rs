@@ -182,6 +182,17 @@ pub fn show_desktop_agent_details() -> bool {
     experimental_enabled()
 }
 
+/// Production wrapper for the desktop overview's **agent cards** (PRD #2374):
+/// the Table | Cards switch, the cards grid, the shared card overlay, and the
+/// table's needs-you marker and row menu. One wrapper per surface (CLAUDE.md
+/// #9) so `grep show_agent_cards` finds every gate at graduation — see the
+/// `graduate-agent-cards` issue. A presentation switch, carried to the webview
+/// by `desktop_features`, exactly like [`show_desktop_deck`]: the daemon's
+/// cards, the `card` CLI and the protocol do not read it.
+pub fn show_agent_cards() -> bool {
+    experimental_enabled()
+}
+
 /// Guards [`init_and_watch`] so the periodic watcher thread is spawned at
 /// most once per process (reviewer #4 / audit INFO-3): a second call is a
 /// no-op rather than leaking a duplicate poll thread.

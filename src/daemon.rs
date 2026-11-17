@@ -852,6 +852,13 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     let telemetry = crate::telemetry::start_for_daemon(&event_tx, &pty_registry);
     // PRD #1666 S3: every inbox state change reaches attached clients.
     pty_registry.inbox().set_broadcast(event_tx.clone());
+    // PRD #2374: agent cards ring their doorbells on the same fan-out, and
+    // offer "close, keeping the worktree" for agents with a dispatched one.
+    pty_registry
+        .agent_cards()
+        .install(event_tx.clone(), daemon.worktree_registry.clone());
+    let agent_cards_watcher =
+        crate::agent_cards::spawn_watcher(Arc::clone(&pty_registry), state.clone());
     // PRD #1666 part 2 §2.7: what a card tells the user to run when an
     // agent's hooks run a dot-agent-deck too old for its messages, composed
     // from this deck's own install path.
@@ -1167,6 +1174,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     pull_request_handle.abort();
     scheduler_handle.abort();
     inbox_ticker.abort();
+    agent_cards_watcher.abort();
     offer_assigner.abort();
     doorbell.abort();
     if let Some(publisher) = doorbell_publisher {
@@ -7466,6 +7474,69 @@ async fn run_hook_loop_with_limits(
                                         .pause_point(crate::task_completion::PAUSE_ACKED)
                                         .await;
                                 }
+                                DaemonMessage::CardPublish(request) => {
+                                    // PRD #2374: held to the agent it names, as
+                                    // a raw event is, and refused without a
+                                    // token whatever the policy: no CLI that
+                                    // predates the token sends this verb.
+                                    let verdict = crate::hook_provenance::classify_event(
+                                        Some(&request.pane_id),
+                                        request.agent_id.as_deref().filter(|a| !a.is_empty()),
+                                        request.token.as_deref(),
+                                        &*pty_registry,
+                                    );
+                                    let reply = match verdict {
+                                        crate::hook_provenance::Provenance::Attested {
+                                            agent_id,
+                                            ..
+                                        } => {
+                                            crate::agent_cards::publish(
+                                                &pty_registry,
+                                                &state,
+                                                &request.pane_id,
+                                                &agent_id,
+                                                request.report,
+                                            )
+                                            .await
+                                        }
+                                        crate::hook_provenance::Provenance::Refused(refusal) => {
+                                            crate::event::CardPublishReply::refused(
+                                                refusal.code(),
+                                                &refusal.caller_message(),
+                                            )
+                                        }
+                                        crate::hook_provenance::Provenance::Unattested => {
+                                            let refusal = if request.token.is_some() {
+                                                crate::hook_provenance::Refusal::UnknownToken
+                                            } else {
+                                                crate::hook_provenance::Refusal::Missing
+                                            };
+                                            crate::event::CardPublishReply::refused(
+                                                refusal.code(),
+                                                "refused: an agent card can be published only \
+                                                 from a pane this deck started, with the hook \
+                                                 capability token it was given.",
+                                            )
+                                        }
+                                    };
+                                    if !reply.accepted {
+                                        warn!(
+                                            verb = "card_publish",
+                                            claimed_pane = %escape_id_for_log(&request.pane_id),
+                                            reason = reply.code.as_deref().unwrap_or_default(),
+                                            "hook socket: refused an agent card"
+                                        );
+                                    }
+                                    if let Ok(json) = serde_json::to_string(&reply) {
+                                        let line = format!("{json}\n");
+                                        if write_hook_reply(&mut write_half, &line, idle_timeout)
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                }
                                 DaemonMessage::HookCapabilities(_) => {
                                     // PRD #1666 part 3 (Q35-14b): the composer
                                     // capability, only to an installed
@@ -7521,6 +7592,8 @@ async fn run_hook_loop_with_limits(
                                         dispatch_launch: Some(
                                             crate::event::DISPATCH_LAUNCH,
                                         ),
+                                        // PRD #2374: agent cards are stored.
+                                        agent_card: Some(crate::event::AGENT_CARD),
                                         ..Default::default()
                                     };
                                     if let Ok(json) = serde_json::to_string(&reply) {
@@ -8130,15 +8203,21 @@ async fn run_hook_loop_with_limits(
                             // PRD #1401: a pull request report is the
                             // daemon's alone — its URL is what a card's badge
                             // opens — so a producer's copy goes no further.
-                            if event.event_type == crate::event::EventType::PullRequest {
+                            // PRD #2374: and so is an agent card's doorbell.
+                            if matches!(
+                                event.event_type,
+                                crate::event::EventType::PullRequest
+                                    | crate::event::EventType::AgentCard
+                            ) {
                                 warn!(
                                     verb = "agent_event",
                                     claimed_pane = %escape_id_for_log(
                                         event.pane_id.as_deref().unwrap_or("<none>")
                                     ),
                                     reason = "daemon_authored_event_type",
-                                    "hook socket: dropped a producer's pull_request event; \
-                                     only the daemon reports an agent's pull request"
+                                    event_type = ?event.event_type,
+                                    "hook socket: dropped a producer's daemon-authored event \
+                                     (pull_request or agent_card); only the daemon sends those"
                                 );
                                 continue;
                             }

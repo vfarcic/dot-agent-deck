@@ -2767,7 +2767,7 @@ pub fn send_gated_at(
     let question_deadline = std::time::Instant::now() + question_wait;
     let Ok(mut client) = crate::platform::ipc::IpcClient::connect_timeout(path, question_wait)
     else {
-        return not_confirmed("no daemon answered");
+        return not_confirmed(GATED_NO_DAEMON);
     };
     if write_gated(
         &mut client,
@@ -2980,6 +2980,45 @@ pub fn confirms_dispatch_launch(line: &str) -> Result<(), Option<(String, String
         return Ok(());
     }
     Err(reply.code.zip(reply.message))
+}
+
+/// PRD #2374: whether a capabilities answer confirms
+/// [`crate::event::AGENT_CARD`], by equality. A refusal of the question comes
+/// back with its code and message.
+pub fn confirms_agent_card(line: &str) -> Result<(), Option<(String, String)>> {
+    let Ok(reply) = serde_json::from_str::<crate::event::HookCapabilitiesReply>(line.trim()) else {
+        return Err(None);
+    };
+    if reply.agent_card == Some(crate::event::AGENT_CARD) {
+        return Ok(());
+    }
+    Err(reply.code.zip(reply.message))
+}
+
+/// The `why` of a [`Gated::NotConfirmed`] when nothing answered at the hook
+/// socket at all: no daemon is running.
+pub const GATED_NO_DAEMON: &str = "no daemon answered";
+
+/// PRD #2374: publish an agent card, only on a connection whose capabilities
+/// answer named [`crate::event::AGENT_CARD`], so an older daemon is never sent
+/// it.
+pub fn send_card_publish(request: &crate::event::CardPublishRequest) -> Gated {
+    let question =
+        crate::event::DaemonMessage::HookCapabilities(crate::event::HookCapabilitiesRequest {
+            pane_id: request.pane_id.clone(),
+            token: request.token.clone(),
+        });
+    let mutation = crate::event::DaemonMessage::CardPublish(request.clone());
+    let (Ok(question), Ok(mutation)) = (
+        serde_json::to_string(&question),
+        serde_json::to_string(&mutation),
+    ) else {
+        return Gated::NotConfirmed {
+            refusal: None,
+            why: "the request could not be encoded",
+        };
+    };
+    send_gated(&question, &mutation, confirms_agent_card)
 }
 
 /// Issue #2172: send a dispatch that chose its unit's command or agent, only

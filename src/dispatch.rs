@@ -836,6 +836,19 @@ fn next_report_nonce() -> String {
 /// directory called `$THE_VARIABLE`. `None` (an unresolvable repository) omits
 /// the paragraph rather than guessing a path — a unit told the wrong durable
 /// location writes there and nobody notices.
+/// PRD #2374: `task` followed by the agent-card catalog's text block —
+/// exactly `"\n\n"` + [`crate::card_catalog::dispatch_text`].
+pub(crate) fn with_card_catalog(
+    task: &str,
+    catalog: &crate::card_catalog::ResolvedCatalog,
+) -> String {
+    let bin = crate::platform::paths::binary_name();
+    format!(
+        "{task}\n\n{}",
+        crate::card_catalog::dispatch_text(catalog, &bin)
+    )
+}
+
 fn dispatch_prompt(
     task: &str,
     target: &crate::spawn::SpawnTarget,
@@ -1100,8 +1113,12 @@ pub async fn handle_dispatch(
         RemovalPolicy::KeepIfDirty,
     );
 
+    // PRD #2374: the agent-card catalog is appended to the TASK, before the
+    // shape branch, so the single-agent prompt and an orchestration's task
+    // (and through it the orchestrator's context file) both carry it.
+    let task = with_card_catalog(task, &ctx.registry.agent_cards().catalog());
     let prompt = dispatch_prompt(
-        task,
+        &task,
         &resolved_target,
         &dispatch_report_path(name, &next_report_nonce()),
         crate::worktree_owner::main_worktree_if_linked(&paths.worktree_dir).as_deref(),

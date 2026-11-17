@@ -1239,6 +1239,14 @@ pub const CAP_HELLO_FOLLOW_ON: &str = "hello-follow-on";
 /// keep path is `#[cfg]`-gated.
 pub const CAP_KEEP_WORKTREE: &str = "keep-worktree";
 
+/// Capability string for PRD #2374's agent cards:
+/// [`AttachRequest::ListAgentCards`], [`AttachRequest::AgentCardCatalog`] and
+/// [`AttachRequest::InvokeCardAction`]. Each is withheld by
+/// [`crate::daemon_client::DaemonClient`] unless the `Hello` on the same
+/// connection named this, so no [`PROTOCOL_VERSION`] bump. Advertised on every
+/// platform: none of the three arms is `#[cfg]`-gated.
+pub const CAP_AGENT_CARDS: &str = "agent-cards";
+
 /// Capability string for [`AttachRequest::ListOutcomes`] (PRD #1666 part 3,
 /// round 5, plan D10): the deck's recovery rows — reports and dispatch results
 /// set aside because their recipient was gone. Sent only by
@@ -1452,6 +1460,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_KEEP_WORKTREE,
     CAP_PROJECT_TRUST,
     CAP_TRUST_REQUESTS,
+    CAP_AGENT_CARDS,
 ];
 #[cfg(not(unix))]
 pub const DAEMON_CAPABILITIES: &[&str] = &[
@@ -1480,6 +1489,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_KEEP_WORKTREE,
     CAP_PROJECT_TRUST,
     CAP_TRUST_REQUESTS,
+    CAP_AGENT_CARDS,
 ];
 
 // ---------------------------------------------------------------------------
@@ -3365,6 +3375,34 @@ pub enum AttachRequest {
     ///
     /// Its own short-lived connection: one request, one response, close.
     HostMetrics,
+    /// PRD #2374: every live agent card, as the daemon computed it, in
+    /// display order. The reply rides back on [`AttachResponse::agent_cards`].
+    /// **Withheld unless the daemon advertises [`CAP_AGENT_CARDS`]** on the
+    /// connection that carries it, so no [`PROTOCOL_VERSION`] bump.
+    ListAgentCards,
+    /// PRD #2374: the resolved agent-card catalog. The reply rides back on
+    /// [`AttachResponse::card_catalog`]. Withheld like
+    /// [`Self::ListAgentCards`].
+    AgentCardCatalog,
+    /// PRD #2374: invoke one action of one card. Names the entry (`pane_id`
+    /// and the `agent_id` generation it showed) and the action, never a free
+    /// target, so it cannot be retargeted: the daemon refuses a pane whose
+    /// current agent is another as `stale_entry`. `request_id` names the
+    /// press, so a repeat within ten minutes answers as the first and sends
+    /// nothing again. The reply rides back on [`AttachResponse::card_action`].
+    /// Withheld like [`Self::ListAgentCards`].
+    InvokeCardAction {
+        pane_id: String,
+        agent_id: String,
+        action_id: String,
+        request_id: String,
+        /// The user confirmed an action that asks for it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        confirm: bool,
+        /// The text a `reply` sends.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+    },
     /// PRD #1666 part 3 (Q35-14b, OQ10): the `e2e` build's control of an
     /// installed generation's arm page: `operation` `publish` or `withdraw`
     /// puts up or takes back its one test liability through the records and
@@ -4302,6 +4340,17 @@ pub struct AttachResponse {
     /// it answers is capability-gated, so neither moves [`PROTOCOL_VERSION`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_metrics: Option<HostMetrics>,
+    /// PRD #2374: the answer to [`AttachRequest::ListAgentCards`]. Additive
+    /// and optional; the request is capability-gated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_cards: Option<crate::agent_cards::AgentCardList>,
+    /// PRD #2374: the answer to [`AttachRequest::AgentCardCatalog`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card_catalog: Option<crate::card_catalog::ResolvedCatalog>,
+    /// PRD #2374: the answer to [`AttachRequest::InvokeCardAction`]; a
+    /// refusal is `ok: true` with `outcome: "refused"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card_action: Option<crate::agent_cards::CardActionResult>,
     /// PRD #1666 part 3 (Q35-15): the `e2e` build's answer to
     /// [`AttachRequest::E2eComposerControl`]'s `fence-status`. Compiled into
     /// that build alone, which is the only one that can ask for it.
@@ -6213,6 +6262,240 @@ async fn pause_before_seed_post(pane_id: &str) {
     }
 }
 
+/// The whole of [`AttachRequest::StopAgent`] for agent `id`: its pane-scoped
+/// cleanup, the stop itself and the dispatched-worktree cleanup or keep. PRD
+/// #2374: shared with an agent card's close, so a card's close is the same
+/// close the desktop row's Close sends. Answers the outcome — on success, the
+/// worktree a keep kept — and the pane hold, which the caller drops once it
+/// has answered (issue #454 round 3).
+pub(crate) async fn stop_agent_request(
+    id: &str,
+    keep_worktree: bool,
+    registry: &Arc<AgentPtyRegistry>,
+    state: &SharedState,
+    event_tx: &broadcast::Sender<BroadcastMsg>,
+    worktree_registry: &crate::issue_dispatch_run::WorktreeRegistry,
+) -> (
+    Result<Option<String>, String>,
+    Option<crate::agent_pty::PaneCleanupHold>,
+) {
+    let id = id.to_string();
+    // PRD #93 round-5: capture the agent's `pane_id_env` BEFORE
+    // close_agent removes the registry entry, so we can clean up
+    // the daemon's per-pane role-map entries after a successful
+    // close. Without this, a closed pane's role/cwd would linger
+    // in the maps and a subsequent `handle_delegate` aimed at
+    // that role would still resolve the dead pane.
+    // Capture the agent's record once, BEFORE close_agent removes it.
+    // `pane_id_env` cleans up the daemon's per-pane role maps; the
+    // record's cwd/orchestration-cwd is how the PRD #120 M2.4 close
+    // watcher matches a dispatched issue agent to its worktree.
+    //
+    // Issue #454: read it through `agent_record_any`, NOT
+    // `agent_records`. The latter filters out an agent whose child has
+    // already exited — right for hydration, exactly wrong here, because
+    // a common way an agent reaches `StopAgent` is that its child died
+    // first and the pane is closed afterwards. Through the filtered list
+    // such a record came back `None`, so `pane_id_env` was `None`, so
+    // EVERY cleanup step below was skipped: the delegation sweep,
+    // the role-map removal,
+    // `unregister_pane` and the dispatched-worktree cleanup. And it was
+    // skipped permanently — `close_agent` drops the entry in this same
+    // handler, so no later call could repair it.
+    //
+    // Round-2 audit (blocker C): reading a DEAD agent's pane back is
+    // what makes the cleanup below reachable at all, and it is also
+    // what makes it dangerous — because every step after this lookup is
+    // PANE-scoped while the agent being stopped is not. The registry
+    // deliberately lets a live agent B reuse the pane a dead agent A
+    // left; a `StopAgent(A)` arriving after that (a stale client, or
+    // just ordinary lifecycle ordering) would then mark B's pane
+    // closing, cancel B's prompt confirmation and every delegation
+    // touching it, and `unregister_pane` B's role, cwd, orchestrator
+    // marker and routing identity. That is strictly worse than the leak
+    // it replaced: before the round-1 fix the filtered lookup found
+    // nothing for A and cleanup was skipped, so stale state lingered but
+    // no LIVE agent's state was deleted.
+    //
+    // So the pane travels into the cleanup only while it is still A's to
+    // give up: nobody else holds it, or A itself still does. Anything
+    // else and A owes the pane nothing — its successor owns it, and
+    // owns the cleanup of it too. `close_agent(&id)` below is keyed by
+    // registry id and is unaffected either way; it is only the
+    // pane-scoped work that is gated. The dispatched-worktree cleanup
+    // keeps reading the record directly: it is guarded by its own
+    // `worktree_still_in_use` sweep over the live records, which is the
+    // same "is anyone else using this?" question asked of a worktree
+    // instead of a pane.
+    //
+    // Round-3 review (blocker 1): that gate is now taken from the
+    // registry as a HOLD rather than as a boolean read, for two reasons
+    // the first version got wrong. It was asked of
+    // `pane_current_agent_id`, which sees only published, non-exited
+    // agents — so a successor that had RESERVED the pane and not
+    // published yet came back `None` and was read as "nobody holds it".
+    // And it was check-then-act: decided here, before a `close_agent`
+    // that can spend the full three-second termination grace, and acted
+    // on afterwards in `unregister_pane`, so a successor could reserve,
+    // spawn, publish and register its whole identity inside the gap only
+    // for this handler to delete it. The hold answers both — it sees
+    // reservations, and nothing may claim the pane until it is dropped
+    // at the end of this arm. See `AgentPtyRegistry::hold_pane_for_cleanup`.
+    let stopping_record = registry.agent_record_any(&id);
+    let pane_cleanup_hold = stopping_record
+        .as_ref()
+        .and_then(|r| r.pane_id_env.as_deref())
+        .and_then(|pane| registry.hold_pane_for_cleanup(pane, &id));
+    let pane_id_env = pane_cleanup_hold
+        .as_ref()
+        .map(|hold| hold.pane_id().to_string());
+    let dispatched_worktree = stopping_record
+        .as_ref()
+        .and_then(crate::issue_dispatch_run::worktree_of_record);
+    // Issue #1958 (F1): a keep is latched HERE, before anything is
+    // stopped and whatever else still runs in the tree, by taking the
+    // registry entry. The deck's cleanups of a dispatched tree — a
+    // stop's, a close's and a failed dispatch's rollback — remove only a
+    // tree whose entry they took, so no later one — this stop's, a
+    // sibling role's earlier ordinary stop's, a close of an agent started
+    // in the same directory afterwards, or the rollback of a dispatch
+    // this stop ended while it was starting — removes it. Left to the cleanup after the stop, the keep
+    // was lost to whichever of those got there first.
+    //
+    // If the stop then fails, the agent keeps running in a tree the
+    // daemon no longer records: no close removes it, and the user finds
+    // and removes it with `dot-agent-deck worktree reclaim`. The entry is
+    // not put back — that would hand the tree to the next ordinary close.
+    //
+    // Round 2: a latch that finds no entry is NOT a keep and is not
+    // reported as one. The ordinary cleanups take the entry only once
+    // they see nothing running in the tree, so for an agent they saw
+    // running there it means an unrecorded tree or one another keep
+    // already holds. For an agent whose process had already exited, or
+    // one started in the tree after an ordinary stop's cleanup looked,
+    // it can also be a tree that cleanup already took for removal; that
+    // removal is not undone, and the cleanup that owns it reports what
+    // it did.
+    let kept_on_request = if keep_worktree {
+        let kept = dispatched_worktree.as_deref().and_then(|worktree| {
+            crate::issue_dispatch_run::keep_on_request(worktree_registry, worktree)
+        });
+        if kept.is_none() && dispatched_worktree.is_some() {
+            tracing::info!(
+                agent_id = %id,
+                "stop: keep requested, but the deck holds no record of the agent's worktree to keep"
+            );
+        }
+        kept
+    } else {
+        None
+    };
+    // PRD #2374: what a card's close reports as kept.
+    let kept_path = kept_on_request.as_ref().map(|kept| kept.path.clone());
+    // PRD #1589: the teardown itself is shared with `CloseAgents`, which
+    // takes the same steps in the same order — see
+    // [`stop_agent_steps`]. The existing teardown is unchanged. What the
+    // extraction added is the unit-lifecycle end: a stop that removes a
+    // dispatched unit's last pane now also ends that unit, which touches
+    // only the daemon's in-memory dispatched-units record — nothing a
+    // client of this request, older or newer, reads.
+    let close_outcome = stop_agent_steps(
+        &id,
+        stopping_record.as_ref(),
+        pane_id_env.as_deref(),
+        registry,
+        state,
+        event_tx,
+        crate::dispatched_units::EndReason::Stopped,
+    )
+    .await;
+    let outcome = match close_outcome {
+        Ok(()) => {
+            // PRD #120 M2.4 + S1: if this agent was dispatched into a
+            // per-issue worktree, the tab close is its cleanup trigger.
+            // But a multi-role orchestration shares ONE worktree across
+            // every role pane, so removing it on the first role's close
+            // would nuke it under still-live siblings. `close_agent` has
+            // already dropped the closing agent, so only when NO live
+            // agent still resolves to this worktree was it the LAST one —
+            // then `git worktree remove` the worktree (the clone is
+            // preserved) and drop the registry entry. The child is already
+            // reaped, so the worktree is no longer a live cwd. No-op for
+            // ordinary agents and for earlier sibling-role closes.
+            // PRD #220: the removal POLICY travels with the registry
+            // entry, because this handler serves both producers and sees
+            // only a path — issue-dispatch needs the force removal its
+            // slot-reclaim model depends on, while a PRD #220 dispatch
+            // sibling must keep uncommitted work. See `RemovalPolicy`.
+            //
+            // Cleanup runs DETACHED, and the close is answered without
+            // waiting for it. The agent is already stopped by this point,
+            // so the client's question ("is this pane closed?") is fully
+            // answered — while the cleanup is two `git` invocations
+            // against a worktree an agent has been working in, and
+            // `git status --porcelain` there is seconds, not milliseconds,
+            // on a real checkout. Awaiting it held the response past the
+            // TUI's 5s `CTRL_W_STOP_TIMEOUT`, so the client gave up,
+            // retained the pane "for retry", and the user saw a card that
+            // would not go away even though its agent was gone
+            // (`dispatch/close/001`).
+            if let Some(worktree) = dispatched_worktree {
+                let registry = registry.clone();
+                let worktree_registry = worktree_registry.clone();
+                // Issue #717: the cleanup's verdict is the only
+                // authoritative one — it is measured with the agent
+                // already reaped, so nothing can change the tree under
+                // it — and it lands after the card is gone. Broadcast it
+                // so attached TUIs can say what actually happened
+                // instead of leaving the user with the dialog's
+                // arm-time prediction.
+                let event_tx = event_tx.clone();
+                // Issue #1958: a keep latched above has nothing left to
+                // clean up; its report is broadcast from here, after
+                // the stop, once — the same place an ordinary stop's
+                // verdict comes from. A stop that ASKED to keep never
+                // takes the ordinary removal path, whatever its latch
+                // found: a latch that found no entry means another keep
+                // already holds the tree, an ordinary cleanup already
+                // owns its removal, or the deck never recorded it — and
+                // an entry recorded again since is not this stop's to
+                // remove. Only a latched keep is reported as one.
+                tokio::spawn(async move {
+                    registry.pause_point("stop-worktree-cleanup").await;
+                    let kept = if keep_worktree {
+                        kept_on_request
+                    } else {
+                        crate::issue_dispatch_run::cleanup_after_stop(
+                            &registry.agent_records_for_worktree_cleanup(),
+                            &worktree_registry,
+                            &worktree,
+                        )
+                        .await
+                    };
+                    if let Some(kept) = kept {
+                        // Errs only when nothing is subscribed (a
+                        // standalone daemon), which is not a failure.
+                        let _ = event_tx.send(BroadcastMsg::WorktreeKept(kept));
+                    }
+                    registry.pause_point("stop-worktree-cleanup-done").await;
+                });
+            }
+            Ok(kept_path)
+        }
+        Err(msg) => {
+            // PRD #126: the close failed, so the agent is still live;
+            // `stop_agent_steps` has already rolled the closing mark back.
+            // Issue #1958: a keep latched above stands (see there), so
+            // it is reported here, the one report it gets.
+            if let Some(kept) = kept_on_request {
+                let _ = event_tx.send(BroadcastMsg::WorktreeKept(kept));
+            }
+            Err(msg)
+        }
+    };
+    (outcome, pane_cleanup_hold)
+}
+
 /// PRD #1589: the teardown `StopAgent` performs on one agent, shared with
 /// `CloseAgents` so the two cannot drift: everything between taking the
 /// pane-cleanup hold and answering, minus the dispatched-worktree cleanup —
@@ -7512,216 +7795,18 @@ async fn handle_connection(
             }
         }
         AttachRequest::StopAgent { id, keep_worktree } => {
-            // PRD #93 round-5: capture the agent's `pane_id_env` BEFORE
-            // close_agent removes the registry entry, so we can clean up
-            // the daemon's per-pane role-map entries after a successful
-            // close. Without this, a closed pane's role/cwd would linger
-            // in the maps and a subsequent `handle_delegate` aimed at
-            // that role would still resolve the dead pane.
-            // Capture the agent's record once, BEFORE close_agent removes it.
-            // `pane_id_env` cleans up the daemon's per-pane role maps; the
-            // record's cwd/orchestration-cwd is how the PRD #120 M2.4 close
-            // watcher matches a dispatched issue agent to its worktree.
-            //
-            // Issue #454: read it through `agent_record_any`, NOT
-            // `agent_records`. The latter filters out an agent whose child has
-            // already exited — right for hydration, exactly wrong here, because
-            // a common way an agent reaches `StopAgent` is that its child died
-            // first and the pane is closed afterwards. Through the filtered list
-            // such a record came back `None`, so `pane_id_env` was `None`, so
-            // EVERY cleanup step below was skipped: the delegation sweep,
-            // the role-map removal,
-            // `unregister_pane` and the dispatched-worktree cleanup. And it was
-            // skipped permanently — `close_agent` drops the entry in this same
-            // handler, so no later call could repair it.
-            //
-            // Round-2 audit (blocker C): reading a DEAD agent's pane back is
-            // what makes the cleanup below reachable at all, and it is also
-            // what makes it dangerous — because every step after this lookup is
-            // PANE-scoped while the agent being stopped is not. The registry
-            // deliberately lets a live agent B reuse the pane a dead agent A
-            // left; a `StopAgent(A)` arriving after that (a stale client, or
-            // just ordinary lifecycle ordering) would then mark B's pane
-            // closing, cancel B's prompt confirmation and every delegation
-            // touching it, and `unregister_pane` B's role, cwd, orchestrator
-            // marker and routing identity. That is strictly worse than the leak
-            // it replaced: before the round-1 fix the filtered lookup found
-            // nothing for A and cleanup was skipped, so stale state lingered but
-            // no LIVE agent's state was deleted.
-            //
-            // So the pane travels into the cleanup only while it is still A's to
-            // give up: nobody else holds it, or A itself still does. Anything
-            // else and A owes the pane nothing — its successor owns it, and
-            // owns the cleanup of it too. `close_agent(&id)` below is keyed by
-            // registry id and is unaffected either way; it is only the
-            // pane-scoped work that is gated. The dispatched-worktree cleanup
-            // keeps reading the record directly: it is guarded by its own
-            // `worktree_still_in_use` sweep over the live records, which is the
-            // same "is anyone else using this?" question asked of a worktree
-            // instead of a pane.
-            //
-            // Round-3 review (blocker 1): that gate is now taken from the
-            // registry as a HOLD rather than as a boolean read, for two reasons
-            // the first version got wrong. It was asked of
-            // `pane_current_agent_id`, which sees only published, non-exited
-            // agents — so a successor that had RESERVED the pane and not
-            // published yet came back `None` and was read as "nobody holds it".
-            // And it was check-then-act: decided here, before a `close_agent`
-            // that can spend the full three-second termination grace, and acted
-            // on afterwards in `unregister_pane`, so a successor could reserve,
-            // spawn, publish and register its whole identity inside the gap only
-            // for this handler to delete it. The hold answers both — it sees
-            // reservations, and nothing may claim the pane until it is dropped
-            // at the end of this arm. See `AgentPtyRegistry::hold_pane_for_cleanup`.
-            let stopping_record = registry.agent_record_any(&id);
-            let pane_cleanup_hold = stopping_record
-                .as_ref()
-                .and_then(|r| r.pane_id_env.as_deref())
-                .and_then(|pane| registry.hold_pane_for_cleanup(pane, &id));
-            let pane_id_env = pane_cleanup_hold
-                .as_ref()
-                .map(|hold| hold.pane_id().to_string());
-            let dispatched_worktree = stopping_record
-                .as_ref()
-                .and_then(crate::issue_dispatch_run::worktree_of_record);
-            // Issue #1958 (F1): a keep is latched HERE, before anything is
-            // stopped and whatever else still runs in the tree, by taking the
-            // registry entry. The deck's cleanups of a dispatched tree — a
-            // stop's, a close's and a failed dispatch's rollback — remove only a
-            // tree whose entry they took, so no later one — this stop's, a
-            // sibling role's earlier ordinary stop's, a close of an agent started
-            // in the same directory afterwards, or the rollback of a dispatch
-            // this stop ended while it was starting — removes it. Left to the cleanup after the stop, the keep
-            // was lost to whichever of those got there first.
-            //
-            // If the stop then fails, the agent keeps running in a tree the
-            // daemon no longer records: no close removes it, and the user finds
-            // and removes it with `dot-agent-deck worktree reclaim`. The entry is
-            // not put back — that would hand the tree to the next ordinary close.
-            //
-            // Round 2: a latch that finds no entry is NOT a keep and is not
-            // reported as one. The ordinary cleanups take the entry only once
-            // they see nothing running in the tree, so for an agent they saw
-            // running there it means an unrecorded tree or one another keep
-            // already holds. For an agent whose process had already exited, or
-            // one started in the tree after an ordinary stop's cleanup looked,
-            // it can also be a tree that cleanup already took for removal; that
-            // removal is not undone, and the cleanup that owns it reports what
-            // it did.
-            let kept_on_request = if keep_worktree {
-                let kept = dispatched_worktree.as_deref().and_then(|worktree| {
-                    crate::issue_dispatch_run::keep_on_request(&worktree_registry, worktree)
-                });
-                if kept.is_none() && dispatched_worktree.is_some() {
-                    tracing::info!(
-                        agent_id = %id,
-                        "stop: keep requested, but the deck holds no record of the agent's worktree to keep"
-                    );
-                }
-                kept
-            } else {
-                None
-            };
-            // PRD #1589: the teardown itself is shared with `CloseAgents`, which
-            // takes the same steps in the same order — see
-            // [`stop_agent_steps`]. The existing teardown is unchanged. What the
-            // extraction added is the unit-lifecycle end: a stop that removes a
-            // dispatched unit's last pane now also ends that unit, which touches
-            // only the daemon's in-memory dispatched-units record — nothing a
-            // client of this request, older or newer, reads.
-            let close_outcome = stop_agent_steps(
+            let (outcome, pane_cleanup_hold) = stop_agent_request(
                 &id,
-                stopping_record.as_ref(),
-                pane_id_env.as_deref(),
+                keep_worktree,
                 &registry,
                 &state,
                 &event_tx,
-                crate::dispatched_units::EndReason::Stopped,
+                &worktree_registry,
             )
             .await;
-            match close_outcome {
-                Ok(()) => {
-                    // PRD #120 M2.4 + S1: if this agent was dispatched into a
-                    // per-issue worktree, the tab close is its cleanup trigger.
-                    // But a multi-role orchestration shares ONE worktree across
-                    // every role pane, so removing it on the first role's close
-                    // would nuke it under still-live siblings. `close_agent` has
-                    // already dropped the closing agent, so only when NO live
-                    // agent still resolves to this worktree was it the LAST one —
-                    // then `git worktree remove` the worktree (the clone is
-                    // preserved) and drop the registry entry. The child is already
-                    // reaped, so the worktree is no longer a live cwd. No-op for
-                    // ordinary agents and for earlier sibling-role closes.
-                    // PRD #220: the removal POLICY travels with the registry
-                    // entry, because this handler serves both producers and sees
-                    // only a path — issue-dispatch needs the force removal its
-                    // slot-reclaim model depends on, while a PRD #220 dispatch
-                    // sibling must keep uncommitted work. See `RemovalPolicy`.
-                    //
-                    // Cleanup runs DETACHED, and the close is answered without
-                    // waiting for it. The agent is already stopped by this point,
-                    // so the client's question ("is this pane closed?") is fully
-                    // answered — while the cleanup is two `git` invocations
-                    // against a worktree an agent has been working in, and
-                    // `git status --porcelain` there is seconds, not milliseconds,
-                    // on a real checkout. Awaiting it held the response past the
-                    // TUI's 5s `CTRL_W_STOP_TIMEOUT`, so the client gave up,
-                    // retained the pane "for retry", and the user saw a card that
-                    // would not go away even though its agent was gone
-                    // (`dispatch/close/001`).
-                    if let Some(worktree) = dispatched_worktree {
-                        let registry = registry.clone();
-                        let worktree_registry = worktree_registry.clone();
-                        // Issue #717: the cleanup's verdict is the only
-                        // authoritative one — it is measured with the agent
-                        // already reaped, so nothing can change the tree under
-                        // it — and it lands after the card is gone. Broadcast it
-                        // so attached TUIs can say what actually happened
-                        // instead of leaving the user with the dialog's
-                        // arm-time prediction.
-                        let event_tx = event_tx.clone();
-                        // Issue #1958: a keep latched above has nothing left to
-                        // clean up; its report is broadcast from here, after
-                        // the stop, once — the same place an ordinary stop's
-                        // verdict comes from. A stop that ASKED to keep never
-                        // takes the ordinary removal path, whatever its latch
-                        // found: a latch that found no entry means another keep
-                        // already holds the tree, an ordinary cleanup already
-                        // owns its removal, or the deck never recorded it — and
-                        // an entry recorded again since is not this stop's to
-                        // remove. Only a latched keep is reported as one.
-                        tokio::spawn(async move {
-                            registry.pause_point("stop-worktree-cleanup").await;
-                            let kept = if keep_worktree {
-                                kept_on_request
-                            } else {
-                                crate::issue_dispatch_run::cleanup_after_stop(
-                                    &registry.agent_records_for_worktree_cleanup(),
-                                    &worktree_registry,
-                                    &worktree,
-                                )
-                                .await
-                            };
-                            if let Some(kept) = kept {
-                                // Errs only when nothing is subscribed (a
-                                // standalone daemon), which is not a failure.
-                                let _ = event_tx.send(BroadcastMsg::WorktreeKept(kept));
-                            }
-                            registry.pause_point("stop-worktree-cleanup-done").await;
-                        });
-                    }
-                    write_resp(&mut stream, &AttachResponse::ok()).await?
-                }
-                Err(msg) => {
-                    // PRD #126: the close failed, so the agent is still live;
-                    // `stop_agent_steps` has already rolled the closing mark back.
-                    // Issue #1958: a keep latched above stands (see there), so
-                    // it is reported here, the one report it gets.
-                    if let Some(kept) = kept_on_request {
-                        let _ = event_tx.send(BroadcastMsg::WorktreeKept(kept));
-                    }
-                    write_resp(&mut stream, &AttachResponse::err(msg)).await?
-                }
+            match outcome {
+                Ok(_) => write_resp(&mut stream, &AttachResponse::ok()).await?,
+                Err(msg) => write_resp(&mut stream, &AttachResponse::err(msg)).await?,
             };
             // Issue #454 round 3: released HERE and not one line earlier —
             // everything from the authorisation above through `unregister_pane`
@@ -7968,6 +8053,65 @@ async fn handle_connection(
         }
         AttachRequest::HostMetrics => {
             write_resp(&mut stream, &host_metrics_response(host_metrics).await).await?
+        }
+        AttachRequest::ListAgentCards => {
+            let list = crate::agent_cards::refresh(&registry, &state).await;
+            let resp = AttachResponse {
+                agent_cards: Some(list),
+                ..AttachResponse::ok()
+            };
+            write_resp(&mut stream, &resp).await?
+        }
+        AttachRequest::AgentCardCatalog => {
+            let catalog = registry.agent_cards().catalog();
+            let resp = AttachResponse {
+                card_catalog: Some((*catalog).clone()),
+                ..AttachResponse::ok()
+            };
+            write_resp(&mut stream, &resp).await?
+        }
+        AttachRequest::InvokeCardAction {
+            pane_id,
+            agent_id,
+            action_id,
+            request_id,
+            confirm,
+            text,
+        } => {
+            let request = crate::agent_cards::CardActionRequest {
+                pane_id,
+                agent_id,
+                action_id,
+                request_id,
+                confirm,
+                text,
+            };
+            // A card's close is the same stop the desktop row's Close sends.
+            let close = |id: String, keep: bool| {
+                let registry = Arc::clone(&registry);
+                let state = state.clone();
+                let event_tx = event_tx.clone();
+                let worktree_registry = worktree_registry.clone();
+                async move {
+                    let (outcome, hold) = stop_agent_request(
+                        &id,
+                        keep,
+                        &registry,
+                        &state,
+                        &event_tx,
+                        &worktree_registry,
+                    )
+                    .await;
+                    drop(hold);
+                    outcome
+                }
+            };
+            let result = crate::agent_cards::invoke(&registry, &state, request, close).await;
+            let resp = AttachResponse {
+                card_action: Some(result),
+                ..AttachResponse::ok()
+            };
+            write_resp(&mut stream, &resp).await?
         }
         #[cfg(feature = "e2e")]
         AttachRequest::E2eComposerControl {

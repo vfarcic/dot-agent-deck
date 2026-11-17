@@ -22,6 +22,12 @@ pub mod agent_registry;
 pub mod attach_recovery;
 pub mod authoring_seeds;
 pub mod bounded_read;
+// PRD #2374: the agent-card catalog (defaults + the user's `[catalog]`).
+pub mod card_catalog;
+// PRD #2374: agent cards — the report an agent publishes and the entry the daemon computes.
+pub mod agent_cards;
+// PRD #2374: the `card` command group.
+pub mod agent_cards_cli;
 pub mod build_id;
 pub mod build_version_handshake;
 // PRD #385: a pane selection copied to the native clipboard and OSC 52.

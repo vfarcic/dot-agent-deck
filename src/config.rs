@@ -1023,6 +1023,12 @@ fn resolve_symlink_chain(path: &Path) -> PathBuf {
     current
 }
 
+/// PRD #2374: the user config file the agent-card catalog is read from — the
+/// same file [`DashboardConfig::load`] reads.
+pub(crate) fn user_config_path() -> PathBuf {
+    config_path()
+}
+
 fn config_path() -> PathBuf {
     if let Ok(dir) = std::env::var("DOT_AGENT_DECK_CONFIG") {
         return PathBuf::from(dir);

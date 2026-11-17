@@ -3842,6 +3842,129 @@ impl DaemonClient {
         }
     }
 
+    /// PRD #2374: a connection whose own `Hello` advertised
+    /// [`crate::daemon_protocol::CAP_AGENT_CARDS`] and
+    /// [`crate::daemon_protocol::CAP_HELLO_FOLLOW_ON`], left open for one card
+    /// request, or `None` when the daemon advertises either not — and then
+    /// nothing follows the `Hello`. On a gated or bound handle the `Hello` is
+    /// the handle's own protocol check.
+    async fn agent_cards_connection(
+        &self,
+    ) -> Result<Option<(TransportReadHalf, TransportWriteHalf)>, ClientError> {
+        let supported = |caps: &DaemonCapabilities| {
+            caps.supports(crate::daemon_protocol::CAP_AGENT_CARDS)
+                && caps.supports(crate::daemon_protocol::CAP_HELLO_FOLLOW_ON)
+        };
+        if self.protocol_gate || self.bound.is_some() {
+            if !supported(&self.capabilities().await?) {
+                return Ok(None);
+            }
+            let (rd, wr, caps, _) = self.protocol_hello(true).await?;
+            return Ok(supported(&caps).then_some((rd, wr)));
+        }
+        let (mut rd, mut wr) = self.connect().await?;
+        let hello = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::Hello {
+                client_version: crate::daemon_protocol::PROTOCOL_VERSION,
+                client_build_version: None,
+                follow_on: true,
+            },
+        )
+        .await?;
+        if !hello.ok {
+            return Err(ClientError::Server(
+                hello
+                    .error
+                    .unwrap_or_else(|| "handshake failed before send".into()),
+            ));
+        }
+        let caps = DaemonCapabilities::from_hello(&hello);
+        Ok(supported(&caps).then_some((rd, wr)))
+    }
+
+    /// PRD #2374: every live agent card, as the daemon computed it, in
+    /// display order. **Withheld unless the daemon's `Hello` on the same
+    /// connection advertised [`crate::daemon_protocol::CAP_AGENT_CARDS`]**,
+    /// answering [`GatedQuery::Unsupported`] without sending anything.
+    pub async fn list_agent_cards(
+        &self,
+    ) -> Result<GatedQuery<crate::agent_cards::AgentCardList>, ClientError> {
+        let Some((mut rd, mut wr)) = self.agent_cards_connection().await? else {
+            return Ok(GatedQuery::Unsupported);
+        };
+        let resp = issue_command(&mut rd, &mut wr, &AttachRequest::ListAgentCards).await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error
+                    .unwrap_or_else(|| "list-agent-cards failed".into()),
+            ));
+        }
+        resp.agent_cards
+            .map(GatedQuery::Answered)
+            .ok_or_else(|| ClientError::Malformed("list-agent-cards answered no cards".into()))
+    }
+
+    /// PRD #2374: the resolved agent-card catalog. Withheld like
+    /// [`Self::list_agent_cards`].
+    pub async fn agent_card_catalog(
+        &self,
+    ) -> Result<GatedQuery<crate::card_catalog::ResolvedCatalog>, ClientError> {
+        let Some((mut rd, mut wr)) = self.agent_cards_connection().await? else {
+            return Ok(GatedQuery::Unsupported);
+        };
+        let resp = issue_command(&mut rd, &mut wr, &AttachRequest::AgentCardCatalog).await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error
+                    .unwrap_or_else(|| "agent-card-catalog failed".into()),
+            ));
+        }
+        resp.card_catalog
+            .map(GatedQuery::Answered)
+            .ok_or_else(|| ClientError::Malformed("agent-card-catalog answered no catalog".into()))
+    }
+
+    /// PRD #2374: invoke action `action_id` of the card of agent `agent_id`
+    /// in `pane_id`. A refusal is an answered [`crate::agent_cards::CardActionResult`]
+    /// with `outcome: "refused"`. Withheld like [`Self::list_agent_cards`].
+    pub async fn invoke_card_action(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        action_id: &str,
+        request_id: &str,
+        confirm: bool,
+        text: Option<&str>,
+    ) -> Result<GatedQuery<crate::agent_cards::CardActionResult>, ClientError> {
+        let Some((mut rd, mut wr)) = self.agent_cards_connection().await? else {
+            return Ok(GatedQuery::Unsupported);
+        };
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::InvokeCardAction {
+                pane_id: pane_id.to_string(),
+                agent_id: agent_id.to_string(),
+                action_id: action_id.to_string(),
+                request_id: request_id.to_string(),
+                confirm,
+                text: text.map(str::to_string),
+            },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error
+                    .unwrap_or_else(|| "invoke-card-action failed".into()),
+            ));
+        }
+        resp.card_action
+            .map(GatedQuery::Answered)
+            .ok_or_else(|| ClientError::Malformed("invoke-card-action answered no result".into()))
+    }
+
     /// Stop agent `id`. On a gated handle the request goes only to a daemon
     /// admitted on its own connection (PRD #1666 part 2): agent ids are a
     /// per-daemon counter, so a replacement the client would refuse may hold an
@@ -6501,6 +6624,147 @@ mod tests {
                 addressed_message_withheld_inner(advertised, address).await;
             }
         });
+    }
+
+    /// PRD #2374 — each agent-card request goes only on a connection whose
+    /// `Hello` advertised `agent-cards` and `hello-follow-on`: against any
+    /// other daemon the method answers `Unsupported` and no frame follows the
+    /// Hello; against one that advertises both, the request rides the same
+    /// connection.
+    #[cfg(unix)]
+    #[test]
+    fn agent_card_requests_are_withheld_unless_the_hello_advertises_them() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        runtime.block_on(async {
+            for advertised in [
+                None,
+                Some(&[crate::daemon_protocol::CAP_AGENT_CARDS][..]),
+                Some(&[crate::daemon_protocol::CAP_HELLO_FOLLOW_ON][..]),
+            ] {
+                for method in 0..3 {
+                    let (answered, after_hello) =
+                        agent_card_request_inner(advertised, method).await;
+                    assert!(
+                        !answered,
+                        "{advertised:?} method {method}: must be Unsupported"
+                    );
+                    assert_eq!(
+                        after_hello, 0,
+                        "{advertised:?} method {method}: nothing follows the Hello"
+                    );
+                }
+            }
+            let both = Some(
+                &[
+                    crate::daemon_protocol::CAP_AGENT_CARDS,
+                    crate::daemon_protocol::CAP_HELLO_FOLLOW_ON,
+                ][..],
+            );
+            for method in 0..3 {
+                let (answered, after_hello) = agent_card_request_inner(both, method).await;
+                assert!(answered, "method {method}: must be answered");
+                assert_eq!(
+                    after_hello, 1,
+                    "method {method}: the request rides the Hello's connection"
+                );
+            }
+        });
+    }
+
+    /// Run agent-card client method `method` (0 list, 1 catalog, 2 invoke)
+    /// against a fake daemon advertising `advertised`; answer whether it was
+    /// answered and how many frames followed a Hello on its connection.
+    #[cfg(unix)]
+    async fn agent_card_request_inner(
+        advertised: Option<&'static [&'static str]>,
+        method: usize,
+    ) -> (bool, usize) {
+        let (dir, path, listener) = {
+            let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("cards-daemon.sock");
+            let listener = bind_attach_listener(&path).expect("bind fake daemon");
+            (dir, path, listener)
+        };
+        let after_hello = Arc::new(AtomicUsize::new(0));
+        let counted = after_hello.clone();
+        let server = tokio::spawn(async move {
+            while let Ok(Ok(mut stream)) =
+                tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept()).await
+            {
+                let mut frames = 0usize;
+                while let Ok(Ok(Some((_kind, payload)))) =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), read_frame(&mut stream))
+                        .await
+                {
+                    frames += 1;
+                    let request: serde_json::Value =
+                        serde_json::from_slice(&payload).unwrap_or_default();
+                    let op = request.get("op").and_then(|op| op.as_str()).unwrap_or("");
+                    let response = if frames == 1 && op == "hello" {
+                        AttachResponse {
+                            capabilities: advertised
+                                .map(|list| list.iter().map(|cap| cap.to_string()).collect()),
+                            ..AttachResponse::hello(PROTOCOL_VERSION)
+                        }
+                    } else {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        match op {
+                            "list-agent-cards" => AttachResponse {
+                                agent_cards: Some(crate::agent_cards::AgentCardList {
+                                    instance_id: "i".into(),
+                                    revision: 1,
+                                    entries: Vec::new(),
+                                    catalog_errors: Vec::new(),
+                                }),
+                                ..AttachResponse::ok()
+                            },
+                            "agent-card-catalog" => AttachResponse {
+                                card_catalog: Some(crate::card_catalog::resolve(None)),
+                                ..AttachResponse::ok()
+                            },
+                            "invoke-card-action" => AttachResponse {
+                                card_action: Some(crate::agent_cards::CardActionResult::refused(
+                                    "r",
+                                    "unknown_entry",
+                                    "there is no card p/1",
+                                )),
+                                ..AttachResponse::ok()
+                            },
+                            _ => AttachResponse::err("malformed request"),
+                        }
+                    };
+                    if crate::daemon_protocol::write_resp(&mut stream, &response)
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        });
+        let client = DaemonClient::new(path);
+        let answered = match method {
+            0 => matches!(client.list_agent_cards().await, Ok(GatedQuery::Answered(_))),
+            1 => matches!(
+                client.agent_card_catalog().await,
+                Ok(GatedQuery::Answered(_))
+            ),
+            _ => matches!(
+                client
+                    .invoke_card_action("p", "1", "merge", "r", false, None)
+                    .await,
+                Ok(GatedQuery::Answered(_))
+            ),
+        };
+        drop(client);
+        let _ = server.await;
+        drop(dir);
+        (answered, after_hello.load(Ordering::SeqCst))
     }
 
     #[cfg(unix)]
