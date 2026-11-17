@@ -2698,7 +2698,8 @@ pub struct PreparedOrchestration {
     /// `.dot-agent-deck/orchestrator-context.md`. A client that built its own
     /// copy would be holding a second, driftable spelling of a file only the
     /// daemon wrote — and, against a current daemon, would point the coordinator
-    /// at the shared compatibility mirror rather than at its own brief.
+    /// at that fixed path, which no current deck writes (issue #1395), rather
+    /// than at its own brief.
     ///
     /// Additive on a response type, exactly like
     /// [`ResolvedProject::config_revision`]: `#[serde(default)]`, so an older

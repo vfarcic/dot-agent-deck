@@ -1334,7 +1334,8 @@ fn project_launch_006_a_later_prepare_does_not_replace_a_started_launchs_context
 
 /// Scenario: Start two orchestrations prepared in the same project, then stop
 /// every pane of the first. Its unique context file disappears, while the
-/// second live orchestration's file and the compatibility mirror remain.
+/// second live orchestration's file remains; neither preparation wrote a
+/// fixed-path copy.
 #[spec("project/launch/008")]
 #[test]
 fn project_launch_008_ended_orchestration_removes_only_its_own_context() {
@@ -1367,8 +1368,9 @@ fn project_launch_008_ended_orchestration_removes_only_its_own_context() {
     let first_path = unique_context_path(&project, &first.context_path);
     let second_path = unique_context_path(&project, &second.context_path);
     assert_ne!(first_path, second_path);
-    let mirror = project.join(".dot-agent-deck/orchestrator-context.md");
-    assert!(first_path.is_file() && second_path.is_file() && mirror.is_file());
+    // Issue #1395: each preparation writes only its own file.
+    let fixed_path = project.join(".dot-agent-deck/orchestrator-context.md");
+    assert!(first_path.is_file() && second_path.is_file() && !fixed_path.exists());
 
     let start =
         |prepared: &dot_agent_deck::event::PreparedOrchestration, title: &str, instance: &str| {
@@ -1431,7 +1433,10 @@ fn project_launch_008_ended_orchestration_removes_only_its_own_context() {
         second_path.is_file(),
         "live orchestration lost its own context"
     );
-    assert!(mirror.is_file(), "the compatibility mirror must remain");
+    assert!(
+        !fixed_path.exists(),
+        "issue #1395: no fixed-path copy appeared either"
+    );
 }
 
 /// Scenario: Resolve a single `loop`, add another role-bearing `loop`, then
