@@ -96,6 +96,11 @@
 mod affected_checks;
 #[cfg(all(test, unix))]
 mod build_gate;
+/// The capacity-only red classifier behind `rerun-unacquired.yml` and
+/// `notify-main-red`'s held alert, `scripts/ci-unacquired-runners.sh`, driven
+/// under `bash` against a fake `gh`. Tests only, and Unix only.
+#[cfg(all(test, unix))]
+mod ci_unacquired_runners;
 /// Issue #2107: `cargo xtask clean-targets`, which reclaims idle worktrees'
 /// cargo `target/` trees.
 mod clean_targets;

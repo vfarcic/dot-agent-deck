@@ -15,6 +15,11 @@ name: Rerun unacquired runners
 # them), so a test failure, a timeout or a job cancelled after it started is
 # never rerun here. Those stay red for a person, as CLAUDE.md rule 6 wants.
 #
+# `notify-main-red` holds its alert for attempt 1 when it reads the same
+# answer, and says so with a `main-red alert held` annotation. When this job
+# then does not rerun a `main` push (the attempt failed further after that job
+# ran, a read failed, or the rerun request did), it sends the held alert.
+#
 # Bounded to ONE rerun: only attempt 1 is rerun, and attempt 2 is left as it
 # ends. A single rerun turned every affected run green on 2026-11-16. The bound
 # is one rather than two for a second reason: a rerun this job requests uses
@@ -67,23 +72,35 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
+          # GitHub runs this under `bash -e`; every command whose failure is
+          # an answer rather than an error is guarded below.
           set -uo pipefail
-          verdict="$(scripts/ci-unacquired-runners.sh "$RUN_ID" "$ATTEMPT")"
-          rc=$?
+          rc=0
+          verdict="$(scripts/ci-unacquired-runners.sh "$RUN_ID" "$ATTEMPT")" || rc=$?
           echo "attempt $ATTEMPT: $verdict"
-          if [ "$rc" -ne 0 ]; then
-            # OTHER (1) or unreadable (2): leave the run as it is.
+          if [ "$rc" -eq 0 ]; then
+            if gh run rerun "$RUN_ID" --failed -R "$GITHUB_REPOSITORY"; then
+              printf '### Rerun requested\n\nattempt %s: %s\n%s\n' "$ATTEMPT" "$verdict" "$RUN_URL" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "::error title=rerun failed::could not rerun $RUN_URL"
+            why="no runner, and the automatic rerun failed"
+          else
+            # OTHER (1) or unreadable (2): no rerun.
             printf '### Not rerun\n\nattempt %s: %s\n' "$ATTEMPT" "$verdict" >> "$GITHUB_STEP_SUMMARY"
-            exit 0
+            why="not rerun: $verdict"
           fi
-          if gh run rerun "$RUN_ID" --failed -R "$GITHUB_REPOSITORY"; then
-            printf '### Rerun requested\n\nattempt %s: %s\n%s\n' "$ATTEMPT" "$verdict" "$RUN_URL" >> "$GITHUB_STEP_SUMMARY"
-            exit 0
+          [ "$RUN_EVENT" = push ] && [ "$HEAD_BRANCH" = main ] || exit 0
+          # notify-main-red may have held its alert for this attempt expecting
+          # a rerun that is not coming: the rerun failed, the attempt failed
+          # further after it ran (it does not wait for `cross-version`), or
+          # this job could not read the run. Exit 1 (not held) is the only
+          # answer that skips the alert; an unreadable one sends it.
+          hrc=0
+          held="$(scripts/ci-unacquired-runners.sh --alert-held "$RUN_ID" "$ATTEMPT")" || hrc=$?
+          echo "notify-main-red: $held"
+          if [ "$hrc" -ne 1 ]; then
+            scripts/notify.sh "$(printf 'dot-agent-deck CI — main is RED (%s)\n%s\n' "$why" "$RUN_URL")"
           fi
-          # notify-main-red held its alert for this attempt expecting the rerun,
-          # so a rerun that could not be requested has to say so itself.
-          echo "::error title=rerun failed::could not rerun $RUN_URL"
-          if [ "$RUN_EVENT" = push ] && [ "$HEAD_BRANCH" = main ]; then
-            scripts/notify.sh "$(printf 'dot-agent-deck CI — main is RED (no runner, and the automatic rerun failed)\n%s\n%s\n' "$verdict" "$RUN_URL")"
-          fi
-          exit 1
+          [ "$rc" -eq 0 ] && exit 1
+          exit 0

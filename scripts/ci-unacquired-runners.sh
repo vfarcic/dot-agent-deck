@@ -31,28 +31,55 @@
 # about its own attempt while it runs.
 #
 # Usage:  scripts/ci-unacquired-runners.sh <run-id> <attempt>
+#         Prints one line, `UNACQUIRED_ONLY <jobs>` or `OTHER <jobs>`.
+#         Exit 0 UNACQUIRED_ONLY, 1 OTHER, 2 the jobs or an annotation could
+#         not be read (treat as OTHER: no rerun, alert as usual).
+#
+#         scripts/ci-unacquired-runners.sh --alert-held <run-id> <attempt>
+#         Did that attempt's `notify-main-red` hold its alert? It says so with
+#         an annotation carrying HELD_MARKER below. `rerun-unacquired.yml`
+#         asks when it declines to rerun or cannot read the run: the attempt
+#         can fail further after `notify-main-red` ran (it does not wait for
+#         `cross-version`), and a held alert must then be sent by someone.
+#         Exit 0 held, 1 not held (or `notify-main-red` did not run), 2 could
+#         not be read (treat as held: a duplicate alert beats a lost one).
+#
 # Env:    GH_TOKEN (actions: read and checks: read), GITHUB_REPOSITORY
 #         (default vfarcic/dot-agent-deck)
-# Prints one line, `UNACQUIRED_ONLY <jobs>` or `OTHER <jobs>`.
-# Exit:   0 UNACQUIRED_ONLY, 1 OTHER, 2 the jobs or an annotation could not be
-#         read (treat as OTHER: no rerun, alert as usual).
 
 set -euo pipefail
 
 # The aggregate jobs in ci.yml: each one only reads `needs` and fails when one
-# of them did not pass. Keep in step with ci.yml.
-AGGREGATES='["build","build-macos","build-windows","e2e-deterministic"]'
+# of them did not pass. Keep in step with ci.yml. `build-windows` is not one:
+# it is `if: false` today (so it reports skipped), but it builds and tests.
+AGGREGATES='["build","build-macos","e2e-deterministic"]'
 
 # GitHub's annotation on a job it gave up queueing.
 NOT_ACQUIRED='was not acquired by Runner'
 
-run="${1:?usage: ci-unacquired-runners.sh <run-id> <attempt>}"
-attempt="${2:?usage: ci-unacquired-runners.sh <run-id> <attempt>}"
-[[ "$run" =~ ^[0-9]+$ && "$attempt" =~ ^[0-9]+$ ]] || { echo "OTHER run id and attempt must be numbers" ; exit 2; }
+# The title of the annotation `notify-main-red` writes when it holds its alert.
+HELD_MARKER='main-red alert held'
+
+mode=classify
+if [ "${1:-}" = --alert-held ]; then mode=held; shift; fi
+
+run="${1:?usage: ci-unacquired-runners.sh [--alert-held] <run-id> <attempt>}"
+attempt="${2:?usage: ci-unacquired-runners.sh [--alert-held] <run-id> <attempt>}"
+[[ "$run" =~ ^[0-9]+$ && "$attempt" =~ ^[0-9]+$ ]] || { echo "OTHER run id and attempt must be numbers"; exit 2; }
 repo="${GITHUB_REPOSITORY:-vfarcic/dot-agent-deck}"
 
 jobs="$(gh api --paginate "repos/$repo/actions/runs/$run/attempts/$attempt/jobs?per_page=100" --jq '.jobs[]' | jq -s .)" \
   || { echo "OTHER could not read the jobs of run $run attempt $attempt"; exit 2; }
+
+if [ "$mode" = held ]; then
+  notify_url="$(jq -r '[.[] | select(.name == "notify-main-red" and .conclusion != "skipped")][0].check_run_url // ""' <<<"$jobs")"
+  if [ -z "$notify_url" ]; then echo "NOT_HELD notify-main-red did not run"; exit 1; fi
+  notes="$(gh api --paginate "${notify_url}/annotations" --jq '.[] | "\(.title // "") \(.message)"')" \
+    || { echo "UNKNOWN could not read the annotations of notify-main-red"; exit 2; }
+  if grep -qF "$HELD_MARKER" <<<"$notes"; then echo "HELD"; exit 0; fi
+  echo "NOT_HELD"
+  exit 1
+fi
 
 # The completed jobs that neither passed nor skipped, minus the aggregates.
 bad="$(jq -c --argjson agg "$AGGREGATES" '
@@ -71,7 +98,7 @@ other=()
 # empty runner name of exactly the job this looks for would vanish.
 while IFS=$'\x1f' read -r name conclusion runner check_url; do
   if [ "$conclusion" = cancelled ] && [ -z "$runner" ]; then
-    notes="$(gh api "${check_url}/annotations" --jq '.[].message')" \
+    notes="$(gh api --paginate "${check_url}/annotations" --jq '.[].message')" \
       || { echo "OTHER could not read the annotations of $name"; exit 2; }
     if grep -qF "$NOT_ACQUIRED" <<<"$notes"; then
       unacquired+=("$name")

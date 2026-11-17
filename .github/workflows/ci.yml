@@ -2354,10 +2354,14 @@ jobs:
           # `rerun-unacquired.yml` once this attempt ends, so the alert waits
           # for the attempt that tests the code. Bounded like that workflow
           # (`run_attempt == 1`): attempt 2 alerts whatever the cause, and
-          # that workflow alerts itself when it cannot rerun.
+          # that workflow sends this held alert itself when it does not rerun
+          # (the attempt failed further, a read failed, or the rerun did).
           if [ "${GITHUB_RUN_ATTEMPT:-1}" -eq 1 ] \
             && capacity="$(scripts/ci-unacquired-runners.sh "$GITHUB_RUN_ID" "${GITHUB_RUN_ATTEMPT:-1}")"; then
             printf '\nNot alerted: %s. An automatic rerun follows this attempt.\n' "$capacity" >> "$GITHUB_STEP_SUMMARY"
+            # The title is what `ci-unacquired-runners.sh --alert-held` looks
+            # for, so the rerun workflow can send this alert if it declines.
+            echo "::notice title=main-red alert held::$capacity"
             exit 0
           fi
 
