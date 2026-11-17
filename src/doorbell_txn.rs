@@ -3102,8 +3102,9 @@ mod gap_withdrawal_tests {
     /// PRD #211 (review: the final seam of the recovery): the echo was
     /// recognised as the deck's line misrendered, and then, on the seam's
     /// final read before the Ctrl+U, a person's job is on the writer (J0
-    /// moved), the composer's text or cursor moved, the input mode is no
-    /// longer usable, or the layout moved to a new epoch. Each one refuses
+    /// moved), the composer's text no longer satisfies the gap recogniser
+    /// or its cursor is no longer at its end, the input mode is no longer
+    /// usable, or the layout moved to a new epoch. Each one refuses
     /// the clear: nothing is pressed, nothing is submitted, and the attempt
     /// ends unresolved at its deadline with the cell suspended.
     #[test]
