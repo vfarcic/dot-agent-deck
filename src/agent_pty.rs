@@ -2878,6 +2878,27 @@ impl AgentBus {
         self.state.lock().unwrap().evidence.frame_unchanged(mark)
     }
 
+    /// PRD #211 (audit B3): run `commit` while the Clean frame `mark` was
+    /// read from still stands, holding the output lock through it, so no
+    /// output the reader takes and no layout edge can land between the check
+    /// and `commit` (both take this lock). The lock is only tried: `None`,
+    /// running nothing, when anything else holds it now, when the frame
+    /// moved, or when it is poisoned. `commit` must not wait on anything: it
+    /// runs under the lock every output push takes.
+    fn commit_if_frame_unchanged<R>(
+        &self,
+        mark: crate::evidence_state::FrameMark,
+        commit: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let state = self.state.try_lock().ok()?;
+        if !state.evidence.frame_unchanged(mark) {
+            return None;
+        }
+        let committed = commit();
+        drop(state);
+        Some(committed)
+    }
+
     /// The current frame, read losslessly, while the evidence state is Clean.
     pub fn clean_frame(&self) -> Option<crate::doorbell_screen::Grid> {
         self.state.lock().unwrap().evidence.clean_frame()
@@ -6002,6 +6023,12 @@ impl PaneWriter {
             {
                 return Ok(AnswerWrite::Superseded);
             }
+            PtyJobOutcome::Done(PtyJobDone { result: Err(e), .. })
+                if e.get_ref()
+                    .is_some_and(|inner| inner.is::<AnswerScreenNotHeld>()) =>
+            {
+                return Ok(AnswerWrite::ScreenMoved);
+            }
             PtyJobOutcome::Done(done) => done.result?,
             PtyJobOutcome::Gone => return Err(PtyWriterThread::gone()),
             PtyJobOutcome::Withdrawn | PtyJobOutcome::Stalled => {
@@ -6941,7 +6968,22 @@ impl PtyWriterThread {
                             done
                         }
                         PtyOp::Answer(buf, mut gate) => {
-                            if gate.still_pending() {
+                            let pending = gate.still_pending();
+                            if pending && let Some(witness) = gate.screen.as_ref() {
+                                // PRD #211 (audit B3): checked once more,
+                                // and written, under the output lock.
+                                let mut done = write_witnessed(
+                                    inner.as_mut(),
+                                    &buf,
+                                    witness,
+                                    &recorder,
+                                    &mut tracking,
+                                );
+                                if done.result.is_ok() {
+                                    done.flushed = Some(inner.flush());
+                                }
+                                done
+                            } else if pending {
                                 let mut done = write_all_recorded(
                                     inner.as_mut(),
                                     &buf,
@@ -7458,6 +7500,81 @@ impl Tracking<'_> {
             let input = self.input;
             natives.written(written, |seq| input.enter_native(seq, Instant::now()));
         }
+    }
+}
+
+/// PRD #211 (audit B3): write a screen-witnessed answer key — one byte — only
+/// while the frame its check read still stands, with the check and the
+/// `write(2)` in one hold of the output lock ([`AgentBus::commit_if_frame_unchanged`]),
+/// so no output the reader takes and no resize can land between them.
+///
+/// Nothing here waits: the lock is only tried, and the byte is written only
+/// when the PTY master reports room for it
+/// ([`crate::doorbell_generation::GenerationDoorbell::master_has_room`]), so
+/// the one-byte write does not wait for the agent to read while every output
+/// push waits on the lock. Any of those failing, a key of more than one byte,
+/// or a pane with no master to ask writes nothing and reports
+/// [`AnswerScreenNotHeld`]; nothing is retried against a frame that may have
+/// moved. What this cannot see is output the agent wrote that the reader has
+/// not taken in yet.
+fn write_witnessed(
+    w: &mut (dyn std::io::Write + Send),
+    buf: &[u8],
+    witness: &ScreenWitness,
+    recorder: &InputRecorder,
+    tracking: &mut Tracking<'_>,
+) -> PtyJobDone {
+    let not_held = || PtyJobDone {
+        accepted: 0,
+        result: Err(std::io::Error::other(AnswerScreenNotHeld)),
+        flushed: None,
+    };
+    // Test seam: after the PTY thread's gate check, before the commit.
+    #[cfg(test)]
+    recorder.pause_at(PtyWritePause::BeforeWrite);
+    if buf.len() != 1 {
+        return not_held();
+    }
+    let has_room = || {
+        recorder
+            .doorbell
+            .as_ref()
+            .is_some_and(|doorbell| doorbell.master_has_room())
+    };
+    let wrote = witness.bus.commit_if_frame_unchanged(witness.mark, || {
+        if !has_room() {
+            return None;
+        }
+        // `Interrupted` took nothing, and the frame cannot move while the
+        // lock is held, so writing again checks against the same frame.
+        loop {
+            match w.write(buf) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                other => return Some(other),
+            }
+        }
+    });
+    let n = match wrote.flatten() {
+        None | Some(Ok(0)) => return not_held(),
+        Some(Ok(n)) => n.min(buf.len()),
+        Some(Err(e)) => {
+            return PtyJobDone {
+                accepted: 0,
+                result: Err(e),
+                flushed: None,
+            };
+        }
+    };
+    tracking.written(&buf[..n]);
+    #[cfg(test)]
+    recorder.pause_at(PtyWritePause::AfterWrite);
+    #[cfg(test)]
+    recorder.pause_at(PtyWritePause::BeforeRecord);
+    recorder.record(ByteSource::Answer, &buf[..n]);
+    PtyJobDone {
+        accepted: n,
+        result: Ok(()),
+        flushed: None,
     }
 }
 
@@ -8094,6 +8211,10 @@ pub(crate) enum AnswerWrite {
     /// PRD #211 (audit B3): a fence held the pane's input, and a key whose
     /// authority is the screen it was checked against is not held.
     NotDeferred,
+    /// PRD #211 (audit B3): at its commit, a screen-witnessed key found the
+    /// frame its check read moved, the output lock taken, or the PTY with no
+    /// room: nothing was written ([`write_witnessed`]).
+    ScreenMoved,
     /// The keys are written; the human-input sequence number they were
     /// committed at.
     Written(u64),
@@ -8230,6 +8351,19 @@ impl std::fmt::Display for AnswerSuperseded {
 }
 
 impl std::error::Error for AnswerSuperseded {}
+
+/// PRD #211 (audit B3): the error a PTY thread reports for a screen-witnessed
+/// answer key it did not write at its commit ([`write_witnessed`]).
+#[derive(Debug)]
+struct AnswerScreenNotHeld;
+
+impl std::fmt::Display for AnswerScreenNotHeld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(ANSWER_SCREEN_NOT_HELD)
+    }
+}
+
+impl std::error::Error for AnswerScreenNotHeld {}
 
 /// Test seam: the barrier name an [`AnswerGate`] stops the PTY thread at.
 #[cfg(test)]
@@ -11274,6 +11408,12 @@ impl AgentPtyRegistry {
             }
             Ok(AnswerWrite::Refused) => return Err(failed(ANSWER_HOLDS_CTRL_G)),
             Ok(AnswerWrite::NotDeferred) => return Err(failed(ANSWER_SCREEN_NOT_HELD)),
+            Ok(AnswerWrite::ScreenMoved) => {
+                return Err(KeyNotWritten::now(
+                    ANSWER_SCREEN_NOT_HELD,
+                    SettlementOutcome::Superseded,
+                ));
+            }
             Ok(AnswerWrite::Full) => return Err(failed(ANSWER_INPUT_FULL)),
             Ok(AnswerWrite::Exited) => {
                 return Err(KeyNotWritten::now(
@@ -13718,6 +13858,26 @@ impl AgentPtyRegistry {
         let (grid, mark) = bus.clean_frame_marked()?;
         let rows = (0..grid.rows).map(|row| grid.text_from(row, 0)).collect();
         Some((rows, ScreenWitness { bus, mark }))
+    }
+
+    /// Test seam: take `agent_id`'s output lock on another thread and hold it
+    /// until the returned sender is dropped or sent on — as the reader does
+    /// while it takes output in. Returns once the lock is held.
+    #[cfg(test)]
+    pub(crate) fn hold_output_lock_for_test(&self, agent_id: &str) -> std::sync::mpsc::Sender<()> {
+        let bus = {
+            let inner = self.inner.lock();
+            Arc::clone(&inner.agents.get(agent_id).expect("a running agent").bus)
+        };
+        let (held_tx, held) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let _state = bus.state.lock().unwrap();
+            let _ = held_tx.send(());
+            let _ = released.recv();
+        });
+        held.recv().expect("the output lock is held");
+        release
     }
 
     /// `agent_id`'s release capture ([`AgentBus::release`]).

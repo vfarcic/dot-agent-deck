@@ -280,6 +280,35 @@ impl GenerationDoorbell {
         master_canonical(self.master.as_ref()?.as_raw_fd())
     }
 
+    /// PRD #211 (audit B3): whether the pane's PTY master has room for a
+    /// write now, asked without waiting (`poll` with a zero timeout). A
+    /// screen-witnessed answer key is written only after this says yes, so
+    /// its one-byte `write(2)` does not wait for the agent to read while the
+    /// output lock is held. `false` with no master to ask, or on any error.
+    pub fn master_has_room(&self) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let Some(master) = self.master.as_ref() else {
+                return false;
+            };
+            let mut fds = libc::pollfd {
+                fd: master.as_raw_fd(),
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            // SAFETY: one pollfd on a descriptor this struct owns, no wait.
+            let ready = unsafe { libc::poll(&mut fds, 1, 0) };
+            ready == 1
+                && fds.revents & libc::POLLOUT != 0
+                && fds.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) == 0
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
     /// An unwrapped generation's first Clean frame showing the empty ready
     /// composer, at `now_ns`: the settle anchor, set once.
     pub fn note_ready_frame(&self, now_ns: u64) {
