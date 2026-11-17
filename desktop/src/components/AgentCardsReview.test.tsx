@@ -1,3 +1,5 @@
+/* The real stylesheet, so a marker's computed style is the one the app gives it (review R3). */
+import "../styles.css";
 import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureFleet, createFixtureStartedAgent, FIXTURE_DAEMON_ID } from "../data/fixture";
@@ -124,16 +126,47 @@ describe("agent cards: what is sent is what was shown (PRD #2374 review round 1)
     expect(live.invokeCardAction).toHaveBeenCalledWith(expect.anything(), "go", expect.objectContaining({ actionToken: "tok-shown" }));
   });
 
-  it("the preview shows exactly the text sent: tabs, bidi controls and separators as visible escapes, nothing dropped (F3)", () => {
-    const prompt = "Use\tmain. Then abc‮def.\nDone.";
+  it("the preview shows exactly the text sent: tabs, bidi controls, separators and other invisible characters as markers, nothing dropped (F3, A3)", () => {
+    const prompt = "Use\tmain.\u2028Then abc\u202Edef\u034Fghi\uFE0F.\nDone.";
     const live = runtime([hostile(prompt)]);
     render(<AgentOverview runtime={live} onNavigate={vi.fn()} />);
     fireEvent.click(within(row()).getByTestId("overview-row-menu"));
     fireEvent.click(within(row()).getByTestId("overview-row-show-card"));
     const shown = screen.getByTestId("agent-card-action-prompt");
-    expect(shown.textContent).toBe("Use\\tmain.\\u{2028}Then abc\\u{202E}def.\nDone.");
+    expect(shown.textContent).toBe("Use\u27E6tab\u27E7main.\u27E6U+2028\u27E7Then abc\u27E6U+202E\u27E7def\u27E6U+034F\u27E7ghi\u27E6U+FE0F\u27E7.\nDone.");
     const escapes = Array.from(shown.querySelectorAll(".exact-text-escape")).map((node) => node.textContent);
-    expect(escapes).toEqual(["\\t", "\\u{2028}", "\\u{202E}"]);
+    expect(escapes).toEqual(["\u27E6tab\u27E7", "\u27E6U+2028\u27E7", "\u27E6U+202E\u27E7", "\u27E6U+034F\u27E7", "\u27E6U+FE0F\u27E7"]);
+    expect(screen.getByTestId("exact-text-note").textContent).toBe("\u27E6\u2026\u27E7 marks a character you cannot see; it is sent as is.");
+  });
+
+  it("a real tab and a typed backslash-t, a real bidi override and a typed \\u{202E}, and a typed marker never look alike (R3)", () => {
+    // What the agent typed: a real tab, then the two characters `\t`; a real
+    // U+202E, then the text `\u{202E}`; and the text of a marker, `⟦tab⟧`.
+    const prompt = "A\tB \\t C\u202ED \\u{202E} \u27E6tab\u27E7";
+    const live = runtime([hostile(prompt)]);
+    render(<AgentOverview runtime={live} onNavigate={vi.fn()} />);
+    fireEvent.click(within(row()).getByTestId("overview-row-menu"));
+    fireEvent.click(within(row()).getByTestId("overview-row-show-card"));
+    const shown = screen.getByTestId("agent-card-action-prompt");
+    const markers = Array.from(shown.querySelectorAll<HTMLElement>(".exact-text-escape"));
+    // Only the real characters, and the typed marker's opener, are markers.
+    expect(markers.map((node) => node.textContent)).toEqual(["\u27E6tab\u27E7", "\u27E6U+202E\u27E7", "\u27E6U+27E6\u27E7"]);
+    expect(markers.map((node) => node.title)).toEqual([
+      "A character you cannot see (tab), sent as is",
+      "A character you cannot see (U+202E), sent as is",
+      "The character \u27E6 itself, sent as is",
+    ]);
+    // The typed text is plain text, as typed.
+    const plain = Array.from(shown.querySelectorAll<HTMLElement>("span:not(.exact-text-escape)")).map((node) => node.textContent).join("|");
+    expect(plain).toBe("A|B \\t C|D \\u{202E} |tab\u27E7");
+    // And a marker is drawn apart from the text around it: boxed, in the code face.
+    const marker = getComputedStyle(markers[0]);
+    const text = getComputedStyle(shown.querySelector<HTMLElement>("span:not(.exact-text-escape)")!);
+    expect(marker.borderTopStyle).toBe("solid");
+    expect(text.borderTopStyle).not.toBe("solid");
+    expect(marker.fontFamily).toContain("JetBrains Mono");
+    expect(marker.fontFamily).not.toBe(text.fontFamily);
+    expect(marker.backgroundColor).not.toBe(text.backgroundColor);
   });
 
   it("an answer belongs to the action's definition: a reused action id does not show the old text's answer (S1)", async () => {
@@ -169,7 +202,7 @@ describe("agent cards: what is sent is what was shown (PRD #2374 review round 1)
     const records = within(screen.getByTestId("agent-card-deliveries")).getAllByTestId("agent-card-delivery-record");
     expect(records).toHaveLength(1);
     expect(records[0].textContent).toContain("Go ahead");
-    expect(records[0].textContent).toContain("Run\\tthe tests.");
+    expect(records[0].textContent).toContain("Run\u27E6tab\u27E7the tests.");
     expect(within(records[0]).getByTestId("agent-card-delivery-state").textContent).toBe("Delivered to the agent");
   });
 });

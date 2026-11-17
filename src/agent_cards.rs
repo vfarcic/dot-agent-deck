@@ -63,11 +63,19 @@ pub const MAX_REPLY_TEXT_BYTES: usize = 16 * 1024;
 /// How long a `request_id` is remembered, so a repeated invocation answers
 /// with its first result and sends nothing again.
 pub const REQUEST_ID_MEMORY: Duration = Duration::from_secs(10 * 60);
-/// The most request ids remembered at once.
+/// The most request ids remembered at once, running and answered together.
 const MAX_REMEMBERED_REQUESTS: usize = 1024;
-/// The most bytes the remembered request ids and their answers may hold
-/// together, besides their count (audit F4).
+/// The most bytes the remembered request ids may hold together, besides
+/// their count (audit F4): an answered one's answer, and a running one's
+/// request plus the room its answer will take (review R2, audit A2).
 const MAX_REMEMBERED_BYTES: usize = 1024 * 1024;
+/// The room a running request keeps for its answer, besides its own text, so
+/// the answer that replaces it usually fits where the request was admitted:
+/// an outcome, a message id and the agent's name or a refusal sentence. A
+/// larger answer (a long refusal, a kept worktree's path) drops older
+/// answers to fit, and is not remembered if it still does not; the bounds
+/// hold either way ([`StoreInner::make_room`]).
+const RESULT_RESERVE_BYTES: usize = 512;
 /// The longest `request_id` a client may name: `[A-Za-z0-9._:-]`, 1 to 128
 /// bytes. A longer or odd one is refused before anything is remembered.
 pub const MAX_REQUEST_ID_BYTES: usize = 128;
@@ -121,6 +129,10 @@ pub const CODE_DAEMON_REPLACED: &str = "daemon_replaced";
 pub const CODE_REQUEST_INVALID: &str = "request_invalid";
 /// The `request_id` was already used for a different request (audit F6).
 pub const CODE_REQUEST_REUSED: &str = "request_reused";
+/// The deck is already running as many card actions as it keeps room for:
+/// nothing was done, and the request id was not remembered, so the same
+/// request can be sent again (review R2, audit A2).
+pub const CODE_BUSY: &str = "busy";
 /// The `disabled_reason` of a prompt action whose agent is not running.
 pub const REASON_AGENT_STOPPED: &str = "agent_stopped";
 
@@ -129,11 +141,17 @@ pub const AGENT_CARD_KEY_METADATA_KEY: &str = "agent_card_key";
 pub const AGENT_CARD_REVISION_METADATA_KEY: &str = "agent_card_revision";
 pub const AGENT_CARD_REMOVED_METADATA_KEY: &str = "agent_card_removed";
 
-/// The inbox `reason` a card action's message is posted under. A
-/// daemon-internal string, deliberately not a [`crate::inbox_hub::PostOrigin`]
-/// variant: that enum is on the wire, and a new variant would fail an older
-/// client's decode.
+/// The inbox `reason` a card action's message is posted under when its text
+/// is the user's own (a `reply`) or their catalog's. A daemon-internal
+/// string, deliberately not a [`crate::inbox_hub::PostOrigin`] variant: that
+/// enum is on the wire, and a new variant would fail an older client's decode.
 pub const CARD_ACTION_POST_REASON: &str = "card_action";
+/// The inbox `reason` a card action's message is posted under when its text,
+/// or part of it, is what the receiving agent itself wrote on its card (a
+/// custom action, an option's prompt, the answer quoting its question), so
+/// the block says the user chose the agent's own suggestion rather than
+/// presenting that text as the user's or the deck's (audit A1).
+pub const CARD_SUGGESTION_POST_REASON: &str = "card_suggestion";
 
 // ---------------------------------------------------------------------------
 // The report an agent sends
@@ -739,15 +757,14 @@ pub struct CardAction {
     #[serde(default)]
     pub prompt: Option<String>,
     /// Who wrote the exact text of `prompt`: `catalog` (a catalog action's
-    /// prompt, the deck's defaults or the user's own catalog), `agent` (a
-    /// custom action's prompt, or a question option's own prompt, as the
-    /// agent reported it) or `deck` (the answer the deck composes for an
-    /// option that carries no prompt of its own). `null` when `prompt` is.
-    /// A client sends an `agent` prompt only from a control that showed the
-    /// user its text; voice, which names an action by its label, opens the
-    /// card's review step for it instead. `source` says who offered the
-    /// action, which for a question option is the agent even when the deck
-    /// wrote its text.
+    /// prompt, the deck's defaults or the user's own catalog) or `agent`
+    /// (text that is, or contains, what the agent reported: a custom action's
+    /// prompt, a question option's own prompt, and the answer the deck
+    /// composes for an option without one, which quotes the agent's question
+    /// and option label — audit A1). `null` when `prompt` is. A client sends
+    /// an `agent` prompt only from a control that showed the user its text;
+    /// voice, which names an action by its label, opens the card's review
+    /// step for it instead. `source` says who offered the action.
     #[serde(default)]
     pub prompt_source: Option<String>,
     pub text_input: bool,
@@ -1311,19 +1328,18 @@ fn project_entry(
         for q in &r.report.questions {
             for o in &q.options {
                 let id = format!("question/{}/{}", q.id, o.id);
-                // The agent's own text for this answer, or the deck's.
-                let (prompt, prompt_source) = match &o.prompt {
-                    Some(own) => (own.clone(), "agent"),
-                    None => (
-                        format!("Answer to your question \"{}\": {}", q.text, o.label),
-                        "deck",
-                    ),
+                // The agent's own text for this answer, or the deck's answer
+                // quoting the agent's question and label: agent-written text
+                // either way (audit A1).
+                let prompt = match &o.prompt {
+                    Some(own) => own.clone(),
+                    None => format!("Answer to your question \"{}\": {}", q.text, o.label),
                 };
                 if answered.get(&q.id).is_none() {
                     primary_candidates.push(id.clone());
                 }
                 answers.insert(id.clone(), (q, o));
-                let mut option = prompt_action(
+                actions.push(prompt_action(
                     id,
                     o.label.clone(),
                     Some(prompt),
@@ -1333,9 +1349,7 @@ fn project_entry(
                     false,
                     "agent",
                     false,
-                );
-                option.prompt_source = Some(prompt_source.into());
-                actions.push(option);
+                ));
             }
         }
     }
@@ -1655,6 +1669,9 @@ enum Remembered {
         fingerprint: [u8; 32],
         at: Instant,
         answer: tokio::sync::watch::Receiver<Option<CardActionResult>>,
+        /// The bytes it was admitted with: its request's text and the room
+        /// kept for its answer (review R2, audit A2).
+        reserved: usize,
     },
     Done {
         fingerprint: [u8; 32],
@@ -1670,10 +1687,11 @@ impl Remembered {
         }
     }
 
-    /// What it holds, besides its key: the answer's own strings.
+    /// What it holds, besides its key: a running request's reservation, or
+    /// the answer's own strings.
     fn bytes(&self) -> usize {
         match self {
-            Remembered::InFlight { .. } => 0,
+            Remembered::InFlight { reserved, .. } => *reserved,
             Remembered::Done { result, .. } => {
                 result.request_id.len()
                     + result.outcome.len()
@@ -1688,11 +1706,15 @@ impl Remembered {
 
 /// What [`CardStore::claim`] answers for a request id.
 enum Claim {
-    /// Nobody has it: run the invocation and send its answer here.
-    Run(tokio::sync::watch::Sender<Option<CardActionResult>>),
+    /// Nobody has it, and it was admitted: run the invocation, send its
+    /// answer on the sender, and wait for it on the receiver like a repeat.
+    Run(
+        tokio::sync::watch::Sender<Option<CardActionResult>>,
+        tokio::sync::watch::Receiver<Option<CardActionResult>>,
+    ),
     /// The same request is running: wait for its answer.
     Wait(tokio::sync::watch::Receiver<Option<CardActionResult>>),
-    /// Answered already (or refused as a reused id).
+    /// Answered already, or refused: a reused id, or no room to admit it.
     Answered(CardActionResult),
 }
 
@@ -1711,7 +1733,8 @@ struct StoreInner {
 
 impl StoreInner {
     /// Forget the answers older than [`REQUEST_ID_MEMORY`], and the running
-    /// claims whose invocation went away without answering.
+    /// claims whose supervisor went away without answering (which happens
+    /// only when the runtime is shutting down).
     fn forget_expired(&mut self, now: Instant) {
         self.requests.retain(|_, r| match r {
             Remembered::Done { at, .. } => now.duration_since(*at) < REQUEST_ID_MEMORY,
@@ -1721,15 +1744,18 @@ impl StoreInner {
         });
     }
 
-    /// Drop the oldest answers until the remembered ids fit their count and
-    /// byte bounds. A running claim is never dropped.
-    fn make_room(&mut self, incoming: usize) {
+    /// Drop the oldest answers until one more id of `incoming` bytes fits
+    /// the count and byte bounds, and say whether it does. A running claim
+    /// is never dropped: forgetting it would let a repeat run its effect
+    /// again (review R2, audit A2), so when only running claims are left
+    /// and there is still no room, the answer is `false`.
+    fn make_room(&mut self, incoming: usize) -> bool {
         loop {
             let bytes: usize = self.requests.iter().map(|(k, r)| k.len() + r.bytes()).sum();
             if self.requests.len() < MAX_REMEMBERED_REQUESTS
                 && bytes + incoming <= MAX_REMEMBERED_BYTES
             {
-                return;
+                return true;
             }
             let oldest = self
                 .requests
@@ -1741,7 +1767,7 @@ impl StoreInner {
                 Some(key) => {
                     self.requests.remove(&key);
                 }
-                None => return,
+                None => return false,
             }
         }
     }
@@ -1980,8 +2006,11 @@ impl CardStore {
 
     /// Claim `request_id` for one invocation, atomically: the first claim
     /// runs it, a repeat of the same request waits for or reuses its answer,
-    /// and a repeat naming different arguments is refused.
-    fn claim(&self, request_id: &str, fingerprint: [u8; 32]) -> Claim {
+    /// and a repeat naming different arguments is refused. A new id is
+    /// admitted only when the remembered ids have room for its `payload`
+    /// (the request's own text) and its answer; otherwise it is refused
+    /// [`CODE_BUSY`] and nothing about it is kept (review R2, audit A2).
+    fn claim(&self, request_id: &str, fingerprint: [u8; 32], payload: usize) -> Claim {
         let mut inner = self.lock();
         let now = Instant::now();
         inner.forget_expired(now);
@@ -2005,20 +2034,31 @@ impl CardStore {
             }
             None => {}
         }
-        inner.make_room(request_id.len());
+        let reserved = payload + RESULT_RESERVE_BYTES;
+        if !inner.make_room(request_id.len() + reserved) {
+            return Claim::Answered(CardActionResult::refused(
+                request_id,
+                CODE_BUSY,
+                "the deck is already running as many card actions as it can; nothing was done, try again in a moment",
+            ));
+        }
         let (tx, rx) = tokio::sync::watch::channel(None);
         inner.requests.insert(
             request_id.to_string(),
             Remembered::InFlight {
                 fingerprint,
                 at: now,
-                answer: rx,
+                answer: rx.clone(),
+                reserved,
             },
         );
-        Claim::Run(tx)
+        Claim::Run(tx, rx)
     }
 
-    /// Remember the answer of the invocation that claimed `request_id`.
+    /// Remember the answer of the invocation that claimed `request_id`, in
+    /// the room its claim reserved. An answer larger than that reservation
+    /// that still does not fit once older answers are dropped is not
+    /// remembered, rather than exceed the bounds; its waiters get it anyway.
     fn finish(&self, request_id: &str, fingerprint: [u8; 32], result: &CardActionResult) {
         let mut inner = self.lock();
         let done = Remembered::Done {
@@ -2028,8 +2068,15 @@ impl CardStore {
         };
         let incoming = request_id.len() + done.bytes();
         inner.requests.remove(request_id);
-        inner.make_room(incoming);
-        inner.requests.insert(request_id.to_string(), done);
+        if inner.make_room(incoming) {
+            inner.requests.insert(request_id.to_string(), done);
+        } else {
+            tracing::warn!(
+                target: "agent_cards",
+                request_id,
+                "a card action's answer did not fit the remembered requests; not remembered"
+            );
+        }
     }
 }
 
@@ -2162,6 +2209,10 @@ pub async fn refresh(
     refresh_in_turn(registry, state).await
 }
 
+/// The pause point between a refresh's reading of the deck and its commit
+/// ([`AgentPtyRegistry::pause_point`], a no-op outside tests).
+const GATHERED_PAUSE: &str = "agent-cards-gathered";
+
 /// [`refresh`] by a caller that already holds the store's turn.
 async fn refresh_in_turn(
     registry: &Arc<AgentPtyRegistry>,
@@ -2175,6 +2226,8 @@ async fn refresh_in_turn(
         attempt += 1;
         let read_at = store.lock().epoch;
         let (agents, units) = gather(registry, state).await;
+        // Between this reading and its commit (review R4's interleaving test).
+        registry.pause_point(GATHERED_PAUSE).await;
         let states = delivery_states(registry);
         let committed = store.lock().commit(
             &agents,
@@ -2385,6 +2438,17 @@ fn request_fingerprint(request: &CardActionRequest) -> [u8; 32] {
     Sha256::digest(&bytes).into()
 }
 
+/// The bytes a request's own text takes while it runs: what its claim
+/// reserves besides the room for its answer (review R2, audit A2).
+fn request_payload_bytes(request: &CardActionRequest) -> usize {
+    request.pane_id.len()
+        + request.agent_id.len()
+        + request.action_id.len()
+        + request.action_token.len()
+        + request.instance_id.len()
+        + request.text.as_ref().map_or(0, String::len)
+}
+
 /// Invoke one action of one entry. `close` performs the deck's stop of an
 /// agent id (`keep_worktree` for `close-keep-worktree`); the attach handler
 /// passes its own stop so a card close is the same close the desktop row's
@@ -2392,10 +2456,15 @@ fn request_fingerprint(request: &CardActionRequest) -> [u8; 32] {
 ///
 /// The `request_id` is claimed atomically before anything runs: a repeat of
 /// the same request while the first is still running waits for its answer,
-/// one after it gets that answer for [`REQUEST_ID_MEMORY`], and neither does
-/// anything again (review B5, audit F6). The invocation runs on its own task,
-/// so a client that hangs up neither cancels an effect already under way nor
-/// leaves the id claimed with no answer.
+/// one after it gets that answer while it is remembered (up to
+/// [`REQUEST_ID_MEMORY`], sooner when newer answers need the room), and
+/// neither does anything again (review B5, audit F6). A new id is admitted
+/// only while the remembered requests have room for it; otherwise it is
+/// refused [`CODE_BUSY`] (review R2, audit A2). The invocation, and
+/// everything that completes it — remembering its answer and handing it to
+/// every caller waiting on the id — run on tasks of their own, so a caller
+/// that is cancelled or panics changes nothing about the outcome (review R1,
+/// audit A4).
 pub async fn invoke<F, Fut>(
     registry: &Arc<AgentPtyRegistry>,
     state: &crate::state::SharedState,
@@ -2410,39 +2479,124 @@ where
         return *refusal;
     }
     let fingerprint = request_fingerprint(&request);
+    let payload = request_payload_bytes(&request);
     let rid = request.request_id.clone();
-    let registry = Arc::clone(registry);
     let state = state.clone();
-    run_once(registry.agent_cards(), &rid, fingerprint, {
-        let registry = Arc::clone(&registry);
-        async move { invoke_once(&registry, &state, &request, close).await }
-    })
+    let work = {
+        let registry = Arc::clone(registry);
+        async move {
+            #[cfg(feature = "e2e")]
+            e2e_seams::pause(&request.request_id).await;
+            invoke_once(&registry, &state, &request, close).await
+        }
+    };
+    run_once(
+        Arc::clone(registry),
+        AgentPtyRegistry::agent_cards,
+        &rid,
+        fingerprint,
+        payload,
+        work,
+    )
     .await
 }
 
 /// Run `work` for `request_id` unless a request with that id ran or is
-/// running: the claim, the detached run and the answer every repeat gets.
-async fn run_once<W>(
-    store: &CardStore,
+/// running, and answer what it answered.
+///
+/// The claim is taken here; when it is this call's to run, `work` runs on its
+/// own task, and a supervisor task — which owns `holder`, the store it
+/// reaches through `store_of`, and the claim's sender — waits for it, turns a
+/// panic into [`interrupted`], remembers the answer and hands it to every
+/// waiter. This call, like every repeat, only waits on a receiver, so
+/// cancelling it (or it panicking) neither loses the answer nor leaves the id
+/// claimed (review R1, audit A4).
+async fn run_once<H, W>(
+    holder: Arc<H>,
+    store_of: fn(&H) -> &CardStore,
     request_id: &str,
     fingerprint: [u8; 32],
+    payload: usize,
     work: W,
 ) -> CardActionResult
 where
+    H: Send + Sync + 'static,
     W: std::future::Future<Output = CardActionResult> + Send + 'static,
 {
-    match store.claim(request_id, fingerprint) {
-        Claim::Answered(result) => result,
-        Claim::Wait(mut answer) => match answer.wait_for(Option::is_some).await {
-            Ok(result) => result.clone().unwrap_or_else(|| interrupted(request_id)),
-            Err(_) => interrupted(request_id),
-        },
-        Claim::Run(tx) => {
-            let task = tokio::spawn(work);
-            let result = task.await.unwrap_or_else(|_| interrupted(request_id));
-            store.finish(request_id, fingerprint, &result);
-            let _ = tx.send(Some(result.clone()));
-            result
+    let mut answer = match store_of(&holder).claim(request_id, fingerprint, payload) {
+        Claim::Answered(result) => return result,
+        Claim::Wait(answer) => {
+            #[cfg(feature = "e2e")]
+            e2e_seams::joined(request_id);
+            answer
+        }
+        Claim::Run(tx, answer) => {
+            let rid = request_id.to_string();
+            let running = tokio::spawn(work);
+            tokio::spawn(async move {
+                let result = running.await.unwrap_or_else(|_| interrupted(&rid));
+                store_of(&holder).finish(&rid, fingerprint, &result);
+                let _ = tx.send(Some(result));
+            });
+            answer
+        }
+    };
+    match answer.wait_for(Option::is_some).await {
+        Ok(result) => result.clone().unwrap_or_else(|| interrupted(request_id)),
+        Err(_) => interrupted(request_id),
+    }
+}
+
+/// PRD #2374 review R4: the lane-1 pause point of a card action, for a real
+/// daemon a test drives through the attach socket (`agent-report/actions/005`).
+/// The directory `DOT_AGENT_DECK_TEST_CARD_ACTION_PAUSE_DIR` names, one
+/// component under HOME as the work-done seams' is, holds markers:
+/// `<request_id>.armed` makes the invocation that claimed that id write
+/// `<request_id>.started` before it does anything and wait for
+/// `<request_id>.release`; every repeat that found the id running appends a
+/// line to `<request_id>.joined`. Built only with the `e2e` feature.
+#[cfg(feature = "e2e")]
+mod e2e_seams {
+    use std::time::Duration;
+
+    const VAR: &str = "DOT_AGENT_DECK_TEST_CARD_ACTION_PAUSE_DIR";
+    /// How long a pause waits for its release before it writes
+    /// `<request_id>.timed-out` and goes on.
+    const RELEASE_WAIT: Duration = Duration::from_secs(30);
+
+    fn root() -> Option<std::path::PathBuf> {
+        crate::doorbell::test_control_dir(VAR)
+    }
+
+    pub(super) async fn pause(request_id: &str) {
+        let Some(root) = root() else {
+            return;
+        };
+        if std::fs::remove_file(root.join(format!("{request_id}.armed"))).is_err() {
+            return;
+        }
+        let _ = std::fs::write(root.join(format!("{request_id}.started")), b"");
+        let deadline = tokio::time::Instant::now() + RELEASE_WAIT;
+        while !root.join(format!("{request_id}.release")).exists() {
+            if tokio::time::Instant::now() >= deadline {
+                let _ = std::fs::write(root.join(format!("{request_id}.timed-out")), b"");
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    pub(super) fn joined(request_id: &str) {
+        use std::io::Write as _;
+        let Some(root) = root() else {
+            return;
+        };
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(root.join(format!("{request_id}.joined")))
+        {
+            let _ = file.write_all(b"joined\n");
         }
     }
 }
@@ -2604,10 +2758,19 @@ where
                 }
             };
             let subject = format!("card action: {}", action.label);
+            // Text the agent wrote is delivered as its own suggestion the
+            // user chose, never as the user's or the deck's words (audit A1).
+            let reason = if !action.text_input && action.prompt_source.as_deref() != Some("catalog")
+            {
+                CARD_SUGGESTION_POST_REASON
+            } else {
+                CARD_ACTION_POST_REASON
+            };
             match post_card_message(
                 registry,
                 &request.pane_id,
                 &request.agent_id,
+                reason,
                 subject,
                 body.clone(),
             ) {
@@ -2655,6 +2818,7 @@ fn post_card_message(
     registry: &Arc<AgentPtyRegistry>,
     pane_id: &str,
     agent_id: &str,
+    reason: &str,
     subject: String,
     body: String,
 ) -> Result<String, String> {
@@ -2668,7 +2832,7 @@ fn post_card_message(
     };
     let mut content = crate::inbox::Content {
         from: crate::inbox::Sender::Deck {
-            reason: CARD_ACTION_POST_REASON.to_string(),
+            reason: reason.to_string(),
         },
         subject,
         body,
@@ -2890,10 +3054,11 @@ mod tests {
             e.action("question/base/main").unwrap().prompt.as_deref(),
             Some("Answer to your question \"Which?\": main")
         );
-        // Who wrote each prompt's text: the deck composed the answer, the
-        // catalog holds `merge`, the agent wrote `zap`; `reply` has none.
+        // Who wrote each prompt's text: the deck's answer quotes the agent's
+        // question and label, so it is the agent's (audit A1); the catalog
+        // holds `merge`, the agent wrote `zap`; `reply` has none.
         let written_by = |id: &str| e.action(id).unwrap().prompt_source.clone();
-        assert_eq!(written_by("question/base/main").as_deref(), Some("deck"));
+        assert_eq!(written_by("question/base/main").as_deref(), Some("agent"));
         assert_eq!(e.action("question/base/main").unwrap().source, "agent");
         assert_eq!(written_by("merge").as_deref(), Some("catalog"));
         assert_eq!(written_by("zap").as_deref(), Some("agent"));
@@ -3279,66 +3444,384 @@ mod tests {
         assert!(!inner.slots.contains_key("p2/2"));
     }
 
-    /// Review B5 / audit F6: two overlapping invocations with one request id
-    /// run the work once and get the same answer; a later repeat gets it from
-    /// memory; the id reused for a different request is refused.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    /// The store a test's `run_once` reaches: the holder itself.
+    fn itself(store: &CardStore) -> &CardStore {
+        store
+    }
+
+    /// Poll `fut` once: its output if that finished it, else pending.
+    async fn poll_once<F: std::future::Future + Unpin>(fut: &mut F) -> std::task::Poll<F::Output> {
+        std::future::poll_fn(|cx| std::task::Poll::Ready(std::pin::Pin::new(&mut *fut).poll(cx)))
+            .await
+    }
+
+    /// Poll `fut` once, and say whether it is still pending. Only for a
+    /// future the caller then awaits only when it was.
+    async fn pending_after_one_poll<F: std::future::Future + Unpin>(fut: &mut F) -> bool {
+        poll_once(fut).await.is_pending()
+    }
+
+    fn sent(request_id: &str, message_id: &str) -> CardActionResult {
+        CardActionResult {
+            request_id: request_id.into(),
+            outcome: "sent".into(),
+            message_id: Some(message_id.into()),
+            kept_worktree: None,
+            code: None,
+            message: None,
+            entry_revision: Some(1),
+        }
+    }
+
+    /// Work that says when it started and finishes when released, counting
+    /// its runs.
+    fn held_work(
+        runs: &Arc<std::sync::atomic::AtomicUsize>,
+        request_id: &'static str,
+        message_id: &'static str,
+    ) -> (
+        impl std::future::Future<Output = CardActionResult> + Send + 'static,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (started_tx, started) = tokio::sync::oneshot::channel::<()>();
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let runs = Arc::clone(runs);
+        let work = async move {
+            runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = started_tx.send(());
+            let _ = released.await;
+            sent(request_id, message_id)
+        };
+        (work, started, release)
+    }
+
+    /// Review B5 / audit F6, made causal by review R4: a repeat that is shown
+    /// to be WAITING on the running claim (polled to pending while the first
+    /// invocation's work is held, with no sleep) gets the first answer, and
+    /// the work ran once; a later repeat gets it from memory; the id reused
+    /// for a different request is refused.
+    #[tokio::test]
     async fn one_request_id_runs_once_however_its_repeats_overlap() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let store = Arc::new(CardStore::default());
         let runs = Arc::new(AtomicUsize::new(0));
-        let (release, released) = tokio::sync::oneshot::channel::<()>();
-        let work = {
-            let runs = Arc::clone(&runs);
-            async move {
-                runs.fetch_add(1, Ordering::SeqCst);
-                let _ = released.await;
-                CardActionResult {
-                    request_id: "card-1".into(),
-                    outcome: "sent".into(),
-                    message_id: Some("m-only".into()),
-                    kept_worktree: None,
-                    code: None,
-                    message: None,
-                    entry_revision: Some(1),
-                }
-            }
-        };
-        let first = tokio::spawn({
-            let store = Arc::clone(&store);
-            async move { run_once(&store, "card-1", [1; 32], work).await }
-        });
-        while runs.load(Ordering::SeqCst) == 0 {
-            tokio::task::yield_now().await;
-        }
-        // The repeat arrives while the first is still running.
-        let second = tokio::spawn({
-            let store = Arc::clone(&store);
-            let runs = Arc::clone(&runs);
-            async move {
-                run_once(&store, "card-1", [1; 32], async move {
+        let (work, started, release) = held_work(&runs, "card-1", "m-only");
+        let mut first = Box::pin(run_once(
+            Arc::clone(&store),
+            itself,
+            "card-1",
+            [1; 32],
+            0,
+            work,
+        ));
+        assert!(pending_after_one_poll(&mut first).await);
+        started.await.expect("the first invocation's work started");
+        // The repeat claims while the first is running: it waits.
+        let mut second = Box::pin(run_once(
+            Arc::clone(&store),
+            itself,
+            "card-1",
+            [1; 32],
+            0,
+            {
+                let runs = Arc::clone(&runs);
+                async move {
                     runs.fetch_add(1, Ordering::SeqCst);
                     CardActionResult::refused("card-1", "x", "a second run")
-                })
-                .await
-            }
-        });
-        tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            },
+        ));
+        assert!(
+            pending_after_one_poll(&mut second).await,
+            "the repeat waits on the running claim"
+        );
+        assert!(matches!(
+            store.lock().requests.get("card-1"),
+            Some(Remembered::InFlight { .. })
+        ));
         release.send(()).unwrap();
-        let (a, b) = (first.await.unwrap(), second.await.unwrap());
+        let (a, b) = (first.await, second.await);
         assert_eq!(a, b);
         assert_eq!(a.message_id.as_deref(), Some("m-only"));
         assert_eq!(runs.load(Ordering::SeqCst), 1, "the work ran once");
-        let third = run_once(&store, "card-1", [1; 32], async {
+        let third = run_once(Arc::clone(&store), itself, "card-1", [1; 32], 0, async {
             CardActionResult::refused("card-1", "x", "a third run")
         })
         .await;
         assert_eq!(third, a);
-        let reused = run_once(&store, "card-1", [2; 32], async {
+        let reused = run_once(Arc::clone(&store), itself, "card-1", [2; 32], 0, async {
             CardActionResult::refused("card-1", "x", "never")
         })
         .await;
         assert_eq!(reused.code.as_deref(), Some(CODE_REQUEST_REUSED));
+    }
+
+    /// Review R1 / audit A4: the caller that claimed a request id is
+    /// cancelled after its work started. The work still completes, its
+    /// answer is remembered, and a retry of the same id gets that answer —
+    /// the same message id — without the work running again.
+    #[tokio::test]
+    async fn a_cancelled_caller_still_settles_its_request() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let store = Arc::new(CardStore::default());
+        let runs = Arc::new(AtomicUsize::new(0));
+        let (work, started, release) = held_work(&runs, "card-cancel", "m-survives");
+        let caller = tokio::spawn({
+            let store = Arc::clone(&store);
+            async move { run_once(store, itself, "card-cancel", [3; 32], 0, work).await }
+        });
+        started.await.expect("the work started");
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        release.send(()).unwrap();
+        let retry = run_once(Arc::clone(&store), itself, "card-cancel", [3; 32], 0, {
+            let runs = Arc::clone(&runs);
+            async move {
+                runs.fetch_add(1, Ordering::SeqCst);
+                CardActionResult::refused("card-cancel", "x", "ran again")
+            }
+        })
+        .await;
+        assert_eq!(retry.outcome, "sent", "{retry:?}");
+        assert_eq!(retry.message_id.as_deref(), Some("m-survives"));
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "the work ran once");
+        assert!(matches!(
+            store.lock().requests.get("card-cancel"),
+            Some(Remembered::Done { .. })
+        ));
+    }
+
+    /// Review R1: work that panics is answered as interrupted to its caller
+    /// and to a waiting repeat, the answer is remembered, and a later retry
+    /// gets the same answer without running anything.
+    #[tokio::test]
+    async fn a_panicking_invocation_is_answered_and_settled() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let store = Arc::new(CardStore::default());
+        let runs = Arc::new(AtomicUsize::new(0));
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let mut first = Box::pin(run_once(
+            Arc::clone(&store),
+            itself,
+            "card-panic",
+            [4; 32],
+            0,
+            async move {
+                let _ = released.await;
+                panic!("a card action's work panicked (expected by this test)");
+            },
+        ));
+        assert!(pending_after_one_poll(&mut first).await);
+        let mut repeat = Box::pin(run_once(
+            Arc::clone(&store),
+            itself,
+            "card-panic",
+            [4; 32],
+            0,
+            async { CardActionResult::refused("card-panic", "x", "never") },
+        ));
+        assert!(pending_after_one_poll(&mut repeat).await);
+        release.send(()).unwrap();
+        let (a, b) = (first.await, repeat.await);
+        assert_eq!(a, interrupted("card-panic"));
+        assert_eq!(b, a);
+        let later = run_once(Arc::clone(&store), itself, "card-panic", [4; 32], 0, {
+            let runs = Arc::clone(&runs);
+            async move {
+                runs.fetch_add(1, Ordering::SeqCst);
+                CardActionResult::refused("card-panic", "x", "ran again")
+            }
+        })
+        .await;
+        assert_eq!(later, a);
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+    }
+
+    /// Review R2 / audit A2: with as many requests running as the store
+    /// admits, a new id is refused `busy` and nothing about it is kept, the
+    /// bounds hold, and a repeat of an admitted id still waits for and gets
+    /// that request's own answer. Then the same holds for the byte bound,
+    /// with requests carrying the most text a reply may.
+    #[tokio::test]
+    async fn running_requests_never_exceed_the_bounds() {
+        let store = Arc::new(CardStore::default());
+        let (release, released) = tokio::sync::watch::channel(false);
+        let held = |rid: String| {
+            let mut released = released.clone();
+            async move {
+                let _ = released.wait_for(|go| *go).await;
+                sent(&rid, &format!("m-{rid}"))
+            }
+        };
+        let within_bounds = |store: &CardStore| {
+            let inner = store.lock();
+            let bytes: usize = inner
+                .requests
+                .iter()
+                .map(|(k, r)| k.len() + r.bytes())
+                .sum();
+            inner.requests.len() <= MAX_REMEMBERED_REQUESTS && bytes <= MAX_REMEMBERED_BYTES
+        };
+
+        // The count bound.
+        let rids: Vec<String> = (0..MAX_REMEMBERED_REQUESTS)
+            .map(|n| format!("c{n}"))
+            .collect();
+        let mut running = Vec::new();
+        for rid in &rids {
+            let mut call = Box::pin(run_once(
+                Arc::clone(&store),
+                itself,
+                rid,
+                [5; 32],
+                0,
+                held(rid.clone()),
+            ));
+            assert!(pending_after_one_poll(&mut call).await, "{rid} admitted");
+            running.push(call);
+        }
+        assert!(within_bounds(&store));
+        let refused = run_once(Arc::clone(&store), itself, "c-extra", [5; 32], 0, async {
+            CardActionResult::refused("c-extra", "x", "never")
+        })
+        .await;
+        assert_eq!(refused.code.as_deref(), Some(CODE_BUSY), "{refused:?}");
+        assert_eq!(refused.request_id, "c-extra");
+        assert!(!store.lock().requests.contains_key("c-extra"));
+        assert_eq!(store.lock().requests.len(), MAX_REMEMBERED_REQUESTS);
+        // A repeat of an admitted id waits for that request's answer.
+        let mut repeat = Box::pin(run_once(
+            Arc::clone(&store),
+            itself,
+            "c7",
+            [5; 32],
+            0,
+            async { CardActionResult::refused("c7", "x", "never") },
+        ));
+        assert!(pending_after_one_poll(&mut repeat).await);
+        release.send(true).unwrap();
+        assert_eq!(repeat.await.message_id.as_deref(), Some("m-c7"));
+        for call in running {
+            assert_eq!(call.await.outcome, "sent");
+        }
+        assert!(within_bounds(&store));
+        // Answered, the old ids make room for new ones again.
+        let fresh = run_once(Arc::clone(&store), itself, "c-after", [5; 32], 0, async {
+            sent("c-after", "m-after")
+        })
+        .await;
+        assert_eq!(fresh.outcome, "sent");
+        assert!(within_bounds(&store));
+
+        // The byte bound: requests each holding a full reply's text.
+        let store = Arc::new(CardStore::default());
+        let (release, released) = tokio::sync::watch::channel(false);
+        let payload = MAX_REPLY_TEXT_BYTES + 5 * MAX_REQUEST_FIELD_BYTES;
+        let held = |rid: String| {
+            let mut released = released.clone();
+            async move {
+                let _ = released.wait_for(|go| *go).await;
+                sent(&rid, "m-b")
+            }
+        };
+        let fits = MAX_REMEMBERED_BYTES / (payload + RESULT_RESERVE_BYTES + 8);
+        let rids: Vec<String> = (0..fits).map(|n| format!("b{n}")).collect();
+        let extras: Vec<String> = (0..4).map(|n| format!("b-extra-{n}")).collect();
+        let mut running = Vec::new();
+        for rid in &rids {
+            let mut call = Box::pin(run_once(
+                Arc::clone(&store),
+                itself,
+                rid,
+                [6; 32],
+                payload,
+                held(rid.clone()),
+            ));
+            assert!(pending_after_one_poll(&mut call).await, "{rid} admitted");
+            running.push(call);
+        }
+        let mut extra = 0;
+        loop {
+            let rid = &extras[extra];
+            let mut call = Box::pin(run_once(
+                Arc::clone(&store),
+                itself,
+                rid,
+                [6; 32],
+                payload,
+                held(rid.clone()),
+            ));
+            match poll_once(&mut call).await {
+                std::task::Poll::Pending => {
+                    running.push(call);
+                    extra += 1;
+                    assert!(extra < 4, "admission stops at the byte bound");
+                }
+                std::task::Poll::Ready(refused) => {
+                    assert_eq!(refused.code.as_deref(), Some(CODE_BUSY), "{refused:?}");
+                    break;
+                }
+            }
+        }
+        assert!(within_bounds(&store));
+        assert!(store.lock().requests.len() < MAX_REMEMBERED_REQUESTS);
+        release.send(true).unwrap();
+        for call in running {
+            assert_eq!(call.await.outcome, "sent");
+        }
+        assert!(within_bounds(&store));
+    }
+
+    /// Review B4, through the public paths (review R4): a refresh is paused
+    /// right after it read the deck — before the new generation existed — and
+    /// a publish by that generation is shown to WAIT for the refresh's turn
+    /// (polled to pending), so it cannot land between the reading and its
+    /// commit. Released, the refresh commits its reading, the publish goes in
+    /// after it, and the new generation's report is on its card.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_publish_waits_for_a_refresh_that_read_the_deck_before_it() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let state: crate::state::SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let (reached, resume) = registry.pause_at_for_test(GATHERED_PAUSE);
+        let refreshing = tokio::spawn({
+            let registry = Arc::clone(&registry);
+            let state = state.clone();
+            async move { refresh(&registry, &state).await }
+        });
+        reached.await.expect("the refresh read the deck");
+        // The new generation spawns and publishes after that reading.
+        let agent = registry.insert_idle_member_for_test("p-new", "team-1", true);
+        let mut publishing = Box::pin(publish(
+            &registry,
+            &state,
+            "p-new",
+            &agent,
+            report(r#"{"summary": "published after the reading"}"#),
+        ));
+        assert!(
+            pending_after_one_poll(&mut publishing).await,
+            "the publish waits for the refresh's turn"
+        );
+        resume.send(()).unwrap();
+        let stale = refreshing.await.unwrap();
+        assert!(
+            stale.entries.iter().all(|e| e.pane_id != "p-new"),
+            "the paused refresh committed the reading it took"
+        );
+        let reply = publishing.await;
+        assert!(reply.accepted, "{reply:?}");
+        let list = refresh(&registry, &state).await;
+        let entry = list
+            .entries
+            .iter()
+            .find(|e| e.key == entry_key("p-new", &agent))
+            .expect("the new generation's card");
+        assert_eq!(
+            entry.report.as_ref().and_then(|r| r.summary.as_deref()),
+            Some("published after the reading")
+        );
     }
 
     /// Audit F4: a request with an oversized or odd request id, or an

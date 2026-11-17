@@ -35,7 +35,7 @@ In the Table view, a row whose card needs you shows a bell next to the agent's n
 
 Click a card's name, or **Show card** in a row's menu, to open the card overlay. It shows everything on the card: the deck's status and pull request, the agent's report and every field, each question with its answers as buttons, and every action with the exact text it sends to the agent, why it is disabled when it is, and what happened to the last time you pressed it. **Sent from this card** lists the last actions you sent the agent, each with the exact text and whether it was delivered, and keeps them after the agent's card stops offering those actions.
 
-The text an action sends is shown exactly as it is sent. Characters you could not otherwise see, such as a tab or a character that changes the direction of the text around it, are shown as a marked code like `\t` or `\u{202E}`, and nothing is left out.
+The text an action sends is shown exactly as it is sent. Characters you could not otherwise see, such as a tab, a character that changes the direction of the text around it, or one that joins or alters the characters next to it, are shown as a boxed code between `⟦` and `⟧`, like `⟦tab⟧` or `⟦U+202E⟧`, with a note under the text saying what the codes mean; hover a code to see what it stands for. Nothing is left out. A `⟦` the agent typed is itself shown as the code `⟦U+27E6⟧`, so ordinary text can never pass for one of these codes, and text such as `\t` that the agent typed is shown as the plain characters it is.
 
 - **[** and **]**, or the arrow buttons, move to the previous and next card without closing the overlay. **n**, or **Next needing you**, jumps to the next card that needs you. **Escape** or the **×** closes it.
 - The overlay updates while it is open: when the agent publishes a new report or a message is delivered, you see it straight away. If the agent is closed while you look at its card, the overlay says "This agent was closed." and you can move on to the next card.
@@ -45,7 +45,7 @@ The text an action sends is shown exactly as it is sent. Characters you could no
 - **Open** opens the agent's terminal pane. **Close** closes the agent, and **Close, keep worktree** closes a dispatched agent but keeps its copy of the repository, when it has one.
 - Actions that send the agent a message are disabled while the agent is not running, and the overlay says so.
 
-An action is always sent to the agent whose card it is on, and only to that agent, with the text the card showed you. If the agent was replaced (its pane restarted) after you opened its card, or the deck's daemon was restarted, the action is refused rather than sent to whichever agent has its place now.
+An action is always sent to the agent whose card it is on, and only to that agent, with the text the card showed you. The agent is told that you pressed it on its card; when the text is, or quotes, what the agent itself wrote on the card (an action or answer it worded, or an answer that repeats its question), the agent is told that too, so it does not take its own words for yours. If the agent was replaced (its pane restarted) after you opened its card, or the deck's daemon was restarted, the action is refused rather than sent to whichever agent has its place now.
 
 ## By voice
 
@@ -62,7 +62,7 @@ With voice control on and the cards shown, you can say:
 | "press go ahead on the coder's card", "answer main to the coder" | Presses that action or answer, named by the label on its button. |
 | "reply to the coder use the main branch" | Sends your words to that agent as a reply. |
 
-Voice sends an action straight away only when you could know its text without looking: an action from your catalog, or an answer to a question when the agent gave that answer no text of its own, which sends `Answer to your question "<question>": <answer>`. Anything whose text the agent wrote, such as an action the agent suggested that is not in your catalog or an answer the agent gave its own text, opens the card at a step showing exactly what would be sent, and the voice row says so; press **Send** to send it. An action that asks you to confirm, and closing an agent, are never done by voice alone either: the card opens at its confirm step and you press the button yourself.
+Voice sends an action straight away only when its text comes from your catalog. Anything with text the agent wrote opens the card at a step showing exactly what would be sent, and the voice row says so; press **Send** to send it. That includes an action the agent suggested that is not in your catalog and every answer to one of its questions: an answer the agent gave no text of its own sends `Answer to your question "<question>": <answer>`, which repeats the agent's question and answer words. An action that asks you to confirm, and closing an agent, are never done by voice alone either: the card opens at its confirm step and you press the button yourself.
 
 ## Which agents publish a card
 
@@ -104,7 +104,7 @@ always = false                     # optional: true offers it on every card, sug
 - An entry with a mistake (an unknown type, a missing description, a bad name) is skipped and the rest still apply. `dot-agent-deck card catalog` prints a warning for each one.
 - The actions **Reply**, **Open**, **Close** and **Close, keep worktree** are the deck's own and cannot be removed or changed.
 - A `[catalog]` table in a project's `.dot-agent-deck.toml` is not used yet. Only the user configuration file's applies.
-- Changes apply to cards agents already published. An action you remove from the catalog leaves every card, including those that suggested it. A field whose type you change is hidden on cards that reported a value of the old type until the agent reports it again.
+- Changes apply to cards agents already published. When you remove an action from the catalog, it disappears from the cards that suggested it only by its catalog name; a card whose agent gave that action its own label and text keeps offering it, marked custom. When you change a field's type, a value an agent already reported is hidden if it does not fit the new type, until the agent reports it again; a value that still fits, such as text in a field you changed to long text, stays.
 
 Agents can also report fields and actions that are not in the catalog. You see them marked **custom**; a custom field shows only in the overlay.
 

@@ -775,12 +775,13 @@ export interface AgentCardAction {
   prompt: string | null;
   /**
    * Who wrote the exact text of `prompt`, as the daemon decides it: `catalog`
-   * (a catalog action), `agent` (a custom action's or a question option's own
-   * prompt) or `deck` (the answer text the deck composes for an option);
-   * `null` when there is no prompt. Voice sends only a `catalog` or `deck`
-   * prompt directly; any other value, or none, opens the review step.
+   * (a catalog action) or `agent` (text that is, or quotes, the agent's: a
+   * custom action's or a question option's own prompt, and the answer the
+   * deck composes from the agent's question and option label); `null` when
+   * there is no prompt. Voice sends only a `catalog` prompt directly; any
+   * other value, or none, opens the review step.
    */
-  prompt_source?: "catalog" | "agent" | "deck" | string | null;
+  prompt_source?: "catalog" | "agent" | string | null;
   text_input: boolean;
   confirm: boolean;
   confirm_detail: string | null;

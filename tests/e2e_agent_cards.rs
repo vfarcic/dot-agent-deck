@@ -469,11 +469,13 @@ fn cli_001_publish_then_list_shows_the_card() {
         action(&e, "question/base/rel").unwrap()["prompt"],
         "Use the release branch."
     );
-    // Who wrote each prompt's text: the deck composed `main`'s answer, the
-    // agent wrote `rel`'s own prompt; both options are offered by the agent.
+    // Who wrote each prompt's text: `main`'s answer is the deck's sentence
+    // quoting the agent's question and label, so it is the agent's text
+    // (audit A1), as is `rel`'s own prompt; both options are offered by the
+    // agent.
     assert_eq!(
         action(&e, "question/base/main").unwrap()["prompt_source"],
-        "deck"
+        "agent"
     );
     assert_eq!(
         action(&e, "question/base/rel").unwrap()["prompt_source"],
@@ -1108,6 +1110,15 @@ fn actions_001_prompt_actions_reach_only_their_agent() {
         sent["text"].as_str().unwrap().contains(MERGE_PROMPT),
         "the delivered text is the shown prompt: {sent:#}"
     );
+    // The catalog's text is delivered as an action the user pressed.
+    assert_eq!(sent["from"]["reason"], "card_action", "{sent:#}");
+    assert!(
+        sent["text"]
+            .as_str()
+            .unwrap()
+            .contains("Sent by: the user, by pressing an action on your agent card."),
+        "{sent:#}"
+    );
     assert_eq!(
         inbox_of(&daemon, &orch.id).len(),
         orch_before,
@@ -1164,6 +1175,27 @@ fn actions_001_prompt_actions_reach_only_their_agent() {
     );
     let out = act(&daemon, &k, "question/base/main", &[]);
     assert_eq!(out.status.code(), Some(0), "{}", describe(&out));
+    // The answer quotes the worker's own question: it is delivered as the
+    // worker's own suggestion the user chose, not as the user's words
+    // (audit A1).
+    let answer_id = sent_message_id(&out, "route-coder");
+    let answers = inbox_of(&daemon, &worker.id);
+    let answer = answers
+        .iter()
+        .find(|m| m["id"] == answer_id.as_str())
+        .unwrap_or_else(|| panic!("the answer in the worker's inbox: {answers:#?}"));
+    assert_eq!(answer["from"]["reason"], "card_suggestion", "{answer:#}");
+    let answer_text = answer["text"].as_str().unwrap();
+    assert!(
+        answer_text.contains("Answer to your question \"Which base branch?\": main"),
+        "{answer:#}"
+    );
+    assert!(
+        answer_text.contains(
+            "Sent by: the user, by choosing a suggestion your own agent card offered: the text below is, or quotes, what you wrote on that card, not the user's own words."
+        ),
+        "{answer:#}"
+    );
     let e = wait_entry(&daemon, &k, "answered", |e| {
         !e["questions"][0]["answered"].is_null()
     });
@@ -1456,34 +1488,81 @@ fn actions_004_a_card_from_a_replaced_daemon_acts_on_nothing() {
     );
 }
 
-/// Scenario: Six clients send the same card action with the same request
-/// id at the same moment, as a retry of an in-flight press would. Every one
-/// gets the same answer, and the agent's inbox gains exactly one message.
+/// The directory the daemon's card-action seam reads, under its HOME
+/// (`DOT_AGENT_DECK_TEST_CARD_ACTION_PAUSE_DIR`).
+const CARD_ACTION_SEAMS: &str = "card-action-seams";
+
+/// Wait until `ok` holds, or fail naming `what`.
+fn wait_until(what: &str, mut ok: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !ok() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Scenario: One client sends a card action and the daemon holds that
+/// invocation right after it claimed the request id. Five more clients send
+/// the same request with the same id, and the daemon records that each one
+/// found it running and is waiting; only then is the first released. Every
+/// client gets the same answer, and the agent's inbox gains exactly one
+/// message.
 #[spec("agent-report/actions/005")]
 #[test]
 fn actions_005_overlapping_repeats_of_one_request_post_once() {
-    let (daemon, _cfg) = daemon_with_config("");
+    let dir = common::harness_tempdir().expect("config tempdir");
+    let config = dir.path().join("config.toml");
+    std::fs::write(&config, "").expect("write user config");
+    let config = config.to_string_lossy().into_owned();
+    let daemon = inbox::daemon_unbound(&[
+        ("DOT_AGENT_DECK_CONFIG", config.as_str()),
+        (
+            "DOT_AGENT_DECK_TEST_CARD_ACTION_PAUSE_DIR",
+            CARD_ACTION_SEAMS,
+        ),
+    ]);
+    let seams = daemon.home().join(CARD_ACTION_SEAMS);
+    std::fs::create_dir_all(&seams).expect("seam directory");
+    let marker = |name: &str| seams.join(format!("card-overlap-1.{name}"));
     let pane = route::start(&daemon, "card-race", json!({}));
     let k = key(&pane);
     let (token, instance) = listed_handle(&daemon, &k, "explain");
     let request = json!({"op": "invoke-card-action", "pane_id": pane.id, "agent_id": pane.agent,
         "action_id": "explain", "request_id": "card-overlap-1", "action_token": token,
         "instance_id": instance});
-    let barrier = std::sync::Arc::new(std::sync::Barrier::new(6));
+    std::fs::write(marker("armed"), b"").expect("arm the seam");
+    let joined = || {
+        std::fs::read_to_string(marker("joined"))
+            .map(|t| t.lines().count())
+            .unwrap_or(0)
+    };
     let answers: Vec<Value> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..6)
-            .map(|_| {
-                let barrier = std::sync::Arc::clone(&barrier);
-                let request = request.clone();
-                let daemon = &daemon;
-                scope.spawn(move || {
-                    barrier.wait();
-                    inbox::attach(daemon, request)["card_action"].clone()
-                })
-            })
-            .collect();
+        let send = |request: Value| {
+            let daemon = &daemon;
+            scope.spawn(move || inbox::attach(daemon, request)["card_action"].clone())
+        };
+        let mut handles = vec![send(request.clone())];
+        wait_until("the first invocation to be held after its claim", || {
+            marker("started").exists()
+        });
+        for _ in 0..5 {
+            handles.push(send(request.clone()));
+        }
+        wait_until("five repeats waiting on the running request", || {
+            joined() == 5
+        });
+        assert!(
+            !marker("timed-out").exists(),
+            "the first invocation was still held while the repeats joined"
+        );
+        std::fs::write(marker("release"), b"").expect("release the first invocation");
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
+    assert!(!marker("timed-out").exists(), "released, not timed out");
+    assert_eq!(joined(), 5, "every repeat found the request running");
     assert_eq!(answers[0]["outcome"], "sent", "{answers:#?}");
     for answer in &answers {
         assert_eq!(answer, &answers[0], "every repeat gets the first answer");

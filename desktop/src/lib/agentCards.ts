@@ -255,11 +255,27 @@ export function actionLabel(entry: AgentCardEntry, action: AgentCardAction): str
 /**
  * The start of a prompt, for the card's preview under its primary button:
  * its first `max` characters as shown by {@link exactTextString} (invisible
- * characters escaped, nothing collapsed), with `…` when there is more.
+ * characters as markers, nothing collapsed), with each line break as the
+ * marker `⟦↵⟧`, and `…` when there is more. A marker is kept whole or left
+ * out, never cut.
  */
 export function promptPreview(prompt: string, max = 60): string {
-  const shown = Array.from(exactTextString(prompt).replace(/\n/g, "\u21b5"));
-  return shown.length <= max ? shown.join("") : `${shown.slice(0, max - 1).join("")}…`;
+  const pieces: string[] = [];
+  for (const segment of exactTextSegments(prompt)) {
+    if (segment.escaped) pieces.push(segment.shown);
+    else for (const char of segment.raw) pieces.push(char === "\n" ? `${MARKER_OPEN}\u21b5${MARKER_CLOSE}` : char);
+  }
+  const length = (parts: string[]) => parts.reduce((total, part) => total + Array.from(part).length, 0);
+  if (length(pieces) <= max) return pieces.join("");
+  const kept: string[] = [];
+  let used = 0;
+  for (const piece of pieces) {
+    const size = Array.from(piece).length;
+    if (used + size > max - 1) break;
+    kept.push(piece);
+    used += size;
+  }
+  return `${kept.join("")}…`;
 }
 
 /**
@@ -275,44 +291,66 @@ export function multilineText(value: string): string {
 export interface ExactTextSegment {
   /** The characters sent, exactly. */
   raw: string;
-  /** What is shown for them: the same text, or a visible escape such as `\t` or `\u{202E}`. */
+  /** What is shown for them: the same text, or a marker such as `⟦tab⟧` or `⟦U+202E⟧`. */
   shown: string;
-  /** Whether `shown` is an escape standing for an invisible or reordering character. */
+  /** Whether `shown` is a marker standing for one character that is not shown as itself. */
   escaped: boolean;
 }
 
+/** What opens a marker. Every one in the shown text opens a marker: a literal one in the prompt is itself shown as a marker. */
+export const MARKER_OPEN = "\u27E6";
+/** What closes a marker. */
+export const MARKER_CLOSE = "\u27E7";
+
 /*
- * The characters a prompt preview shows as visible escapes rather than as
+ * The characters a prompt preview shows as markers rather than as
  * themselves: control characters other than the line break (a tab included),
  * format characters (bidi overrides and isolates, zero-width characters, the
- * byte-order mark, the soft hyphen) and the line and paragraph separators.
- * Shown as themselves they are invisible, or reorder or split the text
- * around them, so the preview would not show what is sent (audit F3).
+ * byte-order mark, the soft hyphen), the line and paragraph separators, and
+ * every other default-ignorable code point — variation selectors, the
+ * combining grapheme joiner, Hangul fillers and the like (audit A3). Shown as
+ * themselves they are invisible, or reorder or split the text around them,
+ * so the preview would not show what is sent (audit F3). The marker opener
+ * itself is marked too, so a marker can never be typed as text (review R3).
  */
-const INVISIBLE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
+const MARKED = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Default_Ignorable_Code_Point}\u27E6]/u;
 
-/** The visible escape for one invisible character. */
-function escapeOf(char: string): string {
-  if (char === "\t") return "\\t";
-  if (char === "\r") return "\\r";
-  return `\\u{${(char.codePointAt(0) ?? 0).toString(16).toUpperCase().padStart(4, "0")}}`;
+/** The name inside one character's marker: `tab`, `CR`, or its code point. */
+function markerName(char: string): string {
+  if (char === "\t") return "tab";
+  if (char === "\r") return "CR";
+  return `U+${(char.codePointAt(0) ?? 0).toString(16).toUpperCase().padStart(4, "0")}`;
+}
+
+/** A character's marker: `⟦tab⟧`, `⟦U+202E⟧`. */
+export function markerOf(char: string): string {
+  return `${MARKER_OPEN}${markerName(char)}${MARKER_CLOSE}`;
+}
+
+/** What the hover of a marker says it stands for. */
+export function markerTitle(char: string): string {
+  if (char === MARKER_OPEN) return `The character ${MARKER_OPEN} itself, sent as is`;
+  return `A character you cannot see (${markerName(char)}), sent as is`;
 }
 
 /**
  * A prompt split into what it is and how to show it, so the preview renders
  * EXACTLY the text that is sent: nothing is dropped, merged or normalised,
- * line breaks stay line breaks, and every invisible or reordering character is
- * shown as a visible escape (audit F3). Joining the `raw` parts gives the
+ * line breaks stay line breaks, and every invisible or reordering character
+ * is shown as a marker, `⟦…⟧` (audit F3, A3). The markers cannot be confused
+ * with the prompt's own text: a literal `⟦` is itself shown as a marker, so
+ * every `⟦` on screen opens one, and a typed `\t` or `\u{202E}` stays the
+ * plain characters it is (review R3). Joining the `raw` parts gives the
  * prompt back character for character.
  */
 export function exactTextSegments(value: string): ExactTextSegment[] {
   const segments: ExactTextSegment[] = [];
   let plain = "";
   for (const char of value) {
-    if (char !== "\n" && INVISIBLE.test(char)) {
+    if (char !== "\n" && MARKED.test(char)) {
       if (plain) segments.push({ raw: plain, shown: plain, escaped: false });
       plain = "";
-      segments.push({ raw: char, shown: escapeOf(char), escaped: true });
+      segments.push({ raw: char, shown: markerOf(char), escaped: true });
     } else {
       plain += char;
     }
@@ -321,7 +359,12 @@ export function exactTextSegments(value: string): ExactTextSegment[] {
   return segments;
 }
 
-/** A prompt as one string with its invisible characters escaped, for a hover (`title`), which cannot style them. */
+/** Whether a prompt has any character shown as a marker. */
+export function hasMarkers(value: string): boolean {
+  return exactTextSegments(value).some((segment) => segment.escaped);
+}
+
+/** A prompt as one string with its markers, for a hover (`title`), which cannot style them; as unambiguous as the styled preview. */
 export function exactTextString(value: string): string {
   return exactTextSegments(value).map((segment) => segment.shown).join("");
 }

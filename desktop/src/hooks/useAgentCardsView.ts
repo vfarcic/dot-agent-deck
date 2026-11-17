@@ -21,11 +21,12 @@ export const agentWrittenReview = (label: string, name: string) => `${name} wrot
 
 /**
  * Who may have written a prompt that is sent without the user reading it
- * first: the catalog's text and the answer the deck composes (PRD #2374). The
- * daemon says which (`prompt_source`); anything else, an absent value
- * included, is treated as the agent's.
+ * first: only the catalog, the deck's defaults or the user's own (PRD #2374).
+ * The daemon says which (`prompt_source`); anything else — the agent's text,
+ * the answer the deck composes by quoting the agent's question (audit A1),
+ * an absent value — is shown for review first.
  */
-const SENDABLE_UNREAD: ReadonlySet<string> = new Set(["catalog", "deck"]);
+const SENDABLE_UNREAD: ReadonlySet<string> = new Set(["catalog"]);
 
 /** The card members the overview serves, every one of them. */
 export type AgentCardControls = Pick<VoiceActionContext, "setOverviewMode" | "showAgentCard" | "stepAgentCard" | "setNeedsYouFilter" | "closeAgentCard" | "runCardAction" | "replyToAgentCard" | "confirmCardAction" | "toggleOverviewRowMenu">;

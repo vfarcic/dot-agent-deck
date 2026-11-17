@@ -951,10 +951,11 @@ export function docsAgentCards(): AgentCardsSnapshot {
         { id: "no", label: "No, ship it", action_id: "question/flag/no" },
       ] }],
       // As the daemon projects a question's options: offered by the agent
-      // (`source`), with the answer text the deck composed (`prompt_source`).
+      // (`source`), and the answer the deck composed quotes the agent's
+      // question and label, so its text is the agent's too (`prompt_source`).
       actions: [
-        docsCardAction("question/flag/yes", { label: "Yes, behind a flag", prompt: "Answer to your question \"Ship the change behind a version flag?\": Yes, behind a flag", source: "agent", prompt_source: "deck" }),
-        docsCardAction("question/flag/no", { label: "No, ship it", prompt: "Answer to your question \"Ship the change behind a version flag?\": No, ship it", source: "agent", prompt_source: "deck" }),
+        docsCardAction("question/flag/yes", { label: "Yes, behind a flag", prompt: "Answer to your question \"Ship the change behind a version flag?\": Yes, behind a flag", source: "agent", prompt_source: "agent" }),
+        docsCardAction("question/flag/no", { label: "No, ship it", prompt: "Answer to your question \"Ship the change behind a version flag?\": No, ship it", source: "agent", prompt_source: "agent" }),
         ...docsDeckActions(),
       ],
       primary_action_id: "question/flag/yes",

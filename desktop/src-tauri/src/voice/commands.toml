@@ -2335,11 +2335,12 @@ must_name   = ["orchestration", "run", "every role", "all roles", "all the roles
 # same way, so the words are known but the door stays shut.
 #
 # None of them sends anything the user cannot see first: `run_card_action`
-# sends a card's prompt action directly only when its text is the catalog's or
-# the deck's own composed answer (the daemon's `prompt_source`); text the agent
-# wrote, an action that asks for confirmation — and both closes — only OPEN
-# the card at its review/confirm step, because voice has no confirm step of its
-# own (PRD #802 D5). `reply_to_agent_card` sends the transcript's own words,
+# sends a card's prompt action directly only when its text is the catalog's
+# (the daemon's `prompt_source: "catalog"`); text the agent wrote — the deck's
+# composed answer included, since it quotes the agent's question and label
+# (audit A1) — an action that asks for confirmation, and both closes, only
+# OPEN the card at its review/confirm step, because voice has no confirm step
+# of its own (PRD #802 D5). `reply_to_agent_card` sends the transcript's own words,
 # never the model's.
 [[commands]]
 id          = "set_overview_mode"
@@ -2448,10 +2449,10 @@ description = """Press one of the buttons on an agent's card: an action the agen
 offers (such as "Merge it", "Go ahead", "Explain") or an answer to a question the agent asked on
 its card. Use when the user names both the action and the agent — "send merge it to the coder",
 "press go ahead on the tester's card", "answer main to the coder". Set `agent` to the user's
-words for the agent and `action` to the button's label as the user said it. A catalog action, or
-an answer worded by the deck, is sent to that agent; one whose text the agent wrote, one that asks
-for confirmation, and closing an agent, only open its card at the step where the user reads it and
-presses Send. Stopping an agent is `stop_agent`; writing your own words to it is
+words for the agent and `action` to the button's label as the user said it. A catalog action is
+sent to that agent; an answer to the agent's question, an action whose text the agent wrote, one
+that asks for confirmation, and closing an agent, only open its card at the step where the user
+reads it and presses Send. Stopping an agent is `stop_agent`; writing your own words to it is
 `reply_to_agent_card`."""
 invoke      = "runCardAction"
 screens     = ["overview"]

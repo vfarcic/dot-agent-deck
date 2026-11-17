@@ -12,26 +12,42 @@ function snapshot(instanceId: string, revision: number): AgentCardsSnapshot {
   return { deckId: "deck", instanceId, revision, entries: [], catalogErrors: [] };
 }
 
-describe("exactTextSegments (F3)", () => {
-  it("gives back every character it was given, and escapes only the invisible ones", () => {
-    for (const prompt of ["Use\tmain", "Run tests. Then delete the private branch.", "abc‮def", "a​b﻿c­d\r\ne", "plain\nlines\n", "emoji 👩‍💻 stay"]) {
+describe("exactTextSegments (F3, A3, R3)", () => {
+  it("gives back every character it was given, and marks only the ones not shown as themselves", () => {
+    for (const prompt of ["Use\tmain", "Run tests. Then delete the private branch.", "abc\u202Edef", "a\u200Bb\uFEFFc\u00ADd\r\ne", "plain\nlines\n", "emoji \u{1F469}\u200D\u{1F4BB} stay", "cgj\u034Fvs\uFE0F", "typed \\t and \\u{202E}", "a \u27E6 b \u27E7"]) {
       const segments = exactTextSegments(prompt);
       expect(segments.map((segment) => segment.raw).join("")).toBe(prompt);
       for (const segment of segments) {
-        if (segment.escaped) expect(segment.shown).toMatch(/^\\(t|r|u\{[0-9A-F]{4,}\})$/);
+        if (segment.escaped) expect(segment.shown).toMatch(/^\u27E6(tab|CR|U\+[0-9A-F]{4,})\u27E7$/u);
         else expect(segment.shown).toBe(segment.raw);
       }
     }
-    expect(exactTextString("Use\tmain")).toBe("Use\\tmain");
-    expect(exactTextString("abc‮def")).toBe("abc\\u{202E}def");
-    expect(exactTextString("a b")).toBe("a\\u{2029}b");
+    expect(exactTextString("Use\tmain")).toBe("Use\u27E6tab\u27E7main");
+    expect(exactTextString("abc\u202Edef")).toBe("abc\u27E6U+202E\u27E7def");
+    expect(exactTextString("a\u2029b")).toBe("a\u27E6U+2029\u27E7b");
     // A zero-width joiner inside an emoji is a format character too: shown, not applied.
-    expect(exactTextString("👩‍💻")).toBe("👩\\u{200D}💻");
+    expect(exactTextString("\u{1F469}\u200D\u{1F4BB}")).toBe("\u{1F469}\u27E6U+200D\u27E7\u{1F4BB}");
+    // Default-ignorable characters outside the control and format classes (audit A3).
+    expect(exactTextString("Use\u034Fmain")).toBe("Use\u27E6U+034F\u27E7main");
+    expect(exactTextString("Use\uFE0Fmain")).toBe("Use\u27E6U+FE0F\u27E7main");
   });
 
-  it("the card's short preview escapes the same way and collapses nothing", () => {
-    expect(promptPreview("a  b\tc")).toBe("a  b\\tc");
-    expect(promptPreview("x".repeat(70))).toBe(`${"x".repeat(59)}…`);
+  it("the hover text is unambiguous: a typed escape or marker never reads like a marked character (R3)", () => {
+    expect(exactTextString("Use\tmain")).not.toBe(exactTextString("Use\\tmain"));
+    expect(exactTextString("Use\\tmain")).toBe("Use\\tmain");
+    expect(exactTextString("x\u202Ey")).not.toBe(exactTextString("x\\u{202E}y"));
+    // A typed marker is shown with its opener marked, so it cannot pass for a real tab.
+    expect(exactTextString("Use\u27E6tab\u27E7main")).toBe("Use\u27E6U+27E6\u27E7tab\u27E7main");
+    expect(exactTextString("Use\u27E6tab\u27E7main")).not.toBe(exactTextString("Use\tmain"));
+  });
+
+  it("the card's short preview marks the same way, shows a line break as a marker and collapses nothing", () => {
+    expect(promptPreview("a  b\tc")).toBe("a  b\u27E6tab\u27E7c");
+    expect(promptPreview("one\ntwo")).toBe("one\u27E6\u21B5\u27E7two");
+    expect(promptPreview("one\u21B5two")).toBe("one\u21B5two");
+    expect(promptPreview("x".repeat(70))).toBe(`${"x".repeat(59)}\u2026`);
+    // A marker is kept whole or left out, never cut.
+    expect(promptPreview(`${"x".repeat(57)}\tyz`)).toBe(`${"x".repeat(57)}\u2026`);
   });
 });
 

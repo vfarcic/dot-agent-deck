@@ -1,6 +1,6 @@
 import { BellRing } from "lucide-react";
 
-import { actionLabel, cardStatusLabel, deliverySentence, disabledReasonSentence, exactTextSegments, exactTextString, resultSentence, type CardResults, fieldValueText, needsYouSentence, placedCardKey, primaryAction, promptPreview, type PlacedCard } from "../lib/agentCards";
+import { actionLabel, cardStatusLabel, deliverySentence, disabledReasonSentence, exactTextSegments, exactTextString, hasMarkers, MARKER_CLOSE, MARKER_OPEN, markerTitle, resultSentence, type CardResults, fieldValueText, needsYouSentence, placedCardKey, primaryAction, promptPreview, type PlacedCard } from "../lib/agentCards";
 import { DISPLAY_LIMITS, displayIdentity, displayText, displayTitle, domIdentity } from "../lib/displayText";
 import { VOICE_ACTIONS, type VoiceActionContext } from "../lib/voiceActions";
 
@@ -26,17 +26,26 @@ export function SourceBadge({ source }: { source: "agent" | "deck" }) {
 
 /**
  * The exact text a prompt action sends, as it is sent: line breaks kept, and
- * every invisible or reordering character shown as a marked escape rather
- * than dropped or applied (audit F3). Rendered as text, never as markup.
+ * every invisible or reordering character shown as a marker, `⟦…⟧`, styled
+ * apart from the text (a boxed code) rather than dropped or applied (audit
+ * F3, A3; review R3). Rendered as text, never as markup.
  */
 export function ExactText({ text }: { text: string }) {
   return (
     <>
       {exactTextSegments(text).map((segment, index) => (segment.escaped
-        ? <span key={index} className="exact-text-escape" title="An invisible character, sent as is">{segment.shown}</span>
+        ? <span key={index} className="exact-text-escape" title={markerTitle(segment.raw)}>{segment.shown}</span>
         : <span key={index}>{segment.shown}</span>))}
     </>
   );
+}
+
+/** What the markers in a shown prompt mean, said under it when it has any. */
+export const MARKER_NOTE = `${MARKER_OPEN}…${MARKER_CLOSE} marks a character you cannot see; it is sent as is.`;
+
+/** {@link MARKER_NOTE}, when `text` shows any marker. */
+export function ExactTextNote({ text }: { text: string }) {
+  return hasMarkers(text) ? <small className="exact-text-note" data-testid="exact-text-note">{MARKER_NOTE}</small> : null;
 }
 
 /**

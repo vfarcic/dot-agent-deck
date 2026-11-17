@@ -6,7 +6,7 @@ import { actionLabel, cardStatusLabel, deliverySentence, formatClockTime, result
 import { DISPLAY_LIMITS, displayIdentity, displayText, displayTitle, domIdentity } from "../lib/displayText";
 import { VOICE_ACTIONS, type VoiceActionContext } from "../lib/voiceActions";
 import type { AgentCardAction } from "../types";
-import { cardRef, ExactText, SourceBadge } from "./AgentCard";
+import { cardRef, ExactText, ExactTextNote, SourceBadge } from "./AgentCard";
 
 /** The members the overlay's controls dispatch through. */
 export type CardOverlayControls = Pick<VoiceActionContext, "showAgentCard" | "stepAgentCard" | "closeAgentCard" | "runCardAction" | "replyToAgentCard" | "confirmCardAction">;
@@ -96,7 +96,7 @@ export function AgentCardOverlay({ card, lastName, position, count, step, result
             <h3 id="agent-card-confirm-title">{displayText(actionLabel(entry, confirming), DISPLAY_LIMITS.name)}?</h3>
             {confirming.source === "agent" && <p className="agent-card-hint"><SourceBadge source="agent" /> The agent wrote this action and its text.</p>}
             {confirming.prompt
-              ? <><p>This sends {name} exactly:</p><blockquote className="agent-card-prompt-text" data-testid="agent-card-confirm-prompt"><ExactText text={confirming.prompt} /></blockquote></>
+              ? <><p>This sends {name} exactly:</p><blockquote className="agent-card-prompt-text" data-testid="agent-card-confirm-prompt"><ExactText text={confirming.prompt} /></blockquote><ExactTextNote text={confirming.prompt} /></>
               : <p>{confirming.kind === "close_keep_worktree" ? `This closes ${name} and keeps its worktree.` : confirming.kind === "close" ? `This closes ${name}.` : `This runs ${displayText(confirming.label, DISPLAY_LIMITS.name)} on ${name}.`}</p>}
             {confirming.confirm_detail && <p className="agent-card-confirm-detail">{displayText(confirming.confirm_detail, DISPLAY_LIMITS.detail)}</p>}
             {changed && (
@@ -211,7 +211,7 @@ export function AgentCardOverlay({ card, lastName, position, count, step, result
                   {entry.recent_deliveries!.map((delivery) => (
                     <li key={delivery.message_id} className="agent-card-delivery-record" data-testid="agent-card-delivery-record" data-action={delivery.action_id}>
                       <p><strong>{displayText(delivery.label, DISPLAY_LIMITS.name)}</strong>{" · "}<time dateTime={delivery.at}>{formatClockTime(delivery.at)}</time>{" · "}<span data-testid="agent-card-delivery-state">{displayText(deliverySentence(delivery), DISPLAY_LIMITS.message)}</span></p>
-                      <blockquote className="agent-card-prompt-text"><ExactText text={delivery.text} /></blockquote>
+                      <blockquote className="agent-card-prompt-text"><ExactText text={delivery.text} /></blockquote><ExactTextNote text={delivery.text} />
                     </li>
                   ))}
                 </ol>
@@ -235,7 +235,7 @@ export function AgentCardOverlay({ card, lastName, position, count, step, result
 function ActionDetails({ action, result }: { action: AgentCardAction; result: CardResults[string] | undefined }) {
   return (
     <>
-      {action.prompt && <p className="agent-card-prompt-text" data-testid="agent-card-action-prompt"><ExactText text={action.prompt} /></p>}
+      {action.prompt && <><p className="agent-card-prompt-text" data-testid="agent-card-action-prompt"><ExactText text={action.prompt} /></p><ExactTextNote text={action.prompt} /></>}
       {action.text_input && <p className="agent-card-hint">Sends your own words.</p>}
       {action.kind === "open" && <p className="agent-card-hint">Opens the agent's terminal.</p>}
       {action.confirm && action.enabled && <p className="agent-card-hint">Asks you to confirm first.</p>}
