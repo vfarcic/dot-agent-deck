@@ -17442,7 +17442,14 @@ mod question_answer_tests {
     {
         use crate::agent_pty::PtyWritePause;
         // (case, the question, deny, the replacement, hold the output lock)
-        let cases: [(&str, fn() -> PendingQuestion, bool, Option<&str>, bool); 5] = [
+        type Case = (
+            &'static str,
+            fn() -> PendingQuestion,
+            bool,
+            Option<&'static str>,
+            bool,
+        );
+        let cases: [Case; 5] = [
             (
                 "grant, screen moved",
                 antigravity_command_question,
