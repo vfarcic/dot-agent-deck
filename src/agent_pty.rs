@@ -15493,10 +15493,11 @@ impl AgentPtyRegistry {
         } else {
             None
         };
-        // Issue #1973: a Claude Code, Codex or Devin generation's hooks are
-        // repaired before its child starts when they name no deck (the agent
-        // was set up after this daemon's startup install ran) or a deck copy
-        // that is gone, so the agent reports its status from its first turn.
+        // Issue #1973: a Claude Code, Codex, Devin or Antigravity generation's
+        // hooks are repaired before its child starts when they name no deck
+        // (the agent was set up after this daemon's startup install ran) or a
+        // deck copy that is gone, so the agent reports its status from its
+        // first turn.
         // Hooks that already name a usable deck are left as they are: they
         // live in the user's own config, which the deck does not rewrite on
         // every start. OpenCode's plugin is refreshed above.
@@ -35339,13 +35340,13 @@ mod spawn_tests {
         );
     }
 
-    /// Issue #1973: a spawn that starts Claude Code, declared or found by its
-    /// command's basename, or Devin, asks for that agent's hooks to be
-    /// repaired before its child starts; a command that is no known agent
-    /// asks for nothing.
+    /// Issue #1973: a spawn that starts Claude Code or Antigravity, declared or
+    /// found by its command's basename (`claude`, `agy`), or Devin, asks for
+    /// that agent's hooks to be repaired before its child starts; a command
+    /// that is no known agent asks for nothing.
     #[cfg(unix)]
     #[test]
-    fn a_claude_code_or_devin_spawn_asks_for_its_hooks_to_be_repaired() {
+    fn a_claude_code_devin_or_antigravity_spawn_asks_for_its_hooks_to_be_repaired() {
         use std::os::unix::fs::PermissionsExt;
         let registry = Arc::new(AgentPtyRegistry::new());
         let bin = tempfile::tempdir().unwrap();
@@ -35353,6 +35354,10 @@ mod spawn_tests {
         crate::test_isolation::write_script(&claude, "#!/bin/sh\nexec cat\n").unwrap();
         std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
         let claude = claude.display().to_string();
+        let agy = bin.path().join("agy");
+        crate::test_isolation::write_script(&agy, "#!/bin/sh\nexec cat\n").unwrap();
+        std::fs::set_permissions(&agy, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let agy = agy.display().to_string();
         let spawn = |command: &str, agent_type: Option<AgentType>| {
             registry
                 .spawn_agent(SpawnOptions {
@@ -35369,12 +35374,16 @@ mod spawn_tests {
         spawn("cat", Some(AgentType::ClaudeCode));
         spawn(&claude, None);
         spawn("cat", Some(AgentType::Devin));
+        spawn("cat", Some(AgentType::Antigravity));
+        spawn(&agy, None);
         assert_eq!(
             registry.hook_repairs_for_test(),
             vec![
                 AgentType::ClaudeCode,
                 AgentType::ClaudeCode,
-                AgentType::Devin
+                AgentType::Devin,
+                AgentType::Antigravity,
+                AgentType::Antigravity
             ]
         );
     }

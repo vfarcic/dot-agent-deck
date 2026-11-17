@@ -3737,7 +3737,7 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Layer:** L2 headless e2e, lane 1 (`tests/e2e_daemon_hook_repair.rs`), the real `daemon serve` from `common::spawn_daemon_serve_with_env` with a durable `~/.local/bin/dot-agent-deck` in an isolated HOME and no `~/.claude` when it starts; no TUI is started.
 - **Agent:** none; a stand-in `claude`, first on the daemon's `PATH` and run as a scheduled task's command through `RunNow`, answers `--version` and exits, and otherwise copies `~/.claude/settings.json` (or `absent`) the moment it starts.
 - **Asserts:** with no `~/.claude` at daemon start no `settings.json` is written; after `~/.claude` is created, the first scheduled Claude Code agent starts with deck hook commands that all run the daemon's `~/.local/bin/dot-agent-deck`; a second scheduled start sees the same file and leaves its bytes, inode and mtime unchanged.
-- **Does not assert:** a real Claude Code reading the hooks; Codex and Devin, which take the same path (unit-tested in `hooks_refresh::tests::the_agents_repaired_before_a_start_are_claude_codex_and_devin` and `agent_pty::spawn_tests::a_claude_code_or_devin_spawn_asks_for_its_hooks_to_be_repaired`); a settings file the deck cannot write, which is logged (unit-tested in `hooks_refresh::tests::the_repair_runs_the_install_only_when_the_pins_need_it`); a launcher command with no declared agent type, which is not checked.
+- **Does not assert:** a real Claude Code reading the hooks; Codex and Devin, which take the same path (unit-tested in `hooks_refresh::tests::the_agents_repaired_before_a_start_are_claude_codex_devin_and_antigravity` and `agent_pty::spawn_tests::a_claude_code_devin_or_antigravity_spawn_asks_for_its_hooks_to_be_repaired`); Antigravity (`hooks/install/035`); a settings file the deck cannot write, which is logged (unit-tested in `hooks_refresh::tests::the_repair_runs_the_install_only_when_the_pins_need_it`); a launcher command with no declared agent type, which is not checked.
 - **Platform coverage:** mac+linux.
 
 ##### hooks/install/029 — A Claude Code agent whose hooks name a deleted copy of the deck starts with them repaired, keeping the user's own hooks and settings (issue #1973).
@@ -3752,6 +3752,13 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Agent:** as `hooks/install/028`.
 - **Asserts:** after the daemon started, `~/.claude/settings.json` is seeded with text that is not valid JSON; the scheduled Claude Code stand-in starts and sees that text unchanged, the file still holds it afterwards, and the deck's log has a line saying Claude Code's hooks could not be repaired before it started, and names the settings file.
 - **Does not assert:** the wording `hooks refresh` prints for the same file (`hooks/install/019`); a file the deck cannot read for permissions, which takes the same path.
+- **Platform coverage:** mac+linux.
+
+##### hooks/install/035 — An Antigravity agent a headless daemon starts from a scheduled task starts with the deck's hook, even when `agy` was installed after the daemon started, keeping the user's own hooks byte for byte, and a hook that already names the deck is not rewritten (issue #1973, PRD #211).
+- **Layer:** L2 headless e2e, lane 1 (`tests/e2e_daemon_hook_repair.rs`), the real `daemon serve` from `common::spawn_daemon_serve_with_env` with a durable `~/.local/bin/dot-agent-deck` in an isolated HOME; its `PATH` starts with a directory that holds no `agy` when it starts; no TUI is started.
+- **Agent:** none; a stand-in `agy`, put in that directory after the daemon started and run as a scheduled task's command through `RunNow`, answers `--version` and otherwise copies `~/.gemini/config/hooks.json` the moment it starts.
+- **Asserts:** with no `agy` at daemon start no `~/.gemini` is created; after the stand-in and a `hooks.json` holding one user hook are put in place, the first scheduled agent starts with a `dot-agent-deck` key whose commands all run the daemon's `~/.local/bin/dot-agent-deck`, and the user's hook value with its original spacing; a second scheduled start sees the same file and leaves its bytes, inode and mtime unchanged.
+- **Does not assert:** a real `agy` reading the hook (`antigravity/live/*`); a deleted-copy pin or a malformed `hooks.json`, which take the Claude Code path of `hooks/install/029`/`030` and the installer's own refusal (`hooks/install/033`).
 - **Platform coverage:** mac+linux.
 
 #### hooks/opencode-real

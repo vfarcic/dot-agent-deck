@@ -91,6 +91,10 @@ fn seed_home_with_credentials(
 
 /// Probe the same model the interactive pane uses, without an inference turn.
 pub fn check_antigravity_available() -> Result<(), String> {
+    // Issue #2132: `agy` below resolves on this process's PATH, which
+    // `DAD_AGENT_BIN` pins; a refused pin fails here, as `cli_invocable`
+    // does for the other agents' preflights, before PATH order picks an agy.
+    common::assert_agent_bin_pin_usable();
     common::install_credential_redaction();
     if !Command::new("agy")
         .arg("--version")
