@@ -170,6 +170,12 @@ mod gh_aw_lock_consistency;
 /// sources. Like `desktop_project_boundary` this carries a live rule — rule 13
 /// in [`RULES`] — as well as its own tests.
 mod git_program_literal;
+/// Issue #2381: the claim on an issue (assignee plus the `in-progress` label)
+/// is defined once, in the `issue-claim` skill; the skills that claim, select
+/// or release link to it, and no other skill writes a claim itself. Tests only
+/// — the rule is prose in repository files, which no compile step reads.
+#[cfg(test)]
+mod issue_claim;
 /// Issue #785: `scripts/junit-strip-output.py`, the stripper that makes a JUnit
 /// report from a credential-holding run structurally incapable of carrying test
 /// output before anyone shares it. Since #502 took the credentialed lane out of

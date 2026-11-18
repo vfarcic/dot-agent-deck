@@ -151,15 +151,15 @@ For documentation-first PRDs:
 
 **⚠️ MANDATORY: Complete this step BEFORE proceeding to Step 4**
 
-### Issue Assignment
+### Claim the Issue
 
-**Assign the GitHub issue to yourself to signal that work is in progress:**
+**Claim the PRD's issue with the [`issue-claim`](../issue-claim/SKILL.md) skill's "Claim" section**: it assigns you and adds the `in-progress` label in one edit, reading the state just before the write and both halves back after it. The label is what stops another machine running as your account, as well as the other maintainer, from picking up the same PRD and working on it in parallel; an assignee alone stops only the other maintainer (issue #2381).
 
-```bash
-gh issue edit [issue-id] --add-assignee @me
-```
+- **Inside a unit `/prd-queue` dispatched**, the dispatcher has already claimed the issue for you. `issue-claim`'s "A unit whose dispatcher already claimed" says how to recognise that (your branch is `agent/dispatch-prd-[issue-id]`, or your task says so): take the claim as yours and go on without writing it again.
+- **Otherwise, a collision** (the label already on the issue, or another assignee) **means someone else is working this PRD**: stop and tell the user, with what the first read showed. Do not remove their label or assignment.
+- **A claim that does not read back** is reported to the user before going on; `issue-claim` says what to release.
 
-This prevents others from picking up the same PRD and working on it in parallel.
+The claim needs no release once the issue closes (`/prd-close`, or the PR that closes it), because selection reads open issues only. A PRD worked by hand across several PRs keeps its claim between them; if you stop before the issue closes, release it with `issue-claim`'s "Release", or the queues will report it as `claimed, possibly stale` after three days.
 
 ### Git Branch Management
 
@@ -190,6 +190,7 @@ This prevents others from picking up the same PRD and working on it in parallel.
 ```markdown
 ## Environment Setup ✅
 - **Assignee**: @[username] ✅
+- **Claim**: `in-progress` label ✅
 - **Branch**: `[current-branch-name]` ✅
 - **Status**: [Created new branch / Already on correct branch / Staying on main (reason)]
 ```
@@ -227,7 +228,7 @@ This command should:
 - ✅ Successfully identify the target PRD for implementation
 - ✅ Verify the PRD is still needed on `origin/main`, closing it with evidence when it is not
 - ✅ Validate that the PRD is ready for development work
-- ✅ Assign the GitHub issue to the current user to prevent duplicate work
+- ✅ Claim the GitHub issue (assignee and `in-progress` label) to prevent duplicate work
 - ✅ Set up proper implementation context (branch, environment)
 - ✅ Hand off to `/prd-next` for task identification
 - ✅ Bridge the gap between PRD planning and development setup
