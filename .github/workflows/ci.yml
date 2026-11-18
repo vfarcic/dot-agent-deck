@@ -2307,12 +2307,20 @@ jobs:
       && github.ref == 'refs/heads/main'
       && contains(needs.*.result, 'failure')
     runs-on: ubuntu-latest
+    # Job-level permissions replace the file's, so `contents: read` is restated.
+    # The other two let `scripts/ci-unacquired-runners.sh` read this attempt's
+    # jobs and their annotations.
+    permissions:
+      contents: read
+      actions: read
+      checks: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - name: Say which commit and which job broke main
         env:
+          GH_TOKEN: ${{ github.token }}
           # `toJSON(needs)` is the only route to the failing job NAMES: an
           # expression can test `needs.*.result` but cannot map a result back to
           # the job it came from, so the mapping is done in `jq` instead.
@@ -2341,5 +2349,20 @@ jobs:
           # actionlint runs shellcheck over every `run:` block in this file.
           printf '### main is red\n\n~~~\n%s\n~~~\n' "$message" >> "$GITHUB_STEP_SUMMARY"
           echo "::error title=main is red::${COMMIT_SHA:0:8} — failed: ${failed:-unknown} — ${RUN_URL}"
+
+          # A red that is only GitHub not giving a job a runner is rerun by
+          # `rerun-unacquired.yml` once this attempt ends, so the alert waits
+          # for the attempt that tests the code. Bounded like that workflow
+          # (`run_attempt == 1`): attempt 2 alerts whatever the cause, and
+          # that workflow sends this held alert itself when it does not rerun
+          # (the attempt failed further, a read failed, or the rerun did).
+          if [ "${GITHUB_RUN_ATTEMPT:-1}" -eq 1 ] \
+            && capacity="$(scripts/ci-unacquired-runners.sh "$GITHUB_RUN_ID" "${GITHUB_RUN_ATTEMPT:-1}")"; then
+            printf '\nNot alerted: %s. An automatic rerun follows this attempt.\n' "$capacity" >> "$GITHUB_STEP_SUMMARY"
+            # The title is what `ci-unacquired-runners.sh --alert-held` looks
+            # for, so the rerun workflow can send this alert if it declines.
+            echo "::notice title=main-red alert held::$capacity"
+            exit 0
+          fi
 
           scripts/notify.sh "$message"
