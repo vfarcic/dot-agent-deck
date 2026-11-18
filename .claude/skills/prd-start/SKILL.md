@@ -156,8 +156,9 @@ For documentation-first PRDs:
 **Claim the PRD's issue with the [`issue-claim`](../issue-claim/SKILL.md) skill's "Claim" section**: it assigns you and adds the `in-progress` label in one edit, reading the state just before the write and both halves back after it. The label is what stops another machine running as your account, as well as the other maintainer, from picking up the same PRD and working on it in parallel; an assignee alone stops only the other maintainer (issue #2381).
 
 - **Inside a unit `/prd-queue` dispatched**, the dispatcher has already claimed the issue for you. `issue-claim`'s "A unit whose dispatcher already claimed" says how to recognise that (your branch is `agent/dispatch-prd-[issue-id]`, or your task says so): take the claim as yours and go on without writing it again.
+- **Resuming your own PRD** after a `Refs` PR merged: the claim you made earlier is still on the issue. The same section of `issue-claim` covers it (you are on `feature/prd-[issue-id]-…`, or the user confirms the claim is theirs): take it as yours and go on.
 - **Otherwise, a collision** (the label already on the issue, or another assignee) **means someone else is working this PRD**: stop and tell the user, with what the first read showed. Do not remove their label or assignment.
-- **A claim that does not read back** is reported to the user before going on; `issue-claim` says what to release.
+- **A claim that does not read back** is reported to the user before going on; `issue-claim`'s "Backing out of a claim that did not hold" says what to remove.
 
 The claim needs no release once the issue closes (`/prd-close`, or the PR that closes it), because selection reads open issues only. A PRD worked by hand across several PRs keeps its claim between them; if you stop before the issue closes, release it with `issue-claim`'s "Release", or the queues will report it as `claimed, possibly stale` after three days.
 

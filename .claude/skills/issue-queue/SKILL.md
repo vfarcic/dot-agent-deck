@@ -294,7 +294,7 @@ Ask **which** issues too, unless the runner already named them. Relative value i
 What stays specific to this queue:
 
 - **A collision at the first read aborts this candidate**: report it in step 9 and take the next one. It does not consume a slot (step 5).
-- **A claim that did not read back means no dispatch.** `issue-claim` says what to release and report.
+- **A claim that did not read back means no dispatch.** Back out of it as `issue-claim`'s "Backing out of a claim that did not hold" says, and report it.
 - **Claim a duplicate or coupled pair's issues one by one**, since step 8 dispatches them as one unit and the release (step 9) drops each.
 
 **Then name the unit `issue-<n>`, or `issue-<n>-<short-slug>` when one dispatch covers a duplicate or coupled pair** (e.g. `issue-493-429`). Two rules:
@@ -417,7 +417,7 @@ Re-check **immediately before each dispatch**, not once for the batch. Issues mo
 - **The issue's state** — closed in the meantime.
 - **The assignees** — an assignee other than `$ME` appearing between step 6 and here is the collision step 6 narrows but cannot close. Skip the candidate and report it.
 
-**A candidate claimed in step 6 and then not dispatched gets its claim released right away**, with [`issue-claim`](../issue-claim/SKILL.md)'s "Release": whether a re-check above rejected it, `dispatch` refused twice, or the runner dropped it. A claim left behind holds the issue out of every queue until the stale report notices it, days later.
+**A candidate claimed in step 6 and then not dispatched gives its claim up right away**, with [`issue-claim`](../issue-claim/SKILL.md): **back out** (remove `$ME`, and the label only if no other login is assigned) when a re-check above found another assignee, and **release** when `dispatch` refused twice, the issue closed, or the runner dropped it. A claim left behind holds the issue out of every queue until the stale report notices it, days later.
 
 **If `dispatch` refuses**, it names which collision: `worktree ... is already claimed` means a live unit is in that directory, `branch ... already exists` means a previous unit's branch survives. Either way — **pick a new name and retry once, then report and stop. Never delete a branch or a worktree to clear the way**, for the reason in step 6. A refusal mid-batch does not invalidate the units already dispatched; report which ones went and which did not.
 
