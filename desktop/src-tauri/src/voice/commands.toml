@@ -2329,10 +2329,7 @@ must_name   = ["orchestration", "run", "every role", "all roles", "all the roles
   name = "orchestration"
   kind = "orchestration_ref"
 
-# PRD #2374 — the agent dashboard's cards, behind the experimental flag. Every
-# row below is offered `callable: false` while the flag hides the cards
-# (`voice::schema::hidden_by_flag`), and refused at dispatch by `App.tsx` the
-# same way, so the words are known but the door stays shut.
+# PRD #2374 — the agent dashboard's cards.
 #
 # None of them sends anything the user cannot see first: `run_card_action`
 # sends a card's prompt action directly only when its text is the catalog's

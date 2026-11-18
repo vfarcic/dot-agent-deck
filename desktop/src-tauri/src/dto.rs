@@ -2227,8 +2227,6 @@ pub struct DesktopFeatures {
     pub show_orchestrations: bool,
     pub show_agent_profiles: bool,
     pub show_agent_details: bool,
-    /// PRD #2374: the overview's agent cards.
-    pub show_agent_cards: bool,
 }
 
 impl DesktopFeatures {
@@ -2243,7 +2241,6 @@ impl DesktopFeatures {
             show_orchestrations: features::show_desktop_orchestrations(),
             show_agent_profiles: features::show_desktop_agent_profiles(),
             show_agent_details: features::show_desktop_agent_details(),
-            show_agent_cards: features::show_agent_cards(),
         }
     }
 }
@@ -6050,7 +6047,6 @@ mod tests {
                 show_orchestrations: false,
                 show_agent_profiles: false,
                 show_agent_details: false,
-                show_agent_cards: false,
             }
         );
 
@@ -6064,7 +6060,6 @@ mod tests {
                 show_orchestrations: true,
                 show_agent_profiles: true,
                 show_agent_details: true,
-                show_agent_cards: true,
             }
         );
     }
@@ -6080,7 +6075,6 @@ mod tests {
             show_orchestrations: false,
             show_agent_profiles: true,
             show_agent_details: false,
-            show_agent_cards: true,
         })
         .expect("serialises");
         assert_eq!(
@@ -6092,7 +6086,6 @@ mod tests {
                 "showOrchestrations": false,
                 "showAgentProfiles": true,
                 "showAgentDetails": false,
-                "showAgentCards": true,
             })
         );
     }

@@ -117,7 +117,7 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
     storeSecret: vi.fn(),
     forgetSecret: vi.fn(),
     setZoom: vi.fn(async (level: number) => level),
-    desktopFeatures: { ...DEFAULT_DESKTOP_FEATURES, showAgentCards: true },
+    desktopFeatures: { ...DEFAULT_DESKTOP_FEATURES },
     agentCards: { [FIXTURE_DAEMON_ID]: snapshot([CODER, TESTER, LONE]) },
     invokeCardAction: vi.fn(async (_target, _actionId, options) => ({ request_id: options?.requestId ?? "r", outcome: "sent", message_id: "m-1" })),
     ...overrides,
@@ -270,9 +270,9 @@ describe("the dashboard's cards (PRD #2374)", () => {
     }
   });
 
-  it("shows none of it with the flag off", () => {
+  it("shows none of it when the runtime offers no cards", () => {
     window.localStorage.setItem(OVERVIEW_MODE_STORAGE_KEY, "cards");
-    render(<AgentOverview runtime={runtime({ desktopFeatures: { ...DEFAULT_DESKTOP_FEATURES } })} onNavigate={vi.fn()} />);
+    render(<AgentOverview runtime={runtime({ agentCards: undefined })} onNavigate={vi.fn()} />);
     expect(screen.queryByTestId("overview-mode-switch")).toBeNull();
     expect(screen.queryByTestId("agent-cards")).toBeNull();
     expect(screen.queryByTestId("overview-needs-you")).toBeNull();

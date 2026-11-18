@@ -894,7 +894,7 @@ export const DOCS_PENDING_QUESTION: PendingQuestionDto = {
  * PRD #2374 — the `agent-cards` docs scene: the cards the daemon would send
  * for the `docs` state's four agents, as one orchestration and one standalone
  * agent, in the daemon's display order (needs-you first within a group).
- * Served by the fixture bridge only for `/?fixture=1&state=docs&experimental=1&cards=1`,
+ * Served by the fixture bridge only for `/?fixture=1&state=docs&cards=1`,
  * so no other fixture scene grows a needs-you bell or a row menu.
  */
 const DOCS_CARDS_INSTANCE = "docs-cards";

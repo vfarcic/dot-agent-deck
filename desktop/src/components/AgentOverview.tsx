@@ -711,7 +711,7 @@ const StopControlsContext = createContext<OverviewStopControls | undefined>(unde
  * dialog covers the rows.
  */
 const RowNumbersContext = createContext<ReadonlyMap<string, number> | undefined>(undefined);
-/** PRD #2374 — the cards view, while the experimental flag shows it: each row's needs-you marker and ⋯ menu read it. */
+/** PRD #2374 — the cards view, while the runtime offers cards: each row's needs-you marker and ⋯ menu read it. */
 const RowCardsContext = createContext<AgentCardsView | undefined>(undefined);
 
 /** Overlap kept between two screens of a spoken scroll, so the row at the edge stays in sight (issue #1492). */
@@ -1327,7 +1327,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
          published only while it is open. */
       ...(newAgent ? {} : { showDashboardCounters }),
       ...(countersOpen ? { closeDashboardCounters: () => setCountersOpen(false) } : {}),
-      /* PRD #2374 — the cards' members, only while the flag shows the cards;
+      /* PRD #2374 — the cards' members, only while the runtime offers cards;
          `closeAgentCard` only while a card is open. */
       ...(cards.shown ? cards.voice : {}),
     };
@@ -1395,7 +1395,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     VOICE_ACTIONS.openAgent.run(voiceContext, { deckId: agent.daemonId, agentId: agent.id, from: "overview", incarnation: agent.incarnation });
   }, [voiceContext]);
   /*
-    PRD #2374 — the agent cards, behind the experimental flag: the Table |
+    PRD #2374 — the agent cards: the Table |
     Cards switch, the cards grid, the card overlay and the table's needs-you
     marker and row menu. A card's `open` action opens the agent exactly as a
     row does.

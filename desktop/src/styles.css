@@ -2069,7 +2069,7 @@ button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-
 @media (max-width: 680px) { .pr-browser-actions .button span { display: none; } }
 .kept-worktree-text { overflow-wrap: anywhere; white-space: normal; }
 
-/* PRD #2374 — the agent dashboard's cards (experimental). The Table | Cards switch, the grid of
+/* PRD #2374 — the agent dashboard's cards. The Table | Cards switch, the grid of
    cards grouped as the daemon groups them, the shared card overlay, and a table row's needs-you
    marker and ⋯ menu. Colours come from the theme's tokens, so both themes follow. */
 .overview-mode-switch { display: inline-flex; border: 1px solid var(--line-strong); border-radius: 5px; overflow: hidden; }

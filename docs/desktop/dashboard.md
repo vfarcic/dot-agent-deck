@@ -4,7 +4,7 @@ The **Agent dashboard** is the desktop app's main screen and the one it opens on
 
 ![The desktop app's dashboard with four agents in one daemon section, each row showing its status, name and uptime](/img/dashboard-desktop.png)
 
-With the `experimental` flag on, the Dashboard can also show each agent as a card that says what it reported, whether it needs you and what you can do about it: see [Agent Cards](agent-cards.md).
+The Dashboard can also show each agent as a card that says what it reported, whether it needs you and what you can do about it: see [Agent Cards](agent-cards.md).
 
 ## Check what is running
 

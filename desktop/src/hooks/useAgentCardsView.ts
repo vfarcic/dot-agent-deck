@@ -4,10 +4,10 @@ import { actionBySpokenLabel, cardTarget, disabledReasonSentence, placeCards, pl
 import { newCardRequestId } from "../lib/bridge";
 import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
 import type { AgentCardRef, VoiceActionContext } from "../lib/voiceActions";
-import { desktopFeaturesOf, type AgentCardAction, type DeckRuntimeState } from "../types";
+import type { AgentCardAction, DeckRuntimeState } from "../types";
 
-/** What a card member says when the cards are not shown (the experimental flag is off). */
-export const CARDS_HIDDEN = "Agent cards are an experimental view, and this app shows them only while the experimental flag is on.";
+/** What a card member says when the cards are not shown (this connection offers no cards). */
+export const CARDS_HIDDEN = "Agent cards are not available here.";
 /** …when the card it names is not on the dashboard any more. */
 export const CARD_GONE = "That agent has no card on the dashboard any more, so nothing was done.";
 /** …when a card step or close is asked for with no card open. */
@@ -34,7 +34,7 @@ export interface CardOverlayView {
 
 /** What {@link useAgentCardsView} hands the overview. */
 export interface AgentCardsView {
-  /** Whether the experimental flag shows the cards at all. */
+  /** Whether the runtime offers cards at all. */
   shown: boolean;
   /** The view on screen: always `table` while the cards are hidden. */
   mode: OverviewMode;
@@ -67,12 +67,12 @@ function sameIncarnation(card: PlacedCard, incarnation: string | undefined): boo
  * own choices (view, filter, which card is open).
  */
 export function useAgentCardsView({ runtime, decks, openAgent }: {
-  runtime: Pick<DeckRuntimeState, "desktopFeatures" | "agentCards" | "invokeCardAction">;
+  runtime: Pick<DeckRuntimeState, "agentCards" | "invokeCardAction">;
   decks: readonly { deckId: string | undefined; connected: boolean }[];
   /** Open an agent's pane — a card's `open` action. */
   openAgent: (target: { deckId: string; agentId: string; incarnation?: string }) => void;
 }): AgentCardsView {
-  const shown = desktopFeaturesOf(runtime).showAgentCards && runtime.agentCards !== undefined;
+  const shown = runtime.agentCards !== undefined;
   const [storedMode, setStoredMode] = useState<OverviewMode>(readOverviewMode);
   const mode: OverviewMode = shown ? storedMode : "table";
   const [needsYouOnly, setNeedsYouOnly] = useState(false);

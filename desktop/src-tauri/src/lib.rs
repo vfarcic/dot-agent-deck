@@ -1849,12 +1849,10 @@ async fn emit_agent_cards(app: &AppHandle, endpoint: &Endpoint, links: &DaemonLi
 }
 
 /// PRD #2374: the webview consumes agent cards. It calls this once, when the
-/// surface that renders them mounts (the dashboard's Table | Cards switch,
-/// which exists only while `desktopFeatures.showAgentCards` shows the cards);
+/// surface that renders them mounts (the dashboard's Table | Cards switch);
 /// from then on every deck watcher subscribes with the card doorbells and
 /// pushes `desktop://agent-cards`, and [`agent_cards_list`] reads. Before it,
-/// the bridge asks no daemon for cards. The bridge acts on this request and
-/// never reads the experimental flag itself (CLAUDE.md rule 9).
+/// the bridge asks no daemon for cards.
 #[tauri::command]
 async fn agent_cards_consume(
     webview: Webview,
@@ -3774,20 +3772,10 @@ async fn desktop_voice_resolve(
         voice::Transcript::new(utterance),
         settings.labels,
         // Issue #1198: the deck is an experimental surface, so voice neither
-        // offers nor dispatches the way there while it is hidden; PRD #2374:
-        // nor the agent cards' rows while the cards are.
-        voice_flag_gates(),
+        // offers nor dispatches the way there while it is hidden.
+        dot_agent_deck::features::show_desktop_deck(),
     )
     .await
-}
-
-/// The experimental surfaces voice is gated on, each read through its own
-/// wrapper (CLAUDE.md rule 9) at the command seams that offer and dispatch.
-fn voice_flag_gates() -> voice::FlagGates {
-    voice::FlagGates {
-        show_deck: dot_agent_deck::features::show_desktop_deck(),
-        show_agent_cards: dot_agent_deck::features::show_agent_cards(),
-    }
 }
 
 /// The webview-declared pieces [`desktop_voice_resolve`] resolves an utterance
@@ -3816,7 +3804,7 @@ async fn resolve_declared_utterance(
     declared: VoiceDeclaration<'_>,
     transcript: voice::Transcript,
     labels: crate::settings::LabelSharing,
-    show_deck: impl Into<voice::FlagGates>,
+    show_deck: bool,
 ) -> Result<voice::VoiceResult, String> {
     let mut decks = voice_decks(observed, declared.deck_step, agents_deck);
     // PRD #1195 M3: the decks the Deck selector lists, as the webview sent
@@ -5156,9 +5144,8 @@ async fn desktop_voice_commands(
             .unwrap_or_default()
             .labels,
         // Issue #1198: the list marks the deck's row unavailable while the deck
-        // is hidden, for the same reason the resolver refuses it; PRD #2374:
-        // and the card rows while the cards are.
-        voice_flag_gates(),
+        // is hidden, for the same reason the resolver refuses it.
+        dot_agent_deck::features::show_desktop_deck(),
     ))
 }
 

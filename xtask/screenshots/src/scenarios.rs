@@ -98,7 +98,7 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "agent-cards",
-        description: "The desktop Dashboard's experimental Cards view: four agents' cards in an orchestration group and a standalone group, three needing you (PRD #2374).",
+        description: "The desktop Dashboard's Cards view: four agents' cards in an orchestration group and a standalone group, three needing you (PRD #2374).",
         clients: &[Client::Desktop],
     },
     Scenario {

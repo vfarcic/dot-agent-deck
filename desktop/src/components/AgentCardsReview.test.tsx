@@ -65,7 +65,7 @@ function runtime(entries: AgentCardEntry[], invokeCardAction = vi.fn(async (_tar
     reconnect: vi.fn(async () => undefined), listProjects: vi.fn(async () => ({ projects: [] })), resolveProject: vi.fn(async () => { throw new Error("unresolved"); }),
     getSettings: vi.fn(), saveSettings: vi.fn(), testEndpoint: vi.fn(), secretStatus: vi.fn(), storeSecret: vi.fn(), forgetSecret: vi.fn(),
     setZoom: vi.fn(async (level: number) => level),
-    desktopFeatures: { ...DEFAULT_DESKTOP_FEATURES, showAgentCards: true },
+    desktopFeatures: { ...DEFAULT_DESKTOP_FEATURES },
     agentCards: { [FIXTURE_DAEMON_ID]: snapshot(entries) },
     invokeCardAction,
   } as unknown as DeckRuntimeState;

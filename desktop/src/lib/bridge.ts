@@ -2383,8 +2383,8 @@ export interface DeckBridge {
   inboxAction?(target: AgentTarget, item: { paneId: string; messageId: string; revision: number }, verb: InboxActionVerb): Promise<InboxActionResult>;
   /**
    * PRD #2374 — tell the app's backend that this webview consumes agent cards
-   * (`agent_cards_consume`), called once and only while the experimental flag
-   * shows them. Until it is called the backend subscribes to no card doorbell,
+   * (`agent_cards_consume`), called once, by the surface that renders them.
+   * Until it is called the backend subscribes to no card doorbell,
    * pushes no cards and `agentCards` answers `null`. Optional: a bridge
    * without it (the browser preview) needs no request.
    */
@@ -2463,7 +2463,7 @@ export function normalizeDesktopFeatures(value: unknown): DesktopFeatures {
 export function fixtureDesktopFeatures(search = window.location.search): DesktopFeatures {
   const requested = new URLSearchParams(search).get("experimental")?.trim().toLowerCase();
   if (requested !== "1" && requested !== "true") return { ...DEFAULT_DESKTOP_FEATURES };
-  return { showDeck: true, showProjects: true, showPrompts: true, showOrchestrations: true, showAgentProfiles: true, showAgentDetails: true, showAgentCards: true };
+  return { showDeck: true, showProjects: true, showPrompts: true, showOrchestrations: true, showAgentProfiles: true, showAgentDetails: true };
 }
 
 
@@ -3195,11 +3195,9 @@ class FixtureDeckBridge implements DeckBridge {
   }
   /**
    * PRD #2374 — the `agent-cards` docs scene's card list: served only for
-   * `/?fixture=1&state=docs&experimental=1&cards=1`, so no other fixture
-   * scene shows cards, needs-you bells or row menus. Every other deck and
-   * scene answers as a daemon without cards does. The flag is not read here:
-   * without `experimental=1` the Cards switch never mounts, so nothing
-   * consumes or reads cards (CLAUDE.md rule 9).
+   * `/?fixture=1&state=docs&cards=1`, so no other fixture scene shows cards,
+   * needs-you bells or row menus. Every other deck and scene answers as a
+   * daemon without cards does.
    */
   async agentCards(deckId: string): Promise<AgentCardsSnapshot | null> {
     const params = new URLSearchParams(window.location.search);

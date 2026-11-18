@@ -55,7 +55,7 @@ use super::filter::grounded_filter_text;
 use super::meaning::{Ballot, MeaningRequest, MeaningVerdict, Place, Strictness, every_action};
 use super::resolver::{IntentAnswer, IntentError, IntentRequest, IntentResolver};
 use super::schema::{
-    FlagGates, LABELS_WITHHELD_HINT, annotate_for, flag_hidden_hint, hidden_by_flag, needs_labels,
+    DECK_HIDDEN_HINT, LABELS_WITHHELD_HINT, annotate_for, hidden_by_flag, needs_labels,
 };
 use super::table::{CommandRow, CommandTable, ParamKind, Requirement, Screen, spoken_words};
 use super::{
@@ -786,14 +786,12 @@ impl VoiceOutcome {
     /// #1223, audit finding A1) — [`VoiceOutcome::unavailable`]'s shape with
     /// [`LABELS_WITHHELD_HINT`] in place of the row's own hint.
     /// Issue #1198 — a pick of the row whose screen the experimental flag
-    /// hides, refused with [`super::schema::DECK_HIDDEN_HINT`] (or the cards' hint) rather than dispatched.
+    /// hides, refused with [`DECK_HIDDEN_HINT`] rather than dispatched.
     fn hidden_by_flag(transcript: Transcript, row: &CommandRow) -> Self {
-        // PRD #2374: the agent cards' rows carry the cards' hint.
-        let hint = flag_hidden_hint(row);
         Self::Unavailable {
-            sentence: format!("Not here — {hint}."),
+            sentence: format!("Not here — {DECK_HIDDEN_HINT}."),
             action: row.id.clone(),
-            hint: hint.to_string(),
+            hint: DECK_HIDDEN_HINT.to_string(),
             transcript,
         }
     }
@@ -969,7 +967,7 @@ pub async fn handle_utterance(
 /// # `show_deck` (issue #1198)
 ///
 /// `false` while the experimental flag hides the deck: the row that goes there
-/// is offered `callable: false` with [`super::schema::DECK_HIDDEN_HINT`], and picked anyway it
+/// is offered `callable: false` with [`DECK_HIDDEN_HINT`], and picked anyway it
 /// is [`VoiceOutcome::Unavailable`] with that hint. Held to the transcript
 /// first, like every row, so a pick the user did not ask for is still answered
 /// as that. `desktop_voice_resolve` passes `features::show_desktop_deck()`.
@@ -984,9 +982,8 @@ pub async fn handle_utterance_with(
     new_agent: Option<&VoiceNewAgent>,
     transcript: Transcript,
     labels: LabelSharing,
-    show_deck: impl Into<FlagGates>,
+    show_deck: bool,
 ) -> VoiceResult {
-    let show_deck: FlagGates = show_deck.into();
     handle_utterance_with_dictation(
         resolver,
         table,
@@ -1023,9 +1020,8 @@ pub async fn handle_utterance_with_dictation(
     dictation: Option<&VoiceDictationTarget>,
     transcript: Transcript,
     labels: LabelSharing,
-    show_deck: impl Into<FlagGates>,
+    show_deck: bool,
 ) -> VoiceResult {
-    let show_deck: FlagGates = show_deck.into();
     handle_utterance_with_modes(
         resolver,
         table,
@@ -1067,9 +1063,8 @@ pub async fn handle_utterance_with_modes(
     reading: VoiceReadingState,
     transcript: Transcript,
     labels: LabelSharing,
-    show_deck: impl Into<FlagGates>,
+    show_deck: bool,
 ) -> VoiceResult {
-    let show_deck: FlagGates = show_deck.into();
     let backend = resolver.backend_name();
     let finish = |outcome, resolve_ms| VoiceResult {
         outcome,
@@ -1177,9 +1172,8 @@ async fn after_local_intercepts(
     new_agent: Option<&VoiceNewAgent>,
     transcript: Transcript,
     labels: LabelSharing,
-    show_deck: impl Into<FlagGates>,
+    show_deck: bool,
 ) -> VoiceResult {
-    let show_deck: FlagGates = show_deck.into();
     let withheld = labels == LabelSharing::Withheld;
     let backend = resolver.backend_name();
     let result = |outcome, resolve_ms| VoiceResult {
@@ -1346,7 +1340,7 @@ struct Picked<'p> {
     new_agent: Option<&'p VoiceNewAgent>,
     transcript: &'p Transcript,
     withheld: bool,
-    show_deck: FlagGates,
+    show_deck: bool,
     answer: &'p IntentAnswer,
     row: &'p CommandRow,
 }
@@ -4059,7 +4053,7 @@ fn redirect_targets<'t>(
     table: &'t CommandTable,
     row: &CommandRow,
     text: &str,
-    show_deck: FlagGates,
+    show_deck: bool,
 ) -> Vec<&'t CommandRow> {
     let mut targets = Vec::new();
     if row.id == OPEN_DECK_ROW || row.id == OPEN_PR_ROW || hidden_by_flag(row, show_deck) {

@@ -291,12 +291,10 @@ pub(crate) struct DesktopState {
     /// with their deck in [`Self::retain_watchers`].
     refetch: Mutex<HashMap<EndpointIdentity, tokio::sync::watch::Sender<u64>>>,
     /// PRD #2374: whether the webview consumes agent cards. `false` until the
-    /// webview, which shows the cards only while its experimental flag says
-    /// so, calls `agent_cards_consume`; from then on every deck watcher
+    /// webview calls `agent_cards_consume`; from then on every deck watcher
     /// subscribes with the card doorbells and pushes cards, and
     /// `agent_cards_list` reads them. Until then no watcher asks a daemon for
-    /// cards. The bridge decides from this request, never from the flag
-    /// (CLAUDE.md rule 9: the flag gates the render and input seams only).
+    /// cards. The bridge decides from this request.
     ///
     /// A [`tokio::sync::watch`] for [`Self::selection`]'s reason: a watcher
     /// already subscribed without the doorbells observes the request as an

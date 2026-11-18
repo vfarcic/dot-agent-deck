@@ -1,8 +1,6 @@
 # Agent Cards
 
-Agent cards are an experimental view of the desktop app's Dashboard. Each agent the daemon runs gets a card that says what it is doing, whether it needs you, what it last reported about its work, and the actions you can take on it, such as answering its question or telling it to go ahead. You read many agents at a glance and act on the one that needs you without opening its terminal.
-
-The cards are hidden unless the `experimental` flag is on. See [Turning the cards on](#turning-the-cards-on).
+Agent cards are a view of the desktop app's Dashboard. Each agent the daemon runs gets a card that says what it is doing, whether it needs you, what it last reported about its work, and the actions you can take on it, such as answering its question or telling it to go ahead. You read many agents at a glance and act on the one that needs you without opening its terminal.
 
 ## What a card shows
 
@@ -17,7 +15,7 @@ A card is marked **Needs you** when its agent stopped, is asking a question in i
 
 ## Switch between the table and the cards
 
-With the flag on, the Dashboard's top bar has a **Table | Cards** switch. **Table** is the Dashboard you know. **Cards** shows a grid of cards. The app remembers your choice in this window's storage, so the next time you open the Dashboard it shows the same view.
+The Dashboard's top bar has a **Table | Cards** switch. **Table** is the Dashboard you know. **Cards** shows a grid of cards. The app remembers your choice in this window's storage, so the next time you open the Dashboard it shows the same view.
 
 ![The Dashboard's Cards view: an orchestration group of three cards, two of them marked Needs you with their main buttons “Go ahead” and “Yes, behind a flag”, and a standalone agent waiting for input](/img/agent-cards-desktop.png)
 
@@ -28,7 +26,7 @@ In the Cards view:
 - **Needs you** above the grid shows only the cards that need you. Press it again to see every card.
 - The Dashboard's filter applies to the cards as it does to the table rows: with a status, kind, agent type, daemon or search text chosen, only the cards of the agents it shows are on screen.
 - Each card has one main button, the action the agent most needs from you: the answer to its question, an action it suggested, or **Open** when it needs nothing. Under the button is the start of the exact text it sends, and hovering shows all of it. An action the agent wrote itself is marked **agent says**, as are its fields. When the agent wrote the text and the card shows only the start of it, the button sends nothing yet: it opens the card at a step showing the whole text, and you send it from there. After you press it, the card says whether the message was sent and, later, whether the agent took it.
-- With several daemons on the Dashboard, each daemon's cards are under its own name. A daemon whose version does not have cards keeps its usual table section.
+- With several daemons on the Dashboard, each daemon's cards are under its own name. A daemon from a release before cards were added has no cards and keeps its usual table section.
 
 In the Table view, a row whose card needs you shows a bell next to the agent's name, and the row's **⋯** menu has **Show card**, which opens that agent's card, and the card's main action. The menu shows only the action's name, so choosing it sends nothing yet: it opens the card at a step that shows exactly what the action sends, and you send it from there. Clicking the row itself still opens the agent's terminal, as before.
 
@@ -51,7 +49,7 @@ An action is always sent to the agent whose card it is on, and only to that agen
 
 ## By voice
 
-With voice control on and the cards shown, you can say:
+With voice control on, you can say:
 
 | Say | What happens |
 | --- | --- |
@@ -110,10 +108,6 @@ always = false                     # optional: true offers it on every card, sug
 - Changes apply to cards agents already published. When you remove an action from the catalog, it disappears from the cards that suggested it only by its catalog name; a card whose agent gave that action its own label and text keeps offering it, marked custom. When you change a field's type, a value an agent already reported is hidden if it does not fit the new type, until the agent reports it again; a value that still fits, such as text in a field you changed to long text, stays.
 
 Agents can also report fields and actions that are not in the catalog. You see them marked **custom**; a custom field shows only in the overlay.
-
-## Turning the cards on
-
-The cards are behind the `experimental` flag. Start the desktop app with `DOT_AGENT_DECK_EXPERIMENTAL=1` in its environment, as described in [Features behind the `experimental` flag](index.md#features-behind-the-experimental-flag). The daemon needs no flag: it keeps every agent's card either way, and the `dot-agent-deck card` commands work without it. A daemon from a release before cards were added has no cards, and the app shows its agents in the table.
 
 ## In the TUI
 

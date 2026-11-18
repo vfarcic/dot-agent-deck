@@ -547,15 +547,13 @@ export function useDeckRuntime(): DeckRuntimeState {
     of a subscription can land before this listener exists. A deck whose
     daemon has no cards answers `null` and keeps no key.
 
-    Nothing here reads the experimental flag (CLAUDE.md rule 9): cards are
-    consumed only once a surface that renders them asks, through
+    Cards are consumed only once a surface that renders them asks, through
     `consumeAgentCards` below. The Table | Cards switch calls it when it
-    mounts, and it is mounted only while the flag shows the cards — its render
-    seam. The first call tells the bridge this webview consumes cards
+    mounts. The first call tells the bridge this webview consumes cards
     (`bridge.consumeAgentCards`), which is what makes the deck watchers
     subscribe to the cards' doorbells and push them; only once that request has
-    succeeded does this hook listen for pushes and read. With the flag off
-    nothing calls it, so no daemon is subscribed to or read for cards at all.
+    succeeded does this hook listen for pushes and read. Until something calls
+    it, no daemon is subscribed to or read for cards at all.
   */
   const [cardsConsumed, setCardsConsumed] = useState(false);
   const cardsRequested = useRef(false);

@@ -1198,10 +1198,7 @@ export const VOICE_ACTIONS = {
      dispatches through one of these; none sends anything unasked: a prompt
      action sends exactly the prompt the card shows, one that asks for
      confirmation (and both closes) only opens the card at its confirm step,
-     because voice has no confirm step of its own (PRD #802 D5). The rows are
-     withheld while the experimental flag hides the cards
-     (`voice::schema::hidden_by_flag`), and `App.tsx` refuses them at dispatch
-     as it refuses `open_deck`. `reportRefused` is read through `?.` for
+     because voice has no confirm step of its own (PRD #802 D5). `reportRefused` is read through `?.` for
      `showHostMetrics`' reason: a button serves no voice surface. */
   setOverviewMode: {
     label: "Show the agent dashboard as a table or as cards",

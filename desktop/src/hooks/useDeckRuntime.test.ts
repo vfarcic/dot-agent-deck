@@ -5,7 +5,7 @@ import { agentKey, boundAgentKey } from "../lib/agentKey";
 import { deckName } from "../lib/displayText";
 import type { DeckBridge } from "../lib/bridge";
 import { LaunchCleanupError } from "../lib/actionError";
-import { DEFAULT_DESKTOP_FEATURES, type AgentCardsSnapshot, type DeckFleet, type DesktopFeatures, type TerminalChunk } from "../types";
+import type { AgentCardsSnapshot, DeckFleet, TerminalChunk } from "../types";
 
 /*
  * A bridge stub rather than `FixtureDeckBridge`, because the state under test
@@ -439,7 +439,6 @@ describe("useDeckRuntime", () => {
  */
 describe("useDeckRuntime agent cards (PRD #2374)", () => {
   type CardsBridge = {
-    desktopFeatures?: () => Promise<DesktopFeatures>;
     consumeAgentCards?: () => Promise<void>;
     subscribeAgentCards?: (listener: (snapshot: AgentCardsSnapshot) => void) => Promise<() => void>;
     agentCards?: (deckId: string) => Promise<AgentCardsSnapshot | null>;
@@ -460,14 +459,11 @@ describe("useDeckRuntime agent cards (PRD #2374)", () => {
     vi.clearAllMocks();
     bridge.onTerminalGeometry.mockReturnValue(() => {});
     calls = [];
-    // The flag is ON throughout: what keeps cards unread is that nothing
-    // consumed them, not a flag this hook reads (CLAUDE.md rule 9). The
-    // flag-off case is the component's: desktop/agent-cards/007.
-    cardsBridge.desktopFeatures = vi.fn(async () => ({ ...DEFAULT_DESKTOP_FEATURES, showAgentCards: true }));
+    // What keeps cards unread is that nothing consumed them; the
+    // no-cards case is the component's: desktop/agent-cards/007.
     cardsBridge.consumeAgentCards = vi.fn(async () => { calls.push("consume"); });
   });
   afterEach(() => {
-    delete cardsBridge.desktopFeatures;
     delete cardsBridge.consumeAgentCards;
     delete cardsBridge.subscribeAgentCards;
     delete cardsBridge.agentCards;
@@ -477,15 +473,14 @@ describe("useDeckRuntime agent cards (PRD #2374)", () => {
    * PR #2378 review: the backend consumes cards only on the webview's
    * request, and the webview requests them only from the surface that renders
    * them. Until that surface calls `consumeAgentCards` the hook asks for,
-   * subscribes to and reads nothing, even with the flag on; once called, the
+   * subscribes to and reads nothing; once called, the
    * request comes first and exactly once, then the listener and the read.
    */
-  it("subscribes to and reads no cards until a surface consumes them, even with the flag on", async () => {
+  it("subscribes to and reads no cards until a surface consumes them", async () => {
     cardsBridge.subscribeAgentCards = vi.fn(async () => () => {});
     cardsBridge.agentCards = vi.fn(async () => null);
     bridge.connect.mockResolvedValue([createFixtureSnapshot("docs-restart")]);
     const { result } = renderHook(() => useDeckRuntime());
-    await waitFor(() => expect(result.current.desktopFeatures?.showAgentCards).toBe(true));
     await waitFor(() => expect(result.current.snapshot.connection.incarnation).toBe("docs-before"));
     await act(async () => { await Promise.resolve(); });
     expect(result.current.consumeAgentCards).toBeTypeOf("function");

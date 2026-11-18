@@ -15778,11 +15778,11 @@ The desktop half of PRD #2374's agent cards. These are Vitest + Testing Library 
 - **Asserts:** the default is Table; choosing Cards writes `cards` under `dot-agent-deck.overview.mode`, and a fresh render comes back in Cards; choosing Table writes `table`; with `localStorage.getItem` throwing, the dashboard renders the Table without an error; with `setItem` throwing too, switching to Cards still works for the session.
 - **Does not assert:** storage shared across windows or app restarts (jsdom only).
 
-##### desktop/agent-cards/007 — With `showAgentCards` off, none of the new controls render and no cards are consumed.
+##### desktop/agent-cards/007 — With no cards offered, none of the new controls render and no cards are consumed.
 - **Test:** vitest `desktop/agent-cards/007: …` in `desktop/src/components/AgentCardsContract.test.tsx`.
 - **Layer:** desktop component (jsdom).
-- **Asserts:** with the daemon sending cards and Cards remembered, the flag off shows no Table | Cards switch, grid, Needs you filter, row needs-you marker, row menu or overlay, never calls the runtime's `consumeAgentCards`, and a row click still opens the agent; with the flag on, mounting the Table | Cards switch calls `consumeAgentCards` once, and a re-render does not call it again.
-- **Does not assert:** the voice rows' flag gate (the crate's `hidden_by_flag`, in the desktop crate's tests); that a consumed runtime asks the backend once before it listens and reads (`useDeckRuntime agent cards` in `desktop/src/hooks/useDeckRuntime.test.ts`).
+- **Asserts:** with Cards remembered and a runtime that offers no cards (`agentCards` absent), the dashboard shows no Table | Cards switch, grid, Needs you filter, row needs-you marker, row menu or overlay, never calls the runtime's `consumeAgentCards`, and a row click still opens the agent; with cards offered, mounting the Table | Cards switch calls `consumeAgentCards` once, and a re-render does not call it again.
+- **Does not assert:** that a consumed runtime asks the backend once before it listens and reads (`useDeckRuntime agent cards` in `desktop/src/hooks/useDeckRuntime.test.ts`).
 
 ##### desktop/agent-cards/008 — Every new card control is reachable by voice, and a spoken confirm action, or one whose text the agent wrote, only opens its step.
 - **Test:** vitest `desktop/agent-cards/008: …` (nine tests) in `desktop/src/components/AgentCardsVoice.test.tsx`.
