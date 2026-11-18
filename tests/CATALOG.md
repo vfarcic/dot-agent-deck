@@ -472,14 +472,14 @@ The deck asks for the approval itself when it refuses to start an unapproved orc
 ##### config-trust/request/001 — A refused `dispatch --orchestration` opens the review in the TUI; approving there lets the retried dispatch start.
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`), real `dispatch` CLI from a plain pane against the real `daemon serve`.
 - **Agent:** stand-ins.
-- **Asserts:** the refusal in the caller's inbox says `requested in the deck` and names the approve command; the TUI opens `Review project commands` on its own, led by the deck's sentence and `Asked by: dispatch`, with the footer `a approve · Esc deny · ↑↓ scroll`; a retry while it is open is refused the same way and the daemon lists one request; `a` approves (status `Approved orchestration 'trust-orch'`, `trust list` reads `current`, no request listed) and the next dispatch runs its roles in the unit's worktree.
+- **Asserts:** the refusal in the caller's inbox says `requested in the deck`, that a notice will follow, and names the approve command; the TUI opens `Review project commands` on its own, led by the deck's sentence and `Asked by: dispatch`, with the footer `a approve · Esc deny · ↑↓ scroll`; a retry while it is open is refused the same way and the daemon lists one request; `a` approves (status `Approved orchestration 'trust-orch'`, `trust list` reads `current`, no request listed); the caller's inbox then holds exactly one deck notice saying it was approved and `Retry your dispatch now` (issue #2348), and the retried dispatch runs its roles in the unit's worktree.
 - **Does not assert:** the key guard's timing (`ui.rs` `request_tui_001`); the desktop app.
 - **Platform coverage:** mac+linux.
 
 ##### config-trust/request/002 — Denying the deck's request refuses the retry as declined, without asking again.
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`).
 - **Agent:** stand-ins.
-- **Asserts:** `Esc` on the review the refused dispatch opened says `Declined orchestration 'trust-orch'` and leaves no request; the retried dispatch is refused with `declined it in the deck`, raises no request, opens no review and starts nothing.
+- **Asserts:** `Esc` on the review the refused dispatch opened says `Declined orchestration 'trust-orch'` and leaves no request; the caller's inbox holds exactly one deck notice saying its dispatch stays refused and not to retry it (issue #2348); the retried dispatch is refused with `declined it in the deck`, raises no request, opens no review and starts nothing.
 - **Does not assert:** that a daemon restart forgets the denial (memory-only by construction, `trust_requests` unit tests).
 - **Platform coverage:** mac+linux.
 
@@ -488,6 +488,20 @@ The deck asks for the approval itself when it refuses to start an unapproved orc
 - **Agent:** stand-ins.
 - **Asserts:** the refused run-now leaves one pending request and `schedule list` says `requested in the deck`; the TUI attaching afterwards opens the review with `Asked by: scheduled task 'request-sched'`; after another client denies it the review closes with `was answered elsewhere` and nothing started.
 - **Does not assert:** two TUIs side by side; the desktop app (its vitest and Playwright specs).
+- **Platform coverage:** mac+linux.
+
+##### config-trust/request/004 — Approving from a terminal while the deck's request is pending tells the refused caller.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`), real `dispatch` CLI from a plain pane against the real `daemon serve`; the approval is the real `trust approve --yes` run outside any pane with the deck's isolated state dir.
+- **Agent:** stand-ins.
+- **Asserts:** the refusal says a notice will follow; after `trust approve`, the TUI's review closes with `was answered elsewhere`, the caller's inbox holds exactly one deck notice saying it was approved (issue #2348), and the retried dispatch runs its roles in the unit's worktree.
+- **Does not assert:** the sweep's interval; a caller that is gone by then (the inbox's live-recipient check, `inbox_hub` tests).
+- **Platform coverage:** mac+linux.
+
+##### config-trust/request/005 — Another client's approval of the deck's request tells the refused caller.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`); the other client is a raw `ApproveProjectTrust` on the attach socket, the verb the desktop app's Approve sends.
+- **Agent:** stand-ins.
+- **Asserts:** the TUI's review closes with `was answered elsewhere`, the caller's inbox holds exactly one deck notice saying it was approved (issue #2348), and the retried dispatch runs its roles in the unit's worktree.
+- **Does not assert:** the desktop app's own UI (its vitest and Playwright specs); `delegate`, `pane restart` and `pane spawn` callers (`trust_requests` unit tests record them the same way).
 - **Platform coverage:** mac+linux.
 
 #### config-trust/rearm

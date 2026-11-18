@@ -1030,8 +1030,22 @@ pub async fn handle_dispatch(
     // `resolved_target` — is the approved text. Checked before the worktree
     // exists, so a refusal creates nothing and its devbox warm-up never runs;
     // the caller's `dispatch` fails with the reason and the approving command.
+    // Issue #2348: the calling agent is told when the user answers the
+    // in-deck request this refusal raises.
     if let crate::spawn::SpawnTarget::Orchestration { config, .. } = &resolved_target
-        && let Some(refusal) = crate::spawn::approval_refusal(&clone_dir, config, "dispatch").await
+        && let Some(refusal) = crate::spawn::approval_refusal(
+            &clone_dir,
+            config,
+            "dispatch",
+            ctx.caller.as_ref().map(|caller| {
+                crate::trust_requests::RefusedCaller::new(
+                    &caller.pane_id,
+                    &caller.agent_id,
+                    "dispatch",
+                )
+            }),
+        )
+        .await
     {
         return DispatchResult {
             worktree_dir: paths.worktree_dir.clone(),

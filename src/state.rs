@@ -5649,25 +5649,42 @@ impl ProjectConfigs {
 
     /// PRD #1885: the refusal for spawning from orchestration `name` of `dir`'s
     /// config, logged at warn under `path`, or `None` when it is approved.
-    pub(crate) fn trust_refusal(&self, path: &str, dir: &str, name: &str) -> Option<String> {
+    ///
+    /// `caller` is the agent whose `path` (`pane restart`, `pane spawn`,
+    /// `delegate`) this is, told the answer once the user answers the
+    /// in-deck request (issue #2348).
+    pub(crate) fn trust_refusal(
+        &self,
+        path: &str,
+        dir: &str,
+        name: &str,
+        caller: Option<&crate::trust_requests::RefusedCaller>,
+    ) -> Option<String> {
         let check = self.trust_check(dir, name)?;
         crate::project_trust::log_refusal(path, &check);
         // Issue #2330: in the serving daemon, ask the attached clients for
         // the approval, and say so.
-        crate::trust_requests::refusal_for(&check, path)
+        crate::trust_requests::refusal_for(&check, path, caller)
     }
 
     /// PRD #1885: [`Self::trust_refusal`] for a `delegate` sent from
     /// `caller_pane`, logged at warn naming that pane, so the daemon log says
     /// which orchestrator's delegate was refused.
+    ///
+    /// `caller_agent` is the agent in `caller_pane`, when one is registered
+    /// there: it is told the answer once the user answers the in-deck request
+    /// (issue #2348).
     pub(crate) fn delegate_trust_refusal(
         &self,
         caller_pane: &str,
+        caller_agent: Option<&str>,
         dir: &str,
         name: &str,
     ) -> Option<String> {
         let check = self.trust_check(dir, name)?;
-        let refusal = crate::trust_requests::refusal_for(&check, "delegate")?;
+        let caller = caller_agent
+            .map(|agent| crate::trust_requests::RefusedCaller::new(caller_pane, agent, "delegate"));
+        let refusal = crate::trust_requests::refusal_for(&check, "delegate", caller.as_ref())?;
         warn!(
             pane_id = %escape_id_for_log(caller_pane),
             orchestration = %escape_id_for_log(name),
@@ -6283,7 +6300,12 @@ async fn dispatch_one_owned(
     let role_config_indexed = match (cwd.as_deref(), orchestration.as_ref()) {
         (Some(c), Some(identity)) => {
             let configs = ProjectConfigs::load(vec![c.to_owned()]).await;
-            trust_refusal = configs.trust_refusal("delegate", c, identity.name());
+            // Issue #2348: the orchestrator whose delegate this is hears the
+            // in-deck answer.
+            let caller = orchestrator_agent_id.as_deref().map(|agent| {
+                crate::trust_requests::RefusedCaller::new(&orchestrator_pane_id, agent, "delegate")
+            });
+            trust_refusal = configs.trust_refusal("delegate", c, identity.name(), caller.as_ref());
             lookup_orchestration_role_indexed(&configs, c, identity.name(), &target_role)
         }
         _ => None,
@@ -11685,6 +11707,12 @@ impl AppState {
         // refusal delivers nothing and the orchestrator's `delegate` fails with
         // the reason and the command that approves it.
         if let Some(identity) = orchestration.as_ref() {
+            // Issue #2348 (PR #2351 review): the agent the sender's capability
+            // attested, not whoever holds the pane after the config read; the
+            // pane's current agent only for an unattested call.
+            let caller_agent = sender_agent_id
+                .map(str::to_owned)
+                .or_else(|| registry.pane_current_agent_id(&signal.pane_id));
             let mut checked: Vec<&str> = Vec::new();
             for (_, pane_id) in &targets {
                 let Some(cwd) = self.pane_cwd_map.get(pane_id).map(String::as_str) else {
@@ -11694,9 +11722,12 @@ impl AppState {
                     continue;
                 }
                 checked.push(cwd);
-                if let Some(refusal) =
-                    configs.delegate_trust_refusal(&signal.pane_id, cwd, identity.name())
-                {
+                if let Some(refusal) = configs.delegate_trust_refusal(
+                    &signal.pane_id,
+                    caller_agent.as_deref(),
+                    cwd,
+                    identity.name(),
+                ) {
                     return DelegateResponse {
                         error: Some(refusal),
                         ..Default::default()
@@ -12444,7 +12475,21 @@ pub async fn handle_restart_role_with_state(
         // only from an approved orchestration — judged on the same read whose
         // command the restart would run.
         if let (Some(c), Some(identity)) = (cwd.as_deref(), orchestration.as_ref())
-            && let Some(refusal) = configs.trust_refusal("pane restart", c, identity.name())
+            && let Some(refusal) = configs.trust_refusal(
+                "pane restart",
+                c,
+                identity.name(),
+                registry
+                    .pane_current_agent_id(&signal.pane_id)
+                    .map(|agent| {
+                        crate::trust_requests::RefusedCaller::new(
+                            &signal.pane_id,
+                            agent,
+                            "pane restart",
+                        )
+                    })
+                    .as_ref(),
+            )
         {
             return RestartRoleResponse {
                 error: Some(refusal),
@@ -12721,7 +12766,21 @@ pub async fn handle_spawn_role_with_state(
         // PRD #1885: spawning a role runs its command, unattended, so only from
         // an approved orchestration — judged on the read the spawn would run.
         if let Some(c) = cwd.as_deref()
-            && let Some(refusal) = configs.trust_refusal("pane spawn", c, identity.name())
+            && let Some(refusal) = configs.trust_refusal(
+                "pane spawn",
+                c,
+                identity.name(),
+                registry
+                    .pane_current_agent_id(&signal.pane_id)
+                    .map(|agent| {
+                        crate::trust_requests::RefusedCaller::new(
+                            &signal.pane_id,
+                            agent,
+                            "pane spawn",
+                        )
+                    })
+                    .as_ref(),
+            )
         {
             return SpawnRoleResponse {
                 error: Some(refusal),

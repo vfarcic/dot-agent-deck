@@ -1522,6 +1522,7 @@ async fn refuse_unapproved_worktree(
                         clone_chosen.config,
                         task_name,
                         &format!("scheduled task '{task_name}'"),
+                        None,
                     )
                     .await
                 }
