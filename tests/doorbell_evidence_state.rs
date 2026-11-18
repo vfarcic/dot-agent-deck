@@ -3,7 +3,9 @@
 use std::path::PathBuf;
 
 use dot_agent_deck::doorbell_screen::{CLAUDE_PROFILE, CODEX_PROFILE, ScreenProfile};
-use dot_agent_deck::evidence_state::{EdgeReason, EvidenceState, EvidenceStatus};
+use dot_agent_deck::evidence_state::{
+    AGREEMENT_TWINS_MAX, CleanBasis, EdgeReason, EvidenceState, EvidenceStatus,
+};
 use spec::spec;
 
 /// A recorded Codex layout run: its bytes, where each PTY read ended, its
@@ -22,10 +24,14 @@ fn run(stem: &str) -> Run {
 }
 
 fn run_in(dir: &str, stem: &str) -> Run {
+    run_at(&format!("{dir}/r5wake"), stem)
+}
+
+/// A recorded run under `tests/fixtures/<dir>`.
+fn run_at(dir: &str, stem: &str) -> Run {
     let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
         .join(dir)
-        .join("r5wake")
         .join(stem);
     let bytes = std::fs::read(format!("{}.bin", base.display())).unwrap();
     let index: serde_json::Value =
@@ -252,6 +258,18 @@ fn clean(state: &EvidenceState) -> bool {
     matches!(state.status(), EvidenceStatus::Clean { .. })
 }
 
+/// Codex's profile with the agreement rule off (issue #2262), for the tests
+/// of what Codex's width and pair witnesses alone decide: with it on, a
+/// frame those witnesses refuse can still be Clean on agreement, and the
+/// agreement tests below say when.
+fn codex_witness_only() -> &'static ScreenProfile {
+    static PROFILE: std::sync::OnceLock<ScreenProfile> = std::sync::OnceLock::new();
+    PROFILE.get_or_init(|| ScreenProfile {
+        agreement: false,
+        ..CODEX_PROFILE
+    })
+}
+
 fn pending_after_edge(state: &EvidenceState) -> bool {
     matches!(
         state.status(),
@@ -290,7 +308,7 @@ fn doorbell_044_a_redraw_for_a_wider_terminal_stays_pending() {
     assert!(clean(&state));
 }
 
-/// Scenario: Codex's start-up logo sits at the same column for the two widths 2k and 2k + 1. Move a terminal from 201 to 200 columns (the even width), and another from 200 to 201 (the odd width), and push a logo drawn for each width: every one turns the state Clean on the pair witness (issue #2124), since it reads the same at either width. A terminal that has only ever been 200 or only ever 201 columns wide is Clean on its own logo as a width witness, and one moved from 200 to 198, a width that does not share the logo's column, refuses the 200-column logo and takes its own.
+/// Scenario: Codex's start-up logo sits at the same column for the two widths 2k and 2k + 1. Move a terminal from 201 to 200 columns (the even width), and another from 200 to 201 (the odd width), and push a logo drawn for each width: every one turns the state Clean on the pair witness (issue #2124), since it reads the same at either width. A terminal that has only ever been 200 or only ever 201 columns wide is Clean on its own logo as a width witness, and one moved from 200 to 198, a width that does not share the logo's column, refuses the 200-column logo on the witnesses alone (with the agreement rule off) and takes its own.
 #[spec("inbox/doorbell/044")]
 #[test]
 fn doorbell_044_a_logo_two_adjacent_widths_share_is_clean_on_the_pair_witness() {
@@ -312,7 +330,7 @@ fn doorbell_044_a_logo_two_adjacent_widths_share_is_clean_on_the_pair_witness() 
         assert!(clean(&state), "only ever {cols} wide");
         assert!(!state.pair_held(), "only ever {cols} wide");
     }
-    let mut state = EvidenceState::new(Some(&CODEX_PROFILE), 50, 200);
+    let mut state = EvidenceState::new(Some(codex_witness_only()), 50, 200);
     state.edge(EdgeReason::Resize, 50, 198);
     state.push(&codex_logo(200), |_| Vec::new());
     assert!(pending_after_edge(&state));
@@ -437,12 +455,12 @@ fn doorbell_044_recorded_redraws_read_the_same_at_both_widths_of_the_pair() {
     assert_eq!(seen, 20);
 }
 
-/// Scenario: Push redraws whose rows reach the right edge without being a witness: for Codex, plain text exactly as wide as the terminal, plain text padded to the edge, the dim turn row's words run to the edge with no padding, and a numbered choice padded to the edge but not highlighted; for Claude Code, a row of other characters across the width and a rule with one cell broken. Each leaves the state pending, and still pending after a carriage return or a cursor move ends the row; a real witness pushed after them turns it Clean.
+/// Scenario: Push redraws whose rows reach the right edge without being a witness: for Codex, read on its witnesses alone, plain text exactly as wide as the terminal, plain text padded to the edge, the dim turn row's words run to the edge with no padding, and a numbered choice padded to the edge but not highlighted; for Claude Code, a row of other characters across the width and a rule with one cell broken. Each leaves the state pending, and still pending after a carriage return or a cursor move ends the row; a real witness pushed after them turns it Clean.
 #[spec("inbox/doorbell/044")]
 #[test]
 fn doorbell_044_text_reaching_the_edge_is_not_a_witness() {
     let cols = 200;
-    let mut state = EvidenceState::new(Some(&CODEX_PROFILE), 50, cols);
+    let mut state = EvidenceState::new(Some(codex_witness_only()), 50, cols);
     for row in [
         "x".repeat(cols as usize),
         padded("  hello", cols),
@@ -497,7 +515,9 @@ fn doorbell_044_text_reaching_the_edge_is_not_a_witness() {
 /// The stale frames a shrink can leave behind, each with the profile, the
 /// width the terminal had and the width it has now: Claude Code's rule one
 /// cell and twenty cells too long, and Codex's choice and turn rows padded one
-/// column and twenty columns too wide.
+/// column and twenty columns too wide, read on Codex's witnesses alone
+/// ([`codex_witness_only`]; the agreement rule's own stale-frame test is
+/// `doorbell_044_agreement_ends_at_the_first_reading_that_differs`).
 fn stale_frames() -> Vec<(&'static str, &'static ScreenProfile, u16, u16, Frame, Frame)> {
     let mut out: Vec<(&'static str, &'static ScreenProfile, u16, u16, Frame, Frame)> = Vec::new();
     for (old, new) in [(81, 80), (200, 180)] {
@@ -513,7 +533,7 @@ fn stale_frames() -> Vec<(&'static str, &'static ScreenProfile, u16, u16, Frame,
     for (old, new) in [(181, 180), (200, 180)] {
         out.push((
             "codex choice",
-            &CODEX_PROFILE,
+            codex_witness_only(),
             old,
             new,
             codex_choice_parts(old),
@@ -521,7 +541,7 @@ fn stale_frames() -> Vec<(&'static str, &'static ScreenProfile, u16, u16, Frame,
         ));
         out.push((
             "codex turn",
-            &CODEX_PROFILE,
+            codex_witness_only(),
             old,
             new,
             codex_turn_parts(old),
@@ -564,7 +584,7 @@ fn never_clean<'a>(
     }
 }
 
-/// Scenario: Shrink a Claude Code terminal and a Codex terminal, then push each agent's redraw drawn for the old, wider width with the PTY read cut right after the last cell that fits the new width: Claude Code's rule, and Codex's padded choice and turn rows, one column and twenty columns too wide. At the cut the row looks exactly like the one drawn for the new width, but the state stays pending there, after the rest of the stale redraw arrives, and when the redraw is pushed one byte at a time or cut at any other single place. The redraw drawn for the width in force, pushed whole, one byte at a time or cut anywhere, turns it Clean.
+/// Scenario: Shrink a Claude Code terminal and a Codex terminal (read on Codex's witnesses alone), then push each agent's redraw drawn for the old, wider width with the PTY read cut right after the last cell that fits the new width: Claude Code's rule, and Codex's padded choice and turn rows, one column and twenty columns too wide. At the cut the row looks exactly like the one drawn for the new width, but the state stays pending there, after the rest of the stale redraw arrives, and when the redraw is pushed one byte at a time or cut at any other single place. The redraw drawn for the width in force, pushed whole, one byte at a time or cut anywhere, turns it Clean.
 #[spec("inbox/doorbell/044")]
 #[test]
 fn doorbell_044_a_wider_row_cut_at_the_new_edge_is_never_clean() {
@@ -632,13 +652,13 @@ fn doorbell_044_a_wider_row_cut_at_the_new_edge_is_never_clean() {
     }
 }
 
-/// Scenario: Push a Codex choice row and a Claude Code rule drawn for the width in force, ending the push right after the row's last cell. The state stays pending until the next byte moves the cursor off the row, and turns Clean then.
+/// Scenario: Push a Codex choice row (read on Codex's witnesses alone) and a Claude Code rule drawn for the width in force, ending the push right after the row's last cell. The state stays pending until the next byte moves the cursor off the row, and turns Clean then.
 #[spec("inbox/doorbell/044")]
 #[test]
 fn doorbell_044_a_witness_row_counts_once_the_row_has_ended() {
     for (profile, (head, row, tail), cols) in [
-        (&CODEX_PROFILE, codex_choice_parts(180), 180),
-        (&CODEX_PROFILE, codex_turn_parts(180), 180),
+        (codex_witness_only(), codex_choice_parts(180), 180),
+        (codex_witness_only(), codex_turn_parts(180), 180),
         (&CLAUDE_PROFILE, claude_frame_parts(80), 80),
     ] {
         let mut state = EvidenceState::new(Some(profile), 50, cols);
@@ -791,4 +811,193 @@ fn doorbell_044_the_state_reports_every_width_its_pane_has_had() {
         state.edge(EdgeReason::Resize, 50, cols);
     }
     assert_eq!(state.widths(), (117, vec![116, 117, 180]));
+}
+
+/// A Codex frame with no witness: the composer's empty row and its
+/// placeholder, the cursor after the prompt glyph.
+fn codex_composer_only() -> Vec<u8> {
+    format!("{CODEX_REDRAW}\x1b[20;1H› \x1b[2mAsk Codex to do anything\x1b[0m\x1b[20;3H")
+        .into_bytes()
+}
+
+/// Scenario: Replay real Codex 0.169.0 before its first prompt in two panes under 32 rows, where it draws no logo, as the PTY read it: one 27 × 162 whose box was typed into (`x`) and cleared, then nudged to 161 columns and back, and one 24 × 80 nudged to 79 and back. Read on Codex's witnesses alone, neither state is ever Clean, the hold issue #2262 reported. With the agreement rule each is Clean on agreement once the replay ends, at the width in force with the other width read alike, and the frame shows Codex's empty composer with its placeholder.
+#[spec("inbox/doorbell/044")]
+#[test]
+fn doorbell_044_a_short_codex_with_no_witness_is_clean_on_agreement() {
+    for stem in ["codex-0.169.0-touched-27x162", "codex-0.169.0-nudged-24x80"] {
+        let run = run_at("codex-inbox/short-pane", stem);
+        assert_eq!(run.edges.len(), 2, "{stem}: a nudge's shrink and restore");
+        for agreement in [false, true] {
+            let profile = if agreement {
+                &CODEX_PROFILE
+            } else {
+                codex_witness_only()
+            };
+            let mut state = EvidenceState::new(Some(profile), run.rows, run.cols);
+            let mut ever = false;
+            let mut pos = 0;
+            for (i, &(off, rows, cols)) in run.edges.iter().enumerate() {
+                while pos < off {
+                    let next = run
+                        .read_ends
+                        .iter()
+                        .copied()
+                        .find(|&e| e > pos)
+                        .unwrap_or(off);
+                    let next = next.min(off);
+                    state.push(&run.bytes[pos..next], |_| Vec::new());
+                    ever |= clean(&state);
+                    pos = next;
+                }
+                let reason = if i == 0 {
+                    EdgeReason::NudgeShrink
+                } else {
+                    EdgeReason::NudgeRestore
+                };
+                state.edge(reason, rows, cols);
+            }
+            let rest: Vec<usize> = run.read_ends.iter().copied().filter(|&e| e > pos).collect();
+            for end in rest {
+                state.push(&run.bytes[pos..end], |_| Vec::new());
+                ever |= clean(&state);
+                pos = end;
+            }
+            if !agreement {
+                assert!(!ever, "{stem}: Clean on a witness: {:?}", state.status());
+                continue;
+            }
+            assert_eq!(
+                state.clean_basis(),
+                Some(CleanBasis::Agreement),
+                "{stem}: {:?}",
+                state.status()
+            );
+            assert_eq!(state.widths(), (run.cols, vec![run.cols - 1, run.cols]));
+            let frame = state.clean_frame().unwrap();
+            assert!(
+                CODEX_PROFILE.empty_and_ready(&frame) && CODEX_PROFILE.placeholder_empty(&frame),
+                "{stem}: the empty composer with its placeholder"
+            );
+        }
+    }
+}
+
+/// Scenario: Shrink Codex terminals from 181 and from 200 columns to 180, both widths now recorded at one row count, then push Codex's padded choice and turn rows drawn for the old width: whole, a byte at a time, and cut once at every byte. The push that reads the row differently at the two widths ends the agreement rule: right after the last cell that fits the new edge both widths still show the same screen, and the next byte, which wraps at the narrower width only, leaves the state not Clean with the frame read at the cut no longer standing; once the stale redraw is all in the state is pending, gives no frame, and any frame read on agreement earlier no longer stands. The redraw drawn for the width in force turns it Clean on its width witness.
+#[spec("inbox/doorbell/044")]
+#[test]
+fn doorbell_044_agreement_ends_at_the_first_reading_that_differs() {
+    let rows = 50;
+    for (old, new) in [(181, 180), (200, 180)] {
+        for (what, stale, fresh) in [
+            ("choice", codex_choice_parts(old), codex_choice(new)),
+            ("turn", codex_turn_parts(old), codex_turn(new)),
+        ] {
+            let bytes = whole(stale.clone());
+            let fits: String = stale.1.chars().take(new as usize).collect();
+            let cut = stale.0.len() + fits.len();
+            let shrunk = || shrunk(&CODEX_PROFILE, rows, old, new, &codex_choice(old));
+            let ended = |state: &EvidenceState, how: &str| {
+                assert!(
+                    pending_after_edge(state) && state.clean_frame().is_none(),
+                    "{what} {old} → {new}, {how}: {:?}",
+                    state.status()
+                );
+            };
+
+            let mut state = shrunk();
+            state.push(&bytes, |_| Vec::new());
+            ended(&state, "whole");
+
+            // Right after the last cell that fits, a terminal of either width
+            // shows the same screen, so a frame read there is the one on
+            // screen; the next byte wraps at the narrower width only, which
+            // ends the rule, and the frame read at the cut no longer stands.
+            let mut state = shrunk();
+            state.push(&bytes[..cut], |_| Vec::new());
+            let mark = state.clean_frame_marked().map(|(_, mark)| mark);
+            state.push(&bytes[cut..cut + 1], |_| Vec::new());
+            assert!(
+                !clean(&state) && mark.is_none_or(|mark| !state.frame_unchanged(mark)),
+                "{what} {old} → {new}: Clean past the edge cut: {:?}",
+                state.status()
+            );
+            state.push(&bytes[cut + 1..], |_| Vec::new());
+            ended(&state, "cut at the edge");
+
+            let mut state = shrunk();
+            let mut marks = Vec::new();
+            for byte in bytes.chunks(1) {
+                state.push(byte, |_| Vec::new());
+                marks.extend(state.clean_frame_marked().map(|(_, mark)| mark));
+            }
+            ended(&state, "a byte at a time");
+            assert!(marks.iter().all(|&mark| !state.frame_unchanged(mark)));
+
+            for at in 1..bytes.len() {
+                let mut state = shrunk();
+                state.push(&bytes[..at], |_| Vec::new());
+                let mark = state.clean_frame_marked().map(|(_, mark)| mark);
+                state.push(&bytes[at..], |_| Vec::new());
+                ended(&state, &format!("cut at {at}"));
+                assert!(mark.is_none_or(|mark| !state.frame_unchanged(mark)));
+            }
+
+            let mut state = shrunk();
+            state.push(&bytes, |_| Vec::new());
+            state.push(&fresh, |_| Vec::new());
+            assert_eq!(state.clean_basis(), Some(CleanBasis::Witness), "{what}");
+        }
+    }
+}
+
+/// Scenario: Push a Codex frame with no witness, only its empty composer. It is Clean on agreement in a terminal that has only ever had one width, and in one that has had up to four other widths at one row count. It stays pending in one that has had five other widths, in one whose row count changed, and for Claude Code, whose profile does not opt in. In a terminal that has had 100 and 90 columns, a write past the narrower edge reads differently at the two widths and the frame stays pending. Codex's start-up logo drawn for 200 columns, read at 198 after 200, reads the same at both and is Clean on agreement, where the witnesses alone refuse it.
+#[spec("inbox/doorbell/044")]
+#[test]
+fn doorbell_044_agreement_needs_one_row_count_and_few_enough_widths() {
+    let frame = codex_composer_only();
+    let mut state = EvidenceState::new(Some(&CODEX_PROFILE), 24, 100);
+    state.push(&frame, |_| Vec::new());
+    assert_eq!(state.clean_basis(), Some(CleanBasis::Agreement));
+
+    let widths = |others: &[u16]| {
+        let mut state = EvidenceState::new(Some(&CODEX_PROFILE), 24, 100);
+        for &cols in others {
+            state.edge(EdgeReason::Resize, 24, cols);
+        }
+        state.edge(EdgeReason::Resize, 24, 100);
+        state.push(&frame, |_| Vec::new());
+        state
+    };
+    let four: Vec<u16> = (96..96 + AGREEMENT_TWINS_MAX as u16).collect();
+    assert_eq!(
+        widths(&four).clean_basis(),
+        Some(CleanBasis::Agreement),
+        "{four:?}"
+    );
+    let five: Vec<u16> = (95..96 + AGREEMENT_TWINS_MAX as u16).collect();
+    let state = widths(&five);
+    assert!(pending_after_edge(&state), "{five:?}: {:?}", state.status());
+
+    let mut state = EvidenceState::new(Some(&CODEX_PROFILE), 24, 100);
+    state.edge(EdgeReason::Resize, 30, 100);
+    state.edge(EdgeReason::Resize, 24, 100);
+    state.push(&frame, |_| Vec::new());
+    assert!(pending_after_edge(&state), "{:?}", state.status());
+
+    let mut state = EvidenceState::new(Some(&CLAUDE_PROFILE), 24, 100);
+    state.push(&frame, |_| Vec::new());
+    assert!(!clean(&state), "{:?}", state.status());
+
+    let mut state = EvidenceState::new(Some(&CODEX_PROFILE), 24, 100);
+    state.edge(EdgeReason::Resize, 24, 90);
+    let mut past = frame.clone();
+    past.extend_from_slice(b"\x1b[5;95Hx\x1b[20;3H");
+    state.push(&past, |_| Vec::new());
+    assert!(pending_after_edge(&state), "{:?}", state.status());
+
+    let mut state = EvidenceState::new(Some(&CODEX_PROFILE), 50, 200);
+    state.edge(EdgeReason::Resize, 50, 198);
+    state.push(&codex_logo(200), |_| Vec::new());
+    assert_eq!(state.clean_basis(), Some(CleanBasis::Agreement));
+    assert!(!state.pair_held());
 }

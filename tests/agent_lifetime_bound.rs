@@ -1027,3 +1027,174 @@ fn a_setsid_escapee_is_still_bounded_by_the_cap() {
          #861."
     );
 }
+
+/// The cap [`a_reaper_ends_once_its_last_escapee_has`] arms: long enough that a
+/// reaper waiting it out cannot be mistaken for one that left on time.
+#[cfg(target_os = "linux")]
+const LINGER_CAP_SECS: u64 = 60;
+
+/// The live processes whose command line contains `marker`.
+#[cfg(target_os = "linux")]
+fn pids_with_marker(marker: &str) -> Vec<libc::pid_t> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| {
+            entry
+                .ok()?
+                .file_name()
+                .to_str()?
+                .parse::<libc::pid_t>()
+                .ok()
+        })
+        .filter(|pid| {
+            std::fs::read(format!("/proc/{pid}/cmdline"))
+                .is_ok_and(|cmdline| String::from_utf8_lossy(&cmdline).contains(marker))
+        })
+        .collect()
+}
+
+/// Scenario: Run a wrapped child that `setsid`s a grandchild into its own
+/// session and exits at once, with a 60-second lifetime cap, then SIGKILL the
+/// wrapper. The wrapper's forked reaper must still be waiting while that
+/// escapee runs, and once the test lets the escapee exit, the reaper must be
+/// gone within seconds rather than at the cap.
+///
+/// Issue #2132. The reaper swept for its tag once, when the group died, and
+/// latched what it found, so a tagged process that was only on its way out at
+/// that moment kept the reaper alive to its deadline: measured after
+/// `inbox/probe/041`, daemon-forked reapers waiting out their 300 s with no
+/// process anywhere still carrying their tag.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_reaper_ends_once_its_last_escapee_has() {
+    if !Command::new("setsid")
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+    {
+        eprintln!("SKIP: the escapee probe needs `setsid(1)` on PATH");
+        return;
+    }
+    let fixture = common::harness_tempdir().expect("create reaper-linger fixture");
+    let escapee_pid_path = fixture.path().join("escapee.pid");
+    let release = fixture.path().join("release");
+    let (socket, listener) = probe_hook_listener(fixture.path());
+    // The fixture path appears in the wrapped shell's script, so in the
+    // wrapper's argv and its reaper's (a fork keeps the argv), and nowhere in
+    // the escapee's, whose script is only the quoted part.
+    let marker = fixture.path().display().to_string();
+    let escapee = "setsid /bin/sh -c 'printf \"%s\\n\" \"$$\" > \"$ESCAPEE_PID_FILE\"; \
+         while [ ! -e \"$ESCAPEE_RELEASE\" ]; do sleep 0.1; done' \
+         </dev/null >/dev/null 2>&1 &";
+    let script = format!("{escapee} : '{marker}'; exit 0");
+
+    // The reaper's deadline counts from after this spawn, so a reaper that
+    // waits it out is still alive at `spawned + LINGER_CAP_SECS`.
+    let spawned = Instant::now();
+    let mut wrapper = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+        .args(["wrap", "--agent", "codex", "--", "/bin/sh", "-c", &script])
+        .env("ESCAPEE_PID_FILE", &escapee_pid_path)
+        .env("ESCAPEE_RELEASE", &release)
+        .env("DOT_AGENT_DECK_SOCKET", &socket)
+        .env(MAX_LIFETIME_VAR, LINGER_CAP_SECS.to_string())
+        .env_remove(LIFETIME_TAG_VAR)
+        .env_remove("DOT_AGENT_DECK_EXIT_WHEN_ORPHANED")
+        .env_remove("DOT_AGENT_DECK_PANE_ID")
+        .env_remove("DOT_AGENT_DECK_AGENT_ID")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn reaper-linger probe");
+    let read_pid = || -> Option<libc::pid_t> {
+        std::fs::read_to_string(&escapee_pid_path)
+            .ok()
+            .and_then(|contents| contents.trim().parse().ok())
+    };
+    if !common::wait_until(probe_start_budget(), || read_pid().is_some()) {
+        kill_wrapper(&mut wrapper);
+        let _ = std::fs::write(&release, "");
+        panic!("the probe never recorded its escapee's pid");
+    }
+    let escapee_pid = read_pid().expect("escapee pid recorded");
+    if let Err(why) = ready_to_strand(&listener, escapee_pid) {
+        kill_wrapper(&mut wrapper);
+        let _ = std::fs::write(&release, "");
+        panic!("reaper-linger probe: {why}");
+    }
+    kill_wrapper(&mut wrapper);
+
+    // The wrapper is dead and its shell exited at once, so what still carries
+    // the marker is the reaper.
+    let found = std::cell::RefCell::new(Vec::new());
+    common::wait_until(probe_start_budget(), || {
+        *found.borrow_mut() = pids_with_marker(&marker);
+        found.borrow().len() == 1
+    });
+    let reapers = found.into_inner();
+    let release_and_reap = |reapers: &[libc::pid_t]| {
+        let _ = std::fs::write(&release, "");
+        for pid in reapers {
+            // SAFETY: best-effort cleanup of a reaper this test's wrapper
+            // forked; the single-pid form, as the escapee cleanup above.
+            unsafe {
+                libc::kill(*pid, libc::SIGKILL);
+            }
+        }
+    };
+    if reapers.len() != 1 || !common::process_running(escapee_pid) {
+        release_and_reap(&reapers);
+        panic!(
+            "precondition failed: expected one reaper beside a live escapee, found reapers \
+             {reapers:?} and the escapee {}",
+            if common::process_running(escapee_pid) {
+                "alive"
+            } else {
+                "gone"
+            }
+        );
+    }
+    let reaper = reapers[0];
+    // Still waiting while its escapee runs: the cap is the escapee's to keep.
+    std::thread::sleep(Duration::from_millis(500));
+    if !common::process_running(reaper) {
+        release_and_reap(&[]);
+        panic!("the reaper left while its escapee was still running");
+    }
+
+    std::fs::write(&release, "").expect("release the escapee");
+    assert!(
+        common::wait_until(probe_start_budget(), || !common::process_running(
+            escapee_pid
+        )),
+        "the escapee must exit once released"
+    );
+    // Bounded by the reaper's own deadline, less a margin: a wait that could
+    // run past it would let a reaper that waits the cap out pass.
+    let before_deadline = (spawned + Duration::from_secs(LINGER_CAP_SECS))
+        .saturating_duration_since(Instant::now())
+        .saturating_sub(Duration::from_secs(5));
+    if before_deadline.is_zero() {
+        release_and_reap(&[reaper]);
+        panic!(
+            "the probe's set-up took too long to leave room before the reaper's \
+             {LINGER_CAP_SECS} s deadline, so this run cannot tell the two behaviours apart"
+        );
+    }
+    let budget = common::load_scaled(Duration::from_secs(10)).min(before_deadline);
+    let left = common::wait_until(budget, || !common::process_running(reaper));
+    if !left {
+        release_and_reap(&[reaper]);
+    }
+    assert!(
+        left,
+        "the reaper (pid {reaper}) was still waiting after the last process carrying its \
+         tag had exited, so it would hold on to its {LINGER_CAP_SECS} s cap with nothing \
+         left to end (issue #2132)"
+    );
+}

@@ -200,7 +200,7 @@ pub enum Tab {
         /// ([`TabManager::set_orchestration_context_path`], issue #1395) — only
         /// when that path names a per-publish file directly under the tab's own
         /// project (`agent_pty::is_own_context_path`). Left `None`, the tab
-        /// re-arms from the project's compatibility mirror, as before #1233.
+        /// re-arms with no task and the TUI says so (issue #1395).
         context_path: Option<std::path::PathBuf>,
     },
 }
@@ -1336,8 +1336,8 @@ impl TabManager {
             // a hydrated/restored tab comes back with the full supervisory view.
             zoomed: false,
             orchestration_id: orchestration_id.map(str::to_string),
-            // Issue #1233: the daemon's records carry no context path yet, so a
-            // hydrated tab re-arms from the compatibility mirror (#1395).
+            // Set afterwards from the daemon's record of the start role, when it
+            // has one (`set_orchestration_context_path`, issue #1395).
             context_path: None,
         });
 

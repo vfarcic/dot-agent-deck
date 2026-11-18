@@ -1391,7 +1391,7 @@ async fn spawn_with_unit(
                     &orchestration_id,
                     // Issue #1395: the file this spawn published for its
                     // orchestrator — the same value recorded above — so a live
-                    // tab re-arms from it rather than from the mirror.
+                    // tab re-arms from it.
                     context_path.as_deref(),
                 );
                 // …and give every role card its ROLE NAME, the same way the

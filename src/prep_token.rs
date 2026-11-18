@@ -38,14 +38,11 @@
 //! the first coordinator was about to read. Each publish now writes its own
 //! never-rewritten `orchestrator-context-<32 hex>.md`, and the coordinator prompt
 //! a binding records ([`PrepBinding::coordinator_prompt`]) names that file, so a
-//! later preparation cannot replace what an earlier launch reads. The fixed
-//! `orchestrator-context.md` is still refreshed after each publish, as a
-//! best-effort compatibility mirror for readers that predate #1233; no binding
-//! covers it. One reader in this build still takes its task from it — the TUI's
-//! re-arm of a tab whose own file it does not know (none recorded, or a path
-//! outside the tab's project) — with the pre-#1233 race. A tab whose known own
-//! file cannot be read carries no task rather than reading the mirror.
-//! Retiring it is follow-up #1395.
+//! later preparation cannot replace what an earlier launch reads. Issue #1395
+//! retired the fixed `orchestrator-context.md` that was refreshed beside each
+//! publish as a compatibility mirror, so no shared path is left for a binding
+//! to miss: nothing writes it, and the TUI's re-arm reads only a tab's own file,
+//! carrying no task when it has none it can read.
 //!
 //! # What a token is, and what it is NOT
 //!
