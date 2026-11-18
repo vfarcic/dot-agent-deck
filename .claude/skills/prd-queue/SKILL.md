@@ -306,6 +306,7 @@ Ask **which** PRDs too, unless the runner already named them. Relative priority 
 **Claim every PRD being dispatched, with [`issue-claim`](../issue-claim/SKILL.md)'s "Claim" section**: it assigns the runner and adds the `in-progress` label in one edit, reading the state immediately before the write and both halves back after it. This is a hard step, not a courtesy: it is what stops the other maintainer, and a second machine running as the same account, from starting the same work, and the whole point of dispatching is that nobody is watching the issue while the unit runs — for a PRD, possibly for hours. The commands, what each read must show, and why it narrows the race without closing it are there, not here.
 
 - **A collision at the first read aborts this candidate**: report it in step 9 and take the next one.
+- **Keep the first read's assignees with the candidate**: backing out later removes `$ME` only if that read showed nobody assigned.
 - **A claim that did not read back means no dispatch**: the unit would then run unclaimed for its whole life, which for a PRD is the longest life any unit here has. Back out of it as `issue-claim`'s "Backing out of a claim that did not hold" says, and report it.
 - **The unit's `/prd-start` sees the claim and takes it as its own**, because the unit runs on `agent/dispatch-prd-<n>` (step 6's name below); `issue-claim`'s "A unit whose dispatcher already claimed" is that rule. Name the unit as below, or the unit reads its dispatcher's label as someone else's claim and stops.
 
@@ -703,7 +704,7 @@ Re-check **immediately before each dispatch**, not once for the batch. PRDs move
 - **The issue's state** — closed in the meantime.
 - **The assignees** — anyone other than `$ME` appearing between step 6 and here is the collision step 6 narrows but cannot close. Skip the candidate and report it.
 
-**A PRD claimed in step 6 and then not dispatched gives its claim up right away**, with [`issue-claim`](../issue-claim/SKILL.md): **back out** (remove `$ME`, and the label only if no other login is assigned) when a re-check above found another assignee, and **release** when `dispatch` refused twice, the issue closed, or the runner dropped it.
+**A PRD claimed in step 6 and then not dispatched gives its claim up right away**, with [`issue-claim`](../issue-claim/SKILL.md): **back out** (remove `$ME` only if step 6's first read showed no assignee, and the label only if no other login is assigned) when a re-check above found another assignee, and **release** when `dispatch` refused twice, the issue closed, or the runner dropped it.
 
 **If `dispatch` refuses**, it names which collision: `worktree ... is already claimed` means a live unit is in that directory, `branch ... already exists` means a previous unit's branch survives. Either way — **pick a new name and retry once, then report and stop. Never delete a branch or a worktree to clear the way**, for the reason in step 6. A refusal mid-batch does not invalidate the units already dispatched; report which went and which did not.
 
