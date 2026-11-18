@@ -3542,51 +3542,55 @@ mod tests {
         );
     }
 
+    /// The bell's defaults (ring on waiting-for-input and on error, not on
+    /// idle) hold for a built config, an empty table and a partial one, and a
+    /// key that is present overrides only its own default.
     #[test]
-    fn bell_config_defaults() {
-        let bc = BellConfig::default();
-        assert!(bc.enabled);
-        assert!(bc.on_waiting_for_input);
-        assert!(!bc.on_idle);
-        assert!(bc.on_error);
+    fn bell_config_defaults_hold_when_built_parsed_empty_or_partial() {
+        let cases = [
+            ("built", BellConfig::default(), false),
+            ("empty", toml::from_str("").unwrap(), false),
+            ("partial", toml::from_str("on_idle = true").unwrap(), true),
+        ];
+        for (name, bc, on_idle) in cases {
+            assert!(bc.enabled, "{name}");
+            assert!(bc.on_waiting_for_input, "{name}");
+            assert_eq!(bc.on_idle, on_idle, "{name}");
+            assert!(bc.on_error, "{name}");
+        }
     }
 
+    /// `auto_config_prompt` and the `[bell]` table default when a config omits
+    /// them, and a config that sets them is read over the defaults, leaving the
+    /// keys it does not set at theirs.
     #[test]
-    fn bell_config_deserialize_empty() {
-        let bc: BellConfig = toml::from_str("").unwrap();
-        assert!(bc.enabled);
-        assert!(bc.on_waiting_for_input);
-        assert!(!bc.on_idle);
-        assert!(bc.on_error);
-    }
+    fn dashboard_config_reads_auto_config_prompt_and_bell_over_their_defaults() {
+        let built = DashboardConfig::default();
+        assert!(built.auto_config_prompt);
 
-    #[test]
-    fn bell_config_deserialize_partial() {
-        let bc: BellConfig = toml::from_str("on_idle = true").unwrap();
-        assert!(bc.enabled);
-        assert!(bc.on_idle);
-    }
+        let empty: DashboardConfig = toml::from_str("").unwrap();
+        assert!(empty.auto_config_prompt);
 
-    #[test]
-    fn dashboard_config_without_bell_section() {
-        let dc: DashboardConfig = toml::from_str(r#"default_command = "echo hi""#).unwrap();
-        assert_eq!(dc.default_command, "echo hi");
-        assert!(dc.bell.enabled);
-    }
+        let off: DashboardConfig = toml::from_str("auto_config_prompt = false").unwrap();
+        assert!(!off.auto_config_prompt);
 
-    #[test]
-    fn dashboard_config_with_bell_section() {
-        let toml_str = r#"
+        let no_bell: DashboardConfig = toml::from_str(r#"default_command = "echo hi""#).unwrap();
+        assert_eq!(no_bell.default_command, "echo hi");
+        assert!(no_bell.bell.enabled);
+
+        let with_bell: DashboardConfig = toml::from_str(
+            r#"
 default_command = "test"
 
 [bell]
 enabled = false
 on_idle = true
-"#;
-        let dc: DashboardConfig = toml::from_str(toml_str).unwrap();
-        assert!(!dc.bell.enabled);
-        assert!(dc.bell.on_idle);
-        assert!(dc.bell.on_waiting_for_input);
+"#,
+        )
+        .unwrap();
+        assert!(!with_bell.bell.enabled);
+        assert!(with_bell.bell.on_idle);
+        assert!(with_bell.bell.on_waiting_for_input);
     }
 
     #[test]
@@ -4599,24 +4603,6 @@ timeout_secs = 600
         assert!(dc.host_metrics.is_empty());
     }
 
-    #[test]
-    fn auto_config_prompt_defaults_to_true() {
-        let dc = DashboardConfig::default();
-        assert!(dc.auto_config_prompt);
-    }
-
-    #[test]
-    fn auto_config_prompt_deserialize_missing() {
-        let dc: DashboardConfig = toml::from_str("").unwrap();
-        assert!(dc.auto_config_prompt);
-    }
-
-    #[test]
-    fn auto_config_prompt_deserialize_false() {
-        let dc: DashboardConfig = toml::from_str("auto_config_prompt = false").unwrap();
-        assert!(!dc.auto_config_prompt);
-    }
-
     // PRD #42 M2: asserts the Unix temp-dir + per-uid fallback specifically
     // (`current_uid()` is Unix-only and the path shape is POSIX), so it is
     // gated to Unix. The Windows endpoint is a per-user named pipe with no
@@ -4700,116 +4686,69 @@ timeout_secs = 600
         }
     }
 
+    /// `state_dir()` takes `DOT_AGENT_DECK_STATE_DIR` first, then (on Unix)
+    /// `$XDG_STATE_HOME/dot-agent-deck`, then `$HOME/.local/state/dot-agent-deck`.
+    /// Windows has no XDG concept and ignores `$HOME`, so its last two rows
+    /// expect `%LOCALAPPDATA%\dot-agent-deck`, derived from the same `dirs`
+    /// crate the resolver uses so no machine-specific username is hardcoded.
     #[test]
-    fn state_dir_uses_explicit_override_first() {
+    fn state_dir_prefers_the_override_then_xdg_state_home_then_home() {
         let _guard = STATE_DIR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev_state = std::env::var("DOT_AGENT_DECK_STATE_DIR").ok();
-        let prev_xdg = std::env::var("XDG_STATE_HOME").ok();
-        // SAFETY: env-var lock held; restored on the way out.
-        unsafe {
-            std::env::set_var("DOT_AGENT_DECK_STATE_DIR", "/tmp/explicit-state");
-            std::env::set_var("XDG_STATE_HOME", "/should/be/ignored");
-        }
-
-        assert_eq!(state_dir(), PathBuf::from("/tmp/explicit-state"));
-
-        // SAFETY: same lock held; restoring previous values.
-        unsafe {
-            match prev_state {
-                Some(v) => std::env::set_var("DOT_AGENT_DECK_STATE_DIR", v),
-                None => std::env::remove_var("DOT_AGENT_DECK_STATE_DIR"),
+        let keys = ["DOT_AGENT_DECK_STATE_DIR", "XDG_STATE_HOME", "HOME"];
+        let prev: Vec<Option<String>> = keys.iter().map(|k| std::env::var(k).ok()).collect();
+        let fallback = |unix_path: &str| -> PathBuf {
+            #[cfg(unix)]
+            {
+                PathBuf::from(unix_path)
             }
-            match prev_xdg {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+            #[cfg(windows)]
+            {
+                let _ = unix_path;
+                dirs::data_local_dir()
+                    .map(|p| p.join("dot-agent-deck"))
+                    .unwrap_or_else(|| {
+                        crate::platform::paths::home_dir().join("AppData/Local/dot-agent-deck")
+                    })
             }
-        }
-    }
-
-    #[test]
-    fn state_dir_uses_xdg_state_home_when_set() {
-        let _guard = STATE_DIR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev_state = std::env::var("DOT_AGENT_DECK_STATE_DIR").ok();
-        let prev_xdg = std::env::var("XDG_STATE_HOME").ok();
-        // SAFETY: env-var lock held; restored on the way out.
-        unsafe {
-            std::env::remove_var("DOT_AGENT_DECK_STATE_DIR");
-            std::env::set_var("XDG_STATE_HOME", "/var/lib/state");
-        }
-
-        // Unix honors `$XDG_STATE_HOME`. Windows has no XDG concept, so the
-        // resolver ignores it and returns `%LOCALAPPDATA%\dot-agent-deck`
-        // (derived here from the same `dirs` crate the resolver uses, so no
-        // machine-specific username is hardcoded).
-        #[cfg(unix)]
-        assert_eq!(state_dir(), PathBuf::from("/var/lib/state/dot-agent-deck"));
-        #[cfg(windows)]
-        {
-            let expected = dirs::data_local_dir()
-                .map(|p| p.join("dot-agent-deck"))
-                .unwrap_or_else(|| {
-                    crate::platform::paths::home_dir().join("AppData/Local/dot-agent-deck")
-                });
-            assert_eq!(state_dir(), expected);
-        }
-
-        // SAFETY: same lock held; restoring previous values.
-        unsafe {
-            match prev_state {
-                Some(v) => std::env::set_var("DOT_AGENT_DECK_STATE_DIR", v),
-                None => std::env::remove_var("DOT_AGENT_DECK_STATE_DIR"),
+        };
+        let cases = [
+            (
+                [
+                    Some("/tmp/explicit-state"),
+                    Some("/should/be/ignored"),
+                    prev[2].as_deref(),
+                ],
+                PathBuf::from("/tmp/explicit-state"),
+            ),
+            (
+                [None, Some("/var/lib/state"), prev[2].as_deref()],
+                fallback("/var/lib/state/dot-agent-deck"),
+            ),
+            (
+                [None, None, Some("/home/test-user")],
+                fallback("/home/test-user/.local/state/dot-agent-deck"),
+            ),
+        ];
+        for (values, expected) in cases {
+            // SAFETY: env-var lock held; restored after the loop.
+            unsafe {
+                for (key, value) in keys.iter().zip(values) {
+                    match value {
+                        Some(v) => std::env::set_var(key, v),
+                        None => std::env::remove_var(key),
+                    }
+                }
             }
-            match prev_xdg {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
-            }
-        }
-    }
-
-    #[test]
-    fn state_dir_falls_back_to_home_when_xdg_unset() {
-        let _guard = STATE_DIR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev_state = std::env::var("DOT_AGENT_DECK_STATE_DIR").ok();
-        let prev_xdg = std::env::var("XDG_STATE_HOME").ok();
-        let prev_home = std::env::var("HOME").ok();
-        // SAFETY: env-var lock held; restored on the way out.
-        unsafe {
-            std::env::remove_var("DOT_AGENT_DECK_STATE_DIR");
-            std::env::remove_var("XDG_STATE_HOME");
-            std::env::set_var("HOME", "/home/test-user");
-        }
-
-        // Unix falls back to `$HOME/.local/state`. Windows ignores `$HOME`
-        // entirely and returns `%LOCALAPPDATA%\dot-agent-deck` (derived from the
-        // same `dirs` crate the resolver uses — no hardcoded username/prefix).
-        #[cfg(unix)]
-        assert_eq!(
-            state_dir(),
-            PathBuf::from("/home/test-user/.local/state/dot-agent-deck")
-        );
-        #[cfg(windows)]
-        {
-            let expected = dirs::data_local_dir()
-                .map(|p| p.join("dot-agent-deck"))
-                .unwrap_or_else(|| {
-                    crate::platform::paths::home_dir().join("AppData/Local/dot-agent-deck")
-                });
-            assert_eq!(state_dir(), expected);
+            assert_eq!(state_dir(), expected, "{values:?}");
         }
 
         // SAFETY: same lock held; restoring previous values.
         unsafe {
-            match prev_state {
-                Some(v) => std::env::set_var("DOT_AGENT_DECK_STATE_DIR", v),
-                None => std::env::remove_var("DOT_AGENT_DECK_STATE_DIR"),
-            }
-            match prev_xdg {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
-            }
-            match prev_home {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
+            for (key, value) in keys.iter().zip(prev) {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
             }
         }
     }
@@ -5521,52 +5460,44 @@ repo = "vfarcic/dot-ai"
         );
     }
 
-    // PRD #120 (M1) — a hand-edited issue-dispatch task with a malformed `repo`
-    // is rejected at load time (the value flows into `gh`/`git` argv), surfaced
-    // as a per-entry error and skipped, while valid siblings still load.
+    /// A repo that is not an `owner/name` slug and a label starting with `-`
+    /// are both rejected at load time (the values flow into `gh`/`git` argv):
+    /// the entry is dropped with one per-entry error.
     #[test]
-    fn issue_dispatch_rejects_invalid_repo() {
-        let toml_str = r#"
+    fn issue_dispatch_rejects_a_repo_or_label_unsafe_for_argv() {
+        let cases = [
+            ("bad repo", "repo = \"ext::sh -c id\"", Some("owner/name")),
+            (
+                "bad label",
+                "repo = \"acme/widgets\"\nlabel = \"-rf\"",
+                None,
+            ),
+        ];
+        for (name, fields, message) in cases {
+            let toml_str = format!(
+                r#"
 [[scheduled_tasks]]
-name = "bad repo"
+name = "{name}"
 cron = "0 9 * * *"
 working_dir = "/work/space"
-prompt = "Work on issue {{issue_number}}"
+prompt = "Work on issue {{{{issue_number}}}}"
 
 [scheduled_tasks.issue_dispatch]
-repo = "ext::sh -c id"
 max_per_run = 3
-"#;
-        let loaded = LoadedSchedules::parse(toml_str);
-        assert!(loaded.tasks.is_empty(), "malformed repo must be rejected");
-        assert_eq!(loaded.errors.len(), 1);
-        assert!(
-            loaded.errors[0].message.contains("owner/name"),
-            "error should explain the slug requirement: {:?}",
-            loaded.errors[0].message
-        );
-    }
-
-    #[test]
-    fn issue_dispatch_rejects_leading_dash_label() {
-        let toml_str = r#"
-[[scheduled_tasks]]
-name = "bad label"
-cron = "0 9 * * *"
-working_dir = "/work/space"
-prompt = "Work on issue {{issue_number}}"
-
-[scheduled_tasks.issue_dispatch]
-repo = "acme/widgets"
-max_per_run = 3
-label = "-rf"
-"#;
-        let loaded = LoadedSchedules::parse(toml_str);
-        assert!(
-            loaded.tasks.is_empty(),
-            "a leading-`-` label must be rejected"
-        );
-        assert_eq!(loaded.errors.len(), 1);
+{fields}
+"#
+            );
+            let loaded = LoadedSchedules::parse(&toml_str);
+            assert!(loaded.tasks.is_empty(), "{name} must be rejected");
+            assert_eq!(loaded.errors.len(), 1, "{name}");
+            if let Some(message) = message {
+                assert!(
+                    loaded.errors[0].message.contains(message),
+                    "{name}: the error should explain the slug requirement: {:?}",
+                    loaded.errors[0].message
+                );
+            }
+        }
     }
 
     #[test]

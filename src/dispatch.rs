@@ -2825,8 +2825,7 @@ mod tests {
                 result.message
             );
 
-            // Issue #1233: the orchestration's own per-publish file, not the
-            // compatibility mirror beside it.
+            // Issue #1233: the orchestration's own per-publish file.
             let context = std::fs::read_dir(worktree.join(".dot-agent-deck"))
                 .expect("list the dispatched worktree's .dot-agent-deck")
                 .filter_map(Result::ok)

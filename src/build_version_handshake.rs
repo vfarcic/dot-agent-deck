@@ -1707,6 +1707,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mismatch_prompt_for_a_daemon_that_predates_the_protocol_field_says_so() {
+        // A daemon too old to report its attach protocol is still a skew: the
+        // prompt says why it cannot attach and offers the exit that leaves the
+        // daemon running, not the keep-it option a compatible daemon gets.
+        let out = render_mismatch_prompt(
+            Some("0.20.0-g0000old"),
+            "0.31.1-g1111new",
+            &["only".into()],
+            ProtocolCheck::Skewed { daemon: None },
+        );
+        assert!(
+            out.contains(&format!(
+                "   This binary cannot attach to it: the daemon predates the attach-protocol \
+                 version field, and this binary speaks v{PROTOCOL_VERSION}.\n"
+            )),
+            "got: {out:?}"
+        );
+        assert!(
+            out.contains("[any other key] exit, leaving the daemon running\n"),
+            "got: {out:?}"
+        );
+    }
+
     fn summary(count: usize, names: &[&str]) -> RunningAgentsSummary {
         RunningAgentsSummary {
             count,

@@ -13,6 +13,7 @@
 
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions, Permissions};
+use std::io::Write;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -30,7 +31,9 @@ use dot_agent_deck::composer_probe::instance::{
 use dot_agent_deck::composer_probe::observe::{
     Bell, ControlOp, ControlRefusal, DRAIN_RETRIES, E2_AFTER, Observer, SCAN_PERIOD, Spawned,
 };
-use dot_agent_deck::composer_probe::record::{Decision, NotConsumed, RecordKey, Settlement};
+use dot_agent_deck::composer_probe::record::{
+    Attribution, Decision, NotConsumed, RecordKey, Settlement,
+};
 use dot_agent_deck::doorbell_activation::{
     EditorProbe, EditorSelection, ExportShape, KeymapSource, LatchedRelease, Measurement,
     PasteToggles,
@@ -42,6 +45,117 @@ use semver::Version;
 use spec::spec;
 
 const G: u64 = 7;
+
+/// When this test binary runs as a helper copy with this variable naming a
+/// directory, it holds itself where a helper is partway through its
+/// `execve(2)`: running the helper copy (its `/proc/<pid>/exe` already names
+/// it) with no argv published yet (its `/proc/<pid>/cmdline` reads empty).
+/// It leaves that state when `<dir>/release` is written, then stays alive.
+const HOLD_MID_EXEC: &str = "DOT_AGENT_DECK_TEST_HOLD_MID_EXEC";
+
+ctor::declarative::ctor! {
+    /// The helper-copy role of this test binary: see [`HOLD_MID_EXEC`]. The
+    /// test process itself returns at once.
+    #[ctor(unsafe)]
+    fn helper_copy_role_before_main() {
+        if let Some(dir) = std::env::var_os(HOLD_MID_EXEC) {
+            hold_mid_exec(Path::new(&dir));
+        }
+    }
+}
+
+/// `/proc/self/stat`'s fields, indexed by their 1-based field numbers.
+fn own_stat_fields() -> Vec<u64> {
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+    let mut fields = vec![0, 0, 0];
+    fields.extend(
+        stat[stat.rfind(')').unwrap() + 2..]
+            .split_whitespace()
+            .map(|f| f.parse::<u64>().unwrap_or(0)),
+    );
+    fields
+}
+
+/// `struct prctl_mm_map` from `<linux/prctl.h>`, which `libc` doesn't
+/// export.
+#[repr(C)]
+struct PrctlMmMap {
+    start_code: u64,
+    end_code: u64,
+    start_data: u64,
+    end_data: u64,
+    start_brk: u64,
+    brk: u64,
+    start_stack: u64,
+    arg_start: u64,
+    arg_end: u64,
+    env_start: u64,
+    env_end: u64,
+    auxv: *mut u64,
+    auxv_size: u32,
+    exe_fd: u32,
+}
+
+/// Point this process's argv at `[start, end)` with `PR_SET_MM_MAP`, which
+/// an unprivileged process may do to itself while it changes no executable.
+/// An empty range is what `/proc/<pid>/cmdline` shows before `execve(2)`
+/// has published the new argv.
+fn set_own_argv(start: u64, end: u64) -> std::io::Result<()> {
+    let f = own_stat_fields();
+    let map = PrctlMmMap {
+        start_code: f[26],
+        end_code: f[27],
+        start_data: f[45],
+        end_data: f[46],
+        start_brk: f[47],
+        // SAFETY: `sbrk(0)` only reads the current break.
+        brk: unsafe { libc::sbrk(0) } as u64,
+        start_stack: f[28],
+        arg_start: start,
+        arg_end: end,
+        env_start: f[50],
+        env_end: f[51],
+        auxv: std::ptr::null_mut(),
+        auxv_size: 0,
+        exe_fd: u32::MAX,
+    };
+    // SAFETY: `map` is a complete `prctl_mm_map` that outlives the call.
+    let r = unsafe {
+        libc::prctl(
+            libc::PR_SET_MM,
+            libc::PR_SET_MM_MAP,
+            &map as *const PrctlMmMap,
+            std::mem::size_of::<PrctlMmMap>(),
+            0,
+        )
+    };
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn hold_mid_exec(dir: &Path) -> ! {
+    // SAFETY: `prctl(PR_SET_PDEATHSIG, SIGKILL)` on this process: it goes
+    // when `A`, its parent, does.
+    unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
+    let f = own_stat_fields();
+    let (start, end) = (f[48], f[49]);
+    if let Err(error) = set_own_argv(start, start) {
+        let _ = std::fs::write(dir.join("failed"), error.to_string());
+        std::process::exit(1);
+    }
+    let _ = std::fs::read(dir.join("release"));
+    if let Err(error) = set_own_argv(start, end) {
+        let _ = std::fs::write(dir.join("failed"), error.to_string());
+        std::process::exit(1);
+    }
+    loop {
+        // SAFETY: `pause(2)` has no preconditions.
+        unsafe { libc::pause() };
+    }
+}
 
 /// The release the latch reports, the one the e2e stand-ins draw for Claude.
 fn release() -> Version {
@@ -154,10 +268,29 @@ impl Harness {
         Harness::start_on(None, None, agent)
     }
 
+    /// [`Harness::start`] with the helper copy made from `helper` rather
+    /// than `/bin/sh`.
+    fn start_with_helper(
+        helper: &Path,
+        agent: impl FnOnce(&Path) -> Option<Vec<OsString>>,
+    ) -> Harness {
+        Harness::start_from(helper, None, None, agent)
+    }
+
     /// [`Harness::start`] with `path` as the agent's `PATH` (Q85), and `A`
     /// executed as `execvp` executes its program word from the directory
     /// `run_from`: the file of that name there, the word as `argv[0]`.
     fn start_on(
+        path: Option<&Path>,
+        run_from: Option<&Path>,
+        agent: impl FnOnce(&Path) -> Option<Vec<OsString>>,
+    ) -> Harness {
+        Harness::start_from(Path::new("/bin/sh"), path, run_from, agent)
+    }
+
+    /// [`Harness::start_on`] with the helper copy made from `helper`.
+    fn start_from(
+        helper: &Path,
         path: Option<&Path>,
         run_from: Option<&Path>,
         agent: impl FnOnce(&Path) -> Option<Vec<OsString>>,
@@ -172,7 +305,7 @@ impl Harness {
         let instance = Instance::create(
             &dir.path().join("state").join("editor"),
             daemon,
-            &mut File::open("/bin/sh").unwrap(),
+            &mut File::open(helper).unwrap(),
         )
         .unwrap();
         let mut installation = install(
@@ -636,4 +769,93 @@ fn probe_072_a_native_install_binds_through_its_path_symlink() {
         "nothing published while no A is bound"
     );
     assert!(h.observer.bound_agent().is_none());
+}
+
+/// Scenario: Have `A` start a helper copy that holds itself where a helper is partway through its `execve(2)`, running the helper copy with no argv published yet, then publish a liability so the child scan runs. The scan makes no record of it in that state; once the helper publishes its Claude-shaped argv the scan records it `Owned`, and its `Armed` invocation on IPC consumes the liability rather than being kept `NotConsumed(Unattributed)`.
+#[spec("inbox/probe/072")]
+#[test]
+fn probe_072_a_helper_seen_mid_exec_is_attributed_once_its_argv_is_published() {
+    let bin = tempdir();
+    let agent_exe = bin.path().join("claude");
+    std::fs::copy("/bin/sh", &agent_exe).unwrap();
+    std::fs::set_permissions(&agent_exe, Permissions::from_mode(0o700)).unwrap();
+    let hold = bin.path().join("hold");
+    std::fs::create_dir(&hold).unwrap();
+    let release = hold.join("release");
+    let c = std::ffi::CString::new(release.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    // SAFETY: `getuid(2)` has no failure mode.
+    let uid = unsafe { libc::getuid() };
+    let export = format!("/tmp/claude-{uid}/claude-prompt-mid-exec.md");
+    let this = std::env::current_exe().unwrap();
+    // `A` starts the helper at once. Nothing is published yet, so no scan
+    // runs until the helper holds itself with no argv: a scan between its
+    // `execve(2)` and its hold would see the argv it was started with.
+    let h = Harness::start_with_helper(&this, |helper| {
+        Some(vec![
+            agent_exe.clone().into(),
+            "-c".into(),
+            format!("{HOLD_MID_EXEC}=\"$0\" \"$1\" \"$2\" & wait").into(),
+            hold.clone().into(),
+            helper.into(),
+            export.clone().into(),
+        ])
+    });
+    let a = h.started[0].id();
+    let helper_id = std::fs::read_link(h.instance.helper()).unwrap_or(h.instance.helper().into());
+    let mut helper = None;
+    assert!(
+        wait_for(Duration::from_secs(10), || {
+            helper = std::fs::read_to_string(format!("/proc/{a}/task/{a}/children"))
+                .unwrap_or_default()
+                .split_whitespace()
+                .filter_map(|p| p.parse::<u32>().ok())
+                .find(|p| {
+                    std::fs::read_link(format!("/proc/{p}/exe")).is_ok_and(|e| e == helper_id)
+                        && std::fs::read(format!("/proc/{p}/cmdline")).is_ok_and(|c| c.is_empty())
+                });
+            helper.is_some()
+        }),
+        "the helper copy holds below A with no argv: {:?}",
+        std::fs::read_to_string(hold.join("failed"))
+    );
+    let helper = helper.unwrap();
+    let key = key_of(helper);
+    let input = h.observer.input();
+    assert!(input.record(key).is_none(), "no scan ran before the hold");
+    assert_eq!(h.observer.control(G, ControlOp::Publish), Ok(1));
+    assert_eq!(h.observer.permission(), Permission::Armable);
+    // A liability is published, so a scan runs every `SCAN_PERIOD`.
+    std::thread::sleep(SCAN_PERIOD * 20);
+    assert!(
+        input.record(key).is_none(),
+        "a helper with no argv yet is not attributed: {:?}",
+        input.record(key)
+    );
+
+    OpenOptions::new()
+        .write(true)
+        .open(&release)
+        .unwrap()
+        .write_all(b"go\n")
+        .unwrap();
+    assert!(
+        wait_for(Duration::from_secs(5), || input.record(key).is_some()),
+        "the scan records the helper once its argv is published"
+    );
+    assert_eq!(input.record(key).unwrap().attribution, Attribution::Owned);
+
+    let conn = h.observer.connect(Ok(Some(pidfd(helper)))).expect("helper");
+    let mut armed = request(ComposerDecision::Armed);
+    armed.argv = vec![export.clone()];
+    h.observer.invocation(&conn, &armed);
+    assert_eq!(
+        input.record(key).unwrap().settlement,
+        Settlement::Consumed,
+        "the Armed invocation consumes the published liability"
+    );
+    drop(conn);
+    // SAFETY: a pid this test captured, of a process alive until now.
+    let _ = unsafe { libc::kill(helper as libc::pid_t, libc::SIGKILL) };
 }

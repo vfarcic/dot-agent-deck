@@ -369,10 +369,20 @@ impl OneShotBatch {
         outputs: &[Output],
         receiver: Receiver,
     ) -> Option<String> {
+        self.publish_stages(spool, outputs, |output| stage_of(receiver, output))
+    }
+
+    /// [`Self::publish`] with each block's stage chosen by `stage`.
+    fn publish_stages(
+        &self,
+        spool: Option<&GenerationSpool>,
+        outputs: &[Output],
+        stage: impl Fn(Output) -> Option<crate::inbox_receipt::RecordStage>,
+    ) -> Option<String> {
         use crate::inbox_receipt::{Cap, RecordKey, RecordStage};
         let mut first = None;
         for (block, output) in self.blocks.iter().zip(outputs) {
-            let Some(stage) = stage_of(receiver, *output) else {
+            let Some(stage) = stage(*output) else {
                 continue;
             };
             let cap = block.caps.as_ref().map(|caps| match stage {
@@ -784,12 +794,26 @@ impl OneShotBatch {
         receiver: Receiver,
         degraded: Option<String>,
     ) -> Ran {
+        let hand = self.hand(connection, pinned, grant_ttl, out, pieces);
+        self.report(connection, pinned, hand, receiver, degraded)
+    }
+
+    /// [`Self::run`]'s hand-over: ask `may`, then write the blocks that
+    /// pass their fence.
+    fn hand<W: Write>(
+        &self,
+        connection: &mut Connection,
+        pinned: &Pinned,
+        grant_ttl: Duration,
+        out: &mut W,
+        pieces: &[Piece<'_>],
+    ) -> HandOver {
         let approval = connection.approve(self, grant_ttl);
         #[cfg(feature = "e2e")]
         if std::env::var_os(ENV_TEST_EXIT_AFTER_GRANT).is_some() {
             std::process::exit(0);
         }
-        let hand = match pinned {
+        match pinned {
             Pinned::Open(spool) => {
                 let mut fence = Fence::new(&approval, spool, connection.arrivals());
                 self.hand_over(out, pieces, |at| fence.check(at, Instant::now()))
@@ -802,7 +826,19 @@ impl OneShotBatch {
                 outputs: vec![Output::NotHanded; self.len()],
                 error: None,
             },
-        };
+        }
+    }
+
+    /// [`Self::run`]'s report: publish each attempt's receipt as `receiver`
+    /// does, then report every attempt on `connection` and finish it.
+    fn report(
+        &self,
+        connection: &mut Connection,
+        pinned: &Pinned,
+        hand: HandOver,
+        receiver: Receiver,
+        degraded: Option<String>,
+    ) -> Ran {
         let published = match pinned {
             Pinned::Open(spool) => self.publish(Some(spool), &hand.outputs, receiver),
             Pinned::Unpinned => self.publish(None, &hand.outputs, receiver),
@@ -815,6 +851,184 @@ impl OneShotBatch {
             outputs: hand.outputs,
             error: hand.error,
         }
+    }
+
+    /// Issue #2341: [`Self::run`] for Claude Code's prompt hook when a
+    /// transcript witness can tell whether Claude took the prompt. The
+    /// blocks are handed over as `run` hands them. A block written and
+    /// flushed whole is then not committed: its caps file is written and its
+    /// `handed` receipt published, as a once-waiter's is, and nothing is
+    /// reported on `connection`, which the caller hands to the witness
+    /// ([`Witnessed::Pending`]). The witness commits the block once the
+    /// transcript shows Claude took it, and reports the batch.
+    ///
+    /// With no spool to keep the caps in, a caps file that could not be
+    /// written, or no block written whole, this reports at once as `run`
+    /// does for a hook ([`Witnessed::Reported`]).
+    pub fn run_witnessed<W: Write>(
+        &self,
+        connection: &mut Connection,
+        pinned: &Pinned,
+        grant_ttl: Duration,
+        out: &mut W,
+        pieces: &[Piece<'_>],
+    ) -> Witnessed {
+        let hand = self.hand(connection, pinned, grant_ttl, out, pieces);
+        let spool = match pinned {
+            Pinned::Open(spool)
+                if hand.outputs.contains(&Output::Written)
+                    && self.write_caps(spool, &hand.outputs) =>
+            {
+                spool
+            }
+            _ => {
+                return Witnessed::Reported(self.report(
+                    connection,
+                    pinned,
+                    hand,
+                    Receiver::Hook,
+                    None,
+                ));
+            }
+        };
+        let degraded = self.publish(Some(spool), &hand.outputs, Receiver::Waiter);
+        Witnessed::Pending(Pending {
+            outputs: hand.outputs,
+            error: hand.error,
+            degraded,
+        })
+    }
+
+    /// Issue #2341: write the caps file of each block written whole, so a
+    /// later process can commit it by its exact attempt. Answers whether
+    /// every one was written; a failure leaves nothing to defer to.
+    fn write_caps(&self, spool: &GenerationSpool, outputs: &[Output]) -> bool {
+        use crate::inbox_receipt::{AttemptCaps, Cap};
+        self.blocks
+            .iter()
+            .zip(outputs)
+            .filter(|(_, output)| **output == Output::Written)
+            .all(|(block, _)| {
+                let Some(caps) = block.caps.as_ref().and_then(|caps| {
+                    Some(AttemptCaps {
+                        handed: Cap::from_hex(&caps.handed)?,
+                        commit: Cap::from_hex(&caps.commit)?,
+                    })
+                }) else {
+                    return false;
+                };
+                spool
+                    .write_caps(&block.at.id, block.at.a, block.at.e, &caps)
+                    .is_ok()
+            })
+    }
+
+    /// Issue #2341: the witness could not be started after
+    /// [`Self::run_witnessed`] deferred: commit each block written whole now,
+    /// as a hook does, and report the batch on `connection`. Their `handed`
+    /// receipts are already published.
+    pub fn commit_now(
+        &self,
+        connection: &mut Connection,
+        pinned: &Pinned,
+        pending: Pending,
+    ) -> Ran {
+        use crate::inbox_receipt::RecordStage;
+        let published = match pinned {
+            Pinned::Open(spool) => self.publish_stages(Some(spool), &pending.outputs, |output| {
+                (output == Output::Written).then_some(RecordStage::Committed)
+            }),
+            Pinned::Unpinned | Pinned::Failed(_) => None,
+        };
+        let line = self.controls(
+            &pending.outputs,
+            Receiver::Hook,
+            pending.degraded.or(published),
+        );
+        let _ = connection.send(&line, Instant::now() + RECEIPTS_ANSWER_WAIT);
+        connection.finish();
+        Ran {
+            outputs: pending.outputs,
+            error: pending.error,
+        }
+    }
+
+    /// Issue #2341: what the witness reports for a batch
+    /// [`Self::run_witnessed`] deferred: each block's attempt by what became
+    /// of it — written whole or in part, `handed` (the witness commits the
+    /// ones Claude took through their caps, on a connection of its own), or
+    /// `not_handed`.
+    pub fn deferred_report(&self, outputs: &[Output]) -> DeferredReport {
+        let mut report = DeferredReport::default();
+        for (block, output) in self.blocks.iter().zip(outputs) {
+            match output {
+                Output::NotHanded => report.not_handed.push(block.at.clone()),
+                Output::Possible => report.possible.push(block.at.clone()),
+                Output::Written => report.written.push(block.at.clone()),
+            }
+        }
+        report
+    }
+}
+
+/// What [`OneShotBatch::run_witnessed`] did.
+#[derive(Debug)]
+pub enum Witnessed {
+    /// It reported the batch itself, as [`OneShotBatch::run`] does.
+    Reported(Ran),
+    /// It reported nothing: the transcript witness reports the batch.
+    Pending(Pending),
+}
+
+/// A batch [`OneShotBatch::run_witnessed`] handed over and left for the
+/// transcript witness to report.
+#[derive(Debug)]
+pub struct Pending {
+    pub outputs: Vec<Output>,
+    pub error: Option<io::Error>,
+    /// A `handed` receipt that could not be published.
+    pub degraded: Option<String>,
+}
+
+impl Pending {
+    /// What the hook's hand-over came to, as [`Ran`] says it.
+    pub fn ran(self) -> Ran {
+        Ran {
+            outputs: self.outputs,
+            error: self.error,
+        }
+    }
+}
+
+/// [`OneShotBatch::deferred_report`]: the batch's attempts by what became of
+/// each block.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DeferredReport {
+    /// Written and flushed whole: committed by the witness only when the
+    /// transcript shows Claude took the prompt.
+    #[serde(default)]
+    pub written: Vec<InboxAttemptRef>,
+    /// Written in part: possibly handed.
+    #[serde(default)]
+    pub possible: Vec<InboxAttemptRef>,
+    #[serde(default)]
+    pub not_handed: Vec<InboxAttemptRef>,
+}
+
+impl DeferredReport {
+    /// The control line reporting the batch once the witness is done:
+    /// every block written whole or in part as `handed`, the rest as
+    /// `not_handed`. A commit the witness made went to the deck on its own
+    /// connection first, and ranks above `handed`, so naming it here
+    /// changes nothing.
+    pub fn control_line(&self, degraded: Option<String>) -> String {
+        let control = InboxStreamControl {
+            handed: self.written.iter().chain(&self.possible).cloned().collect(),
+            not_handed: self.not_handed.clone(),
+            degraded,
+            ..InboxStreamControl::default()
+        };
+        control_line(&control)
     }
 }
 
@@ -1243,6 +1457,9 @@ pub struct Connection {
     /// starts with the newline that ends it, so the deck discards the cut
     /// line and reads the next one whole.
     cut: bool,
+    /// Issue #2341: the socket was handed to another process
+    /// ([`Connection::hand_off`]), so dropping this end must not shut it.
+    handed_off: bool,
 }
 
 #[cfg(unix)]
@@ -1379,6 +1596,7 @@ impl Connection {
             ended: false,
             next_q: 1,
             cut: false,
+            handed_off: false,
         })
     }
 
@@ -1541,14 +1759,34 @@ impl Connection {
     pub fn finish(&mut self) {
         let _ = self.stream.shutdown(std::net::Shutdown::Write);
     }
+
+    /// Issue #2341: the socket, for another process to go on reporting on
+    /// (the transcript witness, as its stdin), and whether the next line it
+    /// sends has to start with a newline ([`Connection::send`]'s `cut`).
+    /// Dropping this end then leaves the socket open, since a shutdown acts
+    /// on the socket every copy of the descriptor shares.
+    pub fn hand_off(&mut self) -> io::Result<(std::os::unix::net::UnixStream, bool)> {
+        let stream = self.stream.try_clone()?;
+        self.handed_off = true;
+        Ok((stream, self.cut))
+    }
+
+    /// The process [`Connection::hand_off`] meant the socket for did not
+    /// take it: this end owns it again, and shuts it when dropped.
+    pub fn take_back(&mut self) {
+        self.handed_off = false;
+    }
 }
 
 /// A connection given up shuts its socket, so its reader thread ends and the
-/// deck sees it close rather than wait out its idle window.
+/// deck sees it close rather than wait out its idle window. One handed off
+/// ([`Connection::hand_off`]) is left open for the process that took it.
 #[cfg(unix)]
 impl Drop for Connection {
     fn drop(&mut self) {
-        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+        if !self.handed_off {
+            let _ = self.stream.shutdown(std::net::Shutdown::Both);
+        }
     }
 }
 
