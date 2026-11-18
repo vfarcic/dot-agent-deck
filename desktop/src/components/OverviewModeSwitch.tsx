@@ -25,6 +25,8 @@ export function OverviewModeSwitch({ mode, controls, consumeCards }: { mode: Ove
         aria-checked={mode === "table"}
         className={mode === "table" ? "is-selected" : undefined}
         data-testid="overview-mode-table"
+        aria-label="Table"
+        title="Table"
         onClick={() => VOICE_ACTIONS.setOverviewMode.run(controls, { overviewMode: "table" })}
       ><LayoutList size={13} aria-hidden="true" /><span>Table</span></button>
       <button
@@ -33,6 +35,8 @@ export function OverviewModeSwitch({ mode, controls, consumeCards }: { mode: Ove
         aria-checked={mode === "cards"}
         className={mode === "cards" ? "is-selected" : undefined}
         data-testid="overview-mode-cards"
+        aria-label="Cards"
+        title="Cards"
         onClick={() => VOICE_ACTIONS.setOverviewMode.run(controls, { overviewMode: "cards" })}
       ><LayoutGrid size={13} aria-hidden="true" /><span>Cards</span></button>
     </div>
