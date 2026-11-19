@@ -2214,6 +2214,16 @@ where
             return Ok(false);
         }
     }
+    // Issue #2347: a witness's report that Claude Code dropped a prompt the
+    // deck's hook had reported ends only the turn that prompt started; any
+    // other such report is neither applied nor fanned out.
+    if !state.admit_prompt_not_taken(&event, unproven) {
+        debug!(
+            pane_id = ?event.pane_id.as_deref().map(escape_id_for_log),
+            "hook: a dropped prompt's report names no turn it started; not applied"
+        );
+        return Ok(false);
+    }
     // Issue #770: half of the orphan verdict (and, round 3, all of the
     // no-live-agent one stamped below), asked of the registry UNDER the
     // `AppState` write lock, at the stamp that spends it (round-2 audit finding

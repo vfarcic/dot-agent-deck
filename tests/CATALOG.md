@@ -13289,7 +13289,7 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 ##### inbox/claude/051 — A doorbell hook commits only what the transcript shows Claude took (issue #2341).
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), real hook CLI children and the real `inbox witness` they start, a session transcript the test writes as Claude Code records one, a 15 s ack-wait (a 10 s witness window).
 - **Agent:** none (synthetic Claude parent; no credential).
-- **Asserts:** with `transcript_path` naming an existing transcript, the real prompt hook prints the task's block as before, and the task stays Fetched for 1.5 s; it is Acknowledged with one delivery only after the transcript gains a `hook_additional_context` attachment carrying that context. A second task whose prompt is blocked (the transcript gains only Claude's `system` entry for a blocked prompt) stays Fetched; once the witness gives up, a later doorbell hands it over as `delivery 1.2` with the possible-repeat line, still Fetched until the transcript records that context, then Acknowledged with two deliveries.
+- **Asserts:** with `transcript_path` naming an existing transcript, the real prompt hook prints the task's block as before, and the task stays Fetched for 1.5 s; it is Acknowledged with one delivery only after the transcript gains a `hook_additional_context` attachment carrying that context. A second task whose prompt is blocked (the transcript gains only Claude's `system` entry for a blocked prompt) stays Fetched; once the witness reads the block (issue #2347: at once, rather than when its window ends), a later doorbell hands it over as `delivery 1.2` with the possible-repeat line, still Fetched until the transcript records that context, then Acknowledged with two deliveries.
 - **Does not assert:** a real Claude Code's transcript or a real blocking hook (`inbox/claude/053`); a payload with no transcript, which commits what it printed (`inbox/claude/019`).
 - **Platform coverage:** mac+linux.
 
@@ -13300,11 +13300,18 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Does not assert:** a payload with no transcript, which commits at once (`inbox/claude/016`).
 - **Platform coverage:** mac+linux.
 
-##### inbox/claude/053 — Live: a doorbell prompt another hook blocks is not acknowledged, and is handed over again (issue #2341).
+##### inbox/claude/054 — A prompt another hook blocks ends the turn its hook reported (issue #2347).
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), real hook CLI children and the real `inbox witness` they start, a session transcript the test writes as Claude Code 2.1.328 records one.
+- **Agent:** none (synthetic Claude parent; no credential).
+- **Asserts:** after a `Stop` the card reads Idle; an ordinary prompt (no deck message) reported by the real prompt hook with `transcript_path` set makes it Thinking, and once the transcript gains Claude's `system` entry for that exact prompt blocked by a hook, the card reads Idle again. A prompt the transcript shows taken keeps the card Thinking, and a further prompt blocked while that turn runs leaves it Thinking for 3 s.
+- **Does not assert:** a real Claude Code or a real blocking hook (`inbox/claude/053`); the entry's recognition rules case by case (`inbox_witness` unit tests); the daemon's guard case by case (`state` unit test `a_dropped_prompt_ends_only_the_turn_it_started`).
+- **Platform coverage:** mac+linux.
+
+##### inbox/claude/053 — Live: a doorbell prompt another hook blocks is not acknowledged, and is handed over again (issues #2341, #2347).
 - **Layer:** L2 lane 2 (`tests/e2e_inbox_claude_live.rs`), the real TUI in a PTY, in the `claude-blocking-hook` fixture: a project `.claude/settings.json` whose own `UserPromptSubmit` hook blocks the first prompt carrying a deck doorbell line and leaves a marker. The scratch pane's armed waiter is killed, so the doorbell is the wake path.
 - **Agent:** Claude Code (Haiku).
-- **Asserts:** the doorbell rings and the project hook blocks its prompt (the marker); for 30 seconds, longer than the transcript witness watches, the task is not acknowledged and the sentinel is not written. After a short prompt typed into the pane, Haiku writes the sentinel exactly once and the task is acknowledged with two deliveries.
-- **Does not assert:** which route hands the task over again (the doorbell, the waiter armed at the turn's end, or a fetch Haiku runs); the deck's card while the blocked prompt leaves it reading busy.
+- **Asserts:** the doorbell rings and the project hook blocks its prompt (the marker). The card then reads Idle (issue #2347), and the doorbell's hold is `AwaitingPrompt` (its `doorbell hold` log line), since Claude Code put the blocked line back in its input box. Once the test presses Enter in the pane, sending that line, the deck's hook hands the task over again; Haiku writes the sentinel exactly once and the task is acknowledged with two deliveries.
+- **Does not assert:** a blocked prompt the user typed; the deck clearing the restored line itself, which it does not do; a box the user clears by hand, after which the doorbell holds as `NeedsFetch`.
 - **Platform coverage:** linux.
 - **Cost:** one or two cheap model turns.
 
