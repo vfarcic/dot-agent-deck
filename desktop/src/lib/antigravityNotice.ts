@@ -58,9 +58,26 @@ export const ANTIGRAVITY_NOTICE_COVERED = "Nothing was chosen: something is open
 /** The three choices, as the bridge names them. */
 export type NoticeChoice = "open" | "later" | "dismiss";
 
+/**
+ * What a New agent start answers: whether it shows the notice, and the first
+ * problem with the notice's state file this app has met, to say once.
+ */
+export type NoticeStart = { show: boolean; problem?: string };
+
+/**
+ * The crate's answer to a start, read defensively: only a literal `true`
+ * shows the notice, for the star reminder's reason, and only a string is a
+ * problem to say.
+ */
+export function noticeStartFrom(value: unknown): NoticeStart {
+  if (typeof value !== "object" || value === null) return { show: false };
+  const { show, problem } = value as { show?: unknown; problem?: unknown };
+  return typeof problem === "string" ? { show: show === true, problem } : { show: show === true };
+}
+
 /** The runtime calls the notice needs; a runtime without them never shows it. */
 export type AntigravityNoticeRuntime = {
-  antigravityNoticeStart?: (command: string | undefined) => Promise<boolean>;
+  antigravityNoticeStart?: (command: string | undefined) => Promise<NoticeStart>;
   antigravityNoticeChoose?: (choice: NoticeChoice) => Promise<string | undefined>;
 };
 
@@ -107,8 +124,10 @@ export function announceNewAgentStart(command: string | undefined): void {
 /**
  * The notice's flow, for the app shell: hears each New agent start, asks the
  * runtime whether it shows the notice, and answers `due` until a choice is
- * made. `report` is given Open issues' sentence, or the reason a choice could
- * not be saved, in which case the notice is due again.
+ * made. `report` is given Open issues' sentence and the first problem with
+ * the notice's state file, which the crate hands out once. A choice closes the
+ * notice whether or not it could be saved, as in the TUI: the crate holds an
+ * unsaved Don't show again until the app restarts.
  */
 export function useAntigravityNotice(runtime: AntigravityNoticeRuntime, report: (message: string) => void): { due: boolean; choose: (choice: NoticeChoice) => void } {
   const [due, setDue] = useState(false);
@@ -117,21 +136,21 @@ export function useAntigravityNotice(runtime: AntigravityNoticeRuntime, report: 
     if (!start) return;
     const listener = (command: string | undefined) => {
       /* A start the crate could not answer shows no notice, and says why in the console rather than nowhere. */
-      void start(command).then((show) => { if (show) setDue(true); }, (cause: unknown) => console.warn("The Antigravity notice's start check failed:", cause));
+      void start(command).then(({ show, problem }) => {
+        if (problem) report(problem);
+        if (show) setDue(true);
+      }, (cause: unknown) => console.warn("The Antigravity notice's start check failed:", cause));
     };
     startListeners.add(listener);
     return () => { startListeners.delete(listener); };
-  }, [start]);
+  }, [report, start]);
   const chooseNotice = runtime.antigravityNoticeChoose;
   const choose = useCallback((choice: NoticeChoice) => {
     setDue(false);
     if (!chooseNotice) return;
     void chooseNotice(choice).then(
       (message) => { if (message) report(message); },
-      (cause: unknown) => {
-        report(cause instanceof Error ? cause.message : String(cause));
-        setDue(true);
-      },
+      (cause: unknown) => report(cause instanceof Error ? cause.message : String(cause)),
     );
   }, [chooseNotice, report]);
   return { due, choose };

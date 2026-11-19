@@ -2284,12 +2284,10 @@ struct UiState {
     /// PRD #211: a notice due while the star reminder is open, shown once
     /// that closes (one dialog at a time).
     antigravity_notice_pending: bool,
-    /// PRD #211: whether this process has said why the notice's state file
-    /// could not be read or saved; it says so once.
-    antigravity_notice_problem_reported: bool,
-    /// PRD #211: the notice's state file, shared with the desktop app
-    /// ([`config::antigravity_notice_path`]).
-    antigravity_notice_path: std::path::PathBuf,
+    /// PRD #211: this process's session over the notice's state file, shared
+    /// with the desktop app ([`config::antigravity_notice_path`]). It holds
+    /// what could not be saved, and says the first problem once.
+    antigravity_notice: config::AntigravityNoticeSession,
     /// Config generation state — tracks directories where user chose "Never".
     config_gen_state: config::ConfigGenState,
     /// Pane ID + cwd for the pending config-gen modal prompt. PRD #1666 part 2
@@ -2753,8 +2751,9 @@ impl UiState {
             star_prompt_state: config::StarPromptState::default(),
             antigravity_notice_resume: UiMode::PaneInput,
             antigravity_notice_pending: false,
-            antigravity_notice_problem_reported: false,
-            antigravity_notice_path: config::antigravity_notice_path(),
+            antigravity_notice: config::AntigravityNoticeSession::new(
+                config::antigravity_notice_path(),
+            ),
             config_gen_state: config::ConfigGenState::load(),
             config_gen_target: None,
             config_gen_selected: 0,
@@ -8254,10 +8253,8 @@ fn close_star_prompt(ui: &mut UiState) {
 /// form's successful non-orchestration start only, so orchestration and
 /// dispatch spawns, restores and `agy` typed into a shell never count.
 fn record_antigravity_start(ui: &mut UiState) {
-    let start = config::AntigravityNoticeState::record_start(&ui.antigravity_notice_path);
-    if let Some(problem) = start.problem
-        && !std::mem::replace(&mut ui.antigravity_notice_problem_reported, true)
-    {
+    let start = ui.antigravity_notice.record_start();
+    if let Some(problem) = start.problem {
         ui.status_message = Some((problem, std::time::Instant::now()));
     }
     if start.show {
@@ -8286,9 +8283,26 @@ fn close_antigravity_notice(ui: &mut UiState) {
 /// Open the repository's new-issue page and build the status message for
 /// whichever way that went.
 fn open_antigravity_issues_and_report() -> String {
-    crate::antigravity_notice::open_issues_message(
-        open::that(crate::antigravity_notice::new_issue_url()).is_ok(),
-    )
+    crate::antigravity_notice::open_issues_message(open_antigravity_issues())
+}
+
+/// Open the repository's new-issue page; whether the browser opened.
+#[cfg(not(test))]
+fn open_antigravity_issues() -> bool {
+    open::that(crate::antigravity_notice::new_issue_url()).is_ok()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times a unit test made Open issues open the browser, which it
+    /// never does for real.
+    static ANTIGRAVITY_ISSUES_OPENED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn open_antigravity_issues() -> bool {
+    ANTIGRAVITY_ISSUES_OPENED.with(|opened| opened.set(opened.get() + 1));
+    false
 }
 
 /// PRD #211: the notice's three choices, shared by its keys and buttons.
@@ -8299,11 +8313,12 @@ fn choose_antigravity_notice(ui: &mut UiState, choice: Action) {
             close_antigravity_notice(ui);
             ui.status_message = Some((msg, std::time::Instant::now()));
         }
+        // Closes whether or not it could be saved: the session holds it
+        // until the deck restarts, and says why once, as the desktop does.
         Action::AntigravityNoticeDismiss => {
-            let saved =
-                config::AntigravityNoticeState::dismiss_permanently(&ui.antigravity_notice_path);
+            let problem = ui.antigravity_notice.dismiss_permanently();
             close_antigravity_notice(ui);
-            if let Err(why) = saved {
+            if let Some(why) = problem {
                 ui.status_message = Some((why, std::time::Instant::now()));
             }
         }
@@ -8313,6 +8328,19 @@ fn choose_antigravity_notice(ui: &mut UiState, choice: Action) {
 }
 
 fn handle_antigravity_notice_key(key: KeyEvent, ui: &mut UiState) -> Action {
+    // A key with Ctrl, Alt or a platform modifier held chooses nothing, as in
+    // the desktop app: such a chord was meant for something else (`Ctrl+D` is
+    // command mode's), and `d` makes a permanent choice. `Ctrl+C`'s quit flow
+    // is taken before this handler is reached.
+    if key.modifiers.intersects(
+        KeyModifiers::CONTROL
+            | KeyModifiers::ALT
+            | KeyModifiers::SUPER
+            | KeyModifiers::META
+            | KeyModifiers::HYPER,
+    ) {
+        return Action::Continue;
+    }
     let choice = match key.code {
         KeyCode::Char('o') => Action::AntigravityNoticeOpen,
         KeyCode::Char('l') | KeyCode::Esc => Action::AntigravityNoticeLater,
@@ -50844,7 +50872,7 @@ mod tests {
     /// whose star reminder state is another, so no test touches the user's.
     fn notice_ui(dir: &std::path::Path) -> UiState {
         let mut ui = default_ui();
-        ui.antigravity_notice_path = dir.join("notice.json");
+        ui.antigravity_notice = config::AntigravityNoticeSession::new(dir.join("notice.json"));
         ui.star_prompt_state = config::StarPromptState::load_from(dir.join("star.json"));
         ui
     }
@@ -50866,7 +50894,8 @@ mod tests {
             ));
             assert_eq!(ui.mode, UiMode::PaneInput, "{code:?} left focus elsewhere");
             assert!(ui.status_message.is_none(), "{code:?}");
-            let (state, _) = config::AntigravityNoticeState::load_from(&ui.antigravity_notice_path);
+            let (state, _) =
+                config::AntigravityNoticeState::load_from(ui.antigravity_notice.path());
             assert_eq!(
                 state.permanently_dismissed,
                 code == KeyCode::Char('d'),
@@ -50938,7 +50967,7 @@ mod tests {
         let blocker = dir.path().join("not-a-directory");
         std::fs::write(&blocker, "").unwrap();
         let mut ui = notice_ui(dir.path());
-        ui.antigravity_notice_path = blocker.join("notice.json");
+        ui.antigravity_notice = config::AntigravityNoticeSession::new(blocker.join("notice.json"));
         ui.mode = UiMode::PaneInput;
         record_antigravity_start(&mut ui);
         assert_eq!(ui.mode, UiMode::AntigravityNotice);
@@ -50949,6 +50978,115 @@ mod tests {
         handle_antigravity_notice_key(KeyEvent::from(KeyCode::Char('l')), &mut ui);
         record_antigravity_start(&mut ui);
         assert!(ui.status_message.is_none(), "the problem was said twice");
+        assert_eq!(
+            ui.mode,
+            UiMode::PaneInput,
+            "the unsaved first showing was forgotten: the next start showed again"
+        );
+    }
+
+    /// PRD #211: a Don't show again that cannot be saved closes the notice,
+    /// as in the desktop app, says why once, and holds for the rest of the
+    /// session: none of the next 150 starts shows the notice.
+    #[test]
+    fn antigravity_notice_unsaved_dismissal_holds_for_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, "").unwrap();
+        let mut ui = notice_ui(dir.path());
+        ui.antigravity_notice = config::AntigravityNoticeSession::new(blocker.join("notice.json"));
+        ui.mode = UiMode::AntigravityNotice;
+        handle_antigravity_notice_key(KeyEvent::from(KeyCode::Char('d')), &mut ui);
+        assert_eq!(ui.mode, UiMode::PaneInput, "the notice stayed open");
+        let said = ui.status_message.take().map(|(why, _)| why);
+        assert!(
+            said.as_deref()
+                .is_some_and(|why| why.contains("Antigravity notice")),
+            "{said:?}"
+        );
+        for start in 1..=150 {
+            record_antigravity_start(&mut ui);
+            assert_eq!(
+                ui.mode,
+                UiMode::PaneInput,
+                "start {start} showed the notice"
+            );
+        }
+        assert!(ui.status_message.is_none(), "the problem was said twice");
+    }
+
+    /// PRD #211: with the notice drawn, `o`, `l`, `d` and `Esc` with `Ctrl`,
+    /// `Alt` or a platform modifier held choose nothing through the TUI's key
+    /// funnel — the notice stays open, nothing is saved and no browser opens —
+    /// as in the desktop app. `Ctrl+C` still leaves for the quit flow, and the
+    /// plain key still chooses (controls).
+    #[test]
+    fn antigravity_notice_modified_keys_choose_nothing() {
+        use tokio::sync::RwLock;
+        let dir = tempfile::tempdir().unwrap();
+        let pc = Arc::new(OpenTabPC::new());
+        let mut tab_manager = TabManager::new(pc.clone());
+        let state: SharedState = Arc::new(RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+        let press = |ui: &mut UiState, tab_manager: &mut TabManager, key: KeyEvent| {
+            handle_key_event(
+                key,
+                ui,
+                &*pc,
+                &state,
+                tab_manager,
+                &snapshot,
+                &[],
+                Rect::new(0, 0, 80, 24),
+            )
+        };
+        let opened = || ANTIGRAVITY_ISSUES_OPENED.with(std::cell::Cell::get);
+        let mut ui = notice_ui(dir.path());
+        ui.mode = UiMode::AntigravityNotice;
+        let rows = draw_sized(&mut ui, 80, 24);
+        assert!(
+            on_screen(&rows, ANTIGRAVITY_NOTICE_KEYS.0),
+            "precondition:\n{}",
+            rows.join("\n")
+        );
+        let before = opened();
+        for modifiers in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::SUPER,
+            KeyModifiers::META,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ] {
+            for code in [
+                KeyCode::Char('o'),
+                KeyCode::Char('l'),
+                KeyCode::Char('d'),
+                KeyCode::Esc,
+            ] {
+                let key = KeyEvent::new(code, modifiers);
+                assert_eq!(press(&mut ui, &mut tab_manager, key), Flow::Continue);
+                assert_eq!(ui.mode, UiMode::AntigravityNotice, "{key:?} chose");
+            }
+        }
+        assert_eq!(opened(), before, "a modified o opened the browser");
+        let (saved, _) = config::AntigravityNoticeState::load_from(ui.antigravity_notice.path());
+        assert!(!saved.permanently_dismissed, "a modified d dismissed it");
+
+        press(
+            &mut ui,
+            &mut tab_manager,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(ui.mode, UiMode::QuitConfirm, "Ctrl+C lost its quit flow");
+
+        ui.mode = UiMode::AntigravityNotice;
+        draw_sized(&mut ui, 80, 24);
+        press(
+            &mut ui,
+            &mut tab_manager,
+            KeyEvent::from(KeyCode::Char('l')),
+        );
+        assert_eq!(ui.mode, UiMode::PaneInput, "the plain key did not choose");
     }
 
     /// PRD #211: the notice's keys, under `prompt/star/001`'s rule — at a

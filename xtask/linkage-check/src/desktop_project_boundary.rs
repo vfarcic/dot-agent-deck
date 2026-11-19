@@ -121,8 +121,9 @@ const ALLOWED_ROOT_MODULES: &[&str] = &[
     // three choices, `issues_display`, `open_issues_message`) and the
     // new-issue page Open issues opens, so both clients say the same thing in
     // the same words (CLAUDE.md rule 22). The notice's state is
-    // `config::AntigravityNoticeState`, already allowlisted with `config`: a
-    // per-user file in the user's config directory, never a project's.
+    // `config::AntigravityNoticeState`, already allowlisted with `config`: by
+    // default a per-user file in the user's config directory, resolved from no
+    // project (`DOT_AGENT_DECK_ANTIGRAVITY_NOTICE` can point it elsewhere).
     // Checked against this rule's lines: the module holds constants and
     // `format!` calls; it reads no file, resolves no project, names no
     // FORBIDDEN_SYMBOL or project-state literal, and contains no

@@ -1787,7 +1787,7 @@ export interface DeckRuntimeState {
    * notice, and the user's choice in it. Optional for the same reason; a
    * runtime without them never shows the notice.
    */
-  antigravityNoticeStart?: (command: string | undefined) => Promise<boolean>;
+  antigravityNoticeStart?: (command: string | undefined) => Promise<import("./lib/antigravityNotice").NoticeStart>;
   antigravityNoticeChoose?: (choice: import("./lib/antigravityNotice").NoticeChoice) => Promise<string | undefined>;
   /** The desktop app's own settings, and where they live (PRD #803). */
   getSettings: () => Promise<import("./lib/bridge").DesktopSettingsSnapshotDto>;

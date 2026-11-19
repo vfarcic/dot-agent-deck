@@ -633,9 +633,9 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   /**
    * PRD #211 — the Antigravity experimental notice, shown after a New agent
    * start of Antigravity, on the first and then every hundredth such start
-   * of either client. Open issues' sentence, or why a choice could not be
-   * saved, goes in a toast slot of its own, whose close button names the
-   * notice rather than the star reminder.
+   * of either client. Open issues' sentence, or why the notice's state file
+   * could not be read or saved (said once), goes in a toast slot of its own,
+   * whose close button names the notice rather than the star reminder.
    */
   const [antigravityToast, setAntigravityToast] = useState<string>(); // voice-registry-exempt: the Antigravity notice's sentence in the toast, reporting what its choice did
   const antigravityNotice = useAntigravityNotice(runtime, setAntigravityToast);

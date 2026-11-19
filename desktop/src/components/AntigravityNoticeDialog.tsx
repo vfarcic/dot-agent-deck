@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useLayoutEffect, useState, type KeyboardEvent } from "react";
+import { useCallback, useLayoutEffect, useState } from "react";
 import { FlaskConical } from "lucide-react";
 
 import { insideVoicePeer, overlayAbove, OVERLAY_LAYER, useInertBackground, useNoOverlayAbove } from "../hooks/useInertBackground";
+import { useReminderKeys } from "../hooks/useReminderKeys";
 import {
   ANTIGRAVITY_NOTICE_COVERED,
   DONT_SHOW_AGAIN,
@@ -44,8 +45,10 @@ const KEYS: Record<string, NoticeChoice> = { o: "open", l: "later", Escape: "lat
  * (Don't show again) stops it.
  *
  * On the overlay stack, so the agent's pane behind it is fenced while it is
- * open — no key reaches the agent, the one that dismisses it included — and
- * focus goes back to where it was when the notice closes. Voice's `close`
+ * open, and focus goes back to where it was when the notice closes. It owns
+ * the keyboard ({@link useReminderKeys}): keys reach neither the agent nor
+ * the window shortcuts that act behind it (`?`, the digits, `Ctrl+K`), the
+ * one that dismisses it included. Voice's `close`
  * ("cancel", "never mind") is Later, as `Esc` is. Each button dispatches
  * through the voice action registry (CLAUDE.md rule 23):
  * `openAntigravityIssues` and `dismissAntigravityNotice` are the
@@ -68,35 +71,16 @@ export function AntigravityNoticeDialog({ onChoose }: { onChoose: (choice: Notic
     },
   }), [onChoose, ref]);
 
-  /* The keys reach the dialog wherever focus was when it opened, but choose
-     only once it has been on screen for `NOTICE_KEYS_ARM_MS`: it opens on its
-     own right after a start, so a key on its way to the new agent must not
-     answer it. A held key's repeats never choose. */
-  const [keysReady, setKeysReady] = useState(false);
-  useEffect(() => {
-    ref.current?.focus();
-    const timer = window.setTimeout(() => setKeysReady(true), NOTICE_KEYS_ARM_MS);
-    return () => window.clearTimeout(timer);
-  }, [ref]);
+  /* The keys choose only once it has been on screen for `NOTICE_KEYS_ARM_MS`:
+     it opens on its own right after a start, so a key on its way to the new
+     agent must not answer it. A held key's repeats never choose. Focus is
+     moved inside by the overlay stack, which first notes where it was so that
+     closing gives it back. */
+  const keys = useReminderKeys(ref, KEYS, NOTICE_KEYS_ARM_MS, onChoose);
 
-  const onKeyDown = (event: KeyboardEvent<HTMLElement>) => {
-    if (event.ctrlKey || event.metaKey || event.altKey) return;
-    if (!keysReady || event.repeat) {
-      if (KEYS[event.key]) {
-        event.preventDefault();
-        event.stopPropagation();
-      }
-      return;
-    }
-    const choice = KEYS[event.key];
-    if (!choice) return;
-    event.preventDefault();
-    event.stopPropagation();
-    onChoose(choice);
-  };
-
-  const here = (choice: NoticeChoice) => () => {
-    onChoose(choice);
+  /** A button's choice; a click a key made before the keys arm chooses nothing. */
+  const here = (choice: NoticeChoice, event: { detail: number }) => () => {
+    if (keys.pressed(event)) onChoose(choice);
     return undefined;
   };
 
@@ -110,18 +94,17 @@ export function AntigravityNoticeDialog({ onChoose }: { onChoose: (choice: Notic
       aria-labelledby="antigravity-notice-title"
       aria-describedby="antigravity-notice-body"
       data-testid="antigravity-notice-dialog"
-      data-keys-ready={keysReady}
+      data-keys-ready={keys.ready}
       onMouseDown={(event) => event.stopPropagation()}
-      onKeyDown={onKeyDown}
     >
       <div className="star-icon"><FlaskConical size={20} /></div>
       <h2 id="antigravity-notice-title">{NOTICE_TITLE}</h2>
       <p id="antigravity-notice-body">{NOTICE_BODY}</p>
       <p className="star-repo">{NOTICE_ISSUES_DISPLAY}</p>
       <div>
-        <button className="button secondary" onClick={() => VOICE_ACTIONS.dismissAntigravityNotice.run({ dismissAntigravityNotice: here("dismiss") })}><kbd>d</kbd> {DONT_SHOW_AGAIN}</button>
-        <button className="button secondary" onClick={() => VOICE_ACTIONS.remindAntigravityLater.run({ remindAntigravityLater: here("later") })}><kbd>l</kbd> {NOTICE_LATER}</button>
-        <button className="button primary" onClick={() => VOICE_ACTIONS.openAntigravityIssues.run({ openAntigravityIssues: here("open") })}><kbd>o</kbd> {OPEN_ISSUES}</button>
+        <button className="button secondary" onClick={(event) => VOICE_ACTIONS.dismissAntigravityNotice.run({ dismissAntigravityNotice: here("dismiss", event) })}><kbd>d</kbd> {DONT_SHOW_AGAIN}</button>
+        <button className="button secondary" onClick={(event) => VOICE_ACTIONS.remindAntigravityLater.run({ remindAntigravityLater: here("later", event) })}><kbd>l</kbd> {NOTICE_LATER}</button>
+        <button className="button primary" onClick={(event) => VOICE_ACTIONS.openAntigravityIssues.run({ openAntigravityIssues: here("open", event) })}><kbd>o</kbd> {OPEN_ISSUES}</button>
       </div>
     </section>
   </div>;

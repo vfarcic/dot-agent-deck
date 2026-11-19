@@ -294,6 +294,8 @@ The deck works with Google's [Antigravity CLI](https://antigravity.google/docs/g
 - **Later** (`l` or `Esc`) closes it until the next interval.
 - **Don't show again** (`d`) closes it for good, in both the TUI and the desktop app.
 
+If the deck cannot save the dialog's state file (see [Where configuration lives](configuration.md#where-configuration-lives)), it says so once. Your starts and your choice still count until you quit the TUI or the desktop app, so a **Don't show again** that could not be saved holds until then; fix the file's location or permissions for it to last.
+
 In the desktop app you can also choose by voice ([Voice control](desktop/voice.md)). Agents an orchestration or a dispatch starts, agents a restored session brings back, and an `agy` you type into a shell do not count as starts and never show the dialog.
 
 **Google's terms for automating `agy`.** Google's [Antigravity FAQ](https://antigravity.google/docs/faq#can-i-use-antigravity-cli-headless-mode-in-third-party-coding-agents-or-automate-account-switching) says that "wrapping `agy` inside third-party coding agents or applications, or automating account rotation, is not supported under consumer plans", and, for using [third-party software with an Antigravity login](https://antigravity.google/docs/faq#why-cant-i-use-third-party-software-such-as-claude-code-openclaw-or-opencode-with-my-antigravity-login), recommends a Gemini Enterprise or Google AI Studio API key. The deck runs the `agy` you installed, signed in as you chose. Read Google's FAQ and terms and decide which sign-in to use.

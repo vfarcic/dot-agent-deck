@@ -21,7 +21,7 @@ import type { AnswerOutcomeDto, PendingQuestionDto, QuestionResultDto, QuestionS
 import { pullRequestFromDto } from "./pullRequest";
 import type { ProjectTrust, ProjectTrustTarget } from "./projectTrust";
 import { STAR_THANKS, type StarChoice } from "./starPrompt";
-import { NOTICE_THANKS, type NoticeChoice } from "./antigravityNotice";
+import { NOTICE_THANKS, noticeStartFrom, type NoticeChoice, type NoticeStart } from "./antigravityNotice";
 import { DEFAULT_DESKTOP_FEATURES, UNREPORTED } from "../types";
 import type { HandoffEdge,
   AgentBackground,
@@ -2358,15 +2358,17 @@ export interface DeckBridge {
   starPromptChoose?(choice: StarChoice): Promise<string | undefined>;
   /**
    * PRD #211 — a New agent start of `command` succeeded: whether it shows the
-   * Antigravity notice. The crate counts it only when the command starts
-   * Antigravity, in the notice state the TUI shares. Optional so a test double
-   * need not serve it; a runtime without it never shows the notice.
+   * Antigravity notice, and the first problem with its state file to say. The
+   * crate counts it only when the command starts Antigravity, in the notice
+   * state the TUI shares. Optional so a test double need not serve it; a
+   * runtime without it never shows the notice.
    */
-  antigravityNoticeStart?(command: string | undefined): Promise<boolean>;
+  antigravityNoticeStart?(command: string | undefined): Promise<NoticeStart>;
   /**
    * PRD #211 — the user's choice in the Antigravity notice. Resolves Open
    * issues' sentence (thanks, or where to go when the browser did not open),
-   * and nothing for Later and Don't show again.
+   * why a Don't show again could not be saved the first time there is a
+   * problem to say, and nothing otherwise.
    */
   antigravityNoticeChoose?(choice: NoticeChoice): Promise<string | undefined>;
   /**
@@ -4084,10 +4086,10 @@ class FixtureDeckBridge implements DeckBridge {
    * PRD #211 — `?antigravity-notice=1` plays a start the Antigravity notice
    * shows at, for a command that starts `agy`; any other preview shows none.
    */
-  async antigravityNoticeStart(command: string | undefined): Promise<boolean> {
+  async antigravityNoticeStart(command: string | undefined): Promise<NoticeStart> {
     await Promise.resolve();
     const startsAgy = (command ?? "").trim().split(/\s+/)[0]?.split("/").pop() === "agy";
-    return startsAgy && new URLSearchParams(window.location.search).get("antigravity-notice") === "1";
+    return { show: startsAgy && new URLSearchParams(window.location.search).get("antigravity-notice") === "1" };
   }
 
   async antigravityNoticeChoose(choice: NoticeChoice): Promise<string | undefined> {
@@ -6064,10 +6066,9 @@ export class TauriDeckBridge implements DeckBridge {
     return typeof message === "string" ? message : undefined;
   }
 
-  async antigravityNoticeStart(command: string | undefined): Promise<boolean> {
+  async antigravityNoticeStart(command: string | undefined): Promise<NoticeStart> {
     const invoke = await this.getInvoke();
-    /* Only a literal `true` shows the notice, for the star reminder's reason. */
-    return (await invoke<unknown>("desktop_antigravity_notice_start", { command: command ?? null })) === true;
+    return noticeStartFrom(await invoke<unknown>("desktop_antigravity_notice_start", { command: command ?? null }));
   }
 
   async antigravityNoticeChoose(choice: NoticeChoice): Promise<string | undefined> {

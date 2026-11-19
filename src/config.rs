@@ -2277,8 +2277,13 @@ pub fn antigravity_notice_path() -> PathBuf {
 /// The Antigravity experimental notice's state (PRD #211), shared by the TUI
 /// and the desktop app. The words are [`crate::antigravity_notice`]'s.
 ///
-/// Every field only ever grows, as [`StarPromptState`]'s do, so folding in
-/// what the other client saved keeps the larger of each.
+/// Each update rereads the file under the lock [`lock_star_prompt`] describes
+/// and changes what it read, so a start or a choice saved by the other client
+/// a moment earlier is kept. The fields only grow in normal use, which is
+/// what lets [`AntigravityNoticeSession`] fold in a state it could not save:
+/// it keeps the larger of each count and either client's Don't show again.
+/// A file that is corrupt is read as a fresh state and replaced by the next
+/// save, so that growth is not a guarantee across a damaged file.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AntigravityNoticeState {
@@ -2290,14 +2295,14 @@ pub struct AntigravityNoticeState {
     pub permanently_dismissed: bool,
 }
 
-/// What [`AntigravityNoticeState::record_start`] answers.
+/// What [`AntigravityNoticeSession::record_start`] answers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AntigravityNoticeStart {
     /// Whether to show the notice for this start.
     pub show: bool,
-    /// Why the state file could not be read or saved, when it could not.
-    /// The caller says it once per process: the start was still counted in
-    /// what this client answers from.
+    /// Why the state file could not be read or saved, the first time this
+    /// session meets a problem; `None` after that. The start was still
+    /// counted in what this session answers from.
     pub problem: Option<String>,
 }
 
@@ -2346,6 +2351,14 @@ impl AntigravityNoticeState {
                     >= crate::antigravity_notice::NOTICE_INTERVAL)
     }
 
+    /// Fold in `other`: the larger of each count, and Don't show again from
+    /// either.
+    fn fold(&mut self, other: &Self) {
+        self.start_count = self.start_count.max(other.start_count);
+        self.last_prompt_at_start = self.last_prompt_at_start.max(other.last_prompt_at_start);
+        self.permanently_dismissed |= other.permanently_dismissed;
+    }
+
     fn save_to(&self, path: &Path) -> Result<(), String> {
         let contents = serde_json::to_string_pretty(self)
             .map_err(|e| format!("Failed to serialize Antigravity notice state: {e}"))?;
@@ -2356,13 +2369,66 @@ impl AntigravityNoticeState {
             )
         })
     }
+}
 
-    /// Read the file at `path`, apply `change`, and save, as one step against
-    /// the other client (the lock [`lock_star_prompt`] describes). Answers
-    /// the state as changed, which is what the caller answers from even when
-    /// it could not be saved, whether it was saved, and why the file could
-    /// not be read or saved.
-    fn update(path: &Path, change: impl FnOnce(&mut Self)) -> (Self, bool, Option<String>) {
+/// One client's use of the Antigravity notice's state for as long as it runs
+/// (PRD #211): the TUI holds one in its UI state, the desktop app one per
+/// process.
+///
+/// Every update reads the file at `path`, applies the change and saves it, as
+/// one step against the other client. When a save fails, the changed state is
+/// kept here and folded into every later read, so this session goes on
+/// answering from it: a start that could not be saved does not bring the
+/// notice back at the next start, and a Don't show again that could not be
+/// saved holds until the client restarts. The first problem met is said once;
+/// later ones are not repeated.
+#[derive(Debug, Clone)]
+pub struct AntigravityNoticeSession {
+    path: PathBuf,
+    /// What this session could not save, folded into each later read.
+    unsaved: Option<AntigravityNoticeState>,
+    /// Whether a problem was already handed to the caller to say.
+    problem_said: bool,
+}
+
+impl AntigravityNoticeSession {
+    /// A session over the state file at `path`.
+    pub fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            unsaved: None,
+            problem_said: false,
+        }
+    }
+
+    /// The state file this session reads and writes.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The state this session answers from now: the file's, with anything it
+    /// could not save folded in.
+    pub fn state(&self) -> AntigravityNoticeState {
+        let (mut state, _) = AntigravityNoticeState::load_from(&self.path);
+        if let Some(unsaved) = &self.unsaved {
+            state.fold(unsaved);
+        }
+        state
+    }
+
+    /// `problem`, the first time this session has one to say.
+    fn say_once(&mut self, problem: Option<String>) -> Option<String> {
+        problem.filter(|_| !std::mem::replace(&mut self.problem_said, true))
+    }
+
+    /// Read the file, fold in what was not saved, apply `change`, and save,
+    /// under the lock [`lock_star_prompt`] describes. Answers whether it was
+    /// saved, and why the file could not be read or saved, if it could not.
+    fn update(
+        &mut self,
+        change: impl FnOnce(&mut AntigravityNoticeState),
+    ) -> (bool, Option<String>) {
+        let path = self.path.clone();
         let mut problem = None;
         if let Some(parent) = path.parent()
             && let Err(e) = std::fs::create_dir_all(parent)
@@ -2372,48 +2438,61 @@ impl AntigravityNoticeState {
             ));
         }
         let lock = lock_reminder_state(
-            path,
+            &path,
             "antigravity-notice-state.json",
             "Antigravity notice state",
         );
-        let (mut state, unreadable) = Self::load_from(path);
+        let (mut state, unreadable) = AntigravityNoticeState::load_from(&path);
+        if let Some(unsaved) = &self.unsaved {
+            state.fold(unsaved);
+        }
         change(&mut state);
         let saved = match lock {
             // The other client kept the file locked: save nothing over it.
             Err(why) => Err(why),
-            Ok(_lock) => state.save_to(path),
+            Ok(_lock) => state.save_to(&path),
         };
         let problem = problem.or(unreadable);
         match saved {
-            Ok(()) => (state, true, problem),
-            Err(why) => (state, false, problem.or(Some(why))),
+            Ok(()) => {
+                self.unsaved = None;
+                (true, problem)
+            }
+            Err(why) => {
+                self.unsaved = Some(state);
+                (false, problem.or(Some(why)))
+            }
         }
     }
 
-    /// Count a user-started Antigravity start in the file at `path`, and
-    /// answer whether to show the notice for it. A showing is recorded with
-    /// the count, so Later and Open issues need not save anything: the notice
-    /// comes back at the next interval either way.
-    pub fn record_start(path: &Path) -> AntigravityNoticeStart {
+    /// Count a user-started Antigravity start, and answer whether to show the
+    /// notice for it. A showing is recorded with the count, so Later and Open
+    /// issues need not save anything: the notice comes back at the next
+    /// interval either way.
+    pub fn record_start(&mut self) -> AntigravityNoticeStart {
         let mut show = false;
-        let (_, _, problem) = Self::update(path, |state| {
+        let (_, problem) = self.update(|state| {
             state.start_count = state.start_count.saturating_add(1);
             show = state.is_due();
             if show {
                 state.last_prompt_at_start = state.start_count;
             }
         });
+        let problem = self.say_once(problem);
         AntigravityNoticeStart { show, problem }
     }
 
-    /// Don't show again, in either client. The error says why it could not be
-    /// saved.
-    pub fn dismiss_permanently(path: &Path) -> Result<(), String> {
-        match Self::update(path, |state| state.permanently_dismissed = true) {
-            (_, true, _) => Ok(()),
-            (_, false, problem) => Err(problem
-                .unwrap_or_else(|| "Failed to save the Antigravity notice state".to_string())),
+    /// Don't show again, in either client. It holds in this session whether
+    /// or not it could be saved; the answer is why it could not, when this is
+    /// the first problem the session has to say.
+    pub fn dismiss_permanently(&mut self) -> Option<String> {
+        let (saved, problem) = self.update(|state| state.permanently_dismissed = true);
+        if saved {
+            return None;
         }
+        self.say_once(
+            problem.or_else(|| Some("Failed to save the Antigravity notice state".to_string())),
+        )
     }
 }
 
@@ -4348,32 +4427,37 @@ command = "vim"
         assert_eq!(StarPromptState::load_from(&path).launch_count, 3);
     }
 
+    /// PRD #211: a client's session over the notice state at `path`.
+    fn notice_session(path: &Path) -> AntigravityNoticeSession {
+        AntigravityNoticeSession::new(path.to_path_buf())
+    }
+
+    /// PRD #211: one start, by a client that has just started (a fresh
+    /// session, which reads everything from the file).
+    fn notice_start(path: &Path) -> AntigravityNoticeStart {
+        notice_session(path).record_start()
+    }
+
     /// PRD #211: the Antigravity notice shows on the first start, then on the
     /// hundredth start after the last showing, and the file records each.
     #[test]
     fn antigravity_notice_shows_first_then_every_hundredth_start() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("notice.json");
-        assert!(
-            AntigravityNoticeState::record_start(&path).show,
-            "first start"
-        );
+        assert!(notice_start(&path).show, "first start");
         let (state, _) = AntigravityNoticeState::load_from(&path);
         assert_eq!(state.start_count, 1);
         assert_eq!(state.last_prompt_at_start, 1);
         for start in 2..=100 {
-            assert!(
-                !AntigravityNoticeState::record_start(&path).show,
-                "start {start} showed"
-            );
+            assert!(!notice_start(&path).show, "start {start} showed");
         }
         assert!(
-            AntigravityNoticeState::record_start(&path).show,
+            notice_start(&path).show,
             "the hundredth start after the showing did not show"
         );
         let (state, _) = AntigravityNoticeState::load_from(&path);
         assert_eq!((state.start_count, state.last_prompt_at_start), (101, 101));
-        assert!(!AntigravityNoticeState::record_start(&path).show);
+        assert!(!notice_start(&path).show);
         let saved = std::fs::read_to_string(&path).unwrap();
         assert!(saved.contains("\"last_prompt_at_start\": 101"), "{saved}");
     }
@@ -4383,13 +4467,10 @@ command = "vim"
     fn antigravity_notice_dont_show_again_is_permanent() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("notice.json");
-        assert!(AntigravityNoticeState::record_start(&path).show);
-        AntigravityNoticeState::dismiss_permanently(&path).unwrap();
+        assert!(notice_start(&path).show);
+        assert_eq!(notice_session(&path).dismiss_permanently(), None);
         for start in 2..=301 {
-            assert!(
-                !AntigravityNoticeState::record_start(&path).show,
-                "start {start} showed"
-            );
+            assert!(!notice_start(&path).show, "start {start} showed");
         }
         let (state, _) = AntigravityNoticeState::load_from(&path);
         assert!(state.permanently_dismissed);
@@ -4410,7 +4491,7 @@ command = "vim"
         assert_eq!(problem, None);
         assert!(state.permanently_dismissed);
         assert_eq!((state.start_count, state.last_prompt_at_start), (0, 0));
-        assert!(!AntigravityNoticeState::record_start(&path).show);
+        assert!(!notice_start(&path).show);
     }
 
     /// PRD #211: an unreadable file is reported, and the start still answers
@@ -4420,7 +4501,7 @@ command = "vim"
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("notice.json");
         std::fs::write(&path, "not json").unwrap();
-        let start = AntigravityNoticeState::record_start(&path);
+        let start = notice_start(&path);
         assert!(start.show);
         let problem = start.problem.expect("the unreadable file is reported");
         assert!(
@@ -4440,10 +4521,10 @@ command = "vim"
         let blocker = dir.path().join("not-a-directory");
         std::fs::write(&blocker, "").unwrap();
         let path = blocker.join("notice.json");
-        let start = AntigravityNoticeState::record_start(&path);
+        let start = notice_start(&path);
         assert!(start.show);
         assert!(start.problem.is_some());
-        assert!(AntigravityNoticeState::dismiss_permanently(&path).is_err());
+        assert!(notice_session(&path).dismiss_permanently().is_some());
     }
 
     /// PRD #211: the two clients share the file: starts in either count
@@ -4453,18 +4534,15 @@ command = "vim"
     fn antigravity_notice_the_two_clients_share_state() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("notice.json");
-        assert!(AntigravityNoticeState::record_start(&path).show);
+        assert!(notice_start(&path).show);
         for start in 2..=100 {
             // Each client reads the file at its own start.
-            assert!(!AntigravityNoticeState::record_start(&path).show, "{start}");
+            assert!(!notice_start(&path).show, "{start}");
         }
-        assert!(
-            AntigravityNoticeState::record_start(&path).show,
-            "start 101"
-        );
-        AntigravityNoticeState::dismiss_permanently(&path).unwrap();
+        assert!(notice_start(&path).show, "start 101");
+        assert_eq!(notice_session(&path).dismiss_permanently(), None);
         for start in 102..=500 {
-            assert!(!AntigravityNoticeState::record_start(&path).show, "{start}");
+            assert!(!notice_start(&path).show, "{start}");
         }
     }
 
@@ -4480,14 +4558,14 @@ command = "vim"
             let (path, start) = (path.clone(), start.clone());
             threads.push(std::thread::spawn(move || {
                 start.wait();
-                AntigravityNoticeState::record_start(&path).show
+                notice_start(&path).show
             }));
         }
         let dismiss = {
             let (path, start) = (path.clone(), start.clone());
             std::thread::spawn(move || {
                 start.wait();
-                AntigravityNoticeState::dismiss_permanently(&path).unwrap();
+                assert_eq!(notice_session(&path).dismiss_permanently(), None);
             })
         };
         let shown = threads
@@ -4500,6 +4578,79 @@ command = "vim"
         let (state, _) = AntigravityNoticeState::load_from(&path);
         assert_eq!(state.start_count, 16);
         assert!(state.permanently_dismissed);
+    }
+
+    /// PRD #211: a session whose state file cannot be saved keeps counting
+    /// in memory, so the start after the first showing does not show the
+    /// notice again, and the hundredth after it does. The problem is said
+    /// once.
+    #[test]
+    fn antigravity_notice_session_keeps_unsaved_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, "").unwrap();
+        let mut session = notice_session(&blocker.join("notice.json"));
+        let first = session.record_start();
+        assert!(first.show, "first start");
+        assert!(first.problem.is_some(), "the problem was not said");
+        for start in 2..=100 {
+            let next = session.record_start();
+            assert!(!next.show, "start {start} showed");
+            assert_eq!(next.problem, None, "start {start} said it again");
+        }
+        assert!(session.record_start().show, "start 101");
+        assert_eq!(session.state().start_count, 101);
+    }
+
+    /// PRD #211: a Don't show again that cannot be saved holds for the rest
+    /// of the session and says why once; a new session (the client
+    /// restarted) reads the file again.
+    #[test]
+    fn antigravity_notice_session_holds_an_unsaved_dismissal() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, "").unwrap();
+        let path = blocker.join("notice.json");
+        let mut session = notice_session(&path);
+        let problem = session.dismiss_permanently();
+        assert!(
+            problem
+                .as_deref()
+                .is_some_and(|p| p.contains("Antigravity notice")),
+            "{problem:?}"
+        );
+        for start in 1..=300 {
+            let next = session.record_start();
+            assert!(!next.show, "start {start} showed after Don't show again");
+            assert_eq!(next.problem, None, "start {start} said it again");
+        }
+        assert_eq!(session.dismiss_permanently(), None, "said twice");
+        assert!(notice_start(&path).show, "a restarted client");
+    }
+
+    /// PRD #211: what a session could not save is saved with its next update
+    /// once the file can be written again.
+    #[test]
+    fn antigravity_notice_session_saves_what_it_held_once_it_can() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("state");
+        std::fs::write(&parent, "").unwrap();
+        let path = parent.join("notice.json");
+        let mut session = notice_session(&path);
+        assert!(session.record_start().show);
+        assert_eq!(session.dismiss_permanently(), None, "said twice");
+        std::fs::remove_file(&parent).unwrap();
+        assert!(!session.record_start().show);
+        let (state, problem) = AntigravityNoticeState::load_from(&path);
+        assert_eq!(problem, None);
+        assert_eq!(
+            state,
+            AntigravityNoticeState {
+                start_count: 2,
+                last_prompt_at_start: 1,
+                permanently_dismissed: true,
+            }
+        );
     }
 
     /// PRD #2174: two clients share one file. Launches of either count

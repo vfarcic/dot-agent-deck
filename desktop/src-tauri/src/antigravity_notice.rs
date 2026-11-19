@@ -16,14 +16,13 @@
 //! TUI's New Agent submit and this crate's `start_agent_action` both make, so
 //! the two clients count the same starts.
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{LazyLock, Mutex};
 
 use dot_agent_deck::antigravity_notice::{new_issue_url, open_issues_message};
-use dot_agent_deck::config::{AntigravityNoticeState, antigravity_notice_path};
+use dot_agent_deck::config::{AntigravityNoticeSession, antigravity_notice_path};
 use dot_agent_deck::event::AgentType;
 use dot_agent_deck::system_browser::{LAUNCH_GRACE, open_with_platform_opener};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tauri::Webview;
 
 /// The dialog's three choices, as the webview names them.
@@ -38,76 +37,106 @@ pub enum NoticeChoice {
     Dismiss,
 }
 
-/// Whether this process has said why the state file could not be read or
-/// saved: once is enough, as the star reminder says it once at startup.
-static PROBLEM_REPORTED: AtomicBool = AtomicBool::new(false);
+/// What a New agent start answers the webview.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NoticeStart {
+    /// Whether to show the notice for this start.
+    pub show: bool,
+    /// Why the state file could not be read or saved, the first time this
+    /// process meets a problem, for the webview to say.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub problem: Option<String>,
+}
+
+/// This process's session over the shared state file: it holds what could
+/// not be saved for as long as the app runs, and hands out the first problem
+/// once, as the TUI's does.
+static SESSION: LazyLock<Mutex<AntigravityNoticeSession>> =
+    LazyLock::new(|| Mutex::new(AntigravityNoticeSession::new(antigravity_notice_path())));
 
 /// Whether `command` starts Antigravity, as the TUI decides it.
 pub fn starts_antigravity(command: Option<&str>) -> bool {
     AgentType::from_command(command) == Some(AgentType::Antigravity)
 }
 
-/// Count a New agent start of `command` in the file at `path`, and answer
-/// whether to show the notice for it. A start of any other agent counts
-/// nothing and shows nothing. Why the file could not be read or saved goes to
-/// stderr, the first time only.
-pub fn record_start(path: &Path, command: Option<&str>) -> bool {
+/// Count a New agent start of `command` in `session`, and answer whether to
+/// show the notice for it. A start of any other agent counts nothing and
+/// shows nothing.
+pub fn record_start(session: &mut AntigravityNoticeSession, command: Option<&str>) -> NoticeStart {
     if !starts_antigravity(command) {
-        return false;
+        return NoticeStart {
+            show: false,
+            problem: None,
+        };
     }
-    let start = AntigravityNoticeState::record_start(path);
-    if let Some(problem) = start.problem
-        && !PROBLEM_REPORTED.swap(true, Ordering::SeqCst)
-    {
-        eprintln!("{problem}");
+    let start = session.record_start();
+    NoticeStart {
+        show: start.show,
+        problem: start.problem,
     }
-    start.show
 }
 
-/// Record `choice` in the file at `path`. Only Don't show again saves
-/// anything: the showing was recorded with the start, so Later and Open
-/// issues leave the next showing where the interval puts it. The error says
-/// why it could not be saved.
-pub fn record_choice(path: &Path, choice: NoticeChoice) -> Result<(), String> {
+/// Record `choice` in `session`. Only Don't show again saves anything: the
+/// showing was recorded with the start, so Later and Open issues leave the
+/// next showing where the interval puts it. A Don't show again holds for the
+/// rest of the session whether or not it could be saved; the answer is why it
+/// could not, when that is the first problem this process has to say.
+pub fn record_choice(
+    session: &mut AntigravityNoticeSession,
+    choice: NoticeChoice,
+) -> Option<String> {
     match choice {
-        NoticeChoice::Dismiss => AntigravityNoticeState::dismiss_permanently(path),
-        NoticeChoice::Open | NoticeChoice::Later => Ok(()),
+        NoticeChoice::Dismiss => session.dismiss_permanently(),
+        NoticeChoice::Open | NoticeChoice::Later => None,
     }
 }
 
-/// A New agent start of `command` succeeded: whether to show the notice.
+fn with_session<T>(use_it: impl FnOnce(&mut AntigravityNoticeSession) -> T) -> T {
+    // A panic while holding it left a session that is still whole: each
+    // update is a fresh read plus what was not saved.
+    let mut session = SESSION
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    use_it(&mut session)
+}
+
+/// A New agent start of `command` succeeded: whether to show the notice, and
+/// the first problem with its state file to say.
 #[tauri::command]
 pub async fn desktop_antigravity_notice_start(
     webview: Webview,
     command: Option<String>,
-) -> Result<bool, String> {
+) -> Result<NoticeStart, String> {
     crate::ensure_main_webview(&webview)?;
-    let path: PathBuf = antigravity_notice_path();
-    tokio::task::spawn_blocking(move || record_start(&path, command.as_deref()))
-        .await
-        .map_err(|error| format!("Could not read the Antigravity notice's state: {error}"))
+    tokio::task::spawn_blocking(move || {
+        with_session(|session| record_start(session, command.as_deref()))
+    })
+    .await
+    .map_err(|error| format!("Could not read the Antigravity notice's state: {error}"))
 }
 
-/// The user's choice in the notice. Answers the sentence to show for Open
-/// issues — thanks, or where to go when the browser did not open — and
-/// nothing for the other two, as the TUI reports them. A Don't show again
-/// that could not be saved is an error, so the webview can show the notice
-/// again.
+/// The user's choice in the notice. Answers the sentence to show: for Open
+/// issues, thanks or where to go when the browser did not open; for a Don't
+/// show again that could not be saved, why, the first time this process has
+/// a problem to say; nothing otherwise, as the TUI reports them.
 #[tauri::command]
 pub async fn desktop_antigravity_notice_choose(
     webview: Webview,
     choice: NoticeChoice,
 ) -> Result<Option<String>, String> {
     crate::ensure_main_webview(&webview)?;
-    let path = antigravity_notice_path();
     tokio::task::spawn_blocking(move || {
-        record_choice(&path, choice)?;
-        Ok((choice == NoticeChoice::Open).then(|| {
-            open_issues_message(open_with_platform_opener(&new_issue_url(), LAUNCH_GRACE).is_ok())
-        }))
+        let problem = with_session(|session| record_choice(session, choice));
+        problem.or_else(|| {
+            (choice == NoticeChoice::Open).then(|| {
+                open_issues_message(
+                    open_with_platform_opener(&new_issue_url(), LAUNCH_GRACE).is_ok(),
+                )
+            })
+        })
     })
     .await
-    .map_err(|error| format!("Could not save the Antigravity notice's choice: {error}"))?
+    .map_err(|error| format!("Could not save the Antigravity notice's choice: {error}"))
 }
 
 #[cfg(test)]
@@ -115,14 +144,25 @@ mod tests {
     use super::*;
     use dot_agent_deck::antigravity_notice::NOTICE_INTERVAL;
 
+    use dot_agent_deck::config::AntigravityNoticeState;
+    use std::path::Path;
+
+    fn session(path: &Path) -> AntigravityNoticeSession {
+        AntigravityNoticeSession::new(path.to_path_buf())
+    }
+
     /// The TUI's start, as `ui.rs` makes it after a successful New Agent
-    /// submit whose command is Antigravity's.
+    /// submit whose command is Antigravity's, from a TUI just started.
     fn tui_start(path: &Path) -> bool {
-        AntigravityNoticeState::record_start(path).show
+        session(path).record_start().show
     }
 
     fn desktop_start(path: &Path) -> bool {
-        record_start(path, Some("agy"))
+        record_start(&mut session(path), Some("agy")).show
+    }
+
+    fn shows(path: &Path, command: Option<&str>) -> bool {
+        record_start(&mut session(path), command).show
     }
 
     fn starts(path: &Path) -> u64 {
@@ -134,10 +174,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("notice.json");
         for command in [None, Some(""), Some("claude"), Some("codex"), Some("bash")] {
-            assert!(!record_start(&path, command), "{command:?} showed");
+            assert!(!shows(&path, command), "{command:?} showed");
         }
         assert_eq!(starts(&path), 0, "another agent's start was counted");
-        assert!(record_start(&path, Some("/usr/local/bin/agy --model x")));
+        assert!(shows(&path, Some("/usr/local/bin/agy --model x")));
         assert_eq!(starts(&path), 1);
     }
 
@@ -152,15 +192,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("notice.json");
         // A plain start with an empty field: the deck's shell.
-        assert!(!record_start(&path, None));
+        assert!(!shows(&path, None));
         assert_eq!(starts(&path), 0);
         // A dispatcher start with an empty field on a deck whose
         // `default_command` is `agy`, resolved and trimmed by the dialog.
-        assert!(record_start(&path, Some("agy")));
+        assert!(shows(&path, Some("agy")));
         // The same default with arguments, and a typed command with spaces
         // around it, which the dialog sends as typed.
-        assert!(!record_start(&path, Some("agy --model x")));
-        assert!(!record_start(&path, Some("  agy  ")));
+        assert!(!shows(&path, Some("agy --model x")));
+        assert!(!shows(&path, Some("  agy  ")));
         assert_eq!(starts(&path), 3, "each Antigravity start counts once");
     }
 
@@ -188,7 +228,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("notice.json");
         assert!(desktop_start(&path));
-        record_choice(&path, NoticeChoice::Dismiss).unwrap();
+        assert_eq!(
+            record_choice(&mut session(&path), NoticeChoice::Dismiss),
+            None
+        );
         for start in 2..=300 {
             assert!(!tui_start(&path), "TUI start {start} showed");
         }
@@ -199,7 +242,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("notice.json");
         assert!(tui_start(&path));
-        AntigravityNoticeState::dismiss_permanently(&path).unwrap();
+        assert_eq!(session(&path).dismiss_permanently(), None);
         for start in 2..=300 {
             assert!(!desktop_start(&path), "desktop start {start} showed");
         }
@@ -211,7 +254,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("notice.json");
             assert!(desktop_start(&path));
-            record_choice(&path, choice).unwrap();
+            assert_eq!(record_choice(&mut session(&path), choice), None);
             for start in 2..=NOTICE_INTERVAL {
                 assert!(!tui_start(&path), "{choice:?}: start {start} showed");
             }
@@ -219,16 +262,85 @@ mod tests {
         }
     }
 
-    /// A Don't show again that cannot be written is reported, not lost
-    /// silently. The state's directory is a file here, so nothing can be saved.
+    /// A Don't show again that cannot be written is reported once, not lost
+    /// silently, and holds for the rest of the session as in the TUI. The
+    /// state's directory is a file here, so nothing can be saved.
     #[test]
-    fn a_dismissal_that_cannot_be_saved_is_an_error() {
+    fn a_dismissal_that_cannot_be_saved_is_said_once_and_holds() {
         let dir = tempfile::tempdir().unwrap();
         let blocker = dir.path().join("not-a-directory");
         std::fs::write(&blocker, "").unwrap();
         let path = blocker.join("notice.json");
-        assert!(record_choice(&path, NoticeChoice::Dismiss).is_err());
-        assert!(record_choice(&path, NoticeChoice::Later).is_ok());
+        let mut session = session(&path);
+        let said = record_choice(&mut session, NoticeChoice::Dismiss);
+        assert!(
+            said.as_deref()
+                .is_some_and(|why| why.contains("Antigravity notice")),
+            "{said:?}"
+        );
+        assert_eq!(record_choice(&mut session, NoticeChoice::Later), None);
+        assert_eq!(
+            record_choice(&mut session, NoticeChoice::Dismiss),
+            None,
+            "said twice"
+        );
+        for start in 1..=150 {
+            let next = record_start(&mut session, Some("agy"));
+            assert_eq!(
+                next,
+                NoticeStart {
+                    show: false,
+                    problem: None
+                },
+                "start {start}"
+            );
+        }
+    }
+
+    /// A start that cannot be saved is said once, and kept in the session:
+    /// the next start does not show the notice again, and the hundredth after
+    /// the showing does.
+    #[test]
+    fn a_start_that_cannot_be_saved_is_said_once_and_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, "").unwrap();
+        let mut session = session(&blocker.join("notice.json"));
+        let first = record_start(&mut session, Some("agy"));
+        assert!(first.show);
+        assert!(first.problem.is_some(), "the problem was not said");
+        for start in 2..=NOTICE_INTERVAL {
+            assert_eq!(
+                record_start(&mut session, Some("agy")),
+                NoticeStart {
+                    show: false,
+                    problem: None
+                },
+                "start {start}"
+            );
+        }
+        assert!(record_start(&mut session, Some("agy")).show);
+    }
+
+    /// The webview reads `show`, and `problem` only when there is one.
+    #[test]
+    fn a_start_answers_the_webview_show_and_any_problem() {
+        let quiet = NoticeStart {
+            show: true,
+            problem: None,
+        };
+        assert_eq!(
+            serde_json::to_value(quiet).unwrap(),
+            serde_json::json!({ "show": true })
+        );
+        let said = NoticeStart {
+            show: false,
+            problem: Some("why".to_string()),
+        };
+        assert_eq!(
+            serde_json::to_value(said).unwrap(),
+            serde_json::json!({ "show": false, "problem": "why" })
+        );
     }
 
     #[test]
