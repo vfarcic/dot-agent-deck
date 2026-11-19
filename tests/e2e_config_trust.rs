@@ -2658,6 +2658,21 @@ fn escape_001_refusals_carry_no_raw_terminal_controls() {
         )
         .and_then(|r| r.pane_id_env)
         .expect("precondition: the approved orchestration opens its start role");
+    // And its coder: `delegate --to coder` is refused by the trust check only
+    // once a coder is there to deliver to. Before its pane is listed the
+    // delegate fails as "reached no worker" instead, which is what a starved
+    // runner produced on `main`'s run for #2378.
+    daemon
+        .wait_for_agent_where(
+            |r| {
+                matches!(
+                    &r.tab_membership,
+                    Some(TabMembership::Orchestration { role_name, .. }) if role_name == "coder"
+                )
+            },
+            common::load_scaled(Duration::from_secs(15)),
+        )
+        .expect("precondition: the approved orchestration opens its coder");
     write_trust_config_with_hostile_role(&roles, CODER_COMMAND_EDITED);
 
     for args in [
