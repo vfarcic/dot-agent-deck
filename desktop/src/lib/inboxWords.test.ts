@@ -25,6 +25,9 @@ describe("deck attention words", () => {
       .toBe("✉ Captain: waiting: a paste into its input has not finished.");
     expect(deckAttentionText([agent("A", false, inbox(1, "cannot_type")), agent("B", false, inbox(2, "awaiting_prompt"))])).toBe("✉ 2 held");
     expect(deckAttentionText([agent("Captain", true, inbox(2))])).toBeUndefined();
+    // Issue #2389: a busy orchestrator that sent nothing for the busy bound.
+    expect(deckAttentionText([agent("Captain", true, inbox(1, "no_activity"))]))
+      .toBe("✉ Captain: not taken: the agent shows as busy but has sent nothing for a while. Ask it to run dot-agent-deck inbox fetch.");
   });
 
   /// Scenario: An agent's attention words are its hold's words while mail waits, the stall's for an unknown hold, the standalone warnings with nothing waiting, and nothing otherwise.

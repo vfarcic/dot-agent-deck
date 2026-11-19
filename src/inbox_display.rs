@@ -44,6 +44,9 @@ pub const WAKE_HOLD_CANNOT_TYPE: &str = "waiting for the agent to fetch it. Send
 /// The card's words for [`WakeHold::NotTaken`].
 pub const WAKE_HOLD_NOT_TAKEN: &str =
     "waiting: the agent did not take the deck's Enter. Send it a prompt.";
+/// Issue #2389: the card's words for [`WakeHold::NoActivity`], a sibling of
+/// [`WAKE_STALLED`] for an agent that reads busy.
+pub const WAKE_HOLD_NO_ACTIVITY: &str = "not taken: the agent shows as busy but has sent nothing for a while. Ask it to run dot-agent-deck inbox fetch.";
 /// The card's words for [`WakeHold::UncertainInput`] while messages wait.
 pub const WAKE_HOLD_UNCERTAIN_INPUT: &str =
     "waiting: the deck's notice may be in its input. Check it before Enter.";
@@ -566,6 +569,12 @@ pub enum WakeHold {
     /// for the cause [`HoldDetail`] names beside it. Tolerant and unset, as
     /// [`WakeHold::NeedsFetch`] is.
     CannotCheck,
+    /// Issue #2389: the agent's status reads busy, and its oldest message has
+    /// waited past the busy bound
+    /// ([`crate::doorbell::DEFAULT_BUSY_STALL_AFTER`]) with the agent sending
+    /// the deck nothing, so the busy reading may be stale. Tolerant: an older
+    /// client reads it as [`WakeHold::Unknown`] and shows the stall's words.
+    NoActivity,
     /// A reason a newer deck names that this build does not know. A client
     /// shows it with [`WAKE_STALLED`]'s words; this build never sends it.
     #[serde(other)]
@@ -586,6 +595,7 @@ impl WakeHold {
             WakeHold::DialogDuringRing => Some(WAKE_HOLD_DIALOG_DURING_RING),
             WakeHold::NeedsFetch => Some(WAKE_HOLD_NEEDS_FETCH),
             WakeHold::CannotCheck => Some(WAKE_HOLD_CANNOT_CHECK),
+            WakeHold::NoActivity => Some(WAKE_HOLD_NO_ACTIVITY),
             WakeHold::Unknown => None,
         }
     }
@@ -627,6 +637,9 @@ impl WakeHold {
             WakeHold::CannotCheck => Some(
                 "the deck can't check the worker's input box, so it doesn't type its notice there; the user can check its pane",
             ),
+            WakeHold::NoActivity => Some(
+                "the worker shows as busy but has sent the deck nothing for a while, so its turn may have ended unseen; it takes its messages when it runs dot-agent-deck inbox fetch",
+            ),
             WakeHold::Unknown => None,
         }
     }
@@ -643,6 +656,7 @@ impl WakeHold {
             WakeHold::Unknown => 9,
             WakeHold::NeedsFetch => 10,
             WakeHold::CannotCheck => 11,
+            WakeHold::NoActivity => 12,
         }
     }
 
@@ -659,6 +673,7 @@ impl WakeHold {
             9 => Some(Some(WakeHold::Unknown)),
             10 => Some(Some(WakeHold::NeedsFetch)),
             11 => Some(Some(WakeHold::CannotCheck)),
+            12 => Some(Some(WakeHold::NoActivity)),
             _ => None,
         }
     }
@@ -1294,6 +1309,13 @@ mod tests {
         );
         assert_eq!(deck_attention_text(None, 2).as_deref(), Some("✉ 2 held"));
         assert_eq!(deck_attention_text(None, 0), None);
+        // Issue #2389: a busy orchestrator that sent nothing for the bound.
+        assert_eq!(
+            deck_attention_text(Some(("Captain", WAKE_HOLD_NO_ACTIVITY)), 0).as_deref(),
+            Some(
+                "✉ Captain: not taken: the agent shows as busy but has sent nothing for a while. Ask it to run dot-agent-deck inbox fetch."
+            )
+        );
     }
 
     /// PRD #1666 part 3 (Q35): a cannot-check detail in words, the exact
@@ -1633,6 +1655,7 @@ mod tests {
             ("dialog_during_ring", WakeHold::DialogDuringRing),
             ("needs_fetch", WakeHold::NeedsFetch),
             ("cannot_check", WakeHold::CannotCheck),
+            ("no_activity", WakeHold::NoActivity),
         ] {
             assert_eq!(
                 serde_json::to_value(hold).unwrap(),
@@ -1646,7 +1669,7 @@ mod tests {
         }
         assert_eq!(
             words["wakeHolds"].as_object().map(|holds| holds.len()),
-            Some(9),
+            Some(10),
             "the fixture lists every hold the deck names"
         );
         // PRD #1666 part 3 (Q35): held typing, and why a check can't run.

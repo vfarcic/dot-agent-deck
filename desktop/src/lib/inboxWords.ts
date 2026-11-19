@@ -37,6 +37,8 @@ export const INBOX_WORDS = {
     needs_fetch: "waiting: ask the agent to run dot-agent-deck inbox fetch; reinstall the deck integration to restore automatic delivery",
     /** PRD #1666 part 3 (Q35): the deck can't check the agent's input box, when no detail it understands says why. */
     cannot_check: "waiting: the deck can't check this agent's input box. Check its pane.",
+    /** Issue #2389: the agent shows as busy, and its oldest message has waited the busy bound with nothing from the agent. */
+    no_activity: "not taken: the agent shows as busy but has sent nothing for a while. Ask it to run dot-agent-deck inbox fetch.",
   } as Partial<Record<string, string>>,
   /**
    * PRD #1666 part 3 (Q35): `cannot_check`'s words with a detail; `{cause}`

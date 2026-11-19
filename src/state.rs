@@ -8405,6 +8405,19 @@ impl AppState {
     }
 
     pub fn agent_status(&self, agent_id: &str, pane_id: &str) -> Option<SessionStatus> {
+        self.agent_status_and_activity(agent_id, pane_id)
+            .map(|(status, _)| status)
+    }
+
+    /// Issue #2389: [`Self::agent_status`] and the same card's
+    /// [`SessionState::last_activity`], the newest frame the deck applied to
+    /// it, which the doorbell reads to tell an agent still at work from a busy
+    /// reading nothing has refreshed.
+    pub fn agent_status_and_activity(
+        &self,
+        agent_id: &str,
+        pane_id: &str,
+    ) -> Option<(SessionStatus, DateTime<Utc>)> {
         self.sessions
             .values()
             .filter(|s| {
@@ -8415,7 +8428,7 @@ impl AppState {
                     .cmp(&b.last_activity)
                     .then_with(|| a.session_id.cmp(&b.session_id))
             })
-            .map(|s| s.status.clone())
+            .map(|s| (s.status.clone(), s.last_activity))
     }
 
     /// Register a pane ID as managed by our app.
