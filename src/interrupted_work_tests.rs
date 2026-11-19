@@ -600,3 +600,209 @@ fn a_workspace_resolves_to_a_matching_cwd_or_expands_under_home() {
     // A `~` with no home to expand it against names nothing.
     assert_eq!(ws.to_path_with_home(Path::new("/")), None);
 }
+
+#[test]
+fn the_interrupted_work_requests_round_trip_with_their_ops_and_omit_their_defaults() {
+    use crate::daemon_protocol::{AttachRequest, CallerClaim};
+    let wire = |req: &AttachRequest| serde_json::to_value(req).unwrap();
+    let back = |value: serde_json::Value| serde_json::from_value::<AttachRequest>(value).unwrap();
+
+    let plain = wire(&AttachRequest::ListInterruptedWork { git: false });
+    assert_eq!(plain, serde_json::json!({"op": "list-interrupted-work"}));
+    assert!(matches!(
+        back(plain),
+        AttachRequest::ListInterruptedWork { git: false }
+    ));
+    let with_git = wire(&AttachRequest::ListInterruptedWork { git: true });
+    // Parsed from text: linkage-check reads a bare `"git"` literal in `src/`
+    // as a Git program name.
+    let expected: serde_json::Value =
+        serde_json::from_str(r#"{"op": "list-interrupted-work", "git": true}"#).unwrap();
+    assert_eq!(with_git, expected);
+    assert!(matches!(
+        back(with_git),
+        AttachRequest::ListInterruptedWork { git: true }
+    ));
+
+    let show = wire(&AttachRequest::ShowInterrupted { id: "w-1".into() });
+    assert_eq!(
+        show,
+        serde_json::json!({"op": "show-interrupted", "id": "w-1"})
+    );
+    assert!(matches!(back(show), AttachRequest::ShowInterrupted { id } if id == "w-1"));
+
+    let person = wire(&AttachRequest::ReclaimInterrupted {
+        id: "w-1".into(),
+        dry_run: false,
+        caller: None,
+    });
+    assert_eq!(
+        person,
+        serde_json::json!({"op": "reclaim-interrupted", "id": "w-1"})
+    );
+    let agent = wire(&AttachRequest::ReclaimInterrupted {
+        id: "w-1".into(),
+        dry_run: true,
+        caller: Some(CallerClaim {
+            pane_id: "p".into(),
+            token: "t".into(),
+        }),
+    });
+    assert_eq!(agent["dry_run"], true);
+    assert_eq!(agent["caller"]["pane_id"], "p");
+    assert!(matches!(
+        back(agent),
+        AttachRequest::ReclaimInterrupted { dry_run: true, caller: Some(c), .. } if c.pane_id == "p"
+    ));
+
+    let all = wire(&AttachRequest::DismissInterrupted {
+        ids: Vec::new(),
+        all: true,
+        caller: None,
+    });
+    assert_eq!(
+        all,
+        serde_json::json!({"op": "dismiss-interrupted", "all": true})
+    );
+    let some = back(serde_json::json!({"op": "dismiss-interrupted", "ids": ["a", "b"]}));
+    assert!(matches!(
+        some,
+        AttachRequest::DismissInterrupted { ids, all: false, caller: None } if ids == ["a", "b"]
+    ));
+}
+
+#[test]
+fn the_interrupted_work_answers_are_additive_and_decode_unknown_values() {
+    use crate::daemon_protocol::AttachResponse;
+    let plain = serde_json::to_value(AttachResponse::ok()).unwrap();
+    for key in [
+        "interrupted_work",
+        "interrupted_item",
+        "interrupted_reclaim",
+        "interrupted_dismiss",
+    ] {
+        assert!(plain.get(key).is_none(), "{key} is omitted when absent");
+    }
+
+    let outcome = ReclaimOutcome {
+        id: Some("w-1".into()),
+        dry_run: false,
+        verdict: ReclaimVerdict::KeptHoldsWorktrees,
+        message: reclaim_sentence(ReclaimVerdict::KeptHoldsWorktrees).into(),
+        refusal: None,
+        worktree: Some("/w".into()),
+        branch: Some("b".into()),
+        unpushed_commits: Some(3),
+        nested_worktrees: vec!["/w/pr".into()],
+        recorded: false,
+    };
+    let dismissed = DismissOutcome {
+        dismissed: vec![DismissedItem {
+            id: "w-2".into(),
+            name: Some("unit".into()),
+        }],
+        refused: vec![DismissRefused {
+            id: "x".into(),
+            refusal: Refusal::new(RefusalReason::NotListed),
+        }],
+        refusal: None,
+        incomplete: true,
+    };
+    let resp = AttachResponse {
+        interrupted_reclaim: Some(outcome.clone()),
+        interrupted_dismiss: Some(dismissed.clone()),
+        ..AttachResponse::ok()
+    };
+    let json = serde_json::to_value(&resp).unwrap();
+    assert_eq!(
+        json["interrupted_reclaim"]["verdict"],
+        "kept-holds-worktrees"
+    );
+    assert_eq!(
+        json["interrupted_dismiss"]["refused"][0]["refusal"]["reason"],
+        "not-listed"
+    );
+    let back: AttachResponse = serde_json::from_value(json).unwrap();
+    assert_eq!(back.interrupted_reclaim, Some(outcome));
+    assert_eq!(back.interrupted_dismiss, Some(dismissed));
+
+    // A newer daemon's value decodes rather than failing the whole answer.
+    let verdict: ReclaimVerdict = serde_json::from_value(serde_json::json!("kept-later")).unwrap();
+    assert_eq!(verdict, ReclaimVerdict::Unknown);
+    let reason: RefusalReason = serde_json::from_value(serde_json::json!("new-reason")).unwrap();
+    assert_eq!(reason, RefusalReason::Unknown);
+    let pr: PrFact = serde_json::from_value(serde_json::json!("draft")).unwrap();
+    assert_eq!(pr, PrFact::Unknown);
+    let facts: GitFacts = serde_json::from_value(serde_json::json!({})).unwrap();
+    assert_eq!(facts, GitFacts::default());
+}
+
+#[test]
+fn an_id_resolves_exactly_then_by_unique_name_branch_or_suffix() {
+    let mut j = Journal::default();
+    let (w1, a1) = pane(&mut j, 1);
+    j.ended(&w1, &a1, EndHow::Interrupted);
+    let (w2, a2) = pane(&mut j, 2);
+    j.ended(&w2, &a2, EndHow::Interrupted);
+    let mut list = derive_in(&j, Vec::new(), &[]);
+    for item in &mut list.items {
+        if item.id == w1 {
+            item.name = Some("alpha".into());
+            item.branch = Some("agent/dispatch-alpha".into());
+        } else {
+            item.name = Some("alpha".into());
+        }
+    }
+    let id_of = |r: Resolved<'_>| match r {
+        Resolved::One(item) => Some(item.id.clone()),
+        _ => None,
+    };
+    assert_eq!(id_of(resolve(&list, w2.as_str())), Some(w2.clone()));
+    assert_eq!(
+        id_of(resolve(&list, "agent/dispatch-alpha")),
+        Some(w1.clone())
+    );
+    let suffix = &w2.as_str()[w2.as_str().len() - 6..];
+    assert_eq!(id_of(resolve(&list, suffix)), Some(w2.clone()));
+    assert_eq!(resolve(&list, "alpha"), Resolved::Ambiguous);
+    assert_eq!(resolve(&list, "nothing"), Resolved::NotListed);
+    assert_eq!(resolve(&list, "  "), Resolved::NotListed);
+}
+
+#[test]
+fn the_shared_words_read_as_decided() {
+    assert_eq!(INTERRUPTED_WORK_TITLE, "Interrupted work");
+    assert_eq!(RECLAIM_ACTION, "Reclaim");
+    assert_eq!(RECLAIM_EXPLANATION, "remove its worktree, keep its branch");
+    assert_eq!(DISMISS_ACTION, "Dismiss");
+    assert_eq!(DISMISS_ALL_ACTION, "Dismiss all");
+    assert_eq!(
+        interrupted_footer(3),
+        "3 interrupted items from before the restart"
+    );
+    assert_eq!(
+        interrupted_footer(1),
+        "1 interrupted item from before the restart"
+    );
+    assert_eq!(unpushed_sentence(0), None);
+    assert!(unpushed_sentence(2).unwrap().starts_with("2 commits"));
+    assert_eq!(
+        Refusal::new(RefusalReason::AgentCaller).message,
+        REFUSED_AGENT_CALLER
+    );
+}
+
+#[test]
+fn still_interrupted_is_false_once_dismissed_or_resumed() {
+    let mut j = Journal::default();
+    let (w, a) = pane(&mut j, 1);
+    j.ended(&w, &a, EndHow::Interrupted);
+    assert!(still_interrupted(&j.read(), &w, live_only));
+    let mut resumed = Journal::default();
+    let (w2, a2) = pane(&mut resumed, 1);
+    resumed.ended(&w2, &a2, EndHow::Interrupted);
+    resumed.started(&w2, &attempt(LIVE, 9));
+    assert!(!still_interrupted(&resumed.read(), &w2, live_only));
+    j.closed(&w, CloseHow::Dismissed);
+    assert!(!still_interrupted(&j.read(), &w, live_only));
+}

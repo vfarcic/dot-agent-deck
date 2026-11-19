@@ -446,7 +446,7 @@ const GH_PR_FIELDS: &str = "state,headRefName,isCrossRepository,headRepository,h
 /// queries the upstream repo from a fork checkout with no default set.
 /// [`parse_pr_state`] reads the answer, against the repository the branch is
 /// pushed to ([`derive_push_repo_slugs`]).
-fn resolve_pr_state(repo_dir: &Path, branch: &str) -> PrState {
+pub(crate) fn resolve_pr_state(repo_dir: &Path, branch: &str) -> PrState {
     let repo_slug = match derive_repo_slug(repo_dir) {
         Some(slug) => slug,
         None => {

@@ -3726,6 +3726,22 @@ pub(crate) async fn run_git_capture(args: &[&str]) -> Result<String, String> {
     capture_of(crate::git_env::git_async(), crate::git_env::GIT, args).await
 }
 
+/// [`run_git_capture`] under `bound` instead of the default subprocess bound,
+/// for a probe whose answer is worth less than a long wait (PRD #1790's
+/// interrupted work list).
+pub(crate) async fn run_git_capture_within(
+    args: &[&str],
+    bound: Duration,
+) -> Result<String, String> {
+    capture_within(
+        crate::git_env::git_async(),
+        crate::git_env::GIT,
+        args,
+        bound,
+    )
+    .await
+}
+
 /// The shared body of [`run_capture_args`] and [`run_git_capture`] — see
 /// [`status_of`] for why it is shared.
 async fn capture_of(

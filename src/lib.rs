@@ -142,6 +142,8 @@ pub mod injected_prompt;
 pub mod input_mode;
 // PRD #1790 stage 2: the interrupted work list, derived from the work journal.
 pub mod interrupted_work;
+// PRD #1790 stage 2: the daemon side of the interrupted work verbs.
+pub mod interrupted_work_daemon;
 pub mod issue_dispatch;
 pub mod issue_dispatch_run;
 pub mod jsonc_edit;
