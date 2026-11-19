@@ -130,6 +130,12 @@ impl Codex {
     /// of them, and the deck, which leaves a switched-off hook off, cannot
     /// turn them back on (PRD #1666 part 3, H4: the untrusted-hooks path).
     pub fn with_hooks(folder_dialog: bool, hooks_on: bool) -> Self {
+        Self::with_pane_env(folder_dialog, hooks_on, &[])
+    }
+
+    /// [`Self::with_hooks`], with `pane_env` added to the environment Codex,
+    /// and so each of its hooks, is started with.
+    pub fn with_pane_env(folder_dialog: bool, hooks_on: bool, pane_env: &[(&str, &str)]) -> Self {
         let deck = common::TuiDeck::builder()
             .with_pty_size(180, 50)
             .with_imported_codex_credentials()
@@ -177,13 +183,16 @@ impl Codex {
             "exec codex --model {} --sandbox workspace-write --ask-for-approval never -c 'sandbox_workspace_write.network_access=true' -c 'model_reasoning_effort=\"low\"'",
             common::codex_test_model()
         ));
+        let mut env = vec![
+            json!(["CODEX_HOME", deck.home_dir().join(".codex")]),
+            json!(["DOT_AGENT_DECK_PANE_ID", "codex-inbox-live"]),
+        ];
+        env.extend(pane_env.iter().map(|(key, value)| json!([key, value])));
         let reply = inbox::attach(
             &deck,
             json!({"op":"start-agent", "command":command,
             "agent_type":"codex", "cwd":deck.workdir(), "rows":40,"cols":140,
-            "display_name":"codex-inbox-live", "env":[
-                ["CODEX_HOME",deck.home_dir().join(".codex")],
-                ["DOT_AGENT_DECK_PANE_ID","codex-inbox-live"]]}),
+            "display_name":"codex-inbox-live", "env":env}),
         );
         assert_eq!(reply["ok"], true, "wrapped Codex spawn: {reply}");
         let agent = reply["id"].as_str().unwrap().to_string();
