@@ -1443,9 +1443,39 @@ fn pi_await_answer(raw: &str) -> Option<Value> {
 /// daemon applies only while that prompt's turn is the pane's latest news
 /// (`crate::state::AppState::admit_prompt_not_taken`). Sent by the
 /// transcript witness ([`crate::inbox_witness`]), with the pane's token from
-/// the environment it inherited from the hook.
+/// the environment it inherited from the hook, and only to a deck whose
+/// answer to `inbox_receipts` says it guards the report
+/// ([`crate::event::InboxWaitReply::prompt_not_taken`]): an older one would
+/// apply it as a plain `Idle`, even over a turn the prompt did not start.
 #[cfg(unix)]
 pub(crate) fn report_prompt_not_taken(turn: &crate::inbox_witness::PromptTurn) {
+    let Some(token) = crate::hook_provenance::token_from_env() else {
+        return;
+    };
+    let Some(pane_id) = std::env::var(DOT_AGENT_DECK_PANE_ID)
+        .ok()
+        .filter(|pane| !pane.is_empty())
+    else {
+        return;
+    };
+    let agent_id = std::env::var(DOT_AGENT_DECK_AGENT_ID)
+        .ok()
+        .filter(|agent| !agent.is_empty());
+    let Some(question) =
+        crate::inbox_oneshot::receipts_question(&pane_id, agent_id.as_deref(), &token)
+    else {
+        return;
+    };
+    let guarded = crate::inbox_oneshot::Connection::ask_receipts(
+        &client_socket_path(),
+        &question,
+        std::time::Instant::now() + PROMPT_NOT_TAKEN_SEND_WAIT,
+    )
+    .and_then(|reply| reply.prompt_not_taken)
+    .is_some_and(|version| version >= crate::event::PROMPT_NOT_TAKEN_REPORTS);
+    if !guarded {
+        return;
+    }
     let mut event = producer_event(
         turn.session_id.clone(),
         AgentType::ClaudeCode,
@@ -1456,13 +1486,13 @@ pub(crate) fn report_prompt_not_taken(turn: &crate::inbox_witness::PromptTurn) {
         crate::event::PROMPT_NOT_TAKEN_METADATA_KEY.to_string(),
         turn.nonce.clone(),
     );
-    let token = crate::hook_provenance::token_from_env();
-    if let Ok(line) = crate::event::agent_event_line(&event, token.as_deref()) {
+    if let Ok(line) = crate::event::agent_event_line(&event, Some(&token)) {
         send_to_socket_bounded(&line, PROMPT_NOT_TAKEN_SEND_WAIT);
     }
 }
 
-/// Issue #2347: how long the witness waits on the deck to take its report.
+/// Issue #2347: how long the witness waits on the deck to answer whether it
+/// guards the report, and then to take it.
 #[cfg(unix)]
 const PROMPT_NOT_TAKEN_SEND_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 

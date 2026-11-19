@@ -607,7 +607,7 @@ fn claude_014_live_killed_waiter_falls_back_to_injection() {
     );
 }
 
-/// Scenario: Run interactive Haiku in a project whose own `UserPromptSubmit` hook blocks the first prompt carrying a deck doorbell line, kill the scratch pane's armed waiter, and post a directive task naming a sentinel. The doorbell rings, the deck's hook hands the task over, and the project hook blocks that prompt, so Claude runs no turn and puts the blocked line back in its input box. The card must read the agent Idle again, holding the task as awaiting a prompt rather than reading busy. The test then presses Enter in the pane, sending the restored line as the card asks: the deck's hook hands the task over again, Haiku writes the sentinel once, and the task is acknowledged with two deliveries. If the deck's Claude Code facts are not Go the test reports SKIP saying so.
+/// Scenario: Run interactive Haiku in a project whose own `UserPromptSubmit` hook blocks the first prompt carrying a deck doorbell line, kill the scratch pane's waiter, and post a directive task naming a sentinel (SKIP when the deck's Claude Code facts are not Go). The doorbell rings and that prompt is blocked, so Claude runs no turn and puts the line back in its input box; the card must read Idle again with the doorbell held as awaiting a prompt. Pressing Enter in the pane sends the line, Haiku writes the sentinel once, and the task is acknowledged with two deliveries.
 #[spec("inbox/claude/053")]
 #[test]
 #[cfg(target_os = "linux")]

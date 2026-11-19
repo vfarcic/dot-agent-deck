@@ -1474,7 +1474,7 @@ fn stays(daemon: &impl Endpoint, pane: &Pane, id: &str, expected: &str, duration
     );
 }
 
-/// Scenario: Claude Code's hook payload names a session transcript that exists. The real prompt hook answers a doorbell with the task's block as before, but the task is not acknowledged by that write: it stays fetched until the transcript gains the hook's context as Claude records a prompt it took, and then it is acknowledged with one delivery. A second task's prompt is blocked: the transcript gains only the system entry Claude writes for a blocked prompt. That task is never acknowledged; once the witness reads that entry, the next doorbell hands it over again marked as a possible repeat, and the transcript recording that one acknowledges it, with two deliveries.
+/// Scenario: With a hook payload naming an existing session transcript, the real prompt hook answers a doorbell with the task's block, and the task stays fetched until the transcript gains that hook context, then is acknowledged with one delivery. A second task's prompt is blocked, the transcript gaining only Claude's system entry for it, so it is never acknowledged. Once the witness reads that entry, the next doorbell hands it over again marked as a possible repeat, and the transcript recording that one acknowledges it with two deliveries.
 #[spec("inbox/claude/051")]
 #[test]
 fn claude_051_a_doorbell_hook_commits_only_what_the_transcript_shows_claude_took() {

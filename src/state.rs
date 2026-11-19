@@ -4672,8 +4672,6 @@ impl AppState {
         self.trust_requests = Some(list);
     }
 
-    /// The status of the session currently bound to `pane_id`, read the way
-    /// [`Self::pane_session_id`] picks that session.
     /// Issue #2347: the daemon's guard on a Claude Code prompt that another
     /// `UserPromptSubmit` hook blocked after the deck's own hook reported it.
     /// Called for every event the daemon admits from a producer, before it
@@ -4692,13 +4690,19 @@ impl AppState {
             return event.prompt_not_taken().is_none();
         };
         if let Some(nonce) = event.prompt_not_taken() {
-            let open = self.prompt_turns.remove(pane_id);
-            return !unproven
+            // A report for another prompt, a late one included, leaves the
+            // open turn alone: that prompt's own report may still come.
+            let admitted = !unproven
                 && event.event_type == EventType::Idle
                 && !event.is_from_subagent()
-                && open.is_some_and(|open| {
-                    open.nonce == nonce && open.session_id == event.session_id
-                });
+                && self
+                    .prompt_turns
+                    .get(pane_id)
+                    .is_some_and(|open| open.nonce == nonce && open.session_id == event.session_id);
+            if admitted {
+                self.prompt_turns.remove(pane_id);
+            }
+            return admitted;
         }
         if event.is_daemon_synthetic() || event.is_wrapper_output_classified() {
             return true;
@@ -4733,6 +4737,8 @@ impl AppState {
         true
     }
 
+    /// The status of the session currently bound to `pane_id`, read the way
+    /// [`Self::pane_session_id`] picks that session.
     fn pane_status(&self, pane_id: &str) -> Option<SessionStatus> {
         let session_id = self.pane_session_id(pane_id)?;
         self.sessions
@@ -26324,7 +26330,7 @@ mod tests {
         true
     }
 
-    /// Scenario: An idle Claude Code card gets a prompt's `Thinking` carrying a nonce, and then the witness's `Idle` naming that nonce: the Idle is applied and the card reads Idle, and a second copy of it is refused. A prompt that arrives while the card is already busy, one followed by another report, a report naming another nonce or session, and an unproven one are each refused, and the card keeps reading busy.
+    /// Scenario: An idle Claude Code card gets a prompt's `Thinking` carrying a nonce, and then the witness's `Idle` naming that nonce: the Idle is applied and the card reads Idle, and a second copy of it is refused. A prompt that arrives while the card is already busy, one followed by another report, a report naming another nonce or session, and an unproven one are each refused, and the card keeps reading busy; a late report for an earlier prompt does not stop the newer prompt's own report from ending its turn.
     #[test]
     fn a_dropped_prompt_ends_only_the_turn_it_started() {
         use crate::event::{
@@ -26411,5 +26417,14 @@ mod tests {
         let mut state = idle_card();
         assert!(ingest_prompt_turn(&mut state, thinking("n7"), true));
         assert!(!ingest_prompt_turn(&mut state, gone("n7"), false));
+
+        // A late report for an earlier prompt leaves the newer prompt's turn
+        // open for that prompt's own report (PR #2405 review).
+        let mut state = idle_card();
+        assert!(ingest_prompt_turn(&mut state, thinking("n8"), false));
+        assert!(!ingest_prompt_turn(&mut state, gone("late"), false));
+        assert_eq!(state.pane_status("p"), Some(SessionStatus::Thinking));
+        assert!(ingest_prompt_turn(&mut state, gone("n8"), false));
+        assert_eq!(state.pane_status("p"), Some(SessionStatus::Idle));
     }
 }

@@ -1992,6 +1992,9 @@ async fn ingest_hook_event(
     }
     let event_type = event.event_type.clone();
     let claimed_pane = event.pane_id.clone();
+    // Issue #2347: a dropped prompt's report the guard refuses is expected,
+    // and logged there; it says nothing about the token's generation.
+    let prompt_not_taken = event.prompt_not_taken().is_some();
     let ingested = ingest_event_unless(
         state,
         event_tx,
@@ -2002,7 +2005,7 @@ async fn ingest_hook_event(
         |_| replaced(),
     )
     .await;
-    if !ingested {
+    if !ingested && !prompt_not_taken {
         // Qodo, PR #1559: logged like the gate's own refusals — the escaped
         // pane and a stable reason code, never the token — so a report the
         // under-lock re-check drops does not vanish without a trace.
@@ -6649,6 +6652,9 @@ async fn run_hook_loop_with_limits(
                                         ),
                                         one_shot_senders: crate::inbox_hub::ONE_SHOT_SENDERS
                                             .to_vec(),
+                                        prompt_not_taken: Some(
+                                            crate::event::PROMPT_NOT_TAKEN_REPORTS,
+                                        ),
                                         ..crate::event::InboxWaitReply::default()
                                     };
                                     if let Ok(json) = serde_json::to_string(&reply) {
