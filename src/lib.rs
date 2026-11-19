@@ -140,6 +140,8 @@ pub mod init;
 pub mod injected_prompt;
 // PRD #1666 part 3 round 5-wake: a wrapper's samples of its agent's line discipline.
 pub mod input_mode;
+// PRD #1790 stage 2: the `dot-agent-deck interrupted` command group.
+pub mod interrupted_cli;
 // PRD #1790 stage 2: the interrupted work list, derived from the work journal.
 pub mod interrupted_work;
 // PRD #1790 stage 2: the daemon side of the interrupted work verbs.

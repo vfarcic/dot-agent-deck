@@ -637,7 +637,8 @@ impl DispatchedUnits {
         }
         Err(Refused::new(
             RefusalReason::UnknownUnit,
-            "no live unit has that name (units are not remembered across a daemon restart)",
+            "no live unit has that name (units are not remembered across a daemon restart; \
+             `dot-agent-deck interrupted list` shows the ones a restart interrupted)",
         ))
     }
 
@@ -663,7 +664,8 @@ impl DispatchedUnits {
         }
         let message = if self.is_foreign_id(id) {
             "that unit id was issued by a daemon that has since restarted; nothing it \
-             recorded is known to this one"
+             recorded is known to this one. `dot-agent-deck interrupted list` shows the work \
+             a restart interrupted"
         } else {
             "no live unit has that id"
         };

@@ -429,6 +429,121 @@ pub const REFUSED_STILL_IN_USE: &str = "Refused: an agent is still running in it
 pub const REFUSED_NOT_RECORDED: &str = "Refused: the deck could not record the dismissal.";
 pub const REFUSED_UNKNOWN: &str = "Refused.";
 
+/// What an empty list says.
+pub const NOTHING_INTERRUPTED: &str = "No interrupted work.";
+/// What a list (or a show) read from an incomplete journal read says.
+pub const LIST_INCOMPLETE: &str =
+    "The deck could not read its whole work journal, so an item may be missing or out of date.";
+/// The labels of an item's facts.
+pub const LABEL_ISSUE: &str = "Issue";
+pub const LABEL_BRANCH: &str = "Branch";
+/// A dispatched unit's or an orchestration's directory.
+pub const LABEL_WORKTREE: &str = "Worktree";
+/// A plain agent's directory, which the deck did not create.
+pub const LABEL_FOLDER: &str = "Folder";
+pub const LABEL_STARTED_BY: &str = "Started by";
+pub const LABEL_LAST_ENTRY: &str = "Last entry";
+pub const LABEL_GIT: &str = "Git";
+pub const LABEL_REPORT: &str = "Report";
+/// A worktree inside the one a reclaim kept (decision D6).
+pub const LABEL_NESTED_WORKTREE: &str = "Holds worktree";
+/// Before a report body that was cut at the show bound.
+pub const REPORT_CUT: &str = "This report is longer than shown; this is its start.";
+/// Before why a report body could not be shown.
+pub const REPORT_UNREADABLE: &str = "This report cannot be shown:";
+/// `dismiss --all` with no terminal to confirm on and no `--yes`.
+pub const DISMISS_ALL_NEEDS_YES: &str = "Refused: there is no terminal to confirm on, so nothing was dismissed. Add --yes to dismiss every item.";
+/// The person answered no to dismissing every item.
+pub const NOTHING_DISMISSED: &str = "Nothing was dismissed.";
+/// The running daemon does not advertise interrupted work.
+pub const UNSUPPORTED: &str = "The running deck daemon does not support interrupted work. Restart it onto this build with `dot-agent-deck daemon restart`.";
+/// No daemon answered.
+pub const NO_DAEMON: &str = "No deck daemon is running.";
+/// Before the error of a request the daemon did not answer.
+pub const DAEMON_FAILED: &str = "The deck daemon could not answer:";
+
+/// The word for an item's kind.
+pub fn kind_label(kind: ItemKind) -> &'static str {
+    match kind {
+        ItemKind::Unit => "Unit",
+        ItemKind::Orchestration => "Orchestration",
+        ItemKind::IssueDispatch => "Issue dispatch",
+        ItemKind::Agent => "Agent",
+    }
+}
+
+/// A time in milliseconds since the Unix epoch, as `YYYY-MM-DD HH:MM UTC`.
+pub fn format_time(ms: u64) -> String {
+    i64::try_from(ms)
+        .ok()
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .map(|at| at.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|| "an unknown time".to_string())
+}
+
+/// "kept until <date>" for a kept report (decision D7), or what is said
+/// while it is held with no removal date yet.
+pub fn kept_until(ms: Option<u64>) -> String {
+    match ms {
+        Some(ms) => format!("{KEPT_UNTIL} {}", format_time(ms)),
+        None => "kept, with no removal date yet".to_string(),
+    }
+}
+
+/// The question `dismiss --all` asks before it dismisses `count` items.
+pub fn dismiss_all_question(count: usize) -> String {
+    format!(
+        "{DISMISS_ALL_ACTION}: {}? [y/N] ",
+        interrupted_footer(count)
+    )
+}
+
+/// What a list that left out its oldest `count` items says.
+pub fn omitted_sentence(count: usize) -> String {
+    if count == 1 {
+        "1 older item is not shown.".to_string()
+    } else {
+        format!("{count} older items are not shown.")
+    }
+}
+
+/// An item's Git and pull request facts on one line; a fact that could not
+/// be read is left out.
+pub fn git_facts_line(git: &GitFacts) -> String {
+    let mut facts: Vec<String> = Vec::new();
+    match git.worktree_exists {
+        Some(true) => facts.push("worktree on disk".into()),
+        Some(false) => facts.push("worktree gone".into()),
+        None => {}
+    }
+    match git.dirty {
+        Some(true) => facts.push("uncommitted changes".into()),
+        Some(false) => facts.push("no uncommitted changes".into()),
+        None => {}
+    }
+    match git.unpushed_commits {
+        Some(1) => facts.push("1 commit on no remote".into()),
+        Some(n) if n > 1 => facts.push(format!("{n} commits on no remote")),
+        _ => {}
+    }
+    match git.branch_exists {
+        Some(true) => facts.push("branch kept".into()),
+        Some(false) => facts.push("branch gone".into()),
+        None => {}
+    }
+    facts.push(
+        match git.pr {
+            PrFact::Open => "pull request open",
+            PrFact::Merged => "pull request merged",
+            PrFact::Closed => "pull request closed",
+            PrFact::None => "no pull request",
+            PrFact::Unknown => "pull request unknown",
+        }
+        .into(),
+    );
+    facts.join(", ")
+}
+
 /// The sentence for a reclaim verdict that is not a refusal.
 pub fn reclaim_sentence(verdict: ReclaimVerdict) -> &'static str {
     match verdict {

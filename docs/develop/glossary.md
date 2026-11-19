@@ -33,6 +33,11 @@ dot-agent-deck is one product with two clients — the terminal TUI and the desk
 | Bringing up an orchestration | **activate** | desktop "Start orchestration", "Launch live loop", "Launch {name}?", "launch a workflow" | "Activated orchestration: {name}" | "Activate orchestration", "Activate {name}?", "activate again" | `prepare-orchestration` then `start-prepared-agent` per role |
 | Where an agent runs / a configured project | **directory** / **project** | desktop "repositories" | `Dir:`, project | "Choose projects & orchestrations" | `cwd`, `path`, `ListProjects`, `ListDirectories` |
 | Cron-scheduled prompts | **schedule** | TUI "Scheduled Tasks" | "Schedules", the Schedules manager | the schedule authoring option | `dot-agent-deck schedule` |
+| Work a daemon restart stopped (dispatched units, orchestrations, agents), and reports left for a caller that is gone (PRD #1790) | **Interrupted work**; one entry is an **item** | — | pending PRD #1790 stage 5 | pending PRD #1790 stage 6 | `dot-agent-deck interrupted …`, `ListInterruptedWork`, `CAP_INTERRUPTED_WORK` (`interrupted-work`), `InterruptedItem` |
+| The list's group for plain agents, which the deck did not dispatch | **Other agents** | — | pending | pending | `ItemKind::Agent` (`agent`) |
+| Removing an interrupted item's worktree while keeping its branch | **Reclaim** ("remove its worktree, keep its branch") | — | pending | pending | `dot-agent-deck interrupted reclaim`, `ReclaimInterrupted`; not `dot-agent-deck worktree reclaim`, which sweeps merged worktrees with no item behind them |
+| Taking items off the interrupted work list, leaving their worktrees, branches and reports alone | **Dismiss**, **Dismiss all** | — | pending | pending | `dot-agent-deck interrupted dismiss [--all]`, `DismissInterrupted`, journal `closed how=dismissed` |
+| How long a report left for a gone caller stays on disk | **kept until** a date | — | pending | pending | `kept_until_ms` |
 
 ### Ending an agent versus leaving its view
 
