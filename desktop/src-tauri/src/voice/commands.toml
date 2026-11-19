@@ -2375,6 +2375,15 @@ must_name   = ["orchestration", "run", "every role", "all roles", "all the roles
 # words, never the model's, in the card's reply box and sends nothing: the
 # user reads them and presses Send reply, as `dictate_to_agent` types into a
 # prompt and leaves sending to the user (PRD #2374 review).
+#
+# Issue #2138: `reply_to_agent_card`'s "tell an agent something" took "tell it
+# …" on the agent screen away from `dictate_to_agent`, and the meaning check
+# then refused it. Fixture `dictate-a-submit-word-in-passing-finished` passed
+# 10 of 10 before this row and 4 of 20 after it, `…-go-ahead` 15 of 20
+# (`gpt-5-mini`, 2026-11-19). Saying the row is for an agent the user NAMES on
+# the dashboard took them to 34 of 50 and 50 of 50. A matching sentence in
+# `dictate_to_agent` naming this row made both worse (4 of 20, 12 of 20), so
+# it did not ship.
 [[commands]]
 id          = "set_overview_mode"
 description = """Switch the agent dashboard between its two views: the table (one row per agent)
@@ -2508,8 +2517,9 @@ description = """Write a reply to an agent from its card with the user's own wor
 that agent's card reply box, for the user to read and send. Use when the user says reply to or
 tell an agent something from the dashboard — "reply to the coder yes go ahead", "tell the tester
 use the main branch". Set `agent` to the user's words for the agent and `reply` to exactly the
-words to send, as the user said them. Typing into an open agent's terminal is `dictate_to_agent`;
-pressing a card's button is `run_card_action`."""
+words to send, as the user said them. It is for an agent the user NAMES, from the agent dashboard:
+with an agent's own pane open, "tell it …", "ask it to …" or "reply …" types into that agent's
+prompt and is `dictate_to_agent`, never this. Pressing a card's button is `run_card_action`."""
 invoke      = "replyToAgentCard"
 screens     = ["overview"]
 unavailable_hint = "a card's reply is sent from the agent dashboard"
