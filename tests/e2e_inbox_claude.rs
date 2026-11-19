@@ -1481,7 +1481,7 @@ fn stays(daemon: &impl Endpoint, pane: &Pane, id: &str, expected: &str, duration
     );
 }
 
-/// Scenario: Claude Code's hook payload names a session transcript that exists. The real prompt hook answers a doorbell with the task's block as before, but the task is not acknowledged by that write: it stays fetched until the transcript gains the hook's context as Claude records a prompt it took, and then it is acknowledged with one delivery. A second task's prompt is blocked: the transcript gains only the system entry Claude writes for a blocked prompt. That task is never acknowledged; once the witness gives up, the next doorbell hands it over again marked as a possible repeat, and the transcript recording that one acknowledges it, with two deliveries.
+/// Scenario: With a hook payload naming an existing session transcript, the real prompt hook answers a doorbell with the task's block, and the task stays fetched until the transcript gains that hook context, then is acknowledged with one delivery. A second task's prompt is blocked, the transcript gaining only Claude's system entry for it, so it is never acknowledged. Once the witness reads that entry, the next doorbell hands it over again marked as a possible repeat, and the transcript recording that one acknowledges it with two deliveries.
 #[spec("inbox/claude/051")]
 #[test]
 fn claude_051_a_doorbell_hook_commits_only_what_the_transcript_shows_claude_took() {
@@ -1590,4 +1590,83 @@ fn claude_052_a_native_wake_commits_once_the_transcript_holds_its_prompt() {
     );
     state(&daemon, &pane, &id, "acknowledged");
     assert_eq!(message_of(&daemon, &pane, &id)["deliveries"], 1);
+}
+
+/// Issue #2347: a Claude Code transcript entry for `prompt` blocked by a
+/// hook, as Claude Code 2.1.328 writes one.
+fn blocked_prompt_entry(prompt: &str) -> Value {
+    json!({"type":"system","subtype":"informational","level":"warning",
+        "content":format!(
+            "UserPromptSubmit operation blocked by hook:\nblocked by a policy hook\n\nOriginal prompt: {prompt}"),
+        "preventContinuation":true,
+        "promptSubmitEnding":{"ending":{"kind":"blocked_by_hook","reason":"blocked by a policy hook"},
+            "promptKept":false}})
+}
+
+/// Issue #2347: the status the card for `pane` shows.
+fn card_status(daemon: &impl Endpoint, pane: &Pane) -> String {
+    record(daemon, pane)["live"]["status"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Scenario: A scripted Claude Code's turn ends, and the real prompt hook reports an ordinary prompt (no deck message in it) with a payload naming the session transcript, so the card reads Thinking. The transcript gains Claude's entry for that prompt blocked by another hook, and the card reads Idle again. A second prompt is taken (the transcript gains it as a user entry) and keeps the card Thinking; a third prompt submitted while that turn runs is then blocked, and the card stays Thinking, since that prompt started no turn.
+#[spec("inbox/claude/054")]
+#[test]
+fn claude_054_a_prompt_another_hook_blocks_ends_the_turn_its_hook_reported() {
+    let daemon = daemon(&[]);
+    let pane = parent(&daemon, "claude-blocked-turn");
+    let transcript = daemon.cwd().join("blocked-turn-session.jsonl");
+    std::fs::write(
+        &transcript,
+        b"{\"type\":\"summary\",\"summary\":\"earlier\"}\n",
+    )
+    .unwrap();
+    let status_is = |want: &str| {
+        common::wait_until(common::load_scaled(Duration::from_secs(20)), || {
+            card_status(&daemon, &pane) == want
+        })
+    };
+    let prompt_hook = |tag: &str, prompt: &str| {
+        let mut hook = payload(&pane, "UserPromptSubmit");
+        hook["prompt"] = json!(prompt);
+        hook["transcript_path"] = json!(transcript);
+        let out = run_hook(&pane, tag, hook);
+        assert_eq!(
+            out["stdout"], "",
+            "an ordinary prompt prints nothing: {out}"
+        );
+    };
+    run_hook(&pane, "stop", payload(&pane, "Stop"));
+    assert!(status_is("Idle"), "{}", record(&daemon, &pane));
+
+    let blocked = "Ordinary prompt 2347-a\n  with a second line ";
+    prompt_hook("blocked", blocked);
+    assert!(status_is("Thinking"), "{}", record(&daemon, &pane));
+    append_entry(&transcript, blocked_prompt_entry(blocked));
+    assert!(
+        status_is("Idle"),
+        "a blocked prompt runs no turn, so the card must read Idle again: {}",
+        record(&daemon, &pane)
+    );
+
+    let taken = "Ordinary prompt 2347-b";
+    prompt_hook("taken", taken);
+    assert!(status_is("Thinking"), "{}", record(&daemon, &pane));
+    append_entry(
+        &transcript,
+        json!({"type":"user","message":{"role":"user","content":taken}}),
+    );
+    let mid_turn = "Ordinary prompt 2347-c";
+    prompt_hook("mid-turn", mid_turn);
+    append_entry(&transcript, blocked_prompt_entry(mid_turn));
+    let left = common::wait_until(Duration::from_secs(3), || {
+        card_status(&daemon, &pane) != "Thinking"
+    });
+    assert!(
+        !left,
+        "a prompt blocked mid-turn ends no turn: {}",
+        record(&daemon, &pane)
+    );
 }

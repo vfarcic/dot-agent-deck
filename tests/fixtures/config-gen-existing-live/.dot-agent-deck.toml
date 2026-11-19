@@ -1,0 +1,13 @@
+# My maintenance workflow and review checklist are deliberate customizations.
+[[orchestrations]]
+name = "user-maintenance-91b7ef"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "make deck-agent-7f3a2c"
+start = true
+
+[[orchestrations.roles]]
+name = "reviewer"
+command = "make deck-agent-7f3a2c"
+description = "Preserve the hand-written review checklist 6d4a89"

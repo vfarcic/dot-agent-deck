@@ -16,7 +16,8 @@ import type { VoiceNumberedListDto } from "../lib/voiceNumbers";
 import type { UpgradeChoice, UpgradeEvent } from "../lib/upgrade";
 import type { QuestionSelectionDto, QuestionTextSlotDto, VoiceQuestionTarget } from "../lib/voiceQuestion";
 const EMPTY_TERMINAL_DATA: Record<string, TerminalBuffer> = {};
-import type { AgentTarget, CleanupWarningEntry, DeckAction, DeckFleet, DeckListingOptions, DeckRuntimeState, DeckSnapshot, DesktopFeatures, InboxActionVerb, RuntimeMode, TerminalBuffer } from "../types";
+import { acceptCardsSnapshot, reconcileCards, type CardsConnection } from "../lib/agentCards";
+import { type AgentCardsSnapshot, type AgentCardTarget, type AgentTarget, type CardActionOptions, type CleanupWarningEntry, type DeckAction, type DeckFleet, type DeckListingOptions, type DeckRuntimeState, type DeckSnapshot, type DesktopFeatures, type InboxActionVerb, type RuntimeMode, type TerminalBuffer } from "../types";
 
 /**
  * The snapshot a runtime starts with, before any deck has answered. Lifted out
@@ -481,6 +482,11 @@ export function useDeckRuntime(): DeckRuntimeState {
     ? (target: AgentTarget, item: { paneId: string; messageId: string; revision: number }, verb: InboxActionVerb) =>
       bridge.inboxAction!(target, item, verb)
     : undefined), [bridge]);
+  // PRD #2119: Generate config. Its answer is the screen's to show, so this
+  // bypasses `runAction` too.
+  const generateConfig = useMemo(() => (typeof bridge.generateConfig === "function"
+    ? (deckId: string, agentId: string, paneId: string, incarnation?: string) => bridge.generateConfig!(deckId, agentId, paneId, incarnation)
+    : undefined), [bridge]);
   const decideUpgrade = useMemo(() => (typeof bridge.decideUpgrade === "function"
     ? (upgradeId: string, questionId: number, choice: UpgradeChoice) => bridge.decideUpgrade(upgradeId, questionId, choice)
     : undefined), [bridge]);
@@ -542,6 +548,118 @@ export function useDeckRuntime(): DeckRuntimeState {
     return () => { cancelled = true; };
   }, [bridge]);
 
+  /*
+    PRD #2374 — each deck's agent cards, by deck id, exactly as its daemon sent
+    them (`desktop://agent-cards`). Pushed by the deck watcher on a new
+    subscription, on a card's doorbell and on its reconciliation tick; read
+    once more here whenever a deck becomes connected, because the first push
+    of a subscription can land before this listener exists. A deck whose
+    daemon has no cards answers `null` and keeps no key.
+
+    Cards are consumed only once a surface that renders them asks, through
+    `consumeAgentCards` below. The Table | Cards switch calls it when it
+    mounts. The first call tells the bridge this webview consumes cards
+    (`bridge.consumeAgentCards`), which is what makes the deck watchers
+    subscribe to the cards' doorbells and push them; only once that request has
+    succeeded does this hook listen for pushes and read. Until something calls
+    it, no daemon is subscribed to or read for cards at all.
+  */
+  const [cardsConsumed, setCardsConsumed] = useState(false);
+  const cardsRequested = useRef(false);
+  const consumeAgentCards = useCallback(() => {
+    if (cardsRequested.current) return;
+    cardsRequested.current = true;
+    const ask = typeof bridge.consumeAgentCards === "function" ? bridge.consumeAgentCards() : Promise.resolve();
+    // A refused request is asked again by the next surface that mounts.
+    void ask.then(() => setCardsConsumed(true), () => { cardsRequested.current = false; });
+  }, [bridge]);
+  const [agentCards, setAgentCards] = useState<Readonly<Record<string, AgentCardsSnapshot>>>({});
+  const cardsOffered = typeof bridge.agentCards === "function" || typeof bridge.subscribeAgentCards === "function";
+  /*
+    Review B6: every snapshot, pushed or read, is accepted only through
+    `acceptCardsSnapshot` against the deck's CURRENT connection — connected,
+    from the daemon process that connection names, and no older than the
+    revision held from that process. `cardsConnections` is that connection
+    per deck as of the last fleet seen; `cardsPushed` the last push per deck,
+    so a push that arrived before the fleet named its process is taken once
+    the fleet catches up.
+  */
+  const cardsConnections = useRef(new Map<string, CardsConnection>());
+  const cardsPushed = useRef(new Map<string, AgentCardsSnapshot>());
+  const offerCards = useCallback((next: AgentCardsSnapshot) => {
+    setAgentCards((current) => (acceptCardsSnapshot(current[next.deckId], next, cardsConnections.current.get(next.deckId)) ? { ...current, [next.deckId]: next } : current));
+  }, []);
+  useEffect(() => {
+    if (!cardsConsumed || typeof bridge.subscribeAgentCards !== "function") return;
+    let active = true;
+    let unsubscribe: (() => void) | undefined;
+    void bridge.subscribeAgentCards((next) => {
+      if (!active) return;
+      cardsPushed.current.set(next.deckId, next);
+      offerCards(next);
+    }).then((stop) => {
+      if (active) unsubscribe = stop;
+      else stop();
+    }, () => undefined);
+    return () => {
+      active = false;
+      unsubscribe?.();
+    };
+  }, [bridge, cardsConsumed, offerCards]);
+  /* Whether the fleet effect below has read cards since they were consumed:
+     the first pass after consuming reads every connected deck, since the
+     pushes of the subscriptions that request started can beat the listener. */
+  const cardsReadSinceConsumed = useRef(false);
+  useEffect(() => {
+    const previous = cardsConnections.current;
+    const connections = new Map<string, CardsConnection>();
+    for (const deck of fleet) {
+      if (deck.connection.deckId === undefined) continue;
+      connections.set(deck.connection.deckId, { connected: deck.connection.status === "connected", ...(deck.connection.incarnation !== undefined ? { incarnation: deck.connection.incarnation } : {}) });
+    }
+    cardsConnections.current = connections;
+    // A deck that newly connected, or whose connection now names another
+    // daemon process although it stayed connected, is read again.
+    const arrived = [...connections].filter(([deckId, connection]) => {
+      if (!connection.connected) return false;
+      const before = previous.get(deckId);
+      return !before?.connected || before.incarnation !== connection.incarnation;
+    }).map(([deckId]) => deckId);
+    for (const deckId of [...cardsPushed.current.keys()]) if (!connections.get(deckId)?.connected) cardsPushed.current.delete(deckId);
+    // A deck that left the fleet, stopped answering or was replaced shows no
+    // stale cards; a push held back for want of the fleet is taken now.
+    setAgentCards((current) => {
+      let next = reconcileCards(current, connections);
+      for (const [deckId, pushed] of cardsPushed.current) {
+        if (acceptCardsSnapshot(next[deckId], pushed, connections.get(deckId))) next = { ...next, [deckId]: pushed };
+      }
+      return next;
+    });
+    if (!cardsConsumed || typeof bridge.agentCards !== "function") {
+      cardsReadSinceConsumed.current = false;
+      return;
+    }
+    const toRead = cardsReadSinceConsumed.current ? arrived : [...connections].filter(([, connection]) => connection.connected).map(([deckId]) => deckId);
+    cardsReadSinceConsumed.current = true;
+    for (const deckId of toRead) {
+      // The read is bound to the connection it was asked under: an answer
+      // that lands after the deck reconnected to another process is dropped.
+      const askedOf = connections.get(deckId)?.incarnation;
+      void bridge.agentCards(deckId).then((snapshot) => {
+        const now = cardsConnections.current.get(deckId);
+        if (!now?.connected || now.incarnation !== askedOf) return;
+        if (snapshot) {
+          offerCards(snapshot);
+          return;
+        }
+        setAgentCards((current) => (deckId in current ? Object.fromEntries(Object.entries(current).filter(([id]) => id !== deckId)) : current));
+      }, () => undefined);
+    }
+  }, [bridge, cardsConsumed, fleet, offerCards]);
+  const invokeCardAction = useMemo(() => (typeof bridge.invokeCardAction === "function"
+    ? (target: AgentCardTarget, actionId: string, options: CardActionOptions) => bridge.invokeCardAction!(target, actionId, options)
+    : undefined), [bridge]);
+
   return {
     appliedGeometry,
     desktopFeatures,
@@ -558,6 +676,9 @@ export function useDeckRuntime(): DeckRuntimeState {
     ...(upgradeDaemon ? { upgradeDaemon } : {}),
     ...(decideUpgrade ? { decideUpgrade } : {}),
     ...(inboxAction ? { inboxAction } : {}),
+    ...(generateConfig ? { generateConfig } : {}),
+    ...(cardsOffered ? { agentCards, consumeAgentCards } : {}),
+    ...(invokeCardAction ? { invokeCardAction } : {}),
     sendTerminalInput,
     resizeTerminal,
     previewWorktreeClose,

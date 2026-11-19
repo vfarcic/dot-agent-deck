@@ -1571,6 +1571,27 @@ impl Connection {
         }
     }
 
+    /// Issue #2347: the deck's answer to the `inbox_receipts` `question`,
+    /// by `deadline`, keepalives skipped; `None` when it does not answer in
+    /// time or the connection fails. What it serves is the caller's to read.
+    pub fn ask_receipts(path: &Path, question: &str, deadline: Instant) -> Option<InboxWaitReply> {
+        let wait = deadline.saturating_duration_since(Instant::now());
+        if wait.is_zero() {
+            return None;
+        }
+        let stream = crate::platform::ipc::IpcClient::connect_timeout(path, wait)
+            .ok()?
+            .into_std();
+        let mut connection = Connection::over(stream, MAX_LINE_BYTES).ok()?;
+        connection.send(question, deadline).ok()?;
+        loop {
+            let reply = connection.next(Some(deadline))?;
+            if !reply.keepalive {
+                return Some(reply);
+            }
+        }
+    }
+
     /// The connection on `stream`, reading lines of at most `max` bytes.
     fn over(stream: std::os::unix::net::UnixStream, max: usize) -> io::Result<Connection> {
         let reading = stream.try_clone()?;

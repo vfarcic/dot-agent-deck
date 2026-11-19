@@ -424,9 +424,10 @@ fn offered_values(outcome: &VoiceOutcome) -> Option<Vec<String>> {
 /// live-model gate. With local opt-in, verify outcomes through the shipping
 /// keyed API backend with the deck shown or hidden as each fixture specifies.
 #[tokio::test]
-// Quarantined (CLAUDE.md rule 6), owner vfarcic: fails intermittently from
-// live-model variance, not from a code change; local-only, never in CI. #2138
-// stays open until it is deterministic enough to un-ignore.
+// Quarantined (CLAUDE.md rule 6), owner vfarcic; local-only, never in CI. It
+// was red on every one of five full runs on 2026-11-19, not intermittently:
+// some phrases are misread most of the time (rates on #2138), so it stays
+// ignored until those are fixed and the rest is deterministic enough.
 #[ignore = "quarantined: vfarcic, #2138"]
 async fn voice_desktop_phrases_001_phrase_fixtures_match_the_default_backend() {
     run_fixtures(manifest()).await;
@@ -436,9 +437,9 @@ async fn voice_desktop_phrases_001_phrase_fixtures_match_the_default_backend() {
 /// resulting action, including whole-sentence commands. Mixed-content requests
 /// and hostile observed names must never cause an unasked action to run.
 #[tokio::test]
-// Quarantined (CLAUDE.md rule 6), owner vfarcic: fails intermittently from
-// live-model variance, not from a code change; local-only, never in CI. #2138
-// stays open until it is deterministic enough to un-ignore.
+// Quarantined (CLAUDE.md rule 6), owner vfarcic; local-only, never in CI. It
+// fails intermittently from live-model variance: 5 of 8 full runs were green
+// on 2026-11-19, each red one a different single fixture (rates on #2138).
 #[ignore = "quarantined: vfarcic, #2138"]
 async fn voice_desktop_phrases_002_paraphrase_fixtures_match_the_default_backend() {
     run_fixtures(paraphrase_manifest()).await;
@@ -1387,6 +1388,7 @@ fn planted_world() -> PlantedWorld {
             local: false,
             unavailable: Some(dot_agent_deck_desktop::voice::DECK_IS_EVERY_DAEMON.to_string()),
             holds_agents: false,
+            agents: Default::default(),
         },
         dot_agent_deck_desktop::voice::VoiceDeck {
             id: "deck-local".to_string(),
@@ -1396,6 +1398,7 @@ fn planted_world() -> PlantedWorld {
             unavailable: None,
             // The planted agents are this machine's.
             holds_agents: true,
+            agents: Default::default(),
         },
         dot_agent_deck_desktop::voice::VoiceDeck {
             id: "deck-build-box".to_string(),
@@ -1404,6 +1407,7 @@ fn planted_world() -> PlantedWorld {
             local: false,
             unavailable: None,
             holds_agents: false,
+            agents: Default::default(),
         },
         dot_agent_deck_desktop::voice::VoiceDeck {
             id: "deck-stale-box".to_string(),
@@ -1412,6 +1416,7 @@ fn planted_world() -> PlantedWorld {
             local: false,
             unavailable: Some(STALE_BOX_REASON.to_string()),
             holds_agents: false,
+            agents: Default::default(),
         },
         // A daemon named as one word, which speech-to-text splits ("mini PC"),
         // and one the app is not connected to, as every daemon but the one
@@ -1424,6 +1429,7 @@ fn planted_world() -> PlantedWorld {
             local: false,
             unavailable: Some(dot_agent_deck_desktop::voice::DECK_NOT_CONNECTED.to_string()),
             holds_agents: false,
+            agents: Default::default(),
         },
         dot_agent_deck_desktop::voice::VoiceDeck {
             id: "deck-inmotion".to_string(),
@@ -1432,6 +1438,7 @@ fn planted_world() -> PlantedWorld {
             local: false,
             unavailable: Some(dot_agent_deck_desktop::voice::DECK_NOT_CONNECTED.to_string()),
             holds_agents: false,
+            agents: Default::default(),
         },
     ];
     // PRD #1223 — what the New agent dialog's browser shows when a fixture says

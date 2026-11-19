@@ -1,11 +1,11 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureFleet, createFixtureSnapshot, FIXTURE_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID, FIXTURE_UNREACHABLE_DAEMON_ID, restartedFixtureSnapshot } from "../data/fixture";
 import { agentKey, boundAgentKey } from "../lib/agentKey";
 import { deckName } from "../lib/displayText";
 import type { DeckBridge } from "../lib/bridge";
 import { LaunchCleanupError } from "../lib/actionError";
-import type { DeckFleet, TerminalChunk } from "../types";
+import type { AgentCardsSnapshot, DeckFleet, TerminalChunk } from "../types";
 
 /*
  * A bridge stub rather than `FixtureDeckBridge`, because the state under test
@@ -427,5 +427,144 @@ describe("useDeckRuntime", () => {
     expect(grid("1")).toBeUndefined();
     // Another deck's agent is not this deck's to forget.
     expect(buffer(OTHER_DECK, "1", "elsewhere")).toBeDefined();
+  });
+});
+
+/*
+ * PRD #2374 review B6 — a deck's agent cards are replaced only by a snapshot
+ * from the daemon process its connection names now, never by an older
+ * revision of that process's cards, whichever way the snapshot arrives (a
+ * push or a direct read) and in whatever order; and a daemon replaced while
+ * its deck stays connected takes its cards with it.
+ */
+describe("useDeckRuntime agent cards (PRD #2374)", () => {
+  type CardsBridge = {
+    consumeAgentCards?: () => Promise<void>;
+    subscribeAgentCards?: (listener: (snapshot: AgentCardsSnapshot) => void) => Promise<() => void>;
+    agentCards?: (deckId: string) => Promise<AgentCardsSnapshot | null>;
+  };
+  const cardsBridge = bridge as unknown as CardsBridge;
+  const cards = (instanceId: string, revision: number): AgentCardsSnapshot => ({ deckId: FIXTURE_DAEMON_ID, instanceId, revision, entries: [], catalogErrors: [] });
+
+  /* The order the card calls reach the bridge in. */
+  let calls: string[] = [];
+  /* The runtime, with cards consumed the way the Cards switch does on mount. */
+  const renderConsuming = () => {
+    const rendered = renderHook(() => useDeckRuntime());
+    act(() => rendered.result.current.consumeAgentCards?.());
+    return rendered;
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    bridge.onTerminalGeometry.mockReturnValue(() => {});
+    calls = [];
+    // What keeps cards unread is that nothing consumed them; the
+    // no-cards case is the component's: desktop/agent-cards/007.
+    cardsBridge.consumeAgentCards = vi.fn(async () => { calls.push("consume"); });
+  });
+  afterEach(() => {
+    delete cardsBridge.consumeAgentCards;
+    delete cardsBridge.subscribeAgentCards;
+    delete cardsBridge.agentCards;
+  });
+
+  /*
+   * PR #2378 review: the backend consumes cards only on the webview's
+   * request, and the webview requests them only from the surface that renders
+   * them. Until that surface calls `consumeAgentCards` the hook asks for,
+   * subscribes to and reads nothing; once called, the
+   * request comes first and exactly once, then the listener and the read.
+   */
+  it("subscribes to and reads no cards until a surface consumes them", async () => {
+    cardsBridge.subscribeAgentCards = vi.fn(async () => () => {});
+    cardsBridge.agentCards = vi.fn(async () => null);
+    bridge.connect.mockResolvedValue([createFixtureSnapshot("docs-restart")]);
+    const { result } = renderHook(() => useDeckRuntime());
+    await waitFor(() => expect(result.current.snapshot.connection.incarnation).toBe("docs-before"));
+    await act(async () => { await Promise.resolve(); });
+    expect(result.current.consumeAgentCards).toBeTypeOf("function");
+    expect(cardsBridge.consumeAgentCards).not.toHaveBeenCalled();
+    expect(cardsBridge.subscribeAgentCards).not.toHaveBeenCalled();
+    expect(cardsBridge.agentCards).not.toHaveBeenCalled();
+  });
+
+  it("asks the backend for cards once, before listening and reading, however often it is consumed", async () => {
+    cardsBridge.subscribeAgentCards = vi.fn(async () => { calls.push("subscribe"); return () => {}; });
+    cardsBridge.agentCards = vi.fn(async () => { calls.push("read"); return null; });
+    bridge.connect.mockResolvedValue([createFixtureSnapshot("docs-restart")]);
+    const { result } = renderConsuming();
+    // A second surface mounting, or the same one mounting again.
+    act(() => result.current.consumeAgentCards?.());
+    await waitFor(() => expect(calls).toContain("subscribe"));
+    await waitFor(() => expect(calls).toContain("read"));
+    act(() => result.current.consumeAgentCards?.());
+    expect(calls[0]).toBe("consume");
+    expect(calls.filter((call) => call === "consume")).toHaveLength(1);
+    expect(cardsBridge.subscribeAgentCards).toHaveBeenCalledTimes(1);
+  });
+
+  it("accepts cards only from the connected process, ignores late and older ones, and drops a replaced daemon's", async () => {
+    let onFleet: ((fleet: DeckFleet) => void) | undefined;
+    bridge.subscribe.mockImplementation(async (fleetListener) => {
+      onFleet = fleetListener as (fleet: DeckFleet) => void;
+      return () => {};
+    });
+    let push: ((snapshot: AgentCardsSnapshot) => void) | undefined;
+    const reads: ((snapshot: AgentCardsSnapshot | null) => void)[] = [];
+    cardsBridge.subscribeAgentCards = vi.fn(async (listener) => {
+      push = listener;
+      return () => {};
+    });
+    cardsBridge.agentCards = vi.fn(() => new Promise<AgentCardsSnapshot | null>((resolve) => { reads.push(resolve); }));
+    bridge.connect.mockResolvedValue([createFixtureSnapshot("docs-restart")]);
+    const { result } = renderConsuming();
+    await waitFor(() => expect(result.current.snapshot.connection.incarnation).toBe("docs-before"));
+    await waitFor(() => expect(reads).toHaveLength(1));
+    await waitFor(() => expect(push).toBeDefined());
+    const held = () => result.current.agentCards?.[FIXTURE_DAEMON_ID];
+
+    act(() => push!(cards("docs-before", 5)));
+    expect(held()).toMatchObject({ instanceId: "docs-before", revision: 5 });
+    // The read asked on connect lands after the push, older: ignored.
+    await act(async () => { reads[0](cards("docs-before", 3)); });
+    expect(held()?.revision).toBe(5);
+    // A push delayed behind a newer one: ignored.
+    act(() => push!(cards("docs-before", 4)));
+    expect(held()?.revision).toBe(5);
+    // Another process's cards while the connection still names this one: not shown.
+    act(() => push!(cards("docs-after", 1)));
+    expect(held()).toMatchObject({ instanceId: "docs-before", revision: 5 });
+
+    // The daemon is replaced and the deck stays connected: the old cards go,
+    // the successor's push (held until the fleet named it) is shown, and its
+    // cards are read again.
+    act(() => onFleet!([restartedFixtureSnapshot()]));
+    expect(held()).toMatchObject({ instanceId: "docs-after", revision: 1 });
+    await waitFor(() => expect(reads).toHaveLength(2));
+    // A late answer from the replaced process changes nothing.
+    await act(async () => { reads[1](cards("docs-before", 99)); });
+    expect(held()).toMatchObject({ instanceId: "docs-after", revision: 1 });
+  });
+
+  it("drops a deck's cards when the daemon is replaced and shows nothing until the successor's arrive", async () => {
+    let onFleet: ((fleet: DeckFleet) => void) | undefined;
+    bridge.subscribe.mockImplementation(async (fleetListener) => {
+      onFleet = fleetListener as (fleet: DeckFleet) => void;
+      return () => {};
+    });
+    let push: ((snapshot: AgentCardsSnapshot) => void) | undefined;
+    cardsBridge.subscribeAgentCards = vi.fn(async (listener) => {
+      push = listener;
+      return () => {};
+    });
+    bridge.connect.mockResolvedValue([createFixtureSnapshot("docs-restart")]);
+    const { result } = renderConsuming();
+    await waitFor(() => expect(push).toBeDefined());
+    await waitFor(() => expect(result.current.snapshot.connection.incarnation).toBe("docs-before"));
+    act(() => push!(cards("docs-before", 7)));
+    expect(result.current.agentCards?.[FIXTURE_DAEMON_ID]?.revision).toBe(7);
+    act(() => onFleet!([restartedFixtureSnapshot()]));
+    expect(result.current.agentCards?.[FIXTURE_DAEMON_ID]).toBeUndefined();
   });
 });

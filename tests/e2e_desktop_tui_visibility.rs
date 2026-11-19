@@ -183,7 +183,7 @@ fn proxy_connection(
         // PRD #1666: the TUI's first subscription is the ordered
         // `SubscribeEventsWithSnapshot` where the daemon offers it, and a
         // plain `SubscribeEvents` otherwise.
-        AttachRequest::SubscribeEvents | AttachRequest::SubscribeEventsWithSnapshot => {
+        AttachRequest::SubscribeEvents { .. } | AttachRequest::SubscribeEventsWithSnapshot => {
             write_wire_frame(&mut downstream, &response_frame)?;
             let _ = subscription_tx.send(());
             relay_subscription(downstream, upstream, event_tx.clone())

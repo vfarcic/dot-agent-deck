@@ -305,6 +305,12 @@ reason = "Dismisses the dashboard's Stop daemon result notice (issue #1073): a d
 [[site]]
 file = "desktop/src/components/AgentOverview.tsx"
 handler = "onClick"
+code = "() => setGenerationNotice(undefined)"
+reason = "Dismisses the dashboard's Generate config result notice (PRD #2119): a dismissal."
+
+[[site]]
+file = "desktop/src/components/AgentOverview.tsx"
+handler = "onClick"
 code = "onUpgrade"
 reason = "A daemon card's Upgrade: the daemon upgrade flow, kept off voice because it restarts a daemon and its agents."
 
@@ -1331,3 +1337,11 @@ file = "desktop/src/components/ZoomPanel.tsx"
 handler = "onChange"
 code = "(event) => onSave({ ...settings, zoom: { level: clampZoom(Number(event.target.value)) } })"
 reason = "Settings → Zoom level select; a preference edit inside the Settings sheet (opened by `open_settings`) — no row sets the zoom."
+
+# --- desktop/src/components/AgentCardOverlay.tsx ---
+
+[[site]]
+file = "desktop/src/components/AgentCardOverlay.tsx"
+handler = "onChange"
+code = "(event) => setReply(event.target.value)"
+reason = "A keystroke into the card overlay's reply box (PRD #2374). Sending the reply is the Send reply button, which dispatches `replyToAgentCard` — a `voice: true` entry whose `reply_to_agent_card` row sends the spoken words directly."

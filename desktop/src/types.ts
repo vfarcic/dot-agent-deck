@@ -112,6 +112,7 @@ export type WakeHold =
   | "dialog_during_ring"
   | "needs_fetch"
   | "cannot_check"
+  | "no_activity"
   | "unknown";
 /**
  * PRD #1666 part 3 (Q35): the daemon's `HoldDetail` — what stopped the check
@@ -163,6 +164,15 @@ export type InboxAttentionItem = {
 export type InboxActionVerb = "retry" | "cancel";
 /** PRD #1666 §2: the daemon's answer to Retry or Cancel. */
 export type InboxActionResult = { outcome: string };
+/**
+ * PRD #2119 — the answer to Generate config: `sent` once the agent's daemon
+ * posted the configuration request to its inbox, `unsupported` from a daemon
+ * too old to compose one (nothing was sent), or `failed`. `message` is the
+ * sentence to show, the same one the TUI shows for that outcome.
+ */
+export type GenerateConfigResult =
+  | { outcome: "sent"; messageId: string; message: string }
+  | { outcome: "unsupported" | "failed"; message: string };
 /**
  * Issue #1678: the background work an agent left running after its turn ended,
  * as the DAEMON counts it — commands still running in their own session and
@@ -702,6 +712,183 @@ export const DEFAULT_DESKTOP_FEATURES: DesktopFeatures = {
   showAgentDetails: false,
 };
 
+/*
+ * PRD #2374 — agent cards, exactly as the daemon computed them
+ * (`list-agent-cards`). The desktop computes NOTHING about status, needs-you,
+ * action availability or order: it renders these as received. Keys are the
+ * daemon's snake_case. Everything under `report`, `fields`, `questions` and
+ * an action with `source: "agent"` is another agent's text: render it as
+ * text, never as markup, and label it as the agent's.
+ */
+
+/** Where a card is grouped: by the dispatcher that started it, its orchestration, or neither. */
+export interface AgentCardGroup {
+  id: string;
+  kind: "dispatcher" | "orchestration" | "standalone" | string;
+  label: string | null;
+}
+
+export interface AgentCardRelations {
+  dispatcher?: { key: string; name: string } | null;
+  orchestration?: { id: string; label: string; role: string; is_orchestrator: boolean } | null;
+}
+
+/** What the agent itself last published — the agent's word, not checked by the deck. */
+export interface AgentCardReport {
+  source: "agent";
+  status: "working" | "waiting" | "done" | "failed" | string;
+  summary: string | null;
+  published_at: string;
+  revision: number;
+}
+
+export interface AgentCardField {
+  name: string;
+  label: string;
+  description: string | null;
+  type: "text" | "long_text" | "number" | "boolean" | "url" | "list" | "pull_request" | "issue" | string;
+  icon: string | null;
+  placement: "compact" | "card" | "detail" | string;
+  custom: boolean;
+  source: "agent" | string;
+  value: unknown;
+}
+
+export interface AgentCardQuestion {
+  id: string;
+  text: string;
+  source: "agent" | string;
+  options: { id: string; label: string; action_id: string }[];
+  answered: { option_id: string; action_id: string; at: string } | null;
+}
+
+/** The latest delivery of one prompt action to the agent's inbox. */
+export interface AgentCardDelivery {
+  message_id: string;
+  state: "queued" | "delivered" | "uncertain" | "not_delivered" | string;
+  detail: string | null;
+  at: string;
+}
+
+export interface AgentCardAction {
+  id: string;
+  label: string;
+  kind: "prompt" | "close" | "close_keep_worktree" | "open" | string;
+  /** The exact text a prompt action sends; `null` for `reply` and the deck's own actions. */
+  prompt: string | null;
+  /**
+   * Who wrote the exact text of `prompt`, as the daemon decides it: `catalog`
+   * (a catalog action) or `agent` (text that is, or quotes, the agent's: a
+   * custom action's or a question option's own prompt, and the answer the
+   * deck composes from the agent's question and option label); `null` when
+   * there is no prompt. Voice sends only a `catalog` prompt directly; any
+   * other value, or none, opens the review step.
+   */
+  prompt_source?: "catalog" | "agent" | string | null;
+  text_input: boolean;
+  confirm: boolean;
+  confirm_detail: string | null;
+  icon: string | null;
+  placement: "compact" | "card" | "detail" | string;
+  custom: boolean;
+  source: "catalog" | "agent" | "deck" | string;
+  enabled: boolean;
+  disabled_reason: string | null;
+  /** The latest delivery of THIS definition of the action (its `token`). */
+  last_delivery: AgentCardDelivery | null;
+  /**
+   * The daemon's name for this definition of the action (its label, exact
+   * prompt, confirmation and question). A press sends it, and the daemon
+   * refuses one whose action changed since (`stale_action`), so a press can
+   * only send the text that was shown.
+   */
+  token: string;
+}
+
+/** One action the user invoked on a card: what was sent, exactly, and what became of it. Kept after the report stops offering the action. */
+export interface AgentCardDeliveryRecord {
+  action_id: string;
+  label: string;
+  /** The exact text sent: the action's prompt, or the user's reply. */
+  text: string;
+  token: string;
+  outcome: "sent" | string;
+  message_id: string;
+  state: "queued" | "delivered" | "uncertain" | "not_delivered" | string;
+  detail: string | null;
+  at: string;
+}
+
+/** One agent's card. `key` is `<pane_id>/<agent_id>`; across decks key by `(deckId, instance_id, key)`. */
+export interface AgentCardEntry {
+  key: string;
+  instance_id: string;
+  pane_id: string;
+  agent_id: string;
+  agent_type: string | null;
+  name: string;
+  status: string;
+  needs_you: boolean;
+  needs_you_reasons: string[];
+  group: AgentCardGroup;
+  relations: AgentCardRelations;
+  report: AgentCardReport | null;
+  fields: AgentCardField[];
+  questions: AgentCardQuestion[];
+  actions: AgentCardAction[];
+  primary_action_id: string;
+  facts: { source: "deck"; pull_request: unknown | null };
+  /** The actions invoked on this card, newest first (bounded by the daemon). */
+  recent_deliveries?: AgentCardDeliveryRecord[];
+  revision: number;
+  updated_at: string;
+}
+
+/** One deck's cards (`desktop://agent-cards`, `agent_cards_list`), in the daemon's display order. */
+export interface AgentCardsSnapshot {
+  deckId: string;
+  instanceId: string;
+  revision: number;
+  entries: AgentCardEntry[];
+  catalogErrors: string[];
+}
+
+/**
+ * How one card action is pressed: the `token` of the definition the user was
+ * shown (required — the daemon refuses another), `confirm` only after the
+ * user confirmed an action that asks for it, `text` only for `reply`, and the
+ * press's `requestId` (minted when absent).
+ */
+export interface CardActionOptions {
+  actionToken: string;
+  confirm?: boolean;
+  text?: string;
+  requestId?: string;
+}
+
+/** The card the user acted on. */
+export interface AgentCardTarget {
+  deckId: string;
+  instanceId: string;
+  paneId: string;
+  agentId: string;
+}
+
+/**
+ * The daemon's answer to a card action. A refusal is `outcome: "refused"`
+ * with a stable `code` (`confirm_required`, `action_disabled`, `stale_entry`,
+ * `unsupported`, …) and a sentence to show.
+ */
+export interface CardActionResult {
+  request_id: string;
+  outcome: "sent" | "closed" | "refused" | string;
+  message_id?: string;
+  kept_worktree?: string;
+  code?: string;
+  message?: string;
+  entry_revision?: number;
+}
+
 /**
  * The orchestrations the New agent form can offer for one directory on one deck
  * (PRD #1223 M6) — that deck's `ResolveProject` answer.
@@ -1105,6 +1292,13 @@ export interface AgentSession {
    * field; never filled in by this app.
    */
   pullRequest?: AgentPullRequest;
+  /**
+   * HONEST. PRD #2119 — whether this agent's project already holds a
+   * `.dot-agent-deck.toml`, as its daemon reported it. `true` makes Generate
+   * config read Update config; `false` and absent (no cwd, or a daemon that
+   * predates the field) keep Generate. Never computed by this app.
+   */
+  projectConfigExists?: boolean;
   /**
    * HONEST. Issue #1678: background work still running after the agent's turn
    * ended, copied from the daemon's aggregate and validated at the bridge.
@@ -1685,6 +1879,28 @@ export interface DeckRuntimeState {
   decideUpgrade?: (upgradeId: string, questionId: number, choice: import("./lib/upgrade").UpgradeChoice) => Promise<void>;
   /** PRD #1666 §6.4: Retry or Cancel one listed deck message; absent where no daemon can answer. */
   inboxAction?: (target: AgentTarget, item: { paneId: string; messageId: string; revision: number }, verb: InboxActionVerb) => Promise<InboxActionResult>;
+  /**
+   * PRD #2119 — ask agent `agentId` in pane `paneId`, on the deck `deckId`
+   * names and as the daemon process `incarnation` that listed it, to generate
+   * the project's `.dot-agent-deck.toml`. Absent where no daemon can answer, and
+   * the screens then offer no Generate config.
+   */
+  generateConfig?: (deckId: string, agentId: string, paneId: string, incarnation?: string) => Promise<GenerateConfigResult>;
+  /**
+   * PRD #2374 — each deck's agent cards, by deck id, as its daemon last sent
+   * them. A deck whose daemon has no cards has no key here. Absent where the
+   * bridge offers no cards (a render-only test runtime).
+   */
+  agentCards?: Readonly<Record<string, AgentCardsSnapshot>>;
+  /**
+   * PRD #2374 — start consuming agent cards: the first call asks the backend
+   * for them, after which `agentCards` is pushed and read; later calls do
+   * nothing. Called by the surface that renders the cards when it mounts
+   * (`OverviewModeSwitch`). Absent where `agentCards` is.
+   */
+  consumeAgentCards?: () => void;
+  /** PRD #2374 — invoke one action of one card; the daemon resolves, refuses or performs it. */
+  invokeCardAction?: (target: AgentCardTarget, actionId: string, options: CardActionOptions) => Promise<CardActionResult>;
   sendTerminalInput: (target: AgentTarget, data: string, precondition?: () => boolean) => Promise<void>;
   resizeTerminal: (target: AgentTarget, cols: number, rows: number) => Promise<void>;
   /**

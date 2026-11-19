@@ -896,6 +896,94 @@ printf '%s\n' '[{"number":1234,"headRefName":"feat/pr-badge","state":"OPEN","isD
     });
 }
 
+/// Scenario: Open one stand-in agent's pane through the new-pane form, give it
+/// its fixed type, prompt and Idle status through hook events addressed to its
+/// pane, go back to the dashboard with `Ctrl+D` and press `g` on its card. Once
+/// the Generate .dot-agent-deck.toml dialog shows `> Yes` and `No` over the
+/// card and its pane, with the status dot lit, write the frame as
+/// `generate-config-tui.html`.
+#[test]
+#[ignore = "docs-screenshot generator: run it with `cargo docs-screenshots`"]
+fn docs_screenshot_generate_config() {
+    html_dir();
+    // The events come from this process, which is not the pane and so cannot
+    // present the per-pane capability the daemon gives each pane's own agent.
+    let deck = launch_with(|builder| {
+        builder
+            .with_launch_subdir(LAUNCH_DIR)
+            .impersonating_pane_signals()
+    });
+    deck.wait_for_string("No active agents");
+    let stand_ins = deck.workdir().join("docs-stand-ins");
+    let commands = write_stand_ins(&stand_ins);
+    // The desktop half shows this same agent (`docs-generate` in
+    // `desktop/src/data/fixture.ts`). `open_pane` ends with `Ctrl+D`, back on
+    // the dashboard with the new pane's card selected.
+    let agent = &DASHBOARD_AGENTS[0];
+    open_pane(&deck, agent, &commands[0], "");
+    let names = std::fs::read_to_string(env_names_path(&stand_ins, agent)).unwrap();
+    for key in common::AGENT_CREDENTIAL_ENV {
+        assert!(
+            !names.lines().any(|name| name == key),
+            "{key} reached the screenshot pane"
+        );
+    }
+    let record = wait_for_record(&deck, agent.name, |_| true);
+    let pane_id = record.pane_id_env.clone().expect("screenshot pane id");
+    send(
+        &deck,
+        serde_json::json!({
+            "session_id": agent.session,
+            "agent_type": agent.agent_type,
+            "event_type": "session_start",
+            "timestamp": (Utc::now() - ChronoDuration::minutes(agent.up_for_minutes)).to_rfc3339(),
+            "cwd": agent.cwd,
+            "pane_id": pane_id,
+            "agent_id": record.id,
+            "metadata": { "display_name": agent.name },
+        }),
+    );
+    wait_for_record(&deck, agent.name, |r| {
+        r.live.as_ref().is_some_and(|live| {
+            live.agent_type.as_ref().map(|kind| serde_json::json!(kind))
+                == Some(serde_json::Value::from(agent.agent_type))
+        })
+    });
+    // Stamped ahead of the clock, so the card reads `Last: 0s` on every run.
+    send(
+        &deck,
+        serde_json::json!({
+            "session_id": agent.session,
+            "agent_type": agent.agent_type,
+            "event_type": agent.status_event,
+            "timestamp": (Utc::now() + ChronoDuration::seconds(30)).to_rfc3339(),
+            "cwd": agent.cwd,
+            "pane_id": pane_id,
+            "agent_id": record.id,
+            "user_prompt": agent.prompt,
+        }),
+    );
+    wait_for_record(&deck, agent.name, |r| {
+        r.live
+            .as_ref()
+            .is_some_and(|live| live.last_user_prompt.as_deref() == Some(agent.prompt))
+    });
+    deck.send_keys(b"g");
+    capture(&deck, "generate-config", |grid| {
+        grid.contains("Generate .dot-agent-deck.toml")
+            && grid.contains("> Yes")
+            && grid.contains("No ")
+            && grid.contains("[Yes] [No]")
+            && grid.contains(agent.name)
+            && grid.contains(agent.prompt)
+            && grid.contains("Last: 0s ")
+            && grid.contains("Proposed retry design:")
+            // An idle card blinks its status dot (see the `dashboard`
+            // capture); exactly one `●` means the image shows it lit.
+            && grid.matches('●').count() == 1
+    });
+}
+
 /// Scenario: Choose the sandbox project's directory through Ctrl+N and show
 /// the New Agent form before starting any command.
 #[test]

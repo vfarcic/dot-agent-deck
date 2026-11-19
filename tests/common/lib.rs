@@ -2276,7 +2276,7 @@ impl TuiDeck {
     /// so this accessor is Unix-gated like the harness it exposes.
     #[cfg(unix)]
     pub fn subscribe_events(&self) -> EventSub {
-        EventSub::open(&self.attach_socket).expect("open SubscribeEvents stream")
+        EventSub::open(&self.attach_socket, false).expect("open SubscribeEvents stream")
     }
 
     /// Issue #701: type `prompt` into a real interactive Claude Code pane that
@@ -5557,9 +5557,10 @@ static CONTAINED_DECK: OnceLock<ContainedDeck> = OnceLock::new();
 ///
 /// A **hard link**, not a symlink: Linux's `/proc/self/exe` resolves a symlink
 /// back to cargo's build directory, while a hard link is reported by the name it
-/// was executed through. A copy is the fallback where the temp root is on
-/// another filesystem than the build directory; it costs the binary's size once
-/// per test process. Either way this changes the pathname the deck reports, and
+/// was executed through. Where the temp root is on another filesystem than the
+/// build directory, the link is taken from one copy per build kept beside the
+/// per-process roots ([`link_shared_copy`], issue #2343), and a copy of its own
+/// is the last fallback. Either way this changes the pathname the deck reports, and
 /// nothing else: the hard link shares the build artifact's inode, and a
 /// same-user agent is not sandboxed from the checkout by never being told its
 /// path. One per process rather than per test HOME, so the
@@ -5572,6 +5573,160 @@ static CONTAINED_DECK: OnceLock<ContainedDeck> = OnceLock::new();
 #[allow(dead_code)]
 pub fn contained_deck_binary() -> &'static Path {
     &contained_deck().binary
+}
+
+/// The directory, beside the per-process roots in the harness temp base, that
+/// holds [`link_shared_copy`]'s one copy of the build under test. Not a
+/// `dad-tests-` name: no process owns it, so `cargo xtask clean-e2e-tmp`, which
+/// decides by the owning PID, leaves it alone.
+const SHARED_DECK_DIR: &str = "dad-deck-under-test";
+
+/// Issue #2343: hard-link `binary` to a copy of `built` shared by every test
+/// process of this temp base, made once per build, for a temp root on another
+/// filesystem than the build directory.
+///
+/// **Why.** nextest runs one process per test, and [`contained_deck`] runs in
+/// each of them. With the build directory and the temp base on different
+/// filesystems, the hard link fails with `EXDEV`, and a copy per process wrote
+/// the whole binary (192 MB in a debug `e2e` build) once per test. That is the
+/// normal layout under `scripts/rwx-export-root.sh`, whose temp base sits on
+/// RWX's task-data XFS while `target/` stays on the task's overlay. Measured in
+/// the RWX sandbox on 2026-11-19, the first wave of 16 test processes of
+/// `tests/e2e_probe_delivery.rs` took dirty memory from 0.8 GB to 5.1 GB in
+/// half a second. That started writeback at once, pressure-stall `io full`
+/// held at about 100 %, and the fixture daemons sat in `fsync`
+/// (`xfs_log_force` → `xlog_wait_on_iclog`) behind it. Their `start-agent`
+/// answers then missed the 10-second wait, and 7 to 11 of the file's 36 tests
+/// failed per run. One copy per build removes that write load, and with it the
+/// stall. The waits are not what was wrong, so none was raised.
+///
+/// The copy is named by a hash of the build's path, then the build's device,
+/// inode, size, modification and change times, so a rebuild gets a fresh copy
+/// rather than reusing a stale one. Making it, and linking from it, happen
+/// under an exclusive `flock` on a file beside it, so the processes that start
+/// together wait for one copy rather than each making their own. Making a copy
+/// removes the copy of an earlier build from the same path, and only that, so
+/// two checkouts testing against one base keep one copy each instead of
+/// evicting each other's. Processes that linked a removed copy keep their own
+/// links, so removing it does not break a run in progress. The
+/// directory must be ours and `0o700`, as the per-process roots are.
+///
+/// `Err` on any step; the caller then copies as before, so this only ever
+/// saves work and never decides what runs.
+#[cfg(unix)]
+fn link_shared_copy(built: &Path, binary: &Path) -> std::io::Result<()> {
+    let base = harness_temp_root().parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "the harness temp root has no parent",
+        )
+    })?;
+    link_through_shared_copy(&base.join(SHARED_DECK_DIR), built, binary)
+}
+
+/// [`link_shared_copy`] with the shared directory given, so the harness's unit
+/// tests can run it in a directory of their own.
+#[cfg(unix)]
+pub(crate) fn link_through_shared_copy(
+    dir: &Path,
+    built: &Path,
+    binary: &Path,
+) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Err(e) if e.kind() != ErrorKind::AlreadyExists => return Err(e),
+        _ => {}
+    }
+    let meta = std::fs::symlink_metadata(dir)?;
+    if !meta.file_type().is_dir() {
+        return Err(Error::other(format!(
+            "{} is not a directory",
+            dir.display()
+        )));
+    }
+    if let Some(why) = private_dir_objection(
+        meta.uid(),
+        meta.permissions().mode() & 0o7777,
+        effective_uid(),
+    ) {
+        return Err(Error::other(format!("{} is {why}", dir.display())));
+    }
+
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(dir.join("lock"))?;
+    // SAFETY: `flock(2)` on a descriptor this function owns; the lock goes
+    // when `lock` is dropped, or with the process.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(Error::last_os_error());
+    }
+
+    let source = std::fs::metadata(built)?;
+    // One slot per build path, so two checkouts or profiles testing against
+    // one base keep a copy each instead of evicting each other's. FNV-1a,
+    // which unlike `DefaultHasher` names a path the same in every toolchain.
+    let slot = {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::fs::canonicalize(built).unwrap_or_else(|_| built.to_path_buf());
+        path.as_os_str()
+            .as_bytes()
+            .iter()
+            .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+            })
+    };
+    let name = format!(
+        "dot-agent-deck-{slot:016x}-{:x}-{:x}-{:x}-{}.{:09}-{}.{:09}",
+        source.dev(),
+        source.ino(),
+        source.size(),
+        source.mtime(),
+        source.mtime_nsec(),
+        source.ctime(),
+        source.ctime_nsec(),
+    );
+    let shared = dir.join(&name);
+    let usable = std::fs::symlink_metadata(&shared).is_ok_and(|m| {
+        m.file_type().is_file() && m.uid() == effective_uid() && m.size() == source.size()
+    });
+    if !usable {
+        // This slot's earlier build, and a copy a process of it died making.
+        let ours = [
+            format!("dot-agent-deck-{slot:016x}-"),
+            format!(".partial-{slot:016x}-"),
+        ];
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let entry_name = entry.file_name();
+            let entry_name = entry_name.to_string_lossy();
+            if ours.iter().any(|prefix| entry_name.starts_with(prefix)) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+        let partial = dir.join(format!(".partial-{slot:016x}-{}", std::process::id()));
+        std::fs::copy(built, &partial)?;
+        std::fs::rename(&partial, &shared)?;
+    }
+    std::fs::hard_link(&shared, binary)?;
+    drop(lock);
+    if std::fs::metadata(binary)?.size() != source.size() {
+        let _ = std::fs::remove_file(binary);
+        return Err(Error::other("the shared copy is not the build's size"));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn link_shared_copy(_built: &Path, _binary: &Path) -> std::io::Result<()> {
+    Err(std::io::ErrorKind::Unsupported.into())
 }
 
 /// The directory [`contain_path`] puts on `PATH`: it holds only a
@@ -5596,7 +5751,8 @@ fn contained_deck() -> &'static ContainedDeck {
         let name = format!("dot-agent-deck{}", std::env::consts::EXE_SUFFIX);
         let binary = dir.join(&name);
         let built = Path::new(deck_binary_path());
-        if std::fs::hard_link(built, &binary).is_err() {
+        if std::fs::hard_link(built, &binary).is_err() && link_shared_copy(built, &binary).is_err()
+        {
             std::fs::copy(built, &binary).unwrap_or_else(|e| {
                 panic!(
                     "link or copy the binary under test {} to {}: {e}",
@@ -12749,7 +12905,7 @@ impl DaemonProc {
     /// live (the initial `KIND_RESP` was read), so no subsequent broadcast is
     /// missed. All polling lives here in the harness (Decision 21).
     pub fn subscribe_events(&self) -> EventSub {
-        EventSub::open(&self.attach_socket).expect("open SubscribeEvents stream")
+        EventSub::open(&self.attach_socket, false).expect("open SubscribeEvents stream")
     }
 }
 
@@ -12773,14 +12929,20 @@ impl EventSub {
     /// `daemon serve`, whose [`DaemonProc::subscribe_events`] is this. Returns
     /// once the subscription is provably live, like that one.
     pub fn subscribe(attach_socket: &Path) -> Self {
-        Self::open(attach_socket).expect("open SubscribeEvents stream")
+        Self::open(attach_socket, false).expect("open SubscribeEvents stream")
+    }
+
+    /// [`Self::subscribe`], opted into the agent-card doorbells (PRD #2374),
+    /// which a plain subscription is never sent.
+    pub fn subscribe_with_agent_cards(attach_socket: &Path) -> Self {
+        Self::open(attach_socket, true).expect("open SubscribeEvents stream")
     }
 
     /// Send a `SubscribeEvents` request, read the `KIND_RESP` ack synchronously
     /// (so the daemon's per-connection broadcast receiver exists before we
     /// return — nothing broadcast afterward can be missed), then spawn a reader
     /// thread collecting `BroadcastMsg::Event` frames.
-    fn open(attach_socket: &Path) -> std::io::Result<Self> {
+    fn open(attach_socket: &Path, agent_cards: bool) -> std::io::Result<Self> {
         use dot_agent_deck::daemon_protocol::{KIND_EVENT, KIND_REQ, KIND_RESP};
         use dot_agent_deck::event::BroadcastMsg;
 
@@ -12788,9 +12950,10 @@ impl EventSub {
         stream.set_read_timeout(Some(Duration::from_millis(200)))?;
         stream.set_write_timeout(Some(Duration::from_secs(5)))?;
 
-        let payload =
-            serde_json::to_vec(&dot_agent_deck::daemon_protocol::AttachRequest::SubscribeEvents)
-                .expect("serialize SubscribeEvents");
+        let payload = serde_json::to_vec(
+            &dot_agent_deck::daemon_protocol::AttachRequest::SubscribeEvents { agent_cards },
+        )
+        .expect("serialize SubscribeEvents");
         let mut header = [0u8; 5];
         header[0] = KIND_REQ;
         header[1..5].copy_from_slice(&(payload.len() as u32).to_be_bytes());
@@ -13085,7 +13248,7 @@ fn count_occurrences(hay: &[u8], needle: &[u8]) -> usize {
 #[cfg(unix)]
 #[allow(dead_code)]
 pub fn subscribe_events_on(socket: &Path) -> EventSub {
-    EventSub::open(socket).expect("open SubscribeEvents stream")
+    EventSub::open(socket, false).expect("open SubscribeEvents stream")
 }
 
 /// Send one `AttachRequest` over a daemon attach socket and read back the

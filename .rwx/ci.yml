@@ -230,6 +230,14 @@ tasks:
     if: ${{ tasks.backend.values.rust == 'true' }}
     use: [system-packages, code, rust, nextest, go-task, node]
     tool-cache: ci-test-v2
+    # RWX's default task timeout is 10 minutes, and this task sits at it: 100
+    # runs on 2026-11-15..17 (every branch, `main` included) took 500-605s, so
+    # runner variance alone decides whether a run passes. Run 01a1ea8fe0d07a19
+    # was killed at 604s with 9973 of 10094 tests passed and none failed: its
+    # compile took 3m29s where the same branch's previous run took 2m16s. 30m
+    # leaves room for that variance and for a run whose tool cache missed
+    # (docs/develop/rwx.md), while still bounding a wedged run.
+    timeout: 30m
     env:
       DAD_REQUIRE_GO_TASK: "1"
       # Issue #326: see the `backend` task.
@@ -239,6 +247,12 @@ tasks:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       CARGO_INCREMENTAL: "0"
     run: |
+      # Issue #2101: the JUnit file as an artifact as well, whatever the exit
+      # status. RWX parses a `test-results` output into its UI and a task's
+      # `TestCount`, but the CLI (v3.36.1) returns only those counts and the
+      # failed tests, so `scripts/rwx-junit.sh` reads per-test results from
+      # this artifact (docs/develop/rwx.md, "Per-test results").
+      trap '[ -e target/nextest/default/junit.xml ] && cp target/nextest/default/junit.xml "$RWX_ARTIFACTS/junit.xml"; true' EXIT
       # pi-extension/'s typecheck (issue #1708), as in ci.yml's `test` job.
       (cd pi-extension && npm ci --ignore-scripts && npm run typecheck)
       cargo test-fast
@@ -324,6 +338,8 @@ tasks:
       # rule accepts (docs/develop/rwx.md, "The export chain"). GitHub's
       # runners need no such step (their root is ext4), so ci.yml runs the
       # tier without it.
+      # Issue #2101: the JUnit file as an artifact, as in the `test` task.
+      trap '[ -e target/nextest/default/junit.xml ] && cp target/nextest/default/junit.xml "$RWX_ARTIFACTS/junit.xml"; true' EXIT
       scripts/rwx-export-root.sh scripts/e2e-shard.sh "$SHARD" \
         cargo nextest run --archive-file e2e.tar.zst --workspace-remap . \
         --extract-to . --extract-overwrite --retries 1
@@ -372,6 +388,8 @@ tasks:
     use: [code, pnpm]
     run: |
       cd desktop
+      # Issue #2101: the JUnit file as an artifact, as in the `test` task.
+      trap '[ -e junit/vitest.xml ] && cp junit/vitest.xml "$RWX_ARTIFACTS/junit.xml"; true' EXIT
       pnpm install --frozen-lockfile
       pnpm test
       pnpm build
@@ -419,8 +437,9 @@ tasks:
     run: |
       cd desktop
       # The reports GHA's job uploads on failure; RWX keeps what lands in
-      # $RWX_ARTIFACTS, whatever the exit status.
-      trap 'for d in playwright-report test-results; do [ -e "$d" ] && cp -r "$d" "$RWX_ARTIFACTS/"; done; true' EXIT
+      # $RWX_ARTIFACTS, whatever the exit status. Issue #2101: the JUnit file
+      # too, as `junit.xml`, as in the `test` task.
+      trap 'for d in playwright-report test-results; do [ -e "$d" ] && cp -r "$d" "$RWX_ARTIFACTS/"; done; [ -e junit/playwright.xml ] && cp junit/playwright.xml "$RWX_ARTIFACTS/junit.xml"; true' EXIT
       pnpm install --frozen-lockfile
       # The browsers and their packages come from `playwright-browsers`, so this
       # downloads nothing; with no `--with-deps` it cannot fall back to the
@@ -447,6 +466,12 @@ tasks:
       DAD_VERSION: ${{ tasks.backend.values.dad_version }}
     run: |
       sudo apt-get update
+      # The .debs first, with a time limit per attempt and a move to
+      # archive.ubuntu.com after a stalled one: this image names one regional
+      # mirror, and on 2026-11-19 it served 58.8 kB/s and then 503s until the
+      # install failed (PR #2386's run 01a1f3a3d831). The arguments match the
+      # install's, so it finds every .deb already downloaded.
+      .github/scripts/apt-prefetch.sh webkit2gtk-driver xvfb xclip xdotool openssh-server libnss-wrapper
       # openssh-server and libnss-wrapper: fleet_001's far deck (issue #1356).
       # UCF_FORCE_CONFFMISS: a restored ci-desktop-driver-v1 tool cache can
       # carry ucf's record of /etc/ssh/sshd_config without the file itself,
@@ -459,7 +484,8 @@ tasks:
       export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
       cargo build --locked --bin dot-agent-deck
       cd desktop
-      trap '[ -e driver-results ] && cp -r driver-results "$RWX_ARTIFACTS/"; true' EXIT
+      # Issue #2101: the JUnit file as `junit.xml`, as in the `test` task.
+      trap '[ -e driver-results ] && cp -r driver-results "$RWX_ARTIFACTS/"; [ -e junit/driver.xml ] && cp junit/driver.xml "$RWX_ARTIFACTS/junit.xml"; true' EXIT
       pnpm install --frozen-lockfile
       pnpm test:driver:types
       VITE_DAD_DRIVER_SEAM=1 pnpm tauri build --debug --no-bundle
@@ -578,6 +604,10 @@ tasks:
     run: |
       set -euo pipefail
       sudo apt-get update
+      # The same regional mirror `desktop-driver`'s prefetch moves off:
+      # on 2026-11-19 its indexes answered 503 and this install found no
+      # `file` package (PR #2386's run 01a1f3b7c59d).
+      .github/scripts/apt-prefetch.sh file
       sudo apt-get install -y file
       cargo install cross --locked --version 0.2.5
       export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"

@@ -115,8 +115,13 @@ impl Installed {
     /// runs [`command`] in the fixture's working directory, with its own
     /// fresh `CODEX_HOME` holding the deck's hooks trusted and the directory
     /// trusted. Waits for the deck to latch the installed release from the
-    /// pane's own header and for Codex's composer.
+    /// pane's own header and for Codex's composer. The pane is 40 × 140.
     pub fn new(extra: &[(&str, &str)]) -> Self {
+        Self::sized(extra, (40, 140))
+    }
+
+    /// [`Self::new`] with the pane `size` (rows, columns) from its spawn.
+    pub fn sized(extra: &[(&str, &str)], size: (u16, u16)) -> Self {
         let release = installed_release().expect("the installed release");
         let mut builder = common::TuiDeck::builder();
         for (key, value) in extra {
@@ -142,7 +147,7 @@ impl Installed {
             deck.snapshot_grid()
         );
         crate::live::prepare(&deck);
-        let reply = start_pane(&deck);
+        let reply = start_pane(&deck, size);
         let agent = reply["id"].as_str().unwrap().to_string();
         let found = std::cell::RefCell::new(None);
         assert!(
@@ -377,12 +382,12 @@ impl Installed {
 }
 
 /// Start [`command`] in `deck`'s one Codex pane: the agent declared, its own
-/// `CODEX_HOME` the sandbox's, in [`project_dir`].
-fn start_pane(deck: &common::TuiDeck) -> Value {
+/// `CODEX_HOME` the sandbox's, in [`project_dir`], at `size` (rows, columns).
+fn start_pane(deck: &common::TuiDeck, (rows, cols): (u16, u16)) -> Value {
     let reply = attach(
         deck,
         json!({"op":"start-agent", "command":command(),
-        "agent_type":"codex", "cwd":project_dir(deck), "rows":40,"cols":140,
+        "agent_type":"codex", "cwd":project_dir(deck), "rows":rows,"cols":cols,
         "display_name":PANE, "env":[
             ["CODEX_HOME",deck.home_dir().join(".codex")],
             ["DOT_AGENT_DECK_PANE_ID",PANE]]}),

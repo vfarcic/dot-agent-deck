@@ -194,6 +194,12 @@ fn cell(value: &Option<String>) -> &str {
 /// nothing is pending.
 fn inbox_cell(inbox: Option<&InboxSummary>) -> String {
     match inbox {
+        // Issue #2389: a stalled wake says so, as the clients' cards do, so a
+        // supervising agent reading the table sees a receiver not taking its
+        // mail; `--json` carries `wake_stalled` and `wake_hold` themselves.
+        Some(i) if (i.queued > 0 || i.fetched > 0) && i.wake_stalled => {
+            format!("{}q {}f stalled", i.queued, i.fetched)
+        }
         Some(i) if i.queued > 0 || i.fetched > 0 => format!("{}q {}f", i.queued, i.fetched),
         _ => DASH.to_string(),
     }
@@ -247,6 +253,7 @@ mod tests {
         AgentRecord {
             input_held: None,
             input_discarded: None,
+            project_config_exists: None,
             id: id.to_string(),
             pane_id_env: Some(pane.to_string()),
             display_name: None,
@@ -504,7 +511,8 @@ mod tests {
     }
 
     /// PRD #1666 S3: INBOX shows queued and fetched counts, a dash when both
-    /// are zero or the daemon reported no inbox; WAKE a dash for no inbox.
+    /// are zero or the daemon reported no inbox, and `stalled` after them
+    /// when the wake stalled (issue #2389); WAKE a dash for no inbox.
     #[test]
     fn inbox_and_wake_cells() {
         use crate::inbox_hub::{InboxSummary, WakePath};
@@ -525,6 +533,12 @@ mod tests {
         assert_eq!(inbox_cell(Some(&summary(0, 2, WakePath::Native))), "0q 2f");
         assert_eq!(inbox_cell(Some(&summary(0, 0, WakePath::Native))), "-");
         assert_eq!(inbox_cell(None), "-");
+        // Issue #2389: a stalled wake is named beside the counts.
+        let stalled = InboxSummary {
+            wake_stalled: true,
+            ..summary(1, 0, WakePath::Doorbell)
+        };
+        assert_eq!(inbox_cell(Some(&stalled)), "1q 0f stalled");
         let table = format_human(&build_status_agents(vec![record("1", "p", None)]));
         let row: Vec<&str> = table.lines().nth(1).unwrap().split('\t').collect();
         assert_eq!((row[5], row[6]), ("-", "-"));

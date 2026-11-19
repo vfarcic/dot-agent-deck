@@ -44,6 +44,9 @@ pub const WAKE_HOLD_CANNOT_TYPE: &str = "waiting for the agent to fetch it. Send
 /// The card's words for [`WakeHold::NotTaken`].
 pub const WAKE_HOLD_NOT_TAKEN: &str =
     "waiting: the agent did not take the deck's Enter. Send it a prompt.";
+/// Issue #2389: the card's words for [`WakeHold::NoActivity`], a sibling of
+/// [`WAKE_STALLED`] for an agent that reads busy.
+pub const WAKE_HOLD_NO_ACTIVITY: &str = "not taken: the agent shows as busy but has sent nothing for a while. Ask it to run dot-agent-deck inbox fetch.";
 /// The card's words for [`WakeHold::UncertainInput`] while messages wait.
 pub const WAKE_HOLD_UNCERTAIN_INPUT: &str =
     "waiting: the deck's notice may be in its input. Check it before Enter.";
@@ -193,31 +196,30 @@ pub fn input_rejection_keeps_typing(reason: &str) -> bool {
     matches!(reason.trim(), "ctrl-g-refused" | "signal-key-refused")
 }
 
-/// PRD #1666 part 3, round 5-wake (Q6): the deck-wide attention item names a
-/// held orchestrator and counts the other held recipients after it
-/// (`· 1 other held`); with no orchestrator held it only counts (`✉ 2 held`).
-pub const ATTENTION_OTHER_HELD: &str = "other held";
-/// [`ATTENTION_OTHER_HELD`]'s count when no orchestrator is named.
+/// Issue #2387: the marker a held agent's card carries beside its status, and
+/// the word the deck-wide attention item names held agents with
+/// (`✉ held: Captain, coder`) or counts them with (`✉ 4 held`).
 pub const ATTENTION_HELD: &str = "held";
 
+/// Issue #2387: the most held agents [`deck_attention_text`] names; with more
+/// it counts them. The desktop's `DECK_ATTENTION_MAX_NAMES` is the same.
+pub const DECK_ATTENTION_MAX_NAMES: usize = 3;
+
 /// The deck-wide attention item both clients show in their header, the same
-/// words in each: `✉ <orchestrator>: <its hold words> · 1 other held`, or
-/// `✉ 2 held` when no orchestrator is held; `None` when nothing is held.
-/// `named` is the held orchestrator's name and [`CardInbox::attention_words`];
-/// `others` counts every other held recipient, other orchestrators included.
-pub fn deck_attention_text(named: Option<(&str, &str)>, others: usize) -> Option<String> {
-    match named {
-        Some((name, words)) if others > 0 => Some(format!(
-            "{GLYPH} {name}: {words} · {others} {ATTENTION_OTHER_HELD}"
-        )),
-        Some((name, words)) => Some(format!("{GLYPH} {name}: {words}")),
-        None => deck_attention_count(others),
+/// words in each: `✉ held: <name>, <name>` naming the held agents in the
+/// order given (start roles first, then by name), `✉ 4 held` past
+/// [`DECK_ATTENTION_MAX_NAMES`], or `None` when nothing is held. The names
+/// are exactly the cards carrying the [`ATTENTION_HELD`] marker.
+pub fn deck_attention_text(names: &[&str]) -> Option<String> {
+    if names.len() > DECK_ATTENTION_MAX_NAMES {
+        return deck_attention_count(names.len());
     }
+    (!names.is_empty()).then(|| format!("{GLYPH} {ATTENTION_HELD}: {}", names.join(", ")))
 }
 
-/// [`deck_attention_text`] counting every one of the `held` recipients and
-/// naming none (`✉ 2 held`): its words when no orchestrator is held, and what
-/// the TUI shows in their place on a row too narrow for them.
+/// [`deck_attention_text`] counting the `held` agents and naming none
+/// (`✉ 2 held`): its words past [`DECK_ATTENTION_MAX_NAMES`], and what the
+/// TUI shows in their place on a row too narrow for the names.
 pub fn deck_attention_count(held: usize) -> Option<String> {
     (held > 0).then(|| format!("{GLYPH} {held} {ATTENTION_HELD}"))
 }
@@ -566,6 +568,12 @@ pub enum WakeHold {
     /// for the cause [`HoldDetail`] names beside it. Tolerant and unset, as
     /// [`WakeHold::NeedsFetch`] is.
     CannotCheck,
+    /// Issue #2389: the agent's status reads busy, and its oldest message has
+    /// waited past the busy bound
+    /// ([`crate::doorbell::DEFAULT_BUSY_STALL_AFTER`]) with the agent sending
+    /// the deck nothing, so the busy reading may be stale. Tolerant: an older
+    /// client reads it as [`WakeHold::Unknown`] and shows the stall's words.
+    NoActivity,
     /// A reason a newer deck names that this build does not know. A client
     /// shows it with [`WAKE_STALLED`]'s words; this build never sends it.
     #[serde(other)]
@@ -586,6 +594,7 @@ impl WakeHold {
             WakeHold::DialogDuringRing => Some(WAKE_HOLD_DIALOG_DURING_RING),
             WakeHold::NeedsFetch => Some(WAKE_HOLD_NEEDS_FETCH),
             WakeHold::CannotCheck => Some(WAKE_HOLD_CANNOT_CHECK),
+            WakeHold::NoActivity => Some(WAKE_HOLD_NO_ACTIVITY),
             WakeHold::Unknown => None,
         }
     }
@@ -627,6 +636,9 @@ impl WakeHold {
             WakeHold::CannotCheck => Some(
                 "the deck can't check the worker's input box, so it doesn't type its notice there; the user can check its pane",
             ),
+            WakeHold::NoActivity => Some(
+                "the worker shows as busy but has sent the deck nothing for a while, so its turn may have ended unseen; it takes its messages when it runs dot-agent-deck inbox fetch",
+            ),
             WakeHold::Unknown => None,
         }
     }
@@ -643,6 +655,7 @@ impl WakeHold {
             WakeHold::Unknown => 9,
             WakeHold::NeedsFetch => 10,
             WakeHold::CannotCheck => 11,
+            WakeHold::NoActivity => 12,
         }
     }
 
@@ -659,6 +672,7 @@ impl WakeHold {
             9 => Some(Some(WakeHold::Unknown)),
             10 => Some(Some(WakeHold::NeedsFetch)),
             11 => Some(Some(WakeHold::CannotCheck)),
+            12 => Some(Some(WakeHold::NoActivity)),
             _ => None,
         }
     }
@@ -1277,23 +1291,25 @@ impl CardInbox {
 mod tests {
     use super::*;
 
-    /// PRD #1666 part 3, round 5-wake (Q6): the deck-wide attention item, in
-    /// the forms `deckAttentionText` (`desktop/src/lib/inboxWords.ts`) builds
-    /// from the same words; its tests pin the same strings.
+    /// Issue #2387: the deck-wide attention item, in the forms
+    /// `deckAttentionNamesText` (`desktop/src/lib/inboxWords.ts`) builds from
+    /// the same words; its tests pin the same strings.
     #[test]
-    fn the_deck_attention_names_one_orchestrator_and_counts_the_rest() {
+    fn the_deck_attention_names_the_held_agents_and_counts_past_three() {
         assert_eq!(
-            deck_attention_text(Some(("Captain", WAKE_HOLD_POSSIBLE_DRAFT)), 1).as_deref(),
-            Some(
-                "✉ Captain: waiting: there may be an unsent draft. Send it or clear it. · 1 other held"
-            )
+            deck_attention_text(&["Captain", "archivist", "Coder"]).as_deref(),
+            Some("✉ held: Captain, archivist, Coder")
         );
         assert_eq!(
-            deck_attention_text(Some(("Captain", WAKE_HOLD_PASTE_OPEN)), 0).as_deref(),
-            Some("✉ Captain: waiting: a paste into its input has not finished.")
+            deck_attention_text(&["Captain"]).as_deref(),
+            Some("✉ held: Captain")
         );
-        assert_eq!(deck_attention_text(None, 2).as_deref(), Some("✉ 2 held"));
-        assert_eq!(deck_attention_text(None, 0), None);
+        assert_eq!(
+            deck_attention_text(&["A", "B", "C", "D"]).as_deref(),
+            Some("✉ 4 held")
+        );
+        assert_eq!(deck_attention_text(&[]), None);
+        assert_eq!(deck_attention_count(2).as_deref(), Some("✉ 2 held"));
     }
 
     /// PRD #1666 part 3 (Q35): a cannot-check detail in words, the exact
@@ -1486,6 +1502,13 @@ mod tests {
                 .as_deref(),
             Some("waiting to wake: send it a prompt")
         );
+        // Issue #2389: a busy agent that sent nothing for the bound is held.
+        assert_eq!(
+            card(1, Some(WakeHold::NoActivity))
+                .attention_words()
+                .as_deref(),
+            Some(WAKE_HOLD_NO_ACTIVITY)
+        );
         assert_eq!(
             card(0, Some(WakeHold::DialogDuringRing))
                 .attention_words()
@@ -1633,6 +1656,7 @@ mod tests {
             ("dialog_during_ring", WakeHold::DialogDuringRing),
             ("needs_fetch", WakeHold::NeedsFetch),
             ("cannot_check", WakeHold::CannotCheck),
+            ("no_activity", WakeHold::NoActivity),
         ] {
             assert_eq!(
                 serde_json::to_value(hold).unwrap(),
@@ -1646,7 +1670,7 @@ mod tests {
         }
         assert_eq!(
             words["wakeHolds"].as_object().map(|holds| holds.len()),
-            Some(9),
+            Some(10),
             "the fixture lists every hold the deck names"
         );
         // PRD #1666 part 3 (Q35): held typing, and why a check can't run.
@@ -1779,7 +1803,6 @@ mod tests {
         assert_eq!(words["cancelApplied"], CANCEL_APPLIED);
         assert_eq!(words["actionUnsupported"], ACTION_UNSUPPORTED);
         assert_eq!(words["attentionTitle"], ATTENTION_TITLE);
-        assert_eq!(words["attentionOtherHeld"], ATTENTION_OTHER_HELD);
         assert_eq!(words["attentionHeld"], ATTENTION_HELD);
         assert_eq!(words["adapterTooOld"], ADAPTER_TOO_OLD);
         assert_eq!(words["cliTooOld"], CLI_TOO_OLD);

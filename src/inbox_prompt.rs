@@ -649,15 +649,18 @@ pub struct Witness {
     /// The prompt's shared receipts budget, for a commit made at once when
     /// no witness can be started.
     pub receipts_by: std::time::Instant,
+    /// Issue #2347: the prompt whose turn the witness settles.
+    pub turn: Option<crate::inbox_witness::PromptTurn>,
 }
 
 #[cfg(unix)]
 impl Witness {
-    /// Start a witness for the prompt's own attempts, with no doorbell batch
-    /// of the hook's. If none could be started they are committed now, as a
-    /// hook with no transcript commits them. Nothing to do without any.
+    /// Start a witness for the prompt's own attempts and its turn, with no
+    /// doorbell batch of the hook's. If none could be started the attempts
+    /// are committed now, as a hook with no transcript commits them. Nothing
+    /// to do without either.
     pub fn start_alone(self) {
-        if self.native.is_empty() {
+        if self.native.is_empty() && self.turn.is_none() {
             return;
         }
         let plan = crate::inbox_witness::Plan {
@@ -667,6 +670,7 @@ impl Witness {
             cut: false,
             degraded: None,
             native: self.native.clone(),
+            turn: self.turn,
         };
         if crate::inbox_witness::spawn(&plan, None).is_err() {
             commit_exact(
@@ -735,6 +739,7 @@ impl OneShotInjection {
                 cut,
                 degraded: pending.degraded.clone(),
                 native: witness.native.clone(),
+                turn: witness.turn.clone(),
             };
             if crate::inbox_witness::spawn(&plan, Some(stream)).is_ok() {
                 return pending.ran();

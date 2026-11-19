@@ -300,6 +300,17 @@ slow-timeout = { period = "60s", terminate-after = 40 }
 filter = 'test(codex_hooks_001_real_interactive_turn_reaches_idle_without_exit)'
 slow-timeout = { period = "60s", terminate-after = 8 }
 
+# Issue #2119: `dashboard/config-gen/003` and `/004` each drive a real interactive Haiku through
+# boot, a project-analysis turn and a write turn. Its sequential wait bounds sum
+# to 750s (the arithmetic is in the test, above `BOOT_WAIT`), under the 840s deck
+# lifetime it sets, which is under this 15 x 60s = 900s window, so a slow phase
+# fails with its own message instead of being killed here first. A passing run
+# takes about 70-90s. Scoped by name; still bounded. The filter tracks the test
+# function name: update it with any rename.
+[[profile.default.overrides]]
+filter = 'test(config_gen_003_a_real_agent_generates_a_valid_config_after_approval) | test(config_gen_004_a_real_agent_updates_a_config_preserving_user_content)'
+slow-timeout = { period = "60s", terminate-after = 15 }
+
 # Issue #1381: the two real-OpenCode `clear = true` delegates in
 # `tests/e2e_delegate_respawn_readiness.rs` wait in phases whose own bounds sum
 # well past the default 3 x 60s kill window. Being killed there costs each
@@ -328,6 +339,18 @@ slow-timeout = { period = "60s", terminate-after = 7 }
 [[profile.default.overrides]]
 filter = 'binary(e2e_inbox_opencode_live)'
 slow-timeout = { period = "60s", terminate-after = 6 }
+
+# PRD #2374: `agent-report/live/001` bounds each phase on its own: the deck's
+# boot and typing-mode screens (90s), Haiku's SessionStart (90s), its pane
+# settling (60s), the publish prompt's submission (up to 120s under load), three
+# agent turns (the published card, the suggested file, the sentinel; 120s
+# each), the delivery and done card (90s) and the TUI showing the sentinel
+# (30s): 840s at worst. It pins its deck's lifetime to 900s (linkage-check rule
+# 11's ceiling), so the test is killed only past that, at 16 x 60s = 960s; the
+# default 3 x 60s killed it mid-run.
+[[profile.default.overrides]]
+filter = 'binary(e2e_agent_cards_live)'
+slow-timeout = { period = "60s", terminate-after = 16 }
 
 # PRD #1666 part 3: `tests/e2e_inbox_load.rs` gives each real agent an absolute
 # window (240s native, 300s Codex) under CPU pressure and asks for a timeout

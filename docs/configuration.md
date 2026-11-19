@@ -98,7 +98,7 @@ A change applies to agents started after it, in the TUI and the desktop app alik
 | --- | --- | --- | --- |
 | `default_command` | string | `""` | [Command new agents start with](#set-the-command-new-agents-start-with) |
 | `default_dir` | absolute path, or `""` | `""` (unset) | [Directory agent creation starts browsing in](#set-the-directory-new-agents-start-browsing-in) |
-| `auto_config_prompt` | boolean | `true` | Accepted and stored, but it currently changes nothing; see [Generate a config with your agent](#generate-a-config-with-your-agent-tui) |
+| `auto_config_prompt` | boolean | `true` | No effect. It is still accepted, so an existing `config.toml` that sets it keeps working |
 | `bell.enabled` | boolean | `true` | [TUI bell](#turn-the-tuis-terminal-bell-on-or-off) master switch |
 | `bell.on_waiting_for_input` | boolean | `true` | Bell on waiting for input |
 | `bell.on_idle` | boolean | `false` | Bell on idle |
@@ -113,7 +113,6 @@ The file is TOML, and you can edit it by hand:
 ```toml
 default_command = "claude"
 default_dir = "/home/me/projects"
-auto_config_prompt = true
 
 [bell]
 enabled = true
@@ -130,7 +129,7 @@ antigravity = true
 question_after_minutes = 10
 ```
 
-`config set` rewrites the whole file from the keys above, so comments and any other keys are removed. If the file does not parse, the TUI and `config` print `Invalid config at <path>: <error>` and use the defaults, and a `config set` then replaces the unparseable file with the defaults plus the key you set. Fix a parse error by hand before running `config set`. While the file can't be used, the daemon also holds the doorbell off for both Claude Code and Codex for the agents it starts, rather than turning it on by default ([`turned_off`](troubleshooting.md#a-card-says-waiting-for-the-agent-to-fetch-it-send-it-a-prompt)). That includes a `config.toml` that is a link to a file that is no longer there, for example one that was moved or is on a drive that isn't mounted. For such a link, `config get` prints the default value, and `config set` keeps the link and writes a new file at its target with the defaults plus the key you set, or fails if the target's folder is gone too. Put the file back, or point the link at it, before running `config set`. The same goes for a config folder that is a link to a folder that is no longer there, such as `~/.config/dot-agent-deck`, or `~/.config` itself, linked into a dotfiles folder that was moved or is on a drive that isn't mounted: the doorbell stays off, `config get` prints the default value, and `config set` fails without writing anything. Put the folder back, or point the link at it. A config folder that doesn't exist yet, as on a first run, is not a problem: the deck uses the defaults and the doorbell is on.
+`config set` rewrites the keys above and leaves the rest of the file as it is: other tables, such as the [agent cards' `[catalog]`](desktop/agent-cards.md#choose-the-fields-and-actions-agents-use), and comments outside the rewritten keys stay. A comment inside one of their tables, such as `[bell]`, can be lost, and so can a comment on a key that `config set` removes because it is back at its default. If the file does not parse, the TUI and `config` print `Invalid config at <path>: <error>` and use the defaults, and `config set` refuses to save over it (`Not saving config at <path>: it is not valid TOML …`, exit code 1). Fix the parse error by hand, then run `config set` again. A file that parses but gives one of the keys above a value of the wrong type is read as the defaults too, and `config set` then writes the defaults plus the key you set for the keys above, keeping the rest of the file. While the file can't be used, the daemon also holds the doorbell off for both Claude Code and Codex for the agents it starts, rather than turning it on by default ([`turned_off`](troubleshooting.md#a-card-says-waiting-for-the-agent-to-fetch-it-send-it-a-prompt)). That includes a `config.toml` that is a link to a file that is no longer there, for example one that was moved or is on a drive that isn't mounted. For such a link, `config get` prints the default value, and `config set` keeps the link and writes a new file at its target with the defaults plus the key you set, or fails if the target's folder is gone too. Put the file back, or point the link at it, before running `config set`. The same goes for a config folder that is a link to a folder that is no longer there, such as `~/.config/dot-agent-deck`, or `~/.config` itself, linked into a dotfiles folder that was moved or is on a drive that isn't mounted: the doorbell stays off, `config get` prints the default value, and `config set` fails without writing anything. Put the folder back, or point the link at it. A config folder that doesn't exist yet, as on a first run, is not a problem: the deck uses the defaults and the doorbell is on.
 
 ## Create a project configuration
 
@@ -163,16 +162,19 @@ Errors include: an orchestration with fewer than two roles, not exactly one role
 
 `validate` does not report a key it does not recognise, or a top-level key placed below a table header (see [Top-level keys](#top-level-keys)).
 
-### Generate a config with your agent (TUI)
+### Generate a config with your agent
 
-This is a TUI feature; the desktop app has no equivalent. It asks an agent that is already running in the project to write the file for you.
+Instead of starting from the template, you can ask an agent that is already running in the project to write the file for you, from the TUI or the desktop app.
 
-1. Start an agent in the project and select its card on the dashboard.
-2. Press `g` (or click **Generate**). A dialog titled **Generate .dot-agent-deck.toml** opens.
-3. Choose with the arrow keys and `Enter`: **Yes** sends your agent a prompt asking it to analyse the project, propose an orchestration and write it after your approval ([Quick setup](orchestration.md#quick-setup) describes what the agent does); **No** or `Esc` closes the dialog; **Never** closes it and records the directory in `config-gen-state.json`.
-4. When the agent has written the file, run `dot-agent-deck validate` in the project, then press `Ctrl+n`, pick the directory, and choose the orchestration on the **Mode** row.
+1. Start an agent in the project.
+2. Ask it to generate the config: in the TUI, select its card in command mode and press `g` (or click **Generate** in the footer); in the desktop app, press **Generate config** on the agent's row on the Dashboard or in its pane, or say "generate config with" and its name.
+3. A dialog titled **Generate .dot-agent-deck.toml** opens in both clients. Choose **Yes** to send the agent the request, or **No** (or `Esc`) to close it and send nothing.
+4. The agent's pane comes to the front and the agent proposes a config. Tell it what to change; it writes the file after you approve.
+5. Run `dot-agent-deck validate` in the project, then start an agent there and choose the orchestration under **Mode** in the New agent form of either client.
 
-The dialog opens only when you press `g` or click **Generate**. The dialog's hint `Disable: dot-agent-deck config set auto_config_prompt false` and the **Never** choice currently have no further effect, because nothing opens the dialog on its own. If `g` shows `No active agent to send prompt to.`, the selected card has no running agent pane.
+When the project already has a `.dot-agent-deck.toml`, the control reads **Update** (`[Update g]` in the TUI, **Update config** in the desktop app) and the dialog **Update .dot-agent-deck.toml**. The agent then reads the existing file and proposes changes to it, keeping what you wrote unless you agree to drop it, and edits it only after you approve. Both clients notice within a few seconds when the file appears or goes away, so after the agent writes it the control reads **Update**. A `.dot-agent-deck.toml` that is a symbolic link counts as an existing config too: the agent edits the file the link points to and keeps the link, and if the link points to a file that does not exist, the agent tells you so instead of writing anything. When the deck can't tell whether the file exists, for example because the project is on a network drive that stopped answering, the control reads **Generate** and the dialog asks whether to have the agent check for `.dot-agent-deck.toml` and create it, or propose updates to it if it already exists.
+
+[Quick setup](orchestration.md#quick-setup) has the screenshots, what the agent is asked to do, and what each message means when it does not work, including `This daemon is too old to generate a config. Upgrade the daemon to use Generate config.`
 
 ## `.dot-agent-deck.toml` reference
 
@@ -310,7 +312,7 @@ Set these in the daemon's environment (see the start of this section). Milliseco
 | `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS` | `30` | The daemon exits this many seconds after it has no attached client, no agents and no pending schedules. `0` keeps it running. A value that is not a whole number uses the default. |
 | `DOT_AGENT_DECK_HOOK_PROVENANCE` | enforce | `warn` (any case) makes the daemon accept, with a warning, a `work-done`/`delegate`/`dispatch` or a status update from an agent pane that carries no hook capability token, which happens when the `dot-agent-deck` on the agent's `PATH` is older than the daemon. Any other value keeps refusing. See [Troubleshooting](troubleshooting.md). |
 | `DOT_AGENT_DECK_WAITING_NOTICE_DEBOUNCE_MS` | `30000` | How long a delegated worker must stay waiting for input, or stopped on an error, before its orchestrator is told. `0` turns both reports off; maximum `600000`. See [Idle Workers & Notifications](idle-workers-and-notifications.md#tune-or-turn-off-the-other-reports). |
-| `DOT_AGENT_DECK_COORDINATION_RETENTION_DAYS` | `14` | Each time the deck writes an orchestration's context into the project's `.dot-agent-deck/` directory, Markdown files there last modified more than this many days ago are deleted, except `orchestrator-context.md`. Subdirectories and symlinks are left alone. `0` turns this off; a value that is not a whole number uses the default. Set it where both the TUI and the daemon are started, since either can start an orchestration. |
+| `DOT_AGENT_DECK_COORDINATION_RETENTION_DAYS` | `14` | Each time the deck writes an orchestration's context into the project's `.dot-agent-deck/` directory, Markdown files there last modified more than this many days ago are deleted, except saved copies of long messages (`inbox-message-*.md`), and an `orchestrator-context.md` left by an earlier version is deleted whatever its age, even with `0`. Subdirectories and symlinks are left alone. `0` turns this off; a value that is not a whole number uses the default. Set it where both the TUI and the daemon are started, since either can start an orchestration. |
 | `DOT_AGENT_DECK_RETAINED_REPORT_MAX_BYTES` | `268435456` (256 MiB) | How much the daemon keeps in its saved-results directory for one daemon run before it refuses new dispatches. See [Saved results and reports](troubleshooting.md#saved-results-and-reports). A value that is not a whole number uses the default. |
 | `DOT_AGENT_DECK_RETAINED_REPORT_MAX_FILES` | `4096` | How many files the daemon keeps there for one daemon run before it refuses new dispatches. Values are kept between `1` and `65536`; one outside that range is moved to the nearer end, with a warning in the log. A value that is not a whole number uses the default. |
 | `DOT_AGENT_DECK_DISPATCH_FALLBACK_SLOTS` | `16` | How many dispatch results the daemon holds in memory when it cannot write them to disk, before it refuses new dispatches. A value that is not a whole number uses the default. |
@@ -392,7 +394,7 @@ dot-agent-deck watch --interval 2 "kubectl get pods"
 | `worker_response_timeout_minutes` seems ignored | the key is below a table header, or out of range | move it to the top of the file; use `0`–`10080` ([Top-level keys](#top-level-keys)) |
 | The experimental flag stays off | the process read a different `.dot-agent-deck.toml`, or the env var is set to something other than `1`/`true` | check the `experimental flag:` log line ([Turn on experimental features](#turn-on-experimental-features)) |
 | The desktop app offers no orchestrations for a directory the TUI handles | the project file is a symlink, not a regular file, or over 1 MiB | make it a regular file under 1 MiB |
-| `config set` lost your comments or other keys | `config set` rewrites the file | keep hand edits to the keys above, or edit the file by hand instead of using `config set` |
+| `config set` lost a comment | `config set` rewrites the keys it manages, and a comment inside one of their tables goes with it | keep comments outside those tables, or edit the file by hand instead of using `config set` |
 | Settings changes in the desktop app are not saved | `desktop.toml` cannot be read | read the **Settings** footer, then fix or remove the file |
 
 For other problems, see [Troubleshooting](troubleshooting.md).

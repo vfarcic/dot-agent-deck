@@ -250,6 +250,9 @@ pub struct DashboardConfig {
     /// a `config set` of another key writes no `[notifications]` table.
     #[serde(skip_serializing_if = "NotificationsConfig::is_default")]
     pub notifications: NotificationsConfig,
+    /// PRD #2119: inert. Nothing opens the config-generation dialog on its
+    /// own, so nothing reads this; the key stays accepted so existing configs
+    /// and `config set auto_config_prompt …` keep working.
     pub auto_config_prompt: bool,
     /// PRD #1258: the `[host_metrics]` table — the thresholds this deck's
     /// daemon judges its host's disk, memory and load by
@@ -265,6 +268,84 @@ pub struct DashboardConfig {
         deserialize_with = "deserialize_host_metrics_table"
     )]
     pub host_metrics: toml::Table,
+}
+
+/// Every top-level key [`DashboardConfig`] reads and writes. A save replaces
+/// these and nothing else, so a table this struct does not own — the agent
+/// cards' `[catalog]` (PRD #2374, `src/card_catalog.rs`), or one a newer build
+/// added — survives `config set`, comments and all.
+/// `dashboard_keys_name_every_field` fails to compile when a field is added
+/// without being listed here.
+const DASHBOARD_KEYS: &[&str] = &[
+    "default_command",
+    "default_dir",
+    "bell",
+    "doorbell",
+    "notifications",
+    "auto_config_prompt",
+    "host_metrics",
+];
+
+/// The file [`DashboardConfig::save_to`] writes: `existing` (the file as it is
+/// on disk, `None` when there is none) with each of [`DASHBOARD_KEYS`] set to
+/// what `ours` (the struct's own serialization) says, or removed when `ours`
+/// leaves it out. Everything else in `existing` is kept as written. `Err` when
+/// `existing` is not valid TOML: there is nothing to merge into, and writing
+/// `ours` alone would delete whatever the file held.
+fn merge_dashboard_config(existing: Option<&str>, ours: &str) -> Result<String, String> {
+    let Some(existing) = existing else {
+        return Ok(ours.to_string());
+    };
+    let mut doc = existing
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| e.message().to_string())?;
+    let mut ours = ours
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| format!("the deck's own serialization did not parse: {e}"))?;
+    for key in DASHBOARD_KEYS {
+        let Some(mut item) = ours.remove(key) else {
+            doc.remove(key);
+            continue;
+        };
+        clear_table_positions(&mut item);
+        if let Some(slot) = doc.get_mut(key) {
+            // Replaced in place, so the key keeps its own comments and place,
+            // and a table its header's comments and its position in the file.
+            if let (Some(old), Some(new)) = (slot.as_table(), item.as_table_mut()) {
+                *new.decor_mut() = old.decor().clone();
+                new.set_position(old.position());
+            } else if let (Some(old), Some(new)) = (slot.as_value(), item.as_value_mut()) {
+                *new.decor_mut() = old.decor().clone();
+            }
+            *slot = item;
+        } else {
+            doc.insert(key, item);
+        }
+    }
+    Ok(doc.to_string())
+}
+
+/// Forget the positions `item`'s tables had in the document they were parsed
+/// from, so each is written after the table before it in the file it is
+/// moved into rather than at a position that means something else there.
+fn clear_table_positions(item: &mut toml_edit::Item) {
+    match item {
+        toml_edit::Item::Table(table) => {
+            table.set_position(None);
+            for (_, child) in table.iter_mut() {
+                clear_table_positions(child);
+            }
+        }
+        toml_edit::Item::ArrayOfTables(tables) => {
+            for table in tables.iter_mut() {
+                table.set_position(None);
+                for (_, child) in table.iter_mut() {
+                    clear_table_positions(child);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// [`DashboardConfig::host_metrics`]'s lenient read: a table is kept as it is,
@@ -471,8 +552,25 @@ impl DashboardConfig {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("Failed to create config directory: {e}"))?;
         }
-        let contents =
+        let ours =
             toml::to_string_pretty(self).map_err(|e| format!("Failed to serialize config: {e}"))?;
+        let existing = match std::fs::read_to_string(path) {
+            Ok(text) => Some(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return Err(format!(
+                    "Failed to read config at {} before saving it: {e}",
+                    path.display()
+                ));
+            }
+        };
+        let contents = merge_dashboard_config(existing.as_deref(), &ours).map_err(|e| {
+            format!(
+                "Not saving config at {}: it is not valid TOML ({e}); fix it first, \
+                 because saving would replace everything it holds",
+                path.display()
+            )
+        })?;
         write_config_atomically(path, contents.as_bytes())
             .map_err(|e| format!("Failed to write config at {}: {e}", path.display()))
     }
@@ -1032,6 +1130,12 @@ fn resolve_symlink_chain(path: &Path) -> PathBuf {
         };
     }
     current
+}
+
+/// PRD #2374: the user config file the agent-card catalog is read from — the
+/// same file [`DashboardConfig::load`] reads.
+pub(crate) fn user_config_path() -> PathBuf {
+    config_path()
 }
 
 fn config_path() -> PathBuf {
@@ -2552,6 +2656,9 @@ fn config_gen_state_path() -> PathBuf {
     config_dir().join("config-gen-state.json")
 }
 
+/// PRD #2119: the config-generation dialog no longer offers "Never", so the
+/// TUI neither reads nor writes this file; the type stays so a file recorded by
+/// an earlier build still loads (`dashboard/config-gen/002`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ConfigGenState {
@@ -3742,6 +3849,128 @@ mod tests {
             missing_config_folder_verdict(Path::new("no-such-folder/config.toml")),
             Ok(None)
         );
+    }
+
+    /// PRD #2374 (review finding): `config set` of an unrelated key keeps the
+    /// agent cards' `[catalog]` table, any other table this build does not
+    /// know, and the user's comments; a key the struct owns is rewritten, and
+    /// one it now leaves out (back at its default) is removed.
+    #[test]
+    fn a_config_save_keeps_the_catalog_and_other_tables_it_does_not_own() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "\
+# my deck
+default_command = \"claude\" # the usual
+
+# about bells
+[bell]
+on_idle = true
+
+[doorbell]
+claude = false
+
+[catalog]
+remove = [\"merge\"] # not this one
+
+[[catalog.fields]]
+name = \"risk\"
+description = \"How risky the change is.\"
+type = \"text\"
+
+[[catalog.actions]]
+name = \"ship\"
+description = \"Offer when it is ready.\"
+prompt = \"Ship it.\"
+
+[from_a_newer_build]
+answer = 42
+";
+        std::fs::write(&path, original).unwrap();
+        let mut config: DashboardConfig = toml::from_str(original).unwrap();
+        config.set_field("bell.enabled", "false").unwrap();
+        config.set_field("doorbell.claude", "true").unwrap();
+        config.save_to(&path).unwrap();
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            saved.starts_with("# my deck\ndefault_command = \"claude\" # the usual\n"),
+            "{saved}"
+        );
+        assert!(saved.contains("# about bells\n[bell]\n"), "{saved}");
+        assert!(
+            saved.contains("remove = [\"merge\"] # not this one"),
+            "{saved}"
+        );
+        let table: toml::Table = toml::from_str(&saved).unwrap();
+        let before: toml::Table = toml::from_str(original).unwrap();
+        assert_eq!(table["catalog"], before["catalog"], "{saved}");
+        assert_eq!(
+            table["from_a_newer_build"], before["from_a_newer_build"],
+            "{saved}"
+        );
+        assert_eq!(table["bell"]["enabled"].as_bool(), Some(false), "{saved}");
+        assert_eq!(table["bell"]["on_idle"].as_bool(), Some(true), "{saved}");
+        assert!(
+            !table.contains_key("doorbell"),
+            "doorbell is back at its default, so the save drops it: {saved}"
+        );
+        let reread: DashboardConfig = toml::from_str(&saved).unwrap();
+        assert!(!reread.bell.enabled && reread.doorbell.claude);
+        assert_eq!(reread.default_command, "claude");
+
+        // The catalog the daemon reads from that file is the user's, not the
+        // defaults.
+        let catalog = crate::card_catalog::resolve(Some(&saved));
+        assert!(catalog.errors.is_empty(), "{:?}", catalog.errors);
+        assert!(catalog.fields.iter().any(|f| f.name == "risk"));
+        assert!(catalog.actions.iter().any(|a| a.name == "ship"));
+        assert!(!catalog.actions.iter().any(|a| a.name == "merge"));
+    }
+
+    /// PRD #2374: a config that is not valid TOML is refused rather than
+    /// replaced, so a typo never costs the user their catalog or any other
+    /// setting the deck could not read.
+    #[test]
+    fn a_config_save_refuses_to_replace_a_file_that_is_not_toml() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "default_command = \n[catalog]\nremove = [\"merge\"]\n";
+        std::fs::write(&path, original).unwrap();
+        let err = DashboardConfig::default().save_to(&path).unwrap_err();
+        assert!(err.starts_with("Not saving config at "), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    /// [`DASHBOARD_KEYS`] names every field of [`DashboardConfig`]: the
+    /// destructuring fails to compile when a field is added, and the
+    /// serialization of a config with every field away from its default
+    /// writes exactly the listed keys.
+    #[test]
+    fn dashboard_keys_name_every_field() {
+        let mut config = DashboardConfig::default();
+        let DashboardConfig {
+            default_command,
+            default_dir,
+            bell,
+            doorbell,
+            notifications,
+            auto_config_prompt,
+            host_metrics,
+        } = &mut config;
+        *default_command = "x".into();
+        *default_dir = "/x".into();
+        bell.enabled = !bell.enabled;
+        doorbell.claude = !doorbell.claude;
+        notifications.question_after_minutes += 1;
+        *auto_config_prompt = !*auto_config_prompt;
+        host_metrics.insert("disk_warn_percent".into(), toml::Value::Integer(80));
+        let written: toml::Table = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        let mut keys: Vec<&str> = written.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        let mut listed = DASHBOARD_KEYS.to_vec();
+        listed.sort_unstable();
+        assert_eq!(keys, listed);
     }
 
     /// Issue #2156 (what `docs/configuration.md` says of it): `config set`

@@ -220,6 +220,9 @@ pub(crate) struct AgentView {
     /// cached path, so a burst of folded events costs no host-metrics
     /// connection. Cleared with the list on a new subscription.
     host_metrics: Option<(dot_agent_deck::daemon_client::HostMetricsReport, Instant)>,
+    /// PRD #2374: the agent cards must be re-read — the subscription is new,
+    /// a card's doorbell rang, or the reconciliation tick fired.
+    cards_due: bool,
 }
 
 impl Default for AgentView {
@@ -235,6 +238,7 @@ impl Default for AgentView {
             fetches: 0,
             folded: 0,
             host_metrics: None,
+            cards_due: true,
         }
     }
 }
@@ -263,6 +267,12 @@ impl AgentView {
         // PRD #1258 M4: a new subscription may be a different daemon process.
         self.host_metrics = None;
         self.due = Some(FetchReason::Resubscribed);
+        self.cards_due = true;
+    }
+
+    /// PRD #2374: whether the agent cards must be re-read, clearing it.
+    pub(crate) fn take_cards_due(&mut self) -> bool {
+        std::mem::take(&mut self.cards_due)
     }
 
     /// PRD #1258 M4: keep the host-metrics answer that came with the last fetch.
@@ -299,6 +309,8 @@ impl AgentView {
                 match event.event_type {
                     EventType::SessionStart => self.mark(FetchReason::SessionStart),
                     EventType::SessionEnd => self.mark(FetchReason::SessionEnd),
+                    // PRD #2374: a doorbell, not a payload — re-read the cards.
+                    EventType::AgentCard => self.cards_due = true,
                     _ => {}
                 }
                 self.fold.apply_event(event.clone());
@@ -370,6 +382,7 @@ impl AgentView {
     /// Force the next refresh to fetch, without a specific transition behind it.
     pub(crate) fn mark_reconcile_due(&mut self) {
         self.mark(FetchReason::Reconcile);
+        self.cards_due = true;
     }
 
     /// A full `ListAgents` reply landed: it becomes the truth, and the fold is
@@ -532,6 +545,7 @@ mod tests {
         AgentRecord {
             input_held: None,
             input_discarded: None,
+            project_config_exists: None,
             id: id.into(),
             pane_id_env: Some(pane_id.into()),
             display_name: Some(format!("worker-{id}")),

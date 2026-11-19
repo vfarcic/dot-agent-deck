@@ -701,6 +701,24 @@ describe("TauriDeckBridge", () => {
   });
 
   /**
+   * Scenario (PRD #2374, PR #2378 review): two offered agents share an id on
+   * two daemons. Rust selects the build box's, and the bridge hands back that
+   * offered entry, not the first one with the same id.
+   */
+  it("hands back the chosen daemon's entry when two offered agents share an id", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    const offered = [
+      { name: "agent", kind: "agent_ref", spoken: "coder", value: "1", label: "Coder on Local daemon", deckId: "deck-local" },
+      { name: "agent", kind: "agent_ref", spoken: "coder", value: "1", label: "Coder on build box", deckId: "deck-build" },
+    ];
+    invoke.mockResolvedValue({ kind: "selected", candidate: { ...offered[1] } });
+    bridge.declareVoiceScreen("overview");
+    const answer = await bridge.answerVoiceChoice("two", "open_agent", offered);
+    expect(answer.kind === "selected" && answer.candidate).toBe(offered[1]);
+  });
+
+  /**
    * Scenario (PRD #1195): Rust resolves "switch deck to the build box", whose
    * row reaches it through a jump host, and omits the row's absent SSH user,
    * socket and key from the deck identity. The bridge hands the webview every

@@ -48,8 +48,11 @@ pub enum ClientError {
     SocketMissing(PathBuf),
     #[error("malformed daemon response: {0}")]
     Malformed(String),
-    /// PRD #1487: the daemon did not answer within the bound, before the
-    /// request itself was sent — see [`DaemonClient::restart_daemon`].
+    /// PRD #1487: the daemon did not answer within the bound. Whether the
+    /// request had reached it depends on the operation: for
+    /// [`DaemonClient::restart_daemon`] the bound runs out before the
+    /// request is sent, while config generation's bounds can run out after
+    /// the daemon received it.
     #[error("no answer from the daemon within {0:?}")]
     TimedOut(std::time::Duration),
     /// PRD #1487: the request was sent, or may have been, and then no answer
@@ -115,6 +118,26 @@ pub const KEEP_WORKTREE_UNSUPPORTED: &str = "the running deck daemon cannot keep
 /// ([`ClientError::DaemonRestarted`]). One sentence, so the TUI and the
 /// desktop say the same thing (CLAUDE.md rule 22).
 pub const AGENT_GONE_AFTER_RESTART: &str = "that agent is gone (the deck restarted)";
+
+/// PRD #2119: what a client says once the daemon has posted the configuration
+/// request. One string, so the TUI and the desktop app say the same thing.
+pub const CONFIG_GEN_SENT_MESSAGE: &str = "Config request sent to the agent's inbox.";
+
+/// PRD #2119: what a client says when the daemon does not advertise
+/// [`crate::daemon_protocol::CAP_GENERATE_CONFIG`]. Neither client composes the
+/// request itself instead, so both say this, in these words.
+pub const CONFIG_GEN_UPGRADE_MESSAGE: &str =
+    "This daemon is too old to generate a config. Upgrade the daemon to use Generate config.";
+
+/// PRD #2119: the start of what a client says when the request was refused or
+/// could not be sent; [`config_gen_failed_message`] appends the reason.
+pub const CONFIG_GEN_FAILED_PREFIX: &str = "Failed to send config prompt";
+
+/// PRD #2119: [`CONFIG_GEN_FAILED_PREFIX`] followed by `reason`, the one
+/// failure message both clients show.
+pub fn config_gen_failed_message(reason: &dyn std::fmt::Display) -> String {
+    format!("{CONFIG_GEN_FAILED_PREFIX}: {reason}")
+}
 
 /// PRD #1666 part 2 (G-fix5): what both clients say when an action aimed at an
 /// agent is refused because the deck did not say which daemon process it is
@@ -2115,6 +2138,7 @@ impl DaemonClient {
                 .map(|id| AgentRecord {
                     input_held: None,
                     input_discarded: None,
+                    project_config_exists: None,
                     id,
                     pane_id_env: None,
                     display_name: None,
@@ -2381,6 +2405,50 @@ impl DaemonClient {
         resp.id
             .map(GatedQuery::Answered)
             .ok_or_else(|| ClientError::Server("post-message answered no message id".into()))
+    }
+
+    /// PRD #2119 — ask the daemon to post the configuration-generation request
+    /// to `pane_id`'s inbox, bound to `expected_agent_id` when given. The
+    /// daemon composes the request for the pane's working directory as it
+    /// knows it; the caller sends no prompt. Answers the message id.
+    ///
+    /// **Withholds unless the daemon advertises
+    /// [`crate::daemon_protocol::CAP_GENERATE_CONFIG`]**, answering
+    /// [`GatedQuery::Unsupported`] without sending anything: an older daemon
+    /// has no such verb, and the caller says it needs upgrading
+    /// ([`crate::config_gen::CONFIG_GEN_UPGRADE_MESSAGE`]) rather than
+    /// composing the request itself.
+    pub async fn generate_config(
+        &self,
+        pane_id: &str,
+        expected_agent_id: Option<&str>,
+    ) -> Result<GatedQuery<String>, ClientError> {
+        if !self
+            .capabilities()
+            .await?
+            .supports(crate::daemon_protocol::CAP_GENERATE_CONFIG)
+        {
+            return Ok(GatedQuery::Unsupported);
+        }
+        let (mut rd, mut wr) = self.admitted_connect().await?;
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::GenerateConfig {
+                pane_id: pane_id.to_string(),
+                expected_agent_id: expected_agent_id.map(str::to_string),
+            },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error
+                    .unwrap_or_else(|| "generate-config failed".into()),
+            ));
+        }
+        resp.id
+            .map(GatedQuery::Answered)
+            .ok_or_else(|| ClientError::Server("generate-config answered no message id".into()))
     }
 
     /// PRD #1666 S3 — the inbox of `pane_id`, or of the whole deck with no
@@ -3842,6 +3910,138 @@ impl DaemonClient {
         }
     }
 
+    /// PRD #2374: a connection whose own `Hello` advertised
+    /// [`crate::daemon_protocol::CAP_AGENT_CARDS`] and
+    /// [`crate::daemon_protocol::CAP_HELLO_FOLLOW_ON`], left open for one card
+    /// request, or `None` when the daemon advertises either not — and then
+    /// nothing follows the `Hello`. On a gated or bound handle the `Hello` is
+    /// the handle's own protocol check.
+    async fn agent_cards_connection(
+        &self,
+    ) -> Result<Option<(TransportReadHalf, TransportWriteHalf)>, ClientError> {
+        let supported = |caps: &DaemonCapabilities| {
+            caps.supports(crate::daemon_protocol::CAP_AGENT_CARDS)
+                && caps.supports(crate::daemon_protocol::CAP_HELLO_FOLLOW_ON)
+        };
+        if self.protocol_gate || self.bound.is_some() {
+            if !supported(&self.capabilities().await?) {
+                return Ok(None);
+            }
+            let (rd, wr, caps, _) = self.protocol_hello(true).await?;
+            return Ok(supported(&caps).then_some((rd, wr)));
+        }
+        let (mut rd, mut wr) = self.connect().await?;
+        let hello = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::Hello {
+                client_version: crate::daemon_protocol::PROTOCOL_VERSION,
+                client_build_version: None,
+                follow_on: true,
+            },
+        )
+        .await?;
+        if !hello.ok {
+            return Err(ClientError::Server(
+                hello
+                    .error
+                    .unwrap_or_else(|| "handshake failed before send".into()),
+            ));
+        }
+        let caps = DaemonCapabilities::from_hello(&hello);
+        Ok(supported(&caps).then_some((rd, wr)))
+    }
+
+    /// PRD #2374: every live agent card, as the daemon computed it, in
+    /// display order. **Withheld unless the daemon's `Hello` on the same
+    /// connection advertised [`crate::daemon_protocol::CAP_AGENT_CARDS`]**,
+    /// answering [`GatedQuery::Unsupported`] without sending anything.
+    pub async fn list_agent_cards(
+        &self,
+    ) -> Result<GatedQuery<crate::agent_cards::AgentCardList>, ClientError> {
+        let Some((mut rd, mut wr)) = self.agent_cards_connection().await? else {
+            return Ok(GatedQuery::Unsupported);
+        };
+        let resp = issue_command(&mut rd, &mut wr, &AttachRequest::ListAgentCards).await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error
+                    .unwrap_or_else(|| "list-agent-cards failed".into()),
+            ));
+        }
+        resp.agent_cards
+            .map(GatedQuery::Answered)
+            .ok_or_else(|| ClientError::Malformed("list-agent-cards answered no cards".into()))
+    }
+
+    /// PRD #2374: the resolved agent-card catalog. Withheld like
+    /// [`Self::list_agent_cards`].
+    pub async fn agent_card_catalog(
+        &self,
+    ) -> Result<GatedQuery<crate::card_catalog::ResolvedCatalog>, ClientError> {
+        let Some((mut rd, mut wr)) = self.agent_cards_connection().await? else {
+            return Ok(GatedQuery::Unsupported);
+        };
+        let resp = issue_command(&mut rd, &mut wr, &AttachRequest::AgentCardCatalog).await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error
+                    .unwrap_or_else(|| "agent-card-catalog failed".into()),
+            ));
+        }
+        resp.card_catalog
+            .map(GatedQuery::Answered)
+            .ok_or_else(|| ClientError::Malformed("agent-card-catalog answered no catalog".into()))
+    }
+
+    /// PRD #2374: invoke one action of one card. `target` names the card as
+    /// `card list` showed it — the daemon process that listed it
+    /// (`instance_id`), its pane and agent generation, the action and the
+    /// `token` of the action definition shown — and this method binds the
+    /// connection to that daemon process itself, so no caller can send a
+    /// card's ids to a daemon that replaced it (review B3): a successor is
+    /// sent nothing and the call fails with [`ClientError::DaemonRestarted`].
+    /// The daemon checks the instance and the token again, refusing
+    /// `daemon_replaced` / `stale_action`. A refusal is an answered
+    /// [`crate::agent_cards::CardActionResult`] with `outcome: "refused"`.
+    /// Withheld like [`Self::list_agent_cards`].
+    pub async fn invoke_card_action(
+        &self,
+        target: &crate::agent_cards::CardActionTarget,
+        request_id: &str,
+        confirm: bool,
+        text: Option<&str>,
+    ) -> Result<GatedQuery<crate::agent_cards::CardActionResult>, ClientError> {
+        let bound = self.bound_to(Incarnation::from(Some(target.instance_id.clone())));
+        let Some((mut rd, mut wr)) = bound.agent_cards_connection().await? else {
+            return Ok(GatedQuery::Unsupported);
+        };
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::InvokeCardAction {
+                pane_id: target.pane_id.clone(),
+                agent_id: target.agent_id.clone(),
+                action_id: target.action_id.clone(),
+                action_token: target.action_token.clone(),
+                instance_id: target.instance_id.clone(),
+                request_id: request_id.to_string(),
+                confirm,
+                text: text.map(str::to_string),
+            },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error
+                    .unwrap_or_else(|| "invoke-card-action failed".into()),
+            ));
+        }
+        resp.card_action
+            .map(GatedQuery::Answered)
+            .ok_or_else(|| ClientError::Malformed("invoke-card-action answered no result".into()))
+    }
+
     /// Stop agent `id`. On a gated handle the request goes only to a daemon
     /// admitted on its own connection (PRD #1666 part 2): agent ids are a
     /// per-daemon counter, so a replacement the client would refuse may hold an
@@ -3985,7 +4185,12 @@ impl DaemonClient {
     /// either side drops the socket.
     pub async fn subscribe_events(&self) -> Result<EventSubscription, ClientError> {
         let (mut rd, mut wr, incarnation) = self.admitted_connect_learning().await?;
-        let resp = issue_command(&mut rd, &mut wr, &AttachRequest::SubscribeEvents).await?;
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::SubscribeEvents { agent_cards: false },
+        )
+        .await?;
         if !resp.ok {
             return Err(ClientError::Server(
                 resp.error
@@ -3999,6 +4204,46 @@ impl DaemonClient {
         // subscription down before any events flow. Letting wr live until
         // EventSubscription drops means the daemon sees EOF exactly when
         // the client actually goes away.
+        Ok(EventSubscription {
+            rd,
+            _wr: wr,
+            incarnation,
+        })
+    }
+
+    /// PRD #2374 (review B1): [`Self::subscribe_events`], opted into the
+    /// agent-card doorbells when the daemon advertises
+    /// [`crate::daemon_protocol::CAP_AGENT_CARDS`] — read from the `Hello` on
+    /// the subscription's own connection on a gated or bound handle, and from
+    /// a fresh `Hello` otherwise. Against a daemon that does not, it is the
+    /// plain subscription, byte for byte. Only a client that reads cards asks:
+    /// a doorbell is an event an older reader would apply to a session.
+    pub async fn subscribe_events_with_agent_cards(
+        &self,
+    ) -> Result<EventSubscription, ClientError> {
+        let (mut rd, mut wr, caps, incarnation) = if self.protocol_gate || self.bound.is_some() {
+            let (rd, wr, caps, incarnation) = self.protocol_hello(true).await?;
+            (rd, wr, caps, Some(incarnation))
+        } else {
+            let caps = self.fresh_capabilities().await?;
+            let (rd, wr) = self.connect().await?;
+            (rd, wr, caps, None)
+        };
+        let agent_cards = caps.supports(crate::daemon_protocol::CAP_AGENT_CARDS);
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::SubscribeEvents { agent_cards },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error
+                    .unwrap_or_else(|| "subscribe-events failed".into()),
+            ));
+        }
+        // The write half stays alive with the subscription, for the reason
+        // `subscribe_events` gives.
         Ok(EventSubscription {
             rd,
             _wr: wr,
@@ -5256,9 +5501,13 @@ mod tests {
 
         let client = DaemonClient::new(socket);
         let (mut rd, mut wr) = client.connect().await.expect("connect");
-        let resp = issue_command(&mut rd, &mut wr, &AttachRequest::SubscribeEvents)
-            .await
-            .expect("the scripted daemon answers");
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::SubscribeEvents { agent_cards: false },
+        )
+        .await
+        .expect("the scripted daemon answers");
         assert!(resp.ok);
         wr.flush().await.expect("flush");
 
@@ -6501,6 +6750,199 @@ mod tests {
                 addressed_message_withheld_inner(advertised, address).await;
             }
         });
+    }
+
+    /// PRD #2374 — each agent-card request goes only on a connection whose
+    /// `Hello` advertised `agent-cards` and `hello-follow-on`: against any
+    /// other daemon the method answers `Unsupported` and no frame follows the
+    /// Hello; against one that advertises both, the request rides the same
+    /// connection.
+    #[cfg(unix)]
+    #[test]
+    fn agent_card_requests_are_withheld_unless_the_hello_advertises_them() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        runtime.block_on(async {
+            for advertised in [
+                None,
+                Some(&[crate::daemon_protocol::CAP_AGENT_CARDS][..]),
+                Some(&[crate::daemon_protocol::CAP_HELLO_FOLLOW_ON][..]),
+            ] {
+                for method in 0..3 {
+                    let (answered, after_hello) =
+                        agent_card_request_inner(advertised, method).await;
+                    assert!(
+                        !answered,
+                        "{advertised:?} method {method}: must be Unsupported"
+                    );
+                    assert_eq!(
+                        after_hello, 0,
+                        "{advertised:?} method {method}: nothing follows the Hello"
+                    );
+                }
+            }
+            let both = Some(
+                &[
+                    crate::daemon_protocol::CAP_AGENT_CARDS,
+                    crate::daemon_protocol::CAP_HELLO_FOLLOW_ON,
+                ][..],
+            );
+            for method in 0..3 {
+                let (answered, after_hello) = agent_card_request_inner(both, method).await;
+                assert!(answered, "method {method}: must be answered");
+                assert_eq!(
+                    after_hello, 1,
+                    "method {method}: the request rides the Hello's connection"
+                );
+            }
+        });
+    }
+
+    /// PRD #2374 (review B3) — `invoke_card_action` binds itself to the
+    /// daemon process that listed the card: against a daemon whose `Hello`
+    /// names another process, nothing follows the `Hello` and the call fails
+    /// as a restarted daemon, so a card read from daemon A can never act on
+    /// whatever daemon B numbered the same.
+    #[cfg(unix)]
+    #[test]
+    fn a_card_action_is_never_sent_to_a_daemon_that_replaced_the_lister() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        runtime.block_on(async {
+            let both = Some(
+                &[
+                    crate::daemon_protocol::CAP_AGENT_CARDS,
+                    crate::daemon_protocol::CAP_HELLO_FOLLOW_ON,
+                ][..],
+            );
+            let (answered, after_hello) = agent_card_request_on(both, 2, "successor").await;
+            assert!(!answered, "the successor's answer is never taken");
+            assert_eq!(after_hello, 0, "the successor is sent nothing");
+            let (answered, after_hello) = agent_card_request_on(both, 2, "test-instance").await;
+            assert!(answered, "the lister itself is asked");
+            assert_eq!(after_hello, 1);
+        });
+    }
+
+    /// Run agent-card client method `method` (0 list, 1 catalog, 2 invoke)
+    /// against a fake daemon advertising `advertised`; answer whether it was
+    /// answered and how many frames followed a Hello on its connection.
+    #[cfg(unix)]
+    async fn agent_card_request_inner(
+        advertised: Option<&'static [&'static str]>,
+        method: usize,
+    ) -> (bool, usize) {
+        agent_card_request_on(advertised, method, "test-instance").await
+    }
+
+    /// [`agent_card_request_inner`] against a fake daemon whose `Hello` names
+    /// the process `instance`.
+    #[cfg(unix)]
+    async fn agent_card_request_on(
+        advertised: Option<&'static [&'static str]>,
+        method: usize,
+        instance: &'static str,
+    ) -> (bool, usize) {
+        let (dir, path, listener) = {
+            let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("cards-daemon.sock");
+            let listener = bind_attach_listener(&path).expect("bind fake daemon");
+            (dir, path, listener)
+        };
+        let after_hello = Arc::new(AtomicUsize::new(0));
+        let counted = after_hello.clone();
+        let server = tokio::spawn(async move {
+            while let Ok(Ok(mut stream)) =
+                tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept()).await
+            {
+                let mut frames = 0usize;
+                while let Ok(Ok(Some((_kind, payload)))) =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), read_frame(&mut stream))
+                        .await
+                {
+                    frames += 1;
+                    let request: serde_json::Value =
+                        serde_json::from_slice(&payload).unwrap_or_default();
+                    let op = request.get("op").and_then(|op| op.as_str()).unwrap_or("");
+                    let response = if frames == 1 && op == "hello" {
+                        AttachResponse {
+                            capabilities: advertised
+                                .map(|list| list.iter().map(|cap| cap.to_string()).collect()),
+                            instance_id: Some(instance.to_string()),
+                            ..AttachResponse::hello(PROTOCOL_VERSION)
+                        }
+                    } else {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        match op {
+                            "list-agent-cards" => AttachResponse {
+                                agent_cards: Some(crate::agent_cards::AgentCardList {
+                                    instance_id: "i".into(),
+                                    revision: 1,
+                                    entries: Vec::new(),
+                                    catalog_errors: Vec::new(),
+                                }),
+                                ..AttachResponse::ok()
+                            },
+                            "agent-card-catalog" => AttachResponse {
+                                card_catalog: Some(crate::card_catalog::resolve(None)),
+                                ..AttachResponse::ok()
+                            },
+                            "invoke-card-action" => AttachResponse {
+                                card_action: Some(crate::agent_cards::CardActionResult::refused(
+                                    "r",
+                                    "unknown_entry",
+                                    "there is no card p/1",
+                                )),
+                                ..AttachResponse::ok()
+                            },
+                            _ => AttachResponse::err("malformed request"),
+                        }
+                    };
+                    if crate::daemon_protocol::write_resp(&mut stream, &response)
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        });
+        let client = DaemonClient::new(path);
+        let answered = match method {
+            0 => matches!(client.list_agent_cards().await, Ok(GatedQuery::Answered(_))),
+            1 => matches!(
+                client.agent_card_catalog().await,
+                Ok(GatedQuery::Answered(_))
+            ),
+            _ => matches!(
+                client
+                    .invoke_card_action(
+                        &crate::agent_cards::CardActionTarget {
+                            instance_id: "test-instance".into(),
+                            pane_id: "p".into(),
+                            agent_id: "1".into(),
+                            action_id: "merge".into(),
+                            action_token: "t".into(),
+                        },
+                        "r",
+                        false,
+                        None,
+                    )
+                    .await,
+                Ok(GatedQuery::Answered(_))
+            ),
+        };
+        drop(client);
+        let _ = server.await;
+        drop(dir);
+        (answered, after_hello.load(Ordering::SeqCst))
     }
 
     #[cfg(unix)]
@@ -9080,6 +9522,7 @@ start = true
         let mut rec = AgentRecord {
             input_held: None,
             input_discarded: None,
+            project_config_exists: None,
             id: "9".into(),
             pane_id_env: None,
             display_name: Some(format!("de\x1bplo\u{202e}yer\0 {}", "\u{3bc}".repeat(400))),
@@ -9147,6 +9590,7 @@ start = true
         let mut rec = AgentRecord {
             input_held: None,
             input_discarded: None,
+            project_config_exists: None,
             id: "7".into(),
             pane_id_env: None,
             display_name: None,
@@ -9173,6 +9617,7 @@ start = true
         let mut ok = AgentRecord {
             input_held: None,
             input_discarded: None,
+            project_config_exists: None,
             id: "8".into(),
             pane_id_env: None,
             display_name: None,
@@ -9991,6 +10436,8 @@ pub(crate) mod restart_fixture {
         hellos: HashMap<&'static str, usize>,
         /// Capabilities every process leaves out of its `Hello`.
         withheld: Vec<&'static str>,
+        generate_reply: Option<AttachResponse>,
+        silent_generate: bool,
     }
 
     pub(crate) struct RestartingDaemon {
@@ -10034,7 +10481,7 @@ pub(crate) mod restart_fixture {
                 ])
             }
             "start-agent" => AttachResponse::with_id("1".into()),
-            "post-message" => AttachResponse::with_id("m-1".into()),
+            "post-message" | "generate-config" => AttachResponse::with_id("m-1".into()),
             "attach-stream" | "resize" => {
                 let mut reply = AttachResponse::ok();
                 reply.viewer = Some("v1".into());
@@ -10126,7 +10573,21 @@ pub(crate) mod restart_fixture {
                                 recorded.lock().unwrap().push(format!("{process}:{op}"));
                                 requests.lock().unwrap().push((process, request.clone()));
                                 restart_after_serving(&script, process, &op);
-                                let _ = write_resp(&mut stream, &serve(&op)).await;
+                                if op == "generate-config" && script.lock().unwrap().silent_generate
+                                {
+                                    std::future::pending::<()>().await;
+                                }
+                                let reply = if op == "generate-config" {
+                                    script
+                                        .lock()
+                                        .unwrap()
+                                        .generate_reply
+                                        .clone()
+                                        .unwrap_or_else(|| serve(&op))
+                                } else {
+                                    serve(&op)
+                                };
+                                let _ = write_resp(&mut stream, &reply).await;
                                 // Hold an attach or subscription open, as a
                                 // daemon would, until the client leaves.
                                 while let Ok(Some(_)) = read_frame(&mut stream).await {}
@@ -10175,6 +10636,12 @@ pub(crate) mod restart_fixture {
         /// as a daemon from before it would.
         pub(crate) fn withhold(&self, capability: &'static str) {
             self.script.lock().unwrap().withheld.push(capability);
+        }
+
+        pub(crate) fn config_generation(&self, reply: Option<AttachResponse>, silent: bool) {
+            let mut script = self.script.lock().unwrap();
+            script.generate_reply = reply;
+            script.silent_generate = silent;
         }
 
         /// The ops `process` received, in order.

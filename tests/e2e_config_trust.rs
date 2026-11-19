@@ -2664,7 +2664,20 @@ fn escape_001_refusals_carry_no_raw_terminal_controls() {
         &["delegate", "--to", "coder", "--task", "TRUST-HOSTILE-TASK"][..],
         &["pane", "restart", "coder", "--force"],
     ] {
-        let out = daemon_agent_verb(&daemon, &roles, &orchestrator, args);
+        // The trust check answers only once the coder is registered for
+        // routing; until then `delegate` answers "reached no worker", which a
+        // starved runner hit on `main`'s run for #2378. Both answers refuse and
+        // deliver nothing, so the verb is asked again until the coder is
+        // there, within the same bound as the waits above.
+        let out = std::cell::RefCell::new(daemon_agent_verb(&daemon, &roles, &orchestrator, args));
+        common::wait_until(common::load_scaled(Duration::from_secs(15)), || {
+            if !text(&out.borrow()).contains("reached no worker") {
+                return true;
+            }
+            *out.borrow_mut() = daemon_agent_verb(&daemon, &roles, &orchestrator, args);
+            false
+        });
+        let out = out.into_inner();
         let printed = text(&out);
         assert!(
             !out.status.success()
@@ -2720,14 +2733,48 @@ fn let_the_request_arm(deck: &TuiDeck) {
     );
 }
 
+/// Issue #2348: what the refusal promises an agent the deck recorded.
+const REFUSAL_WILL_TELL: &str = "You will get a dot-agent-deck notice in your inbox";
+/// Issue #2348: what the deck notice of an approval says.
+const APPROVED_NOTICE: &str = "was approved. Retry your";
+/// Issue #2348: what the deck notice of a denial says.
+const DECLINED_NOTICE: &str = "stays refused, so do not retry it";
+
+/// Wait for one message containing `needle` in `pane`'s inbox, then watch
+/// the inbox for a window and assert no second one arrives in it: each refused
+/// caller is told once per answer.
+fn assert_told_once(attach: &Path, pane: &str, needle: &str) {
+    assert!(
+        inbox_view::wait_for(
+            attach,
+            pane,
+            needle,
+            common::load_scaled(Duration::from_secs(15))
+        ),
+        "the refused caller must be told the answer ({needle:?}).\nInbox:\n{}",
+        inbox_view::text(attach, pane)
+    );
+    // A negative over a window, polled, as `no_roles_for` is: a duplicate
+    // would be posted by the same answer, right behind the first.
+    let duplicated = common::wait_until(Duration::from_millis(500), || {
+        inbox_view::count_containing(attach, pane, needle) > 1
+    });
+    assert!(
+        !duplicated,
+        "the refused caller is told once per answer.\nInbox:\n{}",
+        inbox_view::text(attach, pane)
+    );
+}
+
 /// Scenario: From a plain pane in a never-approved project, run `dispatch
 /// <unit> --orchestration trust-orch`. The TUI opens `Review project commands`
 /// on its own, saying the deck asked and that `dispatch` asked, with `a
 /// approve · Esc deny`; the refusal in the caller's inbox says the approval was
-/// requested in the deck. A retry while it is open raises no second request.
-/// Pressing `a` approves (the status line says so, `trust list` reads it
-/// current, the daemon lists no request), and the retried dispatch starts the
-/// orchestration in the unit's worktree.
+/// requested in the deck and that a notice will follow. A retry while it is
+/// open raises no second request. Pressing `a` approves (the status line says
+/// so, `trust list` reads it current, the daemon lists no request), the
+/// caller's inbox gets one deck notice saying it was approved and to retry, and
+/// the retried dispatch starts the orchestration in the unit's worktree.
 #[spec("config-trust/request/001")]
 #[test]
 fn request_001_a_refused_dispatch_is_approved_inside_the_deck_and_the_retry_starts() {
@@ -2768,6 +2815,10 @@ fn request_001_a_refused_dispatch_is_approved_inside_the_deck_and_the_retry_star
         describe(&out)
     );
     assert_refusal(&inbox, deck.workdir(), "never approved");
+    assert!(
+        inbox.contains(REFUSAL_WILL_TELL),
+        "the refusal must tell the agent a notice will follow.\nInbox:\n{inbox}"
+    );
 
     // The grid, not the byte stream: the review may be drawn before this wait.
     deck.wait_until_grid("the review the deck opened on its own", |grid| {
@@ -2817,6 +2868,13 @@ fn request_001_a_refused_dispatch_is_approved_inside_the_deck_and_the_retry_star
             .any(|l| l.contains(ORCH) && state_word(l) == Some("current")),
         "the approval made in the deck is the stored one:\n{listed}"
     );
+    // Issue #2348: the refused caller is told, once, and only then retries.
+    assert_told_once(attach, &caller, APPROVED_NOTICE);
+    assert!(
+        inbox_view::text(attach, &caller).contains("Retry your dispatch now"),
+        "the notice names the verb to retry.\nInbox:\n{}",
+        inbox_view::text(attach, &caller)
+    );
 
     let unit_wt = dispatch_worktree_of(&deck, "request-approved");
     let _g3 = SiblingWorktreeGuard(unit_wt.clone());
@@ -2846,9 +2904,10 @@ fn request_001_a_refused_dispatch_is_approved_inside_the_deck_and_the_retry_star
 }
 
 /// Scenario: A never-approved `dispatch --orchestration` opens the review on
-/// its own, and `Esc` declines it. The status line says it was declined, the daemon lists no
-/// request, and a retried dispatch is refused saying the user declined it in
-/// the deck, with no review opening again.
+/// its own, and `Esc` declines it. The status line says it was declined, the
+/// daemon lists no request, the caller's inbox gets one deck notice saying it
+/// was declined and not to retry, and a retried dispatch is refused saying the
+/// user declined it in the deck, with no review opening again.
 #[spec("config-trust/request/002")]
 #[test]
 fn request_002_denying_in_the_deck_refuses_the_retry_without_asking_again() {
@@ -2890,6 +2949,8 @@ fn request_002_denying_in_the_deck_refuses_the_retry_without_asking_again() {
         }),
         "declining closes the request"
     );
+    // Issue #2348: the refused caller is told it was declined.
+    assert_told_once(attach, &caller, DECLINED_NOTICE);
 
     let _ = dispatch("deny-retry");
     assert!(
@@ -3002,4 +3063,133 @@ fn request_003_a_request_raised_with_no_client_opens_when_one_attaches() {
         daemon.agent_records().is_empty(),
         "nothing started from the declined orchestration"
     );
+}
+
+/// Refuse `dispatch <unit> --orchestration trust-orch` from a fresh caller pane
+/// of a never-approved deck, wait for the review the deck opens on its own, and
+/// answer the deck, its attach socket and the caller's pane id.
+fn refused_dispatch_with_review_open(unit: &str) -> (TuiDeck, PathBuf, String) {
+    let deck = TuiDeck::builder()
+        .without_trust_preapproval()
+        .impersonating_pane_signals()
+        .with_pty_size(160, 50)
+        .launch_with_fixture("config-trust");
+    deck.wait_for_string("No active agents");
+    common::commit_fixture_repo(deck.workdir());
+    let caller = open_caller(&deck);
+    let attach = deck.attach_socket_path().to_path_buf();
+    let _ = agent_verb(
+        &deck,
+        &caller,
+        &[
+            "dispatch",
+            unit,
+            "--task",
+            "TRUST-NOTICE-TASK",
+            "--orchestration",
+            ORCH,
+        ],
+    );
+    assert!(
+        inbox_view::wait_for(
+            &attach,
+            &caller,
+            REFUSAL_WILL_TELL,
+            common::load_scaled(Duration::from_secs(15))
+        ),
+        "the refusal must tell the agent a notice will follow.\nInbox:\n{}",
+        inbox_view::text(&attach, &caller)
+    );
+    deck.wait_for_string(REQUEST_FOOTER);
+    (deck, attach, caller)
+}
+
+/// Retry the refused dispatch as `unit` and assert its roles start in the
+/// unit's worktree.
+fn retried_dispatch_starts(deck: &TuiDeck, attach: &Path, caller: &str, unit: &str) {
+    let unit_wt = dispatch_worktree_of(deck, unit);
+    let _guard = SiblingWorktreeGuard(unit_wt.clone());
+    let out = agent_verb(
+        deck,
+        caller,
+        &[
+            "dispatch",
+            unit,
+            "--task",
+            "TRUST-NOTICE-TASK",
+            "--orchestration",
+            ORCH,
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "the retried dispatch runs: {}",
+        describe(&out)
+    );
+    let unit_name = unit_wt
+        .file_name()
+        .expect("worktree has a name")
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        common::wait_until(common::load_scaled(Duration::from_secs(20)), || {
+            role_records(attach).iter().any(|r| {
+                r.cwd
+                    .as_deref()
+                    .and_then(|cwd| Path::new(cwd).file_name().map(|n| n == unit_name.as_str()))
+                    .unwrap_or(false)
+            })
+        }),
+        "the retried dispatch's roles must run in {}",
+        unit_wt.display()
+    );
+}
+
+/// Scenario: A refused `dispatch --orchestration` leaves the deck's review open
+/// in the TUI. The user approves it from a terminal instead, with `dot-agent-deck
+/// trust approve --yes`. The TUI's review closes saying it was answered
+/// elsewhere, the caller's inbox gets one deck notice saying it was approved,
+/// and the caller's retried dispatch starts the orchestration.
+#[spec("config-trust/request/004")]
+#[test]
+fn request_004_a_terminal_approval_tells_the_refused_caller() {
+    let (deck, attach, caller) = refused_dispatch_with_review_open("notice-cli-refused");
+    let _g1 = SiblingWorktreeGuard(dispatch_worktree_of(&deck, "notice-cli-refused"));
+    assert!(
+        inbox_view::count_containing(&attach, &caller, APPROVED_NOTICE) == 0,
+        "nothing is told before an answer"
+    );
+    deck.approve_project_trust(deck.workdir());
+    deck.wait_for_string("was answered elsewhere");
+    deck.wait_for_absence(REQUEST_FOOTER);
+    assert_told_once(&attach, &caller, APPROVED_NOTICE);
+    retried_dispatch_starts(&deck, &attach, &caller, "notice-cli-approved");
+}
+
+/// Scenario: A refused `dispatch --orchestration` leaves the deck's review open
+/// in the TUI. Another client — the desktop app's verb, sent raw on the attach
+/// socket — approves the pending request's text. The TUI's review closes saying
+/// it was answered elsewhere, the caller's inbox gets one deck notice saying it
+/// was approved, and the caller's retried dispatch starts the orchestration.
+#[spec("config-trust/request/005")]
+#[test]
+fn request_005_another_clients_approval_tells_the_refused_caller() {
+    let (deck, attach, caller) = refused_dispatch_with_review_open("notice-client-refused");
+    let _g1 = SiblingWorktreeGuard(dispatch_worktree_of(&deck, "notice-client-refused"));
+    let pending = pending_trust_requests(&attach);
+    assert_eq!(pending.len(), 1, "one request is pending: {pending:?}");
+    let resp = common::attach_request_on(
+        &attach,
+        &dot_agent_deck::daemon_protocol::AttachRequest::ApproveProjectTrust {
+            path: pending[0].config_dir.clone(),
+            orchestration: pending[0].orchestration.clone(),
+            digest: pending[0].digest.clone(),
+        },
+    )
+    .expect("approve over the attach socket");
+    assert!(resp.ok, "the approval is served: {:?}", resp.error);
+    deck.wait_for_string("was answered elsewhere");
+    deck.wait_for_absence(REQUEST_FOOTER);
+    assert_told_once(&attach, &caller, APPROVED_NOTICE);
+    retried_dispatch_starts(&deck, &attach, &caller, "notice-client-approved");
 }

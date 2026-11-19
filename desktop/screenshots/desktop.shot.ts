@@ -9,7 +9,7 @@ import { desktopScenario } from "./support";
  */
 
 /** Load a fixture state and open the agent dashboard through its rail control. */
-async function overview(page: Page, state: "docs" | "docs-fleet" | "docs-pr" | "docs-restart" | "empty"): Promise<void> {
+async function overview(page: Page, state: "docs" | "docs-fleet" | "docs-pr" | "docs-generate" | "docs-restart" | "empty"): Promise<void> {
   await page.goto(`/?fixture=1&state=${state}`);
   await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
   await page.getByTestId("open-overview").click();
@@ -90,6 +90,19 @@ desktopScenario("dashboard-filter", async (page) => {
   await expect(page.getByRole("button", { name: "Show all" })).toBeVisible();
 });
 
+// PRD #2374 — desktop-only: the TUI has no cards view. The `docs` state's
+// four agents as the daemon's cards (`docsAgentCards` in the fixture), served
+// only with `cards=1`, shown through the Dashboard's Table | Cards switch.
+desktopScenario("agent-cards", async (page) => {
+  await page.goto("/?fixture=1&state=docs&cards=1");
+  await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
+  await page.getByTestId("open-overview").click();
+  await page.getByTestId("overview-mode-cards").click();
+  await expect(page.getByTestId("agent-cards-group")).toHaveCount(2);
+  await expect(page.locator("article[data-card-key]")).toHaveCount(4);
+  await expect(page.getByTestId("agent-card-primary").first()).toHaveText("Go ahead");
+});
+
 // PRD #1258 — the same fixed host the TUI `host-metrics` image shows
 // (`HOST_SAMPLE` in `tests/e2e_docs_screenshots.rs`), on the `docs` deck.
 // The host button beside the deck's name, opened: its popover is what the
@@ -102,6 +115,20 @@ desktopScenario("host-metrics", async (page) => {
   await expect(page.getByTestId("host-metrics")).toContainText("6 GiB free of 64 GiB total (warning)");
   await expect(page.getByTestId("host-metrics")).toContainText("Memory available43.5 GiB");
   await expect(page.getByTestId("host-metrics-popover").getByRole("button", { name: "Close host" })).toBeVisible();
+});
+
+// PRD #2119 — the Generate config confirmation the TUI `generate-config` image
+// shows, opened from the Plan / architecture row's button: the fixture's
+// `docs-generate` state, whose one agent has a pane.
+desktopScenario("generate-config", async (page) => {
+  await overview(page, "docs-generate");
+  await expect(page.locator(".overview-row")).toHaveCount(1);
+  await page.getByRole("button", { name: "Generate config with Plan / architecture agent" }).click();
+  const dialog = page.getByRole("alertdialog", { name: "Generate .dot-agent-deck.toml" });
+  await expect(dialog).toBeVisible();
+  await expect(dialog).toContainText("No orchestration config found for this project.");
+  await expect(dialog.getByRole("button", { name: "Yes", exact: true })).toBeVisible();
+  await expect(dialog.getByRole("button", { name: "No", exact: true })).toBeVisible();
 });
 
 // The two agents the TUI `restart-notice` image names, stopped by a restart of

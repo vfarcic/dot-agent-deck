@@ -644,27 +644,96 @@ pub fn refusal_text(
 /// Issue #2330: the refusal when the serving daemon has asked the attached
 /// clients for the approval ([`crate::trust_requests`]). Names the
 /// orchestration, the project and the state as [`refusal_text`] does, says the
-/// approval was requested in the deck and to retry once it is approved, and
+/// approval was requested in the deck and what the caller should do next, and
 /// still names the CLI command for a user with no client attached. Escaped for
 /// display, as [`refusal_text`] is.
-pub fn requested_refusal_text(check: &TrustCheck) -> String {
+///
+/// Issue #2348: `told` says the refused agent is recorded against the request
+/// and will get a deck notice with the answer ([`REQUESTED_WILL_TELL`]), so it
+/// waits for that instead of polling; without an agent to tell (a schedule),
+/// the refusal says a retry starts it once approved ([`REQUESTED_RETRY`]).
+pub fn requested_refusal_text(check: &TrustCheck, told: bool) -> String {
     let Some(state) = verdict_phrase(&check.verdict) else {
         return String::new();
     };
     crate::untrusted_text::escape_control_and_bidi(&format!(
-        "orchestration '{}' of project {} {state}, so nothing from it was started. {} \
+        "orchestration '{}' of project {} {state}, so nothing from it was started. {} {} \
          Or approve it from a terminal outside the deck with: {}",
         check.orchestration,
         check.project.display(),
         REQUESTED_IN_DECK,
+        if told {
+            REQUESTED_WILL_TELL
+        } else {
+            REQUESTED_RETRY
+        },
         approve_command(&check.config_dir, &check.orchestration)
     ))
 }
 
-/// Issue #2330: what [`requested_refusal_text`] says the caller should do.
+/// Issue #2330: what [`requested_refusal_text`] says the deck did.
 pub const REQUESTED_IN_DECK: &str = "Its approval was requested in the deck: the user can review \
-     it in the dot-agent-deck TUI or desktop app attached to this deck, and once it is approved \
-     the same attempt, retried, starts it.";
+     it in the dot-agent-deck TUI or desktop app attached to this deck.";
+
+/// Issue #2348: what [`requested_refusal_text`] tells an agent the deck will
+/// tell it.
+pub const REQUESTED_WILL_TELL: &str = "You will get a dot-agent-deck notice in your inbox when \
+     the user approves or declines it: wait for that notice rather than retrying, and once it \
+     says approved, run the same command again to start it.";
+
+/// Issue #2330: what [`requested_refusal_text`] says when there is no agent to
+/// tell (a schedule).
+pub const REQUESTED_RETRY: &str = "Once it is approved, the same attempt, retried, starts it.";
+
+/// Issue #2348: the deck notice each refused caller is sent when the request
+/// for `orchestration` of `project` closes with `answer`, naming the `verbs`
+/// that caller was refused (`dispatch`, `delegate`, …): its subject and body.
+/// Escaped for display, as [`refusal_text`] is.
+pub fn request_answer_notice(
+    project: &str,
+    orchestration: &str,
+    verbs: &[String],
+    answer: crate::trust_requests::Answer,
+) -> (&'static str, String) {
+    use crate::trust_requests::Answer;
+    let verbs = match verbs {
+        [] => "attempt".to_string(),
+        [one] => one.clone(),
+        [init @ .., last] => format!("{} and {last}", init.join(", ")),
+    };
+    let (subject, body) = match answer {
+        Answer::Approved => (
+            "orchestration approved",
+            format!(
+                "Orchestration '{orchestration}' of project {project} was approved. Retry your \
+                 {verbs} now if you still need it: the approval itself started nothing."
+            ),
+        ),
+        Answer::Declined => (
+            "orchestration declined",
+            format!(
+                "Orchestration '{orchestration}' of project {project} was not approved: \
+                 {DECLINED_IN_DECK}. Your {verbs} stays refused, so do not retry it. Nothing \
+                 from it starts until the user approves it from the deck's New Agent form or \
+                 with dot-agent-deck trust approve."
+            ),
+        ),
+        Answer::Withdrawn => (
+            "approval request closed",
+            format!(
+                "The deck's request to approve orchestration '{orchestration}' of project \
+                 {project} closed without an answer: its .dot-agent-deck.toml now reads \
+                 differently, here or in another worktree of the project, or no longer names \
+                 it. Retry your {verbs} if you still need it; if that is refused too, the deck \
+                 asks the user again."
+            ),
+        ),
+    };
+    (
+        subject,
+        crate::untrusted_text::escape_control_and_bidi(&body),
+    )
+}
 
 /// Issue #2330: what [`declined_refusal_text`] says of the user's answer.
 pub const DECLINED_IN_DECK: &str = "the user declined it in the deck";

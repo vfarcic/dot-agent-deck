@@ -859,6 +859,7 @@ async fn question_desktop_004_a_non_answer_falls_through_and_no_is_the_question_
         value: "a1".into(),
         label: "tester".into(),
         deck_identity: None,
+        deck_id: None,
         names: Vec::new(),
     }];
     let live = crate::voice::choice::ChoiceLive {

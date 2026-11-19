@@ -95,6 +95,35 @@ const CLOSE_AGENT_PHRASES: [&str; 8] = [
     "close this agent",
     "close the agent",
 ];
+/// PRD #2119 review — whole requests to generate config for the viewed agent,
+/// outside typing mode. Like [`CLOSE_AGENT_PHRASES`], they name no agent, so
+/// they open the pane's own confirmation without the command backend and work
+/// with Settings → Voice → Send on-screen names off.
+///
+/// "update config" is the same request: the pane's control reads Update config
+/// when the project already has one, and either phrase works whichever label
+/// shows.
+const GENERATE_CONFIG_PHRASES: [&str; 12] = [
+    "generate config",
+    "generate a config",
+    "generate the config",
+    "generate config for this agent",
+    "generate a config for this agent",
+    "generate config with this agent",
+    "update config",
+    "update the config",
+    "update config for this agent",
+    "update the config for this agent",
+    "update config with this agent",
+    "update the config with this agent",
+];
+/// The row [`GENERATE_CONFIG_PHRASES`] dispatch.
+const GENERATE_CONFIG_ROW: &str = "generate_config";
+/// What the agent screen answers a model pick of `generate_config` that names
+/// an agent: like a named stop there, it never targets another agent, and it
+/// is the pane's own control and phrase that reach the viewed one.
+const GENERATE_CONFIG_PANE_HINT: &str =
+    "To generate config for this agent, say 'generate config' or press Generate config.";
 /// The Daemons screen's row, whose bare "go back" is [`CLOSE_ROW`]'s where it
 /// cannot run.
 const OPEN_DECK_ROW: &str = "open_deck";
@@ -399,6 +428,14 @@ pub struct ResolvedParam {
     /// deck, which has no remote address to change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deck_identity: Option<VoiceDeckIdentity>,
+    /// PRD #2374 (PR #2378 review) — on an [`ParamKind::AgentRef`] resolved
+    /// while more than one daemon's agents were in reach
+    /// ([`super::VoiceDeck::agents`]): the deck that agent is on, since agent
+    /// ids are per daemon. The webview dispatches to that deck (`deckId`, the
+    /// key a numbered dashboard row already sets). `None` when only the
+    /// selected deck's agents were in reach, which is the deck it means.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deck_id: Option<String>,
     /// PRD #1261 — on an OFFERED candidate of a
     /// [`VoiceOutcome::ParamAmbiguous`] alone, every name the entry answers
     /// to ([`super::choice::names_of`], the per-kind list
@@ -632,7 +669,12 @@ impl VoiceOutcome {
     fn named(mut self, live: &ChoiceLive) -> Self {
         if let VoiceOutcome::ParamAmbiguous { candidates, .. } = &mut self {
             for candidate in candidates.iter_mut() {
-                candidate.names = super::choice::names_of(candidate.kind, &candidate.value, live);
+                candidate.names = super::choice::names_of(
+                    candidate.kind,
+                    &candidate.value,
+                    candidate.deck_id.as_deref(),
+                    live,
+                );
             }
         }
         self
@@ -1578,6 +1620,32 @@ fn decide(picked: &Picked<'_>, judged: &Judged<'_>) -> VoiceOutcome {
             sentence: hint.to_string(),
         };
     }
+    // PRD #2119 review: the same on the agent screen for Generate config. A
+    // pick naming an agent — another one, or the viewed one by name — is
+    // answered with the pane's own phrase, never sent to the named agent nor
+    // silently redirected to the viewed one; a pick naming none is the viewed
+    // agent's, as its whole phrases are.
+    if screen == Screen::Agent && row.id == GENERATE_CONFIG_ROW {
+        let names_an_agent = answer.params.values().any(|value| !value.trim().is_empty());
+        if names_an_agent {
+            return VoiceOutcome::Unavailable {
+                transcript,
+                action: row.id.clone(),
+                hint: GENERATE_CONFIG_PANE_HINT.to_string(),
+                sentence: GENERATE_CONFIG_PANE_HINT.to_string(),
+            };
+        }
+        return VoiceOutcome::Dispatch {
+            sentence:
+                "Confirm generating a config with the open agent — nothing has been sent yet."
+                    .to_string(),
+            transcript,
+            action: row.id.clone(),
+            invoke: row.invoke.clone(),
+            params: Vec::new(),
+            then_submit: false,
+        };
+    }
     if withheld && needs_labels(row) {
         return VoiceOutcome::labels_withheld(transcript, row);
     }
@@ -2106,6 +2174,7 @@ fn implied_param(spec: &super::table::ParamSpec, decks: &[VoiceDeck]) -> Option<
         value: only.id.clone(),
         label: only.label.clone(),
         deck_identity: None,
+        deck_id: None,
         names: Vec::new(),
     })
 }
@@ -2128,6 +2197,7 @@ fn unnamed_pr_agent(
             value: id,
             label,
             deck_identity: None,
+            deck_id: None,
             names: Vec::new(),
         }),
         AgentRefMatch::None => Err(Box::new(VoiceOutcome::ParamMissing {
@@ -2527,6 +2597,7 @@ fn resolve_param(
         value,
         label,
         deck_identity: None,
+        deck_id: None,
         names: Vec::new(),
     };
     // What follows the longest of `introductions` the transcript opens with,
@@ -2685,6 +2756,20 @@ fn resolve_param(
             Some(text) => Ok(param(text.clone(), text)),
             None => Err(Unmet::NoMatch),
         },
+        // PRD #2374 (PR #2378 review): with other daemons' agents in reach
+        // (All daemons on the dashboard), the reference is resolved against
+        // each daemon's agents in turn, by everything below.
+        ParamKind::AgentRef if reaches_other_daemons(decks) => resolve_agent_ref_across(
+            spec,
+            spoken,
+            transcript,
+            agents,
+            decks,
+            directories,
+            new_agent,
+            for_new_agent,
+            row,
+        ),
         // Issue #1495 (Greptile on PR #1529): the model may drop the daemon
         // the user named — "Codex" for "open the Codex agent on build box" —
         // so the transcript is held to the same rule as the reference: naming
@@ -2897,6 +2982,28 @@ fn resolve_param(
             .and_then(|found| heard_facet(found, spec.kind, transcript, decks)),
         ParamKind::AgentStatus => choice_param(resolve_dashboard_status(spoken))
             .and_then(|found| heard_facet(found, spec.kind, transcript, decks)),
+        // PRD #2374 — the dashboard's view and the cards' Needs you filter:
+        // the app's own closed sets, each held to the transcript by its names
+        // as a dashboard facet is, so a view or state nobody said is refused.
+        ParamKind::OverviewMode => choice_param(resolve_fixed(spoken, &OVERVIEW_MODES))
+            .and_then(|found| heard_facet(found, spec.kind, transcript, decks)),
+        ParamKind::NeedsYouFilter => choice_param(resolve_fixed(spoken, &NEEDS_YOU_FILTER))
+            .and_then(|found| heard_facet(found, spec.kind, transcript, decks)),
+        // PRD #2374 — a card action's label, held to the user's words as the
+        // directory filter is; the webview matches it against the card's own
+        // actions and refuses in words when none or several match.
+        ParamKind::CardAction => match grounded_filter_text(transcript.text(), spoken) {
+            Some(text) => Ok(param(text.clone(), text)),
+            None => Err(Unmet::NoMatch),
+        },
+        // PRD #2374 — a reply to a card's agent: the transcript's own slice,
+        // and only when the model's words are in it, as for the Command field.
+        // What reaches the agent is what the user said, never the model's
+        // retelling of it.
+        ParamKind::ReplyText => match grounded_command_text(transcript.text(), spoken) {
+            Some(text) => Ok(param(text.clone(), text)),
+            None => Err(Unmet::NoMatch),
+        },
         ParamKind::AgentTypeRef if row.id == FILTER_DASHBOARD_ROW => {
             choice_param(resolve_known_agent_type(spoken))
                 .and_then(|found| heard_facet(found, spec.kind, transcript, decks))
@@ -3057,6 +3164,22 @@ fn local_intercept(
         return Some(outcome);
     }
 
+    // PRD #2119 review: a bare Generate config on the agent screen is the
+    // viewed agent's, decided here as the close phrases above are — so it
+    // needs no on-screen name and reaches the backend with nothing.
+    if screen == Screen::Agent
+        && said_whole(transcript.text(), GENERATE_CONFIG_PHRASES)
+        && let Some(row) = table.row(GENERATE_CONFIG_ROW)
+    {
+        let mut outcome = dispatch(row, Vec::new());
+        if let VoiceOutcome::Dispatch { sentence, .. } = &mut outcome {
+            *sentence =
+                "Confirm generating a config with the open agent — nothing has been sent yet."
+                    .to_string();
+        }
+        return Some(outcome);
+    }
+
     // Less an edge politeness word, as every local list and the dictation
     // mode compare: "okay, send it please" is the same request as
     // "send it", and answering it here decides it without a model on every
@@ -3124,6 +3247,7 @@ fn local_intercept(
             value: typed.to_string(),
             label: typed.to_string(),
             deck_identity: None,
+            deck_id: None,
             names: Vec::new(),
         }],
     ))
@@ -3498,6 +3622,7 @@ fn dictation_intercept(
         value: typed.to_string(),
         label: typed.to_string(),
         deck_identity: None,
+        deck_id: None,
         names: Vec::new(),
     }];
     let mut outcome = dispatch(row, params);
@@ -4202,6 +4327,14 @@ impl ParamKind {
             }
             ParamKind::AgentKind => "I could not tell which kind of agent you meant",
             ParamKind::AgentStatus => "I could not tell which status you meant",
+            ParamKind::OverviewMode => "I could not tell whether you wanted the table or the cards",
+            ParamKind::NeedsYouFilter => {
+                "I could not tell whether to show only the cards that need you or every card"
+            }
+            ParamKind::CardAction => {
+                "I could not tell which of the card's actions you meant, so nothing was sent"
+            }
+            ParamKind::ReplyText => "I could not tell what to reply, so nothing was sent",
         }
     }
 
@@ -4265,6 +4398,17 @@ impl ParamKind {
             ParamKind::AgentStatus => {
                 format!("no agent status matches \u{201c}{spoken}\u{201d}")
             }
+            ParamKind::OverviewMode => {
+                format!("no view of the dashboard matches \u{201c}{spoken}\u{201d}")
+            }
+            ParamKind::NeedsYouFilter => {
+                format!("\u{201c}{spoken}\u{201d} is not on or off for the Needs you filter")
+            }
+            // The model's words, quoted beside what was heard, as for the
+            // filter box: nothing was sent to the agent.
+            ParamKind::CardAction | ParamKind::ReplyText => {
+                format!("you did not say \u{201c}{spoken}\u{201d}, so nothing was sent")
+            }
         }
     }
 
@@ -4322,6 +4466,20 @@ impl ParamKind {
             ParamKind::AgentStatus => {
                 format!("\u{201c}{spoken}\u{201d} matches more than one status: {listed}")
             }
+            ParamKind::OverviewMode => {
+                format!("\u{201c}{spoken}\u{201d} matches more than one view: {listed}")
+            }
+            ParamKind::NeedsYouFilter => {
+                format!("\u{201c}{spoken}\u{201d} could be on or off: {listed}")
+            }
+            // Unreachable: words held to the transcript are accepted or
+            // refused, never chosen between.
+            ParamKind::CardAction => {
+                format!("\u{201c}{spoken}\u{201d} could be more than one action: {listed}")
+            }
+            ParamKind::ReplyText => {
+                format!("\u{201c}{spoken}\u{201d} could be more than one reply: {listed}")
+            }
         }
     }
 
@@ -4340,6 +4498,10 @@ impl ParamKind {
             ParamKind::CommandText => "command",
             ParamKind::AgentKind => "kind",
             ParamKind::AgentStatus => "status",
+            ParamKind::OverviewMode => "view",
+            ParamKind::NeedsYouFilter => "filter",
+            ParamKind::CardAction => "action",
+            ParamKind::ReplyText => "reply",
         }
     }
 }
@@ -4371,6 +4533,9 @@ fn listed(matches: &[String]) -> String {
 pub struct Candidate {
     pub value: String,
     pub label: String,
+    /// PRD #2374 (PR #2378 review) — the deck an agent candidate is on, when
+    /// the tie spans daemons ([`ResolvedParam::deck_id`]). `None` otherwise.
+    pub deck_id: Option<String>,
 }
 
 impl Candidate {
@@ -4378,6 +4543,7 @@ impl Candidate {
         Self {
             value: value.into(),
             label: label.into(),
+            deck_id: None,
         }
     }
 }
@@ -4410,9 +4576,143 @@ fn offered(
             value: candidate.value.clone(),
             label: candidate.label.clone(),
             deck_identity: None,
+            deck_id: candidate.deck_id.clone(),
             names: Vec::new(),
         })
         .collect()
+}
+
+/// PRD #2374 (PR #2378 review) — whether agents of a daemon other than the one
+/// that [`VoiceDeck::holds_agents`] are in reach ([`VoiceDeck::agents`]).
+pub(super) fn reaches_other_daemons(decks: &[VoiceDeck]) -> bool {
+    decks
+        .iter()
+        .any(|deck| !deck.holds_agents && !deck.agents.0.is_empty())
+}
+
+/// PRD #2374 (PR #2378 review) — an `agent_ref` resolved against every daemon
+/// in reach: the selected deck's `agents`, then each other deck's own
+/// ([`VoiceDeck::agents`]), each in turn exactly as a single daemon is — with
+/// that daemon alone holding the agents, so naming it narrows nothing and
+/// naming another reaches none of its agents — and the answers put together.
+/// One agent on one daemon is that agent, carrying its deck
+/// ([`ResolvedParam::deck_id`]); agents on several daemons, or a tie on one,
+/// are the numbered choice, each named with its daemon ("Coder on build
+/// box") when the choice spans daemons; none anywhere is no match.
+#[allow(clippy::too_many_arguments)]
+fn resolve_agent_ref_across(
+    spec: &super::table::ParamSpec,
+    spoken: &str,
+    transcript: &Transcript,
+    agents: &[DesktopAgent],
+    decks: &[VoiceDeck],
+    directories: Option<&VoiceDirectories>,
+    new_agent: Option<&VoiceNewAgent>,
+    for_new_agent: bool,
+    row: &CommandRow,
+) -> Result<ResolvedParam, Unmet> {
+    let holding = decks.iter().find(|deck| deck.holds_agents);
+    let mut sets: Vec<(Option<&VoiceDeck>, &[DesktopAgent])> = vec![(holding, agents)];
+    sets.extend(
+        decks
+            .iter()
+            .filter(|deck| !deck.holds_agents && !deck.agents.0.is_empty())
+            .map(|deck| (Some(deck), deck.agents.0.as_slice())),
+    );
+    let mut found: Vec<(Option<&VoiceDeck>, Candidate)> = Vec::new();
+    for &(deck, set) in &sets {
+        let alone: Vec<VoiceDeck> = decks
+            .iter()
+            .map(|each| VoiceDeck {
+                holds_agents: deck.is_some_and(|deck| deck.id == each.id),
+                agents: super::DeckAgents::default(),
+                ..each.clone()
+            })
+            .collect();
+        let deck_id = deck.map(|deck| deck.id.clone());
+        match resolve_param(
+            spec,
+            spoken,
+            transcript,
+            set,
+            &alone,
+            directories,
+            new_agent,
+            for_new_agent,
+            row,
+        ) {
+            Ok(param) => found.push((
+                deck,
+                Candidate {
+                    value: param.value,
+                    label: param.label,
+                    deck_id,
+                },
+            )),
+            Err(Unmet::Ambiguous(candidates)) => {
+                found.extend(candidates.into_iter().map(|candidate| {
+                    (
+                        deck,
+                        Candidate {
+                            deck_id: deck_id.clone(),
+                            ..candidate
+                        },
+                    )
+                }))
+            }
+            Err(_) => {}
+        }
+    }
+    // "The newest agent" with an agent on each daemon is the one that started
+    // last of them all, not a choice between each daemon's newest (Qodo on PR
+    // #2378) — when every one of them reports its start, as on one daemon.
+    if found.len() > 1 {
+        let (mut said, _) = reference_words(transcript.text());
+        if let Some(recency) = Recency::said(&mut said) {
+            let agent_of = |(deck, candidate): &(Option<&VoiceDeck>, Candidate)| {
+                sets.iter()
+                    .find(|(each, _)| each.map(|each| &each.id) == deck.map(|deck| &deck.id))
+                    .and_then(|(_, set)| set.iter().find(|agent| agent.id == candidate.value))
+            };
+            let agents: Option<Vec<&DesktopAgent>> = found.iter().map(agent_of).collect();
+            if let Some(agents) = agents
+                && let [newest] = recency.pick(agents.clone()).as_slice()
+                && let Some(at) = agents
+                    .iter()
+                    .position(|agent| std::ptr::eq(*agent, *newest))
+            {
+                found = vec![found.swap_remove(at)];
+            }
+        }
+    }
+    let spans_daemons = found
+        .iter()
+        .any(|(deck, _)| deck.map(|deck| &deck.id) != found[0].0.map(|deck| &deck.id));
+    match found.as_slice() {
+        [] => Err(Unmet::NoMatch),
+        [(_, one)] => Ok(ResolvedParam {
+            name: spec.name.clone(),
+            kind: spec.kind,
+            spoken: spoken.to_string(),
+            value: one.value.clone(),
+            label: one.label.clone(),
+            deck_identity: None,
+            deck_id: one.deck_id.clone(),
+            names: Vec::new(),
+        }),
+        _ => Err(Unmet::Ambiguous(
+            found
+                .into_iter()
+                .map(|(deck, candidate)| match deck {
+                    Some(deck) if spans_daemons => Candidate {
+                        label: format!("{} on {}", candidate.label, deck.label),
+                        ..candidate
+                    },
+                    _ => candidate,
+                })
+                .collect(),
+        )),
+    }
 }
 
 /// The introductions `dictate_to_agent`'s description names besides the
@@ -5975,6 +6275,45 @@ pub(super) fn agent_type_names(choice: &VoiceChoice) -> Vec<String> {
     names
 }
 
+/// PRD #2374 — the agent dashboard's two views: the id the webview's
+/// `overviewMode` holds, the label a report names it by ("Showing the
+/// cards."), and the names a user calls each by.
+const OVERVIEW_MODES: [(&str, &str, &[&str]); 2] = [
+    (
+        "table",
+        "the table",
+        &["table", "list", "rows", "table view", "list view"],
+    ),
+    (
+        "cards",
+        "the cards",
+        &["cards", "card", "card view", "cards view", "grid"],
+    ),
+];
+
+/// PRD #2374 — the cards' Needs you filter: `on` shows only the cards that
+/// need the user, `off` every card. The names are what the user says about
+/// the state, not the filter's own name ("needs you"), which both share.
+const NEEDS_YOU_FILTER: [(&str, &str, &[&str]); 2] = [
+    (
+        "on",
+        "only the cards that need you",
+        &[
+            "on",
+            "only",
+            "just",
+            "need me",
+            "needs me",
+            "need my attention",
+        ],
+    ),
+    (
+        "off",
+        "every card",
+        &["off", "all", "every", "everything", "clear", "remove"],
+    ),
+];
+
 /// The agent dashboard filter's kinds (issue #1496): the id the frontend's
 /// `DashboardFilter.kinds` holds, the label its filter line shows, and the
 /// names a user calls each by. A mode is its mode tab's name, so
@@ -6103,6 +6442,8 @@ fn facet_heard(kind: ParamKind, value: &str, transcript: &str, decks: &[VoiceDec
     };
     let names: Vec<String> = match kind {
         ParamKind::AgentKind => of_set(&DASHBOARD_KINDS),
+        ParamKind::OverviewMode => of_set(&OVERVIEW_MODES),
+        ParamKind::NeedsYouFilter => of_set(&NEEDS_YOU_FILTER),
         // Issue #1757: a status is heard in the transcript's STATE words, where
         // "waiting for input" is the one word for Needs input
         // ([`state_word_sequence`]). Read word by word, its first word would
@@ -6771,6 +7112,7 @@ fn word_subset(reference_words: &BTreeSet<String>, name: &str) -> bool {
 mod tests {
     use super::*;
 
+    use crate::voice::schema::DECK_HIDDEN_HINT;
     /// The labels of an ambiguous resolver answer, or `None` for any other —
     /// what the assertions written before PRD #1261 carried candidates as.
     trait AmbiguousLabels {
@@ -7266,6 +7608,7 @@ mod tests {
             local: false,
             unavailable: Some(crate::voice::DECK_IS_EVERY_DAEMON.to_string()),
             holds_agents: false,
+            agents: Default::default(),
         });
         let filter = |said: &'static str, answer: IntentAnswer| {
             let decks = decks.clone();
@@ -8111,6 +8454,7 @@ mod tests {
             local,
             unavailable: None,
             holds_agents: local,
+            agents: Default::default(),
         }
     }
 
@@ -8381,6 +8725,7 @@ mod tests {
             local: false,
             unavailable: Some(crate::voice::DECK_IS_EVERY_DAEMON.to_string()),
             holds_agents: false,
+            agents: Default::default(),
         });
         assert!(matches!(
             resolve_deck_ref("all demons", &decks),
@@ -8542,6 +8887,7 @@ mod tests {
                     value: "deck-local".to_string(),
                     label: "Local deck".to_string(),
                     deck_identity: None,
+                    deck_id: None,
                     names: Vec::new(),
                 }],
                 // Named, because the user did not name it: a wrong guess is
@@ -8593,6 +8939,7 @@ mod tests {
                 value: "deck-build".to_string(),
                 label: "deploy@build-box.example.com:2222".to_string(),
                 deck_identity: None,
+                deck_id: None,
                 names: Vec::new(),
             }]
         );
@@ -9054,6 +9401,7 @@ mod tests {
                     value: "/home/dev/code/billing-api".to_string(),
                     label: "billing-api".to_string(),
                     deck_identity: None,
+                    deck_id: None,
                     names: Vec::new(),
                 }],
                 sentence: "Opening billing-api.".to_string(),
@@ -9078,6 +9426,7 @@ mod tests {
                 value: text.to_string(),
                 label: text.to_string(),
                 deck_identity: None,
+                deck_id: None,
                 names: Vec::new(),
             }],
             sentence: format!("Filtering by \u{201c}{text}\u{201d}."),
@@ -9780,6 +10129,7 @@ mod tests {
                         value: "a-1".to_string(),
                         label: "dot-agent-deck-orchestrator-1".to_string(),
                         deck_identity: None,
+                        deck_id: None,
                         names: Vec::new(),
                     }],
                     sentence: "Confirm closing dot-agent-deck-orchestrator-1 \u{2014} nothing has \
@@ -10264,6 +10614,7 @@ mod tests {
             local: false,
             unavailable: Some(crate::voice::DECK_IS_EVERY_DAEMON.to_string()),
             holds_agents: false,
+            agents: Default::default(),
         });
         for (said, supplied) in [
             ("show host for all daemons", "all daemons"),
@@ -11127,6 +11478,7 @@ mod tests {
                     value: "dispatcher".to_string(),
                     label: "dispatcher".to_string(),
                     deck_identity: None,
+                    deck_id: None,
                     names: Vec::new(),
                 }],
                 sentence: "Mode: dispatcher.".to_string(),
@@ -12531,6 +12883,7 @@ mod tests {
         // unless it is said as the qualifier.
         let staging = [VoiceDeck {
             holds_agents: true,
+            agents: Default::default(),
             ..deck("deck-staging", "ops@staging", false)
         }];
         let runs = vec![
@@ -12689,6 +13042,7 @@ mod tests {
         // run here shares its name: "open the Codex agent on staging".
         let staging_here = [VoiceDeck {
             holds_agents: true,
+            agents: Default::default(),
             ..deck("deck-staging", "ops@staging", false)
         }];
         let mut coder = agent("20", Some("Kappa"), "codex");
@@ -13502,6 +13856,7 @@ mod tests {
             value: name.to_string(),
             label: label.to_string(),
             deck_identity: None,
+            deck_id: None,
             names: Vec::new(),
         };
 
@@ -13571,6 +13926,7 @@ mod tests {
             value: "1".to_string(),
             label: "tester".to_string(),
             deck_identity: None,
+            deck_id: None,
             names: Vec::new(),
         };
         assert_eq!(report(&row, &[param]), "Opening tester.");
@@ -13649,6 +14005,7 @@ mod tests {
             value: "1".to_string(),
             label: "tester".to_string(),
             deck_identity: None,
+            deck_id: None,
             names: Vec::new(),
         };
         let variants = vec![
@@ -13742,6 +14099,7 @@ mod tests {
                 value: "1".to_string(),
                 label: "tester".to_string(),
                 deck_identity: None,
+                deck_id: None,
                 names: Vec::new(),
             }],
             sentence: "Opening tester.".to_string(),
@@ -14495,6 +14853,101 @@ mod tests {
                 answer.outcome
             );
         }
+    }
+
+    /// Scenario: In one agent's pane, ask to generate or update config with another live agent. Both phrases give guidance for the viewed agent rather than confirming for another agent; the same named requests work from the dashboard.
+    #[tokio::test]
+    async fn voice_outcome_config_gen_003_named_pane_requests_give_stop_style_guidance() {
+        for said in [
+            "generate config with the tester",
+            "update config with the tester",
+        ] {
+            let resolver = StubResolver::new().answering(
+                said,
+                IntentAnswer::new("generate_config").with_param("agent", "tester"),
+            );
+            let overview = run(&resolver, Screen::Overview, &fleet(), said).await;
+            assert!(
+                matches!(&overview, VoiceOutcome::Dispatch { action, invoke, params, .. }
+                if action == "generate_config" && invoke == "confirmGenerateConfig"
+                && params.iter().any(|param| param.name == "agent" && param.value == "1")),
+                "the present named agent must remain targetable on the dashboard: {overview:?}"
+            );
+            let outcome = run(&resolver, Screen::Agent, &fleet(), said).await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::Unavailable { action, hint, sentence, .. }
+                if action == "generate_config"
+                && hint == "To generate config for this agent, say 'generate config' or press Generate config."
+                && sentence == hint),
+                "named pane requests must mirror stop_agent's guidance, got {outcome:?}"
+            );
+        }
+    }
+
+    /// Scenario: With Send on-screen names off, say generate config or update config in the open agent pane. Both phrases open the current pane's confirmation locally with no named parameters; dashboard requests still need an agent and explicitly named pane requests are refused.
+    #[tokio::test]
+    async fn voice_outcome_config_gen_003_private_names_allow_only_the_viewed_agent() {
+        for said in [
+            "generate config",
+            "update config",
+            "update config with this agent",
+        ] {
+            // The viewed-agent shortcuts must work even if a backend cannot
+            // classify the phrase: exercise the visible confirmation outcome.
+            let resolver = CountingResolver::default();
+            let answer = handle_utterance_with(
+                &resolver,
+                table(),
+                Screen::Agent,
+                &fleet(),
+                &decks(),
+                None,
+                None,
+                Transcript::new(said),
+                LabelSharing::Withheld,
+                true,
+            )
+            .await;
+            assert!(
+                matches!(&answer.outcome, VoiceOutcome::Dispatch { action, invoke, params, .. }
+                if action == "generate_config" && invoke == "confirmGenerateConfig" && params.is_empty()),
+                "a private bare pane request must open its own confirmation: {:?}",
+                answer.outcome
+            );
+        }
+
+        let said = "generate config";
+        let resolver = StubResolver::new().answering(said, IntentAnswer::new("generate_config"));
+        let dashboard = run(&resolver, Screen::Overview, &fleet(), said).await;
+        assert!(
+            matches!(&dashboard, VoiceOutcome::ParamMissing { action, param, .. }
+                if action == "generate_config" && param == "agent"),
+            "the dashboard must still ask which agent: {dashboard:?}"
+        );
+
+        let said = "generate config with the tester";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("generate_config").with_param("agent", "tester"),
+        );
+        let named = handle_utterance_with(
+            &resolver,
+            table(),
+            Screen::Agent,
+            &fleet(),
+            &decks(),
+            None,
+            None,
+            Transcript::new(said),
+            LabelSharing::Withheld,
+            true,
+        )
+        .await;
+        assert!(
+            !matches!(&named.outcome, VoiceOutcome::Dispatch { action, .. } if action == "generate_config"),
+            "privacy must not turn a named request into a request for the viewed agent: {:?}",
+            named.outcome
+        );
     }
 
     /// Scenario: on the Daemons screen and the dashboard, an interrupt, clear
@@ -16643,6 +17096,7 @@ mod tests {
                 value: "deck-build".to_string(),
                 label: "deploy@build-box".to_string(),
                 deck_identity: None,
+                deck_id: None,
                 names: Vec::new(),
             }],
             then_submit: false,
@@ -16939,6 +17393,7 @@ mod tests {
                 local: false,
                 unavailable: None,
                 holds_agents: false,
+                agents: Default::default(),
             });
         }
         for declared in [VoiceNewAgent { form: None }, new_agent_form()] {
@@ -17992,7 +18447,7 @@ mod tests {
     /// included — whose control has a voice row, with that row. `docs/develop/voice-first-design.md`
     /// section 5 has the rule; the labels left out on purpose are listed there
     /// with their reasons.
-    const CONTROL_LABELS: [ControlLabel; 35] = [
+    const CONTROL_LABELS: [ControlLabel; 39] = [
         // PRD #2174 — the star reminder's three buttons, each its own row.
         // Shown at startup over the dashboard, never over the New agent form.
         ControlLabel {
@@ -18257,6 +18712,37 @@ mod tests {
             row: "close",
             over_the_form: false,
         },
+        // PRD #2119 — Generate config on a dashboard row ("Generate config
+        // with <name> agent") and in the open pane ("Generate config").
+        ControlLabel {
+            source: "aria-label={`Generate config with ${name} agent`}",
+            file: AGENT_OVERVIEW_TSX,
+            said: "Generate config with tester agent",
+            row: "generate_config",
+            over_the_form: false,
+        },
+        ControlLabel {
+            source: "<FileCog size={14} aria-hidden=\"true\" /> Generate config</button>",
+            file: AGENT_TILE_TSX,
+            said: "Generate config",
+            row: "generate_config",
+            over_the_form: false,
+        },
+        // The same two controls when the project already has a config.
+        ControlLabel {
+            source: "aria-label={`Update config with ${name} agent`}",
+            file: AGENT_OVERVIEW_TSX,
+            said: "Update config with tester agent",
+            row: "generate_config",
+            over_the_form: false,
+        },
+        ControlLabel {
+            source: "<FileCog size={14} aria-hidden=\"true\" /> Update config</button>",
+            file: AGENT_TILE_TSX,
+            said: "Update config",
+            row: "generate_config",
+            over_the_form: false,
+        },
     ];
 
     /// The label rule as a property: each control's label is still in its
@@ -18496,6 +18982,9 @@ mod tests {
             ("dismiss_antigravity_notice", "don't show again"),
             // Issue #2330 — a review the deck asked for: its Approve and Deny.
             ("approve_project_commands", "approve"),
+            // PRD #2119 — the Generate config button's words.
+            ("generate_config", "generate config"),
+            ("generate_config", "update config"),
             ("close", "deny it"),
             ("close", "decline"),
         ] {
@@ -20291,6 +20780,230 @@ mod tests {
                     if action == row && sentence.contains("needs to be said on its own")),
                 "{said}: {outcome:?}"
             );
+        }
+    }
+
+    // -- agents on every daemon in reach (PRD #2374, PR #2378 review) -------
+
+    /// The local deck holding `here`, and a build box with `there` of its own.
+    fn two_daemons(there: Vec<DesktopAgent>) -> Vec<VoiceDeck> {
+        let mut build = deck("deck-build", "build box", false);
+        build.agents = crate::voice::DeckAgents(there);
+        vec![deck("deck-local", "Local deck", true), build]
+    }
+
+    async fn run_on(
+        said: &str,
+        answer: IntentAnswer,
+        here: &[DesktopAgent],
+        decks: &[VoiceDeck],
+    ) -> VoiceOutcome {
+        let resolver = StubResolver::new().answering(said, answer);
+        handle_utterance(
+            &resolver,
+            table(),
+            Screen::Overview,
+            here,
+            decks,
+            None,
+            None,
+            Transcript::new(said),
+        )
+        .await
+        .outcome
+    }
+
+    /// Scenario: under All daemons, ask to open an agent that is only on the
+    /// build box. Voice reaches it there and the dispatch names that daemon,
+    /// although an agent with the same id is on this machine.
+    #[tokio::test]
+    async fn voice_outcome_reaches_an_agent_on_another_daemon() {
+        let here = [crate::voice::fixtures::agent(
+            "1",
+            Some("Planner"),
+            "claude_code",
+        )];
+        let decks = two_daemons(vec![crate::voice::fixtures::agent(
+            "1",
+            Some("Coder"),
+            "claude_code",
+        )]);
+        let said = "open the coder";
+        let outcome = run_on(
+            said,
+            IntentAnswer::new("open_agent").with_param("agent", "coder"),
+            &here,
+            &decks,
+        )
+        .await;
+        let VoiceOutcome::Dispatch { params, .. } = &outcome else {
+            panic!("expected the build box's coder to open, got {outcome:?}");
+        };
+        assert_eq!(params[0].value, "1");
+        assert_eq!(params[0].label, "Coder");
+        assert_eq!(params[0].deck_id.as_deref(), Some("deck-build"));
+    }
+
+    /// Scenario: an agent called Coder runs on this machine and on the build
+    /// box. "Open the coder" asks which, naming each with its daemon; "open the
+    /// coder on build box" opens the build box's, and "the coder on the local
+    /// deck" this machine's.
+    #[tokio::test]
+    async fn voice_outcome_asks_which_daemon_when_the_name_is_on_two() {
+        let coder = |id: &str| crate::voice::fixtures::agent(id, Some("Coder"), "claude_code");
+        let here = [coder("1")];
+        let decks = two_daemons(vec![coder("4")]);
+        let said = "open the coder";
+        let outcome = run_on(
+            said,
+            IntentAnswer::new("open_agent").with_param("agent", "coder"),
+            &here,
+            &decks,
+        )
+        .await;
+        let VoiceOutcome::ParamAmbiguous { candidates, .. } = &outcome else {
+            panic!("expected a choice between the two coders, got {outcome:?}");
+        };
+        let offered: Vec<(&str, &str, Option<&str>)> = candidates
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate.value.as_str(),
+                    candidate.label.as_str(),
+                    candidate.deck_id.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            offered,
+            [
+                ("1", "Coder on Local deck", Some("deck-local")),
+                ("4", "Coder on build box", Some("deck-build")),
+            ]
+        );
+
+        for (said, id, deck) in [
+            ("open the coder on build box", "4", "deck-build"),
+            ("open the coder on the local deck", "1", "deck-local"),
+        ] {
+            let outcome = run_on(
+                said,
+                IntentAnswer::new("open_agent").with_param("agent", "coder"),
+                &here,
+                &decks,
+            )
+            .await;
+            let VoiceOutcome::Dispatch { params, .. } = &outcome else {
+                panic!("{said}: expected one coder, got {outcome:?}");
+            };
+            assert_eq!(params[0].value, id, "{said}");
+            assert_eq!(params[0].deck_id.as_deref(), Some(deck), "{said}");
+        }
+    }
+
+    /// Scenario: the choice between two coders on two daemons is answered by
+    /// its number and by the daemon's name, and each answer selects the coder
+    /// on that daemon; once the build box's coder is gone, choosing it is
+    /// refused rather than reaching this machine's agent with the same id.
+    #[tokio::test]
+    async fn voice_outcome_a_choice_across_daemons_selects_by_daemon() {
+        let coder = |id: &str| crate::voice::fixtures::agent(id, Some("Coder"), "claude_code");
+        let here = [coder("1")];
+        let decks = two_daemons(vec![coder("1")]);
+        let outcome = run_on(
+            "open the coder",
+            IntentAnswer::new("open_agent").with_param("agent", "coder"),
+            &here,
+            &decks,
+        )
+        .await;
+        let VoiceOutcome::ParamAmbiguous { candidates, .. } = &outcome else {
+            panic!("expected a choice, got {outcome:?}");
+        };
+        let live = crate::voice::choice::ChoiceLive {
+            agents: &here,
+            decks: &decks,
+            directories: None,
+            new_agent: None,
+        };
+        for (said, deck) in [
+            ("the second one", "deck-build"),
+            ("coder on build box", "deck-build"),
+            ("the first", "deck-local"),
+        ] {
+            match crate::voice::choice::answer(said, candidates, &live) {
+                crate::voice::ChoiceAnswer::Selected(param) => {
+                    assert_eq!(param.deck_id.as_deref(), Some(deck), "{said}")
+                }
+                other => panic!("{said}: expected a selection, got {other:?}"),
+            }
+        }
+        let gone = two_daemons(vec![coder("2")]);
+        let live = crate::voice::choice::ChoiceLive {
+            agents: &here,
+            decks: &gone,
+            directories: None,
+            new_agent: None,
+        };
+        assert_eq!(
+            crate::voice::choice::answer("the second one", candidates, &live),
+            crate::voice::ChoiceAnswer::Refused
+        );
+        // Nor when the build box has no agents left (Qodo on PR #2378): its
+        // candidate is checked against the build box's agents, and this
+        // machine's agent with the same id does not stand in for it.
+        let emptied = two_daemons(Vec::new());
+        let live = crate::voice::choice::ChoiceLive {
+            agents: &here,
+            decks: &emptied,
+            directories: None,
+            new_agent: None,
+        };
+        assert_eq!(
+            crate::voice::choice::answer("the second one", candidates, &live),
+            crate::voice::ChoiceAnswer::Refused
+        );
+    }
+
+    /// Scenario: under All daemons, "open the newest agent" with a Planner on
+    /// this machine and a Coder that started later on the build box opens the
+    /// Coder, the newest of them all, rather than asking which daemon's newest
+    /// (Qodo on PR #2378); "the oldest agent" opens the Planner.
+    #[tokio::test]
+    async fn voice_outcome_the_newest_agent_is_the_newest_across_daemons() {
+        let started = |id: &str, name: &str, at: i64| {
+            let mut agent = crate::voice::fixtures::agent(id, Some(name), "claude_code");
+            agent.spawned_at_ms = Some(at);
+            agent
+        };
+        let here = [started("1", "Planner", 1_000)];
+        let decks = two_daemons(vec![started("1", "Coder", 2_000)]);
+        for (said, spoken, label, deck) in [
+            (
+                "open the newest agent",
+                "newest agent",
+                "Coder",
+                "deck-build",
+            ),
+            (
+                "open the oldest agent",
+                "oldest agent",
+                "Planner",
+                "deck-local",
+            ),
+        ] {
+            let outcome = run_on(
+                said,
+                IntentAnswer::new("open_agent").with_param("agent", spoken),
+                &here,
+                &decks,
+            )
+            .await;
+            let VoiceOutcome::Dispatch { params, .. } = &outcome else {
+                panic!("{said}: expected one agent, got {outcome:?}");
+            };
+            assert_eq!(params[0].label, label, "{said}");
+            assert_eq!(params[0].deck_id.as_deref(), Some(deck), "{said}");
         }
     }
 }

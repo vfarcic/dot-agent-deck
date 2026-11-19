@@ -2088,6 +2088,17 @@ struct UiState {
     /// Whether this frame draws [`Self::deck_attention`] in the tab strip,
     /// set by `render_frame` before the card grid reads it.
     deck_attention_in_tab_bar: bool,
+    /// Issue #2387: the cards [`Self::deck_attention`] names, as
+    /// `(session id, name)` in its order; empty while it counts them instead.
+    deck_attention_held: Vec<(String, String)>,
+    /// Issue #2387: where this frame drew each name of
+    /// [`Self::deck_attention_held`], so a click on one reveals its card
+    /// ([`Action::RevealCard`]). Cleared every frame before the item is drawn.
+    deck_attention_hits: Vec<(String, Rect)>,
+    /// Issue #2387: the card a click on a held name asked for, selected on the
+    /// next frame, once the card list is the tab it is on
+    /// ([`apply_pending_reveal`]).
+    pending_reveal: Option<String>,
     /// PRD #1666 part 2 (G-fix6): what the dashboard's names for a pane were
     /// before its last rename — the card's session id and its
     /// `display_names` / `pane_display_names` entries — so a rename the deck
@@ -2288,13 +2299,21 @@ struct UiState {
     /// with the desktop app ([`config::antigravity_notice_path`]). It holds
     /// what could not be saved, and says the first problem once.
     antigravity_notice: config::AntigravityNoticeSession,
-    /// Config generation state — tracks directories where user chose "Never".
-    config_gen_state: config::ConfigGenState,
-    /// Pane ID + cwd for the pending config-gen modal prompt. PRD #1666 part 2
+    /// The pane of the pending config-gen modal prompt. PRD #1666 part 2
     /// (G-fix6): the pane id with the daemon process its card was learned
-    /// from, so the request is posted there or nowhere.
-    config_gen_target: Option<(crate::pane::BoundPane, String)>,
-    /// Selected option index in the config-gen modal (0=Yes, 1=No, 2=Never).
+    /// from, so the request is posted there or nowhere. PRD #2119: no
+    /// directory — the daemon composes the request for the pane's own.
+    config_gen_target: Option<crate::pane::BoundPane>,
+    /// The registry id of the agent the card showed when the config-gen
+    /// prompt opened. The request names it, so an agent that replaced it
+    /// before the user confirmed receives nothing (PRD #2119 review).
+    config_gen_agent: Option<String>,
+    /// PRD #2119: what the daemon reported, when the config-gen prompt
+    /// opened, about the card's project's `.dot-agent-deck.toml`: `Some(true)`
+    /// reads Update, `Some(false)` Generate, and `None` (the daemon could not
+    /// tell) the neutral question that claims neither.
+    config_gen_exists: Option<bool>,
+    /// Selected option index in the config-gen modal (0=Yes, 1=No).
     config_gen_selected: usize,
     /// Selected option in quit confirm modal (0=Detach, 1=Stop, 2=Cancel).
     /// PRD #92 F1 widened this from 2 to 3 options; Detach remains the
@@ -2722,6 +2741,9 @@ impl UiState {
             deck_attention: None,
             deck_attention_short: None,
             deck_attention_in_tab_bar: false,
+            deck_attention_held: Vec::new(),
+            deck_attention_hits: Vec::new(),
+            pending_reveal: None,
             renamed_from: HashMap::new(),
             pane_declared_agent: HashMap::new(),
             pane_metadata: HashMap::new(),
@@ -2754,8 +2776,9 @@ impl UiState {
             antigravity_notice: config::AntigravityNoticeSession::new(
                 config::antigravity_notice_path(),
             ),
-            config_gen_state: config::ConfigGenState::load(),
             config_gen_target: None,
+            config_gen_agent: None,
+            config_gen_exists: None,
             config_gen_selected: 0,
             quit_confirm_selected: 0,
             close_confirm: CloseConfirmState::default(),
@@ -5660,6 +5683,10 @@ pub enum Action {
     /// same card a j/k linear-cycle would land on), mirroring the selection
     /// into the embedded focus the way `dispatch_normal_mode_key` does.
     SelectCard(usize),
+    /// Issue #2387: click a held agent's name in the deck-wide attention item
+    /// → switch to the tab its card is on and select that card, the session
+    /// with this id.
+    RevealCard(String),
     /// PRD #80 M4: enter filter mode (the `/` key and the `[Filter /]` button
     /// share this path).
     EnterFilter,
@@ -5680,9 +5707,6 @@ pub enum Action {
     /// PRD #80 M5: config-gen `[No]` — dismiss the prompt for now (clears the
     /// target, returns to Normal).
     ConfigGenDismiss,
-    /// PRD #80 M5: config-gen `[Never]` — suppress the prompt for this
-    /// directory and return to Normal.
-    ConfigGenSuppress,
     /// PRD #80 M5: star-prompt `[Star]` — open the repo URL and stop asking
     /// (== `s`).
     StarConfirm,
@@ -5749,9 +5773,9 @@ pub enum Action {
     /// variant (it owns a `ModeConfig`/`OrchestrationConfig`), so storing it
     /// inline would bloat every `Action` value (`clippy::large_enum_variant`).
     SpawnPane(Box<NewPaneRequest>),
+    /// PRD #2119: ask the daemon to send the configuration request to `pane`.
     SendConfigGenPrompt {
         pane: crate::pane::BoundPane,
-        cwd: String,
     },
     RequestConfigGen,
     /// PRD #92 F2 (PRD #18 follow-through): the user pressed `y` or `n` on a
@@ -8358,42 +8382,31 @@ fn handle_config_gen_prompt_key(key: KeyEvent, ui: &mut UiState) -> Action {
             Action::Continue
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            if ui.config_gen_selected < 2 {
+            if ui.config_gen_selected < 1 {
                 ui.config_gen_selected += 1;
             }
             Action::Continue
         }
         KeyCode::Enter => match ui.config_gen_selected {
             0 => {
-                // Yes — send prompt and focus pane.
+                // Yes — ask the daemon to send the request, and focus the pane.
                 ui.mode = UiMode::Normal;
-                if let Some((pane, cwd)) = ui.config_gen_target.take() {
-                    return Action::SendConfigGenPrompt { pane, cwd };
+                if let Some(pane) = ui.config_gen_target.take() {
+                    return Action::SendConfigGenPrompt { pane };
                 }
-                Action::Continue
-            }
-            1 => {
-                // No — dismiss for now, hint stays on card.
-                ui.config_gen_target = None;
-                ui.mode = UiMode::Normal;
                 Action::Continue
             }
             _ => {
-                // Never — suppress hint permanently for this directory.
-                if let Some((_, ref cwd)) = ui.config_gen_target {
-                    ui.config_gen_state.suppress_dir(cwd);
-                }
+                // No — dismiss; the user can ask again at any time.
                 ui.config_gen_target = None;
+                ui.config_gen_agent = None;
                 ui.mode = UiMode::Normal;
-                ui.status_message = Some((
-                    "Config prompt suppressed for this directory.".to_string(),
-                    std::time::Instant::now(),
-                ));
                 Action::Continue
             }
         },
         KeyCode::Esc => {
             ui.config_gen_target = None;
+            ui.config_gen_agent = None;
             ui.mode = UiMode::Normal;
             Action::Continue
         }
@@ -8898,6 +8911,87 @@ fn focus_deck(
         }
     }
     true
+}
+
+/// Issue #2387: show the card of `session_id`, a held agent the deck-wide
+/// attention item names: the orchestration tab it is a role of, or the
+/// Dashboard. The target tab's remembered card is written first, so the
+/// switch re-focuses it the way returning to a tab does
+/// ([`switch_tab_with_focus`]); the card itself is selected on the next
+/// frame, once the card list is that tab's ([`apply_pending_reveal`]).
+fn reveal_card(
+    session_id: &str,
+    ui: &mut UiState,
+    tab_manager: &mut TabManager,
+    pane: &dyn PaneController,
+    snapshot: &AppState,
+) {
+    let Some(session) = snapshot.sessions.get(session_id) else {
+        return;
+    };
+    let pane_id = session.pane_id.as_deref();
+    let target = pane_id
+        .and_then(|pid| tab_manager.tab_index_for_pane(pid))
+        .or_else(|| {
+            tab_manager
+                .tabs()
+                .iter()
+                .position(|tab| matches!(tab, Tab::Dashboard { .. }))
+        });
+    let Some(target) = target else {
+        return;
+    };
+    match tab_manager.tabs_mut().get_mut(target) {
+        Some(Tab::Dashboard {
+            selected_session_id,
+            ..
+        }) => *selected_session_id = Some(session_id.to_string()),
+        Some(Tab::Orchestration { .. }) => {
+            if let Some(pid) = pane_id {
+                tab_manager.record_focus_on_tab(target, pid);
+            }
+        }
+        None => return,
+    }
+    if target != tab_manager.active_index() {
+        switch_tab_with_focus(tab_manager, target, pane, snapshot, ui);
+    }
+    ui.pending_reveal = Some(session_id.to_string());
+}
+
+/// Issue #2387: select [`reveal_card`]'s card in this frame's card list,
+/// exactly as a click on the card selects it ([`Action::SelectCard`]), so the
+/// highlight, the focused pane and what Enter opens are that card. A filter
+/// that hides it is cleared, and the card is selected on the frame after.
+fn apply_pending_reveal(
+    ui: &mut UiState,
+    tab_manager: &mut TabManager,
+    pane: &dyn PaneController,
+    filtered: &[(&String, &SessionState)],
+    session_id: &str,
+) {
+    match filtered
+        .iter()
+        .position(|(id, _)| id.as_str() == session_id)
+    {
+        Some(idx) => {
+            let prev = ui.selected_index;
+            ui.selected_index = Some(idx);
+            if let Tab::Dashboard {
+                selected_session_id,
+                ..
+            } = tab_manager.active_tab_mut()
+            {
+                *selected_session_id = Some(session_id.to_string());
+            }
+            mirror_selection_into_focus(prev, ui, filtered, pane);
+        }
+        None if !ui.filter_text.is_empty() => {
+            ui.filter_text.clear();
+            ui.pending_reveal = Some(session_id.to_string());
+        }
+        None => {}
+    }
 }
 
 /// PRD #68: mirror a selection move made by `handle_normal_key`
@@ -11533,32 +11627,36 @@ fn perform_stop_and_quit(ui: &mut UiState, pane: &dyn PaneController) -> Flow {
     }
 }
 
-/// PRD #80 M5: send the config-gen prompt to `pane_id`, focus it for execution,
-/// and surface the outcome. Shared by the `Action::SendConfigGenPrompt` arm
-/// (Enter-on-Yes via the key handler) and `Action::ConfigGenConfirm` (the
-/// `[Yes]` button).
+/// PRD #80 M5: ask the daemon to send the config-gen request to `card`'s pane,
+/// focus it for execution, and surface the outcome. Shared by the
+/// `Action::SendConfigGenPrompt` arm (Enter-on-Yes via the key handler) and
+/// `Action::ConfigGenConfirm` (the `[Yes]` button).
+///
+/// PRD #2119: the daemon composes the request for the pane's own directory
+/// ([`PaneController::generate_config`]); this client sends no prompt. A
+/// daemon too old to generate one is told apart and named
+/// ([`crate::config_gen::CONFIG_GEN_UPGRADE_MESSAGE`]), and nothing else is
+/// sent in its place — no request composed here, no generic inbox post.
+///
+/// `agent` is the card's agent when the prompt opened: the request names it,
+/// so a different agent in the pane by the time the user confirmed is sent
+/// nothing.
 fn send_config_gen_prompt(
     card: &crate::pane::BoundPane,
-    cwd: &str,
+    agent: Option<&str>,
     ui: &mut UiState,
     pane: &dyn PaneController,
     tab_manager: &mut TabManager,
 ) {
     let pane_id = card.pane_id.as_str();
-    let prompt = crate::config_gen::config_gen_prompt(cwd);
     // PRD #1666 S5: the request is a message in the agent's inbox, not text
     // typed into its pane; the agent takes it the way it takes any other.
-    // PRD #1666 part 2 (G-fix6): posted on the daemon process the selected
-    // card was learned from, so a detached or never-attached card posts nothing
-    // to a restarted daemon's agent under the same pane id.
-    match pane.post_message(
-        card,
-        "configuration request",
-        &prompt,
-        crate::inbox_hub::PostOrigin::ConfigGen,
-    ) {
-        Ok(_) => {
-            // Focus the pane so the user can watch the agent take it.
+    // PRD #1666 part 2 (G-fix6): asked of the daemon process the selected card
+    // was learned from, so a detached or never-attached card sends nothing to
+    // a restarted daemon's agent under the same pane id.
+    let message = match pane.generate_config(card, agent) {
+        Ok(crate::daemon_client::GatedQuery::Answered(_)) => {
+            // Open and focus the pane so the user can watch the agent take it.
             if let Some(tab_idx) = tab_manager.tab_index_for_pane(pane_id) {
                 // PRD #83: snapshot the SOURCE tab's focus before leaving it,
                 // mirroring `switch_tab_with_focus` (capture-out → switch_to →
@@ -11573,20 +11671,38 @@ fn send_config_gen_prompt(
                 // PRD #84 M4: the destination tab's panes are sized by the
                 // pre-draw `resize_panes_to_layout` on the next frame.
             }
-            let _ = pane.focus_pane(pane_id);
-            ui.mode = UiMode::PaneInput;
-            ui.status_message = Some((
-                "Config request sent to the agent's inbox.".to_string(),
-                std::time::Instant::now(),
-            ));
+            // PRD #2119: a card whose pane is not open in this TUI — a
+            // daemon-spawned or foreign pane that never went through startup
+            // hydration — is attached first and the focus retried, exactly as
+            // `1` (`focus_deck`) and Enter (`Action::Focus`) open one, bound to
+            // the daemon process the card was learned from. PaneInput is
+            // entered only once a pane is focused: when none can be, the mode
+            // the caller left (the dashboard's) stands and the sent sentence
+            // is still shown, because the request WAS posted. Unlike those two
+            // paths, a pane that cannot be focused is never read as a stale
+            // card to delete — the daemon just accepted a request for it.
+            let mut focus = pane.focus_card(card);
+            if let Err(PaneError::CommandFailed(_)) = focus
+                && pane.try_hydrate_pane(card)
+            {
+                focus = pane.focus_card(card);
+            }
+            match focus {
+                Ok(()) => ui.mode = UiMode::PaneInput,
+                Err(error) => tracing::debug!(
+                    pane_id = %pane_id,
+                    error = %error,
+                    "config request sent, but its pane could not be opened here"
+                ),
+            }
+            crate::config_gen::CONFIG_GEN_SENT_MESSAGE.to_string()
         }
-        Err(e) => {
-            ui.status_message = Some((
-                format!("Failed to send config prompt: {e}"),
-                std::time::Instant::now(),
-            ));
+        Ok(crate::daemon_client::GatedQuery::Unsupported) => {
+            crate::config_gen::CONFIG_GEN_UPGRADE_MESSAGE.to_string()
         }
-    }
+        Err(e) => crate::config_gen::config_gen_failed_message(&e),
+    };
+    ui.status_message = Some((message, std::time::Instant::now()));
 }
 
 /// PRD #80 M6: commit a rename for the selected card — push `new_name` to the
@@ -12074,6 +12190,10 @@ fn dispatch_action(
                 mirror_selection_into_focus(prev, ui, filtered, pane);
             }
         }
+        // Issue #2387: a held agent's name in the attention item → its card.
+        Action::RevealCard(session_id) => {
+            reveal_card(&session_id, ui, tab_manager, pane, snapshot);
+        }
         // PRD #80 M4: `/` key or [Filter /] button → filter mode.
         Action::EnterFilter => {
             ui.mode = UiMode::Filter;
@@ -12238,12 +12358,16 @@ fn dispatch_action(
             }
         }
         Action::RequestConfigGen => {
+            // PRD #2119: the card's own directory is not needed here — the
+            // daemon composes the request for the directory it holds for the
+            // pane, and refuses when it knows none.
             if let Some(sid) = selected_id
                 && let Some(session) = snapshot.sessions.get(sid)
                 && let Some(card) = session.bound_pane()
-                && let Some(ref cwd) = session.cwd
             {
-                ui.config_gen_target = Some((card, cwd.clone()));
+                ui.config_gen_target = Some(card);
+                ui.config_gen_agent = session.agent_id.clone();
+                ui.config_gen_exists = snapshot.project_config_exists(session);
                 ui.config_gen_selected = 0;
                 ui.mode = UiMode::ConfigGenPrompt;
             } else {
@@ -12819,8 +12943,9 @@ fn dispatch_action(
                 } // close else (non-orchestration path)
             }
         }
-        Action::SendConfigGenPrompt { pane: card, cwd } => {
-            send_config_gen_prompt(&card, &cwd, ui, pane, tab_manager);
+        Action::SendConfigGenPrompt { pane: card } => {
+            let agent = ui.config_gen_agent.take();
+            send_config_gen_prompt(&card, agent.as_deref(), ui, pane, tab_manager);
         }
         // ===== PRD #80 M5: modal button actions =====
         // quit-confirm [Stop]: resolve like Enter-on-Stop — straight to
@@ -12850,26 +12975,16 @@ fn dispatch_action(
         // config-gen [Yes]: send the prompt to the pending target pane.
         Action::ConfigGenConfirm => {
             ui.mode = UiMode::Normal;
-            if let Some((card, cwd)) = ui.config_gen_target.take() {
-                send_config_gen_prompt(&card, &cwd, ui, pane, tab_manager);
+            let agent = ui.config_gen_agent.take();
+            if let Some(card) = ui.config_gen_target.take() {
+                send_config_gen_prompt(&card, agent.as_deref(), ui, pane, tab_manager);
             }
         }
-        // config-gen [No]: dismiss for now (hint stays on the card).
+        // config-gen [No]: dismiss; the user can ask again at any time.
         Action::ConfigGenDismiss => {
             ui.config_gen_target = None;
+            ui.config_gen_agent = None;
             ui.mode = UiMode::Normal;
-        }
-        // config-gen [Never]: suppress the prompt for this directory.
-        Action::ConfigGenSuppress => {
-            if let Some((_, ref cwd)) = ui.config_gen_target {
-                ui.config_gen_state.suppress_dir(cwd);
-            }
-            ui.config_gen_target = None;
-            ui.mode = UiMode::Normal;
-            ui.status_message = Some((
-                "Config prompt suppressed for this directory.".to_string(),
-                std::time::Instant::now(),
-            ));
         }
         // star-prompt [Star]: open the repo and stop asking (== `s`).
         Action::StarConfirm => {
@@ -13781,6 +13896,44 @@ fn rearm_trust_gate(
             false
         }
     }
+}
+
+/// Issue #1395: a compaction or `/clear` re-arm that could not read the tab's
+/// own context file re-sends the coordinator its role and protocol with no
+/// task ([`crate::orchestrator_context::reassert_orchestrator_prompt`]). Say so
+/// on the status line rather than only in the log, since a coordinator that
+/// was started with a task has just lost it from what it was told again.
+fn report_rearm_without_brief(
+    ui: &mut UiState,
+    orchestration: &str,
+    without_brief: Option<&crate::orchestrator_context::RearmWithoutBrief>,
+) {
+    use crate::orchestrator_context::RearmWithoutBrief;
+    let Some(without_brief) = without_brief else {
+        return;
+    };
+    let because = match without_brief {
+        RearmWithoutBrief::NoOwnFile => "this tab does not know its context file".to_string(),
+        RearmWithoutBrief::OwnFileUnreadable(reason) => {
+            format!("its context file could not be read: {reason}")
+        }
+    };
+    // Names an orchestration from the config and an OS error: shown, never
+    // obeyed.
+    let shown = crate::untrusted_text::escape_control_and_bidi(&rearm_without_brief_message(
+        orchestration,
+        &because,
+    ));
+    ui.status_message = Some((shown, std::time::Instant::now()));
+}
+
+/// The status-line sentence [`report_rearm_without_brief`] shows. The fact
+/// first, so a status row too narrow for the reason still carries it.
+fn rearm_without_brief_message(orchestration: &str, because: &str) -> String {
+    format!(
+        "Orchestration '{orchestration}': instructions re-sent to its coordinator without a \
+         task ({because})"
+    )
 }
 
 /// PRD #1885: restore a saved orchestration the startup restore held back,
@@ -15805,6 +15958,10 @@ pub fn run_tui(
         // longer snap the selection of another (the cross-tab leak this
         // PRD fixes). A remembered id that's no longer in the filtered
         // list is cleared and the selection falls back to the first card.
+        // Issue #2387: a held name clicked in the header asked for its card.
+        if let Some(session_id) = ui.pending_reveal.take() {
+            apply_pending_reveal(&mut ui, &mut tab_manager, &*pane, &filtered, &session_id);
+        }
         reconcile_frame_selection(&mut ui, &mut tab_manager, &*pane, &filtered);
 
         // PRD #341 M6: before laying out or drawing anything, make sure the pane
@@ -15980,8 +16137,20 @@ pub fn run_tui(
             })
             .collect();
         // PRD #1666 part 3, round 5-wake (Q6): the deck-wide attention item.
-        ui.deck_attention = deck_attention(&snapshot, tab_manager.tabs());
+        let held = held_card_names(&snapshot, tab_manager.tabs(), &ui.display_names);
+        ui.deck_attention = crate::inbox_display::deck_attention_text(
+            &held
+                .iter()
+                .map(|(_, name)| name.as_str())
+                .collect::<Vec<_>>(),
+        );
         ui.deck_attention_short = deck_attention_short(&snapshot);
+        ui.deck_attention_held = if held.len() <= crate::inbox_display::DECK_ATTENTION_MAX_NAMES {
+            held
+        } else {
+            Vec::new()
+        };
+        ui.deck_attention_hits.clear();
         let tab_bar_info = TabBarInfo {
             show: tab_manager.show_tab_bar(),
             labels: tab_bar_labels,
@@ -16174,6 +16343,11 @@ pub fn run_tui(
                         // deliberately a fresh cycle, not a retry of the old
                         // one.
 
+                        report_rearm_without_brief(
+                            &mut ui,
+                            &config.name,
+                            published.without_brief.as_ref(),
+                        );
                         *orchestrator_prompt = Some(published.prompt);
                         // Issue #1445: tell the daemon, so a TUI attaching
                         // later re-arms from this file and the end of the
@@ -16305,6 +16479,11 @@ pub fn run_tui(
                         if let Some(published) =
                             reassert_orchestrator_prompt(config, cwd, context_path.as_deref())
                         {
+                            report_rearm_without_brief(
+                                &mut ui,
+                                &config.name,
+                                published.without_brief.as_ref(),
+                            );
                             *orchestrator_prompt = Some(published.prompt);
                             // Issue #1445: as the compaction re-arm above.
                             pane.report_orchestrator_context(
@@ -16898,6 +17077,9 @@ pub fn run_tui(
                         action = hit_test_tab_close(&ui.tab_close_rects, mouse.column, mouse.row)
                             .or_else(|| {
                                 hit_test_tab_header(&ui.tab_header_rects, mouse.column, mouse.row)
+                            })
+                            .or_else(|| {
+                                hit_test_attention(&ui.deck_attention_hits, mouse.column, mouse.row)
                             });
                     }
                     action
@@ -18040,28 +18222,144 @@ fn deck_title_line(
     Line::from(spans)
 }
 
-/// PRD #1666 part 3, round 5-wake (Q6): the deck-wide attention item
-/// ([`crate::inbox_display::deck_attention_text`]): the first orchestration
-/// tab's start role whose agent the deck holds the doorbell for is named with
-/// its hold's words, and every other held recipient is counted. Start-role
-/// membership decides who is named, not the role's name.
-fn deck_attention(state: &AppState, tabs: &[Tab]) -> Option<String> {
-    let held = state.held_inbox_panes();
-    let named = tabs.iter().find_map(|tab| match tab {
-        Tab::Orchestration {
-            role_pane_ids,
-            start_role_index,
-            config,
-            ..
-        } => {
-            let words = held.get(role_pane_ids.get(*start_role_index)?.as_str())?;
-            let role = config.roles.get(*start_role_index)?;
-            Some((role.name.as_str(), words.as_str()))
-        }
-        Tab::Dashboard { .. } => None,
+/// Issue #2387: the deck-wide attention item
+/// ([`crate::inbox_display::deck_attention_text`]): it names the cards that
+/// carry the `held` marker ([`AppState::held_cards`]) — orchestration start
+/// roles first, whatever the role is called, then by name — and counts them
+/// past [`crate::inbox_display::DECK_ATTENTION_MAX_NAMES`]. Each is named as
+/// its card titles it (`display_names`, then the agent's own name). The
+/// frame builds the same text inline, keeping the names for their click
+/// targets.
+#[cfg(test)]
+fn deck_attention(
+    state: &AppState,
+    tabs: &[Tab],
+    display_names: &HashMap<String, String>,
+) -> Option<String> {
+    let held = held_card_names(state, tabs, display_names);
+    let names: Vec<&str> = held.iter().map(|(_, name)| name.as_str()).collect();
+    crate::inbox_display::deck_attention_text(&names)
+}
+
+/// [`deck_attention`]'s cards, as `(session id, name)` in its order.
+fn held_card_names(
+    state: &AppState,
+    tabs: &[Tab],
+    display_names: &HashMap<String, String>,
+) -> Vec<(String, String)> {
+    let run_names: HashMap<&str, &str> = tabs
+        .iter()
+        .flat_map(|tab| match tab {
+            Tab::Orchestration {
+                role_pane_ids,
+                name,
+                ..
+            } => role_pane_ids
+                .iter()
+                .map(|pane| (pane.as_str(), name.as_str()))
+                .collect::<Vec<_>>(),
+            Tab::Dashboard { .. } => Vec::new(),
+        })
+        .collect();
+    let start_panes: std::collections::HashSet<&str> = tabs
+        .iter()
+        .filter_map(|tab| match tab {
+            Tab::Orchestration {
+                role_pane_ids,
+                start_role_index,
+                ..
+            } => role_pane_ids.get(*start_role_index).map(String::as_str),
+            Tab::Dashboard { .. } => None,
+        })
+        .collect();
+    let mut held: Vec<(bool, String, String)> = state
+        .held_cards()
+        .into_iter()
+        .map(|(session, _)| {
+            let start = session
+                .pane_id
+                .as_deref()
+                .is_some_and(|pane| start_panes.contains(pane));
+            let own = display_names
+                .get(&session.session_id)
+                .or(session.display_name.as_ref())
+                .cloned()
+                .unwrap_or_else(|| {
+                    format!(
+                        "{} · {}",
+                        session.agent_type,
+                        crate::submitted_prompt::truncate_on_char_boundary(&session.session_id, 11)
+                    )
+                });
+            // The run's name before the agent's, as the desktop titles its
+            // tile, so two runs' `coder` read apart.
+            let name = match session
+                .pane_id
+                .as_deref()
+                .and_then(|pane| run_names.get(pane))
+            {
+                Some(run) => format!("{run} / {own}"),
+                None => own,
+            };
+            (start, session.session_id.clone(), name)
+        })
+        .collect();
+    held.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| a.2.to_lowercase().cmp(&b.2.to_lowercase()))
+            .then_with(|| a.1.cmp(&b.1))
     });
-    let others = held.len() - usize::from(named.is_some());
-    crate::inbox_display::deck_attention_text(named, others)
+    held.into_iter().map(|(_, id, name)| (id, name)).collect()
+}
+
+/// Issue #2387: after the attention item is drawn on `row`, where each of
+/// [`UiState::deck_attention_held`]'s names landed: found by the item's
+/// `✉ held: ` opening in the drawn cells, so every draw path (the tab strip,
+/// the title row, an empty deck's top row) records the same way, and a name
+/// cut at the row's end is clickable only where it shows. Nothing when the
+/// row shows the count instead.
+fn record_attention_hits(ui: &mut UiState, buf: &ratatui::buffer::Buffer, row: Rect) {
+    let prefix = format!(
+        "{} {}: ",
+        crate::inbox_display::GLYPH,
+        crate::inbox_display::ATTENTION_HELD
+    );
+    let width = |text: &str| u16::try_from(Span::raw(text).width()).unwrap_or(u16::MAX);
+    let prefix_width = width(&prefix);
+    let end = row
+        .x
+        .saturating_add(row.width)
+        .min(buf.area.x + buf.area.width);
+    if row.y < buf.area.y || row.y >= buf.area.y + buf.area.height {
+        return;
+    }
+    let Some(start) = (row.x..end).find(|&x| {
+        x.saturating_add(prefix_width) <= end
+            && (x..x + prefix_width)
+                .map(|c| buf[(c, row.y)].symbol())
+                .collect::<String>()
+                == prefix
+    }) else {
+        return;
+    };
+    let mut x = start + prefix_width;
+    for (session_id, name) in &ui.deck_attention_held {
+        if x >= end {
+            break;
+        }
+        let shown = width(name).min(end - x);
+        ui.deck_attention_hits
+            .push((session_id.clone(), Rect::new(x, row.y, shown, 1)));
+        x = x.saturating_add(width(name)).saturating_add(2);
+    }
+}
+
+/// Issue #2387: the held agent whose name in the attention item is under
+/// `(col, row)`.
+fn hit_test_attention(hits: &[(String, Rect)], col: u16, row: u16) -> Option<Action> {
+    hits.iter().find_map(|(id, rect)| {
+        point_in_rect(rect, col, row).then(|| Action::RevealCard(id.clone()))
+    })
 }
 
 /// The attention item the deck's title row carries, words and short form:
@@ -18078,9 +18376,9 @@ fn title_attention(ui: &UiState) -> Option<(&str, &str)> {
 }
 
 /// [`deck_attention`]'s short form for a narrow row: the glyph and how many
-/// recipients the deck holds the doorbell for, naming none (`✉ 2 held`).
+/// cards carry the `held` marker, naming none (`✉ 2 held`).
 fn deck_attention_short(state: &AppState) -> Option<String> {
-    crate::inbox_display::deck_attention_count(state.held_inbox_panes().len())
+    crate::inbox_display::deck_attention_count(state.held_cards().len())
 }
 
 /// The columns, after its two-column gap, below which [`deck_attention`]'s
@@ -18149,9 +18447,7 @@ fn draw_deck_attention(
 #[cfg(test)]
 mod deck_attention_tests {
     use super::*;
-    use crate::inbox_display::{
-        WAKE_HOLD_AWAITING_PROMPT, WAKE_HOLD_POSSIBLE_DRAFT, WAKE_STALLED, WakeHold,
-    };
+    use crate::inbox_display::WakeHold;
 
     fn summary(queued: usize, hold: Option<WakeHold>) -> crate::inbox_hub::InboxSummary {
         crate::inbox_hub::InboxSummary {
@@ -18220,13 +18516,33 @@ mod deck_attention_tests {
         .unwrap()
     }
 
-    /// PRD #1666 part 3, round 5-wake (`inbox/status/031`'s fast half): the
-    /// held start role is named with its hold's words, whatever its name and
-    /// wherever it sits in the team; the coder's hold and a dashboard agent's
-    /// are counted; an agent with mail and no hold is not.
+    /// A card for `agent` in `pane`, titled `name`, as an agent's first hook
+    /// creates one.
+    fn card(state: &mut AppState, pane: &str, agent: &str, name: &str) {
+        let mut session = super::tests::make_session(SessionStatus::Idle);
+        session.session_id = format!("s-{agent}");
+        session.pane_id = Some(pane.to_string());
+        session.agent_id = Some(agent.to_string());
+        session.display_name = Some(name.to_string());
+        state.sessions.insert(session.session_id.clone(), session);
+    }
+
+    fn attention(state: &AppState, tabs: &[Tab]) -> Option<String> {
+        deck_attention(state, tabs, &HashMap::new())
+    }
+
+    /// Issue #2387 (`inbox/status/031`'s fast half): the header names the
+    /// held cards, the start role first whatever its name and wherever it
+    /// sits in the team, then by name, a run's agents after the run's name
+    /// as the desktop titles them; an agent with mail and no hold is not
+    /// named.
     #[test]
-    fn deck_attention_names_the_held_start_role_and_counts_the_rest() {
+    fn deck_attention_names_the_held_cards_start_role_first() {
         let mut state = AppState::default();
+        card(&mut state, "captain-pane", "a1", "captain");
+        card(&mut state, "coder-pane", "a2", "coder");
+        card(&mut state, "other-pane", "a3", "Archivist");
+        card(&mut state, "quiet-pane", "a4", "quiet");
         state.apply_inbox_summary(
             "captain-pane",
             "a1",
@@ -18240,63 +18556,165 @@ mod deck_attention_tests {
         );
         state.apply_inbox_summary("quiet-pane", "a4", &summary(3, None));
         assert_eq!(
-            deck_attention(&state, &tabs()).as_deref(),
-            Some(format!("✉ captain: {WAKE_HOLD_POSSIBLE_DRAFT} · 2 other held").as_str())
+            attention(&state, &tabs()).as_deref(),
+            Some("✉ held: team / captain, Archivist, team / coder")
         );
-        // The start role's reason changes: the item follows it.
+        assert_eq!(deck_attention_short(&state).as_deref(), Some("✉ 3 held"));
+        // The start role's reason changes: it is still the one named first.
         state.apply_inbox_notice(&wake_update(
             "captain-pane",
             "a1",
             Some(WakeHold::AwaitingPrompt),
         ));
         assert_eq!(
-            deck_attention(&state, &tabs()).as_deref(),
-            Some(format!("✉ captain: {WAKE_HOLD_AWAITING_PROMPT} · 2 other held").as_str())
+            attention(&state, &tabs()).as_deref(),
+            Some("✉ held: team / captain, Archivist, team / coder")
         );
-        // With no tabs, nobody is a start role: everyone is counted.
-        assert_eq!(deck_attention(&state, &[]).as_deref(), Some("✉ 3 held"));
+        // With no tabs, nobody is a start role: everyone is named by name.
+        assert_eq!(
+            attention(&state, &[]).as_deref(),
+            Some("✉ held: Archivist, captain, coder")
+        );
+        // A fourth held card turns the names into a count.
+        state.apply_inbox_summary("quiet-pane", "a4", &summary(3, Some(WakeHold::CannotType)));
+        assert_eq!(attention(&state, &tabs()).as_deref(), Some("✉ 4 held"));
+    }
+
+    /// Issue #2387: the reported symptom. The header counted pane accounts
+    /// the deck holds a message for, whether or not any card on screen showed
+    /// it, so it could say `✉ 2 held` while no card said held. It now counts
+    /// the cards: an account with no card is not named, and a card that
+    /// arrives for it is.
+    #[test]
+    fn deck_attention_counts_only_cards_that_carry_the_marker() {
+        let mut state = AppState::default();
+        state.apply_inbox_summary(
+            "unseen-pane",
+            "a1",
+            &summary(1, Some(WakeHold::PossibleDraft)),
+        );
+        state.apply_inbox_summary(
+            "other-unseen",
+            "a2",
+            &summary(1, Some(WakeHold::CannotType)),
+        );
+        assert_eq!(attention(&state, &[]), None, "no card, nothing to name");
+        assert_eq!(deck_attention_short(&state), None);
+        card(&mut state, "seen-pane", "a3", "seen");
+        state.apply_inbox_summary("seen-pane", "a3", &summary(1, Some(WakeHold::CannotType)));
+        assert_eq!(attention(&state, &[]).as_deref(), Some("✉ held: seen"));
+        assert_eq!(deck_attention_short(&state).as_deref(), Some("✉ 1 held"));
     }
 
     /// The item is bound to the pane's current generation: a successor with
     /// a clean inbox is not named, and its predecessor's late update does not
-    /// mark it. A hold this build does not know reads as the stall's words.
+    /// mark it. A hold this build does not know still names the card.
     #[test]
-    fn deck_attention_follows_the_generation_and_reads_unknown_holds_as_stalled() {
+    fn deck_attention_follows_the_generation_and_names_unknown_holds() {
         let mut state = AppState::default();
+        card(&mut state, "captain-pane", "a1", "captain");
+        card(&mut state, "coder-pane", "a2", "coder");
         state.apply_inbox_summary(
             "captain-pane",
             "a1",
             &summary(1, Some(WakeHold::PossibleDraft)),
         );
         state.apply_inbox_summary("coder-pane", "a2", &summary(1, Some(WakeHold::Unknown)));
+        assert_eq!(
+            attention(&state, &tabs()).as_deref(),
+            Some("✉ held: team / captain, team / coder")
+        );
+        state.sessions.remove("s-a1");
+        card(&mut state, "captain-pane", "a9", "captain");
         state.apply_inbox_summary("captain-pane", "a9", &summary(0, None));
         state.apply_inbox_notice(&wake_update(
             "captain-pane",
             "a1",
             Some(WakeHold::PossibleDraft),
         ));
-        assert_eq!(deck_attention(&state, &tabs()).as_deref(), Some("✉ 1 held"));
+        assert_eq!(
+            attention(&state, &tabs()).as_deref(),
+            Some("✉ held: team / coder")
+        );
         state.apply_inbox_notice(&wake_update(
             "captain-pane",
             "a9",
             Some(WakeHold::UncertainInput),
         ));
         assert_eq!(
-            deck_attention(&state, &tabs()),
-            Some(format!(
-                "✉ captain: {} · 1 other held",
-                crate::inbox_display::WAKE_HOLD_UNCERTAIN_INPUT_ALONE
-            ))
+            attention(&state, &tabs()).as_deref(),
+            Some("✉ held: team / captain, team / coder")
         );
         state.apply_inbox_notice(&wake_update("captain-pane", "a9", None));
         state.apply_inbox_notice(&wake_update("coder-pane", "a2", None));
-        assert_eq!(deck_attention(&state, &tabs()), None);
-        let mut alone = AppState::default();
-        alone.apply_inbox_summary("captain-pane", "a1", &summary(1, Some(WakeHold::Unknown)));
+        assert_eq!(attention(&state, &tabs()), None);
+    }
+
+    /// Issue #2387: once the item is drawn, each held name it shows is a
+    /// click target for its card, cut where the row cuts the name; the gap
+    /// between names is not, and the count form names nobody to click.
+    #[test]
+    fn deck_attention_records_where_each_name_is_drawn() {
+        let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+        ui.deck_attention_held = vec![
+            ("s-a".to_string(), "captain".to_string()),
+            ("s-b".to_string(), "coder".to_string()),
+        ];
+        let row = Rect::new(0, 0, 26, 1);
+        let mut buf = ratatui::buffer::Buffer::empty(row);
+        draw_deck_attention(&mut buf, row, 4, "✉ held: captain, coder", "✉ 2 held");
+        record_attention_hits(&mut ui, &buf, row);
         assert_eq!(
-            deck_attention(&alone, &tabs()),
-            Some(format!("✉ captain: {WAKE_STALLED}: send it a prompt"))
+            ui.deck_attention_hits,
+            vec![
+                ("s-a".to_string(), Rect::new(14, 0, 7, 1)),
+                ("s-b".to_string(), Rect::new(23, 0, 3, 1)),
+            ]
         );
+        assert!(matches!(
+            hit_test_attention(&ui.deck_attention_hits, 15, 0),
+            Some(Action::RevealCard(id)) if id == "s-a"
+        ));
+        assert!(hit_test_attention(&ui.deck_attention_hits, 22, 0).is_none());
+        ui.deck_attention_hits.clear();
+        let row = Rect::new(0, 0, 12, 1);
+        let mut buf = ratatui::buffer::Buffer::empty(row);
+        draw_deck_attention(&mut buf, row, 3, "✉ held: captain, coder", "✉ 2 held");
+        record_attention_hits(&mut ui, &buf, row);
+        assert!(ui.deck_attention_hits.is_empty(), "the count names nobody");
+    }
+
+    /// Issue #2387: the card a click on a held name asked for is selected
+    /// once the frame's card list holds it, the way a click on the card
+    /// selects it; a filter that hides it is cleared first, and the card
+    /// selected on the frame after.
+    #[test]
+    fn a_revealed_card_is_selected_and_a_hiding_filter_cleared() {
+        let ctrl = Arc::new(EmbeddedPaneController::for_render_seam_without_panes());
+        let mut tabs = TabManager::new(ctrl.clone() as Arc<dyn PaneController>);
+        let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+        let mut state = AppState::default();
+        card(&mut state, "a-pane", "a1", "alpha");
+        card(&mut state, "b-pane", "a2", "bravo");
+        let ids: Vec<String> = vec!["s-a1".to_string(), "s-a2".to_string()];
+        let list: Vec<(&String, &SessionState)> =
+            ids.iter().map(|id| (id, &state.sessions[id])).collect();
+
+        ui.filter_text = "alpha".to_string();
+        let before = ui.selected_index;
+        apply_pending_reveal(&mut ui, &mut tabs, &*ctrl, &list[..1], "s-a2");
+        assert!(ui.filter_text.is_empty(), "the filter hid it, so it goes");
+        assert_eq!(ui.pending_reveal.as_deref(), Some("s-a2"), "asked again");
+        assert_eq!(ui.selected_index, before, "nothing selected yet");
+
+        let asked = ui.pending_reveal.take().unwrap();
+        apply_pending_reveal(&mut ui, &mut tabs, &*ctrl, &list, &asked);
+        assert_eq!(ui.selected_index, Some(1));
+        assert!(matches!(
+            tabs.active_tab(),
+            Tab::Dashboard { selected_session_id: Some(id), .. } if id == "s-a2"
+        ));
+        assert_eq!(ui.pending_reveal, None);
     }
 
     /// The item follows the tabs on the strip's row and is clipped at its end;
@@ -18308,11 +18726,11 @@ mod deck_attention_tests {
             &mut buf,
             Rect::new(0, 0, 30, 1),
             10,
-            "✉ captain: held for a reason",
-            "✉ 1 held",
+            "✉ held: captain, coder-bravo",
+            "✉ 2 held",
         );
         let row: String = (0..30).map(|x| buf[(x, 0)].symbol().to_string()).collect();
-        assert_eq!(row, "            ✉ captain: held fo");
+        assert_eq!(row, "            ✉ held: captain, c");
         let title: String = deck_title_line(1, 1, "", Some(("✉ 2 held", "✉ 2 held")), 80)
             .spans
             .iter()
@@ -18410,7 +18828,7 @@ mod deck_attention_tests {
     /// and the attention item still shows after them, not hidden off its end.
     #[test]
     fn deck_attention_keeps_its_room_when_the_tabs_crowd_the_row() {
-        let attention = format!("✉ captain: {WAKE_HOLD_POSSIBLE_DRAFT} · 1 other held");
+        let attention = "✉ held: release-orchestrator, reviewer-alpha, coder-bravo".to_string();
         let labels = [
             "Dashboard",
             "release-train-alpha1",
@@ -18418,7 +18836,7 @@ mod deck_attention_tests {
             "release-train-delta3",
         ];
         let (row, headers) = crowded_strip(&labels, &attention, 80);
-        assert!(row.contains("✉ captain: waiting"), "{row}");
+        assert!(row.contains("✉ held: release-orch"), "{row}");
         assert_eq!(
             headers.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
             vec![0, 1, 2, 3],
@@ -18440,7 +18858,7 @@ mod deck_attention_tests {
     /// Scenario: a deck holding its orchestrator is drawn at narrow widths, with four tabs and with only the Dashboard tab, whose title row then carries the item, or, with no agents on the deck, its top row. At every width the item is still on the top row: its words where they fit, otherwise its short form, `✉ 2 held`.
     #[test]
     fn deck_attention_stays_on_a_narrow_row() {
-        let attention = format!("✉ captain: {WAKE_HOLD_POSSIBLE_DRAFT} · 1 other held");
+        let attention = "✉ held: release-orchestrator, reviewer-alpha, coder-bravo".to_string();
         let labels = [
             "Dashboard",
             "release-train-alpha1",
@@ -18474,7 +18892,7 @@ mod deck_attention_tests {
         assert!(title(40).contains("agent(s)  ✉ 2 held"), "{:?}", title(40));
         // Wide enough, the words, after the title.
         assert!(
-            title(120).contains("agent(s)  ✉ captain: waiting"),
+            title(120).contains("agent(s)  ✉ held: release-orchestrator"),
             "{:?}",
             title(120)
         );
@@ -18483,7 +18901,7 @@ mod deck_attention_tests {
             |width| frame_top_row(&["Dashboard"], &attention, "✉ 2 held", width, false, 0).0;
         assert!(empty(10).starts_with(" ✉ 2 held"), "{:?}", empty(10));
         assert!(
-            empty(30).starts_with(" ✉ captain: waiting"),
+            empty(30).starts_with(" ✉ held: release-orch"),
             "{:?}",
             empty(30)
         );
@@ -18592,6 +19010,7 @@ fn render_card_grid(
     let row_chunks = Layout::vertical(constraints).split(area);
 
     frame.render_widget(title, row_chunks[0]);
+    record_attention_hits(ui, frame.buffer_mut(), row_chunks[0]);
 
     for (vi, (row, ids)) in rows.iter().zip(row_ids.iter()).enumerate() {
         let col_constraints: Vec<Constraint> = (0..cols)
@@ -18941,6 +19360,7 @@ fn render_frame(
             );
         }
         ui.deck_attention_in_tab_bar = true;
+        record_attention_hits(ui, frame.buffer_mut(), tab_bar_rect);
         ui.tab_header_rects = strip.headers;
         ui.tab_close_rects = strip.closes;
     } else {
@@ -19036,9 +19456,21 @@ fn render_frame(
                         ..dashboard_area
                     },
                 );
+                record_attention_hits(
+                    ui,
+                    frame.buffer_mut(),
+                    Rect {
+                        height: 1,
+                        ..dashboard_area
+                    },
+                );
             }
         }
-        let ctx_buttons = dashboard_context_buttons(&ui.keybindings, !filtered.is_empty());
+        let ctx_buttons = dashboard_context_buttons(
+            &ui.keybindings,
+            !filtered.is_empty(),
+            config_action_label(state, ui, filtered),
+        );
         render_bottom_bar(frame, ui, hints_area, has_pane_control, &ctx_buttons);
 
         if let Some(right) = panes_area {
@@ -19091,6 +19523,7 @@ fn render_frame(
             ])
             .split(dashboard_area);
             frame.render_widget(title, vertical[0]);
+            record_attention_hits(ui, frame.buffer_mut(), vertical[0]);
 
             let msg = Paragraph::new("No agents match filter.")
                 .style(text_primary())
@@ -19105,7 +19538,11 @@ fn render_frame(
 
             render_stats_bar(frame, &state.aggregate_stats(), vertical[2]);
         }
-        let ctx_buttons = dashboard_context_buttons(&ui.keybindings, !filtered.is_empty());
+        let ctx_buttons = dashboard_context_buttons(
+            &ui.keybindings,
+            !filtered.is_empty(),
+            config_action_label(state, ui, filtered),
+        );
         render_bottom_bar(frame, ui, hints_area, has_pane_control, &ctx_buttons);
         // Still render live terminal panes even when filter matches zero sessions.
         if let Some(right) = panes_area {
@@ -19148,7 +19585,11 @@ fn render_frame(
     }
 
     // Full-width hints bar
-    let ctx_buttons = dashboard_context_buttons(&ui.keybindings, !filtered.is_empty());
+    let ctx_buttons = dashboard_context_buttons(
+        &ui.keybindings,
+        !filtered.is_empty(),
+        config_action_label(state, ui, filtered),
+    );
     render_bottom_bar(frame, ui, hints_area, has_pane_control, &ctx_buttons);
 
     // Render terminal panes on the right side
@@ -19342,6 +19783,7 @@ fn draw_modal(frame: &mut Frame, area: Rect, ui: &mut UiState) {
             frame,
             area,
             ui.config_gen_selected,
+            ui.config_gen_exists,
         ));
     }
     if ui.mode == UiMode::QuitConfirm {
@@ -20738,7 +21180,15 @@ fn global_bar_buttons(
 /// shortcut. Filter is always actionable; Rename / Generate-config act on the
 /// selected card, so they're disabled (dimmed) when there are no cards —
 /// matching the keys' `total > 0` guard.
-fn dashboard_context_buttons(keybindings: &KeybindingConfig, has_cards: bool) -> Vec<Button> {
+///
+/// PRD #2119: `config_label` is the selected card's config action — `Update`
+/// when the daemon reported its project already has a config, else
+/// `Generate` ([`config_action_label`]). Same key, same action either way.
+fn dashboard_context_buttons(
+    keybindings: &KeybindingConfig,
+    has_cards: bool,
+    config_label: &'static str,
+) -> Vec<Button> {
     let mut buttons = vec![
         Button::new(
             "Filter",
@@ -20753,7 +21203,7 @@ fn dashboard_context_buttons(keybindings: &KeybindingConfig, has_cards: bool) ->
             has_cards,
         ),
         Button::new(
-            "Generate",
+            config_label,
             button_shortcut_label(keybindings, KbAction::GenerateConfig),
             Action::RequestConfigGen,
             has_cards,
@@ -20778,6 +21228,29 @@ fn dashboard_context_buttons(keybindings: &KeybindingConfig, has_cards: bool) ->
         true,
     ));
     buttons
+}
+
+/// PRD #2119: the footer's config action when the selected card's project
+/// has no config, or the daemon has not said.
+const CONFIG_ACTION_GENERATE: &str = "Generate";
+
+/// PRD #2119: the footer label of the selected card's config action — `Update`
+/// when the daemon reported that its project already has a
+/// `.dot-agent-deck.toml`, else [`CONFIG_ACTION_GENERATE`]. The card is the one
+/// `g` acts on ([`dashboard_focus_target`]).
+fn config_action_label(
+    state: &AppState,
+    ui: &UiState,
+    filtered: &[(&String, &SessionState)],
+) -> &'static str {
+    let exists = dashboard_focus_target(ui, filtered.len())
+        .and_then(|i| filtered.get(i))
+        .and_then(|(_, session)| state.project_config_exists(session));
+    if exists == Some(true) {
+        "Update"
+    } else {
+        CONFIG_ACTION_GENERATE
+    }
 }
 
 /// PRD #144 — greedy line-wrap for the bottom button bar. Lay the buttons out
@@ -21044,7 +21517,13 @@ fn bottom_bar_rows(ui: &UiState, width: u16, frame_height: u16) -> u16 {
         _ if ui.status_message.is_some() => 1,
         _ => {
             let mut buttons = global_bar_buttons(&ui.keybindings, ui.mode, true);
-            buttons.extend(dashboard_context_buttons(&ui.keybindings, true));
+            // PRD #2119: reserved for `Generate`, the longer of the two
+            // config labels, so an `Update` bar never needs more rows.
+            buttons.extend(dashboard_context_buttons(
+                &ui.keybindings,
+                true,
+                CONFIG_ACTION_GENERATE,
+            ));
             let widths: Vec<u16> = buttons
                 .iter()
                 .map(|b| b.display_label().chars().count() as u16)
@@ -21428,7 +21907,7 @@ const STOP_CONFIRM: ConfirmLayout = ConfirmLayout {
     first_choice: 4,
 };
 const CONFIG_GEN_CONFIRM: ConfirmLayout = ConfirmLayout {
-    rows: 14,
+    rows: 12,
     first_choice: 5,
 };
 
@@ -22227,7 +22706,12 @@ fn render_antigravity_notice(frame: &mut Frame, area: Rect) -> ConfirmDrawing {
     }
 }
 
-fn render_config_gen_prompt(frame: &mut Frame, area: Rect, selected: usize) -> ConfirmDrawing {
+fn render_config_gen_prompt(
+    frame: &mut Frame,
+    area: Rect,
+    selected: usize,
+    exists: Option<bool>,
+) -> ConfirmDrawing {
     let popup_width = 60u16.min(area.width.saturating_sub(4));
     let popup_height = CONFIG_GEN_CONFIRM.popup_height(0, area);
     let x = (area.width.saturating_sub(popup_width)) / 2;
@@ -22236,19 +22720,50 @@ fn render_config_gen_prompt(frame: &mut Frame, area: Rect, selected: usize) -> C
 
     frame.render_widget(Clear, popup_area);
 
-    let options = [
-        ("Yes", "generate config for this project"),
-        ("No", "skip for now"),
-        ("Never", "never ask for this directory"),
-    ];
+    // PRD #2119: Update when the daemon reported that the project already
+    // has a config — the request it composes then says so — Generate when it
+    // reported none, and, when it could not tell, a question that claims
+    // neither: the request is then the conditional one (PR #2362 review). The
+    // title stays Generate there, matching the footer. The same words as the
+    // desktop's dialog (CLAUDE.md rule 22).
+    let (verb, question, yes) = match exists {
+        Some(true) => (
+            "Update",
+            [
+                "  This project already has an orchestration config.",
+                "  Want to instruct your agent to analyze the",
+                "  project and update the existing config?",
+            ],
+            "update config for this project",
+        ),
+        Some(false) => (
+            "Generate",
+            [
+                "  No orchestration config found for this",
+                "  project. Want to instruct your agent to",
+                "  analyze the project and create one?",
+            ],
+            "generate config for this project",
+        ),
+        None => (
+            "Generate",
+            [
+                "  Want to instruct your agent to check this",
+                "  project for .dot-agent-deck.toml and create it,",
+                "  or propose updates to it if it already exists?",
+            ],
+            "create or update config for this project",
+        ),
+    };
+    let options = [("Yes", yes), ("No", "skip for now")];
 
-    let mut text = vec![
-        Line::from(""),
-        Line::styled("  No orchestration config found for this", text_primary()),
-        Line::styled("  project. Want to instruct your agent to", text_primary()),
-        Line::styled("  analyze the project and create one?", text_primary()),
-        Line::from(""),
-    ];
+    let mut text = vec![Line::from("")];
+    text.extend(
+        question
+            .iter()
+            .map(|line| Line::styled(*line, text_primary())),
+    );
+    text.push(Line::from(""));
 
     for (i, (label, desc)) in options.iter().enumerate() {
         let cursor = if i == selected { ">" } else { " " };
@@ -22265,11 +22780,10 @@ fn render_config_gen_prompt(frame: &mut Frame, area: Rect, selected: usize) -> C
         ));
     }
 
+    // PRD #2119: Yes / No only. The dialog opens only when asked for, so a
+    // "Never" choice and an automatic-prompt hint had nothing to switch off.
+    // Two rows follow the choices: a gap, and the button row below.
     text.push(Line::from(""));
-    text.push(Line::styled(
-        "  Disable: dot-agent-deck config set auto_config_prompt false",
-        text_primary(),
-    ));
     text.push(Line::from(""));
     text.push(Line::styled(
         "  Up/Down: navigate  Enter: confirm  Esc: cancel",
@@ -22277,7 +22791,7 @@ fn render_config_gen_prompt(frame: &mut Frame, area: Rect, selected: usize) -> C
     ));
 
     let block = Block::default()
-        .title(" Generate .dot-agent-deck.toml ")
+        .title(format!(" {verb} .dot-agent-deck.toml "))
         .title_style(
             Style::default()
                 .fg(Color::Cyan)
@@ -22293,7 +22807,6 @@ fn render_config_gen_prompt(frame: &mut Frame, area: Rect, selected: usize) -> C
     let buttons = [
         Button::new("Yes", "", Action::ConfigGenConfirm, true),
         Button::new("No", "", Action::ConfigGenDismiss, true),
-        Button::new("Never", "", Action::ConfigGenSuppress, true),
     ];
     let btn_row = Rect {
         x: popup_area.x + 1,
@@ -25153,10 +25666,20 @@ fn render_session_card(
     } else {
         session.card_inbox()
     };
+    // Issue #2387: the deck holds a message for this agent. Beside the status,
+    // never instead of it: the status is what the agent is doing, this is
+    // what the deck is doing. Read from the card's own inbox, placeholder or
+    // not, because it is what the deck-wide attention item names
+    // (`AppState::held_cards`).
+    let held_marker = session
+        .card_inbox()
+        .and_then(|inbox| inbox.attention_words())
+        .map(|_| format!("{} ", crate::inbox_display::ATTENTION_HELD));
+    let status_badge = format!("{status_text}{}", held_marker.as_deref().unwrap_or(""));
     let chip_inbox = inbox
         .as_ref()
-        .and_then(|inbox| card_inbox_badge(inbox, &status_text, area.width as usize));
-    let status_width = unicode_width::UnicodeWidthStr::width(status_text.as_str());
+        .and_then(|inbox| card_inbox_badge(inbox, &status_badge, area.width as usize));
+    let status_width = unicode_width::UnicodeWidthStr::width(status_badge.as_str());
     let badge_width = status_width
         + chip_inbox
             .as_deref()
@@ -25531,6 +26054,9 @@ fn render_session_card(
     let title_spans = truncate_styled_segments(title_segments, title_budget);
     block = block.title(Line::from(title_spans)).title({
         let mut badge = vec![Span::styled(status_text, status_style)];
+        if let Some(marker) = held_marker {
+            badge.push(Span::styled(marker, deck_attention_style()));
+        }
         if let Some(inbox) = chip_inbox {
             badge.push(Span::styled(inbox, text_primary()));
         }
@@ -26535,7 +27061,7 @@ pub fn render_config_gen_prompt_to_buffer(
 ) -> ratatui::buffer::Buffer {
     draw_to_buffer(width, height, |frame| {
         let frame_area = frame.area();
-        render_config_gen_prompt(frame, frame_area, selected);
+        render_config_gen_prompt(frame, frame_area, selected, Some(false));
     })
 }
 
@@ -27171,7 +27697,7 @@ pub fn render_button_bar_with_bindings_to_buffer(
     let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
     // Seam renders the full global+context bar (including the always-on
     // Schedules button) so every remappable label is exercised.
-    let ctx_buttons = dashboard_context_buttons(keybindings, true);
+    let ctx_buttons = dashboard_context_buttons(keybindings, true, CONFIG_ACTION_GENERATE);
     let mut ui = UiState::new(DashboardConfig::default(), keybindings.clone());
     terminal
         .draw(|frame| {
@@ -27215,7 +27741,7 @@ pub fn render_button_bar_for_mode_to_buffer(
 
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
-    let ctx_buttons = dashboard_context_buttons(keybindings, true);
+    let ctx_buttons = dashboard_context_buttons(keybindings, true, CONFIG_ACTION_GENERATE);
     let mut ui = UiState::new(DashboardConfig::default(), keybindings.clone());
     ui.mode = mode;
     terminal
@@ -37602,6 +38128,8 @@ mod tests {
         next: std::sync::Mutex<u32>,
         focused: std::sync::Mutex<Vec<String>>,
         closed: std::sync::Mutex<Vec<String>>,
+        config_requests: std::sync::Mutex<Vec<crate::pane::BoundPane>>,
+        posted_messages: std::sync::Mutex<Vec<String>>,
     }
     impl OpenTabPC {
         fn new() -> Self {
@@ -37609,10 +38137,32 @@ mod tests {
                 next: std::sync::Mutex::new(0),
                 focused: std::sync::Mutex::new(Vec::new()),
                 closed: std::sync::Mutex::new(Vec::new()),
+                config_requests: std::sync::Mutex::new(Vec::new()),
+                posted_messages: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
     impl crate::pane::PaneController for OpenTabPC {
+        fn generate_config(
+            &self,
+            card: &crate::pane::BoundPane,
+            _expected_agent_id: Option<&str>,
+        ) -> Result<crate::daemon_client::GatedQuery<String>, PaneError> {
+            self.config_requests.lock().unwrap().push(card.clone());
+            Ok(crate::daemon_client::GatedQuery::Unsupported)
+        }
+
+        fn post_message(
+            &self,
+            _card: &crate::pane::BoundPane,
+            _subject: &str,
+            body: &str,
+            _origin: crate::inbox_hub::PostOrigin,
+        ) -> Result<String, PaneError> {
+            self.posted_messages.lock().unwrap().push(body.to_owned());
+            Ok("unexpected-fallback".into())
+        }
+
         fn create_pane(
             &self,
             _cmd: Option<&str>,
@@ -37688,6 +38238,7 @@ mod tests {
         /// Whether the daemon actually has a pane to attach (`false` = the
         /// card really is dead).
         hydratable: bool,
+        refuse_focus: bool,
         wired: std::sync::Mutex<bool>,
         hydrate_calls: std::sync::Mutex<usize>,
     }
@@ -37695,12 +38246,31 @@ mod tests {
         fn new(hydratable: bool) -> Self {
             Self {
                 hydratable,
+                refuse_focus: false,
                 wired: std::sync::Mutex::new(false),
                 hydrate_calls: std::sync::Mutex::new(0),
             }
         }
     }
     impl crate::pane::PaneController for UnwiredPC {
+        fn generate_config(
+            &self,
+            _card: &crate::pane::BoundPane,
+            _expected_agent_id: Option<&str>,
+        ) -> Result<crate::daemon_client::GatedQuery<String>, crate::pane::PaneError> {
+            Ok(crate::daemon_client::GatedQuery::Answered(
+                "m-config".into(),
+            ))
+        }
+        fn focus_card(&self, card: &crate::pane::BoundPane) -> Result<(), crate::pane::PaneError> {
+            if self.refuse_focus {
+                Err(crate::pane::PaneError::Refused(
+                    "the agent restarted".into(),
+                ))
+            } else {
+                self.focus_pane(&card.pane_id)
+            }
+        }
         fn focus_pane(&self, _id: &str) -> Result<(), crate::pane::PaneError> {
             if *self.wired.lock().unwrap() {
                 Ok(())
@@ -39453,6 +40023,49 @@ mod tests {
         assert_eq!(rows[0], "┌ 1 ClaudeCode · … ● Working ✉1 queued ┐");
         assert_eq!(rows[1], "│ORCHESTRATOR                          │");
         assert_eq!(rows.len(), 3);
+    }
+
+    /// Scenario: draw an 80-column Working card the deck holds a message for,
+    /// one Idle card the deck holds nothing for, and a narrow held card. The
+    /// held card carries `held` beside its status, which stays Working; the
+    /// other card has no marker; and the narrow card keeps the marker and the
+    /// status while its inbox line gives way.
+    #[test]
+    #[spec("inbox/status/044")]
+    fn status_044_a_held_card_carries_the_marker_beside_its_status() {
+        let held = session_with_inbox(
+            SessionStatus::Working,
+            &crate::inbox_display::CardInbox {
+                pending: 1,
+                hold: Some(crate::inbox_display::WakeHold::CannotType),
+                ..Default::default()
+            },
+        );
+        let free = session_with_inbox(
+            SessionStatus::Idle,
+            &crate::inbox_display::CardInbox {
+                pending: 1,
+                ..Default::default()
+            },
+        );
+        let rows = |session: &SessionState, width| {
+            card_rows(session, "lead", width, CardDensity::Compact, false).join("\n")
+        };
+        insta::assert_snapshot!(rows(&held, 80), @r"
+        ┌ 1 ClaudeCode · lead ────────────────────────────────────── ● Working held ✉1 ┐
+        │Dir:  —                                                                       │
+        │✉1 waiting for the agent to fetch it. Send it a prompt.                       │
+        │                                                                              │
+        └────────────────────────────────────────────────────────── Last: 0s  Tools: 0 ┘
+        ");
+        let plain = rows(&free, 80);
+        assert!(
+            !plain.contains(crate::inbox_display::ATTENTION_HELD),
+            "{plain}"
+        );
+        let narrow = rows(&held, 34);
+        let top = narrow.lines().next().unwrap();
+        assert!(top.contains("● Working held"), "{narrow}");
     }
 
     /// Scenario: draw the orchestrator seat's card at 66 columns while its wake
@@ -43641,10 +44254,7 @@ mod tests {
         let mut ui = default_ui();
         ui.mode = UiMode::ConfigGenPrompt;
         ui.config_gen_selected = 0; // Yes
-        ui.config_gen_target = Some((
-            crate::pane::BoundPane::held_by_controller("pane-1"),
-            "/my/project".to_string(),
-        ));
+        ui.config_gen_target = Some(crate::pane::BoundPane::held_by_controller("pane-1"));
 
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         let result = handle_config_gen_prompt_key(enter, &mut ui);
@@ -43652,8 +44262,7 @@ mod tests {
         assert_eq!(ui.mode, UiMode::Normal);
         assert!(ui.config_gen_target.is_none());
         assert!(
-            matches!(result, Action::SendConfigGenPrompt { ref pane, ref cwd }
-                if pane.pane_id == "pane-1" && cwd == "/my/project")
+            matches!(result, Action::SendConfigGenPrompt { ref pane } if pane.pane_id == "pane-1")
         );
     }
 
@@ -43662,10 +44271,7 @@ mod tests {
         let mut ui = default_ui();
         ui.mode = UiMode::ConfigGenPrompt;
         ui.config_gen_selected = 1; // No
-        ui.config_gen_target = Some((
-            crate::pane::BoundPane::held_by_controller("pane-1"),
-            "/my/project".to_string(),
-        ));
+        ui.config_gen_target = Some(crate::pane::BoundPane::held_by_controller("pane-1"));
 
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         let result = handle_config_gen_prompt_key(enter, &mut ui);
@@ -43673,40 +44279,10 @@ mod tests {
         assert_eq!(ui.mode, UiMode::Normal);
         assert!(ui.config_gen_target.is_none());
         assert!(matches!(result, Action::Continue));
+        assert!(ui.status_message.is_none(), "No says nothing");
     }
 
-    #[test]
-    fn config_gen_prompt_enter_on_never_suppresses_dir() {
-        // Picking "Never" calls suppress_dir() → save(), which reads
-        // DOT_AGENT_DECK_CONFIG_GEN_STATE. Hold the shared lock and point at
-        // a temp path so we don't race against other tests touching the same
-        // env var, and don't pollute the real home dir.
-        let _guard = crate::config::CONFIG_GEN_STATE_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("config-gen-state.json");
-        // Drop guard restores the env var even if an assertion below panics.
-        let _env_restore = crate::config::ConfigGenStateEnvGuard::set(path.to_str().unwrap());
-
-        let mut ui = default_ui();
-        ui.mode = UiMode::ConfigGenPrompt;
-        ui.config_gen_selected = 2; // Never
-        ui.config_gen_target = Some((
-            crate::pane::BoundPane::held_by_controller("pane-1"),
-            "/my/project".to_string(),
-        ));
-
-        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-        let result = handle_config_gen_prompt_key(enter, &mut ui);
-
-        assert_eq!(ui.mode, UiMode::Normal);
-        assert!(ui.config_gen_target.is_none());
-        assert!(ui.config_gen_state.is_suppressed("/my/project"));
-        assert!(matches!(result, Action::Continue));
-        assert!(ui.status_message.is_some());
-    }
-
+    /// PRD #2119: the dialog offers Yes and No only, so Down stops at No.
     #[test]
     fn config_gen_prompt_arrow_navigation() {
         let mut ui = default_ui();
@@ -43717,26 +44293,20 @@ mod tests {
         handle_config_gen_prompt_key(down, &mut ui);
         assert_eq!(ui.config_gen_selected, 1);
 
-        handle_config_gen_prompt_key(down, &mut ui);
-        assert_eq!(ui.config_gen_selected, 2);
-
         // Can't go past last
         handle_config_gen_prompt_key(down, &mut ui);
-        assert_eq!(ui.config_gen_selected, 2);
+        assert_eq!(ui.config_gen_selected, 1);
 
         let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
         handle_config_gen_prompt_key(up, &mut ui);
-        assert_eq!(ui.config_gen_selected, 1);
+        assert_eq!(ui.config_gen_selected, 0);
     }
 
     #[test]
     fn config_gen_prompt_esc_dismisses() {
         let mut ui = default_ui();
         ui.mode = UiMode::ConfigGenPrompt;
-        ui.config_gen_target = Some((
-            crate::pane::BoundPane::held_by_controller("pane-1"),
-            "/my/project".to_string(),
-        ));
+        ui.config_gen_target = Some(crate::pane::BoundPane::held_by_controller("pane-1"));
 
         let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
         let result = handle_config_gen_prompt_key(esc, &mut ui);
@@ -47238,7 +47808,11 @@ mod tests {
     /// Draw one full dashboard frame for `state` / `ui` into a 100x24
     /// `TestBackend` and return every row, right-trimmed.
     fn glossary_frame_rows(state: &AppState, ui: &mut UiState) -> Vec<String> {
-        let backend = TestBackend::new(100, 24);
+        glossary_frame_rows_at_width(state, ui, 100)
+    }
+
+    fn glossary_frame_rows_at_width(state: &AppState, ui: &mut UiState, width: u16) -> Vec<String> {
+        let backend = TestBackend::new(width, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let filtered = filter_sessions(state, ui);
         terminal
@@ -47576,6 +48150,7 @@ mod tests {
         let record = crate::agent_pty::AgentRecord {
             input_held: None,
             input_discarded: None,
+            project_config_exists: None,
             id: agent_id.to_string(),
             pane_id_env: Some(pane_id.to_string()),
             display_name: Some(name.to_string()),
@@ -49872,13 +50447,13 @@ mod tests {
                 hidden: 1,
                 later: None,
             },
-            // [Yes] [No] [Never] paints over No; Never is still shown.
+            // [Yes] [No] paints over No (PRD #2119: no Never below it).
             Case {
                 mode: UiMode::ConfigGenPrompt,
                 small: (80, 14),
-                labels: &["Yes", "No", "Never"],
+                labels: &["Yes", "No"],
                 hidden: 1,
-                later: Some(2),
+                later: None,
             },
         ];
         for Case {
@@ -50157,14 +50732,13 @@ mod tests {
             Action::ConfirmCloseSelected => "[Close]",
             Action::ConfigGenConfirm => "[Yes]",
             Action::ConfigGenDismiss => "[No]",
-            Action::ConfigGenSuppress => "[Never]",
             other => panic!("a confirmation button fires {other:?}"),
         };
         let dialogs: [(UiMode, &[&str], usize); 4] = [
             (UiMode::QuitConfirm, &["Detach", "Stop", "Cancel"], 3),
             (UiMode::CloseConfirm, &["Cancel", "Close"], 2),
             (UiMode::StopConfirm, &["No", "Yes"], 0),
-            (UiMode::ConfigGenPrompt, &["Yes", "No", "Never"], 3),
+            (UiMode::ConfigGenPrompt, &["Yes", "No"], 2),
         ];
         let footers: [(bool, &[_]); 4] =
             [(false, &[]), (true, &[]), (false, &notice), (true, &notice)];
@@ -50506,6 +51080,382 @@ mod tests {
                 Some("s-first"),
                 "Enter targets the new agent"
             );
+        }
+    }
+
+    /// Scenario: Refresh a dashboard card from daemon records with existing, absent, or unknown config state and press g. The footer and Yes/No dialog say Update only when the daemon reports an existing file, and an unknown state asks to check for the file and create or update it without claiming either.
+    #[spec("dashboard/config-gen/001")]
+    #[test]
+    fn config_gen_001_existing_config_labels_footer_and_confirmation_update() {
+        for exists in [None, Some(false), Some(true)] {
+            let mut record = serde_json::json!({
+                "id": "config-label-agent", "pane_id_env": "config-label-pane",
+                "cwd": "/project-on-the-daemon"
+            });
+            if let Some(exists) = exists {
+                record["project_config_exists"] = serde_json::json!(exists);
+            }
+            let mut snapshot = AppState::default();
+            let records = [serde_json::from_value(record).unwrap()];
+            snapshot.card_unseen_agents(&records);
+            snapshot.resync_after_event_gap(&records);
+            let selected = snapshot.sessions.keys().next().unwrap().clone();
+            let mut ui = default_ui();
+            let footer = glossary_frame_rows_at_width(&snapshot, &mut ui, 220).join("\n");
+            let verb = if exists == Some(true) {
+                "Update"
+            } else {
+                "Generate"
+            };
+            assert!(
+                footer.contains(&format!("[{verb} g]")),
+                "existing={exists:?}: footer must offer {verb} on g:\n{footer}"
+            );
+            let state: SharedState = Arc::new(tokio::sync::RwLock::new(snapshot.clone()));
+            let pc = Arc::new(OpenTabPC::new());
+            let mut tabs = TabManager::new(pc.clone());
+            let filtered: Vec<_> = snapshot.sessions.iter().collect();
+            handle_key_event(
+                KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+                &mut ui,
+                &*pc,
+                &state,
+                &mut tabs,
+                &snapshot,
+                &filtered,
+                Rect::new(0, 0, 220, 24),
+            );
+            assert_eq!(
+                ui.mode,
+                UiMode::ConfigGenPrompt,
+                "g opens the same confirmation for {selected}"
+            );
+            let dialog = glossary_frame_rows_at_width(&snapshot, &mut ui, 220).join("\n");
+            assert!(
+                dialog.contains(&format!("{verb} .dot-agent-deck.toml")),
+                "existing={exists:?}: dialog title must say {verb}:\n{dialog}"
+            );
+            for label in ["[Yes]", "[No]"] {
+                assert!(
+                    dialog.contains(label),
+                    "neutral confirmation must offer {label}:\n{dialog}"
+                );
+            }
+            match exists {
+                Some(true) => {
+                    assert!(
+                        dialog.contains("update the existing config"),
+                        "ask to update the user's config:\n{dialog}"
+                    );
+                    assert!(!dialog.contains("No orchestration config found"));
+                    insta::assert_snapshot!("config_generation_update_confirmation", dialog);
+                }
+                Some(false) => {
+                    assert!(
+                        dialog.contains("create one?"),
+                        "keep the existing Generate question:\n{dialog}"
+                    );
+                }
+                // PR #2362 review: the daemon could not tell, so the
+                // question claims neither a config nor its absence.
+                None => {
+                    for claim in [
+                        "No orchestration config found",
+                        "already has an orchestration config",
+                        "create one?",
+                    ] {
+                        assert!(
+                            !dialog.contains(claim),
+                            "an unknown state must not claim {claim:?}:\n{dialog}"
+                        );
+                    }
+                    for neutral in [
+                        "check this",
+                        "project for .dot-agent-deck.toml and create it,",
+                        "or propose updates to it if it already exists?",
+                        "create or update config for this project",
+                    ] {
+                        assert!(
+                            dialog.contains(neutral),
+                            "the unknown question must say {neutral:?}:\n{dialog}"
+                        );
+                    }
+                    insta::assert_snapshot!("config_generation_unknown_confirmation", dialog);
+                }
+            }
+        }
+    }
+
+    /// Scenario: Open Generate config for an agent on an older daemon and confirm Yes by mouse or keyboard. The status line explains that the daemon needs upgrading, nothing is posted through the generic inbox fallback, and the deck stays out of typing mode.
+    #[spec("dashboard/config-gen/001")]
+    #[test]
+    fn config_gen_001_older_daemon_shows_upgrade_without_posting_a_fallback() {
+        for keyboard in [false, true] {
+            let mut snapshot = AppState::default();
+            let incarnation =
+                crate::daemon_client::Incarnation::from(Some("listed-process".into()));
+            snapshot.learn_stream_incarnation(incarnation.clone());
+            let sid = snapshot.insert_placeholder_session_learned(
+                "selected-pane".into(),
+                None,
+                None,
+                Some("selected-agent".into()),
+                incarnation,
+            );
+            let state: SharedState = Arc::new(tokio::sync::RwLock::new(snapshot.clone()));
+            let pc = Arc::new(OpenTabPC::new());
+            let mut tab_manager = TabManager::new(pc.clone());
+            let mut ui = default_ui();
+            dispatch_action(
+                Action::RequestConfigGen,
+                &mut ui,
+                &*pc,
+                &state,
+                &mut tab_manager,
+                &snapshot,
+                &[],
+                Some(&sid),
+                Rect::new(0, 0, 180, 24),
+            );
+            assert_eq!(ui.mode, UiMode::ConfigGenPrompt);
+            let confirm = if keyboard {
+                handle_config_gen_prompt_key(
+                    KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    &mut ui,
+                )
+            } else {
+                Action::ConfigGenConfirm
+            };
+            dispatch_action(
+                confirm,
+                &mut ui,
+                &*pc,
+                &state,
+                &mut tab_manager,
+                &snapshot,
+                &[],
+                Some(&sid),
+                Rect::new(0, 0, 180, 24),
+            );
+            assert_eq!(
+                glossary_status_text(&ui),
+                Some(crate::config_gen::CONFIG_GEN_UPGRADE_MESSAGE)
+            );
+            assert!(glossary_status_row(&state, &mut ui).contains("Upgrade"));
+            assert_ne!(ui.mode, UiMode::PaneInput);
+            assert_eq!(pc.config_requests.lock().unwrap().len(), 1);
+            assert!(
+                pc.posted_messages.lock().unwrap().is_empty(),
+                "an older daemon must receive no locally composed fallback"
+            );
+            assert!(pc.focused.lock().unwrap().is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    fn config_gen_scripted_confirmation(
+        replace_card: bool,
+        silent: bool,
+    ) -> (String, Vec<serde_json::Value>) {
+        use crate::daemon_client::restart_fixture::RestartingDaemon;
+        use crate::embedded_pane::EmbeddedPaneController;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let daemon = runtime.block_on(async { RestartingDaemon::spawn("config-process") });
+        daemon.config_generation(
+            Some(crate::daemon_protocol::AttachResponse::err(
+                "target refused",
+            )),
+            silent,
+        );
+        let pc = Arc::new(
+            EmbeddedPaneController::new(daemon.path.clone(), runtime.handle().clone())
+                .with_protocol_gate(),
+        );
+        let mut snapshot = AppState::default();
+        let incarnation = crate::daemon_client::Incarnation::from(Some("config-process".into()));
+        snapshot.learn_stream_incarnation(incarnation.clone());
+        let sid = snapshot.insert_placeholder_session_learned(
+            "pane-1".into(),
+            None,
+            None,
+            Some("1".into()),
+            incarnation,
+        );
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(snapshot.clone()));
+        let mut tabs = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        dispatch_action(
+            Action::RequestConfigGen,
+            &mut ui,
+            &*pc,
+            &state,
+            &mut tabs,
+            &snapshot,
+            &[],
+            Some(&sid),
+            Rect::new(0, 0, 240, 24),
+        );
+        assert_eq!(ui.mode, UiMode::ConfigGenPrompt);
+        if replace_card {
+            snapshot.sessions.get_mut(&sid).unwrap().agent_id = Some("2".into());
+            *state.blocking_write() = snapshot.clone();
+        }
+        dispatch_action(
+            Action::ConfigGenConfirm,
+            &mut ui,
+            &*pc,
+            &state,
+            &mut tabs,
+            &snapshot,
+            &[],
+            Some(&sid),
+            Rect::new(0, 0, 240, 24),
+        );
+        assert_ne!(ui.mode, UiMode::PaneInput);
+        let status = glossary_status_text(&ui)
+            .expect("a visible generation outcome")
+            .to_owned();
+        assert!(glossary_status_row(&state, &mut ui).contains("Failed to send config prompt:"));
+        (
+            status,
+            daemon.requests_to("config-process", "generate-config"),
+        )
+    }
+
+    /// Scenario: Open Generate config on an unopened card for agent A, replace its displayed occupant with B, then confirm Yes. The request still names A, so the replacement can never receive A's config instructions; an unchanged card is the control.
+    #[cfg(unix)]
+    #[spec("dashboard/config-gen/001")]
+    #[test]
+    fn config_gen_001_confirmation_keeps_the_agent_it_opened_for() {
+        let observations: Vec<_> = [false, true]
+            .into_iter()
+            .map(|replace| {
+                let (_, requests) = config_gen_scripted_confirmation(replace, false);
+                assert_eq!(requests.len(), 1, "one confirmation request");
+                (replace, requests[0]["expected_agent_id"].clone())
+            })
+            .collect();
+        assert_eq!(
+            observations,
+            vec![
+                (false, serde_json::json!("1")),
+                (true, serde_json::json!("1"))
+            ],
+            "Yes must preserve the agent captured when the dialog opened, including on an unopened pane"
+        );
+    }
+
+    /// Scenario: Confirm Generate config and have the daemon refuse the target. The TUI's visible status is exactly the desktop's shared failure sentence for the same client error.
+    #[cfg(unix)]
+    #[spec("dashboard/config-gen/001")]
+    #[test]
+    fn config_gen_001_refusal_uses_the_desktop_failure_sentence() {
+        let (status, _) = config_gen_scripted_confirmation(false, false);
+        assert_eq!(
+            status,
+            crate::config_gen::config_gen_failed_message(
+                &crate::daemon_client::ClientError::Server("target refused".into())
+            )
+        );
+    }
+
+    /// Scenario: Confirm Generate config on a daemon that receives the request but never answers. The TUI shows the same timeout sentence as the desktop and stays out of typing mode.
+    #[cfg(unix)]
+    #[spec("dashboard/config-gen/001")]
+    #[test]
+    fn config_gen_001_timeout_uses_the_desktop_failure_sentence() {
+        let (status, requests) = config_gen_scripted_confirmation(false, true);
+        assert_eq!(requests.len(), 1, "the timeout follows a sent request");
+        assert_eq!(
+            status,
+            crate::config_gen::config_gen_failed_message(
+                &crate::daemon_client::ClientError::TimedOut(std::time::Duration::from_secs(15))
+            )
+        );
+    }
+
+    /// Scenario: Confirm Generate config on an agent whose pane is not open here. A pane that can be opened enters typing mode; a refused focus or unavailable pane leaves command mode and the card intact, with the sent notice visible.
+    #[spec("inbox/route/007")]
+    #[test]
+    fn route_007_sent_config_opens_an_unwired_pane_or_keeps_the_card() {
+        for (hydratable, refuse_focus) in [(true, false), (false, false), (true, true)] {
+            for keyboard in [false, true] {
+                let mut controller = UnwiredPC::new(hydratable);
+                controller.refuse_focus = refuse_focus;
+                let pc = Arc::new(controller);
+                let mut snapshot = AppState::default();
+                let incarnation =
+                    crate::daemon_client::Incarnation::from(Some("listed-process".into()));
+                snapshot.learn_stream_incarnation(incarnation.clone());
+                let sid = snapshot.insert_placeholder_session_learned(
+                    "selected-pane".into(),
+                    None,
+                    None,
+                    Some("selected-agent".into()),
+                    incarnation,
+                );
+                let state: SharedState = Arc::new(tokio::sync::RwLock::new(snapshot.clone()));
+                let mut tab_manager = TabManager::new(pc.clone());
+                let mut ui = default_ui();
+                ui.display_names
+                    .insert(sid.clone(), "config-target-agent".into());
+                dispatch_action(
+                    Action::RequestConfigGen,
+                    &mut ui,
+                    &*pc,
+                    &state,
+                    &mut tab_manager,
+                    &snapshot,
+                    &[],
+                    Some(&sid),
+                    Rect::new(0, 0, 180, 24),
+                );
+                assert_eq!(ui.mode, UiMode::ConfigGenPrompt);
+                let confirm = if keyboard {
+                    handle_config_gen_prompt_key(
+                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                        &mut ui,
+                    )
+                } else {
+                    Action::ConfigGenConfirm
+                };
+                dispatch_action(
+                    confirm,
+                    &mut ui,
+                    &*pc,
+                    &state,
+                    &mut tab_manager,
+                    &snapshot,
+                    &[],
+                    Some(&sid),
+                    Rect::new(0, 0, 180, 24),
+                );
+                assert_eq!(
+                    ui.mode,
+                    if hydratable && !refuse_focus {
+                        UiMode::PaneInput
+                    } else {
+                        UiMode::Normal
+                    },
+                    "hydratable={hydratable}, refused={refuse_focus}, keyboard={keyboard}"
+                );
+                let rows = glossary_frame_rows(&state.blocking_read(), &mut ui);
+                let status = rows.last().expect("the frame has a status row");
+                assert!(status.contains(crate::config_gen::CONFIG_GEN_SENT_MESSAGE));
+                assert!(status.contains(if hydratable && !refuse_focus {
+                    "TYPING"
+                } else {
+                    "COMMAND"
+                }));
+                assert!(
+                    rows.iter().any(|row| row.contains("config-target-agent")),
+                    "a sent request must keep its card even when focus fails"
+                );
+            }
         }
     }
 
