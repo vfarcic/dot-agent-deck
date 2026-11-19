@@ -48,8 +48,11 @@ pub enum ClientError {
     SocketMissing(PathBuf),
     #[error("malformed daemon response: {0}")]
     Malformed(String),
-    /// PRD #1487: the daemon did not answer within the bound, before the
-    /// request itself was sent — see [`DaemonClient::restart_daemon`].
+    /// PRD #1487: the daemon did not answer within the bound. Whether the
+    /// request had reached it depends on the operation: for
+    /// [`DaemonClient::restart_daemon`] the bound runs out before the
+    /// request is sent, while config generation's bounds can run out after
+    /// the daemon received it.
     #[error("no answer from the daemon within {0:?}")]
     TimedOut(std::time::Duration),
     /// PRD #1487: the request was sent, or may have been, and then no answer
@@ -115,6 +118,26 @@ pub const KEEP_WORKTREE_UNSUPPORTED: &str = "the running deck daemon cannot keep
 /// ([`ClientError::DaemonRestarted`]). One sentence, so the TUI and the
 /// desktop say the same thing (CLAUDE.md rule 22).
 pub const AGENT_GONE_AFTER_RESTART: &str = "that agent is gone (the deck restarted)";
+
+/// PRD #2119: what a client says once the daemon has posted the configuration
+/// request. One string, so the TUI and the desktop app say the same thing.
+pub const CONFIG_GEN_SENT_MESSAGE: &str = "Config request sent to the agent's inbox.";
+
+/// PRD #2119: what a client says when the daemon does not advertise
+/// [`crate::daemon_protocol::CAP_GENERATE_CONFIG`]. Neither client composes the
+/// request itself instead, so both say this, in these words.
+pub const CONFIG_GEN_UPGRADE_MESSAGE: &str =
+    "This daemon is too old to generate a config. Upgrade the daemon to use Generate config.";
+
+/// PRD #2119: the start of what a client says when the request was refused or
+/// could not be sent; [`config_gen_failed_message`] appends the reason.
+pub const CONFIG_GEN_FAILED_PREFIX: &str = "Failed to send config prompt";
+
+/// PRD #2119: [`CONFIG_GEN_FAILED_PREFIX`] followed by `reason`, the one
+/// failure message both clients show.
+pub fn config_gen_failed_message(reason: &dyn std::fmt::Display) -> String {
+    format!("{CONFIG_GEN_FAILED_PREFIX}: {reason}")
+}
 
 /// PRD #1666 part 2 (G-fix5): what both clients say when an action aimed at an
 /// agent is refused because the deck did not say which daemon process it is
@@ -2115,6 +2138,7 @@ impl DaemonClient {
                 .map(|id| AgentRecord {
                     input_held: None,
                     input_discarded: None,
+                    project_config_exists: None,
                     id,
                     pane_id_env: None,
                     display_name: None,
@@ -2381,6 +2405,50 @@ impl DaemonClient {
         resp.id
             .map(GatedQuery::Answered)
             .ok_or_else(|| ClientError::Server("post-message answered no message id".into()))
+    }
+
+    /// PRD #2119 — ask the daemon to post the configuration-generation request
+    /// to `pane_id`'s inbox, bound to `expected_agent_id` when given. The
+    /// daemon composes the request for the pane's working directory as it
+    /// knows it; the caller sends no prompt. Answers the message id.
+    ///
+    /// **Withholds unless the daemon advertises
+    /// [`crate::daemon_protocol::CAP_GENERATE_CONFIG`]**, answering
+    /// [`GatedQuery::Unsupported`] without sending anything: an older daemon
+    /// has no such verb, and the caller says it needs upgrading
+    /// ([`crate::config_gen::CONFIG_GEN_UPGRADE_MESSAGE`]) rather than
+    /// composing the request itself.
+    pub async fn generate_config(
+        &self,
+        pane_id: &str,
+        expected_agent_id: Option<&str>,
+    ) -> Result<GatedQuery<String>, ClientError> {
+        if !self
+            .capabilities()
+            .await?
+            .supports(crate::daemon_protocol::CAP_GENERATE_CONFIG)
+        {
+            return Ok(GatedQuery::Unsupported);
+        }
+        let (mut rd, mut wr) = self.admitted_connect().await?;
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::GenerateConfig {
+                pane_id: pane_id.to_string(),
+                expected_agent_id: expected_agent_id.map(str::to_string),
+            },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error
+                    .unwrap_or_else(|| "generate-config failed".into()),
+            ));
+        }
+        resp.id
+            .map(GatedQuery::Answered)
+            .ok_or_else(|| ClientError::Server("generate-config answered no message id".into()))
     }
 
     /// PRD #1666 S3 — the inbox of `pane_id`, or of the whole deck with no
@@ -9454,6 +9522,7 @@ start = true
         let mut rec = AgentRecord {
             input_held: None,
             input_discarded: None,
+            project_config_exists: None,
             id: "9".into(),
             pane_id_env: None,
             display_name: Some(format!("de\x1bplo\u{202e}yer\0 {}", "\u{3bc}".repeat(400))),
@@ -9521,6 +9590,7 @@ start = true
         let mut rec = AgentRecord {
             input_held: None,
             input_discarded: None,
+            project_config_exists: None,
             id: "7".into(),
             pane_id_env: None,
             display_name: None,
@@ -9547,6 +9617,7 @@ start = true
         let mut ok = AgentRecord {
             input_held: None,
             input_discarded: None,
+            project_config_exists: None,
             id: "8".into(),
             pane_id_env: None,
             display_name: None,
@@ -10365,6 +10436,8 @@ pub(crate) mod restart_fixture {
         hellos: HashMap<&'static str, usize>,
         /// Capabilities every process leaves out of its `Hello`.
         withheld: Vec<&'static str>,
+        generate_reply: Option<AttachResponse>,
+        silent_generate: bool,
     }
 
     pub(crate) struct RestartingDaemon {
@@ -10408,7 +10481,7 @@ pub(crate) mod restart_fixture {
                 ])
             }
             "start-agent" => AttachResponse::with_id("1".into()),
-            "post-message" => AttachResponse::with_id("m-1".into()),
+            "post-message" | "generate-config" => AttachResponse::with_id("m-1".into()),
             "attach-stream" | "resize" => {
                 let mut reply = AttachResponse::ok();
                 reply.viewer = Some("v1".into());
@@ -10500,7 +10573,21 @@ pub(crate) mod restart_fixture {
                                 recorded.lock().unwrap().push(format!("{process}:{op}"));
                                 requests.lock().unwrap().push((process, request.clone()));
                                 restart_after_serving(&script, process, &op);
-                                let _ = write_resp(&mut stream, &serve(&op)).await;
+                                if op == "generate-config" && script.lock().unwrap().silent_generate
+                                {
+                                    std::future::pending::<()>().await;
+                                }
+                                let reply = if op == "generate-config" {
+                                    script
+                                        .lock()
+                                        .unwrap()
+                                        .generate_reply
+                                        .clone()
+                                        .unwrap_or_else(|| serve(&op))
+                                } else {
+                                    serve(&op)
+                                };
+                                let _ = write_resp(&mut stream, &reply).await;
                                 // Hold an attach or subscription open, as a
                                 // daemon would, until the client leaves.
                                 while let Ok(Some(_)) = read_frame(&mut stream).await {}
@@ -10549,6 +10636,12 @@ pub(crate) mod restart_fixture {
         /// as a daemon from before it would.
         pub(crate) fn withhold(&self, capability: &'static str) {
             self.script.lock().unwrap().withheld.push(capability);
+        }
+
+        pub(crate) fn config_generation(&self, reply: Option<AttachResponse>, silent: bool) {
+            let mut script = self.script.lock().unwrap();
+            script.generate_reply = reply;
+            script.silent_generate = silent;
         }
 
         /// The ops `process` received, in order.

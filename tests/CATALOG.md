@@ -1337,19 +1337,39 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 
 #### dashboard/config-gen
 
-##### dashboard/config-gen/001 — `g` on a card opens the Generate Config dialog with options Yes / No / Never.
-- **Layer:** L2.
+##### dashboard/config-gen/001 — TUI generation preserves the confirmed agent and shows shared outcome words.
+- **Layer:** L1, in-process action dispatch and rendered status row.
 - **Agent:** none.
-- **Asserts:** dialog region appears; arrow keys move between Yes / No / Never; `Enter` on No dismisses without side effects.
-- **Does not assert:** what Yes injects into the agent (covered by `orchestration/delegate/*` for delegate-driven prompt injection, and elsewhere if a non-orchestration path emerges).
+- **Asserts:** confirming generation shows the shared upgrade message and posts no locally composed fallback prompt; an unopened pane sends the agent identity captured when the dialog opened even if the card changes before Yes; a daemon refusal and a silent-daemon timeout show exactly the desktop's shared client error sentence in the status.
+- **Tests:** `config_gen_001_older_daemon_shows_upgrade_without_posting_a_fallback`, `config_gen_001_confirmation_keeps_the_agent_it_opened_for`, `config_gen_001_refusal_uses_the_desktop_failure_sentence`, and `config_gen_001_timeout_uses_the_desktop_failure_sentence` in `src/ui.rs`; mouse/keyboard dispatch and a scripted daemon exercise the real controller.
+- **Does not assert:** successful delivery (covered by `inbox/route/007`) or the shared-client capability gate (`daemon/config-gen/004`).
 - **Platform coverage:** mac+linux.
 
-##### dashboard/config-gen/002 — Picking Never adds the cwd to the suppression list and the prompt does not re-open for that directory.
-- **Layer:** L2.
+The L1 `config_gen_001_existing_config_labels_footer_and_confirmation_update` in `src/ui.rs` also renders a daemon-hydrated card for absent, false, and true `project_config_exists` values, presses `g`, and checks the Generate/Update footer, dialog title, neutral Yes/No choices and existing-config question. The true case has an insta snapshot; no client-local filesystem inference is used.
+
+##### dashboard/config-gen/002 — Existing disabled automatic-prompt settings and recorded Never state remain readable.
+- **Layer:** pure-data, fast tier.
 - **Agent:** none.
-- **Asserts:** after Never, re-opening the new-pane flow for the same cwd does not surface the auto-prompt.
-- **Does not assert:** filesystem path of the suppression list (an implementation detail).
-- **Platform coverage:** mac+linux.
+- **Asserts:** a config containing `auto_config_prompt = false` and a persisted JSON state recording a suppressed directory both deserialize and retain their values.
+- **Test:** `config_gen_002_legacy_settings_and_never_state_still_load` in `tests/render_modal_buttons.rs`.
+- **Does not assert:** automatic dialog opening or suppression behavior; the dialog is requested manually.
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/config-gen/003 — A REAL interactive Haiku agent, asked from its card with `g` and Yes, proposes a config, waits for approval, and writes a `.dot-agent-deck.toml` that `validate` accepts (issue #2119, CLAUDE.md rule 4's real-usage bar).
+- **Layer:** L2 PTY-attached, lane 2 (the real `dot-agent-deck` binary in the vt100 `TuiDeck` harness with its lazy daemon). Runtime-skipped when the `claude` CLI or credentials are absent; `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1` turns that skip into a failure. Runs on a developer's machine and nowhere in CI (CLAUDE.md rule 5).
+- **Agent:** one REAL interactive Claude Code pane pinned to Haiku (`claude --model claude-haiku-4-5-20251001 --allowedTools Bash Read Write Edit Glob Grep`, no `-p`), started over the attach socket (`StartAgent`) in the `config-gen-live` fixture, a two-file project (Makefile and README) with no `.dot-agent-deck.toml` whose only agent launcher is the uniquely named Makefile target `deck-agent-7f3a2c`. Credentials imported into the per-test HOME; `with_claude_trust_workdir()` pre-trusts the work dir.
+- **Asserts:** with the agent's pane opened (`1`, then Ctrl+D back to command mode), pressing `g` on the selected card and Enter on Yes posts one `configuration request` message, bound to the agent, whose body is the daemon-composed `config_gen_prompt` for the agent's cwd; the agent acknowledges it and ends its turn without writing the file (the prompt's present-then-wait step); Yes leaves the TUI typing into the agent's pane, and the approval typed there leads to a `.dot-agent-deck.toml` with an `[[orchestrations]]` table that the real `dot-agent-deck validate` accepts; the agent named `deck-agent-7f3a2c` in its proposal or in the file.
+- **Test:** `config_gen_003_a_real_agent_generates_a_valid_config_after_approval` in `tests/e2e_config_generation_live.rs`.
+- **Does not assert:** the exact roles or prose the model proposes; the message wire shape and the stand-in delivery (`inbox/route/007`); the verb and its capability gate (`daemon/config-gen/*`); the upgrade message on an older daemon (`dashboard/config-gen/001`); the desktop's Generate affordance.
+- **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", feature = "e2e-live", unix))]` — the attach helpers it drives are Unix-domain-socket only).
+
+##### dashboard/config-gen/004 — A REAL interactive Haiku agent updates an existing config after approval and preserves user-written content.
+- **Layer:** L2 PTY-attached, lane 2; runs locally with Claude Code credentials, never in CI. `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1` makes unavailable credentials fail instead of skip.
+- **Agent:** one real interactive Claude Code Haiku pane, using the same command, credential import and trusted work directory as `/003`, in the `config-gen-existing-live` fixture.
+- **Asserts:** the fixture's existing config passes `dot-agent-deck validate`; pressing `g` on the selected card and confirming Yes delivers a request naming that existing file with the words "already exists"; the agent acknowledges and proposes without changing the file before approval; approval typed into the focused pane requests a concrete addition, role `tester-5e1c9a` with command `make deck-agent-7f3a2c`, and produces a changed config that validates, adds that role to `user-maintenance-91b7ef`, and preserves the orchestration's original orchestrator and reviewer roles with their commands and the reviewer's distinctive user-written description byte for byte.
+- **Test:** `config_gen_004_a_real_agent_updates_a_config_preserving_user_content` in `tests/e2e_config_generation_live.rs`.
+- **Does not assert:** exact model prose or the complete proposed diff; preservation of every possible TOML field; desktop controls.
+- **Platform coverage:** mac+linux (Unix attach socket).
 
 ### Statuses
 
@@ -2311,6 +2331,40 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 - **Agent:** synthetic Codex events.
 - **Asserts:** after a history-only `SessionStart` and 51 later events omitting `live_target`, the session remains `Writable::HistoryOnly` rather than falling back to Live when the first event leaves the 50-entry journal.
 - **Does not assert:** reconnect serialization (covered by `session/live/010`) or card rendering (`dashboard/pane/009`).
+- **Platform coverage:** mac+linux+windows.
+
+#### daemon/config-gen
+
+##### daemon/config-gen/001 — Hello advertises config generation without changing the protocol version.
+- **Layer:** protocol, fast tier.
+- **Agent:** none.
+- **Asserts:** the in-process daemon advertises `generate-config` alongside `inbox` and retains protocol version 12.
+- **Test:** `config_gen_001_hello_advertises_generation_without_version_bump` in `tests/daemon_protocol.rs`.
+- **Does not assert:** message delivery (`daemon/config-gen/002`).
+- **Platform coverage:** mac+linux.
+
+##### daemon/config-gen/002 — The daemon composes the exact config request for the selected pane's own directory.
+- **Layer:** protocol, fast tier.
+- **Agent:** none (in-process daemon with cat panes).
+- **Asserts:** one request reaches the target's current agent; its complete body equals `config_gen_prompt` for the daemon's target cwd, and another pane receives nothing. Creating a config before the next request switches it to read/preserve/update/approval instructions naming the exact file; ListAgents reports a fresh optional `project_config_exists` boolean for regular files in the exact cwd, excluding parent configs and directories. Older records omit the unknown flag on serialization.
+- **Tests:** `config_gen_002_daemon_posts_exact_prompt_for_target_cwd` and `config_gen_002_records_report_exact_cwd_config_file` in `tests/daemon_protocol.rs`; `prompt_existing_config_is_read_and_updated_only_after_approval` in `src/config_gen.rs` checks the compose-time prompt variant and unchanged non-file controls.
+- **Does not assert:** real-model compliance or UI confirmation (`inbox/route/007`).
+- **Platform coverage:** mac+linux.
+
+##### daemon/config-gen/003 — A missing or replaced config-generation target is refused.
+- **Layer:** protocol, fast tier.
+- **Agent:** none (in-process daemon with cat panes).
+- **Asserts:** an unknown pane and a request retaining a replaced agent's identity are refused without posting a message to the replacement; replacing an agent after the live sample while the cwd lookup is blocked is refused with both omitted and supplied expected identity, and the replacement inbox stays empty; an unchanged occupant receives one message as a control.
+- **Tests:** `config_gen_003_missing_or_replaced_target_receives_nothing` in `tests/daemon_protocol.rs`; `config_gen_003_replacement_during_directory_lookup_receives_nothing` in `src/daemon_protocol.rs`.
+- **Does not assert:** user-facing refusal wording.
+- **Platform coverage:** mac+linux.
+
+##### daemon/config-gen/004 — The shared client withholds config generation without the advertised capability.
+- **Layer:** protocol/client, fast tier.
+- **Agent:** none.
+- **Asserts:** absent, empty, and generic-inbox-only capability sets return Unsupported without connecting to the daemon.
+- **Test:** `config_gen_004_client_withholds_generation_from_older_daemon` in `tests/config_generation.rs`.
+- **Does not assert:** TUI status rendering (`dashboard/config-gen/001`).
 - **Platform coverage:** mac+linux+windows.
 
 #### daemon/status
@@ -8432,14 +8486,14 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 ##### mouse/modal/001 — Modal dialog buttons fire their action like the keyboard.
 - **Layer:** L2.
 - **Agent:** none (synthetic card for config-gen; fixture `schedules.toml` via `DOT_AGENT_DECK_SCHEDULES` for the Schedules manager).
-- **Asserts:** quit-confirm `[Cancel]` dismisses (app stays), config-gen `[Never]` sets the "Config prompt suppressed" status, help `[Close]` closes the overlay, and the "Schedules" manager dialog's `[Delete]` button surfaces the definition-only delete-confirmation (`Delete schedule '<name>'?`) like pressing `d` (PRD #127 finding #4 — modal mouse parity).
+- **Asserts:** quit-confirm `[Cancel]` dismisses (app stays), config-gen offers Yes/No without Never or the obsolete automatic-prompt hint and `[No]` dismisses without preventing another manual request, help `[Close]` closes the overlay, and the "Schedules" manager dialog's `[Delete]` button surfaces the definition-only delete-confirmation (`Delete schedule '<name>'?`) like pressing `d` (PRD #127 finding #4 — modal mouse parity).
 - **Does not assert:** the destructive quit-confirm `[Detach]`/`[Stop]` (process-exit, keyboard-tested) or the star-prompt (not deterministically triggerable); the manager dialog's other clickable actions — `[Add]`/`[Edit]`/`[Run now]` — which the coder must also wire (and whose click outcomes are deferred).
 - **Platform coverage:** mac+linux.
 
 ##### mouse/modal/002 — Each modal renders explicit buttons alongside its existing selection list / hint.
 - **Layer:** L1.
 - **Agent:** none.
-- **Asserts:** quit-confirm `[Detach] [Stop] [Cancel]`, config-gen `[Yes] [No] [Never]`, star `[Star] [Snooze] [Dismiss]`, and help `[Close]` render while the existing list / hint text is still present (additive).
+- **Asserts:** quit-confirm `[Detach] [Stop] [Cancel]`, config-gen `[Yes] [No]`, star `[Star] [Snooze] [Dismiss]`, and help `[Close]` render with explanatory content; config-gen contains neither Never nor the inert automatic-prompt hint and has an insta snapshot.
 - **Does not assert:** click outcomes (covered by `mouse/modal/001`).
 - **Platform coverage:** mac+linux+windows.
 
@@ -14553,11 +14607,11 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
 
-##### inbox/route/007 — Request configuration generation from a live synthetic card through the real TUI and accept the dialog. One bound configuration prompt must be queued without typed content; after Idle its pane fetches and renders the instructions.
-- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
+##### inbox/route/007 — Confirm config generation in the attached TUI and also request it through the daemon verb; both deliver the exact prompt for the target directory.
+- **Layer:** L1 in-process action dispatch and rendered status row; L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
 - **Agent:** none.
-- **Asserts:** Request configuration generation from a live synthetic card through the real TUI and accept the dialog. One bound configuration prompt must be queued without typed content; after Idle its pane fetches and renders the instructions.
-- **Test:** `route_007_tui_config_generation_posts_bound_message` in `tests/e2e_inbox_route.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
+- **Asserts:** confirming Yes in the real TUI opens a socket-started agent's previously unopened pane in typing mode, displays its output, and sends typed approval there; confirming Yes and calling the daemon's `generate-config` verb each queue one bound message with a complete body equal to `config_gen_prompt` for the daemon-reported target cwd; after Idle its pane fetches the instructions without typed prompt content. L1 covers mouse and keyboard confirmation with successful hydration, unavailable hydration and refused bound focus: typing starts after successful focus, and a failed focus keeps the card in command mode with the sent notice visible.
+- **Tests:** `route_007_tui_config_generation_posts_bound_message` in `tests/e2e_inbox_route.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane. `route_007_sent_config_opens_an_unwired_pane_or_keeps_the_card` in `src/ui.rs`.
 - **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
 
@@ -15845,6 +15899,39 @@ These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[
 - **Asserts:** both daemons give their agent the same id (required, not assumed); with All Decks selected the window shows two connected sections, each holding only its own deck's row, with both lamps connected and the deck counter at `2/2`; after the far daemon is stopped, its section stays, reads disconnected with a disconnected lamp and lists no agents, while the local deck keeps exactly its own row and its connected lamp, and the counter reads `1/2`.
 - **Does not assert:** three or more decks, a deck waiting to report, an unconfigured deck-list row, a deck coming back, New agent or a pane on the far deck, or a far deck on another machine; the far deck shares this machine's filesystem, so it says nothing about a window rendering a far host's paths.
 - **Platform coverage:** Linux WebKitGTK only. Needs a system `sshd` (`DAD_DRIVER_SSHD`) and `libnss_wrapper.so` (`DAD_DRIVER_NSS_WRAPPER`); the scenario fails naming whichever is missing.
+
+## Desktop configuration generation scenarios
+
+These desktop Rust and Vitest tests live outside the root Rust spec scanner, as do the native desktop scenarios below.
+
+#### desktop/config-gen
+
+##### desktop/config-gen/001 — Generation reaches the selected agent's owning daemon and preserves each outcome.
+- **Layer:** fast-tier Rust socket tests and Vitest bridge tests.
+- **Agent:** none (scripted daemon).
+- **Tests:** `config_gen_001_desktop_routes_to_the_owner_and_maps_every_outcome`, `config_gen_001_desktop_refuses_a_restarted_target`, and `config_gen_001_desktop_timeout_uses_the_shared_client_failure_sentence` in `desktop/src-tauri/src/dto.rs`; `desktop/config-gen/001: …` in `desktop/src/lib/bridgeIncarnation.test.ts`.
+- **Optional field:** `agent_mapping_is_frontend_stable` in `desktop/src-tauri/src/dto.rs` also checks that daemon `project_config_exists` true/false/unknown maps to desktop `projectConfigExists` without losing the distinction.
+- **Asserts:** a named agent's request carries its pane and expected agent identity to its owning daemon even when another daemon is selected; sent, unsupported and failed outcomes use the shared crate strings; a silent daemon returns the same client timeout sentence as the TUI without a success claim; an old daemon receives no fallback and a successor process receives no acting request; IPC carries deck, agent, pane and incarnation.
+- **Does not assert:** real agents or native webview rendering.
+- **Platform coverage:** Rust socket test on Unix; Vitest on mac+linux+windows.
+
+##### desktop/config-gen/002 — Generate config uses a neutral Yes/No confirmation and shows the result.
+- **Layer:** Vitest, rendered React components with an injected runtime.
+- **Agent:** none.
+- **Tests:** `desktop/config-gen/002: …` in `desktop/src/components/AgentOverviewStop.test.tsx` and `desktop/src/lib/voiceActions.test.ts`.
+- **Existing config:** the row's accessible label and tooltip, pane-header control, confirmation title and question use Update for `projectConfigExists: true`; false and unknown retain Generate. No remains inert and Yes retains the shared outcome message.
+- **Asserts:** action on the overview row and open agent pane; TUI title and explanation; Yes/No only without destructive styling; No sends nothing; Yes preserves the captured binding, focuses the sent target and shows success; unsupported/failure show their shared text without claiming success; dismissing a pending generation and opening another agent preserves the user's navigation when success arrives late, both from the overview and from an already-open pane; an older failure cannot overwrite a newer success on either entry path; a late result for an old incarnation cannot appear in a reused agent ID's successor pane.
+- **Does not assert:** Tauri transport (covered by desktop/config-gen/001), real agents or a TUI-style desktop command-key layer (none exists).
+- **Platform coverage:** mac+linux+windows.
+
+##### desktop/config-gen/003 — Voice and clicking open the same Generate config confirmation.
+- **Layer:** fast-tier Rust voice-table/outcome tests and Vitest shell/registry tests.
+- **Agent:** none (synthetic voice resolution).
+- **Tests:** `voice_table_config_gen_003_generation_is_agent_targeted_and_only_asks` in `desktop/src-tauri/src/voice/table.rs`; `voice_outcome_config_gen_003_named_pane_requests_give_stop_style_guidance` and `voice_outcome_config_gen_003_private_names_allow_only_the_viewed_agent` in `desktop/src-tauri/src/voice/outcome.rs`; `desktop/config-gen/003: …` in `desktop/src/components/VoiceAgentBinding.test.tsx` and `desktop/src/lib/voiceActions.test.ts`, plus the latter's literal registry classification test.
+- **Update synonym:** shipped command descriptions advertise “update config”; nameless private pane requests resolve locally for both verbs; named dashboard requests reach `confirmGenerateConfig` for either verb. Vitest opens Generate/Update confirmations from either voice phrase regardless of the displayed label.
+- **Asserts:** `generate_config` names `confirmGenerateConfig`, is agent-targeted on overview/agent screens and advertises “generate config”; the registry is voice-enabled; both the control and voice dispatch open the Yes/No confirmation without sending work; naming another live agent in a pane gives stop-style guidance without confirming or sending; with names withheld, a bare pane request dispatches with no parameters and confirms the viewed process, while the dashboard still requires a target and explicit names cannot silently target the viewed agent; delayed nameless bare/model-resolved requests cannot open a confirmation or send work after a pane switch, and the voice report gives the stop-style refusal, while an unchanged pane still confirms and sends to the original agent; component tests also cover a daemon restart and same-process agent replacement during resolution.
+- **Does not assert:** real microphone capture, transcription or model intent classification.
+- **Platform coverage:** mac+linux+windows.
 
 ## Desktop native network scenarios
 

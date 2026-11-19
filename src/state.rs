@@ -1926,6 +1926,12 @@ pub struct AppState {
     /// a failed integration refresh among them — while it spawns it, before
     /// the client has its card; the surfacing start carries them.
     pane_inboxes: HashMap<String, PaneInbox>,
+    /// PRD #2119: per pane, the agent the daemon last listed on it and whether
+    /// that agent's project already holds a `.dot-agent-deck.toml`
+    /// ([`crate::agent_pty::AgentRecord::project_config_exists`]), as of the
+    /// last listing this client read ([`Self::take_project_config_flags`]).
+    /// No entry is unknown. Forgotten with the pane.
+    pane_project_config: HashMap<String, (String, bool)>,
     /// PRD #1666 part 3 (Q35-20e): the daemon's latest word on held typing,
     /// by pane, at most [`MAX_PENDING_INPUT_HELD`] (the oldest word goes
     /// first), kept apart from the pane's account, which a close drops. A
@@ -9519,6 +9525,7 @@ impl AppState {
         // reused pane id surfaces with its own.
         self.pane_surfaced_agent_seq.remove(pane_id);
         self.pane_inboxes.remove(pane_id);
+        self.pane_project_config.remove(pane_id);
         // PRD #1666: and its doorbell epoch. A successor restarting the count
         // at 0 cannot satisfy an admission captured for the previous agent:
         // the doorbell's writer re-checks the agent that owns the pane.
@@ -10212,6 +10219,37 @@ impl AppState {
         // PRD #1666 §2.8: the reply's inbox counts are each card's new
         // starting point, now that its live fields are.
         self.take_inbox_snapshot(records);
+        self.take_project_config_flags(records);
+    }
+
+    /// PRD #2119: the daemon's word, from a listing of its agents, on which
+    /// agents' projects already hold a `.dot-agent-deck.toml`. Each listed pane
+    /// takes its record's value; a record that does not say (no cwd, an older
+    /// daemon) leaves the pane unknown.
+    pub fn take_project_config_flags(&mut self, records: &[crate::agent_pty::AgentRecord]) {
+        for record in records {
+            let Some(pane_id) = record.pane_id_env.as_deref() else {
+                continue;
+            };
+            match record.project_config_exists {
+                Some(exists) => {
+                    self.pane_project_config
+                        .insert(pane_id.to_string(), (record.id.clone(), exists));
+                }
+                None => {
+                    self.pane_project_config.remove(pane_id);
+                }
+            }
+        }
+    }
+
+    /// PRD #2119: whether the daemon last reported that `session`'s project
+    /// already holds a `.dot-agent-deck.toml`. `None` when it has not said for
+    /// this card's agent.
+    pub fn project_config_exists(&self, session: &SessionState) -> Option<bool> {
+        let pane_id = session.pane_id.as_deref()?;
+        let (agent_id, exists) = self.pane_project_config.get(pane_id)?;
+        (session.agent_id.as_deref() == Some(agent_id.as_str())).then_some(*exists)
     }
 
     /// PRD #1666 §2.8: the daemon's agents, read in order with the event
@@ -11392,6 +11430,7 @@ impl AppState {
         self.managed_pane_ids.remove(pane_id);
         self.pane_surfaced_agent_seq.remove(pane_id);
         self.pane_inboxes.remove(pane_id);
+        self.pane_project_config.remove(pane_id);
         self.pane_event_epochs.remove(pane_id);
         self.pane_doorbell_ready.remove(pane_id);
         self.pane_role_map.remove(pane_id);
