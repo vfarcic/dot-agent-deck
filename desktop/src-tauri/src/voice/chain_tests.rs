@@ -71,11 +71,11 @@ fn refused(outcome: &VoiceOutcome) -> &str {
 }
 
 /// Scenario: say "open the overview and then the tester" on the Daemons
-/// screen, answered as two steps each asked for by its own words. Both steps
-/// pass every check, and the chain is still refused because chains are not
-/// enabled yet — nothing runs.
+/// screen, answered as two steps each asked for by its own words. The answer
+/// is a chain of both steps, each with the screen it was judged on and its
+/// own report, and one sentence reporting both.
 #[tokio::test]
-async fn voice_chain_a_valid_chain_is_refused_until_chains_are_enabled() {
+async fn voice_chain_a_valid_chain_is_answered_with_its_steps() {
     let said = "open the overview and then the tester";
     let resolver = StubResolver::new()
         .answering(
@@ -88,7 +88,83 @@ async fn voice_chain_a_valid_chain_is_refused_until_chains_are_enabled() {
         .judging("open the overview", "open_overview", true)
         .judging("the tester", "open_agent", true);
     let outcome = run(&resolver, Screen::Deck, said).await;
-    assert!(refused(&outcome).contains("not enabled yet"), "{outcome:?}");
+    let VoiceOutcome::Chain {
+        steps, sentence, ..
+    } = &outcome
+    else {
+        panic!("expected a chain, got {outcome:?}");
+    };
+    let shape: Vec<_> = steps
+        .iter()
+        .map(|step| (step.action.as_str(), step.screen, step.said.as_str()))
+        .collect();
+    assert_eq!(
+        shape,
+        [
+            ("open_overview", Screen::Deck, "open the overview"),
+            ("open_agent", Screen::Overview, "the tester"),
+        ]
+    );
+    assert_eq!(steps[1].params[0].value, "1");
+    assert!(sentence.contains(", then "), "{sentence}");
+    assert!(sentence.ends_with('.'), "{sentence}");
+}
+
+/// Scenario: "make it a dispatcher, use codex and name it triage bot" with
+/// the New agent form open: three form choices, each kept on the form, are a
+/// chain of three steps judged on the same screen.
+#[tokio::test]
+async fn voice_chain_three_form_choices_are_one_chain() {
+    let said = "make it a dispatcher, use codex and name it triage bot";
+    let form: super::VoiceNewAgent = serde_json::from_value(serde_json::json!({ "form": {
+        "deckId": "deck-local",
+        "path": "/home/dev/code/billing",
+        "modes": [{ "id": "none", "label": "No mode" }, { "id": "dispatcher", "label": "dispatcher" }],
+        "agentTypes": [{ "id": "claude", "label": "Claude Code" }, { "id": "codex", "label": "Codex" }],
+    }}))
+    .expect("form");
+    let resolver = StubResolver::new()
+        .answering(
+            said,
+            chain(vec![
+                step(
+                    "choose_mode",
+                    "make it a dispatcher",
+                    &[("mode", "dispatcher")],
+                ),
+                step("choose_agent_type", "use codex", &[("agent_type", "codex")]),
+                step(
+                    "name_new_agent",
+                    "name it triage bot",
+                    &[("prefix", "name it")],
+                ),
+            ]),
+        )
+        .judging("make it a dispatcher", "choose_mode", true)
+        .judging("use codex", "choose_agent_type", true)
+        .judging("name it triage bot", "name_new_agent", true);
+    let outcome = handle_utterance(
+        &resolver,
+        table(),
+        Screen::Overview,
+        &fleet(),
+        &decks(),
+        None,
+        Some(&form),
+        Transcript::new(said),
+    )
+    .await
+    .outcome;
+    let VoiceOutcome::Chain { steps, .. } = &outcome else {
+        panic!("expected a chain, got {outcome:?}");
+    };
+    assert_eq!(
+        steps
+            .iter()
+            .map(|step| step.action.as_str())
+            .collect::<Vec<_>>(),
+        ["choose_mode", "choose_agent_type", "name_new_agent"]
+    );
 }
 
 /// Scenario: the meaning check finds the whole sentence asks to open the

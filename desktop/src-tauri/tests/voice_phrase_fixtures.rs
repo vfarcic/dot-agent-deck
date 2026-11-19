@@ -250,6 +250,8 @@ enum OutcomeKind {
     Dropped,
     /// PRD #1184: an utterance answered as steps the app would not run.
     ChainRefused,
+    /// PRD #1184: an utterance answered as steps to run in order.
+    Chain,
 }
 
 impl fmt::Display for OutcomeKind {
@@ -267,6 +269,7 @@ impl fmt::Display for OutcomeKind {
             Self::TranscriptionFailed => "transcription_failed",
             Self::Dropped => "dropped",
             Self::ChainRefused => "chain_refused",
+            Self::Chain => "chain",
         })
     }
 }
@@ -336,6 +339,11 @@ fn observed(outcome: &VoiceOutcome) -> (Option<&str>, OutcomeKind, Option<&str>)
         VoiceOutcome::TranscriptionFailed { .. } => (None, OutcomeKind::TranscriptionFailed, None),
         VoiceOutcome::Dropped { .. } => (None, OutcomeKind::Dropped, None),
         VoiceOutcome::ChainRefused { .. } => (None, OutcomeKind::ChainRefused, None),
+        VoiceOutcome::Chain { steps, .. } => (
+            steps.first().map(|step| step.action.as_str()),
+            OutcomeKind::Chain,
+            None,
+        ),
     }
 }
 

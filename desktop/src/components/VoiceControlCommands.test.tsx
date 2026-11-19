@@ -52,6 +52,8 @@ import {
   VOICE_DICTATION_TICK_MS,
   VOICE_JOIN_WINDOW_MS,
   VOICE_STATUS_POLL_MS,
+  VOICE_CHAIN_SETTLE_MS,
+  chainStopped,
 } from "./VoiceControlPanel";
 
 /**
@@ -5571,5 +5573,112 @@ describe("switch deck by voice, against settings edited mid-flight", () => {
     const report = screen.getByTestId("voice-report");
     expect(report).toHaveTextContent("Showing deploy@build-box.");
     expect(report).not.toHaveTextContent("try again");
+  });
+});
+
+describe("chains of commands from one utterance (PRD #1184)", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const PLANNER: VoiceResolvedParamDto[] = [
+    { name: "agent", kind: "agent_ref", spoken: "planner", value: "planner", label: "Planner" },
+  ];
+  const SAID = "open the overview and then the planner";
+
+  type ChainStep = Extract<VoiceResultDto["outcome"], { kind: "chain" }>["steps"][number];
+  function chain(steps: ChainStep[], sentence: string, transcript = SAID): VoiceResultDto {
+    return { resolveMs: 21, backend: "stub", outcome: { kind: "chain", transcript, steps, sentence } };
+  }
+  const OVERVIEW_STEP: ChainStep = { said: "open the overview", action: "open_overview", invoke: "openOverview", params: [], sentence: "Opening the agent dashboard.", screen: "deck" };
+  const PLANNER_STEP: ChainStep = { said: "the planner", action: "open_agent", invoke: "openAgent", params: PLANNER, sentence: "Opening Planner.", screen: "overview" };
+
+  /** Let a chain's later steps find the screen the earlier ones moved to. */
+  async function settle() {
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_CHAIN_SETTLE_MS * 2); });
+    await flush();
+  }
+
+  /**
+   * Scenario: on the Daemons screen, say "open the overview and then the
+   * planner". Both steps run in order — the dashboard, then the Planner's
+   * pane over it — the row reports both, and one Undo puts the Daemons
+   * screen back.
+   */
+  it("runs every step, reports them together, and undoes the whole chain", async () => {
+    const voice = microphone([SAID]);
+    const resolveVoice: ResolveVoice = vi.fn(async () => chain([OVERVIEW_STEP, PLANNER_STEP], "Opening the agent dashboard, then opening Planner."));
+    render(<DeckShell runtime={runtime(resolveVoice, voice)} />);
+
+    await turnVoiceOn();
+    await completeUtterance();
+    await settle();
+
+    expect(screen.getByTestId("agent-pane-overlay")).toBeInTheDocument();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Opening the agent dashboard, then opening Planner.");
+    const undo = screen.getByRole("button", { name: "Undo" });
+    fireEvent.click(undo);
+    await flush();
+    expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
+    expect(screen.queryByTestId("overview-table-region")).toBeNull();
+  });
+
+  /**
+   * Scenario: a chain whose second step was judged on a screen the first one
+   * does not lead to. The first step runs; the second never finds its
+   * screen, so it does not run, and the row says which step stopped and which
+   * ran — never a silent partial chain, and no Undo.
+   */
+  it("stops at a step whose screen never arrives and says what ran", async () => {
+    const voice = microphone([SAID]);
+    const resolveVoice: ResolveVoice = vi.fn(async () => chain([OVERVIEW_STEP, { ...PLANNER_STEP, screen: "agent" }], "Opening the agent dashboard, then opening Planner."));
+    render(<DeckShell runtime={runtime(resolveVoice, voice)} />);
+
+    await turnVoiceOn();
+    await completeUtterance();
+    await settle();
+
+    expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
+    expect(screen.getByTestId("overview-table-region")).toBeVisible();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(
+      "Step 2 (“the planner”) was refused: you moved to another screen. Step 1 (“open the overview”) ran.",
+    );
+    expect(screen.queryByRole("button", { name: "Undo" })).toBeNull();
+  });
+
+  /**
+   * Scenario: a chain whose last step opens Settings, which moves no view.
+   * Both steps run, and no Undo is offered, because an Undo that restored the
+   * view would leave Settings open — not the whole chain reversed.
+   */
+  it("offers no Undo when a step did not move the view", async () => {
+    const voice = microphone(["open the overview and then settings"]);
+    const resolveVoice: ResolveVoice = vi.fn(async () => chain([
+      OVERVIEW_STEP,
+      { said: "settings", action: "open_settings", invoke: "openSettings", params: [], sentence: "Opening Settings.", screen: "overview" },
+    ], "Opening the agent dashboard, then opening Settings.", "open the overview and then settings"));
+    render(<DeckShell runtime={runtime(resolveVoice, voice)} />);
+
+    await turnVoiceOn();
+    await completeUtterance();
+    await settle();
+
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Opening the agent dashboard, then opening Settings.");
+    expect(screen.queryByRole("button", { name: "Undo" })).toBeNull();
+  });
+});
+
+describe("chainStopped (PRD #1184)", () => {
+  /** Scenario: the stop report names the step, its reason and every step that ran, in order. */
+  it("names the step that stopped and the steps that ran", () => {
+    expect(chainStopped(0, "open the tester", "No agent here is called that.", [])).toBe("Step 1 (“open the tester”) was refused: No agent here is called that. Nothing ran.");
+    expect(chainStopped(2, "name it triage", "the form closed", ["make it a dispatcher", "use codex"])).toBe(
+      "Step 3 (“name it triage”) was refused: the form closed. Steps 1 (“make it a dispatcher”) and 2 (“use codex”) ran.",
+    );
   });
 });

@@ -599,6 +599,34 @@ pub enum VoiceOutcome {
         transcript: Transcript,
         sentence: String,
     },
+    /// PRD #1184: two or three steps that passed every check, to run in
+    /// order. The panel runs each one exactly as it runs a single dispatch,
+    /// and before every step after the first it checks that the screen is the
+    /// one the step was judged on; the first step that cannot run stops the
+    /// chain, and the panel says which step stopped and which ran.
+    Chain {
+        transcript: Transcript,
+        steps: Vec<ChainStep>,
+        sentence: String,
+    },
+}
+
+/// One step of a [`VoiceOutcome::Chain`]: a dispatch, with the words it came
+/// from and the screen it was judged on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChainStep {
+    /// The user's words for this step, quoted in the report.
+    pub said: String,
+    pub action: String,
+    pub invoke: String,
+    pub params: Vec<ResolvedParam>,
+    /// What this step reports when it runs.
+    pub sentence: String,
+    /// The screen the step was judged on: the one the user was on for the
+    /// first step, and the one the earlier steps lead to for the others. The
+    /// panel refuses the step when the screen is not this one when it runs.
+    pub screen: Screen,
 }
 
 impl VoiceOutcome {
@@ -616,7 +644,8 @@ impl VoiceOutcome {
             | VoiceOutcome::ResolutionFailed { sentence, .. }
             | VoiceOutcome::TranscriptionFailed { sentence, .. }
             | VoiceOutcome::Dropped { sentence, .. }
-            | VoiceOutcome::ChainRefused { sentence, .. } => sentence,
+            | VoiceOutcome::ChainRefused { sentence, .. }
+            | VoiceOutcome::Chain { sentence, .. } => sentence,
         }
     }
 
@@ -1450,6 +1479,7 @@ async fn chain_outcome(
     let mut screen = context.screen;
     let (directories, new_agent) = (context.directories, context.new_agent);
     let mut deck_switched = false;
+    let mut steps = Vec::with_capacity(rows.len());
     let last = rows.len() - 1;
     for (at, &(step, row)) in rows.iter().enumerate() {
         let number = at + 1;
@@ -1487,7 +1517,15 @@ async fn chain_outcome(
             row,
         };
         let outcome = settle(&picked, &mut ballot).await;
-        let VoiceOutcome::Dispatch { action, params, .. } = &outcome else {
+        let judged_on = screen;
+        let VoiceOutcome::Dispatch {
+            action,
+            invoke,
+            params,
+            sentence,
+            ..
+        } = &outcome
+        else {
             return refuse(situation_of(outcome.sentence()).to_string());
         };
         let dispatched = table.row(action).unwrap_or(row);
@@ -1535,11 +1573,44 @@ async fn chain_outcome(
                 Lands::DeckSwitched => deck_switched = true,
             },
         }
+        steps.push(ChainStep {
+            said: step.said.clone(),
+            action: action.clone(),
+            invoke: invoke.clone(),
+            params: params.clone(),
+            sentence: sentence.clone(),
+            screen: judged_on,
+        });
     }
-    VoiceOutcome::chain_refused(
+    let sentence = chain_sentence(&steps);
+    VoiceOutcome::Chain {
         transcript,
-        "doing several things from one sentence is not enabled yet, so nothing was done; say one command at a time",
-    )
+        steps,
+        sentence,
+    }
+}
+
+/// What a chain reports when every step ran: each step's own sentence, in
+/// order, joined by "then" ("Showing the agent overview, then opening
+/// tester.").
+fn chain_sentence(steps: &[ChainStep]) -> String {
+    let parts: Vec<String> = steps
+        .iter()
+        .enumerate()
+        .map(|(at, step)| {
+            let text = step.sentence.trim().trim_end_matches('.');
+            if at == 0 {
+                text.to_string()
+            } else {
+                let mut letters = text.chars();
+                letters
+                    .next()
+                    .map(|first| first.to_lowercase().chain(letters).collect())
+                    .unwrap_or_default()
+            }
+        })
+        .collect();
+    format!("{}.", parts.join(", then "))
 }
 
 /// Everything [`decide`] reads besides the meaning check's answers: what the
@@ -6055,6 +6126,15 @@ pub fn address_deck_switch(
                 candidates.clear();
                 reports.clear();
             }
+        }
+        // PRD #1184: a chain's switch is addressed as a single one is.
+        VoiceOutcome::Chain { steps, .. } => {
+            steps
+                .iter_mut()
+                .filter(|step| step.action == SWITCH_DECK_ROW)
+                .flat_map(|step| step.params.iter_mut())
+                .filter(|param| param.kind == ParamKind::DeckRef)
+                .for_each(address);
         }
         _ => {}
     }

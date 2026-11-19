@@ -426,7 +426,7 @@ pub use choice::{ChoiceAnswer, ChoiceLive, MAX_CHOICES};
 pub use hold::VoiceHold;
 pub use meaning::{MeaningRequest, MeaningVerdict, Strictness};
 pub use outcome::{
-    ChoiceMatch, DeckRefMatch, DirRefMatch, FILTER_DASHBOARD_ROW, ResolvedParam,
+    ChainStep, ChoiceMatch, DeckRefMatch, DirRefMatch, FILTER_DASHBOARD_ROW, ResolvedParam,
     SHOW_HOST_METRICS_ROW, SWITCH_DECK_ROW, VoiceDeckIdentity, VoiceDeckSelection, VoiceOutcome,
     VoiceResult, address_deck_switch, handle_utterance, handle_utterance_after_local_intercepts,
     handle_utterance_with, handle_utterance_with_dictation, handle_utterance_with_modes,
