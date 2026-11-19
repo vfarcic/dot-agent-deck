@@ -18,9 +18,10 @@ const CONFIG_GEN_EXISTING_TEMPLATE: &str = include_str!("../assets/config_gen_ex
 const CONFIG_GEN_DANGLING_TEMPLATE: &str = include_str!("../assets/config_gen_dangling.md");
 
 /// PRD #2119: the section put ahead of the request when the deck could not
-/// tell, within [`CONFIG_CHECK_TIMEOUT`], whether the project already has a
-/// `.dot-agent-deck.toml`. Every instruction is conditional on what the agent
-/// finds there.
+/// tell whether the project already has a `.dot-agent-deck.toml`
+/// ([`ExistingConfig::Unknown`]: a check that did not finish within
+/// [`CONFIG_CHECK_TIMEOUT`], or a lookup error other than "not found"). Every
+/// instruction is conditional on what the agent finds there.
 const CONFIG_GEN_UNKNOWN_TEMPLATE: &str = include_str!("../assets/config_gen_unknown.md");
 
 /// PRD #2119: the bullet [`CONFIG_GEN_EXISTING_TEMPLATE`]'s `{link}` becomes
@@ -89,8 +90,11 @@ pub enum ExistingConfig {
         target: Option<std::path::PathBuf>,
         dangling: bool,
     },
-    /// The check did not finish within [`CONFIG_CHECK_TIMEOUT`] (or could not
-    /// be run), so the deck does not know.
+    /// The deck does not know: the check did not finish within
+    /// [`CONFIG_CHECK_TIMEOUT`] or could not be run, looking the name up
+    /// failed with anything but "not found" (`EACCES`, `EIO`, `ESTALE`, …),
+    /// or it is a symbolic link whose target could not be looked up for a
+    /// reason other than "not found".
     Unknown,
 }
 
@@ -118,27 +122,81 @@ impl ExistingConfig {
 /// content at that name, which a symlink is, dangling or not, so the request
 /// can tell the agent to keep it. The project resolver's no-follow policy is
 /// unchanged. A directory at that name is not a config.
+///
+/// Only "not found" establishes that nothing is there: any other error from
+/// the lookup (a permission failure, an unavailable mount) leaves a user's
+/// config possible, so it is [`ExistingConfig::Unknown`] and the request is
+/// the conditional one. Likewise a link is dangling only when its target is
+/// not found; a target that could not be looked up otherwise is unknown, not
+/// reported to the user as missing.
 pub fn existing_config(dir: &std::path::Path) -> ExistingConfig {
     let path = dir.join(crate::project_config::CONFIG_FILE_NAME);
-    match std::fs::symlink_metadata(&path) {
-        Err(_) => ExistingConfig::Absent,
-        Ok(meta) if meta.file_type().is_symlink() => ExistingConfig::Symlink {
-            target: std::fs::read_link(&path).ok(),
-            dangling: std::fs::metadata(&path).is_err(),
+    classify_existing_config(
+        std::fs::symlink_metadata(&path).map(|meta| EntryKind::of(meta.file_type())),
+        || std::fs::read_link(&path).ok(),
+        || std::fs::metadata(&path).map(|_| ()),
+    )
+}
+
+/// What `lstat` found at the config's name, as far as [`existing_config`]
+/// cares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryKind {
+    Symlink,
+    File,
+    /// A directory, FIFO, socket or device: not a config.
+    Other,
+}
+
+impl EntryKind {
+    fn of(file_type: std::fs::FileType) -> Self {
+        if file_type.is_symlink() {
+            Self::Symlink
+        } else if file_type.is_file() {
+            Self::File
+        } else {
+            Self::Other
+        }
+    }
+}
+
+/// [`existing_config`]'s decision, with the filesystem lookups passed in so a
+/// test can inject any error: `entry` is the `lstat` of the config's name,
+/// `read_link` what a link holds, and `follow` the `stat` through the link
+/// (called only for a link).
+fn classify_existing_config(
+    entry: std::io::Result<EntryKind>,
+    read_link: impl FnOnce() -> Option<std::path::PathBuf>,
+    follow: impl FnOnce() -> std::io::Result<()>,
+) -> ExistingConfig {
+    let not_found = |error: &std::io::Error| error.kind() == std::io::ErrorKind::NotFound;
+    match entry {
+        Err(error) if not_found(&error) => ExistingConfig::Absent,
+        Err(_) => ExistingConfig::Unknown,
+        Ok(EntryKind::Symlink) => match follow() {
+            Ok(()) => ExistingConfig::Symlink {
+                target: read_link(),
+                dangling: false,
+            },
+            Err(error) if not_found(&error) => ExistingConfig::Symlink {
+                target: read_link(),
+                dangling: true,
+            },
+            Err(_) => ExistingConfig::Unknown,
         },
-        Ok(meta) if meta.file_type().is_file() => ExistingConfig::File,
-        Ok(_) => ExistingConfig::Absent,
+        Ok(EntryKind::File) => ExistingConfig::File,
+        Ok(EntryKind::Other) => ExistingConfig::Absent,
     }
 }
 
 /// PRD #2119: whether `dir` itself holds a `.dot-agent-deck.toml` for
-/// generate/update purposes ([`existing_config`]): a regular file or a
-/// symbolic link (a dangling one included), at that exact directory, with no
-/// walk up the tree. **Blocking.**
-pub fn project_config_exists(dir: &str) -> bool {
-    existing_config(std::path::Path::new(dir))
-        .exists()
-        .unwrap_or(false)
+/// generate/update purposes ([`existing_config`]): `Some(true)` for a regular
+/// file or a symbolic link (a dangling one included), at that exact
+/// directory, with no walk up the tree; `Some(false)` when nothing is there;
+/// `None` when the check could not tell ([`ExistingConfig::Unknown`]).
+/// **Blocking.**
+pub fn project_config_exists(dir: &str) -> Option<bool> {
+    existing_config(std::path::Path::new(dir)).exists()
 }
 
 /// PRD #2119: how long the daemon waits for its config checks — a listing's
@@ -168,10 +226,12 @@ where
 }
 
 /// PRD #2119: [`existing_config`] for each of `dirs`, as one unit of blocking
-/// work off the async runtime, bounded by [`CONFIG_CHECK_TIMEOUT`]. `None`
-/// when the batch did not finish in time: every answer is then unknown. Call
-/// it holding no registry or `AppState` lock.
-pub async fn project_config_flags(dirs: Vec<String>) -> Option<Vec<bool>> {
+/// work off the async runtime, bounded by [`CONFIG_CHECK_TIMEOUT`]: one
+/// [`project_config_exists`] answer per directory, `None` among them where
+/// that check could not tell. `None` overall when the batch did not finish
+/// in time: every answer is then unknown. Call it holding no registry or
+/// `AppState` lock.
+pub async fn project_config_flags(dirs: Vec<String>) -> Option<Vec<Option<bool>>> {
     project_config_flags_within(
         crate::project_resolve::project_fs_limit(),
         CONFIG_CHECK_TIMEOUT,
@@ -185,7 +245,7 @@ pub(crate) async fn project_config_flags_within(
     limit: &std::sync::Arc<tokio::sync::Semaphore>,
     timeout: std::time::Duration,
     dirs: Vec<String>,
-) -> Option<Vec<bool>> {
+) -> Option<Vec<Option<bool>>> {
     off_runtime_within(limit, timeout, move || {
         dirs.iter()
             .map(|dir| project_config_exists(dir))
@@ -235,10 +295,11 @@ pub async fn config_gen_prompt_checked(dir: &str) -> String {
 
 /// The template's sentences that only fit a request to CREATE the file, each
 /// with what an update says instead. [`config_gen_prompt_for`] swaps them in
-/// for an existing config, so the request asks for one thing throughout; the
-/// test `update_wording_anchors_are_in_the_template` keeps each one present in
-/// the template, so a reworded template cannot silently leave the create
-/// wording in an update request.
+/// for an existing config. The test `update_wording_anchors_are_in_the_template`
+/// keeps each of these enumerated sentences present in the template, so
+/// rewording one of them fails that test instead of silently leaving its
+/// create wording in an update request; a create-only sentence added to the
+/// template later is not covered until it is listed here.
 const UPDATE_REWORDS: [(&str, &str); 5] = [
     (
         "Analyze this project and create a `.dot-agent-deck.toml` configuration file in the project root.",
@@ -262,6 +323,45 @@ const UPDATE_REWORDS: [(&str, &str); 5] = [
     ),
 ];
 
+/// The template's sentences that tell the agent to use the Role Library's
+/// text (or this request's composition advice) for a role, each with what a
+/// request that may find an existing config says instead: that text is for
+/// roles the agent ADDS, and what the user already wrote stays as written.
+/// [`config_gen_prompt_for`] swaps them in for an existing config and for the
+/// conditional (unknown) request; the plain create request keeps them, since
+/// there every role is one the agent adds. Without them the body's "use the
+/// library's description as-is" outweighed the preamble's "preserve", and a
+/// real agent replaced a user's role description with the library's
+/// (`dashboard/config-gen/004`). The test
+/// `update_wording_anchors_are_in_the_template` keeps each of these anchors
+/// in the template.
+const LIBRARY_SCOPE_REWORDS: [(&str, &str); 6] = [
+    (
+        "**Fill in each role's `command`** with",
+        "**Fill in the `command` of each role you add** (a role already in the existing file keeps the user's `command` exactly as written, unless they approve a change) with",
+    ),
+    (
+        "**Tune each role's `prompt_template`**: start from the library's suggestion,",
+        "**Tune the `prompt_template` of each role you add** (a role already in the existing file keeps the user's `prompt_template` exactly as written, unless they approve a change): start from the library's suggestion,",
+    ),
+    (
+        "**Compose the orchestrator's `prompt_template`** from the selected workers.",
+        "**Compose the orchestrator's `prompt_template`** from the selected workers, for an orchestration you add. An orchestration already in the existing file keeps its name and its orchestrator's `prompt_template` exactly as the user wrote them, unless they approve a change.",
+    ),
+    (
+        "description = \"Implements features, fixes bugs, refactors code\"   # From library",
+        "description = \"Implements features, fixes bugs, refactors code\"   # From library, only for a role you add",
+    ),
+    (
+        "Use the library's `description` as-is unless the project changes the role's scope.",
+        "Use the library's `description` as-is only for roles you add, unless the project changes the role's scope. A role already in the existing file keeps the user's `description` word for word: never replace it with the library's, reword it or move it into `prompt_template`, unless the user approves that change.",
+    ),
+    (
+        "`description` is what the role does (use as the role's `description`)",
+        "`description` is what the role does (use it as the `description` only for roles you add; a role already in the existing file keeps the user's)",
+    ),
+];
+
 /// The template's write step, which [`config_gen_prompt_for`] replaces for an
 /// existing config (after `{dir}` is filled in).
 const WRITE_STEP: &str = "5. Write the approved config to `{dir}/.dot-agent-deck.toml`.";
@@ -271,30 +371,38 @@ const WRITE_STEP: &str = "5. Write the approved config to `{dir}/.dot-agent-deck
 ///
 /// - [`ExistingConfig::Absent`]: the template as it always was, byte for byte.
 /// - [`ExistingConfig::File`]: the update preamble, then the template with its
-///   create-only sentences reworded ([`UPDATE_REWORDS`]) and its write step
-///   saying to edit the file in place.
+///   create-only sentences reworded ([`UPDATE_REWORDS`]), its Role Library
+///   sentences scoped to roles the agent adds ([`LIBRARY_SCOPE_REWORDS`]) and
+///   its write step saying to edit the file in place.
 /// - A resolving [`ExistingConfig::Symlink`]: as for a file, and the preamble
 ///   and the write step add that it is a link, to edit the file it points to
 ///   in place and to keep the link.
 /// - A dangling symlink: only the instruction to tell the user the link is
 ///   broken and write nothing — there is nothing to analyze against.
-/// - [`ExistingConfig::Unknown`]: the check timed out, so the file may well
-///   exist. Sending the create request then could have the agent replace a
+/// - [`ExistingConfig::Unknown`]: the check timed out or failed with an
+///   error other than "not found", so the file may well exist. Sending the create request then could have the agent replace a
 ///   file the user wrote, so the request is phrased conditionally instead: if
 ///   the file exists, read it first and propose changes; only if nothing is
-///   there, create it.
+///   there, create it. Its Role Library sentences are scoped to roles the
+///   agent adds ([`LIBRARY_SCOPE_REWORDS`]), as in an update.
 pub fn config_gen_prompt_for(dir: &str, existing: &ExistingConfig) -> String {
     let roles_section = render_roles_section(role_library());
     let body = CONFIG_GEN_PROMPT_TEMPLATE
         .replace("{dir}", dir)
         .replace("{roles}", &roles_section);
     let write_step = WRITE_STEP.replace("{dir}", dir);
+    let scope_library = |mut body: String| {
+        for (create, update) in LIBRARY_SCOPE_REWORDS {
+            body = body.replace(create, update);
+        }
+        body
+    };
     let update_body = |new_write_step: String| {
         let mut body = body.replace(&write_step, &new_write_step);
         for (create, update) in UPDATE_REWORDS {
             body = body.replace(create, update);
         }
-        body
+        scope_library(body)
     };
     let link_target = |target: &Option<std::path::PathBuf>| match target {
         Some(target) => format!("`{}`", target.display()),
@@ -344,8 +452,9 @@ pub fn config_gen_prompt_for(dir: &str, existing: &ExistingConfig) -> String {
                 "Analyze this project and create a `.dot-agent-deck.toml` configuration file in the project root, or, if it already has one, propose changes to it (see above).",
             );
             format!(
-                "{}{body}",
-                CONFIG_GEN_UNKNOWN_TEMPLATE.replace("{dir}", dir)
+                "{}{}",
+                CONFIG_GEN_UNKNOWN_TEMPLATE.replace("{dir}", dir),
+                scope_library(body)
             )
         }
     }
@@ -420,9 +529,10 @@ mod tests {
         );
     }
 
-    /// PRD #2119: every create-only sentence the update request rewords is in
-    /// the template exactly once, so a reworded template fails here rather
-    /// than leaving its create wording in an update request unnoticed.
+    /// PRD #2119: every create-only sentence the update request rewords, and
+    /// every Role Library sentence it scopes to added roles, is in the
+    /// template exactly once, so rewording one of those enumerated sentences
+    /// fails here rather than leaving it unreworded in an update request.
     #[test]
     fn update_wording_anchors_are_in_the_template() {
         for (create, _) in UPDATE_REWORDS {
@@ -430,6 +540,13 @@ mod tests {
                 CONFIG_GEN_PROMPT_TEMPLATE.matches(create).count(),
                 1,
                 "the template must hold {create:?} exactly once"
+            );
+        }
+        for (library, _) in LIBRARY_SCOPE_REWORDS {
+            assert_eq!(
+                CONFIG_GEN_PROMPT_TEMPLATE.matches(library).count(),
+                1,
+                "the template must hold {library:?} exactly once"
             );
         }
         assert_eq!(CONFIG_GEN_PROMPT_TEMPLATE.matches(WRITE_STEP).count(), 1);
@@ -493,6 +610,213 @@ mod tests {
         );
     }
 
+    /// PRD #2119 (live `dashboard/config-gen/004`): a request that may find an
+    /// existing config never tells the agent to use the Role Library's
+    /// description (or command, or prompt template) for a role without
+    /// scoping that to the roles it ADDS, and it says plainly that what the
+    /// user wrote stays word for word, with any change shown as a
+    /// before/after for approval. The plain create request is unchanged.
+    #[test]
+    fn update_request_scopes_library_text_to_roles_the_agent_adds() {
+        let dir = "/home/user/my-project";
+        let plain = config_gen_prompt_for(dir, &ExistingConfig::Absent);
+        for (library, _) in LIBRARY_SCOPE_REWORDS {
+            assert!(
+                plain.contains(library),
+                "the create request keeps {library:?}"
+            );
+        }
+        let requests = [
+            ("file", config_gen_prompt_for(dir, &ExistingConfig::File)),
+            (
+                "symlink",
+                config_gen_prompt_for(
+                    dir,
+                    &ExistingConfig::Symlink {
+                        target: Some("/home/user/dotfiles/deck.toml".into()),
+                        dangling: false,
+                    },
+                ),
+            ),
+            (
+                "unknown",
+                config_gen_prompt_for(dir, &ExistingConfig::Unknown),
+            ),
+        ];
+        for (name, request) in &requests {
+            for (library, scoped) in LIBRARY_SCOPE_REWORDS {
+                assert!(
+                    !request.replace(scoped, "").contains(library),
+                    "the {name} request still says {library:?} unscoped"
+                );
+                assert!(
+                    request.contains(scoped),
+                    "the {name} request must say {scoped:?}"
+                );
+            }
+            // However the template is reworded later: any sentence that hands
+            // the agent the library's description carries the added-role scope.
+            for sentence in request.split_inclusive(['.', '\n']) {
+                let lower = sentence.to_lowercase();
+                if lower.contains("library") && lower.contains("description") {
+                    assert!(
+                        lower.contains("you add") || lower.contains("already in the"),
+                        "the {name} request uses the library's description without the \
+                         only-for-roles-you-add scope: {sentence:?}"
+                    );
+                }
+            }
+            assert!(
+                !request
+                    .to_lowercase()
+                    .contains("use the library's `description` as-is unless"),
+                "the {name} request carries the unscoped as-is instruction"
+            );
+            for rule in [
+                "what the user wrote exactly as written.**",
+                "For every orchestration, role, `description`, `command` and `prompt_template` already in the file, keep the user's text word for word",
+                "apply only to roles and orchestrations you add",
+                "Do not propose changing the user's text just to match the library",
+                "propose that change as an explicit before/after",
+                "make it only if the user approves it",
+            ] {
+                assert!(
+                    request.contains(rule),
+                    "the {name} request's preamble must say {rule:?}"
+                );
+            }
+        }
+    }
+
+    /// PRD #2119 (reviewer P2): only "not found" means nothing is there. Any
+    /// other lookup error leaves a user's config possible, so it is unknown
+    /// (conditional request, no Update/Generate answer), and a link is
+    /// dangling only when its target is not found.
+    #[test]
+    fn only_a_not_found_lookup_means_no_config() {
+        use std::io::{Error, ErrorKind};
+        let no_link = || -> Option<std::path::PathBuf> { panic!("not a link: no readlink") };
+        let no_follow = || -> std::io::Result<()> { panic!("not a link: no stat") };
+        assert_eq!(
+            classify_existing_config(Err(Error::from(ErrorKind::NotFound)), no_link, no_follow),
+            ExistingConfig::Absent
+        );
+        let mut errors = vec![
+            Error::from(ErrorKind::PermissionDenied),
+            Error::other("unavailable mount"),
+        ];
+        #[cfg(unix)]
+        errors.extend([libc::EIO, libc::ESTALE, libc::EACCES].map(Error::from_raw_os_error));
+        for error in errors {
+            let shown = format!("{error:?}");
+            let existing = classify_existing_config(Err(error), no_link, no_follow);
+            assert_eq!(
+                existing,
+                ExistingConfig::Unknown,
+                "lstat failed with {shown}"
+            );
+            assert_eq!(existing.exists(), None, "{shown} is not a \"no\"");
+        }
+
+        let target = || Some(std::path::PathBuf::from("/home/user/dotfiles/deck.toml"));
+        assert_eq!(
+            classify_existing_config(Ok(EntryKind::Symlink), target, || Ok(())),
+            ExistingConfig::Symlink {
+                target: target(),
+                dangling: false
+            }
+        );
+        assert_eq!(
+            classify_existing_config(Ok(EntryKind::Symlink), target, || Err(Error::from(
+                ErrorKind::NotFound
+            ))),
+            ExistingConfig::Symlink {
+                target: target(),
+                dangling: true
+            }
+        );
+        for error in [
+            Error::from(ErrorKind::PermissionDenied),
+            Error::other("unavailable mount"),
+        ] {
+            let shown = format!("{error:?}");
+            let existing = classify_existing_config(Ok(EntryKind::Symlink), target, || Err(error));
+            assert_eq!(
+                existing,
+                ExistingConfig::Unknown,
+                "a link whose target lookup failed with {shown} is not dangling"
+            );
+            let request = config_gen_prompt_for("/p", &existing);
+            assert!(
+                !request.contains("which does not exist"),
+                "an uninspectable target is not reported missing"
+            );
+            assert!(request.starts_with("**The deck could not tell"));
+        }
+        assert_eq!(
+            classify_existing_config(Ok(EntryKind::File), no_link, no_follow),
+            ExistingConfig::File
+        );
+        assert_eq!(
+            classify_existing_config(Ok(EntryKind::Other), no_link, no_follow),
+            ExistingConfig::Absent
+        );
+    }
+
+    /// PRD #2119 (reviewer P2), against the real filesystem: a config name in
+    /// a directory without search permission, and a link whose target sits in
+    /// one, are unknown — the conditional request, and no answer in a listing
+    /// — not "no config" and not a broken link. Skipped where the process can
+    /// search such a directory anyway (root).
+    #[cfg(unix)]
+    #[test]
+    fn a_permission_error_is_unknown_not_absent() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let locked = root.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join(".dot-agent-deck.toml"), "# user's\n").unwrap();
+        std::fs::write(locked.join("deck.toml"), "# user's linked\n").unwrap();
+        let linked = root.path().join("linked");
+        std::fs::create_dir(&linked).unwrap();
+        std::os::unix::fs::symlink(
+            locked.join("deck.toml"),
+            linked.join(".dot-agent-deck.toml"),
+        )
+        .unwrap();
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        struct Restore<'a>(&'a std::path::Path);
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+        let _restore = Restore(&locked);
+        if std::fs::symlink_metadata(locked.join(".dot-agent-deck.toml")).is_ok() {
+            eprintln!("SKIP: this process can search a mode-000 directory (root?)");
+            return;
+        }
+
+        assert_eq!(existing_config(&locked), ExistingConfig::Unknown);
+        assert_eq!(project_config_exists(locked.to_str().unwrap()), None);
+        let request = config_gen_prompt(locked.to_str().unwrap());
+        assert!(
+            request.starts_with("**The deck could not tell"),
+            "an inaccessible config gets the conditional request"
+        );
+        assert!(!request.contains(UPDATE_REWORDS[0].0));
+
+        assert_eq!(existing_config(&linked), ExistingConfig::Unknown);
+        assert_eq!(project_config_exists(linked.to_str().unwrap()), None);
+        let request = config_gen_prompt(linked.to_str().unwrap());
+        assert!(
+            !request.contains("which does not exist"),
+            "an inaccessible link target is not reported missing"
+        );
+        assert!(request.starts_with("**The deck could not tell"));
+    }
+
     /// PRD #2119: a `.dot-agent-deck.toml` that is a symbolic link counts as an
     /// existing config for generate/update — dangling or not — while a
     /// directory of that name does not, and the project reader's own
@@ -508,7 +832,11 @@ mod tests {
 
         std::fs::create_dir(&path).unwrap();
         assert_eq!(existing_config(project.path()), ExistingConfig::Absent);
-        assert!(!project_config_exists(cwd), "a directory is not a config");
+        assert_eq!(
+            project_config_exists(cwd),
+            Some(false),
+            "a directory is not a config"
+        );
         std::fs::remove_dir(&path).unwrap();
 
         std::fs::write(&target, "# the user's linked config\n").unwrap();
@@ -520,8 +848,9 @@ mod tests {
                 dangling: false
             }
         );
-        assert!(
+        assert_eq!(
             project_config_exists(cwd),
+            Some(true),
             "a symlinked config reads Update"
         );
         assert!(
@@ -550,8 +879,9 @@ mod tests {
                 dangling: true
             }
         );
-        assert!(
+        assert_eq!(
             project_config_exists(cwd),
+            Some(true),
             "a dangling symlinked config still reads Update"
         );
         let request = config_gen_prompt(cwd);
@@ -637,7 +967,7 @@ mod tests {
         assert_eq!(
             project_config_flags_within(&free, std::time::Duration::from_secs(5), dirs.clone())
                 .await,
-            Some(vec![true, false])
+            Some(vec![Some(true), Some(false)])
         );
         let saturated = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
         assert_eq!(
@@ -668,11 +998,18 @@ mod tests {
                 ["/with", "/without"],
                 "one check per distinct directory"
             );
-            Some(vec![true, false])
+            Some(vec![Some(true), Some(false)])
         })
         .await;
         let flags: Vec<_> = records.iter().map(|r| r.project_config_exists).collect();
         assert_eq!(flags, [Some(true), Some(false), Some(true), None]);
+        // A directory whose check could not tell stays unknown, not "no".
+        crate::agent_pty::attach_project_config_flags(&mut records, |_| async {
+            Some(vec![None, Some(false)])
+        })
+        .await;
+        let flags: Vec<_> = records.iter().map(|r| r.project_config_exists).collect();
+        assert_eq!(flags, [None, Some(false), None, None]);
         crate::agent_pty::attach_project_config_flags(&mut records, |_| async { None }).await;
         assert!(
             records.iter().all(|r| r.project_config_exists.is_none()),

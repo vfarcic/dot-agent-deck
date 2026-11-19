@@ -4323,7 +4323,8 @@ pub struct AgentRecord {
     /// Stamped at the wire boundary by [`attach_project_config_exists`], off
     /// the async runtime and bounded, so each listing reads the disk as it is
     /// then. `None` when the record has no cwd, when the check did not finish
-    /// in time, or from a daemon predating the field: clients then keep
+    /// in time or could not tell (a lookup error other than "not found"), or
+    /// from a daemon predating the field: clients then keep
     /// today's Generate wording. Additive and optional, so no
     /// `PROTOCOL_VERSION` bump.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4401,12 +4402,12 @@ pub async fn attach_project_config_exists(records: &mut [AgentRecord]) {
 pub(crate) async fn attach_project_config_flags<F, Fut>(records: &mut [AgentRecord], check: F)
 where
     F: FnOnce(Vec<String>) -> Fut,
-    Fut: std::future::Future<Output = Option<Vec<bool>>>,
+    Fut: std::future::Future<Output = Option<Vec<Option<bool>>>>,
 {
     let mut dirs: Vec<String> = records.iter().filter_map(|r| r.cwd.clone()).collect();
     dirs.sort();
     dirs.dedup();
-    let answers: std::collections::HashMap<String, bool> = match check(dirs.clone()).await {
+    let answers: std::collections::HashMap<String, Option<bool>> = match check(dirs.clone()).await {
         Some(flags) if flags.len() == dirs.len() => dirs.into_iter().zip(flags).collect(),
         _ => std::collections::HashMap::new(),
     };
@@ -4414,7 +4415,7 @@ where
         record.project_config_exists = record
             .cwd
             .as_deref()
-            .and_then(|cwd| answers.get(cwd).copied());
+            .and_then(|cwd| answers.get(cwd).copied().flatten());
     }
 }
 
