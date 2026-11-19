@@ -1324,11 +1324,22 @@ fn emit_reading_consent_on(app: &AppHandle) {
 
 fn emit_snapshot(app: &AppHandle, snapshot: &DesktopSnapshot) {
     let _ = app.emit("desktop://snapshot", snapshot);
-    // PRD #2374 (PR #2378 review): the agents the app now shows for this
-    // deck, for voice to reach without asking the daemon again.
+}
+
+/// PRD #2374 (PR #2378 review) — the agents a deck's watcher just showed,
+/// recorded for voice ([`DesktopState::record_shown_agents`]) under the
+/// watcher's claim `token`, so a watcher whose claim was retired or replaced
+/// records nothing.
+fn record_watched_agents(
+    app: &AppHandle,
+    endpoint: &Endpoint,
+    token: u64,
+    snapshot: &DesktopSnapshot,
+) {
     if let Some(state) = app.try_state::<DesktopState>() {
         state.record_shown_agents(
-            &snapshot.connection.deck_id,
+            &endpoint.identity(),
+            token,
             snapshot.connection.status == ConnectionStatus::Connected,
             &snapshot.agents,
         );
@@ -1457,6 +1468,7 @@ fn spawn_deck_watcher(app: &AppHandle, state: &DesktopState, endpoint: Endpoint)
     // selection's reason — a request that lands before the task is first
     // polled is still an edge the loop observes.
     let mut cards = state.agent_cards_signal();
+    let token = claim;
     let handle = tauri::async_runtime::spawn(async move {
         // PRD #741 M4(b): the incremental agent list. It belongs to this task
         // and to nothing else — it is only ever correct while this task's
@@ -1470,7 +1482,7 @@ fn spawn_deck_watcher(app: &AppHandle, state: &DesktopState, endpoint: Endpoint)
                 Ok(daemon) if daemon.require_compatible().is_ok() => daemon,
                 _ => {
                     view.resubscribed();
-                    emit_unconnected_snapshot(&app, &endpoint, &links).await;
+                    emit_unconnected_snapshot(&app, &endpoint, &links, token).await;
                     tokio::time::sleep(WATCH_RETRY_DELAY).await;
                     continue;
                 }
@@ -1505,7 +1517,7 @@ fn spawn_deck_watcher(app: &AppHandle, state: &DesktopState, endpoint: Endpoint)
                         // machines in the fleet, and dropping their links would make
                         // one deck's bad moment cost N handshakes.
                         links.invalidate(&endpoint).await;
-                        emit_unconnected_snapshot(&app, &endpoint, &links).await;
+                        emit_unconnected_snapshot(&app, &endpoint, &links, token).await;
                         tokio::time::sleep(WATCH_RETRY_DELAY).await;
                         continue;
                     }
@@ -1523,6 +1535,7 @@ fn spawn_deck_watcher(app: &AppHandle, state: &DesktopState, endpoint: Endpoint)
                 &app,
                 &endpoint,
                 &links,
+                token,
                 &mut view,
                 events,
                 &mut selection,
@@ -1583,12 +1596,18 @@ fn spawn_deck_watcher(app: &AppHandle, state: &DesktopState, endpoint: Endpoint)
 /// from before the start, and emitted after the start's connected one it would
 /// paint a connected deck as disconnected. The check and the emit run under
 /// the lock a start bumps the generation under, so neither can land after it.
-async fn emit_unconnected_snapshot(app: &AppHandle, endpoint: &Endpoint, links: &DaemonLinks) {
+async fn emit_unconnected_snapshot(
+    app: &AppHandle,
+    endpoint: &Endpoint,
+    links: &DaemonLinks,
+    token: u64,
+) {
     let generation = links.reason_generation(endpoint);
     let mut snapshot = snapshot_with(endpoint, links, None).await;
     if !links.if_current(endpoint, generation, || emit_snapshot(app, &snapshot)) {
         return;
     }
+    record_watched_agents(app, endpoint, token, &snapshot);
     if snapshot.connection.status == ConnectionStatus::Disconnected
         && links.refresh_disconnected_reason(endpoint).await
     {
@@ -1691,6 +1710,7 @@ async fn watch_one_subscription(
     app: &AppHandle,
     endpoint: &Endpoint,
     links: &DaemonLinks,
+    token: u64,
     view: &mut AgentView,
     mut events: tokio::sync::mpsc::Receiver<BroadcastMsg>,
     selection: &mut tokio::sync::watch::Receiver<u64>,
@@ -1818,6 +1838,7 @@ async fn watch_one_subscription(
         }
         let snapshot = snapshot_with(endpoint, links, Some(view)).await;
         emit_snapshot(app, &snapshot);
+        record_watched_agents(app, endpoint, token, &snapshot);
         // PRD #2374: the cards ride the same coalesced refresh — re-read on a
         // new subscription, on a card's doorbell and on the reconciliation
         // tick. A deck whose daemon has no cards emits nothing, and nothing is

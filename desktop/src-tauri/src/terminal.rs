@@ -560,21 +560,26 @@ impl DesktopState {
             .retain(|deck, _| observed.contains(deck));
     }
 
-    /// PRD #2374 (PR #2378 review) — record the agents a snapshot of `deck`
-    /// (its wire id) showed, for voice ([`Self::shown_agents`]): kept while
-    /// the deck is connected AND its watcher is still held, removed otherwise.
-    /// Under the watchers lock, so it cannot interleave with
-    /// [`Self::retain_watchers`] retiring that deck: a rejoined deck
-    /// contributes nothing until its new watcher's first connected snapshot.
+    /// PRD #2374 (PR #2378 review) — record the agents `deck`'s watcher
+    /// showed, for voice ([`Self::shown_agents`]): kept while the deck is
+    /// connected, removed otherwise — and only from the watcher whose claim
+    /// `token` is the deck's current one, so a watcher that was retired, or
+    /// replaced when the deck left and rejoined, records nothing. Under the
+    /// watchers lock, so the check and the write cannot interleave with
+    /// [`Self::retain_watchers`] or a new claim: a rejoined deck contributes
+    /// nothing until its new watcher's first connected snapshot.
     pub(crate) fn record_shown_agents(
         &self,
-        deck: &str,
+        deck: &EndpointIdentity,
+        token: u64,
         connected: bool,
         agents: &[crate::dto::DesktopAgent],
     ) {
         let watchers = self.watchers();
-        let watched = watchers.keys().any(|each| each.wire_id() == deck);
-        crate::record_shown_agents(&self.shown_agents, deck, connected && watched, agents);
+        if !watchers.get(deck).is_some_and(|claim| claim.token == token) {
+            return;
+        }
+        crate::record_shown_agents(&self.shown_agents, &deck.wire_id(), connected, agents);
         drop(watchers);
     }
 
@@ -1952,50 +1957,54 @@ mod tests {
         let state = DesktopState::default();
         let deck_a = fixture_deck("/tmp/dot-agent-deck-shown-a.sock").identity();
         let deck_b = fixture_deck("/tmp/dot-agent-deck-shown-b.sock").identity();
-        let (a, b) = (deck_a.wire_id(), deck_b.wire_id());
+        let a = deck_a.wire_id();
         let coder = [crate::voice::fixtures::agent(
             "1",
             Some("Coder"),
             "claude_code",
         )];
-        let cached = |state: &DesktopState, deck: &str| {
+        let cached = |state: &DesktopState| {
             state
                 .shown_agents
                 .lock()
                 .unwrap()
-                .get(deck)
+                .get(&a)
                 .map(|agents| agents.len())
         };
 
-        assert!(state.start_watcher_once_for(&deck_a).is_some());
-        state.record_shown_agents(&a, true, &coder);
-        state.record_shown_agents(&b, true, &coder);
-        assert_eq!(cached(&state, &a), Some(1));
-        assert_eq!(
-            cached(&state, &b),
-            None,
+        let first = state.start_watcher_once_for(&deck_a).expect("claimed");
+        state.record_shown_agents(&deck_a, first, true, &coder);
+        state.record_shown_agents(&deck_b, first, true, &coder);
+        assert_eq!(cached(&state), Some(1));
+        assert!(
+            state
+                .shown_agents
+                .lock()
+                .unwrap()
+                .get(&deck_b.wire_id())
+                .is_none(),
             "an unwatched deck records nothing"
         );
 
         state.retain_watchers(&HashSet::new());
-        assert_eq!(cached(&state, &a), None, "it leaves with its watcher");
-        state.record_shown_agents(&a, true, &coder);
-        assert_eq!(
-            cached(&state, &a),
-            None,
-            "a late snapshot cannot put it back"
-        );
+        assert_eq!(cached(&state), None, "it leaves with its watcher");
+        state.record_shown_agents(&deck_a, first, true, &coder);
+        assert_eq!(cached(&state), None, "a late snapshot cannot put it back");
 
-        assert!(state.start_watcher_once_for(&deck_a).is_some());
-        assert_eq!(cached(&state, &a), None, "nothing until its first snapshot");
-        state.record_shown_agents(&a, true, &coder);
-        assert_eq!(cached(&state, &a), Some(1));
-        state.record_shown_agents(&a, false, &coder);
+        let second = state
+            .start_watcher_once_for(&deck_a)
+            .expect("claimed again");
+        assert_eq!(cached(&state), None, "nothing until its first snapshot");
+        state.record_shown_agents(&deck_a, first, true, &coder);
         assert_eq!(
-            cached(&state, &a),
+            cached(&state),
             None,
-            "a deck that stops answering has none"
+            "the retired watcher records nothing under the new claim"
         );
+        state.record_shown_agents(&deck_a, second, true, &coder);
+        assert_eq!(cached(&state), Some(1));
+        state.record_shown_agents(&deck_a, second, false, &coder);
+        assert_eq!(cached(&state), None, "a deck that stops answering has none");
     }
 
     /// PRD #1223 M4 — the New agent form's per-deck last command.
