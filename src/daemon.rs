@@ -787,6 +787,16 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         journal.start_recovery_in_background();
         drop(crate::work_tracking::spawn_compaction(journal.clone()));
         pty_registry.work().install(journal);
+        // PRD #1790: an agent's latest session id that the tracker held back
+        // (past the per-attempt line cap, or refused by the session quota)
+        // reaches the journal while the attempt lives, not only at its end.
+        let flushed = Arc::downgrade(&pty_registry);
+        drop(crate::work_tracking::spawn_session_flush(move || {
+            flushed
+                .upgrade()
+                .map(|registry| registry.work().flush_held_sessions())
+                .is_some()
+        }));
         pty_registry.install_inbox(hub);
     }
     let inbox_ticker = pty_registry.inbox().spawn_ticker();
@@ -2114,6 +2124,41 @@ pub(crate) async fn ingest_event_in_lifecycle(
     .unwrap_or(false)
 }
 
+/// PRD #1790: the `(pane, generation, session, agent type)` a hook report
+/// gives the work journal's `attempt_session`, or `None` when it gives
+/// nothing. Only a report whose hook capability token ATTESTED its agent
+/// (`attested_agent`) counts, and the generation is that attested agent: a
+/// report that also names an agent (`event.agent_id`) must name the same one.
+/// So a tokenless report, which `DOT_AGENT_DECK_HOOK_PROVENANCE=warn` admits
+/// for a pane that was issued a token (`Refused(Missing)`: not `unproven`,
+/// and no attested agent), an outside agent's (`Unattested`, `unproven`), and
+/// one claiming an agent its token was not minted for record nothing: none
+/// can pin a session id to an attempt. Nor does a report the daemon or the
+/// wrapper authored rather than the agent's own hooks.
+fn attempt_session_report(
+    event: &AgentEvent,
+    unproven: bool,
+    attested_agent: Option<&str>,
+) -> Option<(String, String, String, crate::event::AgentType)> {
+    let generation = attested_agent?;
+    if unproven || event.is_daemon_synthetic() || event.is_wrapper_output_classified() {
+        return None;
+    }
+    if event
+        .agent_id
+        .as_deref()
+        .is_some_and(|claimed| claimed != generation)
+    {
+        return None;
+    }
+    Some((
+        event.pane_id.clone()?,
+        generation.to_string(),
+        event.session_id.clone(),
+        event.agent_type.clone(),
+    ))
+}
+
 /// The body of [`ingest_event_unless`]; its caller holds the question
 /// lifecycle of `held`, the pane it resolved the event to (`None`: none). Under
 /// the `AppState` write lock, before anything else, the event is resolved again
@@ -2401,7 +2446,22 @@ where
     // delegated worker's `WaitingForInput` — see the method's doc, including
     // why the pane's live agent is read there, under this lock, and not before
     // it like `daemon_owns_pane` above.
+    // PRD #1790: what the work journal's `attempt_session` needs, taken
+    // before the apply consumes the event ([`attempt_session_report`]).
+    let session_report = attempt_session_report(&event, unproven, attested_agent);
     state.apply_hook_event_watching_waiting(event, registry, attested_agent);
+    // The session is the attempt's once the apply made it the pane's current
+    // hook session: a report the state refused, or one about a conversation
+    // the pane has moved past, records nothing. The tracker writes it only
+    // when it changed, and holds one from a generation not yet published
+    // for its start. Under this lock, so sessions reach the journal in the
+    // order the state applied them; it takes the registry's lock and the
+    // tracker's leaf mutex, as the apply above already reads the registry.
+    if let Some((pane, generation, session, agent_type)) = session_report
+        && state.pane_hook_session_id(&pane).as_deref() == Some(session.as_str())
+    {
+        registry.session_seen(&generation, Some(&pane), &session, &agent_type);
+    }
     // Stamped on the frame that changed the aggregate, and on every shell frame
     // of a pane that reports its own turns — the client's cue that the frame
     // is background work and not a status (an older daemon never stamps one).
@@ -19283,6 +19343,278 @@ mod hook_provenance_audit_tests {
             turns, 1,
             "a Thinking reported before publication was lost and the first \
              turn did not count"
+        );
+    }
+
+    /// PRD #1790 (R1): an agent reports its session (a proven SessionStart
+    /// naming its own generation) after its child is forked and before the
+    /// deck publishes it, and never reports again. Read back from disk after
+    /// the daemon's journal is drained, as a restarted daemon would read it,
+    /// the attempt's session is that id, written right after its start.
+    #[tokio::test]
+    async fn a_session_reported_before_publication_is_recorded() {
+        let temp = crate::test_temp::tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        std::fs::create_dir(&state_dir).unwrap();
+        let identity = temp.path().join("identity");
+        let script = temp.path().join("reserved-agent.sh");
+        crate::test_isolation::write_script(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' \"$DOT_AGENT_DECK_AGENT_ID\" > \"$TURN_TEST_IDENTITY\"\nexec /bin/cat\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let registry = Arc::new(AgentPtyRegistry::new());
+        registry.work().install(
+            crate::work_journal::WorkJournal::try_open_with(
+                &state_dir,
+                "run1",
+                &crate::deck_identity::DeckId::generate(),
+                crate::work_journal::JournalOptions::default(),
+            )
+            .unwrap(),
+        );
+        let (forked, publish) = registry.pause_next_publish_for_test();
+        let spawning = tokio::task::spawn_blocking({
+            let registry = registry.clone();
+            let identity = identity.clone();
+            move || {
+                registry.spawn_agent(SpawnOptions {
+                    command: Some(script.to_str().unwrap()),
+                    env: vec![
+                        (DOT_AGENT_DECK_PANE_ID.into(), "early-session".into()),
+                        (
+                            "TURN_TEST_IDENTITY".into(),
+                            identity.to_string_lossy().into_owned(),
+                        ),
+                    ],
+                    agent_type: Some(crate::event::AgentType::ClaudeCode),
+                    ..Default::default()
+                })
+            }
+        });
+        reached(forked, "the child never forked").await;
+        let agent = tokio::task::spawn_blocking(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Ok(text) = std::fs::read_to_string(&identity)
+                    && text.ends_with('\n')
+                {
+                    break text.trim().to_string();
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the child never wrote its id"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        })
+        .await
+        .unwrap();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let (event_tx, _) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+        assert!(
+            registry.agent_writer(&agent).is_none(),
+            "precondition: the agent is not published yet"
+        );
+        let mut payload = line(
+            "claude-real-session-1",
+            Some("early-session"),
+            Some(&agent),
+            "session_start",
+            None,
+        );
+        payload["agent_type"] = "claude_code".into();
+        // Attested to the agent, as its hook's token makes it in production.
+        ingest_event_unless(
+            &state,
+            &event_tx,
+            &registry,
+            event_of(payload),
+            false,
+            Some(&agent),
+            |_| false,
+        )
+        .await;
+        assert_eq!(
+            state
+                .read()
+                .await
+                .pane_hook_session_id("early-session")
+                .as_deref(),
+            Some("claude-real-session-1"),
+            "precondition: the state took the report"
+        );
+        publish.send(()).unwrap();
+        let published = spawning.await.unwrap().expect("the spawn publishes");
+        assert_eq!(published, agent);
+        // No second report. What a restarted daemon reads:
+        registry.work().drain(Duration::from_secs(5));
+        let read = crate::work_journal::read_journal(&state_dir).unwrap();
+        registry.shutdown_all();
+        let attempt = crate::work_journal::AttemptId::new("run1", agent.parse().unwrap()).unwrap();
+        assert_eq!(
+            crate::work_journal::latest_session_of(&read.lines, &attempt).map(|(s, _)| s),
+            Some("claude-real-session-1"),
+            "a session reported before publication was lost"
+        );
+        let kinds: Vec<&str> = read
+            .lines
+            .iter()
+            .filter(|l| match &l.event {
+                crate::work_journal::Event::AttemptStarted { attempt: a, .. }
+                | crate::work_journal::Event::AttemptSession { attempt: a, .. } => *a == attempt,
+                _ => false,
+            })
+            .map(|l| l.event.kind())
+            .collect();
+        assert_eq!(kinds, ["attempt_started", "attempt_session"]);
+    }
+
+    /// PRD #1790 (PR #2363 review, Qodo): which hook reports give the
+    /// journal a session. Only one whose token attested its agent, with any
+    /// agent the report names equal to that one; never a tokenless one
+    /// (`DOT_AGENT_DECK_HOOK_PROVENANCE=warn`'s `Refused(Missing)`: not
+    /// unproven, no attested agent), an outside agent's, or one naming
+    /// another agent than its token's.
+    #[test]
+    fn only_an_attested_report_gives_the_journal_a_session() {
+        let mut payload = line(
+            "s-1",
+            Some("pane-1"),
+            Some("agent-a"),
+            "session_start",
+            None,
+        );
+        payload["agent_type"] = "claude_code".into();
+        let event = event_of(payload);
+        // Tokenless under warn mode: admitted, but proves no agent.
+        assert_eq!(attempt_session_report(&event, false, None), None);
+        // An outside agent's.
+        assert_eq!(attempt_session_report(&event, true, None), None);
+        // A token minted for another agent than the one the report names.
+        assert_eq!(attempt_session_report(&event, false, Some("agent-b")), None);
+        // Attested, naming its own agent or none: recorded against the
+        // attested one.
+        let expected = Some((
+            "pane-1".to_string(),
+            "agent-a".to_string(),
+            "s-1".to_string(),
+            crate::event::AgentType::ClaudeCode,
+        ));
+        assert_eq!(
+            attempt_session_report(&event, false, Some("agent-a")),
+            expected
+        );
+        let mut anonymous = event.clone();
+        anonymous.agent_id = None;
+        assert_eq!(
+            attempt_session_report(&anonymous, false, Some("agent-a")),
+            expected
+        );
+    }
+
+    /// PRD #1790 (PR #2363 review, Qodo): a tokenless SessionStart that
+    /// warn mode admits for an issued pane, naming the pane's own agent,
+    /// moves the pane's session but writes no `attempt_session` to the
+    /// journal; the same report attested to that agent does.
+    #[tokio::test]
+    async fn a_tokenless_report_records_no_attempt_session() {
+        let temp = crate::test_temp::tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        std::fs::create_dir(&state_dir).unwrap();
+        let registry = Arc::new(AgentPtyRegistry::new());
+        registry.work().install(
+            crate::work_journal::WorkJournal::try_open_with(
+                &state_dir,
+                "run1",
+                &crate::deck_identity::DeckId::generate(),
+                crate::work_journal::JournalOptions::default(),
+            )
+            .unwrap(),
+        );
+        let agent = {
+            let registry = registry.clone();
+            tokio::task::spawn_blocking(move || {
+                registry.spawn_agent(SpawnOptions {
+                    command: Some("/bin/cat"),
+                    env: vec![(DOT_AGENT_DECK_PANE_ID.into(), "warn-pane".into())],
+                    agent_type: Some(crate::event::AgentType::ClaudeCode),
+                    ..Default::default()
+                })
+            })
+            .await
+            .unwrap()
+            .expect("the spawn publishes")
+        };
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let (event_tx, _) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+        let report = |session: &str| {
+            let mut payload = line(
+                session,
+                Some("warn-pane"),
+                Some(&agent),
+                "session_start",
+                None,
+            );
+            payload["agent_type"] = "claude_code".into();
+            event_of(payload)
+        };
+        let sessions = |registry: &AgentPtyRegistry| {
+            registry.work().drain(Duration::from_secs(5));
+            let read = crate::work_journal::read_journal(&state_dir).unwrap();
+            read.lines
+                .iter()
+                .filter_map(|l| match &l.event {
+                    crate::work_journal::Event::AttemptSession { session, .. } => {
+                        Some(session.clone())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        ingest_event_unless(
+            &state,
+            &event_tx,
+            &registry,
+            report("tokenless-session"),
+            false,
+            None,
+            |_| false,
+        )
+        .await;
+        assert_eq!(
+            state
+                .read()
+                .await
+                .pane_hook_session_id("warn-pane")
+                .as_deref(),
+            Some("tokenless-session"),
+            "precondition: warn mode applied the report"
+        );
+        assert_eq!(
+            sessions(&registry),
+            Vec::<String>::new(),
+            "a tokenless report pinned a session to the attempt"
+        );
+
+        ingest_event_unless(
+            &state,
+            &event_tx,
+            &registry,
+            report("attested-session"),
+            false,
+            Some(&agent),
+            |_| false,
+        )
+        .await;
+        let recorded = sessions(&registry);
+        registry.shutdown_all();
+        assert_eq!(
+            recorded,
+            ["attested-session"],
+            "control: an attested report is recorded"
         );
     }
 

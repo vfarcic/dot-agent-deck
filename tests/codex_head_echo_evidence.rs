@@ -119,7 +119,7 @@ fn premise(capture: &Capture, hooks: Hooks) {
     }
 }
 
-/// Scenario: Replay every committed staged capture of real Codex 0.164.0 (twenty rings at 50 × 200 and ten at 24 × 80 with the deck's hooks trusted, ten at 50 × 200 with them switched off, ten at 50 × 200 through a launcher with them untrusted) through the deck's evidence state and Codex's screen profile. Each was taken on the pinned executable under the deck's wrapper and latches 0.164.0; on every ring the composer was the empty ready one at admission, showed only the placeholder or a prefix of the head, never a dialog, until it held exactly the head within the echo wait, then only prefixes of the line until it held exactly the whole line, exactly so just before the Enter sent at least 150 ms after the rest, and then showed the line as a transcript user message within the confirm wait, with Codex's own record holding exactly that prompt once. Every ring at 50 × 200 was read on Clean frames of the deck's evidence state, and at 24 × 80 every ring but each session's first: a fresh Codex at that size draws no width witness, so no frame from its start to the first ring's Enter is Clean.
+/// Scenario: Replay every committed staged capture of real Codex 0.164.0 (twenty rings at 50 × 200 and ten at 24 × 80 with the deck's hooks trusted, ten at 50 × 200 with them switched off, ten at 50 × 200 through a launcher with them untrusted) through the deck's evidence state and Codex's screen profile. Each was taken on the pinned executable under the deck's wrapper and latches 0.164.0; on every ring the composer was the empty ready one at admission, showed only the placeholder or a prefix of the head, never a dialog, until it held exactly the head within the echo wait, then only prefixes of the line until it held exactly the whole line, exactly so just before the Enter sent at least 150 ms after the rest, and then showed the line as a transcript user message within the confirm wait, with Codex's own record holding exactly that prompt once. Every ring was read on Clean frames of the deck's evidence state: at 50 × 200 on Codex's width witness, and at 24 × 80, where a fresh Codex draws no width witness before its first turn, on agreement, since the terminal only ever had one width, so a Clean frame stands before the first ring.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_codex_164_head_echo_staged_captures() {
@@ -150,40 +150,20 @@ fn doorbell_036_codex_164_head_echo_staged_captures() {
         };
         counts[group] += trials.len();
         groups[group].extend(trials.iter().cloned());
-        // At 50 × 200 every ring is read on Clean frames; a fresh Codex at
-        // 24 × 80 draws no width witness before its first turn.
-        if cols == 200 {
-            assert!(trials.iter().all(|t| t.clean), "{stem}: {trials:?}");
-        } else {
-            assert!(
-                !trials[0].clean && trials[1..].iter().all(|t| t.clean),
-                "{stem}: {trials:?}"
-            );
-            // Not one Clean frame from Codex's start, through its settle
-            // window and the first ring, to that ring's Enter: a doorbell
-            // that waits for a Clean frame never admits a fresh Codex at
-            // 24 × 80 until something else has prompted it. In these two
-            // captures the first Clean frame came as the first turn ended
-            // (31.4 s and 6.4 s after its Enter; the turns ran 30.9 s and
-            // 6.3 s).
+        // Every ring is read on Clean frames. At 50 × 200 Codex draws its
+        // width witness from the start. At 24 × 80 it draws none before its
+        // first turn, and the evidence state is Clean on agreement (issue
+        // #2262): the terminal has only ever had one width, so the frame is
+        // the one Codex drew. Before that rule, no frame from Codex's start
+        // to the first ring's Enter was Clean, and a doorbell waiting for
+        // one never admitted a fresh Codex at 24 × 80.
+        assert!(trials.iter().all(|t| t.clean), "{stem}: {trials:?}");
+        if cols == 80 {
             let reads = head_echo::replay(&capture, |_| Vec::new());
-            let first_cr = capture.point("mark:cr-1");
+            let first_trial = capture.point("mark:trial-1");
             assert!(
-                reads.iter().filter(|r| r.end <= first_cr).all(|r| !r.clean),
-                "{stem}: a Clean frame before the first Enter"
-            );
-            let first_clean = reads.iter().find(|r| r.clean).expect("a Clean frame");
-            let cr_sent = capture.result["events"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|e| e["label"] == "cr-1")
-                .unwrap()["t"]
-                .as_u64()
-                .unwrap();
-            eprintln!(
-                "{stem}: first Clean frame {:.1} s after the first Enter",
-                (first_clean.t - cr_sent) as f64 / 1e9
+                reads.iter().any(|r| r.end <= first_trial && r.clean),
+                "{stem}: a Clean frame before the first ring"
             );
         }
         clean += trials.iter().filter(|t| t.clean).count();
@@ -215,7 +195,7 @@ fn doorbell_036_codex_164_head_echo_staged_captures() {
             ),
         );
     }
-    assert_eq!(clean, 48);
+    assert_eq!(clean, 50);
     let (_, _, max) = spread(&head);
     assert!(max < ECHO_WAIT.as_secs_f64() * 1e3);
     eprintln!(

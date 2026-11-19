@@ -502,6 +502,24 @@ pub fn parse_geometry_frame(bytes: &[u8]) -> Option<(u16, u16)> {
 /// Retiring the mirror is follow-up #1395, and is the point at which that
 /// pairing has to be argued again.
 ///
+/// **Issue #1395 retires it: no bump, and a declared semantic break.** Nothing
+/// on the wire moved. What moved is a side effect a client could rely on: a
+/// daemon no longer refreshes `.dot-agent-deck/orchestrator-context.md` after
+/// a preparation or a spawn, and its retention sweep removes a copy an older
+/// deck left, whatever its age. The pairing argued above now regresses: a TUI
+/// from before #1233 (v0.43.0 and older) re-arms a daemon-published
+/// orchestration from that name, and finds no brief or a stale one. Those
+/// TUIs speak protocol 10 or older against this daemon's 12; the
+/// supported-clients cut-off in `docs/develop/versioning.md` moves past them
+/// with this change. A
+/// TUI from #1233 up to this change reads the name only for a tab whose own
+/// file it does not know — in a pairing with this daemon, a `Ctrl+n` tab
+/// rebuilt after a reattach, which never carried a task — and now finds only
+/// what an older process wrote there, or nothing. Role commands and templates
+/// that read the fixed name find it gone. Declared as
+/// `1395-fixed-path-context-mirror-retired` in [`CONTRACT_BREAKS`] with
+/// `changelog.d/1395.breaking.md`.
+///
 /// Its second half, refusing an ambiguous orchestration name with
 /// [`PROJECT_ERR_AMBIGUOUS_ORCHESTRATION`], moves no wire either — a new error
 /// code on an existing refusal channel — but it IS a semantic break, the
@@ -1832,6 +1850,15 @@ pub const CONTRACT_BREAKS: &[&str] = &[
     // `dot-agent-deck trust approve` command that does.
     // `changelog.d/1885.breaking.md` is its fragment.
     "1885-unapproved-project-config-refused",
+    // Issue #1395, at 12 without moving it -- the #1233/#555 shape. A daemon
+    // no longer refreshes the fixed `.dot-agent-deck/orchestrator-context.md`
+    // after a preparation or a spawn (issue #1233's compatibility mirror), and
+    // its coordination sweep removes a copy an older deck left. Nothing on the
+    // wire moved; what moved is a file a client or a role command could read:
+    // a pre-#1233 TUI's compaction re-arm of a hydrated tab finds no brief, or
+    // a stale one, where an older daemon kept the latest.
+    // `changelog.d/1395.breaking.md` is its fragment.
+    "1395-fixed-path-context-mirror-retired",
 ];
 
 /// What comparing this build's [`CONTRACT_BREAKS`] against a peer's found.
@@ -6906,7 +6933,7 @@ async fn handle_connection(
                 let guard = state.read().await;
                 guard.attach_live_sessions(&mut records);
                 // Issue #1395 item 1: the start role's own context file, so a
-                // hydrating TUI re-arms from it rather than from the mirror.
+                // hydrating TUI re-arms from it.
                 guard.attach_orchestrator_context_paths(&mut records);
             }
             // Issue #770: report the orchestration role registrations whose pane
@@ -8498,15 +8525,12 @@ async fn handle_connection(
                     // Its audit: the ANSWER is bounded, not only the permit
                     // wait — a work still running and uncommitted at the
                     // deadline is answered as expired, and the shared latch
-                    // makes it withdraw itself by its last gate — and the
-                    // compatibility mirror runs
-                    // after the answer has gone, only for a preparation that
-                    // committed to one.
+                    // makes it withdraw itself by its last gate.
                     let deadline =
                         tokio::time::Instant::now() + crate::project_resolve::PREPARE_DEADLINE;
                     let work_deadline = deadline.into_std();
                     match crate::project_resolve::run_bounded_answer(deadline, move |latch| {
-                        match crate::project_resolve::prepare_orchestration_before(
+                        crate::project_resolve::prepare_orchestration_before(
                             &path,
                             &orchestration,
                             &task,
@@ -8515,30 +8539,7 @@ async fn handle_connection(
                             Some(work_deadline),
                             &std::time::Instant::now,
                             Some(latch),
-                        ) {
-                            Ok(prepared) => {
-                                // Runs after the reply on this blocking thread, so
-                                // two preparations' mirror writes can finish in
-                                // either order; `mirror_into`'s ordering guard keeps
-                                // the earlier publish from landing over the later.
-                                //
-                                // Accepted residual of that order (Qodo, PR #1407):
-                                // a reader of the fixed `orchestrator-context.md`
-                                // that acts the instant the reply arrives can still
-                                // read the PREVIOUS mirror until this write lands
-                                // (or keep it, if the write fails). Writing it first
-                                // would let a stalled write hold the reply past the
-                                // deadline. The authoritative context is the
-                                // per-preparation file the prompt names; the mirror
-                                // serves only compatibility readers — see
-                                // `PendingMirror`.
-                                let (answer, mirror) = prepared.into_parts();
-                                let after: crate::project_resolve::AfterReply =
-                                    Box::new(move || mirror.write());
-                                (Ok(answer), Some(after))
-                            }
-                            Err(refusal) => (Err(refusal), None),
-                        }
+                        )
                     })
                     .await
                     {

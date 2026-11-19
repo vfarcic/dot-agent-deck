@@ -1043,8 +1043,22 @@ pub async fn handle_dispatch(
     // `resolved_target` — is the approved text. Checked before the worktree
     // exists, so a refusal creates nothing and its devbox warm-up never runs;
     // the caller's `dispatch` fails with the reason and the approving command.
+    // Issue #2348: the calling agent is told when the user answers the
+    // in-deck request this refusal raises.
     if let crate::spawn::SpawnTarget::Orchestration { config, .. } = &resolved_target
-        && let Some(refusal) = crate::spawn::approval_refusal(&clone_dir, config, "dispatch").await
+        && let Some(refusal) = crate::spawn::approval_refusal(
+            &clone_dir,
+            config,
+            "dispatch",
+            ctx.caller.as_ref().map(|caller| {
+                crate::trust_requests::RefusedCaller::new(
+                    &caller.pane_id,
+                    &caller.agent_id,
+                    "dispatch",
+                )
+            }),
+        )
+        .await
     {
         return DispatchResult {
             worktree_dir: paths.worktree_dir.clone(),
@@ -1131,6 +1145,9 @@ pub async fn handle_dispatch(
         &paths.branch,
         &paths.worktree_dir,
     );
+    // PRD #1790: the task as the dispatcher gave it, saved beside the
+    // worktree under the unit's work id, so a restore can hand it back.
+    crate::dispatch_task::save_or_warn(&paths.worktree_dir, work_id.as_ref(), task).await;
     let req = SpawnRequest {
         work_id: work_id.clone(),
         task_name: format!("dispatch-{name}"),
@@ -2828,8 +2845,7 @@ mod tests {
                 result.message
             );
 
-            // Issue #1233: the orchestration's own per-publish file, not the
-            // compatibility mirror beside it.
+            // Issue #1233: the orchestration's own per-publish file.
             let context = std::fs::read_dir(worktree.join(".dot-agent-deck"))
                 .expect("list the dispatched worktree's .dot-agent-deck")
                 .filter_map(Result::ok)

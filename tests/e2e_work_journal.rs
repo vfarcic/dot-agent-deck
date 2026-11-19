@@ -172,7 +172,7 @@ fn stop(endpoint: &impl Endpoint, agent: &str) {
     assert_eq!(reply["ok"], true, "stop agent {agent}: {reply}");
 }
 
-/// Scenario: A routing stand-in pane in a one-commit repository runs the real `dot-agent-deck dispatch --single`; the journal must open a `launch=dispatch` work parented on the dispatcher pane's work, with the unit's branch, unit id and worktree, whose attempt and `DOT_AGENT_DECK_WORK_ID` are the unit agent's. The unit's `work-done --done` must write `reported` on that work with the unit id, a report id and `to` = the dispatcher's work. A second unit closed before it reports must get `closed how=unit_ended`.
+/// Scenario: A routing stand-in pane in a one-commit repository runs the real `dot-agent-deck dispatch --single`; the journal must record its child work and attempt, while an ignored task file beside the worktree preserves the dispatched text. The unit's `work-done --done` must write `reported` on that work with the unit id, a report id and `to` = the dispatcher's work, without task or report text in the journal. A second unit closed before it reports must get `closed how=unit_ended`.
 #[spec("journal/launch/002")]
 #[test]
 fn journal_launch_002_a_dispatch_is_a_child_of_its_dispatchers_work() {
@@ -269,6 +269,43 @@ fn journal_launch_002_a_dispatch_is_a_child_of_its_dispatchers_work() {
     assert!(
         !text.contains("ROUTE-REPORT-b3d8") && !text.contains("JOURNAL-DISPATCH-TASK"),
         "the journal must hold no task or report text:\n{text}"
+    );
+
+    let task_path = worktree
+        .join(".dot-agent-deck")
+        .join(format!("dispatch-task-{work}.md"));
+    let task = std::fs::read_to_string(&task_path).unwrap_or_else(|error| {
+        panic!(
+            "dispatch must save its task beside the worktree at {}: {error}",
+            task_path.display()
+        )
+    });
+    assert!(
+        task.contains("JOURNAL-DISPATCH-TASK"),
+        "the saved dispatch task must preserve the text sent through --task: {task:?}"
+    );
+    let relative = task_path.strip_prefix(&worktree).unwrap();
+    let ignored = common::fixture_git(&worktree, &daemon.home)
+        .arg("check-ignore")
+        .arg("--")
+        .arg(relative)
+        .output()
+        .unwrap();
+    assert!(
+        ignored.status.success(),
+        "the saved dispatch task must be git-ignored: {ignored:?}"
+    );
+    let status = common::fixture_git(&worktree, &daemon.home)
+        .args(["status", "--porcelain", "--ignored", "--"])
+        .arg(relative)
+        .output()
+        .unwrap();
+    assert!(status.status.success(), "git status: {status:?}");
+    let status_text = String::from_utf8(status.stdout).unwrap();
+    assert!(
+        status_text.lines().any(|line| line.starts_with("!! "))
+            && !status_text.lines().any(|line| line.starts_with("?? ")),
+        "the task must appear as ignored rather than untracked: {status_text:?}"
     );
 }
 
@@ -659,6 +696,147 @@ fn restart_after(signal: libc::c_int, torn_tail: bool) -> Restarted {
         _first: first,
         _scratch: scratch,
     }
+}
+
+/// Scenario: Start a named stand-in orchestration role, post Claude-shaped session-start hooks for its first session and a replacement after clear, then repeat the replacement id. Stop that daemon and start a fresh one on the same state directory; the old attempt's launch command, folder, display name and orchestration membership must survive in owner-only launch records, and the shared journal reader must return exactly the two session ids in order.
+#[spec("journal/restart/003")]
+#[test]
+fn journal_restart_003_launch_details_and_changed_sessions_survive() {
+    use std::io::Read;
+    use std::os::unix::fs::PermissionsExt;
+
+    const NAME: &str = "Restore probe with spaces";
+    const FIRST_SESSION: &str = "restore-session-before-clear";
+    const NEXT_SESSION: &str = "restore-session-after-clear";
+    let scratch = common::harness_tempdir().unwrap();
+    let state = scratch.path().join("state");
+    let state_env = state.to_string_lossy().into_owned();
+    let mut first = inbox::daemon_unbound(&[("DOT_AGENT_DECK_STATE_DIR", &state_env)]);
+    let cwd = first.home.join("restore-workspace");
+    std::fs::create_dir(&cwd).unwrap();
+    let command = route::command(&first.home);
+    let pane = route::start(
+        &first,
+        "restore-pane",
+        json!({"command":command,"cwd":cwd,"display_name":NAME,
+        "agent_type":"claude_code", "tab_membership": {
+            "kind":"orchestration", "name":"restore-team", "role_name":"orchestrator",
+            "role_index":0, "is_start_role":true,
+            "orchestration_id":"restore-instance", "orchestration_cwd":cwd
+        }}),
+    );
+    let attempt = journal::wait_for(&state, "the restore probe's attempt", |lines| {
+        journal::attempt_of(lines, &pane.agent).cloned()
+    });
+    let attempt_id = str_of(&attempt, "attempt");
+    let work = str_of(&attempt, "work");
+
+    for (session, source) in [
+        (FIRST_SESSION, "startup"),
+        (NEXT_SESSION, "clear"),
+        (NEXT_SESSION, "clear"),
+    ] {
+        let metadata = if source == "clear" {
+            json!({"session_start_source":"clear"})
+        } else {
+            json!({})
+        };
+        let event = json!({"session_id":session,"pane_id":pane.id,
+            "agent_id":pane.agent,"token":pane.token,
+            "deck_build":inbox::SYNTHETIC_DECK_BUILD,
+            "agent_type":"claude_code","event_type":"session_start",
+            "timestamp":chrono::Utc::now(),"cwd":cwd,"metadata":metadata});
+        let mut socket = inbox::connect(&first, &event).into_inner();
+        socket.shutdown(std::net::Shutdown::Write).unwrap();
+        // EOF confirms ingestion before the next session, and before shutdown.
+        let mut response = Vec::new();
+        socket.read_to_end(&mut response).unwrap();
+    }
+
+    // SAFETY: this is the pid of the fixture daemon we still own.
+    assert_eq!(
+        unsafe { libc::kill(first.pid() as libc::pid_t, libc::SIGTERM) },
+        0
+    );
+    assert!(first.wait_for_exit(common::load_scaled(Duration::from_secs(20))));
+    drop(pane);
+    let mut second = inbox::daemon_unbound(&[("DOT_AGENT_DECK_STATE_DIR", &state_env)]);
+    assert!(second.is_alive_public(), "the fresh daemon must be serving");
+
+    let read = dot_agent_deck::work_journal::read_journal(&state).unwrap();
+    assert!(!read.stats.truncated, "restore history was truncated");
+    let lines: Vec<Value> = read
+        .lines
+        .iter()
+        .map(|line| serde_json::to_value(line).unwrap())
+        .collect();
+    assert!(
+        journal::find(&lines, "attempt_started", |line| line["attempt"]
+            == attempt_id)
+        .is_some(),
+        "control: the old attempt must survive the restart"
+    );
+    let sessions = journal::all(&lines, "attempt_session", |line| {
+        line["attempt"] == attempt_id
+    });
+    assert_eq!(
+        sessions
+            .iter()
+            .map(|line| str_of(line, "session"))
+            .collect::<Vec<_>>(),
+        [FIRST_SESSION, NEXT_SESSION],
+        "the restarted journal must retain both session ids in order, with no unchanged repeat; journal:\n{}",
+        journal::dump(&state)
+    );
+    for session in sessions {
+        assert_eq!(session["work"], work, "session belongs to the old work");
+        assert_eq!(session["agent"], "claude_code", "session agent type");
+    }
+
+    let records_dir = state.join("launch-records");
+    assert_eq!(
+        std::fs::metadata(&records_dir)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700,
+        "launch-records directory must be owner-only"
+    );
+    let mut records = Vec::new();
+    for entry in std::fs::read_dir(&records_dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|ext| ext == "json") {
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "launch record {} must be owner-only",
+                path.display()
+            );
+            records.push(serde_json::from_slice::<Value>(&std::fs::read(path).unwrap()).unwrap());
+        }
+    }
+    let matching: Vec<_> = records
+        .iter()
+        .filter(|record| record["attempt"] == attempt_id)
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "one launch record for the old attempt: {records:?}"
+    );
+    let record = matching[0];
+    assert_eq!(record["v"], 1);
+    assert_eq!(record["work"], work);
+    assert_eq!(record["command"], command);
+    assert_eq!(record["cwd"], cwd.to_string_lossy().as_ref());
+    assert_eq!(record["name"], NAME);
+    assert_eq!(record["agent_type"], "claude_code");
+    assert_eq!(record["role"], "orchestrator");
+    assert_eq!(record["orchestration"], "restore-team");
+    assert_eq!(record["orchestration_id"], "restore-instance");
+    assert!(record["ts_ms"].as_u64().is_some(), "timestamp: {record}");
+    assert!(record.get("shell").is_some(), "shell field: {record}");
 }
 
 /// The new run's own segment, once it exists: one whose run is not the dead

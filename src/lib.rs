@@ -69,6 +69,7 @@ pub mod devin_hooks_manage;
 pub mod directory_listing;
 pub mod dispatch;
 pub mod dispatch_return;
+pub mod dispatch_task;
 // PRD #1666 S4: the fixed one-line doorbell for an agent with no armed inbox component.
 pub mod doorbell;
 // PRD #1666 part 3 round 5-wake: which agent releases the doorbell may type into.
@@ -145,6 +146,7 @@ pub mod jsonc_edit;
 pub mod keybindings;
 // Issue #1540: the deck's last New-agent-form command, owned by the daemon.
 pub mod last_command;
+pub mod launch_records;
 pub mod lifetime_tag;
 pub mod lock_rank;
 pub mod logging;

@@ -4596,7 +4596,14 @@ async fn run_daemon_serve_cli(
     // request once it is approved elsewhere or its text changes. Here rather
     // than in `run_daemon_with`, for the reason the pin refresh above is: an
     // in-process test daemon shares this process's one hub.
-    dot_agent_deck::trust_requests::install(daemon.event_tx.clone());
+    // Issue #2348: and it tells each agent it refused the answer, through
+    // that agent's inbox.
+    dot_agent_deck::trust_requests::install(
+        daemon.event_tx.clone(),
+        Some(dot_agent_deck::trust_requests::inbox_sink(
+            std::sync::Arc::downgrade(&daemon.pty_registry),
+        )),
+    );
     let trust_sweep = tokio::spawn(dot_agent_deck::trust_requests::run_sweep());
     let result = run_daemon_with(&path, daemon).await;
     pin_refresh.abort();

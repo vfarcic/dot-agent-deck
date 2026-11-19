@@ -630,12 +630,29 @@ export function useOverviewClock(intervalMs: number = OVERVIEW_CLOCK_TICK_MS): n
   return now;
 }
 
-/** What a reported write lease says on hover, in the daemon's own terms. */
-const WRITE_LEASE_TITLE: Record<"read" | "write" | "none", string> = {
-  write: "The daemon holds a live, writable target for this agent — input typed on this screen reaches it.",
+/**
+ * What a reported write lease says on hover, in the daemon's own terms — for
+ * the two leases the overview shows. `write` has no entry because it has no
+ * chip: see `shownWriteLease`.
+ */
+const WRITE_LEASE_TITLE: Record<"read" | "none", string> = {
   read: "History-only: the daemon can replay this session but cannot deliver input to it.",
   none: "View-only: the daemon has no handle it can write to or resume.",
 };
+
+/**
+ * Issue #2353 — the write lease the overview prints for an agent: `read` or
+ * `none`, when input typed on the screen would NOT reach the agent, and
+ * nothing otherwise. `write` is the ordinary case for every agent, but only a
+ * session that declares a live target reports it (today the stdout wrapper,
+ * so Codex alone), so a `write` chip marked one agent type for being normal.
+ * The TUI says the same: nothing on a live card, a `history` / `view-only`
+ * marker on one that is not (CLAUDE.md rule 22). Absence — a daemon that
+ * reported no lease — prints nothing, and is not read as read-only.
+ */
+export function shownWriteLease(writeLease: OverviewAgent["writeLease"]): "read" | "none" | undefined {
+  return writeLease === "read" || writeLease === "none" ? writeLease : undefined;
+}
 
 /**
  * PRD #1105 M5 — how a row's open control reaches the navigation callback.
@@ -2857,6 +2874,7 @@ function OverviewRow({ agent, hoistedCwd, now, columns }: { agent: OverviewAgent
     `src/untrusted_text.rs`; it is fixed by saying something visible instead.
   */
   const name = displayIdentity(agent.displayName, DISPLAY_LIMITS.name, unnamedAgentLabel(agent));
+  const shownLease = shownWriteLease(agent.writeLease);
   /*
     PRD #1105 M5 — the only thing this milestone adds to a card, and the limit
     is deliberate: #745's commitment is that these rows stay terminal-free, so
@@ -2915,15 +2933,13 @@ function OverviewRow({ agent, hoistedCwd, now, columns }: { agent: OverviewAgent
             <strong>{name}</strong>
             {orchestration?.isStartRole && <span className="coordinator-badge" title="Orchestration start role — the agent an operator messages">ORCHESTRATOR</span>}
             {/*
-              The write lease the daemon reported (PRD #745 M8). Shown whenever it
-              IS reported, including the ordinary writable case, so the rule a
-              reader learns is the simple one — a chip means the daemon said
-              something — rather than "no chip means writable, unless it means the
-              daemon said nothing". A daemon that declared no live target renders
-              nothing here: `toOverviewAgent` reversed its sentinel to absent, and
-              absence is NOT read as read-only.
+              The write lease the daemon reported (PRD #745 M8), shown only when
+              input typed here would not reach the agent (issue #2353,
+              `shownWriteLease`). A `write` lease and a daemon that declared no
+              live target both render nothing: `toOverviewAgent` reversed the
+              latter's sentinel to absent, and absence is NOT read as read-only.
             */}
-            {agent.writeLease && <span className={`overview-lease lease-${agent.writeLease}`} title={WRITE_LEASE_TITLE[agent.writeLease]}>{agent.writeLease}</span>}
+            {shownLease && <span className={`overview-lease lease-${shownLease}`} title={WRITE_LEASE_TITLE[shownLease]}>{shownLease}</span>}
             {roleName && !rendersBlank(roleName) && roleLabel?.toLowerCase() !== agent.displayName.toLowerCase() && <em className="overview-role-name">{roleName}</em>}
             {/*
               PRD #1401 — the same badge the agent's tile and screen show, and

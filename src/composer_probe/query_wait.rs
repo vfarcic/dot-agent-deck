@@ -28,7 +28,7 @@ use crate::evidence_state::EvidenceStatus;
 
 /// How long the agent may take to redraw by itself after a size change, and
 /// which output queries its own input loop waits on (A1 §4.1).
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RedrawTiming {
     /// The longest one size change is expected to keep the agent from
     /// redrawing, when its query goes unanswered (serial: waits chain). A

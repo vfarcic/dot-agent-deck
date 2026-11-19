@@ -114,25 +114,6 @@ const DELIVERY_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// budget. The context rewrite watcher independently pins exactly one re-arm.
 const MAX_POINTER_LINES_PER_DELIVERY: usize = 3;
 
-/// The minimum gap [`ContextRewriteWatcher`] requires between two observed
-/// modification times before it counts them as two SEPARATE rewrites.
-///
-/// `prepare_orchestrator_prompt` writes the context file with
-/// `std::fs::write`, which truncates and then writes, so ONE logical rewrite
-/// can bump the mtime twice microseconds apart. Two genuine re-arms cannot be
-/// anywhere near that close: the second cannot start until the first
-/// delivery has actually written its payload (the inbox post in `src/ui.rs`), which puts a whole readiness gate and PTY write between them.
-/// Measured against the deliberate double-fire mutation used to verify this
-/// detector: **~680ms** apart, across three runs (679ms, 688ms, 688ms).
-const CONTEXT_REWRITE_DEBOUNCE: Duration = Duration::from_millis(8);
-
-/// Ceiling on how long [`ContextRewriteWatcher`]'s sampling thread stays
-/// alive. Comfortably above the sum of every bound the watched region can
-/// spend ([`REASSERTION_DELIVERY_TIMEOUT`] + [`DELIVERY_SETTLE_TIMEOUT`] +
-/// the 900ms hold), because a watcher that times out early would silently
-/// UNDER-count. [`ContextRewriteWatcher::stop`] asserts it did not.
-const CONTEXT_WATCH_MAX: Duration = Duration::from_secs(180);
-
 /// Block until the daemon's own `ListAgents`/live-status join reports `pred`
 /// for `pane_id`'s live session, or `timeout` elapses; returns whether it
 /// did.
@@ -235,79 +216,60 @@ fn settled_pointer_count(deck: &TuiDeck, log: &RemitLog, ceiling: usize) -> usiz
     settled_count
 }
 
-/// Count how many times the orchestrator context file is REWRITTEN between
-/// [`ContextRewriteWatcher::start`] and [`ContextRewriteWatcher::stop`] — the
+/// Count the orchestrator contexts PUBLISHED between
+/// [`ContextPublications::start`] and [`ContextPublications::stop`] — the
 /// exactly-once detector `orchestration_remit_004` needs and that no pointer
 /// count can provide.
 ///
 /// Inbox messages can be delivered again if receipt is not acknowledged, so
 /// a pointer count alone cannot distinguish redelivery from a second re-arm.
-/// `reassert_orchestrator_prompt` publishes a new context file, while inbox
-/// redelivery reuses the prepared body. Count context publications separately.
+/// `reassert_orchestrator_prompt` publishes a new
+/// `orchestrator-context-<id>.md` for every logical re-arm, while inbox
+/// redelivery reuses the prepared body and publishes nothing.
 ///
-/// **Why a background sampler rather than reading the file at each step.** The
-/// first version of this check stamped a sentinel comment into the file,
-/// waited for the re-assertion's log line, and re-stamped. That misses,
-/// measured: against a deliberate double-fire mutation it caught only 3 of 5
-/// runs, because the SECOND re-arm fires one frame after the first payload
-/// write — i.e. at essentially the same moment as the log line the test is
-/// waiting on, and usually before the test can react to it. Sampling from
-/// before the trigger removes the reaction entirely: there is no moment the
-/// test has to be quick enough to catch.
+/// **A before/after listing is exact, so nothing samples in the background.**
+/// Until issue #1395 this watched the modification time of the fixed
+/// `orchestrator-context.md` mirror every re-arm refreshed, which needed a
+/// sampler running from before the trigger: a second re-arm one frame after
+/// the first rewrote the same file, and a test that reacted to the first
+/// could miss the second (3 of 5 runs against a deliberate double-fire
+/// mutation). Each publish now writes a file of its own and nothing removes
+/// one during the window — a re-arm leaves the file it replaced in place, and
+/// only the end of the orchestration or a 14-day-old age removes them — so two
+/// re-arms leave two new names however close together they ran.
 #[cfg(unix)]
-struct ContextRewriteWatcher {
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    handle: std::thread::JoinHandle<(usize, bool)>,
+struct ContextPublications {
+    dir: std::path::PathBuf,
+    before: std::collections::HashSet<std::ffi::OsString>,
 }
 
 #[cfg(unix)]
-impl ContextRewriteWatcher {
-    fn start(context_path: &std::path::Path) -> Self {
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let path = context_path.to_path_buf();
-        let thread_stop = std::sync::Arc::clone(&stop);
-        let handle = std::thread::spawn(move || {
-            let mtime = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
-            let last = std::cell::Cell::new(mtime(&path));
-            // Start the debounce already elapsed, so the FIRST rewrite always
-            // counts however soon after `start` it arrives.
-            let last_counted =
-                std::cell::Cell::new(std::time::Instant::now() - CONTEXT_REWRITE_DEBOUNCE);
-            let rewrites = std::cell::Cell::new(0usize);
-            // The pacing comes from `common::wait_until` — the harness's own
-            // bounded poll — rather than from a sleep in this file. That is
-            // Decision 21 (no sleeps in an e2e test body), and the cadence is
-            // right on the measurement rather than by luck: `wait_until` polls
-            // every 50ms (`tests/common/lib.rs`) against a ~680ms gap between
-            // two genuine re-arms, so ~13x margin.
-            let stopped_cleanly = common::wait_until(CONTEXT_WATCH_MAX, || {
-                let now = mtime(&path);
-                if now.is_some() && now != last.get() {
-                    last.set(now);
-                    if last_counted.get().elapsed() >= CONTEXT_REWRITE_DEBOUNCE {
-                        rewrites.set(rewrites.get() + 1);
-                        last_counted.set(std::time::Instant::now());
-                    }
-                }
-                thread_stop.load(std::sync::atomic::Ordering::Relaxed)
-            });
-            (rewrites.get(), stopped_cleanly)
-        });
-        Self { stop, handle }
+impl ContextPublications {
+    fn per_publish_names(dir: &std::path::Path) -> std::collections::HashSet<std::ffi::OsString> {
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .filter(|name| {
+                name.to_str().is_some_and(|name| {
+                    name.starts_with("orchestrator-context-") && name.ends_with(".md")
+                })
+            })
+            .collect()
+    }
+
+    fn start(context_dir: &std::path::Path) -> Self {
+        Self {
+            dir: context_dir.to_path_buf(),
+            before: Self::per_publish_names(context_dir),
+        }
     }
 
     fn stop(self) -> usize {
-        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        let (rewrites, stopped_cleanly) =
-            self.handle.join().expect("context rewrite watcher thread");
-        assert!(
-            stopped_cleanly,
-            "the context-rewrite watcher hit its own {CONTEXT_WATCH_MAX:?} ceiling before the \
-             test asked it to stop, so it stopped sampling early and its count of \
-             {rewrites} rewrite(s) is a floor rather than a total — do not read an \
-             exactly-once verdict off it."
-        );
-        rewrites
+        Self::per_publish_names(&self.dir)
+            .difference(&self.before)
+            .count()
     }
 }
 
@@ -879,11 +841,9 @@ fn orchestration_remit_003_reassertion_waits_for_confirmed_delivery() {
 /// `CLEAR_SESSION_START_METADATA_VALUE`). A second remit must be posted to
 /// the start role's inbox — the orchestrator's remit re-asserting itself on
 /// `/clear`, exactly as it already re-asserts on compaction, via the same
-/// reused delivery machinery. It must then re-assert EXACTLY once: a sentinel
-/// comment is stamped into the fixed `.dot-agent-deck/orchestrator-context.md`
-/// mirror before the trigger, the re-assertion's refresh of that mirror must destroy it
-/// (proving the sentinel detects a re-arm at all), and a freshly stamped one
-/// must then survive the settle-and-hold window that follows.
+/// reused delivery machinery. It must then re-assert EXACTLY once: across the
+/// trigger, the delivery, its settle and a hold, exactly one new
+/// `.dot-agent-deck/orchestrator-context-<id>.md` is published.
 #[spec("orchestration/remit/004")]
 #[test]
 #[cfg(unix)]
@@ -893,17 +853,10 @@ fn orchestration_remit_004_start_role_clear_reasserts_remit() {
         .launch_with_fixture("remit-reassert-orchestration");
     let (socket, pane_id, agent_id, log, baseline) = open_and_confirm_initial_delivery(&deck);
 
-    // Arm the exactly-once detector BEFORE the trigger (see
-    // [`ContextRewriteWatcher`]). It has to be running already: the second
-    // re-arm of a double-fire regression lands one frame after the first
-    // payload write, so any detector that only starts looking once the test
-    // has OBSERVED that write is racing something it loses more often than it
-    // wins.
-    let context_path = deck
-        .workdir()
-        .join(".dot-agent-deck")
-        .join("orchestrator-context.md");
-    let rewrites = ContextRewriteWatcher::start(&context_path);
+    // Take the exactly-once detector's "before" BEFORE the trigger (see
+    // [`ContextPublications`]), so every publication the trigger causes is new.
+    let context_dir = deck.workdir().join(".dot-agent-deck");
+    let publications = ContextPublications::start(&context_dir);
 
     inject_clear_session_start(
         &deck,
@@ -953,21 +906,22 @@ fn orchestration_remit_004_start_role_clear_reasserts_remit() {
     //
     // Stopped here rather than earlier so the window covers everything above —
     // the delivery, its settle, and the hold.
-    let rewrites = rewrites.stop();
+    let published = publications.stop();
     assert_eq!(
-        rewrites,
+        published,
         1,
         "a single `/clear`-originated SessionStart event must trigger exactly ONE \
-         logical re-assertion, but {} was rewritten {rewrites} time(s) while this test \
-         watched it. 0 means no re-arm ran at all and the delivery above came from \
-         somewhere else, so this detector is blind — check it before anything else. 2 \
-         or more is a double fire: only `reassert_orchestrator_prompt` (`src/ui.rs` -> \
-         `src/orchestrator_context.rs`) writes that file, so a second write IS a second \
-         re-arm, and the edge detection on `orchestration_remit_clear_reasserted_at` is \
-         what to look at. The pointer count cannot see this at all — two confirmed \
-         deliveries and one retried delivery leave the same number of lines.\n\
+         logical re-assertion, but {published} new context file(s) appeared in {} while \
+         this test watched it. 0 means no re-arm ran at all and the delivery above came \
+         from somewhere else, so this detector is blind — check it before anything else. \
+         2 or more is a double fire: in this window only `reassert_orchestrator_prompt` \
+         (`src/ui.rs` -> `src/orchestrator_context.rs`) publishes one, so a second file IS \
+         a second re-arm, and the edge detection on \
+         `orchestration_remit_clear_reasserted_at` is what to look at. The pointer count \
+         cannot see this at all — two confirmed deliveries and one retried delivery leave \
+         the same number of lines.\n\
          Final grid:\n{}",
-        context_path.display(),
+        context_dir.display(),
         deck.snapshot_grid()
     );
 }
@@ -1097,7 +1051,7 @@ const CARRY_OUT_TASK_POINTER: &str = "Then carry out that task";
 /// Scenario: Regression for the maintainer review on the fork's upstream PR
 /// #789 ("Required 1"). Before this fix, both re-arm sites called
 /// `prepare_orchestrator_prompt(config, cwd, None)` directly, which
-/// unconditionally rewrote `.dot-agent-deck/orchestrator-context.md` with no
+/// unconditionally rewrote the orchestrator's context file with no
 /// `## Your task` section and delivered the no-task "wait for instructions"
 /// pointer — silently deleting a dispatched orchestration's task from disk on
 /// every compaction, on exactly the long-running `dispatch --task` path this
@@ -1193,7 +1147,7 @@ fn orchestration_remit_007_compaction_reassertion_preserves_a_dispatched_task() 
 
 /// Scenario: Prepare two briefs in one project, start only the first run, and
 /// attach a fresh TUI after the daemon has started its panes. Compaction of
-/// the hydrated start-role tab republishes the first brief, not the later mirror.
+/// the hydrated start-role tab republishes the first brief, not the later one.
 #[spec("orchestration/remit/008")]
 #[test]
 #[cfg(unix)]
@@ -1203,7 +1157,7 @@ fn orchestration_remit_008_hydrated_tab_rearms_from_its_own_context() {
 
 /// Scenario: Attach a TUI before the first orchestration starts, then prepare
 /// a second brief in the same project. When the live-surfaced first tab
-/// compacts, it republishes its own brief instead of the later mirror.
+/// compacts, it republishes its own brief instead of the later one.
 #[spec("orchestration/remit/009")]
 #[test]
 #[cfg(unix)]
@@ -1325,8 +1279,183 @@ fn orchestration_remit_010_reattached_tab_rearms_from_the_latest_rearm() {
             .collect::<Vec<_>>()
     );
     assert!(
-        context_dir.join("orchestrator-context.md").is_file(),
-        "the compatibility mirror must remain"
+        !context_dir.join("orchestrator-context.md").exists(),
+        "issue #1395: no fixed-path copy of any of them is written"
+    );
+}
+
+/// Scenario: Start an orchestration over the daemon socket the way the TUI's
+/// `Ctrl+n` does — plain role starts with no preparation, so the daemon
+/// records no context file for it — in a project where an older deck left a
+/// fixed-path `.dot-agent-deck/orchestrator-context.md` carrying a task, then
+/// attach a TUI. Compacting the start role re-sends its instructions without
+/// that task, and the TUI's status line says they were re-sent without a task.
+#[spec("orchestration/remit/011")]
+#[test]
+#[cfg(unix)]
+fn orchestration_remit_011_a_tab_without_its_own_context_rearms_without_a_task_and_says_so() {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    const LEFT_OVER_TASK: &str = "SENTINEL-LEFT-OVER-TASK-remit011";
+    const TITLE: &str = "No own context run";
+    const RUN_ID: &str = "remit-no-own-context-011";
+    let daemon = common::spawn_daemon_serve_with_env(
+        None,
+        "0",
+        &[("DOT_AGENT_DECK_HOOK_PROVENANCE", "warn")],
+    );
+    let project = common::harness_tempdir().expect("create the orchestration project");
+    std::fs::write(
+        project.path().join(".dot-agent-deck.toml"),
+        include_str!("fixtures/remit-reassert-orchestration/.dot-agent-deck.toml"),
+    )
+    .expect("write orchestration config");
+    write_executable(
+        &project.path().join("orchestrator-remit.sh"),
+        ORCHESTRATOR_REMIT_SCRIPT,
+    );
+    // PRD #1885: the TUI re-arms only an approved orchestration.
+    daemon.approve_project_trust(project.path());
+    let cwd = std::fs::canonicalize(project.path()).expect("canonical project path");
+    let cwd_wire = cwd.to_string_lossy().into_owned();
+
+    // What an older deck left behind: an owner-only `.dot-agent-deck` (the
+    // publish refuses a group-writable one) and the fixed name, refreshed with
+    // some launch's brief.
+    let context_dir = cwd.join(".dot-agent-deck");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&context_dir)
+        .expect("create .dot-agent-deck owner-only");
+    let left_over = context_dir.join("orchestrator-context.md");
+    std::fs::write(
+        &left_over,
+        format!("# Orchestrator\n\n## Your task\n\n{LEFT_OVER_TASK}\n"),
+    )
+    .expect("leave a fixed-path copy");
+
+    let mut start_role = None;
+    for (role_index, (role_name, command, is_start_role)) in [
+        ("orchestrator", "./orchestrator-remit.sh", true),
+        ("worker", "cat", false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let response = daemon
+            .send_attach_request(&AttachRequest::StartAgent {
+                command: Some(command.into()),
+                cwd: Some(cwd_wire.clone()),
+                rows: 24,
+                cols: 80,
+                env: vec![(
+                    "DOT_AGENT_DECK_PANE_ID".into(),
+                    format!("{RUN_ID}-{role_index}"),
+                )],
+                display_name: Some(role_name.into()),
+                tab_membership: Some(TabMembership::Orchestration {
+                    name: "remit-reassert".into(),
+                    role_index,
+                    role_name: role_name.into(),
+                    is_start_role,
+                    orchestration_cwd: Some(cwd_wire.clone()),
+                    display_title: Some(TITLE.into()),
+                    orchestration_id: Some(RUN_ID.into()),
+                }),
+                agent_type: None,
+                seed: None,
+                authoring_kind: None,
+                client_seeded_kind: None,
+                remember_command: false,
+            })
+            .expect("start a role over the daemon socket");
+        assert!(
+            response.ok,
+            "start {role_name} failed: {:?}",
+            response.error
+        );
+        if is_start_role {
+            start_role = response.id;
+        }
+    }
+    let agent_id = start_role.expect("the start role has an agent id");
+    let record = role_agent_record(&daemon.attach_socket, "orchestrator");
+    let pane_id = record.pane_id_env.expect("start role pane id");
+    assert_eq!(
+        record.orchestrator_context_path, None,
+        "the premise: the daemon records no context file for an unprepared start"
+    );
+
+    let deck = TuiDeck::builder()
+        .with_pty_size(160, 40)
+        .with_env(
+            "DOT_AGENT_DECK_ATTACH_SOCKET",
+            daemon.attach_socket.to_string_lossy().to_string(),
+        )
+        .with_env(
+            "DOT_AGENT_DECK_SOCKET",
+            daemon.hook_socket.to_string_lossy().to_string(),
+        )
+        .launch_with_fixture("minimal");
+    deck.wait_until_grid("the hydrated orchestration tab", |grid| {
+        grid.lines().next().is_some_and(|tabs| tabs.contains(TITLE))
+    });
+    assert!(
+        wait_for_applied(
+            &daemon.attach_socket,
+            &pane_id,
+            INJECTED_EVENT_APPLIED_TIMEOUT,
+            |s| s.live_target.is_some()
+        ),
+        "the start role did not publish its live target before compaction; grid:\n{}",
+        deck.snapshot_grid()
+    );
+    assert!(
+        left_over.is_file(),
+        "the premise: the fixed-path copy is still there to be (mis)read"
+    );
+
+    let before = context_files(&context_dir);
+    let event = synthetic_event(
+        EventType::Compacting,
+        &format!("{RUN_ID}-compaction"),
+        &pane_id,
+        &agent_id,
+    );
+    common::write_hook_line(
+        &daemon.hook_socket,
+        &serde_json::to_string(&event).expect("serialize compaction event"),
+    )
+    .expect("inject compaction into the daemon");
+
+    // The status line is the user-visible half: a re-arm that carries no task
+    // says so rather than only logging it.
+    deck.wait_for_string("re-sent to its coordinator without a task");
+
+    let rearmed = || {
+        context_files(&context_dir)
+            .difference(&before)
+            .next()
+            .cloned()
+    };
+    assert!(
+        common::wait_until(REASSERTION_DELIVERY_TIMEOUT, || rearmed().is_some()),
+        "the tab never published a new context after compaction; grid:\n{}",
+        deck.snapshot_grid()
+    );
+    let rearmed_path = rearmed().expect("new context path");
+    let content = read_announced_context(
+        &daemon.attach_socket,
+        &pane_id,
+        &agent_id,
+        &rearmed_path,
+        &deck,
+    );
+    assert!(
+        !content.contains(LEFT_OVER_TASK) && !content.contains("## Your task"),
+        "a tab with no context file of its own must not re-arm from the fixed-path copy an \
+         older deck left; {} carries a task:\n{content}",
+        rearmed_path.display()
     );
 }
 
@@ -1520,21 +1649,21 @@ fn assert_attached_tab_rearms_from_own_context(live_surface: bool) -> RearmedRun
     let (first_brief, second_brief, title, run_id) = if live_surface {
         (
             "FIRST-LIVE-BRIEF-009",
-            "SECOND-MIRROR-BRIEF-009",
+            "SECOND-LATER-BRIEF-009",
             "Live first run",
             "remit-live-first-009",
         )
     } else {
         (
             "FIRST-HYDRATED-BRIEF-008",
-            "SECOND-MIRROR-BRIEF-008",
+            "SECOND-LATER-BRIEF-008",
             "Hydrated first run",
             "remit-hydrated-first-008",
         )
     };
     let first = prepare(first_brief);
     let second = (!live_surface).then(|| prepare(second_brief));
-    let mirror = cwd.join(".dot-agent-deck/orchestrator-context.md");
+    let fixed_path = cwd.join(".dot-agent-deck/orchestrator-context.md");
     let launch_deck = || {
         TuiDeck::builder()
             .with_pty_size(120, 40)
@@ -1598,16 +1727,16 @@ fn assert_attached_tab_rearms_from_own_context(live_surface: bool) -> RearmedRun
 
     let second = second.unwrap_or_else(|| prepare(second_brief));
     assert_ne!(first.context_path, second.context_path);
-    // The daemon writes the compatibility mirror after it has replied to the
-    // preparation (`PrepareWorkflow` in `src/daemon_protocol.rs`), so the reply
-    // alone does not mean the write has landed; on a starved runner a single
-    // read straight after it found the earlier brief (PR #1480's CI run).
+    // The premise: the project's latest preparation is the second brief, which
+    // is what a tab that read "the latest publish" would re-arm with. Issue
+    // #1395: and no fixed-path copy of it exists for a re-arm to read.
     assert!(
-        common::wait_until(Duration::from_secs(10), || {
-            std::fs::read_to_string(&mirror).is_ok_and(|text| text.contains(second_brief))
-        }),
-        "the mirror must hold the later brief before compaction; it holds:\n{}",
-        std::fs::read_to_string(&mirror).unwrap_or_default()
+        std::fs::read_to_string(&second.context_path).is_ok_and(|text| text.contains(second_brief)),
+        "the later preparation's own file must hold the later brief"
+    );
+    assert!(
+        !fixed_path.exists(),
+        "issue #1395: a preparation writes no fixed-path copy"
     );
     let deck = deck.unwrap_or_else(launch_deck);
     deck.wait_until_grid("first orchestration tab", |grid| {
@@ -1695,7 +1824,7 @@ fn assert_attached_tab_rearms_from_own_context(live_surface: bool) -> RearmedRun
     );
     assert!(
         content.contains(first_brief) && !content.contains(second_brief),
-        "the first tab must rearm from its own file, not the later mirror; {}: first={}, second={}",
+        "the first tab must rearm from its own file, not the later preparation's; {}: first={}, second={}",
         rearmed_path.display(),
         content.contains(first_brief),
         content.contains(second_brief)
