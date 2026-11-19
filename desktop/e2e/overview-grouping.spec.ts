@@ -383,6 +383,9 @@ test.describe("the fleet view (PRD #742 M4)", () => {
         await page.setViewportSize({ width, height: 800 });
         await expect(button, `the counters button is off screen at ${width}px`).toBeInViewport();
         await button.hover();
+        // The box is read once the popover is open: read straight after the
+        // hover it raced the opening, and WebKit lost (PR #2378, null box at 961px).
+        await expect(popover, `the counters do not open at ${width}px`).toBeVisible();
         const box = await popover.boundingBox();
         expect((box?.x ?? 0) + (box?.width ?? 0), `the counters run off the right edge at ${width}px`).toBeLessThanOrEqual(width);
         expect(box?.x ?? -1, `the counters run off the left edge at ${width}px`).toBeGreaterThanOrEqual(0);
