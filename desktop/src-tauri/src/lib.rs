@@ -1327,8 +1327,7 @@ fn emit_snapshot(app: &AppHandle, snapshot: &DesktopSnapshot) {
     // PRD #2374 (PR #2378 review): the agents the app now shows for this
     // deck, for voice to reach without asking the daemon again.
     if let Some(state) = app.try_state::<DesktopState>() {
-        record_shown_agents(
-            &state.shown_agents,
+        state.record_shown_agents(
             &snapshot.connection.deck_id,
             snapshot.connection.status == ConnectionStatus::Connected,
             &snapshot.agents,
@@ -1338,7 +1337,7 @@ fn emit_snapshot(app: &AppHandle, snapshot: &DesktopSnapshot) {
 
 /// PRD #2374 (PR #2378 review) — a deck's shown `agents` into `shown`, under
 /// its id: kept while the deck is connected, removed otherwise.
-fn record_shown_agents(
+pub(crate) fn record_shown_agents(
     shown: &std::sync::Mutex<HashMap<String, Vec<voice::DesktopAgent>>>,
     deck: &str,
     connected: bool,

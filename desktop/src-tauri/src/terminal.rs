@@ -536,7 +536,8 @@ impl DesktopState {
     /// that deck reaches the webview — needs a running Tauri app to observe and
     /// is not pinned by any test here; it is stated rather than claimed.
     pub(crate) fn retain_watchers(&self, observed: &HashSet<EndpointIdentity>) {
-        self.watchers().retain(|deck, claim| {
+        let mut watchers = self.watchers();
+        watchers.retain(|deck, claim| {
             if observed.contains(deck) {
                 return true;
             }
@@ -545,8 +546,36 @@ impl DesktopState {
             }
             false
         });
+        // PRD #2374 (PR #2378 review): a departed deck's agents leave the
+        // cache voice reads with its watcher, under the same lock
+        // [`Self::record_shown_agents`] records under, so a snapshot still in
+        // flight from the aborted watcher cannot put them back.
+        let kept: HashSet<String> = observed.iter().map(EndpointIdentity::wire_id).collect();
+        self.shown_agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|deck, _| kept.contains(deck));
+        drop(watchers);
         self.refetch_senders()
             .retain(|deck, _| observed.contains(deck));
+    }
+
+    /// PRD #2374 (PR #2378 review) — record the agents a snapshot of `deck`
+    /// (its wire id) showed, for voice ([`Self::shown_agents`]): kept while
+    /// the deck is connected AND its watcher is still held, removed otherwise.
+    /// Under the watchers lock, so it cannot interleave with
+    /// [`Self::retain_watchers`] retiring that deck: a rejoined deck
+    /// contributes nothing until its new watcher's first connected snapshot.
+    pub(crate) fn record_shown_agents(
+        &self,
+        deck: &str,
+        connected: bool,
+        agents: &[crate::dto::DesktopAgent],
+    ) {
+        let watchers = self.watchers();
+        let watched = watchers.keys().any(|each| each.wire_id() == deck);
+        crate::record_shown_agents(&self.shown_agents, deck, connected && watched, agents);
+        drop(watchers);
     }
 
     /// The refetch signal map, poison-tolerant for the reason
@@ -1907,6 +1936,65 @@ mod tests {
         assert!(
             !watcher_b.has_changed().unwrap(),
             "the deck that stayed keeps its"
+        );
+    }
+
+    /// PRD #2374 (PR #2378 review) — the agents voice reaches on other daemons.
+    ///
+    /// Scenario: deck A is watched and deck B is not. A connected snapshot of A
+    /// is recorded and one of B is not. Deck A then leaves the fleet: its
+    /// agents leave the cache with its watcher, a snapshot of it still in
+    /// flight records nothing, and when A is watched again it has nothing
+    /// cached until a connected snapshot of it arrives.
+    #[cfg(unix)]
+    #[test]
+    fn a_decks_shown_agents_live_and_leave_with_its_watcher() {
+        let state = DesktopState::default();
+        let deck_a = fixture_deck("/tmp/dot-agent-deck-shown-a.sock").identity();
+        let deck_b = fixture_deck("/tmp/dot-agent-deck-shown-b.sock").identity();
+        let (a, b) = (deck_a.wire_id(), deck_b.wire_id());
+        let coder = [crate::voice::fixtures::agent(
+            "1",
+            Some("Coder"),
+            "claude_code",
+        )];
+        let cached = |state: &DesktopState, deck: &str| {
+            state
+                .shown_agents
+                .lock()
+                .unwrap()
+                .get(deck)
+                .map(|agents| agents.len())
+        };
+
+        assert!(state.start_watcher_once_for(&deck_a).is_some());
+        state.record_shown_agents(&a, true, &coder);
+        state.record_shown_agents(&b, true, &coder);
+        assert_eq!(cached(&state, &a), Some(1));
+        assert_eq!(
+            cached(&state, &b),
+            None,
+            "an unwatched deck records nothing"
+        );
+
+        state.retain_watchers(&HashSet::new());
+        assert_eq!(cached(&state, &a), None, "it leaves with its watcher");
+        state.record_shown_agents(&a, true, &coder);
+        assert_eq!(
+            cached(&state, &a),
+            None,
+            "a late snapshot cannot put it back"
+        );
+
+        assert!(state.start_watcher_once_for(&deck_a).is_some());
+        assert_eq!(cached(&state, &a), None, "nothing until its first snapshot");
+        state.record_shown_agents(&a, true, &coder);
+        assert_eq!(cached(&state, &a), Some(1));
+        state.record_shown_agents(&a, false, &coder);
+        assert_eq!(
+            cached(&state, &a),
+            None,
+            "a deck that stops answering has none"
         );
     }
 
