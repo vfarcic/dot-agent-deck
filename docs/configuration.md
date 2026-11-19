@@ -166,9 +166,9 @@ Instead of starting from the template, you can ask an agent that is already runn
 2. Ask it to generate the config: in the TUI, select its card in command mode and press `g` (or click **Generate** in the footer); in the desktop app, press **Generate config** on the agent's row on the Dashboard or in its pane, or say "generate config with" and its name.
 3. A dialog titled **Generate .dot-agent-deck.toml** opens in both clients. Choose **Yes** to send the agent the request, or **No** (or `Esc`) to close it and send nothing.
 4. The agent's pane comes to the front and the agent proposes a config. Tell it what to change; it writes the file after you approve.
-
-When the project already has a `.dot-agent-deck.toml`, the control reads **Update** (`[Update g]` in the TUI, **Update config** in the desktop app) and the dialog **Update .dot-agent-deck.toml**. The agent then reads the existing file and proposes changes to it, keeping what you wrote unless you agree to drop it, and edits it only after you approve.
 5. Run `dot-agent-deck validate` in the project, then start an agent there and choose the orchestration under **Mode** in the New agent form of either client.
+
+When the project already has a `.dot-agent-deck.toml`, the control reads **Update** (`[Update g]` in the TUI, **Update config** in the desktop app) and the dialog **Update .dot-agent-deck.toml**. The agent then reads the existing file and proposes changes to it, keeping what you wrote unless you agree to drop it, and edits it only after you approve. Both clients notice within a few seconds when the file appears or goes away, so after the agent writes it the control reads **Update**. A `.dot-agent-deck.toml` that is a symbolic link counts as an existing config too: the agent edits the file the link points to and keeps the link, and if the link points to a file that does not exist, the agent tells you so instead of writing anything.
 
 [Quick setup](orchestration.md#quick-setup) has the screenshots, what the agent is asked to do, and what each message means when it does not work, including `This daemon is too old to generate a config. Upgrade the daemon to use Generate config.`
 

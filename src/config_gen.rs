@@ -8,8 +8,24 @@ const CONFIG_GEN_PROMPT_TEMPLATE: &str = include_str!("../assets/config_gen_prom
 
 /// PRD #2119: the section put ahead of [`CONFIG_GEN_PROMPT_TEMPLATE`] when the
 /// project already has a `.dot-agent-deck.toml`, turning the request into an
-/// update of the user's file rather than a fresh one.
+/// update of the user's file rather than a fresh one. `{link}` is where the
+/// symbolic-link instructions go when the file is a link ([`SYMLINK_NOTE`]).
 const CONFIG_GEN_EXISTING_TEMPLATE: &str = include_str!("../assets/config_gen_existing.md");
+
+/// PRD #2119: the whole request when the project's `.dot-agent-deck.toml` is a
+/// symbolic link to nothing: there is no file to read or edit, so the agent is
+/// told to say so rather than to write.
+const CONFIG_GEN_DANGLING_TEMPLATE: &str = include_str!("../assets/config_gen_dangling.md");
+
+/// PRD #2119: the section put ahead of the request when the deck could not
+/// tell, within [`CONFIG_CHECK_TIMEOUT`], whether the project already has a
+/// `.dot-agent-deck.toml`. Every instruction is conditional on what the agent
+/// finds there.
+const CONFIG_GEN_UNKNOWN_TEMPLATE: &str = include_str!("../assets/config_gen_unknown.md");
+
+/// PRD #2119: the bullet [`CONFIG_GEN_EXISTING_TEMPLATE`]'s `{link}` becomes
+/// when the existing config is a symbolic link that resolves.
+const SYMLINK_NOTE: &str = "- **`{dir}/.dot-agent-deck.toml` is a symbolic link** (to {target}). Edit the file it points to in place, through the link, and keep the link: never replace it with a regular file, remove it or re-point it.\n";
 
 /// Generic agent role library. Embedded at build time; the config-gen agent picks
 /// from these roles when proposing an orchestration.
@@ -57,33 +73,282 @@ fn render_roles_section(library: &RoleLibrary) -> String {
     out
 }
 
-/// Build the config generation prompt for a specific directory.
+/// PRD #2119: what is at `<dir>/.dot-agent-deck.toml`, as far as generating
+/// or updating a config is concerned ([`existing_config`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExistingConfig {
+    /// Nothing the user wrote is there: no entry at that name, or one that is
+    /// a directory, FIFO, socket or device. The request is the plain one.
+    Absent,
+    /// A regular file.
+    File,
+    /// A symbolic link, whatever it points to. `target` is what the link
+    /// holds (`None` when it could not be read); `dangling` is whether
+    /// following it finds nothing.
+    Symlink {
+        target: Option<std::path::PathBuf>,
+        dangling: bool,
+    },
+    /// The check did not finish within [`CONFIG_CHECK_TIMEOUT`] (or could not
+    /// be run), so the deck does not know.
+    Unknown,
+}
+
+impl ExistingConfig {
+    /// Whether a client should offer Update rather than Generate: `Some(true)`
+    /// for a file or a symlink (a dangling one included), `Some(false)` when
+    /// nothing is there, `None` when unknown.
+    pub fn exists(&self) -> Option<bool> {
+        match self {
+            Self::Absent => Some(false),
+            Self::File | Self::Symlink { .. } => Some(true),
+            Self::Unknown => None,
+        }
+    }
+}
+
+/// PRD #2119: what is at `<dir>/.dot-agent-deck.toml`, for generate/update
+/// purposes only. **Blocking** (an `lstat`, plus a `readlink` and a `stat`
+/// for a link): async callers go through [`existing_config_bounded`] or
+/// [`project_config_flags`].
 ///
-/// PRD #2119: checked against the disk when it is composed. When `dir` already
-/// holds a `.dot-agent-deck.toml` ([`project_config_exists`]), the request
-/// names that file and asks the agent to read it and propose changes to it,
-/// writing only after approval; otherwise it is the plain template.
+/// Deliberately not [`crate::directory_listing::holds_project_config`]: that
+/// predicate answers whether the PROJECT READER would accept the file, and it
+/// refuses a symlink. Here the question is whether the user already has
+/// content at that name, which a symlink is, dangling or not, so the request
+/// can tell the agent to keep it. The project resolver's no-follow policy is
+/// unchanged. A directory at that name is not a config.
+pub fn existing_config(dir: &std::path::Path) -> ExistingConfig {
+    let path = dir.join(crate::project_config::CONFIG_FILE_NAME);
+    match std::fs::symlink_metadata(&path) {
+        Err(_) => ExistingConfig::Absent,
+        Ok(meta) if meta.file_type().is_symlink() => ExistingConfig::Symlink {
+            target: std::fs::read_link(&path).ok(),
+            dangling: std::fs::metadata(&path).is_err(),
+        },
+        Ok(meta) if meta.file_type().is_file() => ExistingConfig::File,
+        Ok(_) => ExistingConfig::Absent,
+    }
+}
+
+/// PRD #2119: whether `dir` itself holds a `.dot-agent-deck.toml` for
+/// generate/update purposes ([`existing_config`]): a regular file or a
+/// symbolic link (a dangling one included), at that exact directory, with no
+/// walk up the tree. **Blocking.**
+pub fn project_config_exists(dir: &str) -> bool {
+    existing_config(std::path::Path::new(dir))
+        .exists()
+        .unwrap_or(false)
+}
+
+/// PRD #2119: how long the daemon waits for its config checks — a listing's
+/// whole batch, or the one a request is composed with — before it treats the
+/// answer as unknown. An `lstat` on a healthy disk takes microseconds; this
+/// bounds one on an unavailable network or FUSE mount.
+pub const CONFIG_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Run `f` on a blocking thread behind the daemon's project-filesystem bound
+/// ([`crate::project_resolve::run_bounded_in`]), giving up after `timeout`.
+/// `None` when it did not finish in time, or could not be run. A thread that
+/// stalls keeps its permit until it returns, so stalled checks cannot pile up
+/// past the bound; what they cannot do is hold the caller past `timeout`.
+async fn off_runtime_within<T, F>(
+    limit: &std::sync::Arc<tokio::sync::Semaphore>,
+    timeout: std::time::Duration,
+    f: F,
+) -> Option<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::time::timeout(timeout, crate::project_resolve::run_bounded_in(limit, f)).await {
+        Ok(Ok(value)) => Some(value),
+        Ok(Err(_)) | Err(_) => None,
+    }
+}
+
+/// PRD #2119: [`existing_config`] for each of `dirs`, as one unit of blocking
+/// work off the async runtime, bounded by [`CONFIG_CHECK_TIMEOUT`]. `None`
+/// when the batch did not finish in time: every answer is then unknown. Call
+/// it holding no registry or `AppState` lock.
+pub async fn project_config_flags(dirs: Vec<String>) -> Option<Vec<bool>> {
+    project_config_flags_within(
+        crate::project_resolve::project_fs_limit(),
+        CONFIG_CHECK_TIMEOUT,
+        dirs,
+    )
+    .await
+}
+
+/// [`project_config_flags`] against an explicit bound and timeout, for tests.
+pub(crate) async fn project_config_flags_within(
+    limit: &std::sync::Arc<tokio::sync::Semaphore>,
+    timeout: std::time::Duration,
+    dirs: Vec<String>,
+) -> Option<Vec<bool>> {
+    off_runtime_within(limit, timeout, move || {
+        dirs.iter()
+            .map(|dir| project_config_exists(dir))
+            .collect::<Vec<_>>()
+    })
+    .await
+}
+
+/// PRD #2119: [`existing_config`] off the async runtime, bounded by
+/// [`CONFIG_CHECK_TIMEOUT`]; [`ExistingConfig::Unknown`] when it did not finish.
+pub async fn existing_config_bounded(dir: &str) -> ExistingConfig {
+    existing_config_within(
+        crate::project_resolve::project_fs_limit(),
+        CONFIG_CHECK_TIMEOUT,
+        dir,
+    )
+    .await
+}
+
+/// [`existing_config_bounded`] against an explicit bound and timeout, for tests.
+async fn existing_config_within(
+    limit: &std::sync::Arc<tokio::sync::Semaphore>,
+    timeout: std::time::Duration,
+    dir: &str,
+) -> ExistingConfig {
+    let dir = dir.to_string();
+    off_runtime_within(limit, timeout, move || {
+        existing_config(std::path::Path::new(&dir))
+    })
+    .await
+    .unwrap_or(ExistingConfig::Unknown)
+}
+
+/// Build the config generation prompt for a specific directory, checking the
+/// disk now. **Blocking**: the daemon composes with
+/// [`config_gen_prompt_checked`] instead.
 pub fn config_gen_prompt(dir: &str) -> String {
+    config_gen_prompt_for(dir, &existing_config(std::path::Path::new(dir)))
+}
+
+/// PRD #2119: [`config_gen_prompt`] with the check run off the async runtime
+/// and bounded ([`existing_config_bounded`]). Call it holding no registry or
+/// `AppState` lock.
+pub async fn config_gen_prompt_checked(dir: &str) -> String {
+    config_gen_prompt_for(dir, &existing_config_bounded(dir).await)
+}
+
+/// The template's sentences that only fit a request to CREATE the file, each
+/// with what an update says instead. [`config_gen_prompt_for`] swaps them in
+/// for an existing config, so the request asks for one thing throughout; the
+/// test `update_wording_anchors_are_in_the_template` keeps each one present in
+/// the template, so a reworded template cannot silently leave the create
+/// wording in an update request.
+const UPDATE_REWORDS: [(&str, &str); 5] = [
+    (
+        "Analyze this project and create a `.dot-agent-deck.toml` configuration file in the project root.",
+        "Analyze this project and propose changes to its existing `.dot-agent-deck.toml` configuration file in the project root.",
+    ),
+    (
+        "**Present the full proposed config to the user before writing it,",
+        "**Present the proposed changes to the existing config to the user before writing them,",
+    ),
+    (
+        "otherwise I'll write the whole thing.",
+        "otherwise I'll apply these changes to the existing file.",
+    ),
+    (
+        "Only write the file after the user confirms.",
+        "Only edit the file after the user confirms.",
+    ),
+    (
+        "**After writing the file, tell the user the next steps:** \"Config created!",
+        "**After updating the file, tell the user the next steps:** \"Config updated!",
+    ),
+];
+
+/// The template's write step, which [`config_gen_prompt_for`] replaces for an
+/// existing config (after `{dir}` is filled in).
+const WRITE_STEP: &str = "5. Write the approved config to `{dir}/.dot-agent-deck.toml`.";
+
+/// PRD #2119: the request for `dir`, given what is at its
+/// `.dot-agent-deck.toml`.
+///
+/// - [`ExistingConfig::Absent`]: the template as it always was, byte for byte.
+/// - [`ExistingConfig::File`]: the update preamble, then the template with its
+///   create-only sentences reworded ([`UPDATE_REWORDS`]) and its write step
+///   saying to edit the file in place.
+/// - A resolving [`ExistingConfig::Symlink`]: as for a file, and the preamble
+///   and the write step add that it is a link, to edit the file it points to
+///   in place and to keep the link.
+/// - A dangling symlink: only the instruction to tell the user the link is
+///   broken and write nothing — there is nothing to analyze against.
+/// - [`ExistingConfig::Unknown`]: the check timed out, so the file may well
+///   exist. Sending the create request then could have the agent replace a
+///   file the user wrote, so the request is phrased conditionally instead: if
+///   the file exists, read it first and propose changes; only if nothing is
+///   there, create it.
+pub fn config_gen_prompt_for(dir: &str, existing: &ExistingConfig) -> String {
     let roles_section = render_roles_section(role_library());
     let body = CONFIG_GEN_PROMPT_TEMPLATE
         .replace("{dir}", dir)
         .replace("{roles}", &roles_section);
-    if project_config_exists(dir) {
-        format!(
-            "{}{body}",
-            CONFIG_GEN_EXISTING_TEMPLATE.replace("{dir}", dir)
-        )
-    } else {
+    let write_step = WRITE_STEP.replace("{dir}", dir);
+    let update_body = |new_write_step: String| {
+        let mut body = body.replace(&write_step, &new_write_step);
+        for (create, update) in UPDATE_REWORDS {
+            body = body.replace(create, update);
+        }
         body
+    };
+    let link_target = |target: &Option<std::path::PathBuf>| match target {
+        Some(target) => format!("`{}`", target.display()),
+        None => "a path the deck could not read".to_string(),
+    };
+    match existing {
+        ExistingConfig::Absent => body,
+        ExistingConfig::File => format!(
+            "{}{}",
+            CONFIG_GEN_EXISTING_TEMPLATE
+                .replace("{link}", "")
+                .replace("{dir}", dir),
+            update_body(format!(
+                "5. Apply the approved changes to `{dir}/.dot-agent-deck.toml` by editing that file in place; never replace it with a fresh file."
+            ))
+        ),
+        ExistingConfig::Symlink {
+            target,
+            dangling: false,
+        } => {
+            let target = link_target(target);
+            format!(
+                "{}{}",
+                CONFIG_GEN_EXISTING_TEMPLATE
+                    .replace("{link}", &SYMLINK_NOTE.replace("{target}", &target))
+                    .replace("{dir}", dir),
+                update_body(format!(
+                    "5. Apply the approved changes to the file `{dir}/.dot-agent-deck.toml` links to ({target}) by editing that file in place, through the link. Keep `{dir}/.dot-agent-deck.toml` a symbolic link: never replace it with a regular file, remove it or re-point it."
+                ))
+            )
+        }
+        ExistingConfig::Symlink {
+            target,
+            dangling: true,
+        } => CONFIG_GEN_DANGLING_TEMPLATE
+            .replace("{target}", &link_target(target))
+            .replace("{dir}", dir),
+        ExistingConfig::Unknown => {
+            let mut body = body.replace(
+                &write_step,
+                &format!(
+                    "5. Write the approved config to `{dir}/.dot-agent-deck.toml` — or, if that file already exists, apply only the approved changes by editing it in place (through the link, if it is a symbolic link), never replacing it."
+                ),
+            );
+            body = body.replace(
+                UPDATE_REWORDS[0].0,
+                "Analyze this project and create a `.dot-agent-deck.toml` configuration file in the project root, or, if it already has one, propose changes to it (see above).",
+            );
+            format!(
+                "{}{body}",
+                CONFIG_GEN_UNKNOWN_TEMPLATE.replace("{dir}", dir)
+            )
+        }
     }
-}
-
-/// PRD #2119: whether `dir` itself holds a `.dot-agent-deck.toml` — a regular
-/// file at that exact directory, by the type rules the project reader applies
-/// (a directory or a symlink of that name does not count), with no walk up the
-/// tree. One `lstat`.
-pub fn project_config_exists(dir: &str) -> bool {
-    crate::directory_listing::holds_project_config(std::path::Path::new(dir))
 }
 
 /// PRD #2119: the subject of the configuration request the daemon posts to an
@@ -152,6 +417,266 @@ mod tests {
             config_gen_prompt(cwd),
             original,
             "check the file at compose time"
+        );
+    }
+
+    /// PRD #2119: every create-only sentence the update request rewords is in
+    /// the template exactly once, so a reworded template fails here rather
+    /// than leaving its create wording in an update request unnoticed.
+    #[test]
+    fn update_wording_anchors_are_in_the_template() {
+        for (create, _) in UPDATE_REWORDS {
+            assert_eq!(
+                CONFIG_GEN_PROMPT_TEMPLATE.matches(create).count(),
+                1,
+                "the template must hold {create:?} exactly once"
+            );
+        }
+        assert_eq!(CONFIG_GEN_PROMPT_TEMPLATE.matches(WRITE_STEP).count(), 1);
+    }
+
+    /// The sentences of the create request that contradict an update: create
+    /// a file, write the whole thing, write a fresh config, "Config created!".
+    fn create_instructions(dir: &str) -> Vec<String> {
+        let mut found: Vec<String> = UPDATE_REWORDS
+            .iter()
+            .map(|(create, _)| create.to_string())
+            .collect();
+        found.push(WRITE_STEP.replace("{dir}", dir));
+        found.push("\"Config created! To use it".to_string());
+        found
+    }
+
+    /// PRD #2119 (reviewer nit): the request for an existing config, file or
+    /// link, asks for an update throughout — no sentence of it still says to
+    /// create the file, write the whole thing, or report "Config created!".
+    #[test]
+    fn update_request_contains_no_create_or_replace_instruction() {
+        let dir = "/home/user/my-project";
+        let file = config_gen_prompt_for(dir, &ExistingConfig::File);
+        let link = config_gen_prompt_for(
+            dir,
+            &ExistingConfig::Symlink {
+                target: Some("/home/user/dotfiles/deck.toml".into()),
+                dangling: false,
+            },
+        );
+        for (name, request) in [("file", &file), ("symlink", &link)] {
+            for create in create_instructions(dir) {
+                assert!(
+                    !request.contains(&create),
+                    "the {name} update request still says {create:?}"
+                );
+            }
+            assert!(
+                request.starts_with("**This project already has a configuration"),
+                "the {name} request opens with the update preamble"
+            );
+            for update in [
+                "propose changes to its existing `.dot-agent-deck.toml`",
+                "otherwise I'll apply these changes to the existing file.",
+                "\"Config updated! To use it",
+                "by editing that file in place",
+            ] {
+                assert!(
+                    request.contains(update),
+                    "the {name} request must say {update:?}"
+                );
+            }
+        }
+        // The plain request is still today's template.
+        assert_eq!(
+            config_gen_prompt_for(dir, &ExistingConfig::Absent),
+            CONFIG_GEN_PROMPT_TEMPLATE
+                .replace("{dir}", dir)
+                .replace("{roles}", &render_roles_section(role_library()))
+        );
+    }
+
+    /// PRD #2119: a `.dot-agent-deck.toml` that is a symbolic link counts as an
+    /// existing config for generate/update — dangling or not — while a
+    /// directory of that name does not, and the project reader's own
+    /// predicate still refuses the link.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_config_exists_for_update_and_a_directory_does_not() {
+        let project = tempfile::tempdir().unwrap();
+        let dotfiles = tempfile::tempdir().unwrap();
+        let cwd = project.path().to_str().unwrap();
+        let path = project.path().join(".dot-agent-deck.toml");
+        let target = dotfiles.path().join("deck.toml");
+
+        std::fs::create_dir(&path).unwrap();
+        assert_eq!(existing_config(project.path()), ExistingConfig::Absent);
+        assert!(!project_config_exists(cwd), "a directory is not a config");
+        std::fs::remove_dir(&path).unwrap();
+
+        std::fs::write(&target, "# the user's linked config\n").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert_eq!(
+            existing_config(project.path()),
+            ExistingConfig::Symlink {
+                target: Some(target.clone()),
+                dangling: false
+            }
+        );
+        assert!(
+            project_config_exists(cwd),
+            "a symlinked config reads Update"
+        );
+        assert!(
+            !crate::directory_listing::holds_project_config(project.path()),
+            "the project reader still refuses a symlinked config"
+        );
+        let request = config_gen_prompt(cwd);
+        let shown = target.display().to_string();
+        for needed in [
+            "is a symbolic link",
+            shown.as_str(),
+            "Edit the file it points to in place, through the link, and keep the link",
+            "never replace it with a regular file, remove it or re-point it",
+        ] {
+            assert!(
+                request.contains(needed),
+                "the symlink request must say {needed:?}"
+            );
+        }
+
+        std::fs::remove_file(&target).unwrap();
+        assert_eq!(
+            existing_config(project.path()),
+            ExistingConfig::Symlink {
+                target: Some(target.clone()),
+                dangling: true
+            }
+        );
+        assert!(
+            project_config_exists(cwd),
+            "a dangling symlinked config still reads Update"
+        );
+        let request = config_gen_prompt(cwd);
+        for needed in [
+            "is a symbolic link to",
+            shown.as_str(),
+            "which does not exist",
+            "Do not write anything",
+            "is a broken symbolic link",
+        ] {
+            assert!(
+                request.contains(needed),
+                "the dangling-link request must say {needed:?}"
+            );
+        }
+        for create in create_instructions(cwd) {
+            assert!(
+                !request.contains(&create),
+                "the dangling-link request must not say {create:?}"
+            );
+        }
+        assert!(!target.exists(), "composing the request wrote nothing");
+    }
+
+    /// PRD #2119: the check a request is composed with runs off the runtime
+    /// behind the project-filesystem bound; when it cannot finish in time, the
+    /// request is the conditional one — read the file first if it exists — and
+    /// never the plain create request.
+    #[tokio::test]
+    async fn a_timed_out_check_sends_the_conditional_update_wording() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        std::fs::write(dir.path().join(".dot-agent-deck.toml"), "# user's\n").unwrap();
+        let free = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        assert_eq!(
+            existing_config_within(&free, std::time::Duration::from_secs(5), cwd).await,
+            ExistingConfig::File
+        );
+        // No permit is ever free: the check cannot start, so it times out.
+        let saturated = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let existing =
+            existing_config_within(&saturated, std::time::Duration::from_millis(50), cwd).await;
+        assert_eq!(existing, ExistingConfig::Unknown);
+        assert_eq!(existing.exists(), None, "an unknown check offers no Update");
+        let request = config_gen_prompt_for(cwd, &existing);
+        let config = format!("{cwd}/.dot-agent-deck.toml");
+        for needed in [
+            format!("If `{config}` exists, read it first"),
+            "Propose changes to that file, not a replacement for it".to_string(),
+            "If nothing exists at that path**, create the file".to_string(),
+            format!(
+                "Write the approved config to `{config}` — or, if that file already exists, apply only the approved changes by editing it in place"
+            ),
+        ] {
+            assert!(
+                request.contains(&needed),
+                "the conditional request must say {needed:?}"
+            );
+        }
+        for create in [
+            UPDATE_REWORDS[0].0.to_string(),
+            WRITE_STEP.replace("{dir}", cwd),
+        ] {
+            assert!(
+                !request.contains(&create),
+                "the conditional request must not carry the unconditional {create:?}"
+            );
+        }
+    }
+
+    /// PRD #2119: a listing's batch check is bounded the same way: answered
+    /// when it finishes, `None` (every record unknown) when it cannot.
+    #[tokio::test]
+    async fn a_listing_batch_check_is_bounded() {
+        let with = tempfile::tempdir().unwrap();
+        let without = tempfile::tempdir().unwrap();
+        let dirs = vec![
+            with.path().to_str().unwrap().to_string(),
+            without.path().to_str().unwrap().to_string(),
+        ];
+        std::fs::write(with.path().join(".dot-agent-deck.toml"), "").unwrap();
+        let free = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        assert_eq!(
+            project_config_flags_within(&free, std::time::Duration::from_secs(5), dirs.clone())
+                .await,
+            Some(vec![true, false])
+        );
+        let saturated = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        assert_eq!(
+            project_config_flags_within(&saturated, std::time::Duration::from_millis(50), dirs)
+                .await,
+            None
+        );
+    }
+
+    /// PRD #2119: a listing stamps each record from its directory's answer,
+    /// a record without a cwd reports unknown, and a batch that did not
+    /// finish in time leaves every record unknown rather than holding the
+    /// reply.
+    #[tokio::test]
+    async fn a_listing_stamps_answers_and_leaves_a_timed_out_batch_unknown() {
+        let record = |id: &str, cwd: Option<&str>| -> crate::agent_pty::AgentRecord {
+            serde_json::from_value(serde_json::json!({ "id": id, "cwd": cwd })).unwrap()
+        };
+        let mut records = vec![
+            record("a", Some("/with")),
+            record("b", Some("/without")),
+            record("c", Some("/with")),
+            record("d", None),
+        ];
+        crate::agent_pty::attach_project_config_flags(&mut records, |dirs| async move {
+            assert_eq!(
+                dirs,
+                ["/with", "/without"],
+                "one check per distinct directory"
+            );
+            Some(vec![true, false])
+        })
+        .await;
+        let flags: Vec<_> = records.iter().map(|r| r.project_config_exists).collect();
+        assert_eq!(flags, [Some(true), Some(false), Some(true), None]);
+        crate::agent_pty::attach_project_config_flags(&mut records, |_| async { None }).await;
+        assert!(
+            records.iter().all(|r| r.project_config_exists.is_none()),
+            "a batch that timed out leaves every record unknown"
         );
     }
 

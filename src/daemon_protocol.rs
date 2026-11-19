@@ -6655,8 +6655,9 @@ async fn handle_connection(
             // PRD #1666 part 3 (Q35-20): held typing, after the live join,
             // whose snapshot carries it too.
             crate::agent_pty::attach_input_held(&registry, &mut records);
-            // PRD #2119: whether each agent's project already has a config.
-            crate::agent_pty::attach_project_config_exists(&mut records);
+            // PRD #2119: whether each agent's project already has a config,
+            // off the runtime and bounded; no lock is held here.
+            crate::agent_pty::attach_project_config_exists(&mut records).await;
             let mut resp = AttachResponse::agent_records(records);
             resp.orchestration_roles = Some(orchestration_roles);
             // Issue #887: the client's only observable of the schedule seed the
@@ -8796,7 +8797,11 @@ async fn generate_config(
              nothing was posted"
         ));
     };
-    let body = crate::config_gen::config_gen_prompt(&cwd);
+    // The check of `<cwd>/.dot-agent-deck.toml` runs off the async runtime and
+    // bounded, with no lock held. When it times out, the request is the
+    // conditional one ("if the file exists, read it first and propose
+    // changes…"), never the create request: the file may well exist.
+    let body = crate::config_gen::config_gen_prompt_checked(&cwd).await;
     // Bind the post to the agent sampled above, whether or not the caller named
     // one: the prompt was composed for that agent's directory, so an agent
     // that replaced it while the directory was being read must receive nothing.
@@ -9950,8 +9955,9 @@ async fn handle_subscribe_events_with_snapshot(
     // repeat 30 s after a pass a display notice woke, which corrects it
     // (R-E-U3-03, auditor U3-8).
     crate::agent_pty::attach_input_held(registry, &mut records);
-    // PRD #2119: as the `ListAgents` reply does.
-    crate::agent_pty::attach_project_config_exists(&mut records);
+    // PRD #2119: as the `ListAgents` reply does — off the runtime, bounded,
+    // and after the `AppState` guard went with the blocking task above.
+    crate::agent_pty::attach_project_config_exists(&mut records).await;
     let mut resp = AttachResponse::agent_records(records);
     // Issue #1637: read under the same guard as the receiver, so a notice
     // change is either in this reply or on the stream.
@@ -11939,6 +11945,7 @@ mod tests {
                 drop_event: None,
                 break_on_event: None,
                 applied: None,
+                project_config_refresh: None,
             },
         ));
         {
