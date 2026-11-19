@@ -115,8 +115,8 @@ impl ExistingConfig {
 }
 
 /// PRD #2119: what is at `<dir>/.dot-agent-deck.toml`, for generate/update
-/// purposes only. **Blocking** (an `lstat`, plus a `readlink` and a `stat`
-/// for a link): async callers go through [`existing_config_bounded`] or
+/// purposes only. **Blocking** (an `lstat` of the name, plus a `stat` through
+/// it when it is a link): async callers go through [`existing_config_bounded`] or
 /// [`project_config_flags`].
 ///
 /// Deliberately not [`crate::directory_listing::holds_project_config`]: that
@@ -235,8 +235,40 @@ pub(crate) fn config_checks() -> &'static ConfigChecks {
     CHECKS.get_or_init(|| ConfigChecks::new(MAX_CONCURRENT_CONFIG_CHECKS))
 }
 
-/// Unmarks a directory's outstanding check when it is dropped, a panicking
-/// check included.
+/// The directories a run of [`check_each_within`] has claimed and its worker
+/// has not started yet, each with its index in the caller's list.
+type Unstarted = std::sync::Mutex<std::collections::VecDeque<(usize, String)>>;
+
+/// A directory moves from unstarted to running only when the worker pops it
+/// from this queue, and the caller's guard ([`UnstartedClaims`]) releases
+/// only what it drains from the same queue, both under the queue's lock: so
+/// each claimed directory is owned by exactly one of them, and released by
+/// exactly one of them.
+///
+/// Owned by the CALLER of [`check_each_within`]: when it drops — a normal
+/// return, the caller's future being dropped while it awaits a permit or the
+/// worker, or the worker having panicked — every directory the worker has
+/// not started is unmarked, so a cancelled run strands none of them. The
+/// directory the worker is checking is not in the queue any more: its
+/// [`OutstandingMark`] keeps it marked until that check returns.
+struct UnstartedClaims<'a> {
+    outstanding: &'a std::sync::Mutex<std::collections::HashSet<String>>,
+    queue: std::sync::Arc<Unstarted>,
+}
+
+impl Drop for UnstartedClaims<'_> {
+    fn drop(&mut self) {
+        let unstarted: Vec<_> = lock(&self.queue).drain(..).collect();
+        let mut outstanding = lock(self.outstanding);
+        for (_, dir) in unstarted {
+            outstanding.remove(&dir);
+        }
+    }
+}
+
+/// Unmarks the directory the worker is checking when it is dropped, a
+/// panicking check included. Owned by the WORKER, from the moment it pops
+/// the directory from the [`Unstarted`] queue.
 struct OutstandingMark<'a> {
     outstanding: &'a std::sync::Mutex<std::collections::HashSet<String>>,
     dir: String,
@@ -269,7 +301,9 @@ enum PermitWait {
 /// directory is `None` when its check had not finished by then, when the
 /// directory already had a check outstanding (so a stalled one is never
 /// queued behind again), or when no permit could be had. A directory that
-/// had not been started by the timeout is unmarked, so the next run tries
+/// had not been started when this run ends — by the timeout, by the worker
+/// panicking, or by the caller dropping this future at any await, the permit
+/// wait included — is unmarked ([`UnstartedClaims`]), so the next run tries
 /// it; the one a stalled thread is stuck in stays marked until it returns.
 async fn check_each_within<T, F>(
     checks: &ConfigChecks,
@@ -294,15 +328,12 @@ where
     if claimed.is_empty() {
         return answers;
     }
-    let queue = std::sync::Arc::new(std::sync::Mutex::new(claimed));
-    let unclaim_unstarted =
-        |queue: &std::sync::Mutex<std::collections::VecDeque<(usize, String)>>| {
-            let unstarted: Vec<_> = lock(queue).drain(..).collect();
-            let mut outstanding = lock(&checks.outstanding);
-            for (_, dir) in unstarted {
-                outstanding.remove(&dir);
-            }
-        };
+    // Created before the first await, so a caller dropped at any point from
+    // here on releases what the worker never started.
+    let unstarted = UnstartedClaims {
+        outstanding: &checks.outstanding,
+        queue: std::sync::Arc::new(std::sync::Mutex::new(claimed)),
+    };
     let permit = match wait {
         PermitWait::Never => checks.limit.clone().try_acquire_owned().ok(),
         PermitWait::UntilTimeout => {
@@ -313,16 +344,18 @@ where
         }
     };
     let Some(permit) = permit else {
-        unclaim_unstarted(&queue);
         return answers;
     };
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-    let worker_queue = queue.clone();
+    let worker_queue = unstarted.queue.clone();
     let outstanding = checks.outstanding.clone();
     // Detached: a thread stuck in a check is left to return on its own.
     drop(tokio::task::spawn_blocking(move || {
         let _permit = permit;
         loop {
+            // The hand-off: popped under the queue's lock, the directory is
+            // the worker's to unmark, and the caller's guard can no longer
+            // drain it. Nothing between the pop and the mark can panic.
             let next = lock(&worker_queue).pop_front();
             let Some((index, dir)) = next else { break };
             let mark = OutstandingMark {
@@ -331,15 +364,15 @@ where
             };
             let answer = check(&mark.dir);
             drop(mark);
-            // The caller may have stopped listening; the rest still runs so
-            // that each claimed directory is unmarked.
+            // The caller may have stopped listening: its guard has then
+            // drained the queue, and the next pop ends the loop.
             let _ = sender.send((index, answer));
         }
     }));
     while let Ok(Some((index, answer))) = tokio::time::timeout_at(deadline, receiver.recv()).await {
         answers[index] = Some(answer);
     }
-    unclaim_unstarted(&queue);
+    drop(unstarted);
     answers
 }
 
@@ -1616,6 +1649,195 @@ mod tests {
         }
         let answers = check_each_within(&checks, timeout, PermitWait::Never, dirs(), check).await;
         assert_eq!(answers, [Some(false), Some(true)]);
+    }
+
+    fn outstanding_dirs(checks: &ConfigChecks) -> Vec<String> {
+        let mut dirs: Vec<_> = lock(&checks.outstanding).iter().cloned().collect();
+        dirs.sort();
+        dirs
+    }
+
+    /// Wait until `checks` has `permits` free again, i.e. every worker that
+    /// held one has exited.
+    async fn wait_for_permits(checks: &ConfigChecks, permits: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while checks.limit.available_permits() < permits {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a config check never let go of its permit"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// PRD #2119 (PR #2362 review): a request dropped while it waits for a
+    /// config-check permit — its caller cancelled — releases the directory it
+    /// claimed, so once permits are free that directory is checked again
+    /// instead of reading as outstanding forever.
+    #[tokio::test]
+    async fn a_config_check_cancelled_while_awaiting_a_permit_releases_its_claim() {
+        use std::future::Future as _;
+        let checks = ConfigChecks::new(1);
+        let held = checks.limit.clone().acquire_owned().await.unwrap();
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let check = {
+            let ran = ran.clone();
+            move |_: &str| {
+                ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                true
+            }
+        };
+        let waiting = check_each_within(
+            &checks,
+            std::time::Duration::from_secs(30),
+            PermitWait::UntilTimeout,
+            vec!["/healthy".to_string()],
+            check.clone(),
+        );
+        let mut waiting = Box::pin(waiting);
+        // Poll it once: it claims /healthy and parks on the permit.
+        let polled =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(waiting.as_mut().poll(cx))).await;
+        assert!(
+            polled.is_pending(),
+            "no permit is free, so the run must still be waiting"
+        );
+        assert_eq!(
+            outstanding_dirs(&checks),
+            ["/healthy"],
+            "claimed while waiting"
+        );
+        // The caller goes away mid-wait.
+        drop(waiting);
+        assert!(
+            outstanding_dirs(&checks).is_empty(),
+            "a cancelled wait stranded its claim"
+        );
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+
+        drop(held);
+        let answers = check_each_within(
+            &checks,
+            std::time::Duration::from_secs(5),
+            PermitWait::UntilTimeout,
+            vec!["/healthy".to_string()],
+            check,
+        )
+        .await;
+        assert_eq!(answers, [Some(true)], "the directory is checked again");
+    }
+
+    /// PRD #2119 (PR #2362 review): a caller dropped while its worker is
+    /// stuck in one directory (a hung mount) releases the directories the
+    /// worker never started, so the next run checks them; the stuck one stays
+    /// outstanding until its check exits, and is released then.
+    #[tokio::test]
+    async fn a_config_check_cancelled_while_stalled_releases_the_unstarted_directories() {
+        let checks = ConfigChecks::new(2);
+        let (release, stalled) = std::sync::mpsc::channel::<()>();
+        let stalled = std::sync::Arc::new(std::sync::Mutex::new(stalled));
+        let (started_tx, mut started) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let check = move |dir: &str| {
+            if dir == "/hung" {
+                let _ = started_tx.send(());
+                let _ = stalled.lock().unwrap().recv();
+            }
+            dir != "/b"
+        };
+        let dirs = || vec!["/hung".to_string(), "/a".to_string(), "/b".to_string()];
+
+        // The caller is dropped once the worker is stuck in /hung.
+        tokio::select! {
+            _ = check_each_within(
+                &checks,
+                std::time::Duration::from_secs(30),
+                PermitWait::UntilTimeout,
+                dirs(),
+                check.clone(),
+            ) => panic!("the run finished although /hung is stuck"),
+            _ = started.recv() => {}
+        }
+        assert_eq!(
+            outstanding_dirs(&checks),
+            ["/hung"],
+            "only the directory being checked stays outstanding"
+        );
+        assert_eq!(
+            checks.limit.available_permits(),
+            1,
+            "the stuck check holds one"
+        );
+
+        // The unstarted directories are checked again; /hung is skipped.
+        let answers = check_each_within(
+            &checks,
+            std::time::Duration::from_secs(5),
+            PermitWait::Never,
+            dirs(),
+            check.clone(),
+        )
+        .await;
+        assert_eq!(answers, [None, Some(true), Some(false)]);
+        assert_eq!(outstanding_dirs(&checks), ["/hung"]);
+
+        // The mount comes back: the stuck check exits and releases /hung.
+        drop(release);
+        wait_for_permits(&checks, 2).await;
+        assert!(outstanding_dirs(&checks).is_empty());
+        let answers = check_each_within(
+            &checks,
+            std::time::Duration::from_secs(5),
+            PermitWait::Never,
+            dirs(),
+            check,
+        )
+        .await;
+        assert_eq!(answers, [Some(true), Some(true), Some(false)]);
+    }
+
+    /// PRD #2119 (PR #2362 review): a config check that panics releases its
+    /// own directory and the ones its worker never started, and its permit,
+    /// so every one of them is checked again by the next run.
+    #[tokio::test]
+    async fn a_panicking_config_check_releases_its_claims() {
+        let checks = ConfigChecks::new(1);
+        let explode = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let check = {
+            let explode = explode.clone();
+            move |dir: &str| {
+                if dir == "/boom" && explode.load(std::sync::atomic::Ordering::SeqCst) {
+                    panic!("config check panicked on purpose");
+                }
+                true
+            }
+        };
+        let dirs = || vec!["/boom".to_string(), "/later".to_string()];
+        let answers = check_each_within(
+            &checks,
+            std::time::Duration::from_secs(5),
+            PermitWait::UntilTimeout,
+            dirs(),
+            check.clone(),
+        )
+        .await;
+        assert_eq!(answers, [None, None], "a panicked run answers nothing");
+        wait_for_permits(&checks, 1).await;
+        assert!(
+            outstanding_dirs(&checks).is_empty(),
+            "a panicked run stranded a claim: {:?}",
+            outstanding_dirs(&checks)
+        );
+
+        explode.store(false, std::sync::atomic::Ordering::SeqCst);
+        let answers = check_each_within(
+            &checks,
+            std::time::Duration::from_secs(5),
+            PermitWait::UntilTimeout,
+            dirs(),
+            check,
+        )
+        .await;
+        assert_eq!(answers, [Some(true), Some(true)]);
     }
 
     /// PRD #2119 (PR #2362 review, Qodo): the config checks have their own
