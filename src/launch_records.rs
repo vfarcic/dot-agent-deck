@@ -686,13 +686,20 @@ mod tests {
         let others = [
             ".pending-0123456789abcdef-deadrun-4.txt",
             ".pending-0123-deadrun-4.json",
-            ".pending-0123456789ABCDEF-deadrun-4.json",
             ".pending-0123456789abcdef-deadrun-x.json",
             ".something-deadrun-4.json",
         ];
         for name in std::iter::once(&dead).chain([&live]).chain(others.iter()) {
             std::fs::write(dir.join(name), b"{\"v\":1,").unwrap();
         }
+        // An upper-case nonce is not a name `write` makes. Checked on the
+        // name, not on disk: on a case-insensitive filesystem (macOS's
+        // default) it is the same file as `dead`.
+        assert_eq!(
+            pending_run(".pending-0123456789ABCDEF-deadrun-4.json"),
+            None,
+            "an upper-case nonce is not a temporary record name"
+        );
         let is_live = |run: &str| run == "liverun";
         let report = prune(
             state.path(),
