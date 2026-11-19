@@ -13259,17 +13259,17 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 ##### inbox/claude/049 — Live: hooks refreshed after an upgrade deliver to a restarted Haiku.
 - **Layer:** L2 lane 2 (`tests/e2e_inbox_claude_live.rs`), the real TUI in a PTY, genuine interactive Haiku panes, the real `hooks refresh --json` from the harness's durable copy (PRD #1666 part 3, R-3).
 - **Agent:** Claude Code (Haiku).
-- **Asserts:** with the settings made a pre-0.47 install (status hooks on a stand-in copy whose `--version` is unreadable, no waiter), a Haiku started under them has the `hooks_too_old` integration notice and `deck hooks run a dot-agent-deck too old` is on its card on screen; with the stand-in removed, `hooks refresh` succeeds with `ok: true` and the settings gain the waiter and lose the stand-in; a Haiku started afterwards arms its waiter, writes a sentinel-writing task's file once, the task is acknowledged after one hand-over with no doorbell, and the card labels it.
+- **Asserts:** with the settings made a pre-0.47 install (status hooks on a stand-in copy whose `--version` is unreadable, no waiter), a Haiku started under them has the `hooks_too_old` integration notice and `deck hooks run a dot-agent-deck too old` is on its card on screen; with the stand-in removed, `hooks refresh` succeeds with `ok: true` and the settings gain the waiter and lose the stand-in; a Haiku started afterwards arms its waiter, writes a sentinel-writing task's file once, the task is acknowledged after one hand-over with no doorbell, and the card labels it. Issue #2390: the restarted Haiku's session transcript, read with the transcript witness's own parser, holds delivery 1.1 of the task, and no other attempt, as a `user` entry.
 - **Does not assert:** a real 0.46 binary, an upgrade client running the refresh (`self_upgrade::agent_hooks`, `upgrade/upgrade-dialog/015`, desktop `local_upgrade_008`–`010`), or the stale Haiku itself answering a doorbell with `inbox fetch`.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/claude/050 — Live: a Claude Code whose doorbell the user turned off is held, and a prompt delivers.
 - **Layer:** L2 lane 2 (`tests/e2e_inbox_claude_live.rs`), the real TUI in a PTY with the deck run under `DOT_AGENT_DECK_DOORBELL_CLAUDE=0`, the Claude Code doorbell turned off.
 - **Agent:** Claude Code (Haiku).
-- **Asserts:** the cause is proved before the hold is read: the deck's log has a `pane release` line naming the installed release as latched, and, after the scratch pane's armed waiter is killed by its captured pid and none is armed, a `doorbell off` line naming `turned_off`; a missing latch line prints `SKIP:` naming what it saw, which `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1` turns into a failure, and a missing `turned_off` line fails the test. For 20 seconds after that, no `doorbell rang` is logged and no doorbell line shows on the pane's screen, the last user prompt carries none, the directive task stays queued, and the card shows the cannot_type words. A short prompt typed into the pane with Enter then has the prompt hook hand Haiku the task: the sentinel is written once and the task acknowledged after one hand-over, not recorded as human history.
-- **Does not assert:** the doorbell switched on (`inbox/claude/014`), or macOS process discovery.
+- **Asserts:** the cause is proved before the hold is read: the deck's log has a `pane release` line naming the installed release as latched, and, after the scratch pane's armed waiter is killed by its captured pid and none is armed, a `doorbell off` line naming `turned_off`; a missing latch line prints `SKIP:` naming what it saw, which `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1` turns into a failure, and a missing `turned_off` line fails the test. For 20 seconds after that, no `doorbell rang` is logged and no doorbell line shows on the pane's screen, the last user prompt carries none, the directive task stays queued, and the card shows the cannot_type words. A short prompt typed into the pane with Enter then starts a turn, after which Haiku is handed the task: the sentinel is written once and the task acknowledged after one hand-over, not recorded as human history.
+- **Does not assert:** the doorbell switched on (`inbox/claude/014`), macOS process discovery, or which route hands the task over: an ordinary prompt's hook hands nothing over, and on Claude Code 2.1.328 the waiter armed when the typed prompt's turn ends does (issue #2390), though Haiku may also fetch the task itself in that turn.
 - **Platform coverage:** linux.
-- **Cost:** one cheap model turn.
+- **Cost:** one or two cheap model turns.
 
 ##### inbox/claude/051 — A doorbell hook commits only what the transcript shows Claude took (issue #2341).
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), real hook CLI children and the real `inbox witness` they start, a session transcript the test writes as Claude Code records one, a 15 s ack-wait (a 10 s witness window).
@@ -13445,7 +13445,7 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 ##### inbox/claude/011 — Idle interactive Haiku wakes natively, acts once and labels the deck task.
 - **Layer:** L2 real agent, lane 2 (PTY-attached).
 - **Agent:** Claude Code, Haiku.
-- **Asserts:** An idle native waiter wakes Claude without doorbell input; the sentinel is appended once, the message is acknowledged after one delivery, the card shows ✉ and user history excludes the task.
+- **Asserts:** An idle native waiter wakes Claude without doorbell input; the sentinel is appended once, the message is acknowledged after one delivery, the card shows ✉ and user history excludes the task. Issue #2390: the session transcript real Claude Code wrote under the test's HOME, read with the transcript witness's own parser (`inbox_witness::witnessed_in_line`), holds delivery 1.1 of the task, and no other attempt, as a `user` entry.
 - **Test:** `claude_011_live_idle_native_wake` in `tests/e2e_inbox_claude_live.rs`.
 - **Does not assert:** Other agents or model behaviour beyond the directive sentinel task.
 - **Platform coverage:** mac+linux.
@@ -13453,7 +13453,7 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 ##### inbox/claude/012 — A task posted during a real Haiku turn folds through its Stop waiter.
 - **Layer:** L2 real agent, lane 2 (PTY-attached).
 - **Agent:** Claude Code, Haiku.
-- **Asserts:** A queued task during a slow Bash operation reaches the agent once without a doorbell and creates its unique sentinel.
+- **Asserts:** A queued task during a slow Bash operation reaches the agent once without a doorbell and creates its unique sentinel. Issue #2390: the session transcript real Claude Code wrote under the test's HOME, read with the transcript witness's own parser (`inbox_witness::witnessed_in_line`), holds delivery 1.1 of the task, and no other attempt, as a `user` entry.
 - **Test:** `claude_012_live_busy_fold_at_stop` in `tests/e2e_inbox_claude_live.rs`.
 - **Does not assert:** Exact model latency.
 - **Platform coverage:** mac+linux.
@@ -13461,7 +13461,7 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 ##### inbox/claude/013 — Waiters armed through real /clear hand over a task once.
 - **Layer:** L2 real agent, lane 2 (PTY-attached).
 - **Agent:** Claude Code, Haiku.
-- **Asserts:** Each of two clears registers a new waiter that takes the place of the one before it (one stays armed); one message then produces one delivery and one sentinel append.
+- **Asserts:** Each of two clears registers a new waiter that takes the place of the one before it (one stays armed); one message then produces one delivery and one sentinel append. Issue #2390: the session transcript real Claude Code wrote under the test's HOME, read with the transcript witness's own parser (`inbox_witness::witnessed_in_line`), holds delivery 1.1 of the task, and no other attempt, as a `user` entry.
 - **Test:** `claude_013_live_clear_waiters_claim_once` in `tests/e2e_inbox_claude_live.rs`.
 - **Does not assert:** Waiter ordering, covered by inbox/claude/006.
 - **Platform coverage:** mac+linux.
@@ -13469,7 +13469,7 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 ##### inbox/claude/014 — Killing a real Claude waiter falls back to doorbell injection and acknowledgement.
 - **Layer:** L2 real agent, lane 2 (PTY-attached).
 - **Agent:** Claude Code, Haiku.
-- **Asserts:** A preflight reads the installed Claude Code release (`claude --version`) and runs the test whenever Claude Code's facts are Go, which they are for every release; otherwise it prints `SKIP:` naming the installed release, which `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1` turns into a failure (UNVERIFIED, never green). Then killing the captured scratch waiter leaves none armed; the token-led doorbell wakes the agent (`doorbell rang` in the deck's log) and its submit hook fetches, injects and acknowledges the sentinel task without recording it as human history.
+- **Asserts:** A preflight reads the installed Claude Code release (`claude --version`) and runs the test whenever Claude Code's facts are Go, which they are for every release; otherwise it prints `SKIP:` naming the installed release, which `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1` turns into a failure (UNVERIFIED, never green). Then killing the captured scratch waiter leaves none armed; the token-led doorbell wakes the agent (`doorbell rang` in the deck's log) and its submit hook fetches, injects and acknowledges the sentinel task without recording it as human history. Issue #2390: the session transcript real Claude Code wrote, read with the transcript witness's own parser (`inbox_witness::witnessed_in_line`), holds delivery 1.1 of the task, and no other attempt, as a `hook_additional_context` attachment.
 - **Test:** `claude_014_live_killed_waiter_falls_back_to_injection` in `tests/e2e_inbox_claude_live.rs`.
 - **Does not assert:** macOS process discovery, or a turned-off doorbell, which is held (`inbox/claude/050`).
 - **Platform coverage:** linux.
