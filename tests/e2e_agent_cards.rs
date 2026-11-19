@@ -583,10 +583,11 @@ impl UnitDeck {
         deck.wait_for_string("No active agents");
         std::fs::write(
             deck.workdir().join(".dot-agent-deck.toml"),
-            format!(
-                "[[orchestrations]]\nname = 'card-team'\n[[orchestrations.roles]]\nname = 'orchestrator'\nstart = true\ncommand = {}\n",
-                serde_json::to_string(&cmd).unwrap()
-            ),
+            // The team's one role only has to stay up while the test reads the
+            // context file it was started with: the deck removes that file when
+            // the orchestration ends (#1395), and the route stand-in leaves at
+            // once in a role.
+            "[[orchestrations]]\nname = 'card-team'\n[[orchestrations.roles]]\nname = 'orchestrator'\nstart = true\ncommand = 'cat'\n",
         )
         .unwrap();
         deck.approve_project_trust(deck.workdir());
@@ -616,8 +617,15 @@ impl UnitDeck {
     }
 
     /// `caller` dispatches `unit` with the real CLI; returns the unit's
-    /// starting agent (for a team, its orchestrator).
+    /// starting agent (for a team, its orchestrator), as the route stand-in.
     fn dispatch(&mut self, caller: &Pane, unit: &str, shape: &str) -> Pane {
+        let id = self.dispatch_spawned(caller, unit, shape);
+        route::observe(&self.deck, &id)
+    }
+
+    /// [`Self::dispatch`] up to the unit's starting agent being listed: its
+    /// id, for a unit whose agent is not the route stand-in.
+    fn dispatch_spawned(&mut self, caller: &Pane, unit: &str, shape: &str) -> String {
         let worktree = self.worktree(unit);
         self.worktrees.push(worktree.clone());
         route::cli(
@@ -642,7 +650,7 @@ impl UnitDeck {
             "dispatch {unit} must spawn its stand-in\n{}",
             self.deck.snapshot_grid()
         );
-        route::observe(&self.deck, &target.into_inner().unwrap())
+        target.into_inner().unwrap()
     }
 }
 
@@ -757,7 +765,7 @@ fn catalog_002_catalog_prints_and_dispatched_tasks_carry_it() {
         seeded.borrow()
     );
 
-    test.dispatch(&caller, "card-catalog-team", "--orchestration=card-team");
+    test.dispatch_spawned(&caller, "card-catalog-team", "--orchestration=card-team");
     let dir = test.worktree("card-catalog-team").join(".dot-agent-deck");
     let context = RefCell::new(String::new());
     assert!(
@@ -776,8 +784,15 @@ fn catalog_002_catalog_prints_and_dispatched_tasks_carry_it() {
                 .join("\n");
             context.borrow().contains("CARD-DISPATCH-TASK-5c1e")
         }),
-        "the team's orchestrator context file must be published in {}",
-        dir.display()
+        "the team's orchestrator context file must be published in {}; it holds {:?}, and the files there read:\n{}",
+        dir.display(),
+        std::fs::read_dir(&dir)
+            .map(|entries| entries
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect::<Vec<_>>())
+            .unwrap_or_default(),
+        context.borrow()
     );
     assert!(
         context.borrow().contains(block.trim_end()),
