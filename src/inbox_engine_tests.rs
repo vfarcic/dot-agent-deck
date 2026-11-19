@@ -3721,6 +3721,7 @@ fn once_waiter_fenced(
                 component: InboxComponent::ClaudeWaiter,
                 doorbell_only: true,
                 kind: engine::LinkKind::Once { spent: true },
+                registered_at: t,
             },
         );
         rx

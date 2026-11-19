@@ -104,6 +104,8 @@ pub(super) struct TurnClock {
     pub(super) busy: bool,
     /// Set only when a turn under way ends.
     pub(super) idle_since: Option<Instant>,
+    /// Issue #2133: when the latest turn started, kept after it ends.
+    pub(super) started_at: Option<Instant>,
     /// The registry's order of the last edge applied; an older one is
     /// ignored.
     pub(super) seq: u64,
@@ -223,6 +225,8 @@ pub(super) struct Link {
     pub(super) component: InboxComponent,
     pub(super) doorbell_only: bool,
     pub(super) kind: LinkKind,
+    /// When it registered (issue #2133, [`Receipts::once_hold_until`]).
+    pub(super) registered_at: Instant,
 }
 
 impl Link {
@@ -372,6 +376,23 @@ impl Receipts {
             })
     }
 
+    /// Issue #2133: until when a once-waiter registered at `registered` is
+    /// handed nothing, if it is held: it was armed before `key`'s latest turn
+    /// started. Claude Code takes a wake that lands mid-turn into the running
+    /// turn as a queued command: no prompt hook runs for it, so nothing can
+    /// confirm it (measured on 2.1.328), and the model may finish the turn it
+    /// was on without acting on it. A waiter armed before the turn that exits
+    /// as the turn ends did not wake Claude in three of five runs either. So
+    /// the batch is left to the waiter Claude's `Stop` hook arms when the turn
+    /// ends. The hold lasts at most one ack-wait from the turn's start, so a
+    /// turn whose end the deck never sees (an interrupted one, say), or one
+    /// after which no waiter arms, keeps the mail from the older waiter no
+    /// longer than that.
+    pub(super) fn once_hold_until(&self, key: &AgentKey, registered: Instant) -> Option<Instant> {
+        let started = self.turns.get(key)?.started_at?;
+        (registered < started).then(|| started + self.limits.ack_wait)
+    }
+
     /// The generation's floor blocks delivery (§11).
     pub(super) fn blocked(&self, key: &AgentKey) -> bool {
         self.floors.get(key).is_some_and(Floor::blocks)
@@ -447,6 +468,20 @@ impl Receipts {
             .filter_map(|generation| generation.model.hold_due_at())
             .min()
             .map(|due| due.max(now));
+        // Issue #2133: a once-waiter held back since a turn started is
+        // handed what waits for it when the hold runs out.
+        let once_hold = self
+            .gens
+            .iter()
+            .flat_map(|(key, generation)| {
+                generation
+                    .links
+                    .values()
+                    .filter(|link| matches!(link.kind, LinkKind::Once { spent: false }))
+                    .filter_map(move |link| self.once_hold_until(key, link.registered_at))
+            })
+            .filter(|until| *until > now)
+            .min();
         // PRD #1666 G3: a not-started attention falls due on its own instant.
         let not_started = self
             .gens
@@ -466,6 +501,7 @@ impl Receipts {
             staging,
             retry,
             not_started,
+            once_hold,
         ]
         .into_iter()
         .flatten()
@@ -615,6 +651,7 @@ pub(super) fn register(
             component,
             doorbell_only,
             kind,
+            registered_at: now,
         },
     );
     info!(
@@ -880,6 +917,18 @@ pub(super) fn dispatch(st: &mut HubState, key: &AgentKey, now: Instant, out: &mu
     };
     let (rx, conn_id, budget) = (*rx, link.conn_id, link.component.inline_budget());
     let once = matches!(link.kind, LinkKind::Once { .. });
+    // Issue #2133: nothing goes to a once-waiter armed before the latest
+    // turn started, within the hold ([`Receipts::once_hold_until`]): the
+    // waiter armed when that turn ends takes it, or the clock hands it over
+    // once the hold runs out.
+    if once
+        && st
+            .receipts
+            .once_hold_until(key, link.registered_at)
+            .is_some_and(|until| now < until)
+    {
+        return;
+    }
     // PR #1735 review 4307236310, auditor R9T-A02: nothing is issued unless
     // the stream's queue gives the hand-out's line its room first, under this
     // lock, since a line that does not fit is dropped after its attempts were
@@ -932,6 +981,8 @@ fn spend(
     }
     let spool = generation.spool.clone();
     forget_waiter(st, key, conn_id);
+    // Issue #2133: its wake is on its way; the doorbell waits it out.
+    st.waiter_spent.insert(key.clone(), now);
     st.receipts.staged.push(Staged {
         key: key.clone(),
         rx,
@@ -1592,6 +1643,7 @@ pub(super) fn note_turn(st: &mut HubState, key: &AgentKey, seen: TurnSeen, now: 
     let changed = match seen.edge {
         TurnEdge::Started if !clock.busy => {
             clock.busy = true;
+            clock.started_at = Some(now);
             true
         }
         TurnEdge::Ended if clock.busy => {
