@@ -1698,6 +1698,17 @@ fn private_group(uid: u32) -> Option<u32> {
     .then_some(gid)
 }
 
+/// The effective user's private group ([`private_group`] of `geteuid`): the
+/// one group whose write permission a directory that only this account may
+/// change can carry, under the same policy [`TrustedWriters`] states. Its
+/// caller outside this module: the dispatched-task save's check of the
+/// worktree root (`orchestrator_context::open_held_context_dir`, PRD #1790).
+#[cfg(unix)]
+pub(crate) fn effective_private_group() -> Option<u32> {
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    private_group(unsafe { libc::geteuid() })
+}
+
 /// Whether a group is the private group of the account `user` (`uid`): it
 /// carries the account's name, no supplementary member (`supplementary`, from
 /// `getgrgid`) but the account, and no account but it and root has it as a
@@ -1765,9 +1776,10 @@ fn reentrant_lookup<T>(
 }
 
 /// `uid`'s home directory from the account database (`getpwuid_r`'s
-/// `pw_dir`), `None` when it has no entry or the lookup fails. Linux-only
-/// because its one caller is (`composer_probe::install::spawn_start_dir`).
-#[cfg(target_os = "linux")]
+/// `pw_dir`), `None` when it has no entry or the lookup fails. Its callers:
+/// `composer_probe::install::spawn_start_dir` (Linux) and the launch folder
+/// a spawn records (`agent_pty::effective_launch_dir`, PRD #1790).
+#[cfg(unix)]
 pub(crate) fn passwd_home(uid: u32) -> Option<std::ffi::OsString> {
     use std::os::unix::ffi::OsStringExt;
     reentrant_lookup(|buf| {

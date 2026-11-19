@@ -1371,12 +1371,16 @@ async fn dispatch_one_issue(
             &paths.worktree_dir,
         )
     };
+    let prompt = substitute_issue_number(prompt_template, issue);
+    // PRD #1790: the task as dispatched, saved beside the worktree under the
+    // issue's work id, so a restore can hand it back.
+    crate::dispatch_task::save_or_warn(&paths.worktree_dir, issue_work.as_ref(), &prompt).await;
     let req = SpawnRequest {
         work_id: issue_work.clone(),
         task_name: task_name.to_string(),
         working_dir: paths.worktree_dir.to_string_lossy().into_owned(),
         command: default_command.map(str::to_string),
-        prompt: substitute_issue_number(prompt_template, issue),
+        prompt,
         // `None`: issue-dispatch keeps deriving the shape from the cloned repo's
         // own config, exactly as before the PRD #220 selector existed.
         resolved_target: None,
