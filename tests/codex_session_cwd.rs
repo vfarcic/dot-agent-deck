@@ -19,6 +19,9 @@ use dot_agent_deck::doorbell_activation::KeymapSource;
 use dot_agent_deck::doorbell_screen::{Grid, codex_status_line};
 use spec::spec;
 
+#[path = "../src/test_temp.rs"]
+mod test_temp;
+
 const FIXTURES: &str = "tests/fixtures/codex-inbox/release-0.164.0/session-cwd";
 
 /// The recording's sandbox root, which every captured path starts with.
@@ -277,7 +280,7 @@ fn probe_103_codexs_status_line_against_the_start_folder() {
 #[test]
 fn probe_103_folders_named_like_the_start_folder_and_more_are_found() {
     use dot_agent_deck::composer_probe::keymap::codex_separator_siblings;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_temp::tempdir().unwrap();
     let proj = dir.path().join("proj");
     std::fs::create_dir_all(proj.join("proj · inside")).unwrap();
     std::fs::create_dir(dir.path().join("proj copy")).unwrap();
@@ -305,7 +308,7 @@ fn probe_103_a_moved_codex_session_holds_for_the_rest_of_the_generation() {
         KeymapSource::CodexProject,
         KeymapSource::CodexOverride,
     ];
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_temp::tempdir().unwrap();
     let home = dir.path().join("home");
     let codex_home = home.join(".codex");
     let work = dir.path().join("work");
