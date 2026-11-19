@@ -9,9 +9,10 @@ import type { AgentSession } from "../types";
  * carries the `held` marker (`heldAgents`) — exactly those, on every daemon
  * the screen shows — and each name opens its agent through `openAgent`, the
  * registry entry "open the tester agent" already reaches by voice (CLAUDE.md
- * rule 23). Past `DECK_ATTENTION_MAX_NAMES` it counts them, with every name
- * and its hold's words on hover. Each name gives its hold's words on hover
- * too, the words its marker gives. It is derived from the snapshot each
+ * rule 23). Past `DECK_ATTENTION_MAX_NAMES` it counts them. The item gives
+ * every held agent and its hold's words on hover, and each name its own;
+ * each name is cut to a width of its own, so the top bar can shorten a name
+ * but never drop one. It is derived from the snapshot each
  * render, so it survives a reconnect and a change of selection or screen.
  *
  * Without `context` (a host that cannot navigate) the names are plain text.
@@ -24,15 +25,18 @@ export function DeckAttention({ agents, from, context }: {
   const held = heldAgents(agents);
   const text = deckAttentionNamesText(held.map((entry) => entry.name));
   if (text === undefined) return null;
+  /* Every held agent and its reason, on hover over the item itself: a name
+     cut short by the top bar's width is still read whole here. */
+  const list = held.map((entry) => `${entry.fullName}: ${entry.words}`).join("\n");
   if (held.length > DECK_ATTENTION_MAX_NAMES) {
     return (
-      <span className="deck-attention" role="status" data-testid="deck-attention" title={held.map((entry) => `${entry.name}: ${entry.words}`).join("\n")}>
+      <span className="deck-attention" role="status" data-testid="deck-attention" title={list}>
         {text}
       </span>
     );
   }
   return (
-    <span className="deck-attention" role="status" data-testid="deck-attention">
+    <span className="deck-attention" role="status" data-testid="deck-attention" title={list}>
       {`${INBOX_WORDS.glyph} ${INBOX_WORDS.attentionHeld}: `}
       {held.map((entry, index) => (
         <Fragment key={`${entry.agent.daemonId}:${entry.agent.id}`}>
@@ -41,11 +45,11 @@ export function DeckAttention({ agents, from, context }: {
             <button
               type="button"
               className="deck-attention-name"
-              title={entry.words}
-              aria-label={`Open ${entry.name}`}
+              title={`${entry.fullName}: ${entry.words}`}
+              aria-label={`Open ${entry.fullName}`}
               onClick={() => VOICE_ACTIONS.openAgent.run(context, { deckId: entry.agent.daemonId, agentId: entry.agent.id, from, incarnation: entry.agent.incarnation })}
             >{entry.name}</button>
-          ) : <span title={entry.words}>{entry.name}</span>}
+          ) : <span className="deck-attention-name" title={`${entry.fullName}: ${entry.words}`}>{entry.name}</span>}
         </Fragment>
       ))}
     </span>

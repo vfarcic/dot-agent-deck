@@ -1,4 +1,5 @@
 import type { AgentInbox, AgentSession, HoldDetail, InboxActionVerb, InboxAttentionItem, InputHeldCause } from "../types";
+import { agentTitle } from "./agentNames";
 
 /**
  * The words both clients use for a message's journey through an agent's inbox
@@ -321,8 +322,12 @@ export function inboxAttentionWords(inbox: AgentInbox | undefined): string | und
  */
 export const DECK_ATTENTION_MAX_NAMES = 3;
 
-/** A held agent, with the words its `held` marker gives on hover. */
-export type HeldAgent = { agent: AgentSession; name: string; words: string };
+/**
+ * A held agent, with the words its `held` marker gives on hover. `name` is
+ * what its tile's title shows (`agentTitle`): a run's agents after the run's
+ * name, so two runs' `coder` read apart; `fullName` is that title unclamped.
+ */
+export type HeldAgent = { agent: AgentSession; name: string; fullName: string; words: string };
 
 /**
  * Issue #2387: the agents whose tile or row carries the `held` marker — the
@@ -334,7 +339,9 @@ export type HeldAgent = { agent: AgentSession; name: string; words: string };
 export function heldAgents(agents: readonly AgentSession[]): HeldAgent[] {
   const held = agents.flatMap((agent) => {
     const words = inboxAttentionWords(agent.inbox);
-    return words === undefined ? [] : [{ agent, name: agent.displayName || agent.role, words }];
+    if (words === undefined) return [];
+    const title = agentTitle(agent);
+    return [{ agent, name: title.shown, fullName: title.full, words }];
   });
   const key = (entry: HeldAgent) => entry.name.toLowerCase();
   return held.sort((a, b) => Number(Boolean(b.agent.isStartRole)) - Number(Boolean(a.agent.isStartRole)) || (key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0));

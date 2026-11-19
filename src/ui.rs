@@ -2089,6 +2089,10 @@ struct UiState {
     /// [`Self::deck_attention_held`], so a click on one reveals its card
     /// ([`Action::RevealCard`]). Cleared every frame before the item is drawn.
     deck_attention_hits: Vec<(String, Rect)>,
+    /// Issue #2387: the card a click on a held name asked for, selected on the
+    /// next frame, once the card list is the tab it is on
+    /// ([`apply_pending_reveal`]).
+    pending_reveal: Option<String>,
     /// PRD #1666 part 2 (G-fix6): what the dashboard's names for a pane were
     /// before its last rename — the card's session id and its
     /// `display_names` / `pane_display_names` entries — so a rename the deck
@@ -2715,6 +2719,7 @@ impl UiState {
             deck_attention_in_tab_bar: false,
             deck_attention_held: Vec::new(),
             deck_attention_hits: Vec::new(),
+            pending_reveal: None,
             renamed_from: HashMap::new(),
             pane_declared_agent: HashMap::new(),
             pane_metadata: HashMap::new(),
@@ -8772,27 +8777,18 @@ fn focus_deck(
     true
 }
 
-/// PRD #68: mirror a selection move made by `handle_normal_key`
-/// (j/k/Up/Down) into the embedded controller's focus. The per-frame
-/// "sync `ui.selected_index` ← focused pane" block at the top of the
-/// outer event loop would otherwise roll the move back on the next
-/// iteration. The digit-jump path (`Ctrl+d` → `1`-`9`) already pairs
-/// selection with focus via [`focus_deck`]; this helper is its
-/// counterpart for the cycling keys. No-op when the index didn't
-/// change or the new selection lacks a `pane_id`.
 /// Issue #2387: show the card of `session_id`, a held agent the deck-wide
 /// attention item names: the orchestration tab it is a role of, or the
 /// Dashboard. The target tab's remembered card is written first, so the
 /// switch re-focuses it the way returning to a tab does
-/// ([`switch_tab_with_focus`]); on the tab already shown, its card's pane is
-/// focused and the card selected, as a click on the card selects it.
+/// ([`switch_tab_with_focus`]); the card itself is selected on the next
+/// frame, once the card list is that tab's ([`apply_pending_reveal`]).
 fn reveal_card(
     session_id: &str,
     ui: &mut UiState,
     tab_manager: &mut TabManager,
     pane: &dyn PaneController,
     snapshot: &AppState,
-    filtered: &[(&String, &SessionState)],
 ) {
     let Some(session) = snapshot.sessions.get(session_id) else {
         return;
@@ -8823,20 +8819,53 @@ fn reveal_card(
     }
     if target != tab_manager.active_index() {
         switch_tab_with_focus(tab_manager, target, pane, snapshot, ui);
-        return;
     }
-    let prev = ui.selected_index;
-    if let Some(idx) = filtered
+    ui.pending_reveal = Some(session_id.to_string());
+}
+
+/// Issue #2387: select [`reveal_card`]'s card in this frame's card list,
+/// exactly as a click on the card selects it ([`Action::SelectCard`]), so the
+/// highlight, the focused pane and what Enter opens are that card. A filter
+/// that hides it is cleared, and the card is selected on the frame after.
+fn apply_pending_reveal(
+    ui: &mut UiState,
+    tab_manager: &mut TabManager,
+    pane: &dyn PaneController,
+    filtered: &[(&String, &SessionState)],
+    session_id: &str,
+) {
+    match filtered
         .iter()
         .position(|(id, _)| id.as_str() == session_id)
     {
-        ui.selected_index = Some(idx);
-        mirror_selection_into_focus(prev, ui, filtered, pane);
-    } else if let Some(card) = session.bound_pane() {
-        let _ = pane.focus_card(&card);
+        Some(idx) => {
+            let prev = ui.selected_index;
+            ui.selected_index = Some(idx);
+            if let Tab::Dashboard {
+                selected_session_id,
+                ..
+            } = tab_manager.active_tab_mut()
+            {
+                *selected_session_id = Some(session_id.to_string());
+            }
+            mirror_selection_into_focus(prev, ui, filtered, pane);
+        }
+        None if !ui.filter_text.is_empty() => {
+            ui.filter_text.clear();
+            ui.pending_reveal = Some(session_id.to_string());
+        }
+        None => {}
     }
 }
 
+/// PRD #68: mirror a selection move made by `handle_normal_key`
+/// (j/k/Up/Down) into the embedded controller's focus. The per-frame
+/// "sync `ui.selected_index` ← focused pane" block at the top of the
+/// outer event loop would otherwise roll the move back on the next
+/// iteration. The digit-jump path (`Ctrl+d` → `1`-`9`) already pairs
+/// selection with focus via [`focus_deck`]; this helper is its
+/// counterpart for the cycling keys. No-op when the index didn't
+/// change or the new selection lacks a `pane_id`.
 fn mirror_selection_into_focus(
     prev_selected_index: Option<usize>,
     ui: &UiState,
@@ -11976,7 +12005,7 @@ fn dispatch_action(
         }
         // Issue #2387: a held agent's name in the attention item → its card.
         Action::RevealCard(session_id) => {
-            reveal_card(&session_id, ui, tab_manager, pane, snapshot, filtered);
+            reveal_card(&session_id, ui, tab_manager, pane, snapshot);
         }
         // PRD #80 M4: `/` key or [Filter /] button → filter mode.
         Action::EnterFilter => {
@@ -15729,6 +15758,10 @@ pub fn run_tui(
         // longer snap the selection of another (the cross-tab leak this
         // PRD fixes). A remembered id that's no longer in the filtered
         // list is cleared and the selection falls back to the first card.
+        // Issue #2387: a held name clicked in the header asked for its card.
+        if let Some(session_id) = ui.pending_reveal.take() {
+            apply_pending_reveal(&mut ui, &mut tab_manager, &*pane, &filtered, &session_id);
+        }
         reconcile_frame_selection(&mut ui, &mut tab_manager, &*pane, &filtered);
 
         // PRD #341 M6: before laying out or drawing anything, make sure the pane
@@ -18014,6 +18047,20 @@ fn held_card_names(
     tabs: &[Tab],
     display_names: &HashMap<String, String>,
 ) -> Vec<(String, String)> {
+    let run_names: HashMap<&str, &str> = tabs
+        .iter()
+        .flat_map(|tab| match tab {
+            Tab::Orchestration {
+                role_pane_ids,
+                name,
+                ..
+            } => role_pane_ids
+                .iter()
+                .map(|pane| (pane.as_str(), name.as_str()))
+                .collect::<Vec<_>>(),
+            Tab::Dashboard { .. } => Vec::new(),
+        })
+        .collect();
     let start_panes: std::collections::HashSet<&str> = tabs
         .iter()
         .filter_map(|tab| match tab {
@@ -18033,7 +18080,7 @@ fn held_card_names(
                 .pane_id
                 .as_deref()
                 .is_some_and(|pane| start_panes.contains(pane));
-            let name = display_names
+            let own = display_names
                 .get(&session.session_id)
                 .or(session.display_name.as_ref())
                 .cloned()
@@ -18044,6 +18091,16 @@ fn held_card_names(
                         crate::submitted_prompt::truncate_on_char_boundary(&session.session_id, 11)
                     )
                 });
+            // The run's name before the agent's, as the desktop titles its
+            // tile, so two runs' `coder` read apart.
+            let name = match session
+                .pane_id
+                .as_deref()
+                .and_then(|pane| run_names.get(pane))
+            {
+                Some(run) => format!("{run} / {own}"),
+                None => own,
+            };
             (start, session.session_id.clone(), name)
         })
         .collect();
@@ -18276,8 +18333,9 @@ mod deck_attention_tests {
 
     /// Issue #2387 (`inbox/status/031`'s fast half): the header names the
     /// held cards, the start role first whatever its name and wherever it
-    /// sits in the team, then by name; an agent with mail and no hold is not
-    /// named. Each named card carries the `held` marker.
+    /// sits in the team, then by name, a run's agents after the run's name
+    /// as the desktop titles them; an agent with mail and no hold is not
+    /// named.
     #[test]
     fn deck_attention_names_the_held_cards_start_role_first() {
         let mut state = AppState::default();
@@ -18299,7 +18357,7 @@ mod deck_attention_tests {
         state.apply_inbox_summary("quiet-pane", "a4", &summary(3, None));
         assert_eq!(
             attention(&state, &tabs()).as_deref(),
-            Some("✉ held: captain, Archivist, coder")
+            Some("✉ held: team / captain, Archivist, team / coder")
         );
         assert_eq!(deck_attention_short(&state).as_deref(), Some("✉ 3 held"));
         // The start role's reason changes: it is still the one named first.
@@ -18310,7 +18368,7 @@ mod deck_attention_tests {
         ));
         assert_eq!(
             attention(&state, &tabs()).as_deref(),
-            Some("✉ held: captain, Archivist, coder")
+            Some("✉ held: team / captain, Archivist, team / coder")
         );
         // With no tabs, nobody is a start role: everyone is named by name.
         assert_eq!(
@@ -18364,7 +18422,7 @@ mod deck_attention_tests {
         state.apply_inbox_summary("coder-pane", "a2", &summary(1, Some(WakeHold::Unknown)));
         assert_eq!(
             attention(&state, &tabs()).as_deref(),
-            Some("✉ held: captain, coder")
+            Some("✉ held: team / captain, team / coder")
         );
         state.sessions.remove("s-a1");
         card(&mut state, "captain-pane", "a9", "captain");
@@ -18374,7 +18432,10 @@ mod deck_attention_tests {
             "a1",
             Some(WakeHold::PossibleDraft),
         ));
-        assert_eq!(attention(&state, &tabs()).as_deref(), Some("✉ held: coder"));
+        assert_eq!(
+            attention(&state, &tabs()).as_deref(),
+            Some("✉ held: team / coder")
+        );
         state.apply_inbox_notice(&wake_update(
             "captain-pane",
             "a9",
@@ -18382,7 +18443,7 @@ mod deck_attention_tests {
         ));
         assert_eq!(
             attention(&state, &tabs()).as_deref(),
-            Some("✉ held: captain, coder")
+            Some("✉ held: team / captain, team / coder")
         );
         state.apply_inbox_notice(&wake_update("captain-pane", "a9", None));
         state.apply_inbox_notice(&wake_update("coder-pane", "a2", None));
@@ -18421,6 +18482,39 @@ mod deck_attention_tests {
         draw_deck_attention(&mut buf, row, 3, "✉ held: captain, coder", "✉ 2 held");
         record_attention_hits(&mut ui, &buf, row);
         assert!(ui.deck_attention_hits.is_empty(), "the count names nobody");
+    }
+
+    /// Issue #2387: the card a click on a held name asked for is selected
+    /// once the frame's card list holds it, the way a click on the card
+    /// selects it; a filter that hides it is cleared first, and the card
+    /// selected on the frame after.
+    #[test]
+    fn a_revealed_card_is_selected_and_a_hiding_filter_cleared() {
+        let ctrl = Arc::new(EmbeddedPaneController::for_render_seam_without_panes());
+        let mut tabs = TabManager::new(ctrl.clone() as Arc<dyn PaneController>);
+        let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+        let mut state = AppState::default();
+        card(&mut state, "a-pane", "a1", "alpha");
+        card(&mut state, "b-pane", "a2", "bravo");
+        let ids: Vec<String> = vec!["s-a1".to_string(), "s-a2".to_string()];
+        let list: Vec<(&String, &SessionState)> =
+            ids.iter().map(|id| (id, &state.sessions[id])).collect();
+
+        ui.filter_text = "alpha".to_string();
+        let before = ui.selected_index;
+        apply_pending_reveal(&mut ui, &mut tabs, &*ctrl, &list[..1], "s-a2");
+        assert!(ui.filter_text.is_empty(), "the filter hid it, so it goes");
+        assert_eq!(ui.pending_reveal.as_deref(), Some("s-a2"), "asked again");
+        assert_eq!(ui.selected_index, before, "nothing selected yet");
+
+        let asked = ui.pending_reveal.take().unwrap();
+        apply_pending_reveal(&mut ui, &mut tabs, &*ctrl, &list, &asked);
+        assert_eq!(ui.selected_index, Some(1));
+        assert!(matches!(
+            tabs.active_tab(),
+            Tab::Dashboard { selected_session_id: Some(id), .. } if id == "s-a2"
+        ));
+        assert_eq!(ui.pending_reveal, None);
     }
 
     /// The item follows the tabs on the strip's row and is clipped at its end;

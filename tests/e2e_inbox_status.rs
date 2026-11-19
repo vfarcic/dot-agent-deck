@@ -67,7 +67,7 @@ fn assert_orchestrator_attention(deck: &common::TuiDeck, reason: &str) {
             let names = &header[at + named.len()..];
             // The start role first, then the other held recipient; the
             // worker, which the deck holds nothing for, is not named.
-            names.starts_with("attention-orchestrator, attention-other")
+            names.starts_with("attention-team / attention-orchestrator, attention-other")
                 && !header.contains(reason)
                 && !header.contains("coder")
         }),

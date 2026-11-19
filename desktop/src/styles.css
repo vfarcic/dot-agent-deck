@@ -507,8 +507,10 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .repo-context { min-width: 0; display: flex; flex-direction: column; justify-content: center; }
 /* PRD #1666 part 3, round 5-wake (Q6): a held orchestrator, across the whole bar, below its instruments. */
 /* Issue #2387: the held agents, inline at the start of the top bar's actions. */
-.deck-attention { min-width: 0; max-width: 34ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--amber-ink); font-size: var(--text-base); font-weight: 600; }
-.deck-attention-name { padding: 0; border: 0; background: none; color: inherit; font: inherit; text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
+.deck-attention { min-width: 0; white-space: nowrap; color: var(--amber-ink); font-size: var(--text-base); font-weight: 600; }
+/* Each name is cut on its own, so a long one shortens rather than pushing the next out of view; the item's hover lists them whole. */
+.deck-attention-name { display: inline-block; max-width: 22ch; overflow: hidden; text-overflow: ellipsis; vertical-align: bottom; padding: 0; border: 0; background: none; color: inherit; font: inherit; }
+button.deck-attention-name { text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
 .deck-attention-name:hover, .deck-attention-name:focus-visible { color: var(--amber); }
 .repo-line, .branch-line { display: flex; align-items: center; min-width: 0; }
 .repo-line { gap: 6px; font-size: var(--text-xl); }
@@ -1412,6 +1414,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
   .topbar { padding: 0 10px; position: static; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
   .branch-line span:last-child, .command-trigger, .top-actions .secondary { display: none; }
   .top-actions .button span { display: none; }
+  .deck-attention-name { max-width: 9ch; }
   /* The counters stay: they are the only place the totals are shown. */
   .top-actions .dashboard-counters-button.secondary { display: inline-flex; }
   .top-actions .dashboard-counters-button span { display: inline; }

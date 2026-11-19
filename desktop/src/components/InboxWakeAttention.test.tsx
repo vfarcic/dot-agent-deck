@@ -66,15 +66,15 @@ function header(container: HTMLElement): HTMLElement {
 // Issue #2387: the header names the held agents, start role first, each
 // giving its hold's words on hover; `e2e_inbox_status.rs` reads the TUI's.
 function expectAttention(top: HTMLElement, reason = words.wakeHolds.possible_draft) {
-  expect(top).toHaveTextContent(`${words.glyph} ${words.attentionHeld}: Coordinator, Helper`);
-  expect(top.querySelector('[aria-label="Open Coordinator"]')).toHaveAttribute("title", reason);
+  expect(top).toHaveTextContent(`${words.glyph} ${words.attentionHeld}: team-away / Coordinator, team-away / Helper`);
+  expect(top.querySelector('[aria-label="Open team-away / Coordinator"]')?.getAttribute("title")).toBe(`team-away / Coordinator: ${reason}`);
   expect(top).not.toHaveTextContent(reason);
   expect(top).not.toHaveTextContent(/coder/i);
 }
 
 /** Captain's hold cleared: only the other held worker is named. */
 function expectOnlyHelper(top: HTMLElement) {
-  expect(top).toHaveTextContent(`${words.glyph} ${words.attentionHeld}: Helper`);
+  expect(top).toHaveTextContent(`${words.glyph} ${words.attentionHeld}: team-away / Helper`);
   expect(top).not.toHaveTextContent(/Coordinator|captain|coder/i);
   expect(top).not.toHaveTextContent(words.wakeHolds.possible_draft);
   expect(top).not.toHaveTextContent(words.wakeHolds.awaiting_prompt);
@@ -107,14 +107,24 @@ describe("inbox/status/044 — held agents are marked where they are listed", ()
     expect(marked("Quiet"), "no hold, no marker").toBeNull();
     const top = header(view.container);
     expect(top.querySelector(".deck-attention")?.parentElement, "inline in the top bar, not a row of its own").toBe(top.querySelector(".top-actions"));
-    expect(top).toHaveTextContent(`${words.glyph} ${words.attentionHeld}: Coordinator, Helper`);
+    expect(top).toHaveTextContent(`${words.glyph} ${words.attentionHeld}: team-away / Coordinator, team-away / Helper`);
     expect(top).not.toHaveTextContent(/Quiet/);
+    // Every held agent and its reason, on hover over the item, so a name the top bar cuts short is still read whole.
+    expect(top.querySelector(".deck-attention")?.getAttribute("title")).toBe(`team-away / Coordinator: ${words.wakeHolds.possible_draft}\nteam-away / Helper: ${words.wakeHolds.possible_draft}`);
     expect(view.container.querySelector(".agent-pane-overlay"), "control: no agent is open yet").toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Open Helper" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open team-away / Helper" }));
     const pane = view.container.querySelector<HTMLElement>(".agent-pane-overlay");
     expect(pane, "the name opens that agent").not.toBeNull();
     expect(pane).toHaveTextContent("Helper");
     expect(pane).not.toHaveTextContent("Coordinator");
+  });
+
+  /// Scenario: inbox/status/044 — Open the deck on a daemon that is not answering, whose last snapshot listed two held agents. The header names nobody: those holds are a past reading, as on the agent dashboard.
+  it("names nobody for a daemon that is not answering", () => {
+    const dto = snapshot();
+    dto.connection = { ...dto.connection, status: "disconnected" };
+    const view = render(<DeckShell runtime={runtime(mapDesktopSnapshot(dto))} initialView={{ kind: "deck" }} />);
+    expect(header(view.container).querySelector(".deck-attention")).toBeNull();
   });
 
   /// Scenario: inbox/status/044 — Open the agent dashboard over two connected daemons, each with one held agent. Each held row shows the `held` marker beside its status and the header names both agents, counting across every daemon the dashboard shows.
@@ -128,7 +138,7 @@ describe("inbox/status/044 — held agents are marked where they are listed", ()
     const view = render(<DeckShell runtime={{ ...runtime(local), fleet: [local, remote] }} initialView={{ kind: "overview" }} />);
     const markers = Array.from(view.container.querySelectorAll(".overview-state .held-marker"));
     expect(markers.map((marker) => marker.getAttribute("title")).sort()).toEqual([words.wakeHolds.awaiting_prompt, words.wakeHolds.cannot_type].sort());
-    expect(header(view.container)).toHaveTextContent(`${words.glyph} ${words.attentionHeld}: Faraway, Helper`);
+    expect(header(view.container)).toHaveTextContent(`${words.glyph} ${words.attentionHeld}: team-away / Faraway, team-away / Helper`);
   });
 });
 

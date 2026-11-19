@@ -8,7 +8,7 @@ function inbox(queued: number, wakeHold?: WakeHold): AgentInbox {
 }
 
 function agent(role: string, isStartRole: boolean, agentInbox?: AgentInbox): AgentSession {
-  return { id: role, role, isStartRole, ...(agentInbox ? { inbox: agentInbox } : {}) } as AgentSession;
+  return { id: role, role, displayName: role, tab: { kind: "dashboard" }, isStartRole, ...(agentInbox ? { inbox: agentInbox } : {}) } as AgentSession;
 }
 
 // PRD #1666 part 3, round 5-wake (Q6): the header's attention item. The TUI's
@@ -25,6 +25,12 @@ describe("deck attention words", () => {
     expect(deckAttentionText([agent("Captain", true, inbox(1, "paste_open"))])).toBe("✉ held: Captain");
     expect(deckAttentionText(["A", "B", "C", "D"].map((name) => agent(name, false, inbox(1, "cannot_type"))))).toBe("✉ 4 held");
     expect(deckAttentionText([agent("Captain", true, inbox(2))])).toBeUndefined();
+  });
+
+  /// Scenario: Two orchestration runs each hold their `coder`: the header names each after its run's name, as their tiles are titled, so the two read apart.
+  it("names a run's agents after the run, so two runs' roles read apart", () => {
+    const coder = (run: string) => ({ ...agent("coder", false, inbox(1, "cannot_type")), id: `${run}-coder`, tab: { kind: "orchestration", name: run, roleIndex: 1, roleName: "coder", isStartRole: false } }) as AgentSession;
+    expect(deckAttentionText([coder("run-b"), coder("run-a")])).toBe("✉ held: run-a / coder, run-b / coder");
   });
 
   /// Scenario: The agents the header counts are exactly those with attention words, the same predicate the held marker on a tile reads.

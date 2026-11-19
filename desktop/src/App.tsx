@@ -2697,7 +2697,8 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
           </div>}
           <div className="top-actions">
             {/* Issue #2387: who the deck holds the doorbell for, inline. */}
-            <DeckAttention agents={snapshot.agents} from="deck" context={onNavigate ? voiceContext : undefined} />
+            {/* A daemon that is not answering has no current hold to report, as on the overview. */}
+            <DeckAttention agents={snapshot.connection.status === "connected" ? snapshot.agents : []} from="deck" context={onNavigate ? voiceContext : undefined} />
             <button className="command-trigger" onClick={() => setPaletteOpen(true)}><Search size={14} /><span>Command</span><kbd>⌘ K</kbd></button>
             <button
               className="button secondary compact"
