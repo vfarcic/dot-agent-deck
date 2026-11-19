@@ -143,6 +143,23 @@ describe("the dashboard's cards (PRD #2374)", () => {
     expect(screen.getAllByTestId("agent-card-show").map((button) => button.textContent)).toEqual(["coder"]);
   });
 
+  /*
+    PR #2378 review (Qodo): the Cards view keeps each daemon's own section
+    and header — its name and the daemon's controls (Stop daemon, Upgrade,
+    host metrics, New agent on this daemon) — with the cards as its body.
+  */
+  it("keeps each daemon's header and its controls above that daemon's cards", () => {
+    render(<AgentOverview runtime={runtime()} onNavigate={vi.fn()} />);
+    const headerControls = () => [...document.querySelectorAll(".daemon-group-header button")].map((button) => button.getAttribute("data-testid") ?? button.textContent);
+    const inTable = headerControls();
+    fireEvent.click(screen.getByTestId("overview-mode-cards"));
+    expect(headerControls()).toEqual(inTable);
+    const identity = screen.getByTestId("daemon-identity");
+    const section = identity.closest(".daemon-group");
+    expect(section).not.toBeNull();
+    for (const group of screen.getAllByTestId("agent-cards-group")) expect(section?.contains(group)).toBe(true);
+  });
+
   it("falls back to the table when storage throws", () => {
     const getItem = vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => { throw new Error("blocked"); });
     try {

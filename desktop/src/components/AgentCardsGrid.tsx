@@ -5,29 +5,19 @@ import { DISPLAY_LIMITS, displayText, domIdentity } from "../lib/displayText";
 import { VOICE_ACTIONS, type VoiceActionContext } from "../lib/voiceActions";
 import { AgentCard, type CardControls } from "./AgentCard";
 
-/** One deck's cards, in the daemon's display order. */
-export interface CardsDeck {
-  deckId: string;
-  /** The deck's name, shown above its groups when more than one deck is on screen. */
-  name: string;
-  cards: PlacedCard[];
-}
-
 /**
- * PRD #2374 — the dashboard's Cards view: every agent's card, grouped as the
- * daemon groups them (by the dispatcher that started it, its orchestration, or
- * neither), each group headed by its label and its counts, in the daemon's
- * order. The Needs you filter hides the cards the daemon did not mark.
+ * PRD #2374 — the Cards view's line above every daemon's section: how many
+ * agents the cards show and how many need the user, the Needs you filter, and
+ * what to say when there is nothing to show. `cards` is every card on screen,
+ * across the daemons, in the daemons' order.
  */
-export function AgentCardsGrid({ decks, needsYouOnly, controls, results }: {
-  decks: readonly CardsDeck[];
+export function AgentCardsToolbar({ cards, needsYouOnly, controls }: {
+  cards: readonly PlacedCard[];
   needsYouOnly: boolean;
-  controls: CardControls & Pick<VoiceActionContext, "setNeedsYouFilter">;
-  /** The last answer to each action pressed on a card, to show under its primary button. */
-  results?: (card: PlacedCard) => CardResults;
+  controls: Pick<VoiceActionContext, "setNeedsYouFilter">;
 }) {
-  const total = decks.reduce((sum, deck) => sum + deck.cards.length, 0);
-  const needYou = decks.reduce((sum, deck) => sum + deck.cards.filter((card) => card.entry.needs_you).length, 0);
+  const total = cards.length;
+  const needYou = cards.filter((card) => card.entry.needs_you).length;
   return (
     <section className="agent-cards" aria-label="Agent cards" data-testid="agent-cards">
       <div className="agent-cards-toolbar">
@@ -43,27 +33,42 @@ export function AgentCardsGrid({ decks, needsYouOnly, controls, results }: {
       </div>
       {total === 0 && <p className="agent-cards-empty">No agent has a card yet. Every agent the daemon runs gets one.</p>}
       {total > 0 && needsYouOnly && needYou === 0 && <p className="agent-cards-empty" data-testid="agent-cards-none-need-you">No card needs you right now.</p>}
-      {decks.map((deck) => {
-        const groups = groupCards(deck.cards, needsYouOnly);
-        if (groups.length === 0) return null;
-        return (
-          <div className="agent-cards-deck" key={deck.deckId} data-testid={`agent-cards-deck-${domIdentity(deck.deckId)}`}>
-            {decks.length > 1 && <h2 className="agent-cards-deck-name">{displayText(deck.name, DISPLAY_LIMITS.name)}</h2>}
-            {groups.map((group) => (
-              <section className="agent-cards-group" key={group.key} data-testid="agent-cards-group" data-group-kind={group.kind} aria-label={group.label}>
-                <h3 className="agent-cards-group-heading">
-                  <span className="section-kicker">{group.kind === "standalone" ? "Standalone" : group.kind === "dispatcher" ? "Dispatcher" : group.kind === "orchestration" ? "Orchestration" : displayText(group.kind, DISPLAY_LIMITS.name)}</span>
-                  <span className="agent-cards-group-label">{displayText(group.label, DISPLAY_LIMITS.name)}</span>
-                  <span className="agent-cards-group-count" data-testid="agent-cards-group-count">{group.total} {group.total === 1 ? "agent" : "agents"} · {group.needYou} {group.needYou === 1 ? "needs" : "need"} you</span>
-                </h3>
-                <div className="agent-cards-grid">
-                  {group.cards.map((card) => <AgentCard key={`${card.entry.instance_id}\u0000${card.entry.key}`} card={card} controls={controls} results={results?.(card)} />)}
-                </div>
-              </section>
-            ))}
-          </div>
-        );
-      })}
     </section>
+  );
+}
+
+/**
+ * PRD #2374 — one daemon's cards, the body of that daemon's section in the
+ * Cards view (its header, with the daemon's own controls, stays above it):
+ * grouped as the daemon groups them (by the dispatcher that started it, its
+ * orchestration, or neither), each group headed by its label and its counts,
+ * in the daemon's order. The Needs you filter hides the cards the daemon did
+ * not mark.
+ */
+export function AgentCardsDeckBody({ deckId, cards, needsYouOnly, controls, results }: {
+  deckId: string;
+  cards: readonly PlacedCard[];
+  needsYouOnly: boolean;
+  controls: CardControls;
+  /** The last answer to each action pressed on a card, to show under its primary button. */
+  results?: (card: PlacedCard) => CardResults;
+}) {
+  const groups = groupCards([...cards], needsYouOnly);
+  if (groups.length === 0) return null;
+  return (
+    <div className="agent-cards-deck" data-testid={`agent-cards-deck-${domIdentity(deckId)}`}>
+      {groups.map((group) => (
+        <section className="agent-cards-group" key={group.key} data-testid="agent-cards-group" data-group-kind={group.kind} aria-label={group.label}>
+          <h3 className="agent-cards-group-heading">
+            <span className="section-kicker">{group.kind === "standalone" ? "Standalone" : group.kind === "dispatcher" ? "Dispatcher" : group.kind === "orchestration" ? "Orchestration" : displayText(group.kind, DISPLAY_LIMITS.name)}</span>
+            <span className="agent-cards-group-label">{displayText(group.label, DISPLAY_LIMITS.name)}</span>
+            <span className="agent-cards-group-count" data-testid="agent-cards-group-count">{group.total} {group.total === 1 ? "agent" : "agents"} · {group.needYou} {group.needYou === 1 ? "needs" : "need"} you</span>
+          </h3>
+          <div className="agent-cards-grid">
+            {group.cards.map((card) => <AgentCard key={`${card.entry.instance_id}\u0000${card.entry.key}`} card={card} controls={controls} results={results?.(card)} />)}
+          </div>
+        </section>
+      ))}
+    </div>
   );
 }

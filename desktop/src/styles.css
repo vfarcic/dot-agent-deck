@@ -2088,7 +2088,6 @@ button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-
 .agent-cards-filter.is-on { color: var(--amber); border-color: var(--amber-rim); background: var(--amber-soft); }
 .agent-cards-empty { margin: 0; padding: 14px; border: 1px dashed var(--line); border-radius: 6px; color: var(--muted); font-size: var(--text-base); text-align: center; }
 .agent-cards-deck { display: grid; gap: 12px; }
-.agent-cards-deck-name { margin: 6px 0 0; font-size: var(--text-lg); }
 .agent-cards-group { display: grid; gap: 8px; }
 .agent-cards-group-heading { margin: 0; display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; font-size: var(--text-base); }
 .agent-cards-group-label { overflow-wrap: anywhere; }

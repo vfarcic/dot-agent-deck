@@ -804,6 +804,19 @@ fn next_report_nonce() -> String {
     )
 }
 
+/// PRD #2374: `task` followed by the agent-card catalog's text block —
+/// exactly `"\n\n"` + [`crate::card_catalog::dispatch_text`].
+pub(crate) fn with_card_catalog(
+    task: &str,
+    catalog: &crate::card_catalog::ResolvedCatalog,
+) -> String {
+    let bin = crate::platform::paths::binary_name();
+    format!(
+        "{task}\n\n{}",
+        crate::card_catalog::dispatch_text(catalog, &bin)
+    )
+}
+
 /// PRD #220 M2.3: what a dispatched unit is actually prompted with.
 ///
 /// An ORCHESTRATION dispatch passes the task through UNCHANGED. `spawn` composes
@@ -836,19 +849,6 @@ fn next_report_nonce() -> String {
 /// directory called `$THE_VARIABLE`. `None` (an unresolvable repository) omits
 /// the paragraph rather than guessing a path — a unit told the wrong durable
 /// location writes there and nobody notices.
-/// PRD #2374: `task` followed by the agent-card catalog's text block —
-/// exactly `"\n\n"` + [`crate::card_catalog::dispatch_text`].
-pub(crate) fn with_card_catalog(
-    task: &str,
-    catalog: &crate::card_catalog::ResolvedCatalog,
-) -> String {
-    let bin = crate::platform::paths::binary_name();
-    format!(
-        "{task}\n\n{}",
-        crate::card_catalog::dispatch_text(catalog, &bin)
-    )
-}
-
 fn dispatch_prompt(
     task: &str,
     target: &crate::spawn::SpawnTarget,

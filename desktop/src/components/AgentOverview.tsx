@@ -39,7 +39,7 @@ import { DeckAttention } from "./DeckAttention";
 import { useAgentCardsView, type AgentCardsView } from "../hooks/useAgentCardsView";
 import type { PlacedCard } from "../lib/agentCards";
 import { OverviewModeSwitch } from "./OverviewModeSwitch";
-import { AgentCardsGrid } from "./AgentCardsGrid";
+import { AgentCardsDeckBody, AgentCardsToolbar } from "./AgentCardsGrid";
 import { AgentCardOverlay } from "./AgentCardOverlay";
 import { OverviewRowCard } from "./OverviewRowMenu";
 
@@ -1404,6 +1404,20 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   const openCardAgent = useCallback((target: { deckId: string; agentId: string; incarnation?: string }) => {
     VOICE_ACTIONS.openAgent.run(voiceContext, { ...target, from: "overview" });
   }, [voiceContext]);
+  /* PRD #2374 — in the Cards view, the cards of a deck whose daemon has them,
+     after the dashboard filter; `undefined` for a deck that keeps its usual
+     body (the Table view, or a daemon with no cards or not answering). */
+  const cardsOnScreen = (deck: (typeof decks)[number]): PlacedCard[] | undefined => {
+    const deckId = deck.snapshot.connection.deckId;
+    if (cards.mode !== "cards" || !deck.connected || deckId === undefined || !cards.decksWithCards.has(deckId)) return undefined;
+    return cards.placed.filter((card) => card.deckId === deckId && (!filtering || cardMatchesFilter(card, deck.matchingAgents)));
+  };
+  const cardsBodyFor = (deck: (typeof decks)[number]): ReactNode | undefined => {
+    const shown = cardsOnScreen(deck);
+    const deckId = deck.snapshot.connection.deckId;
+    if (shown === undefined || deckId === undefined) return undefined;
+    return <AgentCardsDeckBody deckId={deckId} cards={shown} needsYouOnly={cards.needsYouOnly} controls={cards.controls} results={cards.resultsFor} />;
+  };
   const cards = useAgentCardsView({ runtime, decks: cardDeckList, openAgent: openCardAgent });
   const [confirm, setConfirm] = useState<ConfirmState>();
   /** PRD #1487 M5 — the Upgrade dialog, for the deck whose card it was pressed on. */
@@ -1859,22 +1873,12 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
             `.map`, and `DaemonBody` below took a `fleetSize` for its note
             density and nothing else.
           */}
-          {cards.mode === "cards" && (
-            <AgentCardsGrid
-              decks={decks.flatMap((deck) => {
-                const deckId = deck.snapshot.connection.deckId;
-                return deck.connected && deckId !== undefined && cards.decksWithCards.has(deckId)
-                  ? [{ deckId, name: deckName(deck.snapshot.connection), cards: cards.placed.filter((card) => card.deckId === deckId && (!filtering || cardMatchesFilter(card, deck.matchingAgents))) }]
-                  : [];
-              })}
-              needsYouOnly={cards.needsYouOnly}
-              controls={cards.controls}
-              results={cards.resultsFor}
-            />
-          )}
-          {/* PRD #2374 — in the Cards view, a deck whose daemon has no cards
-              (or that is not answering) keeps its own section as before. */}
-          {decks.filter((deck) => cards.mode === "table" || !deck.connected || deck.snapshot.connection.deckId === undefined || !cards.decksWithCards.has(deck.snapshot.connection.deckId)).map((deck) => (
+          {cards.mode === "cards" && <AgentCardsToolbar cards={decks.flatMap((deck) => cardsOnScreen(deck) ?? [])} needsYouOnly={cards.needsYouOnly} controls={cards.controls} />}
+          {/* PRD #2374 — in the Cards view every deck keeps its own section and
+              header, with the daemon's own controls; a deck whose daemon has
+              cards shows them as the section's body, and one with no cards (or
+              that is not answering) keeps its usual body. */}
+          {decks.map((deck) => (
             <DeckGroup
               /*
                 PRD #742 M5: the KEY, not the label. `socketPath` is
@@ -1885,6 +1889,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
               */
               key={deck.key}
               deck={deck}
+              cardsBody={cardsBodyFor(deck)}
               now={now}
               columns={columns}
               filtering={filtering}
@@ -2032,8 +2037,10 @@ function startErrorKey(deckId: string | undefined): string {
   return deckId ?? "";
 }
 
-function DeckGroup({ deck, now, columns, filtering, fleetSize, overrideError, startError, onOpenDeck, onAddDaemon, onReconnect, onStartDaemon, onConnectAnyway, onUpgrade, upgradeLabel, upgradeTitle, onStopDaemon, stopDaemonReason, onReplaceDaemon, onNewAgent, hostOpen, onOpenHost, onCloseHost }: {
+function DeckGroup({ deck, cardsBody, now, columns, filtering, fleetSize, overrideError, startError, onOpenDeck, onAddDaemon, onReconnect, onStartDaemon, onConnectAnyway, onUpgrade, upgradeLabel, upgradeTitle, onStopDaemon, stopDaemonReason, onReplaceDaemon, onNewAgent, hostOpen, onOpenHost, onCloseHost }: {
   deck: FleetDeck;
+  /** PRD #2374 — in the Cards view, this deck's cards, shown in place of its agent table. */
+  cardsBody?: ReactNode;
   now: number;
   columns: OverviewColumnId[];
   /** Whether the dashboard filter is set (issue #1496). */
@@ -2187,7 +2194,7 @@ function DeckGroup({ deck, now, columns, filtering, fleetSize, overrideError, st
       {deck.connected && <HookBinaryNotices notices={connection.hookBinaryNotices} />}
 
       <div className="daemon-group-body">
-        <DaemonBody
+        {cardsBody ?? <DaemonBody
           agents={deck.agents}
           sections={deck.sections}
           filtering={filtering}
@@ -2206,7 +2213,7 @@ function DeckGroup({ deck, now, columns, filtering, fleetSize, overrideError, st
           onReplaceDaemon={onReplaceDaemon}
           onNewAgent={onNewAgent}
           onAddDaemon={onAddDaemon}
-        />
+        />}
       </div>
     </section>
   );
