@@ -392,9 +392,8 @@ struct PinnedReceiver {
     /// The component process admitted as the receiver.
     instance: u32,
     /// Issue #2342: the foreground process whose conversation the receiver
-    /// serves: `instance` itself when it was pinned first, else the Claude
-    /// Code process whose background session `instance` runs
-    /// ([`ReceiptArm::background_origin`]).
+    /// serves: the Claude Code process whose background session `instance`
+    /// runs ([`ReceiptArm::background_origin`]), else `instance` itself.
     origin: u32,
 }
 
@@ -902,11 +901,13 @@ impl HubState {
             }
             (Some(_), _) => Err(ArmError::OtherInstance),
             (None, Some(instance)) => {
+                // A background session that pins first keeps its foreground
+                // as the origin, so a later session of it can take over.
                 self.receivers.insert(
                     key.clone(),
                     PinnedReceiver {
                         instance,
-                        origin: instance,
+                        origin: background_origin.unwrap_or(instance),
                     },
                 );
                 Ok(())
@@ -7019,6 +7020,30 @@ mod tests {
         next.close().await;
         let (gone, other) = OnceWaiter::open(&hub, "p", "a", Some(300)).await;
         assert_eq!(other.refused.as_deref(), Some(refused));
+        gone.close().await;
+    }
+
+    /// Issue #2342: a background session whose waiter pins a generation
+    /// first records the foreground that started it as the origin, so a
+    /// later session of that foreground takes the pin over, and the
+    /// foreground itself still meets the pin.
+    #[tokio::test]
+    async fn a_background_session_that_pins_first_keeps_its_foreground_as_origin() {
+        let hub = Arc::new(hub());
+        let (first, armed) = OnceWaiter::open_from(&hub, "p", "a", Some(300), Some(100)).await;
+        assert!(armed.registered.is_some(), "{armed:?}");
+        first.close().await;
+        let (next, armed) = OnceWaiter::open_from(&hub, "p", "a", Some(400), Some(100)).await;
+        assert!(
+            armed.registered.is_some(),
+            "a later session of the same foreground takes over: {armed:?}"
+        );
+        next.close().await;
+        let (gone, other) = OnceWaiter::open(&hub, "p", "a", Some(100)).await;
+        assert_eq!(
+            other.refused.as_deref(),
+            Some(ArmError::OtherInstance.code())
+        );
         gone.close().await;
     }
 

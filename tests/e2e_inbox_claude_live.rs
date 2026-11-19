@@ -980,6 +980,9 @@ fn doorbell_010_live_left_opens_overview_and_the_line_is_not_typed_there() {
     );
     let input = || std::fs::read(claude.deck.workdir().join("overview-input.log")).unwrap();
     let before_left = input();
+    // Issue #2342: the receiver can move to the background session before
+    // the observation below starts, so its log line is looked for from here.
+    let log_before_left = claude.log().len();
     claude.deck.send_keys(b"\x1b[D");
     assert!(
         common::wait_until(Duration::from_secs(10), || claude
@@ -1051,7 +1054,7 @@ fn doorbell_010_live_left_opens_overview_and_the_line_is_not_typed_there() {
     });
     let leaked = leaked.get();
     let left_queue = left_queue.get();
-    let moved = claude.log()[since..]
+    let moved = claude.log()[log_before_left..]
         .contains("inbox: the receiver moved to the conversation's Claude Code background session");
     let listing = claude.listing();
     let message = listing["messages"]
@@ -2371,11 +2374,14 @@ fn claude_054_live_a_conversation_resumed_from_the_background_host_takes_its_mes
     // ("Esc to cancel"), behind which the session takes no wake. Only while
     // Claude Code answers "Still starting" is it pressed again.
     claude.deck.send_keys(b"\x1b");
+    let pressed = std::cell::Cell::new(std::time::Instant::now());
     let returned = common::wait_until(Duration::from_secs(60), || {
         let grid = claude.pane_grid();
         if grid.contains("Still starting") {
-            std::thread::sleep(Duration::from_secs(2));
-            claude.deck.send_keys(b"\x1b");
+            if pressed.get().elapsed() >= Duration::from_secs(2) {
+                claude.deck.send_keys(b"\x1b");
+                pressed.set(std::time::Instant::now());
+            }
             return false;
         }
         !grid.contains(OVERVIEW) && claude.composer().is_some()
@@ -2396,16 +2402,15 @@ fn claude_054_live_a_conversation_resumed_from_the_background_host_takes_its_mes
         "the background session's fork must arm a waiter; {}",
         claude.evidence()
     );
-    // Let the forked session finish starting, with its empty input box on
-    // screen, before the next task.
+    // The forked session is ready for the next task: its waiter is armed and
+    // its empty input box is on screen, with no dialog over it.
     assert!(
         common::wait_until(BUDGET, || claude.listing()["armed"].as_u64().unwrap_or(0)
-            > 0),
-        "the background session's waiter must stay armed; {}",
+            > 0
+            && claude.composer().as_deref() == Some("")),
+        "the background session must be armed with its empty input box on screen; {}",
         claude.evidence()
     );
-    std::thread::sleep(Duration::from_secs(5));
-    claude.expect_composer("");
 
     // A second task must reach the resumed conversation.
     let second = "resumed-task-9a42d7.txt";
