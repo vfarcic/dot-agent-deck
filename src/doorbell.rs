@@ -506,13 +506,13 @@ impl StallClock {
 /// only an idle agent, so without this the mail waits silently. The clock
 /// runs while messages are queued, no native component is armed or due, and
 /// the status reads busy; it starts again when the oldest queued message
-/// changes and whenever the agent's card takes a new frame (`activity`, its
-/// [`crate::state::SessionState::last_activity`]), so an agent that keeps
-/// using tools or changing status never trips it.
+/// changes and whenever the agent's card takes a new frame (`activity`,
+/// [`crate::state::CardActivity`]), so an agent that keeps using tools or
+/// changing status never trips it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct QuietClock {
     oldest: Option<String>,
-    activity: Option<chrono::DateTime<chrono::Utc>>,
+    activity: Option<crate::state::CardActivity>,
     since: Option<Instant>,
 }
 
@@ -526,7 +526,7 @@ impl QuietClock {
         &mut self,
         oldest: Option<&str>,
         busy: bool,
-        activity: Option<chrono::DateTime<chrono::Utc>>,
+        activity: Option<crate::state::CardActivity>,
         now: Instant,
         after: Duration,
     ) -> bool {
@@ -1021,7 +1021,7 @@ async fn run_tick(
     type Admission = (
         Option<crate::state::DoorbellAdmission>,
         bool,
-        Option<(crate::state::SessionStatus, chrono::DateTime<chrono::Utc>)>,
+        Option<(crate::state::SessionStatus, crate::state::CardActivity)>,
     );
     let admissions: Vec<Admission> = {
         let state = state.read().await;
@@ -1453,7 +1453,14 @@ mod tests {
         let after = Duration::from_secs(900);
         let t0 = Instant::now();
         let at = |s| t0 + Duration::from_secs(s);
-        let frame = |ms| chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms);
+        let frame = |ms| {
+            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms).map(|newest_stamp| {
+                crate::state::CardActivity {
+                    newest_stamp,
+                    native_hook_at: None,
+                }
+            })
+        };
         let mut quiet = QuietClock::default();
         assert!(!quiet.observe(Some("m1"), true, frame(1), at(0), after));
         assert!(!quiet.observe(Some("m1"), true, frame(1), at(899), after));
@@ -1477,6 +1484,23 @@ mod tests {
         );
         assert!(!quiet.observe(Some("m2"), true, frame(2), at(5001), after));
         assert!(!quiet.observe(None, true, frame(2), at(9000), after));
+        // A hook stamped behind the card's newest stamp (a lagging clock)
+        // leaves the stamp alone and still counts: it moves the arrival.
+        let mut skewed = QuietClock::default();
+        let stamp = frame(5).unwrap().newest_stamp;
+        let hook = |s| {
+            Some(crate::state::CardActivity {
+                newest_stamp: stamp,
+                native_hook_at: Some(at(s)),
+            })
+        };
+        assert!(!skewed.observe(Some("m1"), true, hook(0), at(0), after));
+        assert!(
+            !skewed.observe(Some("m1"), true, hook(800), at(1000), after),
+            "a hook that left the stamp alone is still activity"
+        );
+        assert!(!skewed.observe(Some("m1"), true, hook(800), at(1899), after));
+        assert!(skewed.observe(Some("m1"), true, hook(800), at(1900), after));
         // An agent that keeps sending frames never trips it.
         let mut working = QuietClock::default();
         for (i, s) in (0..20u64).map(|i| (i, i * 600)) {

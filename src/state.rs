@@ -1043,6 +1043,18 @@ pub struct HookGeneration {
     pub established_ms: i64,
 }
 
+/// Issue #2389: what changes on a card when the deck applies a frame to it,
+/// as [`AppState::agent_status_and_activity`] reads it. Either half moving is
+/// activity: [`SessionState::last_activity`] moves for any frame stamped later
+/// than the card's newest, and [`SessionState::last_native_hook_at`] for every
+/// frame of the agent's own hooks whatever its stamp, so an agent whose clock
+/// lags a stamp the card already holds still counts as active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CardActivity {
+    pub newest_stamp: DateTime<Utc>,
+    pub native_hook_at: Option<std::time::Instant>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionState {
     pub session_id: String,
@@ -8410,14 +8422,13 @@ impl AppState {
     }
 
     /// Issue #2389: [`Self::agent_status`] and the same card's
-    /// [`SessionState::last_activity`], the newest frame the deck applied to
-    /// it, which the doorbell reads to tell an agent still at work from a busy
-    /// reading nothing has refreshed.
+    /// [`CardActivity`], which the doorbell reads to tell an agent still at
+    /// work from a busy reading nothing has refreshed.
     pub fn agent_status_and_activity(
         &self,
         agent_id: &str,
         pane_id: &str,
-    ) -> Option<(SessionStatus, DateTime<Utc>)> {
+    ) -> Option<(SessionStatus, CardActivity)> {
         self.sessions
             .values()
             .filter(|s| {
@@ -8428,7 +8439,15 @@ impl AppState {
                     .cmp(&b.last_activity)
                     .then_with(|| a.session_id.cmp(&b.session_id))
             })
-            .map(|s| (s.status.clone(), s.last_activity))
+            .map(|s| {
+                (
+                    s.status.clone(),
+                    CardActivity {
+                        newest_stamp: s.last_activity,
+                        native_hook_at: s.last_native_hook_at,
+                    },
+                )
+            })
     }
 
     /// Register a pane ID as managed by our app.
@@ -18886,6 +18905,48 @@ mod tests {
     /// shell-activity pair) landing on the same card later moves
     /// `last_activity` but leaves it where it was, so it cannot vouch for an
     /// OpenCode whose plugin stopped reporting.
+    /// Issue #2389 (Qodo on PR #2393): a hook whose producer stamp is behind
+    /// the card's newest leaves `last_activity` where it was, and still moves
+    /// the card's activity the doorbell's quiet clock reads, through its
+    /// arrival.
+    #[test]
+    fn a_hook_stamped_behind_the_card_still_moves_its_activity() {
+        let event = |event_type, timestamp| AgentEvent {
+            session_id: "s1".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp,
+            user_prompt: None,
+            metadata: HashMap::new(),
+            pane_id: Some("orchestrator".to_string()),
+            agent_id: Some("agent-1".to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            background: None,
+            background_revision: None,
+        };
+        let mut state = AppState::default();
+        state.register_pane("orchestrator".to_string());
+        let ahead = Utc::now() + chrono::Duration::minutes(5);
+        state.apply_event(event(EventType::SessionStart, ahead));
+        state.apply_event(event(EventType::Thinking, ahead));
+        let (status, first) = state
+            .agent_status_and_activity("agent-1", "orchestrator")
+            .expect("the card");
+        assert_eq!(status, SessionStatus::Thinking);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        state.apply_event(event(EventType::ToolStart, Utc::now()));
+        let (_, second) = state
+            .agent_status_and_activity("agent-1", "orchestrator")
+            .expect("the card");
+        assert_eq!(second.newest_stamp, first.newest_stamp, "the stamp stays");
+        assert_ne!(second, first, "the hook's arrival is activity");
+    }
+
     #[test]
     fn only_a_native_frame_moves_the_last_native_hook_instant() {
         let event = |event_type| AgentEvent {

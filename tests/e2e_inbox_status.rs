@@ -240,7 +240,9 @@ fn status_044_mail_behind_a_silent_busy_status_is_shown_not_taken() {
             inbox["wake_stalled"] != true && inbox["wake_hold"].is_null(),
             "an agent still sending events must not be reported stuck: {inbox}"
         );
-        std::thread::sleep(Duration::from_millis(250));
+        // The gap between events, observed rather than slept: the deck types
+        // nothing into a pane that reads busy.
+        unchanged(&orch, Duration::from_millis(250));
     }
     // Silence: the agent still reads busy and sends nothing more.
     assert!(
