@@ -42,6 +42,7 @@ What you can do by voice, by screen:
 | A pull request page | [Scroll it, open it in your system browser, or close it](#pull-requests) |
 | Review project commands | [Approve the commands shown and start the orchestration, or cancel](#approving-project-commands) |
 | The star reminder | [Star the repository, be reminded later, or stop being asked](#the-star-reminder) |
+| The Antigravity notice | [Open the issues page, or stop the notice](#the-antigravity-notice) |
 
 "Close" on its own closes what is in front. With a confirmation or an upgrade dialog open, it closes that dialog the way **Cancel** or `Esc` does and leaves everything behind it as it was. With an agent's output **Reader** open, it closes the Reader, unless a confirmation or Settings is open over it, which closes first. While an upgrade is running, the dialog stays open and the app says why; when the dialog is asking whether to restart and stop running agents, "close" answers **Keep current daemon**, so nothing is stopped. In an agent's pane with typing off, **"close this agent"**, **"close the agent"** or **"close agent"** instead asks to end that agent, opening its **Close agent** confirmation. **"Back to dashboard"** closes the pane without ending the agent.
 
@@ -240,6 +241,10 @@ While **Review project commands** is open ([Approving Project Commands](../proje
 ## The star reminder
 
 While the [star reminder](index.md#the-star-reminder) is open, say **"star the repo"** or **"star on GitHub"** to press **Star**, **"remind me later"** or **"not now"** to press **Later**, and **"don't ask again"** or **"stop asking"** to press **Don't ask again**. "Cancel", "never mind" or "close" closes it the way **Later** and `Esc` do. With no reminder showing, these commands do nothing and the app says the reminder is not showing; none of them opens the repository on its own.
+
+## The Antigravity notice
+
+While the [Antigravity notice](../installation.md#antigravity-cli) is open, say **"open issues"** or **"report a problem"** to press **Open issues**, and **"don't show again"** or **"stop showing this"** to press **Don't show again**. "Cancel", "never mind" or "close" closes it the way **Later** and `Esc` do. With no notice showing, these commands do nothing and the app says the notice is not showing.
 
 ## Checking a daemon's machine
 

@@ -97,9 +97,11 @@ import { LaunchCleanupError, StartDaemonError } from "./lib/actionError";
 import { CleanupWarning } from "./components/CleanupWarning";
 import { ProjectTrustDialog } from "./components/ProjectTrustDialog";
 import { StarPromptGate } from "./components/StarPromptDialog";
+import { AntigravityNoticeGate } from "./components/AntigravityNoticeDialog";
 import { TrustRequestGate } from "./components/TrustRequestGate";
 import type { TrustRequestNotice } from "./lib/trustRequests";
 import { chooseShownStarPrompt, useStarPrompt } from "./lib/starPrompt";
+import { chooseShownAntigravityNotice, useAntigravityNotice } from "./lib/antigravityNotice";
 import { approveShownReview, isNotApproved, reviewDeckChangedNotice, useProjectTrustReview, type ProjectTrustView } from "./lib/projectTrust";
 import type { VoiceDirectoriesDto, VoiceNewAgentDto, VoiceOutcomeDto } from "./lib/bridge";
 import { desktopFeaturesOf } from "./types";
@@ -627,6 +629,13 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   const [starNotice, setStarNotice] = useState<string>(); // voice-registry-exempt: Star's sentence in the toast, reporting what the reminder's choice did
   const star = useStarPrompt(runtime, setStarNotice);
   const dismissStarNotice = useCallback(() => setStarNotice(undefined), []);
+  /**
+   * PRD #211 — the Antigravity experimental notice, shown after a New agent
+   * start of Antigravity, on the first and then every hundredth such start
+   * of either client. Open issues' sentence goes in the star toast, which is
+   * the reminders' one place to report a choice.
+   */
+  const antigravityNotice = useAntigravityNotice(runtime, setStarNotice);
   /**
    * Issue #2330 — what the review a deck asked for left behind: approved (and
    * who will start it), declined, or answered elsewhere. The shell's, because
@@ -1239,6 +1248,11 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       starRepo: () => chooseShownStarPrompt("star"),
       remindStarLater: () => chooseShownStarPrompt("later"),
       dismissStarPrompt: () => chooseShownStarPrompt("dismiss"),
+      /* PRD #211 — the Antigravity notice's buttons, while it is showing;
+         with none showing each answers that it is not. */
+      openAntigravityIssues: () => chooseShownAntigravityNotice("open"),
+      remindAntigravityLater: () => chooseShownAntigravityNotice("later"),
+      dismissAntigravityNotice: () => chooseShownAntigravityNotice("dismiss"),
       /* Only while Settings is open and nothing is drawn over it, so `close`
          reads its presence as "Settings is on top" (#1197, PR #1680 review). */
       ...(overlaysOpen.settings && !overlayAbove(document.querySelector(SETTINGS_PANEL)) ? { closeSettings: () => setOverlay(screen, "settings", false) } : {}),
@@ -1467,7 +1481,9 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
         <VoiceControlPanel runtime={runtime} screen={prBrowser ? "pull_request" : view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} directories={readDirectories} newAgent={readNewAgent} newAgentInstance={readNewAgentInstance} endpoints={readEndpoints} pane={voicePane} fleet={runtime.fleet} selectedDeckId={selectedDeckId} confirmationOpen={confirmationOpen || selfUpgradeOpen} reading={settings.loaded ? readingSwitch : undefined} readingAgents={readingAgents} readingDecks={readingDecks} onReadingSwitch={switchReading} onReadingNoticeShown={readingNoticeShown} onVoiceChange={setVoiceOn} agentIncarnations={readAgentIncarnations} numbered={readNumbered} pages={readPager} onChoiceChange={setChoiceOpen} keyboard={panelKeyboard} />
         <ShellSettings runtime={runtime} settings={settings} open={overlaysOpen.settings ?? false} onClose={() => setOverlay(screen, "settings", false)} addDaemonOpen={overlaysOpen.addDaemon ?? false} onCloseAddDaemon={closeAddDaemon} />
         {localUpgrade.target && <UpgradeDialog target={localUpgrade.target} runtime={runtime} onClose={localUpgrade.close} autoStart />}
-        <StarPromptGate due={star.due} ready={starReady} onChoose={star.choose} />
+        {/* PRD #211: one reminder at a time — the star reminder waits while the Antigravity notice is due, and the notice waits behind the star reminder on screen (it is drawn above the pane). */}
+        <StarPromptGate due={star.due} ready={starReady && !antigravityNotice.due} onChoose={star.choose} />
+        <AntigravityNoticeGate due={antigravityNotice.due} ready={starReady} onChoose={antigravityNotice.choose} />
         {/* Issue #2330: a review a deck asked for waits behind what the star reminder waits behind. */}
         <TrustRequestGate runtime={runtime} fleet={runtime.fleet} ready={starReady} onNotice={setTrustNotice} />
         {/* PRD #1401 — LAST, so opening it moves no sibling's position (see above). */}

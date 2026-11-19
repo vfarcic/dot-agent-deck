@@ -1782,6 +1782,13 @@ export interface DeckRuntimeState {
    */
   starPromptLaunch?: () => Promise<boolean>;
   starPromptChoose?: (choice: import("./lib/starPrompt").StarChoice) => Promise<string | undefined>;
+  /**
+   * PRD #211 — whether a New agent start of a command shows the Antigravity
+   * notice, and the user's choice in it. Optional for the same reason; a
+   * runtime without them never shows the notice.
+   */
+  antigravityNoticeStart?: (command: string | undefined) => Promise<boolean>;
+  antigravityNoticeChoose?: (choice: import("./lib/antigravityNotice").NoticeChoice) => Promise<string | undefined>;
   /** The desktop app's own settings, and where they live (PRD #803). */
   getSettings: () => Promise<import("./lib/bridge").DesktopSettingsSnapshotDto>;
   /**

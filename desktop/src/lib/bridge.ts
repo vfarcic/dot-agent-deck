@@ -21,6 +21,7 @@ import type { AnswerOutcomeDto, PendingQuestionDto, QuestionResultDto, QuestionS
 import { pullRequestFromDto } from "./pullRequest";
 import type { ProjectTrust, ProjectTrustTarget } from "./projectTrust";
 import { STAR_THANKS, type StarChoice } from "./starPrompt";
+import { NOTICE_THANKS, type NoticeChoice } from "./antigravityNotice";
 import { DEFAULT_DESKTOP_FEATURES, UNREPORTED } from "../types";
 import type { HandoffEdge,
   AgentBackground,
@@ -2356,6 +2357,19 @@ export interface DeckBridge {
    */
   starPromptChoose?(choice: StarChoice): Promise<string | undefined>;
   /**
+   * PRD #211 — a New agent start of `command` succeeded: whether it shows the
+   * Antigravity notice. The crate counts it only when the command starts
+   * Antigravity, in the notice state the TUI shares. Optional so a test double
+   * need not serve it; a runtime without it never shows the notice.
+   */
+  antigravityNoticeStart?(command: string | undefined): Promise<boolean>;
+  /**
+   * PRD #211 — the user's choice in the Antigravity notice. Resolves Open
+   * issues' sentence (thanks, or where to go when the browser did not open),
+   * and nothing for Later and Don't show again.
+   */
+  antigravityNoticeChoose?(choice: NoticeChoice): Promise<string | undefined>;
+  /**
    * Issue #1198 — which of the app's experimental surfaces to show: the
    * desktop process's own flag, read through its `features::show_desktop_*`
    * wrappers. The runtime asks ONCE at startup (`useDeckRuntime`), and the
@@ -4064,6 +4078,21 @@ class FixtureDeckBridge implements DeckBridge {
     await Promise.resolve();
     this.starAnswered = true;
     return choice === "star" ? STAR_THANKS : undefined;
+  }
+
+  /**
+   * PRD #211 — `?antigravity-notice=1` plays a start the Antigravity notice
+   * shows at, for a command that starts `agy`; any other preview shows none.
+   */
+  async antigravityNoticeStart(command: string | undefined): Promise<boolean> {
+    await Promise.resolve();
+    const startsAgy = (command ?? "").trim().split(/\s+/)[0]?.split("/").pop() === "agy";
+    return startsAgy && new URLSearchParams(window.location.search).get("antigravity-notice") === "1";
+  }
+
+  async antigravityNoticeChoose(choice: NoticeChoice): Promise<string | undefined> {
+    await Promise.resolve();
+    return choice === "open" ? NOTICE_THANKS : undefined;
   }
 
   async newAgentOrchestrations(deckId: string, path: string): Promise<NewAgentOrchestrations> {
@@ -6032,6 +6061,18 @@ export class TauriDeckBridge implements DeckBridge {
   async starPromptChoose(choice: StarChoice): Promise<string | undefined> {
     const invoke = await this.getInvoke();
     const message = await invoke<unknown>("desktop_star_prompt_choose", { choice });
+    return typeof message === "string" ? message : undefined;
+  }
+
+  async antigravityNoticeStart(command: string | undefined): Promise<boolean> {
+    const invoke = await this.getInvoke();
+    /* Only a literal `true` shows the notice, for the star reminder's reason. */
+    return (await invoke<unknown>("desktop_antigravity_notice_start", { command: command ?? null })) === true;
+  }
+
+  async antigravityNoticeChoose(choice: NoticeChoice): Promise<string | undefined> {
+    const invoke = await this.getInvoke();
+    const message = await invoke<unknown>("desktop_antigravity_notice_choose", { choice });
     return typeof message === "string" ? message : undefined;
   }
 

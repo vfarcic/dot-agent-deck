@@ -2218,11 +2218,22 @@ const STAR_PROMPT_LOCK_POLL: std::time::Duration = std::time::Duration::from_mil
 /// update is still made against a fresh read, and refusing there would count
 /// no launch and save no choice at all (Qodo, PR #2321).
 fn lock_star_prompt(path: &Path) -> Result<Option<std::fs::File>, String> {
+    lock_reminder_state(path, "star-prompt-state.json", "star prompt state")
+}
+
+/// The lock [`lock_star_prompt`] describes, for any reminder state shared by
+/// the two clients: `default_name` names the sidecar when `path` has no file
+/// name, and `what` names the state in the error.
+fn lock_reminder_state(
+    path: &Path,
+    default_name: &str,
+    what: &str,
+) -> Result<Option<std::fs::File>, String> {
     let target = resolve_symlink_chain(path);
     let name = target
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "star-prompt-state.json".to_string());
+        .unwrap_or_else(|| default_name.to_string());
     let lock_path = target.with_file_name(format!(".{name}.lock"));
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
@@ -2240,11 +2251,168 @@ fn lock_star_prompt(path: &Path) -> Result<Option<std::fs::File>, String> {
             }
             Err(std::fs::TryLockError::WouldBlock) => {
                 return Err(format!(
-                    "Failed to save the star prompt state: {} stayed locked",
+                    "Failed to save the {what}: {} stayed locked",
                     lock_path.display()
                 ));
             }
             Err(std::fs::TryLockError::Error(_)) => return Ok(None),
+        }
+    }
+}
+
+/// Where the Antigravity experimental notice's state lives:
+/// `antigravity-notice-state.json` in the platform config dir, or the file
+/// `DOT_AGENT_DECK_ANTIGRAVITY_NOTICE` names.
+///
+/// PRD #211: like [`star_prompt_path`], one file the TUI and the desktop app
+/// both read and write, so a start in either counts and Don't show again in
+/// either holds in both.
+pub fn antigravity_notice_path() -> PathBuf {
+    if let Ok(p) = std::env::var("DOT_AGENT_DECK_ANTIGRAVITY_NOTICE") {
+        return PathBuf::from(p);
+    }
+    config_dir().join("antigravity-notice-state.json")
+}
+
+/// The Antigravity experimental notice's state (PRD #211), shared by the TUI
+/// and the desktop app. The words are [`crate::antigravity_notice`]'s.
+///
+/// Every field only ever grows, as [`StarPromptState`]'s do, so folding in
+/// what the other client saved keeps the larger of each.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AntigravityNoticeState {
+    /// Antigravity starts counted, from either client.
+    pub start_count: u64,
+    /// The start the notice was last shown at; `0` when it never was.
+    pub last_prompt_at_start: u64,
+    /// Don't show again, from either client.
+    pub permanently_dismissed: bool,
+}
+
+/// What [`AntigravityNoticeState::record_start`] answers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AntigravityNoticeStart {
+    /// Whether to show the notice for this start.
+    pub show: bool,
+    /// Why the state file could not be read or saved, when it could not.
+    /// The caller says it once per process: the start was still counted in
+    /// what this client answers from.
+    pub problem: Option<String>,
+}
+
+enum AntigravityNoticeRead {
+    State(AntigravityNoticeState),
+    Missing,
+    Unreadable(String),
+}
+
+fn read_antigravity_notice(path: &Path) -> AntigravityNoticeRead {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => match serde_json::from_str::<AntigravityNoticeState>(&contents) {
+            Ok(state) => AntigravityNoticeRead::State(state),
+            Err(err) => AntigravityNoticeRead::Unreadable(format!(
+                "Invalid Antigravity notice state at {}: {err}",
+                path.display()
+            )),
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => AntigravityNoticeRead::Missing,
+        Err(err) => AntigravityNoticeRead::Unreadable(format!(
+            "Failed to read Antigravity notice state at {}: {err}",
+            path.display()
+        )),
+    }
+}
+
+impl AntigravityNoticeState {
+    /// The state in the file at `path`: the default when it is missing or
+    /// cannot be read, with the reason for the second.
+    pub fn load_from(path: &Path) -> (Self, Option<String>) {
+        match read_antigravity_notice(path) {
+            AntigravityNoticeRead::State(state) => (state, None),
+            AntigravityNoticeRead::Missing => (Self::default(), None),
+            AntigravityNoticeRead::Unreadable(why) => (Self::default(), Some(why)),
+        }
+    }
+
+    /// Whether a start at this state's count is one the notice shows at: the
+    /// first, and then the [`crate::antigravity_notice::NOTICE_INTERVAL`]th
+    /// after the last showing, until Don't show again.
+    pub fn is_due(&self) -> bool {
+        !self.permanently_dismissed
+            && self.start_count > 0
+            && (self.last_prompt_at_start == 0
+                || self.start_count.saturating_sub(self.last_prompt_at_start)
+                    >= crate::antigravity_notice::NOTICE_INTERVAL)
+    }
+
+    fn save_to(&self, path: &Path) -> Result<(), String> {
+        let contents = serde_json::to_string_pretty(self)
+            .map_err(|e| format!("Failed to serialize Antigravity notice state: {e}"))?;
+        write_config_atomically(path, contents.as_bytes()).map_err(|e| {
+            format!(
+                "Failed to write Antigravity notice state at {}: {e}",
+                path.display()
+            )
+        })
+    }
+
+    /// Read the file at `path`, apply `change`, and save, as one step against
+    /// the other client (the lock [`lock_star_prompt`] describes). Answers
+    /// the state as changed, which is what the caller answers from even when
+    /// it could not be saved, whether it was saved, and why the file could
+    /// not be read or saved.
+    fn update(path: &Path, change: impl FnOnce(&mut Self)) -> (Self, bool, Option<String>) {
+        let mut problem = None;
+        if let Some(parent) = path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            problem = Some(format!(
+                "Failed to create Antigravity notice directory: {e}"
+            ));
+        }
+        let lock = lock_reminder_state(
+            path,
+            "antigravity-notice-state.json",
+            "Antigravity notice state",
+        );
+        let (mut state, unreadable) = Self::load_from(path);
+        change(&mut state);
+        let saved = match lock {
+            // The other client kept the file locked: save nothing over it.
+            Err(why) => Err(why),
+            Ok(_lock) => state.save_to(path),
+        };
+        let problem = problem.or(unreadable);
+        match saved {
+            Ok(()) => (state, true, problem),
+            Err(why) => (state, false, problem.or(Some(why))),
+        }
+    }
+
+    /// Count a user-started Antigravity start in the file at `path`, and
+    /// answer whether to show the notice for it. A showing is recorded with
+    /// the count, so Later and Open issues need not save anything: the notice
+    /// comes back at the next interval either way.
+    pub fn record_start(path: &Path) -> AntigravityNoticeStart {
+        let mut show = false;
+        let (_, _, problem) = Self::update(path, |state| {
+            state.start_count = state.start_count.saturating_add(1);
+            show = state.is_due();
+            if show {
+                state.last_prompt_at_start = state.start_count;
+            }
+        });
+        AntigravityNoticeStart { show, problem }
+    }
+
+    /// Don't show again, in either client. The error says why it could not be
+    /// saved.
+    pub fn dismiss_permanently(path: &Path) -> Result<(), String> {
+        match Self::update(path, |state| state.permanently_dismissed = true) {
+            (_, true, _) => Ok(()),
+            (_, false, problem) => Err(problem
+                .unwrap_or_else(|| "Failed to save the Antigravity notice state".to_string())),
         }
     }
 }
@@ -4178,6 +4346,160 @@ command = "vim"
             vec![".star.json.lock".to_string(), "star.json".to_string()]
         );
         assert_eq!(StarPromptState::load_from(&path).launch_count, 3);
+    }
+
+    /// PRD #211: the Antigravity notice shows on the first start, then on the
+    /// hundredth start after the last showing, and the file records each.
+    #[test]
+    fn antigravity_notice_shows_first_then_every_hundredth_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notice.json");
+        assert!(
+            AntigravityNoticeState::record_start(&path).show,
+            "first start"
+        );
+        let (state, _) = AntigravityNoticeState::load_from(&path);
+        assert_eq!(state.start_count, 1);
+        assert_eq!(state.last_prompt_at_start, 1);
+        for start in 2..=100 {
+            assert!(
+                !AntigravityNoticeState::record_start(&path).show,
+                "start {start} showed"
+            );
+        }
+        assert!(
+            AntigravityNoticeState::record_start(&path).show,
+            "the hundredth start after the showing did not show"
+        );
+        let (state, _) = AntigravityNoticeState::load_from(&path);
+        assert_eq!((state.start_count, state.last_prompt_at_start), (101, 101));
+        assert!(!AntigravityNoticeState::record_start(&path).show);
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("\"last_prompt_at_start\": 101"), "{saved}");
+    }
+
+    /// PRD #211: Don't show again holds at every later start, however many.
+    #[test]
+    fn antigravity_notice_dont_show_again_is_permanent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notice.json");
+        assert!(AntigravityNoticeState::record_start(&path).show);
+        AntigravityNoticeState::dismiss_permanently(&path).unwrap();
+        for start in 2..=301 {
+            assert!(
+                !AntigravityNoticeState::record_start(&path).show,
+                "start {start} showed"
+            );
+        }
+        let (state, _) = AntigravityNoticeState::load_from(&path);
+        assert!(state.permanently_dismissed);
+        assert_eq!(state.start_count, 301);
+    }
+
+    /// PRD #211: a missing file is a fresh state; missing fields default.
+    #[test]
+    fn antigravity_notice_missing_file_and_fields_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent.json");
+        assert_eq!(
+            AntigravityNoticeState::load_from(&path),
+            (AntigravityNoticeState::default(), None)
+        );
+        std::fs::write(&path, r#"{"permanently_dismissed":true}"#).unwrap();
+        let (state, problem) = AntigravityNoticeState::load_from(&path);
+        assert_eq!(problem, None);
+        assert!(state.permanently_dismissed);
+        assert_eq!((state.start_count, state.last_prompt_at_start), (0, 0));
+        assert!(!AntigravityNoticeState::record_start(&path).show);
+    }
+
+    /// PRD #211: an unreadable file is reported, and the start still answers
+    /// as a fresh state's first; the next save replaces the file.
+    #[test]
+    fn antigravity_notice_unreadable_file_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notice.json");
+        std::fs::write(&path, "not json").unwrap();
+        let start = AntigravityNoticeState::record_start(&path);
+        assert!(start.show);
+        let problem = start.problem.expect("the unreadable file is reported");
+        assert!(
+            problem.contains("Invalid Antigravity notice state"),
+            "{problem}"
+        );
+        let (state, problem) = AntigravityNoticeState::load_from(&path);
+        assert_eq!(problem, None, "the save replaced the unreadable file");
+        assert_eq!(state.start_count, 1);
+    }
+
+    /// PRD #211: a file that cannot be saved is reported for the start and
+    /// for Don't show again; the start still answers.
+    #[test]
+    fn antigravity_notice_unsaveable_file_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, "").unwrap();
+        let path = blocker.join("notice.json");
+        let start = AntigravityNoticeState::record_start(&path);
+        assert!(start.show);
+        assert!(start.problem.is_some());
+        assert!(AntigravityNoticeState::dismiss_permanently(&path).is_err());
+    }
+
+    /// PRD #211: the two clients share the file: starts in either count
+    /// towards the next showing, and Don't show again in either holds in the
+    /// other, even when the other saves a start straight after it.
+    #[test]
+    fn antigravity_notice_the_two_clients_share_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notice.json");
+        assert!(AntigravityNoticeState::record_start(&path).show);
+        for start in 2..=100 {
+            // Each client reads the file at its own start.
+            assert!(!AntigravityNoticeState::record_start(&path).show, "{start}");
+        }
+        assert!(
+            AntigravityNoticeState::record_start(&path).show,
+            "start 101"
+        );
+        AntigravityNoticeState::dismiss_permanently(&path).unwrap();
+        for start in 102..=500 {
+            assert!(!AntigravityNoticeState::record_start(&path).show, "{start}");
+        }
+    }
+
+    /// PRD #211: starts racing on the shared file lose no count and no
+    /// dismissal, under the lock the star reminder uses.
+    #[test]
+    fn antigravity_notice_racing_starts_lose_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notice.json");
+        let start = std::sync::Arc::new(std::sync::Barrier::new(17));
+        let mut threads = Vec::new();
+        for _ in 0..16 {
+            let (path, start) = (path.clone(), start.clone());
+            threads.push(std::thread::spawn(move || {
+                start.wait();
+                AntigravityNoticeState::record_start(&path).show
+            }));
+        }
+        let dismiss = {
+            let (path, start) = (path.clone(), start.clone());
+            std::thread::spawn(move || {
+                start.wait();
+                AntigravityNoticeState::dismiss_permanently(&path).unwrap();
+            })
+        };
+        let shown = threads
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .filter(|shown| *shown)
+            .count();
+        dismiss.join().unwrap();
+        assert!(shown <= 1, "{shown} starts showed the notice");
+        let (state, _) = AntigravityNoticeState::load_from(&path);
+        assert_eq!(state.start_count, 16);
+        assert!(state.permanently_dismissed);
     }
 
     /// PRD #2174: two clients share one file. Launches of either count

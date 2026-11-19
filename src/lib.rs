@@ -22,6 +22,8 @@ pub mod agent_pty;
 pub mod agent_registry;
 // PRD #211: the Antigravity CLI's hook installer.
 pub mod antigravity_hooks_manage;
+// PRD #211: the Antigravity experimental notice's words, shared by both clients.
+pub mod antigravity_notice;
 pub mod attach_recovery;
 pub mod authoring_seeds;
 pub mod bounded_read;

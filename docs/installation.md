@@ -288,6 +288,14 @@ The deck works with Google's [Antigravity CLI](https://antigravity.google/docs/g
 - **Its reason is on the card.** When `agy` waits for a permission or a sign-in, or a turn ends in an error, the card shows `agy`'s own words for it, for example `Approve Bash: rm -f probe.txt` or `Sign in required`: in the TUI under `Dir:`, in the desktop app on the agent's tile.
 - **Turning the hook off.** `agy`'s `/hooks` command lists the deck's hook as `dot-agent-deck`. Turning it off there turns off the card's prompt and tool detail and the deck's message hand-over, and the deck leaves it off when it reinstalls the hook. Turn it on again in `/hooks`.
 
+**Antigravity support is experimental, and a dialog says so.** The first time you start Antigravity from the new-agent form (`Ctrl+n` in the TUI, **New agent** in the desktop app), a dialog titled **Antigravity support is experimental** opens over the new agent. It asks you to tell us how it works for you, whether to report a problem or to let us know it works as expected, and shows the address of the project's issues. After that it comes back about once every 100 Antigravity starts, counting starts in both the TUI and the desktop app. Until you close it, what you type goes to the dialog, not to the agent. Its choices:
+
+- **Open issues** (`o`) opens the page for a new issue in your browser. If no browser opens, the deck shows the address instead. The dialog comes back at the next interval.
+- **Later** (`l` or `Esc`) closes it until the next interval.
+- **Don't show again** (`d`) closes it for good, in both the TUI and the desktop app.
+
+In the desktop app you can also choose by voice ([Voice control](desktop/voice.md)). Agents an orchestration or a dispatch starts, agents a restored session brings back, and an `agy` you type into a shell do not count as starts and never show the dialog.
+
 **Google's terms for automating `agy`.** Google's [Antigravity FAQ](https://antigravity.google/docs/faq#can-i-use-antigravity-cli-headless-mode-in-third-party-coding-agents-or-automate-account-switching) says that "wrapping `agy` inside third-party coding agents or applications, or automating account rotation, is not supported under consumer plans", and, for using [third-party software with an Antigravity login](https://antigravity.google/docs/faq#why-cant-i-use-third-party-software-such-as-claude-code-openclaw-or-opencode-with-my-antigravity-login), recommends a Gemini Enterprise or Google AI Studio API key. The deck runs the `agy` you installed, signed in as you chose. Read Google's FAQ and terms and decide which sign-in to use.
 
 ## Desktop app

@@ -17962,6 +17962,8 @@ mod tests {
         include_str!("../../../src/components/ProjectTrustDialog.tsx");
     /// PRD #2174 — the star reminder's words, which its buttons render.
     const STAR_PROMPT_TS: &str = include_str!("../../../src/lib/starPrompt.ts");
+    /// PRD #211 — the Antigravity notice's words, which its buttons render.
+    const ANTIGRAVITY_NOTICE_TS: &str = include_str!("../../../src/lib/antigravityNotice.ts");
     /// The one rail, shown beside the overview as well as the deck (#1197).
     const NAVIGATION_RAIL_TSX: &str = include_str!("../../../src/components/NavigationRail.tsx");
     const NEW_AGENT_TS: &str = include_str!("../../../src/lib/newAgent.ts");
@@ -17990,7 +17992,7 @@ mod tests {
     /// included — whose control has a voice row, with that row. `docs/develop/voice-first-design.md`
     /// section 5 has the rule; the labels left out on purpose are listed there
     /// with their reasons.
-    const CONTROL_LABELS: [ControlLabel; 33] = [
+    const CONTROL_LABELS: [ControlLabel; 35] = [
         // PRD #2174 — the star reminder's three buttons, each its own row.
         // Shown at startup over the dashboard, never over the New agent form.
         ControlLabel {
@@ -18012,6 +18014,23 @@ mod tests {
             file: STAR_PROMPT_TS,
             said: "Don't ask again",
             row: "dismiss_star_prompt",
+            over_the_form: false,
+        },
+        // PRD #211 — the Antigravity notice's Open issues and Don't show
+        // again, each its own row; its Later is `close`, which closes the
+        // notice on top. Shown after a New agent start, once the form closed.
+        ControlLabel {
+            source: "OPEN_ISSUES = \"Open issues\"",
+            file: ANTIGRAVITY_NOTICE_TS,
+            said: "Open issues",
+            row: "open_antigravity_issues",
+            over_the_form: false,
+        },
+        ControlLabel {
+            source: "DONT_SHOW_AGAIN = \"Don't show again\"",
+            file: ANTIGRAVITY_NOTICE_TS,
+            said: "Don't show again",
+            row: "dismiss_antigravity_notice",
             over_the_form: false,
         },
         // PRD #1885 — the Review project commands dialog, over the New agent
@@ -18470,6 +18489,11 @@ mod tests {
             ("star_repo", "star the repo"),
             ("remind_star_later", "remind me later"),
             ("dismiss_star_prompt", "don't ask again"),
+            // PRD #211 — the Antigravity notice's buttons, and the words the
+            // user docs give for them.
+            ("open_antigravity_issues", "open issues"),
+            ("open_antigravity_issues", "report a problem"),
+            ("dismiss_antigravity_notice", "don't show again"),
             // Issue #2330 — a review the deck asked for: its Approve and Deny.
             ("approve_project_commands", "approve"),
             ("close", "deny it"),

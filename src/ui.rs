@@ -391,6 +391,12 @@ pub enum UiMode {
     /// session. Nothing of it is spawned while this is open. Its state lives in
     /// `UiState::trust_prompt`.
     TrustPrompt,
+    /// PRD #211: the Antigravity experimental notice, shown after a New Agent
+    /// start of Antigravity on the first start and every
+    /// [`crate::antigravity_notice::NOTICE_INTERVAL`]th after. It owns the
+    /// keyboard, so nothing typed reaches the new pane behind it; closing it
+    /// returns to `UiState::antigravity_notice_resume`.
+    AntigravityNotice,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2272,6 +2278,18 @@ struct UiState {
     form_button_rects: Vec<(Action, Rect)>,
     /// Star-prompt state for the "star the repo" reminder dialog.
     star_prompt_state: config::StarPromptState,
+    /// PRD #211: the mode the Antigravity notice returns to when it closes —
+    /// where the New Agent start would have left the user without it.
+    antigravity_notice_resume: UiMode,
+    /// PRD #211: a notice due while the star reminder is open, shown once
+    /// that closes (one dialog at a time).
+    antigravity_notice_pending: bool,
+    /// PRD #211: whether this process has said why the notice's state file
+    /// could not be read or saved; it says so once.
+    antigravity_notice_problem_reported: bool,
+    /// PRD #211: the notice's state file, shared with the desktop app
+    /// ([`config::antigravity_notice_path`]).
+    antigravity_notice_path: std::path::PathBuf,
     /// Config generation state — tracks directories where user chose "Never".
     config_gen_state: config::ConfigGenState,
     /// Pane ID + cwd for the pending config-gen modal prompt. PRD #1666 part 2
@@ -2733,6 +2751,10 @@ impl UiState {
             drawn_pane_rects: Vec::new(),
             last_click: None,
             star_prompt_state: config::StarPromptState::default(),
+            antigravity_notice_resume: UiMode::PaneInput,
+            antigravity_notice_pending: false,
+            antigravity_notice_problem_reported: false,
+            antigravity_notice_path: config::antigravity_notice_path(),
             config_gen_state: config::ConfigGenState::load(),
             config_gen_target: None,
             config_gen_selected: 0,
@@ -5669,6 +5691,14 @@ pub enum Action {
     StarSnooze,
     /// PRD #80 M5: star-prompt `[Dismiss]` — stop asking permanently (== `d`).
     StarDismiss,
+    /// PRD #211: Antigravity notice `[Open issues]` — open the new-issue
+    /// page (== `o`).
+    AntigravityNoticeOpen,
+    /// PRD #211: Antigravity notice `[Later]` — close it until the next
+    /// interval (== `l` / Esc).
+    AntigravityNoticeLater,
+    /// PRD #211: Antigravity notice `[Don't show again]` (== `d`).
+    AntigravityNoticeDismiss,
     /// PRD #80 M6: filter-row `[Apply]` — commit the filter and return to
     /// Normal, KEEPING the typed filter text (== Enter in filter mode).
     ApplyFilter,
@@ -8189,25 +8219,108 @@ fn handle_star_prompt_key(key: KeyEvent, ui: &mut UiState) -> Action {
         KeyCode::Char('s') => {
             let msg = star_repo_and_report();
             let saved = ui.star_prompt_state.dismiss_permanently();
-            ui.mode = UiMode::Normal;
+            close_star_prompt(ui);
             ui.status_message = Some((msg, std::time::Instant::now()));
             report_star_save(ui, saved);
             Action::Continue
         }
         KeyCode::Char('l') | KeyCode::Esc => {
             let saved = ui.star_prompt_state.snooze();
-            ui.mode = UiMode::Normal;
+            close_star_prompt(ui);
             report_star_save(ui, saved);
             Action::Continue
         }
         KeyCode::Char('d') => {
             let saved = ui.star_prompt_state.dismiss_permanently();
-            ui.mode = UiMode::Normal;
+            close_star_prompt(ui);
             report_star_save(ui, saved);
             Action::Continue
         }
         _ => Action::Continue,
     }
+}
+
+/// Close the star reminder, opening the Antigravity notice when one waited
+/// behind it (PRD #211: one dialog at a time).
+fn close_star_prompt(ui: &mut UiState) {
+    ui.mode = UiMode::Normal;
+    if std::mem::take(&mut ui.antigravity_notice_pending) {
+        open_antigravity_notice(ui);
+    }
+}
+
+/// PRD #211: count a user-started Antigravity start and, when it is one the
+/// notice shows at, open it over the new pane. Called from the New Agent
+/// form's successful non-orchestration start only, so orchestration and
+/// dispatch spawns, restores and `agy` typed into a shell never count.
+fn record_antigravity_start(ui: &mut UiState) {
+    let start = config::AntigravityNoticeState::record_start(&ui.antigravity_notice_path);
+    if let Some(problem) = start.problem
+        && !std::mem::replace(&mut ui.antigravity_notice_problem_reported, true)
+    {
+        ui.status_message = Some((problem, std::time::Instant::now()));
+    }
+    if start.show {
+        open_antigravity_notice(ui);
+    }
+}
+
+/// Open the Antigravity notice over whatever the user is in, which it returns
+/// to; behind the star reminder when that is open.
+fn open_antigravity_notice(ui: &mut UiState) {
+    match ui.mode {
+        UiMode::StarPrompt => ui.antigravity_notice_pending = true,
+        UiMode::AntigravityNotice => {}
+        mode => {
+            ui.antigravity_notice_resume = mode;
+            ui.mode = UiMode::AntigravityNotice;
+        }
+    }
+}
+
+/// Close the Antigravity notice, returning where the start left the user.
+fn close_antigravity_notice(ui: &mut UiState) {
+    ui.mode = ui.antigravity_notice_resume;
+}
+
+/// Open the repository's new-issue page and build the status message for
+/// whichever way that went.
+fn open_antigravity_issues_and_report() -> String {
+    crate::antigravity_notice::open_issues_message(
+        open::that(crate::antigravity_notice::new_issue_url()).is_ok(),
+    )
+}
+
+/// PRD #211: the notice's three choices, shared by its keys and buttons.
+fn choose_antigravity_notice(ui: &mut UiState, choice: Action) {
+    match choice {
+        Action::AntigravityNoticeOpen => {
+            let msg = open_antigravity_issues_and_report();
+            close_antigravity_notice(ui);
+            ui.status_message = Some((msg, std::time::Instant::now()));
+        }
+        Action::AntigravityNoticeDismiss => {
+            let saved =
+                config::AntigravityNoticeState::dismiss_permanently(&ui.antigravity_notice_path);
+            close_antigravity_notice(ui);
+            if let Err(why) = saved {
+                ui.status_message = Some((why, std::time::Instant::now()));
+            }
+        }
+        // Later saves nothing: the showing was recorded with the start.
+        _ => close_antigravity_notice(ui),
+    }
+}
+
+fn handle_antigravity_notice_key(key: KeyEvent, ui: &mut UiState) -> Action {
+    let choice = match key.code {
+        KeyCode::Char('o') => Action::AntigravityNoticeOpen,
+        KeyCode::Char('l') | KeyCode::Esc => Action::AntigravityNoticeLater,
+        KeyCode::Char('d') => Action::AntigravityNoticeDismiss,
+        _ => return Action::Continue,
+    };
+    choose_antigravity_notice(ui, choice);
+    Action::Continue
 }
 
 fn handle_config_gen_prompt_key(key: KeyEvent, ui: &mut UiState) -> Action {
@@ -10745,7 +10858,13 @@ fn global_action_for_mode(kb: &KeybindingConfig, mode: UiMode, key: &KeyEvent) -
     // tab switch or a new pane cannot slip in under an upgrade's question.
     // PRD #1885: so does the trust prompt: nothing may open, switch or spawn
     // under a question about what is about to run.
-    if mode == UiMode::CloseConfirm || mode == UiMode::Upgrade || mode == UiMode::TrustPrompt {
+    // PRD #211: and so does the Antigravity notice, which opens over a pane
+    // the user was about to type into: no key may act behind it.
+    if mode == UiMode::CloseConfirm
+        || mode == UiMode::Upgrade
+        || mode == UiMode::TrustPrompt
+        || mode == UiMode::AntigravityNotice
+    {
         return None;
     }
     let resolved = global_action(kb, key).or_else(|| {
@@ -11072,6 +11191,8 @@ fn modal_owns_clicks(mode: &UiMode) -> bool {
             | UiMode::CloseConfirm
             | UiMode::ConfigGenPrompt
             | UiMode::StarPrompt
+            // PRD #211: its buttons live in `modal_button_rects` too.
+            | UiMode::AntigravityNotice
             | UiMode::Help
             // PRD #1258 M3: the host overlay's [Close] button lives
             // in `modal_button_rects`, like help's.
@@ -11117,6 +11238,8 @@ fn overlay_blocks_mouse(mode: &UiMode) -> bool {
         | UiMode::CloseConfirm
         | UiMode::ConfigGenPrompt
         | UiMode::StarPrompt
+        // PRD #211: the Antigravity notice covers the pane it opened over.
+        | UiMode::AntigravityNotice
         | UiMode::Help
         | UiMode::DirPicker
         | UiMode::NewPaneForm
@@ -12471,6 +12594,9 @@ fn dispatch_action(
                     } else {
                         AgentType::from_command(Some(req.command.as_str()))
                     };
+                    // PRD #211: a user-started Antigravity start counts towards
+                    // the experimental notice, once the daemon accepts it.
+                    let starts_antigravity = spawn_agent_type == Some(AgentType::Antigravity);
                     // PRD #20 M8: Wrapper-strategy agents (Codex is the only
                     // one) launch WRAPPED so their stdout is monitored
                     // transparently, but the wrap is applied by the DAEMON, not
@@ -12636,6 +12762,11 @@ fn dispatch_action(
                             // this path — commit the submit candidate as the
                             // global last-command.
                             ui.commit_pending_last_command();
+                            // PRD #211: over the new pane, which it returns
+                            // focus to when it closes.
+                            if starts_antigravity {
+                                record_antigravity_start(ui);
+                            }
                         }
                         Err(e) => {
                             ui.status_message =
@@ -12701,21 +12832,27 @@ fn dispatch_action(
         Action::StarConfirm => {
             let msg = star_repo_and_report();
             let saved = ui.star_prompt_state.dismiss_permanently();
-            ui.mode = UiMode::Normal;
+            close_star_prompt(ui);
             ui.status_message = Some((msg, std::time::Instant::now()));
             report_star_save(ui, saved);
         }
         // star-prompt [Snooze]: snooze (== `l` / Esc).
         Action::StarSnooze => {
             let saved = ui.star_prompt_state.snooze();
-            ui.mode = UiMode::Normal;
+            close_star_prompt(ui);
             report_star_save(ui, saved);
         }
         // star-prompt [Dismiss]: stop asking permanently (== `d`).
         Action::StarDismiss => {
             let saved = ui.star_prompt_state.dismiss_permanently();
-            ui.mode = UiMode::Normal;
+            close_star_prompt(ui);
             report_star_save(ui, saved);
+        }
+        // PRD #211: the Antigravity notice's buttons (== `o`, `l`, `d`).
+        choice @ (Action::AntigravityNoticeOpen
+        | Action::AntigravityNoticeLater
+        | Action::AntigravityNoticeDismiss) => {
+            choose_antigravity_notice(ui, choice);
         }
         // ===== PRD #80 M6: inline-edit button actions =====
         // filter [Apply]: commit and keep the typed filter (== Enter).
@@ -14449,6 +14586,14 @@ fn handle_key_event(
                 gated
             }
             UiMode::StarPrompt => handle_star_prompt_key(key, ui),
+            // PRD #211: `Ctrl+C` keeps its PRD #40 safety net; leaving for the
+            // quit flow closes the notice as Later does.
+            UiMode::AntigravityNotice if is_ctrl_c => {
+                ui.quit_confirm_selected = 0;
+                ui.mode = UiMode::QuitConfirm;
+                Action::Continue
+            }
+            UiMode::AntigravityNotice => handle_antigravity_notice_key(key, ui),
             UiMode::ConfigGenPrompt => handle_config_gen_prompt_key(key, ui),
             UiMode::QuitConfirm => {
                 // PRD #92 F1: the dialog needs to know the
@@ -19146,6 +19291,9 @@ fn draw_modal(frame: &mut Frame, area: Rect, ui: &mut UiState) {
     if ui.mode == UiMode::StarPrompt {
         confirmation = Some(render_star_prompt(frame, area));
     }
+    if ui.mode == UiMode::AntigravityNotice {
+        confirmation = Some(render_antigravity_notice(frame, area));
+    }
     if ui.mode == UiMode::ConfigGenPrompt {
         confirmation = Some(render_config_gen_prompt(
             frame,
@@ -21385,6 +21533,9 @@ fn confirmation_awaits_frame(ui: &UiState) -> bool {
             | UiMode::StopConfirm
             | UiMode::ConfigGenPrompt
             | UiMode::StarPrompt
+            // PRD #211: nor does input typed before the Antigravity notice
+            // was on screen answer it.
+            | UiMode::AntigravityNotice
             // PRD #1885: input typed before the trust prompt was on screen
             // never approves it.
             | UiMode::TrustPrompt
@@ -21421,6 +21572,16 @@ fn refuse_undrawn_choice(key: &KeyEvent, ui: &UiState) -> Option<Action> {
         UiMode::StarPrompt => {
             let choice = match key.code {
                 KeyCode::Char('s') => 0,
+                KeyCode::Char('l') => 1,
+                KeyCode::Char('d') => 2,
+                _ => return None,
+            };
+            return (!shown.contains(choice)).then_some(Action::Continue);
+        }
+        // PRD #211: the same rule for the Antigravity notice's `o`, `l`, `d`.
+        UiMode::AntigravityNotice => {
+            let choice = match key.code {
+                KeyCode::Char('o') => 0,
                 KeyCode::Char('l') => 1,
                 KeyCode::Char('d') => 2,
                 _ => return None,
@@ -21876,6 +22037,135 @@ fn render_star_prompt(frame: &mut Frame, area: Rect) -> ConfirmDrawing {
     let inner = popup_area.inner(ratatui::layout::Margin::new(1, 1));
     let (line, labels) = STAR_PROMPT_KEYS;
     let row = key_line.and_then(|n| inner.y.checked_add(n));
+    let cells = labels
+        .iter()
+        .map(|label| {
+            let offset = line.find(label).and_then(|i| u16::try_from(i).ok());
+            let x = offset.and_then(|i| inner.x.checked_add(2)?.checked_add(i));
+            (
+                x.unwrap_or(inner.x),
+                row.filter(|_| x.is_some()),
+                (*label).to_string(),
+            )
+        })
+        .collect();
+    ConfirmDrawing {
+        buttons: render_confirm_buttons(frame, &buttons, btn_row),
+        choices: ConfirmChoices { inner, cells },
+    }
+}
+
+/// PRD #211: the Antigravity notice's key line, and the choices on it in key
+/// order: Open issues, Later, Don't show again.
+const ANTIGRAVITY_NOTICE_KEYS: (&str, [&str; 3]) = (
+    "o Open issues  l Later  d Don't show again",
+    ["o Open issues", "l Later", "d Don't show again"],
+);
+
+/// Greedy word wrap of `text` into lines of at most `width` columns; a word
+/// longer than `width` gets a line of its own.
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for word in text.split_whitespace() {
+        match lines.last_mut() {
+            Some(line) if line.chars().count() + 1 + word.chars().count() <= width => {
+                line.push(' ');
+                line.push_str(word);
+            }
+            _ => lines.push(word.to_string()),
+        }
+    }
+    lines
+}
+
+/// PRD #211: the Antigravity notice. As wide as its request needs, capped
+/// by the terminal, where the request wraps.
+fn render_antigravity_notice(frame: &mut Frame, area: Rect) -> ConfirmDrawing {
+    use crate::antigravity_notice::{BODY, TITLE, issues_display};
+    /// The two-space indent, the borders, and a column of right margin.
+    const CHROME: u16 = 2 + 2 + 1;
+    let issues = issues_display();
+    let widest = [BODY, issues.as_str(), ANTIGRAVITY_NOTICE_KEYS.0, TITLE]
+        .iter()
+        .map(|line| u16::try_from(line.chars().count()).unwrap_or(u16::MAX))
+        .max()
+        .unwrap_or(0)
+        .saturating_add(CHROME);
+    let popup_width = widest.min(area.width.saturating_sub(4));
+    let body = wrap_words(BODY, usize::from(popup_width.saturating_sub(CHROME)).max(1));
+
+    let mut text = vec![Line::from("")];
+    text.extend(
+        body.iter()
+            .map(|line| Line::styled(format!("  {line}"), text_primary())),
+    );
+    text.extend([
+        Line::from(""),
+        Line::styled(
+            format!("  {issues}"),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::UNDERLINED),
+        ),
+        Line::from(""),
+        Line::styled(format!("  {}", ANTIGRAVITY_NOTICE_KEYS.0), text_primary()),
+    ]);
+    // Where the key line puts each of its choices, so the frame as flushed
+    // can be read back for which of them it shows (issue #1799's rule).
+    let key_line = u16::try_from(text.len() - 1).ok();
+    // The text, the button row and the two borders.
+    let wanted = u16::try_from(text.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(3);
+    let popup_height = wanted.min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+    let block = Block::default()
+        .title(format!(" {TITLE} "))
+        .title_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow));
+    frame.render_widget(Paragraph::new(text).block(block), popup_area);
+
+    let buttons = [
+        Button::new(
+            crate::antigravity_notice::OPEN_ISSUES,
+            "",
+            Action::AntigravityNoticeOpen,
+            true,
+        ),
+        Button::new(
+            crate::antigravity_notice::LATER,
+            "",
+            Action::AntigravityNoticeLater,
+            true,
+        ),
+        Button::new(
+            crate::antigravity_notice::DONT_SHOW_AGAIN,
+            "",
+            Action::AntigravityNoticeDismiss,
+            true,
+        ),
+    ];
+    let btn_row = Rect {
+        x: popup_area.x + 1,
+        y: popup_area.y + popup_area.height.saturating_sub(2),
+        width: popup_area.width.saturating_sub(2),
+        height: 1,
+    };
+    let inner = popup_area.inner(ratatui::layout::Margin::new(1, 1));
+    let (line, labels) = ANTIGRAVITY_NOTICE_KEYS;
+    // A key line the popup cut off shows none of its choices.
+    let row = key_line
+        .filter(|n| *n < inner.height.saturating_sub(1))
+        .and_then(|n| inner.y.checked_add(n));
     let cells = labels
         .iter()
         .map(|label| {
@@ -42538,6 +42828,7 @@ mod tests {
             UiMode::CloseConfirm,
             UiMode::ConfigGenPrompt,
             UiMode::StarPrompt,
+            UiMode::AntigravityNotice,
             UiMode::Help,
             UiMode::DirPicker,
             UiMode::NewPaneForm,
@@ -45580,7 +45871,8 @@ mod tests {
             | UiMode::InboxAttention
             | UiMode::RestartNotice
             | UiMode::CopyMode
-            | UiMode::TrustPrompt => mode,
+            | UiMode::TrustPrompt
+            | UiMode::AntigravityNotice => mode,
         }
     }
 
@@ -45607,6 +45899,7 @@ mod tests {
             UiMode::RestartNotice,
             UiMode::CopyMode,
             UiMode::TrustPrompt,
+            UiMode::AntigravityNotice,
         ]
         .into_iter()
         .map(assert_exhaustive_ui_mode)
@@ -49970,6 +50263,7 @@ mod tests {
             UiMode::CloseConfirm,
             UiMode::ConfigGenPrompt,
             UiMode::StarPrompt,
+            UiMode::AntigravityNotice,
             UiMode::Help,
             UiMode::DirPicker,
             UiMode::NewPaneForm,
@@ -50468,6 +50762,200 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// PRD #211: a UI whose Antigravity notice state is a scratch file, and
+    /// whose star reminder state is another, so no test touches the user's.
+    fn notice_ui(dir: &std::path::Path) -> UiState {
+        let mut ui = default_ui();
+        ui.antigravity_notice_path = dir.join("notice.json");
+        ui.star_prompt_state = config::StarPromptState::load_from(dir.join("star.json"));
+        ui
+    }
+
+    /// PRD #211: the first Antigravity start opens the notice over the new
+    /// pane; Later, Escape and Don't show again close it back into the pane,
+    /// and only Don't show again saves anything.
+    #[test]
+    fn antigravity_notice_choices_return_to_the_pane() {
+        for code in [KeyCode::Char('l'), KeyCode::Esc, KeyCode::Char('d')] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut ui = notice_ui(dir.path());
+            ui.mode = UiMode::PaneInput;
+            record_antigravity_start(&mut ui);
+            assert_eq!(ui.mode, UiMode::AntigravityNotice, "{code:?}");
+            assert!(matches!(
+                handle_antigravity_notice_key(KeyEvent::from(code), &mut ui),
+                Action::Continue
+            ));
+            assert_eq!(ui.mode, UiMode::PaneInput, "{code:?} left focus elsewhere");
+            assert!(ui.status_message.is_none(), "{code:?}");
+            let (state, _) = config::AntigravityNoticeState::load_from(&ui.antigravity_notice_path);
+            assert_eq!(
+                state.permanently_dismissed,
+                code == KeyCode::Char('d'),
+                "{code:?}"
+            );
+        }
+    }
+
+    /// PRD #211: a key that is not a choice does nothing and keeps the notice
+    /// open, and no global shortcut acts behind it.
+    #[test]
+    fn antigravity_notice_owns_the_keyboard() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ui = notice_ui(dir.path());
+        ui.mode = UiMode::AntigravityNotice;
+        for code in [KeyCode::Char('z'), KeyCode::Enter, KeyCode::Char('s')] {
+            handle_antigravity_notice_key(KeyEvent::from(code), &mut ui);
+            assert_eq!(ui.mode, UiMode::AntigravityNotice, "{code:?}");
+        }
+        let kb = KeybindingConfig::default();
+        for key in [
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+        ] {
+            assert!(
+                global_action_for_mode(&kb, UiMode::AntigravityNotice, &key).is_none(),
+                "{key:?} acted behind the notice"
+            );
+        }
+    }
+
+    /// PRD #211: only the start the notice is due at opens it.
+    #[test]
+    fn antigravity_notice_opens_only_when_due() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ui = notice_ui(dir.path());
+        ui.mode = UiMode::PaneInput;
+        record_antigravity_start(&mut ui);
+        handle_antigravity_notice_key(KeyEvent::from(KeyCode::Char('l')), &mut ui);
+        for _ in 2..=100 {
+            record_antigravity_start(&mut ui);
+            assert_eq!(ui.mode, UiMode::PaneInput);
+        }
+        record_antigravity_start(&mut ui);
+        assert_eq!(ui.mode, UiMode::AntigravityNotice, "the 101st start");
+    }
+
+    /// PRD #211: a notice due while the star reminder is open waits behind
+    /// it, and opens once the reminder closes — one dialog at a time.
+    #[test]
+    fn antigravity_notice_waits_behind_the_star_reminder() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ui = notice_ui(dir.path());
+        ui.mode = UiMode::StarPrompt;
+        record_antigravity_start(&mut ui);
+        assert_eq!(ui.mode, UiMode::StarPrompt, "both dialogs at once");
+        handle_star_prompt_key(KeyEvent::from(KeyCode::Char('l')), &mut ui);
+        assert_eq!(ui.mode, UiMode::AntigravityNotice);
+        handle_antigravity_notice_key(KeyEvent::from(KeyCode::Esc), &mut ui);
+        assert_eq!(ui.mode, UiMode::Normal, "back where the star reminder left");
+    }
+
+    /// PRD #211: a state file that cannot be saved is said once per process,
+    /// and the notice still shows.
+    #[test]
+    fn antigravity_notice_problem_is_said_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, "").unwrap();
+        let mut ui = notice_ui(dir.path());
+        ui.antigravity_notice_path = blocker.join("notice.json");
+        ui.mode = UiMode::PaneInput;
+        record_antigravity_start(&mut ui);
+        assert_eq!(ui.mode, UiMode::AntigravityNotice);
+        assert!(
+            ui.status_message.take().is_some(),
+            "the problem was not said"
+        );
+        handle_antigravity_notice_key(KeyEvent::from(KeyCode::Char('l')), &mut ui);
+        record_antigravity_start(&mut ui);
+        assert!(ui.status_message.is_none(), "the problem was said twice");
+    }
+
+    /// PRD #211: the notice's keys, under `prompt/star/001`'s rule — at a
+    /// height that cuts its key line off, `o`, `l` and `d` choose nothing and
+    /// Escape still closes it; at 80×24 each reaches it, its words are on
+    /// screen and its buttons are clickable. Before its first frame none of
+    /// the three reaches it.
+    #[test]
+    fn antigravity_notice_keys_are_refused_while_their_choices_are_not_drawn() {
+        let keys = [KeyCode::Char('o'), KeyCode::Char('l'), KeyCode::Char('d')];
+        let reached = |ui: &mut UiState, code: KeyCode| {
+            let mut reached = false;
+            guarded(ui, code, |_, _| {
+                reached = true;
+                Action::Continue
+            });
+            reached
+        };
+        let open = || {
+            let mut ui = default_ui();
+            ui.mode = UiMode::AntigravityNotice;
+            ui
+        };
+        for (height, drawn) in [(9u16, false), (24, true)] {
+            let mut ui = open();
+            let rows = draw_sized(&mut ui, 80, height);
+            let shown = rows.join("\n");
+            assert_eq!(
+                on_screen(&rows, ANTIGRAVITY_NOTICE_KEYS.0),
+                drawn,
+                "{height}: precondition:\n{shown}"
+            );
+            for code in keys {
+                assert_eq!(
+                    reached(&mut ui, code),
+                    drawn,
+                    "{height}: {code:?} with its choice drawn={drawn}:\n{shown}"
+                );
+            }
+            assert!(
+                reached(&mut ui, KeyCode::Esc),
+                "{height}: Esc is the way back"
+            );
+            if drawn {
+                assert!(
+                    on_screen(&rows, crate::antigravity_notice::TITLE),
+                    "{shown}"
+                );
+                assert!(
+                    on_screen(&rows, &crate::antigravity_notice::issues_display()),
+                    "{shown}"
+                );
+                for action in ["Open", "Later", "Dismiss"] {
+                    assert!(
+                        ui.modal_button_rects.iter().any(|(a, _)| match action {
+                            "Open" => matches!(a, Action::AntigravityNoticeOpen),
+                            "Later" => matches!(a, Action::AntigravityNoticeLater),
+                            _ => matches!(a, Action::AntigravityNoticeDismiss),
+                        }),
+                        "{height}: [{action}] is not clickable:\n{shown}"
+                    );
+                }
+            }
+
+            let mut ui = open();
+            assert!(confirmation_awaits_frame(&ui), "{height}: not drawn yet");
+            for code in keys {
+                assert!(
+                    !reached(&mut ui, code),
+                    "{height}: {code:?} answered the notice before its first frame"
+                );
+            }
+        }
+    }
+
+    /// PRD #211: the request wraps on a narrow terminal and every word of it
+    /// is still drawn.
+    #[test]
+    fn antigravity_notice_wraps_its_request() {
+        let lines = wrap_words(crate::antigravity_notice::BODY, 40);
+        assert!(lines.len() > 1);
+        assert!(lines.iter().all(|line| line.chars().count() <= 40));
+        assert_eq!(lines.join(" "), crate::antigravity_notice::BODY);
     }
 
     /// Scenario: the user opens the directory picker on a list with `alpha` selected. In a frame so short that the popup shows its current directory but no entry, Enter, `l` and Right open nothing while Space still picks the current directory it shows; in one too short to show even that, Space picks nothing either. At 80×24, where `alpha` is on screen, Enter opens it; with room for one entry, `j` and Enter in one burst open nothing until `beta` is drawn.

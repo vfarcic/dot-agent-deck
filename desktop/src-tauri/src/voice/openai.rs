@@ -369,6 +369,8 @@ mod tests {
                 "star_repo",
                 "remind_star_later",
                 "dismiss_star_prompt",
+                "open_antigravity_issues",
+                "dismiss_antigravity_notice",
                 "stop_agent",
                 "close_orchestration",
                 "none"

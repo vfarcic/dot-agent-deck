@@ -495,6 +495,22 @@ screen = "overview"
 action = "dismiss_star_prompt"
 outcome = "dispatch"
 
+# PRD #211 — the Antigravity notice's two rows, by their buttons' labels, over
+# the new agent's pane where the notice shows.
+[[fixtures]]
+name = "open-antigravity-issues-by-its-label"
+utterance = "open issues"
+screen = "agent"
+action = "open_antigravity_issues"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dismiss-antigravity-notice-by-its-label"
+utterance = "don't show again"
+screen = "agent"
+action = "dismiss_antigravity_notice"
+outcome = "dispatch"
+
 # Issue #1263 — the deck field once the dialog is open. Over a dialog with no
 # form yet, and over a live form (where a different deck clears the directory);
 # the field's label said with a deck's name; and the deck screen, where there is

@@ -1407,6 +1407,18 @@ mod tests {
                     "dismissStarPrompt",
                     vec!["deck", "overview", "agent"]
                 ),
+                // PRD #211: the Antigravity notice's two rows, on the star
+                // reminder's screens (its Later is `close`).
+                (
+                    "open_antigravity_issues",
+                    "openAntigravityIssues",
+                    vec!["deck", "overview", "agent"]
+                ),
+                (
+                    "dismiss_antigravity_notice",
+                    "dismissAntigravityNotice",
+                    vec!["deck", "overview", "agent"]
+                ),
                 // PRD #802 D5's set: each only opens a confirmation.
                 ("stop_agent", "confirmStopAgent", vec!["overview", "agent"]),
                 (
@@ -2309,7 +2321,9 @@ mod tests {
                 // the app says so.
                 "star_repo",
                 "remind_star_later",
-                "dismiss_star_prompt"
+                "dismiss_star_prompt",
+                "open_antigravity_issues",
+                "dismiss_antigravity_notice"
             ]
         );
         assert_eq!(
@@ -2347,6 +2361,8 @@ mod tests {
                 "star_repo",
                 "remind_star_later",
                 "dismiss_star_prompt",
+                "open_antigravity_issues",
+                "dismiss_antigravity_notice",
                 // PRD #802 D5's two stops: on the overview, where their
                 // controls are. Each only opens a confirmation.
                 "stop_agent",
@@ -2377,6 +2393,8 @@ mod tests {
                 "star_repo",
                 "remind_star_later",
                 "dismiss_star_prompt",
+                "open_antigravity_issues",
+                "dismiss_antigravity_notice",
                 // Issue #1402: ask to close the agent shown in the pane.
                 "stop_agent"
             ]

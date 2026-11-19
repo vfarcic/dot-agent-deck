@@ -425,6 +425,8 @@ mod tests {
                 "star_repo".to_string(),
                 "remind_star_later".to_string(),
                 "dismiss_star_prompt".to_string(),
+                "open_antigravity_issues".to_string(),
+                "dismiss_antigravity_notice".to_string(),
                 "stop_agent".to_string(),
                 "close_orchestration".to_string(),
                 "none".to_string(),
@@ -525,6 +527,8 @@ mod tests {
                 "star_repo",
                 "remind_star_later",
                 "dismiss_star_prompt",
+                "open_antigravity_issues",
+                "dismiss_antigravity_notice",
                 "stop_agent",
                 "close_orchestration",
                 "none"
@@ -746,6 +750,8 @@ mod tests {
                 ("star_repo".to_string(), true),
                 ("remind_star_later".to_string(), true),
                 ("dismiss_star_prompt".to_string(), true),
+                ("open_antigravity_issues".to_string(), true),
+                ("dismiss_antigravity_notice".to_string(), true),
                 ("stop_agent".to_string(), false),
                 ("close_orchestration".to_string(), false),
             ]
@@ -812,6 +818,8 @@ mod tests {
                 ("star_repo".to_string(), true),
                 ("remind_star_later".to_string(), true),
                 ("dismiss_star_prompt".to_string(), true),
+                ("open_antigravity_issues".to_string(), true),
+                ("dismiss_antigravity_notice".to_string(), true),
                 // The D5 stops: on the overview with the New agent dialog
                 // closed (#1260), and each only opens a confirmation.
                 ("stop_agent".to_string(), true),
@@ -875,6 +883,8 @@ mod tests {
                 ("star_repo".to_string(), true),
                 ("remind_star_later".to_string(), true),
                 ("dismiss_star_prompt".to_string(), true),
+                ("open_antigravity_issues".to_string(), true),
+                ("dismiss_antigravity_notice".to_string(), true),
                 ("stop_agent".to_string(), true),
                 ("close_orchestration".to_string(), false),
             ]

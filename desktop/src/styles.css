@@ -1197,7 +1197,8 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 /* PRD #2174 — the star reminder: the confirm card, with the repository under the invitation and each button's key. */
 .star-icon { width: 38px; height: 38px; margin: 2px auto 10px; display: grid; place-items: center; border-radius: 50%; color: var(--teal); background: var(--teal-soft); }
 .confirm-dialog p.star-repo { margin-top: -8px; color: var(--ink); text-decoration: underline; }
-.star-dialog .button kbd { padding: 0 4px; border: 1px solid currentColor; border-radius: 3px; font: inherit; opacity: .7; }
+.star-dialog .button kbd,
+.antigravity-notice-dialog .button kbd { padding: 0 4px; border: 1px solid currentColor; border-radius: 3px; font: inherit; opacity: .7; }
 /* PRD #1487 M5 — the Upgrade / Replace daemon dialog: the confirm card, plus its stages and stop lists. */
 .upgrade-dialog { width: min(440px, 100%); }
 .upgrade-icon { width: 38px; height: 38px; margin: 2px auto 10px; display: grid; place-items: center; border-radius: 50%; color: var(--green); background: var(--green-soft); }

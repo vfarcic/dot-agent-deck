@@ -2190,6 +2190,45 @@ report      = "The star reminder will not ask again."
 asks_to     = "never be asked to star the repository again"
 try_saying  = "don't ask again"
 
+# PRD #211 — the Antigravity experimental notice's buttons. The app shows the
+# notice after a New agent start of Antigravity — the first, then about every
+# hundredth — over the new agent's pane, or over the dashboard when the pane
+# does not open, so the rows run on the screens the star reminder's do. Each
+# chooses only while the notice is showing and nothing is drawn over it, and
+# with no notice showing the app says so and does nothing
+# (`chooseShownAntigravityNotice`). Later has no row: "cancel", "close" and
+# "never mind" are `close`'s, which closes the notice as the overlay on top —
+# Later, as `Esc` is in both clients — and a row of its own would compete with
+# `remind_star_later` for the word "later".
+[[commands]]
+id          = "open_antigravity_issues"
+description = """Open the dot-agent-deck issues page from the Antigravity notice — the notice's Open issues
+button. It opens the repository's new-issue page on GitHub in the browser, to report a problem with
+Antigravity or say that it works. Use for open issues, open the issues, report a problem, report an
+issue, file an issue, or tell them it works. It runs only while the Antigravity notice ("Antigravity
+support is experimental") is showing; with none showing the app says so. Never showing the notice
+again is `dismiss_antigravity_notice`, and closing it until next time is `close`."""
+invoke      = "openAntigravityIssues"
+screens     = ["deck", "overview", "agent"]
+unavailable_hint = "opening the issues page works while the Antigravity notice is showing"
+report      = "Opening the issues page."
+asks_to     = "open the issues page to tell how Antigravity works"
+try_saying  = "open issues"
+
+[[commands]]
+id          = "dismiss_antigravity_notice"
+description = """Stop the Antigravity notice for good — the notice's Don't show again button: neither the
+app nor the TUI shows it again. Use for don't show again, do not show again, never show this again,
+don't show it again, or stop showing this. It runs only while the Antigravity notice ("Antigravity
+support is experimental") is showing; with none showing the app says so. Opening the issues page is
+`open_antigravity_issues`, and closing it until next time is `close`."""
+invoke      = "dismissAntigravityNotice"
+screens     = ["deck", "overview", "agent"]
+unavailable_hint = "dismissing the Antigravity notice works while it is showing"
+report      = "The Antigravity notice will not show again."
+asks_to     = "never be shown the Antigravity notice again"
+try_saying  = "don't show again"
+
 # PRD #1223 x PRD #802 D5 — the two rows that STOP something, and the one rule
 # they share: **each terminates at a `ConfirmDialog`, never at a direct
 # dispatch.** D5 requires confirmation "regardless of model confidence, because
