@@ -5575,12 +5575,14 @@ const SHARED_DECK_DIR: &str = "dad-deck-under-test";
 /// failed per run. One copy per build removes that write load, and with it the
 /// stall. The waits are not what was wrong, so none was raised.
 ///
-/// The copy is named by the build's device, inode, size, modification and
-/// change times, so a rebuild gets a fresh copy rather than reusing a stale
-/// one. Making it, and linking from it, happen under an exclusive `flock` on
-/// a file beside it, so the processes that start together wait for one copy
-/// rather than each making their own. A copy left by an earlier build is
-/// removed when the next one is made. Processes that linked it keep their own
+/// The copy is named by a hash of the build's path, then the build's device,
+/// inode, size, modification and change times, so a rebuild gets a fresh copy
+/// rather than reusing a stale one. Making it, and linking from it, happen
+/// under an exclusive `flock` on a file beside it, so the processes that start
+/// together wait for one copy rather than each making their own. Making a copy
+/// removes the copy of an earlier build from the same path, and only that, so
+/// two checkouts testing against one base keep one copy each instead of
+/// evicting each other's. Processes that linked a removed copy keep their own
 /// links, so removing it does not break a run in progress. The
 /// directory must be ours and `0o700`, as the per-process roots are.
 ///
@@ -5643,8 +5645,21 @@ pub(crate) fn link_through_shared_copy(
     }
 
     let source = std::fs::metadata(built)?;
+    // One slot per build path, so two checkouts or profiles testing against
+    // one base keep a copy each instead of evicting each other's. FNV-1a,
+    // which unlike `DefaultHasher` names a path the same in every toolchain.
+    let slot = {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::fs::canonicalize(built).unwrap_or_else(|_| built.to_path_buf());
+        path.as_os_str()
+            .as_bytes()
+            .iter()
+            .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+            })
+    };
     let name = format!(
-        "dot-agent-deck-{:x}-{:x}-{:x}-{}.{:09}-{}.{:09}",
+        "dot-agent-deck-{slot:016x}-{:x}-{:x}-{:x}-{}.{:09}-{}.{:09}",
         source.dev(),
         source.ino(),
         source.size(),
@@ -5658,13 +5673,20 @@ pub(crate) fn link_through_shared_copy(
         m.file_type().is_file() && m.uid() == effective_uid() && m.size() == source.size()
     });
     if !usable {
+        // This slot's earlier build, and a copy a process of it died making.
+        let ours = [
+            format!("dot-agent-deck-{slot:016x}-"),
+            format!(".partial-{slot:016x}-"),
+        ];
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
-            if entry.file_name() != "lock" {
+            let entry_name = entry.file_name();
+            let entry_name = entry_name.to_string_lossy();
+            if ours.iter().any(|prefix| entry_name.starts_with(prefix)) {
                 let _ = std::fs::remove_file(entry.path());
             }
         }
-        let partial = dir.join(format!(".partial-{}", std::process::id()));
+        let partial = dir.join(format!(".partial-{slot:016x}-{}", std::process::id()));
         std::fs::copy(built, &partial)?;
         std::fs::rename(&partial, &shared)?;
     }

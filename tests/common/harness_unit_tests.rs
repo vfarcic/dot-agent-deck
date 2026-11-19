@@ -7128,7 +7128,8 @@ fn a_stale_opencode_login_in_one_file_does_not_refuse_a_lasting_one_in_another()
 /// Scenario: Two test processes' worth of links are taken from one shared
 /// copy of a stand-in build, then the build changes and a third link is
 /// taken. The first two links share the copy's inode, so the build was copied
-/// once; the change replaces the copy rather than reusing the stale one; and a
+/// once; the change replaces the copy rather than reusing the stale one; a
+/// second build path gets its own copy without evicting the first; and a
 /// shared directory that is not private is refused, so the caller copies
 /// instead (issue #2343).
 #[cfg(unix)]
@@ -7179,10 +7180,68 @@ fn deck_links_share_one_copy_per_build() {
         .collect();
     assert_eq!(copies.len(), 1, "the stale copy is removed: {copies:?}");
 
+    // Another checkout's build, testing against the same base, gets a slot of
+    // its own and leaves this one's copy in place.
+    let other_build = root.path().join("other-checkout").join("built");
+    std::fs::create_dir(other_build.parent().unwrap()).unwrap();
+    std::fs::write(&other_build, b"other build").unwrap();
+    let other = root.path().join("other");
+    link_through_shared_copy(&shared, &other_build, &other).unwrap();
+    let fifth = root.path().join("fifth");
+    link_through_shared_copy(&shared, &built, &fifth).unwrap();
+    assert_eq!(ino(&fifth), ino(&third), "the other build evicted nothing");
+    assert_eq!(std::fs::read(&other).unwrap(), b"other build");
+
     std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
     let fourth = root.path().join("fourth");
     let refused = link_through_shared_copy(&shared, &built, &fourth)
         .expect_err("a shared directory others can read is refused");
     assert!(refused.to_string().contains("0o755"), "{refused}");
     assert!(!fourth.exists());
+}
+
+/// Scenario: Sixteen callers, as many as the first wave of test processes on a
+/// 16-CPU machine, ask for a link to the same stand-in build at the same
+/// moment. Every link holds the build's bytes and shares one inode, and the
+/// shared directory holds one copy, so the `flock` made them wait for one copy
+/// rather than each writing its own (issue #2343). Threads rather than
+/// processes: each call opens the lock file itself, and `flock` locks the open
+/// file description, so threads contend for it as processes do.
+#[cfg(unix)]
+#[test]
+fn deck_links_started_together_share_one_copy() {
+    use std::os::unix::fs::MetadataExt;
+
+    let root = harness_tempdir().unwrap();
+    let built = root.path().join("built");
+    let bytes: Vec<u8> = (0..4 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&built, &bytes).unwrap();
+    let shared = root.path().join("shared");
+    let start = std::sync::Arc::new(std::sync::Barrier::new(16));
+    let links: Vec<PathBuf> = (0..16)
+        .map(|i| root.path().join(format!("link-{i}")))
+        .collect();
+    std::thread::scope(|scope| {
+        for link in &links {
+            let (start, shared, built) = (start.clone(), &shared, &built);
+            scope.spawn(move || {
+                start.wait();
+                link_through_shared_copy(shared, built, link).unwrap();
+            });
+        }
+    });
+    let first = std::fs::metadata(&links[0]).unwrap().ino();
+    for link in &links {
+        assert_eq!(std::fs::metadata(link).unwrap().ino(), first, "{link:?}");
+        assert!(
+            std::fs::read(link).unwrap() == bytes,
+            "{link:?} holds the build"
+        );
+    }
+    let copies: Vec<_> = std::fs::read_dir(&shared)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n != "lock")
+        .collect();
+    assert_eq!(copies.len(), 1, "one copy for sixteen callers: {copies:?}");
 }
