@@ -196,31 +196,30 @@ pub fn input_rejection_keeps_typing(reason: &str) -> bool {
     matches!(reason.trim(), "ctrl-g-refused" | "signal-key-refused")
 }
 
-/// PRD #1666 part 3, round 5-wake (Q6): the deck-wide attention item names a
-/// held orchestrator and counts the other held recipients after it
-/// (`· 1 other held`); with no orchestrator held it only counts (`✉ 2 held`).
-pub const ATTENTION_OTHER_HELD: &str = "other held";
-/// [`ATTENTION_OTHER_HELD`]'s count when no orchestrator is named.
+/// Issue #2387: the marker a held agent's card carries beside its status, and
+/// the word the deck-wide attention item names held agents with
+/// (`✉ held: Captain, coder`) or counts them with (`✉ 4 held`).
 pub const ATTENTION_HELD: &str = "held";
 
+/// Issue #2387: the most held agents [`deck_attention_text`] names; with more
+/// it counts them. The desktop's `DECK_ATTENTION_MAX_NAMES` is the same.
+pub const DECK_ATTENTION_MAX_NAMES: usize = 3;
+
 /// The deck-wide attention item both clients show in their header, the same
-/// words in each: `✉ <orchestrator>: <its hold words> · 1 other held`, or
-/// `✉ 2 held` when no orchestrator is held; `None` when nothing is held.
-/// `named` is the held orchestrator's name and [`CardInbox::attention_words`];
-/// `others` counts every other held recipient, other orchestrators included.
-pub fn deck_attention_text(named: Option<(&str, &str)>, others: usize) -> Option<String> {
-    match named {
-        Some((name, words)) if others > 0 => Some(format!(
-            "{GLYPH} {name}: {words} · {others} {ATTENTION_OTHER_HELD}"
-        )),
-        Some((name, words)) => Some(format!("{GLYPH} {name}: {words}")),
-        None => deck_attention_count(others),
+/// words in each: `✉ held: <name>, <name>` naming the held agents in the
+/// order given (start roles first, then by name), `✉ 4 held` past
+/// [`DECK_ATTENTION_MAX_NAMES`], or `None` when nothing is held. The names
+/// are exactly the cards carrying the [`ATTENTION_HELD`] marker.
+pub fn deck_attention_text(names: &[&str]) -> Option<String> {
+    if names.len() > DECK_ATTENTION_MAX_NAMES {
+        return deck_attention_count(names.len());
     }
+    (!names.is_empty()).then(|| format!("{GLYPH} {ATTENTION_HELD}: {}", names.join(", ")))
 }
 
-/// [`deck_attention_text`] counting every one of the `held` recipients and
-/// naming none (`✉ 2 held`): its words when no orchestrator is held, and what
-/// the TUI shows in their place on a row too narrow for them.
+/// [`deck_attention_text`] counting the `held` agents and naming none
+/// (`✉ 2 held`): its words past [`DECK_ATTENTION_MAX_NAMES`], and what the
+/// TUI shows in their place on a row too narrow for the names.
 pub fn deck_attention_count(held: usize) -> Option<String> {
     (held > 0).then(|| format!("{GLYPH} {held} {ATTENTION_HELD}"))
 }
@@ -1292,30 +1291,25 @@ impl CardInbox {
 mod tests {
     use super::*;
 
-    /// PRD #1666 part 3, round 5-wake (Q6): the deck-wide attention item, in
-    /// the forms `deckAttentionText` (`desktop/src/lib/inboxWords.ts`) builds
-    /// from the same words; its tests pin the same strings.
+    /// Issue #2387: the deck-wide attention item, in the forms
+    /// `deckAttentionNamesText` (`desktop/src/lib/inboxWords.ts`) builds from
+    /// the same words; its tests pin the same strings.
     #[test]
-    fn the_deck_attention_names_one_orchestrator_and_counts_the_rest() {
+    fn the_deck_attention_names_the_held_agents_and_counts_past_three() {
         assert_eq!(
-            deck_attention_text(Some(("Captain", WAKE_HOLD_POSSIBLE_DRAFT)), 1).as_deref(),
-            Some(
-                "✉ Captain: waiting: there may be an unsent draft. Send it or clear it. · 1 other held"
-            )
+            deck_attention_text(&["Captain", "archivist", "Coder"]).as_deref(),
+            Some("✉ held: Captain, archivist, Coder")
         );
         assert_eq!(
-            deck_attention_text(Some(("Captain", WAKE_HOLD_PASTE_OPEN)), 0).as_deref(),
-            Some("✉ Captain: waiting: a paste into its input has not finished.")
+            deck_attention_text(&["Captain"]).as_deref(),
+            Some("✉ held: Captain")
         );
-        assert_eq!(deck_attention_text(None, 2).as_deref(), Some("✉ 2 held"));
-        assert_eq!(deck_attention_text(None, 0), None);
-        // Issue #2389: a busy orchestrator that sent nothing for the bound.
         assert_eq!(
-            deck_attention_text(Some(("Captain", WAKE_HOLD_NO_ACTIVITY)), 0).as_deref(),
-            Some(
-                "✉ Captain: not taken: the agent shows as busy but has sent nothing for a while. Ask it to run dot-agent-deck inbox fetch."
-            )
+            deck_attention_text(&["A", "B", "C", "D"]).as_deref(),
+            Some("✉ 4 held")
         );
+        assert_eq!(deck_attention_text(&[]), None);
+        assert_eq!(deck_attention_count(2).as_deref(), Some("✉ 2 held"));
     }
 
     /// PRD #1666 part 3 (Q35): a cannot-check detail in words, the exact
@@ -1507,6 +1501,13 @@ mod tests {
                 .attention_words()
                 .as_deref(),
             Some("waiting to wake: send it a prompt")
+        );
+        // Issue #2389: a busy agent that sent nothing for the bound is held.
+        assert_eq!(
+            card(1, Some(WakeHold::NoActivity))
+                .attention_words()
+                .as_deref(),
+            Some(WAKE_HOLD_NO_ACTIVITY)
         );
         assert_eq!(
             card(0, Some(WakeHold::DialogDuringRing))
@@ -1802,7 +1803,6 @@ mod tests {
         assert_eq!(words["cancelApplied"], CANCEL_APPLIED);
         assert_eq!(words["actionUnsupported"], ACTION_UNSUPPORTED);
         assert_eq!(words["attentionTitle"], ATTENTION_TITLE);
-        assert_eq!(words["attentionOtherHeld"], ATTENTION_OTHER_HELD);
         assert_eq!(words["attentionHeld"], ATTENTION_HELD);
         assert_eq!(words["adapterTooOld"], ADAPTER_TOO_OLD);
         assert_eq!(words["cliTooOld"], CLI_TOO_OLD);

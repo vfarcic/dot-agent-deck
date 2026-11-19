@@ -34,7 +34,7 @@ import { DISPLAY_LIMITS, deckName, displayActivity, displayIdentity, displayPath
 import { HookBinaryNotices } from "./HookBinaryNotice";
 import { sameIncarnation } from "../lib/agentKey";
 import { AGENT_GONE_AFTER_RESTART } from "../lib/agentIdentity";
-import { deckAttentionText } from "../lib/inboxWords";
+import { inboxAttentionWords, INBOX_WORDS } from "../lib/inboxWords";
 import { DeckAttention } from "./DeckAttention";
 import { useAgentCardsView, type AgentCardsView } from "../hooks/useAgentCardsView";
 import type { PlacedCard } from "../lib/agentCards";
@@ -94,6 +94,11 @@ export type OverviewAgent = Pick<
    * it can only ever remove a placeholder, never a fact.
    */
   writeLease?: "read" | "write" | "none";
+  /**
+   * Issue #2387: the words the row's `held` marker gives on hover, while the
+   * deck holds a message for the agent (`inboxAttentionWords`).
+   */
+  holdWords?: string;
 };
 
 export function toOverviewAgent(agent: AgentSession): OverviewAgent {
@@ -119,8 +124,11 @@ export function toOverviewAgent(agent: AgentSession): OverviewAgent {
     ...(pullRequest ? { pullRequest } : {}),
     ...(incarnation ? { incarnation } : {}),
     ...(paneId ? { paneId } : {}),
+    ...withHoldWords(inboxAttentionWords(agent.inbox)),
   };
 }
+
+const withHoldWords = (holdWords: string | undefined) => (holdWords === undefined ? {} : { holdWords });
 
 /**
  * Agents are keyed by the composite `(daemonId, agentId)` from day one. Agent
@@ -1124,9 +1132,9 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
    * statement about a knowable part of the fleet rather than a guess.
    */
   const known = aggregate.decksUp > 0;
-  // PRD #1666 part 3, round 5-wake (Q6): who the deck holds the doorbell for,
-  // over the decks that answered, as the counters beside it are.
-  const deckAttention = deckAttentionText(decks.filter((deck) => deck.connected).flatMap((deck) => deck.snapshot.agents));
+  // PRD #1666 part 3, round 5-wake (Q6); issue #2387: who the deck holds the
+  // doorbell for, over the decks that answered, as the counters beside it are.
+  const heldOnDecks = useMemo(() => decks.filter((deck) => deck.connected).flatMap((deck) => deck.snapshot.agents), [decks]);
   const countOf = (status: AgentStatus) => aggregate.counts.find((entry) => entry.status === status)?.count ?? 0;
   /**
    * PRD #802 M2 — the overview's "Open deck" controls and
@@ -1793,13 +1801,15 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     <div className="control-deck overview-screen">
       {/* The rail is the shell's — one rail, rendered once, beside every screen (#1197). */}
       <main className="deck-main">
-        <header className={`topbar overview-topbar${deckAttention ? " with-attention" : ""}`}>
+        <header className="topbar overview-topbar">
           <div className="repo-context">
             <div className="repo-line"><LayoutList size={15} /><strong>Agent dashboard</strong></div>
             {/* PRD #741 M9: the same control, in the same block, as the deck's. */}
             {settings && <DeckSelector settings={settings} connection={connection} />}
           </div>
           <div className="top-actions">
+            {/* Issue #2387: the held agents, inline; each name opens its agent. */}
+            <DeckAttention agents={heldOnDecks} from="overview" context={voiceContext} />
             {/*
               Issue #2312 follow-up: the counters are one button that names
               only what needs someone (needs input, failed, daemons not
@@ -1837,7 +1847,6 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
             {cards.mode === "table" && <OverviewColumnPicker columns={columns} onChange={setColumns} />}
             <button className="button secondary compact" data-testid="overview-refresh" onClick={() => void runtime.reconnect()}><RefreshCw size={14} /><span>Refresh</span></button>
           </div>
-          <DeckAttention text={deckAttention} />
         </header>
 
         {/*
@@ -2924,6 +2933,8 @@ function OverviewRow({ agent, hoistedCwd, now, columns }: { agent: OverviewAgent
           <td className="overview-state" role="cell" key={column}>
             <span className={`agent-state-mark status-${agent.status}`} aria-hidden="true" />
             <span className={`status-label status-${agent.status}`}>{statusLabel(agent.status)}</span>
+            {/* Issue #2387: the tile's marker, beside the status it never replaces. */}
+            {agent.holdWords && <span className="held-marker" title={agent.holdWords}>{INBOX_WORDS.attentionHeld}</span>}
           </td>
         );
       case "displayName":
