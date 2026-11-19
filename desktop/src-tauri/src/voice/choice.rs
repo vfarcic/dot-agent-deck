@@ -792,17 +792,21 @@ fn names_something(
     }
 }
 
-/// PRD #2374 (PR #2378 review) — the agents of the deck `deck_id` names: that
-/// deck's own ([`VoiceDeck::agents`]) when it is another daemon in reach, and
-/// otherwise the agents voice was handed, which are the selected deck's.
+/// PRD #2374 (PR #2378 review) — the agents of the deck `deck_id` names: the
+/// agents voice was handed when it names none or the deck that
+/// [`VoiceDeck::holds_agents`]; another deck's own ([`VoiceDeck::agents`]),
+/// even when that list is empty or was not read, so a candidate on it is never
+/// matched to the selected deck's agent with the same id; and none for a deck
+/// not in reach at all.
 fn agents_on<'a>(live: &'a ChoiceLive, deck_id: Option<&str>) -> &'a [DesktopAgent] {
-    deck_id
-        .and_then(|id| {
-            live.decks
-                .iter()
-                .find(|deck| deck.id == id && !deck.holds_agents && !deck.agents.0.is_empty())
-        })
-        .map_or(live.agents, |deck| deck.agents.0.as_slice())
+    let Some(id) = deck_id else {
+        return live.agents;
+    };
+    match live.decks.iter().find(|deck| deck.id == id) {
+        Some(deck) if deck.holds_agents => live.agents,
+        Some(deck) => deck.agents.0.as_slice(),
+        None => &[],
+    }
 }
 
 /// `candidate`, selected — if what it names is still on screen. A deck is

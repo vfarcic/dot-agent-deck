@@ -219,6 +219,12 @@ pub(crate) struct DesktopState {
     /// `'static` spawned task that outlives any borrow of this state; it holds
     /// its own handle and invalidates through it when its event stream ends.
     pub(crate) daemon: Arc<DaemonLinks>,
+    /// PRD #2374 (PR #2378 review): each deck's agents as the snapshot the
+    /// app last showed for it carried them, by deck id — written by
+    /// `emit_snapshot`, removed for a deck whose last snapshot was not
+    /// connected. Voice reads the other daemons' agents from here, so no
+    /// utterance waits on another daemon.
+    pub(crate) shown_agents: Mutex<HashMap<String, Vec<crate::dto::DesktopAgent>>>,
     /// PRD #741 M7: the live `ssh -N -L` children, keyed by endpoint.
     ///
     /// **Beside [`DaemonLinks`], never inside it.** A `TrustedDaemon` is
@@ -392,6 +398,7 @@ impl Default for DesktopState {
             watchers: Mutex::new(HashMap::new()),
             watcher_claims: Generation::default(),
             daemon: Arc::clone(&daemon),
+            shown_agents: Mutex::new(HashMap::new()),
             tunnels: daemon.tunnels(),
             voice_answer_leases: crate::voice::lease::AnswerLeases::default(),
             selection: tokio::sync::watch::Sender::new(0),

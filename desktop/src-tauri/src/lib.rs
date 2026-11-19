@@ -1324,6 +1324,34 @@ fn emit_reading_consent_on(app: &AppHandle) {
 
 fn emit_snapshot(app: &AppHandle, snapshot: &DesktopSnapshot) {
     let _ = app.emit("desktop://snapshot", snapshot);
+    // PRD #2374 (PR #2378 review): the agents the app now shows for this
+    // deck, for voice to reach without asking the daemon again.
+    if let Some(state) = app.try_state::<DesktopState>() {
+        record_shown_agents(
+            &state.shown_agents,
+            &snapshot.connection.deck_id,
+            snapshot.connection.status == ConnectionStatus::Connected,
+            &snapshot.agents,
+        );
+    }
+}
+
+/// PRD #2374 (PR #2378 review) — a deck's shown `agents` into `shown`, under
+/// its id: kept while the deck is connected, removed otherwise.
+fn record_shown_agents(
+    shown: &std::sync::Mutex<HashMap<String, Vec<voice::DesktopAgent>>>,
+    deck: &str,
+    connected: bool,
+    agents: &[voice::DesktopAgent],
+) {
+    let mut shown = shown
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if connected {
+        shown.insert(deck.to_string(), agents.to_vec());
+    } else {
+        shown.remove(deck);
+    }
 }
 
 fn ensure_explicit_start_connected(
@@ -3755,7 +3783,11 @@ async fn desktop_voice_resolve(
         .unwrap_or_default();
     let resolver = voice::resolver_for(&settings.intent, Arc::new(KeychainSecretStore::new()));
     let snapshot = get_snapshot(&state.daemon).await;
-    let others = other_deck_agents(&state.daemon, &snapshot).await;
+    let others = other_deck_agents(
+        &state.shown_agents,
+        &snapshot.observed,
+        &snapshot.connection.deck_id,
+    );
     resolve_declared_utterance(
         resolver.as_ref(),
         screen,
@@ -3915,12 +3947,17 @@ async fn desktop_voice_choice(
         validate_voice_deck_step(deck_step)?;
     }
     let snapshot = get_snapshot(&state.daemon).await;
-    let others = other_deck_agents(&state.daemon, &snapshot).await;
+    let others = other_deck_agents(
+        &state.shown_agents,
+        &snapshot.observed,
+        &snapshot.connection.deck_id,
+    );
     Ok(answer_declared_choice(
         &utterance,
         &action,
         &offered,
         &snapshot.agents,
+        Some(snapshot.connection.deck_id.as_str()),
         &snapshot.observed,
         VoiceDeclaration {
             directories: directories.as_ref(),
@@ -4341,10 +4378,13 @@ fn answer_declared_choice(
     action: &str,
     offered: &[voice::ResolvedParam],
     agents: &[voice::DesktopAgent],
+    agents_deck: Option<&str>,
     observed: &[crate::dto::ObservedDeckDto],
     declared: VoiceDeclaration<'_>,
 ) -> voice::ChoiceAnswer {
-    let mut decks = voice_decks(observed, declared.deck_step, None);
+    // PRD #2374 (PR #2378 review): the deck `agents` are on is marked, so a
+    // candidate on another daemon is checked against that daemon's agents.
+    let mut decks = voice_decks(observed, declared.deck_step, agents_deck);
     with_other_agents(&mut decks, declared.other_agents);
     let selections = selector_voice_decks(declared.endpoints, &mut decks, declared.deck_step);
     if action == voice::SWITCH_DECK_ROW {
@@ -4537,59 +4577,32 @@ fn selector_voice_decks(
     selections
 }
 
-/// PRD #2374 (PR #2378 review): how long voice waits for another daemon's
-/// agent list before resolving without that daemon's agents.
-const OTHER_DECK_AGENTS_WAIT: Duration = Duration::from_millis(1500);
-
 /// PRD #2374 (PR #2378 review) — under All daemons, every OTHER observed deck's
-/// agents, by deck id, read concurrently and each bounded by
-/// [`OTHER_DECK_AGENTS_WAIT`], in the observed order. A deck that is not
-/// connected, has no agents or does not answer in time is left out, and voice
-/// resolves without it. Empty when one deck is observed, which is every
+/// agents, by deck id, in the observed order, as the app last showed them
+/// ([`crate::terminal::DesktopState::shown_agents`]): read from memory, so no
+/// utterance waits on another daemon. A deck that is not connected or has no
+/// agents is left out. Empty when one deck is observed, which is every
 /// single-deck selection.
-async fn other_deck_agents(
-    links: &Arc<DaemonLinks>,
-    snapshot: &crate::dto::DesktopSnapshot,
+fn other_deck_agents(
+    shown: &std::sync::Mutex<HashMap<String, Vec<voice::DesktopAgent>>>,
+    observed: &[crate::dto::ObservedDeckDto],
+    selected: &str,
 ) -> Vec<(String, Vec<voice::DesktopAgent>)> {
-    if snapshot.observed.len() < 2 {
+    if observed.len() < 2 {
         return Vec::new();
     }
-    let selected = snapshot.connection.deck_id.as_str();
-    let mut reads = tokio::task::JoinSet::new();
-    for (at, deck) in snapshot.observed.iter().enumerate() {
-        if deck.deck_id == selected {
-            continue;
-        }
-        // Resolved against the observed set, as every deck id is
-        // ([`crate::dto::DeckScope::resolve`]).
-        let Ok(scope) = crate::dto::DeckScope::resolve(Some(&deck.deck_id)) else {
-            continue;
-        };
-        let endpoint = scope.endpoint().clone();
-        let id = deck.deck_id.clone();
-        let links = Arc::clone(links);
-        reads.spawn(async move {
-            let snapshot = tokio::time::timeout(
-                OTHER_DECK_AGENTS_WAIT,
-                crate::daemon_bridge::snapshot_of(&endpoint, &links),
-            )
-            .await
-            .ok()?;
-            (snapshot.connection.status == crate::dto::ConnectionStatus::Connected
-                && !snapshot.agents.is_empty())
-            .then_some((at, id, snapshot.agents))
-        });
-    }
-    let mut found = Vec::new();
-    while let Some(read) = reads.join_next().await {
-        if let Ok(Some(entry)) = read {
-            found.push(entry);
-        }
-    }
-    found.sort_by_key(|(at, _, _)| *at);
-    found
-        .into_iter()
-        .map(|(_, id, agents)| (id, agents))
+    let shown = shown
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    observed
+        .iter()
+        .filter(|deck| deck.deck_id != selected)
+        .filter_map(|deck| {
+            shown
+                .get(&deck.deck_id)
+                .filter(|agents| !agents.is_empty())
+                .map(|agents| (deck.deck_id.clone(), agents.clone()))
+        })
         .collect()
 }
 
@@ -8404,7 +8417,15 @@ mod tests {
             other_agents: &[],
         };
         assert_eq!(
-            answer_declared_choice("two", "switch_deck", candidates, &[], &[], declared(&both)),
+            answer_declared_choice(
+                "two",
+                "switch_deck",
+                candidates,
+                &[],
+                None,
+                &[],
+                declared(&both)
+            ),
             voice::ChoiceAnswer::Selected(candidates[1].clone())
         );
         let without_staging = section(&[("rowbuild", "build-box")]);
@@ -8414,6 +8435,7 @@ mod tests {
                 "switch_deck",
                 candidates,
                 &[],
+                None,
                 &[],
                 declared(&without_staging)
             ),
@@ -8651,6 +8673,39 @@ mod tests {
             "{:?}",
             result.outcome
         );
+    }
+
+    /// Scenario (PRD #2374, PR #2378 review): the agents the app showed for
+    /// each deck are what voice reaches on the other daemons — every observed
+    /// deck but the selected one, in the observed order, none with no agents
+    /// and none whose last snapshot was not connected; and nothing at all with
+    /// one deck observed.
+    #[test]
+    fn voice_reaches_the_agents_the_app_showed_on_the_other_daemons() {
+        let observed = |id: &str| crate::dto::ObservedDeckDto {
+            deck_id: id.to_string(),
+            label: id.to_string(),
+            deck_kind: "remote",
+            name: None,
+        };
+        let fleet = [
+            observed("deck-a"),
+            observed("deck-b"),
+            observed("deck-c"),
+            observed("deck-d"),
+        ];
+        let shown = std::sync::Mutex::new(HashMap::new());
+        let coder = [voice::fixtures::agent("1", Some("Coder"), "claude_code")];
+        record_shown_agents(&shown, "deck-a", true, &coder);
+        record_shown_agents(&shown, "deck-b", true, &coder);
+        record_shown_agents(&shown, "deck-c", true, &[]);
+        record_shown_agents(&shown, "deck-d", true, &coder);
+        record_shown_agents(&shown, "deck-d", false, &coder);
+        let reached = other_deck_agents(&shown, &fleet, "deck-a");
+        let ids: Vec<&str> = reached.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["deck-b"]);
+        assert_eq!(reached[0].1[0].id, "1");
+        assert!(other_deck_agents(&shown, &fleet[..1], "deck-a").is_empty());
     }
 
     /// Scenario: the webview declares the New agent dialog's deck step with an

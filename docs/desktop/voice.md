@@ -93,7 +93,7 @@ An agent that is part of an orchestration is called by the orchestration's title
 
 If what you said fits more than one agent, for example "open the Claude agent" with two Claude Code agents running, the app lists them for you to choose from; see [When a command matches several things](#when-a-command-matches-several-things). "When it started" needs a daemon that reports when each agent started; if one of the agents you meant has no start time, the app lists them instead of guessing.
 
-Voice reaches the agents of the daemon the app shows. With **All daemons** selected, it reaches the agents on every daemon the dashboard shows. Naming a daemon picks among its agents: "open the coder on build box" opens the build box's coder, even when this machine has a coder too. When what you said fits agents on more than one daemon, the app lists them with each one's daemon, such as "coder on build box", for you to choose from. A daemon that is slow to answer is left out of that one command; say it again, or name the agent by its number on the dashboard (see [Choosing by number](#choosing-by-number)).
+Voice reaches the agents of the daemon the app shows. With **All daemons** selected, it reaches the agents on every daemon the dashboard shows. Naming a daemon picks among its agents: "open the coder on build box" opens the build box's coder, even when this machine has a coder too. When what you said fits agents on more than one daemon, the app lists them with each one's daemon, such as "coder on build box", for you to choose from. Voice uses the agents the dashboard shows for each daemon, so a daemon that is not connected has none to reach.
 
 ## Filtering the dashboard
 

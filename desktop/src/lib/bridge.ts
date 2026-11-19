@@ -5688,7 +5688,8 @@ export class TauriDeckBridge implements DeckBridge {
     /* Rust hands back the entry exactly as offered; the offered one is
        returned, so its identity keeps the keys it was given on the way in. */
     if (answer.kind !== "selected") return answer;
-    const candidate = offered.find((entry) => entry.value === answer.candidate.value);
+    /* PRD #2374 (PR #2378 review): two offered agents can share an id on two daemons. */
+    const candidate = offered.find((entry) => entry.value === answer.candidate.value && entry.deckId === answer.candidate.deckId);
     return candidate ? { kind: "selected", candidate } : { kind: "refused" };
   }
 

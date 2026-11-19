@@ -4549,7 +4549,7 @@ fn resolve_agent_ref_across(
             .map(|deck| (Some(deck), deck.agents.0.as_slice())),
     );
     let mut found: Vec<(Option<&VoiceDeck>, Candidate)> = Vec::new();
-    for (deck, set) in sets {
+    for &(deck, set) in &sets {
         let alone: Vec<VoiceDeck> = decks
             .iter()
             .map(|each| VoiceDeck {
@@ -4590,6 +4590,28 @@ fn resolve_agent_ref_across(
                 }))
             }
             Err(_) => {}
+        }
+    }
+    // "The newest agent" with an agent on each daemon is the one that started
+    // last of them all, not a choice between each daemon's newest (Qodo on PR
+    // #2378) — when every one of them reports its start, as on one daemon.
+    if found.len() > 1 {
+        let (mut said, _) = reference_words(transcript.text());
+        if let Some(recency) = Recency::said(&mut said) {
+            let agent_of = |(deck, candidate): &(Option<&VoiceDeck>, Candidate)| {
+                sets.iter()
+                    .find(|(each, _)| each.map(|each| &each.id) == deck.map(|deck| &deck.id))
+                    .and_then(|(_, set)| set.iter().find(|agent| agent.id == candidate.value))
+            };
+            let agents: Option<Vec<&DesktopAgent>> = found.iter().map(agent_of).collect();
+            if let Some(agents) = agents
+                && let [newest] = recency.pick(agents.clone()).as_slice()
+                && let Some(at) = agents
+                    .iter()
+                    .position(|agent| std::ptr::eq(*agent, *newest))
+            {
+                found = vec![found.swap_remove(at)];
+            }
         }
     }
     let spans_daemons = found
@@ -20688,5 +20710,61 @@ mod tests {
             crate::voice::choice::answer("the second one", candidates, &live),
             crate::voice::ChoiceAnswer::Refused
         );
+        // Nor when the build box has no agents left (Qodo on PR #2378): its
+        // candidate is checked against the build box's agents, and this
+        // machine's agent with the same id does not stand in for it.
+        let emptied = two_daemons(Vec::new());
+        let live = crate::voice::choice::ChoiceLive {
+            agents: &here,
+            decks: &emptied,
+            directories: None,
+            new_agent: None,
+        };
+        assert_eq!(
+            crate::voice::choice::answer("the second one", candidates, &live),
+            crate::voice::ChoiceAnswer::Refused
+        );
+    }
+
+    /// Scenario: under All daemons, "open the newest agent" with a Planner on
+    /// this machine and a Coder that started later on the build box opens the
+    /// Coder, the newest of them all, rather than asking which daemon's newest
+    /// (Qodo on PR #2378); "the oldest agent" opens the Planner.
+    #[tokio::test]
+    async fn voice_outcome_the_newest_agent_is_the_newest_across_daemons() {
+        let started = |id: &str, name: &str, at: i64| {
+            let mut agent = crate::voice::fixtures::agent(id, Some(name), "claude_code");
+            agent.spawned_at_ms = Some(at);
+            agent
+        };
+        let here = [started("1", "Planner", 1_000)];
+        let decks = two_daemons(vec![started("1", "Coder", 2_000)]);
+        for (said, spoken, label, deck) in [
+            (
+                "open the newest agent",
+                "newest agent",
+                "Coder",
+                "deck-build",
+            ),
+            (
+                "open the oldest agent",
+                "oldest agent",
+                "Planner",
+                "deck-local",
+            ),
+        ] {
+            let outcome = run_on(
+                said,
+                IntentAnswer::new("open_agent").with_param("agent", spoken),
+                &here,
+                &decks,
+            )
+            .await;
+            let VoiceOutcome::Dispatch { params, .. } = &outcome else {
+                panic!("{said}: expected one agent, got {outcome:?}");
+            };
+            assert_eq!(params[0].label, label, "{said}");
+            assert_eq!(params[0].deck_id.as_deref(), Some(deck), "{said}");
+        }
     }
 }

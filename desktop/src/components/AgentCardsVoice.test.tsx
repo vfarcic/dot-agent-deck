@@ -254,6 +254,25 @@ describe("desktop/agent-cards/008 — the cards by voice (PRD #2374)", () => {
     expect(invokeCardAction).toHaveBeenCalledWith(expect.objectContaining({ deckId: "deck-build", agentId }), "go-ahead", expect.objectContaining({ requestId: expect.any(String) }));
   });
 
+  /// Scenario: with two daemons each running an agent of the same id, say "press go ahead on the voice card agent's card"; voice cannot tell which and offers both, each named with its daemon. Clicking the second, the build box's, presses Go ahead on the build box's card and on no other.
+  it("desktop/agent-cards/008: a choice between same-id agents on two daemons presses the one chosen", async () => {
+    const agentId = createFixtureSnapshot("connected").agents[0].id;
+    const candidate = (label: string, deckId: string) => ({ name: "agent", kind: "agent_ref", spoken: "the voice card agent", value: agentId, label, deckId });
+    const offered = [candidate("voice-card-agent on Local daemon", FIXTURE_DAEMON_ID), candidate("voice-card-agent on build box", "deck-build")];
+    const tie = {
+      kind: "param_ambiguous", transcript: "press go ahead on the voice card agent's card", action: "run_card_action", invoke: "runCardAction",
+      param: "agent", spoken: "the voice card agent", matches: offered.map((entry) => entry.label), candidates: offered,
+      params: [{ name: "action", kind: "card_action", spoken: "Go ahead", value: "Go ahead", label: "Go ahead" }],
+      sentence: "Heard: “press go ahead on the voice card agent's card” — “the voice card agent” matches more than one agent.",
+    } as unknown as VoiceResultDto["outcome"];
+    const { invokeCardAction, resolveVoice } = renderSpoken(tie, { secondDeck: "deck-build" });
+    await speak(resolveVoice);
+    const second = await screen.findByRole("button", { name: "2. voice-card-agent on build box" });
+    await act(async () => { fireEvent.click(second); });
+    await waitFor(() => expect(invokeCardAction).toHaveBeenCalledTimes(1));
+    expect(invokeCardAction).toHaveBeenCalledWith(expect.objectContaining({ deckId: "deck-build", agentId }), "go-ahead", expect.objectContaining({ requestId: expect.any(String) }));
+  });
+
   /// Scenario: say "press re-run tests on the voice card agent's card", an action whose text the agent wrote. The card's overlay opens at its review step showing that exact text, the voice row says why, and nothing is sent until Send is pressed, which sends it once.
   it("desktop/agent-cards/008: a spoken action the agent wrote opens its review step and sends nothing", async () => {
     const agentId = createFixtureSnapshot("connected").agents[0].id;
