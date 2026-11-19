@@ -40,30 +40,59 @@ fn attention_header(deck: &common::TuiDeck) -> String {
         .join("\n")
 }
 
+/// The grid below the chrome [`attention_header`] reads: the cards, so a
+/// held name in the header does not read as that agent's card on screen.
+fn below_header(grid: &str) -> String {
+    grid.lines()
+        .skip_while(|line| !line.trim_start().starts_with(['┌', '┏', '╭']))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Issue #2387: the header names the held cards, the start role first, and
+/// leaves each hold's words to its card, which carries the `held` marker.
 fn assert_orchestrator_attention(deck: &common::TuiDeck, reason: &str) {
     let words: Value = serde_json::from_str(include_str!("fixtures/inbox-display.json")).unwrap();
-    let glyph = words["glyph"].as_str().unwrap();
-    // Keep the labelled-count grammar identical to InboxWakeAttention.test.tsx.
-    let one_other_held = regex::Regex::new(
-        r"(?i)(?:^|[^a-z0-9_])(?:1\s+(?:other|held|blocked)|(?:other|held|blocked)\s*:?\s*1)(?:$|[^a-z0-9_])",
-    )
-    .unwrap();
+    let named = format!(
+        "{} {}: ",
+        words["glyph"].as_str().unwrap(),
+        words["attentionHeld"].as_str().unwrap()
+    );
     assert!(
         common::wait_until(WAIT, || {
             let header = attention_header(deck);
-            let label = header.to_ascii_lowercase();
-            label.contains("orchestrator")
-                && header.contains(reason)
-                && header.contains(glyph)
-                && one_other_held.is_match(&header)
-                && !label.contains("coder")
+            let Some(at) = header.find(&named) else {
+                return false;
+            };
+            let names = &header[at + named.len()..];
+            // The start role first, then the other held recipient; the
+            // worker, which the deck holds nothing for, is not named.
+            names.starts_with("attention-team / attention-orchestrator, attention-other")
+                && !header.contains(reason)
+                && !header.contains("coder")
         }),
-        "deck-wide attention must name the held orchestrator, explain its hold and count one other held recipient outside its card; grid:\n{}",
+        "deck-wide attention must name the held orchestrator first and the other held recipient, without the hold's words or the worker; grid:\n{}",
         deck.snapshot_grid()
     );
 }
 
-/// Scenario: A worker reports to an orchestrator whose input holds an unsent draft, while one other recipient is held too. The real attached TUI must show the envelope glyph, name the orchestrator and count the other recipient without worker detail in its header even on another tab, retain that attention across detach/reattach and tab switches, then clear it after the user clears the draft and the report is taken.
+/// Issue #2387: a held card on screen says `held` beside its status.
+fn assert_card_marked(deck: &common::TuiDeck, name: &str) {
+    let held = |grid: &str| {
+        grid.lines().any(|line| {
+            line.trim_start().starts_with(['┌', '┏', '╭'])
+                && line.contains(name)
+                && line.contains(" held ")
+        })
+    };
+    assert!(
+        common::wait_until(WAIT, || held(&deck.snapshot_grid())),
+        "{name}'s card must carry the held marker beside its status; grid:\n{}",
+        deck.snapshot_grid()
+    );
+}
+
+/// Scenario: A worker reports to an orchestrator whose input holds an unsent draft, while one other recipient is held too. The real attached TUI must name the orchestrator first and then the other recipient after the envelope glyph and `held:`, without the worker or the hold's words, in its header even on another tab, mark the other recipient's card `held`, open that card's tab when its name in the header is clicked, retain that attention across detach/reattach and tab switches, then clear it after the user clears the draft and the report is taken.
 #[spec("inbox/status/031")]
 #[test]
 fn status_031_orchestrator_attention_survives_tabs_and_reattach() {
@@ -122,16 +151,24 @@ fn status_031_orchestrator_attention_survives_tabs_and_reattach() {
     let words: Value = serde_json::from_str(include_str!("fixtures/inbox-display.json")).unwrap();
     let reason = words["wakeHolds"]["cannot_type"].as_str().unwrap();
     assert_orchestrator_attention(&deck, reason);
+    assert_card_marked(&deck, "attention-other");
     // Dashboard -> the team's tab -> Dashboard. No focus or selection clears it.
     deck.send_keys(b"\x1b[C");
     deck.wait_until_grid("team tab selected, showing its worker", |grid| {
-        grid.contains("attention-coder") && !grid.contains("attention-other")
+        let cards = below_header(grid);
+        cards.contains("attention-coder") && !cards.contains("attention-other")
     });
     assert_orchestrator_attention(&deck, reason);
-    deck.send_keys(b"\x1b[D");
+    // Issue #2387: a held name in the header opens that agent's card. On the
+    // team's tab the only `attention-other` on screen is the header's.
+    let (col, row) = deck.wait_for_in_grid("attention-other");
+    deck.click(col + 1, row);
     deck.wait_until_grid(
-        "Dashboard selected again, showing its non-team recipient",
-        |grid| grid.contains("attention-other") && !grid.contains("attention-coder"),
+        "clicking attention-other in the header shows its card on the Dashboard",
+        |grid| {
+            let cards = below_header(grid);
+            cards.contains("attention-other") && !cards.contains("attention-coder")
+        },
     );
     assert_orchestrator_attention(&deck, reason);
     deck.send_keys(b"\x03");
@@ -152,7 +189,11 @@ fn status_031_orchestrator_attention_survives_tabs_and_reattach() {
     assert!(taken.to_string().contains("ATTENTION-WORKER-REPORT-79d1"));
     fetch(&daemon, &other, true);
     assert!(
-        common::wait_until(WAIT, || !attention_header(&reattached).contains(reason)),
+        // The item, in either form (`✉ held: …`, `✉ 2 held`); the pane
+        // beside the cards still titles itself with an agent's name.
+        common::wait_until(WAIT, || !attention_header(&reattached)
+            .lines()
+            .any(|line| line.contains('✉') && line.contains(" held"))),
         "clearing the drafts and taking the messages must clear header attention: {}",
         reattached.snapshot_grid()
     );

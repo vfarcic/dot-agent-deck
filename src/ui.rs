@@ -2082,6 +2082,17 @@ struct UiState {
     /// Whether this frame draws [`Self::deck_attention`] in the tab strip,
     /// set by `render_frame` before the card grid reads it.
     deck_attention_in_tab_bar: bool,
+    /// Issue #2387: the cards [`Self::deck_attention`] names, as
+    /// `(session id, name)` in its order; empty while it counts them instead.
+    deck_attention_held: Vec<(String, String)>,
+    /// Issue #2387: where this frame drew each name of
+    /// [`Self::deck_attention_held`], so a click on one reveals its card
+    /// ([`Action::RevealCard`]). Cleared every frame before the item is drawn.
+    deck_attention_hits: Vec<(String, Rect)>,
+    /// Issue #2387: the card a click on a held name asked for, selected on the
+    /// next frame, once the card list is the tab it is on
+    /// ([`apply_pending_reveal`]).
+    pending_reveal: Option<String>,
     /// PRD #1666 part 2 (G-fix6): what the dashboard's names for a pane were
     /// before its last rename — the card's session id and its
     /// `display_names` / `pane_display_names` entries — so a rename the deck
@@ -2713,6 +2724,9 @@ impl UiState {
             deck_attention: None,
             deck_attention_short: None,
             deck_attention_in_tab_bar: false,
+            deck_attention_held: Vec::new(),
+            deck_attention_hits: Vec::new(),
+            pending_reveal: None,
             renamed_from: HashMap::new(),
             pane_declared_agent: HashMap::new(),
             pane_metadata: HashMap::new(),
@@ -5647,6 +5661,10 @@ pub enum Action {
     /// same card a j/k linear-cycle would land on), mirroring the selection
     /// into the embedded focus the way `dispatch_normal_mode_key` does.
     SelectCard(usize),
+    /// Issue #2387: click a held agent's name in the deck-wide attention item
+    /// → switch to the tab its card is on and select that card, the session
+    /// with this id.
+    RevealCard(String),
     /// PRD #80 M4: enter filter mode (the `/` key and the `[Filter /]` button
     /// share this path).
     EnterFilter,
@@ -8751,6 +8769,87 @@ fn focus_deck(
         }
     }
     true
+}
+
+/// Issue #2387: show the card of `session_id`, a held agent the deck-wide
+/// attention item names: the orchestration tab it is a role of, or the
+/// Dashboard. The target tab's remembered card is written first, so the
+/// switch re-focuses it the way returning to a tab does
+/// ([`switch_tab_with_focus`]); the card itself is selected on the next
+/// frame, once the card list is that tab's ([`apply_pending_reveal`]).
+fn reveal_card(
+    session_id: &str,
+    ui: &mut UiState,
+    tab_manager: &mut TabManager,
+    pane: &dyn PaneController,
+    snapshot: &AppState,
+) {
+    let Some(session) = snapshot.sessions.get(session_id) else {
+        return;
+    };
+    let pane_id = session.pane_id.as_deref();
+    let target = pane_id
+        .and_then(|pid| tab_manager.tab_index_for_pane(pid))
+        .or_else(|| {
+            tab_manager
+                .tabs()
+                .iter()
+                .position(|tab| matches!(tab, Tab::Dashboard { .. }))
+        });
+    let Some(target) = target else {
+        return;
+    };
+    match tab_manager.tabs_mut().get_mut(target) {
+        Some(Tab::Dashboard {
+            selected_session_id,
+            ..
+        }) => *selected_session_id = Some(session_id.to_string()),
+        Some(Tab::Orchestration { .. }) => {
+            if let Some(pid) = pane_id {
+                tab_manager.record_focus_on_tab(target, pid);
+            }
+        }
+        None => return,
+    }
+    if target != tab_manager.active_index() {
+        switch_tab_with_focus(tab_manager, target, pane, snapshot, ui);
+    }
+    ui.pending_reveal = Some(session_id.to_string());
+}
+
+/// Issue #2387: select [`reveal_card`]'s card in this frame's card list,
+/// exactly as a click on the card selects it ([`Action::SelectCard`]), so the
+/// highlight, the focused pane and what Enter opens are that card. A filter
+/// that hides it is cleared, and the card is selected on the frame after.
+fn apply_pending_reveal(
+    ui: &mut UiState,
+    tab_manager: &mut TabManager,
+    pane: &dyn PaneController,
+    filtered: &[(&String, &SessionState)],
+    session_id: &str,
+) {
+    match filtered
+        .iter()
+        .position(|(id, _)| id.as_str() == session_id)
+    {
+        Some(idx) => {
+            let prev = ui.selected_index;
+            ui.selected_index = Some(idx);
+            if let Tab::Dashboard {
+                selected_session_id,
+                ..
+            } = tab_manager.active_tab_mut()
+            {
+                *selected_session_id = Some(session_id.to_string());
+            }
+            mirror_selection_into_focus(prev, ui, filtered, pane);
+        }
+        None if !ui.filter_text.is_empty() => {
+            ui.filter_text.clear();
+            ui.pending_reveal = Some(session_id.to_string());
+        }
+        None => {}
+    }
 }
 
 /// PRD #68: mirror a selection move made by `handle_normal_key`
@@ -11919,6 +12018,10 @@ fn dispatch_action(
                 }
                 mirror_selection_into_focus(prev, ui, filtered, pane);
             }
+        }
+        // Issue #2387: a held agent's name in the attention item → its card.
+        Action::RevealCard(session_id) => {
+            reveal_card(&session_id, ui, tab_manager, pane, snapshot);
         }
         // PRD #80 M4: `/` key or [Filter /] button → filter mode.
         Action::EnterFilter => {
@@ -15666,6 +15769,10 @@ pub fn run_tui(
         // longer snap the selection of another (the cross-tab leak this
         // PRD fixes). A remembered id that's no longer in the filtered
         // list is cleared and the selection falls back to the first card.
+        // Issue #2387: a held name clicked in the header asked for its card.
+        if let Some(session_id) = ui.pending_reveal.take() {
+            apply_pending_reveal(&mut ui, &mut tab_manager, &*pane, &filtered, &session_id);
+        }
         reconcile_frame_selection(&mut ui, &mut tab_manager, &*pane, &filtered);
 
         // PRD #341 M6: before laying out or drawing anything, make sure the pane
@@ -15841,8 +15948,20 @@ pub fn run_tui(
             })
             .collect();
         // PRD #1666 part 3, round 5-wake (Q6): the deck-wide attention item.
-        ui.deck_attention = deck_attention(&snapshot, tab_manager.tabs());
+        let held = held_card_names(&snapshot, tab_manager.tabs(), &ui.display_names);
+        ui.deck_attention = crate::inbox_display::deck_attention_text(
+            &held
+                .iter()
+                .map(|(_, name)| name.as_str())
+                .collect::<Vec<_>>(),
+        );
         ui.deck_attention_short = deck_attention_short(&snapshot);
+        ui.deck_attention_held = if held.len() <= crate::inbox_display::DECK_ATTENTION_MAX_NAMES {
+            held
+        } else {
+            Vec::new()
+        };
+        ui.deck_attention_hits.clear();
         let tab_bar_info = TabBarInfo {
             show: tab_manager.show_tab_bar(),
             labels: tab_bar_labels,
@@ -16769,6 +16888,9 @@ pub fn run_tui(
                         action = hit_test_tab_close(&ui.tab_close_rects, mouse.column, mouse.row)
                             .or_else(|| {
                                 hit_test_tab_header(&ui.tab_header_rects, mouse.column, mouse.row)
+                            })
+                            .or_else(|| {
+                                hit_test_attention(&ui.deck_attention_hits, mouse.column, mouse.row)
                             });
                     }
                     action
@@ -17911,28 +18033,144 @@ fn deck_title_line(
     Line::from(spans)
 }
 
-/// PRD #1666 part 3, round 5-wake (Q6): the deck-wide attention item
-/// ([`crate::inbox_display::deck_attention_text`]): the first orchestration
-/// tab's start role whose agent the deck holds the doorbell for is named with
-/// its hold's words, and every other held recipient is counted. Start-role
-/// membership decides who is named, not the role's name.
-fn deck_attention(state: &AppState, tabs: &[Tab]) -> Option<String> {
-    let held = state.held_inbox_panes();
-    let named = tabs.iter().find_map(|tab| match tab {
-        Tab::Orchestration {
-            role_pane_ids,
-            start_role_index,
-            config,
-            ..
-        } => {
-            let words = held.get(role_pane_ids.get(*start_role_index)?.as_str())?;
-            let role = config.roles.get(*start_role_index)?;
-            Some((role.name.as_str(), words.as_str()))
-        }
-        Tab::Dashboard { .. } => None,
+/// Issue #2387: the deck-wide attention item
+/// ([`crate::inbox_display::deck_attention_text`]): it names the cards that
+/// carry the `held` marker ([`AppState::held_cards`]) — orchestration start
+/// roles first, whatever the role is called, then by name — and counts them
+/// past [`crate::inbox_display::DECK_ATTENTION_MAX_NAMES`]. Each is named as
+/// its card titles it (`display_names`, then the agent's own name). The
+/// frame builds the same text inline, keeping the names for their click
+/// targets.
+#[cfg(test)]
+fn deck_attention(
+    state: &AppState,
+    tabs: &[Tab],
+    display_names: &HashMap<String, String>,
+) -> Option<String> {
+    let held = held_card_names(state, tabs, display_names);
+    let names: Vec<&str> = held.iter().map(|(_, name)| name.as_str()).collect();
+    crate::inbox_display::deck_attention_text(&names)
+}
+
+/// [`deck_attention`]'s cards, as `(session id, name)` in its order.
+fn held_card_names(
+    state: &AppState,
+    tabs: &[Tab],
+    display_names: &HashMap<String, String>,
+) -> Vec<(String, String)> {
+    let run_names: HashMap<&str, &str> = tabs
+        .iter()
+        .flat_map(|tab| match tab {
+            Tab::Orchestration {
+                role_pane_ids,
+                name,
+                ..
+            } => role_pane_ids
+                .iter()
+                .map(|pane| (pane.as_str(), name.as_str()))
+                .collect::<Vec<_>>(),
+            Tab::Dashboard { .. } => Vec::new(),
+        })
+        .collect();
+    let start_panes: std::collections::HashSet<&str> = tabs
+        .iter()
+        .filter_map(|tab| match tab {
+            Tab::Orchestration {
+                role_pane_ids,
+                start_role_index,
+                ..
+            } => role_pane_ids.get(*start_role_index).map(String::as_str),
+            Tab::Dashboard { .. } => None,
+        })
+        .collect();
+    let mut held: Vec<(bool, String, String)> = state
+        .held_cards()
+        .into_iter()
+        .map(|(session, _)| {
+            let start = session
+                .pane_id
+                .as_deref()
+                .is_some_and(|pane| start_panes.contains(pane));
+            let own = display_names
+                .get(&session.session_id)
+                .or(session.display_name.as_ref())
+                .cloned()
+                .unwrap_or_else(|| {
+                    format!(
+                        "{} · {}",
+                        session.agent_type,
+                        crate::submitted_prompt::truncate_on_char_boundary(&session.session_id, 11)
+                    )
+                });
+            // The run's name before the agent's, as the desktop titles its
+            // tile, so two runs' `coder` read apart.
+            let name = match session
+                .pane_id
+                .as_deref()
+                .and_then(|pane| run_names.get(pane))
+            {
+                Some(run) => format!("{run} / {own}"),
+                None => own,
+            };
+            (start, session.session_id.clone(), name)
+        })
+        .collect();
+    held.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| a.2.to_lowercase().cmp(&b.2.to_lowercase()))
+            .then_with(|| a.1.cmp(&b.1))
     });
-    let others = held.len() - usize::from(named.is_some());
-    crate::inbox_display::deck_attention_text(named, others)
+    held.into_iter().map(|(_, id, name)| (id, name)).collect()
+}
+
+/// Issue #2387: after the attention item is drawn on `row`, where each of
+/// [`UiState::deck_attention_held`]'s names landed: found by the item's
+/// `✉ held: ` opening in the drawn cells, so every draw path (the tab strip,
+/// the title row, an empty deck's top row) records the same way, and a name
+/// cut at the row's end is clickable only where it shows. Nothing when the
+/// row shows the count instead.
+fn record_attention_hits(ui: &mut UiState, buf: &ratatui::buffer::Buffer, row: Rect) {
+    let prefix = format!(
+        "{} {}: ",
+        crate::inbox_display::GLYPH,
+        crate::inbox_display::ATTENTION_HELD
+    );
+    let width = |text: &str| u16::try_from(Span::raw(text).width()).unwrap_or(u16::MAX);
+    let prefix_width = width(&prefix);
+    let end = row
+        .x
+        .saturating_add(row.width)
+        .min(buf.area.x + buf.area.width);
+    if row.y < buf.area.y || row.y >= buf.area.y + buf.area.height {
+        return;
+    }
+    let Some(start) = (row.x..end).find(|&x| {
+        x.saturating_add(prefix_width) <= end
+            && (x..x + prefix_width)
+                .map(|c| buf[(c, row.y)].symbol())
+                .collect::<String>()
+                == prefix
+    }) else {
+        return;
+    };
+    let mut x = start + prefix_width;
+    for (session_id, name) in &ui.deck_attention_held {
+        if x >= end {
+            break;
+        }
+        let shown = width(name).min(end - x);
+        ui.deck_attention_hits
+            .push((session_id.clone(), Rect::new(x, row.y, shown, 1)));
+        x = x.saturating_add(width(name)).saturating_add(2);
+    }
+}
+
+/// Issue #2387: the held agent whose name in the attention item is under
+/// `(col, row)`.
+fn hit_test_attention(hits: &[(String, Rect)], col: u16, row: u16) -> Option<Action> {
+    hits.iter().find_map(|(id, rect)| {
+        point_in_rect(rect, col, row).then(|| Action::RevealCard(id.clone()))
+    })
 }
 
 /// The attention item the deck's title row carries, words and short form:
@@ -17949,9 +18187,9 @@ fn title_attention(ui: &UiState) -> Option<(&str, &str)> {
 }
 
 /// [`deck_attention`]'s short form for a narrow row: the glyph and how many
-/// recipients the deck holds the doorbell for, naming none (`✉ 2 held`).
+/// cards carry the `held` marker, naming none (`✉ 2 held`).
 fn deck_attention_short(state: &AppState) -> Option<String> {
-    crate::inbox_display::deck_attention_count(state.held_inbox_panes().len())
+    crate::inbox_display::deck_attention_count(state.held_cards().len())
 }
 
 /// The columns, after its two-column gap, below which [`deck_attention`]'s
@@ -18020,9 +18258,7 @@ fn draw_deck_attention(
 #[cfg(test)]
 mod deck_attention_tests {
     use super::*;
-    use crate::inbox_display::{
-        WAKE_HOLD_AWAITING_PROMPT, WAKE_HOLD_POSSIBLE_DRAFT, WAKE_STALLED, WakeHold,
-    };
+    use crate::inbox_display::WakeHold;
 
     fn summary(queued: usize, hold: Option<WakeHold>) -> crate::inbox_hub::InboxSummary {
         crate::inbox_hub::InboxSummary {
@@ -18091,13 +18327,33 @@ mod deck_attention_tests {
         .unwrap()
     }
 
-    /// PRD #1666 part 3, round 5-wake (`inbox/status/031`'s fast half): the
-    /// held start role is named with its hold's words, whatever its name and
-    /// wherever it sits in the team; the coder's hold and a dashboard agent's
-    /// are counted; an agent with mail and no hold is not.
+    /// A card for `agent` in `pane`, titled `name`, as an agent's first hook
+    /// creates one.
+    fn card(state: &mut AppState, pane: &str, agent: &str, name: &str) {
+        let mut session = super::tests::make_session(SessionStatus::Idle);
+        session.session_id = format!("s-{agent}");
+        session.pane_id = Some(pane.to_string());
+        session.agent_id = Some(agent.to_string());
+        session.display_name = Some(name.to_string());
+        state.sessions.insert(session.session_id.clone(), session);
+    }
+
+    fn attention(state: &AppState, tabs: &[Tab]) -> Option<String> {
+        deck_attention(state, tabs, &HashMap::new())
+    }
+
+    /// Issue #2387 (`inbox/status/031`'s fast half): the header names the
+    /// held cards, the start role first whatever its name and wherever it
+    /// sits in the team, then by name, a run's agents after the run's name
+    /// as the desktop titles them; an agent with mail and no hold is not
+    /// named.
     #[test]
-    fn deck_attention_names_the_held_start_role_and_counts_the_rest() {
+    fn deck_attention_names_the_held_cards_start_role_first() {
         let mut state = AppState::default();
+        card(&mut state, "captain-pane", "a1", "captain");
+        card(&mut state, "coder-pane", "a2", "coder");
+        card(&mut state, "other-pane", "a3", "Archivist");
+        card(&mut state, "quiet-pane", "a4", "quiet");
         state.apply_inbox_summary(
             "captain-pane",
             "a1",
@@ -18111,63 +18367,165 @@ mod deck_attention_tests {
         );
         state.apply_inbox_summary("quiet-pane", "a4", &summary(3, None));
         assert_eq!(
-            deck_attention(&state, &tabs()).as_deref(),
-            Some(format!("✉ captain: {WAKE_HOLD_POSSIBLE_DRAFT} · 2 other held").as_str())
+            attention(&state, &tabs()).as_deref(),
+            Some("✉ held: team / captain, Archivist, team / coder")
         );
-        // The start role's reason changes: the item follows it.
+        assert_eq!(deck_attention_short(&state).as_deref(), Some("✉ 3 held"));
+        // The start role's reason changes: it is still the one named first.
         state.apply_inbox_notice(&wake_update(
             "captain-pane",
             "a1",
             Some(WakeHold::AwaitingPrompt),
         ));
         assert_eq!(
-            deck_attention(&state, &tabs()).as_deref(),
-            Some(format!("✉ captain: {WAKE_HOLD_AWAITING_PROMPT} · 2 other held").as_str())
+            attention(&state, &tabs()).as_deref(),
+            Some("✉ held: team / captain, Archivist, team / coder")
         );
-        // With no tabs, nobody is a start role: everyone is counted.
-        assert_eq!(deck_attention(&state, &[]).as_deref(), Some("✉ 3 held"));
+        // With no tabs, nobody is a start role: everyone is named by name.
+        assert_eq!(
+            attention(&state, &[]).as_deref(),
+            Some("✉ held: Archivist, captain, coder")
+        );
+        // A fourth held card turns the names into a count.
+        state.apply_inbox_summary("quiet-pane", "a4", &summary(3, Some(WakeHold::CannotType)));
+        assert_eq!(attention(&state, &tabs()).as_deref(), Some("✉ 4 held"));
+    }
+
+    /// Issue #2387: the reported symptom. The header counted pane accounts
+    /// the deck holds a message for, whether or not any card on screen showed
+    /// it, so it could say `✉ 2 held` while no card said held. It now counts
+    /// the cards: an account with no card is not named, and a card that
+    /// arrives for it is.
+    #[test]
+    fn deck_attention_counts_only_cards_that_carry_the_marker() {
+        let mut state = AppState::default();
+        state.apply_inbox_summary(
+            "unseen-pane",
+            "a1",
+            &summary(1, Some(WakeHold::PossibleDraft)),
+        );
+        state.apply_inbox_summary(
+            "other-unseen",
+            "a2",
+            &summary(1, Some(WakeHold::CannotType)),
+        );
+        assert_eq!(attention(&state, &[]), None, "no card, nothing to name");
+        assert_eq!(deck_attention_short(&state), None);
+        card(&mut state, "seen-pane", "a3", "seen");
+        state.apply_inbox_summary("seen-pane", "a3", &summary(1, Some(WakeHold::CannotType)));
+        assert_eq!(attention(&state, &[]).as_deref(), Some("✉ held: seen"));
+        assert_eq!(deck_attention_short(&state).as_deref(), Some("✉ 1 held"));
     }
 
     /// The item is bound to the pane's current generation: a successor with
     /// a clean inbox is not named, and its predecessor's late update does not
-    /// mark it. A hold this build does not know reads as the stall's words.
+    /// mark it. A hold this build does not know still names the card.
     #[test]
-    fn deck_attention_follows_the_generation_and_reads_unknown_holds_as_stalled() {
+    fn deck_attention_follows_the_generation_and_names_unknown_holds() {
         let mut state = AppState::default();
+        card(&mut state, "captain-pane", "a1", "captain");
+        card(&mut state, "coder-pane", "a2", "coder");
         state.apply_inbox_summary(
             "captain-pane",
             "a1",
             &summary(1, Some(WakeHold::PossibleDraft)),
         );
         state.apply_inbox_summary("coder-pane", "a2", &summary(1, Some(WakeHold::Unknown)));
+        assert_eq!(
+            attention(&state, &tabs()).as_deref(),
+            Some("✉ held: team / captain, team / coder")
+        );
+        state.sessions.remove("s-a1");
+        card(&mut state, "captain-pane", "a9", "captain");
         state.apply_inbox_summary("captain-pane", "a9", &summary(0, None));
         state.apply_inbox_notice(&wake_update(
             "captain-pane",
             "a1",
             Some(WakeHold::PossibleDraft),
         ));
-        assert_eq!(deck_attention(&state, &tabs()).as_deref(), Some("✉ 1 held"));
+        assert_eq!(
+            attention(&state, &tabs()).as_deref(),
+            Some("✉ held: team / coder")
+        );
         state.apply_inbox_notice(&wake_update(
             "captain-pane",
             "a9",
             Some(WakeHold::UncertainInput),
         ));
         assert_eq!(
-            deck_attention(&state, &tabs()),
-            Some(format!(
-                "✉ captain: {} · 1 other held",
-                crate::inbox_display::WAKE_HOLD_UNCERTAIN_INPUT_ALONE
-            ))
+            attention(&state, &tabs()).as_deref(),
+            Some("✉ held: team / captain, team / coder")
         );
         state.apply_inbox_notice(&wake_update("captain-pane", "a9", None));
         state.apply_inbox_notice(&wake_update("coder-pane", "a2", None));
-        assert_eq!(deck_attention(&state, &tabs()), None);
-        let mut alone = AppState::default();
-        alone.apply_inbox_summary("captain-pane", "a1", &summary(1, Some(WakeHold::Unknown)));
+        assert_eq!(attention(&state, &tabs()), None);
+    }
+
+    /// Issue #2387: once the item is drawn, each held name it shows is a
+    /// click target for its card, cut where the row cuts the name; the gap
+    /// between names is not, and the count form names nobody to click.
+    #[test]
+    fn deck_attention_records_where_each_name_is_drawn() {
+        let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+        ui.deck_attention_held = vec![
+            ("s-a".to_string(), "captain".to_string()),
+            ("s-b".to_string(), "coder".to_string()),
+        ];
+        let row = Rect::new(0, 0, 26, 1);
+        let mut buf = ratatui::buffer::Buffer::empty(row);
+        draw_deck_attention(&mut buf, row, 4, "✉ held: captain, coder", "✉ 2 held");
+        record_attention_hits(&mut ui, &buf, row);
         assert_eq!(
-            deck_attention(&alone, &tabs()),
-            Some(format!("✉ captain: {WAKE_STALLED}: send it a prompt"))
+            ui.deck_attention_hits,
+            vec![
+                ("s-a".to_string(), Rect::new(14, 0, 7, 1)),
+                ("s-b".to_string(), Rect::new(23, 0, 3, 1)),
+            ]
         );
+        assert!(matches!(
+            hit_test_attention(&ui.deck_attention_hits, 15, 0),
+            Some(Action::RevealCard(id)) if id == "s-a"
+        ));
+        assert!(hit_test_attention(&ui.deck_attention_hits, 22, 0).is_none());
+        ui.deck_attention_hits.clear();
+        let row = Rect::new(0, 0, 12, 1);
+        let mut buf = ratatui::buffer::Buffer::empty(row);
+        draw_deck_attention(&mut buf, row, 3, "✉ held: captain, coder", "✉ 2 held");
+        record_attention_hits(&mut ui, &buf, row);
+        assert!(ui.deck_attention_hits.is_empty(), "the count names nobody");
+    }
+
+    /// Issue #2387: the card a click on a held name asked for is selected
+    /// once the frame's card list holds it, the way a click on the card
+    /// selects it; a filter that hides it is cleared first, and the card
+    /// selected on the frame after.
+    #[test]
+    fn a_revealed_card_is_selected_and_a_hiding_filter_cleared() {
+        let ctrl = Arc::new(EmbeddedPaneController::for_render_seam_without_panes());
+        let mut tabs = TabManager::new(ctrl.clone() as Arc<dyn PaneController>);
+        let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+        let mut state = AppState::default();
+        card(&mut state, "a-pane", "a1", "alpha");
+        card(&mut state, "b-pane", "a2", "bravo");
+        let ids: Vec<String> = vec!["s-a1".to_string(), "s-a2".to_string()];
+        let list: Vec<(&String, &SessionState)> =
+            ids.iter().map(|id| (id, &state.sessions[id])).collect();
+
+        ui.filter_text = "alpha".to_string();
+        let before = ui.selected_index;
+        apply_pending_reveal(&mut ui, &mut tabs, &*ctrl, &list[..1], "s-a2");
+        assert!(ui.filter_text.is_empty(), "the filter hid it, so it goes");
+        assert_eq!(ui.pending_reveal.as_deref(), Some("s-a2"), "asked again");
+        assert_eq!(ui.selected_index, before, "nothing selected yet");
+
+        let asked = ui.pending_reveal.take().unwrap();
+        apply_pending_reveal(&mut ui, &mut tabs, &*ctrl, &list, &asked);
+        assert_eq!(ui.selected_index, Some(1));
+        assert!(matches!(
+            tabs.active_tab(),
+            Tab::Dashboard { selected_session_id: Some(id), .. } if id == "s-a2"
+        ));
+        assert_eq!(ui.pending_reveal, None);
     }
 
     /// The item follows the tabs on the strip's row and is clipped at its end;
@@ -18179,11 +18537,11 @@ mod deck_attention_tests {
             &mut buf,
             Rect::new(0, 0, 30, 1),
             10,
-            "✉ captain: held for a reason",
-            "✉ 1 held",
+            "✉ held: captain, coder-bravo",
+            "✉ 2 held",
         );
         let row: String = (0..30).map(|x| buf[(x, 0)].symbol().to_string()).collect();
-        assert_eq!(row, "            ✉ captain: held fo");
+        assert_eq!(row, "            ✉ held: captain, c");
         let title: String = deck_title_line(1, 1, "", Some(("✉ 2 held", "✉ 2 held")), 80)
             .spans
             .iter()
@@ -18281,7 +18639,7 @@ mod deck_attention_tests {
     /// and the attention item still shows after them, not hidden off its end.
     #[test]
     fn deck_attention_keeps_its_room_when_the_tabs_crowd_the_row() {
-        let attention = format!("✉ captain: {WAKE_HOLD_POSSIBLE_DRAFT} · 1 other held");
+        let attention = "✉ held: release-orchestrator, reviewer-alpha, coder-bravo".to_string();
         let labels = [
             "Dashboard",
             "release-train-alpha1",
@@ -18289,7 +18647,7 @@ mod deck_attention_tests {
             "release-train-delta3",
         ];
         let (row, headers) = crowded_strip(&labels, &attention, 80);
-        assert!(row.contains("✉ captain: waiting"), "{row}");
+        assert!(row.contains("✉ held: release-orch"), "{row}");
         assert_eq!(
             headers.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
             vec![0, 1, 2, 3],
@@ -18311,7 +18669,7 @@ mod deck_attention_tests {
     /// Scenario: a deck holding its orchestrator is drawn at narrow widths, with four tabs and with only the Dashboard tab, whose title row then carries the item, or, with no agents on the deck, its top row. At every width the item is still on the top row: its words where they fit, otherwise its short form, `✉ 2 held`.
     #[test]
     fn deck_attention_stays_on_a_narrow_row() {
-        let attention = format!("✉ captain: {WAKE_HOLD_POSSIBLE_DRAFT} · 1 other held");
+        let attention = "✉ held: release-orchestrator, reviewer-alpha, coder-bravo".to_string();
         let labels = [
             "Dashboard",
             "release-train-alpha1",
@@ -18345,7 +18703,7 @@ mod deck_attention_tests {
         assert!(title(40).contains("agent(s)  ✉ 2 held"), "{:?}", title(40));
         // Wide enough, the words, after the title.
         assert!(
-            title(120).contains("agent(s)  ✉ captain: waiting"),
+            title(120).contains("agent(s)  ✉ held: release-orchestrator"),
             "{:?}",
             title(120)
         );
@@ -18354,7 +18712,7 @@ mod deck_attention_tests {
             |width| frame_top_row(&["Dashboard"], &attention, "✉ 2 held", width, false, 0).0;
         assert!(empty(10).starts_with(" ✉ 2 held"), "{:?}", empty(10));
         assert!(
-            empty(30).starts_with(" ✉ captain: waiting"),
+            empty(30).starts_with(" ✉ held: release-orch"),
             "{:?}",
             empty(30)
         );
@@ -18463,6 +18821,7 @@ fn render_card_grid(
     let row_chunks = Layout::vertical(constraints).split(area);
 
     frame.render_widget(title, row_chunks[0]);
+    record_attention_hits(ui, frame.buffer_mut(), row_chunks[0]);
 
     for (vi, (row, ids)) in rows.iter().zip(row_ids.iter()).enumerate() {
         let col_constraints: Vec<Constraint> = (0..cols)
@@ -18812,6 +19171,7 @@ fn render_frame(
             );
         }
         ui.deck_attention_in_tab_bar = true;
+        record_attention_hits(ui, frame.buffer_mut(), tab_bar_rect);
         ui.tab_header_rects = strip.headers;
         ui.tab_close_rects = strip.closes;
     } else {
@@ -18907,6 +19267,14 @@ fn render_frame(
                         ..dashboard_area
                     },
                 );
+                record_attention_hits(
+                    ui,
+                    frame.buffer_mut(),
+                    Rect {
+                        height: 1,
+                        ..dashboard_area
+                    },
+                );
             }
         }
         let ctx_buttons = dashboard_context_buttons(
@@ -18966,6 +19334,7 @@ fn render_frame(
             ])
             .split(dashboard_area);
             frame.render_widget(title, vertical[0]);
+            record_attention_hits(ui, frame.buffer_mut(), vertical[0]);
 
             let msg = Paragraph::new("No agents match filter.")
                 .style(text_primary())
@@ -24955,10 +25324,20 @@ fn render_session_card(
     } else {
         session.card_inbox()
     };
+    // Issue #2387: the deck holds a message for this agent. Beside the status,
+    // never instead of it: the status is what the agent is doing, this is
+    // what the deck is doing. Read from the card's own inbox, placeholder or
+    // not, because it is what the deck-wide attention item names
+    // (`AppState::held_cards`).
+    let held_marker = session
+        .card_inbox()
+        .and_then(|inbox| inbox.attention_words())
+        .map(|_| format!("{} ", crate::inbox_display::ATTENTION_HELD));
+    let status_badge = format!("{status_text}{}", held_marker.as_deref().unwrap_or(""));
     let chip_inbox = inbox
         .as_ref()
-        .and_then(|inbox| card_inbox_badge(inbox, &status_text, area.width as usize));
-    let status_width = unicode_width::UnicodeWidthStr::width(status_text.as_str());
+        .and_then(|inbox| card_inbox_badge(inbox, &status_badge, area.width as usize));
+    let status_width = unicode_width::UnicodeWidthStr::width(status_badge.as_str());
     let badge_width = status_width
         + chip_inbox
             .as_deref()
@@ -25322,6 +25701,9 @@ fn render_session_card(
     let title_spans = truncate_styled_segments(title_segments, title_budget);
     block = block.title(Line::from(title_spans)).title({
         let mut badge = vec![Span::styled(status_text, status_style)];
+        if let Some(marker) = held_marker {
+            badge.push(Span::styled(marker, deck_attention_style()));
+        }
         if let Some(inbox) = chip_inbox {
             badge.push(Span::styled(inbox, text_primary()));
         }
@@ -39240,6 +39622,49 @@ mod tests {
         assert_eq!(rows[0], "┌ 1 ClaudeCode · … ● Working ✉1 queued ┐");
         assert_eq!(rows[1], "│ORCHESTRATOR                          │");
         assert_eq!(rows.len(), 3);
+    }
+
+    /// Scenario: draw an 80-column Working card the deck holds a message for,
+    /// one Idle card the deck holds nothing for, and a narrow held card. The
+    /// held card carries `held` beside its status, which stays Working; the
+    /// other card has no marker; and the narrow card keeps the marker and the
+    /// status while its inbox line gives way.
+    #[test]
+    #[spec("inbox/status/044")]
+    fn status_044_a_held_card_carries_the_marker_beside_its_status() {
+        let held = session_with_inbox(
+            SessionStatus::Working,
+            &crate::inbox_display::CardInbox {
+                pending: 1,
+                hold: Some(crate::inbox_display::WakeHold::CannotType),
+                ..Default::default()
+            },
+        );
+        let free = session_with_inbox(
+            SessionStatus::Idle,
+            &crate::inbox_display::CardInbox {
+                pending: 1,
+                ..Default::default()
+            },
+        );
+        let rows = |session: &SessionState, width| {
+            card_rows(session, "lead", width, CardDensity::Compact, false).join("\n")
+        };
+        insta::assert_snapshot!(rows(&held, 80), @r"
+        ┌ 1 ClaudeCode · lead ────────────────────────────────────── ● Working held ✉1 ┐
+        │Dir:  —                                                                       │
+        │✉1 waiting for the agent to fetch it. Send it a prompt.                       │
+        │                                                                              │
+        └────────────────────────────────────────────────────────── Last: 0s  Tools: 0 ┘
+        ");
+        let plain = rows(&free, 80);
+        assert!(
+            !plain.contains(crate::inbox_display::ATTENTION_HELD),
+            "{plain}"
+        );
+        let narrow = rows(&held, 34);
+        let top = narrow.lines().next().unwrap();
+        assert!(top.contains("● Working held"), "{narrow}");
     }
 
     /// Scenario: draw the orchestrator seat's card at 66 columns while its wake

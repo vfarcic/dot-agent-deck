@@ -1,30 +1,43 @@
 import { describe, expect, it } from "vitest";
 import type { AgentInbox, AgentSession, WakeHold } from "../types";
 import cardCases from "../../../tests/fixtures/inbox-card-cases.json";
-import { deckAttentionText, holdDetailText, holdDetailWords, inboxAttentionWords, inboxBadge, inboxNotice, inputHeldText, INBOX_WORDS, MAX_HOLD_DETAIL_CHARS } from "./inboxWords";
+import { deckAttentionText, heldAgents, holdDetailText, holdDetailWords, inboxAttentionWords, inboxBadge, inboxNotice, inputHeldText, INBOX_WORDS, MAX_HOLD_DETAIL_CHARS } from "./inboxWords";
 
 function inbox(queued: number, wakeHold?: WakeHold): AgentInbox {
   return { queued, fetched: 0, undeliverable: 0, wake: "doorbell", ...(wakeHold ? { wakeHold } : {}) };
 }
 
 function agent(role: string, isStartRole: boolean, agentInbox?: AgentInbox): AgentSession {
-  return { id: role, role, isStartRole, ...(agentInbox ? { inbox: agentInbox } : {}) } as AgentSession;
+  return { id: role, role, displayName: role, tab: { kind: "dashboard" }, isStartRole, ...(agentInbox ? { inbox: agentInbox } : {}) } as AgentSession;
 }
 
 // PRD #1666 part 3, round 5-wake (Q6): the header's attention item. The TUI's
 // `deck_attention_text` tests in `src/inbox_display.rs` pin the same strings.
 describe("deck attention words", () => {
-  /// Scenario: A held start role is named with its hold's words and every other held agent is counted, in the strings the TUI pins too.
-  it("names one held orchestrator and counts the rest", () => {
+  /// Scenario: The header names the held agents, start roles first and then by name, in the strings the TUI pins too; past three it counts them, and an agent with mail but no hold is neither named nor counted.
+  it("names the held agents, start roles first, and counts past three", () => {
     expect(deckAttentionText([
       agent("Coder", false, inbox(1, "not_taken")),
       agent("Captain", true, inbox(1, "possible_draft")),
       agent("Quiet", false, inbox(3)),
-    ])).toBe("✉ Captain: waiting: there may be an unsent draft. Send it or clear it. · 1 other held");
-    expect(deckAttentionText([agent("Captain", true, inbox(1, "paste_open"))]))
-      .toBe("✉ Captain: waiting: a paste into its input has not finished.");
-    expect(deckAttentionText([agent("A", false, inbox(1, "cannot_type")), agent("B", false, inbox(2, "awaiting_prompt"))])).toBe("✉ 2 held");
+      agent("archivist", false, inbox(0, "uncertain_input")),
+    ])).toBe("✉ held: Captain, archivist, Coder");
+    expect(deckAttentionText([agent("Captain", true, inbox(1, "paste_open"))])).toBe("✉ held: Captain");
+    expect(deckAttentionText(["A", "B", "C", "D"].map((name) => agent(name, false, inbox(1, "cannot_type"))))).toBe("✉ 4 held");
     expect(deckAttentionText([agent("Captain", true, inbox(2))])).toBeUndefined();
+  });
+
+  /// Scenario: Two orchestration runs each hold their `coder`: the header names each after its run's name, as their tiles are titled, so the two read apart.
+  it("names a run's agents after the run, so two runs' roles read apart", () => {
+    const coder = (run: string) => ({ ...agent("coder", false, inbox(1, "cannot_type")), id: `${run}-coder`, tab: { kind: "orchestration", name: run, roleIndex: 1, roleName: "coder", isStartRole: false } }) as AgentSession;
+    expect(deckAttentionText([coder("run-b"), coder("run-a")])).toBe("✉ held: run-a / coder, run-b / coder");
+  });
+
+  /// Scenario: The agents the header counts are exactly those with attention words, the same predicate the held marker on a tile reads.
+  it("lists exactly the agents a marker is drawn for", () => {
+    const agents = [agent("A", false, inbox(1, "unknown")), agent("B", false, inbox(0, "possible_draft")), agent("C", false, inbox(0, "dialog_during_ring"))];
+    expect(heldAgents(agents).map((entry) => entry.name)).toEqual(agents.filter((each) => inboxAttentionWords(each.inbox) !== undefined).map((each) => each.role));
+    expect(heldAgents(agents).map((entry) => entry.words)).toEqual(["waiting to wake: send it a prompt", INBOX_WORDS.wakeHoldsAlone.dialog_during_ring]);
   });
 
   /// Scenario: An agent's attention words are its hold's words while mail waits, the stall's for an unknown hold, the standalone warnings with nothing waiting, and nothing otherwise.
