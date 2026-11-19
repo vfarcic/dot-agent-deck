@@ -1262,7 +1262,11 @@ export type VoiceOutcomeDto =
   | { kind: "transcription_failed"; detail: string; sentence: string }
   /** PRD #1497 D8 — heard while the app was speaking and not a way of
       silencing it: nothing ran and nothing was sent anywhere. */
-  | { kind: "dropped"; transcript: string; sentence: string };
+  | { kind: "dropped"; transcript: string; sentence: string }
+  /** PRD #1184 — an utterance answered as two or three steps that the app
+      would not run: a chain rule refused it, or one of its steps could not
+      run on the screen the earlier steps would leave. Nothing ran. */
+  | { kind: "chain_refused"; transcript: string; sentence: string };
 
 /**
  * One utterance's outcome, plus what it cost (`voice::VoiceResult`).

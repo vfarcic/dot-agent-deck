@@ -43,6 +43,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+use super::chain::{Lands, Plan as ChainPlan};
 use super::choice::{ChoiceLive, MAX_CHOICES};
 use super::command_text::grounded_command_text;
 use super::dictation::{
@@ -53,6 +54,7 @@ use super::dictation::{
 };
 use super::filter::grounded_filter_text;
 use super::meaning::{Ballot, MeaningRequest, MeaningVerdict, Place, Strictness, every_action};
+use super::resolver::IntentStep;
 use super::resolver::{IntentAnswer, IntentError, IntentRequest, IntentResolver};
 use super::schema::{
     DECK_HIDDEN_HINT, LABELS_WITHHELD_HINT, annotate_for, hidden_by_flag, needs_labels,
@@ -589,6 +591,14 @@ pub enum VoiceOutcome {
         transcript: Transcript,
         sentence: String,
     },
+    /// PRD #1184: an utterance answered as two or three steps that the app
+    /// would not run — a rule of [`super::chain`] refused it, or one of its
+    /// steps could not run on the screen the earlier ones would leave.
+    /// Nothing ran, and `sentence` says which rule or which step.
+    ChainRefused {
+        transcript: Transcript,
+        sentence: String,
+    },
 }
 
 impl VoiceOutcome {
@@ -605,7 +615,8 @@ impl VoiceOutcome {
             | VoiceOutcome::ParamAmbiguous { sentence, .. }
             | VoiceOutcome::ResolutionFailed { sentence, .. }
             | VoiceOutcome::TranscriptionFailed { sentence, .. }
-            | VoiceOutcome::Dropped { sentence, .. } => sentence,
+            | VoiceOutcome::Dropped { sentence, .. }
+            | VoiceOutcome::ChainRefused { sentence, .. } => sentence,
         }
     }
 
@@ -687,6 +698,13 @@ impl VoiceOutcome {
     fn dropped(transcript: Transcript) -> Self {
         Self::Dropped {
             sentence: heard(&transcript, DROPPED_WHILE_SPEAKING),
+            transcript,
+        }
+    }
+
+    fn chain_refused(transcript: Transcript, why: &str) -> Self {
+        Self::ChainRefused {
+            sentence: heard(&transcript, why),
             transcript,
         }
     }
@@ -1257,6 +1275,38 @@ async fn after_local_intercepts(
         return finish(VoiceOutcome::no_match(transcript));
     }
 
+    // PRD #1184: an answer of two or three steps. The rules that need no
+    // model are applied first ([`super::chain::plan`]); a chain that passes
+    // them is checked step by step, each on its own words, and the
+    // whole-sentence ballot sent above is dropped unread — a chain's steps are
+    // never grounded in the whole sentence, which is how a hostile label
+    // could smuggle a second action into a sentence that supports only the
+    // first.
+    if let Some(steps) = answer.chain() {
+        match super::chain::plan(table, transcript.text(), &answer.action, steps) {
+            ChainPlan::Single => {}
+            ChainPlan::Refused(refusal) => {
+                return finish(VoiceOutcome::chain_refused(transcript, &refusal.why()));
+            }
+            ChainPlan::Steps(rows) => {
+                drop(ballot);
+                let context = ChainContext {
+                    resolver,
+                    table,
+                    screen,
+                    agents,
+                    decks,
+                    directories,
+                    new_agent,
+                    withheld,
+                    show_deck,
+                };
+                let outcome = chain_outcome(&context, transcript, &rows).await;
+                return result(outcome, Some(millis(started.elapsed())));
+            }
+        }
+    }
+
     // The case PRD #802's four-outcome list could not express: a backend that
     // named an action outside the table. Impossible under grammar-constrained
     // decoding and refused by the schema under either shipping protocol's
@@ -1278,15 +1328,6 @@ async fn after_local_intercepts(
     // classifier still out it is waited for, within its bound, and a backend
     // error, an unreadable reply and a timeout on both votes refuse the pick
     // with the reason ([`Ballot::first`]).
-    let first = match ballot.first().await {
-        Ok(first) => first,
-        Err(error) => {
-            return result(
-                VoiceOutcome::meaning_unchecked(transcript, row, &error),
-                Some(millis(started.elapsed())),
-            );
-        }
-    };
     let picked = Picked {
         table,
         screen,
@@ -1300,6 +1341,31 @@ async fn after_local_intercepts(
         answer: &answer,
         row,
     };
+    let outcome = settle(&picked, &mut ballot).await;
+    // What the user waited for is both calls.
+    result(outcome, Some(millis(started.elapsed())))
+}
+
+/// A pick, settled against the meaning check's ballot: wait for the first
+/// readable vote (refusing as unchecked when none comes), decide, and wait
+/// for the second vote only when it could change the decision.
+///
+/// The single-command path and each step of a chain (PRD #1184) both end
+/// here, so a step is held to exactly the checks a command said on its own
+/// is held to.
+async fn settle(picked: &Picked<'_>, ballot: &mut Ballot<'_>) -> VoiceOutcome {
+    let Picked {
+        table,
+        directories,
+        new_agent,
+        transcript,
+        row,
+        ..
+    } = *picked;
+    let first = match ballot.first().await {
+        Ok(first) => first,
+        Err(error) => return VoiceOutcome::meaning_unchecked(transcript.clone(), row, &error),
+    };
     let judged = Judged {
         first,
         second: Second::NotAwaited,
@@ -1309,7 +1375,7 @@ async fn after_local_intercepts(
         directories,
         new_agent,
     };
-    let mut outcome = decide(&picked, &judged);
+    let mut outcome = decide(picked, &judged);
     // The second vote is waited for only when it could change the decision —
     // a `yes` that needs two votes, or a `no` one more could turn — so an
     // ordinary command the first vote lists never waits on the slower of two
@@ -1324,7 +1390,7 @@ async fn after_local_intercepts(
             target_open: Cell::default(),
             ..judged
         };
-        outcome = decide(&picked, &judged);
+        outcome = decide(picked, &judged);
         // A refusal the missing vote decided is the app failing to check,
         // not the user's words failing to ask — said of the row whose own
         // question that vote left undecided ([`Judged::unchecked`]).
@@ -1337,8 +1403,143 @@ async fn after_local_intercepts(
             outcome = VoiceOutcome::meaning_unchecked(transcript.clone(), unchecked, error);
         }
     }
-    // What the user waited for is both calls.
-    result(outcome, Some(millis(started.elapsed())))
+    outcome
+}
+
+/// What a chain's steps are checked against (PRD #1184): the same
+/// declaration a single pick is, before the first step moves anything.
+struct ChainContext<'c> {
+    resolver: &'c dyn IntentResolver,
+    table: &'c CommandTable,
+    screen: Screen,
+    agents: &'c [DesktopAgent],
+    decks: &'c [VoiceDeck],
+    directories: Option<&'c VoiceDirectories>,
+    new_agent: Option<&'c VoiceNewAgent>,
+    withheld: bool,
+    show_deck: bool,
+}
+
+/// The words of a refusal after its "Heard: “…” — " and without its full
+/// stop, to quote inside a chain's own sentence.
+fn situation_of(sentence: &str) -> &str {
+    let after = sentence
+        .split_once("\u{201d} — ")
+        .map(|(_, rest)| rest)
+        .unwrap_or(sentence);
+    after.strip_suffix('.').unwrap_or(after)
+}
+
+/// PRD #1184: check a chain's steps one by one, each against the screen the
+/// steps before it would leave, and answer the whole utterance.
+///
+/// Each step is a pick of its own: its words alone go to the meaning check
+/// (two votes, at the predicted screen), and it goes through [`settle`] —
+/// every check a command said on its own goes through, with the step's words
+/// as the transcript, so a deck or agent named in another step is not counted
+/// as named for this one. A step must come out a dispatch; the position rules
+/// are then applied to the row that DISPATCHES, which a redirect may have
+/// changed. **If any step fails, nothing runs**, and the sentence names the
+/// step and quotes its own refusal unchanged.
+async fn chain_outcome(
+    context: &ChainContext<'_>,
+    transcript: Transcript,
+    rows: &[(&IntentStep, &CommandRow)],
+) -> VoiceOutcome {
+    let table = context.table;
+    let mut screen = context.screen;
+    let (directories, new_agent) = (context.directories, context.new_agent);
+    let mut deck_switched = false;
+    let last = rows.len() - 1;
+    for (at, &(step, row)) in rows.iter().enumerate() {
+        let number = at + 1;
+        let said = Transcript::new(step.said.clone());
+        let refuse = |why: String| {
+            VoiceOutcome::chain_refused(
+                transcript.clone(),
+                &format!(
+                    "step {number} (\u{201c}{}\u{201d}) could not run: {why}; nothing was done",
+                    said.text()
+                ),
+            )
+        };
+        let classification = MeaningRequest::new(&said, table, &every_action(table)).at(Place::of(
+            screen,
+            directories,
+            new_agent,
+        ));
+        let mut ballot = Ballot::new([
+            context.resolver.judge_meaning(classification.clone()),
+            context.resolver.judge_meaning(classification),
+        ]);
+        let answer = step.answer();
+        let picked = Picked {
+            table,
+            screen,
+            agents: context.agents,
+            decks: context.decks,
+            directories,
+            new_agent,
+            transcript: &said,
+            withheld: context.withheld,
+            show_deck: context.show_deck,
+            answer: &answer,
+            row,
+        };
+        let outcome = settle(&picked, &mut ballot).await;
+        let VoiceOutcome::Dispatch { action, params, .. } = &outcome else {
+            return refuse(situation_of(outcome.sentence()).to_string());
+        };
+        let dispatched = table.row(action).unwrap_or(row);
+        if deck_switched
+            && params.iter().any(|param| {
+                matches!(
+                    param.kind,
+                    ParamKind::AgentRef | ParamKind::OrchestrationRef
+                )
+            })
+        {
+            return refuse(
+                "the daemon it switches to has not shown its agents yet, so say the agent in a command of its own"
+                    .to_string(),
+            );
+        }
+        match super::chain::position(dispatched) {
+            super::chain::Position::Never => {
+                return refuse(format!(
+                    "asking to {} is said on its own, never with other steps",
+                    dispatched.asks_to
+                ));
+            }
+            super::chain::Position::LastOnly if at != last => {
+                return refuse(format!(
+                    "asking to {} can only be the last thing in one sentence",
+                    dispatched.asks_to
+                ));
+            }
+            super::chain::Position::LastOnly => {}
+            super::chain::Position::Before(lands) => match lands {
+                Lands::View(to) => {
+                    // A view move under an open New agent dialog leaves the
+                    // dialog where it was or not, depending on the screen —
+                    // not something the next step can be judged against.
+                    if at != last && (directories.is_some() || new_agent.is_some()) {
+                        return refuse(
+                            "moving the view while the New agent dialog is open can only be the last thing in one sentence"
+                                .to_string(),
+                        );
+                    }
+                    screen = to;
+                }
+                Lands::Stays => {}
+                Lands::DeckSwitched => deck_switched = true,
+            },
+        }
+    }
+    VoiceOutcome::chain_refused(
+        transcript,
+        "doing several things from one sentence is not enabled yet, so nothing was done; say one command at a time",
+    )
 }
 
 /// Everything [`decide`] reads besides the meaning check's answers: what the

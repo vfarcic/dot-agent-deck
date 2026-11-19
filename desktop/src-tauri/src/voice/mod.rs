@@ -41,6 +41,7 @@
 //! are what the panel will call.
 
 pub mod capture;
+pub mod chain;
 pub mod choice;
 mod command_text;
 pub mod dictation;
@@ -67,6 +68,9 @@ pub mod table;
 pub mod transcribe;
 pub mod wake;
 
+#[cfg(test)]
+#[path = "chain_tests.rs"]
+mod chain_tests;
 #[cfg(test)]
 #[path = "choice_tests.rs"]
 mod choice_tests;
