@@ -244,6 +244,9 @@ pub struct DashboardConfig {
     /// a `config set` of another key writes no `[notifications]` table.
     #[serde(skip_serializing_if = "NotificationsConfig::is_default")]
     pub notifications: NotificationsConfig,
+    /// PRD #2119: inert. Nothing opens the config-generation dialog on its
+    /// own, so nothing reads this; the key stays accepted so existing configs
+    /// and `config set auto_config_prompt …` keep working.
     pub auto_config_prompt: bool,
     /// PRD #1258: the `[host_metrics]` table — the thresholds this deck's
     /// daemon judges its host's disk, memory and load by
@@ -2351,6 +2354,9 @@ fn config_gen_state_path() -> PathBuf {
     config_dir().join("config-gen-state.json")
 }
 
+/// PRD #2119: the config-generation dialog no longer offers "Never", so the
+/// TUI neither reads nor writes this file; the type stays so a file recorded by
+/// an earlier build still loads (`dashboard/config-gen/002`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ConfigGenState {

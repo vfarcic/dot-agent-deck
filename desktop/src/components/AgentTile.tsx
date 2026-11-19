@@ -9,6 +9,7 @@ import {
   CircleDot,
   CircleStop,
   FileCode2,
+  FileCog,
   GitCompareArrows,
   Handshake,
   Maximize2,
@@ -36,7 +37,7 @@ import { blockedReasonText } from "../lib/blockedReason";
 import { attentionReason, inboxActionText, inboxAttentionWords, inboxBadge, inboxNotice, inputHeldText, INBOX_WORDS } from "../lib/inboxWords";
 import { displayBackgroundWork, displayUptime } from "../lib/displayText";
 import { agentTitle } from "../lib/agentNames";
-import { OVERVIEW_CLOCK_TICK_MS } from "./AgentOverview";
+import { configActionVerb, OVERVIEW_CLOCK_TICK_MS } from "./AgentOverview";
 import { OutputReader } from "./OutputReader";
 import { PullRequestBadge } from "./PullRequestBadge";
 import { OpenPullRequest } from "../lib/prBrowser";
@@ -274,6 +275,13 @@ export interface AgentTileProps {
   /** Ask to end the agent, separately from the view-only Back control (issue #1402). */
   stopContext?: Pick<VoiceActionContext, "confirmStopAgent" | "reportRefused">;
   /**
+   * PRD #2119 — the open pane's Generate config: `context` is what its button
+   * dispatches `VOICE_ACTIONS.confirmGenerateConfig` through, and `notice` is
+   * the outcome of a request sent for this agent, shown in the pane so it is
+   * not hidden behind it.
+   */
+  generateConfig?: { context?: Pick<VoiceActionContext, "confirmGenerateConfig" | "reportRefused">; notice?: string };
+  /**
    * PRD #1666 §6.4 — Retry or Cancel one deck message the tile lists, at the
    * revision it shows. Supplied only where a daemon can answer: without it the
    * rows show no buttons, as a control that does nothing must not exist.
@@ -357,8 +365,10 @@ export function AgentTile({
   panePresent,
   onClose,
   stopContext,
+  generateConfig,
   onInboxAction,
 }: AgentTileProps) {
+  const generateContext = generateConfig?.context;
   /* PRD #1401 — the badge opens the in-app browser where the shell offers one. */
   const openPullRequest = useContext(OpenPullRequest);
   /* PRD #1666 part 2 (G-fix6): keystrokes and sizes carry the incarnation of
@@ -606,6 +616,10 @@ export function AgentTile({
                 messages waiting on the user's Retry or Cancel. */}
             {/* PRD #1666 part 3 (Q35, core §7): the deck holds what the user
                 typed into this pane, and says why — the TUI card's row. */}
+            {/* PRD #2119: what became of Generate config for this agent. */}
+            {generateConfig?.notice && (
+              <p className="agent-config-notice" role="status" data-testid={`config-notice-${agent.id}`}>{generateConfig.notice}</p>
+            )}
             {inputHeldRow && !held && (
               <p className="agent-inbox-notice" data-testid={`input-held-${agent.id}`}>{inputHeldRow}</p>
             )}
@@ -644,6 +658,22 @@ export function AgentTile({
               onClick={onOpen}
             ><Maximize2 size={13} /></button>
           )}
+          {/* PRD #2119 — Update config when the daemon reports the project already has one; each label written out whole for the voice table's label check. */}
+          {generateContext && (configActionVerb(agent) === "Update" ? (
+            <button
+              className="agent-generate-config-control"
+              title="Update config"
+              onMouseDown={(event) => event.stopPropagation()}
+              onClick={() => VOICE_ACTIONS.confirmGenerateConfig.run(generateContext, { deckId: agent.daemonId, agentId: agent.id, incarnation: agent.incarnation, from: "overview" })}
+            ><FileCog size={14} aria-hidden="true" /> Update config</button>
+          ) : (
+            <button
+              className="agent-generate-config-control"
+              title="Generate config"
+              onMouseDown={(event) => event.stopPropagation()}
+              onClick={() => VOICE_ACTIONS.confirmGenerateConfig.run(generateContext, { deckId: agent.daemonId, agentId: agent.id, incarnation: agent.incarnation, from: "overview" })}
+            ><FileCog size={14} aria-hidden="true" /> Generate config</button>
+          ))}
           {stopContext && (
             <button
               className="agent-stop-control"
