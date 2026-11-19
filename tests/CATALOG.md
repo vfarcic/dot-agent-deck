@@ -5865,7 +5865,7 @@ without depending on the config struct API.
 ##### orchestration/lock/010 — Global chords still fire while a worker pane is focused and the deck is locked.
 - **Layer:** L2 PTY-attached.
 - **Agent:** none (fixture `tests/fixtures/orch-deck`).
-- **Asserts:** with the non-orchestrator worker role focused and the deck LOCKED, `Ctrl+n` (`new_pane`) opens the New Agent form — global chords resolve before the PTY-forward fallback the lock gates. Regression guard against an overly-broad gate. (It pressed `Ctrl+t`, `toggle_layout`, until PRD #312 removed that action.)
+- **Asserts:** with the non-orchestrator worker role focused and the deck LOCKED, `Ctrl+n` (`new_pane`) opens the New Agent directory picker — global chords resolve before the PTY-forward fallback the lock gates. Regression guard against an overly-broad gate. (It pressed `Ctrl+t`, `toggle_layout`, until PRD #312 removed that action.)
 - **Does not assert:** the New Agent flow itself (covered by its own tests).
 - **Platform coverage:** mac+linux.
 
