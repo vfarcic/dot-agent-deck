@@ -251,7 +251,9 @@ pub fn data_turn(request: &IntentRequest<'_>) -> Option<String> {
 ///
 /// And once, beside the list rather than on each agent, `agents_daemon`: the
 /// label of the daemon they are all on, from the deck that
-/// [`super::VoiceDeck::holds_agents`].
+/// [`super::VoiceDeck::holds_agents`]. Under All daemons,
+/// `agents_on_other_daemons` lists each other daemon's agents the same way
+/// under its label ([`super::VoiceDeck::agents`], PRD #2374).
 ///
 /// Every observed string here is stripped of control and bidi characters and
 /// bounded ([`shown`]), and lives in the data turn with every other name.
@@ -367,6 +369,32 @@ pub fn state(request: &IntentRequest<'_>) -> Value {
         && !request.agents.is_empty()
     {
         state["agents_daemon"] = json!(deck.label);
+    }
+    // PRD #2374 (PR #2378 review): under All daemons the other daemons' agents
+    // are in reach too, each listed under its daemon's label the way
+    // `agents_on_screen` lists the selected one's.
+    let elsewhere: Vec<Value> = request
+        .decks
+        .iter()
+        .filter(|deck| !deck.holds_agents && !deck.agents.0.is_empty())
+        .map(|deck| {
+            let agents = deck.agents.0.as_slice();
+            let directories = directory_labels(agents);
+            let ranks = newest_ranks(agents);
+            json!({
+                "daemon": deck.label,
+                "agents": agents
+                    .iter()
+                    .zip(directories.iter().zip(&ranks))
+                    .map(|(agent, (directory, rank))| {
+                        agent_state(agent, agents, directory.as_deref(), *rank)
+                    })
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    if !elsewhere.is_empty() {
+        state["agents_on_other_daemons"] = json!(elsewhere);
     }
     let cards = orchestrations(request.agents);
     if !cards.is_empty() {
@@ -751,6 +779,15 @@ pub(crate) mod tests {
                 "dismiss_star_prompt".to_string(),
                 "stop_agent".to_string(),
                 "close_orchestration".to_string(),
+                "set_overview_mode".to_string(),
+                "show_agent_card".to_string(),
+                "next_agent_card".to_string(),
+                "previous_agent_card".to_string(),
+                "next_needs_you_card".to_string(),
+                "filter_needs_you_cards".to_string(),
+                "close_agent_card".to_string(),
+                "run_card_action".to_string(),
+                "reply_to_agent_card".to_string(),
                 "none".to_string(),
             ]
         );
@@ -782,6 +819,11 @@ pub(crate) mod tests {
                 "mode".to_string(),
                 "command".to_string(),
                 "orchestration".to_string(),
+                // PRD #2374's card rows, at the end of the table.
+                "view".to_string(),
+                "needs_you".to_string(),
+                "action".to_string(),
+                "reply".to_string(),
             ]
         );
     }
@@ -933,6 +975,7 @@ pub(crate) mod tests {
                 local: true,
                 unavailable: None,
                 holds_agents: true,
+                agents: Default::default(),
             },
             crate::voice::VoiceDeck {
                 id: "deck-0000000000000002".to_string(),
@@ -941,6 +984,7 @@ pub(crate) mod tests {
                 local: false,
                 unavailable: None,
                 holds_agents: false,
+                agents: Default::default(),
             },
         ];
         let rendered = state(&IntentRequest {
@@ -1292,6 +1336,59 @@ pub(crate) mod tests {
         assert!(!rendered.contains("scroll"), "{rendered}");
     }
 
+    /// Scenario: under All daemons the model is shown the other daemons'
+    /// agents too, each daemon's under its label, named the way the
+    /// selected daemon's are — and nothing for a daemon with none (PRD #2374).
+    #[test]
+    fn voice_prompt_state_lists_the_other_daemons_agents_under_their_daemon() {
+        let commands = commands();
+        let here = [crate::voice::fixtures::agent(
+            "1",
+            Some("Planner"),
+            "claude_code",
+        )];
+        let transcript = Transcript::new("open the coder");
+        let deck = |id: &str, label: &str, holds: bool, agents: Vec<DesktopAgent>| {
+            crate::voice::VoiceDeck {
+                id: id.to_string(),
+                label: label.to_string(),
+                address: None,
+                local: holds,
+                unavailable: None,
+                holds_agents: holds,
+                agents: crate::voice::DeckAgents(agents),
+            }
+        };
+        let decks = [
+            deck("deck-local", "Local deck", true, Vec::new()),
+            deck(
+                "deck-build",
+                "build box",
+                false,
+                vec![crate::voice::fixtures::agent(
+                    "1",
+                    Some("Coder"),
+                    "claude_code",
+                )],
+            ),
+            deck("deck-idle", "idle box", false, Vec::new()),
+        ];
+        let state = state(&IntentRequest {
+            transcript: &transcript,
+            commands: &commands,
+            agents: &here,
+            decks: &decks,
+            directories: None,
+            new_agent: None,
+        });
+        assert_eq!(state["agents_on_screen"][0]["label"], "Planner");
+        let elsewhere = state["agents_on_other_daemons"].as_array().expect("listed");
+        assert_eq!(elsewhere.len(), 1, "{state}");
+        assert_eq!(elsewhere[0]["daemon"], "build box");
+        assert_eq!(elsewhere[0]["agents"][0]["label"], "Coder");
+        assert!(!state.to_string().contains("\"id\""), "{state}");
+    }
+
     #[test]
     fn voice_prompt_state_tells_agents_apart_by_what_the_deck_knows() {
         // Issue #1495: one field per fact a user names an agent by, and the
@@ -1306,6 +1403,7 @@ pub(crate) mod tests {
             local: false,
             unavailable: None,
             holds_agents: true,
+            agents: Default::default(),
         }];
         let state = state(&IntentRequest {
             transcript: &transcript,

@@ -732,7 +732,7 @@ mod tests {
                     request = follow_on;
                 }
                 match request {
-                    AttachRequest::SubscribeEvents => {
+                    AttachRequest::SubscribeEvents { .. } => {
                         let ok = serde_json::to_vec(&AttachResponse::ok()).unwrap();
                         write_frame(&mut wr, KIND_RESP, &ok).await.unwrap();
                         if n.subscriptions.fetch_add(1, Ordering::SeqCst) == 0 {

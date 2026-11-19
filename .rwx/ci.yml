@@ -230,6 +230,14 @@ tasks:
     if: ${{ tasks.backend.values.rust == 'true' }}
     use: [system-packages, code, rust, nextest, go-task, node]
     tool-cache: ci-test-v2
+    # RWX's default task timeout is 10 minutes, and this task sits at it: 100
+    # runs on 2026-11-15..17 (every branch, `main` included) took 500-605s, so
+    # runner variance alone decides whether a run passes. Run 01a1ea8fe0d07a19
+    # was killed at 604s with 9973 of 10094 tests passed and none failed: its
+    # compile took 3m29s where the same branch's previous run took 2m16s. 30m
+    # leaves room for that variance and for a run whose tool cache missed
+    # (docs/develop/rwx.md), while still bounding a wedged run.
+    timeout: 30m
     env:
       DAD_REQUIRE_GO_TASK: "1"
       # Issue #326: see the `backend` task.
@@ -458,6 +466,12 @@ tasks:
       DAD_VERSION: ${{ tasks.backend.values.dad_version }}
     run: |
       sudo apt-get update
+      # The .debs first, with a time limit per attempt and a move to
+      # archive.ubuntu.com after a stalled one: this image names one regional
+      # mirror, and on 2026-11-19 it served 58.8 kB/s and then 503s until the
+      # install failed (PR #2386's run 01a1f3a3d831). The arguments match the
+      # install's, so it finds every .deb already downloaded.
+      .github/scripts/apt-prefetch.sh webkit2gtk-driver xvfb xclip xdotool openssh-server libnss-wrapper
       # openssh-server and libnss-wrapper: fleet_001's far deck (issue #1356).
       # UCF_FORCE_CONFFMISS: a restored ci-desktop-driver-v1 tool cache can
       # carry ucf's record of /etc/ssh/sshd_config without the file itself,
@@ -590,6 +604,10 @@ tasks:
     run: |
       set -euo pipefail
       sudo apt-get update
+      # The same regional mirror `desktop-driver`'s prefetch moves off:
+      # on 2026-11-19 its indexes answered 503 and this install found no
+      # `file` package (PR #2386's run 01a1f3b7c59d).
+      .github/scripts/apt-prefetch.sh file
       sudo apt-get install -y file
       cargo install cross --locked --version 0.2.5
       export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"

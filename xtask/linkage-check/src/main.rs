@@ -94,6 +94,13 @@
 /// rule 2's and rule 5's gates a change needs — the full gates for code or a
 /// build input, the tests that read them for text.
 mod affected_checks;
+/// `.github/scripts/apt-prefetch.sh`'s mirror fallback, driven under `bash`
+/// with stand-ins for `sudo`, `timeout` and `apt-get`. Tests only, and Linux
+/// only: the script runs on Ubuntu jobs and edits the mirror list with GNU
+/// `sed -i`, which macOS's BSD `sed` reads differently (Greptile and Qodo on
+/// #2386), and `build-macos-tests` runs this crate's tests.
+#[cfg(all(test, target_os = "linux"))]
+mod apt_prefetch;
 #[cfg(all(test, unix))]
 mod build_gate;
 /// The capacity-only red classifier behind `rerun-unacquired.yml` and

@@ -804,6 +804,19 @@ fn next_report_nonce() -> String {
     )
 }
 
+/// PRD #2374: `task` followed by the agent-card catalog's text block —
+/// exactly `"\n\n"` + [`crate::card_catalog::dispatch_text`].
+pub(crate) fn with_card_catalog(
+    task: &str,
+    catalog: &crate::card_catalog::ResolvedCatalog,
+) -> String {
+    let bin = crate::platform::paths::binary_name();
+    format!(
+        "{task}\n\n{}",
+        crate::card_catalog::dispatch_text(catalog, &bin)
+    )
+}
+
 /// PRD #220 M2.3: what a dispatched unit is actually prompted with.
 ///
 /// An ORCHESTRATION dispatch passes the task through UNCHANGED. `spawn` composes
@@ -1114,8 +1127,15 @@ pub async fn handle_dispatch(
         RemovalPolicy::KeepIfDirty,
     );
 
+    // PRD #2374: the agent-card catalog is appended to the TASK, before the
+    // shape branch, so the single-agent prompt and an orchestration's task
+    // (and through it the orchestrator's context file) both carry it.
+    // The dispatcher's own `task` stays as it is: it is what PRD #1790's
+    // journal saves below, so a restore hands back that and not a second
+    // copy of the catalog.
+    let with_catalog = with_card_catalog(task, &ctx.registry.agent_cards().catalog());
     let prompt = dispatch_prompt(
-        task,
+        &with_catalog,
         &resolved_target,
         &dispatch_report_path(name, &next_report_nonce()),
         crate::worktree_owner::main_worktree_if_linked(&paths.worktree_dir).as_deref(),
