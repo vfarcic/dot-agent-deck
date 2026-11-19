@@ -42,7 +42,10 @@
 //! prose. The approval is directive, so a proposal that ends in a question
 //! still gets a definite answer.
 //!
-//! Cost: two Haiku turns (one analysis of a two-file project, one write), well
+//! The update case uses the same flow in a fixture with a valid user-written
+//! config, checking that its orchestration and reviewer description survive.
+//!
+//! Cost per case: two Haiku turns (one analysis of a small project, one write), well
 //! under a cent or two per run. Flaky-tolerant (real LLM) per CLAUDE.md rule 4:
 //! run once, not looped.
 
@@ -76,6 +79,10 @@ const PANE_ID: &str = "config-gen-live-agent";
 
 /// The fixture's only agent launcher, a Makefile target named nowhere else.
 const SENTINEL: &str = "deck-agent-7f3a2c";
+
+/// User-owned values in the existing-config fixture that an update must keep.
+const USER_ORCHESTRATION: &str = "user-maintenance-91b7ef";
+const USER_DESCRIPTION: &str = "Preserve the hand-written review checklist 6d4a89";
 
 /// What the user types into the agent's pane once the proposal is on screen.
 /// Directive, so a proposal that ends in a question still gets a definite yes.
@@ -123,16 +130,7 @@ const WRITE_SETTLE: Duration = Duration::from_secs(30);
 /// hook is the end of a turn, and this rides out a status flicker around it.
 const IDLE_HOLD: Duration = Duration::from_secs(6);
 
-/// Scenario: Launch the real deck in a two-file project with no
-/// `.dot-agent-deck.toml` and start one interactive Haiku Claude Code agent
-/// there. Open its pane with `1`, return to command mode with Ctrl+D, press `g`
-/// on its selected card and confirm Yes; the request reaches
-/// the agent's inbox through the daemon's generate-config verb, the agent
-/// analyses the project and presents a proposal without writing it, and the
-/// test types an approval into the focused pane. HARD-ASSERT that
-/// `.dot-agent-deck.toml` then appears, passes `dot-agent-deck validate`, and
-/// that the agent named the fixture's uniquely named launcher `deck-agent-7f3a2c`
-/// in its proposal or the file. PTY-attached; flaky-tolerant (real LLM), run once.
+/// Scenario: Launch the deck in a two-file project without a config and start an interactive Haiku agent there. Open its pane with `1`, return to command mode with Ctrl+D, press `g` and confirm Yes; the agent receives the request and proposes without writing until approval is typed into its pane. Verify the written config passes `dot-agent-deck validate` and the agent names the project's uniquely named launcher in its proposal or file.
 #[spec("dashboard/config-gen/003")]
 #[test]
 fn config_gen_003_a_real_agent_generates_a_valid_config_after_approval() {
@@ -140,6 +138,19 @@ fn config_gen_003_a_real_agent_generates_a_valid_config_after_approval() {
     // and `launch_with_fixture` panics rather than skips on an import failure.
     skip_unless!(common::check_claude_available());
 
+    run_config_request("config-gen-live", false);
+}
+
+/// Scenario: Start an interactive Haiku agent in a project with a valid user-written config, open its pane, press `g` in command mode and confirm Yes. Verify the received request names the existing file and the agent waits for approval before editing it; approve in the pane, then check the updated config validates and preserves the user's orchestration and role description.
+#[spec("dashboard/config-gen/004")]
+#[test]
+fn config_gen_004_a_real_agent_updates_a_config_preserving_user_content() {
+    skip_unless!(common::check_claude_available());
+
+    run_config_request("config-gen-existing-live", true);
+}
+
+fn run_config_request(fixture: &str, existing: bool) {
     let deck = TuiDeck::builder()
         .with_pty_size(140, 40)
         .with_imported_claude_credentials()
@@ -152,16 +163,25 @@ fn config_gen_003_a_real_agent_generates_a_valid_config_after_approval() {
         // Outlast every wait below; the budget is above `BOOT_WAIT`. A literal,
         // so linkage-check rule 11 can read it.
         .with_env("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "840")
-        .launch_with_fixture("config-gen-live");
+        .launch_with_fixture(fixture);
     deck.wait_for_string("No active agents");
 
     let socket = deck.attach_socket_path().to_path_buf();
     let workdir = deck.workdir().to_path_buf();
     let config_path = workdir.join(".dot-agent-deck.toml");
-    assert!(
-        !config_path.exists(),
-        "the fixture must start with no .dot-agent-deck.toml"
-    );
+    let original = if existing {
+        let config = std::fs::read_to_string(&config_path)
+            .expect("the update fixture must already have .dot-agent-deck.toml");
+        assert_user_content(&config, "initial fixture");
+        validate_config(&deck, &workdir, &config);
+        Some(config)
+    } else {
+        assert!(
+            !config_path.exists(),
+            "the fixture must start with no .dot-agent-deck.toml"
+        );
+        None
+    };
 
     // ---- 1. A live interactive agent in the project directory.
     let events = deck.subscribe_events();
@@ -249,6 +269,21 @@ fn config_gen_003_a_real_agent_generates_a_valid_config_after_approval() {
             .is_some_and(|t| t.contains(expected_prompt.trim())),
         "the inbox body must be the daemon-composed prompt for {cwd}"
     );
+    let body = posted.text.as_deref().expect("configuration request body");
+    if existing {
+        let existing_file = format!("{cwd}/.dot-agent-deck.toml");
+        assert!(
+            body.contains(&format!("`{existing_file}` already exists")),
+            "the request must name the existing file and say it already exists; \
+             request:\n{body}\n{}",
+            evidence(&deck, &socket, &agent_id)
+        );
+    } else {
+        assert!(
+            !body.contains("already exists"),
+            "a fresh project must receive the create request; request:\n{body}"
+        );
+    }
 
     // ---- 3. The agent takes the request, analyses, proposes, and waits.
     // One deadline for the whole turn, so the two waits cannot sum past it.
@@ -271,10 +306,10 @@ fn config_gen_003_a_real_agent_generates_a_valid_config_after_approval() {
         PROPOSAL_WAIT.as_secs(),
         evidence(&deck, &socket, &agent_id)
     );
-    assert!(
-        !config_path.exists(),
-        "the agent wrote {} before the user confirmed, against step 4 of the generation \
-         prompt; {}",
+    assert_eq!(
+        std::fs::read_to_string(&config_path).ok(),
+        original,
+        "the agent must wait for user approval before writing {}; {}",
         config_path.display(),
         evidence(&deck, &socket, &agent_id)
     );
@@ -296,11 +331,13 @@ fn config_gen_003_a_real_agent_generates_a_valid_config_after_approval() {
     deck.send_keys(b"\r");
 
     let written = common::wait_until(WRITE_WAIT, || {
-        std::fs::read_to_string(&config_path).is_ok_and(|c| c.contains("[[orchestrations]]"))
+        std::fs::read_to_string(&config_path).is_ok_and(|c| {
+            c.contains("[[orchestrations]]") && original.as_deref() != Some(c.as_str())
+        })
     });
     assert!(
         written,
-        "no .dot-agent-deck.toml with an [[orchestrations]] table appeared in {} within {}s of \
+        "no new or updated .dot-agent-deck.toml with an [[orchestrations]] table appeared in {} within {}s of \
          the approval; {}",
         workdir.display(),
         WRITE_WAIT.as_secs(),
@@ -311,20 +348,12 @@ fn config_gen_003_a_real_agent_generates_a_valid_config_after_approval() {
     let config = std::fs::read_to_string(&config_path).unwrap();
 
     // ---- 5. The deck accepts the file.
-    let validate = Command::new(common::contained_deck_binary())
-        .arg("validate")
-        .arg("--path")
-        .arg(&workdir)
-        .env("HOME", deck.home_dir())
-        .output()
-        .expect("run dot-agent-deck validate");
-    assert!(
-        validate.status.success(),
-        "`dot-agent-deck validate` rejected the generated config:\nstdout: {}\nstderr: {}\n\
-         === .dot-agent-deck.toml ===\n{config}",
-        String::from_utf8_lossy(&validate.stdout),
-        String::from_utf8_lossy(&validate.stderr)
-    );
+    validate_config(&deck, &workdir, &config);
+    if existing {
+        // Include the pane output if a real agent drops user-owned content:
+        // that is evidence about the update request, not a reason to weaken it.
+        assert_user_content(&config, &evidence(&deck, &socket, &agent_id));
+    }
 
     // ---- 6. The agent analysed THIS project.
     let pane = common::pane_search_key_on(&socket, &agent_id);
@@ -338,6 +367,49 @@ fn config_gen_003_a_real_agent_generates_a_valid_config_after_approval() {
     eprintln!(
         "narrative (soft): launcher {SENTINEL:?} in the written config = {}",
         config.contains(SENTINEL)
+    );
+}
+
+fn validate_config(deck: &TuiDeck, workdir: &Path, config: &str) {
+    let validate = Command::new(common::contained_deck_binary())
+        .arg("validate")
+        .arg("--path")
+        .arg(workdir)
+        .env("HOME", deck.home_dir())
+        .output()
+        .expect("run dot-agent-deck validate");
+    assert!(
+        validate.status.success(),
+        "`dot-agent-deck validate` rejected the generated config:\nstdout: {}\nstderr: {}\n\
+         === .dot-agent-deck.toml ===\n{config}",
+        String::from_utf8_lossy(&validate.stdout),
+        String::from_utf8_lossy(&validate.stderr)
+    );
+}
+
+fn assert_user_content(config: &str, evidence: &str) {
+    let parsed: toml::Value = toml::from_str(config).expect("config must be valid TOML");
+    let preserved = parsed
+        .get("orchestrations")
+        .and_then(toml::Value::as_array)
+        .and_then(|orchestrations| {
+            orchestrations
+                .iter()
+                .find(|o| o.get("name").and_then(toml::Value::as_str) == Some(USER_ORCHESTRATION))
+        })
+        .and_then(|o| o.get("roles"))
+        .and_then(toml::Value::as_array)
+        .is_some_and(|roles| {
+            roles.iter().any(|role| {
+                role.get("name").and_then(toml::Value::as_str) == Some("reviewer")
+                    && role.get("description").and_then(toml::Value::as_str)
+                        == Some(USER_DESCRIPTION)
+            })
+        });
+    assert!(
+        preserved,
+        "the update must preserve user orchestration {USER_ORCHESTRATION:?} and its \
+         reviewer description {USER_DESCRIPTION:?}; config:\n{config}\n{evidence}"
     );
 }
 

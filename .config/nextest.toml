@@ -300,7 +300,7 @@ slow-timeout = { period = "60s", terminate-after = 40 }
 filter = 'test(codex_hooks_001_real_interactive_turn_reaches_idle_without_exit)'
 slow-timeout = { period = "60s", terminate-after = 8 }
 
-# Issue #2119: `dashboard/config-gen/003` drives a real interactive Haiku through
+# Issue #2119: `dashboard/config-gen/003` and `/004` each drive a real interactive Haiku through
 # boot, a project-analysis turn and a write turn. Its sequential wait bounds sum
 # to 750s (the arithmetic is in the test, above `BOOT_WAIT`), under the 840s deck
 # lifetime it sets, which is under this 15 x 60s = 900s window, so a slow phase
@@ -308,7 +308,7 @@ slow-timeout = { period = "60s", terminate-after = 8 }
 # takes about 70-90s. Scoped by name; still bounded. The filter tracks the test
 # function name: update it with any rename.
 [[profile.default.overrides]]
-filter = 'test(config_gen_003_a_real_agent_generates_a_valid_config_after_approval)'
+filter = 'test(config_gen_003_a_real_agent_generates_a_valid_config_after_approval) | test(config_gen_004_a_real_agent_updates_a_config_preserving_user_content)'
 slow-timeout = { period = "60s", terminate-after = 15 }
 
 # Issue #1381: the two real-OpenCode `clear = true` delegates in

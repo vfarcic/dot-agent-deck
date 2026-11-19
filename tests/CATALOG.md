@@ -1342,6 +1342,14 @@ The L1 `config_gen_001_existing_config_labels_footer_and_confirmation_update` in
 - **Does not assert:** the exact roles or prose the model proposes; the message wire shape and the stand-in delivery (`inbox/route/007`); the verb and its capability gate (`daemon/config-gen/*`); the upgrade message on an older daemon (`dashboard/config-gen/001`); the desktop's Generate affordance.
 - **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", feature = "e2e-live", unix))]` — the attach helpers it drives are Unix-domain-socket only).
 
+##### dashboard/config-gen/004 — A REAL interactive Haiku agent updates an existing config after approval and preserves user-written content.
+- **Layer:** L2 PTY-attached, lane 2; runs locally with Claude Code credentials, never in CI. `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1` makes unavailable credentials fail instead of skip.
+- **Agent:** one real interactive Claude Code Haiku pane, using the same command, credential import and trusted work directory as `/003`, in the `config-gen-existing-live` fixture.
+- **Asserts:** the fixture's existing config passes `dot-agent-deck validate`; pressing `g` on the selected card and confirming Yes delivers a request naming that existing file with the words "already exists"; the agent acknowledges and proposes without changing the file before approval; approval typed into the focused pane produces a changed config that validates and retains the `user-maintenance-91b7ef` orchestration and its reviewer's distinctive user-written description.
+- **Test:** `config_gen_004_a_real_agent_updates_a_config_preserving_user_content` in `tests/e2e_config_generation_live.rs`.
+- **Does not assert:** exact model prose or the complete proposed diff; preservation of every possible TOML field; desktop controls.
+- **Platform coverage:** mac+linux (Unix attach socket).
+
 ### Statuses
 
 #### status/transition
