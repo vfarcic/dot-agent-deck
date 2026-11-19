@@ -561,7 +561,7 @@ fn route_006_respawn_failure_posts_daemon_notice() {
     assert!(!String::from_utf8_lossy(&bytes(&worker)).contains(route::TASK));
 }
 
-/// Scenario: Request configuration generation from a live synthetic card through the real TUI and accept the dialog. One bound configuration prompt must be queued without typed content; after Idle its pane fetches and renders the instructions.
+/// Scenario: Start an agent over the attach socket with no pane open in this TUI, request configuration generation from its card and accept the dialog. Its pane becomes visible in typing mode and receives typed approval; this request and the daemon's config-generation verb each queue the target cwd's prompt, fetched after Idle without typed prompt content.
 #[spec("inbox/route/007")]
 #[test]
 fn route_007_tui_config_generation_posts_bound_message() {
@@ -575,10 +575,57 @@ fn route_007_tui_config_generation_posts_bound_message() {
     status(&deck, &pane, "session_start", "codex");
     deck.wait_for_absence("No active agents");
     status(&deck, &pane, "thinking", "codex");
+    assert!(
+        !deck.snapshot_grid().contains("ROUTE-AGENT-READY"),
+        "precondition: the socket-started agent's pane is not open here"
+    );
     deck.send_keys(b"g");
     deck.wait_for_string("[Yes]");
     deck.send_keys(b"\r");
+    deck.wait_until_grid(
+        "sent config opens the agent's pane in typing mode",
+        |grid| grid.contains("ROUTE-AGENT-READY") && grid.contains("[Command Mode"),
+    );
     let messages = route::count(&deck, &pane, 1);
+    let cwd = common::agent_records_on(deck.attach_socket_path())
+        .into_iter()
+        .find(|record| record.id == pane.agent)
+        .and_then(|record| record.cwd)
+        .expect("the daemon knows the target cwd");
+    let expected = dot_agent_deck::config_gen::config_gen_prompt(&cwd);
+    let assert_body = |message: &serde_json::Value| {
+        let text = message["text"].as_str().expect("rendered inbox body");
+        let head = text.splitn(3, '\n').take(2).collect::<Vec<_>>().join("\n");
+        let separator = if expected.ends_with('\n') { "" } else { "\n" };
+        assert_eq!(message["bind_agent"], pane.agent);
+        assert_eq!(
+            text,
+            format!(
+                "{head}\n{expected}{separator}[end of dot-agent-deck message {}]",
+                message["id"].as_str().unwrap()
+            ),
+            "received body must match config_gen_prompt for the daemon's target cwd"
+        );
+    };
+    let with_bodies = attach(
+        &deck,
+        json!({"op":"list-inbox", "pane_id":pane.id, "bodies":true}),
+    );
+    assert_body(&with_bodies["inbox_messages"][0]);
+    let generated = attach(
+        &deck,
+        json!({"op":"generate-config", "pane_id":pane.id, "expected_agent_id":pane.agent}),
+    );
+    assert_eq!(
+        generated["ok"], true,
+        "daemon must compose the same request: {generated}"
+    );
+    route::count(&deck, &pane, 2);
+    let with_bodies = attach(
+        &deck,
+        json!({"op":"list-inbox", "pane_id":pane.id, "bodies":true}),
+    );
+    assert_body(&with_bodies["inbox_messages"][1]);
     assert!(
         bytes(&pane).is_empty(),
         "config-gen prompt must not be typed"
@@ -598,7 +645,12 @@ fn route_007_tui_config_generation_posts_bound_message() {
         "configuration instructions: {fetched}"
     );
     assert!(!String::from_utf8_lossy(&bytes(&pane)).contains(".dot-agent-deck.toml"));
-    route::count(&deck, &pane, 1);
+    let retained = route::count(&deck, &pane, 2);
+    assert_eq!(retained.len(), 2, "one inbox message per confirmed request");
+    deck.send_keys(b"CONFIG-GEN-APPROVAL-7f3a2c\r");
+    deck.wait_until_grid("approval reaches the focused agent", |grid| {
+        grid.contains("SUBMITTED:CONFIG-GEN-APPROVAL-7f3a2c")
+    });
 }
 
 /// Scenario: In separate runs leave a delegate Queued or Fetched past the accelerated undelivered deadline. For the Queued one the orchestrator receives one daemon-labelled inbox notice naming the message, worker, state and doorbell path, without pane text being typed; the Fetched one, which may have reached the worker, raises none. Replace another task's orchestrator before that deadline and require its successor to receive no stale notice while the worker's original task stays fetchable.

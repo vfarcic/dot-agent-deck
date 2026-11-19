@@ -9,7 +9,7 @@
 //! Decision 6: gated behind the `e2e` feature so `cargo test-fast` never
 //! compiles it.
 //!
-//! Coverage (see report): quit-confirm `[Cancel]`, config-gen `[Never]`,
+//! Coverage (see report): quit-confirm `[Cancel]`, config-gen `[No]`,
 //! help `[Close]`. Deferred:
 //!   - star-prompt — only opens when the persisted launch counter trips
 //!     (`StarPromptState::increment_and_check`), not deterministically
@@ -68,14 +68,10 @@ fn modal_001_quit_confirm_cancel_dismisses() {
     deck.wait_for_string("No active agents");
 }
 
-/// Scenario: With a session card present, press `g` to open the config-gen
-/// prompt, then click its `[Never]` button. The prompt must resolve exactly
-/// as the keyboard `Never` choice does — it closes and the deck shows the
-/// `Config prompt suppressed for this directory.` status. RED until M5
-/// renders the modal's clickable buttons.
+/// Scenario: With a session card present, press `g` to open the config-generation prompt and see Yes/No without Never or the automatic-prompt hint. Click No to dismiss it, then press g again to verify the user can ask again.
 #[spec("mouse/modal/001")]
 #[test]
-fn modal_001_config_gen_never_resolves() {
+fn modal_001_config_gen_no_dismisses() {
     let deck = TuiDeck::launch_with_fixture("minimal");
     deck.wait_for_string("No active agents");
     send_session_start(&deck, "alpha", "pane-alpha", "/tmp");
@@ -84,10 +80,21 @@ fn modal_001_config_gen_never_resolves() {
     deck.send_bytes(b"g"); // open config-gen prompt for the selected card
     deck.wait_for_string("Generate .dot-agent-deck.toml");
 
-    click_button(&deck, "[Never]");
-
-    // Same outcome as pressing Never: prompt closes, suppression status set.
-    deck.wait_for_string("Config prompt suppressed");
+    deck.wait_for_string("[Yes]");
+    deck.wait_for_string("[No]");
+    let grid = deck.snapshot_grid();
+    assert!(
+        !grid.contains("Never"),
+        "config-gen offers Yes/No only:\n{grid}"
+    );
+    assert!(
+        !grid.contains("auto_config_prompt"),
+        "obsolete hint:\n{grid}"
+    );
+    click_button(&deck, "[No]");
+    deck.wait_for_absence("Generate .dot-agent-deck.toml");
+    deck.send_bytes(b"g");
+    deck.wait_for_string("[Yes]");
 }
 
 /// Scenario: From the dashboard, press `?` to open the help overlay, then
@@ -123,7 +130,7 @@ fn modal_001_help_close_closes_overlay() {
 fn modal_001_scheduler_delete_button_confirms() {
     // PRD #127 finding #4 (GREEN): the manager dialog's actions are clickable
     // bracketed buttons wired through the PRD #80 modal-button hit-test
-    // (`button_rects` / `hit_test_button`), mirroring `[Cancel]`/`[Never]`/
+    // (`button_rects` / `hit_test_button`), mirroring `[Cancel]`/`[No]`/
     // `[Close]`. Each button advertises its shortcut key, so Delete renders as
     // `[Delete d]` (commit 06d0388). This test covers Delete; click coverage
     // for add / edit / run-now lives in the scheduler manager suite.

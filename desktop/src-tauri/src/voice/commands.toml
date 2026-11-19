@@ -2295,6 +2295,40 @@ action_words = ["stop", "kill", "shut down", "shut it down", "end", "terminate"]
   name = "agent"
   kind = "agent_ref"
 
+# PRD #2119 — the voice form of an agent's Generate config button. Like the two
+# stops around it, it only OPENS a confirmation: the user presses Yes by hand
+# before the daemon posts the configuration request to that agent's inbox, so
+# the report says nothing has been sent. It is not a stop, and nothing in its
+# description talks about stopping, so it does not compete with `stop_agent`.
+# PR #2362 review: on the agent screen it is wired as `stop_agent` is — a whole
+# "generate config" is answered locally for the viewed agent (so it works with
+# Send on-screen names off), and a model pick naming an agent there is answered
+# with the pane's own phrase rather than confirmed for another agent.
+[[commands]]
+id          = "generate_config"
+description = """Ask one agent to generate the project's orchestration config (`.dot-agent-deck.toml`) —
+the voice form of the agent's Generate config button on the agent dashboard and in the agent's
+pane, which reads Update config when the project already has one. Use for generate config,
+generate a config with the tester, create the orchestration config, make a dot agent deck toml,
+have the coder write the project config, and its synonym update config (update config with the
+tester, update the orchestration config): both phrases are this row whichever label the button
+shows. Set `agent` the way
+`open_agent` does on the agent dashboard. On the agent screen it is always the viewed agent: leave
+`agent` empty there, and a request naming an agent gets the pane's own phrase. It never sends
+anything by itself: the app shows the same Yes/No confirmation the button shows and the user
+confirms by hand. Not for opening, stopping or typing to an agent."""
+invoke      = "confirmGenerateConfig"
+screens     = ["overview", "agent"]
+requires    = ["new_agent_dialog_closed"]
+unavailable_hint = "generating a config works from the agent dashboard or an agent's pane, with the New agent dialog closed; in a pane with typing off, say 'generate config' for the viewed agent"
+report      = "Confirm generating a config with {agent} — nothing has been sent yet."
+asks_to     = "generate the project's orchestration config"
+try_saying  = "generate config with {agent}"
+
+  [[commands.params]]
+  name = "agent"
+  kind = "agent_ref"
+
 [[commands]]
 id          = "close_orchestration"
 description = """Close a whole orchestration on the agent dashboard, stopping every one of its roles —

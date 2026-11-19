@@ -35,6 +35,24 @@
 //! payload names no `.jsonl` transcript, the witness cannot be started, or
 //! the deck runs without a receipt spool — the hook commits what it wrote,
 //! as it did before.
+//!
+//! Issue #2347: the same witness also settles the turn the hook reported.
+//! The hook's `Thinking` starts a turn on the card and on the deck's turn
+//! clock, and a prompt Claude drops runs no turn and fires no `Stop`, so
+//! nothing would end it. So in a deck pane every Claude Code prompt whose
+//! payload names a `.jsonl` transcript gets a witness, deck message or not,
+//! and the hook's `Thinking` carries a nonce for that prompt
+//! ([`crate::event::PROMPT_TURN_METADATA_KEY`]). When the transcript records
+//! that exact prompt as blocked by a hook ([`PromptTurn::blocked_in`])
+//! before anything shows Claude took a prompt, the witness reports the turn
+//! as over: an `Idle` carrying the nonce, which the daemon applies only
+//! while that prompt's turn is still the pane's latest news
+//! (`crate::state::AppState::admit_prompt_not_taken`). Measured on Claude
+//! Code 2.1.328, for a hook that exits 2 and for one that prints
+//! `{"decision":"block"}`: the entry is a `system` entry whose
+//! `promptSubmitEnding.ending.kind` is `blocked_by_hook` and whose content
+//! ends with `Original prompt: ` and the prompt exactly as the hook received
+//! it; no `Stop` hook ran.
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -46,8 +64,25 @@ use serde_json::Value;
 
 use crate::event::InboxAttemptRef;
 
-/// The longest a witness watches a transcript.
+/// The longest a witness watches a transcript for the attempts it was
+/// handed.
 pub const WITNESS_MAX: Duration = Duration::from_secs(20);
+
+/// Issue #2347: the longest a witness watches for its prompt's fate. Claude
+/// writes it once every `UserPromptSubmit` hook has finished, so a slow
+/// sibling hook delays it; past this the turn is left to the next event, as
+/// it was before.
+pub const TURN_WATCH_MAX: Duration = Duration::from_secs(120);
+
+/// How often a witness reads the transcript once [`WITNESS_MAX`] has passed.
+const SLOW_POLL: Duration = Duration::from_millis(250);
+
+/// The opening of the `system` entry's content Claude Code writes for a
+/// prompt a `UserPromptSubmit` hook blocked.
+const BLOCKED_OPENER: &str = "UserPromptSubmit operation blocked by hook";
+
+/// What precedes the blocked prompt itself in that entry's content.
+const ORIGINAL_PROMPT: &str = "Original prompt: ";
 
 /// How often a witness reads what the transcript gained.
 const POLL: Duration = Duration::from_millis(50);
@@ -95,8 +130,82 @@ impl TranscriptMark {
     }
 }
 
+/// Issue #2347: the prompt a witness settles the turn of, and what it reports
+/// if Claude drops it. Its nonce names the prompt to the daemon, it is no
+/// credential: the report goes out with the pane's own token, read from the
+/// environment the witness inherits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptTurn {
+    /// [`crate::event::PROMPT_TURN_METADATA_KEY`]'s value on the hook's
+    /// `Thinking`.
+    pub nonce: String,
+    /// The session the hook's `Thinking` reported.
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// The prompt's length in bytes.
+    pub prompt_len: usize,
+    /// The prompt's SHA-256, in hex: the prompt itself can be too long for a
+    /// command line.
+    pub prompt_sha256: String,
+}
+
+impl PromptTurn {
+    /// The turn of `prompt`, with a fresh nonce; `None` when the system has
+    /// no randomness to give one.
+    pub fn new(prompt: &str, session_id: &str, cwd: Option<String>) -> Option<PromptTurn> {
+        let mut bytes = [0u8; 16];
+        getrandom::fill(&mut bytes).ok()?;
+        Some(PromptTurn {
+            nonce: hex(&bytes),
+            session_id: session_id.to_string(),
+            cwd,
+            prompt_len: prompt.len(),
+            prompt_sha256: sha256_hex(prompt.as_bytes()),
+        })
+    }
+
+    /// Whether `entry` is Claude Code's record of this very prompt blocked
+    /// by a hook: a `system` entry, marked blocked by its structured ending
+    /// or its opening words, whose content ends with [`ORIGINAL_PROMPT`] and
+    /// the prompt exactly.
+    pub fn blocked_in(&self, entry: &Value) -> bool {
+        if entry.get("type").and_then(Value::as_str) != Some("system") {
+            return false;
+        }
+        let Some(content) = entry.get("content").and_then(Value::as_str) else {
+            return false;
+        };
+        let ending = entry
+            .get("promptSubmitEnding")
+            .and_then(|ending| ending.get("ending"))
+            .and_then(|ending| ending.get("kind"))
+            .and_then(Value::as_str);
+        if ending != Some("blocked_by_hook") && !content.starts_with(BLOCKED_OPENER) {
+            return false;
+        }
+        let Some(start) = content.len().checked_sub(self.prompt_len) else {
+            return false;
+        };
+        let (Some(head), Some(prompt)) = (content.get(..start), content.get(start..)) else {
+            return false;
+        };
+        head.ends_with(ORIGINAL_PROMPT) && sha256_hex(prompt.as_bytes()) == self.prompt_sha256
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex(&Sha256::digest(bytes))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 /// What a witness is started with, on its command line. It holds attempt
-/// names and a path, nothing secret: the caps stay in the spool.
+/// names, a path and a prompt's digest and nonce, nothing secret: the caps
+/// stay in the spool.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Plan {
     pub transcript: TranscriptMark,
@@ -116,6 +225,9 @@ pub struct Plan {
     /// A once-waiter's attempts whose blocks the prompt itself carried.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub native: Vec<InboxAttemptRef>,
+    /// Issue #2347: the prompt whose turn the witness settles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<PromptTurn>,
 }
 
 impl Plan {
@@ -212,6 +324,20 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
+/// Issue #2347: what the transcript has shown of the witnessed prompt's fate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnFate {
+    /// Nothing yet.
+    Unknown,
+    /// Claude took a prompt: a `user` entry that is not Claude's own meta
+    /// note, an `assistant` entry, or a `UserPromptSubmit` hook's context
+    /// came first. A turn is running, and its `Stop` ends it.
+    Taken,
+    /// Claude recorded this prompt as blocked by a hook before anything
+    /// showed it took one: no turn runs.
+    Blocked,
+}
+
 /// Reads what a transcript gains past a mark, a whole line at a time.
 pub struct Scanner {
     mark: TranscriptMark,
@@ -220,6 +346,9 @@ pub struct Scanner {
     partial: Vec<u8>,
     read: u64,
     skipping: bool,
+    /// Issue #2347: the prompt whose fate is read, if any.
+    turn: Option<PromptTurn>,
+    fate: TurnFate,
 }
 
 impl Scanner {
@@ -230,6 +359,55 @@ impl Scanner {
             partial: Vec::new(),
             read: 0,
             skipping: false,
+            turn: None,
+            fate: TurnFate::Unknown,
+        }
+    }
+
+    /// A scanner that also reads `turn`'s fate ([`Self::fate`]).
+    pub fn with_turn(mark: TranscriptMark, turn: Option<PromptTurn>) -> Scanner {
+        Scanner {
+            turn,
+            ..Scanner::new(mark)
+        }
+    }
+
+    /// What the lines read so far show of the prompt's fate; always
+    /// [`TurnFate::Unknown`] for a scanner with no prompt.
+    pub fn fate(&self) -> TurnFate {
+        self.fate
+    }
+
+    /// Issue #2347: settle the prompt's fate from one whole line, if it is
+    /// still unknown.
+    fn read_fate(&mut self, line: &[u8]) {
+        let Some(turn) = self.turn.as_ref() else {
+            return;
+        };
+        if self.fate != TurnFate::Unknown || line.len() > MAX_LINE {
+            return;
+        }
+        let Ok(entry) = serde_json::from_slice::<Value>(line) else {
+            return;
+        };
+        // A session's first prompt also creates its transcript, and Claude
+        // writes the `SessionStart` hooks' context into it just ahead of
+        // that prompt's own entries, taken or blocked (measured on 2.1.328):
+        // that context says nothing about the prompt.
+        let taken = match entry.get("type").and_then(Value::as_str) {
+            Some("user") => entry.get("isMeta").and_then(Value::as_bool) != Some(true),
+            Some("assistant") => true,
+            Some("attachment") => entry.get("attachment").is_some_and(|attachment| {
+                attachment.get("type").and_then(Value::as_str) == Some("hook_additional_context")
+                    && attachment.get("hookEvent").and_then(Value::as_str)
+                        == Some("UserPromptSubmit")
+            }),
+            _ => false,
+        };
+        if taken {
+            self.fate = TurnFate::Taken;
+        } else if turn.blocked_in(&entry) {
+            self.fate = TurnFate::Blocked;
         }
     }
 
@@ -266,7 +444,8 @@ impl Scanner {
                     found.push(at);
                 }
             }
-            self.partial.clear();
+            let line = std::mem::take(&mut self.partial);
+            self.read_fate(&line);
         }
         if !self.skipping {
             self.partial.extend_from_slice(rest);
@@ -307,7 +486,17 @@ fn open_regular(path: &std::path::Path) -> Option<std::fs::File> {
 /// Watch the transcript until every attempt in `expected` is found or
 /// `deadline` passes.
 pub fn watch(mark: TranscriptMark, expected: &[InboxAttemptRef], deadline: Instant) -> Watched {
-    let mut scanner = Scanner::new(mark);
+    watch_with(&mut Scanner::new(mark), expected, deadline)
+}
+
+/// [`watch`] on a scanner the caller keeps reading afterwards. A prompt the
+/// scanner reads as blocked ends the watch at once: nothing it carried can
+/// reach the model any more.
+pub fn watch_with(
+    scanner: &mut Scanner,
+    expected: &[InboxAttemptRef],
+    deadline: Instant,
+) -> Watched {
     let mut seen = Vec::new();
     loop {
         scanner.poll(&mut seen);
@@ -317,7 +506,7 @@ pub fn watch(mark: TranscriptMark, expected: &[InboxAttemptRef], deadline: Insta
             .cloned()
             .collect();
         let now = Instant::now();
-        if found.len() == expected.len() {
+        if found.len() == expected.len() || scanner.fate() == TurnFate::Blocked {
             return Watched::Found(found);
         }
         if now >= deadline {
@@ -328,6 +517,29 @@ pub fn watch(mark: TranscriptMark, expected: &[InboxAttemptRef], deadline: Insta
             };
         }
         std::thread::sleep(POLL.min(deadline - now));
+    }
+}
+
+/// Issue #2347: keep reading until the scanner's prompt is taken or
+/// blocked, or `deadline` passes, and answer its fate. A transcript that has
+/// not appeared by [`WITNESS_MAX`] after `started` is not waited for: the
+/// session keeps none.
+pub fn settle_turn(scanner: &mut Scanner, started: Instant, deadline: Instant) -> TurnFate {
+    let mut ignored = Vec::new();
+    loop {
+        scanner.poll(&mut ignored);
+        ignored.clear();
+        let now = Instant::now();
+        let gone = !scanner.present && now >= started + WITNESS_MAX;
+        if scanner.fate() != TurnFate::Unknown || now >= deadline || gone {
+            return scanner.fate();
+        }
+        let poll = if now < started + WITNESS_MAX {
+            POLL
+        } else {
+            SLOW_POLL
+        };
+        std::thread::sleep(poll.min(deadline - now));
     }
 }
 
@@ -397,10 +609,11 @@ fn run_unix(plan: Plan) {
     });
     let deadline = started + Duration::from_millis(plan.within_ms);
     let expected = plan.expected();
+    let mut scanner = Scanner::with_turn(plan.transcript.clone(), plan.turn.clone());
     // A session that keeps no transcript can't witness anything: what the
     // hook wrote whole is committed then, as a hook with no transcript
     // commits it.
-    let found = match watch(plan.transcript.clone(), &expected, deadline) {
+    let found = match watch_with(&mut scanner, &expected, deadline) {
         Watched::Found(found) => found,
         Watched::NoTranscript => plan
             .batch
@@ -441,6 +654,13 @@ fn run_unix(plan: Plan) {
         let _ = stream.set_write_timeout(Some(crate::inbox_oneshot::RECEIPTS_ANSWER_WAIT));
         let _ = stream.write_all(line.as_bytes());
         let _ = stream.shutdown(std::net::Shutdown::Write);
+    }
+    // Issue #2347: the batch is settled first, so whatever a dropped prompt
+    // carried is waiting again by the time its turn reads over.
+    if let Some(turn) = plan.turn.as_ref()
+        && settle_turn(&mut scanner, started, started + TURN_WATCH_MAX) == TurnFate::Blocked
+    {
+        crate::hook::report_prompt_not_taken(turn);
     }
 }
 
@@ -644,6 +864,131 @@ mod tests {
         ] {
             assert_eq!(TranscriptMark::of_payload(&payload), None, "{payload}");
         }
+    }
+
+    /// The `system` entry Claude Code 2.1.328 writes for `prompt` blocked by
+    /// a hook that printed `reason` (measured, issue #2347).
+    fn blocked_entry(reason: &str, prompt: &str) -> Value {
+        json!({"type":"system","subtype":"informational","level":"warning",
+            "content":format!("{BLOCKED_OPENER}:\n{reason}\n\n{ORIGINAL_PROMPT}{prompt}"),
+            "preventContinuation":true,
+            "promptSubmitEnding":{"ending":{"kind":"blocked_by_hook","reason":reason},"promptKept":false}})
+    }
+
+    /// Scenario: A prompt with leading, trailing and inner whitespace is blocked, and the transcript entry is read as Claude Code 2.1.328 writes it, for a hook's JSON decision and for an exit-2 hook (whose reason names the command and ends in an extra blank line), and as an older entry with only the opening words. Each is this prompt blocked; the same entry quoting another prompt, a longer prompt ending in it, the prompt with a character more, a user entry holding the prompt, and a system entry that is not a block are not.
+    #[test]
+    fn a_prompt_blocked_by_a_hook_is_recognised_as_this_very_prompt() {
+        let prompt = "  first line\n\nsecond line with \t tab  \n";
+        let turn = PromptTurn::new(prompt, "s", None).unwrap();
+        assert_eq!(turn.nonce.len(), 32);
+        assert_ne!(
+            PromptTurn::new(prompt, "s", None).unwrap().nonce,
+            turn.nonce
+        );
+        let mut legacy = blocked_entry("no", prompt);
+        legacy.as_object_mut().unwrap().remove("promptSubmitEnding");
+        for entry in [
+            blocked_entry("json says no", prompt),
+            blocked_entry("[/x/exit2.sh]: policy refused\n", prompt),
+            legacy,
+        ] {
+            assert!(turn.blocked_in(&entry), "{entry}");
+        }
+        let mut not_a_block = blocked_entry("no", prompt);
+        not_a_block["content"] = json!(format!("Something else\n\n{ORIGINAL_PROMPT}{prompt}"));
+        not_a_block
+            .as_object_mut()
+            .unwrap()
+            .remove("promptSubmitEnding");
+        for entry in [
+            blocked_entry("no", "another prompt"),
+            blocked_entry("no", &format!("more {prompt}")),
+            blocked_entry("no", &format!("{prompt}x")),
+            json!({"type":"user","message":{"role":"user","content":prompt}}),
+            not_a_block,
+            json!({"type":"system","content":7}),
+        ] {
+            assert!(!turn.blocked_in(&entry), "{entry}");
+        }
+    }
+
+    /// Scenario: Settle a prompt's fate from a transcript that gains, after the hook's mark, a `SessionStart` hook's context, a meta user entry and then its blocked entry, as a session's first prompt does; one that gains a user entry first and the blocked entry after; one that gains only a prompt hook's context; and one that gains nothing. The first is blocked at once and ends a watch for an attempt early, the second and third are taken, and the last is unknown when its deadline passes.
+    #[test]
+    fn a_prompts_fate_is_whatever_the_transcript_shows_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompt = "deck line";
+        let turn = PromptTurn::new(prompt, "s", None).unwrap();
+        let case = |name: &str, entries: &[Value]| {
+            let path = dir.path().join(format!("{name}.jsonl"));
+            let mut earlier = line(json!({"type":"user","message":{"content":"earlier"}}));
+            earlier.push(b'\n');
+            let mut bytes = earlier.clone();
+            for entry in entries {
+                bytes.extend(line(entry.clone()));
+                bytes.push(b'\n');
+            }
+            std::fs::write(&path, &bytes).unwrap();
+            Scanner::with_turn(
+                TranscriptMark {
+                    path,
+                    offset: earlier.len() as u64,
+                },
+                Some(turn.clone()),
+            )
+        };
+        let start = Instant::now();
+        let mut blocked = case(
+            "blocked",
+            &[
+                json!({"type":"attachment","attachment":{"type":"hook_additional_context",
+                    "content":["deck framing"],"hookName":"SessionStart","hookEvent":"SessionStart"}}),
+                json!({"type":"user","isMeta":true,"message":{"content":"caveat"}}),
+                blocked_entry("no", prompt),
+            ],
+        );
+        assert_eq!(
+            watch_with(
+                &mut blocked,
+                &[at(ID, 1, 1)],
+                start + Duration::from_secs(10)
+            ),
+            Watched::Found(vec![])
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "a block ends the watch"
+        );
+        assert_eq!(blocked.fate(), TurnFate::Blocked);
+        let deadline = Instant::now() + Duration::from_millis(300);
+        let mut taken = case(
+            "taken",
+            &[
+                json!({"type":"user","message":{"content":prompt}}),
+                blocked_entry("no", prompt),
+            ],
+        );
+        assert_eq!(settle_turn(&mut taken, start, deadline), TurnFate::Taken);
+        let mut context = case(
+            "context",
+            &[
+                json!({"type":"attachment","attachment":{"type":"hook_additional_context",
+                "content":["x"],"hookEvent":"UserPromptSubmit"}}),
+            ],
+        );
+        assert_eq!(settle_turn(&mut context, start, deadline), TurnFate::Taken);
+        let mut quiet = case("quiet", &[json!({"type":"queue-operation"})]);
+        assert_eq!(settle_turn(&mut quiet, start, deadline), TurnFate::Unknown);
+        assert!(Instant::now() >= deadline);
+        let mut none = Scanner::new(TranscriptMark {
+            path: dir.path().join("none.jsonl"),
+            offset: 0,
+        });
+        none.poll(&mut Vec::new());
+        assert_eq!(
+            none.fate(),
+            TurnFate::Unknown,
+            "a scanner with no prompt reads none"
+        );
     }
 
     /// Scenario: Size the witness's window for the default hold and for a short one a test sets. It stays two thirds of the hold, and never past twenty seconds.

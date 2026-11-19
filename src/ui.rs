@@ -2283,13 +2283,21 @@ struct UiState {
     form_button_rects: Vec<(Action, Rect)>,
     /// Star-prompt state for the "star the repo" reminder dialog.
     star_prompt_state: config::StarPromptState,
-    /// Config generation state — tracks directories where user chose "Never".
-    config_gen_state: config::ConfigGenState,
-    /// Pane ID + cwd for the pending config-gen modal prompt. PRD #1666 part 2
+    /// The pane of the pending config-gen modal prompt. PRD #1666 part 2
     /// (G-fix6): the pane id with the daemon process its card was learned
-    /// from, so the request is posted there or nowhere.
-    config_gen_target: Option<(crate::pane::BoundPane, String)>,
-    /// Selected option index in the config-gen modal (0=Yes, 1=No, 2=Never).
+    /// from, so the request is posted there or nowhere. PRD #2119: no
+    /// directory — the daemon composes the request for the pane's own.
+    config_gen_target: Option<crate::pane::BoundPane>,
+    /// The registry id of the agent the card showed when the config-gen
+    /// prompt opened. The request names it, so an agent that replaced it
+    /// before the user confirmed receives nothing (PRD #2119 review).
+    config_gen_agent: Option<String>,
+    /// PRD #2119: what the daemon reported, when the config-gen prompt
+    /// opened, about the card's project's `.dot-agent-deck.toml`: `Some(true)`
+    /// reads Update, `Some(false)` Generate, and `None` (the daemon could not
+    /// tell) the neutral question that claims neither.
+    config_gen_exists: Option<bool>,
+    /// Selected option index in the config-gen modal (0=Yes, 1=No).
     config_gen_selected: usize,
     /// Selected option in quit confirm modal (0=Detach, 1=Stop, 2=Cancel).
     /// PRD #92 F1 widened this from 2 to 3 options; Detach remains the
@@ -2747,8 +2755,9 @@ impl UiState {
             drawn_pane_rects: Vec::new(),
             last_click: None,
             star_prompt_state: config::StarPromptState::default(),
-            config_gen_state: config::ConfigGenState::load(),
             config_gen_target: None,
+            config_gen_agent: None,
+            config_gen_exists: None,
             config_gen_selected: 0,
             quit_confirm_selected: 0,
             close_confirm: CloseConfirmState::default(),
@@ -5677,9 +5686,6 @@ pub enum Action {
     /// PRD #80 M5: config-gen `[No]` — dismiss the prompt for now (clears the
     /// target, returns to Normal).
     ConfigGenDismiss,
-    /// PRD #80 M5: config-gen `[Never]` — suppress the prompt for this
-    /// directory and return to Normal.
-    ConfigGenSuppress,
     /// PRD #80 M5: star-prompt `[Star]` — open the repo URL and stop asking
     /// (== `s`).
     StarConfirm,
@@ -5738,9 +5744,9 @@ pub enum Action {
     /// variant (it owns a `ModeConfig`/`OrchestrationConfig`), so storing it
     /// inline would bloat every `Action` value (`clippy::large_enum_variant`).
     SpawnPane(Box<NewPaneRequest>),
+    /// PRD #2119: ask the daemon to send the configuration request to `pane`.
     SendConfigGenPrompt {
         pane: crate::pane::BoundPane,
-        cwd: String,
     },
     RequestConfigGen,
     /// PRD #92 F2 (PRD #18 follow-through): the user pressed `y` or `n` on a
@@ -8235,42 +8241,31 @@ fn handle_config_gen_prompt_key(key: KeyEvent, ui: &mut UiState) -> Action {
             Action::Continue
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            if ui.config_gen_selected < 2 {
+            if ui.config_gen_selected < 1 {
                 ui.config_gen_selected += 1;
             }
             Action::Continue
         }
         KeyCode::Enter => match ui.config_gen_selected {
             0 => {
-                // Yes — send prompt and focus pane.
+                // Yes — ask the daemon to send the request, and focus the pane.
                 ui.mode = UiMode::Normal;
-                if let Some((pane, cwd)) = ui.config_gen_target.take() {
-                    return Action::SendConfigGenPrompt { pane, cwd };
+                if let Some(pane) = ui.config_gen_target.take() {
+                    return Action::SendConfigGenPrompt { pane };
                 }
-                Action::Continue
-            }
-            1 => {
-                // No — dismiss for now, hint stays on card.
-                ui.config_gen_target = None;
-                ui.mode = UiMode::Normal;
                 Action::Continue
             }
             _ => {
-                // Never — suppress hint permanently for this directory.
-                if let Some((_, ref cwd)) = ui.config_gen_target {
-                    ui.config_gen_state.suppress_dir(cwd);
-                }
+                // No — dismiss; the user can ask again at any time.
                 ui.config_gen_target = None;
+                ui.config_gen_agent = None;
                 ui.mode = UiMode::Normal;
-                ui.status_message = Some((
-                    "Config prompt suppressed for this directory.".to_string(),
-                    std::time::Instant::now(),
-                ));
                 Action::Continue
             }
         },
         KeyCode::Esc => {
             ui.config_gen_target = None;
+            ui.config_gen_agent = None;
             ui.mode = UiMode::Normal;
             Action::Continue
         }
@@ -11462,32 +11457,36 @@ fn perform_stop_and_quit(ui: &mut UiState, pane: &dyn PaneController) -> Flow {
     }
 }
 
-/// PRD #80 M5: send the config-gen prompt to `pane_id`, focus it for execution,
-/// and surface the outcome. Shared by the `Action::SendConfigGenPrompt` arm
-/// (Enter-on-Yes via the key handler) and `Action::ConfigGenConfirm` (the
-/// `[Yes]` button).
+/// PRD #80 M5: ask the daemon to send the config-gen request to `card`'s pane,
+/// focus it for execution, and surface the outcome. Shared by the
+/// `Action::SendConfigGenPrompt` arm (Enter-on-Yes via the key handler) and
+/// `Action::ConfigGenConfirm` (the `[Yes]` button).
+///
+/// PRD #2119: the daemon composes the request for the pane's own directory
+/// ([`PaneController::generate_config`]); this client sends no prompt. A
+/// daemon too old to generate one is told apart and named
+/// ([`crate::config_gen::CONFIG_GEN_UPGRADE_MESSAGE`]), and nothing else is
+/// sent in its place — no request composed here, no generic inbox post.
+///
+/// `agent` is the card's agent when the prompt opened: the request names it,
+/// so a different agent in the pane by the time the user confirmed is sent
+/// nothing.
 fn send_config_gen_prompt(
     card: &crate::pane::BoundPane,
-    cwd: &str,
+    agent: Option<&str>,
     ui: &mut UiState,
     pane: &dyn PaneController,
     tab_manager: &mut TabManager,
 ) {
     let pane_id = card.pane_id.as_str();
-    let prompt = crate::config_gen::config_gen_prompt(cwd);
     // PRD #1666 S5: the request is a message in the agent's inbox, not text
     // typed into its pane; the agent takes it the way it takes any other.
-    // PRD #1666 part 2 (G-fix6): posted on the daemon process the selected
-    // card was learned from, so a detached or never-attached card posts nothing
-    // to a restarted daemon's agent under the same pane id.
-    match pane.post_message(
-        card,
-        "configuration request",
-        &prompt,
-        crate::inbox_hub::PostOrigin::ConfigGen,
-    ) {
-        Ok(_) => {
-            // Focus the pane so the user can watch the agent take it.
+    // PRD #1666 part 2 (G-fix6): asked of the daemon process the selected card
+    // was learned from, so a detached or never-attached card sends nothing to
+    // a restarted daemon's agent under the same pane id.
+    let message = match pane.generate_config(card, agent) {
+        Ok(crate::daemon_client::GatedQuery::Answered(_)) => {
+            // Open and focus the pane so the user can watch the agent take it.
             if let Some(tab_idx) = tab_manager.tab_index_for_pane(pane_id) {
                 // PRD #83: snapshot the SOURCE tab's focus before leaving it,
                 // mirroring `switch_tab_with_focus` (capture-out → switch_to →
@@ -11502,20 +11501,38 @@ fn send_config_gen_prompt(
                 // PRD #84 M4: the destination tab's panes are sized by the
                 // pre-draw `resize_panes_to_layout` on the next frame.
             }
-            let _ = pane.focus_pane(pane_id);
-            ui.mode = UiMode::PaneInput;
-            ui.status_message = Some((
-                "Config request sent to the agent's inbox.".to_string(),
-                std::time::Instant::now(),
-            ));
+            // PRD #2119: a card whose pane is not open in this TUI — a
+            // daemon-spawned or foreign pane that never went through startup
+            // hydration — is attached first and the focus retried, exactly as
+            // `1` (`focus_deck`) and Enter (`Action::Focus`) open one, bound to
+            // the daemon process the card was learned from. PaneInput is
+            // entered only once a pane is focused: when none can be, the mode
+            // the caller left (the dashboard's) stands and the sent sentence
+            // is still shown, because the request WAS posted. Unlike those two
+            // paths, a pane that cannot be focused is never read as a stale
+            // card to delete — the daemon just accepted a request for it.
+            let mut focus = pane.focus_card(card);
+            if let Err(PaneError::CommandFailed(_)) = focus
+                && pane.try_hydrate_pane(card)
+            {
+                focus = pane.focus_card(card);
+            }
+            match focus {
+                Ok(()) => ui.mode = UiMode::PaneInput,
+                Err(error) => tracing::debug!(
+                    pane_id = %pane_id,
+                    error = %error,
+                    "config request sent, but its pane could not be opened here"
+                ),
+            }
+            crate::config_gen::CONFIG_GEN_SENT_MESSAGE.to_string()
         }
-        Err(e) => {
-            ui.status_message = Some((
-                format!("Failed to send config prompt: {e}"),
-                std::time::Instant::now(),
-            ));
+        Ok(crate::daemon_client::GatedQuery::Unsupported) => {
+            crate::config_gen::CONFIG_GEN_UPGRADE_MESSAGE.to_string()
         }
-    }
+        Err(e) => crate::config_gen::config_gen_failed_message(&e),
+    };
+    ui.status_message = Some((message, std::time::Instant::now()));
 }
 
 /// PRD #80 M6: commit a rename for the selected card — push `new_name` to the
@@ -12171,12 +12188,16 @@ fn dispatch_action(
             }
         }
         Action::RequestConfigGen => {
+            // PRD #2119: the card's own directory is not needed here — the
+            // daemon composes the request for the directory it holds for the
+            // pane, and refuses when it knows none.
             if let Some(sid) = selected_id
                 && let Some(session) = snapshot.sessions.get(sid)
                 && let Some(card) = session.bound_pane()
-                && let Some(ref cwd) = session.cwd
             {
-                ui.config_gen_target = Some((card, cwd.clone()));
+                ui.config_gen_target = Some(card);
+                ui.config_gen_agent = session.agent_id.clone();
+                ui.config_gen_exists = snapshot.project_config_exists(session);
                 ui.config_gen_selected = 0;
                 ui.mode = UiMode::ConfigGenPrompt;
             } else {
@@ -12748,8 +12769,9 @@ fn dispatch_action(
                 } // close else (non-orchestration path)
             }
         }
-        Action::SendConfigGenPrompt { pane: card, cwd } => {
-            send_config_gen_prompt(&card, &cwd, ui, pane, tab_manager);
+        Action::SendConfigGenPrompt { pane: card } => {
+            let agent = ui.config_gen_agent.take();
+            send_config_gen_prompt(&card, agent.as_deref(), ui, pane, tab_manager);
         }
         // ===== PRD #80 M5: modal button actions =====
         // quit-confirm [Stop]: resolve like Enter-on-Stop — straight to
@@ -12779,26 +12801,16 @@ fn dispatch_action(
         // config-gen [Yes]: send the prompt to the pending target pane.
         Action::ConfigGenConfirm => {
             ui.mode = UiMode::Normal;
-            if let Some((card, cwd)) = ui.config_gen_target.take() {
-                send_config_gen_prompt(&card, &cwd, ui, pane, tab_manager);
+            let agent = ui.config_gen_agent.take();
+            if let Some(card) = ui.config_gen_target.take() {
+                send_config_gen_prompt(&card, agent.as_deref(), ui, pane, tab_manager);
             }
         }
-        // config-gen [No]: dismiss for now (hint stays on the card).
+        // config-gen [No]: dismiss; the user can ask again at any time.
         Action::ConfigGenDismiss => {
             ui.config_gen_target = None;
+            ui.config_gen_agent = None;
             ui.mode = UiMode::Normal;
-        }
-        // config-gen [Never]: suppress the prompt for this directory.
-        Action::ConfigGenSuppress => {
-            if let Some((_, ref cwd)) = ui.config_gen_target {
-                ui.config_gen_state.suppress_dir(cwd);
-            }
-            ui.config_gen_target = None;
-            ui.mode = UiMode::Normal;
-            ui.status_message = Some((
-                "Config prompt suppressed for this directory.".to_string(),
-                std::time::Instant::now(),
-            ));
         }
         // star-prompt [Star]: open the repo and stop asking (== `s`).
         Action::StarConfirm => {
@@ -19266,7 +19278,11 @@ fn render_frame(
                 );
             }
         }
-        let ctx_buttons = dashboard_context_buttons(&ui.keybindings, !filtered.is_empty());
+        let ctx_buttons = dashboard_context_buttons(
+            &ui.keybindings,
+            !filtered.is_empty(),
+            config_action_label(state, ui, filtered),
+        );
         render_bottom_bar(frame, ui, hints_area, has_pane_control, &ctx_buttons);
 
         if let Some(right) = panes_area {
@@ -19334,7 +19350,11 @@ fn render_frame(
 
             render_stats_bar(frame, &state.aggregate_stats(), vertical[2]);
         }
-        let ctx_buttons = dashboard_context_buttons(&ui.keybindings, !filtered.is_empty());
+        let ctx_buttons = dashboard_context_buttons(
+            &ui.keybindings,
+            !filtered.is_empty(),
+            config_action_label(state, ui, filtered),
+        );
         render_bottom_bar(frame, ui, hints_area, has_pane_control, &ctx_buttons);
         // Still render live terminal panes even when filter matches zero sessions.
         if let Some(right) = panes_area {
@@ -19377,7 +19397,11 @@ fn render_frame(
     }
 
     // Full-width hints bar
-    let ctx_buttons = dashboard_context_buttons(&ui.keybindings, !filtered.is_empty());
+    let ctx_buttons = dashboard_context_buttons(
+        &ui.keybindings,
+        !filtered.is_empty(),
+        config_action_label(state, ui, filtered),
+    );
     render_bottom_bar(frame, ui, hints_area, has_pane_control, &ctx_buttons);
 
     // Render terminal panes on the right side
@@ -19568,6 +19592,7 @@ fn draw_modal(frame: &mut Frame, area: Rect, ui: &mut UiState) {
             frame,
             area,
             ui.config_gen_selected,
+            ui.config_gen_exists,
         ));
     }
     if ui.mode == UiMode::QuitConfirm {
@@ -20964,7 +20989,15 @@ fn global_bar_buttons(
 /// shortcut. Filter is always actionable; Rename / Generate-config act on the
 /// selected card, so they're disabled (dimmed) when there are no cards —
 /// matching the keys' `total > 0` guard.
-fn dashboard_context_buttons(keybindings: &KeybindingConfig, has_cards: bool) -> Vec<Button> {
+///
+/// PRD #2119: `config_label` is the selected card's config action — `Update`
+/// when the daemon reported its project already has a config, else
+/// `Generate` ([`config_action_label`]). Same key, same action either way.
+fn dashboard_context_buttons(
+    keybindings: &KeybindingConfig,
+    has_cards: bool,
+    config_label: &'static str,
+) -> Vec<Button> {
     let mut buttons = vec![
         Button::new(
             "Filter",
@@ -20979,7 +21012,7 @@ fn dashboard_context_buttons(keybindings: &KeybindingConfig, has_cards: bool) ->
             has_cards,
         ),
         Button::new(
-            "Generate",
+            config_label,
             button_shortcut_label(keybindings, KbAction::GenerateConfig),
             Action::RequestConfigGen,
             has_cards,
@@ -21004,6 +21037,29 @@ fn dashboard_context_buttons(keybindings: &KeybindingConfig, has_cards: bool) ->
         true,
     ));
     buttons
+}
+
+/// PRD #2119: the footer's config action when the selected card's project
+/// has no config, or the daemon has not said.
+const CONFIG_ACTION_GENERATE: &str = "Generate";
+
+/// PRD #2119: the footer label of the selected card's config action — `Update`
+/// when the daemon reported that its project already has a
+/// `.dot-agent-deck.toml`, else [`CONFIG_ACTION_GENERATE`]. The card is the one
+/// `g` acts on ([`dashboard_focus_target`]).
+fn config_action_label(
+    state: &AppState,
+    ui: &UiState,
+    filtered: &[(&String, &SessionState)],
+) -> &'static str {
+    let exists = dashboard_focus_target(ui, filtered.len())
+        .and_then(|i| filtered.get(i))
+        .and_then(|(_, session)| state.project_config_exists(session));
+    if exists == Some(true) {
+        "Update"
+    } else {
+        CONFIG_ACTION_GENERATE
+    }
 }
 
 /// PRD #144 — greedy line-wrap for the bottom button bar. Lay the buttons out
@@ -21270,7 +21326,13 @@ fn bottom_bar_rows(ui: &UiState, width: u16, frame_height: u16) -> u16 {
         _ if ui.status_message.is_some() => 1,
         _ => {
             let mut buttons = global_bar_buttons(&ui.keybindings, ui.mode, true);
-            buttons.extend(dashboard_context_buttons(&ui.keybindings, true));
+            // PRD #2119: reserved for `Generate`, the longer of the two
+            // config labels, so an `Update` bar never needs more rows.
+            buttons.extend(dashboard_context_buttons(
+                &ui.keybindings,
+                true,
+                CONFIG_ACTION_GENERATE,
+            ));
             let widths: Vec<u16> = buttons
                 .iter()
                 .map(|b| b.display_label().chars().count() as u16)
@@ -21654,7 +21716,7 @@ const STOP_CONFIRM: ConfirmLayout = ConfirmLayout {
     first_choice: 4,
 };
 const CONFIG_GEN_CONFIRM: ConfirmLayout = ConfirmLayout {
-    rows: 14,
+    rows: 12,
     first_choice: 5,
 };
 
@@ -22311,7 +22373,12 @@ fn render_star_prompt(frame: &mut Frame, area: Rect) -> ConfirmDrawing {
     }
 }
 
-fn render_config_gen_prompt(frame: &mut Frame, area: Rect, selected: usize) -> ConfirmDrawing {
+fn render_config_gen_prompt(
+    frame: &mut Frame,
+    area: Rect,
+    selected: usize,
+    exists: Option<bool>,
+) -> ConfirmDrawing {
     let popup_width = 60u16.min(area.width.saturating_sub(4));
     let popup_height = CONFIG_GEN_CONFIRM.popup_height(0, area);
     let x = (area.width.saturating_sub(popup_width)) / 2;
@@ -22320,19 +22387,50 @@ fn render_config_gen_prompt(frame: &mut Frame, area: Rect, selected: usize) -> C
 
     frame.render_widget(Clear, popup_area);
 
-    let options = [
-        ("Yes", "generate config for this project"),
-        ("No", "skip for now"),
-        ("Never", "never ask for this directory"),
-    ];
+    // PRD #2119: Update when the daemon reported that the project already
+    // has a config — the request it composes then says so — Generate when it
+    // reported none, and, when it could not tell, a question that claims
+    // neither: the request is then the conditional one (PR #2362 review). The
+    // title stays Generate there, matching the footer. The same words as the
+    // desktop's dialog (CLAUDE.md rule 22).
+    let (verb, question, yes) = match exists {
+        Some(true) => (
+            "Update",
+            [
+                "  This project already has an orchestration config.",
+                "  Want to instruct your agent to analyze the",
+                "  project and update the existing config?",
+            ],
+            "update config for this project",
+        ),
+        Some(false) => (
+            "Generate",
+            [
+                "  No orchestration config found for this",
+                "  project. Want to instruct your agent to",
+                "  analyze the project and create one?",
+            ],
+            "generate config for this project",
+        ),
+        None => (
+            "Generate",
+            [
+                "  Want to instruct your agent to check this",
+                "  project for .dot-agent-deck.toml and create it,",
+                "  or propose updates to it if it already exists?",
+            ],
+            "create or update config for this project",
+        ),
+    };
+    let options = [("Yes", yes), ("No", "skip for now")];
 
-    let mut text = vec![
-        Line::from(""),
-        Line::styled("  No orchestration config found for this", text_primary()),
-        Line::styled("  project. Want to instruct your agent to", text_primary()),
-        Line::styled("  analyze the project and create one?", text_primary()),
-        Line::from(""),
-    ];
+    let mut text = vec![Line::from("")];
+    text.extend(
+        question
+            .iter()
+            .map(|line| Line::styled(*line, text_primary())),
+    );
+    text.push(Line::from(""));
 
     for (i, (label, desc)) in options.iter().enumerate() {
         let cursor = if i == selected { ">" } else { " " };
@@ -22349,11 +22447,10 @@ fn render_config_gen_prompt(frame: &mut Frame, area: Rect, selected: usize) -> C
         ));
     }
 
+    // PRD #2119: Yes / No only. The dialog opens only when asked for, so a
+    // "Never" choice and an automatic-prompt hint had nothing to switch off.
+    // Two rows follow the choices: a gap, and the button row below.
     text.push(Line::from(""));
-    text.push(Line::styled(
-        "  Disable: dot-agent-deck config set auto_config_prompt false",
-        text_primary(),
-    ));
     text.push(Line::from(""));
     text.push(Line::styled(
         "  Up/Down: navigate  Enter: confirm  Esc: cancel",
@@ -22361,7 +22458,7 @@ fn render_config_gen_prompt(frame: &mut Frame, area: Rect, selected: usize) -> C
     ));
 
     let block = Block::default()
-        .title(" Generate .dot-agent-deck.toml ")
+        .title(format!(" {verb} .dot-agent-deck.toml "))
         .title_style(
             Style::default()
                 .fg(Color::Cyan)
@@ -22377,7 +22474,6 @@ fn render_config_gen_prompt(frame: &mut Frame, area: Rect, selected: usize) -> C
     let buttons = [
         Button::new("Yes", "", Action::ConfigGenConfirm, true),
         Button::new("No", "", Action::ConfigGenDismiss, true),
-        Button::new("Never", "", Action::ConfigGenSuppress, true),
     ];
     let btn_row = Rect {
         x: popup_area.x + 1,
@@ -26621,7 +26717,7 @@ pub fn render_config_gen_prompt_to_buffer(
 ) -> ratatui::buffer::Buffer {
     draw_to_buffer(width, height, |frame| {
         let frame_area = frame.area();
-        render_config_gen_prompt(frame, frame_area, selected);
+        render_config_gen_prompt(frame, frame_area, selected, Some(false));
     })
 }
 
@@ -27257,7 +27353,7 @@ pub fn render_button_bar_with_bindings_to_buffer(
     let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
     // Seam renders the full global+context bar (including the always-on
     // Schedules button) so every remappable label is exercised.
-    let ctx_buttons = dashboard_context_buttons(keybindings, true);
+    let ctx_buttons = dashboard_context_buttons(keybindings, true, CONFIG_ACTION_GENERATE);
     let mut ui = UiState::new(DashboardConfig::default(), keybindings.clone());
     terminal
         .draw(|frame| {
@@ -27301,7 +27397,7 @@ pub fn render_button_bar_for_mode_to_buffer(
 
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
-    let ctx_buttons = dashboard_context_buttons(keybindings, true);
+    let ctx_buttons = dashboard_context_buttons(keybindings, true, CONFIG_ACTION_GENERATE);
     let mut ui = UiState::new(DashboardConfig::default(), keybindings.clone());
     ui.mode = mode;
     terminal
@@ -37640,6 +37736,8 @@ mod tests {
         next: std::sync::Mutex<u32>,
         focused: std::sync::Mutex<Vec<String>>,
         closed: std::sync::Mutex<Vec<String>>,
+        config_requests: std::sync::Mutex<Vec<crate::pane::BoundPane>>,
+        posted_messages: std::sync::Mutex<Vec<String>>,
     }
     impl OpenTabPC {
         fn new() -> Self {
@@ -37647,10 +37745,32 @@ mod tests {
                 next: std::sync::Mutex::new(0),
                 focused: std::sync::Mutex::new(Vec::new()),
                 closed: std::sync::Mutex::new(Vec::new()),
+                config_requests: std::sync::Mutex::new(Vec::new()),
+                posted_messages: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
     impl crate::pane::PaneController for OpenTabPC {
+        fn generate_config(
+            &self,
+            card: &crate::pane::BoundPane,
+            _expected_agent_id: Option<&str>,
+        ) -> Result<crate::daemon_client::GatedQuery<String>, PaneError> {
+            self.config_requests.lock().unwrap().push(card.clone());
+            Ok(crate::daemon_client::GatedQuery::Unsupported)
+        }
+
+        fn post_message(
+            &self,
+            _card: &crate::pane::BoundPane,
+            _subject: &str,
+            body: &str,
+            _origin: crate::inbox_hub::PostOrigin,
+        ) -> Result<String, PaneError> {
+            self.posted_messages.lock().unwrap().push(body.to_owned());
+            Ok("unexpected-fallback".into())
+        }
+
         fn create_pane(
             &self,
             _cmd: Option<&str>,
@@ -37726,6 +37846,7 @@ mod tests {
         /// Whether the daemon actually has a pane to attach (`false` = the
         /// card really is dead).
         hydratable: bool,
+        refuse_focus: bool,
         wired: std::sync::Mutex<bool>,
         hydrate_calls: std::sync::Mutex<usize>,
     }
@@ -37733,12 +37854,31 @@ mod tests {
         fn new(hydratable: bool) -> Self {
             Self {
                 hydratable,
+                refuse_focus: false,
                 wired: std::sync::Mutex::new(false),
                 hydrate_calls: std::sync::Mutex::new(0),
             }
         }
     }
     impl crate::pane::PaneController for UnwiredPC {
+        fn generate_config(
+            &self,
+            _card: &crate::pane::BoundPane,
+            _expected_agent_id: Option<&str>,
+        ) -> Result<crate::daemon_client::GatedQuery<String>, crate::pane::PaneError> {
+            Ok(crate::daemon_client::GatedQuery::Answered(
+                "m-config".into(),
+            ))
+        }
+        fn focus_card(&self, card: &crate::pane::BoundPane) -> Result<(), crate::pane::PaneError> {
+            if self.refuse_focus {
+                Err(crate::pane::PaneError::Refused(
+                    "the agent restarted".into(),
+                ))
+            } else {
+                self.focus_pane(&card.pane_id)
+            }
+        }
         fn focus_pane(&self, _id: &str) -> Result<(), crate::pane::PaneError> {
             if *self.wired.lock().unwrap() {
                 Ok(())
@@ -43721,10 +43861,7 @@ mod tests {
         let mut ui = default_ui();
         ui.mode = UiMode::ConfigGenPrompt;
         ui.config_gen_selected = 0; // Yes
-        ui.config_gen_target = Some((
-            crate::pane::BoundPane::held_by_controller("pane-1"),
-            "/my/project".to_string(),
-        ));
+        ui.config_gen_target = Some(crate::pane::BoundPane::held_by_controller("pane-1"));
 
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         let result = handle_config_gen_prompt_key(enter, &mut ui);
@@ -43732,8 +43869,7 @@ mod tests {
         assert_eq!(ui.mode, UiMode::Normal);
         assert!(ui.config_gen_target.is_none());
         assert!(
-            matches!(result, Action::SendConfigGenPrompt { ref pane, ref cwd }
-                if pane.pane_id == "pane-1" && cwd == "/my/project")
+            matches!(result, Action::SendConfigGenPrompt { ref pane } if pane.pane_id == "pane-1")
         );
     }
 
@@ -43742,10 +43878,7 @@ mod tests {
         let mut ui = default_ui();
         ui.mode = UiMode::ConfigGenPrompt;
         ui.config_gen_selected = 1; // No
-        ui.config_gen_target = Some((
-            crate::pane::BoundPane::held_by_controller("pane-1"),
-            "/my/project".to_string(),
-        ));
+        ui.config_gen_target = Some(crate::pane::BoundPane::held_by_controller("pane-1"));
 
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         let result = handle_config_gen_prompt_key(enter, &mut ui);
@@ -43753,40 +43886,10 @@ mod tests {
         assert_eq!(ui.mode, UiMode::Normal);
         assert!(ui.config_gen_target.is_none());
         assert!(matches!(result, Action::Continue));
+        assert!(ui.status_message.is_none(), "No says nothing");
     }
 
-    #[test]
-    fn config_gen_prompt_enter_on_never_suppresses_dir() {
-        // Picking "Never" calls suppress_dir() → save(), which reads
-        // DOT_AGENT_DECK_CONFIG_GEN_STATE. Hold the shared lock and point at
-        // a temp path so we don't race against other tests touching the same
-        // env var, and don't pollute the real home dir.
-        let _guard = crate::config::CONFIG_GEN_STATE_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("config-gen-state.json");
-        // Drop guard restores the env var even if an assertion below panics.
-        let _env_restore = crate::config::ConfigGenStateEnvGuard::set(path.to_str().unwrap());
-
-        let mut ui = default_ui();
-        ui.mode = UiMode::ConfigGenPrompt;
-        ui.config_gen_selected = 2; // Never
-        ui.config_gen_target = Some((
-            crate::pane::BoundPane::held_by_controller("pane-1"),
-            "/my/project".to_string(),
-        ));
-
-        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-        let result = handle_config_gen_prompt_key(enter, &mut ui);
-
-        assert_eq!(ui.mode, UiMode::Normal);
-        assert!(ui.config_gen_target.is_none());
-        assert!(ui.config_gen_state.is_suppressed("/my/project"));
-        assert!(matches!(result, Action::Continue));
-        assert!(ui.status_message.is_some());
-    }
-
+    /// PRD #2119: the dialog offers Yes and No only, so Down stops at No.
     #[test]
     fn config_gen_prompt_arrow_navigation() {
         let mut ui = default_ui();
@@ -43797,26 +43900,20 @@ mod tests {
         handle_config_gen_prompt_key(down, &mut ui);
         assert_eq!(ui.config_gen_selected, 1);
 
-        handle_config_gen_prompt_key(down, &mut ui);
-        assert_eq!(ui.config_gen_selected, 2);
-
         // Can't go past last
         handle_config_gen_prompt_key(down, &mut ui);
-        assert_eq!(ui.config_gen_selected, 2);
+        assert_eq!(ui.config_gen_selected, 1);
 
         let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
         handle_config_gen_prompt_key(up, &mut ui);
-        assert_eq!(ui.config_gen_selected, 1);
+        assert_eq!(ui.config_gen_selected, 0);
     }
 
     #[test]
     fn config_gen_prompt_esc_dismisses() {
         let mut ui = default_ui();
         ui.mode = UiMode::ConfigGenPrompt;
-        ui.config_gen_target = Some((
-            crate::pane::BoundPane::held_by_controller("pane-1"),
-            "/my/project".to_string(),
-        ));
+        ui.config_gen_target = Some(crate::pane::BoundPane::held_by_controller("pane-1"));
 
         let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
         let result = handle_config_gen_prompt_key(esc, &mut ui);
@@ -47316,7 +47413,11 @@ mod tests {
     /// Draw one full dashboard frame for `state` / `ui` into a 100x24
     /// `TestBackend` and return every row, right-trimmed.
     fn glossary_frame_rows(state: &AppState, ui: &mut UiState) -> Vec<String> {
-        let backend = TestBackend::new(100, 24);
+        glossary_frame_rows_at_width(state, ui, 100)
+    }
+
+    fn glossary_frame_rows_at_width(state: &AppState, ui: &mut UiState, width: u16) -> Vec<String> {
+        let backend = TestBackend::new(width, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let filtered = filter_sessions(state, ui);
         terminal
@@ -47654,6 +47755,7 @@ mod tests {
         let record = crate::agent_pty::AgentRecord {
             input_held: None,
             input_discarded: None,
+            project_config_exists: None,
             id: agent_id.to_string(),
             pane_id_env: Some(pane_id.to_string()),
             display_name: Some(name.to_string()),
@@ -49950,13 +50052,13 @@ mod tests {
                 hidden: 1,
                 later: None,
             },
-            // [Yes] [No] [Never] paints over No; Never is still shown.
+            // [Yes] [No] paints over No (PRD #2119: no Never below it).
             Case {
                 mode: UiMode::ConfigGenPrompt,
                 small: (80, 14),
-                labels: &["Yes", "No", "Never"],
+                labels: &["Yes", "No"],
                 hidden: 1,
-                later: Some(2),
+                later: None,
             },
         ];
         for Case {
@@ -50235,14 +50337,13 @@ mod tests {
             Action::ConfirmCloseSelected => "[Close]",
             Action::ConfigGenConfirm => "[Yes]",
             Action::ConfigGenDismiss => "[No]",
-            Action::ConfigGenSuppress => "[Never]",
             other => panic!("a confirmation button fires {other:?}"),
         };
         let dialogs: [(UiMode, &[&str], usize); 4] = [
             (UiMode::QuitConfirm, &["Detach", "Stop", "Cancel"], 3),
             (UiMode::CloseConfirm, &["Cancel", "Close"], 2),
             (UiMode::StopConfirm, &["No", "Yes"], 0),
-            (UiMode::ConfigGenPrompt, &["Yes", "No", "Never"], 3),
+            (UiMode::ConfigGenPrompt, &["Yes", "No"], 2),
         ];
         let footers: [(bool, &[_]); 4] =
             [(false, &[]), (true, &[]), (false, &notice), (true, &notice)];
@@ -50583,6 +50684,382 @@ mod tests {
                 Some("s-first"),
                 "Enter targets the new agent"
             );
+        }
+    }
+
+    /// Scenario: Refresh a dashboard card from daemon records with existing, absent, or unknown config state and press g. The footer and Yes/No dialog say Update only when the daemon reports an existing file, and an unknown state asks to check for the file and create or update it without claiming either.
+    #[spec("dashboard/config-gen/001")]
+    #[test]
+    fn config_gen_001_existing_config_labels_footer_and_confirmation_update() {
+        for exists in [None, Some(false), Some(true)] {
+            let mut record = serde_json::json!({
+                "id": "config-label-agent", "pane_id_env": "config-label-pane",
+                "cwd": "/project-on-the-daemon"
+            });
+            if let Some(exists) = exists {
+                record["project_config_exists"] = serde_json::json!(exists);
+            }
+            let mut snapshot = AppState::default();
+            let records = [serde_json::from_value(record).unwrap()];
+            snapshot.card_unseen_agents(&records);
+            snapshot.resync_after_event_gap(&records);
+            let selected = snapshot.sessions.keys().next().unwrap().clone();
+            let mut ui = default_ui();
+            let footer = glossary_frame_rows_at_width(&snapshot, &mut ui, 220).join("\n");
+            let verb = if exists == Some(true) {
+                "Update"
+            } else {
+                "Generate"
+            };
+            assert!(
+                footer.contains(&format!("[{verb} g]")),
+                "existing={exists:?}: footer must offer {verb} on g:\n{footer}"
+            );
+            let state: SharedState = Arc::new(tokio::sync::RwLock::new(snapshot.clone()));
+            let pc = Arc::new(OpenTabPC::new());
+            let mut tabs = TabManager::new(pc.clone());
+            let filtered: Vec<_> = snapshot.sessions.iter().collect();
+            handle_key_event(
+                KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+                &mut ui,
+                &*pc,
+                &state,
+                &mut tabs,
+                &snapshot,
+                &filtered,
+                Rect::new(0, 0, 220, 24),
+            );
+            assert_eq!(
+                ui.mode,
+                UiMode::ConfigGenPrompt,
+                "g opens the same confirmation for {selected}"
+            );
+            let dialog = glossary_frame_rows_at_width(&snapshot, &mut ui, 220).join("\n");
+            assert!(
+                dialog.contains(&format!("{verb} .dot-agent-deck.toml")),
+                "existing={exists:?}: dialog title must say {verb}:\n{dialog}"
+            );
+            for label in ["[Yes]", "[No]"] {
+                assert!(
+                    dialog.contains(label),
+                    "neutral confirmation must offer {label}:\n{dialog}"
+                );
+            }
+            match exists {
+                Some(true) => {
+                    assert!(
+                        dialog.contains("update the existing config"),
+                        "ask to update the user's config:\n{dialog}"
+                    );
+                    assert!(!dialog.contains("No orchestration config found"));
+                    insta::assert_snapshot!("config_generation_update_confirmation", dialog);
+                }
+                Some(false) => {
+                    assert!(
+                        dialog.contains("create one?"),
+                        "keep the existing Generate question:\n{dialog}"
+                    );
+                }
+                // PR #2362 review: the daemon could not tell, so the
+                // question claims neither a config nor its absence.
+                None => {
+                    for claim in [
+                        "No orchestration config found",
+                        "already has an orchestration config",
+                        "create one?",
+                    ] {
+                        assert!(
+                            !dialog.contains(claim),
+                            "an unknown state must not claim {claim:?}:\n{dialog}"
+                        );
+                    }
+                    for neutral in [
+                        "check this",
+                        "project for .dot-agent-deck.toml and create it,",
+                        "or propose updates to it if it already exists?",
+                        "create or update config for this project",
+                    ] {
+                        assert!(
+                            dialog.contains(neutral),
+                            "the unknown question must say {neutral:?}:\n{dialog}"
+                        );
+                    }
+                    insta::assert_snapshot!("config_generation_unknown_confirmation", dialog);
+                }
+            }
+        }
+    }
+
+    /// Scenario: Open Generate config for an agent on an older daemon and confirm Yes by mouse or keyboard. The status line explains that the daemon needs upgrading, nothing is posted through the generic inbox fallback, and the deck stays out of typing mode.
+    #[spec("dashboard/config-gen/001")]
+    #[test]
+    fn config_gen_001_older_daemon_shows_upgrade_without_posting_a_fallback() {
+        for keyboard in [false, true] {
+            let mut snapshot = AppState::default();
+            let incarnation =
+                crate::daemon_client::Incarnation::from(Some("listed-process".into()));
+            snapshot.learn_stream_incarnation(incarnation.clone());
+            let sid = snapshot.insert_placeholder_session_learned(
+                "selected-pane".into(),
+                None,
+                None,
+                Some("selected-agent".into()),
+                incarnation,
+            );
+            let state: SharedState = Arc::new(tokio::sync::RwLock::new(snapshot.clone()));
+            let pc = Arc::new(OpenTabPC::new());
+            let mut tab_manager = TabManager::new(pc.clone());
+            let mut ui = default_ui();
+            dispatch_action(
+                Action::RequestConfigGen,
+                &mut ui,
+                &*pc,
+                &state,
+                &mut tab_manager,
+                &snapshot,
+                &[],
+                Some(&sid),
+                Rect::new(0, 0, 180, 24),
+            );
+            assert_eq!(ui.mode, UiMode::ConfigGenPrompt);
+            let confirm = if keyboard {
+                handle_config_gen_prompt_key(
+                    KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    &mut ui,
+                )
+            } else {
+                Action::ConfigGenConfirm
+            };
+            dispatch_action(
+                confirm,
+                &mut ui,
+                &*pc,
+                &state,
+                &mut tab_manager,
+                &snapshot,
+                &[],
+                Some(&sid),
+                Rect::new(0, 0, 180, 24),
+            );
+            assert_eq!(
+                glossary_status_text(&ui),
+                Some(crate::config_gen::CONFIG_GEN_UPGRADE_MESSAGE)
+            );
+            assert!(glossary_status_row(&state, &mut ui).contains("Upgrade"));
+            assert_ne!(ui.mode, UiMode::PaneInput);
+            assert_eq!(pc.config_requests.lock().unwrap().len(), 1);
+            assert!(
+                pc.posted_messages.lock().unwrap().is_empty(),
+                "an older daemon must receive no locally composed fallback"
+            );
+            assert!(pc.focused.lock().unwrap().is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    fn config_gen_scripted_confirmation(
+        replace_card: bool,
+        silent: bool,
+    ) -> (String, Vec<serde_json::Value>) {
+        use crate::daemon_client::restart_fixture::RestartingDaemon;
+        use crate::embedded_pane::EmbeddedPaneController;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let daemon = runtime.block_on(async { RestartingDaemon::spawn("config-process") });
+        daemon.config_generation(
+            Some(crate::daemon_protocol::AttachResponse::err(
+                "target refused",
+            )),
+            silent,
+        );
+        let pc = Arc::new(
+            EmbeddedPaneController::new(daemon.path.clone(), runtime.handle().clone())
+                .with_protocol_gate(),
+        );
+        let mut snapshot = AppState::default();
+        let incarnation = crate::daemon_client::Incarnation::from(Some("config-process".into()));
+        snapshot.learn_stream_incarnation(incarnation.clone());
+        let sid = snapshot.insert_placeholder_session_learned(
+            "pane-1".into(),
+            None,
+            None,
+            Some("1".into()),
+            incarnation,
+        );
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(snapshot.clone()));
+        let mut tabs = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        dispatch_action(
+            Action::RequestConfigGen,
+            &mut ui,
+            &*pc,
+            &state,
+            &mut tabs,
+            &snapshot,
+            &[],
+            Some(&sid),
+            Rect::new(0, 0, 240, 24),
+        );
+        assert_eq!(ui.mode, UiMode::ConfigGenPrompt);
+        if replace_card {
+            snapshot.sessions.get_mut(&sid).unwrap().agent_id = Some("2".into());
+            *state.blocking_write() = snapshot.clone();
+        }
+        dispatch_action(
+            Action::ConfigGenConfirm,
+            &mut ui,
+            &*pc,
+            &state,
+            &mut tabs,
+            &snapshot,
+            &[],
+            Some(&sid),
+            Rect::new(0, 0, 240, 24),
+        );
+        assert_ne!(ui.mode, UiMode::PaneInput);
+        let status = glossary_status_text(&ui)
+            .expect("a visible generation outcome")
+            .to_owned();
+        assert!(glossary_status_row(&state, &mut ui).contains("Failed to send config prompt:"));
+        (
+            status,
+            daemon.requests_to("config-process", "generate-config"),
+        )
+    }
+
+    /// Scenario: Open Generate config on an unopened card for agent A, replace its displayed occupant with B, then confirm Yes. The request still names A, so the replacement can never receive A's config instructions; an unchanged card is the control.
+    #[cfg(unix)]
+    #[spec("dashboard/config-gen/001")]
+    #[test]
+    fn config_gen_001_confirmation_keeps_the_agent_it_opened_for() {
+        let observations: Vec<_> = [false, true]
+            .into_iter()
+            .map(|replace| {
+                let (_, requests) = config_gen_scripted_confirmation(replace, false);
+                assert_eq!(requests.len(), 1, "one confirmation request");
+                (replace, requests[0]["expected_agent_id"].clone())
+            })
+            .collect();
+        assert_eq!(
+            observations,
+            vec![
+                (false, serde_json::json!("1")),
+                (true, serde_json::json!("1"))
+            ],
+            "Yes must preserve the agent captured when the dialog opened, including on an unopened pane"
+        );
+    }
+
+    /// Scenario: Confirm Generate config and have the daemon refuse the target. The TUI's visible status is exactly the desktop's shared failure sentence for the same client error.
+    #[cfg(unix)]
+    #[spec("dashboard/config-gen/001")]
+    #[test]
+    fn config_gen_001_refusal_uses_the_desktop_failure_sentence() {
+        let (status, _) = config_gen_scripted_confirmation(false, false);
+        assert_eq!(
+            status,
+            crate::config_gen::config_gen_failed_message(
+                &crate::daemon_client::ClientError::Server("target refused".into())
+            )
+        );
+    }
+
+    /// Scenario: Confirm Generate config on a daemon that receives the request but never answers. The TUI shows the same timeout sentence as the desktop and stays out of typing mode.
+    #[cfg(unix)]
+    #[spec("dashboard/config-gen/001")]
+    #[test]
+    fn config_gen_001_timeout_uses_the_desktop_failure_sentence() {
+        let (status, requests) = config_gen_scripted_confirmation(false, true);
+        assert_eq!(requests.len(), 1, "the timeout follows a sent request");
+        assert_eq!(
+            status,
+            crate::config_gen::config_gen_failed_message(
+                &crate::daemon_client::ClientError::TimedOut(std::time::Duration::from_secs(15))
+            )
+        );
+    }
+
+    /// Scenario: Confirm Generate config on an agent whose pane is not open here. A pane that can be opened enters typing mode; a refused focus or unavailable pane leaves command mode and the card intact, with the sent notice visible.
+    #[spec("inbox/route/007")]
+    #[test]
+    fn route_007_sent_config_opens_an_unwired_pane_or_keeps_the_card() {
+        for (hydratable, refuse_focus) in [(true, false), (false, false), (true, true)] {
+            for keyboard in [false, true] {
+                let mut controller = UnwiredPC::new(hydratable);
+                controller.refuse_focus = refuse_focus;
+                let pc = Arc::new(controller);
+                let mut snapshot = AppState::default();
+                let incarnation =
+                    crate::daemon_client::Incarnation::from(Some("listed-process".into()));
+                snapshot.learn_stream_incarnation(incarnation.clone());
+                let sid = snapshot.insert_placeholder_session_learned(
+                    "selected-pane".into(),
+                    None,
+                    None,
+                    Some("selected-agent".into()),
+                    incarnation,
+                );
+                let state: SharedState = Arc::new(tokio::sync::RwLock::new(snapshot.clone()));
+                let mut tab_manager = TabManager::new(pc.clone());
+                let mut ui = default_ui();
+                ui.display_names
+                    .insert(sid.clone(), "config-target-agent".into());
+                dispatch_action(
+                    Action::RequestConfigGen,
+                    &mut ui,
+                    &*pc,
+                    &state,
+                    &mut tab_manager,
+                    &snapshot,
+                    &[],
+                    Some(&sid),
+                    Rect::new(0, 0, 180, 24),
+                );
+                assert_eq!(ui.mode, UiMode::ConfigGenPrompt);
+                let confirm = if keyboard {
+                    handle_config_gen_prompt_key(
+                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                        &mut ui,
+                    )
+                } else {
+                    Action::ConfigGenConfirm
+                };
+                dispatch_action(
+                    confirm,
+                    &mut ui,
+                    &*pc,
+                    &state,
+                    &mut tab_manager,
+                    &snapshot,
+                    &[],
+                    Some(&sid),
+                    Rect::new(0, 0, 180, 24),
+                );
+                assert_eq!(
+                    ui.mode,
+                    if hydratable && !refuse_focus {
+                        UiMode::PaneInput
+                    } else {
+                        UiMode::Normal
+                    },
+                    "hydratable={hydratable}, refused={refuse_focus}, keyboard={keyboard}"
+                );
+                let rows = glossary_frame_rows(&state.blocking_read(), &mut ui);
+                let status = rows.last().expect("the frame has a status row");
+                assert!(status.contains(crate::config_gen::CONFIG_GEN_SENT_MESSAGE));
+                assert!(status.contains(if hydratable && !refuse_focus {
+                    "TYPING"
+                } else {
+                    "COMMAND"
+                }));
+                assert!(
+                    rows.iter().any(|row| row.contains("config-target-agent")),
+                    "a sent request must keep its card even when focus fails"
+                );
+            }
         }
     }
 

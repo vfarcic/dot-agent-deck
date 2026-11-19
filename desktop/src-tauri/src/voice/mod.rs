@@ -708,6 +708,7 @@ pub mod test_support {
             answer_settlements: Vec::new(),
             tab: DesktopTab::Dashboard,
             pull_request: None,
+            project_config_exists: None,
             incarnation: Default::default(),
         }
     }

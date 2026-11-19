@@ -1070,6 +1070,25 @@ pub const QUESTION_RELEASED_BY_DECK_METADATA_KEY: &str = "question_released_by_d
 /// when it counts hook latency. Nothing outside telemetry reads it.
 pub const RECEIVED_BY_DECK_AT_METADATA_KEY: &str = "received_by_deck_at_ns";
 
+/// Issue #2347: on the `Thinking` Claude Code's prompt hook reports in a deck
+/// pane, a nonce naming that one prompt. Claude can still drop the prompt
+/// after the hook reported it (another `UserPromptSubmit` hook blocks it),
+/// and then runs no turn and fires no `Stop`; the transcript witness
+/// ([`crate::inbox_witness`]) reports that with
+/// [`PROMPT_NOT_TAKEN_METADATA_KEY`] and the same nonce.
+pub const PROMPT_TURN_METADATA_KEY: &str = "prompt_turn";
+
+/// Issue #2347: on an `Idle` the transcript witness sends, the nonce of the
+/// prompt Claude Code dropped ([`PROMPT_TURN_METADATA_KEY`]). The daemon
+/// applies it only while the turn that prompt's `Thinking` started is still
+/// the pane's latest news, and drops it otherwise
+/// (`crate::state::AppState::admit_prompt_not_taken`).
+pub const PROMPT_NOT_TAKEN_METADATA_KEY: &str = "prompt_not_taken";
+
+/// Issue #2347: the version of the guarded [`PROMPT_NOT_TAKEN_METADATA_KEY`]
+/// report a daemon advertises in [`InboxWaitReply::prompt_not_taken`].
+pub const PROMPT_NOT_TAKEN_REPORTS: u32 = 1;
+
 /// Where a permission prompt stands, on the events the OpenCode hook builds
 /// from one: `pending` on the ask, [`PERMISSION_STATE_REPLIED`] on the answer.
 /// PRD #1631: a question form's answer or dismissal is marked replied too.
@@ -1317,6 +1336,14 @@ impl AgentEvent {
     /// behaviour.
     pub fn is_from_subagent(&self) -> bool {
         self.metadata.contains_key(SUBAGENT_ID_METADATA_KEY)
+    }
+
+    /// Issue #2347: the nonce of the Claude Code prompt this witness `Idle`
+    /// reports dropped ([`PROMPT_NOT_TAKEN_METADATA_KEY`]), if it is one.
+    pub fn prompt_not_taken(&self) -> Option<&str> {
+        self.metadata
+            .get(PROMPT_NOT_TAKEN_METADATA_KEY)
+            .map(String::as_str)
     }
 
     /// Issue #1678: is this a subagent's answered permission prompt — a
@@ -4270,6 +4297,13 @@ pub struct InboxWaitReply {
     /// Code's support (part 2's daemon answers it and serves no other).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub one_shot_senders: Vec<InboxOneShotSender>,
+    /// Issue #2347: with [`Self::one_shot_receipts`], the version of the
+    /// guarded dropped-prompt report this daemon applies
+    /// ([`PROMPT_NOT_TAKEN_REPORTS`]). Additive and optional: the transcript
+    /// witness sends no such report to a daemon whose answer lacks it, since
+    /// that daemon would apply it as a plain `Idle`, unguarded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_not_taken: Option<u32>,
 }
 
 impl InboxWaitReply {

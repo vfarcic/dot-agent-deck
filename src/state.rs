@@ -1880,6 +1880,16 @@ impl std::fmt::Debug for AgentOwnershipOracle {
     }
 }
 
+/// Issue #2347: the Claude Code prompt that started a pane's current turn
+/// ([`AppState::admit_prompt_not_taken`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PromptTurnOpen {
+    /// The prompt's nonce ([`crate::event::PROMPT_TURN_METADATA_KEY`]).
+    nonce: String,
+    /// The session its `Thinking` reported.
+    session_id: String,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct AppState {
     pub sessions: HashMap<String, SessionState>,
@@ -1890,6 +1900,10 @@ pub struct AppState {
     /// it. Forgotten with the pane, so it does not grow by one entry per pane
     /// id ever seen.
     pane_event_epochs: HashMap<String, u64>,
+    /// Issue #2347: per pane, the Claude Code prompt whose `Thinking` started
+    /// the turn the card now shows, while nothing else has arrived from the
+    /// pane since ([`Self::admit_prompt_not_taken`]). Daemon-side only.
+    prompt_turns: HashMap<String, PromptTurnOpen>,
     /// PRD #1666 part 2 (`inbox/doorbell/008`): per pane, what each recent
     /// agent generation's OWN hooks have shown of its readiness for input,
     /// newest generation first and at most [`MAX_READINESS_GENERATIONS`] of
@@ -1926,6 +1940,12 @@ pub struct AppState {
     /// a failed integration refresh among them — while it spawns it, before
     /// the client has its card; the surfacing start carries them.
     pane_inboxes: HashMap<String, PaneInbox>,
+    /// PRD #2119: per pane, the agent the daemon last listed on it and whether
+    /// that agent's project already holds a `.dot-agent-deck.toml`
+    /// ([`crate::agent_pty::AgentRecord::project_config_exists`]), as of the
+    /// last listing this client read ([`Self::take_project_config_flags`]).
+    /// No entry is unknown. Forgotten with the pane.
+    pane_project_config: HashMap<String, (String, bool)>,
     /// PRD #1666 part 3 (Q35-20e): the daemon's latest word on held typing,
     /// by pane, at most [`MAX_PENDING_INPUT_HELD`] (the oldest word goes
     /// first), kept apart from the pane's account, which a close drops. A
@@ -4656,6 +4676,71 @@ impl AppState {
             return;
         }
         self.trust_requests = Some(list);
+    }
+
+    /// Issue #2347: the daemon's guard on a Claude Code prompt that another
+    /// `UserPromptSubmit` hook blocked after the deck's own hook reported it.
+    /// Called for every event the daemon admits from a producer, before it
+    /// is applied; `false` means drop the event unapplied.
+    ///
+    /// A `Thinking` carrying [`crate::event::PROMPT_TURN_METADATA_KEY`],
+    /// reported by the pane's own agent while its card was not busy, opens
+    /// that prompt's turn. Any other event from the pane, save the daemon's
+    /// own frames and the wrapper's output readings, closes it. The witness's
+    /// `Idle` carrying [`crate::event::PROMPT_NOT_TAKEN_METADATA_KEY`] is
+    /// admitted only while the turn its nonce opened is still open, so it
+    /// ends no turn the prompt did not start: one already under way when the
+    /// prompt arrived, or one something else has reported on since.
+    pub fn admit_prompt_not_taken(&mut self, event: &AgentEvent, unproven: bool) -> bool {
+        let Some(pane_id) = event.pane_id.as_deref() else {
+            return event.prompt_not_taken().is_none();
+        };
+        if let Some(nonce) = event.prompt_not_taken() {
+            // A report for another prompt, a late one included, leaves the
+            // open turn alone: that prompt's own report may still come.
+            let admitted = !unproven
+                && event.event_type == EventType::Idle
+                && !event.is_from_subagent()
+                && self
+                    .prompt_turns
+                    .get(pane_id)
+                    .is_some_and(|open| open.nonce == nonce && open.session_id == event.session_id);
+            if admitted {
+                self.prompt_turns.remove(pane_id);
+            }
+            return admitted;
+        }
+        if event.is_daemon_synthetic() || event.is_wrapper_output_classified() {
+            return true;
+        }
+        let opens = !unproven
+            && event.event_type == EventType::Thinking
+            && !event.is_from_subagent()
+            && self.pane_status(pane_id).is_some_and(|status| {
+                !matches!(
+                    status,
+                    SessionStatus::Thinking | SessionStatus::Working | SessionStatus::Compacting
+                )
+            });
+        match event
+            .metadata
+            .get(crate::event::PROMPT_TURN_METADATA_KEY)
+            .filter(|_| opens)
+        {
+            Some(nonce) => {
+                self.prompt_turns.insert(
+                    pane_id.to_string(),
+                    PromptTurnOpen {
+                        nonce: nonce.clone(),
+                        session_id: event.session_id.clone(),
+                    },
+                );
+            }
+            None => {
+                self.prompt_turns.remove(pane_id);
+            }
+        }
+        true
     }
 
     /// The status of the session currently bound to `pane_id`, read the way
@@ -8831,6 +8916,7 @@ impl AppState {
         self.waiting_superseded_sessions.remove(pane_id);
         self.pane_event_epochs.remove(pane_id);
         self.pane_doorbell_ready.remove(pane_id);
+        self.prompt_turns.remove(pane_id);
     }
 
     /// Issue #697: apply the daemon's announcement that it evicted the unproven
@@ -9519,11 +9605,13 @@ impl AppState {
         // reused pane id surfaces with its own.
         self.pane_surfaced_agent_seq.remove(pane_id);
         self.pane_inboxes.remove(pane_id);
+        self.pane_project_config.remove(pane_id);
         // PRD #1666: and its doorbell epoch. A successor restarting the count
         // at 0 cannot satisfy an admission captured for the previous agent:
         // the doorbell's writer re-checks the agent that owns the pane.
         self.pane_event_epochs.remove(pane_id);
         self.pane_doorbell_ready.remove(pane_id);
+        self.prompt_turns.remove(pane_id);
         if !self
             .sessions
             .values()
@@ -10212,6 +10300,37 @@ impl AppState {
         // PRD #1666 §2.8: the reply's inbox counts are each card's new
         // starting point, now that its live fields are.
         self.take_inbox_snapshot(records);
+        self.take_project_config_flags(records);
+    }
+
+    /// PRD #2119: the daemon's word, from a listing of its agents, on which
+    /// agents' projects already hold a `.dot-agent-deck.toml`. Each listed pane
+    /// takes its record's value; a record that does not say (no cwd, an older
+    /// daemon) leaves the pane unknown.
+    pub fn take_project_config_flags(&mut self, records: &[crate::agent_pty::AgentRecord]) {
+        for record in records {
+            let Some(pane_id) = record.pane_id_env.as_deref() else {
+                continue;
+            };
+            match record.project_config_exists {
+                Some(exists) => {
+                    self.pane_project_config
+                        .insert(pane_id.to_string(), (record.id.clone(), exists));
+                }
+                None => {
+                    self.pane_project_config.remove(pane_id);
+                }
+            }
+        }
+    }
+
+    /// PRD #2119: whether the daemon last reported that `session`'s project
+    /// already holds a `.dot-agent-deck.toml`. `None` when it has not said for
+    /// this card's agent.
+    pub fn project_config_exists(&self, session: &SessionState) -> Option<bool> {
+        let pane_id = session.pane_id.as_deref()?;
+        let (agent_id, exists) = self.pane_project_config.get(pane_id)?;
+        (session.agent_id.as_deref() == Some(agent_id.as_str())).then_some(*exists)
     }
 
     /// PRD #1666 §2.8: the daemon's agents, read in order with the event
@@ -11392,8 +11511,10 @@ impl AppState {
         self.managed_pane_ids.remove(pane_id);
         self.pane_surfaced_agent_seq.remove(pane_id);
         self.pane_inboxes.remove(pane_id);
+        self.pane_project_config.remove(pane_id);
         self.pane_event_epochs.remove(pane_id);
         self.pane_doorbell_ready.remove(pane_id);
+        self.prompt_turns.remove(pane_id);
         self.pane_role_map.remove(pane_id);
         self.pane_cwd_map.remove(pane_id);
         self.orchestrator_pane_ids.remove(pane_id);
@@ -26210,5 +26331,139 @@ mod tests {
                 .map(|e| &e.tool_detail),
             "the most recently active card keeps its newest report whole"
         );
+    }
+
+    /// Issue #2347: a Claude Code event from pane `p` for the prompt-turn
+    /// guard, with `metadata` added.
+    fn prompt_turn_event(event_type: EventType, metadata: &[(&str, &str)]) -> AgentEvent {
+        AgentEvent {
+            session_id: "s".into(),
+            agent_type: AgentType::ClaudeCode,
+            event_type,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: metadata
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+            pane_id: Some("p".into()),
+            agent_id: Some("a".into()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            background: None,
+            background_revision: None,
+        }
+    }
+
+    /// Issue #2347: what the daemon does with one event: the guard first,
+    /// then the apply. Answers whether it was applied.
+    fn ingest_prompt_turn(state: &mut AppState, event: AgentEvent, unproven: bool) -> bool {
+        if !state.admit_prompt_not_taken(&event, unproven) {
+            return false;
+        }
+        state.apply_event(event);
+        true
+    }
+
+    /// Scenario: An idle Claude Code card gets a prompt's `Thinking` carrying a nonce, and then the witness's `Idle` naming that nonce: the Idle is applied and the card reads Idle, and a second copy of it is refused. A prompt that arrives while the card is already busy, one followed by another report, a report naming another nonce or session, and an unproven one are each refused, and the card keeps reading busy; a late report for an earlier prompt does not stop the newer prompt's own report from ending its turn.
+    #[test]
+    fn a_dropped_prompt_ends_only_the_turn_it_started() {
+        use crate::event::{
+            PROMPT_NOT_TAKEN_METADATA_KEY as GONE, PROMPT_TURN_METADATA_KEY as TURN,
+        };
+        let idle_card = || {
+            let mut state = AppState::default();
+            for event_type in [EventType::SessionStart, EventType::Idle] {
+                assert!(ingest_prompt_turn(
+                    &mut state,
+                    prompt_turn_event(event_type, &[]),
+                    false
+                ));
+            }
+            assert_eq!(state.pane_status("p"), Some(SessionStatus::Idle));
+            state
+        };
+        let thinking = |nonce: &str| prompt_turn_event(EventType::Thinking, &[(TURN, nonce)]);
+        let gone = |nonce: &str| prompt_turn_event(EventType::Idle, &[(GONE, nonce)]);
+
+        let mut state = idle_card();
+        assert!(ingest_prompt_turn(&mut state, thinking("n1"), false));
+        assert_eq!(state.pane_status("p"), Some(SessionStatus::Thinking));
+        assert!(ingest_prompt_turn(&mut state, gone("n1"), false));
+        assert_eq!(state.pane_status("p"), Some(SessionStatus::Idle));
+        assert!(
+            !ingest_prompt_turn(&mut state, gone("n1"), false),
+            "a turn ends once"
+        );
+
+        // A prompt that arrived mid-turn started nothing.
+        let mut state = idle_card();
+        assert!(ingest_prompt_turn(
+            &mut state,
+            prompt_turn_event(EventType::Thinking, &[]),
+            false
+        ));
+        assert!(ingest_prompt_turn(&mut state, thinking("n2"), false));
+        assert!(!ingest_prompt_turn(&mut state, gone("n2"), false));
+        assert_eq!(state.pane_status("p"), Some(SessionStatus::Thinking));
+
+        // Anything the agent reported since closes the prompt's turn.
+        let mut state = idle_card();
+        assert!(ingest_prompt_turn(&mut state, thinking("n3"), false));
+        assert!(ingest_prompt_turn(
+            &mut state,
+            prompt_turn_event(EventType::ToolStart, &[]),
+            false
+        ));
+        assert!(!ingest_prompt_turn(&mut state, gone("n3"), false));
+        assert_eq!(state.pane_status("p"), Some(SessionStatus::Working));
+
+        // The daemon's own frames leave it open.
+        let mut state = idle_card();
+        assert!(ingest_prompt_turn(&mut state, thinking("n4"), false));
+        assert!(state.admit_prompt_not_taken(&prompt_turn_event(EventType::ShellIdle, &[]), false));
+        assert!(ingest_prompt_turn(&mut state, gone("n4"), false));
+        assert_eq!(state.pane_status("p"), Some(SessionStatus::Idle));
+
+        // Another nonce, another session, a subagent's or an unproven report
+        // names no turn this prompt started.
+        let mut other_session = gone("n5");
+        other_session.session_id = "other".into();
+        let mut subagent = gone("n5");
+        subagent
+            .metadata
+            .insert(crate::event::SUBAGENT_ID_METADATA_KEY.into(), "x".into());
+        for (report, unproven) in [
+            (gone("n6"), false),
+            (other_session, false),
+            (subagent, false),
+            (gone("n5"), true),
+        ] {
+            let mut state = idle_card();
+            assert!(ingest_prompt_turn(&mut state, thinking("n5"), false));
+            assert!(
+                !ingest_prompt_turn(&mut state, report.clone(), unproven),
+                "{report:?}"
+            );
+            assert_eq!(state.pane_status("p"), Some(SessionStatus::Thinking));
+        }
+
+        // An unproven prompt opens nothing.
+        let mut state = idle_card();
+        assert!(ingest_prompt_turn(&mut state, thinking("n7"), true));
+        assert!(!ingest_prompt_turn(&mut state, gone("n7"), false));
+
+        // A late report for an earlier prompt leaves the newer prompt's turn
+        // open for that prompt's own report (PR #2405 review).
+        let mut state = idle_card();
+        assert!(ingest_prompt_turn(&mut state, thinking("n8"), false));
+        assert!(!ingest_prompt_turn(&mut state, gone("late"), false));
+        assert_eq!(state.pane_status("p"), Some(SessionStatus::Thinking));
+        assert!(ingest_prompt_turn(&mut state, gone("n8"), false));
+        assert_eq!(state.pane_status("p"), Some(SessionStatus::Idle));
     }
 }

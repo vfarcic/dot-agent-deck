@@ -253,6 +253,7 @@ mod tests {
         AgentRecord {
             input_held: None,
             input_discarded: None,
+            project_config_exists: None,
             id: id.to_string(),
             pane_id_env: Some(pane.to_string()),
             display_name: None,
