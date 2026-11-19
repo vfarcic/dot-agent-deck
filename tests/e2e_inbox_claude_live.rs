@@ -261,12 +261,16 @@ impl Claude {
         } else {
             "attachment:hook_additional_context"
         };
+        // The acknowledgement can precede Claude's write when the witness
+        // fell back, so wait for the entry rather than read once.
+        let took = |w: &[(String, dot_agent_deck::event::InboxAttemptRef)]| {
+            w.iter().any(|(k, at)| k == kind && at.a == 1 && at.e == 1)
+        };
+        common::wait_until(Duration::from_secs(15), || took(&self.witnessed(id)));
         let witnessed = self.witnessed(id);
         eprintln!("transcript entries witnessed for {id}: {witnessed:?}");
         assert!(
-            witnessed
-                .iter()
-                .any(|(k, at)| k == kind && at.a == 1 && at.e == 1),
+            took(&witnessed),
             "the transcript must show Claude took delivery 1.1 of {id} as a {kind} entry, \
              got {witnessed:?}; transcript lines naming it:\n{}\n{}",
             self.transcript_lines(id).join("\n"),
@@ -675,7 +679,7 @@ fn claude_053_live_a_blocked_doorbell_prompt_is_not_acknowledged_and_is_handed_o
     assert_eq!(message()["deliveries"], 2, "{}", claude.evidence());
 }
 
-/// Scenario: Run interactive Haiku in a deck started with the Claude Code doorbell turned off (`DOT_AGENT_DECK_DOORBELL_CLAUDE=0`), kill its scratch pane's armed waiter, and post a directive task naming a sentinel. The daemon's release line must name the installed release as latched and its `doorbell off` line must name turned_off; for 20 seconds after that no doorbell rings or shows on the pane's screen or in its last prompt, the task stays queued, and the card shows the cannot_type words. The test then types a short prompt into the pane and presses Enter, which starts a turn: Haiku is handed the task (on Claude Code 2.1.328, by the waiter armed when that turn ends; an ordinary prompt's hook hands nothing over), writes the sentinel, and the task is acknowledged.
+/// Scenario: Run interactive Haiku in a deck started with the Claude Code doorbell turned off (`DOT_AGENT_DECK_DOORBELL_CLAUDE=0`), kill its scratch pane's armed waiter, and post a directive task naming a sentinel. The daemon's release line must name the installed release as latched and its `doorbell off` line must name turned_off; for 20 seconds after that no doorbell rings or shows on the pane's screen or in its last prompt, the task stays queued, and the card shows the cannot_type words. The test then types a short prompt into the pane and presses Enter, which starts a turn: Haiku is handed the task (an ordinary prompt's hook hands nothing over, so by another route, such as the waiter armed when that turn ends), writes the sentinel, and the task is acknowledged.
 #[spec("inbox/claude/050")]
 #[test]
 #[cfg(target_os = "linux")]
