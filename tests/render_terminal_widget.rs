@@ -502,7 +502,7 @@ fn widget_006_a_highlight_over_a_row_that_turned_wide_shows_what_was_copied_on_a
     use dot_agent_deck::ui::PaneSelectionSeam;
 
     for host in HOSTS {
-        let mut seam = PaneSelectionSeam::tiled(20, 6, &[("a", b"xZAB")], "a");
+        let mut seam = PaneSelectionSeam::stacked(20, 6, &[("a", b"xZAB")], "a");
         let mut frames = vec![seam.render()];
         let rect = seam.pane_rect("a");
         let (x, y) = (rect.x + 1, rect.y + 1);

@@ -91,7 +91,7 @@ The screenshot lands at `/tmp/dad-screenshot.txt` (override with
 
 ...
 
-[Back to Pane Ctrl+D] [New Pane Ctrl+N] [Close Ctrl+W] [Toggle Layout Ctrl+T] [Help ?] [Quit Ctrl+C] [Filter /]
+[Back to Pane Ctrl+D] [New Pane Ctrl+N] [Close Ctrl+W] [Help ?] [Quit Ctrl+C] [Filter /]
 [Rename r] [Generate g] [Scheduled Tasks s]
 ```
 
