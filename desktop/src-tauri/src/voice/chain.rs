@@ -223,6 +223,9 @@ pub enum Plan<'t> {
     Refused(ChainRefusal<'t>),
     /// Steps to check one by one, each with its row.
     Steps(Vec<(&'t IntentStep, &'t CommandRow)>),
+    /// The same single-valued choice named for every step: not steps but one
+    /// choice between their values, offered when each resolves on screen.
+    OneOf(Vec<(&'t IntentStep, &'t CommandRow)>),
 }
 
 /// Why a chain was refused before any step was checked.
@@ -235,8 +238,8 @@ pub enum ChainRefusal<'t> {
     Span(SpanError),
     /// A step names an action the table does not have.
     Unknown,
-    /// The same single-valued choice twice ("select docs and dot-agent-deck
-    /// directories"): one step with two values, not two steps.
+    /// The same single-valued choice twice beside a different step: two
+    /// values for one choice inside a chain, which no step order can run.
     SameChoiceTwice(&'t CommandRow),
     /// The row may not be a step at all.
     Never(&'t CommandRow),
@@ -326,6 +329,14 @@ pub fn plan<'t>(
             return Plan::Refused(ChainRefusal::Unknown);
         };
         rows.push((step, row));
+    }
+    // The same single-valued choice named for every step ("select docs and
+    // dot-agent-deck directories"): one choice between the values, offered
+    // as a numbered choice when each value resolves on screen.
+    if SINGLE_VALUED.contains(&rows[0].1.id.as_str())
+        && rows.iter().all(|(_, row)| row.id == rows[0].1.id)
+    {
+        return Plan::OneOf(rows);
     }
     if let Some(&(_, row)) = rows.iter().enumerate().find_map(|(at, (_, row))| {
         (SINGLE_VALUED.contains(&row.id.as_str())
@@ -554,21 +565,34 @@ mod tests {
     }
 
     /// Scenario: "select docs and dot-agent-deck directories" answered as the
-    /// same directory step twice is refused as two values for one choice.
+    /// same directory step twice is one choice between the two values, not
+    /// two steps; the same choice twice beside another step is refused.
     #[test]
     fn voice_chain_the_same_choice_twice_is_not_two_steps() {
         let steps = [
             step("open_dir", "select docs"),
             step("open_dir", "dot-agent-deck directories"),
         ];
-        let plan = plan(
+        let planned = plan(
             table(),
             "select docs and dot-agent-deck directories",
             "open_dir",
             &steps,
         );
+        assert!(matches!(&planned, Plan::OneOf(rows) if rows.len() == 2));
+        let steps = [
+            step("choose_mode", "make it a dispatcher"),
+            step("choose_mode", "a schedule"),
+            step("name_new_agent", "name it nightly"),
+        ];
+        let planned = plan(
+            table(),
+            "make it a dispatcher and a schedule and name it nightly",
+            "choose_mode",
+            &steps,
+        );
         assert!(
-            matches!(plan, Plan::Refused(ChainRefusal::SameChoiceTwice(row)) if row.id == "open_dir")
+            matches!(planned, Plan::Refused(ChainRefusal::SameChoiceTwice(row)) if row.id == "choose_mode")
         );
     }
 

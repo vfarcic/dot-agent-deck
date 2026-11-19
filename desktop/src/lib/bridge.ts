@@ -1223,7 +1223,11 @@ function withDeckIdentityKeys(result: VoiceResultDto): VoiceResultDto {
   }
   /* PRD #1184 — and so does a chain's switch step. */
   if (result.outcome.kind === "chain") {
-    return { ...result, outcome: { ...result.outcome, steps: result.outcome.steps.map((step) => ({ ...step, params: step.params.map(keyed) })) } };
+    return { ...result, outcome: { ...result.outcome, steps: result.outcome.steps.map((step) => ({
+      ...step,
+      params: step.params.map(keyed),
+      ...(step.choice ? { choice: { ...step.choice, candidates: step.choice.candidates?.map(keyed) } } : {}),
+    })) } };
   }
   if (result.outcome.kind !== "dispatch") return result;
   return { ...result, outcome: { ...result.outcome, params: result.outcome.params.map(keyed) } };
@@ -1288,6 +1292,9 @@ export interface VoiceChainStepDto {
   params: VoiceResolvedParamDto[];
   sentence: string;
   screen: VoiceScreen;
+  /** A step that matched several things: the numbered choice the chain
+      pauses on when this step's turn comes. At most one step carries one. */
+  choice?: Extract<VoiceOutcomeDto, { kind: "param_ambiguous" }>;
 }
 
 /**

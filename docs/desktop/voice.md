@@ -77,6 +77,8 @@ You can ask for up to three things in one sentence, one after another, joined by
 
 **If a part cannot run when its turn comes, the chain stops there.** For example, if the screen is not the one that part was checked on, it does not run, and neither does anything after it. The row says which part stopped and which ran before it, so you know what to undo by hand: *Step 2 (“the tester”) was refused: you moved to another screen. Step 1 (“open the overview”) ran.*
 
+**A part that matches several things pauses the sentence on a numbered choice.** "open the overview and then the tester", with two agents called tester, opens the dashboard and then asks *Which agent?* as described in [When a command matches several things](#when-a-command-matches-several-things). Choosing one opens it and goes on with the rest of the sentence, each part checked again first. Cancelling, letting the choice run out or saying something that is not an answer drops the rest, and the row says what ran: *Choice closed. Step 1 (“open the overview”) ran; the rest of that sentence was not done.* A sentence pauses like this at most once; a second part that matches several things is refused before anything runs.
+
 **Undo reverses the whole sentence or is not offered.** When every part moved the view, such as opening the overview and then an agent, one **Undo** puts back the screen you started from. When any part did something else, such as opening Settings, choosing in the New agent form or switching daemons, no Undo is offered.
 
 What can go where:
@@ -85,7 +87,7 @@ What can go where:
 - **Only last**: anything else that can be said this way, such as closing what is on top, opening Settings, opening New agent, opening a directory, or stopping an agent or closing an orchestration (which still opens the confirmation you answer by hand). Moving the view is also last-only while the New agent dialog is open.
 - **Never in a sentence with other commands**: starting a new agent, sending the agent's prompt, discarding the New agent form, typing into an agent, turning typing mode on or off, and the other requests that must be said on their own (see [How voice understands you](#how-voice-understands-you)). A sentence that starts by asking to type is one request to type, not several commands: in "type run the tests and then commit", the "and then commit" is part of what is typed.
 
-**Words that weigh one thing against another make it one command.** A sentence with "or", "not", "instead", "rather than", "except", "but" or "without" in it is never split into parts: "open settings, not the overview" is refused with *say one command at a time*. Naming two values where only one can be chosen, such as "select docs and dot-agent-deck directories" or "make it a dispatcher and a reviewer", is refused too: choose one.
+**Words that weigh one thing against another make it one command.** A sentence with "or", "not", "instead", "rather than", "except", "but" or "without" in it is never split into parts: "open settings, not the overview" is refused with *say one command at a time*. Naming two values where only one can be chosen, such as "select docs and dot-agent-deck directories" or "make it a dispatcher and a reviewer", is one choice rather than two commands: the app asks which one, as a numbered choice, when both are on screen, and refuses the sentence when one of them is not.
 
 ## Naming an agent
 

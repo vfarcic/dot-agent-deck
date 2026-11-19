@@ -627,6 +627,13 @@ pub struct ChainStep {
     /// first step, and the one the earlier steps lead to for the others. The
     /// panel refuses the step when the screen is not this one when it runs.
     pub screen: Screen,
+    /// A step that matched several things: the numbered choice the chain
+    /// pauses on when this step's turn comes (a
+    /// [`VoiceOutcome::ParamAmbiguous`] with its candidates). `params` are
+    /// then what the chosen one is dispatched beside, and `sentence` is the
+    /// question. At most one step of a chain carries one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub choice: Option<Box<VoiceOutcome>>,
 }
 
 impl VoiceOutcome {
@@ -1317,6 +1324,22 @@ async fn after_local_intercepts(
             ChainPlan::Refused(refusal) => {
                 return finish(VoiceOutcome::chain_refused(transcript, &refusal.why()));
             }
+            ChainPlan::OneOf(rows) => {
+                drop(ballot);
+                let context = ChainContext {
+                    resolver,
+                    table,
+                    screen,
+                    agents,
+                    decks,
+                    directories,
+                    new_agent,
+                    withheld,
+                    show_deck,
+                };
+                let outcome = one_of_outcome(&context, transcript, &rows).await;
+                return result(outcome, Some(millis(started.elapsed())));
+            }
             ChainPlan::Steps(rows) => {
                 drop(ballot);
                 let context = ChainContext {
@@ -1459,6 +1482,158 @@ fn situation_of(sentence: &str) -> &str {
     after.strip_suffix('.').unwrap_or(after)
 }
 
+/// PRD #1184: one step of a chain, settled on its own words at `screen` —
+/// its own two-vote meaning check and every check a single pick goes
+/// through, with the step's words as the transcript.
+async fn settle_step(
+    context: &ChainContext<'_>,
+    screen: Screen,
+    step: &IntentStep,
+    row: &CommandRow,
+) -> VoiceOutcome {
+    let table = context.table;
+    let said = Transcript::new(step.said.clone());
+    let classification = MeaningRequest::new(&said, table, &every_action(table)).at(Place::of(
+        screen,
+        context.directories,
+        context.new_agent,
+    ));
+    let mut ballot = Ballot::new([
+        context.resolver.judge_meaning(classification.clone()),
+        context.resolver.judge_meaning(classification),
+    ]);
+    let answer = step.answer();
+    let picked = Picked {
+        table,
+        screen,
+        agents: context.agents,
+        decks: context.decks,
+        directories: context.directories,
+        new_agent: context.new_agent,
+        transcript: &said,
+        withheld: context.withheld,
+        show_deck: context.show_deck,
+        answer: &answer,
+        row,
+    };
+    settle(&picked, &mut ballot).await
+}
+
+/// The refusal of a chain at step `number`, quoting that step's words.
+fn step_refused(transcript: &Transcript, number: usize, said: &str, why: &str) -> VoiceOutcome {
+    VoiceOutcome::chain_refused(
+        transcript.clone(),
+        &format!("step {number} (\u{201c}{said}\u{201d}) could not run: {why}; nothing was done"),
+    )
+}
+
+/// PRD #1184: the same single-valued choice named for every step ("select
+/// docs and dot-agent-deck directories", "make it a dispatcher and a
+/// reviewer") — one choice between the values, offered as PRD #1261's
+/// numbered choice when every value resolves on screen, and refused when one
+/// does not. Taking the first was rejected as a guess, and refusing outright
+/// as unhelpful: the user named real things, and one question settles it.
+async fn one_of_outcome(
+    context: &ChainContext<'_>,
+    transcript: Transcript,
+    rows: &[(&IntentStep, &CommandRow)],
+) -> VoiceOutcome {
+    let mut picks = Vec::with_capacity(rows.len());
+    for (at, &(step, row)) in rows.iter().enumerate() {
+        let outcome = settle_step(context, context.screen, step, row).await;
+        let VoiceOutcome::Dispatch {
+            action,
+            invoke,
+            params,
+            sentence,
+            ..
+        } = outcome
+        else {
+            return step_refused(
+                &transcript,
+                at + 1,
+                &step.said,
+                situation_of(outcome.sentence()),
+            );
+        };
+        picks.push((action, invoke, params, sentence));
+    }
+    let refuse = || {
+        VoiceOutcome::chain_refused(
+            transcript.clone(),
+            &super::chain::ChainRefusal::SameChoiceTwice(rows[0].1).why(),
+        )
+    };
+    let (action, invoke) = (picks[0].0.clone(), picks[0].1.clone());
+    let Some(row) = context.table.row(&action) else {
+        return refuse();
+    };
+    let Some(spec) = row.params.last() else {
+        return refuse();
+    };
+    if picks.iter().any(|pick| pick.0 != action) {
+        return refuse();
+    }
+    let mut candidates: Vec<ResolvedParam> = Vec::new();
+    for pick in &picks {
+        let Some(value) = pick.2.iter().find(|param| param.name == spec.name) else {
+            return refuse();
+        };
+        if !candidates.iter().any(|seen| seen.value == value.value) {
+            candidates.push(value.clone());
+        }
+    }
+    // The same value named twice is that one value.
+    if candidates.len() == 1 {
+        let (action, invoke, params, sentence) = picks.swap_remove(0);
+        return VoiceOutcome::Dispatch {
+            transcript,
+            action,
+            invoke,
+            params,
+            sentence,
+            then_submit: false,
+        };
+    }
+    let others: Vec<ResolvedParam> = picks[0]
+        .2
+        .iter()
+        .filter(|param| param.name != spec.name)
+        .cloned()
+        .collect();
+    let matches: Vec<String> = candidates.iter().map(|value| value.label.clone()).collect();
+    let spoken = rows
+        .iter()
+        .map(|(step, _)| step.said.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    VoiceOutcome::ParamAmbiguous {
+        sentence: heard(
+            &transcript,
+            &format!(
+                "only one can be chosen there, so which one: {}",
+                listed(&matches)
+            ),
+        ),
+        transcript,
+        action,
+        invoke,
+        param: spec.name.clone(),
+        spoken,
+        matches,
+        candidates,
+        params: Vec::new(),
+        reports: Vec::new(),
+    }
+    .offered_beside(row, &others, true)
+    .named(&ChoiceLive {
+        agents: context.agents,
+        decks: context.decks,
+        directories: context.directories,
+        new_agent: context.new_agent,
+    })
+}
+
 /// PRD #1184: check a chain's steps one by one, each against the screen the
 /// steps before it would leave, and answer the whole utterance.
 ///
@@ -1479,58 +1654,48 @@ async fn chain_outcome(
     let mut screen = context.screen;
     let (directories, new_agent) = (context.directories, context.new_agent);
     let mut deck_switched = false;
+    let mut paused = false;
     let mut steps = Vec::with_capacity(rows.len());
     let last = rows.len() - 1;
     for (at, &(step, row)) in rows.iter().enumerate() {
         let number = at + 1;
-        let said = Transcript::new(step.said.clone());
-        let refuse = |why: String| {
-            VoiceOutcome::chain_refused(
-                transcript.clone(),
-                &format!(
-                    "step {number} (\u{201c}{}\u{201d}) could not run: {why}; nothing was done",
-                    said.text()
-                ),
-            )
-        };
-        let classification = MeaningRequest::new(&said, table, &every_action(table)).at(Place::of(
-            screen,
-            directories,
-            new_agent,
-        ));
-        let mut ballot = Ballot::new([
-            context.resolver.judge_meaning(classification.clone()),
-            context.resolver.judge_meaning(classification),
-        ]);
-        let answer = step.answer();
-        let picked = Picked {
-            table,
-            screen,
-            agents: context.agents,
-            decks: context.decks,
-            directories,
-            new_agent,
-            transcript: &said,
-            withheld: context.withheld,
-            show_deck: context.show_deck,
-            answer: &answer,
-            row,
-        };
-        let outcome = settle(&picked, &mut ballot).await;
+        let refuse = |why: String| step_refused(&transcript, number, &step.said, &why);
+        let outcome = settle_step(context, screen, step, row).await;
         let judged_on = screen;
-        let VoiceOutcome::Dispatch {
-            action,
-            invoke,
-            params,
-            sentence,
-            ..
-        } = &outcome
-        else {
-            return refuse(situation_of(outcome.sentence()).to_string());
+        // A step that matched several things pauses the chain on the numbered
+        // choice (PRD #1261) — once per chain, so a chain cannot turn into a
+        // dialogue. The panel offers it when the step's turn comes, and the
+        // steps after it run once it is answered.
+        let (action, invoke, params, sentence, choice, offered) = match &outcome {
+            VoiceOutcome::Dispatch {
+                action,
+                invoke,
+                params,
+                sentence,
+                ..
+            } => (action, invoke, params, sentence.clone(), None, &[][..]),
+            VoiceOutcome::ParamAmbiguous {
+                action,
+                invoke,
+                params,
+                candidates,
+                ..
+            } if !paused && !candidates.is_empty() => {
+                paused = true;
+                (
+                    action,
+                    invoke,
+                    params,
+                    situation_of(outcome.sentence()).to_string(),
+                    Some(Box::new(outcome.clone())),
+                    &candidates[..],
+                )
+            }
+            _ => return refuse(situation_of(outcome.sentence()).to_string()),
         };
         let dispatched = table.row(action).unwrap_or(row);
         if deck_switched
-            && params.iter().any(|param| {
+            && params.iter().chain(offered).any(|param| {
                 matches!(
                     param.kind,
                     ParamKind::AgentRef | ParamKind::OrchestrationRef
@@ -1578,8 +1743,9 @@ async fn chain_outcome(
             action: action.clone(),
             invoke: invoke.clone(),
             params: params.clone(),
-            sentence: sentence.clone(),
+            sentence,
             screen: judged_on,
+            choice,
         });
     }
     let sentence = chain_sentence(&steps);

@@ -369,3 +369,133 @@ fn voice_chain_the_rules_live_in_the_answer_schema_only() {
             .contains("`steps`")
     );
 }
+
+/// Scenario: in the New agent dialog's directory listing, "select docs and
+/// dot-agent-deck directories" is answered as the same directory step twice.
+/// It is offered as one numbered choice between the two directories, not
+/// run as two steps.
+#[tokio::test]
+async fn voice_chain_two_values_for_one_choice_are_offered_as_a_choice() {
+    let said = "select docs and dot-agent-deck directories";
+    let listing: super::VoiceDirectories = serde_json::from_value(serde_json::json!({
+        "deckId": "deck-local", "path": "/home/dev/code", "hasParent": true,
+        "entries": [
+            { "name": "docs", "path": "/home/dev/code/docs" },
+            { "name": "dot-agent-deck", "path": "/home/dev/code/dot-agent-deck" },
+            { "name": "infra", "path": "/home/dev/code/infra" },
+        ],
+    }))
+    .expect("listing");
+    let resolver = StubResolver::new()
+        .answering(
+            said,
+            chain(vec![
+                step("open_dir", "select docs", &[("dir", "docs")]),
+                step(
+                    "open_dir",
+                    "dot-agent-deck directories",
+                    &[("dir", "dot-agent-deck")],
+                ),
+            ]),
+        )
+        .judging("select docs", "open_dir", true)
+        .judging("dot-agent-deck directories", "open_dir", true);
+    let outcome = handle_utterance(
+        &resolver,
+        table(),
+        Screen::Overview,
+        &fleet(),
+        &decks(),
+        Some(&listing),
+        None,
+        Transcript::new(said),
+    )
+    .await
+    .outcome;
+    let VoiceOutcome::ParamAmbiguous {
+        action,
+        candidates,
+        sentence,
+        ..
+    } = &outcome
+    else {
+        panic!("expected a choice, got {outcome:?}");
+    };
+    assert_eq!(action, "open_dir");
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|value| value.label.as_str())
+            .collect::<Vec<_>>(),
+        ["docs", "dot-agent-deck"]
+    );
+    assert!(sentence.contains("which one"), "{sentence}");
+}
+
+/// Scenario: "open the overview and then the tester" with two agents called
+/// tester. The second step matched both, so the chain is answered with that
+/// step carrying the numbered choice it pauses on; the first step is
+/// unchanged.
+#[tokio::test]
+async fn voice_chain_an_ambiguous_step_pauses_the_chain_on_a_choice() {
+    let said = "open the overview and then the tester";
+    let resolver = StubResolver::new()
+        .answering(
+            said,
+            chain(vec![
+                step("open_overview", "open the overview", &[]),
+                step("open_agent", "the tester", &[("agent", "tester")]),
+            ]),
+        )
+        .judging("open the overview", "open_overview", true)
+        .judging("the tester", "open_agent", true);
+    let fleet = vec![role_agent("1", "tester"), role_agent("2", "tester")];
+    let outcome = handle_utterance(
+        &resolver,
+        table(),
+        Screen::Deck,
+        &fleet,
+        &decks(),
+        None,
+        None,
+        Transcript::new(said),
+    )
+    .await
+    .outcome;
+    let VoiceOutcome::Chain { steps, .. } = &outcome else {
+        panic!("expected a chain, got {outcome:?}");
+    };
+    assert!(steps[0].choice.is_none());
+    let Some(choice) = steps[1].choice.as_deref() else {
+        panic!("expected step 2 to carry a choice: {steps:?}");
+    };
+    assert!(
+        matches!(choice, VoiceOutcome::ParamAmbiguous { candidates, .. } if candidates.len() == 2),
+        "{choice:?}"
+    );
+}
+
+/// Scenario: "show me the overview, then stop the tester" on the Daemons
+/// screen. The stop may be the last step, and it is answered as the same
+/// confirmation opener a stop said on its own is, so nothing stops until the
+/// user confirms by hand.
+#[tokio::test]
+async fn voice_chain_a_stop_as_the_last_step_ends_at_its_confirmation() {
+    let said = "show me the overview, then stop the tester";
+    let resolver = StubResolver::new()
+        .answering(
+            said,
+            chain(vec![
+                step("open_overview", "show me the overview", &[]),
+                step("stop_agent", "stop the tester", &[("agent", "tester")]),
+            ]),
+        )
+        .judging("show me the overview", "open_overview", true)
+        .judging("stop the tester", "stop_agent", true);
+    let outcome = run(&resolver, Screen::Deck, said).await;
+    let VoiceOutcome::Chain { steps, .. } = &outcome else {
+        panic!("expected a chain, got {outcome:?}");
+    };
+    assert_eq!(steps[1].invoke, "confirmStopAgent");
+    assert_eq!(steps[1].screen, Screen::Overview);
+}

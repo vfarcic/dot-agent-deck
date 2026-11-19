@@ -165,6 +165,19 @@ export const VOICE_CHAIN_SETTLE_MS = 1500;
 const VOICE_CHAIN_POLL_MS = 16;
 
 /**
+ * PRD #1184 — what the voice row says when a chain's numbered choice ends
+ * without an answer (cancelled, expired, or a sentence that was not one):
+ * the reason, then which steps ran before it, and that the rest was dropped.
+ */
+export function chainDropped(why: string, ran: readonly string[]): string {
+  const said = why.trim();
+  if (ran.length === 0) return `${said} Nothing from that sentence ran.`;
+  const listed = ran.map((words, at) => `${at + 1} (\u201c${words}\u201d)`);
+  const steps = listed.length === 1 ? `Step ${listed[0]} ran` : `Steps ${listed.slice(0, -1).join(", ")} and ${listed[listed.length - 1]} ran`;
+  return `${said} ${steps}; the rest of that sentence was not done.`;
+}
+
+/**
  * PRD #1184 — what the voice row says when a chain stops at a step: which
  * step, why, and which steps ran before it, so the user knows what to undo by
  * hand. Never a silent partial chain.
@@ -1392,8 +1405,38 @@ type VoicePanelState =
  * which {@link contextLost} holds the chosen entry to, exactly as it holds a
  * resolved dispatch.
  */
+/**
+ * PRD #1184 — how far a chain got: the step it is at, and what the steps
+ * before it did. Carried by a chain paused on a step's numbered choice, so
+ * answering it goes on from there.
+ */
+type VoiceChainProgress = {
+  /** The step to run next (or, while paused, the step whose choice is open). */
+  index: number;
+  /** The words of each step that ran, for the report if the chain stops. */
+  ran: string[];
+  /** Each step's own report, for the report once every step has run. */
+  reports: string[];
+  /** Each step's Undo, run last to first. */
+  undos: (() => void)[];
+  /** Whether every step so far offered an Undo; the chain's Undo needs all. */
+  reversible: boolean;
+};
+
+/** PRD #1184 — a chain paused on a numbered choice. */
+type VoiceChainPause = VoiceChainProgress & {
+  chain: Extract<VoiceOutcomeDto, { kind: "chain" }>;
+  declared: VoiceContext;
+  backend: string;
+};
+
+type RunChain = (chain: Extract<VoiceOutcomeDto, { kind: "chain" }>, declared: VoiceContext, ours: () => boolean, backend: string, from?: VoiceChainProgress) => Promise<void>;
+
 type VoiceChoiceOffer = {
   outcome: Extract<VoiceOutcomeDto, { kind: "param_ambiguous" }> & { invoke: string; candidates: VoiceResolvedParamDto[] };
+  /** PRD #1184 — set when the choice is a chain's step: the chain to go on
+      with once it is answered, and what ran before it. */
+  chain?: VoiceChainPause;
   backend: string;
   declared: VoiceContext;
   /**
@@ -3078,9 +3121,12 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    * say. Runs nothing. Answers whether a choice was pending.
    */
   const closeChoice = useCallback((why?: string) => {
-    if (panelStateRef.current.kind !== "awaitingChoice") return false;
+    const mode = panelStateRef.current;
+    if (mode.kind !== "awaitingChoice") return false;
     setPanelState(IDLE);
-    if (why !== undefined) setProblem(why);
+    /* PRD #1184 — a chain paused on this choice drops the steps after it,
+       and says which steps ran before it. */
+    if (why !== undefined) setProblem(mode.offer.chain ? chainDropped(why, mode.offer.chain.ran) : why);
     return true;
   }, [setPanelState]);
 
@@ -3093,16 +3139,20 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    * past {@link VOICE_CHOICE_MAX}, which Rust leaves empty) or more than the
    * cap is likewise only its sentence.
    */
-  const offerChoice = useCallback((answer: VoiceResultDto, declared: VoiceContext) => {
+  const offerChoice = useCallback((answer: VoiceResultDto, declared: VoiceContext, chain?: VoiceChainPause) => {
     const outcome = answer.outcome;
-    if (outcome.kind !== "param_ambiguous" || outcome.invoke === undefined || outcome.candidates === undefined) return;
-    if (outcome.candidates.length === 0 || outcome.candidates.length > VOICE_CHOICE_MAX) return;
-    if (panelStateRef.current.kind !== "idle" || confirmationRef.current) return;
+    if (outcome.kind !== "param_ambiguous" || outcome.invoke === undefined || outcome.candidates === undefined) return false;
+    if (outcome.candidates.length === 0 || outcome.candidates.length > VOICE_CHOICE_MAX) return false;
+    if (panelStateRef.current.kind !== "idle" || confirmationRef.current) return false;
     setPanelState({
       kind: "awaitingChoice",
-      offer: { outcome: { ...outcome, invoke: outcome.invoke, candidates: outcome.candidates }, backend: answer.backend, declared, deadline: Date.now() + VOICE_CHOICE_WINDOW_MS },
+      offer: { outcome: { ...outcome, invoke: outcome.invoke, candidates: outcome.candidates }, backend: answer.backend, declared, deadline: Date.now() + VOICE_CHOICE_WINDOW_MS, ...(chain ? { chain } : {}) },
     });
+    return true;
   }, [setPanelState]);
+  /* PRD #1184 — `runChain`, for an answered choice to go on with its chain.
+     A ref because `runChain` is built after `dispatchChoice`, which reads it. */
+  const runChainRef = useRef<RunChain | undefined>(undefined);
 
   /**
    * PR #1451 round 3, change 3 — run what choosing a numbered item runs: the
@@ -3302,13 +3352,16 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
        says has moved on since the first utterance was declared. An agent or
        orchestration entry names its agent by id on the selected deck, which
        alone cannot tell a same-id replacement apart. */
+    /* PRD #1184 — a chain's choice that cannot run stops the chain there. */
+    const paused = offer.chain;
+    const stopChain = (why: string) => setProblem(paused ? chainStopped(paused.index, paused.chain.steps[paused.index].said, why, paused.ran) : why);
     const lost = dispatchLost(offer.declared, current(), [...(offer.outcome.params ?? []), ...(chosen ? [chosen] : [])], offer.outcome.invoke);
     if (lost) {
-      setProblem(choiceRefusal(lost));
+      stopChain(choiceRefusal(lost));
       return;
     }
     if (chosen === undefined) {
-      setProblem(VOICE_CHOICE_REFUSED);
+      stopChain(VOICE_CHOICE_REFUSED);
       return;
     }
     const outcome: Extract<VoiceOutcomeDto, { kind: "dispatch" }> = {
@@ -3324,7 +3377,28 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     /* No backend was asked anything for the answer, so no timing is shown. */
     setResult({ outcome, resolveMs: null, backend: offer.backend });
     refusedRef.current = false;
+    refusalRef.current = undefined;
     const dispatched = dispatchDeclared(outcome, offer.declared);
+    if (paused) {
+      if (refusedRef.current) {
+        setResult(undefined);
+        stopChain(refusalRef.current ?? "it was refused");
+      } else if (!dispatched) {
+        stopChain(NOTHING_DISPATCHED);
+      } else {
+        /* The steps after the choice, each rechecked as it comes. A later
+           utterance supersedes them, as it would the rest of any chain. */
+        const generation = request.current;
+        void runChainRef.current?.(paused.chain, paused.declared, () => request.current === generation, paused.backend, {
+          index: paused.index + 1,
+          ran: [...paused.ran, paused.chain.steps[paused.index].said],
+          reports: [...paused.reports, outcome.sentence],
+          undos: dispatched.undo ? [...paused.undos, dispatched.undo] : paused.undos,
+          reversible: paused.reversible && dispatched.undo !== undefined,
+        });
+      }
+      return;
+    }
     if (refusedRef.current) setResult(undefined);
     else if (!dispatched) setProblem(NOTHING_DISPATCHED);
     else if (dispatched.undo) setUndo({ run: dispatched.undo });
@@ -3436,14 +3510,14 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    * every step offered one (every step moved the view), and it runs them last
    * to first, so the view returns to where it was before the first step.
    */
-  const runChain = useCallback(async (chain: Extract<VoiceOutcomeDto, { kind: "chain" }>, declared: VoiceContext, ours: () => boolean) => {
-    const ran: string[] = [];
-    const undos: (() => void)[] = [];
+  const runChain = useCallback<RunChain>(async (chain, declared, ours, backend, from) => {
+    const progress: VoiceChainProgress = from ?? { index: 0, ran: [], reports: [], undos: [], reversible: true };
     const stop = (index: number, why: string) => {
       setResult(undefined);
-      setProblem(chainStopped(index, chain.steps[index].said, why, ran));
+      setProblem(chainStopped(index, chain.steps[index].said, why, progress.ran));
     };
-    for (const [index, step] of chain.steps.entries()) {
+    for (let index = progress.index; index < chain.steps.length; index += 1) {
+      const step = chain.steps[index];
       let now = current();
       if (index > 0) {
         for (let waited = 0; now.screen !== step.screen && waited < VOICE_CHAIN_SETTLE_MS; waited += VOICE_CHAIN_POLL_MS) {
@@ -3460,6 +3534,18 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
         stop(index, lost.why);
         return;
       }
+      /* A step that matched several things: the chain pauses on its numbered
+         choice, and answering it goes on from the next step
+         (`dispatchChoice`). One that cannot be offered stops the chain. */
+      if (step.choice) {
+        const offered = offerChoice({ outcome: step.choice, resolveMs: null, backend }, judgedOn, { ...progress, index, chain, declared, backend });
+        if (!offered) {
+          stop(index, step.sentence);
+          return;
+        }
+        setResult({ outcome: step.choice, resolveMs: null, backend });
+        return;
+      }
       refusedRef.current = false;
       refusalRef.current = undefined;
       const dispatched = dispatchDeclaredRef.current(
@@ -3474,11 +3560,18 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
         stop(index, NOTHING_DISPATCHED);
         return;
       }
-      ran.push(step.said);
-      if (dispatched.undo) undos.push(dispatched.undo);
+      progress.ran = [...progress.ran, step.said];
+      progress.reports = [...progress.reports, step.sentence];
+      if (dispatched.undo) progress.undos = [...progress.undos, dispatched.undo];
+      else progress.reversible = false;
     }
-    if (undos.length === chain.steps.length) setUndo({ run: () => { for (const undo of [...undos].reverse()) undo(); } });
-  }, [current, setProblem]);
+    /* Resumed after a choice: the report is every step's own, the chosen one
+       included, rather than the sentence Rust wrote before the choice. */
+    if (from) setResult({ outcome: { ...chain, sentence: `${progress.reports.map((report, at) => at === 0 ? report.replace(/\.$/u, "") : report.charAt(0).toLowerCase() + report.slice(1).replace(/\.$/u, "")).join(", then ")}.` }, resolveMs: null, backend });
+    const undos = progress.undos;
+    if (progress.reversible && undos.length === chain.steps.length) setUndo({ run: () => { for (const undo of [...undos].reverse()) undo(); } });
+  }, [current, offerChoice, setProblem]);
+  useEffect(() => { runChainRef.current = runChain; }, [runChain]);
 
   const resolveOne = useCallback(async (utterance: string, ours: () => boolean, alone?: string) => {
     if (!resolveVoice) return;
@@ -3641,7 +3734,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
         else if (!dispatched) setProblem(NOTHING_DISPATCHED);
         else if (dispatched.undo) setUndo({ run: dispatched.undo });
       } else if (final.outcome.kind === "chain") {
-        await runChain(final.outcome, declared, ours);
+        await runChain(final.outcome, declared, ours, final.backend);
       }
     } catch (cause) {
       if (ours()) setProblem(sentenceOf(cause));

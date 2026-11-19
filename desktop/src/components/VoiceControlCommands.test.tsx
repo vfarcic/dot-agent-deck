@@ -53,6 +53,7 @@ import {
   VOICE_JOIN_WINDOW_MS,
   VOICE_STATUS_POLL_MS,
   VOICE_CHAIN_SETTLE_MS,
+  chainDropped,
   chainStopped,
 } from "./VoiceControlPanel";
 
@@ -5673,7 +5674,74 @@ describe("chains of commands from one utterance (PRD #1184)", () => {
   });
 });
 
+describe("a chain paused on a numbered choice (PRD #1184)", () => {
+  beforeEach(() => { window.localStorage.clear(); vi.useFakeTimers(); });
+  afterEach(() => vi.useRealTimers());
+
+  const SAID = "open the overview and then the agent";
+  const first = { name: "agent", kind: "agent_ref", spoken: "the agent", value: "planner", label: "Plan / architecture", names: ["planner"] as string[] } as const;
+  const second = { name: "agent", kind: "agent_ref", spoken: "the agent", value: "builder", label: "Desktop implementation", names: ["builder"] as string[] } as const;
+  type ChainStep = Extract<VoiceResultDto["outcome"], { kind: "chain" }>["steps"][number];
+  const choice = {
+    kind: "param_ambiguous", transcript: "the agent", action: "open_agent", invoke: "openAgent", param: "agent", spoken: "the agent",
+    matches: [first.label, second.label], candidates: [first, second], params: [], reports: [`Opening ${first.label}.`, `Opening ${second.label}.`],
+    sentence: `Heard: “the agent” — “the agent” matches more than one agent: ${first.label}, ${second.label}.`,
+  } as Extract<VoiceResultDto["outcome"], { kind: "param_ambiguous" }>;
+  const steps: ChainStep[] = [
+    { said: "open the overview", action: "open_overview", invoke: "openOverview", params: [], sentence: "Opening the agent dashboard.", screen: "deck" },
+    { said: "the agent", action: "open_agent", invoke: "openAgent", params: [], sentence: "“the agent” matches more than one agent", screen: "overview", choice },
+  ];
+  const answer: VoiceResultDto = { resolveMs: 21, backend: "stub", outcome: { kind: "chain", transcript: SAID, steps, sentence: "Opening the agent dashboard, then: which agent." } };
+
+  async function pause() {
+    const voice = microphone([SAID]);
+    render(<DeckShell runtime={runtime(vi.fn(async () => answer), voice)} />);
+    await turnVoiceOn();
+    await completeUtterance();
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_CHAIN_SETTLE_MS * 2); });
+    await flush();
+    return screen.getByRole("dialog", { name: "Which agent?" });
+  }
+
+  /**
+   * Scenario: "open the overview and then the agent" from the Daemons screen,
+   * where "the agent" matches two agents. The dashboard opens and the chain
+   * pauses on "Which agent?"; choosing the second opens that agent, the row
+   * reports both steps, and one Undo puts the Daemons screen back.
+   */
+  it("runs the step before the choice, then the chosen one, and undoes both", async () => {
+    const dialog = await pause();
+    expect(screen.getByTestId("overview-table-region")).toBeVisible();
+    await act(async () => { fireEvent.click(within(dialog).getByRole("button", { name: `2. ${second.label}` })); await Promise.resolve(); });
+    await flush();
+    expect(within(screen.getByTestId("agent-pane-overlay")).getByTestId(`terminal-${second.value}`)).toBeVisible();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(`Opening the agent dashboard, then opening ${second.label}.`);
+    fireEvent.click(screen.getByRole("button", { name: "Undo" }));
+    await flush();
+    expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
+    expect(screen.queryByTestId("overview-table-region")).toBeNull();
+  });
+
+  /**
+   * Scenario: the same chain, with its choice cancelled. Nothing more runs,
+   * and the row says that the dashboard step ran and the rest was dropped.
+   */
+  it("drops the rest of the chain when the choice is cancelled, and says what ran", async () => {
+    const dialog = await pause();
+    await act(async () => { fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" })); await Promise.resolve(); });
+    await flush();
+    expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Step 1 (\u201copen the overview\u201d) ran; the rest of that sentence was not done.");
+  });
+});
+
 describe("chainStopped (PRD #1184)", () => {
+  /** Scenario: a choice that ends unanswered keeps its reason and says what ran before it. */
+  it("says which steps ran when a chain's choice ends unanswered", () => {
+    expect(chainDropped("Choice closed.", [])).toBe("Choice closed. Nothing from that sentence ran.");
+    expect(chainDropped("Choice expired.", ["open the overview"])).toBe("Choice expired. Step 1 (\u201copen the overview\u201d) ran; the rest of that sentence was not done.");
+  });
+
   /** Scenario: the stop report names the step, its reason and every step that ran, in order. */
   it("names the step that stopped and the steps that ran", () => {
     expect(chainStopped(0, "open the tester", "No agent here is called that.", [])).toBe("Step 1 (“open the tester”) was refused: No agent here is called that. Nothing ran.");
