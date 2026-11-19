@@ -19,10 +19,17 @@
 # one file, minutes apart.
 #
 # So each attempt here gets APT_PREFETCH_ATTEMPT_LIMIT (3 minutes, enough for
-# 142 MB at 0.8 MB/s, a twentieth of the slowest healthy rate), and after the first one
-# that does not finish, the Azure mirror is dropped from the runner's mirror
-# list so the remaining attempts fetch from the next mirror in it
-# (archive.ubuntu.com on the images this was written against). Every attempt
+# 142 MB at 0.8 MB/s, a twentieth of the slowest healthy rate), and after each
+# one that does not finish, the mirror at the top of the runner's mirror list is
+# dropped so the next attempt fetches from the one after it. It used to drop
+# only azure.archive.ubuntu.com, the first mirror on the images this was written
+# against. The ubuntu-26.04 image lists a regional EC2 mirror first instead
+# (us-east-2.ec2.archive.ubuntu.com on 2026-11-18), and when that one trickled,
+# all three attempts stayed on it and `desktop-driver` went red on `main` (run
+# 44262375554) with archive.ubuntu.com unused second in the list. A mirror is
+# dropped only while another archive mirror stays below it:
+# security.ubuntu.com, last in the list, serves only the security pocket, so
+# it is never the one left alone. Every attempt
 # keeps what earlier ones finished — whole .debs stay in the archive cache and
 # apt resumes a partial one — so a retry fetches only the remainder. Which
 # mirror serves a file does not change what is trusted: apt checks every .deb
@@ -36,7 +43,8 @@ fi
 
 attempts=${APT_PREFETCH_ATTEMPTS:-3}
 limit=${APT_PREFETCH_ATTEMPT_LIMIT:-3m}
-mirrors=/etc/apt/apt-mirrors.txt
+# Overridable for xtask/linkage-check's apt_prefetch tests only.
+mirrors=${APT_PREFETCH_MIRRORS:-/etc/apt/apt-mirrors.txt}
 
 if [ -r "$mirrors" ]; then
   echo "apt mirror list ($mirrors):"
@@ -60,10 +68,15 @@ for attempt in $(seq 1 "$attempts"); do
     reason="exited $status"
   fi
   echo "::warning::apt prefetch attempt $attempt/$attempts $reason after $((SECONDS - started))s."
-  if [ -f "$mirrors" ] && grep -q 'azure\.archive\.ubuntu\.com' "$mirrors" \
-    && grep -qv 'azure\.archive\.ubuntu\.com' "$mirrors"; then
-    sudo sed -i '/azure\.archive\.ubuntu\.com/d' "$mirrors"
-    echo "apt prefetch: dropped the Azure mirror; the remaining attempts use:"
+  # The archive mirrors below the first one; security.ubuntu.com is not one.
+  others=0
+  if [ -f "$mirrors" ]; then
+    others=$(awk 'NR > 1 && NF && !/security\.ubuntu\.com/ { n++ } END { print n + 0 }' "$mirrors")
+  fi
+  if [ "$attempt" -lt "$attempts" ] && [ "$others" -gt 0 ]; then
+    dropped=$(head -n 1 "$mirrors" | cut -f1)
+    sudo sed -i 1d "$mirrors"
+    echo "apt prefetch: dropped $dropped; the remaining attempts use:"
     sed 's/^/  /' "$mirrors"
     # A failed refresh leaves the indexes already fetched, which the next
     # mirror serves the same files for, so it is no reason to stop retrying.

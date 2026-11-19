@@ -18,6 +18,7 @@ from pr_review_common import (  # noqa: E402
     check_status,
     deny_sort_key,
     describe_independent_review,
+    GhError,
     gh_json,
     gh_json_paginated,
     focus_pass_requested,
@@ -177,144 +178,158 @@ def main():
     # What the vote job will do with each selected pull request, for the log.
     vote_notes = {}
     for pr in prs:
-        number, sha = pr["number"], pr["headRefOid"]
-        author = pr["author"]["login"]
+        try:
+            number, sha = pr["number"], pr["headRefOid"]
+            author = pr["author"]["login"]
 
-        if only_pr and str(number) != only_pr:
-            continue
-        if pr["isDraft"]:
-            skipped.append((number, "draft"))
-            continue
-        if author not in review_authors:
-            skipped.append((number, f"author {author} not in REVIEW_AUTHORS"))
-            continue
-        if (pr.get("headRepositoryOwner") or {}).get("login") != owner:
-            skipped.append((number, "fork"))
-            continue
-
-        if pr.get("reviewDecision") == "CHANGES_REQUESTED":
-            # ... unless the only thing holding it is OUR OWN rejection, on a head
-            # that has since moved. `dismiss_stale_reviews_on_push` dismisses
-            # approvals and not changes-requested, so without this a pull request
-            # the reviewer rejected was excluded from the reviewer FOREVER: the
-            # author pushes a fix and nothing ever looks again (#1019 needed a
-            # manual dismissal to escape). A human's changes-requested still
-            # parks it — that is someone else's homework.
-            if not bot_rejection_is_stale(pr_reviews(repo, number), sha):
-                skipped.append((number, "changes requested by a reviewer"))
+            if only_pr and str(number) != only_pr:
                 continue
-            print(f"note #{number}: re-reviewing; my own rejection predates {sha[:8]}")
-
-        # Issue #1086: the gate is the contexts branch protection REQUIRES, read
-        # from the live ruleset. It used to be "no check on the head has failed",
-        # which made every advisory job a veto — and because this reviewer's
-        # approval is what satisfies the required-review rule, an advisory red
-        # blocked the only thing that could unblock the merge. PR #1076 lost its
-        # approval to a `devbox` job that died on a third-party CDN's 504 with all
-        # five required contexts green.
-        green, why, advisory = check_status(repo, sha)
-        if not green:
-            skipped.append((number, why))
-            continue
-        if advisory:
-            advisories[number] = advisory
-
-        open_threads = unresolved_threads(repo, number)
-        if open_threads:
-            skipped.append((number, f"{open_threads} unresolved review thread(s)"))
-            continue
-
-        existing = latest_verdict(repo, number)
-        has_current_verdict = bool(existing and existing.get("head_sha") == sha)
-
-        # Issue #1629: an abstention gets ONE more ordinary pass once an
-        # independent review covers the head; `insufficient_retry_due` has the
-        # bound and why it is safe to count from the comments alone. The budget
-        # is checked first because it is one read, and a head with no retry
-        # left -- or a settled verdict -- needs none of the three reads below
-        # (Qodo and Greptile on PR #1765).
-        verdicts_at_head = None
-        if mode == "review" and has_current_verdict and not focus_unreviewed:
-            verdicts_at_head = trusted_verdicts_at(repo, number, sha)
-            if not retry_budget_left(verdicts_at_head):
-                # Idempotence: nothing to add for a head that already has a verdict.
-                skipped.append((number, f"already has a verdict for {sha[:8]}"))
+            if pr["isDraft"]:
+                skipped.append((number, "draft"))
                 continue
-            if not retry_can_change_the_verdict(author):
-                skipped.append((
-                    number,
-                    f"already has a verdict for {sha[:8]}; a retry would repeat the "
-                    f"INSUFFICIENT the integrity filter fixes for {author} (#1847)",
-                ))
+            if author not in review_authors:
+                skipped.append((number, f"author {author} not in REVIEW_AUTHORS"))
+                continue
+            if (pr.get("headRepositoryOwner") or {}).get("login") != owner:
+                skipped.append((number, "fork"))
                 continue
 
-        # Issue #1754: the review pass computes independent coverage HERE, from
-        # the unfiltered API, and hands it to the agent. The agent's own reads go
-        # through gh-aw's integrity filter, which on a pull request whose author
-        # lacks write access returns the issue comments as an empty list, so
-        # Qodo's summary comment -- the artefact that names the head -- is the
-        # one it cannot see. The vote pass recomputes this itself.
-        evidence = None
-        if mode == "review":
-            evidence = independent_review_evidence(
-                sha,
-                pr_comments(repo, number),
-                pr_review_comments(repo, number),
-                pr_reviews(repo, number),
-            )
+            if pr.get("reviewDecision") == "CHANGES_REQUESTED":
+                # ... unless the only thing holding it is OUR OWN rejection, on a head
+                # that has since moved. `dismiss_stale_reviews_on_push` dismisses
+                # approvals and not changes-requested, so without this a pull request
+                # the reviewer rejected was excluded from the reviewer FOREVER: the
+                # author pushes a fix and nothing ever looks again (#1019 needed a
+                # manual dismissal to escape). A human's changes-requested still
+                # parks it — that is someone else's homework.
+                if not bot_rejection_is_stale(pr_reviews(repo, number), sha):
+                    skipped.append((number, "changes requested by a reviewer"))
+                    continue
+                print(f"note #{number}: re-reviewing; my own rejection predates {sha[:8]}")
 
-        if verdicts_at_head is not None:
-            if not insufficient_retry_due(verdicts_at_head, evidence, author):
-                skipped.append((
-                    number,
-                    f"already has a verdict for {sha[:8]}; its INSUFFICIENT is retried "
-                    "once an independent review covers it",
-                ))
+            # Issue #1086: the gate is the contexts branch protection REQUIRES, read
+            # from the live ruleset. It used to be "no check on the head has failed",
+            # which made every advisory job a veto — and because this reviewer's
+            # approval is what satisfies the required-review rule, an advisory red
+            # blocked the only thing that could unblock the merge. PR #1076 lost its
+            # approval to a `devbox` job that died on a third-party CDN's 504 with all
+            # five required contexts green.
+            green, why, advisory = check_status(repo, sha)
+            if not green:
+                skipped.append((number, why))
                 continue
-            print(
-                f"note #{number}: re-reviewing {sha[:8]} once; its only verdict is "
-                f"INSUFFICIENT and {evidence['login']} now covers it"
-            )
-        if mode == "review" and has_current_verdict and focus_unreviewed:
-            # Said out loud because the run costs credits and the operator asked
-            # for it: a focused pass is the ONE case where paying twice for a
-            # head is the point. What makes it worth paying is that the second
-            # verdict covers what the first one declined to, which the agent
-            # reads out of the earlier verdict's `covered_paths`.
-            print(f"note #{number}: focused re-review of {sha[:8]}; it already has a verdict")
-        if mode == "vote" and not has_current_verdict:
-            skipped.append((number, f"no current verdict for {sha[:8]}"))
-            continue
+            if advisory:
+                advisories[number] = advisory
 
-        denied = touches_denied(repo, number)
-        vote_allowed = author in vote_authors and not denied
-        # A deny-listed pull request is still SELECTED in vote mode (issue #998):
-        # the vote job decides between approving it with a visible attention
-        # marker and declining, based on whether auto-merge is armed. Only an
-        # author outside VOTE_AUTHORS is dropped here, since nothing downstream
-        # would act on it.
-        if mode == "vote" and author not in vote_authors:
-            skipped.append((number, f"author {author} not in VOTE_AUTHORS"))
-            continue
+            open_threads = unresolved_threads(repo, number)
+            if open_threads:
+                skipped.append((number, f"{open_threads} unresolved review thread(s)"))
+                continue
 
-        items.append({
-            "number": number,
-            "sha": sha,
-            "vote_allowed": vote_allowed,
-            # Truncated to keep the matrix payload small, and safe to truncate
-            # ONLY because touches_denied sorted by deny_sort_key: the governing
-            # path is now at index 0, so the vote job's explanation cannot depend
-            # on what fell off the end. It still shortens the "Touches:" line on a
-            # pull request with more than five protected paths, which is a display
-            # limit rather than a lost reason.
-            "denied_paths": denied[:5],
-        })
-        vote_notes[number] = vote_note(author in vote_authors, denied)
-        if mode == "review":
-            # Only the review job reads it; the vote job recomputes coverage.
-            items[-1]["independent_review"] = describe_independent_review(evidence)
-        if len(items) >= max_prs:
-            break
+            existing = latest_verdict(repo, number)
+            has_current_verdict = bool(existing and existing.get("head_sha") == sha)
+
+            # Issue #1629: an abstention gets ONE more ordinary pass once an
+            # independent review covers the head; `insufficient_retry_due` has the
+            # bound and why it is safe to count from the comments alone. The budget
+            # is checked first because it is one read, and a head with no retry
+            # left -- or a settled verdict -- needs none of the three reads below
+            # (Qodo and Greptile on PR #1765).
+            verdicts_at_head = None
+            if mode == "review" and has_current_verdict and not focus_unreviewed:
+                verdicts_at_head = trusted_verdicts_at(repo, number, sha)
+                if not retry_budget_left(verdicts_at_head):
+                    # Idempotence: nothing to add for a head that already has a verdict.
+                    skipped.append((number, f"already has a verdict for {sha[:8]}"))
+                    continue
+                if not retry_can_change_the_verdict(author):
+                    skipped.append((
+                        number,
+                        f"already has a verdict for {sha[:8]}; a retry would repeat the "
+                        f"INSUFFICIENT the integrity filter fixes for {author} (#1847)",
+                    ))
+                    continue
+
+            # Issue #1754: the review pass computes independent coverage HERE, from
+            # the unfiltered API, and hands it to the agent. The agent's own reads go
+            # through gh-aw's integrity filter, which on a pull request whose author
+            # lacks write access returns the issue comments as an empty list, so
+            # Qodo's summary comment -- the artefact that names the head -- is the
+            # one it cannot see. The vote pass recomputes this itself.
+            evidence = None
+            if mode == "review":
+                evidence = independent_review_evidence(
+                    sha,
+                    pr_comments(repo, number),
+                    pr_review_comments(repo, number),
+                    pr_reviews(repo, number),
+                )
+
+            if verdicts_at_head is not None:
+                if not insufficient_retry_due(verdicts_at_head, evidence, author):
+                    skipped.append((
+                        number,
+                        f"already has a verdict for {sha[:8]}; its INSUFFICIENT is retried "
+                        "once an independent review covers it",
+                    ))
+                    continue
+                print(
+                    f"note #{number}: re-reviewing {sha[:8]} once; its only verdict is "
+                    f"INSUFFICIENT and {evidence['login']} now covers it"
+                )
+            if mode == "review" and has_current_verdict and focus_unreviewed:
+                # Said out loud because the run costs credits and the operator asked
+                # for it: a focused pass is the ONE case where paying twice for a
+                # head is the point. What makes it worth paying is that the second
+                # verdict covers what the first one declined to, which the agent
+                # reads out of the earlier verdict's `covered_paths`.
+                print(f"note #{number}: focused re-review of {sha[:8]}; it already has a verdict")
+            if mode == "vote" and not has_current_verdict:
+                skipped.append((number, f"no current verdict for {sha[:8]}"))
+                continue
+
+            denied = touches_denied(repo, number)
+            vote_allowed = author in vote_authors and not denied
+            # A deny-listed pull request is still SELECTED in vote mode (issue #998):
+            # the vote job decides between approving it with a visible attention
+            # marker and declining, based on whether auto-merge is armed. Only an
+            # author outside VOTE_AUTHORS is dropped here, since nothing downstream
+            # would act on it.
+            if mode == "vote" and author not in vote_authors:
+                skipped.append((number, f"author {author} not in VOTE_AUTHORS"))
+                continue
+
+            items.append({
+                "number": number,
+                "sha": sha,
+                "vote_allowed": vote_allowed,
+                # Truncated to keep the matrix payload small, and safe to truncate
+                # ONLY because touches_denied sorted by deny_sort_key: the governing
+                # path is now at index 0, so the vote job's explanation cannot depend
+                # on what fell off the end. It still shortens the "Touches:" line on a
+                # pull request with more than five protected paths, which is a display
+                # limit rather than a lost reason.
+                "denied_paths": denied[:5],
+            })
+            vote_notes[number] = vote_note(author in vote_authors, denied)
+            if mode == "review":
+                # Only the review job reads it; the vote job recomputes coverage.
+                items[-1]["independent_review"] = describe_independent_review(evidence)
+            if len(items) >= max_prs:
+                break
+        except GhError as exc:
+            # One pull request GitHub would not answer for is that pull request's
+            # problem, not the sweep's. On 2026-11-17 the 14:06 sweep died here:
+            # `pulls/2376/files` returned HTTP 500 ("this diff is temporarily
+            # unavailable due to heavy server load"), the exception left the loop,
+            # `prepare` failed, and no pull request was reviewed that day. Skipping
+            # it is the safe direction: it gets no verdict and no vote this run,
+            # and the next sweep reads it again. Only a failed `gh` call is caught;
+            # a malformed verdict from the trusted author still raises, because a
+            # broken reviewer must be loud (`latest_verdict`).
+            print(f"::warning::skipped #{pr['number']} this run: {exc}")
+            skipped.append((pr["number"], f"could not be read this run: {exc}"))
+            continue
 
     for number, why in skipped:
         print(f"skip #{number}: {why}")

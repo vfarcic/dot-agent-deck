@@ -1504,6 +1504,57 @@ assert '#1847' in log.getvalue(), log.getvalue()
     );
 }
 
+/// One pull request GitHub cannot serve must not take the sweep down. On
+/// 2026-11-17 `pulls/2376/files` returned HTTP 500 under load, the exception
+/// left the selector's loop, `prepare` failed, and no pull request was
+/// reviewed. Now that pull request is skipped with a warning and the others are
+/// still selected, while an error that is not a failed `gh` call still raises.
+#[test]
+fn a_pull_request_github_cannot_serve_is_skipped_not_fatal() {
+    assert_py_ok(
+        r#"import os, io, tempfile, json, contextlib
+import pr_review_select as sel
+from pr_review_common import GhError
+def pr(n):
+    return {'number': n, 'author': {'login': 'vfarcic'}, 'isDraft': False,
+            'headRefOid': SHA, 'headRepositoryOwner': {'login': 'o'}, 'reviewDecision': ''}
+sel.gh_json = lambda *a: [pr(7), pr(8), pr(9)]
+sel.check_status = lambda repo, sha: (True, 'green', [])
+sel.unresolved_threads = lambda repo, n: 0
+sel.latest_verdict = lambda repo, n: None
+sel.pr_comments = sel.pr_review_comments = sel.pr_reviews = lambda repo, n: []
+def denied(repo, n):
+    if n == 8:
+        raise GhError('gh api repos/o/r/pulls/8/files failed (1): HTTP 500')
+    return []
+sel.touches_denied = denied
+def run():
+    out = tempfile.NamedTemporaryFile('r', delete=False)
+    os.environ.update({'REPO': 'o/r', 'SELECT_MODE': 'review', 'REVIEW_AUTHORS': 'vfarcic',
+                       'VOTE_AUTHORS': 'vfarcic', 'GITHUB_OUTPUT': out.name, 'MAX_PRS': '5'})
+    os.environ.pop('ONLY_PR', None)
+    log = io.StringIO()
+    with contextlib.redirect_stdout(log):
+        sel.main()
+    line = [l for l in open(out.name) if l.startswith('items=')][0]
+    return json.loads(line[len('items='):]), log.getvalue()
+items, log = run()
+assert [i['number'] for i in items] == [7, 9], items
+assert '::warning::skipped #8 this run' in log, log
+assert 'HTTP 500' in log, log
+def broken(repo, n):
+    raise ValueError('verdict block is not valid JSON')
+sel.touches_denied = broken
+try:
+    run()
+except ValueError:
+    pass
+else:
+    raise AssertionError('a defect that is not a failed gh call was swallowed')
+"#,
+    );
+}
+
 /// Wiring for the vote job: an INSUFFICIENT on a head my own older rejection
 /// still holds dismisses that rejection, so it no longer blocks the merge
 /// (#1751). It still casts no review. `gh` is stubbed.
