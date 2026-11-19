@@ -609,6 +609,57 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 - **Does not assert:** resuming an agent, listing interrupted work, retention expiry, Pi synthetic session exclusion or OpenCode session aliases; SIGKILL recovery is `journal/restart/002`.
 - **Platform coverage:** mac+linux.
 
+#### journal/interrupted
+
+##### journal/interrupted/001 — After a restart, `interrupted list` shows the dispatched units and the plain pane the restart interrupted, and nothing before it.
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_interrupted_work.rs`); the real `dot-agent-deck interrupted` CLI run as a person (no pane identity, no terminal on stdin) unless stated; a restart is SIGTERM to the daemon's own pid and a second `daemon serve` on the same state directory.
+- **Agent:** synthetic routing stand-ins: a dispatcher pane and the units it dispatches with the real `dot-agent-deck dispatch` CLI.
+- **Asserts:** a `--single` unit and an orchestration-shaped unit (`--orchestration=interrupted-team`) dispatched from one pane; before the restart `list --json --no-git` has no items; after it the list is complete and has three items: each unit with `kind=unit`, `branch=agent/dispatch-<unit>`, its worktree, `launcher` = the dispatcher pane's name and a `last_entry` with a kind and a timestamp, and the pane with `kind=agent`, its name and no branch; the human list prints the title `Interrupted work`, both unit ids under it and before `Other agents`, the pane's id after `Other agents`, and the footer `3 interrupted items from before the restart`.
+- **Does not assert:** Git and pull request facts (`--no-git`); scheduled issue dispatches and orchestrations started from a client; the TUI and desktop surfaces.
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/002 — `interrupted dismiss` hides an item for good, and `dismiss --all` needs confirmation.
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_interrupted_work.rs`); the real `dot-agent-deck interrupted` CLI run as a person (no pane identity, no terminal on stdin) unless stated; a restart is SIGTERM to the daemon's own pid and a second `daemon serve` on the same state directory.
+- **Agent:** synthetic routing stand-ins: a dispatcher pane and the units it dispatches with the real `dot-agent-deck dispatch` CLI.
+- **Asserts:** `dismiss <id>` exits 0 and says `Dismissed.`; the unit leaves the list and its dispatcher pane stays; after a second restart the unit is still not listed; `dismiss --all` with no terminal and no `--yes` exits 1 and dismisses nothing; `dismiss --all --yes` exits 0 and empties the list.
+- **Does not assert:** the interactive confirmation prompt on a terminal; an older daemon re-listing a dismissed item after a downgrade.
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/003 — `interrupted reclaim` removes a clean, deck-created worktree and keeps its branch; `--dry-run` changes nothing.
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_interrupted_work.rs`); the real `dot-agent-deck interrupted` CLI run as a person (no pane identity, no terminal on stdin) unless stated; a restart is SIGTERM to the daemon's own pid and a second `daemon serve` on the same state directory.
+- **Agent:** synthetic routing stand-ins: a dispatcher pane and the units it dispatches with the real `dot-agent-deck dispatch` CLI.
+- **Asserts:** premises: the worktree carries the deck's ownership marker and `git status` in it is empty; `reclaim <id> --dry-run` exits 0, says `Reclaim would remove its worktree and keep its branch.`, and leaves the worktree on disk and the item listed; `reclaim <id>` exits 0, says `Reclaimed: its worktree was removed and its branch kept.`, the worktree directory is gone, `git branch --list agent/dispatch-<unit>` still shows the branch, and the item is no longer listed.
+- **Does not assert:** the unpushed-commit count; a worktree without the ownership marker or on another branch (daemon unit tests, `interrupted_work_daemon_tests`).
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/004 — `interrupted reclaim` keeps a dirty worktree and one that holds another worktree, and says why.
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_interrupted_work.rs`); the real `dot-agent-deck interrupted` CLI run as a person (no pane identity, no terminal on stdin) unless stated; a restart is SIGTERM to the daemon's own pid and a second `daemon serve` on the same state directory.
+- **Agent:** synthetic routing stand-ins: a dispatcher pane and the units it dispatches with the real `dot-agent-deck dispatch` CLI.
+- **Asserts:** with an untracked file in one unit's worktree, `reclaim` exits 1, says `Kept: its worktree has uncommitted changes. …`, keeps the file and leaves the item listed; with another worktree of the repository under the other unit's ignored `.worktrees/` (so `git status` there is empty), `reclaim` exits 1, says `Kept: other worktrees lie inside its worktree. …`, names the nested worktree's path, and keeps both trees, the nested one's file and the listing.
+- **Does not assert:** a check that cannot run (`KeptCouldNotCheck`) or a removal that fails.
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/005 — A report a unit sent to a dispatcher that never fetched it is listed with its unit after a restart, and `show` prints it framed as untrusted.
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_interrupted_work.rs`); the real `dot-agent-deck interrupted` CLI run as a person (no pane identity, no terminal on stdin) unless stated; a restart is SIGTERM to the daemon's own pid and a second `daemon serve` on the same state directory.
+- **Agent:** synthetic routing stand-ins: a dispatcher pane and the units it dispatches with the real `dot-agent-deck dispatch` CLI.
+- **Asserts:** the unit's `work-done --done` writes `reported destination=inbox` and the dispatcher never fetches it; after the restart the unit's item carries that `report_id` with a `kept_until_ms`; the human list prints `kept until`; `interrupted show <id>` exits 0 and prints the report's text between `[UNTRUSTED-WORKER-REPORT:` and `:END-UNTRUSTED-WORKER-REPORT]`.
+- **Does not assert:** the date's format; report expiry; a report longer than the show bound.
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/006 — With no restart, a report sent to a dispatcher that is gone is listed as an item of the unit's work.
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_interrupted_work.rs`); the real `dot-agent-deck interrupted` CLI run as a person (no pane identity, no terminal on stdin) unless stated; a restart is SIGTERM to the daemon's own pid and a second `daemon serve` on the same state directory.
+- **Agent:** synthetic routing stand-ins: a dispatcher pane and the units it dispatches with the real `dot-agent-deck dispatch` CLI.
+- **Asserts:** while the pane and its unit run the list is empty; after the pane is closed (`StopAgent`) and the unit's `work-done --done` is recorded, the list shows the unit's item, its agent still running, with that report's `report_id` (decision D3).
+- **Does not assert:** the deck notice the report also produces; the TUI and desktop surfaces.
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/007 — An agent in a deck pane may list interrupted work but not reclaim or dismiss it.
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_interrupted_work.rs`); the real `dot-agent-deck interrupted` CLI run as a person (no pane identity, no terminal on stdin) unless stated; a restart is SIGTERM to the daemon's own pid and a second `daemon serve` on the same state directory.
+- **Agent:** synthetic routing stand-ins: a dispatcher pane and the units it dispatches with the real `dot-agent-deck dispatch` CLI.
+- **Asserts:** with the pane identity of a live agent of the new daemon (`DOT_AGENT_DECK_PANE_ID`, `DOT_AGENT_DECK_AGENT_ID`, `DOT_AGENT_DECK_PANE_CAPABILITY`), `list --json --no-git` exits 0 and shows the unit; `reclaim <id>` and `dismiss <id>` each exit 1 and say `Refused: an agent cannot reclaim or dismiss interrupted work. …`; the worktree is still on disk and the item still listed.
+- **Does not assert:** a partial pane identity (refused before any request, as `close` does).
+- **Platform coverage:** mac+linux.
+
 #### journal/compat
 
 ##### journal/compat/001 — Lines of a newer schema or an unknown kind are skipped and kept.
@@ -6590,6 +6641,13 @@ without depending on the config struct API.
 - **Agent:** none — identity-recording `cat` probes.
 - **Asserts:** for two completed single units, each with another worktree of the fixture repository under its ignored `.worktrees/` holding an untracked file and `git status` empty, `close <name>` exits 0, removes the agent, reports `<path>: kept: holds other worktrees` and `holds worktree <nested path>`, and `close <name> --json` reports one `kept-holds-worktrees` verdict whose `nested_worktrees` names the nested path; both unit worktrees and both nested files are still on disk. Without the fix both closes report `removed` and the nested files are gone.
 - **Does not assert:** the orchestration scope, the `Force` policy, or `worktree reclaim` (its own unit test, `worktree_reclaim::tests::a_candidate_holding_other_worktrees_is_kept_and_names_them`).
+- **Platform coverage:** mac+linux.
+
+##### dispatch/close-verb/015 — After a daemon restart, `close <unit>` answers `unknown-unit` and points at `dot-agent-deck interrupted list` (PRD #1790 stage 2).
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_interrupted_work.rs`); a SIGTERM to the first daemon's own pid and a second `daemon serve` on the same state directory, then the real `close` CLI run as a person.
+- **Agent:** synthetic routing stand-ins: a dispatcher pane and a `--single` unit.
+- **Asserts:** `close <unit>` exits 1 and its output names `dot-agent-deck interrupted list`; `close <unit> --json` exits 1 with a report carrying `unknown-unit` and the same hint.
+- **Does not assert:** `close --unit-id` with a pre-restart id (its own message, `dispatched_units` unit tests).
 - **Platform coverage:** mac+linux.
 
 #### dispatch/single
