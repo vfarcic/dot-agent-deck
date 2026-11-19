@@ -15,6 +15,10 @@ use std::time::Duration;
 
 const SUBJECT: &str = "live inbox task";
 const BUDGET: Duration = Duration::from_secs(120);
+/// What Claude Code's overview says once Left in an empty input box moved the
+/// conversation to the background: `Your conversation moved to the
+/// background` before 2.1.328, `Your session moved to the background` on it.
+const OVERVIEW: &str = "moved to the background";
 
 struct Claude {
     pane: inbox::Pane,
@@ -202,10 +206,7 @@ impl Claude {
     }
 
     fn composer(&self) -> Option<String> {
-        if self
-            .pane_grid()
-            .contains("Your conversation moved to the background")
-        {
+        if self.pane_grid().contains(OVERVIEW) {
             return None;
         }
         self.pane_grid().lines().rev().find_map(|row| {
@@ -951,7 +952,7 @@ fn empty_editor_fallback(label: &str, erase_draft: bool) {
     );
 }
 
-/// Scenario: Complete a fallback task in interactive Haiku, then press Left in its empty composer to open the background-session overview and queue another task. For five seconds the input row must remain exactly empty with unchanged captured input bytes, the task queued and zero deliveries. This is a GREEN regression guard on the part-3 head because navigation sets the draft bit; after the fix the unrecognised overview must still hold delivery.
+/// Scenario: Complete a fallback task in interactive Haiku, then press Left in its empty composer to open the background-session overview and queue another task. For five seconds the input row must remain exactly empty with unchanged captured input bytes and the deck must type nothing; the task stays queued with zero deliveries unless the background session the conversation moved to took the deck's receiver over and was handed it there (issue #2342). This is a GREEN regression guard on the part-3 head because navigation sets the draft bit; after the fix the unrecognised overview must still hold the doorbell.
 #[spec("inbox/doorbell/010")]
 #[test]
 #[cfg(target_os = "linux")]
@@ -983,7 +984,7 @@ fn doorbell_010_live_left_opens_overview_and_the_line_is_not_typed_there() {
     assert!(
         common::wait_until(Duration::from_secs(10), || claude
             .pane_grid()
-            .contains("Your conversation moved to the background")),
+            .contains(OVERVIEW)),
         "Left must open the overview; {}",
         claude.evidence()
     );
@@ -1008,7 +1009,12 @@ fn doorbell_010_live_left_opens_overview_and_the_line_is_not_typed_there() {
     let since = claude.log().len();
     let name = "overview-held-7e91.txt";
     let id = claude.post(&claude.directive(name));
+    // Issue #2342: Left moves the conversation to Claude Code's background
+    // session, whose waiter takes the deck's receiver over and may be handed
+    // the task there. That is delivery to the conversation, not typing into
+    // the overview: what this test guards is that nothing is typed.
     let leaked = std::cell::Cell::new(false);
+    let left_queue = std::cell::Cell::new(false);
     // A bounded observation: the closure never asks to stop, so it samples
     // for the whole five seconds.
     common::wait_until(Duration::from_secs(5), || {
@@ -1033,14 +1039,20 @@ fn doorbell_010_live_left_opens_overview_and_the_line_is_not_typed_there() {
                     || line.contains("doorbell sent its cleanup CR")
                     || line.contains("pane_write:")
             })
-            || !grid.contains("Your conversation moved to the background")
-            || claude.deck.workdir().join(name).exists()
-            || message["state"] != "queued"
-            || message["deliveries"] != 0;
+            || !grid.contains(OVERVIEW);
         leaked.set(leaked.get() || seen);
+        left_queue.set(
+            left_queue.get()
+                || claude.deck.workdir().join(name).exists()
+                || message["state"] != "queued"
+                || message["deliveries"] != 0,
+        );
         false
     });
     let leaked = leaked.get();
+    let left_queue = left_queue.get();
+    let moved = claude.log()[since..]
+        .contains("inbox: the receiver moved to the conversation's Claude Code background session");
     let listing = claude.listing();
     let message = listing["messages"]
         .as_array()
@@ -1050,16 +1062,17 @@ fn doorbell_010_live_left_opens_overview_and_the_line_is_not_typed_there() {
         .unwrap();
     let evidence = claude.evidence();
     eprintln!(
-        "overview observation: leaked={leaked}; input ledger unchanged={}; empty input row={empty_row:?}; message={message}; pane=\n{}",
+        "overview observation: leaked={leaked}; left the queue={left_queue}; receiver moved to the background session={moved}; input ledger unchanged={}; empty input row={empty_row:?}; message={message}; pane=\n{}",
         input() == input_before,
         claude.pane_grid()
     );
     assert!(
-        !leaked
-            && input() == input_before
-            && message["state"] == "queued"
-            && message["deliveries"] == 0,
+        !leaked && input() == input_before,
         "deck must not type its line or act on Enter in the overview; {evidence}"
+    );
+    assert!(
+        !left_queue || moved,
+        "the task may leave the queue only through the background session's own waiter; {evidence}"
     );
 }
 
@@ -2251,4 +2264,158 @@ fn claude_049_live_hooks_refreshed_after_an_upgrade_deliver() {
     let id = fresh.post(&fresh.directive(name));
     fresh.done(&id, name, true);
     fresh.assert_witnessed(&id, true);
+}
+
+/// The pids of the processes running under `home` (their `HOME`) whose
+/// command line includes the word `arg`. Words, not arguments: Claude Code
+/// rewrites a `bg-pty-host`'s title into one argument with spaces in it.
+fn home_processes(home: &std::path::Path, arg: &str) -> Vec<i32> {
+    let home = format!("HOME={}", home.display());
+    let mut pids = Vec::new();
+    for entry in std::fs::read_dir("/proc").unwrap().flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
+            continue;
+        };
+        let cmd = std::fs::read(entry.path().join("cmdline")).unwrap_or_default();
+        let env = std::fs::read(entry.path().join("environ")).unwrap_or_default();
+        if cmd
+            .split(|c| *c == 0 || c.is_ascii_whitespace())
+            .any(|a| a == arg.as_bytes())
+            && env.split(|c| *c == 0).any(|v| v == home.as_bytes())
+        {
+            pids.push(pid);
+        }
+    }
+    pids
+}
+
+/// Kills Claude Code's background session processes (its `daemon run
+/// --spawned-by …`, `bg-pty-host` and `bg-spare`) under the test's own HOME
+/// when the test ends: they outlive the pane's agent, so the deck's teardown
+/// does not reach them.
+struct BackgroundHostReaper(PathBuf);
+
+impl Drop for BackgroundHostReaper {
+    fn drop(&mut self) {
+        for arg in ["--spawned-by", "bg-pty-host", "bg-spare"] {
+            for pid in home_processes(&self.0, arg) {
+                // SAFETY: a plain `kill(2)` on a process whose HOME is this
+                // test's own temporary HOME.
+                unsafe {
+                    libc::kill(pid, libc::SIGTERM);
+                }
+            }
+        }
+    }
+}
+
+/// Scenario: Genuine interactive Haiku in a deck pane is woken by a sentinel-writing task and does it. The user then presses Left in the empty input box, which moves the conversation to Claude Code's background session host, and Escape, which brings it back resumed in that host. A second sentinel-writing task posted then must reach the resumed conversation: Claude writes the second sentinel once and the task is acknowledged after one hand-over.
+#[spec("inbox/claude/054")]
+#[test]
+fn claude_054_live_a_conversation_resumed_from_the_background_host_takes_its_messages() {
+    skip_unless!(common::check_claude_available());
+    let claude = Claude::new();
+    let _hosts = BackgroundHostReaper(claude.deck.home_dir().to_path_buf());
+
+    // A first task in the foreground conversation.
+    let first = "foreground-task-3c8e51.txt";
+    let id = claude.post(&claude.directive(first));
+    claude.done(&id, first, true);
+    assert!(
+        common::wait_until(BUDGET, || {
+            claude.listing()["armed"].as_u64().unwrap_or(0) > 0
+                && claude.record()["live"]["status"] == "Idle"
+        }),
+        "the first turn must finish and its waiter re-arm; {}",
+        claude.evidence()
+    );
+    claude.expect_composer("");
+
+    // Left in the empty input box moves the conversation to a background
+    // session, run by a `bg-pty-host` Claude Code starts for it; Escape
+    // returns to it there. Claude Code answers an Escape that comes before the
+    // session runs with "Still starting", so retry.
+    claude.deck.send_keys(b"\x1b[D");
+    assert!(
+        common::wait_until(Duration::from_secs(20), || claude
+            .pane_grid()
+            .contains(OVERVIEW)),
+        "Left must move the conversation to the background; {}",
+        claude.evidence()
+    );
+    let home = claude.deck.home_dir().to_path_buf();
+    let conversation_hosts = || {
+        home_processes(&home, "bg-pty-host")
+            .into_iter()
+            .filter(|pid| {
+                std::fs::read(format!("/proc/{pid}/cmdline"))
+                    .unwrap_or_default()
+                    .split(|c| *c == 0 || c.is_ascii_whitespace())
+                    .any(|arg| arg == b"--session-id")
+            })
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        common::wait_until(Duration::from_secs(60), || !conversation_hosts().is_empty()),
+        "the conversation must run in a bg-pty-host under the test HOME; {}",
+        claude.evidence()
+    );
+    for host in conversation_hosts() {
+        let argv = std::fs::read(format!("/proc/{host}/cmdline")).unwrap_or_default();
+        eprintln!(
+            "background session host {host}: {}",
+            String::from_utf8_lossy(&argv).replace('\0', " ")
+        );
+    }
+    // One Escape: a surplus one in the session opens a Claude Code dialog
+    // ("Esc to cancel"), behind which the session takes no wake. Only while
+    // Claude Code answers "Still starting" is it pressed again.
+    claude.deck.send_keys(b"\x1b");
+    let returned = common::wait_until(Duration::from_secs(60), || {
+        let grid = claude.pane_grid();
+        if grid.contains("Still starting") {
+            std::thread::sleep(Duration::from_secs(2));
+            claude.deck.send_keys(b"\x1b");
+            return false;
+        }
+        !grid.contains(OVERVIEW) && claude.composer().is_some()
+    });
+    assert!(
+        returned,
+        "Escape must bring the conversation back; {}",
+        claude.evidence()
+    );
+    // The background session takes the conversation over (`SessionStart`
+    // with source `fork`) and arms its waiter.
+    assert!(
+        common::wait_until(BUDGET, || claude
+            .log()
+            .lines()
+            .any(|line| line.contains("Received inbox wait")
+                && line.contains("source=Some(\"fork\")"))),
+        "the background session's fork must arm a waiter; {}",
+        claude.evidence()
+    );
+    // Let the forked session finish starting, with its empty input box on
+    // screen, before the next task.
+    assert!(
+        common::wait_until(BUDGET, || claude.listing()["armed"].as_u64().unwrap_or(0)
+            > 0),
+        "the background session's waiter must stay armed; {}",
+        claude.evidence()
+    );
+    std::thread::sleep(Duration::from_secs(5));
+    claude.expect_composer("");
+
+    // A second task must reach the resumed conversation.
+    let second = "resumed-task-9a42d7.txt";
+    let id = claude.post(&claude.directive(second));
+    claude.done(&id, second, false);
+    assert!(
+        claude.log().contains(
+            "inbox: the receiver moved to the conversation's Claude Code background session"
+        ),
+        "the background session must have taken the receiver over; {}",
+        claude.evidence()
+    );
 }

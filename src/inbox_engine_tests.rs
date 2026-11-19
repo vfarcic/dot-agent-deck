@@ -42,6 +42,7 @@ const INTEGRATION: ReceiptArm = ReceiptArm {
     doorbell_only: false,
     resumed: false,
     hook_integration: None,
+    background_origin: None,
 };
 
 /// The component's end of one receipt stream.
