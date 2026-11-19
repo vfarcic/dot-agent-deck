@@ -244,6 +244,50 @@ impl Fixture {
         }
         Some(field(&out, "STOP-SOCKET="))
     }
+
+    /// Record pnpm invocations without reaching a package registry or a GUI.
+    fn run_with_pnpm(&self, mode: &str, port: u16, install_status: u8) -> Output {
+        fs::create_dir_all(self.checkout().join("desktop")).unwrap();
+        let stub_bin = self.root.join("stub-bin");
+        self.write_exec(
+            &stub_bin.join("pnpm"),
+            r#"#!/usr/bin/env bash
+printf '%s|%s\n' "$PWD" "$*" >>"$DAD_TEST_PNPM_CALLS"
+case "$*" in
+  'install --frozen-lockfile')
+    [ "$DAD_TEST_INSTALL_STATUS" -eq 0 ] || exit "$DAD_TEST_INSTALL_STATUS"
+    mkdir -p node_modules ;;
+  'tauri dev') : >"$DAD_TEST_MARK" ;;
+  *) exit 98 ;;
+esac
+"#,
+        );
+        let path = format!(
+            "{}:{}",
+            stub_bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        self.run_with_env(
+            mode,
+            &self.cfg(),
+            self.root.join("sb").to_str().unwrap(),
+            "debug",
+            &[],
+            &[
+                ("PATH", &path),
+                (
+                    "DAD_TEST_PNPM_CALLS",
+                    self.root.join("pnpm-calls").to_str().unwrap(),
+                ),
+                (
+                    "DAD_TEST_MARK",
+                    self.root.join("desktop-started").to_str().unwrap(),
+                ),
+                ("DAD_TEST_INSTALL_STATUS", &install_status.to_string()),
+                ("DAD_SANDBOX_RUN_VITE_PORT", &port.to_string()),
+            ],
+        )
+    }
 }
 
 fn combined(out: &Output) -> String {
@@ -759,6 +803,149 @@ fn the_old_shared_sandbox_is_left_alone_and_still_reachable() {
     );
 }
 
+/// Assert that both a fresh checkout and an existing dependency tree are
+/// installed before the desktop is launched, on each invocation.
+fn assert_desktop_installs_before_launch(mode: &str) {
+    if skip_without(
+        &[("bash", "--version"), ("git", "--version"), ("perl", "-v")],
+        mode,
+    ) {
+        return;
+    }
+    let f = Fixture::new();
+    f.write_exec(
+        &f.checkout().join("target/debug/dot-agent-deck"),
+        r#"#!/usr/bin/env bash
+case "${1:-}" in daemon) exit 0 ;; esac
+i=0
+while [ ! -e "$DAD_TEST_MARK" ] && [ "$i" -lt 100 ]; do sleep 0.05; i=$((i + 1)); done
+[ -e "$DAD_TEST_MARK" ]
+"#,
+    );
+    let port = free_port();
+    let calls_path = f.root.join("pnpm-calls");
+    let desktop = f.checkout().join("desktop");
+    for already_installed in [false, true] {
+        assert_eq!(desktop.join("node_modules").exists(), already_installed);
+        let out = f.run_with_pnpm(mode, port.port, 0);
+        let text = combined(&out);
+        assert!(
+            out.status.success(),
+            "{mode} refused the desktop (node_modules present: {already_installed}): {text}"
+        );
+        let calls = fs::read_to_string(&calls_path).unwrap_or_default();
+        assert_eq!(
+            calls,
+            format!(
+                "{}|install --frozen-lockfile\n{}|tauri dev\n",
+                desktop.display(),
+                desktop.display()
+            ),
+            "{mode} must install from desktop/ before launching, even with node_modules present: {text}"
+        );
+        assert!(f.root.join("desktop-started").exists(), "{text}");
+        fs::remove_file(&calls_path).unwrap();
+        fs::remove_file(f.root.join("desktop-started")).unwrap();
+    }
+}
+
+/// Scenario: run `task run-desktop` without node_modules, then run it again
+/// with the installed tree; each run installs frozen dependencies from the
+/// checkout's desktop directory before starting the desktop.
+#[test]
+fn run_desktop_installs_frozen_dependencies_before_each_launch() {
+    assert_desktop_installs_before_launch("desktop");
+}
+
+/// Scenario: run `task run-all` without node_modules, then with an installed
+/// tree; each run installs frozen dependencies before the desktop starts,
+/// and the TUI waits for that launch before exiting.
+#[test]
+fn run_all_installs_frozen_dependencies_before_each_launch() {
+    assert_desktop_installs_before_launch("all");
+}
+
+/// Scenario: run each desktop mode with a pnpm install that fails, both
+/// without node_modules and with an existing tree; the command fails with an
+/// install diagnostic and never launches the desktop or TUI.
+#[test]
+fn desktop_install_failure_stops_both_modes_before_launch() {
+    if skip_without(
+        &[("bash", "--version"), ("git", "--version")],
+        "desktop_install_failure_stops_both_modes_before_launch",
+    ) {
+        return;
+    }
+    for mode in ["desktop", "all"] {
+        for already_installed in [false, true] {
+            let f = Fixture::new();
+            let desktop = f.checkout().join("desktop");
+            if already_installed {
+                fs::create_dir_all(desktop.join("node_modules")).unwrap();
+            }
+            let port = free_port();
+            let out = f.run_with_pnpm(mode, port.port, 42);
+            let text = combined(&out);
+            let calls = fs::read_to_string(f.root.join("pnpm-calls")).unwrap_or_default();
+            assert_eq!(
+                calls,
+                format!("{}|install --frozen-lockfile\n", desktop.display()),
+                "{mode} must attempt the install and never invoke tauri dev on failure: {text}"
+            );
+            assert!(
+                !out.status.success(),
+                "{mode} accepted a failed install: {text}"
+            );
+            assert!(
+                text.contains("pnpm install"),
+                "install failure was not named: {text}"
+            );
+            assert!(!f.root.join("desktop-started").exists(), "{text}");
+            assert!(!text.contains("TUI-SOCKET="), "the TUI started: {text}");
+        }
+    }
+}
+
+/// Scenario: hold the desktop's port open and run each desktop mode, both
+/// with and without node_modules; it refuses because the port is occupied
+/// before invoking pnpm or creating a dependency tree.
+#[test]
+fn desktop_port_refusal_precedes_dependency_install_in_both_modes() {
+    if skip_without(
+        &[("bash", "--version"), ("git", "--version")],
+        "desktop_port_refusal_precedes_dependency_install_in_both_modes",
+    ) {
+        return;
+    }
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    for mode in ["desktop", "all"] {
+        for already_installed in [false, true] {
+            let f = Fixture::new();
+            let modules = f.checkout().join("desktop/node_modules");
+            if already_installed {
+                fs::create_dir_all(&modules).unwrap();
+            }
+            let out = f.run_with_pnpm(mode, port, 0);
+            let text = combined(&out);
+            assert!(
+                !out.status.success(),
+                "{mode} accepted an occupied port: {text}"
+            );
+            assert!(
+                text.contains(&format!("port {port} is in use")),
+                "{mode} should refuse the occupied port before touching dependencies: {text}"
+            );
+            assert!(
+                !f.root.join("pnpm-calls").exists(),
+                "pnpm was invoked despite the port refusal: {text}"
+            );
+            assert_eq!(modules.exists(), already_installed, "{text}");
+            assert!(!f.root.join("desktop-started").exists(), "{text}");
+        }
+    }
+}
+
 /// The TUI stand-in for the terminal test: once the desktop stand-in has made
 /// its attempt on the terminal, report whether this process's group is the
 /// terminal's foreground, then read one line from it.
@@ -777,6 +964,7 @@ echo "GOT:$line"
 /// if it can reach the terminal at all. Records which happened, and whether it
 /// started with SIGINT ignored (perl reports an inherited SIG_IGN as `IGNORE`).
 const TERMINAL_TAKING_DESKTOP: &str = r#"#!/usr/bin/env perl
+exit 0 if @ARGV && $ARGV[0] eq 'install';
 use POSIX;
 my $int = ($SIG{INT} // '') eq 'IGNORE' ? 'int-ignored' : 'int-default';
 $SIG{TTOU} = 'IGNORE';
@@ -1301,6 +1489,7 @@ const INSTANT_TUI: &str = "#!/usr/bin/env bash\nexit 0\n";
 /// The desktop stand-in for the teardown-race test: records its pid and
 /// whether the script had already exited when it started, then holds on.
 const RECORDING_DESKTOP: &str = r#"#!/usr/bin/env bash
+if [ "${1:-}" = install ]; then exit 0; fi
 if [ -e "$DAD_TEST_EXITED" ]; then when=after-exit; else when=before-exit; fi
 echo "$$ $when" >"$DAD_TEST_MARK"
 exec sleep 600

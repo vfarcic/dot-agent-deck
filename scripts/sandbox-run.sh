@@ -422,8 +422,6 @@ port_answers() {
 desktop_preflight() {
   command -v pnpm >/dev/null 2>&1 ||
     die "pnpm is not on PATH — run this from a \`devbox shell\` (docs/develop/desktop-gui.md#prerequisites)"
-  [ -d "$desktop_dir/node_modules" ] ||
-    die "the desktop's JavaScript dependencies are not installed — run \`pnpm install\` in $desktop_dir once"
   local pgid
   if pgid=$(recorded_desktop_pgid); then
     die "a desktop from an earlier run is still running against this sandbox (process group $pgid) — \`task run-stop\` stops it"
@@ -441,6 +439,18 @@ desktop_preflight() {
   if [ "$(uname -s)" = Linux ] && [ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
     echo "note: neither DISPLAY nor WAYLAND_DISPLAY is set, so the desktop window may fail to open" >&2
   fi
+}
+
+# Install the desktop's JavaScript dependencies from its lockfile, on every
+# desktop run. pnpm makes this a quick no-op when node_modules already matches
+# the lockfile, and it brings a tree left stale by a branch switch back in line
+# with this checkout's lockfile. Both modes call it only after every refusal
+# above (pnpm, an earlier desktop, port 1420, perl), so a refused run changes
+# nothing on disk; a failed install starts nothing.
+install_desktop_dependencies() {
+  echo "installing the desktop's JavaScript dependencies (pnpm install --frozen-lockfile in $desktop_dir)"
+  (cd "$desktop_dir" && pnpm install --frozen-lockfile) ||
+    die "\`pnpm install --frozen-lockfile\` in $desktop_dir failed, so nothing was started — run \`pnpm install\` in $desktop_dir by hand to see why"
 }
 
 config_note() {
@@ -464,6 +474,7 @@ run_tui() {
 
 run_desktop() {
   desktop_preflight
+  install_desktop_dependencies
   echo "$bin" >"$binary_record"
   echo "desktop: $desktop_dir   (pnpm tauri dev)"
   echo "deck:    $bin   (Start deck launches it inside the sandbox)"
@@ -476,6 +487,7 @@ run_all() {
   desktop_preflight
   config_note
   keeper_session_preflight
+  install_desktop_dependencies
   echo "$bin" >"$binary_record"
   rm -f "$desktop_exit_record"
   : >"$desktop_log"
