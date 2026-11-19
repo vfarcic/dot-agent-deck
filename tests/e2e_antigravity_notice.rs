@@ -35,8 +35,8 @@ fn read_state(path: &Path) -> Value {
         .expect("notice state is JSON")
 }
 
-fn tui(path: &Path) -> TuiDeck {
-    let deck = TuiDeck::builder()
+fn builder(path: &Path) -> common::TuiDeckBuilder {
+    TuiDeck::builder()
         .without_agent_credentials()
         .with_pty_size(180, 45)
         .with_env("DOT_AGENT_DECK_ANTIGRAVITY_NOTICE", path.to_string_lossy())
@@ -44,12 +44,15 @@ fn tui(path: &Path) -> TuiDeck {
             "AGY_TEST_DECK_BIN",
             common::contained_deck_binary().display().to_string(),
         )
-        .launch_with_fixture("antigravity");
+}
+
+fn tui(path: &Path) -> TuiDeck {
+    let deck = builder(path).launch_with_fixture("antigravity");
     deck.wait_for_string("No active agents");
     deck
 }
 
-fn start(deck: &TuiDeck, command: &str) {
+fn submit_start(deck: &TuiDeck, command: &str) {
     deck.send_keys(b"\x0e");
     deck.wait_for_string("Select Directory");
     deck.send_keys(b" ");
@@ -60,14 +63,23 @@ fn start(deck: &TuiDeck, command: &str) {
     deck.send_keys(command.as_bytes());
     let (col, row) = deck.wait_for_in_grid("[Submit]");
     deck.click(col, row);
+}
+
+fn stand_in_started(deck: &TuiDeck) {
     assert!(
         common::wait_for_path(
             &deck.workdir().join("replay-pid"),
             common::child_boot_budget()
         ),
-        "new-agent flow never started the stand-in:\n{}",
+        "Antigravity stand-in never started:\n{}",
         deck.snapshot_grid()
     );
+    deck.wait_for_string("Antigravity CLI 1.5.9");
+}
+
+fn start(deck: &TuiDeck, command: &str) {
+    submit_start(deck, command);
+    stand_in_started(deck);
 }
 
 fn notice(deck: &TuiDeck) {
@@ -216,4 +228,132 @@ fn antigravity_notice_006_a_shared_dismissal_is_honoured_by_the_tui() {
     let deck = tui(&path);
     start(&deck, "./agy");
     no_notice(&deck);
+}
+
+/// Scenario: Submit a New Agent command naming an absent Antigravity executable. The TUI reports that creation failed, shows no experimental notice and leaves the due start counter unchanged.
+#[spec("antigravity/notice/007")]
+#[test]
+fn antigravity_notice_007_failed_creation_does_not_count() {
+    let dir = common::harness_tempdir().expect("tempdir");
+    let path = dir.path().join("notice.json");
+    seed(&path, 100, 1, false);
+    let deck = tui(&path);
+    let missing = deck.workdir().join("absent-command/agy");
+    submit_start(&deck, missing.to_str().unwrap());
+    deck.wait_for_string("New agent failed:");
+    deck.wait_until_grid_then_hold(
+        "failed start has no notice",
+        Duration::from_millis(500),
+        |grid| grid.contains("No active agents") && !grid.contains(TITLE),
+    );
+    assert_eq!(read_state(&path)["start_count"], 100);
+}
+
+/// Scenario: Restore a plain shell pane, then type the captured agy command at its prompt and replay its SessionStart hook. The card identifies Antigravity without an experimental notice and its due start counter stays unchanged.
+#[spec("antigravity/notice/008")]
+#[test]
+fn antigravity_notice_008_agy_typed_in_a_shell_does_not_count() {
+    let dir = common::harness_tempdir().expect("tempdir");
+    let path = dir.path().join("notice.json");
+    seed(&path, 100, 1, false);
+    let deck = builder(&path)
+        .with_continue_session("notice-shell", "sh")
+        .launch_with_fixture("antigravity");
+    deck.wait_for_string("[Command Mode Ctrl+D]");
+    deck.send_bytes(b"./agy\r");
+    stand_in_started(&deck);
+    let request = deck.workdir().join("request-0.json");
+    let temporary = request.with_extension("tmp");
+    std::fs::write(
+        &temporary,
+        json!([{"hook": "session-start.json"}]).to_string(),
+    )
+    .expect("write shell-started Antigravity hook");
+    std::fs::rename(temporary, request).expect("publish complete replay request");
+    assert!(common::wait_for_path(
+        &deck.workdir().join("replayed-0"),
+        common::child_boot_budget()
+    ));
+    deck.send_bytes(b"\x04");
+    deck.wait_until_grid_then_hold(
+        "shell-started Antigravity is identified without a notice",
+        Duration::from_millis(500),
+        |grid| grid.contains("Antigravity ·") && !grid.contains(TITLE),
+    );
+    assert_eq!(read_state(&path)["start_count"], 100);
+}
+
+/// Scenario: Open an orchestration whose starting role is Antigravity running the captured agy executable. Its composer appears without an experimental notice and its due start counter stays unchanged.
+#[spec("antigravity/notice/009")]
+#[test]
+fn antigravity_notice_009_orchestration_role_does_not_count() {
+    let dir = common::harness_tempdir().expect("tempdir");
+    let path = dir.path().join("notice.json");
+    seed(&path, 100, 1, false);
+    let deck = tui(&path);
+    std::fs::write(
+        deck.workdir().join(".dot-agent-deck.toml"),
+        "[[orchestrations]]\nname = 'notice-team'\n[[orchestrations.roles]]\nname = 'orchestrator'\nagent = 'antigravity'\ncommand = './agy'\nstart = true\n",
+    ).expect("write Antigravity orchestration");
+    deck.approve_project_trust(deck.workdir());
+    deck.send_keys(b"\x0e");
+    deck.wait_for_string("Select Directory");
+    deck.send_keys(b" ");
+    deck.wait_for_string("Orch: notice-team");
+    deck.send_keys(b"\x1b[C\r\r");
+    stand_in_started(&deck);
+    no_notice(&deck);
+    assert_eq!(read_state(&path)["start_count"], 100);
+}
+
+/// Scenario: Launch the TUI with a saved Antigravity pane running the captured agy executable. Restore opens its composer without an experimental notice and leaves the due start counter unchanged.
+#[spec("antigravity/notice/010")]
+#[test]
+fn antigravity_notice_010_restored_antigravity_does_not_count() {
+    let dir = common::harness_tempdir().expect("tempdir");
+    let path = dir.path().join("notice.json");
+    seed(&path, 100, 1, false);
+    let deck = builder(&path)
+        .with_continue_session("restored-antigravity", "./agy")
+        .launch_with_fixture("antigravity");
+    stand_in_started(&deck);
+    no_notice(&deck);
+    assert_eq!(read_state(&path)["start_count"], 100);
+}
+
+/// Scenario: Configure agy as the default command, select Schedule in New Agent and clear its prefilled Command field. Submitting resolves the empty field to the captured Antigravity executable, increments the start counter and shows its first experimental notice.
+#[spec("antigravity/notice/011")]
+#[test]
+fn antigravity_notice_011_empty_authoring_command_counts_the_resolved_default() {
+    let dir = common::harness_tempdir().expect("tempdir");
+    let path = dir.path().join("notice.json");
+    seed(&path, 0, 0, false);
+    let config = dir.path().join("config.toml");
+    std::fs::write(&config, "default_command = './agy'\n").expect("write default command");
+    let deck = builder(&path)
+        .with_env("DOT_AGENT_DECK_CONFIG", config.to_string_lossy())
+        .launch_with_fixture("antigravity");
+    deck.wait_for_string("No active agents");
+    deck.send_keys(b"\x0e");
+    deck.wait_for_string("Select Directory");
+    deck.send_keys(b" ");
+    deck.wait_for_string("┌ New Agent");
+    deck.send_keys(b"\x1b[C");
+    deck.wait_for_string("schedule mode");
+    deck.send_keys(b"\t\t");
+    deck.send_keys(&[0x7f; 32]);
+    deck.wait_until_grid("authoring Command field is empty", |grid| {
+        grid.lines().any(|line| {
+            line.split_once("Command:")
+                .and_then(|(_, value)| value.split_once('│'))
+                .is_some_and(|(value, _)| value.trim().is_empty())
+        })
+    });
+    // The ordinary empty Command starts a shell; Schedule resolves the
+    // empty field to the configured default before creating the pane.
+    let (col, row) = deck.wait_for_in_grid("[Submit]");
+    deck.click(col, row);
+    stand_in_started(&deck);
+    notice(&deck);
+    assert_eq!(read_state(&path)["start_count"], 1);
 }

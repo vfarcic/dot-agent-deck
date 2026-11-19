@@ -8072,6 +8072,42 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Does not assert:** the future shared Rust state API or the desktop dialog; this scenario seeds its JSON directly.
 - **Platform coverage:** mac+linux.
 
+##### antigravity/notice/007 — A failed New Agent creation does not count.
+
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_antigravity_notice.rs`).
+- **Agent:** absent executable named `agy` in the scratch workspace.
+- **Asserts:** New Agent reports creation failure, shows no experimental notice and preserves a counter due for its next notice.
+- **Platform coverage:** mac+linux.
+
+##### antigravity/notice/008 — Antigravity typed into a shell does not count.
+
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_antigravity_notice.rs`).
+- **Agent:** captured Antigravity stand-in, launched by typing `./agy` into a shell pane.
+- **Asserts:** after `./agy` starts from the shell and replays its captured SessionStart hook, the card identifies Antigravity without the experimental notice and the due start counter stays unchanged.
+- **Platform coverage:** mac+linux.
+
+##### antigravity/notice/009 — An Antigravity orchestration role does not count.
+
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_antigravity_notice.rs`).
+- **Agent:** captured Antigravity stand-in, configured as an orchestration's Antigravity starting role.
+- **Asserts:** opening the orchestration from New Agent starts its composer without the notice and preserves the due start counter.
+- **Platform coverage:** mac+linux.
+
+##### antigravity/notice/010 — Restoring an Antigravity pane does not count.
+
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_antigravity_notice.rs`).
+- **Agent:** captured Antigravity stand-in in a saved session staged by `with_continue_session`.
+- **Asserts:** restore opens the Antigravity composer without the notice and preserves the due start counter.
+- **Platform coverage:** mac+linux.
+
+##### antigravity/notice/011 — An empty authoring Command counts its resolved Antigravity default.
+
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_antigravity_notice.rs`).
+- **Agent:** captured Antigravity stand-in, configured as `default_command`.
+- **Asserts:** clearing the prefilled Command field in New Agent's Schedule mode still starts Antigravity, advances the counter to one and shows its first experimental notice.
+- **Does not assert:** ordinary empty Command starts, which launch a shell, or Schedule authoring with a real model.
+- **Platform coverage:** mac+linux.
+
 #### antigravity/status
 
 ##### antigravity/status/001 — Captured Antigravity hooks drive the visible prompt, running command and ordinary turn end.
