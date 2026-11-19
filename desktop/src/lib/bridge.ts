@@ -2649,6 +2649,7 @@ const WAKE_HOLDS = new Set([
   "dialog_during_ring",
   "needs_fetch",
   "cannot_check",
+  "no_activity",
 ]);
 /** PRD #1666 part 3 (Q35): the hold causes this build names; any other reads as `unknown`. */
 const HOLD_CAUSES = new Set(["filesystem", "writable_directory", "foreign_owner", "acl", "export_file", "io"]);

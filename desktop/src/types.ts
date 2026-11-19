@@ -112,6 +112,7 @@ export type WakeHold =
   | "dialog_during_ring"
   | "needs_fetch"
   | "cannot_check"
+  | "no_activity"
   | "unknown";
 /**
  * PRD #1666 part 3 (Q35): the daemon's `HoldDetail` — what stopped the check

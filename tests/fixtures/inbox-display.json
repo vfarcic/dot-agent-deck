@@ -15,7 +15,8 @@
     "uncertain_input": "waiting: the deck's notice may be in its input. Check it before Enter.",
     "dialog_during_ring": "waiting: a dialog may have taken the deck's keys. Check its pane.",
     "needs_fetch": "waiting: ask the agent to run dot-agent-deck inbox fetch; reinstall the deck integration to restore automatic delivery",
-    "cannot_check": "waiting: the deck can't check this agent's input box. Check its pane."
+    "cannot_check": "waiting: the deck can't check this agent's input box. Check its pane.",
+    "no_activity": "not taken: the agent shows as busy but has sent nothing for a while. Ask it to run dot-agent-deck inbox fetch."
   },
   "inputHeld": {
     "checking": "input held: the deck is checking the input box; what you typed or answered will appear in a moment",

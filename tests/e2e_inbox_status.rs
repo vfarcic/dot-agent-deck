@@ -15,7 +15,7 @@ use spec::spec;
 use std::cell::RefCell;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 fn attention_client(daemon: &common::DaemonProc) -> common::TuiDeck {
     common::TuiDeck::builder()
@@ -196,6 +196,162 @@ fn status_031_orchestrator_attention_survives_tabs_and_reattach() {
             .any(|line| line.contains('✉') && line.contains(" held"))),
         "clearing the drafts and taking the messages must clear header attention: {}",
         reattached.snapshot_grid()
+    );
+}
+
+/// What `daemon status --json` and the human `daemon status` say about
+/// `pane`: its row's `inbox` object, and its human row.
+fn status_rows(daemon: &common::DaemonProc, pane: &Pane) -> (Value, String) {
+    let run = |json: bool| {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"));
+        command.args(["daemon", "status"]);
+        if json {
+            command.arg("--json");
+        }
+        let output = command
+            .env("DOT_AGENT_DECK_ATTACH_SOCKET", &daemon.attach_socket)
+            .env("DOT_AGENT_DECK_SOCKET", &daemon.hook_socket)
+            .output()
+            .expect("run `daemon status`");
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let parsed: Value = serde_json::from_str(&run(true)).expect("status JSON");
+    let inbox = parsed["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|agent| agent["pane_id"] == pane.id.as_str())
+        .map(|agent| agent["inbox"].clone())
+        .unwrap_or_else(|| panic!("no status row for {}: {parsed}", pane.id));
+    let human = run(false)
+        .lines()
+        .find(|line| line.starts_with(&format!("{}\t", pane.id)))
+        .unwrap_or_else(|| panic!("no human status row for {}", pane.id))
+        .to_string();
+    (inbox, human)
+}
+
+/// Scenario: An orchestrator reads busy (Thinking) and a worker's report waits in its inbox. While the orchestrator keeps sending tool events the deck says nothing; once it has sent nothing for the busy bound, `daemon status` and its `--json` say the report has not been taken, and in the attached TUI the orchestrator's card says so and is marked `held`, and the header names it. Taking the report clears all of it.
+#[spec("inbox/status/045")]
+#[test]
+fn status_045_mail_behind_a_silent_busy_status_is_shown_not_taken() {
+    const BOUND_MS: u64 = 2000;
+    let daemon = daemon_unbound(&[(
+        "DOT_AGENT_DECK_INBOX_BUSY_STALL_AFTER_MS",
+        &BOUND_MS.to_string(),
+    )]);
+    let member = |role, index, start| {
+        json!({"tab_membership": {
+            "kind":"orchestration", "name":"silent-team", "role_name":role,
+            "role_index":index, "is_start_role":start, "orchestration_id":"silent-team",
+            "orchestration_cwd":daemon.cwd()
+        }})
+    };
+    let orch = pane_with(
+        &daemon,
+        "silent-orchestrator",
+        member("orchestrator", 0, true),
+    );
+    let worker = pane_with(&daemon, "silent-coder", member("coder", 1, false));
+    let deck = attention_client(&daemon);
+    deck.wait_for_string("silent-team");
+    // The orchestrator's card is on its team's tab: Dashboard, then one right.
+    let (col, row) = deck.wait_for_in_grid("Dashboard");
+    deck.click(col + 1, row);
+    deck.send_keys(b"\x1b[C");
+    deck.wait_until_grid("team tab selected, showing its cards", |grid| {
+        below_header(grid).contains("silent-coder")
+    });
+    status(&daemon, &orch, "session_start", "claude_code");
+    status(&daemon, &orch, "thinking", "claude_code");
+    let mut report = request(&worker, "work_done");
+    report["task"] = json!("SILENT-BUSY-WORKER-REPORT-2389");
+    report["timestamp"] = json!(chrono::Utc::now());
+    assert_eq!(
+        hook(&daemon, report)["accepted"],
+        true,
+        "worker report accepted"
+    );
+    assert!(
+        common::wait_until(WAIT, || summary(&daemon, &orch)["queued"] == 1),
+        "precondition: the report waits for the orchestrator: {}",
+        summary(&daemon, &orch)
+    );
+    // The guard: an agent that keeps sending hook events is working, so for
+    // twice the bound nothing says its mail is stuck.
+    let guard_until = Instant::now() + Duration::from_millis(BOUND_MS * 2);
+    while Instant::now() < guard_until {
+        status(&daemon, &orch, "tool_start", "claude_code");
+        let inbox = summary(&daemon, &orch);
+        assert!(
+            inbox["wake_stalled"] != true && inbox["wake_hold"].is_null(),
+            "an agent still sending events must not be reported stuck: {inbox}"
+        );
+        // The gap between events, observed rather than slept: the deck types
+        // nothing into a pane that reads busy.
+        unchanged(&orch, Duration::from_millis(250));
+    }
+    // Silence: the agent still reads busy and sends nothing more.
+    assert!(
+        common::wait_until(WAIT, || {
+            let inbox = summary(&daemon, &orch);
+            inbox["wake_stalled"] == true && inbox["wake_hold"] == "no_activity"
+        }),
+        "mail behind a busy status with no events past the bound must be reported not taken: {}",
+        summary(&daemon, &orch)
+    );
+    let (json_inbox, human) = status_rows(&daemon, &orch);
+    assert_eq!(json_inbox["wake_stalled"], true, "{json_inbox}");
+    assert_eq!(json_inbox["wake_hold"], "no_activity", "{json_inbox}");
+    assert!(
+        human.contains("stalled"),
+        "the human `daemon status` row must say the mail is stuck: {human:?}"
+    );
+    let words: Value = serde_json::from_str(include_str!("fixtures/inbox-display.json")).unwrap();
+    let reason = words["wakeHolds"]["no_activity"]
+        .as_str()
+        .expect("shared words for no_activity");
+    // The words' opening, which a card of any width shows before it cuts.
+    let opening = &reason[..reason.find(" but ").expect("the words' opening")];
+    assert!(
+        common::wait_until(WAIT, || below_header(&deck.snapshot_grid())
+            .contains(opening)),
+        "the orchestrator's card must say its mail is not taken; grid:\n{}",
+        deck.snapshot_grid()
+    );
+    assert_card_marked(&deck, "silent-orchestrator");
+    // Issue #2387's header: it names the held card and leaves the words to it.
+    let named = format!(
+        "{} {}: silent-team / silent-orchestrator",
+        words["glyph"].as_str().unwrap(),
+        words["attentionHeld"].as_str().unwrap()
+    );
+    assert!(
+        common::wait_until(WAIT, || {
+            let header = attention_header(&deck);
+            header.contains(&named) && !header.contains(opening)
+        }),
+        "the header must name the held orchestrator, without the words; grid:\n{}",
+        deck.snapshot_grid()
+    );
+    let taken = fetch(&daemon, &orch, true);
+    assert!(taken.to_string().contains("SILENT-BUSY-WORKER-REPORT-2389"));
+    assert!(
+        common::wait_until(WAIT, || {
+            let inbox = summary(&daemon, &orch);
+            inbox["wake_stalled"] != true && inbox["wake_hold"].is_null()
+        }),
+        "taking the report clears it: {}",
+        summary(&daemon, &orch)
+    );
+    assert!(
+        common::wait_until(WAIT, || {
+            let grid = deck.snapshot_grid();
+            !attention_header(&deck).contains(&named) && !below_header(&grid).contains(opening)
+        }),
+        "taking the report clears the card's words and the header: {}",
+        deck.snapshot_grid()
     );
 }
 
