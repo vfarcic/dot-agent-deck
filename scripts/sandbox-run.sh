@@ -419,6 +419,19 @@ port_answers() {
   wait "$probe"
 }
 
+# vite binds 1420 with strictPort (desktop/vite.config.ts), so a second `pnpm
+# dev` or `tauri dev` anywhere on this machine would fail the desktop — and
+# under `all` that failure would land in a log file behind the TUI.
+# DAD_SANDBOX_RUN_VITE_PORT moves only this probe, not vite, and exists for
+# xtask/linkage-check/src/sandbox_run.rs, whose stand-in desktop binds
+# nothing: 1420 is in use whenever a `tauri dev` runs on the machine.
+require_vite_port_free() {
+  local port=${DAD_SANDBOX_RUN_VITE_PORT:-1420}
+  if port_answers 127.0.0.1 "$port" || port_answers ::1 "$port"; then
+    die "port $port is in use, probably by another \`pnpm dev\` or \`tauri dev\` — the desktop's vite server needs it"
+  fi
+}
+
 desktop_preflight() {
   command -v pnpm >/dev/null 2>&1 ||
     die "pnpm is not on PATH — run this from a \`devbox shell\` (docs/develop/desktop-gui.md#prerequisites)"
@@ -426,16 +439,7 @@ desktop_preflight() {
   if pgid=$(recorded_desktop_pgid); then
     die "a desktop from an earlier run is still running against this sandbox (process group $pgid) — \`task run-stop\` stops it"
   fi
-  # vite binds 1420 with strictPort (desktop/vite.config.ts), so a second `pnpm
-  # dev` or `tauri dev` anywhere on this machine would fail the desktop — and
-  # under `all` that failure would land in a log file behind the TUI.
-  # DAD_SANDBOX_RUN_VITE_PORT moves only this probe, not vite, and exists for
-  # xtask/linkage-check/src/sandbox_run.rs, whose stand-in desktop binds
-  # nothing: 1420 is in use whenever a `tauri dev` runs on the machine.
-  local port=${DAD_SANDBOX_RUN_VITE_PORT:-1420}
-  if port_answers 127.0.0.1 "$port" || port_answers ::1 "$port"; then
-    die "port $port is in use, probably by another \`pnpm dev\` or \`tauri dev\` — the desktop's vite server needs it"
-  fi
+  require_vite_port_free
   if [ "$(uname -s)" = Linux ] && [ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
     echo "note: neither DISPLAY nor WAYLAND_DISPLAY is set, so the desktop window may fail to open" >&2
   fi
@@ -446,7 +450,10 @@ desktop_preflight() {
 # the lockfile, and it brings a tree left stale by a branch switch back in line
 # with this checkout's lockfile. Both modes call it only after every refusal
 # above (pnpm, an earlier desktop, port 1420, perl), so a refused run changes
-# nothing on disk; a failed install starts nothing.
+# nothing on disk; a failed install starts nothing. The install can take long
+# enough for another `pnpm dev` or `tauri dev` to take port 1420 meanwhile, so
+# both modes probe the port again once it returns, before they write or start
+# anything.
 install_desktop_dependencies() {
   echo "installing the desktop's JavaScript dependencies (pnpm install --frozen-lockfile in $desktop_dir)"
   (cd "$desktop_dir" && pnpm install --frozen-lockfile) ||
@@ -475,6 +482,7 @@ run_tui() {
 run_desktop() {
   desktop_preflight
   install_desktop_dependencies
+  require_vite_port_free
   echo "$bin" >"$binary_record"
   echo "desktop: $desktop_dir   (pnpm tauri dev)"
   echo "deck:    $bin   (Start deck launches it inside the sandbox)"
@@ -488,6 +496,7 @@ run_all() {
   config_note
   keeper_session_preflight
   install_desktop_dependencies
+  require_vite_port_free
   echo "$bin" >"$binary_record"
   rm -f "$desktop_exit_record"
   : >"$desktop_log"

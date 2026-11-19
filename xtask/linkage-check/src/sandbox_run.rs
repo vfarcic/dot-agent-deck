@@ -256,7 +256,15 @@ printf '%s|%s\n' "$PWD" "$*" >>"$DAD_TEST_PNPM_CALLS"
 case "$*" in
   'install --frozen-lockfile')
     [ "$DAD_TEST_INSTALL_STATUS" -eq 0 ] || exit "$DAD_TEST_INSTALL_STATUS"
-    mkdir -p node_modules ;;
+    mkdir -p node_modules
+    if [ -e "$DAD_TEST_PNPM_CALLS.occupy-port" ]; then
+      : >"$DAD_TEST_PNPM_CALLS.listen-request"
+      i=0
+      while [ ! -e "$DAD_TEST_PNPM_CALLS.listening" ] && [ "$i" -lt 100 ]; do
+        sleep 0.05; i=$((i + 1))
+      done
+      [ -e "$DAD_TEST_PNPM_CALLS.listening" ] || exit 97
+    fi ;;
   'tauri dev') : >"$DAD_TEST_MARK" ;;
   *) exit 98 ;;
 esac
@@ -944,6 +952,96 @@ fn desktop_port_refusal_precedes_dependency_install_in_both_modes() {
             assert!(!f.root.join("desktop-started").exists(), "{text}");
         }
     }
+}
+
+/// Have the pnpm stand-in start listening during install, after preflight
+/// passed. The test owns the reserved sockets and turns them into listeners
+/// on the stand-in's request, so they stay held throughout and close on panic.
+fn assert_desktop_refuses_port_taken_during_install(mode: &str) {
+    if skip_without(
+        &[("bash", "--version"), ("git", "--version"), ("perl", "-v")],
+        mode,
+    ) {
+        return;
+    }
+    let f = Fixture::new();
+    let port = free_port();
+    fs::write(f.root.join("pnpm-calls.occupy-port"), "").unwrap();
+    f.write_exec(
+        &f.checkout().join("target/debug/dot-agent-deck"),
+        r#"#!/usr/bin/env bash
+case "${1:-}" in daemon) exit 0 ;; esac
+i=0
+while [ ! -e "$DAD_TEST_MARK" ] && [ "$i" -lt 100 ]; do sleep 0.05; i=$((i + 1)); done
+echo "TUI-SOCKET=$DOT_AGENT_DECK_ATTACH_SOCKET"
+"#,
+    );
+    let out = std::thread::scope(|scope| {
+        let listening = scope.spawn(|| {
+            let request = f.root.join("pnpm-calls.listen-request");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !request.exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                request.exists(),
+                "pnpm never requested the port during install"
+            );
+            for socket in &port._sockets {
+                // SAFETY: HeldPort owns each live TCP socket, already bound
+                // to loopback; listen retains the descriptor and takes no pointer.
+                let result = unsafe { libc::listen(std::os::fd::AsRawFd::as_raw_fd(socket), 8) };
+                assert_eq!(result, 0, "listen: {}", std::io::Error::last_os_error());
+            }
+            fs::write(f.root.join("pnpm-calls.listening"), "").unwrap();
+        });
+        let out = f.run_with_pnpm(mode, port.port, 0);
+        listening
+            .join()
+            .expect("start listener during pnpm install");
+        out
+    });
+    let text = combined(&out);
+    let calls = fs::read_to_string(f.root.join("pnpm-calls")).unwrap_or_default();
+    assert_eq!(
+        calls,
+        format!(
+            "{}|install --frozen-lockfile\n",
+            f.checkout().join("desktop").display()
+        ),
+        "{mode} launched the desktop after install took port {}: {text}",
+        port.port
+    );
+    assert!(
+        !out.status.success(),
+        "{mode} accepted a port taken during install: {text}"
+    );
+    assert!(
+        text.contains(&format!("port {} is in use", port.port)),
+        "{mode} should name the port taken during install: {text}"
+    );
+    assert!(!f.root.join("desktop-started").exists(), "{text}");
+    assert!(!text.contains("TUI-SOCKET="), "the TUI started: {text}");
+    assert!(
+        !f.root.join("sb/desktop.log").exists(),
+        "the background desktop launch was prepared: {text}"
+    );
+}
+
+/// Scenario: run the desktop with a frozen dependency install that takes its
+/// port before succeeding; the command names the occupied port and refuses
+/// without launching the desktop or TUI.
+#[test]
+fn run_desktop_refuses_port_taken_during_dependency_install() {
+    assert_desktop_refuses_port_taken_during_install("desktop");
+}
+
+/// Scenario: run both clients with a frozen dependency install that takes
+/// the desktop port before succeeding; the command names the occupied port
+/// and refuses without starting the desktop, TUI or keeper.
+#[test]
+fn run_all_refuses_port_taken_during_dependency_install() {
+    assert_desktop_refuses_port_taken_during_install("all");
 }
 
 /// The TUI stand-in for the terminal test: once the desktop stand-in has made
