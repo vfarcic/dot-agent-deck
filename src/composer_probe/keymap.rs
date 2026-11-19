@@ -1314,9 +1314,10 @@ pub fn codex_cwd_display(cwd: &Path, home: Option<&Path>) -> Option<String> {
 pub const SIBLING_SCAN_ENTRIES: usize = 65_536;
 
 /// Whether the directory holding `cwd` has an entry whose name is `cwd`'s
-/// own name followed by [`CODEX_STATUS_SEPARATOR`] (the Greptile review's
-/// P1 on issue #2130): a directory Codex could be moved into whose status
-/// line reads as `cwd` and a thread name. For `/` itself, an entry of `/`
+/// own name followed by [`CODEX_STATUS_SEPARATOR`] and is a directory, or a
+/// symlink to one (the Greptile review's P1 on issue #2130): a directory
+/// Codex could be moved into whose status line reads as `cwd` and a thread
+/// name. An entry whose type can't be read counts. For `/` itself, an entry of `/`
 /// whose name starts with the separator. A directory that can't be read,
 /// or holds more than [`SIBLING_SCAN_ENTRIES`] entries, counts as holding
 /// one, which can only hold more checks. File I/O, unbounded in time like
@@ -1337,7 +1338,15 @@ pub fn codex_separator_siblings(cwd: &Path) -> bool {
             return true;
         }
         match entry {
-            Ok(entry) if entry.file_name().to_string_lossy().starts_with(&prefix) => return true,
+            // Only a directory, a symlink to one included, is somewhere
+            // Codex could be moved into; one whose type can't be read
+            // counts (Qodo's review on #2407).
+            Ok(entry) if entry.file_name().to_string_lossy().starts_with(&prefix) => {
+                match std::fs::metadata(entry.path()) {
+                    Ok(meta) if !meta.is_dir() => {}
+                    _ => return true,
+                }
+            }
             Ok(_) => {}
             Err(_) => return true,
         }

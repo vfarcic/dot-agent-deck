@@ -275,7 +275,7 @@ fn probe_103_codexs_status_line_against_the_start_folder() {
     assert_eq!(beside("gpt-5.5 medium · ~/code/other"), Err(Hold::Changed));
 }
 
-/// Scenario: Look beside a start folder for a folder named like it followed by ` · `, which Codex's status line would show as the start folder and a thread name. Only such a folder counts, the start folder's own contents and look-alikes without the separator don't, and a folder holding `/` is looked for in `/`; a parent that can't be read counts as holding one.
+/// Scenario: Look beside a start folder for a folder named like it followed by ` · `, which Codex's status line would show as the start folder and a thread name. Only such a folder counts, a symlink to one and a link whose target can't be read included; a file of that name, the start folder's own contents and look-alikes without the separator don't, and a folder holding `/` is looked for in `/`; a parent that can't be read counts as holding one.
 #[spec("inbox/probe/103")]
 #[test]
 fn probe_103_folders_named_like_the_start_folder_and_more_are_found() {
@@ -286,7 +286,24 @@ fn probe_103_folders_named_like_the_start_folder_and_more_are_found() {
     std::fs::create_dir(dir.path().join("proj copy")).unwrap();
     std::fs::create_dir(dir.path().join("projx · y")).unwrap();
     std::fs::write(dir.path().join("proj ·"), "").unwrap();
+    // A file is nowhere Codex could be moved into (Qodo's review).
+    std::fs::write(dir.path().join("proj · notes"), "").unwrap();
     assert!(!codex_separator_siblings(&proj), "none beside it");
+    #[cfg(unix)]
+    {
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, dir.path().join("proj · link")).unwrap();
+        assert!(codex_separator_siblings(&proj), "a symlink to a folder");
+        std::fs::remove_file(dir.path().join("proj · link")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("gone"), dir.path().join("proj · dangling"))
+            .unwrap();
+        assert!(
+            codex_separator_siblings(&proj),
+            "a link whose type can't be read"
+        );
+        std::fs::remove_file(dir.path().join("proj · dangling")).unwrap();
+    }
     std::fs::create_dir(dir.path().join("proj · copy")).unwrap();
     assert!(codex_separator_siblings(&proj), "proj · copy");
     assert!(
