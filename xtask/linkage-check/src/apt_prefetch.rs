@@ -34,13 +34,16 @@ const FAKE_SUDO: &str = "#!/usr/bin/env bash\nexec \"$@\"\n";
 
 const FAKE_APT_GET: &str = "#!/usr/bin/env bash\nexit 0\n";
 
-/// Logs the head of the mirror list (or `-` when there is none) and exits with
-/// the next of `FAKE_OUTCOMES`.
+/// Logs the head of the mirror list, or with no list the first `URIs:` of the
+/// deb822 sources file, or `-` when there is neither, and exits with the next
+/// of `FAKE_OUTCOMES`.
 const FAKE_TIMEOUT: &str = r#"#!/usr/bin/env bash
 n=$(( $(cat "$FAKE_DIR/count" 2>/dev/null || echo 0) + 1 ))
 echo "$n" > "$FAKE_DIR/count"
 if [ -f "$APT_PREFETCH_MIRRORS" ]; then
   head -n 1 "$APT_PREFETCH_MIRRORS" | cut -f1 >> "$FAKE_DIR/used"
+elif [ -f "$APT_PREFETCH_SOURCES" ]; then
+  grep -m1 '^URIs:' "$APT_PREFETCH_SOURCES" | awk '{print $2}' >> "$FAKE_DIR/used"
 else
   echo - >> "$FAKE_DIR/used"
 fi
@@ -75,14 +78,23 @@ impl Run {
             .collect()
     }
 
+    fn sources(&self) -> String {
+        fs::read_to_string(self.dir.path().join("ubuntu.sources")).unwrap_or_default()
+    }
+
     fn stdout(&self) -> String {
         String::from_utf8_lossy(&self.out.stdout).into_owned()
     }
 }
 
 /// Runs the script against `mirrors` (one URL per line, `None` for no list)
-/// with the attempt outcomes given.
+/// with the attempt outcomes given, and no deb822 sources file.
 fn run(mirrors: Option<&[&str]>, outcomes: &str) -> Run {
+    run_with_sources(mirrors, None, outcomes)
+}
+
+/// As `run`, with `sources` written as the deb822 `ubuntu.sources` file.
+fn run_with_sources(mirrors: Option<&[&str]>, sources: Option<&str>, outcomes: &str) -> Run {
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("bin");
     fs::create_dir(&bin).unwrap();
@@ -104,6 +116,10 @@ fn run(mirrors: Option<&[&str]>, outcomes: &str) -> Run {
             .collect();
         fs::write(&list, text).unwrap();
     }
+    let deb822 = dir.path().join("ubuntu.sources");
+    if let Some(text) = sources {
+        fs::write(&deb822, text).unwrap();
+    }
     let path = format!(
         "{}:{}",
         bin.display(),
@@ -116,6 +132,7 @@ fn run(mirrors: Option<&[&str]>, outcomes: &str) -> Run {
         .env("FAKE_DIR", dir.path())
         .env("FAKE_OUTCOMES", outcomes)
         .env("APT_PREFETCH_MIRRORS", &list)
+        .env("APT_PREFETCH_SOURCES", &deb822)
         .output()
         .expect("bash runs");
     Run { dir, out }
@@ -182,4 +199,65 @@ fn apt_prefetch_005_a_finished_first_attempt_changes_nothing() {
     assert!(r.out.status.success(), "{}", r.stdout());
     assert_eq!(r.used(), [EC2]);
     assert_eq!(r.mirrors_left(), [EC2, ARCHIVE, SECURITY]);
+}
+
+/// RWX's `ubuntu:24.04` image as of 2026-11-19: no mirror list, one regional
+/// mirror in `ubuntu.sources`. A standard noble file's security stanza is
+/// added to show it is left alone.
+const RWX_SOURCES: &str = "Types: deb
+URIs: http://us-east-2.ec2.archive.ubuntu.com/ubuntu/
+Suites: noble noble-updates noble-backports
+Components: main universe restricted multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+Types: deb
+URIs: http://security.ubuntu.com/ubuntu/
+Suites: noble-security
+Components: main universe restricted multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+";
+
+/// Scenario: no mirror list, and `ubuntu.sources` names a regional EC2
+/// mirror, as on RWX; the first attempt times out, the archive URIs are
+/// switched to archive.ubuntu.com, the security stanza and the signing key
+/// stay, and the second attempt succeeds there.
+#[test]
+fn apt_prefetch_006_with_no_mirror_list_a_regional_source_is_switched() {
+    let r = run_with_sources(None, Some(RWX_SOURCES), "124 0");
+    assert!(r.out.status.success(), "{}", r.stdout());
+    assert_eq!(r.used(), [EC2, "http://archive.ubuntu.com/ubuntu/"]);
+    let after = r.sources();
+    assert!(
+        after.contains("URIs: http://archive.ubuntu.com/ubuntu/\n"),
+        "{after}"
+    );
+    assert!(!after.contains("ec2.archive"), "{after}");
+    assert!(
+        after.contains("URIs: http://security.ubuntu.com/ubuntu/\n"),
+        "{after}"
+    );
+    assert_eq!(
+        after
+            .matches("Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg")
+            .count(),
+        2,
+        "{after}"
+    );
+}
+
+/// Scenario: sources that already name archive.ubuntu.com, and GitHub's
+/// `mirror+file:` sources beside a mirror list, are never rewritten; the
+/// mirror list, when there is one, is what moves.
+#[test]
+fn apt_prefetch_007_archive_and_mirror_file_sources_are_left_alone() {
+    let plain = RWX_SOURCES.replace(EC2, "http://archive.ubuntu.com/ubuntu/");
+    let r = run_with_sources(None, Some(&plain), "124 0");
+    assert!(r.out.status.success(), "{}", r.stdout());
+    assert_eq!(r.sources(), plain);
+
+    let github = "Types: deb\nURIs: mirror+file:/etc/apt/apt-mirrors.txt\nSuites: resolute\n";
+    let r = run_with_sources(Some(&[EC2, ARCHIVE, SECURITY]), Some(github), "124 0");
+    assert!(r.out.status.success(), "{}", r.stdout());
+    assert_eq!(r.sources(), github);
+    assert_eq!(r.used(), [EC2, ARCHIVE]);
 }

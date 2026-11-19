@@ -29,8 +29,19 @@
 # 44262375554) with archive.ubuntu.com unused second in the list. A mirror is
 # dropped only while another archive mirror stays below it:
 # security.ubuntu.com, last in the list, serves only the security pocket, so
-# it is never the one left alone. Every attempt
-# keeps what earlier ones finished — whole .debs stay in the archive cache and
+# it is never the one left alone.
+#
+# A runner with no mirror list gets the same move another way. RWX's
+# ubuntu:24.04 image names one mirror, us-east-2.ec2.archive.ubuntu.com, in
+# /etc/apt/sources.list.d/ubuntu.sources. On 2026-11-19 RWX's `desktop-driver`
+# fetched from it at 58.8 kB/s for ten minutes and then got 503s (PR #2386's
+# run 01a1f3a3d831), with nowhere else to go. So when there is no mirror list
+# and that file points the archive at a regional *.archive.ubuntu.com mirror,
+# a stalled attempt rewrites those URIs to archive.ubuntu.com. A
+# security.ubuntu.com stanza, and GitHub's `mirror+file:` URIs, do not match
+# and are left alone.
+#
+# Every attempt keeps what earlier ones finished — whole .debs stay in the archive cache and
 # apt resumes a partial one — so a retry fetches only the remainder. Which
 # mirror serves a file does not change what is trusted: apt checks every .deb
 # against the index whose signature it verified with Ubuntu's archive key.
@@ -45,6 +56,11 @@ attempts=${APT_PREFETCH_ATTEMPTS:-3}
 limit=${APT_PREFETCH_ATTEMPT_LIMIT:-3m}
 # Overridable for xtask/linkage-check's apt_prefetch tests only.
 mirrors=${APT_PREFETCH_MIRRORS:-/etc/apt/apt-mirrors.txt}
+sources=${APT_PREFETCH_SOURCES:-/etc/apt/sources.list.d/ubuntu.sources}
+# A deb822 URIs line naming a regional archive mirror (a host ending in
+# .archive.ubuntu.com, so archive.ubuntu.com itself does not match).
+regional='^URIs:[[:space:]]*https?://[^[:space:]/]+\.archive\.ubuntu\.com/ubuntu/?[[:space:]]*$'
+fallback=http://archive.ubuntu.com/ubuntu/
 
 if [ -r "$mirrors" ]; then
   echo "apt mirror list ($mirrors):"
@@ -73,11 +89,21 @@ for attempt in $(seq 1 "$attempts"); do
   if [ -f "$mirrors" ]; then
     others=$(awk 'NR > 1 && NF && !/security\.ubuntu\.com/ { n++ } END { print n + 0 }' "$mirrors")
   fi
+  changed=false
   if [ "$attempt" -lt "$attempts" ] && [ "$others" -gt 0 ]; then
     dropped=$(head -n 1 "$mirrors" | cut -f1)
     sudo sed -i 1d "$mirrors"
     echo "apt prefetch: dropped $dropped; the remaining attempts use:"
     sed 's/^/  /' "$mirrors"
+    changed=true
+  elif [ "$attempt" -lt "$attempts" ] && [ ! -f "$mirrors" ] && [ -f "$sources" ] \
+    && grep -Eq "$regional" "$sources"; then
+    echo "apt prefetch: $sources named a regional mirror; the remaining attempts use $fallback:"
+    sudo sed -E -i "s#$regional#URIs: $fallback#" "$sources"
+    grep '^URIs:' "$sources" | sed 's/^/  /'
+    changed=true
+  fi
+  if [ "$changed" = true ]; then
     # A failed refresh leaves the indexes already fetched, which the next
     # mirror serves the same files for, so it is no reason to stop retrying.
     if ! sudo apt-get update -qq; then
