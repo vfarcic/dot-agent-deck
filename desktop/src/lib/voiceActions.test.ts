@@ -262,20 +262,25 @@ describe("VOICE_ACTIONS", () => {
     }
   });
 
-  /// Scenario: Say generate config for a dashboard agent. The real voice dispatch opens the same Yes/No confirmation as the agent's control and sends nothing until Yes is pressed.
-  it("desktop/config-gen/003: generate config opens the shared confirmation by voice", async () => {
-    const { deck, resolveVoice } = renderDashboardVoice("generate config", "overview", {
-      kind: "dispatch", transcript: "generate config", action: "generate_config", invoke: "confirmGenerateConfig",
+  /// Scenario: Say generate config or update config for a dashboard agent whose config is present or absent. Both phrases open the shared confirmation using the current Update or Generate label, and send nothing before Yes.
+  it.each([
+    ["generate config", false], ["generate config", true],
+    ["update config", false], ["update config", true],
+  ] as const)("desktop/config-gen/003: %s opens the shared confirmation by voice (existing config: %s)", async (said, exists) => {
+    const snapshot = generationSnapshot();
+    snapshot.agents = snapshot.agents.map((agent, at) => ({ ...agent, displayName: `filter-voice-agent-${at + 1}`, projectConfigExists: exists }));
+    const { deck, resolveVoice } = renderDashboardVoice(said, "overview", {
+      kind: "dispatch", transcript: said, action: "generate_config", invoke: "confirmGenerateConfig",
       params: [{ name: "agent", kind: "agent_ref", spoken: "first agent", value: "planner", label: "planner" }],
       sentence: "Confirm generating config — nothing has been sent yet.",
-    });
+    }, { snapshot });
     const { VOICE_ACTIONS } = await vi.importActual<typeof import("./voiceActions")>("./voiceActions");
     // Spoken dispatch reads this original registry, rather than the exported
     // wrapper above that records control clicks.
     const spokenDispatch = vi.spyOn(VOICE_ACTIONS.confirmGenerateConfig, "run");
     try {
       await speakDashboardCommand(resolveVoice);
-      const dialog = await screen.findByRole("alertdialog", { name: "Generate .dot-agent-deck.toml" });
+      const dialog = await screen.findByRole("alertdialog", { name: `${exists ? "Update" : "Generate"} .dot-agent-deck.toml` });
       expect(within(dialog).getByRole("button", { name: "Yes" })).toBeVisible();
       expect(within(dialog).getByRole("button", { name: "No" })).toBeVisible();
       expect(spokenDispatch).toHaveBeenCalledTimes(1);
@@ -298,16 +303,19 @@ describe("VOICE_ACTIONS", () => {
     expect(deck.generateConfig).not.toHaveBeenCalled();
   });
 
-  /// Scenario: Open an agent's full-window pane from the dashboard and press Generate config in its header. The same voice registry entry opens the neutral Yes/No confirmation; after Yes, the agent pane stays visible and the success sentence is shown outside any inert background.
-  it("desktop/config-gen/002: the open agent pane offers the same confirmation", async () => {
-    const deck = runtime({ snapshot: generationSnapshot() });
+  /// Scenario: Open an agent's pane and press its config control for known existing, absent, or unknown config state. The header and Yes/No confirmation use Update only for an existing file, and Yes preserves the shared success sentence and visible pane.
+  it.each([undefined, false, true])("desktop/config-gen/002: the open agent pane offers the same confirmation (existing config: %s)", async (exists) => {
+    const snapshot = generationSnapshot();
+    snapshot.agents = snapshot.agents.map((agent) => ({ ...agent, projectConfigExists: exists }));
+    const deck = runtime({ snapshot });
+    const verb = exists ? "Update" : "Generate";
     render(createElement(DeckShell, { runtime: deck, initialView: { kind: "overview" } }));
     fireEvent.click(screen.getAllByRole("button", { name: /^Open .* agent$/ })[0]);
     const pane = await screen.findByTestId("agent-pane-overlay");
     registryDispatch.mockClear();
-    fireEvent.click(within(pane).getByRole("button", { name: /Generate config/i }));
+    fireEvent.click(within(pane).getByRole("button", { name: `${verb} config` }));
     expectOneRegistryDispatch("confirmGenerateConfig");
-    const dialog = screen.getByRole("alertdialog", { name: "Generate .dot-agent-deck.toml" });
+    const dialog = screen.getByRole("alertdialog", { name: `${verb} .dot-agent-deck.toml` });
     expect(dialog.querySelector(".danger, .danger-icon")).toBeNull();
     expect(within(dialog).getAllByRole("button").map((button) => button.textContent).sort()).toEqual(["No", "Yes"]);
     expect(deck.runAction).not.toHaveBeenCalled();
@@ -318,7 +326,7 @@ describe("VOICE_ACTIONS", () => {
     expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
     expect(notice).toBeVisible();
     await waitFor(() => {
-      expect(screen.queryByRole("alertdialog", { name: "Generate .dot-agent-deck.toml" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("alertdialog", { name: `${verb} .dot-agent-deck.toml` })).not.toBeInTheDocument();
       expect(notice.closest("[inert], [aria-hidden='true']")).toBeNull();
     });
   });

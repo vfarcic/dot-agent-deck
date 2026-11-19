@@ -260,6 +260,8 @@ async fn subscribe(
             let mut state = state.write().await;
             state.learn_stream_incarnation(learned_from(&sub));
             state.take_inbox_snapshot(&records);
+            // PRD #2119: and which agents' projects already have a config.
+            state.take_project_config_flags(&records);
             Ok(sub)
         }
         Ok(Ok(GatedQuery::Unsupported)) => match client.subscribe_events().await {

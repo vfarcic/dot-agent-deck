@@ -6,6 +6,11 @@ use std::sync::OnceLock;
 /// configuration file by analyzing the project structure.
 const CONFIG_GEN_PROMPT_TEMPLATE: &str = include_str!("../assets/config_gen_prompt.md");
 
+/// PRD #2119: the section put ahead of [`CONFIG_GEN_PROMPT_TEMPLATE`] when the
+/// project already has a `.dot-agent-deck.toml`, turning the request into an
+/// update of the user's file rather than a fresh one.
+const CONFIG_GEN_EXISTING_TEMPLATE: &str = include_str!("../assets/config_gen_existing.md");
+
 /// Generic agent role library. Embedded at build time; the config-gen agent picks
 /// from these roles when proposing an orchestration.
 const ROLES_TOML: &str = include_str!("../assets/roles.toml");
@@ -53,11 +58,32 @@ fn render_roles_section(library: &RoleLibrary) -> String {
 }
 
 /// Build the config generation prompt for a specific directory.
+///
+/// PRD #2119: checked against the disk when it is composed. When `dir` already
+/// holds a `.dot-agent-deck.toml` ([`project_config_exists`]), the request
+/// names that file and asks the agent to read it and propose changes to it,
+/// writing only after approval; otherwise it is the plain template.
 pub fn config_gen_prompt(dir: &str) -> String {
     let roles_section = render_roles_section(role_library());
-    CONFIG_GEN_PROMPT_TEMPLATE
+    let body = CONFIG_GEN_PROMPT_TEMPLATE
         .replace("{dir}", dir)
-        .replace("{roles}", &roles_section)
+        .replace("{roles}", &roles_section);
+    if project_config_exists(dir) {
+        format!(
+            "{}{body}",
+            CONFIG_GEN_EXISTING_TEMPLATE.replace("{dir}", dir)
+        )
+    } else {
+        body
+    }
+}
+
+/// PRD #2119: whether `dir` itself holds a `.dot-agent-deck.toml` — a regular
+/// file at that exact directory, by the type rules the project reader applies
+/// (a directory or a symlink of that name does not count), with no walk up the
+/// tree. One `lstat`.
+pub fn project_config_exists(dir: &str) -> bool {
+    crate::directory_listing::holds_project_config(std::path::Path::new(dir))
 }
 
 /// PRD #2119: the subject of the configuration request the daemon posts to an
@@ -83,6 +109,50 @@ mod tests {
         let prompt = config_gen_prompt("/home/user/my-project");
         assert!(prompt.contains("/home/user/my-project"));
         assert!(!prompt.contains("{dir}"));
+    }
+
+    #[test]
+    fn prompt_existing_config_is_read_and_updated_only_after_approval() {
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path().to_str().unwrap();
+        let original = config_gen_prompt(cwd);
+        assert_eq!(
+            original,
+            CONFIG_GEN_PROMPT_TEMPLATE
+                .replace("{dir}", cwd)
+                .replace("{roles}", &render_roles_section(role_library()))
+        );
+        let path = directory.path().join(".dot-agent-deck.toml");
+        std::fs::create_dir(&path).unwrap();
+        assert_eq!(
+            config_gen_prompt(cwd),
+            original,
+            "a directory is not a config file"
+        );
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, "# user-owned configuration\n").unwrap();
+        let update = config_gen_prompt(cwd);
+        assert!(
+            update != original,
+            "an existing file must change the request to an update"
+        );
+        assert!(
+            update.contains(path.to_str().unwrap()),
+            "name the exact existing file"
+        );
+        let words = update.to_lowercase();
+        for required in ["already exists", "read", "update", "preserve", "approval"] {
+            assert!(
+                words.contains(required),
+                "existing-config instructions must contain {required:?}"
+            );
+        }
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            config_gen_prompt(cwd),
+            original,
+            "check the file at compose time"
+        );
     }
 
     #[test]

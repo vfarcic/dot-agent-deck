@@ -2138,6 +2138,7 @@ impl DaemonClient {
                 .map(|id| AgentRecord {
                     input_held: None,
                     input_discarded: None,
+                    project_config_exists: None,
                     id,
                     pane_id_env: None,
                     display_name: None,
@@ -9147,6 +9148,7 @@ start = true
         let mut rec = AgentRecord {
             input_held: None,
             input_discarded: None,
+            project_config_exists: None,
             id: "9".into(),
             pane_id_env: None,
             display_name: Some(format!("de\x1bplo\u{202e}yer\0 {}", "\u{3bc}".repeat(400))),
@@ -9214,6 +9216,7 @@ start = true
         let mut rec = AgentRecord {
             input_held: None,
             input_discarded: None,
+            project_config_exists: None,
             id: "7".into(),
             pane_id_env: None,
             display_name: None,
@@ -9240,6 +9243,7 @@ start = true
         let mut ok = AgentRecord {
             input_held: None,
             input_discarded: None,
+            project_config_exists: None,
             id: "8".into(),
             pane_id_env: None,
             display_name: None,

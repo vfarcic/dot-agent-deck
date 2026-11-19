@@ -1106,6 +1106,13 @@ export interface AgentSession {
    */
   pullRequest?: AgentPullRequest;
   /**
+   * HONEST. PRD #2119 — whether this agent's project already holds a
+   * `.dot-agent-deck.toml`, as its daemon reported it. `true` makes Generate
+   * config read Update config; `false` and absent (no cwd, or a daemon that
+   * predates the field) keep Generate. Never computed by this app.
+   */
+  projectConfigExists?: boolean;
+  /**
    * HONEST. Issue #1678: background work still running after the agent's turn
    * ended, copied from the daemon's aggregate and validated at the bridge.
    * Rendering goes through `displayBackgroundWork`, which words it exactly as

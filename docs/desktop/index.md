@@ -27,7 +27,7 @@ The rail on the left has two entries, **Dashboard** and **Settings**, and the **
 | Open an agent's live terminal and type into it | Click its row on the Dashboard | [Dashboard → The agent pane](dashboard.md#the-agent-pane) |
 | Start an agent, an orchestration, a dispatcher or a schedule-authoring agent | **New agent** on the Dashboard, or `Ctrl+N` / `⌘N` | [New Agent](new-agent.md) |
 | Read an agent's pull request on GitHub, inside the app | The pull request badge on its row or in its pane | [Dashboard → Pull requests](dashboard.md#pull-requests) |
-| Have an agent write the project's `.dot-agent-deck.toml` | **Generate config** on its row or in its pane | [Dashboard → Generate a config with an agent](dashboard.md#generate-a-config-with-an-agent) |
+| Have an agent write or update the project's `.dot-agent-deck.toml` | **Generate config** (**Update config** when the project has one) on its row or in its pane | [Dashboard → Generate a config with an agent](dashboard.md#generate-a-config-with-an-agent) |
 | Stop an agent, or every role of an orchestration | The stop control on a row, **Close** on an orchestration | [Dashboard → Closing agents and orchestrations](dashboard.md#closing-agents-and-orchestrations) |
 | Watch a daemon on another machine over ssh | **Settings → Daemons** | [Daemons](daemons.md) |
 | Start a daemon that is not running, on this machine or a remote one | **Start daemon** on its section of the Dashboard | [Daemons → Start a daemon from the app](daemons.md#start-a-daemon-from-the-app) |

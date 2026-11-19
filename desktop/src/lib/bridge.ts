@@ -443,6 +443,12 @@ export interface DesktopAgentDto {
    */
   pullRequest?: PullRequestInfoDto;
   /**
+   * PRD #2119 — whether the agent's project already holds a
+   * `.dot-agent-deck.toml`, copied through from `AgentRecord`. Absent or null
+   * when the daemon did not say.
+   */
+  projectConfigExists?: boolean | null;
+  /**
    * The desktop crate's `DesktopTab` is structurally identical to the app
    * model's `AgentTab`, so the DTO reuses it and `agentFromDto` copies the
    * value through rather than flattening it to a role string. If the IPC shape
@@ -2839,6 +2845,8 @@ function agentFromDto(agent: DesktopAgentDto, index: number, daemonId: string): 
     ...(answerSettlements.length > 0 ? { answerSettlements } : {}),
     // PRD #1401 — the badge. Checked, not copied: see `pullRequestFromDto`.
     ...(pullRequest ? { pullRequest } : {}),
+    // PRD #2119 — only a boolean the daemon sent; anything else is unknown.
+    ...(typeof agent.projectConfigExists === "boolean" ? { projectConfigExists: agent.projectConfigExists } : {}),
     ...(background ? { background } : {}),
     rows: agent.rows,
     cols: agent.cols,

@@ -702,6 +702,7 @@ fn agent_record_round_trips_explicit_agent_type() {
     let rec = AgentRecord {
         input_held: None,
         input_discarded: None,
+        project_config_exists: None,
         id: "11".into(),
         pane_id_env: Some("pid-11".into()),
         display_name: Some("coder".into()),
@@ -732,6 +733,7 @@ fn agent_record_omits_agent_type_when_none() {
     let rec = AgentRecord {
         input_held: None,
         input_discarded: None,
+        project_config_exists: None,
         id: "12".into(),
         pane_id_env: None,
         display_name: None,
@@ -861,6 +863,7 @@ fn running_agents_summary_from_records_uses_display_name_then_id() {
         AgentRecord {
             input_held: None,
             input_discarded: None,
+            project_config_exists: None,
             id: "7".into(),
             pane_id_env: None,
             display_name: Some("coder".into()),
@@ -881,6 +884,7 @@ fn running_agents_summary_from_records_uses_display_name_then_id() {
         AgentRecord {
             input_held: None,
             input_discarded: None,
+            project_config_exists: None,
             id: "9".into(),
             pane_id_env: None,
             display_name: None,
@@ -2689,7 +2693,7 @@ fn config_generation_request(pane: &str, agent: &str) -> AttachRequest {
     .expect("the capability-gated generate-config request must decode")
 }
 
-/// Scenario: Ask the daemon to generate configuration for one of two live panes with different project directories. Only that pane receives a bound configuration request, whose complete body equals the prompt composed for its daemon-owned cwd.
+/// Scenario: Ask the daemon to generate configuration for one of two live panes with different project directories, then create a config before asking again. Only that pane receives the bound requests, and the second request names the existing file and asks to preserve and update it after approval.
 #[spec("daemon/config-gen/002")]
 #[tokio::test]
 async fn config_gen_002_daemon_posts_exact_prompt_for_target_cwd() {
@@ -2737,8 +2741,102 @@ async fn config_gen_002_daemon_posts_exact_prompt_for_target_cwd() {
         "the delivered body must equal the daemon-cwd prompt byte for byte"
     );
     assert!(text.contains("dot-agent-deck (configuration request)"));
+    let config = project.join(".dot-agent-deck.toml");
+    std::fs::write(&config, "# keep my custom settings\n").unwrap();
+    let mut stream = UnixStream::connect(&server.path).await.unwrap();
+    write_request(
+        &mut stream,
+        &config_generation_request("config-target", &target),
+    )
+    .await;
+    assert!(read_response(&mut stream).await.ok);
+    let rendered = server.registry.inbox().rendered("config-target");
+    let update = &rendered.last().unwrap().text;
+    assert!(
+        update.contains(config.to_str().unwrap()),
+        "the request must name the existing config file"
+    );
+    let words = update.to_lowercase();
+    for required in ["already exists", "read", "update", "preserve", "approval"] {
+        assert!(
+            words.contains(required),
+            "the update request must contain {required:?}"
+        );
+    }
+    assert!(server.registry.inbox().list("config-control").is_empty());
     server.registry.close_agent(&target).unwrap();
     server.registry.close_agent(&control).unwrap();
+}
+
+/// Scenario: List an agent while its project has no config, a config directory, and then a regular config file, with a parent config present throughout. The per-agent wire flag reflects only the exact cwd's regular file, and older records without the field remain readable with the field omitted.
+#[spec("daemon/config-gen/002")]
+#[tokio::test]
+async fn config_gen_002_records_report_exact_cwd_config_file() {
+    let server = start_server().await;
+    let project = server._dir.path().join("record-project");
+    std::fs::create_dir(&project).unwrap();
+    std::fs::write(
+        server._dir.path().join(".dot-agent-deck.toml"),
+        "# parent only\n",
+    )
+    .unwrap();
+    let mut request = serde_json::to_value(AttachRequest::StartAgent {
+        command: Some("cat".into()),
+        cwd: Some(project.to_str().unwrap().into()),
+        display_name: None,
+        rows: 24,
+        cols: 80,
+        env: vec![("DOT_AGENT_DECK_PANE_ID".into(), "config-record".into())],
+        tab_membership: None,
+        agent_type: Some(AgentType::Codex),
+        seed: None,
+        authoring_kind: None,
+        client_seeded_kind: None,
+        remember_command: false,
+    })
+    .unwrap();
+    let id = issue_json_request(&server, request.take())
+        .await
+        .id
+        .unwrap();
+    let config = project.join(".dot-agent-deck.toml");
+    for (kind, expected) in [
+        ("missing", false),
+        ("directory", false),
+        ("file", true),
+        ("removed", false),
+    ] {
+        match kind {
+            "directory" => std::fs::create_dir(&config).unwrap(),
+            "file" => {
+                std::fs::remove_dir(&config).unwrap();
+                std::fs::write(&config, "# user config\n").unwrap();
+            }
+            "removed" => std::fs::remove_file(&config).unwrap(),
+            _ => {}
+        }
+        let response = issue_json_request(&server, serde_json::json!({"op":"list-agents"})).await;
+        let record = response
+            .agent_records
+            .unwrap()
+            .into_iter()
+            .find(|record| record.id == id)
+            .unwrap();
+        let wire = serde_json::to_value(record).unwrap();
+        assert_eq!(
+            wire["project_config_exists"], expected,
+            "{kind}: daemon must report the exact cwd's config file"
+        );
+    }
+    let legacy: dot_agent_deck::agent_pty::AgentRecord =
+        serde_json::from_value(serde_json::json!({"id":"old"})).unwrap();
+    assert!(
+        serde_json::to_value(legacy)
+            .unwrap()
+            .get("project_config_exists")
+            .is_none()
+    );
+    server.registry.close_agent(&id).unwrap();
 }
 
 /// Scenario: Request config generation for an unknown pane and for a pane whose agent was replaced after selection. Both requests are refused and the replacement's inbox stays empty.

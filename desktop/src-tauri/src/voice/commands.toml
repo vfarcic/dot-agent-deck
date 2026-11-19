@@ -2307,8 +2307,11 @@ action_words = ["stop", "kill", "shut down", "shut it down", "end", "terminate"]
 id          = "generate_config"
 description = """Ask one agent to generate the project's orchestration config (`.dot-agent-deck.toml`) —
 the voice form of the agent's Generate config button on the agent dashboard and in the agent's
-pane. Use for generate config, generate a config with the tester, create the orchestration config,
-make a dot agent deck toml, have the coder write the project config. Set `agent` the way
+pane, which reads Update config when the project already has one. Use for generate config,
+generate a config with the tester, create the orchestration config, make a dot agent deck toml,
+have the coder write the project config, and its synonym update config (update config with the
+tester, update the orchestration config): both phrases are this row whichever label the button
+shows. Set `agent` the way
 `open_agent` does on the agent dashboard. On the agent screen it is always the viewed agent: leave
 `agent` empty there, and a request naming an agent gets the pane's own phrase. It never sends
 anything by itself: the app shows the same Yes/No confirmation the button shows and the user

@@ -883,6 +883,13 @@ pub struct DesktopAgent {
     /// no PR, or the daemon predates the field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pull_request: Option<dot_agent_deck::pull_request_info::PullRequestInfo>,
+    /// PRD #2119: whether this agent's project already holds a
+    /// `.dot-agent-deck.toml`, as the daemon reported it
+    /// ([`AgentRecord::project_config_exists`]). Absent when the daemon did
+    /// not say — no cwd, or a daemon predating the field — and the webview
+    /// then keeps the Generate wording. Copied through; never computed here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_config_exists: Option<bool>,
     pub tab: DesktopTab,
     /// PRD #1666 part 2 (G-fix4): the daemon process this row was listed by,
     /// which the webview sends back with every action on the agent
@@ -2649,6 +2656,7 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
         input_discarded,
         answer_settlements,
         pull_request,
+        project_config_exists: record.project_config_exists,
         tab,
         // Stamped by the snapshot that lists this record, which knows which
         // daemon process answered (`daemon_bridge::connected_snapshot`).
@@ -4567,6 +4575,7 @@ mod tests {
         AgentRecord {
             input_held: None,
             input_discarded: None,
+            project_config_exists: None,
             id: "agent-7".into(),
             pane_id_env: Some("pane-7".into()),
             display_name: Some("builder".into()),
@@ -4614,6 +4623,7 @@ mod tests {
         }
     }
 
+    /// Scenario: Map daemon records reporting an existing, absent, or unknown project config. The desktop receives the same optional boolean so remote agents can label the config action accurately.
     #[test]
     fn agent_mapping_is_frontend_stable() {
         let value = serde_json::to_value(map_agent(fixture_record())).unwrap();
@@ -4624,6 +4634,15 @@ mod tests {
         assert_eq!(value["status"], "working");
         assert_eq!(value["activeTool"]["name"], "shell");
         assert_eq!(value["tab"]["kind"], "mode");
+        for exists in [Some(false), Some(true), None] {
+            let mut wire = serde_json::to_value(fixture_record()).unwrap();
+            if let Some(exists) = exists {
+                wire["project_config_exists"] = serde_json::json!(exists);
+            }
+            let record = serde_json::from_value(wire).unwrap();
+            let mapped = serde_json::to_value(map_agent(record)).unwrap();
+            assert_eq!(mapped["projectConfigExists"], serde_json::json!(exists));
+        }
     }
 
     /// Scenario: Map a daemon record with queued and fetched messages into the desktop DTO; its inbox counts must survive for the card badge.

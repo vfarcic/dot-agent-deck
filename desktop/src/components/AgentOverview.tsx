@@ -65,6 +65,8 @@ export type OverviewAgent = Pick<
   | "pullRequest"
   /* PRD #1666 part 2 — sent back with a stop, so it reaches the daemon process that listed the agent. */
   | "incarnation" | "paneId"
+  /* PRD #2119 — Generate config reads Update config when the daemon says the project already has one. */
+  | "projectConfigExists"
 > & {
   /**
    * HONEST, and optional exactly as `AgentSession.cwd` is. It was optional here
@@ -91,7 +93,7 @@ export type OverviewAgent = Pick<
 };
 
 export function toOverviewAgent(agent: AgentSession): OverviewAgent {
-  const { id, daemonId, displayName, cli, status, cwd, activeTool, activeToolDetail, toolCount, tab, lastUserPrompt, lastActivityMs, spawnedAtMs, writeLease, agentType, daemonStatus, authoringKind, pullRequest, incarnation, paneId } = agent;
+  const { id, daemonId, displayName, cli, status, cwd, activeTool, activeToolDetail, toolCount, tab, lastUserPrompt, lastActivityMs, spawnedAtMs, writeLease, agentType, daemonStatus, authoringKind, pullRequest, incarnation, paneId, projectConfigExists } = agent;
   return {
     id,
     daemonId,
@@ -113,6 +115,7 @@ export function toOverviewAgent(agent: AgentSession): OverviewAgent {
     ...(pullRequest ? { pullRequest } : {}),
     ...(incarnation ? { incarnation } : {}),
     ...(paneId ? { paneId } : {}),
+    ...(projectConfigExists !== undefined ? { projectConfigExists } : {}),
   };
 }
 
@@ -921,6 +924,14 @@ export function stopAgentConfirmation(agent: OverviewAgent, connection: Connecti
 */
 export const GENERATE_CONFIG_TITLE = "Generate .dot-agent-deck.toml";
 export const GENERATE_CONFIG_BODY = "No orchestration config found for this project. Want to instruct your agent to analyze the project and create one?";
+/** PRD #2119 — the same question when the daemon reports the project already has a config: the TUI's words again. */
+export const UPDATE_CONFIG_TITLE = "Update .dot-agent-deck.toml";
+export const UPDATE_CONFIG_BODY = "This project already has an orchestration config. Want to instruct your agent to analyze the project and update the existing config?";
+
+/** PRD #2119 — the config action's verb: Update only when the daemon reported an existing config, else Generate (the TUI footer's `config_action_label`). */
+export function configActionVerb(agent: Pick<OverviewAgent, "projectConfigExists">): "Update" | "Generate" {
+  return agent.projectConfigExists === true ? "Update" : "Generate";
+}
 /** The agent offers no pane the daemon could post the request to. */
 export const GENERATE_CONFIG_NO_PANE = "That agent has no pane the daemon can send the request to, so nothing was sent.";
 /** Generate config's refusals for an agent that went away, in its own words: nothing was SENT, not closed. */
@@ -955,11 +966,12 @@ const latestGeneration = new Map<string, number>();
  * the app's backend included; an attempt superseded by a newer Yes for the same
  * agent is not reported.
  */
-export function generateConfigConfirmation(agent: Pick<OverviewAgent, "daemonId" | "id" | "paneId" | "incarnation">, paneId: string, generateConfig: NonNullable<DeckRuntimeState["generateConfig"]>, onAnswer: (result: GenerateConfigResult) => void): ConfirmState {
+export function generateConfigConfirmation(agent: Pick<OverviewAgent, "daemonId" | "id" | "paneId" | "incarnation" | "projectConfigExists">, paneId: string, generateConfig: NonNullable<DeckRuntimeState["generateConfig"]>, onAnswer: (result: GenerateConfigResult) => void): ConfirmState {
   const { daemonId, id, incarnation } = agent;
+  const update = configActionVerb(agent) === "Update";
   return {
-    title: GENERATE_CONFIG_TITLE,
-    body: GENERATE_CONFIG_BODY,
+    title: update ? UPDATE_CONFIG_TITLE : GENERATE_CONFIG_TITLE,
+    body: update ? UPDATE_CONFIG_BODY : GENERATE_CONFIG_BODY,
     label: "Yes",
     busyLabel: "Sending…",
     cancelLabel: "No",
@@ -3039,7 +3051,16 @@ function OverviewRow({ agent, hoistedCwd, now, columns }: { agent: OverviewAgent
               ><CircleStop size={12} /></button>
             )}
             {/* PRD #2119 — ask this agent to write the project's `.dot-agent-deck.toml`; it opens a Yes/No confirmation, the same one `generate_config` opens by voice. */}
-            {generateControls && agent.paneId && (
+            {/* Each label is written out whole, as the voice table's label check reads it (`voice_outcome_every_control_label_asks_for_its_own_row`); Update when the daemon reports the project already has a config. */}
+            {generateControls && agent.paneId && (configActionVerb(agent) === "Update" ? (
+              <button
+                className="overview-generate-config"
+                data-testid="overview-generate-config"
+                aria-label={`Update config with ${name} agent`}
+                title={`Update config with ${name}`}
+                onClick={() => VOICE_ACTIONS.confirmGenerateConfig.run(generateControls, { deckId: agent.daemonId, agentId: agent.id, from: "overview", ...(agent.incarnation ? { incarnation: agent.incarnation } : {}) })}
+              ><FileCog size={12} /></button>
+            ) : (
               <button
                 className="overview-generate-config"
                 data-testid="overview-generate-config"
@@ -3047,7 +3068,7 @@ function OverviewRow({ agent, hoistedCwd, now, columns }: { agent: OverviewAgent
                 title={`Generate config with ${name}`}
                 onClick={() => VOICE_ACTIONS.confirmGenerateConfig.run(generateControls, { deckId: agent.daemonId, agentId: agent.id, from: "overview", ...(agent.incarnation ? { incarnation: agent.incarnation } : {}) })}
               ><FileCog size={12} /></button>
-            )}
+            ))}
           </td>
         );
       case "lastActivityMs":

@@ -1423,7 +1423,7 @@ mod tests {
         );
     }
 
-    /// Scenario: Load the shipped voice command table and ask how to generate config for an agent. The command advertises generate config on the overview and agent screens, resolves an agent reference, and only opens the shared confirmation.
+    /// Scenario: Load the shipped voice command table and ask how to generate or update config for an agent. Both phrases describe the same command on the overview and agent screens, resolve an agent reference, and only open the shared confirmation.
     #[test]
     fn voice_table_config_gen_003_generation_is_agent_targeted_and_only_asks() {
         let row = super::table()
@@ -1441,6 +1441,10 @@ mod tests {
             }]
         );
         assert!(row.try_saying.contains("generate config"));
+        assert!(
+            row.description.contains("update config"),
+            "the shipped command must teach the update config synonym"
+        );
         assert!(
             row.report.contains("nothing has"),
             "opening confirmation must not claim delivery"

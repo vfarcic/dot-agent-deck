@@ -4316,6 +4316,17 @@ pub struct AgentRecord {
     /// Additive and optional, as [`Self::input_held`] is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_discarded: Option<crate::inbox_display::InputDiscarded>,
+    /// PRD #2119: whether [`Self::cwd`] holds a `.dot-agent-deck.toml` of its
+    /// own — a regular file at that exact directory, not one a walk up the
+    /// tree would discover, and not a directory or a symlink of that name
+    /// (the type refusals the project reader applies). Stamped at the wire
+    /// boundary by [`attach_project_config_exists`] with one `lstat` per
+    /// record, so each listing reads the disk as it is then. `None` when the
+    /// record has no cwd, or from a daemon predating the field: clients then
+    /// keep today's Generate wording. Additive and optional, so no
+    /// `PROTOCOL_VERSION` bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_config_exists: Option<bool>,
 }
 
 impl AgentRecord {
@@ -4367,6 +4378,18 @@ pub fn attach_prompt_keys(records: &mut [AgentRecord]) {
         record.prompt_keys = record
             .reported_agent_type()
             .and_then(|agent_type| crate::agent_registry::spec(agent_type).prompt_keys.clone());
+    }
+}
+
+/// PRD #2119: stamp each record's [`AgentRecord::project_config_exists`] from
+/// the disk now. Unconditional: a record without a cwd reports unknown rather
+/// than keeping what a caller had put there.
+pub fn attach_project_config_exists(records: &mut [AgentRecord]) {
+    for record in records {
+        record.project_config_exists = record
+            .cwd
+            .as_deref()
+            .map(crate::config_gen::project_config_exists);
     }
 }
 
@@ -18344,6 +18367,7 @@ impl AgentPtyRegistry {
             inbox: None,
             input_held: None,
             input_discarded: None,
+            project_config_exists: None,
         }
     }
 
@@ -18731,6 +18755,7 @@ impl AgentPtyRegistry {
                 inbox: None,
                 input_held: None,
                 input_discarded: None,
+                project_config_exists: None,
             })
             .collect();
         records.sort_by_key(|r| r.id.parse::<u64>().unwrap_or(0));
@@ -25907,6 +25932,7 @@ mod spawn_tests {
         AgentRecord {
             input_held: None,
             input_discarded: None,
+            project_config_exists: None,
             id: "1".into(),
             pane_id_env: None,
             display_name: None,
@@ -26157,6 +26183,7 @@ mod spawn_tests {
             inbox: None,
             input_held: None,
             input_discarded: None,
+            project_config_exists: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -31510,6 +31537,7 @@ mod spawn_tests {
             inbox: None,
             input_held: None,
             input_discarded: None,
+            project_config_exists: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();

@@ -6655,6 +6655,8 @@ async fn handle_connection(
             // PRD #1666 part 3 (Q35-20): held typing, after the live join,
             // whose snapshot carries it too.
             crate::agent_pty::attach_input_held(&registry, &mut records);
+            // PRD #2119: whether each agent's project already has a config.
+            crate::agent_pty::attach_project_config_exists(&mut records);
             let mut resp = AttachResponse::agent_records(records);
             resp.orchestration_roles = Some(orchestration_roles);
             // Issue #887: the client's only observable of the schedule seed the
@@ -9948,6 +9950,8 @@ async fn handle_subscribe_events_with_snapshot(
     // repeat 30 s after a pass a display notice woke, which corrects it
     // (R-E-U3-03, auditor U3-8).
     crate::agent_pty::attach_input_held(registry, &mut records);
+    // PRD #2119: as the `ListAgents` reply does.
+    crate::agent_pty::attach_project_config_exists(&mut records);
     let mut resp = AttachResponse::agent_records(records);
     // Issue #1637: read under the same guard as the receiver, so a notice
     // change is either in this reply or on the stream.
@@ -13048,6 +13052,7 @@ mod tests {
             inbox: None,
             input_held: None,
             input_discarded: None,
+            project_config_exists: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let back: AgentRecord = serde_json::from_str(&json).unwrap();
@@ -13075,6 +13080,7 @@ mod tests {
             inbox: None,
             input_held: None,
             input_discarded: None,
+            project_config_exists: None,
         };
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
@@ -13233,6 +13239,7 @@ mod tests {
         let rec = AgentRecord {
             input_held: None,
             input_discarded: None,
+            project_config_exists: None,
             id: "9".into(),
             pane_id_env: Some("pane-9".into()),
             display_name: None,
@@ -13641,6 +13648,7 @@ mod tests {
             inbox: None,
             input_held: None,
             input_discarded: None,
+            project_config_exists: None,
         };
         let value: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&rec).expect("serializes"))

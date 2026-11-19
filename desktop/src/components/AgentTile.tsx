@@ -37,7 +37,7 @@ import { blockedReasonText } from "../lib/blockedReason";
 import { attentionReason, inboxActionText, inboxBadge, inboxNotice, inputHeldText, INBOX_WORDS } from "../lib/inboxWords";
 import { displayBackgroundWork, displayUptime } from "../lib/displayText";
 import { agentTitle } from "../lib/agentNames";
-import { OVERVIEW_CLOCK_TICK_MS } from "./AgentOverview";
+import { configActionVerb, OVERVIEW_CLOCK_TICK_MS } from "./AgentOverview";
 import { OutputReader } from "./OutputReader";
 import { PullRequestBadge } from "./PullRequestBadge";
 import { OpenPullRequest } from "../lib/prBrowser";
@@ -646,14 +646,22 @@ export function AgentTile({
               onClick={onOpen}
             ><Maximize2 size={13} /></button>
           )}
-          {generateContext && (
+          {/* PRD #2119 — Update config when the daemon reports the project already has one; each label written out whole for the voice table's label check. */}
+          {generateContext && (configActionVerb(agent) === "Update" ? (
+            <button
+              className="agent-generate-config-control"
+              title="Update config"
+              onMouseDown={(event) => event.stopPropagation()}
+              onClick={() => VOICE_ACTIONS.confirmGenerateConfig.run(generateContext, { deckId: agent.daemonId, agentId: agent.id, incarnation: agent.incarnation, from: "overview" })}
+            ><FileCog size={14} aria-hidden="true" /> Update config</button>
+          ) : (
             <button
               className="agent-generate-config-control"
               title="Generate config"
               onMouseDown={(event) => event.stopPropagation()}
               onClick={() => VOICE_ACTIONS.confirmGenerateConfig.run(generateContext, { deckId: agent.daemonId, agentId: agent.id, incarnation: agent.incarnation, from: "overview" })}
             ><FileCog size={14} aria-hidden="true" /> Generate config</button>
-          )}
+          ))}
           {stopContext && (
             <button
               className="agent-stop-control"

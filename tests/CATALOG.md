@@ -1324,6 +1324,8 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 - **Does not assert:** successful delivery (covered by `inbox/route/007`) or the shared-client capability gate (`daemon/config-gen/004`).
 - **Platform coverage:** mac+linux.
 
+The L1 `config_gen_001_existing_config_labels_footer_and_confirmation_update` in `src/ui.rs` also renders a daemon-hydrated card for absent, false, and true `project_config_exists` values, presses `g`, and checks the Generate/Update footer, dialog title, neutral Yes/No choices and existing-config question. The true case has an insta snapshot; no client-local filesystem inference is used.
+
 ##### dashboard/config-gen/002 — Existing disabled automatic-prompt settings and recorded Never state remain readable.
 - **Layer:** pure-data, fast tier.
 - **Agent:** none.
@@ -2315,8 +2317,8 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 ##### daemon/config-gen/002 — The daemon composes the exact config request for the selected pane's own directory.
 - **Layer:** protocol, fast tier.
 - **Agent:** none (in-process daemon with cat panes).
-- **Asserts:** one request reaches the target's current agent; its complete body equals `config_gen_prompt` for the daemon's target cwd, and another pane receives nothing.
-- **Test:** `config_gen_002_daemon_posts_exact_prompt_for_target_cwd` in `tests/daemon_protocol.rs`.
+- **Asserts:** one request reaches the target's current agent; its complete body equals `config_gen_prompt` for the daemon's target cwd, and another pane receives nothing. Creating a config before the next request switches it to read/preserve/update/approval instructions naming the exact file; ListAgents reports a fresh optional `project_config_exists` boolean for regular files in the exact cwd, excluding parent configs and directories. Older records omit the unknown flag on serialization.
+- **Tests:** `config_gen_002_daemon_posts_exact_prompt_for_target_cwd` and `config_gen_002_records_report_exact_cwd_config_file` in `tests/daemon_protocol.rs`; `prompt_existing_config_is_read_and_updated_only_after_approval` in `src/config_gen.rs` checks the compose-time prompt variant and unchanged non-file controls.
 - **Does not assert:** real-model compliance or UI confirmation (`inbox/route/007`).
 - **Platform coverage:** mac+linux.
 
@@ -15656,6 +15658,7 @@ These desktop Rust and Vitest tests live outside the root Rust spec scanner, as 
 - **Layer:** fast-tier Rust socket tests and Vitest bridge tests.
 - **Agent:** none (scripted daemon).
 - **Tests:** `config_gen_001_desktop_routes_to_the_owner_and_maps_every_outcome`, `config_gen_001_desktop_refuses_a_restarted_target`, and `config_gen_001_desktop_timeout_uses_the_shared_client_failure_sentence` in `desktop/src-tauri/src/dto.rs`; `desktop/config-gen/001: …` in `desktop/src/lib/bridgeIncarnation.test.ts`.
+- **Optional field:** `agent_mapping_is_frontend_stable` in `desktop/src-tauri/src/dto.rs` also checks that daemon `project_config_exists` true/false/unknown maps to desktop `projectConfigExists` without losing the distinction.
 - **Asserts:** a named agent's request carries its pane and expected agent identity to its owning daemon even when another daemon is selected; sent, unsupported and failed outcomes use the shared crate strings; a silent daemon returns the same client timeout sentence as the TUI without a success claim; an old daemon receives no fallback and a successor process receives no acting request; IPC carries deck, agent, pane and incarnation.
 - **Does not assert:** real agents or native webview rendering.
 - **Platform coverage:** Rust socket test on Unix; Vitest on mac+linux+windows.
@@ -15664,6 +15667,7 @@ These desktop Rust and Vitest tests live outside the root Rust spec scanner, as 
 - **Layer:** Vitest, rendered React components with an injected runtime.
 - **Agent:** none.
 - **Tests:** `desktop/config-gen/002: …` in `desktop/src/components/AgentOverviewStop.test.tsx` and `desktop/src/lib/voiceActions.test.ts`.
+- **Existing config:** the row's accessible label and tooltip, pane-header control, confirmation title and question use Update for `projectConfigExists: true`; false and unknown retain Generate. No remains inert and Yes retains the shared outcome message.
 - **Asserts:** action on the overview row and open agent pane; TUI title and explanation; Yes/No only without destructive styling; No sends nothing; Yes preserves the captured binding, focuses the sent target and shows success; unsupported/failure show their shared text without claiming success; dismissing a pending generation and opening another agent preserves the user's navigation when success arrives late, both from the overview and from an already-open pane; an older failure cannot overwrite a newer success on either entry path; a late result for an old incarnation cannot appear in a reused agent ID's successor pane.
 - **Does not assert:** Tauri transport (covered by desktop/config-gen/001), real agents or a TUI-style desktop command-key layer (none exists).
 - **Platform coverage:** mac+linux+windows.
@@ -15672,6 +15676,7 @@ These desktop Rust and Vitest tests live outside the root Rust spec scanner, as 
 - **Layer:** fast-tier Rust voice-table/outcome tests and Vitest shell/registry tests.
 - **Agent:** none (synthetic voice resolution).
 - **Tests:** `voice_table_config_gen_003_generation_is_agent_targeted_and_only_asks` in `desktop/src-tauri/src/voice/table.rs`; `voice_outcome_config_gen_003_named_pane_requests_give_stop_style_guidance` and `voice_outcome_config_gen_003_private_names_allow_only_the_viewed_agent` in `desktop/src-tauri/src/voice/outcome.rs`; `desktop/config-gen/003: …` in `desktop/src/components/VoiceAgentBinding.test.tsx` and `desktop/src/lib/voiceActions.test.ts`, plus the latter's literal registry classification test.
+- **Update synonym:** shipped command descriptions advertise “update config”; nameless private pane requests resolve locally for both verbs; named dashboard requests reach `confirmGenerateConfig` for either verb. Vitest opens Generate/Update confirmations from either voice phrase regardless of the displayed label.
 - **Asserts:** `generate_config` names `confirmGenerateConfig`, is agent-targeted on overview/agent screens and advertises “generate config”; the registry is voice-enabled; both the control and voice dispatch open the Yes/No confirmation without sending work; naming another live agent in a pane gives stop-style guidance without confirming or sending; with names withheld, a bare pane request dispatches with no parameters and confirms the viewed process, while the dashboard still requires a target and explicit names cannot silently target the viewed agent; delayed nameless bare/model-resolved requests cannot open a confirmation or send work after a pane switch, and the voice report gives the stop-style refusal, while an unchanged pane still confirms and sends to the original agent; component tests also cover a daemon restart and same-process agent replacement during resolution.
 - **Does not assert:** real microphone capture, transcription or model intent classification.
 - **Platform coverage:** mac+linux+windows.

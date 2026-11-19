@@ -2281,6 +2281,10 @@ struct UiState {
     /// prompt opened. The request names it, so an agent that replaced it
     /// before the user confirmed receives nothing (PRD #2119 review).
     config_gen_agent: Option<String>,
+    /// PRD #2119: whether the daemon reported, when the config-gen prompt
+    /// opened, that the card's project already has a `.dot-agent-deck.toml`,
+    /// so the prompt reads Update rather than Generate.
+    config_gen_update: bool,
     /// Selected option index in the config-gen modal (0=Yes, 1=No).
     config_gen_selected: usize,
     /// Selected option in quit confirm modal (0=Detach, 1=Stop, 2=Cancel).
@@ -2738,6 +2742,7 @@ impl UiState {
             star_prompt_state: config::StarPromptState::default(),
             config_gen_target: None,
             config_gen_agent: None,
+            config_gen_update: false,
             config_gen_selected: 0,
             quit_confirm_selected: 0,
             close_confirm: CloseConfirmState::default(),
@@ -12088,6 +12093,7 @@ fn dispatch_action(
             {
                 ui.config_gen_target = Some(card);
                 ui.config_gen_agent = session.agent_id.clone();
+                ui.config_gen_update = snapshot.project_config_exists(session) == Some(true);
                 ui.config_gen_selected = 0;
                 ui.mode = UiMode::ConfigGenPrompt;
             } else {
@@ -18855,7 +18861,11 @@ fn render_frame(
                 );
             }
         }
-        let ctx_buttons = dashboard_context_buttons(&ui.keybindings, !filtered.is_empty());
+        let ctx_buttons = dashboard_context_buttons(
+            &ui.keybindings,
+            !filtered.is_empty(),
+            config_action_label(state, ui, filtered),
+        );
         render_bottom_bar(frame, ui, hints_area, has_pane_control, &ctx_buttons);
 
         if let Some(right) = panes_area {
@@ -18922,7 +18932,11 @@ fn render_frame(
 
             render_stats_bar(frame, &state.aggregate_stats(), vertical[2]);
         }
-        let ctx_buttons = dashboard_context_buttons(&ui.keybindings, !filtered.is_empty());
+        let ctx_buttons = dashboard_context_buttons(
+            &ui.keybindings,
+            !filtered.is_empty(),
+            config_action_label(state, ui, filtered),
+        );
         render_bottom_bar(frame, ui, hints_area, has_pane_control, &ctx_buttons);
         // Still render live terminal panes even when filter matches zero sessions.
         if let Some(right) = panes_area {
@@ -18965,7 +18979,11 @@ fn render_frame(
     }
 
     // Full-width hints bar
-    let ctx_buttons = dashboard_context_buttons(&ui.keybindings, !filtered.is_empty());
+    let ctx_buttons = dashboard_context_buttons(
+        &ui.keybindings,
+        !filtered.is_empty(),
+        config_action_label(state, ui, filtered),
+    );
     render_bottom_bar(frame, ui, hints_area, has_pane_control, &ctx_buttons);
 
     // Render terminal panes on the right side
@@ -19156,6 +19174,7 @@ fn draw_modal(frame: &mut Frame, area: Rect, ui: &mut UiState) {
             frame,
             area,
             ui.config_gen_selected,
+            ui.config_gen_update,
         ));
     }
     if ui.mode == UiMode::QuitConfirm {
@@ -20552,7 +20571,15 @@ fn global_bar_buttons(
 /// shortcut. Filter is always actionable; Rename / Generate-config act on the
 /// selected card, so they're disabled (dimmed) when there are no cards —
 /// matching the keys' `total > 0` guard.
-fn dashboard_context_buttons(keybindings: &KeybindingConfig, has_cards: bool) -> Vec<Button> {
+///
+/// PRD #2119: `config_label` is the selected card's config action — `Update`
+/// when the daemon reported its project already has a config, else
+/// `Generate` ([`config_action_label`]). Same key, same action either way.
+fn dashboard_context_buttons(
+    keybindings: &KeybindingConfig,
+    has_cards: bool,
+    config_label: &'static str,
+) -> Vec<Button> {
     let mut buttons = vec![
         Button::new(
             "Filter",
@@ -20567,7 +20594,7 @@ fn dashboard_context_buttons(keybindings: &KeybindingConfig, has_cards: bool) ->
             has_cards,
         ),
         Button::new(
-            "Generate",
+            config_label,
             button_shortcut_label(keybindings, KbAction::GenerateConfig),
             Action::RequestConfigGen,
             has_cards,
@@ -20592,6 +20619,29 @@ fn dashboard_context_buttons(keybindings: &KeybindingConfig, has_cards: bool) ->
         true,
     ));
     buttons
+}
+
+/// PRD #2119: the footer's config action when the selected card's project
+/// has no config, or the daemon has not said.
+const CONFIG_ACTION_GENERATE: &str = "Generate";
+
+/// PRD #2119: the footer label of the selected card's config action — `Update`
+/// when the daemon reported that its project already has a
+/// `.dot-agent-deck.toml`, else [`CONFIG_ACTION_GENERATE`]. The card is the one
+/// `g` acts on ([`dashboard_focus_target`]).
+fn config_action_label(
+    state: &AppState,
+    ui: &UiState,
+    filtered: &[(&String, &SessionState)],
+) -> &'static str {
+    let exists = dashboard_focus_target(ui, filtered.len())
+        .and_then(|i| filtered.get(i))
+        .and_then(|(_, session)| state.project_config_exists(session));
+    if exists == Some(true) {
+        "Update"
+    } else {
+        CONFIG_ACTION_GENERATE
+    }
 }
 
 /// PRD #144 — greedy line-wrap for the bottom button bar. Lay the buttons out
@@ -20858,7 +20908,13 @@ fn bottom_bar_rows(ui: &UiState, width: u16, frame_height: u16) -> u16 {
         _ if ui.status_message.is_some() => 1,
         _ => {
             let mut buttons = global_bar_buttons(&ui.keybindings, ui.mode, true);
-            buttons.extend(dashboard_context_buttons(&ui.keybindings, true));
+            // PRD #2119: reserved for `Generate`, the longer of the two
+            // config labels, so an `Update` bar never needs more rows.
+            buttons.extend(dashboard_context_buttons(
+                &ui.keybindings,
+                true,
+                CONFIG_ACTION_GENERATE,
+            ));
             let widths: Vec<u16> = buttons
                 .iter()
                 .map(|b| b.display_label().chars().count() as u16)
@@ -21899,7 +21955,12 @@ fn render_star_prompt(frame: &mut Frame, area: Rect) -> ConfirmDrawing {
     }
 }
 
-fn render_config_gen_prompt(frame: &mut Frame, area: Rect, selected: usize) -> ConfirmDrawing {
+fn render_config_gen_prompt(
+    frame: &mut Frame,
+    area: Rect,
+    selected: usize,
+    update: bool,
+) -> ConfirmDrawing {
     let popup_width = 60u16.min(area.width.saturating_sub(4));
     let popup_height = CONFIG_GEN_CONFIRM.popup_height(0, area);
     let x = (area.width.saturating_sub(popup_width)) / 2;
@@ -21908,18 +21969,42 @@ fn render_config_gen_prompt(frame: &mut Frame, area: Rect, selected: usize) -> C
 
     frame.render_widget(Clear, popup_area);
 
-    let options = [
-        ("Yes", "generate config for this project"),
-        ("No", "skip for now"),
-    ];
+    // PRD #2119: Update when the daemon reported that the project already
+    // has a config — the request it composes then says so. The same words
+    // as the desktop's dialog (CLAUDE.md rule 22).
+    let (verb, question) = if update {
+        (
+            "Update",
+            [
+                "  This project already has an orchestration config.",
+                "  Want to instruct your agent to analyze the",
+                "  project and update the existing config?",
+            ],
+        )
+    } else {
+        (
+            "Generate",
+            [
+                "  No orchestration config found for this",
+                "  project. Want to instruct your agent to",
+                "  analyze the project and create one?",
+            ],
+        )
+    };
+    let yes = if update {
+        "update config for this project"
+    } else {
+        "generate config for this project"
+    };
+    let options = [("Yes", yes), ("No", "skip for now")];
 
-    let mut text = vec![
-        Line::from(""),
-        Line::styled("  No orchestration config found for this", text_primary()),
-        Line::styled("  project. Want to instruct your agent to", text_primary()),
-        Line::styled("  analyze the project and create one?", text_primary()),
-        Line::from(""),
-    ];
+    let mut text = vec![Line::from("")];
+    text.extend(
+        question
+            .iter()
+            .map(|line| Line::styled(*line, text_primary())),
+    );
+    text.push(Line::from(""));
 
     for (i, (label, desc)) in options.iter().enumerate() {
         let cursor = if i == selected { ">" } else { " " };
@@ -21947,7 +22032,7 @@ fn render_config_gen_prompt(frame: &mut Frame, area: Rect, selected: usize) -> C
     ));
 
     let block = Block::default()
-        .title(" Generate .dot-agent-deck.toml ")
+        .title(format!(" {verb} .dot-agent-deck.toml "))
         .title_style(
             Style::default()
                 .fg(Color::Cyan)
@@ -26193,7 +26278,7 @@ pub fn render_config_gen_prompt_to_buffer(
 ) -> ratatui::buffer::Buffer {
     draw_to_buffer(width, height, |frame| {
         let frame_area = frame.area();
-        render_config_gen_prompt(frame, frame_area, selected);
+        render_config_gen_prompt(frame, frame_area, selected, false);
     })
 }
 
@@ -26829,7 +26914,7 @@ pub fn render_button_bar_with_bindings_to_buffer(
     let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
     // Seam renders the full global+context bar (including the always-on
     // Schedules button) so every remappable label is exercised.
-    let ctx_buttons = dashboard_context_buttons(keybindings, true);
+    let ctx_buttons = dashboard_context_buttons(keybindings, true, CONFIG_ACTION_GENERATE);
     let mut ui = UiState::new(DashboardConfig::default(), keybindings.clone());
     terminal
         .draw(|frame| {
@@ -26873,7 +26958,7 @@ pub fn render_button_bar_for_mode_to_buffer(
 
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
-    let ctx_buttons = dashboard_context_buttons(keybindings, true);
+    let ctx_buttons = dashboard_context_buttons(keybindings, true, CONFIG_ACTION_GENERATE);
     let mut ui = UiState::new(DashboardConfig::default(), keybindings.clone());
     ui.mode = mode;
     terminal
@@ -46846,7 +46931,11 @@ mod tests {
     /// Draw one full dashboard frame for `state` / `ui` into a 100x24
     /// `TestBackend` and return every row, right-trimmed.
     fn glossary_frame_rows(state: &AppState, ui: &mut UiState) -> Vec<String> {
-        let backend = TestBackend::new(100, 24);
+        glossary_frame_rows_at_width(state, ui, 100)
+    }
+
+    fn glossary_frame_rows_at_width(state: &AppState, ui: &mut UiState, width: u16) -> Vec<String> {
+        let backend = TestBackend::new(width, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let filtered = filter_sessions(state, ui);
         terminal
@@ -47184,6 +47273,7 @@ mod tests {
         let record = crate::agent_pty::AgentRecord {
             input_held: None,
             input_discarded: None,
+            project_config_exists: None,
             id: agent_id.to_string(),
             pane_id_env: Some(pane_id.to_string()),
             display_name: Some(name.to_string()),
@@ -50112,6 +50202,80 @@ mod tests {
                 Some("s-first"),
                 "Enter targets the new agent"
             );
+        }
+    }
+
+    /// Scenario: Refresh a dashboard card from daemon records with existing, absent, or unknown config state and press g. The footer and neutral Yes/No dialog say Update only when the daemon reports an existing file, retaining the same keyboard shortcut.
+    #[spec("dashboard/config-gen/001")]
+    #[test]
+    fn config_gen_001_existing_config_labels_footer_and_confirmation_update() {
+        for exists in [None, Some(false), Some(true)] {
+            let mut record = serde_json::json!({
+                "id": "config-label-agent", "pane_id_env": "config-label-pane",
+                "cwd": "/project-on-the-daemon"
+            });
+            if let Some(exists) = exists {
+                record["project_config_exists"] = serde_json::json!(exists);
+            }
+            let mut snapshot = AppState::default();
+            let records = [serde_json::from_value(record).unwrap()];
+            snapshot.card_unseen_agents(&records);
+            snapshot.resync_after_event_gap(&records);
+            let selected = snapshot.sessions.keys().next().unwrap().clone();
+            let mut ui = default_ui();
+            let footer = glossary_frame_rows_at_width(&snapshot, &mut ui, 220).join("\n");
+            let verb = if exists == Some(true) {
+                "Update"
+            } else {
+                "Generate"
+            };
+            assert!(
+                footer.contains(&format!("[{verb} g]")),
+                "existing={exists:?}: footer must offer {verb} on g:\n{footer}"
+            );
+            let state: SharedState = Arc::new(tokio::sync::RwLock::new(snapshot.clone()));
+            let pc = Arc::new(OpenTabPC::new());
+            let mut tabs = TabManager::new(pc.clone());
+            let filtered: Vec<_> = snapshot.sessions.iter().collect();
+            handle_key_event(
+                KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+                &mut ui,
+                &*pc,
+                &state,
+                &mut tabs,
+                &snapshot,
+                &filtered,
+                Rect::new(0, 0, 220, 24),
+            );
+            assert_eq!(
+                ui.mode,
+                UiMode::ConfigGenPrompt,
+                "g opens the same confirmation for {selected}"
+            );
+            let dialog = glossary_frame_rows_at_width(&snapshot, &mut ui, 220).join("\n");
+            assert!(
+                dialog.contains(&format!("{verb} .dot-agent-deck.toml")),
+                "existing={exists:?}: dialog title must say {verb}:\n{dialog}"
+            );
+            for label in ["[Yes]", "[No]"] {
+                assert!(
+                    dialog.contains(label),
+                    "neutral confirmation must offer {label}:\n{dialog}"
+                );
+            }
+            if exists == Some(true) {
+                assert!(
+                    dialog.contains("update the existing config"),
+                    "ask to update the user's config:\n{dialog}"
+                );
+                assert!(!dialog.contains("No orchestration config found"));
+                insta::assert_snapshot!("config_generation_update_confirmation", dialog);
+            } else {
+                assert!(
+                    dialog.contains("create one?"),
+                    "keep the existing Generate question:\n{dialog}"
+                );
+            }
         }
     }
 

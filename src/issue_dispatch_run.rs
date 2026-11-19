@@ -5892,6 +5892,7 @@ mod tests {
         AgentRecord {
             input_held: None,
             input_discarded: None,
+            project_config_exists: None,
             id: "a1".into(),
             pane_id_env: None,
             display_name: None,

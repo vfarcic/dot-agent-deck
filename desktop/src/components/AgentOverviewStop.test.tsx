@@ -87,14 +87,23 @@ describe("desktop/config-gen/002: generating configuration from an agent", () =>
     expect(screen.getByText(sent)).toBeVisible();
   });
 
-  /** Scenario: Ask the remote planner to generate a project config. The neutral confirmation uses the TUI's title and explanation and only Yes/No; No closes it without sending or opening the agent. */
-  it("offers a neutral Yes/No confirmation and No sends nothing", () => {
+  /** Scenario: Ask the remote planner to create or update a config, including an older daemon with unknown file state. Its row and neutral Yes/No confirmation say Update only for an existing file; No sends nothing. */
+  it.each([undefined, false, true])("offers a neutral Yes/No confirmation and No sends nothing (existing config: %s)", (exists) => {
     const { rt, generateConfig } = generation();
+    rt.fleet = rt.fleet.map((deck) => ({ ...deck, agents: deck.agents.map((agent) => ({ ...agent, projectConfigExists: exists })) }));
     const navigate = vi.fn();
     render(<AgentOverview runtime={rt} onNavigate={navigate} />);
-    open();
-    const dialog = screen.getByRole("alertdialog", { name: title });
-    expect(dialog).toHaveTextContent("No orchestration config found for this project. Want to instruct your agent to analyze the project and create one?");
+    const verb = exists ? "Update" : "Generate";
+    const button = within(row(FIXTURE_REMOTE_DAEMON_ID, "41")).getByRole("button", { name: `${verb} config with planner agent` });
+    expect(button).toHaveAttribute("title", `${verb} config with planner`);
+    fireEvent.click(button);
+    const dialog = screen.getByRole("alertdialog", { name: `${verb} .dot-agent-deck.toml` });
+    if (exists) {
+      expect(dialog).toHaveTextContent(/instruct your agent to analyze the project and update the existing config/i);
+      expect(dialog).not.toHaveTextContent("No orchestration config found");
+    } else {
+      expect(dialog).toHaveTextContent("No orchestration config found for this project. Want to instruct your agent to analyze the project and create one?");
+    }
     expect(within(dialog).getAllByRole("button").map((button) => button.textContent).sort()).toEqual(["No", "Yes"]);
     expect(dialog.querySelector(".danger, .danger-icon")).toBeNull();
     fireEvent.click(within(dialog).getByRole("button", { name: "No" }));

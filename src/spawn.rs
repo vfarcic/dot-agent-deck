@@ -4641,6 +4641,7 @@ mod tests {
         crate::agent_pty::AgentRecord {
             input_held: None,
             input_discarded: None,
+            project_config_exists: None,
             id: "7".into(),
             pane_id_env: pane_id.map(str::to_string),
             display_name: display_name.map(str::to_string),
