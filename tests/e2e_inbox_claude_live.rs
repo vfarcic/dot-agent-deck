@@ -202,10 +202,7 @@ impl Claude {
     }
 
     fn composer(&self) -> Option<String> {
-        if self
-            .pane_grid()
-            .contains("Your conversation moved to the background")
-        {
+        if overview_open(&self.pane_grid()) {
             return None;
         }
         self.pane_grid().lines().rev().find_map(|row| {
@@ -951,6 +948,15 @@ fn empty_editor_fallback(label: &str, erase_draft: bool) {
     );
 }
 
+/// Whether Claude Code's background-session overview is on screen. Its
+/// banner read "Your conversation moved to the background" through 2.1.328
+/// and "Your session moved to the background" from 2.1.329.
+fn overview_open(grid: &str) -> bool {
+    ["conversation", "session"]
+        .iter()
+        .any(|what| grid.contains(&format!("Your {what} moved to the background")))
+}
+
 /// Scenario: Complete a fallback task in interactive Haiku, then press Left in its empty composer to open the background-session overview and queue another task. For five seconds the input row must remain exactly empty with unchanged captured input bytes, the task queued and zero deliveries. This is a GREEN regression guard on the part-3 head because navigation sets the draft bit; after the fix the unrecognised overview must still hold delivery.
 #[spec("inbox/doorbell/010")]
 #[test]
@@ -981,9 +987,9 @@ fn doorbell_010_live_left_opens_overview_and_the_line_is_not_typed_there() {
     let before_left = input();
     claude.deck.send_keys(b"\x1b[D");
     assert!(
-        common::wait_until(Duration::from_secs(10), || claude
-            .pane_grid()
-            .contains("Your conversation moved to the background")),
+        common::wait_until(Duration::from_secs(10), || overview_open(
+            &claude.pane_grid()
+        )),
         "Left must open the overview; {}",
         claude.evidence()
     );
@@ -1033,7 +1039,7 @@ fn doorbell_010_live_left_opens_overview_and_the_line_is_not_typed_there() {
                     || line.contains("doorbell sent its cleanup CR")
                     || line.contains("pane_write:")
             })
-            || !grid.contains("Your conversation moved to the background")
+            || !overview_open(&grid)
             || claude.deck.workdir().join(name).exists()
             || message["state"] != "queued"
             || message["deliveries"] != 0;
