@@ -517,7 +517,11 @@ fn plain_dashboard_shows(grid: &str, labels: &[&str]) -> bool {
         && grid
             .lines()
             .any(|line| line.starts_with(" COMMAND  [Back to Pane d/Ctrl+D]"))
-        && grid.contains("[Filter /] [Rename r] [Generate g] [Schedules s]")
+        // Each context button on its own: where the bar wraps depends on how
+        // many buttons precede them (PRD #312 removed one), not on this test.
+        && ["[Filter /]", "[Rename r]", "[Generate g]", "[Schedules s]"]
+            .iter()
+            .all(|button| grid.contains(button))
 }
 
 /// Send the plain `StartAgent` shape built by the desktop action. The explicit
