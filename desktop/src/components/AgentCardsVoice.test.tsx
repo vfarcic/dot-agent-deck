@@ -117,7 +117,7 @@ function settingsStore() {
 }
 
 /** The real shell on the dashboard, a daemon list with one card per fixture agent, and one utterance resolved to `outcome`. */
-function renderSpoken(outcome: VoiceResultDto["outcome"]) {
+function renderSpoken(outcome: VoiceResultDto["outcome"], { secondDeck }: { secondDeck?: string } = {}) {
   let started = false;
   let delivered = false;
   const status = (state: VoiceStatusDto["state"]): VoiceStatusDto => ({ state, capturedMs: 900, maxMs: 30_000, capped: false, available: true, backend: "remote" });
@@ -131,7 +131,7 @@ function renderSpoken(outcome: VoiceResultDto["outcome"]) {
     mode: "fixture",
     desktopFeatures: fixtureDesktopFeatures("?experimental=1"),
     snapshot,
-    fleet: [snapshot],
+    fleet: secondDeck === undefined ? [snapshot] : [snapshot, { ...snapshot, connection: { ...snapshot.connection, deckId: secondDeck, socketPath: "deploy@build-box" } }],
     terminalData: {},
     clearError: vi.fn(),
     ...approvedProjectTrust(),
@@ -145,7 +145,10 @@ function renderSpoken(outcome: VoiceResultDto["outcome"]) {
     setZoom: vi.fn(async (level: number) => level),
     getSettings: settings.getSettings,
     saveSettings: settings.saveSettings,
-    agentCards: { [FIXTURE_DAEMON_ID]: { deckId: FIXTURE_DAEMON_ID, instanceId: INSTANCE, revision: 3, entries: [card], catalogErrors: [] } },
+    agentCards: {
+      [FIXTURE_DAEMON_ID]: { deckId: FIXTURE_DAEMON_ID, instanceId: INSTANCE, revision: 3, entries: [card], catalogErrors: [] },
+      ...(secondDeck === undefined ? {} : { [secondDeck]: { deckId: secondDeck, instanceId: "build-instance", revision: 1, entries: [card], catalogErrors: [] } }),
+    },
     invokeCardAction,
     resolveVoice,
     voiceStatus: vi.fn(async () => {
@@ -165,11 +168,11 @@ async function speak(resolveVoice: ReturnType<typeof vi.fn>) {
   await waitFor(() => expect(resolveVoice).toHaveBeenCalledTimes(1));
 }
 
-function runCardAction(agentId: string, label: string, transcript: string): VoiceResultDto["outcome"] {
+function runCardAction(agentId: string, label: string, transcript: string, deckId?: string): VoiceResultDto["outcome"] {
   return {
     kind: "dispatch", transcript, action: "run_card_action", invoke: "runCardAction",
     params: [
-      { name: "agent", kind: "agent_ref", spoken: "the voice card agent", value: agentId, label: "voice-card-agent" },
+      { name: "agent", kind: "agent_ref", spoken: "the voice card agent", value: agentId, label: "voice-card-agent", ...(deckId === undefined ? {} : { deckId }) },
       { name: "action", kind: "card_action", spoken: label, value: label, label },
     ],
     sentence: `Pressed ${label} on voice-card-agent's card.`,
@@ -240,6 +243,15 @@ describe("desktop/agent-cards/008 — the cards by voice (PRD #2374)", () => {
     await waitFor(() => expect(invokeCardAction).toHaveBeenCalledTimes(1));
     expect(invokeCardAction).toHaveBeenCalledWith({ deckId: FIXTURE_DAEMON_ID, instanceId: INSTANCE, paneId: `pane-${agentId}`, agentId }, "go-ahead", expect.objectContaining({ requestId: expect.any(String) }));
     expect((invokeCardAction.mock.calls[0][2] as { confirm?: boolean }).confirm).not.toBe(true);
+  });
+
+  /// Scenario: with two daemons on the dashboard, each with an agent of the same id, say "press go ahead on the voice card agent's card on build box"; voice resolved the agent on the build box. Exactly that action of the build box's card is sent, to the build box, and nothing to this machine's agent of the same id.
+  it("desktop/agent-cards/008: a spoken action on another daemon's card is sent to that daemon", async () => {
+    const agentId = createFixtureSnapshot("connected").agents[0].id;
+    const { invokeCardAction, resolveVoice } = renderSpoken(runCardAction(agentId, "Go ahead", "press go ahead on the voice card agent's card on build box", "deck-build"), { secondDeck: "deck-build" });
+    await speak(resolveVoice);
+    await waitFor(() => expect(invokeCardAction).toHaveBeenCalledTimes(1));
+    expect(invokeCardAction).toHaveBeenCalledWith(expect.objectContaining({ deckId: "deck-build", agentId }), "go-ahead", expect.objectContaining({ requestId: expect.any(String) }));
   });
 
   /// Scenario: say "press re-run tests on the voice card agent's card", an action whose text the agent wrote. The card's overlay opens at its review step showing that exact text, the voice row says why, and nothing is sent until Send is pressed, which sends it once.

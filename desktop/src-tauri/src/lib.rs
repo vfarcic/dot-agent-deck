@@ -3755,6 +3755,7 @@ async fn desktop_voice_resolve(
         .unwrap_or_default();
     let resolver = voice::resolver_for(&settings.intent, Arc::new(KeychainSecretStore::new()));
     let snapshot = get_snapshot(&state.daemon).await;
+    let others = other_deck_agents(&state.daemon, &snapshot).await;
     resolve_declared_utterance(
         resolver.as_ref(),
         screen,
@@ -3768,6 +3769,7 @@ async fn desktop_voice_resolve(
             endpoints: endpoints.as_ref(),
             dictation: dictation.as_ref(),
             reading: reading.unwrap_or_default(),
+            other_agents: &others,
         },
         voice::Transcript::new(utterance),
         settings.labels,
@@ -3788,6 +3790,11 @@ struct VoiceDeclaration<'a> {
     dictation: Option<&'a voice::VoiceDictationTarget>,
     /// PRD #1497 — reading mode and the app's own speech, two booleans.
     reading: voice::VoiceReadingState,
+    /// PRD #2374 (PR #2378 review) — under All daemons, each other observed
+    /// deck's agents, by deck id ([`other_deck_agents`]), which voice reaches
+    /// beside the selected deck's ([`voice::VoiceDeck::agents`]). Empty when
+    /// one deck is on screen.
+    other_agents: &'a [(String, Vec<voice::DesktopAgent>)],
 }
 
 /// [`desktop_voice_resolve`] once the live state is read: the decks voice
@@ -3807,6 +3814,7 @@ async fn resolve_declared_utterance(
     show_deck: bool,
 ) -> Result<voice::VoiceResult, String> {
     let mut decks = voice_decks(observed, declared.deck_step, agents_deck);
+    with_other_agents(&mut decks, declared.other_agents);
     // PRD #1195 M3: the decks the Deck selector lists, as the webview sent
     // them — the section the selector is rendering, not `desktop.toml`, which
     // lags it by a queued write — rather than only the ones the app observes,
@@ -3850,7 +3858,8 @@ const MAX_VOICE_CHOICE_TEXT_BYTES: usize = 4 * 1024;
 fn validate_voice_choice(offered: &[voice::ResolvedParam]) -> Result<(), String> {
     let too_long = |param: &voice::ResolvedParam| {
         [&param.name, &param.spoken, &param.value, &param.label]
-            .iter()
+            .into_iter()
+            .chain(param.deck_id.as_ref())
             .any(|text| text.len() > MAX_VOICE_CHOICE_TEXT_BYTES)
     };
     if offered.is_empty()
@@ -3906,6 +3915,7 @@ async fn desktop_voice_choice(
         validate_voice_deck_step(deck_step)?;
     }
     let snapshot = get_snapshot(&state.daemon).await;
+    let others = other_deck_agents(&state.daemon, &snapshot).await;
     Ok(answer_declared_choice(
         &utterance,
         &action,
@@ -3919,6 +3929,7 @@ async fn desktop_voice_choice(
             endpoints: endpoints.as_ref(),
             dictation: None,
             reading: voice::VoiceReadingState::default(),
+            other_agents: &others,
         },
     ))
 }
@@ -4334,6 +4345,7 @@ fn answer_declared_choice(
     declared: VoiceDeclaration<'_>,
 ) -> voice::ChoiceAnswer {
     let mut decks = voice_decks(observed, declared.deck_step, None);
+    with_other_agents(&mut decks, declared.other_agents);
     let selections = selector_voice_decks(declared.endpoints, &mut decks, declared.deck_step);
     if action == voice::SWITCH_DECK_ROW {
         decks = decks
@@ -4432,6 +4444,7 @@ fn selector_voice_decks(
             address: None,
             local: true,
             holds_agents: false,
+            agents: Default::default(),
         },
         voice::VoiceDeckSelection {
             token: crate::settings::LOCAL_SELECTION_TOKEN.to_string(),
@@ -4446,6 +4459,7 @@ fn selector_voice_decks(
             local: false,
             unavailable: Some(voice::DECK_IS_EVERY_DAEMON.to_string()),
             holds_agents: false,
+            agents: Default::default(),
         },
         voice::VoiceDeckSelection {
             token: crate::settings::ALL_SELECTION_TOKEN.to_string(),
@@ -4488,6 +4502,7 @@ fn selector_voice_decks(
                 local: false,
                 unavailable,
                 holds_agents: false,
+                agents: Default::default(),
             },
             voice::VoiceDeckSelection {
                 token: row.id.as_str().to_string(),
@@ -4520,6 +4535,73 @@ fn selector_voice_decks(
         selections.entry(deck.id).or_insert(selection);
     }
     selections
+}
+
+/// PRD #2374 (PR #2378 review): how long voice waits for another daemon's
+/// agent list before resolving without that daemon's agents.
+const OTHER_DECK_AGENTS_WAIT: Duration = Duration::from_millis(1500);
+
+/// PRD #2374 (PR #2378 review) — under All daemons, every OTHER observed deck's
+/// agents, by deck id, read concurrently and each bounded by
+/// [`OTHER_DECK_AGENTS_WAIT`], in the observed order. A deck that is not
+/// connected, has no agents or does not answer in time is left out, and voice
+/// resolves without it. Empty when one deck is observed, which is every
+/// single-deck selection.
+async fn other_deck_agents(
+    links: &Arc<DaemonLinks>,
+    snapshot: &crate::dto::DesktopSnapshot,
+) -> Vec<(String, Vec<voice::DesktopAgent>)> {
+    if snapshot.observed.len() < 2 {
+        return Vec::new();
+    }
+    let selected = snapshot.connection.deck_id.as_str();
+    let mut reads = tokio::task::JoinSet::new();
+    for (at, deck) in snapshot.observed.iter().enumerate() {
+        if deck.deck_id == selected {
+            continue;
+        }
+        // Resolved against the observed set, as every deck id is
+        // ([`crate::dto::DeckScope::resolve`]).
+        let Ok(scope) = crate::dto::DeckScope::resolve(Some(&deck.deck_id)) else {
+            continue;
+        };
+        let endpoint = scope.endpoint().clone();
+        let id = deck.deck_id.clone();
+        let links = Arc::clone(links);
+        reads.spawn(async move {
+            let snapshot = tokio::time::timeout(
+                OTHER_DECK_AGENTS_WAIT,
+                crate::daemon_bridge::snapshot_of(&endpoint, &links),
+            )
+            .await
+            .ok()?;
+            (snapshot.connection.status == crate::dto::ConnectionStatus::Connected
+                && !snapshot.agents.is_empty())
+            .then_some((at, id, snapshot.agents))
+        });
+    }
+    let mut found = Vec::new();
+    while let Some(read) = reads.join_next().await {
+        if let Ok(Some(entry)) = read {
+            found.push(entry);
+        }
+    }
+    found.sort_by_key(|(at, _, _)| *at);
+    found
+        .into_iter()
+        .map(|(_, id, agents)| (id, agents))
+        .collect()
+}
+
+/// PRD #2374 (PR #2378 review) — `other` agents onto their decks in `decks`
+/// ([`voice::VoiceDeck::agents`]). The deck that holds the selected deck's
+/// agents takes none: those are the agents voice is handed already.
+fn with_other_agents(decks: &mut [voice::VoiceDeck], other: &[(String, Vec<voice::DesktopAgent>)]) {
+    for deck in decks.iter_mut().filter(|deck| !deck.holds_agents) {
+        if let Some((_, agents)) = other.iter().find(|(id, _)| *id == deck.id) {
+            deck.agents = voice::DeckAgents(agents.clone());
+        }
+    }
 }
 
 /// The decks a spoken `deck_ref` resolves against (PRD #1223): the snapshot's
@@ -4580,6 +4662,7 @@ fn voice_decks(
                 local,
                 unavailable,
                 holds_agents: agents_deck == Some(deck.deck_id.as_str()),
+                agents: Default::default(),
             }
         })
         .collect()
@@ -8118,6 +8201,7 @@ mod tests {
                 endpoints: Some(endpoints),
                 dictation: None,
                 reading: voice::VoiceReadingState::default(),
+                other_agents: &[],
             },
             voice::Transcript::new(said),
             crate::settings::LabelSharing::Shared,
@@ -8317,6 +8401,7 @@ mod tests {
             endpoints: Some(endpoints),
             dictation: None,
             reading: voice::VoiceReadingState::default(),
+            other_agents: &[],
         };
         assert_eq!(
             answer_declared_choice("two", "switch_deck", candidates, &[], &[], declared(&both)),

@@ -1163,10 +1163,11 @@ export interface VoiceResolvedParamDto {
    */
   names?: string[];
   /**
-   * PR #1451 round 3, change 3 — on an `agent_ref` chosen by its number on
-   * the dashboard alone: the deck that agent is on, since those rows span
-   * every deck where a resolved agent is the selected deck's. Never sent by
-   * Rust.
+   * On an `agent_ref`: the deck that agent is on. Set for one chosen by its
+   * number on the dashboard (PR #1451 round 3, change 3), whose rows span every
+   * deck, and by Rust for one resolved while other daemons' agents were in
+   * reach under All daemons (PRD #2374, `ResolvedParam::deck_id`). Absent: the
+   * selected deck's agent.
    */
   deckId?: string;
   /**

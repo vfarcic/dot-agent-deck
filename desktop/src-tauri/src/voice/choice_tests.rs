@@ -34,6 +34,7 @@ fn candidate(kind: ParamKind, value: &str, label: &str) -> ResolvedParam {
         value: value.to_string(),
         label: label.to_string(),
         deck_identity: None,
+        deck_id: None,
         names: Vec::new(),
     }
 }
@@ -295,6 +296,7 @@ fn choice_refuses_an_offered_value_that_is_no_longer_live() {
         local: false,
         unavailable: None,
         holds_agents: false,
+        agents: Default::default(),
     }];
     let live = ChoiceLive {
         agents: &agents,

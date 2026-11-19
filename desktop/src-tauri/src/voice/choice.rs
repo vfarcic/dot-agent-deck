@@ -157,9 +157,14 @@ pub fn answer(utterance: &str, offered: &[ResolvedParam], live: &ChoiceLive) -> 
     if (cancels || ordinal.is_some())
         && offered.iter().any(|candidate| {
             spoken_words(&candidate.label) == words
-                || names_of(candidate.kind, &candidate.value, live)
-                    .iter()
-                    .any(|name| spoken_words(name) == words)
+                || names_of(
+                    candidate.kind,
+                    &candidate.value,
+                    candidate.deck_id.as_deref(),
+                    live,
+                )
+                .iter()
+                .any(|name| spoken_words(name) == words)
         })
     {
         return ChoiceAnswer::Refused;
@@ -485,6 +490,31 @@ fn by_name(
                 said(names)
             })
     };
+    // PRD #2374 (PR #2378 review): a tie that spans daemons names each agent
+    // by its deck as well as its id, so it is answered candidate by candidate.
+    if kind == ParamKind::AgentRef && offered.iter().any(|candidate| candidate.deck_id.is_some()) {
+        let said_of = |candidate: &&ResolvedParam| {
+            agents_on(live, candidate.deck_id.as_deref())
+                .iter()
+                .find(|agent| agent.id == candidate.value)
+                .is_some_and(|agent| {
+                    let mut names = spoken_names(agent);
+                    names.push(candidate.label.clone());
+                    said(names)
+                })
+        };
+        return match offered
+            .iter()
+            .filter(said_of)
+            .collect::<Vec<_>>()
+            .as_slice()
+        {
+            [one] => still_live(one, live),
+            [] if names_something(words, kind, offered, live) => ChoiceAnswer::Refused,
+            [] => ChoiceAnswer::NotAnswer,
+            _ => ChoiceAnswer::Refused,
+        };
+    }
     let found = match kind {
         ParamKind::AgentRef => {
             let agents: Vec<DesktopAgent> = live
@@ -625,10 +655,14 @@ fn in_an_offered_run(
 /// offered candidate carries as [`ResolvedParam::names`], so the webview's
 /// fallback (`answerChoiceLocally`) reads these names rather than keeping a
 /// second definition of them. Empty when nothing live has that value.
-pub(super) fn names_of(kind: ParamKind, value: &str, live: &ChoiceLive) -> Vec<String> {
+pub(super) fn names_of(
+    kind: ParamKind,
+    value: &str,
+    deck_id: Option<&str>,
+    live: &ChoiceLive,
+) -> Vec<String> {
     let names = match kind {
-        ParamKind::AgentRef => live
-            .agents
+        ParamKind::AgentRef => agents_on(live, deck_id)
             .iter()
             .find(|agent| agent.id == value)
             .map(spoken_names),
@@ -724,6 +758,7 @@ fn names_something(
         ParamKind::AgentRef => live
             .agents
             .iter()
+            .chain(live.decks.iter().flat_map(|deck| deck.agents.0.iter()))
             .any(|agent| spoken_names(agent).iter().any(|name| is(name))),
         // A named deck (issue #1426) is still said by its address, which is
         // what its label was before it had a name.
@@ -757,13 +792,28 @@ fn names_something(
     }
 }
 
+/// PRD #2374 (PR #2378 review) — the agents of the deck `deck_id` names: that
+/// deck's own ([`VoiceDeck::agents`]) when it is another daemon in reach, and
+/// otherwise the agents voice was handed, which are the selected deck's.
+fn agents_on<'a>(live: &'a ChoiceLive, deck_id: Option<&str>) -> &'a [DesktopAgent] {
+    deck_id
+        .and_then(|id| {
+            live.decks
+                .iter()
+                .find(|deck| deck.id == id && !deck.holds_agents && !deck.agents.0.is_empty())
+        })
+        .map_or(live.agents, |deck| deck.agents.0.as_slice())
+}
+
 /// `candidate`, selected — if what it names is still on screen. A deck is
 /// looked up by the value offered, which for a switch is the Deck selector's
 /// token: the caller hands in decks keyed the same way.
 fn still_live(candidate: &ResolvedParam, live: &ChoiceLive) -> ChoiceAnswer {
     let value = candidate.value.as_str();
     let present = match candidate.kind {
-        ParamKind::AgentRef => live.agents.iter().any(|agent| agent.id == value),
+        ParamKind::AgentRef => agents_on(live, candidate.deck_id.as_deref())
+            .iter()
+            .any(|agent| agent.id == value),
         ParamKind::DeckRef => live.decks.iter().any(|deck| deck.id == value),
         ParamKind::OrchestrationRef => live.agents.iter().any(|agent| {
             agent.id == value && matches!(agent.tab, DesktopTab::Orchestration { .. })
@@ -804,6 +854,7 @@ mod tests {
             value: id.to_string(),
             label: label.to_string(),
             deck_identity: None,
+            deck_id: None,
             names: Vec::new(),
         }
     }

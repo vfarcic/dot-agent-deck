@@ -17,7 +17,7 @@ A card is marked **Needs you** when its agent stopped, is asking a question in i
 
 The Dashboard's top bar has a **Table | Cards** switch. **Table** is the Dashboard you know. **Cards** shows a grid of cards. The app remembers your choice in this window's storage, so the next time you open the Dashboard it shows the same view.
 
-![The Dashboard's Cards view: an orchestration group of three cards, two of them marked Needs you with their main buttons “Go ahead” and “Yes, behind a flag”, and a standalone agent waiting for input](/img/agent-cards-desktop.png)
+![The Dashboard's Cards view: under the Local daemon's header, an orchestration group of three cards, two of them marked Needs you with their main buttons “Go ahead” and “Yes, behind a flag”, and a standalone agent waiting for input](/img/agent-cards-desktop.png)
 
 In the Cards view:
 
@@ -26,7 +26,7 @@ In the Cards view:
 - **Needs you** above the grid shows only the cards that need you. Press it again to see every card.
 - The Dashboard's filter applies to the cards as it does to the table rows: with a status, kind, agent type, daemon or search text chosen, only the cards of the agents it shows are on screen.
 - Each card has one main button, the action the agent most needs from you: the answer to its question, an action it suggested, or **Open** when it needs nothing. Under the button is the start of the exact text it sends, and hovering shows all of it. An action the agent wrote itself is marked **agent says**, as are its fields. When the agent wrote the text and the card shows only the start of it, the button sends nothing yet: it opens the card at a step showing the whole text, and you send it from there. After you press it, the card says whether the message was sent and, later, whether the agent took it.
-- With several daemons on the Dashboard, each daemon's cards are under its own name. A daemon from a release before cards were added has no cards and keeps its usual table section.
+- Each daemon keeps its own section with its header, so its **Stop daemon**, **Upgrade**, host figures and **New agent** buttons are there in both views, and its cards are below the header. A daemon from a release before cards were added has no cards and keeps its usual table.
 
 In the Table view, a row whose card needs you shows a bell next to the agent's name, and the row's **⋯** menu has **Show card**, which opens that agent's card, and the card's main action. The menu shows only the action's name, so choosing it sends nothing yet: it opens the card at a step that shows exactly what the action sends, and you send it from there. Clicking the row itself still opens the agent's terminal, as before.
 
@@ -61,6 +61,8 @@ With voice control on, you can say:
 | "close the card" | Closes the card overlay. |
 | "press go ahead on the coder's card", "answer main to the coder" | Presses that action or answer, named by the label on its button. |
 | "reply to the coder use the main branch" | Opens that agent's card with your words in its **Reply** box, for you to read, change and send with **Send reply**. |
+
+With **All daemons** selected, you can name an agent on any daemon the Dashboard shows. When the name fits agents on more than one daemon, the app asks which; add the daemon's name, as in "show the coder's card on build box", to pick it straight away (see [Naming an agent](voice.md#naming-an-agent)).
 
 Voice sends an action straight away only when its text comes from your catalog. Anything with text the agent wrote opens the card at a step showing exactly what would be sent, and the voice row says so; press **Send** to send it. That includes an action the agent suggested that is not in your catalog and every answer to one of its questions: an answer the agent gave no text of its own sends `Answer to your question "<question>": <answer>`, which repeats the agent's question and answer words. An action that asks you to confirm, and closing an agent, are never done by voice alone either: the card opens at its confirm step and you press the button yourself. A spoken reply is not sent by voice alone, as dictating to an agent's terminal types your words without pressing Enter: you see what was heard before it goes.
 

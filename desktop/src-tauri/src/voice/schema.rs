@@ -137,7 +137,8 @@ pub const TOOL_INSTRUCTIONS: &str = "Pick the Agent Deck action the user asked f
     about each agent: `mode` (such as dispatcher), `agent_type`, `directory` (its \
     working directory's name), `orchestration` (its run's title) and `newest_rank` \
     (1 is the agent that started last); `agents_daemon` is the daemon they are all \
-    on. A user refers to an agent by state as readily as by name — \"the one that \
+    on, and `agents_on_other_daemons`, when present, lists each other daemon's \
+    agents the same way under its `daemon` label. A user refers to an agent by state as readily as by name — \"the one that \
     is stuck\" — so resolve such a reference against those fields and answer with \
     that agent's `label`. For an agent the user named by mode, agent type, \
     directory, orchestration, daemon, start order or what it was asked to do — \
