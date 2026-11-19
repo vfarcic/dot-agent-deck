@@ -1510,21 +1510,32 @@ describe("AgentOverview", () => {
   });
 
   /**
-   * Scenario: render an agent for each write lease the daemon can report, then
-   * one whose lease is the daemon's `"unknown"` sentinel. The three reported
-   * values print; the sentinel prints nothing, and in particular does not print
-   * the word "unknown" on a screen that promises no placeholders.
+   * Scenario (issue #2353): render an agent for each write lease the daemon can
+   * report, then one whose lease is the daemon's `"unknown"` sentinel. `read`
+   * and `none` — input typed here would not reach the agent — print with their
+   * hover text; `write`, the ordinary case, prints nothing; the sentinel prints
+   * nothing either, and in particular not the word "unknown" on a screen that
+   * promises no placeholders.
    */
-  it("prints a reported write lease and nothing for the absent one", () => {
-    for (const lease of ["write", "read", "none"] as const) {
+  it("prints a write lease only when input would not reach the agent", () => {
+    const hover = {
+      read: "History-only: the daemon can replay this session but cannot deliver input to it.",
+      none: "View-only: the daemon has no handle it can write to or resume.",
+    } as const;
+    for (const lease of ["read", "none"] as const) {
       const { unmount } = renderOverview({ snapshot: snapshotWithAgent({ writeLease: lease, tab: { kind: "dashboard" } }) });
-      expect(document.querySelector(".overview-lease")).toHaveTextContent(lease);
+      const chip = document.querySelector(".overview-lease");
+      expect(chip).toHaveTextContent(lease);
+      expect(chip).toHaveAttribute("title", hover[lease]);
       unmount();
     }
 
-    const { container } = renderOverview({ snapshot: snapshotWithAgent({ writeLease: "unknown", tab: { kind: "dashboard" } }) });
-    expect(document.querySelector(".overview-lease")).toBeNull();
-    expect([container.textContent ?? "", ...titlesOf(container)].join(" ~ ")).not.toContain("unknown");
+    for (const lease of ["write", "unknown"] as const) {
+      const { container, unmount } = renderOverview({ snapshot: snapshotWithAgent({ writeLease: lease, tab: { kind: "dashboard" } }) });
+      expect(document.querySelector(".overview-lease")).toBeNull();
+      expect([container.textContent ?? "", ...titlesOf(container)].join(" ~ ")).not.toMatch(lease === "write" ? /writable target/ : /unknown/);
+      unmount();
+    }
   });
 
   /**

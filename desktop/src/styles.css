@@ -35,7 +35,9 @@
      even ladder than the 17.6 / 14.9 / 14.3 it replaces and no smaller a step
      than the 8.2 the dark block below already ships between --ink-soft and
      --muted.
-     The per-surface arithmetic is in the PR that closed #821. */
+     The per-surface arithmetic is in the PR that closed #821. Since issue #2353
+     that badge renders only in amber, so the --faint-on-scrim ground that set
+     the cap no longer occurs there; the value was left where #821 put it. */
   --ink: #1d2522;
   --ink-soft: #313734;
   --muted: #444b48;
@@ -1668,8 +1670,8 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .overview-prompt { min-width: 0; overflow: hidden; color: var(--muted); font-size: var(--text-base); text-overflow: ellipsis; white-space: nowrap; }
 /* The daemon-reported write lease, next to the agent's name. Muted and small:
    it is a qualifier on the row, not a status. */
-.overview-lease { flex: 0 0 auto; padding: 1px 4px; border-radius: 2px; color: var(--faint); background: rgb(var(--scrim-rgb) / .04); font-family: "JetBrains Mono", monospace; font-size: var(--text-xs); font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
-.overview-lease.lease-read, .overview-lease.lease-none { color: var(--amber); background: var(--amber-soft); }
+/* Issue #2353: only a `read` or `none` lease renders a chip, so every chip is amber. */
+.overview-lease { flex: 0 0 auto; padding: 1px 4px; border-radius: 2px; color: var(--amber); background: var(--amber-soft); font-family: "JetBrains Mono", monospace; font-size: var(--text-xs); font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
 
 .overview-note { min-height: 260px; padding: 30px; display: flex; flex-direction: column; align-items: center; justify-content: center; border: 1px dashed var(--line-strong); border-radius: var(--radius); color: var(--muted); background: rgb(var(--paper-rgb) / .55); text-align: center; }
 /* The same note inside a FLEET, where it is one deck's line among its

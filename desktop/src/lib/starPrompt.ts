@@ -27,14 +27,21 @@ export const STAR_BODY_FIRST = "If you find dot-agent-deck useful,";
 export const STAR_BODY_SECOND = "please consider starring the repo!";
 /** The repository, as the prompt shows it and as Star opens it. */
 export const STAR_REPO_DISPLAY = "github.com/vfarcic/dot-agent-deck";
-export const STAR_REPO_URL = "https://github.com/vfarcic/dot-agent-deck";
+/**
+ * Not exported, because nothing in TypeScript uses this or `STAR_VISIT`: the
+ * crate opens the URL and words the result (`desktop/src-tauri/src/star_prompt.rs`).
+ * They are here because that file's `the_dialog_uses_the_tui_prompts_words`
+ * reads this file as text for the TUI's words, so deleting them fails it.
+ */
+const STAR_REPO_URL = "https://github.com/vfarcic/dot-agent-deck";
 /** The three choices, in the TUI's words and key order. */
 export const STAR = "Star";
 export const LATER = "Later";
 export const DONT_ASK_AGAIN = "Don't ask again";
 /** What Star reports: the TUI's status-line sentences. */
 export const STAR_THANKS = "Thanks for starring! ⭐";
-export const STAR_VISIT = "Visit github.com/vfarcic/dot-agent-deck to star ⭐";
+/** Not exported; see `STAR_REPO_URL`. */
+const STAR_VISIT = "Visit github.com/vfarcic/dot-agent-deck to star ⭐";
 /**
  * How long the dialog's keys wait after it is drawn before they choose. The
  * dialog opens on its own, at startup or when the dialog in front of it

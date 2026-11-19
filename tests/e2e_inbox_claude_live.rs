@@ -57,6 +57,11 @@ impl Claude {
 
     /// [`Self::launch`] with `extra` set for the deck and its daemon.
     fn launch_with(command: &str, extra: &[(&str, &str)]) -> Self {
+        Self::launch_in("minimal", command, extra)
+    }
+
+    /// [`Self::launch_with`] in the deck fixture `fixture`.
+    fn launch_in(fixture: &str, command: &str, extra: &[(&str, &str)]) -> Self {
         let command = command.to_string();
         let mut builder = common::TuiDeck::builder();
         for (key, value) in extra {
@@ -75,7 +80,7 @@ impl Claude {
             .with_env("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "30000")
             .with_env("DOT_AGENT_DECK_INBOX_WAKE_STALL_AFTER_MS", "2000")
             .with_continue_session("inbox-haiku", command)
-            .launch_with_fixture("minimal");
+            .launch_with_fixture(fixture);
         deck.wait_for_string("inbox-haiku");
         let record = std::cell::RefCell::new(Value::Null);
         assert!(
@@ -499,6 +504,75 @@ fn claude_014_live_killed_waiter_falls_back_to_injection() {
             .to_string()
             .contains("waiting, run:")
     );
+}
+
+/// Scenario: Run interactive Haiku in a project whose own `UserPromptSubmit` hook blocks the first prompt carrying a deck doorbell line, kill the scratch pane's armed waiter, and post a directive task naming a sentinel. The doorbell rings, the deck's hook hands the task over, and the project hook blocks that prompt. For 30 seconds, longer than the witness watches, the task is not acknowledged and the sentinel is not written. The test then types a short prompt into the pane: the task is handed over again, Haiku writes the sentinel once, and the task is acknowledged with two deliveries. If the deck's Claude Code facts are not Go the test reports SKIP saying so.
+#[spec("inbox/claude/053")]
+#[test]
+#[cfg(target_os = "linux")]
+fn claude_053_live_a_blocked_doorbell_prompt_is_not_acknowledged_and_is_handed_over_again() {
+    skip_unless!(common::check_claude_available());
+    skip_unless!(claude_facts_admit_installed_release());
+    let claude = Claude::launch_in(
+        "claude-blocking-hook",
+        &common::capability_export_command(&format!("exec {CLAUDE}")),
+        &[],
+    );
+    kill_trial_waiter(&claude);
+    let name = "blocked-doorbell-5d1e7a.txt";
+    let id = claude.post(&claude.directive(name));
+    let marker = claude.deck.workdir().join("doorbell-blocked-once.marker");
+    assert!(
+        common::wait_until(BUDGET, || marker.exists()),
+        "the doorbell must ring and the project hook block its prompt; {}",
+        claude.evidence()
+    );
+    assert!(
+        claude.log().contains("doorbell rang"),
+        "{}",
+        claude.evidence()
+    );
+    let message = || {
+        claude.listing()["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == id)
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    let sentinel = claude.deck.workdir().join(name);
+    // Longer than the witness watches: neither an acknowledgement nor the
+    // sentinel may appear while the blocked prompt is all Haiku was sent.
+    let leaked = common::wait_until(Duration::from_secs(30), || {
+        message()["state"] == "acknowledged" || sentinel.exists()
+    });
+    assert!(
+        !leaked,
+        "a blocked prompt must not acknowledge the task, and Haiku never saw it; {}",
+        claude.evidence()
+    );
+    claude
+        .deck
+        .send_keys(b"Check for new messages and do what they say.");
+    claude.deck.send_keys(b"\r");
+    assert!(
+        common::wait_until(BUDGET, || std::fs::read_to_string(&sentinel)
+            .is_ok_and(|text| text.ends_with('\n'))),
+        "real Haiku must act on {id} once it is handed over again; {}",
+        claude.evidence()
+    );
+    assert!(
+        common::wait_until(BUDGET, || message()["state"] == "acknowledged"),
+        "the task must be acknowledged; {}",
+        claude.evidence()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&sentinel).unwrap(),
+        format!("inbox-action-{name}\n"),
+        "one append proves one action"
+    );
+    assert_eq!(message()["deliveries"], 2, "{}", claude.evidence());
 }
 
 /// Scenario: Run interactive Haiku in a deck started with the Claude Code doorbell turned off (`DOT_AGENT_DECK_DOORBELL_CLAUDE=0`), kill its scratch pane's armed waiter, and post a directive task naming a sentinel. The daemon's release line must name the installed release as latched and its `doorbell off` line must name turned_off; for 20 seconds after that no doorbell rings or shows on the pane's screen or in its last prompt, the task stays queued, and the card shows the cannot_type words. The test then types a short prompt into the pane and presses Enter: the prompt hook hands Haiku the task, Haiku writes the sentinel, and the task is acknowledged.

@@ -75,7 +75,7 @@ Some work starts an orchestration, or a role of one, without you choosing it in 
 - `dot-agent-deck dispatch` when it starts an orchestration, before the unit's worktree runs any setup ([Dispatcher Mode](dispatcher-mode.md));
 - an orchestrator's `delegate`, `pane restart` and `pane spawn` ([Orchestration](orchestration.md#commands)). An orchestration you started from a current client was approved then, so for it these are refused when its file changed since.
 
-If the orchestration is not approved as its file now reads, the attempt is refused and nothing from it starts. The deck then asks you for the approval in the TUI and the desktop app attached to it, so you can approve without leaving the deck, and the attempt goes through when it is tried again.
+If the orchestration is not approved as its file now reads, the attempt is refused and nothing from it starts. The deck then asks you for the approval in the TUI and the desktop app attached to it, so you can approve without leaving the deck, and the attempt goes through when it is tried again. An agent whose attempt was refused is told when you answer, so it knows when to try again.
 
 ### Answering the deck's request
 
@@ -84,12 +84,13 @@ The deck shows the same **Review project commands** review, led by a sentence sa
 - **TUI:** the review opens over the dashboard or the pane you are typing in, with the footer `a approve · Esc deny · ↑↓ scroll`. `a` (or a click on `a approve`) approves exactly the text shown, and the status line says `Approved orchestration 'team'. It starts when dispatch tries again.`. `Esc` (or a click on `Esc deny`) declines it. You return to where you were.
 - **Desktop app:** the dialog names the daemon that asked (**Daemon:**) and offers **Deny** and **Approve**. With **All daemons** selected it shows the requests of every daemon the app watches; with one daemon selected, that daemon's. With [voice control](desktop/voice.md#approving-project-commands) on, "approve" approves, and "cancel" or "close" denies.
 
-Approving records the approval exactly as the New Agent form and `trust approve` do. It starts nothing itself: the attempt that was refused starts when it is tried again. An agent that ran `dispatch` or `delegate` is told to retry once you approve; a schedule runs at its next fire, or now with `dot-agent-deck schedule run-now --name <name>`.
+Approving records the approval exactly as the New Agent form and `trust approve` do. It starts nothing itself: the attempt that was refused starts when it is tried again. Each agent whose `dispatch`, `delegate`, `pane restart` or `pane spawn` was refused gets a notice from the deck in its inbox saying the orchestration was approved and to retry now, and it decides whether it still needs to. A schedule is not told anything: it runs at its next fire, or now with `dot-agent-deck schedule run-now --name <name>`.
 
-**Deny** refuses the attempt, and its retries, with a message saying you declined it in the deck. The deck does not ask about that exact text again until the daemon restarts, so a schedule that fires every few minutes does not bring the review back each time. You can still approve it from the New Agent form or with `trust approve`, and a change to the file asks again.
+**Deny** refuses the attempt, and its retries, with a message saying you declined it in the deck. Each agent whose attempt was refused gets a notice saying you declined it and not to retry, so it stops waiting. The deck does not ask about that exact text again until the daemon restarts, so a schedule that fires every few minutes does not bring the review back each time. You can still approve it from the New Agent form or with `trust approve`, and a change to the file asks again.
 
 - **Once per change:** a retry while the review is waiting for your answer is refused the same way and opens no second review. After you approve, nothing asks again until the text changes.
 - **Answered once, closed everywhere:** answer in one client, and the review closes in the others, which say `The approval request for orchestration 'team' was answered elsewhere.`. Approving with `trust approve`, or changing the file, also closes it within a few seconds.
+- **Each waiting agent is told once:** whichever client you answer in, or `trust approve` from a terminal, every agent the request refused gets one notice. If the file changes instead, they are told the request closed without an answer, so they can try again and be asked about the new text. An agent whose pane has closed, or now runs another agent, is not told.
 - **No client attached:** the request waits, and the review appears the next time a TUI or desktop app attaches to that deck.
 - **A restart forgets it:** the deck keeps waiting requests and your declines in memory only. Restarting the daemon drops them; the next attempt asks again. Approvals are kept on disk and survive a restart, as before.
 
@@ -97,10 +98,18 @@ A TUI or desktop app from an older release shows no request; approve with the co
 
 ### The refusal
 
-Each refusal says which orchestration and project, whether it was never approved or what changed, that the approval was requested in the deck, and the command that approves it from a terminal:
+Each refusal says which orchestration and project, whether it was never approved or what changed, that the approval was requested in the deck, and the command that approves it from a terminal. An agent's refusal also tells it to wait for the deck's notice instead of retrying:
 
 ```text
-orchestration 'team' of project /home/you/code/demo was never approved, so nothing from it was started. Its approval was requested in the deck: the user can review it in the dot-agent-deck TUI or desktop app attached to this deck, and once it is approved the same attempt, retried, starts it. Or approve it from a terminal outside the deck with: dot-agent-deck trust approve /home/you/code/demo --orchestration team
+orchestration 'team' of project /home/you/code/demo was never approved, so nothing from it was started. Its approval was requested in the deck: the user can review it in the dot-agent-deck TUI or desktop app attached to this deck. You will get a dot-agent-deck notice in your inbox when the user approves or declines it: wait for that notice rather than retrying, and once it says approved, run the same command again to start it. Or approve it from a terminal outside the deck with: dot-agent-deck trust approve /home/you/code/demo --orchestration team
+```
+
+A schedule's refusal says `Once it is approved, the same attempt, retried, starts it.` in place of the sentence about the notice.
+
+The notice an agent gets when you approve reads:
+
+```text
+Orchestration 'team' of project /home/you/code/demo was approved. Retry your dispatch now if you still need it: the approval itself started nothing.
 ```
 
 After you deny it, the refusal says `… was never approved and the user declined it in the deck, so nothing from it was started. To start it, approve it from the deck's New Agent form or from a terminal outside the deck with: …`.
@@ -130,6 +139,14 @@ Orchestration 'team': its instructions were not sent to its coordinator again, b
 ```
 
 The orchestrator keeps running, but without its instructions in its conversation. Approve the change with the command in the message, or revert the file; the next compaction or `/clear` then sends them. If you approve a change that only edits the roles' text, that text is what the orchestrator gets. If the change adds, removes, renames or reorders roles, or moves `start`, the status line says `its roles changed since it was opened. Open it again to use the new roles.`: open the orchestration again from the New Agent form.
+
+The instructions are sent again with the task the orchestration was started with, read from that orchestration's own `orchestrator-context-<id>.md`. When the TUI cannot read that file, it sends them without a task and the status line says why, for example:
+
+```text
+Orchestration 'team': instructions re-sent to its coordinator without a task (this tab does not know its context file)
+```
+
+That happens for an orchestration you opened with `Ctrl+n` and came back to after detaching, or from a second TUI, which never had a task to send; and for any orchestration whose file was deleted, by hand or because it was more than 14 days old. If the orchestrator was working on a task, give it the task again.
 
 The desktop app does not send the orchestrator's instructions again after compaction or `/clear`, so this does not apply there.
 

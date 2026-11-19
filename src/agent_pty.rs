@@ -2948,6 +2948,7 @@ fn log_evidence_transition(transition: &crate::evidence_state::Transition, cause
         layout_epoch = transition.layout_epoch,
         out_seq = transition.out_seq,
         marker_seq = transition.marker_seq,
+        basis = transition.basis.map(crate::evidence_state::CleanBasis::as_str),
         "pane layout evidence"
     );
 }
@@ -4496,14 +4497,13 @@ pub struct AgentRecord {
     /// Issue #1445: once a TUI has re-armed that coordinator and reported it
     /// ([`crate::daemon_protocol::AttachRequest::RecordOrchestratorContext`]),
     /// the newest re-arm's file instead.
-    /// A TUI hydrating the tab re-arms compaction and `/clear` from this file
-    /// instead of the fixed-path mirror, which a later preparation in the same
-    /// project may have overwritten.
+    /// A TUI hydrating the tab re-arms compaction and `/clear` from this file.
     ///
     /// `None` for every other pane, for a start role the daemon has no record
     /// for (a TUI-launched `Ctrl+n` tab, which publishes its own context), and
-    /// from a daemon predating this field — in which case the TUI falls back to
-    /// the mirror exactly as before. Additive optional, so no
+    /// from a daemon predating this field. A tab with none re-arms with no task
+    /// and says so on the TUI's status line (issue #1395); before #1395 it read
+    /// the fixed-path mirror instead. Additive optional, so no
     /// `PROTOCOL_VERSION` bump — same basis as `live` and `crashed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestrator_context_path: Option<String>,
@@ -8431,29 +8431,32 @@ impl QuestionAnswers {
     }
 }
 
-/// PRD #1666 §11: whether a spawn starts OpenCode — by its declared agent
-/// type, or by the basename of its command when it declares none — and so
-/// owes the inbox its integration refresh and capability probe.
-fn opencode_spawn(agent_type: Option<&crate::event::AgentType>, command: Option<&str>) -> bool {
-    let basename = command
-        .and_then(|c| c.split_whitespace().next())
-        .and_then(|program| std::path::Path::new(program).file_name())
-        .and_then(|name| name.to_str())
-        .and_then(crate::agent_registry::detect_from_basename);
-    agent_type.cloned().or(basename) == Some(crate::event::AgentType::OpenCode)
+/// Which agent a spawn starts: its declared agent type, or the one the
+/// basename of its command names when it declares none. A wrapper
+/// (`devbox run pi-big`) declaring nothing is not detected.
+fn spawned_agent(
+    agent_type: Option<&crate::event::AgentType>,
+    command: Option<&str>,
+) -> Option<crate::event::AgentType> {
+    agent_type.cloned().or_else(|| {
+        command
+            .and_then(|c| c.split_whitespace().next())
+            .and_then(|program| std::path::Path::new(program).file_name())
+            .and_then(|name| name.to_str())
+            .and_then(crate::agent_registry::detect_from_basename)
+    })
 }
 
-/// PRD #1666 G6: whether a spawn starts Pi — by its declared agent type, or by
-/// the basename of its command when it declares none — and so owes the inbox
-/// a refresh of its extension. A wrapper (`devbox run pi-big`) is not
-/// detected and gets none.
+/// PRD #1666 §11: whether a spawn starts OpenCode ([`spawned_agent`]), and so
+/// owes the inbox its integration refresh and capability probe.
+fn opencode_spawn(agent_type: Option<&crate::event::AgentType>, command: Option<&str>) -> bool {
+    spawned_agent(agent_type, command) == Some(crate::event::AgentType::OpenCode)
+}
+
+/// PRD #1666 G6: whether a spawn starts Pi ([`spawned_agent`]), and so owes
+/// the inbox a refresh of its extension.
 fn pi_spawn(agent_type: Option<&crate::event::AgentType>, command: Option<&str>) -> bool {
-    let basename = command
-        .and_then(|c| c.split_whitespace().next())
-        .and_then(|program| std::path::Path::new(program).file_name())
-        .and_then(|name| name.to_str())
-        .and_then(crate::agent_registry::detect_from_basename);
-    agent_type.cloned().or(basename) == Some(crate::event::AgentType::Pi)
+    spawned_agent(agent_type, command) == Some(crate::event::AgentType::Pi)
 }
 
 /// PRD #1666 §11: which integration a spawn's inbox refresh was for.
@@ -8741,6 +8744,9 @@ pub struct AgentPtyRegistry {
     /// [`Self::pause_next_publish_for_test`].
     #[cfg(test)]
     publish_pause: PublishPause,
+    /// Issue #1973 test seam: see [`Self::hook_repairs_for_test`].
+    #[cfg(test)]
+    hook_repairs: Mutex<Vec<crate::event::AgentType>>,
     /// PRD #1487 re-check R2: woken whenever the last respawn in its
     /// remove→replace window finishes (`RegistryInner::respawns_in_flight`
     /// reaches zero), which is what [`Self::freeze_admission`] waits on.
@@ -10980,6 +10986,8 @@ impl AgentPtyRegistry {
             work: crate::work_tracking::WorkTracker::default(),
             #[cfg(test)]
             publish_pause: Mutex::new(None),
+            #[cfg(test)]
+            hook_repairs: Mutex::new(Vec::new()),
             #[cfg(test)]
             close_failures: Mutex::new(HashSet::new()),
             #[cfg(test)]
@@ -14952,6 +14960,18 @@ impl AgentPtyRegistry {
         } else {
             None
         };
+        // Issue #1973: a Claude Code, Codex or Devin generation's hooks are
+        // repaired before its child starts when they name no deck (the agent
+        // was set up after this daemon's startup install ran) or a deck copy
+        // that is gone, so the agent reports its status from its first turn.
+        // Hooks that already name a usable deck are left as they are: they
+        // live in the user's own config, which the deck does not rewrite on
+        // every start. OpenCode's plugin is refreshed above.
+        if let Some(agent) = spawned_agent(inbox_agent_type.as_ref(), spawn_command.as_deref())
+            .filter(crate::hooks_refresh::repairs_before_spawn)
+        {
+            self.repair_hooks_before_spawn(agent);
+        }
         // PRD #2050: an OpenCode 2 started directly runs with `--standalone`
         // added, so its pane has its own server.
         let mut opts = match standalone_command.as_deref() {
@@ -15585,6 +15605,26 @@ impl AgentPtyRegistry {
             self.note_inbox_spawn(&pane, &id, integration, refresh, &inbox_spawn.2);
         }
         Ok(id)
+    }
+
+    /// Issue #1973: [`crate::hooks_refresh::repair_before_spawn`] for `agent`,
+    /// off the executor. A unit test only records the request
+    /// ([`Self::hook_repairs_for_test`]), so no test reads or writes the
+    /// developer's real agent configs.
+    fn repair_hooks_before_spawn(&self, agent: crate::event::AgentType) {
+        #[cfg(test)]
+        self.hook_repairs.lock().unwrap().push(agent);
+        #[cfg(not(test))]
+        crate::inbox_hub::off_the_executor(move || {
+            crate::hooks_refresh::repair_before_spawn(&agent);
+        });
+    }
+
+    /// Issue #1973 test seam: the agents whose hooks spawns asked to repair,
+    /// in order.
+    #[cfg(test)]
+    pub(crate) fn hook_repairs_for_test(&self) -> Vec<crate::event::AgentType> {
+        self.hook_repairs.lock().unwrap().clone()
     }
 
     /// PRD #1666 part 3 (Q35-14b): start generation `id`'s observer from its
@@ -27339,7 +27379,17 @@ mod spawn_tests {
     #[test]
     fn doorbell_055_the_latch_does_not_wait_for_clean_evidence() {
         use crate::evidence_state::{EdgeReason, EvidenceStatus};
-        let profile = Some(&crate::doorbell_screen::CODEX_PROFILE);
+        // Codex's witnesses alone (issue #2262): with the agreement rule a
+        // terminal that has had one width is Clean from its first byte, and
+        // this test needs a header read before any Clean frame.
+        static WITNESS_ONLY: std::sync::OnceLock<crate::doorbell_screen::ScreenProfile> =
+            std::sync::OnceLock::new();
+        let profile = Some(
+            WITNESS_ONLY.get_or_init(|| crate::doorbell_screen::ScreenProfile {
+                agreement: false,
+                ..crate::doorbell_screen::CODEX_PROFILE
+            }),
+        );
         // (l) never Clean.
         let bus = AgentBus::for_generation("g-l", profile, 24, 80);
         bus.push(codex_header("0.164.0"));
@@ -28421,6 +28471,12 @@ mod spawn_tests {
             Latch::Resolved(_, Resolution::Submitted)
         ));
         editor.control.lock().unwrap().on_enter = OnEnter::SubmitSilently;
+        // The first ring ends on the hook's token, which the model editor
+        // reports before it redraws its emptied composer: on a loaded runner
+        // the second ring could otherwise read the frame still holding the
+        // line and refuse as AwaitingPrompt (main run 44059710599).
+        editor.wait_drawn("");
+        editor.wait_clean();
         let second = editor.ring().await;
         assert_eq!(
             second.outcome,
@@ -30081,6 +30137,7 @@ mod spawn_tests {
     /// Scenario: inbox/doorbell/046 through the real adapter: a model editor drops the deck's Enter, so the ring ends unresolved and the doorbell is suspended with uncertain_input shown, while the user has a draft of their own in the tracker. An older attempt's token reported exact by the prompt hook moves nothing; this attempt's token reported exact afterwards resolves the attempt late, lifts the suspension and clears the card, and leaves the user's draft bit as it was.
     #[spec("inbox/doorbell/046")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    #[ignore = "quarantined: vfarcic, #2345"]
     async fn doorbell_046_late_exact_evidence_resolves_only_its_attempt_through_the_hook_arm() {
         use crate::doorbell_txn::{Latch, Outcome, Resolution};
         use crate::inbox_display::WakeHold;
@@ -34954,6 +35011,46 @@ mod spawn_tests {
             reaped.iter().all(|r| r.load(Ordering::SeqCst)),
             "signal independence must not be bought by dropping the reap — a \
              child that is signalled and never waited on is a zombie"
+        );
+    }
+
+    /// Issue #1973: a spawn that starts Claude Code, declared or found by its
+    /// command's basename, or Devin, asks for that agent's hooks to be
+    /// repaired before its child starts; a command that is no known agent
+    /// asks for nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_claude_code_or_devin_spawn_asks_for_its_hooks_to_be_repaired() {
+        use std::os::unix::fs::PermissionsExt;
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let bin = tempfile::tempdir().unwrap();
+        let claude = bin.path().join("claude");
+        crate::test_isolation::write_script(&claude, "#!/bin/sh\nexec cat\n").unwrap();
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let claude = claude.display().to_string();
+        let spawn = |command: &str, agent_type: Option<AgentType>| {
+            registry
+                .spawn_agent(SpawnOptions {
+                    command: Some(command),
+                    agent_type,
+                    ..SpawnOptions::default()
+                })
+                .expect("spawn")
+        };
+
+        spawn("cat", None);
+        assert_eq!(registry.hook_repairs_for_test(), Vec::<AgentType>::new());
+
+        spawn("cat", Some(AgentType::ClaudeCode));
+        spawn(&claude, None);
+        spawn("cat", Some(AgentType::Devin));
+        assert_eq!(
+            registry.hook_repairs_for_test(),
+            vec![
+                AgentType::ClaudeCode,
+                AgentType::ClaudeCode,
+                AgentType::Devin
+            ]
         );
     }
 

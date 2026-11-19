@@ -467,7 +467,10 @@ Constraints:
     conflict resolution or the specific change the user asked for. No cargo fmt,
     no lint tidy-up, no unrelated edit, however obviously correct it looks. If
     the fix appears to need more than that, STOP and report instead of
-    broadening the patch.
+    broadening the patch. `cargo xtask affected-checks --run` runs `cargo fmt`
+    itself and names each file it reformatted: leave any of those outside that
+    scope unstaged and report them rather than pushing. Do not reset them with
+    `git checkout`, which also discards any other unstaged edit in the file.
     BEFORE EVERY push, not merely the first one of the
     session, show the user both of these and get a yes:
       git -C ../<repo>-pr-<n> diff <head-sha>..HEAD  # exactly what you would push

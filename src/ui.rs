@@ -13603,6 +13603,44 @@ fn rearm_trust_gate(
     }
 }
 
+/// Issue #1395: a compaction or `/clear` re-arm that could not read the tab's
+/// own context file re-sends the coordinator its role and protocol with no
+/// task ([`crate::orchestrator_context::reassert_orchestrator_prompt`]). Say so
+/// on the status line rather than only in the log, since a coordinator that
+/// was started with a task has just lost it from what it was told again.
+fn report_rearm_without_brief(
+    ui: &mut UiState,
+    orchestration: &str,
+    without_brief: Option<&crate::orchestrator_context::RearmWithoutBrief>,
+) {
+    use crate::orchestrator_context::RearmWithoutBrief;
+    let Some(without_brief) = without_brief else {
+        return;
+    };
+    let because = match without_brief {
+        RearmWithoutBrief::NoOwnFile => "this tab does not know its context file".to_string(),
+        RearmWithoutBrief::OwnFileUnreadable(reason) => {
+            format!("its context file could not be read: {reason}")
+        }
+    };
+    // Names an orchestration from the config and an OS error: shown, never
+    // obeyed.
+    let shown = crate::untrusted_text::escape_control_and_bidi(&rearm_without_brief_message(
+        orchestration,
+        &because,
+    ));
+    ui.status_message = Some((shown, std::time::Instant::now()));
+}
+
+/// The status-line sentence [`report_rearm_without_brief`] shows. The fact
+/// first, so a status row too narrow for the reason still carries it.
+fn rearm_without_brief_message(orchestration: &str, because: &str) -> String {
+    format!(
+        "Orchestration '{orchestration}': instructions re-sent to its coordinator without a \
+         task ({because})"
+    )
+}
+
 /// PRD #1885: restore a saved orchestration the startup restore held back,
 /// once its trust prompt was approved: re-resolved from the saved session and
 /// gated again, so what opens is exactly the approved text (and a config that
@@ -15986,6 +16024,11 @@ pub fn run_tui(
                         // deliberately a fresh cycle, not a retry of the old
                         // one.
 
+                        report_rearm_without_brief(
+                            &mut ui,
+                            &config.name,
+                            published.without_brief.as_ref(),
+                        );
                         *orchestrator_prompt = Some(published.prompt);
                         // Issue #1445: tell the daemon, so a TUI attaching
                         // later re-arms from this file and the end of the
@@ -16117,6 +16160,11 @@ pub fn run_tui(
                         if let Some(published) =
                             reassert_orchestrator_prompt(config, cwd, context_path.as_deref())
                         {
+                            report_rearm_without_brief(
+                                &mut ui,
+                                &config.name,
+                                published.without_brief.as_ref(),
+                            );
                             *orchestrator_prompt = Some(published.prompt);
                             // Issue #1445: as the compaction re-arm above.
                             pane.report_orchestrator_context(

@@ -921,6 +921,15 @@ enum InboxAction {
         #[arg(long, hide = true)]
         resumed: bool,
     },
+    /// Confirm a deck message Claude Code's prompt hook handed over once the
+    /// session transcript shows Claude took it (issue #2341). Started by
+    /// that hook, not by hand.
+    #[command(hide = true)]
+    Witness {
+        /// What to watch for, as the hook wrote it.
+        #[arg(long)]
+        plan: String,
+    },
     /// Tell the deck an agent's native inbox component is about to arm. Run
     /// by those components, not by hand.
     #[command(hide = true)]
@@ -2126,6 +2135,7 @@ fn main() -> ExitCode {
                 },
             ),
             InboxAction::Announce { agent } => dot_agent_deck::inbox_cli::announce(&agent),
+            InboxAction::Witness { plan } => dot_agent_deck::inbox_witness::run(&plan),
             InboxAction::Publish { topic, body } => {
                 dot_agent_deck::inbox_cli::publish(&topic, body.text, body.file)
             }
@@ -4391,7 +4401,14 @@ async fn run_daemon_serve_cli(
     // request once it is approved elsewhere or its text changes. Here rather
     // than in `run_daemon_with`, for the reason the pin refresh above is: an
     // in-process test daemon shares this process's one hub.
-    dot_agent_deck::trust_requests::install(daemon.event_tx.clone());
+    // Issue #2348: and it tells each agent it refused the answer, through
+    // that agent's inbox.
+    dot_agent_deck::trust_requests::install(
+        daemon.event_tx.clone(),
+        Some(dot_agent_deck::trust_requests::inbox_sink(
+            std::sync::Arc::downgrade(&daemon.pty_registry),
+        )),
+    );
     let trust_sweep = tokio::spawn(dot_agent_deck::trust_requests::run_sweep());
     let result = run_daemon_with(&path, daemon).await;
     pin_refresh.abort();

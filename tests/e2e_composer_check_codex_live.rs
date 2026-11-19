@@ -17,7 +17,9 @@
 //! into and emptied, which Codex draws with its placeholder, and `043`
 //! holds a visible draft with nothing typed, then checks the emptied box.
 //!
-//! `041` needs no model turn (nothing is submitted); `043` delivers tasks.
+//! `041` needs no model turn (nothing is submitted); `043` delivers tasks,
+//! one of them in a pane under 32 rows, where Codex draws no witness before
+//! its first prompt (issue #2262).
 #[path = "support/codex_installed.rs"]
 mod codex_installed;
 dot_agent_deck_test_harness::link!();
@@ -484,6 +486,69 @@ fn probe_043_live_a_touched_box_with_a_client_attached_is_checked_and_delivered(
         );
         codex.idle();
     }
+}
+
+/// Scenario: In real interactive Codex in an installed pane 27 rows by 162 columns, where Codex draws no start-up logo before its first prompt (issue #2262's pane), with a test-owned client attached that answers Codex's cursor position queries, type a draft into the box and delete it before Codex has had any prompt, then queue a sentinel task. The deck checks the touched box, reads it empty, rings, and the task is acted on and acknowledged after exactly one hand-over, where before the fix every check was refused until someone sent Codex a prompt.
+#[spec("inbox/probe/043")]
+#[test]
+fn probe_043_live_a_touched_box_in_a_short_pane_is_checked_before_any_prompt() {
+    skip_unless!(codex_installed::checkable());
+    let codex = Installed::sized(&[], (27, 162));
+    codex.assert_installed();
+    codex.wait_armable();
+    let record = codex.record();
+    assert_eq!(
+        (record["rows"].as_u64(), record["cols"].as_u64()),
+        (Some(27), Some(162)),
+        "{record}"
+    );
+    assert!(
+        !codex
+            .screen()
+            .chars()
+            .any(|c| ('\u{2800}'..='\u{28ff}').contains(&c)),
+        "the premise: no logo in a pane under 32 rows; {}",
+        codex.evidence()
+    );
+    let answerer = CprAnswerer::attach(codex.deck.attach_socket_path(), &codex.pane.agent, 27, 162);
+    let mut person = codex.input();
+    let draft = "p043-short-draft";
+    person.write(draft);
+    codex.expect_composer(draft);
+    person.write(&"\x7f".repeat(draft.len()));
+    let since = codex.log().len();
+    let name = "p043-short-0432.txt";
+    let id = codex.post(name);
+    let delivered = common::wait_until(BUDGET, || {
+        codex_installed::project_dir(&codex.deck)
+            .join(name)
+            .exists()
+    });
+    assert!(
+        delivered,
+        "the touched box in a short pane must be checked and the task delivered; {}",
+        codex.evidence()
+    );
+    codex.done(&id, name);
+    let log = codex.log()[since..].to_string();
+    let at = |needle: &str| log.lines().position(|l| l.contains(needle));
+    let (written, applied, rang) = (
+        log.lines()
+            .position(|l| l.contains("doorbell tick probe") && l.contains("outcome=Written")),
+        at("empty read applied"),
+        at("doorbell rang"),
+    );
+    assert!(
+        matches!((written, applied, rang), (Some(w), Some(a), Some(r)) if w < a && a < r),
+        "a check of the emptied box, its empty read, then the ring \
+         (written={written:?}, applied={applied:?}, rang={rang:?}); {}",
+        codex.evidence()
+    );
+    eprintln!(
+        "043 short pane: checked, one delivery: {}; cpr answers {}",
+        codex.message(&id),
+        answerer.answered()
+    );
 }
 
 /// For three seconds the task stays queued with no delivery, the draft is
