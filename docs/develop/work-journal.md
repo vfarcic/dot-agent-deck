@@ -46,7 +46,7 @@ Every line is one ASCII-escaped JSON object (non-ASCII written as `\u` escapes, 
 | `attempt_ended` | `attempt`; `how`: `exited`, `closed`, `replaced`, `replacement_failed`, `interrupted` or `unknown`; `code`?: the exit code, with `exited`; `cause`?: `daemon_shutdown` or `daemon_gone`, with `interrupted` |
 | `linked` | `refs`, the same shape as `opened.refs` (defined, not emitted yet: see below) |
 | `reported` | `report_id`; `task_id`?; `unit_id`?; `destination`: `inbox` or `recovery`; `to`?: the recipient's work id, when the deck knows it |
-| `closed` | `how`: `pane_closed`, `unit_ended`, `task_done`, `fire_done` or `orchestration_ended` |
+| `closed` | `how`: `pane_closed`, `unit_ended`, `task_done`, `fire_done`, `orchestration_ended`, `dismissed` or `reclaimed` (the last two added by PRD #1790 stage 2 under `v:1`: see [Interrupted work](#interrupted-work-prd-1790-stage-2)) |
 
 `work` on every kind is the work the event belongs to.
 
@@ -61,6 +61,8 @@ These ship in the first release, so a later schema can add to the journal withou
 - A final line with no `\n` is a torn write and is dropped.
 - A line over 4096 bytes is skipped without being buffered.
 - Lines are merged across files in `(ts_ms, run, seq)` order, and a second line with the same `run` and `seq` is a duplicate and dropped (a compacted chunk and a file it was folded from whose unlink failed can both be present).
+
+- A `closed` line whose `how` the reader does not know fails to decode and is skipped as unparsable (not as an unknown kind), so it does not stop launch-record pruning (`launch_read_incomplete`) and compaction carries it byte for byte. That is why PRD #1790's dismissal and reclaim are new `how` values rather than a new kind. The cost is a downgrade: a daemon older than PRD #1790 stage 2 does not see `closed how=dismissed` or `how=reclaimed`, so it lists the dismissed or reclaimed work as interrupted again.
 
 `read_journal` and `WorkJournal::read` apply all of these and return what they skipped in `ReadStats`. Recovery rewrites no file. Compaction carries a line it cannot read into its output byte for byte, up to 10,000 such lines per round (`carried_unreadable`); past that, and for a line over 4096 bytes or a torn tail, the line is discarded and counted in `CompactReport::discarded` (see [Budgets](#budgets)).
 
@@ -125,6 +127,18 @@ Stage 1 of PRD #1790 records, for every agent the daemon starts, what a later st
 **Launch-record retention follows the journal's.** After each compaction round the daemon reads the journal (`prune_launch_records`) and removes a record only when that read holds no line of the record's work, **and** the read is not one `launch_read_incomplete` flags, **and** the record is at least an hour old (`PRUNE_GRACE`). `launch_read_incomplete` checks exactly three things: the read was truncated, or it skipped a line of a newer schema, or a line of a kind this build does not know, since such a line may be the one naming the work. A line the reader skipped as unparsable, too long or torn does not stop a prune. So a record outlives its work's lines in the journal, which compaction drops under the limits in [Retention and compaction](#retention-and-compaction); the hour covers a record written while its work's `opened` was still queued for the writer, or after the read the prune compared against. An incomplete read removes no record. A record whose work the journal never held (its event dropped from a full queue) goes once the hour has passed, since no reader of the journal can find that work either. The same prune removes up to 256 temporary files a crash left behind, and only those whose name has exactly the temporary shape above and whose run is not live (`WorkJournal::run_is_live`: not this daemon's run, and its `run-<run>.lock` is missing or exists and is not held; a lock it cannot judge counts as live), so the temporary file of a writer whose run lock is held is not reached; this happens whether or not the read was complete. The prune looks at the store one listing window at a time (`MAX_LISTED` entries), each call starting where the previous one stopped (`launch_records::PruneWindow`), so on a store larger than one listing successive rounds move through the store instead of repeating its first window; it removes a record only on what it saw, never on an entry's absence from the listing.
 
 None of this changes the daemon's wire: no `PROTOCOL_VERSION` change, and nothing reaches a client yet.
+
+## Interrupted work (PRD #1790 stage 2)
+
+`src/interrupted_work.rs` derives the interrupted work list from a journal read, a launch-record read (`launch_records::read_all_with_stats`), whether each run is live (`WorkJournal::run_is_live`) and the kept report files (`RetainedStore::kept_reports`). It opens no file and runs no Git or forge query (resolving a workspace canonicalizes paths, as the redaction does): Git and forge facts are added by the caller, per [the authority boundary](#the-authority-boundary).
+
+- **Interrupted.** An attempt is interrupted when its `attempt_ended` (keyed by attempt id) says `interrupted`, or when it has no `attempt_ended` and its run is not live, since startup recovery may not have written the end yet. A work is interrupted when one of its attempts is and it has no `closed`.
+- **Items.** Works roll up to one item per root: a delegation rolls into its orchestration, and an orchestration into the dispatch or scheduled issue dispatch that started it. Any other parent (the dispatcher's pane or orchestration, a scheduled fire) is the item's launcher. The item kind is `unit` (root `dispatch`), `issue_dispatch`, `orchestration`, or `agent` (a pane, a scheduled fire's pane, or a root whose `opened` was not read). An item is listed when a work under it is interrupted and no work under it has a live attempt, or when it carries a kept report (below); never when its root has `closed how=dismissed` or `how=reclaimed`.
+- **Launch records** are joined by attempt and used only when the record is the one for its attempt and the journal holds that attempt under the record's work and otherwise only under delegations (whose `attempt_started` names their worker's generation). Anything else is ignored.
+- **Worktree.** The root's `workspace` (or the first one under the item) is resolved to an absolute path: a joined launch record's `cwd` that redacts to the same workspace is preferred, else the `~` is expanded against `$HOME` (`Workspace::to_path_with_home`).
+- **Reports left for a caller that is gone.** A `reported` line is joined to its retained file by report id. It is listed under its producer's item, closed or not, when the file was not acknowledged and either was adopted in state `p`, `r` or `u`, or the line says `destination=recovery`. Its "kept until" is the file's deadline.
+- **Incomplete.** A truncated journal or launch-record read sets `incomplete` on the list: an end or close that would hide an item may not have been read.
+- **Dismiss and reclaim** write `closed how=dismissed` or `how=reclaimed` on every work `works_under` names: the root, closed or not, and each work under it with no `closed` yet, so nothing under it is listed on its own later. Retention is unchanged: the work and the line that hides it age out together.
 
 ## The daemon's bookkeeping is bounded
 
