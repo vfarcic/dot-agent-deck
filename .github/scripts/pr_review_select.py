@@ -19,6 +19,7 @@ from pr_review_common import (  # noqa: E402
     deny_sort_key,
     describe_independent_review,
     GhError,
+    fail,
     gh_json,
     gh_json_paginated,
     focus_pass_requested,
@@ -177,6 +178,9 @@ def main():
     advisories = {}
     # What the vote job will do with each selected pull request, for the log.
     vote_notes = {}
+    # Pull requests that passed the filters needing no API read, and those of
+    # them skipped because a read failed (the `except GhError` below).
+    readable, unreadable = 0, []
     for pr in prs:
         try:
             number, sha = pr["number"], pr["headRefOid"]
@@ -193,6 +197,7 @@ def main():
             if (pr.get("headRepositoryOwner") or {}).get("login") != owner:
                 skipped.append((number, "fork"))
                 continue
+            readable += 1
 
             if pr.get("reviewDecision") == "CHANGES_REQUESTED":
                 # ... unless the only thing holding it is OUR OWN rejection, on a head
@@ -329,6 +334,7 @@ def main():
             # broken reviewer must be loud (`latest_verdict`).
             print(f"::warning::skipped #{pr['number']} this run: {exc}")
             skipped.append((pr["number"], f"could not be read this run: {exc}"))
+            unreadable.append(pr["number"])
             continue
 
     for number, why in skipped:
@@ -352,6 +358,17 @@ def main():
         out.write(f"items={json.dumps(items, separators=(',', ':'))}\n")
         out.write(f"count={len(items)}\n")
         out.write(f"live={'true' if live else 'false'}\n")
+
+    # Skipping an unreadable pull request is right when the others can still be
+    # read. When none of them can, GitHub (or this token) is failing for the
+    # whole repository, and a green run selecting nothing would hide that
+    # (Qodo on #2386). Written after the outputs, so the log above still names
+    # every skip.
+    if unreadable and len(unreadable) == readable:
+        fail(
+            f"every eligible pull request ({len(unreadable)}) failed a GitHub read "
+            "this run; see the warnings above"
+        )
 
 
 if __name__ == "__main__":

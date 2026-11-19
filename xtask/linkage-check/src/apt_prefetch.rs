@@ -13,8 +13,9 @@
 //! mirror list is a temporary file passed in `APT_PREFETCH_MIRRORS`. No
 //! network, no root.
 //!
-//! Unix-only, like `ci_unacquired_runners`: the script is bash, and its callers
-//! are Ubuntu jobs.
+//! Linux-only: the script's callers are Ubuntu jobs, and it edits the mirror
+//! list with GNU `sed -i`, which macOS's BSD `sed` would read as a backup
+//! suffix.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;

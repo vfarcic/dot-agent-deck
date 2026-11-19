@@ -1508,7 +1508,9 @@ assert '#1847' in log.getvalue(), log.getvalue()
 /// 2026-11-17 `pulls/2376/files` returned HTTP 500 under load, the exception
 /// left the selector's loop, `prepare` failed, and no pull request was
 /// reviewed. Now that pull request is skipped with a warning and the others are
-/// still selected, while an error that is not a failed `gh` call still raises.
+/// still selected; when every eligible one fails, the run fails rather than
+/// going green with nothing selected; and an error that is not a failed `gh`
+/// call still raises.
 #[test]
 fn a_pull_request_github_cannot_serve_is_skipped_not_fatal() {
     assert_py_ok(
@@ -1542,6 +1544,18 @@ items, log = run()
 assert [i['number'] for i in items] == [7, 9], items
 assert '::warning::skipped #8 this run' in log, log
 assert 'HTTP 500' in log, log
+def outage(repo, n):
+    raise GhError(f'gh api repos/o/r/pulls/{n}/files failed (1): HTTP 503')
+sel.touches_denied = outage
+err = io.StringIO()
+try:
+    with contextlib.redirect_stderr(err):
+        run()
+except SystemExit as exc:
+    assert exc.code == 1, exc.code
+    assert 'every eligible pull request (3) failed a GitHub read' in err.getvalue(), err.getvalue()
+else:
+    raise AssertionError('a repository-wide outage made the sweep green')
 def broken(repo, n):
     raise ValueError('verdict block is not valid JSON')
 sel.touches_denied = broken
