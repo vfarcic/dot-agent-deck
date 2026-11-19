@@ -63,23 +63,21 @@ function header(container: HTMLElement): HTMLElement {
   return top!;
 }
 
-// Keep the labelled-count grammar identical to e2e_inbox_status.rs.
-const oneOtherHeld = /(?:^|[^a-z0-9_])(?:1\s+(?:other|held|blocked)|(?:other|held|blocked)\s*:?\s*1)(?:$|[^a-z0-9_])/i;
-
+// Issue #2387: the header names the held agents, start role first, each
+// giving its hold's words on hover; `e2e_inbox_status.rs` reads the TUI's.
 function expectAttention(top: HTMLElement, reason = words.wakeHolds.possible_draft) {
-  expect(top).toHaveTextContent(/captain/i);
-  expect(top).toHaveTextContent(reason);
-  expect(top).toHaveTextContent(words.glyph);
-  expect(top).toHaveTextContent(oneOtherHeld);
+  expect(top).toHaveTextContent(`${words.glyph} ${words.attentionHeld}: Coordinator, Helper`);
+  expect(top.querySelector('[aria-label="Open Coordinator"]')).toHaveAttribute("title", reason);
+  expect(top).not.toHaveTextContent(reason);
   expect(top).not.toHaveTextContent(/coder/i);
 }
 
-function expectOnlyCount(top: HTMLElement) {
-  expect(top).not.toHaveTextContent(/captain|coder/i);
+/** Captain's hold cleared: only the other held worker is named. */
+function expectOnlyHelper(top: HTMLElement) {
+  expect(top).toHaveTextContent(`${words.glyph} ${words.attentionHeld}: Helper`);
+  expect(top).not.toHaveTextContent(/Coordinator|captain|coder/i);
   expect(top).not.toHaveTextContent(words.wakeHolds.possible_draft);
   expect(top).not.toHaveTextContent(words.wakeHolds.awaiting_prompt);
-  expect(top).toHaveTextContent(words.glyph);
-  expect(top).toHaveTextContent(oneOtherHeld);
 }
 
 function wake(agentId: string, paneId: string, hold?: string) {
@@ -90,8 +88,52 @@ function wake(agentId: string, paneId: string, hold?: string) {
   } });
 }
 
+// Issue #2387: the header counted held agents that no tile or row marked.
+describe("inbox/status/044 — held agents are marked where they are listed", () => {
+  /// Scenario: inbox/status/044 — Open the deck with two held agents and one with mail but no hold. Each held tile shows a `held` marker beside its status, giving the hold's words on hover; the agent with no hold has none; the header names exactly the marked agents, inline in the top bar, and clicking a name opens that agent.
+  it("marks each held tile and names exactly those agents in the header", () => {
+    const dto = snapshot();
+    dto.agents.push({ ...dto.agents[1], id: "10", incarnation: "daemon-a-generation-10", paneId: "quiet-pane", displayName: "Quiet",
+      tab: { kind: "orchestration", name: "team-away", orchestrationId: "away-19", roleIndex: 2, roleName: "tester", isStartRole: false },
+      inbox: { queued: 2, fetched: 0, undeliverable: 0, wake: "doorbell" } });
+    const mapped = mapDesktopSnapshot(dto);
+    const view = render(<DeckShell runtime={runtime(mapped)} initialView={{ kind: "deck" }} />);
+    const marked = (name: string) => screen.getByRole("article", { name: `team-away / ${name}` }).querySelector(".held-marker");
+    for (const name of ["Coordinator", "Helper"]) {
+      expect(marked(name), `${name}'s tile carries the marker`).not.toBeNull();
+      expect(marked(name)).toHaveTextContent(words.attentionHeld);
+      expect(marked(name)).toHaveAttribute("title", words.wakeHolds.possible_draft);
+    }
+    expect(marked("Quiet"), "no hold, no marker").toBeNull();
+    const top = header(view.container);
+    expect(top.querySelector(".deck-attention")?.parentElement, "inline in the top bar, not a row of its own").toBe(top.querySelector(".top-actions"));
+    expect(top).toHaveTextContent(`${words.glyph} ${words.attentionHeld}: Coordinator, Helper`);
+    expect(top).not.toHaveTextContent(/Quiet/);
+    expect(view.container.querySelector(".agent-pane-overlay"), "control: no agent is open yet").toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Open Helper" }));
+    const pane = view.container.querySelector<HTMLElement>(".agent-pane-overlay");
+    expect(pane, "the name opens that agent").not.toBeNull();
+    expect(pane).toHaveTextContent("Helper");
+    expect(pane).not.toHaveTextContent("Coordinator");
+  });
+
+  /// Scenario: inbox/status/044 — Open the agent dashboard over two connected daemons, each with one held agent. Each held row shows the `held` marker beside its status and the header names both agents, counting across every daemon the dashboard shows.
+  it("counts and marks held agents across every daemon on the dashboard", () => {
+    const local = mapDesktopSnapshot(snapshot(null));
+    const remoteDto = snapshot(null);
+    remoteDto.connection = { ...remoteDto.connection, deckId: "deck-remote-00000002", socketPath: "/tmp/remote.sock" };
+    const remote = mapDesktopSnapshot(remoteDto);
+    local.agents[1] = { ...local.agents[1], inbox: { ...local.agents[1].inbox!, wakeHold: "awaiting_prompt" } };
+    remote.agents[0] = { ...remote.agents[0], displayName: "Faraway", inbox: { ...remote.agents[0].inbox!, wakeHold: "cannot_type" } };
+    const view = render(<DeckShell runtime={{ ...runtime(local), fleet: [local, remote] }} initialView={{ kind: "overview" }} />);
+    const markers = Array.from(view.container.querySelectorAll(".overview-state .held-marker"));
+    expect(markers.map((marker) => marker.getAttribute("title")).sort()).toEqual([words.wakeHolds.awaiting_prompt, words.wakeHolds.cannot_type].sort());
+    expect(header(view.container)).toHaveTextContent(`${words.glyph} ${words.attentionHeld}: Faraway, Helper`);
+  });
+});
+
 describe("inbox/status/034 — orchestrator wake attention", () => {
-  /// Scenario: inbox/status/034 — Render an unselected start role's Diff tab with a possible draft, then open the real deck and select Coder while Captain remains held. The header must name Captain and count the other worker before and after selecting Coder, and retain attention through a dashboard round-trip with Coder selected again on return.
+  /// Scenario: inbox/status/034 — Render an unselected start role's Diff tab with a possible draft, then open the real deck and select Coder while Captain remains held. The header must name Captain first and the other held worker after it, giving Captain's hold on hover, before and after selecting Coder, and retain attention through a dashboard round-trip with Coder selected again on return.
   it("shows an off-selected-tab orchestrator in the deck header and on its tile", () => {
     const mapped = mapDesktopSnapshot(snapshot());
     const offTab = render(tile(mapped, "diff"));
@@ -114,7 +156,7 @@ describe("inbox/status/034 — orchestrator wake attention", () => {
     expectAttention(header(view.container));
   });
 
-  /// Scenario: inbox/status/034 — A connected real bridge receives a wake-update reason change and then its clear for the listed generation. The already-mounted tile and header must follow both without a replacement snapshot; clearing Captain's hold removes its header detail while the other held worker remains counted.
+  /// Scenario: inbox/status/034 — A connected real bridge receives a wake-update reason change and then its clear for the listed generation. The already-mounted tile and header must follow both without a replacement snapshot; clearing Captain's hold removes its name from the header while the other held worker stays named.
   it.each(["awaiting_prompt", null])("renders a broadcast reason change or clear (%s) without waiting for a snapshot", async (nextHold) => {
     invoke.mockResolvedValue(snapshot());
     const bridge = new TauriDeckBridge();
@@ -132,12 +174,12 @@ describe("inbox/status/034 — orchestrator wake attention", () => {
       expect(screen.getByRole("article", { name: "team-away / Coordinator" })).toHaveTextContent(nextHold ? words.wakeHolds.awaiting_prompt : words.wakeStalled);
       expect(header(view.container)).not.toHaveTextContent(words.wakeHolds.possible_draft);
       if (nextHold) expectAttention(header(view.container), words.wakeHolds.awaiting_prompt);
-      else expectOnlyCount(header(view.container));
+      else expectOnlyHelper(header(view.container));
       await act(async () => { wake("7", "captain-pane"); });
       view.rerender(shell());
       expect(screen.getByRole("article", { name: "team-away / Coordinator" })).not.toHaveTextContent(words.wakeHolds.awaiting_prompt);
       expect(screen.getByRole("article", { name: "team-away / Coordinator" })).toHaveTextContent(words.wakeStalled);
-      expectOnlyCount(header(view.container));
+      expectOnlyHelper(header(view.container));
     } finally { await bridge.dispose(); }
   });
 

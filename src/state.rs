@@ -10426,20 +10426,20 @@ impl AppState {
         })
     }
 
-    /// PRD #1666 part 3, round 5-wake (Q6): every pane whose current agent
-    /// generation the deck holds the doorbell for, with the words the
-    /// deck-wide attention item gives its hold
-    /// ([`crate::inbox_display::CardInbox::attention_words`]). Read from the
-    /// pane's account, which a generation change replaces, so a predecessor's
-    /// hold never marks its successor.
-    pub fn held_inbox_panes(&self) -> std::collections::BTreeMap<&str, String> {
-        self.pane_inboxes
-            .iter()
-            .filter_map(|(pane_id, inbox)| {
-                inbox
-                    .card()
-                    .attention_words()
-                    .map(|words| (pane_id.as_str(), words))
+    /// Issue #2387: every card the deck holds a message for, with the words
+    /// its `held` marker and the deck-wide attention item give the hold
+    /// ([`crate::inbox_display::CardInbox::attention_words`]). Read from each
+    /// card's own inbox ([`SessionState::card_inbox`]), the one that draws the
+    /// marker, so the header can never count an agent no card marks: a pane
+    /// account with no card on screen is not counted.
+    pub fn held_cards(&self) -> Vec<(&SessionState, String)> {
+        self.sessions
+            .values()
+            .filter_map(|session| {
+                session
+                    .card_inbox()
+                    .and_then(|inbox| inbox.attention_words())
+                    .map(|words| (session, words))
             })
             .collect()
     }

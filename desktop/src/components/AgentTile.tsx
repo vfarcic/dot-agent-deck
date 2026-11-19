@@ -33,7 +33,7 @@ import type {
 } from "../types";
 import { terminalInputState, type AgentRecordFreshness, type NoTerminalState } from "../lib/terminalInput";
 import { blockedReasonText } from "../lib/blockedReason";
-import { attentionReason, inboxActionText, inboxBadge, inboxNotice, inputHeldText, INBOX_WORDS } from "../lib/inboxWords";
+import { attentionReason, inboxActionText, inboxAttentionWords, inboxBadge, inboxNotice, inputHeldText, INBOX_WORDS } from "../lib/inboxWords";
 import { displayBackgroundWork, displayUptime } from "../lib/displayText";
 import { agentTitle } from "../lib/agentNames";
 import { OVERVIEW_CLOCK_TICK_MS } from "./AgentOverview";
@@ -475,6 +475,9 @@ export function AgentTile({
     fixture ? agent.model : undefined,
   ].filter((part): part is string => Boolean(part));
   const badge = inboxBadge(agent.inbox);
+  /* Issue #2387: the deck holds a message for this agent — the header names
+     exactly the agents this marks (`heldAgents`). */
+  const holdWords = inboxAttentionWords(agent.inbox);
   const inboxNoticeRow = inboxNotice(agent.inbox);
   const inputHeldRow = inputHeldText(agent.inputHeld, agent.inputDiscarded === true);
   const attention = agent.inbox?.attention ?? [];
@@ -559,6 +562,12 @@ export function AgentTile({
                 `last seen queued` do not parse, where `last seen: passed` does.
               */}
               <span className={`status-label status-${agent.status}${held ? " is-held" : ""}`}>{held ? `last seen: ${tileStatusLabel}` : tileStatusLabel}</span>
+              {/*
+                Issue #2387 — beside the status, never instead of it: the status
+                is what the agent is doing, this is what the deck is doing. Its
+                hover gives the hold's words, the ones the header's name gives.
+              */}
+              {holdWords && !held && <span className="held-marker" data-testid={`held-marker-${agent.id}`} title={holdWords}>{INBOX_WORDS.attentionHeld}</span>}
               {/* PRD #1401 — the agent's pull request, when the daemon found one. */}
               {agent.pullRequest && (
                 <PullRequestBadge

@@ -140,12 +140,10 @@ export const INBOX_WORDS = {
   actionUnsupported: "this deck cannot Retry or Cancel deck messages: upgrade dot-agent-deck",
   attentionTitle: "Deck messages",
   /**
-   * PRD #1666 part 3, round 5-wake (Q6): the header's attention item counts
-   * the held recipients other than the orchestrator it names (`· 1 other
-   * held`), or all of them when it names none (`✉ 2 held`).
+   * Issue #2387: the marker a held agent's tile and row carry beside its
+   * status, and the word the header's attention item names them with
+   * (`✉ held: Captain, coder`) or counts them with (`✉ 4 held`).
    */
-  attentionOtherHeld: "other held",
-  /** `attentionOtherHeld`'s count when no orchestrator is named. */
   attentionHeld: "held",
   /**
    * PRD #1666 part 3, round 5-wake: what ended an agent's pane before it took
@@ -318,24 +316,45 @@ export function inboxAttentionWords(inbox: AgentInbox | undefined): string | und
 }
 
 /**
- * PRD #1666 part 3, round 5-wake (Q6): the deck-wide attention item both
- * clients show in their header: `✉ <orchestrator>: <its hold> · 1 other held`,
- * or `✉ 2 held` with no orchestrator held, or nothing. The first held agent of
- * an orchestration's start role is named, whatever the role is called; every
- * other held agent is counted. The TUI's `deck_attention_text` is the same.
+ * Issue #2387: the most held agents the header's attention item names; with
+ * more it counts them. The TUI's `DECK_ATTENTION_MAX_NAMES` is the same.
  */
-export function deckAttentionText(agents: readonly AgentSession[]): string | undefined {
+export const DECK_ATTENTION_MAX_NAMES = 3;
+
+/** A held agent, with the words its `held` marker gives on hover. */
+export type HeldAgent = { agent: AgentSession; name: string; words: string };
+
+/**
+ * Issue #2387: the agents whose tile or row carries the `held` marker — the
+ * ones `inboxAttentionWords` gives words — in the order the header names
+ * them: orchestration start roles first, then by name. The header counts
+ * exactly these, so it can never count an agent no tile marks. The TUI's
+ * `deck_attention` builds the same list from its cards.
+ */
+export function heldAgents(agents: readonly AgentSession[]): HeldAgent[] {
   const held = agents.flatMap((agent) => {
     const words = inboxAttentionWords(agent.inbox);
-    return words === undefined ? [] : [{ agent, words }];
+    return words === undefined ? [] : [{ agent, name: agent.displayName || agent.role, words }];
   });
-  const named = held.find((entry) => entry.agent.isStartRole);
-  const others = held.length - (named ? 1 : 0);
-  if (named) {
-    const head = `${INBOX_WORDS.glyph} ${named.agent.role}: ${named.words}`;
-    return others > 0 ? `${head} · ${others} ${INBOX_WORDS.attentionOtherHeld}` : head;
-  }
-  return others > 0 ? `${INBOX_WORDS.glyph} ${others} ${INBOX_WORDS.attentionHeld}` : undefined;
+  const key = (entry: HeldAgent) => entry.name.toLowerCase();
+  return held.sort((a, b) => Number(Boolean(b.agent.isStartRole)) - Number(Boolean(a.agent.isStartRole)) || (key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0));
+}
+
+/**
+ * Issue #2387: the header's attention item for `names`, the held agents in
+ * {@link heldAgents}' order: `✉ held: Captain, coder`, or `✉ 4 held` past
+ * {@link DECK_ATTENTION_MAX_NAMES}, or nothing. The TUI's
+ * `deck_attention_text` is the same.
+ */
+export function deckAttentionNamesText(names: readonly string[]): string | undefined {
+  if (names.length === 0) return undefined;
+  if (names.length > DECK_ATTENTION_MAX_NAMES) return `${INBOX_WORDS.glyph} ${names.length} ${INBOX_WORDS.attentionHeld}`;
+  return `${INBOX_WORDS.glyph} ${INBOX_WORDS.attentionHeld}: ${names.join(", ")}`;
+}
+
+/** {@link deckAttentionNamesText} for the held ones among `agents`. */
+export function deckAttentionText(agents: readonly AgentSession[]): string | undefined {
+  return deckAttentionNamesText(heldAgents(agents).map((entry) => entry.name));
 }
 
 /**
