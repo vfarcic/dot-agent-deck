@@ -2341,6 +2341,12 @@ function DeckGroup({ deck, cardsBody, now, columns, filtering, fleetSize, overri
       aria-labelledby={titleId}
     >
       <header className="daemon-group-header">
+        {/*
+          Issue #2406: the row is its own box, so the connection message can
+          sit on a line of its own below it instead of competing with the
+          name, the Host button, the pips and the buttons for the row's width.
+        */}
+        <div className="daemon-group-header-row">
         <span className={`connection-lamp connection-${connection.status}`} aria-hidden="true" />
         <div className="daemon-identity">
           {/*
@@ -2352,14 +2358,6 @@ function DeckGroup({ deck, cardsBody, now, columns, filtering, fleetSize, overri
         </div>
         {/* PRD #1258: this deck's host, from its own daemon — a small button beside its name, coloured by the worst reading, that opens the numbers. Every deck in a fleet has its own. */}
         {deck.connected && deck.snapshot.hostMetrics && <HostMetricsButton report={deck.snapshot.hostMetrics} deckLabel={deckName(connection)} open={hostOpen} onOpen={onOpenHost} onClose={onCloseHost} />}
-        {/*
-          Only when it says something the lamp does not. The element is
-          not deleted — in the disconnected, incompatible and
-          connected-anyway states it carries the only explanation on the
-          header, including the build-mismatch caveat issue #801 requires
-          to survive the whole session.
-        */}
-        {messageSaysSomethingNew && <p className="daemon-state" data-testid="daemon-state">{daemonMessage ?? connection.status}</p>}
         {deck.connected && deck.agents.length > 0 && (
           <div className="daemon-pips">{deck.counts.map((entry) => (
             <span className={`status-label status-${entry.status}`} key={entry.status}>{entry.count} {statusLabel(entry.status)}</span>
@@ -2374,6 +2372,18 @@ function DeckGroup({ deck, cardsBody, now, columns, filtering, fleetSize, overri
         {onUpgrade && !upgradeInNote && <button type="button" className="button primary compact daemon-upgrade" data-testid="daemon-upgrade" aria-label={upgradeLabel ?? `Upgrade the daemon on ${connection.deckKind === "remote" ? deckName(connection) : "this machine"}`} title={upgradeTitle} onClick={onUpgrade}><CircleArrowUp size={13} /><span>Upgrade</span></button>}
         {(onStopDaemon || stopDaemonReason) && <button type="button" className="button secondary compact daemon-stop" data-testid="daemon-stop" aria-label={`Stop the daemon on ${connection.deckKind === "remote" ? deckName(connection) : "this machine"}`} title={stopDaemonReason ? displayTitle(stopDaemonReason) : undefined} disabled={!onStopDaemon} onClick={onStopDaemon}><CircleStop size={13} /><span>Stop daemon</span></button>}
         {onNewAgent && <button type="button" className="button secondary compact daemon-new-agent" data-testid="daemon-new-agent" aria-label={`New agent on ${deckName(connection)}`} onClick={onNewAgent}><Plus size={13} /><span>New agent</span></button>}
+        </div>
+        {/*
+          Only when it says something the lamp does not. The element is
+          not deleted — in the disconnected, incompatible and
+          connected-anyway states it carries the only explanation on the
+          header, including the build-mismatch caveat issue #801 requires
+          to survive the whole session. It has a line of its own below the
+          row and wraps rather than truncating, so the whole sentence reads
+          and the row's controls keep their layout whatever its length
+          (issue #2406); with no message there is no second line.
+        */}
+        {messageSaysSomethingNew && <p className="daemon-state" data-testid="daemon-state">{daemonMessage ?? connection.status}</p>}
       </header>
 
       {/* Issue #1637: this deck's agents' hooks run an older dot-agent-deck. */}

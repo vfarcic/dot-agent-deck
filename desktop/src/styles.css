@@ -1551,14 +1551,22 @@ button.deck-attention-name { text-decoration: underline; text-underline-offset: 
 /* The em dash where a connected deck's pips are, so "unknown" and "none" read
    differently on the same line. */
 .daemon-unknown { margin-left: auto; color: var(--faint); font-family: "JetBrains Mono", monospace; font-size: var(--text-base); }
-.daemon-group-header { min-height: 50px; padding: 9px 13px; display: flex; align-items: center; gap: 11px; border-bottom: 1px solid var(--line); background: var(--paper-strong); border-radius: var(--radius) var(--radius) 0 0; }
+/* Issue #2406: the header is a column — the row of controls, then the
+   connection message on a line of its own when there is one. The row keeps the
+   layout the header used to have; the 50px floor stays on the header, with the
+   row centred in it, so a deck with nothing to say is exactly as tall as it was. */
+.daemon-group-header { min-height: 50px; padding: 9px 13px; display: flex; flex-direction: column; justify-content: center; gap: 4px; border-bottom: 1px solid var(--line); background: var(--paper-strong); border-radius: var(--radius) var(--radius) 0 0; }
+.daemon-group-header-row { display: flex; align-items: center; gap: 11px; }
 /* One line, not two: the socket filename that used to sit under the name is
    gone from the layout and lives on the name's own `title` — it contained the
    very uid it was meant to keep out of a screenshot and said nothing a reader
    could act on (PRD #745). */
 .daemon-identity { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
 .daemon-identity strong { font-size: var(--text-lg); font-weight: 720; }
-.daemon-state { min-width: 0; margin: 0; overflow: hidden; color: var(--faint); font-size: var(--text-base); text-overflow: ellipsis; white-space: nowrap; }
+/* Below the row, indented to start under the deck's name (the lamp's 9px plus
+   the row's 11px gap), and wrapping rather than ellipsised: it is the whole
+   explanation on the header, and issue #801's caveat has to read in full. */
+.daemon-state { margin: 0; padding-left: 20px; color: var(--faint); font-size: var(--text-base); overflow-wrap: anywhere; }
 .daemon-pips { margin-left: auto; display: flex; flex-wrap: wrap; gap: 5px; }
 .daemon-group-body { padding: 11px 12px 13px; }
 /* PRD #1258: the deck's host — a compact button beside the deck's name,
