@@ -1311,6 +1311,14 @@ impl TuiDeck {
         // 20's pins, and finally layer the test's `with_env` overrides
         // (so a test asking for `NO_COLOR=1` still wins).
         let state_dir = work.join("state");
+        // Reminder tests override these paths below. Other PTY tests get
+        // dismissed scratch states, including real agents started by the form.
+        let star_prompt_path = work.join("star-prompt-state.json");
+        let antigravity_notice_path = work.join("antigravity-notice-state.json");
+        for path in [&star_prompt_path, &antigravity_notice_path] {
+            std::fs::write(path, r#"{"permanently_dismissed":true}"#)
+                .expect("seed dismissed scratch reminder");
+        }
         // Pin the XDG config root inside the isolated HOME. `env_clear` above
         // already drops the host's value, but an agent adapter that resolves its
         // config the XDG way (Devin does — see `devin_hooks_manage`) would then
@@ -1326,6 +1334,18 @@ impl TuiDeck {
                 xdg_config_home.to_str().expect("XDG config path is UTF-8"),
             ),
             ("COLORTERM", "truecolor"),
+            (
+                "DOT_AGENT_DECK_STAR_PROMPT",
+                star_prompt_path
+                    .to_str()
+                    .expect("star prompt path is UTF-8"),
+            ),
+            (
+                "DOT_AGENT_DECK_ANTIGRAVITY_NOTICE",
+                antigravity_notice_path
+                    .to_str()
+                    .expect("Antigravity notice path is UTF-8"),
+            ),
             // M2.1 auditor S3: pin SHELL so portable-pty cannot leak
             // the parent password DB entry on Unix. /bin/sh is
             // sufficient for the deck's spawn paths.

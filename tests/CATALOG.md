@@ -8026,6 +8026,52 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Does not assert:** a real model's scheduling or an OSC read before a newer hook but applied afterwards; the daemon regression covers that ordering directly.
 - **Platform coverage:** mac+linux.
 
+#### antigravity/notice
+
+##### antigravity/notice/001 — The first user-started Antigravity shows its experimental notice.
+
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_antigravity_notice.rs`).
+- **Agent:** captured Antigravity stand-in `tests/fixtures/antigravity/agy`.
+- **Asserts:** starting through the TUI's New Agent form with fresh state shows the experimental title, feedback request, repository issues address and Open issues, Later and Don't show again choices.
+- **Does not assert:** opening a browser or desktop rendering.
+- **Platform coverage:** mac+linux.
+
+##### antigravity/notice/002 — Dialog keys stay out of the Antigravity pane and Escape restores focus.
+
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_antigravity_notice.rs`).
+- **Agent:** captured Antigravity stand-in with its raw input log.
+- **Asserts:** an unrelated letter and the dismissing Escape leave the stand-in's input log unchanged; a marker typed afterward reaches its composer through the attached TUI.
+- **Platform coverage:** mac+linux.
+
+##### antigravity/notice/003 — Later delays the notice until the hundredth subsequent Antigravity start.
+
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_antigravity_notice.rs`).
+- **Agent:** captured Antigravity stand-in.
+- **Asserts:** Later after the first start persists the showing count; the second start and the 99th since the showing have no notice, while the 100th since that showing does. Separate TUI launches share a scratch state file.
+- **Platform coverage:** mac+linux.
+
+##### antigravity/notice/004 — Don't show again persists across a later due Antigravity start.
+
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_antigravity_notice.rs`).
+- **Agent:** captured Antigravity stand-in.
+- **Asserts:** pressing `d` dismisses the dialog and saves a permanent choice; preserving that choice while advancing the start count past the interval keeps a subsequent start free of the notice.
+- **Platform coverage:** mac+linux.
+
+##### antigravity/notice/005 — Other agents neither show nor advance the Antigravity notice.
+
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_antigravity_notice.rs`).
+- **Agent:** Claude-labelled stand-in from the Antigravity fixture.
+- **Asserts:** starting `./claude` through New Agent shows the pane without the Antigravity notice and leaves its scratch start counter at zero.
+- **Platform coverage:** mac+linux.
+
+##### antigravity/notice/006 — The TUI honours a permanent choice saved in the shared state file.
+
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_antigravity_notice.rs`).
+- **Agent:** captured Antigravity stand-in.
+- **Asserts:** a permanent choice seeded in the clients' shared scratch state file suppresses a due notice when Antigravity starts through the TUI.
+- **Does not assert:** the future shared Rust state API or the desktop dialog; this scenario seeds its JSON directly.
+- **Platform coverage:** mac+linux.
+
 #### antigravity/status
 
 ##### antigravity/status/001 — Captured Antigravity hooks drive the visible prompt, running command and ordinary turn end.
