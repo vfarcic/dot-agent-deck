@@ -11,6 +11,7 @@ import {
   CircleArrowUp as ArrowUpCircleIcon,
   CircleStop,
   Command,
+  FlaskConical,
   FolderGit2,
   Gauge,
   GitBranch,
@@ -632,10 +633,13 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   /**
    * PRD #211 — the Antigravity experimental notice, shown after a New agent
    * start of Antigravity, on the first and then every hundredth such start
-   * of either client. Open issues' sentence goes in the star toast, which is
-   * the reminders' one place to report a choice.
+   * of either client. Open issues' sentence, or why a choice could not be
+   * saved, goes in a toast slot of its own, whose close button names the
+   * notice rather than the star reminder.
    */
-  const antigravityNotice = useAntigravityNotice(runtime, setStarNotice);
+  const [antigravityToast, setAntigravityToast] = useState<string>(); // voice-registry-exempt: the Antigravity notice's sentence in the toast, reporting what its choice did
+  const antigravityNotice = useAntigravityNotice(runtime, setAntigravityToast);
+  const dismissAntigravityToast = useCallback(() => setAntigravityToast(undefined), []);
   /**
    * Issue #2330 — what the review a deck asked for left behind: approved (and
    * who will start it), declined, or answered elsewhere. The shell's, because
@@ -1420,11 +1424,11 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
           mounted together, so there is at most one toast. The cleanup
           warnings ride with it but outlive it (issue #1234).
         */}
-        <Toast message={runtime.error} onDismiss={runtime.clearError} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} restart={restart.notice} onDismissRestart={restart.dismiss} worktrees={runtime.worktreeKept} onDismissWorktree={runtime.dismissWorktreeKept} star={starNotice} onDismissStar={dismissStarNotice} trust={trustNotice} onDismissTrust={dismissTrustNotice} />
+        <Toast message={runtime.error} onDismiss={runtime.clearError} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} restart={restart.notice} onDismissRestart={restart.dismiss} worktrees={runtime.worktreeKept} onDismissWorktree={runtime.dismissWorktreeKept} star={starNotice} onDismissStar={dismissStarNotice} antigravity={antigravityToast} onDismissAntigravity={dismissAntigravityToast} trust={trustNotice} onDismissTrust={dismissTrustNotice} />
       </>
     )
     // voice-registry-exempt: the deck's navigator, which it names as `navigate` in its own registry context and dispatches through `VOICE_ACTIONS`
-    : <DeckSurface runtime={runtime} settings={settings} orchestrationPlatformIssue={orchestrationPlatformIssue} onNavigate={setView} openAgent={openAgent} onCloseAgent={closeAgent} stopContext={agentStopContext} voiceChannel={deckVoiceContext} overlays={deckOverlays} onConfirmationChange={setConfirmationOpen} onPaneTabChange={setPaneTab} restartNotice={restart.notice} onDismissRestartNotice={restart.dismiss} starNotice={starNotice} onDismissStarNotice={dismissStarNotice} trustNotice={trustNotice} onDismissTrustNotice={dismissTrustNotice} />;
+    : <DeckSurface runtime={runtime} settings={settings} orchestrationPlatformIssue={orchestrationPlatformIssue} onNavigate={setView} openAgent={openAgent} onCloseAgent={closeAgent} stopContext={agentStopContext} voiceChannel={deckVoiceContext} overlays={deckOverlays} onConfirmationChange={setConfirmationOpen} onPaneTabChange={setPaneTab} restartNotice={restart.notice} onDismissRestartNotice={restart.dismiss} starNotice={starNotice} onDismissStarNotice={dismissStarNotice} antigravityNotice={antigravityToast} onDismissAntigravityNotice={dismissAntigravityToast} trustNotice={trustNotice} onDismissTrustNotice={dismissTrustNotice} />;
   /*
     PRD #802 M6 — the voice surface is a SIBLING of the screen switch, and this
     shape is the whole of that decision.
@@ -1770,7 +1774,7 @@ function tileKey(agent: { daemonId: string; id: string; incarnation?: string }):
   return `${agent.daemonId}\u0000${agent.id}\u0000${agent.incarnation ?? ""}`;
 }
 
-export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = desktopOrchestrationPlatformIssue(), onNavigate, openAgent, onCloseAgent, stopContext, voiceChannel, overlays: shellOverlays, onConfirmationChange, onPaneTabChange, restartNotice, onDismissRestartNotice, starNotice, onDismissStarNotice, trustNotice, onDismissTrustNotice }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; orchestrationPlatformIssue?: string; onNavigate?: (view: DeckView) => void; openAgent?: { deckId: string; agentId: string; incarnation?: string }; onCloseAgent?: () => void; stopContext?: AgentTileProps["stopContext"]; voiceChannel?: VoiceContextChannel; overlays?: ScreenOverlays; onConfirmationChange?: (open: boolean) => void; onPaneTabChange?: (tab: PanelTab) => void; restartNotice?: string; onDismissRestartNotice?: () => void; starNotice?: string; onDismissStarNotice?: () => void; trustNotice?: TrustRequestNotice; onDismissTrustNotice?: () => void }) {
+export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = desktopOrchestrationPlatformIssue(), onNavigate, openAgent, onCloseAgent, stopContext, voiceChannel, overlays: shellOverlays, onConfirmationChange, onPaneTabChange, restartNotice, onDismissRestartNotice, starNotice, onDismissStarNotice, antigravityNotice, onDismissAntigravityNotice, trustNotice, onDismissTrustNotice }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; orchestrationPlatformIssue?: string; onNavigate?: (view: DeckView) => void; openAgent?: { deckId: string; agentId: string; incarnation?: string }; onCloseAgent?: () => void; stopContext?: AgentTileProps["stopContext"]; voiceChannel?: VoiceContextChannel; overlays?: ScreenOverlays; onConfirmationChange?: (open: boolean) => void; onPaneTabChange?: (tab: PanelTab) => void; restartNotice?: string; onDismissRestartNotice?: () => void; starNotice?: string; onDismissStarNotice?: () => void; antigravityNotice?: string; onDismissAntigravityNotice?: () => void; trustNotice?: TrustRequestNotice; onDismissTrustNotice?: () => void }) {
   const { mode, setShownTerminals } = runtime;
   const keyboardInput = useKeyboardInput(runtime.sendTerminalInput);
   // #1083: this screen cannot merge across decks, so under All Decks it shows
@@ -2892,7 +2896,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
           mounts its own copy of this over `runtime.error` alone (audit W2) —
           it has no notice of its own, and it is not mounted at the same time
           as this one. */}
-      <Toast message={notice || runtime.error} detail={notice ? noticeState?.detail : undefined} onDismiss={dismissToast} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} restart={restartNotice} onDismissRestart={onDismissRestartNotice} worktrees={runtime.worktreeKept} onDismissWorktree={runtime.dismissWorktreeKept} star={starNotice} onDismissStar={onDismissStarNotice} trust={trustNotice} onDismissTrust={onDismissTrustNotice} />
+      <Toast message={notice || runtime.error} detail={notice ? noticeState?.detail : undefined} onDismiss={dismissToast} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} restart={restartNotice} onDismissRestart={onDismissRestartNotice} worktrees={runtime.worktreeKept} onDismissWorktree={runtime.dismissWorktreeKept} star={starNotice} onDismissStar={onDismissStarNotice} antigravity={antigravityNotice} onDismissAntigravity={onDismissAntigravityNotice} trust={trustNotice} onDismissTrust={onDismissTrustNotice} />
     </div>
   );
 }
@@ -2918,7 +2922,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
  * while a warning that roles may still be running ends only when the user
  * dismisses THAT warning.
  */
-function Toast({ message, detail, onDismiss, warnings, onDismissWarning, restart, onDismissRestart, worktrees, onDismissWorktree, star, onDismissStar, trust, onDismissTrust }: { message?: string; detail?: string; onDismiss: () => void; warnings?: readonly CleanupWarningEntry[]; onDismissWarning?: (id: number) => void; restart?: string; onDismissRestart?: () => void; worktrees?: readonly WorktreeKeptEntry[]; onDismissWorktree?: (id: number) => void; star?: string; onDismissStar?: () => void; trust?: TrustRequestNotice; onDismissTrust?: () => void }) {
+function Toast({ message, detail, onDismiss, warnings, onDismissWarning, restart, onDismissRestart, worktrees, onDismissWorktree, star, onDismissStar, antigravity, onDismissAntigravity, trust, onDismissTrust }: { message?: string; detail?: string; onDismiss: () => void; warnings?: readonly CleanupWarningEntry[]; onDismissWarning?: (id: number) => void; restart?: string; onDismissRestart?: () => void; worktrees?: readonly WorktreeKeptEntry[]; onDismissWorktree?: (id: number) => void; star?: string; onDismissStar?: () => void; antigravity?: string; onDismissAntigravity?: () => void; trust?: TrustRequestNotice; onDismissTrust?: () => void }) {
   /* The newest entries are at the bottom, so an overflowing stack is kept
      scrolled there whenever something is added or the message changes. */
   const stack = useRef<HTMLDivElement>(null);
@@ -2926,8 +2930,8 @@ function Toast({ message, detail, onDismiss, warnings, onDismissWarning, restart
   const newestWorktree = worktrees?.at(-1)?.id;
   useEffect(() => {
     if (stack.current) stack.current.scrollTop = stack.current.scrollHeight;
-  }, [newestWarning, newestWorktree, message, restart, star, trust]);
-  if (!message && !warnings?.length && !restart && !worktrees?.length && !star && !trust) return null;
+  }, [newestWarning, newestWorktree, message, restart, star, antigravity, trust]);
+  if (!message && !warnings?.length && !restart && !worktrees?.length && !star && !antigravity && !trust) return null;
   return (
     <div className="toast-stack" ref={stack}>
       {worktrees?.map((kept) => (
@@ -2965,6 +2969,14 @@ function Toast({ message, detail, onDismiss, warnings, onDismissWarning, restart
           <StarIcon size={15} />
           <div className="toast-body"><span>{star}</span></div>
           <button aria-label="Dismiss star message" onClick={onDismissStar}><X size={14} /></button>
+        </div>
+      )}
+      {/* PRD #211: the Antigravity notice's sentence, in a slot of its own so its close button names that notice. */}
+      {antigravity && (
+        <div className="toast" data-testid="antigravity-toast" role="status">
+          <FlaskConical size={15} />
+          <div className="toast-body"><span>{antigravity}</span></div>
+          <button aria-label="Dismiss Antigravity message" onClick={onDismissAntigravity}><X size={14} /></button>
         </div>
       )}
       {/* Issue #2330: what an in-deck approval request's review did, in a slot of its own so an action's sentence never replaces it unseen. */}

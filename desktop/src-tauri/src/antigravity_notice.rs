@@ -141,6 +141,29 @@ mod tests {
         assert_eq!(starts(&path), 1);
     }
 
+    /// The New agent dialog announces the command it actually started
+    /// (`NewAgentDialog.tsx`'s `startCommand`), so a built-in mode's empty
+    /// Command field arrives already resolved to the deck's `default_command`
+    /// (`resolveAuthoringCommand`), and a plain start's empty field arrives as
+    /// no command, because the deck runs its default shell for it. The crate
+    /// counts the first and not the second, whatever `default_command` is.
+    #[test]
+    fn a_start_counts_by_the_command_it_spawned() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notice.json");
+        // A plain start with an empty field: the deck's shell.
+        assert!(!record_start(&path, None));
+        assert_eq!(starts(&path), 0);
+        // A dispatcher start with an empty field on a deck whose
+        // `default_command` is `agy`, resolved and trimmed by the dialog.
+        assert!(record_start(&path, Some("agy")));
+        // The same default with arguments, and a typed command with spaces
+        // around it, which the dialog sends as typed.
+        assert!(!record_start(&path, Some("agy --model x")));
+        assert!(!record_start(&path, Some("  agy  ")));
+        assert_eq!(starts(&path), 3, "each Antigravity start counts once");
+    }
+
     #[test]
     fn the_first_start_and_every_hundredth_after_show_whichever_client_it_is() {
         let dir = tempfile::tempdir().unwrap();

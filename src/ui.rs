@@ -10628,6 +10628,25 @@ fn build_new_pane_request(form: &NewPaneFormState, default_command: &str) -> New
     }
 }
 
+/// The agent a non-orchestration New Agent start runs, inferred from the
+/// command it actually spawns (PRD #76 M2.13), which is also what PRD #211's
+/// Antigravity notice counts by.
+///
+/// `req.command` is already the spawned command: [`build_new_pane_request`]
+/// resolves a built-in option's empty Command field to `default_command`
+/// (then `claude`), so an empty field there counts as whatever that resolves
+/// to. A plain start's empty field stays empty, and the daemon runs its
+/// default shell for it (`agent_pty`'s no-command fallback), which is no
+/// agent: `default_command` only pre-fills that field, it is never
+/// substituted at spawn.
+fn new_pane_spawn_agent_type(req: &NewPaneRequest) -> Option<AgentType> {
+    if req.command.is_empty() {
+        None
+    } else {
+        AgentType::from_command(Some(req.command.as_str()))
+    }
+}
+
 /// Issue #555: the daemon refused an orchestration start because its run
 /// title is already held by another live orchestration in the same directory
 /// — the case the form's own check could not see, since its snapshot of live
@@ -12589,11 +12608,7 @@ fn dispatch_action(
                     // a remote reconnect's hydration carries it; the local
                     // placeholder stays at `None` until the first `SessionStart`
                     // hook fires (pre-M2.13 contract).
-                    let spawn_agent_type = if req.command.is_empty() {
-                        None
-                    } else {
-                        AgentType::from_command(Some(req.command.as_str()))
-                    };
+                    let spawn_agent_type = new_pane_spawn_agent_type(&req);
                     // PRD #211: a user-started Antigravity start counts towards
                     // the experimental notice, once the daemon accepts it.
                     let starts_antigravity = spawn_agent_type == Some(AgentType::Antigravity);
@@ -50762,6 +50777,67 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// PRD #211: a New Agent start is told apart by the command it spawns,
+    /// not by what was typed. With `default_command = "agy"`, a built-in
+    /// option's empty Command field starts `agy` and is an Antigravity start;
+    /// a plain start's empty field starts the daemon's shell and is not; and a
+    /// typed `agy` is one either way.
+    #[test]
+    fn antigravity_start_is_told_by_the_spawned_command() {
+        let form = |command: &str| {
+            NewPaneFormState::new(
+                PathBuf::from("/tmp"),
+                String::new(),
+                command.to_string(),
+                vec![],
+            )
+        };
+        let spawned = |f: &NewPaneFormState| {
+            let req = build_new_pane_request(f, "  agy  ");
+            (req.command.clone(), new_pane_spawn_agent_type(&req))
+        };
+
+        // A plain start with an empty field runs the shell: no agent.
+        assert_eq!(spawned(&form("")), (String::new(), None));
+        // A plain start of a typed `agy`.
+        assert_eq!(
+            spawned(&form("agy")),
+            ("agy".to_string(), Some(AgentType::Antigravity))
+        );
+
+        // Every built-in option resolves an empty field to `default_command`
+        // (trimmed), so it starts `agy`.
+        let mut f = form("");
+        let mut builtins = Vec::new();
+        for _ in 0..8 {
+            f.select_next_mode();
+            if let Some(builtin) = f.selected_builtin()
+                && !builtins.contains(&builtin)
+            {
+                builtins.push(builtin);
+                assert_eq!(
+                    spawned(&f),
+                    ("agy".to_string(), Some(AgentType::Antigravity)),
+                    "{builtin:?}"
+                );
+            }
+        }
+        assert!(
+            builtins.contains(&BuiltinOption::Schedule)
+                && builtins.contains(&BuiltinOption::Dispatcher),
+            "the Mode row offered {builtins:?}"
+        );
+
+        // A built-in option with another command typed starts that command.
+        let mut f = form("claude");
+        f.select_next_mode();
+        assert!(f.selected_builtin().is_some());
+        assert_eq!(
+            spawned(&f),
+            ("claude".to_string(), Some(AgentType::ClaudeCode))
+        );
     }
 
     /// PRD #211: a UI whose Antigravity notice state is a scratch file, and

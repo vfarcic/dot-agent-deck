@@ -245,6 +245,57 @@ describe("the Antigravity notice in the app", () => {
     expect(antigravityNoticeChoose).toHaveBeenCalledExactlyOnceWith("dismiss");
   });
 
+  /** Open New agent on a deck whose `default_command` is `agy`, use the home directory, and clear the Command field. */
+  async function blankCommandOnAgyDeck(): Promise<HTMLElement> {
+    fireEvent.click(await screen.findByTestId("overview-new-agent"));
+    const dialog = await screen.findByTestId("new-agent-dialog");
+    await waitFor(() => expect(within(dialog).getByTestId("new-agent-current-path").textContent).toBe("/home/dev"));
+    fireEvent.keyDown(within(dialog).getByTestId("new-agent-directory-list"), { key: "Enter" });
+    await waitFor(() => expect(within(dialog).getByTestId("new-agent-command")).toHaveValue("agy"));
+    fireEvent.change(within(dialog).getByTestId("new-agent-command"), { target: { value: "" } });
+    return dialog;
+  }
+  const agyDeck: NewAgentOptions = { kind: "deck", agents: [], experimental: false, authoringKinds: ["dispatcher"], defaultCommand: "agy" };
+
+  /** Scenario: on a deck whose `default_command` is `agy`, the user chooses the dispatcher mode, leaves Command empty and starts. The empty Command starts `agy`, so the start is announced as `agy` and the notice comes up. */
+  it("counts a start whose empty Command a built-in mode resolves to agy", async () => {
+    const runAction = vi.fn(async () => ({ ok: true }));
+    const antigravityNoticeStart = vi.fn(async (command: string | undefined) => command === "agy");
+    render(<DeckShell runtime={runtimeOf({ runAction, antigravityNoticeStart, antigravityNoticeChoose: vi.fn(async () => undefined), listDirectories: vi.fn(async () => structuredClone(listing)), newAgentOptions: vi.fn(async () => structuredClone(agyDeck)) })} initialView={{ kind: "overview" }} />);
+    const dialog = await blankCommandOnAgyDeck();
+    fireEvent.click(await within(dialog).findByTestId("new-agent-mode-dispatcher"));
+    fireEvent.click(within(dialog).getByTestId("new-agent-start"));
+    expect(await screen.findByTestId("antigravity-notice-dialog")).toBeVisible();
+    expect(runAction).toHaveBeenCalledWith(expect.objectContaining({ type: "start_agent", command: "agy", authoringKind: "dispatcher" }));
+    expect(antigravityNoticeStart).toHaveBeenCalledExactlyOnceWith("agy");
+  });
+
+  /** Scenario: on the same deck the user leaves Command empty with No mode and starts. That start runs the deck's default shell, not `agy`, so it is announced with no command and no notice comes up. */
+  it("does not count an empty plain Command, which starts the deck's shell", async () => {
+    const runAction = vi.fn(async () => ({ ok: true }));
+    const antigravityNoticeStart = vi.fn(async (command: string | undefined) => command === "agy");
+    render(<DeckShell runtime={runtimeOf({ runAction, antigravityNoticeStart, listDirectories: vi.fn(async () => structuredClone(listing)), newAgentOptions: vi.fn(async () => structuredClone(agyDeck)) })} initialView={{ kind: "overview" }} />);
+    const dialog = await blankCommandOnAgyDeck();
+    fireEvent.click(within(dialog).getByTestId("new-agent-start"));
+    await waitFor(() => expect(antigravityNoticeStart).toHaveBeenCalledExactlyOnceWith(undefined));
+    expect(runAction).toHaveBeenCalledWith(expect.not.objectContaining({ command: expect.anything() }));
+    await act(async () => { await Promise.resolve(); });
+    expect(screen.queryByTestId("antigravity-notice-dialog")).toBeNull();
+  });
+
+  /** Scenario: the user answers the notice with Open issues. Its sentence shows in a toast whose close button names the Antigravity notice, not the star reminder, and closing it clears the toast. */
+  it("reports Open issues in a toast of its own", async () => {
+    render(<DeckShell runtime={runtimeOf({ antigravityNoticeStart: vi.fn(async () => true), antigravityNoticeChoose: vi.fn(async () => NOTICE_THANKS) })} initialView={{ kind: "deck" }} />);
+    await act(async () => { announceNewAgentStart("agy"); await Promise.resolve(); });
+    fireEvent.click(within(await screen.findByTestId("antigravity-notice-dialog")).getByRole("button", { name: `o ${OPEN_ISSUES}` }));
+    const toast = await screen.findByTestId("antigravity-toast");
+    expect(toast).toHaveTextContent(NOTICE_THANKS);
+    expect(screen.queryByTestId("star-toast")).toBeNull();
+    expect(within(toast).queryByRole("button", { name: "Dismiss star message" })).toBeNull();
+    fireEvent.click(within(toast).getByRole("button", { name: "Dismiss Antigravity message" }));
+    expect(screen.queryByTestId("antigravity-toast")).toBeNull();
+  });
+
   /** Scenario: the user starts another agent from the New agent dialog. The start is announced, the runtime says it shows nothing, and no notice comes up. */
   it("shows nothing after a start the runtime does not show it for", async () => {
     const antigravityNoticeStart = vi.fn(async (command: string | undefined) => command === "agy");
