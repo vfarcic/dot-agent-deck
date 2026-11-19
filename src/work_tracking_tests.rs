@@ -2369,6 +2369,19 @@ fn a_drain_against_a_full_stalled_queue_returns_and_keeps_the_held_session() {
     };
     start("1");
     start("2");
+    // The writer takes an event off the queue before it parks at the gate.
+    // Wait for it to park, so the queue filled below stays full: a writer
+    // still starting up when the queue fills would take one event off it
+    // afterwards, freeing the slot the drain must not find (seen on a
+    // loaded CI runner, the held id on disk).
+    let parked = std::time::Instant::now() + Duration::from_secs(60);
+    while gate.reached.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(
+            std::time::Instant::now() < parked,
+            "the writer never reached its gate"
+        );
+        std::thread::yield_now();
+    }
     // Attempt 2's ids take the whole session quota, so attempt 1's one
     // report is refused and held.
     for n in 0..8 / crate::work_journal::SESSION_QUEUE_SHARE {
