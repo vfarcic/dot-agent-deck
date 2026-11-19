@@ -2664,7 +2664,20 @@ fn escape_001_refusals_carry_no_raw_terminal_controls() {
         &["delegate", "--to", "coder", "--task", "TRUST-HOSTILE-TASK"][..],
         &["pane", "restart", "coder", "--force"],
     ] {
-        let out = daemon_agent_verb(&daemon, &roles, &orchestrator, args);
+        // The trust check answers only once the coder is registered for
+        // routing; until then `delegate` answers "reached no worker", which a
+        // starved runner hit on `main`'s run for #2378. Both answers refuse and
+        // deliver nothing, so the verb is asked again until the coder is
+        // there, within the same bound as the waits above.
+        let out = std::cell::RefCell::new(daemon_agent_verb(&daemon, &roles, &orchestrator, args));
+        common::wait_until(common::load_scaled(Duration::from_secs(15)), || {
+            if !text(&out.borrow()).contains("reached no worker") {
+                return true;
+            }
+            *out.borrow_mut() = daemon_agent_verb(&daemon, &roles, &orchestrator, args);
+            false
+        });
+        let out = out.into_inner();
         let printed = text(&out);
         assert!(
             !out.status.success()
