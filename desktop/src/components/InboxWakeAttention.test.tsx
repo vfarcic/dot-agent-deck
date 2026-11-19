@@ -127,6 +127,20 @@ describe("inbox/status/044 — held agents are marked where they are listed", ()
     expect(header(view.container).querySelector(".deck-attention")).toBeNull();
   });
 
+  /// Scenario: inbox/status/044 — Render a held agent's tile from the deck's last record (its daemon is not answering) and from a live one. Both carry the `held` marker; the last record's is greyed like its `last seen` status and says so on hover, so no tile drops the marker an agent's hold gives it.
+  it("keeps the marker, greyed, on a tile drawn from the deck's last record", () => {
+    const mapped = mapDesktopSnapshot(snapshot());
+    const view = render(<AgentTile {...tile(mapped).props} recordFreshness="held" />);
+    const marker = () => view.container.querySelector(".held-marker");
+    expect(view.container).toHaveTextContent("last seen: idle");
+    expect(marker(), "a past report keeps the marker").not.toBeNull();
+    expect(marker()).toHaveClass("is-held");
+    expect(marker()).toHaveAttribute("title", `last seen: ${words.wakeHolds.possible_draft}`);
+    view.rerender(<AgentTile {...tile(mapped).props} recordFreshness="live" />);
+    expect(marker(), "control: the live tile's marker").not.toHaveClass("is-held");
+    expect(marker()).toHaveAttribute("title", words.wakeHolds.possible_draft);
+  });
+
   /// Scenario: inbox/status/044 — Open the agent dashboard over two connected daemons, each with one held agent. Each held row shows the `held` marker beside its status and the header names both agents, counting across every daemon the dashboard shows.
   it("counts and marks held agents across every daemon on the dashboard", () => {
     const local = mapDesktopSnapshot(snapshot(null));

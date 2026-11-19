@@ -726,6 +726,7 @@ button.deck-attention-name { text-decoration: underline; text-underline-offset: 
 .status-label.is-held { color: var(--faint); background: var(--paper-sunken-strong); }
 /* Issue #2387: the deck holds a message for this agent; beside its status, never instead of it. */
 .held-marker { padding: 2px 4px; border-radius: 2px; color: var(--amber); background: var(--amber-soft); font-size: var(--text-xs); font-weight: 800; letter-spacing: .08em; text-transform: uppercase; white-space: nowrap; flex-shrink: 0; cursor: help; }
+.held-marker.is-held { color: var(--faint); background: var(--paper-sunken-strong); }
 .agent-state-mark.is-held { color: var(--faint); background: transparent; }
 /* Issue #2000: each label sits on its value's first line rather than on a row
    of its own. A prompt that wraps hangs under its own first word, as the TUI

@@ -566,8 +566,11 @@ export function AgentTile({
                 Issue #2387 — beside the status, never instead of it: the status
                 is what the agent is doing, this is what the deck is doing. Its
                 hover gives the hold's words, the ones the header's name gives.
+                A held record (a daemon that is not answering) keeps the marker
+                as part of its past report, greyed like its status, so no agent
+                the header could ever name is drawn without it.
               */}
-              {holdWords && !held && <span className="held-marker" data-testid={`held-marker-${agent.id}`} title={holdWords}>{INBOX_WORDS.attentionHeld}</span>}
+              {holdWords && <span className={`held-marker${held ? " is-held" : ""}`} data-testid={`held-marker-${agent.id}`} title={held ? `last seen: ${holdWords}` : holdWords}>{INBOX_WORDS.attentionHeld}</span>}
               {/* PRD #1401 — the agent's pull request, when the daemon found one. */}
               {agent.pullRequest && (
                 <PullRequestBadge
