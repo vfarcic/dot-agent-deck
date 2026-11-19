@@ -141,13 +141,19 @@ def _is_trusted_verdict_comment(comment):
     )
 
 
+class GhError(RuntimeError):
+    """A `gh` command that failed. Its own type so a caller can tell a read
+    GitHub refused or could not serve apart from a defect in this code, which
+    the selector must not swallow (`pr_review_select.py`'s per-PR loop)."""
+
+
 def gh(*args, check=True):
     """Run gh and return stdout. Raises on failure so nothing fails silently."""
     result = subprocess.run(
         ("gh",) + args, capture_output=True, text=True, check=False
     )
     if check and result.returncode != 0:
-        raise RuntimeError(
+        raise GhError(
             f"gh {' '.join(args)} failed ({result.returncode}): {result.stderr.strip()}"
         )
     return result.stdout
