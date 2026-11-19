@@ -14513,6 +14513,15 @@ impl AppState {
                     )
                 })
             });
+            // Issue #2246: the deck's notice standing on the ending card. An
+            // agent's final `SessionEnd` can be applied after the notice saying
+            // how its pane ended, and the placeholder below must not lose it:
+            // an exited agent has no later report to explain its card.
+            let ended_notice = self
+                .sessions
+                .get(&event.session_id)
+                .and_then(|session| session.delivery_notice())
+                .map(str::to_string);
             // Issue #1678 (R2): the ending spawn's card's newest background copy,
             // scoped to that spawn, so the placeholder restored below can keep
             // the replay barrier (see the restore).
@@ -14568,6 +14577,17 @@ impl AppState {
                     && let Some(placeholder) = self.sessions.get_mut(&placeholder_id)
                 {
                     placeholder.display_name = Some(name);
+                }
+                // Issue #2246: the same agent's placeholder keeps the deck's
+                // notice, and its Error, until the agent reports again — its
+                // next conversation's start ends it as any newer report does.
+                if let Some(notice) = ended_notice
+                    && let Some(placeholder) = self.sessions.get_mut(&placeholder_id)
+                    && placeholder.agent_id.is_some()
+                    && placeholder.agent_id == agent_id_of_ended
+                {
+                    placeholder.status = SessionStatus::Error;
+                    push_delivery_notice_carrier(placeholder, notice);
                 }
                 // Issue #1678 (R2): the same spawn's restored placeholder holds
                 // the ending card's newest copy, so an older snapshot or frame
@@ -23521,6 +23541,56 @@ mod tests {
         let card = &state.sessions["gen-q"];
         assert_eq!(card.delivery_notice(), None);
         assert_eq!(card.live_snapshot().delivery_notice, None);
+    }
+
+    /// Issue #2246: an agent's final `SessionEnd` can be applied after the
+    /// deck's notice saying how its pane ended. The placeholder that replaces
+    /// the ended card keeps the notice, so an exited agent's card still says
+    /// why its message was not delivered; the same agent's next conversation
+    /// ends it, as any newer report of the agent's does.
+    #[test]
+    fn a_delivery_notice_outlives_the_session_end_until_the_agent_reports_again() {
+        let notice = "not delivered: the command started in the agent's pane exited (code 7) before taking this message";
+        let mut state = AppState::default();
+        state.register_pane("pane-q".to_string());
+        state.apply_event(quota_event(EventType::SessionStart, 1));
+        let mut report = quota_event(EventType::Error, 2);
+        report.agent_type = AgentType::None;
+        report.tool_name = None;
+        report.tool_detail = Some(notice.to_string());
+        report.metadata.insert(
+            crate::event::DELIVERY_NOTICE_METADATA_KEY.to_string(),
+            notice.to_string(),
+        );
+        state.apply_daemon_report_event(report);
+        state.apply_event(quota_event(EventType::SessionEnd, 3));
+        let card = |state: &AppState| {
+            state
+                .sessions
+                .values()
+                .find(|s| s.pane_id.as_deref() == Some("pane-q"))
+                .cloned()
+                .expect("the pane keeps a card")
+        };
+        let placeholder = card(&state);
+        assert_eq!(placeholder.delivery_notice(), Some(notice));
+        assert_eq!(
+            placeholder.live_snapshot().delivery_notice.as_deref(),
+            Some(notice)
+        );
+
+        let mut next = quota_event(EventType::SessionStart, 4);
+        next.session_id = "gen-q-2".to_string();
+        state.apply_event(next);
+        assert_eq!(card(&state).delivery_notice(), None);
+
+        // A card the deck had no notice on gets none from the end.
+        let mut quiet = AppState::default();
+        quiet.register_pane("pane-q".to_string());
+        quiet.apply_event(quota_event(EventType::SessionStart, 1));
+        quiet.apply_event(quota_event(EventType::SessionEnd, 2));
+        assert_eq!(card(&quiet).delivery_notice(), None);
+        assert_ne!(card(&quiet).status, SessionStatus::Error);
     }
 
     /// PRD #1666 long-turn delivery: the daemon's "delivered after all" event
