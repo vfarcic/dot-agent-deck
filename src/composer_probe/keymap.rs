@@ -1309,13 +1309,54 @@ pub fn codex_cwd_display(cwd: &Path, home: Option<&Path>) -> Option<String> {
     (!shown.contains(CODEX_STATUS_SEPARATOR)).then_some(shown)
 }
 
+/// The most entries [`codex_separator_siblings`] reads from one directory;
+/// a larger one counts as holding such a sibling.
+pub const SIBLING_SCAN_ENTRIES: usize = 65_536;
+
+/// Whether the directory holding `cwd` has an entry whose name is `cwd`'s
+/// own name followed by [`CODEX_STATUS_SEPARATOR`] (the Greptile review's
+/// P1 on issue #2130): a directory Codex could be moved into whose status
+/// line reads as `cwd` and a thread name. For `/` itself, an entry of `/`
+/// whose name starts with the separator. A directory that can't be read,
+/// or holds more than [`SIBLING_SCAN_ENTRIES`] entries, counts as holding
+/// one, which can only hold more checks. File I/O, unbounded in time like
+/// [`read_source`]: call it with no lock held.
+pub fn codex_separator_siblings(cwd: &Path) -> bool {
+    let (dir, name) = match (cwd.parent(), cwd.file_name()) {
+        (Some(parent), Some(name)) => (parent, name.to_string_lossy()),
+        _ => (cwd, "".into()),
+    };
+    let prefix = format!("{name}{CODEX_STATUS_SEPARATOR}");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return true;
+    };
+    let mut seen = 0usize;
+    for entry in entries {
+        seen += 1;
+        if seen > SIBLING_SCAN_ENTRIES {
+            return true;
+        }
+        match entry {
+            Ok(entry) if entry.file_name().to_string_lossy().starts_with(&prefix) => return true,
+            Ok(_) => {}
+            Err(_) => return true,
+        }
+    }
+    false
+}
+
 /// Whether Codex's status line `status_line` shows the directory `cwd` the
 /// bound Codex started in, `home` its `HOME` (issue #2130). Codex's default
 /// status line is `<model> <reasoning> · <directory>`, then ` · <thread
 /// name>` once the thread has one; a configured one can hold other items
 /// in another order. The items are split at the separator, and exactly one
 /// of them may read as a directory (`/…`, `~` or `~/…`):
-/// - it is `cwd` as Codex spells it ([`codex_cwd_display`]): `Ok`;
+/// - it is `cwd` as Codex spells it ([`codex_cwd_display`]): `Ok`, unless
+///   more items follow it and `separator_siblings` says a directory beside
+///   `cwd` is named like `cwd`'s own name, the separator and more
+///   ([`codex_separator_siblings`]): Codex in `/srv/proj · copy` draws
+///   `<model> · /srv/proj · copy`, which splits as `/srv/proj` and a
+///   thread name (the Greptile review's P1), so that is [`Hold::Footer`];
 /// - it is another directory, whole: [`Hold::Changed`], which the caller
 ///   latches ([`CodexReads::session`]);
 /// - anything else is [`Hold::Footer`]: no status line, none or two items
@@ -1330,16 +1371,22 @@ pub fn codex_session_cwd(
     status_line: Option<&str>,
     cwd: &Path,
     home: Option<&Path>,
+    separator_siblings: bool,
 ) -> Result<(), Hold> {
     let line = status_line.ok_or(Hold::Footer)?;
     let expected = codex_cwd_display(cwd, home).ok_or(Hold::Footer)?;
-    let mut directories = line
-        .split(CODEX_STATUS_SEPARATOR)
-        .filter(|item| item.starts_with('/') || *item == "~" || item.starts_with("~/"));
-    let (Some(shown), None) = (directories.next(), directories.next()) else {
+    let items: Vec<&str> = line.split(CODEX_STATUS_SEPARATOR).collect();
+    let mut directories = items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| item.starts_with('/') || **item == "~" || item.starts_with("~/"));
+    let (Some((at, &shown)), None) = (directories.next(), directories.next()) else {
         return Err(Hold::Footer);
     };
     if shown == expected {
+        if at + 1 < items.len() && separator_siblings {
+            return Err(Hold::Footer);
+        }
         Ok(())
     } else if shown.ends_with('…') || (home.is_none() && shown.starts_with('~')) {
         Err(Hold::Footer)
@@ -1787,6 +1834,9 @@ struct CodexReadsState {
     /// How many bookkeeping rewrites this generation has accepted, which is
     /// how many times `last` has changed.
     rewrites: u8,
+    /// [`codex_separator_siblings`] for the session's directory as the last
+    /// [`CodexReads::check`] found it; `true` until one has.
+    siblings: bool,
 }
 
 /// The most bookkeeping rewrites of `config.toml` one Codex generation
@@ -1812,6 +1862,7 @@ impl CodexReads {
                 last: baseline.read.clone(),
                 held: None,
                 rewrites: 0,
+                siblings: true,
             }),
         }
     }
@@ -1822,7 +1873,14 @@ impl CodexReads {
     /// [`CodexReads::read`] then [`CodexReads::settle`]. The file I/O comes
     /// before its own lock, which guards only the comparison: call it with
     /// no lock held.
+    /// It also scans the session directory's parent
+    /// ([`codex_separator_siblings`]) for [`CodexReads::session`], which
+    /// does no I/O of its own.
     pub fn check(&self, precedence: &[KeymapSource]) -> Result<(), Hold> {
+        if let Some(session) = self.session.as_ref() {
+            let siblings = codex_separator_siblings(&session.cwd);
+            self.lock().siblings = siblings;
+        }
         self.settle(self.read(), precedence)
     }
 
@@ -1842,7 +1900,12 @@ impl CodexReads {
         let Some(session) = self.session.as_ref() else {
             return Err(Hold::Footer);
         };
-        let compared = codex_session_cwd(status_line, &session.cwd, session.home.as_deref());
+        let compared = codex_session_cwd(
+            status_line,
+            &session.cwd,
+            session.home.as_deref(),
+            state.siblings,
+        );
         if compared == Err(Hold::Changed) {
             state.held = Some(Hold::Changed);
         }

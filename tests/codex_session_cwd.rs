@@ -85,7 +85,7 @@ fn probe_103_the_status_line_on_codexs_measured_screens() {
         let read = codex_status_line(&grid);
         assert_eq!(read.as_deref(), Some(line.as_str()), "{name}");
         assert_eq!(
-            codex_session_cwd(read.as_deref(), &work, Some(&home)),
+            codex_session_cwd(read.as_deref(), &work, Some(&home), false),
             outcome,
             "{name}, bound in work"
         );
@@ -96,7 +96,8 @@ fn probe_103_the_status_line_on_codexs_measured_screens() {
         codex_session_cwd(
             codex_status_line(&plain).as_deref(),
             &home.join("plain"),
-            Some(&home)
+            Some(&home),
+            false
         ),
         Ok(()),
         "~/plain, bound in ~/plain"
@@ -106,7 +107,8 @@ fn probe_103_the_status_line_on_codexs_measured_screens() {
         codex_session_cwd(
             codex_status_line(&plain).as_deref(),
             &home.join("plain"),
-            None
+            None,
+            false
         ),
         Err(Hold::Footer),
         "~/plain with no HOME"
@@ -117,7 +119,7 @@ fn probe_103_the_status_line_on_codexs_measured_screens() {
     let read = codex_status_line(&long).expect("the long path's line");
     assert!(read.ends_with('…'), "{read}");
     assert_eq!(
-        codex_session_cwd(Some(&read), &work, Some(&home)),
+        codex_session_cwd(Some(&read), &work, Some(&home), false),
         Err(Hold::Footer)
     );
 
@@ -133,7 +135,8 @@ fn probe_103_the_status_line_on_codexs_measured_screens() {
         codex_session_cwd(
             Some(&read),
             &wt_root.join("work"),
-            Some(&wt_root.join("home"))
+            Some(&wt_root.join("home")),
+            false
         ),
         Err(Hold::Changed)
     );
@@ -196,12 +199,12 @@ fn probe_103_codexs_status_line_against_the_start_folder() {
         let odd = Path::new(std::ffi::OsStr::from_bytes(b"/srv/\xff"));
         assert_eq!(codex_cwd_display(odd, None), None);
         assert_eq!(
-            codex_session_cwd(Some("m low · /srv/\u{fffd}"), odd, None),
+            codex_session_cwd(Some("m low · /srv/\u{fffd}"), odd, None, false),
             Err(Hold::Footer)
         );
     }
 
-    let check = |line: &str| codex_session_cwd(Some(line), proj, Some(home));
+    let check = |line: &str| codex_session_cwd(Some(line), proj, Some(home), false);
     assert_eq!(check("gpt-5.5 medium · ~/code/proj"), Ok(()));
     assert_eq!(
         check("gpt-5.5 medium · ~/code/proj · fix the tests"),
@@ -235,20 +238,61 @@ fn probe_103_codexs_status_line_against_the_start_folder() {
         Err(Hold::Footer),
         "another separator"
     );
-    assert_eq!(codex_session_cwd(None, proj, Some(home)), Err(Hold::Footer));
+    assert_eq!(
+        codex_session_cwd(None, proj, Some(home), false),
+        Err(Hold::Footer)
+    );
     // No HOME: an absolute path compares, a `~` holds.
     assert_eq!(
-        codex_session_cwd(Some("m low · /srv/proj"), outside, None),
+        codex_session_cwd(Some("m low · /srv/proj"), outside, None, false),
         Ok(())
     );
     assert_eq!(
-        codex_session_cwd(Some("m low · /srv/other"), outside, None),
+        codex_session_cwd(Some("m low · /srv/other"), outside, None, false),
         Err(Hold::Changed)
     );
     assert_eq!(
-        codex_session_cwd(Some("m low · ~/proj"), outside, None),
+        codex_session_cwd(Some("m low · ~/proj"), outside, None, false),
         Err(Hold::Footer)
     );
+    // A folder named like the start folder, the separator and more beside
+    // it (the Greptile review's P1): Codex in `~/code/proj · copy` draws
+    // the same line as a thread named `copy`, so anything after the folder
+    // holds while such a folder exists, and the folder alone still passes.
+    let beside = |line: &str| codex_session_cwd(Some(line), proj, Some(home), true);
+    assert_eq!(beside("gpt-5.5 medium · ~/code/proj"), Ok(()));
+    assert_eq!(
+        beside("gpt-5.5 medium · ~/code/proj · copy"),
+        Err(Hold::Footer)
+    );
+    assert_eq!(
+        beside("gpt-5.5 medium · ~/code/proj · co…"),
+        Err(Hold::Footer)
+    );
+    assert_eq!(beside("gpt-5.5 medium · ~/code/other"), Err(Hold::Changed));
+}
+
+/// Scenario: Look beside a start folder for a folder named like it followed by ` · `, which Codex's status line would show as the start folder and a thread name. Only such a folder counts, the start folder's own contents and look-alikes without the separator don't, and a folder holding `/` is looked for in `/`; a parent that can't be read counts as holding one.
+#[spec("inbox/probe/103")]
+#[test]
+fn probe_103_folders_named_like_the_start_folder_and_more_are_found() {
+    use dot_agent_deck::composer_probe::keymap::codex_separator_siblings;
+    let dir = tempfile::tempdir().unwrap();
+    let proj = dir.path().join("proj");
+    std::fs::create_dir_all(proj.join("proj · inside")).unwrap();
+    std::fs::create_dir(dir.path().join("proj copy")).unwrap();
+    std::fs::create_dir(dir.path().join("projx · y")).unwrap();
+    std::fs::write(dir.path().join("proj ·"), "").unwrap();
+    assert!(!codex_separator_siblings(&proj), "none beside it");
+    std::fs::create_dir(dir.path().join("proj · copy")).unwrap();
+    assert!(codex_separator_siblings(&proj), "proj · copy");
+    assert!(
+        codex_separator_siblings(&dir.path().join("missing").join("proj")),
+        "an unreadable parent"
+    );
+    // `/`: what matters is an entry of `/` starting with the separator,
+    // which a host's root doesn't hold.
+    assert!(!codex_separator_siblings(std::path::Path::new("/")));
 }
 
 /// Scenario: Follow one Codex generation's checks as the deck makes them. Its status line naming its own folder passes; a line the deck can't read holds that check alone; a line naming another folder holds, and from then on every check of the generation holds as changed, its own folder shown again and its settings files unchanged included. A generation the deck has no folder for holds every check, and a new generation on its own folder passes.
@@ -294,6 +338,24 @@ fn probe_103_a_moved_codex_session_holds_for_the_rest_of_the_generation() {
     assert_eq!(unbound.check(ORDER), Ok(()));
     assert_eq!(unbound.session(Some(&own)), Err(Hold::Footer));
 
-    let next = CodexReads::with_session(&baseline, Some(session));
+    let next = CodexReads::with_session(&baseline, Some(session.clone()));
     assert_eq!(next.session(Some(&own)), Ok(()), "a new generation");
+
+    // A thread name after the folder passes only once a check has looked
+    // beside the folder and found nothing named like it and ` · `; each
+    // check looks again.
+    let named = format!("{own} · copy");
+    let reads = CodexReads::with_session(&baseline, Some(session));
+    assert_eq!(reads.session(Some(&named)), Err(Hold::Footer), "not looked");
+    assert_eq!(reads.check(ORDER), Ok(()));
+    assert_eq!(reads.session(Some(&named)), Ok(()), "a thread name");
+    std::fs::create_dir(dir.path().join("work · copy")).unwrap();
+    assert_eq!(reads.session(Some(&named)), Ok(()), "until the next check");
+    assert_eq!(reads.check(ORDER), Ok(()));
+    assert_eq!(
+        reads.session(Some(&named)),
+        Err(Hold::Footer),
+        "the folder beside it"
+    );
+    assert_eq!(reads.session(Some(&own)), Ok(()), "the folder alone");
 }
