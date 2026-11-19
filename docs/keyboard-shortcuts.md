@@ -42,7 +42,7 @@ Whether there is anything to scroll depends on the agent; see [Scrolling back th
 | `Ctrl+E` | **Experimental, off by default.** Toggle the command-entry lock. See [below](#ctrle-locks-command-entry-to-the-orchestrator-pane). | Command mode, on an orchestration tab, with the `experimental` flag on |
 | `Ctrl+C` | In a pane: sent to the program (interrupt). In command mode, the directory picker or the New Agent form: opens the [quit dialog](#dialogs). | Both modes |
 
-Where a key is not claimed (for example `Ctrl+T` anywhere, or `Ctrl+W`, `Ctrl+L`, `Ctrl+Z` or `Ctrl+E` while typing in a pane), it is passed to the program in the pane. While the close confirmation is open, only its keys and `Ctrl+C` work.
+While typing in a pane, a key that is not claimed (for example `Ctrl+T`, `Ctrl+W`, `Ctrl+L`, `Ctrl+Z` or `Ctrl+E`) is passed to the program in the pane. While the close confirmation is open, only its keys and `Ctrl+C` work.
 
 ### Plain letters in command mode
 

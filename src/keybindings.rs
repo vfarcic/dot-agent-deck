@@ -476,7 +476,7 @@ const REMOVED_ACTIONS: &[(Section, &str, &str)] = &[(
     "toggle_layout",
     // PRD #312.
     "the stacked/tiled layout toggle was removed: the focused agent always fills \
-     the pane column (zoom it with toggle_zoom, `z` by default); delete this line",
+     the pane column (zoom it with toggle_zoom, Ctrl+z by default); delete this line",
 )];
 
 /// The note for an action name that [`REMOVED_ACTIONS`] lists, if it does.
@@ -1465,6 +1465,9 @@ new_pane = "Alt+n"
         assert!(w.contains("[global] toggle_layout"), "{w}");
         assert!(w.contains("removed"), "{w}");
         assert!(w.contains("toggle_zoom"), "{w}");
+        // The zoom it points at is the default chord, which works from a pane
+        // too, not the command-mode-only plain letter.
+        assert!(w.contains("Ctrl+z by default"), "{w}");
         assert!(!w.contains("unknown"), "{w}");
         assert!(c.matches(Action::NewPane, &ev(KeyCode::Char('n'), KeyModifiers::ALT)));
         // Nothing claims Ctrl+t any more.
