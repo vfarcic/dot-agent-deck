@@ -1215,6 +1215,7 @@ pub static ANTIGRAVITY_PROFILE: ScreenProfile = ScreenProfile {
     redraw_marker: b"\x1b[2J",
     width_witness: claude_width_witness,
     pair_witness: no_pair_witness,
+    agreement: false,
     min_cols: 80,
     cpr_wait_end: crate::composer_probe::query_ledger::CprWaitEnd::Counted,
     redraw: crate::composer_probe::query_wait::RedrawTiming {
