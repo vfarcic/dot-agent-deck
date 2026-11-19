@@ -1036,6 +1036,207 @@ pub struct AgentPty {
     /// or after it.
     #[cfg(target_os = "linux")]
     pub opened: Option<u64>,
+    /// PRD #1790: the absolute folder the child was started in: for a
+    /// prepared start, a path naming the verified directory it entered
+    /// ([`prepared_launch_folder`]: the path it asked for while that still
+    /// names it, never the descriptor alias it entered through on Linux);
+    /// otherwise resolved
+    /// as the PTY library resolves it ([`effective_launch_dir`]): the spawn's
+    /// cwd, or with none (or one that is not a directory) the child's `HOME`.
+    /// Not the registry's `cwd` metadata, which keeps only what the caller
+    /// gave. For a pathname start, re-checked once the child exists
+    /// ([`confirm_launch_dir`]): a folder replaced or removed before the
+    /// PTY library's own check is not recorded as where the child started.
+    /// `None` when it could not be resolved, and for a start whose directory
+    /// was moved away from its path to where no path can be found for it
+    /// ([`Self::launch_dir_moved_from`]).
+    pub launch_dir: Option<String>,
+    /// PRD #1790: for a prepared start whose verified directory no longer
+    /// sat at the path it asked for when the child entered it, and whose
+    /// current path could not be resolved ([`prepared_launch_folder`]), that
+    /// requested path, which names some other directory or nothing; and for
+    /// a pathname start whose resolved folder no longer named the same
+    /// directory after the spawn, when the child's own cwd could not be read
+    /// ([`confirm_launch_dir`]). `None` otherwise.
+    pub launch_dir_moved_from: Option<String>,
+}
+
+/// PRD #1790: where a prepared start's launch record says its child started.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PreparedLaunchFolder {
+    /// An absolute path that, when it was checked, named the verified
+    /// directory itself (no final symlink followed).
+    At(String),
+    /// The verified directory was no longer at the requested path (this
+    /// absolute path), and no path naming it could be resolved.
+    MovedFrom(String),
+}
+
+/// PRD #1790: the absolute path that names `dir`, the verified directory a
+/// prepared start's child enters, for its launch record. The requested path
+/// when it still names `dir` (compared by `(dev, ino)`, the final component
+/// not followed); otherwise the path the system reports for the held
+/// descriptor (Linux: `/proc/self/fd/N`'s link), taken only once its own
+/// `(dev, ino)`, read the same way, is `dir`'s. Neither: the directory was
+/// moved, or removed, from the path the start asked for, and the record
+/// says so ([`PreparedLaunchFolder::MovedFrom`]) instead of naming the
+/// replacement the child never entered. `None` for a start with no path.
+#[cfg(unix)]
+pub(crate) fn prepared_launch_folder(
+    requested: Option<&str>,
+    dir: &crate::project_resolve::VerifiedProjectDir,
+) -> Option<PreparedLaunchFolder> {
+    let requested = std::path::absolute(requested?).ok()?;
+    let names_dir = |path: &std::path::Path| {
+        std::fs::symlink_metadata(path)
+            .ok()
+            .filter(std::fs::Metadata::is_dir)
+            .as_ref()
+            .and_then(crate::prep_token::inode_identity)
+            == Some(dir.identity())
+    };
+    if names_dir(&requested) {
+        return Some(PreparedLaunchFolder::At(
+            requested.to_string_lossy().into_owned(),
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::{AsFd as _, AsRawFd as _};
+        let via_fd = format!("/proc/self/fd/{}", dir.as_fd().as_raw_fd());
+        if let Ok(current) = std::fs::read_link(&via_fd)
+            && current.is_absolute()
+            && names_dir(&current)
+        {
+            return Some(PreparedLaunchFolder::At(
+                current.to_string_lossy().into_owned(),
+            ));
+        }
+    }
+    Some(PreparedLaunchFolder::MovedFrom(
+        requested.to_string_lossy().into_owned(),
+    ))
+}
+
+/// PRD #1790: the folder `cmd`'s child starts in, as an absolute path,
+/// resolved the way `portable-pty` 0.8 resolves it when it spawns: its cwd
+/// when that is a directory; otherwise, on Unix, the `HOME` the child gets
+/// (the env overlay's, else the inherited one), else the account's home from
+/// the user database, else `/`. Elsewhere only a cwd that is a directory.
+pub(crate) fn effective_launch_dir(cmd: &CommandBuilder) -> Option<String> {
+    let cwd = cmd
+        .get_cwd()
+        .map(std::path::PathBuf::from)
+        .filter(|dir| dir.is_dir());
+    #[cfg(unix)]
+    let dir = cwd.or_else(|| {
+        Some(
+            cmd.get_env("HOME")
+                .and_then(std::ffi::OsStr::to_str)
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    // SAFETY: `getuid` has no preconditions and cannot fail.
+                    crate::platform::paths::passwd_home(unsafe { libc::getuid() })
+                        .map(std::path::PathBuf::from)
+                })
+                .unwrap_or_else(|| std::path::PathBuf::from("/")),
+        )
+    });
+    #[cfg(not(unix))]
+    let dir = cwd;
+    std::path::absolute(dir?)
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+/// The `(device, inode)` of the directory `path` names (symlinks followed,
+/// as a `chdir` follows them), or `None` when it names no directory. Off
+/// Unix there is no identity to read, so always `None`.
+fn dir_identity(path: &str) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let meta = std::fs::metadata(path).ok()?;
+        meta.is_dir().then(|| (meta.dev(), meta.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// PRD #1790 (PR #2363 review): the launch record's folder for a pathname
+/// start, settled once its child exists. `resolved` is the folder
+/// [`effective_launch_dir`] resolved before the spawn and `before` that
+/// directory's identity then. `portable-pty` repeats the `is_dir` test
+/// itself inside `spawn_command` and falls back to `HOME` when it fails, so
+/// a folder removed or replaced between the two is not where the child
+/// started.
+///
+/// - The path still names the directory it named before the spawn: that
+///   directory was there throughout, so the child started in it. Recorded.
+/// - Otherwise, on Linux, the child's cwd as `/proc/<pid>/cwd` reports it,
+///   when that link reads as an absolute path naming the same directory the
+///   link itself resolves to (the identity check); this is normally where
+///   the fallback put it. Recorded.
+/// - Otherwise (no child cwd to read, a deleted cwd, off Linux): no folder,
+///   and `resolved` as the folder it was moved or removed from, the same
+///   outcome a prepared start whose directory vanished gets.
+///
+/// Off Unix there is no identity to compare, so the pre-spawn folder is
+/// kept as it is.
+fn confirm_launch_dir(
+    resolved: Option<String>,
+    before: Option<(u64, u64)>,
+    child_pid: Option<u32>,
+) -> (Option<String>, Option<String>) {
+    #[cfg(not(unix))]
+    {
+        let _ = (before, child_pid);
+        (resolved, None)
+    }
+    #[cfg(unix)]
+    {
+        let Some(path) = resolved else {
+            return (None, None);
+        };
+        if before.is_some() && dir_identity(&path) == before {
+            return (Some(path), None);
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(actual) = child_pid.and_then(child_cwd) {
+            return (Some(actual), None);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = child_pid;
+        (None, Some(path))
+    }
+}
+
+/// The current directory of process `pid` as an absolute path, read from
+/// `/proc/<pid>/cwd` and kept only when that path names the very directory
+/// the link resolves to (a deleted directory reads as `"<path> (deleted)"`,
+/// which names nothing or something else).
+#[cfg(target_os = "linux")]
+fn child_cwd(pid: u32) -> Option<String> {
+    use std::os::unix::fs::MetadataExt as _;
+    let link = format!("/proc/{pid}/cwd");
+    let actual = std::fs::metadata(&link).ok()?;
+    let path = std::fs::read_link(&link).ok()?;
+    if !path.is_absolute() {
+        return None;
+    }
+    let path = path.to_str()?.to_string();
+    (dir_identity(&path) == Some((actual.dev(), actual.ino()))).then_some(path)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: run once by the next pathname spawn on this thread, after
+    /// its launch folder was resolved and before `spawn_command`.
+    static BEFORE_SPAWN_COMMAND: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// PRD #92 F8: hardcoded grace window between SIGTERM and the SIGKILL
@@ -1697,7 +1898,9 @@ fn spawn_with_dir(
     // **This narrows the fallback without closing it**: a directory removed
     // between this check and portable-pty's own still lands the child in
     // `$HOME`, because portable-pty 0.8.1 decides the fallback inside
-    // `spawn_command` with no way for a caller to refuse it.
+    // `spawn_command` with no way for a caller to refuse it. The launch
+    // record re-checks the folder once the child exists, so it does not name
+    // a folder the child never started in (`confirm_launch_dir`).
     if verified_dir.is_none()
         && let Some(dir) = opts.cwd
         && !std::path::Path::new(dir).is_dir()
@@ -1942,10 +2145,19 @@ fn spawn_with_dir(
         None => cmd.env_remove(crate::platform::paths::DOT_AGENT_DECK_EXE),
     }
 
+    // PRD #1790: the folder a launch record keeps. For a prepared start it is
+    // a path that names the verified directory the child enters, normally
+    // the one the start asked for ([`prepared_launch_folder`]): the cwd below
+    // is only how the child enters it (on Linux a `/proc/self/fd/N` alias of
+    // this process's descriptor, which names nothing once that descriptor is
+    // closed or the daemon restarts).
+    #[allow(unused_mut)]
+    let mut prepared_launch: Option<Option<PreparedLaunchFolder>> = None;
     // Issue #1233 item 2: as late as the parent can decide it. See `spawn_in`.
     #[cfg(unix)]
     if let Some(dir) = verified_dir {
         let cwd = prepared_spawn_cwd(opts.cwd, dir)?;
+        prepared_launch = Some(prepared_launch_folder(opts.cwd, dir));
         // Probe the program against the held descriptor where the child enters
         // it (Linux), and by pathname where the child does too.
         #[cfg(target_os = "linux")]
@@ -1961,10 +2173,34 @@ fn spawn_with_dir(
     }
 
     let argv = cmd.get_argv().clone();
+    let pathname_start = prepared_launch.is_none();
+    let (launch_dir, launch_dir_moved_from) = match prepared_launch {
+        Some(Some(PreparedLaunchFolder::At(path))) => (Some(path), None),
+        Some(Some(PreparedLaunchFolder::MovedFrom(path))) => (None, Some(path)),
+        Some(None) => (None, None),
+        None => (effective_launch_dir(&cmd), None),
+    };
+    // PRD #1790 (PR #2363 review): the identity of the folder a pathname
+    // start resolved, re-checked once the child exists
+    // ([`confirm_launch_dir`]).
+    let launch_identity = if pathname_start {
+        launch_dir.as_deref().and_then(dir_identity)
+    } else {
+        None
+    };
+    #[cfg(test)]
+    if let Some(hook) = BEFORE_SPAWN_COMMAND.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
     let child = pair
         .slave
         .spawn_command(cmd)
         .map_err(|e| AgentPtyError::Spawn(e.to_string()))?;
+    let (launch_dir, launch_dir_moved_from) = if pathname_start {
+        confirm_launch_dir(launch_dir, launch_identity, child.process_id())
+    } else {
+        (launch_dir, launch_dir_moved_from)
+    };
 
     // PRD #163 M3: adopt the child into the OS grouping its teardown will use, as
     // early as possible. This is a no-op on Unix (`portable-pty` already `setsid`'d
@@ -2026,6 +2262,8 @@ fn spawn_with_dir(
         argv,
         #[cfg(target_os = "linux")]
         opened,
+        launch_dir,
+        launch_dir_moved_from,
     })
 }
 
@@ -2710,6 +2948,7 @@ fn log_evidence_transition(transition: &crate::evidence_state::Transition, cause
         layout_epoch = transition.layout_epoch,
         out_seq = transition.out_seq,
         marker_seq = transition.marker_seq,
+        basis = transition.basis.map(crate::evidence_state::CleanBasis::as_str),
         "pane layout evidence"
     );
 }
@@ -4258,14 +4497,13 @@ pub struct AgentRecord {
     /// Issue #1445: once a TUI has re-armed that coordinator and reported it
     /// ([`crate::daemon_protocol::AttachRequest::RecordOrchestratorContext`]),
     /// the newest re-arm's file instead.
-    /// A TUI hydrating the tab re-arms compaction and `/clear` from this file
-    /// instead of the fixed-path mirror, which a later preparation in the same
-    /// project may have overwritten.
+    /// A TUI hydrating the tab re-arms compaction and `/clear` from this file.
     ///
     /// `None` for every other pane, for a start role the daemon has no record
     /// for (a TUI-launched `Ctrl+n` tab, which publishes its own context), and
-    /// from a daemon predating this field — in which case the TUI falls back to
-    /// the mirror exactly as before. Additive optional, so no
+    /// from a daemon predating this field. A tab with none re-arms with no task
+    /// and says so on the TUI's status line (issue #1395); before #1395 it read
+    /// the fixed-path mirror instead. Additive optional, so no
     /// `PROTOCOL_VERSION` bump — same basis as `live` and `crashed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestrator_context_path: Option<String>,
@@ -8242,29 +8480,32 @@ impl QuestionAnswers {
     }
 }
 
-/// PRD #1666 §11: whether a spawn starts OpenCode — by its declared agent
-/// type, or by the basename of its command when it declares none — and so
-/// owes the inbox its integration refresh and capability probe.
-fn opencode_spawn(agent_type: Option<&crate::event::AgentType>, command: Option<&str>) -> bool {
-    let basename = command
-        .and_then(|c| c.split_whitespace().next())
-        .and_then(|program| std::path::Path::new(program).file_name())
-        .and_then(|name| name.to_str())
-        .and_then(crate::agent_registry::detect_from_basename);
-    agent_type.cloned().or(basename) == Some(crate::event::AgentType::OpenCode)
+/// Which agent a spawn starts: its declared agent type, or the one the
+/// basename of its command names when it declares none. A wrapper
+/// (`devbox run pi-big`) declaring nothing is not detected.
+fn spawned_agent(
+    agent_type: Option<&crate::event::AgentType>,
+    command: Option<&str>,
+) -> Option<crate::event::AgentType> {
+    agent_type.cloned().or_else(|| {
+        command
+            .and_then(|c| c.split_whitespace().next())
+            .and_then(|program| std::path::Path::new(program).file_name())
+            .and_then(|name| name.to_str())
+            .and_then(crate::agent_registry::detect_from_basename)
+    })
 }
 
-/// PRD #1666 G6: whether a spawn starts Pi — by its declared agent type, or by
-/// the basename of its command when it declares none — and so owes the inbox
-/// a refresh of its extension. A wrapper (`devbox run pi-big`) is not
-/// detected and gets none.
+/// PRD #1666 §11: whether a spawn starts OpenCode ([`spawned_agent`]), and so
+/// owes the inbox its integration refresh and capability probe.
+fn opencode_spawn(agent_type: Option<&crate::event::AgentType>, command: Option<&str>) -> bool {
+    spawned_agent(agent_type, command) == Some(crate::event::AgentType::OpenCode)
+}
+
+/// PRD #1666 G6: whether a spawn starts Pi ([`spawned_agent`]), and so owes
+/// the inbox a refresh of its extension.
 fn pi_spawn(agent_type: Option<&crate::event::AgentType>, command: Option<&str>) -> bool {
-    let basename = command
-        .and_then(|c| c.split_whitespace().next())
-        .and_then(|program| std::path::Path::new(program).file_name())
-        .and_then(|name| name.to_str())
-        .and_then(crate::agent_registry::detect_from_basename);
-    agent_type.cloned().or(basename) == Some(crate::event::AgentType::Pi)
+    spawned_agent(agent_type, command) == Some(crate::event::AgentType::Pi)
 }
 
 /// PRD #1666 §11: which integration a spawn's inbox refresh was for.
@@ -8474,6 +8715,9 @@ pub struct AgentPtyRegistry {
         { crate::lock_rank::LEAF },
         crate::dispatched_units::DispatchedUnits,
     >,
+    /// PRD #2374: the agent cards' reports, delivery state and revisions.
+    /// See [`crate::agent_cards`].
+    agent_cards: crate::agent_cards::CardStore,
     /// Issue #424 (reviewer blocker 3 / auditor MEDIUM): where a daemon-side
     /// delivery failure is REPORTED, so the report is durable state on the
     /// pane's card rather than bytes typed into the agent's input buffer.
@@ -8552,6 +8796,9 @@ pub struct AgentPtyRegistry {
     /// [`Self::pause_next_publish_for_test`].
     #[cfg(test)]
     publish_pause: PublishPause,
+    /// Issue #1973 test seam: see [`Self::hook_repairs_for_test`].
+    #[cfg(test)]
+    hook_repairs: Mutex<Vec<crate::event::AgentType>>,
     /// PRD #1487 re-check R2: woken whenever the last respawn in its
     /// remove→replace window finishes (`RegistryInner::respawns_in_flight`
     /// reaches zero), which is what [`Self::freeze_admission`] waits on.
@@ -10289,7 +10536,13 @@ impl<'a> SpawnReservation<'a> {
     /// The start was refused after the fork: give up the reservation and undo
     /// the binding, while the caller holds the registry lock.
     fn abandon_locked(mut self, inner: &mut RegistryInner) {
+        let id = self.id.clone();
         self.give_up(inner);
+        // PRD #1790: the session reports held for the generation it never
+        // published go with it, in the same lock hold.
+        if let Some(id) = id {
+            self.registry.work.spawn_abandoned(&id);
+        }
     }
 
     fn give_up(&mut self, inner: &mut RegistryInner) {
@@ -10334,7 +10587,12 @@ impl Drop for SpawnReservation<'_> {
                 .inner
                 .lock_in_drop(crate::lock_rank::OnPoison::Skip)
             {
+                let id = self.id.clone();
                 self.give_up(&mut inner);
+                // PRD #1790: as in `abandon_locked`.
+                if let Some(id) = id {
+                    self.registry.work.spawn_abandoned(&id);
+                }
             }
             self.registry.release_abandoned_turns();
         }
@@ -10765,6 +11023,7 @@ impl AgentPtyRegistry {
             dispatched_units: crate::lock_rank::RankedMutex::new(
                 crate::dispatched_units::DispatchedUnits::default(),
             ),
+            agent_cards: crate::agent_cards::CardStore::default(),
             delivery_notice_sink: Mutex::new(None),
             delegations: crate::lock_rank::RankedMutex::new(DelegationTracker::default()),
             delegation_seq: AtomicU64::new(1),
@@ -10780,6 +11039,8 @@ impl AgentPtyRegistry {
             work: crate::work_tracking::WorkTracker::default(),
             #[cfg(test)]
             publish_pause: Mutex::new(None),
+            #[cfg(test)]
+            hook_repairs: Mutex::new(Vec::new()),
             #[cfg(test)]
             close_failures: Mutex::new(HashSet::new()),
             #[cfg(test)]
@@ -11037,6 +11298,35 @@ impl AgentPtyRegistry {
     /// installs its run's journal ([`crate::work_tracking::WorkTracker::install`]).
     pub fn work(&self) -> &crate::work_tracking::WorkTracker {
         &self.work
+    }
+
+    /// PRD #1790: generation `agent_id`'s hooks report agent session
+    /// `session` ([`crate::work_tracking::WorkTracker::session_seen`]).
+    /// Decided under the registry lock, so a generation whose spawn is
+    /// reserved and not yet published has the id held for its start, and
+    /// neither its publication (which writes the held ids) nor its
+    /// abandonment (which drops them) can fall between the check and the
+    /// hold.
+    pub fn session_seen(
+        &self,
+        agent_id: &str,
+        pane: Option<&str>,
+        session: &str,
+        agent: &crate::event::AgentType,
+    ) {
+        let inner = self.inner.lock();
+        let reserved =
+            !inner.agents.contains_key(agent_id) && inner.pending_spawns.contains_key(agent_id);
+        self.work
+            .session_seen(agent_id, pane, session, agent, reserved);
+        drop(inner);
+    }
+
+    /// TEST: the agent ids of the spawns the registry holds a reservation
+    /// for (forked or forking, not yet published).
+    #[cfg(test)]
+    pub(crate) fn reserved_ids_for_test(&self) -> Vec<String> {
+        self.inner.lock().pending_spawns.keys().cloned().collect()
     }
 
     /// TEST: the environment generation `agent_id` was spawned with.
@@ -14723,6 +15013,18 @@ impl AgentPtyRegistry {
         } else {
             None
         };
+        // Issue #1973: a Claude Code, Codex or Devin generation's hooks are
+        // repaired before its child starts when they name no deck (the agent
+        // was set up after this daemon's startup install ran) or a deck copy
+        // that is gone, so the agent reports its status from its first turn.
+        // Hooks that already name a usable deck are left as they are: they
+        // live in the user's own config, which the deck does not rewrite on
+        // every start. OpenCode's plugin is refreshed above.
+        if let Some(agent) = spawned_agent(inbox_agent_type.as_ref(), spawn_command.as_deref())
+            .filter(crate::hooks_refresh::repairs_before_spawn)
+        {
+            self.repair_hooks_before_spawn(agent);
+        }
         // PRD #2050: an OpenCode 2 started directly runs with `--standalone`
         // added, so its pane has its own server.
         let mut opts = match standalone_command.as_deref() {
@@ -15021,6 +15323,8 @@ impl AgentPtyRegistry {
             argv,
             #[cfg(target_os = "linux")]
             opened,
+            launch_dir,
+            launch_dir_moved_from,
         } = pty;
         // PRD #1666 part 3 (Q84): what the deck executed, for the observer's
         // binding of `A`.
@@ -15165,6 +15469,20 @@ impl AgentPtyRegistry {
             Some(Arc::clone(&doorbell)),
             Arc::clone(bus.input()),
         );
+        // PRD #1790: what this generation's launch record keeps, captured
+        // before the record below takes the values; written once the
+        // generation is published, with the registry lock released.
+        let launch_record = work.as_ref().map(|_| {
+            (
+                spawn_command.clone(),
+                overlay_value(&captured_env, "SHELL").map(str::to_string),
+                spawn_agent_type.clone(),
+                launch_dir,
+                launch_dir_moved_from,
+                display_name.clone(),
+                tab_membership.clone(),
+            )
+        });
         let agent = RunningAgent {
             child,
             process_group,
@@ -15274,12 +15592,37 @@ impl AgentPtyRegistry {
         if let Some(work) = &work {
             self.work
                 .attempt_started(work, &id, journal_pane.as_deref(), journal_role.as_deref());
+        } else {
+            // PRD #1790: no attempt starts, so the session reports held for
+            // the reservation go with it, in the lock hold that ends it.
+            self.work.spawn_abandoned(&id);
         }
         // Signal *after* releasing the lock would be cleaner, but we still
         // hold `inner` here. Notify is cheap and a spurious wake-up is
         // harmless — the monitor will re-check counters anyway.
         self.change_notify.notify_one();
         drop(inner);
+        // PRD #1790: how this attempt was launched, kept across a restart
+        // (file I/O, so after the registry lock is released).
+        if let (
+            Some(work),
+            Some((command, shell, agent_type, cwd, cwd_moved_from, name, membership)),
+        ) = (&work, &launch_record)
+        {
+            self.work.launch_recorded(
+                work,
+                &id,
+                crate::work_tracking::LaunchDetails {
+                    command: command.as_deref(),
+                    shell: shell.as_deref(),
+                    agent_type: agent_type.as_ref(),
+                    cwd: cwd.as_deref(),
+                    cwd_moved_from: cwd_moved_from.as_deref(),
+                    name: name.as_deref(),
+                    membership: membership.as_ref(),
+                },
+            );
+        }
         // PRD #1666 part 3, round 5 test seam: a panic after the record is
         // published and before the spawn returns ((f2')'s seam).
         let _ = self.fault_point(FAULT_SPAWN_AFTER_INSERT);
@@ -15315,6 +15658,26 @@ impl AgentPtyRegistry {
             self.note_inbox_spawn(&pane, &id, integration, refresh, &inbox_spawn.2);
         }
         Ok(id)
+    }
+
+    /// Issue #1973: [`crate::hooks_refresh::repair_before_spawn`] for `agent`,
+    /// off the executor. A unit test only records the request
+    /// ([`Self::hook_repairs_for_test`]), so no test reads or writes the
+    /// developer's real agent configs.
+    fn repair_hooks_before_spawn(&self, agent: crate::event::AgentType) {
+        #[cfg(test)]
+        self.hook_repairs.lock().unwrap().push(agent);
+        #[cfg(not(test))]
+        crate::inbox_hub::off_the_executor(move || {
+            crate::hooks_refresh::repair_before_spawn(&agent);
+        });
+    }
+
+    /// Issue #1973 test seam: the agents whose hooks spawns asked to repair,
+    /// in order.
+    #[cfg(test)]
+    pub(crate) fn hook_repairs_for_test(&self) -> Vec<crate::event::AgentType> {
+        self.hook_repairs.lock().unwrap().clone()
     }
 
     /// PRD #1666 part 3 (Q35-14b): start generation `id`'s observer from its
@@ -20395,6 +20758,11 @@ impl AgentPtyRegistry {
     /// PRD #1589: the record of dispatched units. Held only for pure reads and
     /// updates of [`crate::dispatched_units::DispatchedUnits`]; never across an
     /// await or while taking the registry lock.
+    /// PRD #2374: the agent cards' store.
+    pub fn agent_cards(&self) -> &crate::agent_cards::CardStore {
+        &self.agent_cards
+    }
+
     pub fn dispatched_units(
         &self,
     ) -> crate::lock_rank::RankedGuard<
@@ -24520,6 +24888,108 @@ mod spawn_tests {
         (verified, old)
     }
 
+    /// A pathname spawn of a child that stays up, in `cwd`, with `HOME` set
+    /// to `home`; answers its launch folder and moved-from path once it has
+    /// been killed and reaped.
+    #[cfg(target_os = "linux")]
+    fn launch_folder_of_pathname_spawn(cwd: &str, home: &std::path::Path) -> LaunchFolder {
+        let pty = spawn(SpawnOptions {
+            command: Some("exec sleep 30"),
+            cwd: Some(cwd),
+            env: vec![
+                ("SHELL".into(), "/bin/sh".into()),
+                ("HOME".into(), home.to_string_lossy().into_owned()),
+            ],
+            ..SpawnOptions::default()
+        })
+        .expect("spawn should succeed");
+        let folder = (pty.launch_dir.clone(), pty.launch_dir_moved_from.clone());
+        let mut child = pty.child;
+        let _ = child.kill();
+        let _ = child.wait();
+        folder
+    }
+
+    #[cfg(target_os = "linux")]
+    type LaunchFolder = (Option<String>, Option<String>);
+
+    /// PRD #1790 (PR #2363 review, Qodo): a pathname start's folder removed
+    /// after the deck resolved it and before the PTY library spawned the
+    /// child (which then starts in `HOME`) is not recorded as the launch
+    /// folder: the record names where the child really started, read from
+    /// its `/proc/<pid>/cwd`. Control: an untouched folder is recorded as
+    /// given.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_launch_folder_removed_before_the_spawn_is_not_recorded() {
+        let root = tempfile::tempdir().expect("create tempdir");
+        let home = root.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let dir = root.path().join("d");
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.to_str().expect("utf-8 tempdir").to_string();
+
+        let (kept, moved) = launch_folder_of_pathname_spawn(&path, &home);
+        assert_eq!(kept.as_deref(), Some(path.as_str()), "control");
+        assert_eq!(moved, None);
+
+        let removed = dir.clone();
+        BEFORE_SPAWN_COMMAND.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::fs::remove_dir(&removed).expect("remove the launch folder");
+            }));
+        });
+        let (recorded, moved) = launch_folder_of_pathname_spawn(&path, &home);
+        assert_ne!(
+            recorded.as_deref(),
+            Some(path.as_str()),
+            "a folder the child never started in was recorded"
+        );
+        let recorded = recorded.expect("the child's own cwd is readable while it runs");
+        assert_eq!(
+            std::fs::canonicalize(&recorded).unwrap(),
+            std::fs::canonicalize(&home).unwrap(),
+            "the child started in HOME, and the record must say so"
+        );
+        assert_eq!(moved, None);
+    }
+
+    /// PRD #1790 (PR #2363 review, Qodo): the post-spawn decision. A path
+    /// still naming the directory it named before the spawn is kept; one
+    /// that does not, with no child cwd to read, is no folder and the path
+    /// it was moved from; with a readable child cwd, that cwd.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_launch_folder_is_confirmed_by_identity_after_the_spawn() {
+        let root = tempfile::tempdir().expect("create tempdir");
+        let dir = root.path().join("d");
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.to_str().unwrap().to_string();
+        let before = dir_identity(&path);
+        assert!(before.is_some());
+        assert_eq!(
+            confirm_launch_dir(Some(path.clone()), before, None),
+            (Some(path.clone()), None)
+        );
+        // Replaced by another directory at the same path.
+        std::fs::rename(&dir, root.path().join("old")).unwrap();
+        std::fs::create_dir(&dir).unwrap();
+        assert_eq!(
+            confirm_launch_dir(Some(path.clone()), before, None),
+            (None, Some(path.clone()))
+        );
+        // With a process whose cwd can be read (this one), that cwd.
+        let own = std::env::current_dir().unwrap();
+        let (recorded, moved) =
+            confirm_launch_dir(Some(path.clone()), before, Some(std::process::id()));
+        assert_eq!(
+            std::fs::canonicalize(recorded.unwrap()).unwrap(),
+            std::fs::canonicalize(own).unwrap()
+        );
+        assert_eq!(moved, None);
+        assert_eq!(confirm_launch_dir(None, None, None), (None, None));
+    }
+
     /// A child that writes `marker` into its working directory and exits.
     fn marker_writer(cwd: &str) -> SpawnOptions<'_> {
         SpawnOptions {
@@ -24544,6 +25014,10 @@ mod spawn_tests {
 
         let path = dir.to_str().expect("utf-8 tempdir");
         let pty = spawn_in(marker_writer(path), &verified).expect("spawn should succeed");
+        // PRD #1790 (G2): the folder the launch record gets is where the
+        // directory the child entered now is, not the replacement.
+        let launch_dir = pty.launch_dir.clone();
+        let moved_from = pty.launch_dir_moved_from.clone();
         let mut child = pty.child;
         let status = child.wait().expect("wait should succeed");
         assert!(status.success(), "the marker writer failed: {status:?}");
@@ -24557,6 +25031,52 @@ mod spawn_tests {
             !dir.join("marker").exists(),
             "the child ran in the replacement at the verified path"
         );
+        let recorded = launch_dir.expect("a moved directory that still exists has a path");
+        assert_eq!(
+            std::fs::canonicalize(&recorded).unwrap(),
+            std::fs::canonicalize(&old).unwrap(),
+            "the launch folder must be where the child ran, not the replacement at {path}"
+        );
+        assert_eq!(moved_from, None);
+    }
+
+    /// PRD #1790 (G2): the launch folder of a prepared start names the
+    /// verified directory: the requested path while it still names it;
+    /// after a rename-and-replace, the directory's current path (Linux, from
+    /// its descriptor); and once the directory is gone, no folder, only the
+    /// path it was moved from, never the replacement standing there.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_prepared_launch_folder_follows_the_verified_directory_not_its_path() {
+        let root = tempfile::tempdir().expect("create tempdir");
+        let dir = root.path().join("d");
+        std::fs::create_dir(&dir).expect("create the project dir");
+        let path = dir.to_str().expect("utf-8 tempdir");
+        let verified = crate::project_resolve::VerifiedProjectDir::open(&dir).expect("open");
+        assert_eq!(
+            prepared_launch_folder(Some(path), &verified),
+            Some(PreparedLaunchFolder::At(path.to_string())),
+            "an unmoved directory keeps the path the start asked for"
+        );
+        drop(verified);
+
+        let (verified, old) = verify_then_replace(&dir);
+        let real_old = std::fs::canonicalize(&old).unwrap();
+        assert_eq!(
+            prepared_launch_folder(Some(path), &verified),
+            Some(PreparedLaunchFolder::At(
+                real_old.to_string_lossy().into_owned()
+            )),
+            "a moved directory is recorded where it now is"
+        );
+
+        std::fs::remove_dir(&old).expect("remove the verified directory");
+        assert_eq!(
+            prepared_launch_folder(Some(path), &verified),
+            Some(PreparedLaunchFolder::MovedFrom(path.to_string())),
+            "a directory with no path left is recorded as moved, not as the replacement"
+        );
+        assert_eq!(prepared_launch_folder(None, &verified), None);
     }
 
     /// Issue #1233 review (PR #1407): a prepared start whose program is a
@@ -26921,7 +27441,17 @@ mod spawn_tests {
     #[test]
     fn doorbell_055_the_latch_does_not_wait_for_clean_evidence() {
         use crate::evidence_state::{EdgeReason, EvidenceStatus};
-        let profile = Some(&crate::doorbell_screen::CODEX_PROFILE);
+        // Codex's witnesses alone (issue #2262): with the agreement rule a
+        // terminal that has had one width is Clean from its first byte, and
+        // this test needs a header read before any Clean frame.
+        static WITNESS_ONLY: std::sync::OnceLock<crate::doorbell_screen::ScreenProfile> =
+            std::sync::OnceLock::new();
+        let profile = Some(
+            WITNESS_ONLY.get_or_init(|| crate::doorbell_screen::ScreenProfile {
+                agreement: false,
+                ..crate::doorbell_screen::CODEX_PROFILE
+            }),
+        );
         // (l) never Clean.
         let bus = AgentBus::for_generation("g-l", profile, 24, 80);
         bus.push(codex_header("0.164.0"));
@@ -28003,6 +28533,12 @@ mod spawn_tests {
             Latch::Resolved(_, Resolution::Submitted)
         ));
         editor.control.lock().unwrap().on_enter = OnEnter::SubmitSilently;
+        // The first ring ends on the hook's token, which the model editor
+        // reports before it redraws its emptied composer: on a loaded runner
+        // the second ring could otherwise read the frame still holding the
+        // line and refuse as AwaitingPrompt (main run 44059710599).
+        editor.wait_drawn("");
+        editor.wait_clean();
         let second = editor.ring().await;
         assert_eq!(
             second.outcome,
@@ -29663,6 +30199,7 @@ mod spawn_tests {
     /// Scenario: inbox/doorbell/046 through the real adapter: a model editor drops the deck's Enter, so the ring ends unresolved and the doorbell is suspended with uncertain_input shown, while the user has a draft of their own in the tracker. An older attempt's token reported exact by the prompt hook moves nothing; this attempt's token reported exact afterwards resolves the attempt late, lifts the suspension and clears the card, and leaves the user's draft bit as it was.
     #[spec("inbox/doorbell/046")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    #[ignore = "quarantined: vfarcic, #2345"]
     async fn doorbell_046_late_exact_evidence_resolves_only_its_attempt_through_the_hook_arm() {
         use crate::doorbell_txn::{Latch, Outcome, Resolution};
         use crate::inbox_display::WakeHold;
@@ -34537,6 +35074,46 @@ mod spawn_tests {
             reaped.iter().all(|r| r.load(Ordering::SeqCst)),
             "signal independence must not be bought by dropping the reap — a \
              child that is signalled and never waited on is a zombie"
+        );
+    }
+
+    /// Issue #1973: a spawn that starts Claude Code, declared or found by its
+    /// command's basename, or Devin, asks for that agent's hooks to be
+    /// repaired before its child starts; a command that is no known agent
+    /// asks for nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_claude_code_or_devin_spawn_asks_for_its_hooks_to_be_repaired() {
+        use std::os::unix::fs::PermissionsExt;
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let bin = tempfile::tempdir().unwrap();
+        let claude = bin.path().join("claude");
+        crate::test_isolation::write_script(&claude, "#!/bin/sh\nexec cat\n").unwrap();
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let claude = claude.display().to_string();
+        let spawn = |command: &str, agent_type: Option<AgentType>| {
+            registry
+                .spawn_agent(SpawnOptions {
+                    command: Some(command),
+                    agent_type,
+                    ..SpawnOptions::default()
+                })
+                .expect("spawn")
+        };
+
+        spawn("cat", None);
+        assert_eq!(registry.hook_repairs_for_test(), Vec::<AgentType>::new());
+
+        spawn("cat", Some(AgentType::ClaudeCode));
+        spawn(&claude, None);
+        spawn("cat", Some(AgentType::Devin));
+        assert_eq!(
+            registry.hook_repairs_for_test(),
+            vec![
+                AgentType::ClaudeCode,
+                AgentType::ClaudeCode,
+                AgentType::Devin
+            ]
         );
     }
 

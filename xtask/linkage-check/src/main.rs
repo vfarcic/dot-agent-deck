@@ -94,8 +94,20 @@
 /// rule 2's and rule 5's gates a change needs — the full gates for code or a
 /// build input, the tests that read them for text.
 mod affected_checks;
+/// `.github/scripts/apt-prefetch.sh`'s mirror fallback, driven under `bash`
+/// with stand-ins for `sudo`, `timeout` and `apt-get`. Tests only, and Linux
+/// only: the script runs on Ubuntu jobs and edits the mirror list with GNU
+/// `sed -i`, which macOS's BSD `sed` reads differently (Greptile and Qodo on
+/// #2386), and `build-macos-tests` runs this crate's tests.
+#[cfg(all(test, target_os = "linux"))]
+mod apt_prefetch;
 #[cfg(all(test, unix))]
 mod build_gate;
+/// The capacity-only red classifier behind `rerun-unacquired.yml` and
+/// `notify-main-red`'s held alert, `scripts/ci-unacquired-runners.sh`, driven
+/// under `bash` against a fake `gh`. Tests only, and Unix only.
+#[cfg(all(test, unix))]
+mod ci_unacquired_runners;
 /// Issue #2107: `cargo xtask clean-targets`, which reclaims idle worktrees'
 /// cargo `target/` trees.
 mod clean_targets;
@@ -165,6 +177,12 @@ mod gh_aw_lock_consistency;
 /// sources. Like `desktop_project_boundary` this carries a live rule — rule 13
 /// in [`RULES`] — as well as its own tests.
 mod git_program_literal;
+/// Issue #2381: the claim on an issue (assignee plus the `in-progress` label)
+/// is defined once, in the `issue-claim` skill; the skills that claim, select
+/// or release link to it, and no other skill writes a claim itself. Tests only
+/// — the rule is prose in repository files, which no compile step reads.
+#[cfg(test)]
+mod issue_claim;
 /// Issue #785: `scripts/junit-strip-output.py`, the stripper that makes a JUnit
 /// report from a credential-holding run structurally incapable of carrying test
 /// output before anyone shares it. Since #502 took the credentialed lane out of

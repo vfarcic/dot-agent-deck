@@ -563,7 +563,8 @@ impl Drop for ToolTraffic {
 fn subscribe(socket: &Path) -> UnixStream {
     let mut stream = UnixStream::connect(socket).expect("connect event client");
     stream.set_read_timeout(Some(WAIT)).unwrap();
-    let request = serde_json::to_vec(&AttachRequest::SubscribeEvents).unwrap();
+    let request =
+        serde_json::to_vec(&AttachRequest::SubscribeEvents { agent_cards: false }).unwrap();
     stream.write_all(&[KIND_REQ]).unwrap();
     stream
         .write_all(&(request.len() as u32).to_be_bytes())

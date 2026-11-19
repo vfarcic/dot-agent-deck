@@ -10,6 +10,10 @@ mod endpoint_test;
 #[cfg(test)]
 mod endpoint_field_parity;
 mod endpoint_tunnels;
+// Tests only: the lock and restoring guard every test that writes the
+// process-global experimental flag shares. No item outside `#[cfg(test)]`.
+#[cfg(test)]
+mod features_lock;
 mod generation;
 // The local deck's address, read in one place so the tests have one seam to move
 // it with instead of the process-wide environment variable (issue #1078).
@@ -1322,6 +1326,44 @@ fn emit_snapshot(app: &AppHandle, snapshot: &DesktopSnapshot) {
     let _ = app.emit("desktop://snapshot", snapshot);
 }
 
+/// PRD #2374 (PR #2378 review) — the agents a deck's watcher just showed,
+/// recorded for voice ([`DesktopState::record_shown_agents`]) under the
+/// watcher's claim `token`, so a watcher whose claim was retired or replaced
+/// records nothing.
+fn record_watched_agents(
+    app: &AppHandle,
+    endpoint: &Endpoint,
+    token: u64,
+    snapshot: &DesktopSnapshot,
+) {
+    if let Some(state) = app.try_state::<DesktopState>() {
+        state.record_shown_agents(
+            &endpoint.identity(),
+            token,
+            snapshot.connection.status == ConnectionStatus::Connected,
+            &snapshot.agents,
+        );
+    }
+}
+
+/// PRD #2374 (PR #2378 review) — a deck's shown `agents` into `shown`, under
+/// its id: kept while the deck is connected, removed otherwise.
+pub(crate) fn record_shown_agents(
+    shown: &std::sync::Mutex<HashMap<String, Vec<voice::DesktopAgent>>>,
+    deck: &str,
+    connected: bool,
+    agents: &[voice::DesktopAgent],
+) {
+    let mut shown = shown
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if connected {
+        shown.insert(deck.to_string(), agents.to_vec());
+    } else {
+        shown.remove(deck);
+    }
+}
+
 fn ensure_explicit_start_connected(
     start_if_missing: bool,
     snapshot: &DesktopSnapshot,
@@ -1422,6 +1464,11 @@ fn spawn_deck_watcher(app: &AppHandle, state: &DesktopState, endpoint: Endpoint)
     // reason the selection is — a start that lands before the task is first
     // polled must still be an edge the loop observes.
     let mut refetch = state.refetch_signal(&key);
+    // PRD #2374: whether the webview consumes cards, subscribed here for the
+    // selection's reason — a request that lands before the task is first
+    // polled is still an edge the loop observes.
+    let mut cards = state.agent_cards_signal();
+    let token = claim;
     let handle = tauri::async_runtime::spawn(async move {
         // PRD #741 M4(b): the incremental agent list. It belongs to this task
         // and to nothing else — it is only ever correct while this task's
@@ -1435,7 +1482,7 @@ fn spawn_deck_watcher(app: &AppHandle, state: &DesktopState, endpoint: Endpoint)
                 Ok(daemon) if daemon.require_compatible().is_ok() => daemon,
                 _ => {
                     view.resubscribed();
-                    emit_unconnected_snapshot(&app, &endpoint, &links).await;
+                    emit_unconnected_snapshot(&app, &endpoint, &links, token).await;
                     tokio::time::sleep(WATCH_RETRY_DELAY).await;
                     continue;
                 }
@@ -1444,27 +1491,37 @@ fn spawn_deck_watcher(app: &AppHandle, state: &DesktopState, endpoint: Endpoint)
             // `ListAgents` after it. Only the RESP that CONFIRMS the
             // subscription is bounded — the event frames that follow are
             // long-lived by design and are read by `spawn_event_reader`.
-            let subscription = match crate::daemon_bridge::bounded_reply(
-                "SubscribeEvents",
-                daemon.client.subscribe_events(),
-            )
-            .await
-            {
-                Ok(subscription) => subscription,
-                Err(_) => {
-                    // Could not even subscribe against a link that just said it
-                    // was compatible: drop it rather than retry through it.
-                    view.resubscribed();
-                    // PRD #742 M3: THIS deck's link, not every deck's. A
-                    // subscription that failed says nothing about the other
-                    // machines in the fleet, and dropping their links would make
-                    // one deck's bad moment cost N handshakes.
-                    links.invalidate(&endpoint).await;
-                    emit_unconnected_snapshot(&app, &endpoint, &links).await;
-                    tokio::time::sleep(WATCH_RETRY_DELAY).await;
-                    continue;
+            // PRD #2374 (review B1): opted into the agent-card doorbells, which
+            // a daemon forwards only to a subscriber that asked — and only
+            // once the webview asked for cards (`agent_cards_consume`), so a
+            // daemon serving a webview that shows none runs no card watcher
+            // for it. Marked seen here: a request that lands from now on is an
+            // edge `watch_one_subscription` re-subscribes on.
+            let with_cards = *cards.borrow_and_update();
+            let subscribe = async {
+                if with_cards {
+                    daemon.client.subscribe_events_with_agent_cards().await
+                } else {
+                    daemon.client.subscribe_events().await
                 }
             };
+            let subscription =
+                match crate::daemon_bridge::bounded_reply("SubscribeEvents", subscribe).await {
+                    Ok(subscription) => subscription,
+                    Err(_) => {
+                        // Could not even subscribe against a link that just said it
+                        // was compatible: drop it rather than retry through it.
+                        view.resubscribed();
+                        // PRD #742 M3: THIS deck's link, not every deck's. A
+                        // subscription that failed says nothing about the other
+                        // machines in the fleet, and dropping their links would make
+                        // one deck's bad moment cost N handshakes.
+                        links.invalidate(&endpoint).await;
+                        emit_unconnected_snapshot(&app, &endpoint, &links, token).await;
+                        tokio::time::sleep(WATCH_RETRY_DELAY).await;
+                        continue;
+                    }
+                };
             // A NEW subscription means the fold has a hole in it of unknown
             // size, so everything held is discarded and the first refresh under
             // this stream re-fetches. Called before the first event can arrive.
@@ -1473,17 +1530,30 @@ fn spawn_deck_watcher(app: &AppHandle, state: &DesktopState, endpoint: Endpoint)
             // is already accounted for by the establishment above, so the arm
             // starts from here rather than firing once on a stale edge.
             selection.mark_unchanged();
-            let reader = spawn_event_reader(subscription);
+            let (events, reader) = spawn_event_reader(subscription);
             let ended = watch_one_subscription(
                 &app,
                 &endpoint,
                 &links,
+                token,
                 &mut view,
-                reader,
+                events,
                 &mut selection,
                 &mut refetch,
+                &mut cards,
+                with_cards,
             )
             .await;
+            // The subscription is left whatever ended it: its reader goes now,
+            // and the daemon connection with it, rather than lingering until
+            // the next event on a deck that may send none (PR #2378 review).
+            drop(reader);
+            // PRD #2374: the webview asked for cards while this subscription
+            // ran without their doorbells. The link is healthy, so it is kept
+            // and the watcher re-subscribes at once, with them.
+            if ended == SubscriptionEnd::CardsRequested {
+                continue;
+            }
             // PRD #741 M4(a): the event stream ended. That is this watcher's
             // long-lived connection to its daemon going away, and a daemon
             // cannot be replaced without the old process dying and taking this
@@ -1526,12 +1596,18 @@ fn spawn_deck_watcher(app: &AppHandle, state: &DesktopState, endpoint: Endpoint)
 /// from before the start, and emitted after the start's connected one it would
 /// paint a connected deck as disconnected. The check and the emit run under
 /// the lock a start bumps the generation under, so neither can land after it.
-async fn emit_unconnected_snapshot(app: &AppHandle, endpoint: &Endpoint, links: &DaemonLinks) {
+async fn emit_unconnected_snapshot(
+    app: &AppHandle,
+    endpoint: &Endpoint,
+    links: &DaemonLinks,
+    token: u64,
+) {
     let generation = links.reason_generation(endpoint);
     let mut snapshot = snapshot_with(endpoint, links, None).await;
     if !links.if_current(endpoint, generation, || emit_snapshot(app, &snapshot)) {
         return;
     }
+    record_watched_agents(app, endpoint, token, &snapshot);
     if snapshot.connection.status == ConnectionStatus::Disconnected
         && links.refresh_disconnected_reason(endpoint).await
     {
@@ -1542,15 +1618,51 @@ async fn emit_unconnected_snapshot(app: &AppHandle, endpoint: &Endpoint, links: 
     }
 }
 
-/// Drain one subscription into a channel until it ends.
+/// A source of daemon events the reader drains: an [`EventSubscription`], or
+/// a stand-in in the tests.
+trait EventSource: Send + 'static {
+    fn next_event(
+        &mut self,
+    ) -> impl std::future::Future<Output = std::io::Result<Option<BroadcastMsg>>> + Send;
+}
+
+impl EventSource for EventSubscription {
+    fn next_event(
+        &mut self,
+    ) -> impl std::future::Future<Output = std::io::Result<Option<BroadcastMsg>>> + Send {
+        EventSubscription::next_event(self)
+    }
+}
+
+/// The reader task of one subscription, ended when this is dropped.
+///
+/// PRD #2374 (PR #2378 review): a watcher that leaves a subscription whose
+/// stream has NOT ended — the webview asked for cards, or the selection moved
+/// — used to drop only the channel's receiver. The reader noticed only when
+/// its next `tx.send` failed, so on a quiet deck it stayed blocked in
+/// `next_event` holding the old [`EventSubscription`], and the daemon went on
+/// serving that connection beside its replacement. Aborting the task drops
+/// the subscription at once, which half-closes its socket and ends the
+/// daemon's side of it. Cancelling a partly read frame is safe here because
+/// the subscription is being discarded with it.
+struct EventReader(tauri::async_runtime::JoinHandle<()>);
+
+impl Drop for EventReader {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Drain one subscription into a channel until it ends, or until the returned
+/// [`EventReader`] is dropped.
 ///
 /// A task of its own so nothing can cancel a partially-read frame — see
 /// [`EVENT_QUEUE_DEPTH`].
 fn spawn_event_reader(
-    mut subscription: EventSubscription,
-) -> tokio::sync::mpsc::Receiver<BroadcastMsg> {
+    mut subscription: impl EventSource,
+) -> (tokio::sync::mpsc::Receiver<BroadcastMsg>, EventReader) {
     let (tx, rx) = tokio::sync::mpsc::channel(EVENT_QUEUE_DEPTH);
-    tauri::async_runtime::spawn(async move {
+    let handle = tauri::async_runtime::spawn(async move {
         while let Ok(Some(msg)) = subscription.next_event().await {
             if tx.send(msg).await.is_err() {
                 break;
@@ -1559,7 +1671,7 @@ fn spawn_event_reader(
         // Dropping `tx` here is what tells the refresh loop the stream ended,
         // and it happens after every already-read event has been delivered.
     });
-    rx
+    (rx, EventReader(handle))
 }
 
 /// Why [`watch_one_subscription`] returned (PRD #741 M9).
@@ -1575,6 +1687,9 @@ enum SubscriptionEnd {
     /// The user chose a different deck, so this subscription is against the
     /// wrong one.
     SelectionChanged,
+    /// PRD #2374: the webview asked for agent cards and this subscription
+    /// has no card doorbells. Nothing is wrong with the link.
+    CardsRequested,
 }
 
 /// The refresh loop for one subscription: fold what arrives, re-emit at the
@@ -1586,14 +1701,22 @@ enum SubscriptionEnd {
 /// PRD #742 M3: `endpoint` is the deck this subscription is against, and it is
 /// the only deck this call ever names — the fold it fills, the events it stamps
 /// and the snapshot it emits are all that deck's.
+///
+/// PRD #2374: `cards` and `with_cards` are the webview's card request and
+/// whether this subscription was made with the card doorbells; kept as two
+/// plain arguments beside the other signals rather than a struct of one use.
+#[allow(clippy::too_many_arguments)]
 async fn watch_one_subscription(
     app: &AppHandle,
     endpoint: &Endpoint,
     links: &DaemonLinks,
+    token: u64,
     view: &mut AgentView,
     mut events: tokio::sync::mpsc::Receiver<BroadcastMsg>,
     selection: &mut tokio::sync::watch::Receiver<u64>,
     refetch: &mut tokio::sync::watch::Receiver<u64>,
+    cards: &mut tokio::sync::watch::Receiver<bool>,
+    with_cards: bool,
 ) -> SubscriptionEnd {
     let mut reconcile = tokio::time::interval(RECONCILE_INTERVAL);
     reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1610,6 +1733,10 @@ async fn watch_one_subscription(
     // is aborting this task — so a closed channel cannot complete the arm on
     // every pass and spin the loop.
     let mut refetch_open = true;
+    // PRD #2374: watched only while this subscription has no card doorbells;
+    // cleared, like `refetch_open`, once the sender is gone so a closed
+    // channel cannot spin the loop.
+    let mut cards_open = !with_cards;
 
     let mut last_refresh: Option<tokio::time::Instant> = None;
     loop {
@@ -1631,6 +1758,13 @@ async fn watch_one_subscription(
             changed = refetch.changed(), if refetch_open => match changed {
                 Ok(()) => view.mark_reconcile_due(),
                 Err(_) => refetch_open = false,
+            },
+            // PRD #2374: the webview asked for cards; this subscription has
+            // no doorbells for them, so it is replaced by one that does.
+            changed = cards.changed(), if cards_open => match changed {
+                Ok(()) if *cards.borrow_and_update() => return SubscriptionEnd::CardsRequested,
+                Ok(()) => {}
+                Err(_) => cards_open = false,
             },
             // PRD #741 M9: returns BEFORE the refresh below, deliberately, and
             // the shape is kept — but PRD #742 M3 changed what it buys, so the
@@ -1704,8 +1838,170 @@ async fn watch_one_subscription(
         }
         let snapshot = snapshot_with(endpoint, links, Some(view)).await;
         emit_snapshot(app, &snapshot);
+        record_watched_agents(app, endpoint, token, &snapshot);
+        // PRD #2374: the cards ride the same coalesced refresh — re-read on a
+        // new subscription, on a card's doorbell and on the reconciliation
+        // tick. A deck whose daemon has no cards emits nothing, and nothing is
+        // read until the webview asked for cards.
+        if view.take_cards_due() && with_cards {
+            emit_agent_cards(app, endpoint, links).await;
+        }
         last_refresh = Some(tokio::time::Instant::now());
     }
+}
+
+/// PRD #2374: the `desktop://agent-cards` payload — one deck's cards as its
+/// daemon computed them. `entries` are passed through as the daemon sent
+/// them: the desktop computes nothing about status, needs-you, actions or
+/// order (CLAUDE.md rule 18).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DesktopAgentCards {
+    deck_id: String,
+    instance_id: String,
+    revision: u64,
+    entries: Vec<dot_agent_deck::agent_cards::AgentCardEntry>,
+    catalog_errors: Vec<String>,
+}
+
+impl DesktopAgentCards {
+    fn new(endpoint: &Endpoint, list: dot_agent_deck::agent_cards::AgentCardList) -> Self {
+        Self {
+            deck_id: crate::dto::deck_wire_id(endpoint),
+            instance_id: list.instance_id,
+            revision: list.revision,
+            entries: list.entries,
+            catalog_errors: list.catalog_errors,
+        }
+    }
+}
+
+/// PRD #2374: read `endpoint`'s cards and emit them; nothing for a deck whose
+/// daemon does not advertise cards, or that did not answer.
+async fn emit_agent_cards(app: &AppHandle, endpoint: &Endpoint, links: &DaemonLinks) {
+    let Ok(daemon) = links.trusted(endpoint).await else {
+        return;
+    };
+    if daemon.require_compatible().is_err() {
+        return;
+    }
+    if let Ok(GatedQuery::Answered(list)) =
+        crate::daemon_bridge::bounded_reply("ListAgentCards", daemon.client.list_agent_cards())
+            .await
+    {
+        let _ = app.emit(
+            "desktop://agent-cards",
+            DesktopAgentCards::new(endpoint, list),
+        );
+    }
+}
+
+/// PRD #2374: the webview consumes agent cards. It calls this once, when the
+/// surface that renders them mounts (the dashboard's Table | Cards switch);
+/// from then on every deck watcher subscribes with the card doorbells and
+/// pushes `desktop://agent-cards`, and [`agent_cards_list`] reads. Before it,
+/// the bridge asks no daemon for cards.
+#[tauri::command]
+async fn agent_cards_consume(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+) -> Result<(), String> {
+    ensure_main_webview(&webview)?;
+    state.consume_agent_cards();
+    Ok(())
+}
+
+/// PRD #2374: the cards of deck `deck_id`, or `None` when its daemon does not
+/// advertise them, or the webview has not asked for cards — the webview then
+/// shows that deck's table only.
+#[tauri::command]
+async fn agent_cards_list(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    deck_id: String,
+) -> Result<Option<DesktopAgentCards>, String> {
+    ensure_main_webview(&webview)?;
+    agent_cards_list_on(&state, &deck_id).await
+}
+
+/// [`agent_cards_list`] minus the webview. `None`, asking no daemon, until
+/// the webview asked for cards ([`agent_cards_consume`]).
+async fn agent_cards_list_on(
+    state: &DesktopState,
+    deck_id: &str,
+) -> Result<Option<DesktopAgentCards>, String> {
+    if !state.agent_cards_consumed() {
+        return Ok(None);
+    }
+    let scope = crate::dto::DeckScope::resolve(Some(deck_id))?;
+    let daemon = state.daemon.trusted(scope.endpoint()).await?;
+    daemon.require_compatible()?;
+    match crate::daemon_bridge::bounded_reply("ListAgentCards", daemon.client.list_agent_cards())
+        .await?
+    {
+        GatedQuery::Answered(list) => Ok(Some(DesktopAgentCards::new(scope.endpoint(), list))),
+        GatedQuery::Unsupported => Ok(None),
+    }
+}
+
+/// PRD #2374: invoke action `action_id` of the card of agent `agent_id` in
+/// `pane_id` on deck `deck_id`. `instance_id` is the daemon process that
+/// listed the card and `action_token` the version of the action the user was
+/// shown; the shared client binds the call to that process, so a successor
+/// that numbered an unrelated agent the same is sent nothing, and the daemon
+/// refuses an action that changed since (`stale_action`). The answer is the
+/// daemon's result as is — a refusal is `outcome: "refused"` with its code —
+/// or `daemon_replaced` / `unsupported`. `request_id` names the press, so a
+/// repeat sends nothing again.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn agent_card_invoke(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    deck_id: String,
+    pane_id: String,
+    agent_id: String,
+    action_id: String,
+    action_token: String,
+    confirm: bool,
+    text: Option<String>,
+    request_id: String,
+    instance_id: String,
+) -> Result<dot_agent_deck::agent_cards::CardActionResult, String> {
+    ensure_main_webview(&webview)?;
+    let scope = crate::dto::DeckScope::resolve(Some(&deck_id))?;
+    let daemon = state.daemon.trusted(scope.endpoint()).await?;
+    daemon.require_compatible()?;
+    let target = dot_agent_deck::agent_cards::CardActionTarget {
+        instance_id,
+        pane_id,
+        agent_id,
+        action_id,
+        action_token,
+    };
+    let answer = match daemon
+        .client
+        .invoke_card_action(&target, &request_id, confirm, text.as_deref())
+        .await
+    {
+        Ok(answer) => answer,
+        Err(ClientError::DaemonRestarted | ClientError::DaemonUnnamed) => {
+            return Ok(dot_agent_deck::agent_cards::CardActionResult::refused(
+                &request_id,
+                dot_agent_deck::agent_cards::CODE_DAEMON_REPLACED,
+                "the deck's daemon was restarted after this card was read; nothing was sent",
+            ));
+        }
+        Err(error) => return Err(safe_message(error.to_string())),
+    };
+    Ok(match answer {
+        GatedQuery::Answered(result) => result,
+        GatedQuery::Unsupported => dot_agent_deck::agent_cards::CardActionResult::refused(
+            &request_id,
+            "unsupported",
+            "this deck's daemon does not support agent cards; upgrade it to act on cards",
+        ),
+    })
 }
 
 /// Has the selection moved since this receiver last observed it?
@@ -3614,6 +3910,11 @@ async fn desktop_voice_resolve(
         .unwrap_or_default();
     let resolver = voice::resolver_for(&settings.intent, Arc::new(KeychainSecretStore::new()));
     let snapshot = get_snapshot(&state.daemon).await;
+    let others = other_deck_agents(
+        &state.shown_agents,
+        &snapshot.observed,
+        &snapshot.connection.deck_id,
+    );
     resolve_declared_utterance(
         resolver.as_ref(),
         screen,
@@ -3627,6 +3928,7 @@ async fn desktop_voice_resolve(
             endpoints: endpoints.as_ref(),
             dictation: dictation.as_ref(),
             reading: reading.unwrap_or_default(),
+            other_agents: &others,
         },
         voice::Transcript::new(utterance),
         settings.labels,
@@ -3647,6 +3949,11 @@ struct VoiceDeclaration<'a> {
     dictation: Option<&'a voice::VoiceDictationTarget>,
     /// PRD #1497 — reading mode and the app's own speech, two booleans.
     reading: voice::VoiceReadingState,
+    /// PRD #2374 (PR #2378 review) — under All daemons, each other observed
+    /// deck's agents, by deck id ([`other_deck_agents`]), which voice reaches
+    /// beside the selected deck's ([`voice::VoiceDeck::agents`]). Empty when
+    /// one deck is on screen.
+    other_agents: &'a [(String, Vec<voice::DesktopAgent>)],
 }
 
 /// [`desktop_voice_resolve`] once the live state is read: the decks voice
@@ -3666,6 +3973,7 @@ async fn resolve_declared_utterance(
     show_deck: bool,
 ) -> Result<voice::VoiceResult, String> {
     let mut decks = voice_decks(observed, declared.deck_step, agents_deck);
+    with_other_agents(&mut decks, declared.other_agents);
     // PRD #1195 M3: the decks the Deck selector lists, as the webview sent
     // them — the section the selector is rendering, not `desktop.toml`, which
     // lags it by a queued write — rather than only the ones the app observes,
@@ -3709,7 +4017,8 @@ const MAX_VOICE_CHOICE_TEXT_BYTES: usize = 4 * 1024;
 fn validate_voice_choice(offered: &[voice::ResolvedParam]) -> Result<(), String> {
     let too_long = |param: &voice::ResolvedParam| {
         [&param.name, &param.spoken, &param.value, &param.label]
-            .iter()
+            .into_iter()
+            .chain(param.deck_id.as_ref())
             .any(|text| text.len() > MAX_VOICE_CHOICE_TEXT_BYTES)
     };
     if offered.is_empty()
@@ -3765,11 +4074,17 @@ async fn desktop_voice_choice(
         validate_voice_deck_step(deck_step)?;
     }
     let snapshot = get_snapshot(&state.daemon).await;
+    let others = other_deck_agents(
+        &state.shown_agents,
+        &snapshot.observed,
+        &snapshot.connection.deck_id,
+    );
     Ok(answer_declared_choice(
         &utterance,
         &action,
         &offered,
         &snapshot.agents,
+        Some(snapshot.connection.deck_id.as_str()),
         &snapshot.observed,
         VoiceDeclaration {
             directories: directories.as_ref(),
@@ -3778,6 +4093,7 @@ async fn desktop_voice_choice(
             endpoints: endpoints.as_ref(),
             dictation: None,
             reading: voice::VoiceReadingState::default(),
+            other_agents: &others,
         },
     ))
 }
@@ -4189,10 +4505,14 @@ fn answer_declared_choice(
     action: &str,
     offered: &[voice::ResolvedParam],
     agents: &[voice::DesktopAgent],
+    agents_deck: Option<&str>,
     observed: &[crate::dto::ObservedDeckDto],
     declared: VoiceDeclaration<'_>,
 ) -> voice::ChoiceAnswer {
-    let mut decks = voice_decks(observed, declared.deck_step, None);
+    // PRD #2374 (PR #2378 review): the deck `agents` are on is marked, so a
+    // candidate on another daemon is checked against that daemon's agents.
+    let mut decks = voice_decks(observed, declared.deck_step, agents_deck);
+    with_other_agents(&mut decks, declared.other_agents);
     let selections = selector_voice_decks(declared.endpoints, &mut decks, declared.deck_step);
     if action == voice::SWITCH_DECK_ROW {
         decks = decks
@@ -4291,6 +4611,7 @@ fn selector_voice_decks(
             address: None,
             local: true,
             holds_agents: false,
+            agents: Default::default(),
         },
         voice::VoiceDeckSelection {
             token: crate::settings::LOCAL_SELECTION_TOKEN.to_string(),
@@ -4305,6 +4626,7 @@ fn selector_voice_decks(
             local: false,
             unavailable: Some(voice::DECK_IS_EVERY_DAEMON.to_string()),
             holds_agents: false,
+            agents: Default::default(),
         },
         voice::VoiceDeckSelection {
             token: crate::settings::ALL_SELECTION_TOKEN.to_string(),
@@ -4347,6 +4669,7 @@ fn selector_voice_decks(
                 local: false,
                 unavailable,
                 holds_agents: false,
+                agents: Default::default(),
             },
             voice::VoiceDeckSelection {
                 token: row.id.as_str().to_string(),
@@ -4379,6 +4702,46 @@ fn selector_voice_decks(
         selections.entry(deck.id).or_insert(selection);
     }
     selections
+}
+
+/// PRD #2374 (PR #2378 review) — under All daemons, every OTHER observed deck's
+/// agents, by deck id, in the observed order, as the app last showed them
+/// ([`crate::terminal::DesktopState::shown_agents`]): read from memory, so no
+/// utterance waits on another daemon. A deck that is not connected or has no
+/// agents is left out. Empty when one deck is observed, which is every
+/// single-deck selection.
+fn other_deck_agents(
+    shown: &std::sync::Mutex<HashMap<String, Vec<voice::DesktopAgent>>>,
+    observed: &[crate::dto::ObservedDeckDto],
+    selected: &str,
+) -> Vec<(String, Vec<voice::DesktopAgent>)> {
+    if observed.len() < 2 {
+        return Vec::new();
+    }
+    let shown = shown
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    observed
+        .iter()
+        .filter(|deck| deck.deck_id != selected)
+        .filter_map(|deck| {
+            shown
+                .get(&deck.deck_id)
+                .filter(|agents| !agents.is_empty())
+                .map(|agents| (deck.deck_id.clone(), agents.clone()))
+        })
+        .collect()
+}
+
+/// PRD #2374 (PR #2378 review) — `other` agents onto their decks in `decks`
+/// ([`voice::VoiceDeck::agents`]). The deck that holds the selected deck's
+/// agents takes none: those are the agents voice is handed already.
+fn with_other_agents(decks: &mut [voice::VoiceDeck], other: &[(String, Vec<voice::DesktopAgent>)]) {
+    for deck in decks.iter_mut().filter(|deck| !deck.holds_agents) {
+        if let Some((_, agents)) = other.iter().find(|(id, _)| *id == deck.id) {
+            deck.agents = voice::DeckAgents(agents.clone());
+        }
+    }
 }
 
 /// The decks a spoken `deck_ref` resolves against (PRD #1223): the snapshot's
@@ -4439,6 +4802,7 @@ fn voice_decks(
                 local,
                 unavailable,
                 holds_agents: agents_deck == Some(deck.deck_id.as_str()),
+                agents: Default::default(),
             }
         })
         .collect()
@@ -7194,6 +7558,9 @@ pub fn run() {
             desktop_list_directories,
             desktop_inbox_action,
             desktop_generate_config,
+            agent_cards_consume,
+            agent_cards_list,
+            agent_card_invoke,
             desktop_new_agent_options,
             desktop_bootstrap,
             desktop_reconnect_deck,
@@ -7292,6 +7659,97 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// A subscription that never delivers an event, as on a quiet deck, and
+    /// records when it is dropped.
+    struct QuietSubscription(Arc<AtomicBool>);
+
+    impl Drop for QuietSubscription {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl EventSource for QuietSubscription {
+        fn next_event(
+            &mut self,
+        ) -> impl std::future::Future<Output = std::io::Result<Option<BroadcastMsg>>> + Send
+        {
+            std::future::pending()
+        }
+    }
+
+    /// PR #2378 review: a watcher leaving a subscription on a deck that sends
+    /// nothing more ends that subscription's reader, and with it the daemon
+    /// connection, rather than leaving it blocked beside its replacement.
+    /// Dropping the receiver alone, which is all the watcher used to do, does
+    /// not reach a reader parked in `next_event`.
+    #[tokio::test]
+    async fn dropping_the_event_reader_ends_a_quiet_subscription() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (events, reader) = spawn_event_reader(QuietSubscription(Arc::clone(&dropped)));
+        drop(events);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !dropped.load(Ordering::SeqCst),
+            "the receiver alone does not end a reader no event wakes"
+        );
+        drop(reader);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !dropped.load(Ordering::SeqCst) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the subscription outlived its dropped reader"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// PRD #2374 (PR #2378 review): the bridge serves cards on the webview's
+    /// request and never on the experimental flag. Before `agent_cards_consume`
+    /// `agent_cards_list` answers `None` without resolving the deck or asking
+    /// a daemon — with the flag ON — and the watchers' card signal reads
+    /// false, so none subscribes with card doorbells or pushes cards. After it
+    /// the signal moves (the edge a doorbell-less subscription re-subscribes
+    /// on), a second request moves nothing, and the same call goes on to the
+    /// deck — with the flag OFF (an unknown deck here, so it fails there).
+    ///
+    /// A plain `#[test]` driving its own runtime, so the features lock (a std
+    /// mutex) is held for the whole test without being held across an await.
+    #[test]
+    fn card_reads_follow_the_webview_request_not_the_flag() {
+        use dot_agent_deck::features::{self, Features};
+        let _lock = crate::features_lock::lock_features();
+        let _restore = crate::features_lock::RestoreFeatures::current();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let state = DesktopState::default();
+        let mut signal = state.agent_cards_signal();
+
+        features::set_for_test(Features::test_with(true));
+        assert!(!*signal.borrow_and_update());
+        assert!(!state.agent_cards_consumed());
+        assert!(matches!(
+            runtime.block_on(agent_cards_list_on(&state, "no-such-deck")),
+            Ok(None)
+        ));
+
+        state.consume_agent_cards();
+        assert!(signal.has_changed().unwrap());
+        assert!(*signal.borrow_and_update());
+        state.consume_agent_cards();
+        assert!(!signal.has_changed().unwrap());
+
+        features::set_for_test(Features::test_with(false));
+        assert!(state.agent_cards_consumed());
+        assert!(
+            runtime
+                .block_on(agent_cards_list_on(&state, "no-such-deck"))
+                .is_err()
+        );
+    }
 
     /// A reading session whose task runs until aborted, and records being
     /// dropped (aborted) and its ender being called.
@@ -7884,6 +8342,7 @@ mod tests {
                 endpoints: Some(endpoints),
                 dictation: None,
                 reading: voice::VoiceReadingState::default(),
+                other_agents: &[],
             },
             voice::Transcript::new(said),
             crate::settings::LabelSharing::Shared,
@@ -8083,9 +8542,18 @@ mod tests {
             endpoints: Some(endpoints),
             dictation: None,
             reading: voice::VoiceReadingState::default(),
+            other_agents: &[],
         };
         assert_eq!(
-            answer_declared_choice("two", "switch_deck", candidates, &[], &[], declared(&both)),
+            answer_declared_choice(
+                "two",
+                "switch_deck",
+                candidates,
+                &[],
+                None,
+                &[],
+                declared(&both)
+            ),
             voice::ChoiceAnswer::Selected(candidates[1].clone())
         );
         let without_staging = section(&[("rowbuild", "build-box")]);
@@ -8095,6 +8563,7 @@ mod tests {
                 "switch_deck",
                 candidates,
                 &[],
+                None,
                 &[],
                 declared(&without_staging)
             ),
@@ -8332,6 +8801,39 @@ mod tests {
             "{:?}",
             result.outcome
         );
+    }
+
+    /// Scenario (PRD #2374, PR #2378 review): the agents the app showed for
+    /// each deck are what voice reaches on the other daemons — every observed
+    /// deck but the selected one, in the observed order, none with no agents
+    /// and none whose last snapshot was not connected; and nothing at all with
+    /// one deck observed.
+    #[test]
+    fn voice_reaches_the_agents_the_app_showed_on_the_other_daemons() {
+        let observed = |id: &str| crate::dto::ObservedDeckDto {
+            deck_id: id.to_string(),
+            label: id.to_string(),
+            deck_kind: "remote",
+            name: None,
+        };
+        let fleet = [
+            observed("deck-a"),
+            observed("deck-b"),
+            observed("deck-c"),
+            observed("deck-d"),
+        ];
+        let shown = std::sync::Mutex::new(HashMap::new());
+        let coder = [voice::fixtures::agent("1", Some("Coder"), "claude_code")];
+        record_shown_agents(&shown, "deck-a", true, &coder);
+        record_shown_agents(&shown, "deck-b", true, &coder);
+        record_shown_agents(&shown, "deck-c", true, &[]);
+        record_shown_agents(&shown, "deck-d", true, &coder);
+        record_shown_agents(&shown, "deck-d", false, &coder);
+        let reached = other_deck_agents(&shown, &fleet, "deck-a");
+        let ids: Vec<&str> = reached.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["deck-b"]);
+        assert_eq!(reached[0].1[0].id, "1");
+        assert!(other_deck_agents(&shown, &fleet[..1], "deck-a").is_empty());
     }
 
     /// Scenario: the webview declares the New agent dialog's deck step with an

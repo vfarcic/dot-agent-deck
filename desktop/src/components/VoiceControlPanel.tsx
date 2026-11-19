@@ -3273,7 +3273,9 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       dispatchNumbered(offer, candidate);
       return;
     }
-    const at = offer.outcome.candidates.findIndex((entry) => entry.value === candidate.value);
+    /* PRD #2374 (PR #2378 review): a tie across daemons can offer two agents
+       with one id, told apart by their deck. */
+    const at = offer.outcome.candidates.findIndex((entry) => entry.value === candidate.value && entry.deckId === candidate.deckId);
     const chosen = offer.outcome.candidates[at];
     /* The one place both a click and a spoken answer pass, so neither can run
        an entry — or open a stop confirmation for an agent — that the gate

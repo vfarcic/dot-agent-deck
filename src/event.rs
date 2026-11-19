@@ -51,6 +51,17 @@ pub enum EventType {
     /// session's current `last_activity`, so even that reader's activity clock
     /// does not move.
     PullRequest,
+    /// PRD #2374: the DAEMON's doorbell that an agent card changed — created,
+    /// updated or removed. Synthesized only by [`crate::agent_cards`] and
+    /// broadcast straight onto the fan-out; the hook socket drops a producer's
+    /// copy. A **doorbell, not a payload**: its metadata names the card
+    /// ([`crate::agent_cards::AGENT_CARD_KEY_METADATA_KEY`]), its new revision
+    /// and whether it was removed, and a client re-reads `list-agent-cards`.
+    ///
+    /// Status-neutral: [`crate::state::AppState::apply_event`] ignores it. An
+    /// older reader decodes it as [`EventType::Unknown`], the `PullRequest`
+    /// precedent, so no `PROTOCOL_VERSION` bump.
+    AgentCard,
     /// PRD #370 / precedent PRD #201 (`AgentType`'s identical retrofit):
     /// forward-compat catch-all for a future/unknown `event_type` string on
     /// the wire, so a build newer than THIS one can add further variants
@@ -1586,7 +1597,10 @@ impl AgentEvent {
     pub fn is_daemon_synthetic(&self) -> bool {
         matches!(
             self.event_type,
-            EventType::ShellBusy | EventType::ShellIdle | EventType::PullRequest
+            EventType::ShellBusy
+                | EventType::ShellIdle
+                | EventType::PullRequest
+                | EventType::AgentCard
         ) || self.metadata.contains_key(DELIVERY_NOTICE_METADATA_KEY)
             || self
                 .metadata
@@ -1869,6 +1883,14 @@ pub enum DaemonMessage {
     /// and answers nothing.
     #[serde(rename = "composer_invocation")]
     ComposerInvocation(ComposerInvocationRequest),
+    /// PRD #2374: an agent publishes its card's report. **Withheld unless
+    /// the daemon answered the same connection's [`HookCapabilitiesRequest`]
+    /// with [`AGENT_CARD`]** ([`crate::hook::confirms_agent_card`]). Answered
+    /// with one [`CardPublishReply`]. Additive on the unversioned hook socket,
+    /// so it does NOT move the attach `PROTOCOL_VERSION`; an older daemon is
+    /// never sent it.
+    #[serde(rename = "card_publish")]
+    CardPublish(CardPublishRequest),
 }
 
 impl DaemonMessage {
@@ -1904,6 +1926,7 @@ impl DaemonMessage {
             DaemonMessage::InboxComplete(r) | DaemonMessage::InboxRelease(r) => &r.pane_id,
             DaemonMessage::Question(s) => &s.pane_id,
             DaemonMessage::ComposerInvocation(r) => &r.pane_id,
+            DaemonMessage::CardPublish(r) => &r.pane_id,
         }
     }
 
@@ -1935,6 +1958,7 @@ impl DaemonMessage {
             DaemonMessage::InboxComplete(r) | DaemonMessage::InboxRelease(r) => r.token.as_deref(),
             DaemonMessage::Question(s) => s.token.as_deref(),
             DaemonMessage::ComposerInvocation(r) => r.token.as_deref(),
+            DaemonMessage::CardPublish(r) => r.token.as_deref(),
         }
     }
 
@@ -1961,6 +1985,10 @@ impl DaemonMessage {
             // needs a token that attests an agent, as the inbox verbs do.
             | DaemonMessage::ComposerInvocation(_)
             | DaemonMessage::Ack(_) => true,
+            // PRD #2374: checked in its own arm against the agent it names
+            // (`hook_provenance::classify_event`), so a refusal carries the
+            // provenance gate's own codes.
+            DaemonMessage::CardPublish(_) => false,
             DaemonMessage::Delegate(_)
             | DaemonMessage::WorkDone(_)
             | DaemonMessage::HookCapabilities(_)
@@ -2003,6 +2031,7 @@ impl DaemonMessage {
             | DaemonMessage::Ack(_)
             | DaemonMessage::InputMode(_)
             | DaemonMessage::ComposerInvocation(_)
+            | DaemonMessage::CardPublish(_)
             | DaemonMessage::Question(_) => None,
         };
         claimed.filter(|id| !id.is_empty())
@@ -2037,6 +2066,7 @@ impl DaemonMessage {
             DaemonMessage::InboxRelease(_) => "inbox_release",
             DaemonMessage::Question(_) => "question",
             DaemonMessage::ComposerInvocation(_) => "composer_invocation",
+            DaemonMessage::CardPublish(_) => "card_publish",
         }
     }
 
@@ -2093,6 +2123,9 @@ impl DaemonMessage {
             }
             DaemonMessage::WorkDoneTask(_) => {
                 serde_json::to_string(&WorkDoneTaskReply::refused(reason, message))
+            }
+            DaemonMessage::CardPublish(_) => {
+                serde_json::to_string(&CardPublishReply::refused(reason, message))
             }
             DaemonMessage::WorkDone(_)
             | DaemonMessage::Dispatch(_)
@@ -2176,6 +2209,7 @@ impl DaemonMessage {
             | DaemonMessage::Ack(_)
             | DaemonMessage::Question(_)
             | DaemonMessage::ComposerInvocation(_)
+            | DaemonMessage::CardPublish(_)
             | DaemonMessage::InboxWait(_)
             | DaemonMessage::InboxAnnounce(_)
             | DaemonMessage::InboxFetch(_)
@@ -2698,7 +2732,8 @@ pub struct PreparedOrchestration {
     /// `.dot-agent-deck/orchestrator-context.md`. A client that built its own
     /// copy would be holding a second, driftable spelling of a file only the
     /// daemon wrote — and, against a current daemon, would point the coordinator
-    /// at the shared compatibility mirror rather than at its own brief.
+    /// at that fixed path, which no current deck writes (issue #1395), rather
+    /// than at its own brief.
     ///
     /// Additive on a response type, exactly like
     /// [`ResolvedProject::config_revision`]: `#[serde(default)]`, so an older
@@ -4469,6 +4504,11 @@ pub struct HookCapabilitiesReply {
     /// named it, so a daemon that would ignore them gets no dispatch at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_launch: Option<u32>,
+    /// PRD #2374: this daemon stores agent cards
+    /// ([`DaemonMessage::CardPublish`]) at this version ([`AGENT_CARD`]). The
+    /// CLI sends a publish only on the connection whose answer named it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_card: Option<u32>,
     /// On a refusal (the provenance gate), its stable code and sentence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
@@ -4490,6 +4530,57 @@ pub const EDITOR_FRONTIER: u32 = 1;
 /// A sender requires equality ([`HookCapabilitiesReply::dispatch_launch`]),
 /// never `>=`.
 pub const DISPATCH_LAUNCH: u32 = 1;
+
+/// PRD #2374: the version of [`DaemonMessage::CardPublish`] this build speaks.
+/// A sender requires equality ([`HookCapabilitiesReply::agent_card`]), never
+/// `>=`.
+pub const AGENT_CARD: u32 = 1;
+
+/// PRD #2374: an agent publishes (or replaces) its card's report —
+/// `dot-agent-deck card publish`. Sent only on a connection whose
+/// [`HookCapabilitiesReply`] named [`AGENT_CARD`]; answered with one
+/// [`CardPublishReply`]. Touches neither the inbox nor the work-done update
+/// budget.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CardPublishRequest {
+    pub pane_id: String,
+    /// The agent the sender speaks for (`DOT_AGENT_DECK_AGENT_ID`); refused
+    /// when it is not the one the token attests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    pub report: crate::agent_cards::AgentReport,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// PRD #2374: the answer to a [`CardPublishRequest`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CardPublishReply {
+    pub accepted: bool,
+    /// The card's key, `<pane>/<agent>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// The card's revision after the publish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+impl CardPublishReply {
+    /// A refusal with its stable `code` and the sentence the agent reads.
+    pub fn refused(code: &str, message: &str) -> Self {
+        CardPublishReply {
+            accepted: false,
+            code: Some(code.to_string()),
+            message: Some(message.to_string()),
+            ..Default::default()
+        }
+    }
+}
 
 /// PRD #1666 part 3 (Q35-12; amendment 3 §3.2, amendment 6 §2.3): what the
 /// editor helper reports after its editor phase, as one line on the

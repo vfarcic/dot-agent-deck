@@ -804,6 +804,19 @@ fn next_report_nonce() -> String {
     )
 }
 
+/// PRD #2374: `task` followed by the agent-card catalog's text block —
+/// exactly `"\n\n"` + [`crate::card_catalog::dispatch_text`].
+pub(crate) fn with_card_catalog(
+    task: &str,
+    catalog: &crate::card_catalog::ResolvedCatalog,
+) -> String {
+    let bin = crate::platform::paths::binary_name();
+    format!(
+        "{task}\n\n{}",
+        crate::card_catalog::dispatch_text(catalog, &bin)
+    )
+}
+
 /// PRD #220 M2.3: what a dispatched unit is actually prompted with.
 ///
 /// An ORCHESTRATION dispatch passes the task through UNCHANGED. `spawn` composes
@@ -1030,8 +1043,22 @@ pub async fn handle_dispatch(
     // `resolved_target` — is the approved text. Checked before the worktree
     // exists, so a refusal creates nothing and its devbox warm-up never runs;
     // the caller's `dispatch` fails with the reason and the approving command.
+    // Issue #2348: the calling agent is told when the user answers the
+    // in-deck request this refusal raises.
     if let crate::spawn::SpawnTarget::Orchestration { config, .. } = &resolved_target
-        && let Some(refusal) = crate::spawn::approval_refusal(&clone_dir, config, "dispatch").await
+        && let Some(refusal) = crate::spawn::approval_refusal(
+            &clone_dir,
+            config,
+            "dispatch",
+            ctx.caller.as_ref().map(|caller| {
+                crate::trust_requests::RefusedCaller::new(
+                    &caller.pane_id,
+                    &caller.agent_id,
+                    "dispatch",
+                )
+            }),
+        )
+        .await
     {
         return DispatchResult {
             worktree_dir: paths.worktree_dir.clone(),
@@ -1100,8 +1127,15 @@ pub async fn handle_dispatch(
         RemovalPolicy::KeepIfDirty,
     );
 
+    // PRD #2374: the agent-card catalog is appended to the TASK, before the
+    // shape branch, so the single-agent prompt and an orchestration's task
+    // (and through it the orchestrator's context file) both carry it.
+    // The dispatcher's own `task` stays as it is: it is what PRD #1790's
+    // journal saves below, so a restore hands back that and not a second
+    // copy of the catalog.
+    let with_catalog = with_card_catalog(task, &ctx.registry.agent_cards().catalog());
     let prompt = dispatch_prompt(
-        task,
+        &with_catalog,
         &resolved_target,
         &dispatch_report_path(name, &next_report_nonce()),
         crate::worktree_owner::main_worktree_if_linked(&paths.worktree_dir).as_deref(),
@@ -1114,6 +1148,9 @@ pub async fn handle_dispatch(
         &paths.branch,
         &paths.worktree_dir,
     );
+    // PRD #1790: the task as the dispatcher gave it, saved beside the
+    // worktree under the unit's work id, so a restore can hand it back.
+    crate::dispatch_task::save_or_warn(&paths.worktree_dir, work_id.as_ref(), task).await;
     let req = SpawnRequest {
         work_id: work_id.clone(),
         task_name: format!("dispatch-{name}"),
@@ -2811,8 +2848,7 @@ mod tests {
                 result.message
             );
 
-            // Issue #1233: the orchestration's own per-publish file, not the
-            // compatibility mirror beside it.
+            // Issue #1233: the orchestration's own per-publish file.
             let context = std::fs::read_dir(worktree.join(".dot-agent-deck"))
                 .expect("list the dispatched worktree's .dot-agent-deck")
                 .filter_map(Result::ok)

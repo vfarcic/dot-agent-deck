@@ -137,7 +137,8 @@ pub const TOOL_INSTRUCTIONS: &str = "Pick the Agent Deck action the user asked f
     about each agent: `mode` (such as dispatcher), `agent_type`, `directory` (its \
     working directory's name), `orchestration` (its run's title) and `newest_rank` \
     (1 is the agent that started last); `agents_daemon` is the daemon they are all \
-    on. A user refers to an agent by state as readily as by name — \"the one that \
+    on, and `agents_on_other_daemons`, when present, lists each other daemon's \
+    agents the same way under its `daemon` label. A user refers to an agent by state as readily as by name — \"the one that \
     is stuck\" — so resolve such a reference against those fields and answer with \
     that agent's `label`. For an agent the user named by mode, agent type, \
     directory, orchestration, daemon, start order or what it was asked to do — \
@@ -428,6 +429,15 @@ mod tests {
                 "stop_agent".to_string(),
                 "generate_config".to_string(),
                 "close_orchestration".to_string(),
+                "set_overview_mode".to_string(),
+                "show_agent_card".to_string(),
+                "next_agent_card".to_string(),
+                "previous_agent_card".to_string(),
+                "next_needs_you_card".to_string(),
+                "filter_needs_you_cards".to_string(),
+                "close_agent_card".to_string(),
+                "run_card_action".to_string(),
+                "reply_to_agent_card".to_string(),
                 "none".to_string(),
             ]
         );
@@ -529,6 +539,15 @@ mod tests {
                 "stop_agent",
                 "generate_config",
                 "close_orchestration",
+                "set_overview_mode",
+                "show_agent_card",
+                "next_agent_card",
+                "previous_agent_card",
+                "next_needs_you_card",
+                "filter_needs_you_cards",
+                "close_agent_card",
+                "run_card_action",
+                "reply_to_agent_card",
                 "none"
             ]
         );
@@ -751,6 +770,15 @@ mod tests {
                 ("stop_agent".to_string(), false),
                 ("generate_config".to_string(), false),
                 ("close_orchestration".to_string(), false),
+                ("set_overview_mode".to_string(), false),
+                ("show_agent_card".to_string(), false),
+                ("next_agent_card".to_string(), false),
+                ("previous_agent_card".to_string(), false),
+                ("next_needs_you_card".to_string(), false),
+                ("filter_needs_you_cards".to_string(), false),
+                ("close_agent_card".to_string(), false),
+                ("run_card_action".to_string(), false),
+                ("reply_to_agent_card".to_string(), false),
             ]
         );
         assert_eq!(
@@ -820,6 +848,16 @@ mod tests {
                 ("stop_agent".to_string(), true),
                 ("generate_config".to_string(), true),
                 ("close_orchestration".to_string(), true),
+                // PRD #2374: the agent cards, on the dashboard only.
+                ("set_overview_mode".to_string(), true),
+                ("show_agent_card".to_string(), true),
+                ("next_agent_card".to_string(), true),
+                ("previous_agent_card".to_string(), true),
+                ("next_needs_you_card".to_string(), true),
+                ("filter_needs_you_cards".to_string(), true),
+                ("close_agent_card".to_string(), true),
+                ("run_card_action".to_string(), true),
+                ("reply_to_agent_card".to_string(), true),
             ]
         );
         assert_eq!(
@@ -882,6 +920,15 @@ mod tests {
                 ("stop_agent".to_string(), true),
                 ("generate_config".to_string(), true),
                 ("close_orchestration".to_string(), false),
+                ("set_overview_mode".to_string(), false),
+                ("show_agent_card".to_string(), false),
+                ("next_agent_card".to_string(), false),
+                ("previous_agent_card".to_string(), false),
+                ("next_needs_you_card".to_string(), false),
+                ("filter_needs_you_cards".to_string(), false),
+                ("close_agent_card".to_string(), false),
+                ("run_card_action".to_string(), false),
+                ("reply_to_agent_card".to_string(), false),
             ]
         );
     }

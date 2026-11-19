@@ -57,6 +57,11 @@ impl Claude {
 
     /// [`Self::launch`] with `extra` set for the deck and its daemon.
     fn launch_with(command: &str, extra: &[(&str, &str)]) -> Self {
+        Self::launch_in("minimal", command, extra)
+    }
+
+    /// [`Self::launch_with`] in the deck fixture `fixture`.
+    fn launch_in(fixture: &str, command: &str, extra: &[(&str, &str)]) -> Self {
         let command = command.to_string();
         let mut builder = common::TuiDeck::builder();
         for (key, value) in extra {
@@ -75,7 +80,7 @@ impl Claude {
             .with_env("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "30000")
             .with_env("DOT_AGENT_DECK_INBOX_WAKE_STALL_AFTER_MS", "2000")
             .with_continue_session("inbox-haiku", command)
-            .launch_with_fixture("minimal");
+            .launch_with_fixture(fixture);
         deck.wait_for_string("inbox-haiku");
         let record = std::cell::RefCell::new(Value::Null);
         assert!(
@@ -244,6 +249,106 @@ impl Claude {
         )
     }
 
+    /// Issue #2390: [`Self::done`]'s acknowledgement could also come from
+    /// the witness's no-transcript fallback, so read the session transcript
+    /// real Claude Code wrote with the witness's own parser. Delivery 1.1 of
+    /// `id` must be there, and no other attempt, in the entry kind its path
+    /// records: a native wake's prompt is a `user` entry, a prompt hook's
+    /// block a `hook_additional_context` attachment.
+    fn assert_witnessed(&self, id: &str, native: bool) {
+        let kind = if native {
+            "user"
+        } else {
+            "attachment:hook_additional_context"
+        };
+        // The acknowledgement can precede Claude's write when the witness
+        // fell back, so wait for the entry rather than read once.
+        let took = |w: &[(String, dot_agent_deck::event::InboxAttemptRef)]| {
+            w.iter().any(|(k, at)| k == kind && at.a == 1 && at.e == 1)
+        };
+        common::wait_until(Duration::from_secs(15), || took(&self.witnessed(id)));
+        let witnessed = self.witnessed(id);
+        eprintln!("transcript entries witnessed for {id}: {witnessed:?}");
+        assert!(
+            took(&witnessed),
+            "the transcript must show Claude took delivery 1.1 of {id} as a {kind} entry, \
+             got {witnessed:?}; transcript lines naming it:\n{}\n{}",
+            self.transcript_lines(id).join("\n"),
+            self.evidence()
+        );
+        assert!(
+            witnessed.iter().all(|(_, at)| at.a == 1 && at.e == 1),
+            "no other attempt of {id} may reach the transcript: {witnessed:?}"
+        );
+    }
+
+    /// The session transcripts (`.jsonl`) Claude Code wrote under the test's
+    /// HOME.
+    fn transcripts(&self) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut dirs = vec![self.deck.home_dir().join(".claude/projects")];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "jsonl") {
+                    out.push(path);
+                }
+            }
+        }
+        out
+    }
+
+    /// The transcript lines that name message `id`, each cut to 3000
+    /// characters: evidence for [`Self::assert_witnessed`].
+    fn transcript_lines(&self, id: &str) -> Vec<String> {
+        self.transcripts()
+            .iter()
+            .flat_map(|path| {
+                std::fs::read_to_string(path)
+                    .unwrap_or_default()
+                    .lines()
+                    .filter(|line| line.contains(id))
+                    .map(|line| line.chars().take(3000).collect::<String>())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Issue #2390: every attempt of message `id` that the deck's transcript
+    /// witness ([`dot_agent_deck::inbox_witness::witnessed_in_line`]) reads
+    /// in [`Self::transcripts`], each with its entry's kind (`user`, or
+    /// `attachment:<type>`).
+    fn witnessed(&self, id: &str) -> Vec<(String, dot_agent_deck::event::InboxAttemptRef)> {
+        let mut out = Vec::new();
+        for path in self.transcripts() {
+            let bytes = std::fs::read(&path).unwrap_or_default();
+            for line in bytes.split(|b| *b == b'\n') {
+                let found = dot_agent_deck::inbox_witness::witnessed_in_line(line);
+                if found.is_empty() {
+                    continue;
+                }
+                let entry: Value = serde_json::from_slice(line).unwrap_or(Value::Null);
+                let kind = match entry["type"].as_str() {
+                    Some("attachment") => format!(
+                        "attachment:{}",
+                        entry["attachment"]["type"].as_str().unwrap_or("")
+                    ),
+                    Some(other) => other.to_string(),
+                    None => String::new(),
+                };
+                out.extend(
+                    found
+                        .into_iter()
+                        .filter(|at| at.id == id)
+                        .map(|at| (kind.clone(), at)),
+                );
+            }
+        }
+        out
+    }
+
     fn post(&self, body: &str) -> String {
         let reply = attach(
             &self.deck,
@@ -339,6 +444,7 @@ fn claude_011_live_idle_native_wake() {
         BUDGET,
     );
     claude.done(&id, name, true);
+    claude.assert_witnessed(&id, true);
 }
 
 /// Scenario: Ask interactive Haiku to run a slow shell operation, then post a second inbox task while that operation is running. At turn end the native Stop waiter must hand over the second task exactly once without typing a doorbell.
@@ -373,6 +479,7 @@ fn claude_012_live_busy_fold_at_stop() {
     );
     let id = claude.post(&claude.directive(name));
     claude.done(&id, name, true);
+    claude.assert_witnessed(&id, true);
     assert!(
         claude.listing()["messages"]
             .as_array()
@@ -419,6 +526,7 @@ fn claude_013_live_clear_waiters_claim_once() {
     let name = "native-clear-44f81c.txt";
     let id = claude.post(&claude.directive(name));
     claude.done(&id, name, true);
+    claude.assert_witnessed(&id, true);
 }
 
 /// The installed Claude Code release, read from `claude --version`.
@@ -489,6 +597,7 @@ fn claude_014_live_killed_waiter_falls_back_to_injection() {
     let name = "doorbell-fallback-908c2a.txt";
     let id = claude.post(&claude.directive(name));
     claude.done(&id, name, false);
+    claude.assert_witnessed(&id, false);
     assert!(
         claude.log().contains("doorbell rang"),
         "fallback must ring; {}",
@@ -501,7 +610,76 @@ fn claude_014_live_killed_waiter_falls_back_to_injection() {
     );
 }
 
-/// Scenario: Run interactive Haiku in a deck started with the Claude Code doorbell turned off (`DOT_AGENT_DECK_DOORBELL_CLAUDE=0`), kill its scratch pane's armed waiter, and post a directive task naming a sentinel. The daemon's release line must name the installed release as latched and its `doorbell off` line must name turned_off; for 20 seconds after that no doorbell rings or shows on the pane's screen or in its last prompt, the task stays queued, and the card shows the cannot_type words. The test then types a short prompt into the pane and presses Enter: the prompt hook hands Haiku the task, Haiku writes the sentinel, and the task is acknowledged.
+/// Scenario: Run interactive Haiku in a project whose own `UserPromptSubmit` hook blocks the first prompt carrying a deck doorbell line, kill the scratch pane's armed waiter, and post a directive task naming a sentinel. The doorbell rings, the deck's hook hands the task over, and the project hook blocks that prompt. For 30 seconds, longer than the witness watches, the task is not acknowledged and the sentinel is not written. The test then types a short prompt into the pane: the task is handed over again, Haiku writes the sentinel once, and the task is acknowledged with two deliveries. If the deck's Claude Code facts are not Go the test reports SKIP saying so.
+#[spec("inbox/claude/053")]
+#[test]
+#[cfg(target_os = "linux")]
+fn claude_053_live_a_blocked_doorbell_prompt_is_not_acknowledged_and_is_handed_over_again() {
+    skip_unless!(common::check_claude_available());
+    skip_unless!(claude_facts_admit_installed_release());
+    let claude = Claude::launch_in(
+        "claude-blocking-hook",
+        &common::capability_export_command(&format!("exec {CLAUDE}")),
+        &[],
+    );
+    kill_trial_waiter(&claude);
+    let name = "blocked-doorbell-5d1e7a.txt";
+    let id = claude.post(&claude.directive(name));
+    let marker = claude.deck.workdir().join("doorbell-blocked-once.marker");
+    assert!(
+        common::wait_until(BUDGET, || marker.exists()),
+        "the doorbell must ring and the project hook block its prompt; {}",
+        claude.evidence()
+    );
+    assert!(
+        claude.log().contains("doorbell rang"),
+        "{}",
+        claude.evidence()
+    );
+    let message = || {
+        claude.listing()["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == id)
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    let sentinel = claude.deck.workdir().join(name);
+    // Longer than the witness watches: neither an acknowledgement nor the
+    // sentinel may appear while the blocked prompt is all Haiku was sent.
+    let leaked = common::wait_until(Duration::from_secs(30), || {
+        message()["state"] == "acknowledged" || sentinel.exists()
+    });
+    assert!(
+        !leaked,
+        "a blocked prompt must not acknowledge the task, and Haiku never saw it; {}",
+        claude.evidence()
+    );
+    claude
+        .deck
+        .send_keys(b"Check for new messages and do what they say.");
+    claude.deck.send_keys(b"\r");
+    assert!(
+        common::wait_until(BUDGET, || std::fs::read_to_string(&sentinel)
+            .is_ok_and(|text| text.ends_with('\n'))),
+        "real Haiku must act on {id} once it is handed over again; {}",
+        claude.evidence()
+    );
+    assert!(
+        common::wait_until(BUDGET, || message()["state"] == "acknowledged"),
+        "the task must be acknowledged; {}",
+        claude.evidence()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&sentinel).unwrap(),
+        format!("inbox-action-{name}\n"),
+        "one append proves one action"
+    );
+    assert_eq!(message()["deliveries"], 2, "{}", claude.evidence());
+}
+
+/// Scenario: Run interactive Haiku in a deck started with the Claude Code doorbell turned off (`DOT_AGENT_DECK_DOORBELL_CLAUDE=0`), kill its scratch pane's armed waiter, and post a directive task naming a sentinel. The daemon's release line must name the installed release as latched and its `doorbell off` line must name turned_off; for 20 seconds after that no doorbell rings or shows on the pane's screen or in its last prompt, the task stays queued, and the card shows the cannot_type words. The test then types a short prompt into the pane and presses Enter, which starts a turn: Haiku is handed the task (an ordinary prompt's hook hands nothing over, so by another route, such as the waiter armed when that turn ends), writes the sentinel, and the task is acknowledged.
 #[spec("inbox/claude/050")]
 #[test]
 #[cfg(target_os = "linux")]
@@ -2072,4 +2250,5 @@ fn claude_049_live_hooks_refreshed_after_an_upgrade_deliver() {
     let name = "refreshed-hooks-41c9e7.txt";
     let id = fresh.post(&fresh.directive(name));
     fresh.done(&id, name, true);
+    fresh.assert_witnessed(&id, true);
 }

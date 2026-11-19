@@ -282,7 +282,7 @@ async fn handle_connection(
                 while read_frame(&mut stream).await.ok().flatten().is_some() {}
             }
         }
-        AttachRequest::SubscribeEvents => {
+        AttachRequest::SubscribeEvents { .. } => {
             write_resp(&mut stream, &AttachResponse::ok())
                 .await
                 .expect("reply to SubscribeEvents");

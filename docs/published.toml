@@ -103,6 +103,11 @@ title = "Dashboard"
 description = "The desktop app's main screen: agents per daemon, their statuses, the agent pane, and closing agents and orchestrations."
 
 [[page]]
+slug = "desktop/agent-cards"
+title = "Agent Cards"
+description = "The desktop Dashboard's Cards view: each agent's status, report, questions and actions on a card, the card overlay, voice commands, the [catalog] of fields and actions, and the TUI's card commands."
+
+[[page]]
 slug = "desktop/new-agent"
 title = "New Agent"
 description = "Start an agent from the desktop app: choose the daemon, the directory, the mode and the command."

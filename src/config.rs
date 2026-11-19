@@ -264,6 +264,84 @@ pub struct DashboardConfig {
     pub host_metrics: toml::Table,
 }
 
+/// Every top-level key [`DashboardConfig`] reads and writes. A save replaces
+/// these and nothing else, so a table this struct does not own — the agent
+/// cards' `[catalog]` (PRD #2374, `src/card_catalog.rs`), or one a newer build
+/// added — survives `config set`, comments and all.
+/// `dashboard_keys_name_every_field` fails to compile when a field is added
+/// without being listed here.
+const DASHBOARD_KEYS: &[&str] = &[
+    "default_command",
+    "default_dir",
+    "bell",
+    "doorbell",
+    "notifications",
+    "auto_config_prompt",
+    "host_metrics",
+];
+
+/// The file [`DashboardConfig::save_to`] writes: `existing` (the file as it is
+/// on disk, `None` when there is none) with each of [`DASHBOARD_KEYS`] set to
+/// what `ours` (the struct's own serialization) says, or removed when `ours`
+/// leaves it out. Everything else in `existing` is kept as written. `Err` when
+/// `existing` is not valid TOML: there is nothing to merge into, and writing
+/// `ours` alone would delete whatever the file held.
+fn merge_dashboard_config(existing: Option<&str>, ours: &str) -> Result<String, String> {
+    let Some(existing) = existing else {
+        return Ok(ours.to_string());
+    };
+    let mut doc = existing
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| e.message().to_string())?;
+    let mut ours = ours
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| format!("the deck's own serialization did not parse: {e}"))?;
+    for key in DASHBOARD_KEYS {
+        let Some(mut item) = ours.remove(key) else {
+            doc.remove(key);
+            continue;
+        };
+        clear_table_positions(&mut item);
+        if let Some(slot) = doc.get_mut(key) {
+            // Replaced in place, so the key keeps its own comments and place,
+            // and a table its header's comments and its position in the file.
+            if let (Some(old), Some(new)) = (slot.as_table(), item.as_table_mut()) {
+                *new.decor_mut() = old.decor().clone();
+                new.set_position(old.position());
+            } else if let (Some(old), Some(new)) = (slot.as_value(), item.as_value_mut()) {
+                *new.decor_mut() = old.decor().clone();
+            }
+            *slot = item;
+        } else {
+            doc.insert(key, item);
+        }
+    }
+    Ok(doc.to_string())
+}
+
+/// Forget the positions `item`'s tables had in the document they were parsed
+/// from, so each is written after the table before it in the file it is
+/// moved into rather than at a position that means something else there.
+fn clear_table_positions(item: &mut toml_edit::Item) {
+    match item {
+        toml_edit::Item::Table(table) => {
+            table.set_position(None);
+            for (_, child) in table.iter_mut() {
+                clear_table_positions(child);
+            }
+        }
+        toml_edit::Item::ArrayOfTables(tables) => {
+            for table in tables.iter_mut() {
+                table.set_position(None);
+                for (_, child) in table.iter_mut() {
+                    clear_table_positions(child);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// [`DashboardConfig::host_metrics`]'s lenient read: a table is kept as it is,
 /// anything else reads as empty, so it never fails the whole config. Silent:
 /// the warning is [`host_metrics_not_a_table`], raised by
@@ -468,8 +546,25 @@ impl DashboardConfig {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("Failed to create config directory: {e}"))?;
         }
-        let contents =
+        let ours =
             toml::to_string_pretty(self).map_err(|e| format!("Failed to serialize config: {e}"))?;
+        let existing = match std::fs::read_to_string(path) {
+            Ok(text) => Some(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return Err(format!(
+                    "Failed to read config at {} before saving it: {e}",
+                    path.display()
+                ));
+            }
+        };
+        let contents = merge_dashboard_config(existing.as_deref(), &ours).map_err(|e| {
+            format!(
+                "Not saving config at {}: it is not valid TOML ({e}); fix it first, \
+                 because saving would replace everything it holds",
+                path.display()
+            )
+        })?;
         write_config_atomically(path, contents.as_bytes())
             .map_err(|e| format!("Failed to write config at {}: {e}", path.display()))
     }
@@ -1024,6 +1119,12 @@ fn resolve_symlink_chain(path: &Path) -> PathBuf {
         };
     }
     current
+}
+
+/// PRD #2374: the user config file the agent-card catalog is read from — the
+/// same file [`DashboardConfig::load`] reads.
+pub(crate) fn user_config_path() -> PathBuf {
+    config_path()
 }
 
 fn config_path() -> PathBuf {
@@ -3448,6 +3549,128 @@ mod tests {
         );
     }
 
+    /// PRD #2374 (review finding): `config set` of an unrelated key keeps the
+    /// agent cards' `[catalog]` table, any other table this build does not
+    /// know, and the user's comments; a key the struct owns is rewritten, and
+    /// one it now leaves out (back at its default) is removed.
+    #[test]
+    fn a_config_save_keeps_the_catalog_and_other_tables_it_does_not_own() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "\
+# my deck
+default_command = \"claude\" # the usual
+
+# about bells
+[bell]
+on_idle = true
+
+[doorbell]
+claude = false
+
+[catalog]
+remove = [\"merge\"] # not this one
+
+[[catalog.fields]]
+name = \"risk\"
+description = \"How risky the change is.\"
+type = \"text\"
+
+[[catalog.actions]]
+name = \"ship\"
+description = \"Offer when it is ready.\"
+prompt = \"Ship it.\"
+
+[from_a_newer_build]
+answer = 42
+";
+        std::fs::write(&path, original).unwrap();
+        let mut config: DashboardConfig = toml::from_str(original).unwrap();
+        config.set_field("bell.enabled", "false").unwrap();
+        config.set_field("doorbell.claude", "true").unwrap();
+        config.save_to(&path).unwrap();
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            saved.starts_with("# my deck\ndefault_command = \"claude\" # the usual\n"),
+            "{saved}"
+        );
+        assert!(saved.contains("# about bells\n[bell]\n"), "{saved}");
+        assert!(
+            saved.contains("remove = [\"merge\"] # not this one"),
+            "{saved}"
+        );
+        let table: toml::Table = toml::from_str(&saved).unwrap();
+        let before: toml::Table = toml::from_str(original).unwrap();
+        assert_eq!(table["catalog"], before["catalog"], "{saved}");
+        assert_eq!(
+            table["from_a_newer_build"], before["from_a_newer_build"],
+            "{saved}"
+        );
+        assert_eq!(table["bell"]["enabled"].as_bool(), Some(false), "{saved}");
+        assert_eq!(table["bell"]["on_idle"].as_bool(), Some(true), "{saved}");
+        assert!(
+            !table.contains_key("doorbell"),
+            "doorbell is back at its default, so the save drops it: {saved}"
+        );
+        let reread: DashboardConfig = toml::from_str(&saved).unwrap();
+        assert!(!reread.bell.enabled && reread.doorbell.claude);
+        assert_eq!(reread.default_command, "claude");
+
+        // The catalog the daemon reads from that file is the user's, not the
+        // defaults.
+        let catalog = crate::card_catalog::resolve(Some(&saved));
+        assert!(catalog.errors.is_empty(), "{:?}", catalog.errors);
+        assert!(catalog.fields.iter().any(|f| f.name == "risk"));
+        assert!(catalog.actions.iter().any(|a| a.name == "ship"));
+        assert!(!catalog.actions.iter().any(|a| a.name == "merge"));
+    }
+
+    /// PRD #2374: a config that is not valid TOML is refused rather than
+    /// replaced, so a typo never costs the user their catalog or any other
+    /// setting the deck could not read.
+    #[test]
+    fn a_config_save_refuses_to_replace_a_file_that_is_not_toml() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "default_command = \n[catalog]\nremove = [\"merge\"]\n";
+        std::fs::write(&path, original).unwrap();
+        let err = DashboardConfig::default().save_to(&path).unwrap_err();
+        assert!(err.starts_with("Not saving config at "), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    /// [`DASHBOARD_KEYS`] names every field of [`DashboardConfig`]: the
+    /// destructuring fails to compile when a field is added, and the
+    /// serialization of a config with every field away from its default
+    /// writes exactly the listed keys.
+    #[test]
+    fn dashboard_keys_name_every_field() {
+        let mut config = DashboardConfig::default();
+        let DashboardConfig {
+            default_command,
+            default_dir,
+            bell,
+            doorbell,
+            notifications,
+            auto_config_prompt,
+            host_metrics,
+        } = &mut config;
+        *default_command = "x".into();
+        *default_dir = "/x".into();
+        bell.enabled = !bell.enabled;
+        doorbell.claude = !doorbell.claude;
+        notifications.question_after_minutes += 1;
+        *auto_config_prompt = !*auto_config_prompt;
+        host_metrics.insert("disk_warn_percent".into(), toml::Value::Integer(80));
+        let written: toml::Table = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        let mut keys: Vec<&str> = written.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        let mut listed = DASHBOARD_KEYS.to_vec();
+        listed.sort_unstable();
+        assert_eq!(keys, listed);
+    }
+
     /// Issue #2156 (what `docs/configuration.md` says of it): `config set`
     /// through a config folder that is a link whose target is missing fails,
     /// and creates nothing at the link or where it points.
@@ -3548,51 +3771,55 @@ mod tests {
         );
     }
 
+    /// The bell's defaults (ring on waiting-for-input and on error, not on
+    /// idle) hold for a built config, an empty table and a partial one, and a
+    /// key that is present overrides only its own default.
     #[test]
-    fn bell_config_defaults() {
-        let bc = BellConfig::default();
-        assert!(bc.enabled);
-        assert!(bc.on_waiting_for_input);
-        assert!(!bc.on_idle);
-        assert!(bc.on_error);
+    fn bell_config_defaults_hold_when_built_parsed_empty_or_partial() {
+        let cases = [
+            ("built", BellConfig::default(), false),
+            ("empty", toml::from_str("").unwrap(), false),
+            ("partial", toml::from_str("on_idle = true").unwrap(), true),
+        ];
+        for (name, bc, on_idle) in cases {
+            assert!(bc.enabled, "{name}");
+            assert!(bc.on_waiting_for_input, "{name}");
+            assert_eq!(bc.on_idle, on_idle, "{name}");
+            assert!(bc.on_error, "{name}");
+        }
     }
 
+    /// `auto_config_prompt` and the `[bell]` table default when a config omits
+    /// them, and a config that sets them is read over the defaults, leaving the
+    /// keys it does not set at theirs.
     #[test]
-    fn bell_config_deserialize_empty() {
-        let bc: BellConfig = toml::from_str("").unwrap();
-        assert!(bc.enabled);
-        assert!(bc.on_waiting_for_input);
-        assert!(!bc.on_idle);
-        assert!(bc.on_error);
-    }
+    fn dashboard_config_reads_auto_config_prompt_and_bell_over_their_defaults() {
+        let built = DashboardConfig::default();
+        assert!(built.auto_config_prompt);
 
-    #[test]
-    fn bell_config_deserialize_partial() {
-        let bc: BellConfig = toml::from_str("on_idle = true").unwrap();
-        assert!(bc.enabled);
-        assert!(bc.on_idle);
-    }
+        let empty: DashboardConfig = toml::from_str("").unwrap();
+        assert!(empty.auto_config_prompt);
 
-    #[test]
-    fn dashboard_config_without_bell_section() {
-        let dc: DashboardConfig = toml::from_str(r#"default_command = "echo hi""#).unwrap();
-        assert_eq!(dc.default_command, "echo hi");
-        assert!(dc.bell.enabled);
-    }
+        let off: DashboardConfig = toml::from_str("auto_config_prompt = false").unwrap();
+        assert!(!off.auto_config_prompt);
 
-    #[test]
-    fn dashboard_config_with_bell_section() {
-        let toml_str = r#"
+        let no_bell: DashboardConfig = toml::from_str(r#"default_command = "echo hi""#).unwrap();
+        assert_eq!(no_bell.default_command, "echo hi");
+        assert!(no_bell.bell.enabled);
+
+        let with_bell: DashboardConfig = toml::from_str(
+            r#"
 default_command = "test"
 
 [bell]
 enabled = false
 on_idle = true
-"#;
-        let dc: DashboardConfig = toml::from_str(toml_str).unwrap();
-        assert!(!dc.bell.enabled);
-        assert!(dc.bell.on_idle);
-        assert!(dc.bell.on_waiting_for_input);
+"#,
+        )
+        .unwrap();
+        assert!(!with_bell.bell.enabled);
+        assert!(with_bell.bell.on_idle);
+        assert!(with_bell.bell.on_waiting_for_input);
     }
 
     #[test]
@@ -4605,24 +4832,6 @@ timeout_secs = 600
         assert!(dc.host_metrics.is_empty());
     }
 
-    #[test]
-    fn auto_config_prompt_defaults_to_true() {
-        let dc = DashboardConfig::default();
-        assert!(dc.auto_config_prompt);
-    }
-
-    #[test]
-    fn auto_config_prompt_deserialize_missing() {
-        let dc: DashboardConfig = toml::from_str("").unwrap();
-        assert!(dc.auto_config_prompt);
-    }
-
-    #[test]
-    fn auto_config_prompt_deserialize_false() {
-        let dc: DashboardConfig = toml::from_str("auto_config_prompt = false").unwrap();
-        assert!(!dc.auto_config_prompt);
-    }
-
     // PRD #42 M2: asserts the Unix temp-dir + per-uid fallback specifically
     // (`current_uid()` is Unix-only and the path shape is POSIX), so it is
     // gated to Unix. The Windows endpoint is a per-user named pipe with no
@@ -4706,116 +4915,69 @@ timeout_secs = 600
         }
     }
 
+    /// `state_dir()` takes `DOT_AGENT_DECK_STATE_DIR` first, then (on Unix)
+    /// `$XDG_STATE_HOME/dot-agent-deck`, then `$HOME/.local/state/dot-agent-deck`.
+    /// Windows has no XDG concept and ignores `$HOME`, so its last two rows
+    /// expect `%LOCALAPPDATA%\dot-agent-deck`, derived from the same `dirs`
+    /// crate the resolver uses so no machine-specific username is hardcoded.
     #[test]
-    fn state_dir_uses_explicit_override_first() {
+    fn state_dir_prefers_the_override_then_xdg_state_home_then_home() {
         let _guard = STATE_DIR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev_state = std::env::var("DOT_AGENT_DECK_STATE_DIR").ok();
-        let prev_xdg = std::env::var("XDG_STATE_HOME").ok();
-        // SAFETY: env-var lock held; restored on the way out.
-        unsafe {
-            std::env::set_var("DOT_AGENT_DECK_STATE_DIR", "/tmp/explicit-state");
-            std::env::set_var("XDG_STATE_HOME", "/should/be/ignored");
-        }
-
-        assert_eq!(state_dir(), PathBuf::from("/tmp/explicit-state"));
-
-        // SAFETY: same lock held; restoring previous values.
-        unsafe {
-            match prev_state {
-                Some(v) => std::env::set_var("DOT_AGENT_DECK_STATE_DIR", v),
-                None => std::env::remove_var("DOT_AGENT_DECK_STATE_DIR"),
+        let keys = ["DOT_AGENT_DECK_STATE_DIR", "XDG_STATE_HOME", "HOME"];
+        let prev: Vec<Option<String>> = keys.iter().map(|k| std::env::var(k).ok()).collect();
+        let fallback = |unix_path: &str| -> PathBuf {
+            #[cfg(unix)]
+            {
+                PathBuf::from(unix_path)
             }
-            match prev_xdg {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
+            #[cfg(windows)]
+            {
+                let _ = unix_path;
+                dirs::data_local_dir()
+                    .map(|p| p.join("dot-agent-deck"))
+                    .unwrap_or_else(|| {
+                        crate::platform::paths::home_dir().join("AppData/Local/dot-agent-deck")
+                    })
             }
-        }
-    }
-
-    #[test]
-    fn state_dir_uses_xdg_state_home_when_set() {
-        let _guard = STATE_DIR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev_state = std::env::var("DOT_AGENT_DECK_STATE_DIR").ok();
-        let prev_xdg = std::env::var("XDG_STATE_HOME").ok();
-        // SAFETY: env-var lock held; restored on the way out.
-        unsafe {
-            std::env::remove_var("DOT_AGENT_DECK_STATE_DIR");
-            std::env::set_var("XDG_STATE_HOME", "/var/lib/state");
-        }
-
-        // Unix honors `$XDG_STATE_HOME`. Windows has no XDG concept, so the
-        // resolver ignores it and returns `%LOCALAPPDATA%\dot-agent-deck`
-        // (derived here from the same `dirs` crate the resolver uses, so no
-        // machine-specific username is hardcoded).
-        #[cfg(unix)]
-        assert_eq!(state_dir(), PathBuf::from("/var/lib/state/dot-agent-deck"));
-        #[cfg(windows)]
-        {
-            let expected = dirs::data_local_dir()
-                .map(|p| p.join("dot-agent-deck"))
-                .unwrap_or_else(|| {
-                    crate::platform::paths::home_dir().join("AppData/Local/dot-agent-deck")
-                });
-            assert_eq!(state_dir(), expected);
-        }
-
-        // SAFETY: same lock held; restoring previous values.
-        unsafe {
-            match prev_state {
-                Some(v) => std::env::set_var("DOT_AGENT_DECK_STATE_DIR", v),
-                None => std::env::remove_var("DOT_AGENT_DECK_STATE_DIR"),
+        };
+        let cases = [
+            (
+                [
+                    Some("/tmp/explicit-state"),
+                    Some("/should/be/ignored"),
+                    prev[2].as_deref(),
+                ],
+                PathBuf::from("/tmp/explicit-state"),
+            ),
+            (
+                [None, Some("/var/lib/state"), prev[2].as_deref()],
+                fallback("/var/lib/state/dot-agent-deck"),
+            ),
+            (
+                [None, None, Some("/home/test-user")],
+                fallback("/home/test-user/.local/state/dot-agent-deck"),
+            ),
+        ];
+        for (values, expected) in cases {
+            // SAFETY: env-var lock held; restored after the loop.
+            unsafe {
+                for (key, value) in keys.iter().zip(values) {
+                    match value {
+                        Some(v) => std::env::set_var(key, v),
+                        None => std::env::remove_var(key),
+                    }
+                }
             }
-            match prev_xdg {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
-            }
-        }
-    }
-
-    #[test]
-    fn state_dir_falls_back_to_home_when_xdg_unset() {
-        let _guard = STATE_DIR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev_state = std::env::var("DOT_AGENT_DECK_STATE_DIR").ok();
-        let prev_xdg = std::env::var("XDG_STATE_HOME").ok();
-        let prev_home = std::env::var("HOME").ok();
-        // SAFETY: env-var lock held; restored on the way out.
-        unsafe {
-            std::env::remove_var("DOT_AGENT_DECK_STATE_DIR");
-            std::env::remove_var("XDG_STATE_HOME");
-            std::env::set_var("HOME", "/home/test-user");
-        }
-
-        // Unix falls back to `$HOME/.local/state`. Windows ignores `$HOME`
-        // entirely and returns `%LOCALAPPDATA%\dot-agent-deck` (derived from the
-        // same `dirs` crate the resolver uses — no hardcoded username/prefix).
-        #[cfg(unix)]
-        assert_eq!(
-            state_dir(),
-            PathBuf::from("/home/test-user/.local/state/dot-agent-deck")
-        );
-        #[cfg(windows)]
-        {
-            let expected = dirs::data_local_dir()
-                .map(|p| p.join("dot-agent-deck"))
-                .unwrap_or_else(|| {
-                    crate::platform::paths::home_dir().join("AppData/Local/dot-agent-deck")
-                });
-            assert_eq!(state_dir(), expected);
+            assert_eq!(state_dir(), expected, "{values:?}");
         }
 
         // SAFETY: same lock held; restoring previous values.
         unsafe {
-            match prev_state {
-                Some(v) => std::env::set_var("DOT_AGENT_DECK_STATE_DIR", v),
-                None => std::env::remove_var("DOT_AGENT_DECK_STATE_DIR"),
-            }
-            match prev_xdg {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
-            }
-            match prev_home {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
+            for (key, value) in keys.iter().zip(prev) {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
             }
         }
     }
@@ -5527,52 +5689,44 @@ repo = "vfarcic/dot-ai"
         );
     }
 
-    // PRD #120 (M1) — a hand-edited issue-dispatch task with a malformed `repo`
-    // is rejected at load time (the value flows into `gh`/`git` argv), surfaced
-    // as a per-entry error and skipped, while valid siblings still load.
+    /// A repo that is not an `owner/name` slug and a label starting with `-`
+    /// are both rejected at load time (the values flow into `gh`/`git` argv):
+    /// the entry is dropped with one per-entry error.
     #[test]
-    fn issue_dispatch_rejects_invalid_repo() {
-        let toml_str = r#"
+    fn issue_dispatch_rejects_a_repo_or_label_unsafe_for_argv() {
+        let cases = [
+            ("bad repo", "repo = \"ext::sh -c id\"", Some("owner/name")),
+            (
+                "bad label",
+                "repo = \"acme/widgets\"\nlabel = \"-rf\"",
+                None,
+            ),
+        ];
+        for (name, fields, message) in cases {
+            let toml_str = format!(
+                r#"
 [[scheduled_tasks]]
-name = "bad repo"
+name = "{name}"
 cron = "0 9 * * *"
 working_dir = "/work/space"
-prompt = "Work on issue {{issue_number}}"
+prompt = "Work on issue {{{{issue_number}}}}"
 
 [scheduled_tasks.issue_dispatch]
-repo = "ext::sh -c id"
 max_per_run = 3
-"#;
-        let loaded = LoadedSchedules::parse(toml_str);
-        assert!(loaded.tasks.is_empty(), "malformed repo must be rejected");
-        assert_eq!(loaded.errors.len(), 1);
-        assert!(
-            loaded.errors[0].message.contains("owner/name"),
-            "error should explain the slug requirement: {:?}",
-            loaded.errors[0].message
-        );
-    }
-
-    #[test]
-    fn issue_dispatch_rejects_leading_dash_label() {
-        let toml_str = r#"
-[[scheduled_tasks]]
-name = "bad label"
-cron = "0 9 * * *"
-working_dir = "/work/space"
-prompt = "Work on issue {{issue_number}}"
-
-[scheduled_tasks.issue_dispatch]
-repo = "acme/widgets"
-max_per_run = 3
-label = "-rf"
-"#;
-        let loaded = LoadedSchedules::parse(toml_str);
-        assert!(
-            loaded.tasks.is_empty(),
-            "a leading-`-` label must be rejected"
-        );
-        assert_eq!(loaded.errors.len(), 1);
+{fields}
+"#
+            );
+            let loaded = LoadedSchedules::parse(&toml_str);
+            assert!(loaded.tasks.is_empty(), "{name} must be rejected");
+            assert_eq!(loaded.errors.len(), 1, "{name}");
+            if let Some(message) = message {
+                assert!(
+                    loaded.errors[0].message.contains(message),
+                    "{name}: the error should explain the slug requirement: {:?}",
+                    loaded.errors[0].message
+                );
+            }
+        }
     }
 
     #[test]

@@ -468,11 +468,15 @@ fn claude_inbox_hooks(
         }
         "UserPromptSubmit" => {
             let prompt = payload.get("prompt").and_then(Value::as_str)?;
+            // Issue #2341: Claude can still drop the prompt after this hook
+            // exits, so what it hands over is committed once the session
+            // transcript shows Claude took it.
             deck_prompt_submit(
                 prompt,
                 crate::event::InboxComponent::ClaudeHooks,
                 crate::inbox_hub::SESSION_FRAMING,
                 event,
+                crate::inbox_witness::TranscriptMark::of_payload(&payload),
             )
         }
         _ => None,
@@ -486,6 +490,10 @@ pub struct HookOutput {
     /// reports its own attempts instead.
     #[cfg(unix)]
     one_shot: Option<crate::inbox_prompt::OneShotInjection>,
+    /// Issue #2341: the transcript witness that commits what Claude took,
+    /// instead of the hand-over committing what it wrote.
+    #[cfg(unix)]
+    witness: Option<crate::inbox_prompt::Witness>,
 }
 
 impl HookOutput {
@@ -494,16 +502,29 @@ impl HookOutput {
             stdout,
             #[cfg(unix)]
             one_shot: None,
+            #[cfg(unix)]
+            witness: None,
         }
     }
 
     /// Write the output. A one-shot hand-over commits what it wrote in full,
-    /// on each attempt's own cap.
+    /// on each attempt's own cap, or leaves that to its transcript witness.
     fn print(self) {
         #[cfg(unix)]
-        if let Some(one_shot) = self.one_shot {
-            one_shot.print();
-            return;
+        match (self.one_shot, self.witness) {
+            (Some(one_shot), Some(witness)) => {
+                one_shot.print_witnessed(witness);
+                return;
+            }
+            (Some(one_shot), None) => {
+                one_shot.print();
+                return;
+            }
+            (None, Some(witness)) => {
+                witness.start_alone();
+                return;
+            }
+            (None, None) => {}
         }
         let mut out = std::io::stdout();
         let _ = writeln!(out, "{}", self.stdout).and_then(|()| out.flush());
@@ -598,11 +619,14 @@ fn codex_inbox_hooks(
             .get("prompt")
             .and_then(Value::as_str)
             .and_then(|prompt| {
+                // Codex's prompt hook still commits what it wrote: no
+                // transcript witness reads Codex's session yet.
                 deck_prompt_submit(
                     prompt,
                     crate::event::InboxComponent::CodexHooks,
                     framing,
                     event,
+                    None,
                 )
             })
             .map_or(CodexInbox::Nothing, CodexInbox::Print),
@@ -639,6 +663,7 @@ pub fn deck_prompt_submit(
     component: crate::event::InboxComponent,
     framing: &str,
     event: &mut AgentEvent,
+    transcript: Option<crate::inbox_witness::TranscriptMark>,
 ) -> Option<HookOutput> {
     let ids = crate::inbox_prompt::scan(prompt);
     if ids.is_empty() {
@@ -648,11 +673,28 @@ pub fn deck_prompt_submit(
     // (what it leaves out: `prompt_receipts_wait`): the hook blocks the
     // user's prompt while it runs.
     let receipts_by = std::time::Instant::now() + crate::inbox_prompt::prompt_receipts_wait();
-    crate::inbox_prompt::commit_delivered(
-        prompt,
-        crate::inbox_prompt::sender_of(component),
+    // Issue #2341: with a transcript to witness it, what the prompt carries
+    // is committed once Claude has taken the prompt, not now.
+    #[cfg(unix)]
+    let witness = transcript.map(|mark| crate::inbox_prompt::Witness {
+        mark,
+        native: crate::inbox_prompt::delivered(prompt),
         receipts_by,
-    );
+    });
+    // No witness runs off Unix: the one-shots that would hand a block over
+    // are Unix only.
+    #[cfg(not(unix))]
+    let witness: Option<()> = {
+        let _ = transcript;
+        None
+    };
+    if witness.is_none() {
+        crate::inbox_prompt::commit_delivered(
+            prompt,
+            crate::inbox_prompt::sender_of(component),
+            receipts_by,
+        );
+    }
     #[cfg(unix)]
     {
         let envelope = crate::inbox_prompt::Envelope::Context {
@@ -677,16 +719,21 @@ pub fn deck_prompt_submit(
             .map(crate::inbox_prompt::OneShotInjection::ids)
             .unwrap_or_default();
         crate::inbox_prompt::mark_event(event, &ids, &fetched);
-        injection.map(|injection| HookOutput {
-            stdout: String::new(),
-            one_shot: Some(injection),
-        })
+        match (injection, witness) {
+            (None, Some(witness)) if witness.native.is_empty() => None,
+            (None, None) => None,
+            (one_shot, witness) => Some(HookOutput {
+                stdout: String::new(),
+                one_shot,
+                witness,
+            }),
+        }
     }
     // The one-shot receivers are Unix only: no body is injected here, so a
     // doorbell does not deliver to Claude Code or Codex on Windows yet.
     #[cfg(not(unix))]
     {
-        let _ = (component, framing);
+        let _ = (component, framing, witness);
         crate::inbox_prompt::mark_event(event, &ids, &[]);
         None
     }
@@ -2720,7 +2767,7 @@ pub fn send_gated_at(
     let question_deadline = std::time::Instant::now() + question_wait;
     let Ok(mut client) = crate::platform::ipc::IpcClient::connect_timeout(path, question_wait)
     else {
-        return not_confirmed("no daemon answered");
+        return not_confirmed(GATED_NO_DAEMON);
     };
     if write_gated(
         &mut client,
@@ -2933,6 +2980,45 @@ pub fn confirms_dispatch_launch(line: &str) -> Result<(), Option<(String, String
         return Ok(());
     }
     Err(reply.code.zip(reply.message))
+}
+
+/// PRD #2374: whether a capabilities answer confirms
+/// [`crate::event::AGENT_CARD`], by equality. A refusal of the question comes
+/// back with its code and message.
+pub fn confirms_agent_card(line: &str) -> Result<(), Option<(String, String)>> {
+    let Ok(reply) = serde_json::from_str::<crate::event::HookCapabilitiesReply>(line.trim()) else {
+        return Err(None);
+    };
+    if reply.agent_card == Some(crate::event::AGENT_CARD) {
+        return Ok(());
+    }
+    Err(reply.code.zip(reply.message))
+}
+
+/// The `why` of a [`Gated::NotConfirmed`] when nothing answered at the hook
+/// socket at all: no daemon is running.
+pub const GATED_NO_DAEMON: &str = "no daemon answered";
+
+/// PRD #2374: publish an agent card, only on a connection whose capabilities
+/// answer named [`crate::event::AGENT_CARD`], so an older daemon is never sent
+/// it.
+pub fn send_card_publish(request: &crate::event::CardPublishRequest) -> Gated {
+    let question =
+        crate::event::DaemonMessage::HookCapabilities(crate::event::HookCapabilitiesRequest {
+            pane_id: request.pane_id.clone(),
+            token: request.token.clone(),
+        });
+    let mutation = crate::event::DaemonMessage::CardPublish(request.clone());
+    let (Ok(question), Ok(mutation)) = (
+        serde_json::to_string(&question),
+        serde_json::to_string(&mutation),
+    ) else {
+        return Gated::NotConfirmed {
+            refusal: None,
+            why: "the request could not be encoded",
+        };
+    };
+    send_gated(&question, &mutation, confirms_agent_card)
 }
 
 /// Issue #2172: send a dispatch that chose its unit's command or agent, only
@@ -4167,48 +4253,56 @@ mod tests {
         assert!(event.metadata.is_empty());
     }
 
+    /// Each named tool's card detail is the input field it works on: a
+    /// `Bash` command's first line, bounded to 120 characters, a `Read` or
+    /// `Edit` file path, and a `Grep` or `Glob` pattern.
     #[test]
-    fn tool_detail_bash_command() {
-        let input: Value = serde_json::json!({"command": "ls -la\necho hello"});
-        let detail = extract_tool_detail(Some("Bash"), Some(&input));
-        assert_eq!(detail.as_deref(), Some("ls -la"));
-    }
-
-    #[test]
-    fn tool_detail_bash_truncates_long_command() {
+    fn tool_detail_is_the_field_each_named_tool_works_on() {
         let long_cmd = "x".repeat(200);
-        let input: Value = serde_json::json!({"command": long_cmd});
-        let detail = extract_tool_detail(Some("Bash"), Some(&input)).unwrap();
-        assert!(detail.len() <= 124); // 120 + "…" (3 bytes)
-    }
-
-    #[test]
-    fn tool_detail_read_file_path() {
-        let input: Value = serde_json::json!({"file_path": "/src/main.rs"});
-        let detail = extract_tool_detail(Some("Read"), Some(&input));
-        assert_eq!(detail.as_deref(), Some("/src/main.rs"));
-    }
-
-    #[test]
-    fn tool_detail_edit_file_path() {
-        let input: Value =
-            serde_json::json!({"file_path": "/src/lib.rs", "old_string": "a", "new_string": "b"});
-        let detail = extract_tool_detail(Some("Edit"), Some(&input));
-        assert_eq!(detail.as_deref(), Some("/src/lib.rs"));
-    }
-
-    #[test]
-    fn tool_detail_grep_pattern() {
-        let input: Value = serde_json::json!({"pattern": "fn main"});
-        let detail = extract_tool_detail(Some("Grep"), Some(&input));
-        assert_eq!(detail.as_deref(), Some("fn main"));
-    }
-
-    #[test]
-    fn tool_detail_glob_pattern() {
-        let input: Value = serde_json::json!({"pattern": "**/*.rs"});
-        let detail = extract_tool_detail(Some("Glob"), Some(&input));
-        assert_eq!(detail.as_deref(), Some("**/*.rs"));
+        let cases = [
+            (
+                "Bash",
+                serde_json::json!({"command": "ls -la\necho hello"}),
+                "ls -la".to_string(),
+            ),
+            (
+                "Bash",
+                serde_json::json!({"command": long_cmd}),
+                truncate(&long_cmd, 120),
+            ),
+            (
+                "Read",
+                serde_json::json!({"file_path": "/src/main.rs"}),
+                "/src/main.rs".to_string(),
+            ),
+            (
+                "Edit",
+                serde_json::json!({"file_path": "/src/lib.rs", "old_string": "a", "new_string": "b"}),
+                "/src/lib.rs".to_string(),
+            ),
+            (
+                "Grep",
+                serde_json::json!({"pattern": "fn main"}),
+                "fn main".to_string(),
+            ),
+            (
+                "Glob",
+                serde_json::json!({"pattern": "**/*.rs"}),
+                "**/*.rs".to_string(),
+            ),
+        ];
+        for (tool, input, expected) in cases {
+            assert_eq!(
+                extract_tool_detail(Some(tool), Some(&input)).as_deref(),
+                Some(expected.as_str()),
+                "{tool} {input}"
+            );
+        }
+        let bounded = extract_tool_detail(
+            Some("Bash"),
+            Some(&serde_json::json!({"command": long_cmd})),
+        );
+        assert!(bounded.unwrap().len() <= 124); // 120 + "…" (3 bytes)
     }
 
     #[test]
@@ -4239,50 +4333,6 @@ mod tests {
     }
 
     #[test]
-    fn build_event_session_start() {
-        let input = ClaudeCodeHookInput {
-            session_id: "test-123".into(),
-            hook_event_name: "SessionStart".into(),
-            cwd: Some("/tmp".into()),
-            tool_name: None,
-            tool_input: None,
-            tool_use_id: None,
-            prompt: None,
-            source: None,
-            subagent_id: None,
-            _extra: HashMap::new(),
-            ..Default::default()
-        };
-        let event = build_event(input).unwrap();
-        assert_eq!(event.session_id, "test-123");
-        assert_eq!(event.event_type, EventType::SessionStart);
-        assert_eq!(event.cwd.as_deref(), Some("/tmp"));
-        assert!(event.tool_name.is_none());
-        assert!(event.user_prompt.is_none());
-    }
-
-    #[test]
-    fn build_event_tool_start_with_detail() {
-        let input = ClaudeCodeHookInput {
-            session_id: "test-123".into(),
-            hook_event_name: "PreToolUse".into(),
-            cwd: None,
-            tool_name: Some("Read".into()),
-            tool_input: Some(serde_json::json!({"file_path": "/src/main.rs"})),
-            tool_use_id: None,
-            prompt: None,
-            source: None,
-            subagent_id: None,
-            _extra: HashMap::new(),
-            ..Default::default()
-        };
-        let event = build_event(input).unwrap();
-        assert_eq!(event.event_type, EventType::ToolStart);
-        assert_eq!(event.tool_name.as_deref(), Some("Read"));
-        assert_eq!(event.tool_detail.as_deref(), Some("/src/main.rs"));
-    }
-
-    #[test]
     fn build_event_unknown_hook_returns_none() {
         let input = ClaudeCodeHookInput {
             session_id: "test-123".into(),
@@ -4300,46 +4350,67 @@ mod tests {
         assert!(build_event(input).is_none());
     }
 
+    /// A Claude Code `UserPromptSubmit` is a `Thinking` event carrying the
+    /// prompt, and a prompt longer than 200 characters is cut to 200 plus `…`.
     #[test]
-    fn build_event_user_prompt_submit_extracts_prompt() {
-        let input = ClaudeCodeHookInput {
-            session_id: "test-123".into(),
-            hook_event_name: "UserPromptSubmit".into(),
-            cwd: None,
-            tool_name: None,
-            tool_input: None,
-            tool_use_id: None,
-            prompt: Some("fix the login bug".into()),
-            source: None,
-            subagent_id: None,
-            _extra: HashMap::new(),
-            ..Default::default()
+    fn build_event_user_prompt_submit_carries_the_prompt_bounded_to_200() {
+        let prompt_event = |prompt: String| {
+            build_event(ClaudeCodeHookInput {
+                session_id: "test-123".into(),
+                hook_event_name: "UserPromptSubmit".into(),
+                prompt: Some(prompt),
+                ..Default::default()
+            })
+            .unwrap()
         };
-        let event = build_event(input).unwrap();
+        let event = prompt_event("fix the login bug".into());
         assert_eq!(event.event_type, EventType::Thinking);
         assert_eq!(event.user_prompt.as_deref(), Some("fix the login bug"));
-    }
 
-    #[test]
-    fn build_event_prompt_truncated_to_200() {
-        let long_prompt = "x".repeat(300);
-        let input = ClaudeCodeHookInput {
-            session_id: "test-123".into(),
-            hook_event_name: "UserPromptSubmit".into(),
-            cwd: None,
-            tool_name: None,
-            tool_input: None,
-            tool_use_id: None,
-            prompt: Some(long_prompt),
-            source: None,
-            subagent_id: None,
-            _extra: HashMap::new(),
-            ..Default::default()
-        };
-        let event = build_event(input).unwrap();
-        let prompt = event.user_prompt.unwrap();
+        let prompt = prompt_event("x".repeat(300)).user_prompt.unwrap();
         assert!(prompt.len() <= 204); // 200 + "…" (3 bytes)
         assert!(prompt.ends_with('…'));
+    }
+
+    /// A Claude Code `PreToolUse` for a non-`Bash` tool is a `ToolStart` naming
+    /// the tool and its detail, and stores no `bash_command`.
+    #[test]
+    fn build_event_non_bash_tool_start_has_detail_and_no_bash_command() {
+        let event = build_event(ClaudeCodeHookInput {
+            session_id: "test-123".into(),
+            hook_event_name: "PreToolUse".into(),
+            tool_name: Some("Read".into()),
+            tool_input: Some(serde_json::json!({"file_path": "/src/main.rs"})),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(event.event_type, EventType::ToolStart);
+        assert_eq!(event.tool_name.as_deref(), Some("Read"));
+        assert_eq!(event.tool_detail.as_deref(), Some("/src/main.rs"));
+        assert!(!event.metadata.contains_key("bash_command"));
+    }
+
+    /// An OpenCode `tool.execute.before` for `Bash` is a `ToolStart` naming
+    /// the tool, with the command as its detail and stored whole as
+    /// `bash_command`.
+    #[test]
+    fn build_opencode_event_bash_tool_start_has_detail_and_full_command() {
+        let full_cmd = "helm status my-release --namespace prod";
+        let event = build_opencode_event(OpenCodeHookInput {
+            session_id: "oc-123".into(),
+            event: "tool.execute.before".into(),
+            tool_name: Some("Bash".into()),
+            tool_input: Some(serde_json::json!({"command": full_cmd})),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(event.event_type, EventType::ToolStart);
+        assert_eq!(event.tool_name.as_deref(), Some("Bash"));
+        assert_eq!(event.tool_detail.as_deref(), Some(full_cmd));
+        assert_eq!(
+            event.metadata.get("bash_command").map(String::as_str),
+            Some(full_cmd),
+        );
     }
 
     /// `source` degrades the same way an unexpected-shape field elsewhere in
@@ -5424,45 +5495,6 @@ mod tests {
     }
 
     #[test]
-    fn build_opencode_event_session_created() {
-        let input = OpenCodeHookInput {
-            session_id: "oc-123".into(),
-            event: "session.created".into(),
-            tool_name: None,
-            tool_input: None,
-            status: None,
-            cwd: Some("/tmp".into()),
-            prompt: None,
-            _extra: HashMap::new(),
-            ..Default::default()
-        };
-        let event = build_opencode_event(input).unwrap();
-        assert_eq!(event.session_id, "oc-123");
-        assert_eq!(event.agent_type, AgentType::OpenCode);
-        assert_eq!(event.event_type, EventType::SessionStart);
-        assert_eq!(event.cwd.as_deref(), Some("/tmp"));
-    }
-
-    #[test]
-    fn build_opencode_event_tool_with_detail() {
-        let input = OpenCodeHookInput {
-            session_id: "oc-123".into(),
-            event: "tool.execute.before".into(),
-            tool_name: Some("Bash".into()),
-            tool_input: Some(serde_json::json!({"command": "cargo build"})),
-            status: None,
-            cwd: None,
-            prompt: None,
-            _extra: HashMap::new(),
-            ..Default::default()
-        };
-        let event = build_opencode_event(input).unwrap();
-        assert_eq!(event.event_type, EventType::ToolStart);
-        assert_eq!(event.tool_name.as_deref(), Some("Bash"));
-        assert_eq!(event.tool_detail.as_deref(), Some("cargo build"));
-    }
-
-    #[test]
     fn build_opencode_event_unknown_returns_none() {
         let input = OpenCodeHookInput {
             session_id: "oc-123".into(),
@@ -5677,64 +5709,63 @@ mod tests {
         );
     }
 
-    #[test]
-    fn pane_id_propagated_from_env_claude_code() {
+    /// Sets `DOT_AGENT_DECK_PANE_ID` for the duration of `f`, under
+    /// [`ENV_MUTEX`], and restores whatever was there before.
+    fn with_pane_id_env<T>(pane: &str, f: impl FnOnce() -> T) -> T {
         let _lock = ENV_MUTEX.lock().unwrap();
         let key = DOT_AGENT_DECK_PANE_ID;
         let prev = std::env::var(key).ok();
-        unsafe { std::env::set_var(key, "pane-42") };
-
-        let input = ClaudeCodeHookInput {
-            session_id: "s1".into(),
-            hook_event_name: "SessionStart".into(),
-            cwd: None,
-            tool_name: None,
-            tool_input: None,
-            tool_use_id: None,
-            prompt: None,
-            source: None,
-            subagent_id: None,
-            _extra: HashMap::new(),
-            ..Default::default()
-        };
-        let event = build_event(input).unwrap();
-        assert_eq!(event.pane_id.as_deref(), Some("pane-42"));
-
+        unsafe { std::env::set_var(key, pane) };
+        let out = f();
         unsafe {
             match prev {
                 Some(v) => std::env::set_var(key, v),
                 None => std::env::remove_var(key),
             }
         }
+        out
     }
 
+    /// A Claude Code `SessionStart` is a `SessionStart` event for its session
+    /// and cwd, with no tool or prompt, carrying the pane id the deck put in
+    /// the hook's environment.
     #[test]
-    fn pane_id_propagated_from_env_opencode() {
-        let _lock = ENV_MUTEX.lock().unwrap();
-        let key = DOT_AGENT_DECK_PANE_ID;
-        let prev = std::env::var(key).ok();
-        unsafe { std::env::set_var(key, "pane-99") };
+    fn build_event_session_start_carries_session_cwd_and_env_pane_id() {
+        let event = with_pane_id_env("pane-42", || {
+            build_event(ClaudeCodeHookInput {
+                session_id: "test-123".into(),
+                hook_event_name: "SessionStart".into(),
+                cwd: Some("/tmp".into()),
+                ..Default::default()
+            })
+            .unwrap()
+        });
+        assert_eq!(event.session_id, "test-123");
+        assert_eq!(event.event_type, EventType::SessionStart);
+        assert_eq!(event.cwd.as_deref(), Some("/tmp"));
+        assert!(event.tool_name.is_none());
+        assert!(event.user_prompt.is_none());
+        assert_eq!(event.pane_id.as_deref(), Some("pane-42"));
+    }
 
-        let input = OpenCodeHookInput {
-            session_id: "oc-1".into(),
-            event: "session.created".into(),
-            cwd: None,
-            tool_name: None,
-            tool_input: None,
-            prompt: None,
-            status: None,
-            _extra: HashMap::new(),
-            ..Default::default()
-        };
-        let event = build_opencode_event(input).unwrap();
+    /// An OpenCode `session.created` is an OpenCode `SessionStart` event for
+    /// its session and cwd, carrying the pane id from the hook's environment.
+    #[test]
+    fn build_opencode_event_session_created_carries_session_cwd_and_env_pane_id() {
+        let event = with_pane_id_env("pane-99", || {
+            build_opencode_event(OpenCodeHookInput {
+                session_id: "oc-123".into(),
+                event: "session.created".into(),
+                cwd: Some("/tmp".into()),
+                ..Default::default()
+            })
+            .unwrap()
+        });
+        assert_eq!(event.session_id, "oc-123");
+        assert_eq!(event.agent_type, AgentType::OpenCode);
+        assert_eq!(event.event_type, EventType::SessionStart);
+        assert_eq!(event.cwd.as_deref(), Some("/tmp"));
         assert_eq!(event.pane_id.as_deref(), Some("pane-99"));
-
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var(key, v),
-                None => std::env::remove_var(key),
-            }
-        }
     }
 
     #[test]
@@ -5766,25 +5797,6 @@ mod tests {
     }
 
     #[test]
-    fn build_event_non_bash_tool_start_no_bash_command() {
-        let input = ClaudeCodeHookInput {
-            session_id: "s1".into(),
-            hook_event_name: "PreToolUse".into(),
-            cwd: None,
-            tool_name: Some("Read".into()),
-            tool_input: Some(serde_json::json!({"file_path": "/src/main.rs"})),
-            tool_use_id: None,
-            prompt: None,
-            source: None,
-            subagent_id: None,
-            _extra: HashMap::new(),
-            ..Default::default()
-        };
-        let event = build_event(input).unwrap();
-        assert!(!event.metadata.contains_key("bash_command"));
-    }
-
-    #[test]
     fn build_event_bash_tool_end_no_bash_command() {
         let input = ClaudeCodeHookInput {
             session_id: "s1".into(),
@@ -5801,27 +5813,6 @@ mod tests {
         };
         let event = build_event(input).unwrap();
         assert!(!event.metadata.contains_key("bash_command"));
-    }
-
-    #[test]
-    fn build_opencode_event_bash_tool_start_stores_full_command() {
-        let full_cmd = "helm status my-release --namespace prod";
-        let input = OpenCodeHookInput {
-            session_id: "oc-1".into(),
-            event: "tool.execute.before".into(),
-            tool_name: Some("Bash".into()),
-            tool_input: Some(serde_json::json!({"command": full_cmd})),
-            status: None,
-            cwd: None,
-            prompt: None,
-            _extra: HashMap::new(),
-            ..Default::default()
-        };
-        let event = build_opencode_event(input).unwrap();
-        assert_eq!(
-            event.metadata.get("bash_command").map(String::as_str),
-            Some(full_cmd),
-        );
     }
 
     /// Issue #2087: a Claude Code `Skill` call and an OpenCode `skill` call

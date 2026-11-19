@@ -35,6 +35,7 @@ use std::path::Path;
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 use crate::agent_pty::{TabMembership, Termination};
+use crate::event::AgentType;
 use crate::work_journal::{
     CloseHow, Destination, EndCause, EndHow, Event, Launch, Refs, WorkId, WorkJournal,
 };
@@ -58,6 +59,54 @@ const MAX_RETIRED_TASKS: usize = 64;
 /// abandoned task that arrives after many newer ones still finds its work.
 /// Bounded: the oldest goes first.
 const MAX_SETTLED_TASKS: usize = 4096;
+
+/// PRD #1790: the most `attempt_session` lines one attempt writes as soon as
+/// its session id changes. Past it the latest id is held, not written at
+/// once: [`WorkTracker::flush_held_sessions`] writes it at its first round
+/// that finds room in the session quota (every [`SESSION_FLUSH_EVERY`] in
+/// the daemon, [`spawn_session_flush`]), one line per attempt per round
+/// however often the id changed in between, and the attempt's end writes it
+/// too ([`WorkTracker::attempt_ended`]), as does an orderly shutdown
+/// ([`WorkTracker::drain`]). So a producer that flaps between ids writes at
+/// most this many lines, then at most one per round, then one at its end.
+pub const MAX_SESSION_LINES: usize = 32;
+
+/// PRD #1790: how often the daemon writes the session ids its tracker holds
+/// back ([`spawn_session_flush`]): one refused by the journal's session
+/// quota, or one past [`MAX_SESSION_LINES`]. An id the tracker holds reaches
+/// the journal's queue at the first round after it was reported that finds
+/// room in the session quota, while the daemon runs, and at an orderly
+/// shutdown ([`WorkTracker::drain`]).
+pub const SESSION_FLUSH_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// PRD #1790: whether `session`, reported by an agent of type `agent` on
+/// `pane`, names a session the agent could be resumed into. Pi's hooks report
+/// a synthetic `<pane>-session` id that is not Pi's own, so it is not one; an
+/// empty id is not one either. OpenCode's id is taken as reported, though its
+/// plugin reports every later session in a folder under the folder's first id
+/// (the docs say so; a later stage settles which id a resume needs).
+pub fn is_resumable_session(agent: &AgentType, pane: Option<&str>, session: &str) -> bool {
+    if session.is_empty() || *agent == AgentType::Pi {
+        return false;
+    }
+    !pane.is_some_and(|pane| session == format!("{pane}-session"))
+}
+
+/// What [`WorkTracker::launch_recorded`] writes about one launch: the spawn's
+/// own view of it, before any wrapping.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LaunchDetails<'a> {
+    pub command: Option<&'a str>,
+    pub shell: Option<&'a str>,
+    pub agent_type: Option<&'a AgentType>,
+    pub cwd: Option<&'a str>,
+    /// The path a prepared start asked for, when its verified directory
+    /// had been moved from it and could not be found
+    /// ([`crate::launch_records::LaunchRecord::cwd_moved_from`]).
+    pub cwd_moved_from: Option<&'a str>,
+    pub name: Option<&'a str>,
+    pub membership: Option<&'a TabMembership>,
+}
 
 /// How a generation's end reads in the journal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,6 +232,38 @@ struct Book {
     spawning: HashMap<WorkId, usize>,
     /// Dispatched unit id -> its work.
     units: HashMap<String, UnitWork>,
+    /// Live attempt (registry agent id) -> what it wrote as
+    /// `attempt_session` (PRD #1790): the last id, so an unchanged id is not
+    /// written again, how many lines it wrote ([`MAX_SESSION_LINES`]) and the
+    /// latest id it holds back. Retired with the attempt.
+    sessions: HashMap<String, SessionBook>,
+    /// Reserved generation (registry agent id, its spawn not yet published)
+    /// -> the session ids its hooks reported, in order, held until its
+    /// attempt starts ([`WorkTracker::attempt_started`] writes them right
+    /// after its `attempt_started`) or dropped when its reservation ends
+    /// without one ([`WorkTracker::spawn_abandoned`]). An entry is added only
+    /// when the caller says the generation is reserved, which the registry
+    /// decides under its lock, and the registry clears it in the lock hold that
+    /// ends that reservation, so this holds at most one entry per reservation
+    /// the registry holds (one more per spawn whose reservation's `Drop` found
+    /// the registry lock poisoned, as the reservation itself leaks then).
+    /// Each entry keeps at most [`MAX_SESSION_LINES`] ids, the newest.
+    early_sessions: HashMap<String, VecDeque<(String, AgentType)>>,
+}
+
+/// What one live attempt wrote as `attempt_session` (PRD #1790).
+#[derive(Default)]
+struct SessionBook {
+    /// The id last written.
+    last: Option<String>,
+    /// How many `attempt_session` lines it wrote.
+    written: usize,
+    /// The latest id, when it is not the one last written: past the cap, or
+    /// refused by the journal's session quota. Written at the first
+    /// [`WorkTracker::flush_held_sessions`] round that finds quota room, at
+    /// an orderly shutdown's [`WorkTracker::drain`], or when the attempt
+    /// ends.
+    held: Option<(String, AgentType)>,
 }
 
 impl Book {
@@ -279,6 +360,8 @@ pub(crate) struct BookSizes {
     pub settled: usize,
     pub units: usize,
     pub spawning: usize,
+    pub sessions: usize,
+    pub early_sessions: usize,
 }
 
 /// What a spawn minted, so a spawn that publishes nothing can forget it.
@@ -380,16 +463,85 @@ impl WorkTracker {
         }
     }
 
-    /// Wait at most `bound` for the journal's writer to write what it was
-    /// handed (a graceful shutdown).
+    /// An orderly shutdown's journal barrier, best effort: first hand every
+    /// live attempt's held-back session id ([`Self::flush_held_sessions`]'s,
+    /// which no later round will write) to the writer, outside the session
+    /// quota and waiting for queue room rather than dropping it, then wait
+    /// for the writer to write what it was handed. On a shutdown whose
+    /// writer keeps up, that leaves each live attempt's latest reported id
+    /// on disk without relying on the next periodic round or on the
+    /// attempt's end, which a PTY reader detached at shutdown may never
+    /// reach.
+    ///
+    /// `bound` caps the waiting for queue room and for the writer's drain,
+    /// not the whole call: taking the book's lock and walking its sessions
+    /// are outside it, and each wait polls every 5 ms, so the call can
+    /// overrun `bound` by about that much. An id still unqueued when the
+    /// deadline passes stays held and is logged, not written; one the writer
+    /// was handed but did not write in time (or that a failed writer drops)
+    /// is missing from disk. A session reported after this call is not
+    /// covered.
     pub fn drain(&self, bound: std::time::Duration) {
-        if let Some(journal) = self.journal()
-            && !journal.flush_within(bound)
-        {
+        let Some(journal) = self.journal() else {
+            return;
+        };
+        let deadline = std::time::Instant::now() + bound;
+        let unsent = self.hand_over_held_sessions(journal, deadline);
+        if unsent > 0 {
+            tracing::warn!(
+                unsent,
+                "work journal: could not queue every held session id before shutdown"
+            );
+        }
+        if !journal.flush_within(deadline.saturating_duration_since(std::time::Instant::now())) {
             tracing::warn!(
                 "work journal: the writer did not drain before shutdown; its last events may be missing"
             );
         }
+    }
+
+    /// [`Self::drain`]'s first half: queue each live attempt's held session
+    /// id with [`WorkJournal::record_within`] until `deadline`, under the
+    /// book's lock so a session reported meanwhile is queued after it, not
+    /// before. The journal's writer never takes the book, so waiting for its
+    /// queue under the lock cannot deadlock. Answers how many held ids it
+    /// could not queue (kept held).
+    fn hand_over_held_sessions(
+        &self,
+        journal: &WorkJournal,
+        deadline: std::time::Instant,
+    ) -> usize {
+        let mut guard = self.book();
+        let book = &mut *guard;
+        let mut unsent = 0;
+        for (agent_id, entry) in &mut book.sessions {
+            let Some((session, agent)) = entry.held.take() else {
+                continue;
+            };
+            let (Some(work), Some(attempt)) = (
+                book.attempts.get(agent_id),
+                agent_id
+                    .parse::<u64>()
+                    .ok()
+                    .and_then(|agent| journal.attempt_id(agent)),
+            ) else {
+                entry.held = Some((session, agent));
+                continue;
+            };
+            let event = Event::AttemptSession {
+                work: work.clone(),
+                attempt,
+                session: session.clone(),
+                agent: agent.clone(),
+            };
+            if journal.record_within(event, deadline) {
+                entry.last = Some(session);
+            } else {
+                entry.held = Some((session, agent));
+                unsent += 1;
+            }
+        }
+        unsent
     }
 
     /// The run's journal, once installed.
@@ -552,6 +704,8 @@ impl WorkTracker {
             settled: book.settled.len(),
             units: book.units.len(),
             spawning: book.spawning.len(),
+            sessions: book.sessions.len(),
+            early_sessions: book.early_sessions.len(),
         }
     }
 
@@ -632,17 +786,273 @@ impl WorkTracker {
             agent,
             role: role.and_then(|r| journal.plain(r)),
         });
+        // PRD #1790: the sessions its hooks reported before it was
+        // published, in order, right after its start.
+        for (session, agent_type) in book.early_sessions.remove(agent_id).unwrap_or_default() {
+            Self::note_session(journal, book, agent_id, work, &attempt, session, agent_type);
+        }
         match book.early_ends.remove(agent_id) {
-            Some(end) => journal.record(Event::AttemptEnded {
-                work: work.clone(),
-                attempt,
-                how: end.how,
-                code: end.code,
-                cause: end.cause,
-            }),
+            Some(end) => {
+                Self::flush_held_session(journal, book, agent_id, work, &attempt);
+                journal.record(Event::AttemptEnded {
+                    work: work.clone(),
+                    attempt,
+                    how: end.how,
+                    code: end.code,
+                    cause: end.cause,
+                });
+            }
             None => {
                 book.attempts.insert(agent_id.to_string(), work.clone());
             }
+        }
+    }
+
+    /// PRD #1790: the reservation of generation `agent_id` ended without an
+    /// attempt starting for it (its spawn was abandoned, or published serving
+    /// no work): the session reports held for it go. The registry calls it
+    /// under its lock, in the same hold that ends the reservation.
+    pub fn spawn_abandoned(&self, agent_id: &str) {
+        self.book().early_sessions.remove(agent_id);
+    }
+
+    /// Write `session` for live attempt `agent_id` unless it is the id last
+    /// written; past [`MAX_SESSION_LINES`], or when the journal's session
+    /// quota refuses it, hold it instead, for [`Self::flush_held_sessions`]
+    /// and the attempt's end.
+    fn note_session(
+        journal: &WorkJournal,
+        book: &mut Book,
+        agent_id: &str,
+        work: &WorkId,
+        attempt: &crate::work_journal::AttemptId,
+        session: String,
+        agent: AgentType,
+    ) {
+        let entry = book.sessions.entry(agent_id.to_string()).or_default();
+        if entry.last.as_deref() == Some(session.as_str()) {
+            entry.held = None;
+            return;
+        }
+        if entry.written >= MAX_SESSION_LINES {
+            entry.held = Some((session, agent));
+            return;
+        }
+        let event = Event::AttemptSession {
+            work: work.clone(),
+            attempt: attempt.clone(),
+            session: session.clone(),
+            agent: agent.clone(),
+        };
+        if journal.record_session(event) {
+            entry.last = Some(session);
+            entry.written += 1;
+            entry.held = None;
+        } else {
+            entry.held = Some((session, agent));
+        }
+    }
+
+    /// PRD #1790: write each live attempt's held-back session id
+    /// ([`Self::note_session`]), at most one line per attempt, through the
+    /// journal's session quota; an id the quota refuses again stays held for
+    /// the next round. Answers how many it queued. The daemon runs it every
+    /// [`SESSION_FLUSH_EVERY`] ([`spawn_session_flush`]); it takes only the
+    /// book's leaf mutex and queues, so it may run on the async runtime.
+    ///
+    /// What this makes durable, and what it does not: an attempt's latest
+    /// admitted id reaches the writer's queue at the first round after it
+    /// was reported that finds room in the quota, without waiting for the
+    /// attempt to end or for another hook, and the writer writes and syncs
+    /// it from there. A daemon that dies before that round, or before the
+    /// writer took the line, loses that id, and the journal keeps the one
+    /// before it. An orderly shutdown writes it at [`Self::drain`].
+    pub fn flush_held_sessions(&self) -> usize {
+        let Some(journal) = self.journal() else {
+            return 0;
+        };
+        let mut guard = self.book();
+        let book = &mut *guard;
+        let mut queued = 0;
+        for (agent_id, entry) in &mut book.sessions {
+            let Some((session, agent)) = entry.held.take() else {
+                continue;
+            };
+            let (Some(work), Some(attempt)) = (
+                book.attempts.get(agent_id),
+                agent_id
+                    .parse::<u64>()
+                    .ok()
+                    .and_then(|agent| journal.attempt_id(agent)),
+            ) else {
+                entry.held = Some((session, agent));
+                continue;
+            };
+            let event = Event::AttemptSession {
+                work: work.clone(),
+                attempt,
+                session: session.clone(),
+                agent: agent.clone(),
+            };
+            if journal.record_session(event) {
+                entry.last = Some(session);
+                queued += 1;
+            } else {
+                entry.held = Some((session, agent));
+            }
+        }
+        queued
+    }
+
+    /// Retire live attempt `agent_id`'s session book, handing the id it held
+    /// back, if any, to the journal so the attempt's last `attempt_session`
+    /// line is its latest id. Outside the session quota (one line per
+    /// attempt), and best effort as [`WorkJournal::record`] is: a full queue
+    /// drops it.
+    fn flush_held_session(
+        journal: &WorkJournal,
+        book: &mut Book,
+        agent_id: &str,
+        work: &WorkId,
+        attempt: &crate::work_journal::AttemptId,
+    ) {
+        if let Some(SessionBook {
+            held: Some((session, agent)),
+            ..
+        }) = book.sessions.remove(agent_id)
+        {
+            journal.record(Event::AttemptSession {
+                work: work.clone(),
+                attempt: attempt.clone(),
+                session,
+                agent,
+            });
+        }
+    }
+
+    /// PRD #1790: generation `agent_id`'s hooks report it is in agent session
+    /// `session`. For a live attempt, writes `attempt_session` the first time
+    /// the attempt's id is seen and each time it changes, never for an
+    /// unchanged one, at most [`MAX_SESSION_LINES`] times at once, holding the
+    /// latest past that (or one the session quota refused) for
+    /// [`Self::flush_held_sessions`] and the attempt's end. For a generation
+    /// whose spawn is `reserved` (forked, not yet published) the id is held,
+    /// in order, and
+    /// written right after the attempt's `attempt_started`. Nothing for an
+    /// attempt this run is not serving otherwise (one already ended), for an
+    /// id the redaction rule refuses, or for an id that names no resumable
+    /// session ([`is_resumable_session`]). Takes only the book's leaf mutex
+    /// and queues the event, so it may be called under the state's lock that
+    /// applied the hook, and under the registry's (which is how `reserved`
+    /// is decided: [`crate::agent_pty::AgentPtyRegistry::session_seen`]).
+    pub fn session_seen(
+        &self,
+        agent_id: &str,
+        pane: Option<&str>,
+        session: &str,
+        agent: &AgentType,
+        reserved: bool,
+    ) {
+        let Some(journal) = self.journal() else {
+            return;
+        };
+        if !is_resumable_session(agent, pane, session) {
+            return;
+        }
+        let Some(attempt) = agent_id
+            .parse::<u64>()
+            .ok()
+            .and_then(|agent| journal.attempt_id(agent))
+        else {
+            return;
+        };
+        let Some(plain) = journal.plain(session) else {
+            return;
+        };
+        let mut guard = self.book();
+        let book = &mut *guard;
+        if let Some(work) = book.attempts.get(agent_id).cloned() {
+            Self::note_session(
+                journal,
+                book,
+                agent_id,
+                &work,
+                &attempt,
+                plain,
+                agent.clone(),
+            );
+            return;
+        }
+        if !reserved {
+            return;
+        }
+        let held = book.early_sessions.entry(agent_id.to_string()).or_default();
+        if held.back().is_some_and(|(last, _)| *last == plain) {
+            return;
+        }
+        held.push_back((plain, agent.clone()));
+        while held.len() > MAX_SESSION_LINES {
+            held.pop_front();
+        }
+    }
+
+    /// PRD #1790: write how generation `agent_id`, serving `work`, was
+    /// launched to the launch-record store under the journal's state
+    /// directory ([`crate::launch_records`]). File I/O: call it with no lock
+    /// held. Nothing is written with no journal installed, or a disabled one
+    /// (whose retention could never remove the record); a failure is logged.
+    pub fn launch_recorded(&self, work: &WorkId, agent_id: &str, launch: LaunchDetails<'_>) {
+        let Some(journal) = self.journal().filter(|j| j.is_enabled()) else {
+            return;
+        };
+        let (Some(state_dir), Some(attempt)) = (
+            journal.state_dir(),
+            agent_id
+                .parse::<u64>()
+                .ok()
+                .and_then(|agent| journal.attempt_id(agent)),
+        ) else {
+            return;
+        };
+        let (role, orchestration, orchestration_id) = match launch.membership {
+            Some(TabMembership::Orchestration {
+                name,
+                role_name,
+                orchestration_id,
+                ..
+            }) => (
+                (!role_name.is_empty()).then(|| role_name.clone()),
+                Some(name.clone()),
+                orchestration_id.clone(),
+            ),
+            _ => (None, None, None),
+        };
+        let cwd = launch.cwd.map(|cwd| {
+            std::path::absolute(cwd)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| cwd.to_string())
+        });
+        let record = crate::launch_records::LaunchRecord {
+            v: crate::launch_records::SCHEMA_VERSION,
+            work: work.clone(),
+            attempt,
+            command: launch.command.map(str::to_string),
+            shell: launch.shell.map(str::to_string),
+            agent_type: launch.agent_type.cloned(),
+            cwd,
+            cwd_moved_from: launch.cwd_moved_from.map(str::to_string),
+            name: launch.name.map(str::to_string),
+            role,
+            orchestration,
+            orchestration_id,
+            ts_ms: crate::launch_records::now_ms(),
+        };
+        if let Err(error) = crate::launch_records::write(state_dir, &record) {
+            tracing::warn!(
+                %error,
+                agent_id,
+                "launch records: could not record how an agent was launched"
+            );
         }
     }
 
@@ -658,15 +1068,20 @@ impl WorkTracker {
         else {
             return;
         };
-        let mut book = self.book();
+        let mut guard = self.book();
+        let book = &mut *guard;
         // A task bound to this generation can no longer be worked by it.
         book.retire_tasks(|_, task| task.worker_agent == agent_id);
         let Some(work) = book.attempts.remove(agent_id) else {
+            book.sessions.remove(agent_id);
             if book.early_ends.len() < MAX_EARLY_ENDS {
                 book.early_ends.insert(agent_id.to_string(), end);
             }
             return;
         };
+        // PRD #1790: the latest session id, when it was held back, before
+        // the end.
+        Self::flush_held_session(journal, book, agent_id, &work, &attempt);
         journal.record(Event::AttemptEnded {
             work,
             attempt,
@@ -1182,7 +1597,15 @@ pub fn spawn_compaction(journal: WorkJournal) -> tokio::task::JoinHandle<()> {
             every.tick().await;
             loop {
                 let round = journal.clone();
-                let Ok(report) = tokio::task::spawn_blocking(move || round.compact()).await else {
+                let Ok(report) = tokio::task::spawn_blocking(move || {
+                    let report = round.compact();
+                    if !report.skipped_recovery_pending {
+                        prune_launch_records(&round);
+                    }
+                    report
+                })
+                .await
+                else {
                     break;
                 };
                 if !report.skipped_recovery_pending {
@@ -1200,6 +1623,76 @@ pub fn spawn_compaction(journal: WorkJournal) -> tokio::task::JoinHandle<()> {
             }
         }
     })
+}
+
+/// PRD #1790: run `flush` every [`SESSION_FLUSH_EVERY`] until it answers
+/// `false` (the daemon passes one that runs
+/// [`WorkTracker::flush_held_sessions`] on its registry's tracker, and
+/// answers `false` once the registry is gone).
+pub fn spawn_session_flush(
+    flush: impl Fn() -> bool + Send + 'static,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut every = tokio::time::interval(SESSION_FLUSH_EVERY);
+        every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first tick is immediate; there is nothing held yet.
+        every.tick().await;
+        loop {
+            every.tick().await;
+            if !flush() {
+                return;
+            }
+        }
+    })
+}
+
+/// Where the daemon's next launch-record prune lists from
+/// ([`crate::launch_records::PruneWindow`]); one daemon, one store.
+static LAUNCH_PRUNE_WINDOW: crate::launch_records::PruneWindow =
+    crate::launch_records::PruneWindow::new();
+
+/// PRD #1790: remove the launch records whose work `journal` no longer holds
+/// ([`crate::launch_records::prune`]), after a compaction round. Blocking;
+/// never fails: an error is logged.
+pub fn prune_launch_records(journal: &WorkJournal) {
+    let Some(state_dir) = journal.state_dir().filter(|_| journal.is_enabled()) else {
+        return;
+    };
+    let read = match journal.read() {
+        Ok(read) => read,
+        Err(error) => {
+            tracing::warn!(%error, "launch records: the journal could not be read to prune them");
+            return;
+        }
+    };
+    let works: std::collections::HashSet<WorkId> =
+        read.lines.iter().map(|l| l.event.work().clone()).collect();
+    match crate::launch_records::prune(
+        state_dir,
+        &works,
+        // A line of a newer schema, or of a kind this build does not know,
+        // may hold a work this build cannot see, so such a read cannot show
+        // a work is gone either.
+        launch_read_incomplete(&read.stats),
+        crate::launch_records::now_ms(),
+        |run| journal.run_is_live(run),
+        &LAUNCH_PRUNE_WINDOW,
+    ) {
+        Ok(report) if report.removed > 0 || report.pending_removed > 0 => {
+            tracing::info!(?report, "launch records: pruned");
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "launch records: could not prune"),
+    }
+}
+
+/// PRD #1790: a journal read whose absence of a work the launch-record prune
+/// does not act on. Exactly three conditions: the read was truncated, or it
+/// skipped a line of a newer schema, or a line of a kind this build does not
+/// know; any of them may hold the work. A line skipped as unparsable, too
+/// long or torn is not one of them.
+pub(crate) fn launch_read_incomplete(stats: &crate::work_journal::ReadStats) -> bool {
+    stats.truncated || stats.newer_version > 0 || stats.unknown_kind > 0
 }
 
 /// What a committed report was about.

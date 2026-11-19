@@ -765,8 +765,8 @@ where
 /// itself ([`prepare_orchestration_before`]), and an expired preparation is
 /// **withdrawn** rather than merely answered late: a token it issued is
 /// revoked, a context file it published is removed best effort
-/// ([`crate::orchestrator_context::withdraw_published_context`]), and it does
-/// not write the compatibility mirror. That is the property a client-side
+/// ([`crate::orchestrator_context::withdraw_published_context`]). That is the
+/// property a client-side
 /// timeout alone could not give, because dropping the client's future stops
 /// none of the daemon's work.
 ///
@@ -788,7 +788,7 @@ pub const PREPARE_DEADLINE: std::time::Duration = std::time::Duration::from_secs
 /// (issue #1233 audit).
 ///
 /// The work calls [`ReplyLatch::commit`] at its last gate, after every side
-/// effect but the post-reply mirror; the reply calls [`ReplyLatch::abandon`]
+/// effect; the reply calls [`ReplyLatch::abandon`]
 /// when its deadline fires first. Whichever gets there first wins, and the
 /// other learns it: a work that cannot commit revokes its token and withdraws
 /// its file (not the directory creation or housekeeping its publish did), and
@@ -831,10 +831,6 @@ impl ReplyLatch {
     }
 }
 
-/// Work to run after the answer has been handed over, on the same blocking
-/// thread and under the same permit — issue #1233's compatibility mirror.
-pub type AfterReply = Box<dyn FnOnce() + Send>;
-
 /// Why [`run_bounded_answer`] gave up at its deadline without an answer. Both
 /// causes reach a client as the same `preparation-expired` refusal; they are
 /// told apart for the daemon's log, where they point at different remedies
@@ -856,10 +852,6 @@ pub enum Expired {
 ///   permit freed up (`f` never ran), or `f` had not committed and the
 ///   [`ReplyLatch`] was abandoned — so an `f` that checks the latch, as the
 ///   preparation does at its last gate, refuses and withdraws.
-/// * `f` returns its answer and, optionally, work to run **after** the answer
-///   has gone: that work cannot delay the reply. This function runs it
-///   whenever `f` returns it; the preparation returns it only for an answer it
-///   committed.
 ///
 /// A blocking thread cannot be cancelled, so a stalled `f` keeps its thread and
 /// permit until it returns; what it cannot do is hold the reply.
@@ -868,7 +860,7 @@ pub async fn run_bounded_answer<T, F>(
     f: F,
 ) -> Result<Result<T, Expired>, ProjectResolveError>
 where
-    F: FnOnce(&ReplyLatch) -> (T, Option<AfterReply>) + Send + 'static,
+    F: FnOnce(&ReplyLatch) -> T + Send + 'static,
     T: Send + 'static,
 {
     run_bounded_answer_in(project_fs_limit(), deadline, f).await
@@ -882,7 +874,7 @@ async fn run_bounded_answer_in<T, F>(
     f: F,
 ) -> Result<Result<T, Expired>, ProjectResolveError>
 where
-    F: FnOnce(&ReplyLatch) -> (T, Option<AfterReply>) + Send + 'static,
+    F: FnOnce(&ReplyLatch) -> T + Send + 'static,
     T: Send + 'static,
 {
     let permit = match tokio::time::timeout_at(deadline, limit.clone().acquire_owned()).await {
@@ -892,8 +884,7 @@ where
     let latch = Arc::new(ReplyLatch::default());
     let work_latch = Arc::clone(&latch);
     let (tx, mut rx) = tokio::sync::oneshot::channel();
-    // Detached: the answer arrives over `rx`, and what runs after it is not
-    // this reply's business.
+    // Detached: the answer arrives over `rx`.
     //
     // A panic inside `f` after it committed — between the preparation's last
     // gate and `tx.send` — delivers no answer (the reply reads `Internal`) yet
@@ -903,11 +894,7 @@ where
     // answer stands in that window.
     drop(tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let (answer, after) = f(&work_latch);
-        let _ = tx.send(answer);
-        if let Some(after) = after {
-            after();
-        }
+        let _ = tx.send(f(&work_latch));
     }));
     match tokio::time::timeout_at(deadline, &mut rx).await {
         Ok(answer) => answer.map(Ok).map_err(|_| ProjectResolveError::Internal),
@@ -1187,10 +1174,9 @@ pub fn resolve_for_wire(path: &str, seeds: &[ProjectCandidate]) -> Result<Resolv
 /// no roles" true rather than aspirational: every step that can refuse the
 /// request on its own merits runs before anything observable is created, and
 /// this function starts nothing. Roles are started by a later `StartAgent`
-/// sequence that never runs if this returns `Err`. Since issue #1233 two things
-/// follow the publish: the compatibility mirror write, and — under
-/// [`prepare_orchestration_before`]'s deadline — a refusal that withdraws the
-/// publish best effort. (The token minted after the publish is an in-memory
+/// sequence that never runs if this returns `Err`. Since issue #1233 one thing
+/// can follow the publish: under [`prepare_orchestration_before`]'s deadline,
+/// a refusal that withdraws the publish best effort. (The token minted after the publish is an in-memory
 /// record; a preparation refused after minting it revokes it, so no live token
 /// outlasts a refused preparation. One that committed and then lost its answer
 /// to a panic before it was sent is not refused, and is bounded by the token
@@ -1211,9 +1197,8 @@ pub fn resolve_for_wire(path: &str, seeds: &[ProjectCandidate]) -> Result<Resolv
 /// (`orchestrator-context-<32 hex>.md`), and the prompt it returns names that
 /// file, so two preparations in one project each keep their own context and both
 /// tokens stay valid — including after the first launch's last role has started,
-/// the window the binding alone could not cover. The fixed
-/// `orchestrator-context.md` is refreshed afterwards as a compatibility mirror
-/// and is bound by nothing.
+/// the window the binding alone could not cover. Issue #1395 retired the fixed
+/// `orchestrator-context.md` copy that was refreshed beside it.
 ///
 /// **One canonical string, carried end to end.** `path` is canonicalised once,
 /// here, and the same `PathBuf` is what the config is read from, what the
@@ -1229,9 +1214,8 @@ pub fn resolve_for_wire(path: &str, seeds: &[ProjectCandidate]) -> Result<Resolv
 /// detail is logged daemon-locally on every failure, whichever refusal goes
 /// back.
 ///
-/// Under no deadline, and with the compatibility mirror written before this
-/// returns; the daemon's verb calls [`prepare_orchestration_before`] with
-/// [`PREPARE_DEADLINE`] and writes the mirror after its reply.
+/// Under no deadline; the daemon's verb calls [`prepare_orchestration_before`]
+/// with [`PREPARE_DEADLINE`].
 pub fn prepare_orchestration_for_wire(
     path: &str,
     orchestration: &str,
@@ -1239,7 +1223,7 @@ pub fn prepare_orchestration_for_wire(
     expected_revision: Option<&str>,
     seeds: &[ProjectCandidate],
 ) -> Result<crate::event::PreparedOrchestration, String> {
-    let prepared = prepare_orchestration_before(
+    prepare_orchestration_before(
         path,
         orchestration,
         task,
@@ -1248,35 +1232,7 @@ pub fn prepare_orchestration_for_wire(
         None,
         &std::time::Instant::now,
         None,
-    )?;
-    let (answer, mirror) = prepared.into_parts();
-    mirror.write();
-    Ok(answer)
-}
-
-/// A preparation that passed every gate: the answer, and the compatibility
-/// mirror write still owed for it (issue #1233 audit).
-///
-/// The mirror is handed back rather than written so the caller can answer
-/// first — see [`crate::orchestrator_context::PendingMirror`]. Only a
-/// preparation that passed its last gate — committed to an answer — produces
-/// one.
-#[derive(Debug)]
-pub struct Prepared {
-    answer: crate::event::PreparedOrchestration,
-    mirror: crate::orchestrator_context::PendingMirror,
-}
-
-impl Prepared {
-    /// The answer, and the mirror to write once it has gone.
-    pub fn into_parts(
-        self,
-    ) -> (
-        crate::event::PreparedOrchestration,
-        crate::orchestrator_context::PendingMirror,
-    ) {
-        (self.answer, self.mirror)
-    }
+    )
 }
 
 /// [`prepare_orchestration_for_wire`] under a `deadline`, read through `now`,
@@ -1290,10 +1246,8 @@ impl Prepared {
 /// effort ([`crate::orchestrator_context::withdraw_published_context`]), and no
 /// token is issued. Expired at the last gate, or with a `latch` the reply already
 /// abandoned, the token is revoked ([`crate::prep_token::revoke`]) and the file
-/// withdrawn. Every one of those answers [`preparation_expired_refusal`], and
-/// none of them writes the compatibility mirror: it is returned un-written in
-/// [`Prepared`], only for a preparation that passed the last gate, so the
-/// caller writes it after answering. `now` is a parameter so a test can expire
+/// withdrawn. Every one of those answers [`preparation_expired_refusal`]. `now`
+/// is a parameter so a test can expire
 /// the deadline at exactly one of those points.
 ///
 /// **Blocking**, like [`prepare_orchestration_for_wire`].
@@ -1307,7 +1261,7 @@ pub fn prepare_orchestration_before(
     deadline: Option<std::time::Instant>,
     now: &dyn Fn() -> std::time::Instant,
     latch: Option<&ReplyLatch>,
-) -> Result<Prepared, String> {
+) -> Result<crate::event::PreparedOrchestration, String> {
     let expired = || deadline.is_some_and(|deadline| now() >= deadline);
     if expired() {
         warn!("prepare-orchestration refused: its deadline passed before any work began");
@@ -1439,9 +1393,7 @@ pub fn prepare_orchestration_before(
     // `AttachRequest::PrepareOrchestration` — a wire change, with CLAUDE.md rule 12's
     // cross-version test attached to it. It is deliberately not pre-built.
     //
-    // Unmirrored (issue #1233): the compatibility mirror is refreshed only once
-    // this preparation is certain to be answered, below.
-    let prepared = crate::orchestrator_context::prepare_unmirrored_orchestrator_context(
+    let prepared = crate::orchestrator_context::prepare_orchestrator_context(
         orch,
         &dir,
         Some(task),
@@ -1514,15 +1466,7 @@ pub fn prepare_orchestration_before(
         return Err(preparation_expired_refusal());
     }
 
-    // Not written here: the caller answers first and writes it afterwards
-    // (issue #1233 audit). See `CONTEXT_FILE_NAME` for who reads it.
-    let mirror = crate::orchestrator_context::PendingMirror::new(
-        prepared.dir.clone(),
-        prepared.publish_seq,
-        prepared.content,
-    );
-
-    let answer = crate::event::PreparedOrchestration {
+    Ok(crate::event::PreparedOrchestration {
         context_path: prepared.context_path.to_string_lossy().into_owned(),
         // The canonical directory this preparation actually resolved to, so the
         // spawn does not have to trust the caller's spelling — see
@@ -1535,8 +1479,7 @@ pub fn prepare_orchestration_before(
         // party that delivers it, and it may not compose its own copy — see
         // `PreparedOrchestration::prompt`.
         prompt: prepared.prompt,
-    };
-    Ok(Prepared { answer, mirror })
+    })
 }
 
 /// Why [`find_orchestration`] found no single orchestration.
@@ -2470,7 +2413,7 @@ command = "cat"
     const MALFORMED: &str = "bogus = \u{1b}[31mPWNED\u{1b}[0m\n";
 
     /// Every `orchestrator-context*` entry in `dir`'s `.dot-agent-deck` — the
-    /// per-publish files and the compatibility mirror alike (issue #1233).
+    /// per-publish files and the retired fixed-path name alike (issue #1233).
     fn published_contexts(dir: &Path) -> Vec<PathBuf> {
         std::fs::read_dir(dir.join(crate::orchestrator_context::CONTEXT_DIR_NAME))
             .map(|entries| {
@@ -3257,13 +3200,6 @@ command = "cat"
         );
     }
 
-    /// Where the compatibility mirror of `project` lives.
-    fn mirror_of(project: &Path) -> PathBuf {
-        project
-            .join(crate::orchestrator_context::CONTEXT_DIR_NAME)
-            .join(crate::orchestrator_context::CONTEXT_FILE_NAME)
-    }
-
     /// Whether the daemon-wide token store still holds a live token for
     /// `project` (canonicalised, as the binding records it).
     fn token_live_for(project: &Path) -> bool {
@@ -3323,8 +3259,7 @@ command = "cat"
     }
 
     /// Issue #1233 item 4: a deadline that passes DURING the publish withdraws
-    /// it — the per-publish file is removed, no token is issued, and the
-    /// compatibility mirror is never written.
+    /// it — the per-publish file is removed and no token is issued.
     ///
     /// The clock answers "before the deadline" for the entry and pre-publish
     /// checks and "after it" from the third reading on, which is the check
@@ -3361,15 +3296,15 @@ command = "cat"
         );
         assert!(
             published_contexts(&project).is_empty(),
-            "the withdrawn file is gone and the mirror was never written: {:?}",
+            "the withdrawn file is gone: {:?}",
             published_contexts(&project)
         );
         assert!(!token_live_for(&project));
 
         // And a clock that never passes the deadline prepares as usual, which is
-        // what makes the refusal above about the deadline. The mirror is handed
-        // back un-written, for the caller to write after answering.
-        let prepared = prepare_orchestration_before(
+        // what makes the refusal above about the deadline. Issue #1395: it
+        // publishes its own file and nothing at the retired fixed path.
+        let answer = prepare_orchestration_before(
             project.to_str().expect("utf-8 scratch path"),
             "loop",
             "a task",
@@ -3380,22 +3315,16 @@ command = "cat"
             None,
         )
         .expect("a preparation inside its deadline succeeds");
-        let (answer, mirror) = prepared.into_parts();
-        assert!(Path::new(&answer.context_path).is_file());
-        assert!(
-            !mirror_of(&project).exists(),
-            "the preparation itself does not write the mirror"
-        );
-        mirror.write();
-        assert!(
-            mirror_of(&project).is_file(),
-            "the caller writes it once the preparation is answered"
+        assert_eq!(
+            published_contexts(&project),
+            vec![PathBuf::from(&answer.context_path)],
+            "exactly the preparation's own file, and no fixed-path copy"
         );
     }
 
     /// Issue #1233 audit: a deadline that passes DURING the token issue — the
     /// last side effect — is caught by the gate after it: the token is revoked,
-    /// the per-publish file withdrawn, and no mirror is handed back to write.
+    /// and the per-publish file withdrawn.
     #[test]
     fn a_deadline_passing_during_the_token_issue_revokes_and_withdraws() {
         let (_guard, root) = scratch();
@@ -3428,7 +3357,7 @@ command = "cat"
         );
         assert!(
             published_contexts(&project).is_empty(),
-            "the file is withdrawn and no mirror written: {:?}",
+            "the file is withdrawn: {:?}",
             published_contexts(&project)
         );
     }
@@ -3502,7 +3431,6 @@ command = "cat"
             tokio::time::Instant::now() + Duration::from_millis(50),
             move |_| {
                 ran_inner.store(true, std::sync::atomic::Ordering::SeqCst);
-                ((), None)
             },
         )
         .await
@@ -3521,7 +3449,7 @@ command = "cat"
         let outcome = run_bounded_answer_in(
             &limit,
             tokio::time::Instant::now() + Duration::from_secs(10),
-            |latch| (latch.commit().then_some(42), None),
+            |latch| latch.commit().then_some(42),
         )
         .await
         .expect("no internal error");
@@ -3543,7 +3471,7 @@ command = "cat"
                 let _ = release_rx.recv_timeout(Duration::from_secs(30));
                 let committed = latch.commit();
                 let _ = committed_tx.send(committed);
-                (committed, None)
+                committed
             })
             .await
             .expect("no internal error");
@@ -3570,50 +3498,6 @@ command = "cat"
             !committed,
             "a work that finishes after an expired answer cannot commit"
         );
-    }
-
-    /// Issue #1233 audit: the post-reply work — the compatibility mirror — runs
-    /// only after the answer has been handed over, so a mirror write that
-    /// stalls past the deadline neither delays nor changes the answer.
-    #[tokio::test]
-    async fn run_bounded_answer_answers_before_a_stalled_after_reply() {
-        let limit = own_project_permits();
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        let (ran_tx, ran_rx) = std::sync::mpsc::channel::<()>();
-        let started = tokio::time::Instant::now();
-        // The deadline is generous on purpose. It plays no part in the property:
-        // an answer that waited for the after-reply work would wait out its 30 s
-        // stall whatever the deadline, and the elapsed check below catches that.
-        // At 100 ms it only measured how fast a loaded box starts a blocking
-        // thread, and answered `Abandoned` when it did not start in time.
-        let outcome =
-            run_bounded_answer_in(&limit, started + Duration::from_secs(10), move |latch| {
-                let after: AfterReply = Box::new(move || {
-                    let _ = release_rx.recv_timeout(Duration::from_secs(30));
-                    let _ = ran_tx.send(());
-                });
-                (latch.commit(), Some(after))
-            })
-            .await
-            .expect("no internal error");
-        assert_eq!(outcome, Ok(true), "the committed answer is delivered");
-        assert!(
-            started.elapsed() < Duration::from_secs(20),
-            "the answer did not wait for the after-reply work ({:?})",
-            started.elapsed()
-        );
-        assert!(
-            ran_rx.try_recv().is_err(),
-            "the after-reply work had not run when the answer arrived"
-        );
-        release_tx.send(()).expect("release the after-reply work");
-        tokio::task::spawn_blocking(move || {
-            ran_rx
-                .recv_timeout(Duration::from_secs(30))
-                .expect("the after-reply work ran after the answer")
-        })
-        .await
-        .expect("join");
     }
 
     /// Issue #1233: the lookup counts role-bearing matches only, and refuses

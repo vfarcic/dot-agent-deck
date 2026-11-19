@@ -231,6 +231,12 @@ fn codec_round_trips_every_kind() {
             ),
         },
         started(work(1), run, 9),
+        Event::AttemptSession {
+            work: work(1),
+            attempt: attempt(run, 9),
+            session: "0f6c2a4e-6b1d-4f7a-9c2e-1a2b3c4d5e6f".into(),
+            agent: crate::event::AgentType::ClaudeCode,
+        },
         ended(work(1), run, 9),
         Event::AttemptEnded {
             work: work(1),
@@ -524,6 +530,161 @@ fn redaction_refuses_a_path_outside_workspace() {
         },
     );
     assert!(encode_line_with_home(&l, &home()).is_ok());
+}
+
+/// PRD #1790: an `attempt_session` line is accepted with a plain session id
+/// and refused, like every other string field outside `workspace`, when the
+/// id looks like a path; the rule elsewhere is unchanged by the new kind.
+#[test]
+fn an_attempt_session_is_accepted_but_a_path_like_session_is_refused() {
+    let session = |id: &str| {
+        line(
+            "r1",
+            1,
+            1,
+            Event::AttemptSession {
+                work: work(1),
+                attempt: attempt("r1", 3),
+                session: id.into(),
+                agent: crate::event::AgentType::Codex,
+            },
+        )
+    };
+    let ok = encode_line_with_home(&session("ses_01JABCDEF"), &home()).unwrap();
+    assert!(
+        String::from_utf8(ok)
+            .unwrap()
+            .contains(r#""kind":"attempt_session""#)
+    );
+    for bad in ["/home/someone/x", "~/x", "x/home/someone/y"] {
+        assert_eq!(
+            encode_line_with_home(&session(bad), &home()),
+            Err(Refusal::PathOutsideWorkspace { field: "session" }),
+            "{bad:?}"
+        );
+    }
+    assert_eq!(
+        encode_line_with_home(&session("a\u{7}b"), &home()),
+        Err(Refusal::ControlCharacter { field: "session" })
+    );
+    // The other fields still refuse a path.
+    assert_eq!(
+        encode_line_with_home(&started_with_role("/etc"), &home()),
+        Err(Refusal::PathOutsideWorkspace { field: "role" })
+    );
+}
+
+/// PRD #1790: the shared reader understands `attempt_session` (not skipped as
+/// an unknown kind), and an agent type this build does not know reads as
+/// `none` rather than losing the line.
+#[test]
+fn the_reader_returns_attempt_sessions_in_order() {
+    let state = state();
+    let session = |seq: u64, id: &str| {
+        encoded(&line(
+            "r1",
+            seq,
+            seq,
+            Event::AttemptSession {
+                work: work(1),
+                attempt: attempt("r1", 2),
+                session: id.into(),
+                agent: crate::event::AgentType::ClaudeCode,
+            },
+        ))
+    };
+    let future_agent = format!(
+        r#"{{"v":1,"seq":4,"ts_ms":4,"run":"r1","kind":"attempt_session","work":"{}","attempt":"r1/2","session":"s-3","agent":"some_future_agent"}}"#,
+        work(1)
+    );
+    plant(
+        state.path(),
+        "run-r1.jsonl",
+        &[
+            encoded(&line("r1", 1, 1, started(work(1), "r1", 2))),
+            session(2, "s-1"),
+            session(3, "s-2"),
+            future_agent,
+        ],
+        "",
+    );
+    let read = read_journal(state.path()).unwrap();
+    assert_eq!(read.stats.unknown_kind, 0);
+    assert!(!read.stats.truncated);
+    let sessions: Vec<(String, crate::event::AgentType)> = read
+        .lines
+        .iter()
+        .filter_map(|l| match &l.event {
+            Event::AttemptSession { session, agent, .. } => Some((session.clone(), agent.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        sessions,
+        [
+            ("s-1".to_string(), crate::event::AgentType::ClaudeCode),
+            ("s-2".to_string(), crate::event::AgentType::ClaudeCode),
+            ("s-3".to_string(), crate::event::AgentType::None),
+        ]
+    );
+}
+
+/// PRD #1790 (R4): an attempt's latest session is its `attempt_session` line
+/// with the highest `seq` from its own run, even when the clock stepped
+/// backwards so the reader's wall-clock order puts it first; a line of
+/// another run naming the same attempt does not count.
+#[test]
+fn the_latest_session_follows_seq_not_the_wall_clock() {
+    let state = state();
+    let session = |run: &str, seq: u64, ts: u64, id: &str| {
+        encoded(&line(
+            run,
+            seq,
+            ts,
+            Event::AttemptSession {
+                work: work(1),
+                attempt: attempt("r1", 2),
+                session: id.into(),
+                agent: crate::event::AgentType::ClaudeCode,
+            },
+        ))
+    };
+    plant(
+        state.path(),
+        "run-r1.jsonl",
+        &[
+            encoded(&line("r1", 1, 900, started(work(1), "r1", 2))),
+            session("r1", 2, 1000, "s-old"),
+            // The clock stepped back between the two changes.
+            session("r1", 3, 500, "s-new"),
+        ],
+        "",
+    );
+    plant(
+        state.path(),
+        "run-r2.jsonl",
+        &[session("r2", 99, 2000, "s-foreign")],
+        "",
+    );
+    let read = read_journal(state.path()).unwrap();
+    let in_read_order: Vec<&str> = read
+        .lines
+        .iter()
+        .filter_map(|l| match &l.event {
+            Event::AttemptSession { session, .. } => Some(session.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        in_read_order,
+        ["s-new", "s-old", "s-foreign"],
+        "precondition: the reader orders by wall clock"
+    );
+    assert_eq!(
+        latest_session_of(&read.lines, &attempt("r1", 2)),
+        Some(("s-new", &crate::event::AgentType::ClaudeCode))
+    );
+    assert_eq!(latest_session_of(&read.lines, &attempt("r1", 3)), None);
 }
 
 #[test]

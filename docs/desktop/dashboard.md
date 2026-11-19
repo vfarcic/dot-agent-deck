@@ -4,6 +4,8 @@ The **Agent dashboard** is the desktop app's main screen and the one it opens on
 
 ![The desktop app's dashboard with four agents in one daemon section, each row showing its status, name and uptime](/img/dashboard-desktop.png)
 
+The Dashboard can also show each agent as a card that says what it reported, whether it needs you and what you can do about it: see [Agent Cards](agent-cards.md).
+
 ## Check what is running
 
 1. Choose what to watch with the **Daemon** selector under the title: **All daemons**, **This machine** (the default on a fresh install), or one remote daemon. To add a daemon on another machine, choose **Add a daemon…** at the bottom of the selector ([Daemons](daemons.md#watch-a-daemon-on-another-machine)).

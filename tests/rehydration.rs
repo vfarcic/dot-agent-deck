@@ -3607,6 +3607,67 @@ fn hydration_diagnostics_enabled(value: Option<&std::ffi::OsStr>) -> bool {
     value == Some(std::ffi::OsStr::new("1"))
 }
 
+/// A `MakeWriter` over a shared buffer, so a failing hydration can print what
+/// the controller logged while it ran (issue #1786).
+#[derive(Clone)]
+struct HydrationLogWriter(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for HydrationLogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for HydrationLogWriter {
+    type Writer = HydrationLogWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// The subscriber a hydration runs under: the controller's and the client's
+/// debug lines, which name the step that absorbed an error, into `buffer`.
+fn hydration_log_subscriber(buffer: Arc<Mutex<Vec<u8>>>) -> impl tracing::Subscriber + Send {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            "dot_agent_deck::embedded_pane=debug,dot_agent_deck::daemon_client=debug",
+        ))
+        .with_writer(HydrationLogWriter(buffer))
+        .with_ansi(false)
+        .without_time()
+        .finish()
+}
+
+/// Scenario: Run a hydration against an attach socket nothing listens on, under the subscriber the wrapped-pane reconnect test uses. The hydration comes back empty, and the recorded log names the `ListAgents` step that absorbed the error.
+#[spec("session/live/017")]
+#[test]
+fn live_017_diagnostic_hydration_log_names_the_absorbed_step() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("build hydration-log control runtime");
+    let dir = test_temp::tempdir().expect("allocate hydration-log control tempdir");
+    let controller =
+        EmbeddedPaneController::new(dir.path().join("absent.sock"), rt.handle().clone());
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let hydrated = tracing::subscriber::with_default(hydration_log_subscriber(log.clone()), || {
+        controller.hydrate_from_daemon()
+    });
+    assert!(hydrated.is_empty(), "nothing listens, so nothing hydrates");
+    let log = String::from_utf8_lossy(&log.lock().unwrap()).into_owned();
+    assert!(
+        log.contains("hydrate_from_daemon: list_agents failed"),
+        "the recorded log must name the step that absorbed the error: {log:?}"
+    );
+}
+
 fn hydration_registry_snapshot(registry: &AgentPtyRegistry) -> String {
     format!(
         "registry (record, observed_exited, termination_unconfirmed)={:?}",
@@ -3768,7 +3829,6 @@ impl HydrationTrace {
 /// Scenario: A wrapped Codex pane runs under a real daemon, where Codex announced its conversation and the wrapper (reporting under `<pane>-session`) has spoken since; a fresh TUI hydrates through `ListAgents` after its event stream already delivered a wrapper frame. The reconnected TUI must hold the conversation the daemon's send guard holds, and must keep a genuine `SessionStart` it received after the daemon built its reply rather than roll back to the reply. Control: an older daemon's reply carries no generation, so the TUI keeps the id it built from events.
 #[spec("session/live/017")]
 #[test]
-#[ignore = "quarantined: vfarcic, #1786"]
 fn live_017_reconnect_adopts_the_daemons_pane_generation() {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -3844,20 +3904,36 @@ async fn live_017_reconnect_adopts_the_daemons_pane_generation_inner() {
             .map_or_else(|| daemon.attach_path.clone(), |trace| trace.path.clone()),
         tokio::runtime::Handle::current(),
     ));
+    // Issue #1786: hydration absorbs a failed `ListAgents` or `AttachStream`
+    // into an empty result and says why only in a debug line, so record those
+    // lines on the hydrating thread alone. Unlike the opt-in observer above,
+    // this changes nothing on the wire or in the daemon's scheduling.
+    let hydration_log = Arc::new(Mutex::new(Vec::new()));
     let hydrated = {
         let controller = controller.clone();
-        tokio::task::spawn_blocking(move || controller.hydrate_from_daemon())
-            .await
-            .expect("fresh TUI hydration task did not panic")
+        let subscriber = hydration_log_subscriber(hydration_log.clone());
+        tokio::task::spawn_blocking(move || {
+            tracing::subscriber::with_default(subscriber, || controller.hydrate_from_daemon())
+        })
+        .await
+        .expect("fresh TUI hydration task did not panic")
     };
     let pane = hydrated
         .iter()
         .find(|pane| pane.agent_id == agent_id)
         .unwrap_or_else(|| {
             panic!(
-                "the wrapped pane was not hydrated; hydrated={hydrated:?}; after hydration {}; wire trace={:?}",
+                "the wrapped pane was not hydrated; hydrated={hydrated:?}; hydration log={:?}; \
+                 after hydration {}; the agent's terminal output={:?}; wire trace={:?}",
+                String::from_utf8_lossy(&hydration_log.lock().unwrap()),
                 hydration_registry_snapshot(&daemon.registry),
-                trace.as_ref().map(|trace| trace.entries.lock().unwrap().clone())
+                daemon
+                    .registry
+                    .snapshot(&agent_id)
+                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
+                trace
+                    .as_ref()
+                    .map(|trace| trace.entries.lock().unwrap().clone())
             )
         })
         .clone();
