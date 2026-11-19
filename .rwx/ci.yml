@@ -230,6 +230,11 @@ tasks:
     if: ${{ tasks.backend.values.rust == 'true' }}
     use: [system-packages, code, rust, nextest, go-task, node]
     tool-cache: ci-test-v2
+    # RWX's default task timeout is 10 minutes, and this task ran 9:00 to 9:40
+    # on 2026-11-19 (a 2:51 to 3:27 compile, then about six minutes of tests);
+    # a 4:03 compile on PR #2393 took it over, killed with exit code 137 at
+    # 7115 of 10138 tests with none failed.
+    timeout: 20m
     env:
       DAD_REQUIRE_GO_TASK: "1"
       # Issue #326: see the `backend` task.
