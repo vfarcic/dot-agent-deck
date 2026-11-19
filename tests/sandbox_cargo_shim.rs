@@ -21,6 +21,9 @@
 #[allow(dead_code)]
 mod build_version_resolve;
 
+#[path = "../src/test_temp.rs"]
+mod test_temp;
+
 use build_version_resolve::{
     VersionSource, build_needs_git, normalize_build_id, normalize_version, resolve_build_id,
 };
@@ -70,7 +73,7 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = test_temp::tempdir().expect("tempdir");
         let root = dir.path().canonicalize().unwrap();
         let stubs = root.join("stubs");
         let workspace = root.join("workspace");
