@@ -24,9 +24,14 @@
 #
 # It composes nothing, leaving `build.rs` to do what it always did, when
 # `DAD_BUILD_ID` is already set (an explicit injection, or this shim further
-# up the process tree), when `DAD_VERSION` is not a plain X.Y.Z (`build.rs`
-# would then not take the version from it), or when cargo runs outside the
-# sandbox's checkout ($RWX_WORKSPACE_DIR), whose build id this is not.
+# up the process tree), when `DAD_VERSION` is not a plain X.Y.Z, or when the
+# checkout cargo builds is not the sandbox's ($RWX_WORKSPACE_DIR), whose build
+# id this is. Plain X.Y.Z is narrower than what `build.rs` accepts (it takes a
+# SemVer prerelease or build suffix too): the shim stays out rather than
+# re-implement SemVer, which costs such a version the speed-up and nothing
+# else. The sandbox's DAD_VERSION is always a plain X.Y.Z. The checkout is the
+# one `--manifest-path` names when it is given, and cargo's working directory
+# otherwise.
 # `tests/sandbox_cargo_shim.rs` holds the value to `resolve_build_id`.
 set -u
 
@@ -47,7 +52,26 @@ if [ -z "$real_cargo" ]; then
   exit 127
 fi
 
+# The directory whose checkout cargo builds: that of `--manifest-path` when it
+# is given (before a `--`, after which arguments are the program's), the
+# working directory otherwise.
+checkout_dir=.
+expect_manifest=
+for arg in "$@"; do
+  if [ -n "$expect_manifest" ]; then
+    checkout_dir=$(dirname -- "$arg")
+    expect_manifest=
+    continue
+  fi
+  case "$arg" in
+    --) break ;;
+    --manifest-path) expect_manifest=1 ;;
+    --manifest-path=*) checkout_dir=$(dirname -- "${arg#--manifest-path=}") ;;
+  esac
+done
+
 compose_build_id() {
+  cd "$checkout_dir" 2>/dev/null || return 1
   local injected="${DAD_BUILD_ID:-}"
   [ -z "${injected//[[:space:]]/}" ] || return 1
   local version="${DAD_VERSION:-}"

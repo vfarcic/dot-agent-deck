@@ -37,12 +37,13 @@ fn repo_root() -> PathBuf {
 }
 
 /// A `git` stand-in: records each call's arguments, answers the three
-/// questions the shim asks from `$STUB_*`, and fails a call whose arguments
+/// questions the shim asks from `$STUB_*` (the toplevel is the directory git
+/// was asked from when `$STUB_TOP` is unset), and fails a call whose arguments
 /// it does not know, so a changed command shows up as a missing build id.
 const GIT_STUB: &str = r#"#!/usr/bin/env bash
 printf '%s\n' "$*" >> "$STUB_LOG"
 case "$*" in
-  "rev-parse --show-toplevel") printf '%s\n' "$STUB_TOP" ;;
+  "rev-parse --show-toplevel") printf '%s\n' "${STUB_TOP:-$(pwd -P)}" ;;
   "rev-parse --short HEAD") printf '%s\n' "$STUB_SHA" ;;
   "--no-optional-locks status --porcelain")
     [ -z "${STUB_STATUS_FAIL:-}" ] || exit 128
@@ -95,6 +96,11 @@ impl Fixture {
     /// checkout is the sandbox's, at sha `abc1234`, clean, with `DAD_VERSION`
     /// 0.51.0 and no `DAD_BUILD_ID`.
     fn run(&self, args: &[&str], env: &[(&str, Option<&str>)]) -> Output {
+        self.run_in(&self.workspace, args, env)
+    }
+
+    /// [`Fixture::run`] with cargo started in `cwd` instead of the workspace.
+    fn run_in(&self, cwd: &Path, args: &[&str], env: &[(&str, Option<&str>)]) -> Output {
         let shim = repo_root().join(SHIM);
         let path = format!(
             "{}:{}:{}",
@@ -105,7 +111,7 @@ impl Fixture {
         let mut cmd = Command::new("bash");
         cmd.arg(&shim)
             .args(args)
-            .current_dir(&self.workspace)
+            .current_dir(cwd)
             .env("PATH", path)
             .env("STUB_LOG", &self.log)
             .env("STUB_TOP", &self.workspace)
@@ -202,9 +208,11 @@ fn sandbox_cargo_shim_004_an_injected_build_id_is_left_alone_and_git_is_not_aske
 }
 
 #[test]
-fn sandbox_cargo_shim_005_no_id_unless_build_rs_would_take_the_version_from_dad_version() {
-    // Without a plain X.Y.Z `DAD_VERSION`, build.rs would take the version
-    // from git or the placeholder, so an id composed here would not match.
+fn sandbox_cargo_shim_005_no_id_unless_dad_version_is_a_plain_x_y_z() {
+    // Unset or blank, build.rs takes the version from git or the placeholder,
+    // so an id composed here would not match. A prerelease build.rs would
+    // take, but the shim stays out of anything beyond a plain X.Y.Z rather
+    // than re-implement SemVer: such a build only misses the speed-up.
     for version in [
         None,
         Some(""),
@@ -324,4 +332,50 @@ fn sandbox_cargo_shim_010_the_sandbox_puts_the_shim_on_path() {
         "{SHIM} must be executable to be found on PATH"
     );
     assert!(Path::new(SHIM).file_name() == Some("cargo".as_ref()));
+}
+
+/// The checkout cargo builds is the one `--manifest-path` names, not the
+/// working directory: another checkout's build must not get this one's id,
+/// and this one's still gets it when cargo is started elsewhere.
+#[test]
+fn sandbox_cargo_shim_011_the_checkout_is_the_one_manifest_path_names() {
+    let f = Fixture::new();
+    let other = f.workspace.parent().unwrap().join("other-checkout");
+    fs::create_dir_all(&other).unwrap();
+    let other_manifest = other.join("Cargo.toml");
+    let other_manifest = other_manifest.to_str().unwrap();
+    let own_manifest = f.workspace.join("Cargo.toml");
+    let own_manifest = own_manifest.to_str().unwrap();
+    let toplevel_by_cwd = [("STUB_TOP", None)];
+
+    for args in [
+        vec!["build", "--manifest-path", other_manifest],
+        vec!["build", &format!("--manifest-path={other_manifest}")],
+    ] {
+        let out = f.run(&args, &toplevel_by_cwd);
+        assert_eq!(
+            received_build_id(&out),
+            None,
+            "{args:?} from the sandbox checkout builds another one"
+        );
+    }
+
+    for args in [
+        vec!["build", "--manifest-path", own_manifest],
+        vec!["build", &format!("--manifest-path={own_manifest}")],
+    ] {
+        let out = f.run_in(&other, &args, &toplevel_by_cwd);
+        assert_eq!(
+            received_build_id(&out).as_deref(),
+            Some("0.51.0-gabc1234"),
+            "{args:?} from elsewhere builds the sandbox checkout"
+        );
+    }
+
+    // After `--` the arguments are the program's, not cargo's.
+    let out = f.run(
+        &["run", "--", "--manifest-path", other_manifest],
+        &toplevel_by_cwd,
+    );
+    assert_eq!(received_build_id(&out).as_deref(), Some("0.51.0-gabc1234"));
 }
