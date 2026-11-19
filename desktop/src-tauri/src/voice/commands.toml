@@ -214,7 +214,8 @@ directory, orchestration, daemon or start order — or by what it was asked to d
 user's own words ("dispatcher", "the Claude agent", "the newest agent", "the one fixing the
 scroll"), except for an agent named by what it is doing now (its status or its tool), such as
 "the one that's stuck" or "whichever is waiting": for that one, the `label` of the agent whose
-`status` or `tool` fits, never the user's words."""
+`status` or `tool` fits, never the user's words. A request for an agent's CARD ("show the coder's
+card") is `show_agent_card`, not this one."""
 invoke      = "openAgent"
 screens     = ["deck", "overview"]
 unavailable_hint = "opening an agent works from the Daemons screen or the agent dashboard"
@@ -2327,3 +2328,165 @@ must_name   = ["orchestration", "run", "every role", "all roles", "all the roles
   [[commands.params]]
   name = "orchestration"
   kind = "orchestration_ref"
+
+# PRD #2374 — the agent dashboard's cards.
+#
+# None of them sends anything the user cannot see first: `run_card_action`
+# sends a card's prompt action directly only when its text is the catalog's
+# (the daemon's `prompt_source: "catalog"`); text the agent wrote — the deck's
+# composed answer included, since it quotes the agent's question and label
+# (audit A1) — an action that asks for confirmation, and both closes, only
+# OPEN the card at its review/confirm step, because voice has no confirm step
+# of its own (PRD #802 D5). `reply_to_agent_card` puts the transcript's own
+# words, never the model's, in the card's reply box and sends nothing: the
+# user reads them and presses Send reply, as `dictate_to_agent` types into a
+# prompt and leaves sending to the user (PRD #2374 review).
+[[commands]]
+id          = "set_overview_mode"
+description = """Switch the agent dashboard between its two views: the table (one row per agent)
+and the cards (one card per agent, grouped by dispatcher or orchestration, showing what each
+agent reported and what it needs). Use when the user asks to show cards, the card view, switch to
+cards, show the table, the list view, or back to the table. Set `view` to "table" or "cards".
+Showing the dashboard itself is `open_overview`; filtering its rows is `filter_dashboard`."""
+invoke      = "setOverviewMode"
+screens     = ["overview"]
+unavailable_hint = "the dashboard's view changes on the agent dashboard"
+report      = "Showing {view}."
+asks_to     = "switch the agent dashboard between the table and the cards"
+try_saying  = "show cards"
+
+  [[commands.params]]
+  name = "view"
+  kind = "overview_mode"
+
+[[commands]]
+id          = "show_agent_card"
+description = """Open one agent's CARD: the overlay that shows what that agent reported, its
+questions and the actions it offers. Use only when the user says card — "show the coder's card",
+"open the tester's card", "card for the dispatcher". Opening an agent's terminal pane ("open the
+coder", "show the tester") is `open_agent`, not this one. Set `agent` to the user's own words for
+the agent."""
+invoke      = "showAgentCard"
+screens     = ["overview"]
+unavailable_hint = "an agent's card opens on the agent dashboard"
+report      = "Showing {agent}'s card."
+asks_to     = "open one agent's card"
+try_saying  = "show {agent}'s card"
+
+  [[commands.params]]
+  name = "agent"
+  kind = "agent_ref"
+
+[[commands]]
+id          = "next_agent_card"
+description = """With an agent's card open, show the next agent's card in the dashboard's order
+without closing it. Use for next card, the next one, or the card after this. "next page" is
+`next_page`; the next card that needs the user is `next_needs_you_card`."""
+invoke      = "nextAgentCard"
+screens     = ["overview"]
+unavailable_hint = "moving between cards works while an agent's card is open on the agent dashboard"
+report      = "Next card."
+asks_to     = "show the next agent's card"
+try_saying  = "next card"
+
+[[commands]]
+id          = "previous_agent_card"
+description = """With an agent's card open, show the previous agent's card in the dashboard's order
+without closing it. Use for previous card, the one before, or go back a card. "previous page" is
+`previous_page`."""
+invoke      = "previousAgentCard"
+screens     = ["overview"]
+unavailable_hint = "moving between cards works while an agent's card is open on the agent dashboard"
+report      = "Previous card."
+asks_to     = "show the previous agent's card"
+try_saying  = "previous card"
+
+[[commands]]
+id          = "next_needs_you_card"
+description = """With an agent's card open, jump to the next card that needs the user — an agent
+asking a question, waiting, done, failed, blocked or stopped. Use for next one that needs me, next
+card that needs me, what needs me next, or next needing attention."""
+invoke      = "nextNeedsYouCard"
+screens     = ["overview"]
+unavailable_hint = "moving between cards works while an agent's card is open on the agent dashboard"
+report      = "Next card that needs you."
+asks_to     = "show the next card that needs you"
+try_saying  = "next one that needs me"
+
+[[commands]]
+id          = "filter_needs_you_cards"
+description = """Turn the cards view's Needs you filter on or off: on shows only the agents' cards
+that need the user, off shows every card. Use for only the ones that need me, show only the cards
+that need me, just the ones needing my attention (`needs_you` = "on"), or show all cards, every card,
+clear the needs you filter (`needs_you` = "off"). It shows the cards view when turned on. Filtering the
+table by status is `filter_dashboard`."""
+invoke      = "toggleNeedsYouFilter"
+screens     = ["overview"]
+unavailable_hint = "the Needs you filter is on the agent dashboard's cards"
+report      = "Showing {needs_you}."
+asks_to     = "show only the cards that need you, or every card again"
+try_saying  = "only the ones that need me"
+
+  [[commands.params]]
+  name = "needs_you"
+  kind = "needs_you_filter"
+
+[[commands]]
+id          = "close_agent_card"
+description = """Close the agent's card that is open over the dashboard. Use for close the card,
+close this card, or done with the card. A bare "close" closes whatever is on top and is `close`."""
+invoke      = "closeAgentCard"
+screens     = ["overview"]
+unavailable_hint = "a card closes while one is open on the agent dashboard"
+report      = "Closed the card."
+asks_to     = "close the open card"
+try_saying  = "close the card"
+
+[[commands]]
+id          = "run_card_action"
+description = """Press one of the buttons on an agent's card: an action the agent or the deck
+offers (such as "Merge it", "Go ahead", "Explain") or an answer to a question the agent asked on
+its card. Use when the user names both the action and the agent — "send merge it to the coder",
+"press go ahead on the tester's card", "answer main to the coder". Set `agent` to the user's
+words for the agent and `action` to the button's label as the user said it. A catalog action is
+sent to that agent; an answer to the agent's question, an action whose text the agent wrote, one
+that asks for confirmation, and closing an agent, only open its card at the step where the user
+reads it and presses Send. Stopping an agent is `stop_agent`; writing your own words to it is
+`reply_to_agent_card`."""
+invoke      = "runCardAction"
+screens     = ["overview"]
+unavailable_hint = "a card's actions are pressed on the agent dashboard"
+report      = "Pressed {action} on {agent}'s card."
+asks_to     = "press one of the actions on an agent's card"
+try_saying  = "press {action} on {agent}'s card"
+
+  [[commands.params]]
+  name = "agent"
+  kind = "agent_ref"
+
+  [[commands.params]]
+  name = "action"
+  kind = "card_action"
+
+[[commands]]
+id          = "reply_to_agent_card"
+description = """Write a reply to an agent from its card with the user's own words: they are put in
+that agent's card reply box, for the user to read and send. Use when the user says reply to or
+tell an agent something from the dashboard — "reply to the coder yes go ahead", "tell the tester
+use the main branch". Set `agent` to the user's words for the agent and `reply` to exactly the
+words to send, as the user said them. Typing into an open agent's terminal is `dictate_to_agent`;
+pressing a card's button is `run_card_action`."""
+invoke      = "replyToAgentCard"
+screens     = ["overview"]
+unavailable_hint = "a card's reply is sent from the agent dashboard"
+report      = "Your reply to {agent} is in its card: press Send reply to send it."
+asks_to     = "reply to an agent from its card with my own words"
+try_saying  = "reply to {agent} go ahead"
+
+  [[commands.params]]
+  name = "agent"
+  kind = "agent_ref"
+
+  [[commands.params]]
+  name = "reply"
+  kind = "reply_text"

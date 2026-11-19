@@ -97,6 +97,11 @@ pub const SCENARIOS: &[Scenario] = &[
         clients: &[Client::Desktop],
     },
     Scenario {
+        name: "agent-cards",
+        description: "The desktop Dashboard's Cards view: four agents' cards in an orchestration group and a standalone group, three needing you (PRD #2374).",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
         name: "new-agent",
         description: "The New Agent form with a project directory selected.",
         clients: &[Client::Tui, Client::Desktop],

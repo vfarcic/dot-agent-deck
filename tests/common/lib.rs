@@ -2256,7 +2256,7 @@ impl TuiDeck {
     /// so this accessor is Unix-gated like the harness it exposes.
     #[cfg(unix)]
     pub fn subscribe_events(&self) -> EventSub {
-        EventSub::open(&self.attach_socket).expect("open SubscribeEvents stream")
+        EventSub::open(&self.attach_socket, false).expect("open SubscribeEvents stream")
     }
 
     /// Issue #701: type `prompt` into a real interactive Claude Code pane that
@@ -12722,7 +12722,7 @@ impl DaemonProc {
     /// live (the initial `KIND_RESP` was read), so no subsequent broadcast is
     /// missed. All polling lives here in the harness (Decision 21).
     pub fn subscribe_events(&self) -> EventSub {
-        EventSub::open(&self.attach_socket).expect("open SubscribeEvents stream")
+        EventSub::open(&self.attach_socket, false).expect("open SubscribeEvents stream")
     }
 }
 
@@ -12746,14 +12746,20 @@ impl EventSub {
     /// `daemon serve`, whose [`DaemonProc::subscribe_events`] is this. Returns
     /// once the subscription is provably live, like that one.
     pub fn subscribe(attach_socket: &Path) -> Self {
-        Self::open(attach_socket).expect("open SubscribeEvents stream")
+        Self::open(attach_socket, false).expect("open SubscribeEvents stream")
+    }
+
+    /// [`Self::subscribe`], opted into the agent-card doorbells (PRD #2374),
+    /// which a plain subscription is never sent.
+    pub fn subscribe_with_agent_cards(attach_socket: &Path) -> Self {
+        Self::open(attach_socket, true).expect("open SubscribeEvents stream")
     }
 
     /// Send a `SubscribeEvents` request, read the `KIND_RESP` ack synchronously
     /// (so the daemon's per-connection broadcast receiver exists before we
     /// return — nothing broadcast afterward can be missed), then spawn a reader
     /// thread collecting `BroadcastMsg::Event` frames.
-    fn open(attach_socket: &Path) -> std::io::Result<Self> {
+    fn open(attach_socket: &Path, agent_cards: bool) -> std::io::Result<Self> {
         use dot_agent_deck::daemon_protocol::{KIND_EVENT, KIND_REQ, KIND_RESP};
         use dot_agent_deck::event::BroadcastMsg;
 
@@ -12761,9 +12767,10 @@ impl EventSub {
         stream.set_read_timeout(Some(Duration::from_millis(200)))?;
         stream.set_write_timeout(Some(Duration::from_secs(5)))?;
 
-        let payload =
-            serde_json::to_vec(&dot_agent_deck::daemon_protocol::AttachRequest::SubscribeEvents)
-                .expect("serialize SubscribeEvents");
+        let payload = serde_json::to_vec(
+            &dot_agent_deck::daemon_protocol::AttachRequest::SubscribeEvents { agent_cards },
+        )
+        .expect("serialize SubscribeEvents");
         let mut header = [0u8; 5];
         header[0] = KIND_REQ;
         header[1..5].copy_from_slice(&(payload.len() as u32).to_be_bytes());
@@ -13058,7 +13065,7 @@ fn count_occurrences(hay: &[u8], needle: &[u8]) -> usize {
 #[cfg(unix)]
 #[allow(dead_code)]
 pub fn subscribe_events_on(socket: &Path) -> EventSub {
-    EventSub::open(socket).expect("open SubscribeEvents stream")
+    EventSub::open(socket, false).expect("open SubscribeEvents stream")
 }
 
 /// Send one `AttachRequest` over a daemon attach socket and read back the

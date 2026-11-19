@@ -198,6 +198,8 @@ const OPEN_DECK_INVOKE: keyof typeof VOICE_ACTIONS = "openDeck";
 const SWITCH_DECK_INVOKE: keyof typeof VOICE_ACTIONS = "switchDeck";
 /** Issue #1496 — the one entry whose params are the dashboard filter's facets. */
 const FILTER_DASHBOARD_INVOKE: keyof typeof VOICE_ACTIONS = "filterDashboard";
+const RUN_CARD_ACTION_INVOKE: keyof typeof VOICE_ACTIONS = "runCardAction";
+const REPLY_TO_AGENT_CARD_INVOKE: keyof typeof VOICE_ACTIONS = "replyToAgentCard";
 /** The Settings sheet as `SettingsSheet` renders it, for asking the fence's stack whether anything is drawn over it. */
 const SETTINGS_PANEL = "[data-testid='settings-panel']";
 
@@ -1166,6 +1168,16 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
        named by one member's agent id on the selected deck, whose agents Rust
        resolved it against. */
     const namedOrchestration = outcome.params.find((param) => param.kind === "orchestration_ref");
+    /* PRD #2374 — the cards' two closed sets, resolved Rust-side: the view
+       (`table` or `cards`) and the Needs you filter (`on` or `off`). */
+    const namedOverviewMode = outcome.params.find((param) => param.kind === "overview_mode");
+    const namedNeedsYouFilter = outcome.params.find((param) => param.kind === "needs_you_filter");
+    /* PRD #2374 — a card action's label and a reply's words. The crate sends
+       them as their own kinds (`card_action`, held to the transcript like the
+       Filter box's text, and `reply_text`, the transcript's own slice like the
+       Command field's), not as `filter_text` / `command_text`. */
+    const namedCardAction = outcome.params.find((param) => param.kind === "card_action");
+    const namedReplyText = outcome.params.find((param) => param.kind === "reply_text");
     const target: VoiceDispatchTarget = {
       /* The dictation pair targets the pane on SCREEN — its row declares no
          agent param and is `screens = ["agent"]`, so `agentView` is defined
@@ -1212,6 +1224,13 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       ...(declaredForm ? { declaredForm: { deckId: declaredForm.deckId, path: declaredForm.path } } : {}),
       ...(namedOrchestration ? { orchestrationAgentId: namedOrchestration.value, ...("incarnation" in namedOrchestration ? { orchestrationIncarnation: namedOrchestration.incarnation } : {}) } : {}),
       ...(outcome.invoke === FILTER_DASHBOARD_INVOKE ? { dashboardFilter: dashboardFilterFromParams(outcome.params) } : {}),
+      ...(namedOverviewMode && (namedOverviewMode.value === "table" || namedOverviewMode.value === "cards") ? { overviewMode: namedOverviewMode.value } : {}),
+      ...(namedNeedsYouFilter && (namedNeedsYouFilter.value === "on" || namedNeedsYouFilter.value === "off") ? { needsYouOnly: namedNeedsYouFilter.value === "on" } : {}),
+      /* The action's label as the user said it (a `card_action`, held to the
+         transcript), and a reply's words (a `reply_text`: the transcript's
+         own slice), each for its own row only. */
+      ...(outcome.invoke === RUN_CARD_ACTION_INVOKE && namedCardAction ? { cardActionLabel: namedCardAction.value } : {}),
+      ...(outcome.invoke === REPLY_TO_AGENT_CARD_INVOKE && namedReplyText ? { cardReplyText: namedReplyText.value } : {}),
     };
     let moved = false;
     const context: VoiceDispatchContext = {
