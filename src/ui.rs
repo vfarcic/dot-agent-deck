@@ -2292,10 +2292,11 @@ struct UiState {
     /// prompt opened. The request names it, so an agent that replaced it
     /// before the user confirmed receives nothing (PRD #2119 review).
     config_gen_agent: Option<String>,
-    /// PRD #2119: whether the daemon reported, when the config-gen prompt
-    /// opened, that the card's project already has a `.dot-agent-deck.toml`,
-    /// so the prompt reads Update rather than Generate.
-    config_gen_update: bool,
+    /// PRD #2119: what the daemon reported, when the config-gen prompt
+    /// opened, about the card's project's `.dot-agent-deck.toml`: `Some(true)`
+    /// reads Update, `Some(false)` Generate, and `None` (the daemon could not
+    /// tell) the neutral question that claims neither.
+    config_gen_exists: Option<bool>,
     /// Selected option index in the config-gen modal (0=Yes, 1=No).
     config_gen_selected: usize,
     /// Selected option in quit confirm modal (0=Detach, 1=Stop, 2=Cancel).
@@ -2756,7 +2757,7 @@ impl UiState {
             star_prompt_state: config::StarPromptState::default(),
             config_gen_target: None,
             config_gen_agent: None,
-            config_gen_update: false,
+            config_gen_exists: None,
             config_gen_selected: 0,
             quit_confirm_selected: 0,
             close_confirm: CloseConfirmState::default(),
@@ -12196,7 +12197,7 @@ fn dispatch_action(
             {
                 ui.config_gen_target = Some(card);
                 ui.config_gen_agent = session.agent_id.clone();
-                ui.config_gen_update = snapshot.project_config_exists(session) == Some(true);
+                ui.config_gen_exists = snapshot.project_config_exists(session);
                 ui.config_gen_selected = 0;
                 ui.mode = UiMode::ConfigGenPrompt;
             } else {
@@ -19591,7 +19592,7 @@ fn draw_modal(frame: &mut Frame, area: Rect, ui: &mut UiState) {
             frame,
             area,
             ui.config_gen_selected,
-            ui.config_gen_update,
+            ui.config_gen_exists,
         ));
     }
     if ui.mode == UiMode::QuitConfirm {
@@ -22376,7 +22377,7 @@ fn render_config_gen_prompt(
     frame: &mut Frame,
     area: Rect,
     selected: usize,
-    update: bool,
+    exists: Option<bool>,
 ) -> ConfirmDrawing {
     let popup_width = 60u16.min(area.width.saturating_sub(4));
     let popup_height = CONFIG_GEN_CONFIRM.popup_height(0, area);
@@ -22387,31 +22388,39 @@ fn render_config_gen_prompt(
     frame.render_widget(Clear, popup_area);
 
     // PRD #2119: Update when the daemon reported that the project already
-    // has a config — the request it composes then says so. The same words
-    // as the desktop's dialog (CLAUDE.md rule 22).
-    let (verb, question) = if update {
-        (
+    // has a config — the request it composes then says so — Generate when it
+    // reported none, and, when it could not tell, a question that claims
+    // neither: the request is then the conditional one (PR #2362 review). The
+    // title stays Generate there, matching the footer. The same words as the
+    // desktop's dialog (CLAUDE.md rule 22).
+    let (verb, question, yes) = match exists {
+        Some(true) => (
             "Update",
             [
                 "  This project already has an orchestration config.",
                 "  Want to instruct your agent to analyze the",
                 "  project and update the existing config?",
             ],
-        )
-    } else {
-        (
+            "update config for this project",
+        ),
+        Some(false) => (
             "Generate",
             [
                 "  No orchestration config found for this",
                 "  project. Want to instruct your agent to",
                 "  analyze the project and create one?",
             ],
-        )
-    };
-    let yes = if update {
-        "update config for this project"
-    } else {
-        "generate config for this project"
+            "generate config for this project",
+        ),
+        None => (
+            "Generate",
+            [
+                "  Want to instruct your agent to check this",
+                "  project for .dot-agent-deck.toml and create it,",
+                "  or propose updates to it if it already exists?",
+            ],
+            "create or update config for this project",
+        ),
     };
     let options = [("Yes", yes), ("No", "skip for now")];
 
@@ -26708,7 +26717,7 @@ pub fn render_config_gen_prompt_to_buffer(
 ) -> ratatui::buffer::Buffer {
     draw_to_buffer(width, height, |frame| {
         let frame_area = frame.area();
-        render_config_gen_prompt(frame, frame_area, selected, false);
+        render_config_gen_prompt(frame, frame_area, selected, Some(false));
     })
 }
 
@@ -50678,7 +50687,7 @@ mod tests {
         }
     }
 
-    /// Scenario: Refresh a dashboard card from daemon records with existing, absent, or unknown config state and press g. The footer and neutral Yes/No dialog say Update only when the daemon reports an existing file, retaining the same keyboard shortcut.
+    /// Scenario: Refresh a dashboard card from daemon records with existing, absent, or unknown config state and press g. The footer and Yes/No dialog say Update only when the daemon reports an existing file, and an unknown state asks to check for the file and create or update it without claiming either.
     #[spec("dashboard/config-gen/001")]
     #[test]
     fn config_gen_001_existing_config_labels_footer_and_confirmation_update() {
@@ -50736,18 +50745,47 @@ mod tests {
                     "neutral confirmation must offer {label}:\n{dialog}"
                 );
             }
-            if exists == Some(true) {
-                assert!(
-                    dialog.contains("update the existing config"),
-                    "ask to update the user's config:\n{dialog}"
-                );
-                assert!(!dialog.contains("No orchestration config found"));
-                insta::assert_snapshot!("config_generation_update_confirmation", dialog);
-            } else {
-                assert!(
-                    dialog.contains("create one?"),
-                    "keep the existing Generate question:\n{dialog}"
-                );
+            match exists {
+                Some(true) => {
+                    assert!(
+                        dialog.contains("update the existing config"),
+                        "ask to update the user's config:\n{dialog}"
+                    );
+                    assert!(!dialog.contains("No orchestration config found"));
+                    insta::assert_snapshot!("config_generation_update_confirmation", dialog);
+                }
+                Some(false) => {
+                    assert!(
+                        dialog.contains("create one?"),
+                        "keep the existing Generate question:\n{dialog}"
+                    );
+                }
+                // PR #2362 review: the daemon could not tell, so the
+                // question claims neither a config nor its absence.
+                None => {
+                    for claim in [
+                        "No orchestration config found",
+                        "already has an orchestration config",
+                        "create one?",
+                    ] {
+                        assert!(
+                            !dialog.contains(claim),
+                            "an unknown state must not claim {claim:?}:\n{dialog}"
+                        );
+                    }
+                    for neutral in [
+                        "check this",
+                        "project for .dot-agent-deck.toml and create it,",
+                        "or propose updates to it if it already exists?",
+                        "create or update config for this project",
+                    ] {
+                        assert!(
+                            dialog.contains(neutral),
+                            "the unknown question must say {neutral:?}:\n{dialog}"
+                        );
+                    }
+                    insta::assert_snapshot!("config_generation_unknown_confirmation", dialog);
+                }
             }
         }
     }

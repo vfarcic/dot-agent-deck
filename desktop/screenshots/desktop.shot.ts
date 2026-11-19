@@ -99,6 +99,7 @@ desktopScenario("generate-config", async (page) => {
   await page.getByRole("button", { name: "Generate config with Plan / architecture agent" }).click();
   const dialog = page.getByRole("alertdialog", { name: "Generate .dot-agent-deck.toml" });
   await expect(dialog).toBeVisible();
+  await expect(dialog).toContainText("No orchestration config found for this project.");
   await expect(dialog.getByRole("button", { name: "Yes", exact: true })).toBeVisible();
   await expect(dialog.getByRole("button", { name: "No", exact: true })).toBeVisible();
 });

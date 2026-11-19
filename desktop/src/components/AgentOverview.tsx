@@ -960,6 +960,19 @@ export const GENERATE_CONFIG_BODY = "No orchestration config found for this proj
 /** PRD #2119 — the same question when the daemon reports the project already has a config: the TUI's words again. */
 export const UPDATE_CONFIG_TITLE = "Update .dot-agent-deck.toml";
 export const UPDATE_CONFIG_BODY = "This project already has an orchestration config. Want to instruct your agent to analyze the project and update the existing config?";
+/**
+ * PR #2362 review — the question when the daemon could not tell whether the project has a config (or did not say):
+ * it claims neither, since the request the daemon then sends is the conditional one. Titled Generate, like the
+ * button. The TUI's words again (`render_config_gen_prompt`, CLAUDE.md rule 22).
+ */
+export const UNKNOWN_CONFIG_BODY = "Want to instruct your agent to check this project for .dot-agent-deck.toml and create it, or propose updates to it if it already exists?";
+
+/** PRD #2119 — the confirmation's body for what the daemon reported: an existing config, none, or unknown. */
+export function configConfirmationBody(agent: Pick<OverviewAgent, "projectConfigExists">): string {
+  if (agent.projectConfigExists === true) return UPDATE_CONFIG_BODY;
+  if (agent.projectConfigExists === false) return GENERATE_CONFIG_BODY;
+  return UNKNOWN_CONFIG_BODY;
+}
 
 /** PRD #2119 — the config action's verb: Update only when the daemon reported an existing config, else Generate (the TUI footer's `config_action_label`). */
 export function configActionVerb(agent: Pick<OverviewAgent, "projectConfigExists">): "Update" | "Generate" {
@@ -1004,7 +1017,7 @@ export function generateConfigConfirmation(agent: Pick<OverviewAgent, "daemonId"
   const update = configActionVerb(agent) === "Update";
   return {
     title: update ? UPDATE_CONFIG_TITLE : GENERATE_CONFIG_TITLE,
-    body: update ? UPDATE_CONFIG_BODY : GENERATE_CONFIG_BODY,
+    body: configConfirmationBody(agent),
     label: "Yes",
     busyLabel: "Sending…",
     cancelLabel: "No",

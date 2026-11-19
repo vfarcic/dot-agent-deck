@@ -4625,12 +4625,13 @@ pub fn attach_prompt_keys(records: &mut [AgentRecord]) {
 /// the disk now. Unconditional: a record without a cwd reports unknown rather
 /// than keeping what a caller had put there.
 ///
-/// The checks run as one unit of blocking work off the async runtime, behind
-/// the daemon's project-filesystem bound and [`crate::config_gen::CONFIG_CHECK_TIMEOUT`]
-/// ([`crate::config_gen::project_config_flags`]), one per distinct directory.
-/// When they do not finish in time, an unavailable mount for instance, every
-/// record reports unknown for this listing rather than holding the reply. Call
-/// it holding no registry or `AppState` lock.
+/// The checks run off the async runtime, one per distinct directory, behind
+/// the config checks' own bound and [`crate::config_gen::CONFIG_CHECK_TIMEOUT`]
+/// ([`crate::config_gen::project_config_flags`]). A directory whose check did
+/// not finish in time, an unavailable mount for instance, or still has one
+/// outstanding from an earlier listing, reports unknown for this listing
+/// rather than holding the reply. Call it holding no registry or `AppState`
+/// lock.
 pub async fn attach_project_config_exists(records: &mut [AgentRecord]) {
     attach_project_config_flags(records, crate::config_gen::project_config_flags).await;
 }
@@ -4640,14 +4641,16 @@ pub async fn attach_project_config_exists(records: &mut [AgentRecord]) {
 pub(crate) async fn attach_project_config_flags<F, Fut>(records: &mut [AgentRecord], check: F)
 where
     F: FnOnce(Vec<String>) -> Fut,
-    Fut: std::future::Future<Output = Option<Vec<Option<bool>>>>,
+    Fut: std::future::Future<Output = Vec<Option<bool>>>,
 {
     let mut dirs: Vec<String> = records.iter().filter_map(|r| r.cwd.clone()).collect();
     dirs.sort();
     dirs.dedup();
-    let answers: std::collections::HashMap<String, Option<bool>> = match check(dirs.clone()).await {
-        Some(flags) if flags.len() == dirs.len() => dirs.into_iter().zip(flags).collect(),
-        _ => std::collections::HashMap::new(),
+    let flags = check(dirs.clone()).await;
+    let answers: std::collections::HashMap<String, Option<bool>> = if flags.len() == dirs.len() {
+        dirs.into_iter().zip(flags).collect()
+    } else {
+        std::collections::HashMap::new()
     };
     for record in records {
         record.project_config_exists = record

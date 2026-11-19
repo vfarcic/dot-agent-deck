@@ -87,7 +87,7 @@ describe("desktop/config-gen/002: generating configuration from an agent", () =>
     expect(screen.getByText(sent)).toBeVisible();
   });
 
-  /** Scenario: Ask the remote planner to create or update a config, including an older daemon with unknown file state. Its row and neutral Yes/No confirmation say Update only for an existing file; No sends nothing. */
+  /** Scenario: Ask the remote planner to create or update a config, including an unknown file state. Its row and neutral Yes/No confirmation say Update only for an existing file, an unknown state asks to check for the file and create or update it without claiming either, and No sends nothing. */
   it.each([undefined, false, true])("offers a neutral Yes/No confirmation and No sends nothing (existing config: %s)", (exists) => {
     const { rt, generateConfig } = generation();
     rt.fleet = rt.fleet.map((deck) => ({ ...deck, agents: deck.agents.map((agent) => ({ ...agent, projectConfigExists: exists })) }));
@@ -101,8 +101,13 @@ describe("desktop/config-gen/002: generating configuration from an agent", () =>
     if (exists) {
       expect(dialog).toHaveTextContent(/instruct your agent to analyze the project and update the existing config/i);
       expect(dialog).not.toHaveTextContent("No orchestration config found");
-    } else {
+    } else if (exists === false) {
       expect(dialog).toHaveTextContent("No orchestration config found for this project. Want to instruct your agent to analyze the project and create one?");
+    } else {
+      // PR #2362 review: unknown claims neither a config nor its absence.
+      expect(dialog).toHaveTextContent("Want to instruct your agent to check this project for .dot-agent-deck.toml and create it, or propose updates to it if it already exists?");
+      expect(dialog).not.toHaveTextContent("No orchestration config found");
+      expect(dialog).not.toHaveTextContent("already has an orchestration config");
     }
     expect(within(dialog).getAllByRole("button").map((button) => button.textContent).sort()).toEqual(["No", "Yes"]);
     expect(dialog.querySelector(".danger, .danger-icon")).toBeNull();
