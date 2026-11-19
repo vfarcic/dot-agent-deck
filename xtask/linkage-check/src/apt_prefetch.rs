@@ -261,3 +261,23 @@ fn apt_prefetch_007_archive_and_mirror_file_sources_are_left_alone() {
     assert_eq!(r.sources(), github);
     assert_eq!(r.used(), [EC2, ARCHIVE]);
 }
+
+/// Scenario: a deb822 `URIs:` field listing two URLs, a regional mirror and
+/// another one (Qodo on #2386); after a stalled attempt the regional one is
+/// replaced, the other stays, and the retry fetches from archive.ubuntu.com.
+#[test]
+fn apt_prefetch_008_a_regional_url_among_several_is_replaced() {
+    let two = RWX_SOURCES.replace(
+        "URIs: http://us-east-2.ec2.archive.ubuntu.com/ubuntu/\n",
+        "URIs: http://us-east-2.ec2.archive.ubuntu.com/ubuntu/ https://mirror.example/ubuntu/\n",
+    );
+    let r = run_with_sources(None, Some(&two), "124 0");
+    assert!(r.out.status.success(), "{}", r.stdout());
+    assert_eq!(r.used(), [EC2, "http://archive.ubuntu.com/ubuntu/"]);
+    let after = r.sources();
+    assert!(
+        after.contains("URIs: http://archive.ubuntu.com/ubuntu/ https://mirror.example/ubuntu/\n"),
+        "{after}"
+    );
+    assert!(!after.contains("ec2.archive"), "{after}");
+}

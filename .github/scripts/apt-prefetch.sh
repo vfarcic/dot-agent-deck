@@ -57,9 +57,10 @@ limit=${APT_PREFETCH_ATTEMPT_LIMIT:-3m}
 # Overridable for xtask/linkage-check's apt_prefetch tests only.
 mirrors=${APT_PREFETCH_MIRRORS:-/etc/apt/apt-mirrors.txt}
 sources=${APT_PREFETCH_SOURCES:-/etc/apt/sources.list.d/ubuntu.sources}
-# A deb822 URIs line naming a regional archive mirror (a host ending in
-# .archive.ubuntu.com, so archive.ubuntu.com itself does not match).
-regional='^URIs:[[:space:]]*https?://[^[:space:]/]+\.archive\.ubuntu\.com/ubuntu/?[[:space:]]*$'
+# A regional archive mirror's URL (a host ending in .archive.ubuntu.com, so
+# archive.ubuntu.com itself does not match), as one of the URLs a deb822
+# `URIs:` field lists; the field may list several (Qodo on #2386).
+regional='https?://[^[:space:]/]+\.archive\.ubuntu\.com/ubuntu/?'
 fallback=http://archive.ubuntu.com/ubuntu/
 
 if [ -r "$mirrors" ]; then
@@ -97,9 +98,14 @@ for attempt in $(seq 1 "$attempts"); do
     sed 's/^/  /' "$mirrors"
     changed=true
   elif [ "$attempt" -lt "$attempts" ] && [ ! -f "$mirrors" ] && [ -f "$sources" ] \
-    && grep -Eq "$regional" "$sources"; then
+    && grep -Eq "^URIs:(.*[[:space:]])?$regional([[:space:]]|\$)" "$sources"; then
     echo "apt prefetch: $sources named a regional mirror; the remaining attempts use $fallback:"
-    sudo sed -E -i "s#$regional#URIs: $fallback#" "$sources"
+    # Each regional URL in a URIs field becomes the fallback; the field's
+    # other URLs stay. The loop catches two regional URLs one space apart,
+    # where the first match consumes the space the second needs.
+    sudo sed -E -i -e '/^URIs:/{' -e ':a' \
+      -e "s#(^URIs:|[[:space:]])$regional([[:space:]]|\$)#\1$fallback\2#" \
+      -e 'ta' -e '}' "$sources"
     grep '^URIs:' "$sources" | sed 's/^/  /'
     changed=true
   fi
