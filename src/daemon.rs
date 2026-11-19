@@ -1993,8 +1993,10 @@ async fn ingest_hook_event(
     let event_type = event.event_type.clone();
     let claimed_pane = event.pane_id.clone();
     // Issue #2347: a dropped prompt's report the guard refuses is expected,
-    // and logged there; it says nothing about the token's generation.
+    // and logged there; it says nothing about the token's generation. One
+    // the generation re-check refused still warns (PR #2405 review).
     let prompt_not_taken = event.prompt_not_taken().is_some();
+    let generation_replaced = std::sync::atomic::AtomicBool::new(false);
     let ingested = ingest_event_unless(
         state,
         event_tx,
@@ -2002,10 +2004,16 @@ async fn ingest_hook_event(
         event,
         unproven,
         attested_agent.as_deref(),
-        |_| replaced(),
+        |_| {
+            let stale = replaced();
+            generation_replaced.store(stale, std::sync::atomic::Ordering::Relaxed);
+            stale
+        },
     )
     .await;
-    if !ingested && !prompt_not_taken {
+    if !ingested
+        && (!prompt_not_taken || generation_replaced.load(std::sync::atomic::Ordering::Relaxed))
+    {
         // Qodo, PR #1559: logged like the gate's own refusals — the escaped
         // pane and a stable reason code, never the token — so a report the
         // under-lock re-check drops does not vanish without a trace.
