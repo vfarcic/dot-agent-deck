@@ -7124,3 +7124,65 @@ fn a_stale_opencode_login_in_one_file_does_not_refuse_a_lasting_one_in_another()
     );
     assert!(!err.contains("TOKEN"), "quotes a secret: {err}");
 }
+
+/// Scenario: Two test processes' worth of links are taken from one shared
+/// copy of a stand-in build, then the build changes and a third link is
+/// taken. The first two links share the copy's inode, so the build was copied
+/// once; the change replaces the copy rather than reusing the stale one; and a
+/// shared directory that is not private is refused, so the caller copies
+/// instead (issue #2343).
+#[cfg(unix)]
+#[test]
+fn deck_links_share_one_copy_per_build() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let root = harness_tempdir().unwrap();
+    let built = root.path().join("built");
+    std::fs::write(&built, b"build one").unwrap();
+    std::fs::set_permissions(&built, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let shared = root.path().join("shared");
+    let first = root.path().join("first");
+    let second = root.path().join("second");
+
+    link_through_shared_copy(&shared, &built, &first).unwrap();
+    link_through_shared_copy(&shared, &built, &second).unwrap();
+    let ino = |p: &Path| std::fs::metadata(p).unwrap().ino();
+    assert_eq!(ino(&first), ino(&second), "both links share one copy");
+    assert_ne!(ino(&first), ino(&built), "a copy, not the build itself");
+    assert_eq!(std::fs::read(&first).unwrap(), b"build one");
+    assert_eq!(
+        std::fs::metadata(&first).unwrap().permissions().mode() & 0o777,
+        0o755,
+        "the copy stays executable"
+    );
+    assert_eq!(
+        std::fs::metadata(&shared).unwrap().permissions().mode() & 0o7777,
+        0o700
+    );
+
+    // A rebuild: a new file under the build's name, as the linker writes it.
+    std::fs::remove_file(&built).unwrap();
+    std::fs::write(&built, b"build two!").unwrap();
+    let third = root.path().join("third");
+    link_through_shared_copy(&shared, &built, &third).unwrap();
+    assert_eq!(std::fs::read(&third).unwrap(), b"build two!");
+    assert_ne!(ino(&third), ino(&first), "a rebuild gets a fresh copy");
+    assert_eq!(
+        std::fs::read(&first).unwrap(),
+        b"build one",
+        "an earlier link keeps its own copy"
+    );
+    let copies: Vec<_> = std::fs::read_dir(&shared)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n != "lock")
+        .collect();
+    assert_eq!(copies.len(), 1, "the stale copy is removed: {copies:?}");
+
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let fourth = root.path().join("fourth");
+    let refused = link_through_shared_copy(&shared, &built, &fourth)
+        .expect_err("a shared directory others can read is refused");
+    assert!(refused.to_string().contains("0o755"), "{refused}");
+    assert!(!fourth.exists());
+}
