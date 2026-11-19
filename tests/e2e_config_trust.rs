@@ -2658,28 +2658,26 @@ fn escape_001_refusals_carry_no_raw_terminal_controls() {
         )
         .and_then(|r| r.pane_id_env)
         .expect("precondition: the approved orchestration opens its start role");
-    // And its coder: `delegate --to coder` is refused by the trust check only
-    // once a coder is there to deliver to. Before its pane is listed the
-    // delegate fails as "reached no worker" instead, which is what a starved
-    // runner produced on `main`'s run for #2378.
-    daemon
-        .wait_for_agent_where(
-            |r| {
-                matches!(
-                    &r.tab_membership,
-                    Some(TabMembership::Orchestration { role_name, .. }) if role_name == "coder"
-                )
-            },
-            common::load_scaled(Duration::from_secs(15)),
-        )
-        .expect("precondition: the approved orchestration opens its coder");
     write_trust_config_with_hostile_role(&roles, CODER_COMMAND_EDITED);
 
     for args in [
         &["delegate", "--to", "coder", "--task", "TRUST-HOSTILE-TASK"][..],
         &["pane", "restart", "coder", "--force"],
     ] {
-        let out = daemon_agent_verb(&daemon, &roles, &orchestrator, args);
+        // The trust check answers only once the coder is registered for
+        // routing; until then `delegate` answers "reached no worker", which a
+        // starved runner hit on `main`'s run for #2378. Both answers refuse and
+        // deliver nothing, so the verb is asked again until the coder is
+        // there, within the same bound as the waits above.
+        let out = std::cell::RefCell::new(daemon_agent_verb(&daemon, &roles, &orchestrator, args));
+        common::wait_until(common::load_scaled(Duration::from_secs(15)), || {
+            if !text(&out.borrow()).contains("reached no worker") {
+                return true;
+            }
+            *out.borrow_mut() = daemon_agent_verb(&daemon, &roles, &orchestrator, args);
+            false
+        });
+        let out = out.into_inner();
         let printed = text(&out);
         assert!(
             !out.status.success()
