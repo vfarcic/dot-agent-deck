@@ -97,6 +97,18 @@ pub const ENV_WAKE_STALL_AFTER_MS: &str = "DOT_AGENT_DECK_INBOX_WAKE_STALL_AFTER
 /// native, at a turn's end, or by a doorbell the agent answers — never shows.
 pub const DEFAULT_WAKE_STALL_AFTER: Duration = Duration::from_secs(120);
 
+/// Issue #2389: how long, in milliseconds, the oldest message queued for an
+/// agent whose status reads busy (Thinking, Working or Compacting) may wait
+/// with the agent sending the deck nothing before both clients show it as not
+/// taken ([`QuietClock`], [`crate::inbox_display::WakeHold::NoActivity`]).
+pub const ENV_BUSY_STALL_AFTER_MS: &str = "DOT_AGENT_DECK_INBOX_BUSY_STALL_AFTER_MS";
+
+/// See [`ENV_BUSY_STALL_AFTER_MS`]: longer than one foreground command can
+/// hold a Claude Code turn with no hook event by default (its Bash tool stops
+/// a command at ten minutes), so a long but live turn does not trip it, and
+/// shorter than the shortest stall issue #2385 reported (16 minutes).
+pub const DEFAULT_BUSY_STALL_AFTER: Duration = Duration::from_secs(15 * 60);
+
 /// The fixed line, before its id.
 pub const LINE_PREFIX: &str = " dot-agent-deck: message ";
 
@@ -157,6 +169,8 @@ pub struct DoorbellConfig {
     pub arm_grace: Duration,
     /// See [`ENV_WAKE_STALL_AFTER_MS`].
     pub wake_stall_after: Duration,
+    /// See [`ENV_BUSY_STALL_AFTER_MS`].
+    pub busy_stall_after: Duration,
 }
 
 impl Default for DoorbellConfig {
@@ -166,6 +180,7 @@ impl Default for DoorbellConfig {
             schedule: DEFAULT_SCHEDULE.to_vec(),
             arm_grace: DEFAULT_ARM_GRACE,
             wake_stall_after: DEFAULT_WAKE_STALL_AFTER,
+            busy_stall_after: DEFAULT_BUSY_STALL_AFTER,
         }
     }
 }
@@ -206,6 +221,12 @@ impl DoorbellConfig {
             match parse_ms(&raw) {
                 Some(ms) if !ms.is_zero() => config.wake_stall_after = ms,
                 _ => ignored(ENV_WAKE_STALL_AFTER_MS),
+            }
+        }
+        if let Some(raw) = lookup(ENV_BUSY_STALL_AFTER_MS) {
+            match parse_ms(&raw) {
+                Some(ms) if !ms.is_zero() => config.busy_stall_after = ms,
+                _ => ignored(ENV_BUSY_STALL_AFTER_MS),
             }
         }
         config
@@ -431,11 +452,14 @@ pub enum StallChange {
 impl StallClock {
     /// One tick: `oldest` is the oldest message queued for the agent,
     /// `waiting` whether nothing is working on the agent's side (no armed
-    /// component, the agent not working).
+    /// component, the agent not working). `overdue` (issue #2389) raises at
+    /// once: a [`QuietClock`] already found the message waiting its own bound
+    /// behind a busy status nothing refreshed, and `waiting` holds with it.
     pub fn observe(
         &mut self,
         oldest: Option<&str>,
         waiting: bool,
+        overdue: bool,
         now: Instant,
         after: Duration,
     ) -> StallChange {
@@ -464,11 +488,58 @@ impl StallClock {
             return change;
         }
         let since = *self.since.get_or_insert(now);
-        if !self.raised && now >= since + after {
+        if !self.raised && (overdue || now >= since + after) {
             self.raised = true;
             return StallChange::Raise;
         }
         change
+    }
+}
+
+/// Issue #2389: whether a message has waited past
+/// [`DoorbellConfig::busy_stall_after`] for an agent whose status reads busy
+/// while the agent sent the deck nothing.
+///
+/// A busy status explains waiting mail ([`status_explains_waiting`]) only
+/// while something keeps it current. A turn whose end the deck never saw
+/// (#2347 is one way) leaves it reading busy for good, and the doorbell rings
+/// only an idle agent, so without this the mail waits silently. The clock
+/// runs while messages are queued, no native component is armed or due, and
+/// the status reads busy; it starts again when the oldest queued message
+/// changes and whenever the agent's card takes a new frame (`activity`,
+/// [`crate::state::CardActivity`]), so an agent that keeps using tools or
+/// changing status never trips it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QuietClock {
+    oldest: Option<String>,
+    activity: Option<crate::state::CardActivity>,
+    since: Option<Instant>,
+}
+
+impl QuietClock {
+    /// One tick: `oldest` is the oldest message queued for the agent, `busy`
+    /// whether its status reads busy with nothing armed to take the message,
+    /// and `activity` the newest frame its card took. Returns whether the
+    /// message has waited `after` since the later of its turn as the oldest
+    /// and the agent's last frame.
+    pub fn observe(
+        &mut self,
+        oldest: Option<&str>,
+        busy: bool,
+        activity: Option<crate::state::CardActivity>,
+        now: Instant,
+        after: Duration,
+    ) -> bool {
+        let Some(oldest) = oldest.filter(|_| busy) else {
+            *self = Self::default();
+            return false;
+        };
+        if self.oldest.as_deref() != Some(oldest) || self.activity != activity {
+            self.oldest = Some(oldest.to_string());
+            self.activity = activity;
+            self.since = Some(now);
+        }
+        self.since.is_some_and(|since| now >= since + after)
     }
 }
 
@@ -510,6 +581,10 @@ pub struct HoldFacts {
     pub not_taken: bool,
     /// How many of the agent's turns have ended in the pane.
     pub turns: u64,
+    /// Issue #2389: the agent's status reads busy, and the oldest message has
+    /// waited past the busy bound with the agent sending nothing
+    /// ([`QuietClock`]).
+    pub silent: bool,
 }
 
 /// What a hold does to its episode's clock ([`HoldEpisode`]).
@@ -524,7 +599,9 @@ pub enum HoldClock {
 
 /// PRD #1666 part 3, round 5-wake (plan §5.1): the obstacle in front of the
 /// doorbell, as the reason a card would show and what it does to the
-/// episode's clock. The first row that holds wins: nothing queued; a native
+/// episode's clock. The first row that holds wins: nothing queued; the agent
+/// reading busy with nothing from it past the busy bound (`no_activity`, issue
+/// #2389, shown at once with the clock stopped); a native
 /// component armed or due, or an integration notice on the card; the agent
 /// working; the first ring settling; the agent waiting for input
 /// (`awaiting_prompt`); an open paste (`paste_open`); a touched box the deck
@@ -539,6 +616,10 @@ pub fn obstacle(facts: &HoldFacts) -> (Option<crate::inbox_display::WakeHold>, H
     use crate::inbox_display::WakeHold;
     if !facts.queued {
         (None, HoldClock::Reset)
+    } else if facts.silent {
+        // Issue #2389: shown at once, its own bound already passed; the
+        // agent reads busy, so the episode's clock stands still.
+        (Some(WakeHold::NoActivity), HoldClock::Paused)
     } else if facts.receiver || facts.working || facts.settling {
         (None, HoldClock::Paused)
     } else if facts.waiting_for_input {
@@ -600,7 +681,11 @@ impl HoldEpisode {
             + self
                 .running_since
                 .map_or(Duration::ZERO, |since| now.saturating_duration_since(since));
-        let shown = if elapsed >= after { reason } else { None };
+        let shown = if facts.silent || elapsed >= after {
+            reason
+        } else {
+            None
+        };
         if shown == self.published {
             return None;
         }
@@ -681,6 +766,18 @@ fn status_explains_waiting(status: Option<&crate::state::SessionStatus>) -> bool
                 | SessionStatus::WaitingForInput
                 | SessionStatus::Blocked
         )
+    )
+}
+
+/// Issue #2389: whether `status` says the agent is in a turn — thinking,
+/// working or compacting — the readings a missed turn end can leave behind.
+/// Not waiting on the user (WaitingForInput, Blocked), which the card already
+/// shows as needing them.
+fn status_reads_busy(status: Option<&crate::state::SessionStatus>) -> bool {
+    use crate::state::SessionStatus;
+    matches!(
+        status,
+        Some(SessionStatus::Thinking | SessionStatus::Working | SessionStatus::Compacting)
     )
 }
 
@@ -791,6 +888,8 @@ struct Slot {
     busy: bool,
     /// PR #1735 fifth review (R5).
     stall: StallClock,
+    /// Issue #2389.
+    quiet: QuietClock,
     /// PRD #1666 part 3, round 5-wake.
     hold: HoldEpisode,
     /// The last ring found no screen it could type into, and none has written
@@ -922,7 +1021,7 @@ async fn run_tick(
     type Admission = (
         Option<crate::state::DoorbellAdmission>,
         bool,
-        Option<crate::state::SessionStatus>,
+        Option<(crate::state::SessionStatus, crate::state::CardActivity)>,
     );
     let admissions: Vec<Admission> = {
         let state = state.read().await;
@@ -935,14 +1034,15 @@ async fn run_tick(
                 (
                     state.doorbell_admission(agent, pane),
                     hooked,
-                    state.agent_status(agent, pane),
+                    state.agent_status_and_activity(agent, pane),
                 )
             })
             .collect()
     };
     #[cfg(not(feature = "e2e"))]
     let now = Instant::now();
-    for ((pane, agent), (admission, hooked, status)) in keys.into_iter().zip(admissions) {
+    for ((pane, agent), (admission, hooked, live)) in keys.into_iter().zip(admissions) {
+        let (status, activity) = live.map_or((None, None), |(status, at)| (Some(status), Some(at)));
         let explained = status_explains_waiting(status.as_ref());
         let input = registry.pane_input_hold(&pane, &agent);
         let inbox = hub.doorbell_facts(&pane, &agent);
@@ -974,10 +1074,20 @@ async fn run_tick(
         let (action, nudge, rering) = {
             let mut slots = slots.lock().unwrap_or_else(|e| e.into_inner());
             let slot = slots.entry((pane.clone(), agent.clone())).or_default();
-            let waiting = inbox.armed == 0 && !explained;
+            // Issue #2389: a busy status nothing has refreshed for the busy
+            // bound no longer explains the wait.
+            let silent = slot.quiet.observe(
+                inbox.queued.first().map(String::as_str),
+                !receiver && status_reads_busy(status.as_ref()),
+                activity,
+                now,
+                config.busy_stall_after,
+            );
+            let waiting = inbox.armed == 0 && (!explained || silent);
             match slot.stall.observe(
                 inbox.queued.first().map(String::as_str),
                 waiting,
+                silent,
                 now,
                 config.wake_stall_after,
             ) {
@@ -1032,6 +1142,7 @@ async fn run_tick(
                 unrecognised: slot.unrecognised || dirty,
                 not_taken: slot.not_taken.is_some(),
                 turns: input.turns,
+                silent,
             };
             if let Some(shown) = slot.hold.observe(&hold, now, config.wake_stall_after) {
                 info!(pane_id = %pane, agent_id = %agent, hold = ?shown, ?hold, "doorbell hold");
@@ -1271,65 +1382,215 @@ mod tests {
         let at = |s| t0 + Duration::from_secs(s);
         let mut clock = StallClock::default();
         assert_eq!(
-            clock.observe(Some("m1"), true, at(0), after),
+            clock.observe(Some("m1"), true, false, at(0), after),
             StallChange::Nothing
         );
         assert_eq!(
-            clock.observe(Some("m1"), true, at(119), after),
+            clock.observe(Some("m1"), true, false, at(119), after),
             StallChange::Nothing
         );
         assert_eq!(
-            clock.observe(Some("m1"), true, at(120), after),
+            clock.observe(Some("m1"), true, false, at(120), after),
             StallChange::Raise
         );
         assert_eq!(
-            clock.observe(Some("m1"), true, at(500), after),
+            clock.observe(Some("m1"), true, false, at(500), after),
             StallChange::Nothing,
             "raised once"
         );
         assert_eq!(
-            clock.observe(Some("m1"), false, at(501), after),
+            clock.observe(Some("m1"), false, false, at(501), after),
             StallChange::Clear,
             "the agent started working"
         );
         assert_eq!(
-            clock.observe(Some("m1"), true, at(502), after),
+            clock.observe(Some("m1"), true, false, at(502), after),
             StallChange::Nothing
         );
         assert_eq!(
-            clock.observe(Some("m1"), true, at(621), after),
+            clock.observe(Some("m1"), true, false, at(621), after),
             StallChange::Nothing,
             "the window starts again once the agent stops working"
         );
         assert_eq!(
-            clock.observe(Some("m1"), true, at(622), after),
+            clock.observe(Some("m1"), true, false, at(622), after),
             StallChange::Raise
         );
         assert_eq!(
-            clock.observe(Some("m2"), true, at(623), after),
+            clock.observe(Some("m2"), true, false, at(623), after),
             StallChange::Clear,
             "something took the oldest message"
         );
         assert_eq!(
-            clock.observe(Some("m2"), true, at(743), after),
+            clock.observe(Some("m2"), true, false, at(743), after),
             StallChange::Raise
         );
         assert_eq!(
-            clock.observe(None, true, at(744), after),
+            clock.observe(None, true, false, at(744), after),
             StallChange::Clear
         );
         assert_eq!(
-            clock.observe(None, true, at(745), after),
+            clock.observe(None, true, false, at(745), after),
             StallChange::Nothing
         );
         let mut working = StallClock::default();
         for s in [0, 200, 400] {
             assert_eq!(
-                working.observe(Some("m1"), false, at(s), after),
+                working.observe(Some("m1"), false, false, at(s), after),
                 StallChange::Nothing,
                 "an agent at work is never shown as waiting to wake"
             );
         }
+    }
+
+    /// Issue #2389: mail behind a busy status trips the quiet clock only once
+    /// it has waited the busy bound since the later of its turn as the oldest
+    /// and the agent's last frame; a frame, a new oldest message or a status
+    /// that is no longer busy starts it again, and the stall raises at once
+    /// when it trips.
+    #[test]
+    fn a_busy_status_nothing_refreshes_stops_explaining_waiting_mail() {
+        let after = Duration::from_secs(900);
+        let t0 = Instant::now();
+        let at = |s| t0 + Duration::from_secs(s);
+        let frame = |ms| {
+            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms).map(|newest_stamp| {
+                crate::state::CardActivity {
+                    newest_stamp,
+                    native_hook_at: None,
+                }
+            })
+        };
+        let mut quiet = QuietClock::default();
+        assert!(!quiet.observe(Some("m1"), true, frame(1), at(0), after));
+        assert!(!quiet.observe(Some("m1"), true, frame(1), at(899), after));
+        assert!(
+            quiet.observe(Some("m1"), true, frame(1), at(900), after),
+            "the bound passed with no frame from the agent"
+        );
+        assert!(
+            !quiet.observe(Some("m1"), true, frame(2), at(901), after),
+            "a frame from the agent is work: the clock starts again"
+        );
+        assert!(!quiet.observe(Some("m1"), true, frame(2), at(1800), after));
+        assert!(quiet.observe(Some("m1"), true, frame(2), at(1801), after));
+        assert!(
+            !quiet.observe(Some("m2"), true, frame(2), at(1802), after),
+            "a new oldest message waits the bound itself"
+        );
+        assert!(
+            !quiet.observe(Some("m2"), false, frame(2), at(5000), after),
+            "an agent not reading busy is the stall clock's"
+        );
+        assert!(!quiet.observe(Some("m2"), true, frame(2), at(5001), after));
+        assert!(!quiet.observe(None, true, frame(2), at(9000), after));
+        // A hook stamped behind the card's newest stamp (a lagging clock)
+        // leaves the stamp alone and still counts: it moves the arrival.
+        let mut skewed = QuietClock::default();
+        let stamp = frame(5).unwrap().newest_stamp;
+        let hook = |s| {
+            Some(crate::state::CardActivity {
+                newest_stamp: stamp,
+                native_hook_at: Some(at(s)),
+            })
+        };
+        assert!(!skewed.observe(Some("m1"), true, hook(0), at(0), after));
+        assert!(
+            !skewed.observe(Some("m1"), true, hook(800), at(1000), after),
+            "a hook that left the stamp alone is still activity"
+        );
+        assert!(!skewed.observe(Some("m1"), true, hook(800), at(1899), after));
+        assert!(skewed.observe(Some("m1"), true, hook(800), at(1900), after));
+        // An agent that keeps sending frames never trips it.
+        let mut working = QuietClock::default();
+        for (i, s) in (0..20u64).map(|i| (i, i * 600)) {
+            assert!(
+                !working.observe(Some("m1"), true, frame(i as i64), at(s), after),
+                "frame {i}"
+            );
+        }
+        // The stall raises the tick the quiet clock trips.
+        let mut stall = StallClock::default();
+        assert_eq!(
+            stall.observe(Some("m1"), true, true, at(0), Duration::from_secs(120)),
+            StallChange::Raise
+        );
+        assert_eq!(
+            stall.observe(Some("m1"), false, false, at(1), Duration::from_secs(120)),
+            StallChange::Clear
+        );
+        // Only the in-turn readings count as busy.
+        use crate::state::SessionStatus;
+        for status in [
+            SessionStatus::Thinking,
+            SessionStatus::Working,
+            SessionStatus::Compacting,
+        ] {
+            assert!(status_reads_busy(Some(&status)), "{status:?}");
+        }
+        for status in [
+            Some(SessionStatus::WaitingForInput),
+            Some(SessionStatus::Blocked),
+            Some(SessionStatus::Idle),
+            Some(SessionStatus::Error),
+            None,
+        ] {
+            assert!(!status_reads_busy(status.as_ref()), "{status:?}");
+        }
+    }
+
+    /// Issue #2389: a silent busy agent's hold is `no_activity`, shown on
+    /// the first tick it holds, ahead of the busy row that would show nothing,
+    /// and gone the tick the agent sends anything.
+    #[test]
+    fn a_silent_busy_agent_holds_as_no_activity_at_once() {
+        use crate::inbox_display::WakeHold;
+        let after = Duration::from_secs(120);
+        let t0 = Instant::now();
+        let silent = HoldFacts {
+            silent: true,
+            working: true,
+            ..held(true)
+        };
+        assert_eq!(
+            obstacle(&silent),
+            (Some(WakeHold::NoActivity), HoldClock::Paused)
+        );
+        let mut episode = HoldEpisode::default();
+        assert_eq!(
+            episode.observe(
+                &HoldFacts {
+                    silent: false,
+                    ..silent
+                },
+                t0,
+                after
+            ),
+            None
+        );
+        assert_eq!(
+            episode.observe(&silent, t0 + Duration::from_secs(1), after),
+            Some(Some(WakeHold::NoActivity))
+        );
+        assert_eq!(
+            episode.observe(
+                &HoldFacts {
+                    silent: false,
+                    ..silent
+                },
+                t0 + Duration::from_secs(2),
+                after
+            ),
+            Some(None)
+        );
+        assert_eq!(
+            obstacle(&HoldFacts {
+                silent: true,
+                ..held(false)
+            }),
+            (None, HoldClock::Reset),
+            "nothing queued holds nothing"
+        );
     }
 
     fn held(queued: bool) -> HoldFacts {
@@ -1450,6 +1711,8 @@ mod tests {
             unrecognised: true,
             not_taken: true,
             turns: 0,
+            // Issue #2389's row comes first of all; its own test covers it.
+            silent: false,
         };
         assert_eq!(
             obstacle(&HoldFacts {

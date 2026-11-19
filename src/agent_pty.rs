@@ -30013,6 +30013,7 @@ mod spawn_tests {
             schedule: vec![Duration::from_secs(60)],
             arm_grace: Duration::from_millis(1),
             wake_stall_after,
+            ..crate::doorbell::DoorbellConfig::default()
         }
     }
 
@@ -32313,6 +32314,7 @@ mod spawn_tests {
             schedule: vec![Duration::from_secs(60)],
             arm_grace: Duration::from_millis(1),
             wake_stall_after: Duration::from_millis(150),
+            ..crate::doorbell::DoorbellConfig::default()
         };
         let bell = crate::doorbell::spawn(registry.clone(), state.clone(), config);
         let held = |want: Option<WakeHold>| {

@@ -25,6 +25,8 @@ describe("deck attention words", () => {
     expect(deckAttentionText([agent("Captain", true, inbox(1, "paste_open"))])).toBe("✉ held: Captain");
     expect(deckAttentionText(["A", "B", "C", "D"].map((name) => agent(name, false, inbox(1, "cannot_type"))))).toBe("✉ 4 held");
     expect(deckAttentionText([agent("Captain", true, inbox(2))])).toBeUndefined();
+    // Issue #2389: a busy orchestrator that sent nothing for the busy bound is held.
+    expect(deckAttentionText([agent("Captain", true, inbox(1, "no_activity"))])).toBe("✉ held: Captain");
   });
 
   /// Scenario: Two orchestration runs each hold their `coder`: the header names each after its run's name, as their tiles are titled, so the two read apart.
@@ -43,6 +45,7 @@ describe("deck attention words", () => {
   /// Scenario: An agent's attention words are its hold's words while mail waits, the stall's for an unknown hold, the standalone warnings with nothing waiting, and nothing otherwise.
   it("gives each hold the words its card uses", () => {
     expect(inboxAttentionWords(inbox(2, "cannot_type"))).toBe(INBOX_WORDS.wakeHolds.cannot_type);
+    expect(inboxAttentionWords(inbox(1, "no_activity"))).toBe(INBOX_WORDS.wakeHolds.no_activity);
     expect(inboxAttentionWords(inbox(1, "unknown"))).toBe("waiting to wake: send it a prompt");
     expect(inboxAttentionWords(inbox(0, "dialog_during_ring"))).toBe(INBOX_WORDS.wakeHoldsAlone.dialog_during_ring);
     expect(inboxAttentionWords(inbox(0, "possible_draft"))).toBeUndefined();
