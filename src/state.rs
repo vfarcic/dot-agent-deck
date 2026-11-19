@@ -13523,6 +13523,11 @@ impl AppState {
             self.apply_pull_request_report(&event, pull_request);
             return AppliedEvent::Rejected;
         }
+        // PRD #2374: an agent card's doorbell tells clients to re-read the
+        // cards; it is about no session and changes none.
+        if event.event_type == EventType::AgentCard {
+            return AppliedEvent::Rejected;
+        }
         // Issue #697: the daemon evicted an outside agent's card to stay within
         // `MAX_UNPROVEN_SESSIONS`. Like the pane-closed announcement it is a
         // statement about a card, not a conversation ending, and it must not
@@ -15564,6 +15569,8 @@ impl AppState {
             }
             // PRD #1401: returned early at the top of `apply_event_unsettled`.
             EventType::PullRequest => false,
+            // PRD #2374: returned early at the top of `apply_event_unsettled`.
+            EventType::AgentCard => false,
             EventType::SessionEnd => unreachable!(),
         };
         // Issue #714: the reason exists only beside the status it explains.

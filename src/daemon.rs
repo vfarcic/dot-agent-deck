@@ -862,6 +862,13 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     let telemetry = crate::telemetry::start_for_daemon(&event_tx, &pty_registry);
     // PRD #1666 S3: every inbox state change reaches attached clients.
     pty_registry.inbox().set_broadcast(event_tx.clone());
+    // PRD #2374: agent cards ring their doorbells on the same fan-out, and
+    // offer "close, keeping the worktree" for agents with a dispatched one.
+    pty_registry
+        .agent_cards()
+        .install(event_tx.clone(), daemon.worktree_registry.clone());
+    let agent_cards_watcher =
+        crate::agent_cards::spawn_watcher(Arc::clone(&pty_registry), state.clone());
     // PRD #1666 part 2 §2.7: what a card tells the user to run when an
     // agent's hooks run a dot-agent-deck too old for its messages, composed
     // from this deck's own install path.
@@ -1177,6 +1184,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     pull_request_handle.abort();
     scheduler_handle.abort();
     inbox_ticker.abort();
+    agent_cards_watcher.abort();
     offer_assigner.abort();
     doorbell.abort();
     if let Some(publisher) = doorbell_publisher {
@@ -4942,6 +4950,12 @@ fn hook_line_for_log(line: &str) -> String {
 /// withheld. Every producer serializes the key after the event's identifiers
 /// (`serde_json` writes members in sorted order), so what is logged of such a
 /// line is still the part a diagnostic needs.
+///
+/// PRD #2374 (audit F7): an agent card's report is withheld the same two ways
+/// under [`CARD_REPORT_LINE_KEY`] — a `card_publish` the daemon could not
+/// decode (an unknown key, a wrong value shape) must not copy the agent's
+/// summary, questions or prompts into `deck.log`. What is logged of it is
+/// its identifiers and how many bytes were withheld.
 fn redact_hook_token(line: &str) -> std::borrow::Cow<'_, str> {
     if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(line) {
         withhold_turn_replies(&mut value);
@@ -4951,7 +4965,11 @@ fn redact_hook_token(line: &str) -> std::borrow::Cow<'_, str> {
     if line.contains("\\u") {
         return std::borrow::Cow::Borrowed("<withheld: an unparseable line with a \\u escape>");
     }
-    let (head, withheld) = match line.find(crate::turn_reply::TURN_REPLY_LINE_KEY) {
+    let first = [crate::turn_reply::TURN_REPLY_LINE_KEY, CARD_REPORT_LINE_KEY]
+        .into_iter()
+        .filter_map(|key| line.find(key))
+        .min();
+    let (head, withheld) = match first {
         Some(at) => (&line[..at], Some(line.len() - at)),
         None => (line, None),
     };
@@ -4962,10 +4980,14 @@ fn redact_hook_token(line: &str) -> std::borrow::Cow<'_, str> {
     match withheld {
         None => head,
         Some(bytes) => std::borrow::Cow::Owned(format!(
-            "{head}<withheld: a turn reply and the {bytes} bytes from it on>"
+            "{head}<withheld: a turn reply or card report and the {bytes} bytes from it on>"
         )),
     }
 }
+
+/// The member a `card_publish` line carries an agent's card report under
+/// (PRD #2374): withheld from every log line like a turn reply (audit F7).
+const CARD_REPORT_LINE_KEY: &str = "report";
 
 /// [`redact_hook_token`]'s turn-reply half over a parsed line: every
 /// [`crate::turn_reply::TURN_REPLY_LINE_KEY`] member, at any depth, becomes a
@@ -4975,7 +4997,7 @@ fn withhold_turn_replies(value: &mut serde_json::Value) {
         serde_json::Value::Array(items) => items.iter_mut().for_each(withhold_turn_replies),
         serde_json::Value::Object(map) => {
             for (key, item) in map.iter_mut() {
-                if key == crate::turn_reply::TURN_REPLY_LINE_KEY {
+                if key == crate::turn_reply::TURN_REPLY_LINE_KEY || key == CARD_REPORT_LINE_KEY {
                     *item = serde_json::Value::String(format!(
                         "<withheld: {} bytes>",
                         item.to_string().len()
@@ -7526,6 +7548,69 @@ async fn run_hook_loop_with_limits(
                                         .pause_point(crate::task_completion::PAUSE_ACKED)
                                         .await;
                                 }
+                                DaemonMessage::CardPublish(request) => {
+                                    // PRD #2374: held to the agent it names, as
+                                    // a raw event is, and refused without a
+                                    // token whatever the policy: no CLI that
+                                    // predates the token sends this verb.
+                                    let verdict = crate::hook_provenance::classify_event(
+                                        Some(&request.pane_id),
+                                        request.agent_id.as_deref().filter(|a| !a.is_empty()),
+                                        request.token.as_deref(),
+                                        &*pty_registry,
+                                    );
+                                    let reply = match verdict {
+                                        crate::hook_provenance::Provenance::Attested {
+                                            agent_id,
+                                            ..
+                                        } => {
+                                            crate::agent_cards::publish(
+                                                &pty_registry,
+                                                &state,
+                                                &request.pane_id,
+                                                &agent_id,
+                                                request.report,
+                                            )
+                                            .await
+                                        }
+                                        crate::hook_provenance::Provenance::Refused(refusal) => {
+                                            crate::event::CardPublishReply::refused(
+                                                refusal.code(),
+                                                &refusal.caller_message(),
+                                            )
+                                        }
+                                        crate::hook_provenance::Provenance::Unattested => {
+                                            let refusal = if request.token.is_some() {
+                                                crate::hook_provenance::Refusal::UnknownToken
+                                            } else {
+                                                crate::hook_provenance::Refusal::Missing
+                                            };
+                                            crate::event::CardPublishReply::refused(
+                                                refusal.code(),
+                                                "refused: an agent card can be published only \
+                                                 from a pane this deck started, with the hook \
+                                                 capability token it was given.",
+                                            )
+                                        }
+                                    };
+                                    if !reply.accepted {
+                                        warn!(
+                                            verb = "card_publish",
+                                            claimed_pane = %escape_id_for_log(&request.pane_id),
+                                            reason = reply.code.as_deref().unwrap_or_default(),
+                                            "hook socket: refused an agent card"
+                                        );
+                                    }
+                                    if let Ok(json) = serde_json::to_string(&reply) {
+                                        let line = format!("{json}\n");
+                                        if write_hook_reply(&mut write_half, &line, idle_timeout)
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                }
                                 DaemonMessage::HookCapabilities(_) => {
                                     // PRD #1666 part 3 (Q35-14b): the composer
                                     // capability, only to an installed
@@ -7581,6 +7666,8 @@ async fn run_hook_loop_with_limits(
                                         dispatch_launch: Some(
                                             crate::event::DISPATCH_LAUNCH,
                                         ),
+                                        // PRD #2374: agent cards are stored.
+                                        agent_card: Some(crate::event::AGENT_CARD),
                                         ..Default::default()
                                     };
                                     if let Ok(json) = serde_json::to_string(&reply) {
@@ -8190,15 +8277,21 @@ async fn run_hook_loop_with_limits(
                             // PRD #1401: a pull request report is the
                             // daemon's alone — its URL is what a card's badge
                             // opens — so a producer's copy goes no further.
-                            if event.event_type == crate::event::EventType::PullRequest {
+                            // PRD #2374: and so is an agent card's doorbell.
+                            if matches!(
+                                event.event_type,
+                                crate::event::EventType::PullRequest
+                                    | crate::event::EventType::AgentCard
+                            ) {
                                 warn!(
                                     verb = "agent_event",
                                     claimed_pane = %escape_id_for_log(
                                         event.pane_id.as_deref().unwrap_or("<none>")
                                     ),
                                     reason = "daemon_authored_event_type",
-                                    "hook socket: dropped a producer's pull_request event; \
-                                     only the daemon reports an agent's pull request"
+                                    event_type = ?event.event_type,
+                                    "hook socket: dropped a producer's daemon-authored event \
+                                     (pull_request or agent_card); only the daemon sends those"
                                 );
                                 continue;
                             }
@@ -11258,6 +11351,87 @@ mod hook_ingestion_tests {
         );
         assert!(
             raw.contains("reply-log-session") && raw.contains("<withheld"),
+            "the diagnostics still name the line and say what was withheld: {raw}"
+        );
+    }
+
+    /// PRD #2374 (audit F7): a `card_publish` the daemon cannot decode — one
+    /// whose report has an unknown key, and one cut off inside the report —
+    /// reaches the malformed-line warning, which names the line but never
+    /// copies the agent's report text into the log.
+    #[tokio::test]
+    async fn hook_diagnostics_never_log_a_card_report() {
+        use std::sync::Mutex;
+
+        #[derive(Clone, Default)]
+        struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for CapturedLog {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+            type Writer = CapturedLog;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        const SENTINEL: &str = "PRIVATE_CARD_SUMMARY_2374_c41d";
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing_subscriber::filter::LevelFilter::DEBUG)
+            .with_ansi(false)
+            .finish();
+        let subscriber_guard = crate::test_isolation::capture_tracing_on_this_thread(subscriber);
+        let fixture = HookLoopFixture::start();
+
+        let unknown_key = serde_json::json!({
+            "message_type": "card_publish", "pane_id": "card-log-pane",
+            "report": {"summary": format!("{SENTINEL} secret plan"), "bogus": 1},
+            "timestamp": "2026-11-17T12:00:00Z",
+        })
+        .to_string();
+        let cut = unknown_key[..unknown_key.find(SENTINEL).unwrap() + SENTINEL.len()].to_owned();
+
+        let mut stream = UnixStream::connect(&fixture.socket)
+            .await
+            .expect("connect hook socket");
+        for line in [&unknown_key, &cut] {
+            stream
+                .write_all(format!("{line}\n").as_bytes())
+                .await
+                .expect("write hook line");
+        }
+        stream
+            .write_all(format!("{}\n", padded_session_start("card-log-sentinel", 0)).as_bytes())
+            .await
+            .expect("write sentinel");
+        stream.flush().await.unwrap();
+        fixture.wait_for_session("card-log-sentinel").await;
+
+        drop(subscriber_guard);
+        fixture.handle.abort();
+        let _ = fixture.handle.await;
+
+        let raw = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            raw.matches("Malformed event:").count() >= 2,
+            "every diagnostic was reached, or this proves nothing: {raw}"
+        );
+        assert!(
+            !raw.contains(SENTINEL) && !raw.contains("secret plan"),
+            "a card report reached the log: {raw}"
+        );
+        assert!(
+            raw.contains("card-log-pane") && raw.contains("<withheld"),
             "the diagnostics still name the line and say what was withheld: {raw}"
         );
     }

@@ -1213,6 +1213,10 @@ impl RunTracker {
     /// session on the run's pane, when exactly one does. The run's copy names
     /// the pane, which a card state with panes of its own needs to admit it.
     pub fn observe_event(&mut self, event: &AgentEvent, now: u64) {
+        // PRD #2374: an agent card's doorbell is about no run.
+        if event.event_type == EventType::AgentCard {
+            return;
+        }
         self.observe_kept(KeptEvent::of(event), now);
     }
 

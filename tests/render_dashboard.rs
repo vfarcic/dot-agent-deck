@@ -5816,7 +5816,7 @@ fn status_011_live_subscriber_updates_the_rendered_inbox_card() {
             };
             assert!(matches!(
                 request,
-                AttachRequest::SubscribeEvents
+                AttachRequest::SubscribeEvents { .. }
             ));
             write_frame(&mut stream, KIND_RESP, &serde_json::to_vec(&AttachResponse::ok()).unwrap())
                 .await.unwrap();

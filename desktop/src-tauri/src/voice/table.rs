@@ -158,6 +158,16 @@ impl fmt::Display for Screen {
 /// vocabulary rather than names it observed, so they resolve against a fixed
 /// list, and an [`ParamKind::AgentTypeRef`] on a row that is not the New agent
 /// form's resolves against the agent types the deck knows the same way.
+///
+/// PRD #2374 adds four for the agent cards. [`ParamKind::OverviewMode`] and
+/// [`ParamKind::NeedsYouFilter`] are closed sets of the app's own words, like
+/// the dashboard filter's: the dashboard's two views (`table`, `cards`) and
+/// the Needs you filter's two states (`on`, `off`), each held to the
+/// transcript by its names. [`ParamKind::CardAction`] is the label of one of a
+/// card's actions as the user said it, held to the transcript as filter text
+/// is; the webview matches it against that card's actions. [`ParamKind::ReplyText`]
+/// is a reply to a card's agent, held to the transcript as a command is and
+/// taken from the transcript's own slice, so the words sent are the user's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ParamKind {
@@ -172,10 +182,14 @@ pub enum ParamKind {
     CommandText,
     AgentKind,
     AgentStatus,
+    OverviewMode,
+    NeedsYouFilter,
+    CardAction,
+    ReplyText,
 }
 
 impl ParamKind {
-    pub const ALL: [ParamKind; 11] = [
+    pub const ALL: [ParamKind; 15] = [
         ParamKind::AgentRef,
         ParamKind::DeckRef,
         ParamKind::DirRef,
@@ -187,6 +201,10 @@ impl ParamKind {
         ParamKind::CommandText,
         ParamKind::AgentKind,
         ParamKind::AgentStatus,
+        ParamKind::OverviewMode,
+        ParamKind::NeedsYouFilter,
+        ParamKind::CardAction,
+        ParamKind::ReplyText,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -202,6 +220,10 @@ impl ParamKind {
             ParamKind::CommandText => "command_text",
             ParamKind::AgentKind => "agent_kind",
             ParamKind::AgentStatus => "agent_status",
+            ParamKind::OverviewMode => "overview_mode",
+            ParamKind::NeedsYouFilter => "needs_you_filter",
+            ParamKind::CardAction => "card_action",
+            ParamKind::ReplyText => "reply_text",
         }
     }
 
@@ -232,6 +254,14 @@ impl ParamKind {
             // This app's own closed vocabulary (issue #1496), the same on
             // every deck: nothing observed is involved.
             ParamKind::AgentKind | ParamKind::AgentStatus => false,
+            // PRD #2374 — the dashboard's view and the cards' Needs you
+            // filter are this app's own closed vocabulary; a card action's
+            // label and a reply are the user's words, held to the transcript.
+            // The agent the two name is an `agent_ref` of its own.
+            ParamKind::OverviewMode
+            | ParamKind::NeedsYouFilter
+            | ParamKind::CardAction
+            | ParamKind::ReplyText => false,
         }
     }
 }
@@ -1413,7 +1443,20 @@ mod tests {
                     "close_orchestration",
                     "confirmCloseOrchestration",
                     vec!["overview"]
+                ), // PRD #2374: the agent cards, on the dashboard only.
+                ("set_overview_mode", "setOverviewMode", vec!["overview"]),
+                ("show_agent_card", "showAgentCard", vec!["overview"]),
+                ("next_agent_card", "nextAgentCard", vec!["overview"]),
+                ("previous_agent_card", "previousAgentCard", vec!["overview"]),
+                ("next_needs_you_card", "nextNeedsYouCard", vec!["overview"]),
+                (
+                    "filter_needs_you_cards",
+                    "toggleNeedsYouFilter",
+                    vec!["overview"]
                 ),
+                ("close_agent_card", "closeAgentCard", vec!["overview"]),
+                ("run_card_action", "runCardAction", vec!["overview"]),
+                ("reply_to_agent_card", "replyToAgentCard", vec!["overview"]),
             ]
         );
     }
@@ -2350,7 +2393,17 @@ mod tests {
                 // PRD #802 D5's two stops: on the overview, where their
                 // controls are. Each only opens a confirmation.
                 "stop_agent",
-                "close_orchestration"
+                "close_orchestration",
+                // PRD #2374: the agent cards, on the dashboard only.
+                "set_overview_mode",
+                "show_agent_card",
+                "next_agent_card",
+                "previous_agent_card",
+                "next_needs_you_card",
+                "filter_needs_you_cards",
+                "close_agent_card",
+                "run_card_action",
+                "reply_to_agent_card"
             ]
         );
         assert_eq!(

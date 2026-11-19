@@ -228,11 +228,26 @@ os.execvp("cat", ["cat"])
 
     fn report_done(&self, terminal: &AgentRecord) {
         let marker = format!("close-probe-completed-1589-{}", terminal.id);
-        let output = self.cli(
-            Some(terminal),
-            Path::new(terminal.cwd.as_deref().expect("cwd")),
-            &["work-done", "--done", "--task", &marker],
-        );
+        let report = || {
+            self.cli(
+                Some(terminal),
+                Path::new(terminal.cwd.as_deref().expect("cwd")),
+                &["work-done", "--done", "--task", &marker],
+            )
+        };
+        // A unit is ready (its `SessionStart` arrived) before the deck has
+        // necessarily finished recording its dispatch. A report in that window
+        // is answered `report_pending`, changes nothing, and asks for the same
+        // command again, which is what an agent does; so does this setup.
+        let last = std::cell::RefCell::new(None);
+        common::wait_until(WAIT, || {
+            let output = report();
+            let pending = output.status.code() == Some(1)
+                && output_text(&output).contains("[report_pending]");
+            *last.borrow_mut() = Some(output);
+            !pending
+        });
+        let output = last.into_inner().expect("the setup report ran");
         assert_exit("attested work-done --done setup", &output, 0);
         // PRD #1666: the completion is posted to the caller's inbox, not typed
         // into its pane.

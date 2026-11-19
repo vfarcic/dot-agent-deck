@@ -36,6 +36,12 @@ import { sameIncarnation } from "../lib/agentKey";
 import { AGENT_GONE_AFTER_RESTART } from "../lib/agentIdentity";
 import { deckAttentionText } from "../lib/inboxWords";
 import { DeckAttention } from "./DeckAttention";
+import { useAgentCardsView, type AgentCardsView } from "../hooks/useAgentCardsView";
+import type { PlacedCard } from "../lib/agentCards";
+import { OverviewModeSwitch } from "./OverviewModeSwitch";
+import { AgentCardsDeckBody, AgentCardsToolbar } from "./AgentCardsGrid";
+import { AgentCardOverlay } from "./AgentCardOverlay";
+import { OverviewRowCard } from "./OverviewRowMenu";
 
 /**
  * The honest subset of `AgentSession`: every field a daemon genuinely reports
@@ -722,6 +728,8 @@ const StopControlsContext = createContext<OverviewStopControls | undefined>(unde
  * dialog covers the rows.
  */
 const RowNumbersContext = createContext<ReadonlyMap<string, number> | undefined>(undefined);
+/** PRD #2374 — the cards view, while the runtime offers cards: each row's needs-you marker and ⋯ menu read it. */
+const RowCardsContext = createContext<AgentCardsView | undefined>(undefined);
 
 /** Overlap kept between two screens of a spoken scroll, so the row at the edge stays in sight (issue #1492). */
 const DASHBOARD_SCROLL_OVERLAP = 48;
@@ -1069,7 +1077,8 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   const decks = useMemo(() => fleet.map((deck, at): FleetDeck => {
     const deckAgents = deck.agents.map(toOverviewAgent);
     const groups = groupAgents(deckAgents);
-    const shown = filtering ? groupAgents(filterDashboardAgents(deckAgents, filter, overviewFilterFacts)) : groups;
+    const matchingAgents = filtering ? filterDashboardAgents(deckAgents, filter, overviewFilterFacts) : deckAgents;
+    const shown = filtering ? groupAgents(matchingAgents) : groups;
     return {
       key: fleetMemberKey(deck.connection.deckId, at),
       snapshot: deck,
@@ -1082,6 +1091,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
         return matching ? { group: matching, matching: true } : { group, matching: false };
       }),
       shownCount: shown.reduce((total, group) => total + group.agents.length, 0),
+      matchingAgents,
       counts: countByStatus(deckAgents),
       connected: deck.connection.status === "connected",
     };
@@ -1334,6 +1344,9 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
          published only while it is open. */
       ...(newAgent ? {} : { showDashboardCounters }),
       ...(countersOpen ? { closeDashboardCounters: () => setCountersOpen(false) } : {}),
+      /* PRD #2374 — the cards' members, only while the runtime offers cards;
+         `closeAgentCard` only while a card is open. */
+      ...(cards.shown ? cards.voice : {}),
     };
     voiceChannel.current = newAgent
       ? { closeNewAgent: () => newAgentClose.current?.(), ...directoryMoves }
@@ -1398,6 +1411,31 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   const openAgent = useCallback((agent: OverviewAgent) => {
     VOICE_ACTIONS.openAgent.run(voiceContext, { deckId: agent.daemonId, agentId: agent.id, from: "overview", incarnation: agent.incarnation });
   }, [voiceContext]);
+  /*
+    PRD #2374 — the agent cards: the Table |
+    Cards switch, the cards grid, the card overlay and the table's needs-you
+    marker and row menu. A card's `open` action opens the agent exactly as a
+    row does.
+  */
+  const cardDeckList = useMemo(() => decks.map((deck) => ({ deckId: deck.snapshot.connection.deckId, connected: deck.connected })), [decks]);
+  const openCardAgent = useCallback((target: { deckId: string; agentId: string; incarnation?: string }) => {
+    VOICE_ACTIONS.openAgent.run(voiceContext, { ...target, from: "overview" });
+  }, [voiceContext]);
+  /* PRD #2374 — in the Cards view, the cards of a deck whose daemon has them,
+     after the dashboard filter; `undefined` for a deck that keeps its usual
+     body (the Table view, or a daemon with no cards or not answering). */
+  const cardsOnScreen = (deck: (typeof decks)[number]): PlacedCard[] | undefined => {
+    const deckId = deck.snapshot.connection.deckId;
+    if (cards.mode !== "cards" || !deck.connected || deckId === undefined || !cards.decksWithCards.has(deckId)) return undefined;
+    return cards.placed.filter((card) => card.deckId === deckId && (!filtering || cardMatchesFilter(card, deck.matchingAgents)));
+  };
+  const cardsBodyFor = (deck: (typeof decks)[number]): ReactNode | undefined => {
+    const shown = cardsOnScreen(deck);
+    const deckId = deck.snapshot.connection.deckId;
+    if (shown === undefined || deckId === undefined) return undefined;
+    return <AgentCardsDeckBody deckId={deckId} cards={shown} needsYouOnly={cards.needsYouOnly} controls={cards.controls} results={cards.resultsFor} />;
+  };
+  const cards = useAgentCardsView({ runtime, decks: cardDeckList, openAgent: openCardAgent });
   const [confirm, setConfirm] = useState<ConfirmState>();
   /** PRD #1487 M5 — the Upgrade dialog, for the deck whose card it was pressed on. */
   const [upgrade, setUpgrade] = useState<UpgradeTarget>();
@@ -1794,8 +1832,9 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
             </DashboardCounters>
             {newAgentAvailable && <button className="button primary compact" data-testid="overview-new-agent" aria-label="New agent" title="New agent (Ctrl+N / ⌘N)" onClick={() => VOICE_ACTIONS.openNewAgent.run(voiceContext)}><Plus size={14} /><span>New agent</span></button>}
             {openDeck && <button className="button secondary compact" data-testid="overview-open-deck" onClick={openDeck}><SquareTerminal size={14} /><span>Open daemons</span></button>}
+            {cards.shown && <OverviewModeSwitch mode={cards.mode} controls={cards.controls} consumeCards={runtime.consumeAgentCards} />}
             <DashboardFilterControls filter={filter} daemons={filterDaemons} />
-            <OverviewColumnPicker columns={columns} onChange={setColumns} />
+            {cards.mode === "table" && <OverviewColumnPicker columns={columns} onChange={setColumns} />}
             <button className="button secondary compact" data-testid="overview-refresh" onClick={() => void runtime.reconnect()}><RefreshCw size={14} /><span>Refresh</span></button>
           </div>
           <DeckAttention text={deckAttention} />
@@ -1851,6 +1890,11 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
             `.map`, and `DaemonBody` below took a `fleetSize` for its note
             density and nothing else.
           */}
+          {cards.mode === "cards" && <AgentCardsToolbar cards={decks.flatMap((deck) => cardsOnScreen(deck) ?? [])} needsYouOnly={cards.needsYouOnly} controls={cards.controls} />}
+          {/* PRD #2374 — in the Cards view every deck keeps its own section and
+              header, with the daemon's own controls; a deck whose daemon has
+              cards shows them as the section's body, and one with no cards (or
+              that is not answering) keeps its usual body. */}
           {decks.map((deck) => (
             <DeckGroup
               /*
@@ -1862,6 +1906,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
               */
               key={deck.key}
               deck={deck}
+              cardsBody={cardsBodyFor(deck)}
               now={now}
               columns={columns}
               filtering={filtering}
@@ -1896,6 +1941,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
           ))}
         </section>
       </main>
+      {cards.overlay && <AgentCardOverlay {...cards.overlay} controls={cards.controls} />}
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}
       {upgrade && <UpgradeDialog target={upgrade} runtime={runtime} onClose={() => setUpgrade(undefined)} />}
       {localUpgrade && <LocalUpgradeFlow {...localUpgrade} runtime={runtime} onClose={() => { setLocalUpgrade(undefined); selfUpgrade?.onClosed?.(); }} />}
@@ -1928,7 +1974,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       )}
     </div>
   );
-  return <OpenAgentContext.Provider value={openAgent}><StopControlsContext.Provider value={stopControls}><RowNumbersContext.Provider value={rowNumbers}>{overviewScreen}</RowNumbersContext.Provider></StopControlsContext.Provider></OpenAgentContext.Provider>;
+  return <OpenAgentContext.Provider value={openAgent}><StopControlsContext.Provider value={stopControls}><RowNumbersContext.Provider value={rowNumbers}><RowCardsContext.Provider value={cards.shown ? cards : undefined}>{overviewScreen}</RowCardsContext.Provider></RowNumbersContext.Provider></StopControlsContext.Provider></OpenAgentContext.Provider>;
 }
 
 /** One deck of the fleet, as {@link AgentOverview} prepares it for rendering. */
@@ -1942,8 +1988,21 @@ interface FleetDeck {
   sections: OverviewSection[];
   /** How many of {@link agents} the filter shows. */
   shownCount: number;
+  /** The agents the filter shows (all of {@link agents} while none is set): the Cards view shows their cards. */
+  matchingAgents: OverviewAgent[];
   counts: { status: AgentStatus; count: number }[];
   connected: boolean;
+}
+
+/**
+ * Whether the dashboard filter (issue #1496) shows `card`: its agent is one of
+ * the deck's `matching` agents. The filter is applied to the cards as it is to
+ * the table rows, on the same facts; it changes which cards are shown, never
+ * their order or what they say (PRD #2374 review).
+ */
+function cardMatchesFilter(card: PlacedCard, matching: readonly OverviewAgent[]): boolean {
+  return matching.some((agent) => agent.id === card.entry.agent_id
+    && (agent.incarnation === undefined || card.entry.instance_id === "" || card.entry.instance_id === agent.incarnation));
 }
 
 /** One group as the filter leaves it: its matching agents, or a line saying none match. */
@@ -1995,8 +2054,10 @@ function startErrorKey(deckId: string | undefined): string {
   return deckId ?? "";
 }
 
-function DeckGroup({ deck, now, columns, filtering, fleetSize, overrideError, startError, onOpenDeck, onAddDaemon, onReconnect, onStartDaemon, onConnectAnyway, onUpgrade, upgradeLabel, upgradeTitle, onStopDaemon, stopDaemonReason, onReplaceDaemon, onNewAgent, hostOpen, onOpenHost, onCloseHost }: {
+function DeckGroup({ deck, cardsBody, now, columns, filtering, fleetSize, overrideError, startError, onOpenDeck, onAddDaemon, onReconnect, onStartDaemon, onConnectAnyway, onUpgrade, upgradeLabel, upgradeTitle, onStopDaemon, stopDaemonReason, onReplaceDaemon, onNewAgent, hostOpen, onOpenHost, onCloseHost }: {
   deck: FleetDeck;
+  /** PRD #2374 — in the Cards view, this deck's cards, shown in place of its agent table. */
+  cardsBody?: ReactNode;
   now: number;
   columns: OverviewColumnId[];
   /** Whether the dashboard filter is set (issue #1496). */
@@ -2150,7 +2211,7 @@ function DeckGroup({ deck, now, columns, filtering, fleetSize, overrideError, st
       {deck.connected && <HookBinaryNotices notices={connection.hookBinaryNotices} />}
 
       <div className="daemon-group-body">
-        <DaemonBody
+        {cardsBody ?? <DaemonBody
           agents={deck.agents}
           sections={deck.sections}
           filtering={filtering}
@@ -2169,7 +2230,7 @@ function DeckGroup({ deck, now, columns, filtering, fleetSize, overrideError, st
           onReplaceDaemon={onReplaceDaemon}
           onNewAgent={onNewAgent}
           onAddDaemon={onAddDaemon}
-        />
+        />}
       </div>
     </section>
   );
@@ -2918,6 +2979,7 @@ function OverviewRow({ agent, hoistedCwd, now, columns }: { agent: OverviewAgent
                 onClick={() => stopControls.stopAgent(agent)}
               ><CircleStop size={12} /></button>
             )}
+            {rowCard && rowCards && <OverviewRowCard card={rowCard} name={name} rowKey={agentDomKey(agent)} open={rowCards.rowMenu === agentDomKey(agent)} controls={rowCards.controls} />}
           </td>
         );
       case "lastActivityMs":
@@ -3038,6 +3100,9 @@ function OverviewRow({ agent, hoistedCwd, now, columns }: { agent: OverviewAgent
   /* PR #1451 round 3, change 3 — the number this row shows while voice is
      on, first in the row and first in its accessible name. */
   const number = useContext(RowNumbersContext)?.get(agentKey(agent));
+  /* PRD #2374 — this row's card, while the cards are shown. */
+  const rowCards = useContext(RowCardsContext);
+  const rowCard = rowCards?.cardFor(agent.daemonId, agent.id, agent.incarnation);
   const openFromRow = openAgent && ((event: MouseEvent<HTMLTableRowElement>) => {
     if (clickLandedOnRowControl(event) || clickFinishedSelection(event.currentTarget)) return;
     openAgent(agent);

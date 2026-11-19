@@ -72,7 +72,11 @@ fn kind_nouns(kind: ParamKind) -> &'static [&'static str] {
         | ParamKind::FilterText
         | ParamKind::CommandText
         | ParamKind::AgentKind
-        | ParamKind::AgentStatus => &[],
+        | ParamKind::AgentStatus
+        | ParamKind::OverviewMode
+        | ParamKind::NeedsYouFilter
+        | ParamKind::CardAction
+        | ParamKind::ReplyText => &[],
     }
 }
 
@@ -153,9 +157,14 @@ pub fn answer(utterance: &str, offered: &[ResolvedParam], live: &ChoiceLive) -> 
     if (cancels || ordinal.is_some())
         && offered.iter().any(|candidate| {
             spoken_words(&candidate.label) == words
-                || names_of(candidate.kind, &candidate.value, live)
-                    .iter()
-                    .any(|name| spoken_words(name) == words)
+                || names_of(
+                    candidate.kind,
+                    &candidate.value,
+                    candidate.deck_id.as_deref(),
+                    live,
+                )
+                .iter()
+                .any(|name| spoken_words(name) == words)
         })
     {
         return ChoiceAnswer::Refused;
@@ -481,6 +490,31 @@ fn by_name(
                 said(names)
             })
     };
+    // PRD #2374 (PR #2378 review): a tie that spans daemons names each agent
+    // by its deck as well as its id, so it is answered candidate by candidate.
+    if kind == ParamKind::AgentRef && offered.iter().any(|candidate| candidate.deck_id.is_some()) {
+        let said_of = |candidate: &&ResolvedParam| {
+            agents_on(live, candidate.deck_id.as_deref())
+                .iter()
+                .find(|agent| agent.id == candidate.value)
+                .is_some_and(|agent| {
+                    let mut names = spoken_names(agent);
+                    names.push(candidate.label.clone());
+                    said(names)
+                })
+        };
+        return match offered
+            .iter()
+            .filter(said_of)
+            .collect::<Vec<_>>()
+            .as_slice()
+        {
+            [one] => still_live(one, live),
+            [] if names_something(words, kind, offered, live) => ChoiceAnswer::Refused,
+            [] => ChoiceAnswer::NotAnswer,
+            _ => ChoiceAnswer::Refused,
+        };
+    }
     let found = match kind {
         ParamKind::AgentRef => {
             let agents: Vec<DesktopAgent> = live
@@ -559,7 +593,11 @@ fn by_name(
         | ParamKind::FilterText
         | ParamKind::CommandText
         | ParamKind::AgentKind
-        | ParamKind::AgentStatus => Found::None,
+        | ParamKind::AgentStatus
+        | ParamKind::OverviewMode
+        | ParamKind::NeedsYouFilter
+        | ParamKind::CardAction
+        | ParamKind::ReplyText => Found::None,
     };
     match found {
         Found::One(value) => match offered.iter().find(|candidate| candidate.value == value) {
@@ -617,10 +655,14 @@ fn in_an_offered_run(
 /// offered candidate carries as [`ResolvedParam::names`], so the webview's
 /// fallback (`answerChoiceLocally`) reads these names rather than keeping a
 /// second definition of them. Empty when nothing live has that value.
-pub(super) fn names_of(kind: ParamKind, value: &str, live: &ChoiceLive) -> Vec<String> {
+pub(super) fn names_of(
+    kind: ParamKind,
+    value: &str,
+    deck_id: Option<&str>,
+    live: &ChoiceLive,
+) -> Vec<String> {
     let names = match kind {
-        ParamKind::AgentRef => live
-            .agents
+        ParamKind::AgentRef => agents_on(live, deck_id)
             .iter()
             .find(|agent| agent.id == value)
             .map(spoken_names),
@@ -650,7 +692,11 @@ pub(super) fn names_of(kind: ParamKind, value: &str, live: &ChoiceLive) -> Vec<S
         | ParamKind::FilterText
         | ParamKind::CommandText
         | ParamKind::AgentKind
-        | ParamKind::AgentStatus => None,
+        | ParamKind::AgentStatus
+        | ParamKind::OverviewMode
+        | ParamKind::NeedsYouFilter
+        | ParamKind::CardAction
+        | ParamKind::ReplyText => None,
     };
     names.unwrap_or_default()
 }
@@ -712,6 +758,7 @@ fn names_something(
         ParamKind::AgentRef => live
             .agents
             .iter()
+            .chain(live.decks.iter().flat_map(|deck| deck.agents.0.iter()))
             .any(|agent| spoken_names(agent).iter().any(|name| is(name))),
         // A named deck (issue #1426) is still said by its address, which is
         // what its label was before it had a name.
@@ -737,7 +784,28 @@ fn names_something(
         | ParamKind::FilterText
         | ParamKind::CommandText
         | ParamKind::AgentKind
-        | ParamKind::AgentStatus => false,
+        | ParamKind::AgentStatus
+        | ParamKind::OverviewMode
+        | ParamKind::NeedsYouFilter
+        | ParamKind::CardAction
+        | ParamKind::ReplyText => false,
+    }
+}
+
+/// PRD #2374 (PR #2378 review) — the agents of the deck `deck_id` names: the
+/// agents voice was handed when it names none or the deck that
+/// [`VoiceDeck::holds_agents`]; another deck's own ([`VoiceDeck::agents`]),
+/// even when that list is empty or was not read, so a candidate on it is never
+/// matched to the selected deck's agent with the same id; and none for a deck
+/// not in reach at all.
+fn agents_on<'a>(live: &'a ChoiceLive, deck_id: Option<&str>) -> &'a [DesktopAgent] {
+    let Some(id) = deck_id else {
+        return live.agents;
+    };
+    match live.decks.iter().find(|deck| deck.id == id) {
+        Some(deck) if deck.holds_agents => live.agents,
+        Some(deck) => deck.agents.0.as_slice(),
+        None => &[],
     }
 }
 
@@ -747,7 +815,9 @@ fn names_something(
 fn still_live(candidate: &ResolvedParam, live: &ChoiceLive) -> ChoiceAnswer {
     let value = candidate.value.as_str();
     let present = match candidate.kind {
-        ParamKind::AgentRef => live.agents.iter().any(|agent| agent.id == value),
+        ParamKind::AgentRef => agents_on(live, candidate.deck_id.as_deref())
+            .iter()
+            .any(|agent| agent.id == value),
         ParamKind::DeckRef => live.decks.iter().any(|deck| deck.id == value),
         ParamKind::OrchestrationRef => live.agents.iter().any(|agent| {
             agent.id == value && matches!(agent.tab, DesktopTab::Orchestration { .. })
@@ -762,7 +832,11 @@ fn still_live(candidate: &ResolvedParam, live: &ChoiceLive) -> ChoiceAnswer {
         | ParamKind::FilterText
         | ParamKind::CommandText
         | ParamKind::AgentKind
-        | ParamKind::AgentStatus => false,
+        | ParamKind::AgentStatus
+        | ParamKind::OverviewMode
+        | ParamKind::NeedsYouFilter
+        | ParamKind::CardAction
+        | ParamKind::ReplyText => false,
     };
     if present {
         ChoiceAnswer::Selected(candidate.clone())
@@ -784,6 +858,7 @@ mod tests {
             value: id.to_string(),
             label: label.to_string(),
             deck_identity: None,
+            deck_id: None,
             names: Vec::new(),
         }
     }

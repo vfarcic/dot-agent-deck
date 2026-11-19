@@ -284,6 +284,12 @@ fn journal_launch_002_a_dispatch_is_a_child_of_its_dispatchers_work() {
         task.contains("JOURNAL-DISPATCH-TASK"),
         "the saved dispatch task must preserve the text sent through --task: {task:?}"
     );
+    // PRD #2374: the unit's prompt carries the agent-card catalog after the
+    // task; what is saved is the task as the dispatcher gave it, without it.
+    assert!(
+        !task.contains("## Your agent card"),
+        "the saved dispatch task must not carry the card catalog the prompt appends: {task:?}"
+    );
     let relative = task_path.strip_prefix(&worktree).unwrap();
     let ignored = common::fixture_git(&worktree, &daemon.home)
         .arg("check-ignore")
