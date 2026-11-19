@@ -8,7 +8,7 @@ mod inbox;
 mod route;
 
 use inbox::*;
-use serde_json::json;
+use serde_json::{Value, json};
 use spec::spec;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -43,8 +43,32 @@ fn fixture(mode: &str, wrapped: bool) -> (common::DaemonProc, Pane, Pane, String
             "is_start_role":true,"orchestration_id":"route-fixture","orchestration_cwd":daemon.cwd()
         }}),
     );
+    let worker = terminal_worker(
+        &daemon,
+        mode,
+        wrapped,
+        json!({"kind":"orchestration", "name":"route", "role_name":"coder",
+            "role_index":1,"is_start_role":false,"orchestration_id":"route-fixture", "orchestration_cwd":daemon.cwd()}),
+    );
+    let base = daemon.home.join("terminal-worker");
+    status(&daemon, &orch, "session_start", "codex");
+    status(&daemon, &orch, "thinking", "codex");
+    let task = route::delegate(&daemon, &orch, "TERMINATION-WAITING-TASK-4c91", false);
+    state(&daemon, &worker, &task, "queued");
+    assert!(
+        route::messages(&daemon, &orch).is_empty(),
+        "control: no notice before termination"
+    );
+    let guard = Descendant(base.with_extension("descendant"));
+    (daemon, orch, worker, task, guard)
+}
+
+/// A pane whose command is `terminal'command.py` in `mode`: it announces
+/// itself, waits for [`finish`], then ends as `mode` says. `membership` is its
+/// `tab_membership` (`null` for a standalone agent).
+fn terminal_worker(endpoint: &impl Endpoint, mode: &str, wrapped: bool, membership: Value) -> Pane {
     // Exercise shell quoting with an apostrophe in the executable's path too.
-    let script = daemon.home.join("terminal'command.py");
+    let script = endpoint.home().join("terminal'command.py");
     std::fs::write(&script, r#"import os, sys, time, signal, subprocess
 base, mode = sys.argv[1:]
 open(base + '.pid', 'w').write(str(os.getpid()))
@@ -68,35 +92,24 @@ if mode == 'detached':
     open(base + '.descendant', 'w').write(str(child.pid))
 sys.exit(7 if mode == 'nonzero' else 0)
 "#).unwrap();
-    let base = daemon.home.join("terminal-worker");
+    let base = endpoint.home().join("terminal-worker");
     let quote = |path: &std::path::Path| path.to_string_lossy().replace('\'', "'\\''");
     let command = format!(
         "exec python3 '{}' '{}' '{mode}'",
         quote(&script),
         quote(&base)
     );
-    let worker = pane_with(
-        &daemon,
+    pane_with(
+        endpoint,
         "terminal-worker",
         json!({
             "profile":false, "command":common::capability_export_command(&command),
             // Ask the real spawn seam to construct the wrapper, so the deck
             // knows its child is a wrapper and must use its child's report.
             "agent_type": if wrapped { json!("codex") } else { json!(null) },
-            "tab_membership":{"kind":"orchestration", "name":"route", "role_name":"coder",
-                "role_index":1,"is_start_role":false,"orchestration_id":"route-fixture", "orchestration_cwd":daemon.cwd()}
+            "tab_membership": membership,
         }),
-    );
-    status(&daemon, &orch, "session_start", "codex");
-    status(&daemon, &orch, "thinking", "codex");
-    let task = route::delegate(&daemon, &orch, "TERMINATION-WAITING-TASK-4c91", false);
-    state(&daemon, &worker, &task, "queued");
-    assert!(
-        route::messages(&daemon, &orch).is_empty(),
-        "control: no notice before termination"
-    );
-    let guard = Descendant(base.with_extension("descendant"));
-    (daemon, orch, worker, task, guard)
+    )
 }
 
 fn finish(worker: &Pane) {
@@ -117,6 +130,9 @@ fn notice(daemon: &impl Endpoint, orch: &Pane, task: &str) -> String {
 
 fn exited(mode: &str, code: i32, wrapped: bool) {
     let (daemon, orch, worker, task, _descendant) = fixture(mode, wrapped);
+    // Issue #2246: an attached client, subscribed before the pane ends, is
+    // where the worker's card notice has to arrive.
+    let events = daemon.subscribe_events();
     finish(&worker);
     state(&daemon, &worker, &task, "undeliverable");
     if mode == "detached" {
@@ -133,6 +149,30 @@ fn exited(mode: &str, code: i32, wrapped: bool) {
     assert!(
         message.contains(&expected),
         "pane-command exit (wrapped={wrapped}) must say {expected:?}: {message}"
+    );
+    // Issue #2246: the worker's card is told too, in the same words. The
+    // exited generation is still its pane's last, so its card is the one a
+    // client still shows.
+    let card = events.wait_for(
+        |event| {
+            event.pane_id.as_deref() == Some(worker.id.as_str())
+                && event
+                    .metadata
+                    .contains_key(dot_agent_deck::event::DELIVERY_NOTICE_METADATA_KEY)
+        },
+        Duration::from_secs(10),
+    );
+    assert_eq!(
+        card.agent_id.as_deref(),
+        Some(worker.agent.as_str()),
+        "{card:?}"
+    );
+    assert_eq!(
+        card.metadata
+            .get(dot_agent_deck::event::DELIVERY_NOTICE_METADATA_KEY)
+            .map(String::as_str),
+        Some(format!("not delivered: {expected}").as_str()),
+        "the worker's card notice must say how its pane ended: {card:?}"
     );
 }
 
@@ -162,6 +202,44 @@ fn status_032_unwrapped_zero_exit_names_the_pane_command() {
 #[test]
 fn status_032_unwrapped_nonzero_exit_names_the_pane_command() {
     exited("nonzero", 7, false);
+}
+
+/// Scenario: Open the TUI, start a standalone agent whose pane command waits and whose hooks report it thinking, post it a message, then let the command exit with code seven before the agent takes the message. The agent's card stays on the dashboard, turns Error and says `not delivered: the command started in the agent's pane exited (code 7) before taking this message`.
+#[spec("inbox/status/032")]
+#[test]
+fn status_032_attached_tui_card_says_how_the_pane_ended() {
+    let deck = common::TuiDeck::builder()
+        .with_pty_size(160, 45)
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active agents");
+    let worker = terminal_worker(&deck, "nonzero", false, Value::Null);
+    let _descendant = Descendant(deck.home_dir().join("terminal-worker.descendant"));
+    // The agent in the pane reports through its hooks, as a real one does,
+    // so the card is that agent's.
+    status(&deck, &worker, "session_start", "codex");
+    status(&deck, &worker, "thinking", "codex");
+    deck.wait_for_string("Codex");
+    let message = enqueue(&deck, &worker, "TERMINATION-CARD-MESSAGE-2246");
+    state(&deck, &worker, &message, "queued");
+    assert!(
+        !deck.snapshot_grid().contains("not delivered"),
+        "control: no notice before the pane ends\n{}",
+        deck.snapshot_grid()
+    );
+    finish(&worker);
+    state(&deck, &worker, &message, "undeliverable");
+    // The card wraps the notice over up to three rows, so each part is
+    // looked for on its own.
+    for part in [
+        "not delivered: the command started in the agent's",
+        "exited (code 7)",
+    ] {
+        assert!(
+            deck.wait_for_grid_string_within(part, common::load_scaled(Duration::from_secs(10))),
+            "the exited agent's card must say how its pane ended ({part:?})\n{}",
+            deck.snapshot_grid()
+        );
+    }
 }
 
 /// Scenario: A live pane command closes its terminal descriptors without exiting or reporting a child status. Its waiting task becomes undeliverable and the orchestrator is told that the connection ended and whether the agent still runs is unknown.
