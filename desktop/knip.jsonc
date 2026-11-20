@@ -13,5 +13,12 @@
   },
   // The `webkit-warm-up` setup project in playwright.config.ts selects this file
   // by a `testMatch` regex, which knip's Playwright plugin does not resolve.
-  "entry": ["e2e/webkit-warm-up.setup.ts"]
+  "entry": ["e2e/webkit-warm-up.setup.ts"],
+  // `WorktreeClosePreview` is used, by `src/lib/bridge.ts` and `src/types.ts`,
+  // only through inline `import("./worktreeClose").WorktreeClosePreview` type
+  // references, which knip does not follow. It is the one type this file
+  // exports that nothing imports by name, so the ignore covers nothing else.
+  "ignoreIssues": {
+    "src/lib/worktreeClose.ts": ["types"]
+  }
 }
