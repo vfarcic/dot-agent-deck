@@ -36,7 +36,10 @@
 //! it, the journal must say the unit's attempt ended interrupted and that the
 //! unit reported nothing. Elapsed time proves neither. Nothing in the test
 //! signals the held command: dropping the hold closes the FIFO's last writer,
-//! so a `cat` the restart left running reads end-of-file and exits.
+//! so a `cat` the restart left running reads end-of-file and exits, and the
+//! command runs under `timeout` ([`HOLD_BOUND`]), so a `cat` that reaches the
+//! FIFO's open only after that close exits by itself too. The FIFO's path and
+//! the hold's directory reach the agent's shell as single-quoted words.
 //!
 //! Cost: one short Haiku turn (one Bash command). Lane 2: it reaches a real
 //! agent, so it runs on a developer's machine and never in CI.
@@ -77,6 +80,13 @@ const SENTINEL: &str = "interrupted-live-sentinel-7c41.txt";
 /// The file name of the FIFO the agent's command reads last, in a directory
 /// of this run's own test root; its absolute path is what identifies it.
 const HOLD: &str = "interrupted-live-hold-7c41.fifo";
+
+/// How long the held command may run at most, whatever happens to the hold:
+/// comfortably past this test's own 900 s lifetime cap, so it never ends the
+/// command while the test needs it, and finite, so a reader that reaches the
+/// FIFO's open only after the hold's release still exits by itself
+/// (`support/fifo_hold.rs`).
+const HOLD_BOUND: Duration = Duration::from_secs(1200);
 
 /// Every process now running, as `(pid, parent pid, argv)` from `ps`, which
 /// macOS and Linux both have. `argv` is split on spaces, which is enough to
@@ -305,18 +315,20 @@ fn interrupted_028_a_real_agents_unit_is_listed_and_reclaimed_after_a_restart() 
     // is still in it, and has not reported, when the restart stops it: the
     // work is interrupted, not done. The command is on a line of its own, so
     // no word of the prose after it can be read as one of its arguments.
-    let hold_path = hold.path().display();
+    let held_command = hold.command(HOLD_BOUND);
     let task = format!(
         "Use the Bash tool to run exactly this one command now, in the foreground, as one \
          command, and wait for it:\n\n\
-         `mkdir -p .dot-agent-deck && echo done > .dot-agent-deck/{SENTINEL} && cat {hold_path}`\n\n\
+         `mkdir -p .dot-agent-deck && echo done > .dot-agent-deck/{SENTINEL} && {held_command}`\n\n\
          Do not run any other command, do not create or change any other file, and do not \
          commit."
     );
-    // The deck delivers the task: no first prompt on the command line.
+    // The deck delivers the task: no first prompt on the command line. The
+    // deck runs this line with a shell, so the directory goes as one quoted
+    // word, whatever the test root's spelling.
     let agent_command = format!(
         "claude --ax-screen-reader --model {HAIKU_MODEL} --add-dir {} --allowedTools Bash Read Write",
-        hold_dir.display()
+        hold::shell_quote(hold_dir.to_str().expect("the hold's directory is UTF-8"))
     );
     route::cli(
         &live,
