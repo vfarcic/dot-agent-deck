@@ -9653,7 +9653,7 @@ fn handle_restart_notice_key(key: KeyEvent, ui: &mut UiState, kb: &KeybindingCon
         _ if kb.matches(KbAction::DismissRestartNotice, &key) => Action::DismissRestartNotice,
         // PRD #1790 stage 2: the list's line leading to the interrupted work.
         _ if kb.matches(KbAction::InterruptedWork, &key)
-            && interrupted_work_view::listed_count(ui).is_some() =>
+            && interrupted_work_view::may_have_interrupted(ui) =>
         {
             Action::OpenInterruptedWork
         }
@@ -23434,9 +23434,16 @@ fn render_restart_notice_overlay(
     // The opening words and a blank row, the rows, then a blank row, the
     // button row and the hint: plus the border. Counted in `usize` and clamped
     // before narrowing.
-    // PRD #1790 stage 2: a row more for the line leading to the interrupted
-    // work, when there is any.
-    let hint_rows = usize::from(interrupted_hint.is_some());
+    // PRD #1790 stage 2: rows more for the line leading to the interrupted
+    // work, when there is any, wrapped to the popup (an incomplete list's
+    // sentence is longer than a count's).
+    let hint_lines: Vec<String> = interrupted_hint
+        .as_deref()
+        .map(|hint| {
+            crate::upgrade_dialog::wrap(hint, usize::from(popup_width.saturating_sub(2 + 2)))
+        })
+        .unwrap_or_default();
+    let hint_rows = hint_lines.len();
     let popup_height = rows
         .len()
         .saturating_add(opening.len() + 1 + 3 + 2 + hint_rows)
@@ -23516,9 +23523,11 @@ fn render_restart_notice_overlay(
             text_primary(),
         ),
     ];
-    if let Some(hint) = interrupted_hint {
-        footer_lines.push(Line::styled(hint, Style::default().fg(Color::Yellow)));
-    }
+    footer_lines.extend(
+        hint_lines
+            .into_iter()
+            .map(|row| Line::styled(format!("  {row}"), Style::default().fg(Color::Yellow))),
+    );
     frame.render_widget(Paragraph::new(footer_lines), footer_area);
     let buttons = [
         Button::new(

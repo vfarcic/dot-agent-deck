@@ -37,8 +37,8 @@ use std::time::Duration;
 use super::*;
 use crate::daemon_client::{ClientError, DaemonClient, GatedQuery, Incarnation};
 use crate::interrupted_work::{
-    self as words, DismissOutcome, InterruptedItem, InterruptedList, InterruptedShow, ItemKind,
-    ReclaimOutcome, ReclaimVerdict,
+    self as words, DismissOutcome, GitFacts, InterruptedItem, InterruptedList, InterruptedShow,
+    ItemKind, ReclaimOutcome, ReclaimVerdict,
 };
 
 /// The bound on a list request. A list opened from the overlay asks for the
@@ -782,6 +782,18 @@ pub(super) fn footer_sentence(ui: &UiState) -> Option<String> {
         .then(|| words::INTERRUPTED_UNREAD.to_string())
 }
 
+/// Whether the daemon listed interrupted work or, its list being
+/// incomplete, may hold some it could not read: what offers the footer row
+/// and the restart notice's line.
+pub(super) fn may_have_interrupted(ui: &UiState) -> bool {
+    listed_count(ui).is_some()
+        || ui
+            .interrupted
+            .list
+            .as_ref()
+            .is_some_and(|list| list.incomplete)
+}
+
 /// How many items the daemon listed, when it listed any.
 pub(super) fn listed_count(ui: &UiState) -> Option<usize> {
     let list = ui.interrupted.list.as_ref()?;
@@ -1184,14 +1196,17 @@ pub(super) fn render_footer(
 }
 
 /// The restart notice list's line leading to the interrupted work list, when
-/// there is any.
+/// there is any, or when an incomplete list may hold some (PR #2431 review).
 pub(super) fn restart_notice_hint(ui: &UiState) -> Option<String> {
-    let count = listed_count(ui)?;
-    Some(format!(
-        "  {} · {} to show them",
-        words::interrupted_footer(count),
-        display_notation(&ui.keybindings, KbAction::InterruptedWork),
-    ))
+    let key = display_notation(&ui.keybindings, KbAction::InterruptedWork);
+    if let Some(count) = listed_count(ui) {
+        return Some(format!(
+            "{} · {key} to show them",
+            words::interrupted_footer(count)
+        ));
+    }
+    may_have_interrupted(ui)
+        .then(|| format!("{} · {key} to show the list", words::INTERRUPTED_UNREAD))
 }
 
 // ---------------------------------------------------------------------------
@@ -1330,6 +1345,7 @@ fn list_body(iw: &InterruptedWork, width: usize) -> (Vec<Line<'static>>, Option<
 /// The details view's body.
 fn details_body(
     item: &InterruptedItem,
+    git: Option<&GitFacts>,
     show: Option<&InterruptedShow>,
     asked: bool,
     width: usize,
@@ -1372,7 +1388,7 @@ fn details_body(
         words::LABEL_PROGRESS,
         clean(&words::progress_line(&item.progress)),
     );
-    if let Some(git) = &item.git {
+    if let Some(git) = git {
         fact(words::LABEL_GIT, words::git_facts_line(git));
     }
     for report in &item.reports {
@@ -1647,8 +1663,13 @@ pub(super) fn render_overlay(
             id, show, asked, ..
         } => {
             let item = show.as_ref().map(|s| &s.item).or_else(|| iw.item(id));
+            // A show answers its item without Git facts: the list's are
+            // kept (PR #2431 review), whichever of the two arrived last.
+            let git = item
+                .and_then(|item| item.git.as_ref())
+                .or_else(|| iw.item(id).and_then(|listed| listed.git.as_ref()));
             let body = item
-                .map(|item| details_body(item, show.as_deref(), *asked, width))
+                .map(|item| details_body(item, git, show.as_deref(), *asked, width))
                 .unwrap_or_default();
             (body, None, Vec::new())
         }

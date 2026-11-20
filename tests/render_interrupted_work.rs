@@ -17,14 +17,14 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use dot_agent_deck::interrupted_work::{
-    DISMISSED, DismissOutcome, DismissStopReason, DismissStopped, DismissedItem,
+    DISMISSED, DismissOutcome, DismissStopReason, DismissStopped, DismissedItem, GitFacts,
     INTERRUPTED_UNREAD, INTERRUPTED_WORK_TITLE, InterruptedItem, InterruptedList, InterruptedShow,
-    ItemKind, ItemReport, LABEL_BRANCH, LABEL_FOLDER, LABEL_LAST_ENTRY, LABEL_PROGRESS,
+    ItemKind, ItemReport, LABEL_BRANCH, LABEL_FOLDER, LABEL_GIT, LABEL_LAST_ENTRY, LABEL_PROGRESS,
     LABEL_REPORT, LABEL_STARTED_BY, LABEL_WORKTREE, LIST_INCOMPLETE, LastEntry, OTHER_AGENTS_GROUP,
-    Progress, RECLAIM_EXPLANATION, RECLAIM_REMOVED, RECLAIM_WOULD_REMOVE, ReclaimOutcome,
+    PrFact, Progress, RECLAIM_EXPLANATION, RECLAIM_REMOVED, RECLAIM_WOULD_REMOVE, ReclaimOutcome,
     ReclaimVerdict, Refusal, RefusalReason, ShownReport, UNSUPPORTED, dismiss_all_question,
-    dismiss_stopped_sentence, interrupted_footer, kept_until, kind_label, progress_line,
-    refusal_sentence, unpushed_sentence,
+    dismiss_stopped_sentence, git_facts_line, interrupted_footer, kept_until, kind_label,
+    progress_line, refusal_sentence, unpushed_sentence,
 };
 use dot_agent_deck::keybindings::KeybindingConfig;
 use dot_agent_deck::ui::{
@@ -1997,5 +1997,86 @@ fn interrupted_033_an_incomplete_empty_list_still_offers_the_footer_row() {
         !complete[0].contains(INTERRUPTED_UNREAD) && !complete[0].contains("[Show I]"),
         "a complete empty list, no row:\n{}",
         complete[0]
+    );
+}
+
+/// Scenario: The list was read with each item's Git facts, and the unit's
+/// details show its "Git:" line. Pressing `Enter` in the details asks for its
+/// kept reports; the daemon's answer carries the item without Git facts. The
+/// details, now showing the report's text, still show the same "Git:" line.
+#[spec("journal/interrupted/034")]
+#[test]
+fn interrupted_034_opening_the_reports_keeps_the_items_git_facts() {
+    let mut listed = unit();
+    listed.git = Some(GitFacts {
+        worktree_exists: Some(true),
+        dirty: Some(true),
+        unpushed_commits: Some(2),
+        branch_exists: Some(true),
+        pr: PrFact::Open,
+    });
+    let git_line = format!(
+        "{LABEL_GIT}: {}",
+        git_facts_line(listed.git.as_ref().unwrap())
+    );
+    let mut answer = page(1, 1, 1, Some(1));
+    answer.item.git = None;
+    let shown = frames(
+        &only(listed),
+        &[
+            ch('I'),
+            key(KeyCode::Enter),
+            key(KeyCode::Enter),
+            InterruptedSeamStep::Shown(answer),
+        ],
+    );
+    let details = popup_text(&shown[2]);
+    assert!(details.contains(&squeezed(&git_line)), "{}", shown[2]);
+    let reports = &shown[4];
+    assert!(
+        reports.contains("BODY OF r-1"),
+        "the report is shown:\n{reports}"
+    );
+    assert!(
+        popup_text(reports).contains(&squeezed(&git_line)),
+        "the report page keeps the list's Git facts:\n{reports}"
+    );
+}
+
+/// Scenario: A deck restart stopped two agents and the interrupted work list
+/// came back empty but incomplete. The restart notice still adds its line
+/// leading to the list, saying some interrupted work may not be listed, and
+/// pressing `I` there opens "Interrupted work", which says the list is
+/// incomplete.
+#[spec("journal/interrupted/035")]
+#[test]
+fn interrupted_035_the_restart_notice_leads_to_an_incomplete_empty_list() {
+    let unread = InterruptedList {
+        items: Vec::new(),
+        incomplete: true,
+        omitted: 0,
+    };
+    let shown: Vec<String> = render_interrupted_work_to_buffers(
+        &unread,
+        &["coder", "reviewer"],
+        UiMode::RestartNotice,
+        &[ch('I')],
+        WIDTH,
+        HEIGHT,
+    )
+    .iter()
+    .map(text)
+    .collect();
+    let notice = &shown[0];
+    at(notice, "The deck restarted; these agents were stopped:");
+    assert!(
+        popup_text(notice).contains(&squeezed(INTERRUPTED_UNREAD)),
+        "the notice's line says some work may not be listed:\n{notice}"
+    );
+    assert!(
+        shown[1].contains(INTERRUPTED_WORK_TITLE)
+            && popup_text(&shown[1]).contains(&squeezed(LIST_INCOMPLETE)),
+        "`I` opens the interrupted work list:\n{}",
+        shown[1]
     );
 }
