@@ -874,6 +874,10 @@ impl LastCommandReader {
 /// reads one project config through its bounded reader for either.
 const TRUST_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// PRD #82: how long the render thread waits for the daemon to name the
+/// context file it re-arms a coordinator from ([`PaneController::daemon_rearm_file`]).
+const DAEMON_REARM_FILE_TIMEOUT: Duration = Duration::from_secs(2);
+
 pub type HostMetricsAnswer = Result<crate::daemon_client::HostMetricsReport, String>;
 
 /// PRD #1258 M3 — fetches the attached daemon's host sample for the TUI's host
@@ -5615,10 +5619,29 @@ impl PaneController for EmbeddedPaneController {
         })
     }
 
-    fn daemon_rearms_orchestrator(&self, pane_id: &str) -> bool {
-        self.held_client(&BoundPane::held_by_controller(pane_id))
+    fn daemon_rearm_file(&self, pane_id: &str) -> Option<std::path::PathBuf> {
+        let client = self.held_client(&BoundPane::held_by_controller(pane_id));
+        if !client
             .cached_capabilities()
             .is_some_and(|caps| caps.supports(crate::daemon_protocol::CAP_REARM_ORCHESTRATOR))
+        {
+            return None;
+        }
+        // The render thread waits on this, once per compaction or `/clear`,
+        // so the wait is short: a daemon that does not answer in time is
+        // treated as not re-arming, and the TUI re-arms instead.
+        let records = self
+            .runtime
+            .block_on(async move {
+                tokio::time::timeout(DAEMON_REARM_FILE_TIMEOUT, client.list_agents()).await
+            })
+            .ok()?
+            .ok()?;
+        records
+            .into_iter()
+            .find(|record| record.pane_id_env.as_deref() == Some(pane_id))
+            .and_then(|record| record.orchestrator_context_path)
+            .map(std::path::PathBuf::from)
     }
 
     fn report_orchestrator_context(&self, pane_id: &str, context_path: &std::path::Path) {

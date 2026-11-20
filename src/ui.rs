@@ -13595,21 +13595,22 @@ fn rearm_trust_gate(
 }
 
 /// PRD #82: whether the daemon, not this TUI, re-arms the coordinator on
-/// `start_pane_id`: the daemon records the tab's context file, advertises that
-/// it re-arms, and that file is still there for it to republish. The daemon
-/// re-arms only from the recorded file, since it holds no approved config to
-/// publish from, so when retention or a person has removed the file this TUI
-/// re-arms instead, from its trust-checked config, as it did before the daemon
-/// could.
+/// `start_pane_id`: the tab's file is one the daemon records, and the file the
+/// daemon records for it now (a newer one after each of its re-arms) is there
+/// for it to republish. The daemon re-arms only from that file, since it holds
+/// no approved config to publish from, so when retention or a person has
+/// removed it this TUI re-arms instead, from its trust-checked config, as it
+/// did before the daemon could. Asks the daemon, so callers ask once per
+/// compaction or `/clear`.
 fn daemon_owns_orchestrator_rearm(
     recorded_by_daemon: bool,
     pane: &dyn PaneController,
     start_pane_id: &str,
-    context_path: Option<&std::path::Path>,
 ) -> bool {
     recorded_by_daemon
-        && pane.daemon_rearms_orchestrator(start_pane_id)
-        && context_path.is_some_and(std::path::Path::is_file)
+        && pane
+            .daemon_rearm_file(start_pane_id)
+            .is_some_and(|file| file.is_file())
 }
 
 /// Issue #1395: a compaction or `/clear` re-arm that could not read the tab's
@@ -16000,17 +16001,6 @@ pub fn run_tui(
                 }
                 let is_compacting = compacting_now || unseen_event.is_some();
                 if is_compacting {
-                    // PRD #82: the daemon re-arms an orchestration whose
-                    // context file it records, attached client or not;
-                    // re-arming it here as well would send the coordinator
-                    // its role twice. The edge is still tracked below, so
-                    // nothing fires late if this changes.
-                    let daemon_rearms = daemon_owns_orchestrator_rearm(
-                        *context_recorded_by_daemon,
-                        &*pane,
-                        &start_pane_id,
-                        context_path.as_deref(),
-                    );
                     // Eligibility no longer requires
                     // `orchestration_prompted.contains(id)`. That condition
                     // is true only after THIS loop's own delivery path has
@@ -16038,8 +16028,17 @@ pub fn run_tui(
                         .unwrap_or(false);
 
                     if !ui.orchestration_remit_compacting.contains(id)
-                        && !daemon_rearms
                         && no_delivery_pending
+                        // PRD #82: the daemon re-arms an orchestration whose
+                        // context file it records, attached client or not;
+                        // re-arming it here as well would send the
+                        // coordinator its role twice. Asked only on the
+                        // compaction's edge, after the cheap checks.
+                        && !daemon_owns_orchestrator_rearm(
+                            *context_recorded_by_daemon,
+                            &*pane,
+                            &start_pane_id,
+                        )
                         && !ui.orchestration_remit_abandoned.contains(id)
                         && !start_role_is_pi
                         // Re-run the spawn-time write-then-point pair
@@ -16177,22 +16176,6 @@ pub fn run_tui(
                         .map(|r| AgentType::from_command(Some(&r.command)) == Some(AgentType::Pi))
                         .unwrap_or(false);
 
-                    // Permanently excluded tabs are marked SEEN regardless of
-                    // outcome this frame — neither condition can ever
-                    // change, so there is nothing to gain by re-evaluating
-                    // them on every subsequent frame this same event
-                    // remains the latest one.
-                    // PRD #82: as in the compaction loop above.
-                    let daemon_rearms = daemon_owns_orchestrator_rearm(
-                        *context_recorded_by_daemon,
-                        &*pane,
-                        &start_pane_id,
-                        context_path.as_deref(),
-                    );
-                    let permanently_excluded = ui.orchestration_remit_abandoned.contains(id)
-                        || start_role_is_pi
-                        || daemon_rearms;
-
                     // A persistently failing `prepare_orchestrator_prompt`
                     // (deleted/unmounted cwd, read-only fs, disk full) must
                     // not be retried every frame at the render loop's ~62 Hz
@@ -16207,6 +16190,24 @@ pub fn run_tui(
                                     >= CLEAR_REASSERT_RETRY_FLOOR
                             });
 
+                    // Permanently excluded tabs are marked SEEN regardless of
+                    // outcome this frame — neither condition can ever
+                    // change, so there is nothing to gain by re-evaluating
+                    // them on every subsequent frame this same event
+                    // remains the latest one.
+                    // PRD #82: as in the compaction loop above. Asked only
+                    // once nothing else holds this `/clear` back, so a frame
+                    // waiting on a pending prompt or the retry floor does
+                    // not ask again.
+                    let permanently_excluded = ui.orchestration_remit_abandoned.contains(id)
+                        || start_role_is_pi
+                        || (no_delivery_pending
+                            && retry_floor_ok
+                            && daemon_owns_orchestrator_rearm(
+                                *context_recorded_by_daemon,
+                                &*pane,
+                                &start_pane_id,
+                            ));
                     if no_delivery_pending
                         && !permanently_excluded
                         && retry_floor_ok
@@ -41342,12 +41343,13 @@ mod tests {
     }
 
     /// Scenario: the daemon records an orchestration's role file and says it
-    /// re-arms coordinators. The TUI leaves the re-arm to it while that file
-    /// exists, and takes it back once the file is gone (removed by retention or
-    /// by hand), since the daemon re-arms only from that file (PRD #82).
+    /// re-arms coordinators. The TUI leaves the re-arm to it while the file the
+    /// daemon records NOW exists, whatever older file the tab still names, and
+    /// takes it back once that file is gone (removed by retention or by hand),
+    /// since the daemon re-arms only from it (PRD #82).
     #[test]
     fn the_tui_rearms_when_the_daemons_role_file_is_gone() {
-        struct RearmingDaemon;
+        struct RearmingDaemon(Option<std::path::PathBuf>);
         impl PaneController for RearmingDaemon {
             fn create_pane(&self, _: Option<&str>, _: Option<&str>) -> Result<String, PaneError> {
                 Ok(String::new())
@@ -41388,37 +41390,27 @@ mod tests {
             fn as_any(&self) -> &dyn std::any::Any {
                 self
             }
-            fn daemon_rearms_orchestrator(&self, _: &str) -> bool {
-                true
+            fn daemon_rearm_file(&self, _: &str) -> Option<std::path::PathBuf> {
+                self.0.clone()
             }
         }
         let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("orchestrator-context-0.md");
+        let file = dir.path().join("orchestrator-context-1.md");
         std::fs::write(&file, "role").unwrap();
-        let pane = RearmingDaemon;
+        let pane = RearmingDaemon(Some(file.clone()));
 
-        assert!(daemon_owns_orchestrator_rearm(
-            true,
-            &pane,
-            "1",
-            Some(&file)
-        ));
-        // A tab whose file the daemon does not record stays the TUI's.
+        assert!(daemon_owns_orchestrator_rearm(true, &pane, "1"));
+        // A tab whose file the daemon does not record stays the TUI's, and so
+        // does one whose daemon names no file for it.
+        assert!(!daemon_owns_orchestrator_rearm(false, &pane, "1"));
         assert!(!daemon_owns_orchestrator_rearm(
-            false,
-            &pane,
-            "1",
-            Some(&file)
+            true,
+            &RearmingDaemon(None),
+            "1"
         ));
-        assert!(!daemon_owns_orchestrator_rearm(true, &pane, "1", None));
 
         std::fs::remove_file(&file).unwrap();
-        assert!(!daemon_owns_orchestrator_rearm(
-            true,
-            &pane,
-            "1",
-            Some(&file)
-        ));
+        assert!(!daemon_owns_orchestrator_rearm(true, &pane, "1"));
     }
 
     /// Scenario: OpenCode 1.x reports a session busy within milliseconds of

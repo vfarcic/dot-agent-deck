@@ -579,16 +579,17 @@ pub trait PaneController: Send + Sync {
     /// with no daemon behind them. The daemon-backed `EmbeddedPaneController`
     /// overrides it to send the report on its runtime.
     fn report_orchestrator_context(&self, _pane_id: &str, _context_path: &std::path::Path) {}
-    /// PRD #82: whether the daemon running the agent in `pane_id` re-arms an
-    /// orchestration's coordinator itself after a compaction or `/clear`, for
-    /// every orchestration it records a context file for
-    /// ([`crate::daemon_protocol::CAP_REARM_ORCHESTRATOR`]). The TUI leaves
-    /// those re-arms to it. Answered from capabilities already captured, never
-    /// by asking: a caller is on the render thread. `false` until they are,
-    /// and by default, so a controller with no daemon behind it, or an older
-    /// daemon, keeps the TUI's own re-arm.
-    fn daemon_rearms_orchestrator(&self, _pane_id: &str) -> bool {
-        false
+    /// PRD #82: the context file the daemon running the agent in `pane_id`
+    /// would re-arm that coordinator from after a compaction or `/clear`: the
+    /// one it records for the orchestration now, which moves to a new file on
+    /// each re-arm. `Some` only when that daemon re-arms coordinators itself
+    /// ([`crate::daemon_protocol::CAP_REARM_ORCHESTRATOR`]) and records a file
+    /// for this one; the TUI leaves the re-arm to it while that file is there.
+    /// Asked of the daemon, so a caller asks once per compaction or `/clear`,
+    /// not per frame. `None` by default, so a controller with no daemon
+    /// behind it, or an older daemon, keeps the TUI's own re-arm.
+    fn daemon_rearm_file(&self, _pane_id: &str) -> Option<std::path::PathBuf> {
+        None
     }
     /// PRD #1666 S5: post a deck-generated message — a seed, an orchestrator's
     /// role context, the configuration request — to `pane`'s inbox, bound to
