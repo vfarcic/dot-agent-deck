@@ -1142,7 +1142,7 @@ fn reclaim_keeps_the_tree_without_blocking_when_its_marker_becomes_a_fifo_before
         .await;
         let Ok(outcome) = bounded else {
             // Give the stuck open its writer, so the runtime can shut down.
-            let _ = std::fs::OpenOptions::new().write(true).open(&marker);
+            crate::worktree_owner::tests_support::release_fifo_reader(&marker);
             panic!("the reclaim blocked on a FIFO at the marker path");
         };
         assert_eq!(outcome.verdict, ReclaimVerdict::KeptChanged, "{outcome:?}");

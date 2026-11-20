@@ -1720,7 +1720,10 @@ pub struct DaemonClient {
     /// end state the deck holds for an agent: [`Self::post_message`],
     /// [`Self::inbox_action`], [`Self::answer_question_while`],
     /// [`Self::stop_agent`], [`Self::set_agent_label`],
-    /// [`Self::seed_last_command`] and [`Self::record_orchestrator_context`].
+    /// [`Self::seed_last_command`] and [`Self::record_orchestrator_context`];
+    /// and the interrupted-work verbs ([`Self::list_interrupted_work`] and
+    /// its siblings), which also need the daemon to advertise
+    /// [`crate::daemon_protocol::CAP_INTERRUPTED_WORK`].
     /// The gate answers "is this daemon compatible?", not "is this the daemon
     /// the agent id came from?": an agent id is a per-daemon counter, so a
     /// compatible replacement reuses it. A caller acting on an id it learned
@@ -3793,36 +3796,55 @@ impl DaemonClient {
         request: &AttachRequest,
         pinned_instance: Option<&str>,
     ) -> Result<InterruptedAnswer, ClientError> {
-        let (mut rd, mut wr) = self.connect().await?;
-        let hello = issue_command(
-            &mut rd,
-            &mut wr,
-            &AttachRequest::Hello {
-                client_version: crate::daemon_protocol::PROTOCOL_VERSION,
-                client_build_version: None,
-                follow_on: true,
-            },
-        )
-        .await?;
-        if !hello.ok {
-            return Ok(InterruptedAnswer::Unsupported);
-        }
-        let capabilities = DaemonCapabilities::from_hello(&hello);
+        // PR #2431 round 4 (Qodo): on a gated handle (the TUI's, the
+        // desktop's) the `Hello` this request follows is the gate's own, so a
+        // daemon on another protocol, one the handle's admission refuses, or
+        // a process other than the one it is bound to is sent nothing. An
+        // ungated handle (the one-shot CLI's) keeps its policy and checks
+        // only the capability.
+        let (mut rd, mut wr, capabilities, instance) = if self.protocol_gate || self.bound.is_some()
+        {
+            let (rd, wr, capabilities, incarnation) = self.protocol_hello(true).await?;
+            (
+                rd,
+                wr,
+                capabilities,
+                incarnation.as_deref().map(str::to_string),
+            )
+        } else {
+            let (mut rd, mut wr) = self.connect().await?;
+            let hello = issue_command(
+                &mut rd,
+                &mut wr,
+                &AttachRequest::Hello {
+                    client_version: crate::daemon_protocol::PROTOCOL_VERSION,
+                    client_build_version: None,
+                    follow_on: true,
+                },
+            )
+            .await?;
+            if !hello.ok {
+                return Ok(InterruptedAnswer::Unsupported);
+            }
+            (
+                rd,
+                wr,
+                DaemonCapabilities::from_hello(&hello),
+                hello.instance_id,
+            )
+        };
         if !capabilities.supports(crate::daemon_protocol::CAP_INTERRUPTED_WORK)
             || !capabilities.supports(crate::daemon_protocol::CAP_HELLO_FOLLOW_ON)
         {
             return Ok(InterruptedAnswer::Unsupported);
         }
         if let Some(pinned) = pinned_instance
-            && hello.instance_id.as_deref() != Some(pinned)
+            && instance.as_deref() != Some(pinned)
         {
             return Ok(InterruptedAnswer::OtherInstance);
         }
         let response = Box::new(issue_command(&mut rd, &mut wr, request).await?);
-        Ok(InterruptedAnswer::Answered {
-            response,
-            instance: hello.instance_id,
-        })
+        Ok(InterruptedAnswer::Answered { response, instance })
     }
 
     /// PRD #1790 stage 2 (verification finding A): [`Self::list_interrupted_work`],
@@ -10602,6 +10624,44 @@ mod protocol_gate_tests {
                 client.subscribe_turn_replies("7").await.map(drop),
             ),
             ("list-inbox", client.list_inbox(None).await.map(drop)),
+            // PR #2431 round 4 (Qodo): the interrupted-work verbs, which
+            // open their own `Hello`, go through the gate too.
+            (
+                "list-interrupted",
+                client.list_interrupted_work(false, None).await.map(drop),
+            ),
+            (
+                "list-interrupted-pinned",
+                client
+                    .list_interrupted_work_pinned(false, None)
+                    .await
+                    .map(drop),
+            ),
+            (
+                "show-interrupted",
+                client.show_interrupted("w-1", None, None).await.map(drop),
+            ),
+            (
+                "reclaim-interrupted",
+                client
+                    .reclaim_interrupted("w-1", false, None, None)
+                    .await
+                    .map(drop),
+            ),
+            (
+                "dismiss-interrupted",
+                client
+                    .dismiss_interrupted(vec!["w-1".into()], false, None, None)
+                    .await
+                    .map(drop),
+            ),
+            (
+                "dismiss-interrupted-pinned",
+                client
+                    .dismiss_interrupted_pinned(vec!["w-1".into()], false, None, None)
+                    .await
+                    .map(drop),
+            ),
         ]
     }
 
@@ -10645,6 +10705,10 @@ mod protocol_gate_tests {
             "subscribe-events-with-snapshot",
             "subscribe-turn-replies",
             "list-inbox",
+            "list-interrupted-work",
+            "show-interrupted",
+            "reclaim-interrupted",
+            "dismiss-interrupted",
         ] {
             assert!(
                 reached.iter().any(|r| r == op),

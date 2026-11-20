@@ -1424,7 +1424,19 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     first. "No interrupted work" is said only when every one of them answered
     that with a complete list.
   */
+  /*
+    PR #2431 round 4 (Qodo) — which request to show interrupted work is the
+    newest. Asking several daemons again takes a round trip, and by its end
+    the person may have moved on: asked again, opened or closed a dialog,
+    left the dashboard. Each of those moves this on, and an answer to an
+    older request opens nothing and says nothing.
+  */
+  const showRequest = useRef(0);
+  useEffect(() => () => { showRequest.current += 1; }, []);
+  const openInterruptedDialog = interrupted?.dialog;
+  useEffect(() => { showRequest.current += 1; }, [openInterruptedDialog]);
   const showInterruptedWork = useCallback((deckId?: string): string | undefined | Promise<string | undefined> => {
+    const request = ++showRequest.current;
     if (!interrupted) return NOTHING_INTERRUPTED;
     if (deckId !== undefined) return interrupted.openDialog(deckId) ? undefined : NOTHING_INTERRUPTED;
     const held = interrupted.decks;
@@ -1439,6 +1451,8 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       const id = deck.snapshot.connection.deckId as string;
       return refresh(id, false).then((found) => ({ deck, id, found }));
     })).then((answers) => {
+      /* The person moved on, or another modal now covers the dashboard: this answer is not theirs any more. */
+      if (showRequest.current !== request || modalOpen()) return undefined;
       /*
         A daemon that could not be asked again still counts the items its last
         answer listed. One whose list is incomplete may have work it could not

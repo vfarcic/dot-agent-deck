@@ -1056,6 +1056,7 @@ pub(crate) mod seams {
 /// Fixture helpers other modules' tests share.
 #[cfg(test)]
 pub(crate) mod tests_support {
+    #[cfg(unix)]
     use std::path::Path;
 
     /// Make a FIFO at `path`.
@@ -1064,6 +1065,21 @@ pub(crate) mod tests_support {
         let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
         // SAFETY: a valid NUL-terminated path and mode; `mkfifo` only reads it.
         assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+    }
+
+    /// Give a reader stuck opening the FIFO at `path` the writer it waits
+    /// for, so its thread can finish, without ever waiting itself: a
+    /// failure's cleanup that blocked would hide the failure behind a hang
+    /// (PR #2431 round 4, Qodo). The open does not wait for a reader
+    /// (`O_NONBLOCK`), so with none there it fails at once (`ENXIO`), which
+    /// is fine: there is then nothing to release.
+    #[cfg(unix)]
+    pub(crate) fn release_fifo_reader(path: &Path) {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path);
     }
 }
 
@@ -1077,6 +1093,7 @@ mod tests {
     /// `marked_launch_in(git_dir)` run on its own thread, answered within
     /// `bound` or `None`. When it does not answer, `unblock` is run so the
     /// stuck reader can finish rather than outlive the test.
+    #[cfg(unix)]
     fn marked_launch_within(
         git_dir: &Path,
         bound: std::time::Duration,
@@ -1089,9 +1106,12 @@ mod tests {
         });
         match rx.recv_timeout(bound) {
             Ok(read) => Some(read),
-            Err(_) => {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 unblock();
                 None
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("the marker reader's thread panicked before it answered")
             }
         }
     }
@@ -1153,11 +1173,38 @@ mod tests {
         let started = std::time::Instant::now();
         let read = marked_launch_within(&git_dir, std::time::Duration::from_secs(5), || {
             // Give the stuck open its writer, so its thread can finish.
-            let _ = std::fs::OpenOptions::new().write(true).open(&marker);
+            super::tests_support::release_fifo_reader(&marker);
         });
         let read = read.expect("the read answers without a writer on the FIFO");
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
         assert_eq!(read, MarkedLaunch::NotMarked, "a FIFO is not a marker");
+    }
+
+    /// PR #2431 round 4 (Qodo): the FIFO tests' failure cleanup returns at
+    /// once when no reader ever opened the FIFO, instead of waiting for one
+    /// forever and hiding the failure it was cleaning up after.
+    #[cfg(unix)]
+    #[test]
+    fn releasing_a_fifo_reader_does_not_wait_when_there_is_none() {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let scratch = crate::test_temp::tempdir().unwrap();
+        let fifo = scratch.path().join("no-reader.fifo");
+        mkfifo_at(&fifo);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = fifo.clone();
+        std::thread::spawn(move || {
+            super::tests_support::release_fifo_reader(&path);
+            let _ = tx.send(());
+        });
+        let answered = rx.recv_timeout(std::time::Duration::from_secs(5));
+        if answered.is_err() {
+            // Open the reading end ourselves so the stuck writer returns.
+            let _ = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&fifo);
+        }
+        assert!(answered.is_ok(), "the cleanup waited for a reader");
     }
 
     /// PR #2431 round 3: what is at the marker path and is not a regular
@@ -1176,7 +1223,7 @@ mod tests {
 
         mkfifo_at(&marker);
         let read = marked_launch_within(&git_dir, std::time::Duration::from_secs(5), || {
-            let _ = std::fs::OpenOptions::new().write(true).open(&marker);
+            super::tests_support::release_fifo_reader(&marker);
         });
         assert_eq!(read, Some(MarkedLaunch::NotMarked), "a FIFO, unblocked");
         std::fs::remove_file(&marker).unwrap();
@@ -1228,10 +1275,21 @@ mod tests {
             &Creator::dispatch("x").for_launch(Some(&launch)),
         )
         .unwrap();
-        assert_eq!(
-            marked_launch_in(&git_dir),
-            MarkedLaunch::Names(launch.clone())
-        );
+        // Off Unix no open refuses a symlink, so even a freshly written
+        // marker naming the launch is read as naming none: a reclaim there
+        // refuses as owner unconfirmed and never removes the tree.
+        if cfg!(unix) {
+            assert_eq!(
+                marked_launch_in(&git_dir),
+                MarkedLaunch::Names(launch.clone())
+            );
+        } else {
+            assert_eq!(
+                marked_launch_in(&git_dir),
+                MarkedLaunch::Unnamed,
+                "a non-Unix read never names a launch, so never authorises a removal"
+            );
+        }
 
         write_marker(&repo, "agent/x", &Creator::dispatch("x")).unwrap();
         let legacy = std::fs::read_to_string(&marker).unwrap();

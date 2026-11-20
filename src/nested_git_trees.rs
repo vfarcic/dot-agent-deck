@@ -208,6 +208,31 @@ mod tests {
         assert_eq!(walk(&top), Ok(Vec::new()));
     }
 
+    /// PR #2431 round 4 (Qodo): a directory below the top level holding a
+    /// symbolic link named `.git`, dangling or not, is named as a working
+    /// tree, so a removal keeps the tree that holds it. The walk did this
+    /// before `e0be7194` too (it marked any entry named `.git`, whatever its
+    /// type); keeping is the safe answer, since the link may lead to a real
+    /// repository's metadata.
+    #[cfg(unix)]
+    #[test]
+    fn a_symbolic_link_named_git_names_its_directory_as_a_tree() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let outside = tmp.path().join("outside-repo");
+        std::fs::create_dir_all(outside.join(".git")).unwrap();
+        let top = tmp.path().join("top");
+        let linked = top.join("ignored").join("linked");
+        std::fs::create_dir_all(&linked).unwrap();
+        std::os::unix::fs::symlink(outside.join(".git"), linked.join(".git")).unwrap();
+        let dangling = top.join("ignored").join("dangling");
+        std::fs::create_dir_all(&dangling).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("nowhere"), dangling.join(".git")).unwrap();
+
+        let mut found = walk(&top).expect("answered");
+        found.sort();
+        assert_eq!(found, vec![dangling, linked]);
+    }
+
     /// The entry bound and the deadline each end the walk with an `Err`.
     #[test]
     fn a_bound_reached_is_an_error() {

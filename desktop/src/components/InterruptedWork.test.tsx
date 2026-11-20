@@ -7,7 +7,7 @@ import { createFixtureSnapshot } from "../data/fixture";
 import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, LOCAL_ENDPOINT_SELECTION, type DeckBridge, type DesktopSettingsDto } from "../lib/bridge";
 import { AGENTS_STOPPED_BY_RESTART } from "../lib/agentIdentity";
 import {
-  DISMISSED, INTERRUPTED_UNREAD, INTERRUPTED_WORK_TITLE, LIST_INCOMPLETE, NOTHING_INTERRUPTED, OTHER_AGENTS_GROUP, RECLAIM_KEPT_DIRTY, RECLAIM_REMOVED, RECLAIM_WOULD_REMOVE, REFUSED_AMBIGUOUS, REFUSED_INCOMPLETE_READ, REFUSED_NOT_LISTED, dismissAllQuestion, gitFactsLine, interruptedFooter, reportRangeSentence,
+  DISMISSED, INTERRUPTED_UNREAD, INTERRUPTED_WORK_TITLE, LIST_INCOMPLETE, LIST_REFRESH_FAILED, NOTHING_INTERRUPTED, OTHER_AGENTS_GROUP, RECLAIM_KEPT_DIRTY, RECLAIM_REMOVED, RECLAIM_WOULD_REMOVE, REFUSED_AMBIGUOUS, REFUSED_INCOMPLETE_READ, REFUSED_NOT_LISTED, dismissAllQuestion, gitFactsLine, interruptedFooter, reportRangeSentence,
   type DismissOutcome, type InterruptedItem, type InterruptedList, type InterruptedReply, type InterruptedShow, type InterruptedTarget, type ReclaimOutcome,
 } from "../lib/interruptedWork";
 import { VOICE_ACTIONS, INTERRUPTED_RECLAIM_CHECKING, type VoiceOverviewChannel, type VoiceOverviewContext } from "../lib/voiceActions";
@@ -1145,5 +1145,94 @@ describe("X hides a banner, as the TUI's X hides its row (final reviewer 3)", ()
     await act(async () => { fireEvent.keyDown(document.body, { key: "X" }); });
     expect(screen.queryByTestId("interrupted-banner")).toBeNull();
     expect(dismissCalls(calls)).toEqual([]);
+  });
+});
+
+describe("a refresh that failed while a list is shown (PR #2431 round 4, Qodo)", () => {
+  /** Scenario: the dialog shows three items. Closed and opened again, the daemon's answer to the new list request is an error, so the dialog still shows the three items and says the list could not be refreshed and may be out of date, with the error. Closed and opened again once the daemon answers, the sentence is gone. */
+  it("says a failed refresh may leave the list out of date", async () => {
+    const lists: Record<string, InterruptedList | Error> = { "process-a": three() };
+    const { bridge, listed } = perProcessBridge(lists);
+    render(<Overview bridge={bridge} deck={deckOf("process-a")} />);
+    let dialog = await openDialog();
+    expect(dialog).not.toHaveTextContent(LIST_REFRESH_FAILED);
+    await act(async () => { fireEvent.click(screen.getByTestId("interrupted-close")); });
+
+    lists["process-a"] = new Error("daemon busy");
+    const before = listed.length;
+    dialog = await openDialog();
+    await waitFor(() => expect(listed.length).toBe(before + 1));
+    await waitFor(() => expect(dialog).toHaveTextContent(LIST_REFRESH_FAILED));
+    expect(dialog).toHaveTextContent("daemon busy");
+    expect(rows()).toHaveLength(3);
+    await act(async () => { fireEvent.click(screen.getByTestId("interrupted-close")); });
+
+    lists["process-a"] = three();
+    const again = listed.length;
+    dialog = await openDialog();
+    await waitFor(() => expect(listed.length).toBe(again + 1));
+    await waitFor(() => expect(dialog).not.toHaveTextContent(LIST_REFRESH_FAILED));
+    expect(rows()).toHaveLength(3);
+  });
+});
+
+describe("a request to show interrupted work that the person moved on from (PR #2431 round 4, Qodo)", () => {
+  /** A bridge whose list answers for process-b wait until the test releases them, while process-a answers at once. */
+  function heldBridge(lists: Record<string, InterruptedList>) {
+    const { bridge } = recordingBridge({ list: three() });
+    const held: { hold: boolean; release?: (list: InterruptedList) => void } = { hold: false };
+    const listed: InterruptedTarget[] = [];
+    const answering = {
+      ...(bridge as unknown as Record<string, unknown>),
+      interruptedWorkList: vi.fn((target: InterruptedTarget) => {
+        listed.push(target);
+        if (target.instance === "process-b" && held.hold) {
+          return new Promise((resolve) => { held.release = (list) => resolve(answered(target, list)); });
+        }
+        return Promise.resolve(answered(target, structuredClone(lists[target.instance] ?? { items: [] })));
+      }),
+    } as unknown as DeckBridge;
+    return { bridge: answering, held, listed };
+  }
+
+  /** Scenario: two daemons, the first listing a unit. "Show interrupted work" asks both again; while the second has not answered, the person opens the first daemon's dialog from its banner and closes it. When the second answers with nothing, no dialog opens again. */
+  it("does not reopen a dialog the person closed meanwhile", async () => {
+    const { bridge, held, listed } = heldBridge({ "process-a": { items: [unit()] }, "process-b": { items: [] } });
+    const fleet = [deckOf("process-a"), remoteDeck("deck-b", "beta", "process-b")];
+    const voice = voiced(bridge, fleet);
+    render(<voice.Voiced />);
+    await waitFor(() => expect(listed).toHaveLength(2));
+    held.hold = true;
+
+    await act(async () => { VOICE_ACTIONS.showInterruptedWork.run(voice.context(), {}); });
+    await waitFor(() => expect(held.release).toBeDefined());
+    const dialog = await openDialog();
+    expect(dialog).toBeInTheDocument();
+    await act(async () => { fireEvent.click(screen.getByTestId("interrupted-close")); });
+    expect(screen.queryByTestId("interrupted-dialog")).toBeNull();
+
+    await act(async () => { held.release?.({ items: [] }); await Promise.resolve(); });
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 20)); });
+    expect(screen.queryByTestId("interrupted-dialog")).toBeNull();
+    expect(voice.reportRefused).not.toHaveBeenCalled();
+  });
+
+  /** Scenario: as above, but while the second daemon has not answered another modal is drawn over the dashboard. When it answers, no interrupted work dialog opens under or over that modal. */
+  it("does not open a dialog while another modal covers the dashboard", async () => {
+    const { bridge, held, listed } = heldBridge({ "process-a": { items: [unit()] }, "process-b": { items: [] } });
+    const fleet = [deckOf("process-a"), remoteDeck("deck-b", "beta", "process-b")];
+    const voice = voiced(bridge, fleet);
+    const view = render(<voice.Voiced />);
+    await waitFor(() => expect(listed).toHaveLength(2));
+    held.hold = true;
+
+    await act(async () => { VOICE_ACTIONS.showInterruptedWork.run(voice.context(), {}); });
+    await waitFor(() => expect(held.release).toBeDefined());
+    view.rerender(<voice.Voiced cover />);
+    expect(screen.getByTestId("cover-modal")).toBeInTheDocument();
+
+    await act(async () => { held.release?.({ items: [] }); await Promise.resolve(); });
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 20)); });
+    expect(screen.queryByTestId("interrupted-dialog")).toBeNull();
   });
 });

@@ -197,6 +197,9 @@ pub(super) struct InterruptedWork {
     list: Option<InterruptedList>,
     /// Why there is no list, for the overlay.
     unavailable: Option<String>,
+    /// Why the last request for the list failed while an earlier answer is
+    /// still shown, so the overlay can say that list may be out of date.
+    refresh_failed: Option<String>,
     /// The selected item, an index into [`ordered`].
     selected: usize,
     /// The list view's first row.
@@ -246,6 +249,7 @@ impl Default for InterruptedWork {
             last_op: 0,
             list: None,
             unavailable: None,
+            refresh_failed: None,
             selected: 0,
             scroll: 0,
             view: View::List,
@@ -394,8 +398,11 @@ async fn bounded<T>(
     }
 }
 
+/// Protocol-gated, like the TUI's other requests that change what the deck
+/// holds: each request rides a connection whose own `Hello` named this
+/// binary's protocol (PR #2431 round 4).
 fn client() -> DaemonClient {
-    DaemonClient::new(crate::endpoint_resolve::client_attach_socket_path())
+    DaemonClient::new(crate::endpoint_resolve::client_attach_socket_path()).with_protocol_gate()
 }
 
 /// Send `request` to the daemon process the list came from, on the tokio
@@ -563,16 +570,21 @@ pub(super) fn apply(ui: &mut UiState, answer: Answer) {
                     }
                     iw.list = Some(list);
                     iw.unavailable = None;
+                    iw.refresh_failed = None;
                 }
                 Ok(None) => {
                     iw.list = None;
                     iw.unavailable = Some(words::UNSUPPORTED.to_string());
+                    iw.refresh_failed = None;
                 }
-                // A failed refresh keeps the list it had; a failed first
-                // fetch shows nothing but in the overlay.
+                // A failed refresh keeps the list it had, and says it may be
+                // out of date; a failed first fetch shows nothing but in the
+                // overlay.
                 Err(message) => {
                     if iw.list.is_none() {
                         iw.unavailable = Some(message);
+                    } else {
+                        iw.refresh_failed = Some(message);
                     }
                 }
             }
@@ -1299,6 +1311,15 @@ fn list_body(iw: &InterruptedWork, width: usize) -> (Vec<Line<'static>>, Option<
         }
         return (lines, None);
     };
+    if let Some(why) = &iw.refresh_failed {
+        lines.extend(wrapped(
+            &format!("{} {why}", words::LIST_REFRESH_FAILED),
+            width,
+            "  ",
+            notice(),
+        ));
+        lines.push(Line::from(""));
+    }
     if list.incomplete {
         lines.extend(wrapped(words::LIST_INCOMPLETE, width, "  ", notice()));
         lines.push(Line::from(""));
@@ -1921,4 +1942,15 @@ fn seam_kind(step: &InterruptedSeamStep) -> Option<InterruptedSeamKind> {
         InterruptedSeamStep::Failed(kind, _) | InterruptedSeamStep::Unsupported(kind) => *kind,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod client_tests {
+    /// PR #2431 round 4 (Qodo): the TUI's interrupted-work requests go on a
+    /// protocol-gated handle, like its other requests that change what the
+    /// deck holds, so a daemon on another protocol is sent none of them.
+    #[test]
+    fn the_interrupted_work_client_checks_the_protocol_on_every_request() {
+        assert!(super::client().is_gated());
+    }
 }

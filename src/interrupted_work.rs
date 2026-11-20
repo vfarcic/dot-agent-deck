@@ -715,6 +715,9 @@ pub const NOTHING_INTERRUPTED: &str = "No interrupted work.";
 /// What a list (or a show) read from an incomplete journal read says.
 pub const LIST_INCOMPLETE: &str =
     "The deck could not read its whole work journal, so an item may be missing or out of date.";
+/// What the list says when asking for it again failed while an earlier
+/// answer is still shown, before why it failed (PR #2431 round 4).
+pub const LIST_REFRESH_FAILED: &str = "The list could not be refreshed, so it may be out of date.";
 /// What the TUI's footer row and the desktop's banner say for a list that
 /// came back empty but incomplete: there may be work the deck could not read,
 /// so the row still offers a way into the list (verification finding N4).

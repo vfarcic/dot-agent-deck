@@ -4,7 +4,7 @@ import { OVERLAY_LAYER, overlayAbove, useInertBackground } from "../hooks/useIne
 import type { InterruptedDeck, InterruptedWorkRuntime } from "../hooks/useInterruptedWork";
 import {
   DAEMON_FAILED, DISMISS_ACTION, DISMISS_ALL_ACTION, INTERRUPTED_NO_NEXT_PAGE, INTERRUPTED_UNREAD, INTERRUPTED_NO_PREVIOUS_PAGE, INTERRUPTED_NO_REPORTS, INTERRUPTED_WAIT, INTERRUPTED_WORK_TITLE, ITEM_CUT, LABEL_BRANCH, LABEL_GIT, LABEL_ISSUE,
-  LABEL_LAST_ENTRY, LABEL_NESTED_WORKTREE, LABEL_PROGRESS, LABEL_REPORT, LABEL_STARTED_BY, LABEL_WORKTREE, LIST_INCOMPLETE, MAX_SHOWN_REPORTS, NOTHING_INTERRUPTED, OTHER_AGENTS_GROUP, RECLAIM_ACTION, RECLAIM_EXPLANATION,
+  LABEL_LAST_ENTRY, LABEL_NESTED_WORKTREE, LABEL_PROGRESS, LABEL_REPORT, LABEL_STARTED_BY, LABEL_WORKTREE, LIST_INCOMPLETE, LIST_REFRESH_FAILED, MAX_SHOWN_REPORTS, NOTHING_INTERRUPTED, OTHER_AGENTS_GROUP, RECLAIM_ACTION, RECLAIM_EXPLANATION,
   REFUSED_NOT_LISTED, REFUSED_PLAIN_AGENT, REPORT_CUT, REPORT_UNREADABLE, UNSUPPORTED,
   detailsItem, directoryLabel, dismissAllQuestion, dismissMessage, dismissOneQuestion, displayValue, formatTime, gitFactsLine, interruptedFooter, itemName, keptUntil, kindLabel, lastEntryLine, mayHaveInterrupted, omittedSentence, orderedItems, progressFact,
   progressLine, publishInterruptedDialog, reclaimMessage, reportLines, reportRangeSentence, resolveSpokenItem, unpushedSentence, wouldRemove,
@@ -537,6 +537,8 @@ function ListView({ deck, ordered, selected, busy, registry, listRef }: { deck: 
   const firstAgent = ordered.findIndex((candidate) => candidate.kind === "agent");
   return (
     <>
+      {/* PR #2431 round 4: a refresh that failed leaves the list it had on screen, and says so. */}
+      {deck.failed !== undefined && <p className="interrupted-note" role="status" data-testid="interrupted-refresh-failed">{LIST_REFRESH_FAILED} {failure(new Error(deck.failed))}</p>}
       {deck.list.incomplete && <p className="interrupted-note">{LIST_INCOMPLETE}</p>}
       {ordered.length === 0
         ? <p className="interrupted-note" data-testid="interrupted-empty">{NOTHING_INTERRUPTED}</p>

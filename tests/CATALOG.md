@@ -863,6 +863,13 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 - **Does not assert:** a `--dir` into a worktree an earlier dispatch created, whose marker names that earlier launch (reclaim refuses it as another launch's, `interrupted_work_daemon_tests`); an orchestration-shaped `--dir` unit.
 - **Platform coverage:** mac+linux.
 
+##### journal/interrupted/037 — A refresh that fails while a list is shown says the list may be out of date, until a list answers.
+- **Layer:** L1 in-process `TestBackend` (`tests/render_interrupted_work.rs`, seam `run_interrupted_work_seam`): the daemon's answers are handed in where the background request would deliver them, keys go through the production `handle_key_event`.
+- **Agent:** none.
+- **Asserts:** with three items listed, `I` shows them without `LIST_REFRESH_FAILED`; the list request failing (`timed out`) keeps the three items and shows `LIST_REFRESH_FAILED` followed by the reason; `Esc` and `I` again still show it while the new request is outstanding; that request answering with a list removes it (PR #2431 round 4, Qodo).
+- **Does not assert:** the desktop dialog (`desktop/src/components/InterruptedWork.test.tsx`, "says a failed refresh may leave the list out of date"); a failed first fetch, which shows only the failure.
+- **Platform coverage:** mac+linux.
+
 #### journal/compat
 
 ##### journal/compat/001 — Lines of a newer schema or an unknown kind are skipped and kept.

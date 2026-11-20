@@ -20,11 +20,11 @@ use dot_agent_deck::interrupted_work::{
     DISMISSED, DismissOutcome, DismissStopReason, DismissStopped, DismissedItem, GitFacts,
     INTERRUPTED_UNREAD, INTERRUPTED_WORK_TITLE, InterruptedItem, InterruptedList, InterruptedShow,
     ItemKind, ItemReport, LABEL_BRANCH, LABEL_FOLDER, LABEL_GIT, LABEL_LAST_ENTRY, LABEL_PROGRESS,
-    LABEL_REPORT, LABEL_STARTED_BY, LABEL_WORKTREE, LIST_INCOMPLETE, LastEntry, OTHER_AGENTS_GROUP,
-    PrFact, Progress, RECLAIM_EXPLANATION, RECLAIM_REMOVED, RECLAIM_WOULD_REMOVE, ReclaimOutcome,
-    ReclaimVerdict, Refusal, RefusalReason, ShownReport, UNSUPPORTED, dismiss_all_question,
-    dismiss_stopped_sentence, git_facts_line, interrupted_footer, kept_until, kind_label,
-    progress_line, refusal_sentence, unpushed_sentence,
+    LABEL_REPORT, LABEL_STARTED_BY, LABEL_WORKTREE, LIST_INCOMPLETE, LIST_REFRESH_FAILED,
+    LastEntry, OTHER_AGENTS_GROUP, PrFact, Progress, RECLAIM_EXPLANATION, RECLAIM_REMOVED,
+    RECLAIM_WOULD_REMOVE, ReclaimOutcome, ReclaimVerdict, Refusal, RefusalReason, ShownReport,
+    UNSUPPORTED, dismiss_all_question, dismiss_stopped_sentence, git_facts_line,
+    interrupted_footer, kept_until, kind_label, progress_line, refusal_sentence, unpushed_sentence,
 };
 use dot_agent_deck::keybindings::KeybindingConfig;
 use dot_agent_deck::ui::{
@@ -2078,5 +2078,52 @@ fn interrupted_035_the_restart_notice_leads_to_an_incomplete_empty_list() {
             && popup_text(&shown[1]).contains(&squeezed(LIST_INCOMPLETE)),
         "`I` opens the interrupted work list:\n{}",
         shown[1]
+    );
+}
+
+/// Scenario: The "Interrupted work" list is open with three items, and asking
+/// for it again fails (a timeout). The overlay still shows the three items and
+/// now says the list could not be refreshed and may be out of date, with why.
+/// Closed with `Esc` and opened again with `I`, it still says so until the new
+/// request answers; then the sentence is gone.
+#[spec("journal/interrupted/037")]
+#[test]
+fn interrupted_037_a_failed_refresh_says_the_list_may_be_out_of_date() {
+    let (shown, _) = run(
+        &three(),
+        &[
+            ch('I'),
+            InterruptedSeamStep::Failed(InterruptedSeamKind::List, "timed out".into()),
+            key(KeyCode::Esc),
+            ch('I'),
+            InterruptedSeamStep::Listed(three()),
+        ],
+    );
+    let open = popup_text(&shown[1]);
+    assert!(
+        !open.contains(&squeezed(LIST_REFRESH_FAILED)),
+        "{}",
+        shown[1]
+    );
+    let failed = popup_text(&shown[2]);
+    assert!(
+        failed.contains(&squeezed(LIST_REFRESH_FAILED)) && failed.contains("timedout"),
+        "a failed refresh says so, and why:\n{}",
+        shown[2]
+    );
+    assert!(
+        shown[2].contains("fix-login") && shown[2].contains("release-team"),
+        "the list it had is still shown:\n{}",
+        shown[2]
+    );
+    assert!(
+        popup_text(&shown[4]).contains(&squeezed(LIST_REFRESH_FAILED)),
+        "reopened, it still says so until a list answers:\n{}",
+        shown[4]
+    );
+    assert!(
+        !popup_text(&shown[5]).contains(&squeezed(LIST_REFRESH_FAILED)),
+        "a list that answers clears it:\n{}",
+        shown[5]
     );
 }

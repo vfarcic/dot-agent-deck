@@ -329,6 +329,8 @@ export const REFUSED_NOT_RECORDED = "Refused: the deck could not record the dism
 export const REFUSED_UNKNOWN = "Refused.";
 
 export const NOTHING_INTERRUPTED = "No interrupted work.";
+/** PR #2431 round 4 — a list request failed while an earlier answer is still shown; the reason follows. */
+export const LIST_REFRESH_FAILED = "The list could not be refreshed, so it may be out of date.";
 export const LIST_INCOMPLETE = "The deck could not read its whole work journal, so an item may be missing or out of date.";
 /**
  * Verification finding N4 — the banner of a daemon whose list came back
