@@ -730,6 +730,62 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 - **Does not assert:** the CLI (`interrupted_cli` unit test `bidi_controls_from_the_journal_cannot_reorder_the_text`); other invisible format characters.
 - **Platform coverage:** mac+linux.
 
+##### journal/interrupted/018 — The TUI escapes every control and bidi character a journal value, a report or a daemon message carries, wherever it shows one.
+- **Layer:** L1 in-process `TestBackend` (`tests/render_interrupted_work.rs`, seam `run_interrupted_work_seam`): every request the TUI sends is recorded instead of sent, the daemon's answers are handed in for a recorded request, keys go through the production `handle_key_event`, and each frame is drawn after the production per-frame fetch check.
+- **Agent:** none.
+- **Asserts:** with every C0 and C1 control, DEL and every bidi formatting character in an item's name, branch, worktree (a long Chinese path), launcher, last entry, roles, repository and report id, in a report's text, in a reclaim dry run's paths and an unknown verdict's sentence, and in a failed request's message, no cell of any frame of the list, details, shown report, reclaim confirmation or list message holds one, at 110×32, 80×24 and 40×24, and the overlay's borders stay whole; the failed request's message is shown escaped (`\u{0}\u{1}`).
+- **Does not assert:** the CLI (`interrupted_cli` unit test `bidi_controls_from_the_journal_cannot_reorder_the_text`); invisible format characters other than the bidi ones.
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/019 — A dry run the person backed out of leaves reclaim and dismiss free, and its late answer is not taken for a newer one's.
+- **Layer:** L1 in-process `TestBackend` (`tests/render_interrupted_work.rs`, seam `run_interrupted_work_seam`): every request the TUI sends is recorded instead of sent, the daemon's answers are handed in for a recorded request, keys go through the production `handle_key_event`, and each frame is drawn after the production per-frame fetch check.
+- **Agent:** none.
+- **Asserts:** after `r` and `Esc`, `q` or `n`, whether the dry run then answers, fails or never answers, `d` sends a dismissal of the selected item; a second `r` sends a second dry run, the first one's late answer shows no `y/n`, the second's does, and `y` sends the real reclaim.
+- **Does not assert:** a real reclaim or dismissal in flight (it cannot be cancelled, and its answer frees the actions).
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/020 — Answers from a daemon process the TUI has since left are dropped, and the list is fetched once per process.
+- **Layer:** L1 in-process `TestBackend` (`tests/render_interrupted_work.rs`, seam `run_interrupted_work_seam`): every request the TUI sends is recorded instead of sent, the daemon's answers are handed in for a recorded request, keys go through the production `handle_key_event`, and each frame is drawn after the production per-frame fetch check.
+- **Agent:** none.
+- **Asserts:** after the TUI attaches to a second process, a late list answer from the first, numbered as the second's newest list request, does not replace the second's list; late dry-run, reclaim and dismissal answers from the first send nothing and change no frame, and `d` then dismisses the second's item; a report asked of the first is not shown in the second's details of an item with the same id; attaching to the same process again fetches nothing, and each new process is fetched once.
+- **Does not assert:** the real event stream's reconnect (`journal/interrupted/014` covers a fresh TUI).
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/021 — A refresh of the TUI's interrupted work list keeps the selected item, not the selected row.
+- **Layer:** L1 in-process `TestBackend` (`tests/render_interrupted_work.rs`, seam `run_interrupted_work_seam`): every request the TUI sends is recorded instead of sent, the daemon's answers are handed in for a recorded request, keys go through the production `handle_key_event`, and each frame is drawn after the production per-frame fetch check.
+- **Agent:** none.
+- **Asserts:** with the orchestration selected, a refresh that drops an earlier item, adds a newer one or reorders the list keeps `▶ release-team` and `d` dismisses the orchestration's id; a selected plain agent stays selected when another agent is listed before it; when the selected item is gone, its neighbour is selected and `d` dismisses that one.
+- **Does not assert:** the list's scroll position.
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/022 — The interrupted work footer's hide key acts while the overlay is open, remapped or not.
+- **Layer:** L1 in-process `TestBackend` (`tests/render_interrupted_work.rs`, seam `run_interrupted_work_seam`): every request the TUI sends is recorded instead of sent, the daemon's answers are handed in for a recorded request, keys go through the production `handle_key_event`, and each frame is drawn after the production per-frame fetch check.
+- **Agent:** none.
+- **Asserts:** with the list, an item's details or the dismiss-all question open, the footer offers `[Hide X]` and `X` hides it, leaves the overlay open and sends no dismissal; with `hide_interrupted_work = "Z"` the footer offers `[Hide Z]` and `Z` hides it.
+- **Does not assert:** the footer coming back on another daemon process (`journal/interrupted/014`).
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/023 — A failed or unsupported report request says why in the item's details and can be asked again.
+- **Layer:** L1 in-process `TestBackend` (`tests/render_interrupted_work.rs`, seam `run_interrupted_work_seam`): every request the TUI sends is recorded instead of sent, the daemon's answers are handed in for a recorded request, keys go through the production `handle_key_event`, and each frame is drawn after the production per-frame fetch check.
+- **Agent:** none.
+- **Asserts:** a failed show answer shows its message in the details, an unsupported one the shared unsupported sentence, `Enter` sends the show request again and the next answer shows the report's text; a failed next page shows its message and keeps `Reports 1 to 3 of 8.`, and `n` asks for that page again.
+- **Does not assert:** the daemon's own failures (`interrupted_work_daemon` unit tests).
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/024 — A confirmation too big for its popup can still be read whole and answered.
+- **Layer:** L1 in-process `TestBackend` (`tests/render_interrupted_work.rs`, seam `run_interrupted_work_seam`): every request the TUI sends is recorded instead of sent, the daemon's answers are handed in for a recorded request, keys go through the production `handle_key_event`, and each frame is drawn after the production per-frame fetch check.
+- **Agent:** none.
+- **Asserts:** at 40 columns the dismiss-all question is wrapped and drawn whole, and `y` dismisses the three listed ids; at 80×24 a dry run naming long Chinese paths pushes `Reclaim? y/n` below the popup, `y` then sends no reclaim, PageDown scrolls the question into view and `y` sends exactly one; `Esc` and `q` go back from both.
+- **Does not assert:** mouse scrolling.
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/025 — A confirmation's `y` sends only what the confirmation showed.
+- **Layer:** L1 in-process `TestBackend` (`tests/render_interrupted_work.rs`, seam `run_interrupted_work_seam`): every request the TUI sends is recorded instead of sent, the daemon's answers are handed in for a recorded request, keys go through the production `handle_key_event`, and each frame is drawn after the production per-frame fetch check.
+- **Agent:** none.
+- **Asserts:** `y` typed in the same burst as `D`, or as the dry run's answer, sends nothing; in a terminal too short to show the question, `y` sends nothing; kept (`KeptDirty`) and refused dry runs show no `y/n` and `y` sends no reclaim; `D`, a refresh listing a fourth item, then `y` sends a dismissal of exactly the three ids the question named, with `all` false.
+- **Does not assert:** the daemon's handling of a dismissal (`journal/interrupted/002`).
+- **Platform coverage:** mac+linux.
+
 #### journal/compat
 
 ##### journal/compat/001 — Lines of a newer schema or an unknown kind are skipped and kept.

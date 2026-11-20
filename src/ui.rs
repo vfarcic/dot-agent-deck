@@ -29853,25 +29853,93 @@ pub fn render_restart_notice_key_sequence_to_buffers(
     render_restart_notice_agents_key_sequence_to_buffers(&agents, mode, status, keys, width, height)
 }
 
-/// PRD #1790 stage 2 L1 seam: one step of
-/// [`render_interrupted_work_to_buffers`] — a key pressed, or a daemon answer
-/// delivered where the background request would deliver it.
+/// PRD #1790 stage 2 L1 seam: one step of [`run_interrupted_work_seam`] — a
+/// key pressed, a daemon answer delivered where the background request would
+/// deliver it, or the event stream attaching to a daemon process.
 #[doc(hidden)]
 pub enum InterruptedSeamStep {
     Key(KeyEvent),
+    /// These steps, one after another, with no frame drawn before, between or
+    /// after them; one frame is drawn when the last is done.
+    Burst(Vec<InterruptedSeamStep>),
+    /// The newest list request answered this list.
     Listed(crate::interrupted_work::InterruptedList),
+    /// The newest show request answered this page.
     Shown(crate::interrupted_work::InterruptedShow),
+    /// The newest reclaim request of this outcome's `dry_run` answered it.
     Reclaimed(crate::interrupted_work::ReclaimOutcome),
+    /// The newest dismissal answered this.
     Dismissed(crate::interrupted_work::DismissOutcome),
+    /// The newest request of this kind failed with this message (a timeout,
+    /// say).
+    Failed(InterruptedSeamKind, String),
+    /// The newest request of this kind answered that the daemon does not
+    /// support interrupted work.
+    Unsupported(InterruptedSeamKind),
+    /// The request at this index of [`InterruptedSeamRun::sent`] answered as
+    /// the inner step says, however long ago it was sent.
+    AnswerTo(usize, Box<InterruptedSeamStep>),
+    /// The TUI's event stream attached to the daemon process of this name
+    /// (the seam starts attached to [`INTERRUPTED_SEAM_FIRST_DAEMON`]).
+    Attach(String),
 }
 
-/// PRD #1790 stage 2 L1 seam: start on an empty dashboard in `mode` whose
-/// attach fetch answered `list`, with a restart notice naming `notice` (none
-/// when empty), apply `steps` one at a time — a key through the production
-/// [`handle_key_event`], an answer where the background request delivers it
-/// — and draw each frame with the production [`render_frame`]. Returns the
-/// frame before the first step and one after each. Outside a tokio runtime no
-/// request is sent, so the daemon says only what the steps hand in.
+/// PRD #1790 stage 2 L1 seam: the daemon process the seam starts attached to.
+#[doc(hidden)]
+pub const INTERRUPTED_SEAM_FIRST_DAEMON: &str = "seam-daemon-1";
+
+/// PRD #1790 stage 2 L1 seam: what kind of request an answer step answers.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterruptedSeamKind {
+    List,
+    Show,
+    Reclaim,
+    Dismiss,
+}
+
+/// PRD #1790 stage 2: a request the TUI sends the daemon about interrupted
+/// work. The L1 seam records these rather than sending them.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InterruptedSeamRequest {
+    List { git: bool },
+    Show { id: String, reports_from: usize },
+    Reclaim { id: String, dry_run: bool },
+    Dismiss { ids: Vec<String>, all: bool },
+}
+
+impl InterruptedSeamRequest {
+    pub fn kind(&self) -> InterruptedSeamKind {
+        match self {
+            InterruptedSeamRequest::List { .. } => InterruptedSeamKind::List,
+            InterruptedSeamRequest::Show { .. } => InterruptedSeamKind::Show,
+            InterruptedSeamRequest::Reclaim { .. } => InterruptedSeamKind::Reclaim,
+            InterruptedSeamRequest::Dismiss { .. } => InterruptedSeamKind::Dismiss,
+        }
+    }
+}
+
+/// PRD #1790 stage 2: a request, and the daemon process it is pinned to.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterruptedSeamSent {
+    pub instance: Option<String>,
+    pub request: InterruptedSeamRequest,
+}
+
+/// PRD #1790 stage 2 L1 seam: what [`run_interrupted_work_seam`] drew and
+/// what the TUI sent.
+#[doc(hidden)]
+pub struct InterruptedSeamRun {
+    /// The frame before the first step, and one after each.
+    pub frames: Vec<ratatui::buffer::Buffer>,
+    /// Every request the TUI sent, in order: the attach fetch first.
+    pub sent: Vec<InterruptedSeamSent>,
+}
+
+/// PRD #1790 stage 2 L1 seam: [`run_interrupted_work_seam`] with the default
+/// keys, answering only its frames.
 #[doc(hidden)]
 pub fn render_interrupted_work_to_buffers(
     list: &crate::interrupted_work::InterruptedList,
@@ -29881,6 +29949,36 @@ pub fn render_interrupted_work_to_buffers(
     width: u16,
     height: u16,
 ) -> Vec<ratatui::buffer::Buffer> {
+    run_interrupted_work_seam(
+        list,
+        notice,
+        mode,
+        &KeybindingConfig::default(),
+        steps,
+        width,
+        height,
+    )
+    .frames
+}
+
+/// PRD #1790 stage 2 L1 seam: start on an empty dashboard in `mode`, with
+/// `keybindings`, attached to [`INTERRUPTED_SEAM_FIRST_DAEMON`] whose attach
+/// fetch answered `list`, with a restart notice naming `notice` (none when
+/// empty), apply `steps` one at a time — a key through the production
+/// [`handle_key_event`], an answer where the background request delivers it
+/// — and draw each frame with the production [`render_frame`], after the
+/// production per-frame fetch check. No request reaches a daemon: each is
+/// recorded, and the daemon says only what the steps hand in.
+#[doc(hidden)]
+pub fn run_interrupted_work_seam(
+    list: &crate::interrupted_work::InterruptedList,
+    notice: &[&str],
+    mode: UiMode,
+    keybindings: &KeybindingConfig,
+    steps: &[InterruptedSeamStep],
+    width: u16,
+    height: u16,
+) -> InterruptedSeamRun {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use std::sync::Arc;
@@ -29895,7 +29993,7 @@ pub fn render_interrupted_work_to_buffers(
     let mut tab_manager = TabManager::new(ctrl.clone() as Arc<dyn PaneController>);
     let shared: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
     let state = AppState::default();
-    let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+    let mut ui = UiState::new(DashboardConfig::default(), keybindings.clone());
     if !notice.is_empty() {
         let mut stopped = RestartNotice::default();
         for (i, label) in notice.iter().enumerate() {
@@ -29915,7 +30013,15 @@ pub fn render_interrupted_work_to_buffers(
         }
         ui.restart_notice = Some(stopped);
     }
-    interrupted_work_view::seam_listed(&mut ui, list);
+    let mut attached =
+        crate::daemon_client::Incarnation::from(Some(INTERRUPTED_SEAM_FIRST_DAEMON.to_string()));
+    interrupted_work_view::seam_record(&mut ui);
+    interrupted_work_view::sync(&mut ui, &attached);
+    if let Some(answer) =
+        interrupted_work_view::seam_answer(&ui, Some(0), &InterruptedSeamStep::Listed(list.clone()))
+    {
+        interrupted_work_view::apply(&mut ui, answer);
+    }
     ui.mode = mode;
     // A fixed instant: the dashboard has no cards, so nothing measures against it.
     let wall_now = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).expect("fixed instant");
@@ -29934,7 +30040,9 @@ pub fn render_interrupted_work_to_buffers(
     let mut terminal =
         Terminal::new(TestBackend::new(width, height)).expect("TestBackend should construct");
 
-    let mut draw = |ui: &mut UiState| {
+    let mut draw = |ui: &mut UiState, attached: &crate::daemon_client::Incarnation| {
+        // The event loop's check, before each frame.
+        interrupted_work_view::sync(ui, attached);
         let bar_rows = bottom_bar_rows(ui, width, height);
         let layout = compute_frame_layout(
             frame_area,
@@ -29959,31 +30067,80 @@ pub fn render_interrupted_work_to_buffers(
     };
 
     let mut frames = Vec::with_capacity(steps.len() + 1);
-    frames.push(draw(&mut ui));
+    frames.push(draw(&mut ui, &attached));
     for step in steps {
-        match step {
-            InterruptedSeamStep::Key(key) => {
-                let filtered = filter_sessions(&state, &ui);
-                let _ = handle_key_event(
-                    *key,
-                    &mut ui,
-                    &*ctrl,
-                    &shared,
-                    &mut tab_manager,
-                    &state,
-                    &filtered,
+        seam_interrupted_step(
+            &mut ui,
+            step,
+            &mut attached,
+            &ctrl,
+            &shared,
+            &mut tab_manager,
+            &state,
+            frame_area,
+        );
+        frames.push(draw(&mut ui, &attached));
+    }
+    InterruptedSeamRun {
+        frames,
+        sent: interrupted_work_view::seam_sent(&ui),
+    }
+}
+
+/// One step of [`run_interrupted_work_seam`], with no frame drawn.
+#[allow(clippy::too_many_arguments)]
+fn seam_interrupted_step(
+    ui: &mut UiState,
+    step: &InterruptedSeamStep,
+    attached: &mut crate::daemon_client::Incarnation,
+    ctrl: &EmbeddedPaneController,
+    shared: &SharedState,
+    tab_manager: &mut TabManager,
+    state: &AppState,
+    frame_area: Rect,
+) {
+    match step {
+        InterruptedSeamStep::Key(key) => {
+            let filtered = filter_sessions(state, ui);
+            let _ = handle_key_event(
+                *key,
+                ui,
+                ctrl,
+                shared,
+                tab_manager,
+                state,
+                &filtered,
+                frame_area,
+            );
+        }
+        InterruptedSeamStep::Burst(steps) => {
+            for step in steps {
+                seam_interrupted_step(
+                    ui,
+                    step,
+                    attached,
+                    ctrl,
+                    shared,
+                    tab_manager,
+                    state,
                     frame_area,
                 );
             }
-            answer => {
-                if let Some(answer) = interrupted_work_view::seam_answer(&ui, answer) {
-                    interrupted_work_view::apply(&mut ui, answer);
-                }
+        }
+        InterruptedSeamStep::Attach(process) => {
+            *attached = crate::daemon_client::Incarnation::from(Some(process.clone()));
+        }
+        InterruptedSeamStep::AnswerTo(index, answer) => {
+            if let Some(answer) = interrupted_work_view::seam_answer(ui, Some(*index), answer) {
+                interrupted_work_view::apply(ui, answer);
             }
         }
-        frames.push(draw(&mut ui));
+        answer => {
+            if let Some(answer) = interrupted_work_view::seam_answer(ui, None, answer) {
+                interrupted_work_view::apply(ui, answer);
+            }
+        }
     }
-    frames
 }
 
 /// [`render_restart_notice_key_sequence_to_buffers`] for a notice naming

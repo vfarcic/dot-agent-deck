@@ -142,8 +142,18 @@ pub(super) struct InterruptedWork {
     busy: bool,
     /// The newest list request; an older one's answer is not applied.
     list_seq: u64,
+    /// The L1 seam's record of every request sent, in order; `None` in
+    /// production, where each is sent to the daemon instead.
+    recorder: Option<Vec<Recorded>>,
     tx: mpsc::Sender<Answer>,
     rx: mpsc::Receiver<Answer>,
+}
+
+/// A request the L1 seam recorded, with what its answer needs.
+#[derive(Debug, Clone)]
+pub(super) struct Recorded {
+    seq: u64,
+    sent: InterruptedSeamSent,
 }
 
 impl Default for InterruptedWork {
@@ -161,6 +171,7 @@ impl Default for InterruptedWork {
             footer_hidden: false,
             busy: false,
             list_seq: 0,
+            recorder: None,
             tx,
             rx,
         }
@@ -281,34 +292,73 @@ fn client() -> DaemonClient {
     DaemonClient::new(crate::endpoint_resolve::client_attach_socket_path())
 }
 
-/// Run `work` on the tokio runtime and deliver its answer to [`drain`].
-/// `false`, with nothing run, outside a runtime (the L1 seams, which hand the
-/// answers in themselves).
-fn spawn(iw: &InterruptedWork, work: impl Future<Output = Answer> + Send + 'static) -> bool {
+/// Send `request` to the daemon process the list came from, on the tokio
+/// runtime, and deliver its answer to [`drain`]; the L1 seam records it
+/// instead. `false`, with nothing sent, outside a runtime and the seam.
+fn send(iw: &mut InterruptedWork, request: InterruptedSeamRequest) -> bool {
+    let sent = InterruptedSeamSent {
+        instance: iw.instance.clone(),
+        request,
+    };
+    let seq = iw.list_seq;
+    if let Some(log) = iw.recorder.as_mut() {
+        log.push(Recorded { seq, sent });
+        return true;
+    }
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         return false;
     };
     let tx = iw.tx.clone();
     handle.spawn(async move {
-        let _ = tx.send(work.await);
+        let _ = tx.send(ask(seq, sent).await);
     });
     true
+}
+
+/// The daemon's answer to `sent`.
+async fn ask(seq: u64, sent: InterruptedSeamSent) -> Answer {
+    let InterruptedSeamSent { instance, request } = sent;
+    let instance = instance.as_deref();
+    match request {
+        InterruptedSeamRequest::List { git } => Answer::Listed {
+            seq,
+            result: bounded(LIST_TIMEOUT, client().list_interrupted_work(git, instance)).await,
+        },
+        InterruptedSeamRequest::Show { id, reports_from } => {
+            let result = bounded(
+                SHOW_TIMEOUT,
+                client().show_interrupted_page(&id, None, Some(reports_from), instance),
+            )
+            .await;
+            Answer::Shown { id, result }
+        }
+        InterruptedSeamRequest::Reclaim { id, dry_run } => {
+            let result = bounded(
+                RECLAIM_TIMEOUT,
+                client().reclaim_interrupted(&id, dry_run, None, instance),
+            )
+            .await;
+            Answer::Reclaimed {
+                id,
+                dry_run,
+                result,
+            }
+        }
+        InterruptedSeamRequest::Dismiss { ids, all } => Answer::Dismissed {
+            result: bounded(
+                DISMISS_TIMEOUT,
+                client().dismiss_interrupted(ids, all, None, instance),
+            )
+            .await,
+        },
+    }
 }
 
 /// Ask for the list again; `git` asks for each item's Git and pull request
 /// facts too.
 fn request_list(iw: &mut InterruptedWork, git: bool) {
     iw.list_seq += 1;
-    let seq = iw.list_seq;
-    let instance = iw.instance.clone();
-    spawn(iw, async move {
-        let result = bounded(
-            LIST_TIMEOUT,
-            client().list_interrupted_work(git, instance.as_deref()),
-        )
-        .await;
-        Answer::Listed { seq, result }
-    });
+    send(iw, InterruptedSeamRequest::List { git });
 }
 
 /// PRD #1790 stage 2: fetch the list once for each daemon process the TUI's
@@ -322,10 +372,13 @@ pub(super) fn sync(ui: &mut UiState, incarnation: &Incarnation) {
     if iw.fetched_for.as_deref() == Some(process) {
         return;
     }
-    let InterruptedWork { tx, rx, .. } = std::mem::take(iw);
+    let InterruptedWork {
+        tx, rx, recorder, ..
+    } = std::mem::take(iw);
     *iw = InterruptedWork {
         fetched_for: Some(process.to_string()),
         instance: Some(process.to_string()),
+        recorder,
         tx,
         rx,
         ..InterruptedWork::default()
@@ -697,33 +750,19 @@ fn request_page(iw: &mut InterruptedWork, id: String, from: usize) {
         *asked = true;
         *page = Some(from);
     }
-    let instance = iw.instance.clone();
-    spawn(iw, async move {
-        let result = bounded(
-            SHOW_TIMEOUT,
-            client().show_interrupted_page(&id, None, Some(from), instance.as_deref()),
-        )
-        .await;
-        Answer::Shown { id, result }
-    });
+    send(
+        iw,
+        InterruptedSeamRequest::Show {
+            id,
+            reports_from: from,
+        },
+    );
 }
 
 /// Reclaim the item `id`, or with `dry_run` ask what that would do.
 fn reclaim(iw: &mut InterruptedWork, id: String, dry_run: bool) {
     iw.busy = true;
-    let instance = iw.instance.clone();
-    if !spawn(iw, async move {
-        let result = bounded(
-            RECLAIM_TIMEOUT,
-            client().reclaim_interrupted(&id, dry_run, None, instance.as_deref()),
-        )
-        .await;
-        Answer::Reclaimed {
-            id,
-            dry_run,
-            result,
-        }
-    }) {
+    if !send(iw, InterruptedSeamRequest::Reclaim { id, dry_run }) {
         iw.busy = false;
     }
 }
@@ -732,15 +771,7 @@ fn reclaim(iw: &mut InterruptedWork, id: String, dry_run: bool) {
 fn dismiss(iw: &mut InterruptedWork, ids: Vec<String>) {
     iw.busy = true;
     iw.view = View::List;
-    let instance = iw.instance.clone();
-    if !spawn(iw, async move {
-        let result = bounded(
-            DISMISS_TIMEOUT,
-            client().dismiss_interrupted(ids, false, None, instance.as_deref()),
-        )
-        .await;
-        Answer::Dismissed { result }
-    }) {
+    if !send(iw, InterruptedSeamRequest::Dismiss { ids, all: false }) {
         iw.busy = false;
     }
 }
@@ -1402,38 +1433,102 @@ pub(super) fn render_overlay(
 // L1 seam
 // ---------------------------------------------------------------------------
 
-/// An answer the L1 seam hands in, as the request would deliver it.
-pub(super) fn seam_answer(ui: &UiState, step: &InterruptedSeamStep) -> Option<Answer> {
-    let iw = &ui.interrupted;
+/// The L1 seam: record every request instead of sending it.
+pub(super) fn seam_record(ui: &mut UiState) {
+    ui.interrupted.recorder = Some(Vec::new());
+}
+
+/// The requests the L1 seam recorded, in order.
+pub(super) fn seam_sent(ui: &UiState) -> Vec<InterruptedSeamSent> {
+    ui.interrupted
+        .recorder
+        .iter()
+        .flatten()
+        .map(|r| r.sent.clone())
+        .collect()
+}
+
+/// The answer the L1 seam hands in for `step`: to the request at index
+/// `to` of the record, or else to the newest recorded request of the step's
+/// kind. `None` when there is no such request, or `step` is no answer.
+pub(super) fn seam_answer(
+    ui: &UiState,
+    to: Option<usize>,
+    step: &InterruptedSeamStep,
+) -> Option<Answer> {
+    let log = ui.interrupted.recorder.as_ref()?;
+    let wanted = |r: &&Recorded| match step {
+        InterruptedSeamStep::Reclaimed(outcome) => matches!(
+            &r.sent.request,
+            InterruptedSeamRequest::Reclaim { dry_run, .. } if *dry_run == outcome.dry_run
+        ),
+        _ => seam_kind(step).is_some_and(|kind| r.sent.request.kind() == kind),
+    };
+    let recorded = match to {
+        Some(index) => log.get(index)?,
+        None => log.iter().rev().find(wanted)?,
+    };
+    let seq = recorded.seq;
+    let (id, dry_run) = match &recorded.sent.request {
+        InterruptedSeamRequest::Show { id, .. } => (id.clone(), false),
+        InterruptedSeamRequest::Reclaim { id, dry_run } => (id.clone(), *dry_run),
+        _ => (String::new(), false),
+    };
+    // A failed (`Err`) or unsupported (`Ok`) answer of the request's kind.
+    let failed = |result: Result<(), String>| -> Answer {
+        fn none<T>(result: &Result<(), String>) -> Result<Option<T>, String> {
+            result.clone().map(|()| None)
+        }
+        match recorded.sent.request.kind() {
+            InterruptedSeamKind::List => Answer::Listed {
+                seq,
+                result: none(&result),
+            },
+            InterruptedSeamKind::Show => Answer::Shown {
+                id: id.clone(),
+                result: none(&result),
+            },
+            InterruptedSeamKind::Reclaim => Answer::Reclaimed {
+                id: id.clone(),
+                dry_run,
+                result: none(&result),
+            },
+            InterruptedSeamKind::Dismiss => Answer::Dismissed {
+                result: none(&result),
+            },
+        }
+    };
     Some(match step {
-        InterruptedSeamStep::Key(_) => return None,
         InterruptedSeamStep::Listed(list) => Answer::Listed {
-            seq: iw.list_seq,
+            seq,
             result: Ok(Some(list.clone())),
         },
         InterruptedSeamStep::Shown(show) => Answer::Shown {
-            id: show.item.id.as_str().to_string(),
+            id,
             result: Ok(Some(show.clone())),
         },
         InterruptedSeamStep::Reclaimed(outcome) => Answer::Reclaimed {
-            id: match &iw.view {
-                View::Reclaim { id, .. } => id.clone(),
-                _ => outcome.id.clone().unwrap_or_default(),
-            },
+            id,
             dry_run: outcome.dry_run,
             result: Ok(Some(outcome.clone())),
         },
         InterruptedSeamStep::Dismissed(outcome) => Answer::Dismissed {
             result: Ok(Some(outcome.clone())),
         },
+        InterruptedSeamStep::Failed(_, message) => failed(Err(message.clone())),
+        InterruptedSeamStep::Unsupported(_) => failed(Ok(())),
+        _ => return None,
     })
 }
 
-/// The L1 seam's start: the attach fetch answered `list`.
-pub(super) fn seam_listed(ui: &mut UiState, list: &InterruptedList) {
-    let answer = Answer::Listed {
-        seq: ui.interrupted.list_seq,
-        result: Ok(Some(list.clone())),
-    };
-    apply(ui, answer);
+/// The kind of request `step` answers.
+fn seam_kind(step: &InterruptedSeamStep) -> Option<InterruptedSeamKind> {
+    Some(match step {
+        InterruptedSeamStep::Listed(_) => InterruptedSeamKind::List,
+        InterruptedSeamStep::Shown(_) => InterruptedSeamKind::Show,
+        InterruptedSeamStep::Reclaimed(_) => InterruptedSeamKind::Reclaim,
+        InterruptedSeamStep::Dismissed(_) => InterruptedSeamKind::Dismiss,
+        InterruptedSeamStep::Failed(kind, _) | InterruptedSeamStep::Unsupported(kind) => *kind,
+        _ => return None,
+    })
 }

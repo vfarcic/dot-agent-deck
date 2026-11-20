@@ -21,10 +21,15 @@ use dot_agent_deck::interrupted_work::{
     InterruptedList, InterruptedShow, ItemKind, ItemReport, LABEL_BRANCH, LABEL_FOLDER,
     LABEL_LAST_ENTRY, LABEL_PROGRESS, LABEL_REPORT, LABEL_STARTED_BY, LABEL_WORKTREE, LastEntry,
     OTHER_AGENTS_GROUP, Progress, RECLAIM_EXPLANATION, RECLAIM_REMOVED, RECLAIM_WOULD_REMOVE,
-    ReclaimOutcome, ReclaimVerdict, ShownReport, dismiss_all_question, interrupted_footer,
-    kept_until, kind_label, progress_line, unpushed_sentence,
+    ReclaimOutcome, ReclaimVerdict, Refusal, RefusalReason, ShownReport, UNSUPPORTED,
+    dismiss_all_question, interrupted_footer, kept_until, kind_label, progress_line,
+    unpushed_sentence,
 };
-use dot_agent_deck::ui::{InterruptedSeamStep, UiMode, render_interrupted_work_to_buffers};
+use dot_agent_deck::keybindings::KeybindingConfig;
+use dot_agent_deck::ui::{
+    INTERRUPTED_SEAM_FIRST_DAEMON, InterruptedSeamKind, InterruptedSeamRequest,
+    InterruptedSeamStep, UiMode, render_interrupted_work_to_buffers, run_interrupted_work_seam,
+};
 use dot_agent_deck::work_journal::WorkId;
 use spec::spec;
 
@@ -612,4 +617,830 @@ fn interrupted_017_bidi_controls_from_the_journal_are_not_drawn() {
         &shown[2],
         &format!("{LABEL_BRANCH}: agent/\\u{{202e}}txt.exe"),
     );
+}
+
+// ---------------------------------------------------------------------------
+// The TUI review's findings (#1790 stage 2): what the TUI sends, and which
+// answers it applies. `run` records every request instead of sending it.
+// ---------------------------------------------------------------------------
+
+const NEW_ID: &str = "w-abcdefgh-0000000000000004";
+const SECOND_DAEMON: &str = "seam-daemon-2";
+
+/// The frames drawn and the requests sent by `steps`, with `keybindings`, at
+/// `width` × `height`.
+fn run_with(
+    list: &InterruptedList,
+    keybindings: &KeybindingConfig,
+    steps: &[InterruptedSeamStep],
+    width: u16,
+    height: u16,
+) -> (Vec<String>, Vec<InterruptedSeamRequest>) {
+    let run =
+        run_interrupted_work_seam(list, &[], UiMode::Normal, keybindings, steps, width, height);
+    (
+        run.frames.iter().map(text).collect(),
+        run.sent.into_iter().map(|sent| sent.request).collect(),
+    )
+}
+
+fn run(
+    list: &InterruptedList,
+    steps: &[InterruptedSeamStep],
+) -> (Vec<String>, Vec<InterruptedSeamRequest>) {
+    run_with(list, &KeybindingConfig::default(), steps, WIDTH, HEIGHT)
+}
+
+fn dismissal(ids: &[&str]) -> InterruptedSeamRequest {
+    InterruptedSeamRequest::Dismiss {
+        ids: ids.iter().map(|id| id.to_string()).collect(),
+        all: false,
+    }
+}
+
+fn dry_run(id: &str) -> InterruptedSeamRequest {
+    InterruptedSeamRequest::Reclaim {
+        id: id.to_string(),
+        dry_run: true,
+    }
+}
+
+fn real_reclaim(id: &str) -> InterruptedSeamRequest {
+    InterruptedSeamRequest::Reclaim {
+        id: id.to_string(),
+        dry_run: false,
+    }
+}
+
+fn is_real_reclaim(request: &InterruptedSeamRequest) -> bool {
+    matches!(
+        request,
+        InterruptedSeamRequest::Reclaim { dry_run: false, .. }
+    )
+}
+
+fn list_of(items: Vec<InterruptedItem>) -> InterruptedList {
+    InterruptedList {
+        items,
+        incomplete: false,
+        omitted: 0,
+    }
+}
+
+/// The unit's dry run, which would remove its worktree.
+fn would_remove() -> ReclaimOutcome {
+    ReclaimOutcome {
+        id: Some(UNIT_ID.to_string()),
+        dry_run: true,
+        verdict: ReclaimVerdict::WouldRemove,
+        message: RECLAIM_WOULD_REMOVE.to_string(),
+        refusal: None,
+        worktree: unit().worktree,
+        branch: unit().branch,
+        unpushed_commits: None,
+        nested_worktrees: Vec::new(),
+        recorded: false,
+    }
+}
+
+fn removed() -> ReclaimOutcome {
+    ReclaimOutcome {
+        dry_run: false,
+        verdict: ReclaimVerdict::Removed,
+        message: RECLAIM_REMOVED.to_string(),
+        recorded: true,
+        ..would_remove()
+    }
+}
+
+/// Every character a journal value must not put on screen as itself: the C0
+/// and C1 controls, DEL, and the bidi formatting characters.
+fn hostile(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}' | '\u{061C}'
+        )
+}
+
+fn every_hostile_char() -> String {
+    (0u32..=0x9f)
+        .filter_map(char::from_u32)
+        .filter(|c| c.is_control())
+        .chain(
+            ['\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}']
+                .into_iter()
+                .chain(['\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}'])
+                .chain(['\u{200E}', '\u{200F}', '\u{061C}']),
+        )
+        .collect()
+}
+
+/// The overlay's box in `buffer`: every row between its top and bottom
+/// border starts and ends with a vertical border cell.
+fn assert_box_intact(buffer: &ratatui::buffer::Buffer, at_step: usize) {
+    let area = buffer.area();
+    let find = |want: &str| {
+        (0..area.height).find_map(|y| {
+            (0..area.width).find_map(|x| (buffer[(x, y)].symbol() == want).then_some((x, y)))
+        })
+    };
+    let Some((left, top)) = find("┌") else {
+        return;
+    };
+    let right = (left..area.width)
+        .find(|x| buffer[(*x, top)].symbol() == "┐")
+        .unwrap_or_else(|| panic!("frame {at_step}: the box has a top right corner"));
+    let bottom = (top..area.height)
+        .find(|y| buffer[(left, *y)].symbol() == "└")
+        .unwrap_or_else(|| panic!("frame {at_step}: the box has a bottom left corner"));
+    assert_eq!(buffer[(right, bottom)].symbol(), "┘", "frame {at_step}");
+    for y in top + 1..bottom {
+        assert!(
+            buffer[(left, y)].symbol() == "│" && buffer[(right, y)].symbol() == "│",
+            "frame {at_step}: row {y} keeps both borders:\n{}",
+            text(buffer)
+        );
+    }
+}
+
+/// Scenario: Every journal value the TUI shows carries C0 and C1 controls
+/// and every bidi formatting character, around long Chinese paths: an item's
+/// name, branch, worktree, launcher, last entry, roles and repository, its
+/// report's id and text, a reclaim dry run's paths and an unknown verdict's
+/// sentence, and a failed request's message. No frame of the list, details,
+/// shown reports or reclaim draws any of them, and the overlay's borders stay
+/// whole.
+#[spec("journal/interrupted/018")]
+#[test]
+fn interrupted_018_hostile_journal_values_are_escaped_everywhere_they_are_shown() {
+    let evil = every_hostile_char();
+    let long = format!(
+        "/home/me/代码/{}{evil}/尾巴",
+        "非常长的目录名称/".repeat(12)
+    );
+    let mut item = unit();
+    item.name = Some(format!("fix{evil}login"));
+    item.branch = Some(format!("agent/{evil}分支-{}", "长".repeat(60)));
+    item.worktree = Some(long.clone());
+    item.launcher = Some(format!("dispatcher{evil}"));
+    item.last_entry.kind = format!("attempt{evil}_ended");
+    item.progress.roles = vec![format!("coder{evil}")];
+    item.repo = Some(format!("me/app{evil}"));
+    item.issue = Some(7);
+    item.reports[0].report_id = format!("r-{evil}");
+    let mut show = page(1, 1, 1, None);
+    show.item = item.clone();
+    show.reports = vec![ShownReport {
+        report_id: format!("r-{evil}"),
+        body: Some(format!("[UNTRUSTED-WORKER-REPORT:\nall {evil} done\n")),
+        cut: false,
+        error: None,
+    }];
+    let dry = ReclaimOutcome {
+        worktree: Some(long.clone()),
+        branch: item.branch.clone(),
+        nested_worktrees: vec![format!("{long}/嵌套{evil}")],
+        ..would_remove()
+    };
+    let unknown = ReclaimOutcome {
+        verdict: ReclaimVerdict::Unknown,
+        message: format!("a newer daemon says {evil} this"),
+        ..dry.clone()
+    };
+    let steps = [
+        ch('I'),
+        key(KeyCode::Enter),
+        key(KeyCode::Enter),
+        InterruptedSeamStep::Shown(show),
+        key(KeyCode::Esc),
+        ch('r'),
+        InterruptedSeamStep::Reclaimed(dry),
+        key(KeyCode::Esc),
+        ch('r'),
+        InterruptedSeamStep::Reclaimed(unknown),
+        key(KeyCode::Esc),
+        ch('d'),
+        InterruptedSeamStep::Failed(
+            InterruptedSeamKind::Dismiss,
+            format!("the daemon failed {evil} here"),
+        ),
+    ];
+    for (width, height) in [(WIDTH, HEIGHT), (80, 24), (40, 24)] {
+        let run = run_interrupted_work_seam(
+            &only(item.clone()),
+            &[],
+            UiMode::Normal,
+            &KeybindingConfig::default(),
+            &steps,
+            width,
+            height,
+        );
+        for (at_step, buffer) in run.frames.iter().enumerate() {
+            let area = buffer.area();
+            for y in 0..area.height {
+                for x in 0..area.width {
+                    let symbol = buffer[(x, y)].symbol();
+                    assert!(
+                        !symbol.chars().any(hostile),
+                        "{width}x{height} frame {at_step} draws {symbol:?} at ({x}, {y}):\n{}",
+                        text(buffer)
+                    );
+                }
+            }
+            assert_box_intact(buffer, at_step);
+        }
+        if width == WIDTH {
+            let shown: Vec<String> = run.frames.iter().map(text).collect();
+            assert!(shown[1].contains("▶ fix"), "{}", shown[1]);
+            assert!(shown[7].contains("y/n"), "{}", shown[7]);
+            assert!(shown[10].contains("a newer daemon says"), "{}", shown[10]);
+            // Escaped where it is drawn, as the CLI shows it, whatever path
+            // the message took.
+            assert!(
+                shown[13].contains("the daemon failed \\u{0}\\u{1}"),
+                "{}",
+                shown[13]
+            );
+        }
+    }
+}
+
+/// Scenario: In the "Interrupted work" list, `r` asks for a dry run and the
+/// person backs out with `Esc`, `q` or `n` before it answers. Whether the dry
+/// run then answers, fails or never answers, `d` and `r` work again at once,
+/// and a late answer of the abandoned dry run is not shown as the answer of
+/// a newer one.
+#[spec("journal/interrupted/019")]
+#[test]
+fn interrupted_019_a_cancelled_dry_run_leaves_the_actions_free() {
+    for cancel in [KeyCode::Esc, KeyCode::Char('q'), KeyCode::Char('n')] {
+        for (what, late) in [
+            (
+                "answered",
+                Some(InterruptedSeamStep::Reclaimed(would_remove())),
+            ),
+            (
+                "failed",
+                Some(InterruptedSeamStep::Failed(
+                    InterruptedSeamKind::Reclaim,
+                    "timed out".to_string(),
+                )),
+            ),
+            ("still out", None),
+        ] {
+            let mut steps = vec![ch('I'), ch('r'), key(cancel)];
+            steps.extend(late);
+            steps.push(ch('d'));
+            let (shown, sent) = run(&three(), &steps);
+            assert_eq!(
+                sent.last(),
+                Some(&dismissal(&[UNIT_ID])),
+                "{cancel:?}, the dry run {what}: `d` dismisses:\n{}",
+                shown.last().unwrap()
+            );
+        }
+    }
+
+    // A second dry run while the first, abandoned, is still out.
+    let (shown, sent) = run(
+        &three(),
+        &[
+            ch('I'),
+            ch('r'),
+            key(KeyCode::Esc),
+            ch('r'),
+            InterruptedSeamStep::AnswerTo(
+                2,
+                Box::new(InterruptedSeamStep::Reclaimed(would_remove())),
+            ),
+            InterruptedSeamStep::Reclaimed(would_remove()),
+            ch('y'),
+        ],
+    );
+    assert_eq!(
+        sent.iter().filter(|r| **r == dry_run(UNIT_ID)).count(),
+        2,
+        "the second `r` asks again: {sent:?}"
+    );
+    assert!(
+        !shown[5].contains("y/n"),
+        "the abandoned dry run's answer is not the newer one's:\n{}",
+        shown[5]
+    );
+    assert!(shown[6].contains("y/n"), "{}", shown[6]);
+    assert_eq!(sent.last(), Some(&real_reclaim(UNIT_ID)), "{sent:?}");
+}
+
+/// Scenario: The TUI attached to one daemon process asked it for the list,
+/// a dry run, a reclaim, a dismissal and a report, and then reconnected to
+/// another process before they answered. Each late answer from the first
+/// process is dropped — even a list answer whose request number collides
+/// with the second's — so the second's list, view and requests stay as they
+/// were. The list is fetched once per process the TUI attaches to.
+#[spec("journal/interrupted/020")]
+#[test]
+fn interrupted_020_answers_from_an_earlier_daemon_process_are_dropped() {
+    let mut other = item(NEW_ID, ItemKind::Unit, "other-work");
+    other.reports = unit().reports;
+    let second = only(other.clone());
+    let attach = || InterruptedSeamStep::Attach(SECOND_DAEMON.to_string());
+
+    // A list answer, numbered as the second process's newest list request.
+    let (shown, sent) = run(
+        &three(),
+        &[
+            ch('I'),
+            attach(),
+            InterruptedSeamStep::Listed(second.clone()),
+            key(KeyCode::Esc),
+            ch('I'),
+            InterruptedSeamStep::AnswerTo(1, Box::new(InterruptedSeamStep::Listed(three()))),
+        ],
+    );
+    assert_eq!(sent.len(), 4, "{sent:?}");
+    let after = shown.last().unwrap();
+    assert!(
+        after.contains("other-work") && !after.contains("fix-login"),
+        "the first process's list does not replace the second's:\n{after}"
+    );
+
+    // A dry run, a real reclaim and a dismissal of the first process.
+    let cases: Vec<(&str, Vec<InterruptedSeamStep>, usize, InterruptedSeamStep)> = vec![
+        (
+            "dry run",
+            vec![ch('I'), ch('r')],
+            2,
+            InterruptedSeamStep::Reclaimed(would_remove()),
+        ),
+        (
+            "reclaim",
+            vec![
+                ch('I'),
+                ch('r'),
+                InterruptedSeamStep::Reclaimed(would_remove()),
+                ch('y'),
+            ],
+            3,
+            InterruptedSeamStep::Reclaimed(removed()),
+        ),
+        (
+            "dismissal",
+            vec![ch('I'), ch('d')],
+            2,
+            InterruptedSeamStep::Dismissed(DismissOutcome {
+                dismissed: vec![DismissedItem {
+                    id: UNIT_ID.to_string(),
+                    name: None,
+                }],
+                ..DismissOutcome::default()
+            }),
+        ),
+    ];
+    for (what, mut steps, index, late) in cases {
+        steps.push(attach());
+        steps.push(InterruptedSeamStep::Listed(second.clone()));
+        let (before, sent_before) = run(&three(), &steps);
+        steps.push(InterruptedSeamStep::AnswerTo(index, Box::new(late)));
+        let (shown, sent) = run(&three(), &steps);
+        assert_eq!(
+            sent, sent_before,
+            "the first process's {what} answer sends nothing"
+        );
+        assert_eq!(
+            shown.last(),
+            before.last(),
+            "the first process's {what} answer changes nothing:\n{}",
+            shown.last().unwrap()
+        );
+        // And nothing is left busy: the second process's item can be dismissed.
+        steps.push(ch('d'));
+        let (_, sent) = run(&three(), &steps);
+        assert_eq!(sent.last(), Some(&dismissal(&[NEW_ID])), "after the {what}");
+    }
+
+    // A report asked of the first process for an item of the same id.
+    let mut same_id = unit();
+    same_id.name = Some("second-unit".to_string());
+    let mut from_first = page(1, 1, 1, None);
+    from_first.reports = vec![ShownReport {
+        report_id: REPORT_ID.to_string(),
+        body: Some("BODY FROM THE FIRST PROCESS".to_string()),
+        cut: false,
+        error: None,
+    }];
+    let (shown, _) = run(
+        &three(),
+        &[
+            ch('I'),
+            key(KeyCode::Enter),
+            key(KeyCode::Enter),
+            attach(),
+            InterruptedSeamStep::Listed(only(same_id)),
+            key(KeyCode::Enter),
+            key(KeyCode::Enter),
+            InterruptedSeamStep::AnswerTo(2, Box::new(InterruptedSeamStep::Shown(from_first))),
+        ],
+    );
+    assert!(
+        !shown
+            .last()
+            .unwrap()
+            .contains("BODY FROM THE FIRST PROCESS"),
+        "the first process's report is not shown in the second's details:\n{}",
+        shown.last().unwrap()
+    );
+
+    // One attach fetch per process: none for a frame on the same process.
+    let (_, sent) = run(
+        &three(),
+        &[
+            InterruptedSeamStep::Attach(INTERRUPTED_SEAM_FIRST_DAEMON.to_string()),
+            attach(),
+            attach(),
+            InterruptedSeamStep::Listed(second),
+            attach(),
+        ],
+    );
+    assert_eq!(
+        sent,
+        vec![
+            InterruptedSeamRequest::List { git: false },
+            InterruptedSeamRequest::List { git: false },
+        ],
+        "one fetch for each daemon process"
+    );
+}
+
+/// Scenario: With the orchestration selected in the "Interrupted work" list,
+/// a refresh drops an earlier item, adds a newer one or reorders the list.
+/// The selection stays on the orchestration (`▶ release-team`), and `d`
+/// dismisses it; only when the selected item is gone does the selection
+/// move to its neighbour.
+#[spec("journal/interrupted/021")]
+#[test]
+fn interrupted_021_a_refresh_keeps_the_selected_item() {
+    let newer = item(NEW_ID, ItemKind::Unit, "newer-work");
+    let mut agent2 = agent();
+    agent2.id = WorkId::parse("w-abcdefgh-0000000000000005").unwrap();
+    agent2.name = Some("other-shell".to_string());
+    for (what, refreshed) in [
+        ("an earlier item dismissed", list_of(vec![agent(), team()])),
+        (
+            "a newer item added",
+            list_of(vec![agent(), newer.clone(), unit(), team()]),
+        ),
+        ("reordered", list_of(vec![agent(), team(), unit()])),
+    ] {
+        let (shown, sent) = run(
+            &three(),
+            &[
+                ch('I'),
+                ch('j'),
+                InterruptedSeamStep::Listed(refreshed),
+                ch('d'),
+            ],
+        );
+        assert!(
+            shown[3].contains("▶ release-team"),
+            "{what}: the selection stays on the orchestration:\n{}",
+            shown[3]
+        );
+        assert_eq!(sent.last(), Some(&dismissal(&[TEAM_ID])), "{what}");
+    }
+    // The selected plain agent, after another agent is listed before it.
+    let (shown, sent) = run(
+        &three(),
+        &[
+            ch('I'),
+            ch('j'),
+            ch('j'),
+            InterruptedSeamStep::Listed(list_of(vec![agent2, agent(), unit(), team()])),
+            ch('d'),
+        ],
+    );
+    assert!(shown[4].contains("▶ scratch-shell"), "{}", shown[4]);
+    assert_eq!(sent.last(), Some(&dismissal(&[AGENT_ID])));
+    // Gone: its neighbour.
+    let (shown, sent) = run(
+        &three(),
+        &[
+            ch('I'),
+            ch('j'),
+            InterruptedSeamStep::Listed(list_of(vec![agent(), unit()])),
+            ch('d'),
+        ],
+    );
+    assert!(shown[3].contains("▶ scratch-shell"), "{}", shown[3]);
+    assert_eq!(sent.last(), Some(&dismissal(&[AGENT_ID])));
+}
+
+/// Scenario: With the "Interrupted work" list open, its details or a
+/// confirmation, the footer offers `[Hide X]`; pressing `X` hides the footer
+/// row and dismisses nothing, and with the hide key remapped to `Z` the
+/// footer offers `[Hide Z]` and `Z` hides it.
+#[spec("journal/interrupted/022")]
+#[test]
+fn interrupted_022_the_hide_key_acts_in_the_overlay() {
+    let footer = interrupted_footer(3);
+    for (what, steps) in [
+        ("list", vec![ch('I'), ch('X')]),
+        ("details", vec![ch('I'), key(KeyCode::Enter), ch('X')]),
+        ("dismiss all", vec![ch('I'), ch('D'), ch('X')]),
+    ] {
+        let (shown, sent) = run(&three(), &steps);
+        let before = &shown[shown.len() - 2];
+        let after = shown.last().unwrap();
+        assert!(
+            before.contains(&footer) && before.contains("[Hide X]"),
+            "{what}: {before}"
+        );
+        assert!(
+            !after.contains(&footer) && after.contains(INTERRUPTED_WORK_TITLE),
+            "{what}: `X` hides the footer and leaves the overlay open:\n{after}"
+        );
+        assert!(
+            !sent
+                .iter()
+                .any(|r| matches!(r, InterruptedSeamRequest::Dismiss { .. })),
+            "{what}: {sent:?}"
+        );
+    }
+    let (remapped, warnings) =
+        KeybindingConfig::from_toml_str("[dashboard]\nhide_interrupted_work = \"Z\"\n")
+            .expect("the remap parses");
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let (shown, _) = run_with(&three(), &remapped, &[ch('I'), ch('Z')], WIDTH, HEIGHT);
+    assert!(shown[1].contains("[Hide Z]"), "{}", shown[1]);
+    assert!(!shown[2].contains(&footer), "{}", shown[2]);
+}
+
+/// Scenario: In a unit's details, `Enter` asks for its kept reports and the
+/// request fails, or the daemon does not support it. The details say why,
+/// `Enter` asks again, and the next answer shows the report. A failed `n`
+/// for the next page says why too, keeps the page shown, and `n` asks again.
+#[spec("journal/interrupted/023")]
+#[test]
+fn interrupted_023_a_failed_report_request_is_shown_and_can_be_retried() {
+    let good = page(1, 1, 1, Some(1));
+    for (what, failure, reason) in [
+        (
+            "failed",
+            InterruptedSeamStep::Failed(InterruptedSeamKind::Show, "the daemon went away".into()),
+            "the daemon went away",
+        ),
+        (
+            "unsupported",
+            InterruptedSeamStep::Unsupported(InterruptedSeamKind::Show),
+            &UNSUPPORTED[..=UNSUPPORTED.find('.').unwrap()],
+        ),
+    ] {
+        let (shown, sent) = run(
+            &only(unit()),
+            &[
+                ch('I'),
+                key(KeyCode::Enter),
+                key(KeyCode::Enter),
+                failure,
+                key(KeyCode::Enter),
+                InterruptedSeamStep::Shown(good.clone()),
+            ],
+        );
+        assert!(
+            shown[4].contains(reason),
+            "{what}: the details say why:\n{}",
+            shown[4]
+        );
+        let shows = sent
+            .iter()
+            .filter(|r| matches!(r, InterruptedSeamRequest::Show { .. }))
+            .count();
+        assert_eq!(shows, 2, "{what}: `Enter` asks again: {sent:?}");
+        assert!(shown[6].contains("BODY OF r-1"), "{what}:\n{}", shown[6]);
+    }
+
+    let mut listed = unit();
+    listed.reports = (1..=3).map(report).collect();
+    listed.reports_omitted = 5;
+    let (shown, sent) = run(
+        &only(listed),
+        &[
+            ch('I'),
+            key(KeyCode::Enter),
+            key(KeyCode::Enter),
+            InterruptedSeamStep::Shown(page(1, 3, 8, Some(1))),
+            ch('n'),
+            InterruptedSeamStep::Failed(InterruptedSeamKind::Show, "timed out".into()),
+            ch('n'),
+        ],
+    );
+    let failed = &shown[6];
+    assert!(
+        failed.contains("timed out") && failed.contains("Reports 1 to 3 of 8."),
+        "a failed page says why and keeps the page shown:\n{failed}"
+    );
+    assert_eq!(
+        sent.last(),
+        Some(&InterruptedSeamRequest::Show {
+            id: UNIT_ID.to_string(),
+            reports_from: 3,
+        }),
+        "`n` asks again: {sent:?}"
+    );
+}
+
+/// Scenario: In a 40-column terminal, `D` asks "Dismiss all: 3 interrupted
+/// items from before the restart? [y/N]" wrapped over several rows, and `y`
+/// dismisses all three. In an 80×24 terminal, a dry run naming long Chinese
+/// paths pushes "Reclaim? y/n" below the popup: `y` does nothing until
+/// PageDown scrolls the question into view, then reclaims. `Esc` and `q`
+/// still go back.
+#[spec("journal/interrupted/024")]
+#[test]
+fn interrupted_024_a_confirmation_too_big_for_its_popup_can_be_reached() {
+    let all = dismissal(&[UNIT_ID, TEAM_ID, AGENT_ID]);
+    let (shown, sent) = run_with(
+        &three(),
+        &KeybindingConfig::default(),
+        &[ch('I'), ch('D'), ch('y')],
+        40,
+        24,
+    );
+    let asked: String = shown[2]
+        .lines()
+        .filter_map(|line| line.split('│').nth(1))
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        asked.contains(dismiss_all_question(3).trim_end()),
+        "the whole question is drawn:\n{}",
+        shown[2]
+    );
+    assert_eq!(sent.last(), Some(&all), "{}", shown[3]);
+    for back in [key(KeyCode::Esc), ch('q')] {
+        let (shown, sent) = run_with(
+            &three(),
+            &KeybindingConfig::default(),
+            &[ch('I'), ch('D'), back],
+            40,
+            24,
+        );
+        assert!(!sent.contains(&all) && !shown[3].contains("Dismiss all:"));
+    }
+
+    let long = |n: usize| format!("/home/me/代码/{}/{n}", "非常长的目录名称".repeat(6));
+    let dry = ReclaimOutcome {
+        worktree: Some(long(0)),
+        branch: Some(format!("agent/{}", "分支".repeat(40))),
+        unpushed_commits: Some(3),
+        nested_worktrees: (1..=6).map(long).collect(),
+        ..would_remove()
+    };
+    let (shown, sent) = run_with(
+        &only(unit()),
+        &KeybindingConfig::default(),
+        &[
+            ch('I'),
+            ch('r'),
+            InterruptedSeamStep::Reclaimed(dry.clone()),
+            ch('y'),
+            key(KeyCode::PageDown),
+            key(KeyCode::PageDown),
+            key(KeyCode::PageDown),
+            key(KeyCode::PageDown),
+            ch('y'),
+        ],
+        80,
+        24,
+    );
+    assert!(
+        !shown[3].contains("Reclaim? y/n"),
+        "the premise: the question is below the popup:\n{}",
+        shown[3]
+    );
+    assert_eq!(
+        sent.iter().filter(|r| is_real_reclaim(r)).count(),
+        1,
+        "`y` reclaims once, after the question is in view: {sent:?}"
+    );
+    assert!(shown[8].contains("Reclaim? y/n"), "{}", shown[8]);
+    let (_, before_scroll) = run_with(
+        &only(unit()),
+        &KeybindingConfig::default(),
+        &[
+            ch('I'),
+            ch('r'),
+            InterruptedSeamStep::Reclaimed(dry.clone()),
+            ch('y'),
+        ],
+        80,
+        24,
+    );
+    assert!(
+        !before_scroll.iter().any(is_real_reclaim),
+        "`y` before the question is in view does nothing: {before_scroll:?}"
+    );
+    for back in [key(KeyCode::Esc), ch('q')] {
+        let (shown, _) = run_with(
+            &only(unit()),
+            &KeybindingConfig::default(),
+            &[
+                ch('I'),
+                ch('r'),
+                InterruptedSeamStep::Reclaimed(dry.clone()),
+                back,
+            ],
+            80,
+            24,
+        );
+        assert!(
+            shown[4].contains("fix-login") && !shown[4].contains(RECLAIM_EXPLANATION),
+            "{}",
+            shown[4]
+        );
+    }
+}
+
+/// Scenario: A `y` typed before the confirmation was drawn, or while a
+/// terminal too short shows no question, sends nothing; a dry run that keeps
+/// the worktree or was refused offers no `y`, and `y` sends no reclaim; and
+/// `D`, a refresh that lists a fourth item, then `y` dismisses exactly the
+/// three items the question named, never "all".
+#[spec("journal/interrupted/025")]
+#[test]
+fn interrupted_025_a_confirmation_sends_only_what_it_showed() {
+    let all = dismissal(&[UNIT_ID, TEAM_ID, AGENT_ID]);
+    // Typed before a frame showed the question.
+    let (_, sent) = run(
+        &three(),
+        &[ch('I'), InterruptedSeamStep::Burst(vec![ch('D'), ch('y')])],
+    );
+    assert!(!sent.contains(&all), "{sent:?}");
+    let (_, sent) = run(
+        &only(unit()),
+        &[
+            ch('I'),
+            ch('r'),
+            InterruptedSeamStep::Burst(vec![
+                InterruptedSeamStep::Reclaimed(would_remove()),
+                ch('y'),
+            ]),
+        ],
+    );
+    assert!(!sent.iter().any(is_real_reclaim), "{sent:?}");
+    // A terminal too short to show the question at all.
+    let (_, sent) = run_with(
+        &three(),
+        &KeybindingConfig::default(),
+        &[ch('I'), ch('D'), ch('y'), key(KeyCode::PageDown), ch('y')],
+        WIDTH,
+        7,
+    );
+    assert!(!sent.contains(&all), "{sent:?}");
+    // Kept and refused dry runs.
+    for outcome in [
+        ReclaimOutcome {
+            verdict: ReclaimVerdict::KeptDirty,
+            ..would_remove()
+        },
+        ReclaimOutcome {
+            verdict: ReclaimVerdict::Refused,
+            refusal: Some(Refusal::new(RefusalReason::NotOwned)),
+            ..would_remove()
+        },
+        ReclaimOutcome {
+            refusal: Some(Refusal::new(RefusalReason::StillInUse)),
+            ..would_remove()
+        },
+    ] {
+        let (shown, sent) = run(
+            &only(unit()),
+            &[
+                ch('I'),
+                ch('r'),
+                InterruptedSeamStep::Reclaimed(outcome),
+                ch('y'),
+            ],
+        );
+        assert!(!shown[3].contains("y/n"), "{}", shown[3]);
+        assert!(!sent.iter().any(is_real_reclaim), "{sent:?}");
+    }
+    // Exactly the ids the question named, with `all` false.
+    let newer = item(NEW_ID, ItemKind::Unit, "newer-work");
+    let (shown, sent) = run(
+        &three(),
+        &[
+            ch('I'),
+            ch('D'),
+            InterruptedSeamStep::Listed(list_of(vec![agent(), newer, unit(), team()])),
+            ch('y'),
+        ],
+    );
+    assert!(
+        shown[3].contains(dismiss_all_question(3).trim_end()),
+        "{}",
+        shown[3]
+    );
+    assert_eq!(sent.last(), Some(&all), "{sent:?}");
 }
