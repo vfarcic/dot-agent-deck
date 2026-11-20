@@ -34,7 +34,6 @@ Whether there is anything to scroll depends on the agent; see [Scrolling back th
 |---|---|---|
 | `Ctrl+D` | Switch between command mode and the pane you came from | Both modes |
 | `Ctrl+N` | New agent: directory picker, then the New Agent form | Both modes |
-| `Ctrl+T` | Toggle stacked layout (only the focused pane, full height; the default) and tiled layout (every pane) | Both modes |
 | `Ctrl+PageDown` / `Ctrl+PageUp` | Next / previous tab | Both modes |
 | `Ctrl+W` | Close the selected pane on the dashboard, or a whole orchestration tab, after a confirmation. The dashboard tab cannot be closed. | Command mode |
 | `1`–`9` | Jump to card N and focus its pane | Command mode |
@@ -43,7 +42,7 @@ Whether there is anything to scroll depends on the agent; see [Scrolling back th
 | `Ctrl+E` | **Experimental, off by default.** Toggle the command-entry lock. See [below](#ctrle-locks-command-entry-to-the-orchestrator-pane). | Command mode, on an orchestration tab, with the `experimental` flag on |
 | `Ctrl+C` | In a pane: sent to the program (interrupt). In command mode, the directory picker or the New Agent form: opens the [quit dialog](#dialogs). | Both modes |
 
-Where a key is not claimed (for example `Ctrl+W`, `Ctrl+L`, `Ctrl+Z` or `Ctrl+E` while typing in a pane), it is passed to the program in the pane. While the close confirmation is open, only its keys and `Ctrl+C` work.
+While typing in a pane, a key that is not claimed (for example `Ctrl+T`, `Ctrl+W`, `Ctrl+L`, `Ctrl+Z` or `Ctrl+E`) is passed to the program in the pane. While the close confirmation is open, only its keys and `Ctrl+C` work.
 
 ### Plain letters in command mode
 
@@ -54,7 +53,6 @@ In command mode you can drop the `Ctrl`: the letter alone does the same thing as
 | `d` | `Ctrl+D` | Back to the pane you came from |
 | `n` | `Ctrl+N` | New agent. When the selected card shows **Needs Input**, `n` denies the permission request instead, as it always has. |
 | `w` | `Ctrl+W` | Close, with its confirmation |
-| `t` | `Ctrl+T` | Toggle layout |
 | `z` | `Ctrl+Z` | Zoom, on the dashboard or an orchestration tab |
 | `e` | `Ctrl+E` | Command-entry lock, only where `Ctrl+E` works (experimental flag on, orchestration tab) |
 
@@ -279,7 +277,6 @@ The file has two tables, `[global]` and `[dashboard]`, each mapping an action na
 ```toml
 # ~/.config/dot-agent-deck/keybindings.toml
 [global]
-toggle_layout = "Alt+Shift+l"                # move it off Ctrl+t
 toggle_orchestration_split = "Alt+Shift+s"   # move it off Ctrl+l
 toggle_zoom = "Ctrl+Alt+z"                   # move zoom off Ctrl+z
 new_pane = ""                                # unbind New Agent
@@ -308,11 +305,12 @@ Modifier and named-key names are case-insensitive (`ctrl+enter` equals `Ctrl+Ent
 | `dashboard` | `Ctrl+d` | Switch between command mode and the pane | Both modes |
 | `new_pane` | `Ctrl+n` | New agent | Both modes |
 | `close_pane` | `Ctrl+w` | Close the selected agent or orchestration tab, with confirmation | Command mode |
-| `toggle_layout` | `Ctrl+t` | Toggle stacked / tiled layout | Both modes |
 | `toggle_orchestration_lock` | `Ctrl+e` | Toggle the command-entry lock (**experimental flag required**) | Command mode, orchestration tab |
 | `toggle_orchestration_split` | `Ctrl+l` | Toggle the orchestration split between 34/66 and 25/75 | Command mode, orchestration tab |
 | `toggle_zoom` | `Ctrl+z` | Zoom the focused pane; again to restore | Command mode, dashboard or orchestration tab |
 | `jump_1` … `jump_9` | `1` … `9` | Jump to card N and focus its pane | Command mode |
+
+`toggle_layout` (`Ctrl+t`), which switched between showing only the focused pane and showing every pane, has been removed: the focused agent's pane always fills the pane column. A file that still sets it keeps working; the TUI prints a warning that the line is ignored, and you can delete it.
 
 `[dashboard]` (command mode):
 

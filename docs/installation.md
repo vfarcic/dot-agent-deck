@@ -137,7 +137,7 @@ To pin a release, append its tag: `github:vfarcic/dot-agent-deck/<tag>`. Tags fr
     # Rendered to ~/.config/dot-agent-deck/keybindings.toml
     keybindings = {
       global = {
-        toggle_layout = "Alt+Shift+l";
+        toggle_zoom = "Ctrl+Alt+z";
         new_pane = "";            # an empty string unbinds the action
       };
       dashboard.help = "F1";
