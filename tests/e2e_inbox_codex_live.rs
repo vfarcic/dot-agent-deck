@@ -251,7 +251,7 @@ fn holding_codex() -> (Codex, std::path::PathBuf, tempfile::TempDir) {
 /// interrupt Codex (Esc) in that window, release the hook, and check `id`
 /// is neither acted on nor acknowledged for longer than the witness
 /// watches; then have Codex take its messages and check it acts on `id`
-/// once, settled by its receipt with two deliveries.
+/// once (one appended line), settled by its receipt with two deliveries.
 fn interrupted_hand_over_is_handed_again(
     codex: &Codex,
     hold: &std::path::Path,
@@ -289,6 +289,12 @@ fn interrupted_hand_over_is_handed_again(
         input.write("\r");
     }
     codex.done(id, name);
+    assert_eq!(
+        std::fs::read_to_string(&sentinel).unwrap(),
+        "codex-inbox-action\n",
+        "Codex acted on the task once; {}",
+        codex.evidence()
+    );
     let summary = inbox::listing(&codex.deck, &codex.pane)["messages"]
         .as_array()
         .unwrap()
@@ -299,7 +305,7 @@ fn interrupted_hand_over_is_handed_again(
     assert_eq!(summary["deliveries"], 2, "{summary}; {}", codex.evidence());
 }
 
-/// Scenario: Start interactive Codex whose deck hooks hold after printing a hand-over, and post a sentinel task while it is idle. The deck rings Codex, Codex's real prompt hook prints the task as its context and holds, and the test presses Esc in Codex's pane, so Codex interrupts the turn and drops what the hook printed. The task must not be acted on or acknowledged for longer than the deck watches Codex's session log; once Codex takes its messages again it writes the sentinel once and the task is settled by its receipt with two deliveries.
+/// Scenario: Start interactive Codex whose deck hooks hold after printing a hand-over, and post a sentinel task while it is idle. The deck rings Codex (or, if a starved machine makes the deck withdraw its ring, the test submits the same doorbell line), Codex's real prompt hook prints the task as its context and holds, and the test presses Esc in Codex's pane, so Codex interrupts the turn and drops what the hook printed. The task must not be acted on or acknowledged for longer than the deck watches Codex's session log; once Codex takes its messages again it writes the sentinel once and the task is settled by its receipt with two deliveries.
 #[spec("inbox/codex/031")]
 #[test]
 fn codex_031_live_interrupted_doorbell_hand_over_is_handed_again() {
@@ -309,6 +315,21 @@ fn codex_031_live_interrupted_doorbell_hand_over_is_handed_again() {
     std::fs::write(&hold, b"").unwrap();
     let name = "codex-interrupted-doorbell-3d81.txt";
     let id = codex.post(name);
+    // On a starved machine the deck can withdraw its own ring before Codex
+    // submits it, and then holds the task until Codex takes a prompt; the
+    // ring is `inbox/codex/009`'s to pin. What this test needs is Codex's
+    // prompt hook handing the task over, so it then submits the same
+    // doorbell line itself.
+    let mut held = hold.as_os_str().to_owned();
+    held.push(".held");
+    let held = std::path::PathBuf::from(held);
+    let withdrawn = || codex.log().contains("doorbell ring withdrawn");
+    if !common::wait_until(BUDGET, || held.exists() || withdrawn()) || !held.exists() {
+        let line = inbox::fixed_line(&id);
+        let mut input = codex.input(line.trim_start());
+        codex.wait_screen(&id);
+        input.write("\r");
+    }
     interrupted_hand_over_is_handed_again(&codex, &hold, &id, name);
 }
 

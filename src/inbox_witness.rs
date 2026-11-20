@@ -363,7 +363,9 @@ fn strings(value: &Value) -> Vec<&str> {
 }
 
 /// The exact attempts one transcript line shows the agent took, whole
-/// ([`crate::inbox_prompt::delivered`] over [`entry_texts`]).
+/// ([`crate::inbox_prompt::delivered`] over [`entry_texts`]). An entry's
+/// texts are read one by one and also joined, as the model reads them, so a
+/// block an agent records across two parts of one message is still whole.
 pub fn witnessed_in_line(line: &[u8]) -> Vec<InboxAttemptRef> {
     if line.len() > MAX_LINE || !contains(line, NEEDLE) {
         return Vec::new();
@@ -371,8 +373,10 @@ pub fn witnessed_in_line(line: &[u8]) -> Vec<InboxAttemptRef> {
     let Ok(entry) = serde_json::from_slice::<Value>(line) else {
         return Vec::new();
     };
+    let texts = entry_texts(&entry);
+    let joined = (texts.len() > 1).then(|| texts.concat());
     let mut out: Vec<InboxAttemptRef> = Vec::new();
-    for text in entry_texts(&entry) {
+    for text in texts.iter().copied().chain(joined.as_deref()) {
         for at in crate::inbox_prompt::delivered(text) {
             if !out.contains(&at) {
                 out.push(at);
@@ -811,7 +815,7 @@ mod tests {
                     "content_item_metadata":[{"provenance":{"type":if hook {"harness"} else {"user"},"hook":hook}}]}}})
     }
 
-    /// Scenario: Read Codex rollout lines of every kind Codex 0.164.0 writes around a hand-over carrying a deck block: the prompt as a user message, a prompt hook's context as a developer message, a `Stop` reason it went on with as a user message wrapping the reason in `<hook_prompt>` with XML-escaped text, the model's own reply quoting the block, a tool's output, the `event_msg` items echoing the prompt and the `Stop` reason, and the `turn_aborted` note an interrupt leaves. Only the three messages the model took count, and only for a block that is whole.
+    /// Scenario: Read Codex rollout lines of every kind Codex 0.164.0 writes around a hand-over carrying a deck block: the prompt as a user message, a prompt hook's context as a developer message, a `Stop` reason it went on with as a user message wrapping the reason in `<hook_prompt>` with XML-escaped text, the model's own reply quoting the block, a tool's output, the `event_msg` items echoing the prompt and the `Stop` reason, and the `turn_aborted` note an interrupt leaves. Only the three messages the model took count, and only for a block that is whole, which it still is when one message holds it in two parts.
     #[test]
     fn only_what_codex_took_witnesses_a_block() {
         let whole = block(ID, 1, 2);
@@ -828,7 +832,13 @@ mod tests {
             ),
             codex_message("user", &escaped, "unknown", true),
         ];
-        for entry in counted {
+        let (head, tail) = whole.split_at(whole.len() / 2);
+        let mut split = codex_message("developer", head, "hooks.additional_context", true);
+        split["payload"]["content"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type":"input_text","text":tail}));
+        for entry in counted.into_iter().chain([split]) {
             assert_eq!(
                 witnessed_in_line(&line(entry.clone())),
                 vec![at(ID, 1, 2)],

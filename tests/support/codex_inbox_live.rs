@@ -267,7 +267,9 @@ impl Codex {
             &self.deck,
             &self.pane,
             &format!(
-                "Run exactly this shell command: printf '%s' 'codex-inbox-action' > '{}'. Then reply DONE and end your turn.",
+                // Appended, so a task Codex runs twice leaves two lines
+                // and fails [`Self::done`]'s exact read.
+                "Run exactly this shell command: printf '%s\\n' 'codex-inbox-action' >> '{}'. Then reply DONE and end your turn.",
                 // PRD #1666: the absolute path, not "the current directory".
                 self.deck.workdir().join(name).display()
             ),
