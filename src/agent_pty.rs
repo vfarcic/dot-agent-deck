@@ -10395,6 +10395,12 @@ struct RegistryInner {
     /// deletion. A list rather than a set so two holds on one directory each
     /// release only their own entry. See [`DirRemovalHold`].
     removal_holds: Vec<PathBuf>,
+    /// PRD #468: directories a `dispatch --dir` is checking and starting a
+    /// unit in, from before its interlock check until its spawn returns. Each
+    /// counts as in use ([`AgentPtyRegistry::dir_in_use`]), so a removal does
+    /// not take one while the unit is starting there, and a second `--dir`
+    /// dispatch into one is refused. See [`DispatchDirHold`].
+    dispatch_dir_holds: Vec<PathBuf>,
     /// PRD #1589 D4: orchestration instances a `close` is taking down. While an
     /// instance is here, [`AgentPtyRegistry::reserve_spawn`] refuses any spawn
     /// whose membership names it and the publish step refuses one that reserved
@@ -10641,6 +10647,38 @@ impl Drop for DirRemovalHold<'_> {
             inner.removal_holds.swap_remove(at);
         }
     }
+}
+
+/// PRD #468: RAII holder for a [`RegistryInner::dispatch_dir_holds`] entry,
+/// taken by [`AgentPtyRegistry::hold_dir_for_dispatch`] and released on every
+/// exit from the dispatch, a cancelled one included.
+pub struct DispatchDirHold {
+    registry: Arc<AgentPtyRegistry>,
+    dir: PathBuf,
+}
+
+impl Drop for DispatchDirHold {
+    fn drop(&mut self) {
+        // A poisoned lock leaves the hold behind, which keeps one directory
+        // counted as in use: the fail-safe direction for a deletion guard.
+        if let Some(mut inner) = self
+            .registry
+            .inner
+            .lock_in_drop(crate::lock_rank::OnPoison::Skip)
+            && let Some(at) = inner.dispatch_dir_holds.iter().position(|d| *d == self.dir)
+        {
+            inner.dispatch_dir_holds.swap_remove(at);
+        }
+    }
+}
+
+/// PRD #468: why [`AgentPtyRegistry::hold_dir_for_dispatch`] refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DispatchDirRefusal {
+    /// Another `dispatch --dir` holds this directory.
+    AlreadyHeld,
+    /// A removal holds this directory, or one it lies inside (named).
+    BeingRemoved(PathBuf),
 }
 
 /// PRD #1589 test seam: a child that has already exited and needs nothing to
@@ -10979,6 +11017,7 @@ impl AgentPtyRegistry {
                 abandoned_turns: Vec::new(),
                 turn_seq: 0,
                 removal_holds: Vec::new(),
+                dispatch_dir_holds: Vec::new(),
                 closing_instances: HashSet::new(),
                 closing_generations: HashSet::new(),
                 ended_instances: VecDeque::new(),
@@ -20276,6 +20315,7 @@ impl AgentPtyRegistry {
                 .chain(inner.respawning_dirs.values())
                 .flatten()
                 .any(|d| path_within(d, dir))
+            || inner.dispatch_dir_holds.iter().any(|d| path_within(d, dir))
     }
 
     /// Issue #1612: [`Self::dir_in_use_locked`], asked under one acquisition of
@@ -20307,6 +20347,36 @@ impl AgentPtyRegistry {
         inner.removal_holds.push(dir.to_path_buf());
         Some(DirRemovalHold {
             registry: self,
+            dir: dir.to_path_buf(),
+        })
+    }
+
+    /// PRD #468: hold `dir` for a `dispatch --dir` from before its interlock
+    /// check until its spawn returns. Refused when another such dispatch holds
+    /// it, or when a removal holds it or a directory it lies inside
+    /// ([`Self::hold_dir_for_removal`]). Taken under the lock removals and
+    /// spawns reserve under, so a removal that starts after it finds the
+    /// directory in use, and one already holding it is seen here. Directories
+    /// are compared by path ([`path_within`]), so pass the spelling the
+    /// worktree registry records when there is one.
+    pub fn hold_dir_for_dispatch(
+        self: &Arc<Self>,
+        dir: &std::path::Path,
+    ) -> Result<DispatchDirHold, DispatchDirRefusal> {
+        let mut inner = self.inner.lock();
+        if let Some(held) = inner
+            .removal_holds
+            .iter()
+            .find(|held| path_within(dir, held))
+        {
+            return Err(DispatchDirRefusal::BeingRemoved(held.clone()));
+        }
+        if inner.dispatch_dir_holds.iter().any(|d| d == dir) {
+            return Err(DispatchDirRefusal::AlreadyHeld);
+        }
+        inner.dispatch_dir_holds.push(dir.to_path_buf());
+        Ok(DispatchDirHold {
+            registry: Arc::clone(self),
             dir: dir.to_path_buf(),
         })
     }

@@ -749,37 +749,6 @@ fn place_in_existing_dir(dir: &str, recorded: &[PathBuf]) -> Result<ExistingDir,
     })
 }
 
-/// PRD #468: the `--dir` targets a dispatch is checking or starting a unit in
-/// right now, so a second `--dir` dispatch into one of them is refused rather
-/// than passing the interlock before the first one's agents exist.
-static DIRS_BEING_STARTED: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashSet<PathBuf>>,
-> = std::sync::LazyLock::new(Default::default);
-
-/// One entry in [`DIRS_BEING_STARTED`], released when dropped, on every exit
-/// from the dispatch, a cancelled one included.
-struct DirReservation(PathBuf);
-
-impl DirReservation {
-    /// Reserve `dir`, or `None` when another dispatch holds it.
-    fn take(dir: &Path) -> Option<Self> {
-        DIRS_BEING_STARTED
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(dir.to_path_buf())
-            .then(|| Self(dir.to_path_buf()))
-    }
-}
-
-impl Drop for DirReservation {
-    fn drop(&mut self) {
-        DIRS_BEING_STARTED
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.0);
-    }
-}
-
 /// The most coordination files the interlock's refusal names; the rest are
 /// counted.
 const MAX_NAMED_COORDINATION_FILES: usize = 5;
@@ -1256,24 +1225,45 @@ pub async fn handle_dispatch_at(
 
     // PRD #468 M3: the interlock. A `--dir` target where other live agents
     // already work is refused before anything is read or started there. The
-    // directory is reserved first and held until this function returns, by
-    // which time the unit's agents are in the registry the next check reads,
-    // so two `--dir` dispatches into one directory cannot both pass (Qodo on
-    // PR #2424).
-    let _reservation = match &existing_dir {
+    // directory is held in the registry first, until this function returns,
+    // by which time the unit's agents are in the registry the next check
+    // reads: so two `--dir` dispatches into one directory cannot both pass,
+    // and a worktree cleanup counts the directory as in use meanwhile instead
+    // of removing it under the starting unit (Qodo on PR #2424). The hold is
+    // taken on the unit's own spelling, which is what removals compare.
+    let _hold = match &existing_dir {
         None => None,
         Some(dir) => {
-            let Some(reservation) = DirReservation::take(dir) else {
-                return refuse(format!(
-                    "another dispatch is starting a unit in {} right now, so this one was \
-                     refused and nothing was started for it. Wait for that dispatch's reply.",
-                    dir.display()
-                ));
+            let hold = match ctx.registry.hold_dir_for_dispatch(&unit_dir) {
+                Ok(hold) => hold,
+                Err(crate::agent_pty::DispatchDirRefusal::AlreadyHeld) => {
+                    return refuse(format!(
+                        "another dispatch is starting a unit in {} right now, so this one was \
+                         refused and nothing was started for it. Wait for that dispatch's reply.",
+                        dir.display()
+                    ));
+                }
+                Err(crate::agent_pty::DispatchDirRefusal::BeingRemoved(held)) => {
+                    return refuse(format!(
+                        "{} is being removed (the deck is cleaning up {}), so nothing was \
+                         started there",
+                        dir.display(),
+                        held.display()
+                    ));
+                }
             };
             let records = ctx.registry.agent_records_for_worktree_cleanup();
             let caller = ctx.caller.as_ref().map(|c| c.agent_id.clone());
             let target = dir.clone();
             let refusal = tokio::task::spawn_blocking(move || {
+                // A removal that finished before the hold was taken has
+                // already deleted the directory; none can start now.
+                if !target.is_dir() {
+                    return Some(format!(
+                        "--dir {}: the directory no longer exists, so nothing was started",
+                        target.display()
+                    ));
+                }
                 occupied_dir_refusal(&records, &target, caller.as_deref(), |p| {
                     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
                 })
@@ -1288,7 +1278,7 @@ pub async fn handle_dispatch_at(
             if let Some(refusal) = refusal {
                 return refuse(refusal);
             }
-            Some(reservation)
+            Some(hold)
         }
     };
 
@@ -5015,22 +5005,48 @@ mod tests {
         assert!(occupied_dir_refusal(&records, &canonical(&dir), None, canonical).is_some());
     }
 
-    /// A directory reserved by one `--dir` dispatch cannot be reserved by a
-    /// second until the first lets go, on any exit.
+    /// A directory held by one `--dir` dispatch cannot be held by a second
+    /// until the first lets go, counts as in use so a worktree cleanup cannot
+    /// take it meanwhile, and cannot be held while a removal holds it.
     #[test]
-    fn a_dir_being_started_cannot_be_reserved_twice() {
+    fn a_dir_being_started_is_held_against_a_second_dispatch_and_a_removal() {
+        let registry = Arc::new(AgentPtyRegistry::new());
         let tmp = crate::test_temp::tempdir().unwrap();
         let dir = canonical(tmp.path());
-        let first = DirReservation::take(&dir).expect("a free directory is reserved");
-        assert!(
-            DirReservation::take(&dir).is_none(),
+        let first = registry
+            .hold_dir_for_dispatch(&dir)
+            .expect("a free directory is held");
+        assert_eq!(
+            registry.hold_dir_for_dispatch(&dir).err(),
+            Some(crate::agent_pty::DispatchDirRefusal::AlreadyHeld),
             "a second dispatch is refused"
+        );
+        assert!(
+            registry.dir_in_use(&dir),
+            "a starting unit's directory is in use"
+        );
+        assert!(
+            registry.hold_dir_for_removal(&dir).is_none(),
+            "so a worktree cleanup does not take it"
         );
         drop(first);
         assert!(
-            DirReservation::take(&dir).is_some(),
-            "released when the first dispatch returns"
+            !registry.dir_in_use(&dir),
+            "released when the dispatch returns"
         );
+
+        let removal = registry
+            .hold_dir_for_removal(&dir)
+            .expect("an unused directory can be held for removal");
+        assert_eq!(
+            registry.hold_dir_for_dispatch(&dir.join("sub")).err(),
+            Some(crate::agent_pty::DispatchDirRefusal::BeingRemoved(
+                dir.clone()
+            )),
+            "a directory inside one being removed is refused"
+        );
+        drop(removal);
+        assert!(registry.hold_dir_for_dispatch(&dir).is_ok());
     }
 
     /// Scenario: a worktree the deck records is spelled through a symlinked
