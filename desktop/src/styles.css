@@ -2195,6 +2195,11 @@ button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-
 .agent-card-primary { flex: none; margin-top: auto; height: 26px; display: flex; flex-wrap: nowrap; align-items: center; gap: 6px; min-width: 0; overflow: hidden; }
 .agent-card-primary > button { flex: 0 1 auto; max-width: 62%; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .agent-card-primary > small, .agent-card-primary > span { flex: 1 1 0; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+/* Issue #2418: the button is a centring flex box, which cuts an overflowing label at both ends with no ellipsis; the label's own block box is cut at its end, with one. */
+.agent-card-primary > button { min-width: 0; }
+.agent-card-primary-label { display: block; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+/* The source badge keeps its own width; the prompt and notes after it take what is left. */
+.agent-card-primary > .agent-card-primary-source { flex: none; overflow: visible; }
 .agent-card-prompt, .agent-card-disabled, .agent-card-result, .agent-card-delivery { color: var(--muted); font-size: var(--text-xs); overflow-wrap: anywhere; }
 .agent-card-disabled { color: var(--faint); }
 .agent-card-result { color: var(--ink); }

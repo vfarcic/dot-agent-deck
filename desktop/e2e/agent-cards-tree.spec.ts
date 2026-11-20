@@ -28,7 +28,9 @@ import { expect, test, type Page } from "@playwright/test";
  *   shown whole for review before anything is sent (024);
  * - references that do not fit a card's line are hidden whole and counted by a
  *   `+N` that opens the card's overlay at its list of every reference, from
- *   which one past the line opens (025).
+ *   which one past the line opens (025);
+ * - a primary action's long label is cut at its end, never its start, and the
+ *   source badge beside it keeps its width (027).
  */
 
 const WIDTHS = [375, 768, 1024, 1440, 1920] as const;
@@ -497,3 +499,80 @@ for (const width of [375, 1440] as const) {
   });
 }
 
+
+for (const width of [375, 1440] as const) {
+  test.describe(`desktop/agent-cards/027 — a compact card's action label and source stay readable at ${width}px`, () => {
+    test.use({ viewport: { width, height: 900 } });
+
+    /**
+     * Scenario: the bench agent asks a question and offers a long answer as its
+     * card's primary action, marked as the agent's and with a prompt of its
+     * own. The button's label starts at its first character and is cut only at
+     * its end, the "agent says" badge beside it is drawn whole, and the card's
+     * line and the roots keep their size and place.
+     */
+    test("the primary's label is cut at its end only, and the source badge keeps its width", async ({ page }) => {
+      await openCardsTree(page);
+      const before = await rootBoxes(page);
+      const label = "Yes, ship it behind a version flag and tell the release channel";
+      await pushCards(page, `
+        const bench = byName("bench");
+        bench.actions = [{ id: "answer", label: ${JSON.stringify(label)}, kind: "prompt", prompt: "Answer: " + ${JSON.stringify(label)}, prompt_source: "agent", text_input: false, confirm: false, confirm_detail: null, icon: null,
+          placement: "card", custom: true, source: "agent", enabled: true, disabled_reason: null, last_delivery: null, token: "tok-answer" }, ...bench.actions];
+        bench.primary_action_id = "answer";
+      `);
+      const card = await cardNamed(page, "bench");
+      const primary = card.getByTestId("agent-card-primary");
+      await expect(primary).toHaveText(label);
+
+      const seen = await primary.evaluate((button) => {
+        const walker = document.createTreeWalker(button, NodeFilter.SHOW_TEXT);
+        const text = walker.nextNode() as Text;
+        const holder = text.parentElement!;
+        const first = document.createRange();
+        first.setStart(text, 0);
+        first.setEnd(text, 1);
+        const style = getComputedStyle(button);
+        const box = button.getBoundingClientRect();
+        const contentLeft = box.left + parseFloat(style.borderLeftWidth) + parseFloat(style.paddingLeft);
+        const contentRight = box.right - parseFloat(style.borderRightWidth) - parseFloat(style.paddingRight);
+        const holderStyle = getComputedStyle(holder);
+        return {
+          firstLeft: first.getBoundingClientRect().left,
+          contentLeft,
+          holderRight: holder.getBoundingClientRect().right,
+          contentRight,
+          holderDisplay: holderStyle.display,
+          holderOverflow: holderStyle.overflowX,
+          holderEllipsis: holderStyle.textOverflow,
+          holderCut: holder.scrollWidth > holder.clientWidth,
+        };
+      });
+      expect(seen.firstLeft, "the label's first character is cut off on the left").toBeGreaterThanOrEqual(seen.contentLeft - TOLERANCE);
+      expect(seen.holderRight, "the label runs past the button's right edge").toBeLessThanOrEqual(seen.contentRight + TOLERANCE);
+      expect(seen.holderCut, "the long label is cut").toBe(true);
+      expect(seen.holderDisplay, "an ellipsis needs a block box, not a flex box").not.toMatch(/flex|grid/);
+      expect(seen.holderOverflow).toBe("hidden");
+      expect(seen.holderEllipsis, "the cut end of the label shows an ellipsis").toBe("ellipsis");
+
+      const source = card.getByTestId("agent-card-primary-source");
+      await expect(source).toBeVisible();
+      const badge = await source.evaluate((holder) => {
+        const inner = holder.querySelector(".card-source")!;
+        const at = holder.getBoundingClientRect();
+        const own = inner.getBoundingClientRect();
+        return { scroll: holder.scrollWidth, client: holder.clientWidth, innerScroll: inner.scrollWidth, innerClient: inner.clientWidth, whole: own.left >= at.left - 0.5 && own.right <= at.right + 0.5 };
+      });
+      expect(badge.scroll, "the agent says badge is cut").toBeLessThanOrEqual(badge.client);
+      expect(badge.innerScroll, "the agent says text is cut").toBeLessThanOrEqual(badge.innerClient);
+      expect(badge.whole, "the agent says badge runs past its slot").toBe(true);
+
+      // The line keeps its fixed height, and no root moved or resized.
+      const line = await card.locator(".agent-card-primary").evaluate((node) => node.getBoundingClientRect().height);
+      expect(Math.abs(line - 26), "the primary line's height").toBeLessThanOrEqual(TOLERANCE);
+      const after = await rootBoxes(page);
+      for (const [at, was] of before.entries()) for (const side of ["x", "y", "w", "h"] as const) expect(Math.abs(after[at][side] - was[side]), `${was.key}'s ${side}`).toBeLessThanOrEqual(TOLERANCE);
+      await expectNoSidewaysScroll(page);
+    });
+  });
+}

@@ -17,7 +17,7 @@ A card is marked **Needs you** when its agent stopped, is asking a question in i
 
 The Dashboard's top bar has a **Table | Cards** switch. **Table** is the Dashboard you know. **Cards** shows the cards. The app remembers your choice in this window's storage, so the next time you open the Dashboard it shows the same view.
 
-![The Dashboard's Cards view: under the Local daemon's header, two cards side by side, the Plan / architecture orchestrator, whose tree is open, and a standalone agent that needs input; under the orchestrator, joined by a line, its two roles, one of them showing its checked pull request #18421 and the main button “Yes, behind a flag”](/img/agent-cards-desktop.png)
+![The Dashboard's Cards view: under the Local daemon's header, two cards side by side, the Plan / architecture orchestrator, whose tree is open, and a standalone agent that needs input; under the orchestrator, joined by a line, its two roles, one of them showing its checked pull request #18421 and its main button, “Yes, behind a flag” shortened to fit, marked **agent says**](/img/agent-cards-desktop.png)
 
 ## The tree of cards
 

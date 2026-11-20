@@ -267,8 +267,8 @@ export function AgentCard({ card, controls, results, place }: { card: PlacedCard
             disabled={!primary.enabled}
             title={primaryTitle}
             onClick={() => VOICE_ACTIONS.runCardAction.run(controls, { ...ref, cardActionId: primary.id, cardActionToken: primary.token, ...(primaryNeedsReview(primary) ? { cardActionReview: true } : {}) })}
-          >{displayText(actionLabel(entry, primary), DISPLAY_LIMITS.name)}</button>
-          {primary.source === "agent" && <span data-testid="agent-card-primary-source"><SourceBadge source="agent" /></span>}
+          ><span className="agent-card-primary-label">{displayText(actionLabel(entry, primary), DISPLAY_LIMITS.name)}</span></button>
+          {primary.source === "agent" && <span className="agent-card-primary-source" data-testid="agent-card-primary-source"><SourceBadge source="agent" /></span>}
           {primary.prompt && <small className="agent-card-prompt" title={exactTextString(primary.prompt)}>{promptPreview(primary.prompt)}</small>}
           {!primary.enabled && <small className="agent-card-disabled">{disabledReasonSentence(primary.disabled_reason)}</small>}
           {results?.[primary.token] && <small className="agent-card-result" role="status" data-testid="agent-card-result">{displayText(resultSentence(results[primary.token]), DISPLAY_LIMITS.detail)}</small>}

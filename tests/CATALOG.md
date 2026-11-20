@@ -16077,6 +16077,12 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 - **Asserts:** with the in-app browser already on an address, a second accepted open of that address does not reload the page (the host's `open` is called once) but the browser takes the new request's subject: two cards on one deck, or on two decks, reporting the same issue leave it named for the second card, and it stays open when the first card's list drops it and closes when the second's does; a card's pull request reopened from the agent's table badge is named for the agent, stays open when the card goes and closes when the agent goes; the badge's pull request reopened from the card is named for the card, stays open when the agent stops while the card is listed, and closes when the card goes.
 - **Does not assert:** a switch to a different address (`PullRequestBrowser.test.tsx`); voice beyond the shared providers.
 
+##### desktop/agent-cards/027 — A compact card's action label and its source badge stay readable.
+- **Test:** Playwright `desktop/agent-cards/027 — a compact card's action label and source stay readable at <width>px` in `desktop/e2e/agent-cards-tree.spec.ts`, against `cards=tree` with a pushed primary action.
+- **Layer:** desktop browser (production build, `vite preview`) at 375 and 1440 px.
+- **Asserts:** with an agent-written primary action whose label is longer than the card's button, the label's first character starts inside the button's content box, the label's box ends inside it, is cut (scroll width larger than client width), is not a flex or grid box and has `overflow: hidden` and `text-overflow: ellipsis`, so it is cut at its end with an ellipsis; the **agent says** badge beside it is not cut (scroll width no larger than client width, for its slot and its text) and lies wholly inside its slot; the primary line stays 26 px high, no root moves or resizes, and the page does not scroll sideways.
+- **Does not assert:** the pixels of the ellipsis glyph; the docs screenshot, which shows the same line (`site/static/img/agent-cards-desktop.png`).
+
 ## Desktop native driver scenarios
 
 These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[spec]` scanner, and run in CI's advisory `desktop-driver` job. `docs/develop/desktop-gui.md` ("The driver tier") describes the harness.
