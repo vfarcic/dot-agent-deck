@@ -2387,8 +2387,8 @@ must_name   = ["orchestration", "run", "every role", "all roles", "all the roles
 [[commands]]
 id          = "set_overview_mode"
 description = """Switch the agent dashboard between its two views: the table (one row per agent)
-and the cards (one card per agent, grouped by dispatcher or orchestration, showing what each
-agent reported and what it needs). Use when the user asks to show cards, the card view, switch to
+and the cards (one card per agent, the agents each one started in a tree under it, showing what
+each agent is doing and what it needs). Use when the user asks to show cards, the card view, switch to
 cards, show the table, the list view, or back to the table. Set `view` to "table" or "cards".
 Showing the dashboard itself is `open_overview`; filtering its rows is `filter_dashboard`."""
 invoke      = "setOverviewMode"
@@ -2458,8 +2458,8 @@ try_saying  = "next one that needs me"
 
 [[commands]]
 id          = "filter_needs_you_cards"
-description = """Turn the cards view's Needs you filter on or off: on shows only the agents' cards
-that need the user, off shows every card. Use for only the ones that need me, show only the cards
+description = """Turn the cards view's Needs you only on or off: on opens the way to every agent's
+card that needs the user and fades the others, off shows every card as usual. Use for only the ones that need me, show only the cards
 that need me, just the ones needing my attention (`needs_you` = "on"), or show all cards, every card,
 clear the needs you filter (`needs_you` = "off"). It shows the cards view when turned on. Filtering the
 table by status is `filter_dashboard`."""
@@ -2484,6 +2484,79 @@ unavailable_hint = "a card closes while one is open on the agent dashboard"
 report      = "Closed the card."
 asks_to     = "close the open card"
 try_saying  = "close the card"
+
+# Issue #2418 — the Cards tree. Opening and closing the tree under a card
+# changes what the dashboard shows and sends nothing; opening a card's pull
+# request or issue opens the app's GitHub browser on the address the deck
+# itself checked, never on the agent's own text.
+[[commands]]
+id          = "open_card_tree"
+description = """In the agent dashboard's cards, open the TREE under one agent's card: show the
+agents it started (a dispatcher's units, an orchestrator's roles) under it. Use for open the
+dispatcher's tree, expand the queue, show what is under the coder, show the agents under the
+orchestrator. Set `agent` to the user's words for the agent whose tree to open. Opening the card's
+own overlay is `show_agent_card`; opening an agent's terminal pane is `open_agent`."""
+invoke      = "openCardTree"
+screens     = ["overview"]
+unavailable_hint = "a card's tree opens on the agent dashboard's cards"
+report      = "Opened {agent}'s tree."
+asks_to     = "show the agents under one agent's card"
+try_saying  = "open {agent}'s tree"
+
+  [[commands.params]]
+  name = "agent"
+  kind = "agent_ref"
+
+[[commands]]
+id          = "close_card_tree"
+description = """In the agent dashboard's cards, close the TREE under one agent's card, hiding the
+agents it started. Use for close the dispatcher's tree, collapse the queue, hide what is under the
+orchestrator. Set `agent` to the user's words for the agent whose tree to close. Closing the card
+overlay is `close_agent_card`."""
+invoke      = "closeCardTree"
+screens     = ["overview"]
+unavailable_hint = "a card's tree closes on the agent dashboard's cards"
+report      = "Closed {agent}'s tree."
+asks_to     = "hide the agents under one agent's card"
+try_saying  = "close {agent}'s tree"
+
+  [[commands.params]]
+  name = "agent"
+  kind = "agent_ref"
+
+[[commands]]
+id          = "open_card_pull_request"
+description = """Open, in the app's GitHub browser, the pull request an agent reported on its CARD,
+as the deck checked it. Use when the user names an agent's card and its pull request — "open the
+pull request on the coder's card", "show the PR the tester reported". The pull request of the
+agent's own branch, from its badge on the dashboard or its pane, is `open_pr`. Set `agent` to the
+user's words for the agent."""
+invoke      = "openCardPullRequest"
+screens     = ["overview"]
+unavailable_hint = "a card's pull request opens from the agent dashboard's cards"
+report      = "Opening the pull request on {agent}'s card."
+asks_to     = "open the pull request an agent reported on its card"
+try_saying  = "open the pull request on {agent}'s card"
+
+  [[commands.params]]
+  name = "agent"
+  kind = "agent_ref"
+
+[[commands]]
+id          = "open_card_issue"
+description = """Open, in the app's GitHub browser, the issue an agent reported on its CARD, as the
+deck checked it. Use for open the issue on the coder's card, show the tester's issue, which issue
+is the dispatcher's unit working on. Set `agent` to the user's words for the agent."""
+invoke      = "openCardIssue"
+screens     = ["overview"]
+unavailable_hint = "a card's issue opens from the agent dashboard's cards"
+report      = "Opening the issue on {agent}'s card."
+asks_to     = "open the issue an agent reported on its card"
+try_saying  = "open the issue on {agent}'s card"
+
+  [[commands.params]]
+  name = "agent"
+  kind = "agent_ref"
 
 [[commands]]
 id          = "run_card_action"

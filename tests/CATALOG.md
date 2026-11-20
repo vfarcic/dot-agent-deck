@@ -14552,6 +14552,45 @@ The TUI renders no cards in this slice (the desktop app does; `docs/desktop/agen
 - **Does not assert:** `confirm_detail`'s pending-work wording.
 - **Platform coverage:** mac+linux.
 
+#### agent-report/tree
+
+##### agent-report/tree/001 — Cards hang under the agent that started them.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_agent_cards.rs`).
+- **Agent:** synthetic routing stand-ins as dispatcher, dispatched single unit and standalone agent, and a dispatched two-role team of capability-exporting `cat` seats; no real agent.
+- **Asserts:** `card list` holds exactly five entries in tree order — the dispatcher (`kind: dispatcher`, no `parent`), the unit (`agent`) and the team's orchestrator (`orchestrator`) with the dispatcher as `parent`, the worker (`role`) with the orchestrator as `parent`, then the standalone agent (`agent`, no `parent`) started last; the dispatcher's `rollup.total` is 3 and the orchestrator's 1, the leaves carry no `rollup`, and the unit and orchestrator still name the dispatcher in `relations`.
+- **Does not assert:** a dispatcher dispatched by a dispatcher, a child whose parent's card is gone, or cycles (the `agent_cards` unit tests); the desktop's drawing of the tree (`desktop/agent-cards/*`).
+- **Platform coverage:** mac+linux.
+
+##### agent-report/tree/002 — A grandchild's status rolls up to the root.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_agent_cards.rs`).
+- **Agent:** the tree of `agent-report/tree/001`, whose statuses the test reports through the hook socket with each pane's own capability; no real agent.
+- **Asserts:** with the unit idle and the orchestrator and worker thinking, the dispatcher's `rollup` is `{total: 3, worst: thinking, counts: {idle: 1, thinking: 2}, needs_you: 0}`; after the worker (the dispatcher's grandchild) reports `quota_blocked`, it becomes `{total: 3, worst: blocked, counts: {blocked: 1, idle: 1, thinking: 1}, needs_you: 1}` and the orchestrator's `{total: 1, worst: blocked, counts: {blocked: 1}, needs_you: 1}`, while both cards' own `status` stays `thinking`, the dispatcher's own `needs_you` stays false, the worker reads `blocked` with reason `blocked`, and the list's order is unchanged.
+- **Does not assert:** every status word's place in the severity order (the `agent_cards` unit tests); a roll-up's doorbell timing.
+- **Platform coverage:** mac+linux.
+
+#### agent-report/refs
+
+##### agent-report/refs/001 — A reported pull request and issue show the deck's own check.
+- **Layer:** L2 headless, lane 1 (`tests/e2e_agent_cards_refs.rs`).
+- **Agent:** one capability-exporting `cat` pane in a fixture clone whose `origin` is `github.com/test-org/test-repo`, under a daemon whose `PATH` has a stand-in `gh` answering from files; no real agent, no GitHub.
+- **Asserts:** after a report with `pull-request` = `#41` and `issue` = `other-org/other-repo#7`, `checked_refs` shows the pull request with its claim as written, `repo` resolved from the folder's origin, the canonical `https://github.com/test-org/test-repo/pull/41`, and the deck's check `merged`, CI `failing` (1 passing, 1 failing), review `approved`, its title, `stale: false` and an RFC 3339 `checked_at`; the issue as `closed` with its canonical `/issues/7` link and no CI or review; the report's own field values are unchanged; the daemon ran exactly `gh pr view 41 --repo test-org/test-repo --json …` and `gh issue view 7 --repo other-org/other-repo --json number,state,title,url`, and with a one-second refresh does not look either up again.
+- **Does not assert:** a full URL claim (`agent-report/live/002` reports one) or answers whose link names another repository or number (the `reference_check` unit tests).
+- **Platform coverage:** mac+linux.
+
+##### agent-report/refs/002 — A reference the deck cannot check says why.
+- **Layer:** L2 headless, lane 1 (`tests/e2e_agent_cards_refs.rs`).
+- **Agent:** capability-exporting `cat` panes under two daemons, one with the stand-in `gh` and a one-second refresh, one whose `PATH` holds only `git` and `cat`; no real agent, no GitHub.
+- **Asserts:** while the stand-in holds a lookup (released as soon as the test has seen it; a fresh pull request is named instead if the daemon's own `gh` timeout ends the held lookup first), the reference reads `{status: pending}` with its repository and link already known, then `checked` `open` once released; `gh` answering `Could not resolve to` reads `not_found`, exit 4 reads `no_github_access`, and a GitLab link reads `unrecognised` with no link and no `gh` call, each with the deck's fixed sentence as `detail`; once the open pull request's lookups fail, it keeps `state: open` and the `checked_at` of a successful lookup, reads `stale: true`, and keeps that `checked_at` through a later failed lookup; a rate-limited lookup reads `rate_limited`, and a reference named after it stays `pending` with no `gh` call for it; with no `gh` on the daemon's `PATH` a reference reads `no_github_access`, and a bare `#5` from a folder with no GitHub origin reads `unrecognised` (`no GitHub origin for this agent's folder`).
+- **Does not assert:** the end of the five-minute rate-limit pause, the failure backoff's length or the lookup budget (the `reference_check` unit tests).
+- **Platform coverage:** mac+linux.
+
+##### agent-report/refs/003 — The check a client shows is the one made on the daemon's host.
+- **Layer:** L2 headless, lane 1 (`tests/e2e_agent_cards_refs.rs`).
+- **Agent:** one capability-exporting `cat` pane under a daemon with the stand-in `gh`; no real agent, no GitHub.
+- **Asserts:** `card list` run with a `PATH` whose own `gh` records every call and answers nothing shows `test-org/test-repo#88` as `merged` with the deck's title and canonical link; the daemon's `gh` made the one lookup and the client's `gh` was never run.
+- **Does not assert:** a client on another machine: the client reaches the daemon over its local attach socket, not over a remote deck's SSH tunnel (`fleet/observe/002` covers that transport; this test does not list cards through it), so the daemon's host and the client's are one machine told apart only by their `PATH`s.
+- **Platform coverage:** mac+linux.
+
 #### agent-report/live
 
 ##### agent-report/live/001 — A real agent publishes its card and acts on a card action.
@@ -14559,6 +14598,13 @@ The TUI renders no cards in this slice (the desktop app does; `docs/desktop/agen
 - **Agent:** Claude Code (interactive Haiku; onboarding and trust seeded, `--allowedTools Bash Read Write`).
 - **Asserts:** told to publish a waiting card with a question that suggests the user catalog's `touch-sentinel` action, and a custom action of its own, the agent's card appears in `card list` with that report; pressing its own custom action delivers the agent's text framed as untrusted and the agent still creates the file that text names; `card act --action touch-sentinel` sends the prompt, the agent creates the uniquely named sentinel file, the action's `last_delivery` reaches `delivered`, the card's report turns `done`, and the attached TUI shows the sentinel's name in the agent's pane.
 - **Does not assert:** the desktop app's cards with a real agent (no native-driver test in this slice).
+- **Platform coverage:** mac+linux.
+
+##### agent-report/live/002 — A real agent's reported pull request is checked by the deck.
+- **Layer:** L2 PTY-attached, lane 2 (real agent) (`tests/e2e_agent_cards_live.rs`).
+- **Agent:** Claude Code (interactive Haiku; onboarding and trust seeded, `--allowedTools Bash Read Write`); the daemon's `gh` is the host's, logged in with the token `gh auth token` prints on the host, which the pane's own environment does not carry.
+- **Asserts:** told to create a uniquely named sentinel file and publish its card with `pull-request` = `https://github.com/vfarcic/dot-agent-deck/pull/2378`, the agent creates the sentinel, its card shows that claim as written, and `checked_refs` shows the deck's check: `vfarcic/dot-agent-deck` #2378, the canonical link, `checked`, `merged`, not stale. Skips (a failure under `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1`) when the host's `gh` is not logged in or the deck's lookup reads `no_github_access`.
+- **Does not assert:** the desktop's badge for the reference (`desktop/agent-cards/*`); the TUI draws no cards.
 - **Platform coverage:** mac+linux.
 
 ### Docs cross-reference skips
@@ -15873,19 +15919,19 @@ PRD #1666 part 3, round 5: where the deck keeps a worker's report, or a dispatch
 
 ## Desktop agent cards (webview)
 
-The desktop half of PRD #2374's agent cards. These are Vitest + Testing Library tests in the webview (`cd desktop && pnpm test`), outside the Rust `#[spec]` scanner, so they are named here by test title (`desktop/agent-cards/00N: …`), as in `question/desktop`. 001–007 are in `desktop/src/components/AgentCardsContract.test.tsx` and render the real `AgentOverview`; 008 is in `desktop/src/components/AgentCardsVoice.test.tsx` and renders the real `DeckShell` with only the microphone and the resolved voice answer synthetic. The fixtures contradict what a client would compute (a `working` agent the daemon marks needs-you with reason `done`, a `waiting_for_input` one it does not mark, a prompt action disabled `agent_stopped` on a running agent, a primary that is not the first action, entries in neither alphabetical nor needs-you-first order, one group appearing twice), so a view that recomputed status, needs-you, enablement or order fails. **Agent:** none. **Platform coverage:** jsdom on Node; CI runs them in `desktop-web`'s vitest (or the RWX counterpart).
+The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. These are Vitest + Testing Library tests in the webview (`cd desktop && pnpm test`), outside the Rust `#[spec]` scanner, so they are named here by test title (`desktop/agent-cards/0NN: …`), as in `question/desktop`. 001–007 are in `desktop/src/components/AgentCardsContract.test.tsx` and render the real `AgentOverview`; 008 and 018 are in `desktop/src/components/AgentCardsVoice.test.tsx` and render the real `DeckShell` with only the microphone and the resolved voice answer synthetic; 009–017 and 020–023 are in `desktop/src/components/AgentCardsTree.test.tsx` and render the real `AgentOverview` (023 calls the issue-address check directly); 019 is the Playwright spec `desktop/e2e/agent-cards-tree.spec.ts` (`cd desktop && pnpm test:browser agent-cards-tree`). The fixtures contradict what a client would compute (a `working` agent the daemon marks needs-you with reason `done`, a `waiting_for_input` one it does not mark, a prompt action disabled `agent_stopped` on a running agent, a primary that is not the first action, entries in neither alphabetical nor needs-you-first order, a roll-up that changes while the entries under it do not, a checked state that differs from the agent's claim), so a view that recomputed status, needs-you, enablement, order, the tree, a roll-up or a reference fails. **Agent:** none. **Platform coverage:** jsdom on Node; CI runs them in `desktop-web`'s vitest (or the RWX counterpart); 019 runs in Chromium and WebKit in the desktop browser job.
 
-##### desktop/agent-cards/001 — The Cards grid groups consecutive entries by `group.id`, with the daemon's counts.
+##### desktop/agent-cards/001 — A daemon list without the tree draws every card as a root, in the daemon's order, with the daemon's counts.
 - **Test:** vitest `desktop/agent-cards/001: …` in `desktop/src/components/AgentCardsContract.test.tsx`.
 - **Layer:** desktop component (jsdom), real `AgentOverview` against a daemon card list.
-- **Asserts:** one group section per run of consecutive entries sharing a `group.id`, so the dispatcher's group appears twice when the daemon orders a member last; each section's label, kind and `N agents · M need you` (singular forms included); each group's card names in the daemon's order; the toolbar's total `5 agents · 3 need you`.
-- **Does not assert:** the daemon's grouping or ordering (`agent-report/cli/002` covers the dispatcher group); several decks' grids.
+- **Asserts:** no grouping by `group.id` is rebuilt (issue #2418 replaced the grouped grid with the tree); every card of a list that does not advertise the tree is a root, in the order received; the toolbar's total `5 agents · 3 need you`.
+- **Does not assert:** the tree itself (009); the daemon's ordering (`agent-report/cli/002`).
 
-##### desktop/agent-cards/002 — Cards keep the daemon's order, status and needs-you; the Needs you filter hides the rest.
+##### desktop/agent-cards/002 — Cards keep the daemon's order, status words and needs-you; Needs you only fades the rest in place.
 - **Test:** vitest `desktop/agent-cards/002: …` in `desktop/src/components/AgentCardsContract.test.tsx`.
 - **Layer:** desktop component (jsdom).
-- **Asserts:** cards render in the received order, and a new list reorders them with no client sort; each card shows the deck-checked status words (`Working`, `Waiting for input`, `Thinking`, `Stopped`) and the Needs you marker exactly where the daemon set `needs_you`, even against the agent's own report; the summary and `card`-placed fields show, a `detail` field does not; an unreported agent reads "No report from this agent yet."; the Needs you filter (`aria-pressed`) keeps only the daemon-marked cards, in order, while the group count stays the whole group's.
-- **Does not assert:** the hover text of the needs-you reasons; the CSS grid's responsive layout.
+- **Asserts:** cards render in the received order, and a new list reorders them with no client sort; each card shows the deck-checked status in the daemon's words as the table shows them (`working`, `needs input`, `thinking`, `stopped`) and the Needs you marker exactly where the daemon set `needs_you`, even against the agent's own report; the summary and fields are not on the compact card; Needs you only (`aria-pressed`) keeps every card in place and fades exactly the cards the daemon did not mark, and turning it off unfades them.
+- **Does not assert:** the hover text of the needs-you reasons; the tree's layout (019).
 
 ##### desktop/agent-cards/003 — The primary action sends the daemon's action, shows its prompt, and asks first when it must.
 - **Test:** vitest `desktop/agent-cards/003: …` in `desktop/src/components/AgentCardsContract.test.tsx`.
@@ -15922,6 +15968,120 @@ The desktop half of PRD #2374's agent cards. These are Vitest + Testing Library 
 - **Layer:** desktop component (jsdom), real `DeckShell`, voice panel and dispatch seam; the resolved answer is shaped as the crate sends it (`card_action` and `reply_text` param kinds).
 - **Asserts:** each of `setOverviewMode`, `showAgentCard`, `nextAgentCard`, `previousAgentCard`, `nextNeedsYouCard`, `toggleNeedsYouFilter`, `closeAgentCard`, `runCardAction` and `replyToAgentCard` is `voice: true` with no `no_voice`, and exactly one `commands.toml` row invokes it, with the contract's row id, `screens = ["overview"]` and its param names and kinds; `confirmCardAction` and `toggleOverviewRowMenu` carry a `no_voice` reason and no row. A spoken `run_card_action` naming a `confirm` action, or Close, opens that card's overlay at its confirm step (exact prompt and pending detail) and sends nothing; one naming an action or a question's answer whose text is, or quotes, what the agent wrote (`prompt_source: "agent"`, the deck-composed answer included) opens that card's review step showing the exact text, says why on the voice row, and sends nothing until Send, which sends it once — including an answer to a question whose quotes and line breaks smuggle an instruction into the composed text (audit A1); only one naming a catalog prompt action sends exactly that action of that card once, unconfirmed; a spoken `reply_to_agent_card` sends `reply` with the user's words.
 - **Does not assert:** the model's choice of row or the crate's param resolution (the desktop crate's voice tests); real speech.
+
+##### desktop/agent-cards/009 — Only roots show at first, and opening a card shows exactly its children, to any depth.
+- **Test:** vitest `desktop/agent-cards/009: …` in `desktop/src/components/AgentCardsTree.test.tsx`.
+- **Layer:** desktop component (jsdom), real `AgentOverview` against a list whose entries carry `parent` from a daemon that advertises the tree.
+- **Asserts:** only the three roots render (`data-depth="0"`), in the daemon's order; a card with nothing under it has no toggle; the toggle reads `Open <name>'s tree` with `aria-expanded`; opening the dispatcher shows one band for it holding exactly its two children in order at depth 1, the roots unchanged; opening the orchestrator under it adds its two roles at depth 2; closing the dispatcher removes its whole tree and the band.
+- **Does not assert:** the parent links themselves (`agent-report/tree/001`); geometry (019).
+
+##### desktop/agent-cards/010 — A closed card with children shows its roll-up's colour, counts bar and totals.
+- **Test:** vitest `desktop/agent-cards/010: …` in `desktop/src/components/AgentCardsTree.test.tsx`.
+- **Layer:** desktop component (jsdom).
+- **Asserts:** a closed card's `data-tone` is the worst of its own status and its roll-up's `worst` (an idle dispatcher over a `waiting_for_input` card reads `needs_input`; one over `blocked` reads `blocked`); the bar's segments follow the roll-up's counts, most severe first, with the accessible name `1 needs input, 1 working, 2 idle`; the totals read `4 under it · 1 needs you` (singular forms included); a card with no children shows its own status and no roll-up; opened, the card takes its own status's colour again.
+- **Does not assert:** the roll-up's computation (`agent-report/tree/002`, module tests in `src/agent_cards.rs`); the palette's colours (CSS).
+
+##### desktop/agent-cards/011 — Roll-ups and statuses update live, and open trees stay open.
+- **Test:** vitest `desktop/agent-cards/011: …` in `desktop/src/components/AgentCardsTree.test.tsx`.
+- **Layer:** desktop component (jsdom).
+- **Asserts:** after a new list in which only a closed root's `rollup` changed, its colour, totals and bar follow the new roll-up with no client recount; another root's open tree stays open, and a card in it shows its new status.
+- **Does not assert:** the daemon's doorbell or the runtime's re-read (`useDeckRuntime agent cards`).
+
+##### desktop/agent-cards/012 — A compact card shows who and what in the daemon's words, and the overlay keeps what the agent said.
+- **Test:** vitest `desktop/agent-cards/012: …` in `desktop/src/components/AgentCardsTree.test.tsx`.
+- **Layer:** desktop component (jsdom).
+- **Asserts:** each card shows its kind (`dispatcher` for a card the daemon names as another's dispatcher, `orchestrator` and `role` from its orchestration relation, else `agent`), its agent type in the dashboard filter's words (`Claude Code`, `Codex`, `OpenCode`), its status in the daemon's words (`working`, `needs input` for `waiting_for_input`, `idle` for `unknown`, `error`) and the needs-you marker where the daemon set it; the summary, progress and next step are not on the card; clicking the name opens the overlay on that card, which shows all three.
+- **Does not assert:** the overlay's own behaviour (004).
+
+##### desktop/agent-cards/013 — Checked pull request and issue badges show the deck's check and open their GitHub pages.
+- **Test:** vitest `desktop/agent-cards/013: …` in `desktop/src/components/AgentCardsTree.test.tsx`.
+- **Layer:** desktop component (jsdom), the shell's `OpenCardReference` replaced by a spy.
+- **Asserts:** a pull request the agent claimed as `#24180` shows the deck's check (`data-pr-state="merged"`, checks `failing`, review `approved`) through the shared pull request badge; clicking it calls the opener once with the card (its deck, the daemon instance that listed it and its key), `pull_request`, the number and the checked github.com address, and opens no overlay; an issue claimed as `o/r#3` shows `closed` and opens its checked issue address the same way.
+- **Does not assert:** the lookup (`agent-report/refs/001`); the in-app browser itself (018 opens it through the shell).
+
+##### desktop/agent-cards/014 — Pending, unavailable and stale references say so.
+- **Test:** vitest `desktop/agent-cards/014: …` in `desktop/src/components/AgentCardsTree.test.tsx`.
+- **Layer:** desktop component (jsdom).
+- **Asserts:** a pending reference reads `#7 · checking…` with a tooltip saying the deck has not looked it up yet; a `not_found` one reads `not found or private` with the daemon's detail in its tooltip and no button; an `unrecognised` one reads `not a GitHub reference` with the agent's claim in its tooltip; a stale one keeps its badge with its last checked state, is marked `stale`, and its tooltip says when it was last checked.
+- **Does not assert:** the daemon's failure classification (`agent-report/refs/002`).
+
+##### desktop/agent-cards/015 — Needs you only opens the path to every card that needs you and fades the rest.
+- **Test:** vitest `desktop/agent-cards/015: …` (two tests) in `desktop/src/components/AgentCardsTree.test.tsx`.
+- **Layer:** desktop component (jsdom).
+- **Asserts:** with every tree closed, turning it on opens every card that has a daemon-marked card under it, at any depth; the marked cards and the cards on their paths stay bright and exactly the others fade (`data-faded`); turning it off unfades every card. While it stays on, a live list that adds a marked card under a card with no tree before and a marked card one level under an open card's child opens the way to each, and both are bright; a tree the user closed stays closed when nothing under it newly needs them; and a card that comes to need the user under a tree the user closed reopens that tree.
+- **Does not assert:** the fade's opacity (CSS).
+
+##### desktop/agent-cards/016 — Open trees are remembered per client, pruned, and a broken storage falls back to closed.
+- **Test:** vitest `desktop/agent-cards/016: …` (two tests) in `desktop/src/components/AgentCardsTree.test.tsx`.
+- **Layer:** desktop component (jsdom).
+- **Asserts:** opening a tree stores its key under `dot-agent-deck.cards.open` as deck, daemon instance and card key; a fresh render comes back with it open; a remembered key of a card the on-screen daemon no longer lists is pruned while a deck not on screen keeps its keys; with that storage throwing on read and write, every tree renders closed without an error and opening one still works for the session. What is read back is bounded and checked: of 501 stored keys the oldest is not read and the newest is; stored text longer than the app ever writes is ignored whole; malformed JSON reads as nothing open; non-strings, an overlong key and keys not shaped `deck\0instance\0key` are dropped while a valid key beside them is kept; a key of a replaced daemon instance is forgotten; and a deck whose daemon answers with no cards forgets its keys while another deck's stay.
+- **Does not assert:** storage shared across windows or app restarts (jsdom only).
+
+##### desktop/agent-cards/017 — An older daemon's cards are all roots, with no roll-ups, and a note says why.
+- **Test:** vitest `desktop/agent-cards/017: …` in `desktop/src/components/AgentCardsTree.test.tsx`.
+- **Layer:** desktop component (jsdom).
+- **Asserts:** for a list whose daemon does not advertise the tree, every entry is a root in its order even if it carries `parent`, no card has a toggle, a roll-up or a checked reference, and one line says the daemon is older than the app.
+- **Does not assert:** that the shared client drops the tree fields (`src/daemon_client.rs`'s tree gate tests).
+
+##### desktop/agent-cards/018 — The tree's controls are reachable by voice.
+- **Test:** vitest `desktop/agent-cards/018: …` (seven tests) in `desktop/src/components/AgentCardsVoice.test.tsx`.
+- **Layer:** desktop component (jsdom), real `DeckShell`, voice panel and dispatch seam; the resolved answer is shaped as the crate sends it.
+- **Asserts:** `openCardTree`, `closeCardTree`, `openCardPullRequest` and `openCardIssue` are each `voice: true` with no `no_voice`, invoked by exactly one `commands.toml` row (`open_card_tree`, `close_card_tree`, `open_card_pull_request`, `open_card_issue`) on `screens = ["overview"]` taking an `agent_ref`; a spoken `open_card_tree` shows the card under the named card, and `close_card_tree` hides it; a spoken `open_card_pull_request` opens the app's GitHub browser on the checked pull request (`Pull request #24180`), and `open_card_issue` on the checked issue (`Issue #3`); the same two commands on a card whose agent has stopped and is absent from the fleet's agents (`status: "stopped"`, an agent id no deck lists) open the browser named for that card (`Issue #3 for child-card`) and it stays open; a spoken `open_card_tree` for a card one level under a closed root opens the root too, so the card and its child show; and with the dashboard filter hiding the named card, the voice answer says the tree is open but the filter hides it, instead of reporting success.
+- **Does not assert:** the model's choice of row (the desktop crate's voice tests); real speech.
+
+##### desktop/agent-cards/019 — The Cards tree's layout keeps the roots in place at every width.
+- **Test:** Playwright `desktop/agent-cards/019 — the Cards tree at <width>px` (five tests per width) in `desktop/e2e/agent-cards-tree.spec.ts`, against the fixture scene `/?fixture=1&state=docs&cards=tree` (eight roots, a dispatcher with an orchestration under it, one with seven units, orchestrators with roles) and `cards=tree-nested` (a root whose only child has nine cards under it). Live updates are pushed through the tree scenes' `window.__dadFixtureCards` hook.
+- **Layer:** desktop browser (production build, `vite preview`), widths 375, 768, 1024, 1440 and 1920 px.
+- **Asserts:** the page never scrolls sideways with every tree closed or every root open, and every tree and line stays inside the frame; opening any root leaves every root's x, width and height unchanged, the roots in its row and above do not move, the rows below move down together by one amount, and closing it puts every root back; two roots opened in one row each get their own level under it in the roots' order, and the later root's line passes through no part of the earlier tree and stays inside the frame. At 375 px each row holds one root, so the two-roots case asserts that instead. With the nested scene's child level wider than the frame, the root's line ends on the child's top edge, within its width, both as opened and after the tree's block is scrolled, and stays inside the frame. With a tree open, a live list in which a root and a child start needing the user with other status words, and then one in which more checked references than fit on a line appear on a root and on a child, leaves every root's x, y, width and height unchanged.
+- **Does not assert:** the colours; a real daemon's tree (the fixture plays the daemon); the line while the child is scrolled wholly out of view (it then ends at the block's nearer edge).
+
+##### desktop/agent-cards/020 — The grid measures its frame whenever cards appear, including after a filter emptied it.
+- **Test:** vitest `desktop/agent-cards/020: …` in `desktop/src/components/AgentCardsTree.test.tsx`.
+- **Layer:** desktop component (jsdom) with a recording `ResizeObserver` and a set frame width.
+- **Asserts:** a deck that starts with no cards lays its grid out for the frame's width as soon as cards arrive, and again on a resize; after the dashboard filter hides every card and is cleared, the restored frame is measured afresh and its resizes are followed.
+- **Does not assert:** real layout (019 does that in a browser).
+
+##### desktop/agent-cards/021 — A card's kind is the daemon's, whatever the dashboard filter shows.
+- **Test:** vitest `desktop/agent-cards/021: …` in `desktop/src/components/AgentCardsTree.test.tsx`.
+- **Layer:** desktop component (jsdom).
+- **Asserts:** a card the daemon sends with `kind: "dispatcher"` reads "dispatcher" whether its unit is on screen or hidden by the dashboard filter, and so does one with no unit listed at all; for a daemon without the tree, the kind is read off the relations of the cards on screen.
+- **Does not assert:** how the daemon works the kind out (`agent_cards::tests::each_card_carries_its_kind_from_the_dispatch_records`).
+
+##### desktop/agent-cards/022 — A cyclic list is drawn once, with persisted open cards and Needs you only.
+- **Test:** vitest `desktop/agent-cards/022: …` in `desktop/src/components/AgentCardsTree.test.tsx`.
+- **Layer:** desktop component (jsdom).
+- **Asserts:** two entries naming each other as `parent`, both remembered open and one needing the user, render without recursing: the first is the only root, each card is drawn once, and Needs you only and toggling the root leave it that way.
+- **Does not assert:** the daemon's own cycle cutting (`agent_cards::tests::self_links_and_cycles_still_give_a_forest`).
+
+##### desktop/agent-cards/023 — An issue badge opens only an issue's own numbered page.
+- **Test:** vitest `desktop/agent-cards/023: …` in `desktop/src/components/AgentCardsTree.test.tsx`.
+- **Layer:** pure webview helper (`isIssueUrl`, `referenceUrl`).
+- **Asserts:** `https://github.com/<owner>/<repo>/issues/<n>` with n ≥ 1, an optional trailing `/` and an explicit `:443` is accepted; a segment after the number, a query (even an empty one), a fragment, number 0 or a leading zero, a pull request page, another host, plain http, a login and another port are refused. The native browser's matcher has the same cases in `pr_browser::tests::a_github_issue_opens_the_browser_too`.
+- **Does not assert:** the in-app browser's navigation policy after it opens.
+
+##### desktop/agent-cards/024 — A compact card's agent-written prompt is reviewed before it is sent.
+- **Test:** vitest `primaryNeedsReview (issue #2418 audit A4)` in `desktop/src/lib/agentCards.test.ts`; Playwright `desktop/agent-cards/024 — a compact card's agent-written prompt is reviewed before it is sent` in `desktop/e2e/agent-cards-tree.spec.ts`, against the fixture scene `cards=tree` with a pushed primary action.
+- **Layer:** pure webview helper; desktop browser (production build, `vite preview`) at 1024 px.
+- **Asserts:** the compact card's primary sends directly only a prompt whose `prompt_source` is `catalog`; any other prompt (the agent's, the deck's, none given), however short, goes to the review step, and a primary with no prompt is unaffected. In the browser, an agent-written 51-character prompt that the card's line cuts off (scroll width larger than client width) opens the review with the whole prompt on pressing the primary, no result appears on the card or in the overlay, and only Send produces the fixture daemon's `m-fixture-card` answer.
+- **Does not assert:** what the daemon does with the request (`agent-report/actions/001`); a real agent.
+
+##### desktop/agent-cards/025 — Every checked reference is reachable from a compact card.
+- **Test:** vitest `desktop/agent-cards/025: …` (three tests) in `desktop/src/components/AgentCardsTree.test.tsx`; Playwright `desktop/agent-cards/025 — every checked reference is reachable from a compact card at <width>px` in `desktop/e2e/agent-cards-tree.spec.ts`, against `cards=tree` with pushed references.
+- **Layer:** desktop component (jsdom; the second test stubs the reference line's and badges' layout widths); desktop browser at 375 and 1440 px.
+- **Asserts:** the card overlay's "Pull requests and issues" section lists every `checked_refs` entry in the daemon's order with the deck's check (a pull request's state, review and CI, an issue's state, the title), when it was checked or that it is stale, that it is still to be checked, or why it cannot be (with the daemon's detail), and the agent's claim marked **agent says**; its checked badges open their pages through the same opener as the card's, named by the card; an open the opener accepts closes the overlay, and one it refuses leaves the overlay open with the opener's sentence in it, and on the card the same refusal shows in a dashboard banner that Dismiss clears; an unchecked one has no link. On the card, badges that do not fit the line whole are hidden whole (`data-overflow`, `aria-hidden`, not drawn) and counted by a `+N` button; pressing it, from the keyboard in the browser, opens that card's overlay with the focus on the section, scrolled into view. In the browser with two pull requests, a stale issue and a not-found issue, every drawn badge is wholly inside the line and clear of the count, the roots do not move, the overlay lists all four with their states, and a real click on the stale issue past the card's line opens the in-app browser on it although bench's card is `stopped` and its agent is absent from the fleet's agents. The browser is then in front: the card overlay is gone, the browser is not `inert`, none of its toolbar buttons is, it is not marked covered, a hit-test at its centre lands inside it and the focus is inside it; its Back works, a later card list that still holds bench keeps it open, Close puts the focus back on the `+N`, and a list without bench's card closes it.
+- **Does not assert:** the lookup (`agent-report/refs/001`, `002`); voice beyond the existing show-card command, which opens the same overlay.
+
+##### desktop/agent-cards/026 — A reference opened again follows what asked for it last.
+- **Test:** vitest `desktop/agent-cards/026: …` (four tests) in `desktop/src/CardReferenceSubject.test.tsx`.
+- **Layer:** desktop shell (jsdom): the real `DeckShell` with its `OpenCardReference` and `OpenPullRequest` providers, opened from the dashboard's own card badges and table pull request badge; the native page host and the daemons' pushes are synthetic.
+- **Asserts:** with the in-app browser already on an address, a second accepted open of that address does not reload the page (the host's `open` is called once) but the browser takes the new request's subject: two cards on one deck, or on two decks, reporting the same issue leave it named for the second card, and it stays open when the first card's list drops it and closes when the second's does; a card's pull request reopened from the agent's table badge is named for the agent, stays open when the card goes and closes when the agent goes; the badge's pull request reopened from the card is named for the card, stays open when the agent stops while the card is listed, and closes when the card goes.
+- **Does not assert:** a switch to a different address (`PullRequestBrowser.test.tsx`); voice beyond the shared providers.
+
+##### desktop/agent-cards/027 — A compact card's action label and its source badge stay readable.
+- **Test:** Playwright `desktop/agent-cards/027 — a compact card's action label and source stay readable at <width>px` in `desktop/e2e/agent-cards-tree.spec.ts`, against `cards=tree` with a pushed primary action.
+- **Layer:** desktop browser (production build, `vite preview`) at 375 and 1440 px.
+- **Asserts:** with an agent-written primary action whose label is longer than the card's button, the label's first character starts inside the button's content box, the label's box ends inside it, is cut (scroll width larger than client width), is not a flex or grid box and has `overflow: hidden` and `text-overflow: ellipsis`, so it is cut at its end with an ellipsis; the **agent says** badge beside it is not cut (scroll width no larger than client width, for its slot and its text) and lies wholly inside its slot; the primary line stays 26 px high, no root moves or resizes, and the page does not scroll sideways.
+- **Does not assert:** the pixels of the ellipsis glyph; the docs screenshot, which shows the same line (`site/static/img/agent-cards-desktop.png`).
 
 ## Desktop native driver scenarios
 

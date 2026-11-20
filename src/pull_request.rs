@@ -180,6 +180,20 @@ const GIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// every directory and key. Further jobs wait for a permit.
 const MAX_CONCURRENT_JOBS: usize = 4;
 
+/// A new bound of [`MAX_CONCURRENT_JOBS`] permits for [`JobPool`]s. The
+/// daemon makes one and hands a clone to each background monitor that runs
+/// `git` or `gh` for GitHub lookups, so those monitors together stay inside
+/// it.
+pub(crate) fn new_job_bound() -> Arc<tokio::sync::Semaphore> {
+    Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_JOBS))
+}
+
+/// How long a failed lookup waits before the next one, at refresh
+/// `interval`: what [`fetch_due`] applies after a failure.
+pub(crate) fn failure_backoff(interval: Duration) -> Duration {
+    interval * FAILURE_BACKOFF_FACTOR
+}
+
 /// How much of `gh`'s stderr a failure keeps.
 const MAX_LOGGED_STDERR_CHARS: usize = 300;
 
@@ -296,8 +310,7 @@ pub(crate) async fn branch_key(cwd: &Path) -> Option<BranchProbe> {
     if is_default_branch(&branch, default) {
         return None;
     }
-    let origin = git_line(cwd, &["remote", "get-url", "origin"]).await?;
-    let slug = crate::worktree_reclaim::parse_github_owner_repo(&origin)?;
+    let slug = origin_repo(cwd).await?;
     let push = push_repos(cwd, &branch).await;
     Some(BranchProbe {
         push_known: push.is_ok(),
@@ -307,6 +320,14 @@ pub(crate) async fn branch_key(cwd: &Path) -> Option<BranchProbe> {
             push: push.unwrap_or_default(),
         },
     })
+}
+
+/// `owner/name` of `cwd`'s `origin`, or `None` when `cwd` is not a git
+/// repository, has no `origin`, or its `origin` is not on GitHub. Bounded by
+/// [`GIT_TIMEOUT`] like every other probe here.
+pub(crate) async fn origin_repo(cwd: &Path) -> Option<String> {
+    let origin = git_line(cwd, &["remote", "get-url", "origin"]).await?;
+    crate::worktree_reclaim::parse_github_owner_repo(&origin)
 }
 
 /// `owner/name` of each GitHub repository `branch` is pushed to, or `Err`
@@ -553,98 +574,333 @@ pub fn parse_pr_list(
         }))
 }
 
+/// The arguments of `gh pr view` for pull request `number` of `repo_slug`,
+/// asking for `fields`. Issue #2418: a reference an agent reports names its
+/// pull request by number rather than by branch. Its output is one object,
+/// which [`parse_pr_view`] reads.
+pub fn gh_pr_view_args<'a>(number: &'a str, repo_slug: &'a str, fields: &'a str) -> [&'a str; 7] {
+    ["pr", "view", number, "--repo", repo_slug, "--json", fields]
+}
+
+/// The PR `gh pr view --json` output (asked for [`GH_PR_FIELDS`]) reports,
+/// with the same tolerance as [`parse_pr_list`]: a state this build does not
+/// know, or a URL off `https://github.com/`, is `None` rather than an error.
+/// Unlike a branch's lookup, the head branch is not compared, since the
+/// number already names the pull request.
+pub fn parse_pr_view(json: &str) -> Result<Option<PullRequestInfo>, String> {
+    let pr: GhPr =
+        serde_json::from_str(json).map_err(|e| format!("could not parse gh output: {e}"))?;
+    Ok(pr.into_info())
+}
+
 /// Run `gh pr list` for `key`. Never blocks the runtime, and gives up after
 /// [`GH_TIMEOUT`].
-async fn query_gh(cwd: PathBuf, key: PrKey) -> Result<Option<PullRequestInfo>, String> {
+async fn query_gh(cwd: PathBuf, key: PrKey) -> Result<Option<PullRequestInfo>, GhFailure> {
+    let stdout = run_gh(
+        "gh pr list",
+        Some(&cwd),
+        &gh_pr_list_args(&key.branch, &key.slug, GH_PR_FIELDS),
+    )
+    .await?;
+    parse_pr_list(&String::from_utf8_lossy(&stdout), &key.branch, &key.push)
+        .map_err(GhFailure::error)
+}
+
+/// Why a `gh` lookup gave no answer, in the words issue #2418's checked
+/// references report (D5). The branch badge only logs the failure; a checked
+/// reference shows its reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GhFailureReason {
+    /// `gh` is not installed or could not be started, or it is not logged in
+    /// (or its token was refused).
+    NoGithubAccess,
+    /// GitHub knows no such repository, pull request or issue — or it is
+    /// private to this login, which GitHub does not tell apart.
+    NotFound,
+    /// GitHub refused the call for its rate limit.
+    RateLimited,
+    /// Anything else: a timeout, no network, output that does not parse.
+    Error,
+}
+
+impl GhFailureReason {
+    /// The snake_case word for this reason.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GhFailureReason::NoGithubAccess => "no_github_access",
+            GhFailureReason::NotFound => "not_found",
+            GhFailureReason::RateLimited => "rate_limited",
+            GhFailureReason::Error => "error",
+        }
+    }
+}
+
+/// A failed `gh` lookup: why ([`GhFailureReason`]) and what happened, as the
+/// line the daemon logs. When `detail` quotes `gh`'s stderr, that is escaped
+/// and capped ([`gh_failure`]); other details (a timeout, a spawn error,
+/// output that does not parse) are not capped here, and none is redacted,
+/// so `detail` is for the daemon's own log. Issue #2418: a checked
+/// reference shows a fixed sentence per reason instead
+/// ([`crate::reference_check::unavailable_detail`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GhFailure {
+    pub reason: GhFailureReason,
+    pub detail: String,
+}
+
+impl GhFailure {
+    /// A failure of no more specific reason.
+    pub(crate) fn error(detail: String) -> Self {
+        Self {
+            reason: GhFailureReason::Error,
+            detail,
+        }
+    }
+}
+
+impl std::fmt::Display for GhFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+/// The exit code `gh` documents for "authentication required".
+const GH_EXIT_AUTH_REQUIRED: i32 = 4;
+
+/// The reason a `gh` that exited with `code` and printed `stderr` failed.
+/// `gh` has one documented exit code for this ([`GH_EXIT_AUTH_REQUIRED`]);
+/// the rest is read from the messages `gh` and GitHub's API print, and a
+/// message that matches none of the phrases below is [`GhFailureReason::Error`].
+pub(crate) fn classify_gh_failure(code: Option<i32>, stderr: &str) -> GhFailureReason {
+    if code == Some(GH_EXIT_AUTH_REQUIRED) {
+        return GhFailureReason::NoGithubAccess;
+    }
+    let stderr = stderr.to_ascii_lowercase();
+    let says = |needles: &[&str]| needles.iter().any(|n| stderr.contains(n));
+    // Rate limits first: GitHub answers a secondary rate limit or its abuse
+    // detection with an HTTP 403, which must not read as "not accessible".
+    if says(&["rate limit", "abuse detection", "http 429", "rate_limited"]) {
+        GhFailureReason::RateLimited
+    } else if says(&[
+        "gh auth login",
+        "authentication required",
+        "bad credentials",
+        "http 401",
+    ]) {
+        GhFailureReason::NoGithubAccess
+    } else if says(&[
+        "could not resolve to",
+        "http 404",
+        // A 403 "Resource not accessible by personal access token" (or "by
+        // integration"): gh is logged in, but that login cannot see the
+        // repository, which reads like a private one.
+        "resource not accessible by",
+    ]) {
+        GhFailureReason::NotFound
+    } else {
+        GhFailureReason::Error
+    }
+}
+
+/// Run `gh <args>` (in `cwd` when given) and return its stdout, or why it
+/// failed. Never blocks the runtime, gives up after [`GH_TIMEOUT`], and kills
+/// the child when it times out or the future is dropped. `what` names the
+/// command in the failure's detail (`"gh pr list"`).
+///
+/// A `gh` that cannot be started is [`GhFailureReason::NoGithubAccess`] when
+/// the spawn error is "not found" or "permission denied". A `cwd` that does
+/// not exist fails the spawn with "not found" too, so a lookup that needs no
+/// directory passes `None`.
+pub(crate) async fn run_gh(
+    what: &str,
+    cwd: Option<&Path>,
+    args: &[&str],
+) -> Result<Vec<u8>, GhFailure> {
     let mut cmd = tokio::process::Command::new("gh");
-    cmd.current_dir(&cwd)
-        .args(gh_pr_list_args(&key.branch, &key.slug, GH_PR_FIELDS))
+    if let Some(cwd) = cwd {
+        cmd.current_dir(cwd);
+    }
+    cmd.args(args)
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true);
     let out = tokio::time::timeout(GH_TIMEOUT, cmd.output())
         .await
-        .map_err(|_| format!("gh pr list timed out after {}s", GH_TIMEOUT.as_secs()))?
-        .map_err(|e| format!("gh unavailable: {e}"))?;
+        .map_err(|_| GhFailure::error(format!("{what} timed out after {}s", GH_TIMEOUT.as_secs())))?
+        .map_err(|e| GhFailure {
+            reason: match e.kind() {
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => {
+                    GhFailureReason::NoGithubAccess
+                }
+                _ => GhFailureReason::Error,
+            },
+            detail: format!("gh unavailable: {e}"),
+        })?;
     if !out.status.success() {
-        return Err(gh_failure(&out.status, &out.stderr));
+        return Err(GhFailure {
+            reason: classify_gh_failure(out.status.code(), &String::from_utf8_lossy(&out.stderr)),
+            detail: gh_failure(what, &out.status, &out.stderr),
+        });
     }
-    parse_pr_list(
-        &String::from_utf8_lossy(&out.stdout),
-        &key.branch,
-        &key.push,
-    )
+    Ok(out.stdout)
 }
 
 /// The error a failed `gh` reports. Its stderr is quoted into a log line, so
 /// control characters, line breaks and bidi marks are escaped first, and the
 /// result is capped at [`MAX_LOGGED_STDERR_CHARS`].
-fn gh_failure(status: &impl std::fmt::Display, stderr: &[u8]) -> String {
+fn gh_failure(what: &str, status: &impl std::fmt::Display, stderr: &[u8]) -> String {
     let stderr = escape_control_and_bidi(String::from_utf8_lossy(stderr).trim());
     let stderr: String = stderr.chars().take(MAX_LOGGED_STDERR_CHARS).collect();
-    format!("gh pr list failed ({status}): {stderr}")
+    format!("{what} failed ({status}): {stderr}")
 }
 
-/// What the monitor knows about one key.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct KeyEntry {
-    /// The last successful answer: `Some(None)` is "no PR". `None` until one.
-    pub value: Option<Option<PullRequestInfo>>,
+/// What a lookup's answer tells [`fetch_due`] about re-reading it: the half
+/// of the refresh policy that depends on what was looked up. The branch
+/// badge's answer is `Option<PullRequestInfo>` (`None`: the branch has no PR);
+/// a second kind of lookup implements this for its own answer and reuses
+/// [`LookupEntry`] and [`fetch_due`] unchanged.
+pub trait LookupAnswer {
+    /// The answer is final — a merged or closed PR — and is not re-read,
+    /// unless [`Self::still_settling`].
+    fn is_terminal(&self) -> bool;
+    /// A terminal answer with a part still pending, such as a merged PR whose
+    /// CI is still running: re-read as an open one is, but only for
+    /// [`TERMINAL_PENDING_CHECKS_WINDOW`] after it first turned terminal.
+    fn still_settling(&self) -> bool;
+    /// Both answers are about the same subject (the same PR), so the clock of
+    /// [`LookupEntry::terminal_since`] carries on rather than starting again.
+    fn same_subject(&self, other: &Self) -> bool;
+}
+
+impl LookupAnswer for Option<PullRequestInfo> {
+    fn is_terminal(&self) -> bool {
+        self.as_ref().is_some_and(|pr| {
+            matches!(
+                pr.state,
+                PullRequestState::Merged | PullRequestState::Closed
+            )
+        })
+    }
+
+    fn still_settling(&self) -> bool {
+        self.as_ref()
+            .is_some_and(|pr| checks_still_running(pr.checks.as_ref()))
+    }
+
+    fn same_subject(&self, other: &Self) -> bool {
+        matches!((self, other), (Some(old), Some(new)) if old.number == new.number)
+    }
+}
+
+/// What a monitor knows about one lookup key: the last answer, when it was
+/// read, and the state of the refresh policy ([`fetch_due`]).
+#[derive(Debug, Clone)]
+pub struct LookupEntry<V> {
+    /// The last successful answer. `None` until one.
+    pub value: Option<V>,
     /// When the last lookup finished.
     pub fetched_at: Option<Instant>,
     /// The last lookup failed.
     pub failed: bool,
+    /// Why the last lookup failed, while [`Self::failed`]. The branch badge
+    /// only logs it; a checked reference reports its reason.
+    pub last_failure: Option<GhFailure>,
     /// A lookup is running.
     pub in_flight: bool,
     /// A turn ended or an agent stopped on this key since the last lookup.
     pub kicked: bool,
     /// The current run of failures has been logged.
     pub failure_logged: bool,
-    /// When a lookup first answered with this key's PR merged or closed —
-    /// that PR, by number; `None` while it is open, or there is none.
+    /// When a lookup first answered with this key's subject terminal (a PR
+    /// merged or closed) — that subject, by [`LookupAnswer::same_subject`];
+    /// `None` while it is not terminal.
     pub terminal_since: Option<Instant>,
 }
 
-impl KeyEntry {
+impl<V> Default for LookupEntry<V> {
+    fn default() -> Self {
+        Self {
+            value: None,
+            fetched_at: None,
+            failed: false,
+            last_failure: None,
+            in_flight: false,
+            kicked: false,
+            failure_logged: false,
+            terminal_since: None,
+        }
+    }
+}
+
+impl<V> LookupEntry<V> {
+    /// The value is a last-known answer that a later lookup failed to
+    /// confirm: still shown, but no longer fresh.
+    pub fn is_stale(&self) -> bool {
+        self.failed && self.value.is_some()
+    }
+
+    /// Store a failed lookup. Returns whether it starts a run of failures —
+    /// the one to log; the run ends at the next successful [`Self::record`].
+    /// The last answer is kept.
+    pub(crate) fn record_failure(&mut self, failure: GhFailure) -> bool {
+        self.failed = true;
+        self.last_failure = Some(failure);
+        !std::mem::replace(&mut self.failure_logged, true)
+    }
+}
+
+impl<V: LookupAnswer> LookupEntry<V> {
     /// Store a successful lookup's `value`, answered at `now`.
-    pub(crate) fn record(&mut self, value: Option<PullRequestInfo>, now: Instant) {
-        let terminal = value.as_ref().is_some_and(|pr| {
-            matches!(
-                pr.state,
-                PullRequestState::Merged | PullRequestState::Closed
-            )
-        });
-        // The clock belongs to one PR: a different one, as when a branch's
-        // closed PR is replaced by another, starts it again.
-        let same_pr = matches!(
-            (&self.value, &value),
-            (Some(Some(old)), Some(new)) if old.number == new.number
-        );
+    pub(crate) fn record(&mut self, value: V, now: Instant) {
+        let terminal = value.is_terminal();
+        // The clock belongs to one subject: a different one, as when a
+        // branch's closed PR is replaced by another, starts it again.
+        let same_subject = self
+            .value
+            .as_ref()
+            .is_some_and(|old| old.same_subject(&value));
         self.terminal_since = match (terminal, self.terminal_since) {
             (false, _) => None,
-            (true, Some(since)) if same_pr => Some(since),
+            (true, Some(since)) if same_subject => Some(since),
             (true, _) => Some(now),
         };
         self.value = Some(value);
         self.failed = false;
+        self.last_failure = None;
         self.failure_logged = false;
     }
 }
+
+/// Whether any of `checks` is still running. Review R2 (#2418): the count,
+/// not the summary's state, since a failed check makes the state `Failing`
+/// while another one still runs.
+pub(crate) fn checks_still_running(checks: Option<&PullRequestChecks>) -> bool {
+    checks.is_some_and(|checks| checks.pending > 0)
+}
+
+/// What the branch badge's monitor knows about one key: `Some(None)` as the
+/// value is "no PR".
+pub(crate) type KeyEntry = LookupEntry<Option<PullRequestInfo>>;
 
 /// Whether `entry` needs a lookup at `now`. The refresh policy, pure:
 ///
 /// * never two at once, and a key never looked up is due at once;
 /// * after a failure, only once [`FAILURE_BACKOFF_FACTOR`] intervals passed;
-/// * a merged or closed PR, never (a new branch is a new key) — unless its
-///   CI checks are still pending, which are then re-read as an open PR's
-///   are for [`TERMINAL_PENDING_CHECKS_WINDOW`] after it closed, so the badge
-///   does not keep a pending mark for good, nor poll for good on a check that
-///   never finishes (issue #1781);
+/// * a terminal answer ([`LookupAnswer::is_terminal`]: a merged or closed
+///   PR), never (for the branch badge, a new branch is a new key) — unless it
+///   is still settling (its CI checks are still pending), which is then
+///   re-read as an open PR's are for [`TERMINAL_PENDING_CHECKS_WINDOW`] after
+///   it closed, so the badge does not keep a pending mark for good, nor poll
+///   for good on a check that never finishes (issue #1781);
 /// * an open or draft PR, every `interval`, or after a turn end once the
 ///   debounce passed;
 /// * no PR, every `interval` too — a PR the user opens while the agent is
 ///   idle ends no turn, and must still show within about a minute — or after
 ///   a turn end once the debounce passed.
-pub(crate) fn fetch_due(entry: &KeyEntry, now: Instant, interval: Duration) -> bool {
+pub(crate) fn fetch_due<V: LookupAnswer>(
+    entry: &LookupEntry<V>,
+    now: Instant,
+    interval: Duration,
+) -> bool {
     if entry.in_flight {
         return false;
     }
@@ -658,20 +914,16 @@ pub(crate) fn fetch_due(entry: &KeyEntry, now: Instant, interval: Duration) -> b
     }
     match &entry.value {
         None => true,
-        Some(Some(pr))
-            if matches!(
-                pr.state,
-                PullRequestState::Merged | PullRequestState::Closed
-            ) && !(pr
-                .checks
-                .is_some_and(|checks| checks.state == PullRequestChecksState::Pending)
-                && entry.terminal_since.is_some_and(|since| {
-                    now.saturating_duration_since(since) < TERMINAL_PENDING_CHECKS_WINDOW
-                })) =>
+        Some(value)
+            if value.is_terminal()
+                && !(value.still_settling()
+                    && entry.terminal_since.is_some_and(|since| {
+                        now.saturating_duration_since(since) < TERMINAL_PENDING_CHECKS_WINDOW
+                    })) =>
         {
             false
         }
-        Some(Some(_)) | Some(None) => age >= interval || kicked,
+        Some(_) => age >= interval || kicked,
     }
 }
 
@@ -758,7 +1010,7 @@ struct CwdEntry {
 /// Whether a directory's branch needs re-reading at `now`: never read, once an
 /// interval, or after a turn end once the same debounce as a lookup's passed —
 /// so a stream of Idle reports cannot drive `git` at its completion rate.
-fn resolve_due(
+pub(crate) fn resolve_due(
     resolved_at: Option<Instant>,
     kicked: bool,
     now: Instant,
@@ -782,6 +1034,11 @@ pub(crate) struct JobPool<K, T> {
     running: HashMap<K, (u64, tokio::task::AbortHandle)>,
     next_id: u64,
     permits: Arc<tokio::sync::Semaphore>,
+    /// A narrower bound a job holds first, before a permit of `permits`
+    /// ([`Self::with_lane`]): at most its permit count of the pool's jobs —
+    /// and of every pool sharing the lane — hold or wait for a shared permit
+    /// at once, which leaves the rest of the shared permits to other pools.
+    lane: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl<K, T> JobPool<K, T>
@@ -795,6 +1052,21 @@ where
             running: HashMap::new(),
             next_id: 0,
             permits,
+            lane: None,
+        }
+    }
+
+    /// A pool whose every job first holds a permit of `lane`, then one of
+    /// `permits`. Issue #2418 (review A1): the checked references' lookups
+    /// run in a lane narrower than the shared bound, so however many of them
+    /// are queued, the branch badge's jobs still get permits.
+    pub(crate) fn with_lane(
+        permits: Arc<tokio::sync::Semaphore>,
+        lane: Arc<tokio::sync::Semaphore>,
+    ) -> Self {
+        Self {
+            lane: Some(lane),
+            ..Self::new(permits)
         }
     }
 
@@ -804,7 +1076,6 @@ where
 
     /// Jobs started and neither finished nor cancelled, waiting for a permit
     /// or running.
-    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.running.len()
     }
@@ -818,9 +1089,15 @@ where
         let generation = self.next_id;
         self.next_id += 1;
         let permits = self.permits.clone();
+        let lane = self.lane.clone();
         let task_id = id.clone();
         let handle = self.jobs.spawn(async move {
-            // The semaphore is never closed, so this only waits.
+            // The lane first, so a job waiting for its lane holds no shared
+            // permit. Neither semaphore is ever closed, so this only waits.
+            let _lane = match lane {
+                Some(lane) => Some(lane.acquire_owned().await),
+                None => None,
+            };
             let _permit = permits.acquire_owned().await;
             (task_id, generation, job.await)
         });
@@ -863,17 +1140,19 @@ where
 /// PRD #1401: the daemon's background task that resolves every live
 /// session's pull request and reports changes — see the module docs. Runs
 /// until aborted (`run_daemon_with`'s cleanup) or the broadcast closes; either
-/// way its jobs, and the children they run, go with it.
+/// way its jobs, and the children they run, go with it. Every `git` and `gh`
+/// it runs holds a permit of `permits` ([`new_job_bound`]), which other
+/// GitHub lookups the daemon runs may share.
 pub async fn run_pull_request_monitor(
     registry: Arc<AgentPtyRegistry>,
     state: SharedState,
     event_tx: broadcast::Sender<BroadcastMsg>,
     interval: Duration,
+    permits: Arc<tokio::sync::Semaphore>,
 ) {
     let mut events = event_tx.subscribe();
-    let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_JOBS));
     let mut probes: JobPool<PathBuf, Option<BranchProbe>> = JobPool::new(permits.clone());
-    let mut lookups: JobPool<PrKey, Result<Option<PullRequestInfo>, String>> =
+    let mut lookups: JobPool<PrKey, Result<Option<PullRequestInfo>, GhFailure>> =
         JobPool::new(permits);
     // One timer for the monitor's life: a sleep rebuilt on every pass would
     // start over at each broadcast message, so steady unrelated traffic could
@@ -918,13 +1197,12 @@ pub async fn run_pull_request_monitor(
                 match result {
                     Ok(value) => entry.record(value, Instant::now()),
                     Err(error) => {
-                        entry.failed = true;
-                        if !entry.failure_logged {
-                            entry.failure_logged = true;
+                        let detail = error.detail.clone();
+                        if entry.record_failure(error) {
                             warn!(
                                 repo = %escape_control_and_bidi(&key.slug),
                                 branch = %escape_control_and_bidi(&key.branch),
-                                error = %escape_control_and_bidi(&error),
+                                error = %escape_control_and_bidi(&detail),
                                 "pull request lookup failed; the agent's card shows no \
                                  pull request until a later lookup succeeds"
                             );
@@ -1394,11 +1672,12 @@ mod tests {
         let interval = Duration::from_secs(60);
         let with_checks = |state, checks_state| {
             let mut value = pr_in(state);
+            let pending = u32::from(checks_state == PullRequestChecksState::Pending);
             value.as_mut().unwrap().as_mut().unwrap().checks = Some(PullRequestChecks {
                 state: checks_state,
                 passing: 1,
-                failing: 0,
-                pending: 1,
+                failing: u32::from(checks_state == PullRequestChecksState::Failing),
+                pending,
                 skipped: 0,
             });
             let mut entry = KeyEntry::default();
@@ -1417,6 +1696,47 @@ mod tests {
                 let done = with_checks(state, finished);
                 assert!(!fetch_due(&done, at + interval * 10, interval), "{state:?}");
             }
+        }
+    }
+
+    /// Review R2 (#2418): a merged or closed PR with one failed check and
+    /// another still running summarises as `Failing`, yet is still settling:
+    /// it is re-read until the running one finishes, and stops after the
+    /// window like any other.
+    #[test]
+    fn a_terminal_pr_with_a_failed_and_a_running_check_is_still_polled() {
+        let at = Instant::now();
+        let interval = Duration::from_secs(60);
+        let checks = |failing, pending| PullRequestChecks {
+            state: PullRequestChecksState::Failing,
+            passing: 0,
+            failing,
+            pending,
+            skipped: 0,
+        };
+        for state in [PullRequestState::Merged, PullRequestState::Closed] {
+            let mut pr = pr_in(state).unwrap().unwrap();
+            pr.checks = Some(checks(1, 1));
+            let mut entry = KeyEntry::default();
+            entry.record(Some(pr.clone()), at);
+            entry.fetched_at = Some(at);
+            assert!(!fetch_due(&entry, at + Duration::from_secs(59), interval));
+            assert!(fetch_due(&entry, at + interval, interval), "{state:?}");
+            // Past the window it stops, even with the check still running.
+            assert!(!fetch_due(
+                &entry,
+                at + TERMINAL_PENDING_CHECKS_WINDOW + interval,
+                interval
+            ));
+            // The running check finished (failed too): settled, not re-read.
+            let mut done = pr;
+            done.checks = Some(checks(2, 0));
+            entry.record(Some(done), at + interval);
+            entry.fetched_at = Some(at + interval);
+            assert!(
+                !fetch_due(&entry, at + interval * 10, interval),
+                "{state:?}"
+            );
         }
     }
 
@@ -2160,6 +2480,41 @@ mod tests {
         assert_eq!((probes.len(), lookups.len()), (0, 0));
     }
 
+    /// Issue #2418 (review A1): a pool in a lane of two holds at most two of
+    /// the shared permits however many of its jobs are queued, so a pool
+    /// outside the lane — the branch badge's — still runs its jobs.
+    #[tokio::test]
+    async fn a_lane_leaves_shared_permits_to_the_other_pools() {
+        let permits = new_job_bound();
+        let lane = Arc::new(tokio::sync::Semaphore::new(2));
+        let mut references: JobPool<u32, ()> = JobPool::with_lane(permits.clone(), lane.clone());
+        let mut other: JobPool<u32, ()> = JobPool::with_lane(permits.clone(), lane);
+        for id in 0..20 {
+            references.spawn(id, std::future::pending::<()>());
+            other.spawn(id, std::future::pending::<()>());
+        }
+        eventually("the lane full", || {
+            permits.available_permits() == MAX_CONCURRENT_JOBS - 2
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(permits.available_permits(), MAX_CONCURRENT_JOBS - 2);
+        let mut branch: JobPool<u32, u32> = JobPool::new(permits.clone());
+        for id in 0..10 {
+            branch.spawn(id, async move { id });
+        }
+        let mut served = 0;
+        while tokio::time::timeout(Duration::from_secs(10), branch.next())
+            .await
+            .expect("the branch jobs are served")
+            .is_some()
+        {
+            served += 1;
+        }
+        assert_eq!(served, 10);
+        assert_eq!((references.len(), other.len()), (20, 20));
+    }
+
     /// A job whose id is retained away, or whose pool is dropped (the monitor
     /// stopping), has its future dropped; a superseded job's result is never
     /// reported.
@@ -2240,7 +2595,7 @@ mod tests {
     #[test]
     fn gh_stderr_is_escaped_and_capped_before_it_is_logged() {
         let hostile = "HTTP 401\n2026-10-10T00:00:00Z WARN forged line\x1b[2J\u{202e}gnp.exe";
-        let msg = gh_failure(&"exit status: 1", hostile.as_bytes());
+        let msg = gh_failure("gh pr list", &"exit status: 1", hostile.as_bytes());
         assert!(!msg.chars().any(|c| c.is_control()), "{msg}");
         assert!(
             !msg.chars().any(crate::untrusted_text::is_bidi_format_char),
@@ -2248,8 +2603,209 @@ mod tests {
         );
         assert!(msg.contains("HTTP 401\\n2026"), "{msg}");
         let long = "y".repeat(10_000);
-        let msg = gh_failure(&"exit status: 1", long.as_bytes());
+        let msg = gh_failure("gh pr list", &"exit status: 1", long.as_bytes());
         assert_eq!(msg.matches('y').count(), MAX_LOGGED_STDERR_CHARS);
+        // The detail names the command it ran.
+        assert!(
+            gh_failure("gh issue view", &"exit status: 1", b"x")
+                .starts_with("gh issue view failed")
+        );
+    }
+
+    /// Issue #2418 (D5): a failed `gh` is sorted into the reason a checked
+    /// reference shows, from its exit code and the messages `gh` and the API
+    /// print; one this does not know is `Error`.
+    #[test]
+    fn gh_failures_are_classified_into_reasons() {
+        use GhFailureReason::*;
+        let cases: &[(Option<i32>, &str, GhFailureReason)] = &[
+            (
+                Some(4),
+                "To get started with GitHub CLI, please run:  gh auth login",
+                NoGithubAccess,
+            ),
+            (Some(4), "", NoGithubAccess),
+            (
+                Some(1),
+                "HTTP 401: Bad credentials (https://api.github.com/graphql)",
+                NoGithubAccess,
+            ),
+            (Some(1), "authentication required", NoGithubAccess),
+            (
+                Some(1),
+                "GraphQL: Could not resolve to a PullRequest with the number of 999. (repository.pullRequest)",
+                NotFound,
+            ),
+            (
+                Some(1),
+                "GraphQL: Could not resolve to a Repository with the name 'o/private'. (repository)",
+                NotFound,
+            ),
+            (Some(1), "gh: Not Found (HTTP 404)", NotFound),
+            (
+                Some(1),
+                "HTTP 403: API rate limit exceeded for user ID 1. (https://api.github.com/graphql)",
+                RateLimited,
+            ),
+            (
+                Some(1),
+                "GraphQL: API rate limit already exceeded for user ID 1. (RATE_LIMITED)",
+                RateLimited,
+            ),
+            (
+                Some(1),
+                "HTTP 403: You have exceeded a secondary rate limit",
+                RateLimited,
+            ),
+            (Some(1), "HTTP 429: Too Many Requests", RateLimited),
+            (
+                Some(1),
+                "HTTP 403: You have triggered an abuse detection mechanism. Please wait a few minutes before you try again.",
+                RateLimited,
+            ),
+            (
+                Some(1),
+                "GraphQL: Resource not accessible by personal access token (repository.pullRequest)",
+                NotFound,
+            ),
+            (
+                Some(1),
+                "HTTP 403: Resource not accessible by personal access token (https://api.github.com/repos/o/r/issues/7)",
+                NotFound,
+            ),
+            (
+                Some(1),
+                "HTTP 403: Resource not accessible by integration (https://api.github.com/repos/o/r/pulls/7)",
+                NotFound,
+            ),
+            (
+                Some(1),
+                "HTTP 403: Must have admin rights to Repository. (https://api.github.com/repos/o/r)",
+                Error,
+            ),
+            (
+                Some(1),
+                "error connecting to api.github.com\ncheck your internet connection",
+                Error,
+            ),
+            (None, "", Error),
+            (Some(1), "something new", Error),
+        ];
+        for (code, stderr, want) in cases {
+            assert_eq!(classify_gh_failure(*code, stderr), *want, "{stderr:?}");
+        }
+        assert_eq!(NoGithubAccess.as_str(), "no_github_access");
+        assert_eq!(NotFound.as_str(), "not_found");
+        assert_eq!(RateLimited.as_str(), "rate_limited");
+        assert_eq!(Error.as_str(), "error");
+    }
+
+    /// A run of failures is logged once, keeps the last answer (marked
+    /// stale) and its reason, and ends at the next success.
+    #[test]
+    fn a_failure_keeps_the_last_answer_as_stale_with_its_reason() {
+        let now = Instant::now();
+        let mut entry = KeyEntry::default();
+        let failure = |reason| GhFailure {
+            reason,
+            detail: "gh pr list failed".into(),
+        };
+        assert!(entry.record_failure(failure(GhFailureReason::RateLimited)));
+        assert!(!entry.record_failure(failure(GhFailureReason::NotFound)));
+        assert!(entry.failed && !entry.is_stale(), "no answer to be stale");
+        assert_eq!(
+            entry.last_failure.as_ref().map(|f| f.reason),
+            Some(GhFailureReason::NotFound)
+        );
+        entry.record(pr_in(PullRequestState::Open).unwrap(), now);
+        assert!(!entry.failed && !entry.is_stale() && entry.last_failure.is_none());
+        assert!(
+            entry.record_failure(failure(GhFailureReason::Error)),
+            "a new run"
+        );
+        assert!(entry.is_stale());
+        assert_eq!(entry.value, pr_in(PullRequestState::Open));
+    }
+
+    /// Issue #2418: the refresh policy is reusable by another kind of answer.
+    /// An issue-like answer that is never settling freezes once closed, and
+    /// polls every interval while open.
+    #[test]
+    fn the_refresh_policy_serves_another_kind_of_answer() {
+        #[derive(Clone, Debug, PartialEq)]
+        struct Issue {
+            number: u64,
+            closed: bool,
+        }
+        impl LookupAnswer for Issue {
+            fn is_terminal(&self) -> bool {
+                self.closed
+            }
+            fn still_settling(&self) -> bool {
+                false
+            }
+            fn same_subject(&self, other: &Self) -> bool {
+                self.number == other.number
+            }
+        }
+        let at = Instant::now();
+        let interval = Duration::from_secs(60);
+        let mut entry: LookupEntry<Issue> = LookupEntry::default();
+        assert!(fetch_due(&entry, at, interval));
+        entry.record(
+            Issue {
+                number: 7,
+                closed: false,
+            },
+            at,
+        );
+        entry.fetched_at = Some(at);
+        assert!(!fetch_due(&entry, at + interval / 2, interval));
+        assert!(fetch_due(&entry, at + interval, interval));
+        entry.record(
+            Issue {
+                number: 7,
+                closed: true,
+            },
+            at,
+        );
+        assert_eq!(entry.terminal_since, Some(at));
+        assert!(!fetch_due(&entry, at + interval * 100, interval));
+        // A failure backs off for the same factor as the badge's.
+        entry.record_failure(GhFailure::error("timed out".into()));
+        assert!(!fetch_due(&entry, at + interval, interval));
+        assert!(fetch_due(
+            &entry,
+            at + interval * FAILURE_BACKOFF_FACTOR,
+            interval
+        ));
+    }
+
+    /// Issue #2418: `gh pr view` answers one object, read with the branch
+    /// lookup's tolerance and no head-branch match.
+    #[test]
+    fn a_pr_view_reply_is_parsed_like_a_list_entry() {
+        let one = gh_pr(
+            42,
+            "someone/else",
+            "MERGED",
+            false,
+            serde_json::json!("APPROVED"),
+        );
+        let pr = parse_pr_view(&one.to_string())
+            .expect("parses")
+            .expect("a PR");
+        assert_eq!(pr.number, 42);
+        assert_eq!(pr.state, PullRequestState::Merged);
+        assert_eq!(pr.review, Some(PullRequestReview::Approved));
+        let mut off_site = one.clone();
+        off_site["url"] = serde_json::json!("https://example.com/o/r/pull/42");
+        assert_eq!(parse_pr_view(&off_site.to_string()), Ok(None));
+        assert!(parse_pr_view("[]").is_err());
+        assert_eq!(
+            gh_pr_view_args("42", "o/r", GH_PR_FIELDS),
+            ["pr", "view", "42", "--repo", "o/r", "--json", GH_PR_FIELDS]
+        );
     }
 
     fn sample_session() -> SessionState {

@@ -563,8 +563,21 @@ impl Drop for UnitDeck {
     }
 }
 
+/// The project config [`UnitDeck::new`] commits: a one-role team whose
+/// orchestrator is `cat`.
+// The team's one role only has to stay up while the test reads the context
+// file it was started with: the deck removes that file when the
+// orchestration ends (#1395), and the route stand-in leaves at once in a
+// role.
+const CARD_TEAM: &str = "[[orchestrations]]\nname = 'card-team'\n[[orchestrations.roles]]\nname = 'orchestrator'\nstart = true\ncommand = 'cat'\n";
+
 impl UnitDeck {
     fn new(extra_config: &str) -> Self {
+        Self::with_project(extra_config, CARD_TEAM)
+    }
+
+    /// [`Self::new`] with `project` as the committed `.dot-agent-deck.toml`.
+    fn with_project(extra_config: &str, project: &str) -> Self {
         let scratch = common::harness_tempdir().unwrap();
         let cmd = route::command(scratch.path());
         let config = scratch.path().join("config.toml");
@@ -581,15 +594,7 @@ impl UnitDeck {
             .with_env("DOT_AGENT_DECK_CONFIG", config.to_string_lossy())
             .launch_with_fixture("minimal");
         deck.wait_for_string("No active agents");
-        std::fs::write(
-            deck.workdir().join(".dot-agent-deck.toml"),
-            // The team's one role only has to stay up while the test reads the
-            // context file it was started with: the deck removes that file when
-            // the orchestration ends (#1395), and the route stand-in leaves at
-            // once in a role.
-            "[[orchestrations]]\nname = 'card-team'\n[[orchestrations.roles]]\nname = 'orchestrator'\nstart = true\ncommand = 'cat'\n",
-        )
-        .unwrap();
+        std::fs::write(deck.workdir().join(".dot-agent-deck.toml"), project).unwrap();
         deck.approve_project_trust(deck.workdir());
         common::commit_fixture_repo(deck.workdir());
         Self {
@@ -1647,4 +1652,225 @@ fn state_002_a_changed_catalog_applies_to_published_cards() {
     let out = act_with(&daemon, &k, "merge", &merge, &instance, &[]);
     assert_refused(&out, "unknown_action");
     assert_eq!(inbox_of(&daemon, &pane.id).len(), before);
+}
+
+/// The team `agent-report/tree/*` dispatch: an orchestrator and a worker,
+/// each a `cat` that keeps its capability in its folder, so the test can
+/// report their status as their agents' hooks would.
+fn tree_team() -> String {
+    let seat = serde_json::to_string(&common::capability_export_command("exec cat")).unwrap();
+    format!(
+        "[[orchestrations]]\nname = 'tree-team'\n[[orchestrations.roles]]\nname = 'orchestrator'\nstart = true\ncommand = {seat}\n[[orchestrations.roles]]\nname = 'worker'\ndescription = 'Does the work'\ncommand = {seat}\n"
+    )
+}
+
+/// A deck holding the tree `agent-report/tree/*` read: a dispatcher that
+/// dispatched a single unit and a two-role team, and a standalone agent
+/// started after them. The panes come first so they are stopped before the
+/// deck goes.
+struct TreeDeck {
+    dispatcher: Pane,
+    unit: Pane,
+    orchestrator: Pane,
+    worker: Pane,
+    standalone: Pane,
+    test: UnitDeck,
+}
+
+/// The orchestration seat in `worktree` (the orchestrator when
+/// `orchestrator`, else the worker), as a pane the test can report from.
+fn seat(test: &UnitDeck, worktree: &Path, orchestrator: bool) -> Pane {
+    use dot_agent_deck::agent_pty::TabMembership;
+    let found = RefCell::new(None);
+    assert!(
+        common::wait_until(common::load_scaled(WAIT), || {
+            *found.borrow_mut() = common::agent_records_on(test.deck.attach_socket_path())
+                .into_iter()
+                .find(|r| {
+                    r.cwd.as_deref().is_some_and(|c| Path::new(c) == worktree)
+                        && matches!(
+                            &r.tab_membership,
+                            Some(TabMembership::Orchestration { is_start_role, .. })
+                                if *is_start_role == orchestrator
+                        )
+                });
+            found.borrow().is_some()
+        }),
+        "the team's {} must be listed\n{}",
+        if orchestrator {
+            "orchestrator"
+        } else {
+            "worker"
+        },
+        test.deck.snapshot_grid()
+    );
+    let record = found.into_inner().unwrap();
+    let token = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(common::recorded_hook_capability(worktree, &record.id))
+        .expect("the seat's capability");
+    Pane {
+        id: record.pane_id_env.clone().expect("pane identity"),
+        agent: record.id.clone(),
+        token,
+        pid: 0,
+        capture: worktree.join(format!(".seat-{}.bytes", record.id)),
+        attach_socket: test.deck.attach_socket_path().to_path_buf(),
+    }
+}
+
+fn tree_deck() -> TreeDeck {
+    let mut test = UnitDeck::with_project("", &tree_team());
+    let dispatcher = test.dispatcher();
+    let unit = test.dispatch(&dispatcher, "card-tree-single", "--single");
+    test.dispatch_spawned(&dispatcher, "card-tree-team", "--orchestration=tree-team");
+    let team = test.worktree("card-tree-team");
+    let orchestrator = seat(&test, &team, true);
+    let worker = seat(&test, &team, false);
+    let standalone = route::start(&test.deck, "card-tree-standalone", json!({}));
+    TreeDeck {
+        dispatcher,
+        unit,
+        orchestrator,
+        worker,
+        standalone,
+        test,
+    }
+}
+
+/// Each entry of `doc` as (key, parent, kind), in list order.
+fn tree_shape(doc: &Value) -> Vec<(String, Option<String>, Option<String>)> {
+    doc["entries"]
+        .as_array()
+        .expect("card list has entries")
+        .iter()
+        .map(|e| {
+            (
+                e["key"].as_str().unwrap().to_string(),
+                e["parent"].as_str().map(str::to_string),
+                e["kind"].as_str().map(str::to_string),
+            )
+        })
+        .collect()
+}
+
+/// Scenario: A dispatcher stand-in dispatches a single unit and a two-role
+/// team (orchestrator and worker), and a standalone stand-in is started after
+/// them. `card list` shows exactly two roots, the dispatcher and the
+/// standalone agent, in that order; the unit and the orchestrator hang under
+/// the dispatcher and the worker under the orchestrator, each card says what
+/// it is, and the dispatcher's and orchestrator's cards count what is under
+/// them.
+#[spec("agent-report/tree/001")]
+#[test]
+fn tree_001_cards_hang_under_the_agent_that_started_them() {
+    let t = tree_deck();
+    let d = key(&t.dispatcher);
+    let o = key(&t.orchestrator);
+    let some = |s: &str| Some(s.to_string());
+    let expected = vec![
+        (d.clone(), None, some("dispatcher")),
+        (key(&t.unit), Some(d.clone()), some("agent")),
+        (o.clone(), Some(d.clone()), some("orchestrator")),
+        (key(&t.worker), Some(o.clone()), some("role")),
+        (key(&t.standalone), None, some("agent")),
+    ];
+    let last = RefCell::new(Value::Null);
+    let settled = common::wait_until(common::load_scaled(WAIT), || {
+        let doc = list(&t.test.deck);
+        let done = tree_shape(&doc) == expected;
+        *last.borrow_mut() = doc;
+        done
+    });
+    let doc = last.into_inner();
+    assert!(
+        settled,
+        "the tree must be: dispatcher → (unit, orchestrator → worker), then \
+         the standalone agent\nwant {expected:#?}\ngot {:#?}\n{doc:#}",
+        tree_shape(&doc)
+    );
+
+    let entry = |k: &str| entry_in(&doc, k).unwrap();
+    assert_eq!(entry(&d)["rollup"]["total"], 3, "{doc:#}");
+    assert_eq!(entry(&o)["rollup"]["total"], 1, "{doc:#}");
+    for leaf in [key(&t.unit), key(&t.worker), key(&t.standalone)] {
+        assert!(
+            entry(&leaf).get("rollup").is_none(),
+            "a card with nothing under it has no roll-up: {doc:#}"
+        );
+    }
+    // The tree does not replace the groups: the unit and the orchestrator
+    // still name their dispatcher.
+    assert_eq!(
+        entry(&key(&t.unit))["relations"]["dispatcher"]["key"],
+        d.as_str()
+    );
+    assert_eq!(entry(&o)["relations"]["dispatcher"]["key"], d.as_str());
+}
+
+/// Scenario: In the tree of `agent-report/tree/001`, the unit reports idle
+/// and the orchestrator and worker thinking, and the dispatcher's card
+/// rolls up three cards, worst thinking, none needing the user. The worker
+/// — the dispatcher's grandchild — then reports it is blocked: the
+/// dispatcher's and orchestrator's roll-ups turn worst blocked, count it, and
+/// say one card under them needs the user, while their own statuses and the
+/// order of the cards do not change.
+#[spec("agent-report/tree/002")]
+#[test]
+fn tree_002_a_grandchilds_status_rolls_up_to_the_root() {
+    let t = tree_deck();
+    let deck = &t.test.deck;
+    for (pane, event) in [
+        (&t.unit, "idle"),
+        (&t.orchestrator, "thinking"),
+        (&t.worker, "thinking"),
+    ] {
+        inbox::status(deck, pane, "session_start", "codex");
+        inbox::status(deck, pane, event, "codex");
+    }
+    let d = key(&t.dispatcher);
+    let o = key(&t.orchestrator);
+    let before = wait_entry(deck, &d, "rolled up over thinking agents", |e| {
+        e["rollup"]
+            == json!({"total": 3, "worst": "thinking",
+                "counts": {"idle": 1, "thinking": 2}, "needs_you": 0})
+    });
+    assert_eq!(before["status"], "thinking", "{before:#}");
+    let order = tree_shape(&list(deck));
+
+    inbox::status(deck, &t.worker, "quota_blocked", "codex");
+    let root = wait_entry(deck, &d, "rolled up over the blocked grandchild", |e| {
+        e["rollup"]
+            == json!({"total": 3, "worst": "blocked",
+                "counts": {"blocked": 1, "idle": 1, "thinking": 1}, "needs_you": 1})
+    });
+    assert_eq!(
+        root["status"], "thinking",
+        "the roll-up is not the card's own status"
+    );
+    assert_eq!(
+        root["needs_you"], false,
+        "the card itself still needs nothing: {root:#}"
+    );
+
+    let doc = list(deck);
+    let orchestrator = entry_in(&doc, &o).unwrap();
+    assert_eq!(
+        orchestrator["rollup"],
+        json!({"total": 1, "worst": "blocked", "counts": {"blocked": 1}, "needs_you": 1}),
+        "{orchestrator:#}"
+    );
+    assert_eq!(orchestrator["status"], "thinking");
+    let worker = entry_in(&doc, &key(&t.worker)).unwrap();
+    assert_eq!(worker["status"], "blocked", "{worker:#}");
+    assert_eq!(
+        worker["needs_you_reasons"],
+        json!(["blocked"]),
+        "{worker:#}"
+    );
+    assert_eq!(
+        tree_shape(&doc),
+        order,
+        "a card that needs the user moves no card in the list"
+    );
 }

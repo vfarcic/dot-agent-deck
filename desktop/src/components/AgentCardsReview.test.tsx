@@ -118,11 +118,17 @@ describe("agent cards: what is sent is what was shown (PRD #2374 review round 1)
     expect(first.invokeCardAction).toHaveBeenCalledWith(expect.anything(), "go", expect.objectContaining({ actionToken: "tok-go-2" }));
   });
 
-  it("a button sends the version of the action it showed (B2)", async () => {
+  /* Issue #2418 audit A4: the card's primary shows an agent's prompt on a line
+     it cuts off, so the press goes through the review step, which sends the
+     version it showed. */
+  it("a button sends the version of the action it showed, from the review step (B2, A4)", async () => {
     const live = runtime([hostile("Run the tests.", "tok-shown")]);
     render(<AgentOverview runtime={live} onNavigate={vi.fn()} />);
     fireEvent.click(screen.getByTestId("overview-mode-cards"));
     await act(async () => { fireEvent.click(screen.getByTestId("agent-card-primary")); });
+    expect(live.invokeCardAction).not.toHaveBeenCalled();
+    expect(screen.getByTestId("agent-card-confirm-prompt").textContent).toBe("Run the tests.");
+    await act(async () => { fireEvent.click(screen.getByTestId("agent-card-confirm-send")); });
     expect(live.invokeCardAction).toHaveBeenCalledWith(expect.anything(), "go", expect.objectContaining({ actionToken: "tok-shown" }));
   });
 
@@ -174,12 +180,13 @@ describe("agent cards: what is sent is what was shown (PRD #2374 review round 1)
     const view = render(<AgentOverview runtime={first} onNavigate={vi.fn()} />);
     fireEvent.click(screen.getByTestId("overview-mode-cards"));
     await act(async () => { fireEvent.click(screen.getByTestId("agent-card-primary")); });
+    await act(async () => { fireEvent.click(screen.getByTestId("agent-card-confirm-send")); });
     expect(screen.getByTestId("agent-card-result").textContent).toContain("m-1");
     view.rerender(<AgentOverview runtime={runtime([hostile("Something else.", "tok-go-2")], first.invokeCardAction as never)} onNavigate={vi.fn()} />);
     expect(screen.queryByTestId("agent-card-result")).toBeNull();
   });
 
-  it("a card without a summary still labels its fields and its custom primary action as the agent's (S2)", () => {
+  it("a card without a summary still labels its custom primary action as the agent's, and its overlay labels its fields (S2)", () => {
     const card = entry("7", "coder", {
       report: { source: "agent", status: "working", summary: null, published_at: "2026-11-17T00:00:00Z", revision: 1 },
       fields: [{ name: "risk", label: "Risk", description: null, type: "text", icon: null, placement: "card", custom: true, source: "agent", value: "low" }],
@@ -188,8 +195,15 @@ describe("agent cards: what is sent is what was shown (PRD #2374 review round 1)
     });
     render(<AgentOverview runtime={runtime([card])} onNavigate={vi.fn()} />);
     fireEvent.click(screen.getByTestId("overview-mode-cards"));
-    expect(screen.getByTestId("agent-card-fields-source").textContent).toContain("agent says");
     expect(screen.getByTestId("agent-card-primary-source").textContent).toContain("agent says");
+    // Issue #2418: the fields are the overlay's, under the agent's label.
+    expect(screen.queryByText("low")).toBeNull();
+    fireEvent.click(screen.getByTestId("agent-card-show"));
+    const overlay = screen.getByTestId("agent-card-overlay");
+    // The field's own section carries the agent's label, whatever the primary action's attribution says.
+    const fields = within(overlay).getByRole("region", { name: "Fields" });
+    expect(within(fields).getByText("low")).toBeInTheDocument();
+    expect(within(fields).getByText("agent says")).toBeInTheDocument();
   });
 
   it("the overlay lists what was sent from the card, with the exact text, after the report stopped offering it (decision (a))", () => {

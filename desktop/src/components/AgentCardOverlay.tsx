@@ -1,28 +1,31 @@
-import { useEffect, useState, type KeyboardEvent } from "react";
+import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { BellRing, ChevronLeft, ChevronRight, X } from "lucide-react";
 
 import { OVERLAY_LAYER, useInertBackground } from "../hooks/useInertBackground";
-import { actionLabel, cardStatusLabel, deliverySentence, formatClockTime, resultSentence, type CardOverlayStep, type CardResults, disabledReasonSentence, fieldValueText, linkOf, multilineText, needsYouSentence, reportStatusLabel, type PlacedCard } from "../lib/agentCards";
+import { actionLabel, cardStatusClass, cardStatusLabel, deliverySentence, formatClockTime, resultSentence, type CardOverlayStep, type CardResults, disabledReasonSentence, fieldValueText, linkOf, multilineText, needsYouSentence, reportStatusLabel, type PlacedCard } from "../lib/agentCards";
 import { DISPLAY_LIMITS, displayIdentity, displayText, displayTitle, domIdentity } from "../lib/displayText";
+import { referenceDetail, referenceView } from "../lib/agentCardsTree";
 import { VOICE_ACTIONS, type VoiceActionContext } from "../lib/voiceActions";
-import type { AgentCardAction } from "../types";
-import { cardRef, ExactText, ExactTextNote, SourceBadge } from "./AgentCard";
+import type { AgentCardAction, AgentCardCheckedRef } from "../types";
+import { CardReference, cardRef, ExactText, ExactTextNote, SourceBadge, type ReferenceControls } from "./AgentCard";
 
 /** The members the overlay's controls dispatch through. */
-export type CardOverlayControls = Pick<VoiceActionContext, "showAgentCard" | "stepAgentCard" | "closeAgentCard" | "runCardAction" | "replyToAgentCard" | "confirmCardAction">;
+export type CardOverlayControls = Pick<VoiceActionContext, "showAgentCard" | "stepAgentCard" | "closeAgentCard" | "runCardAction" | "replyToAgentCard" | "confirmCardAction" | "openCardReference"> & Partial<Pick<VoiceActionContext, "reportRefused">>;
 
 /**
  * PRD #2374 — the one card overlay, opened from a card or a table row's Show
  * card. It shows everything on the entry: the deck-checked status and facts,
- * what the agent reported (labelled as the agent's), its questions, and every
- * action with the exact text it sends, its state and its last delivery.
+ * what the agent reported (labelled as the agent's), every pull request and
+ * issue it reported as the deck checked them (issue #2418 review: a card's
+ * `+N` opens the overlay there), its questions, and every action with the
+ * exact text it sends, its state and its last delivery.
  * Content-sized; full screen at narrow widths (CSS). `[`, `]` and `n` move
  * between cards in the dashboard's order without closing it; `Escape` closes.
  *
  * `card` is `undefined` once the agent it showed is gone: the overlay says so
  * and keeps its navigation, so the next card is one key away.
  */
-export function AgentCardOverlay({ card, lastName, position, count, step, results, controls }: {
+export function AgentCardOverlay({ card, lastName, position, count, step, results, tree, notice, controls }: {
   card: PlacedCard | undefined;
   /** The name of the card that was open, for the closed notice. */
   lastName: string;
@@ -31,6 +34,10 @@ export function AgentCardOverlay({ card, lastName, position, count, step, result
   count: number;
   step: CardOverlayStep | undefined;
   results: CardResults;
+  /** Whether the card's daemon builds the tree, so its checked references are its own. */
+  tree: boolean;
+  /** Why the last thing pressed did not happen (issue #2418 review, F2): said here, since the overlay covers the dashboard's banner. */
+  notice?: string;
   controls: CardOverlayControls;
 }) {
   const ref = useInertBackground<HTMLElement>(true, OVERLAY_LAYER.dialog, () => { controls.closeAgentCard(); });
@@ -40,6 +47,17 @@ export function AgentCardOverlay({ card, lastName, position, count, step, result
   /* A spoken reply opens this step with its words in the box, to be read,
      edited and sent by hand. */
   useEffect(() => { if (step?.kind === "reply" && step.text !== undefined) setReply(step.text); }, [step]);
+  /* Opened from a card's `+N`: the references are scrolled into view and take
+     the focus, so the keyboard is on them. */
+  const refsSection = useRef<HTMLElement>(null);
+  const atReferences = step?.kind === "references";
+  useEffect(() => {
+    if (!atReferences) return;
+    const section = refsSection.current;
+    if (!section) return;
+    section.scrollIntoView?.({ block: "start" });
+    section.focus({ preventScroll: true });
+  }, [atReferences, cardKey]);
   const onKeyDown = (event: KeyboardEvent<HTMLElement>) => {
     const target = event.target;
     if (target instanceof Element && target.matches("input, textarea, select, [contenteditable='true']")) {
@@ -61,6 +79,7 @@ export function AgentCardOverlay({ card, lastName, position, count, step, result
   const replyAction = entry?.actions.find((action) => action.id === "reply");
   const optionIds = new Set(entry?.questions.flatMap((question) => question.options.map((option) => option.action_id)) ?? []);
   const actions = entry?.actions.filter((action) => !optionIds.has(action.id)) ?? [];
+  const checkedRefs = tree ? entry?.checked_refs ?? [] : [];
   const pullRequest = entry?.facts.pull_request as { number?: number; title?: string; state?: string; url?: string } | null | undefined;
   return (
     <div className="dialog-backdrop agent-card-backdrop" role="presentation" onMouseDown={() => VOICE_ACTIONS.closeAgentCard.run(controls)}>
@@ -79,7 +98,7 @@ export function AgentCardOverlay({ card, lastName, position, count, step, result
         <header className="agent-card-overlay-header">
           <div className="agent-card-overlay-identity">
             <h2 id="agent-card-overlay-title">{name}</h2>
-            {entry && <span className={`status-label card-status status-${domIdentity(entry.status)}`}>{cardStatusLabel(entry.status)}</span>}
+            {entry && <span className={`status-label card-status ${cardStatusClass(entry.status)}`}>{cardStatusLabel(entry.status)}</span>}
             {entry && <SourceBadge source="deck" />}
             {entry?.needs_you && <span className="agent-card-needs-you" data-testid="agent-card-overlay-needs-you"><BellRing size={11} aria-hidden="true" />{needsYouSentence(entry)}</span>}
           </div>
@@ -91,6 +110,8 @@ export function AgentCardOverlay({ card, lastName, position, count, step, result
             <button type="button" className="icon-button" aria-label="Close card" title="Close card (Escape)" data-testid="agent-card-close" onClick={() => VOICE_ACTIONS.closeAgentCard.run(controls)}><X size={15} /></button>
           </nav>
         </header>
+
+        {notice && <p className="agent-card-overlay-notice" role="status" data-testid="agent-card-overlay-notice">{displayText(notice, DISPLAY_LIMITS.message)}</p>}
 
         {!entry && <p className="agent-card-gone" role="status" data-testid="agent-card-gone">This agent was closed.</p>}
 
@@ -126,6 +147,15 @@ export function AgentCardOverlay({ card, lastName, position, count, step, result
                 </section>
               )
               : <p className="agent-card-summary is-empty">No report from this agent yet.</p>}
+
+            {checkedRefs.length > 0 && (
+              <section ref={refsSection} tabIndex={-1} className="agent-card-section agent-card-overlay-refs" aria-label="Pull requests and issues" data-testid="agent-card-overlay-refs">
+                <h3>Pull requests and issues <SourceBadge source="deck" /></h3>
+                <ul className="agent-card-overlay-ref-list">
+                  {checkedRefs.map((reference, index) => <OverlayReference key={`${reference.field}\u0000${index}`} card={card} reference={reference} controls={controls} />)}
+                </ul>
+              </section>
+            )}
 
             {entry.fields.length > 0 && (
               <section className="agent-card-section" aria-label="Fields">
@@ -246,5 +276,27 @@ function ActionDetails({ action, result }: { action: AgentCardAction; result: Ca
       {result && <p className="agent-card-result" role="status" data-testid="agent-card-action-result">{displayText(resultSentence(result), DISPLAY_LIMITS.detail)}</p>}
       {action.last_delivery && <p className="agent-card-delivery" data-testid="agent-card-action-delivery">{displayText(deliverySentence(action.last_delivery), DISPLAY_LIMITS.message)}</p>}
     </>
+  );
+}
+
+/**
+ * Issue #2418 review (D-R1) — one reported reference in the overlay's list:
+ * its badge, which opens its page as the card's does, what the deck's check
+ * found and how fresh it is (or that it is still to be checked, or why it
+ * cannot be), and what the agent wrote, labelled as the agent's.
+ */
+function OverlayReference({ card, reference, controls }: { card: PlacedCard; reference: AgentCardCheckedRef; controls: ReferenceControls }) {
+  const view = referenceView(reference);
+  const detail = referenceDetail(reference);
+  return (
+    <li className={`agent-card-overlay-ref is-${view.status}`} data-testid="agent-card-overlay-ref" data-field={reference.field} data-kind={reference.kind} data-ref-status={view.status}>
+      <div className="agent-card-overlay-ref-head">
+        <CardReference card={card} reference={reference} controls={controls} scope="overlay" />
+        {detail.checked && <span className="agent-card-overlay-ref-checked" data-testid="agent-card-overlay-ref-checked">{displayText(detail.checked, DISPLAY_LIMITS.detail)}</span>}
+      </div>
+      {detail.title && <p className="agent-card-overlay-ref-title">{displayText(detail.title, DISPLAY_LIMITS.message)}</p>}
+      <p className={`agent-card-overlay-ref-note${view.status === "stale" ? " is-stale" : ""}`} data-testid="agent-card-overlay-ref-note">{displayText(detail.note, DISPLAY_LIMITS.message)}</p>
+      <p className="agent-card-overlay-ref-claim" data-testid="agent-card-overlay-ref-claim"><SourceBadge source="agent" /> {reference.kind === "issue" ? "Issue" : "Pull request"} as reported: {displayText(detail.claim, DISPLAY_LIMITS.detail)}</p>
+    </li>
   );
 }
