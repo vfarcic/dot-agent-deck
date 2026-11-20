@@ -349,6 +349,21 @@ enum Commands {
         #[command(subcommand)]
         action: InboxAction,
     },
+    /// Interrupted work: the dispatched units, orchestrations and agents a
+    /// daemon restart stopped, and reports left for a caller that is gone.
+    /// List them, show one with its kept reports, reclaim a unit's worktree
+    /// (remove the worktree, keep the branch) or dismiss items from the list.
+    ///
+    /// Reclaim and dismiss are for a person: run from an agent's pane, they
+    /// are refused.
+    ///
+    /// Exit status: 0 done; 1 refused, kept, not listed or failed; 2 the
+    /// running daemon does not support interrupted work; 3 no deck daemon is
+    /// running.
+    Interrupted {
+        #[command(subcommand)]
+        cmd: InterruptedCmd,
+    },
     /// Your agent card in the deck's overview: publish it, list every card,
     /// print the catalog of fields and actions, or act on a card.
     ///
@@ -891,6 +906,57 @@ enum WorktreeCmd {
         /// (the `ask` verdict), in addition to the ones it did. Has no effect
         /// on worktrees the gate already keeps for another reason.
         #[arg(long)]
+        yes: bool,
+    },
+}
+
+/// PRD #1790 stage 2: `dot-agent-deck interrupted …`. See
+/// [`dot_agent_deck::interrupted_cli`].
+#[derive(Subcommand)]
+enum InterruptedCmd {
+    /// List the interrupted work, newest first, with each item's id.
+    List {
+        /// Print the daemon's list as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Leave out each item's Git and pull request facts, so no `git` or
+        /// `gh` runs.
+        #[arg(long = "no-git")]
+        no_git: bool,
+    },
+    /// Show one item, and the text of the reports kept for it.
+    Show {
+        /// The item's id, or its unique name, branch or id suffix.
+        id: String,
+        /// Show the text of this one of the item's kept reports, by its id.
+        #[arg(long = "report", value_name = "REPORT_ID")]
+        report: Option<String>,
+        /// List the item's kept reports from this one on (counted from 0),
+        /// a page at a time, with their text. Each page says where the next
+        /// one starts.
+        #[arg(long = "reports-from", value_name = "N")]
+        reports_from: Option<usize>,
+    },
+    /// Reclaim an item: remove its worktree, keep its branch. A worktree with
+    /// uncommitted changes, or with other worktrees inside it, is kept.
+    Reclaim {
+        /// The item's id, or its unique name, branch or id suffix.
+        id: String,
+        /// Say what reclaiming would do, and change nothing.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+    },
+    /// Dismiss items: stop listing them. Their worktrees, branches and kept
+    /// reports are left as they are.
+    Dismiss {
+        /// The items' ids, or their unique names, branches or id suffixes.
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        ids: Vec<String>,
+        /// Dismiss every listed item. Asks first unless --yes.
+        #[arg(long)]
+        all: bool,
+        /// With --all: dismiss without asking.
+        #[arg(long, requires = "all")]
         yes: bool,
     },
 }
@@ -2260,6 +2326,7 @@ fn main() -> ExitCode {
             run_work_done(pane_id, task, done, task_id)
         }
         Some(Commands::Card { action }) => run_card_cli(action),
+        Some(Commands::Interrupted { cmd }) => run_interrupted_cli(cmd),
         Some(Commands::Inbox { action }) => match action {
             InboxAction::Fetch {
                 doorbell: Some(id),
@@ -4310,6 +4377,49 @@ fn print_cli_output(output: dot_agent_deck::roles_cli::CliOutput) -> ExitCode {
     print!("{}", output.stdout);
     eprint!("{}", output.stderr);
     ExitCode::from(output.code)
+}
+
+/// `dot-agent-deck interrupted …` — PRD #1790 stage 2. Connect-only, like
+/// `close`: a daemon it just started would know of nothing interrupted. The
+/// request building and rendering live in [`dot_agent_deck::interrupted_cli`].
+#[tokio::main]
+async fn run_interrupted_cli(cmd: InterruptedCmd) -> ExitCode {
+    use dot_agent_deck::interrupted_cli as cli;
+    use std::io::{BufRead, IsTerminal, Write};
+    let client = DaemonClient::new(client_attach_socket_path());
+    let identity = || dot_agent_deck::close_cli::ambient_identity();
+    let output = match cmd {
+        InterruptedCmd::List { json, no_git } => cli::run_list(&client, json, !no_git).await,
+        InterruptedCmd::Show {
+            id,
+            report,
+            reports_from,
+        } => cli::run_show(&client, &id, report.as_deref(), reports_from).await,
+        InterruptedCmd::Reclaim { id, dry_run } => match identity() {
+            Ok(identity) => cli::run_reclaim(&client, &id, dry_run, &identity).await,
+            Err(message) => cli::identity_error_output(message),
+        },
+        InterruptedCmd::Dismiss { ids, all, yes } => match identity() {
+            Ok(identity) => {
+                let args = cli::DismissArgs { ids, all, yes };
+                let mut ask = |question: &str| {
+                    eprint!("{question}");
+                    let _ = std::io::stderr().flush();
+                    let mut answer = String::new();
+                    std::io::stdin().lock().read_line(&mut answer).is_ok()
+                        && matches!(answer.trim(), "y" | "Y" | "yes" | "Yes" | "YES")
+                };
+                let confirm = if std::io::stdin().is_terminal() {
+                    cli::Confirm::Ask(&mut ask)
+                } else {
+                    cli::Confirm::NoTerminal
+                };
+                cli::run_dismiss(&client, &args, &identity, confirm).await
+            }
+            Err(message) => cli::identity_error_output(message),
+        },
+    };
+    print_cli_output(output)
 }
 
 /// `dot-agent-deck card …` — PRD #2374. See [`dot_agent_deck::agent_cards_cli`].

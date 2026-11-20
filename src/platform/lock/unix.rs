@@ -57,3 +57,32 @@ pub async fn acquire_spawn_lock(path: &Path) -> std::io::Result<SpawnLock> {
     .await
     .map_err(std::io::Error::other)?
 }
+
+/// Try once to take the exclusive `flock(2)` on `path` (opened or created as
+/// [`acquire_spawn_lock`] opens it), without waiting: `Ok(None)` when another
+/// open file description holds it. Neither the open (`O_NONBLOCK`, which
+/// changes nothing for a regular file) nor the lock (`LOCK_NB`) waits for a
+/// holder, so a caller that gives up leaves nothing behind
+/// ([`super::acquire_spawn_lock_within`]).
+pub fn try_acquire_spawn_lock(path: &Path) -> std::io::Result<Option<SpawnLock>> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    // SAFETY: as in `acquire_spawn_lock`; `LOCK_NB` makes it return at once.
+    let res = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if res != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            return Ok(None);
+        }
+        return Err(error);
+    }
+    Ok(Some(SpawnLock { file }))
+}

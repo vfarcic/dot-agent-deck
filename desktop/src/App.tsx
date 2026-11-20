@@ -84,9 +84,10 @@ import { NO_NUMBERED_LIST, sameNumberedSections, type VoiceNumberedEntryDto, typ
 import { offPageSentence, offPageTarget, pageMarker, pageSlice, pageTurnRefusal, type VoiceOffPageItem, type VoicePager } from "./lib/voicePages";
 import { agentKey, boundAgentKey, sameIncarnation } from "./lib/agentKey";
 import { dashboardFilterFromParams } from "./lib/dashboardFilter";
-import { VOICE_ACTIONS, dispatchVoiceAction, saysCommand, type DashboardScroll, type DeckOverlay, type NewAgentVoice, type VoiceContextChannel, type VoiceDispatchContext, type VoiceDispatchTarget, type VoiceOverviewContext, type VoicePanelContext, type VoiceScreenContext, type PullRequestContext } from "./lib/voiceActions";
+import { VOICE_ACTIONS, dispatchVoiceAction, saysCommand, type DashboardScroll, type DeckOverlay, type NewAgentVoice, type VoiceContextChannel, type VoiceDispatchContext, type VoiceDispatchTarget, type VoiceOverviewContext, type VoicePanelContext, type VoiceScreenContext, type PullRequestContext, type VoiceActionContext } from "./lib/voiceActions";
 import { terminalInputState, unreachableDeckTerminalState } from "./lib/terminalInput";
 import { useRestartNotice } from "./hooks/useRestartNotice";
+import { INTERRUPTED_UNREAD, interruptedFooter, listedCount, mayHaveInterrupted } from "./lib/interruptedWork";
 import { bindViewIncarnation, viewAgent, viewAgentReplaced, viewBound } from "./lib/viewIdentity";
 import { applyAppearance } from "./lib/appearance";
 import { desktopOrchestrationPlatformIssue } from "./lib/platform";
@@ -624,6 +625,30 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    * set, which detaches that terminal's own connection only.
    */
   const restart = useRestartNotice(runtime.fleet);
+  /*
+    PRD #1790 stage 2 — the restart notice's hint line, as the TUI's restart
+    notice adds one: while it is up and a daemon lists interrupted work, the
+    footer's words and a Show that opens the dashboard and, when one daemon
+    lists it, that daemon's "Interrupted work" dialog. Without such items the
+    notice is unchanged.
+  */
+  const interruptedWork = runtime.interruptedWork;
+  /* PR #2431 review — every daemon the dashboard draws a banner for, an empty list it could not read whole included. */
+  const interruptedListing = interruptedWork ? Object.entries(interruptedWork.decks).filter(([, deck]) => mayHaveInterrupted(deck.list)) : [];
+  const interruptedTotal = interruptedListing.reduce((sum, [, deck]) => sum + listedCount(deck.list), 0);
+  const restartInterrupted: RestartInterrupted | undefined = restart.notice && interruptedWork && interruptedListing.length > 0
+    ? {
+      text: interruptedTotal > 0 ? interruptedFooter(interruptedTotal) : INTERRUPTED_UNREAD,
+      context: {
+        showInterruptedWork: (deckId?: string) => {
+          railContext.navigate({ kind: "overview" });
+          const target = deckId ?? (interruptedListing.length === 1 ? interruptedListing[0][0] : undefined);
+          if (target !== undefined) interruptedWork.openDialog(target);
+          return undefined;
+        },
+      },
+    }
+    : undefined;
   /**
    * PRD #2174 — the star reminder, shown at startup about once every ten
    * launches of either client. The shell's, not a screen's, because it comes
@@ -1466,11 +1491,11 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
           mounted together, so there is at most one toast. The cleanup
           warnings ride with it but outlive it (issue #1234).
         */}
-        <Toast message={runtime.error} onDismiss={runtime.clearError} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} restart={restart.notice} onDismissRestart={restart.dismiss} worktrees={runtime.worktreeKept} onDismissWorktree={runtime.dismissWorktreeKept} star={starNotice} onDismissStar={dismissStarNotice} trust={trustNotice} onDismissTrust={dismissTrustNotice} />
+        <Toast message={runtime.error} onDismiss={runtime.clearError} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} restart={restart.notice} onDismissRestart={restart.dismiss} restartInterrupted={restartInterrupted} worktrees={runtime.worktreeKept} onDismissWorktree={runtime.dismissWorktreeKept} star={starNotice} onDismissStar={dismissStarNotice} trust={trustNotice} onDismissTrust={dismissTrustNotice} />
       </>
     )
     // voice-registry-exempt: the deck's navigator, which it names as `navigate` in its own registry context and dispatches through `VOICE_ACTIONS`
-    : <DeckSurface runtime={runtime} settings={settings} orchestrationPlatformIssue={orchestrationPlatformIssue} onNavigate={setView} openAgent={openAgent} onCloseAgent={closeAgent} stopContext={agentStopContext} generateConfig={paneGenerateConfig} voiceChannel={deckVoiceContext} overlays={deckOverlays} onConfirmationChange={setConfirmationOpen} onPaneTabChange={setPaneTab} restartNotice={restart.notice} onDismissRestartNotice={restart.dismiss} starNotice={starNotice} onDismissStarNotice={dismissStarNotice} trustNotice={trustNotice} onDismissTrustNotice={dismissTrustNotice} />;
+    : <DeckSurface runtime={runtime} settings={settings} orchestrationPlatformIssue={orchestrationPlatformIssue} onNavigate={setView} openAgent={openAgent} onCloseAgent={closeAgent} stopContext={agentStopContext} generateConfig={paneGenerateConfig} voiceChannel={deckVoiceContext} overlays={deckOverlays} onConfirmationChange={setConfirmationOpen} onPaneTabChange={setPaneTab} restartNotice={restart.notice} onDismissRestartNotice={restart.dismiss} restartInterrupted={restartInterrupted} starNotice={starNotice} onDismissStarNotice={dismissStarNotice} trustNotice={trustNotice} onDismissTrustNotice={dismissTrustNotice} />;
   /*
     PRD #802 M6 — the voice surface is a SIBLING of the screen switch, and this
     shape is the whole of that decision.
@@ -1816,7 +1841,7 @@ function tileKey(agent: { daemonId: string; id: string; incarnation?: string }):
   return `${agent.daemonId}\u0000${agent.id}\u0000${agent.incarnation ?? ""}`;
 }
 
-export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = desktopOrchestrationPlatformIssue(), onNavigate, openAgent, onCloseAgent, stopContext, generateConfig, voiceChannel, overlays: shellOverlays, onConfirmationChange, onPaneTabChange, restartNotice, onDismissRestartNotice, starNotice, onDismissStarNotice, trustNotice, onDismissTrustNotice }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; orchestrationPlatformIssue?: string; onNavigate?: (view: DeckView) => void; openAgent?: { deckId: string; agentId: string; incarnation?: string }; onCloseAgent?: () => void; stopContext?: AgentTileProps["stopContext"]; generateConfig?: AgentTileProps["generateConfig"]; voiceChannel?: VoiceContextChannel; overlays?: ScreenOverlays; onConfirmationChange?: (open: boolean) => void; onPaneTabChange?: (tab: PanelTab) => void; restartNotice?: string; onDismissRestartNotice?: () => void; starNotice?: string; onDismissStarNotice?: () => void; trustNotice?: TrustRequestNotice; onDismissTrustNotice?: () => void }) {
+export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = desktopOrchestrationPlatformIssue(), onNavigate, openAgent, onCloseAgent, stopContext, generateConfig, voiceChannel, overlays: shellOverlays, onConfirmationChange, onPaneTabChange, restartNotice, onDismissRestartNotice, restartInterrupted, starNotice, onDismissStarNotice, trustNotice, onDismissTrustNotice }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; orchestrationPlatformIssue?: string; onNavigate?: (view: DeckView) => void; openAgent?: { deckId: string; agentId: string; incarnation?: string }; onCloseAgent?: () => void; stopContext?: AgentTileProps["stopContext"]; generateConfig?: AgentTileProps["generateConfig"]; voiceChannel?: VoiceContextChannel; overlays?: ScreenOverlays; onConfirmationChange?: (open: boolean) => void; onPaneTabChange?: (tab: PanelTab) => void; restartNotice?: string; onDismissRestartNotice?: () => void; restartInterrupted?: RestartInterrupted; starNotice?: string; onDismissStarNotice?: () => void; trustNotice?: TrustRequestNotice; onDismissTrustNotice?: () => void }) {
   const { mode, setShownTerminals } = runtime;
   const keyboardInput = useKeyboardInput(runtime.sendTerminalInput);
   // #1083: this screen cannot merge across decks, so under All Decks it shows
@@ -2938,7 +2963,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
           mounts its own copy of this over `runtime.error` alone (audit W2) —
           it has no notice of its own, and it is not mounted at the same time
           as this one. */}
-      <Toast message={notice || runtime.error} detail={notice ? noticeState?.detail : undefined} onDismiss={dismissToast} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} restart={restartNotice} onDismissRestart={onDismissRestartNotice} worktrees={runtime.worktreeKept} onDismissWorktree={runtime.dismissWorktreeKept} star={starNotice} onDismissStar={onDismissStarNotice} trust={trustNotice} onDismissTrust={onDismissTrustNotice} />
+      <Toast message={notice || runtime.error} detail={notice ? noticeState?.detail : undefined} onDismiss={dismissToast} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} restart={restartNotice} onDismissRestart={onDismissRestartNotice} restartInterrupted={restartInterrupted} worktrees={runtime.worktreeKept} onDismissWorktree={runtime.dismissWorktreeKept} star={starNotice} onDismissStar={onDismissStarNotice} trust={trustNotice} onDismissTrust={onDismissTrustNotice} />
     </div>
   );
 }
@@ -2964,7 +2989,10 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
  * while a warning that roles may still be running ends only when the user
  * dismisses THAT warning.
  */
-function Toast({ message, detail, onDismiss, warnings, onDismissWarning, restart, onDismissRestart, worktrees, onDismissWorktree, star, onDismissStar, trust, onDismissTrust }: { message?: string; detail?: string; onDismiss: () => void; warnings?: readonly CleanupWarningEntry[]; onDismissWarning?: (id: number) => void; restart?: string; onDismissRestart?: () => void; worktrees?: readonly WorktreeKeptEntry[]; onDismissWorktree?: (id: number) => void; star?: string; onDismissStar?: () => void; trust?: TrustRequestNotice; onDismissTrust?: () => void }) {
+/** PRD #1790 stage 2 — the restart notice's interrupted work line: its words, and what its Show opens. */
+interface RestartInterrupted { text: string; context: Pick<VoiceActionContext, "showInterruptedWork"> }
+
+function Toast({ message, detail, onDismiss, warnings, onDismissWarning, restart, onDismissRestart, restartInterrupted, worktrees, onDismissWorktree, star, onDismissStar, trust, onDismissTrust }: { message?: string; detail?: string; onDismiss: () => void; warnings?: readonly CleanupWarningEntry[]; onDismissWarning?: (id: number) => void; restart?: string; onDismissRestart?: () => void; restartInterrupted?: RestartInterrupted; worktrees?: readonly WorktreeKeptEntry[]; onDismissWorktree?: (id: number) => void; star?: string; onDismissStar?: () => void; trust?: TrustRequestNotice; onDismissTrust?: () => void }) {
   /* The newest entries are at the bottom, so an overflowing stack is kept
      scrolled there whenever something is added or the message changes. */
   const stack = useRef<HTMLDivElement>(null);
@@ -3001,6 +3029,13 @@ function Toast({ message, detail, onDismiss, warnings, onDismissWarning, restart
                 scrolls when the list is long. `useRestartNotice` clamps each
                 name it takes. */}
             <span>{sanitizeText(restart)}</span>
+            {/* PRD #1790 stage 2: the TUI's hint line, when a daemon lists interrupted work. */}
+            {restartInterrupted && (
+              <span className="toast-hint" data-testid="restart-toast-interrupted">
+                {restartInterrupted.text}{" "}
+                <button type="button" className="button secondary compact" data-testid="restart-toast-interrupted-show" onClick={() => VOICE_ACTIONS.showInterruptedWork.run(restartInterrupted.context, {})}>Show</button>
+              </span>
+            )}
           </div>
           <button aria-label="Dismiss restart notice" onClick={onDismissRestart}><X size={14} /></button>
         </div>

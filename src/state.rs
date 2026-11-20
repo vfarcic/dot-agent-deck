@@ -3380,6 +3380,25 @@ pub(crate) fn frame_untrusted_report_for_file(summary: &str) -> String {
     format!("{REPORT_FRAME_OPEN}\n{body}{separator}{REPORT_FRAME_CLOSE}\n")
 }
 
+/// PRD #1790 stage 2: the report inside a file body that
+/// [`frame_untrusted_report_for_file`] framed, without its marker lines;
+/// `None` when `framed` does not open and close with them. A reader that shows
+/// a saved report frames what this answers again rather than trusting the
+/// file's own frame, since a same-user process can write a file in that
+/// format; an unframed body is framed whole. With `cut` (the text is the
+/// start of a longer file, so its closing line was not read) only the opening
+/// line is required.
+pub(crate) fn strip_report_file_frame(framed: &str, cut: bool) -> Option<&str> {
+    let opened = framed.strip_prefix(REPORT_FRAME_OPEN)?.strip_prefix('\n')?;
+    if cut {
+        return Some(opened);
+    }
+    let inner = opened
+        .strip_suffix('\n')?
+        .strip_suffix(REPORT_FRAME_CLOSE)?;
+    Some(inner.strip_suffix('\n').unwrap_or(inner))
+}
+
 /// Text another agent wrote, made safe to read as written: CRLF becomes LF,
 /// and every control character other than newline and tab, plus the
 /// bidi and invisible marks [`rewrites_how_text_reads`] names, is dropped.

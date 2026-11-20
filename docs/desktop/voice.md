@@ -282,6 +282,19 @@ To close the figures, say **"close"**, **"close it"**, **"close host"** (the nam
 
 On the dashboard, say **"show the counters"**, **"show the stats"** or ask "how many agents are running?" to open the list under the counters button at the top of the dashboard: every count, from **AGENTS** to **DAEMONS** ([Dashboard → Check what is running](dashboard.md#check-what-is-running)). To close it, say **"close"** or **"close the counters"**; if something else is open over the dashboard, "close" closes that first. Its button, `Esc` or a click elsewhere also closes it. The app does not read the counts aloud.
 
+## Interrupted work
+
+When a daemon restart left work behind, its section of the dashboard shows a banner such as `3 interrupted items from before the restart` ([Interrupted Work](../interrupted-work.md)). Say **"show interrupted work"**, **"what did the restart leave behind?"** or **"show the leftovers"** to open that daemon's **Interrupted work** dialog, as the banner's **Show** does. Without a name, the app asks each connected daemon again first and opens the dialog of the one that has interrupted work. With several daemons listing interrupted work, name the one you mean, for example "show interrupted work on build box"; if you do not, nothing opens and the app asks which one.
+
+With the dialog open:
+
+- **"reclaim"**, **"reclaim the second one"** or **"reclaim fix-login"** checks what reclaiming that item would do and reads the answer back, such as "Reclaim would remove its worktree and keep its branch." The worktree is removed only when you confirm on screen.
+- **"dismiss the first one"** or **"forget that one"** asks, in the dialog, whether to dismiss that item, naming it; it is dismissed when you confirm on screen.
+- **"dismiss all"** or **"clear the list"** asks whether to dismiss every listed item; they are dismissed when you confirm on screen.
+- **"show the details of the first one"**, **"show its reports"**, **"next reports"** and **"previous reports"** show an item and its kept reports on screen. The app does not read them aloud.
+
+Name an item by its place in the list ("the second one", "the last one") or by its name or branch. With no item named, these act on the selected row.
+
 ## Long lists are shown in pages
 
 While voice is on, a list that does not fit in the window is shown a page at a time instead of scrolling, so everything you can choose by voice is on screen. This applies to the directories and the modes in the New agent dialog and the agent tiles on the Daemons screen. The dashboard is not split into pages; it scrolls (see [Scrolling the dashboard](#scrolling-the-dashboard)). A list that fits is shown whole, as before. With voice off, every list scrolls as it always has. The daemons in the New agent dialog are never split into pages: every daemon that can take a new agent is always shown in full.

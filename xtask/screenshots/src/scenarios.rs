@@ -212,6 +212,11 @@ pub const SCENARIOS: &[Scenario] = &[
         clients: &[Client::Tui, Client::Desktop],
     },
     Scenario {
+        name: "interrupted-work",
+        description: "What a deck restart left behind: the Interrupted work list, opened with `I` in the TUI and from the dashboard banner in the desktop app, listing a dispatched unit, an orchestration and a plain agent under Other agents (PRD #1790).",
+        clients: &[Client::Tui, Client::Desktop],
+    },
+    Scenario {
         name: "project-trust",
         description: "Review project commands for the orchestration `team`, changed since it was approved: `coder` changed, `tester` new, `reviewer` removed — opened from New Agent in both clients (PRD #1885).",
         clients: &[Client::Tui, Client::Desktop],

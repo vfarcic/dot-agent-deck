@@ -405,6 +405,15 @@ slow-timeout = { period = "60s", terminate-after = 6 }
 filter = 'test(close_verb_008_real_dispatcher_closes_its_reported_single_unit)'
 slow-timeout = { period = "60s", terminate-after = 15 }
 
+# PRD #1790 stage 2: `journal/interrupted/028` waits up to 240s for a real
+# interactive Haiku unit's one Bash command, then restarts the daemon (up to
+# 30s), and drives a fresh TUI through the list and a reclaim. The default
+# 3 x 60s window kills it before the sentinel assertion can print why. Scoped
+# by the TEST FUNCTION name, so keep it in lockstep with a rename.
+[[profile.default.overrides]]
+filter = 'test(interrupted_028_a_real_agents_unit_is_listed_and_reclaimed_after_a_restart)'
+slow-timeout = { period = "60s", terminate-after = 8 }
+
 # Issue #2260: `dispatch/return/030` adds a second unit turn (the update)
 # after the real dispatch and report. Its phase waits are dispatcher ready
 # (120s), settle (90s), unit start (90s), report (210s), unit settle (60s),

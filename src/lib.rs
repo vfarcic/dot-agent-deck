@@ -140,6 +140,14 @@ pub mod init;
 pub mod injected_prompt;
 // PRD #1666 part 3 round 5-wake: a wrapper's samples of its agent's line discipline.
 pub mod input_mode;
+// PRD #1790 stage 2: the `dot-agent-deck interrupted` command group.
+pub mod interrupted_cli;
+// PRD #1790 stage 2: the interrupted work list, derived from the work journal.
+pub mod interrupted_work;
+// PRD #1790 stage 2: the daemon side of the interrupted work verbs.
+pub mod interrupted_work_daemon;
+// PRD #1790 stage 2: the bounded `git` and `gh` children of those verbs.
+pub mod interrupted_work_probe;
 pub mod issue_dispatch;
 pub mod issue_dispatch_run;
 pub mod jsonc_edit;
@@ -150,7 +158,10 @@ pub mod launch_records;
 pub mod lifetime_tag;
 pub mod lock_rank;
 pub mod logging;
+// PRD #1790 stage 2 (final review, auditor 1): Git working trees of any
+// repository lying inside a worktree a removal would delete.
 pub mod login_shell;
+pub mod nested_git_trees;
 // PRD #1223 M2: what the daemon reports about itself to a new-agent form.
 pub mod new_agent_options;
 pub mod opencode_manage;

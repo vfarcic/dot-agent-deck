@@ -1,9 +1,7 @@
 ---
 source: tests/render_help_overlay.rs
-assertion_line: 146
 expression: buf
 ---
-                                                                                                              
                                                                                                               
                                                                                                               
                                                                                                               
@@ -47,6 +45,7 @@ expression: buf
    │  o                  open pull request                                                               │    
    │  u / ctrl+u         upgrade (update badge)                                                          │    
    │  a / c              restart notice: list / dismiss                                                  │    
+   │  i / x              interrupted work: list / hide                                                   │    
    │  pageup / pagedown  scroll focused pane                                                             │    
    │  v                  copy mode (select & copy)                                                       │    
    │  ?                  toggle this help                                                                │    

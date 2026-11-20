@@ -1,9 +1,7 @@
 ---
 source: tests/render_keybindings.rs
-assertion_line: 111
 expression: text
 ---
-                                                                                                                        
                                                                                                                         
         ┌ Help ───────────────────────────────────────────────────────────────────────────────────────────────┐         
         │  Global (chords work from any pane)                 Mouse                                           │         
@@ -39,6 +37,7 @@ expression: text
         │  o                  Open pull request                                                               │         
         │  u / Ctrl+u         Upgrade (update badge)                                                          │         
         │  a / c              Restart notice: list / dismiss                                                  │         
+        │  I / X              Interrupted work: list / hide                                                   │         
         │  PageUp / PageDown  Scroll focused pane                                                             │         
         │  v                  Copy mode (select & copy)                                                       │         
         │  F1                 Toggle this help                                                                │         

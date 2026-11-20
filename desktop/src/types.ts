@@ -1887,6 +1887,12 @@ export interface DeckRuntimeState {
   consumeAgentCards?: () => void;
   /** PRD #2374 — invoke one action of one card; the daemon resolves, refuses or performs it. */
   invokeCardAction?: (target: AgentCardTarget, actionId: string, options: CardActionOptions) => Promise<CardActionResult>;
+  /**
+   * PRD #1790 stage 2 — each deck's interrupted work (what a restart of its
+   * daemon left behind), the dialog that lists it, and the calls that act on
+   * it. Absent where the bridge offers none (a render-only test runtime).
+   */
+  interruptedWork?: import("./hooks/useInterruptedWork").InterruptedWorkRuntime;
   sendTerminalInput: (target: AgentTarget, data: string, precondition?: () => boolean) => Promise<void>;
   resizeTerminal: (target: AgentTarget, cols: number, rows: number) => Promise<void>;
   /**

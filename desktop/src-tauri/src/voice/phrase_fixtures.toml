@@ -768,6 +768,31 @@ screen = "overview"
 action = "close"
 outcome = "dispatch"
 
+# PRD #1790 stage 2 — interrupted work (`show_interrupted_work`,
+# `reclaim_interrupted`, `dismiss_all_interrupted`): the banner's words, an
+# ordinal reclaim, and the dismiss-all question. Not yet measured against a
+# live backend.
+[[fixtures]]
+name = "show-interrupted-work"
+utterance = "show the interrupted work"
+screen = "overview"
+action = "show_interrupted_work"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "reclaim-interrupted-second"
+utterance = "reclaim the second one"
+screen = "overview"
+action = "reclaim_interrupted"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dismiss-all-interrupted"
+utterance = "dismiss all the interrupted items"
+screen = "overview"
+action = "dismiss_all_interrupted"
+outcome = "dispatch"
+
 [[fixtures]]
 name = "close-counters-hide-stats"
 utterance = "hide the stats"
