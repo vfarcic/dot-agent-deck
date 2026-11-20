@@ -27,8 +27,16 @@ export interface InterruptedWorkRuntime {
   /** Ask deck `deckId`'s daemon for the list again; `git` asks for each item's Git and pull request facts. */
   refresh: (deckId: string, git?: boolean) => void;
   show: (target: InterruptedTarget, id: string, reportsFrom: number) => Promise<InterruptedReply<InterruptedShow>>;
+  /**
+   * A dry run, or a real reclaim. A real one, like a dismissal, is held here
+   * rather than by the dialog (reviewer 2): it stays pending while the dialog
+   * is closed and opened again ({@link busy}), and when it answers, the list
+   * is asked for again if the deck still names the process it was sent to.
+   */
   reclaim: (target: InterruptedTarget, id: string, dryRun: boolean) => Promise<InterruptedReply<ReclaimOutcome>>;
   dismiss: (target: InterruptedTarget, ids: string[]) => Promise<InterruptedReply<DismissOutcome>>;
+  /** Whether a real reclaim or a dismissal sent to `target`'s daemon process is still waiting for its answer. */
+  busy: (target: InterruptedTarget) => boolean;
   /** The open "Interrupted work" dialog, when one is. */
   dialog?: InterruptedDialog;
   /** Open deck `deckId`'s dialog; `false` when that deck has no daemon process to ask. */
@@ -47,7 +55,8 @@ function reason(error: unknown): string {
  * The list is asked for once per daemon process a deck's connection names —
  * when the deck connects, and again when it reconnects to another process —
  * again when its dialog opens (with the Git facts), and after each reclaim or
- * dismissal. Nothing polls on a timer. An answer from a process the deck has
+ * dismissal — whether or not a dialog is still open to show its answer.
+ * Nothing polls on a timer. An answer from a process the deck has
  * since left, or to a list request that a newer one replaced, is dropped.
  *
  * `undefined` where the bridge offers none of it (a render-only runtime).
@@ -63,6 +72,10 @@ export function useInterruptedWork(bridge: DeckBridge, fleet: DeckFleet): Interr
   /* The newest list request per deck: an older one's answer is not applied. */
   const lastOp = useRef(0);
   const listOps = useRef(new Map<string, number>());
+  /* The real reclaim or dismissal in flight per deck: the process it was sent to and its op. A ref for the
+     synchronous check, mirrored in state so a dialog renders it. */
+  const mutations = useRef(new Map<string, { instance: string; op: number }>());
+  const [mutating, setMutating] = useState<Readonly<Record<string, string>>>({});
 
   const fetchList = useCallback((deckId: string, git: boolean) => {
     if (!bridge.interruptedWorkList) return;
@@ -136,12 +149,38 @@ export function useInterruptedWork(bridge: DeckBridge, fleet: DeckFleet): Interr
   const show = useCallback((target: InterruptedTarget, id: string, reportsFrom: number) => (
     bridge.interruptedWorkShow ? bridge.interruptedWorkShow(target, id, reportsFrom) : Promise.resolve<InterruptedReply<InterruptedShow>>({ outcome: "unsupported" })
   ), [bridge]);
-  const reclaim = useCallback((target: InterruptedTarget, id: string, dryRun: boolean) => (
-    bridge.interruptedWorkReclaim ? bridge.interruptedWorkReclaim(target, id, dryRun) : Promise.resolve<InterruptedReply<ReclaimOutcome>>({ outcome: "unsupported" })
-  ), [bridge]);
-  const dismiss = useCallback((target: InterruptedTarget, ids: string[]) => (
+  /* A real reclaim or dismissal: pending until it answers, then the list again, of that process only. */
+  const mutate = useCallback(<T,>(target: InterruptedTarget, send: () => Promise<T>): Promise<T> => {
+    const op = ++lastOp.current;
+    mutations.current.set(target.deckId, { instance: target.instance, op });
+    setMutating((held) => ({ ...held, [target.deckId]: target.instance }));
+    const settled = () => {
+      if (mutations.current.get(target.deckId)?.op === op) {
+        mutations.current.delete(target.deckId);
+        setMutating((held) => {
+          const rest = { ...held };
+          delete rest[target.deckId];
+          return rest;
+        });
+      }
+      if (current.current.get(target.deckId) === target.instance) fetchList(target.deckId, false);
+    };
+    return send().then((reply) => {
+      settled();
+      return reply;
+    }, (error: unknown) => {
+      settled();
+      throw error;
+    });
+  }, [fetchList]);
+  const busy = useCallback((target: InterruptedTarget) => mutations.current.get(target.deckId)?.instance === target.instance || mutating[target.deckId] === target.instance, [mutating]);
+  const reclaim = useCallback((target: InterruptedTarget, id: string, dryRun: boolean) => {
+    const send = () => (bridge.interruptedWorkReclaim ? bridge.interruptedWorkReclaim(target, id, dryRun) : Promise.resolve<InterruptedReply<ReclaimOutcome>>({ outcome: "unsupported" }));
+    return dryRun ? send() : mutate(target, send);
+  }, [bridge, mutate]);
+  const dismiss = useCallback((target: InterruptedTarget, ids: string[]) => mutate(target, () => (
     bridge.interruptedWorkDismiss ? bridge.interruptedWorkDismiss(target, ids) : Promise.resolve<InterruptedReply<DismissOutcome>>({ outcome: "unsupported" })
-  ), [bridge]);
+  )), [bridge, mutate]);
 
-  return useMemo(() => (offered ? { decks, hidden, hide, refresh, show, reclaim, dismiss, ...(dialog ? { dialog } : {}), openDialog, closeDialog } : undefined), [closeDialog, decks, dialog, dismiss, hidden, hide, offered, openDialog, reclaim, refresh, show]);
+  return useMemo(() => (offered ? { decks, hidden, hide, refresh, show, reclaim, dismiss, busy, ...(dialog ? { dialog } : {}), openDialog, closeDialog } : undefined), [busy, closeDialog, decks, dialog, dismiss, hidden, hide, offered, openDialog, reclaim, refresh, show]);
 }

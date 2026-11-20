@@ -11,6 +11,9 @@
  * backend passes through as the daemon sent them, snake_case and all.
  */
 
+import type { VoiceResolvedParamDto } from "./bridge";
+import { collidingChoiceEntry, ordinal, spokenWords } from "./voiceChoice";
+
 // ---------------------------------------------------------------------------
 // The daemon's answers.
 // ---------------------------------------------------------------------------
@@ -153,20 +156,120 @@ export interface InterruptedTarget { deckId: string; instance: string }
  * What the dialog serves to its buttons, its keys and voice — the same
  * calls by every route. Each that can be refused answers the sentence why;
  * reclaim and dismiss answer, once settled, the sentence for their outcome.
+ *
+ * `item` is what the user said for which item (an ordinal, or its name,
+ * branch or id; see {@link resolveSpokenItem}); without it, the selected row.
  */
 export interface InterruptedDialogControls {
+  /** Run the dry run of a reclaim; the reclaim itself waits for {@link confirmReclaim}. */
   reclaim: (item?: string) => string | Promise<string | undefined>;
   confirmReclaim: () => string | undefined;
-  dismiss: (item?: string) => string | Promise<string | undefined>;
+  /** Dismiss the selected item now: the Dismiss button's and `d`'s, as the TUI's `d`. */
+  dismiss: () => string | Promise<string | undefined>;
+  /** Ask whether to dismiss the item `item` names, bound to its id: nothing is sent until {@link confirmDismiss}. */
+  askDismiss: (item?: string) => string | undefined;
+  confirmDismiss: () => string | undefined;
   dismissAll: () => string | undefined;
   confirmDismissAll: () => string | undefined;
   select: (id: string) => void;
-  openDetails: (id: string) => void;
-  showReports: (from: number) => void;
+  /** Open the details of the item `id` names, or of the one `item` names. */
+  openDetails: (which?: { item?: string; id?: string }) => string | undefined;
+  /** Show the first page of an item's kept reports: the one `item` names, the open details' item, or the selected one. */
+  showReports: (item?: string) => string | undefined;
+  nextReports: () => string | undefined;
+  previousReports: () => string | undefined;
   back: () => void;
   close: () => void;
 }
 
+/** Desktop-only: the question a spoken Dismiss of one item asks before anything is sent. */
+export function dismissOneQuestion(item: InterruptedItem): string {
+  return `${DISMISS_ACTION} ${itemName(item)} · ${kindLabel(item.kind)}? [y/N]`;
+}
+
+/** What an item answers to when the user names it: its name and its branch, as words. */
+function spokenNames(item: InterruptedItem): string[][] {
+  return [item.name, item.branch].filter((value): value is string => typeof value === "string" && value !== "").map(spokenWords);
+}
+
+/** Whether `words` occur in `name`, in order and next to each other. */
+function containsRun(name: readonly string[], words: readonly string[]): boolean {
+  if (words.length === 0 || words.length > name.length) return false;
+  for (let at = 0; at + words.length <= name.length; at += 1) {
+    if (words.every((word, offset) => name[at + offset] === word)) return true;
+  }
+  return false;
+}
+
+/**
+ * PRD #1790 stage 2 (reviewer 10, auditor 3) — the item `said` names in
+ * `ordered`, or the sentence why none: no words are the `selected` row; an
+ * ordinal ("the second one", "last") is that position, unless the same words
+ * are also another item's whole name (`voiceChoice`'s collision rule), which
+ * is refused as ambiguous; otherwise a name, branch or id. Names and branches
+ * are compared as runs of words, so "fix login" names `fix-login`; an exact
+ * match wins over a partial one, and two of either kind are refused.
+ */
+export function resolveSpokenItem(ordered: readonly InterruptedItem[], selected: InterruptedItem | undefined, said?: string): InterruptedItem | string {
+  if (said === undefined || said.trim() === "") return selected ?? REFUSED_NOT_LISTED;
+  const words = spokenWords(said);
+  if (words.length === 0) return REFUSED_NOT_LISTED;
+  const position = ordinal(words);
+  if (position !== undefined) {
+    const at = position === "last" ? ordered.at(-1) : ordered[position - 1];
+    const offered = ordered.map((item): VoiceResolvedParamDto => ({ name: "item", kind: "filter_text", spoken: item.name ?? item.id, value: item.id, label: item.name ?? item.branch ?? item.id, names: item.branch ? [item.branch] : [] }));
+    const colliding = collidingChoiceEntry(said, offered);
+    if (colliding !== undefined && ordered[colliding - 1]?.id !== at?.id) return REFUSED_AMBIGUOUS;
+    return at ?? REFUSED_NOT_LISTED;
+  }
+  const phrase = words.join(" ");
+  const raw = said.trim().toLowerCase();
+  const exact = ordered.filter((item) => item.id.toLowerCase() === raw || spokenNames(item).some((name) => name.join(" ") === phrase));
+  if (exact.length === 1) return exact[0];
+  if (exact.length > 1) return REFUSED_AMBIGUOUS;
+  const partial = ordered.filter((item) => [...spokenNames(item), spokenWords(item.id)].some((name) => containsRun(name, words)));
+  if (partial.length === 1) return partial[0];
+  return partial.length > 1 ? REFUSED_AMBIGUOUS : REFUSED_NOT_LISTED;
+}
+
+/**
+ * PRD #1790 stage 2 (auditor 2) — the open dialog as voice sees it: `token`
+ * names its deck, daemon process, opening, listed items, selection and view,
+ * and `covered` says whether another modal is drawn over it. The voice
+ * surface reads the token when an utterance is declared and refuses an
+ * answer for the dialog once it moved; the dashboard refuses a spoken action
+ * while the dialog is covered.
+ */
+export interface ShownInterruptedDialog { token: string; covered: () => boolean }
+let shownDialog: ShownInterruptedDialog | undefined;
+
+/** The dialog on screen, or `undefined` with none. */
+export function shownInterruptedDialog(): ShownInterruptedDialog | undefined {
+  return shownDialog;
+}
+
+/** The token of the dialog on screen, or `undefined` with none (read when an utterance is declared). */
+export function shownInterruptedToken(): string | undefined {
+  return shownDialog?.token;
+}
+
+/** Publish the dialog on screen; answers the unpublish, which only takes back its own. */
+export function publishInterruptedDialog(dialog: ShownInterruptedDialog): () => void {
+  shownDialog = dialog;
+  return () => {
+    if (shownDialog === dialog) shownDialog = undefined;
+  };
+}
+
+/** What a spoken action on the dialog says while another modal covers it. */
+export const INTERRUPTED_COVERED = "Something is open over the interrupted work; close it first.";
+/** …while a reclaim or dismissal of this daemon is still waiting for its answer. */
+export const INTERRUPTED_WAIT = "Wait for the last action to finish.";
+/** …asked for an item's reports when it keeps none. */
+export const INTERRUPTED_NO_REPORTS = "That item has no kept reports.";
+/** …asked for another page of reports when there is none that way. */
+export const INTERRUPTED_NO_NEXT_PAGE = "There is no next page of reports.";
+export const INTERRUPTED_NO_PREVIOUS_PAGE = "There is no previous page of reports.";
 
 // ---------------------------------------------------------------------------
 // Decision D2: the words (copies of `src/interrupted_work.rs`).
@@ -229,6 +332,8 @@ export const NOTHING_DISMISSED = "Nothing was dismissed.";
 export const UNSUPPORTED = "The running deck daemon does not support interrupted work. Restart it onto this build with `dot-agent-deck daemon restart`.";
 export const DAEMON_FAILED = "The deck daemon could not answer:";
 export const MAX_SHOWN_CHARS = 300;
+/** `MAX_SHOWN_REPORTS`: the most reports one page shows; Previous reports falls back on it with no page to go back to. */
+export const MAX_SHOWN_REPORTS = 16;
 
 /** `interrupted_footer`: "N interrupted items from before the restart", singular for one. */
 export function interruptedFooter(count: number): string {

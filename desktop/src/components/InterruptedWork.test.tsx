@@ -712,7 +712,9 @@ describe("which item spoken words name (reviewer 10, auditor 3)", () => {
 describe("details and reports by voice (reviewer 11)", () => {
   /** Scenario: "show the details of the first one" opens fix-login's details; "show its reports" asks for the first page of its 33 reports, "next page of reports" for the page from 16 and "previous page of reports" for the page from 0 again — all without a pointer. "Show the reports of release team" from the list opens that item's details and asks for its first page. */
   it("opens an item's details and pages its reports", async () => {
-    const { bridge, calls } = recordingBridge({ list: three(), show: (id, from) => pagedShow(three().items.find((candidate) => candidate.id === id)!, 33)(id, from) });
+    /* The orchestration keeps a report too, so its reports can be asked for by name. */
+    const list: InterruptedList = { items: [agent(), unit(), { ...team(), reports: [{ report_id: "r-release-team", kept_until_ms: KEPT_TS }] }] };
+    const { bridge, calls } = recordingBridge({ list, show: (id, from) => pagedShow(list.items.find((candidate) => candidate.id === id)!, 33)(id, from) });
     const voice = voiced(bridge);
     render(<voice.Voiced />);
     await screen.findByTestId("interrupted-banner");

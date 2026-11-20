@@ -1354,6 +1354,26 @@ mod tests {
                     "dismissAllInterrupted",
                     vec!["overview"]
                 ),
+                (
+                    "show_interrupted_details",
+                    "showInterruptedDetails",
+                    vec!["overview"]
+                ),
+                (
+                    "show_interrupted_reports",
+                    "showInterruptedReports",
+                    vec!["overview"]
+                ),
+                (
+                    "next_interrupted_reports",
+                    "nextInterruptedReports",
+                    vec!["overview"]
+                ),
+                (
+                    "previous_interrupted_reports",
+                    "previousInterruptedReports",
+                    vec!["overview"]
+                ),
                 ("switch_deck", "switchDeck", vec!["deck", "overview"]),
                 // No screens: see the row's own comment — stopping must never
                 // be unavailable.
@@ -2392,6 +2412,10 @@ mod tests {
                 "reclaim_interrupted",
                 "dismiss_interrupted",
                 "dismiss_all_interrupted",
+                "show_interrupted_details",
+                "show_interrupted_reports",
+                "next_interrupted_reports",
+                "previous_interrupted_reports",
                 "switch_deck",
                 "voice_off",
                 "list_commands",

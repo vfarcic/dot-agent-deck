@@ -2,7 +2,7 @@ import type { DeckView } from "../types";
 import type { VoiceDeckIdentityDto } from "./bridge";
 import { clearDashboardFilter, setDashboardFilter, type DashboardFilter } from "./dashboardFilter";
 import type { CardStep, OverviewMode } from "./agentCards";
-import { DISMISSED, type InterruptedDialogControls } from "./interruptedWork";
+import type { InterruptedDialogControls } from "./interruptedWork";
 
 /**
  * PRD #802 M2 — the frontend action registry, and the app's one dispatch seam
@@ -671,8 +671,6 @@ export type VoiceActionEntry = {
 /** PRD #1790 stage 2 — what voice says while a reclaim's dry run is checking, and once it has answered with nothing to read back. */
 export const INTERRUPTED_RECLAIM_CHECKING = "Checking what reclaiming it would do…";
 export const INTERRUPTED_RECLAIM_CHECKED = "Checked.";
-/** …and while a dismissal is on its way. */
-export const INTERRUPTED_DISMISSING = "Dismissing…";
 
 /** PRD #1401 — what voice says while the system browser is being handed the page. */
 export const PULL_REQUEST_HANDING_OFF = "Opening it in your browser…";
@@ -1263,18 +1261,31 @@ export const VOICE_ACTIONS = {
     run: (context: Pick<VoiceActionContext, "interruptedDialog">) => { context.interruptedDialog.confirmReclaim(); },
   },
 
+  /* Voice never completes a dismissal (PRD #802 D5; desktop review R6/A1):
+     this asks whether to dismiss the item the words name, bound to its id,
+     and the dismissal waits for the person's click or `y` on the question. */
   dismissInterrupted: {
-    label: "Dismiss one interrupted item",
+    label: "Ask to dismiss one interrupted item",
     voice: true,
     needs: ["interruptedDialog"],
-    run: (context: Pick<VoiceActionContext, "interruptedDialog"> & Partial<Pick<VoiceActionContext, "reportRefused" | "reportPending">>, target?: { filterText?: string }) => {
-      const answer = context.interruptedDialog.dismiss(target?.filterText);
-      if (typeof answer === "string") {
-        context.reportRefused?.(answer);
-        return;
-      }
-      context.reportPending?.(INTERRUPTED_DISMISSING, answer.then((said) => (said === DISMISSED ? undefined : said)), DISMISSED);
+    run: (context: Pick<VoiceActionContext, "interruptedDialog"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target?: { filterText?: string }) => {
+      const refused = context.interruptedDialog.askDismiss(target?.filterText);
+      if (refused !== undefined) context.reportRefused?.(refused);
     },
+  },
+
+  confirmDismissInterrupted: {
+    label: "Dismiss the interrupted item the question names",
+    no_voice: "the answer to a spoken dismissal's question; voice has no confirm-before-acting step yet (PRD #802 D5), so `dismiss_interrupted` asks the question on screen, naming the item, and stops — the click or `y` that dismisses it is the person's own",
+    needs: ["interruptedDialog"],
+    run: (context: Pick<VoiceActionContext, "interruptedDialog">) => { context.interruptedDialog.confirmDismiss(); },
+  },
+
+  dismissSelectedInterrupted: {
+    label: "Dismiss the selected interrupted item",
+    no_voice: "the Dismiss button and the `d` key, which dismiss the selected row at once, as the TUI's `d` does; a spoken dismissal must not complete without the person's confirm, so voice reaches it through `dismiss_interrupted`, which asks first",
+    needs: ["interruptedDialog"],
+    run: (context: Pick<VoiceActionContext, "interruptedDialog">) => { void context.interruptedDialog.dismiss(); },
   },
 
   dismissAllInterrupted: {
@@ -1302,18 +1313,46 @@ export const VOICE_ACTIONS = {
     run: (context: Pick<VoiceActionContext, "interruptedDialog">, id: string) => context.interruptedDialog.select(id),
   },
 
+  /* Reviewer 11 (CLAUDE.md rule 23): an item's details, its reports and their
+     pages by voice. They are shown to read on screen; nothing is read aloud. */
   showInterruptedDetails: {
     label: "Show an interrupted item's details",
-    no_voice: "shows facts and report text to read on screen, and voice reads none of them aloud; a row that opened them would leave the user looking at a page voice cannot page through or read, and the decisions they inform — reclaim, dismiss — have rows of their own",
+    voice: true,
     needs: ["interruptedDialog"],
-    run: (context: Pick<VoiceActionContext, "interruptedDialog">, id: string) => context.interruptedDialog.openDetails(id),
+    run: (context: Pick<VoiceActionContext, "interruptedDialog"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target?: { filterText?: string; itemId?: string }) => {
+      const refused = context.interruptedDialog.openDetails({ ...(target?.filterText !== undefined ? { item: target.filterText } : {}), ...(target?.itemId !== undefined ? { id: target.itemId } : {}) });
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
   },
 
   showInterruptedReports: {
-    label: "Show a page of an interrupted item's kept reports",
-    no_voice: "shows report text an agent wrote, to read on screen; voice reads no report aloud, for `show_interrupted_details`' reason",
+    label: "Show the first page of an interrupted item's kept reports",
+    voice: true,
     needs: ["interruptedDialog"],
-    run: (context: Pick<VoiceActionContext, "interruptedDialog">, from: number) => context.interruptedDialog.showReports(from),
+    run: (context: Pick<VoiceActionContext, "interruptedDialog"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target?: { filterText?: string }) => {
+      const refused = context.interruptedDialog.showReports(target?.filterText);
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  nextInterruptedReports: {
+    label: "Show the next page of an interrupted item's kept reports",
+    voice: true,
+    needs: ["interruptedDialog"],
+    run: (context: Pick<VoiceActionContext, "interruptedDialog"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.interruptedDialog.nextReports();
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  previousInterruptedReports: {
+    label: "Show the previous page of an interrupted item's kept reports",
+    voice: true,
+    needs: ["interruptedDialog"],
+    run: (context: Pick<VoiceActionContext, "interruptedDialog"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.interruptedDialog.previousReports();
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
   },
 
   backInterruptedWork: {
@@ -2142,7 +2181,8 @@ export type VoiceContextChannel = { current: VoiceScreenContext | undefined };
 export function dispatchVoiceAction(invoke: string, context: VoiceDispatchContext, target: VoiceDispatchTarget): boolean {
   const entry: VoiceActionEntry | undefined = (VOICE_ACTIONS as Record<string, VoiceActionEntry>)[invoke];
   if (!entry) return false;
-  if (entry.needs.some((member) => typeof context[member] !== "function")) return false;
+  /* A member is a call, or — `interruptedDialog` (PRD #1790 stage 2) — an object of calls. */
+  if (entry.needs.some((member) => typeof context[member] !== "function" && (typeof context[member] !== "object" || context[member] === null))) return false;
   (entry.run as (...args: unknown[]) => void)(context, target);
   return true;
 }

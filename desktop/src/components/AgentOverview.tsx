@@ -33,7 +33,7 @@ import { agentSpokenName, orchestrationTitle } from "../lib/agentNames";
 import { DISPLAY_LIMITS, deckName, displayActivity, displayIdentity, displayPath, displayText, displayTitle, displayUptime, domIdentity, rendersBlank } from "../lib/displayText";
 import { HookBinaryNotices } from "./HookBinaryNotice";
 import { InterruptedWorkBanner, InterruptedWorkDialog } from "./InterruptedWork";
-import { listedCount, NOTHING_INTERRUPTED, type InterruptedDialogControls } from "../lib/interruptedWork";
+import { INTERRUPTED_COVERED, listedCount, NOTHING_INTERRUPTED, shownInterruptedDialog, type InterruptedDialogControls } from "../lib/interruptedWork";
 import { sameIncarnation } from "../lib/agentKey";
 import { AGENT_GONE_AFTER_RESTART } from "../lib/agentIdentity";
 import { inboxAttentionWords, INBOX_WORDS } from "../lib/inboxWords";
@@ -1271,24 +1271,40 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     if (deckId !== undefined) return interrupted.openDialog(deckId) ? undefined : NOTHING_INTERRUPTED;
     const listing = decks.filter((deck) => deck.connected && deck.snapshot.connection.deckId !== undefined && listedCount(interrupted.decks[deck.snapshot.connection.deckId]?.list) > 0);
     if (listing.length === 0) return NOTHING_INTERRUPTED;
-    if (listing.length > 1) return `Several daemons have interrupted work: ${listing.map((deck) => deckName(deck.snapshot.connection)).join(", ")}. Say which one.`;
+    if (listing.length > 1) return `Several daemons have interrupted work: ${listing.map((deck) => deckName(deck.snapshot.connection)).join(", ")}. Open one from its banner, or say which one.`;
     return interrupted.openDialog(listing[0].snapshot.connection.deckId as string) ? undefined : NOTHING_INTERRUPTED;
   }, [decks, interrupted]);
   const hideInterruptedWork = useCallback((deckId: string) => interrupted?.hide(deckId), [interrupted]);
+  /*
+    What voice reaches: the open dialog's calls, refused while no dialog is
+    open (reviewer 9: an action's own `undefined` answer is its success, never
+    taken for that), and while another modal is drawn over the dialog
+    (auditor 2). The utterance's binding to the dialog it was said to is the
+    voice surface's gate (`shownInterruptedToken`).
+  */
   const interruptedDialog = useMemo<InterruptedDialogControls>(() => {
-    const open = (): InterruptedDialogControls | undefined => interruptedControls.current;
     const first = "Open the interrupted work first: say “show interrupted work”.";
+    const reach = <T,>(act: (controls: InterruptedDialogControls) => T): T | string => {
+      const open = interruptedControls.current;
+      if (!open) return first;
+      if (shownInterruptedDialog()?.covered()) return INTERRUPTED_COVERED;
+      return act(open);
+    };
     return {
-      reclaim: (said) => open()?.reclaim(said) ?? first,
-      confirmReclaim: () => open()?.confirmReclaim() ?? first,
-      dismiss: (said) => open()?.dismiss(said) ?? first,
-      dismissAll: () => open()?.dismissAll() ?? first,
-      confirmDismissAll: () => open()?.confirmDismissAll() ?? first,
-      select: (id) => open()?.select(id),
-      openDetails: (id) => open()?.openDetails(id),
-      showReports: (from) => open()?.showReports(from),
-      back: () => open()?.back(),
-      close: () => open()?.close(),
+      reclaim: (said) => reach((open) => open.reclaim(said)),
+      confirmReclaim: () => reach((open) => open.confirmReclaim()),
+      dismiss: () => reach((open) => open.dismiss()),
+      askDismiss: (said) => reach((open) => open.askDismiss(said)),
+      confirmDismiss: () => reach((open) => open.confirmDismiss()),
+      dismissAll: () => reach((open) => open.dismissAll()),
+      confirmDismissAll: () => reach((open) => open.confirmDismissAll()),
+      select: (id) => { reach((open) => open.select(id)); },
+      openDetails: (which) => reach((open) => open.openDetails(which)),
+      showReports: (said) => reach((open) => open.showReports(said)),
+      nextReports: () => reach((open) => open.nextReports()),
+      previousReports: () => reach((open) => open.previousReports()),
+      back: () => { reach((open) => open.back()); },
+      close: () => { reach((open) => open.close()); },
     };
   }, []);
   const interruptedVoice = useMemo(() => ({ showInterruptedWork, hideInterruptedWork }), [hideInterruptedWork, showInterruptedWork]);
@@ -1439,6 +1455,26 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [agentPaneOpen, newAgent, newAgentAvailable, voiceContext]);
+  /*
+    PRD #1790 stage 2 (reviewer 8, CLAUDE.md rule 22) — `I`, the TUI's
+    Interrupted work key: opens the one daemon's dialog that lists items, as
+    its banner's Show does; with several, the dashboard says so, as voice's
+    "show interrupted work" does. It stands down where the Ctrl+N shortcut
+    does, and under any modal.
+  */
+  useEffect(() => {
+    if (!interrupted || agentPaneOpen || newAgent) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "I" || event.ctrlKey || event.metaKey || event.altKey || event.defaultPrevented) return;
+      const target = event.target;
+      if (target instanceof Element && target.matches("input, textarea, select, [contenteditable='true'], .xterm-helper-textarea")) return;
+      if (modalOpen()) return;
+      event.preventDefault();
+      VOICE_ACTIONS.showInterruptedWork.run({ showInterruptedWork, reportRefused: setDaemonNotice }, {});
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [agentPaneOpen, interrupted, newAgent, showInterruptedWork]);
   /**
    * PRD #1105 M5 — the overview's entry point into an agent's pane.
    *
