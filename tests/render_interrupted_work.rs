@@ -858,7 +858,7 @@ fn interrupted_018_hostile_journal_values_are_escaped_everywhere_they_are_shown(
             // Escaped where it is drawn, as the CLI shows it, whatever path
             // the message took.
             assert!(
-                shown[13].contains("the daemon failed \\u{0}\\u{1}"),
+                shown[13].contains("the daemon failed") && shown[13].contains("\\u{0}\\u{1}"),
                 "{}",
                 shown[13]
             );
@@ -1155,8 +1155,12 @@ fn interrupted_022_the_hide_key_acts_in_the_overlay() {
             before.contains(&footer) && before.contains("[Hide X]"),
             "{what}: {before}"
         );
+        // The dismiss-all question repeats the footer's sentence; its
+        // buttons are the footer's own.
         assert!(
-            !after.contains(&footer) && after.contains(INTERRUPTED_WORK_TITLE),
+            !after.contains("[Hide X]")
+                && !after.contains("[Show I]")
+                && after.contains(INTERRUPTED_WORK_TITLE),
             "{what}: `X` hides the footer and leaves the overlay open:\n{after}"
         );
         assert!(

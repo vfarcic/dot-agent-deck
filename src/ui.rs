@@ -21947,11 +21947,11 @@ fn refuse_undrawn_choice(key: &KeyEvent, ui: &UiState) -> Option<Action> {
             return refused.then_some(Action::Continue);
         }
         // PRD #1790 stage 2: reclaim's and dismiss all's `y` only once a
-        // frame showed the question's y/n line.
+        // frame showed every row of the question.
         UiMode::InterruptedWork => {
             let refused = interrupted_work_view::asks(ui)
                 && matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y'))
-                && !shown.contains(0);
+                && !interrupted_work_view::question_shown(ui, shown);
             return refused.then_some(Action::Continue);
         }
         _ => {}

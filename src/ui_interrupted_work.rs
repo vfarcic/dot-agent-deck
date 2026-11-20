@@ -17,6 +17,11 @@
 //!   the first page of the item's kept reports with their text, and `n`/`p`
 //!   the next and previous page, so a report past the ones the list carries
 //!   can be reached; only the page last asked for is shown.
+//! - **Answers.** Each answer carries the daemon process it came from and
+//!   the request it answers ([`Tag`]); one from a process the TUI has since
+//!   left, or for a request no longer waited for, is dropped before it
+//!   changes anything. Backing out of a dry run abandons it; a reclaim or
+//!   dismissal in flight keeps the actions waiting until it answers.
 //!
 //! Every sentence shown is one of the shared wording constants and helpers of
 //! [`crate::interrupted_work`] (decision D2), so the CLI, the TUI and the
@@ -76,45 +81,80 @@ pub enum Press {
 pub(super) enum View {
     #[default]
     List,
-    /// One item's details. `asked`: its kept reports' text was asked for.
-    /// `page`: where the page of kept reports last asked for starts; only
-    /// an answer for that page is shown.
+    /// One item's details. `asked`: its kept reports' text was asked for and
+    /// has not failed. `page`: where the page of kept reports last asked for
+    /// starts. `failed`: why the last report request failed.
     Details {
         id: String,
         show: Option<Box<InterruptedShow>>,
         asked: bool,
         scroll: usize,
         page: Option<usize>,
+        failed: Option<String>,
     },
     /// Reclaim's confirmation: the dry run's outcome once it answered.
     Reclaim {
         id: String,
         dry: Option<ReclaimOutcome>,
+        scroll: usize,
     },
     /// Dismiss all's confirmation, naming exactly the items listed when it was
     /// asked, so one that appears meanwhile is not dismissed unseen.
-    DismissAll { ids: Vec<String> },
+    DismissAll { ids: Vec<String>, scroll: usize },
+}
+
+/// Which daemon process and which request an answer belongs to. An answer is
+/// applied only while both are still the ones waited for: the process
+/// (`generation`, which changes with every process the TUI attaches to) and
+/// the request (`op`, a number no other request of this TUI shares).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Tag {
+    generation: u64,
+    op: u64,
 }
 
 /// A daemon answer, delivered to the render thread.
 pub(super) enum Answer {
     /// `Ok(None)`: the daemon does not support interrupted work.
     Listed {
-        seq: u64,
+        tag: Tag,
         result: Result<Option<InterruptedList>, String>,
     },
     Shown {
+        tag: Tag,
         id: String,
         result: Result<Option<InterruptedShow>, String>,
     },
     Reclaimed {
+        tag: Tag,
         id: String,
         dry_run: bool,
         result: Result<Option<ReclaimOutcome>, String>,
     },
     Dismissed {
+        tag: Tag,
         result: Result<Option<DismissOutcome>, String>,
     },
+}
+
+impl Answer {
+    fn tag(&self) -> Tag {
+        match self {
+            Answer::Listed { tag, .. }
+            | Answer::Shown { tag, .. }
+            | Answer::Reclaimed { tag, .. }
+            | Answer::Dismissed { tag, .. } => *tag,
+        }
+    }
+}
+
+/// A reclaim or dismissal in flight: the actions wait for its answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Pending {
+    op: u64,
+    /// A dry run only asks; backing out of its confirmation abandons it, and
+    /// its late answer is dropped.
+    dry_run: bool,
 }
 
 /// What the TUI holds of the interrupted work list.
@@ -124,6 +164,11 @@ pub(super) struct InterruptedWork {
     instance: Option<String>,
     /// The daemon process the attach fetch was made for.
     fetched_for: Option<String>,
+    /// Counts the daemon processes the TUI attached to; an answer tagged
+    /// with an earlier one is dropped.
+    generation: u64,
+    /// The last request number given out, across processes.
+    last_op: u64,
     /// The last list the daemon answered; `None` before an answer, and after
     /// one that was unsupported or failed.
     list: Option<InterruptedList>,
@@ -138,10 +183,15 @@ pub(super) struct InterruptedWork {
     message: Option<String>,
     /// The footer row was hidden (`X`), until another daemon process.
     footer_hidden: bool,
-    /// A reclaim or dismissal is in flight.
-    busy: bool,
+    /// The reclaim or dismissal in flight.
+    pending: Option<Pending>,
     /// The newest list request; an older one's answer is not applied.
-    list_seq: u64,
+    list_op: Option<u64>,
+    /// The report request the open details wait for.
+    show_op: Option<u64>,
+    /// How many rows the y/n question took when it was last drawn; `y`
+    /// counts only once a frame showed every one of them.
+    question_rows: usize,
     /// The L1 seam's record of every request sent, in order; `None` in
     /// production, where each is sent to the daemon instead.
     recorder: Option<Vec<Recorded>>,
@@ -149,10 +199,10 @@ pub(super) struct InterruptedWork {
     rx: mpsc::Receiver<Answer>,
 }
 
-/// A request the L1 seam recorded, with what its answer needs.
+/// A request the L1 seam recorded, with the tag its answer carries.
 #[derive(Debug, Clone)]
 pub(super) struct Recorded {
-    seq: u64,
+    tag: Tag,
     sent: InterruptedSeamSent,
 }
 
@@ -162,6 +212,8 @@ impl Default for InterruptedWork {
         InterruptedWork {
             instance: None,
             fetched_for: None,
+            generation: 0,
+            last_op: 0,
             list: None,
             unavailable: None,
             selected: 0,
@@ -169,8 +221,10 @@ impl Default for InterruptedWork {
             view: View::List,
             message: None,
             footer_hidden: false,
-            busy: false,
-            list_seq: 0,
+            pending: None,
+            list_op: None,
+            show_op: None,
+            question_rows: 0,
             recorder: None,
             tx,
             rx,
@@ -205,13 +259,34 @@ impl InterruptedWork {
             .find(|item| item.id.as_str() == id)
     }
 
+    /// A reclaim or dismissal is in flight.
+    fn busy(&self) -> bool {
+        self.pending.is_some()
+    }
+
     /// Whether the open view asks y/n now: reclaim's confirmation once its dry
     /// run says the worktree would be removed, and dismiss all's.
     fn asks(&self) -> bool {
         match &self.view {
-            View::Reclaim { dry: Some(dry), .. } => !self.busy && would_remove(dry),
-            View::DismissAll { ids } => !self.busy && !ids.is_empty(),
+            View::Reclaim { dry: Some(dry), .. } => !self.busy() && would_remove(dry),
+            View::DismissAll { ids, .. } => !self.busy() && !ids.is_empty(),
             _ => false,
+        }
+    }
+
+    /// A tag for a new request to the current daemon process.
+    fn next_tag(&mut self) -> Tag {
+        self.last_op += 1;
+        Tag {
+            generation: self.generation,
+            op: self.last_op,
+        }
+    }
+
+    /// Abandon a dry run in flight: its answer is no longer waited for.
+    fn abandon_dry_run(&mut self) {
+        if self.pending.is_some_and(|p| p.dry_run) {
+            self.pending = None;
         }
     }
 }
@@ -293,16 +368,16 @@ fn client() -> DaemonClient {
 }
 
 /// Send `request` to the daemon process the list came from, on the tokio
-/// runtime, and deliver its answer to [`drain`]; the L1 seam records it
-/// instead. `false`, with nothing sent, outside a runtime and the seam.
-fn send(iw: &mut InterruptedWork, request: InterruptedSeamRequest) -> bool {
+/// runtime, and deliver its answer, tagged `tag`, to [`drain`]; the L1 seam
+/// records it instead. `false`, with nothing sent, outside a runtime and the
+/// seam.
+fn send(iw: &mut InterruptedWork, tag: Tag, request: InterruptedSeamRequest) -> bool {
     let sent = InterruptedSeamSent {
         instance: iw.instance.clone(),
         request,
     };
-    let seq = iw.list_seq;
     if let Some(log) = iw.recorder.as_mut() {
-        log.push(Recorded { seq, sent });
+        log.push(Recorded { tag, sent });
         return true;
     }
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
@@ -310,18 +385,18 @@ fn send(iw: &mut InterruptedWork, request: InterruptedSeamRequest) -> bool {
     };
     let tx = iw.tx.clone();
     handle.spawn(async move {
-        let _ = tx.send(ask(seq, sent).await);
+        let _ = tx.send(ask(tag, sent).await);
     });
     true
 }
 
-/// The daemon's answer to `sent`.
-async fn ask(seq: u64, sent: InterruptedSeamSent) -> Answer {
+/// The daemon's answer to `sent`, tagged `tag`.
+async fn ask(tag: Tag, sent: InterruptedSeamSent) -> Answer {
     let InterruptedSeamSent { instance, request } = sent;
     let instance = instance.as_deref();
     match request {
         InterruptedSeamRequest::List { git } => Answer::Listed {
-            seq,
+            tag,
             result: bounded(LIST_TIMEOUT, client().list_interrupted_work(git, instance)).await,
         },
         InterruptedSeamRequest::Show { id, reports_from } => {
@@ -330,7 +405,7 @@ async fn ask(seq: u64, sent: InterruptedSeamSent) -> Answer {
                 client().show_interrupted_page(&id, None, Some(reports_from), instance),
             )
             .await;
-            Answer::Shown { id, result }
+            Answer::Shown { tag, id, result }
         }
         InterruptedSeamRequest::Reclaim { id, dry_run } => {
             let result = bounded(
@@ -339,12 +414,14 @@ async fn ask(seq: u64, sent: InterruptedSeamSent) -> Answer {
             )
             .await;
             Answer::Reclaimed {
+                tag,
                 id,
                 dry_run,
                 result,
             }
         }
         InterruptedSeamRequest::Dismiss { ids, all } => Answer::Dismissed {
+            tag,
             result: bounded(
                 DISMISS_TIMEOUT,
                 client().dismiss_interrupted(ids, all, None, instance),
@@ -357,13 +434,15 @@ async fn ask(seq: u64, sent: InterruptedSeamSent) -> Answer {
 /// Ask for the list again; `git` asks for each item's Git and pull request
 /// facts too.
 fn request_list(iw: &mut InterruptedWork, git: bool) {
-    iw.list_seq += 1;
-    send(iw, InterruptedSeamRequest::List { git });
+    let tag = iw.next_tag();
+    iw.list_op = Some(tag.op);
+    send(iw, tag, InterruptedSeamRequest::List { git });
 }
 
 /// PRD #1790 stage 2: fetch the list once for each daemon process the TUI's
 /// event stream attaches to — after the TUI attaches, and after it reconnects
-/// to another process. What an earlier process said is forgotten then.
+/// to another process. What an earlier process said is forgotten then, and
+/// an answer to any request made of it is dropped when it arrives.
 pub(super) fn sync(ui: &mut UiState, incarnation: &Incarnation) {
     let Some(process) = incarnation.as_deref() else {
         return;
@@ -373,11 +452,18 @@ pub(super) fn sync(ui: &mut UiState, incarnation: &Incarnation) {
         return;
     }
     let InterruptedWork {
-        tx, rx, recorder, ..
+        tx,
+        rx,
+        recorder,
+        generation,
+        last_op,
+        ..
     } = std::mem::take(iw);
     *iw = InterruptedWork {
         fetched_for: Some(process.to_string()),
         instance: Some(process.to_string()),
+        generation: generation + 1,
+        last_op,
         recorder,
         tx,
         rx,
@@ -393,14 +479,23 @@ pub(super) fn drain(ui: &mut UiState) {
     }
 }
 
-/// Apply one daemon answer.
+/// Apply one daemon answer: only one the TUI still waits for, from the
+/// daemon process it is attached to; any other is dropped before it changes
+/// anything.
 pub(super) fn apply(ui: &mut UiState, answer: Answer) {
     let iw = &mut ui.interrupted;
+    let tag = answer.tag();
+    if tag.generation != iw.generation {
+        return;
+    }
     match answer {
-        Answer::Listed { seq, result } => {
-            if seq != iw.list_seq {
+        Answer::Listed { result, .. } => {
+            if iw.list_op != Some(tag.op) {
                 return;
             }
+            iw.list_op = None;
+            // The selection follows its item, not its row.
+            let selected_id = iw.selected_item().map(|item| item.id.as_str().to_string());
             match result {
                 Ok(Some(mut list)) => {
                     // A refresh without Git facts keeps the ones a list with
@@ -429,89 +524,114 @@ pub(super) fn apply(ui: &mut UiState, answer: Answer) {
                     }
                 }
             }
-            let count = iw.ordered().len();
-            iw.selected = iw.selected.min(count.saturating_sub(1));
+            let ordered = iw.ordered();
+            let still =
+                selected_id.and_then(|id| ordered.iter().position(|item| item.id.as_str() == id));
+            // Gone: the row that took its place, or the last.
+            let count = ordered.len();
+            iw.selected = still.unwrap_or_else(|| iw.selected.min(count.saturating_sub(1)));
             let gone = match &iw.view {
                 View::Details { id, .. } | View::Reclaim { id, .. } => iw.item(id).is_none(),
                 View::DismissAll { .. } | View::List => false,
             };
-            if gone && !iw.busy {
+            if gone && !iw.busy() {
+                iw.abandon_dry_run();
+                iw.show_op = None;
                 iw.view = View::List;
             }
         }
-        Answer::Shown { id, result } => {
-            if let View::Details {
+        Answer::Shown { id, result, .. } => {
+            if iw.show_op != Some(tag.op) {
+                return;
+            }
+            iw.show_op = None;
+            let View::Details {
                 id: open,
                 show,
+                asked,
                 page,
                 scroll,
-                ..
+                failed,
             } = &mut iw.view
-                && *open == id
-            {
-                match result {
-                    // A page this view did not ask for (an earlier request
-                    // answering late) is not shown.
-                    Ok(Some(shown)) if page.is_some_and(|from| from != shown.reports_from) => {}
-                    Ok(Some(shown)) => {
-                        *show = Some(Box::new(shown));
-                        *scroll = 0;
-                    }
-                    Ok(None) => iw.message = Some(words::UNSUPPORTED.to_string()),
-                    Err(message) => iw.message = Some(message),
-                }
-            }
-        }
-        Answer::Reclaimed {
-            id,
-            dry_run: true,
-            result,
-        } => {
-            let View::Reclaim { id: open, dry } = &mut iw.view else {
+            else {
                 return;
             };
             if *open != id {
                 return;
             }
-            iw.busy = false;
-            match result {
-                Ok(Some(outcome)) => {
-                    *dry = Some(outcome);
-                    // A question that just appeared waits for its own frame.
-                    ui.confirm_choices_drawn = None;
+            let why = match result {
+                Ok(Some(shown)) => {
+                    *show = Some(Box::new(shown));
+                    *scroll = 0;
+                    *failed = None;
+                    return;
                 }
-                Ok(None) => {
-                    iw.message = Some(words::UNSUPPORTED.to_string());
-                    iw.view = View::List;
-                }
-                Err(message) => {
-                    iw.message = Some(message);
-                    iw.view = View::List;
-                }
+                Ok(None) => words::UNSUPPORTED.to_string(),
+                Err(message) => message,
+            };
+            // Failed: say why, and keep the page shown, if any, so the same
+            // key asks again.
+            *failed = Some(why);
+            *page = show.as_ref().map(|show| show.reports_from);
+            if show.is_none() {
+                *asked = false;
             }
         }
         Answer::Reclaimed {
-            dry_run: false,
+            id,
+            dry_run,
             result,
             ..
         } => {
-            iw.busy = false;
+            if iw.pending.map(|p| p.op) != Some(tag.op) {
+                return;
+            }
+            iw.pending = None;
+            let open = matches!(&iw.view, View::Reclaim { id: open, .. } if *open == id);
+            if dry_run {
+                if !open {
+                    return;
+                }
+                match result {
+                    Ok(Some(outcome)) => {
+                        if let View::Reclaim { dry, scroll, .. } = &mut iw.view {
+                            *dry = Some(outcome);
+                            *scroll = 0;
+                        }
+                        // A question that just appeared waits for its own frame.
+                        ui.confirm_choices_drawn = None;
+                    }
+                    Ok(None) => {
+                        iw.message = Some(words::UNSUPPORTED.to_string());
+                        iw.view = View::List;
+                    }
+                    Err(message) => {
+                        iw.message = Some(message);
+                        iw.view = View::List;
+                    }
+                }
+                return;
+            }
             iw.message = Some(match result {
                 Ok(Some(outcome)) => crate::interrupted_cli::reclaim_message(&outcome),
                 Ok(None) => words::UNSUPPORTED.to_string(),
                 Err(message) => message,
             });
-            iw.view = View::List;
+            if open {
+                iw.view = View::List;
+            }
             request_list(iw, false);
         }
-        Answer::Dismissed { result } => {
-            iw.busy = false;
+        Answer::Dismissed { result, .. } => {
+            if iw.pending.map(|p| p.op) != Some(tag.op) {
+                return;
+            }
+            iw.pending = None;
             iw.message = Some(match result {
                 Ok(Some(outcome)) => dismiss_message(&outcome),
                 Ok(None) => words::UNSUPPORTED.to_string(),
                 Err(message) => message,
             });
-            iw.view = View::List;
             request_list(iw, false);
         }
     }
@@ -539,6 +659,8 @@ pub(super) fn open(ui: &mut UiState, current: &Incarnation) {
     if iw.instance.is_none() {
         iw.instance = current.as_deref().map(str::to_string);
     }
+    iw.abandon_dry_run();
+    iw.show_op = None;
     iw.view = View::List;
     iw.message = None;
     ui.mode = UiMode::InterruptedWork;
@@ -571,12 +693,23 @@ pub(super) fn asks(ui: &UiState) -> bool {
     ui.mode == UiMode::InterruptedWork && ui.interrupted.asks()
 }
 
+/// Whether the frame that recorded `shown` drew every row of the open
+/// view's y/n question.
+pub(super) fn question_shown(ui: &UiState, shown: ChoicesShown) -> bool {
+    let rows = ui.interrupted.question_rows;
+    rows > 0 && (0..rows).all(|row| shown.contains(row))
+}
+
 /// Keys while the overlay is up. Ctrl+C keeps its PRD #40 safety net.
 pub(super) fn handle_key(key: KeyEvent, ui: &mut UiState, kb: &KeybindingConfig) -> Action {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         ui.quit_confirm_selected = 0;
         ui.mode = UiMode::QuitConfirm;
         return Action::Continue;
+    }
+    // The footer row offers its hide key here too (`interrupted_keys_act`).
+    if footer_count(ui).is_some() && kb.matches(KbAction::HideInterruptedWork, &key) {
+        return Action::HideInterruptedWork;
     }
     let shifted = |c: char| {
         key.code == KeyCode::Char(c.to_ascii_uppercase())
@@ -610,25 +743,48 @@ pub(super) fn handle_key(key: KeyEvent, ui: &mut UiState, kb: &KeybindingConfig)
                 Some(Press::Back)
             }
             KeyCode::Char('y') | KeyCode::Char('Y') => Some(Press::Yes),
+            // A confirmation longer than its popup scrolls to its question.
+            KeyCode::Down | KeyCode::Char('j') => Some(Press::Down),
+            KeyCode::Up | KeyCode::Char('k') => Some(Press::Up),
+            KeyCode::PageDown => Some(Press::PageDown),
+            KeyCode::PageUp => Some(Press::PageUp),
             _ => None,
         },
     };
     press.map_or(Action::Continue, Action::InterruptedWork)
 }
 
-/// How far PageUp/PageDown scroll the details.
+/// How far PageUp/PageDown scroll the details and the confirmations.
 const DETAILS_PAGE: usize = 10;
+
+/// `scroll` moved as `press` asks.
+fn scrolled(scroll: usize, press: Press) -> usize {
+    match press {
+        Press::Down => scroll.saturating_add(1),
+        Press::Up => scroll.saturating_sub(1),
+        Press::PageDown => scroll.saturating_add(DETAILS_PAGE),
+        Press::PageUp => scroll.saturating_sub(DETAILS_PAGE),
+        _ => scroll,
+    }
+}
 
 /// Do what `press` asks.
 pub(super) fn press(ui: &mut UiState, press: Press) {
     if press == Press::Close {
-        ui.interrupted.view = View::List;
+        let iw = &mut ui.interrupted;
+        iw.abandon_dry_run();
+        iw.show_op = None;
+        iw.view = View::List;
         if ui.mode == UiMode::InterruptedWork {
             ui.mode = UiMode::Normal;
         }
         return;
     }
     let iw = &mut ui.interrupted;
+    let scrolls = matches!(
+        press,
+        Press::Down | Press::Up | Press::PageDown | Press::PageUp
+    );
     match iw.view.clone() {
         View::List => match press {
             Press::Down => {
@@ -646,6 +802,7 @@ pub(super) fn press(ui: &mut UiState, press: Press) {
                         asked: false,
                         scroll: 0,
                         page: None,
+                        failed: None,
                     };
                 }
             }
@@ -654,18 +811,19 @@ pub(super) fn press(ui: &mut UiState, press: Press) {
                     return;
                 };
                 // Decision D1: a plain agent has no worktree the deck created.
-                if iw.busy || item.kind == ItemKind::Agent {
+                if iw.busy() || item.kind == ItemKind::Agent {
                     return;
                 }
                 let id = item.id.as_str().to_string();
                 iw.view = View::Reclaim {
                     id: id.clone(),
                     dry: None,
+                    scroll: 0,
                 };
                 reclaim(iw, id, true);
             }
             Press::Dismiss => {
-                if iw.busy {
+                if iw.busy() {
                     return;
                 }
                 if let Some(item) = iw.selected_item() {
@@ -679,8 +837,8 @@ pub(super) fn press(ui: &mut UiState, press: Press) {
                     .iter()
                     .map(|item| item.id.as_str().to_string())
                     .collect();
-                if !iw.busy && !ids.is_empty() {
-                    iw.view = View::DismissAll { ids };
+                if !iw.busy() && !ids.is_empty() {
+                    iw.view = View::DismissAll { ids, scroll: 0 };
                     // A question that just appeared waits for its own frame.
                     ui.confirm_choices_drawn = None;
                 }
@@ -690,14 +848,9 @@ pub(super) fn press(ui: &mut UiState, press: Press) {
         View::Details {
             id, asked, show, ..
         } => match press {
-            Press::Down | Press::Up | Press::PageDown | Press::PageUp => {
+            _ if scrolls => {
                 if let View::Details { scroll, .. } = &mut iw.view {
-                    *scroll = match press {
-                        Press::Down => scroll.saturating_add(1),
-                        Press::Up => scroll.saturating_sub(1),
-                        Press::PageDown => scroll.saturating_add(DETAILS_PAGE),
-                        _ => scroll.saturating_sub(DETAILS_PAGE),
-                    };
+                    *scroll = scrolled(*scroll, press);
                 }
             }
             Press::Open => {
@@ -718,22 +871,39 @@ pub(super) fn press(ui: &mut UiState, press: Press) {
                     request_page(iw, id, from.saturating_sub(words::MAX_SHOWN_REPORTS));
                 }
             }
-            Press::Back => iw.view = View::List,
+            Press::Back => {
+                iw.show_op = None;
+                iw.view = View::List;
+            }
             _ => {}
         },
-        View::Reclaim { id, dry } => match press {
+        View::Reclaim { id, dry, .. } => match press {
+            _ if scrolls => {
+                if let View::Reclaim { scroll, .. } = &mut iw.view {
+                    *scroll = scrolled(*scroll, press);
+                }
+            }
             Press::Yes => {
-                if !iw.busy && dry.as_ref().is_some_and(would_remove) {
+                if !iw.busy() && dry.as_ref().is_some_and(would_remove) {
                     reclaim(iw, id, false);
                 }
             }
-            // A reclaim in flight still reports its sentence in the list.
-            Press::Back => iw.view = View::List,
+            // A reclaim in flight still reports its sentence in the list; a
+            // dry run in flight is abandoned.
+            Press::Back => {
+                iw.abandon_dry_run();
+                iw.view = View::List;
+            }
             _ => {}
         },
-        View::DismissAll { ids } => match press {
+        View::DismissAll { ids, .. } => match press {
+            _ if scrolls => {
+                if let View::DismissAll { scroll, .. } = &mut iw.view {
+                    *scroll = scrolled(*scroll, press);
+                }
+            }
             Press::Yes => {
-                if !iw.busy {
+                if !iw.busy() {
                     dismiss(iw, ids);
                 }
             }
@@ -744,14 +914,18 @@ pub(super) fn press(ui: &mut UiState, press: Press) {
 }
 
 /// Ask for the page of the item `id`'s kept reports, and their text, that
-/// starts at its `from`-th report; only that page's answer is shown.
+/// starts at its `from`-th report; only the newest such request's answer is
+/// shown.
 fn request_page(iw: &mut InterruptedWork, id: String, from: usize) {
+    let tag = iw.next_tag();
     if let View::Details { asked, page, .. } = &mut iw.view {
         *asked = true;
         *page = Some(from);
     }
+    iw.show_op = Some(tag.op);
     send(
         iw,
+        tag,
         InterruptedSeamRequest::Show {
             id,
             reports_from: from,
@@ -761,18 +935,27 @@ fn request_page(iw: &mut InterruptedWork, id: String, from: usize) {
 
 /// Reclaim the item `id`, or with `dry_run` ask what that would do.
 fn reclaim(iw: &mut InterruptedWork, id: String, dry_run: bool) {
-    iw.busy = true;
-    if !send(iw, InterruptedSeamRequest::Reclaim { id, dry_run }) {
-        iw.busy = false;
+    let tag = iw.next_tag();
+    iw.pending = Some(Pending {
+        op: tag.op,
+        dry_run,
+    });
+    if !send(iw, tag, InterruptedSeamRequest::Reclaim { id, dry_run }) {
+        iw.pending = None;
     }
 }
 
-/// Dismiss the items `ids` name.
+/// Dismiss exactly the items `ids` name: never "all", so an item listed
+/// after the person was asked is not dismissed.
 fn dismiss(iw: &mut InterruptedWork, ids: Vec<String>) {
-    iw.busy = true;
+    let tag = iw.next_tag();
+    iw.pending = Some(Pending {
+        op: tag.op,
+        dry_run: false,
+    });
     iw.view = View::List;
-    if !send(iw, InterruptedSeamRequest::Dismiss { ids, all: false }) {
-        iw.busy = false;
+    if !send(iw, tag, InterruptedSeamRequest::Dismiss { ids, all: false }) {
+        iw.pending = None;
     }
 }
 
@@ -1165,13 +1348,17 @@ fn details_body(
     lines
 }
 
+/// A y/n question's rows: each row's index in its body, and its text after
+/// the indent.
+type Question = Vec<(usize, String)>;
+
 /// Reclaim's confirmation body, and the row of its y/n question when it asks.
 fn reclaim_body(
     iw: &InterruptedWork,
     id: &str,
     dry: Option<&ReclaimOutcome>,
     width: usize,
-) -> (Vec<Line<'static>>, Option<(usize, String)>) {
+) -> (Vec<Line<'static>>, Question) {
     let mut lines = Vec::new();
     if let Some(item) = iw.item(id) {
         lines.push(row(
@@ -1192,11 +1379,11 @@ fn reclaim_body(
         text_primary(),
     ));
     let Some(dry) = dry else {
-        return (lines, None);
+        return (lines, Vec::new());
     };
     lines.push(Line::from(""));
     lines.extend(wrapped(
-        &crate::interrupted_cli::reclaim_message(dry),
+        &clean(&crate::interrupted_cli::reclaim_message(dry)),
         width,
         "  ",
         notice(),
@@ -1229,18 +1416,40 @@ fn reclaim_body(
         lines.extend(wrapped(&sentence, width, "  ", text_primary()));
     }
     if !iw.asks() {
-        return (lines, None);
+        return (lines, Vec::new());
     }
     lines.push(Line::from(""));
     let question = format!("{}? y/n", words::RECLAIM_ACTION);
     let at = lines.len();
     lines.push(Line::styled(format!("  {question}"), heading()));
-    (lines, Some((at, question)))
+    (lines, vec![(at, question)])
 }
 
-/// The hints under the body.
-fn hints(iw: &InterruptedWork) -> String {
+/// Dismiss all's confirmation body: its question, wrapped, every row of it
+/// a row of the y/n question.
+fn dismiss_all_body(
+    iw: &InterruptedWork,
+    count: usize,
+    width: usize,
+) -> (Vec<Line<'static>>, Question) {
+    let text = words::dismiss_all_question(count).trim_end().to_string();
+    let rows = crate::upgrade_dialog::wrap(&text, width.saturating_sub(2).max(1));
+    let lines = rows
+        .iter()
+        .map(|row| Line::styled(format!("  {row}"), heading()))
+        .collect();
+    let question = if iw.asks() {
+        rows.into_iter().enumerate().collect()
+    } else {
+        Vec::new()
+    };
+    (lines, question)
+}
+
+/// The hints under the body; `overflow`: the body is longer than its room.
+fn hints(iw: &InterruptedWork, overflow: bool) -> String {
     let lower = |word: &str| word.to_lowercase();
+    let scroll = if overflow { " · j/k scroll" } else { "" };
     match &iw.view {
         View::List => {
             let mut parts = Vec::new();
@@ -1276,12 +1485,12 @@ fn hints(iw: &InterruptedWork) -> String {
             format!("  {}", parts.join(" · "))
         }
         View::Reclaim { .. } if iw.asks() => {
-            format!("  y {} · n back", lower(words::RECLAIM_ACTION))
+            format!("  y {} · n back{scroll}", lower(words::RECLAIM_ACTION))
         }
         View::DismissAll { .. } if iw.asks() => {
-            format!("  y {} · n back", lower(words::DISMISS_ALL_ACTION))
+            format!("  y {} · n back{scroll}", lower(words::DISMISS_ALL_ACTION))
         }
-        View::Reclaim { .. } | View::DismissAll { .. } => "  Esc back".to_string(),
+        View::Reclaim { .. } | View::DismissAll { .. } => format!("  Esc back{scroll}"),
     }
 }
 
@@ -1301,7 +1510,7 @@ pub(super) fn render_overlay(
     let (body, selected_rows, question) = match &iw.view {
         View::List => {
             let (body, selected) = list_body(iw, width);
-            (body, selected, None)
+            (body, selected, Vec::new())
         }
         View::Details {
             id, show, asked, ..
@@ -1310,26 +1519,28 @@ pub(super) fn render_overlay(
             let body = item
                 .map(|item| details_body(item, show.as_deref(), *asked, width))
                 .unwrap_or_default();
-            (body, None, None)
+            (body, None, Vec::new())
         }
-        View::Reclaim { id, dry } => {
+        View::Reclaim { id, dry, .. } => {
             let (body, question) = reclaim_body(iw, id, dry.as_ref(), width);
             (body, None, question)
         }
-        View::DismissAll { ids } => {
-            let question = words::dismiss_all_question(ids.len())
-                .trim_end()
-                .to_string();
-            let body = vec![Line::styled(format!("  {question}"), heading())];
-            let question = iw.asks().then_some((0, question));
+        View::DismissAll { ids, .. } => {
+            let (body, question) = dismiss_all_body(iw, ids.len(), width);
             (body, None, question)
         }
     };
+    // Every message is drawn escaped, whichever path it took here.
     let message: Vec<Line<'static>> = match (&iw.view, &iw.message) {
-        (View::List, Some(message)) => wrapped(message, width, "  ", notice()),
+        (View::List, Some(message)) => wrapped(&clean(message), width, "  ", notice()),
+        (
+            View::Details {
+                failed: Some(why), ..
+            },
+            _,
+        ) => wrapped(&clean(why), width, "  ", notice()),
         _ => Vec::new(),
     };
-    let hint = hints(iw);
     // A blank row, then the body, then a blank row, the message and the hint:
     // plus the border.
     let footer_height = message.len() + 2;
@@ -1348,8 +1559,9 @@ pub(super) fn render_overlay(
 
     let body_height =
         usize::from(inner.height).saturating_sub(footer_height.min(usize::from(inner.height)) + 1);
-    // Keep the selected item in view; the details scroll where the keys put
-    // them, up to their last screenful.
+    let last_screenful = body.len().saturating_sub(body_height);
+    // Keep the selected item in view; the details and the confirmations
+    // scroll where the keys put them, up to their last screenful.
     let scroll = match &mut iw.view {
         View::List => {
             if let Some((first, last)) = selected_rows {
@@ -1359,15 +1571,17 @@ pub(super) fn render_overlay(
                     iw.scroll = last + 1 - body_height.min(last + 1);
                 }
             }
-            iw.scroll = iw.scroll.min(body.len().saturating_sub(body_height));
+            iw.scroll = iw.scroll.min(last_screenful);
             iw.scroll
         }
-        View::Details { scroll, .. } => {
-            *scroll = (*scroll).min(body.len().saturating_sub(body_height));
+        View::Details { scroll, .. }
+        | View::Reclaim { scroll, .. }
+        | View::DismissAll { scroll, .. } => {
+            *scroll = (*scroll).min(last_screenful);
             *scroll
         }
-        View::Reclaim { .. } | View::DismissAll { .. } => 0,
     };
+    let hint = hints(iw, body.len() > body_height);
     let shown: Vec<Line<'static>> = body.into_iter().skip(scroll).take(body_height).collect();
     let mut lines = vec![Line::from("")];
     lines.extend(shown);
@@ -1395,18 +1609,24 @@ pub(super) fn render_overlay(
     );
 
     // The y/n question: the confirmation's one choice, counted only once a
-    // flushed frame shows it (`refuse_undrawn_choice`).
-    let confirmation = question.map(|(at, text)| {
-        let row = (at < body_height)
-            .then(|| u16::try_from(at + 1).ok())
-            .flatten()
-            .and_then(|r| inner.y.checked_add(r));
+    // flushed frame shows every row of it (`refuse_undrawn_choice`); a row
+    // scrolled out of the body is not shown.
+    iw.question_rows = question.len();
+    let confirmation = (!question.is_empty()).then(|| {
+        let cells = question
+            .into_iter()
+            .map(|(at, text)| {
+                let row = at
+                    .checked_sub(scroll)
+                    .filter(|shown_at| *shown_at < body_height)
+                    .and_then(|shown_at| u16::try_from(shown_at + 1).ok())
+                    .and_then(|r| inner.y.checked_add(r));
+                (inner.x + 2, row, text)
+            })
+            .collect();
         ConfirmDrawing {
             buttons: Vec::new(),
-            choices: ConfirmChoices {
-                inner,
-                cells: vec![(inner.x + 2, row, text)],
-            },
+            choices: ConfirmChoices { inner, cells },
         }
     });
     let close_row = Rect::new(
@@ -1448,9 +1668,10 @@ pub(super) fn seam_sent(ui: &UiState) -> Vec<InterruptedSeamSent> {
         .collect()
 }
 
-/// The answer the L1 seam hands in for `step`: to the request at index
-/// `to` of the record, or else to the newest recorded request of the step's
-/// kind. `None` when there is no such request, or `step` is no answer.
+/// The answer the L1 seam hands in for `step`, tagged as the daemon would
+/// tag it: to the request at index `to` of the record, or else to the newest
+/// recorded request of the step's kind. `None` when there is no such
+/// request, or `step` is no answer.
 pub(super) fn seam_answer(
     ui: &UiState,
     to: Option<usize>,
@@ -1468,7 +1689,7 @@ pub(super) fn seam_answer(
         Some(index) => log.get(index)?,
         None => log.iter().rev().find(wanted)?,
     };
-    let seq = recorded.seq;
+    let tag = recorded.tag;
     let (id, dry_run) = match &recorded.sent.request {
         InterruptedSeamRequest::Show { id, .. } => (id.clone(), false),
         InterruptedSeamRequest::Reclaim { id, dry_run } => (id.clone(), *dry_run),
@@ -1481,38 +1702,44 @@ pub(super) fn seam_answer(
         }
         match recorded.sent.request.kind() {
             InterruptedSeamKind::List => Answer::Listed {
-                seq,
+                tag,
                 result: none(&result),
             },
             InterruptedSeamKind::Show => Answer::Shown {
+                tag,
                 id: id.clone(),
                 result: none(&result),
             },
             InterruptedSeamKind::Reclaim => Answer::Reclaimed {
+                tag,
                 id: id.clone(),
                 dry_run,
                 result: none(&result),
             },
             InterruptedSeamKind::Dismiss => Answer::Dismissed {
+                tag,
                 result: none(&result),
             },
         }
     };
     Some(match step {
         InterruptedSeamStep::Listed(list) => Answer::Listed {
-            seq,
+            tag,
             result: Ok(Some(list.clone())),
         },
         InterruptedSeamStep::Shown(show) => Answer::Shown {
+            tag,
             id,
             result: Ok(Some(show.clone())),
         },
         InterruptedSeamStep::Reclaimed(outcome) => Answer::Reclaimed {
+            tag,
             id,
             dry_run: outcome.dry_run,
             result: Ok(Some(outcome.clone())),
         },
         InterruptedSeamStep::Dismissed(outcome) => Answer::Dismissed {
+            tag,
             result: Ok(Some(outcome.clone())),
         },
         InterruptedSeamStep::Failed(_, message) => failed(Err(message.clone())),

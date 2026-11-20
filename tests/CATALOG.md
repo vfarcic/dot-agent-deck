@@ -692,7 +692,7 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 - **Layer:** L1 in-process `TestBackend` + `insta` (`tests/render_interrupted_work.rs`, seam `render_interrupted_work_to_buffers`): the daemon's answers are handed to the TUI where its background request delivers them, and keys go through the production `handle_key_event`.
 - **Agent:** none.
 - **Asserts:** `D` shows `Dismiss all: 3 interrupted items from before the restart? [y/N]` (snapshot) and `n` returns to the list; `d` and the daemon's answer show `Dismissed.`, and the refreshed list drops the unit and counts two.
-- **Does not assert:** `y` on dismiss all (the same dismissal path, naming every listed id); refusals.
+- **Does not assert:** `y` on dismiss all (`journal/interrupted/024`, `025`); refusals.
 - **Platform coverage:** mac+linux.
 
 ##### journal/interrupted/013 — The TUI's restart notice list leads to the interrupted work list with the same key.
