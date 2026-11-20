@@ -514,14 +514,34 @@ fn plain_dashboard_shows(grid: &str, labels: &[&str]) -> bool {
         && grid.matches('┌').count() + grid.matches('┏').count() == labels.len()
         && grid.matches('└').count() + grid.matches('┗').count() == labels.len()
         && grid.matches("Launch an agent to get started").count() == labels.len()
-        && grid
-            .lines()
-            .any(|line| line.starts_with(" COMMAND  [Back to Pane d/Ctrl+D]"))
-        // Each context button on its own: where the bar wraps depends on how
-        // many buttons precede them (PRD #312 removed one), not on this test.
-        && ["[Filter /]", "[Rename r]", "[Generate g]", "[Schedules s]"]
-            .iter()
-            .all(|button| grid.contains(button))
+        && bottom_bar_shows_in_order(
+            grid,
+            &["[Filter /]", "[Rename r]", "[Generate g]", "[Schedules s]"],
+        )
+}
+
+/// The command-mode button bar, read from its ` COMMAND ` line to the bottom
+/// of the grid (the rows it wraps onto), carries `buttons` in this order.
+/// Joining the bar's rows rather than matching one row keeps the check about
+/// the bar and not about where it happens to wrap, which moves whenever a
+/// button is added or removed (PRD #312 removed one).
+fn bottom_bar_shows_in_order(grid: &str, buttons: &[&str]) -> bool {
+    let lines: Vec<&str> = grid.lines().collect();
+    let Some(start) = lines
+        .iter()
+        .position(|line| line.starts_with(" COMMAND  [Back to Pane d/Ctrl+D]"))
+    else {
+        return false;
+    };
+    let bar = lines[start..].join(" ");
+    let mut rest = bar.as_str();
+    buttons.iter().all(|button| match rest.find(button) {
+        Some(at) => {
+            rest = &rest[at + button.len()..];
+            true
+        }
+        None => false,
+    })
 }
 
 /// Send the plain `StartAgent` shape built by the desktop action. The explicit
