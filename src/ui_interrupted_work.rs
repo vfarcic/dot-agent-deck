@@ -189,9 +189,12 @@ pub(super) struct InterruptedWork {
     list_op: Option<u64>,
     /// The report request the open details wait for.
     show_op: Option<u64>,
-    /// How many rows the y/n question took when it was last drawn; `y`
-    /// counts only once a frame showed every one of them.
-    question_rows: usize,
+    /// The rows of the y/n question as last drawn, each with whether a
+    /// flushed frame has shown it whole since the question appeared: `y`
+    /// counts only once every row has been seen, though not necessarily all
+    /// in one frame, so a question taller than the popup can be scrolled
+    /// through and then answered. Re-wrapped rows (a resize) start unseen.
+    question_seen: Vec<(String, bool)>,
     /// The L1 seam's record of every request sent, in order; `None` in
     /// production, where each is sent to the daemon instead.
     recorder: Option<Vec<Recorded>>,
@@ -224,7 +227,7 @@ impl Default for InterruptedWork {
             pending: None,
             list_op: None,
             show_op: None,
-            question_rows: 0,
+            question_seen: Vec::new(),
             recorder: None,
             tx,
             rx,
@@ -600,6 +603,7 @@ pub(super) fn apply(ui: &mut UiState, answer: Answer) {
                         }
                         // A question that just appeared waits for its own frame.
                         ui.confirm_choices_drawn = None;
+                        iw.question_seen.clear();
                     }
                     Ok(None) => {
                         iw.message = Some(words::UNSUPPORTED.to_string());
@@ -693,11 +697,23 @@ pub(super) fn asks(ui: &UiState) -> bool {
     ui.mode == UiMode::InterruptedWork && ui.interrupted.asks()
 }
 
-/// Whether the frame that recorded `shown` drew every row of the open
-/// view's y/n question.
-pub(super) fn question_shown(ui: &UiState, shown: ChoicesShown) -> bool {
-    let rows = ui.interrupted.question_rows;
-    rows > 0 && (0..rows).all(|row| shown.contains(row))
+/// Whether flushed frames have shown every row of the open view's y/n
+/// question since it appeared, whether in one frame or over several as it
+/// was scrolled through.
+pub(super) fn question_shown(ui: &UiState) -> bool {
+    let seen = &ui.interrupted.question_seen;
+    !seen.is_empty() && seen.iter().all(|(_, seen)| *seen)
+}
+
+/// Read the y/n question's rows back from the frame as flushed: each row it
+/// shows whole counts as seen from now on (`question_seen`).
+pub(super) fn record_question(ui: &mut UiState, choices: &ConfirmChoices, flushed: &Buffer) {
+    let seen = &mut ui.interrupted.question_seen;
+    for ((x, row, text), (drawn, was_seen)) in choices.cells.iter().zip(seen.iter_mut()) {
+        if drawn == text && row.is_some_and(|y| choices.intact(*x, y, text, flushed)) {
+            *was_seen = true;
+        }
+    }
 }
 
 /// Keys while the overlay is up. Ctrl+C keeps its PRD #40 safety net.
@@ -841,6 +857,7 @@ pub(super) fn press(ui: &mut UiState, press: Press) {
                     iw.view = View::DismissAll { ids, scroll: 0 };
                     // A question that just appeared waits for its own frame.
                     ui.confirm_choices_drawn = None;
+                    ui.interrupted.question_seen.clear();
                 }
             }
             _ => {}
@@ -1611,7 +1628,18 @@ pub(super) fn render_overlay(
     // The y/n question: the confirmation's one choice, counted only once a
     // flushed frame shows every row of it (`refuse_undrawn_choice`); a row
     // scrolled out of the body is not shown.
-    iw.question_rows = question.len();
+    let same_rows = iw.question_seen.len() == question.len()
+        && iw
+            .question_seen
+            .iter()
+            .zip(&question)
+            .all(|((seen, _), (_, text))| seen == text);
+    if !same_rows {
+        iw.question_seen = question
+            .iter()
+            .map(|(_, text)| (text.clone(), false))
+            .collect();
+    }
     let confirmation = (!question.is_empty()).then(|| {
         let cells = question
             .into_iter()

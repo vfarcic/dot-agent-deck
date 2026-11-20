@@ -19718,6 +19718,9 @@ fn draw_modal(frame: &mut Frame, area: Rect, ui: &mut UiState) {
 fn record_flushed_confirmation(ui: &mut UiState, flushed: &Buffer) {
     ui.confirm_choices_drawn = match ui.confirm_drawing.take() {
         Some((mode, drawing)) => {
+            if mode == UiMode::InterruptedWork {
+                interrupted_work_view::record_question(ui, &drawing.choices, flushed);
+            }
             let (shown, buttons) = drawing.read_back(flushed);
             ui.modal_button_rects = buttons;
             Some((mode, shown))
@@ -21946,12 +21949,13 @@ fn refuse_undrawn_choice(key: &KeyEvent, ui: &UiState) -> Option<Action> {
             let refused = key.code == KeyCode::Char('a') && !shown.contains(0);
             return refused.then_some(Action::Continue);
         }
-        // PRD #1790 stage 2: reclaim's and dismiss all's `y` only once a
-        // frame showed every row of the question.
+        // PRD #1790 stage 2: reclaim's and dismiss all's `y` only once
+        // flushed frames showed every row of the question, in one frame or
+        // over several as it was scrolled through.
         UiMode::InterruptedWork => {
             let refused = interrupted_work_view::asks(ui)
                 && matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y'))
-                && !interrupted_work_view::question_shown(ui, shown);
+                && !interrupted_work_view::question_shown(ui);
             return refused.then_some(Action::Continue);
         }
         _ => {}
