@@ -30,7 +30,7 @@ const COPIED = [
   "REFUSED_STILL_IN_USE", "REFUSED_IN_USE_UNKNOWN", "REFUSED_NOT_RECORDED", "REFUSED_UNKNOWN",
   "NOTHING_INTERRUPTED", "LIST_INCOMPLETE", "LABEL_ISSUE", "LABEL_BRANCH", "LABEL_WORKTREE", "LABEL_FOLDER", "LABEL_STARTED_BY", "LABEL_LAST_ENTRY",
   "LABEL_GIT", "LABEL_REPORT", "LABEL_PROGRESS", "ITEM_CUT", "LABEL_NESTED_WORKTREE", "REPORT_CUT", "REPORT_UNREADABLE", "NOTHING_DISMISSED",
-  "UNSUPPORTED", "DAEMON_FAILED",
+  "UNSUPPORTED", "DAEMON_FAILED", "DISMISS_STOPPED_REPLACED", "DISMISS_STOPPED_FAILED",
 ] as const;
 
 describe("the interrupted work wording", () => {
@@ -88,6 +88,21 @@ describe("the interrupted work wording", () => {
     expect(words.dismissMessage({ dismissed: [{ id: "w" }], refused: [] })).toBe(words.DISMISSED);
     expect(words.dismissMessage({ dismissed: [], refused: [] })).toBe(words.NOTHING_DISMISSED);
     expect(words.dismissMessage({ dismissed: [], refused: [{ id: "w", refusal: { reason: "not-listed", message: "" } }] })).toBe(words.REFUSED_NOT_LISTED);
+  });
+
+  /** Scenario: Dismiss all over more items than one request names is sent in batches by the app's bridge; when a later batch stops — the daemon replaced, no answer, or refused — the sentence after "Dismissed." says how many more items were or may not have been dismissed and why, as the TUI and the CLI say it. */
+  it("says why a dismissal sent in batches stopped, as the Rust helper does", () => {
+    const done = { dismissed: [{ id: "w" }], refused: [] };
+    expect(words.dismissMessage({ ...done, stopped: { reason: "replaced", not_sent: 1 } })).toBe(`${words.DISMISSED} 1 more item may not have been dismissed: ${words.DISMISS_STOPPED_REPLACED}`);
+    expect(words.dismissMessage({ ...done, stopped: { reason: "failed", not_sent: 3 } })).toBe(`${words.DISMISSED} 3 more items may not have been dismissed: ${words.DISMISS_STOPPED_FAILED}`);
+    expect(words.dismissMessage({ ...done, stopped: { reason: "refused", refusal: "unreadable", not_sent: 257 } })).toBe(`${words.DISMISSED} 257 more items were not dismissed. ${words.REFUSED_UNREADABLE}`);
+    expect(words.dismissMessage({ ...done, stopped: { reason: "a-newer-reason", not_sent: 1 } })).toBe(`${words.DISMISSED} 1 more item was not dismissed.`);
+    expect(rust).toContain('"1 more item may not have been dismissed"');
+    expect(rust).toContain('"more items may not have been dismissed"');
+    expect(rust).toContain('"1 more item was not dismissed"');
+    expect(rust).toContain('"more items were not dismissed"');
+    expect(rust).toContain('format!("{lead}: {DISMISS_STOPPED_REPLACED}")');
+    expect(rust).toContain('format!("{lead}: {DISMISS_STOPPED_FAILED}")');
   });
 
   /** Scenario: daemon-supplied text carrying C0 and C1 controls and bidi formatting characters is shown with each written as its escape, as the CLI and the TUI show it, and a long value is cut to 300 characters with an ellipsis. */
