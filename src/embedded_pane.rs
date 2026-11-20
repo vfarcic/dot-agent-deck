@@ -2964,6 +2964,11 @@ const _: () = assert!(
 /// writes nothing to a pane, so the daemon answers it at once.
 const POST_MESSAGE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// PRD #2119: how long the TUI waits for a Generate config answer — the
+/// desktop app's budget (`DECK_REPLY_TIMEOUT`), so both clients give up at the
+/// same moment and say the same sentence when they do.
+const GENERATE_CONFIG_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Bounded wait for the `attach` RPC inside `create_stream_pane`. Same
 /// rationale as [`HYDRATE_ATTACH_TIMEOUT`]: a single attach round-trip is
 /// well under a millisecond on a healthy daemon; capping at three seconds
@@ -5532,6 +5537,43 @@ impl PaneController for EmbeddedPaneController {
         }
     }
 
+    fn generate_config(
+        &self,
+        pane: &BoundPane,
+        expected_agent_id: Option<&str>,
+    ) -> Result<GatedQuery<String>, PaneError> {
+        // PRD #2119: bound exactly as `post_message` binds a post — to the
+        // process the card was learned from — and to the agent the caller
+        // asked about, captured when its confirmation opened. Without one,
+        // the agent this controller attached, only when that attach is the
+        // card's own (PR #1817).
+        let pane_id = pane.pane_id.as_str();
+        let client = self.held_client(pane);
+        let agent_id = match expected_agent_id {
+            Some(agent) => Some(agent.to_owned()),
+            None => match self.local_pane_for(pane) {
+                LocalPaneFor::Card => self.pane_attachment(pane_id).map(|a| a.agent_id),
+                LocalPaneFor::Other | LocalPaneFor::None => None,
+            },
+        };
+        let reply = self.runtime.block_on(async move {
+            tokio::time::timeout(
+                GENERATE_CONFIG_TIMEOUT,
+                client.generate_config(pane_id, agent_id.as_deref()),
+            )
+            .await
+        });
+        // The shared client error's own words, unwrapped, so the TUI and the
+        // desktop app show the same failure sentence for the same cause.
+        match reply {
+            Ok(Ok(answer)) => Ok(answer),
+            Ok(Err(e)) => Err(PaneError::Client(e)),
+            Err(_) => Err(PaneError::Client(ClientError::TimedOut(
+                GENERATE_CONFIG_TIMEOUT,
+            ))),
+        }
+    }
+
     fn project_trust_state(
         &self,
         dir: &str,
@@ -7953,6 +7995,9 @@ mod incarnation_binding_tests {
                         crate::inbox_hub::PostOrigin::ConfigGen
                     )
                 )
+            }),
+            ("generate", "generate-config", |c, card| {
+                format!("{:?}", c.generate_config(card, None))
             }),
             ("press", "inbox-retry", |c, card| {
                 c.inbox_action_sender()

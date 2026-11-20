@@ -1,0 +1,28 @@
+---
+source: src/ui.rs
+expression: dialog
+---
+ dot-agent-deck — 1 agent(s)
+┏ ▸ 1 No agent · pane-config… ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ ● No agent ┓
+┃Dir:  project-on-the-daemon                                            ┃
+┃Launch an agent to get started                                         ┃
+┃                                                                       ┃
+┃                                                                       ┃
+┃                                                                       ┃       ┌ Generate .dot-agent-deck.toml ───────────────────────────┐
+┃                                                                       ┃       │                                                          │
+┃                                                                       ┃       │  Want to instruct your agent to check this               │
+┃                                                                       ┃       │  project for .dot-agent-deck.toml and create it,         │
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Last: 0s  Tools: 0 ┛       │  or propose updates to it if it already exists?          │
+                                                                                │                                                          │
+                                                                                │  > Yes    — create or update config for this project     │
+                                                                                │    No     — skip for now                                 │
+                                                                                │                                                          │
+                                                                                │ [Yes] [No]                                               │
+                                                                                │  Up/Down: navigate  Enter: confirm  Esc: cancel          │
+                                                                                └──────────────────────────────────────────────────────────┘
+
+
+
+
+ 0 active  │  0 tools
+ COMMAND  [Command Mode Ctrl+D] [New Agent Ctrl+N] [Close Ctrl+W] [Toggle Layout Ctrl+T] [Help ?] [Quit Ctrl+C] [Filter /] [Rename r] [Generate g] [Schedules s]
