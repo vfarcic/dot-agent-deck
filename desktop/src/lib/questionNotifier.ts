@@ -39,7 +39,7 @@ export interface QuestionNotification {
 }
 
 /** The most keys the ledger keeps before forgetting the oldest. */
-export const QUESTION_NOTIFY_LEDGER_LIMIT = 1000;
+const QUESTION_NOTIFY_LEDGER_LIMIT = 1000;
 
 /** The body's longest length, in characters, ellipsis included. */
 export const QUESTION_NOTIFY_BODY_LIMIT = 120;
@@ -48,7 +48,7 @@ export const QUESTION_NOTIFY_BODY_LIMIT = 120;
 export type QuestionNotifyLedger = Set<string>;
 
 /** The ledger key for one question on one agent of one daemon. */
-export function questionNotifyKey(question: Pick<WaitingQuestion, "deckId" | "agentId" | "questionId">): string {
+function questionNotifyKey(question: Pick<WaitingQuestion, "deckId" | "agentId" | "questionId">): string {
   return JSON.stringify([question.deckId, question.agentId, question.questionId]);
 }
 

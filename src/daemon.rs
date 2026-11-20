@@ -1992,6 +1992,11 @@ async fn ingest_hook_event(
     }
     let event_type = event.event_type.clone();
     let claimed_pane = event.pane_id.clone();
+    // Issue #2347: a dropped prompt's report the guard refuses is expected,
+    // and logged there; it says nothing about the token's generation. One
+    // the generation re-check refused still warns (PR #2405 review).
+    let prompt_not_taken = event.prompt_not_taken().is_some();
+    let generation_replaced = std::sync::atomic::AtomicBool::new(false);
     let ingested = ingest_event_unless(
         state,
         event_tx,
@@ -1999,10 +2004,16 @@ async fn ingest_hook_event(
         event,
         unproven,
         attested_agent.as_deref(),
-        |_| replaced(),
+        |_| {
+            let stale = replaced();
+            generation_replaced.store(stale, std::sync::atomic::Ordering::Relaxed);
+            stale
+        },
     )
     .await;
-    if !ingested {
+    if !ingested
+        && (!prompt_not_taken || generation_replaced.load(std::sync::atomic::Ordering::Relaxed))
+    {
         // Qodo, PR #1559: logged like the gate's own refusals — the escaped
         // pane and a stable reason code, never the token — so a report the
         // under-lock re-check drops does not vanish without a trace.
@@ -2213,6 +2224,16 @@ where
             );
             return Ok(false);
         }
+    }
+    // Issue #2347: a witness's report that Claude Code dropped a prompt the
+    // deck's hook had reported ends only the turn that prompt started; any
+    // other such report is neither applied nor fanned out.
+    if !state.admit_prompt_not_taken(&event, unproven) {
+        debug!(
+            pane_id = ?event.pane_id.as_deref().map(escape_id_for_log),
+            "hook: a dropped prompt's report names no turn it started; not applied"
+        );
+        return Ok(false);
     }
     // Issue #770: half of the orphan verdict (and, round 3, all of the
     // no-live-agent one stamped below), asked of the registry UNDER the
@@ -6639,6 +6660,9 @@ async fn run_hook_loop_with_limits(
                                         ),
                                         one_shot_senders: crate::inbox_hub::ONE_SHOT_SENDERS
                                             .to_vec(),
+                                        prompt_not_taken: Some(
+                                            crate::event::PROMPT_NOT_TAKEN_REPORTS,
+                                        ),
                                         ..crate::event::InboxWaitReply::default()
                                     };
                                     if let Ok(json) = serde_json::to_string(&reply) {
@@ -7442,7 +7466,10 @@ async fn run_hook_loop_with_limits(
                                         ),
                                     };
                                     let task = signal.task.as_deref().unwrap_or_default();
-                                    let result = dispatch::handle_dispatch(
+                                    // PRD #468: `dispatch --dir` starts the unit
+                                    // in that existing directory instead of a
+                                    // new worktree.
+                                    let result = dispatch::handle_dispatch_at(
                                         &ctx,
                                         &signal.name,
                                         task,
@@ -7451,6 +7478,7 @@ async fn run_hook_loop_with_limits(
                                             command: signal.command.as_deref(),
                                             agent: signal.agent.as_deref(),
                                         },
+                                        signal.dir.as_deref(),
                                     )
                                     .await;
 
@@ -8059,11 +8087,20 @@ async fn run_hook_loop_with_limits(
                                     info!(
                                         pane_id = %escape_id_for_log(&req.pane_id),
                                         resolved_cwd = ?cwd,
+                                        dir = ?req.dir,
                                         "Received list-targets request"
                                     );
-                                    let resp = crate::dispatch::list_targets_response(
-                                        cwd.as_deref().map(std::path::Path::new),
-                                    );
+                                    // PRD #468: `--list-targets --dir <path>`
+                                    // lists that directory's targets, the config
+                                    // a `dispatch --dir <path>` resolves from.
+                                    let resp = match req.dir.as_deref() {
+                                        Some(dir) => {
+                                            crate::dispatch::list_targets_response_for_dir(dir)
+                                        }
+                                        None => crate::dispatch::list_targets_response(
+                                            cwd.as_deref().map(std::path::Path::new),
+                                        ),
+                                    };
                                     if let Ok(json) = serde_json::to_string(&resp) {
                                         let line = format!("{json}\n");
                                         if write_hook_reply(&mut write_half, &line, idle_timeout)
@@ -16278,6 +16315,7 @@ mod hook_ingestion_tests {
             token: Some(fx.orchestrator_token.clone()),
             command: None,
             agent: None,
+            dir: None,
         });
         let line = format!("{}\n", serde_json::to_string(&msg).unwrap());
         let mut stream = UnixStream::connect(&fx.sock).await.expect("connect");

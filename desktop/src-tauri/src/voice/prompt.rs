@@ -778,6 +778,7 @@ pub(crate) mod tests {
                 "remind_star_later".to_string(),
                 "dismiss_star_prompt".to_string(),
                 "stop_agent".to_string(),
+                "generate_config".to_string(),
                 "close_orchestration".to_string(),
                 "set_overview_mode".to_string(),
                 "show_agent_card".to_string(),

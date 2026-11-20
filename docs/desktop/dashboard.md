@@ -9,7 +9,7 @@ The Dashboard can also show each agent as a card that says what it reported, whe
 ## Check what is running
 
 1. Choose what to watch with the **Daemon** selector under the title: **All daemons**, **This machine** (the default on a fresh install), or one remote daemon. To add a daemon on another machine, choose **Add a daemon…** at the bottom of the selector ([Daemons](daemons.md#watch-a-daemon-on-another-machine)).
-2. Read the counters button at the top, beside **New agent**. It shows how many agents the daemons that answered are running, for example `7 agents`, and adds a count only when something needs you: amber `1 needs input`, red `1 failed`, and red `2/4 daemons` when some of the daemons shown have not answered. Hover over it, or click it, to see every count: **AGENTS**, **RUNNING**, **NEEDS INPUT**, **FAILED**, **WAITING**, **IDLE** and **GROUPS** count the agents on the daemons that answered, and **DAEMONS** reads `<answered>/<shown>`, for example `1/1` for one healthy daemon. When no daemon answered, the counts read `—`. After a click the list stays open until you click the button again, press `Esc` or click elsewhere; with voice on, "show the counters" opens it ([Voice Control → Checking the counters](voice.md#checking-the-counters)). In a window narrower than 1240 pixels the button shows its numbers without the words. The TUI's dashboard shows the same counts on one line.
+2. Read the counters button at the top, beside **New agent**. It shows how many agents the daemons that answered are running, for example `7 agents`, and adds a count only when something needs you: amber `1 needs input`, red `1 error`, and red `2/4 daemons` when some of the daemons shown have not answered. Hover over it, or click it, to see every count: **AGENTS**, **WORKING**, **THINKING**, **COMPACTING**, **NEEDS INPUT**, **ERROR**, **WAITING**, **IDLE** and **GROUPS** count the agents on the daemons that answered, and **DAEMONS** reads `<answered>/<shown>`, for example `1/1` for one healthy daemon. When no daemon answered, the counts read `—`. After a click the list stays open until you click the button again, press `Esc` or click elsewhere; with voice on, "show the counters" opens it ([Voice Control → Checking the counters](voice.md#checking-the-counters)). In a window narrower than 1240 pixels the button shows its numbers without the words. The TUI's dashboard shows the same counts on one line.
 3. Read the rows. Each daemon has its own section (below); press **Refresh** to reconnect to the daemons and read their agent lists again. When there are more daemons and agents than fit the window, a scrollbar stays on the right edge: its length shows how much of the dashboard is on screen and its position shows where you are. Scroll with the mouse, the trackpad or the keyboard, or, with voice on, [by voice](voice.md#scrolling-the-dashboard).
 
 ## One section per daemon
@@ -55,7 +55,7 @@ Dispatchers, schedule agents and schedule: issues agents are the agents started 
 
 An agent is shown when it matches everything you chose: the text, and one of the ticked entries in each list you ticked something in. For example, ticking **Working** and **Thinking** under Status and **Codex** under Agent type shows the Codex agents that are working or thinking.
 
-While a filter is set, a line under the header says how much of the fleet you are looking at, for example `Showing 4 of 11 agents · Working · Dispatchers`. Each part of the filter has its own remove control on that line, and **Show all** clears the whole filter in one click. The counters in the header (**AGENTS**, **RUNNING**, **NEEDS INPUT**, **FAILED**, **WAITING**, **IDLE**, **GROUPS** and **DAEMONS**) always count the whole fleet, not only the agents the filter shows.
+While a filter is set, a line under the header says how much of the fleet you are looking at, for example `Showing 4 of 11 agents · Working · Dispatchers`. Each part of the filter has its own remove control on that line, and **Show all** clears the whole filter in one click. The counters in the header (**AGENTS**, **WORKING**, **THINKING**, **COMPACTING**, **NEEDS INPUT**, **ERROR**, **WAITING**, **IDLE**, **GROUPS** and **DAEMONS**) always count the whole fleet, not only the agents the filter shows.
 
 A daemon none of whose agents match shows one line in its place, for example `build-box: no matching agents`, and so does an orchestration or other group with no matching agents, so nothing disappears without a word.
 
@@ -65,16 +65,17 @@ The filter stays while you move between screens and lasts until you clear it or 
 
 ## Statuses
 
-The desktop app shows six statuses. Each covers one or more of the words the TUI shows on its cards:
+The desktop app shows a status in the same word the TUI's cards use, on the table, the cards, the tiles and the counters:
 
-| Desktop | TUI | Meaning |
-| --- | --- | --- |
-| **RUNNING** | Thinking, Working, Compacting | The agent is busy. An agent that has reported no status at all yet, for example a plain shell or an agent whose hooks are not installed, also shows **RUNNING**. |
-| **NEEDS INPUT** | Needs Input | The agent is waiting for you: a permission answer or other input. Answer it in its pane, or from the app or by voice when the deck knows the question; its row then shows `QUESTION` and how long it has waited, and the app sends one notification once it has waited 10 minutes ([When a question waits](../session-management.md#when-a-question-waits)). |
-| **WAITING** | Waiting | The agent's turn ended while a command it started in that turn is still running. Its mark is hollow, in **RUNNING**'s colour: its work is not finished, but nothing needs you. It turns **IDLE** when the command ends. Open its pane to see what is still running ([Work left running after a turn](../session-management.md#work-left-running-after-a-turn)). |
-| **IDLE** | Idle | The agent finished its turn and is waiting for its next prompt. Commands it left running from an earlier turn, and subagents it left running, keep it **IDLE**; open its pane to see what is still running. A status this build does not recognise, from a newer daemon, also shows **IDLE**, as it does in the TUI. |
-| **error** (counted under **FAILED**) | Error | Something went wrong, including a message the deck could not deliver. Read the notice and open the pane. |
-| **BLOCKED** | Blocked | The agent's provider refused it because a usage limit or credit pool is exhausted. Open the agent's pane to see which limit, and when it resets if the provider says. |
+| Status | Meaning |
+| --- | --- |
+| **THINKING**, **WORKING**, **COMPACTING** | The agent is busy: reasoning, running a tool, or compacting its conversation. |
+| **NEEDS INPUT** | The agent is waiting for you: a permission answer or other input. Answer it in its pane, or from the app or by voice when the deck knows the question; its row then shows `QUESTION` and how long it has waited, and the app sends one notification once it has waited 10 minutes ([When a question waits](../session-management.md#when-a-question-waits)). |
+| **WAITING** | The agent's turn ended while a command it started in that turn is still running. Its mark is hollow, in **WORKING**'s colour: its work is not finished, but nothing needs you. It turns **IDLE** when the command ends. Open its pane to see what is still running ([Work left running after a turn](../session-management.md#work-left-running-after-a-turn)). |
+| **IDLE** | The agent finished its turn and is waiting for its next prompt. Commands it left running from an earlier turn, and subagents it left running, keep it **IDLE**; open its pane to see what is still running. A status this build does not recognise, from a newer daemon, also shows **IDLE**, as it does in the TUI. |
+| **ERROR** | Something went wrong, including a message the deck could not deliver. Read the notice and open the pane. |
+| **BLOCKED** | The agent's provider refused it because a usage limit or credit pool is exhausted. Open the agent's pane to see which limit, and when it resets if the provider says. |
+| **RUNNING** | The agent has reported no status at all yet, for example a plain shell or an agent whose hooks are not installed. The counters do not count it under a status, only under **AGENTS**. |
 
 What each status means, and which agents can report Blocked, is on [Session Management → Session Statuses](../session-management.md#session-statuses). An agent that stays **RUNNING** when it is clearly idle usually has no hooks reporting to the daemon; see [Troubleshooting → Hooks](../troubleshooting.md#hooks).
 
@@ -98,6 +99,8 @@ To watch or talk to one agent:
 4. To copy the agent's output, drag across it with the mouse. Some agents, such as Codex, OpenCode and Claude Code in its fullscreen mode, handle the mouse themselves: they highlight what you drag across and copy it when you release the button, so the text is on your clipboard with nothing more to press. Otherwise the terminal highlights the text, and you copy it with your system's copy key: `⌘C` on macOS, `Ctrl+Shift+C` on Linux, and `Ctrl+C` or `Ctrl+Shift+C` on Windows. On Windows, `Ctrl+C` copies only while text is highlighted and then clears the highlight, so pressing it again interrupts the agent. On macOS and Linux, plain `Ctrl+C` always goes to the agent as an interrupt, even while text is highlighted.
 5. Press **Back to dashboard**, or `Escape` when you are not typing in the terminal, to close the pane. The agent keeps running.
 
+To ask the agent to write the project's `.dot-agent-deck.toml`, press **Generate config** in the pane's header, which reads **Update config** when the project already has one ([Generate a config with an agent](#generate-a-config-with-an-agent)).
+
 To end the agent instead, press the red **Close agent** button with the stop icon in the pane's header. The same `Close <name>?` confirmation as on the Dashboard asks before stopping it. **Cancel** (or `Escape`) leaves the agent and its pane open; confirming stops that agent and returns you to the Dashboard. For an orchestration role, the confirmation warns that this closes just that role: the other roles keep running, leaving the orchestration one role short. To close the whole orchestration, return to the Dashboard and use **Close** on its group header.
 
 With voice on and typing mode off, say **"stop"**, **"stop it"**, **"stop that"** or **"close this agent"** on its own to open that confirmation; you still confirm by hand. In typing mode, "stop" interrupts the agent's turn instead of ending its session. Say "typing off" before asking to close the agent. See [Voice Control](voice.md#interrupt-clear-and-scratch-that). In the TUI, enter command mode (`Ctrl+D`), select the agent's card on the dashboard and press `Ctrl+W`, then choose **Close**. On an orchestration tab, that key asks to close the whole orchestration instead.
@@ -110,7 +113,7 @@ The pane's header is one line. It names the agent by the name its row shows, whi
 
 Between the header and the terminal, the pane shows the agent's assignment and two readings: **TIME**, how long the agent has been running (hover it for the exact time it started), and **TOOLS**, how many tool calls it has reported. TIME reads `—` when the daemon did not say when it started the agent.
 
-![An agent's full-window pane: its one-line header reads Desktop implementation, codex in muted text, and Running, with a red Close agent stop-icon button and a separate Back to dashboard cross in the header; its assignment, readings and Terminal tab appear below, with the agent's live output](/img/agent-pane-desktop.png)
+![An agent's full-window pane: its one-line header reads Desktop implementation, codex in muted text, and Working, with a red Close agent stop-icon button and a separate Back to dashboard cross in the header; its assignment, readings and Terminal tab appear below, with the agent's live output](/img/agent-pane-desktop.png)
 
 What can go wrong in the pane:
 
@@ -154,6 +157,12 @@ To sign out, use [Settings → GitHub → Sign out of GitHub](settings.md#github
 ### In the TUI
 
 The TUI shows the same pull request on the agent's card, as `#1234` with a glyph for its state and its review on the card's bottom border (see [Session Management → What a TUI card shows](../session-management.md#what-a-tui-card-shows)), and `o` opens the selected card's pull request in your system browser rather than inside the TUI. The desktop app has no `o` key, because it has no keyboard selection of a row: click the badge or say "open the PR for" and the agent's name instead.
+
+## Generate a config with an agent
+
+To have an agent write the project's `.dot-agent-deck.toml` for you, press **Generate config** on its row (the file icon, `Generate config with <name> agent`) or in the header of its pane, or, with voice on, say "generate config with" and the agent's name ("generate config" alone in its pane). The **Generate .dot-agent-deck.toml** dialog asks whether to instruct the agent to analyse the project and create one: **Yes** sends the request, **No** sends nothing. After **Yes** the agent's pane opens and shows `Config request sent to the agent's inbox.`, and the agent proposes a config in its pane and writes it once you approve. Pressing **No** while the dialog says `Sending…` closes it without taking the request back, and the app stays where you are. When the request cannot be sent, the Dashboard or the pane says why, for example `This daemon is too old to generate a config. Upgrade the daemon to use Generate config.` In the TUI, select the agent's card in command mode and press `g`.
+
+When the agent's project already has a `.dot-agent-deck.toml`, the button reads **Update config** (`Update config with <name> agent`), the dialog is titled **Update .dot-agent-deck.toml** and asks whether to instruct the agent to analyse the project and update the existing config, and "update config" works by voice as "generate config" does. The agent then reads the existing file and proposes changes to it, keeping what you wrote unless you agree to drop it, and edits it only after you approve. The TUI's footer shows `[Update g]` in the same case. When the deck can't tell whether the file exists, for example because the project is on a network drive that stopped answering, the button reads **Generate config** and the dialog asks whether to instruct the agent to check the project for `.dot-agent-deck.toml` and create it, or propose updates to it if it already exists, in both clients. [Orchestration → Quick setup](../orchestration.md#quick-setup) has the steps, the screenshots and what each message means.
 
 ## Closing agents and orchestrations
 

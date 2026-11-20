@@ -167,17 +167,22 @@ async fn restart_role(
     .await
 }
 
-/// Scenario: a worker stand-in exits on its own shortly after boot (M1 marks
-/// its record `crashed == Some(true)`), then the orchestrator pane calls the
-/// new restart handler with `force: false`. The role must come back: the
-/// response reports success with no error, a fresh agent id now owns the
-/// worker's pane, and the role registration survives — a subsequent
+/// Scenario: a worker stand-in exits on its own shortly after boot, on its
+/// first run only (M1 marks its record `crashed == Some(true)`), then the
+/// orchestrator pane calls the new restart handler with `force: false`. The
+/// role must come back: the response reports success with no error, a fresh,
+/// live agent id now owns the worker's pane, and the role registration survives — a subsequent
 /// `delegate_targets` lookup from the orchestrator still resolves `coder` to
 /// the same pane.
 #[tokio::test(flavor = "multi_thread")]
 #[spec("pane/restart/001")]
 async fn pane_restart_001_restarts_a_crashed_worker_and_role_stays_reachable() {
-    let fx = fixture("sleep 0.2").await;
+    // Crashes on its first run only: the restart respawns the role's
+    // configured command, and a replacement that also exited after 0.2 s
+    // could be gone before the live-agent check below reads the pane (a CI
+    // run under io starvation, after #2425's merge).
+    let fx =
+        fixture("sh -c '[ -e crashed-once ] && exec cat; touch crashed-once; sleep 0.2'").await;
 
     let crashed = wait_for_crashed(
         &fx.daemon.registry,

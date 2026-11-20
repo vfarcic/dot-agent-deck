@@ -55,7 +55,6 @@ pub enum Action {
     Dashboard,
     NewPane,
     ClosePane,
-    ToggleLayout,
     /// Toggle the deck-global command-entry lock — whether direct keystrokes
     /// reach a focused non-orchestrator role pane's PTY. Claimed only on an
     /// Orchestration tab in command mode (see `scope_orchestration_chord`).
@@ -131,8 +130,7 @@ pub struct ActionSpec {
 /// The `default` notations mirror the authoritative hardcoded checks in
 /// `src/ui.rs` as of this branch:
 /// - global Ctrl+ shortcuts: `Ctrl+d` (dashboard/command mode), `Ctrl+n`
-///   (new pane), `Ctrl+w` (close pane), `Ctrl+t` (toggle layout), `Ctrl+l`
-///   (toggle orchestration split), `Ctrl+z` (PRD #313: zoom the focused pane);
+///   (new pane), `Ctrl+w` (close pane), `Ctrl+l` (toggle orchestration split), `Ctrl+z` (PRD #313: zoom the focused pane);
 ///   `1`..`9` jump to a card. `Ctrl+z` is claimed ONLY in command mode, so in a
 ///   pane it still reaches the agent as `0x1a` job control — the same
 ///   command-mode-only narrowing `Ctrl+l` and `Ctrl+w` already use. (Quit is
@@ -162,13 +160,6 @@ pub const ACTIONS: &[ActionSpec] = &[
         name: "close_pane",
         default: "Ctrl+w",
         description: "Close agent",
-    },
-    ActionSpec {
-        action: Action::ToggleLayout,
-        section: Section::Global,
-        name: "toggle_layout",
-        default: "Ctrl+t",
-        description: "Toggle layout",
     },
     ActionSpec {
         action: Action::ToggleOrchestrationLock,
@@ -452,12 +443,12 @@ impl Action {
         self.spec().section
     }
 
-    /// Config key name (e.g. `"toggle_layout"`).
+    /// Config key name (e.g. `"new_pane"`).
     pub fn config_name(self) -> &'static str {
         self.spec().name
     }
 
-    /// Default key notation (e.g. `"Ctrl+t"`).
+    /// Default key notation (e.g. `"Ctrl+n"`).
     pub fn default_notation(self) -> &'static str {
         self.spec().default
     }
@@ -476,12 +467,31 @@ impl Action {
     }
 }
 
+/// Actions that existed once and were removed, as `(section, name, what to do
+/// instead)`. A config that still sets one keeps loading — the line is ignored
+/// like any unknown action — but its warning says the action is gone and why,
+/// rather than reading like a typo the user should go and correct.
+const REMOVED_ACTIONS: &[(Section, &str, &str)] = &[(
+    Section::Global,
+    "toggle_layout",
+    // PRD #312.
+    "the stacked/tiled layout toggle was removed: the focused agent always fills \
+     the pane column (zoom it with toggle_zoom, Ctrl+z by default); delete this line",
+)];
+
+/// The note for an action name that [`REMOVED_ACTIONS`] lists, if it does.
+fn removed_action_note(section: Section, name: &str) -> Option<&'static str> {
+    REMOVED_ACTIONS
+        .iter()
+        .find(|(s, n, _)| *s == section && *n == name)
+        .map(|(_, _, note)| *note)
+}
+
 /// The actions whose default `Ctrl+<letter>` chord also answers to the plain
 /// letter **in command mode** (PRD #1258): `d` (dashboard / back to the pane),
 /// `n` (new agent, unless the selected card is waiting for a permission answer,
-/// when `n` denies it as before), `w` (close, with its confirmation), `t`
-/// (layout), `e` (orchestration lock, gated exactly as `Ctrl+E`) and `z`
-/// (zoom). In a pane every letter still goes to the agent, and the chords keep
+/// when `n` denies it as before), `w` (close, with its confirmation), `e`
+/// (orchestration lock, gated exactly as `Ctrl+E`) and `z` (zoom). In a pane every letter still goes to the agent, and the chords keep
 /// working everywhere they did.
 ///
 /// Left out on purpose: the split toggle (`Ctrl+L`), because `l` is already
@@ -492,11 +502,10 @@ impl Action {
 /// while it is still on its default chord — a remapped action gets none — and
 /// only while no other action is bound to that letter. Deny permission's `n`
 /// is the one binding that shares a letter instead of taking it.
-pub const PLAIN_LETTER_ALIASES: [Action; 6] = [
+pub const PLAIN_LETTER_ALIASES: [Action; 5] = [
     Action::Dashboard,
     Action::NewPane,
     Action::ClosePane,
-    Action::ToggleLayout,
     Action::ToggleOrchestrationLock,
     Action::ToggleZoom,
 ];
@@ -901,11 +910,18 @@ impl KeybindingConfig {
         ] {
             for (name, notation) in table {
                 let Some(action) = Action::from_section_name(section, name) else {
-                    warnings.push(format!(
-                        "unknown keybinding action '[{}] {}' — ignored",
-                        section.as_str(),
-                        name
-                    ));
+                    warnings.push(match removed_action_note(section, name) {
+                        Some(note) => format!(
+                            "keybinding action '[{}] {}' — ignored: {note}",
+                            section.as_str(),
+                            name
+                        ),
+                        None => format!(
+                            "unknown keybinding action '[{}] {}' — ignored",
+                            section.as_str(),
+                            name
+                        ),
+                    });
                     continue;
                 };
                 match parse_binding(notation) {
@@ -1342,7 +1358,7 @@ mod tests {
         assert_eq!(parse_binding("?").unwrap().notation(), "?");
         assert_eq!(parse_binding("").unwrap().notation(), "");
         let c = KeybindingConfig::default();
-        assert_eq!(c.notation(Action::ToggleLayout), "Ctrl+t");
+        assert_eq!(c.notation(Action::NewPane), "Ctrl+n");
         assert_eq!(c.notation(Action::Help), "?");
     }
 
@@ -1375,10 +1391,6 @@ mod tests {
         assert!(c.matches(
             Action::ClosePane,
             &ev(KeyCode::Char('w'), KeyModifiers::CONTROL)
-        ));
-        assert!(c.matches(
-            Action::ToggleLayout,
-            &ev(KeyCode::Char('t'), KeyModifiers::CONTROL)
         ));
         assert!(c.matches(Action::Jump1, &ev(KeyCode::Char('1'), KeyModifiers::NONE)));
         assert!(c.matches(Action::Jump9, &ev(KeyCode::Char('9'), KeyModifiers::NONE)));
@@ -1416,25 +1428,58 @@ mod tests {
     fn merge_user_override_wins_unspecified_keep_default() {
         let toml = r#"
 [global]
-toggle_layout = "Alt+Shift+l"
+new_pane = "Alt+Shift+l"
 "#;
         let (c, warnings) = KeybindingConfig::from_toml_str(toml).unwrap();
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         // overridden
         assert!(c.matches(
-            Action::ToggleLayout,
+            Action::NewPane,
             &ev(KeyCode::Char('l'), KeyModifiers::ALT | KeyModifiers::SHIFT)
         ));
         // old default no longer triggers it
         assert!(!c.matches(
-            Action::ToggleLayout,
-            &ev(KeyCode::Char('t'), KeyModifiers::CONTROL)
-        ));
-        // unspecified action keeps its default
-        assert!(c.matches(
             Action::NewPane,
             &ev(KeyCode::Char('n'), KeyModifiers::CONTROL)
         ));
+        // unspecified action keeps its default
+        assert!(c.matches(
+            Action::ClosePane,
+            &ev(KeyCode::Char('w'), KeyModifiers::CONTROL)
+        ));
+    }
+
+    /// PRD #312: a config written before the layout toggle was removed still
+    /// loads, and its warning says the action is gone and what replaces it
+    /// rather than reading like a typo. The rest of the file still applies.
+    #[test]
+    fn removed_toggle_layout_is_ignored_with_a_readable_warning() {
+        let toml = r#"
+[global]
+toggle_layout = "Alt+Shift+l"
+new_pane = "Alt+n"
+"#;
+        let (c, warnings) = KeybindingConfig::from_toml_str(toml).unwrap();
+        assert_eq!(warnings.len(), 1, "warnings: {warnings:?}");
+        let w = &warnings[0];
+        assert!(w.contains("[global] toggle_layout"), "{w}");
+        assert!(w.contains("removed"), "{w}");
+        assert!(w.contains("toggle_zoom"), "{w}");
+        // The zoom it points at is the default chord, which works from a pane
+        // too, not the command-mode-only plain letter.
+        assert!(w.contains("Ctrl+z by default"), "{w}");
+        assert!(!w.contains("unknown"), "{w}");
+        assert!(c.matches(Action::NewPane, &ev(KeyCode::Char('n'), KeyModifiers::ALT)));
+        // Nothing claims Ctrl+t any more.
+        assert_eq!(
+            c.action_for(&ev(KeyCode::Char('t'), KeyModifiers::CONTROL)),
+            None
+        );
+        // A removed name is only removed in its own section.
+        let (_, warnings) =
+            KeybindingConfig::from_toml_str("[dashboard]\ntoggle_layout = \"x\"\n").unwrap();
+        assert_eq!(warnings.len(), 1, "warnings: {warnings:?}");
+        assert!(warnings[0].contains("unknown"), "{warnings:?}");
     }
 
     #[test]
@@ -1724,13 +1769,13 @@ move_down = "k"
     fn invalid_notation_keeps_default_with_warning() {
         let toml = r#"
 [global]
-toggle_layout = "Banana"
+new_pane = "Banana"
 "#;
         let (c, warnings) = KeybindingConfig::from_toml_str(toml).unwrap();
         // default retained
         assert!(c.matches(
-            Action::ToggleLayout,
-            &ev(KeyCode::Char('t'), KeyModifiers::CONTROL)
+            Action::NewPane,
+            &ev(KeyCode::Char('n'), KeyModifiers::CONTROL)
         ));
         assert_eq!(warnings.len(), 1, "warnings: {warnings:?}");
         assert!(warnings[0].contains("invalid"));
@@ -1746,8 +1791,8 @@ toggle_layout = "Banana"
         let (c, warnings) = KeybindingConfig::from_toml_str("").unwrap();
         assert!(warnings.is_empty());
         assert!(c.matches(
-            Action::ToggleLayout,
-            &ev(KeyCode::Char('t'), KeyModifiers::CONTROL)
+            Action::NewPane,
+            &ev(KeyCode::Char('n'), KeyModifiers::CONTROL)
         ));
     }
 

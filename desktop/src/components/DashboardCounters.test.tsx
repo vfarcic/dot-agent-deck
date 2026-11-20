@@ -79,18 +79,18 @@ describe("the dashboard's counters button (issue #2312 follow-up)", () => {
 
   /** Scenario: the button reads the total and only what needs someone; with nothing to act on it reads the total alone. */
   it("names the total and what needs someone", () => {
-    expect(countersWords({ known: true, agents: 6, needsInput: 1, failed: 2, decksUp: 1, decksTotal: 2 })).toEqual({
+    expect(countersWords({ known: true, agents: 6, needsInput: 1, errors: 2, decksUp: 1, decksTotal: 2 })).toEqual({
       total: "6 agents", totalCount: "6", totalWord: "agents",
       alerts: [
         { count: "1", word: "needs input", text: "1 needs input", className: "count-needs-input" },
-        { count: "2", word: "failed", text: "2 failed", className: "count-failed" },
+        { count: "2", word: "error", text: "2 error", className: "count-error" },
         { count: "1/2", word: "daemons", text: "1/2 daemons", className: "count-failed" },
       ],
-      label: "6 agents, 1 needs input, 2 failed, 1/2 daemons",
+      label: "6 agents, 1 needs input, 2 error, 1/2 daemons",
     });
-    expect(countersWords({ known: true, agents: 1, needsInput: 0, failed: 0, decksUp: 1, decksTotal: 1 })).toMatchObject({ total: "1 agent", alerts: [], label: "1 agent" });
+    expect(countersWords({ known: true, agents: 1, needsInput: 0, errors: 0, decksUp: 1, decksTotal: 1 })).toMatchObject({ total: "1 agent", alerts: [], label: "1 agent" });
     // No daemon answering: the total is not known and is not a zero.
-    expect(countersWords({ known: false, agents: 0, needsInput: 0, failed: 0, decksUp: 0, decksTotal: 1 }).label).toBe("— agents, 0/1 daemons");
+    expect(countersWords({ known: false, agents: 0, needsInput: 0, errors: 0, decksUp: 0, decksTotal: 1 }).label).toBe("— agents, 0/1 daemons");
   });
 
   /** Scenario: on the fleet fixture the counters row is gone from the top bar; the button opens the popover with every counter on a click, and a second click, Escape and a press outside each close it. */
@@ -103,7 +103,7 @@ describe("the dashboard's counters button (issue #2312 follow-up)", () => {
     fireEvent.click(button());
     expect(button()).toHaveAttribute("aria-expanded", "true");
     expect(counters()).toHaveClass("is-open");
-    for (const name of ["agents", "running", "needs-input", "failed", "waiting", "idle", "groups", "decks"]) {
+    for (const name of ["agents", "working", "thinking", "compacting", "needs-input", "error", "waiting", "idle", "groups", "decks"]) {
       expect(screen.getByTestId("dashboard-counters-popover")).toContainElement(screen.getByTestId(`overview-count-${name}`));
     }
 

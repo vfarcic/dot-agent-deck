@@ -32,15 +32,10 @@ export type RunHealth = "healthy" | "attention" | "failed" | "idle";
 export type AgentStatus = "queued" | "running" | "needs_input" | "waiting" | "idle" | "passed" | "failed" | "stopped" | "blocked";
 
 /**
- * The words a status is shown as. Each is its own id except Needs input, whose
- * id cannot carry a space; the TUI's cards say Needs Input and Idle for the
- * same two states.
+ * The daemon's own status words (`DesktopAgentDto["status"]`), which `AgentStatus`
+ * merges. A status is SHOWN in these words (`statusWord` in `lib/statusWords.ts`,
+ * issue #2411), never in the merged column's.
  */
-export function statusLabel(status: AgentStatus): string {
-  return status === "needs_input" ? "needs input" : status;
-}
-
-/** The daemon's own status words (`DesktopAgentDto["status"]`), which `AgentStatus` merges. */
 export type DaemonAgentStatus = "running" | "thinking" | "working" | "compacting" | "waiting_for_input" | "waiting" | "idle" | "error" | "blocked" | "unknown";
 
 /**
@@ -164,6 +159,15 @@ export type InboxAttentionItem = {
 export type InboxActionVerb = "retry" | "cancel";
 /** PRD #1666 §2: the daemon's answer to Retry or Cancel. */
 export type InboxActionResult = { outcome: string };
+/**
+ * PRD #2119 — the answer to Generate config: `sent` once the agent's daemon
+ * posted the configuration request to its inbox, `unsupported` from a daemon
+ * too old to compose one (nothing was sent), or `failed`. `message` is the
+ * sentence to show, the same one the TUI shows for that outcome.
+ */
+export type GenerateConfigResult =
+  | { outcome: "sent"; messageId: string; message: string }
+  | { outcome: "unsupported" | "failed"; message: string };
 /**
  * Issue #1678: the background work an agent left running after its turn ended,
  * as the DAEMON counts it — commands still running in their own session and
@@ -1275,6 +1279,13 @@ export interface AgentSession {
    */
   pullRequest?: AgentPullRequest;
   /**
+   * HONEST. PRD #2119 — whether this agent's project already holds a
+   * `.dot-agent-deck.toml`, as its daemon reported it. `true` makes Generate
+   * config read Update config; `false` and absent (no cwd, or a daemon that
+   * predates the field) keep Generate. Never computed by this app.
+   */
+  projectConfigExists?: boolean;
+  /**
    * HONEST. Issue #1678: background work still running after the agent's turn
    * ended, copied from the daemon's aggregate and validated at the bridge.
    * Rendering goes through `displayBackgroundWork`, which words it exactly as
@@ -1854,6 +1865,13 @@ export interface DeckRuntimeState {
   decideUpgrade?: (upgradeId: string, questionId: number, choice: import("./lib/upgrade").UpgradeChoice) => Promise<void>;
   /** PRD #1666 §6.4: Retry or Cancel one listed deck message; absent where no daemon can answer. */
   inboxAction?: (target: AgentTarget, item: { paneId: string; messageId: string; revision: number }, verb: InboxActionVerb) => Promise<InboxActionResult>;
+  /**
+   * PRD #2119 — ask agent `agentId` in pane `paneId`, on the deck `deckId`
+   * names and as the daemon process `incarnation` that listed it, to generate
+   * the project's `.dot-agent-deck.toml`. Absent where no daemon can answer, and
+   * the screens then offer no Generate config.
+   */
+  generateConfig?: (deckId: string, agentId: string, paneId: string, incarnation?: string) => Promise<GenerateConfigResult>;
   /**
    * PRD #2374 — each deck's agent cards, by deck id, as its daemon last sent
    * them. A deck whose daemon has no cards has no key here. Absent where the
