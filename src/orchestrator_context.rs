@@ -480,11 +480,7 @@ pub fn compose_orchestrator_context(
 /// the path is the line's second whitespace-separated word, so it never needs
 /// quoting: the file name is [`CONTEXT_FILE_PREFIX`] plus hex digits.
 fn orchestrator_prompt_line(has_task: bool, context_path: &std::path::Path) -> String {
-    let file = context_path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| CONTEXT_FILE_NAME.to_string());
-    let rel = format!("{CONTEXT_DIR_NAME}/{file}");
+    let rel = context_rel_path(context_path);
     if has_task {
         format!(
             "Read {rel} for your role, the available agents, the delegation protocol, and your \
@@ -495,6 +491,51 @@ fn orchestrator_prompt_line(has_task: bool, context_path: &std::path::Path) -> S
         format!(
             "Read {rel} for your role, available agents, and delegation protocol. Acknowledge \
              your role and wait for instructions."
+        )
+    }
+}
+
+/// `context_path` as the prompt names it: `.dot-agent-deck/<file>`, relative to
+/// the project directory.
+fn context_rel_path(context_path: &std::path::Path) -> String {
+    let file = context_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| CONTEXT_FILE_NAME.to_string());
+    format!("{CONTEXT_DIR_NAME}/{file}")
+}
+
+/// PRD #82: the line a re-arm (compaction or `/clear`) posts to the
+/// coordinator, pointing at the role file the re-arm published.
+///
+/// Not the startup line ([`orchestrator_prompt_line`]): a coordinator re-armed
+/// mid-run has work under way, and the startup line's "wait for instructions"
+/// would stall it there. This one says why the role is being restored and tells
+/// the coordinator to carry on coordinating, delegating the next step rather
+/// than doing the work itself. Waiting is kept only for a coordinator that was
+/// never given any work, which is what a `Ctrl+n` orchestration is until its
+/// user types an instruction.
+///
+/// It keeps the startup line's shape, the `Read .dot-agent-deck/<file>` prefix
+/// with the path as the second word, so everything that recognises a remit
+/// pointer recognises this one.
+pub(crate) fn rearm_prompt_line(has_task: bool, context_path: &std::path::Path) -> String {
+    let rel = context_rel_path(context_path);
+    if has_task {
+        format!(
+            "Read {rel} for your role, the available agents, the delegation protocol, and your \
+             task under `## Your task`; your context was just compacted or cleared, and this \
+             restores your role. Then carry out that task from where it stands, delegating its \
+             next step to the agents listed there; do not implement, review or audit the work \
+             yourself."
+        )
+    } else {
+        format!(
+            "Read {rel} for your role, available agents, and delegation protocol; your context \
+             was just compacted or cleared, and this restores your role. Then resume coordinating \
+             any work under way, delegating its next step to the agents listed there; do not \
+             implement, review or audit the work yourself. If you have not been given any work \
+             yet, acknowledge your role and wait for instructions."
         )
     }
 }
@@ -871,9 +912,54 @@ pub fn reassert_orchestrator_prompt(
     let (task, attendance) = read_back_context(content.as_deref());
     let published = prepare_orchestrator_prompt(config, cwd, task.as_deref(), attendance)?;
     Some(Rearmed {
-        prompt: published.prompt,
+        // PRD #82: the resume line, not the startup line `prepare` returned.
+        prompt: rearm_prompt_line(task.is_some(), &published.context_path),
         context_path: published.context_path,
         without_brief,
+    })
+}
+
+/// PRD #82: the daemon's re-arm of an orchestration it records a context file
+/// for — `recorded`, the newest one
+/// ([`crate::state::AppState::orchestration_context_paths`]).
+///
+/// The TUI's re-arm ([`reassert_orchestrator_prompt`]) recomposes the role from
+/// its tab's configuration. The daemon holds no configuration for a running
+/// orchestration, and needs none: `recorded` already is the coordinator's whole
+/// role, composed and approved when the orchestration started (or last
+/// re-armed), with its task and attendance. So the re-arm publishes the same
+/// bytes as a new per-publish file, which restarts the file's retention clock
+/// the way a TUI re-arm does, and answers the resume line naming it
+/// ([`rearm_prompt_line`]).
+///
+/// `recorded` must be a per-publish file directly in its project's
+/// `.dot-agent-deck` ([`own_context_file_name`]) and is read through
+/// [`read_context_file`]: bounded, and on Unix never following a link at the
+/// last two components nor opening anything but a regular file. Any refusal is
+/// an `Err`, and nothing is published.
+///
+/// **Blocking.** The daemon calls it through
+/// [`crate::project_resolve::run_bounded`].
+pub fn republish_orchestrator_context(recorded: &std::path::Path) -> std::io::Result<Rearmed> {
+    let not_a_context_file = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a per-publish context path",
+        )
+    };
+    let project_dir = recorded
+        .parent()
+        .and_then(std::path::Path::parent)
+        .ok_or_else(not_a_context_file)?;
+    let name = own_context_file_name(project_dir, recorded).ok_or_else(not_a_context_file)?;
+    let content = read_context_file(project_dir, name)?;
+    let (task, _) = read_back_context(Some(&content));
+    let published = publish_orchestrator_context(project_dir, &content)
+        .map_err(|e| std::io::Error::other(e.detail()))?;
+    Ok(Rearmed {
+        prompt: rearm_prompt_line(task.is_some(), &published.path),
+        context_path: published.path,
+        without_brief: None,
     })
 }
 
@@ -4325,6 +4411,126 @@ mod tests {
         assert!(
             written.contains("Verify PR #232 and report."),
             "the task must survive the re-assertion rewrite:\n{written}"
+        );
+    }
+
+    /// Scenario: a coordinator whose context was compacted is re-armed. The
+    /// line it is posted tells it why, and to carry on coordinating, delegating
+    /// rather than doing the work; it keeps the `Read .dot-agent-deck/<file>`
+    /// shape every remit pointer has. With a task it never says to wait; with
+    /// none it waits only if no work was given yet (PRD #82).
+    #[test]
+    fn a_rearm_line_resumes_coordinating_rather_than_waiting() {
+        let path = std::path::Path::new(
+            "/p/.dot-agent-deck/orchestrator-context-0123456789abcdef0123456789abcdef.md",
+        );
+        let with_task = rearm_prompt_line(true, path);
+        let without = rearm_prompt_line(false, path);
+        for line in [&with_task, &without] {
+            assert!(
+                line.starts_with(
+                    "Read .dot-agent-deck/orchestrator-context-0123456789abcdef0123456789abcdef.md "
+                ),
+                "{line:?}"
+            );
+            assert!(line.contains("compacted or cleared"), "{line:?}");
+            assert!(line.contains("delegating its next step"), "{line:?}");
+            assert!(
+                line.contains("do not implement, review or audit the work yourself"),
+                "{line:?}"
+            );
+        }
+        assert!(with_task.contains("carry out that task from where it stands"));
+        assert!(
+            !with_task.contains("wait for instructions"),
+            "{with_task:?}"
+        );
+        assert!(without.contains("resume coordinating any work under way"));
+        assert!(
+            without.contains("If you have not been given any work yet"),
+            "waiting is only for a coordinator never given work: {without:?}"
+        );
+    }
+
+    /// Scenario: the daemon re-arms an orchestration it recorded a context file
+    /// for. The same bytes are published as a new per-publish file beside the
+    /// recorded one, which is left as it was, and the resume line names the
+    /// new file; the dispatched task travels with it (PRD #82).
+    #[test]
+    fn a_daemon_rearm_republishes_the_recorded_file_verbatim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().to_string_lossy().to_string();
+        let started = prepare_orchestrator_prompt(
+            &config(),
+            &cwd,
+            Some("Ship PRD #82."),
+            Attendance::Unattended,
+        )
+        .expect("spawn-time write");
+        let before = std::fs::read_to_string(&started.context_path).unwrap();
+
+        let rearmed = republish_orchestrator_context(&started.context_path).expect("republished");
+        assert_ne!(rearmed.context_path, started.context_path);
+        assert_eq!(
+            rearmed.context_path.parent(),
+            started.context_path.parent(),
+            "beside the recorded file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&rearmed.context_path).unwrap(),
+            before,
+            "the role, agents and task are republished as they were"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&started.context_path).unwrap(),
+            before,
+            "the recorded file is not rewritten"
+        );
+        assert_eq!(rearmed.without_brief, None);
+        assert_eq!(
+            rearmed.prompt,
+            rearm_prompt_line(true, &rearmed.context_path),
+            "a file with a task gets the task-carrying resume line"
+        );
+
+        let ctrl_n = prepare_orchestrator_prompt(&config(), &cwd, None, Attendance::Attended)
+            .expect("no-task write");
+        let rearmed = republish_orchestrator_context(&ctrl_n.context_path).expect("republished");
+        assert_eq!(
+            rearmed.prompt,
+            rearm_prompt_line(false, &rearmed.context_path)
+        );
+    }
+
+    /// Scenario: the daemon is asked to re-arm from a path that is not a
+    /// per-publish context file directly in its project's `.dot-agent-deck`,
+    /// or from one that is gone. It publishes nothing and says why (PRD #82).
+    #[test]
+    fn a_daemon_rearm_refuses_anything_but_a_readable_own_context_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().to_string_lossy().to_string();
+        let started = prepare_orchestrator_prompt(&config(), &cwd, None, Attendance::Attended)
+            .expect("spawn-time write");
+        let dir = started.context_path.parent().unwrap().to_path_buf();
+        let count = || std::fs::read_dir(&dir).unwrap().count();
+        let files = count();
+
+        let foreign = tmp.path().join("notes.md");
+        std::fs::write(&foreign, "not a context file").unwrap();
+        let fixed = dir.join(CONTEXT_FILE_NAME);
+        std::fs::write(&fixed, "an older deck's mirror").unwrap();
+        let gone = dir.join("orchestrator-context-ffffffffffffffffffffffffffffffff.md");
+        for path in [foreign.as_path(), fixed.as_path(), gone.as_path()] {
+            assert!(
+                republish_orchestrator_context(path).is_err(),
+                "{} must be refused",
+                path.display()
+            );
+        }
+        assert_eq!(
+            count(),
+            files + 1,
+            "nothing was published (the mirror is the +1)"
         );
     }
 

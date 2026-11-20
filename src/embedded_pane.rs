@@ -5615,6 +5615,12 @@ impl PaneController for EmbeddedPaneController {
         })
     }
 
+    fn daemon_rearms_orchestrator(&self, pane_id: &str) -> bool {
+        self.held_client(&BoundPane::held_by_controller(pane_id))
+            .cached_capabilities()
+            .is_some_and(|caps| caps.supports(crate::daemon_protocol::CAP_REARM_ORCHESTRATOR))
+    }
+
     fn report_orchestrator_context(&self, pane_id: &str, context_path: &std::path::Path) {
         // PRD #1666 part 2 (G-fix4, G-fix6): recorded for the pane's agent on
         // the daemon process it runs under. A role pane is one this controller

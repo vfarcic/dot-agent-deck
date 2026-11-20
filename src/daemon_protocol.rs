@@ -823,6 +823,17 @@ pub const CAP_RECORD_ORCHESTRATOR_CONTEXT: &str = "record-orchestrator-context";
 /// dispatch arm is not `#[cfg]`-gated.
 pub const CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT: &str = "subscribe-events-with-snapshot";
 
+/// PRD #82: the daemon re-arms an orchestration's coordinator itself after a
+/// compaction or `/clear` — republishing the context file it records for the
+/// orchestration and posting the resume line to the coordinator's inbox
+/// ([`rearm_orchestrator`]) — for every orchestration it records a context file
+/// for, whether or not a client is attached. Not a verb: a behaviour a client
+/// reads so as not to repeat it. A TUI that sees it leaves the re-arm of such a
+/// tab to the daemon and keeps its own for a tab it opened with `Ctrl+n`, whose
+/// file the daemon does not record. An older daemon does not advertise it, and
+/// a TUI then re-arms every tab itself, as before.
+pub const CAP_REARM_ORCHESTRATOR: &str = "rearm-orchestrator";
+
 /// Capability string for [`AttachRequest::RestartDaemon`] (PRD #1487).
 ///
 /// Same convention as the PRD #819 verbs: the string is the variant's `op`.
@@ -1490,6 +1501,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_PROJECT_TRUST,
     CAP_TRUST_REQUESTS,
     CAP_AGENT_CARDS,
+    CAP_REARM_ORCHESTRATOR,
 ];
 #[cfg(not(unix))]
 pub const DAEMON_CAPABILITIES: &[&str] = &[
@@ -1520,6 +1532,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_PROJECT_TRUST,
     CAP_TRUST_REQUESTS,
     CAP_AGENT_CARDS,
+    CAP_REARM_ORCHESTRATOR,
 ];
 
 // ---------------------------------------------------------------------------
@@ -5967,6 +5980,109 @@ async fn record_rearmed_context(
 /// Issue #1445: how many times [`record_rearmed_context`] compares again after
 /// the record moved under it before giving up on the report.
 const REARM_RECORD_ATTEMPTS: usize = 4;
+
+/// PRD #82: the subject of the message that carries an orchestrator's role, as
+/// the TUI posts it too.
+pub(crate) const ORCHESTRATOR_REMIT_SUBJECT: &str = "your role as orchestrator";
+
+/// PRD #82: the daemon's re-arm of an orchestration's coordinator after a
+/// compaction or `/clear`, as [`crate::state::AppState::orchestrator_rearm_due`]
+/// found it owed. Run off the ingest path, with no lock held on entry.
+///
+/// It republishes the context file the daemon records for the orchestration
+/// as a new per-publish file
+/// ([`crate::orchestrator_context::republish_orchestrator_context`]), moves the
+/// record to it, and posts the resume line naming it to the coordinator's
+/// inbox, bound to the agent generation that reported the compaction, exactly
+/// as a client's [`AttachRequest::PostMessage`] with
+/// [`crate::inbox_hub::PostOrigin::OrchestratorRemit`] is posted. The inbox then
+/// hands it over when the agent next takes messages, which for a compaction is
+/// after the summary.
+///
+/// **The record moves before anything is posted, and only from the file the
+/// re-arm read** ([`crate::state::AppState::record_rearmed_orchestration_context`]
+/// with that file as `compared`). If something else moved it in between — the
+/// orchestration ended, or an older TUI re-armed the same coordinator and
+/// reported its own file — this re-arm withdraws the file it published and
+/// posts nothing, so it never answers a re-arm that already happened with a
+/// second one. Returns the message id it posted, for tests.
+pub(crate) async fn rearm_orchestrator(
+    state: &SharedState,
+    registry: &AgentPtyRegistry,
+    rearm: crate::state::OrchestratorRearm,
+) -> Option<String> {
+    let recorded = rearm.recorded.clone();
+    let published = crate::project_resolve::run_bounded(move || {
+        crate::orchestrator_context::republish_orchestrator_context(&recorded)
+    })
+    .await;
+    let published = match published {
+        Ok(Ok(published)) => published,
+        Ok(Err(e)) => {
+            tracing::warn!(
+                pane_id = %rearm.pane_id,
+                path = %rearm.recorded.display(),
+                error = %e,
+                "orchestrator re-arm: could not republish the recorded context file; \
+                 the coordinator's role was not re-sent"
+            );
+            return None;
+        }
+        Err(e) => {
+            tracing::warn!(
+                pane_id = %rearm.pane_id,
+                error = %e,
+                "orchestrator re-arm: the republish did not run; the coordinator's role was \
+                 not re-sent"
+            );
+            return None;
+        }
+    };
+    let recorded = state.write().await.record_rearmed_orchestration_context(
+        &rearm.pane_id,
+        &published.context_path,
+        &rearm.recorded,
+    );
+    if let Err(refusal) = recorded {
+        tracing::info!(
+            pane_id = %rearm.pane_id,
+            reason = %refusal,
+            "orchestrator re-arm: the recorded context moved while it was republished; \
+             withdrawing this re-arm"
+        );
+        let path = published.context_path;
+        let _ = crate::project_resolve::run_bounded(move || {
+            crate::orchestrator_context::remove_ended_orchestration_context(&path)
+        })
+        .await;
+        return None;
+    }
+    let resp = post_message_as(
+        "orchestrator-rearm",
+        registry,
+        &rearm.pane_id,
+        Some(rearm.agent_id.as_str()),
+        ORCHESTRATOR_REMIT_SUBJECT.to_string(),
+        published.prompt,
+        None,
+        crate::inbox_hub::PostOrigin::OrchestratorRemit,
+    );
+    if !resp.ok {
+        tracing::warn!(
+            pane_id = %rearm.pane_id,
+            error = resp.error.as_deref().unwrap_or(""),
+            "orchestrator re-arm: the coordinator's inbox refused its role"
+        );
+        return None;
+    }
+    tracing::info!(
+        pane_id = %rearm.pane_id,
+        agent_id = %rearm.agent_id,
+        path = %published.context_path.display(),
+        "orchestrator re-arm: the coordinator's role was re-sent to its inbox"
+    );
+    resp.id
+}
 
 /// One refusal to an [`AttachRequest::RestartDaemon`]: `ok = false`, the
 /// message in `error` for a client that knows nothing of the field, and the

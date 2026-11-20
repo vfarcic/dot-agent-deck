@@ -2192,6 +2192,7 @@ async fn ingest_event_core<F>(
 where
     F: FnOnce(&mut crate::state::AppState) -> bool,
 {
+    let shared = state;
     let mut state = state.write().await;
     // Audit T2: the pane whose question this event can change, which is the
     // one whose lifecycle must be held.
@@ -2470,6 +2471,19 @@ where
     // PRD #1790: what the work journal's `attempt_session` needs, taken
     // before the apply consumes the event ([`attempt_session_report`]).
     let session_report = attempt_session_report(&event, unproven, attested_agent);
+    // PRD #82: a compaction or `/clear` on an orchestration's coordinator owes
+    // it its role again. Asked before the apply, which is what tells a
+    // compaction from a repeat of one, and only of a report from the pane's own
+    // live agent; the re-arm itself runs after this lock is released.
+    let rearm = (!unproven && !event.is_daemon_synthetic() && !event.is_from_subagent())
+        .then(|| event.agent_id.as_deref().or(attested_agent))
+        .flatten()
+        .filter(|generation| {
+            event.pane_id.as_deref().is_some_and(|pane_id| {
+                registry.pane_current_agent_id(pane_id).as_deref() == Some(*generation)
+            })
+        })
+        .and_then(|generation| state.orchestrator_rearm_due(&event, generation));
     state.apply_hook_event_watching_waiting(event, registry, attested_agent);
     // The session is the attempt's once the apply made it the pane's current
     // hook session: a report the state refused, or one about a conversation
@@ -2533,6 +2547,12 @@ where
     drop(state);
     if let Some((pane_id, agent_id, epoch)) = reported_block {
         notify_orchestrator_of_quota_block(registry, &pane_id, &agent_id, epoch);
+    }
+    if let Some(rearm) = rearm {
+        let (shared, registry) = (Arc::clone(shared), Arc::clone(registry));
+        tokio::spawn(async move {
+            crate::daemon_protocol::rearm_orchestrator(&shared, &registry, rearm).await;
+        });
     }
     Ok(true)
 }

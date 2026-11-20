@@ -1751,6 +1751,26 @@ fn orchestrator_remit_pane_is_compacting<'a>(
     })
 }
 
+/// PRD #82: the timestamp of the newest `Compacting` event recorded on the
+/// orchestrator start-role pane's own (non-placeholder) sessions, from the
+/// main thread rather than a subagent. The compaction re-arm reads it beside
+/// the status ([`orchestrator_remit_pane_is_compacting`]) because a status
+/// can move on before any frame sees it.
+fn orchestrator_remit_pane_latest_compacting<'a>(
+    sessions: impl Iterator<Item = &'a SessionState>,
+    start_pane_id: &str,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    sessions
+        .filter(|s| s.pane_id.as_deref() == Some(start_pane_id) && s.agent_type != AgentType::None)
+        .filter_map(|s| {
+            s.recent_events.iter().rev().find_map(|e| {
+                (e.event_type == EventType::Compacting && !e.is_from_subagent())
+                    .then_some(e.timestamp)
+            })
+        })
+        .max()
+}
+
 /// Pure policy: the timestamp of the most recent clear-originated
 /// `SessionStart` recorded against the orchestrator start-role pane's own
 /// (non-placeholder) session, if one is still present in its retained
@@ -2324,6 +2344,13 @@ struct UiState {
     /// the moment the status is next observed as anything else, which
     /// re-arms detection for a possible later compaction.
     orchestration_remit_compacting: HashSet<TabId>,
+    /// PRD #82: for each orchestration tab, the timestamp of the newest
+    /// `Compacting` event on its start-role pane that the compaction re-arm
+    /// has already counted. The status can be `Compacting` for less than a
+    /// frame — OpenCode 1.x reports the session busy within milliseconds of
+    /// the compaction starting (measured on 1.19.5) — so the loop also reads
+    /// the event itself, and this keeps one event from counting twice.
+    orchestration_remit_compacting_event_at: HashMap<TabId, chrono::DateTime<chrono::Utc>>,
     /// For each orchestration tab, the timestamp of the most recent
     /// clear-originated `SessionStart` the remit re-arm loop has already
     /// reacted to on the start-role pane, if any. A `SessionStart` is a
@@ -2756,6 +2783,7 @@ impl UiState {
             stop_confirm_agent_count: 0,
             orchestration_prompted: HashSet::new(),
             orchestration_remit_compacting: HashSet::new(),
+            orchestration_remit_compacting_event_at: HashMap::new(),
             orchestration_remit_clear_reasserted_at: HashMap::new(),
             orchestration_remit_clear_tab_anchor_at: HashMap::new(),
             orchestration_remit_clear_retry_at: HashMap::new(),
@@ -4607,7 +4635,7 @@ fn adopt_surfaced_context_path(
     bucket: &OrchestrationHydrationBucket,
 ) {
     if let Some(path) = bucket.context_path.clone() {
-        tab_manager.set_orchestration_context_path(tab_index, Some(path));
+        tab_manager.set_daemon_recorded_context_path(tab_index, path);
     }
 }
 
@@ -4648,7 +4676,7 @@ fn adopt_context_path_into_owning_tab(
         context_path: None, ..
     }) = tab_manager.tabs().get(owner)
     {
-        tab_manager.set_orchestration_context_path(owner, Some(PathBuf::from(path)));
+        tab_manager.set_daemon_recorded_context_path(owner, PathBuf::from(path));
     }
 }
 
@@ -15120,8 +15148,9 @@ pub fn run_tui(
                     }
                     // Issue #1395 item 1: re-arm this tab from the file its
                     // coordinator was started with, as a Ctrl+n tab does.
-                    tab_manager
-                        .set_orchestration_context_path(tab_index, bucket.context_path.clone());
+                    if let Some(path) = bucket.context_path.clone() {
+                        tab_manager.set_daemon_recorded_context_path(tab_index, path);
+                    }
                     if let Some(warning) = drift_warning {
                         surface_orchestration_config_drift(
                             &mut ui,
@@ -15921,6 +15950,7 @@ pub fn run_tui(
                 config,
                 cwd,
                 context_path,
+                context_recorded_by_daemon,
                 ..
             } = tab
             {
@@ -15928,10 +15958,36 @@ pub fn run_tui(
                 // Order-independent lookup — see
                 // `orchestrator_remit_pane_is_compacting`'s doc comment for
                 // why `.find()` over `snapshot.sessions.values()` was wrong.
-                let is_compacting = orchestrator_remit_pane_is_compacting(
+                let compacting_now = orchestrator_remit_pane_is_compacting(
                     snapshot.sessions.values(),
                     &start_pane_id,
                 );
+                // PRD #82: or a `Compacting` event this tab has not counted
+                // yet, whose status the pane may already have left. Events
+                // older than the tab (the anchor the `/clear` loop below uses)
+                // are not this tab's to answer.
+                let tab_anchor = *ui
+                    .orchestration_remit_clear_tab_anchor_at
+                    .entry(*id)
+                    .or_insert_with(Utc::now);
+                let compacting_event = orchestrator_remit_pane_latest_compacting(
+                    snapshot.sessions.values(),
+                    &start_pane_id,
+                )
+                .filter(|at| *at >= tab_anchor);
+                let unseen_event = compacting_event
+                    .filter(|at| ui.orchestration_remit_compacting_event_at.get(id) != Some(at));
+                if let Some(at) = compacting_event {
+                    ui.orchestration_remit_compacting_event_at.insert(*id, at);
+                }
+                let is_compacting = compacting_now || unseen_event.is_some();
+                // PRD #82: the daemon re-arms an orchestration whose context
+                // file it records, attached client or not; re-arming it here
+                // as well would send the coordinator its role twice. The edge
+                // is still tracked below, so nothing fires late if this
+                // changes.
+                let daemon_rearms =
+                    *context_recorded_by_daemon && pane.daemon_rearms_orchestrator(&start_pane_id);
 
                 if is_compacting {
                     // Eligibility no longer requires
@@ -15961,6 +16017,7 @@ pub fn run_tui(
                         .unwrap_or(false);
 
                     if !ui.orchestration_remit_compacting.contains(id)
+                        && !daemon_rearms
                         && no_delivery_pending
                         && !ui.orchestration_remit_abandoned.contains(id)
                         && !start_role_is_pi
@@ -16058,10 +16115,14 @@ pub fn run_tui(
                 config,
                 cwd,
                 context_path,
+                context_recorded_by_daemon,
                 ..
             } = tab
             {
                 let start_pane_id = role_pane_ids[*start_role_index].clone();
+                // PRD #82: as in the compaction loop above.
+                let daemon_rearms =
+                    *context_recorded_by_daemon && pane.daemon_rearms_orchestrator(&start_pane_id);
                 let latest_clear = orchestrator_remit_pane_latest_clear_session_start(
                     snapshot.sessions.values(),
                     &start_pane_id,
@@ -16103,8 +16164,9 @@ pub fn run_tui(
                     // change, so there is nothing to gain by re-evaluating
                     // them on every subsequent frame this same event
                     // remains the latest one.
-                    let permanently_excluded =
-                        ui.orchestration_remit_abandoned.contains(id) || start_role_is_pi;
+                    let permanently_excluded = ui.orchestration_remit_abandoned.contains(id)
+                        || start_role_is_pi
+                        || daemon_rearms;
 
                     // A persistently failing `prepare_orchestrator_prompt`
                     // (deleted/unmounted cwd, read-only fs, disk full) must
@@ -18109,6 +18171,7 @@ mod deck_attention_tests {
                 zoomed: false,
                 orchestration_id: None,
                 context_path: None,
+                context_recorded_by_daemon: false,
             },
         ]
     }
@@ -41251,6 +41314,80 @@ mod tests {
         assert!(!should_reassert_orchestrator_remit(&SessionStatus::Idle));
         assert!(!should_reassert_orchestrator_remit(&SessionStatus::Error));
         assert!(!should_reassert_orchestrator_remit(&SessionStatus::Unknown));
+    }
+
+    /// Scenario: OpenCode 1.x reports a session busy within milliseconds of
+    /// its compaction starting, so the start-role pane can read `Thinking` on
+    /// the first frame that sees it. The compaction re-arm still finds the
+    /// `Compacting` event in the pane's recent events (the newest one, from
+    /// the main thread, not a subagent's, not a placeholder's) (PRD #82).
+    #[test]
+    fn remit_finds_a_compaction_the_status_has_already_left() {
+        let at = |secs| chrono::DateTime::from_timestamp(secs, 0).unwrap();
+        let event = |event_type, secs, subagent: bool| {
+            let mut e = AgentEvent {
+                session_id: "s".into(),
+                agent_type: AgentType::OpenCode,
+                event_type,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: at(secs),
+                user_prompt: None,
+                metadata: Default::default(),
+                pane_id: Some("orch-pane".into()),
+                agent_id: None,
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+                background: None,
+                background_revision: None,
+            };
+            if subagent {
+                e.metadata.insert(
+                    crate::event::SUBAGENT_ID_METADATA_KEY.to_string(),
+                    "child".to_string(),
+                );
+            }
+            e
+        };
+        let mut sessions: HashMap<String, SessionState> = HashMap::new();
+        let mut real = SessionState {
+            pane_id: Some("orch-pane".to_string()),
+            agent_type: AgentType::OpenCode,
+            ..make_session(SessionStatus::Thinking)
+        };
+        real.recent_events
+            .push_back(event(EventType::Thinking, 10, false));
+        real.recent_events
+            .push_back(event(EventType::Compacting, 20, false));
+        real.recent_events
+            .push_back(event(EventType::Thinking, 21, false));
+        real.recent_events
+            .push_back(event(EventType::Compacting, 30, true));
+        sessions.insert("real".into(), real);
+        let mut placeholder = SessionState {
+            pane_id: Some("orch-pane".to_string()),
+            agent_type: AgentType::None,
+            ..make_session(SessionStatus::Thinking)
+        };
+        placeholder
+            .recent_events
+            .push_back(event(EventType::Compacting, 40, false));
+        sessions.insert("placeholder".into(), placeholder);
+
+        assert!(
+            !orchestrator_remit_pane_is_compacting(sessions.values(), "orch-pane"),
+            "premise: the status has already left Compacting"
+        );
+        assert_eq!(
+            orchestrator_remit_pane_latest_compacting(sessions.values(), "orch-pane"),
+            Some(at(20))
+        );
+        assert_eq!(
+            orchestrator_remit_pane_latest_compacting(sessions.values(), "other-pane"),
+            None
+        );
     }
 
     // Pure policy: `orchestrator_remit_pane_is_compacting` must find the

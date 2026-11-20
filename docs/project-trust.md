@@ -132,7 +132,7 @@ Other issues, on the default branch, keep dispatching meanwhile.
 
 ### An orchestrator's instructions after compaction or `/clear`
 
-In the TUI, when the orchestrator's conversation is compacted, or you clear it with `/clear`, the deck sends the orchestrator its instructions again (its prompt, the workers and how to delegate). It sends them only when the orchestration is approved as its file now reads. If the file changed since you approved it, or the orchestration was never approved, nothing is sent and the TUI's status line says why, for example:
+When the orchestrator's conversation is compacted, or you clear it with `/clear`, the deck sends the orchestrator its instructions again (its prompt, the workers and how to delegate); [Orchestration](orchestration.md#when-the-orchestrators-conversation-is-compacted-or-cleared) says when. For an orchestration started from the desktop app, by `dispatch` or by a schedule, it sends the instructions that were approved when the orchestration started, and nothing on this page applies. For one you opened in the TUI with `Ctrl+n`, the TUI sends them only when the orchestration is approved as its file now reads. If the file changed since you approved it, or the orchestration was never approved, nothing is sent and the TUI's status line says why, for example:
 
 ```text
 Orchestration 'team': its instructions were not sent to its coordinator again, because its config changed since you approved it. Review and approve it from a terminal outside the deck with: dot-agent-deck trust approve /home/you/code/demo --orchestration team
@@ -148,7 +148,7 @@ Orchestration 'team': instructions re-sent to its coordinator without a task (th
 
 That happens for an orchestration you opened with `Ctrl+n` and came back to after detaching, or from a second TUI, which never had a task to send; and for any orchestration whose file was deleted, by hand or because it was more than 14 days old. If the orchestrator was working on a task, give it the task again.
 
-The desktop app does not send the orchestrator's instructions again after compaction or `/clear`, so this does not apply there.
+The desktop app sends nothing of its own, and shows none of these messages: an orchestration it started gets its instructions from the deck, as above.
 
 ## Manage approvals from the command line
 
