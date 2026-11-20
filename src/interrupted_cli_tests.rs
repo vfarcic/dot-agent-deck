@@ -341,6 +341,69 @@ fn no_daemon_is_exit_three() {
     assert!(out.stderr.contains(words::NO_DAEMON), "{}", out.stderr);
 }
 
+/// PR #2431 round 5 (Qodo): a running daemon on another attach protocol,
+/// reached through a client that checks the protocol, is a daemon that cannot
+/// serve interrupted work: exit 2 with the shared sentence, and it is sent
+/// nothing past its `Hello`. No daemon at all stays exit 3. (The one-shot
+/// CLI's own client does not check the protocol, so it never meets this
+/// error; the mapping is what any caller of these functions gets.)
+#[cfg(unix)]
+#[test]
+fn a_daemon_on_another_protocol_is_exit_two_and_no_daemon_is_exit_three() {
+    use crate::daemon_protocol::{AttachResponse, PROTOCOL_VERSION, read_frame, write_resp};
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let dir = crate::test_temp::tempdir().unwrap();
+    let path = dir.path().join("other-protocol.sock");
+    let listener = {
+        let _enter = rt.enter();
+        tokio::net::UnixListener::bind(&path).expect("bind the fake daemon")
+    };
+    let after_hello = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let log = after_hello.clone();
+    rt.spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let log = log.clone();
+            tokio::spawn(async move {
+                while let Ok(Some((_kind, payload))) = read_frame(&mut stream).await {
+                    let request: serde_json::Value =
+                        serde_json::from_slice(&payload).unwrap_or_default();
+                    let op = request["op"].as_str().unwrap_or("").to_string();
+                    let response = if op == "hello" {
+                        AttachResponse {
+                            capabilities: Some(vec![
+                                crate::daemon_protocol::CAP_INTERRUPTED_WORK.to_string(),
+                                crate::daemon_protocol::CAP_HELLO_FOLLOW_ON.to_string(),
+                            ]),
+                            ..AttachResponse::hello(PROTOCOL_VERSION + 1)
+                        }
+                    } else {
+                        log.lock().unwrap().push(op);
+                        AttachResponse::err("not sent by a gated client")
+                    };
+                    if write_resp(&mut stream, &response).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+
+    let other = DaemonClient::new(path).with_protocol_gate();
+    let out = rt.block_on(run_list(&other, false, false));
+    assert_eq!(out.code, EXIT_DAEMON_TOO_OLD, "{out:?}");
+    assert!(out.stderr.contains(words::UNSUPPORTED), "{}", out.stderr);
+    assert!(
+        after_hello.lock().unwrap().is_empty(),
+        "nothing past the Hello: {:?}",
+        after_hello.lock().unwrap()
+    );
+
+    let (_none, absent) = no_daemon();
+    let out = rt.block_on(run_list(&absent.with_protocol_gate(), false, false));
+    assert_eq!(out.code, EXIT_UNREACHABLE, "{out:?}");
+    assert!(out.stderr.contains(words::NO_DAEMON), "{}", out.stderr);
+}
+
 /// Reviewer 5 and 3: an item prints its progress on its own line, with the
 /// shared wording, and a show that carried the bodies of fewer reports than
 /// the item lists says how to read the rest by id; a list that left report

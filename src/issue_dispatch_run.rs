@@ -1573,9 +1573,16 @@ async fn dispatch_one_issue(
     // PRD #1889: a spawned issue's work closes with its pane or its
     // orchestration; a failed one is forgotten, or closed when something it
     // started was already written.
+    //
+    // PR #2431 round 5: one this daemon's shutdown cut short after its agent
+    // came up stays open, so the next daemon lists it as interrupted work.
+    // Its worktree stays on disk, as for any failed spawn below.
     if let Some(work) = &issue_work {
         match &spawned {
             Ok(_) => registry.work().launched_without_unit(work),
+            Err(crate::spawn::SpawnError::ShutdownWhileStarting) => {
+                registry.work().launch_interrupted(work);
+            }
             Err(_) => registry.work().launch_failed(work, None),
         }
     }

@@ -791,6 +791,16 @@ export function modalOpen(): boolean {
 }
 
 /**
+ * PR #2431 round 5 — whether a modal other than the Interrupted work dialog
+ * is open. A request to show interrupted work may turn that dialog to another
+ * daemon's list, so it never blocks one; Settings, a confirmation, or any
+ * modal drawn over the dialog still does.
+ */
+function modalOtherThanInterruptedOpen(): boolean {
+  return [...document.querySelectorAll("[aria-modal='true']")].some((modal) => !modal.classList.contains("interrupted-dialog"));
+}
+
+/**
  * The most dashboard rows that carry a number: the most items a numbered list
  * may declare to voice (`MAX_VOICE_NUMBERED_ENTRIES` in `src-tauri/src/lib.rs`,
  * which refuses a longer list and with it every voice command on the screen).
@@ -1451,8 +1461,14 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       const id = deck.snapshot.connection.deckId as string;
       return refresh(id, false).then((found) => ({ deck, id, found }));
     })).then((answers) => {
-      /* The person moved on, or another modal now covers the dashboard: this answer is not theirs any more. */
-      if (showRequest.current !== request || modalOpen()) return undefined;
+      /*
+        The person moved on, or another modal now covers the dashboard: this
+        answer is not theirs any more. An Interrupted work dialog open since
+        the request is the one it asked for and may be turned to another
+        daemon (PR #2431 round 5); one opened or closed meanwhile moved the
+        request on above.
+      */
+      if (showRequest.current !== request || modalOtherThanInterruptedOpen()) return undefined;
       /*
         A daemon that could not be asked again still counts the items its last
         answer listed. One whose list is incomplete may have work it could not

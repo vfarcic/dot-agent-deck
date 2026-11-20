@@ -81,6 +81,19 @@ use std::time::Duration;
 /// The orchestration an orchestration-shaped unit is dispatched as.
 const TEAM: &str = "interrupted-team";
 
+/// The directory under each daemon's HOME its test seams read
+/// (`DOT_AGENT_DECK_TEST_WORK_DONE_PAUSE_DIR`): the spawn's `dispatch-seed`
+/// pause, which `journal/interrupted/038` arms.
+const SEAMS: &str = "interrupted-seams";
+
+/// A daemon on the state directory `state_env`, with its seams readable.
+fn daemon_on(state_env: &str) -> common::DaemonProc {
+    inbox::daemon_unbound(&[
+        ("DOT_AGENT_DECK_STATE_DIR", state_env),
+        ("DOT_AGENT_DECK_TEST_WORK_DONE_PAUSE_DIR", SEAMS),
+    ])
+}
+
 /// A sequence of daemons on one state directory: the one serving now, and
 /// the ones a restart ended, kept so their homes outlive the test.
 struct Decks {
@@ -101,7 +114,7 @@ impl Decks {
         let scratch = common::harness_tempdir().unwrap();
         let state = scratch.path().join("state");
         let state_env = state.to_string_lossy().into_owned();
-        let live = inbox::daemon_unbound(&[("DOT_AGENT_DECK_STATE_DIR", &state_env)]);
+        let live = daemon_on(&state_env);
         let repo = scratch.path().join("interrupted-repo");
         std::fs::create_dir_all(&repo).unwrap();
         let cmd = route::command(&live.home);
@@ -137,20 +150,38 @@ impl Decks {
     /// End the serving daemon with SIGTERM to its own pid, as a deck restart
     /// does, and start another on the same state directory.
     fn restart(&mut self) {
-        // The daemon's own pid, never a pattern (CLAUDE.md rule 12).
+        self.signal_stop();
+        self.finish_restart();
+    }
+
+    /// The first half of [`Self::restart`]: SIGTERM to the serving daemon's
+    /// own pid, never a pattern (CLAUDE.md rule 12).
+    fn signal_stop(&self) {
         // SAFETY: kill(2) on a pid this test spawned and still holds.
         assert_eq!(
             unsafe { libc::kill(self.live.pid() as libc::pid_t, libc::SIGTERM) },
             0
         );
+    }
+
+    /// The second half of [`Self::restart`]: wait for the signalled daemon
+    /// to exit and start another on the same state directory.
+    fn finish_restart(&mut self) {
         assert!(
             self.live
                 .wait_for_exit(common::load_scaled(Duration::from_secs(20))),
             "the daemon must exit on SIGTERM"
         );
-        let mut next = inbox::daemon_unbound(&[("DOT_AGENT_DECK_STATE_DIR", &self.state_env)]);
+        let mut next = daemon_on(&self.state_env);
         assert!(next.is_alive_public(), "the next daemon must start");
         self.gone.push(std::mem::replace(&mut self.live, next));
+    }
+
+    /// The serving daemon's seam directory, created.
+    fn seams(&self) -> PathBuf {
+        let dir = self.live.home.join(SEAMS);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     /// The routing stand-in pane `name`, started in the repository.
@@ -194,8 +225,10 @@ impl Decks {
     /// Wait until the dispatch of `unit` that `caller` just ran has answered
     /// it: a message beyond the `before` it already held. The `dispatch` CLI
     /// returns once the daemon accepts the request, and the daemon answers
-    /// only when the spawn is done, so a restart before this could stop the
-    /// dispatch itself, whose rollback then removes the unit's new worktree.
+    /// only when the spawn is done, so this makes a restart stop a unit that
+    /// finished starting, with its unit record and the caller's answer in
+    /// place. A restart inside that start is its own case, which keeps the
+    /// unit as interrupted work too (`journal/interrupted/038`).
     fn dispatch_answered(&self, caller: &Pane, unit: &str, before: usize) {
         let budget = common::load_scaled(Duration::from_secs(20));
         assert!(
@@ -749,6 +782,102 @@ fn interrupted_036_reclaim_keeps_a_directory_a_dir_dispatch_started_in() {
         "its branch is kept"
     );
     assert!(listed(&decks.list(), &id), "a refused item stays listed");
+}
+
+/// Scenario: A dispatcher runs `dispatch --single`, and the CLI is answered.
+/// The unit's agent is running, but its first prompt is not posted yet (the
+/// spawn's `dispatch-seed` seam holds it) when the daemon is stopped; the
+/// stop drains the agent, and the dispatch goes on and finds it gone. The
+/// next daemon lists the unit as interrupted work, naming its worktree, and
+/// the worktree and its branch are still there.
+#[spec("journal/interrupted/038")]
+#[test]
+fn interrupted_038_a_stop_while_a_dispatch_starts_keeps_its_unit_as_interrupted_work() {
+    use std::os::unix::fs::PermissionsExt;
+    const UNIT: &str = "interrupted-cut";
+    let mut decks = Decks::start();
+    let seams = decks.seams();
+    // The unit's agent: ignores the stop's SIGTERM, so the stopping daemon
+    // waits out its grace with the dispatch still running, and says it got
+    // the signal, which the stop sends once it has drained the agent.
+    let got_term = seams.join("unit-got-term");
+    let stand_in = decks.repo.parent().unwrap().join("term-holding-unit.sh");
+    std::fs::write(
+        &stand_in,
+        format!(
+            "#!/bin/sh\ntrap 'touch {}' TERM\nwhile :; do sleep 0.1; done\n",
+            got_term.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&stand_in, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(seams.join("dispatch-seed.armed"), b"").unwrap();
+
+    let caller = decks.pane("interrupted-cut-caller");
+    inbox::status(&decks.live, &caller, "session_start", "codex");
+    inbox::status(&decks.live, &caller, "thinking", "codex");
+    route::cli(
+        &decks.live,
+        &caller,
+        &decks.repo,
+        &[
+            "dispatch",
+            UNIT,
+            "--task",
+            "INTERRUPTED-WORK-TASK",
+            "--single",
+            "--command",
+            &stand_in.to_string_lossy(),
+            "--agent",
+            "opencode",
+        ],
+    );
+    let budget = common::load_scaled(Duration::from_secs(20));
+    assert!(
+        common::wait_until(budget, || seams.join("dispatch-seed.reached").exists()),
+        "the dispatch never reached its first prompt within {budget:?}"
+    );
+    let suffix = format!("-dispatch-{UNIT}");
+    let unit = common::agent_records_on(&decks.live.attach_socket)
+        .into_iter()
+        .find(|r| r.cwd.as_deref().is_some_and(|c| c.ends_with(&suffix)))
+        .unwrap_or_else(|| panic!("premise: the unit's agent runs at the seam"));
+    let worktree = PathBuf::from(unit.cwd.clone().unwrap());
+    journal::wait_for(&decks.state, "the unit's attempt", |lines| {
+        journal::attempt_of(lines, &unit.id).map(|_| ())
+    });
+
+    decks.signal_stop();
+    assert!(
+        common::wait_until(budget, || got_term.exists()),
+        "premise: the stop drained the unit's agent within {budget:?}"
+    );
+    std::fs::write(seams.join("dispatch-seed.release"), b"").unwrap();
+    decks.finish_restart();
+    drop(caller);
+
+    assert!(
+        worktree.is_dir(),
+        "the unit's worktree stays on disk: {}",
+        worktree.display()
+    );
+    let branch = format!("agent/dispatch-{UNIT}");
+    assert!(branch_listed(&decks.repo, &branch), "its branch stays too");
+    let list = decks.list();
+    let item = unit_item(&list, UNIT)
+        .unwrap_or_else(|| panic!("the unit is listed as interrupted work: {list}"));
+    assert_eq!(item["kind"], "unit", "{item}");
+    assert!(
+        names_worktree(item, &worktree),
+        "the item names the unit's worktree: {item}"
+    );
+
+    // Its ownership marker names this launch, so a reclaim removes it.
+    let out = decks.person(&["interrupted", "reclaim", &id_of(item)]);
+    assert_exit("reclaim of the kept unit", &out, 0);
+    assert!(text(&out).contains(RECLAIM_REMOVED), "{}", text(&out));
+    assert!(!worktree.exists(), "the reclaim removed the worktree");
+    assert!(branch_listed(&decks.repo, &branch), "and kept its branch");
 }
 
 /// Scenario: A dispatched unit sends its report to its dispatcher, which

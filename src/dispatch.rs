@@ -1561,17 +1561,24 @@ pub async fn handle_dispatch_at(
     // started nothing, and keeps and closes it when something it started was
     // already written (a role of its orchestration that came up before a
     // later one failed).
+    //
+    // PR #2431 round 5: a spawn this daemon's shutdown cut short after its
+    // agent came up is not a failed launch. Its work stays open, so the next
+    // daemon lists the unit as interrupted work, and below its worktree and
+    // branch stay for that item. Kept only when the journal holds it: with no
+    // journal nothing would list it, so it rolls back as any failed start.
+    let mut kept_for_restart = false;
     if let Some(work) = &work_id {
-        if spawned.is_ok() {
-            if ctx.caller.is_some() {
-                ctx.registry.work().launch_succeeded(work);
-            } else {
-                ctx.registry.work().launched_without_unit(work);
+        match &spawned {
+            Ok(_) if ctx.caller.is_some() => ctx.registry.work().launch_succeeded(work),
+            Ok(_) => ctx.registry.work().launched_without_unit(work),
+            Err(crate::spawn::SpawnError::ShutdownWhileStarting) => {
+                kept_for_restart = ctx.registry.work().launch_interrupted(work);
             }
-        } else {
-            ctx.registry
+            Err(_) => ctx
+                .registry
                 .work()
-                .launch_failed(work, Some(crate::work_journal::CloseHow::UnitEnded));
+                .launch_failed(work, Some(crate::work_journal::CloseHow::UnitEnded)),
         }
     }
     match spawned {
@@ -1639,6 +1646,21 @@ pub async fn handle_dispatch_at(
                 },
             }
         }
+        // PR #2431 round 5: the deck stopped while the unit was starting.
+        // Nothing is rolled back: the unit is interrupted work, and its
+        // worktree (or `--dir` directory) and branch are what that item
+        // names. Its ownership marker names this launch, so a reclaim of the
+        // item can remove the worktree.
+        Err(e) if kept_for_restart => DispatchResult {
+            message: format!(
+                "dispatch: {e}. Nothing was removed: {} is kept, and once the deck is running \
+                 again the unit is listed by `dot-agent-deck interrupted list`.",
+                unit_dir.display()
+            ),
+            worktree_dir: unit_dir,
+            success: false,
+            unit_id: None,
+        },
         // PRD #468: a `--dir` unit's directory is not this dispatch's, so a
         // failed spawn runs no rollback and removes nothing. The deck's own
         // files the attempt already wrote under `.dot-agent-deck/` (the saved
@@ -3959,6 +3981,170 @@ mod tests {
         );
         assert!(!worktree_dir.exists());
         assert!(!branch_exists(tmp.path(), &repo, "agent/dispatch-survivor"));
+    }
+
+    /// PR #2431 round 5: a single-agent dispatch `name`, with a caller and a
+    /// work journal, held at the spawn's `seam` once its agent is up; this
+    /// daemon's registry then shuts down, as a daemon stop drains it, and the
+    /// dispatch goes on. Answers its result, the sandbox, the repository, and
+    /// what a restarted daemon lists from the journal.
+    #[cfg(unix)]
+    async fn dispatch_cut_short_by_shutdown(
+        name: &str,
+        seam: &str,
+    ) -> (
+        DispatchResult,
+        tempfile::TempDir,
+        PathBuf,
+        crate::interrupted_work::InterruptedList,
+    ) {
+        use crate::deck_identity::DeckId;
+        use crate::work_journal::{JournalOptions, WorkJournal, read_journal};
+
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo_in(tmp.path(), &repo);
+        let state_dir = tmp.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let home = PathBuf::from("/home/someone");
+        let registry = Arc::new(AgentPtyRegistry::new());
+        registry.work().install(
+            WorkJournal::try_open_with(
+                &state_dir,
+                "run1",
+                &DeckId::generate(),
+                JournalOptions {
+                    home: home.clone(),
+                    ..JournalOptions::default()
+                },
+            )
+            .unwrap(),
+        );
+        struct Guard(Arc<AgentPtyRegistry>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.shutdown_all();
+            }
+        }
+        let _guard = Guard(registry.clone());
+        let (event_tx, _keep) = tokio::sync::broadcast::channel(1024);
+        let ctx = DispatchContext {
+            caller_work: None,
+            working_dir: repo.clone(),
+            registry: registry.clone(),
+            event_tx,
+            worktrees: new_worktree_registry(),
+            default_command: Some("sleep 30".to_string()),
+            state: None,
+            caller: Some(crate::dispatch_return::DispatchCaller {
+                pane_id: "dispatcher".to_string(),
+                agent_id: "dispatcher-agent".to_string(),
+                unit_name: name.to_string(),
+            }),
+        };
+
+        let (reached, release) = registry.pause_at_for_test(seam);
+        let dispatch = {
+            let name = name.to_string();
+            tokio::spawn(async move {
+                handle_dispatch(
+                    &ctx,
+                    &name,
+                    "task",
+                    Some(&crate::event::DispatchShape::SingleAgent),
+                    LaunchChoice::default(),
+                )
+                .await
+            })
+        };
+        reached.await.expect("the dispatch reaches the seam");
+        let draining = registry.clone();
+        tokio::task::spawn_blocking(move || {
+            draining.shutdown_all_graceful(std::time::Duration::ZERO);
+        })
+        .await
+        .unwrap();
+        release.send(()).unwrap();
+        let result = dispatch.await.unwrap();
+
+        let journal = registry.work().journal().unwrap();
+        journal.flush();
+        let read = read_journal(&state_dir).unwrap();
+        let list = crate::interrupted_work::derive_with_home(
+            &read,
+            &crate::launch_records::LaunchRead::default(),
+            |_| false,
+            &[],
+            &home,
+        );
+        (result, tmp, repo, list)
+    }
+
+    /// The assertions both shutdown windows share: the dispatch failed, its
+    /// worktree and branch are kept, and the restarted daemon lists the unit
+    /// as interrupted work naming that worktree.
+    #[cfg(unix)]
+    fn assert_kept_as_interrupted(
+        name: &str,
+        result: &DispatchResult,
+        tmp: &tempfile::TempDir,
+        repo: &Path,
+        list: &crate::interrupted_work::InterruptedList,
+    ) {
+        assert!(!result.success, "{}", result.message);
+        assert!(
+            result.worktree_dir.is_dir(),
+            "the unit's worktree must stay on disk: {}",
+            result.message
+        );
+        assert!(
+            result.message.contains("interrupted list"),
+            "the answer says where the unit went: {}",
+            result.message
+        );
+        let branch = format!("agent/dispatch-{name}");
+        assert!(
+            branch_exists(tmp.path(), repo, &branch),
+            "its branch must stay too"
+        );
+        let worktree = std::fs::canonicalize(&result.worktree_dir).unwrap();
+        let listed: Vec<_> = list
+            .items
+            .iter()
+            .filter(|item| item.kind == crate::interrupted_work::ItemKind::Unit)
+            .collect();
+        assert_eq!(listed.len(), 1, "one interrupted unit: {list:?}");
+        let listed_at = listed[0]
+            .worktree
+            .as_deref()
+            .map(|w| std::fs::canonicalize(w).unwrap());
+        assert_eq!(listed_at.as_deref(), Some(worktree.as_path()), "{list:?}");
+        assert_eq!(listed[0].branch.as_deref(), Some(branch.as_str()));
+    }
+
+    /// Scenario: a dispatch's agent is running and its first prompt is not
+    /// posted yet when the daemon stops; the stop drains the agent, so the
+    /// post fails. The unit is kept, not rolled back: its worktree and branch
+    /// stay, and a restarted daemon lists it as interrupted work.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_shutdown_before_the_first_prompt_keeps_the_unit_as_interrupted_work() {
+        let name = "cut-at-seed";
+        let (result, tmp, repo, list) =
+            dispatch_cut_short_by_shutdown(name, crate::spawn::PAUSE_DISPATCH_SEED).await;
+        assert_kept_as_interrupted(name, &result, &tmp, &repo, &list);
+    }
+
+    /// Scenario: the daemon stops after a dispatch's agent came up and before
+    /// the unit was published, so the spawn finds its agent gone. As above,
+    /// the unit is kept and listed as interrupted work after the restart.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_shutdown_before_the_unit_is_published_keeps_it_as_interrupted_work() {
+        let name = "cut-at-publication";
+        let (result, tmp, repo, list) =
+            dispatch_cut_short_by_shutdown(name, "dispatch-publication").await;
+        assert_kept_as_interrupted(name, &result, &tmp, &repo, &list);
     }
 
     /// Scenario: reviewer nit-R1 (PRD #1589) — a dispatched orchestration is

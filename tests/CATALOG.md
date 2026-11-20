@@ -870,6 +870,13 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 - **Does not assert:** the desktop dialog (`desktop/src/components/InterruptedWork.test.tsx`, "says a failed refresh may leave the list out of date"); a failed first fetch, which shows only the failure.
 - **Platform coverage:** mac+linux.
 
+##### journal/interrupted/038 — A daemon stop while a dispatch is still starting keeps its unit as interrupted work.
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_interrupted_work.rs`); the real `dot-agent-deck dispatch` CLI from a routing stand-in dispatcher; the spawn's `dispatch-seed` pause armed through `DOT_AGENT_DECK_TEST_WORK_DONE_PAUSE_DIR`; the stop is SIGTERM to the daemon's own pid, then a second `daemon serve` on the same state directory.
+- **Agent:** synthetic: a `--single --command <script> --agent opencode` unit whose script ignores SIGTERM and records that it got one, so the stopping daemon waits out its grace while the dispatch goes on.
+- **Asserts:** the CLI is answered and the unit's agent runs, with its attempt in the journal, while the seam holds its first prompt; the stop drains the agent (the script got SIGTERM) before the seam is released, so posting the prompt fails; after the restart the unit's worktree and branch `agent/dispatch-interrupted-cut` are on disk, and `interrupted list --json` lists a `unit` item naming that worktree; `interrupted reclaim <id>` exits 0 with `RECLAIM_REMOVED`, removes the worktree and keeps the branch, since its ownership marker names this launch (PR #2431 round 5).
+- **Does not assert:** the window before the unit's agent is published (`dispatch::tests::a_shutdown_before_the_unit_is_published_keeps_it_as_interrupted_work`); an orchestration-shaped unit or a scheduled issue dispatch cut short the same way (`work_tracking::tests::a_launch_the_shutdown_cut_short_stays_open_once_something_of_it_was_written` holds their journal half).
+- **Platform coverage:** mac+linux.
+
 #### journal/compat
 
 ##### journal/compat/001 — Lines of a newer schema or an unknown kind are skipped and kept.

@@ -1572,6 +1572,28 @@ impl WorkTracker {
         self.close(work, how);
     }
 
+    /// PR #2431 round 5: launch `work`'s spawn was cut short by this daemon
+    /// shutting down ([`crate::spawn::SpawnError::ShutdownWhileStarting`]).
+    /// When something of it was written, its `opened` is written if it is
+    /// still held and it stays open: the attempts the shutdown interrupted
+    /// list it as interrupted work after the restart. Answers whether it was
+    /// kept; when nothing of it was written it is forgotten, as
+    /// [`Self::launch_failed`] forgets it, since nothing lists it then.
+    pub fn launch_interrupted(&self, work: &WorkId) -> bool {
+        let Some(journal) = self.journal() else {
+            return false;
+        };
+        let mut book = self.book();
+        let launch = book.launches.remove(work).unwrap_or_default();
+        if !launch.written {
+            drop(book);
+            self.forget(work);
+            return false;
+        }
+        Self::flush_locked(journal, &mut book, work);
+        !launch.closed
+    }
+
     /// Orchestration instance `instance` lost its last role pane: its work
     /// closes, and a later start of the same instance id opens a new one.
     pub fn orchestration_ended(&self, instance: &str) {

@@ -6,7 +6,7 @@ When the deck daemon restarts, the agents it was running stop. The units a dispa
 
 Each item is one piece of work that a restart stopped before it finished:
 
-- **Units** that `dot-agent-deck dispatch` started, single agents and orchestrations alike, with the unit's branch (`agent/dispatch-<name>`) and worktree.
+- **Units** that `dot-agent-deck dispatch` started, single agents and orchestrations alike, with the unit's branch (`agent/dispatch-<name>`) and worktree. A unit whose agent had started but had not yet received its task when the daemon stopped is listed too, and its worktree and branch are kept for it.
 - **Orchestrations** you started from the TUI or the desktop app, or that a schedule started, as one item for the whole team.
 - **Issue dispatches** a schedule started, with the issue they were working on.
 - **Other agents**: agents you started yourself, or that a plain schedule started, in a folder of yours rather than in a worktree the deck created. They are listed in a group of their own, under **Other agents**.

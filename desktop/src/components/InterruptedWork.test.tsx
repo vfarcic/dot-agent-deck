@@ -1235,4 +1235,25 @@ describe("a request to show interrupted work that the person moved on from (PR #
     await act(async () => { await new Promise((resolve) => setTimeout(resolve, 20)); });
     expect(screen.queryByTestId("interrupted-dialog")).toBeNull();
   });
+
+  /** Scenario (PR #2431 round 5): two daemons, and the first daemon's Interrupted work dialog is open. Its last item goes and the second daemon gains work; "show interrupted work" with no daemon named asks both again, and the open dialog turns to the second daemon's list rather than staying on the first's empty one. */
+  it("retargets the Interrupted work dialog that was already open", async () => {
+    const lists: Record<string, InterruptedList> = { "process-a": { items: [unit()] }, "process-b": { items: [] } };
+    const { bridge, listed } = heldBridge(lists);
+    const fleet = [deckOf("process-a"), remoteDeck("deck-b", "beta", "process-b")];
+    const voice = voiced(bridge, fleet);
+    render(<voice.Voiced />);
+    await waitFor(() => expect(listed).toHaveLength(2));
+    const dialog = await openDialog();
+    expect(rowOf(UNIT_ID)).toBeDefined();
+
+    lists["process-a"] = { items: [] };
+    lists["process-b"] = { items: [team()] };
+    const before = listed.length;
+    await act(async () => { await VOICE_ACTIONS.showInterruptedWork.run(voice.context(), {}); });
+    await waitFor(() => expect(listed.length).toBeGreaterThanOrEqual(before + 2));
+    await waitFor(() => expect(within(screen.getByTestId("interrupted-dialog")).queryAllByTestId("interrupted-row").map((row) => row.getAttribute("data-item-id"))).toEqual([TEAM_ID]));
+    expect(dialog).toBeDefined();
+    expect(voice.reportRefused).not.toHaveBeenCalled();
+  });
 });

@@ -71,6 +71,12 @@ fn client_error(e: ClientError) -> CliOutput {
         return failed(words::NO_DAEMON, EXIT_UNREACHABLE);
     }
     match e {
+        // PR #2431 round 5 (Qodo): a running daemon on another attach
+        // protocol cannot serve interrupted work, which is exit 2. Only a
+        // client that checks the protocol meets this: the one-shot CLI's
+        // does not (`run_interrupted_cli` in `main.rs`), so it is answered
+        // by the daemon's capabilities alone.
+        ClientError::ProtocolMismatch { .. } => unsupported(),
         // The daemon's own sentence (an id that matches nothing, say).
         ClientError::Server(message) => failed(shown(&message), EXIT_REFUSED),
         other => failed(
