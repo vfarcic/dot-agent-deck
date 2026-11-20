@@ -15,6 +15,8 @@ Each item shows what the deck knows about it: its name, branch and worktree (a p
 
 Work that finished, work you closed and work that is still running are listed only when they carry a report nobody received (below).
 
+The list is not a permanent inventory. The deck forgets old work after a while, so an item you neither reclaim nor dismiss eventually leaves the list on its own, while its worktree and branch stay on disk. Reclaim what you no longer need while it is listed.
+
 ### Reports nobody received
 
 A worker or a unit sends its report to the orchestrator or dispatcher that gave it the task. When that agent is no longer running, the deck keeps the report instead of handing it to whoever took its place, and lists it with the work that sent it. This happens after a restart, and also while the deck keeps running, for example when you closed the dispatcher before its unit reported: the unit is then listed with its report even though no restart happened.
@@ -25,7 +27,7 @@ Each kept report is shown with its id and `kept until <date>`, the day the deck 
 
 ### TUI
 
-When the daemon the TUI is attached to has interrupted work, a row above the footer says how many items there are, such as `3 interrupted items from before the restart`, with `[Show I]` and `[Hide X]`. In command mode, press `I` (or click `[Show I]`) to open the **Interrupted work** list, and `X` to hide the row. If you are typing in a pane, press `Ctrl+D` first. Hiding the row is not saved: it comes back when the TUI attaches to a restarted daemon or is started again. `I` opens the list whether or not the row is shown.
+When the daemon the TUI is attached to has interrupted work, a row above the footer says how many items there are, such as `3 interrupted items from before the restart`, with `[Show I]` and `[Hide X]`. The row counts what the daemon listed when the TUI attached, opened the list, or reclaimed or dismissed an item; `I` asks the daemon again, so it also finds a report kept since then. In command mode, press `I` (or click `[Show I]`) to open the **Interrupted work** list, and `X` to hide the row. If you are typing in a pane, press `Ctrl+D` first. Hiding the row is not saved: it comes back when the TUI attaches to a restarted daemon or is started again. `I` opens the list whether or not the row is shown.
 
 ![The TUI's Interrupted work list, opened with I from the footer row 3 interrupted items from before the restart: the unit fix-login on branch agent/dispatch-fix-login is selected, with its worktree, who started it, its last entry and progress; below it the orchestration release-team, and under Other agents the agent scratch-shell with its folder; the keys j/k select, Enter details, r reclaim, d dismiss, D dismiss all and Esc close are at the bottom](/img/interrupted-work-tui.png)
 
@@ -42,19 +44,19 @@ In the list:
 | `d` | **Dismiss** the selected item |
 | `D` | **Dismiss all** (asks first) |
 | `y` / `n` | Answer a reclaim or dismiss-all question |
-| `Esc`, `q` or `I` | Close the list (`Esc` and `q` go back from the details or a question first) |
+| `Esc`, `q` or `I` | `I` closes from the item list; `Esc` or `q` return from an item's details or a question, then close from the list |
 
 You can rebind `I` and `X` in `keybindings.toml` (`interrupted_work` and `hide_interrupted_work`, see [Keyboard Shortcuts](keyboard-shortcuts.md#actions-and-defaults)); the keys inside the list are fixed.
 
 ### Desktop app
 
-On the agent dashboard, each daemon that has interrupted work shows a banner in its section with the same words, such as `3 interrupted items from before the restart`, and **Show** and **Hide** buttons. **Show** opens that daemon's **Interrupted work** dialog. **Hide** hides the banner until the app connects to a restarted daemon or is started again. After a restart, the notice in the corner that names the stopped agents also says how many interrupted items there are, with a **Show** button that opens the dashboard and, when only one daemon has interrupted work, its dialog.
+On the agent dashboard, each daemon that has interrupted work shows a banner in its section with the same words, such as `3 interrupted items from before the restart`, and **Show** and **Hide** buttons. **Show** opens that daemon's **Interrupted work** dialog. **Hide** hides the banner until the app connects to a restarted daemon or is started again. The banner counts what the daemon listed when the app connected to it, opened its dialog, or reclaimed or dismissed an item. After a restart, the notice in the corner that names the stopped agents also says how many interrupted items there are, with a **Show** button that opens the dashboard and, when only one daemon has interrupted work, its dialog.
 
 ![The desktop app's Interrupted work dialog for the Local daemon, opened from the banner 3 interrupted items from before the restart: the unit fix-login on branch agent/dispatch-fix-login is selected, with its worktree, who started it, its last entry and progress; below it the orchestration release-team, and under Other agents the agent scratch-shell with its folder; the buttons Details, Reclaim, Dismiss and Dismiss all are at the bottom](/img/interrupted-work-desktop.png)
 
 You can also press `I` on the dashboard. It asks the daemons for their interrupted work again before deciding, so it finds work left since the banner was last updated. With one daemon connected, it opens that daemon's dialog; with several, it opens the dialog of the one that has interrupted work, or, when several have, the dashboard says which ones and you open the one you want from its banner. If a daemon could not be asked, the dashboard says so rather than that there is nothing. `X` hides the banner, as its **Hide** button does; with several banners on the dashboard, `X` hides none and you use the **Hide** of the one you mean.
 
-In the dialog, click an item to select it, or use the same keys as the TUI: `j` / `k`, `Enter`, `n` / `p`, `r`, `d`, `D`, `y` / `n`, and `Esc`, `q` or `I` to close. In an item's details, its reports and a question, `j` / `k` scroll the dialog. The buttons are **Details**, **Show reports**, **Next reports**, **Previous reports**, **Reclaim**, **Dismiss**, **Dismiss all** and **Back**.
+In the dialog, click an item to select it, or use the same keys as the TUI: `j` / `k`, `Enter`, `n` / `p`, `r`, `d`, `D`, `y` / `n`, and `Esc`, `q` or `I` as in the TUI: `I` closes from the item list, and `Esc` or `q` return from an item's details or a question, then close from the list. In an item's details, its reports and a question, `j` / `k` scroll the dialog. The buttons are **Details**, **Show reports**, **Next reports**, **Previous reports**, **Reclaim**, **Dismiss**, **Dismiss all** and **Back**.
 
 By voice ([Voice Control](desktop/voice.md#interrupted-work)), say:
 
@@ -94,7 +96,9 @@ dot-agent-deck interrupted dismiss --all        # stop listing every item (asks 
 
 ## Reclaim a worktree
 
-**Reclaim** removes the item's worktree and keeps its branch, so the work you committed is still there and a pull request from it is untouched. It is offered for units, orchestrations and issue dispatches, which run in a worktree the deck created. A plain agent's folder is yours, so there is nothing to reclaim: dismiss it instead.
+**Reclaim** removes the item's worktree and keeps its branch, so the work you committed is still there and a pull request from it is untouched. It is offered for units, orchestrations and issue dispatches, and it removes a worktree only when the deck created it for that work, as it does for a dispatched unit or an issue dispatch. A team you started in your own folder ran there, not in a worktree the deck created: reclaim refuses it and removes nothing, and you can dismiss it. A plain agent's folder is yours too, so there is nothing to reclaim: dismiss it instead.
+
+> **Copy what you want to keep first.** Reclaim deletes the whole worktree folder, including the files Git ignores there, such as build output, local notes or a saved task. The branch keeps only what was committed.
 
 The TUI and the desktop app first check what reclaiming would do and show it, such as `Reclaim would remove its worktree and keep its branch.`, and remove the worktree only when you answer `y` or click **Reclaim** to confirm. From a shell, `reclaim --dry-run` shows the same answer and `reclaim` acts on it. The item then leaves the list: `Reclaimed: its worktree was removed and its branch kept.`
 
@@ -115,9 +119,9 @@ The branch is never deleted. A kept branch stops you dispatching a unit of the s
 
 ## Dismiss
 
-**Dismiss** takes an item off the list and changes nothing else: its worktree, branch and kept reports stay as they are, and the reports are still deleted on their `kept until` date. In the TUI and the desktop app, `d` and the **Dismiss** button dismiss the selected item at once; asking by voice shows a question first. In both clients **Dismiss all** asks first and dismisses exactly the items its question named, so an item that appears while you are answering is not swept up. From a shell, `dismiss --all` asks on the terminal, or dismisses without asking with `--yes`. A dismissal is saved: a dismissed item stays off the list after later restarts, in every client.
+**Dismiss** takes an item off the list and changes nothing else: its worktree, branch and kept reports stay as they are, and the reports are still deleted on their `kept until` date. In the TUI and the desktop app, `d` and the **Dismiss** button dismiss the selected item at once; asking by voice shows a question first. In both clients **Dismiss all** asks first and dismisses exactly the items its question named, so an item that appears while you are answering is not swept up. From a shell, `dismiss --all` asks on the terminal and then dismisses exactly the items it listed, or dismisses without asking with `--yes`. A dismissal is saved: a dismissed item stays off the list after later restarts, in every client.
 
-A **Dismiss all** of many items is sent to the daemon in parts. If the daemon is restarted, stops answering or refuses partway through, the rest are not sent, and the answer after `Dismissed.` says how many items were not, or may not have been, dismissed, such as `1 more item may not have been dismissed: the deck daemon was replaced. List the interrupted work again.` Open the list again to see what is left.
+A **Dismiss all** of many items, or a `dismiss` naming many, is sent in parts, all to the same daemon. If that daemon is restarted, stops answering or refuses partway through, the rest are not sent, and the answer says how many items were not, or may not have been, dismissed, such as `1 more item may not have been dismissed: the deck daemon was replaced. List the interrupted work again.`; from a shell the command then exits 1. Open the list again to see what is left.
 
 ## Agents can list, not change
 
@@ -134,9 +138,9 @@ An agent running in one of the deck's panes can run `interrupted list` and `inte
 
 | Symptom | Cause | What to do |
 |---|---|---|
-| `The running deck daemon does not support interrupted work. …` (exit 2), and the TUI and the desktop app show no row or banner | The daemon was started by an older version of the deck. | Restart it onto this version with `dot-agent-deck daemon restart` ([Recycling the daemon](troubleshooting.md#recycling-the-daemon)). |
+| `The running deck daemon does not support interrupted work. …` (exit 2), and the TUI and the desktop app show no row or banner | The daemon was started by an older version of the deck. | Finish or stop the agents it runs, since stopping it stops them, then stop it with `dot-agent-deck daemon restart`. That command only stops the daemon: start the new one by opening the TUI, pressing **Start daemon** in the desktop app, or running `dot-agent-deck daemon serve` where nothing else starts it ([Recycling the daemon](troubleshooting.md#recycling-the-daemon)). |
 | `No deck daemon is running.` (exit 3) | Nothing is listening on the deck's socket. | Start the deck, or point `DOT_AGENT_DECK_ATTACH_SOCKET` at the daemon you mean. |
-| `The deck could not read its whole work journal, so an item may be missing or out of date.` | Part of the record the list is built from could not be read. | The list shows what could be read. Reclaim and dismiss refuse an item they cannot be sure of; try again later. |
+| `The deck could not read its whole work journal, so an item may be missing or out of date.` | Part of the record the list is built from could not be read. | The list shows what could be read. While the deck cannot read its whole work journal, reclaim and dismiss are refused with `Refused: the deck could not read its whole work journal, …` and change nothing; try again later. |
 | `pull request unknown` | The GitHub CLI is not installed or signed in, or did not answer in time. | Check `gh auth status`. Reclaim does not depend on it. |
 | `No interrupted item has that id, name or branch.` | Nothing listed matches what you typed, or another client has since dismissed or reclaimed it. | Run `interrupted list` and use the id it prints. |
 | `More than one interrupted item matches; use the item's id.` | The name or branch you typed belongs to several items. | Use the item's id. |
