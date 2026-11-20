@@ -632,7 +632,6 @@ fn resize_burst_trial(trial: usize) -> bool {
     // machine, and well short of the 30 s backoff step a counted failure
     // waits.
     const BOUND: Duration = Duration::from_secs(15);
-    const RESIZES: usize = 3;
     let codex = Installed::new(&[]);
     codex.assert_installed();
     codex.wait_armable();
@@ -656,19 +655,20 @@ fn resize_burst_trial(trial: usize) -> bool {
         "trial {trial}: the emptied box must go quiet before the burst; {}",
         codex.evidence()
     );
-    // The burst's own timing (CX-5h's): one-column resizes 200 ms apart and
-    // the task 200 ms after the last, the scenario rather than a wait for
-    // any state.
-    let mut cols = 140;
-    for _ in 0..RESIZES {
-        cols = if cols == 140 { 139 } else { 140 };
+    // The burst's own schedule (CX-5h's): one-column resizes 200 ms apart
+    // and the task 200 ms after the last, the scenario rather than a wait
+    // for any state.
+    const GAP: Duration = Duration::from_millis(200);
+    let start = Instant::now();
+    for (n, cols) in [139, 140, 139].into_iter().enumerate() {
+        helper_pause::until(start + GAP * n as u32);
         let reply = inbox::attach(
             &codex.deck,
             json!({"op": "resize", "id": codex.pane.agent, "rows": 40, "cols": cols}),
         );
         assert_eq!(reply["ok"], true, "resize: {reply}");
-        std::thread::sleep(Duration::from_millis(200));
     }
+    helper_pause::until(start + GAP * 3);
     let since = codex.log().len();
     let name = format!("p104-burst-104{trial}.txt");
     let posted = Instant::now();
