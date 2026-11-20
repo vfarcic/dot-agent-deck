@@ -591,7 +591,7 @@ fi
 #   ~/.local/share/dot-agent-deck/opencode-1/bin/opencode
 # (select it with DOT_AGENT_DECK_OPENCODE_TEST_BIN): a stable link into npm's
 # layout under that prefix, which no PATH includes.
-OPENCODE_1_VERSION=1.19.5
+OPENCODE_1_VERSION=1.19.6
 OPENCODE_1_DIR="$HOME/.local/share/dot-agent-deck/opencode-1"
 oc1_version() { "$OPENCODE_1_DIR/bin/opencode" --version 2>/dev/null | head -n1; }
 if [ "$(oc1_version)" != "$OPENCODE_1_VERSION" ]; then
