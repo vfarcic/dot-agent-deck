@@ -96,6 +96,12 @@ pub fn not_started_after_from_env() -> Duration {
 /// ingest, so the memory only has to outlast that, not hours.
 pub(super) const EXITED_TURN_KEYS: usize = 1024;
 
+/// Issue #2133: how long after a turn ends a once-waiter armed before it
+/// still waits for the waiter Claude's `Stop` hook arms. That one registered
+/// 7 to 35 ms after the turn's Idle in every measured run, under three
+/// busy-loop processes per CPU.
+pub(super) const STOP_ARM_GRACE: Duration = Duration::from_secs(5);
+
 /// PRD #1666 G3: one generation's turns, as its own hook reports reached the
 /// daemon. Kept apart from [`Gen`]: an edge creates no receipt generation,
 /// and a registration reads the clock without resetting it.
@@ -380,17 +386,27 @@ impl Receipts {
     /// handed nothing, if it is held: it was armed before `key`'s latest turn
     /// started. Claude Code takes a wake that lands mid-turn into the running
     /// turn as a queued command: no prompt hook runs for it, so nothing can
-    /// confirm it (measured on 2.1.328), and the model may finish the turn it
-    /// was on without acting on it. A waiter armed before the turn that exits
-    /// as the turn ends did not wake Claude in three of five runs either. So
-    /// the batch is left to the waiter Claude's `Stop` hook arms when the turn
-    /// ends. The hold lasts at most one ack-wait from the turn's start, so a
-    /// turn whose end the deck never sees (an interrupted one, say), or one
-    /// after which no waiter arms, keeps the mail from the older waiter no
-    /// longer than that.
+    /// confirm it (measured on 2.1.328 and 2.1.329), and the model may finish
+    /// the turn it was on without acting on it. A waiter armed before the
+    /// turn that exits as the turn ends did not wake Claude in three of five
+    /// runs either. So the batch is left to the waiter Claude's `Stop` hook
+    /// arms when the turn ends, which supersedes this one.
+    ///
+    /// The hold ends at the earlier of one ack-wait from the turn's start,
+    /// for a turn whose end the deck never sees, and [`STOP_ARM_GRACE`] after
+    /// the turn ended, for an end no `Stop` hook follows (a prompt another
+    /// hook blocked, #2347): the older waiter is then the only one.
     pub(super) fn once_hold_until(&self, key: &AgentKey, registered: Instant) -> Option<Instant> {
-        let started = self.turns.get(key)?.started_at?;
-        (registered < started).then(|| started + self.limits.ack_wait)
+        let clock = self.turns.get(key)?;
+        let started = clock.started_at?;
+        if registered >= started {
+            return None;
+        }
+        let cap = started + self.limits.ack_wait;
+        let ended = clock
+            .idle_since
+            .filter(|ended| !clock.busy && *ended >= started);
+        Some(ended.map_or(cap, |ended| (ended + STOP_ARM_GRACE).min(cap)))
     }
 
     /// The generation's floor blocks delivery (§11).

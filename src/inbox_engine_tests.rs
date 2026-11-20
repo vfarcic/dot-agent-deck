@@ -5918,3 +5918,40 @@ async fn boundary_076_possession_reported_with_the_check_is_fresh_at_the_check()
         }
     }
 }
+
+/// Issue #2133: a once-waiter armed before the latest turn started is held
+/// until one ack-wait from that start while the turn runs, and once the turn
+/// has ended, until the `Stop` arm grace after its end if that comes sooner.
+/// A waiter armed after the turn started is not held at all.
+#[test]
+fn a_waiter_armed_before_a_turn_is_held_until_the_stop_grace_or_the_ack_wait() {
+    use crate::agent_pty::TurnEdge::{Ended, Started};
+    let key: AgentKey = ("p".into(), "a".into());
+    for ack_wait in [Duration::from_secs(60), Duration::from_secs(3)] {
+        let hub = hub_with(Duration::from_secs(30), ack_wait);
+        let t = Instant::now();
+        let before = t.checked_sub(Duration::from_secs(1)).unwrap();
+        let held = |registered| hub.lock().receipts.once_hold_until(&key, registered);
+        assert_eq!(held(before), None, "{ack_wait:?}: no turn yet, no hold");
+        hub.note_turn("p", "a", turn(1, Started), t);
+        assert_eq!(
+            held(before),
+            Some(t + ack_wait),
+            "{ack_wait:?}: while it runs"
+        );
+        assert_eq!(held(t), None, "{ack_wait:?}: armed as it started");
+        let ended = t + Duration::from_secs(2);
+        hub.note_turn("p", "a", turn(2, Ended), ended);
+        assert_eq!(
+            held(before),
+            Some((ended + engine::STOP_ARM_GRACE).min(t + ack_wait)),
+            "{ack_wait:?}: once it ended"
+        );
+        hub.note_turn("p", "a", turn(3, Started), ended + Duration::from_secs(1));
+        assert_eq!(
+            held(ended),
+            Some(ended + Duration::from_secs(1) + ack_wait),
+            "{ack_wait:?}: the next turn holds the waiter its Stop armed"
+        );
+    }
+}
