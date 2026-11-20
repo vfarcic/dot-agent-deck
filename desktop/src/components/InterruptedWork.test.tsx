@@ -1044,6 +1044,29 @@ describe("X hides a banner, as the TUI's X hides its row (final reviewer 3)", ()
     expect(dismissCalls(calls)).toEqual([]);
   });
 
+  /** Scenario: two daemons' lists arrive while nothing else is happening, and `X` is pressed at the very moment both banners are first on screen, before React has run its later effects. `X` acts on the banners shown: it hides neither and says that several daemons have one. */
+  it("acts on the banners on screen when X is pressed as they first appear", async () => {
+    const { bridge } = recordingBridge({ list: three() });
+    const fleet = [deckOf("process-a"), remoteDeck("deck-b", "beta", "process-b")];
+    const voice = voiced(bridge, fleet);
+    let pressed = false;
+    /* A MutationObserver runs as a microtask right after the commit that draws the banners: earlier than React's passive effects, which it schedules as a later task. */
+    const observer = new MutationObserver(() => {
+      if (pressed || document.querySelectorAll("[data-testid='interrupted-banner']").length < 2) return;
+      pressed = true;
+      fireEvent.keyDown(document.body, { key: "X" });
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+    try {
+      render(<voice.Voiced />);
+      await waitFor(() => expect(pressed).toBe(true));
+    } finally {
+      observer.disconnect();
+    }
+    await waitFor(() => expect(screen.getByText(/Several daemons have interrupted work/)).toBeInTheDocument());
+    expect(screen.getAllByTestId("interrupted-banner")).toHaveLength(2);
+  });
+
   /** Scenario: two daemons' banners are up; `X` hides neither and says that several daemons have one. Once the first daemon's banner is hidden with its Hide button, `X` hides the other one. */
   it("asks which banner when several are up", async () => {
     const { bridge, calls } = recordingBridge({ list: three() });

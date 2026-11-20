@@ -1,4 +1,4 @@
-import { Children, cloneElement, createContext, isValidElement, useCallback, useContext, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type MouseEvent, type ReactNode } from "react";
+import { Children, cloneElement, createContext, isValidElement, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent, type ReactNode } from "react";
 import { Blocks, Boxes, CircleArrowUp, CircleStop, Columns3, Filter, LayoutList, Layers, Maximize2, Network, Play, Plus, RefreshCw, RotateCcw, Server, ShieldAlert, Sparkles, SquareTerminal, Wrench, X } from "lucide-react";
 import { desktopFeaturesOf } from "../types";
 import { KEEP_WORKTREE_SUFFIX, worktreePreview } from "../lib/worktreeClose";
@@ -1503,8 +1503,15 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     several, the dashboard says so, as voice's "show interrupted work" does.
     `X` hides a banner. Both stand down where the Ctrl+N shortcut does, and
     under any modal.
+
+    A layout effect, not a passive one: the listener reads the banners'
+    state from its closure, and a passive effect re-registers it only in a
+    task React schedules after the commit, so a key pressed once the banners
+    were drawn but before that task ran was handled against the state before
+    them (`X` with two banners up did nothing). A layout effect runs inside
+    the commit, so the listener always matches what is drawn.
   */
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!interrupted || agentPaneOpen || newAgent) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if ((event.key !== "I" && event.key !== "X") || event.ctrlKey || event.metaKey || event.altKey || event.defaultPrevented) return;
