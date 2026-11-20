@@ -75,14 +75,22 @@
 //! (above). Neither stops another process
 //! (a terminal, a Git command, another tool) from moving, replacing or
 //! switching the worktree, or adding a worktree inside it. The re-validation
-//! narrows that to the gap between its last check (the second device and
-//! inode check) and `git worktree remove` acting on the path, which nothing
-//! here closes: `git worktree remove` resolves the path itself, so a process
-//! that swaps another clean tree in at that path inside that gap can still
-//! have that tree removed, and a worktree added inside it in that gap is
-//! removed with it. Without `--force` Git itself refuses to remove a
-//! worktree with modified tracked files or untracked files; that refusal
-//! does not cover ignored files.
+//! checks each fact once, at its own point, and each has its own window
+//! between that check and `git worktree remove` acting on the path, which
+//! nothing here closes. The directory's identity is checked last (the second
+//! device and inode check), so a process that swaps another clean tree in at
+//! that path after it can still have that tree removed: `git worktree remove`
+//! resolves the path itself. The owner marker, the branch and the set of
+//! worktrees inside it are checked earlier, and changing one of them in place
+//! changes neither the directory's device nor its inode, so the identity
+//! check after them does not notice: a marker removed or a branch switched
+//! after its own check, or a worktree added inside the tree after the nested
+//! list was taken, is not seen, and that nested worktree is removed with it.
+//! Without `--force`, Git refuses to remove a worktree in which it reports
+//! modified tracked files or untracked files. That covers only what Git
+//! reports: ignored files are removed, and so are changes to a tracked file
+//! Git is told not to look at (`git update-index --assume-unchanged` or
+//! `--skip-worktree`).
 //!
 //! A removal that succeeds writes `closed how=reclaimed` on the item's works
 //! from the task that owns the removal, while it still holds the worktree,
