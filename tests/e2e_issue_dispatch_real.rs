@@ -144,18 +144,18 @@ fn pane_screen(deck: &TuiDeck, agent: &str) -> String {
     parser.screen().contents()
 }
 
-/// Whether the inbox of the worker's pane `pane` holds a task the
-/// orchestrator sent it that the worker acknowledged: the delegation, as the
-/// worker received it.
-fn worker_took_a_delegated_task(deck: &TuiDeck, pane: &str) -> bool {
+/// Whether the inbox of the worker's pane `pane` holds a task sent from the
+/// orchestrator's pane `orchestrator` that the worker acknowledged: the
+/// delegation, as the worker received it. Matched by the sender's pane, not
+/// its role: on this start path the sender carries no role name.
+fn worker_took_a_delegated_task(deck: &TuiDeck, pane: &str, orchestrator: &str) -> bool {
     inbox_view::messages(deck.attach_socket_path(), pane)
         .into_iter()
         .any(|message| {
             message.state == dot_agent_deck::inbox::StateName::Acknowledged
                 && matches!(
                     &message.from,
-                    dot_agent_deck::inbox::Sender::Agent { role: Some(role), .. }
-                        if role == "orchestrator"
+                    dot_agent_deck::inbox::Sender::Agent { pane_id, .. } if pane_id == orchestrator
                 )
         })
 }
@@ -399,9 +399,11 @@ fn dispatch_013_orchestration_surfaces_and_delegates() {
     // proved nothing: the orchestrator could list the files itself, and in
     // three runs on 2026-11-20 it did, with the worker idle.
     const DELEGATION_WAIT: Duration = Duration::from_secs(150);
+    let (_, orchestrator_pane) =
+        role_agent(&deck, "orchestrator").expect("the orchestrator registered above");
     let worker_shows_it = || {
         role_agent(&deck, "worker").is_some_and(|(agent, pane)| {
-            worker_took_a_delegated_task(&deck, &pane)
+            worker_took_a_delegated_task(&deck, &pane, &orchestrator_pane)
                 && pane_screen(&deck, &agent).contains(SENTINEL)
         })
     };
