@@ -312,6 +312,41 @@ fn reclaim_refuses_a_truncated_journal_read() {
     });
 }
 
+/// R2 (docs review): a truncated journal read can omit an item's
+/// descendants, so a dismissal then would close the root and leave works
+/// under it unclosed. Dismiss refuses it, as reclaim does, for one id and for
+/// Dismiss all, and writes no close.
+#[test]
+fn dismiss_refuses_a_truncated_journal_read_and_writes_no_close() {
+    rt().block_on(async {
+        let state = crate::test_temp::tempdir().unwrap();
+        let defaults = Budgets::default();
+        let options = JournalOptions {
+            budgets: Budgets {
+                read: Budget {
+                    entries: 4,
+                    ..defaults.read
+                },
+                ..defaults
+            },
+            ..JournalOptions::default()
+        };
+        let registry = registry_with_journal(state.path(), options);
+        let (root, _) = unit(&registry, "agent/dispatch-x", None);
+        let whole = |o: &DismissOutcome| o.refusal.as_ref().map(|r| r.reason);
+
+        let one = dismiss(&registry, vec![root.to_string()], false, None).await;
+        assert_eq!(whole(&one), Some(RefusalReason::IncompleteRead), "{one:?}");
+        assert!(one.dismissed.is_empty(), "{one:?}");
+
+        let all = dismiss(&registry, Vec::new(), true, None).await;
+        assert_eq!(whole(&all), Some(RefusalReason::IncompleteRead), "{all:?}");
+        assert!(all.dismissed.is_empty(), "{all:?}");
+
+        assert!(closes(&registry).is_empty(), "no close was written");
+    });
+}
+
 #[test]
 fn reclaim_refuses_a_worktree_without_the_owner_marker_or_on_another_branch() {
     rt().block_on(async {

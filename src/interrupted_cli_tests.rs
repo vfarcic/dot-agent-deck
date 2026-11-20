@@ -571,3 +571,214 @@ fn a_malformed_reply_cannot_move_the_terminal_through_a_body_or_a_dismissed_id()
     assert!(!live(&out.stdout) && !live(&out.stderr), "{out:?}");
     assert!(out.stdout.contains("red"), "{out:?}");
 }
+
+// ---------------------------------------------------------------------------
+// A dismissal pinned to one daemon process (verification finding A)
+// ---------------------------------------------------------------------------
+
+/// One request a [`replacing_daemon`] received after its `Hello`: the daemon
+/// process that received it, its `op` and the ids it named.
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+struct Received {
+    instance: String,
+    op: String,
+    ids: Vec<String>,
+}
+
+/// A fake daemon on its own socket whose `Hello` names the process
+/// `first` on its first `replaced_after` connections, and `second` after
+/// them, as a daemon replaced between two requests would. It lists `listed`
+/// items and dismisses every id it is sent. Answers the client, and every
+/// request after a `Hello` it received.
+#[cfg(unix)]
+fn replacing_daemon(
+    listed: usize,
+    replaced_after: usize,
+) -> (
+    tempfile::TempDir,
+    DaemonClient,
+    std::sync::Arc<std::sync::Mutex<Vec<Received>>>,
+    tokio::runtime::Runtime,
+) {
+    use crate::daemon_protocol::{AttachResponse, PROTOCOL_VERSION, read_frame, write_resp};
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let dir = crate::test_temp::tempdir().unwrap();
+    let path = dir.path().join("replacing-daemon.sock");
+    let listener = {
+        let _enter = rt.enter();
+        tokio::net::UnixListener::bind(&path).expect("bind the fake daemon")
+    };
+    let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Received>::new()));
+    let log = received.clone();
+    let ids: Vec<String> = (0..listed)
+        .map(|n| format!("w-abcdefgh-{:016}", 1000 + n))
+        .collect();
+    rt.spawn(async move {
+        let mut connection = 0usize;
+        while let Ok((mut stream, _)) = listener.accept().await {
+            connection += 1;
+            let instance = if connection <= replaced_after {
+                "first-process"
+            } else {
+                "second-process"
+            };
+            let log = log.clone();
+            let ids = ids.clone();
+            tokio::spawn(async move {
+                let mut frames = 0usize;
+                while let Ok(Some((_kind, payload))) = read_frame(&mut stream).await {
+                    frames += 1;
+                    let request: serde_json::Value =
+                        serde_json::from_slice(&payload).unwrap_or_default();
+                    let op = request["op"].as_str().unwrap_or("").to_string();
+                    let response = if frames == 1 && op == "hello" {
+                        AttachResponse {
+                            capabilities: Some(vec![
+                                crate::daemon_protocol::CAP_INTERRUPTED_WORK.to_string(),
+                                crate::daemon_protocol::CAP_HELLO_FOLLOW_ON.to_string(),
+                            ]),
+                            instance_id: Some(instance.to_string()),
+                            ..AttachResponse::hello(PROTOCOL_VERSION)
+                        }
+                    } else {
+                        let named: Vec<String> = request["ids"]
+                            .as_array()
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|v| v.as_str().map(str::to_string))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        log.lock().unwrap().push(Received {
+                            instance: instance.to_string(),
+                            op: op.clone(),
+                            ids: named.clone(),
+                        });
+                        match op.as_str() {
+                            "list-interrupted-work" => AttachResponse {
+                                interrupted_work: Some(InterruptedList {
+                                    items: ids
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(n, id)| {
+                                            item(id, ItemKind::Unit, &format!("unit-{n}"))
+                                        })
+                                        .collect(),
+                                    incomplete: false,
+                                    omitted: 0,
+                                }),
+                                ..AttachResponse::ok()
+                            },
+                            "dismiss-interrupted" => AttachResponse {
+                                interrupted_dismiss: Some(DismissOutcome {
+                                    dismissed: named
+                                        .into_iter()
+                                        .map(|id| DismissedItem { id, name: None })
+                                        .collect(),
+                                    ..DismissOutcome::default()
+                                }),
+                                ..AttachResponse::ok()
+                            },
+                            _ => AttachResponse::err("malformed request"),
+                        }
+                    };
+                    if write_resp(&mut stream, &response).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    let client = DaemonClient::new(path);
+    (dir, client, received, rt)
+}
+
+/// Scenario: `interrupted dismiss` names 513 items, more than one request
+/// takes, so the CLI sends them in batches. The daemon process is replaced
+/// after the first batch answered: the CLI sends the replacement no
+/// dismissal, prints the items the first batch dismissed, says the rest may
+/// not have been dismissed because the daemon was replaced, and exits 1.
+#[cfg(unix)]
+#[test]
+fn a_dismissal_in_batches_sends_a_replaced_daemon_nothing() {
+    let (_dir, client, received, rt) = replacing_daemon(0, 1);
+    let ids: Vec<String> = (0..513)
+        .map(|n| format!("w-abcdefgh-{:016}", 5000 + n))
+        .collect();
+    let out = rt.block_on(run_dismiss(
+        &client,
+        &DismissArgs {
+            ids: ids.clone(),
+            all: false,
+            yes: false,
+        },
+        &AmbientIdentity::Person,
+        Confirm::NoTerminal,
+    ));
+    let received = received.lock().unwrap().clone();
+    let mutations: Vec<&Received> = received
+        .iter()
+        .filter(|r| r.op == "dismiss-interrupted")
+        .collect();
+    let seen: Vec<(&str, usize)> = mutations
+        .iter()
+        .map(|r| (r.instance.as_str(), r.ids.len()))
+        .collect();
+    assert!(
+        mutations.iter().all(|r| r.instance == "first-process"),
+        "no dismissal reached the replacement: {seen:?}"
+    );
+    assert_eq!(mutations.len(), 1, "{seen:?}");
+    assert_eq!(out.code, EXIT_REFUSED, "{out:?}");
+    assert!(out.stdout.contains(&ids[0]), "{}", out.stdout);
+    let why = words::dismiss_stopped_sentence(&words::DismissStopped {
+        reason: words::DismissStopReason::Replaced,
+        refusal: None,
+        not_sent: 513 - mutations[0].ids.len(),
+    });
+    assert!(out.stderr.contains(&why), "{why:?} in {}", out.stderr);
+}
+
+/// Scenario: `interrupted dismiss --all` lists the items and asks; while the
+/// question is open, the daemon process is replaced. After `y`, the CLI sends
+/// the replacement no dismissal, says nothing was dismissed because the
+/// daemon was replaced, and exits 1.
+#[cfg(unix)]
+#[test]
+fn a_dismiss_all_confirmed_against_a_replaced_daemon_sends_it_nothing() {
+    let (_dir, client, received, rt) = replacing_daemon(3, 1);
+    let mut asked = |_: &str| true;
+    let out = rt.block_on(run_dismiss(
+        &client,
+        &DismissArgs {
+            ids: Vec::new(),
+            all: true,
+            yes: false,
+        },
+        &AmbientIdentity::Person,
+        Confirm::Ask(&mut asked),
+    ));
+    let received = received.lock().unwrap().clone();
+    let seen: Vec<(&str, &str, usize)> = received
+        .iter()
+        .map(|r| (r.instance.as_str(), r.op.as_str(), r.ids.len()))
+        .collect();
+    assert!(
+        !received
+            .iter()
+            .any(|r| r.op == "dismiss-interrupted" && r.instance != "first-process"),
+        "no dismissal reached the replacement: {seen:?}"
+    );
+    assert_eq!(out.code, EXIT_REFUSED, "{out:?}");
+    assert!(
+        out.stderr.contains(words::DISMISS_STOPPED_REPLACED),
+        "{}",
+        out.stderr
+    );
+    assert!(
+        !out.stdout.contains(words::NOTHING_INTERRUPTED),
+        "{}",
+        out.stdout
+    );
+}

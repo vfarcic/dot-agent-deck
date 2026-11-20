@@ -35,11 +35,23 @@ pub fn git_trees_inside(
     max_found: usize,
     deadline: Instant,
 ) -> Result<Vec<PathBuf>, String> {
+    walk_with(dir, max_entries, max_found, deadline, Instant::now)
+}
+
+/// [`git_trees_inside`], reading the time from `now`, so a test can move the
+/// clock while one directory is being read.
+fn walk_with(
+    dir: &Path,
+    max_entries: usize,
+    max_found: usize,
+    deadline: Instant,
+    mut now: impl FnMut() -> Instant,
+) -> Result<Vec<PathBuf>, String> {
     let mut found = Vec::new();
     let mut read = 0usize;
     let mut pending = vec![dir.to_path_buf()];
     while let Some(current) = pending.pop() {
-        if Instant::now() >= deadline {
+        if now() >= deadline {
             return Err(format!("the look inside {} ran out of time", dir.display()));
         }
         let entries = match std::fs::read_dir(&current) {
@@ -179,6 +191,32 @@ mod tests {
             git_trees_inside(tmp.path(), MAX_SCAN_ENTRIES, 16, soon()),
             Ok(Vec::new())
         );
+    }
+
+    /// Verification finding D: the deadline passing while one directory's
+    /// entries are being read ends the walk with an `Err`, rather than an
+    /// answer finished late.
+    #[test]
+    fn a_deadline_passed_inside_one_directory_is_an_error() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        for n in 0..8 {
+            std::fs::write(tmp.path().join(format!("f{n}")), "").unwrap();
+        }
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(30);
+        let mut calls = 0usize;
+        // The first reading of the clock is in time; every later one is past
+        // the deadline, as if the directory took that long to read.
+        let clock = || {
+            calls += 1;
+            if calls == 1 {
+                start
+            } else {
+                deadline + Duration::from_secs(1)
+            }
+        };
+        let answer = walk_with(tmp.path(), MAX_SCAN_ENTRIES, 16, deadline, clock);
+        assert!(answer.is_err(), "{answer:?}");
     }
 
     /// A directory that cannot be read may hold a working tree: `Err`.

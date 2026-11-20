@@ -23,7 +23,7 @@ use dot_agent_deck::interrupted_work::{
     LABEL_STARTED_BY, LABEL_WORKTREE, LastEntry, OTHER_AGENTS_GROUP, Progress, RECLAIM_EXPLANATION,
     RECLAIM_REMOVED, RECLAIM_WOULD_REMOVE, ReclaimOutcome, ReclaimVerdict, Refusal, RefusalReason,
     ShownReport, UNSUPPORTED, dismiss_all_question, dismiss_stopped_sentence, interrupted_footer,
-    kept_until, kind_label, progress_line, unpushed_sentence,
+    kept_until, kind_label, progress_line, refusal_sentence, unpushed_sentence,
 };
 use dot_agent_deck::keybindings::KeybindingConfig;
 use dot_agent_deck::ui::{
@@ -1765,11 +1765,38 @@ fn interrupted_029_dismiss_all_sends_bounded_batches_of_exactly_the_confirmed_id
 /// Scenario: Dismiss all over 257 items; the first batch of 256 is dismissed
 /// and the second fails (a timeout), or is refused whole. No third request is
 /// sent, the list is asked for again, and the overlay says "Dismissed." and
-/// that 1 more item was not dismissed, and why.
+/// that 1 more item was not dismissed, and why. When the first batch also
+/// refused one of its ids, the overlay says that refusal and still says the
+/// later batch stopped.
 #[spec("journal/interrupted/030")]
 #[test]
 fn interrupted_030_a_failed_later_batch_stops_dismiss_all_and_says_so() {
     let ids = many_ids();
+    // Verification finding B: a first batch that dismissed 255 and refused
+    // one, then a later batch that failed. Both facts are said.
+    let mut partly = dismissed_all(&ids[..255]);
+    partly.push_refused(ids[255].clone(), RefusalReason::NotListed);
+    let (shown, sent) = run(
+        &many(),
+        &[
+            ch('I'),
+            ch('D'),
+            ch('y'),
+            InterruptedSeamStep::Dismissed(partly),
+            InterruptedSeamStep::Failed(InterruptedSeamKind::Dismiss, "timed out".to_string()),
+        ],
+    );
+    assert_eq!(dismissals(&sent).len(), 2, "{sent:?}");
+    let said = popup_text(shown.last().unwrap());
+    let refused = squeezed(refusal_sentence(RefusalReason::NotListed));
+    let why = squeezed(&dismiss_stopped_sentence(&DismissStopped {
+        reason: DismissStopReason::Failed,
+        refusal: None,
+        not_sent: 1,
+    }));
+    assert!(said.contains(&refused), "the refusal, in:\n{said}");
+    assert!(said.contains(&why), "and the stopped batch, in:\n{said}");
+
     let first = || InterruptedSeamStep::Dismissed(dismissed_all(&ids[..256]));
     for (last, stopped) in [
         (

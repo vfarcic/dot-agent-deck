@@ -910,6 +910,24 @@ fn dispatch_prompt(
     prompt
 }
 
+/// What a dispatched unit is prompted with: its task, the agent-card
+/// catalog ([`with_card_catalog`]) and, for a single agent, what
+/// [`dispatch_prompt`] adds.
+fn unit_prompt(
+    task: &str,
+    catalog: &crate::card_catalog::ResolvedCatalog,
+    target: &crate::spawn::SpawnTarget,
+    report_path: &str,
+    main_worktree: Option<&std::path::Path>,
+) -> String {
+    dispatch_prompt(
+        &with_card_catalog(task, catalog),
+        target,
+        report_path,
+        main_worktree,
+    )
+}
+
 /// How the daemon's reply to a dispatch that STARTED something opens — the
 /// message posted to the caller's inbox once the spawn returns. Every refusal
 /// or failure [`handle_dispatch`] reports opens `dispatch:` with anything else.
@@ -1133,9 +1151,9 @@ pub async fn handle_dispatch(
     // The dispatcher's own `task` stays as it is: it is what PRD #1790's
     // journal saves below, so a restore hands back that and not a second
     // copy of the catalog.
-    let with_catalog = with_card_catalog(task, &ctx.registry.agent_cards().catalog());
-    let prompt = dispatch_prompt(
-        &with_catalog,
+    let prompt = unit_prompt(
+        task,
+        &ctx.registry.agent_cards().catalog(),
         &resolved_target,
         &dispatch_report_path(name, &next_report_nonce()),
         crate::worktree_owner::main_worktree_if_linked(&paths.worktree_dir).as_deref(),
@@ -2594,6 +2612,49 @@ mod tests {
             !prompt.contains("<slug>"),
             "no filename placeholder may survive — a slug the model invents is a slug \
              nothing validates:\n{prompt}"
+        );
+
+        // `dispatch/return/006` (lane 2): a Haiku unit given a short task
+        // answered it in its own conversation and ended its turn without
+        // reporting, with the completion instructions further down its
+        // prompt, after the agent-card catalog. The completion step is now
+        // part of the task: the paragraph right after the task says the task
+        // ends with the report, names the exact command, and says a chat
+        // answer alone reaches no one; the catalog comes after it.
+        let task = "Find the sentinel file and report its full filename.";
+        let report = ".dot-agent-deck/dispatch-report-probe-99990002.md";
+        let composed = unit_prompt(
+            task,
+            &crate::card_catalog::resolve(None),
+            &crate::spawn::SpawnTarget::SingleAgent {
+                command: None,
+                inherited: None,
+            },
+            report,
+            None,
+        );
+        assert!(composed.starts_with(task), "{composed}");
+        let next = composed[task.len()..]
+            .trim_start()
+            .split("\n\n")
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            next.contains(&format!("{bin} work-done --done --task-file '{report}'")),
+            "the paragraph after the task names the exact completion command:\n{next}"
+        );
+        assert!(
+            next.contains("reaches no one"),
+            "and says an answer in the conversation alone reaches no one:\n{next}"
+        );
+        let command_at = composed
+            .find("work-done --done --task-file")
+            .expect("the command");
+        let catalog_at = composed.find("## Your agent card").expect("the catalog");
+        assert!(
+            command_at < catalog_at,
+            "the completion step comes before the agent-card catalog:\n{composed}"
         );
     }
 

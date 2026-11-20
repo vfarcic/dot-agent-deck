@@ -7,7 +7,7 @@ import { createFixtureSnapshot } from "../data/fixture";
 import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, LOCAL_ENDPOINT_SELECTION, type DeckBridge, type DesktopSettingsDto } from "../lib/bridge";
 import { AGENTS_STOPPED_BY_RESTART } from "../lib/agentIdentity";
 import {
-  DISMISSED, INTERRUPTED_WORK_TITLE, NOTHING_INTERRUPTED, OTHER_AGENTS_GROUP, RECLAIM_KEPT_DIRTY, RECLAIM_REMOVED, RECLAIM_WOULD_REMOVE, REFUSED_AMBIGUOUS, REFUSED_NOT_LISTED, dismissAllQuestion, interruptedFooter, reportRangeSentence,
+  DISMISSED, INTERRUPTED_WORK_TITLE, LIST_INCOMPLETE, NOTHING_INTERRUPTED, OTHER_AGENTS_GROUP, RECLAIM_KEPT_DIRTY, RECLAIM_REMOVED, RECLAIM_WOULD_REMOVE, REFUSED_AMBIGUOUS, REFUSED_NOT_LISTED, dismissAllQuestion, interruptedFooter, reportRangeSentence,
   type DismissOutcome, type InterruptedItem, type InterruptedList, type InterruptedReply, type InterruptedShow, type InterruptedTarget, type ReclaimOutcome,
 } from "../lib/interruptedWork";
 import { VOICE_ACTIONS, INTERRUPTED_RECLAIM_CHECKING, type VoiceOverviewChannel, type VoiceOverviewContext } from "../lib/voiceActions";
@@ -924,6 +924,27 @@ describe("opening the list asks the daemon again (final reviewer 2)", () => {
     expect(said).not.toBe(NOTHING_INTERRUPTED);
     expect(said).toContain("beta");
     expect(screen.queryByTestId("interrupted-dialog")).toBeNull();
+  });
+});
+
+describe("an incomplete empty answer is not an answer that there is none (verification finding C)", () => {
+  /** Scenario: two daemons; asked again, one lists nothing and the other lists nothing but says its journal could not be read whole. `I` never says there is no interrupted work: it opens the second daemon's dialog, which says the list may be missing items. */
+  it("opens the daemon whose empty list is incomplete rather than saying there is none", async () => {
+    const lists: Record<string, InterruptedList | Error> = { "process-a": { items: [] }, "process-b": { items: [] } };
+    const { bridge, listed } = perProcessBridge(lists);
+    const fleet = [deckOf("process-a"), remoteDeck("deck-b", "beta", "process-b")];
+    const voice = voiced(bridge, fleet);
+    render(<voice.Voiced />);
+    await waitFor(() => expect(listed).toHaveLength(2));
+    lists["process-b"] = { items: [], incomplete: true };
+
+    await act(async () => { VOICE_ACTIONS.showInterruptedWork.run(voice.context(), {}); });
+    await waitFor(() => expect(listed.length).toBeGreaterThanOrEqual(4));
+    const dialog = await screen.findByTestId("interrupted-dialog");
+    expect(dialog).toHaveTextContent("beta");
+    await waitFor(() => expect(dialog).toHaveTextContent(LIST_INCOMPLETE));
+    expect(voice.reportRefused.mock.calls.map((call) => call[0])).not.toContain(NOTHING_INTERRUPTED);
+    expect(screen.queryByText(NOTHING_INTERRUPTED)).toBeNull();
   });
 });
 

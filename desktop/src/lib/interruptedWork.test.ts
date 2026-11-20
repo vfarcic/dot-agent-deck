@@ -97,6 +97,10 @@ describe("the interrupted work wording", () => {
     expect(words.dismissMessage({ ...done, stopped: { reason: "failed", not_sent: 3 } })).toBe(`${words.DISMISSED} 3 more items may not have been dismissed: ${words.DISMISS_STOPPED_FAILED}`);
     expect(words.dismissMessage({ ...done, stopped: { reason: "refused", refusal: "unreadable", not_sent: 257 } })).toBe(`${words.DISMISSED} 257 more items were not dismissed. ${words.REFUSED_UNREADABLE}`);
     expect(words.dismissMessage({ ...done, stopped: { reason: "a-newer-reason", not_sent: 1 } })).toBe(`${words.DISMISSED} 1 more item was not dismissed.`);
+    /* Verification finding B: a refusal in an earlier batch does not hide that a later batch stopped. */
+    const refused = { dismissed: [{ id: "w" }], refused: [{ id: "x", refusal: { reason: "not-listed", message: "" } }] };
+    expect(words.dismissMessage({ ...refused, stopped: { reason: "failed", not_sent: 1 } })).toBe(`${words.REFUSED_NOT_LISTED} 1 more item may not have been dismissed: ${words.DISMISS_STOPPED_FAILED}`);
+    expect(words.dismissMessage(refused)).toBe(words.REFUSED_NOT_LISTED);
     expect(rust).toContain('"1 more item may not have been dismissed"');
     expect(rust).toContain('"more items may not have been dismissed"');
     expect(rust).toContain('"1 more item was not dismissed"');
