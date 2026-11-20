@@ -15,6 +15,10 @@
 //! answer it could not finish — a bound reached, a directory it could not
 //! read — is an `Err`, which every caller reads as a reason to keep.
 //!
+//! A directory below the top level is looked at for a `.git` entry before
+//! its other entries are read, so a nested tree is named without its own top
+//! level counting against the bound.
+//!
 //! The deadline is checked before each directory is opened, after each entry
 //! is read and before an answer is returned, so a walk that passes it never
 //! answers. It is not a deadline on a single filesystem call: a `read_dir` or
@@ -61,6 +65,18 @@ fn walk_with(
     while let Some(current) = pending.pop() {
         if now() >= deadline {
             return Err(format!("the look inside {} ran out of time", dir.display()));
+        }
+        // Below the top level, a `.git` entry makes the directory a tree of
+        // its own: name it without reading its other entries (PR #2431
+        // review). Only a `.git` that is there settles it; on any other
+        // answer the directory is read, which finds a `.git` the look could
+        // not reach, or fails as it always did.
+        if current != dir && std::fs::symlink_metadata(current.join(".git")).is_ok() {
+            found.push(current);
+            if found.len() >= max_found {
+                break;
+            }
+            continue;
         }
         let entries = match std::fs::read_dir(&current) {
             Ok(entries) => entries,
@@ -250,6 +266,24 @@ mod tests {
         let answer = walk(tmp.path());
         std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(answer.is_err(), "{answer:?}");
+    }
+
+    /// PR #2431 review (Qodo): a directory below the top level is checked
+    /// for `.git` before its entries are read, so a nested tree whose own top
+    /// level holds more entries than the bound is found, not given up on, and
+    /// its entries are not counted against the walk's bound.
+    #[test]
+    fn a_nested_tree_is_found_before_its_entries_are_read() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let nested = tmp.path().join("vendor").join("big-clone");
+        std::fs::create_dir_all(nested.join(".git")).unwrap();
+        for n in 0..20 {
+            std::fs::write(nested.join(format!("f{n}")), "").unwrap();
+        }
+        assert_eq!(
+            git_trees_inside(tmp.path(), 10, 16, soon()),
+            Ok(vec![nested])
+        );
     }
 
     /// At most `max_found` are answered; one is enough to keep a tree.
