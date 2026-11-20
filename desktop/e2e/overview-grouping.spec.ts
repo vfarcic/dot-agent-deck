@@ -356,7 +356,7 @@ test.describe("the fleet view (PRD #742 M4)", () => {
 
       await button.hover();
       await expect(popover).toBeVisible();
-      for (const name of ["agents", "running", "needs-input", "failed", "waiting", "idle", "groups", "decks"]) {
+      for (const name of ["agents", "working", "thinking", "compacting", "needs-input", "error", "waiting", "idle", "groups", "decks"]) {
         await expect(page.getByTestId(`overview-count-${name}`), `${name} is not in the popover`).toBeVisible();
       }
       // Down onto the list itself: it stays open on the way.

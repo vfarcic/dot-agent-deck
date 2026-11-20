@@ -3803,6 +3803,7 @@ mod tests {
         dot_agent_deck::daemon_client::AgentRecord {
             input_held: None,
             input_discarded: None,
+            project_config_exists: None,
             id: id.into(),
             pane_id_env: Some(pane_id.into()),
             display_name: None,

@@ -883,6 +883,13 @@ pub struct DesktopAgent {
     /// no PR, or the daemon predates the field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pull_request: Option<dot_agent_deck::pull_request_info::PullRequestInfo>,
+    /// PRD #2119: whether this agent's project already holds a
+    /// `.dot-agent-deck.toml`, as the daemon reported it
+    /// ([`AgentRecord::project_config_exists`]). Absent when the daemon did
+    /// not say — no cwd, or a daemon predating the field — and the webview
+    /// then keeps the Generate wording. Copied through; never computed here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_config_exists: Option<bool>,
     pub tab: DesktopTab,
     /// PRD #1666 part 2 (G-fix4): the daemon process this row was listed by,
     /// which the webview sends back with every action on the agent
@@ -2649,6 +2656,7 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
         input_discarded,
         answer_settlements,
         pull_request,
+        project_config_exists: record.project_config_exists,
         tab,
         // Stamped by the snapshot that lists this record, which knows which
         // daemon process answered (`daemon_bridge::connected_snapshot`).
@@ -3711,6 +3719,200 @@ pub(crate) fn ensure_desktop_orchestration_platform_supported(
 #[cfg(test)]
 mod tests {
 
+    /// Two daemons on the dashboard: the selected one differs from the owner.
+    #[cfg(unix)]
+    fn config_gen_fleet(selected: Endpoint, owner: Endpoint) -> impl Drop {
+        struct Restore(Option<AppliedSelection>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                *APPLIED_SELECTION.write().unwrap() = self.0.take();
+            }
+        }
+        let previous = APPLIED_SELECTION
+            .write()
+            .unwrap()
+            .replace(AppliedSelection {
+                selected: SelectedDeck {
+                    endpoint: selected.clone(),
+                    fallback: None,
+                    all_decks: false,
+                },
+                observed: vec![selected, owner],
+                ..AppliedSelection::default()
+            });
+        Restore(previous)
+    }
+
+    /// Invoke the actual command from the main webview on Tauri's mock runtime.
+    #[cfg(unix)]
+    fn config_gen_ipc(
+        state: crate::terminal::DesktopState,
+        deck_id: &str,
+        incarnation: &str,
+    ) -> serde_json::Value {
+        use tauri::ipc::{CallbackFn, InvokeBody};
+        use tauri::test::{INVOKE_KEY, get_ipc_response, mock_builder};
+        use tauri::webview::InvokeRequest;
+        let app = mock_builder()
+            .manage(state)
+            .invoke_handler(tauri::generate_handler![crate::desktop_generate_config])
+            .build(crate::app_context())
+            .expect("a mock app");
+        let main = tauri::WebviewWindowBuilder::new(
+            &app,
+            crate::pr_browser::MAIN_WEBVIEW_LABEL,
+            tauri::WebviewUrl::default(),
+        )
+        .build()
+        .expect("the main webview");
+        get_ipc_response(&main, InvokeRequest {
+            cmd: "desktop_generate_config".into(), callback: CallbackFn(0), error: CallbackFn(1),
+            url: "tauri://localhost".parse().unwrap(),
+            body: InvokeBody::Json(serde_json::json!({
+                "deckId": deck_id, "agentId": "1", "paneId": "pane-1", "incarnation": incarnation,
+            })),
+            headers: Default::default(), invoke_key: INVOKE_KEY.to_string(),
+        }).expect("the command returns a named outcome").deserialize().unwrap()
+    }
+
+    /// Scenario: Generate config through Tauri IPC for an agent whose daemon differs from the selected daemon. The owner alone receives the captured pane/agent request; sent, old-daemon and failed answers return the shared user-visible sentence, with no generic fallback on an old daemon.
+    #[cfg(unix)]
+    #[test]
+    fn config_gen_001_desktop_routes_to_the_owner_and_maps_every_outcome() {
+        use crate::restart_binding_tests::RestartingDeck;
+        use dot_agent_deck::config_gen::{
+            CONFIG_GEN_SENT_MESSAGE, CONFIG_GEN_UPGRADE_MESSAGE, config_gen_failed_message,
+        };
+        use dot_agent_deck::daemon_client::ClientError;
+        use dot_agent_deck::daemon_protocol::AttachResponse;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let _selection = runtime.block_on(SELECTION_LOCK.lock());
+        let (selected, owner) = {
+            let _entered = runtime.enter();
+            (
+                RestartingDeck::start("config-selected", "selected-a"),
+                RestartingDeck::start("config-owner", "owner-a"),
+            )
+        };
+        let _fleet = config_gen_fleet(selected.endpoint(), owner.endpoint());
+        let wire = deck_wire_id(&owner.endpoint());
+        for outcome in ["sent", "unsupported", "failed"] {
+            owner.config_generation(
+                outcome != "unsupported",
+                (outcome == "failed").then(|| AttachResponse::err("target refused")),
+            );
+            let answer = config_gen_ipc(crate::terminal::DesktopState::default(), &wire, "owner-a");
+            assert_eq!(answer["outcome"], outcome);
+            let expected = match outcome {
+                "sent" => CONFIG_GEN_SENT_MESSAGE.to_string(),
+                "unsupported" => CONFIG_GEN_UPGRADE_MESSAGE.to_string(),
+                _ => config_gen_failed_message(&ClientError::Server("target refused".into())),
+            };
+            assert_eq!(answer["message"], expected);
+            assert_eq!(
+                answer["messageId"].as_str(),
+                (outcome == "sent").then_some("m-config")
+            );
+            assert!(
+                selected.received_by("selected-a").is_empty(),
+                "the selected daemon must not receive the owner's action"
+            );
+            let requests = owner.config_requests();
+            if outcome == "unsupported" {
+                assert!(requests.is_empty());
+            } else {
+                assert_eq!(requests.len(), 1);
+                assert_eq!(requests[0]["pane_id"], "pane-1");
+                assert_eq!(requests[0]["expected_agent_id"], "1");
+            }
+            assert!(
+                !owner
+                    .received_by("owner-a")
+                    .iter()
+                    .any(|op| op == "post-message"),
+                "generation must never fall back to a generic inbox post"
+            );
+        }
+    }
+
+    /// Scenario: Confirm Generate config through Tauri on a daemon that receives the request but never answers it. The result carries exactly the shared client timeout sentence used by the TUI, with no claim of successful delivery.
+    #[cfg(unix)]
+    #[test]
+    fn config_gen_001_desktop_timeout_uses_the_shared_client_failure_sentence() {
+        use crate::restart_binding_tests::RestartingDeck;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let _selection = runtime.block_on(SELECTION_LOCK.lock());
+        let owner = {
+            let _entered = runtime.enter();
+            RestartingDeck::start("config-timeout", "owner-a")
+        };
+        let _fleet = config_gen_fleet(owner.endpoint(), owner.endpoint());
+        owner.silence_config_generation();
+        let answer = config_gen_ipc(
+            crate::terminal::DesktopState::default(),
+            &deck_wire_id(&owner.endpoint()),
+            "owner-a",
+        );
+        assert_eq!(answer["outcome"], "failed");
+        assert!(answer.get("messageId").is_none());
+        assert_eq!(owner.config_requests().len(), 1);
+        assert_eq!(
+            answer["message"],
+            dot_agent_deck::config_gen::config_gen_failed_message(
+                &dot_agent_deck::daemon_client::ClientError::TimedOut(
+                    std::time::Duration::from_secs(15)
+                )
+            )
+        );
+    }
+
+    /// Scenario: A confirmation was opened on daemon process A, then the daemon restarts and reuses the agent id on process B. Confirming through Tauri shows the shared failure sentence and sends B nothing; a confirmation captured from B succeeds as a control.
+    #[cfg(unix)]
+    #[test]
+    fn config_gen_001_desktop_refuses_a_restarted_target() {
+        use crate::restart_binding_tests::RestartingDeck;
+        use dot_agent_deck::daemon_client::AGENT_GONE_AFTER_RESTART;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let _selection = runtime.block_on(SELECTION_LOCK.lock());
+        let (selected, owner) = {
+            let _entered = runtime.enter();
+            (
+                RestartingDeck::start("config-selected", "selected-a"),
+                RestartingDeck::start("config-restart", "owner-a"),
+            )
+        };
+        let _fleet = config_gen_fleet(selected.endpoint(), owner.endpoint());
+        let state = crate::terminal::DesktopState::default();
+        runtime
+            .block_on(state.daemon.trusted(&owner.endpoint()))
+            .expect("the original daemon is trusted");
+        owner.restart_as("owner-b");
+        let wire = deck_wire_id(&owner.endpoint());
+        let answer = config_gen_ipc(state, &wire, "owner-a");
+        assert_eq!(answer["outcome"], "failed");
+        assert_eq!(
+            answer["message"],
+            dot_agent_deck::config_gen::config_gen_failed_message(&AGENT_GONE_AFTER_RESTART)
+        );
+        assert!(owner.received_by("owner-b").is_empty());
+        let answer = config_gen_ipc(crate::terminal::DesktopState::default(), &wire, "owner-b");
+        assert_eq!(answer["outcome"], "sent");
+        assert_eq!(owner.config_requests().len(), 1);
+        assert!(selected.received_by("selected-a").is_empty());
+    }
+
     /// Scenario (PRD #1258 M4): a daemon's host answer reaches the webview as
     /// the camelCase `hostMetrics` shape, with absent readings omitted rather
     /// than zeroed, the daemon's health levels passed through beside their
@@ -4373,6 +4575,7 @@ mod tests {
         AgentRecord {
             input_held: None,
             input_discarded: None,
+            project_config_exists: None,
             id: "agent-7".into(),
             pane_id_env: Some("pane-7".into()),
             display_name: Some("builder".into()),
@@ -4420,6 +4623,7 @@ mod tests {
         }
     }
 
+    /// Scenario: Map daemon records reporting an existing, absent, or unknown project config. The desktop receives the same optional boolean so remote agents can label the config action accurately.
     #[test]
     fn agent_mapping_is_frontend_stable() {
         let value = serde_json::to_value(map_agent(fixture_record())).unwrap();
@@ -4430,6 +4634,15 @@ mod tests {
         assert_eq!(value["status"], "working");
         assert_eq!(value["activeTool"]["name"], "shell");
         assert_eq!(value["tab"]["kind"], "mode");
+        for exists in [Some(false), Some(true), None] {
+            let mut wire = serde_json::to_value(fixture_record()).unwrap();
+            if let Some(exists) = exists {
+                wire["project_config_exists"] = serde_json::json!(exists);
+            }
+            let record = serde_json::from_value(wire).unwrap();
+            let mapped = serde_json::to_value(map_agent(record)).unwrap();
+            assert_eq!(mapped["projectConfigExists"], serde_json::json!(exists));
+        }
     }
 
     /// Scenario: Map a daemon record with queued and fetched messages into the desktop DTO; its inbox counts must survive for the card badge.

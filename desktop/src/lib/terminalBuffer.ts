@@ -4,7 +4,7 @@ import type { TerminalBuffer, TerminalChunk } from "../types";
 // only backs remount replay — live bytes stream straight to xterm — so the
 // cost is memory (~1 MiB x agents), not render time. A small cap made the
 // buffer trim every few seconds under TUI repaint traffic.
-export const MAX_TERMINAL_BUFFER_BYTES = 1024 * 1024;
+const MAX_TERMINAL_BUFFER_BYTES = 1024 * 1024;
 
 function boundedReplacement(data: Uint8Array, generation: number | undefined, maxBytes: number): TerminalBuffer {
   const dropped = Math.max(0, data.byteLength - maxBytes);

@@ -1035,6 +1035,16 @@ impl TrustRequestList {
 /// pane. Advertised on every platform: the arm is not `#[cfg]`-gated.
 pub const CAP_INBOX: &str = "inbox";
 
+/// Capability string for [`AttachRequest::GenerateConfig`] (PRD #2119): the
+/// daemon composes the configuration-generation request for one of its panes —
+/// [`crate::config_gen::config_gen_prompt`] for that pane's own working
+/// directory — and posts it to the pane's inbox, so every client sends the same
+/// request the daemon running the agent would write. Held by
+/// [`crate::daemon_client::DaemonClient::generate_config`], which answers
+/// `Unsupported` without sending anything to a daemon that does not name it.
+/// Advertised on every platform: the arm is not `#[cfg]`-gated.
+pub const CAP_GENERATE_CONFIG: &str = "generate-config";
+
 /// Capability string for [`AttachRequest::SubscribeTurnReplies`] (PRD #1497):
 /// a stream of one agent's finished-turn replies, for the desktop's voice
 /// "reading on". Held by
@@ -1479,6 +1489,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_TURN_REPLIES,
     CAP_INBOX,
     CAP_INBOX_ACTIONS,
+    CAP_GENERATE_CONFIG,
     CAP_HOST_METRICS,
     CAP_CLOSE_AGENTS,
     CAP_HELLO_FOLLOW_ON,
@@ -1510,6 +1521,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_TURN_REPLIES,
     CAP_INBOX,
     CAP_INBOX_ACTIONS,
+    CAP_GENERATE_CONFIG,
     CAP_CLOSE_AGENTS,
     CAP_HELLO_FOLLOW_ON,
     CAP_DECK_OUTCOMES,
@@ -3395,6 +3407,24 @@ pub enum AttachRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         spill_path: Option<String>,
         origin: crate::inbox_hub::PostOrigin,
+    },
+    /// PRD #2119: ask the daemon to generate a `.dot-agent-deck.toml` with the
+    /// agent in `pane_id`. The daemon composes the request itself —
+    /// [`crate::config_gen::config_gen_prompt`] for the pane's own working
+    /// directory, as this daemon knows it — and posts it to the pane's inbox as
+    /// [`Self::PostMessage`] would, bound to `expected_agent_id` (the pane's
+    /// live agent when omitted). The reply carries the message id on
+    /// [`AttachResponse::id`]; a refusal (no such agent, another agent in the
+    /// pane, no known directory, a full inbox) is `ok: false` with `error`, and
+    /// posts nothing.
+    ///
+    /// **Withheld unless the daemon advertises [`CAP_GENERATE_CONFIG`]**, on
+    /// the same no-bump basis as [`Self::PostMessage`]: an older daemon has no
+    /// such variant and refuses it with the generic `malformed request: …`.
+    GenerateConfig {
+        pane_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_agent_id: Option<String>,
     },
     /// PRD #1666 §6.4: the user's Retry on a deck message `agent_id`'s card in
     /// `pane_id` lists as uncertain, held_long or not_started (G3), at the
@@ -7054,6 +7084,9 @@ async fn handle_connection(
             // PRD #1666 part 3 (Q35-20): held typing, after the live join,
             // whose snapshot carries it too.
             crate::agent_pty::attach_input_held(&registry, &mut records);
+            // PRD #2119: whether each agent's project already has a config,
+            // off the runtime and bounded; no lock is held here.
+            crate::agent_pty::attach_project_config_exists(&mut records).await;
             let mut resp = AttachResponse::agent_records(records);
             resp.orchestration_roles = Some(orchestration_roles);
             // Issue #887: the client's only observable of the schedule seed the
@@ -8935,6 +8968,14 @@ async fn handle_connection(
             );
             write_resp(&mut stream, &resp).await?
         }
+        AttachRequest::GenerateConfig {
+            pane_id,
+            expected_agent_id,
+        } => {
+            let resp =
+                generate_config(&registry, &state, &pane_id, expected_agent_id.as_deref()).await;
+            write_resp(&mut stream, &resp).await?
+        }
         AttachRequest::InboxRetry {
             pane_id,
             agent_id,
@@ -9035,16 +9076,95 @@ fn post_message(
     spill_path: Option<String>,
     origin: crate::inbox_hub::PostOrigin,
 ) -> AttachResponse {
+    post_message_as(
+        "post-message",
+        registry,
+        pane_id,
+        expected_agent_id,
+        subject,
+        body,
+        spill_path,
+        origin,
+    )
+}
+
+/// PRD #2119: [`AttachRequest::GenerateConfig`]'s handling — compose the
+/// configuration request for the working directory THIS daemon holds for
+/// `pane_id`, and post it exactly as [`post_message`] posts a client's message:
+/// the same binding to the pane's live agent, the same admission, the same
+/// liveness recheck. The directory is the pane's role directory when it is an
+/// orchestration role, else the directory its live agent was started in; never
+/// the client's, so a client on another host or version cannot change what the
+/// agent is asked to inspect.
+async fn generate_config(
+    registry: &AgentPtyRegistry,
+    state: &SharedState,
+    pane_id: &str,
+    expected_agent_id: Option<&str>,
+) -> AttachResponse {
     let Some(live) = registry.pane_current_agent_id(pane_id) else {
         return AttachResponse::err(format!(
-            "post-message: pane {pane_id} has no live agent; nothing was posted"
+            "generate-config: pane {pane_id} has no live agent; nothing was posted"
         ));
     };
     if let Some(expected) = expected_agent_id
         && expected != live
     {
         return AttachResponse::err(format!(
-            "post-message: pane {pane_id} is now occupied by another agent than {expected}; \
+            "generate-config: pane {pane_id} is now occupied by another agent than {expected}; \
+             nothing was posted"
+        ));
+    }
+    let role_cwd = state.read().await.pane_cwd_map.get(pane_id).cloned();
+    let cwd = role_cwd.or_else(|| registry.agent_record_any(&live).and_then(|r| r.cwd));
+    let Some(cwd) = cwd else {
+        return AttachResponse::err(format!(
+            "generate-config: the deck knows no project directory for pane {pane_id}; \
+             nothing was posted"
+        ));
+    };
+    // The check of `<cwd>/.dot-agent-deck.toml` runs off the async runtime and
+    // bounded, with no lock held. When it times out, the request is the
+    // conditional one ("if the file exists, read it first and propose
+    // changes…"), never the create request: the file may well exist.
+    let body = crate::config_gen::config_gen_prompt_checked(&cwd).await;
+    // Bind the post to the agent sampled above, whether or not the caller named
+    // one: the prompt was composed for that agent's directory, so an agent
+    // that replaced it while the directory was being read must receive nothing.
+    post_message_as(
+        "generate-config",
+        registry,
+        pane_id,
+        Some(live.as_str()),
+        crate::config_gen::CONFIG_GEN_SUBJECT.to_string(),
+        body,
+        None,
+        crate::inbox_hub::PostOrigin::ConfigGen,
+    )
+}
+
+/// [`post_message`] with its errors prefixed by `verb`, the request that asked.
+#[allow(clippy::too_many_arguments)]
+fn post_message_as(
+    verb: &str,
+    registry: &AgentPtyRegistry,
+    pane_id: &str,
+    expected_agent_id: Option<&str>,
+    subject: String,
+    body: String,
+    spill_path: Option<String>,
+    origin: crate::inbox_hub::PostOrigin,
+) -> AttachResponse {
+    let Some(live) = registry.pane_current_agent_id(pane_id) else {
+        return AttachResponse::err(format!(
+            "{verb}: pane {pane_id} has no live agent; nothing was posted"
+        ));
+    };
+    if let Some(expected) = expected_agent_id
+        && expected != live
+    {
+        return AttachResponse::err(format!(
+            "{verb}: pane {pane_id} is now occupied by another agent than {expected}; \
              nothing was posted"
         ));
     }
@@ -9064,7 +9184,7 @@ fn post_message(
     // Audit F2: a post the inbox would refuse is refused before anything is
     // saved for it.
     if let Err(error) = registry.inbox().admit_direct(&to, &content) {
-        return AttachResponse::err(format!("post-message: {error}"));
+        return AttachResponse::err(format!("{verb}: {error}"));
     }
     // PRD #1666 hardening H4: a body too long to hand over whole is saved to
     // a file the block names, or the post is refused.
@@ -9074,7 +9194,7 @@ fn post_message(
         crate::inbox_hub::retain_full_body_minted(&deck, pane_id, &mut content, &dirs)
     }) {
         Ok(spill) => spill,
-        Err(error) => return AttachResponse::err(format!("post-message: {error}")),
+        Err(error) => return AttachResponse::err(format!("{verb}: {error}")),
     };
     // PR #1735 fifth review (N4): the agent sampled above is asked about again
     // under the inbox's lock, right before the message goes in, so a message
@@ -9086,7 +9206,7 @@ fn post_message(
             registry.inbox().own_spill(spill, &id);
             AttachResponse::with_id(id.to_string())
         }
-        Err(error) => AttachResponse::err(format!("post-message: {error}")),
+        Err(error) => AttachResponse::err(format!("{verb}: {error}")),
     }
 }
 
@@ -10193,6 +10313,9 @@ async fn handle_subscribe_events_with_snapshot(
     // repeat 30 s after a pass a display notice woke, which corrects it
     // (R-E-U3-03, auditor U3-8).
     crate::agent_pty::attach_input_held(registry, &mut records);
+    // PRD #2119: as the `ListAgents` reply does — off the runtime, bounded,
+    // and after the `AppState` guard went with the blocking task above.
+    crate::agent_pty::attach_project_config_exists(&mut records).await;
     let mut resp = AttachResponse::agent_records(records);
     // Issue #1637: read under the same guard as the receiver, so a notice
     // change is either in this reply or on the stream.
@@ -10968,6 +11091,92 @@ mod fence_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Scenario: Start a config request for agent A, pause its directory lookup, and replace A with B in the same pane. Both an omitted and a supplied expected agent must refuse the request and leave B's inbox empty; an unchanged agent receives one request as a control.
+    #[cfg(unix)]
+    #[spec("daemon/config-gen/003")]
+    #[tokio::test]
+    async fn config_gen_003_replacement_during_directory_lookup_receives_nothing() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+        let mut observations = Vec::new();
+        for supplied in [true, false] {
+            for replace in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let registry = Arc::new(AgentPtyRegistry::new());
+                registry.set_hook_socket(dir.path().join("unreachable.sock"));
+                let spawn = || {
+                    registry
+                        .spawn_agent(SpawnOptions {
+                            command: Some("cat"),
+                            cwd: Some(dir.path().to_str().unwrap()),
+                            env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                                crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                                "config-race-pane".into(),
+                            )]),
+                            ..SpawnOptions::default()
+                        })
+                        .unwrap()
+                };
+                let original = spawn();
+                let state: SharedState =
+                    Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+                let mut locked = state.write().await;
+                locked.pane_cwd_map.insert(
+                    "config-race-pane".into(),
+                    dir.path().to_str().unwrap().into(),
+                );
+                let request = generate_config(
+                    &registry,
+                    &state,
+                    "config-race-pane",
+                    supplied.then_some(original.as_str()),
+                );
+                tokio::pin!(request);
+                // The initial live-agent sample is synchronous. Holding this
+                // lock makes the following directory read the first Pending,
+                // so no sleep or scheduler timing selects the interleaving.
+                assert!(matches!(
+                    request
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop())),
+                    Poll::Pending
+                ));
+                if replace {
+                    registry.close_agent(&original).unwrap();
+                    let replacement = spawn();
+                    assert_ne!(replacement, original);
+                }
+                drop(locked);
+                let response = request.await;
+                let messages = registry.inbox().list("config-race-pane");
+                let bindings: Vec<_> = messages
+                    .iter()
+                    .map(|message| message.bind_agent.clone())
+                    .collect();
+                observations.push((
+                    supplied,
+                    replace,
+                    response.ok,
+                    response.id.is_some(),
+                    bindings,
+                ));
+                registry.shutdown_all();
+            }
+        }
+        for (supplied, replace, ok, claimed_message, bindings) in observations {
+            assert_eq!(
+                ok, !replace,
+                "supplied_expected_id={supplied}, replaced={replace}: a config composed for A must never be accepted for B; bindings={bindings:?}"
+            );
+            assert_eq!(claimed_message, !replace);
+            assert_eq!(
+                bindings.len(),
+                usize::from(!replace),
+                "the replacement's inbox must stay empty"
+            );
+        }
+    }
 
     /// PRD #1885 review (reviewer 4). Scenario: a client asks for the trust
     /// view of an orchestration, then the project's config changes and it asks
@@ -12109,6 +12318,7 @@ mod tests {
                 drop_event: None,
                 break_on_event: None,
                 applied: None,
+                project_config_refresh: None,
             },
         ));
         {
@@ -13222,6 +13432,7 @@ mod tests {
             inbox: None,
             input_held: None,
             input_discarded: None,
+            project_config_exists: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let back: AgentRecord = serde_json::from_str(&json).unwrap();
@@ -13249,6 +13460,7 @@ mod tests {
             inbox: None,
             input_held: None,
             input_discarded: None,
+            project_config_exists: None,
         };
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
@@ -13407,6 +13619,7 @@ mod tests {
         let rec = AgentRecord {
             input_held: None,
             input_discarded: None,
+            project_config_exists: None,
             id: "9".into(),
             pane_id_env: Some("pane-9".into()),
             display_name: None,
@@ -13815,6 +14028,7 @@ mod tests {
             inbox: None,
             input_held: None,
             input_discarded: None,
+            project_config_exists: None,
         };
         let value: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&rec).expect("serializes"))

@@ -1231,6 +1231,13 @@ const AGENT_TARGETING_KINDS: ReadonlySet<string> = new Set(["agent_ref", "orches
 const INTERRUPTED_DIALOG_INVOKES: ReadonlySet<string> = new Set(Object.entries(VOICE_ACTIONS as Record<string, { needs: readonly string[] }>).filter(([, entry]) => entry.needs.includes("interruptedDialog")).map(([invoke]) => invoke));
 
 /**
+ * The invokes that, said on the agent screen without an `agent_ref`, act on
+ * the pane on screen: issue #1402's whole "stop", and PRD #2119's nameless
+ * "generate config". {@link dispatchLost} holds each to the pane it was said in.
+ */
+const IMPLICIT_PANE_INVOKES: ReadonlySet<string> = new Set(["confirmStopAgent", "confirmGenerateConfig"]);
+
+/**
  * The gate for dispatching a resolved outcome: {@link contextLost}'s `answer`
  * touch, then its `agent` touch for every agent the outcome's params name —
  * so a stop resolved before a same-id replacement, or before the selected deck
@@ -1239,9 +1246,10 @@ const INTERRUPTED_DIALOG_INVOKES: ReadonlySet<string> = new Set(Object.entries(V
 function dispatchLost(was: VoiceContext, now: VoiceContext, params: readonly VoiceResolvedParamDto[], invoke?: string): Lost | undefined {
   const lost = contextLost(was, now, { answer: true });
   if (lost) return lost;
-  // Issue #1402: a whole "stop" names the pane implicitly. Hold it to the
-  // subject heard, without requiring an editable or visible terminal to close it.
-  if (invoke === "confirmStopAgent" && was.screen === "agent" && !params.some((param) => param.kind === "agent_ref")) {
+  // Issue #1402: a whole "stop" (and PRD #2119: a nameless "generate config")
+  // names the pane implicitly. Hold it to the subject heard, without requiring
+  // an editable or visible terminal to act on it.
+  if (invoke !== undefined && IMPLICIT_PANE_INVOKES.has(invoke) && was.screen === "agent" && !params.some((param) => param.kind === "agent_ref")) {
     if (!was.pane || !showsAgent(now.pane, { ...was.pane, incarnation: was.pane.incarnation })) return { code: "pane", why: "the pane on screen changed" };
     if (!sameIncarnation(was.pane.incarnation, now.pane.incarnation)) return { code: "restarted", why: AGENT_GONE_AFTER_RESTART };
     if (incarnationsDiffer(was.pane.spawnedAtMs, now.pane.spawnedAtMs)) return { code: "replaced", why: "the agent in the pane was replaced" };

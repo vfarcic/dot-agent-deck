@@ -1480,6 +1480,11 @@ mod tests {
                 // PRD #802 D5's set: each only opens a confirmation.
                 ("stop_agent", "confirmStopAgent", vec!["overview", "agent"]),
                 (
+                    "generate_config",
+                    "confirmGenerateConfig",
+                    vec!["overview", "agent"]
+                ),
+                (
                     "close_orchestration",
                     "confirmCloseOrchestration",
                     vec!["overview"]
@@ -1498,6 +1503,34 @@ mod tests {
                 ("run_card_action", "runCardAction", vec!["overview"]),
                 ("reply_to_agent_card", "replyToAgentCard", vec!["overview"]),
             ]
+        );
+    }
+
+    /// Scenario: Load the shipped voice command table and ask how to generate or update config for an agent. Both phrases describe the same command on the overview and agent screens, resolve an agent reference, and only open the shared confirmation.
+    #[test]
+    fn voice_table_config_gen_003_generation_is_agent_targeted_and_only_asks() {
+        let row = super::table()
+            .row("generate_config")
+            .expect("generate config must be a shipped voice command");
+        assert_eq!(row.invoke, "confirmGenerateConfig");
+        assert_eq!(row.screens, vec![Screen::Overview, Screen::Agent]);
+        assert_eq!(row.requires, vec![Requirement::NewAgentDialogClosed]);
+        assert_eq!(
+            row.params,
+            vec![ParamSpec {
+                name: "agent".into(),
+                kind: ParamKind::AgentRef,
+                optional: false
+            }]
+        );
+        assert!(row.try_saying.contains("generate config"));
+        assert!(
+            row.description.contains("update config"),
+            "the shipped command must teach the update config synonym"
+        );
+        assert!(
+            row.report.contains("nothing has"),
+            "opening confirmation must not claim delivery"
         );
     }
 
@@ -2439,8 +2472,10 @@ mod tests {
                 "remind_star_later",
                 "dismiss_star_prompt",
                 // PRD #802 D5's two stops: on the overview, where their
-                // controls are. Each only opens a confirmation.
+                // controls are. Each only opens a confirmation, and so does
+                // PRD #2119's Generate config between them.
                 "stop_agent",
+                "generate_config",
                 "close_orchestration",
                 // PRD #2374: the agent cards, on the dashboard only.
                 "set_overview_mode",
@@ -2479,7 +2514,9 @@ mod tests {
                 "remind_star_later",
                 "dismiss_star_prompt",
                 // Issue #1402: ask to close the agent shown in the pane.
-                "stop_agent"
+                "stop_agent",
+                // PRD #2119: ask the pane's agent to generate the config.
+                "generate_config"
             ]
         );
         // PRD #1401 — over the pull request browser: the rows callable
@@ -2895,10 +2932,7 @@ mod tests {
         }
     }
 
-    /// PRD #802 D5, as a property of the table: the rows that STOP something
-    /// are exactly these two, each dispatches a registry entry that only opens
-    /// a confirmation, and each tells the model — and the user, in its report
-    /// — that nothing has happened yet.
+    /// Scenario: Load the voice command table and inspect actions that open a confirmation, including Generate config. Each names a confirmation registry entry and says nothing has happened yet; starting an agent still presses the form's Start directly.
     ///
     /// **This pin used to hold three rows, and `start_new_agent` left it
     /// deliberately** (PRD #1223, 2026-09-23): D5's start half was revisited —
@@ -2919,6 +2953,7 @@ mod tests {
             asking,
             vec![
                 ("stop_agent", "confirmStopAgent"),
+                ("generate_config", "confirmGenerateConfig"),
                 ("close_orchestration", "confirmCloseOrchestration"),
             ]
         );
@@ -2936,7 +2971,7 @@ mod tests {
             );
             assert_eq!(
                 row.screens,
-                if *id == "stop_agent" {
+                if matches!(*id, "stop_agent" | "generate_config") {
                     vec![Screen::Overview, Screen::Agent]
                 } else {
                     vec![Screen::Overview]

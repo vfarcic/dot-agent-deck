@@ -2379,6 +2379,113 @@ async fn inbox_action_on(
     Ok(DesktopInboxActionResult { outcome })
 }
 
+/// PRD #2119: the desktop's answer to Generate config — `sent` with the
+/// posted message's id, `unsupported` for a daemon that predates the verb, or
+/// `failed` — each carrying the sentence the TUI shows for the same outcome
+/// (`dot_agent_deck::daemon_client`), so the two clients say the same thing.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopGenerateConfigResult {
+    outcome: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message_id: Option<String>,
+    message: String,
+}
+
+impl DesktopGenerateConfigResult {
+    fn failed(reason: &dyn std::fmt::Display) -> Self {
+        Self {
+            outcome: "failed",
+            message_id: None,
+            message: safe_message(dot_agent_deck::daemon_client::config_gen_failed_message(
+                reason,
+            )),
+        }
+    }
+}
+
+/// PRD #2119: ask the daemon that owns agent `agent_id` (in `pane_id`) to post
+/// the configuration-generation request to that agent's inbox. The daemon
+/// composes the request; this sends no prompt. The deck comes from the
+/// request, never the selection, and the request is bound to `incarnation`,
+/// the daemon process that listed the agent when the confirmation opened, so a
+/// successor that reused the id is sent nothing.
+///
+/// Every outcome, a refusal included, comes back as a
+/// [`DesktopGenerateConfigResult`] rather than an error, so the webview shows
+/// the shared sentence. A daemon that does not advertise the verb is answered
+/// `unsupported` without being sent anything — no generic inbox post stands in
+/// for it (CLAUDE.md rule 18).
+///
+/// Generic over the Tauri runtime so a test registers this very command on
+/// `tauri::test::MockRuntime` and invokes it over IPC.
+#[tauri::command]
+async fn desktop_generate_config<R: tauri::Runtime>(
+    webview: Webview<R>,
+    state: State<'_, DesktopState>,
+    deck_id: String,
+    agent_id: String,
+    pane_id: String,
+    incarnation: Option<String>,
+) -> Result<DesktopGenerateConfigResult, String> {
+    ensure_main_webview(&webview)?;
+    Ok(generate_config_on(
+        &state,
+        &deck_id,
+        &agent_id,
+        &pane_id,
+        &Incarnation::from(incarnation),
+    )
+    .await)
+}
+
+/// [`desktop_generate_config`] minus the webview.
+async fn generate_config_on(
+    state: &DesktopState,
+    deck_id: &str,
+    agent_id: &str,
+    pane_id: &str,
+    incarnation: &Incarnation,
+) -> DesktopGenerateConfigResult {
+    use dot_agent_deck::daemon_client::{CONFIG_GEN_SENT_MESSAGE, CONFIG_GEN_UPGRADE_MESSAGE};
+    if let Err(error) = validate_agent_id(agent_id) {
+        return DesktopGenerateConfigResult::failed(&error);
+    }
+    let scope = match crate::dto::DeckScope::resolve(Some(deck_id)) {
+        Ok(scope) => scope,
+        Err(error) => return DesktopGenerateConfigResult::failed(&error),
+    };
+    let daemon = match state.daemon.trusted(scope.endpoint()).await {
+        Ok(daemon) => daemon,
+        Err(error) => return DesktopGenerateConfigResult::failed(&error),
+    };
+    if let Err(error) = daemon.require_compatible() {
+        return DesktopGenerateConfigResult::failed(&error);
+    }
+    let client = daemon.client.bound_to(incarnation.clone());
+    let request = client.generate_config(pane_id, Some(agent_id));
+    match tokio::time::timeout(crate::daemon_bridge::DECK_REPLY_TIMEOUT, request).await {
+        Ok(Ok(GatedQuery::Answered(message_id))) => DesktopGenerateConfigResult {
+            outcome: "sent",
+            message_id: Some(message_id),
+            message: CONFIG_GEN_SENT_MESSAGE.to_string(),
+        },
+        Ok(Ok(GatedQuery::Unsupported)) => DesktopGenerateConfigResult {
+            outcome: "unsupported",
+            message_id: None,
+            message: CONFIG_GEN_UPGRADE_MESSAGE.to_string(),
+        },
+        Ok(Err(error)) => DesktopGenerateConfigResult::failed(&error),
+        // The shared client's timeout sentence, so the TUI (which waits the
+        // same budget) says the same words.
+        Err(_) => DesktopGenerateConfigResult::failed(
+            &dot_agent_deck::daemon_client::ClientError::TimedOut(
+                crate::daemon_bridge::DECK_REPLY_TIMEOUT,
+            ),
+        ),
+    }
+}
+
 /// Issue #1240: the refusal for listing options sent to a deck that does not
 /// advertise them. Unreachable from the dialog, which offers the options only
 /// where the connection says the deck honours them.
@@ -7546,6 +7653,7 @@ pub fn run() {
             star_prompt::desktop_star_prompt_choose,
             desktop_list_directories,
             desktop_inbox_action,
+            desktop_generate_config,
             agent_cards_consume,
             agent_cards_list,
             agent_card_invoke,

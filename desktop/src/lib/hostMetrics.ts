@@ -9,7 +9,7 @@ import type { HostLevel, HostMetricsReport } from "../types";
 
 export const HOST_TITLE = "Host of this deck";
 export const HOST_SUBTITLE = "The machine this deck's daemon runs on";
-export const HOST_UNKNOWN = "unknown";
+const HOST_UNKNOWN = "unknown";
 export const HOST_NOT_AVAILABLE = "Host metrics are not available from this deck.";
 export const HOST_NOT_AVAILABLE_WHY = "Its daemon is an older version, or runs on Windows.";
 /** The deck header's host button text. */
@@ -151,7 +151,7 @@ export const HOST_VOICE_NONE = "No daemon on the dashboard has Host figures to s
 export const HOST_VOICE_NOT_SHOWN = "That daemon is not on the dashboard, so its Host figures cannot be shown.";
 
 /** Several daemons show a Host button and none was named. */
-export function hostVoiceWhich(names: readonly string[]): string {
+function hostVoiceWhich(names: readonly string[]): string {
   return `Several daemons are on the dashboard: say which one, like “host ${names[0]}”.`;
 }
 

@@ -49,6 +49,22 @@ const as = (incarnation: string): AgentTarget => ({ deckId: DECK, agentId: "agen
 const A = as("process-a");
 const B = as("process-b");
 
+describe("desktop/config-gen/001: the config-generation bridge", () => {
+  beforeEach(() => invoke.mockReset());
+  /** Scenario: Generate config for an agent on a named deck. The bridge invokes the dedicated command with that deck, pane, agent and captured incarnation and returns each daemon outcome verbatim. */
+  it.each(["sent", "unsupported", "failed"])("keeps the agent binding and the %s outcome", async (outcome) => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const reply = { outcome, message: "the backend's shared sentence", ...(outcome === "sent" ? { messageId: "m-config" } : {}) };
+    invoke.mockResolvedValue(reply);
+    const bridge = new TauriDeckBridge();
+    const answer = await bridge.generateConfig(DECK, "agent-1", "pane-1", "process-a");
+    expect(invoke).toHaveBeenCalledExactlyOnceWith("desktop_generate_config", {
+      deckId: DECK, agentId: "agent-1", paneId: "pane-1", incarnation: "process-a",
+    });
+    expect(answer).toEqual(reply);
+  });
+});
+
 /** The backend's half: an attach bound to the old process is refused with the gone sentence; the successor's is accepted. */
 function backend(attachA?: () => Promise<unknown>) {
   invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {

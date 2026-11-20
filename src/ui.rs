@@ -398,12 +398,6 @@ pub enum UiMode {
     InterruptedWork,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PaneLayout {
-    Stacked,
-    Tiled,
-}
-
 /// Describes which panes to render and how to lay them out, based on the active tab.
 enum ActiveTabView {
     /// Dashboard tab: show all panes except those managed by orchestration tabs.
@@ -2172,8 +2166,6 @@ struct UiState {
     /// Issue #1635: a dialog that ran an upgrade was closed, so the next frame
     /// starts a fresh release check.
     upgrade_recheck: bool,
-    /// Layout mode for embedded terminal panes (stacked or tiled).
-    pane_layout: PaneLayout,
     /// The command-entry lock: while engaged, a keystroke aimed at a focused
     /// NON-orchestrator role pane of an Orchestration tab is dropped instead of
     /// reaching that pane's PTY (see [`gate_pane_input_key`]), and the deck
@@ -2181,9 +2173,8 @@ struct UiState {
     /// Toggled by `Ctrl+E` from command mode. **Locked by default** — a lock
     /// you must remember to engage protects nothing.
     ///
-    /// Deck-global, deliberately, and stored next to [`Self::pane_layout`] for
-    /// the same reason: it describes how someone is working right now, not
-    /// which tab they happened to open. A per-tab lock means unlocking has to
+    /// Deck-global, deliberately: it describes how someone is working right
+    /// now, not which tab they happened to open. A per-tab lock means unlocking has to
     /// be repeated in every Orchestration tab, with nothing on screen saying
     /// why the state set moments ago does not apply here.
     ///
@@ -2292,13 +2283,21 @@ struct UiState {
     form_button_rects: Vec<(Action, Rect)>,
     /// Star-prompt state for the "star the repo" reminder dialog.
     star_prompt_state: config::StarPromptState,
-    /// Config generation state — tracks directories where user chose "Never".
-    config_gen_state: config::ConfigGenState,
-    /// Pane ID + cwd for the pending config-gen modal prompt. PRD #1666 part 2
+    /// The pane of the pending config-gen modal prompt. PRD #1666 part 2
     /// (G-fix6): the pane id with the daemon process its card was learned
-    /// from, so the request is posted there or nowhere.
-    config_gen_target: Option<(crate::pane::BoundPane, String)>,
-    /// Selected option index in the config-gen modal (0=Yes, 1=No, 2=Never).
+    /// from, so the request is posted there or nowhere. PRD #2119: no
+    /// directory — the daemon composes the request for the pane's own.
+    config_gen_target: Option<crate::pane::BoundPane>,
+    /// The registry id of the agent the card showed when the config-gen
+    /// prompt opened. The request names it, so an agent that replaced it
+    /// before the user confirmed receives nothing (PRD #2119 review).
+    config_gen_agent: Option<String>,
+    /// PRD #2119: what the daemon reported, when the config-gen prompt
+    /// opened, about the card's project's `.dot-agent-deck.toml`: `Some(true)`
+    /// reads Update, `Some(false)` Generate, and `None` (the daemon could not
+    /// tell) the neutral question that claims neither.
+    config_gen_exists: Option<bool>,
+    /// Selected option index in the config-gen modal (0=Yes, 1=No).
     config_gen_selected: usize,
     /// Selected option in quit confirm modal (0=Detach, 1=Stop, 2=Cancel).
     /// PRD #92 F1 widened this from 2 to 3 options; Detach remains the
@@ -2743,7 +2742,6 @@ impl UiState {
             upgrade_installed: None,
             upgrade_results: None,
             upgrade_recheck: false,
-            pane_layout: PaneLayout::Stacked,
             command_entry_locked: true,
             session_warnings: Vec::new(),
             config_drift_tabs: HashSet::new(),
@@ -2757,8 +2755,9 @@ impl UiState {
             drawn_pane_rects: Vec::new(),
             last_click: None,
             star_prompt_state: config::StarPromptState::default(),
-            config_gen_state: config::ConfigGenState::load(),
             config_gen_target: None,
+            config_gen_agent: None,
+            config_gen_exists: None,
             config_gen_selected: 0,
             quit_confirm_selected: 0,
             close_confirm: CloseConfirmState::default(),
@@ -2938,75 +2937,39 @@ pub(crate) fn dashboard_layout_percents(zoomed: bool) -> (u16, u16) {
     }
 }
 
-/// Inner helper: right column dims for a dashboard/orchestration-style tab
-/// where the right column holds a vertical stack of `pane_count` panes.
-/// Factors out the common chrome/stack math so the dashboard (67%) and
-/// orchestration (66%) helpers can share the body and only differ on the
-/// width percentage.
-fn right_column_pane_dims(
-    area: Rect,
-    width_percent: u16,
-    pane_count: u16,
-    is_focused: bool,
-    layout: PaneLayout,
-    show_tab_bar: bool,
-) -> (u16, u16) {
+/// Inner helper: the inner `(rows, cols)` of a pane in a dashboard /
+/// orchestration-style tab's right column.
+///
+/// PRD #312: every pane in the column is sized to the WHOLE column. Only the
+/// focused pane is drawn (PRD #311), and it fills the column; an undrawn pane
+/// is sized "as if focused" (PRD #311 Open Question 1, the same rule
+/// `FrameLayout::pane_target_dims` applies per frame), so a spawn and the
+/// first frame after it agree and no pane reflows when focus moves to it.
+/// That is why there is no pane count or focus parameter: neither changes the
+/// answer. Factors out the common chrome math so the dashboard (67%) and
+/// orchestration (66%) helpers can share the body and only differ on the width
+/// percentage.
+fn right_column_pane_dims(area: Rect, width_percent: u16, show_tab_bar: bool) -> (u16, u16) {
     let chrome_rows: u16 = if show_tab_bar { 1 } else { 0 };
     let main_height = area.height.saturating_sub(chrome_rows + 1); // +1 for hints bar
     let right_width = area.width * width_percent / 100;
-    let count = pane_count.max(1);
-    let chunk_height = match layout {
-        PaneLayout::Tiled => main_height / count,
-        // PRD #311: the expanded slot now takes the WHOLE main height — no
-        // per-collapsed-pane row is carved off, since non-focused panes
-        // reserve zero rows instead of a 1-row title bar.
-        PaneLayout::Stacked => {
-            if is_focused {
-                main_height
-            } else {
-                1
-            }
-        }
-    };
-    let rows = chunk_height.saturating_sub(2);
+    let rows = main_height.saturating_sub(2);
     let cols = right_width.saturating_sub(2);
     (rows, cols)
 }
 
-/// Dashboard pane: right 67% of width, height divided across `pane_count`
-/// panes per the active `PaneLayout`. `is_focused` matters in `Stacked`
-/// mode (PRD #311: the focused pane fills the whole column, unfocused
-/// panes reserve zero rows — this helper returns a zero-row chunk for
-/// them); in `Tiled` it's ignored. `show_tab_bar` matches
+/// Dashboard pane: right 67% of width, the whole main height (PRD #312, see
+/// [`right_column_pane_dims`]). `show_tab_bar` matches
 /// `TabManager::show_tab_bar` and adds 1 row of chrome.
-pub(crate) fn dashboard_pane_dims(
-    area: Rect,
-    pane_count: u16,
-    is_focused: bool,
-    layout: PaneLayout,
-    show_tab_bar: bool,
-) -> (u16, u16) {
-    right_column_pane_dims(
-        area,
-        DASHBOARD_PANES_PERCENT,
-        pane_count,
-        is_focused,
-        layout,
-        show_tab_bar,
-    )
+pub(crate) fn dashboard_pane_dims(area: Rect, show_tab_bar: bool) -> (u16, u16) {
+    right_column_pane_dims(area, DASHBOARD_PANES_PERCENT, show_tab_bar)
 }
 
 /// Orchestration role pane: right 66% of width (the orchestration
 /// renderer uses a `[34%, 66%]` horizontal split — one column narrower
 /// than the dashboard's `[33%, 67%]` to leave room for the role status
-/// gutter), height divided across `role_count` role panes per `layout`.
-///
-/// `role_index` matters only in `Stacked` mode, where role 0 is the
-/// expanded slot (PRD #311: it fills the whole column and every other
-/// role reserves zero rows — this helper returns a zero-row chunk for
-/// them) — mirroring the renderer's "expand the first slot if nothing is
-/// focused" fallback (see `render_terminal_panes` Stacked branch). In
-/// `Tiled` mode `role_index` is ignored (height divides equally).
+/// gutter), the whole main height. Every role gets the same dims (PRD #312,
+/// see [`right_column_pane_dims`]).
 ///
 /// `show_tab_bar` is exposed for symmetry with `dashboard_pane_dims` and
 /// because hydration-time callers may briefly be in a "single-tab" state
@@ -3019,13 +2982,9 @@ pub(crate) fn dashboard_pane_dims(
 /// column wider than the rendered area, recreating exactly the
 /// spawn-vs-render drift M2.15 was meant to fix.
 ///
-/// PRD #84 M4 removed the resize sweep that once threaded a live
-/// focused-role index through this helper (so role panes could re-expand
-/// on focus). The per-frame `resize_panes_to_layout` pass now owns PTY
-/// sizing from `compute_frame_layout`, so the sole remaining caller is
-/// the spawn path, which spawns `Tiled` with no role focused yet — hence
-/// the `focused_role_index` parameter is gone and role 0 is the
-/// Stacked expanded slot.
+/// PRD #84 M4: the per-frame `resize_panes_to_layout` pass owns PTY sizing
+/// from `compute_frame_layout`, so the sole remaining caller is the spawn
+/// path.
 ///
 /// PRD #336: `narrow` selects the split via `orchestration_split_percents`.
 /// The sole caller is the spawn path, which opens a brand-new (or restored)
@@ -3038,61 +2997,11 @@ pub(crate) fn dashboard_pane_dims(
 /// (`orchestration/layout/003`).
 pub(crate) fn orchestration_role_pane_dims(
     frame_area: Rect,
-    role_count: usize,
-    role_index: usize,
-    layout: PaneLayout,
     show_tab_bar: bool,
     narrow: bool,
 ) -> (u16, u16) {
-    // Stacked: role 0 is the expanded slot, mirroring the renderer's
-    // "expand the first slot if nothing is focused" fallback. Tiled
-    // ignores `is_focused` (equal division).
-    let is_focused = role_index == 0;
     let (_, panes_percent) = orchestration_split_percents(narrow);
-    right_column_pane_dims(
-        frame_area,
-        panes_percent,
-        role_count as u16,
-        is_focused,
-        layout,
-        show_tab_bar,
-    )
-}
-
-/// PRD #76 M2.15 fixup F1 — saved-session restore spawn dims for a
-/// dashboard pane. Computes the eventual layout from the current
-/// `frame_area`, the embedded controller's pane count (incremented to
-/// account for the pane about to be added), and the live
-/// `show_tab_bar` state, then routes through `dashboard_pane_dims`.
-/// Each restore site previously called `pane.create_pane(...)` which
-/// fell through to `AgentSpawnOptions::default()` and opened the
-/// daemon-side PTY at 24×80 — the exact bug M2.15 was meant to
-/// eliminate, just on the restore entry point that wasn't on the
-/// original radar. PRD #84 M4: the per-frame `resize_panes_to_layout`
-/// pass reconciles any rounding once the pane is in the layout, but
-/// spawning at the right size removes the visible 24×80 hiccup.
-///
-/// `is_focused=false` is used because the restore loop doesn't focus
-/// any pane until after restore; the helper is forgiving in Tiled mode
-/// where `is_focused` is ignored.
-fn dashboard_restore_pane_dims(
-    pane: &dyn PaneController,
-    tab_manager: &TabManager,
-    frame_area: Rect,
-) -> (u16, u16) {
-    let embedded_pane_count = pane
-        .as_any()
-        .downcast_ref::<EmbeddedPaneController>()
-        .map(|e| e.pane_ids().len())
-        .unwrap_or(0);
-    let pane_count_after = (embedded_pane_count as u16).saturating_add(1);
-    dashboard_pane_dims(
-        frame_area,
-        pane_count_after,
-        false,
-        PaneLayout::Tiled,
-        tab_manager.show_tab_bar(),
-    )
+    right_column_pane_dims(frame_area, panes_percent, show_tab_bar)
 }
 
 /// Order an orchestration tab's cards by role config order (`role_pane_ids`),
@@ -5120,9 +5029,8 @@ fn surface_one_orchestration(
                     ui.pane_declared_agent
                         .insert(role.pane_id.clone(), declared);
                 }
-                // Bring the newly-spawned role into view — under the default
-                // `Stacked` pane layout only the focused role pane's box is
-                // drawn (every other slot reserves zero rows, PRD #311), so
+                // Bring the newly-spawned role into view — only the focused
+                // role pane's box is drawn (every other slot reserves zero rows, PRD #311), so
                 // without this the operator who just spawned a role would see
                 // no visible change at all. Only steal the LIVE embedded focus
                 // when this orchestration's tab is the one currently on
@@ -5611,9 +5519,6 @@ pub enum Action {
     /// daemon to keep the worktree; a daemon that cannot keep it refuses and
     /// nothing is closed.
     ConfirmCloseKeepWorktree,
-    /// PRD #80: toggle the embedded-pane layout between stacked and tiled
-    /// (Ctrl+T).
-    ToggleLayout,
     /// Toggle the deck-global command-entry lock (Ctrl+E), which decides
     /// whether keystrokes reach a focused non-orchestrator role pane's PTY.
     /// Only ever reaches the handler from an Orchestration tab in command mode
@@ -5687,9 +5592,6 @@ pub enum Action {
     /// PRD #80 M5: config-gen `[No]` — dismiss the prompt for now (clears the
     /// target, returns to Normal).
     ConfigGenDismiss,
-    /// PRD #80 M5: config-gen `[Never]` — suppress the prompt for this
-    /// directory and return to Normal.
-    ConfigGenSuppress,
     /// PRD #80 M5: star-prompt `[Star]` — open the repo URL and stop asking
     /// (== `s`).
     StarConfirm,
@@ -5748,9 +5650,9 @@ pub enum Action {
     /// variant (it owns a `ModeConfig`/`OrchestrationConfig`), so storing it
     /// inline would bloat every `Action` value (`clippy::large_enum_variant`).
     SpawnPane(Box<NewPaneRequest>),
+    /// PRD #2119: ask the daemon to send the configuration request to `pane`.
     SendConfigGenPrompt {
         pane: crate::pane::BoundPane,
-        cwd: String,
     },
     RequestConfigGen,
     /// PRD #92 F2 (PRD #18 follow-through): the user pressed `y` or `n` on a
@@ -8253,42 +8155,31 @@ fn handle_config_gen_prompt_key(key: KeyEvent, ui: &mut UiState) -> Action {
             Action::Continue
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            if ui.config_gen_selected < 2 {
+            if ui.config_gen_selected < 1 {
                 ui.config_gen_selected += 1;
             }
             Action::Continue
         }
         KeyCode::Enter => match ui.config_gen_selected {
             0 => {
-                // Yes — send prompt and focus pane.
+                // Yes — ask the daemon to send the request, and focus the pane.
                 ui.mode = UiMode::Normal;
-                if let Some((pane, cwd)) = ui.config_gen_target.take() {
-                    return Action::SendConfigGenPrompt { pane, cwd };
+                if let Some(pane) = ui.config_gen_target.take() {
+                    return Action::SendConfigGenPrompt { pane };
                 }
-                Action::Continue
-            }
-            1 => {
-                // No — dismiss for now, hint stays on card.
-                ui.config_gen_target = None;
-                ui.mode = UiMode::Normal;
                 Action::Continue
             }
             _ => {
-                // Never — suppress hint permanently for this directory.
-                if let Some((_, ref cwd)) = ui.config_gen_target {
-                    ui.config_gen_state.suppress_dir(cwd);
-                }
+                // No — dismiss; the user can ask again at any time.
                 ui.config_gen_target = None;
+                ui.config_gen_agent = None;
                 ui.mode = UiMode::Normal;
-                ui.status_message = Some((
-                    "Config prompt suppressed for this directory.".to_string(),
-                    std::time::Instant::now(),
-                ));
                 Action::Continue
             }
         },
         KeyCode::Esc => {
             ui.config_gen_target = None;
+            ui.config_gen_agent = None;
             ui.mode = UiMode::Normal;
             Action::Continue
         }
@@ -10802,15 +10693,12 @@ enum Flow {
 /// Key dispatch must go through [`global_action_for_mode`] instead, which
 /// applies the one mode restriction the PRD adds.
 pub fn global_action(kb: &KeybindingConfig, key: &KeyEvent) -> Option<Action> {
-    // PRD #40: the four configurable global commands resolve from the active
-    // keybinding config (any chord), defaulting to Ctrl+d/t/n/w. The caller
+    // PRD #40: the configurable global commands resolve from the active
+    // keybinding config (any chord), defaulting to Ctrl+d/n/w. The caller
     // excludes Ctrl+C before calling this, so a binding to Ctrl+C can't win
     // here.
     if kb.matches(KbAction::Dashboard, key) {
         return Some(Action::DetachToNormal);
-    }
-    if kb.matches(KbAction::ToggleLayout, key) {
-        return Some(Action::ToggleLayout);
     }
     // PRD #336. This stays a pure chord→action mapping with no tab awareness;
     // the orchestration-tab scoping is applied by `scope_orchestration_chord`
@@ -10860,14 +10748,14 @@ pub fn global_action(kb: &KeybindingConfig, key: &KeyEvent) -> Option<Action> {
 /// PTY.
 ///
 /// This generalizes the `is_ctrl_c` carve-out (a mode-dependent global chord)
-/// instead of adding a second hardcoded special case. `Dashboard`, `NewPane`,
-/// and `ToggleLayout` keep resolving from EVERY mode — none of them is
-/// destructive, and two of them are the way *out* of a pane.
+/// instead of adding a second hardcoded special case. `Dashboard` and `NewPane`
+/// keep resolving from EVERY mode — neither is destructive, and both are a way
+/// *out* of a pane.
 ///
 /// PRD #241 review F1: `UiMode::CloseConfirm` claims **nothing** here. The
 /// [`overlay_blocks_mouse`] / `modal_active` guards that make the dialog topmost are
 /// mouse-only, and this resolution runs *before* the per-mode key handler — so
-/// `Ctrl+PgUp` / `Ctrl+PgDn` (and `Ctrl+D`/`Ctrl+N`/`Ctrl+T`) still landed while
+/// `Ctrl+PgUp` / `Ctrl+PgDn` (and `Ctrl+D`/`Ctrl+N`) still landed while
 /// the modal was up, moving the ground under an open confirmation. The armed
 /// target is now identity-bound so that could no longer redirect the teardown,
 /// but a dialog you can navigate out from under is still a lie about what is
@@ -10893,7 +10781,7 @@ fn global_action_for_mode(kb: &KeybindingConfig, mode: UiMode, key: &KeyEvent) -
 }
 
 /// PRD #1258: the global command a plain letter names in command mode — `d`,
-/// `t`, `z`, `w` and `e` for their `Ctrl+` chords, under the rule
+/// `z`, `w` and `e` for their `Ctrl+` chords, under the rule
 /// [`crate::keybindings::PLAIN_LETTER_ALIASES`] documents. Keyboard only, so it
 /// stays out of [`global_action`], which the mouse and the button bar share.
 ///
@@ -10905,7 +10793,6 @@ fn global_action_for_mode(kb: &KeybindingConfig, mode: UiMode, key: &KeyEvent) -
 fn command_mode_alias_action(kb: &KeybindingConfig, key: &KeyEvent) -> Option<Action> {
     [
         (KbAction::Dashboard, Action::DetachToNormal),
-        (KbAction::ToggleLayout, Action::ToggleLayout),
         (KbAction::ToggleZoom, Action::ToggleZoom),
         (KbAction::ClosePane, Action::CloseSelected),
         (
@@ -11500,32 +11387,36 @@ fn perform_stop_and_quit(ui: &mut UiState, pane: &dyn PaneController) -> Flow {
     }
 }
 
-/// PRD #80 M5: send the config-gen prompt to `pane_id`, focus it for execution,
-/// and surface the outcome. Shared by the `Action::SendConfigGenPrompt` arm
-/// (Enter-on-Yes via the key handler) and `Action::ConfigGenConfirm` (the
-/// `[Yes]` button).
+/// PRD #80 M5: ask the daemon to send the config-gen request to `card`'s pane,
+/// focus it for execution, and surface the outcome. Shared by the
+/// `Action::SendConfigGenPrompt` arm (Enter-on-Yes via the key handler) and
+/// `Action::ConfigGenConfirm` (the `[Yes]` button).
+///
+/// PRD #2119: the daemon composes the request for the pane's own directory
+/// ([`PaneController::generate_config`]); this client sends no prompt. A
+/// daemon too old to generate one is told apart and named
+/// ([`crate::config_gen::CONFIG_GEN_UPGRADE_MESSAGE`]), and nothing else is
+/// sent in its place — no request composed here, no generic inbox post.
+///
+/// `agent` is the card's agent when the prompt opened: the request names it,
+/// so a different agent in the pane by the time the user confirmed is sent
+/// nothing.
 fn send_config_gen_prompt(
     card: &crate::pane::BoundPane,
-    cwd: &str,
+    agent: Option<&str>,
     ui: &mut UiState,
     pane: &dyn PaneController,
     tab_manager: &mut TabManager,
 ) {
     let pane_id = card.pane_id.as_str();
-    let prompt = crate::config_gen::config_gen_prompt(cwd);
     // PRD #1666 S5: the request is a message in the agent's inbox, not text
     // typed into its pane; the agent takes it the way it takes any other.
-    // PRD #1666 part 2 (G-fix6): posted on the daemon process the selected
-    // card was learned from, so a detached or never-attached card posts nothing
-    // to a restarted daemon's agent under the same pane id.
-    match pane.post_message(
-        card,
-        "configuration request",
-        &prompt,
-        crate::inbox_hub::PostOrigin::ConfigGen,
-    ) {
-        Ok(_) => {
-            // Focus the pane so the user can watch the agent take it.
+    // PRD #1666 part 2 (G-fix6): asked of the daemon process the selected card
+    // was learned from, so a detached or never-attached card sends nothing to
+    // a restarted daemon's agent under the same pane id.
+    let message = match pane.generate_config(card, agent) {
+        Ok(crate::daemon_client::GatedQuery::Answered(_)) => {
+            // Open and focus the pane so the user can watch the agent take it.
             if let Some(tab_idx) = tab_manager.tab_index_for_pane(pane_id) {
                 // PRD #83: snapshot the SOURCE tab's focus before leaving it,
                 // mirroring `switch_tab_with_focus` (capture-out → switch_to →
@@ -11540,20 +11431,38 @@ fn send_config_gen_prompt(
                 // PRD #84 M4: the destination tab's panes are sized by the
                 // pre-draw `resize_panes_to_layout` on the next frame.
             }
-            let _ = pane.focus_pane(pane_id);
-            ui.mode = UiMode::PaneInput;
-            ui.status_message = Some((
-                "Config request sent to the agent's inbox.".to_string(),
-                std::time::Instant::now(),
-            ));
+            // PRD #2119: a card whose pane is not open in this TUI — a
+            // daemon-spawned or foreign pane that never went through startup
+            // hydration — is attached first and the focus retried, exactly as
+            // `1` (`focus_deck`) and Enter (`Action::Focus`) open one, bound to
+            // the daemon process the card was learned from. PaneInput is
+            // entered only once a pane is focused: when none can be, the mode
+            // the caller left (the dashboard's) stands and the sent sentence
+            // is still shown, because the request WAS posted. Unlike those two
+            // paths, a pane that cannot be focused is never read as a stale
+            // card to delete — the daemon just accepted a request for it.
+            let mut focus = pane.focus_card(card);
+            if let Err(PaneError::CommandFailed(_)) = focus
+                && pane.try_hydrate_pane(card)
+            {
+                focus = pane.focus_card(card);
+            }
+            match focus {
+                Ok(()) => ui.mode = UiMode::PaneInput,
+                Err(error) => tracing::debug!(
+                    pane_id = %pane_id,
+                    error = %error,
+                    "config request sent, but its pane could not be opened here"
+                ),
+            }
+            crate::config_gen::CONFIG_GEN_SENT_MESSAGE.to_string()
         }
-        Err(e) => {
-            ui.status_message = Some((
-                format!("Failed to send config prompt: {e}"),
-                std::time::Instant::now(),
-            ));
+        Ok(crate::daemon_client::GatedQuery::Unsupported) => {
+            crate::config_gen::CONFIG_GEN_UPGRADE_MESSAGE.to_string()
         }
-    }
+        Err(e) => crate::config_gen::config_gen_failed_message(&e),
+    };
+    ui.status_message = Some((message, std::time::Instant::now()));
 }
 
 /// PRD #80 M6: commit a rename for the selected card — push `new_name` to the
@@ -11629,21 +11538,6 @@ fn dispatch_action(
         // ===== PRD #80 global command actions (formerly inline in run_tui) =====
         // Ctrl+n: new pane (open directory picker).
         Action::NewPane => open_new_pane_dir_picker(ui),
-        // Ctrl+t: toggle layout.
-        Action::ToggleLayout => {
-            ui.pane_layout = match ui.pane_layout {
-                PaneLayout::Stacked => PaneLayout::Tiled,
-                PaneLayout::Tiled => PaneLayout::Stacked,
-            };
-            let mode_name = match ui.pane_layout {
-                PaneLayout::Stacked => "stacked",
-                PaneLayout::Tiled => "tiled",
-            };
-            // PRD #84 M4: toggling the layout just flips `ui.pane_layout`; the
-            // pre-draw `resize_panes_to_layout` re-sizes every pane to the new
-            // split on the next frame (it reads `pane_layout`).
-            ui.status_message = Some((format!("Layout: {mode_name}"), std::time::Instant::now()));
-        }
         // Ctrl+e: toggle the deck-global command-entry lock. The action only
         // ever reaches here from an Orchestration tab in command mode —
         // `scope_orchestration_chord` un-resolves it everywhere else — so there
@@ -11690,8 +11584,7 @@ fn dispatch_action(
                 // disagrees with another.
                 let narrow = tab_manager.toggle_orchestration_split();
                 let split_name = if narrow { "25/75" } else { "34/66" };
-                // Mirroring `ToggleLayout`: flip the flag and let the next
-                // frame pick it up. `compute_frame_layout` reads it off
+                // Flip the flag and let the next frame pick it up. `compute_frame_layout` reads it off
                 // `ActiveTabView::Orchestration`, and the pre-draw
                 // `resize_panes_to_layout` pass reflows the role panes' PTYs
                 // from the same rects — no resize is pushed from here.
@@ -12061,7 +11954,7 @@ fn dispatch_action(
         // Normal-mode digit 1-9: jump to card N and focus its pane.
         Action::FocusCard(idx) => {
             focus_deck(idx, ui, filtered, snapshot, state, pane);
-            // PRD #84 M4: focusing a card can change which Stacked pane expands;
+            // PRD #84 M4: focusing a card can change which pane expands;
             // the pre-draw `resize_panes_to_layout` re-sizes it next frame.
         }
         Action::Quit => return Flow::Break,
@@ -12209,12 +12102,16 @@ fn dispatch_action(
             }
         }
         Action::RequestConfigGen => {
+            // PRD #2119: the card's own directory is not needed here — the
+            // daemon composes the request for the directory it holds for the
+            // pane, and refuses when it knows none.
             if let Some(sid) = selected_id
                 && let Some(session) = snapshot.sessions.get(sid)
                 && let Some(card) = session.bound_pane()
-                && let Some(ref cwd) = session.cwd
             {
-                ui.config_gen_target = Some((card, cwd.clone()));
+                ui.config_gen_target = Some(card);
+                ui.config_gen_agent = session.agent_id.clone();
+                ui.config_gen_exists = snapshot.project_config_exists(session);
                 ui.config_gen_selected = 0;
                 ui.mode = UiMode::ConfigGenPrompt;
             } else {
@@ -12391,20 +12288,11 @@ fn dispatch_action(
                     // show_tab_bar=true: opening an orchestration
                     // adds a new tab next to Dashboard, so the
                     // post-spawn render has ≥2 tabs.
-                    // All roles share the same spawn dims (Tiled
-                    // layout); pass role_index=0 so the helper falls
-                    // back to "role 0 expanded" — matching the
-                    // renderer's "first slot expands" default when
-                    // no role is focused yet (panes haven't been
-                    // created at this point). `Tiled` makes role_index
-                    // a geometric no-op anyway; the per-frame
-                    // `resize_panes_to_layout` reconciles the exact
-                    // rects once the tab is active.
+                    // All roles share the same spawn dims: the whole
+                    // pane column, the size the focused role is drawn
+                    // at and an undrawn one is kept at (PRD #312).
                     let spawn_dims = orchestration_role_pane_dims(
                         frame_area,
-                        orch_config.roles.len(),
-                        0,
-                        PaneLayout::Tiled,
                         true,
                         // PRD #336: the split is global, so a newly opened tab
                         // adopts whatever is currently in effect — spawn the
@@ -12647,25 +12535,11 @@ fn dispatch_action(
                     // PRD #76 M2.15: pre-compute spawn dims via the
                     // shared layout helpers so the agent PTY opens
                     // at the eventual size (no 24×80 → resize
-                    // hiccup): the dashboard right-67% column
-                    // layout with `is_focused=true` (this path
-                    // immediately focuses the new pane via
-                    // `focus_pane(&new_id)` below).
-                    let (spawn_rows, spawn_cols) = {
-                        let embedded_pane_count = pane
-                            .as_any()
-                            .downcast_ref::<EmbeddedPaneController>()
-                            .map(|e| e.pane_ids().len())
-                            .unwrap_or(0);
-                        let pane_count_after = (embedded_pane_count as u16).saturating_add(1);
-                        dashboard_pane_dims(
-                            frame_area,
-                            pane_count_after,
-                            true,
-                            ui.pane_layout,
-                            tab_manager.show_tab_bar(),
-                        )
-                    };
+                    // hiccup): the dashboard right-67% column, full
+                    // height (this path immediately focuses the new
+                    // pane via `focus_pane(&new_id)` below).
+                    let (spawn_rows, spawn_cols) =
+                        dashboard_pane_dims(frame_area, tab_manager.show_tab_bar());
                     // `spawn_agent_type` (which the daemon also wraps from) and
                     // `cmd` were both resolved before the dims block.
                     match pane.create_pane_with_options(
@@ -12786,8 +12660,9 @@ fn dispatch_action(
                 } // close else (non-orchestration path)
             }
         }
-        Action::SendConfigGenPrompt { pane: card, cwd } => {
-            send_config_gen_prompt(&card, &cwd, ui, pane, tab_manager);
+        Action::SendConfigGenPrompt { pane: card } => {
+            let agent = ui.config_gen_agent.take();
+            send_config_gen_prompt(&card, agent.as_deref(), ui, pane, tab_manager);
         }
         // ===== PRD #80 M5: modal button actions =====
         // quit-confirm [Stop]: resolve like Enter-on-Stop — straight to
@@ -12817,26 +12692,16 @@ fn dispatch_action(
         // config-gen [Yes]: send the prompt to the pending target pane.
         Action::ConfigGenConfirm => {
             ui.mode = UiMode::Normal;
-            if let Some((card, cwd)) = ui.config_gen_target.take() {
-                send_config_gen_prompt(&card, &cwd, ui, pane, tab_manager);
+            let agent = ui.config_gen_agent.take();
+            if let Some(card) = ui.config_gen_target.take() {
+                send_config_gen_prompt(&card, agent.as_deref(), ui, pane, tab_manager);
             }
         }
-        // config-gen [No]: dismiss for now (hint stays on the card).
+        // config-gen [No]: dismiss; the user can ask again at any time.
         Action::ConfigGenDismiss => {
             ui.config_gen_target = None;
+            ui.config_gen_agent = None;
             ui.mode = UiMode::Normal;
-        }
-        // config-gen [Never]: suppress the prompt for this directory.
-        Action::ConfigGenSuppress => {
-            if let Some((_, ref cwd)) = ui.config_gen_target {
-                ui.config_gen_state.suppress_dir(cwd);
-            }
-            ui.config_gen_target = None;
-            ui.mode = UiMode::Normal;
-            ui.status_message = Some((
-                "Config prompt suppressed for this directory.".to_string(),
-                std::time::Instant::now(),
-            ));
         }
         // star-prompt [Star]: open the repo and stop asking (== `s`).
         Action::StarConfirm => {
@@ -13551,15 +13416,10 @@ fn restore_orchestration_tab(
     orch_config: &OrchestrationConfig,
     saved_start_idx: usize,
 ) -> Result<usize, String> {
-    // All roles share spawn dims (Tiled); role_index=0 so the
-    // helper falls back to "role 0 expanded" — the per-frame
-    // `resize_panes_to_layout` reconciles the exact rects once
-    // the tab is active. Mirrors the live new-pane path.
+    // All roles share spawn dims: the whole pane column (PRD #312).
+    // Mirrors the live new-pane path.
     let spawn_dims = orchestration_role_pane_dims(
         frame_area,
-        orch_config.roles.len(),
-        0,
-        PaneLayout::Tiled,
         true,
         // PRD #336: a restored tab adopts the current
         // global split, like any other tab. The global is
@@ -15533,8 +15393,11 @@ pub fn run_tui(
             // bleed-through from `AgentSpawnOptions::default()`. PRD #84 M4:
             // the per-frame `resize_panes_to_layout` pass reconciles any
             // rounding once every restored pane is in the layout.
+            //
+            // PRD #312: the dims no longer depend on how many panes are
+            // already open — every pane is sized to the whole column.
             let (rows, cols) =
-                dashboard_restore_pane_dims(&*pane, &tab_manager, terminal.get_frame().area());
+                dashboard_pane_dims(terminal.get_frame().area(), tab_manager.show_tab_bar());
             // Infer the agent type once so both the daemon registry and the
             // local placeholder identify a recognized command immediately.
             let agent_type = AgentType::from_command(cmd);
@@ -17531,14 +17394,11 @@ enum FrameContent {
     /// of panes shown in `panes_area`. `pane_rects` is each pane's OUTER rect
     /// in that column (M4: same `pane_stack_rects` split `render_terminal_panes`
     /// draws into, so the PTY-resize target and the rendered rect can't drift).
-    /// `pane_layout` is threaded through so `pane_target_dims` (PRD #311 M2)
-    /// can tell a genuinely-empty `Stacked` slot apart from a `Tiled` one.
     Cards {
         dashboard_area: Rect,
         panes_area: Option<Rect>,
         pane_ids: Vec<String>,
         pane_rects: Vec<(String, Rect)>,
-        pane_layout: PaneLayout,
     },
 }
 
@@ -17591,15 +17451,14 @@ impl FrameLayout {
     /// the single source `resize_panes_to_layout` drives PTYs from (invariant
     /// 2).
     ///
-    /// PRD #311 M2: a non-focused `Stacked` pane is not drawn and its rect
-    /// collapses to zero height, but its PTY still needs a defined, stable
-    /// size — otherwise an agent reflows to something arbitrary the moment it
-    /// loses focus and reflows again when it regains it. Resolution of Open
-    /// Question 1: size it "as if focused" — since the expanded slot always
-    /// fills the WHOLE pane column once every other slot reserves zero rows,
-    /// that is simply `panes_area` (dims shared with the pane that is
-    /// actually expanded this frame). `Tiled` is untouched: a zero-height
-    /// `Tiled` rect is a genuine "no room" case, not an undrawn pane.
+    /// PRD #311 M2: a non-focused pane is not drawn and its rect collapses to
+    /// zero height, but its PTY still needs a defined, stable size — otherwise
+    /// an agent reflows to something arbitrary the moment it loses focus and
+    /// reflows again when it regains it. Resolution of Open Question 1: size
+    /// it "as if focused" — since the expanded slot always fills the WHOLE
+    /// pane column once every other slot reserves zero rows, that is simply
+    /// `panes_area` (dims shared with the pane that is actually expanded this
+    /// frame).
     fn pane_target_dims(&self) -> Vec<(&str, u16, u16)> {
         // Inner area of a bordered pane = outer minus 1 cell on each side,
         // then bounded by what the daemon will actually give the child
@@ -17612,11 +17471,10 @@ impl FrameLayout {
             FrameContent::Cards {
                 pane_rects,
                 panes_area,
-                pane_layout,
                 ..
             } => {
                 for (id, rect) in pane_rects {
-                    let target = if *pane_layout == PaneLayout::Stacked && rect.height == 0 {
+                    let target = if rect.height == 0 {
                         panes_area.unwrap_or(*rect)
                     } else {
                         *rect
@@ -17632,7 +17490,7 @@ impl FrameLayout {
 
 /// PRD #84 M3/M4 — the single per-frame layout pass. Given the frame area, the
 /// active tab view, the tab-bar snapshot, the full set of embedded pane ids,
-/// the active `PaneLayout`, and the controller's focused pane, produce every
+/// and the controller's focused pane, produce every
 /// structural rect the render path draws into — including each terminal pane's
 /// OUTER rect (M4, used to size PTYs). The split math mirrors
 /// `render_frame` / `render_terminal_panes` exactly, so the
@@ -17642,7 +17500,6 @@ fn compute_frame_layout(
     tab_view: &ActiveTabView,
     tab_bar: &TabBarInfo,
     all_pane_ids: &[String],
-    pane_layout: PaneLayout,
     focused_pane_id: Option<&str>,
     bottom_bar_rows: u16,
 ) -> FrameLayout {
@@ -17676,26 +17533,17 @@ fn compute_frame_layout(
                 .cloned()
                 .collect();
             // PRD #313: the Dashboard zooms on exactly the same terms as an
-            // orchestration tab — zero-width sidebar, full-frame pane column,
-            // and an effective `Stacked` layout so the non-focused panes are not
-            // drawn whatever `Ctrl+t` is set to. Both halves are resolved here,
-            // once, and carried in `FrameContent::Cards`; see the Orchestration
-            // arm below for why that matters (PRD #84 invariant 1).
+            // orchestration tab — zero-width sidebar, full-frame pane column.
+            // Only the focused pane is drawn either way (PRD #311, #312).
             let (left_percent, panes_percent) = dashboard_layout_percents(*zoomed);
-            let pane_layout = if *zoomed {
-                PaneLayout::Stacked
-            } else {
-                pane_layout
-            };
             let (dashboard_area, panes_area) =
                 split_cards_area(main_area, &pane_ids, left_percent, panes_percent);
-            let pane_rects = cards_pane_rects(panes_area, &pane_ids, pane_layout, focused_pane_id);
+            let pane_rects = cards_pane_rects(panes_area, &pane_ids, focused_pane_id);
             FrameContent::Cards {
                 dashboard_area,
                 panes_area,
                 pane_ids,
                 pane_rects,
-                pane_layout,
             }
         }
         ActiveTabView::Orchestration {
@@ -17719,41 +17567,16 @@ fn compute_frame_layout(
             // new width with no spawn-site or resize-site plumbing of its own.
             let (left_percent, panes_percent) =
                 orchestration_layout_percents(*split_narrow, *zoomed);
-            // PRD #313 M1 — the EFFECTIVE pane layout for this frame. Zoom's
-            // promise is "the focused agent gets the frame and everything else
-            // gets out of the way", and the second half of that is false under
-            // `Tiled`: the sidebar resolves away above, and then every role pane
-            // still takes an equal full-width slice of the column, so zoom reads
-            // as "make all the panes wider". Resolving the layout to `Stacked`
-            // for the duration of the frame reuses PRD #311's existing
-            // "only the focused pane is drawn, the rest reserve zero rows"
-            // machinery, so zoom needs no drawing rule of its own.
-            //
-            // It is EFFECTIVE, not stored: `ui.pane_layout` is the user's
-            // `Ctrl+t` choice and stays whatever they set it to, so unzooming
-            // restores Tiled exactly (`orchestration/layout/011` asserts both
-            // halves). And it is resolved ONCE, here, then carried in
-            // `FrameContent::Cards` — `render_frame` reads it back out rather
-            // than re-deriving it, which is what stops the geometry pass and the
-            // render pass from disagreeing about what layout this frame is in
-            // (PRD #84 invariant 1). It is also why the undrawn panes are sized
-            // "as if focused" by `pane_target_dims` (PRD #311 M2) instead of
-            // keeping a stale pre-zoom Tiled slice they would never reflow out
-            // of — the case `orchestration/layout/010` exists to pin.
-            let pane_layout = if *zoomed {
-                PaneLayout::Stacked
-            } else {
-                pane_layout
-            };
+            // Only the focused role pane is drawn, zoomed or not (PRD #311,
+            // #312); zoom changes the split above and nothing else.
             let (dashboard_area, panes_area) =
                 split_cards_area(main_area, &pane_ids, left_percent, panes_percent);
-            let pane_rects = cards_pane_rects(panes_area, &pane_ids, pane_layout, focused_pane_id);
+            let pane_rects = cards_pane_rects(panes_area, &pane_ids, focused_pane_id);
             FrameContent::Cards {
                 dashboard_area,
                 panes_area,
                 pane_ids,
                 pane_rects,
-                pane_layout,
             }
         }
     };
@@ -17771,12 +17594,11 @@ fn compute_frame_layout(
 fn cards_pane_rects(
     panes_area: Option<Rect>,
     pane_ids: &[String],
-    pane_layout: PaneLayout,
     focused_pane_id: Option<&str>,
 ) -> Vec<(String, Rect)> {
     match panes_area {
         Some(area) if !pane_ids.is_empty() => {
-            let chunks = pane_stack_rects(area, pane_ids, pane_layout, focused_pane_id);
+            let chunks = pane_stack_rects(area, pane_ids, focused_pane_id);
             pane_ids.iter().cloned().zip(chunks).collect()
         }
         _ => Vec::new(),
@@ -17804,7 +17626,7 @@ fn split_cards_area(
     }
 }
 
-/// PRD #84 — which pane index is the expanded (full-height) slot in a `Stacked`
+/// PRD #84 — which pane index is the expanded (full-height) slot in the
 /// pane column: the focused pane, or — when nothing in the stack is focused —
 /// the first pane. `None` only for an empty stack. Single source of truth so
 /// the rect split and `render_terminal_panes`' per-pane render agree on which
@@ -17823,44 +17645,29 @@ fn stacked_expanded_index(pane_ids: &[String], focused_id: Option<&str>) -> Opti
 }
 
 /// PRD #84 — the per-pane OUTER rects for a vertical terminal stack, matching
-/// exactly how `render_terminal_panes` lays panes out for the given
-/// `PaneLayout` and resolved focus. Single source of truth so the layout pass
-/// (which drives PTY resize) and the renderer can't disagree on a pane's rect.
-/// `Tiled`: equal vertical division. `Stacked` (PRD #311): the expanded slot
-/// fills the whole area and every other pane reserves zero rows (`Length(0)`) —
-/// it is not drawn at all, rather than collapsing to a 1-row title bar.
-fn pane_stack_rects(
-    area: Rect,
-    pane_ids: &[String],
-    layout: PaneLayout,
-    focused_id: Option<&str>,
-) -> Vec<Rect> {
+/// exactly how `render_terminal_panes` lays panes out for the resolved focus.
+/// Single source of truth so the layout pass (which drives PTY resize) and the
+/// renderer can't disagree on a pane's rect. PRD #311: the expanded slot fills
+/// the whole area and every other pane reserves zero rows (`Length(0)`) — it
+/// is not drawn at all, rather than collapsing to a 1-row title bar. PRD #312:
+/// this is the only arrangement, on the dashboard and on an orchestration tab
+/// alike; there is no user-chosen layout to consult.
+fn pane_stack_rects(area: Rect, pane_ids: &[String], focused_id: Option<&str>) -> Vec<Rect> {
     if pane_ids.is_empty() {
         return Vec::new();
     }
-    let constraints: Vec<Constraint> = match layout {
-        PaneLayout::Tiled => pane_ids
-            .iter()
-            .map(|_| Constraint::Ratio(1, pane_ids.len() as u32))
-            .collect(),
-        PaneLayout::Stacked => {
-            // PRD #311: the focused pane gets the ENTIRE area; non-focused
-            // panes are not drawn at all, so they reserve zero rows rather
-            // than a collapsed 1-row title bar.
-            let expanded = stacked_expanded_index(pane_ids, focused_id);
-            pane_ids
-                .iter()
-                .enumerate()
-                .map(|(i, _)| {
-                    if expanded == Some(i) {
-                        Constraint::Fill(1)
-                    } else {
-                        Constraint::Length(0)
-                    }
-                })
-                .collect()
-        }
-    };
+    let expanded = stacked_expanded_index(pane_ids, focused_id);
+    let constraints: Vec<Constraint> = pane_ids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| {
+            if expanded == Some(i) {
+                Constraint::Fill(1)
+            } else {
+                Constraint::Length(0)
+            }
+        })
+        .collect();
     Layout::vertical(constraints).split(area).to_vec()
 }
 
@@ -17871,10 +17678,9 @@ fn pane_stack_rects(
 /// transition) converges here instead of pushing its own
 /// `resize_pane_pty` from a private dimension calculation.
 ///
-/// A pane whose target inner area has a zero dimension (a `Tiled` pane with no
-/// room, or a viewport too small for the border) is skipped — matching the old
-/// helpers' `rows > 0 && cols > 0` guard. A non-focused `Stacked` pane is NOT a
-/// zero case here: `pane_target_dims` sizes it as if focused (PRD #311), so it
+/// A pane whose target inner area has a zero dimension (a viewport too small
+/// for the border) is skipped — matching the old helpers' `rows > 0 && cols >
+/// 0` guard. A non-focused pane is NOT a zero case here: `pane_target_dims` sizes it as if focused (PRD #311), so it
 /// keeps a stable PTY size even while undrawn. `resize_pane_pty` is the one resize
 /// primitive and handles local vs stream-backed panes itself (stream panes
 /// coalesce to the daemon; see `embedded_pane.rs`), so no per-backend
@@ -18641,7 +18447,6 @@ mod deck_attention_tests {
             &tab_view,
             &tab_bar,
             &[],
-            PaneLayout::Stacked,
             None,
             bottom_bar_rows(&ui, width, 24),
         );
@@ -19020,7 +18825,6 @@ fn draw_frame<B: ratatui::backend::Backend>(
             sources.tab_view,
             sources.tab_bar,
             &all_pane_ids,
-            ui.pane_layout,
             focused_pane_id.as_deref(),
             bar_rows,
         );
@@ -19229,33 +19033,15 @@ fn render_frame(
     // be unit-tested without a live daemon.
     let pane_status: HashMap<&str, SessionStatus> = build_pane_status(state);
 
-    // PRD #313 M1 + PRD #84 invariant 1 — the EFFECTIVE pane layout for this
-    // frame, read back out of the layout pass rather than re-derived here. A
-    // zoomed orchestration tab resolves to `Stacked` for the duration of the
-    // frame (see the Orchestration arm of `compute_frame_layout`), and reading
-    // the value the geometry actually used is what makes "the rects were split
-    // one way and the panes drawn another" unrepresentable — there is exactly
-    // one `if zoomed` in the layout, and no second one here. Issue #749: it is
-    // bound in the SAME destructure as the rects it has to agree with, so no
-    // other layout value is in scope for this function to reach for by
-    // accident — the single source is compiler-enforced, not conventional.
-    //
     // Destructure the content the layout pass resolved: dashboard and
     // orchestration tabs both render as the card grid.
-    let (dashboard_area, panes_area, pane_ids, pane_rects, pane_layout) = match &layout.content {
+    let (dashboard_area, panes_area, pane_ids, pane_rects) = match &layout.content {
         FrameContent::Cards {
             dashboard_area,
             panes_area,
             pane_ids,
             pane_rects,
-            pane_layout,
-        } => (
-            *dashboard_area,
-            *panes_area,
-            pane_ids,
-            pane_rects,
-            *pane_layout,
-        ),
+        } => (*dashboard_area, *panes_area, pane_ids, pane_rects),
     };
 
     // PRD #84: the OUTER rect each pane in the right column was sized to this
@@ -19315,7 +19101,11 @@ fn render_frame(
                 );
             }
         }
-        let ctx_buttons = dashboard_context_buttons(&ui.keybindings, !filtered.is_empty());
+        let ctx_buttons = dashboard_context_buttons(
+            &ui.keybindings,
+            !filtered.is_empty(),
+            config_action_label(state, ui, filtered),
+        );
         render_bottom_bar(frame, ui, hints_area, has_pane_control, &ctx_buttons);
 
         if let Some(right) = panes_area {
@@ -19324,7 +19114,6 @@ fn render_frame(
                 embedded,
                 right,
                 pane_ids,
-                pane_layout,
                 &ui.pane_display_names,
                 &pane_status,
                 &ui.selection,
@@ -19383,7 +19172,11 @@ fn render_frame(
 
             render_stats_bar(frame, &state.aggregate_stats(), vertical[2]);
         }
-        let ctx_buttons = dashboard_context_buttons(&ui.keybindings, !filtered.is_empty());
+        let ctx_buttons = dashboard_context_buttons(
+            &ui.keybindings,
+            !filtered.is_empty(),
+            config_action_label(state, ui, filtered),
+        );
         render_bottom_bar(frame, ui, hints_area, has_pane_control, &ctx_buttons);
         // Still render live terminal panes even when filter matches zero sessions.
         if let Some(right) = panes_area {
@@ -19392,7 +19185,6 @@ fn render_frame(
                 embedded,
                 right,
                 pane_ids,
-                pane_layout,
                 &ui.pane_display_names,
                 &pane_status,
                 &ui.selection,
@@ -19426,7 +19218,11 @@ fn render_frame(
     }
 
     // Full-width hints bar
-    let ctx_buttons = dashboard_context_buttons(&ui.keybindings, !filtered.is_empty());
+    let ctx_buttons = dashboard_context_buttons(
+        &ui.keybindings,
+        !filtered.is_empty(),
+        config_action_label(state, ui, filtered),
+    );
     render_bottom_bar(frame, ui, hints_area, has_pane_control, &ctx_buttons);
 
     // Render terminal panes on the right side
@@ -19436,7 +19232,6 @@ fn render_frame(
             embedded,
             right,
             pane_ids,
-            pane_layout,
             &ui.pane_display_names,
             &pane_status,
             &ui.selection,
@@ -19627,6 +19422,7 @@ fn draw_modal(frame: &mut Frame, area: Rect, ui: &mut UiState) {
             frame,
             area,
             ui.config_gen_selected,
+            ui.config_gen_exists,
         ));
     }
     if ui.mode == UiMode::QuitConfirm {
@@ -20341,7 +20137,6 @@ fn render_terminal_panes(
     embedded: Option<&EmbeddedPaneController>,
     area: Rect,
     pane_ids: &[String],
-    layout: PaneLayout,
     display_names: &HashMap<String, String>,
     // PRD #155 (M3): per-pane agent status keyed by pane_id, sourced from the
     // SAME `state.sessions[*].status` the deck cards render through
@@ -20388,9 +20183,8 @@ fn render_terminal_panes(
     // PRD #313 M3: is the tab being drawn zoomed? The ONLY thing this changes is
     // the border title of the pane the layout expanded, which gains the
     // `ZOOM_TITLE_MARKER` (see `zoom_marked_id` below). Geometry is not decided
-    // here — `compute_frame_layout` already handed this call the rects, and
-    // already resolved a zoomed frame to an effective `Stacked` — so a zoomed
-    // frame differs from an unzoomed one by a marker on one border title and
+    // here — `compute_frame_layout` already handed this call the rects — so a
+    // zoomed frame differs from an unzoomed one by a marker on one border title and
     // nothing else. Every caller that cannot be on a zoomed orchestration tab
     // passes `false`.
     zoomed: bool,
@@ -20448,10 +20242,7 @@ fn render_terminal_panes(
     // marker the moment focus is `None` — the exact "you forgot you were
     // zoomed" hazard M3 exists to close, arrived at by the two answers
     // disagreeing. Asking the same helper the split asked makes "the visible
-    // pane carries `[Z]`" structural rather than contingent. A zoomed frame is
-    // always effectively `Stacked` (PRD #313 M1 resolves it in
-    // `compute_frame_layout`), which is what makes this the right question to
-    // ask under either toggle.
+    // pane carries `[Z]`" structural rather than contingent.
     let zoom_marked_id: Option<&str> = if zoomed {
         stacked_expanded_index(pane_ids, focused_id.as_deref()).map(|i| pane_ids[i].as_str())
     } else {
@@ -20487,81 +20278,47 @@ fn render_terminal_panes(
             rects
         }
         None => {
-            computed_chunks = pane_stack_rects(area, pane_ids, layout, focused_id.as_deref());
+            computed_chunks = pane_stack_rects(area, pane_ids, focused_id.as_deref());
             &computed_chunks
         }
     };
-    match layout {
-        PaneLayout::Tiled => {
-            for (i, pane_id) in pane_ids.iter().enumerate() {
-                if let Some(screen) = ctrl.get_screen(pane_id) {
-                    let focused = focused_id.as_deref() == Some(pane_id.as_str());
-                    let title = pane_name(pane_id);
-                    // PRD #84 M5: this pane was sized to `chunks[i]` by
-                    // `resize_panes_to_layout` this frame, so attest the contract.
-                    let mut widget = TerminalWidget::new(
-                        pane_screen_to_draw(copy_mode, pane_id, &screen),
-                        title,
-                        focused,
-                    )
-                    .contract_guaranteed(true)
-                    .with_input_active(input_active)
-                    .with_zoom_marker(is_zoom_marked(pane_id.as_str()));
-                    // PRD #155 (M3): supply the pane's status so a non-focused
-                    // pane renders its status-colored border via the palette (the
-                    // focus override stays inside TerminalWidget). Panes without a
-                    // backing session keep the legacy focus-only border.
-                    if let Some(status) = pane_status.get(pane_id.as_str()) {
-                        widget = widget.with_status(status.clone());
-                    }
-                    drawn.panes.push((pane_id.clone(), chunks[i]));
-                    if focused {
-                        focused_pane_rect = Some(chunks[i]);
-                        focused_screen = Some(screen);
-                    }
-                    if scroll_notice_visible(ctrl, pane_id, now) {
-                        notice_rects.push(chunks[i]);
-                    }
-                    frame.render_widget(widget, chunks[i]);
-                }
+    // PRD #311: only the focused pane is drawn — non-focused panes render
+    // nothing at all (no collapsed title-bar frame). `stacked_expanded_index`
+    // resolves which slot expands (focused, else first) — the same decision
+    // the split used. PRD #312: the dashboard and an orchestration tab both
+    // draw this way; there is no other arrangement.
+    let focused_idx = stacked_expanded_index(pane_ids, focused_id.as_deref());
+    if let Some(i) = focused_idx {
+        let pane_id = &pane_ids[i];
+        if let Some(screen) = ctrl.get_screen(pane_id) {
+            let title = pane_name(pane_id);
+            let is_focused = focused_id.as_deref() == Some(pane_id.as_str());
+            // PRD #84 M5: the expanded pane was sized to `chunks[i]`
+            // by `resize_panes_to_layout` this frame — attest it.
+            let mut widget = TerminalWidget::new(
+                pane_screen_to_draw(copy_mode, pane_id, &screen),
+                title,
+                is_focused,
+            )
+            .contract_guaranteed(true)
+            .with_input_active(input_active)
+            .with_zoom_marker(is_zoom_marked(pane_id.as_str()));
+            // PRD #155 (M3): supply the pane's status so the pane renders its
+            // status-colored border via the palette (the focus override stays
+            // inside TerminalWidget). Panes without a backing session keep the
+            // legacy focus-only border.
+            if let Some(status) = pane_status.get(pane_id.as_str()) {
+                widget = widget.with_status(status.clone());
             }
-        }
-        PaneLayout::Stacked => {
-            // PRD #311: only the focused pane is drawn — non-focused panes
-            // render nothing at all (no collapsed title-bar frame).
-            // `stacked_expanded_index` resolves which slot expands (focused,
-            // else first) — the same decision the split used.
-            let focused_idx = stacked_expanded_index(pane_ids, focused_id.as_deref());
-            if let Some(i) = focused_idx {
-                let pane_id = &pane_ids[i];
-                if let Some(screen) = ctrl.get_screen(pane_id) {
-                    let title = pane_name(pane_id);
-                    let is_focused = focused_id.as_deref() == Some(pane_id.as_str());
-                    // PRD #84 M5: the expanded pane was sized to `chunks[i]`
-                    // by `resize_panes_to_layout` this frame — attest it.
-                    let mut widget = TerminalWidget::new(
-                        pane_screen_to_draw(copy_mode, pane_id, &screen),
-                        title,
-                        is_focused,
-                    )
-                    .contract_guaranteed(true)
-                    .with_input_active(input_active)
-                    .with_zoom_marker(is_zoom_marked(pane_id.as_str()));
-                    // PRD #155 (M3): same status threading as the Tiled arm.
-                    if let Some(status) = pane_status.get(pane_id.as_str()) {
-                        widget = widget.with_status(status.clone());
-                    }
-                    drawn.panes.push((pane_id.clone(), chunks[i]));
-                    if is_focused {
-                        focused_pane_rect = Some(chunks[i]);
-                        focused_screen = Some(screen);
-                    }
-                    if scroll_notice_visible(ctrl, pane_id, now) {
-                        notice_rects.push(chunks[i]);
-                    }
-                    frame.render_widget(widget, chunks[i]);
-                }
+            drawn.panes.push((pane_id.clone(), chunks[i]));
+            if is_focused {
+                focused_pane_rect = Some(chunks[i]);
+                focused_screen = Some(screen);
             }
+            if scroll_notice_visible(ctrl, pane_id, now) {
+                notice_rects.push(chunks[i]);
+            }
+            frame.render_widget(widget, chunks[i]);
         }
     }
 
@@ -20710,7 +20467,7 @@ fn render_terminal_panes(
     // PRD #385 M5: copy mode's selection and cursor, over the frozen screen
     // its pane was drawn from above, so the highlight shows exactly what a
     // yank copies. A copy mode whose pane this frame did not draw (it closed,
-    // or another pane took the stacked layout's one slot) has nothing left to
+    // or another pane took the column's one drawn slot) has nothing left to
     // show, so it is reported for the caller to close.
     if let Some(copy) = copy_mode {
         match drawn.panes.iter().find(|(id, _)| id == copy.pane_id()) {
@@ -20871,13 +20628,12 @@ fn render_stats_bar(frame: &mut Frame, stats: &DashboardStats, area: Rect) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// PRD #80 M2: the five global commands the persistent button bar exposes,
-/// each carrying its inline keyboard shortcut (so the bar doubles as the
-/// legend it replaced). The pane-dependent commands (New Agent / Close /
-/// Toggle Layout) are disabled — rendered dimmed — when no pane controller is
-/// available; Help and Quit are always actionable. Shortcuts mirror the
-/// keyboard handlers: `global_ctrl_action` (Ctrl+N/W/T), `?` → Help,
-/// Ctrl+C → Quit.
+/// PRD #80 M2: the global commands the persistent button bar exposes, each
+/// carrying its inline keyboard shortcut (so the bar doubles as the legend it
+/// replaced). Close is disabled — rendered dimmed — when no pane controller is
+/// available; the rest are always actionable. Shortcuts mirror the keyboard
+/// handlers: `global_ctrl_action` (Ctrl+N/W), `?` → Help, Ctrl+C → Quit.
+/// PRD #312 removed the Toggle Layout button with its chord.
 /// PRD #40: format a keybinding's notation for a BUTTON label. Buttons use the
 /// prd-80 convention of `Ctrl+<UPPERCASE letter>` (e.g. `Ctrl+N`), while
 /// `notation()` emits lowercase (`Ctrl+n`). Uppercase ONLY the trailing single
@@ -21003,12 +20759,6 @@ fn global_bar_buttons(
             has_pane_control && g.close_available,
         ),
         Button::new(
-            "Toggle Layout",
-            button_shortcut_label_for_mode(keybindings, KbAction::ToggleLayout, mode),
-            Action::ToggleLayout,
-            has_pane_control,
-        ),
-        Button::new(
             "Help",
             button_shortcut_label(keybindings, KbAction::Help),
             Action::ToggleHelp,
@@ -21026,7 +20776,15 @@ fn global_bar_buttons(
 /// shortcut. Filter is always actionable; Rename / Generate-config act on the
 /// selected card, so they're disabled (dimmed) when there are no cards —
 /// matching the keys' `total > 0` guard.
-fn dashboard_context_buttons(keybindings: &KeybindingConfig, has_cards: bool) -> Vec<Button> {
+///
+/// PRD #2119: `config_label` is the selected card's config action — `Update`
+/// when the daemon reported its project already has a config, else
+/// `Generate` ([`config_action_label`]). Same key, same action either way.
+fn dashboard_context_buttons(
+    keybindings: &KeybindingConfig,
+    has_cards: bool,
+    config_label: &'static str,
+) -> Vec<Button> {
     let mut buttons = vec![
         Button::new(
             "Filter",
@@ -21041,7 +20799,7 @@ fn dashboard_context_buttons(keybindings: &KeybindingConfig, has_cards: bool) ->
             has_cards,
         ),
         Button::new(
-            "Generate",
+            config_label,
             button_shortcut_label(keybindings, KbAction::GenerateConfig),
             Action::RequestConfigGen,
             has_cards,
@@ -21066,6 +20824,29 @@ fn dashboard_context_buttons(keybindings: &KeybindingConfig, has_cards: bool) ->
         true,
     ));
     buttons
+}
+
+/// PRD #2119: the footer's config action when the selected card's project
+/// has no config, or the daemon has not said.
+const CONFIG_ACTION_GENERATE: &str = "Generate";
+
+/// PRD #2119: the footer label of the selected card's config action — `Update`
+/// when the daemon reported that its project already has a
+/// `.dot-agent-deck.toml`, else [`CONFIG_ACTION_GENERATE`]. The card is the one
+/// `g` acts on ([`dashboard_focus_target`]).
+fn config_action_label(
+    state: &AppState,
+    ui: &UiState,
+    filtered: &[(&String, &SessionState)],
+) -> &'static str {
+    let exists = dashboard_focus_target(ui, filtered.len())
+        .and_then(|i| filtered.get(i))
+        .and_then(|(_, session)| state.project_config_exists(session));
+    if exists == Some(true) {
+        "Update"
+    } else {
+        CONFIG_ACTION_GENERATE
+    }
 }
 
 /// PRD #144 — greedy line-wrap for the bottom button bar. Lay the buttons out
@@ -21332,7 +21113,13 @@ fn bottom_bar_rows(ui: &UiState, width: u16, frame_height: u16) -> u16 {
         _ if ui.status_message.is_some() => 1,
         _ => {
             let mut buttons = global_bar_buttons(&ui.keybindings, ui.mode, true);
-            buttons.extend(dashboard_context_buttons(&ui.keybindings, true));
+            // PRD #2119: reserved for `Generate`, the longer of the two
+            // config labels, so an `Update` bar never needs more rows.
+            buttons.extend(dashboard_context_buttons(
+                &ui.keybindings,
+                true,
+                CONFIG_ACTION_GENERATE,
+            ));
             let widths: Vec<u16> = buttons
                 .iter()
                 .map(|b| b.display_label().chars().count() as u16)
@@ -21752,7 +21539,7 @@ const STOP_CONFIRM: ConfirmLayout = ConfirmLayout {
     first_choice: 4,
 };
 const CONFIG_GEN_CONFIRM: ConfirmLayout = ConfirmLayout {
-    rows: 14,
+    rows: 12,
     first_choice: 5,
 };
 
@@ -22419,7 +22206,12 @@ fn render_star_prompt(frame: &mut Frame, area: Rect) -> ConfirmDrawing {
     }
 }
 
-fn render_config_gen_prompt(frame: &mut Frame, area: Rect, selected: usize) -> ConfirmDrawing {
+fn render_config_gen_prompt(
+    frame: &mut Frame,
+    area: Rect,
+    selected: usize,
+    exists: Option<bool>,
+) -> ConfirmDrawing {
     let popup_width = 60u16.min(area.width.saturating_sub(4));
     let popup_height = CONFIG_GEN_CONFIRM.popup_height(0, area);
     let x = (area.width.saturating_sub(popup_width)) / 2;
@@ -22428,19 +22220,50 @@ fn render_config_gen_prompt(frame: &mut Frame, area: Rect, selected: usize) -> C
 
     frame.render_widget(Clear, popup_area);
 
-    let options = [
-        ("Yes", "generate config for this project"),
-        ("No", "skip for now"),
-        ("Never", "never ask for this directory"),
-    ];
+    // PRD #2119: Update when the daemon reported that the project already
+    // has a config — the request it composes then says so — Generate when it
+    // reported none, and, when it could not tell, a question that claims
+    // neither: the request is then the conditional one (PR #2362 review). The
+    // title stays Generate there, matching the footer. The same words as the
+    // desktop's dialog (CLAUDE.md rule 22).
+    let (verb, question, yes) = match exists {
+        Some(true) => (
+            "Update",
+            [
+                "  This project already has an orchestration config.",
+                "  Want to instruct your agent to analyze the",
+                "  project and update the existing config?",
+            ],
+            "update config for this project",
+        ),
+        Some(false) => (
+            "Generate",
+            [
+                "  No orchestration config found for this",
+                "  project. Want to instruct your agent to",
+                "  analyze the project and create one?",
+            ],
+            "generate config for this project",
+        ),
+        None => (
+            "Generate",
+            [
+                "  Want to instruct your agent to check this",
+                "  project for .dot-agent-deck.toml and create it,",
+                "  or propose updates to it if it already exists?",
+            ],
+            "create or update config for this project",
+        ),
+    };
+    let options = [("Yes", yes), ("No", "skip for now")];
 
-    let mut text = vec![
-        Line::from(""),
-        Line::styled("  No orchestration config found for this", text_primary()),
-        Line::styled("  project. Want to instruct your agent to", text_primary()),
-        Line::styled("  analyze the project and create one?", text_primary()),
-        Line::from(""),
-    ];
+    let mut text = vec![Line::from("")];
+    text.extend(
+        question
+            .iter()
+            .map(|line| Line::styled(*line, text_primary())),
+    );
+    text.push(Line::from(""));
 
     for (i, (label, desc)) in options.iter().enumerate() {
         let cursor = if i == selected { ">" } else { " " };
@@ -22457,11 +22280,10 @@ fn render_config_gen_prompt(frame: &mut Frame, area: Rect, selected: usize) -> C
         ));
     }
 
+    // PRD #2119: Yes / No only. The dialog opens only when asked for, so a
+    // "Never" choice and an automatic-prompt hint had nothing to switch off.
+    // Two rows follow the choices: a gap, and the button row below.
     text.push(Line::from(""));
-    text.push(Line::styled(
-        "  Disable: dot-agent-deck config set auto_config_prompt false",
-        text_primary(),
-    ));
     text.push(Line::from(""));
     text.push(Line::styled(
         "  Up/Down: navigate  Enter: confirm  Esc: cancel",
@@ -22469,7 +22291,7 @@ fn render_config_gen_prompt(frame: &mut Frame, area: Rect, selected: usize) -> C
     ));
 
     let block = Block::default()
-        .title(" Generate .dot-agent-deck.toml ")
+        .title(format!(" {verb} .dot-agent-deck.toml "))
         .title_style(
             Style::default()
                 .fg(Color::Cyan)
@@ -22485,7 +22307,6 @@ fn render_config_gen_prompt(frame: &mut Frame, area: Rect, selected: usize) -> C
     let buttons = [
         Button::new("Yes", "", Action::ConfigGenConfirm, true),
         Button::new("No", "", Action::ConfigGenDismiss, true),
-        Button::new("Never", "", Action::ConfigGenSuppress, true),
     ];
     let btn_row = Rect {
         x: popup_area.x + 1,
@@ -22595,9 +22416,8 @@ fn dashboard_hints_string(keybindings: &KeybindingConfig, mode: UiMode) -> Strin
     // the non-overridable modal trigger (Detach/Stop/Cancel), so the hint is a
     // fixed string rather than a config-derived notation.
     format!(
-        "{}: new  {close}{}: layout  {}: {dashboard_label} ({} {} {})  Ctrl+c: quit",
+        "{}: new  {close}{}: {dashboard_label} ({} {} {})  Ctrl+c: quit",
         hint(KbAction::NewPane),
-        hint(KbAction::ToggleLayout),
         hint(KbAction::Dashboard),
         jump_range_notation(keybindings),
         display_notation(keybindings, KbAction::Help),
@@ -22725,10 +22545,6 @@ fn render_help_overlay(
         // are typing in a pane. It is listed under "Dashboard (command mode)"
         // below; leaving it here would document a key that does nothing where
         // the heading promises it works.
-        help_key_line(
-            &lettered(KbAction::ToggleLayout),
-            "Toggle layout (stacked/tiled)",
-        ),
         // PRD #336: `toggle_orchestration_split` is NOT listed here, for the
         // same reason PRD #241 review F6 moved `close_pane` out — it is
         // command-mode only, so this heading's "chords work from any pane" promise
@@ -26743,7 +26559,7 @@ pub fn render_config_gen_prompt_to_buffer(
 ) -> ratatui::buffer::Buffer {
     draw_to_buffer(width, height, |frame| {
         let frame_area = frame.area();
-        render_config_gen_prompt(frame, frame_area, selected);
+        render_config_gen_prompt(frame, frame_area, selected, Some(false));
     })
 }
 
@@ -27152,8 +26968,7 @@ fn clamp_render_seam_dims(width: u16, height: u16) -> (u16, u16) {
 /// `role_names` are the roles in tab order, each used as BOTH its sidebar card's
 /// display name and its pane's border title (which is what makes the rendered
 /// frame legible to a role-keyed scan such as `common::role_pane_left_edge`).
-/// `focused_role_index` selects the focused — and, under `PaneLayout::Stacked`,
-/// the only drawn — role pane. `split_narrow` and `zoomed` are the tab's view
+/// `focused_role_index` selects the focused — and the only drawn — role pane. `split_narrow` and `zoomed` are the tab's view
 /// state, resolved through the same [`orchestration_layout_percents`] the live
 /// tab uses.
 ///
@@ -27309,7 +27124,6 @@ pub fn render_orchestration_frame_to_buffer(
         &tab_view,
         &tab_bar,
         &pane_ids,
-        PaneLayout::Stacked,
         Some(pane_ids[focused_role_index].as_str()),
         bar_rows,
     );
@@ -27379,7 +27193,7 @@ pub fn render_button_bar_with_bindings_to_buffer(
     let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
     // Seam renders the full global+context bar (including the always-on
     // Schedules button) so every remappable label is exercised.
-    let ctx_buttons = dashboard_context_buttons(keybindings, true);
+    let ctx_buttons = dashboard_context_buttons(keybindings, true, CONFIG_ACTION_GENERATE);
     let mut ui = UiState::new(DashboardConfig::default(), keybindings.clone());
     terminal
         .draw(|frame| {
@@ -27423,7 +27237,7 @@ pub fn render_button_bar_for_mode_to_buffer(
 
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
-    let ctx_buttons = dashboard_context_buttons(keybindings, true);
+    let ctx_buttons = dashboard_context_buttons(keybindings, true, CONFIG_ACTION_GENERATE);
     let mut ui = UiState::new(DashboardConfig::default(), keybindings.clone());
     ui.mode = mode;
     terminal
@@ -27485,7 +27299,6 @@ pub fn render_focused_pane_cursor_for_mode_to_position(
                 Some(&ctrl),
                 area,
                 &[PANE_ID.to_string()],
-                PaneLayout::Stacked,
                 &HashMap::new(),
                 &HashMap::new(),
                 &None,
@@ -27572,7 +27385,6 @@ pub fn render_command_banner_pane_to_buffer(
                 Some(&ctrl),
                 area,
                 &[PANE_ID.to_string()],
-                PaneLayout::Stacked,
                 &HashMap::new(),
                 &HashMap::new(),
                 &None,
@@ -27589,12 +27401,15 @@ pub fn render_command_banner_pane_to_buffer(
     terminal.backend().buffer().clone()
 }
 
-/// PRD #385 M2/M3 L1 seam: panes tiled over a `TestBackend` frame, driven by
+/// PRD #385 M2/M3 L1 seam: panes stacked in a `TestBackend` frame, driven by
 /// the mouse and the keyboard through the functions the live loop calls, so a
 /// test sees the selection, its highlight and its copies the way a user does.
+/// As on the dashboard, only the focused pane is drawn, over the whole frame
+/// (PRD #311, #312).
 ///
 /// The panes are inert seam panes (no daemon, no agent); each is sized to the
-/// inner area of its tiled rect, as `resize_panes_to_layout` sizes a live one.
+/// inner area of the whole frame, as `resize_panes_to_layout` sizes a live one
+/// whether or not it is drawn.
 /// Copies are collected rather than delivered, so no test reaches a clipboard.
 #[doc(hidden)]
 pub struct PaneSelectionSeam {
@@ -27605,7 +27420,6 @@ pub struct PaneSelectionSeam {
     area: Rect,
     deck: DeckKey,
     copies: Vec<String>,
-    layout: PaneLayout,
     banner: CommandBannerVisibility,
     /// The panes belong to an orchestration tab: that tab draws them and the
     /// dashboard does not ([`Self::on_orchestration_tab`]).
@@ -27614,18 +27428,18 @@ pub struct PaneSelectionSeam {
 
 #[doc(hidden)]
 impl PaneSelectionSeam {
-    /// `panes` are `(pane id, bytes already on its screen)`, tiled over a
+    /// `panes` are `(pane id, bytes already on its screen)`, stacked in a
     /// `width` x `height` frame, with `focused` focused and keys reaching it
     /// (`UiMode::PaneInput`).
-    pub fn tiled(width: u16, height: u16, panes: &[(&str, &[u8])], focused: &str) -> Self {
+    pub fn stacked(width: u16, height: u16, panes: &[(&str, &[u8])], focused: &str) -> Self {
         Self::build(width, height, panes, focused, None)
     }
 
-    /// As [`Self::tiled`], but every pane's terminal screen is `rows` x
+    /// As [`Self::stacked`], but every pane's terminal screen is `rows` x
     /// `cols` whatever the size of the pane it is drawn in: what a client sees
     /// while another attached client decides the size, or while a resize it
     /// asked for has not been applied yet.
-    pub fn tiled_with_screen(
+    pub fn stacked_with_screen(
         width: u16,
         height: u16,
         panes: &[(&str, &[u8])],
@@ -27645,15 +27459,14 @@ impl PaneSelectionSeam {
     ) -> Self {
         let area = Rect::new(0, 0, width, height);
         let pane_ids: Vec<String> = panes.iter().map(|(id, _)| (*id).to_string()).collect();
-        let rects = pane_stack_rects(area, &pane_ids, PaneLayout::Tiled, Some(focused));
-        let inner = |rect: Rect| {
-            screen.unwrap_or_else(|| {
-                let inner = pane_inner_rect(rect);
-                (inner.height.max(1), inner.width.max(1))
-            })
-        };
+        // Every pane is sized to the whole frame, drawn or not: the size the
+        // focused pane is drawn at, and the one `pane_target_dims` keeps an
+        // undrawn pane at.
+        let (rows, cols) = screen.unwrap_or_else(|| {
+            let inner = pane_inner_rect(area);
+            (inner.height.max(1), inner.width.max(1))
+        });
         let (first_id, first_bytes) = panes[0];
-        let (rows, cols) = inner(rects[0]);
         let (ctrl, first_input) = EmbeddedPaneController::for_scroll_seam_with_focused_pane(
             first_id,
             rows,
@@ -27662,8 +27475,7 @@ impl PaneSelectionSeam {
             false,
         );
         let mut inputs = vec![first_input];
-        for (i, (id, bytes)) in panes.iter().enumerate().skip(1) {
-            let (rows, cols) = inner(rects[i]);
+        for (id, bytes) in panes.iter().skip(1) {
             inputs.push(ctrl.add_scroll_seam_pane(id, rows, cols, bytes));
         }
         ctrl.focus_pane(focused)
@@ -27678,7 +27490,6 @@ impl PaneSelectionSeam {
             area,
             deck: DeckKey::Dashboard,
             copies: Vec::new(),
-            layout: PaneLayout::Tiled,
             banner: CommandBannerVisibility::Hidden,
             orchestration_owned: false,
         }
@@ -27716,11 +27527,6 @@ impl PaneSelectionSeam {
             .arm_scroll_notice(pane_id, std::time::Instant::now());
     }
 
-    /// The stacked layout: only the focused pane is drawn, over the whole area.
-    pub fn stack(&mut self) {
-        self.layout = PaneLayout::Stacked;
-    }
-
     /// The frame becomes `width` x `height`; the panes' screens keep their
     /// size, as they do until the resize reaches them.
     pub fn resize(&mut self, width: u16, height: u16) {
@@ -27749,7 +27555,6 @@ impl PaneSelectionSeam {
         use ratatui::backend::TestBackend;
         // As `run_tui` does right before it draws.
         clear_selection_on_tab_switch(&mut self.ui, Some(self.deck));
-        self.ui.pane_layout = self.layout;
         let mut terminal = Terminal::new(TestBackend::new(self.area.width, self.area.height))
             .expect("TestBackend should construct");
         let snapshot = AppState::default();
@@ -27817,7 +27622,6 @@ impl PaneSelectionSeam {
                     Some(&self.ctrl),
                     self.area,
                     &ids,
-                    self.layout,
                     &HashMap::new(),
                     &HashMap::new(),
                     &self.ui.selection,
@@ -27835,11 +27639,12 @@ impl PaneSelectionSeam {
         terminal.backend().buffer().clone()
     }
 
-    /// The outer rect `pane_id` is drawn in.
+    /// The outer rect `pane_id` is drawn in: the whole frame for the focused
+    /// pane, a zero-height rect for any other.
     pub fn pane_rect(&self, pane_id: &str) -> Rect {
         let ids = self.drawn_ids();
         let focused = self.ctrl.focused_pane_id();
-        let rects = pane_stack_rects(self.area, &ids, self.layout, focused.as_deref());
+        let rects = pane_stack_rects(self.area, &ids, focused.as_deref());
         let i = ids
             .iter()
             .position(|id| id == pane_id)
@@ -28188,7 +27993,6 @@ impl CopyModeSeam {
                     Some(&*self.ctrl),
                     pane,
                     &ids,
-                    PaneLayout::Tiled,
                     &HashMap::new(),
                     &HashMap::new(),
                     &self.ui.selection,
@@ -28476,7 +28280,6 @@ fn render_sized_scroll_seam_pane_to_buffer(
                 Some(ctrl),
                 frame.area(),
                 &[SCROLL_SEAM_PANE_ID.to_string()],
-                PaneLayout::Stacked,
                 &HashMap::new(),
                 &HashMap::new(),
                 &None,
@@ -28754,7 +28557,6 @@ pub fn observe_dashboard_geometry(width: u16, height: u16, card_count: usize) ->
         &tab_view,
         &tab_bar,
         &pane_ids,
-        PaneLayout::Stacked,
         Some(pane_id.as_str()),
         bar_rows,
     );
@@ -28871,9 +28673,12 @@ pub struct ScrollNoticeBannerPrecedenceObservation {
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct ScrollNoticePaneAffinityObservation {
-    pub render: ratatui::buffer::Buffer,
-    pub first_pane_rect: Rect,
-    pub second_pane_rect: Rect,
+    /// The frame after focus moved from the pane that armed the notice to the
+    /// other pane: only that other pane is drawn (PRD #311, #312).
+    pub second_focused_render: ratatui::buffer::Buffer,
+    /// The frame after focus came back to the pane that armed the notice,
+    /// still inside the notice's lifetime.
+    pub first_refocused_render: ratatui::buffer::Buffer,
 }
 
 /// Observable lifecycle and rendering variants of one failed-scroll notice.
@@ -29021,39 +28826,42 @@ fn observe_scroll_notice_pane_affinity(
         "the affinity seam must move production focus to its second pane"
     );
 
-    let pane_width = COLS + 2;
-    let pane_height = SCROLL_SEAM_ROWS + 2;
-    let backend = TestBackend::new(pane_width, pane_height * 2);
-    let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
-    terminal
-        .draw(|frame| {
-            render_terminal_panes(
-                frame,
-                Some(&ctrl),
-                frame.area(),
-                &[
-                    SCROLL_SEAM_PANE_ID.to_string(),
-                    RECONCILE_SEAM_SECOND_PANE_ID.to_string(),
-                ],
-                PaneLayout::Tiled,
-                &HashMap::new(),
-                &HashMap::new(),
-                &None,
-                None,
-                None,
-                UiMode::PaneInput,
-                CommandBannerVisibility::Hidden,
-                None,
-                now,
-                false,
-            );
-        })
-        .expect("TestBackend draw should succeed");
+    let ids = [
+        SCROLL_SEAM_PANE_ID.to_string(),
+        RECONCILE_SEAM_SECOND_PANE_ID.to_string(),
+    ];
+    let render = || {
+        let backend = TestBackend::new(COLS + 2, SCROLL_SEAM_ROWS + 2);
+        let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
+        terminal
+            .draw(|frame| {
+                render_terminal_panes(
+                    frame,
+                    Some(&ctrl),
+                    frame.area(),
+                    &ids,
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    &None,
+                    None,
+                    None,
+                    UiMode::PaneInput,
+                    CommandBannerVisibility::Hidden,
+                    None,
+                    now,
+                    false,
+                );
+            })
+            .expect("TestBackend draw should succeed");
+        terminal.backend().buffer().clone()
+    };
+    let second_focused_render = render();
+    focus_reconcile_seam_pane(&ctrl, ReconcileSeamPane::First);
+    let first_refocused_render = render();
 
     ScrollNoticePaneAffinityObservation {
-        render: terminal.backend().buffer().clone(),
-        first_pane_rect: Rect::new(0, 0, pane_width, pane_height),
-        second_pane_rect: Rect::new(0, pane_height, pane_width, pane_height),
+        second_focused_render,
+        first_refocused_render,
     }
 }
 
@@ -29609,9 +29417,6 @@ impl PaneController for SeamPanes {
     fn rename_pane(&self, _pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError> {
         Ok(RenameOutcome::Applied(name.to_string()))
     }
-    fn toggle_layout(&self) -> Result<(), PaneError> {
-        Ok(())
-    }
     fn write_to_pane(&self, _pane_id: &str, _text: &str) -> Result<(), PaneError> {
         Ok(())
     }
@@ -29788,15 +29593,8 @@ pub fn render_host_metrics_key_sequence_to_buffers(
 
     let mut draw = |ui: &mut UiState| {
         let bar_rows = bottom_bar_rows(ui, width, height);
-        let layout = compute_frame_layout(
-            frame_area,
-            &tab_view,
-            &tab_bar,
-            &pane_ids,
-            PaneLayout::Stacked,
-            None,
-            bar_rows,
-        );
+        let layout =
+            compute_frame_layout(frame_area, &tab_view, &tab_bar, &pane_ids, None, bar_rows);
         let filtered = filter_sessions(&state, ui);
         let completed = terminal
             .draw(|frame| {
@@ -30048,15 +29846,8 @@ pub fn run_interrupted_work_seam(
         // The event loop's check, before each frame.
         interrupted_work_view::sync(ui, attached);
         let bar_rows = bottom_bar_rows(ui, width, height);
-        let layout = compute_frame_layout(
-            frame_area,
-            &tab_view,
-            &tab_bar,
-            &pane_ids,
-            PaneLayout::Stacked,
-            None,
-            bar_rows,
-        );
+        let layout =
+            compute_frame_layout(frame_area, &tab_view, &tab_bar, &pane_ids, None, bar_rows);
         let filtered = filter_sessions(&state, ui);
         let completed = terminal
             .draw(|frame| {
@@ -30207,15 +29998,8 @@ pub fn render_restart_notice_agents_key_sequence_to_buffers(
 
     let mut draw = |ui: &mut UiState| {
         let bar_rows = bottom_bar_rows(ui, width, height);
-        let layout = compute_frame_layout(
-            frame_area,
-            &tab_view,
-            &tab_bar,
-            &pane_ids,
-            PaneLayout::Stacked,
-            None,
-            bar_rows,
-        );
+        let layout =
+            compute_frame_layout(frame_area, &tab_view, &tab_bar, &pane_ids, None, bar_rows);
         let filtered = filter_sessions(&state, ui);
         let completed = terminal
             .draw(|frame| {
@@ -31117,66 +30901,52 @@ mod tests {
     // agent draws into a mismatched buffer.
 
     #[test]
-    fn dashboard_pane_dims_tiled_divides_main_height() {
-        // 100×30 terminal, no tab bar, 2 panes, tiled. main_height = 30-1
-        // (hints bar) = 29; chunk = 29/2 = 14; rows = 14 - 2 = 12.
-        // right_width = 100 * 67 / 100 = 67; cols = 67 - 2 = 65.
-        let (rows, cols) =
-            dashboard_pane_dims(Rect::new(0, 0, 100, 30), 2, false, PaneLayout::Tiled, false);
-        assert_eq!((rows, cols), (12, 65));
+    fn dashboard_pane_dims_fill_the_whole_column() {
+        // PRD #312: every pane is sized to the whole column, whatever else is
+        // open. 100×30 terminal, no tab bar: main_height = 30-1 (hints bar) =
+        // 29; rows = 29 - 2 = 27. right_width = 100 * 67 / 100 = 67; cols =
+        // 67 - 2 = 65.
+        let (rows, cols) = dashboard_pane_dims(Rect::new(0, 0, 100, 30), false);
+        assert_eq!((rows, cols), (27, 65));
     }
 
     #[test]
-    fn dashboard_pane_dims_tiled_with_tab_bar_subtracts_chrome() {
+    fn dashboard_pane_dims_with_tab_bar_subtracts_chrome() {
         // Same shape but show_tab_bar=true: chrome_rows = 1, main_height
-        // = 30 - 2 = 28; chunk = 14; rows = 12.
-        let (rows, cols) =
-            dashboard_pane_dims(Rect::new(0, 0, 100, 30), 2, false, PaneLayout::Tiled, true);
-        assert_eq!((rows, cols), (12, 65));
+        // = 30 - 2 = 28; rows = 26.
+        let (rows, cols) = dashboard_pane_dims(Rect::new(0, 0, 100, 30), true);
+        assert_eq!((rows, cols), (26, 65));
     }
 
     #[test]
-    fn dashboard_pane_dims_stacked_focused_takes_remainder() {
-        // PRD #311: the focused slot takes the WHOLE main height (no rows
-        // ceded to collapsed siblings). 100×30, 3 panes, stacked, focused:
-        // main = 29; chunk = 29; rows = 27.
-        let (rows, cols) = dashboard_pane_dims(
-            Rect::new(0, 0, 100, 30),
-            3,
-            true,
-            PaneLayout::Stacked,
-            false,
+    fn dashboard_pane_dims_match_the_rendered_focused_pane() {
+        // Drift guard: the spawn size equals the inner area of the rect the
+        // layout pass gives the focused pane, so a spawned agent does not
+        // reflow on its first frame.
+        let frame_area = Rect::new(0, 0, 100, 30);
+        let pane_ids = vec!["p0".to_string(), "p1".to_string(), "p2".to_string()];
+        let layout = compute_frame_layout(
+            frame_area,
+            &ActiveTabView::Dashboard {
+                exclude_pane_ids: vec![],
+                zoomed: false,
+            },
+            &TabBarInfo {
+                show: false,
+                labels: vec![],
+                active_index: 0,
+                orchestration_statuses: vec![],
+            },
+            &pane_ids,
+            Some("p1"),
+            1,
         );
-        assert_eq!((rows, cols), (27, 65));
-    }
-
-    #[test]
-    fn dashboard_pane_dims_stacked_unfocused_reserves_zero_rows() {
-        // PRD #311: a non-focused Stacked pane is not drawn and reserves zero
-        // rows (no collapsed title bar). This spawn-path helper mirrors that by
-        // returning a zero-row chunk for the unfocused case: chunk = 1; rows =
-        // saturating_sub(2) = 0. Spawn-time resize callers gate on rows > 0, so
-        // this just signals "don't dispatch a resize for this pane right now";
-        // the per-frame `resize_panes_to_layout` pass later sizes the pane's PTY
-        // as if focused (see `FrameLayout::pane_target_dims`).
-        let (rows, _cols) = dashboard_pane_dims(
-            Rect::new(0, 0, 100, 30),
-            3,
-            false,
-            PaneLayout::Stacked,
-            false,
-        );
-        assert_eq!(rows, 0);
-    }
-
-    #[test]
-    fn dashboard_pane_dims_zero_pane_count_does_not_divide_by_zero() {
-        // Edge case: pane_count = 0 (the very first pane is about to be
-        // added). Clamp to 1 so the math produces a sane value instead
-        // of a panic / overflow.
-        let (rows, cols) =
-            dashboard_pane_dims(Rect::new(0, 0, 100, 30), 0, false, PaneLayout::Tiled, false);
-        assert_eq!((rows, cols), (27, 65));
+        let targets = layout.pane_target_dims();
+        let expected = dashboard_pane_dims(frame_area, false);
+        assert_eq!(targets.len(), 3);
+        for (id, rows, cols) in targets {
+            assert_eq!((rows, cols), expected, "pane {id}");
+        }
     }
 
     // PRD #76 M2.15 fixup F3 — pin the orchestration helper's geometry to
@@ -31187,20 +30957,13 @@ mod tests {
 
     #[test]
     fn orchestration_role_pane_dims_uses_right_66_percent_width() {
-        // 100×30 terminal, no tab bar, 2 roles, tiled. main_height = 30-1
-        // (hints bar) = 29; chunk = 29/2 = 14; rows = 12. right_width =
-        // 100 * 66 / 100 = 66; cols = 64. Critical assertion: cols = 64,
-        // NOT 65 (which is what `dashboard_pane_dims` would return for
-        // the same input). The 1-col gap is exactly the F3 drift bug.
-        let (rows, cols) = orchestration_role_pane_dims(
-            Rect::new(0, 0, 100, 30),
-            2,
-            0,
-            PaneLayout::Tiled,
-            false,
-            false,
-        );
-        assert_eq!((rows, cols), (12, 64));
+        // 100×30 terminal, no tab bar. main_height = 30-1 (hints bar) = 29;
+        // rows = 27. right_width = 100 * 66 / 100 = 66; cols = 64. Critical
+        // assertion: cols = 64, NOT 65 (which is what `dashboard_pane_dims`
+        // would return for the same input). The 1-col gap is exactly the F3
+        // drift bug.
+        let (rows, cols) = orchestration_role_pane_dims(Rect::new(0, 0, 100, 30), false, false);
+        assert_eq!((rows, cols), (27, 64));
     }
 
     #[test]
@@ -31211,8 +30974,7 @@ mod tests {
         // Without this, a future tweak to one but not the other silently
         // re-introduces the F3 spawn-vs-render drift.
         let area = Rect::new(0, 0, 200, 50);
-        let (_rows, helper_cols) =
-            orchestration_role_pane_dims(area, 3, 0, PaneLayout::Tiled, false, false);
+        let (_rows, helper_cols) = orchestration_role_pane_dims(area, false, false);
         // Inner cols = right-column width - 2 (pane borders).
         let renderer_cols = (area.width * ORCHESTRATION_PANES_PERCENT / 100).saturating_sub(2);
         assert_eq!(helper_cols, renderer_cols);
@@ -31223,80 +30985,18 @@ mod tests {
     }
 
     #[test]
-    fn orchestration_role_pane_dims_tiled_divides_height_equally() {
-        // 4 roles, Tiled: every role_index returns the same dims.
-        let area = Rect::new(0, 0, 100, 30);
-        let r0 = orchestration_role_pane_dims(area, 4, 0, PaneLayout::Tiled, true, false);
-        let r1 = orchestration_role_pane_dims(area, 4, 1, PaneLayout::Tiled, true, false);
-        let r2 = orchestration_role_pane_dims(area, 4, 2, PaneLayout::Tiled, true, false);
-        let r3 = orchestration_role_pane_dims(area, 4, 3, PaneLayout::Tiled, true, false);
-        assert_eq!(r0, r1);
-        assert_eq!(r1, r2);
-        assert_eq!(r2, r3);
-    }
-
-    #[test]
-    fn orchestration_role_pane_dims_stacked_role_zero_expands() {
-        // In Stacked mode with no focused role, role_index 0 mirrors
-        // the renderer's "expand the first slot if nothing is focused"
-        // fallback (see `render_terminal_panes` Stacked branch). Role
-        // 0 fills the whole column; others reserve zero rows (PRD #311),
-        // so this helper returns the zero-row sentinel that spawn-time
-        // resize callers gate on (`rows > 0` skips the resize).
-        let area = Rect::new(0, 0, 100, 30);
-        let (rows_focused, _) =
-            orchestration_role_pane_dims(area, 3, 0, PaneLayout::Stacked, false, false);
-        let (rows_unfocused, _) =
-            orchestration_role_pane_dims(area, 3, 1, PaneLayout::Stacked, false, false);
-        assert!(rows_focused > rows_unfocused);
-        assert_eq!(rows_unfocused, 0);
-    }
-
-    // PRD #84 M4 removed the `focused_role_index` parameter (and the resize
-    // sweep that threaded a live focused-role index through this helper), so
-    // the Stacked expanded slot is always role 0. The two tests that pinned the
-    // `focused_role_index = Some(non-zero)` behavior are gone with the param;
-    // the renderer-match drift guard below now pins role 0's expanded height.
-
-    #[test]
-    fn orchestration_role_pane_dims_stacked_role_zero_matches_renderer_expanded_height() {
-        // Drift guard: the helper's expanded-row height for the Stacked
-        // expanded slot (role 0) must equal the renderer's expanded height.
-        // PRD #311: the renderer gives the expanded slot `Constraint::Fill(1)`
-        // after every other slot reserves ZERO rows (no collapsed title bars
-        // any more) — i.e. the expanded inner height = main_height - 2
-        // (border only, no per-collapsed-pane subtraction).
+    fn orchestration_role_pane_dims_match_renderer_expanded_height() {
+        // Drift guard: the helper's rows must equal the renderer's expanded
+        // height. PRD #311: the renderer gives the expanded slot
+        // `Constraint::Fill(1)` after every other slot reserves ZERO rows —
+        // i.e. the expanded inner height = main_height - 2 (border only).
+        // PRD #312: every role spawns at that size.
         let area = Rect::new(0, 0, 200, 50);
-        let role_count: u16 = 4;
         let chrome_rows: u16 = 1; // hints bar; no tab bar in this test
         let main_height = area.height.saturating_sub(chrome_rows);
         let expanded_inner = main_height.saturating_sub(2);
-        let (helper_rows, _) = orchestration_role_pane_dims(
-            area,
-            role_count as usize,
-            0,
-            PaneLayout::Stacked,
-            false,
-            false,
-        );
+        let (helper_rows, _) = orchestration_role_pane_dims(area, false, false);
         assert_eq!(helper_rows, expanded_inner);
-    }
-
-    #[test]
-    fn orchestration_role_pane_dims_zero_role_count_does_not_divide_by_zero() {
-        // Defensive: role_count = 0 (transient state during a tab
-        // teardown). Clamp to 1 so the helper returns a sane value.
-        let (rows, cols) = orchestration_role_pane_dims(
-            Rect::new(0, 0, 100, 30),
-            0,
-            0,
-            PaneLayout::Tiled,
-            false,
-            false,
-        );
-        // main_height = 29, count = 1, chunk = 29, rows = 27.
-        // right_width = 66, cols = 64.
-        assert_eq!((rows, cols), (27, 64));
     }
 
     // PRD #84 (deferred render/layout/004) — pin `compute_frame_layout`, the
@@ -31308,7 +31008,7 @@ mod tests {
 
     #[test]
     fn compute_frame_layout_cards_two_panes_geometry() {
-        // 100x40 frame, tab bar shown, 2 dashboard panes, Tiled pane column.
+        // 100x40 frame, tab bar shown, 2 dashboard panes, the second focused.
         let frame_area = Rect::new(0, 0, 100, 40);
         let tab_view = ActiveTabView::Dashboard {
             exclude_pane_ids: vec![],
@@ -31323,15 +31023,8 @@ mod tests {
         let pane_ids = vec!["p0".to_string(), "p1".to_string()];
         // A 1-row bottom bar (this fixture exercises the split math, not the
         // PRD #144 wrap height — that is covered by `render/layout/004`).
-        let layout = compute_frame_layout(
-            frame_area,
-            &tab_view,
-            &tab_bar,
-            &pane_ids,
-            PaneLayout::Tiled,
-            None,
-            1,
-        );
+        let layout =
+            compute_frame_layout(frame_area, &tab_view, &tab_bar, &pane_ids, Some("p1"), 1);
 
         // Vertical chrome: a 1-row tab bar at the top, a 1-row hints bar at the
         // bottom, the main content in between.
@@ -31356,20 +31049,17 @@ mod tests {
         assert_eq!(panes_area.x, dashboard_area.width);
         assert_eq!(laid_out_ids, pane_ids);
 
-        // Tiled: the pane column divides equally, keyed by pane id in order,
-        // stacked top-to-bottom (pane 1 starts where pane 0 ends).
-        assert_eq!(
-            pane_rects,
-            vec![
-                ("p0".to_string(), Rect::new(33, 1, 67, 19)),
-                ("p1".to_string(), Rect::new(33, 20, 67, 19)),
-            ]
-        );
+        // PRD #311/#312: the focused pane fills the whole column and the other
+        // reserves zero rows, keyed by pane id in order.
+        assert_eq!(pane_rects.len(), 2);
+        assert_eq!(pane_rects[0].0, "p0");
+        assert_eq!(pane_rects[0].1.height, 0);
+        assert_eq!(pane_rects[1], ("p1".to_string(), Rect::new(33, 1, 67, 38)));
     }
 
     /// Scenario: Render a 7-role Orchestration tab (mirroring issue #307's
     /// `orchestrator`/`developer`/`tester`/`reviewer`/`releaser`/`researcher`/
-    /// `documenter` roster) in `PaneLayout::Stacked` through the real
+    /// `documenter` roster) through the real
     /// `compute_frame_layout` + `render_frame` path into a `TestBackend`, with
     /// no pane explicitly focused (so the first role, `orchestrator`, is the
     /// resolved expanded slot per `stacked_expanded_index`'s fallback). Assert
@@ -31419,15 +31109,8 @@ mod tests {
         terminal
             .draw(|frame| {
                 let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
-                let layout = compute_frame_layout(
-                    frame.area(),
-                    &tab_view,
-                    &tab_bar,
-                    &pane_ids,
-                    PaneLayout::Stacked,
-                    None,
-                    1,
-                );
+                let layout =
+                    compute_frame_layout(frame.area(), &tab_view, &tab_bar, &pane_ids, None, 1);
 
                 let FrameContent::Cards {
                     panes_area: this_panes_area,
@@ -31470,7 +31153,7 @@ mod tests {
             assert!(
                 !rendered.contains(id.as_str()),
                 "non-focused role pane {id} must not render a collapsed title \
-                 frame in PaneLayout::Stacked:\n{rendered}"
+                 frame:\n{rendered}"
             );
         }
     }
@@ -31498,15 +31181,7 @@ mod tests {
             active_index: 0,
             orchestration_statuses: vec![],
         };
-        let layout = compute_frame_layout(
-            frame_area,
-            &tab_view,
-            &tab_bar,
-            role_pane_ids,
-            PaneLayout::Tiled,
-            None,
-            1,
-        );
+        let layout = compute_frame_layout(frame_area, &tab_view, &tab_bar, role_pane_ids, None, 1);
         let FrameContent::Cards {
             dashboard_area,
             panes_area,
@@ -32258,10 +31933,10 @@ mod tests {
             for mode in [UiMode::Normal, UiMode::PaneInput] {
                 assert!(
                     matches!(
-                        scope_orchestration_split(Some(Action::ToggleLayout), is_orch, mode),
-                        Some(Action::ToggleLayout)
+                        scope_orchestration_split(Some(Action::NewPane), is_orch, mode),
+                        Some(Action::NewPane)
                     ),
-                    "ToggleLayout must survive (is_orch={is_orch}, {mode:?})"
+                    "NewPane must survive (is_orch={is_orch}, {mode:?})"
                 );
                 assert!(
                     matches!(
@@ -32392,10 +32067,10 @@ mod tests {
             for mode in [UiMode::Normal, UiMode::PaneInput] {
                 assert!(
                     matches!(
-                        scope_zoom(Some(Action::ToggleLayout), is_orch, mode),
-                        Some(Action::ToggleLayout)
+                        scope_zoom(Some(Action::NewPane), is_orch, mode),
+                        Some(Action::NewPane)
                     ),
-                    "ToggleLayout must survive (is_orch={is_orch}, {mode:?})"
+                    "NewPane must survive (is_orch={is_orch}, {mode:?})"
                 );
                 assert!(
                     matches!(
@@ -32425,15 +32100,7 @@ mod tests {
             active_index: 0,
             orchestration_statuses: vec![],
         };
-        let layout = compute_frame_layout(
-            frame_area,
-            &tab_view,
-            &tab_bar,
-            pane_ids,
-            PaneLayout::Tiled,
-            None,
-            1,
-        );
+        let layout = compute_frame_layout(frame_area, &tab_view, &tab_bar, pane_ids, None, 1);
         let FrameContent::Cards {
             dashboard_area,
             panes_area,
@@ -32456,8 +32123,8 @@ mod tests {
     /// stack of agent panes. Drive `compute_frame_layout` for a Dashboard tab
     /// with two panes, unzoomed and zoomed, and assert the sidebar goes from the
     /// 33/67 default to zero width with the pane column taking the whole frame,
-    /// that only the focused pane is drawn while zoomed even under `Tiled`, and
-    /// that unzooming restores 33/67 exactly.
+    /// that only the focused pane is drawn while zoomed, and that unzooming
+    /// restores 33/67 exactly.
     #[spec("orchestration/layout/012")]
     #[test]
     fn orchestration_layout_012_the_dashboard_zooms_like_an_orchestration_tab() {
@@ -32490,8 +32157,7 @@ mod tests {
         );
 
         // And the second half of M1 — "other panes are not drawn" — holds here
-        // too, under `Tiled`, via the same effective-Stacked resolution the
-        // Orchestration arm uses (`orchestration/layout/011` is its sibling).
+        // too.
         let tab_view = ActiveTabView::Dashboard {
             exclude_pane_ids: Vec::new(),
             zoomed: true,
@@ -32502,15 +32168,8 @@ mod tests {
             active_index: 0,
             orchestration_statuses: vec![],
         };
-        let layout = compute_frame_layout(
-            frame_area,
-            &tab_view,
-            &tab_bar,
-            &pane_ids,
-            PaneLayout::Tiled,
-            Some("p0"),
-            1,
-        );
+        let layout =
+            compute_frame_layout(frame_area, &tab_view, &tab_bar, &pane_ids, Some("p0"), 1);
         let FrameContent::Cards {
             panes_area,
             pane_rects,
@@ -32526,14 +32185,13 @@ mod tests {
         assert_eq!(
             rect("p0"),
             panes_area.expect("panes => a right column"),
-            "zoomed, the focused Dashboard pane must be the whole pane column \
-             whatever the Stacked/Tiled toggle says"
+            "zoomed, the focused Dashboard pane must be the whole pane column"
         );
         assert_eq!(
             rect("p1").height,
             0,
             "zoomed, a non-focused Dashboard pane must reserve zero rows \
-             (PRD #311 M2's convention) rather than take a tiled slice"
+             (PRD #311 M2's convention)"
         );
     }
 
@@ -32813,7 +32471,6 @@ mod tests {
             },
             &tab_bar,
             &role_pane_ids,
-            PaneLayout::Stacked,
             Some(role_pane_ids[1].as_str()),
             1,
         );
@@ -32837,7 +32494,7 @@ mod tests {
     /// directly: on a 100-wide frame an unzoomed orchestration role pane targets
     /// 64 inner columns (the 66% column less its border) and a narrowed one 73,
     /// while a ZOOMED one must target 98 (the whole frame less its border) —
-    /// including the non-focused Stacked role, which is sized "as if focused" so
+    /// including the non-focused role, which is sized "as if focused" so
     /// it does not reflow twice on the way back.
     #[spec("orchestration/layout/010")]
     #[test]
@@ -32862,7 +32519,6 @@ mod tests {
                 &tab_view,
                 &tab_bar,
                 &role_pane_ids,
-                PaneLayout::Stacked,
                 Some("r0"),
                 1,
             );
@@ -32970,7 +32626,6 @@ mod tests {
                 &tab_view,
                 &tab_bar,
                 &role_pane_ids,
-                PaneLayout::Stacked,
                 Some("r0"),
                 1,
             );
@@ -33235,243 +32890,6 @@ mod tests {
         assert!(
             rows[1].starts_with("experimental: on"),
             "the 64x2 frame keeps its footer label on the bottom row: {rows:#?}"
-        );
-    }
-
-    /// Scenario: PRD #313 M1 under the Tiled pane layout — tile an orchestration
-    /// tab with the real `Action::ToggleLayout` dispatch, then zoom it with
-    /// `Action::ToggleZoom` and assert only the FOCUSED role pane gets a drawn
-    /// rect, the other two collapsing to zero height (PRD #311 M2's convention),
-    /// while the same tab unzoomed still tiles all three. The deck's stored
-    /// `PaneLayout::Tiled` must survive the zoom untouched, so unzooming restores
-    /// the user's tiled view exactly rather than dropping them into Stacked.
-    #[spec("orchestration/layout/011")]
-    #[test]
-    fn orchestration_layout_011_zoom_draws_only_the_focused_pane_under_tiled() {
-        let tmp = tempdir().expect("tempdir");
-        let pc = Arc::new(CapturingPaneController::new());
-        let mut tm = TabManager::new(pc.clone());
-        let mut ui = default_ui();
-        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
-        let frame_area = Rect::new(0, 0, 100, 40);
-
-        // THREE roles, deliberately: with two panes "only the focused one is
-        // drawn" and "the other one happens to be empty" are the same
-        // observation, and a Tiled frame that dropped just one slot would still
-        // pass. With three, the claim has to hold for every non-focused pane.
-        let mut snapshot = AppState::default();
-        for (sid, pid) in [
-            ("sess-0", "pane-0"),
-            ("sess-1", "pane-1"),
-            ("sess-2", "pane-2"),
-        ] {
-            let mut sess = make_session(SessionStatus::Idle);
-            sess.session_id = sid.to_string();
-            sess.pane_id = Some(pid.to_string());
-            snapshot.sessions.insert(sid.to_string(), sess);
-        }
-        let session_ids = [
-            "sess-0".to_string(),
-            "sess-1".to_string(),
-            "sess-2".to_string(),
-        ];
-        let filtered: Vec<(&String, &SessionState)> = session_ids
-            .iter()
-            .map(|id| (id, snapshot.sessions.get(id).expect("seeded session")))
-            .collect();
-
-        let role = |name: &str, start: bool| OrchestrationRoleConfig {
-            agent: None,
-            name: name.to_string(),
-            command: "cat".to_string(),
-            start,
-            description: None,
-            prompt_template: None,
-            clear: false,
-        };
-        tm.open_orchestration_tab(
-            &OrchestrationConfig {
-                default: false,
-                name: "tiled-zoom".to_string(),
-                roles: vec![
-                    role("orchestrator", true),
-                    role("worker", false),
-                    role("reviewer", false),
-                ],
-            },
-            tmp.path().to_str().expect("utf-8 tmp path"),
-            None,
-            None,
-            (24, 80),
-        )
-        .expect("open orchestration tab");
-
-        let role_pane_ids = match &tm.tabs()[1] {
-            Tab::Orchestration { role_pane_ids, .. } => role_pane_ids.clone(),
-            _ => panic!("tab 1 should be an orchestration tab"),
-        };
-        assert_eq!(role_pane_ids.len(), 3, "the tab must own three role panes");
-        let zoomed_of = |tm: &TabManager| match &tm.tabs()[1] {
-            Tab::Orchestration { zoomed, .. } => *zoomed,
-            _ => panic!("tab 1 should be an orchestration tab"),
-        };
-
-        // `Ctrl+t` — the user's own layout choice, made through the real
-        // dispatch rather than by poking `ui.pane_layout`.
-        assert_eq!(
-            ui.pane_layout,
-            PaneLayout::Stacked,
-            "the deck starts in the default Stacked layout"
-        );
-        dispatch_action(
-            Action::ToggleLayout,
-            &mut ui,
-            pc.as_ref(),
-            &state,
-            &mut tm,
-            &snapshot,
-            &filtered,
-            None,
-            frame_area,
-        );
-        assert_eq!(
-            ui.pane_layout,
-            PaneLayout::Tiled,
-            "ToggleLayout must put the deck in Tiled"
-        );
-
-        // `z` on top of it.
-        dispatch_action(
-            Action::ToggleZoom,
-            &mut ui,
-            pc.as_ref(),
-            &state,
-            &mut tm,
-            &snapshot,
-            &filtered,
-            None,
-            frame_area,
-        );
-        assert!(zoomed_of(&tm), "the tab must be zoomed after one toggle");
-
-        // The half a plausible-but-wrong implementation fails: zoom must NOT
-        // flip the stored layout to Stacked and flip it back on unzoom. The
-        // toggle the user set is theirs; zoom overrides the frame, not the
-        // preference, and that is what makes PRD #313's "the same key restores
-        // the previous view exactly" true for a tiled deck.
-        assert_eq!(
-            ui.pane_layout,
-            PaneLayout::Tiled,
-            "zooming must leave the deck's stored pane layout at Tiled — zoom \
-             overrides the frame for as long as it is on, it does not rewrite \
-             the user's Ctrl+t choice"
-        );
-
-        // Geometry, resolved through the same seam the render loop reads: the
-        // stored `ui.pane_layout` goes in, and the effective layout comes out.
-        let tab_bar = TabBarInfo {
-            show: true,
-            labels: vec!["tiled-zoom".into()],
-            active_index: 0,
-            orchestration_statuses: vec![Some(vec![])],
-        };
-        let rects = |zoomed: bool| -> (Rect, Vec<(String, Rect)>) {
-            let layout = compute_frame_layout(
-                frame_area,
-                &ActiveTabView::Orchestration {
-                    role_pane_ids: role_pane_ids.clone(),
-                    split_narrow: false,
-                    zoomed,
-                },
-                &tab_bar,
-                &role_pane_ids,
-                ui.pane_layout,
-                Some(role_pane_ids[0].as_str()),
-                1,
-            );
-            let FrameContent::Cards {
-                panes_area,
-                pane_rects,
-                ..
-            } = layout.content;
-            (
-                panes_area.expect("role panes => a right pane column"),
-                pane_rects,
-            )
-        };
-        let height_of = |pane_rects: &[(String, Rect)], id: &str| -> u16 {
-            pane_rects
-                .iter()
-                .find(|(pid, _)| pid.as_str() == id)
-                .map(|(_, r)| r.height)
-                .unwrap_or_else(|| {
-                    panic!("role pane {id} must keep a rect in the layout: {pane_rects:?}")
-                })
-        };
-
-        // (1) Zoomed + Tiled: only the focused pane is drawn. PRD #313 M1 says
-        // "sidebar and other panes are not drawn", and under Tiled today the
-        // second half is false — every role keeps a full-width slice of the
-        // frame, so zoom reads as "make all the panes wider" instead of
-        // "get everything else out of the way".
-        let (panes_area, zoomed_rects) = rects(true);
-        assert_eq!(
-            zoomed_rects
-                .iter()
-                .find(|(id, _)| id == &role_pane_ids[0])
-                .map(|(_, r)| *r),
-            Some(panes_area),
-            "zoomed, the FOCUSED role pane must be the whole pane column \
-             (which orchestration/layout/008 pins to the whole frame), whatever \
-             the Stacked/Tiled toggle says: {zoomed_rects:?}"
-        );
-        for id in &role_pane_ids[1..] {
-            assert_eq!(
-                height_of(&zoomed_rects, id.as_str()),
-                0,
-                "zoomed, the non-focused role pane {id} must not be drawn — \
-                 zero reserved height, the same convention PRD #311 M2 gives \
-                 Stacked and orchestration/layout/002 pins: {zoomed_rects:?}"
-            );
-        }
-
-        // (2) The same tab UNZOOMED is still tiled: every role pane keeps a
-        // drawn slice. Zoom overrode the frame; it did not quietly restack the
-        // deck underneath.
-        let (unzoomed_area, unzoomed_rects) = rects(false);
-        for id in &role_pane_ids {
-            assert!(
-                height_of(&unzoomed_rects, id.as_str()) > 0,
-                "unzoomed, every role pane must still be drawn under Tiled — \
-                 {id} got zero height: {unzoomed_rects:?}"
-            );
-        }
-        assert_eq!(
-            unzoomed_rects.iter().map(|(_, r)| r.height).sum::<u16>(),
-            unzoomed_area.height,
-            "unzoomed, the three tiled panes must divide the pane column \
-             between them: {unzoomed_rects:?}"
-        );
-
-        // (3) Unzooming leaves the user exactly where they were: tab unzoomed,
-        // layout still Tiled, nothing to undo by hand.
-        dispatch_action(
-            Action::ToggleZoom,
-            &mut ui,
-            pc.as_ref(),
-            &state,
-            &mut tm,
-            &snapshot,
-            &filtered,
-            None,
-            frame_area,
-        );
-        assert!(!zoomed_of(&tm), "the tab must round-trip to unzoomed");
-        assert_eq!(
-            ui.pane_layout,
-            PaneLayout::Tiled,
-            "unzooming must leave the deck in Tiled — the layout the user chose \
-             before they ever pressed z"
         );
     }
 
@@ -34717,9 +34135,6 @@ mod tests {
             ) -> Result<(), crate::pane::PaneError> {
                 Ok(())
             }
-            fn toggle_layout(&self) -> Result<(), crate::pane::PaneError> {
-                Ok(())
-            }
             fn name(&self) -> &str {
                 "noop"
             }
@@ -35104,9 +34519,6 @@ mod tests {
             ) -> Result<(), crate::pane::PaneError> {
                 Ok(())
             }
-            fn toggle_layout(&self) -> Result<(), crate::pane::PaneError> {
-                Ok(())
-            }
             fn name(&self) -> &str {
                 "noop"
             }
@@ -35452,15 +34864,7 @@ mod tests {
                     active_index: 0,
                     orchestration_statuses: vec![],
                 };
-                let layout = compute_frame_layout(
-                    frame.area(),
-                    &tab_view,
-                    &tab_bar,
-                    &[],
-                    PaneLayout::Stacked,
-                    None,
-                    1,
-                );
+                let layout = compute_frame_layout(frame.area(), &tab_view, &tab_bar, &[], None, 1);
                 render_frame(
                     frame,
                     &state,
@@ -35547,15 +34951,7 @@ mod tests {
                     active_index: 0,
                     orchestration_statuses: vec![],
                 };
-                let layout = compute_frame_layout(
-                    frame.area(),
-                    &tab_view,
-                    &tab_bar,
-                    &[],
-                    PaneLayout::Stacked,
-                    None,
-                    1,
-                );
+                let layout = compute_frame_layout(frame.area(), &tab_view, &tab_bar, &[], None, 1);
                 render_frame(
                     frame,
                     &state,
@@ -35702,15 +35098,7 @@ mod tests {
                     active_index: 0,
                     orchestration_statuses: vec![],
                 };
-                let layout = compute_frame_layout(
-                    frame.area(),
-                    &tab_view,
-                    &tab_bar,
-                    &[],
-                    PaneLayout::Stacked,
-                    None,
-                    1,
-                );
+                let layout = compute_frame_layout(frame.area(), &tab_view, &tab_bar, &[], None, 1);
                 render_frame(
                     frame,
                     &state,
@@ -36113,15 +35501,7 @@ mod tests {
                     active_index: 0,
                     orchestration_statuses: vec![],
                 };
-                let layout = compute_frame_layout(
-                    frame.area(),
-                    &tab_view,
-                    &tab_bar,
-                    &[],
-                    PaneLayout::Stacked,
-                    None,
-                    1,
-                );
+                let layout = compute_frame_layout(frame.area(), &tab_view, &tab_bar, &[], None, 1);
                 render_frame(
                     frame,
                     &state,
@@ -36390,15 +35770,7 @@ mod tests {
                     active_index: 0,
                     orchestration_statuses: vec![],
                 };
-                let layout = compute_frame_layout(
-                    frame.area(),
-                    &tab_view,
-                    &tab_bar,
-                    &[],
-                    PaneLayout::Stacked,
-                    None,
-                    1,
-                );
+                let layout = compute_frame_layout(frame.area(), &tab_view, &tab_bar, &[], None, 1);
                 render_frame(
                     frame,
                     &state,
@@ -36459,15 +35831,7 @@ mod tests {
                     active_index: 0,
                     orchestration_statuses: vec![],
                 };
-                let layout = compute_frame_layout(
-                    frame.area(),
-                    &tab_view,
-                    &tab_bar,
-                    &[],
-                    PaneLayout::Stacked,
-                    None,
-                    1,
-                );
+                let layout = compute_frame_layout(frame.area(), &tab_view, &tab_bar, &[], None, 1);
                 render_frame(
                     frame,
                     &state,
@@ -37891,9 +37255,6 @@ mod tests {
         ) -> Result<(), crate::pane::PaneError> {
             Ok(())
         }
-        fn toggle_layout(&self) -> Result<(), crate::pane::PaneError> {
-            Ok(())
-        }
         fn name(&self) -> &str {
             "recording"
         }
@@ -38052,6 +37413,8 @@ mod tests {
         next: std::sync::Mutex<u32>,
         focused: std::sync::Mutex<Vec<String>>,
         closed: std::sync::Mutex<Vec<String>>,
+        config_requests: std::sync::Mutex<Vec<crate::pane::BoundPane>>,
+        posted_messages: std::sync::Mutex<Vec<String>>,
     }
     impl OpenTabPC {
         fn new() -> Self {
@@ -38059,10 +37422,32 @@ mod tests {
                 next: std::sync::Mutex::new(0),
                 focused: std::sync::Mutex::new(Vec::new()),
                 closed: std::sync::Mutex::new(Vec::new()),
+                config_requests: std::sync::Mutex::new(Vec::new()),
+                posted_messages: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
     impl crate::pane::PaneController for OpenTabPC {
+        fn generate_config(
+            &self,
+            card: &crate::pane::BoundPane,
+            _expected_agent_id: Option<&str>,
+        ) -> Result<crate::daemon_client::GatedQuery<String>, PaneError> {
+            self.config_requests.lock().unwrap().push(card.clone());
+            Ok(crate::daemon_client::GatedQuery::Unsupported)
+        }
+
+        fn post_message(
+            &self,
+            _card: &crate::pane::BoundPane,
+            _subject: &str,
+            body: &str,
+            _origin: crate::inbox_hub::PostOrigin,
+        ) -> Result<String, PaneError> {
+            self.posted_messages.lock().unwrap().push(body.to_owned());
+            Ok("unexpected-fallback".into())
+        }
+
         fn create_pane(
             &self,
             _cmd: Option<&str>,
@@ -38102,9 +37487,6 @@ mod tests {
         ) -> Result<(), crate::pane::PaneError> {
             Ok(())
         }
-        fn toggle_layout(&self) -> Result<(), crate::pane::PaneError> {
-            Ok(())
-        }
         fn name(&self) -> &str {
             "open-tab-mock"
         }
@@ -38138,6 +37520,7 @@ mod tests {
         /// Whether the daemon actually has a pane to attach (`false` = the
         /// card really is dead).
         hydratable: bool,
+        refuse_focus: bool,
         wired: std::sync::Mutex<bool>,
         hydrate_calls: std::sync::Mutex<usize>,
     }
@@ -38145,12 +37528,31 @@ mod tests {
         fn new(hydratable: bool) -> Self {
             Self {
                 hydratable,
+                refuse_focus: false,
                 wired: std::sync::Mutex::new(false),
                 hydrate_calls: std::sync::Mutex::new(0),
             }
         }
     }
     impl crate::pane::PaneController for UnwiredPC {
+        fn generate_config(
+            &self,
+            _card: &crate::pane::BoundPane,
+            _expected_agent_id: Option<&str>,
+        ) -> Result<crate::daemon_client::GatedQuery<String>, crate::pane::PaneError> {
+            Ok(crate::daemon_client::GatedQuery::Answered(
+                "m-config".into(),
+            ))
+        }
+        fn focus_card(&self, card: &crate::pane::BoundPane) -> Result<(), crate::pane::PaneError> {
+            if self.refuse_focus {
+                Err(crate::pane::PaneError::Refused(
+                    "the agent restarted".into(),
+                ))
+            } else {
+                self.focus_pane(&card.pane_id)
+            }
+        }
         fn focus_pane(&self, _id: &str) -> Result<(), crate::pane::PaneError> {
             if *self.wired.lock().unwrap() {
                 Ok(())
@@ -38197,9 +37599,6 @@ mod tests {
             _d: crate::pane::PaneDirection,
             _a: u16,
         ) -> Result<(), crate::pane::PaneError> {
-            Ok(())
-        }
-        fn toggle_layout(&self) -> Result<(), crate::pane::PaneError> {
             Ok(())
         }
         fn name(&self) -> &str {
@@ -44133,10 +43532,7 @@ mod tests {
         let mut ui = default_ui();
         ui.mode = UiMode::ConfigGenPrompt;
         ui.config_gen_selected = 0; // Yes
-        ui.config_gen_target = Some((
-            crate::pane::BoundPane::held_by_controller("pane-1"),
-            "/my/project".to_string(),
-        ));
+        ui.config_gen_target = Some(crate::pane::BoundPane::held_by_controller("pane-1"));
 
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         let result = handle_config_gen_prompt_key(enter, &mut ui);
@@ -44144,8 +43540,7 @@ mod tests {
         assert_eq!(ui.mode, UiMode::Normal);
         assert!(ui.config_gen_target.is_none());
         assert!(
-            matches!(result, Action::SendConfigGenPrompt { ref pane, ref cwd }
-                if pane.pane_id == "pane-1" && cwd == "/my/project")
+            matches!(result, Action::SendConfigGenPrompt { ref pane } if pane.pane_id == "pane-1")
         );
     }
 
@@ -44154,10 +43549,7 @@ mod tests {
         let mut ui = default_ui();
         ui.mode = UiMode::ConfigGenPrompt;
         ui.config_gen_selected = 1; // No
-        ui.config_gen_target = Some((
-            crate::pane::BoundPane::held_by_controller("pane-1"),
-            "/my/project".to_string(),
-        ));
+        ui.config_gen_target = Some(crate::pane::BoundPane::held_by_controller("pane-1"));
 
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         let result = handle_config_gen_prompt_key(enter, &mut ui);
@@ -44165,40 +43557,10 @@ mod tests {
         assert_eq!(ui.mode, UiMode::Normal);
         assert!(ui.config_gen_target.is_none());
         assert!(matches!(result, Action::Continue));
+        assert!(ui.status_message.is_none(), "No says nothing");
     }
 
-    #[test]
-    fn config_gen_prompt_enter_on_never_suppresses_dir() {
-        // Picking "Never" calls suppress_dir() → save(), which reads
-        // DOT_AGENT_DECK_CONFIG_GEN_STATE. Hold the shared lock and point at
-        // a temp path so we don't race against other tests touching the same
-        // env var, and don't pollute the real home dir.
-        let _guard = crate::config::CONFIG_GEN_STATE_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("config-gen-state.json");
-        // Drop guard restores the env var even if an assertion below panics.
-        let _env_restore = crate::config::ConfigGenStateEnvGuard::set(path.to_str().unwrap());
-
-        let mut ui = default_ui();
-        ui.mode = UiMode::ConfigGenPrompt;
-        ui.config_gen_selected = 2; // Never
-        ui.config_gen_target = Some((
-            crate::pane::BoundPane::held_by_controller("pane-1"),
-            "/my/project".to_string(),
-        ));
-
-        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-        let result = handle_config_gen_prompt_key(enter, &mut ui);
-
-        assert_eq!(ui.mode, UiMode::Normal);
-        assert!(ui.config_gen_target.is_none());
-        assert!(ui.config_gen_state.is_suppressed("/my/project"));
-        assert!(matches!(result, Action::Continue));
-        assert!(ui.status_message.is_some());
-    }
-
+    /// PRD #2119: the dialog offers Yes and No only, so Down stops at No.
     #[test]
     fn config_gen_prompt_arrow_navigation() {
         let mut ui = default_ui();
@@ -44209,26 +43571,20 @@ mod tests {
         handle_config_gen_prompt_key(down, &mut ui);
         assert_eq!(ui.config_gen_selected, 1);
 
-        handle_config_gen_prompt_key(down, &mut ui);
-        assert_eq!(ui.config_gen_selected, 2);
-
         // Can't go past last
         handle_config_gen_prompt_key(down, &mut ui);
-        assert_eq!(ui.config_gen_selected, 2);
+        assert_eq!(ui.config_gen_selected, 1);
 
         let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
         handle_config_gen_prompt_key(up, &mut ui);
-        assert_eq!(ui.config_gen_selected, 1);
+        assert_eq!(ui.config_gen_selected, 0);
     }
 
     #[test]
     fn config_gen_prompt_esc_dismisses() {
         let mut ui = default_ui();
         ui.mode = UiMode::ConfigGenPrompt;
-        ui.config_gen_target = Some((
-            crate::pane::BoundPane::held_by_controller("pane-1"),
-            "/my/project".to_string(),
-        ));
+        ui.config_gen_target = Some(crate::pane::BoundPane::held_by_controller("pane-1"));
 
         let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
         let result = handle_config_gen_prompt_key(esc, &mut ui);
@@ -44521,9 +43877,6 @@ mod tests {
         }
         fn rename_pane(&self, _pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError> {
             Ok(RenameOutcome::applied(name))
-        }
-        fn toggle_layout(&self) -> Result<(), PaneError> {
-            Ok(())
         }
         fn write_to_pane(&self, _pane_id: &str, _text: &str) -> Result<(), PaneError> {
             Ok(())
@@ -45091,9 +44444,6 @@ mod tests {
         fn rename_pane(&self, pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError> {
             self.inner.rename_pane(pane_id, name)
         }
-        fn toggle_layout(&self) -> Result<(), PaneError> {
-            self.inner.toggle_layout()
-        }
         fn write_to_pane(&self, pane_id: &str, text: &str) -> Result<(), PaneError> {
             self.inner.write_to_pane(pane_id, text)
         }
@@ -45319,9 +44669,6 @@ mod tests {
         }
         fn rename_pane(&self, pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError> {
             self.inner.rename_pane(pane_id, name)
-        }
-        fn toggle_layout(&self) -> Result<(), PaneError> {
-            self.inner.toggle_layout()
         }
         fn write_to_pane(&self, pane_id: &str, text: &str) -> Result<(), PaneError> {
             self.inner.write_to_pane(pane_id, text)
@@ -46259,9 +45606,6 @@ mod tests {
             _direction: crate::pane::PaneDirection,
             _amount: u16,
         ) -> Result<(), crate::pane::PaneError> {
-            Ok(())
-        }
-        fn toggle_layout(&self) -> Result<(), crate::pane::PaneError> {
             Ok(())
         }
         fn name(&self) -> &str {
@@ -47730,7 +47074,11 @@ mod tests {
     /// Draw one full dashboard frame for `state` / `ui` into a 100x24
     /// `TestBackend` and return every row, right-trimmed.
     fn glossary_frame_rows(state: &AppState, ui: &mut UiState) -> Vec<String> {
-        let backend = TestBackend::new(100, 24);
+        glossary_frame_rows_at_width(state, ui, 100)
+    }
+
+    fn glossary_frame_rows_at_width(state: &AppState, ui: &mut UiState, width: u16) -> Vec<String> {
+        let backend = TestBackend::new(width, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let filtered = filter_sessions(state, ui);
         terminal
@@ -47746,15 +47094,7 @@ mod tests {
                     active_index: 0,
                     orchestration_statuses: vec![],
                 };
-                let layout = compute_frame_layout(
-                    frame.area(),
-                    &tab_view,
-                    &tab_bar,
-                    &[],
-                    PaneLayout::Stacked,
-                    None,
-                    1,
-                );
+                let layout = compute_frame_layout(frame.area(), &tab_view, &tab_bar, &[], None, 1);
                 render_frame(
                     frame,
                     state,
@@ -47860,15 +47200,7 @@ mod tests {
                     active_index: 0,
                     orchestration_statuses: vec![],
                 };
-                let layout = compute_frame_layout(
-                    frame.area(),
-                    &tab_view,
-                    &tab_bar,
-                    &[],
-                    PaneLayout::Stacked,
-                    None,
-                    1,
-                );
+                let layout = compute_frame_layout(frame.area(), &tab_view, &tab_bar, &[], None, 1);
                 render_frame(
                     frame,
                     state,
@@ -48068,6 +47400,7 @@ mod tests {
         let record = crate::agent_pty::AgentRecord {
             input_held: None,
             input_discarded: None,
+            project_config_exists: None,
             id: agent_id.to_string(),
             pane_id_env: Some(pane_id.to_string()),
             display_name: Some(name.to_string()),
@@ -49014,15 +48347,8 @@ mod tests {
                     active_index: 0,
                     orchestration_statuses: vec![],
                 };
-                let layout = compute_frame_layout(
-                    frame.area(),
-                    &tab_view,
-                    &tab_bar,
-                    &[],
-                    PaneLayout::Stacked,
-                    None,
-                    bar_rows,
-                );
+                let layout =
+                    compute_frame_layout(frame.area(), &tab_view, &tab_bar, &[], None, bar_rows);
                 render_frame(
                     frame,
                     state,
@@ -49869,15 +49195,7 @@ mod tests {
                     active_index: 0,
                     orchestration_statuses: vec![],
                 };
-                let layout = compute_frame_layout(
-                    area,
-                    &tab_view,
-                    &tab_bar,
-                    &[],
-                    PaneLayout::Stacked,
-                    None,
-                    bar_rows,
-                );
+                let layout = compute_frame_layout(area, &tab_view, &tab_bar, &[], None, bar_rows);
                 render_frame(
                     frame,
                     &state,
@@ -50364,13 +49682,13 @@ mod tests {
                 hidden: 1,
                 later: None,
             },
-            // [Yes] [No] [Never] paints over No; Never is still shown.
+            // [Yes] [No] paints over No (PRD #2119: no Never below it).
             Case {
                 mode: UiMode::ConfigGenPrompt,
                 small: (80, 14),
-                labels: &["Yes", "No", "Never"],
+                labels: &["Yes", "No"],
                 hidden: 1,
-                later: Some(2),
+                later: None,
             },
         ];
         for Case {
@@ -50649,14 +49967,13 @@ mod tests {
             Action::ConfirmCloseSelected => "[Close]",
             Action::ConfigGenConfirm => "[Yes]",
             Action::ConfigGenDismiss => "[No]",
-            Action::ConfigGenSuppress => "[Never]",
             other => panic!("a confirmation button fires {other:?}"),
         };
         let dialogs: [(UiMode, &[&str], usize); 4] = [
             (UiMode::QuitConfirm, &["Detach", "Stop", "Cancel"], 3),
             (UiMode::CloseConfirm, &["Cancel", "Close"], 2),
             (UiMode::StopConfirm, &["No", "Yes"], 0),
-            (UiMode::ConfigGenPrompt, &["Yes", "No", "Never"], 3),
+            (UiMode::ConfigGenPrompt, &["Yes", "No"], 2),
         ];
         let footers: [(bool, &[_]); 4] =
             [(false, &[]), (true, &[]), (false, &notice), (true, &notice)];
@@ -50998,6 +50315,382 @@ mod tests {
                 Some("s-first"),
                 "Enter targets the new agent"
             );
+        }
+    }
+
+    /// Scenario: Refresh a dashboard card from daemon records with existing, absent, or unknown config state and press g. The footer and Yes/No dialog say Update only when the daemon reports an existing file, and an unknown state asks to check for the file and create or update it without claiming either.
+    #[spec("dashboard/config-gen/001")]
+    #[test]
+    fn config_gen_001_existing_config_labels_footer_and_confirmation_update() {
+        for exists in [None, Some(false), Some(true)] {
+            let mut record = serde_json::json!({
+                "id": "config-label-agent", "pane_id_env": "config-label-pane",
+                "cwd": "/project-on-the-daemon"
+            });
+            if let Some(exists) = exists {
+                record["project_config_exists"] = serde_json::json!(exists);
+            }
+            let mut snapshot = AppState::default();
+            let records = [serde_json::from_value(record).unwrap()];
+            snapshot.card_unseen_agents(&records);
+            snapshot.resync_after_event_gap(&records);
+            let selected = snapshot.sessions.keys().next().unwrap().clone();
+            let mut ui = default_ui();
+            let footer = glossary_frame_rows_at_width(&snapshot, &mut ui, 220).join("\n");
+            let verb = if exists == Some(true) {
+                "Update"
+            } else {
+                "Generate"
+            };
+            assert!(
+                footer.contains(&format!("[{verb} g]")),
+                "existing={exists:?}: footer must offer {verb} on g:\n{footer}"
+            );
+            let state: SharedState = Arc::new(tokio::sync::RwLock::new(snapshot.clone()));
+            let pc = Arc::new(OpenTabPC::new());
+            let mut tabs = TabManager::new(pc.clone());
+            let filtered: Vec<_> = snapshot.sessions.iter().collect();
+            handle_key_event(
+                KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+                &mut ui,
+                &*pc,
+                &state,
+                &mut tabs,
+                &snapshot,
+                &filtered,
+                Rect::new(0, 0, 220, 24),
+            );
+            assert_eq!(
+                ui.mode,
+                UiMode::ConfigGenPrompt,
+                "g opens the same confirmation for {selected}"
+            );
+            let dialog = glossary_frame_rows_at_width(&snapshot, &mut ui, 220).join("\n");
+            assert!(
+                dialog.contains(&format!("{verb} .dot-agent-deck.toml")),
+                "existing={exists:?}: dialog title must say {verb}:\n{dialog}"
+            );
+            for label in ["[Yes]", "[No]"] {
+                assert!(
+                    dialog.contains(label),
+                    "neutral confirmation must offer {label}:\n{dialog}"
+                );
+            }
+            match exists {
+                Some(true) => {
+                    assert!(
+                        dialog.contains("update the existing config"),
+                        "ask to update the user's config:\n{dialog}"
+                    );
+                    assert!(!dialog.contains("No orchestration config found"));
+                    insta::assert_snapshot!("config_generation_update_confirmation", dialog);
+                }
+                Some(false) => {
+                    assert!(
+                        dialog.contains("create one?"),
+                        "keep the existing Generate question:\n{dialog}"
+                    );
+                }
+                // PR #2362 review: the daemon could not tell, so the
+                // question claims neither a config nor its absence.
+                None => {
+                    for claim in [
+                        "No orchestration config found",
+                        "already has an orchestration config",
+                        "create one?",
+                    ] {
+                        assert!(
+                            !dialog.contains(claim),
+                            "an unknown state must not claim {claim:?}:\n{dialog}"
+                        );
+                    }
+                    for neutral in [
+                        "check this",
+                        "project for .dot-agent-deck.toml and create it,",
+                        "or propose updates to it if it already exists?",
+                        "create or update config for this project",
+                    ] {
+                        assert!(
+                            dialog.contains(neutral),
+                            "the unknown question must say {neutral:?}:\n{dialog}"
+                        );
+                    }
+                    insta::assert_snapshot!("config_generation_unknown_confirmation", dialog);
+                }
+            }
+        }
+    }
+
+    /// Scenario: Open Generate config for an agent on an older daemon and confirm Yes by mouse or keyboard. The status line explains that the daemon needs upgrading, nothing is posted through the generic inbox fallback, and the deck stays out of typing mode.
+    #[spec("dashboard/config-gen/001")]
+    #[test]
+    fn config_gen_001_older_daemon_shows_upgrade_without_posting_a_fallback() {
+        for keyboard in [false, true] {
+            let mut snapshot = AppState::default();
+            let incarnation =
+                crate::daemon_client::Incarnation::from(Some("listed-process".into()));
+            snapshot.learn_stream_incarnation(incarnation.clone());
+            let sid = snapshot.insert_placeholder_session_learned(
+                "selected-pane".into(),
+                None,
+                None,
+                Some("selected-agent".into()),
+                incarnation,
+            );
+            let state: SharedState = Arc::new(tokio::sync::RwLock::new(snapshot.clone()));
+            let pc = Arc::new(OpenTabPC::new());
+            let mut tab_manager = TabManager::new(pc.clone());
+            let mut ui = default_ui();
+            dispatch_action(
+                Action::RequestConfigGen,
+                &mut ui,
+                &*pc,
+                &state,
+                &mut tab_manager,
+                &snapshot,
+                &[],
+                Some(&sid),
+                Rect::new(0, 0, 180, 24),
+            );
+            assert_eq!(ui.mode, UiMode::ConfigGenPrompt);
+            let confirm = if keyboard {
+                handle_config_gen_prompt_key(
+                    KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    &mut ui,
+                )
+            } else {
+                Action::ConfigGenConfirm
+            };
+            dispatch_action(
+                confirm,
+                &mut ui,
+                &*pc,
+                &state,
+                &mut tab_manager,
+                &snapshot,
+                &[],
+                Some(&sid),
+                Rect::new(0, 0, 180, 24),
+            );
+            assert_eq!(
+                glossary_status_text(&ui),
+                Some(crate::config_gen::CONFIG_GEN_UPGRADE_MESSAGE)
+            );
+            assert!(glossary_status_row(&state, &mut ui).contains("Upgrade"));
+            assert_ne!(ui.mode, UiMode::PaneInput);
+            assert_eq!(pc.config_requests.lock().unwrap().len(), 1);
+            assert!(
+                pc.posted_messages.lock().unwrap().is_empty(),
+                "an older daemon must receive no locally composed fallback"
+            );
+            assert!(pc.focused.lock().unwrap().is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    fn config_gen_scripted_confirmation(
+        replace_card: bool,
+        silent: bool,
+    ) -> (String, Vec<serde_json::Value>) {
+        use crate::daemon_client::restart_fixture::RestartingDaemon;
+        use crate::embedded_pane::EmbeddedPaneController;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let daemon = runtime.block_on(async { RestartingDaemon::spawn("config-process") });
+        daemon.config_generation(
+            Some(crate::daemon_protocol::AttachResponse::err(
+                "target refused",
+            )),
+            silent,
+        );
+        let pc = Arc::new(
+            EmbeddedPaneController::new(daemon.path.clone(), runtime.handle().clone())
+                .with_protocol_gate(),
+        );
+        let mut snapshot = AppState::default();
+        let incarnation = crate::daemon_client::Incarnation::from(Some("config-process".into()));
+        snapshot.learn_stream_incarnation(incarnation.clone());
+        let sid = snapshot.insert_placeholder_session_learned(
+            "pane-1".into(),
+            None,
+            None,
+            Some("1".into()),
+            incarnation,
+        );
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(snapshot.clone()));
+        let mut tabs = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        dispatch_action(
+            Action::RequestConfigGen,
+            &mut ui,
+            &*pc,
+            &state,
+            &mut tabs,
+            &snapshot,
+            &[],
+            Some(&sid),
+            Rect::new(0, 0, 240, 24),
+        );
+        assert_eq!(ui.mode, UiMode::ConfigGenPrompt);
+        if replace_card {
+            snapshot.sessions.get_mut(&sid).unwrap().agent_id = Some("2".into());
+            *state.blocking_write() = snapshot.clone();
+        }
+        dispatch_action(
+            Action::ConfigGenConfirm,
+            &mut ui,
+            &*pc,
+            &state,
+            &mut tabs,
+            &snapshot,
+            &[],
+            Some(&sid),
+            Rect::new(0, 0, 240, 24),
+        );
+        assert_ne!(ui.mode, UiMode::PaneInput);
+        let status = glossary_status_text(&ui)
+            .expect("a visible generation outcome")
+            .to_owned();
+        assert!(glossary_status_row(&state, &mut ui).contains("Failed to send config prompt:"));
+        (
+            status,
+            daemon.requests_to("config-process", "generate-config"),
+        )
+    }
+
+    /// Scenario: Open Generate config on an unopened card for agent A, replace its displayed occupant with B, then confirm Yes. The request still names A, so the replacement can never receive A's config instructions; an unchanged card is the control.
+    #[cfg(unix)]
+    #[spec("dashboard/config-gen/001")]
+    #[test]
+    fn config_gen_001_confirmation_keeps_the_agent_it_opened_for() {
+        let observations: Vec<_> = [false, true]
+            .into_iter()
+            .map(|replace| {
+                let (_, requests) = config_gen_scripted_confirmation(replace, false);
+                assert_eq!(requests.len(), 1, "one confirmation request");
+                (replace, requests[0]["expected_agent_id"].clone())
+            })
+            .collect();
+        assert_eq!(
+            observations,
+            vec![
+                (false, serde_json::json!("1")),
+                (true, serde_json::json!("1"))
+            ],
+            "Yes must preserve the agent captured when the dialog opened, including on an unopened pane"
+        );
+    }
+
+    /// Scenario: Confirm Generate config and have the daemon refuse the target. The TUI's visible status is exactly the desktop's shared failure sentence for the same client error.
+    #[cfg(unix)]
+    #[spec("dashboard/config-gen/001")]
+    #[test]
+    fn config_gen_001_refusal_uses_the_desktop_failure_sentence() {
+        let (status, _) = config_gen_scripted_confirmation(false, false);
+        assert_eq!(
+            status,
+            crate::config_gen::config_gen_failed_message(
+                &crate::daemon_client::ClientError::Server("target refused".into())
+            )
+        );
+    }
+
+    /// Scenario: Confirm Generate config on a daemon that receives the request but never answers. The TUI shows the same timeout sentence as the desktop and stays out of typing mode.
+    #[cfg(unix)]
+    #[spec("dashboard/config-gen/001")]
+    #[test]
+    fn config_gen_001_timeout_uses_the_desktop_failure_sentence() {
+        let (status, requests) = config_gen_scripted_confirmation(false, true);
+        assert_eq!(requests.len(), 1, "the timeout follows a sent request");
+        assert_eq!(
+            status,
+            crate::config_gen::config_gen_failed_message(
+                &crate::daemon_client::ClientError::TimedOut(std::time::Duration::from_secs(15))
+            )
+        );
+    }
+
+    /// Scenario: Confirm Generate config on an agent whose pane is not open here. A pane that can be opened enters typing mode; a refused focus or unavailable pane leaves command mode and the card intact, with the sent notice visible.
+    #[spec("inbox/route/007")]
+    #[test]
+    fn route_007_sent_config_opens_an_unwired_pane_or_keeps_the_card() {
+        for (hydratable, refuse_focus) in [(true, false), (false, false), (true, true)] {
+            for keyboard in [false, true] {
+                let mut controller = UnwiredPC::new(hydratable);
+                controller.refuse_focus = refuse_focus;
+                let pc = Arc::new(controller);
+                let mut snapshot = AppState::default();
+                let incarnation =
+                    crate::daemon_client::Incarnation::from(Some("listed-process".into()));
+                snapshot.learn_stream_incarnation(incarnation.clone());
+                let sid = snapshot.insert_placeholder_session_learned(
+                    "selected-pane".into(),
+                    None,
+                    None,
+                    Some("selected-agent".into()),
+                    incarnation,
+                );
+                let state: SharedState = Arc::new(tokio::sync::RwLock::new(snapshot.clone()));
+                let mut tab_manager = TabManager::new(pc.clone());
+                let mut ui = default_ui();
+                ui.display_names
+                    .insert(sid.clone(), "config-target-agent".into());
+                dispatch_action(
+                    Action::RequestConfigGen,
+                    &mut ui,
+                    &*pc,
+                    &state,
+                    &mut tab_manager,
+                    &snapshot,
+                    &[],
+                    Some(&sid),
+                    Rect::new(0, 0, 180, 24),
+                );
+                assert_eq!(ui.mode, UiMode::ConfigGenPrompt);
+                let confirm = if keyboard {
+                    handle_config_gen_prompt_key(
+                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                        &mut ui,
+                    )
+                } else {
+                    Action::ConfigGenConfirm
+                };
+                dispatch_action(
+                    confirm,
+                    &mut ui,
+                    &*pc,
+                    &state,
+                    &mut tab_manager,
+                    &snapshot,
+                    &[],
+                    Some(&sid),
+                    Rect::new(0, 0, 180, 24),
+                );
+                assert_eq!(
+                    ui.mode,
+                    if hydratable && !refuse_focus {
+                        UiMode::PaneInput
+                    } else {
+                        UiMode::Normal
+                    },
+                    "hydratable={hydratable}, refused={refuse_focus}, keyboard={keyboard}"
+                );
+                let rows = glossary_frame_rows(&state.blocking_read(), &mut ui);
+                let status = rows.last().expect("the frame has a status row");
+                assert!(status.contains(crate::config_gen::CONFIG_GEN_SENT_MESSAGE));
+                assert!(status.contains(if hydratable && !refuse_focus {
+                    "TYPING"
+                } else {
+                    "COMMAND"
+                }));
+                assert!(
+                    rows.iter().any(|row| row.contains("config-target-agent")),
+                    "a sent request must keep its card even when focus fails"
+                );
+            }
         }
     }
 
@@ -51451,9 +51144,6 @@ mod pane_closure_tests {
         fn rename_pane(&self, _i: &str, n: &str) -> Result<RenameOutcome, PaneError> {
             Ok(RenameOutcome::Applied(n.to_string()))
         }
-        fn toggle_layout(&self) -> Result<(), PaneError> {
-            Ok(())
-        }
         fn write_to_pane(&self, _i: &str, _t: &str) -> Result<(), PaneError> {
             Ok(())
         }
@@ -51726,9 +51416,6 @@ mod config_drift_tests {
         }
         fn rename_pane(&self, _i: &str, n: &str) -> Result<RenameOutcome, PaneError> {
             Ok(RenameOutcome::Applied(n.to_string()))
-        }
-        fn toggle_layout(&self) -> Result<(), PaneError> {
-            Ok(())
         }
         fn write_to_pane(&self, _i: &str, _t: &str) -> Result<(), PaneError> {
             Ok(())

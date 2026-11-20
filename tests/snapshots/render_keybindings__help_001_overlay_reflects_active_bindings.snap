@@ -1,6 +1,5 @@
 ---
 source: tests/render_keybindings.rs
-assertion_line: 111
 expression: text
 ---
                                                                                                                         
@@ -8,32 +7,31 @@ expression: text
         │  Global (chords work from any pane)                 Mouse                                           │         
         │                                                                                                     │         
         │  d / Ctrl+d         Toggle command / pane           Mouse click     Focus pane                      │         
-        │  n / Ctrl+n         Create new agent                Drag            Select & copy                   │         
-        │  Alt+Shift+l        Toggle layout (stacked/tiled)   Ctrl+click      Open hyperlink                  │         
-        │  Ctrl+c             Quit                                                                            │         
-        │                                                     New Agent Form                                  │         
-        │  Tab Navigation                                                                                     │         
-        │                                                     Tab             Switch field                    │         
-        │  Tab / Right / l    Next tab                        ◀/▶             Cycle mode                      │         
-        │  Shift+Tab / Left / h Prev tab                      Enter           Next field / confirm            │         
-        │  Ctrl+PgDn          Next tab                        Esc             Cancel                          │         
-        │  Ctrl+PgUp          Prev tab                                                                        │         
-        │                                                     Directory Picker                                │         
-        │  Dashboard (command mode)                                                                           │         
-        │                                                     j / Down        Select next                     │         
-        │  j / Down           Select next card                k / Up          Select previous                 │         
-        │  k / Up             Select previous card            l / Right / Enter   Enter directory             │         
-        │  1-9                Jump to card N                  h / Left / Bksp     Go up one level             │         
-        │  Enter              Focus selected pane             Space           Confirm current directory       │         
-        │  w / Ctrl+w         Close selected agent (confirms) /               Filter (case-insensitive)       │         
-        │  Ctrl+l             Toggle orch tab split ratio     Esc             Clear filter (twice = close)    │         
-        │  z / Ctrl+z         Zoom focused pane               q               Cancel                          │         
-        │  /                  Filter agents                                                                   │         
-        │  Esc                Clear filter                    Session                                         │         
-        │  r / Ctrl+r         Rename agent                                                                    │         
-        │  g / Ctrl+g         Generate .dot-agent-deck.toml   Panes auto-saved continuously.                  │         
-        │  y / n              Approve / deny permission       Restored automatically on launch.               │         
-        │  s / Ctrl+s         Schedules manager                                                               │         
+        │  Alt+Shift+l        Create new agent                Drag            Select & copy                   │         
+        │  Ctrl+c             Quit                            Ctrl+click      Open hyperlink                  │         
+        │                                                                                                     │         
+        │  Tab Navigation                                     New Agent Form                                  │         
+        │                                                                                                     │         
+        │  Tab / Right / l    Next tab                        Tab             Switch field                    │         
+        │  Shift+Tab / Left / h Prev tab                      ◀/▶             Cycle mode                      │         
+        │  Ctrl+PgDn          Next tab                        Enter           Next field / confirm            │         
+        │  Ctrl+PgUp          Prev tab                        Esc             Cancel                          │         
+        │                                                                                                     │         
+        │  Dashboard (command mode)                           Directory Picker                                │         
+        │                                                                                                     │         
+        │  j / Down           Select next card                j / Down        Select next                     │         
+        │  k / Up             Select previous card            k / Up          Select previous                 │         
+        │  1-9                Jump to card N                  l / Right / Enter   Enter directory             │         
+        │  Enter              Focus selected pane             h / Left / Bksp     Go up one level             │         
+        │  w / Ctrl+w         Close selected agent (confirms) Space           Confirm current directory       │         
+        │  Ctrl+l             Toggle orch tab split ratio     /               Filter (case-insensitive)       │         
+        │  z / Ctrl+z         Zoom focused pane               Esc             Clear filter (twice = close)    │         
+        │  /                  Filter agents                   q               Cancel                          │         
+        │  Esc                Clear filter                                                                    │         
+        │  r / Ctrl+r         Rename agent                    Session                                         │         
+        │  g / Ctrl+g         Generate .dot-agent-deck.toml                                                   │         
+        │  y / n              Approve / deny permission       Panes auto-saved continuously.                  │         
+        │  s / Ctrl+s         Schedules manager               Restored automatically on launch.               │         
         │  m / Ctrl+m         Host of this deck                                                               │         
         │  i                  Deck messages: Retry or Cancel                                                  │         
         │  o                  Open pull request                                                               │         

@@ -238,7 +238,7 @@ fn preserve_disabled_button_is_inert() {
     // the test.
     let assert_no_side_effect = |grid: &str| {
         assert!(
-            !grid.contains("No orchestration config found"),
+            !grid.contains("instruct your agent"),
             "clicking the disabled Generate button must not open the config-gen prompt:\n{grid}"
         );
         assert!(

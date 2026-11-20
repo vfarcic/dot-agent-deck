@@ -34,7 +34,6 @@ Whether there is anything to scroll depends on the agent; see [Scrolling back th
 |---|---|---|
 | `Ctrl+D` | Switch between command mode and the pane you came from | Both modes |
 | `Ctrl+N` | New agent: directory picker, then the New Agent form | Both modes |
-| `Ctrl+T` | Toggle stacked layout (only the focused pane, full height; the default) and tiled layout (every pane) | Both modes |
 | `Ctrl+PageDown` / `Ctrl+PageUp` | Next / previous tab | Both modes |
 | `Ctrl+W` | Close the selected pane on the dashboard, or a whole orchestration tab, after a confirmation. The dashboard tab cannot be closed. | Command mode |
 | `1`–`9` | Jump to card N and focus its pane | Command mode |
@@ -43,7 +42,7 @@ Whether there is anything to scroll depends on the agent; see [Scrolling back th
 | `Ctrl+E` | **Experimental, off by default.** Toggle the command-entry lock. See [below](#ctrle-locks-command-entry-to-the-orchestrator-pane). | Command mode, on an orchestration tab, with the `experimental` flag on |
 | `Ctrl+C` | In a pane: sent to the program (interrupt). In command mode, the directory picker or the New Agent form: opens the [quit dialog](#dialogs). | Both modes |
 
-Where a key is not claimed (for example `Ctrl+W`, `Ctrl+L`, `Ctrl+Z` or `Ctrl+E` while typing in a pane), it is passed to the program in the pane. While the close confirmation is open, only its keys and `Ctrl+C` work.
+While typing in a pane, a key that is not claimed (for example `Ctrl+T`, `Ctrl+W`, `Ctrl+L`, `Ctrl+Z` or `Ctrl+E`) is passed to the program in the pane. While the close confirmation is open, only its keys and `Ctrl+C` work.
 
 ### Plain letters in command mode
 
@@ -54,7 +53,6 @@ In command mode you can drop the `Ctrl`: the letter alone does the same thing as
 | `d` | `Ctrl+D` | Back to the pane you came from |
 | `n` | `Ctrl+N` | New agent. When the selected card shows **Needs Input**, `n` denies the permission request instead, as it always has. |
 | `w` | `Ctrl+W` | Close, with its confirmation |
-| `t` | `Ctrl+T` | Toggle layout |
 | `z` | `Ctrl+Z` | Zoom, on the dashboard or an orchestration tab |
 | `e` | `Ctrl+E` | Command-entry lock, only where `Ctrl+E` works (experimental flag on, orchestration tab) |
 
@@ -123,7 +121,7 @@ Command mode. If you are typing in a pane, press `Ctrl+D` first.
 | `/` | Filter cards |
 | `Esc` | Clear the filter |
 | `r` | Rename the selected agent |
-| `g` | Ask the selected agent to generate `.dot-agent-deck.toml` for its directory |
+| `g` | Ask the selected agent to generate `.dot-agent-deck.toml` for its directory, or to update it when the directory already has one; the footer then reads `[Update g]` (see [Quick setup](orchestration.md#quick-setup)). The desktop app has no `g`: press **Generate config** (**Update config**) on the agent's row or in its pane, or say "generate config with" and its name |
 | `s` or `S` | Open the **Schedules** manager (see [Schedules](scheduled-tasks.md)) |
 | `o` | Open the selected agent's pull request in your system browser (uses `$BROWSER` when set; a `$BROWSER` that puts the address into a shell command, such as `sh -c %s`, is refused); when no browser can be opened, for example in a TUI on a remote host, the status line shows the pull request's address so you can copy it. On a card with no [pull request badge](session-management.md#pull-request-badge) it says the agent has none. The desktop app has no `o`: click the badge or say "open the PR", and it opens inside the app ([Dashboard → Pull requests](desktop/dashboard.md#pull-requests)) |
 | `m` | Open the **Host of this deck** overlay: disk, load and memory of the machine the deck runs on (see [Session Management](session-management.md#check-the-machine-a-deck-runs-on)); `Esc` closes it |
@@ -250,7 +248,7 @@ While filtering: `Enter` stops editing and keeps the filter, `Backspace` deletes
 |---|---|---|
 | **Filter** | `/` | Type to narrow the cards · `Backspace` deletes · `Enter` keeps the filter and closes · `Esc` clears and closes |
 | **Rename** | `r` | Type the new name · `Enter` confirms · `Esc` cancels |
-| **Generate config** | `g` | `Up` / `Down` (or `k` / `j`) to choose **Yes**, **No** or **Never** · `Enter` confirms · `Esc` cancels. **Yes** asks the selected agent to write `.dot-agent-deck.toml`; **Never** stops offering it for that directory. |
+| **Generate config** | `g`, or the footer's `[Generate g]` (`[Update g]` when the agent's project already has a config) | `Up` / `Down` (or `k` / `j`) to choose **Yes** or **No** · `Enter` confirms · `Esc` cancels. Clicking `[Yes]` or `[No]` does the same. **Yes** asks the selected agent to propose and write `.dot-agent-deck.toml`, or, in the **Update .dot-agent-deck.toml** dialog, to propose changes to the existing file; **No** sends nothing. See [Quick setup](orchestration.md#quick-setup). |
 | **Quit** | `Ctrl+C` in command mode | `Up` / `Down` (or `k` / `j`) to choose **Detach** (default), **Stop** or **Cancel** · `Enter` confirms · `Esc` dismisses · `Ctrl+C` again leaves immediately. Clicking the footer's `[Quit Ctrl+C]` opens this same dialog. **Detach** keeps the agents running; **Stop** stops them and the daemon, asking once more first while agents are running. See [Resuming Sessions](session-management.md#resuming-sessions). |
 | **Close confirmation** | `Ctrl+W`, the `[Close]` button, or a tab's `[×]` | `Up` / `Down` (or `k` / `j`) to choose **Cancel** (default) or **Close**, and for a dispatched unit **Close, keep worktree** · `Enter` confirms · `Esc` dismisses. It names what it will close and closes exactly that. A key typed ahead that is still waiting to be read when it opens is discarded. If a pane refuses to stop, the tab is kept so you can try again. |
 | **Upgrade** | `u`, or a click on the footer's update notice | `Up` / `Down` (or `k` / `j`) to choose **Cancel** (default) or **Upgrade** · `Enter` confirms · `Esc` closes · `PageUp` / `PageDown` (or the mouse wheel) scroll a plan too long for the terminal; **Upgrade** waits until the whole plan has been on screen. It asks about one copy at a time; after one copy is upgraded, **Cancel** skips the next. A copy the TUI cannot upgrade offers only **Close**. See [Upgrade from the TUI](installation.md#upgrade-from-the-tui). |
@@ -281,7 +279,6 @@ The file has two tables, `[global]` and `[dashboard]`, each mapping an action na
 ```toml
 # ~/.config/dot-agent-deck/keybindings.toml
 [global]
-toggle_layout = "Alt+Shift+l"                # move it off Ctrl+t
 toggle_orchestration_split = "Alt+Shift+s"   # move it off Ctrl+l
 toggle_zoom = "Ctrl+Alt+z"                   # move zoom off Ctrl+z
 new_pane = ""                                # unbind New Agent
@@ -310,11 +307,12 @@ Modifier and named-key names are case-insensitive (`ctrl+enter` equals `Ctrl+Ent
 | `dashboard` | `Ctrl+d` | Switch between command mode and the pane | Both modes |
 | `new_pane` | `Ctrl+n` | New agent | Both modes |
 | `close_pane` | `Ctrl+w` | Close the selected agent or orchestration tab, with confirmation | Command mode |
-| `toggle_layout` | `Ctrl+t` | Toggle stacked / tiled layout | Both modes |
 | `toggle_orchestration_lock` | `Ctrl+e` | Toggle the command-entry lock (**experimental flag required**) | Command mode, orchestration tab |
 | `toggle_orchestration_split` | `Ctrl+l` | Toggle the orchestration split between 34/66 and 25/75 | Command mode, orchestration tab |
 | `toggle_zoom` | `Ctrl+z` | Zoom the focused pane; again to restore | Command mode, dashboard or orchestration tab |
 | `jump_1` … `jump_9` | `1` … `9` | Jump to card N and focus its pane | Command mode |
+
+`toggle_layout` (`Ctrl+t`), which switched between showing only the focused pane and showing every pane, has been removed: the focused agent's pane always fills the pane column. A file that still sets it keeps working; the TUI prints a warning that the line is ignored, and you can delete it.
 
 `[dashboard]` (command mode):
 

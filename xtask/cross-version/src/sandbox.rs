@@ -930,7 +930,7 @@ pub fn stage_binary(src: &Path, dst: &Path) -> Result<String, String> {
 ///   issued from a WORKER pane. The orchestrator then fetches and lists the
 ///   report in its own inbox; the status change is read from daemon status.
 ///
-/// Each role prints a unique sentinel first: `PaneLayout::Stacked` draws only
+/// Each role prints a unique sentinel first: the deck draws only
 /// the focused role's pane, so the sentinel on screen names which role is
 /// focused and proves its process is live rather than an empty rebuilt frame.
 pub const FIXTURE_TOML: &str = r#"# Written by `cargo xver`. Stand-in agents only — no credentials are used.

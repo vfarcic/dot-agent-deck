@@ -2391,6 +2391,7 @@ mod tests {
                             r.agent_records = Some(vec![crate::agent_pty::AgentRecord {
                                 input_held: None,
                                 input_discarded: None,
+                                project_config_exists: None,
                                 id: "a1".into(),
                                 pane_id_env: Some("7".into()),
                                 display_name: Some("coder".into()),

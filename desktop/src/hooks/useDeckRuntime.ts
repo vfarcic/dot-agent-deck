@@ -479,6 +479,11 @@ export function useDeckRuntime(): DeckRuntimeState {
     ? (target: AgentTarget, item: { paneId: string; messageId: string; revision: number }, verb: InboxActionVerb) =>
       bridge.inboxAction!(target, item, verb)
     : undefined), [bridge]);
+  // PRD #2119: Generate config. Its answer is the screen's to show, so this
+  // bypasses `runAction` too.
+  const generateConfig = useMemo(() => (typeof bridge.generateConfig === "function"
+    ? (deckId: string, agentId: string, paneId: string, incarnation?: string) => bridge.generateConfig!(deckId, agentId, paneId, incarnation)
+    : undefined), [bridge]);
   const decideUpgrade = useMemo(() => (typeof bridge.decideUpgrade === "function"
     ? (upgradeId: string, questionId: number, choice: UpgradeChoice) => bridge.decideUpgrade(upgradeId, questionId, choice)
     : undefined), [bridge]);
@@ -670,6 +675,7 @@ export function useDeckRuntime(): DeckRuntimeState {
     ...(upgradeDaemon ? { upgradeDaemon } : {}),
     ...(decideUpgrade ? { decideUpgrade } : {}),
     ...(inboxAction ? { inboxAction } : {}),
+    ...(generateConfig ? { generateConfig } : {}),
     ...(cardsOffered ? { agentCards, consumeAgentCards } : {}),
     ...(invokeCardAction ? { invokeCardAction } : {}),
     ...(interruptedWork ? { interruptedWork } : {}),
