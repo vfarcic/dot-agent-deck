@@ -1149,12 +1149,16 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
                 .ok()
                 .as_deref(),
         );
+        // Issue #2418: the job bound the daemon's background GitHub lookups
+        // share; a clone goes to each monitor that runs `git` or `gh` for one.
+        let github_jobs = crate::pull_request::new_job_bound();
         tokio::spawn(async move {
             crate::pull_request::run_pull_request_monitor(
                 registry,
                 monitor_state,
                 monitor_event_tx,
                 interval,
+                github_jobs,
             )
             .await;
         })

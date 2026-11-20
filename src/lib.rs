@@ -102,6 +102,8 @@ pub mod event_subscriber;
 // PRD #1666 part 3 round 5-wake: whether a parsed frame was drawn for the PTY's current width.
 pub mod evidence_state;
 pub mod features;
+// Issue #2418: strict parsing of the PR/issue references agents report on cards.
+pub mod github_refs;
 pub mod guarded;
 // PRD #1105 M11: when the TUI claims focus on its daemon (terminal focus-in and
 // throttled input).
