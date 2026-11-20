@@ -2,9 +2,13 @@
  * PRD #1790 stage 2 — the desktop's interrupted work: the work a deck
  * restart left behind, as each deck's daemon derives it from its work journal.
  *
- * Every sentence here is a copy of one in `src/interrupted_work.rs` (decision
- * D2), so the CLI, the TUI and the desktop say the same thing (CLAUDE.md rule
- * 22); `interruptedWork.test.ts` reads that file and fails when a copy drifts.
+ * The constants in the "Decision D2" section below are copies of the ones in
+ * `src/interrupted_work.rs` (decision D2), so the CLI, the TUI and the desktop
+ * say the same thing (CLAUDE.md rule 22); `interruptedWork.test.ts` reads that
+ * file and fails when one of them drifts, and checks several helpers'
+ * sentences against the Rust helpers'. The desktop-only sentences above that
+ * section — the spoken dismissal's question and what voice is told when it is
+ * refused — are the desktop's own, not copies.
  *
  * The types mirror the daemon's own answers (`InterruptedList`,
  * `InterruptedShow`, `ReclaimOutcome`, `DismissOutcome`), which the app's
@@ -549,9 +553,4 @@ export function lastEntryLine(item: InterruptedItem): string {
 /** "Progress: …". */
 export function progressFact(item: InterruptedItem): string {
   return `${LABEL_PROGRESS}: ${displayValue(progressLine(item.progress))}`;
-}
-
-/** The restart toast's hint line, as the TUI's restart notice adds it: the footer's words. */
-export function restartHint(count: number): string | undefined {
-  return count > 0 ? interruptedFooter(count) : undefined;
 }

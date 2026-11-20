@@ -2180,7 +2180,8 @@ button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-
 .interrupted-fact { display: contents; }
 .interrupted-fact dt { font-weight: 600; }
 .interrupted-fact dd { margin: 0; overflow-wrap: anywhere; }
-.interrupted-report-body { margin: 0; padding: 8px; max-height: 40vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; border: 1px solid var(--dialog-edge); border-radius: var(--radius); }
+/* No scroll of its own: the dialog scrolls the whole text, so `j` / `k` reach every line of it (final reviewer 3). */
+.interrupted-report-body { margin: 0; padding: 8px; white-space: pre-wrap; overflow-wrap: anywhere; border: 1px solid var(--dialog-edge); border-radius: var(--radius); }
 .interrupted-note, .interrupted-message { margin: 0; overflow-wrap: anywhere; }
 .interrupted-confirm p { margin: 0 0 6px; overflow-wrap: anywhere; }
 .toast-hint { display: block; margin-top: 4px; }

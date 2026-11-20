@@ -419,11 +419,13 @@ export type VoiceActionContext = {
   /**
    * PRD #1790 stage 2 — open a daemon's "Interrupted work" dialog: what its
    * banner's Show does. `deckId` is the daemon a row's `deck_ref` resolved
-   * to, or the banner's own; without one, the one daemon whose banner is
-   * shown. Answers `undefined` when it opened, or the sentence saying why
-   * not. **Served by the OVERVIEW**, which renders the banners.
+   * to, or the banner's own; without one, the connected daemon when there is
+   * one, and with several, the one that lists work once each has been asked
+   * again (final reviewer 2). Answers `undefined` when it opened, or the
+   * sentence saying why not — later, as a promise, when it asked again first.
+   * **Served by the OVERVIEW**, which renders the banners.
    */
-  showInterruptedWork: (deckId?: string) => string | undefined;
+  showInterruptedWork: (deckId?: string) => string | undefined | Promise<string | undefined>;
   /** PRD #1790 stage 2 — hide a daemon's interrupted work banner until it is another daemon process: records nothing. */
   hideInterruptedWork: (deckId: string) => void;
   /**
@@ -1227,7 +1229,9 @@ export const VOICE_ACTIONS = {
     needs: ["showInterruptedWork"],
     run: (context: Pick<VoiceActionContext, "showInterruptedWork"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target?: { preselectDeckId?: string }) => {
       const refused = context.showInterruptedWork(target?.preselectDeckId || undefined);
-      if (refused !== undefined) context.reportRefused?.(refused);
+      /* With several daemons the dashboard asks each again first (final reviewer 2), and reports once they answer. */
+      if (refused instanceof Promise) void refused.then((later) => { if (later !== undefined) context.reportRefused?.(later); });
+      else if (refused !== undefined) context.reportRefused?.(refused);
     },
   },
 

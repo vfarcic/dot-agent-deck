@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { DeckBridge } from "../lib/bridge";
-import { isInterruptedList, type DismissOutcome, type InterruptedList, type InterruptedReply, type InterruptedShow, type InterruptedTarget, type ReclaimOutcome } from "../lib/interruptedWork";
+import { isInterruptedList, listedCount, type DismissOutcome, type InterruptedList, type InterruptedReply, type InterruptedShow, type InterruptedTarget, type ReclaimOutcome } from "../lib/interruptedWork";
 import type { DeckFleet } from "../types";
 
 /** PRD #1790 stage 2 — what the app holds of one deck's interrupted work. */
@@ -11,7 +11,21 @@ export interface InterruptedDeck {
   list?: InterruptedList;
   /** Why the last list request failed, for the dialog. */
   failed?: string;
+  /** The process answered that it does not support interrupted work. */
+  unsupported?: true;
 }
+
+/**
+ * What one list request found (final reviewer 2): how many items the process
+ * lists, that it does not support interrupted work, that the request failed,
+ * or that its answer was not applied because the deck left that process or a
+ * newer request replaced it.
+ */
+export type InterruptedFetch =
+  | { outcome: "listed"; count: number }
+  | { outcome: "unsupported" }
+  | { outcome: "failed"; reason: string }
+  | { outcome: "superseded" };
 
 /** The deck and daemon process the dialog was opened for. */
 export interface InterruptedDialog { deckId: string; instance: string }
@@ -24,8 +38,13 @@ export interface InterruptedWorkRuntime {
   hidden: (deckId: string) => boolean;
   /** Hide deck `deckId`'s banner: records nothing, and lasts until its connection names another daemon process. */
   hide: (deckId: string) => void;
-  /** Ask deck `deckId`'s daemon for the list again; `git` asks for each item's Git and pull request facts. */
-  refresh: (deckId: string, git?: boolean) => void;
+  /**
+   * Ask deck `deckId`'s daemon for the list again; `git` asks for each item's
+   * Git and pull request facts. Settles with what that request found, once its
+   * answer is applied, so a caller can decide from the fresh answer rather
+   * than from the list held before it.
+   */
+  refresh: (deckId: string, git?: boolean) => Promise<InterruptedFetch>;
   show: (target: InterruptedTarget, id: string, reportsFrom: number) => Promise<InterruptedReply<InterruptedShow>>;
   /**
    * A dry run, or a real reclaim. A real one, like a dismissal, is held here
@@ -54,9 +73,11 @@ function reason(error: unknown): string {
  *
  * The list is asked for once per daemon process a deck's connection names —
  * when the deck connects, and again when it reconnects to another process —
- * again when its dialog opens (with the Git facts), and after each reclaim or
- * dismissal — whether or not a dialog is still open to show its answer.
- * Nothing polls on a timer. An answer from a process the deck has
+ * again when its dialog opens (with the Git facts), when the person asks to
+ * see interrupted work without naming a daemon while several are connected
+ * (final reviewer 2: `refresh`, so the dashboard decides from fresh answers),
+ * and after each reclaim or dismissal — whether or not a dialog is still open
+ * to show its answer. Nothing polls on a timer. An answer from a process the deck has
  * since left, or to a list request that a newer one replaced, is dropped.
  *
  * `undefined` where the bridge offers none of it (a render-only runtime).
@@ -77,27 +98,32 @@ export function useInterruptedWork(bridge: DeckBridge, fleet: DeckFleet): Interr
   const mutations = useRef(new Map<string, { instance: string; op: number }>());
   const [mutating, setMutating] = useState<Readonly<Record<string, string>>>({});
 
-  const fetchList = useCallback((deckId: string, git: boolean) => {
-    if (!bridge.interruptedWorkList) return;
+  const fetchList = useCallback((deckId: string, git: boolean): Promise<InterruptedFetch> => {
+    const superseded: InterruptedFetch = { outcome: "superseded" };
+    if (!bridge.interruptedWorkList) return Promise.resolve(superseded);
     const instance = current.current.get(deckId);
-    if (instance === undefined) return;
+    if (instance === undefined) return Promise.resolve(superseded);
     const op = ++lastOp.current;
     listOps.current.set(deckId, op);
     const applies = () => current.current.get(deckId) === instance && listOps.current.get(deckId) === op;
-    void bridge.interruptedWorkList({ deckId, instance }, git).then((reply) => {
-      if (!applies()) return;
+    return bridge.interruptedWorkList({ deckId, instance }, git).then((reply): InterruptedFetch => {
+      if (!applies()) return superseded;
+      const listed = reply.outcome === "answered" && isInterruptedList(reply.answer);
       setDecks((held) => {
         const before = held[deckId];
         if (!before || before.instance !== instance) return held;
-        if (reply.outcome !== "answered" || !isInterruptedList(reply.answer)) return { ...held, [deckId]: { instance } };
+        if (reply.outcome !== "answered" || !isInterruptedList(reply.answer)) return { ...held, [deckId]: reply.outcome === "unsupported" ? { instance, unsupported: true } : { instance } };
         /* A refresh without Git facts keeps the ones a list with them read, for the items still listed. */
         const items = reply.answer.items.map((item) => (item.git ? item : { ...item, git: before.list?.items.find((old) => old.id === item.id)?.git ?? item.git }));
         return { ...held, [deckId]: { instance, list: { ...reply.answer, items } } };
       });
-    }, (error: unknown) => {
-      if (!applies()) return;
+      if (listed) return { outcome: "listed", count: listedCount(reply.answer as InterruptedList) };
+      return reply.outcome === "unsupported" ? { outcome: "unsupported" } : { outcome: "failed", reason: "the daemon's answer could not be read" };
+    }, (error: unknown): InterruptedFetch => {
+      if (!applies()) return superseded;
       /* A failed refresh keeps the list it had. */
       setDecks((held) => (held[deckId]?.instance === instance ? { ...held, [deckId]: { ...held[deckId], failed: reason(error) } } : held));
+      return { outcome: "failed", reason: reason(error) };
     });
   }, [bridge]);
 
@@ -126,7 +152,7 @@ export function useInterruptedWork(bridge: DeckBridge, fleet: DeckFleet): Interr
       return changed ? kept : held;
     });
     setDialog((open) => (open && next.get(open.deckId) !== open.instance ? undefined : open));
-    for (const deckId of arrived) fetchList(deckId, false);
+    for (const deckId of arrived) void fetchList(deckId, false);
   }, [fetchList, fleet, offered]);
 
   const refresh = useCallback((deckId: string, git = false) => fetchList(deckId, git), [fetchList]);
@@ -142,7 +168,7 @@ export function useInterruptedWork(bridge: DeckBridge, fleet: DeckFleet): Interr
     const instance = current.current.get(deckId);
     if (instance === undefined) return false;
     setDialog({ deckId, instance });
-    fetchList(deckId, true);
+    void fetchList(deckId, true);
     return true;
   }, [fetchList]);
   const closeDialog = useCallback(() => setDialog(undefined), []);
@@ -163,7 +189,7 @@ export function useInterruptedWork(bridge: DeckBridge, fleet: DeckFleet): Interr
           return rest;
         });
       }
-      if (current.current.get(target.deckId) === target.instance) fetchList(target.deckId, false);
+      if (current.current.get(target.deckId) === target.instance) void fetchList(target.deckId, false);
     };
     return send().then((reply) => {
       settled();

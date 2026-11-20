@@ -193,6 +193,7 @@ test.describe("Interrupted work", () => {
 
     await page.keyboard.press("D");
     await expect(dialog.getByTestId("interrupted-dismiss-all")).toHaveAttribute("data-presented", "true");
+    await page.setViewportSize({ width: 900, height: 90 });
     await scrolls();
     await expect(dialog.getByTestId("interrupted-dismiss-all-question")).toBeVisible();
     await expect(dialog.getByTestId("interrupted-message")).toHaveCount(0);

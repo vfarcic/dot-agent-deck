@@ -254,7 +254,7 @@ On the dashboard, say **"show the counters"**, **"show the stats"** or ask "how 
 
 ## Interrupted work
 
-When a daemon restart left work behind, its section of the dashboard shows a banner such as `3 interrupted items from before the restart` ([Interrupted Work](../interrupted-work.md)). Say **"show interrupted work"**, **"what did the restart leave behind?"** or **"show the leftovers"** to open that daemon's **Interrupted work** dialog, as the banner's **Show** does. With several daemons listing interrupted work, name the one you mean, for example "show interrupted work on build box"; if you do not, nothing opens and the app asks which one.
+When a daemon restart left work behind, its section of the dashboard shows a banner such as `3 interrupted items from before the restart` ([Interrupted Work](../interrupted-work.md)). Say **"show interrupted work"**, **"what did the restart leave behind?"** or **"show the leftovers"** to open that daemon's **Interrupted work** dialog, as the banner's **Show** does. Without a name, the app asks each connected daemon again first and opens the dialog of the one that has interrupted work. With several daemons listing interrupted work, name the one you mean, for example "show interrupted work on build box"; if you do not, nothing opens and the app asks which one.
 
 With the dialog open:
 

@@ -56,6 +56,9 @@ const TEXT_FIELD = "input, textarea, select, [contenteditable='true']";
  */
 const QUESTION_PRESENTED_MS = 300;
 
+/** How far one `j` or `k` scrolls the dialog outside the list: about two lines of its text. */
+const SCROLL_STEP_PX = 40;
+
 /** Each opening of a dialog, so voice can tell a reopened one from the one it spoke to. */
 let openings = 0;
 
@@ -414,6 +417,15 @@ export function InterruptedWorkDialog({ deckLabel, deck, target, runtime, contro
         case "Escape": case "q": escape(); return true;
         case "I": if (view.kind !== "list") return false; VOICE_ACTIONS.closeInterruptedWork.run(registry); return true;
         case "ArrowDown": case "j": case "ArrowUp": case "k": {
+          /*
+            Final reviewer 3 — in an item's details, its report text and a
+            question, `j` / `k` scroll the dialog, as the TUI's scroll its text:
+            the selection and the view stay as they are.
+          */
+          if (view.kind !== "list" && (event.key === "j" || event.key === "k")) {
+            ref.current?.scrollBy?.({ top: (event.key === "j" ? 1 : -1) * SCROLL_STEP_PX });
+            return true;
+          }
           if (view.kind !== "list" || ordered.length === 0) return false;
           const step = event.key === "ArrowDown" || event.key === "j" ? 1 : -1;
           const next = ordered[Math.min(Math.max(selectedIndex + step, 0), ordered.length - 1)];

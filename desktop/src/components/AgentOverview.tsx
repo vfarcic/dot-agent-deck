@@ -949,6 +949,11 @@ export function stopAgentConfirmation(agent: OverviewAgent, connection: Connecti
   };
 }
 
+/** PRD #1790 stage 2 — the dashboard's answer when several daemons have interrupted work and a key or spoken request named none. */
+function interruptedSeveral(names: string[], then: string): string {
+  return `Several daemons have interrupted work: ${names.join(", ")}. ${then}`;
+}
+
 /**
  * The fleet at a glance: every agent the desktop can see, grouped the way the
  * daemon groups them, described only by things that are actually true — and
@@ -1266,13 +1271,37 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   */
   const interrupted = runtime.interruptedWork;
   const interruptedControls = useRef<InterruptedDialogControls | undefined>(undefined);
-  const showInterruptedWork = useCallback((deckId?: string): string | undefined => {
+  /*
+    Final reviewer 2 — `I`, the restart notice's Show and "show interrupted
+    work" never decide from a list held from before: with one daemon to ask,
+    its dialog opens and asks it again, as the TUI's `I` does, even when its
+    last answer listed nothing or failed; with several, each is asked again
+    first. "No interrupted work" is said only when every one of them answered
+    that.
+  */
+  const showInterruptedWork = useCallback((deckId?: string): string | undefined | Promise<string | undefined> => {
     if (!interrupted) return NOTHING_INTERRUPTED;
     if (deckId !== undefined) return interrupted.openDialog(deckId) ? undefined : NOTHING_INTERRUPTED;
-    const listing = decks.filter((deck) => deck.connected && deck.snapshot.connection.deckId !== undefined && listedCount(interrupted.decks[deck.snapshot.connection.deckId]?.list) > 0);
-    if (listing.length === 0) return NOTHING_INTERRUPTED;
-    if (listing.length > 1) return `Several daemons have interrupted work: ${listing.map((deck) => deckName(deck.snapshot.connection)).join(", ")}. Open one from its banner, or say which one.`;
-    return interrupted.openDialog(listing[0].snapshot.connection.deckId as string) ? undefined : NOTHING_INTERRUPTED;
+    const held = interrupted.decks;
+    const asked = decks.filter((deck) => {
+      const id = deck.snapshot.connection.deckId;
+      return deck.connected && id !== undefined && held[id] !== undefined && !held[id].unsupported;
+    });
+    if (asked.length === 0) return NOTHING_INTERRUPTED;
+    if (asked.length === 1) return interrupted.openDialog(asked[0].snapshot.connection.deckId as string) ? undefined : NOTHING_INTERRUPTED;
+    const { openDialog, refresh } = interrupted;
+    return Promise.all(asked.map((deck) => {
+      const id = deck.snapshot.connection.deckId as string;
+      return refresh(id, false).then((found) => ({ deck, id, found }));
+    })).then((answers) => {
+      /* A daemon that could not be asked again still counts the items its last answer listed. */
+      const listing = answers.filter(({ id, found }) => (found.outcome === "listed" ? found.count > 0 : found.outcome !== "unsupported" && listedCount(held[id]?.list) > 0));
+      if (listing.length === 1) return openDialog(listing[0].id) ? undefined : NOTHING_INTERRUPTED;
+      if (listing.length > 1) return interruptedSeveral(listing.map(({ deck }) => deckName(deck.snapshot.connection)), "Open one from its banner, or say which one.");
+      const unknown = answers.filter(({ found }) => found.outcome === "failed" || found.outcome === "superseded");
+      if (unknown.length > 0) return `Could not ask ${unknown.map(({ deck }) => deckName(deck.snapshot.connection)).join(", ")} for its interrupted work; try again, or say which daemon.`;
+      return NOTHING_INTERRUPTED;
+    });
   }, [decks, interrupted]);
   const hideInterruptedWork = useCallback((deckId: string) => interrupted?.hide(deckId), [interrupted]);
   /*
@@ -1457,24 +1486,42 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   }, [agentPaneOpen, newAgent, newAgentAvailable, voiceContext]);
   /*
     PRD #1790 stage 2 (reviewer 8, CLAUDE.md rule 22) — `I`, the TUI's
-    Interrupted work key: opens the one daemon's dialog that lists items, as
-    its banner's Show does; with several, the dashboard says so, as voice's
-    "show interrupted work" does. It stands down where the Ctrl+N shortcut
-    does, and under any modal.
+    Interrupted work key: opens the dialog of the daemon that lists items, as
+    its banner's Show does, asking again first (final reviewer 2); with
+    several, the dashboard says so, as voice's "show interrupted work" does.
+    `X` hides a banner. Both stand down where the Ctrl+N shortcut does, and
+    under any modal.
   */
   useEffect(() => {
     if (!interrupted || agentPaneOpen || newAgent) return;
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== "I" || event.ctrlKey || event.metaKey || event.altKey || event.defaultPrevented) return;
+      if ((event.key !== "I" && event.key !== "X") || event.ctrlKey || event.metaKey || event.altKey || event.defaultPrevented) return;
       const target = event.target;
       if (target instanceof Element && target.matches("input, textarea, select, [contenteditable='true'], .xterm-helper-textarea")) return;
       if (modalOpen()) return;
+      if (event.key === "I") {
+        event.preventDefault();
+        VOICE_ACTIONS.showInterruptedWork.run({ showInterruptedWork, reportRefused: setDaemonNotice }, {});
+        return;
+      }
+      /*
+        Final reviewer 3 — `X`, the TUI's Hide: hides the one banner on the
+        dashboard, as its Hide button does, and dismisses nothing. With
+        several banners up it hides none and says so, as `I` does, since no
+        key says which one was meant.
+      */
+      const shown = decks.flatMap((deck) => {
+        const id = deck.snapshot.connection.deckId;
+        return id !== undefined && listedCount(interrupted.decks[id]?.list) > 0 && !interrupted.hidden(id) ? [{ id, name: deckName(deck.snapshot.connection) }] : [];
+      });
+      if (shown.length === 0) return;
       event.preventDefault();
-      VOICE_ACTIONS.showInterruptedWork.run({ showInterruptedWork, reportRefused: setDaemonNotice }, {});
+      if (shown.length > 1) setDaemonNotice(interruptedSeveral(shown.map(({ name }) => name), "Hide one with its banner's Hide."));
+      else VOICE_ACTIONS.hideInterruptedWork.run({ hideInterruptedWork }, shown[0].id);
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [agentPaneOpen, interrupted, newAgent, showInterruptedWork]);
+  }, [agentPaneOpen, decks, hideInterruptedWork, interrupted, newAgent, showInterruptedWork]);
   /**
    * PRD #1105 M5 — the overview's entry point into an agent's pane.
    *

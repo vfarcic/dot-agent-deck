@@ -50,9 +50,9 @@ On the agent dashboard, each daemon that has interrupted work shows a banner in 
 
 ![The desktop app's Interrupted work dialog for the Local daemon, opened from the banner 3 interrupted items from before the restart: the unit fix-login on branch agent/dispatch-fix-login is selected, with its worktree, who started it, its last entry and progress; below it the orchestration release-team, and under Other agents the agent scratch-shell with its folder; the buttons Details, Reclaim, Dismiss and Dismiss all are at the bottom](/img/interrupted-work-desktop.png)
 
-You can also press `I` on the dashboard. With one daemon listing interrupted work, it opens that daemon's dialog; with several, the dashboard says which ones and you open the one you want from its banner.
+You can also press `I` on the dashboard. It asks the daemons for their interrupted work again before deciding, so it finds work left since the banner was last updated. With one daemon connected, it opens that daemon's dialog; with several, it opens the dialog of the one that has interrupted work, or, when several have, the dashboard says which ones and you open the one you want from its banner. If a daemon could not be asked, the dashboard says so rather than that there is nothing. `X` hides the banner, as its **Hide** button does; with several banners on the dashboard, `X` hides none and you use the **Hide** of the one you mean.
 
-In the dialog, click an item to select it, or use the same keys as the TUI: `j` / `k`, `Enter`, `n` / `p`, `r`, `d`, `D`, `y` / `n`, and `Esc`, `q` or `I` to close. The buttons are **Details**, **Show reports**, **Next reports**, **Previous reports**, **Reclaim**, **Dismiss**, **Dismiss all** and **Back**.
+In the dialog, click an item to select it, or use the same keys as the TUI: `j` / `k`, `Enter`, `n` / `p`, `r`, `d`, `D`, `y` / `n`, and `Esc`, `q` or `I` to close. In an item's details, its reports and a question, `j` / `k` scroll the dialog. The buttons are **Details**, **Show reports**, **Next reports**, **Previous reports**, **Reclaim**, **Dismiss**, **Dismiss all** and **Back**.
 
 By voice ([Voice Control](desktop/voice.md#interrupted-work)), say:
 
@@ -122,7 +122,7 @@ An agent running in one of the deck's panes can run `interrupted list` and `inte
 ## Differences between the clients
 
 - The TUI shows the interrupted work of the one daemon it is attached to. The desktop app shows a banner for each daemon on its dashboard, and `I` and "show interrupted work" ask you to pick one when several have interrupted work.
-- The TUI hides its row with `X`; the desktop app hides a banner with its **Hide** button and has no key for it.
+- With several daemons' banners on the dashboard, the desktop app's `X` hides none of them; use the **Hide** button of the one you mean.
 - The TUI's `I` and `X` can be rebound in `keybindings.toml`; the desktop app's keys are fixed.
 - Voice control is in the desktop app only.
 
