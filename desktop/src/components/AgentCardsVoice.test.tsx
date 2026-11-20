@@ -5,6 +5,7 @@ import { createElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { approvedProjectTrust } from "../test/projectTrust";
 import { createFixtureSnapshot, FIXTURE_DAEMON_ID } from "../data/fixture";
+import { clearDashboardFilter, setDashboardFilter } from "../lib/dashboardFilter";
 import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, type DesktopSettingsDto, type VoiceResultDto, type VoiceStatusDto } from "../lib/bridge";
 import { VOICE_ACTIONS } from "../lib/voiceActions";
 import type { AgentCardAction, AgentCardEntry, DeckActionResult, DeckRuntimeState } from "../types";
@@ -131,6 +132,15 @@ function treeEntries(agents: { id: string }[]): AgentCardEntry[] {
   return [parent, child];
 }
 
+/** A parent, a child under it and a grandchild under that, every tree closed (issue #2418 review). */
+function nestedEntries(agents: { id: string }[]): AgentCardEntry[] {
+  const plain = (at: number, name: string): AgentCardEntry => ({ ...cardFor(agents[at].id, name), needs_you: false, needs_you_reasons: [] });
+  const parent = { ...plain(0, "parent-card"), rollup: { total: 2, worst: "working", counts: { working: 2 }, needs_you: 0 } };
+  const child = { ...plain(1, "child-card"), parent: parent.key, rollup: { total: 1, worst: "working", counts: { working: 1 }, needs_you: 0 } };
+  const grandchild = { ...plain(2, "grandchild-card"), parent: child.key };
+  return [parent, child, grandchild];
+}
+
 function settingsStore() {
   let document: DesktopSettingsDto = { ...DEFAULT_DESKTOP_SETTINGS };
   return {
@@ -214,6 +224,7 @@ describe("desktop/agent-cards/008 — the cards by voice (PRD #2374)", () => {
     })));
   });
   afterEach(() => {
+    act(() => setDashboardFilter(clearDashboardFilter()));
     vi.unstubAllGlobals();
     window.localStorage.clear();
   });
@@ -429,5 +440,34 @@ describe("desktop/agent-cards/008 — the cards by voice (PRD #2374)", () => {
     await speak(issue.resolveVoice);
     const issueFrame = await screen.findByTestId("pr-browser");
     expect(issueFrame.getAttribute("aria-label")).toContain("Issue #3");
+  });
+
+  /// Scenario: with every tree closed, say "open the child's tree" for a card one level under a root. The way to it opens too, so the child and the grandchild under it are both on screen.
+  it("desktop/agent-cards/018: a spoken open of a nested card's tree opens the way to it", async () => {
+    const agents = createFixtureSnapshot("connected").agents;
+    const opened = renderSpoken({
+      kind: "dispatch", transcript: "open the child's tree", action: "open_card_tree", invoke: "openCardTree",
+      params: [{ name: "agent", kind: "agent_ref", spoken: "the child", value: agents[1].id, label: "child-card" }],
+      sentence: "Opened.",
+    } as VoiceResultDto["outcome"], { entries: nestedEntries });
+    expect(document.querySelector(`article[data-card-key="${treeKey(agents[1].id)}"]`)).toBeNull();
+    await speak(opened.resolveVoice);
+    await waitFor(() => expect(document.querySelector(`article[data-card-key="${treeKey(agents[2].id)}"]`)).not.toBeNull());
+    expect(document.querySelector(`article[data-card-key="${treeKey(agents[1].id)}"]`)).not.toBeNull();
+  });
+
+  /// Scenario: with the dashboard filter hiding the child, say "open the child's tree". The voice answer says the tree is open but the filter hides the child, rather than reporting it done.
+  it("desktop/agent-cards/018: a spoken open of a tree the dashboard filter hides says so", async () => {
+    const agents = createFixtureSnapshot("connected").agents;
+    const spoken = renderSpoken({
+      kind: "dispatch", transcript: "open the child's tree", action: "open_card_tree", invoke: "openCardTree",
+      params: [{ name: "agent", kind: "agent_ref", spoken: "the child", value: agents[1].id, label: "child-card" }],
+      sentence: "Opened.",
+    } as VoiceResultDto["outcome"], { entries: nestedEntries });
+    act(() => setDashboardFilter({ ...clearDashboardFilter(), text: agents[0].displayName }));
+    expect(document.querySelector(`article[data-card-key="${treeKey(agents[0].id)}"]`), "the filter keeps the parent").not.toBeNull();
+    await speak(spoken.resolveVoice);
+    expect(await screen.findByText("child-card's tree is open, but the dashboard filter hides child-card: clear the filter to see it.")).toBeInTheDocument();
+    expect(document.querySelector(`article[data-card-key="${treeKey(agents[1].id)}"]`)).toBeNull();
   });
 });

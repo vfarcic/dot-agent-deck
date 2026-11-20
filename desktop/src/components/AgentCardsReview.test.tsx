@@ -193,8 +193,10 @@ describe("agent cards: what is sent is what was shown (PRD #2374 review round 1)
     expect(screen.queryByText("low")).toBeNull();
     fireEvent.click(screen.getByTestId("agent-card-show"));
     const overlay = screen.getByTestId("agent-card-overlay");
-    expect(within(overlay).getByText("low")).toBeInTheDocument();
-    expect(within(overlay).getAllByText("agent says").length).toBeGreaterThan(0);
+    // The field's own section carries the agent's label, whatever the primary action's attribution says.
+    const fields = within(overlay).getByRole("region", { name: "Fields" });
+    expect(within(fields).getByText("low")).toBeInTheDocument();
+    expect(within(fields).getByText("agent says")).toBeInTheDocument();
   });
 
   it("the overlay lists what was sent from the card, with the exact text, after the report stopped offering it (decision (a))", () => {

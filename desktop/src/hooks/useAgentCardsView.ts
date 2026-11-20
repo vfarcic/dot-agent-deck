@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { actionBySpokenLabel, cardTarget, disabledReasonSentence, placeCards, placedCardKey, pruneCardResults, readOverviewMode, sendableUnread, stepCard, writeOverviewMode, type CardOverlayStep, type CardResults, type CardStep, type OverviewMode, type PlacedCard } from "../lib/agentCards";
-import { cardTree, needsYouPath, pruneOpenCards, readOpenCards, referenceUrl, writeOpenCards } from "../lib/agentCardsTree";
+import { boundOpenCards, cardTree, pathTo, pruneOpenCards, readOpenCards, referenceUrl, writeOpenCards } from "../lib/agentCardsTree";
 import { newCardRequestId } from "../lib/bridge";
 import type { CardReferenceTarget } from "../lib/prBrowser";
 import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
@@ -23,6 +23,10 @@ export const agentWrittenReview = (label: string, name: string) => `${name} wrot
 
 /** …when voice asks for a card's tree on a card with nothing under it. */
 export const nothingUnder = (name: string) => `${name} has no cards under it.`;
+/** …when voice opens a tree whose card the dashboard filter hides. */
+export const treeHiddenByFilter = (name: string) => `${name}'s tree is open, but the dashboard filter hides ${name}: clear the filter to see it.`;
+/** …when voice opens a tree all of whose cards the dashboard filter hides. */
+export const treeEmptiedByFilter = (name: string) => `${name}'s tree is open, but the dashboard filter hides every card under it: clear the filter to see them.`;
 /** …when a reference is asked for and this window cannot open GitHub pages. */
 export const NO_REFERENCE_OPENER = "This window cannot open GitHub pages.";
 
@@ -77,13 +81,15 @@ function sameIncarnation(card: PlacedCard, incarnation: string | undefined): boo
  * sends what the daemon decided; the only things decided here are the user's
  * own choices (view, filter, which card is open).
  */
-export function useAgentCardsView({ runtime, decks, openAgent, openReference }: {
+export function useAgentCardsView({ runtime, decks, openAgent, openReference, hiddenByFilter }: {
   runtime: Pick<DeckRuntimeState, "agentCards" | "invokeCardAction">;
   decks: readonly { deckId: string | undefined; connected: boolean }[];
   /** Open an agent's pane — a card's `open` action. */
   openAgent: (target: { deckId: string; agentId: string; incarnation?: string }) => void;
   /** Issue #2418 — open a checked pull request or issue in the app's GitHub browser; absent where there is none. */
   openReference?: (target: CardReferenceTarget) => string | undefined;
+  /** Issue #2418 — whether the dashboard filter keeps a card off screen; absent when nothing filters. */
+  hiddenByFilter?: (card: PlacedCard) => boolean;
 }): AgentCardsView {
   const shown = runtime.agentCards !== undefined;
   const [storedMode, setStoredMode] = useState<OverviewMode>(readOverviewMode);
@@ -97,22 +103,45 @@ export function useAgentCardsView({ runtime, decks, openAgent, openReference }: 
   const treeFor = useCallback((deckId: string) => runtime.agentCards?.[deckId]?.tree === true, [runtime.agentCards]);
   const [openCards, setOpenCards] = useState<ReadonlySet<string>>(readOpenCards);
   /* The latest committed state, for members a dispatch calls after a render. */
-  const latest = useRef({ placed, open, shown, treeFor, openReference });
-  latest.current = { placed, open, shown, treeFor, openReference };
+  const latest = useRef({ placed, open, shown, treeFor, openReference, hiddenByFilter });
+  latest.current = { placed, open, shown, treeFor, openReference, hiddenByFilter };
   /* Every change to the open cards is remembered; one this window cannot
      store still applies until it closes. */
   const changeOpenCards = useCallback((change: (current: ReadonlySet<string>) => ReadonlySet<string>) => {
     setOpenCards((current) => {
-      const next = change(current);
+      const next = boundOpenCards(change(current));
       if (next !== current) writeOpenCards(next);
       return next;
     });
   }, []);
-  /* A remembered open card its daemon no longer lists goes (a deck not on
-     screen keeps what it had). */
+  /* The decks whose daemon answered with its cards, an answer with none
+     included: the open cards they no longer list are forgotten. */
+  const answering = useMemo(() => new Set(shown ? decks.flatMap((deck) => (deck.connected && deck.deckId !== undefined && runtime.agentCards?.[deck.deckId] ? [deck.deckId] : [])) : []), [decks, runtime.agentCards, shown]);
+  /* A remembered open card its daemon no longer lists goes (a deck that is
+     not answering keeps what it had). */
   useEffect(() => {
-    if (shown) changeOpenCards((current) => pruneOpenCards(current, placed));
-  }, [changeOpenCards, placed, shown]);
+    if (shown) changeOpenCards((current) => pruneOpenCards(current, placed, answering));
+  }, [answering, changeOpenCards, placed, shown]);
+  /* Needs you only keeps every card that needs the user on screen: on, it
+     opens the way to each one, and while it stays on, to each card that comes
+     to need the user after — a new card, or one whose status changed. The way
+     to a card it already revealed is not opened again, so a tree the user
+     closed stays closed until a card under it newly needs them. */
+  const revealed = useRef<ReadonlySet<string>>(new Set());
+  useEffect(() => {
+    if (!needsYouOnly || !shown) {
+      revealed.current = new Set();
+      return;
+    }
+    const needy = new Set(placed.filter((card) => card.entry.needs_you).map(placedCardKey));
+    const fresh = [...needy].filter((cardKey) => !revealed.current.has(cardKey));
+    revealed.current = needy;
+    if (fresh.length === 0) return;
+    const freshKeys = new Set(fresh);
+    const deckIds = [...new Set(placed.map((card) => card.deckId))];
+    const wanted = deckIds.flatMap((deckId) => [...pathTo(cardTree(placed.filter((card) => card.deckId === deckId), treeFor(deckId)), (node) => freshKeys.has(placedCardKey(node.card))).open]);
+    if (wanted.length) changeOpenCards((current) => (wanted.every((cardKey) => current.has(cardKey)) ? current : new Set([...current, ...wanted])));
+  }, [changeOpenCards, needsYouOnly, placed, shown, treeFor]);
 
   const cardFor = useCallback((deckId: string, agentId: string, incarnation?: string) => (
     placed.find((card) => card.deckId === deckId && card.entry.agent_id === agentId && sameIncarnation(card, incarnation))
@@ -177,14 +206,9 @@ export function useAgentCardsView({ runtime, decks, openAgent, openReference }: 
     },
     setNeedsYouFilter: (on) => {
       if (!latest.current.shown) return CARDS_HIDDEN;
+      /* Needs you only opens the path to every card that needs the user
+         (the effect above, which also follows the cards while it is on). */
       setNeedsYouOnly(on);
-      /* Needs you only opens the path to every card that needs the user. */
-      if (on) {
-        const { placed: listed, treeFor: tree } = latest.current;
-        const deckIds = [...new Set(listed.map((card) => card.deckId))];
-        const wanted = deckIds.flatMap((deckId) => [...needsYouPath(cardTree(listed.filter((card) => card.deckId === deckId), tree(deckId))).open]);
-        if (wanted.length) changeOpenCards((current) => (wanted.every((key) => current.has(key)) ? current : new Set([...current, ...wanted])));
-      }
       // The filter is the Cards view's: asking for it shows that view.
       if (on) remember("cards");
       return undefined;
@@ -270,19 +294,27 @@ export function useAgentCardsView({ runtime, decks, openAgent, openReference }: 
       const card = find(ref);
       if (!card) return CARD_GONE;
       const name = displayText(card.entry.name, DISPLAY_LIMITS.name);
-      const { placed: listed, treeFor: tree } = latest.current;
-      const hasChildren = tree(card.deckId) && listed.some((other) => other.deckId === card.deckId && other.entry.instance_id === card.entry.instance_id && other.entry.parent === card.entry.key && other.entry.key !== card.entry.key);
-      if (!hasChildren) return nothingUnder(name);
+      const { placed: listed, treeFor: tree, hiddenByFilter: hidden } = latest.current;
+      const sameDaemon = (other: PlacedCard) => other.deckId === card.deckId && other.entry.instance_id === card.entry.instance_id;
+      const children = tree(card.deckId) ? listed.filter((other) => sameDaemon(other) && other.entry.parent === card.entry.key && other.entry.key !== card.entry.key) : [];
+      if (children.length === 0) return nothingUnder(name);
       const cardKey = placedCardKey(card);
+      /* Opening a tree opens the way to it as well: every card above it, so
+         the named card and what is under it are on screen. */
+      const above = wantOpen ? pathTo(cardTree(listed.filter(sameDaemon), true), (node) => placedCardKey(node.card) === cardKey).open : new Set<string>();
       changeOpenCards((current) => {
-        if (current.has(cardKey) === wantOpen) return current;
+        const want = [...above, cardKey];
+        if (wantOpen ? want.every((wanted) => current.has(wanted)) : !current.has(cardKey)) return current;
         const next = new Set(current);
-        if (wantOpen) next.add(cardKey);
+        if (wantOpen) want.forEach((wanted) => next.add(wanted));
         else next.delete(cardKey);
         return next;
       });
       // The tree is the Cards view's: asking for it shows that view.
       remember("cards");
+      // Open but kept off screen by the dashboard filter: say so rather than report it done.
+      if (wantOpen && hidden?.(card)) return treeHiddenByFilter(name);
+      if (wantOpen && hidden && children.every(hidden)) return treeEmptiedByFilter(name);
       return undefined;
     },
     openCardReference: (ref, kind, url) => {

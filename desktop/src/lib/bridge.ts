@@ -3227,15 +3227,36 @@ class FixtureDeckBridge implements DeckBridge {
    * a daemon without cards does.
    */
   async agentCards(deckId: string): Promise<AgentCardsSnapshot | null> {
-    const params = new URLSearchParams(window.location.search);
-    const scene = params.get("cards");
-    if (this.fixtureState !== "docs" || (scene !== "1" && scene !== "tree")) return null;
-    const cards = scene === "tree" ? treeAgentCards() : docsAgentCards();
-    return cards.deckId === deckId ? cards : null;
+    const cards = this.sceneCards();
+    return cards && cards.deckId === deckId ? cards : null;
   }
-  /** The preview's cards never change, so there is nothing to push. */
-  async subscribeAgentCards(): Promise<Unsubscribe> {
-    return () => undefined;
+  /**
+   * The docs and tree scenes' cards, as last pushed. Issue #2418 review: the
+   * tree scenes (`cards=tree`, `cards=tree-nested`) let a browser test push a
+   * changed list through `window.__dadFixtureCards`, so it can watch the view
+   * follow a live update; the preview itself never changes them.
+   */
+  private treeCards?: AgentCardsSnapshot;
+  private cardListeners = new Set<(snapshot: AgentCardsSnapshot) => void>();
+  private sceneCards(): AgentCardsSnapshot | null {
+    const scene = new URLSearchParams(window.location.search).get("cards");
+    if (this.fixtureState !== "docs") return null;
+    if (scene === "1") return docsAgentCards();
+    if (scene !== "tree" && scene !== "tree-nested") return null;
+    if (!this.treeCards) {
+      this.treeCards = treeAgentCards(scene);
+      const push = (next: AgentCardsSnapshot) => {
+        this.treeCards = next;
+        for (const listener of this.cardListeners) listener(next);
+      };
+      (window as Window & { __dadFixtureCards?: unknown }).__dadFixtureCards = { snapshot: () => structuredClone(this.treeCards), push };
+    }
+    return this.treeCards;
+  }
+  async subscribeAgentCards(listener: (snapshot: AgentCardsSnapshot) => void): Promise<Unsubscribe> {
+    this.sceneCards();
+    this.cardListeners.add(listener);
+    return () => { this.cardListeners.delete(listener); };
   }
   /** The preview answers a card action as a daemon that queued it would; nothing changes in the fixture's state. */
   async invokeCardAction(_target: AgentCardTarget, actionId: string, options: CardActionOptions): Promise<CardActionResult> {

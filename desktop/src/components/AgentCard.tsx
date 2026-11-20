@@ -131,6 +131,19 @@ export function AgentCard({ card, controls, results, place }: { card: PlacedCard
   const agentType = agentTypeText(entry.agent_type);
   const refs = place.tree ? entry.checked_refs ?? [] : [];
   const ref = cardRef(card);
+  const statusText = cardStatusLabel(entry.status);
+  /* Every line has a fixed height and truncates rather than wraps, so a status
+     word, the needs-you marker, a reference, a roll-up or a primary action
+     appearing never resizes a card or moves a root (issue #2418 review). What
+     a cut line hides is in its tooltip, and all of it is in the overlay. */
+  const metaTitle = [place.kind, statusText, agentType].filter(Boolean).join(" · ");
+  const refsTitle = refs.map((reference) => referenceView(reference).title).join("\n");
+  const primaryNotes = primary ? [
+    primary.prompt ? exactTextString(primary.prompt) : undefined,
+    !primary.enabled ? disabledReasonSentence(primary.disabled_reason) : undefined,
+    results?.[primary.token] ? resultSentence(results[primary.token]) : undefined,
+    primary.last_delivery ? deliverySentence(primary.last_delivery) : undefined,
+  ].filter((note): note is string => note !== undefined) : [];
   return (
     <article
       className={`agent-card tone-${tone}${entry.needs_you ? " needs-you" : ""}${place.faded ? " is-faded" : ""}`}
@@ -164,19 +177,22 @@ export function AgentCard({ card, controls, results, place }: { card: PlacedCard
           >{place.open ? <ChevronUp size={14} aria-hidden="true" /> : <ChevronDown size={14} aria-hidden="true" />}</button>
         )}
       </header>
-      <div className="agent-card-meta">
+      <div className="agent-card-meta" title={displayTitle(metaTitle)}>
         <span className="agent-card-kind" data-testid="agent-card-kind">{place.kind}</span>
-        <span className={`status-label card-status ${cardStatusClass(entry.status)}`} data-testid="agent-card-status" title="Status checked by the deck">{cardStatusLabel(entry.status)}</span>
+        <span className={`status-label card-status ${cardStatusClass(entry.status)}`} data-testid="agent-card-status" title="Status checked by the deck">{statusText}</span>
         {agentType && <span className="agent-card-agent-type" data-testid="agent-card-agent-type">{displayText(agentType, DISPLAY_LIMITS.name)}</span>}
       </div>
-      {refs.length > 0 && (
-        <div className="agent-card-refs" aria-label="Pull requests and issues the agent reported, as the deck checked them">
-          {refs.map((reference, index) => <CardReference key={`${reference.field}\u0000${index}`} card={card} reference={reference} controls={controls} />)}
-        </div>
-      )}
-      {rollup && <CardRollup rollup={rollup} />}
+      {place.tree && (refs.length > 0
+        ? (
+          <div className="agent-card-refs" aria-label="Pull requests and issues the agent reported, as the deck checked them" title={displayTitle(refsTitle)}>
+            {refs.map((reference, index) => <CardReference key={`${reference.field}\u0000${index}`} card={card} reference={reference} controls={controls} />)}
+          </div>
+        )
+        : <div className="agent-card-refs is-empty" aria-hidden="true" />)}
+      {place.tree && (rollup ? <CardRollup rollup={rollup} /> : <div className="agent-card-rollup-block is-empty" aria-hidden="true" />)}
+      {!primary && <div className="agent-card-primary is-empty" aria-hidden="true" />}
       {primary && (
-        <div className="agent-card-primary">
+        <div className="agent-card-primary" title={primaryNotes.length ? displayTitle(primaryNotes.join("\n")) : undefined}>
           <button
             type="button"
             className="button primary compact"

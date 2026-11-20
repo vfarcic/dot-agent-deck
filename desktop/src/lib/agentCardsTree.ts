@@ -27,34 +27,73 @@ export interface CardNode {
  * whether the deck's daemon advertised the card tree: without it, every card
  * is a root. A card whose `parent` is not among `cards` (the dashboard filter
  * hides it, or the daemon no longer lists it) is drawn as a root.
+ *
+ * The result is always a forest, whatever the links say. The daemon links by
+ * exact identity and sends none, but a malformed snapshot could link cards in
+ * a cycle, which no root leads to. Then the first card in the daemon's order
+ * that no root reaches — on the cycle or below it — becomes a root and its own
+ * link is dropped, until every card is reached; so each card appears once in
+ * the result and a walk down it ends.
  */
 export function cardTree(cards: readonly PlacedCard[], tree: boolean): CardNode[] {
   const nodes = cards.map((card) => ({ card, children: [] as CardNode[] }));
   if (!tree) return nodes;
   const byKey = new Map(nodes.map((node) => [node.card.entry.key, node]));
+  const above = new Map<CardNode, CardNode>();
   const roots: CardNode[] = [];
   for (const node of nodes) {
     const parent = node.card.entry.parent;
-    const above = parent && parent !== node.card.entry.key ? byKey.get(parent) : undefined;
-    if (above) above.children.push(node);
-    else roots.push(node);
+    const starter = parent && parent !== node.card.entry.key ? byKey.get(parent) : undefined;
+    if (starter) {
+      starter.children.push(node);
+      above.set(node, starter);
+    } else roots.push(node);
   }
-  /* A cycle would leave its cards reachable from no root; the daemon links by
-     exact identity and forms none, but a card is never dropped for it. */
   const reached = new Set<CardNode>();
-  const walk = (node: CardNode) => {
-    if (reached.has(node)) return;
-    reached.add(node);
-    node.children.forEach(walk);
+  const walk = (start: CardNode) => {
+    const stack = [start];
+    while (stack.length) {
+      const node = stack.pop() as CardNode;
+      if (reached.has(node)) continue;
+      reached.add(node);
+      stack.push(...node.children);
+    }
   };
   roots.forEach(walk);
   for (const node of nodes) {
-    if (!reached.has(node)) {
-      roots.push(node);
-      walk(node);
-    }
+    if (reached.has(node)) continue;
+    // On a cycle, or below one: cut this card's link and draw it as a root.
+    const starter = above.get(node);
+    if (starter) starter.children = starter.children.filter((child) => child !== node);
+    roots.push(node);
+    walk(node);
   }
   return roots;
+}
+
+/**
+ * The cards on the way to every card `wanted` picks: `path` holds those cards
+ * and every card above them (Needs you only keeps them bright), `open` the
+ * cards with a picked card under them, which must be open for it to show.
+ * Walks the tree it is given once; a card met again below itself is skipped.
+ */
+export function pathTo(roots: readonly CardNode[], wanted: (node: CardNode) => boolean): { path: Set<string>; open: Set<string> } {
+  const path = new Set<string>();
+  const open = new Set<string>();
+  const active = new Set<CardNode>();
+  const visit = (node: CardNode): boolean => {
+    if (active.has(node)) return false;
+    active.add(node);
+    let below = false;
+    for (const child of node.children) if (visit(child)) below = true;
+    active.delete(node);
+    const picked = wanted(node);
+    if (below) open.add(placedCardKey(node.card));
+    if (below || picked) path.add(placedCardKey(node.card));
+    return below || picked;
+  };
+  roots.forEach(visit);
+  return { path, open };
 }
 
 /**
@@ -63,17 +102,7 @@ export function cardTree(cards: readonly PlacedCard[], tree: boolean): CardNode[
  * marked card is on screen (`open`: those with a marked card under them).
  */
 export function needsYouPath(roots: readonly CardNode[]): { path: Set<string>; open: Set<string> } {
-  const path = new Set<string>();
-  const open = new Set<string>();
-  const visit = (node: CardNode): boolean => {
-    let below = false;
-    for (const child of node.children) if (visit(child)) below = true;
-    if (below) open.add(placedCardKey(node.card));
-    if (below || node.card.entry.needs_you) path.add(placedCardKey(node.card));
-    return below || node.card.entry.needs_you;
-  };
-  roots.forEach(visit);
-  return { path, open };
+  return pathTo(roots, (node) => node.card.entry.needs_you);
 }
 
 /**
@@ -128,19 +157,29 @@ export function rollupSentence(rollup: { total: number; needs_you: number }): st
   return `${rollup.total} under it · ${rollup.needs_you} ${rollup.needs_you === 1 ? "needs" : "need"} you`;
 }
 
-/** What a card is: one that dispatches others, an orchestration's orchestrator, one of its roles, or a plain agent — read off the daemon's relations. */
+/** What a card is: one that dispatches others, an orchestration's orchestrator, one of its roles, or a plain agent. */
 export type CardKind = "dispatcher" | "orchestrator" | "role" | "agent";
 
+const CARD_KINDS: readonly CardKind[] = ["dispatcher", "orchestrator", "role", "agent"];
+
 /**
- * Each card's kind, by placed key. A card is a dispatcher when the daemon names
- * it as the dispatcher of another card; an orchestrator or a role by its
- * orchestration relation.
+ * Each card's kind, by placed key. A daemon that builds the tree (`tree`)
+ * sends each card's `kind`, worked out from its own dispatch records, and that
+ * is what is drawn — whichever other cards the dashboard filter shows.
+ *
+ * Fallback for an older daemon, which sends no `kind` (and for a kind this
+ * build does not know): read it off the relations among `cards` — an
+ * orchestrator or a role by its orchestration relation, a dispatcher when
+ * another card in `cards` names it as its dispatcher, otherwise an agent. That
+ * guess sees only the cards it is given, so a dispatcher whose units are all
+ * filtered out reads as an agent there.
  */
-export function cardKinds(cards: readonly PlacedCard[]): Map<string, CardKind> {
+export function cardKinds(cards: readonly PlacedCard[], tree: boolean): Map<string, CardKind> {
   const dispatchers = new Set(cards.flatMap((card) => (card.entry.relations.dispatcher ? [`${card.deckId}\u0000${card.entry.instance_id}\u0000${card.entry.relations.dispatcher.key}`] : [])));
   return new Map(cards.map((card) => {
+    const sent = tree ? CARD_KINDS.find((kind) => kind === card.entry.kind) : undefined;
     const orchestration = card.entry.relations.orchestration;
-    const kind: CardKind = orchestration?.is_orchestrator ? "orchestrator" : dispatchers.has(placedCardKey(card)) ? "dispatcher" : orchestration ? "role" : "agent";
+    const kind: CardKind = sent ?? (orchestration?.is_orchestrator ? "orchestrator" : dispatchers.has(placedCardKey(card)) ? "dispatcher" : orchestration ? "role" : "agent");
     return [placedCardKey(card), kind];
   }));
 }
@@ -157,11 +196,38 @@ export const CARDS_OPEN_STORAGE_KEY = "dot-agent-deck.cards.open";
 /** How many open cards are remembered at most; the newest are kept. */
 const MAX_REMEMBERED_OPEN = 500;
 
-/** The remembered open cards (placed keys); none when nothing usable is stored or storage is unavailable. */
+/** The longest placed key remembered; a longer one is not a key this app wrote. */
+const MAX_OPEN_KEY_LENGTH = 512;
+
+/** The most stored text read back: room for the newest keys at their longest, escaped. */
+const MAX_STORED_OPEN_CHARS = MAX_REMEMBERED_OPEN * (MAX_OPEN_KEY_LENGTH * 6 + 3) + 2;
+
+/** `deck\0instance\0key`: a deck and a key that are not empty, an instance that may be. */
+const OPEN_KEY_SHAPE = /^[^\u0000]+\u0000[^\u0000]*\u0000[^\u0000]+$/;
+
+function isOpenCardKey(value: unknown): value is string {
+  return typeof value === "string" && value.length <= MAX_OPEN_KEY_LENGTH && OPEN_KEY_SHAPE.test(value);
+}
+
+/** At most the newest {@link MAX_REMEMBERED_OPEN} of `open`, in the order they were opened. */
+export function boundOpenCards(open: ReadonlySet<string>): ReadonlySet<string> {
+  return open.size <= MAX_REMEMBERED_OPEN ? open : new Set([...open].slice(-MAX_REMEMBERED_OPEN));
+}
+
+/**
+ * The remembered open cards (placed keys); none when nothing usable is stored
+ * or storage is unavailable. What is read is bounded as what is written is:
+ * stored text longer than any this app writes is ignored whole, an entry that
+ * is not a placed key of a sane length is dropped, and only the newest
+ * {@link MAX_REMEMBERED_OPEN} are kept.
+ */
 export function readOpenCards(): Set<string> {
   try {
-    const parsed: unknown = JSON.parse(window.localStorage.getItem(CARDS_OPEN_STORAGE_KEY) ?? "[]");
-    return new Set(Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string") : []);
+    const raw = window.localStorage.getItem(CARDS_OPEN_STORAGE_KEY);
+    if (raw === null || raw.length > MAX_STORED_OPEN_CHARS) return new Set();
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return new Set();
+    return new Set(parsed.filter(isOpenCardKey).slice(-MAX_REMEMBERED_OPEN));
   } catch {
     return new Set();
   }
@@ -170,22 +236,22 @@ export function readOpenCards(): Set<string> {
 /** Remember `open`; a storage that refuses the write keeps the choice for this session only. */
 export function writeOpenCards(open: ReadonlySet<string>): void {
   try {
-    window.localStorage.setItem(CARDS_OPEN_STORAGE_KEY, JSON.stringify([...open].slice(-MAX_REMEMBERED_OPEN)));
+    window.localStorage.setItem(CARDS_OPEN_STORAGE_KEY, JSON.stringify([...open].filter(isOpenCardKey).slice(-MAX_REMEMBERED_OPEN)));
   } catch {
     // Unavailable or full storage: the open cards still apply until the window closes.
   }
 }
 
 /**
- * The open cards worth remembering: for a deck whose cards are on screen, only
- * those its daemon still lists (a card that closed, or a daemon that was
- * replaced, drops them); a deck not on screen keeps what it had, since it may
- * only be disconnected for now. `listed` is every deck's placed cards.
+ * The open cards worth remembering: for a deck whose daemon answered with its
+ * cards (`answering`, by deck id — an answer with no cards included), only
+ * those it still lists (a card that closed, or a daemon that was replaced,
+ * drops them); a deck that did not answer keeps what it had, since it may only
+ * be disconnected for now. `listed` is every answering deck's placed cards.
  */
-export function pruneOpenCards(open: ReadonlySet<string>, listed: readonly PlacedCard[]): ReadonlySet<string> {
-  const decks = new Set(listed.map((card) => card.deckId));
+export function pruneOpenCards(open: ReadonlySet<string>, listed: readonly PlacedCard[], answering: ReadonlySet<string>): ReadonlySet<string> {
   const keys = new Set(listed.map(placedCardKey));
-  const kept = [...open].filter((key) => !decks.has(key.split("\u0000")[0]) || keys.has(key));
+  const kept = [...open].filter((key) => !answering.has(key.split("\u0000")[0]) || keys.has(key));
   return kept.length === open.size ? open : new Set(kept);
 }
 
@@ -220,7 +286,14 @@ function referenceName(ref: AgentCardCheckedRef): string {
   return ref.number !== undefined ? `#${ref.number}` : ref.claim;
 }
 
-/** `https://github.com/<owner>/<repo>/issues/<number>` and nothing else — the same rule as `pr_browser::is_issue_url`. */
+/**
+ * Whether `value` is a github.com issue page this app opens: exactly
+ * `https://github.com/<owner>/<repo>/issues/<number>`, the number 1 or more
+ * with no leading zero, and at most a trailing `/` after it. No other segment,
+ * no query and no fragment; no login and no port other than the default (an
+ * explicit `:443` is the same address, and URL parsing drops it). The same
+ * rule as `pr_browser::is_issue_url`.
+ */
 export function isIssueUrl(value: string): boolean {
   let url: URL;
   try {
@@ -229,8 +302,8 @@ export function isIssueUrl(value: string): boolean {
     return false;
   }
   if (url.protocol !== "https:" || url.hostname.toLowerCase() !== "github.com" || url.port !== "" || url.username !== "" || url.password !== "") return false;
-  const [owner, repo, issues, number] = url.pathname.split("/").slice(1);
-  return Boolean(owner) && Boolean(repo) && issues === "issues" && /^[0-9]+$/.test(number ?? "");
+  if (url.search !== "" || url.hash !== "" || value.includes("?") || value.includes("#")) return false;
+  return /^\/[^/]+\/[^/]+\/issues\/[1-9][0-9]*\/?$/.test(url.pathname);
 }
 
 /** The address a checked reference opens, when it is a github.com pull request or issue page. */

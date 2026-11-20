@@ -1,6 +1,8 @@
 import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureFleet, createFixtureStartedAgent, FIXTURE_DAEMON_ID } from "../data/fixture";
+import { isIssueUrl, referenceUrl } from "../lib/agentCardsTree";
+import { clearDashboardFilter, setDashboardFilter } from "../lib/dashboardFilter";
 import { OpenCardReference } from "../lib/prBrowser";
 import { DEFAULT_DESKTOP_FEATURES, type AgentCardCheckedRef, type AgentCardEntry, type AgentCardsSnapshot, type DeckFleet, type DeckRuntimeState } from "../types";
 import { AgentOverview } from "./AgentOverview";
@@ -164,9 +166,13 @@ beforeEach(() => {
   openReference.mockClear();
 });
 afterEach(() => {
+  act(() => setDashboardFilter(clearDashboardFilter()));
   vi.restoreAllMocks();
   window.localStorage.clear();
 });
+
+/** A placed key as the open cards are remembered under: deck, daemon instance, card key. */
+const placed = (card: AgentCardEntry, instance = INSTANCE) => `${FIXTURE_DAEMON_ID}\u0000${instance}\u0000${card.key}`;
 
 describe("desktop/agent-cards — the Cards tree (issue #2418)", () => {
   /// Scenario: open the Cards view on a daemon list whose entries carry parent links. Only the three roots show; opening the dispatcher shows exactly its two children in the daemon's order, opening the orchestrator under it shows its two roles one level deeper, and closing the dispatcher takes its whole tree off screen.
@@ -335,6 +341,34 @@ describe("desktop/agent-cards — the Cards tree (issue #2418)", () => {
     expect(TREE.filter((card) => document.querySelector(`article[data-card-key="${card.key}"]`) !== null).filter(faded)).toEqual([]);
   });
 
+  /// Scenario: with Needs you only on, close triage's tree, then the daemon sends a list in which a new card under solo and a new card one level under the open dispatcher's unit need the user. Solo's and the unit's trees open on their own and both new cards are bright, while triage stays closed because nothing under it newly needs the user; then close the orchestrator and the coder under it comes to need the user, and the orchestrator opens again.
+  it("desktop/agent-cards/015: while Needs you only is on, a card that comes to need you has the way to it opened", () => {
+    const view = cardsView();
+    fireEvent.click(screen.getByTestId("agent-cards-needs-you-filter"));
+    fireEvent.click(toggle(TRIAGE));
+    expect(toggle(TRIAGE).getAttribute("aria-expanded")).toBe("false");
+
+    const late = entry("9", "late", { parent: SOLO.key, status: "waiting_for_input", needs_you: true, needs_you_reasons: ["native_question"] });
+    const deep = entry("10", "deep", { parent: UNIT.key, status: "blocked", needs_you: true, needs_you_reasons: ["blocked"], relations: { dispatcher: { key: UNIT.key, name: "unit" } } });
+    const solo = { ...SOLO, revision: 2, rollup: { total: 1, worst: "waiting_for_input", counts: { waiting_for_input: 1 }, needs_you: 1 } };
+    const unit = { ...UNIT, revision: 2, rollup: { total: 1, worst: "blocked", counts: { blocked: 1 }, needs_you: 1 } };
+    const grown = [QUEUE, LEAD, CODER, TESTER, unit, deep, solo, late, TRIAGE, STUCK];
+    act(() => view.update(runtime(grown)));
+    expect(toggle(SOLO).getAttribute("aria-expanded")).toBe("true");
+    expect(toggle(UNIT).getAttribute("aria-expanded")).toBe("true");
+    expect(cardOf(late.key).getAttribute("data-faded")).toBeNull();
+    expect(cardOf(deep.key).getAttribute("data-faded")).toBeNull();
+    // Nothing under triage newly needs the user: the user's close stands.
+    expect(toggle(TRIAGE).getAttribute("aria-expanded")).toBe("false");
+
+    fireEvent.click(toggle(LEAD));
+    expect(document.querySelector(`article[data-card-key="${CODER.key}"]`)).toBeNull();
+    const coder = { ...CODER, revision: 2, status: "waiting_for_input", needs_you: true, needs_you_reasons: ["native_question"] };
+    act(() => view.update(runtime([QUEUE, LEAD, coder, TESTER, unit, deep, solo, late, TRIAGE, STUCK])));
+    expect(toggle(LEAD).getAttribute("aria-expanded")).toBe("true");
+    expect(cardOf(CODER.key).getAttribute("data-faded")).toBeNull();
+  });
+
   /// Scenario: open the dispatcher's tree, then render the dashboard again. The open card is remembered under `dot-agent-deck.cards.open`, keyed by deck, daemon instance and card key, and comes back open; a remembered key this daemon no longer lists is pruned; a storage that throws shows every tree closed without an error.
   it("desktop/agent-cards/016: open trees are remembered per client, pruned, and a broken storage falls back to closed", () => {
     const first = cardsView();
@@ -376,6 +410,59 @@ describe("desktop/agent-cards — the Cards tree (issue #2418)", () => {
     setItem.mockRestore();
   });
 
+  /// Scenario: put hostile or stale values under `dot-agent-deck.cards.open` and open the Cards view each time. Only the newest 500 entries are read, text longer than the app ever writes is ignored whole, malformed JSON, non-strings, overlong keys and keys of the wrong shape are dropped, a key of a replaced daemon instance is forgotten, and a deck that answers with no cards forgets its keys while a deck that is not answering keeps them.
+  it("desktop/agent-cards/016: what is read back is bounded and checked, and an answering deck with no cards is pruned", () => {
+    const queue = placed(QUEUE);
+    const others = Array.from({ length: 500 }, (_, at) => `other-deck\u0000other-instance\u0000pane-${at}/${at}`);
+    const shownOpen = (stored: string, entries: AgentCardEntry[] = TREE) => {
+      window.localStorage.setItem(OPEN_KEY, stored);
+      const view = cardsView(runtime(entries));
+      const open = entries.includes(QUEUE) ? toggle(QUEUE).getAttribute("aria-expanded") === "true" : false;
+      return { open, view };
+    };
+    const storedNow = () => JSON.parse(window.localStorage.getItem(OPEN_KEY) ?? "[]") as unknown[];
+
+    // Only the newest 500 are read: the oldest goes.
+    let run = shownOpen(JSON.stringify([queue, ...others]));
+    expect(run.open, "the 501st-newest key is not read").toBe(false);
+    run.view.unmount();
+    run = shownOpen(JSON.stringify([...others, queue]));
+    expect(run.open, "the newest key is read").toBe(true);
+    run.view.unmount();
+
+    // Stored text longer than the app ever writes is ignored whole.
+    run = shownOpen(JSON.stringify([queue, "x".repeat(2_000_000)]));
+    expect(run.open).toBe(false);
+    run.view.unmount();
+
+    // Malformed JSON reads as nothing open, without an error.
+    run = shownOpen("[not json");
+    expect(run.open).toBe(false);
+    run.view.unmount();
+
+    // Non-strings, an overlong key and keys of the wrong shape are dropped; the valid key stays.
+    const overlong = `other-deck\u0000other-instance\u0000${"p".repeat(600)}`;
+    run = shownOpen(JSON.stringify([42, { key: queue }, null, overlong, "no-separators", "other-deck\u0000x", queue]));
+    expect(run.open).toBe(true);
+    fireEvent.click(toggle(TRIAGE));
+    expect(storedNow()).toEqual([queue, placed(TRIAGE)]);
+    run.view.unmount();
+
+    // A replaced daemon instance's keys are forgotten.
+    window.localStorage.clear();
+    run = shownOpen(JSON.stringify([placed(QUEUE, "old-instance"), queue]));
+    expect(run.open).toBe(true);
+    expect(storedNow()).toEqual([queue]);
+    run.view.unmount();
+
+    // A deck that answers with no cards forgets its keys; another deck's stay.
+    window.localStorage.clear();
+    const otherDeck = others[0];
+    run = shownOpen(JSON.stringify([queue, otherDeck]), []);
+    expect(storedNow()).toEqual([otherDeck]);
+    run.view.unmount();
+  });
+
   /// Scenario: open the Cards view on a daemon older than the app, which does not advertise the tree. Every card it lists is a root in its order, none has a toggle or a roll-up, and one line says the deck's daemon is older than the app.
   it("desktop/agent-cards/017: an older daemon's cards are all roots, with no roll-ups, and a note says why", () => {
     cardsView(runtime(TREE, { tree: false }));
@@ -384,5 +471,123 @@ describe("desktop/agent-cards — the Cards tree (issue #2418)", () => {
     expect(screen.queryAllByTestId("agent-card-rollup")).toHaveLength(0);
     expect(screen.queryAllByTestId("agent-card-ref")).toHaveLength(0);
     expect(screen.getByTestId("agent-cards-older-daemon").textContent).toMatch(/older than (this|the) app/);
+  });
+
+  /// Scenario: open the Cards view while the deck has no cards, then the daemon lists some. The grid is laid out for the frame's width as soon as the cards appear, and again when the frame is resized; the dashboard filter then hides every card and is cleared, and the grid is measured afresh for the new width and keeps following resizes.
+  it("desktop/agent-cards/020: the grid measures its frame whenever cards appear, including after a filter emptied it", () => {
+    let frameWidth = 900;
+    const observers: { callback: () => void; targets: Element[]; disconnected: boolean }[] = [];
+    const realObserver = globalThis.ResizeObserver;
+    globalThis.ResizeObserver = class {
+      private readonly record: { callback: () => void; targets: Element[]; disconnected: boolean };
+      constructor(callback: () => void) {
+        this.record = { callback, targets: [], disconnected: false };
+        observers.push(this.record);
+      }
+      observe(target: Element) { this.record.targets.push(target); }
+      unobserve() { /* not used by the grid */ }
+      disconnect() { this.record.disconnected = true; }
+    } as unknown as typeof ResizeObserver;
+    const descriptor = Object.getOwnPropertyDescriptor(Element.prototype, "clientWidth");
+    Object.defineProperty(HTMLElement.prototype, "clientWidth", {
+      configurable: true,
+      get(this: HTMLElement) { return this.classList.contains("agent-cards-deck") ? frameWidth : 0; },
+    });
+    try {
+      const columns = () => (screen.getAllByTestId("agent-cards-roots")[0] as HTMLElement).style.gridTemplateColumns;
+      const resize = (next: number) => {
+        frameWidth = next;
+        const frame = document.querySelector(".agent-cards-deck");
+        const live = observers.filter((observer) => !observer.disconnected && observer.targets.includes(frame as Element));
+        expect(live.length, "the frame on screen is watched").toBeGreaterThan(0);
+        act(() => live.forEach((observer) => observer.callback()));
+      };
+
+      const view = cardsView(runtime([]));
+      expect(document.querySelector(".agent-cards-deck")).toBeNull();
+      act(() => view.update(runtime(TREE)));
+      expect(columns()).toBe("repeat(3, minmax(0px, 224px))");
+      resize(500);
+      expect(columns()).toBe("repeat(2, minmax(0px, 224px))");
+
+      act(() => setDashboardFilter({ ...clearDashboardFilter(), text: "zz-matches-no-agent" }));
+      expect(document.querySelector(".agent-cards-deck")).toBeNull();
+      frameWidth = 1200;
+      act(() => setDashboardFilter(clearDashboardFilter()));
+      expect(columns()).toBe("repeat(5, minmax(0px, 224px))");
+      resize(300);
+      expect(columns()).toBe("repeat(1, minmax(0px, 224px))");
+    } finally {
+      globalThis.ResizeObserver = realObserver;
+      if (descriptor) Object.defineProperty(HTMLElement.prototype, "clientWidth", { configurable: true, get: descriptor.get });
+      else delete (HTMLElement.prototype as unknown as Record<string, unknown>).clientWidth;
+    }
+  });
+
+  /// Scenario: the daemon sends each card's kind. A dispatcher whose only unit the dashboard filter hides still reads "dispatcher", as does one the daemon names a dispatcher with no unit listed at all; against an older daemon, which sends no kind, the app reads the kind off the cards on screen instead.
+  it("desktop/agent-cards/021: a card's kind is the daemon's, whatever the dashboard filter shows", () => {
+    const boss = entry("1", "boss-dispatcher", { kind: "dispatcher", rollup: { total: 1, worst: "working", counts: { working: 1 }, needs_you: 0 } });
+    const worker = entry("2", "worker-unit", { kind: "agent", parent: boss.key, status: "working", relations: { dispatcher: { key: boss.key, name: "boss-dispatcher" } } });
+    const lone = entry("3", "lone-dispatcher", { kind: "dispatcher" });
+    const kindOf = (card: AgentCardEntry) => within(cardOf(card.key)).getByTestId("agent-card-kind").textContent;
+    const view = cardsView(runtime([boss, worker, lone]));
+    expect(kindOf(boss)).toBe("dispatcher");
+    expect(kindOf(lone)).toBe("dispatcher");
+    act(() => setDashboardFilter({ ...clearDashboardFilter(), text: "dispatcher" }));
+    expect(document.querySelector(`article[data-card-key="${worker.key}"]`), "the filter hides the unit").toBeNull();
+    expect(kindOf(boss)).toBe("dispatcher");
+    expect(kindOf(lone)).toBe("dispatcher");
+    act(() => setDashboardFilter(clearDashboardFilter()));
+
+    // An older daemon sends no kind (the app drops what it did not vouch for): the relations on screen decide.
+    act(() => view.update(runtime([boss, worker, lone], { tree: false })));
+    expect(kindOf(boss)).toBe("dispatcher");
+    expect(kindOf(lone)).toBe("agent");
+  });
+
+  /// Scenario: a malformed list links two cards to each other, both remembered open, one needing the user. The view draws each card once, the first as the root and the other under it, and Needs you only works on it without looping.
+  it("desktop/agent-cards/022: a cyclic list is drawn once, with persisted open cards and Needs you only", () => {
+    const first = entry("1", "first-loop", { parent: key("2"), status: "waiting_for_input", needs_you: true, needs_you_reasons: ["native_question"], rollup: { total: 1, worst: "idle", counts: { idle: 1 }, needs_you: 0 } });
+    const second = entry("2", "second-loop", { parent: key("1"), rollup: { total: 1, worst: "waiting_for_input", counts: { waiting_for_input: 1 }, needs_you: 1 } });
+    window.localStorage.setItem(OPEN_KEY, JSON.stringify([placed(first), placed(second)]));
+    cardsView(runtime([first, second]));
+    expect(roots()).toEqual([first.key]);
+    expect(shownKeys()).toEqual([first.key, second.key]);
+    fireEvent.click(screen.getByTestId("agent-cards-needs-you-filter"));
+    expect(shownKeys()).toEqual([first.key, second.key]);
+    expect(cardOf(first.key).getAttribute("data-faded")).toBeNull();
+    fireEvent.click(toggle(first));
+    fireEvent.click(toggle(first));
+    expect(shownKeys()).toEqual([first.key, second.key]);
+  });
+
+  /// Scenario: ask which addresses an issue badge may open. Only a github.com issue's own page by its number, with at most a trailing slash, opens; a page under it, a query, a fragment, number 0 or a leading zero, another site, plain http, a login or another port does not; an explicit :443 is the same address and does.
+  it("desktop/agent-cards/023: an issue badge opens only an issue's own numbered page", () => {
+    for (const good of [
+      "https://github.com/o/r/issues/1",
+      "https://github.com/vfarcic/dot-agent-deck/issues/2418",
+      "https://github.com/o/r/issues/3/",
+      "https://github.com:443/o/r/issues/3",
+    ]) {
+      expect(isIssueUrl(good), good).toBe(true);
+      expect(referenceUrl({ url: good }), good).toBe(good);
+    }
+    for (const bad of [
+      "https://github.com/o/r/issues/1/anything",
+      "https://github.com/o/r/issues/1?return_to=https://example.com",
+      "https://github.com/o/r/issues/1?",
+      "https://github.com/o/r/issues/1#issuecomment-1",
+      "https://github.com/o/r/issues/0",
+      "https://github.com/o/r/issues/01",
+      "https://github.com/o/r/issues",
+      "https://github.com/o/r/issues/abc",
+      "https://github.com/o/r/pull/1",
+      "https://github.com.evil.example/o/r/issues/1",
+      "http://github.com/o/r/issues/1",
+      "https://user:pass@github.com/o/r/issues/1",
+      "https://github.com:8443/o/r/issues/1",
+    ]) {
+      expect(isIssueUrl(bad), bad).toBe(false);
+    }
   });
 });

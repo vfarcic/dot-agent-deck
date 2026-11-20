@@ -1584,7 +1584,16 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     return <AgentCardsDeckBody deckId={deckId} cards={shown} tree={cards.treeFor(deckId)} openCards={cards.openCards} needsYouOnly={cards.needsYouOnly} controls={cards.controls} results={cards.resultsFor} />;
   };
   const openCardReference = useContext(OpenCardReference);
-  const cards = useAgentCardsView({ runtime, decks: cardDeckList, openAgent: openCardAgent, openReference: openCardReference });
+  /* Issue #2418 — whether the dashboard filter keeps a card off the Cards
+     view, so a spoken open of its tree can say so. */
+  const cardHiddenByFilter = useMemo(() => {
+    if (!filtering) return undefined;
+    return (card: PlacedCard) => {
+      const deck = decks.find((candidate) => candidate.snapshot.connection.deckId === card.deckId);
+      return deck !== undefined && !cardMatchesFilter(card, deck.matchingAgents);
+    };
+  }, [decks, filtering]);
+  const cards = useAgentCardsView({ runtime, decks: cardDeckList, openAgent: openCardAgent, openReference: openCardReference, hiddenByFilter: cardHiddenByFilter });
   const [confirm, setConfirm] = useState<ConfirmState>();
   /* The confirmation on screen as of the last render, read by an answer that
      arrives after it: a Generate config the user dismissed with No must not

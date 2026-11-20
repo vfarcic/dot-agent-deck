@@ -1020,6 +1020,19 @@ const TREE_SCENE: readonly TreeSceneCard[] = [
   ] },
 ];
 
+/**
+ * Issue #2418 review — the `cards=tree-nested` scene: a root whose only child
+ * has nine cards under it, so that child's level is wider than the frame at
+ * every width the browser tier uses, and
+ * one plain root beside it.
+ */
+const TREE_NESTED_SCENE: readonly TreeSceneCard[] = [
+  { name: "deep-queue", status: "idle", kind: "dispatcher", children: [
+    { name: "prd-2400", status: "working", kind: "orchestrator", children: ["one", "two", "three", "four", "five", "six", "seven", "eight", "nine"].map((name) => ({ name, status: "working", kind: "role" as const })) },
+  ] },
+  { name: "scratch", status: "idle", kind: "agent" },
+];
+
 /** The card statuses from the most severe down, as the daemon orders a roll-up's worst. */
 const TREE_SCENE_SEVERITY = ["waiting_for_input", "blocked", "error", "waiting", "working", "thinking", "compacting", "idle", "stopped", "unknown"];
 
@@ -1030,7 +1043,7 @@ const TREE_SCENE_SEVERITY = ["waiting_for_input", "blocked", "error", "waiting",
  * roles — linked and summed up as a daemon that builds the tree sends them.
  * The browser tier lays it out at every width.
  */
-export function treeAgentCards(): AgentCardsSnapshot {
+export function treeAgentCards(scene: "tree" | "tree-nested" = "tree"): AgentCardsSnapshot {
   const entries: AgentCardEntry[] = [];
   let next = 100;
   const add = (card: TreeSceneCard, parent: string | undefined, dispatcher: { key: string; name: string } | undefined, orchestration: string | undefined): AgentCardEntry[] => {
@@ -1041,7 +1054,7 @@ export function treeAgentCards(): AgentCardsSnapshot {
       ...(dispatcher && card.kind !== "role" ? { dispatcher } : {}),
       ...(card.kind === "orchestrator" || card.kind === "role" ? { orchestration: { id: `o-${orchestration ?? card.name}`, label: orchestration ?? card.name, role: card.kind === "orchestrator" ? "lead" : card.name, is_orchestrator: card.kind === "orchestrator" } } : {}),
     };
-    const entry = docsCard(id, card.name, { status: card.status, needs_you: card.needsYou === true, needs_you_reasons: card.needsYou ? ["waiting"] : [], relations, ...(parent ? { parent } : {}) });
+    const entry = docsCard(id, card.name, { status: card.status, needs_you: card.needsYou === true, needs_you_reasons: card.needsYou ? ["waiting"] : [], relations, kind: card.kind, ...(parent ? { parent } : {}) });
     entries.push(entry);
     const below = (card.children ?? []).flatMap((child) => add(child, key, card.kind === "dispatcher" ? { key, name: card.name } : undefined, card.kind === "orchestrator" ? card.name : orchestration));
     if (below.length) {
@@ -1052,7 +1065,7 @@ export function treeAgentCards(): AgentCardsSnapshot {
     }
     return [entry, ...below];
   };
-  for (const root of TREE_SCENE) add(root, undefined, undefined, undefined);
+  for (const root of scene === "tree-nested" ? TREE_NESTED_SCENE : TREE_SCENE) add(root, undefined, undefined, undefined);
   return { deckId: FIXTURE_DAEMON_ID, instanceId: DOCS_CARDS_INSTANCE, revision: 1, entries, catalogErrors: [], tree: true };
 }
 

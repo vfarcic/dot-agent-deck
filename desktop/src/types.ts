@@ -840,6 +840,12 @@ export interface AgentCardEntry {
    * (`AgentCardsSnapshot.tree`).
    */
   parent?: string | null;
+  /**
+   * Issue #2418 — what the card is, as the daemon worked it out from its own
+   * records: `dispatcher`, `orchestrator`, `role` or `agent`. Sent with the
+   * tree only; absent from an older daemon.
+   */
+  kind?: string | null;
   /** Issue #2418 — what is under this card, as the daemon summed it up; absent when nothing is. */
   rollup?: AgentCardRollup | null;
   /** Issue #2418 — the pull requests and issues the agent reported, each beside the deck's own check of it. */

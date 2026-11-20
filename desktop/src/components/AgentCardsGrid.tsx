@@ -1,5 +1,5 @@
 import { BellRing } from "lucide-react";
-import { useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useLayoutEffect, useMemo, useState } from "react";
 
 import { placedCardKey, type CardResults, type PlacedCard } from "../lib/agentCards";
 import { cardKinds, cardTree, needsYouPath, type CardNode } from "../lib/agentCardsTree";
@@ -44,17 +44,23 @@ const CARD_WIDTH = 224;
 const CARD_GAP = 12;
 const SLOT = CARD_WIDTH + CARD_GAP;
 
-/** The cards under one card, as a level of the tree, each opening further to any depth. */
-function TreeLevel({ nodes, depth, top, view }: { nodes: readonly CardNode[]; depth: number; top?: boolean; view: TreeView }) {
+/**
+ * The cards under one card, as a level of the tree, each opening further to
+ * any depth. `above` is every card on the way down to this level: a card met
+ * again below itself is not drawn, so even a cyclic list cannot recurse.
+ */
+function TreeLevel({ nodes, depth, top, view, above }: { nodes: readonly CardNode[]; depth: number; top?: boolean; view: TreeView; above: ReadonlySet<string> }) {
+  const shown = nodes.filter((node) => !above.has(placedCardKey(node.card)));
+  if (shown.length === 0) return null;
   return (
     <ul className={`agent-cards-tree-level${top ? " is-top" : ""}`}>
-      {nodes.map((node) => {
+      {shown.map((node) => {
         const key = placedCardKey(node.card);
         const open = node.children.length > 0 && view.openCards.has(key);
         return (
           <li key={key}>
             <AgentCard card={node.card} controls={view.controls} results={view.results?.(node.card)} place={view.place(node, depth, open)} />
-            {open && <TreeLevel nodes={node.children} depth={depth + 1} view={view} />}
+            {open && <TreeLevel nodes={node.children} depth={depth + 1} view={view} above={new Set([...above, key])} />}
           </li>
         );
       })}
@@ -78,6 +84,14 @@ interface TreeView {
  * root runs from the root down to its own tree, going around the trees above
  * it on the right. Measured from the DOM after every render and written
  * straight onto it, so the roots' own boxes are never touched.
+ *
+ * A tree wider than the frame scrolls inside its block. Its first level joins
+ * the root's line at the level's middle — the first card itself when it is
+ * the only one, else the rail over the cards — so the line ends there, where
+ * the block's scroll has put it. When the block first overflows (or its width
+ * changes) it is scrolled to put that point in the middle; a later scroll
+ * lays the row out again, and while the point is scrolled out of view the
+ * line ends at the block's nearer edge, inside the frame.
  */
 function layoutRow(row: HTMLElement) {
   const grid = row.querySelector<HTMLElement>(":scope > .agent-cards-roots");
@@ -95,17 +109,27 @@ function layoutRow(row: HTMLElement) {
   const placed = bands.map((band) => {
     const block = band.querySelector<HTMLElement>(":scope > .agent-cards-block");
     const col = Number(band.dataset.col ?? 0);
-    if (!block) return { band, col, width: 0, left: 0 };
+    if (!block) return { band, col, width: 0, left: 0, attach: 0 };
     block.style.maxWidth = `${room}px`;
     const width = block.offsetWidth;
     const left = Math.max(0, Math.min(col * SLOT, room - width));
     block.style.marginLeft = `${left}px`;
-    return { band, col, width, left };
+    const level = block.querySelector<HTMLElement>(":scope > .agent-cards-tree-level");
+    const overflow = block.scrollWidth - block.clientWidth;
+    if (overflow > 0.5 && block.dataset.centredFor !== `${block.scrollWidth}/${block.clientWidth}`) {
+      block.dataset.centredFor = `${block.scrollWidth}/${block.clientWidth}`;
+      block.scrollLeft = level ? level.offsetLeft + level.offsetWidth / 2 - block.clientWidth / 2 : overflow / 2;
+    } else if (overflow <= 0.5) delete block.dataset.centredFor;
+    if (!block.onscroll) block.onscroll = () => layoutRow(row);
+    // Where the first level joins the line, in the block's own box, after its scroll.
+    const middle = level ? level.offsetLeft + level.offsetWidth / 2 - block.scrollLeft : width / 2;
+    const attach = left + Math.max(0, Math.min(width, middle));
+    return { band, col, width, left, attach };
   });
   const paths = placed.map((place, k) => {
     const pad = k === 0 ? firstPad : 22;
     const rootX = place.col * SLOT + CARD_WIDTH / 2;
-    const blockX = place.left + place.width / 2;
+    const blockX = place.attach;
     const top = place.band.offsetTop + pad;
     const elbowY = top - 7;
     const above = placed.slice(0, k);
@@ -150,24 +174,27 @@ export function AgentCardsDeckBody({ deckId, cards, tree, openCards, needsYouOnl
   /** The last answer to each action pressed on a card, to show under its primary button. */
   results?: (card: PlacedCard) => CardResults;
 }) {
-  const frame = useRef<HTMLDivElement>(null);
+  /* The frame as a state, set by its ref: it is not mounted while there are
+     no cards to show, so measuring follows it in and out — a deck that starts
+     empty, or that the dashboard filter empties and restores, is measured
+     (and watched for resizes) from the moment its frame appears. */
+  const [frame, setFrame] = useState<HTMLDivElement | null>(null);
   const [width, setWidth] = useState(0);
   const roots = useMemo(() => cardTree(cards, tree), [cards, tree]);
-  const kinds = useMemo(() => cardKinds(cards), [cards]);
+  const kinds = useMemo(() => cardKinds(cards, tree), [cards, tree]);
   const path = useMemo(() => (needsYouOnly ? needsYouPath(roots).path : undefined), [needsYouOnly, roots]);
   useLayoutEffect(() => {
-    const node = frame.current;
-    if (!node) return undefined;
-    const measure = () => setWidth(node.clientWidth);
+    if (!frame) return undefined;
+    const measure = () => setWidth(frame.clientWidth);
     measure();
     if (typeof ResizeObserver === "undefined") return undefined;
     const observer = new ResizeObserver(measure);
-    observer.observe(node);
+    observer.observe(frame);
     return () => observer.disconnect();
-  }, []);
+  }, [frame]);
   /* Every render may move what is under a row: lay each row out again. */
   useLayoutEffect(() => {
-    frame.current?.querySelectorAll<HTMLElement>(":scope > .agent-cards-rows > .agent-cards-row").forEach(layoutRow);
+    frame?.querySelectorAll<HTMLElement>(":scope > .agent-cards-rows > .agent-cards-row").forEach(layoutRow);
   });
   if (cards.length === 0) return null;
   const columns = Math.max(1, Math.floor((width + CARD_GAP) / SLOT));
@@ -187,7 +214,7 @@ export function AgentCardsDeckBody({ deckId, cards, tree, openCards, needsYouOnl
     }),
   };
   return (
-    <div className="agent-cards-deck" ref={frame} data-testid={`agent-cards-deck-${domIdentity(deckId)}`}>
+    <div className="agent-cards-deck" ref={setFrame} data-testid={`agent-cards-deck-${domIdentity(deckId)}`}>
       {!tree && <p className="agent-cards-note" data-testid="agent-cards-older-daemon">This daemon is older than the app, so its cards are shown side by side rather than as a tree.</p>}
       <div className="agent-cards-rows" data-testid="agent-cards-tree">
         {rows.map((row) => {
@@ -204,7 +231,7 @@ export function AgentCardsDeckBody({ deckId, cards, tree, openCards, needsYouOnl
               {opened.map(({ node, col }) => (
                 <div className="agent-cards-band" key={placedCardKey(node.card)} data-testid="agent-cards-band" data-root-key={node.card.entry.key} data-col={col}>
                   <div className="agent-cards-block" aria-label={`Agents under ${displayText(node.card.entry.name, DISPLAY_LIMITS.name)}`}>
-                    <TreeLevel nodes={node.children} depth={1} top view={view} />
+                    <TreeLevel nodes={node.children} depth={1} top view={view} above={new Set([placedCardKey(node.card)])} />
                   </div>
                 </div>
               ))}
