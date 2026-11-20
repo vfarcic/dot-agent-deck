@@ -4554,6 +4554,19 @@ pub struct AgentRecord {
     /// Additive and optional, as [`Self::input_held`] is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_discarded: Option<crate::inbox_display::InputDiscarded>,
+    /// PRD #2119: whether [`Self::cwd`] holds a `.dot-agent-deck.toml` of its
+    /// own — a regular file or a symbolic link (a dangling one included) at
+    /// that exact directory, not one a walk up the tree would discover, and
+    /// not a directory of that name ([`crate::config_gen::existing_config`]).
+    /// Stamped at the wire boundary by [`attach_project_config_exists`], off
+    /// the async runtime and bounded, so each listing reads the disk as it is
+    /// then. `None` when the record has no cwd, when the check did not finish
+    /// in time or could not tell (a lookup error other than "not found"), or
+    /// from a daemon predating the field: clients then keep
+    /// today's Generate wording. Additive and optional, so no
+    /// `PROTOCOL_VERSION` bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_config_exists: Option<bool>,
 }
 
 impl AgentRecord {
@@ -4605,6 +4618,45 @@ pub fn attach_prompt_keys(records: &mut [AgentRecord]) {
         record.prompt_keys = record
             .reported_agent_type()
             .and_then(|agent_type| crate::agent_registry::spec(agent_type).prompt_keys.clone());
+    }
+}
+
+/// PRD #2119: stamp each record's [`AgentRecord::project_config_exists`] from
+/// the disk now. Unconditional: a record without a cwd reports unknown rather
+/// than keeping what a caller had put there.
+///
+/// The checks run off the async runtime, one per distinct directory, behind
+/// the config checks' own bound and [`crate::config_gen::CONFIG_CHECK_TIMEOUT`]
+/// ([`crate::config_gen::project_config_flags`]). A directory whose check did
+/// not finish in time, an unavailable mount for instance, or still has one
+/// outstanding from an earlier listing, reports unknown for this listing
+/// rather than holding the reply. Call it holding no registry or `AppState`
+/// lock.
+pub async fn attach_project_config_exists(records: &mut [AgentRecord]) {
+    attach_project_config_flags(records, crate::config_gen::project_config_flags).await;
+}
+
+/// [`attach_project_config_exists`] with the batch check passed in, so a test
+/// can bound it differently.
+pub(crate) async fn attach_project_config_flags<F, Fut>(records: &mut [AgentRecord], check: F)
+where
+    F: FnOnce(Vec<String>) -> Fut,
+    Fut: std::future::Future<Output = Vec<Option<bool>>>,
+{
+    let mut dirs: Vec<String> = records.iter().filter_map(|r| r.cwd.clone()).collect();
+    dirs.sort();
+    dirs.dedup();
+    let flags = check(dirs.clone()).await;
+    let answers: std::collections::HashMap<String, Option<bool>> = if flags.len() == dirs.len() {
+        dirs.into_iter().zip(flags).collect()
+    } else {
+        std::collections::HashMap::new()
+    };
+    for record in records {
+        record.project_config_exists = record
+            .cwd
+            .as_deref()
+            .and_then(|cwd| answers.get(cwd).copied().flatten());
     }
 }
 
@@ -18707,6 +18759,7 @@ impl AgentPtyRegistry {
             inbox: None,
             input_held: None,
             input_discarded: None,
+            project_config_exists: None,
         }
     }
 
@@ -19094,6 +19147,7 @@ impl AgentPtyRegistry {
                 inbox: None,
                 input_held: None,
                 input_discarded: None,
+                project_config_exists: None,
             })
             .collect();
         records.sort_by_key(|r| r.id.parse::<u64>().unwrap_or(0));
@@ -26427,6 +26481,7 @@ mod spawn_tests {
         AgentRecord {
             input_held: None,
             input_discarded: None,
+            project_config_exists: None,
             id: "1".into(),
             pane_id_env: None,
             display_name: None,
@@ -26677,6 +26732,7 @@ mod spawn_tests {
             inbox: None,
             input_held: None,
             input_discarded: None,
+            project_config_exists: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -32048,6 +32104,7 @@ mod spawn_tests {
             inbox: None,
             input_held: None,
             input_discarded: None,
+            project_config_exists: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();

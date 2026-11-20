@@ -48,7 +48,7 @@ export const FIXTURE_UNREACHABLE_DAEMON_ID = "ci@runner-7";
 export const FIXTURE_PENDING_DAEMON_ID = "ops@edge-3";
 
 /** Which scenario `createFixtureFleet` builds; selected by `?state=`. */
-export type FixtureState = "connected" | "disconnected" | "error" | "empty" | "crowded" | "fleet" | "docs" | "docs-pr" | "docs-fleet" | "voice-pages" | "upgrade" | "upgrade-error" | "hook-notice" | "docs-question" | "docs-restart";
+export type FixtureState = "connected" | "disconnected" | "error" | "empty" | "crowded" | "fleet" | "docs" | "docs-pr" | "docs-generate" | "docs-fleet" | "voice-pages" | "upgrade" | "upgrade-error" | "hook-notice" | "docs-question" | "docs-restart";
 
 /**
  * PRD #1487 M5 — the versions the `upgrade` scenarios play: this app's, and the
@@ -1397,6 +1397,16 @@ export function createFixtureSnapshot(state: FixtureState = "connected"): DeckSn
         },
       }],
     };
+  }
+  // PRD #2119 — the `generate-config` docs scene: the docs deck narrowed to
+  // its Plan / architecture agent, the one the TUI `generate-config` image
+  // shows, given a pane so the row offers Generate config. A state of its own
+  // so the `docs` agents, and every image drawn from them, stay paneless. Its
+  // project has no config, as the TUI image's sandbox project has none: left
+  // unset, the dialog would ask the unknown-state question instead.
+  if (state === "docs-generate") {
+    const snapshot = createFixtureSnapshot("docs");
+    return { ...snapshot, agents: [{ ...snapshot.agents[0], paneId: "docs-plan", projectConfigExists: false }] };
   }
   // `fleet` is a THREE-deck scenario and has no single snapshot, so a caller
   // asking for one gets the deck the single-deck screens are on — never the

@@ -1,0 +1,28 @@
+---
+source: src/ui.rs
+expression: dialog
+---
+ dot-agent-deck — 1 agent(s)
+┏ ▸ 1 No agent · pane-config… ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ ● No agent ┓
+┃Dir:  project-on-the-daemon                                            ┃
+┃Launch an agent to get started                                         ┃
+┃                                                                       ┃
+┃                                                                       ┃
+┃                                                                       ┃       ┌ Update .dot-agent-deck.toml ─────────────────────────────┐
+┃                                                                       ┃       │                                                          │
+┃                                                                       ┃       │  This project already has an orchestration config.       │
+┃                                                                       ┃       │  Want to instruct your agent to analyze the              │
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Last: 0s  Tools: 0 ┛       │  project and update the existing config?                 │
+                                                                                │                                                          │
+                                                                                │  > Yes    — update config for this project               │
+                                                                                │    No     — skip for now                                 │
+                                                                                │                                                          │
+                                                                                │ [Yes] [No]                                               │
+                                                                                │  Up/Down: navigate  Enter: confirm  Esc: cancel          │
+                                                                                └──────────────────────────────────────────────────────────┘
+
+
+
+
+ 0 active  │  0 tools
+ COMMAND  [Command Mode Ctrl+D] [New Agent Ctrl+N] [Close Ctrl+W] [Toggle Layout Ctrl+T] [Help ?] [Quit Ctrl+C] [Filter /] [Rename r] [Update g] [Schedules s]

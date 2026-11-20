@@ -128,6 +128,7 @@ fn listed(id: &str) -> AgentRecord {
     AgentRecord {
         input_held: None,
         input_discarded: None,
+        project_config_exists: None,
         id: id.into(),
         pane_id_env: Some(PANE.into()),
         display_name: None,

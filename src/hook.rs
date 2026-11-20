@@ -468,18 +468,69 @@ fn claude_inbox_hooks(
         }
         "UserPromptSubmit" => {
             let prompt = payload.get("prompt").and_then(Value::as_str)?;
+            let mark = crate::inbox_witness::TranscriptMark::of_payload(&payload);
+            // Issue #2347: and when it drops the prompt it runs no turn and
+            // fires no `Stop`, so the witness settles the turn this event
+            // starts, whatever the prompt carries.
+            #[cfg(unix)]
+            let turn = mark.as_ref().and_then(|_| {
+                crate::inbox_witness::PromptTurn::new(prompt, &event.session_id, event.cwd.clone())
+            });
+            #[cfg(unix)]
+            if let Some(turn) = &turn {
+                event.metadata.insert(
+                    crate::event::PROMPT_TURN_METADATA_KEY.to_string(),
+                    turn.nonce.clone(),
+                );
+            }
             // Issue #2341: Claude can still drop the prompt after this hook
             // exits, so what it hands over is committed once the session
             // transcript shows Claude took it.
-            deck_prompt_submit(
+            let output = deck_prompt_submit(
                 prompt,
                 crate::event::InboxComponent::ClaudeHooks,
                 crate::inbox_hub::SESSION_FRAMING,
                 event,
-                crate::inbox_witness::TranscriptMark::of_payload(&payload),
-            )
+                mark.clone(),
+            );
+            #[cfg(unix)]
+            return with_turn_witness(output, mark, turn);
+            #[cfg(not(unix))]
+            output
         }
         _ => None,
+    }
+}
+
+/// Issue #2347: `output` with its witness settling `turn` too, or, for a
+/// prompt the inbox had nothing to witness for, a witness for the turn
+/// alone.
+#[cfg(unix)]
+fn with_turn_witness(
+    output: Option<HookOutput>,
+    mark: Option<crate::inbox_witness::TranscriptMark>,
+    turn: Option<crate::inbox_witness::PromptTurn>,
+) -> Option<HookOutput> {
+    let Some(turn) = turn else {
+        return output;
+    };
+    match output {
+        Some(mut output) => {
+            if let Some(witness) = output.witness.as_mut() {
+                witness.turn = Some(turn);
+            }
+            Some(output)
+        }
+        None => Some(HookOutput {
+            stdout: String::new(),
+            one_shot: None,
+            witness: Some(crate::inbox_prompt::Witness {
+                mark: mark?,
+                native: Vec::new(),
+                receipts_by: std::time::Instant::now(),
+                turn: Some(turn),
+            }),
+        }),
     }
 }
 
@@ -680,6 +731,7 @@ pub fn deck_prompt_submit(
         mark,
         native: crate::inbox_prompt::delivered(prompt),
         receipts_by,
+        turn: None,
     });
     // No witness runs off Unix: the one-shots that would hand a block over
     // are Unix only.
@@ -1385,6 +1437,64 @@ fn pi_await_answer(raw: &str) -> Option<Value> {
     let reply = hold_question(&event, AWAIT_ANSWER_DEADLINE);
     crate::question::pi_value(&dialog, &question, &reply?)
 }
+
+/// Issue #2347: tell the deck that Claude Code dropped the prompt `turn`
+/// names: an `Idle` from this pane carrying the prompt's nonce, which the
+/// daemon applies only while that prompt's turn is the pane's latest news
+/// (`crate::state::AppState::admit_prompt_not_taken`). Sent by the
+/// transcript witness ([`crate::inbox_witness`]), with the pane's token from
+/// the environment it inherited from the hook, and only to a deck whose
+/// answer to `inbox_receipts` says it guards the report
+/// ([`crate::event::InboxWaitReply::prompt_not_taken`]): an older one would
+/// apply it as a plain `Idle`, even over a turn the prompt did not start.
+#[cfg(unix)]
+pub(crate) fn report_prompt_not_taken(turn: &crate::inbox_witness::PromptTurn) {
+    let Some(token) = crate::hook_provenance::token_from_env() else {
+        return;
+    };
+    let Some(pane_id) = std::env::var(DOT_AGENT_DECK_PANE_ID)
+        .ok()
+        .filter(|pane| !pane.is_empty())
+    else {
+        return;
+    };
+    let agent_id = std::env::var(DOT_AGENT_DECK_AGENT_ID)
+        .ok()
+        .filter(|agent| !agent.is_empty());
+    let Some(question) =
+        crate::inbox_oneshot::receipts_question(&pane_id, agent_id.as_deref(), &token)
+    else {
+        return;
+    };
+    let guarded = crate::inbox_oneshot::Connection::ask_receipts(
+        &client_socket_path(),
+        &question,
+        std::time::Instant::now() + PROMPT_NOT_TAKEN_SEND_WAIT,
+    )
+    .and_then(|reply| reply.prompt_not_taken)
+    .is_some_and(|version| version >= crate::event::PROMPT_NOT_TAKEN_REPORTS);
+    if !guarded {
+        return;
+    }
+    let mut event = producer_event(
+        turn.session_id.clone(),
+        AgentType::ClaudeCode,
+        EventType::Idle,
+        turn.cwd.clone(),
+    );
+    event.metadata.insert(
+        crate::event::PROMPT_NOT_TAKEN_METADATA_KEY.to_string(),
+        turn.nonce.clone(),
+    );
+    if let Ok(line) = crate::event::agent_event_line(&event, Some(&token)) {
+        send_to_socket_bounded(&line, PROMPT_NOT_TAKEN_SEND_WAIT);
+    }
+}
+
+/// Issue #2347: how long the witness waits on the deck to answer whether it
+/// guards the report, and then to take it.
+#[cfg(unix)]
+const PROMPT_NOT_TAKEN_SEND_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// A bare event from this pane, as every producer here stamps one.
 fn producer_event(

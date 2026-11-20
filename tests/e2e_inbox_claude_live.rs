@@ -202,7 +202,7 @@ impl Claude {
     }
 
     fn composer(&self) -> Option<String> {
-        if overview_open(&self.pane_grid()) {
+        if shows_overview(&self.pane_grid()) {
             return None;
         }
         self.pane_grid().lines().rev().find_map(|row| {
@@ -607,7 +607,7 @@ fn claude_014_live_killed_waiter_falls_back_to_injection() {
     );
 }
 
-/// Scenario: Run interactive Haiku in a project whose own `UserPromptSubmit` hook blocks the first prompt carrying a deck doorbell line, kill the scratch pane's armed waiter, and post a directive task naming a sentinel. The doorbell rings, the deck's hook hands the task over, and the project hook blocks that prompt. For 30 seconds, longer than the witness watches, the task is not acknowledged and the sentinel is not written. The test then types a short prompt into the pane: the task is handed over again, Haiku writes the sentinel once, and the task is acknowledged with two deliveries. If the deck's Claude Code facts are not Go the test reports SKIP saying so.
+/// Scenario: Run interactive Haiku in a project whose own `UserPromptSubmit` hook blocks the first prompt carrying a deck doorbell line, kill the scratch pane's waiter, and post a directive task naming a sentinel (SKIP when the deck's Claude Code facts are not Go). The doorbell rings and that prompt is blocked, so Claude runs no turn and puts the line back in its input box; the card must read Idle again with the doorbell held as awaiting a prompt. Pressing Enter in the pane sends the line, Haiku writes the sentinel once, and the task is acknowledged with two deliveries.
 #[spec("inbox/claude/053")]
 #[test]
 #[cfg(target_os = "linux")]
@@ -643,19 +643,23 @@ fn claude_053_live_a_blocked_doorbell_prompt_is_not_acknowledged_and_is_handed_o
             .unwrap_or(Value::Null)
     };
     let sentinel = claude.deck.workdir().join(name);
-    // Longer than the witness watches: neither an acknowledgement nor the
-    // sentinel may appear while the blocked prompt is all Haiku was sent.
-    let leaked = common::wait_until(Duration::from_secs(30), || {
-        message()["state"] == "acknowledged" || sentinel.exists()
-    });
+    // Issue #2347: the blocked prompt ran no turn, so the card reads the
+    // agent Idle again. Claude Code put the blocked line back in its input
+    // box, which the deck does not type over, so the card says the task
+    // awaits a prompt. Before, it kept reading busy and said nothing.
     assert!(
-        !leaked,
-        "a blocked prompt must not acknowledge the task, and Haiku never saw it; {}",
+        common::wait_until(BUDGET, || {
+            claude.record()["live"]["status"] == "Idle"
+                && claude
+                    .log()
+                    .lines()
+                    .any(|line| line.contains("doorbell hold") && line.contains("AwaitingPrompt"))
+        }),
+        "a blocked prompt must leave the card Idle, awaiting a prompt; {}",
         claude.evidence()
     );
-    claude
-        .deck
-        .send_keys(b"Check for new messages and do what they say.");
+    // Send the restored line, as the card asks: the deck's own hook hands
+    // the task over again.
     claude.deck.send_keys(b"\r");
     assert!(
         common::wait_until(BUDGET, || std::fs::read_to_string(&sentinel)
@@ -948,15 +952,6 @@ fn empty_editor_fallback(label: &str, erase_draft: bool) {
     );
 }
 
-/// Whether Claude Code's background-session overview is on screen. Its
-/// banner read "Your conversation moved to the background" through 2.1.328
-/// and "Your session moved to the background" from 2.1.329.
-fn overview_open(grid: &str) -> bool {
-    ["conversation", "session"]
-        .iter()
-        .any(|what| grid.contains(&format!("Your {what} moved to the background")))
-}
-
 /// Scenario: Complete a fallback task in interactive Haiku, then press Left in its empty composer to open the background-session overview and queue another task. For five seconds the input row must remain exactly empty with unchanged captured input bytes, the task queued and zero deliveries. This is a GREEN regression guard on the part-3 head because navigation sets the draft bit; after the fix the unrecognised overview must still hold delivery.
 #[spec("inbox/doorbell/010")]
 #[test]
@@ -987,7 +982,7 @@ fn doorbell_010_live_left_opens_overview_and_the_line_is_not_typed_there() {
     let before_left = input();
     claude.deck.send_keys(b"\x1b[D");
     assert!(
-        common::wait_until(Duration::from_secs(10), || overview_open(
+        common::wait_until(Duration::from_secs(10), || shows_overview(
             &claude.pane_grid()
         )),
         "Left must open the overview; {}",
@@ -1039,7 +1034,7 @@ fn doorbell_010_live_left_opens_overview_and_the_line_is_not_typed_there() {
                     || line.contains("doorbell sent its cleanup CR")
                     || line.contains("pane_write:")
             })
-            || !overview_open(&grid)
+            || !shows_overview(&grid)
             || claude.deck.workdir().join(name).exists()
             || message["state"] != "queued"
             || message["deliveries"] != 0;
@@ -2257,4 +2252,13 @@ fn claude_049_live_hooks_refreshed_after_an_upgrade_deliver() {
     let id = fresh.post(&fresh.directive(name));
     fresh.done(&id, name, true);
     fresh.assert_witnessed(&id, true);
+}
+
+/// Whether `grid` shows Claude Code's background-session overview by its
+/// banner: "Your conversation moved to the background" up to 2.1.310 or
+/// so, "Your session moved to the background" on 2.1.328.
+fn shows_overview(grid: &str) -> bool {
+    ["Your conversation", "Your session"]
+        .iter()
+        .any(|whose| grid.contains(&format!("{whose} moved to the background")))
 }
