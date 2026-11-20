@@ -520,6 +520,11 @@ fn interrupted_003_reclaim_removes_a_clean_worktree_and_keeps_its_branch() {
 
     let list = decks.list();
     let id = id_of(unit_item(&list, UNIT).unwrap_or_else(|| panic!("listed: {list}")));
+    assert_eq!(
+        marked_launch(&worktree),
+        Some(id.clone()),
+        "premise: the marker names the launch the item is rooted at"
+    );
 
     let dry = decks.person(&["interrupted", "reclaim", &id, "--dry-run"]);
     assert_exit("interrupted reclaim --dry-run", &dry, 0);
@@ -547,6 +552,16 @@ fn interrupted_003_reclaim_removes_a_clean_worktree_and_keeps_its_branch() {
         !listed(&after, &id),
         "a reclaimed item is not listed: {after}"
     );
+}
+
+/// The launch the ownership marker of `worktree` names, as the work id's
+/// text; `None` when it names none or there is no marker.
+fn marked_launch(worktree: &Path) -> Option<String> {
+    use dot_agent_deck::worktree_owner::{MarkedLaunch, git_dir_of, marked_launch_in};
+    match marked_launch_in(&git_dir_of(worktree)?) {
+        MarkedLaunch::Names(work) => Some(work.as_str().to_string()),
+        MarkedLaunch::NotMarked | MarkedLaunch::Unnamed => None,
+    }
 }
 
 /// Scenario: Two dispatched units are left by a restart. One worktree gets

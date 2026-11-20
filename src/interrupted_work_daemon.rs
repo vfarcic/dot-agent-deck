@@ -47,12 +47,20 @@
 //! tree with uncommitted changes, or with other worktrees inside it, is kept
 //! (decisions D5, D6). Before that it requires a fresh, untruncated journal
 //! read in which the item is still interrupted, an item that is not a plain
-//! agent's (D1), no work the journal opened after the item, outside it,
-//! naming the same worktree ([`newer_run_at`]: an issue dispatched again at
-//! the same path and on the same branch passes the marker and branch checks,
-//! so only the journal tells its tree from the older item's), a linked
-//! worktree at the recorded path whose checked-out branch is the item's, and
-//! the deck's ownership marker. It then holds the
+//! agent's (D1), a linked worktree at the recorded path whose checked-out
+//! branch is the item's, and the deck's ownership marker naming the item's
+//! own launch ([`crate::worktree_owner::marked_launch_in`], PR #2431 round 2).
+//! An issue dispatched again at the same path and on the same branch passes
+//! the branch check and carries a marker too, so only the launch the marker
+//! names tells that run's tree from the older item's: a marker naming
+//! another launch refuses ([`RefusalReason::NewerRun`]), and so does one
+//! naming none ([`RefusalReason::OwnerUnconfirmed`]: a marker an older build
+//! wrote, or one that cannot be read). The decision never rests on the
+//! journal holding no record of a later run, since the journal is best
+//! effort and such a record can be missing. An item's root is the launch's
+//! own work for a dispatched unit and an issue dispatch, which are the
+//! launches that create worktrees, so it is compared with the root alone.
+//! It then holds the
 //! worktree against new spawns ([`AgentPtyRegistry::hold_dir_for_removal`],
 //! by its recorded and its canonical path) and, with the hold taken,
 //! resolves every directory anything this daemon runs or is starting is
@@ -76,7 +84,9 @@
 //! nested-worktree check, then, immediately before `git worktree remove`,
 //! re-validates that the directory is the one it checked: the same device and
 //! inode at the same canonical path, the owner marker in the same git
-//! metadata directory, the item's branch checked out, no other worktree
+//! metadata directory and still naming the item's launch (read again, so a
+//! later launch that created the tree again since the first check is
+//! caught), the item's branch checked out, no other worktree
 //! inside it (asked again), and last the same device and inode once more,
 //! since the probes in between take time. Any difference keeps the tree.
 //!
@@ -93,8 +103,8 @@
 //! resolves the path itself. The owner marker, the branch and the set of
 //! worktrees inside it are checked earlier, and changing one of them in place
 //! changes neither the directory's device nor its inode, so the identity
-//! check after them does not notice: a marker removed or a branch switched
-//! after its own check, or a worktree added inside the tree after the nested
+//! check after them does not notice: a marker removed or rewritten or a
+//! branch switched after its own check, or a worktree added inside the tree after the nested
 //! list was taken, is not seen, and that nested worktree is removed with it.
 //! Without `--force`, Git refuses to remove a worktree in which it reports
 //! modified tracked files or untracked files. That covers only what Git
@@ -131,8 +141,8 @@ use crate::interrupted_work::{
     CloseSets, DismissOutcome, DismissedItem, GIT_FACTS_RESERVE, GitFacts, InterruptedItem,
     InterruptedList, InterruptedShow, ItemKind, MAX_REPLY_BYTES, MAX_SHOWN_REPORT_BYTES,
     MAX_SHOWN_REPORTS, PrFact, REPORT_NOT_OF_ITEM, ReclaimOutcome, ReclaimVerdict, RefusalReason,
-    Resolved, ShownReport, derive, fit_list, fit_show_page, newer_run_at, reclaim_sentence,
-    resolve, still_interrupted,
+    Resolved, ShownReport, derive, fit_list, fit_show_page, reclaim_sentence, resolve,
+    still_interrupted,
 };
 use crate::interrupted_work_probe::{self as probe, Deadline};
 use crate::issue_dispatch_run::{
@@ -140,7 +150,8 @@ use crate::issue_dispatch_run::{
 };
 use crate::launch_records::LaunchRead;
 use crate::retained_store::{KeptReport, KeptReports, RetainedStore};
-use crate::work_journal::{CloseHow, Event, JournalRead, WorkId, WorkJournal, Workspace};
+use crate::work_journal::{CloseHow, Event, JournalRead, WorkId, WorkJournal};
+use crate::worktree_owner::MarkedLaunch;
 
 /// The bound on one item's Git facts.
 pub const GIT_FACT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -471,20 +482,6 @@ fn prepare_reclaim(
     else {
         return Err(refuse_item(RefusalReason::NoWorktree));
     };
-    // A later run in the same worktree owns it now (PR #2431 review): the
-    // marker and the branch checked below cannot tell the two runs apart.
-    let home = crate::platform::paths::home_dir();
-    let same_place = |workspace: &Workspace| {
-        workspace.matches_path_with_home(&raw, &home)
-            || workspace.matches_path_with_home(&worktree, &home)
-            || workspace
-                .to_path_with_home(&home)
-                .and_then(|path| std::fs::canonicalize(path).ok())
-                .is_some_and(|path| path == worktree)
-    };
-    if newer_run_at(&snap.read, &item.id, same_place) {
-        return Err(refuse_item(RefusalReason::NewerRun));
-    }
     let works = CloseSets::build(&snap.read).works_under(&item.id);
     Ok(Prepared {
         item,
@@ -572,6 +569,17 @@ struct Checked {
     clone: PathBuf,
     git_dir: PathBuf,
     branch: String,
+    /// The item's root, which the marker must still name.
+    launch: WorkId,
+}
+
+/// The launch the marker in `git_dir` names, read on the blocking pool;
+/// [`MarkedLaunch::Unnamed`] when the read task fails.
+async fn marked_launch(git_dir: &Path) -> MarkedLaunch {
+    let git_dir = git_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || crate::worktree_owner::marked_launch_in(&git_dir))
+        .await
+        .unwrap_or(MarkedLaunch::Unnamed)
 }
 
 /// Whether the directory at the reclaimed path is still the one the reclaim
@@ -664,7 +672,8 @@ async fn bounded_keep_check(worktree: &Path, clone: &Path) -> Result<TreeKeepChe
 /// repository's worktree lock: whether the directory at the reclaimed path
 /// is still the worktree the reclaim checked. In order: the same canonical
 /// path and device and inode; a linked worktree of the same repository with
-/// its owner marker in the same git metadata directory; the item's branch
+/// its owner marker in the same git metadata directory, naming the item's
+/// launch; the item's branch
 /// checked out; no other worktree inside it (asked again, since one may have
 /// been added since the keep check); and, last, the same device and inode
 /// again, since the probes in between take time. Any difference keeps the
@@ -688,10 +697,9 @@ async fn still_the_checked_worktree(checked: Checked) -> RemovalGuard {
     {
         return RemovalGuard::Changed;
     }
-    let git_dir = facts.git_dir.clone();
-    let marked = tokio::task::spawn_blocking(move || crate::worktree_owner::is_marked_in(&git_dir))
-        .await
-        .unwrap_or(false);
+    // The marker again, as it is now: a later launch that created the tree
+    // again since the first check names itself there (PR #2431 round 2).
+    let marked = marked_launch(&facts.git_dir).await == MarkedLaunch::Names(checked.launch.clone());
     if !marked
         || probe::head_branch(&checked.worktree, deadline)
             .await
@@ -794,14 +802,16 @@ async fn reclaim_with(
     let Some(branch) = item.branch.clone() else {
         return refuse(RefusalReason::BranchMismatch);
     };
-    let marked = {
-        let git_dir = facts.git_dir.clone();
-        tokio::task::spawn_blocking(move || crate::worktree_owner::is_marked_in(&git_dir))
-            .await
-            .unwrap_or(false)
-    };
-    if !marked {
-        return refuse(RefusalReason::NotOwned);
+    // The marker must name this item's launch (PR #2431 round 2): the
+    // branch and the marker's presence are the same for a later run that
+    // created the tree again at this path, and the journal's record of such
+    // a run may be missing, so the decision rests on what the tree itself
+    // says created it, never on the absence of another run.
+    match marked_launch(&facts.git_dir).await {
+        MarkedLaunch::NotMarked => return refuse(RefusalReason::NotOwned),
+        MarkedLaunch::Names(launch) if launch == item.id => {}
+        MarkedLaunch::Names(_) => return refuse(RefusalReason::NewerRun),
+        MarkedLaunch::Unnamed => return refuse(RefusalReason::OwnerUnconfirmed),
     }
     if probe::head_branch(&worktree, deadline).await.as_deref() != Some(branch.as_str()) {
         return refuse(RefusalReason::BranchMismatch);
@@ -814,6 +824,7 @@ async fn reclaim_with(
         clone: facts.geometry.main.clone(),
         git_dir: facts.git_dir.clone(),
         branch: branch.clone(),
+        launch: item.id.clone(),
     };
 
     // The hold, the removal and its record run in their own task, as

@@ -562,6 +562,19 @@ fn interrupted_028_a_real_agents_unit_is_listed_and_reclaimed_after_a_restart() 
         "the item names the unit's worktree {}: {item}",
         worktree.display()
     );
+    // The marker the dispatch wrote names the launch the item is rooted at,
+    // which reclaim requires (PR #2431 round 2).
+    let marked = dot_agent_deck::worktree_owner::git_dir_of(&worktree)
+        .map(|git_dir| dot_agent_deck::worktree_owner::marked_launch_in(&git_dir));
+    assert!(
+        matches!(
+            &marked,
+            Some(dot_agent_deck::worktree_owner::MarkedLaunch::Names(work))
+                if item["id"] == work.as_str()
+        ),
+        "the worktree's ownership marker names the item {}: {marked:?}",
+        item["id"]
+    );
     let human = person(&live, &repo, &["interrupted", "list", "--no-git"]);
     eprintln!("narrative: `interrupted list --no-git`:\n{}", text(&human));
     // The sentinel is ignored and the agent was told to change nothing else:

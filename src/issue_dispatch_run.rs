@@ -1451,12 +1451,17 @@ async fn dispatch_one_issue(
     // PRD #1885: created unwarmed, so the trust check below reads the config
     // this worktree's (possibly reattached) branch carries before its devbox
     // warm-up runs anything that branch configured.
+    // PR #2431 round 2: the issue's work id, minted before its worktree
+    // exists so the worktree's ownership marker names this launch, which is
+    // what lets an interrupted-work reclaim tell an earlier fire's item from
+    // this fire's tree at the same path. Writes nothing until it is held.
+    let minted = registry.work().mint_launch();
     match create_worktree_unwarmed(
         clone_dir,
         &paths.worktree_dir,
         &paths.branch,
         true,
-        Creator::issue_dispatch(task_name, issue),
+        Creator::issue_dispatch(task_name, issue).for_launch(minted.as_ref()),
         None,
     )
     .await?
@@ -1528,9 +1533,10 @@ async fn dispatch_one_issue(
     // are attempts of the orchestration's work, which is a child of this one.
     // Its `opened` is held until the spawn settles: a spawn that starts
     // nothing leaves no work behind.
-    let issue_work = {
+    let issue_work = minted.and_then(|minted| {
         let work = registry.work();
-        work.hold_launch(
+        work.hold_launch_as(
+            minted,
             crate::work_journal::Launch::IssueDispatch,
             fire_work,
             crate::work_journal::Refs {
@@ -1541,7 +1547,7 @@ async fn dispatch_one_issue(
             },
             &paths.worktree_dir,
         )
-    };
+    });
     let prompt = substitute_issue_number(prompt_template, issue);
     // PRD #1790: the task as dispatched, saved beside the worktree under the
     // issue's work id, so a restore can hand it back.
@@ -6830,6 +6836,75 @@ mod tests {
                  {after}"
             )
         });
+    }
+
+    /// PR #2431 round 2: the marker names the launch the worktree was created
+    /// for, and an issue dispatched again at the same path and on the same
+    /// branch, after the first tree was removed, leaves a marker naming the
+    /// LATER launch, so a reclaim of the earlier launch's item can tell the
+    /// tree is no longer its own. A creation that names no launch (the journal
+    /// is disabled) leaves a marker the ownership gate still accepts and that
+    /// names none.
+    #[tokio::test]
+    async fn create_worktree_marks_the_launch_and_a_recreation_names_the_latest() {
+        use crate::worktree_owner::{MarkedLaunch, marked_launch_in};
+        let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
+        let repo = scratch.path().join("repo");
+        init_repo_with_commit(scratch.path(), &repo);
+        let worktree_dir = repo.join(".worktrees").join("issue-7");
+        let first = crate::work_journal::WorkId::parse("w-abcdefgh-0000000000000001").unwrap();
+        let second = crate::work_journal::WorkId::parse("w-abcdefgh-0000000000000002").unwrap();
+        let launch_of = |dir: &Path| {
+            marked_launch_in(&crate::worktree_owner::git_dir_of(dir).expect("git dir resolves"))
+        };
+
+        assert_eq!(
+            create_worktree(
+                &repo,
+                &worktree_dir,
+                "agent/issue-7",
+                true,
+                Creator::issue_dispatch("unit", 7).for_launch(Some(&first)),
+            )
+            .await,
+            Ok(WorktreeCreation::Created)
+        );
+        assert_eq!(launch_of(&worktree_dir), MarkedLaunch::Names(first.clone()));
+
+        remove_worktree(&worktree_dir, &repo, RemovalPolicy::Force).await;
+        assert!(!worktree_dir.exists(), "fixture precondition: removed");
+        assert_eq!(
+            create_worktree(
+                &repo,
+                &worktree_dir,
+                "agent/issue-7",
+                true,
+                Creator::issue_dispatch("unit", 7).for_launch(Some(&second)),
+            )
+            .await,
+            Ok(WorktreeCreation::Created),
+            "the existing branch is attached again"
+        );
+        assert_eq!(
+            launch_of(&worktree_dir),
+            MarkedLaunch::Names(second),
+            "the recreated tree's marker names the latest launch"
+        );
+
+        remove_worktree(&worktree_dir, &repo, RemovalPolicy::Force).await;
+        assert_eq!(
+            create_worktree(
+                &repo,
+                &worktree_dir,
+                "agent/issue-7",
+                true,
+                Creator::issue_dispatch("unit", 7).for_launch(None),
+            )
+            .await,
+            Ok(WorktreeCreation::Created)
+        );
+        assert!(crate::worktree_owner::is_marked(&worktree_dir));
+        assert_eq!(launch_of(&worktree_dir), MarkedLaunch::Unnamed);
     }
 
     /// The dangerous direction. `AlreadyClaimed` means the worktree DIRECTORY

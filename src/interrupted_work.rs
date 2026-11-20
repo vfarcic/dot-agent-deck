@@ -319,11 +319,16 @@ pub enum RefusalReason {
     BranchMismatch,
     /// The worktree carries no deck ownership marker.
     NotOwned,
-    /// A work the journal opened after this item, and not under it, ran in
-    /// the same worktree (PR #2431 review): the issue was dispatched again at
-    /// the same path and on the same branch, so the marker and the branch no
-    /// longer tell this item's tree from that run's.
+    /// The worktree's ownership marker names another launch than this item
+    /// (PR #2431 review, round 2): the work was dispatched again at the same
+    /// path and on the same branch, and that later run created the tree that
+    /// is there now.
     NewerRun,
+    /// The worktree's ownership marker names no launch the deck can match to
+    /// this item (PR #2431 round 2): an older build wrote it, the launch had
+    /// no work id to record, or the marker could not be read. Whether the
+    /// tree is still this item's cannot be confirmed, so it is kept.
+    OwnerUnconfirmed,
     /// Something this daemon runs is still rooted in the worktree.
     StillInUse,
     /// Whether something this daemon runs is rooted in the worktree could not
@@ -698,6 +703,7 @@ pub const REFUSED_BRANCH_MISMATCH: &str =
     "Refused: its worktree has another branch checked out than the one it was started on.";
 pub const REFUSED_NOT_OWNED: &str = "Refused: the deck did not create this worktree.";
 pub const REFUSED_NEWER_RUN: &str = "Refused: a later run used this worktree, so reclaiming this older item could remove that run's work. Dismiss this item instead.";
+pub const REFUSED_OWNER_UNCONFIRMED: &str = "Refused: the deck cannot confirm this worktree is still this item's, for example because an older version of the deck created it. Dismiss this item instead, and remove the worktree with Git if you no longer need it.";
 pub const REFUSED_STILL_IN_USE: &str = "Refused: an agent is still running in its worktree.";
 pub const REFUSED_IN_USE_UNKNOWN: &str =
     "Refused: the deck could not tell whether an agent is still running in its worktree.";
@@ -1019,6 +1025,7 @@ pub fn refusal_sentence(reason: RefusalReason) -> &'static str {
         RefusalReason::BranchMismatch => REFUSED_BRANCH_MISMATCH,
         RefusalReason::NotOwned => REFUSED_NOT_OWNED,
         RefusalReason::NewerRun => REFUSED_NEWER_RUN,
+        RefusalReason::OwnerUnconfirmed => REFUSED_OWNER_UNCONFIRMED,
         RefusalReason::StillInUse => REFUSED_STILL_IN_USE,
         RefusalReason::InUseUnknown => REFUSED_IN_USE_UNKNOWN,
         RefusalReason::NotRecorded => REFUSED_NOT_RECORDED,
@@ -1246,72 +1253,6 @@ impl CloseSets {
         }
         out
     }
-}
-
-/// PR #2431 review (Greptile P1): whether a dispatch or an issue dispatch the
-/// journal opened after the item rooted at `root`, and not under it,
-/// recorded a workspace that `same_place` says is the item's worktree.
-///
-/// The ownership marker names who created a worktree (a dispatch, an issue
-/// dispatch) and the branch names what it holds, and both are the same for
-/// an issue dispatched again at the same path, so neither tells an older
-/// item's tree from a newer run's. The journal does: the newer run's
-/// `opened` line comes later and names the same workspace. Only the two
-/// launches that create a worktree count. A plain pane or an orchestration
-/// started later in the item's worktree creates none, so the tree is still
-/// the item's: while it runs, the reclaim's in-use check refuses, and what it
-/// left behind is the keep check's to find, as for the item's own panes. A
-/// work counts as
-/// under the item when its `parent` chain reaches `root` within
-/// [`MAX_WALK`] steps; one whose chain cannot be followed that far is not
-/// counted as the item's, so the answer leans to "a newer run", which keeps
-/// the tree. A root with no `opened` line answers `true` for the same reason.
-pub fn newer_run_at(
-    read: &JournalRead,
-    root: &WorkId,
-    mut same_place: impl FnMut(&Workspace) -> bool,
-) -> bool {
-    let mut parents: HashMap<&WorkId, Option<&WorkId>> = HashMap::new();
-    let mut root_at = None;
-    let mut later: Vec<(&WorkId, &Workspace)> = Vec::new();
-    for (at, line) in read.lines.iter().enumerate() {
-        let Event::Opened {
-            work,
-            launch,
-            parent,
-            workspace,
-            ..
-        } = &line.event
-        else {
-            continue;
-        };
-        parents.entry(work).or_insert(parent.as_ref());
-        if work == root && root_at.is_none() {
-            root_at = Some(at);
-        } else if root_at.is_some()
-            && matches!(launch, Launch::Dispatch | Launch::IssueDispatch)
-            && let Some(workspace) = workspace
-        {
-            later.push((work, workspace));
-        }
-    }
-    if root_at.is_none() {
-        return true;
-    }
-    let under_root = |work: &WorkId| {
-        let mut current = Some(work);
-        for _ in 0..=MAX_WALK {
-            match current {
-                Some(w) if w == root => return true,
-                Some(w) => current = parents.get(w).copied().flatten(),
-                None => return false,
-            }
-        }
-        false
-    };
-    later
-        .into_iter()
-        .any(|(work, workspace)| !under_root(work) && same_place(workspace))
 }
 
 /// [`CloseSets::works_under`] for one root, indexing `read` for it alone.

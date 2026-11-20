@@ -44,13 +44,25 @@
 //!
 //! The content records WHO created the worktree ([`Creator`]) rather than a
 //! bare "the deck", so a later reader can tell which dispatch or which
-//! issue-dispatch fire is responsible. The gate ([`is_marked`]) never parses
-//! this document: the content is informational, and making the gate depend on
-//! parsing it would turn every future format change into "all existing
+//! issue-dispatch fire is responsible, and, since PR #2431 round 2, which
+//! LAUNCH it was created for: the work journal id of the `dispatch` or issue
+//! dispatch (`creator.launch`), minted before the worktree exists so the one
+//! write can carry it. A worktree created again at the same path gets a new
+//! git metadata dir and so a marker naming the later launch. The gate
+//! ([`is_marked`]) never parses this document, and making it depend on
+//! parsing would turn every future format change into "all existing
 //! worktrees became foreign". It asks two things of the file and no more —
 //! that it exists, and that it is not empty. The length is not a format
 //! check and cannot go stale the way a parse can; it is there only so the
 //! zero-byte residue of a torn write does not read as a claim.
+//!
+//! One reader does parse the document, and it is not the gate:
+//! [`marked_launch_in`], for PRD #1790's interrupted-work reclaim, which
+//! removes a worktree only when the marker names the interrupted item's own
+//! launch. It fails the other way from the gate: a marker it cannot read, or
+//! one an older build wrote without the field, names no launch, and that
+//! reclaim refuses rather than removes. `worktree reclaim` keeps the gate's
+//! reading.
 //!
 //! One thing here is not about the marker: [`main_worktree_of`] (issue #550),
 //! which answers "which checkout outlives this worktree". It lives beside
@@ -68,6 +80,7 @@ use serde::Serialize;
 #[cfg(test)]
 use crate::git_env::fixture_git;
 use crate::git_env::git_at;
+use crate::work_journal::WorkId;
 
 /// The name of the marker file that proves the deck created a worktree. Lives
 /// in the worktree's OWN git metadata dir — see the module docs for why it is
@@ -77,10 +90,10 @@ pub const OWNER_MARKER_FILENAME: &str = "dot-agent-deck-owner";
 /// Version of the marker DOCUMENT's shape. Independent of
 /// `worktree_reclaim::SCHEMA_VERSION` (the `--json` report): this one versions
 /// a file on disk that outlives the process that wrote it. Bump on a field
-/// removal or a meaning change; additive fields don't need a bump. Nothing
-/// reads it yet — the ownership gate never looks inside the document — so it
-/// exists to make the first reader's job possible, not to gate anything
-/// today.
+/// removal or a meaning change; additive fields don't need a bump (the
+/// optional `creator.launch` did not). Nothing reads it: the ownership gate
+/// never looks inside the document, and [`marked_launch_in`] looks for that
+/// one optional field and reads a document without it as naming no launch.
 pub const MARKER_SCHEMA_VERSION: u32 = 1;
 
 /// Build a `PathBuf` from raw bytes read from `git`'s output (a `-z` path
@@ -552,6 +565,14 @@ pub struct Creator {
     /// What that path was creating the worktree FOR: the dispatch name, or the
     /// issue-dispatch task and issue number.
     pub subject: String,
+    /// PR #2431 round 2: the work journal's id for the launch that created
+    /// this worktree generation — the `dispatch`'s or the issue dispatch's
+    /// work, which is also the root of the interrupted work item that launch
+    /// becomes. Additive and optional: `None` when the launch has no work id
+    /// (the journal is disabled) and for every marker an older build wrote,
+    /// and then omitted from the document. Read by [`marked_launch_in`] only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub launch: Option<String>,
 }
 
 impl Creator {
@@ -561,6 +582,7 @@ impl Creator {
         Self {
             kind: "dispatch",
             subject: name.to_string(),
+            launch: None,
         }
     }
 
@@ -569,8 +591,75 @@ impl Creator {
         Self {
             kind: "issue-dispatch",
             subject: format!("{task}#{issue}"),
+            launch: None,
         }
     }
+
+    /// This creator, naming `launch` as the launch the worktree is created
+    /// for (`None` leaves it unnamed).
+    pub fn for_launch(mut self, launch: Option<&WorkId>) -> Self {
+        self.launch = launch.map(|work| work.as_str().to_string());
+        self
+    }
+}
+
+/// The most of a marker [`marked_launch_in`] reads. A marker the deck writes
+/// is a few hundred bytes; one larger than this is not one it wrote whole.
+const MAX_MARKER_READ_BYTES: u64 = 64 * 1024;
+
+/// Which launch a worktree's marker says created it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarkedLaunch {
+    /// No marker [`is_marked`] accepts: missing, empty, or not a regular file.
+    NotMarked,
+    /// A marker that names this launch's work.
+    Names(WorkId),
+    /// A marker [`is_marked`] accepts that names no launch this reader can
+    /// use: an older build's (written before the field existed), one written
+    /// while the journal was disabled, a torn or unparsable document, an
+    /// oversized one, or one that could not be read.
+    Unnamed,
+}
+
+/// The launch the marker in the git metadata directory `git_dir` names
+/// (PR #2431 round 2), for a reader that removes a worktree only when the
+/// tree is still that launch's: PRD #1790's interrupted work reclaim.
+///
+/// The one place this module parses the marker, and it is not the ownership
+/// gate: [`is_marked`] still asks only that the file exist and not be empty,
+/// so `worktree reclaim` reads every marker as it did. Anything this reader
+/// cannot use reads as [`MarkedLaunch::Unnamed`], never as a match, so a
+/// format change or a marker from an older build costs that reclaim a
+/// refusal, not a removal. Runs no `git`; reads at most
+/// [`MAX_MARKER_READ_BYTES`]. Blocking.
+pub fn marked_launch_in(git_dir: &Path) -> MarkedLaunch {
+    use std::io::Read as _;
+
+    #[derive(serde::Deserialize)]
+    struct Doc {
+        creator: DocCreator,
+    }
+    #[derive(serde::Deserialize)]
+    struct DocCreator {
+        #[serde(default)]
+        launch: Option<String>,
+    }
+
+    let path = git_dir.join(OWNER_MARKER_FILENAME);
+    if !reads_as_claim(&path) {
+        return MarkedLaunch::NotMarked;
+    }
+    let mut body = Vec::new();
+    let read = std::fs::File::open(&path)
+        .and_then(|file| file.take(MAX_MARKER_READ_BYTES + 1).read_to_end(&mut body));
+    if read.is_err() || body.len() as u64 > MAX_MARKER_READ_BYTES {
+        return MarkedLaunch::Unnamed;
+    }
+    serde_json::from_slice::<Doc>(&body)
+        .ok()
+        .and_then(|doc| doc.creator.launch)
+        .and_then(|launch| WorkId::parse(&launch))
+        .map_or(MarkedLaunch::Unnamed, MarkedLaunch::Names)
 }
 
 /// The marker file's content. Informational only — see the module docs on why
@@ -872,6 +961,55 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         (scratch, repo)
+    }
+
+    /// PR #2431 round 2: what [`marked_launch_in`] reads from a marker. A
+    /// marker [`write_marker`] writes for a launch names it; one written with
+    /// no launch, the shape every older build wrote, names none; and so does
+    /// anything it cannot parse or that is larger than a marker the deck
+    /// writes, each still accepted by the ownership gate. No marker at all
+    /// is not marked.
+    #[test]
+    fn marked_launch_names_only_a_launch_the_marker_records() {
+        let (_scratch, repo) = git_dir_fixture();
+        let git_dir = git_dir_of(&repo).expect("git dir resolves");
+        let marker = git_dir.join(OWNER_MARKER_FILENAME);
+        let launch = WorkId::parse("w-abcdefgh-00000000000000c3").unwrap();
+
+        assert_eq!(marked_launch_in(&git_dir), MarkedLaunch::NotMarked);
+
+        write_marker(
+            &repo,
+            "agent/x",
+            &Creator::dispatch("x").for_launch(Some(&launch)),
+        )
+        .unwrap();
+        assert_eq!(
+            marked_launch_in(&git_dir),
+            MarkedLaunch::Names(launch.clone())
+        );
+
+        write_marker(&repo, "agent/x", &Creator::dispatch("x")).unwrap();
+        let legacy = std::fs::read_to_string(&marker).unwrap();
+        assert!(!legacy.contains("launch"), "no launch, no field: {legacy}");
+        assert_eq!(marked_launch_in(&git_dir), MarkedLaunch::Unnamed);
+
+        let not_an_id = r#"{"creator":{"kind":"dispatch","subject":"x","launch":"w-nope"}}"#;
+        let oversized = format!(
+            r#"{{"creator":{{"launch":"{}"}},"pad":"{}"}}"#,
+            launch.as_str(),
+            "x".repeat(MAX_MARKER_READ_BYTES as usize)
+        );
+        for body in ["{ torn", "[]", not_an_id, oversized.as_str()] {
+            std::fs::write(&marker, body).unwrap();
+            assert!(is_marked(&repo), "the gate still accepts it");
+            assert_eq!(
+                marked_launch_in(&git_dir),
+                MarkedLaunch::Unnamed,
+                "{:.60}",
+                body
+            );
+        }
     }
 
     /// The gate must not accept a zero-byte marker. That file is precisely

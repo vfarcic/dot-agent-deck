@@ -1362,11 +1362,33 @@ impl WorkTracker {
         branch: &str,
         workspace: &Path,
     ) -> Option<WorkId> {
+        let work = self.mint_launch()?;
+        self.dispatch_held(work, parent, branch, workspace)
+    }
+
+    /// [`Self::dispatch_minted`] for a work id the caller minted earlier
+    /// ([`Self::mint_launch`]), so the worktree it created could name it.
+    pub fn dispatch_held(
+        &self,
+        work: WorkId,
+        parent: Option<&WorkId>,
+        branch: &str,
+        workspace: &Path,
+    ) -> Option<WorkId> {
         let refs = Refs {
             branch: self.plain(branch),
             ..Refs::default()
         };
-        self.hold_launch(Launch::Dispatch, parent, refs, workspace)
+        self.hold_launch_as(work, Launch::Dispatch, parent, refs, workspace)
+    }
+
+    /// A fresh work id for a launch that has not been held yet, or `None`
+    /// when there is no journal (PR #2431 round 2). Writes nothing: a launch
+    /// minted here and never held leaves no line behind. Minted before the
+    /// launch creates its worktree, so the worktree's ownership marker can
+    /// name the launch ([`crate::worktree_owner::Creator::for_launch`]).
+    pub fn mint_launch(&self) -> Option<WorkId> {
+        self.journal()?.mint_work_id()
     }
 
     /// The unit dispatched as `work` was registered as `unit_id`: its
@@ -1440,8 +1462,22 @@ impl WorkTracker {
         refs: Refs,
         workspace: &Path,
     ) -> Option<WorkId> {
+        let work = self.mint_launch()?;
+        self.hold_launch_as(work, launch, parent, refs, workspace)
+    }
+
+    /// [`Self::hold_launch`] for a work id the caller minted earlier
+    /// ([`Self::mint_launch`]). `None`, holding nothing, when there is no
+    /// journal.
+    pub fn hold_launch_as(
+        &self,
+        work: WorkId,
+        launch: Launch,
+        parent: Option<&WorkId>,
+        refs: Refs,
+        workspace: &Path,
+    ) -> Option<WorkId> {
         let journal = self.journal()?;
-        let work = journal.mint_work_id()?;
         // Resolved before the book's lock: it reads the filesystem.
         let workspace = journal.workspace(workspace);
         let mut book = self.book();

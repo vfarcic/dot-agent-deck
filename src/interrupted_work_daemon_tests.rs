@@ -177,6 +177,8 @@ fn repo_with_worktree(root: &Path) -> (PathBuf, PathBuf) {
     )
 }
 
+/// A marker as a build before the launch field wrote it: it names who
+/// created the worktree, not which launch.
 fn mark(wt: &Path) {
     crate::worktree_owner::write_marker(
         wt,
@@ -184,6 +186,24 @@ fn mark(wt: &Path) {
         &crate::worktree_owner::Creator::dispatch("x"),
     )
     .expect("marker written");
+}
+
+/// The marker a dispatch writes when it creates `wt` for the launch
+/// `launch` (PR #2431 round 2): the document with `creator.launch` naming
+/// that launch's work. Written as the bytes a marker holds, so the fixture
+/// does not depend on the writer it checks.
+fn mark_naming(wt: &Path, launch: &WorkId) {
+    let path = crate::worktree_owner::marker_path(wt).expect("the marker's directory resolves");
+    let doc = serde_json::json!({
+        "schema": 1,
+        "created_by": "dot-agent-deck",
+        "version": "test",
+        "created_at": "2026-11-20T00:00:00Z",
+        "pid": 1,
+        "creator": { "kind": "dispatch", "subject": "x", "launch": launch.as_str() },
+        "branch": "agent/dispatch-x",
+    });
+    std::fs::write(&path, format!("{doc:#}\n")).expect("marker written");
 }
 
 fn branch_exists_in(repo: &Path, root: &Path, branch: &str) -> bool {
@@ -369,8 +389,8 @@ fn reclaim_refuses_a_worktree_without_the_owner_marker_or_on_another_branch() {
 
         // Marked, but the journal names another branch than the one checked
         // out.
-        mark(&wt);
         let (other_branch, _) = unit(&registry, "agent/dispatch-y", Some(&wt));
+        mark_naming(&wt, &other_branch);
         let outcome = reclaim(&registry, other_branch.to_string(), false, None).await;
         assert_eq!(
             reason(&outcome),
@@ -398,10 +418,10 @@ fn reclaim_keeps_a_dirty_worktree_and_leaves_the_item_listed() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let root_dir = std::fs::canonicalize(tmp.path()).unwrap();
         let (_repo, wt) = repo_with_worktree(&root_dir);
-        mark(&wt);
         std::fs::write(wt.join("scratch.txt"), "work").unwrap();
         let registry = registry_with_journal(&root_dir.join("state"), JournalOptions::default());
         let (root, _) = unit(&registry, "agent/dispatch-x", Some(&wt));
+        mark_naming(&wt, &root);
 
         let dry = reclaim(&registry, root.to_string(), true, None).await;
         assert_eq!(dry.verdict, ReclaimVerdict::KeptDirty, "{dry:?}");
@@ -421,7 +441,6 @@ fn reclaim_removes_a_clean_owned_worktree_keeps_its_branch_and_records_it() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let root_dir = std::fs::canonicalize(tmp.path()).unwrap();
         let (repo, wt) = repo_with_worktree(&root_dir);
-        mark(&wt);
         // One commit no remote holds: counted, never blocking (D5).
         std::fs::write(wt.join("b.txt"), "b").unwrap();
         for args in [&["add", "."][..], &["commit", "-qm", "b"][..]] {
@@ -433,6 +452,7 @@ fn reclaim_removes_a_clean_owned_worktree_keeps_its_branch_and_records_it() {
         }
         let registry = registry_with_journal(&root_dir.join("state"), JournalOptions::default());
         let (root, child) = unit(&registry, "agent/dispatch-x", Some(&wt));
+        mark_naming(&wt, &root);
 
         let git_list = list(&registry, true).await.unwrap();
         let facts = git_list.items[0].git.clone().expect("asked for");
@@ -473,7 +493,6 @@ fn reclaim_keeps_and_names_a_worktree_inside_the_items_worktree() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let root_dir = std::fs::canonicalize(tmp.path()).unwrap();
         let (repo, wt) = repo_with_worktree(&root_dir);
-        mark(&wt);
         let nested = wt.join("pr-worktree");
         let out = crate::git_env::fixture_git(&repo, &root_dir)
             .args([
@@ -491,6 +510,7 @@ fn reclaim_keeps_and_names_a_worktree_inside_the_items_worktree() {
         // nested check wins, so the report names it (issue #2285).
         let registry = registry_with_journal(&root_dir.join("state"), JournalOptions::default());
         let (root, _) = unit(&registry, "agent/dispatch-x", Some(&wt));
+        mark_naming(&wt, &root);
 
         let outcome = reclaim(&registry, root.to_string(), false, None).await;
         assert_eq!(
@@ -581,8 +601,9 @@ fn finished_work(
 /// PR #2431 review (Greptile P1): an interrupted unit's worktree was removed
 /// and the issue dispatched again, at the same path and on the same branch,
 /// so the newer run's worktree carries the deck's marker and that branch.
-/// Once the newer run has finished, reclaiming the OLDER item keeps the tree
-/// and says why, dry run or not, and records nothing; the item stays listed.
+/// The marker names the launch that created the tree, the newer run's, so
+/// once that run has finished, reclaiming the OLDER item keeps the tree and
+/// says why, dry run or not, and records nothing; the item stays listed.
 /// When the newer run is a dispatch that was itself interrupted, reclaiming
 /// the newer item is still offered. A plain pane started later in the tree
 /// does not count (`reclaim_refuses_while_a_pane_runs_in_the_worktree_through_a_symlink`
@@ -590,45 +611,23 @@ fn finished_work(
 #[test]
 fn reclaim_of_an_older_item_keeps_the_worktree_a_newer_run_uses() {
     rt().block_on(async {
-        let tmp = crate::test_temp::tempdir().unwrap();
-        let root_dir = std::fs::canonicalize(tmp.path()).unwrap();
-        let (_repo, wt) = repo_with_worktree(&root_dir);
-        mark(&wt);
-        // The newer run's work, committed, so its tree is clean and nothing
-        // but the ownership check stands between it and the removal.
-        std::fs::write(wt.join(".notes"), "the newer run's notes").unwrap();
-        git_in(&wt, &root_dir, &["add", "."]);
-        git_in(&wt, &root_dir, &["commit", "-qm", "newer run"]);
-        let registry = registry_with_journal(&root_dir.join("state"), JournalOptions::default());
-        let (older, _) = unit(&registry, "agent/dispatch-x", Some(&wt));
-        // Its schedule fired the issue again: an issue dispatch.
-        finished_work(
-            &registry,
+        let fx = NewerRunFixture::new();
+        let registry = &fx.registry;
+        let older = fx.older(registry);
+        // Its schedule fired the issue again: an issue dispatch, which
+        // created the tree again and marked it as its own.
+        let newer_fire = finished_work(
+            registry,
             7,
             Launch::IssueDispatch,
             "agent/dispatch-x",
-            &wt,
+            &fx.wt,
             CloseHow::FireDone,
         );
+        mark_naming(&fx.wt, &newer_fire);
 
-        for dry_run in [true, false] {
-            let outcome = reclaim(&registry, older.to_string(), dry_run, None).await;
-            assert_eq!(
-                reason_of(&outcome),
-                Some(RefusalReason::NewerRun),
-                "dry run {dry_run}: {outcome:?}"
-            );
-            assert_eq!(outcome.verdict, ReclaimVerdict::Refused);
-            assert_eq!(
-                outcome.message,
-                crate::interrupted_work::REFUSED_NEWER_RUN,
-                "the sentence says why it was kept"
-            );
-            assert_eq!(outcome.worktree.as_deref(), Some(&*wt.to_string_lossy()));
-            assert!(wt.join(".notes").is_file(), "the newer run's tree is kept");
-        }
-        assert!(closes(&registry).iter().all(|(work, _)| *work != older));
-        let listed_ids: Vec<WorkId> = listed(&registry)
+        fx.assert_older_is_refused(registry, &older).await;
+        let listed_ids: Vec<WorkId> = listed(registry)
             .await
             .items
             .into_iter()
@@ -642,15 +641,407 @@ fn reclaim_of_an_older_item_keeps_the_worktree_a_newer_run_uses() {
 
         // A newer run that was itself interrupted: the older item is still
         // refused, and the newer one is the one reclaim acts on.
-        let (newer, _) = unit(&registry, "agent/dispatch-x", Some(&wt));
-        let outcome = reclaim(&registry, older.to_string(), true, None).await;
+        let (newer, _) = unit(registry, "agent/dispatch-x", Some(&fx.wt));
+        mark_naming(&fx.wt, &newer);
+        let outcome = reclaim(registry, older.to_string(), true, None).await;
         assert_eq!(reason_of(&outcome), Some(RefusalReason::NewerRun));
-        let outcome = reclaim(&registry, newer.to_string(), true, None).await;
+        let outcome = reclaim(registry, newer.to_string(), true, None).await;
         assert_eq!(
             outcome.verdict,
             ReclaimVerdict::WouldRemove,
             "the newest run's item can be reclaimed: {outcome:?}"
         );
+    });
+}
+
+/// What every newer-run regression starts from: a clean linked worktree
+/// holding a newer run's committed work, so nothing but the ownership check
+/// stands between it and the removal, and a journal under `state`.
+struct NewerRunFixture {
+    _tmp: tempfile::TempDir,
+    root_dir: PathBuf,
+    wt: PathBuf,
+    registry: Arc<AgentPtyRegistry>,
+}
+
+impl NewerRunFixture {
+    fn new() -> Self {
+        Self::with_journal(|_| {})
+    }
+
+    /// The fixture, with `before_open` run on the state directory before the
+    /// journal is opened (to plant another run's segment).
+    fn with_journal(before_open: impl FnOnce(&Path)) -> Self {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let root_dir = std::fs::canonicalize(tmp.path()).unwrap();
+        let (_repo, wt) = repo_with_worktree(&root_dir);
+        std::fs::write(wt.join(".notes"), "the newer run's notes").unwrap();
+        git_in(&wt, &root_dir, &["add", "."]);
+        git_in(&wt, &root_dir, &["commit", "-qm", "newer run"]);
+        let state = root_dir.join("state");
+        before_open(&state);
+        let registry = registry_with_journal(&state, JournalOptions::default());
+        NewerRunFixture {
+            _tmp: tmp,
+            root_dir,
+            wt,
+            registry,
+        }
+    }
+
+    /// The older, interrupted unit in the worktree.
+    fn older(&self, registry: &AgentPtyRegistry) -> WorkId {
+        unit(registry, "agent/dispatch-x", Some(&self.wt)).0
+    }
+
+    /// Reclaiming `older`, dry run and not, is refused because another run
+    /// created the tree, and the tree and its newer work are still there;
+    /// nothing records a close of `older`.
+    async fn assert_older_is_refused(&self, registry: &Arc<AgentPtyRegistry>, older: &WorkId) {
+        for dry_run in [true, false] {
+            let outcome = reclaim(registry, older.to_string(), dry_run, None).await;
+            assert_eq!(
+                reason_of(&outcome),
+                Some(RefusalReason::NewerRun),
+                "dry run {dry_run}: {outcome:?}"
+            );
+            assert_eq!(outcome.verdict, ReclaimVerdict::Refused);
+            assert_eq!(
+                outcome.message,
+                crate::interrupted_work::REFUSED_NEWER_RUN,
+                "the sentence says why it was kept"
+            );
+            assert_eq!(
+                outcome.worktree.as_deref(),
+                Some(&*self.wt.to_string_lossy())
+            );
+            assert!(
+                self.wt.join(".notes").is_file(),
+                "dry run {dry_run}: the newer run's tree is kept"
+            );
+        }
+        assert!(closes(registry).iter().all(|(work, _)| work != older));
+    }
+}
+
+/// Record the attempt of `work`, which exited, and its close: a newer run
+/// that finished. Its `opened` is written only with `opened`, and names
+/// `workspace` (which may be none).
+fn finished_launch(
+    registry: &AgentPtyRegistry,
+    work: &WorkId,
+    agent: u64,
+    opened: bool,
+    workspace: Option<crate::work_journal::Workspace>,
+) {
+    if opened {
+        record(
+            registry,
+            Event::Opened {
+                work: work.clone(),
+                launch: Launch::IssueDispatch,
+                parent: None,
+                refs: Box::new(Refs {
+                    branch: Some("agent/dispatch-x".to_string()),
+                    ..Refs::default()
+                }),
+                workspace,
+            },
+        );
+    }
+    let attempt = AttemptId::new(RUN, agent).unwrap();
+    record(
+        registry,
+        Event::AttemptStarted {
+            work: work.clone(),
+            attempt: attempt.clone(),
+            pane: format!("pane-{agent}"),
+            agent,
+            role: None,
+        },
+    );
+    record(
+        registry,
+        Event::AttemptEnded {
+            work: work.clone(),
+            attempt,
+            how: EndHow::Exited,
+            code: Some(0),
+            cause: None,
+        },
+    );
+    record(
+        registry,
+        Event::Closed {
+            work: work.clone(),
+            how: CloseHow::FireDone,
+        },
+    );
+}
+
+/// PR #2431 round 2, auditor A1: the journal is best effort, so the newer
+/// run that created the tree again may have no `opened` line at all (a full
+/// writer queue dropped it). The tree's marker names that run's launch, so
+/// reclaiming the older item keeps the tree.
+#[test]
+fn reclaim_keeps_a_newer_runs_tree_whose_opened_line_was_dropped() {
+    rt().block_on(async {
+        let fx = NewerRunFixture::new();
+        let registry = &fx.registry;
+        let older = fx.older(registry);
+        let newer = journal(registry).mint_work_id().unwrap();
+        finished_launch(registry, &newer, 7, false, None);
+        mark_naming(&fx.wt, &newer);
+
+        fx.assert_older_is_refused(registry, &older).await;
+    });
+}
+
+/// PR #2431 round 2, auditor A1: the newer run's `opened` was written, but
+/// with no workspace (the journal writes none for a path it cannot record).
+/// The marker still names that run, so the older item's reclaim keeps it.
+#[test]
+fn reclaim_keeps_a_newer_runs_tree_whose_opened_line_names_no_workspace() {
+    rt().block_on(async {
+        let fx = NewerRunFixture::new();
+        let registry = &fx.registry;
+        let older = fx.older(registry);
+        let newer = journal(registry).mint_work_id().unwrap();
+        finished_launch(registry, &newer, 7, true, None);
+        mark_naming(&fx.wt, &newer);
+
+        fx.assert_older_is_refused(registry, &older).await;
+    });
+}
+
+/// PR #2431 round 2, auditor A2: the newer run recorded its workspace
+/// through a symlinked parent that was removed afterwards, so its recorded
+/// path no longer leads to the tree. The marker names the newer run, so the
+/// older item's reclaim keeps the tree.
+#[test]
+fn reclaim_keeps_a_newer_runs_tree_recorded_through_a_removed_alias() {
+    rt().block_on(async {
+        let fx = NewerRunFixture::new();
+        let registry = &fx.registry;
+        let older = fx.older(registry);
+        let alias = fx.root_dir.join("alias");
+        std::os::unix::fs::symlink(&fx.root_dir, &alias).unwrap();
+        let through_alias = alias.join(fx.wt.file_name().unwrap());
+        let workspace = journal(registry).workspace(&through_alias);
+        assert!(
+            workspace
+                .as_ref()
+                .is_some_and(|w| w.as_str().contains("/alias/")),
+            "fixture precondition: the workspace keeps the alias: {workspace:?}"
+        );
+        let newer = journal(registry).mint_work_id().unwrap();
+        finished_launch(registry, &newer, 7, true, workspace);
+        std::fs::remove_file(&alias).unwrap();
+        mark_naming(&fx.wt, &newer);
+
+        fx.assert_older_is_refused(registry, &older).await;
+    });
+}
+
+/// One line of the dead run `run`'s segment, at `seq` and `ts_ms`.
+fn planted_line(run: &str, seq: u64, ts_ms: u64, event: Event) -> String {
+    serde_json::to_string(&crate::work_journal::Line {
+        v: crate::work_journal::SCHEMA_VERSION,
+        seq,
+        ts_ms,
+        run: run.to_string(),
+        event,
+    })
+    .unwrap()
+}
+
+/// PR #2431 round 2, auditor A3: the wall clock stepped back between the
+/// older item's launch and the newer run's, so in one run the newer
+/// `opened` has the higher `seq` and the lower `ts_ms`, and a read ordered
+/// by time puts it first. The marker names the newer run, so the older
+/// item's reclaim keeps the tree.
+#[test]
+fn reclaim_keeps_a_newer_runs_tree_when_the_clock_stepped_back() {
+    rt().block_on(async {
+        let older = WorkId::parse("w-abcdefgh-00000000000000a1").unwrap();
+        let newer = WorkId::parse("w-abcdefgh-00000000000000b2").unwrap();
+        let wt_slot: std::sync::Arc<std::sync::Mutex<Option<PathBuf>>> = Default::default();
+        let slot = std::sync::Arc::clone(&wt_slot);
+        let (planted_older, planted_newer) = (older.clone(), newer.clone());
+        let fx = NewerRunFixture::with_journal(move |state| {
+            let (older, newer) = (planted_older, planted_newer);
+            let wt = state.parent().unwrap().join("wt");
+            let workspace = crate::work_journal::Workspace::from_path(&wt);
+            *slot.lock().unwrap() = Some(wt);
+            let run = "r0";
+            let opened = |work: &WorkId, launch| Event::Opened {
+                work: work.clone(),
+                launch,
+                parent: None,
+                refs: Box::new(Refs {
+                    branch: Some("agent/dispatch-x".to_string()),
+                    ..Refs::default()
+                }),
+                workspace: workspace.clone(),
+            };
+            let attempt = |agent| AttemptId::new(run, agent).unwrap();
+            let lines = [
+                planted_line(run, 1, 2_000, opened(&older, Launch::Dispatch)),
+                planted_line(
+                    run,
+                    2,
+                    2_001,
+                    Event::AttemptStarted {
+                        work: older.clone(),
+                        attempt: attempt(1),
+                        pane: "pane-1".into(),
+                        agent: 1,
+                        role: None,
+                    },
+                ),
+                planted_line(
+                    run,
+                    3,
+                    2_002,
+                    Event::AttemptEnded {
+                        work: older.clone(),
+                        attempt: attempt(1),
+                        how: EndHow::Interrupted,
+                        code: None,
+                        cause: None,
+                    },
+                ),
+                // The clock stepped back: a later line, an earlier time.
+                planted_line(run, 4, 1_000, opened(&newer, Launch::IssueDispatch)),
+                planted_line(
+                    run,
+                    5,
+                    1_001,
+                    Event::AttemptStarted {
+                        work: newer.clone(),
+                        attempt: attempt(2),
+                        pane: "pane-2".into(),
+                        agent: 2,
+                        role: None,
+                    },
+                ),
+                planted_line(
+                    run,
+                    6,
+                    1_002,
+                    Event::AttemptEnded {
+                        work: newer.clone(),
+                        attempt: attempt(2),
+                        how: EndHow::Exited,
+                        code: Some(0),
+                        cause: None,
+                    },
+                ),
+                planted_line(
+                    run,
+                    7,
+                    1_003,
+                    Event::Closed {
+                        work: newer.clone(),
+                        how: CloseHow::FireDone,
+                    },
+                ),
+            ];
+            let dir = state.join(crate::work_journal::DIR_NAME);
+            std::fs::create_dir_all(&dir).unwrap();
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(state, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::write(dir.join("run-r0.jsonl"), lines.join("\n") + "\n").unwrap();
+        });
+        assert_eq!(wt_slot.lock().unwrap().as_deref(), Some(fx.wt.as_path()));
+        let registry = &fx.registry;
+        let listed_ids: Vec<WorkId> = listed(registry)
+            .await
+            .items
+            .into_iter()
+            .map(|item| item.id)
+            .collect();
+        assert_eq!(
+            listed_ids,
+            vec![older.clone()],
+            "fixture precondition: the planted older item is listed"
+        );
+        mark_naming(&fx.wt, &newer);
+
+        fx.assert_older_is_refused(registry, &older).await;
+    });
+}
+
+/// PR #2431 round 2, auditor A1 (late write): the newer run's launch
+/// lands after the reclaim's first checks and before the removal. Played
+/// here by rewriting the marker to name it, and writing its journal lines,
+/// between the keep check and the last re-validation. The re-validation
+/// reads the marker again, so the tree is kept and the item stays listed.
+#[test]
+fn reclaim_keeps_the_tree_when_a_newer_launch_marks_it_before_the_removal() {
+    rt().block_on(async {
+        let fx = NewerRunFixture::new();
+        let registry = &fx.registry;
+        let older = fx.older(registry);
+        mark_naming(&fx.wt, &older);
+        let newer = journal(registry).mint_work_id().unwrap();
+        {
+            let wt = fx.wt.clone();
+            let newer = newer.clone();
+            let registry = Arc::clone(registry);
+            super::seams::arm_before_revalidate(&fx.wt, move || {
+                finished_launch(
+                    &registry,
+                    &newer,
+                    7,
+                    true,
+                    journal(&registry).workspace(&wt),
+                );
+                mark_naming(&wt, &newer);
+            });
+        }
+
+        let outcome = reclaim(registry, older.to_string(), false, None).await;
+        assert_eq!(outcome.verdict, ReclaimVerdict::KeptChanged, "{outcome:?}");
+        assert!(
+            fx.wt.join(".notes").is_file(),
+            "the newer run's tree is kept"
+        );
+        assert!(closes(registry).iter().all(|(work, _)| *work != older));
+    });
+}
+
+/// PR #2431 round 2: a marker written before it named the launch (an older
+/// build's, or one whose launch could not be recorded) cannot show the tree
+/// is still this item's, so the reclaim refuses, dry run or not, with its
+/// own reason, and removes nothing. Dismissing the item still works.
+#[test]
+fn reclaim_refuses_a_worktree_whose_marker_names_no_launch() {
+    rt().block_on(async {
+        let fx = NewerRunFixture::new();
+        let registry = &fx.registry;
+        let older = fx.older(registry);
+        mark(&fx.wt);
+
+        for dry_run in [true, false] {
+            let outcome = reclaim(registry, older.to_string(), dry_run, None).await;
+            assert_eq!(outcome.verdict, ReclaimVerdict::Refused, "{outcome:?}");
+            let wire = serde_json::to_value(&outcome).unwrap();
+            assert_eq!(
+                wire["refusal"]["reason"], "owner-unconfirmed",
+                "dry run {dry_run}: {outcome:?}"
+            );
+            assert_eq!(reason_of(&outcome), Some(RefusalReason::OwnerUnconfirmed));
+            assert_eq!(
+                outcome.message,
+                crate::interrupted_work::REFUSED_OWNER_UNCONFIRMED
+            );
+            assert!(fx.wt.join(".notes").is_file(), "the tree is kept");
+        }
+        let dismissed = dismiss(registry, vec![older.to_string()], false, None).await;
+        assert_eq!(dismissed.dismissed.len(), 1, "{dismissed:?}");
+        assert!(fx.wt.is_dir());
     });
 }
 
@@ -677,9 +1068,9 @@ fn reclaim_refuses_while_a_pane_runs_in_the_worktree_through_a_symlink() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let root_dir = std::fs::canonicalize(tmp.path()).unwrap();
         let (_repo, wt) = repo_with_worktree(&root_dir);
-        mark(&wt);
         let registry = registry_with_journal(&root_dir.join("state"), JournalOptions::default());
         let (root, _) = unit(&registry, "agent/dispatch-x", Some(&wt));
+        mark_naming(&wt, &root);
         let s = |p: &Path| p.to_string_lossy().into_owned();
 
         // Started through a symlink to the worktree.
@@ -741,9 +1132,9 @@ fn reclaim_refuses_when_a_rooted_directory_cannot_be_resolved() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let root_dir = std::fs::canonicalize(tmp.path()).unwrap();
         let (_repo, wt) = repo_with_worktree(&root_dir);
-        mark(&wt);
         let registry = registry_with_journal(&root_dir.join("state"), JournalOptions::default());
         let (root, _) = unit(&registry, "agent/dispatch-x", Some(&wt));
+        mark_naming(&wt, &root);
         let unresolvable = root_dir.join("no-such-dir").join("..").join("wt");
         let reserved = registry
             .reserve_spawn_in_for_test(&unresolvable)
@@ -775,9 +1166,9 @@ fn reclaim_removes_nothing_when_the_worktree_is_replaced_before_removal() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let root_dir = std::fs::canonicalize(tmp.path()).unwrap();
         let (repo, wt) = repo_with_worktree(&root_dir);
-        mark(&wt);
         let registry = registry_with_journal(&root_dir.join("state"), JournalOptions::default());
         let (root, _) = unit(&registry, "agent/dispatch-x", Some(&wt));
+        mark_naming(&wt, &root);
         let aside = root_dir.join("wt-aside");
         {
             let (repo, wt, aside, root_dir) =
@@ -819,9 +1210,9 @@ fn reclaim_removes_nothing_when_the_branch_is_switched_before_removal() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let root_dir = std::fs::canonicalize(tmp.path()).unwrap();
         let (_repo, wt) = repo_with_worktree(&root_dir);
-        mark(&wt);
         let registry = registry_with_journal(&root_dir.join("state"), JournalOptions::default());
         let (root, _) = unit(&registry, "agent/dispatch-x", Some(&wt));
+        mark_naming(&wt, &root);
         {
             let (wt, root_dir) = (wt.clone(), root_dir.clone());
             seams::arm_before_revalidate(&wt.clone(), move || {
@@ -845,9 +1236,9 @@ fn a_removal_that_finishes_after_the_reply_bound_is_still_recorded() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let root_dir = std::fs::canonicalize(tmp.path()).unwrap();
         let (_repo, wt) = repo_with_worktree(&root_dir);
-        mark(&wt);
         let registry = registry_with_journal(&root_dir.join("state"), JournalOptions::default());
         let (root, child) = unit(&registry, "agent/dispatch-x", Some(&wt));
+        mark_naming(&wt, &root);
         seams::arm_after_removal(&wt, || std::thread::sleep(Duration::from_millis(1500)));
 
         let outcome = reclaim_within(
@@ -1152,12 +1543,12 @@ fn a_stale_full_id_is_refused_rather_than_retargeted_to_another_item() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let root_dir = std::fs::canonicalize(tmp.path()).unwrap();
         let (_repo, wt) = repo_with_worktree(&root_dir);
-        mark(&wt);
         let registry = registry_with_journal(&root_dir.join("state"), JournalOptions::default());
         let a = interrupted_work(&registry, 1, Launch::Pane, None, None, None);
         let gone = dismiss(&registry, vec![a.to_string()], false, None).await;
         assert_eq!(gone.dismissed.len(), 1, "{gone:?}");
         let b = interrupted_unit_named(&registry, 2, a.as_str(), "agent/dispatch-x", Some(&wt));
+        mark_naming(&wt, &b);
         let now = listed(&registry).await;
         assert_eq!(now.items.len(), 1);
         assert_eq!(now.items[0].id, b);
@@ -1259,9 +1650,9 @@ fn reclaim_removes_nothing_when_the_worktree_is_swapped_after_the_first_identity
         let tmp = crate::test_temp::tempdir().unwrap();
         let root_dir = std::fs::canonicalize(tmp.path()).unwrap();
         let (_repo, wt) = repo_with_worktree(&root_dir);
-        mark(&wt);
         let registry = registry_with_journal(&root_dir.join("state"), JournalOptions::default());
         let (root, _) = unit(&registry, "agent/dispatch-x", Some(&wt));
+        mark_naming(&wt, &root);
         let aside = root_dir.join("wt-aside");
         {
             let (wt, aside) = (wt.clone(), aside.clone());
@@ -1299,7 +1690,6 @@ fn reclaim_keeps_a_worktree_nested_inside_it_after_the_keep_check() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let root_dir = std::fs::canonicalize(tmp.path()).unwrap();
         let (repo, wt) = repo_with_worktree(&root_dir);
-        mark(&wt);
         let exclude = repo.join(".git").join("info").join("exclude");
         std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
         let mut patterns = std::fs::read_to_string(&exclude).unwrap_or_default();
@@ -1307,6 +1697,7 @@ fn reclaim_keeps_a_worktree_nested_inside_it_after_the_keep_check() {
         std::fs::write(&exclude, patterns).unwrap();
         let registry = registry_with_journal(&root_dir.join("state"), JournalOptions::default());
         let (root, _) = unit(&registry, "agent/dispatch-x", Some(&wt));
+        mark_naming(&wt, &root);
         let nested = wt.join(".worktrees").join("nested");
         {
             let (repo, nested, root_dir) = (repo.clone(), nested.clone(), root_dir.clone());
@@ -1354,9 +1745,9 @@ fn reclaim_removes_nothing_when_the_repositorys_worktree_lock_cannot_be_taken() 
         let tmp = crate::test_temp::tempdir().unwrap();
         let root_dir = std::fs::canonicalize(tmp.path()).unwrap();
         let (repo, wt) = repo_with_worktree(&root_dir);
-        mark(&wt);
         let registry = registry_with_journal(&root_dir.join("state"), JournalOptions::default());
         let (root, _) = unit(&registry, "agent/dispatch-x", Some(&wt));
+        mark_naming(&wt, &root);
         let lock_path = crate::issue_dispatch_run::worktree_lock_path(&repo)
             .await
             .expect("a lock path");
@@ -1524,7 +1915,6 @@ fn busy_reclaims_leave_no_lock_waiter_behind_in_the_blocking_pool() {
     let tmp = crate::test_temp::tempdir().unwrap();
     let root_dir = std::fs::canonicalize(tmp.path()).unwrap();
     let (repo, wt) = repo_with_worktree(&root_dir);
-    mark(&wt);
     let lock_path = rt
         .block_on(crate::issue_dispatch_run::worktree_lock_path(&repo))
         .expect("a lock path");
@@ -1532,6 +1922,7 @@ fn busy_reclaims_leave_no_lock_waiter_behind_in_the_blocking_pool() {
     let answers = rt.block_on(async {
         let registry = registry_with_journal(&root_dir.join("state"), JournalOptions::default());
         let (root, _) = unit(&registry, "agent/dispatch-x", Some(&wt));
+        mark_naming(&wt, &root);
         let mut answers = Vec::new();
         for _ in 0..4 {
             let outcome = tokio::time::timeout(
@@ -1576,9 +1967,9 @@ fn a_lock_that_cannot_be_opened_is_not_reported_as_another_change() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let root_dir = std::fs::canonicalize(tmp.path()).unwrap();
         let (repo, wt) = repo_with_worktree(&root_dir);
-        mark(&wt);
         let registry = registry_with_journal(&root_dir.join("state"), JournalOptions::default());
         let (root, _) = unit(&registry, "agent/dispatch-x", Some(&wt));
+        mark_naming(&wt, &root);
         let lock_path = crate::issue_dispatch_run::worktree_lock_path(&repo)
             .await
             .expect("a lock path");
@@ -1733,12 +2124,12 @@ fn reclaim_keeps_a_worktree_holding_another_repositorys_worktree() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let root_dir = std::fs::canonicalize(tmp.path()).unwrap();
         let (repo, wt) = repo_with_worktree(&root_dir);
-        mark(&wt);
         ignore_worktrees_dir(&repo);
         let child = wt.join(".worktrees").join("b-child");
         foreign_worktree_at(&root_dir, &child);
         let registry = registry_with_journal(&root_dir.join("state"), JournalOptions::default());
         let (root, _) = unit(&registry, "agent/dispatch-x", Some(&wt));
+        mark_naming(&wt, &root);
 
         for dry_run in [true, false] {
             let outcome = reclaim(&registry, root.to_string(), dry_run, None).await;
@@ -1776,11 +2167,11 @@ fn reclaim_keeps_a_worktree_another_repository_nests_in_after_the_keep_check() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let root_dir = std::fs::canonicalize(tmp.path()).unwrap();
         let (repo, wt) = repo_with_worktree(&root_dir);
-        mark(&wt);
         ignore_worktrees_dir(&repo);
         let child = wt.join(".worktrees").join("b-child");
         let registry = registry_with_journal(&root_dir.join("state"), JournalOptions::default());
         let (root, _) = unit(&registry, "agent/dispatch-x", Some(&wt));
+        mark_naming(&wt, &root);
         {
             let (root_dir, child) = (root_dir.clone(), child.clone());
             seams::arm_before_revalidate(&wt.clone(), move || {
@@ -1914,9 +2305,9 @@ fn reclaim_keeps_the_tree_when_the_keep_checks_output_floods() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let root_dir = std::fs::canonicalize(tmp.path()).unwrap();
         let (_repo, wt) = repo_with_worktree(&root_dir);
-        mark(&wt);
         let registry = registry_with_journal(&root_dir.join("state"), JournalOptions::default());
         let (root, _) = unit(&registry, "agent/dispatch-x", Some(&wt));
+        mark_naming(&wt, &root);
         for (status, worktree, kept) in [
             ("flood", "real", ReclaimVerdict::KeptDirty),
             ("clean", "flood", ReclaimVerdict::KeptCouldNotCheck),
@@ -1952,9 +2343,9 @@ fn reclaim_kills_and_reaps_a_stalled_keep_check_and_keeps_the_tree() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let root_dir = std::fs::canonicalize(tmp.path()).unwrap();
         let (_repo, wt) = repo_with_worktree(&root_dir);
-        mark(&wt);
         let registry = registry_with_journal(&root_dir.join("state"), JournalOptions::default());
         let (root, _) = unit(&registry, "agent/dispatch-x", Some(&wt));
+        mark_naming(&wt, &root);
         let script = keep_check_stand_in(&root_dir, "stall", "real");
         seams::arm_keep_check(&wt, script, Duration::from_secs(1));
         for dry_run in [true, true, false] {

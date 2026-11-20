@@ -111,10 +111,12 @@ The deck keeps the worktree, removes nothing and says why when:
 - other worktrees or Git checkouts lie inside it, of its own repository or of any other, which it names: move or remove those first;
 - the deck could not check whether it has uncommitted changes or whether anything like that lies inside it;
 - the deck could not get its repository's worktree lock in time, or could not take it at all: reclaim it again;
-- it was moved, replaced or switched to another branch while it was being reclaimed: list the interrupted work again;
+- it was moved, replaced, created again by a later run or switched to another branch while it was being reclaimed: list the interrupted work again;
 - Git could not remove it, or the removal did not finish in time. In that last case it may still be removed, and the deck records it if it is.
 
 It refuses, also without removing anything, when the worktree is no longer on disk, is not a Git worktree, has a different branch checked out than the one the work started on, was not created by the deck, or still has an agent running in it, or when the deck cannot tell whether one is. It also refuses an older item whose work was dispatched again at the same folder, since that worktree now holds the later run's work: `Refused: a later run used this worktree, …`. Dismiss the older item; the later run's item is the one to reclaim if a restart interrupted it too.
+
+It also refuses when it cannot confirm the worktree is still the item's: `Refused: the deck cannot confirm this worktree is still this item's, …`. You see this for a worktree an older version of the deck created, since those do not record which run they were created for, and for one whose record the deck cannot read. Dismiss the item. If you no longer need the worktree, copy out anything you want to keep, including files Git ignores, then run `git worktree remove <worktree>` from the repository, or let `dot-agent-deck worktree reclaim` remove it once its pull request has merged ([Dispatcher Mode → Finish up](dispatcher-mode.md#finish-up)).
 
 The branch is never deleted. A kept branch stops you dispatching a unit of the same name again; delete it with `git branch -D agent/dispatch-<name>` when you no longer need it.
 

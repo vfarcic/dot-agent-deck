@@ -91,8 +91,8 @@ export interface InterruptedShow {
 
 export type RefusalReason =
   | "agent-caller" | "bad-request" | "too-large" | "unreadable" | "incomplete-read" | "not-listed" | "ambiguous"
-  | "plain-agent" | "no-worktree" | "not-linked-worktree" | "branch-mismatch" | "not-owned" | "still-in-use"
-  | "in-use-unknown" | "not-recorded" | "unknown";
+  | "plain-agent" | "no-worktree" | "not-linked-worktree" | "branch-mismatch" | "not-owned" | "newer-run"
+  | "owner-unconfirmed" | "still-in-use" | "in-use-unknown" | "not-recorded" | "unknown";
 
 export interface Refusal { reason: RefusalReason | string; message: string }
 
@@ -322,6 +322,7 @@ export const REFUSED_NOT_LINKED_WORKTREE = "Refused: its directory is not a link
 export const REFUSED_BRANCH_MISMATCH = "Refused: its worktree has another branch checked out than the one it was started on.";
 export const REFUSED_NOT_OWNED = "Refused: the deck did not create this worktree.";
 export const REFUSED_NEWER_RUN = "Refused: a later run used this worktree, so reclaiming this older item could remove that run's work. Dismiss this item instead.";
+export const REFUSED_OWNER_UNCONFIRMED = "Refused: the deck cannot confirm this worktree is still this item's, for example because an older version of the deck created it. Dismiss this item instead, and remove the worktree with Git if you no longer need it.";
 export const REFUSED_STILL_IN_USE = "Refused: an agent is still running in its worktree.";
 export const REFUSED_IN_USE_UNKNOWN = "Refused: the deck could not tell whether an agent is still running in its worktree.";
 export const REFUSED_NOT_RECORDED = "Refused: the deck could not record the dismissal.";
@@ -460,6 +461,7 @@ const REFUSAL_SENTENCES: Record<string, string> = {
   "branch-mismatch": REFUSED_BRANCH_MISMATCH,
   "not-owned": REFUSED_NOT_OWNED,
   "newer-run": REFUSED_NEWER_RUN,
+  "owner-unconfirmed": REFUSED_OWNER_UNCONFIRMED,
   "still-in-use": REFUSED_STILL_IN_USE,
   "in-use-unknown": REFUSED_IN_USE_UNKNOWN,
   "not-recorded": REFUSED_NOT_RECORDED,

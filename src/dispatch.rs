@@ -664,13 +664,14 @@ async fn create_dispatch_worktree(
     paths: &DispatchPaths,
     name: &str,
     base: Option<&DispatchBase>,
+    launch: Option<&crate::work_journal::WorkId>,
 ) -> Result<WorktreeCreation, String> {
     create_worktree_from(
         clone_dir,
         &paths.worktree_dir,
         &paths.branch,
         false,
-        Creator::dispatch(name),
+        Creator::dispatch(name).for_launch(launch),
         base.map(|b| b.sha.as_str()),
     )
     .await
@@ -1104,7 +1105,13 @@ pub async fn handle_dispatch(
     // reply names is the unit's base. See [`resolve_dispatch_base`].
     let base = resolve_dispatch_base(&clone_dir).await;
 
-    match create_dispatch_worktree(&clone_dir, &paths, name, base.as_ref()).await {
+    // PR #2431 round 2: the dispatch's work id, minted before its worktree
+    // exists so the worktree's ownership marker names this launch. That is
+    // what lets an interrupted-work reclaim tell this dispatch's tree from
+    // one a later run created at the same path. Writes nothing until the
+    // launch is held below.
+    let minted = ctx.registry.work().mint_launch();
+    match create_dispatch_worktree(&clone_dir, &paths, name, base.as_ref(), minted.as_ref()).await {
         Ok(WorktreeCreation::Created) => {}
         Ok(WorktreeCreation::AlreadyClaimed) => {
             return DispatchResult {
@@ -1175,11 +1182,14 @@ pub async fn handle_dispatch(
 
     // PRD #1889: the dispatch's work, a child of the dispatcher's. Its
     // `opened` is held until the unit is registered, so it names the unit.
-    let work_id = ctx.registry.work().dispatch_minted(
-        ctx.caller_work.as_ref(),
-        &paths.branch,
-        &paths.worktree_dir,
-    );
+    let work_id = minted.and_then(|work| {
+        ctx.registry.work().dispatch_held(
+            work,
+            ctx.caller_work.as_ref(),
+            &paths.branch,
+            &paths.worktree_dir,
+        )
+    });
     // PRD #1790: the task as the dispatcher gave it, saved beside the
     // worktree under the unit's work id, so a restore can hand it back.
     crate::dispatch_task::save_or_warn(&paths.worktree_dir, work_id.as_ref(), task).await;
@@ -1662,7 +1672,7 @@ mod tests {
         assert_ne!(moved, base.sha, "the premise: HEAD really moved");
 
         assert_eq!(
-            create_dispatch_worktree(&repo, &paths, "race", Some(&base)).await,
+            create_dispatch_worktree(&repo, &paths, "race", Some(&base), None).await,
             Ok(WorktreeCreation::Created)
         );
         assert_eq!(
@@ -1683,7 +1693,7 @@ mod tests {
         let paths = derive_dispatch_paths(&repo, "no-base");
 
         assert_eq!(
-            create_dispatch_worktree(&repo, &paths, "no-base", None).await,
+            create_dispatch_worktree(&repo, &paths, "no-base", None, None).await,
             Ok(WorktreeCreation::Created)
         );
         assert_eq!(
