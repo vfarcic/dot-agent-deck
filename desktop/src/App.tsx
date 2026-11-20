@@ -87,7 +87,7 @@ import { dashboardFilterFromParams } from "./lib/dashboardFilter";
 import { VOICE_ACTIONS, dispatchVoiceAction, saysCommand, type DashboardScroll, type DeckOverlay, type NewAgentVoice, type VoiceContextChannel, type VoiceDispatchContext, type VoiceDispatchTarget, type VoiceOverviewContext, type VoicePanelContext, type VoiceScreenContext, type PullRequestContext, type VoiceActionContext } from "./lib/voiceActions";
 import { terminalInputState, unreachableDeckTerminalState } from "./lib/terminalInput";
 import { useRestartNotice } from "./hooks/useRestartNotice";
-import { interruptedFooter, listedCount } from "./lib/interruptedWork";
+import { INTERRUPTED_UNREAD, interruptedFooter, listedCount, mayHaveInterrupted } from "./lib/interruptedWork";
 import { bindViewIncarnation, viewAgent, viewAgentReplaced, viewBound } from "./lib/viewIdentity";
 import { applyAppearance } from "./lib/appearance";
 import { desktopOrchestrationPlatformIssue } from "./lib/platform";
@@ -633,11 +633,12 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     notice is unchanged.
   */
   const interruptedWork = runtime.interruptedWork;
-  const interruptedListing = interruptedWork ? Object.entries(interruptedWork.decks).filter(([, deck]) => listedCount(deck.list) > 0) : [];
+  /* PR #2431 review — every daemon the dashboard draws a banner for, an empty list it could not read whole included. */
+  const interruptedListing = interruptedWork ? Object.entries(interruptedWork.decks).filter(([, deck]) => mayHaveInterrupted(deck.list)) : [];
   const interruptedTotal = interruptedListing.reduce((sum, [, deck]) => sum + listedCount(deck.list), 0);
-  const restartInterrupted: RestartInterrupted | undefined = restart.notice && interruptedWork && interruptedTotal > 0
+  const restartInterrupted: RestartInterrupted | undefined = restart.notice && interruptedWork && interruptedListing.length > 0
     ? {
-      text: interruptedFooter(interruptedTotal),
+      text: interruptedTotal > 0 ? interruptedFooter(interruptedTotal) : INTERRUPTED_UNREAD,
       context: {
         showInterruptedWork: (deckId?: string) => {
           railContext.navigate({ kind: "overview" });

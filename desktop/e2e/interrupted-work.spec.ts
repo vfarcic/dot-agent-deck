@@ -205,6 +205,38 @@ test.describe("Interrupted work", () => {
     await expect(dialog.getByTestId("interrupted-row")).toHaveCount(3);
   });
 
+  /** Scenario: with the Interrupted work dialog open, `X` hides the deck's banner behind it, as the TUI's `X` hides its row from the overlay, and leaves the dialog open with all three items listed; it does the same from an item's details and from the Dismiss all question, and dismisses nothing. */
+  test("X in the dialog hides the banner and leaves the dialog open", async ({ page }) => {
+    const dialog = page.getByTestId("interrupted-dialog");
+    const banner = page.getByTestId("interrupted-banner");
+    const from: Record<string, () => Promise<void>> = {
+      list: async () => {},
+      details: async () => {
+        await page.keyboard.press("Enter");
+        await expect(dialog.getByTestId("interrupted-details-view")).toBeVisible();
+      },
+      "the Dismiss all question": async () => {
+        await page.keyboard.press("D");
+        await expect(dialog.getByTestId("interrupted-dismiss-all")).toHaveAttribute("data-presented", "true");
+      },
+    };
+    for (const [view, reach] of Object.entries(from)) {
+      await openDashboard(page);
+      await expect(banner).toBeVisible();
+      await page.keyboard.press("I");
+      await expect(dialog.getByTestId("interrupted-row")).toHaveCount(3);
+      await reach();
+      await page.keyboard.press("X");
+      await expect(banner, view).toHaveCount(0);
+      await expect(dialog, view).toBeVisible();
+      await page.keyboard.press("q");
+      await page.keyboard.press("q");
+      await expect(dialog, view).toHaveCount(0);
+      await page.keyboard.press("I");
+      await expect(dialog.getByTestId("interrupted-row"), `${view}: nothing was dismissed`).toHaveCount(3);
+    }
+  });
+
   /** Scenario: in a window too short for the dialog, `j` scrolls an item's details down and `k` back up, the same with its report text shown and with the Dismiss all question; none of them changes the selected item, answers the question or dismisses anything. */
   test("j and k scroll the details, the report text and a question", async ({ page }) => {
     await openDashboard(page);

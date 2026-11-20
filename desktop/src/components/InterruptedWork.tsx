@@ -6,7 +6,7 @@ import {
   DAEMON_FAILED, DISMISS_ACTION, DISMISS_ALL_ACTION, INTERRUPTED_NO_NEXT_PAGE, INTERRUPTED_UNREAD, INTERRUPTED_NO_PREVIOUS_PAGE, INTERRUPTED_NO_REPORTS, INTERRUPTED_WAIT, INTERRUPTED_WORK_TITLE, ITEM_CUT, LABEL_BRANCH, LABEL_GIT, LABEL_ISSUE,
   LABEL_LAST_ENTRY, LABEL_NESTED_WORKTREE, LABEL_PROGRESS, LABEL_REPORT, LABEL_STARTED_BY, LABEL_WORKTREE, LIST_INCOMPLETE, MAX_SHOWN_REPORTS, NOTHING_INTERRUPTED, OTHER_AGENTS_GROUP, RECLAIM_ACTION, RECLAIM_EXPLANATION,
   REFUSED_NOT_LISTED, REFUSED_PLAIN_AGENT, REPORT_CUT, REPORT_UNREADABLE, UNSUPPORTED,
-  directoryLabel, dismissAllQuestion, dismissMessage, dismissOneQuestion, displayValue, formatTime, gitFactsLine, interruptedFooter, itemName, keptUntil, kindLabel, lastEntryLine, omittedSentence, orderedItems, progressFact,
+  detailsItem, directoryLabel, dismissAllQuestion, dismissMessage, dismissOneQuestion, displayValue, formatTime, gitFactsLine, interruptedFooter, itemName, keptUntil, kindLabel, lastEntryLine, mayHaveInterrupted, omittedSentence, orderedItems, progressFact,
   progressLine, publishInterruptedDialog, reclaimMessage, reportLines, reportRangeSentence, resolveSpokenItem, unpushedSentence, wouldRemove,
   type InterruptedDialogControls, type InterruptedItem, type InterruptedShow, type InterruptedTarget, type ReclaimOutcome,
 } from "../lib/interruptedWork";
@@ -418,6 +418,16 @@ export function InterruptedWorkDialog({ deckLabel, deck, target, runtime, contro
       switch (event.key) {
         case "Escape": case "q": escape(); return true;
         case "I": if (view.kind !== "list") return false; VOICE_ACTIONS.closeInterruptedWork.run(registry); return true;
+        /*
+          PR #2431 review (CLAUDE.md rule 22) — `X`, the TUI's Hide, from
+          every view of the dialog as the TUI's overlay offers it: hides this
+          deck's banner behind the dialog, which stays open, and dismisses
+          nothing. Only while that banner is up, as the dashboard's `X`.
+        */
+        case "X":
+          if (!mayHaveInterrupted(deck.list) || runtime.hidden(target.deckId)) return false;
+          VOICE_ACTIONS.hideInterruptedWork.run({ hideInterruptedWork: runtime.hide }, target.deckId);
+          return true;
         case "ArrowDown": case "j": case "ArrowUp": case "k": {
           /*
             Final reviewer 3 — in an item's details, its report text and a
@@ -494,7 +504,7 @@ export function InterruptedWorkDialog({ deckLabel, deck, target, runtime, contro
         </header>
         {message && <p className="interrupted-message" role="status" data-testid="interrupted-message">{message}</p>}
         {view.kind === "list" && <ListView deck={deck} ordered={ordered} selected={selected} busy={busy} registry={registry} listRef={listRef} />}
-        {view.kind === "details" && <DetailsView view={view} item={view.show?.item ?? item(view.id)} registry={registry} />}
+        {view.kind === "details" && <DetailsView view={view} item={detailsItem(view.show?.item, item(view.id))} registry={registry} />}
         {view.kind === "reclaim" && <ReclaimView view={view} item={item(view.id)} busy={busy} registry={registry} question={question} presented={presented} />}
         {view.kind === "dismissOne" && confirmItem && (
           <div className="interrupted-confirm" role="alertdialog" aria-labelledby="interrupted-dismiss-question" data-testid="interrupted-dismiss-one" data-presented={presented ? "true" : undefined}>

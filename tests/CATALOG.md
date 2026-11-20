@@ -846,14 +846,14 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 - **Layer:** L1 in-process `TestBackend` (`tests/render_interrupted_work.rs`, seam `run_interrupted_work_seam`): the daemon's answers are handed in where the background request would deliver them, keys go through the production `handle_key_event`.
 - **Agent:** none.
 - **Asserts:** a unit listed with Git facts shows `LABEL_GIT` and `git_facts_line`'s words in its details; after `Enter` asks for its reports and the show answer carries the item with `git: None`, the details show the report's text and still the same Git line (PR #2431 review, Greptile P2).
-- **Does not assert:** the desktop dialog (`InterruptedWork.test.tsx`, "a report page keeps the Git facts the list read"); the daemon's show answer itself, which carries no Git facts by design.
+- **Does not assert:** the desktop dialog (`desktop/src/components/InterruptedWork.test.tsx`, "keeps the list's Git facts when the report page arrives"); the daemon's show answer itself, which carries no Git facts by design.
 - **Platform coverage:** mac+linux.
 
 ##### journal/interrupted/035 — With an empty list the daemon could not read whole, the restart notice still leads to the list.
 - **Layer:** L1 in-process `TestBackend` (`tests/render_interrupted_work.rs`, seam `run_interrupted_work_seam`): the daemon's answer is handed in where the background request would deliver it, keys go through the production `handle_key_event`.
 - **Agent:** none.
 - **Asserts:** in `UiMode::RestartNotice` over an empty list marked incomplete, the notice's line shows `INTERRUPTED_UNREAD` wrapped inside the popup; `I` opens `Interrupted work`, which says `LIST_INCOMPLETE` (PR #2431 review, Qodo 2, the TUI half for CLAUDE.md rule 22).
-- **Does not assert:** the desktop restart toast (`App.test.tsx`, "the restart notice offers Show for an incomplete empty list").
+- **Does not assert:** the desktop restart toast (`desktop/src/components/InterruptedWork.test.tsx`, "offers Show for an incomplete empty list").
 - **Platform coverage:** mac+linux.
 
 #### journal/compat

@@ -573,6 +573,16 @@ export function mayHaveInterrupted(list: InterruptedList | undefined): boolean {
   return listedCount(list) > 0 || list?.incomplete === true;
 }
 
+/**
+ * PR #2431 review — the item an item's details show: the show's answer when
+ * there is one, with the Git facts the list read, since a show answers its
+ * item without them. The TUI's details keep them the same way.
+ */
+export function detailsItem(shown: InterruptedItem | undefined, listed: InterruptedItem | undefined): InterruptedItem | undefined {
+  if (!shown) return listed;
+  return shown.git || !listed?.git ? shown : { ...shown, git: listed.git };
+}
+
 /** An item's name, or its branch, or its id, escaped. */
 export function itemName(item: InterruptedItem): string {
   return displayValue(item.name ?? item.branch ?? item.id);

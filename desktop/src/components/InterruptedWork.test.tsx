@@ -7,7 +7,7 @@ import { createFixtureSnapshot } from "../data/fixture";
 import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, LOCAL_ENDPOINT_SELECTION, type DeckBridge, type DesktopSettingsDto } from "../lib/bridge";
 import { AGENTS_STOPPED_BY_RESTART } from "../lib/agentIdentity";
 import {
-  DISMISSED, INTERRUPTED_UNREAD, INTERRUPTED_WORK_TITLE, LIST_INCOMPLETE, NOTHING_INTERRUPTED, OTHER_AGENTS_GROUP, RECLAIM_KEPT_DIRTY, RECLAIM_REMOVED, RECLAIM_WOULD_REMOVE, REFUSED_AMBIGUOUS, REFUSED_INCOMPLETE_READ, REFUSED_NOT_LISTED, dismissAllQuestion, interruptedFooter, reportRangeSentence,
+  DISMISSED, INTERRUPTED_UNREAD, INTERRUPTED_WORK_TITLE, LIST_INCOMPLETE, NOTHING_INTERRUPTED, OTHER_AGENTS_GROUP, RECLAIM_KEPT_DIRTY, RECLAIM_REMOVED, RECLAIM_WOULD_REMOVE, REFUSED_AMBIGUOUS, REFUSED_INCOMPLETE_READ, REFUSED_NOT_LISTED, dismissAllQuestion, gitFactsLine, interruptedFooter, reportRangeSentence,
   type DismissOutcome, type InterruptedItem, type InterruptedList, type InterruptedReply, type InterruptedShow, type InterruptedTarget, type ReclaimOutcome,
 } from "../lib/interruptedWork";
 import { VOICE_ACTIONS, INTERRUPTED_RECLAIM_CHECKING, type VoiceOverviewChannel, type VoiceOverviewContext } from "../lib/voiceActions";
@@ -328,6 +328,41 @@ describe("the restart notice's interrupted work line", () => {
     expect(hint).toHaveTextContent(interruptedFooter(3));
     await act(async () => { fireEvent.click(within(hint).getByTestId("restart-toast-interrupted-show")); });
     expect(await screen.findByTestId("interrupted-dialog")).toBeInTheDocument();
+  });
+});
+
+describe("the restart notice and an incomplete empty list (PR #2431 review)", () => {
+  /** Scenario: the deck restarts and its new daemon's interrupted work list comes back empty but incomplete, so the dashboard offers a banner; the restart toast adds "The deck could not read its whole work journal, so some interrupted work may not be listed." with a Show that opens the "Interrupted work" dialog, which says the list is incomplete. */
+  it("offers Show for an incomplete empty list", async () => {
+    const { bridge } = recordingBridge({ list: { items: [], incomplete: true } });
+    const { rerender } = render(<Shell bridge={bridge} deck={deckOf("process-a")} />);
+    await act(async () => { rerender(<Shell bridge={bridge} deck={deckOf("process-b", () => [])} />); });
+    const toast = await screen.findByTestId("restart-toast");
+    const hint = await within(toast).findByTestId("restart-toast-interrupted");
+    expect(hint).toHaveTextContent(INTERRUPTED_UNREAD);
+    await act(async () => { fireEvent.click(within(hint).getByTestId("restart-toast-interrupted-show")); });
+    const dialog = await screen.findByTestId("interrupted-dialog");
+    await waitFor(() => expect(dialog).toHaveTextContent(LIST_INCOMPLETE));
+  });
+});
+
+describe("a report page keeps the Git facts the list read (PR #2431 review)", () => {
+  /** Scenario: the list is read with each item's Git facts, and the unit's details show "worktree on disk, uncommitted changes, 2 commits on no remote, branch kept, pull request open". Show reports answers the unit without Git facts, as the daemon's show does; the details, now with the report's text, still show the same Git line. */
+  it("keeps the list's Git facts when the report page arrives", async () => {
+    const git = { worktree_exists: true, dirty: true, unpushed_commits: 2, branch_exists: true, pr: "open" as const };
+    const listed = { ...unit(), git };
+    const { bridge } = recordingBridge({
+      list: { items: [listed] },
+      show: (_id, from) => ({ item: { ...listed, git: undefined }, reports: [{ report_id: "r-fix-login-done", body: "[UNTRUSTED-WORKER-REPORT:\nall done\n" }], reports_from: from }),
+    });
+    render(<Overview bridge={bridge} deck={deckOf("process-a")} />);
+    const dialog = await openDialog();
+    await act(async () => { fireEvent.click(within(dialog).getByTestId("interrupted-details")); });
+    const line = gitFactsLine(git);
+    expect(within(dialog).getByTestId("interrupted-details-view")).toHaveTextContent(line);
+    await act(async () => { fireEvent.click(within(dialog).getByTestId("interrupted-show-reports")); });
+    await within(dialog).findByTestId("interrupted-report-body");
+    expect(within(dialog).getByTestId("interrupted-details-view")).toHaveTextContent(line);
   });
 });
 
