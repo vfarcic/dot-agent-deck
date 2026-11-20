@@ -880,6 +880,7 @@ mod tests {
                 "remind_star_later",
                 "dismiss_star_prompt",
                 "stop_agent",
+                "generate_config",
                 "close_orchestration",
                 "set_overview_mode",
                 "show_agent_card",

@@ -2222,6 +2222,23 @@ screen = "deck"
 action = "stop_agent"
 outcome = "unavailable"
 
+# PRD #2119: Generate config opens a Yes/No confirmation for the named agent;
+# the agent screen offers it too, and the deck screen does not.
+[[fixtures]]
+name = "generate-config-with-the-tester"
+utterance = "generate config with the tester"
+screen = "overview"
+action = "generate_config"
+outcome = "dispatch"
+resolved_agent = "agent-tester"
+
+[[fixtures]]
+name = "generate-config-unavailable"
+utterance = "generate config with the tester"
+screen = "deck"
+action = "generate_config"
+outcome = "unavailable"
+
 [[fixtures]]
 name = "close-orchestration"
 utterance = "close the build orchestration"

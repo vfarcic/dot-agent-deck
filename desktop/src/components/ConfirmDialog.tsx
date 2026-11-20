@@ -27,6 +27,15 @@ export interface ConfirmState {
    * that can keep one, so an older deck never offers it.
    */
   keepWorktree?: { label: string; action: () => Promise<void> };
+  /**
+   * PRD #2119: a question that changes nothing irreversible — Generate config
+   * asks an agent to write a file the user can review — is drawn without the
+   * stop icon and the danger colour, so it does not read as a stop. Absent on
+   * every destructive confirmation, which keep their look and words.
+   */
+  neutral?: boolean;
+  /** The dismissing button's word; "Cancel" when absent. */
+  cancelLabel?: string;
 }
 
 /**
@@ -78,5 +87,5 @@ export function ConfirmDialog({ state, onClose }: { state: ConfirmState; onClose
   };
   const confirm = () => run("confirm", state.action);
   const keep = state.keepWorktree;
-  return <div ref={placed} className="dialog-backdrop" role="presentation" onMouseDown={onClose}><section ref={ref} tabIndex={-1} className={`confirm-dialog${kept ? " has-worktree-preview" : ""}`} role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" onMouseDown={(event) => event.stopPropagation()}><div className="danger-icon"><CircleStop size={20} /></div><h2 id="confirm-title">{state.title}</h2><p>{state.body}</p>{kept && <p className="worktree-close-preview"><KeptWorktreeText kept={kept} /></p>}<div><button className="button secondary" onClick={onClose}>Cancel</button><button className="button danger" disabled={Boolean(busy) || checking} onClick={confirm}>{busy === "confirm" ? state.busyLabel : checking ? "Checking worktree…" : state.label}</button>{keep && keepPath && <button className="button danger" title={`Keeps ${sanitizeText(keepPath)}`} disabled={Boolean(busy)} onClick={() => run("keep", keep.action)}>{busy === "keep" ? state.busyLabel : keep.label}</button>}</div></section></div>;
+  return <div ref={placed} className="dialog-backdrop" role="presentation" onMouseDown={onClose}><section ref={ref} tabIndex={-1} className={`confirm-dialog${kept ? " has-worktree-preview" : ""}`} role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" onMouseDown={(event) => event.stopPropagation()}>{!state.neutral && <div className="danger-icon"><CircleStop size={20} /></div>}<h2 id="confirm-title">{state.title}</h2><p>{state.body}</p>{kept && <p className="worktree-close-preview"><KeptWorktreeText kept={kept} /></p>}<div><button className="button secondary" onClick={onClose}>{state.cancelLabel ?? "Cancel"}</button><button className={`button ${state.neutral ? "primary" : "danger"}`} disabled={Boolean(busy) || checking} onClick={confirm}>{busy === "confirm" ? state.busyLabel : checking ? "Checking worktree…" : state.label}</button>{keep && keepPath && <button className="button danger" title={`Keeps ${sanitizeText(keepPath)}`} disabled={Boolean(busy)} onClick={() => run("keep", keep.action)}>{busy === "keep" ? state.busyLabel : keep.label}</button>}</div></section></div>;
 }

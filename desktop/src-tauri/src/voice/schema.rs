@@ -462,6 +462,7 @@ mod tests {
                 "remind_star_later".to_string(),
                 "dismiss_star_prompt".to_string(),
                 "stop_agent".to_string(),
+                "generate_config".to_string(),
                 "close_orchestration".to_string(),
                 "set_overview_mode".to_string(),
                 "show_agent_card".to_string(),
@@ -571,6 +572,7 @@ mod tests {
                 "remind_star_later",
                 "dismiss_star_prompt",
                 "stop_agent",
+                "generate_config",
                 "close_orchestration",
                 "set_overview_mode",
                 "show_agent_card",
@@ -801,6 +803,7 @@ mod tests {
                 ("remind_star_later".to_string(), true),
                 ("dismiss_star_prompt".to_string(), true),
                 ("stop_agent".to_string(), false),
+                ("generate_config".to_string(), false),
                 ("close_orchestration".to_string(), false),
                 ("set_overview_mode".to_string(), false),
                 ("show_agent_card".to_string(), false),
@@ -878,6 +881,7 @@ mod tests {
                 // The D5 stops: on the overview with the New agent dialog
                 // closed (#1260), and each only opens a confirmation.
                 ("stop_agent".to_string(), true),
+                ("generate_config".to_string(), true),
                 ("close_orchestration".to_string(), true),
                 // PRD #2374: the agent cards, on the dashboard only.
                 ("set_overview_mode".to_string(), true),
@@ -949,6 +953,7 @@ mod tests {
                 ("remind_star_later".to_string(), true),
                 ("dismiss_star_prompt".to_string(), true),
                 ("stop_agent".to_string(), true),
+                ("generate_config".to_string(), true),
                 ("close_orchestration".to_string(), false),
                 ("set_overview_mode".to_string(), false),
                 ("show_agent_card".to_string(), false),

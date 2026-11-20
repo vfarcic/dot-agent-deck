@@ -15,6 +15,7 @@
 //! Lives in the library rather than in `main.rs` so a test can drive it against
 //! a scripted daemon; `main.rs` spawns [`run`].
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::daemon_client::{ClientError, DaemonClient};
@@ -43,6 +44,11 @@ pub struct SubscriberConfig {
     /// not only on its socket. `None` in a shipped binary, like
     /// [`Self::drop_event`].
     pub applied: Option<fn(&AgentEvent)>,
+    /// PRD #2119: how often, while a subscription is open, the subscriber
+    /// re-reads the daemon's agents for which projects already hold a
+    /// `.dot-agent-deck.toml` ([`refresh_project_config_flags`]). `None` turns
+    /// the refresh off, for a test whose scripted daemon counts listings.
+    pub project_config_refresh: Option<Duration>,
 }
 
 impl Default for SubscriberConfig {
@@ -57,6 +63,67 @@ impl Default for SubscriberConfig {
             drop_event: None,
             break_on_event: None,
             applied: None,
+            project_config_refresh: Some(PROJECT_CONFIG_REFRESH_INTERVAL),
+        }
+    }
+}
+
+/// PRD #2119: the cadence of [`refresh_project_config_flags`] — the desktop
+/// app's own `ListAgents` reconcile interval (`RECONCILE_INTERVAL` in
+/// `desktop/src-tauri/src/agent_view.rs`), so the two clients' Generate /
+/// Update labels catch up with the disk within the same few seconds.
+pub const PROJECT_CONFIG_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Aborts the task it holds when dropped, so a refresh never outlives the
+/// subscription it was started for.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// PRD #2119: while one subscription is open, re-read the daemon's agents
+/// every `every` and take ONLY which of their projects already hold a
+/// `.dot-agent-deck.toml` ([`crate::state::AppState::take_project_config_flags`],
+/// which keeps its pane-and-agent identity check). The first subscription and
+/// a gap resync take the flags from their snapshot; this is what keeps them
+/// current after an agent writes or removes the file, and gives an agent
+/// started after the subscription its flag. Nothing else in the listing is
+/// applied — not the gap-resync routine, whose reconciliation is for a stream
+/// that missed events, which this one has not.
+///
+/// It runs as its own task, so the stream is read while a listing is in
+/// flight; it is one loop, so at most one listing is outstanding and a slow
+/// daemon delays the next one rather than stacking them; and a reply from
+/// another daemon process than the one `stream` names — or than the state's
+/// current stream, should they differ — is discarded. The daemon does the
+/// filesystem check, so this works against a remote daemon too.
+async fn refresh_project_config_flags(
+    client: DaemonClient,
+    state: SharedState,
+    stream: crate::daemon_client::Incarnation,
+    every: Duration,
+) {
+    loop {
+        tokio::time::sleep(every).await;
+        let listing =
+            match tokio::time::timeout(RESYNC_LIST_TIMEOUT, client.list_agents_detailed()).await {
+                Ok(Ok(listing)) => listing,
+                Ok(Err(e)) => {
+                    tracing::debug!(error = %e, "project-config refresh: listing failed");
+                    continue;
+                }
+                Err(_) => {
+                    tracing::debug!("project-config refresh: listing timed out");
+                    continue;
+                }
+            };
+        let answered = listing.incarnation.unwrap_or_default();
+        let mut st = state.write().await;
+        if answered.same_process(&stream) && answered.same_process(&st.stream_incarnation) {
+            st.take_project_config_flags(&listing.records);
         }
     }
 }
@@ -115,6 +182,16 @@ pub async fn run(client: DaemonClient, state: SharedState, config: SubscriberCon
             delay = config.initial_delay;
             seed_hook_binary_notices(&client, &state).await;
             seed_trust_requests(&client, &state).await;
+            // PRD #2119: keep the Generate / Update labels current while
+            // this stream is open; dropped (and so stopped) with it.
+            let _refresh = config.project_config_refresh.map(|every| {
+                AbortOnDrop(tokio::spawn(refresh_project_config_flags(
+                    client.clone(),
+                    Arc::clone(&state),
+                    learned_from(&sub),
+                    every,
+                )))
+            });
             loop {
                 match sub.next_event().await {
                     Ok(Some(BroadcastMsg::Event(event))) => {
@@ -260,6 +337,8 @@ async fn subscribe(
             let mut state = state.write().await;
             state.learn_stream_incarnation(learned_from(&sub));
             state.take_inbox_snapshot(&records);
+            // PRD #2119: and which agents' projects already have a config.
+            state.take_project_config_flags(&records);
             Ok(sub)
         }
         Ok(Ok(GatedQuery::Unsupported)) => match client.subscribe_events().await {
@@ -837,6 +916,7 @@ mod tests {
             drop_event: None,
             break_on_event: None,
             applied: None,
+            project_config_refresh: None,
         };
         // Gated, as `main.rs` spawns it: an ungated client learns no process,
         // and the fallback takes no listing for an unnamed stream (issue #1825).
@@ -977,6 +1057,7 @@ mod tests {
             drop_event: None,
             break_on_event: None,
             applied: None,
+            project_config_refresh: None,
         };
         let subscriber = tokio::spawn(run(DaemonClient::new(socket), Arc::clone(&state), config));
 
@@ -1296,6 +1377,7 @@ mod tests {
             drop_event: None,
             break_on_event: None,
             applied: None,
+            project_config_refresh: None,
         };
         let subscriber = tokio::spawn(run(
             DaemonClient::new(socket.clone()),
@@ -1926,5 +2008,202 @@ mod tests {
         });
         tui.stream_incarnation = named("b");
         assert_eq!(tui.pending_orchestration_surfaces[0].1, named("a"));
+    }
+
+    /// PRD #2119: a daemon that answers the first ordered subscription and
+    /// every `ListAgents` from `agents` (agent, pane, cwd), stamped with the
+    /// real config check, naming the process `process` holds on each `Hello`.
+    /// The subscription's stream is held open and carries nothing.
+    async fn serve_config_flags(
+        listener: tokio::net::UnixListener,
+        agents: Arc<std::sync::Mutex<Vec<(String, String, String)>>>,
+        process: Arc<std::sync::Mutex<&'static str>>,
+        lists: Arc<AtomicUsize>,
+    ) {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let agents = Arc::clone(&agents);
+            let process = Arc::clone(&process);
+            let lists = Arc::clone(&lists);
+            tokio::spawn(async move {
+                let (mut rd, mut wr) = stream.into_split();
+                let Some(AttachRequest::Hello { .. }) = read_request(&mut rd).await else {
+                    return;
+                };
+                let mut hello = AttachResponse::hello(PROTOCOL_VERSION).with_capabilities();
+                hello.instance_id = Some((*process.lock().unwrap()).to_string());
+                write_frame(&mut wr, KIND_RESP, &serde_json::to_vec(&hello).unwrap())
+                    .await
+                    .unwrap();
+                let Some(request) = read_request(&mut rd).await else {
+                    return;
+                };
+                let mut records: Vec<AgentRecord> = agents
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|(agent, pane, cwd)| {
+                        serde_json::from_value(serde_json::json!({
+                            "id": agent, "pane_id_env": pane, "cwd": cwd
+                        }))
+                        .unwrap()
+                    })
+                    .collect();
+                crate::agent_pty::attach_project_config_exists(&mut records).await;
+                let resp = serde_json::to_vec(&AttachResponse::agent_records(records)).unwrap();
+                match request {
+                    AttachRequest::SubscribeEventsWithSnapshot => {
+                        write_frame(&mut wr, KIND_RESP, &resp).await.unwrap();
+                        let _ = read_frame(&mut rd).await;
+                    }
+                    AttachRequest::ListAgents => {
+                        lists.fetch_add(1, Ordering::SeqCst);
+                        write_frame(&mut wr, KIND_RESP, &resp).await.unwrap();
+                    }
+                    other => panic!("the scripted daemon does not answer {other:?}"),
+                }
+            });
+        }
+    }
+
+    /// PRD #2119 (rule 22 parity with the desktop's reconcile): while the
+    /// subscription stays open, the TUI's Generate / Update flag follows the
+    /// disk — a config written or removed after the subscription flips it,
+    /// an agent started after the subscription in a project that already has
+    /// one gets Update, and a listing answered by another daemon process than
+    /// the stream's is not applied.
+    #[tokio::test]
+    async fn the_project_config_flag_follows_the_disk_while_subscribed() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let configured = tempfile::tempdir().unwrap();
+        std::fs::write(configured.path().join(".dot-agent-deck.toml"), "").unwrap();
+        let config = project.path().join(".dot-agent-deck.toml");
+        let socket = dir.path().join("attach.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind the scripted daemon");
+        let agents = Arc::new(std::sync::Mutex::new(vec![(
+            AGENT.to_string(),
+            PANE.to_string(),
+            project.path().to_str().unwrap().to_string(),
+        )]));
+        let process = Arc::new(std::sync::Mutex::new(SCRIPTED_PROCESS));
+        let lists = Arc::new(AtomicUsize::new(0));
+        let server = tokio::spawn(serve_config_flags(
+            listener,
+            Arc::clone(&agents),
+            Arc::clone(&process),
+            Arc::clone(&lists),
+        ));
+
+        let mut tui = AppState::default();
+        tui.register_pane(PANE.to_string());
+        tui.insert_placeholder_session(PANE.to_string(), None, None, Some(AGENT.to_string()));
+        let state: SharedState = Arc::new(RwLock::new(tui));
+        let config_refresh = SubscriberConfig {
+            initial_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(50),
+            drop_event: None,
+            break_on_event: None,
+            applied: None,
+            project_config_refresh: Some(Duration::from_millis(30)),
+        };
+        let client = DaemonClient::new(socket).with_protocol_gate();
+        let subscriber = tokio::spawn(run(client, Arc::clone(&state), config_refresh));
+
+        let flag = |pane: &'static str| {
+            let state = Arc::clone(&state);
+            async move {
+                let st = state.read().await;
+                st.sessions
+                    .values()
+                    .find(|s| s.pane_id.as_deref() == Some(pane))
+                    .and_then(|s| st.project_config_exists(s))
+            }
+        };
+        let wait_for = |pane: &'static str, expected: Option<bool>, why: &'static str| {
+            let flag = &flag;
+            async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                let mut seen = flag(pane).await;
+                while seen != expected && tokio::time::Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    seen = flag(pane).await;
+                }
+                assert_eq!(seen, expected, "{why}");
+            }
+        };
+
+        wait_for(PANE, Some(false), "the snapshot says no config yet").await;
+        std::fs::write(&config, "# written by the agent\n").unwrap();
+        wait_for(
+            PANE,
+            Some(true),
+            "a config written after the subscription turns the card to Update",
+        )
+        .await;
+        std::fs::remove_file(&config).unwrap();
+        wait_for(
+            PANE,
+            Some(false),
+            "a config removed after the subscription turns it back to Generate",
+        )
+        .await;
+
+        agents.lock().unwrap().push((
+            OTHER_AGENT.to_string(),
+            OTHER_PANE.to_string(),
+            configured.path().to_str().unwrap().to_string(),
+        ));
+        {
+            let mut st = state.write().await;
+            st.register_pane(OTHER_PANE.to_string());
+            st.insert_placeholder_session(
+                OTHER_PANE.to_string(),
+                None,
+                None,
+                Some(OTHER_AGENT.to_string()),
+            );
+        }
+        wait_for(
+            OTHER_PANE,
+            Some(true),
+            "an agent started after the subscription, in a project with a config, gets Update",
+        )
+        .await;
+
+        // Another daemon process answers the listings from here on; the
+        // stream still comes from the first one.
+        *process.lock().unwrap() = "replacement";
+        let lists_reach = |target: usize| {
+            let lists = Arc::clone(&lists);
+            async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                while lists.load(Ordering::SeqCst) < target
+                    && tokio::time::Instant::now() < deadline
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                assert!(
+                    lists.load(Ordering::SeqCst) >= target,
+                    "the refresh kept listing"
+                );
+            }
+        };
+        // At most one listing was in flight at the switch (the refresh is one
+        // loop), so by the second one counted after it, every listing has met
+        // the replacement's `Hello`.
+        lists_reach(lists.load(Ordering::SeqCst) + 2).await;
+        std::fs::write(&config, "").unwrap();
+        lists_reach(lists.load(Ordering::SeqCst) + 3).await;
+        assert_eq!(
+            flag(PANE).await,
+            Some(false),
+            "a listing from another daemon process than the stream's is discarded"
+        );
+
+        subscriber.abort();
+        server.abort();
     }
 }

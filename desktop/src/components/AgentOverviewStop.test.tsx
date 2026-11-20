@@ -55,6 +55,119 @@ function runtime(runAction: DeckRuntimeState["runAction"], fleet: DeckFleet = fl
 const row = (deckId: string, agentId: string) => screen.getByTestId(`overview-agent-${agentKey({ daemonId: deckId, id: agentId })}`);
 const confirmation = () => screen.queryByRole("alertdialog");
 
+describe("desktop/config-gen/002: generating configuration from an agent", () => {
+  type GenerationResult = { outcome: "sent"; message: string; messageId: string } | { outcome: "unsupported" | "failed"; message: string };
+  const title = "Generate .dot-agent-deck.toml";
+  const sent = "Config request sent to the agent's inbox.";
+  const upgrade = "This daemon is too old to generate a config. Upgrade the daemon to use Generate config.";
+  const failed = "Failed to send config prompt: daemon refused the target";
+  const open = () => fireEvent.click(within(row(FIXTURE_REMOTE_DAEMON_ID, "41")).getByRole("button", { name: /Generate config/i }));
+  const generation = (outcome: GenerationResult["outcome"] = "sent", message = sent) => {
+    const generateConfig = vi.fn(async (): Promise<GenerationResult> => outcome === "sent" ? { outcome, message, messageId: "m-config" } : { outcome, message });
+    return { generateConfig, rt: { ...runtime(vi.fn()), generateConfig } };
+  };
+
+  /// Scenario: Send a config request, dismiss its pending question with No, and send again for the same agent. The second request succeeds before the first fails, and its success notice must stay visible.
+  it("keeps the latest overview result when an older request fails late", async () => {
+    const pending: Array<(result: GenerationResult) => void> = [];
+    const generateConfig = vi.fn(() => new Promise<GenerationResult>((resolve) => { pending.push(resolve); }));
+    render(<AgentOverview runtime={{ ...runtime(vi.fn()), generateConfig }} onNavigate={vi.fn()} />);
+    open();
+    fireEvent.click(within(confirmation()!).getByRole("button", { name: "Yes" }));
+    fireEvent.click(within(confirmation()!).getByRole("button", { name: "No" }));
+    open();
+    fireEvent.click(within(confirmation()!).getByRole("button", { name: "Yes" }));
+    expect(generateConfig).toHaveBeenCalledTimes(2);
+
+    await act(async () => pending[1]({ outcome: "sent", message: sent, messageId: "m-new" }));
+    expect(screen.getByText(sent)).toBeVisible();
+    await act(async () => pending[0]({ outcome: "failed", message: failed }));
+
+    expect(screen.queryByText(failed)).not.toBeInTheDocument();
+    expect(screen.getByText(sent)).toBeVisible();
+  });
+
+  /** Scenario: Ask the remote planner to create or update a config, including an unknown file state. Its row and neutral Yes/No confirmation say Update only for an existing file, an unknown state asks to check for the file and create or update it without claiming either, and No sends nothing. */
+  it.each([undefined, false, true])("offers a neutral Yes/No confirmation and No sends nothing (existing config: %s)", (exists) => {
+    const { rt, generateConfig } = generation();
+    rt.fleet = rt.fleet.map((deck) => ({ ...deck, agents: deck.agents.map((agent) => ({ ...agent, projectConfigExists: exists })) }));
+    const navigate = vi.fn();
+    render(<AgentOverview runtime={rt} onNavigate={navigate} />);
+    const verb = exists ? "Update" : "Generate";
+    const button = within(row(FIXTURE_REMOTE_DAEMON_ID, "41")).getByRole("button", { name: `${verb} config with planner agent` });
+    expect(button).toHaveAttribute("title", `${verb} config with planner`);
+    fireEvent.click(button);
+    const dialog = screen.getByRole("alertdialog", { name: `${verb} .dot-agent-deck.toml` });
+    if (exists) {
+      expect(dialog).toHaveTextContent(/instruct your agent to analyze the project and update the existing config/i);
+      expect(dialog).not.toHaveTextContent("No orchestration config found");
+    } else if (exists === false) {
+      expect(dialog).toHaveTextContent("No orchestration config found for this project. Want to instruct your agent to analyze the project and create one?");
+    } else {
+      // PR #2362 review: unknown claims neither a config nor its absence.
+      expect(dialog).toHaveTextContent("Want to instruct your agent to check this project for .dot-agent-deck.toml and create it, or propose updates to it if it already exists?");
+      expect(dialog).not.toHaveTextContent("No orchestration config found");
+      expect(dialog).not.toHaveTextContent("already has an orchestration config");
+    }
+    expect(within(dialog).getAllByRole("button").map((button) => button.textContent).sort()).toEqual(["No", "Yes"]);
+    expect(dialog.querySelector(".danger, .danger-icon")).toBeNull();
+    fireEvent.click(within(dialog).getByRole("button", { name: "No" }));
+    expect(confirmation()).toBeNull();
+    expect(generateConfig).not.toHaveBeenCalled();
+    expect(rt.runAction).not.toHaveBeenCalled();
+    expect(navigate).not.toHaveBeenCalled();
+  });
+
+  /** Scenario: Confirm generation on a remote planner, then refresh its row from a successor daemon before pressing Yes. The command still names the captured daemon, pane, agent and incarnation, opens that agent's pane, and shows the daemon's success sentence. */
+  it("sends the captured agent binding, focuses its pane, and shows success", async () => {
+    const { rt, generateConfig } = generation();
+    const navigate = vi.fn();
+    const view = render(<AgentOverview runtime={rt} onNavigate={navigate} />);
+    open();
+    const successor = fleetWithOrchestration().map((deck) => ({ ...deck, agents: deck.agents.map((agent) => ({ ...agent, incarnation: "successor-process-b" })) }));
+    view.rerender(<AgentOverview runtime={{ ...rt, ...runtime(rt.runAction, successor), generateConfig }} onNavigate={navigate} />);
+    await act(async () => fireEvent.click(within(screen.getByRole("alertdialog", { name: title })).getByRole("button", { name: "Yes" })));
+    expect(generateConfig).toHaveBeenCalledExactlyOnceWith(FIXTURE_REMOTE_DAEMON_ID, "41", "pane-41", "listed-process-a");
+    expect(navigate).toHaveBeenCalledWith(expect.objectContaining({ kind: "agent", deckId: FIXTURE_REMOTE_DAEMON_ID, agentId: "41", incarnation: "listed-process-a" }));
+    expect(screen.getByText(sent)).toBeVisible();
+    expect(confirmation()).toBeNull();
+  });
+
+  /** Scenario: Confirm generation for planner, dismiss the busy question, and open builder while the request is still pending. A late successful send must leave builder open instead of taking the user back to planner. */
+  it("keeps the user's navigation after dismissing a pending generation with No", async () => {
+    let settle!: (result: GenerationResult) => void;
+    const generateConfig = vi.fn(() => new Promise<GenerationResult>((resolve) => { settle = resolve; }));
+    const navigate = vi.fn();
+    render(<AgentOverview runtime={{ ...runtime(vi.fn()), generateConfig }} onNavigate={navigate} />);
+    open();
+    fireEvent.click(within(confirmation()!).getByRole("button", { name: "Yes" }));
+    expect(generateConfig).toHaveBeenCalledTimes(1);
+    fireEvent.click(within(confirmation()!).getByRole("button", { name: "No" }));
+    expect(confirmation()).toBeNull();
+    fireEvent.click(within(row(FIXTURE_REMOTE_DAEMON_ID, "42")).getByRole("button", { name: "Open builder agent" }));
+    expect(navigate).toHaveBeenLastCalledWith(expect.objectContaining({ kind: "agent", agentId: "42" }));
+    navigate.mockClear();
+
+    await act(async () => settle({ outcome: "sent", message: sent, messageId: "m-late" }));
+
+    expect(navigate).not.toHaveBeenCalled();
+    expect(confirmation()).toBeNull();
+  });
+
+  /** Scenario: The daemon answers unsupported or refuses the captured target after Yes. The shared upgrade/failure sentence is visible and the app does not present a successful send or enter the agent pane. */
+  it.each([["unsupported", upgrade], ["failed", failed]] as const)("shows the shared %s outcome", async (outcome, message) => {
+    const { rt, generateConfig } = generation(outcome, message);
+    const navigate = vi.fn();
+    render(<AgentOverview runtime={rt} onNavigate={navigate} />);
+    open();
+    await act(async () => fireEvent.click(within(screen.getByRole("alertdialog", { name: title })).getByRole("button", { name: "Yes" })));
+    expect(generateConfig).toHaveBeenCalledTimes(1);
+    expect(screen.getByText(message)).toBeVisible();
+    expect(screen.queryByText(sent)).toBeNull();
+    expect(navigate).not.toHaveBeenCalled();
+  });
+});
+
 describe("stopping from the overview (PRD #1223 U4)", () => {
   /** Scenario: close a remote dispatched agent or its whole team. The confirmation names the worktree the daemon predicts will be kept; an ordinary close has no warning, and an inconclusive probe does not claim confirmed uncommitted changes. */
   it.each(["agent", "orchestration"] as const)("previews the kept worktree before closing a remote %s", async (kind) => {

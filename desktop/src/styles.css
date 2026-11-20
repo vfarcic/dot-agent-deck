@@ -711,6 +711,7 @@ button.deck-attention-name { text-decoration: underline; text-underline-offset: 
 .agent-inbox-attention-answer { display: block; margin-top: 3px; color: var(--ink); }
 /* Issue #1933: the notice says how the agent's pane ended, its exit code last,
    so it wraps rather than being cut, as the TUI card wraps it. */
+.agent-identity p.agent-config-notice, .agent-config-notice { color: var(--teal-deep); font-size: var(--text-sm); white-space: normal; overflow-wrap: anywhere; }
 .agent-identity p.agent-delivery-notice, .agent-delivery-notice { color: var(--red); font-family: "JetBrains Mono", monospace; font-size: var(--text-sm); white-space: normal; overflow-wrap: anywhere; }
 /* Issue #1678: background work still running after the turn ended. Ink rather
    than --muted, as the TUI draws it in its primary text colour: it is a reading
@@ -1550,14 +1551,22 @@ button.deck-attention-name { text-decoration: underline; text-underline-offset: 
 /* The em dash where a connected deck's pips are, so "unknown" and "none" read
    differently on the same line. */
 .daemon-unknown { margin-left: auto; color: var(--faint); font-family: "JetBrains Mono", monospace; font-size: var(--text-base); }
-.daemon-group-header { min-height: 50px; padding: 9px 13px; display: flex; align-items: center; gap: 11px; border-bottom: 1px solid var(--line); background: var(--paper-strong); border-radius: var(--radius) var(--radius) 0 0; }
+/* Issue #2406: the header is a column — the row of controls, then the
+   connection message on a line of its own when there is one. The row keeps the
+   layout the header used to have; the 50px floor stays on the header, with the
+   row centred in it, so a deck with nothing to say is exactly as tall as it was. */
+.daemon-group-header { min-height: 50px; padding: 9px 13px; display: flex; flex-direction: column; justify-content: center; gap: 4px; border-bottom: 1px solid var(--line); background: var(--paper-strong); border-radius: var(--radius) var(--radius) 0 0; }
+.daemon-group-header-row { display: flex; align-items: center; gap: 11px; }
 /* One line, not two: the socket filename that used to sit under the name is
    gone from the layout and lives on the name's own `title` — it contained the
    very uid it was meant to keep out of a screenshot and said nothing a reader
    could act on (PRD #745). */
 .daemon-identity { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
 .daemon-identity strong { font-size: var(--text-lg); font-weight: 720; }
-.daemon-state { min-width: 0; margin: 0; overflow: hidden; color: var(--faint); font-size: var(--text-base); text-overflow: ellipsis; white-space: nowrap; }
+/* Below the row, indented to start under the deck's name (the lamp's 9px plus
+   the row's 11px gap), and wrapping rather than ellipsised: it is the whole
+   explanation on the header, and issue #801's caveat has to read in full. */
+.daemon-state { margin: 0; padding-left: 20px; color: var(--faint); font-size: var(--text-base); overflow-wrap: anywhere; }
 .daemon-pips { margin-left: auto; display: flex; flex-wrap: wrap; gap: 5px; }
 .daemon-group-body { padding: 11px 12px 13px; }
 /* PRD #1258: the deck's host — a compact button beside the deck's name,
@@ -1824,6 +1833,8 @@ button.deck-attention-name { text-decoration: underline; text-underline-offset: 
    the page's 16px default beside them. */
 .agent-stop-control { height: 26px; display: flex; align-items: center; gap: 5px; padding: 0 8px; font-size: var(--text-base); font-weight: 650; border: 1px solid currentColor; border-radius: 4px; color: var(--red); background: transparent; cursor: pointer; white-space: nowrap; }
 .agent-stop-control:hover, .agent-stop-control:focus-visible { background: var(--red-soft); }
+.agent-generate-config-control { height: 26px; display: flex; align-items: center; gap: 5px; padding: 0 8px; font-size: var(--text-base); font-weight: 650; border: 1px solid var(--line-strong); border-radius: 4px; color: var(--ink); background: transparent; cursor: pointer; white-space: nowrap; }
+.agent-generate-config-control:hover, .agent-generate-config-control:focus-visible { background: var(--paper-sunken); }
 /* The overview's entry control. `margin-left: auto` puts it at the end of the
    name cell rather than beside the name, so a long display name is still
    clamped by its own `text-overflow` and the control never moves. */
@@ -1831,6 +1842,9 @@ button.deck-attention-name { text-decoration: underline; text-underline-offset: 
 .overview-open-agent:hover, .overview-open-agent:focus-visible, .overview-row.is-openable:hover .overview-open-agent { color: var(--teal); border-color: var(--teal-focus); background: var(--teal-soft); }
 .overview-stop-agent { flex: 0 0 auto; width: 20px; height: 20px; display: grid; place-items: center; border: 1px solid transparent; border-radius: 4px; color: var(--faint); background: transparent; cursor: pointer; }
 .overview-stop-agent:hover, .overview-stop-agent:focus-visible { color: var(--red); border-color: currentColor; }
+/* PRD #2119 — Generate config beside it: the same small control, in the neutral accent rather than the stop's red. */
+.overview-generate-config { flex: 0 0 auto; width: 20px; height: 20px; display: grid; place-items: center; border: 1px solid transparent; border-radius: 4px; color: var(--faint); background: transparent; cursor: pointer; }
+.overview-generate-config:hover, .overview-generate-config:focus-visible { color: var(--teal); border-color: currentColor; }
 .overview-close-orchestration { margin-left: 6px; }
 /* A click anywhere on the row opens the pane too, so the row reads as one
    target: a pointer over all of it, and while it is hovered the control lights

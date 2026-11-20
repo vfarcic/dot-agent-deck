@@ -97,6 +97,35 @@ const CLOSE_AGENT_PHRASES: [&str; 8] = [
     "close this agent",
     "close the agent",
 ];
+/// PRD #2119 review — whole requests to generate config for the viewed agent,
+/// outside typing mode. Like [`CLOSE_AGENT_PHRASES`], they name no agent, so
+/// they open the pane's own confirmation without the command backend and work
+/// with Settings → Voice → Send on-screen names off.
+///
+/// "update config" is the same request: the pane's control reads Update config
+/// when the project already has one, and either phrase works whichever label
+/// shows.
+const GENERATE_CONFIG_PHRASES: [&str; 12] = [
+    "generate config",
+    "generate a config",
+    "generate the config",
+    "generate config for this agent",
+    "generate a config for this agent",
+    "generate config with this agent",
+    "update config",
+    "update the config",
+    "update config for this agent",
+    "update the config for this agent",
+    "update config with this agent",
+    "update the config with this agent",
+];
+/// The row [`GENERATE_CONFIG_PHRASES`] dispatch.
+const GENERATE_CONFIG_ROW: &str = "generate_config";
+/// What the agent screen answers a model pick of `generate_config` that names
+/// an agent: like a named stop there, it never targets another agent, and it
+/// is the pane's own control and phrase that reach the viewed one.
+const GENERATE_CONFIG_PANE_HINT: &str =
+    "To generate config for this agent, say 'generate config' or press Generate config.";
 /// The Daemons screen's row, whose bare "go back" is [`CLOSE_ROW`]'s where it
 /// cannot run.
 const OPEN_DECK_ROW: &str = "open_deck";
@@ -2075,6 +2104,32 @@ fn decide(picked: &Picked<'_>, judged: &Judged<'_>) -> VoiceOutcome {
             sentence: hint.to_string(),
         };
     }
+    // PRD #2119 review: the same on the agent screen for Generate config. A
+    // pick naming an agent — another one, or the viewed one by name — is
+    // answered with the pane's own phrase, never sent to the named agent nor
+    // silently redirected to the viewed one; a pick naming none is the viewed
+    // agent's, as its whole phrases are.
+    if screen == Screen::Agent && row.id == GENERATE_CONFIG_ROW {
+        let names_an_agent = answer.params.values().any(|value| !value.trim().is_empty());
+        if names_an_agent {
+            return VoiceOutcome::Unavailable {
+                transcript,
+                action: row.id.clone(),
+                hint: GENERATE_CONFIG_PANE_HINT.to_string(),
+                sentence: GENERATE_CONFIG_PANE_HINT.to_string(),
+            };
+        }
+        return VoiceOutcome::Dispatch {
+            sentence:
+                "Confirm generating a config with the open agent — nothing has been sent yet."
+                    .to_string(),
+            transcript,
+            action: row.id.clone(),
+            invoke: row.invoke.clone(),
+            params: Vec::new(),
+            then_submit: false,
+        };
+    }
     if withheld && needs_labels(row) {
         return VoiceOutcome::labels_withheld(transcript, row);
     }
@@ -3589,6 +3644,22 @@ fn local_intercept(
         if let VoiceOutcome::Dispatch { sentence, .. } = &mut outcome {
             *sentence =
                 "Confirm closing the open agent — nothing has been stopped yet.".to_string();
+        }
+        return Some(outcome);
+    }
+
+    // PRD #2119 review: a bare Generate config on the agent screen is the
+    // viewed agent's, decided here as the close phrases above are — so it
+    // needs no on-screen name and reaches the backend with nothing.
+    if screen == Screen::Agent
+        && said_whole(transcript.text(), GENERATE_CONFIG_PHRASES)
+        && let Some(row) = table.row(GENERATE_CONFIG_ROW)
+    {
+        let mut outcome = dispatch(row, Vec::new());
+        if let VoiceOutcome::Dispatch { sentence, .. } = &mut outcome {
+            *sentence =
+                "Confirm generating a config with the open agent — nothing has been sent yet."
+                    .to_string();
         }
         return Some(outcome);
     }
@@ -15262,6 +15333,101 @@ mod tests {
         }
     }
 
+    /// Scenario: In one agent's pane, ask to generate or update config with another live agent. Both phrases give guidance for the viewed agent rather than confirming for another agent; the same named requests work from the dashboard.
+    #[tokio::test]
+    async fn voice_outcome_config_gen_003_named_pane_requests_give_stop_style_guidance() {
+        for said in [
+            "generate config with the tester",
+            "update config with the tester",
+        ] {
+            let resolver = StubResolver::new().answering(
+                said,
+                IntentAnswer::new("generate_config").with_param("agent", "tester"),
+            );
+            let overview = run(&resolver, Screen::Overview, &fleet(), said).await;
+            assert!(
+                matches!(&overview, VoiceOutcome::Dispatch { action, invoke, params, .. }
+                if action == "generate_config" && invoke == "confirmGenerateConfig"
+                && params.iter().any(|param| param.name == "agent" && param.value == "1")),
+                "the present named agent must remain targetable on the dashboard: {overview:?}"
+            );
+            let outcome = run(&resolver, Screen::Agent, &fleet(), said).await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::Unavailable { action, hint, sentence, .. }
+                if action == "generate_config"
+                && hint == "To generate config for this agent, say 'generate config' or press Generate config."
+                && sentence == hint),
+                "named pane requests must mirror stop_agent's guidance, got {outcome:?}"
+            );
+        }
+    }
+
+    /// Scenario: With Send on-screen names off, say generate config or update config in the open agent pane. Both phrases open the current pane's confirmation locally with no named parameters; dashboard requests still need an agent and explicitly named pane requests are refused.
+    #[tokio::test]
+    async fn voice_outcome_config_gen_003_private_names_allow_only_the_viewed_agent() {
+        for said in [
+            "generate config",
+            "update config",
+            "update config with this agent",
+        ] {
+            // The viewed-agent shortcuts must work even if a backend cannot
+            // classify the phrase: exercise the visible confirmation outcome.
+            let resolver = CountingResolver::default();
+            let answer = handle_utterance_with(
+                &resolver,
+                table(),
+                Screen::Agent,
+                &fleet(),
+                &decks(),
+                None,
+                None,
+                Transcript::new(said),
+                LabelSharing::Withheld,
+                true,
+            )
+            .await;
+            assert!(
+                matches!(&answer.outcome, VoiceOutcome::Dispatch { action, invoke, params, .. }
+                if action == "generate_config" && invoke == "confirmGenerateConfig" && params.is_empty()),
+                "a private bare pane request must open its own confirmation: {:?}",
+                answer.outcome
+            );
+        }
+
+        let said = "generate config";
+        let resolver = StubResolver::new().answering(said, IntentAnswer::new("generate_config"));
+        let dashboard = run(&resolver, Screen::Overview, &fleet(), said).await;
+        assert!(
+            matches!(&dashboard, VoiceOutcome::ParamMissing { action, param, .. }
+                if action == "generate_config" && param == "agent"),
+            "the dashboard must still ask which agent: {dashboard:?}"
+        );
+
+        let said = "generate config with the tester";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("generate_config").with_param("agent", "tester"),
+        );
+        let named = handle_utterance_with(
+            &resolver,
+            table(),
+            Screen::Agent,
+            &fleet(),
+            &decks(),
+            None,
+            None,
+            Transcript::new(said),
+            LabelSharing::Withheld,
+            true,
+        )
+        .await;
+        assert!(
+            !matches!(&named.outcome, VoiceOutcome::Dispatch { action, .. } if action == "generate_config"),
+            "privacy must not turn a named request into a request for the viewed agent: {:?}",
+            named.outcome
+        );
+    }
+
     /// Scenario: on the Daemons screen and the dashboard, an interrupt, clear
     /// or scratch phrase is not intercepted locally; it goes to the model,
     /// and a pick of the row is refused with the row's own hint.
@@ -18757,7 +18923,7 @@ mod tests {
     /// included — whose control has a voice row, with that row. `docs/develop/voice-first-design.md`
     /// section 5 has the rule; the labels left out on purpose are listed there
     /// with their reasons.
-    const CONTROL_LABELS: [ControlLabel; 33] = [
+    const CONTROL_LABELS: [ControlLabel; 37] = [
         // PRD #2174 — the star reminder's three buttons, each its own row.
         // Shown at startup over the dashboard, never over the New agent form.
         ControlLabel {
@@ -19005,6 +19171,37 @@ mod tests {
             row: "close",
             over_the_form: false,
         },
+        // PRD #2119 — Generate config on a dashboard row ("Generate config
+        // with <name> agent") and in the open pane ("Generate config").
+        ControlLabel {
+            source: "aria-label={`Generate config with ${name} agent`}",
+            file: AGENT_OVERVIEW_TSX,
+            said: "Generate config with tester agent",
+            row: "generate_config",
+            over_the_form: false,
+        },
+        ControlLabel {
+            source: "<FileCog size={14} aria-hidden=\"true\" /> Generate config</button>",
+            file: AGENT_TILE_TSX,
+            said: "Generate config",
+            row: "generate_config",
+            over_the_form: false,
+        },
+        // The same two controls when the project already has a config.
+        ControlLabel {
+            source: "aria-label={`Update config with ${name} agent`}",
+            file: AGENT_OVERVIEW_TSX,
+            said: "Update config with tester agent",
+            row: "generate_config",
+            over_the_form: false,
+        },
+        ControlLabel {
+            source: "<FileCog size={14} aria-hidden=\"true\" /> Update config</button>",
+            file: AGENT_TILE_TSX,
+            said: "Update config",
+            row: "generate_config",
+            over_the_form: false,
+        },
     ];
 
     /// The label rule as a property: each control's label is still in its
@@ -19239,6 +19436,9 @@ mod tests {
             ("dismiss_star_prompt", "don't ask again"),
             // Issue #2330 — a review the deck asked for: its Approve and Deny.
             ("approve_project_commands", "approve"),
+            // PRD #2119 — the Generate config button's words.
+            ("generate_config", "generate config"),
+            ("generate_config", "update config"),
             ("close", "deny it"),
             ("close", "decline"),
         ] {
