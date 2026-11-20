@@ -287,8 +287,8 @@ pub fn parse_adopted_name(name: &str) -> Option<(&str, i64, AdoptedState)> {
 // Kept reports (PRD #1790 stage 2)
 // ---------------------------------------------------------------------------
 
-/// The most directory entries one [`RetainedStore::kept_reports`] looks at,
-/// across every run's directory.
+/// The most directory entries one [`RetainedStore::kept_reports`] looks at:
+/// the entries of `files/` and of every run's directory in it, together.
 pub const MAX_KEPT_LISTED: usize = 65_536;
 
 /// The most of a kept report's file [`RetainedStore::read_kept_report`] is
@@ -384,6 +384,15 @@ impl KeptReport {
                 AdoptedState::Pinned | AdoptedState::Recovered | AdoptedState::Unlisted
             )
         )
+    }
+
+    /// Whether the file itself says its report was left for a caller that is
+    /// gone: adopted unread from a run that ended ([`Self::adopted_unread`]),
+    /// or this run's own file in state recovered — a report the inbox
+    /// accepted and then set aside when its caller went away, whose journal
+    /// line still says it went to the inbox.
+    pub fn left_for_gone_caller(&self) -> bool {
+        self.adopted_unread() || matches!(self.state, KeptState::Own(Some(OwnState::Recovered(_))))
     }
 }
 
@@ -1847,15 +1856,26 @@ impl RetainedStore {
     /// file's state from its inventory; another live run's own file's state
     /// is not known here. Attempts' temporary names and names that parse as
     /// neither form are left out. At most [`MAX_KEPT_LISTED`] entries are
-    /// looked at; [`KeptReports::incomplete`] says when the listing stopped
-    /// short of that, failed, or the store cannot be used.
+    /// looked at, across `files/` and every run directory in it
+    /// ([`Self::kept_reports_within`]); [`KeptReports::incomplete`] says when
+    /// the listing stopped at that, failed, or the store cannot be used.
     pub fn kept_reports(&self) -> KeptReports {
+        self.kept_reports_within(MAX_KEPT_LISTED)
+    }
+
+    /// [`Self::kept_reports`] looking at no more than `budget` directory
+    /// entries. One budget covers both levels: every entry of `files/` (a run
+    /// directory, an invalid name, one that cannot be opened) and every entry
+    /// inside a run directory is charged before it is used, and the listing
+    /// stops, [`KeptReports::incomplete`], as soon as it is spent, so neither
+    /// many run directories nor many reports can make it look further.
+    pub fn kept_reports_within(&self, budget: usize) -> KeptReports {
         let mut out = KeptReports::default();
         let Some(dirs) = &self.dirs else {
             out.incomplete = true;
             return out;
         };
-        let runs = match collect_names(&dirs.files) {
+        let mut runs = match dirs.files.stream() {
             Ok(runs) => runs,
             Err(_) => {
                 out.incomplete = true;
@@ -1874,7 +1894,23 @@ impl RetainedStore {
             }
         };
         let mut looked = 0usize;
-        for run in runs {
+        // Charge one entry; `false` once the budget is spent.
+        let mut charge = |out: &mut KeptReports| {
+            if looked >= budget {
+                out.incomplete = true;
+                return false;
+            }
+            looked += 1;
+            true
+        };
+        'runs: while let Some(run) = runs.next_name() {
+            if !charge(&mut out) {
+                break;
+            }
+            let Ok(run) = run else {
+                out.incomplete = true;
+                continue;
+            };
             let Some(run) = run.to_str().filter(|run| valid_run_id(run)) else {
                 continue;
             };
@@ -1893,11 +1929,9 @@ impl RetainedStore {
                 }
             };
             while let Some(name) = stream.next_name() {
-                if looked >= MAX_KEPT_LISTED {
-                    out.incomplete = true;
-                    return out;
+                if !charge(&mut out) {
+                    break 'runs;
                 }
-                looked += 1;
                 let Ok(name) = name else {
                     out.incomplete = true;
                     continue;

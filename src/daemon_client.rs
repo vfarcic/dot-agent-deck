@@ -3740,15 +3740,20 @@ impl DaemonClient {
     }
 
     /// PRD #1790 stage 2: one interrupted item and its kept reports' bodies
-    /// ([`AttachRequest::ShowInterrupted`]). Gated as
-    /// [`Self::list_interrupted_work`] is. An id that matches no item is a
+    /// ([`AttachRequest::ShowInterrupted`]): the first ones, or with `report`
+    /// that one of the item's. Gated as [`Self::list_interrupted_work`] is.
+    /// An id that matches no item, or a report that is not the item's, is a
     /// [`ClientError::Server`] carrying the daemon's sentence.
     pub async fn show_interrupted(
         &self,
         id: &str,
+        report: Option<&str>,
         pinned_instance: Option<&str>,
     ) -> Result<GatedQuery<crate::interrupted_work::InterruptedShow>, ClientError> {
-        let request = AttachRequest::ShowInterrupted { id: id.to_string() };
+        let request = AttachRequest::ShowInterrupted {
+            id: id.to_string(),
+            report: report.map(str::to_string),
+        };
         let Some(resp) = self
             .interrupted_work_request(&request, pinned_instance)
             .await?
@@ -8163,6 +8168,9 @@ mod tests {
                                     ts_ms: 1,
                                 },
                                 reports: Vec::new(),
+                                reports_omitted: 0,
+                                cut: false,
+                                progress: Default::default(),
                                 git: None,
                             };
                             let response = match op.as_str() {
@@ -8185,6 +8193,7 @@ mod tests {
                                             item: item(),
                                             reports: Vec::new(),
                                             incomplete: false,
+                                            bodies_omitted: 0,
                                         },
                                     ),
                                     ..AttachResponse::ok()
@@ -8219,7 +8228,7 @@ mod tests {
                             GatedQuery::Answered(_)
                         ),
                         "show-interrupted" => matches!(
-                            client.show_interrupted("w-1", pinned).await.unwrap(),
+                            client.show_interrupted("w-1", None, pinned).await.unwrap(),
                             GatedQuery::Answered(_)
                         ),
                         "reclaim-interrupted" => matches!(

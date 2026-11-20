@@ -2527,14 +2527,17 @@ pub enum AttachRequest {
     },
     /// PRD #1790 stage 2: one interrupted item (by id, or its unique name,
     /// branch or id suffix) and the bodies of its kept reports, bounded and
-    /// framed as untrusted text. Answered with
-    /// [`AttachResponse::interrupted_item`]; an id that matches no item is an
-    /// error response.
+    /// framed as untrusted text: the first ones, or with `report` that one of
+    /// the item's reports (any of them, however many it has). Answered with
+    /// [`AttachResponse::interrupted_item`]; an id that matches no item, or a
+    /// `report` that is not one of the item's, is an error response.
     ///
     /// **Withheld unless the daemon advertises [`CAP_INTERRUPTED_WORK`]** on
     /// the connection that carries it, so no [`PROTOCOL_VERSION`] bump.
     ShowInterrupted {
         id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        report: Option<String>,
     },
     /// PRD #1790 stage 2: remove an interrupted item's worktree and keep its
     /// branch, or with `dry_run` say what that would do. Refused for an agent
@@ -7986,8 +7989,8 @@ async fn handle_connection(
             };
             write_resp(&mut stream, &resp).await?
         }
-        AttachRequest::ShowInterrupted { id } => {
-            let resp = match crate::interrupted_work_daemon::show(&registry, id).await {
+        AttachRequest::ShowInterrupted { id, report } => {
+            let resp = match crate::interrupted_work_daemon::show(&registry, id, report).await {
                 Ok(shown) => AttachResponse {
                     interrupted_item: Some(shown),
                     ..AttachResponse::ok()

@@ -1684,3 +1684,44 @@ fn read_kept_report_frames_the_body_as_untrusted_and_bounds_it() {
         io::ErrorKind::NotFound
     );
 }
+
+/// PRD #1790 stage 2 (auditor 5): one budget covers `files/` and the run
+/// directories in it. Many empty run directories and invalid names, with no
+/// report anywhere, stop the listing at the budget and mark it incomplete; a
+/// budget that covers every entry lists them all, complete.
+#[test]
+fn kept_reports_charge_both_directory_levels_to_one_budget() {
+    let root = crate::test_temp::tempdir().unwrap();
+    let now = t0();
+    let store = open(root.path(), StoreConfig::default(), now);
+    let files = store.dir().parent().unwrap().to_path_buf();
+    for n in 0..40u32 {
+        use std::os::unix::fs::DirBuilderExt as _;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(files.join(format!("{n:032x}")))
+            .unwrap();
+        std::fs::write(files.join(format!("not-a-run-{n}")), b"").unwrap();
+    }
+
+    let cut = store.kept_reports_within(25);
+    assert!(cut.incomplete, "empty runs and stray names use the budget");
+    assert!(cut.reports.is_empty());
+
+    put(&store, "mine", "M", now);
+    let whole = store.kept_reports_within(1_000);
+    assert!(!whole.incomplete);
+    assert_eq!(
+        whole
+            .reports
+            .iter()
+            .map(|k| k.report_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["mine"]
+    );
+    let at_budget = store.kept_reports_within(80);
+    assert!(
+        at_budget.incomplete,
+        "80 outer entries leave nothing for the run's own"
+    );
+}

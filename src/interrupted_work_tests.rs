@@ -561,6 +561,7 @@ fn the_list_serialises_with_the_agreed_field_names() {
             "last_entry",
             "launcher",
             "name",
+            "progress",
             "repo",
             "reports",
             "worktree"
@@ -624,12 +625,30 @@ fn the_interrupted_work_requests_round_trip_with_their_ops_and_omit_their_defaul
         AttachRequest::ListInterruptedWork { git: true }
     ));
 
-    let show = wire(&AttachRequest::ShowInterrupted { id: "w-1".into() });
+    let show = wire(&AttachRequest::ShowInterrupted {
+        id: "w-1".into(),
+        report: None,
+    });
     assert_eq!(
         show,
         serde_json::json!({"op": "show-interrupted", "id": "w-1"})
     );
-    assert!(matches!(back(show), AttachRequest::ShowInterrupted { id } if id == "w-1"));
+    assert!(matches!(
+        back(show),
+        AttachRequest::ShowInterrupted { id, report: None } if id == "w-1"
+    ));
+    let one = wire(&AttachRequest::ShowInterrupted {
+        id: "w-1".into(),
+        report: Some("r-17".into()),
+    });
+    assert_eq!(
+        one,
+        serde_json::json!({"op": "show-interrupted", "id": "w-1", "report": "r-17"})
+    );
+    assert!(matches!(
+        back(one),
+        AttachRequest::ShowInterrupted { report: Some(r), .. } if r == "r-17"
+    ));
 
     let person = wire(&AttachRequest::ReclaimInterrupted {
         id: "w-1".into(),
@@ -707,6 +726,8 @@ fn the_interrupted_work_answers_are_additive_and_decode_unknown_values() {
         }],
         refusal: None,
         incomplete: true,
+        dismissed_omitted: 0,
+        refused_omitted: 0,
     };
     let resp = AttachResponse {
         interrupted_reclaim: Some(outcome.clone()),
@@ -805,4 +826,232 @@ fn still_interrupted_is_false_once_dismissed_or_resumed() {
     assert!(!still_interrupted(&resumed.read(), &w2, live_only));
     j.closed(&w, CloseHow::Dismissed);
     assert!(!still_interrupted(&j.read(), &w, live_only));
+}
+
+/// Reviewer 1: a report the inbox accepted (`reported destination=inbox`)
+/// and later set aside when its caller went away (this run's own file in
+/// state recovered) is listed under its producer's item without a restart;
+/// one still pinned is not.
+#[test]
+fn an_inbox_report_set_aside_for_a_gone_caller_is_listed_without_a_restart() {
+    let mut j = Journal::default();
+    let unit = work(1);
+    let a = attempt(LIVE, 1);
+    j.opened(&unit, Launch::Dispatch, None, Refs::default(), None)
+        .started(&unit, &a)
+        .reported(&unit, "set-aside", Destination::Inbox, None)
+        .reported(&unit, "still-pinned", Destination::Inbox, None)
+        .ended(&unit, &a, EndHow::Exited)
+        .closed(&unit, CloseHow::UnitEnded);
+    let own = |id: &str, state: OwnState| {
+        KeptReport::from_name(LIVE, &crate::retained_store::own_name(id), Some(state)).unwrap()
+    };
+    let kept = vec![
+        own("set-aside", OwnState::Recovered(1_800_000_000)),
+        own("still-pinned", OwnState::Pinned),
+    ];
+    assert!(kept[0].left_for_gone_caller());
+    assert!(!kept[1].left_for_gone_caller());
+    let list = derive_in(&j, Vec::new(), &kept);
+    assert_eq!(ids(&list), vec![unit]);
+    let reports: Vec<&str> = list.items[0]
+        .reports
+        .iter()
+        .map(|r| r.report_id.as_str())
+        .collect();
+    assert_eq!(reports, vec!["set-aside"]);
+}
+
+/// Reviewer 5: an item's progress rolls up every work under it: distinct
+/// attempts (a delegation's attempt is its worker's, counted once), the
+/// roles they ran as in the order first seen, and the delegations opened
+/// and closed as done.
+#[test]
+fn an_items_progress_rolls_up_attempts_roles_and_delegations() {
+    let mut j = Journal::default();
+    let team = work(1);
+    let lead = attempt(OLD, 1);
+    let coder = attempt(OLD, 2);
+    let tester = attempt(OLD, 3);
+    let with_role = |j: &mut Journal, w: &WorkId, a: &AttemptId, role: &str| {
+        j.push(
+            OLD,
+            Event::AttemptStarted {
+                work: w.clone(),
+                attempt: a.clone(),
+                pane: "pane".into(),
+                agent: 1,
+                role: Some(role.into()),
+            },
+        );
+    };
+    j.opened(&team, Launch::Orchestration, None, Refs::default(), None);
+    with_role(&mut j, &team, &lead, "orchestrator");
+    with_role(&mut j, &team, &coder, "coder");
+    let delegate = |j: &mut Journal, n: u64, worker: &AttemptId, role: &str, done: bool| {
+        let task = work(n);
+        j.opened(
+            &task,
+            Launch::Delegation,
+            Some(&team),
+            Refs {
+                role: Some(role.into()),
+                ..Refs::default()
+            },
+            None,
+        );
+        with_role(j, &task, worker, role);
+        if done {
+            j.closed(&task, CloseHow::TaskDone);
+        }
+    };
+    delegate(&mut j, 2, &coder, "coder", true);
+    delegate(&mut j, 3, &coder, "coder", true);
+    delegate(&mut j, 4, &tester, "tester", false);
+    j.ended(&team, &lead, EndHow::Interrupted);
+
+    let list = derive_in(&j, Vec::new(), &[]);
+    assert_eq!(ids(&list), vec![team]);
+    let progress = &list.items[0].progress;
+    assert_eq!(
+        progress,
+        &Progress {
+            attempts: 3,
+            roles: vec!["orchestrator".into(), "coder".into(), "tester".into()],
+            delegations: 3,
+            delegations_done: 2,
+        }
+    );
+    assert_eq!(
+        progress_line(progress),
+        "3 attempts; roles orchestrator, coder, tester; 2 of 3 delegations done"
+    );
+
+    // A plain pane: one attempt, no roles, no delegations.
+    let mut j = Journal::default();
+    let (w, a) = pane(&mut j, 9);
+    j.ended(&w, &a, EndHow::Interrupted);
+    let list = derive_in(&j, Vec::new(), &[]);
+    assert_eq!(list.items[0].progress.attempts, 1);
+    assert_eq!(progress_line(&list.items[0].progress), "1 attempt");
+    assert_eq!(
+        progress_line(&Progress {
+            attempts: 2,
+            roles: Vec::new(),
+            delegations: 1,
+            delegations_done: 0,
+        }),
+        "2 attempts; 0 of 1 delegation done"
+    );
+}
+
+/// An item whose strings are as long as a launch record allows and made of
+/// characters JSON escapes six times over, with many reports.
+fn heavy_item(n: u64, reports: usize) -> InterruptedItem {
+    let ugly = |len: usize| "\u{1}".repeat(len);
+    InterruptedItem {
+        id: work(n),
+        kind: ItemKind::Unit,
+        name: Some(ugly(MAX_FIELD_BYTES * 3)),
+        issue: Some(n),
+        repo: Some(ugly(MAX_FIELD_BYTES)),
+        branch: Some(ugly(MAX_FIELD_BYTES)),
+        worktree: Some(ugly(MAX_FIELD_BYTES)),
+        launcher: Some(ugly(MAX_FIELD_BYTES)),
+        last_entry: LastEntry {
+            kind: "reported".into(),
+            ts_ms: n,
+        },
+        reports: (0..reports)
+            .map(|r| ItemReport {
+                report_id: format!("r-{n}-{r}"),
+                task_id: Some(ugly(MAX_FIELD_BYTES)),
+                unit_id: Some(ugly(MAX_FIELD_BYTES)),
+                kept_until_ms: Some(1),
+            })
+            .collect(),
+        reports_omitted: 0,
+        cut: false,
+        progress: Progress::default(),
+        git: None,
+    }
+}
+
+/// Auditor 6: a list whose items' metadata and reports would serialise far
+/// past the attach frame is fitted to the reply budget: it stays within it
+/// (escaping included), each item keeps at most `MAX_LISTED_REPORTS` report
+/// entries and counts the rest, a string past `MAX_FIELD_BYTES` is cut and
+/// marked, and the items left out are counted. A tiny budget still answers
+/// the list's own fields with every item counted as omitted.
+#[test]
+fn a_list_is_fitted_to_the_reply_budget() {
+    let unfitted = InterruptedList {
+        items: (0..40).map(|n| heavy_item(n, 40)).collect(),
+        incomplete: false,
+        omitted: 0,
+    };
+    let whole: usize = unfitted.items.iter().map(json_len).sum();
+    assert!(whole > crate::daemon_protocol::MAX_FRAME_LEN, "{whole}");
+
+    let mut list = unfitted.clone();
+    fit_list(&mut list, MAX_REPLY_BYTES, GIT_FACTS_RESERVE);
+    let size = json_len(&list);
+    assert!(size <= MAX_REPLY_BYTES, "{size}");
+    assert!(size + list.items.len() * GIT_FACTS_RESERVE <= MAX_REPLY_BYTES);
+    assert!(!list.items.is_empty());
+    assert_eq!(list.items.len() + list.omitted, 40);
+    assert!(list.omitted > 0);
+    for item in &list.items {
+        assert_eq!(item.reports.len(), MAX_LISTED_REPORTS);
+        assert_eq!(item.reports_omitted, 40 - MAX_LISTED_REPORTS);
+        assert!(item.cut);
+        assert!(item.name.as_ref().unwrap().len() <= MAX_FIELD_BYTES);
+    }
+
+    let mut small = unfitted.clone();
+    fit_list(&mut small, 2_048, 0);
+    assert!(small.items.is_empty());
+    assert_eq!(small.omitted, 40);
+    assert!(json_len(&small) <= 2_048);
+
+    // An ordinary list is left as it was.
+    let mut j = Journal::default();
+    let (w, a) = pane(&mut j, 1);
+    j.ended(&w, &a, EndHow::Interrupted);
+    let plain = derive_in(&j, Vec::new(), &[]);
+    let mut fitted = plain.clone();
+    fit_list(&mut fitted, MAX_REPLY_BYTES, 0);
+    assert_eq!(fitted, plain);
+}
+
+/// Auditor 6: a show of an item with thousands of reports and large bodies
+/// stays within the reply budget: its report entries are cut at
+/// `MAX_SHOWN_ENTRY_BYTES` and counted, and bodies that would not fit are
+/// counted rather than sent.
+#[test]
+fn a_show_is_fitted_to_the_reply_budget() {
+    let item = heavy_item(1, 1_000);
+    let bodies: Vec<String> = item
+        .reports
+        .iter()
+        .take(MAX_SHOWN_REPORTS)
+        .map(|r| r.report_id.clone())
+        .collect();
+    let big = |report_id: &str| ShownReport {
+        report_id: report_id.to_string(),
+        body: Some("\u{1}".repeat(MAX_SHOWN_REPORT_BYTES as usize * 2)),
+        cut: true,
+        error: None,
+    };
+    let shown = fit_show(item.clone(), &bodies, false, MAX_REPLY_BYTES, big);
+    let size = json_len(&shown);
+    assert!(size <= MAX_REPLY_BYTES, "{size}");
+    assert!(shown.item.reports_omitted > 0);
+    assert_eq!(shown.item.reports.len() + shown.item.reports_omitted, 1_000);
+    assert!(shown.bodies_omitted > 0, "these bodies cannot all fit");
+    assert_eq!(
+        shown.reports.len() + shown.bodies_omitted,
+        MAX_SHOWN_REPORTS
+    );
+    assert!(shown.item.cut);
 }

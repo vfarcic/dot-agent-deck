@@ -35,7 +35,9 @@
 //! A `reported` line's report is joined to its retained file by report id. It
 //! was left for a caller that is gone when the file was not acknowledged and
 //! either was adopted from an ended run in state pinned, recovered or
-//! unlisted, or the line says it went to recovery. It is listed under the item
+//! unlisted, or is this run's own file in state recovered (the inbox accepted
+//! it and set it aside when its caller went away, so its line still says
+//! `inbox`), or the line says it went to recovery. It is listed under the item
 //! of the work that produced it, closed or not.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -119,12 +121,48 @@ pub struct InterruptedItem {
     pub last_entry: LastEntry,
     #[serde(default)]
     pub reports: Vec<ItemReport>,
+    /// Kept reports of the item left out of [`Self::reports`] to keep the
+    /// reply bounded ([`fit_list`], [`fit_show`]); read one by its id with
+    /// [`crate::daemon_protocol::AttachRequest::ShowInterrupted`]'s `report`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub reports_omitted: usize,
+    /// A name, path or other string of the item was longer than
+    /// [`MAX_FIELD_BYTES`] and was cut to it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cut: bool,
+    /// How far the item's work got, from the journal.
+    #[serde(default)]
+    pub progress: Progress,
     /// Live Git and pull request facts about the item's worktree and branch,
     /// read when the list was asked for with them (`git: true`); absent
     /// otherwise, so the plain list's shape does not change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git: Option<GitFacts>,
 }
+
+/// How far an item's work got, from its journal lines alone: how many
+/// attempts ran under it, the roles they ran as, and how many tasks were
+/// delegated and how many of those were closed as done (`closed
+/// how=task_done`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Progress {
+    /// Distinct attempts across every work of the item.
+    #[serde(default)]
+    pub attempts: u64,
+    /// The roles those attempts ran as, in the order first seen, at most
+    /// [`MAX_PROGRESS_ROLES`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<String>,
+    /// Delegated tasks (`opened launch=delegation`) under the item.
+    #[serde(default)]
+    pub delegations: u64,
+    /// Of those, the ones closed as done.
+    #[serde(default)]
+    pub delegations_done: u64,
+}
+
+/// The most roles a [`Progress`] names.
+pub const MAX_PROGRESS_ROLES: usize = 16;
 
 /// What Git (and `gh`) said about an item's worktree and branch when it was
 /// listed. Every fact is `None` when it could not be read within its bound,
@@ -178,6 +216,11 @@ pub struct InterruptedShow {
     /// ([`InterruptedList::incomplete`]).
     #[serde(default)]
     pub incomplete: bool,
+    /// Bodies of the first [`MAX_SHOWN_REPORTS`] reports left out because
+    /// the reply would have been too large ([`fit_show`]); read each by its
+    /// id.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub bodies_omitted: usize,
 }
 
 /// One kept report's body, for showing.
@@ -203,18 +246,45 @@ pub const MAX_SHOWN_REPORTS: usize = 16;
 /// The most of each report's file a show reads.
 pub const MAX_SHOWN_REPORT_BYTES: u64 = 64 * 1024;
 
-/// The most items a list answers with, so a reply stays far inside the
-/// attach protocol's frame bound; [`InterruptedList::omitted`] counts the rest.
+/// The most items a list answers with; [`InterruptedList::omitted`] counts
+/// the rest.
 pub const MAX_LISTED_ITEMS: usize = 2_000;
+
+/// The most bytes a list's or a show's JSON answer may take: half the attach
+/// protocol's 16 MiB frame bound, leaving room for the response's envelope
+/// and the Git facts a list adds after it is fitted ([`GIT_FACTS_RESERVE`]).
+pub const MAX_REPLY_BYTES: usize = 8 * 1024 * 1024;
+
+/// The bytes a list sets aside per item for the Git facts it adds after
+/// fitting: a [`GitFacts`] with every field set serialises far below this.
+pub const GIT_FACTS_RESERVE: usize = 512;
+
+/// The most report entries each item of a list carries;
+/// [`InterruptedItem::reports_omitted`] counts the rest.
+pub const MAX_LISTED_REPORTS: usize = 16;
+
+/// The most bytes a show's report entries (not their bodies) may take.
+pub const MAX_SHOWN_ENTRY_BYTES: usize = 1024 * 1024;
+
+/// The longest string of an item a reply carries, in bytes. A journal line
+/// is at most 4 KiB, so only a launch record's longer display string is ever
+/// cut.
+pub const MAX_FIELD_BYTES: usize = 4096;
 
 /// Why a reclaim or dismissal was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RefusalReason {
-    /// The request came from an agent in a deck pane (decision D4).
+    /// The request carried an agent's pane claim (decision D4). A guard for
+    /// a cooperative agent, not an authentication boundary: see
+    /// [`crate::interrupted_work_daemon`].
     AgentCaller,
     /// The request named nothing, or named items and `all` together.
     BadRequest,
+    /// The request named more items, or longer ids, than one request may
+    /// ([`crate::interrupted_work_daemon::MAX_DISMISS_IDS`] and its
+    /// siblings).
+    TooLarge,
     /// The journal could not be read.
     Unreadable,
     /// The journal read stopped at its budget, so the item's state is not
@@ -238,6 +308,9 @@ pub enum RefusalReason {
     NotOwned,
     /// Something this daemon runs is still rooted in the worktree.
     StillInUse,
+    /// Whether something this daemon runs is rooted in the worktree could not
+    /// be told: a directory an agent runs in could not be resolved.
+    InUseUnknown,
     /// The journal could not record the close.
     NotRecorded,
     #[serde(other)]
@@ -278,6 +351,10 @@ pub enum ReclaimVerdict {
     RemoveFailed,
     /// The removal did not answer within its bound.
     TimedOut,
+    /// Kept: just before removing it, the worktree was no longer the one the
+    /// reclaim checked (another directory at its path, a missing owner
+    /// marker, or another branch checked out), so nothing was removed.
+    KeptChanged,
     /// Refused before anything was checked or removed; see
     /// [`ReclaimOutcome::refusal`].
     Refused,
@@ -364,6 +441,40 @@ pub struct DismissOutcome {
     /// The listing the ids were matched against was incomplete.
     #[serde(default)]
     pub incomplete: bool,
+    /// Items dismissed but left out of [`Self::dismissed`], past
+    /// [`MAX_DISMISS_REPORTED`].
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub dismissed_omitted: usize,
+    /// Refusals left out of [`Self::refused`], past [`MAX_DISMISS_REPORTED`].
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub refused_omitted: usize,
+}
+
+/// The most entries each of a dismissal's [`DismissOutcome::dismissed`] and
+/// [`DismissOutcome::refused`] carries; the rest are counted.
+pub const MAX_DISMISS_REPORTED: usize = 256;
+
+impl DismissOutcome {
+    /// Record `item` as dismissed, within [`MAX_DISMISS_REPORTED`].
+    pub fn push_dismissed(&mut self, item: DismissedItem) {
+        if self.dismissed.len() < MAX_DISMISS_REPORTED {
+            self.dismissed.push(item);
+        } else {
+            self.dismissed_omitted += 1;
+        }
+    }
+
+    /// Record a refusal of `id`, within [`MAX_DISMISS_REPORTED`].
+    pub fn push_refused(&mut self, id: String, reason: RefusalReason) {
+        if self.refused.len() < MAX_DISMISS_REPORTED {
+            self.refused.push(DismissRefused {
+                id,
+                refusal: Refusal::new(reason),
+            });
+        } else {
+            self.refused_omitted += 1;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -406,13 +517,15 @@ pub const RECLAIM_KEPT_HOLDS_WORKTREES: &str =
 pub const RECLAIM_KEPT_COULD_NOT_CHECK: &str =
     "Kept: whether its worktree has uncommitted changes could not be checked.";
 pub const RECLAIM_REMOVE_FAILED: &str = "Kept: git could not remove its worktree.";
-pub const RECLAIM_TIMED_OUT: &str =
-    "Removing its worktree did not finish in time; it may still be removed.";
+pub const RECLAIM_TIMED_OUT: &str = "Removing its worktree did not finish in time; it may still be removed, and the deck records it if it is.";
+pub const RECLAIM_KEPT_CHANGED: &str = "Kept: its worktree was moved, replaced or switched to another branch while it was being reclaimed, so nothing was removed. List the interrupted work again.";
 pub const RECLAIM_NOT_RECORDED: &str = "Its worktree was removed and its branch kept, but the deck could not record it, so it may be listed again.";
 pub const DISMISSED: &str = "Dismissed.";
 
-pub const REFUSED_AGENT_CALLER: &str = "Refused: an agent cannot reclaim or dismiss interrupted work. Do it from the deck or from a terminal.";
+pub const REFUSED_AGENT_CALLER: &str = "Refused: this request came from an agent in a deck pane, and reclaiming or dismissing interrupted work is left to the person. Do it from the deck or from a terminal.";
 pub const REFUSED_BAD_REQUEST: &str = "Refused: name the items to dismiss, or dismiss all of them.";
+pub const REFUSED_TOO_LARGE: &str =
+    "Refused: the request names too many items, or an id that is too long.";
 pub const REFUSED_UNREADABLE: &str = "Refused: the deck could not read its work journal.";
 pub const REFUSED_INCOMPLETE_READ: &str =
     "Refused: the deck could not read its whole work journal, so it cannot be sure of this item.";
@@ -426,6 +539,8 @@ pub const REFUSED_BRANCH_MISMATCH: &str =
     "Refused: its worktree has another branch checked out than the one it was started on.";
 pub const REFUSED_NOT_OWNED: &str = "Refused: the deck did not create this worktree.";
 pub const REFUSED_STILL_IN_USE: &str = "Refused: an agent is still running in its worktree.";
+pub const REFUSED_IN_USE_UNKNOWN: &str =
+    "Refused: the deck could not tell whether an agent is still running in its worktree.";
 pub const REFUSED_NOT_RECORDED: &str = "Refused: the deck could not record the dismissal.";
 pub const REFUSED_UNKNOWN: &str = "Refused.";
 
@@ -445,6 +560,11 @@ pub const LABEL_STARTED_BY: &str = "Started by";
 pub const LABEL_LAST_ENTRY: &str = "Last entry";
 pub const LABEL_GIT: &str = "Git";
 pub const LABEL_REPORT: &str = "Report";
+pub const LABEL_PROGRESS: &str = "Progress";
+/// A show asked for a report the item does not carry.
+pub const REPORT_NOT_OF_ITEM: &str = "That report is not one of this item's kept reports.";
+/// Before the item's strings when one was cut to [`MAX_FIELD_BYTES`].
+pub const ITEM_CUT: &str = "Some of this item's text is too long to show in full.";
 /// A worktree inside the one a reclaim kept (decision D6).
 pub const LABEL_NESTED_WORKTREE: &str = "Holds worktree";
 /// Before a report body that was cut at the show bound.
@@ -496,6 +616,71 @@ pub fn dismiss_all_question(count: usize) -> String {
         "{DISMISS_ALL_ACTION}: {}? [y/N] ",
         interrupted_footer(count)
     )
+}
+
+/// What an item or a show that left out `count` of its kept reports says,
+/// and how to read one: `dot-agent-deck interrupted show <id> --report
+/// <report id>`.
+pub fn more_reports_sentence(count: usize, id: &str) -> String {
+    let lead = if count == 1 {
+        "1 more report is kept".to_string()
+    } else {
+        format!("{count} more reports are kept")
+    };
+    format!("{lead}; read one with `dot-agent-deck interrupted show {id} --report <report id>`.")
+}
+
+/// What a dismissal that dismissed `count` items more than it named says.
+pub fn more_dismissed_sentence(count: usize) -> String {
+    if count == 1 {
+        "1 more item was dismissed.".to_string()
+    } else {
+        format!("{count} more items were dismissed.")
+    }
+}
+
+/// What a dismissal that refused `count` ids more than it named says.
+pub fn more_refused_sentence(count: usize) -> String {
+    if count == 1 {
+        "1 more id was refused.".to_string()
+    } else {
+        format!("{count} more ids were refused.")
+    }
+}
+
+/// What a show that left out the bodies of `count` reports says.
+pub fn bodies_omitted_sentence(count: usize, id: &str) -> String {
+    let lead = if count == 1 {
+        "1 report is not shown here, to keep the answer small".to_string()
+    } else {
+        format!("{count} reports are not shown here, to keep the answer small")
+    };
+    format!("{lead}; read one with `dot-agent-deck interrupted show {id} --report <report id>`.")
+}
+
+/// An item's progress on one line: its attempts, the roles they ran as, and
+/// its delegations done of those opened.
+pub fn progress_line(progress: &Progress) -> String {
+    let mut parts = vec![if progress.attempts == 1 {
+        "1 attempt".to_string()
+    } else {
+        format!("{} attempts", progress.attempts)
+    }];
+    if !progress.roles.is_empty() {
+        parts.push(format!("roles {}", progress.roles.join(", ")));
+    }
+    if progress.delegations > 0 {
+        let noun = if progress.delegations == 1 {
+            "delegation"
+        } else {
+            "delegations"
+        };
+        parts.push(format!(
+            "{} of {} {noun} done",
+            progress.delegations_done, progress.delegations
+        ));
+    }
+    parts.join("; ")
 }
 
 /// What a list that left out its oldest `count` items says.
@@ -554,6 +739,7 @@ pub fn reclaim_sentence(verdict: ReclaimVerdict) -> &'static str {
         ReclaimVerdict::KeptCouldNotCheck => RECLAIM_KEPT_COULD_NOT_CHECK,
         ReclaimVerdict::RemoveFailed => RECLAIM_REMOVE_FAILED,
         ReclaimVerdict::TimedOut => RECLAIM_TIMED_OUT,
+        ReclaimVerdict::KeptChanged => RECLAIM_KEPT_CHANGED,
         ReclaimVerdict::Refused | ReclaimVerdict::Unknown => REFUSED_UNKNOWN,
     }
 }
@@ -563,6 +749,7 @@ pub fn refusal_sentence(reason: RefusalReason) -> &'static str {
     match reason {
         RefusalReason::AgentCaller => REFUSED_AGENT_CALLER,
         RefusalReason::BadRequest => REFUSED_BAD_REQUEST,
+        RefusalReason::TooLarge => REFUSED_TOO_LARGE,
         RefusalReason::Unreadable => REFUSED_UNREADABLE,
         RefusalReason::IncompleteRead => REFUSED_INCOMPLETE_READ,
         RefusalReason::NotListed => REFUSED_NOT_LISTED,
@@ -573,6 +760,7 @@ pub fn refusal_sentence(reason: RefusalReason) -> &'static str {
         RefusalReason::BranchMismatch => REFUSED_BRANCH_MISMATCH,
         RefusalReason::NotOwned => REFUSED_NOT_OWNED,
         RefusalReason::StillInUse => REFUSED_STILL_IN_USE,
+        RefusalReason::InUseUnknown => REFUSED_IN_USE_UNKNOWN,
         RefusalReason::NotRecorded => REFUSED_NOT_RECORDED,
         RefusalReason::Unknown => REFUSED_UNKNOWN,
     }
@@ -700,7 +888,8 @@ pub fn derive_with_home(
             .and_then(|kept| {
                 kept.iter().find(|kept| {
                     !kept.acknowledged()
-                        && (kept.adopted_unread() || reported.destination == Destination::Recovery)
+                        && (kept.left_for_gone_caller()
+                            || reported.destination == Destination::Recovery)
                 })
             })
         else {
@@ -746,24 +935,192 @@ pub fn derive_with_home(
     }
 }
 
-/// The works a dismissal or reclaim of the item rooted at `root` closes: the
-/// root itself, closed or not, so the item is hidden, and every work that
-/// rolls up to it and has no `closed` line yet, so none of them is listed on
-/// its own later. The root comes first.
-pub fn works_under(read: &JournalRead, root: &WorkId) -> Vec<WorkId> {
-    let no_records = LaunchRead::default();
-    let index = Index::build(read, &no_records, |_| true);
-    let roots = index.roots();
-    let mut out = vec![root.clone()];
-    if let Some(works) = roots.under.get(root) {
-        out.extend(
-            works
-                .iter()
-                .filter(|w| **w != root && !index.closes.contains_key(*w))
-                .map(|w| (*w).clone()),
-        );
+/// For every root of one read, the works a dismissal or reclaim of its item
+/// closes. Built once per read ([`CloseSets::build`]) and asked per item, so
+/// dismissing many items indexes the journal once, not once per item.
+#[derive(Debug, Default)]
+pub struct CloseSets {
+    /// Each root's works with no `closed` line, the root excluded.
+    unclosed_under: HashMap<WorkId, Vec<WorkId>>,
+}
+
+impl CloseSets {
+    /// Index `read` once.
+    pub fn build(read: &JournalRead) -> Self {
+        let no_records = LaunchRead::default();
+        let index = Index::build(read, &no_records, |_| true);
+        let roots = index.roots();
+        let unclosed_under = roots
+            .under
+            .iter()
+            .map(|(root, works)| {
+                let unclosed = works
+                    .iter()
+                    .filter(|w| *w != root && !index.closes.contains_key(*w))
+                    .map(|w| (*w).clone())
+                    .collect();
+                ((*root).clone(), unclosed)
+            })
+            .collect();
+        CloseSets { unclosed_under }
     }
-    out
+
+    /// The works a dismissal or reclaim of the item rooted at `root` closes:
+    /// the root itself, closed or not, so the item is hidden, and every work
+    /// that rolls up to it and has no `closed` line yet, so none of them is
+    /// listed on its own later. The root comes first.
+    pub fn works_under(&self, root: &WorkId) -> Vec<WorkId> {
+        let mut out = vec![root.clone()];
+        if let Some(works) = self.unclosed_under.get(root) {
+            out.extend(works.iter().cloned());
+        }
+        out
+    }
+}
+
+/// [`CloseSets::works_under`] for one root, indexing `read` for it alone.
+pub fn works_under(read: &JournalRead, root: &WorkId) -> Vec<WorkId> {
+    CloseSets::build(read).works_under(root)
+}
+
+/// `value` cut to at most `max` bytes on a character boundary; `true` when
+/// it was cut.
+fn cut_to(value: &mut String, max: usize) -> bool {
+    if value.len() <= max {
+        return false;
+    }
+    let mut end = max;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+    true
+}
+
+/// Cut every display string of `item` to [`MAX_FIELD_BYTES`], marking it
+/// [`InterruptedItem::cut`]. Report ids are never cut: a show selects by
+/// them.
+fn cut_fields(item: &mut InterruptedItem) {
+    let mut cut = false;
+    for field in [
+        &mut item.name,
+        &mut item.repo,
+        &mut item.branch,
+        &mut item.worktree,
+        &mut item.launcher,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        cut |= cut_to(field, MAX_FIELD_BYTES);
+    }
+    cut |= cut_to(&mut item.last_entry.kind, MAX_FIELD_BYTES);
+    for role in &mut item.progress.roles {
+        cut |= cut_to(role, MAX_FIELD_BYTES);
+    }
+    for report in &mut item.reports {
+        for field in [&mut report.task_id, &mut report.unit_id]
+            .into_iter()
+            .flatten()
+        {
+            cut |= cut_to(field, MAX_FIELD_BYTES);
+        }
+    }
+    item.cut |= cut;
+}
+
+/// The bytes `value` takes as JSON. A value that cannot be serialised counts
+/// as too large for any budget.
+pub fn json_len<T: Serialize>(value: &T) -> usize {
+    serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len())
+}
+
+/// Fit a list into a reply of at most `budget` bytes, setting aside
+/// `reserve_per_item` bytes for each item kept (the Git facts a list adds
+/// afterwards): each item carries at most [`MAX_LISTED_REPORTS`] report
+/// entries, each string at most [`MAX_FIELD_BYTES`], and items are kept,
+/// newest first, while the whole list fits and at most [`MAX_LISTED_ITEMS`]
+/// are kept. [`InterruptedList::omitted`] counts the items left out. The
+/// list's own items are cut in place, so what a reclaim or a dismissal acts
+/// on must be resolved from an unfitted list.
+pub fn fit_list(list: &mut InterruptedList, budget: usize, reserve_per_item: usize) {
+    let total = list.items.len();
+    let mut used = json_len(&InterruptedList {
+        items: Vec::new(),
+        incomplete: list.incomplete,
+        omitted: total,
+    });
+    let mut kept = 0;
+    for item in list.items.iter_mut() {
+        if kept == MAX_LISTED_ITEMS {
+            break;
+        }
+        if item.reports.len() > MAX_LISTED_REPORTS {
+            item.reports_omitted += item.reports.len() - MAX_LISTED_REPORTS;
+            item.reports.truncate(MAX_LISTED_REPORTS);
+        }
+        cut_fields(item);
+        // The item and the comma before it.
+        let size = json_len(item)
+            .saturating_add(reserve_per_item)
+            .saturating_add(1);
+        if used.saturating_add(size) > budget {
+            break;
+        }
+        used += size;
+        kept += 1;
+    }
+    list.items.truncate(kept);
+    list.omitted += total - kept;
+}
+
+/// Fit a show of `item` into a reply of at most `budget` bytes. The item's
+/// strings are cut to [`MAX_FIELD_BYTES`]; its report entries are kept, in
+/// order, while they take at most [`MAX_SHOWN_ENTRY_BYTES`]
+/// ([`InterruptedItem::reports_omitted`] counts the rest); then the bodies
+/// `read` answers for `bodies` (report ids) are added, in order, while the
+/// whole show fits ([`InterruptedShow::bodies_omitted`] counts the rest).
+pub fn fit_show(
+    mut item: InterruptedItem,
+    bodies: &[String],
+    incomplete: bool,
+    budget: usize,
+    mut read: impl FnMut(&str) -> ShownReport,
+) -> InterruptedShow {
+    cut_fields(&mut item);
+    let mut entries = 0usize;
+    let mut kept = 0usize;
+    for report in &item.reports {
+        let size = json_len(report).saturating_add(1);
+        if entries.saturating_add(size) > MAX_SHOWN_ENTRY_BYTES {
+            break;
+        }
+        entries += size;
+        kept += 1;
+    }
+    item.reports_omitted += item.reports.len() - kept;
+    item.reports.truncate(kept);
+    let mut show = InterruptedShow {
+        item,
+        reports: Vec::new(),
+        incomplete,
+        bodies_omitted: 0,
+    };
+    let mut used = json_len(&InterruptedShow {
+        bodies_omitted: bodies.len(),
+        ..show.clone()
+    });
+    for (at, report_id) in bodies.iter().enumerate() {
+        let shown = read(report_id);
+        let size = json_len(&shown).saturating_add(1);
+        if used.saturating_add(size) > budget {
+            show.bodies_omitted = bodies.len() - at;
+            break;
+        }
+        used += size;
+        show.reports.push(shown);
+    }
+    show
 }
 
 /// The resolved directory of `workspace`: the first of `cwds` (absolute
@@ -814,6 +1171,8 @@ struct Index<'a> {
     works: Vec<&'a WorkId>,
     opened: HashMap<&'a WorkId, Opened<'a>>,
     attempts_of: HashMap<&'a WorkId, Vec<&'a AttemptId>>,
+    /// The roles each work's attempts ran as, in the order first seen.
+    roles_of: HashMap<&'a WorkId, Vec<&'a String>>,
     attempt_state: HashMap<&'a AttemptId, AttemptState>,
     closes: HashMap<&'a WorkId, Vec<CloseHow>>,
     reported: Vec<Reported<'a>>,
@@ -841,6 +1200,7 @@ impl<'a> Index<'a> {
             works: Vec::new(),
             opened: HashMap::new(),
             attempts_of: HashMap::new(),
+            roles_of: HashMap::new(),
             attempt_state: HashMap::new(),
             closes: HashMap::new(),
             reported: Vec::new(),
@@ -873,12 +1233,18 @@ impl<'a> Index<'a> {
                         workspace: workspace.as_ref(),
                     });
                 }
-                Event::AttemptStarted { attempt, .. } => {
+                Event::AttemptStarted { attempt, role, .. } => {
                     let list = index.attempts_of.entry(work).or_default();
                     if !list.contains(&attempt) {
                         list.push(attempt);
                     }
                     works_of.entry(attempt).or_default().insert(work);
+                    if let Some(role) = role {
+                        let roles = index.roles_of.entry(work).or_default();
+                        if !roles.contains(&role) {
+                            roles.push(role);
+                        }
+                    }
                 }
                 Event::AttemptEnded { attempt, how, .. } => {
                     let interrupted = ends.entry(attempt).or_insert(false);
@@ -1034,6 +1400,45 @@ impl<'a> Index<'a> {
         self.attempts_of.get(work).into_iter().flatten().copied()
     }
 
+    /// How far the item made of `ordered` (its root first) got.
+    fn progress(&self, ordered: &[&'a WorkId]) -> Progress {
+        let mut attempts: HashSet<&AttemptId> = HashSet::new();
+        let mut roles: Vec<&String> = Vec::new();
+        let mut progress = Progress::default();
+        for work in ordered {
+            attempts.extend(self.attempts(work));
+            let opened = self.opened.get(*work);
+            let delegated_role = opened
+                .filter(|o| o.launch == Launch::Delegation)
+                .and_then(|o| o.refs.role.as_ref());
+            for role in self
+                .roles_of
+                .get(*work)
+                .into_iter()
+                .flatten()
+                .copied()
+                .chain(delegated_role)
+            {
+                if roles.len() < MAX_PROGRESS_ROLES && !roles.contains(&role) {
+                    roles.push(role);
+                }
+            }
+            if opened.is_some_and(|o| o.launch == Launch::Delegation) {
+                progress.delegations += 1;
+                if self
+                    .closes
+                    .get(*work)
+                    .is_some_and(|hows| hows.contains(&CloseHow::TaskDone))
+                {
+                    progress.delegations_done += 1;
+                }
+            }
+        }
+        progress.attempts = attempts.len() as u64;
+        progress.roles = roles.into_iter().cloned().collect();
+        progress
+    }
+
     /// The launch records joined to `work`'s own attempts, latest first.
     fn records_of(&self, work: &WorkId) -> Vec<&'a LaunchRecord> {
         let mut records: Vec<&LaunchRecord> = self
@@ -1134,6 +1539,7 @@ impl<'a> Index<'a> {
             kind: last.map_or("", |line| line.event.kind()).to_string(),
             ts_ms: last.map_or(0, |line| line.ts_ms),
         };
+        let progress = self.progress(&ordered);
         InterruptedItem {
             id: root.clone(),
             kind,
@@ -1145,6 +1551,9 @@ impl<'a> Index<'a> {
             launcher,
             last_entry,
             reports,
+            reports_omitted: 0,
+            cut: false,
+            progress,
             git: None,
         }
     }

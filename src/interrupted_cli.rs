@@ -189,6 +189,10 @@ pub fn render_item(item: &InterruptedItem) -> String {
             words::format_time(item.last_entry.ts_ms)
         ),
     );
+    line(
+        words::LABEL_PROGRESS,
+        shown(&words::progress_line(&item.progress)),
+    );
     if let Some(git) = &item.git {
         line(words::LABEL_GIT, words::git_facts_line(git));
     }
@@ -202,6 +206,15 @@ pub fn render_item(item: &InterruptedItem) -> String {
             ),
         );
     }
+    if item.reports_omitted > 0 {
+        out.push_str(&format!(
+            "    {}\n",
+            words::more_reports_sentence(item.reports_omitted, item.id.as_str())
+        ));
+    }
+    if item.cut {
+        out.push_str(&format!("    {}\n", words::ITEM_CUT));
+    }
     out
 }
 
@@ -209,10 +222,11 @@ pub fn render_item(item: &InterruptedItem) -> String {
 // show
 // ---------------------------------------------------------------------------
 
-/// `interrupted show <id>`: the item and the body of each kept report, as
-/// the daemon framed it (untrusted text written by an agent).
-pub async fn run_show(client: &DaemonClient, id: &str) -> CliOutput {
-    match client.show_interrupted(id, None).await {
+/// `interrupted show <id> [--report <report id>]`: the item and the body of
+/// its first kept reports, or of the one `report` names, as the daemon framed
+/// it (untrusted text written by an agent).
+pub async fn run_show(client: &DaemonClient, id: &str, report: Option<&str>) -> CliOutput {
+    match client.show_interrupted(id, report, None).await {
         Ok(GatedQuery::Answered(shown)) => ok(render_show(&shown)),
         Ok(GatedQuery::Unsupported) => unsupported(),
         Err(e) => client_error(e),
@@ -226,6 +240,26 @@ pub fn render_show(show: &InterruptedShow) -> String {
         out.push_str(&format!("{}\n", words::LIST_INCOMPLETE));
     }
     out.push_str(&render_item(&show.item));
+    if show.bodies_omitted > 0 {
+        out.push_str(&format!(
+            "{}\n",
+            words::bodies_omitted_sentence(show.bodies_omitted, show.item.id.as_str())
+        ));
+    }
+    // The item's listed reports past the bodies shown (the first ones, or
+    // the one asked for): each can be read by its id. Reports the item left
+    // out of its list are counted by `render_item` already.
+    let unshown = show
+        .item
+        .reports
+        .len()
+        .saturating_sub(show.reports.len() + show.bodies_omitted);
+    if unshown > 0 {
+        out.push_str(&format!(
+            "{}\n",
+            words::more_reports_sentence(unshown, show.item.id.as_str())
+        ));
+    }
     for report in &show.reports {
         out.push_str(&format!(
             "\n{} {}\n",
@@ -394,17 +428,51 @@ pub async fn run_dismiss(
     send_dismiss(client, ids, all, claim).await
 }
 
+/// Send the dismissal, `ids` in batches of at most
+/// [`crate::interrupted_work_daemon::MAX_DISMISS_IDS`] (the daemon refuses a
+/// larger selector), and render the outcomes together.
 async fn send_dismiss(
     client: &DaemonClient,
     ids: Vec<String>,
     all: bool,
     claim: Option<crate::daemon_protocol::CallerClaim>,
 ) -> CliOutput {
-    match client.dismiss_interrupted(ids, all, claim, None).await {
-        Ok(GatedQuery::Answered(outcome)) => render_dismiss(&outcome),
-        Ok(GatedQuery::Unsupported) => unsupported(),
-        Err(e) => client_error(e),
+    let batches: Vec<Vec<String>> = if all {
+        vec![Vec::new()]
+    } else {
+        ids.chunks(crate::interrupted_work_daemon::MAX_DISMISS_IDS)
+            .map(<[String]>::to_vec)
+            .collect()
+    };
+    let mut merged = DismissOutcome::default();
+    for batch in batches {
+        match client
+            .dismiss_interrupted(batch, all, claim.clone(), None)
+            .await
+        {
+            Ok(GatedQuery::Answered(outcome)) => {
+                if outcome.refusal.is_some() {
+                    return render_dismiss(&outcome);
+                }
+                merged.incomplete |= outcome.incomplete;
+                merged.dismissed_omitted += outcome.dismissed_omitted;
+                merged.refused_omitted += outcome.refused_omitted;
+                for item in outcome.dismissed {
+                    merged.push_dismissed(item);
+                }
+                for refused in outcome.refused {
+                    if merged.refused.len() < words::MAX_DISMISS_REPORTED {
+                        merged.refused.push(refused);
+                    } else {
+                        merged.refused_omitted += 1;
+                    }
+                }
+            }
+            Ok(GatedQuery::Unsupported) => return unsupported(),
+            Err(e) => return client_error(e),
+        }
     }
+    render_dismiss(&merged)
 }
 
 /// [`run_dismiss`]'s text and exit code: 0 when nothing was refused.
@@ -427,7 +495,14 @@ pub fn render_dismiss(outcome: &DismissOutcome) -> CliOutput {
         }
         stdout.push('\n');
     }
-    if outcome.dismissed.is_empty() && outcome.refused.is_empty() {
+    if outcome.dismissed_omitted > 0 {
+        stdout.push_str(&format!(
+            "{}\n",
+            words::more_dismissed_sentence(outcome.dismissed_omitted)
+        ));
+    }
+    if outcome.dismissed.is_empty() && outcome.dismissed_omitted == 0 && outcome.refused.is_empty()
+    {
         stdout.push_str(&format!("{}\n", words::NOTHING_INTERRUPTED));
     }
     let mut stderr = String::new();
@@ -441,10 +516,16 @@ pub fn render_dismiss(outcome: &DismissOutcome) -> CliOutput {
             refusal_text(&refused.refusal)
         ));
     }
+    if outcome.refused_omitted > 0 {
+        stderr.push_str(&format!(
+            "{}\n",
+            words::more_refused_sentence(outcome.refused_omitted)
+        ));
+    }
     CliOutput {
         stdout,
         stderr,
-        code: if outcome.refused.is_empty() {
+        code: if outcome.refused.is_empty() && outcome.refused_omitted == 0 {
             EXIT_OK
         } else {
             EXIT_REFUSED

@@ -2,11 +2,30 @@
 //! [`crate::daemon_protocol::AttachRequest::ListInterruptedWork`],
 //! `ShowInterrupted`, `ReclaimInterrupted` and `DismissInterrupted`.
 //!
-//! Each one reads the journal afresh (a complete read, the launch records
+//! Each request reads the journal afresh (a complete read, the launch records
 //! and the kept report files) and derives the list with
-//! [`crate::interrupted_work::derive`]; nothing is cached, so two clients
-//! never disagree about an item. The reads and the journal writes are
-//! blocking and run on `spawn_blocking`; Git runs as bounded subprocesses.
+//! [`crate::interrupted_work::derive`]; nothing is cached between requests.
+//! That does not make two clients agree: requests read at different times,
+//! and the journal, the launch records and the report files are read one
+//! after another, so recovery or adoption can change one source while
+//! another is being read. The reads and the journal writes are blocking and
+//! run on `spawn_blocking`. The `git` and `gh` children of a list's facts and
+//! of a reclaim's geometry, marker and branch checks run through
+//! [`crate::interrupted_work_probe`] (a deadline, an output cap, the process
+//! group killed and the child reaped at the deadline, and a daemon-wide limit
+//! on how many run at once); the reclaim's dirty and nested-worktree check
+//! and its removal run through [`crate::issue_dispatch_run`]'s runner, which
+//! kills the process group at its own bound.
+//!
+//! **Replies are bounded.** A list keeps at most
+//! [`crate::interrupted_work::MAX_LISTED_ITEMS`] items and at most
+//! [`MAX_REPLY_BYTES`] of JSON, each item at most
+//! [`crate::interrupted_work::MAX_LISTED_REPORTS`] report entries and each
+//! string at most [`crate::interrupted_work::MAX_FIELD_BYTES`]; a show bounds
+//! its report entries and bodies the same way ([`fit_list`], [`fit_show`]),
+//! and either says what it left out. A show can ask for any one of the item's
+//! reports by id. What a reclaim or a dismissal acts on is resolved from the
+//! unfitted list, never from what a reply carried.
 //!
 //! **Who may act.** Listing and showing are open to every caller. Reclaim and
 //! dismiss are refused when the request carries a pane claim
@@ -14,23 +33,53 @@
 //! (the CLI sends one whenever its shell carries a pane's identity, as
 //! `close` does), and stage 2 leaves these actions to the person (decision
 //! D4). The claim is refused whether or not it would attest, since no agent
-//! is allowed either way.
+//! is allowed either way. **This is a guard for a cooperative agent, not an
+//! authentication boundary**, as `close`'s is (`src/close_agents.rs`): the
+//! claim is optional, so a same-uid process that drops its pane identity, or
+//! sends the request without the field, is treated as the person
+//! (`docs/develop/hook-provenance.md` has the trust boundary).
 //!
 //! **Reclaim** removes the item's worktree and keeps its branch. It reuses
-//! [`crate::issue_dispatch_run::remove_worktree_outcome`] with
+//! [`crate::issue_dispatch_run::remove_worktree_outcome_guarded`] with
 //! [`RemovalPolicy::KeepIfDirty`], so it never passes `--force` to Git and a
 //! tree with uncommitted changes, or with other worktrees inside it, is kept
 //! (decisions D5, D6). Before that it requires a fresh, untruncated journal
 //! read in which the item is still interrupted, an item that is not a plain
 //! agent's (D1), a linked worktree at the recorded path whose checked-out
-//! branch is the item's, the deck's ownership marker, and nothing this daemon
-//! runs rooted inside it (held for the whole removal). Only a removal writes
-//! `closed how=reclaimed` on the item's works.
+//! branch is the item's, and the deck's ownership marker. It then holds the
+//! worktree against new spawns ([`AgentPtyRegistry::hold_dir_for_removal`],
+//! by its recorded and its canonical path) and, with the hold taken,
+//! resolves every directory anything this daemon runs or is starting is
+//! rooted in to its canonical form, outside the registry lock: one inside the
+//! worktree refuses the reclaim, and so does one that cannot be resolved. A
+//! spawn reserved after the hold into an alias of the worktree is refused by
+//! it, since a spawn whose directory resolves records its canonical spelling
+//! too. Immediately before
+//! `git worktree remove`, still under the hold, it re-validates that the
+//! directory is the one it checked: the same device and inode at the same
+//! canonical path, the owner marker in the same git metadata directory, and
+//! the item's branch checked out. Any difference keeps the tree.
+//!
+//! **What reclaim does not guard against.** The hold refuses spawns this
+//! daemon starts; it does not stop another process (a terminal, another
+//! daemon) from moving, replacing or switching the worktree. The
+//! re-validation narrows that to the gap between its last check and
+//! `git worktree remove` acting on the path, which no lock here closes: a
+//! process that swaps the directory inside that gap can still have the
+//! swapped-in tree removed, if it is clean.
+//!
+//! A removal that succeeds writes `closed how=reclaimed` on the item's works
+//! from the task that owns the removal, while it still holds the worktree,
+//! so a removal that finishes after the reply's bound is recorded too.
 //!
 //! **Dismiss** writes `closed how=dismissed` on every work of each item named
 //! (or of every listed item), so it is no longer listed. Kept reports are left
-//! to expire on schedule (D7).
+//! to expire on schedule (D7). Its selector is bounded before anything is
+//! read ([`MAX_DISMISS_IDS`], [`MAX_DISMISS_ID_BYTES`], [`MAX_DISMISS_BYTES`]),
+//! the journal is indexed once per request ([`CloseSets`]), and its report
+//! lists are capped ([`crate::interrupted_work::MAX_DISMISS_REPORTED`]).
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,28 +87,55 @@ use std::time::Duration;
 use crate::agent_pty::AgentPtyRegistry;
 use crate::daemon_protocol::CallerClaim;
 use crate::interrupted_work::{
-    DismissOutcome, DismissRefused, DismissedItem, GitFacts, InterruptedItem, InterruptedList,
-    InterruptedShow, ItemKind, MAX_LISTED_ITEMS, MAX_SHOWN_REPORT_BYTES, MAX_SHOWN_REPORTS, PrFact,
-    ReclaimOutcome, ReclaimVerdict, Refusal, RefusalReason, Resolved, ShownReport, derive,
-    reclaim_sentence, resolve, still_interrupted, works_under,
+    CloseSets, DismissOutcome, DismissedItem, GIT_FACTS_RESERVE, GitFacts, InterruptedItem,
+    InterruptedList, InterruptedShow, ItemKind, MAX_REPLY_BYTES, MAX_SHOWN_REPORT_BYTES,
+    MAX_SHOWN_REPORTS, PrFact, REPORT_NOT_OF_ITEM, ReclaimOutcome, ReclaimVerdict, RefusalReason,
+    Resolved, ShownReport, derive, fit_list, fit_show, reclaim_sentence, resolve,
+    still_interrupted,
 };
+use crate::interrupted_work_probe::{self as probe, Deadline};
 use crate::issue_dispatch_run::{RemovalPolicy, TreeKeepCheck, WorktreeRemoval};
 use crate::launch_records::LaunchRead;
 use crate::retained_store::{KeptReport, KeptReports, RetainedStore};
-use crate::work_journal::{CloseHow, Event, JournalRead, WorkJournal};
+use crate::work_journal::{CloseHow, Event, JournalRead, WorkId, WorkJournal};
 
-/// The bound on each Git probe of a list's Git facts.
+/// The bound on one item's Git facts.
 pub const GIT_FACT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The bound on one item's pull request lookup (decision D8).
+/// The bound on one item's pull request lookup (decision D8), all its `git`
+/// and `gh` children together.
 pub const PR_STATE_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// The bound on a reclaim's checks and removal, as `close`'s worktree
-/// cleanup has.
+/// The bound on all of one list's Git and pull request facts: an item not
+/// started by then gets none, and one running then is cut short.
+pub const LIST_ENRICHMENT_BUDGET: Duration = Duration::from_secs(20);
+
+/// The bound on a reclaim's checks before its removal: the worktree's
+/// geometry, its branch and its unpushed commits.
+pub const RECLAIM_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The bound on the re-validation just before the removal.
+pub const REVALIDATE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The bound on a reclaim's removal, as `close`'s worktree cleanup has. The
+/// removal is not stopped at it, only the reply.
 pub const RECLAIM_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How many items' Git facts are read at once.
+/// How many items' Git facts one list reads at once.
 const GIT_FACT_CONCURRENCY: usize = 8;
+
+/// The most ids one dismissal may name, as `close`'s selector
+/// ([`crate::close_agents::MAX_SELECTOR_ENTRIES`]).
+pub const MAX_DISMISS_IDS: usize = crate::close_agents::MAX_SELECTOR_ENTRIES;
+
+/// The longest id a dismissal may name, in bytes.
+pub const MAX_DISMISS_ID_BYTES: usize = crate::close_agents::MAX_SELECTOR_ENTRY_BYTES;
+
+/// The most bytes all of a dismissal's ids may add up to.
+pub const MAX_DISMISS_BYTES: usize = crate::close_agents::MAX_SELECTOR_BYTES;
+
+/// The `gh` a list runs for pull request state: `gh` on the daemon's `PATH`.
+const GH: &str = "gh";
 
 /// One fresh read of everything the list is derived from.
 struct Snapshot {
@@ -124,25 +200,39 @@ async fn blocking<T: Send + 'static>(
         .map_err(|e| format!("the interrupted work read failed: {e}"))
 }
 
-/// The list, with each item's Git facts when `git` is set.
+/// The list, fitted to [`MAX_REPLY_BYTES`], with each item's Git facts when
+/// `git` is set.
 pub async fn list(registry: &AgentPtyRegistry, git: bool) -> Result<InterruptedList, String> {
+    list_with(registry, git, OsStr::new(GH)).await
+}
+
+/// [`list`], running `gh` for pull request state.
+async fn list_with(
+    registry: &AgentPtyRegistry,
+    git: bool,
+    gh: &OsStr,
+) -> Result<InterruptedList, String> {
     let mut list = blocking(registry, |journal, retained| {
         snapshot(&journal, retained.as_deref()).map(|snap| snap.list)
     })
     .await?
     .map_err(|e| format!("the deck could not read its work journal: {e}"))?;
-    if list.items.len() > MAX_LISTED_ITEMS {
-        list.omitted = list.items.len() - MAX_LISTED_ITEMS;
-        list.items.truncate(MAX_LISTED_ITEMS);
-    }
+    let reserve = if git { GIT_FACTS_RESERVE } else { 0 };
+    fit_list(&mut list, MAX_REPLY_BYTES, reserve);
     if git {
-        add_git_facts(&mut list.items).await;
+        add_git_facts(&mut list.items, gh, Deadline::after(LIST_ENRICHMENT_BUDGET)).await;
     }
     Ok(list)
 }
 
-/// One item and its kept reports' bodies, framed as untrusted text.
-pub async fn show(registry: &AgentPtyRegistry, id: String) -> Result<InterruptedShow, String> {
+/// One item and its kept reports' bodies, framed as untrusted text: the
+/// first [`MAX_SHOWN_REPORTS`] of them, or, with `report`, that one report of
+/// the item's.
+pub async fn show(
+    registry: &AgentPtyRegistry,
+    id: String,
+    report: Option<String>,
+) -> Result<InterruptedShow, String> {
     blocking(registry, move |journal, retained| {
         let snap = snapshot(&journal, retained.as_deref())
             .map_err(|e| format!("the deck could not read its work journal: {e}"))?;
@@ -155,19 +245,36 @@ pub async fn show(registry: &AgentPtyRegistry, id: String) -> Result<Interrupted
                 return Err(crate::interrupted_work::REFUSED_AMBIGUOUS.to_string());
             }
         };
-        let reports = item
+        let bodies = shown_bodies(&item, report.as_deref())?;
+        Ok(fit_show(
+            item,
+            &bodies,
+            snap.list.incomplete,
+            MAX_REPLY_BYTES,
+            |report_id| shown_report(report_id, &snap.kept, retained.as_deref()),
+        ))
+    })
+    .await?
+}
+
+/// The report ids a show reads bodies for: `report`, when it is one of
+/// `item`'s, else the item's first [`MAX_SHOWN_REPORTS`]. Matched against
+/// every report of the item, not only the ones a reply would carry.
+fn shown_bodies(item: &InterruptedItem, report: Option<&str>) -> Result<Vec<String>, String> {
+    match report {
+        Some(wanted) => item
+            .reports
+            .iter()
+            .find(|r| r.report_id == wanted)
+            .map(|r| vec![r.report_id.clone()])
+            .ok_or_else(|| REPORT_NOT_OF_ITEM.to_string()),
+        None => Ok(item
             .reports
             .iter()
             .take(MAX_SHOWN_REPORTS)
-            .map(|report| shown_report(&report.report_id, &snap.kept, retained.as_deref()))
-            .collect();
-        Ok(InterruptedShow {
-            item,
-            reports,
-            incomplete: snap.list.incomplete,
-        })
-    })
-    .await?
+            .map(|r| r.report_id.clone())
+            .collect()),
+    }
 }
 
 /// One report's body, from the file the list joined it to: one not yet
@@ -204,18 +311,41 @@ fn shown_report(
     shown
 }
 
-/// What a reclaim checked before it may remove anything.
+/// A directory's identity on disk: its device and inode. `None` off Unix,
+/// where only the canonical path is compared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DirIdentity(Option<(u64, u64)>);
+
+impl DirIdentity {
+    fn of(dir: &Path) -> Option<Self> {
+        let meta = std::fs::metadata(dir).ok()?;
+        if !meta.is_dir() {
+            return None;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Some(DirIdentity(Some((meta.dev(), meta.ino()))))
+        }
+        #[cfg(not(unix))]
+        {
+            Some(DirIdentity(None))
+        }
+    }
+}
+
+/// What a reclaim read from the journal, before it asks Git anything.
 struct Prepared {
     item: InterruptedItem,
-    read: JournalRead,
     journal: WorkJournal,
+    /// The works a reclaim closes, root first.
+    works: Vec<WorkId>,
     /// The recorded path, as the item names it.
     raw: PathBuf,
-    /// Its canonical form, a linked worktree's top level.
+    /// Its canonical form.
     worktree: PathBuf,
-    /// The main worktree of its repository.
-    clone: PathBuf,
-    branch: String,
+    /// The canonical path's identity when it was resolved.
+    identity: DirIdentity,
 }
 
 /// The checks of a reclaim that read the journal and the filesystem.
@@ -252,37 +382,139 @@ fn prepare_reclaim(
     let Some(raw) = item.worktree.as_deref().map(PathBuf::from) else {
         return Err(refuse_item(RefusalReason::NoWorktree));
     };
-    let worktree = match std::fs::canonicalize(&raw) {
-        Ok(path) if path.is_dir() => path,
-        _ => return Err(refuse_item(RefusalReason::NoWorktree)),
+    let Some((worktree, identity)) = std::fs::canonicalize(&raw)
+        .ok()
+        .and_then(|path| DirIdentity::of(&path).map(|identity| (path, identity)))
+    else {
+        return Err(refuse_item(RefusalReason::NoWorktree));
     };
-    let clone = match crate::worktree_owner::verified_geometry_of(&worktree) {
-        Some(geometry) if geometry.toplevel == worktree && geometry.main != worktree => {
-            geometry.main
-        }
-        _ => return Err(refuse_item(RefusalReason::NotLinkedWorktree)),
-    };
-    let Some(branch) = item.branch.clone() else {
-        return Err(refuse_item(RefusalReason::BranchMismatch));
-    };
-    if !crate::worktree_owner::is_marked(&worktree) {
-        return Err(refuse_item(RefusalReason::NotOwned));
-    }
+    let works = CloseSets::build(&snap.read).works_under(&item.id);
     Ok(Prepared {
         item,
-        read: snap.read,
         journal,
+        works,
         raw,
         worktree,
-        clone,
-        branch,
+        identity,
     })
 }
 
-/// What the removal step answered.
+/// What the removal task answered.
 enum Removal {
     InUse,
-    Done(ReclaimVerdict, Vec<String>),
+    InUseUnknown,
+    Done {
+        verdict: ReclaimVerdict,
+        nested: Vec<String>,
+        recorded: bool,
+    },
+}
+
+impl Removal {
+    fn done(verdict: ReclaimVerdict) -> Self {
+        Removal::Done {
+            verdict,
+            nested: Vec::new(),
+            recorded: false,
+        }
+    }
+}
+
+/// Whether anything rooted in `worktree` (canonical) is running or starting.
+enum InUse {
+    No,
+    Yes,
+    /// A rooted directory could not be resolved, so it is not known.
+    Unknown,
+}
+
+/// The canonical form of `path`. A path that is gone resolves through its
+/// nearest existing ancestor, with the missing names appended; `None` when
+/// that cannot be done (a `..` among the missing names, a directory that
+/// cannot be read).
+fn canonical_identity(path: &Path) -> Option<PathBuf> {
+    match std::fs::canonicalize(path) {
+        Ok(canonical) => Some(canonical),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let name = path.file_name()?;
+            let parent = path.parent().filter(|p| !p.as_os_str().is_empty())?;
+            canonical_identity(parent).map(|parent| parent.join(name))
+        }
+        Err(_) => None,
+    }
+}
+
+/// Whether anything `registry` runs or is starting is rooted in `worktree`,
+/// with every rooted directory resolved to its canonical form outside the
+/// registry lock, so a pane started through a symlink to the worktree, or a
+/// path with `..` in it, is seen.
+async fn in_use_by_identity(registry: &AgentPtyRegistry, worktree: &Path) -> InUse {
+    let dirs = registry.rooted_dirs_snapshot();
+    let worktree = worktree.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut unknown = false;
+        for dir in dirs {
+            match canonical_identity(&dir) {
+                Some(canonical) if canonical.starts_with(&worktree) => return InUse::Yes,
+                Some(_) => {}
+                None => unknown = true,
+            }
+        }
+        if unknown { InUse::Unknown } else { InUse::No }
+    })
+    .await
+    .unwrap_or(InUse::Unknown)
+}
+
+/// What a reclaim checked, for re-validating just before the removal.
+#[derive(Clone)]
+struct Checked {
+    raw: PathBuf,
+    worktree: PathBuf,
+    identity: DirIdentity,
+    clone: PathBuf,
+    git_dir: PathBuf,
+    branch: String,
+}
+
+/// Whether the directory at the reclaimed path is still the worktree the
+/// reclaim checked: the same canonical path and device and inode, a linked
+/// worktree of the same repository with its owner marker in the same git
+/// metadata directory, and the item's branch checked out.
+async fn still_the_checked_worktree(checked: Checked) -> bool {
+    #[cfg(test)]
+    seams::before_revalidate(&checked.worktree);
+    let deadline = Deadline::after(REVALIDATE_TIMEOUT);
+    let same_dir = {
+        let checked = checked.clone();
+        tokio::task::spawn_blocking(move || {
+            std::fs::canonicalize(&checked.raw).ok().as_ref() == Some(&checked.worktree)
+                && DirIdentity::of(&checked.worktree) == Some(checked.identity)
+        })
+        .await
+        .unwrap_or(false)
+    };
+    if !same_dir {
+        return false;
+    }
+    let Some(facts) = probe::worktree_facts(&checked.worktree, deadline).await else {
+        return false;
+    };
+    if facts.geometry.toplevel != checked.worktree
+        || facts.geometry.main != checked.clone
+        || facts.git_dir != checked.git_dir
+    {
+        return false;
+    }
+    let git_dir = facts.git_dir.clone();
+    let marked = tokio::task::spawn_blocking(move || crate::worktree_owner::is_marked_in(&git_dir))
+        .await
+        .unwrap_or(false);
+    marked
+        && probe::head_branch(&checked.worktree, deadline)
+            .await
+            .as_deref()
+            == Some(checked.branch.as_str())
 }
 
 /// Reclaim the item `id` names: remove its worktree, keep its branch. With
@@ -293,6 +525,18 @@ pub async fn reclaim(
     dry_run: bool,
     caller: Option<&CallerClaim>,
 ) -> ReclaimOutcome {
+    reclaim_within(registry, id, dry_run, caller, RECLAIM_TIMEOUT).await
+}
+
+/// [`reclaim`], answering after at most `bound` of removal.
+async fn reclaim_within(
+    registry: &Arc<AgentPtyRegistry>,
+    id: String,
+    dry_run: bool,
+    caller: Option<&CallerClaim>,
+    bound: Duration,
+) -> ReclaimOutcome {
+    // Any claim, well formed or not: see the module's "Who may act".
     if caller.is_some() {
         return ReclaimOutcome::refused(None, dry_run, RefusalReason::AgentCaller);
     }
@@ -307,31 +551,61 @@ pub async fn reclaim(
     };
     let Prepared {
         item,
-        read,
         journal,
+        works,
         raw,
         worktree,
-        clone,
-        branch,
+        identity,
     } = prepared;
     let shown_path = worktree.to_string_lossy().into_owned();
     let refuse = |reason| {
         let mut outcome = ReclaimOutcome::refused(Some(item.id.to_string()), dry_run, reason);
         outcome.worktree = Some(shown_path.clone());
-        outcome.branch = Some(branch.clone());
+        outcome.branch = item.branch.clone();
         outcome
     };
-    if head_branch(&worktree).await.as_deref() != Some(branch.as_str()) {
+
+    // The Git checks, each child bounded.
+    let deadline = Deadline::after(RECLAIM_CHECK_TIMEOUT);
+    let facts = match probe::worktree_facts(&worktree, deadline).await {
+        Some(facts) if facts.geometry.toplevel == worktree && facts.geometry.main != worktree => {
+            facts
+        }
+        _ => return refuse(RefusalReason::NotLinkedWorktree),
+    };
+    let Some(branch) = item.branch.clone() else {
+        return refuse(RefusalReason::BranchMismatch);
+    };
+    let marked = {
+        let git_dir = facts.git_dir.clone();
+        tokio::task::spawn_blocking(move || crate::worktree_owner::is_marked_in(&git_dir))
+            .await
+            .unwrap_or(false)
+    };
+    if !marked {
+        return refuse(RefusalReason::NotOwned);
+    }
+    if probe::head_branch(&worktree, deadline).await.as_deref() != Some(branch.as_str()) {
         return refuse(RefusalReason::BranchMismatch);
     }
-    let unpushed_commits = unpushed_commits(&worktree).await;
+    let unpushed_commits = probe::unpushed_commits(&worktree, deadline).await;
+    let checked = Checked {
+        raw: raw.clone(),
+        worktree: worktree.clone(),
+        identity,
+        clone: facts.geometry.main.clone(),
+        git_dir: facts.git_dir.clone(),
+        branch: branch.clone(),
+    };
 
-    // The hold and the removal run in their own task, as `close`'s cleanup
-    // does: a removal that outlives the bound keeps its hold until it ends.
+    // The hold, the removal and its record run in their own task, as
+    // `close`'s cleanup does: a removal that outlives the bound keeps its
+    // hold until it ends, and records itself when it succeeds.
     let task = {
         let registry = Arc::clone(registry);
-        let worktree = worktree.clone();
         tokio::spawn(async move {
+            let worktree = checked.worktree.clone();
+            let clone = checked.clone.clone();
             let Some(_hold) = registry.hold_dir_for_removal(&worktree) else {
                 return Removal::InUse;
             };
@@ -343,71 +617,99 @@ pub async fn reclaim(
                     None => return Removal::InUse,
                 }
             };
+            match in_use_by_identity(&registry, &worktree).await {
+                InUse::No => {}
+                InUse::Yes => return Removal::InUse,
+                InUse::Unknown => return Removal::InUseUnknown,
+            }
             if dry_run {
                 return match crate::issue_dispatch_run::worktree_keep_check(&worktree, &clone).await
                 {
-                    Ok(TreeKeepCheck::Clean) => Removal::Done(ReclaimVerdict::WouldRemove, vec![]),
-                    Ok(TreeKeepCheck::Dirty) => Removal::Done(ReclaimVerdict::KeptDirty, vec![]),
-                    Ok(TreeKeepCheck::HoldsWorktrees(nested)) => {
-                        Removal::Done(ReclaimVerdict::KeptHoldsWorktrees, nested)
-                    }
-                    Err(_) => Removal::Done(ReclaimVerdict::KeptCouldNotCheck, vec![]),
+                    Ok(TreeKeepCheck::Clean) => Removal::done(ReclaimVerdict::WouldRemove),
+                    Ok(TreeKeepCheck::Dirty) => Removal::done(ReclaimVerdict::KeptDirty),
+                    Ok(TreeKeepCheck::HoldsWorktrees(nested)) => Removal::Done {
+                        verdict: ReclaimVerdict::KeptHoldsWorktrees,
+                        nested,
+                        recorded: false,
+                    },
+                    Err(_) => Removal::done(ReclaimVerdict::KeptCouldNotCheck),
                 };
             }
-            match crate::issue_dispatch_run::remove_worktree_outcome(
+            let removal = crate::issue_dispatch_run::remove_worktree_outcome_guarded(
                 &worktree,
                 &clone,
                 RemovalPolicy::KeepIfDirty,
+                || still_the_checked_worktree(checked),
             )
-            .await
-            {
-                WorktreeRemoval::Removed => Removal::Done(ReclaimVerdict::Removed, vec![]),
-                WorktreeRemoval::KeptDirty => Removal::Done(ReclaimVerdict::KeptDirty, vec![]),
-                WorktreeRemoval::KeptCouldNotCheck => {
-                    Removal::Done(ReclaimVerdict::KeptCouldNotCheck, vec![])
+            .await;
+            match removal {
+                None => Removal::done(ReclaimVerdict::KeptChanged),
+                Some(WorktreeRemoval::Removed) => {
+                    #[cfg(test)]
+                    seams::after_removal(&worktree);
+                    let recorded = tokio::task::spawn_blocking(move || {
+                        close_all(&journal, &works, CloseHow::Reclaimed)
+                    })
+                    .await
+                    .unwrap_or(false);
+                    Removal::Done {
+                        verdict: ReclaimVerdict::Removed,
+                        nested: Vec::new(),
+                        recorded,
+                    }
                 }
-                WorktreeRemoval::RemoveFailed => {
-                    Removal::Done(ReclaimVerdict::RemoveFailed, vec![])
+                Some(WorktreeRemoval::KeptDirty) => Removal::done(ReclaimVerdict::KeptDirty),
+                Some(WorktreeRemoval::KeptCouldNotCheck) => {
+                    Removal::done(ReclaimVerdict::KeptCouldNotCheck)
                 }
-                WorktreeRemoval::KeptHoldsWorktrees(nested) => {
-                    Removal::Done(ReclaimVerdict::KeptHoldsWorktrees, nested)
-                }
+                Some(WorktreeRemoval::RemoveFailed) => Removal::done(ReclaimVerdict::RemoveFailed),
+                Some(WorktreeRemoval::KeptHoldsWorktrees(nested)) => Removal::Done {
+                    verdict: ReclaimVerdict::KeptHoldsWorktrees,
+                    nested,
+                    recorded: false,
+                },
             }
         })
     };
-    let (verdict, nested_worktrees) = match tokio::time::timeout(RECLAIM_TIMEOUT, task).await {
-        Ok(Ok(Removal::Done(verdict, nested))) => (verdict, nested),
+    let (verdict, nested_worktrees, recorded) = match tokio::time::timeout(bound, task).await {
+        Ok(Ok(Removal::Done {
+            verdict,
+            nested,
+            recorded,
+        })) => (verdict, nested, recorded),
         Ok(Ok(Removal::InUse)) => return refuse(RefusalReason::StillInUse),
+        Ok(Ok(Removal::InUseUnknown)) => return refuse(RefusalReason::InUseUnknown),
         Ok(Err(join_error)) => {
             tracing::warn!(error = %join_error, "interrupted work: the reclaim task failed");
-            (ReclaimVerdict::RemoveFailed, Vec::new())
+            (ReclaimVerdict::RemoveFailed, Vec::new(), false)
         }
-        Err(_) => (ReclaimVerdict::TimedOut, Vec::new()),
+        Err(_) => (ReclaimVerdict::TimedOut, Vec::new(), false),
     };
-    let mut outcome = ReclaimOutcome {
+    let message = if verdict == ReclaimVerdict::Removed && !recorded {
+        crate::interrupted_work::RECLAIM_NOT_RECORDED.to_string()
+    } else {
+        reclaim_sentence(verdict).to_string()
+    };
+    ReclaimOutcome {
         id: Some(item.id.to_string()),
         dry_run,
         verdict,
-        message: reclaim_sentence(verdict).to_string(),
+        message,
         refusal: None,
-        worktree: Some(shown_path.clone()),
-        branch: Some(branch.clone()),
+        worktree: Some(shown_path),
+        branch: Some(branch),
         unpushed_commits,
         nested_worktrees,
-        recorded: false,
-    };
-    if verdict == ReclaimVerdict::Removed {
-        let root = item.id.clone();
-        outcome.recorded = tokio::task::spawn_blocking(move || {
-            close_all(&journal, &works_under(&read, &root), CloseHow::Reclaimed)
-        })
-        .await
-        .unwrap_or(false);
-        if !outcome.recorded {
-            outcome.message = crate::interrupted_work::RECLAIM_NOT_RECORDED.to_string();
-        }
+        recorded,
     }
-    outcome
+}
+
+/// Whether a dismissal's selector is within [`MAX_DISMISS_IDS`],
+/// [`MAX_DISMISS_ID_BYTES`] and [`MAX_DISMISS_BYTES`].
+fn selector_fits(ids: &[String]) -> bool {
+    ids.len() <= MAX_DISMISS_IDS
+        && ids.iter().all(|id| id.len() <= MAX_DISMISS_ID_BYTES)
+        && ids.iter().map(String::len).sum::<usize>() <= MAX_DISMISS_BYTES
 }
 
 /// Dismiss the items `ids` name, or every listed item with `all`.
@@ -418,14 +720,18 @@ pub async fn dismiss(
     caller: Option<&CallerClaim>,
 ) -> DismissOutcome {
     let refused = |reason| DismissOutcome {
-        refusal: Some(Refusal::new(reason)),
+        refusal: Some(crate::interrupted_work::Refusal::new(reason)),
         ..DismissOutcome::default()
     };
+    // Any claim, well formed or not: see the module's "Who may act".
     if caller.is_some() {
         return refused(RefusalReason::AgentCaller);
     }
     if all == !ids.is_empty() {
         return refused(RefusalReason::BadRequest);
+    }
+    if !selector_fits(&ids) {
+        return refused(RefusalReason::TooLarge);
     }
     let answer = blocking(registry, move |journal, retained| {
         let Ok(snap) = snapshot(&journal, retained.as_deref()) else {
@@ -439,39 +745,32 @@ pub async fn dismiss(
         if all {
             targets.extend(snap.list.items.iter());
         } else {
+            let mut seen = std::collections::HashSet::new();
             for id in &ids {
                 match resolve(&snap.list, id) {
                     Resolved::One(item) => {
-                        if !targets.iter().any(|t| t.id == item.id) {
+                        if seen.insert(&item.id) {
                             targets.push(item);
                         }
                     }
-                    Resolved::NotListed => outcome.refused.push(DismissRefused {
-                        id: id.clone(),
-                        refusal: Refusal::new(RefusalReason::NotListed),
-                    }),
-                    Resolved::Ambiguous => outcome.refused.push(DismissRefused {
-                        id: id.clone(),
-                        refusal: Refusal::new(RefusalReason::Ambiguous),
-                    }),
+                    Resolved::NotListed => {
+                        outcome.push_refused(id.clone(), RefusalReason::NotListed)
+                    }
+                    Resolved::Ambiguous => {
+                        outcome.push_refused(id.clone(), RefusalReason::Ambiguous)
+                    }
                 }
             }
         }
+        let sets = CloseSets::build(&snap.read);
         for item in targets {
-            if close_all(
-                &journal,
-                &works_under(&snap.read, &item.id),
-                CloseHow::Dismissed,
-            ) {
-                outcome.dismissed.push(DismissedItem {
+            if close_all(&journal, &sets.works_under(&item.id), CloseHow::Dismissed) {
+                outcome.push_dismissed(DismissedItem {
                     id: item.id.to_string(),
                     name: item.name.clone(),
                 });
             } else {
-                outcome.refused.push(DismissRefused {
-                    id: item.id.to_string(),
-                    refusal: Refusal::new(RefusalReason::NotRecorded),
-                });
+                outcome.push_refused(item.id.to_string(), RefusalReason::NotRecorded);
             }
         }
         outcome
@@ -482,7 +781,7 @@ pub async fn dismiss(
 
 /// Write `closed how=<how>` on every work, waiting for each write; `true`
 /// when all were written. Blocking.
-fn close_all(journal: &WorkJournal, works: &[crate::work_journal::WorkId], how: CloseHow) -> bool {
+fn close_all(journal: &WorkJournal, works: &[WorkId], how: CloseHow) -> bool {
     let mut all = true;
     for work in works {
         if let Err(error) = journal.try_record(Event::Closed {
@@ -496,74 +795,17 @@ fn close_all(journal: &WorkJournal, works: &[crate::work_journal::WorkId], how: 
     all
 }
 
-/// The branch checked out in `worktree`, or `None` when `HEAD` is detached
-/// or Git did not answer.
-async fn head_branch(worktree: &Path) -> Option<String> {
-    let dir = worktree.to_string_lossy();
-    crate::issue_dispatch_run::run_git_capture_within(
-        &["-C", &dir, "symbolic-ref", "--quiet", "--short", "HEAD"],
-        GIT_FACT_TIMEOUT,
-    )
-    .await
-    .ok()
-    .map(|out| out.trim().to_string())
-    .filter(|branch| !branch.is_empty())
-}
-
-/// How many commits `HEAD` has that no remote-tracking branch holds.
-async fn unpushed_commits(worktree: &Path) -> Option<u64> {
-    let dir = worktree.to_string_lossy();
-    crate::issue_dispatch_run::run_git_capture_within(
-        &[
-            "-C",
-            &dir,
-            "rev-list",
-            "--count",
-            "HEAD",
-            "--not",
-            "--remotes",
-        ],
-        GIT_FACT_TIMEOUT,
-    )
-    .await
-    .ok()?
-    .trim()
-    .parse()
-    .ok()
-}
-
-/// Whether `branch` is a local branch of `worktree`'s repository.
-async fn branch_exists(worktree: &Path, branch: &str) -> Option<bool> {
-    let dir = worktree.to_string_lossy();
-    let full = format!("refs/heads/{branch}");
-    let out = crate::issue_dispatch_run::run_git_capture_within(
-        &["-C", &dir, "for-each-ref", "--format=%(refname)", &full],
-        GIT_FACT_TIMEOUT,
-    )
-    .await
-    .ok()?;
-    Some(out.lines().any(|line| line == full))
-}
-
-/// The state of `branch`'s pull request, within [`PR_STATE_TIMEOUT`].
-async fn pr_state(worktree: &Path, branch: &str) -> PrFact {
-    let (dir, branch) = (worktree.to_path_buf(), branch.to_string());
-    let lookup = tokio::task::spawn_blocking(move || {
-        crate::worktree_reclaim::resolve_pr_state(&dir, &branch)
-    });
-    use crate::worktree_reclaim::PrState;
-    match tokio::time::timeout(PR_STATE_TIMEOUT, lookup).await {
-        Ok(Ok(PrState::Open)) => PrFact::Open,
-        Ok(Ok(PrState::Merged)) => PrFact::Merged,
-        Ok(Ok(PrState::ClosedUnmerged)) => PrFact::Closed,
-        Ok(Ok(PrState::NoPr)) => PrFact::None,
-        _ => PrFact::Unknown,
-    }
-}
-
-/// One item's Git facts. A plain agent's directory is not a worktree the
-/// deck made, so only whether it exists is read for it.
-async fn git_facts(kind: ItemKind, worktree: Option<String>, branch: Option<String>) -> GitFacts {
+/// One item's Git facts, its probes bounded by `deadline` and its pull
+/// request lookup by `pr_deadline`. A plain agent's directory is not a
+/// worktree the deck made, so only whether it exists is read for it.
+async fn git_facts(
+    kind: ItemKind,
+    worktree: Option<String>,
+    branch: Option<String>,
+    gh: &OsStr,
+    deadline: Deadline,
+    pr_deadline: Deadline,
+) -> GitFacts {
     let Some(worktree) = worktree else {
         return GitFacts::default();
     };
@@ -580,29 +822,25 @@ async fn git_facts(kind: ItemKind, worktree: Option<String>, branch: Option<Stri
     if worktree_exists != Some(true) || kind == ItemKind::Agent {
         return facts;
     }
-    let dirty = async {
-        tokio::time::timeout(
-            GIT_FACT_TIMEOUT,
-            crate::issue_dispatch_run::worktree_is_dirty(&path),
-        )
-        .await
-        .ok()
-        .and_then(Result::ok)
-    };
     let branch = branch.as_deref();
     let exists = async {
         match branch {
-            Some(branch) => branch_exists(&path, branch).await,
+            Some(branch) => probe::branch_exists(&path, branch, deadline).await,
             None => None,
         }
     };
     let pr = async {
         match branch {
-            Some(branch) => pr_state(&path, branch).await,
+            Some(branch) => probe::pr_state(&path, branch, gh, pr_deadline).await,
             None => PrFact::Unknown,
         }
     };
-    let (dirty, unpushed, exists, pr) = tokio::join!(dirty, unpushed_commits(&path), exists, pr);
+    let (dirty, unpushed, exists, pr) = tokio::join!(
+        probe::is_dirty(&path, deadline),
+        probe::unpushed_commits(&path, deadline),
+        exists,
+        pr
+    );
     facts.dirty = dirty;
     facts.unpushed_commits = unpushed;
     facts.branch_exists = exists;
@@ -610,26 +848,91 @@ async fn git_facts(kind: ItemKind, worktree: Option<String>, branch: Option<Stri
     facts
 }
 
-/// Fill each item's Git facts, [`GIT_FACT_CONCURRENCY`] items at a time.
-async fn add_git_facts(items: &mut [InterruptedItem]) {
+/// Fill each item's Git facts, [`GIT_FACT_CONCURRENCY`] items at a time, all
+/// by `total`: an item that has not started by then keeps the empty facts.
+async fn add_git_facts(items: &mut [InterruptedItem], gh: &OsStr, total: Deadline) {
     let permits = Arc::new(tokio::sync::Semaphore::new(GIT_FACT_CONCURRENCY));
     let mut set = tokio::task::JoinSet::new();
     for (at, item) in items.iter().enumerate() {
         let (kind, worktree, branch) = (item.kind, item.worktree.clone(), item.branch.clone());
         let permits = Arc::clone(&permits);
+        let gh = gh.to_os_string();
         set.spawn(async move {
-            let _permit = permits.acquire_owned().await;
-            (at, git_facts(kind, worktree, branch).await)
+            let wait = total.remaining()?;
+            let _permit = tokio::time::timeout(wait, permits.acquire_owned())
+                .await
+                .ok()?
+                .ok()?;
+            total.remaining()?;
+            let deadline = Deadline::after(GIT_FACT_TIMEOUT).min(total);
+            let pr_deadline = Deadline::after(PR_STATE_TIMEOUT).min(total);
+            Some((
+                at,
+                git_facts(kind, worktree, branch, &gh, deadline, pr_deadline).await,
+            ))
         });
     }
     for item in items.iter_mut() {
         item.git = Some(GitFacts::default());
     }
     while let Some(joined) = set.join_next().await {
-        if let Ok((at, facts)) = joined
+        if let Ok(Some((at, facts))) = joined
             && let Some(item) = items.get_mut(at)
         {
             item.git = Some(facts);
+        }
+    }
+}
+
+/// Test seams: hooks a test arms for one worktree path. Every seam is off
+/// unless a test arms it, and is keyed by the path so tests running at once
+/// cannot fire each other's.
+#[cfg(test)]
+mod seams {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{LazyLock, Mutex};
+
+    type Hook = Box<dyn FnOnce() + Send>;
+
+    static BEFORE_REVALIDATE: LazyLock<Mutex<HashMap<PathBuf, Hook>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    static AFTER_REMOVAL: LazyLock<Mutex<HashMap<PathBuf, Hook>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    fn take(seam: &Mutex<HashMap<PathBuf, Hook>>, worktree: &Path) -> Option<Hook> {
+        seam.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(worktree)
+    }
+
+    /// Run `hook` once, between a reclaim's keep check and its
+    /// re-validation, for the reclaim of `worktree` (canonical).
+    pub(super) fn arm_before_revalidate(worktree: &Path, hook: impl FnOnce() + Send + 'static) {
+        BEFORE_REVALIDATE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(worktree.to_path_buf(), Box::new(hook));
+    }
+
+    /// Run `hook` once, after `worktree`'s removal and before it is
+    /// recorded.
+    pub(super) fn arm_after_removal(worktree: &Path, hook: impl FnOnce() + Send + 'static) {
+        AFTER_REMOVAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(worktree.to_path_buf(), Box::new(hook));
+    }
+
+    pub(super) fn before_revalidate(worktree: &Path) {
+        if let Some(hook) = take(&BEFORE_REVALIDATE, worktree) {
+            hook();
+        }
+    }
+
+    pub(super) fn after_removal(worktree: &Path) {
+        if let Some(hook) = take(&AFTER_REMOVAL, worktree) {
+            hook();
         }
     }
 }

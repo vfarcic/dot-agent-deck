@@ -19,6 +19,9 @@ fn item(id: &str, kind: ItemKind, name: &str) -> InterruptedItem {
             ts_ms: 1_795_000_000_000,
         },
         reports: Vec::new(),
+        reports_omitted: 0,
+        cut: false,
+        progress: Default::default(),
         git: None,
     }
 }
@@ -128,6 +131,7 @@ fn show_prints_each_body_as_the_daemon_framed_it() {
             },
         ],
         incomplete: false,
+        bodies_omitted: 0,
     };
     let text = render_show(&show);
     assert!(
@@ -252,6 +256,8 @@ fn dismiss_reports_each_item_and_exits_one_when_any_was_refused() {
         }],
         refusal: None,
         incomplete: false,
+        dismissed_omitted: 0,
+        refused_omitted: 0,
     });
     assert_eq!(partly.code, EXIT_REFUSED);
     assert!(
@@ -330,4 +336,104 @@ fn no_daemon_is_exit_three() {
     let out = rt.block_on(run_list(&client, false, false));
     assert_eq!(out.code, EXIT_UNREACHABLE, "{out:?}");
     assert!(out.stderr.contains(words::NO_DAEMON), "{}", out.stderr);
+}
+
+/// Reviewer 5 and 3: an item prints its progress on its own line, with the
+/// shared wording, and a show that carried the bodies of fewer reports than
+/// the item lists says how to read the rest by id; a list that left report
+/// entries out, or cut a string, says so.
+#[test]
+fn an_item_prints_its_progress_and_how_to_read_reports_not_shown() {
+    let mut unit = item(UNIT_ID, ItemKind::Unit, "team");
+    unit.progress = crate::interrupted_work::Progress {
+        attempts: 3,
+        roles: vec!["orchestrator".into(), "coder".into()],
+        delegations: 4,
+        delegations_done: 2,
+    };
+    for n in 1..=18 {
+        unit.reports.push(ItemReport {
+            report_id: format!("r-{n}"),
+            task_id: None,
+            unit_id: None,
+            kept_until_ms: None,
+        });
+    }
+    let text = render_item(&unit);
+    assert!(
+        text.contains(&format!(
+            "    {}: {}\n",
+            words::LABEL_PROGRESS,
+            words::progress_line(&unit.progress)
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains("3 attempts; roles orchestrator, coder; 2 of 4 delegations done"),
+        "{text}"
+    );
+
+    let one = ShownReport {
+        report_id: "r-17".into(),
+        body: Some("[UNTRUSTED-WORKER-REPORT:\nseventeen\n:END-UNTRUSTED-WORKER-REPORT]\n".into()),
+        cut: false,
+        error: None,
+    };
+    let show = InterruptedShow {
+        item: unit.clone(),
+        reports: vec![one],
+        incomplete: false,
+        bodies_omitted: 0,
+    };
+    let text = render_show(&show);
+    assert!(text.contains("seventeen"), "{text}");
+    assert!(
+        text.contains(&words::more_reports_sentence(17, UNIT_ID)),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("interrupted show {UNIT_ID} --report")),
+        "{text}"
+    );
+
+    let mut listed = unit.clone();
+    listed.reports.truncate(16);
+    listed.reports_omitted = 2;
+    listed.cut = true;
+    let text = render_item(&listed);
+    assert!(
+        text.contains(&words::more_reports_sentence(2, UNIT_ID)),
+        "{text}"
+    );
+    assert!(text.contains(words::ITEM_CUT), "{text}");
+}
+
+/// Auditor 4: a dismissal whose report was capped says how many more items
+/// were dismissed and how many more ids were refused, and a refusal it did
+/// not list still fails the command.
+#[test]
+fn a_capped_dismissal_report_counts_what_it_left_out() {
+    let outcome = DismissOutcome {
+        dismissed: vec![DismissedItem {
+            id: UNIT_ID.into(),
+            name: None,
+        }],
+        refused: Vec::new(),
+        refusal: None,
+        incomplete: false,
+        dismissed_omitted: 5,
+        refused_omitted: 1,
+    };
+    let out = render_dismiss(&outcome);
+    assert!(
+        out.stdout.contains(&words::more_dismissed_sentence(5)),
+        "{}",
+        out.stdout
+    );
+    assert!(
+        out.stderr.contains(&words::more_refused_sentence(1)),
+        "{}",
+        out.stderr
+    );
+    assert_eq!(out.code, EXIT_REFUSED);
 }

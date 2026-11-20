@@ -3756,22 +3756,6 @@ pub(crate) async fn run_git_capture(args: &[&str]) -> Result<String, String> {
     capture_of(crate::git_env::git_async(), crate::git_env::GIT, args).await
 }
 
-/// [`run_git_capture`] under `bound` instead of the default subprocess bound,
-/// for a probe whose answer is worth less than a long wait (PRD #1790's
-/// interrupted work list).
-pub(crate) async fn run_git_capture_within(
-    args: &[&str],
-    bound: Duration,
-) -> Result<String, String> {
-    capture_within(
-        crate::git_env::git_async(),
-        crate::git_env::GIT,
-        args,
-        bound,
-    )
-    .await
-}
-
 /// PRD #1790 stage 2: `cmd` (`program` with `args`) under `bound`, keeping at
 /// most `stdout_cap` bytes of stdout (past that it is killed and reported as
 /// too large) and `stderr_cap` of stderr ([`output_within_capped`]). On a
