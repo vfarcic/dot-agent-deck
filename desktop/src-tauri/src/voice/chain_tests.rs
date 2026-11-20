@@ -499,3 +499,106 @@ async fn voice_chain_a_stop_as_the_last_step_ends_at_its_confirmation() {
     assert_eq!(steps[1].invoke, "confirmStopAgent");
     assert_eq!(steps[1].screen, Screen::Overview);
 }
+
+/// Scenario (Qodo on PR #2417): a backend answers "open the overview and then
+/// the tester" with `none` at the top level but two steps. The steps are
+/// judged on their own, so the chain runs as if the top level had been the
+/// first step, rather than being dropped as no match.
+#[tokio::test]
+async fn voice_chain_steps_under_a_none_top_level_are_still_judged() {
+    let said = "open the overview and then the tester";
+    let resolver = StubResolver::new()
+        .answering(
+            said,
+            IntentAnswer::none().with_steps(vec![
+                step("open_overview", "open the overview", &[]),
+                step("open_agent", "the tester", &[("agent", "tester")]),
+            ]),
+        )
+        .judging("open the overview", "open_overview", true)
+        .judging("the tester", "open_agent", true);
+    let outcome = run(&resolver, Screen::Deck, said).await;
+    assert!(matches!(outcome, VoiceOutcome::Chain { .. }), "{outcome:?}");
+}
+
+/// Scenario (Qodo and Greptile on PR #2417): a chain whose daemon switch
+/// pauses on a choice between two daemons. Addressing the outcome gives the
+/// choice's candidates the Daemon selector's tokens, as a single switch's
+/// are; when one candidate has no token, the choice is not offered at all.
+#[test]
+fn voice_chain_a_paused_switch_offers_selector_tokens() {
+    use super::outcome::{ChainStep, ResolvedParam, VoiceDeckSelection, address_deck_switch};
+    use super::table::ParamKind;
+    let candidate = |value: &str, label: &str| ResolvedParam {
+        name: "deck".to_string(),
+        kind: ParamKind::DeckRef,
+        spoken: "build".to_string(),
+        value: value.to_string(),
+        label: label.to_string(),
+        deck_identity: None,
+        deck_id: None,
+        names: Vec::new(),
+    };
+    let chain_with = |candidates: Vec<ResolvedParam>| VoiceOutcome::Chain {
+        transcript: Transcript::new("open the overview, then switch to build"),
+        steps: vec![ChainStep {
+            said: "switch to build".to_string(),
+            action: "switch_deck".to_string(),
+            invoke: "switchDeck".to_string(),
+            params: Vec::new(),
+            sentence: String::new(),
+            screen: Screen::Overview,
+            choice: Some(Box::new(VoiceOutcome::ParamAmbiguous {
+                transcript: Transcript::new("switch to build"),
+                action: "switch_deck".to_string(),
+                invoke: "switchDeck".to_string(),
+                param: "deck".to_string(),
+                spoken: "build".to_string(),
+                matches: vec!["build-one".to_string(), "build-two".to_string()],
+                reports: vec![
+                    "Showing build-one.".to_string(),
+                    "Showing build-two.".to_string(),
+                ],
+                candidates,
+                params: Vec::new(),
+                sentence: "which daemon".to_string(),
+            })),
+        }],
+        sentence: String::new(),
+    };
+    let tokens = |id: &str| match id {
+        "deck-one" => Some(VoiceDeckSelection {
+            token: "row-one".to_string(),
+            identity: None,
+        }),
+        "deck-two" => Some(VoiceDeckSelection {
+            token: "row-two".to_string(),
+            identity: None,
+        }),
+        _ => None,
+    };
+    let choice_of = |outcome: &VoiceOutcome| match outcome {
+        VoiceOutcome::Chain { steps, .. } => match steps[0].choice.as_deref() {
+            Some(VoiceOutcome::ParamAmbiguous { candidates, .. }) => candidates
+                .iter()
+                .map(|value| value.value.clone())
+                .collect::<Vec<_>>(),
+            other => panic!("expected a choice, got {other:?}"),
+        },
+        other => panic!("expected a chain, got {other:?}"),
+    };
+
+    let mut addressed = chain_with(vec![
+        candidate("deck-one", "build-one"),
+        candidate("deck-two", "build-two"),
+    ]);
+    address_deck_switch(&mut addressed, tokens);
+    assert_eq!(choice_of(&addressed), ["row-one", "row-two"]);
+
+    let mut unlisted = chain_with(vec![
+        candidate("deck-one", "build-one"),
+        candidate("deck-gone", "gone"),
+    ]);
+    address_deck_switch(&mut unlisted, tokens);
+    assert!(choice_of(&unlisted).is_empty());
+}

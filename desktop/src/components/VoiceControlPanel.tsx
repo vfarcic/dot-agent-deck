@@ -163,6 +163,16 @@ export const NOTHING_DISPATCHED = "That command is not wired to anything in this
 export const VOICE_CHAIN_SETTLE_MS = 1500;
 /** PRD #1184 — how often a chain looks for that screen while it waits. */
 const VOICE_CHAIN_POLL_MS = 16;
+/**
+ * PRD #1184 (Greptile on PR #2417) — how long every step after the first
+ * waits, at least, before it runs. A step that changes no screen (a New agent
+ * form choice) still changes state its successor's handler reads: the
+ * dialog republishes its voice handlers in an effect after each commit, so a
+ * step run before that commit lands calls the handler built for the form as
+ * it was ("use claude" refused as if the orchestration chip were still
+ * chosen). Several frames, so the render and its effects have both run.
+ */
+export const VOICE_CHAIN_STEP_GAP_MS = 64;
 
 /**
  * PRD #1184 — what the voice row says when a chain's numbered choice ends
@@ -3528,7 +3538,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       const step = chain.steps[index];
       let now = current();
       if (index > 0) {
-        for (let waited = 0; now.screen !== step.screen && waited < VOICE_CHAIN_SETTLE_MS; waited += VOICE_CHAIN_POLL_MS) {
+        for (let waited = 0; (waited < VOICE_CHAIN_STEP_GAP_MS || now.screen !== step.screen) && waited < VOICE_CHAIN_SETTLE_MS; waited += VOICE_CHAIN_POLL_MS) {
           await new Promise((resolve) => window.setTimeout(resolve, VOICE_CHAIN_POLL_MS));
           /* Superseded by a later utterance: its report wins, and nothing
              more of this chain runs. */
@@ -3536,7 +3546,13 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
           now = current();
         }
       }
-      const judgedOn: VoiceContext = index === 0 ? declared : { ...now, screen: step.screen, newAgent: declared.newAgent, instance: declared.instance, generation: declared.generation, trustReview: declared.trustReview, incarnations: declared.incarnations };
+      /* The daemon the sentence was heard on, unless a step before this one
+         switched it (Greptile on PR #2417): a daemon switched by hand while a
+         chain runs is then caught by `dispatchLost` for a step that names an
+         agent, as it is for a single command, instead of compared with
+         itself. */
+      const switched = chain.steps.slice(0, index).some((earlier) => earlier.action === "switch_deck");
+      const judgedOn: VoiceContext = index === 0 ? declared : { ...now, screen: step.screen, deck: switched ? now.deck : declared.deck, newAgent: declared.newAgent, instance: declared.instance, generation: declared.generation, trustReview: declared.trustReview, incarnations: declared.incarnations };
       const lost = dispatchLost(judgedOn, now, step.params, step.invoke);
       if (lost) {
         stop(index, lost.why);
@@ -3558,7 +3574,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       refusalRef.current = undefined;
       const dispatched = dispatchDeclaredRef.current(
         { kind: "dispatch", transcript: chain.transcript, action: step.action, invoke: step.invoke, params: step.params, sentence: step.sentence },
-        index === 0 ? declared : { ...now, incarnations: declared.incarnations },
+        index === 0 ? declared : { ...now, deck: judgedOn.deck, incarnations: declared.incarnations },
       );
       if (refusedRef.current) {
         stop(index, refusalRef.current ?? "it was refused");

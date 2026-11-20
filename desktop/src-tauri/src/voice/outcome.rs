@@ -1336,10 +1336,6 @@ async fn after_local_intercepts(
         Err(error) => return finish(VoiceOutcome::resolution_failed(transcript, &error)),
     };
 
-    if answer.is_no_match() {
-        return finish(VoiceOutcome::no_match(transcript));
-    }
-
     // PRD #1184: an answer of two or three steps. The rules that need no
     // model are applied first ([`super::chain::plan`]); a chain that passes
     // them is checked step by step, each on its own words, and the
@@ -1386,6 +1382,13 @@ async fn after_local_intercepts(
                 return result(outcome, Some(millis(started.elapsed())));
             }
         }
+    }
+
+    // After the chain path, so an answer whose top level is `none` but whose
+    // steps are not is judged by its steps rather than dropped (Qodo on PR
+    // #2417): each step is held to the same checks either way.
+    if answer.is_no_match() {
+        return finish(VoiceOutcome::no_match(transcript));
     }
 
     // The case PRD #802's four-outcome list could not express: a backend that
@@ -6379,6 +6382,16 @@ pub fn address_deck_switch(
     outcome: &mut VoiceOutcome,
     selection_of: impl Fn(&str) -> Option<VoiceDeckSelection>,
 ) {
+    address_with(outcome, &selection_of);
+}
+
+/// [`address_deck_switch`], with the lookup as a trait object so a chain's
+/// paused choice can be addressed by the same code without instantiating the
+/// generic again for every level.
+fn address_with(
+    outcome: &mut VoiceOutcome,
+    selection_of: &dyn Fn(&str) -> Option<VoiceDeckSelection>,
+) {
     let address = |param: &mut ResolvedParam| {
         let selection = selection_of(&param.value);
         param.deck_identity = selection
@@ -6410,14 +6423,23 @@ pub fn address_deck_switch(
                 reports.clear();
             }
         }
-        // PRD #1184: a chain's switch is addressed as a single one is.
+        // PRD #1184: a chain's switch is addressed as a single one is —
+        // its params, and the candidates of a switch the chain pauses on
+        // (Qodo and Greptile on PR #2417), which lose their choice when one
+        // has no selector token, as a single switch's do.
         VoiceOutcome::Chain { steps, .. } => {
-            steps
+            for step in steps
                 .iter_mut()
                 .filter(|step| step.action == SWITCH_DECK_ROW)
-                .flat_map(|step| step.params.iter_mut())
-                .filter(|param| param.kind == ParamKind::DeckRef)
-                .for_each(address);
+            {
+                step.params
+                    .iter_mut()
+                    .filter(|param| param.kind == ParamKind::DeckRef)
+                    .for_each(address);
+                if let Some(choice) = step.choice.as_deref_mut() {
+                    address_with(choice, selection_of);
+                }
+            }
         }
         _ => {}
     }

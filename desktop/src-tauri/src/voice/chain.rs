@@ -280,18 +280,24 @@ impl ChainRefusal<'_> {
     }
 }
 
-/// The rows that set ONE value, where two steps of the row are one choice
-/// between two values rather than two steps.
+/// The rows that choose ONE of the things on screen, where the same row for
+/// every step is one choice between those things rather than steps — offered
+/// as PRD #1261's numbered choice, which can be answered by voice only for a
+/// value it can check is still on screen.
 const SINGLE_VALUED: &[&str] = &[
     "open_dir",
     "use_this_directory",
     "choose_mode",
     "choose_agent_type",
-    "name_new_agent",
     "choose_deck",
     "switch_deck",
-    "set_new_agent_command",
 ];
+
+/// The rows that set ONE value from the user's own words (the Name, the
+/// Command): the same row twice is two values for one field, which no step
+/// order can run and a numbered choice cannot be answered by voice for
+/// (Greptile on PR #2417), so it is refused.
+const TEXT_VALUED: &[&str] = &["name_new_agent", "set_new_agent_command"];
 
 /// Apply rules 1–5 to `top_action` and its `steps`, as answered for
 /// `transcript`.
@@ -339,7 +345,7 @@ pub fn plan<'t>(
         return Plan::OneOf(rows);
     }
     if let Some(&(_, row)) = rows.iter().enumerate().find_map(|(at, (_, row))| {
-        (SINGLE_VALUED.contains(&row.id.as_str())
+        ((SINGLE_VALUED.contains(&row.id.as_str()) || TEXT_VALUED.contains(&row.id.as_str()))
             && rows[..at].iter().any(|(_, earlier)| earlier.id == row.id))
         .then_some(&rows[at])
     }) {
@@ -596,6 +602,26 @@ mod tests {
         );
     }
 
+    /// Scenario: "name it alpha and name it beta" answered as two Name steps
+    /// is refused, not offered as a choice: a spoken answer cannot pick
+    /// between two names (Greptile on PR #2417).
+    #[test]
+    fn voice_chain_two_names_are_refused_not_offered() {
+        let steps = [
+            step("name_new_agent", "name it alpha"),
+            step("name_new_agent", "name it beta"),
+        ];
+        let planned = plan(
+            table(),
+            "name it alpha and name it beta",
+            "name_new_agent",
+            &steps,
+        );
+        assert!(
+            matches!(planned, Plan::Refused(ChainRefusal::SameChoiceTwice(row)) if row.id == "name_new_agent")
+        );
+    }
+
     /// Scenario: a start, a whole-sentence row and a dictation row are never
     /// a step; a close and a stop may only be last; a view move, a deck
     /// switch and a form choice may come before another step.
@@ -675,6 +701,7 @@ mod tests {
             .iter()
             .chain(DICTATION_ROWS)
             .chain(SINGLE_VALUED)
+            .chain(TEXT_VALUED)
             .chain(&[
                 "open_overview",
                 "open_deck",

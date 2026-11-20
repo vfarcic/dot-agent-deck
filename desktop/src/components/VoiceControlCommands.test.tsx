@@ -3742,6 +3742,15 @@ describe("the rest of the New agent form, by voice (PRD #1223)", () => {
          command is kept only when the transcript holds it, and the value is
          the transcript's words less the sentence's full stop. "with flags"
          stands for a model that added one: refused, nothing dispatched. */
+      /* PRD #1184 — a chain of two form steps, as Rust answers it: No mode,
+         then an agent type, both judged on the form as declared. */
+      if (utterance === "back to no mode and use claude") {
+        const steps = [
+          { said: "back to no mode", action: "choose_mode", invoke: "chooseNewAgentMode", params: [{ name: "mode", kind: "mode_ref", spoken: "no mode", value: "none", label: "No mode" }], sentence: "Mode: No mode.", screen: "overview" },
+          { said: "use claude", action: "choose_agent_type", invoke: "chooseNewAgentType", params: [{ name: "agent_type", kind: "agent_type_ref", spoken: "claude", value: "claude", label: "Claude Code" }], sentence: "Command set to Claude Code's default command.", screen: "overview" },
+        ] as Extract<VoiceResultDto["outcome"], { kind: "chain" }>["steps"];
+        return { resolveMs: 21, backend: "stub", outcome: { kind: "chain", transcript: utterance, steps, sentence: "Mode: No mode, then command set to Claude Code's default command." } };
+      }
       const commandOpener = ["set the command to ", "make the command "].find((opener) => utterance.toLowerCase().startsWith(opener));
       if (commandOpener !== undefined) {
         if (!form && !options.forced) return unavailable("set_new_agent_command", "setting the command needs a daemon and a directory chosen in the New agent dialog; choose those first");
@@ -3929,6 +3938,31 @@ describe("the rest of the New agent form, by voice (PRD #1223)", () => {
     expect(screen.getByTestId("voice-report")).toHaveTextContent(COMMAND_HIDDEN_BY_ORCHESTRATION);
     fireEvent.click(screen.getByTestId("new-agent-mode-none"));
     expect(screen.getByTestId("new-agent-command")).toHaveValue("bash");
+  });
+
+  /**
+   * Scenario (PRD #1184, Greptile on PR #2417): with the review orchestration
+   * chosen, say "back to no mode and use claude". The second step runs only
+   * once the first one's form change has landed, so it fills Command instead
+   * of being refused as if the orchestration were still chosen.
+   */
+  it("runs a chain's second form step against the form the first one left", async () => {
+    const voice = microphone([]);
+    const { deck } = formDeck(voice);
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnVoiceOn();
+    await openForm();
+
+    voice.deliver("mode orch: review");
+    await completeUtterance();
+    voice.deliver("back to no mode and use claude");
+    await completeUtterance();
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_CHAIN_SETTLE_MS * 2); });
+    await flush();
+
+    expect(screen.getByTestId("voice-report")).not.toHaveTextContent(COMMAND_HIDDEN_BY_ORCHESTRATION);
+    expect(pressedMode()).toBe("none");
+    expect(screen.getByTestId("new-agent-command")).toHaveValue("claude --model haiku");
   });
 
   /** Scenario: an agent the daemon does not offer is refused, and Command is left alone. */
