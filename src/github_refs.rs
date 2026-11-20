@@ -80,12 +80,37 @@ pub struct GithubReference {
 
 /// A reference with its repository known: what the daemon looks up, caches
 /// and links to.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+///
+/// Two references are the same when their repositories differ only in ASCII
+/// case (review A1): GitHub's owner and repository names are
+/// case-insensitive, so `O/R#1` and `o/r#1` share one lookup and one cache
+/// entry rather than costing two.
+#[derive(Debug, Clone)]
 pub struct ResolvedReference {
     /// `owner/name`, as written in the reference or in the agent's `origin`.
     pub repo: String,
     pub kind: ReferenceKind,
     pub number: u64,
+}
+
+impl PartialEq for ResolvedReference {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && self.number == other.number
+            && self.repo.eq_ignore_ascii_case(&other.repo)
+    }
+}
+
+impl Eq for ResolvedReference {}
+
+impl std::hash::Hash for ResolvedReference {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        for byte in self.repo.bytes() {
+            state.write_u8(byte.to_ascii_lowercase());
+        }
+        self.kind.hash(state);
+        self.number.hash(state);
+    }
 }
 
 impl GithubReference {
@@ -131,6 +156,20 @@ impl GithubReference {
 }
 
 impl ResolvedReference {
+    /// Read `url`, a link a `gh` lookup answered, as the page it names —
+    /// review A2: only the URL form the module docs list, never `#N` or
+    /// `owner/repo#N`, with the same host and path restrictions as a claim.
+    /// `None` for anything else.
+    pub fn from_github_url(url: &str) -> Option<Self> {
+        let rest = strip_prefix_ignore_ascii_case(url, "https://github.com/")?;
+        let parsed = parse_url_path(rest)?;
+        Some(Self {
+            repo: parsed.repo?,
+            kind: parsed.kind,
+            number: parsed.number,
+        })
+    }
+
     /// The reference's page on github.com.
     pub fn url(&self) -> String {
         format!(
@@ -345,6 +384,61 @@ mod tests {
             GithubReference::parse(&issue.url(), PullRequest),
             Some(reference(Some("o/r"), Issue, 12))
         );
+    }
+
+    /// Review A1: one repository, whatever its case, is one reference — one
+    /// lookup and one cache entry.
+    #[test]
+    fn a_repository_differing_only_in_case_is_the_same_reference() {
+        use std::collections::HashSet;
+        let reference = |repo: &str| ResolvedReference {
+            repo: repo.into(),
+            kind: PullRequest,
+            number: 4,
+        };
+        let set: HashSet<ResolvedReference> = [reference("Owner/Repo"), reference("owner/repo")]
+            .into_iter()
+            .collect();
+        assert_eq!(set.len(), 1);
+        assert_ne!(reference("o/r"), reference("o/r2"));
+        assert_ne!(
+            reference("o/r"),
+            ResolvedReference {
+                kind: Issue,
+                ..reference("o/r")
+            }
+        );
+    }
+
+    /// Review A2: an answered link is read only as a URL, with a claim's
+    /// strictness; shorthand and every other page are refused.
+    #[test]
+    fn an_answered_link_is_read_only_as_a_github_page_url() {
+        assert_eq!(
+            ResolvedReference::from_github_url("https://github.com/O/R/pull/7"),
+            Some(ResolvedReference {
+                repo: "O/R".into(),
+                kind: PullRequest,
+                number: 7
+            })
+        );
+        for bad in [
+            "o/r#7",
+            "#7",
+            "https://github.com/login",
+            "https://github.com/o/r",
+            "https://github.com/o/r/pull/%37",
+            "https://github.com/o/r%2Fx/pull/7",
+            "https://user@github.com/o/r/pull/7",
+            "https://user:token@github.com/o/r/pull/7",
+            "https://github.com.evil.example/o/r/pull/7",
+            "http://github.com/o/r/pull/7",
+            "https://github.com/o/r/pull/7?x=1",
+            "https://github.com/o/r/pull/7/files",
+            " https://github.com/o/r/pull/7",
+        ] {
+            assert_eq!(ResolvedReference::from_github_url(bad), None, "{bad:?}");
+        }
     }
 
     #[test]

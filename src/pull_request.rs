@@ -188,6 +188,12 @@ pub(crate) fn new_job_bound() -> Arc<tokio::sync::Semaphore> {
     Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_JOBS))
 }
 
+/// How long a failed lookup waits before the next one, at refresh
+/// `interval`: what [`fetch_due`] applies after a failure.
+pub(crate) fn failure_backoff(interval: Duration) -> Duration {
+    interval * FAILURE_BACKOFF_FACTOR
+}
+
 /// How much of `gh`'s stderr a failure keeps.
 const MAX_LOGGED_STDERR_CHARS: usize = 300;
 
@@ -630,8 +636,12 @@ impl GhFailureReason {
 }
 
 /// A failed `gh` lookup: why ([`GhFailureReason`]) and what happened, as the
-/// line the daemon logs. `detail` quotes `gh`'s stderr escaped and capped
-/// ([`gh_failure`]), so it is safe to log and to show.
+/// line the daemon logs. When `detail` quotes `gh`'s stderr, that is escaped
+/// and capped ([`gh_failure`]); other details (a timeout, a spawn error,
+/// output that does not parse) are not capped here, and none is redacted,
+/// so `detail` is for the daemon's own log. Issue #2418: a checked
+/// reference shows a fixed sentence per reason instead
+/// ([`crate::reference_check::unavailable_detail`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GhFailure {
     pub reason: GhFailureReason,
@@ -763,10 +773,8 @@ impl LookupAnswer for Option<PullRequestInfo> {
     }
 
     fn still_settling(&self) -> bool {
-        self.as_ref().is_some_and(|pr| {
-            pr.checks
-                .is_some_and(|checks| checks.state == PullRequestChecksState::Pending)
-        })
+        self.as_ref()
+            .is_some_and(|pr| checks_still_running(pr.checks.as_ref()))
     }
 
     fn same_subject(&self, other: &Self) -> bool {
@@ -851,6 +859,13 @@ impl<V: LookupAnswer> LookupEntry<V> {
         self.last_failure = None;
         self.failure_logged = false;
     }
+}
+
+/// Whether any of `checks` is still running. Review R2 (#2418): the count,
+/// not the summary's state, since a failed check makes the state `Failing`
+/// while another one still runs.
+pub(crate) fn checks_still_running(checks: Option<&PullRequestChecks>) -> bool {
+    checks.is_some_and(|checks| checks.pending > 0)
 }
 
 /// What the branch badge's monitor knows about one key: `Some(None)` as the
@@ -1010,6 +1025,11 @@ pub(crate) struct JobPool<K, T> {
     running: HashMap<K, (u64, tokio::task::AbortHandle)>,
     next_id: u64,
     permits: Arc<tokio::sync::Semaphore>,
+    /// A narrower bound a job holds first, before a permit of `permits`
+    /// ([`Self::with_lane`]): at most its permit count of the pool's jobs —
+    /// and of every pool sharing the lane — hold or wait for a shared permit
+    /// at once, which leaves the rest of the shared permits to other pools.
+    lane: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl<K, T> JobPool<K, T>
@@ -1023,6 +1043,21 @@ where
             running: HashMap::new(),
             next_id: 0,
             permits,
+            lane: None,
+        }
+    }
+
+    /// A pool whose every job first holds a permit of `lane`, then one of
+    /// `permits`. Issue #2418 (review A1): the checked references' lookups
+    /// run in a lane narrower than the shared bound, so however many of them
+    /// are queued, the branch badge's jobs still get permits.
+    pub(crate) fn with_lane(
+        permits: Arc<tokio::sync::Semaphore>,
+        lane: Arc<tokio::sync::Semaphore>,
+    ) -> Self {
+        Self {
+            lane: Some(lane),
+            ..Self::new(permits)
         }
     }
 
@@ -1032,7 +1067,6 @@ where
 
     /// Jobs started and neither finished nor cancelled, waiting for a permit
     /// or running.
-    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.running.len()
     }
@@ -1046,9 +1080,15 @@ where
         let generation = self.next_id;
         self.next_id += 1;
         let permits = self.permits.clone();
+        let lane = self.lane.clone();
         let task_id = id.clone();
         let handle = self.jobs.spawn(async move {
-            // The semaphore is never closed, so this only waits.
+            // The lane first, so a job waiting for its lane holds no shared
+            // permit. Neither semaphore is ever closed, so this only waits.
+            let _lane = match lane {
+                Some(lane) => Some(lane.acquire_owned().await),
+                None => None,
+            };
             let _permit = permits.acquire_owned().await;
             (task_id, generation, job.await)
         });
@@ -1623,11 +1663,12 @@ mod tests {
         let interval = Duration::from_secs(60);
         let with_checks = |state, checks_state| {
             let mut value = pr_in(state);
+            let pending = u32::from(checks_state == PullRequestChecksState::Pending);
             value.as_mut().unwrap().as_mut().unwrap().checks = Some(PullRequestChecks {
                 state: checks_state,
                 passing: 1,
-                failing: 0,
-                pending: 1,
+                failing: u32::from(checks_state == PullRequestChecksState::Failing),
+                pending,
                 skipped: 0,
             });
             let mut entry = KeyEntry::default();
@@ -1646,6 +1687,47 @@ mod tests {
                 let done = with_checks(state, finished);
                 assert!(!fetch_due(&done, at + interval * 10, interval), "{state:?}");
             }
+        }
+    }
+
+    /// Review R2 (#2418): a merged or closed PR with one failed check and
+    /// another still running summarises as `Failing`, yet is still settling:
+    /// it is re-read until the running one finishes, and stops after the
+    /// window like any other.
+    #[test]
+    fn a_terminal_pr_with_a_failed_and_a_running_check_is_still_polled() {
+        let at = Instant::now();
+        let interval = Duration::from_secs(60);
+        let checks = |failing, pending| PullRequestChecks {
+            state: PullRequestChecksState::Failing,
+            passing: 0,
+            failing,
+            pending,
+            skipped: 0,
+        };
+        for state in [PullRequestState::Merged, PullRequestState::Closed] {
+            let mut pr = pr_in(state).unwrap().unwrap();
+            pr.checks = Some(checks(1, 1));
+            let mut entry = KeyEntry::default();
+            entry.record(Some(pr.clone()), at);
+            entry.fetched_at = Some(at);
+            assert!(!fetch_due(&entry, at + Duration::from_secs(59), interval));
+            assert!(fetch_due(&entry, at + interval, interval), "{state:?}");
+            // Past the window it stops, even with the check still running.
+            assert!(!fetch_due(
+                &entry,
+                at + TERMINAL_PENDING_CHECKS_WINDOW + interval,
+                interval
+            ));
+            // The running check finished (failed too): settled, not re-read.
+            let mut done = pr;
+            done.checks = Some(checks(2, 0));
+            entry.record(Some(done), at + interval);
+            entry.fetched_at = Some(at + interval);
+            assert!(
+                !fetch_due(&entry, at + interval * 10, interval),
+                "{state:?}"
+            );
         }
     }
 
@@ -2387,6 +2469,41 @@ mod tests {
         assert_eq!(finished, 8);
         assert_eq!(peak.load(Ordering::SeqCst), 2);
         assert_eq!((probes.len(), lookups.len()), (0, 0));
+    }
+
+    /// Issue #2418 (review A1): a pool in a lane of two holds at most two of
+    /// the shared permits however many of its jobs are queued, so a pool
+    /// outside the lane — the branch badge's — still runs its jobs.
+    #[tokio::test]
+    async fn a_lane_leaves_shared_permits_to_the_other_pools() {
+        let permits = new_job_bound();
+        let lane = Arc::new(tokio::sync::Semaphore::new(2));
+        let mut references: JobPool<u32, ()> = JobPool::with_lane(permits.clone(), lane.clone());
+        let mut other: JobPool<u32, ()> = JobPool::with_lane(permits.clone(), lane);
+        for id in 0..20 {
+            references.spawn(id, std::future::pending::<()>());
+            other.spawn(id, std::future::pending::<()>());
+        }
+        eventually("the lane full", || {
+            permits.available_permits() == MAX_CONCURRENT_JOBS - 2
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(permits.available_permits(), MAX_CONCURRENT_JOBS - 2);
+        let mut branch: JobPool<u32, u32> = JobPool::new(permits.clone());
+        for id in 0..10 {
+            branch.spawn(id, async move { id });
+        }
+        let mut served = 0;
+        while tokio::time::timeout(Duration::from_secs(10), branch.next())
+            .await
+            .expect("the branch jobs are served")
+            .is_some()
+        {
+            served += 1;
+        }
+        assert_eq!(served, 10);
+        assert_eq!((references.len(), other.len()), (20, 20));
     }
 
     /// A job whose id is retained away, or whose pool is dropped (the monitor

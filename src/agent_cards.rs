@@ -1101,6 +1101,20 @@ pub struct AgentFacts {
     /// Whether the daemon records a dispatched worktree for the agent, which
     /// is what offers "close, keeping the worktree".
     pub has_worktree: bool,
+    /// Issue #2418 (D4): the working directory the joined live session
+    /// reports, picked as `record.live` is. Daemon-only: a bare `#N`
+    /// reference resolves against it, else against `record.cwd`, as the
+    /// branch badge prefers a session's reported directory.
+    pub live_cwd: Option<String>,
+}
+
+impl AgentFacts {
+    /// The folder a bare `#N` reference on this agent's card resolves in:
+    /// its live session's reported directory, else the one the deck started
+    /// it in.
+    fn reference_cwd(&self) -> Option<&str> {
+        self.live_cwd.as_deref().or(self.record.cwd.as_deref())
+    }
 }
 
 /// A live dispatched unit, as projection needs it.
@@ -1732,8 +1746,7 @@ fn project_all_checked(
         .map(|a| {
             let key = entry_key(&a.pane_id, &a.record.id);
             let mut entry = project_entry(a, slots.get(&key), catalog, units, &names, instance_id);
-            entry.checked_refs =
-                checked_references(&entry.fields, a.record.cwd.as_deref(), refs, wanted);
+            entry.checked_refs = checked_references(&entry.fields, a.reference_cwd(), refs, wanted);
             entry
         })
         .collect();
@@ -1866,11 +1879,49 @@ fn link_tree(entries: &mut Vec<AgentCardEntry>) {
         })
         .collect();
 
-    // Walk the tree from its roots, in spawn order. A card no root reaches
-    // sits on a cycle of starters, which exact identity should never form:
-    // the earliest-spawned such card becomes a root, which reaches the rest.
     let mut by_order: Vec<usize> = (0..entries.len()).collect();
     by_order.sort_by_key(|i| order_of(&entries[*i]));
+    let mut rank = vec![0usize; entries.len()];
+    for (position, &i) in by_order.iter().enumerate() {
+        rank[i] = position;
+    }
+
+    // Break every cycle of starters, which exact identity should never form.
+    // Walking up from each card either reaches a root, a card already known
+    // to reach one, or a card already on this walk: then the walk from that
+    // card on is a cycle, and its earliest-spawned card becomes a root. Only
+    // a card ON a cycle is cut, once per cycle; a card whose starters lead
+    // into a cycle keeps its starter.
+    let mut reaches_root = vec![false; entries.len()];
+    let mut on_walk = vec![false; entries.len()];
+    for &start in &by_order {
+        let mut walk: Vec<usize> = Vec::new();
+        let mut at = start;
+        loop {
+            if reaches_root[at] {
+                break;
+            }
+            if on_walk[at] {
+                let from = walk.iter().position(|&n| n == at).unwrap_or(0);
+                if let Some(&cut) = walk[from..].iter().min_by_key(|&&n| rank[n]) {
+                    parent[cut] = None;
+                }
+                break;
+            }
+            on_walk[at] = true;
+            walk.push(at);
+            match parent[at] {
+                Some(p) => at = p,
+                None => break,
+            }
+        }
+        for n in walk {
+            on_walk[n] = false;
+            reaches_root[n] = true;
+        }
+    }
+
+    // Walk the forest from its roots, in spawn order.
     let mut children: Vec<Vec<usize>> = vec![Vec::new(); entries.len()];
     for &c in &by_order {
         if let Some(p) = parent[c] {
@@ -1879,25 +1930,7 @@ fn link_tree(entries: &mut Vec<AgentCardEntry>) {
     }
     let mut visited = vec![false; entries.len()];
     let mut preorder: Vec<usize> = Vec::with_capacity(entries.len());
-    for &start in &by_order {
-        if visited[start] {
-            continue;
-        }
-        if parent[start].is_some() {
-            // Reached later from its root — unless no root reaches it.
-            let mut at = start;
-            let mut seen = HashSet::new();
-            while let Some(p) = parent[at] {
-                if !seen.insert(at) {
-                    break;
-                }
-                at = p;
-            }
-            if parent[at].is_none() {
-                continue;
-            }
-            parent[start] = None;
-        }
+    for &start in by_order.iter().filter(|&&i| parent[i].is_none()) {
         let mut stack = vec![start];
         while let Some(node) = stack.pop() {
             if visited[node] {
@@ -1905,8 +1938,6 @@ fn link_tree(entries: &mut Vec<AgentCardEntry>) {
             }
             visited[node] = true;
             preorder.push(node);
-            // A card made a root above is still in its old starter's list;
-            // `visited` keeps it from being placed twice.
             stack.extend(children[node].iter().rev().copied());
         }
     }
@@ -2534,16 +2565,18 @@ async fn gather(
     registry: &Arc<AgentPtyRegistry>,
     state: &crate::state::SharedState,
 ) -> (Vec<AgentFacts>, Vec<UnitFacts>) {
-    let mut records: Vec<(AgentRecord, bool)> = registry
+    let mut records: Vec<(AgentRecord, bool, Option<String>)> = registry
         .agent_records_including_exited()
         .into_iter()
         .filter(|(record, _, unconfirmed)| !unconfirmed && record.pane_id_env.is_some())
-        .map(|(record, exited, _)| (record, exited))
+        .map(|(record, exited, _)| (record, exited, None))
         .collect();
     {
         let guard = state.read().await;
-        for (record, _) in &mut records {
-            record.live = guard.live_session_for(&record.id, record.pane_id_env.as_deref());
+        for (record, _, live_cwd) in &mut records {
+            let pane = record.pane_id_env.as_deref();
+            record.live = guard.live_session_for(&record.id, pane);
+            *live_cwd = guard.live_session_cwd_for(&record.id, pane);
         }
     }
     let worktrees = registry
@@ -2555,7 +2588,7 @@ async fn gather(
     let inbox = registry.inbox();
     let agents = records
         .into_iter()
-        .map(|(record, exited)| {
+        .map(|(record, exited, live_cwd)| {
             let pane_id = record.pane_id_env.clone().unwrap_or_default();
             let summary = inbox.summary(&pane_id, &record.id);
             let has_worktree = worktrees.as_ref().is_some_and(|w| {
@@ -2569,6 +2602,7 @@ async fn gather(
                 stopped: exited || record.crashed == Some(true),
                 undelivered_messages: summary.queued + summary.fetched,
                 has_worktree,
+                live_cwd,
                 pane_id,
                 record,
             }
@@ -3475,6 +3509,7 @@ mod tests {
             stopped: false,
             undelivered_messages: 0,
             has_worktree: false,
+            live_cwd: None,
         }
     }
 
@@ -3922,6 +3957,298 @@ mod tests {
         assert_eq!(rollup.worst, "blocked");
         assert_eq!(rollup.needs_you, 1);
         assert_ne!(content_hash(&before), content_hash(&after));
+    }
+
+    /// Review R5 (D1): of several orchestrator generations of one
+    /// orchestration instance, the roles hang under a live one over a stopped
+    /// one, then the latest; the others stay where their own starter puts
+    /// them.
+    #[test]
+    fn roles_hang_under_the_orchestrators_live_generation() {
+        let catalog = resolve(None);
+        let mut stopped = role("2", "o1", "orch-a", "orchestrator", true);
+        stopped.stopped = true;
+        let agents = [
+            facts("1", "d"),
+            stopped,
+            role("3", "r1", "orch-a", "coder", false),
+            // A later live generation of the orchestrator, in another pane.
+            role("4", "o2", "orch-a", "orchestrator", true),
+        ];
+        let units = [orchestration_unit(("d", "1"), "orch-a")];
+        let entries = project_all(&agents, &HashMap::new(), &catalog, &units, "i");
+        assert_eq!(
+            tree(&entries),
+            [
+                ("d/1", None),
+                ("o1/2", Some("d/1")),
+                ("o2/4", Some("d/1")),
+                ("r1/3", Some("o2/4")),
+            ]
+        );
+        // Both live: the latest.
+        let agents = [
+            role("2", "o1", "orch-a", "orchestrator", true),
+            role("3", "r1", "orch-a", "coder", false),
+            role("4", "o2", "orch-a", "orchestrator", true),
+        ];
+        let entries = project_all(&agents, &HashMap::new(), &catalog, &[], "i");
+        assert_eq!(
+            tree(&entries),
+            [("o1/2", None), ("o2/4", None), ("r1/3", Some("o2/4"))]
+        );
+    }
+
+    /// Review R5 (D1): a unit hangs under the dispatcher GENERATION that
+    /// dispatched it, not under whatever runs in that pane now — and with
+    /// that generation gone it is a root, not the new generation's child.
+    #[test]
+    fn a_unit_hangs_under_its_dispatchers_generation_not_its_pane() {
+        let catalog = resolve(None);
+        let units = [single_unit(("d", "1"), ("u", "2"))];
+        // The pane `d` runs a later generation too.
+        let agents = [facts("1", "d"), facts("2", "u"), facts("3", "d")];
+        let entries = project_all(&agents, &HashMap::new(), &catalog, &units, "i");
+        assert_eq!(
+            tree(&entries),
+            [("d/1", None), ("u/2", Some("d/1")), ("d/3", None)]
+        );
+        // The dispatching generation closed; the pane reused.
+        let agents = [facts("2", "u"), facts("3", "d")];
+        let entries = project_all(&agents, &HashMap::new(), &catalog, &units, "i");
+        assert_eq!(tree(&entries), [("u/2", None), ("d/3", None)]);
+    }
+
+    /// Review R5 (D1): two orchestrations with the same display name are
+    /// told apart by their instance tokens; each role hangs under its own.
+    #[test]
+    fn orchestrations_sharing_a_name_keep_their_own_roles() {
+        let catalog = resolve(None);
+        // `role` names every orchestration "team".
+        let agents = [
+            role("1", "o1", "orch-a", "orchestrator", true),
+            role("2", "o2", "orch-b", "orchestrator", true),
+            role("3", "r1", "orch-b", "coder", false),
+            role("4", "r2", "orch-a", "coder", false),
+        ];
+        let entries = project_all(&agents, &HashMap::new(), &catalog, &[], "i");
+        assert_eq!(
+            tree(&entries),
+            [
+                ("o1/1", None),
+                ("r2/4", Some("o1/1")),
+                ("o2/2", None),
+                ("r1/3", Some("o2/2")),
+            ]
+        );
+    }
+
+    /// Review R5/R6 (D1): starters that point at themselves or round in a
+    /// circle — which exact identity should never produce — still give a
+    /// forest. A self-link is no parent; a cycle is cut once, at its
+    /// earliest-spawned card; and a card whose starters lead into a cycle,
+    /// without being on it, keeps its starter.
+    #[test]
+    fn self_links_and_cycles_still_give_a_forest() {
+        let catalog = resolve(None);
+        // Self-link.
+        let units = [single_unit(("a", "1"), ("a", "1"))];
+        let entries = project_all(&[facts("1", "a")], &HashMap::new(), &catalog, &units, "i");
+        assert_eq!(tree(&entries), [("a/1", None)]);
+        assert!(entries[0].rollup.is_none());
+
+        // A two-card cycle: the earlier one is the root.
+        let units = [
+            single_unit(("a", "1"), ("b", "2")),
+            single_unit(("b", "2"), ("a", "1")),
+        ];
+        let entries = project_all(
+            &[facts("2", "b"), facts("1", "a")],
+            &HashMap::new(),
+            &catalog,
+            &units,
+            "i",
+        );
+        assert_eq!(tree(&entries), [("a/1", None), ("b/2", Some("a/1"))]);
+
+        // A tail into a cycle, the tail spawned first: `c` stays under `a`,
+        // the cycle `a`/`b` is cut at `a`, and nothing else is cut.
+        let units = [
+            single_unit(("a", "2"), ("c", "1")),
+            single_unit(("a", "2"), ("b", "3")),
+            single_unit(("b", "3"), ("a", "2")),
+        ];
+        let entries = project_all(
+            &[facts("1", "c"), facts("2", "a"), facts("3", "b")],
+            &HashMap::new(),
+            &catalog,
+            &units,
+            "i",
+        );
+        assert_eq!(
+            tree(&entries),
+            [("a/2", None), ("c/1", Some("a/2")), ("b/3", Some("a/2"))]
+        );
+        assert_eq!(one(&entries, "a/2").rollup.unwrap().total, 2);
+
+        // A three-card cycle with a tail of two: one cut, at its earliest.
+        let units = [
+            single_unit(("x", "4"), ("y", "5")),
+            single_unit(("y", "5"), ("z", "6")),
+            single_unit(("z", "6"), ("x", "4")),
+            single_unit(("y", "5"), ("t1", "1")),
+            single_unit(("t1", "1"), ("t2", "2")),
+        ];
+        let agents = [
+            facts("1", "t1"),
+            facts("2", "t2"),
+            facts("4", "x"),
+            facts("5", "y"),
+            facts("6", "z"),
+        ];
+        let entries = project_all(&agents, &HashMap::new(), &catalog, &units, "i");
+        assert_eq!(
+            tree(&entries),
+            [
+                ("x/4", None),
+                ("y/5", Some("x/4")),
+                ("t1/1", Some("y/5")),
+                ("t2/2", Some("t1/1")),
+                ("z/6", Some("y/5")),
+            ]
+        );
+    }
+
+    /// Review R5 (D2): in the store, a grandchild's status change gives the
+    /// root's entry a new revision and rings its doorbell — not only a new
+    /// content hash.
+    #[test]
+    fn a_grandchild_change_bumps_the_roots_revision_and_doorbell() {
+        let catalog = resolve(None);
+        let store = CardStore::default();
+        let units = [
+            single_unit(("d1", "1"), ("d2", "2")),
+            single_unit(("d2", "2"), ("u", "3")),
+        ];
+        let agents = |status: &str| {
+            [
+                facts("1", "d1"),
+                facts("2", "d2"),
+                with_status(facts("3", "u"), status),
+            ]
+        };
+        let start = Instant::now();
+        let commit = |status: &str, instant: Instant| {
+            let mut inner = store.lock();
+            let read_at = inner.epoch;
+            let (list, bells) = inner
+                .commit(
+                    &agents(status),
+                    &units,
+                    &HashMap::new(),
+                    &catalog,
+                    "i",
+                    read_at,
+                    false,
+                    Utc::now(),
+                    instant,
+                    &Default::default(),
+                    &mut Default::default(),
+                )
+                .unwrap();
+            let root = one(&list.entries, "d1/1").revision;
+            let rang: Vec<String> = bells.into_iter().map(|b| b.key).collect();
+            (root, rang)
+        };
+        let (before, _) = commit("Working", start);
+        let (same, rang) = commit("Working", start + Duration::from_secs(2));
+        assert_eq!(same, before);
+        assert!(rang.is_empty(), "{rang:?}");
+        let (after, rang) = commit("Blocked", start + Duration::from_secs(4));
+        assert!(after > before, "{after} > {before}");
+        assert!(rang.contains(&"d1/1".to_string()), "{rang:?}");
+        assert!(rang.contains(&"d2/2".to_string()), "{rang:?}");
+    }
+
+    /// Review R1 (D4): a bare `#N` resolves in the folder the agent's live
+    /// session reports, as the branch badge does, and only without one in
+    /// the folder the deck started it in. The two folders' repositories give
+    /// different answers for the same number, so the wrong one shows.
+    #[test]
+    fn a_bare_reference_resolves_in_the_live_sessions_folder() {
+        use crate::github_refs::{ReferenceKind, ResolvedReference};
+        use crate::pull_request::LookupEntry;
+        use crate::pull_request_info::PullRequestState;
+        use crate::reference_check::{RefAnswer, ReferenceView, WantedRefs};
+
+        let catalog = resolve(None);
+        let mut slots = HashMap::new();
+        slots.insert(
+            "p1/1".to_string(),
+            slot_with(r##"{"fields": [{"name": "pull-request", "value": "#7"}]}"##),
+        );
+        let mut view = ReferenceView::default();
+        view.origins
+            .insert("/launched".into(), Some("o/launched".into()));
+        view.origins
+            .insert("/working".into(), Some("o/working".into()));
+        for (repo, state) in [
+            ("o/launched", PullRequestState::Merged),
+            ("o/working", PullRequestState::Open),
+        ] {
+            let mut entry = LookupEntry::<RefAnswer>::default();
+            entry.record(
+                RefAnswer {
+                    state,
+                    ci: None,
+                    review: None,
+                    title: None,
+                    url: format!("https://github.com/{repo}/pull/7"),
+                    checked_at: Utc::now(),
+                },
+                Instant::now(),
+            );
+            let key = ResolvedReference {
+                repo: repo.into(),
+                kind: ReferenceKind::PullRequest,
+                number: 7,
+            };
+            view.answers.insert(key, entry);
+        }
+        let agent = |live_cwd: Option<&str>| {
+            let mut f = facts("1", "p1");
+            f.record.cwd = Some("/launched".into());
+            f.live_cwd = live_cwd.map(str::to_string);
+            f
+        };
+        let check = |f: AgentFacts| {
+            let mut wanted = WantedRefs::default();
+            let entries = project_all_checked(&[f], &slots, &catalog, &[], "i", &view, &mut wanted);
+            (one(&entries, "p1/1").checked_refs[0].clone(), wanted)
+        };
+
+        let (checked, wanted) = check(agent(Some("/working")));
+        assert_eq!(checked.repo.as_deref(), Some("o/working"));
+        assert!(matches!(
+            checked.result,
+            CheckResult::Checked {
+                state: PullRequestState::Open,
+                ..
+            }
+        ));
+        assert!(wanted.cwds.contains("/working"));
+        assert!(!wanted.cwds.contains("/launched"));
+
+        // No live folder: the one the deck started it in.
+        let (checked, _) = check(agent(None));
+        assert_eq!(checked.repo.as_deref(), Some("o/launched"));
+        assert!(matches!(
+            checked.result,
+            CheckResult::Checked {
+                state: PullRequestState::Merged,
+                ..
+            }
+        ));
     }
 
     #[test]
