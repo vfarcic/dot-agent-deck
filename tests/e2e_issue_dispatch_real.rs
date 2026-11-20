@@ -125,12 +125,14 @@ fn dispatch_schedule_toml(working_dir: &str) -> String {
     )
 }
 
-/// The id of the agent whose card is titled `role`, once one is registered.
-fn role_agent(deck: &TuiDeck, role: &str) -> Option<String> {
+/// The agent id and the pane id (which an inbox is keyed by) of the agent
+/// whose card is titled `role` now. Asked again each time: a delegation with
+/// `clear = true` respawns the worker under a new agent id in the same pane.
+fn role_agent(deck: &TuiDeck, role: &str) -> Option<(String, String)> {
     common::agent_records_on(deck.attach_socket_path())
         .into_iter()
         .find(|r| r.display_name.as_deref() == Some(role))
-        .map(|r| r.id)
+        .and_then(|r| Some((r.id, r.pane_id_env?)))
 }
 
 /// `agent`'s pane as its own screen now reads.
@@ -142,10 +144,11 @@ fn pane_screen(deck: &TuiDeck, agent: &str) -> String {
     parser.screen().contents()
 }
 
-/// Whether the worker's inbox holds a task the orchestrator sent it that the
-/// worker acknowledged: the delegation, as the worker received it.
-fn worker_took_a_delegated_task(deck: &TuiDeck, worker: &str) -> bool {
-    inbox_view::messages(deck.attach_socket_path(), worker)
+/// Whether the inbox of the worker's pane `pane` holds a task the
+/// orchestrator sent it that the worker acknowledged: the delegation, as the
+/// worker received it.
+fn worker_took_a_delegated_task(deck: &TuiDeck, pane: &str) -> bool {
+    inbox_view::messages(deck.attach_socket_path(), pane)
         .into_iter()
         .any(|message| {
             message.state == dot_agent_deck::inbox::StateName::Acknowledged
@@ -395,21 +398,28 @@ fn dispatch_013_orchestration_surfaces_and_delegates() {
     // worker's own screen. Seeing the sentinel anywhere in the tab's stream
     // proved nothing: the orchestrator could list the files itself, and in
     // three runs on 2026-11-20 it did, with the worker idle.
-    let worker = role_agent(&deck, "worker").expect("the worker registered above");
     const DELEGATION_WAIT: Duration = Duration::from_secs(150);
+    let worker_shows_it = || {
+        role_agent(&deck, "worker").is_some_and(|(agent, pane)| {
+            worker_took_a_delegated_task(&deck, &pane)
+                && pane_screen(&deck, &agent).contains(SENTINEL)
+        })
+    };
     assert!(
-        common::wait_until(DELEGATION_WAIT, || {
-            worker_took_a_delegated_task(&deck, &worker)
-                && pane_screen(&deck, &worker).contains(SENTINEL)
-        }),
+        common::wait_until(DELEGATION_WAIT, worker_shows_it),
         "within {}s the worker must hold an acknowledged task from the orchestrator and \
-         show {SENTINEL:?} on its own screen.\nWorker inbox: {:?}\nWorker screen:\n{}\n\
-         Orchestrator screen:\n{}",
+         show {SENTINEL:?} on its own screen.\nWorker: {:?}\nWorker inbox: {:?}\n\
+         Worker screen:\n{}\nOrchestrator screen:\n{}",
         DELEGATION_WAIT.as_secs(),
-        inbox_view::messages(deck.attach_socket_path(), &worker),
-        pane_screen(&deck, &worker),
+        role_agent(&deck, "worker"),
+        role_agent(&deck, "worker")
+            .map(|(_, pane)| inbox_view::messages(deck.attach_socket_path(), &pane))
+            .unwrap_or_default(),
+        role_agent(&deck, "worker")
+            .map(|(agent, _)| pane_screen(&deck, &agent))
+            .unwrap_or_default(),
         role_agent(&deck, "orchestrator")
-            .map(|o| pane_screen(&deck, &o))
+            .map(|(agent, _)| pane_screen(&deck, &agent))
             .unwrap_or_default()
     );
 

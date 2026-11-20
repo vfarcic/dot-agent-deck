@@ -249,6 +249,12 @@ fn interrupted_028_a_real_agents_unit_is_listed_and_reclaimed_after_a_restart() 
         common::agent_records_on(&live.attach_socket)
     );
     let unit_agent = spawned.into_inner().unwrap();
+    // The unit's pane id, which its inbox is keyed by.
+    let unit_pane = common::agent_records_on(&live.attach_socket)
+        .into_iter()
+        .find(|r| r.id == unit_agent)
+        .and_then(|r| r.pane_id_env)
+        .expect("the unit's pane id");
 
     // The real agent does its one command.
     let sentinel = worktree.join(".dot-agent-deck").join(SENTINEL);
@@ -260,7 +266,7 @@ fn interrupted_028_a_real_agents_unit_is_listed_and_reclaimed_after_a_restart() 
         sentinel.display(),
         SENTINEL_WAIT.as_secs(),
         pane_screen(&live, &unit_agent),
-        inbox_view::messages(&live.attach_socket, &unit_agent),
+        inbox_view::messages(&live.attach_socket, &unit_pane),
         first_log.display(),
         log_tail(&first_log, 80)
     );
@@ -271,7 +277,7 @@ fn interrupted_028_a_real_agents_unit_is_listed_and_reclaimed_after_a_restart() 
     // The deck's own delivery took the task to the agent: its seed, the
     // message naming the sentinel, was handed over and acknowledged.
     let seed_acknowledged = || {
-        inbox_view::messages(&live.attach_socket, &unit_agent)
+        inbox_view::messages(&live.attach_socket, &unit_pane)
             .into_iter()
             .any(|message| {
                 message.state == StateName::Acknowledged
@@ -287,7 +293,7 @@ fn interrupted_028_a_real_agents_unit_is_listed_and_reclaimed_after_a_restart() 
             seed_acknowledged
         ),
         "the dispatched task was not acknowledged by the unit: {:?}\nDaemon log ({}):\n{}",
-        inbox_view::messages(&live.attach_socket, &unit_agent),
+        inbox_view::messages(&live.attach_socket, &unit_pane),
         first_log.display(),
         log_tail(&first_log, 80)
     );
