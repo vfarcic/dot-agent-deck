@@ -16,8 +16,9 @@
 //!
 //! The restart is lane 1's: SIGTERM to the daemon's own pid (never a
 //! pattern, CLAUDE.md rule 12) and a second `daemon serve` on the same state
-//! directory. The agent's first-run onboarding and the worktree's trust are
-//! seeded into the daemon's HOME before the dispatch, as
+//! directory. The agent's first-run onboarding and the trust of the worktree
+//! and of the hold's directory are seeded into the daemon's HOME before the
+//! dispatch, as
 //! `scheduler/dispatch/013` seeds them, with the deck's Claude Code hooks,
 //! so the unattended `claude` takes its task from the deck with no keystroke.
 //!
@@ -263,8 +264,15 @@ fn interrupted_028_a_real_agents_unit_is_listed_and_reclaimed_after_a_restart() 
         .path()
         .join(format!("interrupted-live-repo-dispatch-{UNIT}"));
     let branch = format!("agent/dispatch-{UNIT}");
-    common::seed_claude_worker_home(&live.home, &trust_spellings(&worktree))
-        .expect("seed the agent's credentials, onboarding and the worktree's trust");
+    // The hold's directory, which the agent is given with `--add-dir`: Claude
+    // Code asks whether to trust an added directory as it asks for its working
+    // one, so both are seeded as trusted.
+    let hold_dir = scratch.path().join("hold");
+    let mut trusted = trust_spellings(&worktree);
+    trusted.extend(trust_spellings(&hold_dir));
+    common::seed_claude_worker_home(&live.home, &trusted).expect(
+        "seed the agent's credentials, onboarding and the trust of the worktree and the hold's directory",
+    );
     // The deck's Claude Code hooks, in the HOME the agent runs under: the
     // credential import strips the host's hooks, and the deck learns that the
     // agent is ready for its task from them (as `e2e_pi_orchestrator.rs` does).
@@ -287,7 +295,6 @@ fn interrupted_028_a_real_agents_unit_is_listed_and_reclaimed_after_a_restart() 
     // its command: in this run's own root, outside the worktree, with the
     // agent given access to its directory. Dropping it, on a pass or a
     // failure, releases the command (`support/fifo_hold.rs`).
-    let hold_dir = scratch.path().join("hold");
     std::fs::create_dir_all(&hold_dir).expect("the hold's directory");
     let hold = hold::FifoHold::create(&hold_dir.join(HOLD));
 
