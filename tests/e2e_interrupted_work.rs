@@ -62,9 +62,9 @@ mod journal;
 mod route;
 
 use dot_agent_deck::interrupted_work::{
-    DISMISSED, INTERRUPTED_WORK_TITLE, KEPT_UNTIL, OTHER_AGENTS_GROUP, RECLAIM_KEPT_DIRTY,
-    RECLAIM_KEPT_HOLDS_WORKTREES, RECLAIM_REMOVED, RECLAIM_WOULD_REMOVE, REFUSED_AGENT_CALLER,
-    interrupted_footer,
+    DISMISSED, INTERRUPTED_WORK_TITLE, KEPT_UNTIL, LABEL_PROGRESS, OTHER_AGENTS_GROUP,
+    RECLAIM_KEPT_DIRTY, RECLAIM_KEPT_HOLDS_WORKTREES, RECLAIM_REMOVED, RECLAIM_WOULD_REMOVE,
+    REFUSED_AGENT_CALLER, REPORT_NOT_OF_ITEM, interrupted_footer,
 };
 use inbox::Pane;
 use serde_json::{Value, json};
@@ -324,8 +324,9 @@ fn reported_by(decks: &Decks, pane: &Pane) -> Value {
 /// shows none of them. The daemon is stopped and another started on the
 /// same state directory; `interrupted list --json --no-git` then shows the
 /// two units with their kind, branch, worktree, launcher and last journal
-/// entry, and the pane as a plain agent, and the human list shows the title,
-/// the units, the pane under "Other agents" and the footer.
+/// entry and how far each got (its attempts), and the pane as a plain agent,
+/// and the human list shows the title, the units, a progress line for each
+/// item, the pane under "Other agents" and the footer.
 #[spec("journal/interrupted/001")]
 #[test]
 fn interrupted_001_a_restart_lists_both_units_and_the_plain_pane() {
@@ -376,6 +377,10 @@ fn interrupted_001_a_restart_lists_both_units_and_the_plain_pane() {
                 && ts_ms(item) > 0,
             "the item names its last journal line: {item}"
         );
+        assert!(
+            item["progress"]["attempts"].as_u64().unwrap_or(0) >= 1,
+            "the item counts the attempts that ran under it: {item}"
+        );
     }
     let agent = items(&list)
         .iter()
@@ -404,6 +409,11 @@ fn interrupted_001_a_restart_lists_both_units_and_the_plain_pane() {
     assert!(
         at(&id_of(agent)) > group,
         "the plain pane is listed under {OTHER_AGENTS_GROUP:?}:\n{out}"
+    );
+    assert_eq!(
+        out.matches(&format!("\n    {LABEL_PROGRESS}: ")).count(),
+        3,
+        "every item prints how far it got:\n{out}"
     );
     at(&interrupted_footer(3));
 }
@@ -599,8 +609,10 @@ fn interrupted_004_reclaim_keeps_a_dirty_worktree_and_one_holding_another() {
 
 /// Scenario: A dispatched unit sends its report to its dispatcher, which
 /// never fetches it, and the daemon restarts. The unit's item lists that
-/// report with the date it is kept until, and `interrupted show <id>` prints
-/// the report's text inside the untrusted-report frame.
+/// report with the date it is kept until, `interrupted show <id>` prints
+/// the report's text inside the untrusted-report frame, `interrupted show <id>
+/// --report <report id>` prints that one report the same way, and a report id
+/// that is not the item's is refused.
 #[spec("journal/interrupted/005")]
 #[test]
 fn interrupted_005_an_unread_report_is_listed_and_shown_after_a_restart() {
@@ -653,6 +665,31 @@ fn interrupted_005_an_unread_report_is_listed_and_shown_after_a_restart() {
         .find(":END-UNTRUSTED-WORKER-REPORT]")
         .unwrap_or_else(|| panic!("the frame is closed:\n{out}"));
     assert!(open < body && body < close, "inside the frame:\n{out}");
+
+    let report_id = report["report_id"].as_str().unwrap().to_string();
+    let one = decks.person(&["interrupted", "show", &id_of(item), "--report", &report_id]);
+    assert_exit("interrupted show <id> --report <report id>", &one, 0);
+    let out = String::from_utf8_lossy(&one.stdout).into_owned();
+    let open = out
+        .find("[UNTRUSTED-WORKER-REPORT:")
+        .unwrap_or_else(|| panic!("the report is framed as untrusted:\n{out}"));
+    let body = out
+        .find(REPORT)
+        .unwrap_or_else(|| panic!("the report's text is shown:\n{out}"));
+    assert!(open < body, "inside the frame:\n{out}");
+    let stranger = decks.person(&[
+        "interrupted",
+        "show",
+        &id_of(item),
+        "--report",
+        "not-this-items-report",
+    ]);
+    assert_exit("interrupted show <id> --report <another id>", &stranger, 1);
+    assert!(
+        text(&stranger).contains(REPORT_NOT_OF_ITEM),
+        "{}",
+        text(&stranger)
+    );
 }
 
 /// Scenario: With no restart, a dispatched unit's dispatcher pane is closed
