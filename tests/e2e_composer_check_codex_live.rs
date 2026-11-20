@@ -43,16 +43,21 @@ use std::time::{Duration, Instant};
 /// The user's editor: a terminal program that reads what the person types
 /// into it (`read`, until `LATE` or `T041_EDITOR_WAIT` seconds) and appends
 /// the printable bytes to the file, or empties the file (`empty`). Each run
-/// appends one JSON line to `T041_EDITOR_LOG`.
+/// appends one JSON line to `T041_EDITOR_LOG`, with when it opened its
+/// terminal and when it stopped reading, so a `LATE` it never read shows
+/// whether its window ran out or the bytes never came (issue #2264).
 const EDITOR: &str = r#"#!/usr/bin/env python3
-import json, os, select, sys, termios, time, tty
+import datetime, json, os, select, sys, termios, time, tty
+now = lambda: datetime.datetime.now(datetime.timezone.utc).isoformat()
 path = sys.argv[-1]
 with open(path, "rb") as f:
     initial = f.read()
 got = b""
+opened = closed = None
 mode = os.environ.get("T041_EDITOR_MODE", "read")
 if mode == "read":
     fd = os.open("/dev/tty", os.O_RDWR)
+    opened = now()
     old = termios.tcgetattr(fd)
     try:
         # TCSANOW: TCSAFLUSH, setraw's default, would discard what the
@@ -70,6 +75,7 @@ if mode == "read":
                     break
                 got += chunk
     finally:
+        closed = now()
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
         os.close(fd)
     body = initial[:-1] if initial.endswith(b"\n") else initial
@@ -81,7 +87,8 @@ with open(path, "wb") as f:
 with open(os.environ["T041_EDITOR_LOG"], "a") as f:
     f.write(json.dumps({"mode": mode, "initial": initial.decode(errors="replace"),
                         "read_hex": got.hex(), "final": text.decode(errors="replace"),
-                        "pid": os.getpid(), "ppid": os.getppid()}) + "\n")
+                        "pid": os.getpid(), "ppid": os.getppid(),
+                        "opened": opened, "closed": closed}) + "\n")
 "#;
 
 /// The user's editor and its log, in a directory of the test's own.
@@ -244,6 +251,15 @@ fn overlap_trials(path: Path041) {
             "deliveries": message["deliveries"],
         });
         eprintln!("041 {} {row}", path.name);
+        // A missed trial's whole deck log, for reading its helper records'
+        // attribution and timing its trace against the editor's `opened`
+        // and `closed` (issue #2264).
+        if !landed && let Ok(out) = std::env::var("DAD_PROBE_041_OUT") {
+            let _ = std::fs::write(
+                format!("{out}.{}-{trial}.log", path.name),
+                common::redact_credentials_for_output(&codex.log()),
+            );
+        }
         assert_eq!(
             branches.first().copied(),
             Some("Armed"),
@@ -263,7 +279,8 @@ fn overlap_trials(path: Path041) {
         assert_eq!(
             codex.composer().as_deref(),
             Some("EARLYLATE"),
-            "trial {trial}: nothing but the person's typing reached the box; {row}"
+            "trial {trial}: nothing but the person's typing reached the box; {row}; {}",
+            codex.evidence()
         );
         // The route, not only the box: Ctrl+G opened the person's editor once,
         // on the box as typed before it, and LATE reached that editor.
@@ -281,7 +298,8 @@ fn overlap_trials(path: Path041) {
         assert_eq!(
             runs[0]["read_hex"].as_str().and_then(unhex).as_deref(),
             Some(&b"LATE"[..]),
-            "trial {trial}: LATE reaches the person's editor; {row}"
+            "trial {trial}: LATE reaches the person's editor; {row}; {}",
+            codex.evidence()
         );
         match path.exit {
             // The box was empty when the check's byte reached Codex: what
@@ -378,7 +396,6 @@ fn probe_041_live_failed_report_with_notice_keeps_overlapping_typing() {
 /// Scenario: As the delayed case, but the check's helper is held for 11 seconds at its very start, before it reads anything, past the ten-second wait after which the deck counts the check's byte as unanswered. Every trial must still end with exactly EARLYLATE in Codex's input box and the task undelivered, the person's editor having opened once and read LATE, and the helper still reports the box it read empty.
 #[spec("inbox/probe/041")]
 #[test]
-#[ignore = "quarantined: vfarcic, #2264"]
 fn probe_041_live_late_helper_keeps_overlapping_typing() {
     overlap_trials(Path041 {
         name: "late-helper",
