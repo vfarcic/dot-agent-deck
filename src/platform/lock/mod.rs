@@ -82,7 +82,12 @@ pub async fn acquire_spawn_lock_within(
 ) -> Result<SpawnLock, LockWaitError> {
     #[cfg(unix)]
     {
-        acquire_within_using(path, wait, unix::try_acquire_spawn_lock).await
+        acquire_within_using(
+            path,
+            ClockDeadline::after(wait),
+            unix::try_acquire_spawn_lock,
+        )
+        .await
     }
     #[cfg(not(unix))]
     {
@@ -94,53 +99,102 @@ pub async fn acquire_spawn_lock_within(
     }
 }
 
-/// The Unix wait of [`acquire_spawn_lock_within`], with the single attempt
-/// passed in so a test can stand in for it.
+/// When a bounded wait runs out, readable both from the wait itself and from
+/// a blocking-pool attempt. The wait uses [`ClockDeadline`]; a test stands in
+/// one it moves itself, so its setup decides when the wait runs out rather than
+/// the scheduler (auditor N10).
 #[cfg(unix)]
-async fn acquire_within_using<F>(
+trait WaitDeadline: Clone + Send + Sync + 'static {
+    /// Whether the wait has run out.
+    fn passed(&self) -> bool;
+    /// Resolves once the wait has run out.
+    fn reached(&self) -> impl std::future::Future<Output = ()> + Send + 'static;
+}
+
+/// The deadline of a real wait: a point on the clock, or none for a wait too
+/// long to represent, which then never runs out.
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+struct ClockDeadline(Option<std::time::Instant>);
+
+#[cfg(unix)]
+impl ClockDeadline {
+    fn after(wait: std::time::Duration) -> Self {
+        Self(std::time::Instant::now().checked_add(wait))
+    }
+}
+
+#[cfg(unix)]
+impl WaitDeadline for ClockDeadline {
+    fn passed(&self) -> bool {
+        self.0.is_some_and(|at| std::time::Instant::now() >= at)
+    }
+
+    fn reached(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let at = self.0;
+        async move {
+            match at {
+                Some(at) => tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await,
+                None => std::future::pending().await,
+            }
+        }
+    }
+}
+
+/// The Unix wait of [`acquire_spawn_lock_within`], with the single attempt
+/// and the deadline passed in so a test can stand in for them.
+#[cfg(unix)]
+async fn acquire_within_using<F, D>(
     path: &Path,
-    wait: std::time::Duration,
+    deadline: D,
     attempt: F,
 ) -> Result<SpawnLock, LockWaitError>
 where
     F: Fn(&Path) -> std::io::Result<Option<SpawnLock>> + Clone + Send + 'static,
+    D: WaitDeadline,
 {
-    let deadline = tokio::time::Instant::now() + wait;
-    // The same deadline on the clock a blocking-pool job can read. A wait too
-    // long to represent has no deadline worth checking there.
-    let job_deadline = std::time::Instant::now().checked_add(wait);
-    let expired = move || job_deadline.is_some_and(|at| std::time::Instant::now() >= at);
+    let reached = deadline.reached();
+    tokio::pin!(reached);
     let mut pause = LOCK_RETRY_FIRST_PAUSE;
     loop {
         let attempt_path = path.to_path_buf();
         let try_once = attempt.clone();
-        let job = tokio::task::spawn_blocking(move || {
-            if expired() {
+        let expired = deadline.clone();
+        let mut job = tokio::task::spawn_blocking(move || {
+            if expired.passed() {
                 return Ok(None);
             }
             // A lock taken after the deadline is dropped here, which lets go
             // of it, rather than handed to a caller that has stopped waiting.
-            Ok(try_once(&attempt_path)?.filter(|_| !expired()))
+            Ok(try_once(&attempt_path)?.filter(|_| !expired.passed()))
         });
         let cancel = job.abort_handle();
-        match tokio::time::timeout_at(deadline, job).await {
-            // Cancels the attempt if it is still queued; one already running
-            // finishes, and its lock, if any, is dropped with its unclaimed
-            // result.
-            Err(_elapsed) => {
+        // `biased`: an attempt that has finished is read before the deadline,
+        // as `tokio::time::timeout` reads its future before its timer.
+        let joined = tokio::select! {
+            biased;
+            joined = &mut job => joined,
+            () = &mut reached => {
+                // Cancels the attempt if it is still queued; one already
+                // running finishes, and its lock, if any, is dropped with its
+                // unclaimed result.
                 cancel.abort();
                 return Err(LockWaitError::Busy);
             }
-            Ok(Ok(Ok(Some(lock)))) if tokio::time::Instant::now() < deadline => return Ok(lock),
-            Ok(Ok(Ok(_))) => {}
-            Ok(Ok(Err(error))) => return Err(LockWaitError::Failed(error)),
-            Ok(Err(join)) => return Err(LockWaitError::Failed(std::io::Error::other(join))),
+        };
+        match joined {
+            Ok(Ok(Some(lock))) if !deadline.passed() => return Ok(lock),
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => return Err(LockWaitError::Failed(error)),
+            Err(join) => return Err(LockWaitError::Failed(std::io::Error::other(join))),
         }
-        let now = tokio::time::Instant::now();
-        if now >= deadline {
+        if deadline.passed() {
             return Err(LockWaitError::Busy);
         }
-        tokio::time::sleep(pause.min(deadline - now)).await;
+        tokio::select! {
+            () = &mut reached => return Err(LockWaitError::Busy),
+            () = tokio::time::sleep(pause) => {}
+        }
         pause = (pause * 2).min(LOCK_RETRY_LONGEST_PAUSE);
     }
 }
@@ -494,11 +548,46 @@ mod tests {
         );
     }
 
+    /// A deadline the test moves itself (auditor N10): it runs out when the
+    /// test says so, after the setup it is waiting for has been seen to
+    /// happen, so the scheduler cannot spend the budget before it does.
+    #[cfg(unix)]
+    #[derive(Clone)]
+    struct TestDeadline(tokio::sync::watch::Receiver<bool>);
+
+    #[cfg(unix)]
+    impl TestDeadline {
+        /// The deadline, and the sender that makes it run out.
+        fn new() -> (tokio::sync::watch::Sender<bool>, Self) {
+            let (expire, passed) = tokio::sync::watch::channel(false);
+            (expire, Self(passed))
+        }
+    }
+
+    #[cfg(unix)]
+    impl WaitDeadline for TestDeadline {
+        fn passed(&self) -> bool {
+            *self.0.borrow()
+        }
+
+        fn reached(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+            let mut passed = self.0.clone();
+            async move {
+                // A dropped sender leaves the deadline where it is; a test
+                // always sends before it lets go.
+                if passed.wait_for(|passed| *passed).await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            }
+        }
+    }
+
     /// Auditor N7: an attempt that takes the lock only after the wait has run
     /// out is not handed back, and does not keep it. The attempt here waits
-    /// for the test before taking a free lock; the wait answers `Busy` within
-    /// its budget while it does, and once it has taken the lock and finished,
-    /// the lock is free again.
+    /// for the test before taking a free lock. The test runs the wait out only
+    /// once the attempt has started (auditor N10), and the wait answers `Busy`
+    /// while the attempt is still held; once it has taken the lock and
+    /// finished, the lock is free again.
     #[cfg(unix)]
     #[test]
     fn an_attempt_that_succeeds_after_the_deadline_is_not_returned_and_lets_go() {
@@ -507,35 +596,49 @@ mod tests {
         let rt = one_blocking_thread();
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("worktree.lock");
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let entered_tx = Arc::new(Mutex::new(entered_tx));
         let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
         let gate_rx = Arc::new(Mutex::new(gate_rx));
         let took_it = Arc::new(AtomicBool::new(false));
         let attempt = {
             let took_it = Arc::clone(&took_it);
             move |path: &Path| {
+                let _ = entered_tx.lock().unwrap().send(());
                 let _ = gate_rx.lock().unwrap().recv();
                 let taken = unix::try_acquire_spawn_lock(path)?;
                 took_it.store(taken.is_some(), Ordering::SeqCst);
                 Ok(taken)
             }
         };
-        let began = std::time::Instant::now();
-        let wait = rt.block_on(async {
-            tokio::time::timeout(
-                Duration::from_secs(2),
-                acquire_within_using(&path, Duration::from_millis(50), attempt),
-            )
-            .await
-        });
-        let took = began.elapsed();
+        let (expire, deadline) = TestDeadline::new();
+        let wait_path = path.clone();
+        let wait =
+            rt.spawn(async move { acquire_within_using(&wait_path, deadline, attempt).await });
+        // The deadline runs out only once the attempt is inside it, however
+        // long the blocking thread took to start it.
+        let entered = entered_rx.recv_timeout(Duration::from_secs(30));
+        expire.send_replace(true);
+        // The attempt is still held at the gate, so the wait has to answer
+        // without it. The watchdog is generous: it only bounds a wait that
+        // never answers.
+        let answer =
+            rt.block_on(async { tokio::time::timeout(Duration::from_secs(30), wait).await });
+        // Let go before asserting, so a failure cannot leave the runtime's
+        // only blocking thread waiting at shutdown.
         drop(gate_tx);
-        rt.shutdown_timeout(Duration::from_secs(10));
+        rt.shutdown_timeout(Duration::from_secs(30));
+        assert!(entered.is_ok(), "the attempt never started");
+        let answer = match answer {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(join)) => panic!("the wait failed: {join}"),
+            Err(_) => panic!("the wait did not answer while its attempt was held"),
+        };
         assert!(
-            matches!(wait, Ok(Err(LockWaitError::Busy))),
-            "answered {:?} after {took:?}",
-            wait.as_ref().map(|r| r.as_ref().map(|_| "the lock"))
+            matches!(answer, Err(LockWaitError::Busy)),
+            "answered {:?}",
+            answer.as_ref().map(|_| "the lock")
         );
-        assert!(took < Duration::from_secs(1), "answered after {took:?}");
         assert!(
             took_it.load(Ordering::SeqCst),
             "the attempt took the lock, late"
@@ -546,7 +649,8 @@ mod tests {
     /// Auditor N8: polling promises no turn. Every attempt here meets a
     /// DIFFERENT holder, the previous one having let go in between, and the
     /// wait still runs out; its error says it could not get the lock in time,
-    /// not that one holder kept it for the whole wait.
+    /// not that one holder kept it for the whole wait. The test runs the wait
+    /// out only after the second holder has taken its turn (auditor N10).
     #[cfg(unix)]
     #[test]
     fn holders_that_take_turns_can_outlast_a_wait_which_says_only_that_it_ran_out() {
@@ -555,6 +659,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("worktree.lock");
         let holders: Arc<Mutex<(Option<std::fs::File>, usize)>> = Arc::new(Mutex::new((None, 0)));
+        let (turn_tx, turn_rx) = std::sync::mpsc::channel::<usize>();
+        let turn_tx = Arc::new(Mutex::new(turn_tx));
         let attempt = {
             let holders = Arc::clone(&holders);
             move |path: &Path| {
@@ -571,26 +677,41 @@ mod tests {
                 next.lock()?;
                 turn.0 = Some(next);
                 turn.1 += 1;
-                unix::try_acquire_spawn_lock(path)
+                let taken = unix::try_acquire_spawn_lock(path);
+                let _ = turn_tx.lock().unwrap().send(turn.1);
+                taken
             }
         };
-        let wait = rt.block_on(async {
-            tokio::time::timeout(
-                Duration::from_secs(5),
-                acquire_within_using(&path, Duration::from_millis(100), attempt),
-            )
-            .await
-        });
+        let (expire, deadline) = TestDeadline::new();
+        let wait_path = path.clone();
+        let wait =
+            rt.spawn(async move { acquire_within_using(&wait_path, deadline, attempt).await });
+        // Two attempts have met two holders before the deadline runs out,
+        // however long the scheduler took to run them.
+        let second_turn = loop {
+            match turn_rx.recv_timeout(Duration::from_secs(30)) {
+                Ok(turn) if turn >= 2 => break true,
+                Ok(_) => {}
+                Err(_) => break false,
+            }
+        };
+        expire.send_replace(true);
+        let answer =
+            rt.block_on(async { tokio::time::timeout(Duration::from_secs(30), wait).await });
+        // An attempt already running when the deadline ran out finishes
+        // first, so the holder it leaves is the one let go of here.
+        rt.shutdown_timeout(Duration::from_secs(30));
         let (last, turns) = {
             let mut turn = holders.lock().unwrap();
             (turn.0.take(), turn.1)
         };
         drop(last);
-        rt.shutdown_timeout(Duration::from_secs(10));
-        let error = match wait {
-            Ok(Err(error)) => error,
-            Ok(Ok(_)) => panic!("took a lock that every attempt found held"),
-            Err(_) => panic!("the wait outlived its budget"),
+        assert!(second_turn, "{turns} holder(s): no turnover was exercised");
+        let error = match answer {
+            Ok(Ok(Err(error))) => error,
+            Ok(Ok(Ok(_))) => panic!("took a lock that every attempt found held"),
+            Ok(Err(join)) => panic!("the wait failed: {join}"),
+            Err(_) => panic!("the wait did not answer once it had run out"),
         };
         assert!(matches!(error, LockWaitError::Busy), "{error:?}");
         assert!(turns >= 2, "{turns} holder(s): no turnover was exercised");
