@@ -592,6 +592,71 @@ fn held_for(codex: &Installed, id: &str, name: &str, draft: &str, since: usize, 
 }
 
 // ---------------------------------------------------------------------------
+// inbox/probe/104
+// ---------------------------------------------------------------------------
+
+/// Scenario: In real interactive Codex in an installed 40 × 140 pane of a deck with only the TUI attached, so nothing answers Codex's cursor position queries, type a draft into the box and delete it, wait for the pane to go quiet, resize the pane three times 200 ms apart, toggling its width by one column, and queue a sentinel task 200 ms later. The deck's check is written within 15 seconds of the post, where before the fix one refused check waited the 30 s backoff (about 36 s), and the task is acted on and acknowledged after exactly one hand-over (#2129, CX-5h).
+#[spec("inbox/probe/104")]
+#[test]
+fn probe_104_live_a_touched_box_after_a_resize_burst_is_checked_within_seconds() {
+    skip_unless!(codex_installed::checkable());
+    // Measured on this branch: 5.9 to 6.2 s (three trials), against 36.1 s
+    // before it and 3.1 to 3.3 s with no resize. Inside the doorbell's
+    // first re-ring with room for a loaded machine, and well short of the
+    // 30 s backoff step a counted failure waits.
+    const BOUND: Duration = Duration::from_secs(15);
+    let codex = Installed::new(&[]);
+    codex.assert_installed();
+    codex.wait_armable();
+    let mut person = codex.input();
+    let draft = "p104-draft";
+    person.write(draft);
+    codex.expect_composer(draft);
+    person.write(&"\x7f".repeat(draft.len()));
+    codex.expect_composer("");
+    std::thread::sleep(Duration::from_secs(3));
+    let mut cols = 140;
+    for _ in 0..3 {
+        cols = if cols == 140 { 139 } else { 140 };
+        let reply = inbox::attach(
+            &codex.deck,
+            json!({"op": "resize", "id": codex.pane.agent, "rows": 40, "cols": cols}),
+        );
+        assert_eq!(reply["ok"], true, "resize: {reply}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let since = codex.log().len();
+    let name = "p104-burst-1041.txt";
+    let posted = Instant::now();
+    let id = codex.post(name);
+    let written = |log: &str| {
+        log.lines()
+            .any(|l| l.contains("doorbell tick probe") && l.contains("outcome=Written"))
+    };
+    assert!(
+        common::wait_until(BUDGET, || written(&codex.log()[since..])),
+        "the touched box must be checked after the burst; {}",
+        codex.evidence()
+    );
+    let after = posted.elapsed();
+    let log = codex.log()[since..].to_string();
+    assert!(
+        after <= BOUND,
+        "the check came {after:?} after the post, past {BOUND:?}; refusals:\n{}\n{}",
+        log.lines()
+            .filter(|l| l.contains("probe refused") || l.contains("doorbell tick probe"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        codex.evidence()
+    );
+    codex.done(&id, name);
+    eprintln!(
+        "104: checked {after:?} after the post, one delivery: {}",
+        codex.message(&id)
+    );
+}
+
+// ---------------------------------------------------------------------------
 // inbox/probe/103
 // ---------------------------------------------------------------------------
 
