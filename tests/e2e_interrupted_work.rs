@@ -68,8 +68,8 @@ mod route;
 use dot_agent_deck::interrupted_work::{
     DISMISSED, INTERRUPTED_WORK_TITLE, KEPT_UNTIL, LABEL_PROGRESS, NOTHING_INTERRUPTED,
     OTHER_AGENTS_GROUP, RECLAIM_EXPLANATION, RECLAIM_KEPT_DIRTY, RECLAIM_KEPT_HOLDS_WORKTREES,
-    RECLAIM_REMOVED, RECLAIM_WOULD_REMOVE, REFUSED_AGENT_CALLER, REPORT_NOT_OF_ITEM,
-    interrupted_footer,
+    RECLAIM_REMOVED, RECLAIM_WOULD_REMOVE, REFUSED_AGENT_CALLER, REFUSED_NOT_OWNED,
+    REPORT_NOT_OF_ITEM, interrupted_footer,
 };
 use inbox::Pane;
 use serde_json::{Value, json};
@@ -639,6 +639,97 @@ fn interrupted_004_reclaim_keeps_a_dirty_worktree_and_one_holding_another() {
         listed(&decks.list(), &holder_id),
         "a kept item stays listed"
     );
+}
+
+/// Scenario: A stand-in pane dispatches a `--single` unit with `--dir` into
+/// a clean linked worktree the user made with `git worktree add`, and the
+/// daemon restarts. The unit is listed with that directory as its worktree;
+/// `interrupted reclaim` on it refuses because the deck did not create the
+/// worktree, and the directory, its file and its branch are all kept.
+#[spec("journal/interrupted/036")]
+#[test]
+fn interrupted_036_reclaim_keeps_a_directory_a_dir_dispatch_started_in() {
+    const UNIT: &str = "interrupted-dir";
+    let mut decks = Decks::start();
+    let target = decks.repo.parent().unwrap().join("users-own-worktree-1790");
+    let added = common::fixture_git(&decks.repo, &decks.repo)
+        .args(["worktree", "add", "-q", "-b", "feat/users-own-1790"])
+        .arg(&target)
+        .output()
+        .expect("git available");
+    assert!(added.status.success(), "`git worktree add`: {added:?}");
+    let target = std::fs::canonicalize(&target).unwrap();
+    let kept_file = target.join("README.md");
+    assert!(kept_file.is_file(), "premise: the worktree has the fixture");
+
+    let caller = decks.pane("interrupted-dir-caller");
+    inbox::status(&decks.live, &caller, "session_start", "codex");
+    inbox::status(&decks.live, &caller, "thinking", "codex");
+    route::cli(
+        &decks.live,
+        &caller,
+        &decks.repo,
+        &[
+            "dispatch",
+            UNIT,
+            "--dir",
+            &target.to_string_lossy(),
+            "--task",
+            "INTERRUPTED-WORK-TASK",
+            "--single",
+        ],
+    );
+    let found = std::cell::RefCell::new(None);
+    let budget = common::load_scaled(Duration::from_secs(20));
+    assert!(
+        common::wait_until(budget, || {
+            *found.borrow_mut() = common::agent_records_on(&decks.live.attach_socket)
+                .into_iter()
+                .find(|r| {
+                    r.id != caller.agent
+                        && r.cwd
+                            .as_deref()
+                            .is_some_and(|c| std::fs::canonicalize(c).is_ok_and(|c| c == target))
+                })
+                .map(|r| r.id);
+            found.borrow().is_some()
+        }),
+        "the --dir dispatch never spawned within {budget:?}: {:?}",
+        common::agent_records_on(&decks.live.attach_socket)
+    );
+    let unit = route::observe(&decks.live, &found.into_inner().unwrap());
+    decks.journaled(&[&caller, &unit]);
+    decks.restart();
+    drop((caller, unit));
+    assert!(
+        !dot_agent_deck::worktree_owner::is_marked(&target),
+        "premise: a --dir dispatch marks nothing as the deck's"
+    );
+    assert_eq!(porcelain(&target), "", "premise: the worktree is clean");
+
+    let list = decks.list();
+    let item = items(&list)
+        .iter()
+        .find(|i| i["branch"] == "feat/users-own-1790")
+        .unwrap_or_else(|| panic!("the --dir unit is listed by its branch: {list}"));
+    assert!(
+        names_worktree(item, &target),
+        "the item names the --dir directory: {item}"
+    );
+    let id = id_of(item);
+
+    let out = decks.person(&["interrupted", "reclaim", &id]);
+    assert_exit("reclaim of a --dir unit's directory", &out, 1);
+    assert!(text(&out).contains(REFUSED_NOT_OWNED), "{}", text(&out));
+    assert!(
+        kept_file.is_file(),
+        "the directory a --dir dispatch started in is kept"
+    );
+    assert!(
+        branch_listed(&decks.repo, "feat/users-own-1790"),
+        "its branch is kept"
+    );
+    assert!(listed(&decks.list(), &id), "a refused item stays listed");
 }
 
 /// Scenario: A dispatched unit sends its report to its dispatcher, which

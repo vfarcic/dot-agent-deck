@@ -1535,6 +1535,8 @@ This section is what you need in order to **add a voice command without reading 
 
 **Why voice is in the desktop app and not the TUI.** It needs a microphone, OS integration and a persistent local process — awkward through `ssh -t`, natural in a native app. Together with the fleet view it is what gives this app a job the TUI structurally cannot do.
 
+**One utterance may also be a chain of up to three commands** (PRD #1184): the answer can carry ordered `steps`, `voice/chain.rs` applies the rules that need no model, `outcome.rs` checks each step on its own words at the screen the steps before it leave (`chain_outcome`), and the panel runs them one by one (`runChain` in `VoiceControlPanel.tsx`). A new row needs nothing for chains unless it should be allowed before another step, which is `chain::position`'s closed list. The design and its measurements are in [`voice-first-design.md` §11](voice-first-design.md#11-chains-several-commands-from-one-utterance-prd-1184).
+
 ### The pipeline, end to end
 
 Six stages. The fifth is the one that keeps voice from becoming a second control surface.

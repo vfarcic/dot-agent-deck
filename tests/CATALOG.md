@@ -856,6 +856,13 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 - **Does not assert:** the desktop restart toast (`desktop/src/components/InterruptedWork.test.tsx`, "offers Show for an incomplete empty list").
 - **Platform coverage:** mac+linux.
 
+##### journal/interrupted/036 — `interrupted reclaim` keeps the directory a `dispatch --dir` unit was started in.
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_interrupted_work.rs`); the real `dot-agent-deck interrupted` CLI run as a person (no pane identity, no terminal on stdin); a restart is SIGTERM to the daemon's own pid and a second `daemon serve` on the same state directory.
+- **Agent:** synthetic routing stand-ins: a dispatcher pane and the `--single` unit it dispatches with the real `dot-agent-deck dispatch --dir` CLI into a linked worktree the test made with `git worktree add`.
+- **Asserts:** premises: the directory carries no deck ownership marker after the dispatch and reads clean; the item listed for the unit names the directory and its checked-out branch; `reclaim <id>` exits 1, says `Refused: the deck did not create this worktree.`, keeps the directory, its file and its branch, and leaves the item listed (PRD #468 merged into PR #2431).
+- **Does not assert:** a `--dir` into a worktree an earlier dispatch created, whose marker names that earlier launch (reclaim refuses it as another launch's, `interrupted_work_daemon_tests`); an orchestration-shaped `--dir` unit.
+- **Platform coverage:** mac+linux.
+
 #### journal/compat
 
 ##### journal/compat/001 — Lines of a newer schema or an unknown kind are skipped and kept.
@@ -6928,6 +6935,29 @@ without depending on the config struct API.
 - **Agent:** Claude Code on Haiku, twice: the dispatcher and the unit. Each is started through its own launcher script that records `<which>|<cwd>|<CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION>` and execs `claude`; the unit's launcher name reveals no agent, so `--agent claude` is what gives it Claude Code's prompt-delivery path. Imported credentials and per-folder trust seeded for the unit's worktree.
 - **Asserts:** the dispatcher becomes ready with its seed acknowledged; after it is told to run the dispatch, the unit writes the uniquely named sentinel in its own worktree, which only a real agent that received its task can do; the launch log shows the unit's launcher, and not the dispatcher's, starting in that worktree; the unit's Claude started with `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false` and the dispatcher's with the variable unset (issue #2094); the unit's record is Claude Code.
 - **Does not assert:** a unit on a different agent from its dispatcher (that is `dispatch/single/002`, with stand-ins, because the harness runs only Claude Code headless); the dispatcher choosing the flags from a request in plain words (the directive gives it the command line); the completion report back to the dispatcher (`dispatch/return/006`).
+- **Platform coverage:** mac+linux, on a developer's machine only (lane 2 runs nowhere in CI).
+
+#### dispatch/dir
+
+##### dispatch/dir/001 — A unit dispatched with `--dir` into an existing worktree runs there, and closing it leaves the directory, its untracked files and its branch in place (PRD #468).
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_close_verb.rs`, the `CloseDeck` harness on the `minimal` fixture): the REAL `dot-agent-deck dispatch --dir <path> --single` and `close <name>` CLIs, each with the caller's own minted identity.
+- **Agent:** none. The identity-recording Python probes of `dispatch/close-verb/*`, which announce themselves as Claude Code and then `exec cat`.
+- **Asserts:** the dispatch succeeds into a `git worktree add` directory outside the deck's checkout, on its own branch, holding an untracked brief; the unit's record is rooted there and its card appears on the deck; the reply in the caller's inbox names the directory, its branch and that it is an existing directory; no `-dispatch-` sibling is created; after the unit reports, `close <name>` succeeds and says the directory was left in place, without pointing at `worktree reclaim`; the directory, the brief and the checked-out branch are all still there.
+- **Does not assert:** the interlock (`dispatch/dir/002`); an orchestration in an existing directory (`dispatch/dir/002`, and `dispatch::tests::e2e_only::a_dir_orchestration_starts_in_the_existing_directory_and_owns_nothing`); a `--dir` target that an earlier default dispatch created and still records, which follows that dispatch's own removal; the TUI's Ctrl+W close, which reads the same worktree registry `close` does.
+- **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]`).
+
+##### dispatch/dir/002 — A dispatcher continues in place with `dispatch --dir . --orchestration`, and a second unit into that directory is refused while the team runs (PRD #468).
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_close_verb.rs`, the `CloseDeck` harness): the REAL `dispatch --dir .` CLI run from the deck's own checkout as the caller.
+- **Agent:** none. The same identity-recording probes, as both roles of the fixture's `close-team`.
+- **Asserts:** with an untracked brief written into the caller's `.dot-agent-deck/`, the team's two roles come up rooted in the caller's own directory as roles of `close-team`, and a tab strip appears on the deck; the orchestrator context published there carries the task naming the brief; the brief is still in place, no `-dispatch-` sibling exists and the checked-out branch is unchanged. Then a second `dispatch --dir .` from the same caller is admitted by the CLI and refused by the daemon with a reply naming the directory, and starts nothing: the deck still holds exactly the caller and the two roles.
+- **Does not assert:** the interlock's other cases (a caller that is itself a role, a record spelled through a symlink: `dispatch::tests::the_interlock_*`); a real agent deciding to dispatch (`dispatch/dir/003`); delegation inside the continued team (`orchestration/dispatch/001`).
+- **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]`).
+
+##### dispatch/dir/003 — A real agent writes a brief and hands its work to a team in its own directory with `dispatch --dir .` (PRD #468).
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_dispatch_dir_live.rs`, `#![cfg(all(feature = "e2e", feature = "e2e-live", unix))]`): a real interactive agent opened as a plain pane through the new-pane form, which runs the real `dispatch` CLI itself.
+- **Agent:** Claude Code on Haiku as the agent that hands over, with imported credentials and per-folder trust; the team it starts is two `cat` roles.
+- **Asserts:** after the agent is told to write a uniquely named brief into `.dot-agent-deck/` and run `dispatch <name> --dir . --orchestration=<team> --task-file <brief>`, both roles come up rooted in the agent's own directory; the brief holds its marker where the agent wrote it; the orchestrator context published in that directory carries the brief's text; a tab strip appears; no `-dispatch-` sibling exists; and the agent is still running beside its team.
+- **Does not assert:** the agent deciding on its own that the work needs a team (the directive tells it to dispatch; escalating is the user's decision, PRD #468's scope); the team doing any work (its roles are stand-ins); the interlock (`dispatch/dir/002`).
 - **Platform coverage:** mac+linux, on a developer's machine only (lane 2 runs nowhere in CI).
 
 #### orchestration/roles

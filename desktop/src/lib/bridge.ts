@@ -1230,6 +1230,14 @@ function withDeckIdentityKeys(result: VoiceResultDto): VoiceResultDto {
   if (result.outcome.kind === "param_ambiguous" && result.outcome.candidates) {
     return { ...result, outcome: { ...result.outcome, candidates: result.outcome.candidates.map(keyed) } };
   }
+  /* PRD #1184 — and so does a chain's switch step. */
+  if (result.outcome.kind === "chain") {
+    return { ...result, outcome: { ...result.outcome, steps: result.outcome.steps.map((step) => ({
+      ...step,
+      params: step.params.map(keyed),
+      ...(step.choice ? { choice: { ...step.choice, candidates: step.choice.candidates?.map(keyed) } } : {}),
+    })) } };
+  }
   if (result.outcome.kind !== "dispatch") return result;
   return { ...result, outcome: { ...result.outcome, params: result.outcome.params.map(keyed) } };
 }
@@ -1271,7 +1279,32 @@ export type VoiceOutcomeDto =
   | { kind: "transcription_failed"; detail: string; sentence: string }
   /** PRD #1497 D8 — heard while the app was speaking and not a way of
       silencing it: nothing ran and nothing was sent anywhere. */
-  | { kind: "dropped"; transcript: string; sentence: string };
+  | { kind: "dropped"; transcript: string; sentence: string }
+  /** PRD #1184 — an utterance answered as two or three steps that the app
+      would not run: a chain rule refused it, or one of its steps could not
+      run on the screen the earlier steps would leave. Nothing ran. */
+  | { kind: "chain_refused"; transcript: string; sentence: string }
+  /** PRD #1184 — two or three steps that passed every check, run in order by
+      the panel (`runChain`). `sentence` reports them all; a step that cannot
+      run when its turn comes stops the chain, and the panel says which. */
+  | { kind: "chain"; transcript: string; steps: VoiceChainStepDto[]; sentence: string };
+
+/**
+ * PRD #1184 — one step of a `chain` outcome: a dispatch, the user's words for
+ * it (`said`, quoted when it stops the chain) and the screen it was judged on,
+ * which the panel holds the screen to before running any step after the first.
+ */
+export interface VoiceChainStepDto {
+  said: string;
+  action: string;
+  invoke: string;
+  params: VoiceResolvedParamDto[];
+  sentence: string;
+  screen: VoiceScreen;
+  /** A step that matched several things: the numbered choice the chain
+      pauses on when this step's turn comes. At most one step carries one. */
+  choice?: Extract<VoiceOutcomeDto, { kind: "param_ambiguous" }>;
+}
 
 /**
  * One utterance's outcome, plus what it cost (`voice::VoiceResult`).
