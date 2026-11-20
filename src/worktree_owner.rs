@@ -1449,6 +1449,137 @@ mod tests {
         );
     }
 
+    /// A linked worktree and the three answers `verify_geometry` checks for
+    /// it, with its administrative `gitdir` back-pointer's path and bytes.
+    #[cfg(unix)]
+    struct BackPointerFixture {
+        _scratch: tempfile::TempDir,
+        root: PathBuf,
+        toplevel: PathBuf,
+        git_dir: PathBuf,
+        common: PathBuf,
+        gitdir: PathBuf,
+        pointer: Vec<u8>,
+    }
+
+    #[cfg(unix)]
+    impl BackPointerFixture {
+        fn new() -> Self {
+            let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
+            let root = std::fs::canonicalize(scratch.path()).expect("canonical scratch");
+            let repo = root.join("repo");
+            checkout_with_a_commit(&repo, &root);
+            let linked = root.join("linked");
+            git_in(
+                &repo,
+                &root,
+                &[
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    "-b",
+                    "feature",
+                    &linked.to_string_lossy(),
+                ],
+            );
+            let toplevel = rev_parse_path(&linked, "--show-toplevel").expect("toplevel");
+            let git_dir = rev_parse_path(&linked, "--git-dir").expect("git dir");
+            let common = rev_parse_path(&linked, "--git-common-dir").expect("common dir");
+            let gitdir = std::fs::canonicalize(&git_dir).unwrap().join("gitdir");
+            let pointer = std::fs::read(&gitdir).expect("read the back-pointer");
+            let fixture = BackPointerFixture {
+                _scratch: scratch,
+                root,
+                toplevel,
+                git_dir,
+                common,
+                gitdir,
+                pointer,
+            };
+            assert!(
+                fixture.verify().is_some(),
+                "control: the real worktree is accepted"
+            );
+            fixture
+        }
+
+        fn verify(&self) -> Option<VerifiedGeometry> {
+            verify_geometry(&self.toplevel, &self.git_dir, &self.common)
+        }
+
+        /// Remove the back-pointer, whatever it is now.
+        fn clear(&self) {
+            let meta = std::fs::symlink_metadata(&self.gitdir).unwrap();
+            if meta.is_dir() {
+                std::fs::remove_dir(&self.gitdir).unwrap();
+            } else {
+                std::fs::remove_file(&self.gitdir).unwrap();
+            }
+        }
+
+        /// Put the real back-pointer back, and check it is accepted again.
+        fn restore(&self) {
+            self.clear();
+            std::fs::write(&self.gitdir, &self.pointer).unwrap();
+            assert!(
+                self.verify().is_some(),
+                "the real back-pointer is accepted again"
+            );
+        }
+    }
+
+    /// Auditor N4: the `gitdir` back-pointer is opened without following a
+    /// symlink, so a symlink to a file that holds the right pointer is
+    /// refused.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_back_pointer_is_not_followed() {
+        let f = BackPointerFixture::new();
+        let copy = f.root.join("pointer-copy");
+        std::fs::write(&copy, &f.pointer).unwrap();
+        f.clear();
+        std::os::unix::fs::symlink(&copy, &f.gitdir).unwrap();
+        assert_eq!(f.verify(), None, "a symlinked back-pointer is not followed");
+        f.restore();
+    }
+
+    /// Auditor N4: a back-pointer that is not a regular file is refused: a
+    /// FIFO without blocking on it, and a directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_or_directory_back_pointer_is_refused_without_blocking() {
+        let f = BackPointerFixture::new();
+        f.clear();
+        let c_path = std::ffi::CString::new(f.gitdir.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path and mode.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let started = std::time::Instant::now();
+        assert_eq!(f.verify(), None, "a FIFO is not a back-pointer");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "refused without blocking on the FIFO"
+        );
+        f.clear();
+        std::fs::create_dir(&f.gitdir).unwrap();
+        assert_eq!(f.verify(), None, "a directory is not a back-pointer");
+        f.restore();
+    }
+
+    /// Auditor N4: the back-pointer is read only up to a small bound. The
+    /// right pointer padded with `/.` (which still resolves to the same
+    /// place) past that bound is refused rather than read whole.
+    #[cfg(unix)]
+    #[test]
+    fn a_back_pointer_past_its_bound_is_refused() {
+        let f = BackPointerFixture::new();
+        let mut padded = b"/.".repeat(8 * 1024);
+        padded.extend_from_slice(&f.pointer);
+        f.clear();
+        std::fs::write(&f.gitdir, &padded).unwrap();
+        assert_eq!(f.verify(), None, "a back-pointer past the bound is refused");
+        f.restore();
+    }
+
     /// A cwd that no longer exists resolves to nothing rather than to
     /// whatever the resolving process's own cwd happens to be — the daemon
     /// runs in a checkout of this repo often enough that "falls back to mine"
