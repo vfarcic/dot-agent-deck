@@ -1051,10 +1051,24 @@ async fn git_facts(
         return GitFacts::default();
     };
     let path = PathBuf::from(worktree);
-    let worktree_exists = match tokio::fs::metadata(&path).await {
-        Ok(meta) => Some(meta.is_dir()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(false),
-        Err(_) => None,
+    let lookup = async {
+        #[cfg(test)]
+        if let Some(stall) = seams::metadata_stall(&path) {
+            tokio::time::sleep(stall).await;
+        }
+        tokio::fs::metadata(&path).await
+    };
+    // Bounded like the probes (PR #2431 review): a lookup on a stalled mount
+    // answers "not known" at the deadline instead of holding the list. The
+    // blocking-pool thread it runs on is not interrupted, only waited for no
+    // longer.
+    let worktree_exists = match deadline.remaining() {
+        Some(left) => match tokio::time::timeout(left, lookup).await {
+            Ok(Ok(meta)) => Some(meta.is_dir()),
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => Some(false),
+            Ok(Err(_)) | Err(_) => None,
+        },
+        None => None,
     };
     let mut facts = GitFacts {
         worktree_exists,
@@ -1180,6 +1194,26 @@ mod seams {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(worktree.to_path_buf(), Box::new(hook));
+    }
+
+    static METADATA_STALL: LazyLock<Mutex<HashMap<PathBuf, std::time::Duration>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    /// PR #2431 review (Qodo): make the list's look at whether `worktree`
+    /// exists take `stall` first, as a lookup on a stalled mount would.
+    pub(super) fn arm_metadata_stall(worktree: &Path, stall: std::time::Duration) {
+        METADATA_STALL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(worktree.to_path_buf(), stall);
+    }
+
+    pub(super) fn metadata_stall(worktree: &Path) -> Option<std::time::Duration> {
+        METADATA_STALL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(worktree)
+            .copied()
     }
 
     static KEEP_CHECK: LazyLock<Mutex<HashMap<PathBuf, (PathBuf, std::time::Duration)>>> =

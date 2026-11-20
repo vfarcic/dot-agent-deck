@@ -1989,3 +1989,34 @@ fn reclaim_kills_and_reaps_a_stalled_keep_check_and_keeps_the_tree() {
         seams::disarm_keep_check(&wt);
     });
 }
+
+/// PR #2431 review (Qodo): the look at whether an item's worktree exists is
+/// bounded by the item's Git deadline. A lookup that stalls, as one on a hung
+/// mount would, answers the facts as unknown once the deadline passes rather
+/// than holding the list.
+#[test]
+fn git_facts_answer_unknown_when_the_worktree_lookup_stalls() {
+    rt().block_on(async {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let stalled = std::fs::canonicalize(tmp.path())
+            .unwrap()
+            .join("on-a-hung-mount");
+        seams::arm_metadata_stall(&stalled, Duration::from_secs(60));
+        let deadline = Deadline::after(Duration::from_millis(200));
+        let facts = tokio::time::timeout(
+            Duration::from_secs(10),
+            git_facts(
+                ItemKind::Unit,
+                Some(stalled.to_string_lossy().into_owned()),
+                Some("agent/dispatch-x".into()),
+                OsStr::new("gh"),
+                deadline,
+                deadline,
+            ),
+        )
+        .await
+        .expect("the facts answer by their deadline, not after the stalled lookup");
+        assert_eq!(facts, GitFacts::default(), "unknown: {facts:?}");
+        assert_eq!(facts.worktree_exists, None);
+    });
+}
