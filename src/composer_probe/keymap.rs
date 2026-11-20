@@ -152,6 +152,13 @@ pub enum Hold {
     /// of those can't be resolved ([`codex_home_checkable`]): Codex would
     /// write the box's file somewhere the deck doesn't read.
     CodexHome,
+    /// Codex's status line, on the frame the check would be admitted on,
+    /// doesn't show the directory its session works in in a shape the deck
+    /// reads ([`codex_session_cwd`], issue #2130): no status line, one
+    /// without the current directory or with it truncated, a `~` with no
+    /// `HOME` to resolve it, or a spawn directory the deck can't spell as
+    /// Codex does. Decided again by each check.
+    Footer,
 }
 
 /// Reads `path`, following a symlink: absent, its identity and contents, or
@@ -1281,6 +1288,122 @@ pub fn codex_keymap(
     codex_bindings(&merged)
 }
 
+/// The separator Codex puts between its status line's items (measured on
+/// 0.164.0: `nollm-model default · /var/tmp/…/work`).
+pub const CODEX_STATUS_SEPARATOR: &str = " · ";
+
+/// How Codex 0.164.0 spells `cwd` in its status line: `~` for `home`
+/// itself, `~/<rest>` below it, else the path as it is
+/// (`format_directory_display` with no width and `relativize_to_home`, in
+/// `codex-rs/tui` at `rust-v0.164.0`, `6aaac69`: a component-wise prefix of
+/// `home` as the environment names it, not canonicalised). With no `home`
+/// the absolute path, which is what Codex shows unless the passwd entry's
+/// home holds `cwd` ([`codex_session_cwd`] holds a `~` then). `None` for a
+/// path that isn't UTF-8, or that holds the separator.
+pub fn codex_cwd_display(cwd: &Path, home: Option<&Path>) -> Option<String> {
+    let shown = match home.and_then(|home| cwd.strip_prefix(home).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Some(rest) => format!("~/{}", rest.to_str()?),
+        None => cwd.to_str()?.to_string(),
+    };
+    (!shown.contains(CODEX_STATUS_SEPARATOR)).then_some(shown)
+}
+
+/// The most entries [`codex_separator_siblings`] reads from one directory;
+/// a larger one counts as holding such a sibling.
+pub const SIBLING_SCAN_ENTRIES: usize = 65_536;
+
+/// Whether the directory holding `cwd` has an entry whose name is `cwd`'s
+/// own name followed by [`CODEX_STATUS_SEPARATOR`] and is a directory, or a
+/// symlink to one (the Greptile review's P1 on issue #2130): a directory
+/// Codex could be moved into whose status line reads as `cwd` and a thread
+/// name. An entry whose type can't be read counts. For `/` itself, an entry of `/`
+/// whose name starts with the separator. A directory that can't be read,
+/// or holds more than [`SIBLING_SCAN_ENTRIES`] entries, counts as holding
+/// one, which can only hold more checks. File I/O, unbounded in time like
+/// [`read_source`]: call it with no lock held.
+pub fn codex_separator_siblings(cwd: &Path) -> bool {
+    let (dir, name) = match (cwd.parent(), cwd.file_name()) {
+        (Some(parent), Some(name)) => (parent, name.to_string_lossy()),
+        _ => (cwd, "".into()),
+    };
+    let prefix = format!("{name}{CODEX_STATUS_SEPARATOR}");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return true;
+    };
+    let mut seen = 0usize;
+    for entry in entries {
+        seen += 1;
+        if seen > SIBLING_SCAN_ENTRIES {
+            return true;
+        }
+        match entry {
+            // Only a directory, a symlink to one included, is somewhere
+            // Codex could be moved into; one whose type can't be read
+            // counts (Qodo's review on #2407).
+            Ok(entry) if entry.file_name().to_string_lossy().starts_with(&prefix) => {
+                match std::fs::metadata(entry.path()) {
+                    Ok(meta) if !meta.is_dir() => {}
+                    _ => return true,
+                }
+            }
+            Ok(_) => {}
+            Err(_) => return true,
+        }
+    }
+    false
+}
+
+/// Whether Codex's status line `status_line` shows the directory `cwd` the
+/// bound Codex started in, `home` its `HOME` (issue #2130). Codex's default
+/// status line is `<model> <reasoning> · <directory>`, then ` · <thread
+/// name>` once the thread has one; a configured one can hold other items
+/// in another order. The items are split at the separator, and exactly one
+/// of them may read as a directory (`/…`, `~` or `~/…`):
+/// - it is `cwd` as Codex spells it ([`codex_cwd_display`]): `Ok`, unless
+///   more items follow it and `separator_siblings` says a directory beside
+///   `cwd` is named like `cwd`'s own name, the separator and more
+///   ([`codex_separator_siblings`]): Codex in `/srv/proj · copy` draws
+///   `<model> · /srv/proj · copy`, which splits as `/srv/proj` and a
+///   thread name (the Greptile review's P1), so that is [`Hold::Footer`];
+/// - it is another directory, whole: [`Hold::Changed`], which the caller
+///   latches ([`CodexReads::session`]);
+/// - anything else is [`Hold::Footer`]: no status line, none or two items
+///   that read as a directory, one cut short with `…` (Codex truncates the
+///   line at the pane's width), a `~` with no `home` to resolve it (Codex
+///   then uses the passwd entry's), or a `cwd` it can't spell.
+///
+/// The status line is Codex's own drawing, and a configured one can show a
+/// thread name that reads as a directory; this reads what Codex shows, it
+/// doesn't authenticate it.
+pub fn codex_session_cwd(
+    status_line: Option<&str>,
+    cwd: &Path,
+    home: Option<&Path>,
+    separator_siblings: bool,
+) -> Result<(), Hold> {
+    let line = status_line.ok_or(Hold::Footer)?;
+    let expected = codex_cwd_display(cwd, home).ok_or(Hold::Footer)?;
+    let items: Vec<&str> = line.split(CODEX_STATUS_SEPARATOR).collect();
+    let mut directories = items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| item.starts_with('/') || **item == "~" || item.starts_with("~/"));
+    let (Some((at, &shown)), None) = (directories.next(), directories.next()) else {
+        return Err(Hold::Footer);
+    };
+    if shown == expected {
+        if at + 1 < items.len() && separator_siblings {
+            return Err(Hold::Footer);
+        }
+        Ok(())
+    } else if shown.ends_with('…') || (home.is_none() && shown.starts_with('~')) {
+        Err(Hold::Footer)
+    } else {
+        Err(Hold::Changed)
+    }
+}
+
 /// Whether `after` is the same launch's sources as `before` (CX-10b), else
 /// [`Hold::Changed`]. Every source compares by its whole read (identity
 /// and bytes, [`read_source`]), except that `$CODEX_HOME/config.toml` may
@@ -1680,10 +1803,35 @@ impl CodexSources {
 /// bookkeeping write landed over it, and the undone file, whose bookkeeping
 /// then differs from the last accepted read, would be accepted while Codex
 /// still ran the edit's binding.
+///
+/// **The session's directory (issue #2130).** Codex's `/cd` and `/worktree`
+/// move the directory its session works in without a `chdir` (measured on
+/// 0.164.0: `/proc/<pid>/cwd` stays at the spawn directory), and Codex then
+/// loads the new directory's project files and rebuilds its keymap from
+/// them, which no read of the spawn's sources sees. So each admission also
+/// compares the directory Codex's status line shows on the frame the check
+/// is admitted on with the bound agent's own directory
+/// ([`CodexReads::session`], [`codex_session_cwd`]): a status line naming
+/// another directory latches [`Hold::Changed`] like a changed source, and
+/// one the deck can't read holds that check ([`Hold::Footer`]).
 #[derive(Debug)]
 pub struct CodexReads {
     sources: CodexSources,
+    /// The bound Codex's own working directory and the `HOME` its
+    /// environment names, which Codex's status line spells the directory
+    /// from; `None` when the deck has no directory to compare with, which
+    /// holds every check ([`Hold::Footer`]).
+    session: Option<CodexSession>,
     state: std::sync::Mutex<CodexReadsState>,
+}
+
+/// What a Codex generation's status line is compared with (issue #2130).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexSession {
+    /// The bound Codex's working directory (`/proc/<pid>/cwd`).
+    pub cwd: PathBuf,
+    /// `HOME` in the bound Codex's environment, when set and not empty.
+    pub home: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -1695,6 +1843,9 @@ struct CodexReadsState {
     /// How many bookkeeping rewrites this generation has accepted, which is
     /// how many times `last` has changed.
     rewrites: u8,
+    /// [`codex_separator_siblings`] for the session's directory as the last
+    /// [`CodexReads::check`] found it; `true` until one has.
+    siblings: bool,
 }
 
 /// The most bookkeeping rewrites of `config.toml` one Codex generation
@@ -1707,12 +1858,20 @@ pub const CODEX_REWRITES_PER_GENERATION: u8 = 2;
 impl CodexReads {
     /// A generation's reads from its spawn baseline.
     pub fn new(baseline: &CodexBaseline) -> CodexReads {
+        CodexReads::with_session(baseline, None)
+    }
+
+    /// [`CodexReads::new`] with the directory its status line is compared
+    /// with ([`CodexReads::session`]).
+    pub fn with_session(baseline: &CodexBaseline, session: Option<CodexSession>) -> CodexReads {
         CodexReads {
             sources: baseline.sources.clone(),
+            session,
             state: std::sync::Mutex::new(CodexReadsState {
                 last: baseline.read.clone(),
                 held: None,
                 rewrites: 0,
+                siblings: true,
             }),
         }
     }
@@ -1723,8 +1882,43 @@ impl CodexReads {
     /// [`CodexReads::read`] then [`CodexReads::settle`]. The file I/O comes
     /// before its own lock, which guards only the comparison: call it with
     /// no lock held.
+    /// It also scans the session directory's parent
+    /// ([`codex_separator_siblings`]) for [`CodexReads::session`], which
+    /// does no I/O of its own.
     pub fn check(&self, precedence: &[KeymapSource]) -> Result<(), Hold> {
+        if let Some(session) = self.session.as_ref() {
+            let siblings = codex_separator_siblings(&session.cwd);
+            self.lock().siblings = siblings;
+        }
         self.settle(self.read(), precedence)
+    }
+
+    /// Whether `status_line`, Codex's status line on the frame a check is
+    /// admitted on (`crate::doorbell_screen::codex_status_line`, `None`
+    /// for none), still shows the bound Codex's own directory (issue
+    /// #2130): [`codex_session_cwd`]. Another directory latches
+    /// [`Hold::Changed`] for the rest of the generation, as a changed
+    /// source does, and a latched hold is returned whatever the line says;
+    /// a line it can't read, or no directory to compare with, holds this
+    /// check alone ([`Hold::Footer`]). No I/O.
+    pub fn session(&self, status_line: Option<&str>) -> Result<(), Hold> {
+        let mut state = self.lock();
+        if let Some(hold) = state.held {
+            return Err(hold);
+        }
+        let Some(session) = self.session.as_ref() else {
+            return Err(Hold::Footer);
+        };
+        let compared = codex_session_cwd(
+            status_line,
+            &session.cwd,
+            session.home.as_deref(),
+            state.siblings,
+        );
+        if compared == Err(Hold::Changed) {
+            state.held = Some(Hold::Changed);
+        }
+        compared
     }
 
     /// Reads the sources now: [`CodexReads::start_read`] then

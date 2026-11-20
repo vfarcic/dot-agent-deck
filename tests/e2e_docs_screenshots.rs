@@ -986,6 +986,11 @@ fn stage_orchestration() -> DashboardScene {
             .with_launch_subdir(DOCS_PROJECT_DIR)
             .impersonating_pane_signals()
     });
+    // PRD #1885: the harness pre-approves a config at the fixture root, and
+    // this fixture keeps its config in the launch subdir. Approve it the way a
+    // user who approved the project once has, or the trust prompt stands in
+    // front of the orchestration and nothing spawns.
+    deck.approve_project_trust(&deck.workdir().join(DOCS_PROJECT_DIR));
     deck.wait_for_string("No active agents");
     deck.send_keys(b"\x0e");
     deck.wait_for_string("Select Directory");

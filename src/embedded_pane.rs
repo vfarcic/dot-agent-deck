@@ -5458,11 +5458,6 @@ impl PaneController for EmbeddedPaneController {
         Ok(outcome)
     }
 
-    fn toggle_layout(&self) -> Result<(), PaneError> {
-        // Layout toggling will be implemented in the layout engine milestone.
-        Ok(())
-    }
-
     /// Concurrency contract: callers must not invoke `write_to_pane` concurrently
     /// for the same `pane_id`. The pane lock is released around `SUBMIT_DELAY` so
     /// other panes can be drawn — but interleaved writes for the *same* pane would
