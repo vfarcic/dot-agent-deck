@@ -310,8 +310,9 @@ pub async fn run_reclaim(
     }
 }
 
-/// The sentence for a reclaim's outcome, from the shared wording.
-fn reclaim_message(outcome: &ReclaimOutcome) -> String {
+/// The sentence for a reclaim's outcome, from the shared wording. The TUI
+/// says the same ([`crate::ui`]'s interrupted work list).
+pub fn reclaim_message(outcome: &ReclaimOutcome) -> String {
     match (&outcome.refusal, outcome.verdict) {
         (Some(refusal), _) if refusal.reason != RefusalReason::Unknown => {
             words::refusal_sentence(refusal.reason).to_string()

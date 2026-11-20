@@ -39,6 +39,7 @@ expression: text
         │  o                  Open pull request                                                               │         
         │  u / Ctrl+u         Upgrade (update badge)                                                          │         
         │  a / c              Restart notice: list / dismiss                                                  │         
+        │  I / X              Interrupted work: list / hide                                                   │         
         │  PageUp / PageDown  Scroll focused pane                                                             │         
         │  v                  Copy mode (select & copy)                                                       │         
         │  F1                 Toggle this help                                                                │         

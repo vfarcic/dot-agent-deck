@@ -10,7 +10,7 @@
 //! the desktop say the same thing.
 //!
 //! Keys: `I` opens the list from the dashboard (the footer's `[Show I]`, and
-//! the restart notice's list), `x` hides the footer row; in the list `j`/`k`
+//! the restart notice's list), `X` hides the footer row; in the list `j`/`k`
 //! select, `Enter` opens details (and there shows the kept reports' text),
 //! `r` reclaims, `d` dismisses, `D` dismisses all, `Esc`/`q` close.
 
@@ -156,12 +156,12 @@ fn at(shown: &str, needle: &str) -> usize {
 
 /// Scenario: A deck restart left one interrupted unit. On the dashboard the
 /// footer shows "1 interrupted item from before the restart" with a `[Show I]`
-/// and a `[Hide x]` button; with three items it says "3 interrupted items";
-/// with none there is no row. Pressing `x` hides the row.
+/// and a `[Hide X]` button; with three items it says "3 interrupted items";
+/// with none there is no row. Pressing `X` hides the row.
 #[spec("journal/interrupted/008")]
 #[test]
 fn interrupted_008_the_footer_counts_the_interrupted_items() {
-    let one = frames(&only(unit()), &[ch('x')]);
+    let one = frames(&only(unit()), &[ch('X')]);
     assert!(one[0].contains(&interrupted_footer(1)), "{}", one[0]);
     assert!(
         one[0].contains("1 interrupted item from before the restart"),
@@ -169,11 +169,11 @@ fn interrupted_008_the_footer_counts_the_interrupted_items() {
         one[0]
     );
     assert!(one[0].contains("[Show I]"), "{}", one[0]);
-    assert!(one[0].contains("[Hide x]"), "{}", one[0]);
+    assert!(one[0].contains("[Hide X]"), "{}", one[0]);
     insta::assert_snapshot!("footer_one_item", one[0]);
     assert!(
         !one[1].contains("interrupted item"),
-        "`x` hides the footer row:\n{}",
+        "`X` hides the footer row:\n{}",
         one[1]
     );
 

@@ -1,0 +1,36 @@
+---
+source: tests/render_interrupted_work.rs
+expression: notice
+---
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                   ┌ Restart notice ──────────────────────────────────────────────────────┐                   
+                   │  The deck restarted; these agents were stopped:                      │                   
+                   │                                                                      │                   
+                   │  coder                                                               │                   
+                   │  reviewer                                                            │                   
+                   │                                                                      │                   
+                   │  [Dismiss c] [Close]                                                 │                   
+                   │  j/k scroll · c dismiss · Esc to close                               │                   
+                   │  3 interrupted items from before the restart · I to show them        │                   
+                   └──────────────────────────────────────────────────────────────────────┘                   
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+The deck restarted; these agents were stopped: coder, reviewer.                         [Agents a] [Dismiss c]
+3 interrupted items from before the restart                                                      [Show] [Hide]
+ COMMAND  [Command Mode Ctrl+D] [New Agent Ctrl+N] [Close Ctrl+W] [Toggle Layout Ctrl+T] [Help ?]             
+[Quit Ctrl+C] [Filter /] [Rename r] [Generate g] [Schedules s]

@@ -391,6 +391,11 @@ pub enum UiMode {
     /// session. Nothing of it is spawned while this is open. Its state lives in
     /// `UiState::trust_prompt`.
     TrustPrompt,
+    /// PRD #1790 stage 2: the "Interrupted work" list — the work a deck
+    /// restart left behind — opened by the `interrupted_work` key (default
+    /// `I`), the footer's `[Show]` button or the restart notice's list. Its
+    /// state lives in `UiState::interrupted`.
+    InterruptedWork,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1960,6 +1965,10 @@ struct UiState {
     /// room for them, until the user dismisses it — agents later drops take
     /// join it meanwhile.
     restart_notice: Option<RestartNotice>,
+    /// PRD #1790 stage 2: the interrupted work list the daemon answered, the
+    /// overlay's view of it and the footer row's state
+    /// ([`interrupted_work_view`]).
+    interrupted: interrupted_work_view::InterruptedWork,
     /// PRD #1885: the open trust prompt (`UiMode::TrustPrompt`).
     trust_prompt: Option<TrustPromptState>,
     /// PRD #1885: saved orchestrations the startup restore held back because
@@ -2684,6 +2693,7 @@ impl UiState {
             selected_index: Some(0),
             last_focused_pane_id: None,
             restart_notice: None,
+            interrupted: Default::default(),
             trust_prompt: None,
             pending_trust_restores: std::collections::VecDeque::new(),
             declined_trust_restores: Vec::new(),
@@ -5813,6 +5823,14 @@ pub enum Action {
     DismissRestartNotice,
     /// PRD #1666 part 2 (G-fix7d): scroll the list by this many lines.
     RestartNoticeScroll(isize),
+    /// PRD #1790 stage 2: open the interrupted work list — its key (default
+    /// `I`) and the footer's `[Show]` button.
+    OpenInterruptedWork,
+    /// PRD #1790 stage 2: hide the interrupted work footer row — its key
+    /// (default `X`) and its `[Hide]` button.
+    HideInterruptedWork,
+    /// PRD #1790 stage 2: a key or click in the interrupted work list.
+    InterruptedWork(interrupted_work_view::Press),
     /// Issue #1635: open the upgrade dialog. Shared by the `open_upgrade` key
     /// (default `u`) and a click on the footer's update badge.
     OpenUpgrade,
@@ -9549,6 +9567,16 @@ fn handle_normal_key(
             return Action::DismissRestartNotice;
         }
     }
+    // PRD #1790 stage 2: the interrupted work list (default `I`), and hiding
+    // its footer row (default `X`) while the footer shows it.
+    if kb.matches(KbAction::InterruptedWork, &key) {
+        return Action::OpenInterruptedWork;
+    }
+    if interrupted_work_view::footer_count(ui).is_some()
+        && kb.matches(KbAction::HideInterruptedWork, &key)
+    {
+        return Action::HideInterruptedWork;
+    }
     // Issue #1635: open the upgrade dialog the footer badge names (default
     // `u`), shared with a click on the badge.
     if pressed(KbAction::OpenUpgrade) {
@@ -9732,6 +9760,12 @@ fn handle_restart_notice_key(key: KeyEvent, ui: &mut UiState, kb: &KeybindingCon
     }
     match key.code {
         _ if kb.matches(KbAction::DismissRestartNotice, &key) => Action::DismissRestartNotice,
+        // PRD #1790 stage 2: the list's line leading to the interrupted work.
+        _ if kb.matches(KbAction::InterruptedWork, &key)
+            && interrupted_work_view::listed_count(ui).is_some() =>
+        {
+            Action::OpenInterruptedWork
+        }
         KeyCode::Esc | KeyCode::Char('q') => Action::CloseRestartNotice,
         _ if kb.matches(KbAction::RestartNotice, &key) => Action::CloseRestartNotice,
         KeyCode::Down | KeyCode::Char('j') => Action::RestartNoticeScroll(1),
@@ -11180,6 +11214,8 @@ fn modal_owns_clicks(mode: &UiMode) -> bool {
             // PRD #1666 part 2 (G-fix7d): and the restart
             // notice list's.
             | UiMode::RestartNotice
+            // PRD #1790 stage 2: and the interrupted work list's.
+            | UiMode::InterruptedWork
             // PRD #127 finding #4: the Schedules dialog is a
             // topmost modal too — its [Add]/[Edit]/[Delete]/[Run now]
             // buttons live in `modal_button_rects` and any miss is
@@ -11231,6 +11267,8 @@ fn overlay_blocks_mouse(mode: &UiMode) -> bool {
         | UiMode::InboxAttention
         // PRD #1666 part 2 (G-fix7d): so is the restart notice's list.
         | UiMode::RestartNotice
+        // PRD #1790 stage 2: and the interrupted work list.
+        | UiMode::InterruptedWork
         // PRD #385 M5: copy mode's pane shows a frozen screen, so the wheel
         // must not scroll the live one behind it (the run loop ignores the
         // mouse in copy mode altogether).
@@ -13072,6 +13110,11 @@ fn dispatch_action(
                 ui.mode = UiMode::Normal;
             }
         }
+        Action::OpenInterruptedWork => {
+            interrupted_work_view::open(ui, &snapshot.stream_incarnation)
+        }
+        Action::HideInterruptedWork => interrupted_work_view::hide_footer(ui),
+        Action::InterruptedWork(press) => interrupted_work_view::press(ui, press),
         Action::RestartNoticeScroll(by) => {
             if let Some(notice) = ui.restart_notice.as_mut() {
                 // The overlay clamps it to the last screenful when it draws.
@@ -14628,6 +14671,7 @@ fn handle_key_event(
             UiMode::HostMetrics => handle_host_metrics_key(key, ui, &kb),
             UiMode::InboxAttention => handle_inbox_attention_key(key, ui, &kb),
             UiMode::RestartNotice => handle_restart_notice_key(key, ui, &kb),
+            UiMode::InterruptedWork => interrupted_work_view::handle_key(key, ui, &kb),
             // Issue #1635: `Ctrl+C` keeps its PRD #40 safety net here too, even
             // while an upgrade runs; the running upgrade's dialog is kept so the
             // upgrade key reopens it on the same run.
@@ -15711,6 +15755,11 @@ pub fn run_tui(
         // Issue #1635: the latest release check, and the result of an
         // upgrade the dialog started.
         sync_upgrade_state(&mut ui, &snapshot, &state);
+        // PRD #1790 stage 2: fetch the interrupted work once per daemon
+        // process the event stream is attached to, and take the answers that
+        // arrived.
+        interrupted_work_view::sync(&mut ui, &snapshot.stream_incarnation);
+        interrupted_work_view::drain(&mut ui);
 
         // Apply pending pane names to sessions that have appeared
         if !ui.pane_names.is_empty() {
@@ -19486,12 +19535,15 @@ fn render_overlays(frame: &mut Frame, ui: &mut UiState) {
     ui.form_field_rects.clear();
     ui.form_chip_rects.clear();
     ui.form_button_rects.clear();
-    if ui.mode == UiMode::RestartNotice
-        && let Some(notice) = ui.restart_notice.as_mut()
-    {
+    if ui.mode == UiMode::RestartNotice && ui.restart_notice.is_some() {
         // The notice's own list: nothing it would cover needs to stay in view.
         let full = frame.area();
-        ui.modal_button_rects = render_restart_notice_overlay(frame, full, notice, &ui.keybindings);
+        // PRD #1790 stage 2: with a line leading to the interrupted work.
+        let hint = interrupted_work_view::restart_notice_hint(ui);
+        if let Some(notice) = ui.restart_notice.as_mut() {
+            ui.modal_button_rects =
+                render_restart_notice_overlay(frame, full, notice, &ui.keybindings, hint);
+        }
     }
     // PRD #241 review F5, G-fix7g: an open confirmation's drawing becomes the
     // record of which choices this frame shows. The record is the render gate:
@@ -19520,6 +19572,13 @@ fn draw_modal(frame: &mut Frame, area: Rect, ui: &mut UiState) {
     // G-fix7i: a confirmation's buttons are not click targets yet, nor its
     // choices counted: both wait for the frame as flushed.
     let mut confirmation = None;
+    // PRD #1790 stage 2: the interrupted work list; its reclaim and dismiss
+    // all questions are confirmations.
+    if ui.mode == UiMode::InterruptedWork {
+        let (buttons, question) = interrupted_work_view::render_overlay(frame, area, ui);
+        ui.modal_button_rects = buttons;
+        confirmation = question;
+    }
     if ui.mode == UiMode::DirPicker {
         // Capture the picker's row/button rects after the `dir_picker` borrow
         // ends so they can be stored back on `ui`.
@@ -21294,7 +21353,9 @@ fn bottom_bar_rows(ui: &UiState, width: u16, frame_height: u16) -> u16 {
                 restart_notice_keys_act(ui.mode),
                 width,
             )
-        });
+        })
+        // PRD #1790 stage 2: and the interrupted work's row, below it.
+        + interrupted_work_view::footer_rows(ui, interrupted_keys_act(ui.mode), width);
     // Reserve at most `frame_height - 1` rows so the content region keeps ≥1 row.
     rows.min(frame_height.saturating_sub(1))
 }
@@ -21316,7 +21377,7 @@ fn render_bottom_bar(
         restart_notice_rows(notice, &ui.keybindings, keys, area.width)
     });
     ui.restart_notice_area = None;
-    let (area, notice_rects) = match ui.restart_notice.as_ref() {
+    let (area, mut notice_rects) = match ui.restart_notice.as_ref() {
         Some(notice) if notice_rows > 0 && area.height > notice_rows => {
             let rows = Rect {
                 height: notice_rows,
@@ -21333,8 +21394,42 @@ fn render_bottom_bar(
         }
         _ => (area, Vec::new()),
     };
+    // PRD #1790 stage 2: the interrupted work's footer row, below the restart
+    // notice's, on the same terms; a modal overlay is laid out above both.
+    let interrupted_keys = interrupted_keys_act(ui.mode);
+    let interrupted_rows = interrupted_work_view::footer_rows(ui, interrupted_keys, area.width);
+    let area = if interrupted_rows > 0 && area.height > interrupted_rows {
+        let rows = Rect {
+            height: interrupted_rows,
+            ..area
+        };
+        notice_rects.extend(interrupted_work_view::render_footer(
+            frame,
+            ui,
+            interrupted_keys,
+            rows,
+        ));
+        ui.restart_notice_area = Some(match ui.restart_notice_area {
+            Some(notice) => notice.union(rows),
+            None => rows,
+        });
+        Rect {
+            y: area.y + interrupted_rows,
+            height: area.height - interrupted_rows,
+            ..area
+        }
+    } else {
+        area
+    };
     render_bottom_bar_below_notice(frame, ui, area, has_pane_control, extra_buttons);
     ui.button_rects.extend(notice_rects);
+}
+
+/// PRD #1790 stage 2: whether the interrupted work footer's keys act in
+/// `mode` — command mode and the list's own overlay, as the restart notice's
+/// do ([`restart_notice_keys_act`]).
+fn interrupted_keys_act(mode: UiMode) -> bool {
+    matches!(mode, UiMode::Normal | UiMode::InterruptedWork)
 }
 
 fn render_bottom_bar_below_notice(
@@ -21805,7 +21900,8 @@ fn confirmation_awaits_frame(ui: &UiState) -> bool {
             // PRD #1885: input typed before the trust prompt was on screen
             // never approves it.
             | UiMode::TrustPrompt
-    ) || (ui.mode == UiMode::ScheduledTasks && ui.scheduled_delete_confirm))
+    ) || (ui.mode == UiMode::ScheduledTasks && ui.scheduled_delete_confirm)
+        || interrupted_work_view::asks(ui))
         && !ui
             .confirm_choices_drawn
             .is_some_and(|(mode, _)| mode == ui.mode)
@@ -21848,6 +21944,14 @@ fn refuse_undrawn_choice(key: &KeyEvent, ui: &UiState) -> Option<Action> {
         // PRD #1885: `a` approves only once a frame showed its label.
         UiMode::TrustPrompt => {
             let refused = key.code == KeyCode::Char('a') && !shown.contains(0);
+            return refused.then_some(Action::Continue);
+        }
+        // PRD #1790 stage 2: reclaim's and dismiss all's `y` only once a
+        // frame showed the question's y/n line.
+        UiMode::InterruptedWork => {
+            let refused = interrupted_work_view::asks(ui)
+                && matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y'))
+                && !shown.contains(0);
             return refused.then_some(Action::Continue);
         }
         _ => {}
@@ -22708,6 +22812,15 @@ fn render_help_overlay(
             ),
             "Restart notice: list / dismiss",
         ),
+        // PRD #1790 stage 2: the work a deck restart left behind.
+        help_key_line(
+            &format!(
+                "{} / {}",
+                n(KbAction::InterruptedWork),
+                n(KbAction::HideInterruptedWork)
+            ),
+            "Interrupted work: list / hide",
+        ),
         // PRD #341 M5: command mode is a real read-only inspect mode — the wheel
         // and these keys scroll the focused pane's own scrollback without ever
         // reaching the agent.
@@ -23463,6 +23576,7 @@ fn render_restart_notice_overlay(
     area: Rect,
     notice: &mut RestartNotice,
     keybindings: &KeybindingConfig,
+    interrupted_hint: Option<String>,
 ) -> Vec<(Action, Rect)> {
     let entries: Vec<String> = notice
         .agents
@@ -23500,16 +23614,19 @@ fn render_restart_notice_overlay(
     // The opening words and a blank row, the rows, then a blank row, the
     // button row and the hint: plus the border. Counted in `usize` and clamped
     // before narrowing.
+    // PRD #1790 stage 2: a row more for the line leading to the interrupted
+    // work, when there is any.
+    let hint_rows = usize::from(interrupted_hint.is_some());
     let popup_height = rows
         .len()
-        .saturating_add(opening.len() + 1 + 3 + 2)
+        .saturating_add(opening.len() + 1 + 3 + 2 + hint_rows)
         .min(usize::from(area.height.saturating_sub(2))) as u16;
     let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
     let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(x, y, popup_width, popup_height);
 
     frame.render_widget(Clear, popup_area);
-    let footer_height: u16 = 2;
+    let footer_height: u16 = 2 + hint_rows as u16;
     let inner_height = popup_height.saturating_sub(2);
     let shown =
         usize::from(inner_height.saturating_sub(footer_height)).saturating_sub(opening.len() + 1);
@@ -23569,19 +23686,20 @@ fn render_restart_notice_overlay(
     if footer_area.height == 0 {
         return Vec::new();
     }
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(""),
-            Line::styled(
-                format!(
-                    "  j/k scroll · {} dismiss · Esc to close",
-                    display_notation(keybindings, KbAction::DismissRestartNotice)
-                ),
-                text_primary(),
+    let mut footer_lines = vec![
+        Line::from(""),
+        Line::styled(
+            format!(
+                "  j/k scroll · {} dismiss · Esc to close",
+                display_notation(keybindings, KbAction::DismissRestartNotice)
             ),
-        ]),
-        footer_area,
-    );
+            text_primary(),
+        ),
+    ];
+    if let Some(hint) = interrupted_hint {
+        footer_lines.push(Line::styled(hint, Style::default().fg(Color::Yellow)));
+    }
+    frame.render_widget(Paragraph::new(footer_lines), footer_area);
     let buttons = [
         Button::new(
             "Dismiss",
@@ -29749,11 +29867,11 @@ pub enum InterruptedSeamStep {
 
 /// PRD #1790 stage 2 L1 seam: start on an empty dashboard in `mode` whose
 /// attach fetch answered `list`, with a restart notice naming `notice` (none
-/// when empty), apply `steps` one at a time and draw each frame with the
-/// production [`render_frame`]. Returns the frame before the first step and
-/// one after each.
-///
-/// RED stub: draws nothing yet.
+/// when empty), apply `steps` one at a time — a key through the production
+/// [`handle_key_event`], an answer where the background request delivers it
+/// — and draw each frame with the production [`render_frame`]. Returns the
+/// frame before the first step and one after each. Outside a tokio runtime no
+/// request is sent, so the daemon says only what the steps hand in.
 #[doc(hidden)]
 pub fn render_interrupted_work_to_buffers(
     list: &crate::interrupted_work::InterruptedList,
@@ -29763,8 +29881,109 @@ pub fn render_interrupted_work_to_buffers(
     width: u16,
     height: u16,
 ) -> Vec<ratatui::buffer::Buffer> {
-    let _ = (list, notice, mode);
-    vec![ratatui::buffer::Buffer::empty(Rect::new(0, 0, width, height)); steps.len() + 1]
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use std::sync::Arc;
+
+    let ctrl: Arc<EmbeddedPaneController> =
+        Arc::new(EmbeddedPaneController::for_render_seam_with_focused_pane(
+            BURST_SEAM_PANE_ID,
+            SCROLL_SEAM_ROWS,
+            SCROLL_SEAM_COLS,
+            b"",
+        ));
+    let mut tab_manager = TabManager::new(ctrl.clone() as Arc<dyn PaneController>);
+    let shared: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+    let state = AppState::default();
+    let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+    if !notice.is_empty() {
+        let mut stopped = RestartNotice::default();
+        for (i, label) in notice.iter().enumerate() {
+            stopped.join(
+                StoppedIdentity {
+                    pane: Some(format!("restart-seam-{i}")),
+                    key: None,
+                    agent: Some(i.to_string()),
+                    process: crate::daemon_client::Incarnation::from(Some("replaced".to_string())),
+                },
+                crate::daemon_client::StoppedAgent {
+                    label: (*label).to_string(),
+                    role: None,
+                    orchestration: None,
+                },
+            );
+        }
+        ui.restart_notice = Some(stopped);
+    }
+    interrupted_work_view::seam_listed(&mut ui, list);
+    ui.mode = mode;
+    // A fixed instant: the dashboard has no cards, so nothing measures against it.
+    let wall_now = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).expect("fixed instant");
+    let frame_area = Rect::new(0, 0, width, height);
+    let tab_view = ActiveTabView::Dashboard {
+        exclude_pane_ids: vec![],
+        zoomed: false,
+    };
+    let tab_bar = TabBarInfo {
+        show: false,
+        labels: vec!["Dashboard".into()],
+        active_index: 0,
+        orchestration_statuses: vec![],
+    };
+    let pane_ids: Vec<String> = Vec::new();
+    let mut terminal =
+        Terminal::new(TestBackend::new(width, height)).expect("TestBackend should construct");
+
+    let mut draw = |ui: &mut UiState| {
+        let bar_rows = bottom_bar_rows(ui, width, height);
+        let layout = compute_frame_layout(
+            frame_area,
+            &tab_view,
+            &tab_bar,
+            &pane_ids,
+            PaneLayout::Stacked,
+            None,
+            bar_rows,
+        );
+        let filtered = filter_sessions(&state, ui);
+        let completed = terminal
+            .draw(|frame| {
+                render_frame(
+                    frame, &state, ui, &filtered, 0, true, &*ctrl, &tab_view, &tab_bar, &layout,
+                    wall_now,
+                );
+            })
+            .expect("TestBackend draw should succeed");
+        record_flushed_confirmation(ui, completed.buffer);
+        terminal.backend().buffer().clone()
+    };
+
+    let mut frames = Vec::with_capacity(steps.len() + 1);
+    frames.push(draw(&mut ui));
+    for step in steps {
+        match step {
+            InterruptedSeamStep::Key(key) => {
+                let filtered = filter_sessions(&state, &ui);
+                let _ = handle_key_event(
+                    *key,
+                    &mut ui,
+                    &*ctrl,
+                    &shared,
+                    &mut tab_manager,
+                    &state,
+                    &filtered,
+                    frame_area,
+                );
+            }
+            answer => {
+                if let Some(answer) = interrupted_work_view::seam_answer(&ui, answer) {
+                    interrupted_work_view::apply(&mut ui, answer);
+                }
+            }
+        }
+        frames.push(draw(&mut ui));
+    }
+    frames
 }
 
 /// [`render_restart_notice_key_sequence_to_buffers`] for a notice naming
@@ -46026,7 +46245,8 @@ mod tests {
             | UiMode::InboxAttention
             | UiMode::RestartNotice
             | UiMode::CopyMode
-            | UiMode::TrustPrompt => mode,
+            | UiMode::TrustPrompt
+            | UiMode::InterruptedWork => mode,
         }
     }
 
@@ -46053,6 +46273,7 @@ mod tests {
             UiMode::RestartNotice,
             UiMode::CopyMode,
             UiMode::TrustPrompt,
+            UiMode::InterruptedWork,
         ]
         .into_iter()
         .map(assert_exhaustive_ui_mode)
@@ -50424,6 +50645,7 @@ mod tests {
             UiMode::Upgrade,
             UiMode::InboxAttention,
             UiMode::RestartNotice,
+            UiMode::InterruptedWork,
         ] {
             let routed_first = matches!(mode, UiMode::DirPicker | UiMode::NewPaneForm);
             assert_eq!(
@@ -52164,6 +52386,10 @@ mod one_shot_protocol_gate_tests {
 #[cfg(all(test, unix))]
 #[path = "ui_panic_teardown_tests.rs"]
 mod panic_teardown_tests;
+
+// PRD #1790 stage 2: the interrupted work list, its footer row and overlay.
+#[path = "ui_interrupted_work.rs"]
+mod interrupted_work_view;
 
 /// Issue #1913: a deck restart that reuses an orchestration tab's pane ids.
 #[cfg(all(test, unix))]

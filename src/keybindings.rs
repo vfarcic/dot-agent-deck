@@ -111,6 +111,12 @@ pub enum Action {
     DismissRestartNotice,
     /// PRD #385 M5: open keyboard copy mode on the focused pane.
     CopyMode,
+    /// PRD #1790 stage 2: open the list of the work a deck restart left
+    /// behind ("Interrupted work").
+    InterruptedWork,
+    /// PRD #1790 stage 2: hide the footer row that counts the interrupted
+    /// work, until the TUI attaches to another daemon process.
+    HideInterruptedWork,
 }
 
 /// Static description of one action: which section it lives in, its config
@@ -435,6 +441,24 @@ pub const ACTIONS: &[ActionSpec] = &[
         name: "copy_mode",
         default: "v",
         description: "Copy mode (select and copy with the keyboard)",
+    },
+    // PRD #1790 stage 2: the interrupted work list and the footer row that
+    // counts it. `i` is the deck-messages picker's, so the list takes `I`,
+    // and hiding the row `X` beside it; both are free in command mode. Last in
+    // canonical order, for the reason `host_metrics` is.
+    ActionSpec {
+        action: Action::InterruptedWork,
+        section: Section::Dashboard,
+        name: "interrupted_work",
+        default: "I",
+        description: "Interrupted work",
+    },
+    ActionSpec {
+        action: Action::HideInterruptedWork,
+        section: Section::Dashboard,
+        name: "hide_interrupted_work",
+        default: "X",
+        description: "Hide the interrupted work footer",
     },
 ];
 

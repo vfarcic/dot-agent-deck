@@ -1,0 +1,36 @@
+---
+source: tests/render_interrupted_work.rs
+expression: "one[0]"
+---
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                              No active agents. Press Ctrl+n to create an agent.                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+1 interrupted item from before the restart                                                   [Show I] [Hide X]
+ COMMAND  [Back to Pane d/Ctrl+D] [New Agent n/Ctrl+N] [Close w/Ctrl+W] [Toggle Layout t/Ctrl+T] [Help ?]     
+[Quit Ctrl+C] [Filter /] [Rename r] [Generate g] [Schedules s]

@@ -1,0 +1,36 @@
+---
+source: tests/render_interrupted_work.rs
+expression: open
+---
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+     ┌ Interrupted work ────────────────────────────────────────────────────────────────────────────────┐     
+     │                                                                                                  │     
+     │  ▶ fix-login · Unit · agent/dispatch-fix-login                                                   │     
+     │      Worktree: /home/me/code/app-dispatch-fix-login                                              │     
+     │      Started by: dispatcher · Last entry: attempt_ended, 2026-11-19 10:00 UTC                    │     
+     │      Progress: 1 attempt; roles coder                                                            │     
+     │    release-team · Orchestration                                                                  │     
+     │      Worktree: /home/me/code/app                                                                 │     
+     │      Last entry: attempt_ended, 2026-11-19 10:00 UTC                                             │     
+     │                                                                                                  │     
+     │  Other agents                                                                                    │     
+     │    scratch-shell · Agent                                                                         │     
+     │      Folder: /home/me/notes                                                                      │     
+     │      Last entry: attempt_ended, 2026-11-19 10:00 UTC                                             │     
+     │                                                                                           [Close]│     
+     │  j/k select · Enter details · r reclaim · d dismiss · D dismiss all · Esc close                  │     
+     └──────────────────────────────────────────────────────────────────────────────────────────────────┘     
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+3 interrupted items from before the restart                                                  [Show I] [Hide X]
+ COMMAND  [Command Mode Ctrl+D] [New Agent Ctrl+N] [Close Ctrl+W] [Toggle Layout Ctrl+T] [Help ?]             
+[Quit Ctrl+C] [Filter /] [Rename r] [Generate g] [Schedules s]

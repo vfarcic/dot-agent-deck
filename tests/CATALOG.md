@@ -660,10 +660,10 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 - **Does not assert:** a partial pane identity (refused before any request, as `close` does).
 - **Platform coverage:** mac+linux.
 
-##### journal/interrupted/008 — The TUI's footer counts the interrupted items and offers `[Show I]` and `[Hide x]`.
+##### journal/interrupted/008 — The TUI's footer counts the interrupted items and offers `[Show I]` and `[Hide X]`.
 - **Layer:** L1 in-process `TestBackend` + `insta` (`tests/render_interrupted_work.rs`, seam `render_interrupted_work_to_buffers`): the daemon's answers are handed to the TUI where its background request delivers them, and keys go through the production `handle_key_event`.
 - **Agent:** none.
-- **Asserts:** one item reads `1 interrupted item from before the restart`, three read `3 interrupted items from before the restart` (snapshots); the row carries `[Show I]` and `[Hide x]`; an empty list draws no row; `x` hides it.
+- **Asserts:** one item reads `1 interrupted item from before the restart`, three read `3 interrupted items from before the restart` (snapshots); the row carries `[Show I]` and `[Hide X]`; an empty list draws no row; `X` hides it.
 - **Does not assert:** the attach and reconnect fetch itself (`journal/interrupted/014`); the desktop surface.
 - **Platform coverage:** mac+linux.
 

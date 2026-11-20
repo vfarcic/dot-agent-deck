@@ -1,0 +1,36 @@
+---
+source: tests/render_interrupted_work.rs
+expression: confirm
+---
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+     ┌ Interrupted work ────────────────────────────────────────────────────────────────────────────────┐     
+     │                                                                                                  │     
+     │  Dismiss all: 3 interrupted items from before the restart? [y/N]                                 │     
+     │                                                                                                  │     
+     │  y dismiss all · n back                                                                          │     
+     └──────────────────────────────────────────────────────────────────────────────────────────────────┘     
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+3 interrupted items from before the restart                                                  [Show I] [Hide X]
+ COMMAND  [Command Mode Ctrl+D] [New Agent Ctrl+N] [Close Ctrl+W] [Toggle Layout Ctrl+T] [Help ?]             
+[Quit Ctrl+C] [Filter /] [Rename r] [Generate g] [Schedules s]
