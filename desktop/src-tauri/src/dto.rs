@@ -6175,7 +6175,6 @@ mod tests {
 /// shows nothing for it, never an error.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
-#[cfg_attr(not(test), allow(dead_code))]
 pub enum InterruptedWorkReply<T> {
     Answered {
         /// The daemon process that answered: the one the request named.

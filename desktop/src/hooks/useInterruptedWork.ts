@@ -1,0 +1,147 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { DeckBridge } from "../lib/bridge";
+import { isInterruptedList, type DismissOutcome, type InterruptedList, type InterruptedReply, type InterruptedShow, type InterruptedTarget, type ReclaimOutcome } from "../lib/interruptedWork";
+import type { DeckFleet } from "../types";
+
+/** PRD #1790 stage 2 — what the app holds of one deck's interrupted work. */
+export interface InterruptedDeck {
+  /** The daemon process the deck's connection names: every request is pinned to it. */
+  instance: string;
+  /** The last list that process answered; absent before an answer, and when it does not support interrupted work. */
+  list?: InterruptedList;
+  /** Why the last list request failed, for the dialog. */
+  failed?: string;
+}
+
+/** The deck and daemon process the dialog was opened for. */
+export interface InterruptedDialog { deckId: string; instance: string }
+
+/** PRD #1790 stage 2 — the app's interrupted work, every deck's, and the calls that act on it. */
+export interface InterruptedWorkRuntime {
+  /** By deck id: each connected deck whose daemon is asked. */
+  decks: Readonly<Record<string, InterruptedDeck>>;
+  /** Whether the banner of deck `deckId` was hidden for its current daemon process. */
+  hidden: (deckId: string) => boolean;
+  /** Hide deck `deckId`'s banner: records nothing, and lasts until its connection names another daemon process. */
+  hide: (deckId: string) => void;
+  /** Ask deck `deckId`'s daemon for the list again; `git` asks for each item's Git and pull request facts. */
+  refresh: (deckId: string, git?: boolean) => void;
+  show: (target: InterruptedTarget, id: string, reportsFrom: number) => Promise<InterruptedReply<InterruptedShow>>;
+  reclaim: (target: InterruptedTarget, id: string, dryRun: boolean) => Promise<InterruptedReply<ReclaimOutcome>>;
+  dismiss: (target: InterruptedTarget, ids: string[]) => Promise<InterruptedReply<DismissOutcome>>;
+  /** The open "Interrupted work" dialog, when one is. */
+  dialog?: InterruptedDialog;
+  /** Open deck `deckId`'s dialog; `false` when that deck has no daemon process to ask. */
+  openDialog: (deckId: string) => boolean;
+  closeDialog: () => void;
+}
+
+/** A message from a rejected bridge call. */
+function reason(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * PRD #1790 stage 2 — each deck's interrupted work.
+ *
+ * The list is asked for once per daemon process a deck's connection names —
+ * when the deck connects, and again when it reconnects to another process —
+ * again when its dialog opens (with the Git facts), and after each reclaim or
+ * dismissal. Nothing polls on a timer. An answer from a process the deck has
+ * since left, or to a list request that a newer one replaced, is dropped.
+ *
+ * `undefined` where the bridge offers none of it (a render-only runtime).
+ */
+export function useInterruptedWork(bridge: DeckBridge, fleet: DeckFleet): InterruptedWorkRuntime | undefined {
+  const offered = typeof bridge.interruptedWorkList === "function";
+  const [decks, setDecks] = useState<Readonly<Record<string, InterruptedDeck>>>({});
+  /* Which deck's banner Hide was pressed on, by the daemon process it was pressed for. */
+  const [hiddenFor, setHiddenFor] = useState<Readonly<Record<string, string>>>({});
+  const [dialog, setDialog] = useState<InterruptedDialog | undefined>();
+  /* The process each connected deck names now, as of the last fleet seen. */
+  const current = useRef(new Map<string, string>());
+  /* The newest list request per deck: an older one's answer is not applied. */
+  const lastOp = useRef(0);
+  const listOps = useRef(new Map<string, number>());
+
+  const fetchList = useCallback((deckId: string, git: boolean) => {
+    if (!bridge.interruptedWorkList) return;
+    const instance = current.current.get(deckId);
+    if (instance === undefined) return;
+    const op = ++lastOp.current;
+    listOps.current.set(deckId, op);
+    const applies = () => current.current.get(deckId) === instance && listOps.current.get(deckId) === op;
+    void bridge.interruptedWorkList({ deckId, instance }, git).then((reply) => {
+      if (!applies()) return;
+      setDecks((held) => {
+        const before = held[deckId];
+        if (!before || before.instance !== instance) return held;
+        if (reply.outcome !== "answered" || !isInterruptedList(reply.answer)) return { ...held, [deckId]: { instance } };
+        /* A refresh without Git facts keeps the ones a list with them read, for the items still listed. */
+        const items = reply.answer.items.map((item) => (item.git ? item : { ...item, git: before.list?.items.find((old) => old.id === item.id)?.git ?? item.git }));
+        return { ...held, [deckId]: { instance, list: { ...reply.answer, items } } };
+      });
+    }, (error: unknown) => {
+      if (!applies()) return;
+      /* A failed refresh keeps the list it had. */
+      setDecks((held) => (held[deckId]?.instance === instance ? { ...held, [deckId]: { ...held[deckId], failed: reason(error) } } : held));
+    });
+  }, [bridge]);
+
+  useEffect(() => {
+    if (!offered) return;
+    const next = new Map<string, string>();
+    for (const deck of fleet) {
+      if (deck.connection.deckId === undefined || deck.connection.status !== "connected") continue;
+      next.set(deck.connection.deckId, deck.connection.incarnation ?? "");
+    }
+    const before = current.current;
+    current.current = next;
+    const arrived = [...next].filter(([deckId, instance]) => before.get(deckId) !== instance).map(([deckId]) => deckId);
+    setDecks((held) => {
+      let changed = false;
+      const kept: Record<string, InterruptedDeck> = {};
+      for (const [deckId, instance] of next) {
+        const was = held[deckId];
+        if (was && was.instance === instance) kept[deckId] = was;
+        else {
+          kept[deckId] = { instance };
+          changed = true;
+        }
+      }
+      if (Object.keys(held).some((deckId) => !next.has(deckId))) changed = true;
+      return changed ? kept : held;
+    });
+    setDialog((open) => (open && next.get(open.deckId) !== open.instance ? undefined : open));
+    for (const deckId of arrived) fetchList(deckId, false);
+  }, [fetchList, fleet, offered]);
+
+  const refresh = useCallback((deckId: string, git = false) => fetchList(deckId, git), [fetchList]);
+  const hide = useCallback((deckId: string) => {
+    const instance = current.current.get(deckId);
+    if (instance !== undefined) setHiddenFor((held) => ({ ...held, [deckId]: instance }));
+  }, []);
+  const hidden = useCallback((deckId: string) => {
+    const instance = current.current.get(deckId);
+    return instance !== undefined && hiddenFor[deckId] === instance;
+  }, [hiddenFor]);
+  const openDialog = useCallback((deckId: string) => {
+    const instance = current.current.get(deckId);
+    if (instance === undefined) return false;
+    setDialog({ deckId, instance });
+    fetchList(deckId, true);
+    return true;
+  }, [fetchList]);
+  const closeDialog = useCallback(() => setDialog(undefined), []);
+  const show = useCallback((target: InterruptedTarget, id: string, reportsFrom: number) => (
+    bridge.interruptedWorkShow ? bridge.interruptedWorkShow(target, id, reportsFrom) : Promise.resolve<InterruptedReply<InterruptedShow>>({ outcome: "unsupported" })
+  ), [bridge]);
+  const reclaim = useCallback((target: InterruptedTarget, id: string, dryRun: boolean) => (
+    bridge.interruptedWorkReclaim ? bridge.interruptedWorkReclaim(target, id, dryRun) : Promise.resolve<InterruptedReply<ReclaimOutcome>>({ outcome: "unsupported" })
+  ), [bridge]);
+  const dismiss = useCallback((target: InterruptedTarget, ids: string[]) => (
+    bridge.interruptedWorkDismiss ? bridge.interruptedWorkDismiss(target, ids) : Promise.resolve<InterruptedReply<DismissOutcome>>({ outcome: "unsupported" })
+  ), [bridge]);
+
+  return useMemo(() => (offered ? { decks, hidden, hide, refresh, show, reclaim, dismiss, ...(dialog ? { dialog } : {}), openDialog, closeDialog } : undefined), [closeDialog, decks, dialog, dismiss, hidden, hide, offered, openDialog, reclaim, refresh, show]);
+}

@@ -16,6 +16,7 @@ import type { UpgradeChoice, UpgradeEvent } from "../lib/upgrade";
 import type { QuestionSelectionDto, QuestionTextSlotDto, VoiceQuestionTarget } from "../lib/voiceQuestion";
 const EMPTY_TERMINAL_DATA: Record<string, TerminalBuffer> = {};
 import { acceptCardsSnapshot, reconcileCards, type CardsConnection } from "../lib/agentCards";
+import { useInterruptedWork } from "./useInterruptedWork";
 import { type AgentCardsSnapshot, type AgentCardTarget, type AgentTarget, type CardActionOptions, type CleanupWarningEntry, type DeckAction, type DeckFleet, type DeckListingOptions, type DeckRuntimeState, type DeckSnapshot, type DesktopFeatures, type InboxActionVerb, type RuntimeMode, type TerminalBuffer } from "../types";
 
 /**
@@ -647,6 +648,8 @@ export function useDeckRuntime(): DeckRuntimeState {
       }, () => undefined);
     }
   }, [bridge, cardsConsumed, fleet, offerCards]);
+  /* PRD #1790 stage 2 — each deck's interrupted work, asked for once per daemon process. */
+  const interruptedWork = useInterruptedWork(bridge, fleet);
   const invokeCardAction = useMemo(() => (typeof bridge.invokeCardAction === "function"
     ? (target: AgentCardTarget, actionId: string, options: CardActionOptions) => bridge.invokeCardAction!(target, actionId, options)
     : undefined), [bridge]);
@@ -669,6 +672,7 @@ export function useDeckRuntime(): DeckRuntimeState {
     ...(inboxAction ? { inboxAction } : {}),
     ...(cardsOffered ? { agentCards, consumeAgentCards } : {}),
     ...(invokeCardAction ? { invokeCardAction } : {}),
+    ...(interruptedWork ? { interruptedWork } : {}),
     sendTerminalInput,
     resizeTerminal,
     previewWorktreeClose,

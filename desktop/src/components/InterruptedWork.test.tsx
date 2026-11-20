@@ -9,7 +9,7 @@ import {
   DISMISSED, INTERRUPTED_WORK_TITLE, OTHER_AGENTS_GROUP, RECLAIM_KEPT_DIRTY, RECLAIM_REMOVED, RECLAIM_WOULD_REMOVE, dismissAllQuestion, interruptedFooter,
   type DismissOutcome, type InterruptedItem, type InterruptedList, type InterruptedReply, type InterruptedShow, type InterruptedTarget, type ReclaimOutcome,
 } from "../lib/interruptedWork";
-import { VOICE_ACTIONS, INTERRUPTED_RECLAIM_CHECKING } from "../lib/voiceActions";
+import { VOICE_ACTIONS, INTERRUPTED_RECLAIM_CHECKING, type VoiceOverviewChannel, type VoiceOverviewContext } from "../lib/voiceActions";
 import { useInterruptedWork } from "../hooks/useInterruptedWork";
 import type { AgentSession, DeckRuntimeState, DeckSnapshot } from "../types";
 
@@ -351,20 +351,22 @@ describe("interrupted work by voice", () => {
   /** Scenario: with the dialog open, "reclaim the second one" — the row's `item` words — runs the dry run on the second listed item (the orchestration), reads its verdict back, and leaves the confirm on screen; "dismiss all" opens the question and dismisses nothing. */
   it("reclaims an ordinal's item with a read-back verdict, and asks before dismissing all", async () => {
     const { bridge, calls } = recordingBridge({ list: three() });
-    const channel: { current: Record<string, unknown> | undefined } = { current: undefined };
+    const channel: VoiceOverviewChannel = { current: undefined };
+    /* What the dashboard published, as a dispatch reads it. */
+    const published = () => channel.current as VoiceOverviewContext;
     function Voiced() {
       const interruptedWork = useInterruptedWork(bridge, [deckOf("process-a")]);
-      return <AgentOverview runtime={{ ...baseRuntime(deckOf("process-a")), ...(interruptedWork ? { interruptedWork } : {}) }} onNavigate={vi.fn()} voiceChannel={channel as never} />;
+      return <AgentOverview runtime={{ ...baseRuntime(deckOf("process-a")), ...(interruptedWork ? { interruptedWork } : {}) }} onNavigate={vi.fn()} voiceChannel={channel} />;
     }
     render(<Voiced />);
     await screen.findByTestId("interrupted-banner");
     const reportRefused = vi.fn();
     const reportPending = vi.fn();
-    await act(async () => { VOICE_ACTIONS.showInterruptedWork.run({ ...(channel.current as never), reportRefused }, {}); });
+    await act(async () => { VOICE_ACTIONS.showInterruptedWork.run({ ...published(), reportRefused }, {}); });
     expect(reportRefused).not.toHaveBeenCalled();
     await screen.findByTestId("interrupted-dialog");
     await waitFor(() => expect(rows()).toHaveLength(3));
-    await act(async () => { VOICE_ACTIONS.reclaimInterrupted.run({ ...(channel.current as never), reportRefused, reportPending }, { filterText: "the second one" }); });
+    await act(async () => { VOICE_ACTIONS.reclaimInterrupted.run({ ...published(), reportRefused, reportPending }, { filterText: "the second one" }); });
     expect(calls.filter((call) => call.verb === "reclaim")).toEqual([expect.objectContaining({ args: [TEAM_ID, true] })]);
     expect(reportPending).toHaveBeenCalledWith(INTERRUPTED_RECLAIM_CHECKING, expect.any(Promise), expect.any(String));
     await expect(reportPending.mock.calls[0][1]).resolves.toBe(RECLAIM_WOULD_REMOVE);
@@ -372,9 +374,9 @@ describe("interrupted work by voice", () => {
     expect(calls.some((call) => call.verb === "reclaim" && call.args[1] === false)).toBe(false);
 
     await act(async () => { fireEvent.click(screen.getByTestId("interrupted-back")); });
-    await act(async () => { VOICE_ACTIONS.reclaimInterrupted.run({ ...(channel.current as never), reportRefused, reportPending }, { filterText: "scratch-shell" }); });
+    await act(async () => { VOICE_ACTIONS.reclaimInterrupted.run({ ...published(), reportRefused, reportPending }, { filterText: "scratch-shell" }); });
     expect(reportRefused).toHaveBeenLastCalledWith(expect.stringContaining("nothing to reclaim"));
-    await act(async () => { VOICE_ACTIONS.dismissAllInterrupted.run({ ...(channel.current as never), reportRefused }); });
+    await act(async () => { VOICE_ACTIONS.dismissAllInterrupted.run({ ...published(), reportRefused }); });
     expect(screen.getByTestId("interrupted-dismiss-all-question")).toHaveTextContent(dismissAllQuestion(3));
     expect(calls.some((call) => call.verb === "dismiss")).toBe(false);
   });

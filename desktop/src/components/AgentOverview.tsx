@@ -32,6 +32,8 @@ import { numberKey, type VoiceNumberedEntryDto, type VoiceNumberedSectionDto } f
 import { agentSpokenName, orchestrationTitle } from "../lib/agentNames";
 import { DISPLAY_LIMITS, deckName, displayActivity, displayIdentity, displayPath, displayText, displayTitle, displayUptime, domIdentity, rendersBlank } from "../lib/displayText";
 import { HookBinaryNotices } from "./HookBinaryNotice";
+import { InterruptedWorkBanner, InterruptedWorkDialog } from "./InterruptedWork";
+import { listedCount, NOTHING_INTERRUPTED, type InterruptedDialogControls } from "../lib/interruptedWork";
 import { sameIncarnation } from "../lib/agentKey";
 import { AGENT_GONE_AFTER_RESTART } from "../lib/agentIdentity";
 import { inboxAttentionWords, INBOX_WORDS } from "../lib/inboxWords";
@@ -1257,6 +1259,40 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   }, [decks]);
   const closeHostMetrics = useCallback((deckId: string) => setHostOpen((open) => (open === deckId ? undefined : open)), []);
   /*
+    PRD #1790 stage 2 — each deck's interrupted work: its banner while its
+    daemon lists any, and the "Interrupted work" dialog, whose state the
+    runtime holds so the restart notice can open it too. The open dialog
+    publishes its calls here, for its buttons' registry entries and voice.
+  */
+  const interrupted = runtime.interruptedWork;
+  const interruptedControls = useRef<InterruptedDialogControls | undefined>(undefined);
+  const showInterruptedWork = useCallback((deckId?: string): string | undefined => {
+    if (!interrupted) return NOTHING_INTERRUPTED;
+    if (deckId !== undefined) return interrupted.openDialog(deckId) ? undefined : NOTHING_INTERRUPTED;
+    const listing = decks.filter((deck) => deck.connected && deck.snapshot.connection.deckId !== undefined && listedCount(interrupted.decks[deck.snapshot.connection.deckId]?.list) > 0);
+    if (listing.length === 0) return NOTHING_INTERRUPTED;
+    if (listing.length > 1) return `Several daemons have interrupted work: ${listing.map((deck) => deckName(deck.snapshot.connection)).join(", ")}. Say which one.`;
+    return interrupted.openDialog(listing[0].snapshot.connection.deckId as string) ? undefined : NOTHING_INTERRUPTED;
+  }, [decks, interrupted]);
+  const hideInterruptedWork = useCallback((deckId: string) => interrupted?.hide(deckId), [interrupted]);
+  const interruptedDialog = useMemo<InterruptedDialogControls>(() => {
+    const open = (): InterruptedDialogControls | undefined => interruptedControls.current;
+    const first = "Open the interrupted work first: say “show interrupted work”.";
+    return {
+      reclaim: (said) => open()?.reclaim(said) ?? first,
+      confirmReclaim: () => open()?.confirmReclaim() ?? first,
+      dismiss: (said) => open()?.dismiss(said) ?? first,
+      dismissAll: () => open()?.dismissAll() ?? first,
+      confirmDismissAll: () => open()?.confirmDismissAll() ?? first,
+      select: (id) => open()?.select(id),
+      openDetails: (id) => open()?.openDetails(id),
+      showReports: (from) => open()?.showReports(from),
+      back: () => open()?.back(),
+      close: () => open()?.close(),
+    };
+  }, []);
+  const interruptedVoice = useMemo(() => ({ showInterruptedWork, hideInterruptedWork }), [hideInterruptedWork, showInterruptedWork]);
+  /*
     PR #1672 — the open popover goes with its button. A daemon that
     disconnects or stops sending figures loses its Host button, and the
     popover is closed with it, so it does not reappear unasked when they come
@@ -1352,6 +1388,10 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
          published only while it is open. */
       ...(newAgent ? {} : { showDashboardCounters }),
       ...(countersOpen ? { closeDashboardCounters: () => setCountersOpen(false) } : {}),
+      /* PRD #1790 stage 2 — interrupted work: opening a daemon's dialog, and
+         the open dialog's reclaim and dismissals, while the runtime offers
+         it; withheld while the New agent dialog is open over the dashboard. */
+      ...(interrupted && !newAgent ? { showInterruptedWork, hideInterruptedWork, interruptedDialog } : {}),
       /* PRD #2374 — the cards' members, only while the runtime offers cards;
          `closeAgentCard` only while a card is open. */
       ...(cards.shown ? cards.voice : {}),
@@ -1437,6 +1477,21 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     if (cards.mode !== "cards" || !deck.connected || deckId === undefined || !cards.decksWithCards.has(deckId)) return undefined;
     return cards.placed.filter((card) => card.deckId === deckId && (!filtering || cardMatchesFilter(card, deck.matchingAgents)));
   };
+  /* PRD #1790 stage 2 — a deck's banner, while its daemon lists interrupted work and it was not hidden for this process. */
+  const interruptedBannerFor = (deck: (typeof decks)[number]): ReactNode | undefined => {
+    const deckId = deck.snapshot.connection.deckId;
+    if (!interrupted || deckId === undefined) return undefined;
+    const count = listedCount(interrupted.decks[deckId]?.list);
+    if (count === 0 || interrupted.hidden(deckId)) return undefined;
+    return <InterruptedWorkBanner deckId={deckId} count={count} controls={interruptedVoice} />;
+  };
+  /* The open dialog, mounted per daemon process: another process's answers never reach it. */
+  const interruptedOpen = interrupted?.dialog;
+  const interruptedDeck = interruptedOpen ? interrupted?.decks[interruptedOpen.deckId] : undefined;
+  const interruptedDeckName = interruptedOpen ? decks.find((deck) => deck.snapshot.connection.deckId === interruptedOpen.deckId) : undefined;
+  const interruptedDialogView = interrupted && interruptedOpen && interruptedDeck && interruptedDeck.instance === interruptedOpen.instance
+    ? <InterruptedWorkDialog key={`${interruptedOpen.deckId}:${interruptedOpen.instance}`} deckLabel={interruptedDeckName ? deckName(interruptedDeckName.snapshot.connection) : ""} deck={interruptedDeck} target={interruptedOpen} runtime={interrupted} controlsRef={interruptedControls} />
+    : undefined;
   const cardsBodyFor = (deck: (typeof decks)[number]): ReactNode | undefined => {
     const shown = cardsOnScreen(deck);
     const deckId = deck.snapshot.connection.deckId;
@@ -1946,11 +2001,13 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
               hostOpen={deck.snapshot.connection.deckId !== undefined && hostOpen === deck.snapshot.connection.deckId}
               onOpenHost={() => VOICE_ACTIONS.showHostMetrics.run(voiceContext, { preselectDeckId: deck.snapshot.connection.deckId })}
               onCloseHost={() => { if (deck.snapshot.connection.deckId !== undefined) closeHostMetrics(deck.snapshot.connection.deckId); }}
+              interruptedBanner={interruptedBannerFor(deck)}
             />
           ))}
         </section>
       </main>
       {cards.overlay && <AgentCardOverlay {...cards.overlay} controls={cards.controls} />}
+      {interruptedDialogView}
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}
       {upgrade && <UpgradeDialog target={upgrade} runtime={runtime} onClose={() => setUpgrade(undefined)} />}
       {localUpgrade && <LocalUpgradeFlow {...localUpgrade} runtime={runtime} onClose={() => { setLocalUpgrade(undefined); selfUpgrade?.onClosed?.(); }} />}
@@ -2063,7 +2120,9 @@ function startErrorKey(deckId: string | undefined): string {
   return deckId ?? "";
 }
 
-function DeckGroup({ deck, cardsBody, now, columns, filtering, fleetSize, overrideError, startError, onOpenDeck, onAddDaemon, onReconnect, onStartDaemon, onConnectAnyway, onUpgrade, upgradeLabel, upgradeTitle, onStopDaemon, stopDaemonReason, onReplaceDaemon, onNewAgent, hostOpen, onOpenHost, onCloseHost }: {
+function DeckGroup({ deck, cardsBody, now, columns, filtering, fleetSize, overrideError, startError, onOpenDeck, onAddDaemon, onReconnect, onStartDaemon, onConnectAnyway, onUpgrade, upgradeLabel, upgradeTitle, onStopDaemon, stopDaemonReason, onReplaceDaemon, onNewAgent, hostOpen, onOpenHost, onCloseHost, interruptedBanner }: {
+  /** PRD #1790 stage 2 — this deck's interrupted work banner, while its daemon lists any. */
+  interruptedBanner?: ReactNode;
   deck: FleetDeck;
   /** PRD #2374 — in the Cards view, this deck's cards, shown in place of its agent table. */
   cardsBody?: ReactNode;
@@ -2218,6 +2277,9 @@ function DeckGroup({ deck, cardsBody, now, columns, filtering, fleetSize, overri
 
       {/* Issue #1637: this deck's agents' hooks run an older dot-agent-deck. */}
       {deck.connected && <HookBinaryNotices notices={connection.hookBinaryNotices} />}
+
+      {/* PRD #1790 stage 2: what a restart of this deck's daemon left behind. */}
+      {deck.connected && interruptedBanner}
 
       <div className="daemon-group-body">
         {cardsBody ?? <DaemonBody

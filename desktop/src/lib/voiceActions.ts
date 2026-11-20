@@ -2,6 +2,7 @@ import type { DeckView } from "../types";
 import type { VoiceDeckIdentityDto } from "./bridge";
 import { clearDashboardFilter, setDashboardFilter, type DashboardFilter } from "./dashboardFilter";
 import type { CardStep, OverviewMode } from "./agentCards";
+import { DISMISSED, type InterruptedDialogControls } from "./interruptedWork";
 
 /**
  * PRD #802 M2 — the frontend action registry, and the app's one dispatch seam
@@ -416,6 +417,23 @@ export type VoiceActionContext = {
    */
   closeDashboardCounters: () => void;
   /**
+   * PRD #1790 stage 2 — open a daemon's "Interrupted work" dialog: what its
+   * banner's Show does. `deckId` is the daemon a row's `deck_ref` resolved
+   * to, or the banner's own; without one, the one daemon whose banner is
+   * shown. Answers `undefined` when it opened, or the sentence saying why
+   * not. **Served by the OVERVIEW**, which renders the banners.
+   */
+  showInterruptedWork: (deckId?: string) => string | undefined;
+  /** PRD #1790 stage 2 — hide a daemon's interrupted work banner until it is another daemon process: records nothing. */
+  hideInterruptedWork: (deckId: string) => void;
+  /**
+   * PRD #1790 stage 2 — the open "Interrupted work" dialog's calls: reclaim,
+   * dismiss and dismiss all by every route, and its own buttons. Published by
+   * the overview while the dashboard is up; while no dialog is open each
+   * action answers the sentence that says to open it first.
+   */
+  interruptedDialog: InterruptedDialogControls;
+  /**
    * PRD #1223 — the New agent dialog's directory browser, by voice: go into
    * the child a `dir_ref` resolved to (`target.directoryPath`), go up to `..`,
    * or choose the directory on screen. Each calls the function the browser's
@@ -649,6 +667,12 @@ export type VoiceActionEntry = {
   /** Why this capability is not a spoken command. Mutually exclusive with `voice`. */
   no_voice?: string;
 };
+
+/** PRD #1790 stage 2 — what voice says while a reclaim's dry run is checking, and once it has answered with nothing to read back. */
+export const INTERRUPTED_RECLAIM_CHECKING = "Checking what reclaiming it would do…";
+export const INTERRUPTED_RECLAIM_CHECKED = "Checked.";
+/** …and while a dismissal is on its way. */
+export const INTERRUPTED_DISMISSING = "Dismissing…";
 
 /** PRD #1401 — what voice says while the system browser is being handed the page. */
 export const PULL_REQUEST_HANDING_OFF = "Opening it in your browser…";
@@ -1192,6 +1216,118 @@ export const VOICE_ACTIONS = {
     voice: true,
     needs: ["showDashboardCounters"],
     run: (context: Pick<VoiceActionContext, "showDashboardCounters">) => context.showDashboardCounters(),
+  },
+
+  /* PRD #1790 stage 2 — a daemon's interrupted work: the banner's Show and
+     Hide, and the "Interrupted work" dialog's controls. Every button, key and
+     the restart notice's Show dispatch through these. Reclaim and dismiss
+     name their item by what the user said (`target.filterText`: an ordinal,
+     "the second one", or the item's name), or act on the selected row. */
+  showInterruptedWork: {
+    label: "Show a daemon's interrupted work",
+    voice: true,
+    needs: ["showInterruptedWork"],
+    run: (context: Pick<VoiceActionContext, "showInterruptedWork"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target?: { preselectDeckId?: string }) => {
+      const refused = context.showInterruptedWork(target?.preselectDeckId || undefined);
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  hideInterruptedWork: {
+    label: "Hide a daemon's interrupted work banner",
+    no_voice: "hides a notice for as long as this daemon process runs and records nothing, so a spoken hide would only remove the words that say there is interrupted work to look at; the person can leave the banner, or dismiss the items themselves, which voice reaches (`dismiss_interrupted`, `dismiss_all_interrupted`)",
+    needs: ["hideInterruptedWork"],
+    run: (context: Pick<VoiceActionContext, "hideInterruptedWork">, deckId: string) => context.hideInterruptedWork(deckId),
+  },
+
+  reclaimInterrupted: {
+    label: "Check what reclaiming an interrupted item would do, and ask to confirm it",
+    voice: true,
+    needs: ["interruptedDialog"],
+    /* Starts the dry run only: the report reads back its verdict, and the
+       reclaim itself waits for the person's click on the confirm. */
+    run: (context: Pick<VoiceActionContext, "interruptedDialog"> & Partial<Pick<VoiceActionContext, "reportRefused" | "reportPending">>, target?: { filterText?: string }) => {
+      const answer = context.interruptedDialog.reclaim(target?.filterText);
+      if (typeof answer === "string") {
+        context.reportRefused?.(answer);
+        return;
+      }
+      context.reportPending?.(INTERRUPTED_RECLAIM_CHECKING, answer, INTERRUPTED_RECLAIM_CHECKED);
+    },
+  },
+
+  confirmReclaimInterrupted: {
+    label: "Reclaim the interrupted item the dialog asks about",
+    no_voice: "the confirm of a reclaim, which removes a worktree; voice has no confirm-before-acting step yet (PRD #802 D5), so `reclaim_interrupted` runs the dry run, reads its verdict back and stops — the press that removes the worktree is the person's own, by hand",
+    needs: ["interruptedDialog"],
+    run: (context: Pick<VoiceActionContext, "interruptedDialog">) => { context.interruptedDialog.confirmReclaim(); },
+  },
+
+  dismissInterrupted: {
+    label: "Dismiss one interrupted item",
+    voice: true,
+    needs: ["interruptedDialog"],
+    run: (context: Pick<VoiceActionContext, "interruptedDialog"> & Partial<Pick<VoiceActionContext, "reportRefused" | "reportPending">>, target?: { filterText?: string }) => {
+      const answer = context.interruptedDialog.dismiss(target?.filterText);
+      if (typeof answer === "string") {
+        context.reportRefused?.(answer);
+        return;
+      }
+      context.reportPending?.(INTERRUPTED_DISMISSING, answer.then((said) => (said === DISMISSED ? undefined : said)), DISMISSED);
+    },
+  },
+
+  dismissAllInterrupted: {
+    label: "Ask to dismiss every listed interrupted item",
+    voice: true,
+    needs: ["interruptedDialog"],
+    /* Asks the question only; dismissing waits for the person's click. */
+    run: (context: Pick<VoiceActionContext, "interruptedDialog"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.interruptedDialog.dismissAll();
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  confirmDismissAllInterrupted: {
+    label: "Dismiss every interrupted item the question named",
+    no_voice: "the answer to Dismiss all's question; voice has no confirm-before-acting step yet (PRD #802 D5), so `dismiss_all_interrupted` asks the question on screen and stops — the press that dismisses them is the person's own, by hand",
+    needs: ["interruptedDialog"],
+    run: (context: Pick<VoiceActionContext, "interruptedDialog">) => { context.interruptedDialog.confirmDismissAll(); },
+  },
+
+  selectInterruptedItem: {
+    label: "Select an interrupted item in the list",
+    no_voice: "picks the row the buttons act on, a pointer and keyboard affordance; the spoken rows name their item themselves — \"reclaim the second one\", \"dismiss fix-login\" — so voice never needs a selection first",
+    needs: ["interruptedDialog"],
+    run: (context: Pick<VoiceActionContext, "interruptedDialog">, id: string) => context.interruptedDialog.select(id),
+  },
+
+  showInterruptedDetails: {
+    label: "Show an interrupted item's details",
+    no_voice: "shows facts and report text to read on screen, and voice reads none of them aloud; a row that opened them would leave the user looking at a page voice cannot page through or read, and the decisions they inform — reclaim, dismiss — have rows of their own",
+    needs: ["interruptedDialog"],
+    run: (context: Pick<VoiceActionContext, "interruptedDialog">, id: string) => context.interruptedDialog.openDetails(id),
+  },
+
+  showInterruptedReports: {
+    label: "Show a page of an interrupted item's kept reports",
+    no_voice: "shows report text an agent wrote, to read on screen; voice reads no report aloud, for `show_interrupted_details`' reason",
+    needs: ["interruptedDialog"],
+    run: (context: Pick<VoiceActionContext, "interruptedDialog">, from: number) => context.interruptedDialog.showReports(from),
+  },
+
+  backInterruptedWork: {
+    label: "Back to the interrupted work list",
+    no_voice: "backs out of an item's details or a confirmation to the list; voice's `close` does the same while the dialog is the topmost overlay, which is what the dialog's Escape does",
+    needs: ["interruptedDialog"],
+    run: (context: Pick<VoiceActionContext, "interruptedDialog">) => context.interruptedDialog.back(),
+  },
+
+  closeInterruptedWork: {
+    label: "Close the Interrupted work dialog",
+    no_voice: "the dialog's X and a press outside it; voice's `close` reaches the dialog while it is the topmost overlay, through the fence it registers, so a row naming it directly would close it out from under anything opened over it",
+    needs: ["interruptedDialog"],
+    run: (context: Pick<VoiceActionContext, "interruptedDialog">) => context.interruptedDialog.close(),
   },
 
   /* PRD #2374 — the dashboard's agent cards. Every control of the cards view
@@ -1898,7 +2034,7 @@ export type PullRequestContext = Pick<VoiceActionContext, "openPullRequest" | "o
  * dialog for; a dispatch of `openNewAgent` there is refused against its
  * `needs`, the way the overview refuses a deck overlay.
  */
-export type VoiceOverviewContext = Pick<VoiceActionContext, "openNewAgent" | "closeNewAgent" | "openDirectory" | "goToParentDirectory" | "useThisDirectory" | "filterDirectories" | "clearDirectoryFilter" | NewAgentFormMember | "confirmStopAgent" | "confirmCloseOrchestration" | "scrollDashboard" | "revealAgent" | "showHostMetrics" | "closeHostMetrics" | "showDashboardCounters" | "closeDashboardCounters" | AgentCardMember>;
+export type VoiceOverviewContext = Pick<VoiceActionContext, "openNewAgent" | "closeNewAgent" | "openDirectory" | "goToParentDirectory" | "useThisDirectory" | "filterDirectories" | "clearDirectoryFilter" | NewAgentFormMember | "confirmStopAgent" | "confirmCloseOrchestration" | "scrollDashboard" | "revealAgent" | "showHostMetrics" | "closeHostMetrics" | "showDashboardCounters" | "closeDashboardCounters" | "showInterruptedWork" | "hideInterruptedWork" | "interruptedDialog" | AgentCardMember>;
 
 /** PRD #2374 — the agent cards' members, served by the overview. */
 export type AgentCardMember = "setOverviewMode" | "showAgentCard" | "stepAgentCard" | "setNeedsYouFilter" | "closeAgentCard" | "runCardAction" | "replyToAgentCard" | "confirmCardAction" | "toggleOverviewRowMenu";

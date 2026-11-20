@@ -100,4 +100,13 @@ describe("the interrupted work wording", () => {
     expect(long.endsWith("…")).toBe(true);
     expect(words.reportLines("one\ttwo\r\nthree‮")).toEqual(["one two", "three\\u{202e}"]);
   });
+
+  /** Scenario: the app's backend answers an interrupted work request with something that is not one of its replies — `{ ok: true }`, an answer without items, nothing — and the app reads it as a daemon without interrupted work, showing nothing, rather than breaking the dashboard. */
+  it("reads a malformed reply as unsupported", () => {
+    for (const value of [{ ok: true }, null, undefined, "x", { outcome: "answered", instance: "a" }, { outcome: "answered", instance: "a", answer: {} }, { outcome: "answered", answer: { items: [] } }]) {
+      expect(words.normalizeInterruptedReply(value, words.isInterruptedList), JSON.stringify(value)).toEqual({ outcome: "unsupported" });
+    }
+    expect(words.normalizeInterruptedReply({ outcome: "answered", instance: "a", answer: { items: [] } }, words.isInterruptedList)).toEqual({ outcome: "answered", instance: "a", answer: { items: [] } });
+    expect(words.normalizeInterruptedReply({ outcome: "answered", instance: "a", answer: { verdict: "removed" } }, words.isReclaimOutcome)).toEqual({ outcome: "unsupported" });
+  });
 });

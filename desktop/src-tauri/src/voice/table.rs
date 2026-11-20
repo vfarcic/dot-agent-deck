@@ -1334,6 +1334,26 @@ mod tests {
                     "showDashboardCounters",
                     vec!["overview"]
                 ),
+                (
+                    "show_interrupted_work",
+                    "showInterruptedWork",
+                    vec!["overview"]
+                ),
+                (
+                    "reclaim_interrupted",
+                    "reclaimInterrupted",
+                    vec!["overview"]
+                ),
+                (
+                    "dismiss_interrupted",
+                    "dismissInterrupted",
+                    vec!["overview"]
+                ),
+                (
+                    "dismiss_all_interrupted",
+                    "dismissAllInterrupted",
+                    vec!["overview"]
+                ),
                 ("switch_deck", "switchDeck", vec!["deck", "overview"]),
                 // No screens: see the row's own comment — stopping must never
                 // be unavailable.
@@ -2368,6 +2388,10 @@ mod tests {
                 "add_daemon",
                 "show_host_metrics",
                 "show_dashboard_counters",
+                "show_interrupted_work",
+                "reclaim_interrupted",
+                "dismiss_interrupted",
+                "dismiss_all_interrupted",
                 "switch_deck",
                 "voice_off",
                 "list_commands",
@@ -3185,7 +3209,8 @@ mod tests {
     /// agent references (`open_agent`, `open_pr`, `stop_agent`), the daemon
     /// a required `deck` may be read from ([`super::super::outcome`]'s
     /// `names_the_daemon`: `switch_deck`, `choose_deck`) and the daemon the
-    /// Host figures are asked for (`show_host_metrics`). A list anywhere else
+    /// Host figures and the interrupted work are asked for
+    /// (`show_host_metrics`, `show_interrupted_work`). A list anywhere else
     /// would be read by nothing.
     #[test]
     fn voice_table_action_words_are_the_reference_readers_set() {
@@ -3200,6 +3225,7 @@ mod tests {
             vec![
                 "open_agent",
                 "show_host_metrics",
+                "show_interrupted_work",
                 "switch_deck",
                 "open_pr",
                 "choose_deck",
