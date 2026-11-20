@@ -321,6 +321,7 @@ export const REFUSED_NO_WORKTREE = "Refused: its worktree is not on disk.";
 export const REFUSED_NOT_LINKED_WORKTREE = "Refused: its directory is not a linked Git worktree.";
 export const REFUSED_BRANCH_MISMATCH = "Refused: its worktree has another branch checked out than the one it was started on.";
 export const REFUSED_NOT_OWNED = "Refused: the deck did not create this worktree.";
+export const REFUSED_NEWER_RUN = "Refused: a later run used this worktree, so reclaiming this older item could remove that run's work. Dismiss this item instead.";
 export const REFUSED_STILL_IN_USE = "Refused: an agent is still running in its worktree.";
 export const REFUSED_IN_USE_UNKNOWN = "Refused: the deck could not tell whether an agent is still running in its worktree.";
 export const REFUSED_NOT_RECORDED = "Refused: the deck could not record the dismissal.";
@@ -458,6 +459,7 @@ const REFUSAL_SENTENCES: Record<string, string> = {
   "not-linked-worktree": REFUSED_NOT_LINKED_WORKTREE,
   "branch-mismatch": REFUSED_BRANCH_MISMATCH,
   "not-owned": REFUSED_NOT_OWNED,
+  "newer-run": REFUSED_NEWER_RUN,
   "still-in-use": REFUSED_STILL_IN_USE,
   "in-use-unknown": REFUSED_IN_USE_UNKNOWN,
   "not-recorded": REFUSED_NOT_RECORDED,

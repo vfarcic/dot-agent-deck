@@ -47,8 +47,12 @@
 //! tree with uncommitted changes, or with other worktrees inside it, is kept
 //! (decisions D5, D6). Before that it requires a fresh, untruncated journal
 //! read in which the item is still interrupted, an item that is not a plain
-//! agent's (D1), a linked worktree at the recorded path whose checked-out
-//! branch is the item's, and the deck's ownership marker. It then holds the
+//! agent's (D1), no work the journal opened after the item, outside it,
+//! naming the same worktree ([`newer_run_at`]: an issue dispatched again at
+//! the same path and on the same branch passes the marker and branch checks,
+//! so only the journal tells its tree from the older item's), a linked
+//! worktree at the recorded path whose checked-out branch is the item's, and
+//! the deck's ownership marker. It then holds the
 //! worktree against new spawns ([`AgentPtyRegistry::hold_dir_for_removal`],
 //! by its recorded and its canonical path) and, with the hold taken,
 //! resolves every directory anything this daemon runs or is starting is
@@ -127,8 +131,8 @@ use crate::interrupted_work::{
     CloseSets, DismissOutcome, DismissedItem, GIT_FACTS_RESERVE, GitFacts, InterruptedItem,
     InterruptedList, InterruptedShow, ItemKind, MAX_REPLY_BYTES, MAX_SHOWN_REPORT_BYTES,
     MAX_SHOWN_REPORTS, PrFact, REPORT_NOT_OF_ITEM, ReclaimOutcome, ReclaimVerdict, RefusalReason,
-    Resolved, ShownReport, derive, fit_list, fit_show_page, reclaim_sentence, resolve,
-    still_interrupted,
+    Resolved, ShownReport, derive, fit_list, fit_show_page, newer_run_at, reclaim_sentence,
+    resolve, still_interrupted,
 };
 use crate::interrupted_work_probe::{self as probe, Deadline};
 use crate::issue_dispatch_run::{
@@ -136,7 +140,7 @@ use crate::issue_dispatch_run::{
 };
 use crate::launch_records::LaunchRead;
 use crate::retained_store::{KeptReport, KeptReports, RetainedStore};
-use crate::work_journal::{CloseHow, Event, JournalRead, WorkId, WorkJournal};
+use crate::work_journal::{CloseHow, Event, JournalRead, WorkId, WorkJournal, Workspace};
 
 /// The bound on one item's Git facts.
 pub const GIT_FACT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -467,6 +471,20 @@ fn prepare_reclaim(
     else {
         return Err(refuse_item(RefusalReason::NoWorktree));
     };
+    // A later run in the same worktree owns it now (PR #2431 review): the
+    // marker and the branch checked below cannot tell the two runs apart.
+    let home = crate::platform::paths::home_dir();
+    let same_place = |workspace: &Workspace| {
+        workspace.matches_path_with_home(&raw, &home)
+            || workspace.matches_path_with_home(&worktree, &home)
+            || workspace
+                .to_path_with_home(&home)
+                .and_then(|path| std::fs::canonicalize(path).ok())
+                .is_some_and(|path| path == worktree)
+    };
+    if newer_run_at(&snap.read, &item.id, same_place) {
+        return Err(refuse_item(RefusalReason::NewerRun));
+    }
     let works = CloseSets::build(&snap.read).works_under(&item.id);
     Ok(Prepared {
         item,

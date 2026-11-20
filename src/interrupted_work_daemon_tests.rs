@@ -521,6 +521,139 @@ fn show_answers_the_item_and_refuses_an_unknown_id() {
     });
 }
 
+/// Record a work that ran under `launch` in `workspace` on `branch`, whose
+/// one attempt exited and which closed `how`: a run that finished, so it is
+/// not listed.
+fn finished_work(
+    registry: &AgentPtyRegistry,
+    agent: u64,
+    launch: Launch,
+    branch: &str,
+    workspace: &Path,
+    how: CloseHow,
+) -> WorkId {
+    let journal = journal(registry);
+    let work = journal.mint_work_id().unwrap();
+    let attempt = AttemptId::new(RUN, agent).unwrap();
+    record(
+        registry,
+        Event::Opened {
+            work: work.clone(),
+            launch,
+            parent: None,
+            refs: Box::new(Refs {
+                branch: Some(branch.to_string()),
+                ..Refs::default()
+            }),
+            workspace: journal.workspace(workspace),
+        },
+    );
+    record(
+        registry,
+        Event::AttemptStarted {
+            work: work.clone(),
+            attempt: attempt.clone(),
+            pane: format!("pane-{agent}"),
+            agent,
+            role: None,
+        },
+    );
+    record(
+        registry,
+        Event::AttemptEnded {
+            work: work.clone(),
+            attempt,
+            how: EndHow::Exited,
+            code: Some(0),
+            cause: None,
+        },
+    );
+    record(
+        registry,
+        Event::Closed {
+            work: work.clone(),
+            how,
+        },
+    );
+    work
+}
+
+/// PR #2431 review (Greptile P1): an interrupted unit's worktree was removed
+/// and the issue dispatched again, at the same path and on the same branch,
+/// so the newer run's worktree carries the deck's marker and that branch.
+/// Once the newer run has finished, reclaiming the OLDER item keeps the tree
+/// and says why, dry run or not, and records nothing; the item stays listed.
+/// When the newer run is a dispatch that was itself interrupted, reclaiming
+/// the newer item is still offered. A plain pane started later in the tree
+/// does not count (`reclaim_refuses_while_a_pane_runs_in_the_worktree_through_a_symlink`
+/// removes the tree once its panes are gone).
+#[test]
+fn reclaim_of_an_older_item_keeps_the_worktree_a_newer_run_uses() {
+    rt().block_on(async {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let root_dir = std::fs::canonicalize(tmp.path()).unwrap();
+        let (_repo, wt) = repo_with_worktree(&root_dir);
+        mark(&wt);
+        // The newer run's work, committed, so its tree is clean and nothing
+        // but the ownership check stands between it and the removal.
+        std::fs::write(wt.join(".notes"), "the newer run's notes").unwrap();
+        git_in(&wt, &root_dir, &["add", "."]);
+        git_in(&wt, &root_dir, &["commit", "-qm", "newer run"]);
+        let registry = registry_with_journal(&root_dir.join("state"), JournalOptions::default());
+        let (older, _) = unit(&registry, "agent/dispatch-x", Some(&wt));
+        // Its schedule fired the issue again: an issue dispatch.
+        finished_work(
+            &registry,
+            7,
+            Launch::IssueDispatch,
+            "agent/dispatch-x",
+            &wt,
+            CloseHow::FireDone,
+        );
+
+        for dry_run in [true, false] {
+            let outcome = reclaim(&registry, older.to_string(), dry_run, None).await;
+            assert_eq!(
+                reason_of(&outcome),
+                Some(RefusalReason::NewerRun),
+                "dry run {dry_run}: {outcome:?}"
+            );
+            assert_eq!(outcome.verdict, ReclaimVerdict::Refused);
+            assert_eq!(
+                outcome.message,
+                crate::interrupted_work::REFUSED_NEWER_RUN,
+                "the sentence says why it was kept"
+            );
+            assert_eq!(outcome.worktree.as_deref(), Some(&*wt.to_string_lossy()));
+            assert!(wt.join(".notes").is_file(), "the newer run's tree is kept");
+        }
+        assert!(closes(&registry).iter().all(|(work, _)| *work != older));
+        let listed_ids: Vec<WorkId> = listed(&registry)
+            .await
+            .items
+            .into_iter()
+            .map(|item| item.id)
+            .collect();
+        assert_eq!(
+            listed_ids,
+            vec![older.clone()],
+            "the older item stays listed"
+        );
+
+        // A newer run that was itself interrupted: the older item is still
+        // refused, and the newer one is the one reclaim acts on.
+        let (newer, _) = unit(&registry, "agent/dispatch-x", Some(&wt));
+        let outcome = reclaim(&registry, older.to_string(), true, None).await;
+        assert_eq!(reason_of(&outcome), Some(RefusalReason::NewerRun));
+        let outcome = reclaim(&registry, newer.to_string(), true, None).await;
+        assert_eq!(
+            outcome.verdict,
+            ReclaimVerdict::WouldRemove,
+            "the newest run's item can be reclaimed: {outcome:?}"
+        );
+    });
+}
+
 fn git_in(dir: &Path, root: &Path, args: &[&str]) {
     let out = crate::git_env::fixture_git(dir, root)
         .args(args)

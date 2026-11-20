@@ -113,7 +113,7 @@ The deck keeps the worktree, removes nothing and says why when:
 - it was moved, replaced or switched to another branch while it was being reclaimed: list the interrupted work again;
 - Git could not remove it, or the removal did not finish in time. In that last case it may still be removed, and the deck records it if it is.
 
-It refuses, also without removing anything, when the worktree is no longer on disk, is not a Git worktree, has a different branch checked out than the one the work started on, was not created by the deck, or still has an agent running in it, or when the deck cannot tell whether one is.
+It refuses, also without removing anything, when the worktree is no longer on disk, is not a Git worktree, has a different branch checked out than the one the work started on, was not created by the deck, or still has an agent running in it, or when the deck cannot tell whether one is. It also refuses an older item whose work was dispatched again at the same folder, since that worktree now holds the later run's work: `Refused: a later run used this worktree, …`. Dismiss the older item; the later run's item is the one to reclaim if a restart interrupted it too.
 
 The branch is never deleted. A kept branch stops you dispatching a unit of the same name again; delete it with `git branch -D agent/dispatch-<name>` when you no longer need it.
 
