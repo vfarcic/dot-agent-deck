@@ -654,27 +654,45 @@ pub async fn remove_worktree_outcome(
     clone_dir: &Path,
     policy: RemovalPolicy,
 ) -> WorktreeRemoval {
-    remove_worktree_outcome_guarded(worktree_dir, clone_dir, policy, || async { true })
-        .await
-        .unwrap_or(WorktreeRemoval::RemoveFailed)
+    remove_worktree_outcome_guarded(worktree_dir, clone_dir, policy, || async {
+        RemovalGuard::Proceed
+    })
+    .await
+    .unwrap_or(WorktreeRemoval::RemoveFailed)
 }
 
-/// PRD #1790 stage 2: [`remove_worktree_outcome`], asking `still_ours`
-/// after the keep check and immediately before `git worktree remove`, and
-/// removing nothing — answering `None` — when it says no. The reclaim of an
-/// interrupted item re-validates there that the directory is still the
-/// worktree it checked. Nothing runs between `still_ours` answering and the
-/// removal starting, but another process can still change the directory in
-/// that gap.
+/// PRD #1790 stage 2: what the guard of [`remove_worktree_outcome_guarded`]
+/// answers just before `git worktree remove`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemovalGuard {
+    /// Remove it.
+    Proceed,
+    /// It is no longer the directory that was checked: remove nothing, and
+    /// answer `None`.
+    Changed,
+    /// Keep it, and answer this (a nested worktree found by a check made
+    /// again, say).
+    Keep(WorktreeRemoval),
+}
+
+/// PRD #1790 stage 2: [`remove_worktree_outcome`], asking `guard` after the
+/// keep check and immediately before `git worktree remove`, and removing
+/// nothing when it does not answer [`RemovalGuard::Proceed`]: `None` for
+/// [`RemovalGuard::Changed`], the answer it carries for
+/// [`RemovalGuard::Keep`]. The reclaim of an interrupted item re-validates
+/// there that the directory is still the worktree it checked. Nothing runs
+/// between `guard` answering and the removal starting, but another process
+/// can still change the directory in that gap, and `git worktree remove`
+/// acts on the path, not on what `guard` looked at.
 pub async fn remove_worktree_outcome_guarded<F, Fut>(
     worktree_dir: &Path,
     clone_dir: &Path,
     policy: RemovalPolicy,
-    still_ours: F,
+    guard: F,
 ) -> Option<WorktreeRemoval>
 where
     F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = bool>,
+    Fut: std::future::Future<Output = RemovalGuard>,
 {
     let worktree = worktree_dir.to_string_lossy();
     // PRD #1589 (auditor S5): the path and git's error text are producer
@@ -718,12 +736,23 @@ where
         }
     }
 
-    if !still_ours().await {
-        tracing::warn!(
-            worktree = %shown_worktree,
-            "dispatch: the worktree changed before its removal; leaving in place"
-        );
-        return None;
+    match guard().await {
+        RemovalGuard::Proceed => {}
+        RemovalGuard::Changed => {
+            tracing::warn!(
+                worktree = %shown_worktree,
+                "dispatch: the worktree changed before its removal; leaving in place"
+            );
+            return None;
+        }
+        RemovalGuard::Keep(kept) => {
+            tracing::warn!(
+                worktree = %shown_worktree,
+                kept = ?kept,
+                "dispatch: a check made again before the removal keeps the worktree; leaving in place"
+            );
+            return Some(kept);
+        }
     }
 
     let clone = clone_dir.to_string_lossy();
@@ -2748,6 +2777,36 @@ async fn acquire_worktree_lock(clone_dir: &Path) -> Option<crate::platform::lock
                 waited_secs = WORKTREE_LOCK_WAIT.as_secs(),
                 "timed out waiting for the per-repository worktree lock; creating the \
                  worktree unserialized rather than wedging the dispatch"
+            );
+            None
+        }
+    }
+}
+
+/// PRD #1790 stage 2: the per-repository worktree lock of `clone_dir`
+/// ([`worktree_lock_path`]), the one [`create_worktree`] takes, waiting at
+/// most `wait` for it. Unlike [`acquire_worktree_lock`], whose callers go on
+/// unserialized without it, `None` here is for a caller that must not go on:
+/// the reclaim of an interrupted item removes nothing without it.
+pub(crate) async fn acquire_worktree_lock_within(
+    clone_dir: &Path,
+    wait: Duration,
+) -> Option<crate::platform::lock::SpawnLock> {
+    let Some(path) = worktree_lock_path(clone_dir).await else {
+        tracing::warn!("the repository's worktree lock path could not be resolved");
+        return None;
+    };
+    match tokio::time::timeout(wait, crate::platform::lock::acquire_spawn_lock(&path)).await {
+        Ok(Ok(guard)) => Some(guard),
+        Ok(Err(e)) => {
+            tracing::warn!(lock = %path.display(), error = %e, "could not take the repository's worktree lock");
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                lock = %path.display(),
+                waited_ms = wait.as_millis() as u64,
+                "timed out waiting for the repository's worktree lock"
             );
             None
         }

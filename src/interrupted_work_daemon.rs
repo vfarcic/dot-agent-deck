@@ -54,19 +54,33 @@
 //! worktree refuses the reclaim, and so does one that cannot be resolved. A
 //! spawn reserved after the hold into an alias of the worktree is refused by
 //! it, since a spawn whose directory resolves records its canonical spelling
-//! too. Immediately before
-//! `git worktree remove`, still under the hold, it re-validates that the
-//! directory is the one it checked: the same device and inode at the same
-//! canonical path, the owner marker in the same git metadata directory, and
-//! the item's branch checked out. Any difference keeps the tree.
+//! too. It then takes the per-repository worktree lock, waiting at most
+//! [`RECLAIM_LOCK_WAIT`]; when it cannot be taken nothing is removed
+//! ([`ReclaimVerdict::KeptBusy`]). That is the lock the deck takes to create
+//! a dispatch's worktree ([`crate::issue_dispatch_run::create_worktree`],
+//! which goes on without it after waiting 60 seconds) and to remove a
+//! worktree a spawn abandoned; removing a dispatched worktree when its agent
+//! closes does not take it. Under that lock it runs the dirty and
+//! nested-worktree check, then, immediately before `git worktree remove`,
+//! re-validates that the directory is the one it checked: the same device and
+//! inode at the same canonical path, the owner marker in the same git
+//! metadata directory, the item's branch checked out, no other worktree
+//! inside it (asked again), and last the same device and inode once more,
+//! since the probes in between take time. Any difference keeps the tree.
 //!
 //! **What reclaim does not guard against.** The hold refuses spawns this
-//! daemon starts; it does not stop another process (a terminal, another
-//! daemon) from moving, replacing or switching the worktree. The
-//! re-validation narrows that to the gap between its last check and
-//! `git worktree remove` acting on the path, which no lock here closes: a
-//! process that swaps the directory inside that gap can still have the
-//! swapped-in tree removed, if it is clean.
+//! daemon starts, and the lock excludes only the operations that take it
+//! (above). Neither stops another process
+//! (a terminal, a Git command, another tool) from moving, replacing or
+//! switching the worktree, or adding a worktree inside it. The re-validation
+//! narrows that to the gap between its last check (the second device and
+//! inode check) and `git worktree remove` acting on the path, which nothing
+//! here closes: `git worktree remove` resolves the path itself, so a process
+//! that swaps another clean tree in at that path inside that gap can still
+//! have that tree removed, and a worktree added inside it in that gap is
+//! removed with it. Without `--force` Git itself refuses to remove a
+//! worktree with modified tracked files or untracked files; that refusal
+//! does not cover ignored files.
 //!
 //! A removal that succeeds writes `closed how=reclaimed` on the item's works
 //! from the task that owns the removal, while it still holds the worktree,
@@ -99,7 +113,7 @@ use crate::interrupted_work::{
     still_interrupted,
 };
 use crate::interrupted_work_probe::{self as probe, Deadline};
-use crate::issue_dispatch_run::{RemovalPolicy, TreeKeepCheck, WorktreeRemoval};
+use crate::issue_dispatch_run::{RemovalGuard, RemovalPolicy, TreeKeepCheck, WorktreeRemoval};
 use crate::launch_records::LaunchRead;
 use crate::retained_store::{KeptReport, KeptReports, RetainedStore};
 use crate::work_journal::{CloseHow, Event, JournalRead, WorkId, WorkJournal};
@@ -485,46 +499,73 @@ struct Checked {
     branch: String,
 }
 
-/// Whether the directory at the reclaimed path is still the worktree the
-/// reclaim checked: the same canonical path and device and inode, a linked
-/// worktree of the same repository with its owner marker in the same git
-/// metadata directory, and the item's branch checked out.
-async fn still_the_checked_worktree(checked: Checked) -> bool {
+/// Whether the directory at the reclaimed path is still the one the reclaim
+/// checked, the same device and inode at the same canonical path. Blocking.
+fn same_directory(checked: &Checked) -> bool {
+    std::fs::canonicalize(&checked.raw).ok().as_ref() == Some(&checked.worktree)
+        && DirIdentity::of(&checked.worktree) == Some(checked.identity)
+}
+
+/// [`same_directory`] on the blocking pool.
+async fn still_the_same_directory(checked: &Checked) -> bool {
+    let checked = checked.clone();
+    tokio::task::spawn_blocking(move || same_directory(&checked))
+        .await
+        .unwrap_or(false)
+}
+
+/// The re-validation just before `git worktree remove`, run under the
+/// repository's worktree lock: whether the directory at the reclaimed path
+/// is still the worktree the reclaim checked. In order: the same canonical
+/// path and device and inode; a linked worktree of the same repository with
+/// its owner marker in the same git metadata directory; the item's branch
+/// checked out; no other worktree inside it (asked again, since one may have
+/// been added since the keep check); and, last, the same device and inode
+/// again, since the probes in between take time. Any difference keeps the
+/// tree: [`RemovalGuard::Changed`], or [`RemovalGuard::Keep`] naming the
+/// nested worktrees (or that they could not be asked for).
+async fn still_the_checked_worktree(checked: Checked) -> RemovalGuard {
     #[cfg(test)]
     seams::before_revalidate(&checked.worktree);
     let deadline = Deadline::after(REVALIDATE_TIMEOUT);
-    let same_dir = {
-        let checked = checked.clone();
-        tokio::task::spawn_blocking(move || {
-            std::fs::canonicalize(&checked.raw).ok().as_ref() == Some(&checked.worktree)
-                && DirIdentity::of(&checked.worktree) == Some(checked.identity)
-        })
-        .await
-        .unwrap_or(false)
-    };
-    if !same_dir {
-        return false;
+    if !still_the_same_directory(&checked).await {
+        return RemovalGuard::Changed;
     }
     #[cfg(test)]
     seams::after_first_identity(&checked.worktree);
     let Some(facts) = probe::worktree_facts(&checked.worktree, deadline).await else {
-        return false;
+        return RemovalGuard::Changed;
     };
     if facts.geometry.toplevel != checked.worktree
         || facts.geometry.main != checked.clone
         || facts.git_dir != checked.git_dir
     {
-        return false;
+        return RemovalGuard::Changed;
     }
     let git_dir = facts.git_dir.clone();
     let marked = tokio::task::spawn_blocking(move || crate::worktree_owner::is_marked_in(&git_dir))
         .await
         .unwrap_or(false);
-    marked
-        && probe::head_branch(&checked.worktree, deadline)
+    if !marked
+        || probe::head_branch(&checked.worktree, deadline)
             .await
             .as_deref()
-            == Some(checked.branch.as_str())
+            != Some(checked.branch.as_str())
+    {
+        return RemovalGuard::Changed;
+    }
+    match crate::issue_dispatch_run::nested_worktrees(&checked.worktree, &checked.clone).await {
+        Ok(nested) if !nested.is_empty() => {
+            return RemovalGuard::Keep(WorktreeRemoval::KeptHoldsWorktrees(nested));
+        }
+        Ok(_) => {}
+        Err(_) => return RemovalGuard::Keep(WorktreeRemoval::KeptCouldNotCheck),
+    }
+    // The last check, as close to the removal as this daemon can make it.
+    if !still_the_same_directory(&checked).await {
+        return RemovalGuard::Changed;
+    }
+    RemovalGuard::Proceed
 }
 
 /// Reclaim the item `id` names: remove its worktree, keep its branch. With
@@ -550,7 +591,7 @@ async fn reclaim_within(
 }
 
 /// [`reclaim_within`], waiting at most `lock_wait` for the repository's
-/// worktree lock.
+/// worktree lock ([`RECLAIM_LOCK_WAIT`] in production).
 async fn reclaim_with(
     registry: &Arc<AgentPtyRegistry>,
     id: String,
@@ -559,7 +600,6 @@ async fn reclaim_with(
     bound: Duration,
     lock_wait: Duration,
 ) -> ReclaimOutcome {
-    let _ = lock_wait;
     // Any claim, well formed or not: see the module's "Who may act".
     if caller.is_some() {
         return ReclaimOutcome::refused(None, dry_run, RefusalReason::AgentCaller);
@@ -659,6 +699,15 @@ async fn reclaim_with(
                     Err(_) => Removal::done(ReclaimVerdict::KeptCouldNotCheck),
                 };
             }
+            // The repository's worktree lock, held across the keep check,
+            // the re-validation and the removal, so the deck's own worktree
+            // creation and removal in this repository wait for it. Without
+            // it nothing is removed.
+            let Some(_repo_lock) =
+                crate::issue_dispatch_run::acquire_worktree_lock_within(&clone, lock_wait).await
+            else {
+                return Removal::done(ReclaimVerdict::KeptBusy);
+            };
             let removal = crate::issue_dispatch_run::remove_worktree_outcome_guarded(
                 &worktree,
                 &clone,
