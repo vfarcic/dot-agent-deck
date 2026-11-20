@@ -180,14 +180,26 @@ pub enum SpawnError {
 /// directory ([`crate::task_completion::e2e_seams`]).
 pub(crate) const PAUSE_DISPATCH_SEED: &str = "dispatch-seed";
 
-/// PRD #1790 stage 2 (PR #2431 round 5): whether a spawn step that failed
-/// after `started` agents came up failed because this daemon is shutting
-/// down. Read from the registry's shutdown latch, which the shutdown sets
-/// before it drains a single agent, never from the step's error. With nothing
-/// started there is nothing for the shutdown to interrupt, so the spawn fails
-/// as any other.
-fn interrupted_by_shutdown(registry: &AgentPtyRegistry, started: &[SpawnedAgent]) -> bool {
-    !started.is_empty() && registry.is_shutting_down()
+/// PR #2431 test seam: an orchestration spawn has started at least one role
+/// and is about to start the next.
+#[cfg(test)]
+pub(crate) const PAUSE_NEXT_ROLE: &str = "orchestration-next-role";
+
+/// PRD #1790 stage 2 (PR #2431 rounds 5 and 6): whether a spawn step that
+/// failed after `started` agents came up failed because this daemon is
+/// shutting down — decided from how those agents ended, never from the step's
+/// error or from the shutdown latch alone: every one of them was stopped,
+/// still running, by the shutdown's drain
+/// ([`AgentPtyRegistry::stopped_by_shutdown`]). Exactly those agents' attempts
+/// end as interrupted by the shutdown, so a spawn kept for that reason is one
+/// the next daemon lists as interrupted work. An agent closed before the
+/// shutdown, or one that ended on its own, keeps the ordinary failed start and
+/// its rollback. With nothing started there is nothing for the shutdown to
+/// interrupt, so the spawn fails as any other.
+async fn interrupted_by_shutdown(registry: &AgentPtyRegistry, started: &[SpawnedAgent]) -> bool {
+    registry
+        .stopped_by_shutdown(started.iter().map(|agent| agent.id.as_str()))
+        .await
 }
 
 /// What [`spawn`] opened. `SingleAgent` = one card; `Orchestration` = a tab of
@@ -898,8 +910,8 @@ async fn spawn_with_unit(
                 shell,
                 unit_origin,
                 req.work_id.clone(),
-                notifier,
-            )?;
+            )
+            .inspect_err(|error| announce_spawn_failed(notifier, &req.task_name, error))?;
             // Issue #454: a single-agent spawn registers NOTHING in the
             // daemon's `AppState`, and does not need to. Its pane's lifecycle
             // reports are admitted because the daemon's admission check asks
@@ -947,7 +959,7 @@ async fn spawn_with_unit(
                     pane_id: pane_id.clone(),
                     role_name: None,
                 }];
-                if interrupted_by_shutdown(registry, &started) {
+                if interrupted_by_shutdown(registry, &started).await {
                     return Err(shutdown_while_starting(&req.task_name));
                 }
                 tracing::info!(
@@ -1001,7 +1013,7 @@ async fn spawn_with_unit(
                 }];
                 // PR #2431 round 5: a shutdown that drained the agent before
                 // its first prompt went in leaves the unit to it.
-                if interrupted_by_shutdown(registry, &started) {
+                if interrupted_by_shutdown(registry, &started).await {
                     return Err(shutdown_while_starting(&req.task_name));
                 }
                 close_started_agents(registry, state, event_tx, &started).await;
@@ -1185,6 +1197,10 @@ async fn spawn_with_unit(
                 None => derived_title,
             };
             for (idx, role) in roles.iter().enumerate() {
+                #[cfg(test)]
+                if !agents.is_empty() {
+                    registry.pause_point(PAUSE_NEXT_ROLE).await;
+                }
                 let pane_id = next_pane_id(&req.task_name, Some(role.role_index));
                 let membership = TabMembership::Orchestration {
                     name: name.clone(),
@@ -1215,7 +1231,6 @@ async fn spawn_with_unit(
                     None,
                     unit_origin,
                     req.work_id.clone(),
-                    notifier,
                 );
                 // Issue #600: an orchestration spawn is ALL-OR-NOTHING. This used
                 // to be a bare `?`, which returned the error while every role
@@ -1234,9 +1249,11 @@ async fn spawn_with_unit(
                 // never reached. See the issue and the PR for the full argument.
                 let id = match id {
                     Ok(id) => id,
-                    // PR #2431 round 5: the roles that came up are the
-                    // shutdown's to stop, and the unit stays recorded.
-                    Err(_) if interrupted_by_shutdown(registry, &agents) => {
+                    // PR #2431 rounds 5 and 6: the roles that came up were
+                    // stopped by the shutdown, and the unit stays recorded.
+                    // Classified before anything announces a failed spawn,
+                    // since this is not one.
+                    Err(_) if interrupted_by_shutdown(registry, &agents).await => {
                         if let Some(state) = state {
                             state
                                 .write()
@@ -1246,6 +1263,7 @@ async fn spawn_with_unit(
                         return Err(shutdown_while_starting(&req.task_name));
                     }
                     Err(e) => {
+                        announce_spawn_failed(notifier, &req.task_name, &e);
                         roll_back_partial_orchestration(
                             registry,
                             state,
@@ -1511,7 +1529,7 @@ async fn spawn_with_unit(
                 &reason,
                 &prompt,
             ) {
-                if interrupted_by_shutdown(registry, &agents) {
+                if interrupted_by_shutdown(registry, &agents).await {
                     return Err(shutdown_while_starting(&req.task_name));
                 }
                 close_started_agents(registry, state, event_tx, &agents).await;
@@ -1557,7 +1575,7 @@ async fn abort_closed_orchestration(
 ) -> SpawnError {
     // PR #2431 round 5: the roles were drained by this daemon's shutdown,
     // which stops them itself, and the unit stays recorded.
-    if interrupted_by_shutdown(registry, started) {
+    if interrupted_by_shutdown(registry, started).await {
         if let Some(state) = state {
             state
                 .write()
@@ -1792,7 +1810,6 @@ fn spawn_one(
     origin: crate::hook_provenance::InstanceOrigin,
     // PRD #1889: the work the spawn serves (`SpawnRequest::work_id`).
     work_id: Option<crate::work_journal::WorkId>,
-    notifier: &dyn Notifier,
 ) -> Result<String, SpawnError> {
     let mut env = pane_env(pane_id, false);
     if let Some(shell) = shell {
@@ -1826,12 +1843,21 @@ fn spawn_one(
         if e.is_admission_frozen() {
             return SpawnError::DaemonRestarting;
         }
-        notifier.notify(NotifyEvent::SpawnFailed {
-            task: task_name.to_string(),
-            message: e.to_string(),
-        });
         SpawnError::Agent(e.to_string())
     })
+}
+
+/// Announce `error`, from [`spawn_one`], as a failed spawn of `task`. The
+/// caller decides first whether it is one (PR #2431 round 6): a role this
+/// daemon's shutdown refused after earlier roles came up is an interrupted
+/// spawn, not a failed one, and a restart's refusal is a deferral.
+fn announce_spawn_failed(notifier: &dyn Notifier, task: &str, error: &SpawnError) {
+    if let SpawnError::Agent(message) = error {
+        notifier.notify(NotifyEvent::SpawnFailed {
+            task: task.to_string(),
+            message: message.clone(),
+        });
+    }
 }
 
 /// Build the spawn env for a scheduled pane: always the `DOT_AGENT_DECK_PANE_ID`
@@ -3949,6 +3975,95 @@ mod tests {
         fn notify(&self, event: NotifyEvent) {
             self.0.lock().expect("notifier mutex").push(event);
         }
+    }
+
+    /// PR #2431 round 6: an orchestration of `closable_orchestration_request`
+    /// held after its first role came up and before its second starts. With
+    /// `close_first`, that role is closed as a person closes it, and its
+    /// close has removed it, before this registry shuts down as a daemon stop
+    /// drains it; the spawn then goes on, and the shutdown refuses the second
+    /// role. Answers the outcome and what the notifier was told.
+    #[cfg(unix)]
+    async fn orchestration_cut_by_shutdown_at_its_second_role(
+        task: &str,
+        close_first: bool,
+    ) -> (Result<(), SpawnError>, Vec<NotifyEvent>) {
+        let dir = crate::test_temp::tempdir().expect("tempdir for the orchestration cwd");
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let notifier = Arc::new(RecordingNotifier::default());
+        let (reached, release) = registry.pause_at_for_test(PAUSE_NEXT_ROLE);
+        let spawned = {
+            let registry = registry.clone();
+            let notifier = notifier.clone();
+            let req = closable_orchestration_request(dir.path(), task);
+            tokio::spawn(async move {
+                spawn(req, &registry, &*notifier, None, true, None)
+                    .await
+                    .map(|_| ())
+            })
+        };
+        reached.await.expect("the spawn reaches its second role");
+        if close_first {
+            let records = registry.agent_records();
+            assert_eq!(records.len(), 1, "precondition: one role is up");
+            let first = records[0].id.clone();
+            let closing = registry.clone();
+            tokio::task::spawn_blocking(move || closing.close_agent(&first))
+                .await
+                .unwrap()
+                .expect("the first role closes");
+            assert!(registry.agent_records().is_empty(), "the close removed it");
+        }
+        let draining = registry.clone();
+        tokio::task::spawn_blocking(move || {
+            draining.shutdown_all_graceful(std::time::Duration::ZERO);
+        })
+        .await
+        .unwrap();
+        release.send(()).unwrap();
+        let outcome = spawned.await.unwrap();
+        let seen = notifier.0.lock().expect("notifier mutex").clone();
+        registry.shutdown_all();
+        (outcome, seen)
+    }
+
+    /// Scenario: an orchestration's first role is running when the daemon
+    /// stops; the stop drains it and refuses the next role. The spawn answers
+    /// that the deck stopped while it was starting, and announces no failed
+    /// spawn (PR #2431 round 6, reviewer P3).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_partial_orchestration_cut_by_a_shutdown_announces_no_failed_spawn() {
+        let (outcome, seen) =
+            orchestration_cut_by_shutdown_at_its_second_role("cut-2431", false).await;
+        assert!(
+            matches!(outcome, Err(SpawnError::ShutdownWhileStarting)),
+            "{outcome:?}"
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|e| matches!(e, NotifyEvent::SpawnFailed { .. })),
+            "an interrupted spawn is not announced as a failed one: {seen:?}"
+        );
+    }
+
+    /// Scenario: an orchestration's first role is closed by a person while
+    /// the spawn is between roles, and only then does the daemon stop and
+    /// refuse the next role. Nothing the shutdown stopped was started, so it
+    /// is the ordinary failed spawn, announced and rolled back (PR #2431
+    /// round 6, Qodo).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_role_closed_before_a_shutdown_leaves_the_ordinary_failed_spawn() {
+        let (outcome, seen) =
+            orchestration_cut_by_shutdown_at_its_second_role("closed-2431", true).await;
+        assert!(matches!(outcome, Err(SpawnError::Agent(_))), "{outcome:?}");
+        assert!(
+            seen.iter()
+                .any(|e| matches!(e, NotifyEvent::SpawnFailed { .. })),
+            "the failed spawn is announced: {seen:?}"
+        );
     }
 
     /// PR #1735 review: a fire whose first prompt the agent's inbox would

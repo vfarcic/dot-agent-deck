@@ -10490,6 +10490,16 @@ struct RegistryInner {
     /// each one's [`PaneDiscard::retired_seq`]. Bumped under the registry
     /// lock, so it orders retirements as they happened.
     discard_seq: u64,
+    /// PR #2431 round 6: the generations this registry's shutdown drain
+    /// stopped while they were still running, written in the lock hold that
+    /// drains them. A generation whose stream had already ended on its own
+    /// (`crashed`), or that a close removed before the drain, is not here.
+    /// Read by [`AgentPtyRegistry::stopped_by_shutdown`]. Only filled once the
+    /// registry is shutting down, so it never outgrows one drain.
+    stopped_by_shutdown: HashSet<String>,
+    /// PR #2431 round 6: the shutdown drain has run, so
+    /// [`Self::stopped_by_shutdown`] is final.
+    shutdown_drained: bool,
 }
 
 /// Issue #454: RAII holder for a [`RegistryInner::pending_spawns`] entry.
@@ -11046,6 +11056,8 @@ impl AgentPtyRegistry {
                 exit_waiters: HashMap::new(),
                 input_discarded: HashMap::new(),
                 discard_seq: 0,
+                stopped_by_shutdown: HashSet::new(),
+                shutdown_drained: false,
             }),
             dispatch_mutexes: Mutex::new(HashMap::new()),
             dispatch_order_mutexes: Mutex::new(HashMap::new()),
@@ -21496,20 +21508,30 @@ impl AgentPtyRegistry {
             }
             let fields = &mut *inner;
             let retired = &mut fields.retired_hook_tokens;
+            let stopped = &mut fields.stopped_by_shutdown;
             let mut children: Vec<ShutdownChild> = fields
                 .agents
                 .drain()
                 .map(|(id, agent)| {
                     retired.record(&agent.hook_token, agent.pane_id_env.as_deref(), &id);
                     agent.removal.closed();
+                    // PR #2431 round 6: a generation whose reader had not seen
+                    // its stream end is one this drain stops. Its reader then
+                    // finds it removed and closed, which ends its attempt as
+                    // interrupted by the shutdown.
+                    if agent.crashed != Some(true) {
+                        stopped.insert(id.clone());
+                    }
                     agent.into()
                 })
                 .collect();
-            inner.unconfirmed_agents.retain(|_, agent| {
+            let stopped = &mut fields.stopped_by_shutdown;
+            fields.unconfirmed_agents.retain(|id, agent| {
                 let Some(pending) = agent.child.take() else {
                     return true;
                 };
                 pending.removal.closed();
+                stopped.insert(id.clone());
                 children.push(ShutdownChild {
                     child: pending.child,
                     process_group: pending.process_group,
@@ -21517,7 +21539,41 @@ impl AgentPtyRegistry {
                 });
                 false
             });
+            fields.shutdown_drained = true;
             return children;
+        }
+    }
+
+    /// PR #2431 round 6: whether this registry's shutdown drain stopped every
+    /// generation in `agent_ids` while it was still running — so each one's
+    /// attempt ends as interrupted by the shutdown. False when the registry
+    /// is not shutting down, when `agent_ids` is empty, and for a generation
+    /// that a close removed before the drain or whose stream had already
+    /// ended on its own. Waits, within the drain's own settle bound, for a
+    /// drain that set the shutdown latch but has not run yet.
+    pub(crate) async fn stopped_by_shutdown<'a>(
+        &self,
+        agent_ids: impl IntoIterator<Item = &'a str>,
+    ) -> bool {
+        let agent_ids: Vec<&str> = agent_ids.into_iter().collect();
+        if agent_ids.is_empty() || !self.is_shutting_down() {
+            return false;
+        }
+        let deadline =
+            Instant::now() + AGENT_TERMINATE_GRACE + FORCE_REAP_DEADLINE + Duration::from_secs(1);
+        loop {
+            {
+                let inner = self.inner.lock();
+                if inner.shutdown_drained {
+                    return agent_ids
+                        .iter()
+                        .all(|id| inner.stopped_by_shutdown.contains(*id));
+                }
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(FORCE_REAP_POLL_INTERVAL).await;
         }
     }
 

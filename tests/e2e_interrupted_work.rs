@@ -786,10 +786,10 @@ fn interrupted_036_reclaim_keeps_a_directory_a_dir_dispatch_started_in() {
 
 /// Scenario: A dispatcher runs `dispatch --single`, and the CLI is answered.
 /// The unit's agent is running, but its first prompt is not posted yet (the
-/// spawn's `dispatch-seed` seam holds it) when the daemon is stopped; the
-/// stop drains the agent, and the dispatch goes on and finds it gone. The
-/// next daemon lists the unit as interrupted work, naming its worktree, and
-/// the worktree and its branch are still there.
+/// spawn's `dispatch-seed` seam holds it, and never gives up waiting) when
+/// the daemon is stopped; the stop drains the agent, and the dispatch goes on
+/// and finds it gone. The next daemon lists the unit as interrupted work,
+/// naming its worktree, and the worktree and its branch are still there.
 #[spec("journal/interrupted/038")]
 #[test]
 fn interrupted_038_a_stop_while_a_dispatch_starts_keeps_its_unit_as_interrupted_work() {
@@ -799,17 +799,23 @@ fn interrupted_038_a_stop_while_a_dispatch_starts_keeps_its_unit_as_interrupted_
     let seams = decks.seams();
     // The unit's agent: ignores the stop's SIGTERM, so the stopping daemon
     // waits out its grace with the dispatch still running, and says it got
-    // the signal, which the stop sends once it has drained the agent.
+    // the signal, which the stop sends once it has drained the agent. It says
+    // when its trap is in place, so the stop is sent to a trap that exists.
     let got_term = seams.join("unit-got-term");
+    let trap_ready = seams.join("unit-trap-ready");
     let stand_in = decks.repo.parent().unwrap().join("term-holding-unit.sh");
     std::fs::write(
         &stand_in,
         format!(
-            "#!/bin/sh\ntrap 'touch {}' TERM\nwhile :; do sleep 0.1; done\n",
-            got_term.display()
+            "#!/bin/sh\ntrap 'touch {}' TERM\ntouch {}\nwhile :; do sleep 0.1; done\n",
+            got_term.display(),
+            trap_ready.display()
         ),
     )
     .unwrap();
+    // The seam gives up after a fixed wait and lets the dispatch finish
+    // starting, which is not the window this test is about.
+    let timed_out = seams.join("dispatch-seed.timed-out");
     std::fs::set_permissions(&stand_in, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::write(seams.join("dispatch-seed.armed"), b"").unwrap();
 
@@ -846,6 +852,14 @@ fn interrupted_038_a_stop_while_a_dispatch_starts_keeps_its_unit_as_interrupted_
     journal::wait_for(&decks.state, "the unit's attempt", |lines| {
         journal::attempt_of(lines, &unit.id).map(|_| ())
     });
+    assert!(
+        common::wait_until(budget, || trap_ready.exists()),
+        "premise: the unit's agent set its TERM trap within {budget:?}"
+    );
+    assert!(
+        !timed_out.exists(),
+        "premise: the dispatch is still held before its first prompt when the stop is sent"
+    );
 
     decks.signal_stop();
     assert!(
@@ -855,6 +869,12 @@ fn interrupted_038_a_stop_while_a_dispatch_starts_keeps_its_unit_as_interrupted_
     std::fs::write(seams.join("dispatch-seed.release"), b"").unwrap();
     decks.finish_restart();
     drop(caller);
+    // Read once the stopped daemon is gone, so no pass of the seam is still
+    // deciding between the release and its own deadline.
+    assert!(
+        !timed_out.exists(),
+        "premise: the seam held the dispatch until the release, not past its own deadline"
+    );
 
     assert!(
         worktree.is_dir(),

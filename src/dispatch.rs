@@ -3988,10 +3988,14 @@ mod tests {
     /// daemon's registry then shuts down, as a daemon stop drains it, and the
     /// dispatch goes on. Answers its result, the sandbox, the repository, and
     /// what a restarted daemon lists from the journal.
+    ///
+    /// Round 6: with `close_first`, the agent is closed as a person closes it,
+    /// and the journal holds how its attempt ended, before the shutdown.
     #[cfg(unix)]
     async fn dispatch_cut_short_by_shutdown(
         name: &str,
         seam: &str,
+        close_first: bool,
     ) -> (
         DispatchResult,
         tempfile::TempDir,
@@ -4058,6 +4062,32 @@ mod tests {
             })
         };
         reached.await.expect("the dispatch reaches the seam");
+        if close_first {
+            let records = registry.agent_records();
+            assert_eq!(records.len(), 1, "precondition: the agent is up");
+            let agent = records[0].id.clone();
+            let closing = registry.clone();
+            tokio::task::spawn_blocking(move || closing.close_agent(&agent))
+                .await
+                .unwrap()
+                .expect("the agent closes");
+            let journal = registry.work().journal().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                journal.flush();
+                let ended = read_journal(&state_dir).unwrap().lines.iter().any(|line| {
+                    matches!(line.event, crate::work_journal::Event::AttemptEnded { .. })
+                });
+                if ended {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the closed agent's attempt end is never recorded"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
         let draining = registry.clone();
         tokio::task::spawn_blocking(move || {
             draining.shutdown_all_graceful(std::time::Duration::ZERO);
@@ -4131,7 +4161,7 @@ mod tests {
     async fn a_shutdown_before_the_first_prompt_keeps_the_unit_as_interrupted_work() {
         let name = "cut-at-seed";
         let (result, tmp, repo, list) =
-            dispatch_cut_short_by_shutdown(name, crate::spawn::PAUSE_DISPATCH_SEED).await;
+            dispatch_cut_short_by_shutdown(name, crate::spawn::PAUSE_DISPATCH_SEED, false).await;
         assert_kept_as_interrupted(name, &result, &tmp, &repo, &list);
     }
 
@@ -4143,8 +4173,65 @@ mod tests {
     async fn a_shutdown_before_the_unit_is_published_keeps_it_as_interrupted_work() {
         let name = "cut-at-publication";
         let (result, tmp, repo, list) =
-            dispatch_cut_short_by_shutdown(name, "dispatch-publication").await;
+            dispatch_cut_short_by_shutdown(name, "dispatch-publication", false).await;
         assert_kept_as_interrupted(name, &result, &tmp, &repo, &list);
+    }
+
+    /// The assertions for a dispatch whose agent a person closed before the
+    /// shutdown: the ordinary failed start, rolled back, and nothing listed.
+    #[cfg(unix)]
+    fn assert_rolled_back(
+        name: &str,
+        result: &DispatchResult,
+        tmp: &tempfile::TempDir,
+        repo: &Path,
+        list: &crate::interrupted_work::InterruptedList,
+    ) {
+        assert!(!result.success, "{}", result.message);
+        assert!(
+            !result.message.contains("interrupted list"),
+            "a closed agent's unit is not kept for the restart: {}",
+            result.message
+        );
+        assert!(
+            !result.worktree_dir.is_dir(),
+            "the failed start rolls its worktree back: {}",
+            result.message
+        );
+        let branch = format!("agent/dispatch-{name}");
+        assert!(!branch_exists(tmp.path(), repo, &branch), "and its branch");
+        assert!(
+            !list
+                .items
+                .iter()
+                .any(|item| item.kind == crate::interrupted_work::ItemKind::Unit),
+            "nothing is listed: {list:?}"
+        );
+    }
+
+    /// Scenario: a person closes a dispatch's agent before the unit is
+    /// published, and the daemon then stops before the dispatch notices. The
+    /// close, not the stop, ended the agent, so the dispatch fails and rolls
+    /// back as any failed start: no worktree or branch is kept that the
+    /// restarted daemon would not list (PR #2431 round 6, Qodo).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_close_before_a_shutdown_at_publication_rolls_the_unit_back() {
+        let name = "closed-at-publication";
+        let (result, tmp, repo, list) =
+            dispatch_cut_short_by_shutdown(name, "dispatch-publication", true).await;
+        assert_rolled_back(name, &result, &tmp, &repo, &list);
+    }
+
+    /// Scenario: the same close-then-stop, after the unit was published and
+    /// before its first prompt went in.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_close_before_a_shutdown_at_the_first_prompt_rolls_the_unit_back() {
+        let name = "closed-at-seed";
+        let (result, tmp, repo, list) =
+            dispatch_cut_short_by_shutdown(name, crate::spawn::PAUSE_DISPATCH_SEED, true).await;
+        assert_rolled_back(name, &result, &tmp, &repo, &list);
     }
 
     /// Scenario: reviewer nit-R1 (PRD #1589) — a dispatched orchestration is
