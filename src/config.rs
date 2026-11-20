@@ -2470,16 +2470,22 @@ impl AntigravityNoticeState {
 /// What an [`AntigravityNoticeSession`] changed but could not save, relative
 /// to the state it last read from the file (PRD #211).
 ///
-/// Kept as a change rather than an absolute state so that the other client's
-/// starts, saved in the meantime, are added to rather than merged away: the
-/// file at 10, one unsaved start here and one saved start there make 12, and
-/// this session's next start saves 13.
+/// Its starts are kept as a change rather than an absolute count so that the
+/// other client's starts, saved in the meantime, are added to rather than
+/// merged away: the file at 10, one unsaved start here and one saved start
+/// there make 12, and this session's next start saves 13. Its showing is
+/// kept where it happened instead, so those later starts do not push it
+/// later: a showing at the 151st start stays at 151 when the other client
+/// saves five starts before this one can save, and the next is due at 251,
+/// not 256.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct AntigravityNoticePending {
     /// Starts counted here and not yet saved.
     starts: u64,
-    /// The showing among those starts, as its position from the first of
-    /// them (`1` is the first unsaved start); `None` when none showed it.
+    /// The showing among those starts, as the total it happened at: the
+    /// file's count when this session read it for that start, plus this
+    /// session's unsaved starts up to and including it. `None` when none
+    /// showed it.
     shown_at: Option<u64>,
     /// Don't show again, chosen or read here; either side's holds.
     dismissed: bool,
@@ -2487,13 +2493,14 @@ struct AntigravityNoticePending {
 
 impl AntigravityNoticePending {
     /// Apply this change to `state`, read from the file: its starts follow
-    /// the file's, a showing among them lands at its position after the
-    /// file's count, and either side's Don't show again holds.
+    /// the file's, a showing among them keeps the total it happened at
+    /// (never past the merged total, for a file that went back), the later
+    /// of it and the file's showing holds, and either side's Don't show
+    /// again holds.
     fn apply_to(&self, state: &mut AntigravityNoticeState) {
-        let base = state.start_count;
-        state.start_count = base.saturating_add(self.starts);
+        state.start_count = state.start_count.saturating_add(self.starts);
         if let Some(at) = self.shown_at {
-            state.last_prompt_at_start = state.last_prompt_at_start.max(base.saturating_add(at));
+            state.last_prompt_at_start = state.last_prompt_at_start.max(at.min(state.start_count));
         }
         state.permanently_dismissed |= self.dismissed;
     }
@@ -2502,13 +2509,10 @@ impl AntigravityNoticePending {
     fn between(read: &AntigravityNoticeState, changed: &AntigravityNoticeState) -> Self {
         Self {
             starts: changed.start_count.saturating_sub(read.start_count),
-            shown_at: (changed.last_prompt_at_start != read.last_prompt_at_start)
-                .then(|| {
-                    changed
-                        .last_prompt_at_start
-                        .saturating_sub(read.start_count)
-                })
-                .filter(|at| *at > 0),
+            // `apply_to` and a start only move the showing later, so one that
+            // differs from the file's is this session's.
+            shown_at: (changed.last_prompt_at_start > read.last_prompt_at_start)
+                .then_some(changed.last_prompt_at_start),
             dismissed: changed.permanently_dismissed,
         }
     }
@@ -4999,6 +5003,131 @@ command = "vim"
         assert!(!notice_start(&path).show, "103, the other client");
         let (state, _) = AntigravityNoticeState::load_from(&path);
         assert_eq!((state.start_count, state.last_prompt_at_start), (103, 101));
+    }
+
+    /// PRD #211 (Qodo finding on PR #2370): a showing this session could not
+    /// save keeps the start it happened at when the other client saves starts
+    /// before this session recovers. The file at 150 (last shown at 50); this
+    /// session's 151st start shows the notice and cannot be saved; the other
+    /// client then saves five starts (its first shows the notice too, since
+    /// it cannot know of this one); this session's next start saves 157 with
+    /// the showing at 151, not 156, and the notice is next due at 251.
+    #[test]
+    fn antigravity_notice_unsaved_showing_keeps_its_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notice.json");
+        seed_notice(&path, 150, 50);
+        let mut a = notice_session(&path);
+        let held = hold_notice_lock(&path);
+        let unsaved = a.record_start();
+        assert!(unsaved.show, "the 151st start");
+        assert!(unsaved.problem.is_some(), "the held lock was not said");
+        drop(held);
+        assert_eq!(
+            AntigravityNoticeState::load_from(&path).0.start_count,
+            150,
+            "the showing was saved"
+        );
+        assert!(notice_start(&path).show, "the other client's 151st");
+        for start in 152..=155 {
+            assert!(!notice_start(&path).show, "the other client's {start}");
+        }
+        let (state, _) = AntigravityNoticeState::load_from(&path);
+        assert_eq!((state.start_count, state.last_prompt_at_start), (155, 151));
+        let merged = a.state();
+        assert_eq!(
+            (merged.start_count, merged.last_prompt_at_start),
+            (156, 151),
+            "the unsaved showing moved after the other client's starts"
+        );
+        assert!(!a.record_start().show, "157");
+        let (state, _) = AntigravityNoticeState::load_from(&path);
+        assert_eq!(
+            (state.start_count, state.last_prompt_at_start),
+            (157, 151),
+            "the recovered save rebased the showing"
+        );
+        assert_eq!(a.state(), state, "the saved change was kept twice");
+        for start in 158..=250 {
+            assert!(!notice_start(&path).show, "start {start} showed");
+        }
+        assert!(notice_start(&path).show, "251, the hundredth after 151");
+    }
+
+    /// PRD #211: an unsaved showing applied to a file read later keeps the
+    /// total it happened at whatever the file's own showing — earlier, the
+    /// same or later — and never lands past the merged total when the file
+    /// went back (it was replaced by an empty one).
+    #[test]
+    fn antigravity_notice_pending_showing_keeps_its_total() {
+        let pending = AntigravityNoticePending {
+            starts: 1,
+            shown_at: Some(151),
+            dismissed: false,
+        };
+        for (file_last, merged_last) in [(50, 151), (151, 151), (153, 153)] {
+            let mut state = AntigravityNoticeState {
+                start_count: 155,
+                last_prompt_at_start: file_last,
+                permanently_dismissed: false,
+            };
+            pending.apply_to(&mut state);
+            assert_eq!(
+                (state.start_count, state.last_prompt_at_start),
+                (156, merged_last),
+                "the file's showing at {file_last}"
+            );
+        }
+        let mut state = AntigravityNoticeState::default();
+        pending.apply_to(&mut state);
+        assert_eq!((state.start_count, state.last_prompt_at_start), (1, 1));
+        assert!(!state.is_due(), "the start after the showing");
+    }
+
+    /// PRD #211: Don't show again holds across a save this session could not
+    /// make, in both directions. A dismissal here that could not be saved
+    /// holds over the other client's later start and is saved with this
+    /// session's next start; a dismissal the other client saved while this
+    /// session held an unsaved start holds here and is kept by that save.
+    /// Neither side's starts are lost.
+    #[test]
+    fn antigravity_notice_unsaved_dismissal_ors_both_ways() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // This session's dismissal cannot be saved; the other client's start
+        // is saved without it.
+        let path = dir.path().join("here.json");
+        seed_notice(&path, 10, 1);
+        let mut a = notice_session(&path);
+        let held = hold_notice_lock(&path);
+        assert!(a.dismiss_permanently().is_some(), "the held lock was said");
+        drop(held);
+        assert!(!notice_start(&path).show, "the other client's start");
+        let (state, _) = AntigravityNoticeState::load_from(&path);
+        assert_eq!(state.start_count, 11);
+        assert!(!state.permanently_dismissed, "precondition");
+        assert!(a.state().permanently_dismissed, "the unsaved dismissal");
+        assert!(!a.record_start().show);
+        let (state, _) = AntigravityNoticeState::load_from(&path);
+        assert_eq!(state.start_count, 12);
+        assert!(state.permanently_dismissed, "this session's dismissal");
+
+        // The other client's dismissal is saved while this session holds an
+        // unsaved start.
+        let path = dir.path().join("there.json");
+        seed_notice(&path, 10, 1);
+        let mut a = notice_session(&path);
+        let held = hold_notice_lock(&path);
+        assert!(!a.record_start().show);
+        drop(held);
+        assert_eq!(notice_session(&path).dismiss_permanently(), None);
+        let merged = a.state();
+        assert_eq!(merged.start_count, 11, "the unsaved start");
+        assert!(merged.permanently_dismissed, "the other client's dismissal");
+        assert!(!a.record_start().show);
+        let (state, _) = AntigravityNoticeState::load_from(&path);
+        assert_eq!(state.start_count, 12);
+        assert!(state.permanently_dismissed, "the other client's dismissal");
     }
 
     /// PRD #2174: two clients share one file. Launches of either count

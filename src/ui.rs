@@ -2292,6 +2292,12 @@ struct UiState {
     /// PRD #211: the mode the Antigravity notice returns to when it closes —
     /// where the New Agent start would have left the user without it.
     antigravity_notice_resume: UiMode,
+    /// PRD #211: the quit confirmation on screen was opened by `Ctrl+C` from
+    /// the Antigravity notice, so cancelling it returns to the notice, still
+    /// unanswered, rather than to command mode. Cleared by every key typed
+    /// outside the quit dialogs, so it never outlives the dialog it was set
+    /// for.
+    quit_confirm_over_antigravity_notice: bool,
     /// PRD #211: a notice due while the star reminder is open, shown once
     /// that closes (one dialog at a time).
     antigravity_notice_pending: bool,
@@ -2772,6 +2778,7 @@ impl UiState {
             last_click: None,
             star_prompt_state: config::StarPromptState::default(),
             antigravity_notice_resume: UiMode::PaneInput,
+            quit_confirm_over_antigravity_notice: false,
             antigravity_notice_pending: false,
             antigravity_notice: config::AntigravityNoticeSession::new(
                 config::antigravity_notice_path(),
@@ -7873,16 +7880,28 @@ fn handle_quit_confirm_key(key: KeyEvent, ui: &mut UiState, managed_agents_count
                 }
             }
             _ => {
-                ui.mode = UiMode::Normal;
+                cancel_quit_confirm(ui);
                 Action::Continue
             }
         },
         KeyCode::Esc => {
-            ui.mode = UiMode::Normal;
+            cancel_quit_confirm(ui);
             Action::Continue
         }
         _ => Action::Continue,
     }
+}
+
+/// Cancel the quit confirmation: back to the Antigravity notice when that is
+/// what `Ctrl+C` left (PRD #211: the notice is still unanswered, and it
+/// returns where the start left the user once it is answered), else to
+/// command mode.
+fn cancel_quit_confirm(ui: &mut UiState) {
+    ui.mode = if std::mem::take(&mut ui.quit_confirm_over_antigravity_notice) {
+        UiMode::AntigravityNotice
+    } else {
+        UiMode::Normal
+    };
 }
 
 /// PRD #92 F1: secondary y/n confirmation when the user picks Stop in
@@ -12970,7 +12989,12 @@ fn dispatch_action(
             // user already declined. Harmless for every other modal.
             ui.close_confirm_target = None;
             ui.confirm_choices_drawn = None;
-            ui.mode = UiMode::Normal;
+            if ui.mode == UiMode::QuitConfirm {
+                cancel_quit_confirm(ui);
+            } else {
+                ui.quit_confirm_over_antigravity_notice = false;
+                ui.mode = UiMode::Normal;
+            }
         }
         // config-gen [Yes]: send the prompt to the pending target pane.
         Action::ConfigGenConfirm => {
@@ -14580,6 +14604,11 @@ fn handle_key_event(
     // pressed the key, not the one they landed in.
     let was_command_mode = ui.mode == UiMode::Normal;
     let mode_before = ui.mode;
+    // PRD #211: the notice under the quit dialog is that dialog's alone; a key
+    // typed anywhere else means it is no longer what a Cancel returns to.
+    if !matches!(mode_before, UiMode::QuitConfirm | UiMode::StopConfirm) {
+        ui.quit_confirm_over_antigravity_notice = false;
+    }
 
     // PRD #40: snapshot the active keybindings for this keypress (cheap
     // HashMap clone; config is immutable for the session) so the mapper
@@ -14782,10 +14811,12 @@ fn handle_key_event(
                 gated
             }
             UiMode::StarPrompt => handle_star_prompt_key(key, ui),
-            // PRD #211: `Ctrl+C` keeps its PRD #40 safety net; leaving for the
-            // quit flow closes the notice as Later does.
+            // PRD #211: `Ctrl+C` keeps its PRD #40 safety net. The notice is
+            // not answered by it: cancelling the quit dialog comes back to
+            // the notice, which still returns where the start left the user.
             UiMode::AntigravityNotice if is_ctrl_c => {
                 ui.quit_confirm_selected = 0;
+                ui.quit_confirm_over_antigravity_notice = true;
                 ui.mode = UiMode::QuitConfirm;
                 Action::Continue
             }
@@ -51963,6 +51994,127 @@ mod tests {
             );
         }
         assert!(ui.status_message.is_none(), "the problem was said twice");
+    }
+
+    /// PRD #211 (Qodo finding on PR #2370): `Ctrl+C` on a notice opened over
+    /// the new pane's input opens the quit dialog, and cancelling that dialog
+    /// — Escape, Enter on Cancel, or the `[Cancel]` button — comes back to the
+    /// notice, still unanswered; answering it then returns to the pane, with
+    /// its focus never moved. A quit dialog opened from command mode still
+    /// cancels to command mode, including after one opened from the notice
+    /// (controls).
+    #[test]
+    fn antigravity_notice_cancelled_quit_returns_to_the_notice() {
+        use tokio::sync::RwLock;
+        let pc = Arc::new(OpenTabPC::new());
+        let state: SharedState = Arc::new(RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let press = |ui: &mut UiState, tab_manager: &mut TabManager, key: KeyEvent| {
+            handle_key_event(
+                key,
+                ui,
+                &*pc,
+                &state,
+                tab_manager,
+                &snapshot,
+                &[],
+                Rect::new(0, 0, 80, 24),
+            )
+        };
+        let cancel_button = |ui: &mut UiState, tab_manager: &mut TabManager| {
+            dispatch_action(
+                Action::DismissModal,
+                ui,
+                &*pc,
+                &state,
+                tab_manager,
+                &snapshot,
+                &[],
+                None,
+                Rect::new(0, 0, 80, 24),
+            )
+        };
+        for route in ["Esc", "Enter on Cancel", "[Cancel]"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut tab_manager = TabManager::new(pc.clone());
+            let mut ui = notice_ui(dir.path());
+            pc.focused.lock().unwrap().clear();
+            pc.focus_pane("mock-pane-0").unwrap();
+            ui.mode = UiMode::PaneInput;
+            record_antigravity_start(&mut ui);
+            assert_eq!(ui.mode, UiMode::AntigravityNotice, "{route}: precondition");
+
+            press(&mut ui, &mut tab_manager, ctrl_c);
+            assert_eq!(ui.mode, UiMode::QuitConfirm, "{route}: Ctrl+C");
+            // Like the notice, the dialog takes keys once its choices are drawn.
+            draw_sized(&mut ui, 80, 24);
+            match route {
+                "Esc" => {
+                    press(&mut ui, &mut tab_manager, KeyEvent::from(KeyCode::Esc));
+                }
+                "Enter on Cancel" => {
+                    for _ in 0..2 {
+                        press(&mut ui, &mut tab_manager, KeyEvent::from(KeyCode::Down));
+                    }
+                    assert_eq!(ui.quit_confirm_selected, 2, "{route}: Cancel selected");
+                    press(&mut ui, &mut tab_manager, KeyEvent::from(KeyCode::Enter));
+                }
+                _ => {
+                    cancel_button(&mut ui, &mut tab_manager);
+                }
+            }
+            assert_eq!(
+                ui.mode,
+                UiMode::AntigravityNotice,
+                "{route}: cancelling quit did not come back to the notice"
+            );
+            let (saved, _) =
+                config::AntigravityNoticeState::load_from(ui.antigravity_notice.path());
+            assert!(
+                !saved.permanently_dismissed,
+                "{route}: the notice was answered"
+            );
+
+            // The notice takes a choice only once its choices are drawn.
+            let rows = draw_sized(&mut ui, 80, 24);
+            assert!(
+                on_screen(&rows, ANTIGRAVITY_NOTICE_KEYS.0),
+                "{route}: the notice is not drawn:\n{}",
+                rows.join("\n")
+            );
+            press(
+                &mut ui,
+                &mut tab_manager,
+                KeyEvent::from(KeyCode::Char('l')),
+            );
+            assert_eq!(
+                ui.mode,
+                UiMode::PaneInput,
+                "{route}: Later did not return to the pane"
+            );
+            assert_eq!(
+                *pc.focused.lock().unwrap(),
+                vec!["mock-pane-0".to_string()],
+                "{route}: the pane's focus moved"
+            );
+
+            // Control: a quit dialog from command mode cancels to command
+            // mode, after one from the notice as well as on its own.
+            ui.mode = UiMode::Normal;
+            press(&mut ui, &mut tab_manager, ctrl_c);
+            assert_eq!(ui.mode, UiMode::QuitConfirm, "{route}: control Ctrl+C");
+            draw_sized(&mut ui, 80, 24);
+            match route {
+                "[Cancel]" => {
+                    cancel_button(&mut ui, &mut tab_manager);
+                }
+                _ => {
+                    press(&mut ui, &mut tab_manager, KeyEvent::from(KeyCode::Esc));
+                }
+            }
+            assert_eq!(ui.mode, UiMode::Normal, "{route}: control");
+        }
     }
 
     /// PRD #211: with the notice drawn, `o`, `l`, `d` and `Esc` with `Ctrl`,
