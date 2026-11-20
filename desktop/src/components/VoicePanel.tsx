@@ -215,7 +215,7 @@ export const INTENT_DISCLOSURE_QUESTION = "While the agent on screen waits on a 
  * on — commands may be misheard — and an English-only model (a `.en` Whisper
  * build, such as the local default) is one that cannot do what was chosen.
  */
-export const languageHint = (language: string, model: string): string | undefined => {
+const languageHint = (language: string, model: string): string | undefined => {
   if (language === DEFAULT_SPEECH_LANGUAGE) return undefined;
   const name = language === AUTO_SPEECH_LANGUAGE
     ? undefined

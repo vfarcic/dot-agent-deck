@@ -37,7 +37,7 @@ import type { DaemonProject, DaemonResolvedProject } from "../types";
  *    deliberately no local fallback — one would reinstate the
  *    silently-wrong-filesystem behaviour on the least tested path.
  */
-export type ProjectListingState = "idle" | "loading" | "ready" | "empty" | "unavailable";
+type ProjectListingState = "idle" | "loading" | "ready" | "empty" | "unavailable";
 
 /**
  * The daemon's stable refusal code for "that path did not resolve"

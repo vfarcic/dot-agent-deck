@@ -100,11 +100,11 @@ export interface VoicePager {
 }
 
 /** "next page" with nothing on screen split into pages. */
-export const NOTHING_PAGES = "Nothing on screen is split into pages, so there is no other page to show.";
+const NOTHING_PAGES = "Nothing on screen is split into pages, so there is no other page to show.";
 /** "next page" on the last page. */
-export const LAST_PAGE = "This is the last page, so there is no next page.";
+const LAST_PAGE = "This is the last page, so there is no next page.";
 /** "previous page" on the first page. */
-export const FIRST_PAGE = "This is the first page, so there is no previous page.";
+const FIRST_PAGE = "This is the first page, so there is no previous page.";
 
 /**
  * Why a page turn by `delta` cannot happen on `pager`, or `undefined` when it

@@ -28,7 +28,7 @@ export interface LocalUpgradeRequest {
 export const CLI_LEAVES_DAEMON = "Upgrading the CLI does not restart the daemon on this machine, so its agents keep running.";
 
 /** What the CLI's dialog says when the local daemon is restarted after it: the offer's versions, when the crate gave them. */
-export function restartAfterCli(daemon: UpgradeTarget): string {
+function restartAfterCli(daemon: UpgradeTarget): string {
   const offer = daemon.offer?.kind === "offered" ? daemon.offer : undefined;
   const versions = offer ? `, which runs ${offer.from}, onto ${offer.to},` : " onto";
   return `After the CLI, Agent Deck restarts the daemon on this machine${versions} the version that came with this app. If agents or orchestration roles are running on it, you are shown each one and asked first; Keep current daemon leaves them running.`;
@@ -68,7 +68,7 @@ export function upgradeCopies(check: SelfUpgradeCheck, entry: UpgradeEntry): Sel
 }
 
 /** What the dialog says after the plans, about what follows them: nothing to say unless the CLI is covered. */
-export function afterCopies(check: SelfUpgradeCheck, copies: readonly SelfCopy[], daemon: UpgradeTarget | undefined, entry: UpgradeEntry): string | undefined {
+function afterCopies(check: SelfUpgradeCheck, copies: readonly SelfCopy[], daemon: UpgradeTarget | undefined, entry: UpgradeEntry): string | undefined {
   if (!copies.includes("cli")) return undefined;
   if (copies.includes("app") && appFirst(check)) return entry === "notice" ? CLI_AFTER_APP : APP_BEFORE_CLI;
   return daemon ? restartAfterCli(daemon) : CLI_LEAVES_DAEMON;
