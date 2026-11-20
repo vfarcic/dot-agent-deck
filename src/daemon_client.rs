@@ -1558,7 +1558,7 @@ pub struct AgentCardsAnswer {
 
 /// Issue #2418: the client side of the tree's gate. Against a daemon whose
 /// `capabilities` do not name [`crate::daemon_protocol::CAP_AGENT_CARDS_TREE`],
-/// any `parent`, `rollup` or `checked_refs` an entry carries is dropped
+/// any `parent`, `kind`, `rollup` or `checked_refs` an entry carries is dropped
 /// rather than drawn: those names mean the tree only from a daemon that says
 /// it builds one.
 pub fn tree_gate(
@@ -1569,6 +1569,7 @@ pub fn tree_gate(
     if !tree {
         for entry in &mut list.entries {
             entry.parent = None;
+            entry.kind = None;
             entry.rollup = None;
             entry.checked_refs.clear();
         }
@@ -6925,6 +6926,45 @@ mod tests {
         assert_eq!(e.status, "working", "the rest of the entry is untouched");
         let older = tree_gate(list, &DaemonCapabilities::absent());
         assert!(!older.tree);
+    }
+
+    /// Issue #2418 review (desktop 6) — a card's `kind` is a tree field like
+    /// `parent`: [`tree_gate`] keeps it from a daemon that advertises the tree
+    /// and drops it from one that does not.
+    #[test]
+    fn the_tree_gate_drops_a_kind_the_daemon_did_not_advertise() {
+        use crate::daemon_protocol::{CAP_AGENT_CARDS, CAP_AGENT_CARDS_TREE};
+        let entry: crate::agent_cards::AgentCardEntry = serde_json::from_value(serde_json::json!({
+            "key": "d/1", "instance_id": "i", "pane_id": "d", "agent_id": "1",
+            "name": "dispatcher", "status": "idle", "needs_you": false,
+            "needs_you_reasons": [],
+            "group": {"id": "dispatcher:d/1", "kind": "dispatcher"},
+            "primary_action_id": "open",
+            "facts": {"source": "deck"},
+            "kind": "dispatcher",
+            "revision": 1, "updated_at": "2026-11-20T10:00:00Z",
+        }))
+        .expect("an entry with a kind decodes");
+        assert_eq!(entry.kind.as_deref(), Some("dispatcher"));
+        let list = crate::agent_cards::AgentCardList {
+            instance_id: "i".into(),
+            revision: 1,
+            entries: vec![entry],
+            catalog_errors: Vec::new(),
+        };
+        let caps = |list: &[&str]| {
+            DaemonCapabilities::from_hello(&AttachResponse {
+                capabilities: Some(list.iter().map(|c| c.to_string()).collect()),
+                ..AttachResponse::hello(PROTOCOL_VERSION)
+            })
+        };
+        let kept = tree_gate(
+            list.clone(),
+            &caps(&[CAP_AGENT_CARDS, CAP_AGENT_CARDS_TREE]),
+        );
+        assert_eq!(kept.list.entries[0].kind.as_deref(), Some("dispatcher"));
+        let dropped = tree_gate(list, &caps(&[CAP_AGENT_CARDS]));
+        assert!(dropped.list.entries[0].kind.is_none());
     }
 
     /// PRD #2374 (review B3) — `invoke_card_action` binds itself to the

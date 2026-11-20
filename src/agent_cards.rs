@@ -947,6 +947,13 @@ pub struct AgentCardEntry {
     /// role. Absent on a root, and on a card whose starter's card is gone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
+    /// Issue #2418 review (D6): what this card is — `dispatcher` (the
+    /// dispatch records name it as the dispatcher of a unit, whether or not
+    /// that unit's card is still listed), `orchestrator` or `role` (its
+    /// orchestration seat), or `agent`. Sent with the tree, so absent from a
+    /// daemon that does not advertise `agent-cards-tree`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     /// Issue #2418 (D2): what is under this card; absent when nothing is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollup: Option<CardRollup>,
@@ -1664,6 +1671,14 @@ fn project_entry(
             label: None,
         }
     };
+    // Issue #2418 review (D6): the card's kind, from exact identity. An
+    // orchestrator that also dispatches reads as an orchestrator.
+    let kind = match &orchestration {
+        Some((_, _, _, true)) => "orchestrator",
+        _ if is_dispatcher => "dispatcher",
+        Some(_) => "role",
+        None => "agent",
+    };
     let relations = CardRelations {
         dispatcher: dispatcher_rel,
         orchestration: orchestration.map(|(id, label, role, is_orchestrator)| {
@@ -1709,6 +1724,7 @@ fn project_entry(
             pull_request,
         },
         parent: None,
+        kind: Some(kind.to_string()),
         rollup: None,
         checked_refs: Vec::new(),
         recent_deliveries,
@@ -3750,6 +3766,42 @@ mod tests {
         // dispatcher wins for every member of a dispatched orchestration.
         assert_eq!(one(&entries, "r1/7").group.id, "dispatcher:d1/1");
         assert_eq!(one(&entries, "r3/10").group.id, "orch-b");
+    }
+
+    /// Issue #2418 review (desktop 6): each card carries its kind, computed
+    /// from exact identity — a dispatcher by the dispatch records whether or
+    /// not any card it dispatched is still listed, an orchestrator or a role
+    /// by its orchestration seat, anything else an agent.
+    #[test]
+    fn each_card_carries_its_kind_from_the_dispatch_records() {
+        let catalog = resolve(None);
+        let agents = [
+            facts("1", "d1"),
+            facts("2", "s1"),
+            facts("3", "u1"),
+            facts("4", "d2"),
+            role("6", "o1", "orch-a", "orchestrator", true),
+            role("7", "r1", "orch-a", "coder", false),
+        ];
+        let units = [
+            single_unit(("d1", "1"), ("u1", "3")),
+            orchestration_unit(("d1", "1"), "orch-a"),
+            // d2 dispatched a unit that is no longer listed.
+            single_unit(("d2", "4"), ("gone", "5")),
+        ];
+        let entries = project_all(&agents, &HashMap::new(), &catalog, &units, "i");
+        let kind = |key: &str| one(&entries, key).kind;
+        assert_eq!(kind("d1/1").as_deref(), Some("dispatcher"));
+        assert_eq!(kind("d2/4").as_deref(), Some("dispatcher"));
+        assert_eq!(kind("s1/2").as_deref(), Some("agent"));
+        assert_eq!(kind("u1/3").as_deref(), Some("agent"));
+        assert_eq!(kind("o1/6").as_deref(), Some("orchestrator"));
+        assert_eq!(kind("r1/7").as_deref(), Some("role"));
+        // The kind does not depend on which other cards are listed.
+        let alone = project_all(&agents[..1], &HashMap::new(), &catalog, &units, "i");
+        assert_eq!(alone[0].kind.as_deref(), Some("dispatcher"));
+        let wire = serde_json::to_value(&alone[0]).unwrap();
+        assert_eq!(wire["kind"], "dispatcher");
     }
 
     /// T1 (D1): a child whose parent's entry is gone becomes a root rather
