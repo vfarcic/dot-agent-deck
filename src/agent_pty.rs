@@ -30282,7 +30282,6 @@ mod spawn_tests {
     /// Scenario: inbox/doorbell/046 through the real adapter: a model editor drops the deck's Enter, so the ring ends unresolved and the doorbell is suspended with uncertain_input shown, while the user has a draft of their own in the tracker. An older attempt's token reported exact by the prompt hook moves nothing; this attempt's token reported exact afterwards resolves the attempt late, lifts the suspension and clears the card, and leaves the user's draft bit as it was.
     #[spec("inbox/doorbell/046")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
-    #[ignore = "quarantined: vfarcic, #2345"]
     async fn doorbell_046_late_exact_evidence_resolves_only_its_attempt_through_the_hook_arm() {
         use crate::doorbell_txn::{Latch, Outcome, Resolution};
         use crate::inbox_display::WakeHold;
@@ -30298,6 +30297,14 @@ mod spawn_tests {
         let old_token = typed_line(&editor.typed()).unwrap()[1..7].to_string();
         editor.control.lock().unwrap().on_enter = OnEnter::Drop;
         let typed_before = editor.typed().len();
+        // The first ring ends on the hook's token, which the model editor
+        // reports before it redraws its emptied composer: under load the
+        // second ring could otherwise read the frame still holding the line
+        // and refuse as AwaitingPrompt (issue #2345), as
+        // `doorbell_050_a_ring_on_the_real_writer_submits_its_line_and_nothing_else`
+        // already waits for.
+        editor.wait_drawn("");
+        editor.wait_clean();
         let report = editor.ring().await;
         assert!(
             matches!(report.outcome, RingOutcome::Txn(Outcome::Unresolved(_))),

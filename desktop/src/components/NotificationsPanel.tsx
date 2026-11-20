@@ -18,10 +18,10 @@ import { questionNotifyAfterMinutes } from "../lib/bridge";
 import type { SettingsPanelProps } from "../lib/settingsContract";
 
 /** The minutes offered, `0` being Off. */
-export const QUESTION_NOTIFY_PRESETS = [0, 5, 10, 15, 30, 60] as const;
+const QUESTION_NOTIFY_PRESETS = [0, 5, 10, 15, 30, 60] as const;
 
 /** How a value reads in the select. */
-export function formatNotifyAfter(minutes: number): string {
+function formatNotifyAfter(minutes: number): string {
   if (minutes === 0) return "Off";
   if (minutes === 1) return "After 1 minute";
   return `After ${minutes} minutes`;
