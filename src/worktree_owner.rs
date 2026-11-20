@@ -188,7 +188,16 @@ fn rev_parse_path(dir: &Path, flag: &str) -> Option<PathBuf> {
     if !out.status.success() {
         return None;
     }
-    let raw = trim_trailing_newline(&out.stdout);
+    rev_parse_answer(dir, &out.stdout)
+}
+
+/// The path a successful `git rev-parse <flag>` run from inside `dir`
+/// printed on `stdout`, read the way [`rev_parse_path`] reads it: one
+/// trailing newline trimmed, the bytes kept verbatim, a relative answer
+/// joined to `dir`; `None` for an empty answer. For a caller that runs the
+/// `git` itself, under a deadline (PRD #1790's reclaim).
+pub(crate) fn rev_parse_answer(dir: &Path, stdout: &[u8]) -> Option<PathBuf> {
+    let raw = trim_trailing_newline(stdout);
     if raw.is_empty() {
         return None;
     }
@@ -341,9 +350,21 @@ pub struct VerifiedGeometry {
 /// Three git answers (`--show-toplevel`, `--git-dir`, `--git-common-dir`) are
 /// read once and every fact returned is derived from them and those checks.
 pub fn verified_geometry_of(dir: &Path) -> Option<VerifiedGeometry> {
-    let toplevel = std::fs::canonicalize(rev_parse_path(dir, "--show-toplevel")?).ok()?;
-    let git_dir = std::fs::canonicalize(rev_parse_path(dir, "--git-dir")?).ok()?;
-    let common = std::fs::canonicalize(rev_parse_path(dir, "--git-common-dir")?).ok()?;
+    verify_geometry(
+        &rev_parse_path(dir, "--show-toplevel")?,
+        &rev_parse_path(dir, "--git-dir")?,
+        &rev_parse_path(dir, "--git-common-dir")?,
+    )
+}
+
+/// The checks of [`verified_geometry_of`] on git's three answers
+/// (`--show-toplevel`, `--git-dir`, `--git-common-dir`, each as
+/// [`rev_parse_answer`] reads it), for a caller that asked git itself, under
+/// a deadline (PRD #1790's reclaim). Runs no `git`; reads the filesystem.
+pub fn verify_geometry(toplevel: &Path, git_dir: &Path, common: &Path) -> Option<VerifiedGeometry> {
+    let toplevel = std::fs::canonicalize(toplevel).ok()?;
+    let git_dir = std::fs::canonicalize(git_dir).ok()?;
+    let common = std::fs::canonicalize(common).ok()?;
 
     if git_dir == common {
         // The main checkout, or one git treats as such (a relocated store, a
@@ -365,7 +386,12 @@ pub fn verified_geometry_of(dir: &Path) -> Option<VerifiedGeometry> {
     if !std::fs::symlink_metadata(&dot_git).ok()?.is_file() {
         return None;
     }
-    let raw = std::fs::read(git_dir.join("gitdir")).ok()?;
+    // A regular file only: a FIFO planted there would block the read.
+    let gitdir_file = git_dir.join("gitdir");
+    if !std::fs::metadata(&gitdir_file).ok()?.is_file() {
+        return None;
+    }
+    let raw = std::fs::read(gitdir_file).ok()?;
     let pointer = path_from_bytes(trim_trailing_newline(&raw));
     // `worktree.useRelativePaths` writes the back-pointer relative to the
     // administrative directory.
@@ -464,6 +490,13 @@ fn reads_as_claim(path: &Path) -> bool {
 /// working tree (git lists it first and it is never a reclaim candidate).
 pub fn is_marked(worktree_path: &Path) -> bool {
     marker_path(worktree_path).is_some_and(|p| reads_as_claim(&p))
+}
+
+/// [`is_marked`] for a worktree whose git metadata dir the caller already
+/// resolved (`git rev-parse --git-dir`, asked under a deadline by PRD
+/// #1790's reclaim). Runs no `git`.
+pub fn is_marked_in(git_dir: &Path) -> bool {
+    reads_as_claim(&git_dir.join(OWNER_MARKER_FILENAME))
 }
 
 /// What created a worktree, recorded in the marker so a later reader can name

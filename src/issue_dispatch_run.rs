@@ -654,6 +654,28 @@ pub async fn remove_worktree_outcome(
     clone_dir: &Path,
     policy: RemovalPolicy,
 ) -> WorktreeRemoval {
+    remove_worktree_outcome_guarded(worktree_dir, clone_dir, policy, || async { true })
+        .await
+        .unwrap_or(WorktreeRemoval::RemoveFailed)
+}
+
+/// PRD #1790 stage 2: [`remove_worktree_outcome`], asking `still_ours`
+/// after the keep check and immediately before `git worktree remove`, and
+/// removing nothing — answering `None` — when it says no. The reclaim of an
+/// interrupted item re-validates there that the directory is still the
+/// worktree it checked. Nothing runs between `still_ours` answering and the
+/// removal starting, but another process can still change the directory in
+/// that gap.
+pub async fn remove_worktree_outcome_guarded<F, Fut>(
+    worktree_dir: &Path,
+    clone_dir: &Path,
+    policy: RemovalPolicy,
+    still_ours: F,
+) -> Option<WorktreeRemoval>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
     let worktree = worktree_dir.to_string_lossy();
     // PRD #1589 (auditor S5): the path and git's error text are producer
     // values — a directory name may carry a newline or a terminal control — so
@@ -672,7 +694,7 @@ pub async fn remove_worktree_outcome(
                     worktree = %shown_worktree,
                     "dispatch: worktree has uncommitted changes; leaving in place"
                 );
-                return WorktreeRemoval::KeptDirty;
+                return Some(WorktreeRemoval::KeptDirty);
             }
             // Issue #2285: `git worktree remove` would delete these with the
             // directory, their uncommitted work included, and exit 0.
@@ -682,7 +704,7 @@ pub async fn remove_worktree_outcome(
                     nested = %logged(&nested.join(", ")),
                     "dispatch: other worktrees lie inside the worktree; leaving in place"
                 );
-                return WorktreeRemoval::KeptHoldsWorktrees(nested);
+                return Some(WorktreeRemoval::KeptHoldsWorktrees(nested));
             }
             Ok(TreeKeepCheck::Clean) => {}
             Err(e) => {
@@ -691,9 +713,17 @@ pub async fn remove_worktree_outcome(
                     error = %logged(&e.to_string()),
                     "dispatch: could not check worktree status or the worktrees inside it; leaving in place"
                 );
-                return WorktreeRemoval::KeptCouldNotCheck;
+                return Some(WorktreeRemoval::KeptCouldNotCheck);
             }
         }
+    }
+
+    if !still_ours().await {
+        tracing::warn!(
+            worktree = %shown_worktree,
+            "dispatch: the worktree changed before its removal; leaving in place"
+        );
+        return None;
     }
 
     let clone = clone_dir.to_string_lossy();
@@ -702,7 +732,7 @@ pub async fn remove_worktree_outcome(
         args.push("--force");
     }
     let res = run_git_status(&args).await;
-    match res {
+    Some(match res {
         Ok(()) => {
             tracing::info!(
                 worktree = %shown_worktree,
@@ -723,7 +753,7 @@ pub async fn remove_worktree_outcome(
             );
             WorktreeRemoval::RemoveFailed
         }
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -3468,7 +3498,7 @@ const SUBPROCESS_OVERFLOW_MARKER: &str = "output too large: ";
 
 /// Whether `err` is the error [`output_within_capped`] returns when it killed
 /// a command for printing more than its stdout cap.
-fn is_subprocess_overflow(err: &str) -> bool {
+pub(crate) fn is_subprocess_overflow(err: &str) -> bool {
     err.starts_with(SUBPROCESS_OVERFLOW_MARKER)
 }
 
@@ -3738,6 +3768,34 @@ pub(crate) async fn run_git_capture_within(
         crate::git_env::GIT,
         args,
         bound,
+    )
+    .await
+}
+
+/// PRD #1790 stage 2: `cmd` (`program` with `args`) under `bound`, keeping at
+/// most `stdout_cap` bytes of stdout (past that it is killed and reported as
+/// too large) and `stderr_cap` of stderr ([`output_within_capped`]). On a
+/// timeout or an overflow its process group is killed and the child reaped
+/// before this returns, so a caller holding a concurrency permit across the
+/// call holds it until the child is gone. A non-zero exit is `Ok`: the caller
+/// reads `status`.
+pub(crate) async fn output_bounded(
+    cmd: tokio::process::Command,
+    program: &str,
+    args: &[&str],
+    bound: Duration,
+    stdout_cap: usize,
+    stderr_cap: usize,
+) -> Result<std::process::Output, String> {
+    output_within_capped(
+        cmd,
+        program,
+        args,
+        bound,
+        OutputCaps {
+            stdout: Some(stdout_cap),
+            stderr: Some(stderr_cap),
+        },
     )
     .await
 }

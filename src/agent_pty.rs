@@ -10748,6 +10748,11 @@ fn path_within(path: &std::path::Path, dir: &std::path::Path) -> bool {
 /// is not a directory. The only directories held for removal are abandoned
 /// issue-dispatch worktrees inside the daemon's clones, which are none of those
 /// unless the daemon or its environment was pointed into one.
+///
+/// PRD #1790 stage 2: each directory that resolves through a symlink or a
+/// `..` to another spelling is recorded in that canonical spelling too, so a
+/// hold on a worktree's canonical path refuses a start through an alias of it
+/// (a symlink to the worktree), and a removal sees an agent started that way.
 fn spawn_dirs(cwd: Option<&str>, tab_membership: Option<&TabMembership>) -> Vec<PathBuf> {
     let orchestration_cwd = match tab_membership {
         Some(TabMembership::Orchestration {
@@ -10756,19 +10761,26 @@ fn spawn_dirs(cwd: Option<&str>, tab_membership: Option<&TabMembership>) -> Vec<
         _ => None,
     };
     let mut base = None;
-    cwd.into_iter()
-        .chain(orchestration_cwd)
-        .map(|dir| {
-            let dir = PathBuf::from(dir);
-            if dir.is_absolute() {
-                return dir;
-            }
+    let mut out: Vec<PathBuf> = Vec::new();
+    for dir in cwd.into_iter().chain(orchestration_cwd) {
+        let dir = PathBuf::from(dir);
+        let dir = if dir.is_absolute() {
+            dir
+        } else {
             match base.get_or_insert_with(|| std::env::current_dir().ok()) {
                 Some(base) => base.join(dir),
                 None => dir,
             }
-        })
-        .collect()
+        };
+        let canonical = std::fs::canonicalize(&dir).ok();
+        out.push(dir);
+        if let Some(canonical) = canonical
+            && !out.contains(&canonical)
+        {
+            out.push(canonical);
+        }
+    }
+    out
 }
 
 /// Issue #454 round-3 review (blocker 1): RAII holder for a
@@ -20222,6 +20234,32 @@ impl AgentPtyRegistry {
                 .chain(inner.respawning_dirs.values())
                 .flatten()
                 .any(|d| path_within(d, dir))
+    }
+
+    /// PRD #1790 stage 2: every directory something this registry runs or is
+    /// starting is rooted in — the ones [`Self::dir_in_use_locked`] compares —
+    /// as recorded, copied out under one acquisition of the registry lock so
+    /// the caller can resolve each one (symlinks, `..`) without holding it.
+    pub fn rooted_dirs_snapshot(&self) -> Vec<PathBuf> {
+        let inner = self.inner.lock();
+        let mut out: Vec<PathBuf> = Vec::new();
+        for agent in inner.agents.values() {
+            if !agent.exited.load(Ordering::SeqCst) {
+                out.extend(agent.rooted_dirs());
+            }
+        }
+        for agent in inner.unconfirmed_agents.values() {
+            out.extend(agent.root_dirs.iter().cloned());
+        }
+        out.extend(
+            inner
+                .pending_spawn_dirs
+                .values()
+                .chain(inner.respawning_dirs.values())
+                .flatten()
+                .cloned(),
+        );
+        out
     }
 
     /// Issue #1612: [`Self::dir_in_use_locked`], asked under one acquisition of

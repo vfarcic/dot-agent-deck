@@ -146,6 +146,8 @@ pub mod interrupted_cli;
 pub mod interrupted_work;
 // PRD #1790 stage 2: the daemon side of the interrupted work verbs.
 pub mod interrupted_work_daemon;
+// PRD #1790 stage 2: the bounded `git` and `gh` children of those verbs.
+pub mod interrupted_work_probe;
 pub mod issue_dispatch;
 pub mod issue_dispatch_run;
 pub mod jsonc_edit;

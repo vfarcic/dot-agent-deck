@@ -437,7 +437,8 @@ fn derive_push_repo_slugs(repo_dir: &Path, branch: &str) -> Vec<String> {
 /// them: `--head` matches a branch NAME, so a fork's pull request from a
 /// branch named like ours is listed too (issue #1687), and only the fork the
 /// branch is pushed to is ours (issue #1779).
-const GH_PR_FIELDS: &str = "state,headRefName,isCrossRepository,headRepository,headRepositoryOwner";
+pub(crate) const GH_PR_FIELDS: &str =
+    "state,headRefName,isCrossRepository,headRepository,headRepositoryOwner";
 
 /// `gh pr list --head <branch> --state all --repo <owner/name> --json`
 /// [`GH_PR_FIELDS`] — `--state all` because `gh pr list` defaults to
@@ -494,7 +495,7 @@ pub(crate) fn resolve_pr_state(repo_dir: &Path, branch: &str) -> PrState {
 /// rather than read as ours, since this verdict can delete a directory. Zero
 /// matches is `NoPr`, more than one `Unresolvable` (ambiguous), never
 /// guessing.
-fn parse_pr_state(json: &str, branch: &str, push_repos: &[String]) -> PrState {
+pub(crate) fn parse_pr_state(json: &str, branch: &str, push_repos: &[String]) -> PrState {
     let entries: Vec<serde_json::Value> = match serde_json::from_str(json) {
         Ok(v) => v,
         Err(e) => return PrState::Unresolvable(format!("could not parse gh output: {e}")),
