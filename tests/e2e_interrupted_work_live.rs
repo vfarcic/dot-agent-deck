@@ -27,6 +27,13 @@
 //! refuse the agent's own waiter and stall its task. Each daemon logs to a
 //! file in the test root, which a failure message quotes.
 //!
+//! The agent's command ends by reading a FIFO the test creates in the
+//! worktree and never writes to, so the command blocks until something stops
+//! it. Just before the restart the test finds that command alive among the
+//! daemon's descendants; after it, the journal must say the unit's attempt
+//! ended interrupted and that the unit reported nothing. Elapsed time proves
+//! neither.
+//!
 //! Cost: one short Haiku turn (one Bash command). Lane 2: it reaches a real
 //! agent, so it runs on a developer's machine and never in CI.
 
@@ -60,6 +67,100 @@ const UNIT: &str = "interrupted-live";
 /// The file the agent writes, under the worktree's git-ignored
 /// `.dot-agent-deck/` so writing it leaves the tree clean.
 const SENTINEL: &str = "interrupted-live-sentinel-7c41.txt";
+
+/// The FIFO, beside the sentinel, that the agent's command reads last. The
+/// test creates it and never opens it for writing, so the read blocks.
+const HOLD: &str = "interrupted-live-hold-7c41.fifo";
+
+/// Every process now running, as `(pid, parent pid, argv)` from `ps`, which
+/// macOS and Linux both have. `argv` is split on spaces, which is enough to
+/// find a command whose arguments hold none.
+fn processes() -> Vec<(u32, u32, Vec<String>)> {
+    let out = std::process::Command::new("ps")
+        .args(["-A", "-o", "pid=,ppid=,args="])
+        .output()
+        .expect("run ps");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            let pid = words.next()?.parse().ok()?;
+            let ppid = words.next()?.parse().ok()?;
+            Some((pid, ppid, words.map(str::to_string).collect()))
+        })
+        .collect()
+}
+
+/// The processes under `ancestor` (its descendants, not itself), as
+/// `(pid, argv)`.
+fn descendants(ancestor: u32) -> Vec<(u32, Vec<String>)> {
+    let all = processes();
+    let parent: std::collections::HashMap<u32, u32> =
+        all.iter().map(|(pid, ppid, _)| (*pid, *ppid)).collect();
+    // Up the parent chain until `ancestor`, the root, or a pid seen before.
+    let under = |mut pid: u32| {
+        let mut seen = std::collections::HashSet::new();
+        while seen.insert(pid) {
+            match parent.get(&pid) {
+                Some(p) if *p == ancestor => return true,
+                Some(p) if *p > 1 => pid = *p,
+                _ => return false,
+            }
+        }
+        false
+    };
+    all.into_iter()
+        .filter(|(pid, _, _)| under(*pid))
+        .map(|(pid, _, argv)| (pid, argv))
+        .collect()
+}
+
+/// Whether `argv` is the agent's command waiting on the FIFO: `cat` with an
+/// argument naming [`HOLD`].
+fn is_held(argv: &[String]) -> bool {
+    argv.first()
+        .is_some_and(|a| Path::new(a).file_name().is_some_and(|n| n == "cat"))
+        && argv.iter().skip(1).any(|a| a.ends_with(HOLD))
+}
+
+/// The processes under `ancestor` running the agent's held command.
+fn holding_commands(ancestor: u32) -> Vec<(u32, Vec<String>)> {
+    descendants(ancestor)
+        .into_iter()
+        .filter(|(_, argv)| is_held(argv))
+        .collect()
+}
+
+/// Whether `pid` is still running the held command.
+fn still_held(pid: u32) -> bool {
+    processes()
+        .into_iter()
+        .any(|(p, _, argv)| p == pid && is_held(&argv))
+}
+
+/// Every process under `ancestor` with its argv, for a failure message.
+fn process_tree(ancestor: u32) -> String {
+    descendants(ancestor)
+        .into_iter()
+        .map(|(pid, argv)| format!("{pid}: {}", argv.join(" ")))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// SIGKILLs, by pid, the held commands a stop left running, so a failed or
+/// passed run leaves no `cat` blocked on a FIFO behind it.
+struct HeldCommands(Vec<u32>);
+impl Drop for HeldCommands {
+    fn drop(&mut self) {
+        for pid in &self.0 {
+            if still_held(*pid) {
+                // SAFETY: kill(2) on a pid this test found running its own
+                // FIFO's name, checked again just now.
+                unsafe { libc::kill(*pid as libc::pid_t, libc::SIGKILL) };
+            }
+        }
+    }
+}
 
 /// The real CLI as a person at a terminal runs it against `daemon`: no pane
 /// identity, no terminal on stdin.
@@ -132,8 +233,8 @@ fn trust_spellings(path: &Path) -> Vec<String> {
     spellings
 }
 
-/// Scenario: A stand-in dispatcher pane dispatches a `--single` unit whose agent is a real interactive Claude Code on Haiku; the deck delivers the task, which the agent acknowledges, and the agent writes a uniquely named sentinel file under the worktree's ignored `.dot-agent-deck/` and is still running its command when the daemon is restarted on the same state directory.
-/// The person's `interrupted list` then names the unit with its branch and worktree, the worktree is clean, and a fresh TUI shows the "interrupted items" footer, lists the unit under "Interrupted work" after `I`, and reclaims it with `r` and `y`.
+/// Scenario: A stand-in dispatcher pane dispatches a `--single` unit whose agent is a real interactive Claude Code on Haiku; the deck delivers the task, which the agent acknowledges, and the agent's one command writes a uniquely named sentinel under the worktree's ignored `.dot-agent-deck/` and then blocks reading a FIFO the test never writes, which the test sees running under the daemon just before it restarts the daemon on the same state directory.
+/// After the restart the journal says the unit's attempt ended interrupted with no report, the person's `interrupted list` names the unit with its branch and worktree, the worktree is clean, and a TUI attached to the new daemon shows the "interrupted items" footer, lists the unit under "Interrupted work" after `I`, and reclaims it with `r` and `y`.
 /// The worktree is gone, the branch is kept, the footer counts one item, and the CLI no longer lists the unit.
 #[spec("journal/interrupted/028")]
 #[test]
@@ -155,6 +256,10 @@ fn interrupted_028_a_real_agents_unit_is_listed_and_reclaimed_after_a_restart() 
         ("PATH", &path),
         // A real agent's boot and turn outlast the harness's 300 s default.
         ("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "900"),
+        // Claude Code's Bash tool stops a command after two minutes by
+        // default; the held command must outlast the checks before the stop.
+        ("BASH_DEFAULT_TIMEOUT_MS", "600000"),
+        ("BASH_MAX_TIMEOUT_MS", "600000"),
     ];
     if let Some(key) = api_key.as_deref() {
         env.push(("ANTHROPIC_API_KEY", key));
@@ -206,11 +311,14 @@ fn interrupted_028_a_real_agents_unit_is_listed_and_reclaimed_after_a_restart() 
     let caller = route::start(&live, "interrupted-live-caller", json!({"cwd": repo}));
     inbox::status(&live, &caller, "session_start", "codex");
     inbox::status(&live, &caller, "thinking", "codex");
-    // The command ends in a sleep, so the agent is still in it, and has not
-    // reported, when the restart stops it: the work is interrupted, not done.
+    // The command ends reading the FIFO, which nothing writes, so the agent
+    // is still in it, and has not reported, when the restart stops it: the
+    // work is interrupted, not done. The command is on a line of its own, so
+    // no word of the prose after it can be read as one of its arguments.
     let task = format!(
-        "Use the Bash tool to run exactly this one command now, as one command: \
-         mkdir -p .dot-agent-deck && echo done > .dot-agent-deck/{SENTINEL} && sleep 100 \
+        "Use the Bash tool to run exactly this one command now, in the foreground, as one \
+         command, and wait for it:\n\n\
+         `mkdir -p .dot-agent-deck && echo done > .dot-agent-deck/{SENTINEL} && cat .dot-agent-deck/{HOLD}`\n\n\
          Do not run any other command, do not create or change any other file, and do not \
          commit."
     );
@@ -249,6 +357,20 @@ fn interrupted_028_a_real_agents_unit_is_listed_and_reclaimed_after_a_restart() 
         common::agent_records_on(&live.attach_socket)
     );
     let unit_agent = spawned.into_inner().unwrap();
+    // The hold, in the worktree the unit now runs in. The agent boots and
+    // takes its task before it runs the command; should it run first, `cat`
+    // finds no FIFO and exits, and the check before the restart fails.
+    let hold_dir = worktree.join(".dot-agent-deck");
+    std::fs::create_dir_all(&hold_dir).expect("the worktree's .dot-agent-deck");
+    let hold = std::ffi::CString::new(hold_dir.join(HOLD).to_string_lossy().into_owned())
+        .expect("a path without NUL");
+    // SAFETY: mkfifo(3) on a NUL-terminated path this test owns.
+    assert_eq!(
+        unsafe { libc::mkfifo(hold.as_ptr(), 0o600) },
+        0,
+        "create the hold FIFO: {}",
+        std::io::Error::last_os_error()
+    );
     // The unit's pane id, which its inbox is keyed by.
     let unit_pane = common::agent_records_on(&live.attach_socket)
         .into_iter()
@@ -297,12 +419,29 @@ fn interrupted_028_a_real_agents_unit_is_listed_and_reclaimed_after_a_restart() 
         first_log.display(),
         log_tail(&first_log, 80)
     );
-    journal::wait_for(&state, "both launches' attempts", |lines| {
-        [&caller.agent, &unit_agent]
-            .iter()
-            .all(|agent| journal::attempt_of(lines, agent).is_some())
-            .then_some(())
+    let unit_attempt = journal::wait_for(&state, "both launches' attempts", |lines| {
+        let unit = journal::attempt_of(lines, &unit_agent)?;
+        journal::attempt_of(lines, &caller.agent)?;
+        Some((unit["work"].clone(), unit["attempt"].clone()))
     });
+
+    // Just before the stop, the agent's command is still running: its `cat`
+    // of the FIFO is alive among the daemon's descendants.
+    let held: Vec<u32> = holding_commands(live.pid())
+        .into_iter()
+        .map(|(pid, argv)| {
+            eprintln!("held: pid {pid} runs {argv:?}");
+            pid
+        })
+        .collect();
+    let _held = HeldCommands(held.clone());
+    assert!(
+        !held.is_empty(),
+        "the agent's command is not running before the restart: no `cat` of {HOLD} under the daemon (pid {}).\nIts process tree:\n{}\nThe agent's pane:\n{}",
+        live.pid(),
+        process_tree(live.pid()),
+        pane_screen(&live, &unit_agent)
+    );
 
     // The restart: SIGTERM to this daemon's own pid, and another on the same
     // state directory.
@@ -323,6 +462,35 @@ fn interrupted_028_a_real_agents_unit_is_listed_and_reclaimed_after_a_restart() 
     assert!(next.is_alive_public(), "the next daemon must start");
     let _gone = std::mem::replace(&mut live, next);
     drop(caller);
+    for pid in &held {
+        eprintln!(
+            "held: pid {pid} after the restart: still running={}",
+            still_held(*pid)
+        );
+    }
+
+    // The restart interrupted the unit's work: its attempt ended
+    // `interrupted`, and its work reported nothing (a finished unit's kept
+    // report would list it too).
+    let (unit_work, unit_attempt) = unit_attempt;
+    let ended = journal::wait_for(&state, "the unit's attempt's end", |lines| {
+        journal::find(lines, "attempt_ended", |line| {
+            line["attempt"] == unit_attempt
+        })
+        .cloned()
+    });
+    assert_eq!(
+        ended["how"],
+        "interrupted",
+        "the restart ended the unit's attempt as interrupted: {ended}\n{}",
+        journal::dump(&state)
+    );
+    let lines = journal::lines(&state);
+    assert!(
+        journal::find(&lines, "reported", |line| line["work"] == unit_work).is_none(),
+        "the unit reported nothing before the restart:\n{}",
+        journal::dump(&state)
+    );
 
     // The person's CLI names the unit, its branch and its worktree.
     let out = person(&live, &repo, &["interrupted", "list", "--json", "--no-git"]);
@@ -334,6 +502,10 @@ fn interrupted_028_a_real_agents_unit_is_listed_and_reclaimed_after_a_restart() 
         .and_then(|items| items.iter().find(|i| i["branch"] == branch.as_str()))
         .unwrap_or_else(|| panic!("`interrupted list` names the unit's branch {branch}: {list}"));
     assert_eq!(item["kind"], "unit", "{item}");
+    assert!(
+        item["reports"].as_array().is_none_or(|r| r.is_empty()),
+        "the unit is listed for its interruption, not for a kept report: {item}"
+    );
     let canonical = std::fs::canonicalize(&worktree).expect("the worktree is on disk");
     assert!(
         item["worktree"]
