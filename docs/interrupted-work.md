@@ -27,6 +27,8 @@ Each kept report is shown with its id and `kept until <date>`, the day the deck 
 
 When the daemon the TUI is attached to has interrupted work, a row above the footer says how many items there are, such as `3 interrupted items from before the restart`, with `[Show I]` and `[Hide X]`. In command mode, press `I` (or click `[Show I]`) to open the **Interrupted work** list, and `X` to hide the row. If you are typing in a pane, press `Ctrl+D` first. Hiding the row is not saved: it comes back when the TUI attaches to a restarted daemon or is started again. `I` opens the list whether or not the row is shown.
 
+![The TUI's Interrupted work list, opened with I from the footer row 3 interrupted items from before the restart: the unit fix-login on branch agent/dispatch-fix-login is selected, with its worktree, who started it, its last entry and progress; below it the orchestration release-team, and under Other agents the agent scratch-shell with its folder; the keys j/k select, Enter details, r reclaim, d dismiss, D dismiss all and Esc close are at the bottom](/img/interrupted-work-tui.png)
+
 After a restart, the list of stopped agents that the restart notice opens with `a` ([The deck restarted and its agents disappeared](troubleshooting.md#the-deck-restarted-and-its-agents-disappeared)) also says how many interrupted items there are, and `I` opens their list from there.
 
 In the list:
@@ -101,8 +103,8 @@ Commits on the branch that are on no remote do not stop a reclaim, since the bra
 The deck keeps the worktree, removes nothing and says why when:
 
 - it has uncommitted changes: commit or discard them, then reclaim it again;
-- other worktrees lie inside it, which it names: remove those first;
-- the deck could not check whether it has uncommitted changes;
+- other worktrees or Git checkouts lie inside it, of its own repository or of any other, which it names: move or remove those first;
+- the deck could not check whether it has uncommitted changes or whether anything like that lies inside it;
 - the deck could not get its repository's worktree lock in time, or could not take it at all: reclaim it again;
 - it was moved, replaced or switched to another branch while it was being reclaimed: list the interrupted work again;
 - Git could not remove it, or the removal did not finish in time. In that last case it may still be removed, and the deck records it if it is.
@@ -114,6 +116,8 @@ The branch is never deleted. A kept branch stops you dispatching a unit of the s
 ## Dismiss
 
 **Dismiss** takes an item off the list and changes nothing else: its worktree, branch and kept reports stay as they are, and the reports are still deleted on their `kept until` date. In the TUI and the desktop app, `d` and the **Dismiss** button dismiss the selected item at once; asking by voice shows a question first. In both clients **Dismiss all** asks first and dismisses exactly the items its question named, so an item that appears while you are answering is not swept up. From a shell, `dismiss --all` asks on the terminal, or dismisses without asking with `--yes`. A dismissal is saved: a dismissed item stays off the list after later restarts, in every client.
+
+A **Dismiss all** of many items is sent to the daemon in parts. If the daemon is restarted, stops answering or refuses partway through, the rest are not sent, and the answer after `Dismissed.` says how many items were not, or may not have been, dismissed, such as `1 more item may not have been dismissed: the deck daemon was replaced. List the interrupted work again.` Open the list again to see what is left.
 
 ## Agents can list, not change
 

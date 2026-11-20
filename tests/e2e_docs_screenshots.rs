@@ -1382,6 +1382,172 @@ fn docs_screenshot_restart_notice() {
     });
 }
 
+/// Scenario: Write a work journal holding what a deck restart left behind —
+/// the dispatched unit `fix-login` started by a `dispatcher` pane, the
+/// orchestration `release-team`, and the plain agent `scratch-shell` — as an
+/// earlier daemon run under the same deck would have recorded it, start a
+/// daemon on that state directory and attach the TUI. Its footer says "3
+/// interrupted items from before the restart"; `I` opens the "Interrupted
+/// work" list, and that frame is written as `interrupted-work-tui.html`.
+#[test]
+#[ignore = "docs-screenshot generator: run it with `cargo docs-screenshots`"]
+fn docs_screenshot_interrupted_work() {
+    use dot_agent_deck::inbox::DeckId;
+    use dot_agent_deck::work_journal::{
+        AttemptId, EndHow, Event, JournalOptions, Launch, Refs, WorkId, WorkJournal, Workspace,
+    };
+
+    html_dir();
+    let scene = common::race_safe_tempdir();
+    let state = scene.path().join("state");
+    std::fs::create_dir_all(&state).expect("create the scene's state dir");
+    {
+        // Paths outside the journal's home are written as they are, so the
+        // list shows the desktop fixture's paths, not this sandbox's.
+        let deck = DeckId::load_or_create(&state).expect("the scene's deck id");
+        let journal = WorkJournal::try_open_with(
+            &state,
+            "docsprior",
+            &deck,
+            JournalOptions {
+                home: PathBuf::from("/nonexistent-docs-home"),
+                ..JournalOptions::default()
+            },
+        )
+        .expect("open the scene's journal");
+        let record = |event: Event| {
+            journal.try_record(event).expect("journal line written");
+        };
+        let mut agent = 0u64;
+        let mut work = |launch: Launch,
+                        parent: Option<&WorkId>,
+                        refs: Refs,
+                        workspace: &str,
+                        roles: &[Option<&str>],
+                        how: EndHow| {
+            let id = journal.mint_work_id().expect("a work id");
+            record(Event::Opened {
+                work: id.clone(),
+                launch,
+                parent: parent.cloned(),
+                refs: Box::new(refs),
+                workspace: Workspace::from_path_with_home(
+                    Path::new(workspace),
+                    Path::new("/nonexistent-docs-home"),
+                ),
+            });
+            for role in roles {
+                agent += 1;
+                let attempt = AttemptId::new("docsprior", agent).expect("an attempt id");
+                record(Event::AttemptStarted {
+                    work: id.clone(),
+                    attempt: attempt.clone(),
+                    pane: format!("pane-{agent}"),
+                    agent,
+                    role: role.map(str::to_string),
+                });
+                record(Event::AttemptEnded {
+                    work: id.clone(),
+                    attempt,
+                    how,
+                    code: None,
+                    cause: None,
+                });
+            }
+            id
+        };
+        // Oldest first: the daemon lists the most recent first, so the unit,
+        // written after the orchestration, is the one selected, as on the
+        // desktop.
+        work(
+            Launch::Orchestration,
+            None,
+            Refs {
+                orchestration: Some("release-team".into()),
+                ..Refs::default()
+            },
+            "/home/dev/demo-project",
+            &[Some("orchestrator"), Some("coder"), Some("reviewer")],
+            EndHow::Interrupted,
+        );
+        let dispatcher = work(
+            Launch::Pane,
+            None,
+            Refs {
+                pane: Some("dispatcher".into()),
+                ..Refs::default()
+            },
+            "/home/dev/demo-project",
+            &[None],
+            EndHow::Exited,
+        );
+        work(
+            Launch::Dispatch,
+            Some(&dispatcher),
+            Refs {
+                branch: Some("agent/dispatch-fix-login".into()),
+                unit_id: Some("fix-login".into()),
+                ..Refs::default()
+            },
+            "/home/dev/demo-project-dispatch-fix-login",
+            &[Some("coder")],
+            EndHow::Interrupted,
+        );
+        work(
+            Launch::Pane,
+            None,
+            Refs {
+                pane: Some("scratch-shell".into()),
+                ..Refs::default()
+            },
+            "/home/dev/notes",
+            &[None],
+            EndHow::Interrupted,
+        );
+        journal.flush();
+    }
+    let state_env = state.to_string_lossy().into_owned();
+    let daemon = common::spawn_daemon_serve_with_env(
+        None,
+        "0",
+        &[("DOT_AGENT_DECK_STATE_DIR", state_env.as_str())],
+    );
+    let attach = daemon.attach_socket.to_string_lossy().to_string();
+    let hooks = daemon.hook_socket.to_string_lossy().to_string();
+    let deck = launch_with(|builder| {
+        builder
+            .with_env("DOT_AGENT_DECK_ATTACH_SOCKET", attach.clone())
+            .with_env("DOT_AGENT_DECK_SOCKET", hooks.clone())
+    });
+    deck.wait_until_grid("the footer counts the interrupted items", |grid| {
+        grid.contains("3 interrupted items from before the restart")
+    });
+    deck.send_keys(b"I");
+    let page = deck.capture_screen_when("interrupted-work", |screen| {
+        let grid = screen.contents();
+        (grid.contains("Interrupted work")
+            && grid.contains("fix-login")
+            && grid.contains("agent/dispatch-fix-login")
+            && grid.contains("Started by: dispatcher")
+            && grid.contains("release-team")
+            && grid.contains("Other agents")
+            && grid.contains("scratch-shell")
+            && !STARTUP_HOOK_NOTES.iter().any(|note| grid.contains(note)))
+        .then(|| render_page(screen, "interrupted-work (TUI)", &RenderOptions::default()))
+    });
+    for leak in [
+        "/tmp/",
+        "/var/tmp",
+        "dad-tests-",
+        "dad-e2e-",
+        "nonexistent-docs-home",
+    ] {
+        assert!(!page.contains(leak), "{leak} reaches the image");
+    }
+    write_page("interrupted-work", &page);
+    drop(daemon);
+}
+
 /// What the `project-trust` scene shows as its project's path, in place of
 /// the scene's own `/tmp` folder: the desktop fixture's `demo-project`.
 const PROJECT_TRUST_DISPLAY_DIR: &str = "/home/dev/demo-project";

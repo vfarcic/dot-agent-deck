@@ -208,8 +208,8 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "interrupted-work",
-        description: "What a deck restart left behind: the desktop's Interrupted work dialog, opened from the dashboard banner, listing a dispatched unit, an orchestration and a plain agent under Other agents (PRD #1790). Desktop only so far; the TUI capture is owed.",
-        clients: &[Client::Desktop],
+        description: "What a deck restart left behind: the Interrupted work list, opened with `I` in the TUI and from the dashboard banner in the desktop app, listing a dispatched unit, an orchestration and a plain agent under Other agents (PRD #1790).",
+        clients: &[Client::Tui, Client::Desktop],
     },
     Scenario {
         name: "project-trust",
