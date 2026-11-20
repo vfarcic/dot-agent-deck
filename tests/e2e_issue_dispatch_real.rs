@@ -32,9 +32,10 @@
 //! `DISPATCH_E2E_SENTINEL.md`; a `.dot-agent-deck.toml` with an
 //! `[[orchestrations]] name = "issue-work"` whose roles are `orchestrator`
 //! (`start = true`) and `worker`, BOTH `claude --model
-//! claude-haiku-4-5-20251001 --allowedTools Bash`, the orchestrator's
-//! `prompt_template` instructing it to delegate the task to the worker via
-//! `dot-agent-deck delegate --to worker --task "<TASK>"`; and a PERMANENT open
+//! claude-haiku-4-5-20251001 --allowedTools Bash` (the orchestrator's
+//! `prompt_template` does not reach this start path: an issue dispatch hands
+//! the schedule prompt over verbatim, so that prompt carries the `delegate`
+//! command); and a PERMANENT open
 //! issue #1 labelled `agent-dispatch-test`. The schedule filters on that label
 //! with `max_per_run = 1`, so ONLY issue #1 is ever enumerated — the run is
 //! deterministic against a fixed remote.
@@ -102,15 +103,18 @@ const ORCH_TAB_NAME: &str = "issue-work";
 /// fixture the lazily-spawned daemon loads via `DOT_AGENT_DECK_SCHEDULES`. The
 /// cron never fires on its own (Jan 1 00:00) — the fire is driven by `RunNow`.
 /// `label` + `max_per_run = 1` pin enumeration to the single permanent issue #1.
-/// The `prompt` is the TASK handed to the orchestrator (which it must delegate
-/// to the worker): a directive list-files command robust to LLM phrasing.
+/// The `prompt` is the TASK handed to the orchestrator, verbatim: an issue
+/// dispatch composes no orchestrator context around it, so the prompt itself
+/// tells the orchestrator to delegate, with the exact `delegate` command, and
+/// not to do the listing itself. Without that it listed the files itself, the
+/// worker stayed idle, and the test's sentinel check passed regardless.
 fn dispatch_schedule_toml(working_dir: &str) -> String {
     format!(
         "[[scheduled_tasks]]\n\
          name = \"{SCHEDULE_NAME}\"\n\
          cron = \"0 0 1 1 *\"\n\
          working_dir = \"{working_dir}\"\n\
-         prompt = \"List every file in the current directory using the Bash tool (ls -a) and print each filename verbatim, one per line, with no other commentary.\"\n\
+         prompt = \"You coordinate a worker and do no work yourself: do not list or read any file. Run exactly this one Bash command to hand the task to the worker, then wait: dot-agent-deck delegate --to worker --task 'List every file in the current directory using the Bash tool (ls -a) and print each filename verbatim, one per line, with no other commentary.'\"\n\
          enabled = true\n\
          \n\
          [scheduled_tasks.issue_dispatch]\n\
@@ -205,7 +209,7 @@ fn remote_branch_exists(branch: &str) -> Option<bool> {
 
 /// Scenario: Launch an attached deck with a schedule targeting permanent live GitHub issue #1 and fire it via RunNow; the first fire clones the fixture and is refused on the never-approved clone, as `schedule list` shows, so approve the clone with `trust approve` and fire again to spawn its interactive Haiku orchestration.
 /// After the agents register as `orchestrator` and `worker`, require an `issue-work` orchestration tab to appear in the attached TUI without reconnecting.
-/// Require the worker to hold an acknowledged task from the orchestrator and its own pane to show the sentinel file, then best-effort probe that no `agent/issue-1` branch was pushed.
+/// Require the worker to hold an acknowledged task from the orchestrator, which the schedule prompt tells to delegate, and its own pane to show the sentinel file, then best-effort probe that no `agent/issue-1` branch was pushed.
 #[spec("scheduler/dispatch/013")]
 #[test]
 fn dispatch_013_orchestration_surfaces_and_delegates() {

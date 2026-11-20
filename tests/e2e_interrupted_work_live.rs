@@ -19,7 +19,13 @@
 //! directory. The agent's first-run onboarding and the worktree's trust are
 //! seeded into the daemon's HOME before the dispatch, as
 //! `scheduler/dispatch/013` seeds them, with the deck's Claude Code hooks,
-//! so the unattended `claude` takes its first prompt with no keystroke.
+//! so the unattended `claude` takes its task from the deck with no keystroke.
+//!
+//! Both daemons bind inbox components normally (`inbox::daemon`, not
+//! `daemon_unbound`): the unit is a real agent whose hook shells the daemon
+//! resolves to that agent, which the test switch skips, so that switch could
+//! refuse the agent's own waiter and stall its task. Each daemon logs to a
+//! file in the test root, which a failure message quotes.
 //!
 //! Cost: one short Haiku turn (one Bash command). Lane 2: it reaches a real
 //! agent, so it runs on a developer's machine and never in CI.
@@ -27,14 +33,17 @@
 dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
+#[path = "support/inbox_view.rs"]
+mod inbox_view;
 #[path = "support/work_journal.rs"]
 mod journal;
 #[path = "support/inbox_route.rs"]
 mod route;
 
+use dot_agent_deck::inbox::StateName;
 use dot_agent_deck::interrupted_work::{
-    INTERRUPTED_WORK_TITLE, RECLAIM_EXPLANATION, RECLAIM_KEPT_DIRTY, RECLAIM_REMOVED,
-    RECLAIM_WOULD_REMOVE, interrupted_footer,
+    INTERRUPTED_WORK_TITLE, RECLAIM_EXPLANATION, RECLAIM_REMOVED, RECLAIM_WOULD_REMOVE,
+    interrupted_footer,
 };
 use serde_json::{Value, json};
 use spec::spec;
@@ -101,6 +110,13 @@ fn pane_screen(daemon: &common::DaemonProc, agent: &str) -> String {
     parser.screen().contents()
 }
 
+/// The last `lines` lines of the daemon log at `path`, for a failure message.
+fn log_tail(path: &Path, lines: usize) -> String {
+    let log = std::fs::read_to_string(path).unwrap_or_else(|e| format!("<no log: {e}>"));
+    let all: Vec<&str> = log.lines().collect();
+    all[all.len().saturating_sub(lines)..].join("\n")
+}
+
 /// Both spellings of `path` a `claude` started there may key its trust by:
 /// as written, and with its parent resolved through symlinks.
 fn trust_spellings(path: &Path) -> Vec<String> {
@@ -116,9 +132,9 @@ fn trust_spellings(path: &Path) -> Vec<String> {
     spellings
 }
 
-/// Scenario: A stand-in dispatcher pane dispatches a `--single` unit whose agent is a real interactive Claude Code on Haiku, told to write a uniquely named sentinel file under the worktree's ignored `.dot-agent-deck/` and then wait; once the file is there the daemon is restarted on the same state directory.
-/// The person's `interrupted list` then names the unit with its branch and worktree, and a fresh TUI shows the "interrupted items" footer, lists the unit under "Interrupted work" after `I`, and reclaims it with `r` and `y`.
-/// The worktree is gone and the branch is kept; if the agent left the tree dirty after all, the TUI's reclaim says it kept the worktree, and that is accepted.
+/// Scenario: A stand-in dispatcher pane dispatches a `--single` unit whose agent is a real interactive Claude Code on Haiku; the deck delivers the task, which the agent acknowledges, and the agent writes a uniquely named sentinel file under the worktree's ignored `.dot-agent-deck/` and is still running its command when the daemon is restarted on the same state directory.
+/// The person's `interrupted list` then names the unit with its branch and worktree, the worktree is clean, and a fresh TUI shows the "interrupted items" footer, lists the unit under "Interrupted work" after `I`, and reclaims it with `r` and `y`.
+/// The worktree is gone, the branch is kept, the footer counts one item, and the CLI no longer lists the unit.
 #[spec("journal/interrupted/028")]
 #[test]
 fn interrupted_028_a_real_agents_unit_is_listed_and_reclaimed_after_a_restart() {
@@ -143,7 +159,11 @@ fn interrupted_028_a_real_agents_unit_is_listed_and_reclaimed_after_a_restart() 
     if let Some(key) = api_key.as_deref() {
         env.push(("ANTHROPIC_API_KEY", key));
     }
-    let mut live = inbox::daemon_unbound(&env);
+    let first_log = scratch.path().join("deck-first.log");
+    let first_log_env = first_log.to_string_lossy().into_owned();
+    let mut first_env = env.clone();
+    first_env.push(("DOT_AGENT_DECK_LOG", &first_log_env));
+    let mut live = inbox::daemon(&first_env);
 
     // A one-commit repository that ignores the deck's `.dot-agent-deck/` and
     // the stand-in's files, so the unit's worktree reads clean until its
@@ -186,22 +206,17 @@ fn interrupted_028_a_real_agents_unit_is_listed_and_reclaimed_after_a_restart() 
     let caller = route::start(&live, "interrupted-live-caller", json!({"cwd": repo}));
     inbox::status(&live, &caller, "session_start", "codex");
     inbox::status(&live, &caller, "thinking", "codex");
+    // The command ends in a sleep, so the agent is still in it, and has not
+    // reported, when the restart stops it: the work is interrupted, not done.
     let task = format!(
-        "Use the Bash tool to run exactly this one command now: \
-         mkdir -p .dot-agent-deck && echo done > .dot-agent-deck/{SENTINEL} \
-         Do not run any other command, do not create or change any other file, do not \
-         commit, and do not report back yet. Once the command has run, stop and wait for \
-         further instructions."
+        "Use the Bash tool to run exactly this one command now, as one command: \
+         mkdir -p .dot-agent-deck && echo done > .dot-agent-deck/{SENTINEL} && sleep 100 \
+         Do not run any other command, do not create or change any other file, and do not \
+         commit."
     );
-    // The directive is also the agent's first prompt, on its command line
-    // and before `--allowedTools`, which takes every word after it:
-    // whether the deck's own delivery of the task reaches a fresh claude's
-    // input box is not what this test is about, and in 4 of 6 local runs on
-    // 2026-11-20 it had not within 240 s (the claude pane idle and empty).
-    let agent_command = format!(
-        "claude '{}' --ax-screen-reader --model {HAIKU_MODEL} --allowedTools Bash Read Write",
-        task.replace('\'', "'\\''")
-    );
+    // The deck delivers the task: no first prompt on the command line.
+    let agent_command =
+        format!("claude --ax-screen-reader --model {HAIKU_MODEL} --allowedTools Bash Read Write");
     route::cli(
         &live,
         &caller,
@@ -241,16 +256,40 @@ fn interrupted_028_a_real_agents_unit_is_listed_and_reclaimed_after_a_restart() 
     const SENTINEL_WAIT: Duration = Duration::from_secs(240);
     assert!(
         common::wait_until(SENTINEL_WAIT, || sentinel.is_file()),
-        "the real Haiku agent never wrote {} within {}s.\nThe agent's pane:\n{}\nDaemon stderr:\n{}",
+        "the real Haiku agent never wrote {} within {}s.\nThe agent's pane:\n{}\nIts inbox:\n{:?}\nDaemon log ({}):\n{}",
         sentinel.display(),
         SENTINEL_WAIT.as_secs(),
         pane_screen(&live, &unit_agent),
-        std::fs::read_to_string(live.home.parent().unwrap().join("daemon-stderr.log"))
-            .unwrap_or_default()
+        inbox_view::messages(&live.attach_socket, &unit_agent),
+        first_log.display(),
+        log_tail(&first_log, 80)
     );
     eprintln!(
         "timing: the agent wrote the sentinel {:?} after the dispatch",
         began.elapsed()
+    );
+    // The deck's own delivery took the task to the agent: its seed, the
+    // message naming the sentinel, was handed over and acknowledged.
+    let seed_acknowledged = || {
+        inbox_view::messages(&live.attach_socket, &unit_agent)
+            .into_iter()
+            .any(|message| {
+                message.state == StateName::Acknowledged
+                    && message
+                        .text
+                        .as_deref()
+                        .is_some_and(|text| text.contains(SENTINEL))
+            })
+    };
+    assert!(
+        common::wait_until(
+            common::load_scaled(Duration::from_secs(30)),
+            seed_acknowledged
+        ),
+        "the dispatched task was not acknowledged by the unit: {:?}\nDaemon log ({}):\n{}",
+        inbox_view::messages(&live.attach_socket, &unit_agent),
+        first_log.display(),
+        log_tail(&first_log, 80)
     );
     journal::wait_for(&state, "both launches' attempts", |lines| {
         [&caller.agent, &unit_agent]
@@ -270,7 +309,11 @@ fn interrupted_028_a_real_agents_unit_is_listed_and_reclaimed_after_a_restart() 
         live.wait_for_exit(common::load_scaled(Duration::from_secs(30))),
         "the daemon must exit on SIGTERM"
     );
-    let mut next = inbox::daemon_unbound(&env);
+    let next_log = scratch.path().join("deck-next.log");
+    let next_log_env = next_log.to_string_lossy().into_owned();
+    let mut next_env = env.clone();
+    next_env.push(("DOT_AGENT_DECK_LOG", &next_log_env));
+    let mut next = inbox::daemon(&next_env);
     assert!(next.is_alive_public(), "the next daemon must start");
     let _gone = std::mem::replace(&mut live, next);
     drop(caller);
@@ -296,8 +339,15 @@ fn interrupted_028_a_real_agents_unit_is_listed_and_reclaimed_after_a_restart() 
     );
     let human = person(&live, &repo, &["interrupted", "list", "--no-git"]);
     eprintln!("narrative: `interrupted list --no-git`:\n{}", text(&human));
+    // The sentinel is ignored and the agent was told to change nothing else:
+    // a clean tree, which reclaim removes.
     let dirty = porcelain(&worktree);
-    eprintln!("narrative: the worktree's status after the agent: {dirty:?}");
+    assert!(
+        dirty.is_empty(),
+        "the agent left the worktree dirty, so reclaim would keep it: {dirty:?}\nThe agent's pane before the restart is gone; daemon log ({}):\n{}",
+        first_log.display(),
+        log_tail(&first_log, 40)
+    );
 
     // A fresh TUI: the footer, `I`, and reclaim.
     let deck = common::TuiDeck::builder()
@@ -320,16 +370,8 @@ fn interrupted_028_a_real_agents_unit_is_listed_and_reclaimed_after_a_restart() 
     // The unit is listed before "Other agents", so it is the selected row.
     deck.send_keys(b"r");
     deck.wait_until_grid("the dry run's verdict", |g| {
-        g.contains(RECLAIM_WOULD_REMOVE) || g.contains(RECLAIM_KEPT_DIRTY)
+        g.contains(RECLAIM_WOULD_REMOVE)
     });
-    if deck.snapshot_grid().contains(RECLAIM_KEPT_DIRTY) {
-        // Allowed: the agent changed the tree despite its prompt. The
-        // worktree is kept and the branch with it.
-        eprintln!("narrative: the agent left the worktree dirty ({dirty:?}); reclaim kept it");
-        assert!(worktree.is_dir(), "a kept worktree stays on disk");
-        assert!(branch_listed(&repo, &branch), "the branch is kept");
-        return;
-    }
     assert!(
         deck.snapshot_grid().contains(RECLAIM_EXPLANATION) && worktree.is_dir(),
         "the dry run explains reclaim and removes nothing:\n{}",
