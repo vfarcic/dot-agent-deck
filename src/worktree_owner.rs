@@ -376,47 +376,101 @@ pub fn verified_geometry_of(dir: &Path) -> Option<VerifiedGeometry> {
 /// leaves room for its newline. A longer file is refused, not read whole.
 pub const MAX_BACK_POINTER_BYTES: usize = 4096;
 
-/// The `gitdir` back-pointer at `path`, read only from a regular file: it is
-/// opened without following a symlink and without blocking (a FIFO planted
-/// there would otherwise block the open), checked to be a regular file on
-/// the opened descriptor, and read for at most [`MAX_BACK_POINTER_BYTES`]
-/// plus one byte. `None` for anything else, or one longer than that bound
-/// (auditor N4).
-#[cfg(unix)]
+/// The `gitdir` back-pointer at `path`, read by [`read_regular_bounded`]
+/// for at most [`MAX_BACK_POINTER_BYTES`]: only from a regular file, never
+/// through a symlink and without blocking on a FIFO planted there. `None`
+/// for anything else, or one longer than that bound (auditor N4).
 fn read_back_pointer(path: &Path) -> Option<Vec<u8>> {
-    use std::io::Read as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-        .ok()?;
-    if !file.metadata().ok()?.is_file() {
-        return None;
+    match read_regular_bounded(path, MAX_BACK_POINTER_BYTES as u64) {
+        RegularRead::Bytes(bytes) => Some(bytes),
+        RegularRead::Absent | RegularRead::NotRegular | RegularRead::Refused => None,
     }
-    let mut bytes = Vec::new();
-    file.take(MAX_BACK_POINTER_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    (bytes.len() <= MAX_BACK_POINTER_BYTES).then_some(bytes)
 }
 
-/// [`read_back_pointer`] off Unix: the path itself must be a regular file
-/// (not followed), checked before it is opened, and the read is bounded the
-/// same way.
-#[cfg(not(unix))]
-fn read_back_pointer(path: &Path) -> Option<Vec<u8>> {
+/// What [`read_regular_bounded`] found at a path.
+#[derive(Debug)]
+enum RegularRead {
+    /// Nothing there: the path, or a directory on the way to it, does not
+    /// exist.
+    Absent,
+    /// Something there that is not a regular file: a directory, a FIFO, a
+    /// socket or a device.
+    NotRegular,
+    /// Not read: a symlink (never followed), an open that failed for any
+    /// other reason, a failed read, or a file longer than the bound.
+    Refused,
+    /// The whole regular file, at most the bound long.
+    Bytes(Vec<u8>),
+}
+
+/// The regular file at `path`, read whole when it is at most `max` bytes,
+/// for a reader whose answer decides something (the back-pointer that
+/// [`verify_geometry`] trusts, the marker [`marked_launch_in`] reads).
+///
+/// On Unix the path is opened once, with `O_NOFOLLOW` (a symlink fails the
+/// open), `O_NONBLOCK` (a FIFO opens at once instead of waiting for a
+/// writer) and `O_CLOEXEC`; the opened descriptor is checked to be a regular
+/// file, and the bytes are read from that same descriptor, at most `max`
+/// plus one. Nothing is looked up by name between the check and the read,
+/// so what the path held a moment earlier does not matter (PR #2431 round
+/// 3). `O_NONBLOCK` does not change reads of a regular file.
+#[cfg(unix)]
+fn read_regular_bounded(path: &Path, max: u64) -> RegularRead {
     use std::io::Read as _;
-    if !std::fs::symlink_metadata(path).ok()?.is_file() {
-        return None;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                || e.raw_os_error() == Some(libc::ENOTDIR) =>
+        {
+            return RegularRead::Absent;
+        }
+        Err(_) => return RegularRead::Refused,
+    };
+    match file.metadata() {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => return RegularRead::NotRegular,
+        Err(_) => return RegularRead::Refused,
     }
     let mut bytes = Vec::new();
-    std::fs::File::open(path)
-        .ok()?
-        .take(MAX_BACK_POINTER_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    (bytes.len() <= MAX_BACK_POINTER_BYTES).then_some(bytes)
+    match file.take(max.saturating_add(1)).read_to_end(&mut bytes) {
+        Ok(_) if bytes.len() as u64 <= max => RegularRead::Bytes(bytes),
+        _ => RegularRead::Refused,
+    }
+}
+
+/// [`read_regular_bounded`] off Unix, where there is no `O_NOFOLLOW`: the
+/// path itself must be a regular file (not followed), checked before it is
+/// opened, and the read is bounded the same way. The check and the open are
+/// two lookups, so a symlink put there in between is followed: a reader
+/// whose answer authorises a deletion ([`marked_launch_in`]) does not trust
+/// these bytes off Unix.
+#[cfg(not(unix))]
+fn read_regular_bounded(path: &Path, max: u64) -> RegularRead {
+    use std::io::Read as _;
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return RegularRead::Absent,
+        Err(_) => return RegularRead::Refused,
+    };
+    if meta.file_type().is_symlink() {
+        return RegularRead::Refused;
+    }
+    if !meta.is_file() {
+        return RegularRead::NotRegular;
+    }
+    let mut bytes = Vec::new();
+    let read = std::fs::File::open(path)
+        .and_then(|file| file.take(max.saturating_add(1)).read_to_end(&mut bytes));
+    match read {
+        Ok(_) if bytes.len() as u64 <= max => RegularRead::Bytes(bytes),
+        _ => RegularRead::Refused,
+    }
 }
 
 /// The checks of [`verified_geometry_of`] on git's three answers
@@ -610,14 +664,19 @@ const MAX_MARKER_READ_BYTES: u64 = 64 * 1024;
 /// Which launch a worktree's marker says created it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MarkedLaunch {
-    /// No marker [`is_marked`] accepts: missing, empty, or not a regular file.
+    /// No marker: nothing at the path, an empty file, or something that is
+    /// not a regular file (a directory, a FIFO, a socket, a device), each of
+    /// which [`is_marked`] rejects as well.
     NotMarked,
-    /// A marker that names this launch's work.
+    /// A regular marker file, opened without following a symlink, that
+    /// names this launch's work.
     Names(WorkId),
-    /// A marker [`is_marked`] accepts that names no launch this reader can
-    /// use: an older build's (written before the field existed), one written
-    /// while the journal was disabled, a torn or unparsable document, an
-    /// oversized one, or one that could not be read.
+    /// Something at the marker path that names no launch this reader can
+    /// trust: an older build's marker (written before the field existed),
+    /// one written while the journal was disabled, a torn or unparsable
+    /// document, one that is not UTF-8, an oversized one, one that could not
+    /// be opened or read, a SYMLINK (never followed, dangling or not, though
+    /// [`is_marked`] follows it), and, off Unix, every marker.
     Unnamed,
 }
 
@@ -631,10 +690,18 @@ pub enum MarkedLaunch {
 /// cannot use reads as [`MarkedLaunch::Unnamed`], never as a match, so a
 /// format change or a marker from an older build costs that reclaim a
 /// refusal, not a removal. Runs no `git`; reads at most
-/// [`MAX_MARKER_READ_BYTES`]. Blocking.
+/// [`MAX_MARKER_READ_BYTES`].
+///
+/// PR #2431 round 3: its answer authorises a removal, so it reads through
+/// [`read_regular_bounded`]: one open that follows no symlink and does not
+/// wait on a FIFO, the file type checked on the opened descriptor, the
+/// bytes read from that descriptor. A symlink answers `Unnamed` (the reclaim
+/// refuses as owner unconfirmed), and so does any other open or read
+/// failure; nothing at the path, or something that is not a regular file,
+/// answers `NotMarked` (refused as not owned). Off Unix, where no open
+/// refuses a symlink, a marker answers `Unnamed` rather than be trusted.
+/// Blocking, but never on a FIFO.
 pub fn marked_launch_in(git_dir: &Path) -> MarkedLaunch {
-    use std::io::Read as _;
-
     #[derive(serde::Deserialize)]
     struct Doc {
         creator: DocCreator,
@@ -646,13 +713,17 @@ pub fn marked_launch_in(git_dir: &Path) -> MarkedLaunch {
     }
 
     let path = git_dir.join(OWNER_MARKER_FILENAME);
-    if !reads_as_claim(&path) {
-        return MarkedLaunch::NotMarked;
-    }
-    let mut body = Vec::new();
-    let read = std::fs::File::open(&path)
-        .and_then(|file| file.take(MAX_MARKER_READ_BYTES + 1).read_to_end(&mut body));
-    if read.is_err() || body.len() as u64 > MAX_MARKER_READ_BYTES {
+    #[cfg(test)]
+    seams::before_marker_open(&path);
+    let body = match read_regular_bounded(&path, MAX_MARKER_READ_BYTES) {
+        RegularRead::Absent | RegularRead::NotRegular => return MarkedLaunch::NotMarked,
+        RegularRead::Refused => return MarkedLaunch::Unnamed,
+        RegularRead::Bytes(body) if body.is_empty() => return MarkedLaunch::NotMarked,
+        RegularRead::Bytes(body) => body,
+    };
+    // Off Unix the read could have followed a symlink put there between its
+    // check and its open, so nothing it read authorises a removal.
+    if !cfg!(unix) {
         return MarkedLaunch::Unnamed;
     }
     serde_json::from_slice::<Doc>(&body)
@@ -938,9 +1009,182 @@ pub async fn write_marker_best_effort(worktree_path: &Path, branch: &str, creato
     }
 }
 
+/// Test seams: hooks a test arms for one marker path. Off unless a test
+/// arms one, and keyed by the marker's canonical directory so tests running
+/// at once cannot fire each other's.
+#[cfg(test)]
+pub(crate) mod seams {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{LazyLock, Mutex};
+
+    type Hook = Box<dyn FnOnce() + Send>;
+
+    static BEFORE_MARKER_OPEN: LazyLock<Mutex<HashMap<PathBuf, Hook>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    /// The key for `marker`: its directory resolved, plus its file name, so
+    /// a git dir spelled two ways is one key.
+    fn key(marker: &Path) -> Option<PathBuf> {
+        let dir = std::fs::canonicalize(marker.parent()?).ok()?;
+        Some(dir.join(marker.file_name()?))
+    }
+
+    /// Run `hook` once, right before [`super::marked_launch_in`] opens the
+    /// marker at `marker`: whatever stood at the path a moment earlier, the
+    /// open meets what the hook leaves there.
+    pub(crate) fn arm_before_marker_open(marker: &Path, hook: impl FnOnce() + Send + 'static) {
+        let key = key(marker).expect("the marker's directory resolves");
+        BEFORE_MARKER_OPEN
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, Box::new(hook));
+    }
+
+    pub(super) fn before_marker_open(marker: &Path) {
+        let Some(key) = key(marker) else { return };
+        let hook = BEFORE_MARKER_OPEN
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&key);
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
+/// Fixture helpers other modules' tests share.
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use std::path::Path;
+
+    /// Make a FIFO at `path`.
+    #[cfg(unix)]
+    pub(crate) fn mkfifo_at(path: &Path) {
+        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path and mode; `mkfifo` only reads it.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    use super::tests_support::mkfifo_at;
+
+    /// `marked_launch_in(git_dir)` run on its own thread, answered within
+    /// `bound` or `None`. When it does not answer, `unblock` is run so the
+    /// stuck reader can finish rather than outlive the test.
+    fn marked_launch_within(
+        git_dir: &Path,
+        bound: std::time::Duration,
+        unblock: impl FnOnce(),
+    ) -> Option<MarkedLaunch> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let dir = git_dir.to_path_buf();
+        std::thread::spawn(move || {
+            let _ = tx.send(marked_launch_in(&dir));
+        });
+        match rx.recv_timeout(bound) {
+            Ok(read) => Some(read),
+            Err(_) => {
+                unblock();
+                None
+            }
+        }
+    }
+
+    /// PR #2431 round 3 (reviewer R1): a marker that is a symlink to a file
+    /// naming the launch is not that launch's marker. The reader does not
+    /// follow it: it answers [`MarkedLaunch::Unnamed`] (owner unconfirmed),
+    /// never `Names`. The presence gate is unchanged and still accepts it.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_marker_names_no_launch() {
+        let (scratch, repo) = git_dir_fixture();
+        let git_dir = git_dir_of(&repo).expect("git dir resolves");
+        let launch = WorkId::parse("w-abcdefgh-00000000000000c3").unwrap();
+        let marker = write_marker(
+            &repo,
+            "agent/x",
+            &Creator::dispatch("x").for_launch(Some(&launch)),
+        )
+        .unwrap();
+        assert_eq!(
+            marked_launch_in(&git_dir),
+            MarkedLaunch::Names(launch.clone()),
+            "control: the regular marker names the launch"
+        );
+        let saved = scratch.path().join("saved-marker");
+        std::fs::rename(&marker, &saved).unwrap();
+        std::os::unix::fs::symlink(&saved, &marker).unwrap();
+
+        assert_eq!(marked_launch_in(&git_dir), MarkedLaunch::Unnamed);
+        assert!(is_marked(&repo), "the presence gate is left as it was");
+    }
+
+    /// PR #2431 round 3 (reviewer R2): a FIFO at the marker path when the
+    /// reader opens it, put there after anything the reader looked at
+    /// earlier, is refused promptly instead of blocking the open waiting for
+    /// a writer. The seam swaps a regular marker naming the launch for the
+    /// FIFO right before the open, so the open itself meets it.
+    #[cfg(unix)]
+    #[test]
+    fn a_marker_swapped_for_a_fifo_before_the_open_is_refused_without_blocking() {
+        let (_scratch, repo) = git_dir_fixture();
+        let git_dir = git_dir_of(&repo).expect("git dir resolves");
+        let launch = WorkId::parse("w-abcdefgh-00000000000000c3").unwrap();
+        let marker = write_marker(
+            &repo,
+            "agent/x",
+            &Creator::dispatch("x").for_launch(Some(&launch)),
+        )
+        .unwrap();
+        {
+            let marker = marker.clone();
+            seams::arm_before_marker_open(&marker.clone(), move || {
+                std::fs::remove_file(&marker).unwrap();
+                mkfifo_at(&marker);
+            });
+        }
+
+        let started = std::time::Instant::now();
+        let read = marked_launch_within(&git_dir, std::time::Duration::from_secs(5), || {
+            // Give the stuck open its writer, so its thread can finish.
+            let _ = std::fs::OpenOptions::new().write(true).open(&marker);
+        });
+        let read = read.expect("the read answers without a writer on the FIFO");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(read, MarkedLaunch::NotMarked, "a FIFO is not a marker");
+    }
+
+    /// PR #2431 round 3: what is at the marker path and is not a regular
+    /// file is not marked (a directory, a FIFO, both answered without
+    /// blocking), and a regular marker that is not UTF-8 names no launch.
+    #[cfg(unix)]
+    #[test]
+    fn a_marker_that_is_not_a_regular_utf8_file_names_no_launch() {
+        let (_scratch, repo) = git_dir_fixture();
+        let git_dir = git_dir_of(&repo).expect("git dir resolves");
+        let marker = git_dir.join(OWNER_MARKER_FILENAME);
+
+        std::fs::create_dir(&marker).unwrap();
+        assert_eq!(marked_launch_in(&git_dir), MarkedLaunch::NotMarked);
+        std::fs::remove_dir(&marker).unwrap();
+
+        mkfifo_at(&marker);
+        let read = marked_launch_within(&git_dir, std::time::Duration::from_secs(5), || {
+            let _ = std::fs::OpenOptions::new().write(true).open(&marker);
+        });
+        assert_eq!(read, Some(MarkedLaunch::NotMarked), "a FIFO, unblocked");
+        std::fs::remove_file(&marker).unwrap();
+
+        std::fs::write(&marker, b"{\"creator\":{\"launch\":\"\xff\xfe\"}}").unwrap();
+        assert!(is_marked(&repo), "the gate accepts any non-empty file");
+        assert_eq!(marked_launch_in(&git_dir), MarkedLaunch::Unnamed);
+    }
 
     /// A directory `git rev-parse --git-dir` answers for, so [`marker_path`]
     /// resolves and [`is_marked`] measures something. A plain `git init` is

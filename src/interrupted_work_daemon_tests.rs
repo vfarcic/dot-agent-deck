@@ -1045,6 +1045,112 @@ fn reclaim_refuses_a_worktree_whose_marker_names_no_launch() {
     });
 }
 
+/// PR #2431 round 3 (reviewer R1): replace `wt`'s marker with a symlink to
+/// a saved copy of a marker naming `launch`, kept outside the git metadata
+/// directory, as a planted or restored marker would be.
+#[cfg(unix)]
+fn mark_through_symlink(wt: &Path, saved: &Path, launch: &WorkId) {
+    mark_naming(wt, launch);
+    let marker = crate::worktree_owner::marker_path(wt).expect("the marker's directory resolves");
+    std::fs::rename(&marker, saved).expect("save the marker");
+    std::os::unix::fs::symlink(saved, &marker).expect("link the marker to the saved copy");
+}
+
+/// PR #2431 round 3 (reviewer R1): a marker that is a symlink to a marker
+/// naming the item's own launch is not the tree's own marker, so the
+/// reclaim refuses it as owner unconfirmed, dry run or not, and the tree
+/// with its committed work stays.
+#[cfg(unix)]
+#[test]
+fn reclaim_keeps_a_tree_whose_marker_is_a_symlink() {
+    rt().block_on(async {
+        let fx = NewerRunFixture::new();
+        let registry = &fx.registry;
+        let older = fx.older(registry);
+        mark_through_symlink(&fx.wt, &fx.root_dir.join("saved-marker"), &older);
+
+        for dry_run in [true, false] {
+            let outcome = reclaim(registry, older.to_string(), dry_run, None).await;
+            assert_eq!(outcome.verdict, ReclaimVerdict::Refused, "{outcome:?}");
+            assert_eq!(
+                reason_of(&outcome),
+                Some(RefusalReason::OwnerUnconfirmed),
+                "dry run {dry_run}: {outcome:?}"
+            );
+            assert!(fx.wt.join(".notes").is_file(), "the tree is kept");
+        }
+        assert!(closes(registry).iter().all(|(work, _)| *work != older));
+    });
+}
+
+/// PR #2431 round 3 (reviewer R1), at the last re-read: the marker names
+/// the item's launch when the reclaim first checks it and is then replaced
+/// by a symlink to a copy of itself before the removal. The re-read does
+/// not follow it, so the tree is kept.
+#[cfg(unix)]
+#[test]
+fn reclaim_keeps_the_tree_when_its_marker_becomes_a_symlink_before_the_removal() {
+    rt().block_on(async {
+        let fx = NewerRunFixture::new();
+        let registry = &fx.registry;
+        let older = fx.older(registry);
+        mark_naming(&fx.wt, &older);
+        {
+            let wt = fx.wt.clone();
+            let saved = fx.root_dir.join("saved-marker");
+            let older = older.clone();
+            super::seams::arm_before_revalidate(&fx.wt, move || {
+                mark_through_symlink(&wt, &saved, &older);
+            });
+        }
+
+        let outcome = reclaim(registry, older.to_string(), false, None).await;
+        assert_eq!(outcome.verdict, ReclaimVerdict::KeptChanged, "{outcome:?}");
+        assert!(fx.wt.join(".notes").is_file(), "the tree is kept");
+        assert!(closes(registry).iter().all(|(work, _)| *work != older));
+    });
+}
+
+/// PR #2431 round 3 (reviewer R2): the last re-read, which runs while the
+/// reclaim holds the repository's worktree lock, meets a FIFO where the
+/// marker was, swapped in right before its open. It answers promptly
+/// instead of waiting for a writer, and the tree is kept.
+#[cfg(unix)]
+#[test]
+fn reclaim_keeps_the_tree_without_blocking_when_its_marker_becomes_a_fifo_before_the_open() {
+    rt().block_on(async {
+        let fx = NewerRunFixture::new();
+        let registry = &fx.registry;
+        let older = fx.older(registry);
+        mark_naming(&fx.wt, &older);
+        let marker = crate::worktree_owner::marker_path(&fx.wt).expect("marker path");
+        {
+            let marker = marker.clone();
+            super::seams::arm_before_revalidate(&fx.wt, move || {
+                let swapped = marker.clone();
+                crate::worktree_owner::seams::arm_before_marker_open(&marker, move || {
+                    std::fs::remove_file(&swapped).unwrap();
+                    crate::worktree_owner::tests_support::mkfifo_at(&swapped);
+                });
+            });
+        }
+
+        let bounded = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            reclaim(registry, older.to_string(), false, None),
+        )
+        .await;
+        let Ok(outcome) = bounded else {
+            // Give the stuck open its writer, so the runtime can shut down.
+            let _ = std::fs::OpenOptions::new().write(true).open(&marker);
+            panic!("the reclaim blocked on a FIFO at the marker path");
+        };
+        assert_eq!(outcome.verdict, ReclaimVerdict::KeptChanged, "{outcome:?}");
+        assert!(fx.wt.join(".notes").is_file(), "the tree is kept");
+        assert!(closes(registry).iter().all(|(work, _)| *work != older));
+    });
+}
+
 fn git_in(dir: &Path, root: &Path, args: &[&str]) {
     let out = crate::git_env::fixture_git(dir, root)
         .args(args)
