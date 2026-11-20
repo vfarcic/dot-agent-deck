@@ -11,7 +11,9 @@
 //!   when it is opened and after a reclaim or dismissal.
 //! - **Footer.** While the list has items, a footer row says how many
 //!   ([`crate::interrupted_work::interrupted_footer`]) with `[Show]` and
-//!   `[Hide]` buttons.
+//!   `[Hide]` buttons; a list that came back empty but incomplete gets the
+//!   row too, saying some work may not be listed
+//!   ([`crate::interrupted_work::INTERRUPTED_UNREAD`]).
 //! - **Overlay** (`UiMode::InterruptedWork`): the list, an item's details, and
 //!   the reclaim and dismiss-all confirmations. In the details, `Enter` shows
 //!   the first page of the item's kept reports with their text, and `n`/`p`
@@ -762,13 +764,22 @@ pub(super) fn hide_footer(ui: &mut UiState) {
     ui.interrupted.footer_hidden = true;
 }
 
-/// The number the footer row shows, when it is shown.
-pub(super) fn footer_count(ui: &UiState) -> Option<usize> {
+/// The sentence the footer row shows, when it is shown: how many items the
+/// daemon listed, or, for a list that came back empty but incomplete, that
+/// some interrupted work may not be listed, so the row still leads to the
+/// list (verification finding N4; the desktop draws the same banner).
+pub(super) fn footer_sentence(ui: &UiState) -> Option<String> {
     let iw = &ui.interrupted;
     if iw.footer_hidden {
         return None;
     }
-    listed_count(ui)
+    if let Some(count) = listed_count(ui) {
+        return Some(words::interrupted_footer(count));
+    }
+    iw.list
+        .as_ref()
+        .is_some_and(|list| list.incomplete)
+        .then(|| words::INTERRUPTED_UNREAD.to_string())
 }
 
 /// How many items the daemon listed, when it listed any.
@@ -810,7 +821,7 @@ pub(super) fn handle_key(key: KeyEvent, ui: &mut UiState, kb: &KeybindingConfig)
         return Action::Continue;
     }
     // The footer row offers its hide key here too (`interrupted_keys_act`).
-    if footer_count(ui).is_some() && kb.matches(KbAction::HideInterruptedWork, &key) {
+    if footer_sentence(ui).is_some() && kb.matches(KbAction::HideInterruptedWork, &key) {
         return Action::HideInterruptedWork;
     }
     let shifted = |c: char| {
@@ -1121,10 +1132,10 @@ fn footer_buttons_width(keybindings: &KeybindingConfig, keys: bool) -> u16 {
 /// How many footer rows the interrupted work takes at `width`: none, one, or
 /// two when its sentence and buttons do not fit side by side.
 pub(super) fn footer_rows(ui: &UiState, keys: bool, width: u16) -> u16 {
-    let Some(count) = footer_count(ui) else {
+    let Some(sentence) = footer_sentence(ui) else {
         return 0;
     };
-    let sentence = unicode_width::UnicodeWidthStr::width(words::interrupted_footer(count).as_str());
+    let sentence = unicode_width::UnicodeWidthStr::width(sentence.as_str());
     let buttons = usize::from(footer_buttons_width(&ui.keybindings, keys));
     if sentence + buttons <= usize::from(width) {
         1
@@ -1140,7 +1151,7 @@ pub(super) fn render_footer(
     keys: bool,
     area: Rect,
 ) -> Vec<(Action, Rect)> {
-    let Some(count) = footer_count(ui) else {
+    let Some(sentence) = footer_sentence(ui) else {
         return Vec::new();
     };
     frame.render_widget(Clear, area);
@@ -1157,7 +1168,7 @@ pub(super) fn render_footer(
     };
     frame.render_widget(
         Paragraph::new(Line::styled(
-            words::interrupted_footer(count),
+            sentence,
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),

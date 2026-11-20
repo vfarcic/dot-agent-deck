@@ -331,9 +331,8 @@ export const LIST_INCOMPLETE = "The deck could not read its whole work journal, 
 /**
  * Verification finding N4 — the banner of a daemon whose list came back
  * empty but incomplete: there may be work it could not read, so the banner
- * offers Show rather than leaving that daemon with no way in. Desktop-only:
- * the TUI holds one daemon, and its `I` opens that daemon's list whatever
- * the answer was.
+ * offers Show rather than leaving that daemon with no way in. The TUI's
+ * footer row says the same for its daemon.
  */
 export const INTERRUPTED_UNREAD = "The deck could not read its whole work journal, so some interrupted work may not be listed.";
 export const LABEL_ISSUE = "Issue";

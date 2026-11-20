@@ -835,6 +835,13 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 - **Does not assert:** the daemon's refusal itself (`interrupted_work_daemon::tests::dismiss_refuses_a_truncated_journal_read_and_writes_no_close`).
 - **Platform coverage:** mac+linux.
 
+##### journal/interrupted/033 — A list that came back empty but incomplete still gets the footer row, which opens the list and can be hidden.
+- **Layer:** L1 in-process `TestBackend` + `insta` (`tests/render_interrupted_work.rs`, seam `run_interrupted_work_seam`): the daemon's answer is handed in where the background request would deliver it, keys go through the production `handle_key_event`.
+- **Agent:** none.
+- **Asserts:** with an empty list marked incomplete, the dashboard's footer shows `INTERRUPTED_UNREAD` (the desktop banner's sentence) with `[Show I]` and `[Hide X]` (snapshot `footer_incomplete_empty_list`); `X` hides the row; `I` opens `Interrupted work`, asks for the list again with Git facts, and the overlay says `LIST_INCOMPLETE`; a complete empty list shows no row.
+- **Does not assert:** the desktop banner (`InterruptedWork.test.tsx`, "several daemons whose lists are incomplete each offer a way in"); the restart notice's line, which still counts listed items only.
+- **Platform coverage:** mac+linux.
+
 #### journal/compat
 
 ##### journal/compat/001 — Lines of a newer schema or an unknown kind are skipped and kept.

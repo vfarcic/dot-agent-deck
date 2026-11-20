@@ -703,6 +703,11 @@ pub const NOTHING_INTERRUPTED: &str = "No interrupted work.";
 /// What a list (or a show) read from an incomplete journal read says.
 pub const LIST_INCOMPLETE: &str =
     "The deck could not read its whole work journal, so an item may be missing or out of date.";
+/// What the TUI's footer row and the desktop's banner say for a list that
+/// came back empty but incomplete: there may be work the deck could not read,
+/// so the row still offers a way into the list (verification finding N4).
+pub const INTERRUPTED_UNREAD: &str =
+    "The deck could not read its whole work journal, so some interrupted work may not be listed.";
 /// The labels of an item's facts.
 pub const LABEL_ISSUE: &str = "Issue";
 pub const LABEL_BRANCH: &str = "Branch";

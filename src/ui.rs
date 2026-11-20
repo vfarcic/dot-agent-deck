@@ -9572,7 +9572,7 @@ fn handle_normal_key(
     if kb.matches(KbAction::InterruptedWork, &key) {
         return Action::OpenInterruptedWork;
     }
-    if interrupted_work_view::footer_count(ui).is_some()
+    if interrupted_work_view::footer_sentence(ui).is_some()
         && kb.matches(KbAction::HideInterruptedWork, &key)
     {
         return Action::HideInterruptedWork;

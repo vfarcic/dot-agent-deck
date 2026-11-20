@@ -18,12 +18,13 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use dot_agent_deck::interrupted_work::{
     DISMISSED, DismissOutcome, DismissStopReason, DismissStopped, DismissedItem,
-    INTERRUPTED_WORK_TITLE, InterruptedItem, InterruptedList, InterruptedShow, ItemKind,
-    ItemReport, LABEL_BRANCH, LABEL_FOLDER, LABEL_LAST_ENTRY, LABEL_PROGRESS, LABEL_REPORT,
-    LABEL_STARTED_BY, LABEL_WORKTREE, LastEntry, OTHER_AGENTS_GROUP, Progress, RECLAIM_EXPLANATION,
-    RECLAIM_REMOVED, RECLAIM_WOULD_REMOVE, ReclaimOutcome, ReclaimVerdict, Refusal, RefusalReason,
-    ShownReport, UNSUPPORTED, dismiss_all_question, dismiss_stopped_sentence, interrupted_footer,
-    kept_until, kind_label, progress_line, refusal_sentence, unpushed_sentence,
+    INTERRUPTED_UNREAD, INTERRUPTED_WORK_TITLE, InterruptedItem, InterruptedList, InterruptedShow,
+    ItemKind, ItemReport, LABEL_BRANCH, LABEL_FOLDER, LABEL_LAST_ENTRY, LABEL_PROGRESS,
+    LABEL_REPORT, LABEL_STARTED_BY, LABEL_WORKTREE, LIST_INCOMPLETE, LastEntry, OTHER_AGENTS_GROUP,
+    Progress, RECLAIM_EXPLANATION, RECLAIM_REMOVED, RECLAIM_WOULD_REMOVE, ReclaimOutcome,
+    ReclaimVerdict, Refusal, RefusalReason, ShownReport, UNSUPPORTED, dismiss_all_question,
+    dismiss_stopped_sentence, interrupted_footer, kept_until, kind_label, progress_line,
+    refusal_sentence, unpushed_sentence,
 };
 use dot_agent_deck::keybindings::KeybindingConfig;
 use dot_agent_deck::ui::{
@@ -1941,4 +1942,49 @@ fn interrupted_032_a_dismissal_refused_on_an_incomplete_read_says_so() {
     }));
     assert!(said.contains(&squeezed(DISMISSED)), "{said}");
     assert!(said.contains(&why), "a later batch:\n{said}");
+}
+
+/// Scenario: The daemon answers with an empty list that says its work journal
+/// could not be read whole. The dashboard's footer still shows a row, saying
+/// some interrupted work may not be listed, with `[Show I]` and `[Hide X]`;
+/// `I` opens the "Interrupted work" list, which says the journal could not be
+/// read whole, and `X` hides the row. A complete empty list shows no row.
+#[spec("journal/interrupted/033")]
+#[test]
+fn interrupted_033_an_incomplete_empty_list_still_offers_the_footer_row() {
+    let unread = InterruptedList {
+        items: Vec::new(),
+        incomplete: true,
+        omitted: 0,
+    };
+    let hidden = frames(&unread, &[ch('X')]);
+    assert!(hidden[0].contains(INTERRUPTED_UNREAD), "{}", hidden[0]);
+    assert!(hidden[0].contains("[Show I]"), "{}", hidden[0]);
+    assert!(hidden[0].contains("[Hide X]"), "{}", hidden[0]);
+    insta::assert_snapshot!("footer_incomplete_empty_list", hidden[0]);
+    assert!(
+        !hidden[1].contains(INTERRUPTED_UNREAD) && !hidden[1].contains("[Hide X]"),
+        "`X` hides the row:\n{}",
+        hidden[1]
+    );
+
+    let (opened, sent) = run(&unread, &[ch('I')]);
+    let open = opened.last().unwrap();
+    assert!(open.contains(INTERRUPTED_WORK_TITLE), "{open}");
+    assert!(
+        popup_text(open).contains(&squeezed(LIST_INCOMPLETE)),
+        "{open}"
+    );
+    assert!(
+        sent.iter()
+            .any(|r| matches!(r, InterruptedSeamRequest::List { git: true })),
+        "`I` asks for the list again: {sent:?}"
+    );
+
+    let complete = frames(&InterruptedList::default(), &[]);
+    assert!(
+        !complete[0].contains(INTERRUPTED_UNREAD) && !complete[0].contains("[Show I]"),
+        "a complete empty list, no row:\n{}",
+        complete[0]
+    );
 }

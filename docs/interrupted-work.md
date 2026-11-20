@@ -27,7 +27,7 @@ Each kept report is shown with its id and `kept until <date>`, the day the deck 
 
 ### TUI
 
-When the daemon the TUI is attached to has interrupted work, a row above the footer says how many items there are, such as `3 interrupted items from before the restart`, with `[Show I]` and `[Hide X]`. The row counts what the daemon listed when the TUI attached, opened the list, or reclaimed or dismissed an item; `I` asks the daemon again, so it also finds a report kept since then. In command mode, press `I` (or click `[Show I]`) to open the **Interrupted work** list, and `X` to hide the row. If you are typing in a pane, press `Ctrl+D` first. Hiding the row is not saved: it comes back when the TUI attaches to a restarted daemon or is started again. `I` opens the list whether or not the row is shown.
+When the daemon the TUI is attached to has interrupted work, a row above the footer says how many items there are, such as `3 interrupted items from before the restart`, with `[Show I]` and `[Hide X]`. The row counts what the daemon listed when the TUI attached, opened the list, or reclaimed or dismissed an item; `I` asks the daemon again, so it also finds a report kept since then. If the daemon could not read its whole work journal and listed nothing, the row says `The deck could not read its whole work journal, so some interrupted work may not be listed.` instead, with the same buttons. In command mode, press `I` (or click `[Show I]`) to open the **Interrupted work** list, and `X` to hide the row. If you are typing in a pane, press `Ctrl+D` first. Hiding the row is not saved: it comes back when the TUI attaches to a restarted daemon or is started again. `I` opens the list whether or not the row is shown.
 
 ![The TUI's Interrupted work list, opened with I from the footer row 3 interrupted items from before the restart: the unit fix-login on branch agent/dispatch-fix-login is selected, with its worktree, who started it, its last entry and progress; below it the orchestration release-team, and under Other agents the agent scratch-shell with its folder; the keys j/k select, Enter details, r reclaim, d dismiss, D dismiss all and Esc close are at the bottom](/img/interrupted-work-tui.png)
 
@@ -131,7 +131,6 @@ An agent running in one of the deck's panes can run `interrupted list` and `inte
 
 - The TUI shows the interrupted work of the one daemon it is attached to. The desktop app shows a banner for each daemon on its dashboard, and `I` and "show interrupted work" ask you to pick one when several have interrupted work.
 - With several daemons' banners on the dashboard, the desktop app's `X` hides none of them; use the **Hide** button of the one you mean.
-- When a daemon's list is empty because it could not read its whole work journal, the desktop app shows a banner saying some interrupted work may not be listed. The TUI shows no row then; its `I` still opens the list, which says the deck could not read its whole work journal.
 - The TUI's `I` and `X` can be rebound in `keybindings.toml`; the desktop app's keys are fixed.
 - Voice control is in the desktop app only.
 
