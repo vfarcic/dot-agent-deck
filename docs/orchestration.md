@@ -394,13 +394,12 @@ Do not modify the test files. Run the test suite before reporting completion.
 
 *The TUI's orchestration tab. In the desktop app, open a role's terminal by clicking its row in the ORCHESTRATION group.*
 
-These keys work in command mode; press `Ctrl+d` first if you are typing in a role pane:
+The pane column shows the focused role's pane at full height. These keys work in command mode; press `Ctrl+d` first if you are typing in a role pane:
 
 | Key | Action |
 |---|---|
 | `Left` / `Right` (or `h` / `l`) | Previous / next tab |
 | `1`–`9` | Focus role card N and its pane |
-| `Ctrl+t` | Toggle between `Stacked` (only the focused role's pane is shown) and `Tiled` (every role's pane) |
 | `Ctrl+l` | Toggle the sidebar width between 34% and 25% of the frame (one setting for every orchestration tab) |
 | `Ctrl+z` | Zoom the focused pane to the whole frame; press again to return |
 | `Ctrl+w` | Close the orchestration tab, which stops every role, after a confirmation |
