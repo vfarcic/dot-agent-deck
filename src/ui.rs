@@ -41837,6 +41837,14 @@ mod tests {
             // caller's checkout and undoes the isolation.
             "REFERENCE them by path",
             "RELATIVE to the repo root",
+            // PRD #468: both placements, where a new worktree belongs (CLAUDE.md
+            // rule 14), and the single agent's handoff to a team in place.
+            "--dir .",
+            "--list-targets --dir <path>",
+            "never on a RAM-backed tmpfs",
+            "closing the unit leaves it in place",
+            "a name no other brief has",
+            "is the user's decision",
         ] {
             assert!(
                 dispatcher_seed_prompt().contains(required),

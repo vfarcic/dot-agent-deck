@@ -62,25 +62,49 @@ A single-agent unit that runs Claude Code starts with Claude Code's prompt sugge
 - **The task must stand on its own.** The unit is a fresh agent that cannot see the dispatcher's conversation. State the goal and the expected outcome.
 - **Refer to files in the repository instead of pasting them.** The unit has a copy of the repository, so *"execute the release checklist in docs/release.md"* is complete. Pasted text can be stale against the copy the unit holds.
 - **Use paths relative to the repository root.** An absolute path into your own checkout points the unit back at your working tree and defeats the isolation.
-- **Commit first.** The unit's copy is made from the **last commit on the branch you are on**. Uncommitted edits, untracked files and ignored files are not in it. There is no option to start from another commit or branch, so put your checkout on the branch and commit you want before dispatching. A unit already running keeps the copy it was given.
+- **Commit first.** The unit's copy is made from the **last commit on the branch you are on**. Uncommitted edits, untracked files and ignored files are not in it. There is no option to start from another commit or branch, so put your checkout on the branch and commit you want before dispatching. A unit already running keeps the copy it was given. To start a unit where the work already is, uncommitted files included, continue in that directory instead (below).
+
+## Continue work in an existing directory
+
+A new unit normally gets a new copy of the repository. When the work already has a home, such as the worktree an earlier agent analysed an issue in, with its branch, its notes and the test it wrote, a new copy would leave all of that behind. Ask the dispatcher to continue there instead: *"continue this in ../myapp-dispatch-login-bug with the review team"*, or, to an agent that has finished its analysis, *"hand this over to a team right here"*. The unit is started with `--dir`:
+
+```bash
+dot-agent-deck dispatch <name> --dir <path> --task-file <file> --orchestration '<orchestration-name>'
+dot-agent-deck dispatch <name> --dir . --task-file <file> --orchestration '<orchestration-name>'
+```
+
+`--dir .` means the directory the agent running the command is in. The unit starts in that directory, on whatever branch is checked out there and with every file in it, committed or not. Nothing is created: no new worktree and no new branch. Starting the unit claims nothing, so closing it leaves the directory in place, with the one exception [Finish up](#finish-up) describes. The orchestrations on offer are the ones that directory's `.dot-agent-deck.toml` defines; `dispatch --list-targets --dir <path>` lists them.
+
+Only one unit works in a directory at a time. A `--dir` dispatch into a directory where other agents of the deck are still running is refused, and nothing starts; the refusal names the directory, the agents and the files it found there. Wait for them to finish and close them, or dispatch without `--dir` to get a new copy. The agent that runs `dispatch --dir .` does not count against its own directory when it is a single agent, so it can hand its work to a team where it stands.
+
+### Hand your work to a team
+
+When an agent working on its own decides the work needs a team, whether to start one is your decision: it should recommend it rather than start one by itself, and the dispatcher is told the same. If you agree, the agent writes what the team needs to know into a brief under `.dot-agent-deck/`, with a name no other brief has (for example `.dot-agent-deck/handoff-login-bug-2026-11-20.md`), and starts the team in its own directory with the brief as the task:
+
+```bash
+dot-agent-deck dispatch login-bug-team --dir . --orchestration 'prd' --task-file .dot-agent-deck/handoff-login-bug-2026-11-20.md
+```
+
+The team's orchestrator gets the brief as its task and works from the same branch and files the agent left. Nothing reads a brief unless a task names it, so an old brief in the directory is never picked up by mistake. This works the same from the TUI and from the desktop app: the agent runs the command in its own terminal either way, and the team appears as a tab in the TUI and as an **ORCHESTRATION** group in the desktop app.
 
 ## `dispatch` reference
 
 ```
-dot-agent-deck dispatch <NAME> (--task <TEXT> | --task-file <PATH>) [--single [--agent <AGENT>] [--command <CMD>] | --orchestration <NAME>]
-dot-agent-deck dispatch --list-targets
+dot-agent-deck dispatch <NAME> [--dir <PATH>] (--task <TEXT> | --task-file <PATH>) [--single [--agent <AGENT>] [--command <CMD>] | --orchestration <NAME>]
+dot-agent-deck dispatch --list-targets [--dir <PATH>]
 ```
 
 | Argument | Meaning |
 |---|---|
-| `<NAME>` | Short name for the unit, for example `fix-auth-bug`. Characters other than letters, digits, `-` and `_` become `-`. The unit works in `../<repo>-dispatch-<name>` (a sibling of your project directory) on branch `agent/dispatch-<name>`. Required except with `--list-targets`. |
+| `<NAME>` | Short name for the unit, for example `fix-auth-bug`. Characters other than letters, digits, `-` and `_` become `-`. It names the unit's tab or card. Without `--dir`, the unit works in `../<repo>-dispatch-<name>` (a sibling of your project directory) on branch `agent/dispatch-<name>`. Required except with `--list-targets`. |
+| `--dir <PATH>` | Start the unit in this existing directory instead of a new worktree; `--dir .` is the directory you run the command from. Nothing is created, and closing the unit leaves the directory in place ([Finish up](#finish-up) has the one exception). The orchestrations on offer are that directory's. Refused while other agents of the deck run there. With `--list-targets`, list that directory's targets. See [Continue work in an existing directory](#continue-work-in-an-existing-directory). |
 | `--task <TEXT>` | The unit's task. |
 | `--task-file <PATH>` | Read the task from a file, or from stdin with `-`. Use it for text with quotes, backticks, `$` or newlines. A regular file of at most 1 MiB. |
 | `--single` | Start one agent, with the same command and agent as the dispatcher that asked for it: a dispatcher started as `devbox run agent` gets units started as `devbox run agent`, in the unit's own copy of the repository, and a Codex, OpenCode, Pi or Devin dispatcher gets units of its own agent. A dispatcher started with no command, or with one that only opens a shell (`bash`, `devbox shell`, `nix develop`) in which you then started the agent, gets the configured `default_command`, or `claude`. So does one started from a subdirectory of the repository with a command such as `./agent.sh`, which would not be found from the root of the unit's copy. |
 | `--agent <AGENT>` | Start one agent of this kind: `claude`, `opencode`, `pi`, `codex` or `devin`, the names a role's `agent = "…"` takes. Alone, it starts that agent with its own command, so `--agent opencode` runs `opencode`. With `--command`, it says which agent that command starts. Implies `--single`. Any other name is refused with the list of valid ones, and nothing is started. |
 | `--command <CMD>` | Start one agent with this command instead of the dispatcher's, for example `--command "devbox run oc-big"`. It runs from the root of the unit's copy of the repository. When the command does not start with the agent's own program name, add `--agent` to say which agent it starts; `--command "opencode --model big"` needs no `--agent`, `--command "devbox run oc-big"` does, and is refused without it. A command that only opens a shell, such as `bash` or `devbox shell`, is refused, since there would be no agent to give the task to. Implies `--single`. |
 | `--orchestration <NAME>` | Start the orchestration with that `name`. `--orchestration=` with an empty value starts the project's default orchestration (the one with `default = true`, else the first with roles). The value is required: `--orchestration my-unit` reads `my-unit` as the orchestration name. |
-| `--list-targets` | Print what can be dispatched here and exit. It cannot be combined with the other arguments. |
+| `--list-targets` | Print what can be dispatched here and exit. It cannot be combined with the other arguments except `--dir`. |
 
 `--agent` and `--command` cannot be combined with `--orchestration`: each role of an orchestration has its own command and agent in `.dot-agent-deck.toml`.
 
@@ -108,7 +132,7 @@ Starting a unit happens in three steps, and each one tells you something differe
 | What you see | What it means | What it does not mean |
 |---|---|---|
 | `dot-agent-deck dispatch` exits 0 | The daemon accepted the request, or gave no answer the command could check (an older daemon, or none within 5 seconds). With `--agent` or `--command`, only an accepted request exits 0. | That a worktree was created, that a unit started, or that it got its task. The daemon answers before doing any of that. |
-| A turn in the dispatcher pane beginning `dispatch: spawned isolated` | The worktree exists and the unit's agents were started in it. The turn names what was started, its directory and its branch, and usually the commit the worktree was cut from. | That the agent received its task. |
+| A turn in the dispatcher pane beginning `dispatch: spawned isolated` | The worktree exists and the unit's agents were started in it. The turn names what was started, its directory and its branch, and usually the commit the worktree was cut from. For a `--dir` unit it names the existing directory and the branch checked out there, and says the dispatch created nothing there. | That the agent received its task. |
 | A turn beginning `dispatch: a unit you dispatched has completed` | The unit is reporting back: finished, or stuck and unable to continue. The unit received enough work to send a report; read the report to see what happened. | That the work is correct; read the report. |
 | A `dispatch ended` message: `Dispatched unit <name> ended (it exited / it was closed / it could not be restarted) without reporting.` | The unit's agent stopped before it reported: it exited on its own, its pane was closed, or the deck could not restart it. No report is coming. | That its work is lost: its branch and directory are as it left them. |
 | The unit's `work-done --done` prints `Error: nothing was reported: this dispatched unit already ended …` | The unit ended before its report was taken, and its dispatcher was told it ended without a report. | That the unit's work is lost: its branch and directory are as it left them. |
@@ -155,7 +179,7 @@ Detaching the TUI or closing the desktop app does not close the dispatcher pane,
 
 Close a unit when you are done with it: its tab or card in a client, or `dot-agent-deck close <name>` from a shell. You can also ask the dispatcher to close the units it started, for example *"close the units that have reported back"*; it runs the same command, and closes only units it dispatched. `close --all` lists what can be closed without closing anything. A unit that has not reported back, or whose agent is busy, is refused unless you add `--force`. See [Closing Agents](closing-agents.md) for the details.
 
-Closing a unit removes that unit's worktree directory by default, unless you choose to keep it (below). Closing the dispatcher pane removes nothing; it never owned a worktree, and the units it started keep running. Your own repository is not touched either way.
+Closing a unit removes that unit's worktree directory by default, unless you choose to keep it (below). A unit started with `--dir` is the exception: its directory was there before it, so closing it leaves the directory in place and `close` reports it as `left in place`. If that directory is itself the worktree of an earlier unit, that earlier unit's own rules still apply to it: it is removed, when clean, once the last agent working in it closes. Closing the dispatcher pane removes nothing; it never owned a worktree, and the units it started keep running. Your own repository is not touched either way.
 
 If the unit's worktree has **uncommitted changes** when you close it, the directory is kept on disk so the work can be recovered. In both the TUI and desktop app, the close confirmation warns when that is about to happen and names the directory. After the close, a kept directory is reported on the TUI's status line or in a desktop notice naming its daemon; dismiss the desktop notice with its **×** when you have read it. The same happens when other worktrees of the repository are inside the unit's worktree, such as ones its agents created under a git-ignored `.worktrees/`: removing it would delete them and their uncommitted work, so it is kept and the warning names them. Remove those worktrees first (`git worktree remove <path>`), then the unit's. A unit whose worktree turned out to be clean is removed without a kept-worktree notice, unless you chose to keep it. `close` reports what happened to each worktree in its output.
 
@@ -177,7 +201,9 @@ dot-agent-deck worktree reclaim     # remove the worktrees marked "remove": deck
 | Symptom | Cause | What to do |
 |---|---|---|
 | `dispatch: branch agent/dispatch-<name> already exists from an earlier dispatch …` | A unit with this name ran before; its branch was kept. | Use another name, or delete the branch with the `git … branch -D` command the message gives. |
-| A `dispatch:` failure naming an orchestration and listing the available ones | `--orchestration` named an orchestration the project does not define (names are matched exactly). | Run `dispatch --list-targets` and use a listed name. Nothing was created. |
+| `dispatch: <dir> already holds a live agent's coordination files: …` | A `--dir` dispatch named a directory where other agents of the deck are still running. Nothing was started. | Wait for those agents to finish and close them, or dispatch without `--dir` to start in a new worktree. |
+| `Error: --dir <path>: …` or `dispatch: --dir <path>: not a directory` | The `--dir` path does not exist or is not a directory. Nothing was started. | Pass an existing directory; `--dir .` is the one you are in. |
+| A `dispatch:` failure naming an orchestration and listing the available ones | `--orchestration` named an orchestration the project does not define (names are matched exactly). With `--dir`, the project is that directory. | Run `dispatch --list-targets` (with the same `--dir`, if any) and use a listed name. Nothing was created. |
 | `dispatch: ambiguous-orchestration: …` | The project's `.dot-agent-deck.toml` declares more than one orchestration with roles under that name, so the deck cannot tell which one you meant. | Rename one of them (`dot-agent-deck validate` reports the duplicate as a warning), then dispatch again. Nothing was created. |
 | `Error: unknown agent '<name>' for --agent; known agents: …` | `--agent` named an agent the deck does not know. | Use one of the listed names. Nothing was started. |
 | `Error: --command '<cmd>' does not name an agent the deck recognises, …` | The command does not start with an agent's own program name (for example `devbox run …`), so the deck cannot tell which agent it starts. | Add `--agent <name>`. Nothing was started. |

@@ -7466,7 +7466,10 @@ async fn run_hook_loop_with_limits(
                                         ),
                                     };
                                     let task = signal.task.as_deref().unwrap_or_default();
-                                    let result = dispatch::handle_dispatch(
+                                    // PRD #468: `dispatch --dir` starts the unit
+                                    // in that existing directory instead of a
+                                    // new worktree.
+                                    let result = dispatch::handle_dispatch_at(
                                         &ctx,
                                         &signal.name,
                                         task,
@@ -7475,6 +7478,7 @@ async fn run_hook_loop_with_limits(
                                             command: signal.command.as_deref(),
                                             agent: signal.agent.as_deref(),
                                         },
+                                        signal.dir.as_deref(),
                                     )
                                     .await;
 
@@ -8083,11 +8087,20 @@ async fn run_hook_loop_with_limits(
                                     info!(
                                         pane_id = %escape_id_for_log(&req.pane_id),
                                         resolved_cwd = ?cwd,
+                                        dir = ?req.dir,
                                         "Received list-targets request"
                                     );
-                                    let resp = crate::dispatch::list_targets_response(
-                                        cwd.as_deref().map(std::path::Path::new),
-                                    );
+                                    // PRD #468: `--list-targets --dir <path>`
+                                    // lists that directory's targets, the config
+                                    // a `dispatch --dir <path>` resolves from.
+                                    let resp = match req.dir.as_deref() {
+                                        Some(dir) => {
+                                            crate::dispatch::list_targets_response_for_dir(dir)
+                                        }
+                                        None => crate::dispatch::list_targets_response(
+                                            cwd.as_deref().map(std::path::Path::new),
+                                        ),
+                                    };
                                     if let Ok(json) = serde_json::to_string(&resp) {
                                         let line = format!("{json}\n");
                                         if write_hook_reply(&mut write_half, &line, idle_timeout)
@@ -16302,6 +16315,7 @@ mod hook_ingestion_tests {
             token: Some(fx.orchestrator_token.clone()),
             command: None,
             agent: None,
+            dir: None,
         });
         let line = format!("{}\n", serde_json::to_string(&msg).unwrap());
         let mut stream = UnixStream::connect(&fx.sock).await.expect("connect");
