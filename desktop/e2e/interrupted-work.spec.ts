@@ -148,4 +148,56 @@ test.describe("Interrupted work", () => {
     await page.keyboard.press("y");
     await expect(dialog.getByTestId("interrupted-empty")).toBeVisible();
   });
+  /* PRD #1790 stage 2, final reviewer 3 (CLAUDE.md rule 22): the TUI's X and its j/k scrolling. */
+
+  /** Scenario: on the dashboard `X` hides the deck's banner, as the TUI's `X` hides its row; `I` then opens the dialog with all three items still listed, so nothing was dismissed. */
+  test("X hides the banner and dismisses nothing", async ({ page }) => {
+    await openDashboard(page);
+    await expect(page.getByTestId("interrupted-banner")).toBeVisible();
+    await page.keyboard.press("X");
+    await expect(page.getByTestId("interrupted-banner")).toHaveCount(0);
+    await page.keyboard.press("I");
+    const dialog = page.getByTestId("interrupted-dialog");
+    await expect(dialog.getByTestId("interrupted-row")).toHaveCount(3);
+  });
+
+  /** Scenario: in a window too short for the dialog, `j` scrolls an item's details down and `k` back up, the same with its report text shown and with the Dismiss all question; none of them changes the selected item, answers the question or dismisses anything. */
+  test("j and k scroll the details, the report text and a question", async ({ page }) => {
+    await openDashboard(page);
+    await page.getByTestId("interrupted-banner-show").click();
+    const dialog = page.getByTestId("interrupted-dialog");
+    await expect(dialog.getByTestId("interrupted-row")).toHaveCount(3);
+    await dialog.getByTestId("interrupted-row").filter({ hasText: "fix-login" }).click();
+    await page.setViewportSize({ width: 900, height: 170 });
+    const scrollTop = () => dialog.evaluate((element) => element.scrollTop);
+    const overflows = () => dialog.evaluate((element) => element.scrollHeight > element.clientHeight + 4);
+    const scrolls = async () => {
+      await dialog.evaluate((element) => { element.scrollTop = 0; });
+      expect(await overflows()).toBe(true);
+      await page.keyboard.press("j");
+      await expect.poll(scrollTop).toBeGreaterThan(0);
+      const down = await scrollTop();
+      await page.keyboard.press("k");
+      await expect.poll(scrollTop).toBeLessThan(down);
+    };
+
+    await dialog.getByTestId("interrupted-details").click();
+    await expect(dialog.getByTestId("interrupted-details-view")).toContainText("fix-login");
+    await scrolls();
+    await dialog.getByTestId("interrupted-show-reports").click();
+    await expect(dialog.getByTestId("interrupted-report-body")).toBeVisible();
+    await scrolls();
+    await expect(dialog.getByTestId("interrupted-details-view")).toContainText("fix-login");
+    await page.keyboard.press("q");
+    await expect(dialog.locator(".interrupted-row.is-selected")).toContainText("fix-login");
+
+    await page.keyboard.press("D");
+    await expect(dialog.getByTestId("interrupted-dismiss-all")).toHaveAttribute("data-presented", "true");
+    await scrolls();
+    await expect(dialog.getByTestId("interrupted-dismiss-all-question")).toBeVisible();
+    await expect(dialog.getByTestId("interrupted-message")).toHaveCount(0);
+    await page.keyboard.press("n");
+    await expect(dialog.getByTestId("interrupted-row")).toHaveCount(3);
+    await expect(dialog.locator(".interrupted-row.is-selected")).toContainText("fix-login");
+  });
 });

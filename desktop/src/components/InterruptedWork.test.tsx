@@ -830,3 +830,140 @@ describe("the TUI's keys on the desktop (reviewer 8, CLAUDE.md rule 22)", () => 
     expect(dismissCalls(calls)).toEqual([[AGENT_ID]]);
   });
 });
+
+/** A bridge whose list answers per daemon process from `lists`, rejecting where it holds an `Error`; the requests are recorded. */
+function perProcessBridge(lists: Record<string, InterruptedList | Error>) {
+  const { bridge, calls } = recordingBridge({ list: three() });
+  const listed: InterruptedTarget[] = [];
+  const perProcess = {
+    ...(bridge as unknown as Record<string, unknown>),
+    interruptedWorkList: vi.fn(async (target: InterruptedTarget) => {
+      listed.push(target);
+      const answer = lists[target.instance];
+      if (answer instanceof Error) throw answer;
+      return answered(target, structuredClone(answer ?? { items: [] }));
+    }),
+  } as unknown as DeckBridge;
+  return { bridge: perProcess, calls, listed };
+}
+
+describe("opening the list asks the daemon again (final reviewer 2)", () => {
+  /** Scenario: the daemon's first answer lists nothing, so no banner is drawn; later a unit's report is kept for an orchestrator that went away. `I` on the dashboard asks the daemon again rather than trusting the empty answer, and the dialog shows the unit. Saying "show interrupted work" does the same. */
+  it("refetches an empty first answer on I and on voice", async () => {
+    const lists: Record<string, InterruptedList | Error> = { "process-a": { items: [] } };
+    const { bridge, listed } = perProcessBridge(lists);
+    const voice = voiced(bridge);
+    render(<voice.Voiced />);
+    await waitFor(() => expect(listed).toHaveLength(1));
+    expect(screen.queryByTestId("interrupted-banner")).toBeNull();
+    lists["process-a"] = { items: [unit()] };
+
+    await act(async () => { fireEvent.keyDown(document.body, { key: "I" }); });
+    await waitFor(() => expect(listed.length).toBeGreaterThanOrEqual(2));
+    const dialog = await screen.findByTestId("interrupted-dialog");
+    await waitFor(() => expect(within(dialog).getAllByTestId("interrupted-row")).toHaveLength(1));
+    expect(rows()[0]).toHaveTextContent("fix-login");
+    expect(screen.queryByText(NOTHING_INTERRUPTED)).toBeNull();
+    await act(async () => { fireEvent.click(within(dialog).getByTestId("interrupted-close")); });
+
+    lists["process-a"] = { items: [unit(), team()] };
+    const before = listed.length;
+    await act(async () => { VOICE_ACTIONS.showInterruptedWork.run(voice.context(), {}); });
+    await waitFor(() => expect(listed.length).toBeGreaterThan(before));
+    await waitFor(() => expect(rows()).toHaveLength(2));
+    expect(voice.reportRefused).not.toHaveBeenCalled();
+  });
+
+  /** Scenario: the daemon's first answer to the list is an error. `I` asks again, and when that answer lists a unit the dialog shows it. */
+  it("refetches after a first answer that failed", async () => {
+    const lists: Record<string, InterruptedList | Error> = { "process-a": new Error("daemon busy") };
+    const { bridge, listed } = perProcessBridge(lists);
+    render(<Overview bridge={bridge} deck={deckOf("process-a")} />);
+    await waitFor(() => expect(listed).toHaveLength(1));
+    lists["process-a"] = { items: [unit()] };
+
+    await act(async () => { fireEvent.keyDown(document.body, { key: "I" }); });
+    await waitFor(() => expect(listed.length).toBeGreaterThanOrEqual(2));
+    await waitFor(() => expect(rows()).toHaveLength(1));
+    expect(rows()[0]).toHaveTextContent("fix-login");
+  });
+
+  /** Scenario: two daemons both first answered with nothing. A unit is then listed on the second. `I` asks both again before deciding, and opens the second daemon's dialog showing the unit; nothing says "No interrupted work". */
+  it("asks every daemon again before deciding which ones have work", async () => {
+    const lists: Record<string, InterruptedList | Error> = { "process-a": { items: [] }, "process-b": { items: [] } };
+    const { bridge, listed } = perProcessBridge(lists);
+    const fleet = [deckOf("process-a"), remoteDeck("deck-b", "beta", "process-b")];
+    const voice = voiced(bridge, fleet);
+    render(<voice.Voiced />);
+    await waitFor(() => expect(listed).toHaveLength(2));
+    lists["process-b"] = { items: [unit()] };
+
+    await act(async () => { fireEvent.keyDown(document.body, { key: "I" }); });
+    await waitFor(() => expect(listed.filter((target) => target.instance === "process-a").length).toBeGreaterThanOrEqual(2));
+    expect(listed.filter((target) => target.instance === "process-b").length).toBeGreaterThanOrEqual(2);
+    const dialog = await screen.findByTestId("interrupted-dialog");
+    await waitFor(() => expect(within(dialog).getAllByTestId("interrupted-row")).toHaveLength(1));
+    expect(dialog).toHaveTextContent("beta");
+    expect(screen.queryByText(NOTHING_INTERRUPTED)).toBeNull();
+  });
+
+  /** Scenario: two daemons first answered with nothing; asked again, one still lists nothing and the other's answer fails. `I` opens nothing and says which daemon could not be asked, never that there is no interrupted work. */
+  it("never says there is none when a daemon could not be asked", async () => {
+    const lists: Record<string, InterruptedList | Error> = { "process-a": { items: [] }, "process-b": { items: [] } };
+    const { bridge, listed } = perProcessBridge(lists);
+    const fleet = [deckOf("process-a"), remoteDeck("deck-b", "beta", "process-b")];
+    const voice = voiced(bridge, fleet);
+    render(<voice.Voiced />);
+    await waitFor(() => expect(listed).toHaveLength(2));
+    lists["process-b"] = new Error("connection reset");
+
+    await act(async () => { VOICE_ACTIONS.showInterruptedWork.run(voice.context(), {}); });
+    await waitFor(() => expect(listed.length).toBeGreaterThanOrEqual(4));
+    await waitFor(() => expect(voice.reportRefused).toHaveBeenCalled());
+    const said = voice.reportRefused.mock.calls.at(-1)?.[0] as string;
+    expect(said).not.toBe(NOTHING_INTERRUPTED);
+    expect(said).toContain("beta");
+    expect(screen.queryByTestId("interrupted-dialog")).toBeNull();
+  });
+});
+
+describe("X hides a banner, as the TUI's X hides its row (final reviewer 3)", () => {
+  /** Scenario: one daemon's banner is up; `X` on the dashboard hides it and sends nothing; `I` then still lists every item, so nothing was dismissed. With focus in a text field `X` is typed there and hides nothing. */
+  it("hides the one banner without dismissing anything", async () => {
+    const { bridge, calls } = recordingBridge({ list: three() });
+    render(<Overview bridge={bridge} deck={deckOf("process-a")} />);
+    await screen.findByTestId("interrupted-banner");
+    const field = document.createElement("input");
+    document.body.append(field);
+    field.focus();
+    await act(async () => { fireEvent.keyDown(field, { key: "X" }); });
+    expect(screen.getByTestId("interrupted-banner")).toBeInTheDocument();
+    field.remove();
+
+    const before = calls.length;
+    await act(async () => { fireEvent.keyDown(document.body, { key: "X" }); });
+    expect(screen.queryByTestId("interrupted-banner")).toBeNull();
+    expect(calls.length).toBe(before);
+    await act(async () => { fireEvent.keyDown(document.body, { key: "I" }); });
+    await waitFor(() => expect(rows()).toHaveLength(3));
+    expect(dismissCalls(calls)).toEqual([]);
+  });
+
+  /** Scenario: two daemons' banners are up; `X` hides neither and says that several daemons have one. Once the first daemon's banner is hidden with its Hide button, `X` hides the other one. */
+  it("asks which banner when several are up", async () => {
+    const { bridge, calls } = recordingBridge({ list: three() });
+    const fleet = [deckOf("process-a"), remoteDeck("deck-b", "beta", "process-b")];
+    const voice = voiced(bridge, fleet);
+    render(<voice.Voiced />);
+    await waitFor(() => expect(screen.getAllByTestId("interrupted-banner")).toHaveLength(2));
+    await act(async () => { fireEvent.keyDown(document.body, { key: "X" }); });
+    expect(screen.getAllByTestId("interrupted-banner")).toHaveLength(2);
+    expect(screen.getByText(/Several daemons have interrupted work/)).toBeInTheDocument();
+
+    await act(async () => { fireEvent.click(screen.getAllByTestId("interrupted-banner-hide")[0]); });
+    expect(screen.getAllByTestId("interrupted-banner")).toHaveLength(1);
+    await act(async () => { fireEvent.keyDown(document.body, { key: "X" }); });
+    expect(screen.queryByTestId("interrupted-banner")).toBeNull();
+    expect(dismissCalls(calls)).toEqual([]);
+  });
+});
