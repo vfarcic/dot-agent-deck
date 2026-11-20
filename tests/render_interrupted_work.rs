@@ -672,6 +672,10 @@ fn real_reclaim(id: &str) -> InterruptedSeamRequest {
     }
 }
 
+fn is_dismissal(request: &InterruptedSeamRequest) -> bool {
+    matches!(request, InterruptedSeamRequest::Dismiss { .. })
+}
+
 fn is_real_reclaim(request: &InterruptedSeamRequest) -> bool {
     matches!(
         request,
@@ -770,7 +774,8 @@ fn assert_box_intact(buffer: &ratatui::buffer::Buffer, at_step: usize) {
 /// report's id and text, a reclaim dry run's paths and an unknown verdict's
 /// sentence, and a failed request's message. No frame of the list, details,
 /// shown reports or reclaim draws any of them, and the overlay's borders stay
-/// whole.
+/// whole. A short report shown on screen draws each such character as its
+/// escaped spelling.
 #[spec("journal/interrupted/018")]
 #[test]
 fn interrupted_018_hostile_journal_values_are_escaped_everywhere_they_are_shown() {
@@ -863,6 +868,56 @@ fn interrupted_018_hostile_journal_values_are_escaped_everywhere_they_are_shown(
                 shown[13]
             );
         }
+    }
+
+    // The report body on its own, short enough to be drawn below short
+    // details: each hostile character on its own line beside a sentinel, so
+    // the body is on screen and its escaping, not the widget, keeps each
+    // character out. Every one must be drawn as its escaped spelling.
+    let mut plain = unit();
+    plain.worktree = Some("/w".to_string());
+    plain.branch = Some("b".to_string());
+    let mut show = page(1, 1, 1, None);
+    show.item = plain.clone();
+    let probes = ['\u{202e}', '\u{2066}', '\u{1b}', '\u{7}', '\u{85}'];
+    show.reports = vec![ShownReport {
+        report_id: REPORT_ID.to_string(),
+        body: Some(
+            probes
+                .iter()
+                .enumerate()
+                .map(|(n, c)| format!("BODY-{n}{c}END\n"))
+                .collect(),
+        ),
+        cut: false,
+        error: None,
+    }];
+    let run = run_interrupted_work_seam(
+        &only(plain),
+        &[],
+        UiMode::Normal,
+        &KeybindingConfig::default(),
+        &[
+            ch('I'),
+            key(KeyCode::Enter),
+            key(KeyCode::Enter),
+            InterruptedSeamStep::Shown(show),
+        ],
+        WIDTH,
+        40,
+    );
+    let shown = text(run.frames.last().expect("a frame"));
+    for (n, c) in probes.iter().enumerate() {
+        let escaped = if c.is_control() {
+            c.escape_default().to_string()
+        } else {
+            c.escape_unicode().to_string()
+        };
+        let want = format!("BODY-{n}{escaped}END");
+        assert!(
+            shown.contains(&want),
+            "the report body's line {n} is drawn with {c:?} escaped as {escaped}:\n{shown}"
+        );
     }
 }
 
@@ -1290,7 +1345,7 @@ fn interrupted_024_a_confirmation_too_big_for_its_popup_can_be_reached() {
             40,
             24,
         );
-        assert!(!sent.contains(&all) && !shown[3].contains("Dismiss all:"));
+        assert!(!sent.iter().any(is_dismissal) && !shown[3].contains("Dismiss all:"));
     }
 
     let long = |n: usize| format!("/home/me/代码/{}/{n}", "非常长的目录名称".repeat(6));
@@ -1380,7 +1435,7 @@ fn interrupted_025_a_confirmation_sends_only_what_it_showed() {
         &three(),
         &[ch('I'), InterruptedSeamStep::Burst(vec![ch('D'), ch('y')])],
     );
-    assert!(!sent.contains(&all), "{sent:?}");
+    assert!(!sent.iter().any(is_dismissal), "{sent:?}");
     let (_, sent) = run(
         &only(unit()),
         &[
@@ -1401,7 +1456,7 @@ fn interrupted_025_a_confirmation_sends_only_what_it_showed() {
         WIDTH,
         7,
     );
-    assert!(!sent.contains(&all), "{sent:?}");
+    assert!(!sent.iter().any(is_dismissal), "{sent:?}");
     // Kept and refused dry runs.
     for outcome in [
         ReclaimOutcome {
@@ -1509,4 +1564,95 @@ fn interrupted_026_a_clamped_report_page_is_applied_not_dropped_as_stale() {
     at(back, &format!("{LABEL_REPORT}: r-2"));
     at(back, "BODY OF r-1");
     assert!(!back.contains("n next reports"), "{back}");
+}
+
+/// What the rows of the popup in `frame` hold between its borders, with
+/// every space removed, since a wrap may split a word across rows.
+fn popup_text(frame: &str) -> String {
+    frame
+        .lines()
+        .filter_map(|line| line.split('│').nth(1))
+        .flat_map(|row| row.chars().filter(|c| !c.is_whitespace()))
+        .collect()
+}
+
+/// Scenario: In a 14×24 terminal, `D` asks "Dismiss all: 3 interrupted items
+/// from before the restart? [y/N]" wrapped over nine rows, every one of them
+/// drawn, and `y` dismisses exactly the three listed items. In a terminal too
+/// short to show the whole question at once, `y` does nothing until the
+/// person has scrolled through every row of it, even though no single frame
+/// showed it all; a scroll key and `y` typed together before a frame drew the
+/// rest send nothing.
+#[spec("journal/interrupted/027")]
+#[test]
+fn interrupted_027_a_question_seen_whole_can_be_confirmed_whatever_its_rows() {
+    let all = dismissal(&[UNIT_ID, TEAM_ID, AGENT_ID]);
+    let question: String = dismiss_all_question(3)
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let (shown, sent) = run_with(
+        &three(),
+        &KeybindingConfig::default(),
+        &[ch('I'), ch('D'), ch('y')],
+        14,
+        24,
+    );
+    let rows = shown[2]
+        .lines()
+        .filter_map(|line| line.split('│').nth(1))
+        .filter(|row| !row.trim().is_empty())
+        .count();
+    assert!(
+        rows > 8 && popup_text(&shown[2]).contains(&question),
+        "the premise: the whole question is drawn, over more than eight rows:\n{}",
+        shown[2]
+    );
+    assert_eq!(sent.last(), Some(&all), "{sent:?}\n{}", shown[3]);
+    assert_eq!(sent.iter().filter(|r| is_dismissal(r)).count(), 1);
+
+    // Too short for the whole question at once: nothing until every row was
+    // drawn, then `y` dismisses.
+    let height = 10;
+    let (shown, sent) = run_with(
+        &three(),
+        &KeybindingConfig::default(),
+        &[ch('I'), ch('D'), ch('y')],
+        14,
+        height,
+    );
+    assert!(
+        !popup_text(&shown[2]).contains(&question),
+        "the premise: one frame cannot show the whole question:\n{}",
+        shown[2]
+    );
+    assert!(!sent.iter().any(is_dismissal), "{sent:?}");
+    let mut steps = vec![ch('I'), ch('D')];
+    steps.extend((0..12).map(|_| ch('j')));
+    steps.push(ch('y'));
+    let (shown, sent) = run_with(&three(), &KeybindingConfig::default(), &steps, 14, height);
+    assert_eq!(
+        sent.iter().filter(|r| is_dismissal(r)).collect::<Vec<_>>(),
+        vec![&all],
+        "every row was drawn by some frame: {sent:?}\n{}",
+        shown.last().unwrap()
+    );
+    // Scrolled back to the top after seeing it all: still seen.
+    let mut steps = vec![ch('I'), ch('D')];
+    steps.extend((0..12).map(|_| ch('j')));
+    steps.extend((0..12).map(|_| ch('k')));
+    steps.push(ch('y'));
+    let (_, sent) = run_with(&three(), &KeybindingConfig::default(), &steps, 14, height);
+    assert_eq!(sent.last(), Some(&all), "{sent:?}");
+    // Scroll keys and `y` in one burst, before a frame drew the lower rows.
+    let mut burst: Vec<InterruptedSeamStep> = (0..12).map(|_| ch('j')).collect();
+    burst.push(ch('y'));
+    let (_, sent) = run_with(
+        &three(),
+        &KeybindingConfig::default(),
+        &[ch('I'), ch('D'), InterruptedSeamStep::Burst(burst)],
+        14,
+        height,
+    );
+    assert!(!sent.iter().any(is_dismissal), "{sent:?}");
 }

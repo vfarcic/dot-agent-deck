@@ -733,7 +733,7 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 ##### journal/interrupted/018 — The TUI escapes every control and bidi character a journal value, a report or a daemon message carries, wherever it shows one.
 - **Layer:** L1 in-process `TestBackend` (`tests/render_interrupted_work.rs`, seam `run_interrupted_work_seam`): every request the TUI sends is recorded instead of sent, the daemon's answers are handed in for a recorded request, keys go through the production `handle_key_event`, and each frame is drawn after the production per-frame fetch check.
 - **Agent:** none.
-- **Asserts:** with every C0 and C1 control, DEL and every bidi formatting character in an item's name, branch, worktree (a long Chinese path), launcher, last entry, roles, repository and report id, in a report's text, in a reclaim dry run's paths and an unknown verdict's sentence, and in a failed request's message, no cell of any frame of the list, details, shown report, reclaim confirmation or list message holds one, at 110×32, 80×24 and 40×24, and the overlay's borders stay whole; the failed request's message is shown escaped (`\u{0}\u{1}`).
+- **Asserts:** with every C0 and C1 control, DEL and every bidi formatting character in an item's name, branch, worktree (a long Chinese path), launcher, last entry, roles, repository and report id, in a report's text, in a reclaim dry run's paths and an unknown verdict's sentence, and in a failed request's message, no cell of any frame of the list, details, shown report, reclaim confirmation or list message holds one, at 110×32, 80×24 and 40×24, and the overlay's borders stay whole; the failed request's message is shown escaped (`\u{0}\u{1}`); and a shown report body short enough to be on screen draws each of `U+202E`, `U+2066`, ESC, BEL and `U+0085` beside a sentinel as its escaped spelling.
 - **Does not assert:** the CLI (`interrupted_cli` unit test `bidi_controls_from_the_journal_cannot_reorder_the_text`); invisible format characters other than the bidi ones.
 - **Platform coverage:** mac+linux.
 
@@ -782,7 +782,7 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 ##### journal/interrupted/025 — A confirmation's `y` sends only what the confirmation showed.
 - **Layer:** L1 in-process `TestBackend` (`tests/render_interrupted_work.rs`, seam `run_interrupted_work_seam`): every request the TUI sends is recorded instead of sent, the daemon's answers are handed in for a recorded request, keys go through the production `handle_key_event`, and each frame is drawn after the production per-frame fetch check.
 - **Agent:** none.
-- **Asserts:** `y` typed in the same burst as `D`, or as the dry run's answer, sends nothing; in a terminal too short to show the question, `y` sends nothing; kept (`KeptDirty`) and refused dry runs show no `y/n` and `y` sends no reclaim; `D`, a refresh listing a fourth item, then `y` sends a dismissal of exactly the three ids the question named, with `all` false.
+- **Asserts:** `y` typed in the same burst as `D`, or as the dry run's answer, sends nothing; in a terminal too short to show the question, `y` sends nothing; kept (`KeptDirty`) and refused dry runs show no `y/n` and `y` sends no reclaim; the two cases that send nothing are checked for no dismissal of any shape; `D`, a refresh listing a fourth item, then `y` sends a dismissal of exactly the three ids the question named, with `all` false.
 - **Does not assert:** the daemon's handling of a dismissal (`journal/interrupted/002`).
 - **Platform coverage:** mac+linux.
 
@@ -791,6 +791,13 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 - **Agent:** none.
 - **Asserts:** after `Reports 1 to 3 of 8.`, `n` asks for the page from 3; its answer, clamped to an empty page from 2, replaces the shown page (no `Reports 1 to 3 of 8.`, no `n next reports`, `p previous reports` offered); a late answer to the first page's request is not shown; `p` asks for the page from 0 and shows the two kept reports; the show requests sent are exactly from 0, 3 and 0.
 - **Does not assert:** the daemon's clamping (`interrupted_work` unit tests).
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/027 — A confirmation question seen whole can be confirmed, however many rows it wraps to.
+- **Layer:** L1 in-process `TestBackend` (`tests/render_interrupted_work.rs`, seam `run_interrupted_work_seam`): every request the TUI sends is recorded instead of sent, the daemon's answers are handed in for a recorded request, keys go through the production `handle_key_event`, and each frame is drawn after the production per-frame fetch check.
+- **Agent:** none.
+- **Asserts:** at 14×24 the dismiss-all question wraps to more than eight rows, all drawn, and `y` sends exactly one dismissal of the three listed ids with `all` false; at 14×10, where no frame shows the whole question, `y` sends nothing until `j` has scrolled every row into some drawn frame, then sends the dismissal, and still does after scrolling back up; `j` presses and `y` in one burst, before a frame drew the lower rows, send nothing.
+- **Does not assert:** a resize between frames (the rows are re-wrapped and must be seen again).
 - **Platform coverage:** mac+linux.
 
 #### journal/compat
