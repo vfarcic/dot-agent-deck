@@ -1539,8 +1539,19 @@ async fn one_of_outcome(
     rows: &[(&IntentStep, &CommandRow)],
 ) -> VoiceOutcome {
     let mut picks = Vec::with_capacity(rows.len());
-    for (at, &(step, row)) in rows.iter().enumerate() {
-        let outcome = settle_step(context, context.screen, step, row).await;
+    // All on the screen the user is on, so all at once.
+    let settle_at = |at: usize| settle_step(context, context.screen, rows[at].0, rows[at].1);
+    let settled = match rows.len() {
+        2 => {
+            let (one, two) = tokio::join!(settle_at(0), settle_at(1));
+            vec![one, two]
+        }
+        _ => {
+            let (one, two, three) = tokio::join!(settle_at(0), settle_at(1), settle_at(2));
+            vec![one, two, three]
+        }
+    };
+    for (at, (&(step, _), outcome)) in rows.iter().zip(settled).enumerate() {
         let VoiceOutcome::Dispatch {
             action,
             invoke,
@@ -1657,10 +1668,45 @@ async fn chain_outcome(
     let mut paused = false;
     let mut steps = Vec::with_capacity(rows.len());
     let last = rows.len() - 1;
+    // Every step is settled at once, each at the screen the steps before it
+    // would leave as the model picked them, so a chain waits for its slowest
+    // step's meaning check rather than for each in turn. The walk below then
+    // holds each step to the screen the steps before it ACTUALLY lead to,
+    // once a redirect is accounted for, and refuses one judged elsewhere.
+    let predicted: Vec<Screen> = rows
+        .iter()
+        .scan(context.screen, |at, (_, row)| {
+            let here = *at;
+            if let super::chain::Position::Before(Lands::View(to)) = super::chain::position(row) {
+                *at = to;
+            }
+            Some(here)
+        })
+        .collect();
+    let settle_at = |at: usize| settle_step(context, predicted[at], rows[at].0, rows[at].1);
+    let mut settled = match rows.len() {
+        2 => {
+            let (one, two) = tokio::join!(settle_at(0), settle_at(1));
+            vec![one, two]
+        }
+        _ => {
+            let (one, two, three) = tokio::join!(settle_at(0), settle_at(1), settle_at(2));
+            vec![one, two, three]
+        }
+    }
+    .into_iter();
     for (at, &(step, row)) in rows.iter().enumerate() {
         let number = at + 1;
         let refuse = |why: String| step_refused(&transcript, number, &step.said, &why);
-        let outcome = settle_step(context, screen, step, row).await;
+        let Some(outcome) = settled.next() else {
+            return refuse("it was not checked".to_string());
+        };
+        if predicted[at] != screen {
+            return refuse(
+                "the step before it leads to another screen than the one it was checked on"
+                    .to_string(),
+            );
+        }
         let judged_on = screen;
         // A step that matched several things pauses the chain on the numbered
         // choice (PRD #1261) — once per chain, so a chain cannot turn into a
