@@ -41,6 +41,8 @@ export interface CardOverlayView {
   count: number;
   step: CardOverlayStep | undefined;
   results: CardResults;
+  /** Whether the open card's daemon builds the tree, so its checked references are its own (issue #2418). */
+  tree: boolean;
 }
 
 /** What {@link useAgentCardsView} hands the overview. */
@@ -188,12 +190,12 @@ export function useAgentCardsView({ runtime, decks, openAgent, openReference, hi
       remember(next);
       return undefined;
     },
-    showAgentCard: (ref) => {
+    showAgentCard: (ref, section) => {
       if (!latest.current.shown) return CARDS_HIDDEN;
       const card = find(ref);
       if (!card) return CARD_GONE;
       setRowMenu(undefined);
-      setOpen({ key: placedCardKey(card), name: card.entry.name });
+      setOpen({ key: placedCardKey(card), name: card.entry.name, ...(section === "references" ? { step: { kind: "references" } } : {}) });
       return undefined;
     },
     stepAgentCard: (step: CardStep) => {
@@ -347,8 +349,9 @@ export function useAgentCardsView({ runtime, decks, openAgent, openReference, hi
       count: placed.length,
       step: open.step,
       results: results[open.key] ?? {},
+      tree: at >= 0 && treeFor(placed[at].deckId),
     };
-  }, [open, placed, results, shown]);
+  }, [open, placed, results, shown, treeFor]);
 
   const overlayOpen = overlay !== undefined;
   const voice = useMemo<Partial<AgentCardControls>>(() => (

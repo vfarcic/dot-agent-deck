@@ -602,8 +602,11 @@ export type VoiceActionContext = {
    */
   /** Show the dashboard as its table or as cards (remembered per window). */
   setOverviewMode: (mode: OverviewMode) => string | undefined;
-  /** Open one agent's card in the card overlay. */
-  showAgentCard: (target: AgentCardRef) => string | undefined;
+  /**
+   * Open one agent's card in the card overlay; with `section`, at that part of
+   * it (issue #2418 review: a card's `+N` opens it at its checked references).
+   */
+  showAgentCard: (target: AgentCardRef, section?: CardOverlaySection) => string | undefined;
   /** Move the open card overlay one card on or back, or to the next card that needs the user. */
   stepAgentCard: (step: CardStep) => string | undefined;
   /** Show only the cards that need the user, or every card. */
@@ -639,6 +642,9 @@ export type VoiceActionContext = {
 
 /** PRD #2374 — one card, named the way the dashboard's agents are: deck, agent id and the daemon process that listed it. */
 export type AgentCardRef = { deckId: string; agentId: string; incarnation?: string };
+
+/** A part of the card overlay a control can open it at. */
+export type CardOverlaySection = "references";
 
 /**
  * One registry entry.
@@ -1240,8 +1246,11 @@ export const VOICE_ACTIONS = {
     label: "Open one agent's card",
     voice: true,
     needs: ["showAgentCard"],
-    run: (context: Pick<VoiceActionContext, "showAgentCard"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: AgentCardRef) => {
-      const refused = context.showAgentCard(cardRefOf(target));
+    /* A spoken "show <agent>'s card" opens the overlay at its top, and its
+       checked references are a section of it; the card's `+N` control names
+       that section so it opens there. */
+    run: (context: Pick<VoiceActionContext, "showAgentCard"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: AgentCardRef & { cardSection?: CardOverlaySection }) => {
+      const refused = target.cardSection !== undefined ? context.showAgentCard(cardRefOf(target), target.cardSection) : context.showAgentCard(cardRefOf(target));
       if (refused !== undefined) context.reportRefused?.(refused);
     },
   },

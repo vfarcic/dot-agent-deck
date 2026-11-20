@@ -242,21 +242,13 @@ export function actionLabel(entry: AgentCardEntry, action: AgentCardAction): str
  * out, never cut.
  */
 export function promptPreview(prompt: string, max = 60): string {
-  return promptPreviewOf(prompt, max).text;
-}
-
-/**
- * {@link promptPreview}, and whether it is the whole prompt (every character
- * shown, as itself or as a marker) or was cut short.
- */
-export function promptPreviewOf(prompt: string, max = 60): { text: string; whole: boolean } {
   const pieces: string[] = [];
   for (const segment of exactTextSegments(prompt)) {
     if (segment.escaped) pieces.push(segment.shown);
     else for (const char of segment.raw) pieces.push(char === "\n" ? `${MARKER_OPEN}\u21b5${MARKER_CLOSE}` : char);
   }
   const length = (parts: string[]) => parts.reduce((total, part) => total + Array.from(part).length, 0);
-  if (length(pieces) <= max) return { text: pieces.join(""), whole: true };
+  if (length(pieces) <= max) return pieces.join("");
   const kept: string[] = [];
   let used = 0;
   for (const piece of pieces) {
@@ -265,7 +257,7 @@ export function promptPreviewOf(prompt: string, max = 60): { text: string; whole
     kept.push(piece);
     used += size;
   }
-  return { text: `${kept.join("")}…`, whole: false };
+  return `${kept.join("")}…`;
 }
 
 /**
@@ -284,12 +276,17 @@ export function sendableUnread(action: Pick<AgentCardAction, "prompt_source">): 
 
 /**
  * Whether the compact card's primary button must open the review step rather
- * than send (PRD #2374 review): its prompt is not the catalog's and the card's
- * short preview does not show all of it.
+ * than send (PRD #2374 review; issue #2418 audit A4): its prompt is not the
+ * catalog's. The compact card draws the prompt on one line that the layout
+ * cuts off at whatever width the card has, so a preview short enough to be
+ * whole in characters can still be cut on screen; nothing on that line proves
+ * the user saw the text. A catalog prompt is sent by the button, as before;
+ * every other prompt (the agent's, the deck's answer quoting the agent's
+ * question, one with no source) goes to the review step, which shows it whole.
  */
 export function primaryNeedsReview(action: Pick<AgentCardAction, "prompt" | "prompt_source">): boolean {
   if (action.prompt === null || action.prompt === undefined) return false;
-  return !sendableUnread(action) && !promptPreviewOf(action.prompt).whole;
+  return !sendableUnread(action);
 }
 
 /**
@@ -390,7 +387,7 @@ export function exactTextString(value: string): string {
  * confirms is what is sent: if the agent changes the action meanwhile, the
  * step says so and sends nothing until the new text was reviewed.
  */
-export type CardOverlayStep = { kind: "confirm"; actionId: string; token: string } | { kind: "reply"; /** Words to put in the reply box when the step opens (a spoken reply). */ text?: string };
+export type CardOverlayStep = { kind: "confirm"; actionId: string; token: string } | { kind: "reply"; /** Words to put in the reply box when the step opens (a spoken reply). */ text?: string } | { /** Issue #2418 review: opened at the card's checked references, from its `+N`. */ kind: "references" };
 
 /**
  * The answer to the last press of each action definition on one card, by the

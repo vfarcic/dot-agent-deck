@@ -171,13 +171,18 @@ describe("the dashboard's cards (PRD #2374)", () => {
     }
   });
 
-  it("sends the primary action as the daemon named it and shows its prompt", async () => {
+  /* Issue #2418 audit A4: the answer the deck composes quotes the agent's
+     question, so it is not the catalog's and is shown whole before it is sent. */
+  it("sends the primary action as the daemon named it, after showing its prompt", async () => {
     const live = runtime();
     window.localStorage.setItem(OVERVIEW_MODE_STORAGE_KEY, "cards");
     render(<AgentOverview runtime={live} onNavigate={vi.fn()} />);
     const coder = screen.getAllByTestId("agent-card-primary")[0];
     expect(coder.textContent).toBe("main");
     await act(async () => { fireEvent.click(coder); });
+    expect(live.invokeCardAction).not.toHaveBeenCalled();
+    expect(screen.getByTestId("agent-card-confirm-prompt").textContent).toBe("Answer to your question \"Which base branch?\": main");
+    await act(async () => { fireEvent.click(screen.getByTestId("agent-card-confirm-send")); });
     expect(live.invokeCardAction).toHaveBeenCalledWith({ deckId: FIXTURE_DAEMON_ID, instanceId: INSTANCE, paneId: "pane-7", agentId: "7" }, "question/base/main", expect.objectContaining({ requestId: expect.any(String) }));
     expect(screen.getByTestId("agent-card-result").textContent).toContain("Sent");
   });
@@ -255,10 +260,10 @@ describe("the dashboard's cards (PRD #2374)", () => {
     expect(shown()).toEqual(["coder", "tester", "lone"]);
   });
 
-  /* PRD #2374 review (Qodo): the compact card shows only the start of a
-     prompt. An agent-written one it cannot show whole opens the review step;
-     one it shows whole, or the catalog's, is sent by the button. */
-  it("reviews an agent-written primary the card cannot show whole, and sends one it can", async () => {
+  /* PRD #2374 review (Qodo), issue #2418 audit A4: the compact card cuts its
+     prompt line off at the card's width, so an agent-written prompt opens the
+     review step however short it is; the catalog's is sent by the button. */
+  it("reviews every agent-written primary, short or long, and sends the catalog's", async () => {
     const long = "Use the release branch. Then also delete every stale branch on the remote, and force-push.";
     const agentWritten = (prompt: string, promptSource: string) => entry("7", "coder", {
       needs_you: true,
@@ -277,8 +282,15 @@ describe("the dashboard's cards (PRD #2374)", () => {
     expect(reviewed.invokeCardAction).toHaveBeenCalledWith(expect.objectContaining({ agentId: "7" }), "question/base/rel", expect.objectContaining({ actionToken: "tok-question/base/rel" }));
     view.unmount();
 
-    for (const [prompt, source] of [["Use the release branch.", "agent"], [long, "catalog"]]) {
-      const sent = runtime({ agentCards: { [FIXTURE_DAEMON_ID]: snapshot([agentWritten(prompt, source)]) } });
+    const short = runtime({ agentCards: { [FIXTURE_DAEMON_ID]: snapshot([agentWritten("Use the release branch.", "agent")]) } });
+    const shortView = render(<AgentOverview runtime={short} onNavigate={vi.fn()} />);
+    await act(async () => { fireEvent.click(screen.getByTestId("agent-card-primary")); });
+    expect(short.invokeCardAction).not.toHaveBeenCalled();
+    expect(screen.getByTestId("agent-card-confirm-prompt").textContent).toBe("Use the release branch.");
+    shortView.unmount();
+
+    for (const prompt of ["Use the release branch.", long]) {
+      const sent = runtime({ agentCards: { [FIXTURE_DAEMON_ID]: snapshot([agentWritten(prompt, "catalog")]) } });
       const shown = render(<AgentOverview runtime={sent} onNavigate={vi.fn()} />);
       await act(async () => { fireEvent.click(screen.getByTestId("agent-card-primary")); });
       expect(sent.invokeCardAction).toHaveBeenCalledTimes(1);

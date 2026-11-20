@@ -2,7 +2,7 @@ import type { AgentCardCheckedRef, AgentCardEntry, AgentPullRequest } from "../t
 import type { PullRequestChecksDto, PullRequestInfoDto } from "./bridge";
 import { placedCardKey, type PlacedCard } from "./agentCards";
 import { DASHBOARD_AGENT_TYPES } from "./dashboardFilter";
-import { isPullRequestUrl, pullRequestFromDto } from "./pullRequest";
+import { isPullRequestUrl, pullRequestFromDto, pullRequestLabel } from "./pullRequest";
 import { cardStatusWord, statusWordLabel, type StatusWord } from "./statusWords";
 
 /*
@@ -347,4 +347,35 @@ export function referenceView(ref: AgentCardCheckedRef): ReferenceView {
     text: `${name} · ${UNAVAILABLE_TEXT[reason] ?? reason.replace(/_/g, " ")}`,
     title: `${kindWord} "${ref.claim}" was not checked: ${sentence}.${detail ? ` (${detail})` : ""}`,
   };
+}
+
+/**
+ * Issue #2418 review — one reported reference in words, for the card
+ * overlay's list of every reference: what the deck's check found (a pull
+ * request's state, review and CI, an issue's state, and the title GitHub
+ * gave), how fresh that check is, or why there is no check yet or at all; and
+ * what the agent wrote. Agent-written and GitHub-supplied text is returned as
+ * received, for the caller to bound and render as text.
+ */
+export interface ReferenceDetail {
+  /** `Pull request #24180: merged, approved; CI: …` or `Issue #3: closed`; absent when the deck has no check of it. */
+  checked?: string;
+  /** The title GitHub gave it, when checked. */
+  title?: string;
+  /** When it was checked, that the check is out of date, that it is still to be checked, or why it cannot be. */
+  note: string;
+  /** What the agent reported, exactly. */
+  claim: string;
+}
+
+export function referenceDetail(ref: AgentCardCheckedRef): ReferenceDetail {
+  const view = referenceView(ref);
+  const result = ref.result;
+  if ((view.status === "checked" || view.status === "stale") && result.status === "checked" && typeof result.checked_at === "string") {
+    const when = clockOf(result.checked_at);
+    const note = view.status === "stale" ? `Last checked ${when}; the latest check failed, so this may be out of date.` : `Checked by the deck ${when}.`;
+    const checked = "pullRequest" in view ? pullRequestLabel(view.pullRequest) : "number" in view ? `Issue #${view.number}: ${view.state}` : undefined;
+    return { ...(checked ? { checked } : {}), ...(typeof result.title === "string" ? { title: result.title } : {}), note, claim: ref.claim };
+  }
+  return { note: view.title, claim: ref.claim };
 }

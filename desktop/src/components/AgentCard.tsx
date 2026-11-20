@@ -1,6 +1,6 @@
 import { GitMergeIcon, IssueClosedIcon, IssueOpenedIcon, QuestionIcon, type Icon } from "@primer/octicons-react";
 import { BellRing, ChevronDown, ChevronUp } from "lucide-react";
-import type { ReactNode } from "react";
+import { useLayoutEffect, useRef, useState, type ReactNode } from "react";
 
 import { actionLabel, cardStatusClass, cardStatusLabel, deliverySentence, disabledReasonSentence, exactTextSegments, exactTextString, hasMarkers, MARKER_CLOSE, MARKER_OPEN, markerTitle, resultSentence, type CardResults, needsYouSentence, placedCardKey, primaryAction, primaryNeedsReview, promptPreview, type PlacedCard } from "../lib/agentCards";
 import { agentTypeText, cardTone, referenceUrl, referenceView, rollupSegments, rollupSentence, type CardKind } from "../lib/agentCardsTree";
@@ -55,30 +55,99 @@ const ISSUE_STATE_ICON: Record<string, Icon> = {
   merged: GitMergeIcon,
 };
 
-/** Issue #2418 — one reference the agent reported, drawn from the deck's check of it. */
-function CardReference({ card, reference, controls }: { card: PlacedCard; reference: AgentCardCheckedRef; controls: CardControls }) {
+/** The members a reference's link dispatches through. */
+export type ReferenceControls = Pick<VoiceActionContext, "openCardReference">;
+
+/**
+ * Issue #2418 — one reference the agent reported, drawn from the deck's check
+ * of it: a pull request or issue badge that opens its page, or a short text
+ * saying it is still to be checked or why it cannot be. The card draws it on
+ * its reference line, and the overlay in its list of every reference
+ * (`scope: "overlay"`, whose test ids carry `-overlay`); both open a page
+ * through the same action, so the same address checks apply.
+ */
+export function CardReference({ card, reference, controls, scope = "card", hidden = false }: { card: PlacedCard; reference: AgentCardCheckedRef; controls: ReferenceControls; scope?: "card" | "overlay"; hidden?: boolean }) {
   const view = referenceView(reference);
   const url = referenceUrl(reference);
+  const id = scope === "overlay" ? "agent-card-overlay" : "agent-card";
   const stale = view.status === "stale" ? <small className="agent-card-ref-stale">stale</small> : null;
   let body: ReactNode;
   if (view.status === "checked" || view.status === "stale") {
     if (view.kind === "pull_request" && "pullRequest" in view) {
-      body = <PullRequestBadge pullRequest={view.pullRequest} testId="agent-card-pr" onOpen={url ? () => VOICE_ACTIONS.openCardPullRequest.run(controls, { ...cardRef(card), referenceUrl: url }) : undefined} />;
+      body = <PullRequestBadge pullRequest={view.pullRequest} testId={`${id}-pr`} onOpen={url ? () => VOICE_ACTIONS.openCardPullRequest.run(controls, { ...cardRef(card), referenceUrl: url }) : undefined} />;
     } else if ("number" in view) {
       const StateIcon = ISSUE_STATE_ICON[view.state] ?? QuestionIcon;
       const label = `Issue #${view.number}: ${view.state}`;
       const content = <><StateIcon className="pr-badge-state" size={11} aria-hidden="true" /><span className="pr-badge-number">#{view.number}</span></>;
       body = url
-        ? <button type="button" className={`pr-badge issue-badge issue-state-${domIdentity(view.state)}`} data-testid="agent-card-issue" data-issue-state={view.state} aria-label={label} title={`${label} — open it in the app`} onMouseDown={(event) => event.stopPropagation()} onClick={() => VOICE_ACTIONS.openCardIssue.run(controls, { ...cardRef(card), referenceUrl: url })}>{content}</button>
-        : <span className={`pr-badge issue-badge issue-state-${domIdentity(view.state)}`} data-testid="agent-card-issue" data-issue-state={view.state} role="img" aria-label={label}>{content}</span>;
+        ? <button type="button" className={`pr-badge issue-badge issue-state-${domIdentity(view.state)}`} data-testid={`${id}-issue`} data-issue-state={view.state} aria-label={label} title={`${label} — open it in the app`} onMouseDown={(event) => event.stopPropagation()} onClick={() => VOICE_ACTIONS.openCardIssue.run(controls, { ...cardRef(card), referenceUrl: url })}>{content}</button>
+        : <span className={`pr-badge issue-badge issue-state-${domIdentity(view.state)}`} data-testid={`${id}-issue`} data-issue-state={view.state} role="img" aria-label={label}>{content}</span>;
     }
   } else if ("text" in view) {
     body = <small className="agent-card-ref-text">{displayText(view.text, DISPLAY_LIMITS.name)}</small>;
   }
   return (
-    <span className={`agent-card-ref is-${view.status}`} data-testid="agent-card-ref" data-field={reference.field} data-kind={reference.kind} data-ref-status={view.status} title={displayTitle(view.title)}>
+    <span className={`agent-card-ref is-${view.status}${hidden ? " is-overflow" : ""}`} data-testid={scope === "overlay" ? "agent-card-overlay-ref-badge" : "agent-card-ref"} data-field={reference.field} data-kind={reference.kind} data-ref-status={view.status} data-overflow={hidden ? "true" : undefined} aria-hidden={hidden ? true : undefined} title={displayTitle(view.title)}>
       {body}{stale}
     </span>
+  );
+}
+
+/** The width the `+N` control takes at the end of a card's reference line, with the gap before it, in CSS pixels (kept in step with `.agent-card-refs-more`). */
+const MORE_WIDTH = 34;
+const MORE_GAP = 6;
+
+/**
+ * Issue #2418 review (D-R1) — a card's reference line: as many reference
+ * badges as fit whole on its one line, in the daemon's order, and a `+N`
+ * control counting the rest, which opens the card's overlay at its list of
+ * every reference. The line has a fixed height, so references arriving never
+ * move a root; a badge that would be cut is hidden whole (not drawn, not
+ * focusable) rather than cut, and the count says it is there.
+ *
+ * Which badges fit is measured after layout, and again when the line's width
+ * changes. Every badge stays in the line's flow, the hidden ones invisible, so
+ * a measurement never moves the ones before it. Where nothing has a width (no
+ * layout), every badge counts as fitting.
+ */
+function CardReferences({ card, refs, name, controls }: { card: PlacedCard; refs: AgentCardCheckedRef[]; name: string; controls: CardControls }) {
+  const line = useRef<HTMLDivElement>(null);
+  const [fit, setFit] = useState(refs.length);
+  useLayoutEffect(() => {
+    const node = line.current;
+    if (!node) return undefined;
+    const measure = () => {
+      const width = node.clientWidth;
+      const ends = [...node.querySelectorAll<HTMLElement>(":scope > .agent-card-ref")].map((item) => item.offsetLeft + item.offsetWidth);
+      const within = (room: number) => { const first = ends.findIndex((end) => end > room + 0.5); return first < 0 ? ends.length : first; };
+      const whole = within(width);
+      setFit(whole === ends.length ? whole : within(width - MORE_WIDTH - MORE_GAP));
+    };
+    measure();
+    if (typeof ResizeObserver !== "function") return undefined;
+    const observer = new ResizeObserver(measure);
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [refs]);
+  const shown = Math.min(fit, refs.length);
+  const more = refs.length - shown;
+  const label = `Show all ${refs.length} pull requests and issues on ${name}'s card`;
+  return (
+    <div ref={line} className="agent-card-refs" aria-label="Pull requests and issues the agent reported, as the deck checked them" data-shown={shown}>
+      {refs.map((reference, index) => <CardReference key={`${reference.field}\u0000${index}`} card={card} reference={reference} controls={controls} hidden={index >= shown} />)}
+      {more > 0 && (
+        <button
+          type="button"
+          className="agent-card-refs-more"
+          data-testid="agent-card-refs-more"
+          style={{ width: MORE_WIDTH }}
+          aria-label={`${more} more: ${label}`}
+          title={`${more} more that do not fit here. ${label}`}
+          onMouseDown={(event) => event.stopPropagation()}
+          onClick={() => VOICE_ACTIONS.showAgentCard.run(controls, { ...cardRef(card), cardSection: "references" })}
+        >+{more}</button>
+      )}
+    </div>
   );
 }
 
@@ -134,10 +203,12 @@ export function AgentCard({ card, controls, results, place }: { card: PlacedCard
   const statusText = cardStatusLabel(entry.status);
   /* Every line has a fixed height and truncates rather than wraps, so a status
      word, the needs-you marker, a reference, a roll-up or a primary action
-     appearing never resizes a card or moves a root (issue #2418 review). What
-     a cut line hides is in its tooltip, and all of it is in the overlay. */
+     appearing never resizes a card or moves a root (issue #2418 review). A
+     cut line's text is in its tooltip. References that do not fit are not
+     cut: they are counted by a `+N` that opens the overlay's list of them
+     all. A prompt the primary's line cuts is shown whole at the review step
+     before it is sent, unless it is the catalog's (`primaryNeedsReview`). */
   const metaTitle = [place.kind, statusText, agentType].filter(Boolean).join(" · ");
-  const refsTitle = refs.map((reference) => referenceView(reference).title).join("\n");
   const primaryNotes = primary ? [
     primary.prompt ? exactTextString(primary.prompt) : undefined,
     !primary.enabled ? disabledReasonSentence(primary.disabled_reason) : undefined,
@@ -183,11 +254,7 @@ export function AgentCard({ card, controls, results, place }: { card: PlacedCard
         {agentType && <span className="agent-card-agent-type" data-testid="agent-card-agent-type">{displayText(agentType, DISPLAY_LIMITS.name)}</span>}
       </div>
       {place.tree && (refs.length > 0
-        ? (
-          <div className="agent-card-refs" aria-label="Pull requests and issues the agent reported, as the deck checked them" title={displayTitle(refsTitle)}>
-            {refs.map((reference, index) => <CardReference key={`${reference.field}\u0000${index}`} card={card} reference={reference} controls={controls} />)}
-          </div>
-        )
+        ? <CardReferences card={card} refs={refs} name={name} controls={controls} />
         : <div className="agent-card-refs is-empty" aria-hidden="true" />)}
       {place.tree && (rollup ? <CardRollup rollup={rollup} /> : <div className="agent-card-rollup-block is-empty" aria-hidden="true" />)}
       {!primary && <div className="agent-card-primary is-empty" aria-hidden="true" />}

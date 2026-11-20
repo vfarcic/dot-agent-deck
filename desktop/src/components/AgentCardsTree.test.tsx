@@ -590,4 +590,72 @@ describe("desktop/agent-cards — the Cards tree (issue #2418)", () => {
       expect(isIssueUrl(bad), bad).toBe(false);
     }
   });
+
+  /// Scenario: open the unit's card, whose agent reported six pull requests and issues. Its overlay lists every one in the daemon's order with the deck's check (state, review and CI, or the issue's state, and the title), how fresh that check is or why there is none, and what the agent wrote; a checked badge there opens its page as the card's does, and one the deck could not check has no link.
+  it("desktop/agent-cards/025: the overlay lists every checked reference with its state, its notes and the agent's claim, and opens them", () => {
+    cardsView();
+    fireEvent.click(toggle(QUEUE));
+    fireEvent.click(within(cardOf(UNIT.key)).getByTestId("agent-card-show"));
+    const section = within(screen.getByTestId("agent-card-overlay")).getByRole("region", { name: "Pull requests and issues" });
+    const items = within(section).getAllByTestId("agent-card-overlay-ref");
+    expect(items.map((item) => item.getAttribute("data-field"))).toEqual(["pull-request", "issue", "pull-request", "pr-two", "issue-two", "pr-three"]);
+    expect(items.map((item) => item.getAttribute("data-ref-status"))).toEqual(["checked", "checked", "pending", "unavailable", "unavailable", "stale"]);
+    const [merged, closed, pending, notFound, unrecognised, stale] = items;
+    const text = (item: HTMLElement, id: string) => within(item).getByTestId(id).textContent ?? "";
+
+    // The deck's check: a pull request's state, review and CI; an issue's state; the title; when it was checked.
+    expect(text(merged, "agent-card-overlay-ref-checked")).toBe("Pull request #24180: merged, approved; CI: 1 failing, 3 passing");
+    expect(merged.textContent).toContain("Cards, first slice");
+    expect(text(merged, "agent-card-overlay-ref-note")).toMatch(/^Checked by the deck /);
+    expect(text(merged, "agent-card-overlay-ref-claim")).toContain("#24180");
+    expect(within(merged).getByText("agent says")).toBeInTheDocument();
+    expect(text(closed, "agent-card-overlay-ref-checked")).toBe("Issue #3: closed");
+    expect(text(closed, "agent-card-overlay-ref-claim")).toContain("o/r#3");
+
+    // Still to be checked, not found (with the daemon's detail), not a GitHub reference: said, and no link.
+    expect(text(pending, "agent-card-overlay-ref-note")).toMatch(/not looked #7 up yet/);
+    expect(text(notFound, "agent-card-overlay-ref-note")).toContain("it may be private");
+    expect(text(notFound, "agent-card-overlay-ref-note")).toContain("Could not resolve to a PullRequest");
+    expect(notFound.textContent).toContain("not found or private");
+    expect(text(unrecognised, "agent-card-overlay-ref-note")).toContain("it is not a GitHub pull request or issue");
+    expect(text(unrecognised, "agent-card-overlay-ref-claim")).toContain("see the notes");
+    for (const item of [pending, notFound, unrecognised]) expect(within(item).queryByRole("button")).toBeNull();
+
+    // Stale: the last state the deck saw, marked stale, and when that was.
+    expect(within(stale).getByTestId("agent-card-overlay-pr").getAttribute("data-pr-state")).toBe("open");
+    expect(stale.textContent).toContain("stale");
+    expect(text(stale, "agent-card-overlay-ref-note")).toMatch(/^Last checked .*may be out of date\.$/);
+
+    // The links open through the same path as the card's badges, and leave the overlay open.
+    act(() => { fireEvent.click(within(closed).getByTestId("agent-card-overlay-issue")); });
+    expect(openReference).toHaveBeenLastCalledWith({ deckId: FIXTURE_DAEMON_ID, agentId: "5", kind: "issue", number: 3, url: ISSUE_CLOSED.url });
+    act(() => { fireEvent.click(within(stale).getByTestId("agent-card-overlay-pr")); });
+    expect(openReference).toHaveBeenLastCalledWith({ deckId: FIXTURE_DAEMON_ID, agentId: "5", kind: "pull_request", number: 9, url: PR_STALE.url });
+  });
+
+  /// Scenario: lay out the unit's card with a reference line that holds two of its six badges. The two show, the other four are hidden whole and a "+4" button says so; pressing it opens the unit's overlay with the keyboard on its list of every reference.
+  it("desktop/agent-cards/025: references that do not fit are hidden whole and counted by a +N that opens the overlay at them", () => {
+    // jsdom lays nothing out: give the line 200 px and each badge 60 px with a 6 px gap.
+    vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockImplementation(function width(this: HTMLElement) { return this.classList.contains("agent-card-refs") ? 200 : 0; });
+    vi.spyOn(HTMLElement.prototype, "offsetWidth", "get").mockImplementation(function width(this: HTMLElement) { return this.classList.contains("agent-card-ref") ? 60 : 0; });
+    vi.spyOn(HTMLElement.prototype, "offsetLeft", "get").mockImplementation(function left(this: HTMLElement) { return this.classList.contains("agent-card-ref") ? [...(this.parentElement?.children ?? [])].indexOf(this) * 66 : 0; });
+    cardsView();
+    fireEvent.click(toggle(QUEUE));
+    const unit = cardOf(UNIT.key);
+    const refs = within(unit).getAllByTestId("agent-card-ref");
+    expect(refs).toHaveLength(6);
+    // Three fit the bare line; with room kept for the count, two do.
+    expect(refs.map((node) => node.getAttribute("data-overflow"))).toEqual([null, null, "true", "true", "true", "true"]);
+    for (const hidden of refs.slice(2)) expect(hidden.getAttribute("aria-hidden")).toBe("true");
+    const more = within(unit).getByTestId("agent-card-refs-more");
+    expect(more.textContent).toBe("+4");
+    expect(more.getAttribute("aria-label")).toBe("4 more: Show all 6 pull requests and issues on unit's card");
+    act(() => { fireEvent.click(more); });
+    const overlay = screen.getByTestId("agent-card-overlay");
+    expect(overlay.getAttribute("data-card-key")).toBe(UNIT.key);
+    const section = within(overlay).getByTestId("agent-card-overlay-refs");
+    expect(document.activeElement).toBe(section);
+    expect(within(section).getAllByTestId("agent-card-overlay-ref")).toHaveLength(6);
+  });
 });
+

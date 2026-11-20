@@ -2157,7 +2157,11 @@ button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-
 .agent-card-meta { flex: none; height: 18px; line-height: 18px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--muted); font-size: var(--text-xs); }
 .agent-card-meta > * + * { margin-left: 8px; }
 .agent-card-kind { text-transform: uppercase; letter-spacing: .04em; }
-.agent-card-refs { flex: none; height: 22px; line-height: 22px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.agent-card-refs { position: relative; flex: none; height: 22px; line-height: 22px; overflow: hidden; white-space: nowrap; }
+/* Issue #2418 review (D-R1): a badge that would be cut is hidden whole, kept in the flow so the ones before it never move, and counted by `+N`. */
+.agent-card-ref.is-overflow { visibility: hidden; }
+.agent-card-refs-more { position: absolute; top: 2px; right: 0; height: 18px; padding: 0 3px; border: 1px solid var(--line-strong); border-radius: 9px; color: var(--ink); background: var(--paper-sunken); font-size: var(--text-xs); font-weight: 600; line-height: 16px; text-align: center; font-variant-numeric: tabular-nums; cursor: pointer; }
+.agent-card-refs-more:hover, .agent-card-refs-more:focus-visible { color: var(--teal); border-color: var(--teal-focus); background: var(--teal-soft); }
 .agent-card-ref { display: inline-flex; align-items: center; gap: 4px; min-width: 0; vertical-align: middle; }
 .agent-card-ref + .agent-card-ref { margin-left: 6px; }
 .agent-card-ref-text { color: var(--muted); font-size: var(--text-xs); white-space: nowrap; }
@@ -2202,6 +2206,14 @@ button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-
 .agent-card-overlay-nav { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
 .agent-card-overlay-position { margin-right: 4px; color: var(--muted); font-size: var(--text-sm); }
 .agent-card-overlay-body { display: grid; gap: 12px; }
+.agent-card-overlay-refs:focus { outline: none; }
+.agent-card-overlay-refs:focus-visible { outline: 2px solid var(--teal-focus); outline-offset: 3px; }
+.agent-card-overlay-ref-list { margin: 0; padding: 0; list-style: none; display: grid; gap: 8px; }
+.agent-card-overlay-ref { display: grid; gap: 3px; padding: 7px 8px; border: 1px solid var(--line); border-radius: 5px; }
+.agent-card-overlay-ref-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.agent-card-overlay-ref .agent-card-ref-text { white-space: normal; overflow-wrap: anywhere; }
+.agent-card-overlay-ref-note.is-stale { color: var(--amber-ink); }
+.agent-card-overlay-ref-checked { font-size: var(--text-sm); font-weight: 600; overflow-wrap: anywhere; }
 .agent-card-section { display: grid; gap: 6px; }
 .agent-card-section h3 { margin: 0; font-size: var(--text-base); }
 .agent-card-section p { margin: 0; font-size: var(--text-sm); overflow-wrap: anywhere; }
