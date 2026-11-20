@@ -693,14 +693,15 @@ fn a_removal_that_finishes_after_the_reply_bound_is_still_recorded() {
         assert_eq!(outcome.verdict, ReclaimVerdict::TimedOut, "{outcome:?}");
         assert_eq!(outcome.message, crate::interrupted_work::RECLAIM_TIMED_OUT);
 
+        // The task writes the root's close and the child's one after the
+        // other, so wait for the whole set, not for the first line
+        // (reviewer 4).
+        let expected = vec![(root, CloseHow::Reclaimed), (child, CloseHow::Reclaimed)];
         let until = std::time::Instant::now() + Duration::from_secs(20);
-        while closes(&registry).is_empty() && std::time::Instant::now() < until {
+        while closes(&registry) != expected && std::time::Instant::now() < until {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert_eq!(
-            closes(&registry),
-            vec![(root, CloseHow::Reclaimed), (child, CloseHow::Reclaimed)]
-        );
+        assert_eq!(closes(&registry), expected);
         assert!(!wt.exists());
         assert!(listed(&registry).await.items.is_empty());
     });
