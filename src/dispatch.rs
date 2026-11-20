@@ -1253,9 +1253,24 @@ pub async fn handle_dispatch_at(
                 }
             };
             let records = ctx.registry.agent_records_for_worktree_cleanup();
+            // Read after the hold: a removal holding another spelling of the
+            // target (its worktree entry already taken, so the spelling choice
+            // above could not find it) was taken before the hold, and is
+            // caught below by resolving it (Qodo on PR #2424).
+            let removing = ctx.registry.removal_holds();
             let caller = ctx.caller.as_ref().map(|c| c.agent_id.clone());
             let target = dir.clone();
             let refusal = tokio::task::spawn_blocking(move || {
+                if let Some(held) = removing.iter().find(|held| {
+                    std::fs::canonicalize(held).is_ok_and(|held| target.starts_with(held))
+                }) {
+                    return Some(format!(
+                        "{} is being removed (the deck is cleaning up {}), so nothing was \
+                         started there",
+                        target.display(),
+                        held.display()
+                    ));
+                }
                 // A removal that finished before the hold was taken has
                 // already deleted the directory; none can start now.
                 if !target.is_dir() {
@@ -5047,6 +5062,59 @@ mod tests {
         );
         drop(removal);
         assert!(registry.hold_dir_for_dispatch(&dir).is_ok());
+    }
+
+    /// Scenario: a cleanup already holds a worktree for removal under a
+    /// symlinked spelling, its registry entry taken, when a `--dir` dispatch
+    /// arrives with the resolved path. The lexical hold check cannot see it,
+    /// so the dispatch is refused by resolving the removal's spelling.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_dir_dispatch_is_refused_while_another_spelling_is_being_removed() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo_in(tmp.path(), &repo);
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(real.join("wt")).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let removal = registry
+            .hold_dir_for_removal(&link.join("wt"))
+            .expect("an unused worktree is held for removal");
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
+        let ctx = DispatchContext {
+            caller_work: None,
+            working_dir: repo.clone(),
+            registry: registry.clone(),
+            event_tx,
+            worktrees: new_worktree_registry(),
+            default_command: None,
+            state: None,
+            caller: None,
+        };
+        let resolved = canonical(&real.join("wt")).to_string_lossy().into_owned();
+        let result = handle_dispatch_at(
+            &ctx,
+            "into-removal",
+            "task",
+            Some(&crate::event::DispatchShape::SingleAgent),
+            LaunchChoice::default(),
+            Some(&resolved),
+        )
+        .await;
+        assert!(!result.success, "{}", result.message);
+        assert!(
+            result.message.contains("is being removed"),
+            "{}",
+            result.message
+        );
+        assert!(registry.agent_records().is_empty(), "nothing was started");
+        drop(removal);
+        assert!(
+            !registry.dir_in_use(Path::new(&resolved)),
+            "the dispatch's hold was released"
+        );
     }
 
     /// Scenario: a worktree the deck records is spelled through a symlinked

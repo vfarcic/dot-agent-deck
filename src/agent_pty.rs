@@ -20381,6 +20381,15 @@ impl AgentPtyRegistry {
         })
     }
 
+    /// PRD #468: the directories removals hold right now, as each removal
+    /// spelled it. [`Self::hold_dir_for_dispatch`] compares them by path; a
+    /// `--dir` dispatch also resolves these off the runtime, to catch a
+    /// removal holding another spelling of its target (a symlinked parent)
+    /// whose worktree entry the removal has already taken.
+    pub fn removal_holds(&self) -> Vec<PathBuf> {
+        self.inner.lock().removal_holds.clone()
+    }
+
     /// PRD #1589 D4: whether a spawn into `instance` is refused — a close is
     /// taking it down, or one already finished it.
     fn instance_refuses_spawns_locked(inner: &RegistryInner, instance: &str) -> bool {
