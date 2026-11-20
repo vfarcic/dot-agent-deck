@@ -869,6 +869,16 @@ fn dispatch_prompt(
     // carries, for the same reason: everything after `--task` is rewritten by the
     // unit's own shell before the CLI sees it, and a summary that loses half its
     // words still reports success. `--task-file` is read from disk verbatim.
+    // `dispatch/return/006`: the completion step is stated as the task's own
+    // last step, right after it, so an agent that answers the task in its
+    // conversation has been told that this answer is not where it ends.
+    prompt.push_str(&format!(
+        "This task ends with your report, and is not done until you have sent it: as your \
+         last step, write your report to `{report_path}` and run \
+         `{bin} work-done --done --task-file '{report_path}'`, as described below. An answer \
+         you only write in this conversation reaches no one: the agent that dispatched you \
+         does not read this pane.\n\n"
+    ));
     prompt.push_str(&format!(
         "When this work is finished — or if you are blocked and cannot finish it — report \
          back to the agent that asked for it by running:\n\n\
@@ -910,9 +920,15 @@ fn dispatch_prompt(
     prompt
 }
 
-/// What a dispatched unit is prompted with: its task, the agent-card
-/// catalog ([`with_card_catalog`]) and, for a single agent, what
-/// [`dispatch_prompt`] adds.
+/// What a dispatched unit is prompted with: its task and, for a single
+/// agent, what [`dispatch_prompt`] adds, then the agent-card catalog
+/// ([`with_card_catalog`]). An orchestration's task is unchanged by
+/// [`dispatch_prompt`], so it is the task and then the catalog, as before.
+///
+/// The catalog comes after the completion instructions rather than between
+/// them and the task (`dispatch/return/006`): a unit given a short task read
+/// it, answered in its own conversation and ended its turn without reporting,
+/// with the instructions to report further down, past the catalog.
 fn unit_prompt(
     task: &str,
     catalog: &crate::card_catalog::ResolvedCatalog,
@@ -920,11 +936,9 @@ fn unit_prompt(
     report_path: &str,
     main_worktree: Option<&std::path::Path>,
 ) -> String {
-    dispatch_prompt(
-        &with_card_catalog(task, catalog),
-        target,
-        report_path,
-        main_worktree,
+    with_card_catalog(
+        &dispatch_prompt(task, target, report_path, main_worktree),
+        catalog,
     )
 }
 
