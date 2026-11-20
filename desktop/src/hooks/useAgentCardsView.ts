@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { actionBySpokenLabel, cardTarget, disabledReasonSentence, placeCards, placedCardKey, pruneCardResults, readOverviewMode, sendableUnread, stepCard, writeOverviewMode, type CardOverlayStep, type CardResults, type CardStep, type OverviewMode, type PlacedCard } from "../lib/agentCards";
-import { boundOpenCards, cardTree, pathTo, pruneOpenCards, readOpenCards, referenceUrl, writeOpenCards } from "../lib/agentCardsTree";
+import { boundOpenCards, cardTree, openableReference, pathTo, pruneOpenCards, readOpenCards, writeOpenCards } from "../lib/agentCardsTree";
 import { newCardRequestId } from "../lib/bridge";
 import type { CardReferenceTarget } from "../lib/prBrowser";
 import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
@@ -61,9 +61,22 @@ export interface AgentCardsView {
   /** Issue #2418 — whether a deck's daemon builds the card tree; an older one's cards are all roots. */
   treeFor: (deckId: string) => boolean;
   overlay: CardOverlayView | undefined;
+  /**
+   * Issue #2418 review (F2) — why the last thing pressed on a card or in its
+   * overlay did not happen, until it is dismissed, the overlay closes, or a
+   * reference opens: a press that did nothing says why.
+   */
+  notice: string | undefined;
+  dismissNotice: () => void;
   /** The table row whose ⋯ menu is open. */
   rowMenu: string | undefined;
   controls: AgentCardControls;
+  /**
+   * {@link controls} for the cards' and the overlay's own controls, which
+   * report a refusal in {@link notice}. Kept apart from `controls`, which is
+   * also published to voice, where the voice panel reports refusals itself.
+   */
+  clickControls: AgentCardControls & Pick<VoiceActionContext, "reportRefused">;
   /** The members published to voice: `closeAgentCard` only while a card is open. */
   voice: Partial<AgentCardControls>;
   /** The card of one dashboard agent, when it has one. */
@@ -100,6 +113,8 @@ export function useAgentCardsView({ runtime, decks, openAgent, openReference, hi
   const [open, setOpen] = useState<{ key: string; name: string; step?: CardOverlayStep }>();
   const [results, setResults] = useState<Readonly<Record<string, CardResults>>>({});
   const [rowMenu, setRowMenu] = useState<string>();
+  // voice-registry-exempt: why a press on a card did nothing, written by the controls that refused it; it opens nothing
+  const [notice, setNotice] = useState<string>();
   const placed = useMemo(() => (shown ? placeCards(decks, runtime.agentCards) : []), [decks, runtime.agentCards, shown]);
   const decksWithCards = useMemo(() => new Set(shown ? Object.keys(runtime.agentCards ?? {}) : []), [runtime.agentCards, shown]);
   const treeFor = useCallback((deckId: string) => runtime.agentCards?.[deckId]?.tree === true, [runtime.agentCards]);
@@ -218,6 +233,7 @@ export function useAgentCardsView({ runtime, decks, openAgent, openReference, hi
     closeAgentCard: () => {
       if (!latest.current.open) return NO_CARD_OPEN;
       setOpen(undefined);
+      setNotice(undefined);
       return undefined;
     },
     runCardAction: (ref, wanted) => {
@@ -327,15 +343,25 @@ export function useAgentCardsView({ runtime, decks, openAgent, openReference, hi
       const what = kind === "pull_request" ? "pull request" : "issue";
       const refs = (latest.current.treeFor(card.deckId) ? card.entry.checked_refs ?? [] : []).filter((candidate) => candidate.kind === kind && (url === undefined || candidate.url === url));
       if (refs.length === 0) return `${name}'s card names no ${what}.`;
-      const checked = refs.find((candidate) => candidate.result.status === "checked" && candidate.number !== undefined && referenceUrl(candidate) !== undefined);
-      if (!checked || checked.number === undefined) {
+      const checked = refs.find(openableReference);
+      if (!checked) {
         const first = refs[0];
         const why = first.result.status === "pending" ? "the deck has not checked it yet" : "the deck could not check it";
         return `${name}'s ${what} ${displayText(first.claim, DISPLAY_LIMITS.name)} does not open: ${why}.`;
       }
       const opener = latest.current.openReference;
       if (!opener) return NO_REFERENCE_OPENER;
-      return opener({ deckId: card.deckId, agentId: card.entry.agent_id, kind, number: checked.number, url: referenceUrl(checked) as string });
+      /* Named by the card, so the card of an agent that stopped opens its
+         references too: the shell checks it against the card its deck lists. */
+      const refused = opener({ deckId: card.deckId, instanceId: card.entry.instance_id, cardKey: card.entry.key, kind, number: checked.number, url: checked.url });
+      if (refused !== undefined) return refused;
+      /* The page opens over the dashboard, and the card overlay is drawn
+         over that and would fence it: the overlay closes so the page is in
+         front, as a card's Open closes it for the pane (issue #2418 review,
+         F1). */
+      setOpen(undefined);
+      setNotice(undefined);
+      return undefined;
     },
   }), [changeOpenCards, find, openAgent, remember, send]);
 
@@ -358,6 +384,9 @@ export function useAgentCardsView({ runtime, decks, openAgent, openReference, hi
     overlayOpen ? controls : { ...controls, closeAgentCard: undefined }
   ), [controls, overlayOpen]);
 
+  const clickControls = useMemo(() => ({ ...controls, reportRefused: setNotice }), [controls]);
+  const dismissNotice = useCallback(() => setNotice(undefined), []);
+
   const resultsFor = useCallback((card: PlacedCard) => results[placedCardKey(card)] ?? {}, [results]);
-  return { shown, mode, needsYouOnly, placed, decksWithCards, openCards, treeFor, overlay, rowMenu, controls, voice, cardFor, resultsFor };
+  return { shown, mode, needsYouOnly, placed, decksWithCards, openCards, treeFor, overlay, notice, dismissNotice, rowMenu, controls, clickControls, voice, cardFor, resultsFor };
 }

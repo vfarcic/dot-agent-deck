@@ -2233,6 +2233,7 @@ button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-
 .agent-card-confirm-buttons, .agent-card-reply-buttons { display: flex; flex-wrap: wrap; gap: 7px; }
 .agent-card-reply textarea { width: 100%; min-height: 70px; padding: 7px; border: 1px solid var(--line-strong); border-radius: 5px; color: var(--ink); background: var(--paper); font: inherit; font-size: var(--text-base); resize: vertical; }
 .agent-card-gone { margin: 0; padding: 14px; border: 1px dashed var(--line); border-radius: 6px; color: var(--muted); text-align: center; }
+.agent-card-overlay-notice { margin: 0; padding: 8px 10px; border: 1px solid var(--amber); border-radius: 6px; color: var(--ink); background: var(--amber-soft); font-size: var(--text-xs); overflow-wrap: anywhere; }
 .overview-needs-you { flex: 0 0 auto; width: 20px; height: 20px; display: grid; place-items: center; border-radius: 4px; color: var(--amber); background: var(--amber-soft); }
 .overview-card-menu { position: relative; flex: 0 0 auto; }
 .overview-card-menu-button { width: 20px; height: 20px; display: grid; place-items: center; border: 1px solid transparent; border-radius: 4px; color: var(--faint); background: transparent; cursor: pointer; }

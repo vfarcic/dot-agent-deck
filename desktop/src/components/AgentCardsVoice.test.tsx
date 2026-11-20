@@ -442,6 +442,31 @@ describe("desktop/agent-cards/008 — the cards by voice (PRD #2374)", () => {
     expect(issueFrame.getAttribute("aria-label")).toContain("Issue #3");
   });
 
+  /// Scenario: the child's agent has stopped, so the deck keeps its card but no longer lists its agent. Say "open the child's pull request", then in a second session "open the child's issue": each opens in the app's GitHub browser, named for the child, and stays open.
+  it("desktop/agent-cards/018: a spoken open of a stopped card's pull request or issue opens and stays open", async () => {
+    const agents = createFixtureSnapshot("connected").agents;
+    const STOPPED = "stopped-agent-77";
+    expect(agents.some((agent) => agent.id === STOPPED), "the stopped agent is not in the fleet").toBe(false);
+    const stoppedEntries = (fleet: { id: string }[]): AgentCardEntry[] => {
+      const [parent, child] = treeEntries(fleet);
+      return [parent, { ...child, agent_id: STOPPED, key: `pane-${fleet[1].id}/${STOPPED}`, status: "stopped", needs_you: true, needs_you_reasons: ["stopped"] }];
+    };
+    for (const [invoke, action, title] of [["openCardPullRequest", "open_card_pull_request", "Pull request #24180"], ["openCardIssue", "open_card_issue", "Issue #3"]] as const) {
+      cleanup();
+      window.localStorage.setItem(MODE_KEY, "cards");
+      const spoken = renderSpoken({
+        kind: "dispatch", transcript: `${action} of the child`, action, invoke,
+        params: [{ name: "agent", kind: "agent_ref", spoken: "the child", value: STOPPED, label: "child-card" }],
+        sentence: "Opening.",
+      } as VoiceResultDto["outcome"], { entries: stoppedEntries });
+      await speak(spoken.resolveVoice);
+      const frame = await screen.findByTestId("pr-browser");
+      expect(frame.getAttribute("aria-label")).toBe(`${title} for child-card`);
+      await act(async () => { await new Promise((done) => setTimeout(done, 50)); });
+      expect(screen.getByTestId("pr-browser"), "the page stays open while the deck lists the stopped card").toBeInTheDocument();
+    }
+  });
+
   /// Scenario: with every tree closed, say "open the child's tree" for a card one level under a root. The way to it opens too, so the child and the grandchild under it are both on screen.
   it("desktop/agent-cards/018: a spoken open of a nested card's tree opens the way to it", async () => {
     const agents = createFixtureSnapshot("connected").agents;

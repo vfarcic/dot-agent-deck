@@ -10,7 +10,7 @@ import type { AgentCardCheckedRef, AgentCardRollup } from "../types";
 import { PullRequestBadge } from "./PullRequestBadge";
 
 /** The members a card's own controls dispatch through. */
-export type CardControls = Pick<VoiceActionContext, "showAgentCard" | "runCardAction" | "setCardTree" | "openCardReference">;
+export type CardControls = Pick<VoiceActionContext, "showAgentCard" | "runCardAction" | "setCardTree" | "openCardReference"> & Partial<Pick<VoiceActionContext, "reportRefused">>;
 
 /** The card a control names: its deck, agent and the daemon process that listed it. */
 export function cardRef(card: PlacedCard): { deckId: string; agentId: string; incarnation: string } {
@@ -56,7 +56,7 @@ const ISSUE_STATE_ICON: Record<string, Icon> = {
 };
 
 /** The members a reference's link dispatches through. */
-export type ReferenceControls = Pick<VoiceActionContext, "openCardReference">;
+export type ReferenceControls = Pick<VoiceActionContext, "openCardReference"> & Partial<Pick<VoiceActionContext, "reportRefused">>;
 
 /**
  * Issue #2418 — one reference the agent reported, drawn from the deck's check

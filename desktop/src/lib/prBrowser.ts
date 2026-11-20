@@ -132,8 +132,14 @@ export const PrBrowserHostContext = createContext<PrBrowserHost>(defaultPrBrowse
  */
 export const OpenPullRequest = createContext<((target: { deckId: string; agentId: string }) => void) | undefined>(undefined);
 
-/** Issue #2418 — a pull request or issue an agent reported on its card, as the deck checked it: what the in-app browser opens. */
-export type CardReferenceTarget = { deckId: string; agentId: string; kind: "pull_request" | "issue"; number: number; url: string };
+/**
+ * Issue #2418 — a pull request or issue an agent reported on its card, as the
+ * deck checked it: what the in-app browser opens. Named by the CARD — its deck,
+ * the daemon process that listed it and its key — not by the agent: the deck
+ * keeps the card of an agent that stopped and was not closed, whose agent is
+ * no longer among the deck's agents, and its references still open.
+ */
+export type CardReferenceTarget = { deckId: string; instanceId: string; cardKey: string; kind: "pull_request" | "issue"; number: number; url: string };
 
 /**
  * Issue #2418 — open the in-app browser on a pull request or issue a card's

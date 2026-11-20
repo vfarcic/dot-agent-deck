@@ -10,7 +10,7 @@ import type { AgentCardAction, AgentCardCheckedRef } from "../types";
 import { CardReference, cardRef, ExactText, ExactTextNote, SourceBadge, type ReferenceControls } from "./AgentCard";
 
 /** The members the overlay's controls dispatch through. */
-export type CardOverlayControls = Pick<VoiceActionContext, "showAgentCard" | "stepAgentCard" | "closeAgentCard" | "runCardAction" | "replyToAgentCard" | "confirmCardAction" | "openCardReference">;
+export type CardOverlayControls = Pick<VoiceActionContext, "showAgentCard" | "stepAgentCard" | "closeAgentCard" | "runCardAction" | "replyToAgentCard" | "confirmCardAction" | "openCardReference"> & Partial<Pick<VoiceActionContext, "reportRefused">>;
 
 /**
  * PRD #2374 — the one card overlay, opened from a card or a table row's Show
@@ -25,7 +25,7 @@ export type CardOverlayControls = Pick<VoiceActionContext, "showAgentCard" | "st
  * `card` is `undefined` once the agent it showed is gone: the overlay says so
  * and keeps its navigation, so the next card is one key away.
  */
-export function AgentCardOverlay({ card, lastName, position, count, step, results, tree, controls }: {
+export function AgentCardOverlay({ card, lastName, position, count, step, results, tree, notice, controls }: {
   card: PlacedCard | undefined;
   /** The name of the card that was open, for the closed notice. */
   lastName: string;
@@ -36,6 +36,8 @@ export function AgentCardOverlay({ card, lastName, position, count, step, result
   results: CardResults;
   /** Whether the card's daemon builds the tree, so its checked references are its own. */
   tree: boolean;
+  /** Why the last thing pressed did not happen (issue #2418 review, F2): said here, since the overlay covers the dashboard's banner. */
+  notice?: string;
   controls: CardOverlayControls;
 }) {
   const ref = useInertBackground<HTMLElement>(true, OVERLAY_LAYER.dialog, () => { controls.closeAgentCard(); });
@@ -108,6 +110,8 @@ export function AgentCardOverlay({ card, lastName, position, count, step, result
             <button type="button" className="icon-button" aria-label="Close card" title="Close card (Escape)" data-testid="agent-card-close" onClick={() => VOICE_ACTIONS.closeAgentCard.run(controls)}><X size={15} /></button>
           </nav>
         </header>
+
+        {notice && <p className="agent-card-overlay-notice" role="status" data-testid="agent-card-overlay-notice">{displayText(notice, DISPLAY_LIMITS.message)}</p>}
 
         {!entry && <p className="agent-card-gone" role="status" data-testid="agent-card-gone">This agent was closed.</p>}
 

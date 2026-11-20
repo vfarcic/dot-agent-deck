@@ -57,7 +57,7 @@ async function keyOf(page: Page, name: string): Promise<string> {
   return key;
 }
 
-/** Change the scene's cards as a daemon's next list would: `change` edits the entries by name. */
+/** Change the scene's cards as a daemon's next list would: `change` edits the entries by name, or the whole list as `next`. */
 async function pushCards(page: Page, change: string): Promise<void> {
   await page.evaluate((body) => {
     type Entry = Record<string, unknown> & { name: string };
@@ -68,7 +68,7 @@ async function pushCards(page: Page, change: string): Promise<void> {
       if (!found) throw new Error(`no entry named ${name}`);
       return found;
     };
-    new Function("byName", body)(byName);
+    new Function("byName", "next", body)(byName, next);
     next.revision += 1;
     hook.push(next);
   }, change);
@@ -376,19 +376,21 @@ for (const width of [375, 1440] as const) {
     test.use({ viewport: { width, height: 900 } });
 
     /**
-     * Scenario: the bench agent reports two pull requests, a stale issue and
-     * one GitHub does not find. The card shows the badges that fit its line
-     * whole and a "+N" for the rest; pressing it opens bench's overlay at a
-     * list of all four with their states, and an issue past the card's line
-     * opens in the app from there.
+     * Scenario: the bench agent has stopped, and its card reports two pull
+     * requests, a stale issue and one GitHub does not find. The card shows the
+     * badges that fit its line whole and a "+N" for the rest; pressing it
+     * opens bench's overlay at a list of all four with their states, and an
+     * issue past the card's line opens from there in the app's browser, in
+     * front and usable, until the daemon stops listing bench's card.
      */
     test("a +N control opens the overlay at every reference, and one past the line opens from there", async ({ page }) => {
       await openCardsTree(page);
       const before = await rootBoxes(page);
       await pushCards(page, `
         const bench = byName("bench");
-        // The fleet's agent 2 runs bench, so the app can open its references.
-        bench.agent_id = "2";
+        // Bench's agent has stopped: the deck keeps its card, and its agent is
+        // not in the fleet's list of agents (its id is the scene's own).
+        bench.status = "stopped";
         const pr = (n, field) => ({ field, kind: "pull_request", claim: "#" + n, repo: "vfarcic/dot-agent-deck", number: n, url: "https://github.com/vfarcic/dot-agent-deck/pull/" + n,
           result: { status: "checked", state: "merged", ci: { state: "failing", passing: 3, failing: 1, pending: 0, skipped: 0 }, review: "approved", title: "Pull request " + n, checked_at: "2026-11-20T10:00:00Z", stale: false } });
         bench.checked_refs = [pr(24180, "pull-request"), pr(24181, "pr-two"),
@@ -442,11 +444,55 @@ for (const width of [375, 1440] as const) {
       await expect(items.nth(3).getByTestId("agent-card-overlay-ref-claim")).toContainText("o/r#7");
       await expectNoSidewaysScroll(page);
 
-      // The stale issue, past the card's line, opens in the app from the overlay with a real click.
+      // The stale issue, past the card's line, opens in the app from the overlay with a real click,
+      // although bench's agent has stopped and is not in the fleet.
       await items.nth(2).getByTestId("agent-card-overlay-issue").click();
       const browser = page.getByTestId("pr-browser");
       await expect(browser).toBeVisible();
       await expect(browser).toContainText("#3");
+      await expect(browser).toHaveAttribute("aria-label", "Issue #3 for bench");
+      // It is the foreground: the card's overlay closed, nothing fences or covers the browser,
+      // a hit-test at its centre lands in it, and the keyboard is in it.
+      await expect(overlay).toHaveCount(0);
+      await expect(browser).not.toHaveAttribute("data-covered", /.*/);
+      const front = await browser.evaluate((node) => {
+        const box = node.getBoundingClientRect();
+        const hit = document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2);
+        return {
+          inert: node.closest("[inert]") !== null,
+          toolbarInert: [...node.querySelectorAll("button")].some((button) => button.closest("[inert]") !== null),
+          hitInside: hit !== null && node.contains(hit),
+          focusInside: node.contains(document.activeElement),
+        };
+      });
+      expect(front.inert, "the browser is inert").toBe(false);
+      expect(front.toolbarInert, "a toolbar button is inert").toBe(false);
+      expect(front.hitInside, "a click at the browser's centre lands elsewhere").toBe(true);
+      expect(front.focusInside, "the keyboard is not in the browser").toBe(true);
+      // Its toolbar works: Back is pressed and the page stays.
+      await browser.getByRole("button", { name: "Back" }).click();
+      await expect(browser).toBeVisible();
+
+      // A later list from the daemon that still holds bench's card keeps the page open.
+      await pushCards(page, `byName("bench").updated_at = "2026-11-20T11:00:00Z";`);
+      await page.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));
+      await expect(browser).toBeVisible();
+      await expect(browser).toHaveAttribute("aria-label", "Issue #3 for bench");
+
+      // Close returns to the cards, with the keyboard back on the count that opened the way here.
+      await browser.getByRole("button", { name: "Close pull request" }).click();
+      await expect(browser).toHaveCount(0);
+      await expect(more).toBeFocused();
+
+      // Opened again, the page goes when the daemon stops listing bench's card.
+      await more.click();
+      await overlay.getByTestId("agent-card-overlay-refs").getByTestId("agent-card-overlay-issue").click();
+      await expect(browser).toBeVisible();
+      await pushCards(page, `
+        const at = next.entries.findIndex((entry) => entry.name === "bench");
+        next.entries.splice(at, 1);
+      `);
+      await expect(browser).toHaveCount(0);
     });
   });
 }

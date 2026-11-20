@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureFleet, createFixtureStartedAgent, FIXTURE_DAEMON_ID } from "../data/fixture";
 import { isIssueUrl, referenceUrl } from "../lib/agentCardsTree";
 import { clearDashboardFilter, setDashboardFilter } from "../lib/dashboardFilter";
-import { OpenCardReference } from "../lib/prBrowser";
+import { OpenCardReference, type CardReferenceTarget } from "../lib/prBrowser";
 import { DEFAULT_DESKTOP_FEATURES, type AgentCardCheckedRef, type AgentCardEntry, type AgentCardsSnapshot, type DeckFleet, type DeckRuntimeState } from "../types";
 import { AgentOverview } from "./AgentOverview";
 
@@ -140,7 +140,7 @@ function runtime(entries: AgentCardEntry[] = TREE, options: { tree?: boolean } =
   } as unknown as DeckRuntimeState;
 }
 
-const openReference = vi.fn<(target: { deckId: string; agentId: string; kind: string; number: number; url: string }) => string | undefined>(() => undefined);
+const openReference = vi.fn<(target: CardReferenceTarget) => string | undefined>(() => undefined);
 
 function cardsView(live: DeckRuntimeState = runtime()) {
   window.localStorage.setItem(MODE_KEY, "cards");
@@ -282,7 +282,7 @@ describe("desktop/agent-cards — the Cards tree (issue #2418)", () => {
     expect(pr.getAttribute("data-pr-review")).toBe("approved");
     expect(pr.getAttribute("aria-label")).toContain("#24180");
     act(() => { fireEvent.click(pr); });
-    expect(openReference).toHaveBeenCalledWith({ deckId: FIXTURE_DAEMON_ID, agentId: "5", kind: "pull_request", number: 24180, url: PR_MERGED.url });
+    expect(openReference).toHaveBeenCalledWith({ deckId: FIXTURE_DAEMON_ID, instanceId: INSTANCE, cardKey: UNIT.key, kind: "pull_request", number: 24180, url: PR_MERGED.url });
     // A click on a badge does not open the card's overlay.
     expect(screen.queryByTestId("agent-card-overlay")).toBeNull();
 
@@ -290,7 +290,7 @@ describe("desktop/agent-cards — the Cards tree (issue #2418)", () => {
     expect(issue.getAttribute("data-issue-state")).toBe("closed");
     expect(issue.getAttribute("aria-label")).toContain("#3");
     act(() => { fireEvent.click(issue); });
-    expect(openReference).toHaveBeenLastCalledWith({ deckId: FIXTURE_DAEMON_ID, agentId: "5", kind: "issue", number: 3, url: ISSUE_CLOSED.url });
+    expect(openReference).toHaveBeenLastCalledWith({ deckId: FIXTURE_DAEMON_ID, instanceId: INSTANCE, cardKey: UNIT.key, kind: "issue", number: 3, url: ISSUE_CLOSED.url });
   });
 
   /// Scenario: read the unit's references the deck could not check, or has not yet. A pending one says it is being checked, a not-found one says "not found or private", one that is not a GitHub reference says so, each with the reason in its tooltip and no link; a stale one keeps its badge but is marked stale, with when it was last checked in its tooltip.
@@ -626,11 +626,30 @@ describe("desktop/agent-cards — the Cards tree (issue #2418)", () => {
     expect(stale.textContent).toContain("stale");
     expect(text(stale, "agent-card-overlay-ref-note")).toMatch(/^Last checked .*may be out of date\.$/);
 
-    // The links open through the same path as the card's badges, and leave the overlay open.
-    act(() => { fireEvent.click(within(closed).getByTestId("agent-card-overlay-issue")); });
-    expect(openReference).toHaveBeenLastCalledWith({ deckId: FIXTURE_DAEMON_ID, agentId: "5", kind: "issue", number: 3, url: ISSUE_CLOSED.url });
+    // A link the shell refuses says why in the overlay, which stays open.
+    openReference.mockReturnValueOnce("That card is no longer on its daemon, so its page was not opened.");
     act(() => { fireEvent.click(within(stale).getByTestId("agent-card-overlay-pr")); });
-    expect(openReference).toHaveBeenLastCalledWith({ deckId: FIXTURE_DAEMON_ID, agentId: "5", kind: "pull_request", number: 9, url: PR_STALE.url });
+    expect(openReference).toHaveBeenLastCalledWith({ deckId: FIXTURE_DAEMON_ID, instanceId: INSTANCE, cardKey: UNIT.key, kind: "pull_request", number: 9, url: PR_STALE.url });
+    expect(within(screen.getByTestId("agent-card-overlay")).getByTestId("agent-card-overlay-notice").textContent).toBe("That card is no longer on its daemon, so its page was not opened.");
+
+    // The links open through the same path as the card's badges, named by the card; an open the
+    // shell accepts closes the overlay, so the page it opens is in front (issue #2418 review, F1).
+    act(() => { fireEvent.click(within(closed).getByTestId("agent-card-overlay-issue")); });
+    expect(openReference).toHaveBeenLastCalledWith({ deckId: FIXTURE_DAEMON_ID, instanceId: INSTANCE, cardKey: UNIT.key, kind: "issue", number: 3, url: ISSUE_CLOSED.url });
+    expect(screen.queryByTestId("agent-card-overlay")).toBeNull();
+    expect(screen.queryByTestId("overview-card-notice"), "an open that happened clears the refusal").toBeNull();
+  });
+
+  /// Scenario: press one of the unit's reference badges on its card while the shell refuses to open it. The dashboard says why in a banner, which Dismiss clears, instead of doing nothing.
+  it("desktop/agent-cards/025: a reference the shell refuses to open says why on the dashboard", () => {
+    cardsView();
+    fireEvent.click(toggle(QUEUE));
+    openReference.mockReturnValueOnce("That card's daemon is not answering, so its page was not opened.");
+    act(() => { fireEvent.click(within(cardOf(UNIT.key)).getByTestId("agent-card-issue")); });
+    const banner = screen.getByTestId("overview-card-notice");
+    expect(banner.textContent).toContain("That card's daemon is not answering, so its page was not opened.");
+    act(() => { fireEvent.click(within(banner).getByRole("button", { name: "Dismiss" })); });
+    expect(screen.queryByTestId("overview-card-notice")).toBeNull();
   });
 
   /// Scenario: lay out the unit's card with a reference line that holds two of its six badges. The two show, the other four are hidden whole and a "+4" button says so; pressing it opens the unit's overlay with the keyboard on its list of every reference.

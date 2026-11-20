@@ -1581,7 +1581,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     const shown = cardsOnScreen(deck);
     const deckId = deck.snapshot.connection.deckId;
     if (shown === undefined || deckId === undefined) return undefined;
-    return <AgentCardsDeckBody deckId={deckId} cards={shown} tree={cards.treeFor(deckId)} openCards={cards.openCards} needsYouOnly={cards.needsYouOnly} controls={cards.controls} results={cards.resultsFor} />;
+    return <AgentCardsDeckBody deckId={deckId} cards={shown} tree={cards.treeFor(deckId)} openCards={cards.openCards} needsYouOnly={cards.needsYouOnly} controls={cards.clickControls} results={cards.resultsFor} />;
   };
   const openCardReference = useContext(OpenCardReference);
   /* Issue #2418 — whether the dashboard filter keeps a card off the Cards
@@ -2057,6 +2057,12 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
               <button type="button" aria-label="Dismiss" onClick={() => setGenerationNotice(undefined)}><X size={13} /></button>
             </div>
           )}
+          {cards.notice && (
+            <div className="overview-banner" role="status" data-testid="overview-card-notice">
+              <span>{displayText(cards.notice, DISPLAY_LIMITS.message)}</span>
+              <button type="button" aria-label="Dismiss" onClick={cards.dismissNotice}><X size={13} /></button>
+            </div>
+          )}
           {daemonNotice && (
             <div className="overview-banner" role="status" data-testid="overview-daemon-notice">
               <span>{displayText(daemonNotice, DISPLAY_LIMITS.message)}</span>
@@ -2122,7 +2128,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
           ))}
         </section>
       </main>
-      {cards.overlay && <AgentCardOverlay {...cards.overlay} controls={cards.controls} />}
+      {cards.overlay && <AgentCardOverlay {...cards.overlay} notice={cards.notice} controls={cards.clickControls} />}
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}
       {upgrade && <UpgradeDialog target={upgrade} runtime={runtime} onClose={() => setUpgrade(undefined)} />}
       {localUpgrade && <LocalUpgradeFlow {...localUpgrade} runtime={runtime} onClose={() => { setLocalUpgrade(undefined); selfUpgrade?.onClosed?.(); }} />}

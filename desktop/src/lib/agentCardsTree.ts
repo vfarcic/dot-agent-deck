@@ -311,6 +311,15 @@ export function referenceUrl(ref: Pick<AgentCardCheckedRef, "url">): string | un
   return ref.url !== undefined && (isPullRequestUrl(ref.url) || isIssueUrl(ref.url)) ? ref.url : undefined;
 }
 
+/**
+ * Issue #2418 — whether the deck's check of a reference lets it open: checked
+ * (a stale check included), with its number and a github.com page. What the
+ * card's badge, voice and the shell each ask before opening it.
+ */
+export function openableReference(ref: AgentCardCheckedRef): ref is AgentCardCheckedRef & { number: number; url: string } {
+  return ref.result.status === "checked" && ref.number !== undefined && referenceUrl(ref) !== undefined;
+}
+
 function clockOf(at: string): string {
   const parsed = new Date(at);
   return Number.isNaN(parsed.getTime()) ? at : parsed.toLocaleString();
