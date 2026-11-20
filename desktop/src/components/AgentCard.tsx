@@ -41,7 +41,7 @@ export function ExactText({ text }: { text: string }) {
 }
 
 /** What the markers in a shown prompt mean, said under it when it has any. */
-export const MARKER_NOTE = `${MARKER_OPEN}…${MARKER_CLOSE} marks a character you cannot see; it is sent as is.`;
+const MARKER_NOTE = `${MARKER_OPEN}…${MARKER_CLOSE} marks a character you cannot see; it is sent as is.`;
 
 /** {@link MARKER_NOTE}, when `text` shows any marker. */
 export function ExactTextNote({ text }: { text: string }) {

@@ -81,7 +81,7 @@ export interface SpeechQueueDeps {
  * sentence naming its agent), played when the moment changed while the audio
  * for `say`'s answer was being prepared.
  */
-export interface Worded {
+interface Worded {
   say: () => string;
   safe: string;
 }
@@ -340,7 +340,7 @@ export interface AudioContextLike {
 export const MAX_PROVIDER_AUDIO_SECONDS = 120;
 
 /** Added to a clip's own length before its playback is given up on. */
-export const PROVIDER_PLAYBACK_MARGIN_MS = 2_000;
+const PROVIDER_PLAYBACK_MARGIN_MS = 2_000;
 
 /** Said when decoded provider audio is longer than {@link MAX_PROVIDER_AUDIO_SECONDS}. */
 export const PROVIDER_AUDIO_TOO_LONG = "the speech service's audio is too long to play";

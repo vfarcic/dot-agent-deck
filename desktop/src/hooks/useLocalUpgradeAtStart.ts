@@ -7,7 +7,7 @@ import { localUpgradeAtStart } from "../lib/upgrade";
 import type { DeckRuntimeState } from "../types";
 
 /** How often a waiting upgrade looks again for the other modal to have closed. */
-export const MODAL_RETRY_MS = 500;
+const MODAL_RETRY_MS = 500;
 
 /**
  * Issue #1636 — the app upgrading the local daemon on its own, as the TUI does

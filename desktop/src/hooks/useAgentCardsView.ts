@@ -9,32 +9,32 @@ import type { AgentCardRef, VoiceActionContext } from "../lib/voiceActions";
 import type { AgentCardAction, DeckRuntimeState } from "../types";
 
 /** What a card member says when the cards are not shown (this connection offers no cards). */
-export const CARDS_HIDDEN = "Agent cards are not available here.";
+const CARDS_HIDDEN = "Agent cards are not available here.";
 /** …when the card it names is not on the dashboard any more. */
-export const CARD_GONE = "That agent has no card on the dashboard any more, so nothing was done.";
+const CARD_GONE = "That agent has no card on the dashboard any more, so nothing was done.";
 /** …when a card step or close is asked for with no card open. */
-export const NO_CARD_OPEN = "No card is open.";
+const NO_CARD_OPEN = "No card is open.";
 /** …when no card needs the user. */
-export const NO_CARD_NEEDS_YOU = "No other card needs you right now.";
+const NO_CARD_NEEDS_YOU = "No other card needs you right now.";
 /** …when there are no cards to move between. */
-export const NO_CARDS = "There are no cards to show.";
+const NO_CARDS = "There are no cards to show.";
 /** …when voice named an action whose text the agent wrote: its card opens at the review step instead of sending. */
-export const agentWrittenReview = (label: string, name: string) => `${name} wrote the text of ${label}, so its card is open for you to read it first: press Send to send it.`;
+const agentWrittenReview = (label: string, name: string) => `${name} wrote the text of ${label}, so its card is open for you to read it first: press Send to send it.`;
 
 /** …when voice asks for a card's tree on a card with nothing under it. */
-export const nothingUnder = (name: string) => `${name} has no cards under it.`;
+const nothingUnder = (name: string) => `${name} has no cards under it.`;
 /** …when voice opens a tree whose card the dashboard filter hides. */
-export const treeHiddenByFilter = (name: string) => `${name}'s tree is open, but the dashboard filter hides ${name}: clear the filter to see it.`;
+const treeHiddenByFilter = (name: string) => `${name}'s tree is open, but the dashboard filter hides ${name}: clear the filter to see it.`;
 /** …when voice opens a tree all of whose cards the dashboard filter hides. */
-export const treeEmptiedByFilter = (name: string) => `${name}'s tree is open, but the dashboard filter hides every card under it: clear the filter to see them.`;
+const treeEmptiedByFilter = (name: string) => `${name}'s tree is open, but the dashboard filter hides every card under it: clear the filter to see them.`;
 /** …when a reference is asked for and this window cannot open GitHub pages. */
-export const NO_REFERENCE_OPENER = "This window cannot open GitHub pages.";
+const NO_REFERENCE_OPENER = "This window cannot open GitHub pages.";
 
 /** The card members the overview serves, every one of them. */
-export type AgentCardControls = Pick<VoiceActionContext, "setOverviewMode" | "showAgentCard" | "stepAgentCard" | "setNeedsYouFilter" | "closeAgentCard" | "runCardAction" | "replyToAgentCard" | "confirmCardAction" | "toggleOverviewRowMenu" | "setCardTree" | "openCardReference">;
+type AgentCardControls = Pick<VoiceActionContext, "setOverviewMode" | "showAgentCard" | "stepAgentCard" | "setNeedsYouFilter" | "closeAgentCard" | "runCardAction" | "replyToAgentCard" | "confirmCardAction" | "toggleOverviewRowMenu" | "setCardTree" | "openCardReference">;
 
 /** The overlay as the overview renders it. */
-export interface CardOverlayView {
+interface CardOverlayView {
   card: PlacedCard | undefined;
   lastName: string;
   position: number;

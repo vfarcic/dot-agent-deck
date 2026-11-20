@@ -34,7 +34,7 @@ export interface DaemonHookEvent {
  * in one agent's inbox changed state. Snake_case and flattened beside `kind`,
  * like the `event` variant.
  */
-export interface DaemonInboxNotice {
+interface DaemonInboxNotice {
   kind: "inbox";
   pane_id?: unknown;
   agent_id?: unknown;
@@ -301,4 +301,4 @@ export function applyHandoffEvent(
 }
 
 /** Cap on retained handoff edges — same rationale as `MAX_LIVE_EVIDENCE`. */
-export const MAX_LIVE_HANDOFFS = 100;
+const MAX_LIVE_HANDOFFS = 100;

@@ -334,7 +334,7 @@ function markerName(char: string): string {
 }
 
 /** A character's marker: `⟦tab⟧`, `⟦U+202E⟧`. */
-export function markerOf(char: string): string {
+function markerOf(char: string): string {
   return `${MARKER_OPEN}${markerName(char)}${MARKER_CLOSE}`;
 }
 

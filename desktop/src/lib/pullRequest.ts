@@ -57,7 +57,7 @@ export function isPullRequestUrl(value: string): boolean {
 }
 
 /** The state in the badge's words. */
-export const PULL_REQUEST_STATE_LABEL: Record<PullRequestState, string> = {
+const PULL_REQUEST_STATE_LABEL: Record<PullRequestState, string> = {
   open: "open",
   draft: "draft",
   merged: "merged",
@@ -66,7 +66,7 @@ export const PULL_REQUEST_STATE_LABEL: Record<PullRequestState, string> = {
 };
 
 /** The review decision in the badge's words. */
-export const PULL_REQUEST_REVIEW_LABEL: Record<PullRequestReview, string> = {
+const PULL_REQUEST_REVIEW_LABEL: Record<PullRequestReview, string> = {
   approved: "approved",
   changes_requested: "changes requested",
   review_required: "review required",
@@ -74,7 +74,7 @@ export const PULL_REQUEST_REVIEW_LABEL: Record<PullRequestReview, string> = {
 };
 
 /** Issue #1781 — the CI result in the badge's words, when there are no counts to give. */
-export const PULL_REQUEST_CHECKS_LABEL: Record<PullRequestChecksState, string> = {
+const PULL_REQUEST_CHECKS_LABEL: Record<PullRequestChecksState, string> = {
   passing: "passing",
   failing: "failing",
   pending: "pending",
@@ -82,7 +82,7 @@ export const PULL_REQUEST_CHECKS_LABEL: Record<PullRequestChecksState, string> =
 };
 
 /** Issue #1781 — "CI: 1 failing, 24 passing": every non-empty bucket, the ones that need attention first. */
-export function pullRequestChecksLabel(checks: AgentPullRequestChecks): string {
+function pullRequestChecksLabel(checks: AgentPullRequestChecks): string {
   if (checks.state === "unknown") return `CI: ${PULL_REQUEST_CHECKS_LABEL.unknown}`;
   const counts = ([["failing", checks.failing], ["pending", checks.pending], ["passing", checks.passing], ["skipped", checks.skipped]] as const)
     .filter(([, count]) => count > 0)

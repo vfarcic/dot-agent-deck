@@ -19,7 +19,7 @@ export type UpgradeOffer =
 export type UpgradeStage = "installing" | "restarting" | "verifying";
 
 /** One agent a restart would stop (or stopped). */
-export interface UpgradeStopAgent {
+interface UpgradeStopAgent {
   id: string;
   label: string;
   paneId?: string;
@@ -27,7 +27,7 @@ export interface UpgradeStopAgent {
 }
 
 /** One orchestration role a restart would stop (or stopped). */
-export interface UpgradeStopRole {
+interface UpgradeStopRole {
   paneId: string;
   role: string;
   orchestration: string;
@@ -39,7 +39,7 @@ export interface UpgradeStopSet {
   roles: UpgradeStopRole[];
 }
 
-export type NotRestartedReason =
+type NotRestartedReason =
   | { kind: "kept-by-user"; atStake: UpgradeStopSet }
   | { kind: "no-one-to-ask"; atStake: UpgradeStopSet }
   | { kind: "stale-confirmation"; atStake: UpgradeStopSet }
@@ -187,7 +187,7 @@ export function stopSetCount(set: UpgradeStopSet): string {
   return parts.join(" and ") || "nothing";
 }
 
-export type OutcomeTone = "success" | "neutral" | "failure";
+type OutcomeTone = "success" | "neutral" | "failure";
 
 /** What the dialog shows when an upgrade finishes. */
 export interface OutcomeView {

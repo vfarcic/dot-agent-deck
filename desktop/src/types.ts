@@ -871,7 +871,7 @@ export interface AgentCardRollup {
 }
 
 /** Issue #2418 — what the deck's own lookup of a reported reference found, on the daemon's host. */
-export type AgentCardCheckResult =
+type AgentCardCheckResult =
   | { status: "pending" }
   | {
     status: "checked";

@@ -125,7 +125,7 @@ export function cardTone(entry: Pick<AgentCardEntry, "status" | "rollup">, open:
 }
 
 /** A card's status in the daemon's words, as the table and the TUI show it; a status this build does not know, as it came. */
-export function cardStatusText(status: string): string {
+function cardStatusText(status: string): string {
   const word = cardStatusWord(status);
   return word ? statusWordLabel(word) : status.replace(/_/g, " ");
 }
@@ -191,7 +191,7 @@ export function agentTypeText(agentType: string | null): string | undefined {
 }
 
 /** Where each client remembers which cards are open. */
-export const CARDS_OPEN_STORAGE_KEY = "dot-agent-deck.cards.open";
+const CARDS_OPEN_STORAGE_KEY = "dot-agent-deck.cards.open";
 
 /** How many open cards are remembered at most; the newest are kept. */
 const MAX_REMEMBERED_OPEN = 500;
