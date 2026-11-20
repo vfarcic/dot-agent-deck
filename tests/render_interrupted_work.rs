@@ -1448,3 +1448,65 @@ fn interrupted_025_a_confirmation_sends_only_what_it_showed() {
     );
     assert_eq!(sent.last(), Some(&all), "{sent:?}");
 }
+
+/// Scenario: A unit's details show "Reports 1 to 3 of 8."; then all but two
+/// of its reports expire, and `n` asks for the page from the fourth. The
+/// daemon answers the page clamped to where the two reports end, with no
+/// report on it. The details apply that answer: "Reports 1 to 3 of 8." and
+/// `n next reports` are gone and `p previous reports` is offered; the first
+/// page's late answer is not shown, and `p` reaches the two kept reports.
+#[spec("journal/interrupted/026")]
+#[test]
+fn interrupted_026_a_clamped_report_page_is_applied_not_dropped_as_stale() {
+    let mut listed = unit();
+    listed.reports = (1..=3).map(report).collect();
+    listed.reports_omitted = 5;
+    // The daemon clamps the asked-for offset (3) to the two reports left.
+    let mut clamped = page(1, 2, 2, None);
+    clamped.item.reports = Vec::new();
+    clamped.item.reports_omitted = 2;
+    clamped.reports_from = 2;
+    clamped.next_reports_from = None;
+    let (shown, sent) = run(
+        &only(listed),
+        &[
+            ch('I'),
+            key(KeyCode::Enter),
+            key(KeyCode::Enter),
+            InterruptedSeamStep::Shown(page(1, 3, 8, Some(1))),
+            ch('n'),
+            InterruptedSeamStep::Shown(clamped),
+            // The first page's request, answered again, late.
+            InterruptedSeamStep::AnswerTo(
+                1,
+                Box::new(InterruptedSeamStep::Shown(page(1, 3, 8, Some(1)))),
+            ),
+            ch('p'),
+            InterruptedSeamStep::Shown(page(1, 2, 2, Some(1))),
+        ],
+    );
+    let show = |from: usize| InterruptedSeamRequest::Show {
+        id: UNIT_ID.to_string(),
+        reports_from: from,
+    };
+    assert_eq!(
+        sent.iter()
+            .filter(|r| matches!(r, InterruptedSeamRequest::Show { .. }))
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec![show(0), show(3), show(0)],
+        "{sent:?}"
+    );
+    at(&shown[4], "Reports 1 to 3 of 8.");
+    for frame in [&shown[6], &shown[7]] {
+        assert!(
+            !frame.contains("Reports 1 to 3 of 8.") && !frame.contains("n next reports"),
+            "the clamped page replaces the stale one:\n{frame}"
+        );
+        at(frame, "p previous reports");
+    }
+    let back = &shown[9];
+    at(back, &format!("{LABEL_REPORT}: r-2"));
+    at(back, "BODY OF r-1");
+    assert!(!back.contains("n next reports"), "{back}");
+}

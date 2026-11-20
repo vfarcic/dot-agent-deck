@@ -1323,3 +1323,190 @@ fn show_pages_reach_every_kept_report_beyond_the_metadata_cap() {
     let shown = fit_show(item.clone(), &last, false, MAX_REPLY_BYTES, body);
     assert_eq!(shown.reports[0].body.as_deref(), Some("BODY OF r-40"));
 }
+
+/// The repository's worktree lock held by another process stand-in: an open
+/// file description of its own with an exclusive `flock`, taken on the test's
+/// thread rather than in the runtime's blocking pool, and released when
+/// dropped.
+fn hold_lock_elsewhere(lock_path: &Path) -> std::fs::File {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)
+        .expect("open the lock file");
+    file.lock().expect("take the lock");
+    file
+}
+
+/// Auditor N5 / reviewer P2: a reclaim that gives up waiting for the
+/// repository's worktree lock leaves nothing waiting for it. On a runtime
+/// with two blocking threads, with the lock held elsewhere throughout, four
+/// reclaims in a row each answer `kept-busy` within their bound, and a
+/// blocking job queued after them still runs: no abandoned lock wait holds a
+/// blocking thread.
+#[test]
+fn busy_reclaims_leave_no_lock_waiter_behind_in_the_blocking_pool() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .max_blocking_threads(2)
+        .build()
+        .unwrap();
+    let tmp = crate::test_temp::tempdir().unwrap();
+    let root_dir = std::fs::canonicalize(tmp.path()).unwrap();
+    let (repo, wt) = repo_with_worktree(&root_dir);
+    mark(&wt);
+    let lock_path = rt
+        .block_on(crate::issue_dispatch_run::worktree_lock_path(&repo))
+        .expect("a lock path");
+    let held = hold_lock_elsewhere(&lock_path);
+    let answers = rt.block_on(async {
+        let registry = registry_with_journal(&root_dir.join("state"), JournalOptions::default());
+        let (root, _) = unit(&registry, "agent/dispatch-x", Some(&wt));
+        let mut answers = Vec::new();
+        for _ in 0..4 {
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(20),
+                reclaim_with(
+                    &registry,
+                    root.to_string(),
+                    false,
+                    None,
+                    RECLAIM_TIMEOUT,
+                    Duration::from_millis(100),
+                ),
+            )
+            .await;
+            answers.push(outcome.map(|o| o.verdict).ok());
+        }
+        let heartbeat =
+            tokio::time::timeout(Duration::from_secs(10), tokio::task::spawn_blocking(|| 7))
+                .await
+                .ok()
+                .and_then(Result::ok);
+        (answers, heartbeat)
+    });
+    // Released before asserting, so a failure cannot leave the runtime
+    // waiting on a blocked `flock` at shutdown.
+    drop(held);
+    rt.shutdown_timeout(Duration::from_secs(10));
+    let (answers, heartbeat) = answers;
+    assert_eq!(answers, vec![Some(ReclaimVerdict::KeptBusy); 4]);
+    assert_eq!(heartbeat, Some(7), "a blocking job queued after them runs");
+    assert!(wt.is_dir(), "nothing was removed");
+}
+
+/// Reviewer P3: a reclaim that cannot take the lock because the lock file
+/// cannot be opened (a directory sits at its path) removes nothing and says
+/// the lock could not be taken, not that another change was running; the
+/// lock held elsewhere is still `kept-busy` (the test above, and
+/// `reclaim_removes_nothing_when_the_repositorys_worktree_lock_cannot_be_taken`).
+#[test]
+fn a_lock_that_cannot_be_opened_is_not_reported_as_another_change() {
+    rt().block_on(async {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let root_dir = std::fs::canonicalize(tmp.path()).unwrap();
+        let (repo, wt) = repo_with_worktree(&root_dir);
+        mark(&wt);
+        let registry = registry_with_journal(&root_dir.join("state"), JournalOptions::default());
+        let (root, _) = unit(&registry, "agent/dispatch-x", Some(&wt));
+        let lock_path = crate::issue_dispatch_run::worktree_lock_path(&repo)
+            .await
+            .expect("a lock path");
+        std::fs::create_dir(&lock_path).unwrap();
+
+        let outcome = reclaim_with(
+            &registry,
+            root.to_string(),
+            false,
+            None,
+            RECLAIM_TIMEOUT,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(
+            outcome.verdict,
+            ReclaimVerdict::KeptCouldNotLock,
+            "{outcome:?}"
+        );
+        assert_eq!(
+            outcome.message,
+            crate::interrupted_work::RECLAIM_KEPT_COULD_NOT_LOCK
+        );
+        assert!(!outcome.message.contains("another"), "{}", outcome.message);
+        assert!(wt.is_dir(), "nothing was removed");
+        assert!(closes(&registry).is_empty());
+    });
+}
+
+/// Auditor wire check: a page asked for past the item's reports, up to
+/// `usize::MAX`, answers an empty page clamped to where the reports end,
+/// with no next page and the reports still counted, rather than panicking
+/// on a slice or an addition; and through the daemon's handler too.
+#[test]
+fn a_report_page_past_the_end_up_to_usize_max_is_clamped() {
+    use crate::interrupted_work::{ItemReport, LastEntry, Progress, fit_show_page};
+    let total = 40;
+    let item = InterruptedItem {
+        id: WorkId::parse("w-abcdefgh-0000000000000001").unwrap(),
+        kind: ItemKind::Unit,
+        name: None,
+        issue: None,
+        repo: None,
+        branch: None,
+        worktree: None,
+        launcher: None,
+        last_entry: LastEntry {
+            kind: "reported".into(),
+            ts_ms: 1,
+        },
+        reports: (1..=total)
+            .map(|n| ItemReport {
+                report_id: format!("r-{n}"),
+                task_id: None,
+                unit_id: None,
+                kept_until_ms: None,
+            })
+            .collect(),
+        reports_omitted: 0,
+        cut: false,
+        progress: Progress::default(),
+        git: None,
+    };
+    let body = |report_id: &str| ShownReport {
+        report_id: report_id.to_string(),
+        body: Some(format!("BODY OF {report_id}")),
+        cut: false,
+        error: None,
+    };
+    for from in [total, total + 1, usize::MAX / 2, usize::MAX - 1, usize::MAX] {
+        let bodies = shown_bodies_page(&item, None, Some(from)).unwrap();
+        assert!(bodies.is_empty(), "{from}");
+        let page = fit_show_page(
+            item.clone(),
+            Some(from),
+            &bodies,
+            false,
+            MAX_REPLY_BYTES,
+            body,
+        );
+        assert_eq!(page.reports_from, total, "{from}");
+        assert!(page.item.reports.is_empty(), "{from}");
+        assert!(page.reports.is_empty(), "{from}");
+        assert_eq!(page.item.reports_omitted, total, "{from}");
+        assert_eq!(page.next_reports_from, None, "{from}");
+    }
+
+    rt().block_on(async {
+        let state = crate::test_temp::tempdir().unwrap();
+        let registry = registry_with_journal(state.path(), JournalOptions::default());
+        let (root, _) = unit(&registry, "agent/dispatch-x", None);
+        let shown = show_page(&registry, root.to_string(), None, Some(usize::MAX))
+            .await
+            .expect("an answer");
+        assert_eq!(shown.item.id, root);
+        assert_eq!(shown.reports_from, 0);
+        assert_eq!(shown.next_reports_from, None);
+    });
+}

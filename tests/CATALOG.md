@@ -786,6 +786,13 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 - **Does not assert:** the daemon's handling of a dismissal (`journal/interrupted/002`).
 - **Platform coverage:** mac+linux.
 
+##### journal/interrupted/026 — A report page the daemon clamped after reports expired is applied, not dropped as stale.
+- **Layer:** L1 in-process `TestBackend` (`tests/render_interrupted_work.rs`, seam `run_interrupted_work_seam`): every request the TUI sends is recorded instead of sent, the daemon's answers are handed in for a recorded request, keys go through the production `handle_key_event`, and each frame is drawn after the production per-frame fetch check.
+- **Agent:** none.
+- **Asserts:** after `Reports 1 to 3 of 8.`, `n` asks for the page from 3; its answer, clamped to an empty page from 2, replaces the shown page (no `Reports 1 to 3 of 8.`, no `n next reports`, `p previous reports` offered); a late answer to the first page's request is not shown; `p` asks for the page from 0 and shows the two kept reports; the show requests sent are exactly from 0, 3 and 0.
+- **Does not assert:** the daemon's clamping (`interrupted_work` unit tests).
+- **Platform coverage:** mac+linux.
+
 #### journal/compat
 
 ##### journal/compat/001 — Lines of a newer schema or an unknown kind are skipped and kept.

@@ -1267,3 +1267,37 @@ fn a_report_page_is_additive_and_optional_on_the_wire() {
     assert_eq!(page.item.reports.len(), 4);
     assert_eq!(page.item.reports_omitted, 16);
 }
+
+/// Auditor wire check: the two lock verdicts are additive. Each serialises
+/// as its own kebab-case value, and a reader that predates them (its enum
+/// without them, ending in the same `#[serde(other)] Unknown`) decodes the
+/// value as `Unknown` instead of failing the whole answer.
+#[test]
+fn the_lock_verdicts_decode_as_unknown_in_a_reader_that_predates_them() {
+    #[derive(Debug, PartialEq, serde::Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    enum OlderVerdict {
+        Removed,
+        WouldRemove,
+        KeptDirty,
+        KeptHoldsWorktrees,
+        KeptCouldNotCheck,
+        RemoveFailed,
+        TimedOut,
+        KeptChanged,
+        Refused,
+        #[serde(other)]
+        Unknown,
+    }
+    for (verdict, wire) in [
+        (ReclaimVerdict::KeptBusy, "kept-busy"),
+        (ReclaimVerdict::KeptCouldNotLock, "kept-could-not-lock"),
+    ] {
+        let json = serde_json::to_value(verdict).unwrap();
+        assert_eq!(json, serde_json::json!(wire));
+        let older: OlderVerdict = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(older, OlderVerdict::Unknown);
+        let back: ReclaimVerdict = serde_json::from_value(json).unwrap();
+        assert_eq!(back, verdict);
+    }
+}

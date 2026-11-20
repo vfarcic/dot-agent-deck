@@ -525,3 +525,47 @@ fn an_item_with_more_reports_points_at_the_next_page() {
     );
     assert!(text.contains("Report: r-17,"), "{text}");
 }
+
+/// Auditor N3 (second round): a malformed reply, decoded as the client
+/// decodes the daemon's answer, whose report body and dismissed id carry
+/// escape sequences, a carriage return and bidi controls. The person's
+/// output keeps the body's own lines and tabs and the text around those
+/// characters, and carries none of them live.
+#[test]
+fn a_malformed_reply_cannot_move_the_terminal_through_a_body_or_a_dismissed_id() {
+    use crate::untrusted_text::is_bidi_format_char;
+    // Live: a bidi control, or a control character other than the layout
+    // a multi-line body is allowed (its newlines and tabs).
+    let live = |text: &str| {
+        text.chars()
+            .any(|c| is_bidi_format_char(c) || (c.is_control() && c != '\n' && c != '\t'))
+    };
+    let mut show = serde_json::to_value(InterruptedShow {
+        item: item(UNIT_ID, ItemKind::Unit, "a"),
+        reports: Vec::new(),
+        incomplete: false,
+        bodies_omitted: 0,
+        reports_from: 0,
+        next_reports_from: None,
+    })
+    .unwrap();
+    show["reports"] = serde_json::json!([{
+        "report_id": "r-1",
+        "body": "first\tcolumn\n\u{1b}]0;owned\u{7}title\n\u{1b}[2Jcleared\rover\u{202e}desrever\u{9b}31m\n",
+    }]);
+    let show: InterruptedShow = serde_json::from_value(show).unwrap();
+    let text = render_show(&show);
+    assert!(!live(&text), "{text:?}");
+    assert!(text.contains("first\tcolumn\n"), "{text:?}");
+    for visible in ["owned", "title", "cleared", "over", "desrever"] {
+        assert!(text.contains(visible), "{visible}: {text:?}");
+    }
+
+    let dismissed: DismissOutcome = serde_json::from_value(serde_json::json!({
+        "dismissed": [{"id": "w-\u{1b}[31mred\u{202e}di", "name": "a"}],
+    }))
+    .unwrap();
+    let out = render_dismiss(&dismissed);
+    assert!(!live(&out.stdout) && !live(&out.stderr), "{out:?}");
+    assert!(out.stdout.contains("red"), "{out:?}");
+}
