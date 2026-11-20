@@ -181,6 +181,26 @@ export const PULL_REQUEST_COVERED = "Close what is in front of the pull request 
 type OpenPrBrowser = PullRequestBrowserSession & { over: DeckView; opened: number; card?: { instanceId: string; key: string } };
 
 /**
+ * An accepted open, from the pull request badge or a card's reference, given
+ * the page on screen (`open`) and any switch still waiting (`pending`). With
+ * no page open it opens one, numbered from `opened`. With the page on
+ * another address, or a switch waiting, it is a switch, which the page makes
+ * and only then the toolbar shows (`switchPrBrowser`). With the page already
+ * on that address and nothing waiting, the page is not reloaded, but the
+ * session takes the new request's subject (its name, deck, agent, and whether
+ * a card owns it), so the browser closes with what asked for it last rather
+ * than with whatever first opened the address (issue #2418 review).
+ */
+function admitPrBrowser(open: OpenPrBrowser | undefined, pending: OpenPrBrowser | undefined, wanted: Omit<OpenPrBrowser, "opened">, opened: { current: number }): { show: OpenPrBrowser; switchTo?: undefined } | { show?: undefined; switchTo: OpenPrBrowser } {
+  if (!open) {
+    opened.current += 1;
+    return { show: { ...wanted, opened: opened.current } };
+  }
+  if (pending || open.url !== wanted.url) return { switchTo: { ...wanted, opened: open.opened } };
+  return { show: { ...wanted, opened: open.opened } };
+}
+
+/**
  * Issue #2418 — the card a checked reference names, as its deck's daemon lists
  * it now: by deck, the daemon process that listed it, and its key. Only from a
  * daemon that builds the card tree, whose checked references are its own.
@@ -866,16 +886,9 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       const pullRequest = agent.pullRequest;
       if (!pullRequest) return `${name} has no pull request.`;
       if (!pullRequest.url) return `${name}'s pull request #${pullRequest.number} has no github.com address the app can open.`;
-      const wanted = { deckId: target.deckId, agentId: target.agentId, agentLabel: agent.displayName, number: pullRequest.number, url: pullRequest.url, over: view };
-      /* With a page open this is a switch, which the page makes and only then
-         the toolbar shows (`switchPrBrowser`); the page already on it, with
-         no other switch waiting, needs nothing. */
-      if (prBrowser) {
-        if (prBrowserRequest || prBrowser.url !== wanted.url) setPrBrowserRequest({ ...wanted, opened: prBrowser.opened });
-      } else {
-        prBrowserOpened.current += 1;
-        setPrBrowser({ ...wanted, opened: prBrowserOpened.current });
-      }
+      const admitted = admitPrBrowser(prBrowser, prBrowserRequest, { deckId: target.deckId, agentId: target.agentId, agentLabel: agent.displayName, number: pullRequest.number, url: pullRequest.url, over: view }, prBrowserOpened);
+      if (admitted.switchTo) setPrBrowserRequest(admitted.switchTo);
+      else setPrBrowser(admitted.show);
       return undefined;
     },
     /* Issue #2418 — a pull request or issue a card's agent reported, at the
@@ -891,13 +904,9 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       if (!card) return CARD_REFERENCE_GONE;
       const reference = (card.checked_refs ?? []).find((candidate) => candidate.kind === target.kind && openableReference(candidate) && candidate.number === target.number && candidate.url === target.url);
       if (!reference) return cardReferenceChanged(displayText(card.name, DISPLAY_LIMITS.name), target.kind === "issue" ? "issue" : "pull request");
-      const wanted = { deckId: target.deckId, agentId: card.agent_id, agentLabel: card.name, number: target.number, url: target.url, kind: target.kind, card: { instanceId: card.instance_id, key: card.key }, over: view };
-      if (prBrowser) {
-        if (prBrowserRequest || prBrowser.url !== wanted.url) setPrBrowserRequest({ ...wanted, opened: prBrowser.opened });
-      } else {
-        prBrowserOpened.current += 1;
-        setPrBrowser({ ...wanted, opened: prBrowserOpened.current });
-      }
+      const admitted = admitPrBrowser(prBrowser, prBrowserRequest, { deckId: target.deckId, agentId: card.agent_id, agentLabel: card.name, number: target.number, url: target.url, kind: target.kind, card: { instanceId: card.instance_id, key: card.key }, over: view }, prBrowserOpened);
+      if (admitted.switchTo) setPrBrowserRequest(admitted.switchTo);
+      else setPrBrowser(admitted.show);
       return undefined;
     },
     /* Closed only once the system browser has the page: a hand-off that
