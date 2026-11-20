@@ -6164,3 +6164,23 @@ mod tests {
         assert_eq!(dto.command.as_deref(), Some("brew upgrade dot-agent-deck"));
     }
 }
+
+/// PRD #1790 stage 2: one answer of a deck's interrupted work verbs
+/// (`interrupted_work_list`, `…_show`, `…_reclaim`, `…_dismiss`), as the
+/// webview reads it. `answered` carries the daemon's answer as the daemon
+/// sent it (`dot_agent_deck::interrupted_work`'s own shape, which the
+/// webview mirrors) and the daemon process it came from; `unsupported`
+/// means the deck's daemon does not advertise `interrupted-work`, or is no
+/// longer the process the webview named, and nothing was sent — the webview
+/// shows nothing for it, never an error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+#[cfg_attr(not(test), allow(dead_code))]
+pub enum InterruptedWorkReply<T> {
+    Answered {
+        /// The daemon process that answered: the one the request named.
+        instance: String,
+        answer: T,
+    },
+    Unsupported,
+}

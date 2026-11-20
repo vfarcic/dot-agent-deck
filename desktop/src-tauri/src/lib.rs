@@ -15,6 +15,7 @@ mod endpoint_tunnels;
 #[cfg(test)]
 mod features_lock;
 mod generation;
+mod interrupted_work;
 // The local deck's address, read in one place so the tests have one seam to move
 // it with instead of the process-wide environment variable (issue #1078).
 mod local_deck;
