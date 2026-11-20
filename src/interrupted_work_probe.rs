@@ -145,7 +145,8 @@ pub struct WorktreeFacts {
 }
 
 /// [`crate::worktree_owner::verified_geometry_of`] with its three `git`
-/// answers asked under `deadline`; `None` when any is not answered or the
+/// answers asked under `deadline`, and its filesystem checks waited for
+/// until `deadline` too; `None` when any is not answered in time or the
 /// checks fail.
 pub async fn worktree_facts(dir: &Path, deadline: Deadline) -> Option<WorktreeFacts> {
     let (toplevel, git_dir, common) = tokio::join!(
@@ -154,14 +155,21 @@ pub async fn worktree_facts(dir: &Path, deadline: Deadline) -> Option<WorktreeFa
         rev_parse(dir, "--git-common-dir", deadline),
     );
     let (toplevel, git_dir, common) = (toplevel?, git_dir?, common?);
-    tokio::task::spawn_blocking(move || {
+    // The checks read the filesystem on the blocking pool, each read bounded
+    // (the back-pointer at `MAX_BACK_POINTER_BYTES`). The deadline bounds
+    // the wait for them: past it the answer is `None`. That does not cancel
+    // the blocking task, which finishes its bounded reads on its own.
+    let wait = deadline.remaining()?;
+    let checks = tokio::task::spawn_blocking(move || {
         let geometry = crate::worktree_owner::verify_geometry(&toplevel, &git_dir, &common)?;
         let git_dir = std::fs::canonicalize(&git_dir).ok()?;
         Some(WorktreeFacts { geometry, git_dir })
-    })
-    .await
-    .ok()
-    .flatten()
+    });
+    tokio::time::timeout(wait, checks)
+        .await
+        .ok()?
+        .ok()
+        .flatten()
 }
 
 /// The branch checked out in `worktree`, or `None` when `HEAD` is detached

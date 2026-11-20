@@ -342,8 +342,9 @@ pub struct VerifiedGeometry {
 ///
 /// - its administrative directory sits in `<common>/worktrees/` (the
 ///   repository registered it — `git worktree list` reads exactly there);
-/// - that directory's `gitdir` back-pointer canonicalises to THIS worktree's
-///   `.git` file, which is a regular file;
+/// - that directory's `gitdir` back-pointer, a regular file read without
+///   following a symlink and only up to [`MAX_BACK_POINTER_BYTES`],
+///   canonicalises to THIS worktree's `.git` file, which is a regular file;
 /// - the main checkout (`<common>`'s parent) holds `<common>` as its `.git`
 ///   directory.
 ///
@@ -355,6 +356,54 @@ pub fn verified_geometry_of(dir: &Path) -> Option<VerifiedGeometry> {
         &rev_parse_path(dir, "--git-dir")?,
         &rev_parse_path(dir, "--git-common-dir")?,
     )
+}
+
+/// The most bytes a linked worktree's `gitdir` back-pointer is read for: a
+/// path as long as Linux's `PATH_MAX` (4096, its terminating NUL included)
+/// leaves room for its newline. A longer file is refused, not read whole.
+pub const MAX_BACK_POINTER_BYTES: usize = 4096;
+
+/// The `gitdir` back-pointer at `path`, read only from a regular file: it is
+/// opened without following a symlink and without blocking (a FIFO planted
+/// there would otherwise block the open), checked to be a regular file on
+/// the opened descriptor, and read for at most [`MAX_BACK_POINTER_BYTES`]
+/// plus one byte. `None` for anything else, or one longer than that bound
+/// (auditor N4).
+#[cfg(unix)]
+fn read_back_pointer(path: &Path) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_BACK_POINTER_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() <= MAX_BACK_POINTER_BYTES).then_some(bytes)
+}
+
+/// [`read_back_pointer`] off Unix: the path itself must be a regular file
+/// (not followed), checked before it is opened, and the read is bounded the
+/// same way.
+#[cfg(not(unix))]
+fn read_back_pointer(path: &Path) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+    if !std::fs::symlink_metadata(path).ok()?.is_file() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(MAX_BACK_POINTER_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() <= MAX_BACK_POINTER_BYTES).then_some(bytes)
 }
 
 /// The checks of [`verified_geometry_of`] on git's three answers
@@ -386,12 +435,7 @@ pub fn verify_geometry(toplevel: &Path, git_dir: &Path, common: &Path) -> Option
     if !std::fs::symlink_metadata(&dot_git).ok()?.is_file() {
         return None;
     }
-    // A regular file only: a FIFO planted there would block the read.
-    let gitdir_file = git_dir.join("gitdir");
-    if !std::fs::metadata(&gitdir_file).ok()?.is_file() {
-        return None;
-    }
-    let raw = std::fs::read(gitdir_file).ok()?;
+    let raw = read_back_pointer(&git_dir.join("gitdir"))?;
     let pointer = path_from_bytes(trim_trailing_newline(&raw));
     // `worktree.useRelativePaths` writes the back-pointer relative to the
     // administrative directory.
