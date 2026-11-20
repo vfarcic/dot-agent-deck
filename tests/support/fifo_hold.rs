@@ -1,13 +1,13 @@
 //! A command an agent runs that blocks until the test lets it go, with no
 //! signal from the test anywhere (PRD #1790 stage 2, verification R1/A1, R4,
-//! and verify-8 A2/A3).
+//! verify-8 A2/A3 and verify-9 A2a/A2b).
 //!
 //! [`FifoHold::create`] makes a FIFO at an absolute path inside the run's own
 //! test root and opens it for reading and writing. The agent is handed
 //! [`FifoHold::command`], `perl -e '<BOUND_SCRIPT>' <bound> cat '<path>'`
-//! ([`BOUND_SCRIPT`]). While the hold's
-//! endpoint is open, that `cat` opens the FIFO without waiting and then waits
-//! in its read, since a writer exists and nothing is written.
+//! ([`BOUND_SCRIPT`]). While the hold's endpoint is open, that `cat` opens
+//! the FIFO without waiting and then waits in its read, since a writer exists
+//! and nothing is written.
 //!
 //! Dropping the hold unlinks the path and then closes the endpoint. What
 //! happens to a reader then depends on where it is:
@@ -18,17 +18,30 @@
 //! - one that resolved the path before the unlink and reaches the FIFO's
 //!   open only after the close waits in that open for a writer that never
 //!   comes. Nothing the drop does can reach it, so the command itself carries
-//!   the bound: the `perl` it runs under ends it once `bound` has passed since
-//!   it started.
+//!   the bound.
+//!
+//! The bound lives in the reader itself. `perl` sets SIGALRM's disposition
+//! to the default, sets an alarm for `bound` seconds and then execs `cat` in
+//! its own process: no fork, no supervisor, no child. A pending alarm is kept
+//! across `execve` and a default disposition stays default (POSIX `alarm` and
+//! `exec`), so the `cat` itself receives SIGALRM once `bound` has passed and
+//! ends by the default action, with status 128 + SIGALRM (142 on Linux and
+//! macOS). Nothing forks, waits for or signals a process id, so there is no
+//! supervisor whose death drops the bound and no reaped pid an alarm could
+//! reach. The disposition reset is load-bearing: an agent shell that ignores
+//! SIGALRM would otherwise hand the `cat` an ignored alarm, which never ends
+//! it. Run on Linux; macOS is intended (POSIX behaviour, and a stock macOS
+//! ships `perl`) and has not been run. A SIGALRM *blocked* in the inherited
+//! mask is not undone, as it was not by the earlier supervisor.
 //!
 //! So every reader of the command ends within `bound` of starting, and almost
-//! always at the drop. The test signals no process; the bounding `perl` is
-//! part of the command the agent runs, and stops only its own child.
+//! always at the drop. The test signals no process.
 //! `fifo_hold_bounds_a_reader_that_opens_after_the_release` pins the third
-//! case and `fifo_hold_release_ends_its_reader_with_end_of_file` the first.
-//! The bound needs only `perl` on the agent's PATH, which a stock macOS and
-//! the Linux images here both ship; GNU `timeout`, which a stock macOS lacks,
-//! is not used.
+//! case (also under a parent that ignores SIGALRM) and
+//! `fifo_hold_release_ends_its_reader_with_end_of_file` the first, together
+//! with the `cat` running in the very process the command started (no
+//! `perl` left in `ps`). GNU `timeout`, which a stock macOS lacks, is not
+//! used.
 //!
 //! The endpoint is opened close-on-exec (the standard library's default), so
 //! no process the test spawns afterwards (a daemon, a TUI, the CLI) inherits a
@@ -55,18 +68,18 @@ pub fn shell_quote(word: &str) -> String {
 
 /// The Perl program that bounds the held `cat`, run as
 /// `perl -e BOUND_SCRIPT <secs> <program> <args>…`: a portable stand-in for
-/// GNU `timeout`. It forks, the child execs the program, and the parent waits
-/// for it. If `secs` pass first, its own alarm sends the child `SIGTERM`, reaps
-/// it and exits 124, as `timeout` does; otherwise it exits with the child's
-/// status (128 plus the signal for a child a signal ended), 127 when the
-/// program cannot be run and 125 when it cannot fork. Because it forks rather
-/// than execs, the `cat` runs as its child with this argv as its parent's,
-/// which is how [`FifoHold::bounded_by`] sees the bound is in place. It has no
-/// whitespace, so a whitespace split of `ps` output keeps it one word, and no
-/// `'`, so one pair of single quotes carries it through a shell.
-pub const BOUND_SCRIPT: &str = "$s=shift;defined($p=fork)||exit(125);$p||exec(@ARGV)||exit(127);\
-$SIG{ALRM}=sub{kill(\"TERM\",$p);waitpid($p,0);exit(124)};alarm($s);waitpid($p,0);\
-exit($?&127?128+($?&127):$?>>8)";
+/// GNU `timeout` that keeps no process of its own. It resets SIGALRM to its
+/// default disposition, sets an alarm for `secs` and execs the program in
+/// its own process, which then ends by SIGALRM (status 142) when `secs`
+/// pass; 127 when the program cannot be run. It has no whitespace, so a
+/// whitespace split of `ps` output keeps it one word, and no quote of either
+/// kind and no backtick, so one pair of single quotes carries it through a
+/// shell and it sits inside a Markdown code span
+/// (`fifo_hold_bound_script_needs_no_quoting`).
+pub const BOUND_SCRIPT: &str = "$SIG{ALRM}=q(DEFAULT);alarm(shift);exec(@ARGV);exit(127)";
+
+/// The status a shell reports for a command SIGALRM ended: 128 + SIGALRM.
+pub const ALARM_STATUS: i32 = 128 + libc::SIGALRM;
 
 /// The command that reads the FIFO at `path` until its writer goes, and in
 /// any case for no longer than `bound` (whole seconds, at least one).
@@ -80,6 +93,20 @@ pub fn held_command(path: &Path, bound: Duration) -> String {
         bound.as_secs().max(1),
         shell_quote(path)
     )
+}
+
+/// Whether `argv` is a POSIX-family shell: the program's file name, without
+/// a login shell's leading `-`, is `sh`, `bash`, `zsh`, `dash` or `ksh`. With
+/// the bound running in the `cat` itself, the process a held `cat` runs
+/// under is the shell that ran the command, which is what
+/// `journal/interrupted/028` checks of the agent's `cat`.
+pub fn is_shell(argv: &[String]) -> bool {
+    argv.first().is_some_and(|program| {
+        Path::new(program.trim_start_matches('-'))
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| matches!(n, "sh" | "bash" | "zsh" | "dash" | "ksh"))
+    })
 }
 
 /// A FIFO this run created and holds open; dropping it releases every reader.
@@ -149,27 +176,6 @@ impl FifoHold {
         argv.first()
             .is_some_and(|program| Path::new(program).file_name().is_some_and(|n| n == "cat"))
             && argv.iter().skip(1).any(|arg| Path::new(arg) == self.path)
-    }
-
-    /// Whether `argv` is the bounding `perl` of [`FifoHold::command`] with
-    /// `bound`: the process a held `cat` runs under when its bound is in
-    /// place. The program's file name is `perl`, or a versioned `perl5…` (a
-    /// stock macOS's `/usr/bin/perl` hands over to one), and it runs exactly
-    /// [`BOUND_SCRIPT`].
-    pub fn bounded_by(&self, argv: &[String], bound: Duration) -> bool {
-        match argv {
-            [program, flag, script, secs, reader @ ..] => {
-                Path::new(program)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n == "perl" || n.starts_with("perl5"))
-                    && flag == "-e"
-                    && script == BOUND_SCRIPT
-                    && *secs == bound.as_secs().max(1).to_string()
-                    && self.held_by(reader)
-            }
-            _ => false,
-        }
     }
 }
 
@@ -266,40 +272,57 @@ mod tests {
         assert!(!first.held_by(&argv(&["cat"])));
         assert!(!first.held_by(&[]));
 
-        let bound = Duration::from_secs(1200);
-        assert!(first.bounded_by(&perl("perl", "1200", &first_path), bound));
-        assert!(first.bounded_by(&perl("/usr/bin/perl", "1200", &first_path), bound));
+        // The shell a held `cat` runs under.
+        for shell in [
+            "sh",
+            "/bin/sh",
+            "bash",
+            "/usr/bin/bash",
+            "-bash",
+            "zsh",
+            "/bin/dash",
+            "ksh",
+        ] {
+            assert!(
+                is_shell(&argv(&[shell, "-c", "true"])),
+                "{shell} is a shell"
+            );
+        }
         assert!(
-            first.bounded_by(&perl("/usr/bin/perl5.34", "1200", &first_path), bound),
-            "a stock macOS's versioned perl is the bound too"
+            !is_shell(&perl("perl", "1200", &first_path)),
+            "the bounding `perl` is not a shell, and does not outlive its exec"
         );
-        assert!(second.bounded_by(&perl("perl", "1200", &second_path), bound));
-        assert!(
-            !first.bounded_by(&perl("perl", "60", &first_path), bound),
-            "another bound is not this command's"
-        );
-        assert!(
-            !first.bounded_by(&perl("perl", "1200", &second_path), bound),
-            "a bound on another run's FIFO is not this run's"
-        );
-        assert!(
-            !first.bounded_by(
-                &argv(&["perl", "-e", "exec@ARGV", "1200", "cat", &first_path]),
-                bound
-            ),
-            "another Perl program is not the bound"
-        );
-        assert!(
-            !first.bounded_by(&perl("python3", "1200", &first_path), bound),
-            "only `perl` runs the bound"
-        );
-        assert!(
-            !first.bounded_by(&argv(&["timeout", "1200", "cat", &first_path]), bound),
-            "GNU `timeout` is not this command's bound"
-        );
-        assert!(!first.bounded_by(&argv(&["cat", &first_path]), bound));
-        assert!(!first.bounded_by(&argv(&["perl", "-e", BOUND_SCRIPT, "1200"]), bound));
-        assert!(!first.bounded_by(&[], bound));
+        for other in [
+            "cat",
+            "node",
+            "claude",
+            "timeout",
+            "bashful",
+            "/opt/sh/node",
+        ] {
+            assert!(
+                !is_shell(&argv(&[other, "-c", "true"])),
+                "{other} is not a shell"
+            );
+        }
+        assert!(!is_shell(&[]));
+    }
+
+    /// The bound's Perl program has no whitespace, no quote of either kind
+    /// and no backtick, so `ps` keeps it one word, single quotes carry it
+    /// through a shell and it sits inside the task's Markdown code span; and
+    /// it holds no `fork`, `wait` or `kill`, so it keeps no process and
+    /// signals none.
+    #[test]
+    fn fifo_hold_bound_script_needs_no_quoting() {
+        assert!(!BOUND_SCRIPT.chars().any(char::is_whitespace));
+        for c in ['\'', '"', '`'] {
+            assert!(!BOUND_SCRIPT.contains(c), "{c} in {BOUND_SCRIPT}");
+        }
+        for word in ["fork", "wait", "kill"] {
+            assert!(!BOUND_SCRIPT.contains(word), "{word} in {BOUND_SCRIPT}");
+        }
+        assert_eq!(ALARM_STATUS, 142, "128 + SIGALRM on Linux and macOS");
     }
 
     /// Words with `$`, both quotes, `;`, a backslash, a backtick and an
@@ -333,7 +356,8 @@ mod tests {
     /// In a directory whose name has `$`, both quotes and `;`, the held
     /// command run by `sh` reads this FIFO (its echo of a line written to
     /// the hold proves the path arrived intact), shows in `ps` as a `cat` of
-    /// it whose parent is its bound, waits while the hold lives,
+    /// it in the process `sh` ran it in, with no `perl` of the bound left
+    /// (it execed the `cat`, keeping no supervisor), waits while the hold lives,
     /// and exits successfully, with no signal and well inside its bound, once
     /// the hold is dropped; the FIFO is gone afterwards.
     #[test]
@@ -378,21 +402,31 @@ mod tests {
             reader.try_wait().expect("poll the reader").is_none(),
             "the reader is still waiting while the hold lives"
         );
-        // As `ps` shows it, split on whitespace: one `cat` of this FIFO, run
-        // by the bounding `perl` with this bound.
+        // As `ps` shows it, split on whitespace: one `cat` of this FIFO, in
+        // the `sh` this test spawned or a child of it, and no `perl` of the
+        // bound anywhere: it set the alarm and became the `cat`.
         let all = processes();
         let held: Vec<_> = all
             .iter()
             .filter(|(_, _, argv)| hold.held_by(argv))
             .collect();
         assert_eq!(held.len(), 1, "one `cat` of this FIFO: {held:?}");
-        let parent = all
-            .iter()
-            .find(|(pid, _, _)| *pid == held[0].1)
-            .map(|(_, _, argv)| argv);
+        let (cat_pid, cat_parent, _) = held[0];
         assert!(
-            parent.is_some_and(|argv| hold.bounded_by(argv, Duration::from_secs(600))),
-            "the `cat` runs under its bound: its parent is {parent:?}"
+            *cat_pid == reader.id() || *cat_parent == reader.id(),
+            "the `cat` is the spawned `sh` (pid {}) or its child: {held:?}",
+            reader.id()
+        );
+        let path_word = path.to_string_lossy().into_owned();
+        let supervisors: Vec<_> = all
+            .iter()
+            .filter(|(_, _, argv)| {
+                argv.iter().any(|w| w == BOUND_SCRIPT) && argv.contains(&path_word)
+            })
+            .collect();
+        assert!(
+            supervisors.is_empty(),
+            "no process still runs the bound's Perl program for this FIFO: {supervisors:?}"
         );
 
         drop(hold);
@@ -411,9 +445,12 @@ mod tests {
     /// The opener the drop cannot reach: a reader that resolved the FIFO
     /// before the drop (here through a path-only descriptor it inherits) and
     /// opens it only after the drop, so no writer will ever come. The held
-    /// command still ends, by its own bound (status 124, which
-    /// also shows the open really waited rather than failing or reading
-    /// end-of-file), with no signal from the test.
+    /// command still ends, by its own bound: the `cat` itself receives the
+    /// alarm `perl` set before it execed the `cat`, and ends by SIGALRM
+    /// (status 142, which also shows the open really waited rather than
+    /// failing or reading end-of-file), with no signal from the test. The
+    /// same holds under a shell that ignores SIGALRM, since the bound resets
+    /// the disposition before its exec.
     #[cfg(target_os = "linux")]
     #[test]
     fn fifo_hold_bounds_a_reader_that_opens_after_the_release() {
@@ -436,29 +473,46 @@ mod tests {
 
         drop(hold);
         let bound = Duration::from_secs(2);
-        let started = std::time::Instant::now();
-        let mut reader = Command::new("sh")
-            .arg("-c")
-            .arg(held_command(
-                Path::new(&format!("/proc/self/fd/{fd}")),
-                bound,
-            ))
-            .spawn()
-            .expect("spawn the late reader");
+        let command = held_command(Path::new(&format!("/proc/self/fd/{fd}")), bound);
+        // As it is, and under a shell that ignores SIGALRM, which a process
+        // it starts inherits unless the bound resets it.
+        let readers: Vec<_> = [command.clone(), format!("trap '' ALRM; {command}")]
+            .into_iter()
+            .map(|script| {
+                let started = std::time::Instant::now();
+                let child = Command::new("sh")
+                    .arg("-c")
+                    .arg(&script)
+                    .spawn()
+                    .expect("spawn the late reader");
+                (script, started, child)
+            })
+            .collect();
         drop(resolved);
-        let status = exit_within(
-            &mut reader,
-            common::load_scaled(Duration::from_secs(30)),
-            "the reader that opened after the release",
-        );
-        assert_eq!(
-            status.code(),
-            Some(124),
-            "the late opener waited in its open and was ended by the command's bound: {status}"
-        );
-        assert!(
-            started.elapsed() >= bound,
-            "the reader ended by its bound, not before it"
-        );
+        for (script, started, mut reader) in readers {
+            let status = exit_within(
+                &mut reader,
+                common::load_scaled(Duration::from_secs(30)),
+                "the reader that opened after the release",
+            );
+            assert!(
+                ended_by_alarm(status),
+                "the late opener of `{script}` waited in its open and was ended by the alarm it \
+                 carried (status {ALARM_STATUS}): {status}"
+            );
+            assert!(
+                started.elapsed() >= bound,
+                "the reader of `{script}` ended by its bound, not before it"
+            );
+        }
+    }
+
+    /// Whether `sh` ran a command SIGALRM ended: the shell reports
+    /// [`ALARM_STATUS`], or, when it execed the command, is itself ended by
+    /// SIGALRM.
+    #[cfg(target_os = "linux")]
+    fn ended_by_alarm(status: ExitStatus) -> bool {
+        use std::os::unix::process::ExitStatusExt;
+        status.code() == Some(ALARM_STATUS) || status.signal() == Some(libc::SIGALRM)
     }
 }

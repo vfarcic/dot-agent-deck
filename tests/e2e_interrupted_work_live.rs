@@ -37,10 +37,20 @@
 //! unit reported nothing. Elapsed time proves neither. Nothing in the test
 //! signals the held command: dropping the hold closes the FIFO's last writer,
 //! so a `cat` the restart left running reads end-of-file and exits, and the
-//! command runs under a bound ([`HOLD_BOUND`], kept by a `perl` alarm that a
-//! stock macOS and Linux both have), so a `cat` that reaches the FIFO's open
-//! only after that close exits by itself too. The FIFO's path and
-//! the hold's directory reach the agent's shell as single-quoted words.
+//! command carries a bound ([`HOLD_BOUND`]): `perl` sets an alarm and execs
+//! the `cat`, which keeps the alarm across the exec and ends by SIGALRM when
+//! it fires, so a `cat` that reaches the FIFO's open only after that close
+//! exits by itself too, with no supervisor process to lose. Linux is run;
+//! macOS is intended and not yet run. The FIFO's path and the hold's
+//! directory reach the agent's shell as single-quoted words.
+//!
+//! What the test checks of the bound is that the task it dispatched carries
+//! the bounded command and that each held `cat` runs under the agent's own
+//! shell among the daemon's descendants, not under anything the test
+//! started. A pending alarm is not visible from outside the process, so the
+//! test does not read the alarm itself and does not prove the agent kept the
+//! command's `perl` prefix (a bare `cat` the agent ran would pass the same
+//! check); `support/fifo_hold.rs` pins that the command's `cat` ends by it.
 //!
 //! Cost: one short Haiku turn (one Bash command). Lane 2: it reaches a real
 //! agent, so it runs on a developer's machine and never in CI.
@@ -326,6 +336,16 @@ fn interrupted_028_a_real_agents_unit_is_listed_and_reclaimed_after_a_restart() 
     // work is interrupted, not done. The command is on a line of its own, so
     // no word of the prose after it can be read as one of its arguments.
     let held_command = hold.command(HOLD_BOUND);
+    // The bound is part of what the agent is told to run: `perl` with the
+    // bound's program and this bound, execing the `cat` of this run's FIFO.
+    assert!(
+        held_command.starts_with(&format!(
+            "perl -e {} {} cat ",
+            hold::shell_quote(hold::BOUND_SCRIPT),
+            HOLD_BOUND.as_secs()
+        )),
+        "the held command carries its bound: {held_command}"
+    );
     let task = format!(
         "Use the Bash tool to run exactly this one command now, in the foreground, as one \
          command, and wait for it:\n\n\
@@ -339,6 +359,10 @@ fn interrupted_028_a_real_agents_unit_is_listed_and_reclaimed_after_a_restart() 
     let agent_command = format!(
         "claude --ax-screen-reader --model {HAIKU_MODEL} --add-dir {} --allowedTools Bash Read Write",
         hold::shell_quote(hold_dir.to_str().expect("the hold's directory is UTF-8"))
+    );
+    assert!(
+        task.contains(&format!("&& {held_command}`")),
+        "the dispatched task carries the bounded command: {task}"
     );
     route::cli(
         &live,
@@ -445,14 +469,14 @@ fn interrupted_028_a_real_agents_unit_is_listed_and_reclaimed_after_a_restart() 
     for (pid, argv) in &held {
         let parent = parent_argv(*pid);
         eprintln!("held: pid {pid} runs {argv:?} under {parent:?}");
-        // The agent ran the command as given, bound included, so this `cat`
-        // ends by itself even if it never sees the hold's release.
+        // The command the agent was handed carries the bound (above), and
+        // this `cat` runs under the agent's own shell among the daemon's
+        // descendants, not under anything the test started. That does not
+        // prove the agent kept the `perl` prefix, whose alarm is not visible
+        // from outside the `cat`: a bare `cat` the agent ran would pass too.
         assert!(
-            parent
-                .as_deref()
-                .is_some_and(|parent| hold.bounded_by(parent, HOLD_BOUND)),
-            "the held `cat` (pid {pid}) does not run under its {}s bound (`perl -e` of `hold::BOUND_SCRIPT`): its parent is {parent:?}.\nThe agent's pane:\n{}",
-            HOLD_BOUND.as_secs(),
+            parent.as_deref().is_some_and(hold::is_shell),
+            "the held `cat` (pid {pid}) does not run under the agent's shell: its parent is {parent:?}.\nThe agent's pane:\n{}",
             pane_screen(&live, &unit_agent)
         );
     }
