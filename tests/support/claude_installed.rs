@@ -135,7 +135,13 @@ impl Installed {
             .with_env("DOT_AGENT_DECK_INBOX_WAKE_STALL_AFTER_MS", "2000")
             .with_continue_session(PANE, command)
             .launch_with_fixture("minimal");
-        deck.wait_for_string(PANE);
+        // Issue #2421: on a starved box the restored session's name reached
+        // the card after the fixed 30 s window; this takes the scaled budget.
+        assert!(
+            deck.wait_for_grid_string_within(PANE, budget()),
+            "the restored session must show its name {PANE:?}: {}",
+            deck.snapshot_grid()
+        );
         let record = std::cell::RefCell::new(Value::Null);
         assert!(
             common::wait_until(budget(), || {

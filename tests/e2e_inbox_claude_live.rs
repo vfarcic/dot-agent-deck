@@ -638,8 +638,10 @@ fn claude_053_live_a_blocked_doorbell_prompt_is_not_acknowledged_and_is_handed_o
         "the doorbell must ring and the project hook block its prompt; {}",
         claude.evidence()
     );
+    // The daemon logs the ring as it settles, which can land after the
+    // project hook wrote its marker on a starved box (issue #2133's runs).
     assert!(
-        claude.log().contains("doorbell rang"),
+        common::wait_until(budget(), || claude.log().contains("doorbell rang")),
         "{}",
         claude.evidence()
     );
@@ -1328,7 +1330,6 @@ fn blank_row(frame: &(Option<String>, (u16, u16))) -> bool {
 #[spec("inbox/doorbell/010")]
 #[test]
 #[cfg(target_os = "linux")]
-#[ignore = "quarantined: vfarcic, #2421"]
 fn doorbell_010_live_spaces_only_draft_stays_held() {
     skip_unless!(installed::checkable());
     let claude = fallback_ready_with(Claude::installed(), "spaces");
