@@ -19,6 +19,78 @@ pub use unix::{SpawnLock, acquire_spawn_lock};
 #[cfg(windows)]
 pub use windows::{SpawnLock, acquire_spawn_lock};
 
+/// Why [`acquire_spawn_lock_within`] gave up without the lock.
+#[derive(Debug)]
+pub enum LockWaitError {
+    /// Another holder kept it for the whole wait.
+    Busy,
+    /// It could not be taken for another reason: the lock file could not be
+    /// opened or created (a directory at its path, say), or locking it failed.
+    Failed(std::io::Error),
+}
+
+impl std::fmt::Display for LockWaitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LockWaitError::Busy => f.write_str("another holder kept the lock for the whole wait"),
+            LockWaitError::Failed(error) => error.fmt(f),
+        }
+    }
+}
+
+/// Shortest and longest pause between two attempts of
+/// [`acquire_spawn_lock_within`]; the pause doubles from the first to the
+/// second.
+const LOCK_RETRY_FIRST_PAUSE: std::time::Duration = std::time::Duration::from_millis(10);
+const LOCK_RETRY_LONGEST_PAUSE: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// [`acquire_spawn_lock`], waiting at most `wait` for another holder to let
+/// go, and telling a holder that kept it ([`LockWaitError::Busy`]) from a lock
+/// that could not be taken at all ([`LockWaitError::Failed`]).
+///
+/// On Unix it tries without waiting ([`unix::try_acquire_spawn_lock`], each
+/// attempt a short blocking-pool job that returns at once) and sleeps
+/// between attempts, so giving up leaves nothing waiting for the lock. That
+/// is the point of it: [`acquire_spawn_lock`] under a `tokio::time::timeout`
+/// stops the caller waiting but leaves its blocking `flock` holding a
+/// blocking-pool thread until the holder lets go. Off Unix it is that
+/// timeout over [`acquire_spawn_lock`], whose owner thread is left waiting
+/// for the mutex when the wait runs out.
+pub async fn acquire_spawn_lock_within(
+    path: &Path,
+    wait: std::time::Duration,
+) -> Result<SpawnLock, LockWaitError> {
+    #[cfg(unix)]
+    {
+        let deadline = tokio::time::Instant::now() + wait;
+        let mut pause = LOCK_RETRY_FIRST_PAUSE;
+        loop {
+            let attempt = path.to_path_buf();
+            match tokio::task::spawn_blocking(move || unix::try_acquire_spawn_lock(&attempt)).await
+            {
+                Ok(Ok(Some(lock))) => return Ok(lock),
+                Ok(Ok(None)) => {}
+                Ok(Err(error)) => return Err(LockWaitError::Failed(error)),
+                Err(join) => return Err(LockWaitError::Failed(std::io::Error::other(join))),
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(LockWaitError::Busy);
+            }
+            tokio::time::sleep(pause.min(deadline - now)).await;
+            pause = (pause * 2).min(LOCK_RETRY_LONGEST_PAUSE);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        match tokio::time::timeout(wait, acquire_spawn_lock(path)).await {
+            Ok(Ok(lock)) => Ok(lock),
+            Ok(Err(error)) => Err(LockWaitError::Failed(error)),
+            Err(_) => Err(LockWaitError::Busy),
+        }
+    }
+}
+
 /// Take an exclusive lock on an open file without waiting (PRD #1666 design
 /// §3): `Ok(true)` when this handle now holds it, `Ok(false)` when another
 /// handle does. A wrapper over std's `File::try_lock`, which the inbox's spill
@@ -239,5 +311,66 @@ mod tests {
         // Pinned digest: a change here means older and newer builds would stop
         // agreeing on the mutex name (CLAUDE.md rule 12).
         assert_eq!(fnv1a64(b"dot-agent-deck"), 0x7e10_96f6_8933_bf16);
+    }
+
+    /// Auditor N5 / reviewer P2: a bounded wait that runs out leaves nothing
+    /// waiting for the lock. On a runtime with ONE blocking thread, with the
+    /// lock held by another open file description throughout, three bounded
+    /// waits each give up as `Busy`, and a blocking job queued after them
+    /// still runs; a directory at the lock's path is `Failed`, not `Busy`;
+    /// once the holder lets go the lock is taken. Unix only: off Unix the
+    /// wait is a timeout over the named mutex's owner thread.
+    #[cfg(unix)]
+    #[test]
+    fn a_bounded_wait_that_runs_out_leaves_no_waiter_and_tells_busy_from_failed() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("worktree.lock");
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
+        held.lock().unwrap();
+        let blocked_dir = dir.path().join("a-directory.lock");
+        std::fs::create_dir(&blocked_dir).unwrap();
+        let (busy, heartbeat, failed) = rt.block_on(async {
+            let mut busy = Vec::new();
+            for _ in 0..3 {
+                let wait = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    acquire_spawn_lock_within(&path, Duration::from_millis(50)),
+                )
+                .await;
+                busy.push(matches!(wait, Ok(Err(LockWaitError::Busy))));
+            }
+            let heartbeat =
+                tokio::time::timeout(Duration::from_secs(5), tokio::task::spawn_blocking(|| 7))
+                    .await
+                    .ok()
+                    .and_then(Result::ok);
+            let failed = tokio::time::timeout(
+                Duration::from_secs(5),
+                acquire_spawn_lock_within(&blocked_dir, Duration::from_secs(2)),
+            )
+            .await;
+            let failed = matches!(failed, Ok(Err(LockWaitError::Failed(_))));
+            (busy, heartbeat, failed)
+        });
+        // Released before asserting, so a failure cannot leave the runtime
+        // waiting on a blocked `flock` at shutdown.
+        drop(held);
+        let taken = rt.block_on(acquire_spawn_lock_within(&path, Duration::from_secs(5)));
+        rt.shutdown_timeout(Duration::from_secs(10));
+        assert_eq!(busy, vec![true; 3]);
+        assert_eq!(heartbeat, Some(7), "a blocking job queued after them runs");
+        assert!(failed, "a lock file that cannot be opened is Failed, not Busy");
+        assert!(taken.is_ok(), "{:?}", taken.err());
     }
 }

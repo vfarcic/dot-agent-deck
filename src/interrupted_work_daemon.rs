@@ -57,8 +57,13 @@
 //! spawn reserved after the hold into an alias of the worktree is refused by
 //! it, since a spawn whose directory resolves records its canonical spelling
 //! too. It then takes the per-repository worktree lock, waiting at most
-//! [`RECLAIM_LOCK_WAIT`]; when it cannot be taken nothing is removed
-//! ([`ReclaimVerdict::KeptBusy`]). That is the lock the deck takes to create
+//! [`RECLAIM_LOCK_WAIT`] for another holder to let go; when it cannot be
+//! taken nothing is removed: [`ReclaimVerdict::KeptBusy`] when a holder kept
+//! it for the whole wait, [`ReclaimVerdict::KeptCouldNotLock`] when it could
+//! not be taken for another reason (its path not resolved, its file not
+//! opened or locked). The wait tries the lock without blocking and sleeps
+//! between tries, so a reclaim that gives up leaves nothing waiting for the
+//! lock ([`crate::platform::lock::acquire_spawn_lock_within`]). That is the lock the deck takes to create
 //! a dispatch's worktree ([`crate::issue_dispatch_run::create_worktree`],
 //! which goes on without it after waiting 60 seconds) and to remove a
 //! worktree a spawn abandoned; removing a dispatched worktree when its agent
@@ -123,7 +128,9 @@ use crate::interrupted_work::{
     still_interrupted,
 };
 use crate::interrupted_work_probe::{self as probe, Deadline};
-use crate::issue_dispatch_run::{RemovalGuard, RemovalPolicy, TreeKeepCheck, WorktreeRemoval};
+use crate::issue_dispatch_run::{
+    RemovalGuard, RemovalPolicy, TreeKeepCheck, WorktreeLockUnavailable, WorktreeRemoval,
+};
 use crate::launch_records::LaunchRead;
 use crate::retained_store::{KeptReport, KeptReports, RetainedStore};
 use crate::work_journal::{CloseHow, Event, JournalRead, WorkId, WorkJournal};
@@ -750,11 +757,18 @@ async fn reclaim_with(
             // the re-validation and the removal, so the deck's own worktree
             // creation and removal in this repository wait for it. Without
             // it nothing is removed.
-            let Some(_repo_lock) =
-                crate::issue_dispatch_run::acquire_worktree_lock_within(&clone, lock_wait).await
-            else {
-                return Removal::done(ReclaimVerdict::KeptBusy);
-            };
+            let _repo_lock =
+                match crate::issue_dispatch_run::acquire_worktree_lock_within(&clone, lock_wait)
+                    .await
+                {
+                    Ok(lock) => lock,
+                    Err(WorktreeLockUnavailable::Busy) => {
+                        return Removal::done(ReclaimVerdict::KeptBusy);
+                    }
+                    Err(WorktreeLockUnavailable::Failed) => {
+                        return Removal::done(ReclaimVerdict::KeptCouldNotLock);
+                    }
+                };
             let removal = crate::issue_dispatch_run::remove_worktree_outcome_guarded(
                 &worktree,
                 &clone,

@@ -669,6 +669,24 @@ pub fn display_value(value: &str) -> String {
     out
 }
 
+/// A report body made safe to print as a block of lines: its newlines and
+/// tabs kept as its layout (a `\r\n` read as a newline), and every other
+/// control character and the bidi controls escaped as [`display_value`]
+/// escapes them; not cut. The daemon frames a body before sending it, and
+/// this does not trust that it did.
+pub fn display_block(body: &str) -> String {
+    body.replace("\r\n", "\n")
+        .split('\n')
+        .map(|line| {
+            line.split('\t')
+                .map(crate::untrusted_text::escape_control_and_bidi)
+                .collect::<Vec<_>>()
+                .join("\t")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// The word for an item's kind.
 pub fn kind_label(kind: ItemKind) -> &'static str {
     match kind {

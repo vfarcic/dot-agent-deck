@@ -306,8 +306,11 @@ pub fn render_show(show: &InterruptedShow) -> String {
                     out.push_str(&format!("{}\n", words::REPORT_CUT));
                 }
                 // The daemon framed it as untrusted text; it is printed as
-                // framed, ending on its own closing marker.
-                out.push_str(body);
+                // framed, ending on its own closing marker, its lines and
+                // tabs kept and any other control or bidi character escaped
+                // (a malformed reply's included).
+                let body = words::display_block(body);
+                out.push_str(&body);
                 if !body.ends_with('\n') {
                     out.push('\n');
                 }
@@ -524,7 +527,7 @@ pub fn render_dismiss(outcome: &DismissOutcome) -> CliOutput {
     }
     let mut stdout = String::new();
     for item in &outcome.dismissed {
-        stdout.push_str(&format!("{} {}", words::DISMISSED, item.id));
+        stdout.push_str(&format!("{} {}", words::DISMISSED, shown(&item.id)));
         if let Some(name) = &item.name {
             stdout.push_str(&format!("  {}", shown(name)));
         }

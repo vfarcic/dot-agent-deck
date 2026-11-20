@@ -2753,16 +2753,16 @@ pub(crate) async fn worktree_lock_path(clone_dir: &Path) -> Option<PathBuf> {
 /// Serialization also does not make the retry redundant, and vice versa: this
 /// only binds processes that take the lock, so an add started by the user or by
 /// another tool still races us, and only the retry survives that.
+///
+/// The wait is [`crate::platform::lock::acquire_spawn_lock_within`]'s, so a
+/// wait that runs out leaves no blocking `flock` behind in the runtime's
+/// blocking pool.
 async fn acquire_worktree_lock(clone_dir: &Path) -> Option<crate::platform::lock::SpawnLock> {
+    use crate::platform::lock::LockWaitError;
     let path = worktree_lock_path(clone_dir).await?;
-    match tokio::time::timeout(
-        WORKTREE_LOCK_WAIT,
-        crate::platform::lock::acquire_spawn_lock(&path),
-    )
-    .await
-    {
-        Ok(Ok(guard)) => Some(guard),
-        Ok(Err(e)) => {
+    match crate::platform::lock::acquire_spawn_lock_within(&path, WORKTREE_LOCK_WAIT).await {
+        Ok(guard) => Some(guard),
+        Err(LockWaitError::Failed(e)) => {
             tracing::warn!(
                 lock = %path.display(),
                 error = %e,
@@ -2771,7 +2771,7 @@ async fn acquire_worktree_lock(clone_dir: &Path) -> Option<crate::platform::lock
             );
             None
         }
-        Err(_) => {
+        Err(LockWaitError::Busy) => {
             tracing::warn!(
                 lock = %path.display(),
                 waited_secs = WORKTREE_LOCK_WAIT.as_secs(),
@@ -2783,32 +2783,47 @@ async fn acquire_worktree_lock(clone_dir: &Path) -> Option<crate::platform::lock
     }
 }
 
+/// Why [`acquire_worktree_lock_within`] gave up without the lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorktreeLockUnavailable {
+    /// Another holder kept it for the whole wait.
+    Busy,
+    /// It could not be taken for another reason: the lock's path could not
+    /// be resolved, or its file could not be opened or locked.
+    Failed,
+}
+
 /// PRD #1790 stage 2: the per-repository worktree lock of `clone_dir`
 /// ([`worktree_lock_path`]), the one [`create_worktree`] takes, waiting at
-/// most `wait` for it. Unlike [`acquire_worktree_lock`], whose callers go on
-/// unserialized without it, `None` here is for a caller that must not go on:
-/// the reclaim of an interrupted item removes nothing without it.
+/// most `wait` for another holder to let go
+/// ([`crate::platform::lock::acquire_spawn_lock_within`], which leaves
+/// nothing waiting for the lock once it gives up). Unlike
+/// [`acquire_worktree_lock`], whose callers go on unserialized without it,
+/// an `Err` here is for a caller that must not go on: the reclaim of an
+/// interrupted item removes nothing without it, and says which of the two
+/// reasons kept it.
 pub(crate) async fn acquire_worktree_lock_within(
     clone_dir: &Path,
     wait: Duration,
-) -> Option<crate::platform::lock::SpawnLock> {
+) -> Result<crate::platform::lock::SpawnLock, WorktreeLockUnavailable> {
+    use crate::platform::lock::LockWaitError;
     let Some(path) = worktree_lock_path(clone_dir).await else {
         tracing::warn!("the repository's worktree lock path could not be resolved");
-        return None;
+        return Err(WorktreeLockUnavailable::Failed);
     };
-    match tokio::time::timeout(wait, crate::platform::lock::acquire_spawn_lock(&path)).await {
-        Ok(Ok(guard)) => Some(guard),
-        Ok(Err(e)) => {
+    match crate::platform::lock::acquire_spawn_lock_within(&path, wait).await {
+        Ok(guard) => Ok(guard),
+        Err(LockWaitError::Failed(e)) => {
             tracing::warn!(lock = %path.display(), error = %e, "could not take the repository's worktree lock");
-            None
+            Err(WorktreeLockUnavailable::Failed)
         }
-        Err(_) => {
+        Err(LockWaitError::Busy) => {
             tracing::warn!(
                 lock = %path.display(),
                 waited_ms = wait.as_millis() as u64,
                 "timed out waiting for the repository's worktree lock"
             );
-            None
+            Err(WorktreeLockUnavailable::Busy)
         }
     }
 }
