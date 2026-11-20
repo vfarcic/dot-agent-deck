@@ -383,14 +383,16 @@ impl Receipts {
     }
 
     /// Issue #2133: until when a once-waiter registered at `registered` is
-    /// handed nothing, if it is held: it was armed before `key`'s latest turn
-    /// started. Claude Code takes a wake that lands mid-turn into the running
-    /// turn as a queued command: no prompt hook runs for it, so nothing can
-    /// confirm it (measured on 2.1.328 and 2.1.329), and the model may finish
-    /// the turn it was on without acting on it. A waiter armed before the
-    /// turn that exits as the turn ends did not wake Claude in three of five
-    /// runs either. So the batch is left to the waiter Claude's `Stop` hook
-    /// arms when the turn ends, which supersedes this one.
+    /// handed nothing, if it is held: `key`'s latest turn is still running,
+    /// or the waiter was armed before that turn ended. Claude Code takes a
+    /// wake that lands mid-turn into the running turn as a queued command: no
+    /// prompt hook runs for it, so nothing can confirm it (measured on 2.1.328
+    /// and 2.1.329), and the model may finish the turn it was on without
+    /// acting on it. A waiter armed before the turn that exits as the turn
+    /// ends did not wake Claude in three of five runs either. So the batch is
+    /// left to the waiter Claude's `Stop` hook arms when the turn ends, which
+    /// supersedes this one. A waiter armed during the turn, by the
+    /// `SessionStart` of a compaction for one, is held the same way.
     ///
     /// The hold ends at the earlier of one ack-wait from the turn's start,
     /// for a turn whose end the deck never sees, and [`STOP_ARM_GRACE`] after
@@ -399,14 +401,12 @@ impl Receipts {
     pub(super) fn once_hold_until(&self, key: &AgentKey, registered: Instant) -> Option<Instant> {
         let clock = self.turns.get(key)?;
         let started = clock.started_at?;
-        if registered >= started {
-            return None;
-        }
         let cap = started + self.limits.ack_wait;
-        let ended = clock
-            .idle_since
-            .filter(|ended| !clock.busy && *ended >= started);
-        Some(ended.map_or(cap, |ended| (ended + STOP_ARM_GRACE).min(cap)))
+        if clock.busy {
+            return Some(cap);
+        }
+        let ended = clock.idle_since.filter(|ended| *ended >= started)?;
+        (registered < ended).then(|| (ended + STOP_ARM_GRACE).min(cap))
     }
 
     /// The generation's floor blocks delivery (§11).
