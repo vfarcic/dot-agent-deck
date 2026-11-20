@@ -260,6 +260,7 @@ fn dismiss_reports_each_item_and_exits_one_when_any_was_refused() {
         incomplete: false,
         dismissed_omitted: 0,
         refused_omitted: 0,
+        stopped: None,
     });
     assert_eq!(partly.code, EXIT_REFUSED);
     assert!(
@@ -427,6 +428,7 @@ fn a_capped_dismissal_report_counts_what_it_left_out() {
         incomplete: false,
         dismissed_omitted: 5,
         refused_omitted: 1,
+        stopped: None,
     };
     let out = render_dismiss(&outcome);
     assert!(

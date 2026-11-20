@@ -1113,6 +1113,26 @@ mod tests {
         assert!(refused.message.contains("restarted"), "{}", refused.message);
     }
 
+    /// Final review, reviewer 4: the refusal of a unit id a restarted daemon
+    /// issued says what was lost, the live unit registration, and points at
+    /// the interrupted work list, which the work journal survives to feed. It
+    /// does not claim that nothing the earlier daemon recorded is known.
+    #[test]
+    fn a_foreign_unit_refusal_names_only_the_lost_live_registration() {
+        let mut before = DispatchedUnits::with_epoch("aaaaaa");
+        let id = before.register(single("fix", "a", "p1", "1"));
+        let after = DispatchedUnits::with_epoch("bbbbbb");
+        let refused = after.resolve_id(&id).expect_err("foreign id");
+        assert_eq!(refused.reason, RefusalReason::UnknownUnit);
+        let message = &refused.message;
+        assert!(!message.contains("nothing it recorded"), "{message}");
+        assert!(message.contains("live unit registration"), "{message}");
+        assert!(
+            message.contains("`dot-agent-deck interrupted list`"),
+            "{message}"
+        );
+    }
+
     #[test]
     fn authorize_allows_the_dispatcher_and_refuses_everyone_else() {
         let mut units = DispatchedUnits::with_epoch("aaaaaa");

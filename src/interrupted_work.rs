@@ -471,6 +471,51 @@ pub struct DismissOutcome {
     /// Refusals left out of [`Self::refused`], past [`MAX_DISMISS_REPORTED`].
     #[serde(default, skip_serializing_if = "is_zero")]
     pub refused_omitted: usize,
+    /// Set by a client that sent the dismissal in batches
+    /// ([`dismiss_batches`]) when a batch after the first did not answer
+    /// with a dismissal: the rest were not sent. The daemon never sets it;
+    /// the desktop's bridge hands it to the webview with the outcome.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped: Option<DismissStopped>,
+}
+
+/// Why a dismissal sent in batches stopped before its last batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DismissStopReason {
+    /// The daemon process the batches were pinned to was replaced: a batch
+    /// was withheld, or another process answered.
+    Replaced,
+    /// The daemon refused a batch whole; [`DismissStopped::refusal`] says why.
+    Refused,
+    /// A batch got no answer: the daemon could not be reached, or did not
+    /// answer in time.
+    Failed,
+    #[serde(other)]
+    Unknown,
+}
+
+/// A dismissal sent in batches that stopped before its last batch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DismissStopped {
+    pub reason: DismissStopReason,
+    /// The refusal, for [`DismissStopReason::Refused`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<RefusalReason>,
+    /// How many of the confirmed ids were not dismissed by it: the stopped
+    /// batch's and every later one's.
+    pub not_sent: usize,
+}
+
+/// The confirmed `ids` of a dismissal split into the selectors the daemon
+/// admits, in order: each batch names at most
+/// [`crate::close_agents::MAX_SELECTOR_ENTRIES`] ids, and at most
+/// [`crate::close_agents::MAX_SELECTOR_BYTES`] of them together. An id longer
+/// than [`crate::close_agents::MAX_SELECTOR_ENTRY_BYTES`] goes in a batch of
+/// its own, which the daemon refuses. Every id is in exactly one batch.
+pub fn dismiss_batches(ids: &[String]) -> Vec<Vec<String>> {
+    // RED stub: one batch, as before.
+    vec![ids.to_vec()]
 }
 
 /// The most entries each of a dismissal's [`DismissOutcome::dismissed`] and
@@ -478,6 +523,31 @@ pub struct DismissOutcome {
 pub const MAX_DISMISS_REPORTED: usize = 256;
 
 impl DismissOutcome {
+    /// Add `batch`, the answer to a later batch of the same dismissal: its
+    /// dismissed and refused entries, within [`MAX_DISMISS_REPORTED`] each,
+    /// the rest counted, and its incompleteness. A whole-batch refusal is not
+    /// added: the caller stops there and records it in [`Self::stopped`].
+    pub fn absorb(&mut self, batch: DismissOutcome) {
+        self.incomplete |= batch.incomplete;
+        self.dismissed_omitted += batch.dismissed_omitted;
+        self.refused_omitted += batch.refused_omitted;
+        for item in batch.dismissed {
+            self.push_dismissed(item);
+        }
+        for refused in batch.refused {
+            if self.refused.len() < MAX_DISMISS_REPORTED {
+                self.refused.push(refused);
+            } else {
+                self.refused_omitted += 1;
+            }
+        }
+    }
+
+    /// How many items it dismissed, named and counted.
+    pub fn dismissed_count(&self) -> usize {
+        self.dismissed.len() + self.dismissed_omitted
+    }
+
     /// Record `item` as dismissed, within [`MAX_DISMISS_REPORTED`], its name
     /// cut to [`MAX_FIELD_BYTES`] as every display string a reply carries
     /// is (a launch record's name can be far longer).
@@ -508,6 +578,7 @@ impl DismissOutcome {
             incomplete: self.incomplete,
             dismissed_omitted: self.dismissed_omitted + dismissed,
             refused_omitted: self.refused_omitted + refused,
+            stopped: self.stopped.clone(),
         });
         let mut keep = |sizes: &mut dyn Iterator<Item = usize>| {
             let mut kept = 0;
@@ -767,6 +838,27 @@ pub fn more_refused_sentence(count: usize) -> String {
         "1 more id was refused.".to_string()
     } else {
         format!("{count} more ids were refused.")
+    }
+}
+
+/// What a dismissal sent in batches says after its outcome when it stopped
+/// before its last batch ([`DismissOutcome::stopped`]).
+pub fn dismiss_stopped_sentence(stopped: &DismissStopped) -> String {
+    let lead = if stopped.not_sent == 1 {
+        "1 more item was not dismissed".to_string()
+    } else {
+        format!("{} more items were not dismissed", stopped.not_sent)
+    };
+    match stopped.reason {
+        DismissStopReason::Replaced => {
+            format!("{lead}: the deck daemon was replaced. List the interrupted work again.")
+        }
+        DismissStopReason::Failed => format!("{lead}: the deck daemon did not answer."),
+        DismissStopReason::Refused => format!(
+            "{lead}. {}",
+            refusal_sentence(stopped.refusal.unwrap_or(RefusalReason::Unknown))
+        ),
+        DismissStopReason::Unknown => format!("{lead}."),
     }
 }
 

@@ -1077,6 +1077,37 @@ mod seams {
             .insert(worktree.to_path_buf(), Box::new(hook));
     }
 
+    static KEEP_CHECK: LazyLock<Mutex<HashMap<PathBuf, (PathBuf, std::time::Duration)>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    /// Until [`disarm_keep_check`], run the keep check's `git status` and
+    /// `git worktree list` for the reclaim of `worktree` (canonical) as
+    /// `program`, bounded by `deadline` from the check's start rather than
+    /// [`super::RECLAIM_CHECK_TIMEOUT`].
+    pub(super) fn arm_keep_check(worktree: &Path, program: PathBuf, deadline: std::time::Duration) {
+        KEEP_CHECK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(worktree.to_path_buf(), (program, deadline));
+    }
+
+    pub(super) fn disarm_keep_check(worktree: &Path) {
+        KEEP_CHECK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(worktree);
+    }
+
+    /// The program and deadline armed for `worktree`'s keep check.
+    #[allow(dead_code)]
+    pub(super) fn keep_check(worktree: &Path) -> Option<(PathBuf, std::time::Duration)> {
+        KEEP_CHECK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(worktree)
+            .cloned()
+    }
+
     pub(super) fn before_revalidate(worktree: &Path) {
         if let Some(hook) = take(&BEFORE_REVALIDATE, worktree) {
             hook();

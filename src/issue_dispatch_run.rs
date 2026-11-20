@@ -5732,6 +5732,69 @@ mod tests {
         assert!(!unit.exists());
     }
 
+    /// Final review of PRD #1790 stage 2, auditor 1: close's cleanup asks
+    /// the same keep check as a reclaim. A unit worktree holding, under its
+    /// git-ignored `.worktrees/`, a linked worktree of an INDEPENDENT
+    /// repository with an unsaved file reads clean to `git status`, and its
+    /// own repository's `git worktree list` does not know the nested one. The
+    /// `KeepIfDirty` removal keeps it and names the nested worktree, the
+    /// close preview warns of it, and the unsaved file survives.
+    #[tokio::test]
+    async fn a_worktree_holding_another_repositorys_worktree_is_kept_and_names_it() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let (repo, unit, own_nested) = init_unit_with_nested_worktree(tmp.path());
+        let out = crate::git_env::fixture_git(&repo, tmp.path())
+            .args([
+                "worktree",
+                "remove",
+                "--force",
+                &own_nested.to_string_lossy(),
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let other = tmp.path().join("other-repo");
+        let child = unit.join(".worktrees").join("other-child");
+        init_repo_with_worktree(tmp.path(), &other, &child);
+        std::fs::write(child.join("unsaved.txt"), "keep me").unwrap();
+        assert_eq!(
+            worktree_is_dirty(&unit).await,
+            Ok(false),
+            "the premise: `git status` cannot see the nested worktree"
+        );
+        assert_eq!(
+            nested_worktrees(&unit, &repo).await,
+            Ok(vec![]),
+            "the premise: the unit's repository does not list it"
+        );
+        let shown = vec![child.to_string_lossy().into_owned()];
+        assert_eq!(
+            worktree_keep_check(&unit, &repo).await,
+            Ok(TreeKeepCheck::HoldsWorktrees(shown.clone()))
+        );
+        let reg = new_worktree_registry();
+        record_worktree(&reg, &unit, &repo, RemovalPolicy::KeepIfDirty);
+        let kept = kept_worktree_preview(
+            &[pane_in("pane-1", &unit)],
+            &reg,
+            &["pane-1".to_string()],
+            PROBE,
+        )
+        .await
+        .expect("previewed as kept");
+        assert_eq!(kept.nested_worktrees, shown);
+        assert_eq!(
+            remove_worktree_outcome(&unit, &repo, RemovalPolicy::KeepIfDirty).await,
+            WorktreeRemoval::KeptHoldsWorktrees(shown)
+        );
+        assert_eq!(
+            std::fs::read_to_string(child.join("unsaved.txt"))
+                .ok()
+                .as_deref(),
+            Some("keep me")
+        );
+    }
+
     /// Issue #2285 (review on #2316): a unit that has uncommitted changes AND
     /// holds another worktree is reported as holding it, with its path, since
     /// `git worktree remove --force`, the usual way to discard the changes,

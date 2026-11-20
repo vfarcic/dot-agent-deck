@@ -1510,3 +1510,314 @@ fn a_report_page_past_the_end_up_to_usize_max_is_clamped() {
         assert_eq!(shown.next_reports_from, None);
     });
 }
+
+// ---------------------------------------------------------------------------
+// Final review: a nested worktree of another repository (auditor 1), Dismiss
+// all in batches against the real handler (reviewer 1 / auditor 2), and the
+// keep check's children bounded (auditor 3).
+// ---------------------------------------------------------------------------
+
+/// A second, independent repository at `<root>/repo-b` with one commit, and a
+/// linked worktree of it at `at` on branch `b-child`, holding an unsaved file
+/// `unsaved.txt`.
+fn foreign_worktree_at(root: &Path, at: &Path) {
+    let other = root.join("repo-b");
+    std::fs::create_dir_all(&other).unwrap();
+    git_in(&other, root, &["init", "-q", "."]);
+    crate::worktree_owner::pin_fixture_eol(&other, root);
+    std::fs::write(other.join("b.txt"), "b").unwrap();
+    git_in(&other, root, &["add", "."]);
+    git_in(&other, root, &["commit", "-qm", "b"]);
+    git_in(
+        &other,
+        root,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "b-child",
+            &at.to_string_lossy(),
+        ],
+    );
+    std::fs::write(at.join("unsaved.txt"), "keep me").unwrap();
+}
+
+/// Ignore `.worktrees/` in `repo` and every worktree of it.
+fn ignore_worktrees_dir(repo: &Path) {
+    let exclude = repo.join(".git").join("info").join("exclude");
+    std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+    let mut patterns = std::fs::read_to_string(&exclude).unwrap_or_default();
+    patterns.push_str("\n.worktrees/\n");
+    std::fs::write(&exclude, patterns).unwrap();
+}
+
+/// Auditor 1: the item's worktree, a linked worktree of repository A, holds
+/// under its git-ignored `.worktrees/` a linked worktree of an independent
+/// repository B with an unsaved file. A's `git status` is clean and A's
+/// `git worktree list` does not know B's worktree, so only a look at the
+/// directory finds it. The dry run and the real reclaim both keep the tree
+/// and name the nested one; both directories and the file survive, and no
+/// reclaimed close is written.
+#[test]
+fn reclaim_keeps_a_worktree_holding_another_repositorys_worktree() {
+    rt().block_on(async {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let root_dir = std::fs::canonicalize(tmp.path()).unwrap();
+        let (repo, wt) = repo_with_worktree(&root_dir);
+        mark(&wt);
+        ignore_worktrees_dir(&repo);
+        let child = wt.join(".worktrees").join("b-child");
+        foreign_worktree_at(&root_dir, &child);
+        let registry = registry_with_journal(&root_dir.join("state"), JournalOptions::default());
+        let (root, _) = unit(&registry, "agent/dispatch-x", Some(&wt));
+
+        for dry_run in [true, false] {
+            let outcome = reclaim(&registry, root.to_string(), dry_run, None).await;
+            assert_eq!(
+                outcome.verdict,
+                ReclaimVerdict::KeptHoldsWorktrees,
+                "dry_run={dry_run}: {outcome:?}"
+            );
+            assert!(
+                outcome
+                    .nested_worktrees
+                    .iter()
+                    .any(|nested| nested.ends_with(".worktrees/b-child")),
+                "dry_run={dry_run}: the child is named: {outcome:?}"
+            );
+            assert!(wt.is_dir() && child.is_dir(), "dry_run={dry_run}");
+            assert_eq!(
+                std::fs::read_to_string(child.join("unsaved.txt"))
+                    .ok()
+                    .as_deref(),
+                Some("keep me"),
+                "dry_run={dry_run}"
+            );
+            assert!(closes(&registry).is_empty(), "dry_run={dry_run}");
+        }
+    });
+}
+
+/// Auditor 1, the final removal guard: another repository's worktree appears
+/// under the item's worktree after the keep check, before the re-validation.
+/// The guard's own look finds it, so nothing is removed.
+#[test]
+fn reclaim_keeps_a_worktree_another_repository_nests_in_after_the_keep_check() {
+    rt().block_on(async {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let root_dir = std::fs::canonicalize(tmp.path()).unwrap();
+        let (repo, wt) = repo_with_worktree(&root_dir);
+        mark(&wt);
+        ignore_worktrees_dir(&repo);
+        let child = wt.join(".worktrees").join("b-child");
+        let registry = registry_with_journal(&root_dir.join("state"), JournalOptions::default());
+        let (root, _) = unit(&registry, "agent/dispatch-x", Some(&wt));
+        {
+            let (root_dir, child) = (root_dir.clone(), child.clone());
+            seams::arm_before_revalidate(&wt.clone(), move || {
+                foreign_worktree_at(&root_dir, &child);
+            });
+        }
+
+        let outcome = reclaim(&registry, root.to_string(), false, None).await;
+        assert_eq!(
+            outcome.verdict,
+            ReclaimVerdict::KeptHoldsWorktrees,
+            "{outcome:?}"
+        );
+        assert!(child.join("unsaved.txt").is_file());
+        assert!(wt.is_dir());
+        assert!(closes(&registry).is_empty());
+    });
+}
+
+/// Reviewer 1 / auditor 2, against the real handler and journal: 257
+/// interrupted items, one more than one dismissal may name. Split by the
+/// shared [`crate::interrupted_work::dismiss_batches`], as the TUI, the
+/// desktop and the CLI send them, every batch is admitted and dismisses its
+/// items; an item that became interrupted after the ids were captured stays
+/// listed.
+#[test]
+fn dismissing_more_items_than_one_request_admits_in_batches_dismisses_exactly_them() {
+    rt().block_on(async {
+        let state = crate::test_temp::tempdir().unwrap();
+        let registry = registry_with_journal(state.path(), JournalOptions::default());
+        for agent in 0..257u64 {
+            interrupted_work(&registry, agent + 10, Launch::Pane, None, None, None);
+        }
+        let captured: Vec<String> = listed(&registry)
+            .await
+            .items
+            .iter()
+            .map(|item| item.id.to_string())
+            .collect();
+        assert_eq!(captured.len(), 257);
+        let late = interrupted_work(&registry, 9_999, Launch::Pane, None, None, None);
+
+        let batches = crate::interrupted_work::dismiss_batches(&captured);
+        assert!(
+            batches.iter().all(|batch| selector_fits(batch)),
+            "every batch is admitted: {:?}",
+            batches.iter().map(Vec::len).collect::<Vec<_>>()
+        );
+        let mut dismissed = 0;
+        for batch in batches {
+            let outcome = dismiss(&registry, batch, false, None).await;
+            assert_eq!(outcome.refusal, None, "{outcome:?}");
+            dismissed += outcome.dismissed_count();
+        }
+        assert_eq!(dismissed, 257);
+        let left = listed(&registry).await.items;
+        assert_eq!(
+            left.iter()
+                .map(|item| item.id.to_string())
+                .collect::<Vec<_>>(),
+            vec![late.to_string()]
+        );
+    });
+}
+
+/// A stand-in for the keep check's `git`: `status` and `worktree` each either
+/// flood stdout forever (`flood`), stall with a background descendant,
+/// writing the pids to `<dir>/<what>-leader.pid` and `<dir>/<what>-child.pid`
+/// (`stall`), or run the real `git` (`git`); `status` may also answer clean
+/// (`clean`).
+fn keep_check_stand_in(dir: &Path, status: &str, worktree: &str) -> PathBuf {
+    let script = dir.join("keep-check-git");
+    let act = |what: &str, how: &str| match how {
+        "flood" => "exec yes 'M a-flooded-line-of-git-output'".to_string(),
+        "stall" => format!(
+            "echo $$ > '{dir}/{what}-leader.pid'; sleep 30 & echo $! > '{dir}/{what}-child.pid'; wait",
+            dir = dir.display()
+        ),
+        "clean" => "exit 0".to_string(),
+        _ => format!("exec {} \"$@\"", crate::git_env::GIT),
+    };
+    crate::test_isolation::write_script(
+        &script,
+        format!(
+            "#!/bin/sh\ncase \"$*\" in\n  *status*) {} ;;\n  *worktree*) {} ;;\n  *) exec {} \"$@\" ;;\nesac\n",
+            act("status", status),
+            act("worktree", worktree),
+            crate::git_env::GIT
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    script
+}
+
+fn pid_in(file: &Path) -> Option<libc::pid_t> {
+    std::fs::read_to_string(file).ok()?.trim().parse().ok()
+}
+
+/// Whether `pid` runs no more (gone, or a zombie on Linux).
+fn gone(pid: libc::pid_t) -> bool {
+    // SAFETY: signal 0 only checks that the process exists.
+    let missing = unsafe { libc::kill(pid, 0) } != 0;
+    missing
+        || std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .unwrap_or_default()
+            .rsplit_once(") ")
+            .is_some_and(|(_, rest)| rest.starts_with('Z'))
+}
+
+fn soon_gone(pid: libc::pid_t) -> bool {
+    let until = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < until {
+        if gone(pid) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    gone(pid)
+}
+
+/// Auditor 3: the keep check's `git status` and `git worktree list` run
+/// through the bounded probe runner. Output past its cap kills the child and
+/// keeps the tree: a flooded status reads as uncommitted changes, a flooded
+/// listing as a check that could not be made. The dry run and the real
+/// reclaim both answer, keep the tree and write no close.
+#[test]
+fn reclaim_keeps_the_tree_when_the_keep_checks_output_floods() {
+    rt().block_on(async {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let root_dir = std::fs::canonicalize(tmp.path()).unwrap();
+        let (_repo, wt) = repo_with_worktree(&root_dir);
+        mark(&wt);
+        let registry = registry_with_journal(&root_dir.join("state"), JournalOptions::default());
+        let (root, _) = unit(&registry, "agent/dispatch-x", Some(&wt));
+        for (status, worktree, kept) in [
+            ("flood", "git", ReclaimVerdict::KeptDirty),
+            ("clean", "flood", ReclaimVerdict::KeptCouldNotCheck),
+        ] {
+            let script = keep_check_stand_in(&root_dir, status, worktree);
+            seams::arm_keep_check(&wt, script, Duration::from_secs(20));
+            for dry_run in [true, false] {
+                let outcome = tokio::time::timeout(
+                    Duration::from_secs(25),
+                    reclaim(&registry, root.to_string(), dry_run, None),
+                )
+                .await
+                .expect("the reclaim answers");
+                assert_eq!(
+                    outcome.verdict, kept,
+                    "status={status} worktree={worktree} dry_run={dry_run}: {outcome:?}"
+                );
+                assert!(wt.is_dir());
+                assert!(closes(&registry).is_empty());
+            }
+            seams::disarm_keep_check(&wt);
+        }
+    });
+}
+
+/// Auditor 3: a keep check whose `git status` never answers is killed at the
+/// check's deadline, with its descendant, and reaped before the reclaim
+/// answers; the tree is kept as a check that could not be made. Asked again
+/// after it answered, it does the same, and no child is left behind.
+#[test]
+fn reclaim_kills_and_reaps_a_stalled_keep_check_and_keeps_the_tree() {
+    rt().block_on(async {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let root_dir = std::fs::canonicalize(tmp.path()).unwrap();
+        let (_repo, wt) = repo_with_worktree(&root_dir);
+        mark(&wt);
+        let registry = registry_with_journal(&root_dir.join("state"), JournalOptions::default());
+        let (root, _) = unit(&registry, "agent/dispatch-x", Some(&wt));
+        let script = keep_check_stand_in(&root_dir, "stall", "git");
+        seams::arm_keep_check(&wt, script, Duration::from_secs(1));
+        for dry_run in [true, true, false] {
+            let _ = std::fs::remove_file(root_dir.join("status-leader.pid"));
+            let started = std::time::Instant::now();
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(25),
+                reclaim(&registry, root.to_string(), dry_run, None),
+            )
+            .await
+            .expect("the reclaim answers");
+            assert_eq!(
+                outcome.verdict,
+                ReclaimVerdict::KeptCouldNotCheck,
+                "dry_run={dry_run}: {outcome:?}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "answered by the check's deadline: {:?}",
+                started.elapsed()
+            );
+            let leader = pid_in(&root_dir.join("status-leader.pid")).expect("the child ran");
+            let child = pid_in(&root_dir.join("status-child.pid")).expect("its descendant ran");
+            assert!(
+                gone(leader),
+                "the stalled child was reaped before the answer"
+            );
+            assert!(soon_gone(child), "its descendant was killed with it");
+            assert!(wt.is_dir());
+            assert!(closes(&registry).is_empty());
+        }
+        seams::disarm_keep_check(&wt);
+    });
+}

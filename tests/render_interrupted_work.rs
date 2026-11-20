@@ -17,13 +17,13 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use dot_agent_deck::interrupted_work::{
-    DISMISSED, DismissOutcome, DismissedItem, INTERRUPTED_WORK_TITLE, InterruptedItem,
-    InterruptedList, InterruptedShow, ItemKind, ItemReport, LABEL_BRANCH, LABEL_FOLDER,
-    LABEL_LAST_ENTRY, LABEL_PROGRESS, LABEL_REPORT, LABEL_STARTED_BY, LABEL_WORKTREE, LastEntry,
-    OTHER_AGENTS_GROUP, Progress, RECLAIM_EXPLANATION, RECLAIM_REMOVED, RECLAIM_WOULD_REMOVE,
-    ReclaimOutcome, ReclaimVerdict, Refusal, RefusalReason, ShownReport, UNSUPPORTED,
-    dismiss_all_question, interrupted_footer, kept_until, kind_label, progress_line,
-    unpushed_sentence,
+    DISMISSED, DismissOutcome, DismissStopReason, DismissStopped, DismissedItem,
+    INTERRUPTED_WORK_TITLE, InterruptedItem, InterruptedList, InterruptedShow, ItemKind,
+    ItemReport, LABEL_BRANCH, LABEL_FOLDER, LABEL_LAST_ENTRY, LABEL_PROGRESS, LABEL_REPORT,
+    LABEL_STARTED_BY, LABEL_WORKTREE, LastEntry, OTHER_AGENTS_GROUP, Progress, RECLAIM_EXPLANATION,
+    RECLAIM_REMOVED, RECLAIM_WOULD_REMOVE, ReclaimOutcome, ReclaimVerdict, Refusal, RefusalReason,
+    ShownReport, UNSUPPORTED, dismiss_all_question, dismiss_stopped_sentence, interrupted_footer,
+    kept_until, kind_label, progress_line, unpushed_sentence,
 };
 use dot_agent_deck::keybindings::KeybindingConfig;
 use dot_agent_deck::ui::{
@@ -1655,4 +1655,214 @@ fn interrupted_027_a_question_seen_whole_can_be_confirmed_whatever_its_rows() {
         height,
     );
     assert!(!sent.iter().any(is_dismissal), "{sent:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Dismiss all in batches (final review, reviewer 1 / auditor 2)
+// ---------------------------------------------------------------------------
+
+/// More items than one dismissal may name: the daemon admits at most 256 ids
+/// in one request (`close_agents::MAX_SELECTOR_ENTRIES`).
+const MANY: usize = 257;
+
+fn many_ids() -> Vec<String> {
+    (0..MANY)
+        .map(|n| format!("w-abcdefgh-{:016}", 1000 + n))
+        .collect()
+}
+
+fn many() -> InterruptedList {
+    list_of(
+        many_ids()
+            .iter()
+            .enumerate()
+            .map(|(n, id)| item(id, ItemKind::Unit, &format!("unit-{n}")))
+            .collect(),
+    )
+}
+
+fn dismissed_all(ids: &[String]) -> DismissOutcome {
+    DismissOutcome {
+        dismissed: ids
+            .iter()
+            .map(|id| DismissedItem {
+                id: id.clone(),
+                name: None,
+            })
+            .collect(),
+        ..DismissOutcome::default()
+    }
+}
+
+fn dismissals(sent: &[InterruptedSeamRequest]) -> Vec<(Vec<String>, bool)> {
+    sent.iter()
+        .filter_map(|request| match request {
+            InterruptedSeamRequest::Dismiss { ids, all } => Some((ids.clone(), *all)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn lists_sent(sent: &[InterruptedSeamRequest]) -> usize {
+    sent.iter()
+        .filter(|r| matches!(r, InterruptedSeamRequest::List { .. }))
+        .count()
+}
+
+/// Scenario: The list holds 257 interrupted items, one more than the daemon
+/// takes in one dismissal. `I`, `D` and `y` send two dismissals, of 256 and 1
+/// ids, the second only once the first answered, together naming exactly the
+/// 257 items the question named and never "all"; the list is asked for again
+/// only after the last answer, the overlay says "Dismissed.", and an item that
+/// appeared after the question stays listed.
+#[spec("journal/interrupted/029")]
+#[test]
+fn interrupted_029_dismiss_all_sends_bounded_batches_of_exactly_the_confirmed_ids() {
+    let ids = many_ids();
+    let confirm = || vec![ch('I'), ch('D'), ch('y')];
+    let (_, sent) = run(&many(), &confirm());
+    let batches = dismissals(&sent);
+    assert_eq!(batches.len(), 1, "one batch at a time: {batches:?}");
+    assert_eq!(batches[0].0.len(), 256);
+    assert!(!batches[0].1, "never all");
+
+    let mut steps = confirm();
+    steps.push(InterruptedSeamStep::Dismissed(dismissed_all(&ids[..256])));
+    let (_, sent) = run(&many(), &steps);
+    let batches = dismissals(&sent);
+    assert_eq!(batches.len(), 2, "{batches:?}");
+    assert_eq!(batches[1].0, ids[256..].to_vec());
+    assert!(!batches[1].1, "never all");
+    let named: Vec<String> = batches.iter().flat_map(|(ids, _)| ids.clone()).collect();
+    assert_eq!(named, ids, "together, exactly the confirmed ids, in order");
+    assert_eq!(
+        lists_sent(&sent),
+        2,
+        "no refresh between batches (the attach fetch and `I`): {sent:?}"
+    );
+
+    let newer = item(NEW_ID, ItemKind::Unit, "newer-work");
+    steps.push(InterruptedSeamStep::Dismissed(dismissed_all(&ids[256..])));
+    steps.push(InterruptedSeamStep::Listed(only(newer)));
+    let (shown, sent) = run(&many(), &steps);
+    assert_eq!(dismissals(&sent).len(), 2, "{sent:?}");
+    assert_eq!(lists_sent(&sent), 3, "one refresh, after the last answer");
+    let done = &shown[shown.len() - 2];
+    assert!(done.contains(DISMISSED), "{done}");
+    let refreshed = shown.last().unwrap();
+    assert!(
+        refreshed.contains("newer-work") && refreshed.contains(&interrupted_footer(1)),
+        "the item listed after the question stays listed:\n{refreshed}"
+    );
+}
+
+/// Scenario: Dismiss all over 257 items; the first batch of 256 is dismissed
+/// and the second fails (a timeout), or is refused whole. No third request is
+/// sent, the list is asked for again, and the overlay says "Dismissed." and
+/// that 1 more item was not dismissed, and why.
+#[spec("journal/interrupted/030")]
+#[test]
+fn interrupted_030_a_failed_later_batch_stops_dismiss_all_and_says_so() {
+    let ids = many_ids();
+    let first = || InterruptedSeamStep::Dismissed(dismissed_all(&ids[..256]));
+    for (last, stopped) in [
+        (
+            InterruptedSeamStep::Failed(InterruptedSeamKind::Dismiss, "timed out".to_string()),
+            DismissStopped {
+                reason: DismissStopReason::Failed,
+                refusal: None,
+                not_sent: 1,
+            },
+        ),
+        (
+            InterruptedSeamStep::Dismissed(DismissOutcome {
+                refusal: Some(Refusal::new(RefusalReason::Unreadable)),
+                ..DismissOutcome::default()
+            }),
+            DismissStopped {
+                reason: DismissStopReason::Refused,
+                refusal: Some(RefusalReason::Unreadable),
+                not_sent: 1,
+            },
+        ),
+    ] {
+        let (shown, sent) = run(&many(), &[ch('I'), ch('D'), ch('y'), first(), last]);
+        assert_eq!(dismissals(&sent).len(), 2, "{sent:?}");
+        assert_eq!(
+            lists_sent(&sent),
+            3,
+            "the list is asked for again: {sent:?}"
+        );
+        let said = shown.last().unwrap();
+        assert!(said.contains(DISMISSED), "{said}");
+        let why = dismiss_stopped_sentence(&stopped);
+        assert!(
+            said.split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .contains(&why),
+            "{why:?} in:\n{said}"
+        );
+    }
+}
+
+/// Scenario: Dismiss all over 257 items; after the first batch answers, the
+/// daemon process is replaced — the second batch is withheld from the new
+/// process (unsupported), or the TUI's event stream attaches to the new
+/// process before it answers. No further dismissal is sent to the new
+/// process, and the overlay says that 1 more item was not dismissed because
+/// the deck daemon was replaced.
+#[spec("journal/interrupted/031")]
+#[test]
+fn interrupted_031_a_replaced_daemon_stops_dismiss_all_between_batches() {
+    let ids = many_ids();
+    let first = || InterruptedSeamStep::Dismissed(dismissed_all(&ids[..256]));
+    let why = dismiss_stopped_sentence(&DismissStopped {
+        reason: DismissStopReason::Replaced,
+        refusal: None,
+        not_sent: 1,
+    });
+    for replaced in [
+        vec![InterruptedSeamStep::Unsupported(
+            InterruptedSeamKind::Dismiss,
+        )],
+        vec![
+            InterruptedSeamStep::Attach(SECOND_DAEMON.to_string()),
+            InterruptedSeamStep::AnswerTo(
+                3,
+                Box::new(InterruptedSeamStep::Dismissed(dismissed_all(&ids[256..]))),
+            ),
+        ],
+    ] {
+        let mut steps = vec![ch('I'), ch('D'), ch('y'), first()];
+        steps.extend(replaced);
+        let run = run_interrupted_work_seam(
+            &many(),
+            &[],
+            UiMode::Normal,
+            &KeybindingConfig::default(),
+            &steps,
+            WIDTH,
+            HEIGHT,
+        );
+        let requests: Vec<InterruptedSeamRequest> =
+            run.sent.iter().map(|s| s.request.clone()).collect();
+        assert_eq!(dismissals(&requests).len(), 2, "{requests:?}");
+        assert!(
+            run.sent
+                .iter()
+                .filter(|s| is_dismissal(&s.request))
+                .all(|s| s.instance.as_deref() == Some(INTERRUPTED_SEAM_FIRST_DAEMON)),
+            "every batch is pinned to the process the question was asked of: {:?}",
+            run.sent
+        );
+        let said = text(run.frames.last().unwrap());
+        assert!(
+            said.split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .contains(&why),
+            "{why:?} in:\n{said}"
+        );
+    }
 }

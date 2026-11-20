@@ -807,6 +807,27 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 - **Does not assert:** Git and pull request facts (`--no-git`); the agent's exact output; a report from the unit; the desktop surface.
 - **Platform coverage:** mac+linux.
 
+##### journal/interrupted/029 — Dismiss all over more items than one dismissal may name sends bounded batches of exactly the confirmed ids.
+- **Layer:** L1 in-process `TestBackend` (`tests/render_interrupted_work.rs`, seam `run_interrupted_work_seam`): every request the TUI sends is recorded instead of sent, the daemon's answers are handed in for a recorded request, keys go through the production `handle_key_event`, and each frame is drawn after the production per-frame fetch check.
+- **Agent:** none.
+- **Asserts:** with 257 listed items, `I` `D` `y` sends one dismissal of 256 ids and, only once it answered, a second of the last id; both with `all` false, together naming exactly the 257 ids in the order listed; no list request between the batches, one after the last answer; the overlay then says `Dismissed.`, and an item listed after the question stays listed.
+- **Does not assert:** the byte limit (`interrupted_work::tests`, `dismiss_batches`); the daemon's own admission (`interrupted_work_daemon::tests`).
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/030 — A later batch of Dismiss all that fails or is refused stops the rest and says so.
+- **Layer:** L1 in-process `TestBackend` (`tests/render_interrupted_work.rs`, seam `run_interrupted_work_seam`): every request the TUI sends is recorded instead of sent, the daemon's answers are handed in for a recorded request, keys go through the production `handle_key_event`, and each frame is drawn after the production per-frame fetch check.
+- **Agent:** none.
+- **Asserts:** over 257 items, with the first batch dismissed and the second failing (a timeout) or refused whole (`Unreadable`), no third dismissal is sent, the list is asked for again, and the overlay says `Dismissed.` and `dismiss_stopped_sentence`'s words for one item not dismissed and why.
+- **Does not assert:** a failed FIRST batch, which reads as a single dismissal does (`journal/interrupted/012`).
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/031 — A daemon replaced between Dismiss all's batches is sent no further batch.
+- **Layer:** L1 in-process `TestBackend` (`tests/render_interrupted_work.rs`, seam `run_interrupted_work_seam`): every request the TUI sends is recorded instead of sent, the daemon's answers are handed in for a recorded request, keys go through the production `handle_key_event`, and each frame is drawn after the production per-frame fetch check.
+- **Agent:** none.
+- **Asserts:** over 257 items, after the first batch answered, a second batch withheld from a replaced process (unsupported), or the event stream attaching to another process before it answers, ends the dismissal: exactly two dismissals were sent, both pinned to the first daemon process, and the overlay says one item was not dismissed because the deck daemon was replaced.
+- **Does not assert:** the shared client's instance pin itself (`daemon_client` tests).
+- **Platform coverage:** mac+linux.
+
 #### journal/compat
 
 ##### journal/compat/001 — Lines of a newer schema or an unknown kind are skipped and kept.
@@ -2738,6 +2759,13 @@ Issue #1794: a daemon must not be left half-alive — hook endpoint up, no attac
 - **Agent:** none (a deck-owned, clean worktree in a checkout whose `origin` is the upstream repository and which has a second GitHub remote, `fork`; the stub `gh` reply lists one `MERGED` pull request carrying `isCrossRepository: true` and a `headRepository` / `headRepositoryOwner`, the shape `gh pr list --head <branch>` returns for a contributor's pull request opened from their fork).
 - **Asserts:** a **fixture precondition** that the entry reads `owned: true` and `clean: true`; that with no push remote configured the entry reads `no_pr` / `keep`; that with `branch.<name>.pushRemote` set to `fork` but the pull request's head owned by someone else it still reads `no_pr` / `keep` and the directory survives `worktree reclaim --yes`; then that with the pull request's head being the fork the branch is pushed to the entry reads `merged` / `remove` and a bare `worktree reclaim` removes the directory. Pins issue #1779: the fork filter from #1687 also ignored a contributor's own pull request when they pushed to their fork while `origin` was the upstream, so a merged worktree was kept forever.
 - **Does not assert:** a push remote resolved through `remote.pushDefault` or the branch's upstream remote rather than `branch.<name>.pushRemote` (git resolves all three into the one `%(push:remotename)` the lookup reads); case-insensitive owner matching, a deleted fork (`headRepository: null`) and the ambiguous own-plus-fork case (unit-tested as `parse_pr_state_matches_a_fork_pull_request_only_from_the_push_repository` in `src/worktree_reclaim.rs`); the PR badge's side of the same match (`pull_request::tests::a_pull_request_from_the_fork_the_branch_is_pushed_to_is_the_branchs`).
+- **Platform coverage:** mac+linux.
+
+##### worktree/reclaim/014 — A worktree holding a linked worktree of another repository is kept, and the nested one is named.
+- **Layer:** fast synthetic real-binary-subprocess integration (as `worktree/reclaim/001`).
+- **Agent:** none (a deck-owned, clean worktree whose stub `gh` reply is `MERGED`, so it would be removed; under its git-ignored `.worktrees/` lies a linked worktree of a second, independent repository holding an unsaved file).
+- **Asserts:** `worktree list --json` reads the holder `keep`; after `worktree reclaim --yes` the holder is still on disk, the nested worktree's unsaved file is unchanged, and the output says it `holds other worktrees`, naming the nested one. Pins PRD #1790 stage 2's final review, auditor 1: the holder's own repository's `git worktree list` does not know a worktree of another repository, and `git status` does not see it under an ignored directory.
+- **Does not assert:** the bound on the walk that finds it, or an unreadable directory (`nested_git_trees` unit tests); a plain clone rather than a linked worktree (same walk, unit-tested).
 - **Platform coverage:** mac+linux.
 
 ### Prompts

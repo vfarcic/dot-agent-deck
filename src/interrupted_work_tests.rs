@@ -730,6 +730,7 @@ fn the_interrupted_work_answers_are_additive_and_decode_unknown_values() {
         incomplete: true,
         dismissed_omitted: 0,
         refused_omitted: 0,
+        stopped: None,
     };
     let resp = AttachResponse {
         interrupted_reclaim: Some(outcome.clone()),
