@@ -1948,7 +1948,8 @@ fn interrupted_032_a_dismissal_refused_on_an_incomplete_read_says_so() {
 /// could not be read whole. The dashboard's footer still shows a row, saying
 /// some interrupted work may not be listed, with `[Show I]` and `[Hide X]`;
 /// `I` opens the "Interrupted work" list, which says the journal could not be
-/// read whole, and `X` hides the row. A complete empty list shows no row.
+/// read whole, and `X` hides the row; `I` pressed after `X` still opens the
+/// list. A complete empty list shows no row.
 #[spec("journal/interrupted/033")]
 #[test]
 fn interrupted_033_an_incomplete_empty_list_still_offers_the_footer_row() {
@@ -1979,6 +1980,16 @@ fn interrupted_033_an_incomplete_empty_list_still_offers_the_footer_row() {
         sent.iter()
             .any(|r| matches!(r, InterruptedSeamRequest::List { git: true })),
         "`I` asks for the list again: {sent:?}"
+    );
+
+    // The TUI has one daemon, so a hidden row never leaves `I` pointing at a
+    // banner that is not drawn: `I` opens the list itself (verification R2).
+    let (after_hide, _) = run(&unread, &[ch('X'), ch('I')]);
+    let reopened = after_hide.last().unwrap();
+    assert!(
+        reopened.contains(INTERRUPTED_WORK_TITLE)
+            && popup_text(reopened).contains(&squeezed(LIST_INCOMPLETE)),
+        "`I` opens the list after `X` hid the row:\n{reopened}"
     );
 
     let complete = frames(&InterruptedList::default(), &[]);

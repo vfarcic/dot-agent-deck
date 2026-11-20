@@ -40,6 +40,8 @@ export interface InterruptedWorkRuntime {
   hidden: (deckId: string) => boolean;
   /** Hide deck `deckId`'s banner: records nothing, and lasts until its connection names another daemon process. */
   hide: (deckId: string) => void;
+  /** Bring back the hidden banners of decks `deckIds`, so a user told to open one from its banner has one to open (verification R2). */
+  reveal: (deckIds: readonly string[]) => void;
   /**
    * Ask deck `deckId`'s daemon for the list again; `git` asks for each item's
    * Git and pull request facts. Settles with what that request found, once its
@@ -165,6 +167,14 @@ export function useInterruptedWork(bridge: DeckBridge, fleet: DeckFleet): Interr
     const instance = current.current.get(deckId);
     if (instance !== undefined) setHiddenFor((held) => ({ ...held, [deckId]: instance }));
   }, []);
+  const reveal = useCallback((deckIds: readonly string[]) => {
+    setHiddenFor((held) => {
+      if (!deckIds.some((deckId) => deckId in held)) return held;
+      const rest = { ...held };
+      for (const deckId of deckIds) delete rest[deckId];
+      return rest;
+    });
+  }, []);
   const hidden = useCallback((deckId: string) => {
     const instance = current.current.get(deckId);
     return instance !== undefined && hiddenFor[deckId] === instance;
@@ -213,5 +223,5 @@ export function useInterruptedWork(bridge: DeckBridge, fleet: DeckFleet): Interr
     bridge.interruptedWorkDismiss ? bridge.interruptedWorkDismiss(target, ids) : Promise.resolve<InterruptedReply<DismissOutcome>>({ outcome: "unsupported" })
   )), [bridge, mutate]);
 
-  return useMemo(() => (offered ? { decks, hidden, hide, refresh, show, reclaim, dismiss, busy, ...(dialog ? { dialog } : {}), openDialog, closeDialog } : undefined), [busy, closeDialog, decks, dialog, dismiss, hidden, hide, offered, openDialog, reclaim, refresh, show]);
+  return useMemo(() => (offered ? { decks, hidden, hide, reveal, refresh, show, reclaim, dismiss, busy, ...(dialog ? { dialog } : {}), openDialog, closeDialog } : undefined), [busy, closeDialog, decks, dialog, dismiss, hidden, hide, offered, openDialog, reclaim, refresh, reveal, show]);
 }

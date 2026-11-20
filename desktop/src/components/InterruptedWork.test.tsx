@@ -1002,6 +1002,33 @@ describe("several daemons whose lists are incomplete each offer a way in (verifi
     await waitFor(() => expect(dialog).toHaveTextContent(LIST_INCOMPLETE));
   });
 
+  /** Scenario: two daemons both answer with an empty list that says their journal could not be read whole, and both banners are hidden with their Hide buttons. `I` brings both banners back before telling the user to open one from its banner, so a keyboard or mouse user has a Show to press without voice; pressing the beta daemon's Show opens its dialog. */
+  it("brings hidden banners back when I tells the user to open one from its banner", async () => {
+    const lists: Record<string, InterruptedList | Error> = { "process-a": { items: [], incomplete: true }, "process-b": { items: [], incomplete: true } };
+    const { bridge, listed } = perProcessBridge(lists);
+    const fleet = [deckOf("process-a"), remoteDeck("deck-b", "beta", "process-b")];
+    const voice = voiced(bridge, fleet);
+    render(<voice.Voiced />);
+    await waitFor(() => expect(listed).toHaveLength(2));
+    await waitFor(() => expect(screen.getAllByTestId("interrupted-banner")).toHaveLength(2));
+    for (const banner of screen.getAllByTestId("interrupted-banner")) {
+      await act(async () => { fireEvent.click(within(banner).getByTestId("interrupted-banner-hide")); });
+    }
+    await waitFor(() => expect(screen.queryAllByTestId("interrupted-banner")).toHaveLength(0));
+
+    await act(async () => { fireEvent.keyDown(document.body, { key: "I" }); });
+    await waitFor(() => expect(listed.length).toBeGreaterThanOrEqual(4));
+    await waitFor(() => expect(screen.getByText(/Open one from its banner/)).toBeInTheDocument());
+    expect(screen.queryByTestId("interrupted-dialog")).toBeNull();
+    await waitFor(() => expect(screen.getAllByTestId("interrupted-banner")).toHaveLength(2));
+
+    const beta = screen.getAllByTestId("interrupted-banner").find((banner) => banner.getAttribute("data-deck-id") === "deck-b");
+    expect(beta, "the beta daemon's banner is back").toBeDefined();
+    await act(async () => { fireEvent.click(within(beta as HTMLElement).getByTestId("interrupted-banner-show")); });
+    const dialog = await screen.findByTestId("interrupted-dialog");
+    expect(dialog).toHaveTextContent("beta");
+  });
+
   /** Scenario: one daemon lists a unit and another answers with an empty list that says it could not be read whole. Both sections show a banner; `I` names both, says they may have interrupted work rather than that they have it, and opens nothing. */
   it("says may have when one of several daemons only could not read its list", async () => {
     const lists: Record<string, InterruptedList | Error> = { "process-a": { items: [unit()] }, "process-b": { items: [], incomplete: true } };

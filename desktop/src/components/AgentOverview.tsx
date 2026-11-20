@@ -1294,7 +1294,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     });
     if (asked.length === 0) return NOTHING_INTERRUPTED;
     if (asked.length === 1) return interrupted.openDialog(asked[0].snapshot.connection.deckId as string) ? undefined : NOTHING_INTERRUPTED;
-    const { openDialog, refresh } = interrupted;
+    const { openDialog, refresh, reveal } = interrupted;
     return Promise.all(asked.map((deck) => {
       const id = deck.snapshot.connection.deckId as string;
       return refresh(id, false).then((found) => ({ deck, id, found }));
@@ -1307,9 +1307,17 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       */
       const listing = answers.filter(({ id, found }) => (found.outcome === "listed" ? found.count > 0 || found.incomplete : found.outcome !== "unsupported" && mayHaveInterrupted(held[id]?.list)));
       if (listing.length === 1) return openDialog(listing[0].id) ? undefined : NOTHING_INTERRUPTED;
-      /* Each of them has a banner to open it by, an incomplete empty list's included (N4). */
+      /*
+        Each of them has a banner to open it by, an incomplete empty list's
+        included (N4); one its Hide put away is brought back first, so the
+        banner the answer points at is on screen for a keyboard or mouse
+        user, not only reachable by voice (verification R2).
+      */
       const definite = listing.every(({ id, found }) => (found.outcome === "listed" ? found.count : listedCount(held[id]?.list)) > 0);
-      if (listing.length > 1) return interruptedSeveral(listing.map(({ deck }) => deckName(deck.snapshot.connection)), definite, "Open one from its banner, or say which one.");
+      if (listing.length > 1) {
+        reveal(listing.map(({ id }) => id));
+        return interruptedSeveral(listing.map(({ deck }) => deckName(deck.snapshot.connection)), definite, "Open one from its banner, or say which one.");
+      }
       const unknown = answers.filter(({ found }) => found.outcome === "failed" || found.outcome === "superseded");
       if (unknown.length > 0) return `Could not ask ${unknown.map(({ deck }) => deckName(deck.snapshot.connection)).join(", ")} for its interrupted work; try again, or say which daemon.`;
       return NOTHING_INTERRUPTED;

@@ -86,6 +86,28 @@ test.describe("Interrupted work", () => {
     await expect(dialog.getByTestId("interrupted-row")).toHaveCount(0);
   });
 
+  /** Scenario: several daemons each answer with an empty list that says their journal could not be read whole, and every banner is hidden with its Hide button. `I` brings the banners back while it tells the user to open one from its banner; tabbing to one banner's Show and pressing Enter opens that daemon's dialog. */
+  test("brings hidden banners back when I says to open one from its banner", async ({ page }) => {
+    await page.goto("/?fixture=1&state=fleet&interrupted=unread");
+    await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
+    await page.getByTestId("open-overview").click();
+    const banners = page.getByTestId("interrupted-banner");
+    await expect.poll(() => banners.count()).toBeGreaterThan(1);
+    const shown = await banners.count();
+    while ((await banners.count()) > 0) await banners.first().getByTestId("interrupted-banner-hide").click();
+    await expect(banners).toHaveCount(0);
+
+    await page.keyboard.press("I");
+    await expect(page.getByTestId("overview-daemon-notice")).toContainText("Open one from its banner");
+    await expect(banners).toHaveCount(shown);
+    await expect(page.getByTestId("interrupted-dialog")).toHaveCount(0);
+
+    await banners.nth(1).getByTestId("interrupted-banner-show").focus();
+    await page.keyboard.press("Enter");
+    const dialog = page.getByTestId("interrupted-dialog");
+    await expect(dialog.getByRole("heading", { name: "Interrupted work" })).toBeVisible();
+  });
+
   /* PRD #1790 stage 2, desktop review findings 3, 5 and 8. */
 
   /** Scenario: with keyboard focus on one of the dialog's controls, Enter does what that control does: on Dismiss all it asks the question, on Close it closes, on Reclaim it runs the dry run, and on a row other than the selected one it opens that row's details; in an item's details, Enter on Back returns to the list rather than asking for reports. */
