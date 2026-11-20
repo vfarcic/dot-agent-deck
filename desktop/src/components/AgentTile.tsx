@@ -19,7 +19,8 @@ import {
   Unplug,
   X,
 } from "lucide-react";
-import { statusLabel, UNREPORTED } from "../types";
+import { UNREPORTED } from "../types";
+import { statusWord, statusWordLabel } from "../lib/statusWords";
 import type {
   AgentPanePresentation,
   AgentSession,
@@ -454,9 +455,10 @@ export function AgentTile({
     void onRename(agent.id, next, agent.incarnation);
   };
 
-  // The daemon's `error` is merged into `failed` for grouping; the card says
-  // what the daemon said, the word the TUI's card uses (CLAUDE.md rule 22).
-  const tileStatusLabel = agent.daemonStatus === "error" ? "error" : statusLabel(agent.status);
+  // Issue #2411: the daemon's word, the one the TUI's card uses (CLAUDE.md
+  // rule 22), never the column the deck merges it into.
+  const tileStatus = statusWord(agent);
+  const tileStatusLabel = statusWordLabel(tileStatus);
   /*
     Issue #1798 — the title names the agent: its name, after its run's title
     for an orchestration agent. Every accessible name on the tile is built from
@@ -519,7 +521,7 @@ export function AgentTile({
     >
       <header className="agent-header">
         <div className="agent-identity">
-          <span className={`agent-state-mark status-${agent.status}${held ? " is-held" : ""}`} aria-hidden="true" />
+          <span className={`agent-state-mark status-${tileStatus}${held ? " is-held" : ""}`} aria-hidden="true" />
           <div>
             {/*
               Issue #1798 — one line: the agent's name, the muted facts that
@@ -571,7 +573,7 @@ export function AgentTile({
                 takes, and half of them are not verbs — `last seen passed` and
                 `last seen queued` do not parse, where `last seen: passed` does.
               */}
-              <span className={`status-label status-${agent.status}${held ? " is-held" : ""}`}>{held ? `last seen: ${tileStatusLabel}` : tileStatusLabel}</span>
+              <span className={`status-label status-${tileStatus}${held ? " is-held" : ""}`}>{held ? `last seen: ${tileStatusLabel}` : tileStatusLabel}</span>
               {/*
                 Issue #2387 — beside the status, never instead of it: the status
                 is what the agent is doing, this is what the deck is doing. Its
