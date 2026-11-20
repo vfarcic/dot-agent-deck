@@ -677,7 +677,9 @@ pub(crate) fn classify_gh_failure(code: Option<i32>, stderr: &str) -> GhFailureR
     }
     let stderr = stderr.to_ascii_lowercase();
     let says = |needles: &[&str]| needles.iter().any(|n| stderr.contains(n));
-    if says(&["rate limit", "http 429", "rate_limited"]) {
+    // Rate limits first: GitHub answers a secondary rate limit or its abuse
+    // detection with an HTTP 403, which must not read as "not accessible".
+    if says(&["rate limit", "abuse detection", "http 429", "rate_limited"]) {
         GhFailureReason::RateLimited
     } else if says(&[
         "gh auth login",
@@ -686,7 +688,14 @@ pub(crate) fn classify_gh_failure(code: Option<i32>, stderr: &str) -> GhFailureR
         "http 401",
     ]) {
         GhFailureReason::NoGithubAccess
-    } else if says(&["could not resolve to", "http 404"]) {
+    } else if says(&[
+        "could not resolve to",
+        "http 404",
+        // A 403 "Resource not accessible by personal access token" (or "by
+        // integration"): gh is logged in, but that login cannot see the
+        // repository, which reads like a private one.
+        "resource not accessible by",
+    ]) {
         GhFailureReason::NotFound
     } else {
         GhFailureReason::Error
@@ -2649,6 +2658,31 @@ mod tests {
                 RateLimited,
             ),
             (Some(1), "HTTP 429: Too Many Requests", RateLimited),
+            (
+                Some(1),
+                "HTTP 403: You have triggered an abuse detection mechanism. Please wait a few minutes before you try again.",
+                RateLimited,
+            ),
+            (
+                Some(1),
+                "GraphQL: Resource not accessible by personal access token (repository.pullRequest)",
+                NotFound,
+            ),
+            (
+                Some(1),
+                "HTTP 403: Resource not accessible by personal access token (https://api.github.com/repos/o/r/issues/7)",
+                NotFound,
+            ),
+            (
+                Some(1),
+                "HTTP 403: Resource not accessible by integration (https://api.github.com/repos/o/r/pulls/7)",
+                NotFound,
+            ),
+            (
+                Some(1),
+                "HTTP 403: Must have admin rights to Repository. (https://api.github.com/repos/o/r)",
+                Error,
+            ),
             (
                 Some(1),
                 "error connecting to api.github.com\ncheck your internet connection",

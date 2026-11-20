@@ -101,7 +101,7 @@ The desktop repeats a narrower check before it opens anything: `openableReferenc
 
 ## What a client is told, and what only the log is told (D5)
 
-A reference that cannot be checked carries a reason: `no_github_access`, `not_found` (GitHub cannot tell missing from private, so it is labelled "not found or private"), `rate_limited`, `unrecognised` or `error`; before the first lookup finishes it is `pending`; a last-known answer kept after a later failure is `checked` with `stale: true`.
+A reference that cannot be checked carries a reason: `no_github_access`, `not_found` (GitHub cannot tell missing from private, so it is labelled "not found or private"; a 403 "Resource not accessible by personal access token" or "… by integration" is `not_found` too, since `gh` is logged in but that login cannot see the repository), `rate_limited` (a 403 for a secondary rate limit or abuse detection included: `classify_gh_failure` checks the rate-limit phrases before the others, and a 403 matching none of the phrases is `error`), `unrecognised` or `error`; before the first lookup finishes it is `pending`; a last-known answer kept after a later failure is `checked` with `stale: true`.
 
 The `detail` sent to clients is **one fixed sentence per reason** (`unavailable_detail`), never `gh`'s output:
 

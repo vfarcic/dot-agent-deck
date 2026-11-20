@@ -89,7 +89,7 @@ Until the first lookup finishes, the badge reads **checking…**. A badge marked
 | The card shows | What it means | What to do |
 | --- | --- | --- |
 | no GitHub access | `gh` is missing or not logged in on the deck's host. | Install `gh` on the machine the daemon runs on and run `gh auth login` there. |
-| not found or private | GitHub has nothing by that number that the deck's login can see. It may not exist, or it may be private to a login the deck's host does not use. | Check the number and the repository. For a private repository, log `gh` in on the deck's host with an account that can see it. |
+| not found or private | GitHub has nothing by that number that the deck's login can see. It may not exist, or it may be private to a login the deck's host does not use. | Check the number and the repository. For a private repository, log `gh` in on the deck's host with an account that can see it, or give its token access to that repository. |
 | GitHub rate limit | The deck's host has used up its GitHub requests for now. | Wait: the deck tries again later by itself. |
 | check failed | The deck's host could not check it for another reason, such as a repository that was renamed or moved. | Read the deck's log ([Troubleshooting → Enabling Debug Logs](../troubleshooting.md#enabling-debug-logs)). For a renamed repository, ask the agent to report the repository's current name. |
 | not a GitHub reference | The agent wrote something the deck cannot read as a GitHub pull request or issue, or a `#123` in a folder with no GitHub `origin`. | For a `#123` in a folder with no GitHub `origin`, ask the agent to report `owner/repo#123` or the github.com address. Otherwise, ask it to report `#123`, `owner/repo#123` or the github.com address. |
