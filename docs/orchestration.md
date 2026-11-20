@@ -433,7 +433,7 @@ Claude Code suggests your next prompt after each turn, and each suggestion costs
 
 ### When the orchestrator's conversation is compacted or cleared
 
-A long session compacts the orchestrator's conversation into a summary, and `/clear` empties it. Either can lose the orchestrator its role, and an orchestrator that has lost it starts doing the work itself instead of delegating it. So each time it happens, the deck sends the orchestrator its role again: its `prompt_template`, the workers and how to delegate, and its task if it was given one, with an instruction to carry on coordinating the work under way and to delegate the next step rather than doing it. The message reaches the orchestrator after the summary, and the orchestrator reads its role file again. You do nothing, and nothing is shown for it.
+A long session compacts the orchestrator's conversation into a summary, and `/clear` empties it. Either can lose the orchestrator its role, and an orchestrator that has lost it can start doing the work itself instead of delegating it. So each time it happens, the deck sends the orchestrator its role again: its `prompt_template`, the workers and how to delegate, and its task if it was given one, with an instruction to carry on coordinating the work under way and to delegate the next step rather than doing it. The message reaches the orchestrator after the summary, and the orchestrator reads its role file again. You do nothing, and nothing is shown for it.
 
 Who sends it depends on how the orchestration was started, not on which client you are watching:
 
