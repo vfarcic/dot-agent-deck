@@ -411,12 +411,17 @@ const NO_ORIGIN: &str = "no GitHub origin for this agent's folder";
 // * a daemon-wide token bucket ([`LOOKUP_BURST`], one more every
 //   [`LOOKUP_REFILL_EVERY`]) caps the lookups started per hour, however the
 //   references change;
-// * a `rate_limited` answer stops every reference lookup for
-//   [`RATE_LIMIT_COOLDOWN`], not only that reference's;
+// * a `rate_limited` answer stops reference lookups for
+//   [`RATE_LIMIT_COOLDOWN`], not only that reference's: none is admitted,
+//   and one admitted but still waiting for its permits hands its turn back
+//   without running `gh` and is admitted again after the cooldown
+//   ([`gated`]). A lookup already running when the answer arrives finishes;
 // * a reference no card names any more keeps its entry for a while
-//   ([`retired_ttl`], at most [`MAX_RETIRED`] of them), so naming it again
+//   ([`retired_ttl`]) once a lookup of it has finished, so naming it again
 //   finds its last answer, its retry deadline and its terminal state, rather
-//   than a fresh entry that is due at once;
+//   than a fresh entry that is due at once. At most [`MAX_RETIRED`] are
+//   kept: past that, the entries holding neither an answer nor a failure
+//   still inside its backoff go first, then the oldest;
 // * at most [`MAX_QUEUED_LOOKUPS`] lookups are started and unfinished, and
 //   the oldest-due reference goes first, so a stream of new references does
 //   not hold back the refresh of ones already shown;
@@ -456,13 +461,39 @@ fn retired_ttl(interval: Duration) -> Duration {
     MIN_RETIRED_TTL.max(failure_backoff(interval))
 }
 
+/// When the cooldown after a `rate_limited` answer ends. One is shared by
+/// the scheduler, which admits no lookup while it runs, and every lookup job,
+/// which checks it once it holds its permits and hands its turn back unrun
+/// while it runs ([`gated`]).
+#[derive(Debug, Clone, Default)]
+struct Cooldown(Arc<Mutex<Option<Instant>>>);
+
+impl Cooldown {
+    fn lock(&self) -> MutexGuard<'_, Option<Instant>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Start a cooldown at `now`, or keep a later-ending one.
+    fn start(&self, now: Instant) {
+        let until = now + RATE_LIMIT_COOLDOWN;
+        let mut current = self.lock();
+        if current.is_none_or(|current| current < until) {
+            *current = Some(until);
+        }
+    }
+
+    fn active(&self, now: Instant) -> bool {
+        self.lock().is_some_and(|until| now < until)
+    }
+}
+
 /// The daemon-wide budget of reference lookups: a token bucket and the
 /// cooldown after a rate limit.
 #[derive(Debug)]
 struct Budget {
     tokens: u32,
     refilled_at: Instant,
-    cooldown_until: Option<Instant>,
+    cooldown: Cooldown,
 }
 
 impl Budget {
@@ -470,7 +501,7 @@ impl Budget {
         Self {
             tokens: LOOKUP_BURST,
             refilled_at: now,
-            cooldown_until: None,
+            cooldown: Cooldown::default(),
         }
     }
 
@@ -491,7 +522,7 @@ impl Budget {
 
     /// Spend one lookup at `now`, or `false` when none is allowed.
     fn take(&mut self, now: Instant) -> bool {
-        if self.cooldown_until.is_some_and(|until| now < until) {
+        if self.cooldown.active(now) {
             return false;
         }
         self.refill(now);
@@ -502,9 +533,35 @@ impl Budget {
         true
     }
 
-    fn rate_limited(&mut self, now: Instant) {
-        self.cooldown_until = Some(now + RATE_LIMIT_COOLDOWN);
+    /// Give back a token spent on a lookup that never ran.
+    fn refund(&mut self) {
+        self.tokens = self.tokens.saturating_add(1).min(LOOKUP_BURST);
     }
+
+    fn rate_limited(&mut self, now: Instant) {
+        self.cooldown.start(now);
+    }
+}
+
+/// A lookup job's work once it holds its permits: `lookup`, unless a rate
+/// limit's cooldown is running, in which case it returns `None` without
+/// polling `lookup` — no `gh` runs — and so releases its permits at once
+/// rather than sleeping on them. A `rate_limited` answer starts the cooldown
+/// here, before the job releases its lane permit, so a lookup waiting for
+/// that permit sees it. A lookup already running when the cooldown starts
+/// finishes.
+async fn gated(
+    cooldown: Cooldown,
+    lookup: impl std::future::Future<Output = Result<RefAnswer, GhFailure>>,
+) -> Option<Result<RefAnswer, GhFailure>> {
+    if cooldown.active(Instant::now()) {
+        return None;
+    }
+    let result = lookup.await;
+    if matches!(&result, Err(f) if f.reason == GhFailureReason::RateLimited) {
+        cooldown.start(Instant::now());
+    }
+    Some(result)
 }
 
 /// The reference monitor's bookkeeping, without I/O: which wanted references
@@ -550,7 +607,14 @@ impl Scheduler {
             .cloned()
             .collect();
         for reference in gone {
-            if let Some(entry) = answers.remove(&reference) {
+            // An entry no lookup ever finished for holds nothing to keep: no
+            // answer and no retry deadline. Retiring it would only let a
+            // stream of references never looked up push out entries that
+            // do. A lookup of it still running records its result in a
+            // retired entry of its own ([`Self::finished`]).
+            if let Some(entry) = answers.remove(&reference)
+                && entry.fetched_at.is_some()
+            {
                 self.retired.insert(reference, (entry, now));
             }
         }
@@ -558,13 +622,24 @@ impl Scheduler {
         self.retired
             .retain(|_, (_, since)| now.saturating_duration_since(*since) < ttl);
         if self.retired.len() > MAX_RETIRED {
-            let mut by_age: Vec<(Instant, ResolvedReference)> = self
+            // The entries that protect nothing go first — no answer, and no
+            // failure still inside its backoff — then the oldest.
+            let interval = self.interval;
+            let mut by_worth: Vec<(bool, Instant, ResolvedReference)> = self
                 .retired
                 .iter()
-                .map(|(r, (_, since))| (*since, r.clone()))
+                .map(|(r, (entry, since))| {
+                    let protects = entry.value.is_some()
+                        || (entry.failed
+                            && entry.fetched_at.is_some_and(|at| {
+                                now.saturating_duration_since(at) < failure_backoff(interval)
+                            }));
+                    (protects, *since, r.clone())
+                })
                 .collect();
-            by_age.sort_by_key(|(since, _)| *since);
-            for (_, reference) in by_age.into_iter().take(self.retired.len() - MAX_RETIRED) {
+            by_worth.sort_by_key(|(protects, since, _)| (*protects, *since));
+            let excess = self.retired.len() - MAX_RETIRED;
+            for (_, _, reference) in by_worth.into_iter().take(excess) {
                 self.retired.remove(&reference);
             }
         }
@@ -606,6 +681,22 @@ impl Scheduler {
             start.push(reference);
         }
         start
+    }
+
+    /// Take back the lookup of `reference` that was admitted but handed its
+    /// turn back unrun, because a rate limit was recorded while it waited
+    /// for its permits ([`gated`]). It ran no `gh`, so its token is
+    /// refunded, and its entry is left as it was — still due, in its place —
+    /// for the first pass after the cooldown.
+    fn deferred(
+        &mut self,
+        answers: &mut HashMap<ResolvedReference, LookupEntry<RefAnswer>>,
+        reference: &ResolvedReference,
+    ) {
+        self.budget.refund();
+        if let Some(entry) = answers.get_mut(reference) {
+            entry.in_flight = false;
+        }
     }
 
     /// Record the lookup of `reference` that finished at `now` with
@@ -658,11 +749,32 @@ pub async fn run_reference_monitor(
     interval: Duration,
     permits: Arc<tokio::sync::Semaphore>,
 ) {
-    let checks = registry.agent_cards().references();
+    monitor_references(
+        registry.agent_cards().references(),
+        interval,
+        permits,
+        |reference: ResolvedReference| async move { look_up(&reference).await },
+    )
+    .await;
+}
+
+/// [`run_reference_monitor`] over `checks`, with `lookup` the call that
+/// checks one reference: [`look_up`] in the daemon, a stand-in in tests.
+/// `lookup`'s future does no work until it is first polled, which is after
+/// its job holds its permits.
+async fn monitor_references<L, F>(
+    checks: &ReferenceChecks,
+    interval: Duration,
+    permits: Arc<tokio::sync::Semaphore>,
+    lookup: L,
+) where
+    L: Fn(ResolvedReference) -> F,
+    F: std::future::Future<Output = Result<RefAnswer, GhFailure>> + Send + 'static,
+{
     let lane = Arc::new(tokio::sync::Semaphore::new(REFERENCE_LANE_PERMITS));
     let mut probes: JobPool<String, Option<String>> =
         JobPool::with_lane(permits.clone(), lane.clone());
-    let mut lookups: JobPool<ResolvedReference, Result<RefAnswer, GhFailure>> =
+    let mut lookups: JobPool<ResolvedReference, Option<Result<RefAnswer, GhFailure>>> =
         JobPool::with_lane(permits, lane);
     let mut scheduler = Scheduler::new(Instant::now(), interval);
     let mut probed_at: HashMap<String, Instant> = HashMap::new();
@@ -676,24 +788,28 @@ pub async fn run_reference_monitor(
                 probed_at.insert(cwd.clone(), Instant::now());
                 checks.lock().view.origins.insert(cwd, origin);
             }
-            Some((reference, result)) = lookups.next() => {
-                let logged = scheduler.finished(
-                    &mut checks.lock().view.answers,
-                    &reference,
-                    result,
-                    Instant::now(),
-                );
-                if let Some(detail) = logged {
-                    warn!(
-                        repo = %escape_control_and_bidi(&reference.repo),
-                        kind = reference.kind.as_str(),
-                        number = reference.number,
-                        error = %escape_control_and_bidi(&detail),
-                        "checking a reference an agent reported failed; its card \
-                         says so until a later lookup succeeds"
+            Some((reference, outcome)) = lookups.next() => match outcome {
+                // Handed back unrun during a rate limit's cooldown.
+                None => scheduler.deferred(&mut checks.lock().view.answers, &reference),
+                Some(result) => {
+                    let logged = scheduler.finished(
+                        &mut checks.lock().view.answers,
+                        &reference,
+                        result,
+                        Instant::now(),
                     );
+                    if let Some(detail) = logged {
+                        warn!(
+                            repo = %escape_control_and_bidi(&reference.repo),
+                            kind = reference.kind.as_str(),
+                            number = reference.number,
+                            error = %escape_control_and_bidi(&detail),
+                            "checking a reference an agent reported failed; its card \
+                             says so until a later lookup succeeds"
+                        );
+                    }
                 }
-            }
+            },
         }
         let now = Instant::now();
         let wanted = checks.wanted();
@@ -720,8 +836,8 @@ pub async fn run_reference_monitor(
             );
         }
 
-        // References: a lookup a card stopped naming runs to its end, so the
-        // call it already cost is recorded rather than wasted.
+        // References: a lookup a card stopped naming is not cancelled, so a
+        // call it makes is recorded rather than wasted.
         let due = scheduler.plan(
             &mut checks.lock().view.answers,
             &wanted.refs,
@@ -736,8 +852,8 @@ pub async fn run_reference_monitor(
                 number = reference.number,
                 "checking a reference an agent reported"
             );
-            let job = reference.clone();
-            lookups.spawn(reference, async move { look_up(&job).await });
+            let job = gated(scheduler.budget.cooldown.clone(), lookup(reference.clone()));
+            lookups.spawn(reference, job);
         }
     }
 }
@@ -1213,8 +1329,11 @@ mod tests {
         assert!(answers[&key].value.is_some(), "its answer is back");
     }
 
-    /// One `rate_limited` answer stops every reference lookup, not only its
-    /// own, for the cooldown.
+    /// One `rate_limited` answer stops the scheduler admitting any reference
+    /// lookup, not only that reference's, for the cooldown. This drives
+    /// [`Scheduler::plan`] alone: the lookups already admitted and waiting
+    /// for the lane are
+    /// `a_rate_limit_holds_the_lookups_queued_behind_it`'s.
     #[test]
     fn a_rate_limit_pauses_every_reference_lookup() {
         let interval = Duration::from_secs(60);
@@ -1258,6 +1377,271 @@ mod tests {
             start + RATE_LIMIT_COOLDOWN,
         );
         assert_eq!(due, [other]);
+    }
+
+    /// Wait up to ten seconds for `done`.
+    async fn wait_for(what: &str, done: impl Fn() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Review N1: the monitor admits [`MAX_QUEUED_LOOKUPS`] lookups, two of
+    /// which run while the rest wait for the lane. Once a running one
+    /// answers `rate_limited`, the waiting ones give their turn back without
+    /// calling `gh`, the other running one finishes, nothing more starts
+    /// during the cooldown, and a pool outside the lane — the branch
+    /// badge's — still runs its jobs throughout.
+    #[tokio::test]
+    async fn a_rate_limit_holds_the_lookups_queued_behind_it() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let checks = Arc::new(ReferenceChecks::default());
+        let permits = crate::pull_request::new_job_bound();
+        let started = Arc::new(AtomicUsize::new(0));
+        // Each permit lets one running stand-in answer `rate_limited`.
+        let answer = Arc::new(tokio::sync::Semaphore::new(0));
+        let refs: HashSet<ResolvedReference> = (1..=MAX_QUEUED_LOOKUPS as u64)
+            .map(|n| resolved("o/r", ReferenceKind::Issue, n))
+            .collect();
+        checks.set_wanted(WantedRefs {
+            cwds: BTreeSet::new(),
+            refs: refs.clone(),
+        });
+        let monitor = {
+            let (checks, permits) = (checks.clone(), permits.clone());
+            let (started, answer) = (started.clone(), answer.clone());
+            tokio::spawn(async move {
+                monitor_references(
+                    &checks,
+                    Duration::from_secs(60),
+                    permits,
+                    move |_reference: ResolvedReference| {
+                        let (started, answer) = (started.clone(), answer.clone());
+                        async move {
+                            started.fetch_add(1, Ordering::SeqCst);
+                            answer.acquire().await.expect("never closed").forget();
+                            failed(GhFailureReason::RateLimited)
+                        }
+                    },
+                )
+                .await;
+            })
+        };
+        let branch_jobs_run = |permits: Arc<tokio::sync::Semaphore>| async move {
+            let mut branch: JobPool<u32, u32> = JobPool::new(permits);
+            for id in 0..10 {
+                branch.spawn(id, async move { id });
+            }
+            let mut served = 0;
+            while tokio::time::timeout(Duration::from_secs(10), branch.next())
+                .await
+                .expect("the branch jobs are served")
+                .is_some()
+            {
+                served += 1;
+            }
+            assert_eq!(served, 10);
+        };
+
+        wait_for("the lane full", || {
+            started.load(Ordering::SeqCst) == REFERENCE_LANE_PERMITS
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(started.load(Ordering::SeqCst), REFERENCE_LANE_PERMITS);
+        branch_jobs_run(permits.clone()).await;
+
+        // The first running lookup answers `rate_limited`, then the other.
+        answer.add_permits(1);
+        let settled = |checks: &ReferenceChecks| {
+            let view = checks.view();
+            let answered = refs
+                .iter()
+                .filter(|r| view.answers.get(*r).is_some_and(|e| e.fetched_at.is_some()))
+                .count();
+            let held = refs
+                .iter()
+                .filter(|r| {
+                    view.answers
+                        .get(*r)
+                        .is_some_and(|e| e.fetched_at.is_none() && !e.in_flight)
+                })
+                .count();
+            (answered, held)
+        };
+        wait_for("the queued lookups held, or one started", || {
+            started.load(Ordering::SeqCst) > REFERENCE_LANE_PERMITS
+                || settled(&checks) == (1, MAX_QUEUED_LOOKUPS - REFERENCE_LANE_PERMITS)
+        })
+        .await;
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            REFERENCE_LANE_PERMITS,
+            "a queued lookup ran gh after the rate limit"
+        );
+        answer.add_permits(1);
+        wait_for("the running lookup finished", || {
+            settled(&checks) == (2, MAX_QUEUED_LOOKUPS - REFERENCE_LANE_PERMITS)
+        })
+        .await;
+
+        // A newly named reference wakes the monitor; nothing starts.
+        let mut more = refs.clone();
+        more.insert(resolved("o/r", ReferenceKind::Issue, 99));
+        checks.set_wanted(WantedRefs {
+            cwds: BTreeSet::new(),
+            refs: more,
+        });
+        branch_jobs_run(permits.clone()).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(started.load(Ordering::SeqCst), REFERENCE_LANE_PERMITS);
+        monitor.abort();
+    }
+
+    /// Review N1: lookups handed back unrun during a cooldown cost no
+    /// budget, keep their place, and go first once the cooldown ends.
+    #[test]
+    fn lookups_held_by_a_rate_limit_go_first_after_it() {
+        let interval = Duration::from_secs(60);
+        let start = Instant::now();
+        let mut scheduler = Scheduler::new(start, interval);
+        let mut answers = HashMap::new();
+        let held: HashSet<ResolvedReference> = (1..=MAX_QUEUED_LOOKUPS as u64)
+            .map(|n| resolved("o/r", ReferenceKind::Issue, n))
+            .collect();
+        let due = scheduler.plan(&mut answers, &held, |_| false, 0, start);
+        assert_eq!(due.len(), MAX_QUEUED_LOOKUPS);
+        let tokens = scheduler.budget.tokens;
+        scheduler.finished(
+            &mut answers,
+            &due[0],
+            failed(GhFailureReason::RateLimited),
+            start,
+        );
+        for reference in &due[1..] {
+            scheduler.deferred(&mut answers, reference);
+        }
+        assert_eq!(
+            scheduler.budget.tokens,
+            tokens + MAX_QUEUED_LOOKUPS as u32 - 1,
+            "a lookup that never ran is refunded"
+        );
+        let mut wanted = held.clone();
+        let newer = resolved("o/r", ReferenceKind::Issue, 99);
+        wanted.insert(newer.clone());
+        let later = start + Duration::from_secs(1);
+        assert!(
+            scheduler
+                .plan(&mut answers, &wanted, |_| false, 0, later)
+                .is_empty()
+        );
+        let after = start + RATE_LIMIT_COOLDOWN;
+        let due_after = scheduler.plan(&mut answers, &wanted, |_| false, 0, after);
+        assert_eq!(due_after.len(), MAX_QUEUED_LOOKUPS);
+        assert!(
+            !due_after.contains(&newer),
+            "the held lookups go before a newer reference"
+        );
+        assert!(
+            due_after
+                .iter()
+                .all(|r| due[1..].contains(r) || *r == due[0])
+        );
+    }
+
+    /// Review N2: references named and dropped without ever being looked up
+    /// keep no entry, so however many rotate through, a failed reference
+    /// named again inside its backoff still finds its failure.
+    #[test]
+    fn untouched_references_do_not_evict_a_failed_ones_backoff() {
+        let interval = Duration::from_secs(60);
+        let start = Instant::now();
+        let mut scheduler = Scheduler::new(start, interval);
+        let mut answers = HashMap::new();
+        let key = resolved("o/r", ReferenceKind::PullRequest, 9);
+        let due = scheduler.plan(
+            &mut answers,
+            &HashSet::from([key.clone()]),
+            |_| false,
+            0,
+            start,
+        );
+        assert_eq!(due, std::slice::from_ref(&key));
+        scheduler.finished(&mut answers, &key, failed(GhFailureReason::Error), start);
+        // The budget is spent, so none of the references below is looked up.
+        let rotate_at = start + Duration::from_secs(1);
+        while scheduler.budget.take(rotate_at) {}
+        let sets = MAX_RETIRED / 32 + 2;
+        for set in 0..sets {
+            let wanted: HashSet<ResolvedReference> = (0..32)
+                .map(|i| resolved("a/b", ReferenceKind::Issue, (set * 32 + i + 1) as u64))
+                .collect();
+            let now = rotate_at + Duration::from_millis(set as u64);
+            assert!(
+                scheduler
+                    .plan(&mut answers, &wanted, |_| false, 0, now)
+                    .is_empty()
+            );
+        }
+        assert!(scheduler.retired.len() <= MAX_RETIRED);
+        let again = start + Duration::from_secs(10);
+        assert!(again < start + failure_backoff(interval));
+        let due = scheduler.plan(
+            &mut answers,
+            &HashSet::from([key.clone()]),
+            |_| false,
+            0,
+            again,
+        );
+        assert!(due.is_empty(), "named again inside its backoff: {due:?}");
+        assert!(answers[&key].failed, "its failure is back");
+    }
+
+    /// Review N2: when more than [`MAX_RETIRED`] entries are kept, the ones
+    /// that protect nothing — no answer, and a failure whose backoff has
+    /// passed — go before an older one holding an answer.
+    #[test]
+    fn a_full_retired_set_drops_what_protects_nothing_first() {
+        let interval = Duration::from_secs(60);
+        let start = Instant::now();
+        let mut scheduler = Scheduler::new(start, interval);
+        let mut answers = HashMap::new();
+        let kept = resolved("o/r", ReferenceKind::PullRequest, 1);
+        let open = RefAnswer {
+            state: PullRequestState::Open,
+            ci: None,
+            review: None,
+            title: None,
+            url: kept.url(),
+            checked_at: at(),
+        };
+        let answered = LookupEntry {
+            value: Some(open),
+            fetched_at: Some(start),
+            ..LookupEntry::default()
+        };
+        scheduler.retired.insert(kept.clone(), (answered, start));
+        for n in 0..MAX_RETIRED as u64 {
+            let spent = LookupEntry {
+                failed: true,
+                fetched_at: Some(start),
+                ..LookupEntry::default()
+            };
+            scheduler.retired.insert(
+                resolved("a/b", ReferenceKind::Issue, n + 1),
+                (spent, start + Duration::from_secs(1)),
+            );
+        }
+        let now = start + failure_backoff(interval) + Duration::from_secs(1);
+        assert!(now < start + retired_ttl(interval));
+        scheduler.plan(&mut answers, &HashSet::new(), |_| false, 0, now);
+        assert_eq!(scheduler.retired.len(), MAX_RETIRED);
+        assert!(scheduler.retired.contains_key(&kept), "the answer is kept");
     }
 
     /// At most [`MAX_QUEUED_LOOKUPS`] lookups are unfinished, and the
