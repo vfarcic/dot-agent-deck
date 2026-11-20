@@ -986,7 +986,7 @@ struct CwdEntry {
 /// Whether a directory's branch needs re-reading at `now`: never read, once an
 /// interval, or after a turn end once the same debounce as a lookup's passed —
 /// so a stream of Idle reports cannot drive `git` at its completion rate.
-fn resolve_due(
+pub(crate) fn resolve_due(
     resolved_at: Option<Instant>,
     kicked: bool,
     now: Instant,
