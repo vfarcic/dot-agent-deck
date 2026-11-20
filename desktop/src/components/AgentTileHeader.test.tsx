@@ -1,10 +1,12 @@
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot, createFixtureStartedAgent } from "../data/fixture";
 import { mapDesktopSnapshot, type DesktopSnapshotDto } from "../lib/bridge";
 import { DISPLAY_LIMITS, displayIdentity, displayTitle } from "../lib/displayText";
 import type { AgentSession, RuntimeMode } from "../types";
 import { AgentTile } from "./AgentTile";
+import { OutputReader } from "./OutputReader";
+import { tuiStatusWords } from "../test/tuiStatusWords";
 
 vi.mock("./TerminalViewport", () => ({ TerminalViewport: () => <pre>terminal</pre> }));
 
@@ -121,7 +123,7 @@ describe("the agent tile's header (issue #2001)", () => {
     if (!line) throw new Error("the tile has a title line");
     expect(within(line as HTMLElement).getByRole("heading", { level: 2 })).toHaveTextContent(/^dot-agent-deck$/);
     expect(line).toHaveTextContent("claude");
-    expect(line).toHaveTextContent(/running/i);
+    expect(line).toHaveTextContent(/working/i);
     expect(within(line as HTMLElement).getByRole("button", { name: "Rename dot-agent-deck" })).toBeVisible();
     expect(card.querySelector(".agent-identity > div > p:not([class])")).toBeNull();
   });
@@ -181,5 +183,21 @@ describe("the agent tile's header (issue #2001)", () => {
     expect(card.querySelector("header")).toHaveTextContent(planner.role);
     expect(card.querySelector("header")).toHaveTextContent(planner.model);
     expect(card.querySelector("footer")).toHaveTextContent(`LEASE · ${planner.writeLease.toUpperCase()}`);
+  });
+});
+
+describe("the tile's status word (issue #2411)", () => {
+  /// Scenario: A live agent in each status the daemon reports is on the deck, one at a time; its tile, and the output reader opened on it, show the word the TUI's card shows for that status (Thinking, Working and Compacting by name, Error rather than Failed).
+  it("shows the daemon's word on the tile and in the output reader", () => {
+    for (const [wire, word] of Object.entries(tuiStatusWords())) {
+      const agent = liveAgent({ status: wire as DtoAgent["status"] });
+      const { unmount } = render(<OutputReader agent={agent} onClose={vi.fn()} />);
+      expect(screen.getByRole("dialog").querySelector(".status-label")?.textContent, `reader: ${wire}`).toBe(word);
+      unmount();
+      const card = tile(agent);
+      expect(card.querySelector("header .status-label")?.textContent, `tile: ${wire}`).toBe(word);
+      expect(card.querySelector(`header .agent-state-mark.status-${word.replace(" ", "_")}`), `tile mark: ${wire}`).not.toBeNull();
+      cleanup();
+    }
   });
 });

@@ -13,8 +13,8 @@ expression: end
     │  agent-17                                                            │    
     │  agent-18                                                            │    
     │  agent-19                                                            │    
-The │  agent-20                                                            │and 
-    │  [Dismiss c] [Close]                                                 │s c]
- COM│  j/k scroll · c dismiss · Esc to close                               │    
-[Tog└──────────────────────────────────────────────────────────────────────┘e g]
-[Schedules s]
+    │  agent-20                                                            │    
+The │  [Dismiss c] [Close]                                                 │and 
+    │  j/k scroll · c dismiss · Esc to close                               │s c]
+ COM└──────────────────────────────────────────────────────────────────────┘    
+[Quit Ctrl+C] [Filter /] [Rename r] [Generate g] [Schedules s]

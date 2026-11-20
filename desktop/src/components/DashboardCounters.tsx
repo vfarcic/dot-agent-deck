@@ -8,11 +8,11 @@ const POPOVER_MARGIN = 12;
  * The agent dashboard's counters, folded into one button (issue #2312
  * follow-up).
  *
- * The row of AGENTS, RUNNING, NEEDS INPUT … DAEMONS instruments took most of
+ * The row of AGENTS, WORKING, NEEDS INPUT … DAEMONS instruments took most of
  * the top bar at the type scale's sizes, and every daemon's own header already
  * counts its agents. So the top bar keeps a button that reads the total and
  * names only what someone has to act on — agents waiting for input, agents
- * that failed, daemons that are not answering — and the full set of counters
+ * in error, daemons that are not answering — and the full set of counters
  * opens beneath it: on hover, on a click, or by voice (`show_dashboard_counters`).
  *
  * **Shown** is `open` (a click or voice, held by the overview) or a mouse
@@ -172,7 +172,8 @@ export interface DashboardCountersSummary {
   known: boolean;
   agents: number;
   needsInput: number;
-  failed: number;
+  /** Agents the daemon reports in Error (issue #2411: the daemon's word, not "failed"). */
+  errors: number;
   decksUp: number;
   decksTotal: number;
 }
@@ -188,7 +189,7 @@ export function countersWords(summary: DashboardCountersSummary): { total: strin
   const alerts: CountersAlert[] = [];
   const alert = (count: string, word: string, className: string) => alerts.push({ count, word, text: `${count} ${word}`, className });
   if (summary.known && summary.needsInput > 0) alert(String(summary.needsInput), "needs input", "count-needs-input");
-  if (summary.known && summary.failed > 0) alert(String(summary.failed), "failed", "count-failed");
+  if (summary.known && summary.errors > 0) alert(String(summary.errors), "error", "count-error");
   if (summary.decksUp < summary.decksTotal) alert(`${summary.decksUp}/${summary.decksTotal}`, "daemons", "count-failed");
   const total = `${totalCount} ${totalWord}`;
   return { total, totalCount, totalWord, alerts, label: [total, ...alerts.map((entry) => entry.text)].join(", ") };

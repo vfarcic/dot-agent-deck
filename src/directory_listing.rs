@@ -452,7 +452,7 @@ fn list_canonical_dir_between(
 /// socket or a device. It does not apply that reader's size bound or parse the
 /// file — this is one `lstat` per entry, which is what keeps a thousand-entry
 /// listing cheap, and it never opens anything, so a FIFO cannot block it.
-fn holds_project_config(dir: &Path) -> bool {
+pub(crate) fn holds_project_config(dir: &Path) -> bool {
     std::fs::symlink_metadata(dir.join(CONFIG_FILE_NAME))
         .is_ok_and(|meta| meta.file_type().is_file())
 }

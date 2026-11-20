@@ -319,7 +319,11 @@ pub fn handle_hook(agent: &str) -> ExitCode {
     if agent == "codex" && !pre_inbox && crate::inbox_prompt::in_deck_pane() {
         match codex_inbox_hooks(&input, &mut event, &mut announce) {
             CodexInbox::Nothing => {}
-            CodexInbox::Print(output) => output.print(),
+            CodexInbox::Print(output) => {
+                output.print();
+                #[cfg(unix)]
+                crate::inbox_oneshot::hold_after_print();
+            }
             // PRD #1666 part 3 (H4): a hand-over whose output was written and
             // flushed whole with a block in it goes on with the turn. One the
             // fence refused whole printed nothing, and one whose write or
@@ -331,8 +335,13 @@ pub fn handle_hook(agent: &str) -> ExitCode {
             // Codex works, and a block it did take may come again, marked as
             // a possible repeat.
             #[cfg(unix)]
-            CodexInbox::TurnEnd(injection) => {
-                if injection.print().continues_turn() {
+            CodexInbox::TurnEnd(injection, witness) => {
+                let ran = match witness {
+                    Some(witness) => injection.print_witnessed(witness),
+                    None => injection.print(),
+                };
+                crate::inbox_oneshot::hold_after_print();
+                if ran.continues_turn() {
                     return ExitCode::SUCCESS;
                 }
             }
@@ -468,18 +477,70 @@ fn claude_inbox_hooks(
         }
         "UserPromptSubmit" => {
             let prompt = payload.get("prompt").and_then(Value::as_str)?;
+            let mark = crate::inbox_witness::TranscriptMark::of_payload(&payload);
+            // Issue #2347: and when it drops the prompt it runs no turn and
+            // fires no `Stop`, so the witness settles the turn this event
+            // starts, whatever the prompt carries.
+            #[cfg(unix)]
+            let turn = mark.as_ref().and_then(|_| {
+                crate::inbox_witness::PromptTurn::new(prompt, &event.session_id, event.cwd.clone())
+            });
+            #[cfg(unix)]
+            if let Some(turn) = &turn {
+                event.metadata.insert(
+                    crate::event::PROMPT_TURN_METADATA_KEY.to_string(),
+                    turn.nonce.clone(),
+                );
+            }
             // Issue #2341: Claude can still drop the prompt after this hook
             // exits, so what it hands over is committed once the session
             // transcript shows Claude took it.
-            deck_prompt_submit(
+            let output = deck_prompt_submit(
                 prompt,
                 crate::event::InboxComponent::ClaudeHooks,
                 crate::inbox_hub::SESSION_FRAMING,
                 event,
-                crate::inbox_witness::TranscriptMark::of_payload(&payload),
-            )
+                mark.clone(),
+            );
+            #[cfg(unix)]
+            return with_turn_witness(output, mark, turn);
+            #[cfg(not(unix))]
+            output
         }
         _ => None,
+    }
+}
+
+/// Issue #2347: `output` with its witness settling `turn` too, or, for a
+/// prompt the inbox had nothing to witness for, a witness for the turn
+/// alone.
+#[cfg(unix)]
+fn with_turn_witness(
+    output: Option<HookOutput>,
+    mark: Option<crate::inbox_witness::TranscriptMark>,
+    turn: Option<crate::inbox_witness::PromptTurn>,
+) -> Option<HookOutput> {
+    let Some(turn) = turn else {
+        return output;
+    };
+    match output {
+        Some(mut output) => {
+            if let Some(witness) = output.witness.as_mut() {
+                witness.turn = Some(turn);
+            }
+            Some(output)
+        }
+        None => Some(HookOutput {
+            stdout: String::new(),
+            one_shot: None,
+            witness: Some(crate::inbox_prompt::Witness {
+                mark: mark?,
+                sender: crate::event::InboxOneShotSender::ClaudeHooks,
+                native: Vec::new(),
+                receipts_by: std::time::Instant::now(),
+                turn: Some(turn),
+            }),
+        }),
     }
 }
 
@@ -573,8 +634,13 @@ enum CodexInbox {
     Print(HookOutput),
     /// PRD #1666 part 3 (H4): hand this over as the `Stop` block; a hand-over
     /// written and flushed whole goes on with the turn and reports nothing.
+    /// With a witness, what it wrote is committed once Codex's rollout shows
+    /// Codex went on with it (issue #2346).
     #[cfg(unix)]
-    TurnEnd(crate::inbox_prompt::OneShotInjection),
+    TurnEnd(
+        crate::inbox_prompt::OneShotInjection,
+        Option<crate::inbox_prompt::Witness>,
+    ),
 }
 
 /// PRD #1666 S7: Codex's side of the inbox, for one hook payload in a deck
@@ -592,7 +658,9 @@ enum CodexInbox {
 /// PRD #1666 part 3 (H4): both hand-overs are one-shot receipt receivers, as
 /// Claude Code's prompt hook is (part 2 §1.4): each asks the deck whether it
 /// serves Codex's hooks, fetches on that connection, and commits what it wrote
-/// and flushed; nothing is acknowledged by id. Each is headed by
+/// and flushed; nothing is acknowledged by id. Issue #2346: when the payload
+/// names Codex's rollout, what it wrote is committed only once the rollout
+/// shows Codex took it ([`crate::inbox_witness`]). Each is headed by
 /// [`crate::inbox_hub::AGENT_FRAMING`], and its whole JSON — envelope, framing
 /// and escaped blocks — stays within
 /// [`crate::event::InboxComponent::CodexHooks`]'s byte budget; what does not
@@ -619,30 +687,49 @@ fn codex_inbox_hooks(
             .get("prompt")
             .and_then(Value::as_str)
             .and_then(|prompt| {
-                // Codex's prompt hook still commits what it wrote: no
-                // transcript witness reads Codex's session yet.
+                // Issue #2346: Codex can still drop what the hook printed
+                // after it exits (an interrupt), so it is committed once
+                // Codex's rollout shows Codex took it.
                 deck_prompt_submit(
                     prompt,
                     crate::event::InboxComponent::CodexHooks,
                     framing,
                     event,
-                    None,
+                    crate::inbox_witness::TranscriptMark::of_payload(&payload),
                 )
             })
             .map_or(CodexInbox::Nothing, CodexInbox::Print),
         #[cfg(unix)]
-        Some("Stop") => crate::inbox_prompt::one_shot_injection(
-            crate::inbox_prompt::HookHandOver {
-                component: crate::event::InboxComponent::CodexHooks,
-                consumer: crate::event::InboxFetchConsumer::TurnEndHook,
-                rung: None,
-                ring: None,
-                envelope: &crate::inbox_prompt::Envelope::Block,
-                framing,
-            },
-            std::time::Instant::now() + crate::inbox_prompt::prompt_receipts_wait(),
-        )
-        .map_or(CodexInbox::Nothing, CodexInbox::TurnEnd),
+        Some("Stop") => {
+            let receipts_by =
+                std::time::Instant::now() + crate::inbox_prompt::prompt_receipts_wait();
+            // Issue #2346: an interrupt can drop the block reason after the
+            // hook exits too, so it is committed once the rollout shows Codex
+            // went on with it.
+            let witness = crate::inbox_witness::TranscriptMark::of_payload(&payload).map(|mark| {
+                crate::inbox_prompt::Witness {
+                    mark,
+                    sender: crate::event::InboxOneShotSender::CodexHooks,
+                    native: Vec::new(),
+                    receipts_by,
+                    turn: None,
+                }
+            });
+            crate::inbox_prompt::one_shot_injection(
+                crate::inbox_prompt::HookHandOver {
+                    component: crate::event::InboxComponent::CodexHooks,
+                    consumer: crate::event::InboxFetchConsumer::TurnEndHook,
+                    rung: None,
+                    ring: None,
+                    envelope: &crate::inbox_prompt::Envelope::Block,
+                    framing,
+                },
+                receipts_by,
+            )
+            .map_or(CodexInbox::Nothing, |injection| {
+                CodexInbox::TurnEnd(injection, witness)
+            })
+        }
         _ => CodexInbox::Nothing,
     }
 }
@@ -674,12 +761,15 @@ pub fn deck_prompt_submit(
     // user's prompt while it runs.
     let receipts_by = std::time::Instant::now() + crate::inbox_prompt::prompt_receipts_wait();
     // Issue #2341: with a transcript to witness it, what the prompt carries
-    // is committed once Claude has taken the prompt, not now.
+    // is committed once the agent has taken the prompt, not now (Codex's
+    // too since issue #2346).
     #[cfg(unix)]
     let witness = transcript.map(|mark| crate::inbox_prompt::Witness {
         mark,
+        sender: crate::inbox_prompt::sender_of(component),
         native: crate::inbox_prompt::delivered(prompt),
         receipts_by,
+        turn: None,
     });
     // No witness runs off Unix: the one-shots that would hand a block over
     // are Unix only.
@@ -1385,6 +1475,64 @@ fn pi_await_answer(raw: &str) -> Option<Value> {
     let reply = hold_question(&event, AWAIT_ANSWER_DEADLINE);
     crate::question::pi_value(&dialog, &question, &reply?)
 }
+
+/// Issue #2347: tell the deck that Claude Code dropped the prompt `turn`
+/// names: an `Idle` from this pane carrying the prompt's nonce, which the
+/// daemon applies only while that prompt's turn is the pane's latest news
+/// (`crate::state::AppState::admit_prompt_not_taken`). Sent by the
+/// transcript witness ([`crate::inbox_witness`]), with the pane's token from
+/// the environment it inherited from the hook, and only to a deck whose
+/// answer to `inbox_receipts` says it guards the report
+/// ([`crate::event::InboxWaitReply::prompt_not_taken`]): an older one would
+/// apply it as a plain `Idle`, even over a turn the prompt did not start.
+#[cfg(unix)]
+pub(crate) fn report_prompt_not_taken(turn: &crate::inbox_witness::PromptTurn) {
+    let Some(token) = crate::hook_provenance::token_from_env() else {
+        return;
+    };
+    let Some(pane_id) = std::env::var(DOT_AGENT_DECK_PANE_ID)
+        .ok()
+        .filter(|pane| !pane.is_empty())
+    else {
+        return;
+    };
+    let agent_id = std::env::var(DOT_AGENT_DECK_AGENT_ID)
+        .ok()
+        .filter(|agent| !agent.is_empty());
+    let Some(question) =
+        crate::inbox_oneshot::receipts_question(&pane_id, agent_id.as_deref(), &token)
+    else {
+        return;
+    };
+    let guarded = crate::inbox_oneshot::Connection::ask_receipts(
+        &client_socket_path(),
+        &question,
+        std::time::Instant::now() + PROMPT_NOT_TAKEN_SEND_WAIT,
+    )
+    .and_then(|reply| reply.prompt_not_taken)
+    .is_some_and(|version| version >= crate::event::PROMPT_NOT_TAKEN_REPORTS);
+    if !guarded {
+        return;
+    }
+    let mut event = producer_event(
+        turn.session_id.clone(),
+        AgentType::ClaudeCode,
+        EventType::Idle,
+        turn.cwd.clone(),
+    );
+    event.metadata.insert(
+        crate::event::PROMPT_NOT_TAKEN_METADATA_KEY.to_string(),
+        turn.nonce.clone(),
+    );
+    if let Ok(line) = crate::event::agent_event_line(&event, Some(&token)) {
+        send_to_socket_bounded(&line, PROMPT_NOT_TAKEN_SEND_WAIT);
+    }
+}
+
+/// Issue #2347: how long the witness waits on the deck to answer whether it
+/// guards the report, and then to take it.
+#[cfg(unix)]
+const PROMPT_NOT_TAKEN_SEND_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// A bare event from this pane, as every producer here stamps one.
 fn producer_event(
@@ -8566,6 +8714,7 @@ mod gated_send_tests {
             token: Some("tok".into()),
             command: Some("devbox run oc-big".into()),
             agent: Some("opencode".into()),
+            dir: None,
             timestamp: chrono::Utc::now(),
         }
     }

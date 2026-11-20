@@ -28,7 +28,7 @@ import { DaemonAddressFields, DaemonNameRow, useNewDaemon } from "./AddDaemonFor
 export const AddDaemonOpener = createContext<(() => void) | undefined>(undefined);
 
 /** What voice's "close" answers while the add is being saved. */
-export const ADD_DAEMON_SAVING = "The daemon is being added; the dialog closes once it is saved.";
+const ADD_DAEMON_SAVING = "The daemon is being added; the dialog closes once it is saved.";
 
 /** Said when a save left the daemon on screen but not on disk, and the hook has no sentence of its own for it. */
 const UNSAVED_FALLBACK = "The daemon is added, but saving it failed, so it may not survive a restart.";

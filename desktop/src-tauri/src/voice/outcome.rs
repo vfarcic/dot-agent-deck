@@ -43,6 +43,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+use super::chain::{Lands, Plan as ChainPlan};
 use super::choice::{ChoiceLive, MAX_CHOICES};
 use super::command_text::grounded_command_text;
 use super::dictation::{
@@ -53,6 +54,7 @@ use super::dictation::{
 };
 use super::filter::grounded_filter_text;
 use super::meaning::{Ballot, MeaningRequest, MeaningVerdict, Place, Strictness, every_action};
+use super::resolver::IntentStep;
 use super::resolver::{IntentAnswer, IntentError, IntentRequest, IntentResolver};
 use super::schema::{
     DECK_HIDDEN_HINT, LABELS_WITHHELD_HINT, annotate_for, hidden_by_flag, needs_labels,
@@ -95,6 +97,35 @@ const CLOSE_AGENT_PHRASES: [&str; 8] = [
     "close this agent",
     "close the agent",
 ];
+/// PRD #2119 review — whole requests to generate config for the viewed agent,
+/// outside typing mode. Like [`CLOSE_AGENT_PHRASES`], they name no agent, so
+/// they open the pane's own confirmation without the command backend and work
+/// with Settings → Voice → Send on-screen names off.
+///
+/// "update config" is the same request: the pane's control reads Update config
+/// when the project already has one, and either phrase works whichever label
+/// shows.
+const GENERATE_CONFIG_PHRASES: [&str; 12] = [
+    "generate config",
+    "generate a config",
+    "generate the config",
+    "generate config for this agent",
+    "generate a config for this agent",
+    "generate config with this agent",
+    "update config",
+    "update the config",
+    "update config for this agent",
+    "update the config for this agent",
+    "update config with this agent",
+    "update the config with this agent",
+];
+/// The row [`GENERATE_CONFIG_PHRASES`] dispatch.
+const GENERATE_CONFIG_ROW: &str = "generate_config";
+/// What the agent screen answers a model pick of `generate_config` that names
+/// an agent: like a named stop there, it never targets another agent, and it
+/// is the pane's own control and phrase that reach the viewed one.
+const GENERATE_CONFIG_PANE_HINT: &str =
+    "To generate config for this agent, say 'generate config' or press Generate config.";
 /// The Daemons screen's row, whose bare "go back" is [`CLOSE_ROW`]'s where it
 /// cannot run.
 const OPEN_DECK_ROW: &str = "open_deck";
@@ -589,6 +620,49 @@ pub enum VoiceOutcome {
         transcript: Transcript,
         sentence: String,
     },
+    /// PRD #1184: an utterance answered as two or three steps that the app
+    /// would not run — a rule of [`super::chain`] refused it, or one of its
+    /// steps could not run on the screen the earlier ones would leave.
+    /// Nothing ran, and `sentence` says which rule or which step.
+    ChainRefused {
+        transcript: Transcript,
+        sentence: String,
+    },
+    /// PRD #1184: two or three steps that passed every check, to run in
+    /// order. The panel runs each one exactly as it runs a single dispatch,
+    /// and before every step after the first it checks that the screen is the
+    /// one the step was judged on; the first step that cannot run stops the
+    /// chain, and the panel says which step stopped and which ran.
+    Chain {
+        transcript: Transcript,
+        steps: Vec<ChainStep>,
+        sentence: String,
+    },
+}
+
+/// One step of a [`VoiceOutcome::Chain`]: a dispatch, with the words it came
+/// from and the screen it was judged on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChainStep {
+    /// The user's words for this step, quoted in the report.
+    pub said: String,
+    pub action: String,
+    pub invoke: String,
+    pub params: Vec<ResolvedParam>,
+    /// What this step reports when it runs.
+    pub sentence: String,
+    /// The screen the step was judged on: the one the user was on for the
+    /// first step, and the one the earlier steps lead to for the others. The
+    /// panel refuses the step when the screen is not this one when it runs.
+    pub screen: Screen,
+    /// A step that matched several things: the numbered choice the chain
+    /// pauses on when this step's turn comes (a
+    /// [`VoiceOutcome::ParamAmbiguous`] with its candidates). `params` are
+    /// then what the chosen one is dispatched beside, and `sentence` is the
+    /// question. At most one step of a chain carries one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub choice: Option<Box<VoiceOutcome>>,
 }
 
 impl VoiceOutcome {
@@ -605,7 +679,9 @@ impl VoiceOutcome {
             | VoiceOutcome::ParamAmbiguous { sentence, .. }
             | VoiceOutcome::ResolutionFailed { sentence, .. }
             | VoiceOutcome::TranscriptionFailed { sentence, .. }
-            | VoiceOutcome::Dropped { sentence, .. } => sentence,
+            | VoiceOutcome::Dropped { sentence, .. }
+            | VoiceOutcome::ChainRefused { sentence, .. }
+            | VoiceOutcome::Chain { sentence, .. } => sentence,
         }
     }
 
@@ -687,6 +763,13 @@ impl VoiceOutcome {
     fn dropped(transcript: Transcript) -> Self {
         Self::Dropped {
             sentence: heard(&transcript, DROPPED_WHILE_SPEAKING),
+            transcript,
+        }
+    }
+
+    fn chain_refused(transcript: Transcript, why: &str) -> Self {
+        Self::ChainRefused {
+            sentence: heard(&transcript, why),
             transcript,
         }
     }
@@ -1253,6 +1336,57 @@ async fn after_local_intercepts(
         Err(error) => return finish(VoiceOutcome::resolution_failed(transcript, &error)),
     };
 
+    // PRD #1184: an answer of two or three steps. The rules that need no
+    // model are applied first ([`super::chain::plan`]); a chain that passes
+    // them is checked step by step, each on its own words, and the
+    // whole-sentence ballot sent above is dropped unread — a chain's steps are
+    // never grounded in the whole sentence, which is how a hostile label
+    // could smuggle a second action into a sentence that supports only the
+    // first.
+    if let Some(steps) = answer.chain() {
+        match super::chain::plan(table, transcript.text(), &answer.action, steps) {
+            ChainPlan::Single => {}
+            ChainPlan::Refused(refusal) => {
+                return finish(VoiceOutcome::chain_refused(transcript, &refusal.why()));
+            }
+            ChainPlan::OneOf(rows) => {
+                drop(ballot);
+                let context = ChainContext {
+                    resolver,
+                    table,
+                    screen,
+                    agents,
+                    decks,
+                    directories,
+                    new_agent,
+                    withheld,
+                    show_deck,
+                };
+                let outcome = one_of_outcome(&context, transcript, &rows).await;
+                return result(outcome, Some(millis(started.elapsed())));
+            }
+            ChainPlan::Steps(rows) => {
+                drop(ballot);
+                let context = ChainContext {
+                    resolver,
+                    table,
+                    screen,
+                    agents,
+                    decks,
+                    directories,
+                    new_agent,
+                    withheld,
+                    show_deck,
+                };
+                let outcome = chain_outcome(&context, transcript, &rows).await;
+                return result(outcome, Some(millis(started.elapsed())));
+            }
+        }
+    }
+
+    // After the chain path, so an answer whose top level is `none` but whose
+    // steps are not is judged by its steps rather than dropped (Qodo on PR
+    // #2417): each step is held to the same checks either way.
     if answer.is_no_match() {
         return finish(VoiceOutcome::no_match(transcript));
     }
@@ -1278,15 +1412,6 @@ async fn after_local_intercepts(
     // classifier still out it is waited for, within its bound, and a backend
     // error, an unreadable reply and a timeout on both votes refuse the pick
     // with the reason ([`Ballot::first`]).
-    let first = match ballot.first().await {
-        Ok(first) => first,
-        Err(error) => {
-            return result(
-                VoiceOutcome::meaning_unchecked(transcript, row, &error),
-                Some(millis(started.elapsed())),
-            );
-        }
-    };
     let picked = Picked {
         table,
         screen,
@@ -1300,6 +1425,31 @@ async fn after_local_intercepts(
         answer: &answer,
         row,
     };
+    let outcome = settle(&picked, &mut ballot).await;
+    // What the user waited for is both calls.
+    result(outcome, Some(millis(started.elapsed())))
+}
+
+/// A pick, settled against the meaning check's ballot: wait for the first
+/// readable vote (refusing as unchecked when none comes), decide, and wait
+/// for the second vote only when it could change the decision.
+///
+/// The single-command path and each step of a chain (PRD #1184) both end
+/// here, so a step is held to exactly the checks a command said on its own
+/// is held to.
+async fn settle(picked: &Picked<'_>, ballot: &mut Ballot<'_>) -> VoiceOutcome {
+    let Picked {
+        table,
+        directories,
+        new_agent,
+        transcript,
+        row,
+        ..
+    } = *picked;
+    let first = match ballot.first().await {
+        Ok(first) => first,
+        Err(error) => return VoiceOutcome::meaning_unchecked(transcript.clone(), row, &error),
+    };
     let judged = Judged {
         first,
         second: Second::NotAwaited,
@@ -1309,7 +1459,7 @@ async fn after_local_intercepts(
         directories,
         new_agent,
     };
-    let mut outcome = decide(&picked, &judged);
+    let mut outcome = decide(picked, &judged);
     // The second vote is waited for only when it could change the decision —
     // a `yes` that needs two votes, or a `no` one more could turn — so an
     // ordinary command the first vote lists never waits on the slower of two
@@ -1324,7 +1474,7 @@ async fn after_local_intercepts(
             target_open: Cell::default(),
             ..judged
         };
-        outcome = decide(&picked, &judged);
+        outcome = decide(picked, &judged);
         // A refusal the missing vote decided is the app failing to check,
         // not the user's words failing to ask — said of the row whose own
         // question that vote left undecided ([`Judged::unchecked`]).
@@ -1337,8 +1487,374 @@ async fn after_local_intercepts(
             outcome = VoiceOutcome::meaning_unchecked(transcript.clone(), unchecked, error);
         }
     }
-    // What the user waited for is both calls.
-    result(outcome, Some(millis(started.elapsed())))
+    outcome
+}
+
+/// What a chain's steps are checked against (PRD #1184): the same
+/// declaration a single pick is, before the first step moves anything.
+struct ChainContext<'c> {
+    resolver: &'c dyn IntentResolver,
+    table: &'c CommandTable,
+    screen: Screen,
+    agents: &'c [DesktopAgent],
+    decks: &'c [VoiceDeck],
+    directories: Option<&'c VoiceDirectories>,
+    new_agent: Option<&'c VoiceNewAgent>,
+    withheld: bool,
+    show_deck: bool,
+}
+
+/// The words of a refusal after its "Heard: “…” — " and without its full
+/// stop, to quote inside a chain's own sentence.
+fn situation_of(sentence: &str) -> &str {
+    let after = sentence
+        .split_once("\u{201d} — ")
+        .map(|(_, rest)| rest)
+        .unwrap_or(sentence);
+    after.strip_suffix('.').unwrap_or(after)
+}
+
+/// PRD #1184: one step of a chain, settled on its own words at `screen` —
+/// its own two-vote meaning check and every check a single pick goes
+/// through, with the step's words as the transcript.
+async fn settle_step(
+    context: &ChainContext<'_>,
+    screen: Screen,
+    step: &IntentStep,
+    row: &CommandRow,
+) -> VoiceOutcome {
+    let table = context.table;
+    let said = Transcript::new(step.said.clone());
+    let classification = MeaningRequest::new(&said, table, &every_action(table)).at(Place::of(
+        screen,
+        context.directories,
+        context.new_agent,
+    ));
+    let mut ballot = Ballot::new([
+        context.resolver.judge_meaning(classification.clone()),
+        context.resolver.judge_meaning(classification),
+    ]);
+    let answer = step.answer();
+    let picked = Picked {
+        table,
+        screen,
+        agents: context.agents,
+        decks: context.decks,
+        directories: context.directories,
+        new_agent: context.new_agent,
+        transcript: &said,
+        withheld: context.withheld,
+        show_deck: context.show_deck,
+        answer: &answer,
+        row,
+    };
+    settle(&picked, &mut ballot).await
+}
+
+/// The refusal of a chain at step `number`, quoting that step's words.
+fn step_refused(transcript: &Transcript, number: usize, said: &str, why: &str) -> VoiceOutcome {
+    VoiceOutcome::chain_refused(
+        transcript.clone(),
+        &format!("step {number} (\u{201c}{said}\u{201d}) could not run: {why}; nothing was done"),
+    )
+}
+
+/// PRD #1184: the same single-valued choice named for every step ("select
+/// docs and dot-agent-deck directories", "make it a dispatcher and a
+/// reviewer") — one choice between the values, offered as PRD #1261's
+/// numbered choice when every value resolves on screen, and refused when one
+/// does not. Taking the first was rejected as a guess, and refusing outright
+/// as unhelpful: the user named real things, and one question settles it.
+async fn one_of_outcome(
+    context: &ChainContext<'_>,
+    transcript: Transcript,
+    rows: &[(&IntentStep, &CommandRow)],
+) -> VoiceOutcome {
+    let mut picks = Vec::with_capacity(rows.len());
+    // All on the screen the user is on, so all at once.
+    let settle_at = |at: usize| settle_step(context, context.screen, rows[at].0, rows[at].1);
+    let settled = match rows.len() {
+        2 => {
+            let (one, two) = tokio::join!(settle_at(0), settle_at(1));
+            vec![one, two]
+        }
+        _ => {
+            let (one, two, three) = tokio::join!(settle_at(0), settle_at(1), settle_at(2));
+            vec![one, two, three]
+        }
+    };
+    for (at, (&(step, _), outcome)) in rows.iter().zip(settled).enumerate() {
+        let VoiceOutcome::Dispatch {
+            action,
+            invoke,
+            params,
+            sentence,
+            ..
+        } = outcome
+        else {
+            return step_refused(
+                &transcript,
+                at + 1,
+                &step.said,
+                situation_of(outcome.sentence()),
+            );
+        };
+        picks.push((action, invoke, params, sentence));
+    }
+    let refuse = || {
+        VoiceOutcome::chain_refused(
+            transcript.clone(),
+            &super::chain::ChainRefusal::SameChoiceTwice(rows[0].1).why(),
+        )
+    };
+    let (action, invoke) = (picks[0].0.clone(), picks[0].1.clone());
+    let Some(row) = context.table.row(&action) else {
+        return refuse();
+    };
+    let Some(spec) = row.params.last() else {
+        return refuse();
+    };
+    if picks.iter().any(|pick| pick.0 != action) {
+        return refuse();
+    }
+    let mut candidates: Vec<ResolvedParam> = Vec::new();
+    for pick in &picks {
+        let Some(value) = pick.2.iter().find(|param| param.name == spec.name) else {
+            return refuse();
+        };
+        if !candidates.iter().any(|seen| seen.value == value.value) {
+            candidates.push(value.clone());
+        }
+    }
+    // The same value named twice is that one value.
+    if candidates.len() == 1 {
+        let (action, invoke, params, sentence) = picks.swap_remove(0);
+        return VoiceOutcome::Dispatch {
+            transcript,
+            action,
+            invoke,
+            params,
+            sentence,
+            then_submit: false,
+        };
+    }
+    let others: Vec<ResolvedParam> = picks[0]
+        .2
+        .iter()
+        .filter(|param| param.name != spec.name)
+        .cloned()
+        .collect();
+    let matches: Vec<String> = candidates.iter().map(|value| value.label.clone()).collect();
+    let spoken = rows
+        .iter()
+        .map(|(step, _)| step.said.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    VoiceOutcome::ParamAmbiguous {
+        sentence: heard(
+            &transcript,
+            &format!(
+                "only one can be chosen there, so which one: {}",
+                listed(&matches)
+            ),
+        ),
+        transcript,
+        action,
+        invoke,
+        param: spec.name.clone(),
+        spoken,
+        matches,
+        candidates,
+        params: Vec::new(),
+        reports: Vec::new(),
+    }
+    .offered_beside(row, &others, true)
+    .named(&ChoiceLive {
+        agents: context.agents,
+        decks: context.decks,
+        directories: context.directories,
+        new_agent: context.new_agent,
+    })
+}
+
+/// PRD #1184: check a chain's steps one by one, each against the screen the
+/// steps before it would leave, and answer the whole utterance.
+///
+/// Each step is a pick of its own: its words alone go to the meaning check
+/// (two votes, at the predicted screen), and it goes through [`settle`] —
+/// every check a command said on its own goes through, with the step's words
+/// as the transcript, so a deck or agent named in another step is not counted
+/// as named for this one. A step must come out a dispatch; the position rules
+/// are then applied to the row that DISPATCHES, which a redirect may have
+/// changed. **If any step fails, nothing runs**, and the sentence names the
+/// step and quotes its own refusal unchanged.
+async fn chain_outcome(
+    context: &ChainContext<'_>,
+    transcript: Transcript,
+    rows: &[(&IntentStep, &CommandRow)],
+) -> VoiceOutcome {
+    let table = context.table;
+    let mut screen = context.screen;
+    let (directories, new_agent) = (context.directories, context.new_agent);
+    let mut deck_switched = false;
+    let mut paused = false;
+    let mut steps = Vec::with_capacity(rows.len());
+    let last = rows.len() - 1;
+    // Every step is settled at once, each at the screen the steps before it
+    // would leave as the model picked them, so a chain waits for its slowest
+    // step's meaning check rather than for each in turn. The walk below then
+    // holds each step to the screen the steps before it ACTUALLY lead to,
+    // once a redirect is accounted for, and refuses one judged elsewhere.
+    let predicted: Vec<Screen> = rows
+        .iter()
+        .scan(context.screen, |at, (_, row)| {
+            let here = *at;
+            if let super::chain::Position::Before(Lands::View(to)) = super::chain::position(row) {
+                *at = to;
+            }
+            Some(here)
+        })
+        .collect();
+    let settle_at = |at: usize| settle_step(context, predicted[at], rows[at].0, rows[at].1);
+    let mut settled = match rows.len() {
+        2 => {
+            let (one, two) = tokio::join!(settle_at(0), settle_at(1));
+            vec![one, two]
+        }
+        _ => {
+            let (one, two, three) = tokio::join!(settle_at(0), settle_at(1), settle_at(2));
+            vec![one, two, three]
+        }
+    }
+    .into_iter();
+    for (at, &(step, row)) in rows.iter().enumerate() {
+        let number = at + 1;
+        let refuse = |why: String| step_refused(&transcript, number, &step.said, &why);
+        let Some(outcome) = settled.next() else {
+            return refuse("it was not checked".to_string());
+        };
+        if predicted[at] != screen {
+            return refuse(
+                "the step before it leads to another screen than the one it was checked on"
+                    .to_string(),
+            );
+        }
+        let judged_on = screen;
+        // A step that matched several things pauses the chain on the numbered
+        // choice (PRD #1261) — once per chain, so a chain cannot turn into a
+        // dialogue. The panel offers it when the step's turn comes, and the
+        // steps after it run once it is answered.
+        let (action, invoke, params, sentence, choice, offered) = match &outcome {
+            VoiceOutcome::Dispatch {
+                action,
+                invoke,
+                params,
+                sentence,
+                ..
+            } => (action, invoke, params, sentence.clone(), None, &[][..]),
+            VoiceOutcome::ParamAmbiguous {
+                action,
+                invoke,
+                params,
+                candidates,
+                ..
+            } if !paused && !candidates.is_empty() => {
+                paused = true;
+                (
+                    action,
+                    invoke,
+                    params,
+                    situation_of(outcome.sentence()).to_string(),
+                    Some(Box::new(outcome.clone())),
+                    &candidates[..],
+                )
+            }
+            _ => return refuse(situation_of(outcome.sentence()).to_string()),
+        };
+        let dispatched = table.row(action).unwrap_or(row);
+        if deck_switched
+            && params.iter().chain(offered).any(|param| {
+                matches!(
+                    param.kind,
+                    ParamKind::AgentRef | ParamKind::OrchestrationRef
+                )
+            })
+        {
+            return refuse(
+                "the daemon it switches to has not shown its agents yet, so say the agent in a command of its own"
+                    .to_string(),
+            );
+        }
+        match super::chain::position(dispatched) {
+            super::chain::Position::Never => {
+                return refuse(format!(
+                    "asking to {} is said on its own, never with other steps",
+                    dispatched.asks_to
+                ));
+            }
+            super::chain::Position::LastOnly if at != last => {
+                return refuse(format!(
+                    "asking to {} can only be the last thing in one sentence",
+                    dispatched.asks_to
+                ));
+            }
+            super::chain::Position::LastOnly => {}
+            super::chain::Position::Before(lands) => match lands {
+                Lands::View(to) => {
+                    // A view move under an open New agent dialog leaves the
+                    // dialog where it was or not, depending on the screen —
+                    // not something the next step can be judged against.
+                    if at != last && (directories.is_some() || new_agent.is_some()) {
+                        return refuse(
+                            "moving the view while the New agent dialog is open can only be the last thing in one sentence"
+                                .to_string(),
+                        );
+                    }
+                    screen = to;
+                }
+                Lands::Stays => {}
+                Lands::DeckSwitched => deck_switched = true,
+            },
+        }
+        steps.push(ChainStep {
+            said: step.said.clone(),
+            action: action.clone(),
+            invoke: invoke.clone(),
+            params: params.clone(),
+            sentence,
+            screen: judged_on,
+            choice,
+        });
+    }
+    let sentence = chain_sentence(&steps);
+    VoiceOutcome::Chain {
+        transcript,
+        steps,
+        sentence,
+    }
+}
+
+/// What a chain reports when every step ran: each step's own sentence, in
+/// order, joined by "then" ("Showing the agent overview, then opening
+/// tester.").
+fn chain_sentence(steps: &[ChainStep]) -> String {
+    let parts: Vec<String> = steps
+        .iter()
+        .enumerate()
+        .map(|(at, step)| {
+            let text = step.sentence.trim().trim_end_matches('.');
+            if at == 0 {
+                text.to_string()
+            } else {
+                let mut letters = text.chars();
+                letters
+                    .next()
+                    .map(|first| first.to_lowercase().chain(letters).collect())
+                    .unwrap_or_default()
+            }
+        })
+        .collect();
+    format!("{}.", parts.join(", then "))
 }
 
 /// Everything [`decide`] reads besides the meaning check's answers: what the
@@ -1589,6 +2105,32 @@ fn decide(picked: &Picked<'_>, judged: &Judged<'_>) -> VoiceOutcome {
             action: row.id.clone(),
             hint: hint.to_string(),
             sentence: hint.to_string(),
+        };
+    }
+    // PRD #2119 review: the same on the agent screen for Generate config. A
+    // pick naming an agent — another one, or the viewed one by name — is
+    // answered with the pane's own phrase, never sent to the named agent nor
+    // silently redirected to the viewed one; a pick naming none is the viewed
+    // agent's, as its whole phrases are.
+    if screen == Screen::Agent && row.id == GENERATE_CONFIG_ROW {
+        let names_an_agent = answer.params.values().any(|value| !value.trim().is_empty());
+        if names_an_agent {
+            return VoiceOutcome::Unavailable {
+                transcript,
+                action: row.id.clone(),
+                hint: GENERATE_CONFIG_PANE_HINT.to_string(),
+                sentence: GENERATE_CONFIG_PANE_HINT.to_string(),
+            };
+        }
+        return VoiceOutcome::Dispatch {
+            sentence:
+                "Confirm generating a config with the open agent — nothing has been sent yet."
+                    .to_string(),
+            transcript,
+            action: row.id.clone(),
+            invoke: row.invoke.clone(),
+            params: Vec::new(),
+            then_submit: false,
         };
     }
     if withheld && needs_labels(row) {
@@ -3105,6 +3647,22 @@ fn local_intercept(
         if let VoiceOutcome::Dispatch { sentence, .. } = &mut outcome {
             *sentence =
                 "Confirm closing the open agent — nothing has been stopped yet.".to_string();
+        }
+        return Some(outcome);
+    }
+
+    // PRD #2119 review: a bare Generate config on the agent screen is the
+    // viewed agent's, decided here as the close phrases above are — so it
+    // needs no on-screen name and reaches the backend with nothing.
+    if screen == Screen::Agent
+        && said_whole(transcript.text(), GENERATE_CONFIG_PHRASES)
+        && let Some(row) = table.row(GENERATE_CONFIG_ROW)
+    {
+        let mut outcome = dispatch(row, Vec::new());
+        if let VoiceOutcome::Dispatch { sentence, .. } = &mut outcome {
+            *sentence =
+                "Confirm generating a config with the open agent — nothing has been sent yet."
+                    .to_string();
         }
         return Some(outcome);
     }
@@ -5824,6 +6382,16 @@ pub fn address_deck_switch(
     outcome: &mut VoiceOutcome,
     selection_of: impl Fn(&str) -> Option<VoiceDeckSelection>,
 ) {
+    address_with(outcome, &selection_of);
+}
+
+/// [`address_deck_switch`], with the lookup as a trait object so a chain's
+/// paused choice can be addressed by the same code without instantiating the
+/// generic again for every level.
+fn address_with(
+    outcome: &mut VoiceOutcome,
+    selection_of: &dyn Fn(&str) -> Option<VoiceDeckSelection>,
+) {
     let address = |param: &mut ResolvedParam| {
         let selection = selection_of(&param.value);
         param.deck_identity = selection
@@ -5853,6 +6421,24 @@ pub fn address_deck_switch(
             if candidates.iter().any(|param| param.value.is_empty()) {
                 candidates.clear();
                 reports.clear();
+            }
+        }
+        // PRD #1184: a chain's switch is addressed as a single one is —
+        // its params, and the candidates of a switch the chain pauses on
+        // (Qodo and Greptile on PR #2417), which lose their choice when one
+        // has no selector token, as a single switch's do.
+        VoiceOutcome::Chain { steps, .. } => {
+            for step in steps
+                .iter_mut()
+                .filter(|step| step.action == SWITCH_DECK_ROW)
+            {
+                step.params
+                    .iter_mut()
+                    .filter(|param| param.kind == ParamKind::DeckRef)
+                    .for_each(address);
+                if let Some(choice) = step.choice.as_deref_mut() {
+                    address_with(choice, selection_of);
+                }
             }
         }
         _ => {}
@@ -14769,6 +15355,101 @@ mod tests {
         }
     }
 
+    /// Scenario: In one agent's pane, ask to generate or update config with another live agent. Both phrases give guidance for the viewed agent rather than confirming for another agent; the same named requests work from the dashboard.
+    #[tokio::test]
+    async fn voice_outcome_config_gen_003_named_pane_requests_give_stop_style_guidance() {
+        for said in [
+            "generate config with the tester",
+            "update config with the tester",
+        ] {
+            let resolver = StubResolver::new().answering(
+                said,
+                IntentAnswer::new("generate_config").with_param("agent", "tester"),
+            );
+            let overview = run(&resolver, Screen::Overview, &fleet(), said).await;
+            assert!(
+                matches!(&overview, VoiceOutcome::Dispatch { action, invoke, params, .. }
+                if action == "generate_config" && invoke == "confirmGenerateConfig"
+                && params.iter().any(|param| param.name == "agent" && param.value == "1")),
+                "the present named agent must remain targetable on the dashboard: {overview:?}"
+            );
+            let outcome = run(&resolver, Screen::Agent, &fleet(), said).await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::Unavailable { action, hint, sentence, .. }
+                if action == "generate_config"
+                && hint == "To generate config for this agent, say 'generate config' or press Generate config."
+                && sentence == hint),
+                "named pane requests must mirror stop_agent's guidance, got {outcome:?}"
+            );
+        }
+    }
+
+    /// Scenario: With Send on-screen names off, say generate config or update config in the open agent pane. Both phrases open the current pane's confirmation locally with no named parameters; dashboard requests still need an agent and explicitly named pane requests are refused.
+    #[tokio::test]
+    async fn voice_outcome_config_gen_003_private_names_allow_only_the_viewed_agent() {
+        for said in [
+            "generate config",
+            "update config",
+            "update config with this agent",
+        ] {
+            // The viewed-agent shortcuts must work even if a backend cannot
+            // classify the phrase: exercise the visible confirmation outcome.
+            let resolver = CountingResolver::default();
+            let answer = handle_utterance_with(
+                &resolver,
+                table(),
+                Screen::Agent,
+                &fleet(),
+                &decks(),
+                None,
+                None,
+                Transcript::new(said),
+                LabelSharing::Withheld,
+                true,
+            )
+            .await;
+            assert!(
+                matches!(&answer.outcome, VoiceOutcome::Dispatch { action, invoke, params, .. }
+                if action == "generate_config" && invoke == "confirmGenerateConfig" && params.is_empty()),
+                "a private bare pane request must open its own confirmation: {:?}",
+                answer.outcome
+            );
+        }
+
+        let said = "generate config";
+        let resolver = StubResolver::new().answering(said, IntentAnswer::new("generate_config"));
+        let dashboard = run(&resolver, Screen::Overview, &fleet(), said).await;
+        assert!(
+            matches!(&dashboard, VoiceOutcome::ParamMissing { action, param, .. }
+                if action == "generate_config" && param == "agent"),
+            "the dashboard must still ask which agent: {dashboard:?}"
+        );
+
+        let said = "generate config with the tester";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("generate_config").with_param("agent", "tester"),
+        );
+        let named = handle_utterance_with(
+            &resolver,
+            table(),
+            Screen::Agent,
+            &fleet(),
+            &decks(),
+            None,
+            None,
+            Transcript::new(said),
+            LabelSharing::Withheld,
+            true,
+        )
+        .await;
+        assert!(
+            !matches!(&named.outcome, VoiceOutcome::Dispatch { action, .. } if action == "generate_config"),
+            "privacy must not turn a named request into a request for the viewed agent: {:?}",
+            named.outcome
+        );
+    }
+
     /// Scenario: on the Daemons screen and the dashboard, an interrupt, clear
     /// or scratch phrase is not intercepted locally; it goes to the model,
     /// and a pick of the row is refused with the row's own hint.
@@ -18264,7 +18945,7 @@ mod tests {
     /// included — whose control has a voice row, with that row. `docs/develop/voice-first-design.md`
     /// section 5 has the rule; the labels left out on purpose are listed there
     /// with their reasons.
-    const CONTROL_LABELS: [ControlLabel; 33] = [
+    const CONTROL_LABELS: [ControlLabel; 37] = [
         // PRD #2174 — the star reminder's three buttons, each its own row.
         // Shown at startup over the dashboard, never over the New agent form.
         ControlLabel {
@@ -18512,6 +19193,37 @@ mod tests {
             row: "close",
             over_the_form: false,
         },
+        // PRD #2119 — Generate config on a dashboard row ("Generate config
+        // with <name> agent") and in the open pane ("Generate config").
+        ControlLabel {
+            source: "aria-label={`Generate config with ${name} agent`}",
+            file: AGENT_OVERVIEW_TSX,
+            said: "Generate config with tester agent",
+            row: "generate_config",
+            over_the_form: false,
+        },
+        ControlLabel {
+            source: "<FileCog size={14} aria-hidden=\"true\" /> Generate config</button>",
+            file: AGENT_TILE_TSX,
+            said: "Generate config",
+            row: "generate_config",
+            over_the_form: false,
+        },
+        // The same two controls when the project already has a config.
+        ControlLabel {
+            source: "aria-label={`Update config with ${name} agent`}",
+            file: AGENT_OVERVIEW_TSX,
+            said: "Update config with tester agent",
+            row: "generate_config",
+            over_the_form: false,
+        },
+        ControlLabel {
+            source: "<FileCog size={14} aria-hidden=\"true\" /> Update config</button>",
+            file: AGENT_TILE_TSX,
+            said: "Update config",
+            row: "generate_config",
+            over_the_form: false,
+        },
     ];
 
     /// The label rule as a property: each control's label is still in its
@@ -18746,6 +19458,9 @@ mod tests {
             ("dismiss_star_prompt", "don't ask again"),
             // Issue #2330 — a review the deck asked for: its Approve and Deny.
             ("approve_project_commands", "approve"),
+            // PRD #2119 — the Generate config button's words.
+            ("generate_config", "generate config"),
+            ("generate_config", "update config"),
             ("close", "deny it"),
             ("close", "decline"),
         ] {

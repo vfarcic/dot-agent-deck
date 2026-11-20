@@ -68,7 +68,7 @@ export function saveEndpointSection(onSave: SettingsPanelProps["onSave"], docume
 }
 
 /** How {@link NewDaemon.confirm} ended. */
-export type ConfirmResult =
+type ConfirmResult =
   /** Stored and selected. */
   | "added"
   /**

@@ -37,7 +37,7 @@ export interface PrBrowserHost {
 /** The frame, and the size of the page it sits in, all in the main webview's CSS pixels (`pr_browser::Bounds`). */
 export type PrBrowserBounds = { x: number; y: number; width: number; height: number; viewportWidth: number; viewportHeight: number };
 
-export type PrBrowserScroll = "down" | "up" | "top" | "bottom";
+type PrBrowserScroll = "down" | "up" | "top" | "bottom";
 
 /** What Rust emits to the main webview when the page closed itself, with the generation of the open it closed. */
 export const PR_BROWSER_CLOSED_EVENT = "pr-browser://closed";
@@ -118,7 +118,7 @@ export function unavailablePrBrowser(): PrBrowserHost {
 }
 
 /** The host for the running app: Tauri's when there is one. */
-export function defaultPrBrowser(): PrBrowserHost {
+function defaultPrBrowser(): PrBrowserHost {
   return typeof window !== "undefined" && window.__TAURI_INTERNALS__ ? tauriPrBrowser() : unavailablePrBrowser();
 }
 

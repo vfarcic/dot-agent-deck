@@ -1070,6 +1070,25 @@ pub const QUESTION_RELEASED_BY_DECK_METADATA_KEY: &str = "question_released_by_d
 /// when it counts hook latency. Nothing outside telemetry reads it.
 pub const RECEIVED_BY_DECK_AT_METADATA_KEY: &str = "received_by_deck_at_ns";
 
+/// Issue #2347: on the `Thinking` Claude Code's prompt hook reports in a deck
+/// pane, a nonce naming that one prompt. Claude can still drop the prompt
+/// after the hook reported it (another `UserPromptSubmit` hook blocks it),
+/// and then runs no turn and fires no `Stop`; the transcript witness
+/// ([`crate::inbox_witness`]) reports that with
+/// [`PROMPT_NOT_TAKEN_METADATA_KEY`] and the same nonce.
+pub const PROMPT_TURN_METADATA_KEY: &str = "prompt_turn";
+
+/// Issue #2347: on an `Idle` the transcript witness sends, the nonce of the
+/// prompt Claude Code dropped ([`PROMPT_TURN_METADATA_KEY`]). The daemon
+/// applies it only while the turn that prompt's `Thinking` started is still
+/// the pane's latest news, and drops it otherwise
+/// (`crate::state::AppState::admit_prompt_not_taken`).
+pub const PROMPT_NOT_TAKEN_METADATA_KEY: &str = "prompt_not_taken";
+
+/// Issue #2347: the version of the guarded [`PROMPT_NOT_TAKEN_METADATA_KEY`]
+/// report a daemon advertises in [`InboxWaitReply::prompt_not_taken`].
+pub const PROMPT_NOT_TAKEN_REPORTS: u32 = 1;
+
 /// Where a permission prompt stands, on the events the OpenCode hook builds
 /// from one: `pending` on the ask, [`PERMISSION_STATE_REPLIED`] on the answer.
 /// PRD #1631: a question form's answer or dismissal is marked replied too.
@@ -1317,6 +1336,14 @@ impl AgentEvent {
     /// behaviour.
     pub fn is_from_subagent(&self) -> bool {
         self.metadata.contains_key(SUBAGENT_ID_METADATA_KEY)
+    }
+
+    /// Issue #2347: the nonce of the Claude Code prompt this witness `Idle`
+    /// reports dropped ([`PROMPT_NOT_TAKEN_METADATA_KEY`]), if it is one.
+    pub fn prompt_not_taken(&self) -> Option<&str> {
+        self.metadata
+            .get(PROMPT_NOT_TAKEN_METADATA_KEY)
+            .map(String::as_str)
     }
 
     /// Issue #1678: is this a subagent's answered permission prompt — a
@@ -2534,6 +2561,12 @@ pub struct ListTargetsRequest {
     /// `changelog.d/1077.breaking.md`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    /// PRD #468: `dispatch --list-targets --dir <path>` — list the targets of
+    /// that directory's config, the one a `dispatch --dir <path>` resolves
+    /// from, instead of the pane's. Additive optional, same as
+    /// [`DispatchSignal::dir`]: an older daemon ignores it and lists the pane's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
 }
 
 /// PRD #220: the daemon's reply to a [`DaemonMessage::ListTargets`], one JSON
@@ -3514,6 +3547,20 @@ pub struct DispatchSignal {
     /// agent's default command. Same gate as [`Self::command`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// PRD #468: `dispatch --dir <path>` — the existing directory to start the
+    /// unit in, as an absolute path the CLI resolved. Present, the daemon
+    /// creates no worktree and registers nothing for removal
+    /// ([`crate::dispatch::handle_dispatch_at`]); absent, it cuts a worktree
+    /// from the caller's `HEAD` as every dispatch did before.
+    ///
+    /// **Additive optional on the hook socket, so it does NOT move
+    /// [`crate::daemon_protocol::PROTOCOL_VERSION`].** A daemon that predates it
+    /// ignores the key and cuts a fresh worktree instead. The maintainer decided
+    /// on 2026-11-04 not to gate on that (the CLI and the daemon are upgraded
+    /// together), so unlike [`Self::command`] it is sent without asking the
+    /// daemon first, and that case is no `.breaking.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -4270,6 +4317,13 @@ pub struct InboxWaitReply {
     /// Code's support (part 2's daemon answers it and serves no other).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub one_shot_senders: Vec<InboxOneShotSender>,
+    /// Issue #2347: with [`Self::one_shot_receipts`], the version of the
+    /// guarded dropped-prompt report this daemon applies
+    /// ([`PROMPT_NOT_TAKEN_REPORTS`]). Additive and optional: the transcript
+    /// witness sends no such report to a daemon whose answer lacks it, since
+    /// that daemon would apply it as a plain `Idle`, unguarded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_not_taken: Option<u32>,
 }
 
 impl InboxWaitReply {
@@ -5681,10 +5735,12 @@ mod tests {
                 token: None,
                 command: None,
                 agent: None,
+                dir: None,
             }),
             DaemonMessage::ListTargets(ListTargetsRequest {
                 pane_id: "p".into(),
                 token: None,
+                dir: None,
             }),
             DaemonMessage::RestartRole(RestartRoleSignal {
                 pane_id: "p".into(),

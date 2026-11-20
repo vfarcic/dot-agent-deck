@@ -1,0 +1,278 @@
+{
+ "issue": 2130,
+ "release": "0.164.0",
+ "executable_sha256": "b93f6811d3f653f0fb83be4050d857fb9abbb111dfa2ce160563327daff7f306",
+ "recorder_sha256": "3dba92cb57a07865b848d538e91c356d645cd533af5ce8cf9ae87474be4d309b",
+ "setup": "nollm: dummy key, loopback Responses server, bwrap --unshare-net, tmpfs /home /root /tmp /run/user",
+ "env_names": [
+  "COLORTERM",
+  "HOME",
+  "LANG",
+  "PATH",
+  "PWD",
+  "TERM"
+ ],
+ "cwd": {
+  "root": "/var/tmp/dad-2130-rec-cwd-1795122596",
+  "home": "/var/tmp/dad-2130-rec-cwd-1795122596/home",
+  "launches": [
+   {
+    "launch": "cwd-work-50x200",
+    "spawn_cwd": "ROOT/work",
+    "start": {
+     "ctrl_g_opened": true,
+     "f6_opened": false
+    },
+    "steps": [
+     {
+      "cd": "other",
+      "target": "ROOT/other",
+      "status_line": "nollm-model default · ROOT/other",
+      "keys": {
+       "ctrl_g_opened": false,
+       "f6_opened": true
+      }
+     },
+     {
+      "cd": "hproj",
+      "target": "ROOT/home/proj",
+      "status_line": "nollm-model default · ~/proj",
+      "keys": {
+       "ctrl_g_opened": false,
+       "f6_opened": true
+      }
+     },
+     {
+      "cd": "long",
+      "target": "ROOT/llllllllllllllllllllllllllllllllllllllllllllllllllllllllllll/mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm/proj",
+      "status_line": "nollm-model default · ROOT/llllllllllllllllllllllllllllllllllllllllllllllllllllllllllll/mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm/proj",
+      "keys": {
+       "ctrl_g_opened": false,
+       "f6_opened": true
+      }
+     },
+     {
+      "cd": "start",
+      "target": "ROOT/work",
+      "status_line": "nollm-model default · ROOT/work",
+      "keys": {
+       "ctrl_g_opened": true,
+       "f6_opened": false
+      }
+     }
+    ]
+   },
+   {
+    "launch": "cwd-hplain-50x200",
+    "spawn_cwd": "ROOT/home/plain",
+    "start": {
+     "ctrl_g_opened": true,
+     "f6_opened": false
+    },
+    "steps": [
+     {
+      "cd": "other",
+      "target": "ROOT/other",
+      "status_line": "nollm-model default · ROOT/other",
+      "keys": {
+       "ctrl_g_opened": false,
+       "f6_opened": true
+      }
+     },
+     {
+      "cd": "hproj",
+      "target": "ROOT/home/proj",
+      "status_line": "nollm-model default · ~/proj",
+      "keys": {
+       "ctrl_g_opened": false,
+       "f6_opened": true
+      }
+     },
+     {
+      "cd": "long",
+      "target": "ROOT/llllllllllllllllllllllllllllllllllllllllllllllllllllllllllll/mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm/proj",
+      "status_line": "nollm-model default · ROOT/llllllllllllllllllllllllllllllllllllllllllllllllllllllllllll/mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm/proj",
+      "keys": {
+       "ctrl_g_opened": false,
+       "f6_opened": true
+      }
+     },
+     {
+      "cd": "start",
+      "target": "ROOT/home/plain",
+      "status_line": "nollm-model default · ~/plain",
+      "keys": {
+       "ctrl_g_opened": true,
+       "f6_opened": false
+      }
+     }
+    ]
+   },
+   {
+    "launch": "cwd-work-24x80",
+    "spawn_cwd": "ROOT/work",
+    "start": {
+     "ctrl_g_opened": true,
+     "f6_opened": false
+    },
+    "steps": [
+     {
+      "cd": "other",
+      "target": "ROOT/other",
+      "status_line": "nollm-model default · ROOT/other",
+      "keys": {
+       "ctrl_g_opened": false,
+       "f6_opened": true
+      }
+     },
+     {
+      "cd": "hproj",
+      "target": "ROOT/home/proj",
+      "status_line": "nollm-model default · ~/proj",
+      "keys": {
+       "ctrl_g_opened": false,
+       "f6_opened": true
+      }
+     },
+     {
+      "cd": "long",
+      "target": "ROOT/llllllllllllllllllllllllllllllllllllllllllllllllllllllllllll/mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm/proj",
+      "status_line": "nollm-model default · ROOT/llllllllllllllllll…",
+      "keys": {
+       "ctrl_g_opened": false,
+       "f6_opened": true
+      }
+     },
+     {
+      "cd": "start",
+      "target": "ROOT/work",
+      "status_line": "nollm-model default · ROOT/work",
+      "keys": {
+       "ctrl_g_opened": true,
+       "f6_opened": false
+      }
+     }
+    ]
+   },
+   {
+    "launch": "cwd-hplain-24x80",
+    "spawn_cwd": "ROOT/home/plain",
+    "start": {
+     "ctrl_g_opened": true,
+     "f6_opened": false
+    },
+    "steps": [
+     {
+      "cd": "other",
+      "target": "ROOT/other",
+      "status_line": "nollm-model default · ROOT/other",
+      "keys": {
+       "ctrl_g_opened": false,
+       "f6_opened": true
+      }
+     },
+     {
+      "cd": "hproj",
+      "target": "ROOT/home/proj",
+      "status_line": "nollm-model default · ~/proj",
+      "keys": {
+       "ctrl_g_opened": false,
+       "f6_opened": true
+      }
+     },
+     {
+      "cd": "long",
+      "target": "ROOT/llllllllllllllllllllllllllllllllllllllllllllllllllllllllllll/mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm/proj",
+      "status_line": "nollm-model default · ROOT/llllllllllllllllll…",
+      "keys": {
+       "ctrl_g_opened": false,
+       "f6_opened": true
+      }
+     },
+     {
+      "cd": "start",
+      "target": "ROOT/home/plain",
+      "status_line": "nollm-model default · ~/plain",
+      "keys": {
+       "ctrl_g_opened": true,
+       "f6_opened": false
+      }
+     }
+    ]
+   }
+  ]
+ },
+ "worktree": {
+  "root": "/var/tmp/dad-2130-rec-wt-1795122785",
+  "home": "/var/tmp/dad-2130-rec-wt-1795122785/home",
+  "spawn_cwd": "ROOT/work",
+  "start_status_line": "nollm-model default · ROOT/work",
+  "start_keys": {
+   "ctrl_g_opened": true,
+   "f6_opened": false
+  },
+  "status_line": "nollm-model default · ~/.codex/worktrees/4c8f/work",
+  "keys": {
+   "ctrl_g_opened": true,
+   "f6_opened": false
+  }
+ },
+ "files": {
+  "work-24x80-start.bin": {
+   "launch": "cwd-work-24x80",
+   "cut_before": "cwd-work-24x80-start-ctrl-g",
+   "bytes": 2726,
+   "sha256": "3bee8e194212019ad33a91d664ce7d457a2c6fc2bdf69d1dda23a54496a00b96",
+   "rows": 24,
+   "cols": 80
+  },
+  "work-24x80-cd-other.bin": {
+   "launch": "cwd-work-24x80",
+   "cut_before": "cwd-work-24x80-cd-other-ctrl-g",
+   "bytes": 9535,
+   "sha256": "cb4bf8fb83bb36dee6d15da9cc32493fc97afb62d9c462b584664892241e4be9",
+   "rows": 24,
+   "cols": 80
+  },
+  "work-24x80-cd-home-proj.bin": {
+   "launch": "cwd-work-24x80",
+   "cut_before": "cwd-work-24x80-cd-hproj-ctrl-g",
+   "bytes": 16325,
+   "sha256": "ad85a02573ecdc1de8aae6956313c028a2cf9d9d11163ddaa82b3f11d7953ff2",
+   "rows": 24,
+   "cols": 80
+  },
+  "work-24x80-cd-long.bin": {
+   "launch": "cwd-work-24x80",
+   "cut_before": "cwd-work-24x80-cd-long-ctrl-g",
+   "bytes": 23488,
+   "sha256": "fe99c7290963c766de8a2e6bc23f497bcbc7df1a76730bb7c86506cddc901d4a",
+   "rows": 24,
+   "cols": 80
+  },
+  "work-24x80-cd-back.bin": {
+   "launch": "cwd-work-24x80",
+   "cut_before": "cwd-work-24x80-cd-start-ctrl-g",
+   "bytes": 30709,
+   "sha256": "062d07faa02223c39bfc4bf9fd4ce14560d4c3d0836ebf176bcdc589da1bf812",
+   "rows": 24,
+   "cols": 80
+  },
+  "plain-50x200-start.bin": {
+   "launch": "cwd-hplain-50x200",
+   "cut_before": "cwd-hplain-50x200-start-ctrl-g",
+   "bytes": 6295,
+   "sha256": "1903f6a34a559d1e7f66a0824eda6c9c5da4ab2e13081efedc2573b52a1ae862",
+   "rows": 50,
+   "cols": 200
+  },
+  "worktree-50x200.bin": {
+   "launch": "worktree",
+   "cut_before": "worktree-moved-ctrl-g",
+   "bytes": 26126,
+   "sha256": "57a5d019c65367f342cc34a3ded2f883c998dff53e7880a7e5d35ead4e6b1699",
+   "rows": 50,
+   "cols": 200
+  }
+ }
+}
