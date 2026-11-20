@@ -322,6 +322,18 @@ impl Default for AgentSpawnOptions<'_> {
     }
 }
 
+/// PRD #82: the answer to [`PaneController::daemon_rearm_file`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonRearmFile {
+    /// The question is out and has not been answered yet.
+    Asking,
+    /// The daemon does not re-arm this coordinator: an older daemon, no file
+    /// recorded for it, or no answer in time.
+    NotDaemon,
+    /// The daemon re-arms this coordinator from this file.
+    File(std::path::PathBuf),
+}
+
 /// PRD #1666 part 2 (G-fix6): a pane id as the UI holds it, together with the
 /// daemon process ([`Incarnation`]) of the response that produced it — the
 /// event stream that painted the card, or the listing or attach that named it.
@@ -582,14 +594,19 @@ pub trait PaneController: Send + Sync {
     /// PRD #82: the context file the daemon running the agent in `pane_id`
     /// would re-arm that coordinator from after a compaction or `/clear`: the
     /// one it records for the orchestration now, which moves to a new file on
-    /// each re-arm. `Some` only when that daemon re-arms coordinators itself
-    /// ([`crate::daemon_protocol::CAP_REARM_ORCHESTRATOR`]) and records a file
-    /// for this one; the TUI leaves the re-arm to it while that file is there.
-    /// Asked of the daemon, so a caller asks once per compaction or `/clear`,
-    /// not per frame. `None` by default, so a controller with no daemon
-    /// behind it, or an older daemon, keeps the TUI's own re-arm.
-    fn daemon_rearm_file(&self, _pane_id: &str) -> Option<std::path::PathBuf> {
-        None
+    /// each re-arm. [`DaemonRearmFile::NotDaemon`] when that daemon does not
+    /// re-arm coordinators itself
+    /// ([`crate::daemon_protocol::CAP_REARM_ORCHESTRATOR`]), records no file
+    /// for this one, or did not answer in time.
+    ///
+    /// Never blocks: the caller is the render thread. The first call starts the
+    /// question and answers [`DaemonRearmFile::Asking`]; a later call collects
+    /// the answer once, and the call after that asks afresh. A caller asks once
+    /// per compaction or `/clear`, and waits while the answer is `Asking`. The
+    /// default answers `NotDaemon`, so a controller with no daemon behind it
+    /// keeps the TUI's own re-arm.
+    fn daemon_rearm_file(&self, _pane_id: &str) -> DaemonRearmFile {
+        DaemonRearmFile::NotDaemon
     }
     /// PRD #1666 S5: post a deck-generated message — a seed, an orchestrator's
     /// role context, the configuration request — to `pane`'s inbox, bound to

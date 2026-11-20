@@ -13594,23 +13594,49 @@ fn rearm_trust_gate(
     }
 }
 
-/// PRD #82: whether the daemon, not this TUI, re-arms the coordinator on
-/// `start_pane_id`: the tab's file is one the daemon records, and the file the
-/// daemon records for it now (a newer one after each of its re-arms) is there
-/// for it to republish. The daemon re-arms only from that file, since it holds
-/// no approved config to publish from, so when retention or a person has
-/// removed it this TUI re-arms instead, from its trust-checked config, as it
-/// did before the daemon could. Asks the daemon, so callers ask once per
-/// compaction or `/clear`.
-fn daemon_owns_orchestrator_rearm(
+/// PRD #82: who re-arms the coordinator on `start_pane_id` after a compaction
+/// or `/clear`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RearmOwner {
+    /// The daemon has not said yet; the re-arm waits.
+    Asking,
+    /// The daemon does; this TUI stands down.
+    Daemon,
+    /// This TUI does.
+    Tui,
+}
+
+/// PRD #82: the daemon re-arms the coordinator when the tab's file is one the
+/// daemon records, and the file the daemon records for it now (a newer one
+/// after each of its re-arms) passes every check the daemon's own read of it
+/// applies (`orchestrator_context::recorded_context_is_republishable`: the
+/// deck's own per-publish file, not a symlink, within the size cap). The
+/// daemon re-arms only from that file, since it holds no approved config to
+/// publish from, so when retention or a person has removed or replaced it this
+/// TUI re-arms instead, from its trust-checked config, as it did before the
+/// daemon could. Asks the daemon without blocking: callers ask once per
+/// compaction or `/clear`, and wait while the answer is
+/// [`RearmOwner::Asking`].
+fn orchestrator_rearm_owner(
     recorded_by_daemon: bool,
     pane: &dyn PaneController,
     start_pane_id: &str,
-) -> bool {
-    recorded_by_daemon
-        && pane
-            .daemon_rearm_file(start_pane_id)
-            .is_some_and(|file| file.is_file())
+) -> RearmOwner {
+    use crate::pane::DaemonRearmFile;
+    if !recorded_by_daemon {
+        return RearmOwner::Tui;
+    }
+    match pane.daemon_rearm_file(start_pane_id) {
+        DaemonRearmFile::Asking => RearmOwner::Asking,
+        DaemonRearmFile::NotDaemon => RearmOwner::Tui,
+        DaemonRearmFile::File(file) => {
+            if crate::orchestrator_context::recorded_context_is_republishable(&file) {
+                RearmOwner::Daemon
+            } else {
+                RearmOwner::Tui
+            }
+        }
+    }
 }
 
 /// Issue #1395: a compaction or `/clear` re-arm that could not read the tab's
@@ -15996,10 +16022,11 @@ pub fn run_tui(
                 .filter(|at| *at >= tab_anchor);
                 let unseen_event = compacting_event
                     .filter(|at| ui.orchestration_remit_compacting_event_at.get(id) != Some(at));
-                if let Some(at) = compacting_event {
-                    ui.orchestration_remit_compacting_event_at.insert(*id, at);
-                }
                 let is_compacting = compacting_now || unseen_event.is_some();
+                // PRD #82: set while the daemon has not yet said whether it
+                // re-arms this coordinator; the compaction stays unanswered
+                // and uncounted until it has.
+                let mut asking_daemon = false;
                 if is_compacting {
                     // Eligibility no longer requires
                     // `orchestration_prompted.contains(id)`. That condition
@@ -16027,20 +16054,27 @@ pub fn run_tui(
                         .map(|r| AgentType::from_command(Some(&r.command)) == Some(AgentType::Pi))
                         .unwrap_or(false);
 
-                    if !ui.orchestration_remit_compacting.contains(id)
+                    let edge_open = !ui.orchestration_remit_compacting.contains(id)
                         && no_delivery_pending
-                        // PRD #82: the daemon re-arms an orchestration whose
-                        // context file it records, attached client or not;
-                        // re-arming it here as well would send the
-                        // coordinator its role twice. Asked only on the
-                        // compaction's edge, after the cheap checks.
-                        && !daemon_owns_orchestrator_rearm(
+                        && !ui.orchestration_remit_abandoned.contains(id)
+                        && !start_role_is_pi;
+                    // PRD #82: the daemon re-arms an orchestration whose
+                    // context file it records, attached client or not;
+                    // re-arming it here as well would send the coordinator its
+                    // role twice. Asked only on the compaction's edge, after
+                    // the cheap checks, and never waited on.
+                    let owner = if edge_open {
+                        orchestrator_rearm_owner(
                             *context_recorded_by_daemon,
                             &*pane,
                             &start_pane_id,
                         )
-                        && !ui.orchestration_remit_abandoned.contains(id)
-                        && !start_role_is_pi
+                    } else {
+                        RearmOwner::Tui
+                    };
+                    asking_daemon = owner == RearmOwner::Asking;
+                    if edge_open
+                        && owner == RearmOwner::Tui
                         // Re-run the spawn-time write-then-point pair
                         // instead of injecting the bare pointer constant, so
                         // a re-assertion (a) verifies the context file
@@ -16096,9 +16130,14 @@ pub fn run_tui(
                         replace_orchestration_context_path(context_path, published.context_path);
                         ui.orchestration_prompted.remove(id);
                     }
-                    ui.orchestration_remit_compacting.insert(*id);
+                    if !asking_daemon {
+                        ui.orchestration_remit_compacting.insert(*id);
+                    }
                 } else {
                     ui.orchestration_remit_compacting.remove(id);
+                }
+                if !asking_daemon && let Some(at) = compacting_event {
+                    ui.orchestration_remit_compacting_event_at.insert(*id, at);
                 }
             }
         }
@@ -16198,17 +16237,27 @@ pub fn run_tui(
                     // PRD #82: as in the compaction loop above. Asked only
                     // once nothing else holds this `/clear` back, so a frame
                     // waiting on a pending prompt or the retry floor does
-                    // not ask again.
+                    // not ask again; while the daemon has not answered, the
+                    // `/clear` waits, neither answered nor marked seen.
+                    let owner = if no_delivery_pending
+                        && retry_floor_ok
+                        && !ui.orchestration_remit_abandoned.contains(id)
+                        && !start_role_is_pi
+                    {
+                        orchestrator_rearm_owner(
+                            *context_recorded_by_daemon,
+                            &*pane,
+                            &start_pane_id,
+                        )
+                    } else {
+                        RearmOwner::Tui
+                    };
                     let permanently_excluded = ui.orchestration_remit_abandoned.contains(id)
                         || start_role_is_pi
-                        || (no_delivery_pending
-                            && retry_floor_ok
-                            && daemon_owns_orchestrator_rearm(
-                                *context_recorded_by_daemon,
-                                &*pane,
-                                &start_pane_id,
-                            ));
-                    if no_delivery_pending
+                        || owner == RearmOwner::Daemon;
+                    if owner == RearmOwner::Asking {
+                        // Wait for the daemon's answer.
+                    } else if no_delivery_pending
                         && !permanently_excluded
                         && retry_floor_ok
                         && !rearm_trust_gate(&mut ui, &*pane, config, cwd)
@@ -41344,12 +41393,12 @@ mod tests {
 
     /// Scenario: the daemon records an orchestration's role file and says it
     /// re-arms coordinators. The TUI leaves the re-arm to it while the file the
-    /// daemon records NOW exists, whatever older file the tab still names, and
-    /// takes it back once that file is gone (removed by retention or by hand),
-    /// since the daemon re-arms only from it (PRD #82).
+    /// daemon records NOW is one the daemon can read, waits while the daemon
+    /// has not answered, and takes the re-arm back once that file is gone or
+    /// has been replaced by a symlink the daemon refuses to follow (PRD #82).
     #[test]
-    fn the_tui_rearms_when_the_daemons_role_file_is_gone() {
-        struct RearmingDaemon(Option<std::path::PathBuf>);
+    fn the_tui_rearms_when_the_daemon_cannot_read_its_role_file() {
+        struct RearmingDaemon(crate::pane::DaemonRearmFile);
         impl PaneController for RearmingDaemon {
             fn create_pane(&self, _: Option<&str>, _: Option<&str>) -> Result<String, PaneError> {
                 Ok(String::new())
@@ -41390,27 +41439,57 @@ mod tests {
             fn as_any(&self) -> &dyn std::any::Any {
                 self
             }
-            fn daemon_rearm_file(&self, _: &str) -> Option<std::path::PathBuf> {
+            fn daemon_rearm_file(&self, _: &str) -> crate::pane::DaemonRearmFile {
                 self.0.clone()
             }
         }
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("orchestrator-context-1.md");
+        use crate::pane::DaemonRearmFile;
+        let project = tempfile::tempdir().unwrap();
+        let context_dir = project.path().join(".dot-agent-deck");
+        std::fs::create_dir(&context_dir).unwrap();
+        let file = context_dir.join("orchestrator-context-0123456789abcdef0123456789abcdef.md");
         std::fs::write(&file, "role").unwrap();
-        let pane = RearmingDaemon(Some(file.clone()));
+        let daemon = |answer| RearmingDaemon(answer);
+        let names = |path: &std::path::Path| daemon(DaemonRearmFile::File(path.to_path_buf()));
 
-        assert!(daemon_owns_orchestrator_rearm(true, &pane, "1"));
+        assert_eq!(
+            orchestrator_rearm_owner(true, &names(&file), "1"),
+            RearmOwner::Daemon
+        );
+        assert_eq!(
+            orchestrator_rearm_owner(true, &daemon(DaemonRearmFile::Asking), "1"),
+            RearmOwner::Asking
+        );
         // A tab whose file the daemon does not record stays the TUI's, and so
         // does one whose daemon names no file for it.
-        assert!(!daemon_owns_orchestrator_rearm(false, &pane, "1"));
-        assert!(!daemon_owns_orchestrator_rearm(
-            true,
-            &RearmingDaemon(None),
-            "1"
-        ));
+        assert_eq!(
+            orchestrator_rearm_owner(false, &names(&file), "1"),
+            RearmOwner::Tui
+        );
+        assert_eq!(
+            orchestrator_rearm_owner(true, &daemon(DaemonRearmFile::NotDaemon), "1"),
+            RearmOwner::Tui
+        );
 
+        // A symlink in the recorded file's place, even to a readable file.
+        let elsewhere = project.path().join("elsewhere.md");
+        std::fs::write(&elsewhere, "role").unwrap();
         std::fs::remove_file(&file).unwrap();
-        assert!(!daemon_owns_orchestrator_rearm(true, &pane, "1"));
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&elsewhere, &file).unwrap();
+            assert_eq!(
+                orchestrator_rearm_owner(true, &names(&file), "1"),
+                RearmOwner::Tui
+            );
+            std::fs::remove_file(&file).unwrap();
+        }
+
+        // The recorded file gone.
+        assert_eq!(
+            orchestrator_rearm_owner(true, &names(&file), "1"),
+            RearmOwner::Tui
+        );
     }
 
     /// Scenario: OpenCode 1.x reports a session busy within milliseconds of

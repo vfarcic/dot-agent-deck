@@ -940,7 +940,13 @@ pub fn reassert_orchestrator_prompt(
 ///
 /// **Blocking.** The daemon calls it through
 /// [`crate::project_resolve::run_bounded`].
-pub fn republish_orchestrator_context(recorded: &std::path::Path) -> std::io::Result<Rearmed> {
+/// PRD #82: the project directory and content of a context file the daemon
+/// records, read with every check [`republish_orchestrator_context`] applies:
+/// the path is one of this deck's own per-publish files, and it opens as a
+/// regular file, not through a symlink, within [`MAX_CONTEXT_BYTES`].
+fn read_recorded_context(
+    recorded: &std::path::Path,
+) -> std::io::Result<(&std::path::Path, String)> {
     let not_a_context_file = || {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -953,6 +959,20 @@ pub fn republish_orchestrator_context(recorded: &std::path::Path) -> std::io::Re
         .ok_or_else(not_a_context_file)?;
     let name = own_context_file_name(project_dir, recorded).ok_or_else(not_a_context_file)?;
     let content = read_context_file(project_dir, name)?;
+    Ok((project_dir, content))
+}
+
+/// PRD #82: whether [`republish_orchestrator_context`] can read `recorded`
+/// now — what a TUI asks before it leaves a re-arm to the daemon, so a file
+/// the daemon would refuse (gone, a symlink, too long, not the deck's own)
+/// leaves the re-arm with the TUI instead. Reads the file, which is bounded by
+/// [`MAX_CONTEXT_BYTES`].
+pub fn recorded_context_is_republishable(recorded: &std::path::Path) -> bool {
+    read_recorded_context(recorded).is_ok()
+}
+
+pub fn republish_orchestrator_context(recorded: &std::path::Path) -> std::io::Result<Rearmed> {
+    let (project_dir, content) = read_recorded_context(recorded)?;
     let (task, _) = read_back_context(Some(&content));
     let published = publish_orchestrator_context(project_dir, &content)
         .map_err(|e| std::io::Error::other(e.detail()))?;
