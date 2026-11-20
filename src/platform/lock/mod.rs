@@ -41,7 +41,9 @@ impl std::fmt::Display for LockWaitError {
 /// Shortest and longest pause between two attempts of
 /// [`acquire_spawn_lock_within`]; the pause doubles from the first to the
 /// second.
+#[cfg(unix)]
 const LOCK_RETRY_FIRST_PAUSE: std::time::Duration = std::time::Duration::from_millis(10);
+#[cfg(unix)]
 const LOCK_RETRY_LONGEST_PAUSE: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// [`acquire_spawn_lock`], waiting at most `wait` for another holder to let
@@ -62,24 +64,7 @@ pub async fn acquire_spawn_lock_within(
 ) -> Result<SpawnLock, LockWaitError> {
     #[cfg(unix)]
     {
-        let deadline = tokio::time::Instant::now() + wait;
-        let mut pause = LOCK_RETRY_FIRST_PAUSE;
-        loop {
-            let attempt = path.to_path_buf();
-            match tokio::task::spawn_blocking(move || unix::try_acquire_spawn_lock(&attempt)).await
-            {
-                Ok(Ok(Some(lock))) => return Ok(lock),
-                Ok(Ok(None)) => {}
-                Ok(Err(error)) => return Err(LockWaitError::Failed(error)),
-                Err(join) => return Err(LockWaitError::Failed(std::io::Error::other(join))),
-            }
-            let now = tokio::time::Instant::now();
-            if now >= deadline {
-                return Err(LockWaitError::Busy);
-            }
-            tokio::time::sleep(pause.min(deadline - now)).await;
-            pause = (pause * 2).min(LOCK_RETRY_LONGEST_PAUSE);
-        }
+        acquire_within_using(path, wait, unix::try_acquire_spawn_lock).await
     }
     #[cfg(not(unix))]
     {
@@ -88,6 +73,37 @@ pub async fn acquire_spawn_lock_within(
             Ok(Err(error)) => Err(LockWaitError::Failed(error)),
             Err(_) => Err(LockWaitError::Busy),
         }
+    }
+}
+
+/// The Unix wait of [`acquire_spawn_lock_within`], with the single attempt
+/// passed in so a test can stand in for it.
+#[cfg(unix)]
+async fn acquire_within_using<F>(
+    path: &Path,
+    wait: std::time::Duration,
+    attempt: F,
+) -> Result<SpawnLock, LockWaitError>
+where
+    F: Fn(&Path) -> std::io::Result<Option<SpawnLock>> + Clone + Send + 'static,
+{
+    let deadline = tokio::time::Instant::now() + wait;
+    let mut pause = LOCK_RETRY_FIRST_PAUSE;
+    loop {
+        let attempt_path = path.to_path_buf();
+        let try_once = attempt.clone();
+        match tokio::task::spawn_blocking(move || try_once(&attempt_path)).await {
+            Ok(Ok(Some(lock))) => return Ok(lock),
+            Ok(Ok(None)) => {}
+            Ok(Err(error)) => return Err(LockWaitError::Failed(error)),
+            Err(join) => return Err(LockWaitError::Failed(std::io::Error::other(join))),
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(LockWaitError::Busy);
+        }
+        tokio::time::sleep(pause.min(deadline - now)).await;
+        pause = (pause * 2).min(LOCK_RETRY_LONGEST_PAUSE);
     }
 }
 
@@ -375,5 +391,173 @@ mod tests {
             "a lock file that cannot be opened is Failed, not Busy"
         );
         assert!(taken.is_ok(), "{:?}", taken.err());
+    }
+
+    /// A runtime with one blocking thread, for the waits below.
+    #[cfg(unix)]
+    fn one_blocking_thread() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap()
+    }
+
+    /// Whether nothing holds the lock at `path`: this thread takes it at
+    /// once, and lets go again.
+    #[cfg(unix)]
+    fn lock_is_free(path: &Path) -> bool {
+        matches!(unix::try_acquire_spawn_lock(path), Ok(Some(_)))
+    }
+
+    /// Auditor N7: the wait is bounded even when its attempt cannot run. On a
+    /// runtime with ONE blocking thread, kept busy by an unrelated job that
+    /// waits for the test, a bounded wait for a FREE lock answers within its
+    /// budget, before that job is let go; and once it is, the attempt the wait
+    /// gave up on leaves the lock free.
+    #[cfg(unix)]
+    #[test]
+    fn a_wait_whose_attempt_is_still_queued_answers_within_its_budget() {
+        let rt = one_blocking_thread();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("worktree.lock");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        let unrelated = rt.spawn_blocking(move || {
+            started_tx.send(()).unwrap();
+            let _ = gate_rx.recv();
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the unrelated job holds the blocking thread");
+        let began = std::time::Instant::now();
+        let wait = rt.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                acquire_spawn_lock_within(&path, Duration::from_millis(50)),
+            )
+            .await
+        });
+        let took = began.elapsed();
+        // Let go before asserting, so a failure cannot leave the runtime's
+        // only blocking thread waiting at shutdown.
+        drop(gate_tx);
+        let _ = rt.block_on(unrelated);
+        rt.shutdown_timeout(Duration::from_secs(10));
+        assert!(
+            matches!(wait, Ok(Err(LockWaitError::Busy))),
+            "answered {:?} after {took:?}",
+            wait.as_ref().map(|r| r.as_ref().map(|_| "the lock"))
+        );
+        assert!(took < Duration::from_secs(1), "answered after {took:?}");
+        assert!(
+            lock_is_free(&path),
+            "the abandoned attempt left the lock held"
+        );
+    }
+
+    /// Auditor N7: an attempt that takes the lock only after the wait has run
+    /// out is not handed back, and does not keep it. The attempt here waits
+    /// for the test before taking a free lock; the wait answers `Busy` within
+    /// its budget while it does, and once it has taken the lock and finished,
+    /// the lock is free again.
+    #[cfg(unix)]
+    #[test]
+    fn an_attempt_that_succeeds_after_the_deadline_is_not_returned_and_lets_go() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        let rt = one_blocking_thread();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("worktree.lock");
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        let gate_rx = Arc::new(Mutex::new(gate_rx));
+        let took_it = Arc::new(AtomicBool::new(false));
+        let attempt = {
+            let took_it = Arc::clone(&took_it);
+            move |path: &Path| {
+                let _ = gate_rx.lock().unwrap().recv();
+                let taken = unix::try_acquire_spawn_lock(path)?;
+                took_it.store(taken.is_some(), Ordering::SeqCst);
+                Ok(taken)
+            }
+        };
+        let began = std::time::Instant::now();
+        let wait = rt.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                acquire_within_using(&path, Duration::from_millis(50), attempt),
+            )
+            .await
+        });
+        let took = began.elapsed();
+        drop(gate_tx);
+        rt.shutdown_timeout(Duration::from_secs(10));
+        assert!(
+            matches!(wait, Ok(Err(LockWaitError::Busy))),
+            "answered {:?} after {took:?}",
+            wait.as_ref().map(|r| r.as_ref().map(|_| "the lock"))
+        );
+        assert!(took < Duration::from_secs(1), "answered after {took:?}");
+        assert!(
+            took_it.load(Ordering::SeqCst),
+            "the attempt took the lock, late"
+        );
+        assert!(lock_is_free(&path), "a late success kept the lock");
+    }
+
+    /// Auditor N8: polling promises no turn. Every attempt here meets a
+    /// DIFFERENT holder, the previous one having let go in between, and the
+    /// wait still runs out; its error says it could not get the lock in time,
+    /// not that one holder kept it for the whole wait.
+    #[cfg(unix)]
+    #[test]
+    fn holders_that_take_turns_can_outlast_a_wait_which_says_only_that_it_ran_out() {
+        use std::sync::{Arc, Mutex};
+        let rt = one_blocking_thread();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("worktree.lock");
+        let holders: Arc<Mutex<(Option<std::fs::File>, usize)>> = Arc::new(Mutex::new((None, 0)));
+        let attempt = {
+            let holders = Arc::clone(&holders);
+            move |path: &Path| {
+                let mut turn = holders.lock().unwrap();
+                // The last holder lets go and a fresh one takes the lock,
+                // between this attempt and the one before it.
+                turn.0 = None;
+                let next = std::fs::OpenOptions::new()
+                    .create(true)
+                    .read(true)
+                    .write(true)
+                    .truncate(false)
+                    .open(path)?;
+                next.lock()?;
+                turn.0 = Some(next);
+                turn.1 += 1;
+                unix::try_acquire_spawn_lock(path)
+            }
+        };
+        let wait = rt.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                acquire_within_using(&path, Duration::from_millis(100), attempt),
+            )
+            .await
+        });
+        let (last, turns) = {
+            let mut turn = holders.lock().unwrap();
+            (turn.0.take(), turn.1)
+        };
+        drop(last);
+        rt.shutdown_timeout(Duration::from_secs(10));
+        let error = match wait {
+            Ok(Err(error)) => error,
+            Ok(Ok(_)) => panic!("took a lock that every attempt found held"),
+            Err(_) => panic!("the wait outlived its budget"),
+        };
+        assert!(matches!(error, LockWaitError::Busy), "{error:?}");
+        assert!(turns >= 2, "{turns} holder(s): no turnover was exercised");
+        let said = error.to_string();
+        assert_eq!(said, "could not get the lock in time");
+        assert!(lock_is_free(&path));
     }
 }
