@@ -1681,7 +1681,7 @@ fn dismissing_more_items_than_one_request_admits_in_batches_dismisses_exactly_th
 /// A stand-in for the keep check's `git`: `status` and `worktree` each either
 /// flood stdout forever (`flood`), stall with a background descendant,
 /// writing the pids to `<dir>/<what>-leader.pid` and `<dir>/<what>-child.pid`
-/// (`stall`), or run the real `git` (`git`); `status` may also answer clean
+/// (`stall`), or run the real `git` (`real`); `status` may also answer clean
 /// (`clean`).
 fn keep_check_stand_in(dir: &Path, status: &str, worktree: &str) -> PathBuf {
     let script = dir.join("keep-check-git");
@@ -1750,7 +1750,7 @@ fn reclaim_keeps_the_tree_when_the_keep_checks_output_floods() {
         let registry = registry_with_journal(&root_dir.join("state"), JournalOptions::default());
         let (root, _) = unit(&registry, "agent/dispatch-x", Some(&wt));
         for (status, worktree, kept) in [
-            ("flood", "git", ReclaimVerdict::KeptDirty),
+            ("flood", "real", ReclaimVerdict::KeptDirty),
             ("clean", "flood", ReclaimVerdict::KeptCouldNotCheck),
         ] {
             let script = keep_check_stand_in(&root_dir, status, worktree);
@@ -1787,7 +1787,7 @@ fn reclaim_kills_and_reaps_a_stalled_keep_check_and_keeps_the_tree() {
         mark(&wt);
         let registry = registry_with_journal(&root_dir.join("state"), JournalOptions::default());
         let (root, _) = unit(&registry, "agent/dispatch-x", Some(&wt));
-        let script = keep_check_stand_in(&root_dir, "stall", "git");
+        let script = keep_check_stand_in(&root_dir, "stall", "real");
         seams::arm_keep_check(&wt, script, Duration::from_secs(1));
         for dry_run in [true, true, false] {
             let _ = std::fs::remove_file(root_dir.join("status-leader.pid"));

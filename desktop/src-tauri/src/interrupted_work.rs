@@ -18,7 +18,8 @@ use std::time::Duration;
 
 use dot_agent_deck::daemon_client::{ClientError, DaemonClient, GatedQuery};
 use dot_agent_deck::interrupted_work::{
-    DismissOutcome, InterruptedList, InterruptedShow, ReclaimOutcome,
+    DismissOutcome, DismissStopReason, DismissStopped, InterruptedList, InterruptedShow,
+    ReclaimOutcome, dismiss_batches,
 };
 
 use crate::dto::InterruptedWorkReply;
@@ -104,18 +105,64 @@ pub(crate) async fn reclaim(
 
 /// Dismiss exactly the items `ids` name — never "all", so an item listed
 /// after the person was asked is not dismissed unseen. No pane claim.
+///
+/// The ids go in the batches the daemon admits
+/// ([`dot_agent_deck::interrupted_work::dismiss_batches`]), one after
+/// another, each pinned to `instance`, and the answer adds them up: one call
+/// is the one dismissal the webview holds pending. A later batch that does
+/// not dismiss — refused whole, withheld because the daemon process was
+/// replaced, or unanswered — stops the rest, and the answer records it in
+/// [`DismissOutcome::stopped`]. The first batch answers as a single
+/// dismissal does.
 pub(crate) async fn dismiss(
     client: &DaemonClient,
     instance: &str,
     ids: Vec<String>,
 ) -> Result<InterruptedWorkReply<DismissOutcome>, String> {
-    reply(
+    let mut batches = dismiss_batches(&ids).into_iter();
+    let first = batches.next().unwrap_or_default();
+    let mut done = match reply(
         "DismissInterrupted",
         DISMISS_TIMEOUT,
         instance,
-        client.dismiss_interrupted(ids, false, None, Some(instance)),
+        client.dismiss_interrupted(first, false, None, Some(instance)),
     )
-    .await
+    .await?
+    {
+        InterruptedWorkReply::Answered { answer, .. } if answer.refusal.is_none() => answer,
+        other => return Ok(other),
+    };
+    let rest: Vec<Vec<String>> = batches.collect();
+    for (n, batch) in rest.iter().enumerate() {
+        let answer = crate::daemon_bridge::bounded_reply_within(
+            "DismissInterrupted",
+            DISMISS_TIMEOUT,
+            client.dismiss_interrupted(batch.clone(), false, None, Some(instance)),
+        )
+        .await;
+        let (reason, refusal) = match answer {
+            Ok(GatedQuery::Answered(outcome)) if outcome.refusal.is_none() => {
+                done.absorb(outcome);
+                continue;
+            }
+            Ok(GatedQuery::Answered(outcome)) => (
+                DismissStopReason::Refused,
+                outcome.refusal.map(|r| r.reason),
+            ),
+            Ok(GatedQuery::Unsupported) => (DismissStopReason::Replaced, None),
+            Err(_) => (DismissStopReason::Failed, None),
+        };
+        done.stopped = Some(DismissStopped {
+            reason,
+            refusal,
+            not_sent: rest[n..].iter().map(Vec::len).sum(),
+        });
+        break;
+    }
+    Ok(InterruptedWorkReply::Answered {
+        instance: instance.to_string(),
+        answer: done,
+    })
 }
 
 #[cfg(all(test, unix))]

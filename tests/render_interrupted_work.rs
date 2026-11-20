@@ -1703,6 +1703,12 @@ fn dismissals(sent: &[InterruptedSeamRequest]) -> Vec<(Vec<String>, bool)> {
         .collect()
 }
 
+/// `sentence` without its whitespace, to find it in [`popup_text`], however
+/// the popup wrapped it.
+fn squeezed(sentence: &str) -> String {
+    sentence.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
 fn lists_sent(sent: &[InterruptedSeamRequest]) -> usize {
     sent.iter()
         .filter(|r| matches!(r, InterruptedSeamRequest::List { .. }))
@@ -1797,10 +1803,7 @@ fn interrupted_030_a_failed_later_batch_stops_dismiss_all_and_says_so() {
         assert!(said.contains(DISMISSED), "{said}");
         let why = dismiss_stopped_sentence(&stopped);
         assert!(
-            said.split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-                .contains(&why),
+            popup_text(said).contains(&squeezed(&why)),
             "{why:?} in:\n{said}"
         );
     }
@@ -1858,10 +1861,7 @@ fn interrupted_031_a_replaced_daemon_stops_dismiss_all_between_batches() {
         );
         let said = text(run.frames.last().unwrap());
         assert!(
-            said.split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-                .contains(&why),
+            popup_text(&said).contains(&squeezed(&why)),
             "{why:?} in:\n{said}"
         );
     }

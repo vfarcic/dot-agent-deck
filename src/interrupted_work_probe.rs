@@ -56,6 +56,12 @@ impl Deadline {
         std::cmp::min(self, other)
     }
 
+    /// The same instant, as a [`std::time::Instant`], for a bound that is
+    /// not a child's (a walk of a directory, say).
+    pub fn as_std(self) -> std::time::Instant {
+        self.0.into_std()
+    }
+
     /// The time left, or `None` once it has passed.
     pub fn remaining(self) -> Option<Duration> {
         self.0

@@ -663,9 +663,9 @@ impl DispatchedUnits {
             return Err(already_ended(stone));
         }
         let message = if self.is_foreign_id(id) {
-            "that unit id was issued by a daemon that has since restarted; nothing it \
-             recorded is known to this one. `dot-agent-deck interrupted list` shows the work \
-             a restart interrupted"
+            "that unit id was issued by a daemon that has since restarted, and its live unit \
+             registration did not survive the restart. `dot-agent-deck interrupted list` \
+             shows the work a restart interrupted"
         } else {
             "no live unit has that id"
         };

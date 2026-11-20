@@ -113,6 +113,13 @@ export interface ReclaimOutcome {
   recorded?: boolean;
 }
 
+/** `DismissStopped`: why a dismissal sent in batches stopped, and how many of its ids it did not reach. */
+export interface DismissStopped {
+  reason: "replaced" | "refused" | "failed" | string;
+  refusal?: string | null;
+  not_sent: number;
+}
+
 export interface DismissOutcome {
   dismissed: { id: string; name?: string | null }[];
   refused: { id: string; refusal: Refusal }[];
@@ -120,6 +127,8 @@ export interface DismissOutcome {
   incomplete?: boolean;
   dismissed_omitted?: number;
   refused_omitted?: number;
+  /** Set by the app's bridge when a later batch of a dismissal sent in batches stopped the rest (`DismissOutcome::stopped`). */
+  stopped?: DismissStopped | null;
 }
 
 /**
@@ -333,6 +342,8 @@ export const LABEL_NESTED_WORKTREE = "Holds worktree";
 export const REPORT_CUT = "This report is longer than shown; this is its start.";
 export const REPORT_UNREADABLE = "This report cannot be shown:";
 export const NOTHING_DISMISSED = "Nothing was dismissed.";
+export const DISMISS_STOPPED_REPLACED = "the deck daemon was replaced. List the interrupted work again.";
+export const DISMISS_STOPPED_FAILED = "the deck daemon did not answer. List the interrupted work again.";
 export const UNSUPPORTED = "The running deck daemon does not support interrupted work. Restart it onto this build with `dot-agent-deck daemon restart`.";
 export const DAEMON_FAILED = "The deck daemon could not answer:";
 export const MAX_SHOWN_CHARS = 300;
@@ -467,8 +478,22 @@ export function dismissMessage(outcome: DismissOutcome): string {
   if (outcome.refusal) return refusalText(outcome.refusal);
   const refused = outcome.refused[0];
   if (refused) return refusalText(refused.refusal);
-  if (outcome.dismissed.length === 0 && !outcome.dismissed_omitted) return NOTHING_DISMISSED;
-  return DISMISSED;
+  const said = outcome.dismissed.length === 0 && !outcome.dismissed_omitted ? NOTHING_DISMISSED : DISMISSED;
+  return outcome.stopped ? `${said} ${dismissStoppedSentence(outcome.stopped)}` : said;
+}
+
+/** `dismiss_stopped_sentence`: why a dismissal sent in batches stopped. A refused batch was not dismissed; one whose daemon was replaced, or that got no answer, may have been. */
+export function dismissStoppedSentence(stopped: DismissStopped): string {
+  const n = stopped.not_sent;
+  const unsure = stopped.reason === "replaced" || stopped.reason === "failed";
+  const [one, many] = unsure
+    ? ["1 more item may not have been dismissed", "more items may not have been dismissed"]
+    : ["1 more item was not dismissed", "more items were not dismissed"];
+  const lead = n === 1 ? one : `${n} ${many}`;
+  if (stopped.reason === "replaced") return `${lead}: ${DISMISS_STOPPED_REPLACED}`;
+  if (stopped.reason === "failed") return `${lead}: ${DISMISS_STOPPED_FAILED}`;
+  if (stopped.reason === "refused") return `${lead}. ${REFUSAL_SENTENCES[stopped.refusal ?? ""] ?? REFUSED_UNKNOWN}`;
+  return `${lead}.`;
 }
 
 // ---------------------------------------------------------------------------

@@ -157,6 +157,27 @@ struct Pending {
     dry_run: bool,
 }
 
+/// A dismissal's batches: one is sent at a time, all pinned to the daemon
+/// process the list came from, and the next only once the one before answered
+/// with a dismissal (final review, reviewer 1 / auditor 2).
+#[derive(Debug, Default)]
+struct Batches {
+    /// The ids of the batch in flight.
+    in_flight: usize,
+    /// The batches not yet sent, in order.
+    left: std::collections::VecDeque<Vec<String>>,
+    /// What the answered batches did, added up; `None` before the first
+    /// answered.
+    done: Option<DismissOutcome>,
+}
+
+impl Batches {
+    /// How many ids the batch in flight and the ones after it name.
+    fn not_sent(&self) -> usize {
+        self.in_flight + self.left.iter().map(Vec::len).sum::<usize>()
+    }
+}
+
 /// What the TUI holds of the interrupted work list.
 pub(super) struct InterruptedWork {
     /// The daemon process the list came from; every request is pinned to it,
@@ -185,6 +206,10 @@ pub(super) struct InterruptedWork {
     footer_hidden: bool,
     /// The reclaim or dismissal in flight.
     pending: Option<Pending>,
+    /// A dismissal sent in batches ([`words::dismiss_batches`]): the batches
+    /// not yet sent and what the answered ones did. Its batch in flight is
+    /// [`Self::pending`].
+    dismissal: Option<Batches>,
     /// The newest list request; an older one's answer is not applied.
     list_op: Option<u64>,
     /// The report request the open details wait for.
@@ -225,6 +250,7 @@ impl Default for InterruptedWork {
             message: None,
             footer_hidden: false,
             pending: None,
+            dismissal: None,
             list_op: None,
             show_op: None,
             question_seen: Vec::new(),
@@ -460,14 +486,35 @@ pub(super) fn sync(ui: &mut UiState, incarnation: &Incarnation) {
         recorder,
         generation,
         last_op,
+        pending,
+        dismissal,
         ..
     } = std::mem::take(iw);
+    // A dismissal in batches whose process went away: the rest are not sent
+    // to the new one, and the person is told.
+    let message = dismissal
+        .filter(|batches| pending.is_some() && batches.not_sent() > 0)
+        .map(|batches| {
+            let stopped = words::DismissStopped {
+                reason: words::DismissStopReason::Replaced,
+                refusal: None,
+                not_sent: batches.not_sent(),
+            };
+            match batches.done {
+                Some(mut done) => {
+                    done.stopped = Some(stopped);
+                    dismiss_message(&done)
+                }
+                None => words::dismiss_stopped_sentence(&stopped),
+            }
+        });
     *iw = InterruptedWork {
         fetched_for: Some(process.to_string()),
         instance: Some(process.to_string()),
         generation: generation + 1,
         last_op,
         recorder,
+        message,
         tx,
         rx,
         ..InterruptedWork::default()
@@ -631,11 +678,44 @@ pub(super) fn apply(ui: &mut UiState, answer: Answer) {
                 return;
             }
             iw.pending = None;
-            iw.message = Some(match result {
-                Ok(Some(outcome)) => dismiss_message(&outcome),
-                Ok(None) => words::UNSUPPORTED.to_string(),
-                Err(message) => message,
-            });
+            let mut batches = iw.dismissal.take().unwrap_or_default();
+            let message = match (result, batches.done.take()) {
+                // A batch dismissed: add it up, and send the next if any.
+                (Ok(Some(outcome)), done) if outcome.refusal.is_none() => {
+                    let mut done = done.unwrap_or_default();
+                    done.absorb(outcome);
+                    if let Some(next) = batches.left.pop_front() {
+                        batches.in_flight = next.len();
+                        batches.done = Some(done);
+                        iw.dismissal = Some(batches);
+                        send_batch(iw, next);
+                        return;
+                    }
+                    dismiss_message(&done)
+                }
+                // A later batch did not dismiss: the rest are not sent.
+                (result, Some(mut done)) => {
+                    let (reason, refusal) = match &result {
+                        Ok(Some(outcome)) => (
+                            words::DismissStopReason::Refused,
+                            outcome.refusal.as_ref().map(|r| r.reason),
+                        ),
+                        Ok(None) => (words::DismissStopReason::Replaced, None),
+                        Err(_) => (words::DismissStopReason::Failed, None),
+                    };
+                    done.stopped = Some(words::DismissStopped {
+                        reason,
+                        refusal,
+                        not_sent: batches.not_sent(),
+                    });
+                    dismiss_message(&done)
+                }
+                // The first batch: as a single dismissal reads.
+                (Ok(Some(outcome)), None) => dismiss_message(&outcome),
+                (Ok(None), None) => words::UNSUPPORTED.to_string(),
+                (Err(message), None) => message,
+            };
+            iw.message = Some(message);
             request_list(iw, false);
         }
     }
@@ -649,10 +729,15 @@ fn dismiss_message(outcome: &DismissOutcome) -> String {
     if let Some(refused) = outcome.refused.first() {
         return words::refusal_sentence(refused.refusal.reason).to_string();
     }
-    if outcome.dismissed.is_empty() && outcome.dismissed_omitted == 0 {
-        return words::NOTHING_DISMISSED.to_string();
+    let said = if outcome.dismissed.is_empty() && outcome.dismissed_omitted == 0 {
+        words::NOTHING_DISMISSED
+    } else {
+        words::DISMISSED
+    };
+    match &outcome.stopped {
+        Some(stopped) => format!("{said} {}", words::dismiss_stopped_sentence(stopped)),
+        None => said.to_string(),
     }
-    words::DISMISSED.to_string()
 }
 
 /// PRD #1790 stage 2: open the overlay on the list, and ask for it again with
@@ -964,15 +1049,32 @@ fn reclaim(iw: &mut InterruptedWork, id: String, dry_run: bool) {
 
 /// Dismiss exactly the items `ids` name: never "all", so an item listed
 /// after the person was asked is not dismissed.
+///
+/// The ids go in the batches the daemon admits ([`words::dismiss_batches`]),
+/// one at a time: [`apply`] sends the next once the one before answered.
 fn dismiss(iw: &mut InterruptedWork, ids: Vec<String>) {
+    let mut left: std::collections::VecDeque<Vec<String>> = words::dismiss_batches(&ids).into();
+    let first = left.pop_front().unwrap_or_default();
+    iw.dismissal = Some(Batches {
+        in_flight: first.len(),
+        left,
+        done: None,
+    });
+    iw.view = View::List;
+    send_batch(iw, first);
+}
+
+/// Send one batch of a dismissal; it is the request [`InterruptedWork::pending`]
+/// waits for.
+fn send_batch(iw: &mut InterruptedWork, ids: Vec<String>) {
     let tag = iw.next_tag();
     iw.pending = Some(Pending {
         op: tag.op,
         dry_run: false,
     });
-    iw.view = View::List;
     if !send(iw, tag, InterruptedSeamRequest::Dismiss { ids, all: false }) {
         iw.pending = None;
+        iw.dismissal = None;
     }
 }
 

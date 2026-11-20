@@ -514,8 +514,22 @@ pub struct DismissStopped {
 /// than [`crate::close_agents::MAX_SELECTOR_ENTRY_BYTES`] goes in a batch of
 /// its own, which the daemon refuses. Every id is in exactly one batch.
 pub fn dismiss_batches(ids: &[String]) -> Vec<Vec<String>> {
-    // RED stub: one batch, as before.
-    vec![ids.to_vec()]
+    use crate::close_agents::{MAX_SELECTOR_BYTES, MAX_SELECTOR_ENTRIES};
+    let mut batches: Vec<Vec<String>> = Vec::new();
+    let mut bytes = 0usize;
+    for id in ids {
+        let fits = batches.last().is_some_and(|batch| {
+            batch.len() < MAX_SELECTOR_ENTRIES
+                && bytes.saturating_add(id.len()) <= MAX_SELECTOR_BYTES
+        });
+        if !fits {
+            batches.push(Vec::new());
+            bytes = 0;
+        }
+        bytes = bytes.saturating_add(id.len());
+        batches.last_mut().expect("pushed above").push(id.clone());
+    }
+    batches
 }
 
 /// The most entries each of a dismissal's [`DismissOutcome::dismissed`] and
@@ -841,19 +855,37 @@ pub fn more_refused_sentence(count: usize) -> String {
     }
 }
 
+/// Why a dismissal sent in batches stopped, when its daemon was replaced.
+pub const DISMISS_STOPPED_REPLACED: &str =
+    "the deck daemon was replaced. List the interrupted work again.";
+/// Why a dismissal sent in batches stopped, when a batch got no answer.
+pub const DISMISS_STOPPED_FAILED: &str =
+    "the deck daemon did not answer. List the interrupted work again.";
+
 /// What a dismissal sent in batches says after its outcome when it stopped
-/// before its last batch ([`DismissOutcome::stopped`]).
+/// before its last batch ([`DismissOutcome::stopped`]). A refused batch was
+/// not dismissed; a batch whose daemon was replaced, or that got no answer,
+/// may have been, so that is all it says of them.
 pub fn dismiss_stopped_sentence(stopped: &DismissStopped) -> String {
-    let lead = if stopped.not_sent == 1 {
-        "1 more item was not dismissed".to_string()
+    let n = stopped.not_sent;
+    let (one, many) = match stopped.reason {
+        DismissStopReason::Refused | DismissStopReason::Unknown => (
+            "1 more item was not dismissed",
+            "more items were not dismissed",
+        ),
+        DismissStopReason::Replaced | DismissStopReason::Failed => (
+            "1 more item may not have been dismissed",
+            "more items may not have been dismissed",
+        ),
+    };
+    let lead = if n == 1 {
+        one.to_string()
     } else {
-        format!("{} more items were not dismissed", stopped.not_sent)
+        format!("{n} {many}")
     };
     match stopped.reason {
-        DismissStopReason::Replaced => {
-            format!("{lead}: the deck daemon was replaced. List the interrupted work again.")
-        }
-        DismissStopReason::Failed => format!("{lead}: the deck daemon did not answer."),
+        DismissStopReason::Replaced => format!("{lead}: {DISMISS_STOPPED_REPLACED}"),
+        DismissStopReason::Failed => format!("{lead}: {DISMISS_STOPPED_FAILED}"),
         DismissStopReason::Refused => format!(
             "{lead}. {}",
             refusal_sentence(stopped.refusal.unwrap_or(RefusalReason::Unknown))

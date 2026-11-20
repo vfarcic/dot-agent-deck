@@ -586,6 +586,7 @@ pub fn examine_worktrees(repo_dir: &Path) -> Result<Vec<WorktreeReport>, String>
             decide(&pr_state, &cleanliness, ownership),
             &paths_inside(&wt.path, &all_paths),
         );
+        let verdict = keep_if_it_holds_other_trees(verdict, &wt.path);
         reports.push(WorktreeReport {
             path: wt.path,
             branch: wt.branch,
@@ -615,7 +616,9 @@ fn existing_paths(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
 /// Issue #2285: a worktree that other worktrees lie inside is kept whatever
 /// [`decide`] said, because `git worktree remove` deletes the whole directory,
 /// theirs included, with their uncommitted work, and `check_cleanliness`
-/// cannot see one under a git-ignored directory. A `Keep` stays the `Keep` it
+/// cannot see one under a git-ignored directory. `nested` is the repository's
+/// own worktrees inside it, or ([`keep_if_it_holds_other_trees`]) the working
+/// trees of any repository found by looking at the directory. A `Keep` stays the `Keep` it
 /// was: its reason already blocks the removal.
 fn keep_if_it_holds_worktrees(verdict: Verdict, nested: &[&PathBuf]) -> Verdict {
     if nested.is_empty() || matches!(verdict, Verdict::Keep(_)) {
@@ -626,6 +629,30 @@ fn keep_if_it_holds_worktrees(verdict: Verdict, nested: &[&PathBuf]) -> Verdict 
         "holds other worktrees, which removing it would delete: {}; remove them first",
         names.join(", ")
     ))
+}
+
+/// PRD #1790 stage 2 (final review, auditor 1): a worktree that holds a Git
+/// working tree of ANOTHER repository — which this repository's listing,
+/// and so [`keep_if_it_holds_worktrees`], cannot know — is kept as well,
+/// naming it; and so is one whose directory could not be looked through in
+/// full, since it may hold one. A `Keep` stays the `Keep` it was.
+fn keep_if_it_holds_other_trees(verdict: Verdict, worktree: &Path) -> Verdict {
+    if matches!(verdict, Verdict::Keep(_)) {
+        return verdict;
+    }
+    let deadline = std::time::Instant::now() + crate::nested_git_trees::SCAN_TIMEOUT;
+    match crate::nested_git_trees::git_trees_inside(
+        worktree,
+        crate::nested_git_trees::MAX_SCAN_ENTRIES,
+        crate::issue_dispatch_run::MAX_NESTED_WORKTREES_REPORTED,
+        deadline,
+    ) {
+        Ok(found) if found.is_empty() => verdict,
+        Ok(found) => keep_if_it_holds_worktrees(verdict, &found.iter().collect::<Vec<_>>()),
+        Err(e) => Verdict::Keep(format!(
+            "could not check for other worktrees inside it ({e}); kept in case it holds one"
+        )),
+    }
 }
 
 /// Render a worktree path for human output as an **injective** escape: two

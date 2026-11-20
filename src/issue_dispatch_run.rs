@@ -239,6 +239,10 @@ pub async fn worktree_is_dirty(worktree_dir: &Path) -> Result<bool, String> {
 ///
 /// `Err` is "could not ask", which the callers treat as a reason to KEEP, as
 /// they do a failed `git status`.
+///
+/// This knows `clone_dir`'s repository's worktrees only: a worktree of
+/// another repository inside the tree is not in its listing. The keep check
+/// asks [`nested_trees`], which also looks at the directory.
 pub async fn nested_worktrees(
     worktree_dir: &Path,
     clone_dir: &Path,
@@ -262,11 +266,20 @@ pub async fn nested_worktrees(
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
+    nested_in_listing(worktree_dir, &output.stdout).await
+}
+
+/// [`nested_worktrees`]'s answer from `listing`, the stdout of
+/// `git worktree list --porcelain -z` in the repository: the listed
+/// worktrees inside `worktree_dir`, named under it. PRD #1790 stage 2: a
+/// reclaim takes the listing through its own bounded runner and reads it
+/// here, so the two cannot disagree about what is inside.
+pub async fn nested_in_listing(worktree_dir: &Path, listing: &[u8]) -> Result<Vec<String>, String> {
     let own = tokio::fs::canonicalize(worktree_dir)
         .await
         .map_err(|e| format!("could not resolve {}: {e}", worktree_dir.display()))?;
     let mut resolved = Vec::new();
-    for listed in crate::worktree_reclaim::worktree_paths_from_porcelain_z(&output.stdout) {
+    for listed in crate::worktree_reclaim::worktree_paths_from_porcelain_z(listing) {
         // Only an entry that could lie inside is resolved, so one broken
         // worktree elsewhere in the repository cannot fail every close. Git
         // records absolute paths, so an entry inside starts with the tree's
@@ -297,6 +310,65 @@ pub async fn nested_worktrees(
         .collect())
 }
 
+/// PRD #1790 stage 2 (final review, auditor 1): the Git working trees inside
+/// `worktree_dir` that [`crate::nested_git_trees`] finds by looking at the
+/// directory, of ANY repository, each named under `worktree_dir`; `Err` when
+/// the look could not be finished by `deadline`.
+pub async fn git_trees_inside(
+    worktree_dir: &Path,
+    deadline: std::time::Instant,
+) -> Result<Vec<String>, String> {
+    crate::nested_git_trees::git_trees_inside_async(
+        worktree_dir,
+        MAX_NESTED_WORKTREES_REPORTED,
+        deadline,
+    )
+    .await
+    .map(|found| {
+        found
+            .into_iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect()
+    })
+}
+
+/// PRD #1790 stage 2 (final review, auditor 1): the worktrees inside a tree,
+/// from its repository's listing ([`nested_worktrees`]) and from a look at
+/// the directory itself ([`git_trees_inside`]), which finds a worktree of
+/// another repository the listing cannot know. Any found is an answer even
+/// when the other half failed, since one is enough to keep the tree; with
+/// none found, a half that failed makes it `Err`, a reason to keep. At most
+/// [`MAX_NESTED_WORKTREES_REPORTED`], each named once.
+pub fn merge_nested(
+    listed: Result<Vec<String>, String>,
+    found: Result<Vec<String>, String>,
+) -> Result<Vec<String>, String> {
+    let mut names: Vec<String> = Vec::new();
+    for name in listed.iter().flatten().chain(found.iter().flatten()) {
+        if !names.contains(name) {
+            names.push(name.clone());
+        }
+    }
+    names.truncate(MAX_NESTED_WORKTREES_REPORTED);
+    if names.is_empty() {
+        listed?;
+        found?;
+    }
+    Ok(names)
+}
+
+/// The worktrees inside `worktree_dir` — `clone_dir`'s repository's, and
+/// any other repository's ([`merge_nested`]) — for close's cleanup, its
+/// preview and `worktree_keep_check`'s other callers.
+pub async fn nested_trees(worktree_dir: &Path, clone_dir: &Path) -> Result<Vec<String>, String> {
+    let deadline = std::time::Instant::now() + crate::nested_git_trees::SCAN_TIMEOUT;
+    let (listed, found) = tokio::join!(
+        nested_worktrees(worktree_dir, clone_dir),
+        git_trees_inside(worktree_dir, deadline)
+    );
+    merge_nested(listed, found)
+}
+
 /// Issue #2285: how many of the worktrees inside a tree [`nested_worktrees`]
 /// names.
 pub const MAX_NESTED_WORKTREES_REPORTED: usize = 16;
@@ -313,9 +385,11 @@ pub enum TreeKeepCheck {
 }
 
 /// The ONE question a `KeepIfDirty` removal and the close preview ask before
-/// deleting a tree, so they cannot disagree: does it hold other worktrees
-/// ([`nested_worktrees`]), and failing that, uncommitted work
-/// ([`worktree_is_dirty`])? `Err` when the answer depends on one that could
+/// deleting a tree, so they cannot disagree: does it hold other worktrees, of
+/// its repository or any other ([`nested_trees`]), and failing that,
+/// uncommitted work ([`worktree_is_dirty`])? An interrupted item's reclaim
+/// asks the same two through its own bounded runner and reads them with the
+/// same [`keep_check_answer`]. `Err` when the answer depends on one that could
 /// not be asked. The two read git concurrently, so the close preview's
 /// deadline covers one round trip rather than two.
 ///
@@ -328,8 +402,19 @@ pub async fn worktree_keep_check(
 ) -> Result<TreeKeepCheck, String> {
     let (dirty, nested) = tokio::join!(
         worktree_is_dirty(worktree_dir),
-        nested_worktrees(worktree_dir, clone_dir)
+        nested_trees(worktree_dir, clone_dir)
     );
+    keep_check_answer(dirty, nested)
+}
+
+/// [`worktree_keep_check`]'s answer from its two questions' answers: the
+/// worktrees inside win over a dirty tree, and either question unanswered,
+/// with nothing found to keep it for, is `Err`. PRD #1790 stage 2: a reclaim
+/// asks the two through its own bounded runner and answers here.
+pub fn keep_check_answer(
+    dirty: Result<bool, String>,
+    nested: Result<Vec<String>, String>,
+) -> Result<TreeKeepCheck, String> {
     if let Ok(nested) = &nested
         && !nested.is_empty()
     {
@@ -694,6 +779,33 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = RemovalGuard>,
 {
+    remove_worktree_outcome_checked(
+        worktree_dir,
+        clone_dir,
+        policy,
+        || worktree_keep_check(worktree_dir, clone_dir),
+        guard,
+    )
+    .await
+}
+
+/// PRD #1790 stage 2 (final review, auditor 3):
+/// [`remove_worktree_outcome_guarded`] with the `KeepIfDirty` keep check
+/// passed in, so a reclaim asks it through its own bounded runner instead of
+/// [`worktree_keep_check`]'s. `keep_check` is asked only for `KeepIfDirty`.
+pub async fn remove_worktree_outcome_checked<K, KFut, F, Fut>(
+    worktree_dir: &Path,
+    clone_dir: &Path,
+    policy: RemovalPolicy,
+    keep_check: K,
+    guard: F,
+) -> Option<WorktreeRemoval>
+where
+    K: FnOnce() -> KFut,
+    KFut: std::future::Future<Output = Result<TreeKeepCheck, String>>,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = RemovalGuard>,
+{
     let worktree = worktree_dir.to_string_lossy();
     // PRD #1589 (auditor S5): the path and git's error text are producer
     // values — a directory name may carry a newline or a terminal control — so
@@ -706,7 +818,7 @@ where
     };
     let shown_worktree = logged(&worktree);
     if policy == RemovalPolicy::KeepIfDirty {
-        match worktree_keep_check(worktree_dir, clone_dir).await {
+        match keep_check().await {
             Ok(TreeKeepCheck::Dirty) => {
                 tracing::warn!(
                     worktree = %shown_worktree,

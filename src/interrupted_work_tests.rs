@@ -1302,3 +1302,34 @@ fn the_lock_verdicts_decode_as_unknown_in_a_reader_that_predates_them() {
         assert_eq!(back, verdict);
     }
 }
+
+/// Final review, reviewer 1 / auditor 2: the confirmed ids of a dismissal are
+/// split into selectors the daemon admits — at most 256 ids, and at most
+/// 32 KiB of them together — in order, each id in exactly one batch.
+#[test]
+fn dismiss_batches_fit_the_daemons_count_and_byte_limits() {
+    use crate::close_agents::{MAX_SELECTOR_BYTES, MAX_SELECTOR_ENTRIES, MAX_SELECTOR_ENTRY_BYTES};
+    assert!(dismiss_batches(&[]).is_empty());
+    let short: Vec<String> = (0..257).map(|n| format!("w-{n}")).collect();
+    let batches = dismiss_batches(&short);
+    assert_eq!(
+        batches.iter().map(Vec::len).collect::<Vec<_>>(),
+        vec![256, 1]
+    );
+    assert_eq!(batches.concat(), short);
+    // Ids at the longest one may be: the byte limit, not the count, splits.
+    let long: Vec<String> = (0..100)
+        .map(|n| format!("{n:0>width$}", width = MAX_SELECTOR_ENTRY_BYTES))
+        .collect();
+    let batches = dismiss_batches(&long);
+    assert!(
+        batches.len() > 1,
+        "{:?}",
+        batches.iter().map(Vec::len).collect::<Vec<_>>()
+    );
+    for batch in &batches {
+        assert!(batch.len() <= MAX_SELECTOR_ENTRIES);
+        assert!(batch.iter().map(String::len).sum::<usize>() <= MAX_SELECTOR_BYTES);
+    }
+    assert_eq!(batches.concat(), long);
+}

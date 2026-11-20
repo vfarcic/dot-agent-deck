@@ -466,9 +466,11 @@ pub async fn run_dismiss(
     send_dismiss(client, ids, all, claim).await
 }
 
-/// Send the dismissal, `ids` in batches of at most
-/// [`crate::interrupted_work_daemon::MAX_DISMISS_IDS`] (the daemon refuses a
-/// larger selector), and render the outcomes together.
+/// Send the dismissal, `ids` in the batches the daemon admits
+/// ([`words::dismiss_batches`]: its count and byte limits), one after
+/// another, and render the outcomes together. A later batch that does not
+/// dismiss stops the rest, and the answer says so
+/// ([`DismissOutcome::stopped`]).
 async fn send_dismiss(
     client: &DaemonClient,
     ids: Vec<String>,
@@ -478,39 +480,41 @@ async fn send_dismiss(
     let batches: Vec<Vec<String>> = if all {
         vec![Vec::new()]
     } else {
-        ids.chunks(crate::interrupted_work_daemon::MAX_DISMISS_IDS)
-            .map(<[String]>::to_vec)
-            .collect()
+        words::dismiss_batches(&ids)
     };
-    let mut merged = DismissOutcome::default();
-    for batch in batches {
-        match client
-            .dismiss_interrupted(batch, all, claim.clone(), None)
-            .await
-        {
-            Ok(GatedQuery::Answered(outcome)) => {
-                if outcome.refusal.is_some() {
-                    return render_dismiss(&outcome);
+    let mut merged: Option<DismissOutcome> = None;
+    for (n, batch) in batches.iter().enumerate() {
+        let answer = client
+            .dismiss_interrupted(batch.clone(), all, claim.clone(), None)
+            .await;
+        let stop = match (answer, merged.as_mut()) {
+            (Ok(GatedQuery::Answered(outcome)), done) if outcome.refusal.is_none() => {
+                match done {
+                    Some(done) => done.absorb(outcome),
+                    None => merged = Some(outcome),
                 }
-                merged.incomplete |= outcome.incomplete;
-                merged.dismissed_omitted += outcome.dismissed_omitted;
-                merged.refused_omitted += outcome.refused_omitted;
-                for item in outcome.dismissed {
-                    merged.push_dismissed(item);
-                }
-                for refused in outcome.refused {
-                    if merged.refused.len() < words::MAX_DISMISS_REPORTED {
-                        merged.refused.push(refused);
-                    } else {
-                        merged.refused_omitted += 1;
-                    }
-                }
+                continue;
             }
-            Ok(GatedQuery::Unsupported) => return unsupported(),
-            Err(e) => return client_error(e),
-        }
+            // The first batch: as a single dismissal reads.
+            (Ok(GatedQuery::Answered(outcome)), None) => return render_dismiss(&outcome),
+            (Ok(GatedQuery::Unsupported), None) => return unsupported(),
+            (Err(e), None) => return client_error(e),
+            (Ok(GatedQuery::Answered(outcome)), Some(_)) => (
+                words::DismissStopReason::Refused,
+                outcome.refusal.map(|r| r.reason),
+            ),
+            (Ok(GatedQuery::Unsupported), Some(_)) => (words::DismissStopReason::Replaced, None),
+            (Err(_), Some(_)) => (words::DismissStopReason::Failed, None),
+        };
+        let done = merged.as_mut().expect("a later batch");
+        done.stopped = Some(words::DismissStopped {
+            reason: stop.0,
+            refusal: stop.1,
+            not_sent: batches[n..].iter().map(Vec::len).sum(),
+        });
+        break;
     }
-    render_dismiss(&merged)
+    render_dismiss(&merged.unwrap_or_default())
 }
 
 /// [`run_dismiss`]'s text and exit code: 0 when nothing was refused.
@@ -560,10 +564,16 @@ pub fn render_dismiss(outcome: &DismissOutcome) -> CliOutput {
             words::more_refused_sentence(outcome.refused_omitted)
         ));
     }
+    if let Some(stopped) = &outcome.stopped {
+        stderr.push_str(&format!("{}\n", words::dismiss_stopped_sentence(stopped)));
+    }
     CliOutput {
         stdout,
         stderr,
-        code: if outcome.refused.is_empty() && outcome.refused_omitted == 0 {
+        code: if outcome.refused.is_empty()
+            && outcome.refused_omitted == 0
+            && outcome.stopped.is_none()
+        {
             EXIT_OK
         } else {
             EXIT_REFUSED

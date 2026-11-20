@@ -569,6 +569,77 @@ async fn still_the_same_directory(checked: &Checked) -> bool {
         .unwrap_or(false)
 }
 
+/// The program a reclaim's keep check runs its `git status` and
+/// `git worktree list` as, and the bound on that check: `git` and
+/// [`RECLAIM_CHECK_TIMEOUT`], unless a test armed its seam for `worktree`.
+fn keep_check_runner(worktree: &Path) -> (Option<PathBuf>, Duration) {
+    #[cfg(test)]
+    if let Some((program, bound)) = seams::keep_check(worktree) {
+        return (Some(program), bound);
+    }
+    let _ = worktree;
+    (None, RECLAIM_CHECK_TIMEOUT)
+}
+
+/// One keep-check child through the bounded probe runner
+/// ([`probe::run`]): its output capped, admission held until it has been
+/// reaped, and killed with its process group at `deadline`.
+async fn keep_check_child(
+    program: Option<&Path>,
+    dir: &Path,
+    args: &[&str],
+    deadline: Deadline,
+) -> Result<Vec<u8>, String> {
+    let program = match program {
+        Some(path) => probe::Program::Other(path.as_os_str()),
+        None => probe::Program::Git,
+    };
+    probe::run(program, dir, args, deadline).await
+}
+
+/// Final review, auditor 1 and 3: the worktrees inside `worktree`, bounded
+/// by `deadline` — `clone`'s repository's listing, taken through the
+/// bounded runner (output past its cap is a check not made), and a look at
+/// the directory for any other repository's.
+async fn bounded_nested(
+    worktree: &Path,
+    clone: &Path,
+    program: Option<&Path>,
+    deadline: Deadline,
+) -> Result<Vec<String>, String> {
+    let args = ["worktree", "list", "--porcelain", "-z"];
+    let (listing, found) = tokio::join!(
+        keep_check_child(program, clone, &args, deadline),
+        crate::issue_dispatch_run::git_trees_inside(worktree, deadline.as_std())
+    );
+    let listed = match listing {
+        Ok(out) => crate::issue_dispatch_run::nested_in_listing(worktree, &out).await,
+        Err(e) => Err(e),
+    };
+    crate::issue_dispatch_run::merge_nested(listed, found)
+}
+
+/// Final review, auditor 3: a reclaim's keep check, the question
+/// [`crate::issue_dispatch_run::worktree_keep_check`] asks, with each child
+/// through the bounded runner under one deadline. A status that prints past
+/// the cap is uncommitted changes; a listing that does, or any child that
+/// does not answer in time, is a check that could not be made. Either keeps
+/// the tree.
+async fn bounded_keep_check(worktree: &Path, clone: &Path) -> Result<TreeKeepCheck, String> {
+    let (program, bound) = keep_check_runner(worktree);
+    let program = program.as_deref();
+    let deadline = Deadline::after(bound);
+    let status = async {
+        match keep_check_child(program, worktree, &["status", "--porcelain"], deadline).await {
+            Ok(out) => Ok(!String::from_utf8_lossy(&out).trim().is_empty()),
+            Err(e) if crate::issue_dispatch_run::is_subprocess_overflow(&e) => Ok(true),
+            Err(e) => Err(e),
+        }
+    };
+    let (dirty, nested) = tokio::join!(status, bounded_nested(worktree, clone, program, deadline));
+    crate::issue_dispatch_run::keep_check_answer(dirty, nested)
+}
+
 /// The re-validation just before `git worktree remove`, run under the
 /// repository's worktree lock: whether the directory at the reclaimed path
 /// is still the worktree the reclaim checked. In order: the same canonical
@@ -609,7 +680,15 @@ async fn still_the_checked_worktree(checked: Checked) -> RemovalGuard {
     {
         return RemovalGuard::Changed;
     }
-    match crate::issue_dispatch_run::nested_worktrees(&checked.worktree, &checked.clone).await {
+    let (program, _) = keep_check_runner(&checked.worktree);
+    match bounded_nested(
+        &checked.worktree,
+        &checked.clone,
+        program.as_deref(),
+        deadline,
+    )
+    .await
+    {
         Ok(nested) if !nested.is_empty() => {
             return RemovalGuard::Keep(WorktreeRemoval::KeptHoldsWorktrees(nested));
         }
@@ -742,8 +821,7 @@ async fn reclaim_with(
                 InUse::Unknown => return Removal::InUseUnknown,
             }
             if dry_run {
-                return match crate::issue_dispatch_run::worktree_keep_check(&worktree, &clone).await
-                {
+                return match bounded_keep_check(&worktree, &clone).await {
                     Ok(TreeKeepCheck::Clean) => Removal::done(ReclaimVerdict::WouldRemove),
                     Ok(TreeKeepCheck::Dirty) => Removal::done(ReclaimVerdict::KeptDirty),
                     Ok(TreeKeepCheck::HoldsWorktrees(nested)) => Removal::Done {
@@ -770,10 +848,11 @@ async fn reclaim_with(
                         return Removal::done(ReclaimVerdict::KeptCouldNotLock);
                     }
                 };
-            let removal = crate::issue_dispatch_run::remove_worktree_outcome_guarded(
+            let removal = crate::issue_dispatch_run::remove_worktree_outcome_checked(
                 &worktree,
                 &clone,
                 RemovalPolicy::KeepIfDirty,
+                || bounded_keep_check(&worktree, &clone),
                 || still_the_checked_worktree(checked),
             )
             .await;
@@ -1099,7 +1178,6 @@ mod seams {
     }
 
     /// The program and deadline armed for `worktree`'s keep check.
-    #[allow(dead_code)]
     pub(super) fn keep_check(worktree: &Path) -> Option<(PathBuf, std::time::Duration)> {
         KEEP_CHECK
             .lock()

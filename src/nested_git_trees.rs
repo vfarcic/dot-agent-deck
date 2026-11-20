@@ -35,9 +35,54 @@ pub fn git_trees_inside(
     max_found: usize,
     deadline: Instant,
 ) -> Result<Vec<PathBuf>, String> {
-    // RED stub: finds nothing.
-    let _ = (dir, max_entries, max_found, deadline);
-    Ok(Vec::new())
+    let mut found = Vec::new();
+    let mut read = 0usize;
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(current) = pending.pop() {
+        if Instant::now() >= deadline {
+            return Err(format!("the look inside {} ran out of time", dir.display()));
+        }
+        let entries = match std::fs::read_dir(&current) {
+            Ok(entries) => entries,
+            // Gone since it was seen, or the tree itself is gone: nothing
+            // left in it to lose.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("could not read {}: {e}", current.display())),
+        };
+        let mut subdirs = Vec::new();
+        let mut holds_git = false;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("could not read {}: {e}", current.display()))?;
+            read += 1;
+            if read > max_entries {
+                return Err(format!(
+                    "{} holds more than {max_entries} entries to look through",
+                    dir.display()
+                ));
+            }
+            if entry.file_name() == ".git" {
+                holds_git = true;
+                continue;
+            }
+            // `DirEntry::file_type` does not follow a symbolic link.
+            let kind = entry
+                .file_type()
+                .map_err(|e| format!("could not read {}: {e}", entry.path().display()))?;
+            if kind.is_dir() {
+                subdirs.push(entry.path());
+            }
+        }
+        if holds_git && current != dir {
+            // Everything below it is the nested tree's; one name covers it.
+            found.push(current);
+            if found.len() >= max_found {
+                break;
+            }
+            continue;
+        }
+        pending.extend(subdirs);
+    }
+    Ok(found)
 }
 
 /// [`git_trees_inside`] on the blocking pool, giving up at `deadline`.
