@@ -577,7 +577,7 @@ button.deck-attention-name { text-decoration: underline; text-underline-offset: 
 .dashboard-counters-button { gap: 6px; }
 .dashboard-counters-alert { padding: 1px 6px; border-radius: 999px; font-weight: 650; white-space: nowrap; }
 .dashboard-counters-alert.count-needs-input { color: var(--amber-ink); background: var(--amber-soft); }
-.dashboard-counters-alert.count-failed { color: var(--red-ink); background: var(--red-soft); }
+.dashboard-counters-alert.count-failed, .dashboard-counters-alert.count-error { color: var(--red-ink); background: var(--red-soft); }
 /* Hidden until shown: opened, or hovered with a mouse (`DashboardCounters`
    decides which). The wrapper's ::after bridges the gap between the button
    and the list (on the wrapper, not the list, whose scrolling would clip it),
@@ -658,9 +658,10 @@ button.deck-attention-name { text-decoration: underline; text-underline-offset: 
    an ellipsis and the deck-message rows below it wrap inside the tile. */
 .agent-identity > div { min-width: 0; }
 .agent-state-mark { width: 8px; height: 8px; margin-top: 5px; flex: 0 0 8px; border: 2px solid var(--paper-strong); border-radius: 50%; background: var(--faint); box-shadow: 0 0 0 1px currentColor; }
-.agent-state-mark.status-running { color: var(--teal); background: var(--teal); }
+/* Issue #2411: the daemon's three working states, each shown by its own word, share Running's colour. */
+.agent-state-mark.status-running, .agent-state-mark.status-working, .agent-state-mark.status-thinking, .agent-state-mark.status-compacting { color: var(--teal); background: var(--teal); }
 .agent-state-mark.status-passed { color: var(--green); background: var(--green); }
-.agent-state-mark.status-failed { color: var(--red); background: var(--red); }
+.agent-state-mark.status-failed, .agent-state-mark.status-error { color: var(--red); background: var(--red); }
 /* Issue #714: blocked shares failed's colour (a person has to act) but not its
    shape, so it reads as a distinct state beside a crashed agent. */
 .agent-state-mark.status-blocked { color: var(--red); background: transparent; box-shadow: inset 0 0 0 2px var(--red); }
@@ -683,9 +684,9 @@ button.deck-attention-name { text-decoration: underline; text-underline-offset: 
 .agent-title-line > .agent-identity-facts { flex: 0 1 auto; min-width: 0; overflow: hidden; color: var(--muted); font-family: "JetBrains Mono", monospace; font-size: var(--text-sm); text-overflow: ellipsis; white-space: nowrap; }
 .agent-identity p { margin: 3px 0 0; overflow: hidden; color: var(--muted); font-family: "JetBrains Mono", monospace; font-size: var(--text-sm); text-overflow: ellipsis; white-space: nowrap; }
 .status-label { padding: 2px 4px; border-radius: 2px; color: var(--faint); background: var(--paper-sunken-strong); font-size: var(--text-xs); font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
-.status-label.status-running { color: var(--teal); background: var(--teal-soft); }
+.status-label.status-running, .status-label.status-working, .status-label.status-thinking, .status-label.status-compacting { color: var(--teal); background: var(--teal-soft); }
 .status-label.status-passed { color: var(--green); background: var(--green-soft); }
-.status-label.status-failed { color: var(--red); background: var(--red-soft); }
+.status-label.status-failed, .status-label.status-error { color: var(--red); background: var(--red-soft); }
 .status-label.status-blocked { color: var(--red); background: var(--red-soft); outline: 1px dashed var(--red); outline-offset: -1px; }
 .status-label.status-waiting { color: var(--teal); background: transparent; outline: 1px dashed var(--teal); outline-offset: -1px; }
 /* Wraps rather than eliding (issue #2312): at the type scale's sizes a provider
@@ -1718,9 +1719,9 @@ button.deck-attention-name { text-decoration: underline; text-underline-offset: 
 .overview-note.sheet-select-deck { min-height: 200px; margin: 16px 20px; }
 .overview-note > div { margin-top: 15px; display: flex; gap: 7px; }
 
-.count-running { color: var(--teal); }
+.count-working, .count-thinking, .count-compacting { color: var(--teal); }
 .count-needs-input { color: var(--amber); }
-.count-failed { color: var(--red); }
+.count-failed, .count-error { color: var(--red); }
 /* Issue #1757: Waiting's mark is hollow teal; its count reads in the same teal. */
 .count-waiting { color: var(--teal); }
 /* An unreadable fleet is not an empty one: the em dash says so and stays muted. */

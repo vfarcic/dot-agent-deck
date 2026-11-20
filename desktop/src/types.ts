@@ -32,15 +32,10 @@ export type RunHealth = "healthy" | "attention" | "failed" | "idle";
 export type AgentStatus = "queued" | "running" | "needs_input" | "waiting" | "idle" | "passed" | "failed" | "stopped" | "blocked";
 
 /**
- * The words a status is shown as. Each is its own id except Needs input, whose
- * id cannot carry a space; the TUI's cards say Needs Input and Idle for the
- * same two states.
+ * The daemon's own status words (`DesktopAgentDto["status"]`), which `AgentStatus`
+ * merges. A status is SHOWN in these words (`statusWord` in `lib/statusWords.ts`,
+ * issue #2411), never in the merged column's.
  */
-export function statusLabel(status: AgentStatus): string {
-  return status === "needs_input" ? "needs input" : status;
-}
-
-/** The daemon's own status words (`DesktopAgentDto["status"]`), which `AgentStatus` merges. */
 export type DaemonAgentStatus = "running" | "thinking" | "working" | "compacting" | "waiting_for_input" | "waiting" | "idle" | "error" | "blocked" | "unknown";
 
 /**
