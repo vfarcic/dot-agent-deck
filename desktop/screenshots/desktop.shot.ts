@@ -98,6 +98,22 @@ desktopScenario("restart-notice", async (page) => {
   await expect(page.locator(".overview-row")).toHaveCount(0);
 });
 
+// PRD #1790 stage 2 — the "Interrupted work" dialog over the docs dashboard,
+// opened from the deck's banner: the preview daemon's three items
+// (`desktop/src/data/fixtureInterrupted.ts`), the unit `fix-login` selected.
+desktopScenario("interrupted-work", async (page) => {
+  await page.goto("/?fixture=1&state=docs&interrupted=1");
+  await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
+  await page.getByTestId("open-overview").click();
+  await expect(page.getByTestId("interrupted-banner")).toContainText("3 interrupted items from before the restart");
+  await page.getByTestId("interrupted-banner-show").click();
+  const dialog = page.getByTestId("interrupted-dialog");
+  await expect(dialog.getByTestId("interrupted-row")).toHaveCount(3);
+  await dialog.getByTestId("interrupted-row").filter({ hasText: "fix-login" }).click();
+  await expect(dialog.getByTestId("interrupted-reclaim")).toBeVisible();
+  await expect(dialog.getByTestId("interrupted-other-agents")).toHaveText("Other agents");
+});
+
 /** Select the fixture project's directory in the shared New agent form. */
 async function projectInNewAgent(page: Page, query = ""): Promise<void> {
   await page.goto(`/?fixture=1&state=docs${query}`);

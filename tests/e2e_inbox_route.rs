@@ -357,7 +357,7 @@ fn route_002_worker_notices_are_bound_deck_messages() {
     }
 }
 
-/// Scenario: Exit a bound worker before fetching its delegated message. The task remains inspectable as Undeliverable and the orchestrator receives a daemon notice naming that exact task id, rather than losing the task or delivering it to another generation. Then, in a second team, replace the orchestrator before its worker runs the real `work-done --task-id`: the CLI says the report was saved to a file, naming the report id that the deck's recovery rows list for that task's worker report, that `dot-agent-deck interrupted list` can list it and the clients cannot show saved reports yet, and the successor orchestrator gets nothing.
+/// Scenario: Exit a bound worker before fetching its delegated message. The task remains inspectable as Undeliverable and the orchestrator receives a daemon notice naming that exact task id, rather than losing the task or delivering it to another generation. Then, in a second team, replace the orchestrator before its worker runs the real `work-done --task-id`: the CLI says the report was saved to a file, naming the report id that the deck's recovery rows list for that task's worker report, that `dot-agent-deck interrupted list` can list it and that the clients' Interrupted work shows it too, and the successor orchestrator gets nothing.
 #[spec("inbox/route/003")]
 #[test]
 fn route_003_exited_bound_agent_is_undeliverable_and_notifies_sender() {
@@ -447,7 +447,7 @@ fn route_003_exited_bound_agent_is_undeliverable_and_notifies_sender() {
             "Reported task {id}. Its orchestrator is no longer running, so the deck saved the \
              report to a file, report {report}. `dot-agent-deck interrupted list` can list a \
              saved report with the work that sent it, and `dot-agent-deck interrupted show <id>` \
-             shows it; the TUI and the desktop app cannot show saved reports yet. \
+             shows it; so does Interrupted work in the TUI and the desktop app. \
              `dot-agent-deck docs troubleshooting`, section \"Saved results and reports\", says \
              where the file is.\n"
         )

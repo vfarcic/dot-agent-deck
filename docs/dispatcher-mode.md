@@ -143,7 +143,7 @@ A unit whose report turns out to be wrong or stale, for example because a test r
 
 ### When a report does not arrive
 
-The report waits in the dispatcher's inbox while its agent is running. If that agent exits or its pane is closed, the message is not transferred to whatever starts in that pane next. Restarting the daemon clears its inboxes. Check the unit's own report file and worktree when the summary does not arrive.
+The report waits in the dispatcher's inbox while its agent is running. If that agent exits or its pane is closed, the message is not transferred to whatever starts in that pane next. Restarting the daemon clears its inboxes. When the summary does not arrive because the dispatcher is gone or the deck restarted, look for the unit in [Interrupted Work](interrupted-work.md): the deck lists a report nobody received there with the unit that sent it, and a unit a restart stopped with its branch and worktree.
 
 The deck keeps a copy of every unit's report, and of every dispatch's start and failure message, in its saved-results directory, `retained-reports/` under the deck's state directory, so one that could not reach the dispatcher is not lost with it. It is kept for 24 hours after the dispatcher acknowledged it, and for 7 days after it could not be delivered. A restarted deck keeps the files the previous one left until those times are up, and one that was still waiting for its dispatcher for 7 days from the restart. [Saved results and reports](troubleshooting.md#saved-results-and-reports) says where the directory is. If the deck cannot write a result to disk, the message the dispatcher receives says it is held in memory until the deck restarts, and the deck keeps trying to save it.
 
@@ -163,7 +163,9 @@ Closing a clean worktree also removes the files git ignores in it, such as the u
 
 The branch `agent/dispatch-<name>` is not deleted when a unit is closed, because it may hold committed work. Dispatching the same name again is therefore refused while that branch exists. Delete it when you are done (`git branch -D agent/dispatch-<name>`), or use a different name.
 
-To find and clean up leftover worktrees:
+After a daemon restart, the units it interrupted are listed in [Interrupted Work](interrupted-work.md) (`I` in the TUI, the banner in the desktop app, or `dot-agent-deck interrupted list`), where **Reclaim** removes a unit's worktree and keeps its branch, and **Dismiss** takes it off the list.
+
+To find and clean up any leftover worktree:
 
 ```bash
 dot-agent-deck worktree list        # every linked worktree, its PR state, cleanliness, and a remove/ask/keep verdict

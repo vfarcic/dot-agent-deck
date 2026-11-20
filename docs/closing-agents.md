@@ -95,7 +95,7 @@ Without a terminal you cannot be shown a confirmation dialog, so `close` refuses
 | `not-your-unit` | An agent asked to close something it did not dispatch. | Close it yourself from a shell, or ask the dispatcher that started it. |
 | `own-pane` | An agent asked to close itself or its own team. | Close it from a shell or a client. |
 | `not-attested` / `superseded` | The request came from a pane the deck cannot confirm, or from an agent that has since been replaced in its pane. | Run `close` from the agent now in that pane, or from a shell. |
-| `unknown-unit` | No running unit has that name. Units are not remembered after the daemon restarts. | Check the name with `close --all`. After a restart, see [Worktrees](#worktrees). |
+| `unknown-unit` | No running unit has that name. Units are not remembered after the daemon restarts. | Check the name with `close --all`. After a restart, `dot-agent-deck interrupted list` shows the units the restart interrupted, and reclaims or dismisses them ([Interrupted Work](interrupted-work.md)). |
 | `already-ended` | The unit has already been closed or has ended. | Nothing to close. |
 | `ambiguous` | Units with that name are running in more than one repository. The refusal lists each one with its unit id, worktree and panes. | Close the one you mean with `--unit-id` and its id from that list. |
 | `unknown-pane` | No agent is in that pane. | Check the id with `daemon status`. |
@@ -145,7 +145,7 @@ If the daemon you are running was started by an older version of the deck, it ca
 
 ### Leftover worktrees
 
-To clean up worktrees the deck no longer knows about, such as after a daemon restart, use `dot-agent-deck worktree list` and `dot-agent-deck worktree reclaim` ([Dispatcher Mode → Finish up](dispatcher-mode.md#finish-up)). A kept branch blocks dispatching the same name again until you delete it (`git branch -D agent/dispatch-<name>`).
+After a daemon restart, the units it interrupted are listed in [Interrupted Work](interrupted-work.md), in the TUI (`I`), the desktop app and `dot-agent-deck interrupted list`, where **Reclaim** removes a unit's worktree and keeps its branch. To clean up other worktrees the deck no longer knows about, use `dot-agent-deck worktree list` and `dot-agent-deck worktree reclaim` ([Dispatcher Mode → Finish up](dispatcher-mode.md#finish-up)). A kept branch blocks dispatching the same name again until you delete it (`git branch -D agent/dispatch-<name>`).
 
 ## Exit status and JSON
 
