@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# The `cargo` the RWX sandbox finds first on PATH (issue #2072): it hands the
+# real cargo a `DAD_BUILD_ID` composed from the sandbox checkout's git
+# CONTENT, then gets out of the way.
+#
+# Why: every `rwx sandbox exec` syncs the local tree in with a `git reset`, a
+# `rwx-sync` commit and a `git reset HEAD~1`, which rewrites `.git/HEAD`, the
+# branch's ref file, `logs/HEAD` and the index even when nothing changed.
+# `build.rs` watches those files with `cargo:rerun-if-changed`, which compares
+# mtimes, so every exec rebuilt the root crate and everything that depends on
+# it (201 s for a no-change `cargo build --workspace --all-targets --features
+# e2e,e2e-live`, measured 2026-11-19). With both `DAD_VERSION` (the sandbox
+# task's env) and `DAD_BUILD_ID` injected, `build.rs` runs no git command and
+# watches no git file (`build_needs_git` in `build_version_resolve.rs`), and
+# `cargo:rerun-if-env-changed=DAD_BUILD_ID` invalidates the build when
+# the value moves: on a commit and on a dirty/clean flip.
+#
+# The value is the one `build.rs` would have composed itself,
+# `<DAD_VERSION>-g<git rev-parse --short HEAD>[-dirty]`, from the same two git
+# commands, so a binary built here reports the same build id, and recordings
+# keep the commit sha `recording_build_commit` reads from it. The sync resets
+# the sandbox to the local HEAD commit and applies the local changes on top,
+# so that sha and that dirty flag are the local checkout's.
+#
+# It composes nothing, leaving `build.rs` to do what it always did, when
+# `DAD_BUILD_ID` is already set (an explicit injection, or this shim further
+# up the process tree), when `DAD_VERSION` is not a plain X.Y.Z, or when the
+# checkout cargo builds is not the sandbox's ($RWX_WORKSPACE_DIR), whose build
+# id this is. Plain X.Y.Z is narrower than what `build.rs` accepts (it takes a
+# SemVer prerelease or build suffix too): the shim stays out rather than
+# re-implement SemVer, which costs such a version the speed-up and nothing
+# else. The sandbox's DAD_VERSION is always a plain X.Y.Z. The checkout is the
+# one `--manifest-path` names when it is given, and cargo's working directory
+# otherwise.
+# `tests/sandbox_cargo_shim.rs` holds the value to `resolve_build_id`.
+set -u
+
+shim_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+
+real_cargo=
+IFS=: read -r -a path_dirs <<<"${PATH:-}"
+for dir in "${path_dirs[@]}"; do
+  [ -n "$dir" ] && [ -d "$dir" ] || continue
+  [ "$(cd "$dir" && pwd -P)" = "$shim_dir" ] && continue
+  if [ -x "$dir/cargo" ] && [ ! -d "$dir/cargo" ]; then
+    real_cargo="$dir/cargo"
+    break
+  fi
+done
+if [ -z "$real_cargo" ]; then
+  echo "rwx-sandbox-bin/cargo: no other cargo on PATH ($PATH)" >&2
+  exit 127
+fi
+
+# The directory whose checkout cargo builds: that of `--manifest-path` when it
+# is given (before a `--`, after which arguments are the program's), the
+# working directory otherwise.
+checkout_dir=.
+expect_manifest=
+for arg in "$@"; do
+  if [ -n "$expect_manifest" ]; then
+    checkout_dir=$(dirname -- "$arg")
+    expect_manifest=
+    continue
+  fi
+  case "$arg" in
+    --) break ;;
+    --manifest-path) expect_manifest=1 ;;
+    --manifest-path=*) checkout_dir=$(dirname -- "${arg#--manifest-path=}") ;;
+  esac
+done
+
+compose_build_id() {
+  cd "$checkout_dir" 2>/dev/null || return 1
+  local injected="${DAD_BUILD_ID:-}"
+  [ -z "${injected//[[:space:]]/}" ] || return 1
+  local version="${DAD_VERSION:-}"
+  version="${version#[vV]}"
+  [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || return 1
+  [ -n "${RWX_WORKSPACE_DIR:-}" ] || return 1
+  local top workspace
+  top=$(git rev-parse --show-toplevel 2>/dev/null) || return 1
+  top=$(cd "$top" && pwd -P) || return 1
+  workspace=$(cd "$RWX_WORKSPACE_DIR" 2>/dev/null && pwd -P) || return 1
+  [ "$top" = "$workspace" ] || return 1
+  local sha status
+  sha=$(git rev-parse --short HEAD 2>/dev/null) || return 1
+  [[ "$sha" =~ ^[0-9a-f]+$ ]] || return 1
+  status=$(git --no-optional-locks status --porcelain 2>/dev/null) || return 1
+  if [ -n "$status" ]; then
+    printf '%s-g%s-dirty' "$version" "$sha"
+  else
+    printf '%s-g%s' "$version" "$sha"
+  fi
+}
+
+if build_id=$(compose_build_id); then
+  export DAD_BUILD_ID="$build_id"
+fi
+exec "$real_cargo" "$@"

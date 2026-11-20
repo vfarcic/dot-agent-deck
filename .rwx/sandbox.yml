@@ -110,8 +110,19 @@ tasks:
         | sudo tar zxf - -C /usr/local/bin task
       task --version
 
+  # Issue #2072: puts scripts/rwx-sandbox-bin, whose `cargo` hands the real one
+  # a DAD_BUILD_ID composed from the checkout's git content, ahead of the real
+  # cargo on PATH. Every exec's sync rewrites `.git/HEAD`, the branch ref, the
+  # reflog and the index, so without it `build.rs`'s mtime watches on those
+  # files rebuilt the root crate on every command (201 s for a no-change build
+  # of the gates' target set, 1.2 s with it). The directory is the synced
+  # checkout's, so an edit to the script takes effect on the next exec. RWX
+  # joins PATH across `use` dependencies.
+  - key: cargo-build-id
+    run: printf '%s\n' "$RWX_WORKSPACE_DIR/scripts/rwx-sandbox-bin" > "$RWX_ENV/PATH"
+
   - key: sandbox
-    use: [system-packages, code, rust, nextest, cargo-mutants, go-task, node, opencode]
+    use: [system-packages, code, rust, nextest, cargo-mutants, go-task, node, opencode, cargo-build-id]
     runner:
       cpus: 16
       memory: 64gb
