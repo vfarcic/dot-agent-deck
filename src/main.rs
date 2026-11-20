@@ -125,7 +125,7 @@ enum Commands {
     /// Without --dir, the worktree is a sibling of this checkout,
     /// `../<repo>-dispatch-<name>`, on branch `agent/dispatch-<name>`, cut from
     /// this checkout's HEAD; closing the unit removes it when it has no
-    /// uncommitted changes. With --dir, nothing is created and closing the
+    /// uncommitted changes. With --dir, no worktree or branch is created and closing the
     /// unit leaves the directory in place: the unit starts in that directory
     /// (`--dir .` continues the work right where you are), and it is refused
     /// when other live agents already work there.
@@ -199,7 +199,7 @@ enum Commands {
         #[arg(long, value_name = "NAME", conflicts_with = "orchestration")]
         agent: Option<String>,
         /// Start the unit in this existing directory instead of a new worktree
-        /// (`--dir .` for the directory you are in). Nothing is created, and
+        /// (`--dir .` for the directory you are in). No worktree or branch is created, and
         /// closing the unit leaves the directory in place (unless it is an
         /// earlier unit's worktree, which keeps that unit's cleanup). The
         /// orchestrations on offer are that directory's. Refused when other

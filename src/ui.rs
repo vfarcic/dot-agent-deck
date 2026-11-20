@@ -41843,7 +41843,7 @@ mod tests {
             "--list-targets --dir <path>",
             "never on a RAM-backed tmpfs",
             "closing the unit leaves it in place",
-            "a name no other brief has",
+            "handoff-<something no other brief has>.md",
             "is the user's decision",
         ] {
             assert!(

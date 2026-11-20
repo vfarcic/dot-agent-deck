@@ -715,6 +715,71 @@ pub fn resolve_existing_dir(path: &Path) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+/// PRD #468: a checked `--dir` target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExistingDir {
+    /// The target with every symlink resolved: what the interlock and the
+    /// config read compare against and read from.
+    canonical: PathBuf,
+    /// Where the unit is rooted: the spelling of a worktree the deck records
+    /// for removal that names the same directory, else [`Self::canonical`].
+    /// The removal guards compare a recorded worktree with the agents rooted in
+    /// it by spelling, so a unit rooted at another spelling of the same
+    /// directory would not hold it against that worktree's cleanup, and the
+    /// last close of the earlier unit could remove the directory under it
+    /// (Qodo on PR #2424; a symlinked parent such as macOS `/var`).
+    spawn_at: PathBuf,
+}
+
+/// PRD #468: check the `--dir` value the daemon received and choose where the
+/// unit is rooted ([`ExistingDir`]). Blocking: it canonicalizes paths.
+fn place_in_existing_dir(dir: &str, recorded: &[PathBuf]) -> Result<ExistingDir, String> {
+    if !Path::new(dir).is_absolute() {
+        return Err(format!("--dir {dir}: the daemon needs an absolute path"));
+    }
+    let canonical = resolve_existing_dir(Path::new(dir))?;
+    let spawn_at = recorded
+        .iter()
+        .find(|worktree| std::fs::canonicalize(worktree).is_ok_and(|c| c == canonical))
+        .cloned()
+        .unwrap_or_else(|| canonical.clone());
+    Ok(ExistingDir {
+        canonical,
+        spawn_at,
+    })
+}
+
+/// PRD #468: the `--dir` targets a dispatch is checking or starting a unit in
+/// right now, so a second `--dir` dispatch into one of them is refused rather
+/// than passing the interlock before the first one's agents exist.
+static DIRS_BEING_STARTED: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// One entry in [`DIRS_BEING_STARTED`], released when dropped, on every exit
+/// from the dispatch, a cancelled one included.
+struct DirReservation(PathBuf);
+
+impl DirReservation {
+    /// Reserve `dir`, or `None` when another dispatch holds it.
+    fn take(dir: &Path) -> Option<Self> {
+        DIRS_BEING_STARTED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(dir.to_path_buf())
+            .then(|| Self(dir.to_path_buf()))
+    }
+}
+
+impl Drop for DirReservation {
+    fn drop(&mut self) {
+        DIRS_BEING_STARTED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.0);
+    }
+}
+
 /// The most coordination files the interlock's refusal names; the rest are
 /// counted.
 const MAX_NAMED_COORDINATION_FILES: usize = 5;
@@ -1128,16 +1193,25 @@ pub async fn handle_dispatch_at(
     // before anything else so a bad path costs nothing. The CLI sends it
     // absolute; a relative one would resolve against the DAEMON's directory,
     // so it is refused rather than guessed at.
-    let existing_dir = match dir {
+    // The filesystem checks run off the runtime (Qodo on PR #2424): a slow
+    // or network-mounted path must not hold a runtime worker.
+    let existing = match dir {
         None => None,
         Some(dir) => {
-            let checked = if Path::new(dir).is_absolute() {
-                resolve_existing_dir(Path::new(dir))
-            } else {
-                Err(format!("--dir {dir}: the daemon needs an absolute path"))
-            };
-            match checked {
-                Ok(dir) => Some(dir),
+            let raw = dir.to_string();
+            let recorded: Vec<PathBuf> = ctx
+                .worktrees
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .keys()
+                .cloned()
+                .collect();
+            let placed =
+                tokio::task::spawn_blocking(move || place_in_existing_dir(&raw, &recorded))
+                    .await
+                    .unwrap_or_else(|e| Err(format!("--dir {dir}: the check could not run ({e})")));
+            match placed {
+                Ok(placed) => Some(placed),
                 Err(e) => {
                     return DispatchResult {
                         worktree_dir: PathBuf::from(dir),
@@ -1149,13 +1223,15 @@ pub async fn handle_dispatch_at(
             }
         }
     };
+    let existing_dir = existing.as_ref().map(|placed| placed.canonical.clone());
     // Where the unit runs, and whose config it is resolved from: the new
     // worktree and the caller's checkout by default, the target directory
     // itself with `--dir`. Decided for `--dir` on 2026-11-20 (PRD #468 M2):
     // the target is a live directory whose config the unit will actually run
     // with, uncommitted edits included, so it is the one that applies.
-    let unit_dir = existing_dir
-        .clone()
+    let unit_dir = existing
+        .as_ref()
+        .map(|placed| placed.spawn_at.clone())
         .unwrap_or_else(|| paths.worktree_dir.clone());
     let config_dir = existing_dir.clone().unwrap_or_else(|| clone_dir.clone());
     let refuse = |message: String| DispatchResult {
@@ -1179,17 +1255,42 @@ pub async fn handle_dispatch_at(
     let shape = shape.as_ref();
 
     // PRD #468 M3: the interlock. A `--dir` target where other live agents
-    // already work is refused before anything is read or started there.
-    if let Some(dir) = &existing_dir
-        && let Some(refusal) = occupied_dir_refusal(
-            &ctx.registry.agent_records_for_worktree_cleanup(),
-            dir,
-            ctx.caller.as_ref().map(|c| c.agent_id.as_str()),
-            |p| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()),
-        )
-    {
-        return refuse(refusal);
-    }
+    // already work is refused before anything is read or started there. The
+    // directory is reserved first and held until this function returns, by
+    // which time the unit's agents are in the registry the next check reads,
+    // so two `--dir` dispatches into one directory cannot both pass (Qodo on
+    // PR #2424).
+    let _reservation = match &existing_dir {
+        None => None,
+        Some(dir) => {
+            let Some(reservation) = DirReservation::take(dir) else {
+                return refuse(format!(
+                    "another dispatch is starting a unit in {} right now, so this one was \
+                     refused and nothing was started for it. Wait for that dispatch's reply.",
+                    dir.display()
+                ));
+            };
+            let records = ctx.registry.agent_records_for_worktree_cleanup();
+            let caller = ctx.caller.as_ref().map(|c| c.agent_id.clone());
+            let target = dir.clone();
+            let refusal = tokio::task::spawn_blocking(move || {
+                occupied_dir_refusal(&records, &target, caller.as_deref(), |p| {
+                    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+                })
+            })
+            .await
+            .unwrap_or_else(|e| {
+                Some(format!(
+                    "the check for live agents in {} could not run ({e}), so nothing was started",
+                    dir.display()
+                ))
+            });
+            if let Some(refusal) = refusal {
+                return refuse(refusal);
+            }
+            Some(reservation)
+        }
+    };
 
     // Resolve the shape from the CALLER's repo config, BEFORE any git work.
     //
@@ -1224,7 +1325,9 @@ pub async fn handle_dispatch_at(
         .is_some_and(|d| names_a_relative_path(&d.command))
         && !match &existing_dir {
             None => starts_at_repository_root(&clone_dir).await,
-            Some(dir) => std::fs::canonicalize(&clone_dir).is_ok_and(|caller| &caller == dir),
+            Some(dir) => tokio::fs::canonicalize(&clone_dir)
+                .await
+                .is_ok_and(|caller| &caller == dir),
         }
     {
         tracing::debug!(
@@ -1488,14 +1591,18 @@ pub async fn handle_dispatch_at(
             }
         }
         // PRD #468: a `--dir` unit's directory is not this dispatch's, so a
-        // failed spawn leaves it exactly as it was.
+        // failed spawn runs no rollback and removes nothing. The deck's own
+        // files the attempt already wrote under `.dot-agent-deck/` (the saved
+        // task, a published context) stay, so the reply claims no more than
+        // that.
         Err(e) if existing_dir.is_some() => DispatchResult {
+            message: format!(
+                "dispatch: spawn failed: {e} (no worktree or branch was created, and {} was not \
+                 removed)",
+                unit_dir.display()
+            ),
             worktree_dir: unit_dir,
             success: false,
-            message: format!(
-                "dispatch: spawn failed: {e} (the directory was left as it was: this dispatch \
-                 created nothing there)"
-            ),
             unit_id: None,
         },
         Err(e) => {
@@ -4906,6 +5013,51 @@ mod tests {
         std::os::unix::fs::symlink(&dir, &link).unwrap();
         let records = [dir_record("9", "via-link", &link, None)];
         assert!(occupied_dir_refusal(&records, &canonical(&dir), None, canonical).is_some());
+    }
+
+    /// A directory reserved by one `--dir` dispatch cannot be reserved by a
+    /// second until the first lets go, on any exit.
+    #[test]
+    fn a_dir_being_started_cannot_be_reserved_twice() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let dir = canonical(tmp.path());
+        let first = DirReservation::take(&dir).expect("a free directory is reserved");
+        assert!(
+            DirReservation::take(&dir).is_none(),
+            "a second dispatch is refused"
+        );
+        drop(first);
+        assert!(
+            DirReservation::take(&dir).is_some(),
+            "released when the first dispatch returns"
+        );
+    }
+
+    /// Scenario: a worktree the deck records is spelled through a symlinked
+    /// parent, and `--dir` arrives with the resolved path. The unit is rooted
+    /// at the recorded spelling, so the removal guards, which compare by
+    /// spelling, count it against that worktree's cleanup.
+    #[cfg(unix)]
+    #[test]
+    fn a_dir_unit_is_rooted_at_the_spelling_of_a_recorded_worktree() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(real.join("wt")).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let recorded = link.join("wt");
+        let resolved = canonical(&real.join("wt"));
+
+        let placed =
+            place_in_existing_dir(&resolved.to_string_lossy(), std::slice::from_ref(&recorded))
+                .expect("an existing directory is placed");
+        assert_eq!(placed.canonical, resolved);
+        assert_eq!(placed.spawn_at, recorded, "rooted at the recorded spelling");
+
+        let unrecorded = place_in_existing_dir(&resolved.to_string_lossy(), &[]).unwrap();
+        assert_eq!(unrecorded.spawn_at, resolved, "else at the resolved path");
+        let err = place_in_existing_dir("relative", &[]).unwrap_err();
+        assert!(err.contains("absolute"), "{err}");
     }
 
     /// Scenario: `--dir` names a relative path, or a file. The dispatch is

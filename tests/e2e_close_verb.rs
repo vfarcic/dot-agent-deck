@@ -1336,7 +1336,7 @@ fn dispatch_dir_002_a_dispatcher_continues_in_place_and_a_second_unit_is_refused
     let test = CloseDeck::new();
     let workdir = test.deck.workdir().to_path_buf();
     let branch_before = checked_out_branch(&workdir, &workdir);
-    let brief_name = "brief-468-c0ffee.md";
+    let brief_name = "handoff-468-c0ffee.md";
     std::fs::create_dir_all(workdir.join(".dot-agent-deck")).expect("create .dot-agent-deck");
     let brief = workdir.join(".dot-agent-deck").join(brief_name);
     std::fs::write(&brief, "the analysis the team continues from").expect("write the brief");
