@@ -370,7 +370,10 @@ mod tests {
         rt.shutdown_timeout(Duration::from_secs(10));
         assert_eq!(busy, vec![true; 3]);
         assert_eq!(heartbeat, Some(7), "a blocking job queued after them runs");
-        assert!(failed, "a lock file that cannot be opened is Failed, not Busy");
+        assert!(
+            failed,
+            "a lock file that cannot be opened is Failed, not Busy"
+        );
         assert!(taken.is_ok(), "{:?}", taken.err());
     }
 }
