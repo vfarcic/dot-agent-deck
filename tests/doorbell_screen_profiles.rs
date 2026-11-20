@@ -13,7 +13,7 @@ use dot_agent_deck::doorbell_screen::{
 };
 use dot_agent_deck::event::AgentType;
 use dot_agent_deck::release_scanner::{
-    HEADER_RECOGNISERS, ReleaseScanner, ScanLatch, latch_byte_at_a_time,
+    HEADER_RECOGNISERS, ReleaseScanner, ScanLatch, VERSION_CHARS_MAX, latch_byte_at_a_time,
 };
 use semver::Version;
 use spec::spec;
@@ -386,7 +386,7 @@ fn doorbell_036_release_recogniser_negatives() {
     ));
 }
 
-/// Scenario: Draw each agent's start-up header with a bare release, a pre-release (`-beta.1`, `-alpha.1`, `-rc.1`, and Codex's own `-alpha.17.1`), build metadata (`+abc`) and both (`-rc.1+abc`), and write a Claude Code pre-release in pieces. Each latches the whole SemVer version, tags included, at the header's completing byte, and a piece-written one only once complete (issue #2128).
+/// Scenario: Draw each agent's start-up header with a bare release, a pre-release (`-beta.1`, `-alpha.1`, `-rc.1`, and Codex's own `-alpha.17.1`), build metadata (`+abc`) and both (`-rc.1+abc`), and write a Claude Code pre-release in pieces. Each latches the whole SemVer version, tags included, at the header's completing byte, and a piece-written one only once complete (issue #2128). A version at the length cap latches; one character over it, or a tag run across a 500-column row, latches nothing.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_release_recogniser_latches_pre_releases_and_builds() {
@@ -430,6 +430,28 @@ fn doorbell_036_release_recogniser_latches_pre_releases_and_builds() {
                 Some(latch_of(bytes)),
                 "{agent:?} {version}, a byte at a time"
             );
+        }
+    }
+    // A version of exactly VERSION_CHARS_MAX characters latches; one more,
+    // or a run of tag characters filling a wide row, latches nothing.
+    let at_cap = format!("2.1.330-{}", "a".repeat(VERSION_CHARS_MAX - 8));
+    let over_cap = format!("{at_cap}b");
+    let wide = format!("0.1.0-{}", "a".repeat(400));
+    let wide_latch = |header: String| {
+        let mut scanner = ReleaseScanner::new(4, 500, HEADER_RECOGNISERS).unwrap();
+        scanner.feed(header.as_bytes());
+        scanner.latch().clone()
+    };
+    assert!(matches!(
+        wide_latch(format!("\x1b[2;6HOpenAI Codex (v{at_cap})\r\n")),
+        ScanLatch::Latched { release, .. } if release.to_string() == at_cap
+    ));
+    for version in [&over_cap, &wide] {
+        for header in [
+            format!("\x1b[2;6HOpenAI Codex (v{version})\r\n"),
+            format!("\x1b[2;12HClaude Code v{version}\r\n"),
+        ] {
+            assert_eq!(wide_latch(header), ScanLatch::Pending, "{version}");
         }
     }
     let mut scanner = ReleaseScanner::new(24, 80, HEADER_RECOGNISERS).unwrap();

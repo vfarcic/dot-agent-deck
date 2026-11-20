@@ -799,6 +799,44 @@ fn codex_028_a_fresh_codex_is_rung_before_its_first_prompt() {
     );
 }
 
+/// Scenario: Start the scripted Codex screen behind the real wrapper drawing a pre-release header, `OpenAI Codex (v0.172.0-alpha.2)`, as a Codex alpha build does, and queue a task with no hook run by hand. The deck latches the whole pre-release version from the header, logs no `unknown_release` once it has, and types the token-led line and one Enter into the box after the settle window, the same as for a release; the prompt hook hands the task over (issue #2128).
+#[spec("inbox/codex/028")]
+#[test]
+fn codex_028_a_fresh_pre_release_codex_is_rung_before_its_first_prompt() {
+    const PRE_RELEASE: &str = "0.172.0-alpha.2";
+    let deck = Deck::new();
+    let codex = deck.codex("codex-028-pre-release", PRE_RELEASE, Some("codex"), &[]);
+    deck.latched(&codex, PRE_RELEASE);
+    let id = enqueue(&deck.daemon, &codex.pane, BODY);
+    let line = delivered(&deck, &codex, &id);
+    assert_eq!(codex.typed(), format!("{line}\r"));
+    let inputs = codex.inputs();
+    assert_eq!(inputs[0].1, head(&line), "{inputs:?}");
+    assert!(
+        inputs[0].0 >= deck.anchor(&codex) + MEASURED_SETTLE.as_nanos() as u64,
+        "no byte before the settle window"
+    );
+    let latch = format!("release={PRE_RELEASE}");
+    let after_latch: Vec<String> = deck
+        .lines(&codex.pane.agent, "")
+        .into_iter()
+        .skip_while(|l| !(l.contains("pane release") && l.contains(&latch)))
+        .skip(1)
+        .collect();
+    assert!(
+        !after_latch.iter().any(|l| l.contains("unknown_release")),
+        "no unknown_release once {PRE_RELEASE} latched: {}",
+        deck.log()
+    );
+    assert!(
+        deck.lines(&codex.pane.agent, "doorbell attempt")
+            .iter()
+            .any(|l| l.contains(&format!("release=\"{PRE_RELEASE}\""))),
+        "the attempt names the pre-release: {}",
+        deck.log()
+    );
+}
+
 /// Scenario: A measured Codex 0.164.0 generation reports its own SessionStart and Stop, holds a task of its own behind a screen that is not its composer, and is stopped. A replacement starts in the same pane, also showing no composer yet, and a shell-idle report carrying the predecessor's session arrives for it; a task is queued for it. Nothing reaches the replacement through its settle window and beyond: neither the predecessor's Idle nor that report is its readiness. Once its own composer is drawn it is rung on its own proof, with no hook of its own, and only its own task is delivered.
 #[spec("inbox/codex/028")]
 #[test]

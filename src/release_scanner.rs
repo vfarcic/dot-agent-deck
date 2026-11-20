@@ -111,6 +111,14 @@ pub const CLAUDE_HEADER: HeaderRecogniser = HeaderRecogniser {
     end: VersionEnd::BlankPassed,
 };
 
+/// The most characters a header's version may have, tags included. The
+/// longest measured is Codex's `0.162.0-alpha.17.1` (18). The scanner reads a
+/// header after every byte, and its work budget prices the byte's parse, not
+/// that read, so the read must stay bounded: without a cap a row of
+/// `OpenAI Codex (v0.1.0-aaaa…` would be re-read whole at each byte, across
+/// a grid up to [`SCANNER_CELLS_MAX`] cells wide.
+pub const VERSION_CHARS_MAX: usize = 64;
+
 /// Every header the deck recognises.
 pub const HEADER_RECOGNISERS: &[HeaderRecogniser] = &[CODEX_HEADER, CLAUDE_HEADER];
 
@@ -161,6 +169,9 @@ impl HeaderRecogniser {
                 break;
             }
             version.push(c);
+            if version.len() > VERSION_CHARS_MAX {
+                return None;
+            }
             col += 1;
         }
         if dots != 2 || digits_in_part == 0 {
@@ -176,6 +187,9 @@ impl HeaderRecogniser {
                 continue;
             }
             version.push(marker);
+            if version.len() > VERSION_CHARS_MAX {
+                return None;
+            }
             col += 1;
             loop {
                 let c = cell_char(screen, row, col)?;
@@ -183,6 +197,9 @@ impl HeaderRecogniser {
                     break;
                 }
                 version.push(c);
+                if version.len() > VERSION_CHARS_MAX {
+                    return None;
+                }
                 col += 1;
             }
         }
