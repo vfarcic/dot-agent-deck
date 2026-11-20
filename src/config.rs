@@ -2474,10 +2474,20 @@ impl AntigravityNoticeState {
 /// other client's starts, saved in the meantime, are added to rather than
 /// merged away: the file at 10, one unsaved start here and one saved start
 /// there make 12, and this session's next start saves 13. Its showing is
-/// kept where it happened instead, so those later starts do not push it
-/// later: a showing at the 151st start stays at 151 when the other client
-/// saves five starts before this one can save, and the next is due at 251,
-/// not 256.
+/// kept as the total it happened at instead, so those later starts do not
+/// push it later: a showing at the 151st start stays at 151 when the other
+/// client saves five starts before this one can save, and the next is due at
+/// 251, not 256.
+///
+/// What a merge holds to: no start is lost, either side's Don't show again
+/// holds, and the showing is never past the merged total. While the file
+/// only moves forward — the ordinary case — the showing is also never placed
+/// after starts that came after it. A file that went back (deleted or reset
+/// while this session could not save) gives that total no fixed meaning, so
+/// the showing is clamped to the merged total; when two sessions both hold
+/// an unsaved showing over such a file, where it lands depends on which of
+/// them saves first, and the next notice comes a few starts earlier or
+/// later. A reminder can afford that, so no record of the reset is kept.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct AntigravityNoticePending {
     /// Starts counted here and not yet saved.
@@ -2494,9 +2504,10 @@ struct AntigravityNoticePending {
 impl AntigravityNoticePending {
     /// Apply this change to `state`, read from the file: its starts follow
     /// the file's, a showing among them keeps the total it happened at
-    /// (never past the merged total, for a file that went back), the later
+    /// (clamped to the merged total, for a file that went back), the later
     /// of it and the file's showing holds, and either side's Don't show
-    /// again holds.
+    /// again holds. See [`AntigravityNoticePending`] for what that keeps
+    /// and what, after a reset, it does not.
     fn apply_to(&self, state: &mut AntigravityNoticeState) {
         state.start_count = state.start_count.saturating_add(self.starts);
         if let Some(at) = self.shown_at {
@@ -5128,6 +5139,63 @@ command = "vim"
         let (state, _) = AntigravityNoticeState::load_from(&path);
         assert_eq!(state.start_count, 12);
         assert!(state.permanently_dismissed, "the other client's dismissal");
+    }
+
+    /// PRD #211 (review of the fix for Qodo's finding on PR #2370): two
+    /// sessions hold an unsaved showing over a file that went back, and
+    /// recover in either order. The file at 150 (last shown at 50); session
+    /// A's 151st start shows the notice and cannot be saved; the file is
+    /// deleted; session B's two starts cannot be saved either, its first
+    /// showing the notice. Once saving works, each records one more start.
+    /// Whichever saves first, all five starts are kept, the showing is not
+    /// past the total, and neither recovering start shows the notice. Where
+    /// the showing lands may differ between the two orders, and is not
+    /// asserted.
+    #[test]
+    fn antigravity_notice_two_unsaved_showings_over_a_reset_file() {
+        for a_first in [true, false] {
+            let order = if a_first { "A then B" } else { "B then A" };
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("notice.json");
+            seed_notice(&path, 150, 50);
+            let mut a = notice_session(&path);
+            let mut b = notice_session(&path);
+            let held = hold_notice_lock(&path);
+            let start = a.record_start();
+            assert!(start.show, "{order}: A's 151st start");
+            assert!(start.problem.is_some(), "{order}: A saved");
+            std::fs::remove_file(&path).unwrap();
+            let start = b.record_start();
+            assert!(start.show, "{order}: B's first start over the reset file");
+            assert!(start.problem.is_some(), "{order}: B saved");
+            assert!(!b.record_start().show, "{order}: B's second start");
+            drop(held);
+            assert!(
+                !path.exists(),
+                "{order}: a start was saved while the lock was held"
+            );
+
+            let (first, second) = if a_first {
+                (&mut a, &mut b)
+            } else {
+                (&mut b, &mut a)
+            };
+            for (which, session) in [("first", first), ("second", second)] {
+                let start = session.record_start();
+                assert!(!start.show, "{order}: the {which} recovering start");
+                assert!(start.problem.is_none(), "{order}: {:?}", start.problem);
+            }
+            let (state, unreadable) = AntigravityNoticeState::load_from(&path);
+            assert!(unreadable.is_none(), "{order}: {unreadable:?}");
+            assert_eq!(state.start_count, 5, "{order}: a start was lost");
+            assert!(
+                state.last_prompt_at_start <= state.start_count,
+                "{order}: the showing is past the total: {state:?}"
+            );
+            assert!(!state.permanently_dismissed, "{order}");
+            assert_eq!(a.state(), state, "{order}: A kept an unsaved change");
+            assert_eq!(b.state(), state, "{order}: B kept an unsaved change");
+        }
     }
 
     /// PRD #2174: two clients share one file. Launches of either count
