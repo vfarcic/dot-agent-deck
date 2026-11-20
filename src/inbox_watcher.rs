@@ -60,15 +60,17 @@ pub const ENV_TEST_REGISTER_DELAY_MS: &str = "DOT_AGENT_DECK_INBOX_TEST_REGISTER
 
 /// Every TEST knob above, and the one-shot receivers'
 /// ([`crate::inbox_oneshot::ENV_TEST_HOOK_INTEGRATION`],
-/// [`crate::inbox_oneshot::ENV_TEST_EXIT_AFTER_GRANT`]). A spawned agent
+/// [`crate::inbox_oneshot::ENV_TEST_EXIT_AFTER_GRANT`],
+/// [`crate::inbox_oneshot::ENV_TEST_HOLD_AFTER_PRINT`]). A spawned agent
 /// inherits none of them from the daemon's environment (`agent_pty`); a test sets one explicitly.
-pub const TEST_KNOBS: [&str; 6] = [
+pub const TEST_KNOBS: [&str; 7] = [
     ENV_TEST_PUBLISH_DELAY_MS,
     ENV_TEST_DROP_COMMITTED,
     ENV_TEST_REBIND_DELAY_MS,
     ENV_TEST_REGISTER_DELAY_MS,
     crate::inbox_oneshot::ENV_TEST_HOOK_INTEGRATION,
     crate::inbox_oneshot::ENV_TEST_EXIT_AFTER_GRANT,
+    crate::inbox_oneshot::ENV_TEST_HOLD_AFTER_PRINT,
 ];
 
 #[cfg(not(unix))]

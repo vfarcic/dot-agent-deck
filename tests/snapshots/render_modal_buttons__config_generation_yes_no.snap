@@ -1,0 +1,22 @@
+---
+source: tests/render_modal_buttons.rs
+expression: cfg
+---
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+          ┌ Generate .dot-agent-deck.toml ───────────────────────────┐          
+          │                                                          │          
+          │  No orchestration config found for this                  │          
+          │  project. Want to instruct your agent to                 │          
+          │  analyze the project and create one?                     │          
+          │                                                          │          
+          │  > Yes    — generate config for this project             │          
+          │    No     — skip for now                                 │          
+          │                                                          │          
+          │ [Yes] [No]                                               │          
+          │  Up/Down: navigate  Enter: confirm  Esc: cancel          │          
+          └──────────────────────────────────────────────────────────┘

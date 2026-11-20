@@ -235,9 +235,23 @@ while True:
     /// The deck's own Codex hook for `event`, run with the pane's identity
     /// and spool, and what it did.
     fn hook_output(&self, event: &str, prompt: Option<&str>) -> std::process::Output {
+        self.hook_output_with(event, prompt, None)
+    }
+
+    /// [`Self::hook_output`] with a payload naming `transcript` as Codex's
+    /// rollout (`transcript_path`), when given.
+    fn hook_output_with(
+        &self,
+        event: &str,
+        prompt: Option<&str>,
+        transcript: Option<&std::path::Path>,
+    ) -> std::process::Output {
         let mut payload = json!({"hook_event_name":event,"session_id":"codex-inbox-session","cwd":self.daemon.home});
         if let Some(prompt) = prompt {
             payload["prompt"] = json!(prompt);
+        }
+        if let Some(transcript) = transcript {
+            payload["transcript_path"] = json!(transcript);
         }
         let mut child = self
             .in_pane(&["hook", "--agent", "codex"])
@@ -742,4 +756,223 @@ fn codex_021_prompt_hook_off_doorbell_fetch_idle_and_stop_busy_each_once() {
         );
         codex.committed(id, 1);
     }
+}
+
+/// Issue #2346: a Codex rollout at `path` holding what precedes a turn, as
+/// Codex 0.164.0 writes it before its first prompt's hooks run.
+fn rollout(path: &std::path::Path) {
+    std::fs::write(
+        path,
+        b"{\"type\":\"session_meta\",\"payload\":{\"cli_version\":\"0.164.0\"}}\n",
+    )
+    .unwrap();
+}
+
+/// Issue #2346: append one Codex rollout record to `rollout`.
+fn append_record(rollout: &std::path::Path, record: Value) {
+    let mut line = serde_json::to_vec(&record).unwrap();
+    line.push(b'\n');
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(rollout)
+        .unwrap()
+        .write_all(&line)
+        .unwrap();
+}
+
+/// Issue #2346: a `response_item` message of `role` holding `text`, as Codex
+/// 0.164.0 records the prompt it took (`user`), a prompt hook's context
+/// (`developer`) and a `Stop` reason it went on with (`user`).
+fn codex_message(role: &str, text: &str) -> Value {
+    json!({"type":"response_item","payload":{"type":"message","role":role,
+        "content":[{"type":"input_text","text":text}]}})
+}
+
+/// Issue #2346: the `Stop` reason `reason` as Codex 0.164.0 records the one it
+/// goes on with: inside `<hook_prompt>`, with `&`, `<` and `>` escaped.
+fn hook_prompt(reason: &str) -> Value {
+    let escaped = reason
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    codex_message(
+        "user",
+        &format!("<hook_prompt hook_run_id=\"stop:0:/codex/hooks.json\">{escaped}</hook_prompt>"),
+    )
+}
+
+/// Issue #2346: what Codex 0.164.0 records when the user interrupts a turn
+/// before Codex took what its hook printed.
+fn interrupted(rollout: &std::path::Path) {
+    append_record(
+        rollout,
+        codex_message(
+            "user",
+            "<turn_aborted>\nThe user interrupted the previous turn on purpose.\n</turn_aborted>",
+        ),
+    );
+    append_record(
+        rollout,
+        json!({"type":"event_msg","payload":{"type":"turn_aborted","reason":"interrupted"}}),
+    );
+}
+
+impl Codex {
+    /// Issue #2346: message `id` stays `expected` for all of `span`.
+    fn stays(&self, id: &str, expected: &str, span: Duration) {
+        let seen = std::cell::RefCell::new(String::new());
+        let left = common::wait_until(span, || {
+            *seen.borrow_mut() = self.summary(id)["state"].to_string();
+            !seen.borrow().to_ascii_lowercase().contains(expected)
+        });
+        assert!(
+            !left,
+            "message {id} must stay {expected}, is {}",
+            seen.borrow()
+        );
+    }
+
+    /// Issue #2346: run `hand_over` until what it prints hands `id` over
+    /// again, marked as a possible repeat; answers what it printed then.
+    fn handed_again(&self, id: &str, hand_over: impl Fn() -> String) -> String {
+        let marked = format!("This may repeat dot-agent-deck message {id}");
+        let printed = std::cell::RefCell::new(String::new());
+        assert!(
+            common::wait_until(common::load_scaled(Duration::from_secs(40)), || {
+                *printed.borrow_mut() = hand_over();
+                printed.borrow().contains(&marked)
+            }),
+            "{id} is handed over again, marked; last printed {}",
+            printed.borrow()
+        );
+        printed.into_inner()
+    }
+}
+
+/// Scenario: With a hook payload naming Codex's rollout, the real Codex prompt hook answers a doorbell with the task's block, and the task stays fetched until the rollout gains that context as a developer message, then is acknowledged with one delivery. A second task's turn is interrupted, the rollout gaining only Codex's turn_aborted record, so it is never acknowledged; the next doorbell hands it over again marked as a possible repeat, and the rollout recording that one acknowledges it with two deliveries. A third task's prompt is blocked by another hook, the rollout gaining the context but no user message, as Codex keeps it: it is acknowledged with one delivery.
+#[spec("inbox/codex/029")]
+#[test]
+fn codex_029_a_doorbell_hook_commits_only_what_the_rollout_shows_codex_took() {
+    // A 15 s ack-wait gives the witness a 10 s window.
+    let codex = Codex::new_with(COMPOSER, &[("DOT_AGENT_DECK_INBOX_ACK_WAIT_MS", "15000")]);
+    codex.busy("original human prompt");
+    let path = codex.daemon.home.join("rollout-witness.jsonl");
+    rollout(&path);
+    let doorbell = |id: &str| -> String {
+        let output = codex.hook_output_with(
+            "UserPromptSubmit",
+            Some(fixed_line(id).trim_start()),
+            Some(&path),
+        );
+        assert!(output.status.success(), "hook: {output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let context = |stdout: &str| -> String {
+        let output: Value = serde_json::from_str(stdout)
+            .unwrap_or_else(|e| panic!("additionalContext JSON; {e}; stdout={stdout:?}"));
+        output["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+
+    let taken = codex.queued("codex witness taken 4b1e");
+    let given = context(&doorbell(&taken));
+    assert!(
+        given.contains(&format!(
+            "[dot-agent-deck message {taken} delivery 1.1 from "
+        )),
+        "{given}"
+    );
+    codex.stays(&taken, "fetched", Duration::from_millis(1500));
+    append_record(
+        &path,
+        codex_message("user", fixed_line(&taken).trim_start()),
+    );
+    append_record(&path, codex_message("developer", &given));
+    codex.committed(&taken, 1);
+
+    let dropped = codex.queued("codex witness interrupted 7c20");
+    let given = context(&doorbell(&dropped));
+    assert!(
+        given.contains(&format!(
+            "[dot-agent-deck message {dropped} delivery 1.1 from "
+        )),
+        "{given}"
+    );
+    interrupted(&path);
+    codex.stays(&dropped, "fetched", Duration::from_secs(3));
+    let again = context(&codex.handed_again(&dropped, || doorbell(&dropped)));
+    assert!(
+        again.contains(&format!(
+            "[dot-agent-deck message {dropped} delivery 1.2 from "
+        )),
+        "{again}"
+    );
+    state(&codex.daemon, &codex.pane, &dropped, "fetched");
+    append_record(&path, codex_message("developer", &again));
+    codex.committed(&dropped, 2);
+
+    let blocked = codex.queued("codex witness blocked 2e95");
+    let given = context(&doorbell(&blocked));
+    append_record(&path, codex_message("developer", &given));
+    append_record(
+        &path,
+        json!({"type":"event_msg","payload":{"type":"task_complete","last_agent_message":null}}),
+    );
+    codex.committed(&blocked, 1);
+}
+
+/// Scenario: With a hook payload naming Codex's rollout, the real Codex Stop hook hands a queued task over as its block reason, and the task stays fetched until the rollout gains that reason as Codex records one it goes on with (a user message wrapping it in `<hook_prompt>`, its `&`, `<` and `>` escaped), then is acknowledged with one delivery. A second task's turn is interrupted before Codex took the reason, the rollout gaining only Codex's turn_aborted record, so it is never acknowledged; a later Stop hands it over again marked as a possible repeat, and the rollout recording that one acknowledges it with two deliveries.
+#[spec("inbox/codex/030")]
+#[test]
+fn codex_030_a_stop_hand_over_commits_only_what_the_rollout_shows_codex_took() {
+    let codex = Codex::new_with(COMPOSER, &[("DOT_AGENT_DECK_INBOX_ACK_WAIT_MS", "15000")]);
+    codex.busy("a long human turn");
+    let path = codex.daemon.home.join("rollout-stop-witness.jsonl");
+    rollout(&path);
+    let stop = || -> String {
+        let output = codex.hook_output_with("Stop", None, Some(&path));
+        assert!(output.status.success(), "hook: {output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let reason = |stdout: &str| -> String {
+        let output: Value = serde_json::from_str(stdout)
+            .unwrap_or_else(|e| panic!("a Stop block; {e}; stdout={stdout:?}"));
+        assert_eq!(output["decision"], "block");
+        output["reason"].as_str().unwrap().to_string()
+    };
+
+    let taken = codex.queued("codex stop witness <taken> & kept 61d4");
+    let given = reason(&stop());
+    assert!(
+        given.contains(&format!(
+            "[dot-agent-deck message {taken} delivery 1.1 from "
+        )),
+        "{given}"
+    );
+    codex.stays(&taken, "fetched", Duration::from_millis(1500));
+    append_record(&path, hook_prompt(&given));
+    codex.committed(&taken, 1);
+
+    let dropped = codex.queued("codex stop witness interrupted 0a8f");
+    let given = reason(&stop());
+    assert!(
+        given.contains(&format!(
+            "[dot-agent-deck message {dropped} delivery 1.1 from "
+        )),
+        "{given}"
+    );
+    interrupted(&path);
+    codex.stays(&dropped, "fetched", Duration::from_secs(3));
+    let again = reason(&codex.handed_again(&dropped, stop));
+    assert!(
+        again.contains(&format!(
+            "[dot-agent-deck message {dropped} delivery 1.2 from "
+        )),
+        "{again}"
+    );
+    state(&codex.daemon, &codex.pane, &dropped, "fetched");
+    append_record(&path, hook_prompt(&again));
+    codex.committed(&dropped, 2);
 }

@@ -53,6 +53,7 @@ import type { HandoffEdge,
   EvidenceItem,
   HostMetricsReport,
   InboxActionResult,
+  GenerateConfigResult,
   InboxActionVerb,
   InboxAttentionItem,
   NewAgentOptions,
@@ -446,6 +447,12 @@ export interface DesktopAgentDto {
    * or predates the field.
    */
   pullRequest?: PullRequestInfoDto;
+  /**
+   * PRD #2119 — whether the agent's project already holds a
+   * `.dot-agent-deck.toml`, copied through from `AgentRecord`. Absent or null
+   * when the daemon did not say.
+   */
+  projectConfigExists?: boolean | null;
   /**
    * The desktop crate's `DesktopTab` is structurally identical to the app
    * model's `AgentTab`, so the DTO reuses it and `agentFromDto` copies the
@@ -2383,6 +2390,13 @@ export interface DeckBridge {
    */
   inboxAction?(target: AgentTarget, item: { paneId: string; messageId: string; revision: number }, verb: InboxActionVerb): Promise<InboxActionResult>;
   /**
+   * PRD #2119 — Generate config (`desktop_generate_config`): the daemon that
+   * owns the agent posts the configuration request to its inbox, bound to the
+   * daemon process that listed it. Optional: a bridge without it offers no
+   * control.
+   */
+  generateConfig?(deckId: string, agentId: string, paneId: string, incarnation?: string): Promise<GenerateConfigResult>;
+  /**
    * PRD #2374 — tell the app's backend that this webview consumes agent cards
    * (`agent_cards_consume`), called once, by the surface that renders them.
    * Until it is called the backend subscribes to no card doorbell,
@@ -2894,6 +2908,8 @@ function agentFromDto(agent: DesktopAgentDto, index: number, daemonId: string): 
     ...(answerSettlements.length > 0 ? { answerSettlements } : {}),
     // PRD #1401 — the badge. Checked, not copied: see `pullRequestFromDto`.
     ...(pullRequest ? { pullRequest } : {}),
+    // PRD #2119 — only a boolean the daemon sent; anything else is unknown.
+    ...(typeof agent.projectConfigExists === "boolean" ? { projectConfigExists: agent.projectConfigExists } : {}),
     ...(background ? { background } : {}),
     rows: agent.rows,
     cols: agent.cols,
@@ -3183,7 +3199,7 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
  * reachable from the URL — the previous inline `||` chain had to be edited in
  * lockstep with the fixture and was not.
  */
-const FIXTURE_STATES: readonly FixtureState[] = ["connected", "crowded", "disconnected", "error", "empty", "fleet", "docs", "docs-pr", "docs-fleet", "voice-pages", "upgrade", "upgrade-error", "hook-notice", "docs-question", "docs-restart"];
+const FIXTURE_STATES: readonly FixtureState[] = ["connected", "crowded", "disconnected", "error", "empty", "fleet", "docs", "docs-pr", "docs-generate", "docs-fleet", "voice-pages", "upgrade", "upgrade-error", "hook-notice", "docs-question", "docs-restart"];
 
 class FixtureDeckBridge implements DeckBridge {
   readonly mode = "fixture" as const;
@@ -3194,6 +3210,13 @@ class FixtureDeckBridge implements DeckBridge {
    */
   async inboxAction(): Promise<InboxActionResult> {
     return { outcome: "applied" };
+  }
+  /**
+   * PRD #2119: the preview answers Generate config as a daemon that posted the
+   * request would, with the sentence the app shows for it. Nothing is sent.
+   */
+  async generateConfig(): Promise<GenerateConfigResult> {
+    return { outcome: "sent", messageId: "m-fixture-config", message: "Config request sent to the agent's inbox." };
   }
   /**
    * PRD #2374 — the `agent-cards` docs scene's card list: served only for
@@ -5954,6 +5977,12 @@ export class TauriDeckBridge implements DeckBridge {
     // Issue #1240: `options` only when given, so a PRD #1223 listing is the
     // same invoke it always was.
     return invoke<DeckDirectoryListing>("desktop_list_directories", { deckId, path: path ?? null, ...(options ? { options } : {}) });
+  }
+
+  /** PRD #2119: the deck, pane, agent and process the confirmation captured, untouched. */
+  async generateConfig(deckId: string, agentId: string, paneId: string, incarnation?: string): Promise<GenerateConfigResult> {
+    const invoke = await this.getInvoke();
+    return invoke<GenerateConfigResult>("desktop_generate_config", { deckId, agentId, paneId, incarnation: incarnation ?? null });
   }
 
   async consumeAgentCards(): Promise<void> {

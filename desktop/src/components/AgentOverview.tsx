@@ -1,11 +1,12 @@
 import { Children, cloneElement, createContext, isValidElement, useCallback, useContext, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type MouseEvent, type ReactNode } from "react";
-import { Blocks, Boxes, CircleArrowUp, CircleStop, Columns3, Filter, LayoutList, Layers, Maximize2, Network, Play, Plus, RefreshCw, RotateCcw, Server, ShieldAlert, Sparkles, SquareTerminal, Wrench, X } from "lucide-react";
+import { Blocks, Boxes, CircleArrowUp, CircleStop, Columns3, FileCog, Filter, LayoutList, Layers, Maximize2, Network, Play, Plus, RefreshCw, RotateCcw, Server, ShieldAlert, Sparkles, SquareTerminal, Wrench, X } from "lucide-react";
 import { desktopFeaturesOf } from "../types";
 import { KEEP_WORKTREE_SUFFIX, worktreePreview } from "../lib/worktreeClose";
-import { statusLabel, type AgentSession, type AgentStatus, type ConnectionView, type DeckRuntimeState, type DeckView } from "../types";
+import { type AgentSession, type AgentStatus, type ConnectionView, type DeckRuntimeState, type DeckView, type GenerateConfigResult } from "../types";
+import { STATUS_WORD_ORDER, statusWord, statusWordLabel, type StatusWord } from "../lib/statusWords";
 import { modeScopedKey, type DesktopAgentDto } from "../lib/bridge";
 import { buildDashboardFilterHeader, clearDashboardFilter, DASHBOARD_AGENT_TYPES, DASHBOARD_FILTER_TEXT_MAX, DASHBOARD_KINDS, DASHBOARD_STATUSES, dashboardFilterActive, filterDashboardAgents, removeDashboardFilterFacet, setDashboardFilter, useDashboardFilter, type DashboardFilter, type DashboardFilterFacts } from "../lib/dashboardFilter";
-import { VOICE_ACTIONS, type DashboardScroll, type NewAgentVoice, type NewAgentVoiceChannel, type VoiceDispatchTarget, type VoiceOverviewChannel } from "../lib/voiceActions";
+import { VOICE_ACTIONS, type DashboardScroll, type NewAgentVoice, type NewAgentVoiceChannel, type VoiceActionContext, type VoiceDispatchTarget, type VoiceOverviewChannel } from "../lib/voiceActions";
 import { DECK_STATE_FALLBACK, deckUnavailableReason, isNewAgentShortcut } from "../lib/newAgent";
 import { ConfirmDialog, type ConfirmState } from "./ConfirmDialog";
 import { UpgradeDialog, type UpgradeTarget } from "./UpgradeDialog";
@@ -71,6 +72,8 @@ export type OverviewAgent = Pick<
   | "pullRequest"
   /* PRD #1666 part 2 — sent back with a stop, so it reaches the daemon process that listed the agent. */
   | "incarnation" | "paneId"
+  /* PRD #2119 — Generate config reads Update config when the daemon says the project already has one. */
+  | "projectConfigExists"
 > & {
   /**
    * HONEST, and optional exactly as `AgentSession.cwd` is. It was optional here
@@ -102,7 +105,7 @@ export type OverviewAgent = Pick<
 };
 
 export function toOverviewAgent(agent: AgentSession): OverviewAgent {
-  const { id, daemonId, displayName, cli, status, cwd, activeTool, activeToolDetail, toolCount, tab, lastUserPrompt, lastActivityMs, spawnedAtMs, writeLease, agentType, daemonStatus, authoringKind, pullRequest, incarnation, paneId } = agent;
+  const { id, daemonId, displayName, cli, status, cwd, activeTool, activeToolDetail, toolCount, tab, lastUserPrompt, lastActivityMs, spawnedAtMs, writeLease, agentType, daemonStatus, authoringKind, pullRequest, incarnation, paneId, projectConfigExists } = agent;
   return {
     id,
     daemonId,
@@ -124,6 +127,7 @@ export function toOverviewAgent(agent: AgentSession): OverviewAgent {
     ...(pullRequest ? { pullRequest } : {}),
     ...(incarnation ? { incarnation } : {}),
     ...(paneId ? { paneId } : {}),
+    ...(projectConfigExists !== undefined ? { projectConfigExists } : {}),
     ...withHoldWords(inboxAttentionWords(agent.inbox)),
   };
 }
@@ -377,16 +381,14 @@ function roleIndexOf(agent: OverviewAgent): number {
 }
 
 /**
- * Statuses in the order an operator scans them: what needs attention first.
- * Idle comes after every state a person has to act on (issue #1676).
+ * How many agents show each status word, in `STATUS_WORD_ORDER` (issue #2411:
+ * the daemon's words, so Thinking, Working and Compacting are counted apart,
+ * as the TUI's stats bar counts them).
  */
-// Issue #1757: Waiting after the states a person acts on, before Idle — its
-// work is not done, but nothing needs the user.
-const STATUS_ORDER: AgentStatus[] = ["running", "needs_input", "failed", "blocked", "waiting", "idle", "queued", "passed", "stopped"];
-
-export function countByStatus(agents: OverviewAgent[]): { status: AgentStatus; count: number }[] {
-  return STATUS_ORDER
-    .map((status) => ({ status, count: agents.filter((agent) => agent.status === status).length }))
+export function countByStatus(agents: OverviewAgent[]): { status: StatusWord; count: number }[] {
+  const words = agents.map(statusWord);
+  return STATUS_WORD_ORDER
+    .map((status) => ({ status, count: words.filter((word) => word === status).length }))
     .filter((entry) => entry.count > 0);
 }
 
@@ -947,6 +949,98 @@ export function stopAgentConfirmation(agent: OverviewAgent, connection: Connecti
   };
 }
 
+/*
+  PRD #2119 — Generate config: the TUI's question, in its words, answered
+  Yes/No. It asks an agent to write a file the user can review, so it is drawn
+  neutral rather than as a stop.
+*/
+export const GENERATE_CONFIG_TITLE = "Generate .dot-agent-deck.toml";
+export const GENERATE_CONFIG_BODY = "No orchestration config found for this project. Want to instruct your agent to analyze the project and create one?";
+/** PRD #2119 — the same question when the daemon reports the project already has a config: the TUI's words again. */
+export const UPDATE_CONFIG_TITLE = "Update .dot-agent-deck.toml";
+export const UPDATE_CONFIG_BODY = "This project already has an orchestration config. Want to instruct your agent to analyze the project and update the existing config?";
+/**
+ * PR #2362 review — the question when the daemon could not tell whether the project has a config (or did not say):
+ * it claims neither, since the request the daemon then sends is the conditional one. Titled Generate, like the
+ * button. The TUI's words again (`render_config_gen_prompt`, CLAUDE.md rule 22).
+ */
+export const UNKNOWN_CONFIG_BODY = "Want to instruct your agent to check this project for .dot-agent-deck.toml and create it, or propose updates to it if it already exists?";
+
+/** PRD #2119 — the confirmation's body for what the daemon reported: an existing config, none, or unknown. */
+export function configConfirmationBody(agent: Pick<OverviewAgent, "projectConfigExists">): string {
+  if (agent.projectConfigExists === true) return UPDATE_CONFIG_BODY;
+  if (agent.projectConfigExists === false) return GENERATE_CONFIG_BODY;
+  return UNKNOWN_CONFIG_BODY;
+}
+
+/** PRD #2119 — the config action's verb: Update only when the daemon reported an existing config, else Generate (the TUI footer's `config_action_label`). */
+export function configActionVerb(agent: Pick<OverviewAgent, "projectConfigExists">): "Update" | "Generate" {
+  return agent.projectConfigExists === true ? "Update" : "Generate";
+}
+/** The agent offers no pane the daemon could post the request to. */
+export const GENERATE_CONFIG_NO_PANE = "That agent has no pane the daemon can send the request to, so nothing was sent.";
+/** Generate config's refusals for an agent that went away, in its own words: nothing was SENT, not closed. */
+export const GENERATE_TARGET_GONE = "That agent is not on the dashboard any more, so nothing was sent.";
+export const GENERATE_TARGET_RESTARTED = `${AGENT_GONE_AFTER_RESTART[0].toUpperCase()}${AGENT_GONE_AFTER_RESTART.slice(1)}, so nothing was sent.`;
+/** A confirmation is already open; a second would replace it under the user's pointer. */
+export const GENERATE_CONFIRMATION_ALREADY_OPEN = "A confirmation is already open — answer it first. Nothing was sent.";
+/** The New agent dialog is modal, so the question could not be reached behind it. */
+export const GENERATE_BEHIND_NEW_AGENT = "The New agent dialog is open — close it first. Nothing was sent.";
+/** Prefix of the failure sentence, the TUI's (`daemon_client::CONFIG_GEN_FAILED_PREFIX`), for a request the app itself could not hand over. */
+const GENERATE_CONFIG_FAILED_PREFIX = "Failed to send config prompt";
+
+/** The pane-side reply to a voice request, in a pane, that names an agent other than the one shown. */
+export const GENERATE_FOR_THIS_AGENT = "To generate config for this agent, say 'generate config' or press Generate config.";
+
+/**
+ * PR #2362 review — the latest Generate config attempt per agent (deck and id),
+ * shared by the dashboard row and the pane because both report into the same
+ * pane notice. Each Yes takes the next token for its agent, and only the
+ * attempt still holding the latest one is reported: an older request that
+ * settles after a newer one cannot overwrite the newer result.
+ */
+const latestGeneration = new Map<string, number>();
+
+/**
+ * PRD #2119 — the Generate config confirmation shared by the dashboard row and
+ * the agent's pane. The binding — deck, agent, pane and the daemon process that
+ * listed it — is captured HERE, when the question opens, so a Yes pressed after
+ * the row refreshed from a successor process still names the agent the user was
+ * asked about, and the daemon refuses it if that process is gone. `onAnswer`
+ * hears every outcome of the latest attempt for that agent, a failure to reach
+ * the app's backend included; an attempt superseded by a newer Yes for the same
+ * agent is not reported.
+ */
+export function generateConfigConfirmation(agent: Pick<OverviewAgent, "daemonId" | "id" | "paneId" | "incarnation" | "projectConfigExists">, paneId: string, generateConfig: NonNullable<DeckRuntimeState["generateConfig"]>, onAnswer: (result: GenerateConfigResult) => void): ConfirmState {
+  const { daemonId, id, incarnation } = agent;
+  const update = configActionVerb(agent) === "Update";
+  return {
+    title: update ? UPDATE_CONFIG_TITLE : GENERATE_CONFIG_TITLE,
+    body: configConfirmationBody(agent),
+    label: "Yes",
+    busyLabel: "Sending…",
+    cancelLabel: "No",
+    neutral: true,
+    action: async () => {
+      const key = `${daemonId}\u0000${id}`;
+      const attempt = (latestGeneration.get(key) ?? 0) + 1;
+      latestGeneration.set(key, attempt);
+      let result: GenerateConfigResult;
+      try {
+        result = await generateConfig(daemonId, id, paneId, incarnation);
+      } catch (cause) {
+        result = { outcome: "failed", message: `${GENERATE_CONFIG_FAILED_PREFIX}: ${cause instanceof Error ? cause.message : String(cause)}` };
+      }
+      if (latestGeneration.get(key) === attempt) onAnswer(result);
+    },
+  };
+}
+
+/** PRD #2119 — what a row's Generate config dispatches through: the registry entry's own context. */
+type GenerateConfigControls = Pick<VoiceActionContext, "confirmGenerateConfig" | "reportRefused">;
+
+const GenerateConfigContext = createContext<GenerateConfigControls | undefined>(undefined);
+
 /**
  * The fleet at a glance: every agent the desktop can see, grouped the way the
  * daemon groups them, described only by things that are actually true — and
@@ -973,8 +1067,15 @@ export function stopAgentConfirmation(agent: OverviewAgent, connection: Connecti
  * passes it to whichever view is mounted; a caller that renders this screen
  * standalone gets everything except the control that needs a document.
  */
-export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = false, voiceChannel, newAgentVoice, onConfirmationChange, onNewAgentChange, notice, selfUpgrade }: {
+export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = false, voiceChannel, newAgentVoice, onConfirmationChange, onNewAgentChange, notice, selfUpgrade, onConfigRequestSent }: {
   runtime: DeckRuntimeState;
+  /**
+   * PRD #2119 — told when Generate config was sent from this screen, after it
+   * navigated to that agent's pane. A shell that draws the pane over this
+   * screen shows the sentence there, where it is not behind the pane; without
+   * this prop the sentence is shown on this screen.
+   */
+  onConfigRequestSent?: (target: { deckId: string; agentId: string; incarnation?: string }, message: string) => void;
   settings?: DesktopSettingsState;
   onNavigate: (view: DeckView) => void;
   /**
@@ -1135,7 +1236,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   // PRD #1666 part 3, round 5-wake (Q6); issue #2387: who the deck holds the
   // doorbell for, over the decks that answered, as the counters beside it are.
   const heldOnDecks = useMemo(() => decks.filter((deck) => deck.connected).flatMap((deck) => deck.snapshot.agents), [decks]);
-  const countOf = (status: AgentStatus) => aggregate.counts.find((entry) => entry.status === status)?.count ?? 0;
+  const countOf = (status: StatusWord) => aggregate.counts.find((entry) => entry.status === status)?.count ?? 0;
   /**
    * PRD #802 M2 — the overview's "Open deck" controls and
    * its row-level open all dispatch through the action registry. The context is
@@ -1172,6 +1273,8 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   const newAgentClose = useRef<(() => string | undefined) | undefined>(undefined);
   /** What the flow could not finish on screen: an agent the deck accepted and has not listed. */
   const [newAgentNotice, setNewAgentNotice] = useState<string>();
+  /** PRD #2119 — Generate config's outcome, or why it opened no confirmation. */
+  const [generationNotice, setGenerationNotice] = useState<string>(); // voice-registry-exempt: Generate config's sentence in a banner, reporting what the request did
   /** Issue #1073 — what the last Stop daemon did, in the crate's own sentence, naming the daemon. */
   const [daemonNotice, setDaemonNotice] = useState<string>();
   /** The stop whose result the notice may show: a stop that settles after a later one was confirmed writes nothing. */
@@ -1206,7 +1309,44 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     - the New agent dialog open, which is modal: a confirmation behind it
       would be unreachable, and the user is doing something else.
   */
+  /*
+    PRD #2119 — Generate config by voice or by the row's control, opening the
+    same neutral confirmation and nothing else: no request is sent until the
+    user presses Yes. Refused in words, as the stops are, for an agent that is
+    gone or restarted, behind the New agent dialog, or over another
+    confirmation.
+  */
+  const generateConfig = runtime.generateConfig;
+  const confirmGenerateConfig = (target: VoiceDispatchTarget): string | undefined => {
+    if (newAgent) return GENERATE_BEHIND_NEW_AGENT;
+    if (confirm) return GENERATE_CONFIRMATION_ALREADY_OPEN;
+    const deck = decks.find((candidate) => candidate.connected && candidate.snapshot.connection.deckId === target.deckId);
+    const agent = deck?.agents.find((candidate) => candidate.id === target.agentId);
+    if (!agent || !generateConfig) return GENERATE_TARGET_GONE;
+    if ("incarnation" in target && !sameIncarnation(target.incarnation, agent.incarnation)) return GENERATE_TARGET_RESTARTED;
+    if (!agent.paneId) return GENERATE_CONFIG_NO_PANE;
+    setGenerationNotice(undefined);
+    const question = generateConfigConfirmation(agent, agent.paneId, generateConfig, (result) => {
+      if (result.outcome !== "sent") {
+        setGenerationNotice(result.message);
+        return;
+      }
+      /* Dismissed while it was sending: the outcome is still recorded, but
+         the user has moved on, so the screen stays where they took it. */
+      if (shownConfirm.current === question) {
+        onNavigate({ kind: "agent", deckId: agent.daemonId, agentId: agent.id, from: "overview", ...(agent.incarnation ? { incarnation: agent.incarnation } : {}) });
+      }
+      /* The process the question was asked about, so the pane shows it only for that incarnation. */
+      if (onConfigRequestSent) onConfigRequestSent({ deckId: agent.daemonId, agentId: agent.id, ...(agent.incarnation ? { incarnation: agent.incarnation } : {}) }, result.message);
+      else setGenerationNotice(result.message);
+    });
+    setConfirm(question);
+    return undefined;
+  };
+  /* The rows' control, offered only where the runtime can send the request. A refusal is this screen's banner. */
+  const generateControls: GenerateConfigControls | undefined = generateConfig ? { confirmGenerateConfig, reportRefused: setGenerationNotice } : undefined;
   const voiceStops = {
+    confirmGenerateConfig,
     confirmStopAgent: (target: VoiceDispatchTarget): string | undefined => {
       if (newAgent) return STOP_BEHIND_NEW_AGENT;
       if (confirm) return CONFIRMATION_ALREADY_OPEN;
@@ -1445,6 +1585,19 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   };
   const cards = useAgentCardsView({ runtime, decks: cardDeckList, openAgent: openCardAgent });
   const [confirm, setConfirm] = useState<ConfirmState>();
+  /* The confirmation on screen as of the last render, read by an answer that
+     arrives after it: a Generate config the user dismissed with No must not
+     take them to its agent when its request settles late. `undefined` once
+     this screen is gone, as `ConfirmDialog`'s own `shown` is: a request still
+     pending when the user navigated away (voice "open daemons", say) must not
+     take them back, and a reopened dashboard is a new instance whose
+     confirmations are not this one's. */
+  const shownConfirm = useRef<ConfirmState | undefined>(confirm);
+  shownConfirm.current = confirm;
+  useEffect(() => {
+    shownConfirm.current = confirm;
+    return () => { shownConfirm.current = undefined; };
+  }, [confirm]);
   /** PRD #1487 M5 — the Upgrade dialog, for the deck whose card it was pressed on. */
   const [upgrade, setUpgrade] = useState<UpgradeTarget>();
   /** Issue #1753 — Upgrade on the Local daemon section: the CLI, the daemon, or both. */
@@ -1812,21 +1965,24 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
             <DeckAttention agents={heldOnDecks} from="overview" context={voiceContext} />
             {/*
               Issue #2312 follow-up: the counters are one button that names
-              only what needs someone (needs input, failed, daemons not
+              only what needs someone (needs input, error, daemons not
               answering) and opens the full set on hover, click or voice.
               Issue #1757: WAITING is counted beside IDLE because the TUI's
               stats bar counts it (CLAUDE.md rule 22).
             */}
             <DashboardCounters
-              summary={{ known, agents: aggregate.agents.length, needsInput: countOf("needs_input"), failed: countOf("failed"), decksUp: aggregate.decksUp, decksTotal: decks.length }}
+              summary={{ known, agents: aggregate.agents.length, needsInput: countOf("needs_input"), errors: countOf("error"), decksUp: aggregate.decksUp, decksTotal: decks.length }}
               open={countersOpen}
               onOpen={() => VOICE_ACTIONS.showDashboardCounters.run(voiceContext)}
               onClose={() => setCountersOpen(false)}
             >
               <OverviewInstrument label="AGENTS" testId="overview-count-agents"><OverviewCount known={known} value={aggregate.agents.length} /></OverviewInstrument>
-              <OverviewInstrument label="RUNNING" testId="overview-count-running"><OverviewCount known={known} value={countOf("running")} className="count-running" /></OverviewInstrument>
+              {/* Issue #2411: the daemon's words, each counted apart, as the TUI's stats bar counts them. */}
+              <OverviewInstrument label="WORKING" testId="overview-count-working"><OverviewCount known={known} value={countOf("working")} className="count-working" /></OverviewInstrument>
+              <OverviewInstrument label="THINKING" testId="overview-count-thinking"><OverviewCount known={known} value={countOf("thinking")} className="count-thinking" /></OverviewInstrument>
+              <OverviewInstrument label="COMPACTING" testId="overview-count-compacting"><OverviewCount known={known} value={countOf("compacting")} className="count-compacting" /></OverviewInstrument>
               <OverviewInstrument label="NEEDS INPUT" testId="overview-count-needs-input"><OverviewCount known={known} value={countOf("needs_input")} className="count-needs-input" /></OverviewInstrument>
-              <OverviewInstrument label="FAILED" testId="overview-count-failed"><OverviewCount known={known} value={countOf("failed")} className="count-failed" /></OverviewInstrument>
+              <OverviewInstrument label="ERROR" testId="overview-count-error"><OverviewCount known={known} value={countOf("error")} className="count-error" /></OverviewInstrument>
               <OverviewInstrument label="WAITING" testId="overview-count-waiting"><OverviewCount known={known} value={countOf("waiting")} className="count-waiting" /></OverviewInstrument>
               <OverviewInstrument label="IDLE" testId="overview-count-idle"><OverviewCount known={known} value={countOf("idle")} /></OverviewInstrument>
               <OverviewInstrument label="GROUPS" testId="overview-count-groups"><OverviewCount known={known} value={aggregate.groups} /></OverviewInstrument>
@@ -1883,6 +2039,12 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
             <div className="overview-banner" role="status" data-testid="overview-new-agent-notice">
               <span>{newAgentNotice}</span>
               <button type="button" aria-label="Dismiss" onClick={() => setNewAgentNotice(undefined)}><X size={13} /></button>
+            </div>
+          )}
+          {generationNotice && (
+            <div className="overview-banner" role="status" data-testid="overview-config-notice">
+              <span>{displayText(generationNotice, DISPLAY_LIMITS.message)}</span>
+              <button type="button" aria-label="Dismiss" onClick={() => setGenerationNotice(undefined)}><X size={13} /></button>
             </div>
           )}
           {daemonNotice && (
@@ -1983,7 +2145,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       )}
     </div>
   );
-  return <OpenAgentContext.Provider value={openAgent}><StopControlsContext.Provider value={stopControls}><RowNumbersContext.Provider value={rowNumbers}><RowCardsContext.Provider value={cards.shown ? cards : undefined}>{overviewScreen}</RowCardsContext.Provider></RowNumbersContext.Provider></StopControlsContext.Provider></OpenAgentContext.Provider>;
+  return <OpenAgentContext.Provider value={openAgent}><StopControlsContext.Provider value={stopControls}><GenerateConfigContext.Provider value={generateControls}><RowNumbersContext.Provider value={rowNumbers}><RowCardsContext.Provider value={cards.shown ? cards : undefined}>{overviewScreen}</RowCardsContext.Provider></RowNumbersContext.Provider></GenerateConfigContext.Provider></StopControlsContext.Provider></OpenAgentContext.Provider>;
 }
 
 /** One deck of the fleet, as {@link AgentOverview} prepares it for rendering. */
@@ -1999,7 +2161,7 @@ interface FleetDeck {
   shownCount: number;
   /** The agents the filter shows (all of {@link agents} while none is set): the Cards view shows their cards. */
   matchingAgents: OverviewAgent[];
-  counts: { status: AgentStatus; count: number }[];
+  counts: { status: StatusWord; count: number }[];
   connected: boolean;
 }
 
@@ -2181,6 +2343,12 @@ function DeckGroup({ deck, cardsBody, now, columns, filtering, fleetSize, overri
       aria-labelledby={titleId}
     >
       <header className="daemon-group-header">
+        {/*
+          Issue #2406: the row is its own box, so the connection message can
+          sit on a line of its own below it instead of competing with the
+          name, the Host button, the pips and the buttons for the row's width.
+        */}
+        <div className="daemon-group-header-row">
         <span className={`connection-lamp connection-${connection.status}`} aria-hidden="true" />
         <div className="daemon-identity">
           {/*
@@ -2192,17 +2360,9 @@ function DeckGroup({ deck, cardsBody, now, columns, filtering, fleetSize, overri
         </div>
         {/* PRD #1258: this deck's host, from its own daemon — a small button beside its name, coloured by the worst reading, that opens the numbers. Every deck in a fleet has its own. */}
         {deck.connected && deck.snapshot.hostMetrics && <HostMetricsButton report={deck.snapshot.hostMetrics} deckLabel={deckName(connection)} open={hostOpen} onOpen={onOpenHost} onClose={onCloseHost} />}
-        {/*
-          Only when it says something the lamp does not. The element is
-          not deleted — in the disconnected, incompatible and
-          connected-anyway states it carries the only explanation on the
-          header, including the build-mismatch caveat issue #801 requires
-          to survive the whole session.
-        */}
-        {messageSaysSomethingNew && <p className="daemon-state" data-testid="daemon-state">{daemonMessage ?? connection.status}</p>}
         {deck.connected && deck.agents.length > 0 && (
           <div className="daemon-pips">{deck.counts.map((entry) => (
-            <span className={`status-label status-${entry.status}`} key={entry.status}>{entry.count} {statusLabel(entry.status)}</span>
+            <span className={`status-label status-${entry.status}`} key={entry.status}>{entry.count} {statusWordLabel(entry.status)}</span>
           ))}</div>
         )}
         {/*
@@ -2214,6 +2374,18 @@ function DeckGroup({ deck, cardsBody, now, columns, filtering, fleetSize, overri
         {onUpgrade && !upgradeInNote && <button type="button" className="button primary compact daemon-upgrade" data-testid="daemon-upgrade" aria-label={upgradeLabel ?? `Upgrade the daemon on ${connection.deckKind === "remote" ? deckName(connection) : "this machine"}`} title={upgradeTitle} onClick={onUpgrade}><CircleArrowUp size={13} /><span>Upgrade</span></button>}
         {(onStopDaemon || stopDaemonReason) && <button type="button" className="button secondary compact daemon-stop" data-testid="daemon-stop" aria-label={`Stop the daemon on ${connection.deckKind === "remote" ? deckName(connection) : "this machine"}`} title={stopDaemonReason ? displayTitle(stopDaemonReason) : undefined} disabled={!onStopDaemon} onClick={onStopDaemon}><CircleStop size={13} /><span>Stop daemon</span></button>}
         {onNewAgent && <button type="button" className="button secondary compact daemon-new-agent" data-testid="daemon-new-agent" aria-label={`New agent on ${deckName(connection)}`} onClick={onNewAgent}><Plus size={13} /><span>New agent</span></button>}
+        </div>
+        {/*
+          Only when it says something the lamp does not. The element is
+          not deleted — in the disconnected, incompatible and
+          connected-anyway states it carries the only explanation on the
+          header, including the build-mismatch caveat issue #801 requires
+          to survive the whole session. It has a line of its own below the
+          row and wraps rather than truncating, so the whole sentence reads
+          and the row's controls keep their layout whatever its length
+          (issue #2406); with no message there is no second line.
+        */}
+        {messageSaysSomethingNew && <p className="daemon-state" data-testid="daemon-state">{daemonMessage ?? connection.status}</p>}
       </header>
 
       {/* Issue #1637: this deck's agents' hooks run an older dot-agent-deck. */}
@@ -2809,7 +2981,7 @@ function OverviewGroupCard({ group, now, columns }: { group: OverviewGroup; now:
         )}
         <span className="overview-group-count">{group.agents.length} {group.agents.length === 1 ? "agent" : "agents"}</span>
         <div className="overview-group-pips">{counts.map((entry) => (
-          <span className={`status-label status-${entry.status}`} key={entry.status}>{entry.count} {statusLabel(entry.status)}</span>
+          <span className={`status-label status-${entry.status}`} key={entry.status}>{entry.count} {statusWordLabel(entry.status)}</span>
         ))}</div>
         {/* PRD #1223 U4: the TUI's Ctrl+W on this orchestration's tab — every role, after a confirmation that names them. */}
         {stopControls && group.kind === "orchestration" && (
@@ -2907,6 +3079,7 @@ function OverviewRow({ agent, hoistedCwd, now, columns }: { agent: OverviewAgent
   */
   const openAgent = useContext(OpenAgentContext);
   const stopControls = useContext(StopControlsContext);
+  const generateControls = useContext(GenerateConfigContext);
   const openPullRequest = useContext(OpenPullRequest);
   // ONE instant for the whole screen, ticked by `useOverviewClock` so these two
   // cells keep counting between daemon events. Passed down rather than read
@@ -2931,8 +3104,8 @@ function OverviewRow({ agent, hoistedCwd, now, columns }: { agent: OverviewAgent
         // `aria-hidden` — the label beside it is already the readable value.
         return (
           <td className="overview-state" role="cell" key={column}>
-            <span className={`agent-state-mark status-${agent.status}`} aria-hidden="true" />
-            <span className={`status-label status-${agent.status}`}>{statusLabel(agent.status)}</span>
+            <span className={`agent-state-mark status-${statusWord(agent)}`} aria-hidden="true" />
+            <span className={`status-label status-${statusWord(agent)}`}>{statusWordLabel(statusWord(agent))}</span>
             {/* Issue #2387: the tile's marker, beside the status it never replaces. */}
             {agent.holdWords && <span className="held-marker" title={agent.holdWords}>{INBOX_WORDS.attentionHeld}</span>}
           </td>
@@ -2990,6 +3163,25 @@ function OverviewRow({ agent, hoistedCwd, now, columns }: { agent: OverviewAgent
                 onClick={() => stopControls.stopAgent(agent)}
               ><CircleStop size={12} /></button>
             )}
+            {/* PRD #2119 — ask this agent to write the project's `.dot-agent-deck.toml`; it opens a Yes/No confirmation, the same one `generate_config` opens by voice. */}
+            {/* Each label is written out whole, as the voice table's label check reads it (`voice_outcome_every_control_label_asks_for_its_own_row`); Update when the daemon reports the project already has a config. */}
+            {generateControls && agent.paneId && (configActionVerb(agent) === "Update" ? (
+              <button
+                className="overview-generate-config"
+                data-testid="overview-generate-config"
+                aria-label={`Update config with ${name} agent`}
+                title={`Update config with ${name}`}
+                onClick={() => VOICE_ACTIONS.confirmGenerateConfig.run(generateControls, { deckId: agent.daemonId, agentId: agent.id, from: "overview", ...(agent.incarnation ? { incarnation: agent.incarnation } : {}) })}
+              ><FileCog size={12} /></button>
+            ) : (
+              <button
+                className="overview-generate-config"
+                data-testid="overview-generate-config"
+                aria-label={`Generate config with ${name} agent`}
+                title={`Generate config with ${name}`}
+                onClick={() => VOICE_ACTIONS.confirmGenerateConfig.run(generateControls, { deckId: agent.daemonId, agentId: agent.id, from: "overview", ...(agent.incarnation ? { incarnation: agent.incarnation } : {}) })}
+              ><FileCog size={12} /></button>
+            ))}
             {rowCard && rowCards && <OverviewRowCard card={rowCard} name={name} rowKey={agentDomKey(agent)} open={rowCards.rowMenu === agentDomKey(agent)} controls={rowCards.controls} />}
           </td>
         );

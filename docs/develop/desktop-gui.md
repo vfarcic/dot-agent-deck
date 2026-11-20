@@ -14,6 +14,8 @@ cd desktop
 pnpm install
 ```
 
+`task run-desktop` and `task run-all` run `pnpm install --frozen-lockfile` in `desktop/` on every start, so you can skip this step when you start the desktop through them ([local-run.md](local-run.md)).
+
 Agent CLIs and their credentials are needed only for agents you deliberately start through the daemon. The fixture preview does not call an LLM, execute an agent command, or modify project files.
 
 ### Linux system libraries
