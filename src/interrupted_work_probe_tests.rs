@@ -194,3 +194,95 @@ fn a_deadline_runs_out_and_the_earlier_one_wins() {
         assert!(near.remaining().is_none());
     });
 }
+
+/// A repository at `<root>/repo` with one commit on `agent/dispatch-x` and a
+/// GitHub `origin`, and a fake `gh` at `<root>/bin/gh` that runs `before`
+/// (shell) and then answers one cross-repository pull request for the
+/// branch, from the fork `me/something`.
+fn repo_and_cross_repository_gh(
+    root: &Path,
+    before: &str,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let out = crate::git_env::fixture_git(&repo, root)
+            .args(args)
+            .output()
+            .expect("git available");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    };
+    git(&["init", "-q", "-b", "agent/dispatch-x", "."]);
+    std::fs::write(repo.join("a.txt"), "a").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-qm", "a"]);
+    git(&[
+        "remote",
+        "add",
+        "origin",
+        "https://github.com/someone/something.git",
+    ]);
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let gh = bin.join("gh");
+    let answer = r#"[{"state":"OPEN","headRefName":"agent/dispatch-x","isCrossRepository":true,"headRepository":{"name":"something"},"headRepositoryOwner":{"login":"me"}}]"#;
+    crate::test_isolation::write_script(
+        &gh,
+        format!("#!/bin/sh\n{before}\nprintf '%s\\n' '{answer}'\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (repo, gh)
+}
+
+/// Reviewer 3: `gh` answers a pull request from a fork, and the Git probe
+/// that reads which remote the branch is pushed to then fails (here: the
+/// repository's config was broken while `gh` ran). Whether that fork is the
+/// branch's own cannot be told, so the state is unknown, never "no pull
+/// request".
+#[test]
+fn a_failed_push_remote_lookup_leaves_the_pull_request_unknown() {
+    rt().block_on(async {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let config = root.join("repo").join(".git").join("config");
+        let (repo, gh) = repo_and_cross_repository_gh(
+            &root,
+            &format!("printf '[[[\\n' >> '{}'", config.display()),
+        );
+        let state = pr_state(
+            &repo,
+            "agent/dispatch-x",
+            gh.as_os_str(),
+            Deadline::after(Duration::from_secs(20)),
+        )
+        .await;
+        assert_eq!(state, PrFact::Unknown);
+    });
+}
+
+/// Reviewer 3: the branch names a push remote whose URLs cannot be read (no
+/// such remote), after `gh` answered a pull request from a fork: unknown,
+/// never "no pull request". A branch with no push remote at all is a
+/// successful lookup that finds none, and the fork's pull request is then
+/// someone else's: "no pull request".
+#[test]
+fn a_failed_push_url_lookup_leaves_the_pull_request_unknown() {
+    rt().block_on(async {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let (repo, gh) = repo_and_cross_repository_gh(&root, "");
+        let deadline = || Deadline::after(Duration::from_secs(20));
+
+        let none = pr_state(&repo, "agent/dispatch-x", gh.as_os_str(), deadline()).await;
+        assert_eq!(none, PrFact::None, "no push remote: a successful lookup");
+
+        let out = crate::git_env::fixture_git(&repo, &root)
+            .args(["config", "branch.agent/dispatch-x.pushRemote", "fork"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let state = pr_state(&repo, "agent/dispatch-x", gh.as_os_str(), deadline()).await;
+        assert_eq!(state, PrFact::Unknown);
+    });
+}

@@ -1055,3 +1055,99 @@ fn a_show_is_fitted_to_the_reply_budget() {
     );
     assert!(shown.item.cut);
 }
+
+/// Auditor N1: a query that parses as a full work id names that item or no
+/// item. When the item it named is gone (dismissed or reclaimed by another
+/// client), another item whose name or branch is that id string is not
+/// picked in its place.
+#[test]
+fn a_full_work_id_matches_its_item_exactly_or_nothing() {
+    let gone = work(1);
+    let mut j = Journal::default();
+    let (w2, a2) = pane(&mut j, 2);
+    j.ended(&w2, &a2, EndHow::Interrupted);
+    let base = derive_in(&j, Vec::new(), &[]);
+    assert_eq!(ids(&base), vec![w2.clone()]);
+    let id_of = |r: Resolved<'_>| match r {
+        Resolved::One(item) => Some(item.id.clone()),
+        _ => None,
+    };
+
+    let mut named = base.clone();
+    named.items[0].name = Some(gone.to_string());
+    assert_eq!(resolve(&named, gone.as_str()), Resolved::NotListed);
+    assert_eq!(
+        resolve(&named, &format!("  {gone} ")),
+        Resolved::NotListed,
+        "surrounding blanks do not turn a full id into a name"
+    );
+
+    let mut branched = base.clone();
+    branched.items[0].branch = Some(gone.to_string());
+    assert_eq!(resolve(&branched, gone.as_str()), Resolved::NotListed);
+
+    // The item is still found by its own id, and a name that is not a work
+    // id still resolves.
+    assert_eq!(id_of(resolve(&named, w2.as_str())), Some(w2.clone()));
+    let mut plain = base.clone();
+    plain.items[0].name = Some("fix-login".into());
+    assert_eq!(id_of(resolve(&plain, "fix-login")), Some(w2));
+}
+
+/// Reviewer 5: an item's roles are in the order the journal first records
+/// them, across all of its works: a delegation's role recorded before a
+/// later root attempt's role comes first.
+#[test]
+fn an_items_roles_are_in_the_order_the_journal_first_records_them() {
+    let mut j = Journal::default();
+    let team = work(1);
+    let lead = attempt(OLD, 1);
+    let coder = attempt(OLD, 2);
+    let task = work(2);
+    let with_role = |j: &mut Journal, w: &WorkId, a: &AttemptId, role: &str| {
+        j.push(
+            OLD,
+            Event::AttemptStarted {
+                work: w.clone(),
+                attempt: a.clone(),
+                pane: "pane".into(),
+                agent: 1,
+                role: Some(role.into()),
+            },
+        );
+    };
+    j.opened(&team, Launch::Orchestration, None, Refs::default(), None);
+    j.opened(
+        &task,
+        Launch::Delegation,
+        Some(&team),
+        Refs {
+            role: Some("coder".into()),
+            ..Refs::default()
+        },
+        None,
+    );
+    with_role(&mut j, &task, &coder, "coder");
+    with_role(&mut j, &team, &lead, "tester");
+    j.ended(&team, &lead, EndHow::Interrupted);
+
+    let list = derive_in(&j, Vec::new(), &[]);
+    assert_eq!(ids(&list), vec![team]);
+    assert_eq!(
+        list.items[0].progress.roles,
+        vec!["coder".to_string(), "tester".to_string()]
+    );
+}
+
+/// Auditor N2 / reviewer 2: a dismissed item's name is a display string
+/// like any other a reply carries, so it is cut to `MAX_FIELD_BYTES`.
+#[test]
+fn a_dismissed_items_name_is_cut_to_the_field_bound() {
+    let mut outcome = DismissOutcome::default();
+    outcome.push_dismissed(DismissedItem {
+        id: work(1).to_string(),
+        name: Some("n".repeat(80 * 1024)),
+    });
+    let name = outcome.dismissed[0].name.as_deref().unwrap();
+    assert!(name.len() <= MAX_FIELD_BYTES, "{}", name.len());
+}

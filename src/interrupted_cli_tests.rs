@@ -437,3 +437,34 @@ fn a_capped_dismissal_report_counts_what_it_left_out() {
     );
     assert_eq!(out.code, EXIT_REFUSED);
 }
+
+/// Auditor N3: Unicode bidi controls in a name, branch or path read from the
+/// journal (a branch name Git accepts can carry U+202E) cannot reorder what
+/// the person reads: none survives into the list, the show or a reclaim's
+/// answer, and the text around them still shows.
+#[test]
+fn bidi_controls_from_the_journal_cannot_reorder_the_text() {
+    use crate::untrusted_text::is_bidi_format_char;
+    let live = |text: &str| text.chars().any(is_bidi_format_char);
+    let mut unit = item(UNIT_ID, ItemKind::Unit, "fix\u{202e}nigol");
+    unit.branch = Some("agent/\u{202e}txt.exe".into());
+    unit.worktree = Some("/work/\u{2066}a\u{2069}".into());
+    unit.launcher = Some("caller\u{200f}".into());
+    let text = render_item(&unit);
+    assert!(!live(&text), "{text:?}");
+    assert!(text.contains("txt.exe") && text.contains("nigol"), "{text}");
+    let show = render_show(&InterruptedShow {
+        item: unit.clone(),
+        reports: Vec::new(),
+        incomplete: false,
+        bodies_omitted: 0,
+    });
+    assert!(!live(&show), "{show:?}");
+
+    let mut reclaimed = outcome(ReclaimVerdict::Removed);
+    reclaimed.worktree = unit.worktree.clone();
+    reclaimed.branch = unit.branch.clone();
+    reclaimed.nested_worktrees = vec!["/work/\u{202d}inner".into()];
+    let out = render_reclaim(&reclaimed);
+    assert!(!live(&out.stdout) && !live(&out.stderr), "{out:?}");
+}

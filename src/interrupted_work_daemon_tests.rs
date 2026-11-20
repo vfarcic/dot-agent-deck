@@ -922,3 +922,158 @@ fn show_refuses_a_report_that_is_not_the_items() {
         assert_eq!(shown.item.progress.attempts, 2);
     });
 }
+
+/// A dispatched unit, interrupted, whose `opened` names it `unit_id` and
+/// records `branch`.
+fn interrupted_unit_named(
+    registry: &AgentPtyRegistry,
+    agent: u64,
+    unit_id: &str,
+    branch: &str,
+    workspace: Option<&Path>,
+) -> WorkId {
+    let journal = journal(registry);
+    let work = journal.mint_work_id().unwrap();
+    let attempt = AttemptId::new(RUN, agent).unwrap();
+    record(
+        registry,
+        Event::Opened {
+            work: work.clone(),
+            launch: Launch::Dispatch,
+            parent: None,
+            refs: Box::new(Refs {
+                branch: Some(branch.to_string()),
+                unit_id: Some(unit_id.to_string()),
+                ..Refs::default()
+            }),
+            workspace: workspace.and_then(|path| journal.workspace(path)),
+        },
+    );
+    record(
+        registry,
+        Event::AttemptStarted {
+            work: work.clone(),
+            attempt: attempt.clone(),
+            pane: format!("pane-{agent}"),
+            agent,
+            role: None,
+        },
+    );
+    record(
+        registry,
+        Event::AttemptEnded {
+            work: work.clone(),
+            attempt,
+            how: EndHow::Interrupted,
+            code: None,
+            cause: None,
+        },
+    );
+    work
+}
+
+/// Auditor N1: the person confirmed item A by its full id, and A was
+/// dismissed by another client before their request arrived. Item B, whose
+/// name is A's id, is not dismissed or reclaimed in A's place: both
+/// requests are refused as not listed, and B's journal and clean, owned
+/// worktree are left as they were.
+#[test]
+fn a_stale_full_id_is_refused_rather_than_retargeted_to_another_item() {
+    rt().block_on(async {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let root_dir = std::fs::canonicalize(tmp.path()).unwrap();
+        let (_repo, wt) = repo_with_worktree(&root_dir);
+        mark(&wt);
+        let registry = registry_with_journal(&root_dir.join("state"), JournalOptions::default());
+        let a = interrupted_work(&registry, 1, Launch::Pane, None, None, None);
+        let gone = dismiss(&registry, vec![a.to_string()], false, None).await;
+        assert_eq!(gone.dismissed.len(), 1, "{gone:?}");
+        let b = interrupted_unit_named(&registry, 2, a.as_str(), "agent/dispatch-x", Some(&wt));
+        let now = listed(&registry).await;
+        assert_eq!(now.items.len(), 1);
+        assert_eq!(now.items[0].id, b);
+        assert_eq!(now.items[0].name.as_deref(), Some(a.as_str()));
+        let closes_before = closes(&registry);
+
+        let dismissed = dismiss(&registry, vec![a.to_string()], false, None).await;
+        assert!(dismissed.dismissed.is_empty(), "{dismissed:?}");
+        assert_eq!(dismissed.refused.len(), 1, "{dismissed:?}");
+        assert_eq!(
+            dismissed.refused[0].refusal.reason,
+            RefusalReason::NotListed
+        );
+
+        let reclaimed = reclaim(&registry, a.to_string(), false, None).await;
+        assert_eq!(
+            reason_of(&reclaimed),
+            Some(RefusalReason::NotListed),
+            "{reclaimed:?}"
+        );
+        assert!(wt.is_dir(), "B's worktree is not removed");
+        assert_eq!(closes(&registry), closes_before, "nothing more was closed");
+        assert_eq!(listed(&registry).await.items.len(), 1, "B is still listed");
+
+        // B is still reached by its own id.
+        let dry = reclaim(&registry, b.to_string(), true, None).await;
+        assert_eq!(dry.verdict, ReclaimVerdict::WouldRemove, "{dry:?}");
+    });
+}
+
+/// Auditor N2 / reviewer 2: items whose launch records carry names as long
+/// as the record reader accepts are dismissed, and the dismissal's answer
+/// still fits the reply budget (and so the attach frame): each name is cut
+/// to the field bound, and every item dismissed is reported or counted.
+#[test]
+fn a_dismissal_of_items_with_oversized_names_fits_its_reply() {
+    use crate::interrupted_work::{MAX_FIELD_BYTES, json_len};
+    use crate::launch_records::{LaunchRecord, SCHEMA_VERSION};
+    rt().block_on(async {
+        let state = crate::test_temp::tempdir().unwrap();
+        let registry = registry_with_journal(state.path(), JournalOptions::default());
+        let items = 48usize;
+        let name_bytes = 200 * 1024;
+        for n in 0..items {
+            let agent = n as u64 + 10;
+            let work = interrupted_work(&registry, agent, Launch::Pane, None, None, None);
+            crate::launch_records::write(
+                state.path(),
+                &LaunchRecord {
+                    v: SCHEMA_VERSION,
+                    work,
+                    attempt: AttemptId::new(RUN, agent).unwrap(),
+                    command: None,
+                    shell: None,
+                    agent_type: None,
+                    cwd: None,
+                    cwd_moved_from: None,
+                    name: Some(format!("{n:04}{}", "n".repeat(name_bytes))),
+                    role: None,
+                    orchestration: None,
+                    orchestration_id: None,
+                    ts_ms: 1,
+                },
+            )
+            .expect("write a launch record");
+        }
+        let before = listed(&registry).await;
+        assert_eq!(before.items.len() + before.omitted, items);
+
+        let outcome = dismiss(&registry, Vec::new(), true, None).await;
+        assert_eq!(outcome.refusal, None);
+        let size = json_len(&outcome);
+        assert!(
+            size <= MAX_REPLY_BYTES,
+            "the dismissal answer is {size} bytes"
+        );
+        assert!(
+            outcome
+                .dismissed
+                .iter()
+                .all(|d| d.name.as_ref().is_none_or(|n| n.len() <= MAX_FIELD_BYTES)),
+            "every name is cut to the field bound"
+        );
+        assert_eq!(outcome.dismissed.len() + outcome.dismissed_omitted, items);
+        assert_eq!(closes(&registry).len(), items);
+        assert!(listed(&registry).await.items.is_empty());
+    });
+}
