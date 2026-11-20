@@ -35,6 +35,9 @@ Modes:
            deck's resolver reads the same files in the Rust test)
   forms    M44e: candidate wire forms of Ctrl+G in several states, whole and
            split, and a bracketed-paste BEL
+  cwd      issue #2130: Codex's status line and Ctrl+G after `/cd` into a
+           project that binds the editor to F6, and back
+  worktree issue #2130: the same after `/worktree` (git `work`)
 """
 import hashlib
 import json
@@ -783,6 +786,126 @@ class Recorder:
             row['exit_status'] = s.exit_status
             self.rows.append(row)
 
+
+    # ---- cwd and worktree (issue #2130) ------------------------------------
+    #
+    # Codex's `/cd` and `/worktree` move its session to another directory
+    # without a chdir: what its status line then shows, and whether Ctrl+G
+    # still opens the editor when the new directory's trusted project file
+    # binds the editor to F6. `cwd`: launches at 50 x 200 and 24 x 80, each
+    # started in `work` (outside HOME) and in `~/plain`, then `/cd` into
+    # `other` (outside HOME), `~/proj` and a long path, each binding F6, and
+    # back to where it started. `worktree`: `/worktree` from a git `work`,
+    # continuing the conversation in the new checkout.
+
+    def footer(self, s, n=4):
+        rows = s.screen.display
+        return [r.rstrip() for r in rows[-n:]]
+
+    def cwd_seed(self):
+        f6 = '[tui.keymap.global]\nopen_external_editor = "f6"\n'
+        dirs = {'other': self.root / 'other', 'hproj': self.home / 'proj', 'hplain': self.home / 'plain',
+                'long': self.root / ('l' * 60) / ('m' * 60) / 'proj'}
+        extra = ''
+        for k, d in dirs.items():
+            d.mkdir(parents=True, exist_ok=True)
+            extra += f'[projects."{d}"]\ntrust_level = "trusted"\n\n'
+        extra += f'[projects."{self.home}"]\ntrust_level = "trusted"\n\n'
+        self.seed(extra)
+        for k in ('other', 'hproj', 'long'):
+            (dirs[k] / '.codex').mkdir(exist_ok=True)
+            (dirs[k] / '.codex/config.toml').write_text(f6)
+        return dirs
+
+    def probe_keys(self, s, label):
+        g = self.invoke(s, '\x07', f'{label}-ctrl-g', {'action': 'keep'}, timeout=2)
+        s.reset()
+        f = self.invoke(s, F6, f'{label}-f6', {'action': 'keep'}, timeout=2)
+        s.reset()
+        return {'ctrl_g_opened': g['opened'], 'f6_opened': f['opened']}
+
+    def slash(self, s, line, label, wait=4):
+        s.send(line, label + '-text')
+        s.pump(.6)
+        popup = s.text()
+        s.send('\r', label + '-enter')
+        s.pump(wait)
+        return popup
+
+    def run_cwd(self):
+        global ROWS, COLS
+        dirs = self.cwd_seed()
+        env = {'VISUAL': self.editor_command('cwd')}
+        out = []
+        for (rows, cols) in ((50, 200), (24, 80)):
+            ROWS, COLS = rows, cols
+            for start_key, start in (('work', self.work), ('hplain', dirs['hplain'])):
+                name = f'cwd-{start_key}-{rows}x{cols}'
+                s = Session(self, name, env, (), cwd=start)
+                row = {'launch': name, 'spawn_cwd': str(start), 'steps': []}
+                try:
+                    ok = s.wait(s.ready, 30)
+                    s.pump(SETTLE)
+                    row['ready'] = ok
+                    row['start_footer'] = self.footer(s)
+                    row['start_screen'] = s.text()
+                    row['start_keys'] = self.probe_keys(s, name + '-start')
+                    for target_key in ('other', 'hproj', 'long', 'start'):
+                        target = start if target_key == 'start' else dirs[target_key]
+                        popup = self.slash(s, f'/cd {target}', f'{name}-cd-{target_key}')
+                        step = {'cd': target_key, 'target': str(target), 'popup_before_enter': popup,
+                                'footer': self.footer(s), 'screen': s.text(), 'composer': s.composer()}
+                        s.reset()
+                        step['keys'] = self.probe_keys(s, f'{name}-cd-{target_key}')
+                        step['footer_after_keys'] = self.footer(s)
+                        row['steps'].append(step)
+                except Exception as exc:
+                    import traceback
+                    row['error'] = repr(exc) + traceback.format_exc()
+                    row['screen'] = s.text()
+                finally:
+                    try:
+                        s.close()
+                    except OSError:
+                        pass
+                out.append(row)
+        ROWS, COLS = 50, 200
+        self.rows.extend(out)
+
+    def run_worktree(self):
+        self.cwd_seed()
+        env = {'VISUAL': self.editor_command('worktree'), 'GIT_CONFIG_NOSYSTEM': '1'}
+        git = ['git', '-C', str(self.work), '-c', 'user.email=recorder@invalid', '-c', 'user.name=recorder']
+        subprocess.run(['git', 'init', '-q', '-b', 'main', str(self.work)], check=True)
+        subprocess.run(git + ['commit', '-q', '--allow-empty', '-m', 'init'], check=True)
+        s = Session(self, 'worktree', env, (), cwd=self.work)
+        row = {'launch': 'worktree', 'spawn_cwd': str(self.work)}
+        try:
+            row['ready'] = s.wait(s.ready, 30)
+            s.pump(SETTLE)
+            row['start_footer'] = self.footer(s)
+            row['start_keys'] = self.probe_keys(s, 'worktree-start')
+            row['popup'] = self.slash(s, '/worktree', 'worktree', wait=3)
+            row['menu'] = s.text()
+            # The menu's first entry: continue this conversation in the new
+            # checkout.
+            s.send('\r', 'worktree-continue')
+            s.pump(6)
+            row['footer'] = self.footer(s)
+            row['screen'] = s.text()
+            s.reset()
+            row['keys'] = self.probe_keys(s, 'worktree-moved')
+        except Exception as exc:
+            import traceback
+            row['error'] = repr(exc) + traceback.format_exc()
+            row['screen'] = s.text()
+        finally:
+            try:
+                s.close()
+            except OSError:
+                pass
+        self.rows.append(row)
+
     # ---- forms (M44e) -----------------------------------------------------
 
     def run_forms(self):
@@ -856,7 +979,7 @@ def inner(mode, root, binary, release, digest, pyte_path):
     try:
         {'editor': rec.run_editor, 'startup': rec.run_startup, 'config-writes': rec.run_config_writes,
          'e1f': rec.run_e1f, 'keymap': rec.run_keymap,
-         'forms': rec.run_forms}[mode]()
+         'forms': rec.run_forms, 'cwd': rec.run_cwd, 'worktree': rec.run_worktree}[mode]()
     except Exception as exc:
         import traceback
         error = repr(exc) + '\n' + traceback.format_exc()

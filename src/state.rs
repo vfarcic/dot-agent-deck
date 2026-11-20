@@ -3188,7 +3188,7 @@ fn is_frame_breaking(c: char) -> bool {
 /// invisible marks that reorder or hide surrounding text without changing a
 /// byte of it. Split out for [`frame_untrusted_report_for_file`], which keeps a
 /// report's brackets and line structure but must not keep these.
-fn rewrites_how_text_reads(c: char) -> bool {
+pub(crate) fn rewrites_how_text_reads(c: char) -> bool {
     c.is_control()
         || matches!(
             c,

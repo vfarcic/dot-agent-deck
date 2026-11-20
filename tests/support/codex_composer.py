@@ -80,6 +80,29 @@ original_terminal = termios.tcgetattr(0) if os.isatty(0) else None
 tty.setraw(0, termios.TCSANOW)
 
 
+def status_line(cols):
+    """Codex 0.164.0's status line: model and reasoning, then the folder it
+    works in as Codex spells it (`~` for HOME and below it, component-wise,
+    else the absolute path), cut short with `…` where it would pass the
+    pane's edge (issue #2130: the deck compares that folder with the one
+    the agent was bound in)."""
+    from pathlib import PurePosixPath
+    cwd = os.getcwd()
+    home = os.environ.get('HOME') or ''
+    shown = cwd
+    if home:
+        try:
+            rel = PurePosixPath(cwd).relative_to(PurePosixPath(home))
+            shown = '~' if str(rel) == '.' else '~/' + str(rel)
+        except ValueError:
+            pass
+    line = 'gpt-test low \u00b7 ' + shown
+    width = max(cols - 2, 1)
+    if len(line) > width:
+        line = line[:width - 1] + '\u2026'
+    return line
+
+
 def positionals(argv):
     # Codex takes `-c key=value` anywhere: the deck puts its embedded-mode
     # pair first (#2002) and an installed spawn's editor settings last.
@@ -296,7 +319,7 @@ def redraw():
     else:
         out += b'\x1b[2mAsk Codex to do anything\x1b[0m'
     below = len(lines) - 1
-    out += at(prompt_row + below + 2, 2) + b'gpt-test low \xc2\xb7 ~/work'
+    out += at(prompt_row + below + 2, 2) + status_line(cols).encode()
     if not composer:
         out += at(prompt_row + 3, 2) + b'? for shortcuts'
     shown = len(lines[-1])
