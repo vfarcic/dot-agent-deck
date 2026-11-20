@@ -228,3 +228,132 @@ fn codex_022_live_untrusted_hooks_a_model_run_fetch_delivers_on_receipts() {
         "the sentinel is written once"
     );
 }
+
+/// Issue #2346: start real Codex whose deck hooks, after printing a
+/// hand-over, hold while `hold` exists; answers Codex, `hold` and the folder
+/// holding it, which must outlive the test.
+fn holding_codex() -> (Codex, std::path::PathBuf, tempfile::TempDir) {
+    let dir = common::harness_tempdir().unwrap();
+    let hold = dir.path().join("hold-after-print");
+    let knob = hold.to_str().expect("a UTF-8 path").to_string();
+    let codex = Codex::with_pane_env(
+        false,
+        true,
+        &[(
+            dot_agent_deck::inbox_oneshot::ENV_TEST_HOLD_AFTER_PRINT,
+            knob.as_str(),
+        )],
+    );
+    (codex, hold, dir)
+}
+
+/// Issue #2346: with a deck hook holding after it printed `id`'s hand-over,
+/// interrupt Codex (Esc) in that window, release the hook, and check `id`
+/// is neither acted on nor acknowledged for longer than the witness
+/// watches; then have Codex take its messages and check it acts on `id`
+/// once (one appended line), settled by its receipt with two deliveries.
+fn interrupted_hand_over_is_handed_again(
+    codex: &Codex,
+    hold: &std::path::Path,
+    id: &str,
+    name: &str,
+) {
+    let mut held = hold.as_os_str().to_owned();
+    held.push(".held");
+    let held = std::path::PathBuf::from(held);
+    assert!(
+        common::wait_until(BUDGET, || held.exists()),
+        "a deck hook must print the hand-over and hold; {}",
+        codex.evidence()
+    );
+    let mut input = codex.input("\x1b");
+    codex.wait_screen("Conversation interrupted");
+    std::fs::remove_file(hold).unwrap();
+    let sentinel = codex.deck.workdir().join(name);
+    assert!(
+        !common::wait_until(Duration::from_secs(30), || {
+            sentinel.exists()
+                || inbox::listing(&codex.deck, &codex.pane)["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|m| m["id"] == id && m["state"] == "acknowledged")
+        }),
+        "an interrupted hand-over is not acknowledged; {}",
+        codex.evidence()
+    );
+    // The deck may ring Codex again by itself; if it has not, ask Codex.
+    if !common::wait_until(Duration::from_secs(45), || sentinel.exists()) {
+        input.write("Check for new deck messages and do what they say.");
+        codex.wait_screen("Check for new deck messages");
+        input.write("\r");
+    }
+    codex.done(id, name);
+    assert_eq!(
+        std::fs::read_to_string(&sentinel).unwrap(),
+        "codex-inbox-action\n",
+        "Codex acted on the task once; {}",
+        codex.evidence()
+    );
+    let summary = inbox::listing(&codex.deck, &codex.pane)["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == id)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(summary["deliveries"], 2, "{summary}; {}", codex.evidence());
+}
+
+/// Scenario: Start interactive Codex whose deck hooks hold after printing a hand-over, and post a sentinel task while it is idle. The deck rings Codex (or, if a starved machine makes the deck withdraw its ring, the test submits the same doorbell line), Codex's real prompt hook prints the task as its context and holds, and the test presses Esc in Codex's pane, so Codex interrupts the turn and drops what the hook printed. The task must not be acted on or acknowledged for longer than the deck watches Codex's session log; once Codex takes its messages again it writes the sentinel once and the task is settled by its receipt with two deliveries.
+#[spec("inbox/codex/031")]
+#[test]
+fn codex_031_live_interrupted_doorbell_hand_over_is_handed_again() {
+    skip_unless!(common::check_codex_available());
+    skip_unless!(live::codex_facts_admit_installed_release());
+    let (codex, hold, _dir) = holding_codex();
+    std::fs::write(&hold, b"").unwrap();
+    let name = "codex-interrupted-doorbell-3d81.txt";
+    let id = codex.post(name);
+    // On a starved machine the deck can withdraw its own ring before Codex
+    // submits it, and then holds the task until Codex takes a prompt; the
+    // ring is `inbox/codex/009`'s to pin. What this test needs is Codex's
+    // prompt hook handing the task over, so it then submits the same
+    // doorbell line itself.
+    let mut held = hold.as_os_str().to_owned();
+    held.push(".held");
+    let held = std::path::PathBuf::from(held);
+    let withdrawn = || codex.log().contains("doorbell ring withdrawn");
+    if !common::wait_until(BUDGET, || held.exists() || withdrawn()) || !held.exists() {
+        let line = inbox::fixed_line(&id);
+        let mut input = codex.input(line.trim_start());
+        codex.wait_screen(&id);
+        input.write("\r");
+    }
+    interrupted_hand_over_is_handed_again(&codex, &hold, &id, name);
+}
+
+/// Scenario: Start interactive Codex whose deck hooks hold after printing a hand-over, submit a slow shell directive, and post a sentinel task while its tool runs. At the turn's end Codex's real Stop hook prints the task as its block reason and holds, and the test presses Esc in Codex's pane, so Codex interrupts the turn and drops the reason. The task must not be acted on or acknowledged for longer than the deck watches Codex's session log; once Codex takes its messages again it writes the sentinel once and the task is settled by its receipt with two deliveries.
+#[spec("inbox/codex/032")]
+#[test]
+fn codex_032_live_interrupted_stop_hand_over_is_handed_again() {
+    skip_unless!(common::check_codex_available());
+    let (codex, hold, _dir) = holding_codex();
+    let mut input = codex.input("Run pwd, then run exactly this in the directory it prints: printf busy > codex-hold-started.txt; sleep 20. Then reply BUSY-DONE and end your turn.");
+    codex.wait_screen("codex-hold-started.txt");
+    input.write("\r");
+    assert!(
+        common::wait_until(BUDGET, || codex
+            .deck
+            .workdir()
+            .join("codex-hold-started.txt")
+            .exists()),
+        "slow directive must start; {}",
+        codex.evidence()
+    );
+    std::fs::write(&hold, b"").unwrap();
+    let name = "codex-interrupted-stop-9a4c.txt";
+    let id = codex.post(name);
+    interrupted_hand_over_is_handed_again(&codex, &hold, &id, name);
+    assert!(codex.log().contains("TurnEndHook"), "{}", codex.evidence());
+}
