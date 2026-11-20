@@ -3355,6 +3355,7 @@ mod tests {
                     pane_id: "disp".to_string(),
                     agent_id: "nobody".to_string(),
                 },
+                existing_dir: false,
             };
             let caller = crate::dispatch_return::DispatchCaller {
                 pane_id: "disp".to_string(),
@@ -3684,6 +3685,7 @@ mod tests {
                     pane_id: "disp".to_string(),
                     agent_id: "nobody".to_string(),
                 },
+                existing_dir: false,
             };
             let caller = crate::dispatch_return::DispatchCaller {
                 pane_id: "disp".to_string(),
