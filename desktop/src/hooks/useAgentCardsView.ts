@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { actionBySpokenLabel, cardTarget, disabledReasonSentence, placeCards, placedCardKey, pruneCardResults, readOverviewMode, sendableUnread, stepCard, writeOverviewMode, type CardOverlayStep, type CardResults, type CardStep, type OverviewMode, type PlacedCard } from "../lib/agentCards";
+import { cardTree, needsYouPath, pruneOpenCards, readOpenCards, referenceUrl, writeOpenCards } from "../lib/agentCardsTree";
 import { newCardRequestId } from "../lib/bridge";
+import type { CardReferenceTarget } from "../lib/prBrowser";
 import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
 import type { AgentCardRef, VoiceActionContext } from "../lib/voiceActions";
 import type { AgentCardAction, DeckRuntimeState } from "../types";
@@ -19,8 +21,13 @@ export const NO_CARDS = "There are no cards to show.";
 /** …when voice named an action whose text the agent wrote: its card opens at the review step instead of sending. */
 export const agentWrittenReview = (label: string, name: string) => `${name} wrote the text of ${label}, so its card is open for you to read it first: press Send to send it.`;
 
+/** …when voice asks for a card's tree on a card with nothing under it. */
+export const nothingUnder = (name: string) => `${name} has no cards under it.`;
+/** …when a reference is asked for and this window cannot open GitHub pages. */
+export const NO_REFERENCE_OPENER = "This window cannot open GitHub pages.";
+
 /** The card members the overview serves, every one of them. */
-export type AgentCardControls = Pick<VoiceActionContext, "setOverviewMode" | "showAgentCard" | "stepAgentCard" | "setNeedsYouFilter" | "closeAgentCard" | "runCardAction" | "replyToAgentCard" | "confirmCardAction" | "toggleOverviewRowMenu">;
+export type AgentCardControls = Pick<VoiceActionContext, "setOverviewMode" | "showAgentCard" | "stepAgentCard" | "setNeedsYouFilter" | "closeAgentCard" | "runCardAction" | "replyToAgentCard" | "confirmCardAction" | "toggleOverviewRowMenu" | "setCardTree" | "openCardReference">;
 
 /** The overlay as the overview renders it. */
 export interface CardOverlayView {
@@ -43,6 +50,10 @@ export interface AgentCardsView {
   placed: PlacedCard[];
   /** The deck ids that have cards (their daemon supports them). */
   decksWithCards: ReadonlySet<string>;
+  /** Issue #2418 — the cards whose tree is open, by placed key (remembered per client). */
+  openCards: ReadonlySet<string>;
+  /** Issue #2418 — whether a deck's daemon builds the card tree; an older one's cards are all roots. */
+  treeFor: (deckId: string) => boolean;
   overlay: CardOverlayView | undefined;
   /** The table row whose ⋯ menu is open. */
   rowMenu: string | undefined;
@@ -66,11 +77,13 @@ function sameIncarnation(card: PlacedCard, incarnation: string | undefined): boo
  * sends what the daemon decided; the only things decided here are the user's
  * own choices (view, filter, which card is open).
  */
-export function useAgentCardsView({ runtime, decks, openAgent }: {
+export function useAgentCardsView({ runtime, decks, openAgent, openReference }: {
   runtime: Pick<DeckRuntimeState, "agentCards" | "invokeCardAction">;
   decks: readonly { deckId: string | undefined; connected: boolean }[];
   /** Open an agent's pane — a card's `open` action. */
   openAgent: (target: { deckId: string; agentId: string; incarnation?: string }) => void;
+  /** Issue #2418 — open a checked pull request or issue in the app's GitHub browser; absent where there is none. */
+  openReference?: (target: CardReferenceTarget) => string | undefined;
 }): AgentCardsView {
   const shown = runtime.agentCards !== undefined;
   const [storedMode, setStoredMode] = useState<OverviewMode>(readOverviewMode);
@@ -81,9 +94,25 @@ export function useAgentCardsView({ runtime, decks, openAgent }: {
   const [rowMenu, setRowMenu] = useState<string>();
   const placed = useMemo(() => (shown ? placeCards(decks, runtime.agentCards) : []), [decks, runtime.agentCards, shown]);
   const decksWithCards = useMemo(() => new Set(shown ? Object.keys(runtime.agentCards ?? {}) : []), [runtime.agentCards, shown]);
+  const treeFor = useCallback((deckId: string) => runtime.agentCards?.[deckId]?.tree === true, [runtime.agentCards]);
+  const [openCards, setOpenCards] = useState<ReadonlySet<string>>(readOpenCards);
   /* The latest committed state, for members a dispatch calls after a render. */
-  const latest = useRef({ placed, open, shown });
-  latest.current = { placed, open, shown };
+  const latest = useRef({ placed, open, shown, treeFor, openReference });
+  latest.current = { placed, open, shown, treeFor, openReference };
+  /* Every change to the open cards is remembered; one this window cannot
+     store still applies until it closes. */
+  const changeOpenCards = useCallback((change: (current: ReadonlySet<string>) => ReadonlySet<string>) => {
+    setOpenCards((current) => {
+      const next = change(current);
+      if (next !== current) writeOpenCards(next);
+      return next;
+    });
+  }, []);
+  /* A remembered open card its daemon no longer lists goes (a deck not on
+     screen keeps what it had). */
+  useEffect(() => {
+    if (shown) changeOpenCards((current) => pruneOpenCards(current, placed));
+  }, [changeOpenCards, placed, shown]);
 
   const cardFor = useCallback((deckId: string, agentId: string, incarnation?: string) => (
     placed.find((card) => card.deckId === deckId && card.entry.agent_id === agentId && sameIncarnation(card, incarnation))
@@ -149,6 +178,13 @@ export function useAgentCardsView({ runtime, decks, openAgent }: {
     setNeedsYouFilter: (on) => {
       if (!latest.current.shown) return CARDS_HIDDEN;
       setNeedsYouOnly(on);
+      /* Needs you only opens the path to every card that needs the user. */
+      if (on) {
+        const { placed: listed, treeFor: tree } = latest.current;
+        const deckIds = [...new Set(listed.map((card) => card.deckId))];
+        const wanted = deckIds.flatMap((deckId) => [...needsYouPath(cardTree(listed.filter((card) => card.deckId === deckId), tree(deckId))).open]);
+        if (wanted.length) changeOpenCards((current) => (wanted.every((key) => current.has(key)) ? current : new Set([...current, ...wanted])));
+      }
       // The filter is the Cards view's: asking for it shows that view.
       if (on) remember("cards");
       return undefined;
@@ -229,7 +265,45 @@ export function useAgentCardsView({ runtime, decks, openAgent }: {
       setOpen({ key: current.key, name: current.name });
     },
     toggleOverviewRowMenu: (rowKey) => setRowMenu((current) => (current === rowKey ? undefined : rowKey)),
-  }), [find, openAgent, remember, send]);
+    setCardTree: (ref, wantOpen) => {
+      if (!latest.current.shown) return CARDS_HIDDEN;
+      const card = find(ref);
+      if (!card) return CARD_GONE;
+      const name = displayText(card.entry.name, DISPLAY_LIMITS.name);
+      const { placed: listed, treeFor: tree } = latest.current;
+      const hasChildren = tree(card.deckId) && listed.some((other) => other.deckId === card.deckId && other.entry.instance_id === card.entry.instance_id && other.entry.parent === card.entry.key && other.entry.key !== card.entry.key);
+      if (!hasChildren) return nothingUnder(name);
+      const cardKey = placedCardKey(card);
+      changeOpenCards((current) => {
+        if (current.has(cardKey) === wantOpen) return current;
+        const next = new Set(current);
+        if (wantOpen) next.add(cardKey);
+        else next.delete(cardKey);
+        return next;
+      });
+      // The tree is the Cards view's: asking for it shows that view.
+      remember("cards");
+      return undefined;
+    },
+    openCardReference: (ref, kind, url) => {
+      if (!latest.current.shown) return CARDS_HIDDEN;
+      const card = find(ref);
+      if (!card) return CARD_GONE;
+      const name = displayText(card.entry.name, DISPLAY_LIMITS.name);
+      const what = kind === "pull_request" ? "pull request" : "issue";
+      const refs = (latest.current.treeFor(card.deckId) ? card.entry.checked_refs ?? [] : []).filter((candidate) => candidate.kind === kind && (url === undefined || candidate.url === url));
+      if (refs.length === 0) return `${name}'s card names no ${what}.`;
+      const checked = refs.find((candidate) => candidate.result.status === "checked" && candidate.number !== undefined && referenceUrl(candidate) !== undefined);
+      if (!checked || checked.number === undefined) {
+        const first = refs[0];
+        const why = first.result.status === "pending" ? "the deck has not checked it yet" : "the deck could not check it";
+        return `${name}'s ${what} ${displayText(first.claim, DISPLAY_LIMITS.name)} does not open: ${why}.`;
+      }
+      const opener = latest.current.openReference;
+      if (!opener) return NO_REFERENCE_OPENER;
+      return opener({ deckId: card.deckId, agentId: card.entry.agent_id, kind, number: checked.number, url: referenceUrl(checked) as string });
+    },
+  }), [changeOpenCards, find, openAgent, remember, send]);
 
   const overlay = useMemo<CardOverlayView | undefined>(() => {
     if (!open || !shown) return undefined;
@@ -250,5 +324,5 @@ export function useAgentCardsView({ runtime, decks, openAgent }: {
   ), [controls, overlayOpen]);
 
   const resultsFor = useCallback((card: PlacedCard) => results[placedCardKey(card)] ?? {}, [results]);
-  return { shown, mode, needsYouOnly, placed, decksWithCards, overlay, rowMenu, controls, voice, cardFor, resultsFor };
+  return { shown, mode, needsYouOnly, placed, decksWithCards, openCards, treeFor, overlay, rowMenu, controls, voice, cardFor, resultsFor };
 }

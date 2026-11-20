@@ -208,6 +208,19 @@ pub fn classify(url: &Url) -> Navigation {
 /// `https://github.com/<owner>/<repo>/pull/<number>`, nothing else. The
 /// daemon's URL comes from `gh`, so this is a check rather than a filter.
 pub fn is_pull_request_url(url: &Url) -> bool {
+    is_numbered_github_page(url, "pull")
+}
+
+/// Issue #2418: whether `url` is an issue page this browser may be opened on,
+/// `https://github.com/<owner>/<repo>/issues/<number>` — the address of an
+/// issue an agent reported, as the daemon checked it with `gh`.
+pub fn is_issue_url(url: &Url) -> bool {
+    is_numbered_github_page(url, "issues")
+}
+
+/// `https://github.com/<owner>/<repo>/<section>/<number>`, with no login,
+/// port or other host.
+fn is_numbered_github_page(url: &Url, section: &str) -> bool {
     if url.scheme() != "https"
         || !url
             .host_str()
@@ -224,8 +237,8 @@ pub fn is_pull_request_url(url: &Url) -> bool {
         .unwrap_or_default();
     matches!(
         segments.as_slice(),
-        [owner, repo, "pull", number, ..]
-            if !owner.is_empty() && !repo.is_empty() && !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+        [owner, repo, kind, number, ..]
+            if *kind == section && !owner.is_empty() && !repo.is_empty() && !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
     )
 }
 
@@ -1199,8 +1212,8 @@ pub async fn open<R: Runtime>(
 ) -> Result<u64, String> {
     let bounds = bounds.checked()?;
     let url = Url::parse(url).map_err(|_| "That pull request address is not a URL.".to_string())?;
-    if !is_pull_request_url(&url) {
-        return Err("Only a pull request on github.com opens in the app.".into());
+    if !is_pull_request_url(&url) && !is_issue_url(&url) {
+        return Err("Only a pull request or an issue on github.com opens in the app.".into());
     }
     let _session = SESSION.lock().await;
     admit_open(&CLEARING)?;
@@ -2343,6 +2356,28 @@ mod tests {
             "javascript:alert(1)",
         ] {
             assert!(!is_pull_request_url(&url(bad)), "{bad}");
+        }
+    }
+
+    /// Scenario: ask whether issue addresses may open the in-app browser. A github.com issue page may; a pull request page, another site, plain http, a login or a port may not.
+    #[test]
+    fn a_github_issue_opens_the_browser_too() {
+        for good in [
+            "https://github.com/vfarcic/dot-agent-deck/issues/2418",
+            "https://github.com/o/r/issues/3#issuecomment-1",
+        ] {
+            assert!(is_issue_url(&url(good)), "{good}");
+        }
+        for bad in [
+            "https://github.com/vfarcic/dot-agent-deck/pull/2418",
+            "https://github.com/o/r/issues/abc",
+            "https://github.com/o/r/issues",
+            "https://github.com.evil.example/o/r/issues/1",
+            "http://github.com/o/r/issues/1",
+            "https://user:pass@github.com/o/r/issues/1",
+            "https://github.com:8443/o/r/issues/1",
+        ] {
+            assert!(!is_issue_url(&url(bad)), "{bad}");
         }
     }
 

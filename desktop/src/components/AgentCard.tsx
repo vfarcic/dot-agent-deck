@@ -1,20 +1,20 @@
-import { BellRing } from "lucide-react";
+import { GitMergeIcon, IssueClosedIcon, IssueOpenedIcon, QuestionIcon, type Icon } from "@primer/octicons-react";
+import { BellRing, ChevronDown, ChevronUp } from "lucide-react";
+import type { ReactNode } from "react";
 
-import { actionLabel, cardStatusLabel, deliverySentence, disabledReasonSentence, exactTextSegments, exactTextString, hasMarkers, MARKER_CLOSE, MARKER_OPEN, markerTitle, resultSentence, type CardResults, fieldValueText, needsYouSentence, placedCardKey, primaryAction, primaryNeedsReview, promptPreview, type PlacedCard } from "../lib/agentCards";
+import { actionLabel, cardStatusClass, cardStatusLabel, deliverySentence, disabledReasonSentence, exactTextSegments, exactTextString, hasMarkers, MARKER_CLOSE, MARKER_OPEN, markerTitle, resultSentence, type CardResults, needsYouSentence, placedCardKey, primaryAction, primaryNeedsReview, promptPreview, type PlacedCard } from "../lib/agentCards";
+import { agentTypeText, cardTone, referenceUrl, referenceView, rollupSegments, rollupSentence, type CardKind } from "../lib/agentCardsTree";
 import { DISPLAY_LIMITS, displayIdentity, displayText, displayTitle, domIdentity } from "../lib/displayText";
 import { VOICE_ACTIONS, type VoiceActionContext } from "../lib/voiceActions";
+import type { AgentCardCheckedRef, AgentCardRollup } from "../types";
+import { PullRequestBadge } from "./PullRequestBadge";
 
 /** The members a card's own controls dispatch through. */
-export type CardControls = Pick<VoiceActionContext, "showAgentCard" | "runCardAction">;
+export type CardControls = Pick<VoiceActionContext, "showAgentCard" | "runCardAction" | "setCardTree" | "openCardReference">;
 
 /** The card a control names: its deck, agent and the daemon process that listed it. */
 export function cardRef(card: PlacedCard): { deckId: string; agentId: string; incarnation: string } {
   return { deckId: card.deckId, agentId: card.entry.agent_id, incarnation: card.entry.instance_id };
-}
-
-/** The agent-source label at the head of a card's fields, shown whether or not the card has a summary (review S2). */
-function SourceBadgeRow() {
-  return <div className="agent-card-fields-source" data-testid="agent-card-fields-source"><SourceBadge source="agent" /></div>;
 }
 
 /** A small label saying who a piece of text comes from: the agent's own word, or something the deck checked. */
@@ -48,27 +48,98 @@ export function ExactTextNote({ text }: { text: string }) {
   return hasMarkers(text) ? <small className="exact-text-note" data-testid="exact-text-note">{MARKER_NOTE}</small> : null;
 }
 
+/** Octicons for a checked issue's state, as GitHub draws them. */
+const ISSUE_STATE_ICON: Record<string, Icon> = {
+  open: IssueOpenedIcon,
+  closed: IssueClosedIcon,
+  merged: GitMergeIcon,
+};
+
+/** Issue #2418 — one reference the agent reported, drawn from the deck's check of it. */
+function CardReference({ card, reference, controls }: { card: PlacedCard; reference: AgentCardCheckedRef; controls: CardControls }) {
+  const view = referenceView(reference);
+  const url = referenceUrl(reference);
+  const stale = view.status === "stale" ? <small className="agent-card-ref-stale">stale</small> : null;
+  let body: ReactNode;
+  if (view.status === "checked" || view.status === "stale") {
+    if (view.kind === "pull_request" && "pullRequest" in view) {
+      body = <PullRequestBadge pullRequest={view.pullRequest} testId="agent-card-pr" onOpen={url ? () => VOICE_ACTIONS.openCardPullRequest.run(controls, { ...cardRef(card), referenceUrl: url }) : undefined} />;
+    } else if ("number" in view) {
+      const StateIcon = ISSUE_STATE_ICON[view.state] ?? QuestionIcon;
+      const label = `Issue #${view.number}: ${view.state}`;
+      const content = <><StateIcon className="pr-badge-state" size={11} aria-hidden="true" /><span className="pr-badge-number">#{view.number}</span></>;
+      body = url
+        ? <button type="button" className={`pr-badge issue-badge issue-state-${domIdentity(view.state)}`} data-testid="agent-card-issue" data-issue-state={view.state} aria-label={label} title={`${label} — open it in the app`} onMouseDown={(event) => event.stopPropagation()} onClick={() => VOICE_ACTIONS.openCardIssue.run(controls, { ...cardRef(card), referenceUrl: url })}>{content}</button>
+        : <span className={`pr-badge issue-badge issue-state-${domIdentity(view.state)}`} data-testid="agent-card-issue" data-issue-state={view.state} role="img" aria-label={label}>{content}</span>;
+    }
+  } else if ("text" in view) {
+    body = <small className="agent-card-ref-text">{displayText(view.text, DISPLAY_LIMITS.name)}</small>;
+  }
+  return (
+    <span className={`agent-card-ref is-${view.status}`} data-testid="agent-card-ref" data-field={reference.field} data-kind={reference.kind} data-ref-status={view.status} title={displayTitle(view.title)}>
+      {body}{stale}
+    </span>
+  );
+}
+
+/** Issue #2418 — a roll-up's counts by status, as a bar, and its totals. */
+function CardRollup({ rollup }: { rollup: AgentCardRollup }) {
+  const segments = rollupSegments(rollup.counts);
+  return (
+    <div className="agent-card-rollup-block">
+      <div className="agent-card-rollup-bar" data-testid="agent-card-rollup-bar" role="img" aria-label={segments.map((segment) => `${segment.count} ${segment.label}`).join(", ")}>
+        {segments.map((segment) => <i key={segment.label} className={`tone-${segment.word}`} data-status={segment.word} style={{ flexGrow: segment.count }} />)}
+      </div>
+      <small className="agent-card-rollup" data-testid="agent-card-rollup">{rollupSentence(rollup)}</small>
+    </div>
+  );
+}
+
+/** How a card sits in the tree: its depth, what is under it, whether its tree is open, and whether Needs you only fades it. */
+export interface CardPlace {
+  depth: number;
+  kind: CardKind;
+  /** Whether the daemon hung any shown card under it. */
+  hasChildren: boolean;
+  open: boolean;
+  faded: boolean;
+  /** Whether the deck's daemon builds the tree: an older one's cards carry no roll-up or checked references. */
+  tree: boolean;
+}
+
 /**
- * PRD #2374 — one agent's card on the dashboard's Cards view: who it is, its
- * deck-checked status, whether it needs the user, what it last reported, its
- * card fields and its primary action. Everything comes from the daemon's
- * entry as received; nothing here decides status, needs-you or which action
- * is primary.
+ * Issue #2418 — one agent's compact card on the Cards tree: who it is (name,
+ * kind, agent type), its status in the daemon's words, whether it needs the
+ * user, the pull requests and issues its agent reported as the deck checked
+ * them, what is under it (closed, with its roll-up) and its primary action.
+ * What the agent said, its progress and its next step are the overlay's, which
+ * a click on the name opens. Everything comes from the daemon's entry as
+ * received; nothing here decides status, needs-you, roll-ups or references.
  */
-export function AgentCard({ card, controls, results }: { card: PlacedCard; controls: CardControls; results?: CardResults }) {
+export function AgentCard({ card, controls, results, place }: { card: PlacedCard; controls: CardControls; results?: CardResults; place: CardPlace }) {
   const { entry } = card;
   const name = displayIdentity(entry.name, DISPLAY_LIMITS.name, entry.pane_id);
-  const primary = primaryAction(entry);
-  const fields = entry.fields.filter((field) => field.placement === "card" || field.placement === "compact");
+  /* The deck's own Open is not a card's primary here: the name opens the
+     card, whose overlay opens the pane (the table's row menu leaves it out
+     the same way). */
+  const daemonPrimary = primaryAction(entry);
+  const primary = daemonPrimary?.kind === "open" ? undefined : daemonPrimary;
   const needsYou = needsYouSentence(entry);
-  const summary = entry.report?.summary ? displayText(entry.report.summary, DISPLAY_LIMITS.message) : undefined;
   const primaryTitle = primary && !primary.enabled ? `Disabled: ${disabledReasonSentence(primary.disabled_reason)}` : undefined;
+  const rollup = place.tree && entry.rollup ? entry.rollup : undefined;
+  const tone = cardTone({ status: entry.status, rollup }, place.open);
+  const agentType = agentTypeText(entry.agent_type);
+  const refs = place.tree ? entry.checked_refs ?? [] : [];
+  const ref = cardRef(card);
   return (
     <article
-      className={`agent-card${entry.needs_you ? " needs-you" : ""}`}
+      className={`agent-card tone-${tone}${entry.needs_you ? " needs-you" : ""}${place.faded ? " is-faded" : ""}`}
       data-testid={`agent-card-${domIdentity(placedCardKey(card))}`}
       data-card-key={entry.key}
+      data-depth={place.depth}
       data-status={entry.status}
+      data-tone={tone}
+      data-faded={place.faded ? "true" : undefined}
       aria-label={`${name}${entry.needs_you ? ", needs you" : ""}`}
     >
       <header className="agent-card-header">
@@ -78,24 +149,32 @@ export function AgentCard({ card, controls, results }: { card: PlacedCard; contr
           data-testid="agent-card-show"
           aria-label={`Show ${name}'s card`}
           title={`Show ${name}'s card`}
-          onClick={() => VOICE_ACTIONS.showAgentCard.run(controls, cardRef(card))}
+          onClick={() => VOICE_ACTIONS.showAgentCard.run(controls, ref)}
         >{name}</button>
-        <span className={`status-label card-status status-${domIdentity(entry.status)}`} title="Status checked by the deck">{cardStatusLabel(entry.status)}</span>
         {entry.needs_you && <span className="agent-card-needs-you" data-testid="agent-card-needs-you" title={needsYou}><BellRing size={11} aria-hidden="true" />Needs you</span>}
+        {place.hasChildren && (
+          <button
+            type="button"
+            className="icon-button agent-card-toggle"
+            data-testid="agent-card-toggle"
+            aria-expanded={place.open}
+            aria-label={`${place.open ? "Close" : "Open"} ${name}'s tree`}
+            title={place.open ? "Hide the agents under it" : "Show the agents under it"}
+            onClick={() => VOICE_ACTIONS[place.open ? "closeCardTree" : "openCardTree"].run(controls, ref)}
+          >{place.open ? <ChevronUp size={14} aria-hidden="true" /> : <ChevronDown size={14} aria-hidden="true" />}</button>
+        )}
       </header>
-      {summary && <p className="agent-card-summary"><SourceBadge source="agent" /> <span>{summary}</span></p>}
-      {entry.report === null && <p className="agent-card-summary is-empty">No report from this agent yet.</p>}
-      {fields.length > 0 && <SourceBadgeRow />}
-      {fields.length > 0 && (
-        <dl className="agent-card-fields" aria-label="Fields the agent reported">
-          {fields.map((field) => (
-            <div key={field.name} className="agent-card-field" data-field={field.name}>
-              <dt title={field.description ? displayTitle(field.description) : undefined}>{displayText(field.label, DISPLAY_LIMITS.name)}</dt>
-              <dd title={displayTitle(fieldValueText(field.value))}>{displayText(fieldValueText(field.value), DISPLAY_LIMITS.prompt)}</dd>
-            </div>
-          ))}
-        </dl>
+      <div className="agent-card-meta">
+        <span className="agent-card-kind" data-testid="agent-card-kind">{place.kind}</span>
+        <span className={`status-label card-status ${cardStatusClass(entry.status)}`} data-testid="agent-card-status" title="Status checked by the deck">{cardStatusLabel(entry.status)}</span>
+        {agentType && <span className="agent-card-agent-type" data-testid="agent-card-agent-type">{displayText(agentType, DISPLAY_LIMITS.name)}</span>}
+      </div>
+      {refs.length > 0 && (
+        <div className="agent-card-refs" aria-label="Pull requests and issues the agent reported, as the deck checked them">
+          {refs.map((reference, index) => <CardReference key={`${reference.field}\u0000${index}`} card={card} reference={reference} controls={controls} />)}
+        </div>
       )}
+      {rollup && <CardRollup rollup={rollup} />}
       {primary && (
         <div className="agent-card-primary">
           <button
@@ -104,7 +183,7 @@ export function AgentCard({ card, controls, results }: { card: PlacedCard; contr
             data-testid="agent-card-primary"
             disabled={!primary.enabled}
             title={primaryTitle}
-            onClick={() => VOICE_ACTIONS.runCardAction.run(controls, { ...cardRef(card), cardActionId: primary.id, cardActionToken: primary.token, ...(primaryNeedsReview(primary) ? { cardActionReview: true } : {}) })}
+            onClick={() => VOICE_ACTIONS.runCardAction.run(controls, { ...ref, cardActionId: primary.id, cardActionToken: primary.token, ...(primaryNeedsReview(primary) ? { cardActionReview: true } : {}) })}
           >{displayText(actionLabel(entry, primary), DISPLAY_LIMITS.name)}</button>
           {primary.source === "agent" && <span data-testid="agent-card-primary-source"><SourceBadge source="agent" /></span>}
           {primary.prompt && <small className="agent-card-prompt" title={exactTextString(primary.prompt)}>{promptPreview(primary.prompt)}</small>}

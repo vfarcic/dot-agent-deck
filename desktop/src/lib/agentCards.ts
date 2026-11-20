@@ -1,5 +1,6 @@
 import type { AgentCardAction, AgentCardEntry, AgentCardsSnapshot, AgentCardTarget, CardActionResult } from "../types";
 import { sanitizeText } from "./displayText";
+import { cardStatusWord, statusWordLabel } from "./statusWords";
 
 /*
  * PRD #2374 — the overview's agent cards, as the webview arranges them.
@@ -7,10 +8,9 @@ import { sanitizeText } from "./displayText";
  * Everything here ARRANGES what the daemon sent; nothing DECIDES. Status,
  * needs-you, which actions exist, whether each is enabled and the order the
  * entries come in are the daemon's (CLAUDE.md rule 18): an entry is rendered
- * as received, consecutive entries sharing a `group.id` are one group, and the
- * counts are counts of what arrived. The one judgement made here is the
- * user's own — whether the Needs you filter is on — and it only hides entries
- * the daemon already marked.
+ * as received, and so are the tree it hangs in and its roll-up (issue #2418,
+ * `agentCardsTree.ts`). The judgements made here are the user's own — which
+ * view, which trees are open, whether Needs you only is on.
  */
 
 /** Which view the overview shows. */
@@ -72,52 +72,6 @@ export function placeCards(decks: readonly { deckId: string | undefined; connect
   });
 }
 
-/** One group as the grid shows it: consecutive cards sharing a `group.id`, and their counts. */
-export interface CardGroup {
-  /** Unique among the groups `groupCards` returns: the run's place, the deck and the `group.id`. */
-  key: string;
-  label: string;
-  kind: string;
-  cards: PlacedCard[];
-  /** How many of every card in this group (shown or not) need the user. */
-  needYou: number;
-  /** How many cards the group has, shown or not. */
-  total: number;
-}
-
-/** The heading a group gets when the daemon gave it no label. */
-function groupLabel(entry: AgentCardEntry): string {
-  if (entry.group.label) return entry.group.label;
-  if (entry.group.kind === "standalone") return "Not in a group";
-  return entry.group.kind;
-}
-
-/**
- * The grid's groups: consecutive cards of one deck that share a `group.id`.
- * `needsYouOnly` hides the cards the daemon did not mark, and a group left
- * with none is dropped; the counts are always over the whole group.
- */
-export function groupCards(cards: readonly PlacedCard[], needsYouOnly: boolean): CardGroup[] {
-  const groups: CardGroup[] = [];
-  let lastId: string | undefined;
-  for (const card of cards) {
-    // The deck is part of the id: two daemons' groups never merge.
-    const id = `${card.deckId}\u0000${card.entry.group.id}`;
-    const last = groups[groups.length - 1];
-    // The same group may come round again later in the daemon's order (a run
-    // of its members, another group, then more of them): that is a second
-    // group on screen, so the run's place is part of its key, which React
-    // needs unique among the grid's groups.
-    const group: CardGroup = last !== undefined && lastId === id ? last : { key: `${groups.length}\u0000${id}`, label: groupLabel(card.entry), kind: card.entry.group.kind, cards: [], needYou: 0, total: 0 };
-    lastId = id;
-    if (group !== last) groups.push(group);
-    group.total += 1;
-    if (card.entry.needs_you) group.needYou += 1;
-    if (!needsYouOnly || card.entry.needs_you) group.cards.push(card);
-  }
-  return needsYouOnly ? groups.filter((group) => group.cards.length > 0) : groups;
-}
-
 /** Where the overlay moves: one card on, one back, or to the next card that needs the user. */
 export type CardStep = "next" | "previous" | "needs-you";
 
@@ -144,15 +98,26 @@ export function primaryAction(entry: AgentCardEntry): AgentCardAction | undefine
   return entry.actions.find((action) => action.id === entry.primary_action_id);
 }
 
-/** The words for a deck-checked status (the daemon's snake_case). */
+/**
+ * The words for a deck-checked status: the daemon's own, as the table and the
+ * TUI show them (`statusWords.ts`, issue #2411) — `waiting_for_input` reads
+ * "needs input" and `unknown` reads "idle". A status this build does not know
+ * is shown as it came.
+ */
 export function cardStatusLabel(status: string): string {
-  const words = status.replace(/_/g, " ").trim();
-  return words ? `${words[0].toUpperCase()}${words.slice(1)}` : "Unknown";
+  const word = cardStatusWord(status);
+  return word ? statusWordLabel(word) : status.replace(/_/g, " ").trim() || "unknown";
 }
 
-/** The words for the agent's own reported status. */
+/** The CSS status class of a deck-checked status: its word's, so the card shares the table's palette. */
+export function cardStatusClass(status: string): string {
+  return `status-${cardStatusWord(status) ?? "unknown"}`;
+}
+
+/** The words for the agent's own reported status (`working`, `waiting`, `done`, `failed`): the agent's word, not the daemon's. */
 export function reportStatusLabel(status: string): string {
-  return cardStatusLabel(status);
+  const words = status.replace(/_/g, " ").trim();
+  return words ? `${words[0].toUpperCase()}${words.slice(1)}` : "Unknown";
 }
 
 /** Why a card needs the user, in words, for its marker's hover and the overlay. */

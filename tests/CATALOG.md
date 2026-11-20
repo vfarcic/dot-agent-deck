@@ -15873,19 +15873,19 @@ PRD #1666 part 3, round 5: where the deck keeps a worker's report, or a dispatch
 
 ## Desktop agent cards (webview)
 
-The desktop half of PRD #2374's agent cards. These are Vitest + Testing Library tests in the webview (`cd desktop && pnpm test`), outside the Rust `#[spec]` scanner, so they are named here by test title (`desktop/agent-cards/00N: …`), as in `question/desktop`. 001–007 are in `desktop/src/components/AgentCardsContract.test.tsx` and render the real `AgentOverview`; 008 is in `desktop/src/components/AgentCardsVoice.test.tsx` and renders the real `DeckShell` with only the microphone and the resolved voice answer synthetic. The fixtures contradict what a client would compute (a `working` agent the daemon marks needs-you with reason `done`, a `waiting_for_input` one it does not mark, a prompt action disabled `agent_stopped` on a running agent, a primary that is not the first action, entries in neither alphabetical nor needs-you-first order, one group appearing twice), so a view that recomputed status, needs-you, enablement or order fails. **Agent:** none. **Platform coverage:** jsdom on Node; CI runs them in `desktop-web`'s vitest (or the RWX counterpart).
+The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. These are Vitest + Testing Library tests in the webview (`cd desktop && pnpm test`), outside the Rust `#[spec]` scanner, so they are named here by test title (`desktop/agent-cards/0NN: …`), as in `question/desktop`. 001–007 are in `desktop/src/components/AgentCardsContract.test.tsx` and render the real `AgentOverview`; 008 and 018 are in `desktop/src/components/AgentCardsVoice.test.tsx` and render the real `DeckShell` with only the microphone and the resolved voice answer synthetic; 009–017 are in `desktop/src/components/AgentCardsTree.test.tsx` and render the real `AgentOverview`; 019 is the Playwright spec `desktop/e2e/agent-cards-tree.spec.ts` (`cd desktop && pnpm test:browser agent-cards-tree`). The fixtures contradict what a client would compute (a `working` agent the daemon marks needs-you with reason `done`, a `waiting_for_input` one it does not mark, a prompt action disabled `agent_stopped` on a running agent, a primary that is not the first action, entries in neither alphabetical nor needs-you-first order, a roll-up that changes while the entries under it do not, a checked state that differs from the agent's claim), so a view that recomputed status, needs-you, enablement, order, the tree, a roll-up or a reference fails. **Agent:** none. **Platform coverage:** jsdom on Node; CI runs them in `desktop-web`'s vitest (or the RWX counterpart); 019 runs in Chromium and WebKit in the desktop browser job.
 
-##### desktop/agent-cards/001 — The Cards grid groups consecutive entries by `group.id`, with the daemon's counts.
+##### desktop/agent-cards/001 — A daemon list without the tree draws every card as a root, in the daemon's order, with the daemon's counts.
 - **Test:** vitest `desktop/agent-cards/001: …` in `desktop/src/components/AgentCardsContract.test.tsx`.
 - **Layer:** desktop component (jsdom), real `AgentOverview` against a daemon card list.
-- **Asserts:** one group section per run of consecutive entries sharing a `group.id`, so the dispatcher's group appears twice when the daemon orders a member last; each section's label, kind and `N agents · M need you` (singular forms included); each group's card names in the daemon's order; the toolbar's total `5 agents · 3 need you`.
-- **Does not assert:** the daemon's grouping or ordering (`agent-report/cli/002` covers the dispatcher group); several decks' grids.
+- **Asserts:** no grouping by `group.id` is rebuilt (issue #2418 replaced the grouped grid with the tree); every card of a list that does not advertise the tree is a root, in the order received; the toolbar's total `5 agents · 3 need you`.
+- **Does not assert:** the tree itself (009); the daemon's ordering (`agent-report/cli/002`).
 
-##### desktop/agent-cards/002 — Cards keep the daemon's order, status and needs-you; the Needs you filter hides the rest.
+##### desktop/agent-cards/002 — Cards keep the daemon's order, status words and needs-you; Needs you only fades the rest in place.
 - **Test:** vitest `desktop/agent-cards/002: …` in `desktop/src/components/AgentCardsContract.test.tsx`.
 - **Layer:** desktop component (jsdom).
-- **Asserts:** cards render in the received order, and a new list reorders them with no client sort; each card shows the deck-checked status words (`Working`, `Waiting for input`, `Thinking`, `Stopped`) and the Needs you marker exactly where the daemon set `needs_you`, even against the agent's own report; the summary and `card`-placed fields show, a `detail` field does not; an unreported agent reads "No report from this agent yet."; the Needs you filter (`aria-pressed`) keeps only the daemon-marked cards, in order, while the group count stays the whole group's.
-- **Does not assert:** the hover text of the needs-you reasons; the CSS grid's responsive layout.
+- **Asserts:** cards render in the received order, and a new list reorders them with no client sort; each card shows the deck-checked status in the daemon's words as the table shows them (`working`, `needs input`, `thinking`, `stopped`) and the Needs you marker exactly where the daemon set `needs_you`, even against the agent's own report; the summary and fields are not on the compact card; Needs you only (`aria-pressed`) keeps every card in place and fades exactly the cards the daemon did not mark, and turning it off unfades them.
+- **Does not assert:** the hover text of the needs-you reasons; the tree's layout (019).
 
 ##### desktop/agent-cards/003 — The primary action sends the daemon's action, shows its prompt, and asks first when it must.
 - **Test:** vitest `desktop/agent-cards/003: …` in `desktop/src/components/AgentCardsContract.test.tsx`.
@@ -15922,6 +15922,72 @@ The desktop half of PRD #2374's agent cards. These are Vitest + Testing Library 
 - **Layer:** desktop component (jsdom), real `DeckShell`, voice panel and dispatch seam; the resolved answer is shaped as the crate sends it (`card_action` and `reply_text` param kinds).
 - **Asserts:** each of `setOverviewMode`, `showAgentCard`, `nextAgentCard`, `previousAgentCard`, `nextNeedsYouCard`, `toggleNeedsYouFilter`, `closeAgentCard`, `runCardAction` and `replyToAgentCard` is `voice: true` with no `no_voice`, and exactly one `commands.toml` row invokes it, with the contract's row id, `screens = ["overview"]` and its param names and kinds; `confirmCardAction` and `toggleOverviewRowMenu` carry a `no_voice` reason and no row. A spoken `run_card_action` naming a `confirm` action, or Close, opens that card's overlay at its confirm step (exact prompt and pending detail) and sends nothing; one naming an action or a question's answer whose text is, or quotes, what the agent wrote (`prompt_source: "agent"`, the deck-composed answer included) opens that card's review step showing the exact text, says why on the voice row, and sends nothing until Send, which sends it once — including an answer to a question whose quotes and line breaks smuggle an instruction into the composed text (audit A1); only one naming a catalog prompt action sends exactly that action of that card once, unconfirmed; a spoken `reply_to_agent_card` sends `reply` with the user's words.
 - **Does not assert:** the model's choice of row or the crate's param resolution (the desktop crate's voice tests); real speech.
+
+##### desktop/agent-cards/009 — Only roots show at first, and opening a card shows exactly its children, to any depth.
+- **Test:** vitest `desktop/agent-cards/009: …` in `desktop/src/components/AgentCardsTree.test.tsx`.
+- **Layer:** desktop component (jsdom), real `AgentOverview` against a list whose entries carry `parent` from a daemon that advertises the tree.
+- **Asserts:** only the three roots render (`data-depth="0"`), in the daemon's order; a card with nothing under it has no toggle; the toggle reads `Open <name>'s tree` with `aria-expanded`; opening the dispatcher shows one band for it holding exactly its two children in order at depth 1, the roots unchanged; opening the orchestrator under it adds its two roles at depth 2; closing the dispatcher removes its whole tree and the band.
+- **Does not assert:** the parent links themselves (`agent-report/tree/001`); geometry (019).
+
+##### desktop/agent-cards/010 — A closed card with children shows its roll-up's colour, counts bar and totals.
+- **Test:** vitest `desktop/agent-cards/010: …` in `desktop/src/components/AgentCardsTree.test.tsx`.
+- **Layer:** desktop component (jsdom).
+- **Asserts:** a closed card's `data-tone` is the worst of its own status and its roll-up's `worst` (an idle dispatcher over a `waiting_for_input` card reads `needs_input`; one over `blocked` reads `blocked`); the bar's segments follow the roll-up's counts, most severe first, with the accessible name `1 needs input, 1 working, 2 idle`; the totals read `4 under it · 1 needs you` (singular forms included); a card with no children shows its own status and no roll-up; opened, the card takes its own status's colour again.
+- **Does not assert:** the roll-up's computation (`agent-report/tree/002`, module tests in `src/agent_cards.rs`); the palette's colours (CSS).
+
+##### desktop/agent-cards/011 — Roll-ups and statuses update live, and open trees stay open.
+- **Test:** vitest `desktop/agent-cards/011: …` in `desktop/src/components/AgentCardsTree.test.tsx`.
+- **Layer:** desktop component (jsdom).
+- **Asserts:** after a new list in which only a closed root's `rollup` changed, its colour, totals and bar follow the new roll-up with no client recount; another root's open tree stays open, and a card in it shows its new status.
+- **Does not assert:** the daemon's doorbell or the runtime's re-read (`useDeckRuntime agent cards`).
+
+##### desktop/agent-cards/012 — A compact card shows who and what in the daemon's words, and the overlay keeps what the agent said.
+- **Test:** vitest `desktop/agent-cards/012: …` in `desktop/src/components/AgentCardsTree.test.tsx`.
+- **Layer:** desktop component (jsdom).
+- **Asserts:** each card shows its kind (`dispatcher` for a card the daemon names as another's dispatcher, `orchestrator` and `role` from its orchestration relation, else `agent`), its agent type in the dashboard filter's words (`Claude Code`, `Codex`, `OpenCode`), its status in the daemon's words (`working`, `needs input` for `waiting_for_input`, `idle` for `unknown`, `error`) and the needs-you marker where the daemon set it; the summary, progress and next step are not on the card; clicking the name opens the overlay on that card, which shows all three.
+- **Does not assert:** the overlay's own behaviour (004).
+
+##### desktop/agent-cards/013 — Checked pull request and issue badges show the deck's check and open their GitHub pages.
+- **Test:** vitest `desktop/agent-cards/013: …` in `desktop/src/components/AgentCardsTree.test.tsx`.
+- **Layer:** desktop component (jsdom), the shell's `OpenCardReference` replaced by a spy.
+- **Asserts:** a pull request the agent claimed as `#24180` shows the deck's check (`data-pr-state="merged"`, checks `failing`, review `approved`) through the shared pull request badge; clicking it calls the opener once with the deck, the card's agent, `pull_request`, the number and the checked github.com address, and opens no overlay; an issue claimed as `o/r#3` shows `closed` and opens its checked issue address the same way.
+- **Does not assert:** the lookup (`agent-report/refs/001`); the in-app browser itself (018 opens it through the shell).
+
+##### desktop/agent-cards/014 — Pending, unavailable and stale references say so.
+- **Test:** vitest `desktop/agent-cards/014: …` in `desktop/src/components/AgentCardsTree.test.tsx`.
+- **Layer:** desktop component (jsdom).
+- **Asserts:** a pending reference reads `#7 · checking…` with a tooltip saying the deck has not looked it up yet; a `not_found` one reads `not found or private` with the daemon's detail in its tooltip and no button; an `unrecognised` one reads `not a GitHub reference` with the agent's claim in its tooltip; a stale one keeps its badge with its last checked state, is marked `stale`, and its tooltip says when it was last checked.
+- **Does not assert:** the daemon's failure classification (`agent-report/refs/002`).
+
+##### desktop/agent-cards/015 — Needs you only opens the path to every card that needs you and fades the rest.
+- **Test:** vitest `desktop/agent-cards/015: …` in `desktop/src/components/AgentCardsTree.test.tsx`.
+- **Layer:** desktop component (jsdom).
+- **Asserts:** with every tree closed, turning it on opens every card that has a daemon-marked card under it, at any depth; the marked cards and the cards on their paths stay bright and exactly the others fade (`data-faded`); turning it off unfades every card.
+- **Does not assert:** the fade's opacity (CSS).
+
+##### desktop/agent-cards/016 — Open trees are remembered per client, pruned, and a broken storage falls back to closed.
+- **Test:** vitest `desktop/agent-cards/016: …` in `desktop/src/components/AgentCardsTree.test.tsx`.
+- **Layer:** desktop component (jsdom).
+- **Asserts:** opening a tree stores its key under `dot-agent-deck.cards.open` as deck, daemon instance and card key; a fresh render comes back with it open; a remembered key of a card the on-screen daemon no longer lists is pruned while a deck not on screen keeps its keys; with that storage throwing on read and write, every tree renders closed without an error and opening one still works for the session.
+- **Does not assert:** storage shared across windows or app restarts (jsdom only).
+
+##### desktop/agent-cards/017 — An older daemon's cards are all roots, with no roll-ups, and a note says why.
+- **Test:** vitest `desktop/agent-cards/017: …` in `desktop/src/components/AgentCardsTree.test.tsx`.
+- **Layer:** desktop component (jsdom).
+- **Asserts:** for a list whose daemon does not advertise the tree, every entry is a root in its order even if it carries `parent`, no card has a toggle, a roll-up or a checked reference, and one line says the daemon is older than the app.
+- **Does not assert:** that the shared client drops the tree fields (`src/daemon_client.rs`'s tree gate tests).
+
+##### desktop/agent-cards/018 — The tree's controls are reachable by voice.
+- **Test:** vitest `desktop/agent-cards/018: …` (four tests) in `desktop/src/components/AgentCardsVoice.test.tsx`.
+- **Layer:** desktop component (jsdom), real `DeckShell`, voice panel and dispatch seam; the resolved answer is shaped as the crate sends it.
+- **Asserts:** `openCardTree`, `closeCardTree`, `openCardPullRequest` and `openCardIssue` are each `voice: true` with no `no_voice`, invoked by exactly one `commands.toml` row (`open_card_tree`, `close_card_tree`, `open_card_pull_request`, `open_card_issue`) on `screens = ["overview"]` taking an `agent_ref`; a spoken `open_card_tree` shows the card under the named card, and `close_card_tree` hides it; a spoken `open_card_pull_request` opens the app's GitHub browser on the checked pull request (`Pull request #24180`), and `open_card_issue` on the checked issue (`Issue #3`).
+- **Does not assert:** the model's choice of row (the desktop crate's voice tests); real speech.
+
+##### desktop/agent-cards/019 — The Cards tree's layout keeps the roots in place at every width.
+- **Test:** Playwright `desktop/agent-cards/019 — the Cards tree at <width>px` (three tests per width) in `desktop/e2e/agent-cards-tree.spec.ts`, against the fixture scene `/?fixture=1&state=docs&cards=tree` (eight roots, a dispatcher with an orchestration under it, one with seven units, orchestrators with roles).
+- **Layer:** desktop browser (production build, `vite preview`), widths 375, 768, 1024, 1440 and 1920 px.
+- **Asserts:** the page never scrolls sideways with every tree closed or every root open, and every tree and line stays inside the frame; opening any root leaves every root's x, width and height unchanged, the roots in its row and above do not move, the rows below move down together by one amount, and closing it puts every root back; two roots opened in one row each get their own level under it in the roots' order, and the later root's line passes through no part of the earlier tree and stays inside the frame. At 375 px each row holds one root, so the two-roots case asserts that instead.
+- **Does not assert:** the colours; a real daemon's tree (the fixture plays the daemon).
 
 ## Desktop native driver scenarios
 

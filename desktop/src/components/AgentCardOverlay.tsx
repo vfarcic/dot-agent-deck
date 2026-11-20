@@ -2,7 +2,7 @@ import { useEffect, useState, type KeyboardEvent } from "react";
 import { BellRing, ChevronLeft, ChevronRight, X } from "lucide-react";
 
 import { OVERLAY_LAYER, useInertBackground } from "../hooks/useInertBackground";
-import { actionLabel, cardStatusLabel, deliverySentence, formatClockTime, resultSentence, type CardOverlayStep, type CardResults, disabledReasonSentence, fieldValueText, linkOf, multilineText, needsYouSentence, reportStatusLabel, type PlacedCard } from "../lib/agentCards";
+import { actionLabel, cardStatusClass, cardStatusLabel, deliverySentence, formatClockTime, resultSentence, type CardOverlayStep, type CardResults, disabledReasonSentence, fieldValueText, linkOf, multilineText, needsYouSentence, reportStatusLabel, type PlacedCard } from "../lib/agentCards";
 import { DISPLAY_LIMITS, displayIdentity, displayText, displayTitle, domIdentity } from "../lib/displayText";
 import { VOICE_ACTIONS, type VoiceActionContext } from "../lib/voiceActions";
 import type { AgentCardAction } from "../types";
@@ -79,7 +79,7 @@ export function AgentCardOverlay({ card, lastName, position, count, step, result
         <header className="agent-card-overlay-header">
           <div className="agent-card-overlay-identity">
             <h2 id="agent-card-overlay-title">{name}</h2>
-            {entry && <span className={`status-label card-status status-${domIdentity(entry.status)}`}>{cardStatusLabel(entry.status)}</span>}
+            {entry && <span className={`status-label card-status ${cardStatusClass(entry.status)}`}>{cardStatusLabel(entry.status)}</span>}
             {entry && <SourceBadge source="deck" />}
             {entry?.needs_you && <span className="agent-card-needs-you" data-testid="agent-card-overlay-needs-you"><BellRing size={11} aria-hidden="true" />{needsYouSentence(entry)}</span>}
           </div>

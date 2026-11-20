@@ -50,7 +50,7 @@ import { ProfilesPanel, ProjectsPanel, PromptLibraryPanel, OrchestrationPanel } 
 import { SettingsSheet } from "./components/SettingsSheet";
 import { VoiceControlPanel, type AgentIncarnation, type VoicePane } from "./components/VoiceControlPanel";
 import { PullRequestBrowser, pullRequestBrowserCovered, type PullRequestBrowserSession } from "./components/PullRequestBrowser";
-import { OpenPullRequest, PrBrowserHostContext } from "./lib/prBrowser";
+import { OpenCardReference, OpenPullRequest, PrBrowserHostContext } from "./lib/prBrowser";
 import { LocalUpgradeFlow } from "./components/LocalUpgradeFlow";
 import { SelfUpgradeBanner, SelfUpgradeRailButton, noticeOf } from "./components/SelfUpgradeNotice";
 import { tauriSelfUpgradeApi } from "./lib/selfUpgrade";
@@ -855,6 +855,21 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       }
       return undefined;
     },
+    /* Issue #2418 — a pull request or issue a card's agent reported, at the
+       address the deck checked: opened as the agent's own pull request is. */
+    openCheckedReference: (target) => {
+      const deck = runtime.fleet.find((entry) => entry.connection.deckId === target.deckId);
+      const agent = deck?.agents.find((candidate) => candidate.id === target.agentId);
+      if (!agent) return PULL_REQUEST_AGENT_GONE;
+      const wanted = { deckId: target.deckId, agentId: target.agentId, agentLabel: agent.displayName, number: target.number, url: target.url, kind: target.kind, over: view };
+      if (prBrowser) {
+        if (prBrowserRequest || prBrowser.url !== wanted.url) setPrBrowserRequest({ ...wanted, opened: prBrowser.opened });
+      } else {
+        prBrowserOpened.current += 1;
+        setPrBrowser({ ...wanted, opened: prBrowserOpened.current });
+      }
+      return undefined;
+    },
     /* Closed only once the system browser has the page: a hand-off that
        failed leaves it here, with the reason under the toolbar, so the user
        still has it and can try again. */
@@ -1510,6 +1525,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   const starReady = !connectionBanner && !confirmationOpen && !localUpgrade.pending && !selfUpgradeOpen && !newAgentOpen && !choiceOpen && !overlaysOpen.settings && !prBrowser;
   return (
     <OpenPullRequest.Provider value={openPullRequest}>
+    <OpenCardReference.Provider value={pullRequestContext.openCheckedReference}>
     <VoiceOn.Provider value={voiceOn}>
       <AddDaemonOpener.Provider value={openAddDaemon}>
       <VoiceNumberingContext.Provider value={numbering}>
@@ -1552,6 +1568,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       </VoiceNumberingContext.Provider>
       </AddDaemonOpener.Provider>
     </VoiceOn.Provider>
+    </OpenCardReference.Provider>
     </OpenPullRequest.Provider>
   );
 }

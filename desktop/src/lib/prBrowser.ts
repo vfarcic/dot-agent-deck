@@ -131,3 +131,14 @@ export const PrBrowserHostContext = createContext<PrBrowserHost>(defaultPrBrowse
  * rendered on its own in a test), where the badge opens nothing.
  */
 export const OpenPullRequest = createContext<((target: { deckId: string; agentId: string }) => void) | undefined>(undefined);
+
+/** Issue #2418 — a pull request or issue an agent reported on its card, as the deck checked it: what the in-app browser opens. */
+export type CardReferenceTarget = { deckId: string; agentId: string; kind: "pull_request" | "issue"; number: number; url: string };
+
+/**
+ * Issue #2418 — open the in-app browser on a pull request or issue a card's
+ * agent reported, at the address the deck checked. Provided by the shell, which
+ * owns the browser; answers `undefined` when it opened, or why not. Absent
+ * elsewhere, where a card's reference badge opens nothing.
+ */
+export const OpenCardReference = createContext<((target: CardReferenceTarget) => string | undefined) | undefined>(undefined);

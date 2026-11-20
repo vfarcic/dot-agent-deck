@@ -179,7 +179,7 @@ describe("agent cards: what is sent is what was shown (PRD #2374 review round 1)
     expect(screen.queryByTestId("agent-card-result")).toBeNull();
   });
 
-  it("a card without a summary still labels its fields and its custom primary action as the agent's (S2)", () => {
+  it("a card without a summary still labels its custom primary action as the agent's, and its overlay labels its fields (S2)", () => {
     const card = entry("7", "coder", {
       report: { source: "agent", status: "working", summary: null, published_at: "2026-11-17T00:00:00Z", revision: 1 },
       fields: [{ name: "risk", label: "Risk", description: null, type: "text", icon: null, placement: "card", custom: true, source: "agent", value: "low" }],
@@ -188,8 +188,13 @@ describe("agent cards: what is sent is what was shown (PRD #2374 review round 1)
     });
     render(<AgentOverview runtime={runtime([card])} onNavigate={vi.fn()} />);
     fireEvent.click(screen.getByTestId("overview-mode-cards"));
-    expect(screen.getByTestId("agent-card-fields-source").textContent).toContain("agent says");
     expect(screen.getByTestId("agent-card-primary-source").textContent).toContain("agent says");
+    // Issue #2418: the fields are the overlay's, under the agent's label.
+    expect(screen.queryByText("low")).toBeNull();
+    fireEvent.click(screen.getByTestId("agent-card-show"));
+    const overlay = screen.getByTestId("agent-card-overlay");
+    expect(within(overlay).getByText("low")).toBeInTheDocument();
+    expect(within(overlay).getAllByText("agent says").length).toBeGreaterThan(0);
   });
 
   it("the overlay lists what was sent from the card, with the exact text, after the report stopped offering it (decision (a))", () => {

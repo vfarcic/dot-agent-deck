@@ -131,16 +131,16 @@ afterEach(() => {
 });
 
 describe("the dashboard's cards (PRD #2374)", () => {
-  it("switches to cards, remembers it, and shows the daemon's groups in its order", () => {
+  it("switches to cards, remembers it, and shows the daemon's cards in its order", () => {
     render(<AgentOverview runtime={runtime()} onNavigate={vi.fn()} />);
     fireEvent.click(screen.getByTestId("overview-mode-cards"));
     expect(window.localStorage.getItem(OVERVIEW_MODE_STORAGE_KEY)).toBe("cards");
-    const groups = screen.getAllByTestId("agent-cards-group");
-    expect(groups).toHaveLength(2);
-    expect(within(groups[0]).getByTestId("agent-cards-group-count").textContent).toBe("2 agents · 1 needs you");
-    expect(within(groups[0]).getAllByTestId("agent-card-show").map((button) => button.textContent)).toEqual(["coder", "tester"]);
+    expect(screen.getAllByTestId("agent-card-show").map((button) => button.textContent)).toEqual(["coder", "tester", "lone"]);
+    expect(within(screen.getByTestId("agent-cards")).getByText("3 agents · 1 needs you")).toBeInTheDocument();
+    // Needs you only fades the cards the daemon did not mark, in place (issue #2418).
     fireEvent.click(screen.getByTestId("agent-cards-needs-you-filter"));
-    expect(screen.getAllByTestId("agent-card-show").map((button) => button.textContent)).toEqual(["coder"]);
+    expect(screen.getAllByTestId("agent-card-show").map((button) => button.textContent)).toEqual(["coder", "tester", "lone"]);
+    expect([...document.querySelectorAll("article[data-faded='true']")].map((node) => node.getAttribute("aria-label"))).toEqual(["tester", "lone"]);
   });
 
   /*
@@ -157,7 +157,7 @@ describe("the dashboard's cards (PRD #2374)", () => {
     const identity = screen.getByTestId("daemon-identity");
     const section = identity.closest(".daemon-group");
     expect(section).not.toBeNull();
-    for (const group of screen.getAllByTestId("agent-cards-group")) expect(section?.contains(group)).toBe(true);
+    expect(section?.contains(screen.getByTestId("agent-cards-tree"))).toBe(true);
   });
 
   it("falls back to the table when storage throws", () => {

@@ -207,44 +207,35 @@ afterEach(() => {
 });
 
 describe("desktop/agent-cards — the dashboard renders what the daemon sent (PRD #2374)", () => {
-  /// Scenario: open the Cards view on a daemon list whose entries come in three groups, with the dispatcher's group appearing twice because the daemon ordered one of its members last. The grid shows one section per run of consecutive entries sharing a `group.id`, each headed by its label and "N agents · M need you", and the toolbar counts every card.
-  it("desktop/agent-cards/001: the grid groups consecutive entries by group.id with the daemon's counts", () => {
+  /// Scenario: open the Cards view on a list from a daemon that builds no tree, whose entries the daemon grouped by dispatcher and orchestration. Every card is drawn as a root in the daemon's order — no grouping by `group.id` is rebuilt — and the toolbar counts every card and every one the daemon marked.
+  it("desktop/agent-cards/001: an untreed list draws every card as a root in the daemon's order, with the daemon's counts", () => {
     cardsView();
-    const groups = screen.getAllByTestId("agent-cards-group");
-    expect(groups.map((group) => group.getAttribute("aria-label"))).toEqual(["release dispatcher", "review team", "Not in a group", "release dispatcher"]);
-    expect(groups.map((group) => group.getAttribute("data-group-kind"))).toEqual(["dispatcher", "orchestration", "standalone", "dispatcher"]);
-    expect(groups.map((group) => within(group).getByTestId("agent-cards-group-count").textContent)).toEqual([
-      "2 agents · 1 needs you",
-      "1 agent · 1 needs you",
-      "1 agent · 0 need you",
-      "1 agent · 1 needs you",
-    ]);
-    expect(groups.map((group) => within(group).getAllByTestId("agent-card-show").map((button) => button.textContent))).toEqual([["zulu", "alpha"], ["mike"], ["bravo"], ["yankee"]]);
+    expect(screen.queryByTestId("agent-cards-group")).toBeNull();
+    expect([...document.querySelectorAll("article[data-card-key][data-depth='0']")].map((node) => node.getAttribute("data-card-key"))).toEqual(ORDER.map((card) => card.key));
     expect(within(screen.getByTestId("agent-cards")).getByText("5 agents · 3 need you")).toBeInTheDocument();
   });
 
-  /// Scenario: show the Cards view for entries in an order that is neither alphabetical nor needs-you-first, then re-render with the daemon's new order. Each card shows the daemon's status words and needs-you marker even where they contradict the agent's own report, the cards follow each list's order, and the Needs you filter keeps only the daemon-marked cards, in that order.
-  it("desktop/agent-cards/002: cards keep the daemon's order, status and needs-you, and the filter hides the rest", () => {
+  /// Scenario: show the Cards view for entries in an order that is neither alphabetical nor needs-you-first, then re-render with the daemon's new order. Each card shows the daemon's status words and needs-you marker even where they contradict the agent's own report, the cards follow each list's order, what the agent said is the overlay's rather than the card's, and Needs you only fades every card the daemon did not mark, in place.
+  it("desktop/agent-cards/002: cards keep the daemon's order, status and needs-you, and Needs you only fades the rest", () => {
     const live = runtime();
     const view = cardsView(live);
     expect(shownNames()).toEqual(["zulu", "alpha", "mike", "bravo", "yankee"]);
     expect(shownKeys()).toEqual(ORDER.map((card) => card.key));
 
-    // The deck-checked status, as the daemon named it, and its needs-you mark.
-    expect(within(cardOf(ZULU.key)).getByText("Working")).toBeInTheDocument();
+    // The deck-checked status, in the daemon's words as the table shows them, and its needs-you mark.
+    expect(within(cardOf(ZULU.key)).getByTestId("agent-card-status").textContent).toBe("working");
     expect(within(cardOf(ZULU.key)).getByTestId("agent-card-needs-you")).toBeInTheDocument();
     expect(cardOf(ZULU.key).getAttribute("aria-label")).toBe("zulu, needs you");
-    expect(within(cardOf(ALPHA.key)).getByText("Waiting for input")).toBeInTheDocument();
+    expect(within(cardOf(ALPHA.key)).getByTestId("agent-card-status").textContent).toBe("needs input");
     expect(within(cardOf(ALPHA.key)).queryByTestId("agent-card-needs-you")).toBeNull();
     expect(cardOf(ALPHA.key).getAttribute("aria-label")).toBe("alpha");
-    expect(within(cardOf(MIKE.key)).getByText("Thinking")).toBeInTheDocument();
+    expect(within(cardOf(MIKE.key)).getByTestId("agent-card-status").textContent).toBe("thinking");
     expect(within(cardOf(MIKE.key)).getByTestId("agent-card-needs-you")).toBeInTheDocument();
-    expect(within(cardOf(YANKEE.key)).getByText("Stopped")).toBeInTheDocument();
-    // The agent's summary, and a field placed `card`; a `detail` field is the overlay's only.
-    expect(within(cardOf(ZULU.key)).getByText("Reported working, flagged by the deck anyway")).toBeInTheDocument();
-    expect(within(cardOf(ZULU.key)).getByText("half way")).toBeInTheDocument();
+    expect(within(cardOf(YANKEE.key)).getByTestId("agent-card-status").textContent).toBe("stopped");
+    // What the agent said and its fields are the overlay's (issue #2418), not the compact card's.
+    expect(within(cardOf(ZULU.key)).queryByText("Reported working, flagged by the deck anyway")).toBeNull();
+    expect(within(cardOf(ZULU.key)).queryByText("half way")).toBeNull();
     expect(within(cardOf(ZULU.key)).queryByText("DETAIL-ONLY-TEXT")).toBeNull();
-    expect(within(cardOf(BRAVO.key)).getByText("No report from this agent yet.")).toBeInTheDocument();
 
     // A new list from the daemon reorders the cards; nothing is re-sorted here.
     const reordered = [BRAVO, YANKEE, ALPHA, ZULU, MIKE].map((card) => ({ ...card, group: TEAM }));
@@ -255,11 +246,12 @@ describe("desktop/agent-cards — the dashboard renders what the daemon sent (PR
     expect(filter.getAttribute("aria-pressed")).toBe("false");
     fireEvent.click(filter);
     expect(screen.getByTestId("agent-cards-needs-you-filter").getAttribute("aria-pressed")).toBe("true");
-    expect(shownNames()).toEqual(["yankee", "zulu", "mike"]);
-    // The counts stay the group's whole counts while the filter hides cards.
-    expect(screen.getByTestId("agent-cards-group-count").textContent).toBe("5 agents · 3 need you");
-    fireEvent.click(screen.getByTestId("agent-cards-needs-you-filter"));
+    // Every card stays in its place; the ones the daemon did not mark fade.
     expect(shownNames()).toEqual(["bravo", "yankee", "alpha", "zulu", "mike"]);
+    expect(cardNodes().filter((node) => node.getAttribute("data-faded") === "true").map((node) => node.getAttribute("data-card-key"))).toEqual([BRAVO.key, ALPHA.key]);
+    expect(within(screen.getByTestId("agent-cards")).getByText("5 agents · 3 need you")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("agent-cards-needs-you-filter"));
+    expect(cardNodes().filter((node) => node.getAttribute("data-faded") === "true")).toEqual([]);
   });
 
   /// Scenario: press each card's primary button. The button is the action the daemon named primary (not the first one) and shows its label, with its prompt beneath cut to 60 characters and whole in the hover title; pressing it sends that entry's key and action id; a primary the daemon disabled on a running agent is a disabled button naming the reason and sends nothing; a primary that asks for confirmation opens the overlay's confirm step with the prompt and the pending detail, and sends only from that step, confirmed.
@@ -353,7 +345,7 @@ describe("desktop/agent-cards — the dashboard renders what the daemon sent (PR
     view.rerender(<AgentOverview runtime={{ ...live, agentCards: { [FIXTURE_DAEMON_ID]: snapshot([updated, ALPHA, MIKE, BRAVO, YANKEE], 9) } }} onNavigate={vi.fn()} />);
     expect(overlay().getAttribute("data-card-key")).toBe(ZULU.key);
     expect(within(overlay()).getByText("LIVE-UPDATED-SUMMARY")).toBeInTheDocument();
-    expect(within(overlay()).getByText("Error")).toBeInTheDocument();
+    expect(within(overlay()).getByText("error")).toBeInTheDocument();
 
     // The open agent is gone from the list.
     view.rerender(<AgentOverview runtime={{ ...live, agentCards: { [FIXTURE_DAEMON_ID]: snapshot([ALPHA, MIKE, BRAVO, YANKEE], 10) } }} onNavigate={vi.fn()} />);

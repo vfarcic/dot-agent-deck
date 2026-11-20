@@ -1,4 +1,4 @@
-import { createFixtureFleet, docsAgentCards, DOCS_TRUST_ORCHESTRATION, DOCS_TRUST_REMOVED_ROLES, DOCS_TRUST_ROLES, createFixtureStartedAgent, FIXTURE_RESTART_AFTER_MS, restartedFixtureSnapshot, DEFAULT_PROFILES, FIXTURE_APP_VERSION, FIXTURE_DAEMON_VERSION, FIXTURE_UPGRADE_STEP_MS, FIXTURE_DEFAULT_COMMANDS, FIXTURE_EXPERIMENTAL_DECKS, FIXTURE_HOMES, fixtureAgentRegistry, fixtureDirectoryTree, fixtureProjectOrchestrations, FIXTURE_ROLE_COMMANDS, fixtureVoiceCommands, nextFixtureAgentId, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureQuestion, resolveFixtureVoice, type FixtureState } from "../data/fixture";
+import { createFixtureFleet, docsAgentCards, treeAgentCards, DOCS_TRUST_ORCHESTRATION, DOCS_TRUST_REMOVED_ROLES, DOCS_TRUST_ROLES, createFixtureStartedAgent, FIXTURE_RESTART_AFTER_MS, restartedFixtureSnapshot, DEFAULT_PROFILES, FIXTURE_APP_VERSION, FIXTURE_DAEMON_VERSION, FIXTURE_UPGRADE_STEP_MS, FIXTURE_DEFAULT_COMMANDS, FIXTURE_EXPERIMENTAL_DECKS, FIXTURE_HOMES, fixtureAgentRegistry, fixtureDirectoryTree, fixtureProjectOrchestrations, FIXTURE_ROLE_COMMANDS, fixtureVoiceCommands, nextFixtureAgentId, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureQuestion, resolveFixtureVoice, type FixtureState } from "../data/fixture";
 import { voicePagesDirectory, voicePagesOrchestrations } from "../data/fixtureCrowded";
 import { actionErrorFrom, LaunchCleanupError, startDaemonErrorFrom } from "./actionError";
 import { PartialSettingsSaveError, partialSettingsSave } from "./settingsError";
@@ -2452,6 +2452,7 @@ export function normalizeAgentCards(value: unknown): AgentCardsSnapshot | null {
     revision: typeof record.revision === "number" ? record.revision : 0,
     entries: record.entries as AgentCardEntry[],
     catalogErrors: Array.isArray(record.catalogErrors) ? record.catalogErrors.filter((e): e is string => typeof e === "string") : [],
+    tree: record.tree === true,
   };
 }
 
@@ -3221,13 +3222,15 @@ class FixtureDeckBridge implements DeckBridge {
   /**
    * PRD #2374 — the `agent-cards` docs scene's card list: served only for
    * `/?fixture=1&state=docs&cards=1`, so no other fixture scene shows cards,
-   * needs-you bells or row menus. Every other deck and scene answers as a
-   * daemon without cards does.
+   * needs-you bells or row menus; issue #2418's tree scene, with eight roots
+   * and their trees, for `cards=tree`. Every other deck and scene answers as
+   * a daemon without cards does.
    */
   async agentCards(deckId: string): Promise<AgentCardsSnapshot | null> {
     const params = new URLSearchParams(window.location.search);
-    if (this.fixtureState !== "docs" || params.get("cards") !== "1") return null;
-    const cards = docsAgentCards();
+    const scene = params.get("cards");
+    if (this.fixtureState !== "docs" || (scene !== "1" && scene !== "tree")) return null;
+    const cards = scene === "tree" ? treeAgentCards() : docsAgentCards();
     return cards.deckId === deckId ? cards : null;
   }
   /** The preview's cards never change, so there is nothing to push. */

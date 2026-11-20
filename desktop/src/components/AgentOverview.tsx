@@ -27,7 +27,7 @@ import { AddDaemonOpener } from "./AddDaemonDialog";
 import type { DesktopSettingsState } from "../hooks/useDesktopSettings";
 import { VoiceNumber } from "./VoiceNumber";
 import { PullRequestBadge } from "./PullRequestBadge";
-import { OpenPullRequest } from "../lib/prBrowser";
+import { OpenCardReference, OpenPullRequest } from "../lib/prBrowser";
 import { useNumberedList, useNumbersShown } from "../hooks/useVoiceNumbers";
 import { numberKey, type VoiceNumberedEntryDto, type VoiceNumberedSectionDto } from "../lib/voiceNumbers";
 import { agentSpokenName, orchestrationTitle } from "../lib/agentNames";
@@ -1581,9 +1581,10 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     const shown = cardsOnScreen(deck);
     const deckId = deck.snapshot.connection.deckId;
     if (shown === undefined || deckId === undefined) return undefined;
-    return <AgentCardsDeckBody deckId={deckId} cards={shown} needsYouOnly={cards.needsYouOnly} controls={cards.controls} results={cards.resultsFor} />;
+    return <AgentCardsDeckBody deckId={deckId} cards={shown} tree={cards.treeFor(deckId)} openCards={cards.openCards} needsYouOnly={cards.needsYouOnly} controls={cards.controls} results={cards.resultsFor} />;
   };
-  const cards = useAgentCardsView({ runtime, decks: cardDeckList, openAgent: openCardAgent });
+  const openCardReference = useContext(OpenCardReference);
+  const cards = useAgentCardsView({ runtime, decks: cardDeckList, openAgent: openCardAgent, openReference: openCardReference });
   const [confirm, setConfirm] = useState<ConfirmState>();
   /* The confirmation on screen as of the last render, read by an answer that
      arrives after it: a Generate config the user dismissed with No must not
