@@ -320,7 +320,7 @@ fn latch_of(bytes: &[u8]) -> ScanLatch {
     scanner.latch().clone()
 }
 
-/// Scenario: Feed header-like text in other shapes and positions: the Codex header one column off, without its `(v`, with a pre-release tag or unterminated, and Claude Code's header at another column or with a pre-release tag. None latches; a Claude Code version written in pieces latches once, complete, without a conflict.
+/// Scenario: Feed header-like text in other shapes and positions: the Codex header one column off, without its `(v`, with a malformed pre-release or build tag, or unterminated, and Claude Code's header at another column or with a malformed tag. None latches; a Claude Code version written in pieces latches once, complete, without a conflict.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_release_recogniser_negatives() {
@@ -333,7 +333,12 @@ fn doorbell_036_release_recogniser_negatives() {
         codex(4, "OpenAI Codex (v0.164.0)"),
         codex(6, "OpenAI Codex (v0.164.0)"),
         codex(5, "OpenAI Codex v0.164.0"),
-        codex(5, "OpenAI Codex (v0.165.0-alpha.1)"),
+        codex(5, "OpenAI Codex (v0.165.0-)"),
+        codex(5, "OpenAI Codex (v0.165.0-alpha..1)"),
+        codex(5, "OpenAI Codex (v0.165.0-alpha.01)"),
+        codex(5, "OpenAI Codex (v0.165.0+)"),
+        codex(5, "OpenAI Codex (v0.165.0-alpha_1)"),
+        codex(5, "OpenAI Codex (v0.165.0-alpha.1"),
         codex(5, "OpenAI Codex (v0.164)"),
         codex(5, "OpenAI Codex (v0.164.0"),
         codex(5, "OpenAI codex (v0.164.0)"),
@@ -354,7 +359,10 @@ fn doorbell_036_release_recogniser_negatives() {
     for bytes in [
         claude(10, "Claude Code v2.1.310"),
         claude(11, "Claude Code  v2.1.310"),
-        claude(11, "Claude Code v2.1.310-beta.2"),
+        claude(11, "Claude Code v2.1.310-"),
+        claude(11, "Claude Code v2.1.310-beta..2"),
+        claude(11, "Claude Code v2.1.310+"),
+        claude(11, "Claude Code v2.1.310-beta_2"),
         claude(11, "Claude Code 2.1.310"),
     ] {
         assert_eq!(
@@ -378,24 +386,81 @@ fn doorbell_036_release_recogniser_negatives() {
     ));
 }
 
-/// Scenario: Read the `--version` output a lane-2 measurement gets from an installed Claude Code or Codex: a bare release, a pre-release, a build tag and no version. Only a bare release is usable; then the same versions are drawn in each agent's start-up header, and the deck's release scanner latches exactly the versions the measurements accept.
+/// Scenario: Draw each agent's start-up header with a bare release, a pre-release (`-beta.1`, `-alpha.1`, `-rc.1`, and Codex's own `-alpha.17.1`), build metadata (`+abc`) and both (`-rc.1+abc`), and write a Claude Code pre-release in pieces. Each latches the whole SemVer version, tags included, at the header's completing byte, and a piece-written one only once complete (issue #2128).
+#[spec("inbox/doorbell/036")]
+#[test]
+fn doorbell_036_release_recogniser_latches_pre_releases_and_builds() {
+    for version in [
+        "0.164.0",
+        "2.1.310",
+        "2.1.330-beta.1",
+        "0.172.0-alpha.1",
+        "0.172.0-rc.1",
+        "0.162.0-alpha.17.1",
+        "2.1.330+abc",
+        "0.172.0-rc.1+abc.2",
+        "2.1.330-x-y.1",
+    ] {
+        let want = Version::parse(version).unwrap();
+        for (agent, header) in [
+            (
+                AgentType::Codex,
+                format!("\x1b[2;6HOpenAI Codex (v{version})\r\n"),
+            ),
+            (
+                AgentType::ClaudeCode,
+                format!("\x1b[2;12HClaude Code v{version}\r\n"),
+            ),
+        ] {
+            let bytes = header.as_bytes();
+            // The header completes at its terminator: `)` for Codex, the
+            // carriage return that moves the cursor off Claude Code's.
+            let completing = header.find(')').map_or(bytes.len() - 1, |i| i + 1) as u64;
+            assert_eq!(
+                latch_of(bytes),
+                ScanLatch::Latched {
+                    agent: agent.clone(),
+                    release: want.clone(),
+                    at: completing,
+                },
+                "{agent:?} {version}"
+            );
+            assert_eq!(
+                latch_byte_at_a_time(bytes, 24, 80),
+                Some(latch_of(bytes)),
+                "{agent:?} {version}, a byte at a time"
+            );
+        }
+    }
+    let mut scanner = ReleaseScanner::new(24, 80, HEADER_RECOGNISERS).unwrap();
+    for piece in ["\x1b[2;12HClaude Code\x1b[24Gv2.1.330", "-", "be", "ta.1"] {
+        scanner.feed(piece.as_bytes());
+        assert_eq!(scanner.latch(), &ScanLatch::Pending, "after {piece:?}");
+    }
+    scanner.feed(b"\r");
+    assert!(matches!(
+        scanner.latch(),
+        ScanLatch::Latched { release, .. } if *release == Version::parse("2.1.330-beta.1").unwrap()
+    ));
+}
+
+/// Scenario: Read the `--version` output a lane-2 measurement gets from an installed Claude Code or Codex: a bare release, a pre-release, a build tag and no version. Every SemVer release is usable, tagged or not; then the same versions are drawn in each agent's start-up header, and the deck's release scanner latches exactly the versions the measurements accept.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_installed_release_shape_follows_the_release_scanner() {
     use installed_release::{VersionShape, version_shape};
     let release = |v: &str| VersionShape::Release(v.to_string());
-    let tagged = |v: &str| VersionShape::Tagged(v.to_string());
     for (program, output, expected) in [
         ("claude", "2.1.319 (Claude Code)\n", release("2.1.319")),
         (
             "claude",
             "2.1.320-beta.1 (Claude Code)\n",
-            tagged("2.1.320-beta.1"),
+            release("2.1.320-beta.1"),
         ),
         (
             "claude",
             "2.1.320+abc (Claude Code)\n",
-            tagged("2.1.320+abc"),
+            release("2.1.320+abc"),
         ),
         ("claude", "Claude Code 2.1.319\n", VersionShape::NoRelease),
         ("claude", "", VersionShape::NoRelease),
@@ -403,7 +468,7 @@ fn doorbell_036_installed_release_shape_follows_the_release_scanner() {
         (
             "codex",
             "codex-cli 0.165.0-alpha.2\n",
-            tagged("0.165.0-alpha.2"),
+            release("0.165.0-alpha.2"),
         ),
         ("codex", "codex-cli\n", VersionShape::NoRelease),
     ] {
@@ -414,7 +479,7 @@ fn doorbell_036_installed_release_shape_follows_the_release_scanner() {
         );
     }
     // What a measurement accepts is exactly what the deck latches from the
-    // same version in the agent's header: a bare release, nothing tagged.
+    // same version in the agent's header: any SemVer release, tags included.
     for version in [
         "2.1.319",
         "0.164.0",

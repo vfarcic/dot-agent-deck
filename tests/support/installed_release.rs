@@ -5,16 +5,14 @@
 
 /// The release an agent's `--version` output names, judged by the shape the
 /// deck's release scanner latches from the agent's start-up header
-/// (`src/release_scanner.rs`): a bare `MAJOR.MINOR.PATCH`, which the scanner
-/// then parses with `semver::Version::parse`.
+/// (`src/release_scanner.rs`): a SemVer version, a pre-release or build tag
+/// included (issue #2128), which the scanner parses with
+/// `semver::Version::parse`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VersionShape {
-    /// A bare release, the shape the scanner latches.
+    /// A release, the shape the scanner latches: bare (`2.1.320`) or tagged
+    /// (`2.1.320-beta.1`, `0.172.0-alpha.2`, `2.1.320+abc`).
     Release(String),
-    /// A version with a pre-release or build tag (`2.1.320-beta.1`,
-    /// `2.1.320+abc`). The scanner latches nothing from such a header, so
-    /// the deck rings no doorbell for that agent and nothing can be measured.
-    Tagged(String),
     /// No version where the agent prints one.
     NoRelease,
 }
@@ -33,10 +31,7 @@ pub fn version_shape(program: &str, text: &str) -> VersionShape {
         return VersionShape::NoRelease;
     };
     match semver::Version::parse(word) {
-        Ok(version) if version.pre.is_empty() && version.build.is_empty() => {
-            VersionShape::Release(word.to_string())
-        }
-        Ok(_) => VersionShape::Tagged(word.to_string()),
+        Ok(_) => VersionShape::Release(word.to_string()),
         Err(_) => VersionShape::NoRelease,
     }
 }

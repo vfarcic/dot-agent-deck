@@ -18,8 +18,8 @@
 //! 2. no single header was latched → `unknown_release` (or the latch's own
 //!    clause, `release_conflict`, `scanner_geometry` or `scanner_budget`). The
 //!    latch is a per-generation check that the agent drew its start-up screen
-//!    when it started; any `MAJOR.MINOR.PATCH` latches, and which one is not
-//!    read here;
+//!    when it started; any SemVer version latches, a pre-release or build
+//!    included (issue #2128), and which one is not read here;
 //! 3. the agent's facts decide ([`facts_verdict`]: the required facts, then no
 //!    first-stage byte committing in any known dialog, then `head_echo` when
 //!    the line is staged, then the settle cap).
@@ -611,8 +611,8 @@ pub fn parse_assumed_editor_probes(list: &str) -> Result<Vec<(AgentType, Version
             "claude" => AgentType::ClaudeCode,
             _ => return Err(unknown()),
         };
-        // A pre-release or build is refused: a header the scanner latches
-        // is a bare release, so such an entry could never match one.
+        // A pre-release or build is refused: the entries name releases the
+        // e2e stand-ins' headers draw, and every one of those is bare.
         let release = Version::parse(release)
             .ok()
             .filter(|v| v.pre.is_empty() && v.build.is_empty())

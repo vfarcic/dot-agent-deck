@@ -69,9 +69,13 @@ pub enum VersionEnd {
     BlankPassed,
 }
 
-/// One measured start-up header: `text` at `col` on `row`, then a version
-/// `MAJOR.MINOR.PATCH` (digits only: a pre-release tag does not match), then
-/// `end`.
+/// One measured start-up header: `text` at `col` on `row`, then a SemVer
+/// version, `MAJOR.MINOR.PATCH` with an optional pre-release (`-beta.1`) and
+/// build (`+abc`), then `end`. A pre-release build latches like a release
+/// (issue #2128): the doorbell's admission ([`crate::doorbell_activation`])
+/// and the composer probe's permission read the agent's facts, not which
+/// release latched, and `InputGrammar::of`'s measured grammar is for the bare
+/// 2.1.310 and 2.1.312 only, so a tagged one reads strictly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeaderRecogniser {
     pub agent: AgentType,
@@ -161,6 +165,26 @@ impl HeaderRecogniser {
         }
         if dots != 2 || digits_in_part == 0 {
             return None;
+        }
+        // Then a SemVer pre-release (`-beta.1`, `-alpha.17.1`) and build
+        // (`+abc`), each optional, in that order (issue #2128). Their cells
+        // are read as SemVer's identifier characters and the whole version is
+        // checked by `Version::parse` below, so `2.1.310-` or `-beta..1`
+        // latches nothing.
+        for marker in ['-', '+'] {
+            if cell_char(screen, row, col)? != marker {
+                continue;
+            }
+            version.push(marker);
+            col += 1;
+            loop {
+                let c = cell_char(screen, row, col)?;
+                if !(c.is_ascii_alphanumeric() || c == '.' || c == '-') {
+                    break;
+                }
+                version.push(c);
+                col += 1;
+            }
         }
         let end = cell_char(screen, row, col)?;
         let ended = match self.end {
