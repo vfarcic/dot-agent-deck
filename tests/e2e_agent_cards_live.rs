@@ -389,9 +389,15 @@ fn live_002_a_real_agents_reported_pull_request_is_checked_by_the_deck() {
             unreachable!()
         }
     };
-    // The token never reaches a diagnostic, and it is not in the agent's own
-    // environment: the pane's `GH_TOKEN` is set empty below, so only the
-    // daemon's `gh` reads it.
+    // The token is registered for redaction before anything launches, so the
+    // diagnostics and recordings the harness writes have it replaced. It is
+    // handed to the deck's launch environment: the TUI, the CLI children the
+    // harness runs at launch and the daemon all receive it, and the daemon's
+    // `gh` is the one that uses it. This Haiku pane overrides `GH_TOKEN` with an
+    // empty value below, so the token is not inherited into the agent's own
+    // environment — but the agent runs as the same OS user and can still read
+    // the daemon's or the TUI's environment through `/proc`. This is an
+    // isolated HOME and configuration, not an OS credential sandbox.
     common::register_diagnostic_redactions([token.clone()]);
 
     let scratch = common::harness_tempdir().expect("live checked-reference scratch");
@@ -421,6 +427,9 @@ fn live_002_a_real_agents_reported_pull_request_is_checked_by_the_deck() {
             cols: 156,
             env: vec![
                 ("DOT_AGENT_DECK_PANE_ID".into(), REFS_PANE_ID.into()),
+                // Not inherited from the daemon into this pane; see the
+                // comment where the token is registered for what that does
+                // and does not keep from the agent.
                 ("GH_TOKEN".into(), String::new()),
             ],
             display_name: Some("refs Haiku".into()),

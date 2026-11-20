@@ -37,10 +37,17 @@ const WAIT: Duration = Duration::from_secs(20);
 /// whose agent works there resolves against it.
 const ORIGIN_REPO: &str = "test-org/test-repo";
 
-/// The daemon's `gh`. It records every call, holds a scripted answer while
-/// its `.hold` file exists (at most 25 s, inside the daemon's 30 s `gh`
-/// timeout), then prints the answer's stderr and stdout and exits with its
-/// code.
+/// The daemon's `gh`. It records every call as it starts, waits while the
+/// reference's `.hold` file exists, then reads the reference's `.current`
+/// pointer ONCE and answers from the bundle directory it names: that
+/// bundle's `stderr` and `json`, and its `exit` code.
+///
+/// The hold has no clock of its own: it ends when the test removes the file,
+/// when the daemon's own `gh` timeout kills this process, or when the
+/// fixture's directory is deleted at teardown. Bundles are written in full
+/// before the pointer names them and never change afterwards
+/// ([`RefDeck::answer`]), so a call reads one whole answer, never a mix of
+/// two.
 const GH_STUB: &str = r#"#!/bin/sh
 printf '%s\n' "$*" >> "$GH_STUB_DIR/calls"
 case "$1 $2" in
@@ -49,15 +56,15 @@ case "$1 $2" in
 esac
 [ "$4" = --repo ] && [ "$6" = --json ] && [ "$#" -eq 7 ] || { printf 'unexpected gh argv: %s\n' "$*" >&2; exit 92; }
 answer="$GH_STUB_DIR/answers/$1-$(printf '%s' "$5" | tr '/' '_')-$3"
-waited=0
-while [ -f "$answer.hold" ] && [ "$waited" -lt 250 ]; do
+while [ -f "$answer.hold" ]; do
     sleep 0.1
-    waited=$((waited + 1))
 done
-[ -f "$answer.exit" ] || { printf 'no answer scripted for: %s\n' "$*" >&2; exit 93; }
-[ ! -f "$answer.stderr" ] || cat "$answer.stderr" >&2
-[ ! -f "$answer.json" ] || cat "$answer.json"
-exit "$(cat "$answer.exit")"
+bundle="$(cat "$answer.current" 2>/dev/null)"
+[ -n "$bundle" ] && [ -f "$GH_STUB_DIR/answers/$bundle/exit" ] || { printf 'no answer scripted for: %s\n' "$*" >&2; exit 93; }
+dir="$GH_STUB_DIR/answers/$bundle"
+[ ! -f "$dir/stderr" ] || cat "$dir/stderr" >&2
+[ ! -f "$dir/json" ] || cat "$dir/json"
+exit "$(cat "$dir/exit")"
 "#;
 
 /// A `gh` a CLIENT finds on its own `PATH`: it records that it ran and
@@ -157,22 +164,39 @@ impl RefDeck {
             .join(format!("{kind}-{}-{number}", repo.replace('/', "_")))
     }
 
-    /// Script `gh <kind> view <number> --repo <repo>`'s answer. Written
-    /// stdout and stderr first and the exit code last, so a reference's first
-    /// answer is not read before its output is in place.
+    /// Script `gh <kind> view <number> --repo <repo>`'s answer, replacing any
+    /// earlier one for every call that starts reading it afterwards. The
+    /// answer is a new bundle directory, written in full and never touched
+    /// again; the reference's `.current` pointer is then swapped to name it
+    /// with one `rename`, so a call that already read the pointer finishes
+    /// with the old bundle and a later one reads only the new.
     fn answer(&self, kind: &str, repo: &str, number: u64, exit: i32, stdout: &str, stderr: &str) {
         let base = self.answer_base(kind, repo, number);
-        for (ext, content) in [("json", stdout), ("stderr", stderr)] {
-            let path = base.with_extension(ext);
-            if content.is_empty() {
-                let _ = std::fs::remove_file(path);
-            } else {
-                std::fs::write(path, content).unwrap();
+        let name = base.file_name().unwrap().to_string_lossy().into_owned();
+        let bundle = format!("{name}.{}", unique());
+        let dir = base.with_file_name(&bundle);
+        std::fs::create_dir(&dir).unwrap();
+        for (file, content) in [("json", stdout), ("stderr", stderr)] {
+            if !content.is_empty() {
+                std::fs::write(dir.join(file), content).unwrap();
             }
         }
-        let pending = base.with_extension("exit-pending");
-        std::fs::write(&pending, exit.to_string()).unwrap();
-        std::fs::rename(pending, base.with_extension("exit")).unwrap();
+        std::fs::write(dir.join("exit"), exit.to_string()).unwrap();
+        let pointer = base.with_extension("current-pending");
+        std::fs::write(&pointer, &bundle).unwrap();
+        std::fs::rename(pointer, base.with_extension("current")).unwrap();
+    }
+
+    /// How many lookups of `gh <kind> view <number> --repo <repo>` have
+    /// STARTED. The daemon never runs two lookups of one reference at once
+    /// and records each answer before it starts the next, so a count of
+    /// `n + 1` means the `n`th answer is already in what `card list` shows.
+    fn lookups_of(&self, kind: &str, repo: &str, number: u64) -> usize {
+        let prefix = format!("{kind} view {number} --repo {repo} ");
+        self.lookups()
+            .iter()
+            .filter(|c| c.starts_with(&prefix))
+            .count()
     }
 
     fn hold(&self, kind: &str, repo: &str, number: u64, held: bool) {
@@ -343,6 +367,101 @@ fn wait_ref(
 
 fn status_is(status: &'static str) -> impl Fn(&Value) -> bool {
     move |r| r["result"]["status"] == status
+}
+
+fn rfc3339(at: &Value) -> chrono::DateTime<chrono::FixedOffset> {
+    at.as_str()
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        .unwrap_or_else(|| panic!("checked_at is an RFC 3339 time: {at}"))
+}
+
+/// The pending handshake. For each candidate number in turn: hold the
+/// stand-in's answer for `#<number>`, have `pane`'s agent publish a card
+/// naming it, and poll until the card reads pending, resolved against the
+/// folder's origin, with that lookup started — then release the hold and
+/// return the number. The hold is released as soon as the poll ends, before
+/// the test waits on anything else, so nothing but the daemon's own `gh`
+/// timeout bounds it.
+///
+/// Should that timeout end the held lookup before the test sees it pending (a
+/// starved runner), the card no longer reads pending; the candidate is
+/// released and the card names the next one instead, a fresh reference with
+/// no answer yet.
+fn observe_pending_then_release(deck: &RefDeck, pane: &Pane, candidates: &[u64]) -> u64 {
+    let mut missed = Vec::new();
+    for &number in candidates {
+        deck.hold("pr", ORIGIN_REPO, number, true);
+        deck.answer(
+            "pr",
+            ORIGIN_REPO,
+            number,
+            0,
+            &pr_json(
+                ORIGIN_REPO,
+                number,
+                "OPEN",
+                "REVIEW_REQUIRED",
+                json!([]),
+                "REFS-002 open one",
+            ),
+            "",
+        );
+        let claim = format!("#{number}");
+        publish(
+            &deck.daemon,
+            pane,
+            &json!({"status": "working", "fields": [
+                {"name": "pull-request", "value": claim}
+            ]}),
+        );
+        let last = RefCell::new(None);
+        let ended = common::wait_until(common::load_scaled(WAIT), || {
+            // The lookup count is read before the card, so a started lookup
+            // is one that had started when the card was read.
+            let started = deck.lookups_of("pr", ORIGIN_REPO, number) > 0;
+            let found = checked_in(&list(&deck.daemon), pane, "pull-request")
+                .filter(|r| r["claim"] == claim.as_str());
+            let ended = found.as_ref().is_some_and(|r| {
+                r["result"] != json!({"status": "pending"}) || (started && r["repo"] == ORIGIN_REPO)
+            });
+            *last.borrow_mut() = found;
+            ended
+        });
+        deck.hold("pr", ORIGIN_REPO, number, false);
+        let found = last.into_inner();
+        assert!(
+            ended,
+            "{claim}'s lookup never started while it was held: {found:#?}"
+        );
+        let found = found.unwrap();
+        if found["result"] == json!({"status": "pending"}) {
+            assert_eq!(
+                found["url"],
+                format!("https://github.com/{ORIGIN_REPO}/pull/{number}"),
+                "{found:#}"
+            );
+            return number;
+        }
+        missed.push(found);
+    }
+    panic!("no held lookup was seen pending before the daemon's gh timeout ended it: {missed:#?}");
+}
+
+/// Wait until at least `count` lookups of `ORIGIN_REPO`'s pull request
+/// `number` have started, then return `pane`'s pull-request reference as
+/// `card list` shows it: every answer before the last started lookup is in
+/// it ([`RefDeck::lookups_of`]).
+fn after_lookups(deck: &RefDeck, pane: &Pane, number: u64, count: usize) -> Value {
+    let reached = common::wait_until(common::load_scaled(WAIT), || {
+        deck.lookups_of("pr", ORIGIN_REPO, number) >= count
+    });
+    assert!(
+        reached,
+        "#{number} was looked up {} times, waiting for {count}: {:?}",
+        deck.lookups_of("pr", ORIGIN_REPO, number),
+        deck.lookups()
+    );
+    checked_in(&list(&deck.daemon), pane, "pull-request").unwrap()
 }
 
 /// What `gh pr view --json` prints for a pull request.
@@ -526,12 +645,20 @@ fn refs_001_reported_references_show_the_decks_own_check() {
     let mut calls = deck.lookups();
     calls.sort();
     assert_eq!(calls, expected, "one lookup each, with the documented argv");
-    std::thread::sleep(common::load_scaled(Duration::from_secs(3)));
-    let mut calls = deck.lookups();
-    calls.sort();
-    assert_eq!(
-        calls, expected,
-        "a settled reference is not looked up again"
+    // Three one-second refresh intervals with no further call: polled
+    // throughout, so a repeat lookup fails the test as soon as it is made.
+    let sorted_lookups = || {
+        let mut calls = deck.lookups();
+        calls.sort();
+        calls
+    };
+    let looked_again = common::wait_until(common::load_scaled(Duration::from_secs(3)), || {
+        sorted_lookups() != expected
+    });
+    assert!(
+        !looked_again,
+        "a settled reference is not looked up again: {:?}",
+        sorted_lookups()
     );
 }
 
@@ -539,8 +666,9 @@ fn refs_001_reported_references_show_the_decks_own_check() {
 /// one whose lookup the stand-in `gh` holds (it reads pending until the
 /// answer comes, then open), one `gh` says it cannot find, one `gh` refuses
 /// for authentication, and a GitLab link the deck does not look up. Each
-/// shows its reason with the deck's fixed sentence; when the open pull
-/// request's next lookup fails, its last answer stays and reads stale; a
+/// shows its reason with the deck's fixed sentence; once the open pull
+/// request's lookups fail, its last answer stays, reads stale and keeps its
+/// `checked_at` through later failed lookups; a
 /// rate-limited lookup reads `rate_limited` and holds back a reference named
 /// after it. On a daemon whose `PATH` has no `gh`, a reference reads
 /// `no_github_access`, and a bare `#N` in a folder with no GitHub origin
@@ -552,24 +680,56 @@ fn refs_002_unchecked_references_say_why() {
     let other = deck.scratch.path().join("elsewhere");
     std::fs::create_dir_all(&other).unwrap();
 
-    // Pending, then checked: the lookup is held until the test has seen it
-    // pending.
-    deck.hold("pr", ORIGIN_REPO, 50, true);
+    // Pending, then checked: a short handshake done before any other
+    // reference is named or waited on.
+    let first = deck.agent("refs-first", &deck.repo);
+    let open = observe_pending_then_release(&deck, &first, &[50, 51, 52]);
+    let fresh = wait_ref(
+        &deck.daemon,
+        &first,
+        "pull-request",
+        "checked",
+        status_is("checked"),
+    );
+    assert_eq!(fresh["result"]["state"], "open", "{fresh:#}");
+    assert_eq!(fresh["result"]["stale"], false, "{fresh:#}");
+
+    // The open pull request is read again every second; its answer now
+    // fails, so its last answer is kept and says it is stale. A lookup
+    // already running when the answer is switched may still succeed and
+    // move `checked_at`, so the test does not compare with the success it
+    // saw above: it waits until a lookup that started after the switch has
+    // been recorded, then checks that `checked_at` stays put across a
+    // further failed lookup.
     deck.answer(
         "pr",
         ORIGIN_REPO,
-        50,
-        0,
-        &pr_json(
-            ORIGIN_REPO,
-            50,
-            "OPEN",
-            "REVIEW_REQUIRED",
-            json!([]),
-            "REFS-002 open one",
-        ),
+        open,
+        1,
         "",
+        "error connecting to api.github.com\n",
     );
+    let switched = deck.lookups_of("pr", ORIGIN_REPO, open);
+    let stale = after_lookups(&deck, &first, open, switched + 2);
+    assert_eq!(stale["result"]["status"], "checked", "{stale:#}");
+    assert_eq!(stale["result"]["state"], "open", "{stale:#}");
+    assert_eq!(stale["result"]["stale"], true, "{stale:#}");
+    let checked_at = stale["result"]["checked_at"].clone();
+    assert!(
+        rfc3339(&checked_at) >= rfc3339(&fresh["result"]["checked_at"]),
+        "a stale answer keeps the time of a successful check: {stale:#}"
+    );
+    // `seen + 2`: lookup `seen + 1` started after the card above was read,
+    // and it is recorded once lookup `seen + 2` starts.
+    let seen = deck.lookups_of("pr", ORIGIN_REPO, open);
+    let later = after_lookups(&deck, &first, open, seen + 2);
+    assert_eq!(later["result"]["stale"], true, "{later:#}");
+    assert_eq!(later["result"]["state"], "open", "{later:#}");
+    assert_eq!(
+        later["result"]["checked_at"], checked_at,
+        "a stale answer keeps the time it was checked across later failed lookups"
+    );
+
     deck.answer(
         "issue",
         ORIGIN_REPO,
@@ -586,14 +746,12 @@ fn refs_002_unchecked_references_say_why() {
         "",
         "To get started with GitHub CLI, please run:  gh auth login\n",
     );
-
-    let first = deck.agent("refs-first", &deck.repo);
     let second = deck.agent("refs-second", &other);
     publish(
         &deck.daemon,
         &first,
         &json!({"status": "working", "fields": [
-            {"name": "pull-request", "value": "#50"},
+            {"name": "pull-request", "value": format!("#{open}")},
             {"name": "issue", "value": "test-org/test-repo#404"}
         ]}),
     );
@@ -604,24 +762,6 @@ fn refs_002_unchecked_references_say_why() {
             {"name": "pull-request", "value": "locked-org/locked-repo#60"},
             {"name": "issue", "value": "https://gitlab.com/some-org/some-repo/-/issues/3"}
         ]}),
-    );
-
-    let pending = wait_ref(
-        &deck.daemon,
-        &first,
-        "pull-request",
-        "pending while its lookup runs",
-        |r| {
-            // Resolved against the folder's origin, and its lookup started.
-            r["result"] == json!({"status": "pending"})
-                && r["repo"] == ORIGIN_REPO
-                && deck.lookups().iter().any(|c| c.starts_with("pr view 50 "))
-        },
-    );
-    assert_eq!(pending["repo"], ORIGIN_REPO, "{pending:#}");
-    assert_eq!(
-        pending["url"],
-        "https://github.com/test-org/test-repo/pull/50"
     );
 
     let not_found = wait_ref(
@@ -681,38 +821,6 @@ fn refs_002_unchecked_references_say_why() {
         deck.lookups()
     );
 
-    deck.hold("pr", ORIGIN_REPO, 50, false);
-    let fresh = wait_ref(
-        &deck.daemon,
-        &first,
-        "pull-request",
-        "checked",
-        status_is("checked"),
-    );
-    assert_eq!(fresh["result"]["state"], "open", "{fresh:#}");
-    assert_eq!(fresh["result"]["stale"], false, "{fresh:#}");
-    let checked_at = fresh["result"]["checked_at"].clone();
-
-    // The open pull request is read again every second; that lookup now
-    // fails, so its last answer is kept and says it is stale.
-    deck.answer(
-        "pr",
-        ORIGIN_REPO,
-        50,
-        1,
-        "",
-        "error connecting to api.github.com\n",
-    );
-    let stale = wait_ref(&deck.daemon, &first, "pull-request", "stale", |r| {
-        r["result"]["stale"] == true
-    });
-    assert_eq!(stale["result"]["status"], "checked", "{stale:#}");
-    assert_eq!(stale["result"]["state"], "open", "{stale:#}");
-    assert_eq!(
-        stale["result"]["checked_at"], checked_at,
-        "a stale answer keeps the time it was checked"
-    );
-
     // Rate limited, last: the daemon holds reference lookups back after it.
     deck.answer(
         "pr",
@@ -761,7 +869,20 @@ fn refs_002_unchecked_references_say_why() {
     );
     let held = wait_ref(&deck.daemon, &third, "issue", "listed", |_| true);
     assert_eq!(held["result"], json!({"status": "pending"}), "{held:#}");
-    std::thread::sleep(common::load_scaled(Duration::from_secs(3)));
+    // Three one-second refresh intervals, well inside the pause: polled
+    // throughout, so a lookup or a result for it fails the test as soon as
+    // it shows.
+    let still_pending = || {
+        checked_in(&list(&deck.daemon), &third, "issue")
+            .is_some_and(|r| r["result"] == json!({"status": "pending"}))
+    };
+    let moved = common::wait_until(common::load_scaled(Duration::from_secs(3)), || {
+        deck.lookups_of("issue", "busy-org/busy-repo", 71) > 0 || !still_pending()
+    });
+    assert!(
+        !moved,
+        "the reference named during the rate-limit pause was looked up or answered"
+    );
     let held = checked_in(&list(&deck.daemon), &third, "issue").unwrap();
     assert_eq!(
         held["result"],
