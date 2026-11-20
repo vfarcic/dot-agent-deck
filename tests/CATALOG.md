@@ -14552,6 +14552,45 @@ The TUI renders no cards in this slice (the desktop app does; `docs/desktop/agen
 - **Does not assert:** `confirm_detail`'s pending-work wording.
 - **Platform coverage:** mac+linux.
 
+#### agent-report/tree
+
+##### agent-report/tree/001 — Cards hang under the agent that started them.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_agent_cards.rs`).
+- **Agent:** synthetic routing stand-ins as dispatcher, dispatched single unit and standalone agent, and a dispatched two-role team of capability-exporting `cat` seats; no real agent.
+- **Asserts:** `card list` holds exactly five entries in tree order — the dispatcher (`kind: dispatcher`, no `parent`), the unit (`agent`) and the team's orchestrator (`orchestrator`) with the dispatcher as `parent`, the worker (`role`) with the orchestrator as `parent`, then the standalone agent (`agent`, no `parent`) started last; the dispatcher's `rollup.total` is 3 and the orchestrator's 1, the leaves carry no `rollup`, and the unit and orchestrator still name the dispatcher in `relations`.
+- **Does not assert:** a dispatcher dispatched by a dispatcher, a child whose parent's card is gone, or cycles (the `agent_cards` unit tests); the desktop's drawing of the tree (`desktop/agent-cards/*`).
+- **Platform coverage:** mac+linux.
+
+##### agent-report/tree/002 — A grandchild's status rolls up to the root.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_agent_cards.rs`).
+- **Agent:** the tree of `agent-report/tree/001`, whose statuses the test reports through the hook socket with each pane's own capability; no real agent.
+- **Asserts:** with the unit idle and the orchestrator and worker thinking, the dispatcher's `rollup` is `{total: 3, worst: thinking, counts: {idle: 1, thinking: 2}, needs_you: 0}`; after the worker (the dispatcher's grandchild) reports `quota_blocked`, it becomes `{total: 3, worst: blocked, counts: {blocked: 1, idle: 1, thinking: 1}, needs_you: 1}` and the orchestrator's `{total: 1, worst: blocked, counts: {blocked: 1}, needs_you: 1}`, while both cards' own `status` stays `thinking`, the dispatcher's own `needs_you` stays false, the worker reads `blocked` with reason `blocked`, and the list's order is unchanged.
+- **Does not assert:** every status word's place in the severity order (the `agent_cards` unit tests); a roll-up's doorbell timing.
+- **Platform coverage:** mac+linux.
+
+#### agent-report/refs
+
+##### agent-report/refs/001 — A reported pull request and issue show the deck's own check.
+- **Layer:** L2 headless, lane 1 (`tests/e2e_agent_cards_refs.rs`).
+- **Agent:** one capability-exporting `cat` pane in a fixture clone whose `origin` is `github.com/test-org/test-repo`, under a daemon whose `PATH` has a stand-in `gh` answering from files; no real agent, no GitHub.
+- **Asserts:** after a report with `pull-request` = `#41` and `issue` = `other-org/other-repo#7`, `checked_refs` shows the pull request with its claim as written, `repo` resolved from the folder's origin, the canonical `https://github.com/test-org/test-repo/pull/41`, and the deck's check `merged`, CI `failing` (1 passing, 1 failing), review `approved`, its title, `stale: false` and an RFC 3339 `checked_at`; the issue as `closed` with its canonical `/issues/7` link and no CI or review; the report's own field values are unchanged; the daemon ran exactly `gh pr view 41 --repo test-org/test-repo --json …` and `gh issue view 7 --repo other-org/other-repo --json number,state,title,url`, and with a one-second refresh does not look either up again.
+- **Does not assert:** a full URL claim (`agent-report/live/002` reports one) or answers whose link names another repository or number (the `reference_check` unit tests).
+- **Platform coverage:** mac+linux.
+
+##### agent-report/refs/002 — A reference the deck cannot check says why.
+- **Layer:** L2 headless, lane 1 (`tests/e2e_agent_cards_refs.rs`).
+- **Agent:** capability-exporting `cat` panes under two daemons, one with the stand-in `gh` and a one-second refresh, one whose `PATH` holds only `git` and `cat`; no real agent, no GitHub.
+- **Asserts:** while the stand-in holds a lookup, the reference reads `{status: pending}` with its repository and link already known, then `checked` `open` once released; `gh` answering `Could not resolve to` reads `not_found`, exit 4 reads `no_github_access`, and a GitLab link reads `unrecognised` with no link and no `gh` call, each with the deck's fixed sentence as `detail`; when the open pull request's next lookup fails, it keeps `state: open` and its `checked_at` and reads `stale: true`; a rate-limited lookup reads `rate_limited`, and a reference named after it stays `pending` with no `gh` call for it; with no `gh` on the daemon's `PATH` a reference reads `no_github_access`, and a bare `#5` from a folder with no GitHub origin reads `unrecognised` (`no GitHub origin for this agent's folder`).
+- **Does not assert:** the end of the five-minute rate-limit pause, the failure backoff's length or the lookup budget (the `reference_check` unit tests).
+- **Platform coverage:** mac+linux.
+
+##### agent-report/refs/003 — The check a client shows is the one made on the daemon's host.
+- **Layer:** L2 headless, lane 1 (`tests/e2e_agent_cards_refs.rs`).
+- **Agent:** one capability-exporting `cat` pane under a daemon with the stand-in `gh`; no real agent, no GitHub.
+- **Asserts:** `card list` run with a `PATH` whose own `gh` records every call and answers nothing shows `test-org/test-repo#88` as `merged` with the deck's title and canonical link; the daemon's `gh` made the one lookup and the client's `gh` was never run.
+- **Does not assert:** a client on another machine: the client reaches the daemon over its local attach socket, not over a remote deck's SSH tunnel (`fleet/observe/002` covers that transport; this test does not list cards through it), so the daemon's host and the client's are one machine told apart only by their `PATH`s.
+- **Platform coverage:** mac+linux.
+
 #### agent-report/live
 
 ##### agent-report/live/001 — A real agent publishes its card and acts on a card action.
@@ -14559,6 +14598,13 @@ The TUI renders no cards in this slice (the desktop app does; `docs/desktop/agen
 - **Agent:** Claude Code (interactive Haiku; onboarding and trust seeded, `--allowedTools Bash Read Write`).
 - **Asserts:** told to publish a waiting card with a question that suggests the user catalog's `touch-sentinel` action, and a custom action of its own, the agent's card appears in `card list` with that report; pressing its own custom action delivers the agent's text framed as untrusted and the agent still creates the file that text names; `card act --action touch-sentinel` sends the prompt, the agent creates the uniquely named sentinel file, the action's `last_delivery` reaches `delivered`, the card's report turns `done`, and the attached TUI shows the sentinel's name in the agent's pane.
 - **Does not assert:** the desktop app's cards with a real agent (no native-driver test in this slice).
+- **Platform coverage:** mac+linux.
+
+##### agent-report/live/002 — A real agent's reported pull request is checked by the deck.
+- **Layer:** L2 PTY-attached, lane 2 (real agent) (`tests/e2e_agent_cards_live.rs`).
+- **Agent:** Claude Code (interactive Haiku; onboarding and trust seeded, `--allowedTools Bash Read Write`); the daemon's `gh` is the host's, logged in with the token `gh auth token` prints on the host, which the pane's own environment does not carry.
+- **Asserts:** told to create a uniquely named sentinel file and publish its card with `pull-request` = `https://github.com/vfarcic/dot-agent-deck/pull/2378`, the agent creates the sentinel, its card shows that claim as written, and `checked_refs` shows the deck's check: `vfarcic/dot-agent-deck` #2378, the canonical link, `checked`, `merged`, not stale. Skips (a failure under `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1`) when the host's `gh` is not logged in or the deck's lookup reads `no_github_access`.
+- **Does not assert:** the desktop's badge for the reference (`desktop/agent-cards/*`); the TUI draws no cards.
 - **Platform coverage:** mac+linux.
 
 ### Docs cross-reference skips
