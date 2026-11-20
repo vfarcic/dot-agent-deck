@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { DesktopAgentDto } from "./bridge";
 import { statusFromDaemon } from "./bridge";
-import { statusLabel } from "../types";
+import { statusWord, statusWordLabel } from "./statusWords";
 import {
   buildDashboardFilterHeader,
   clearDashboardFilter,
@@ -209,7 +209,7 @@ describe("Waiting is its own status, never Idle or Needs input (issue #1757)", (
   it("maps the daemon's word to its own column and label", () => {
     expect(statusFromDaemon("waiting")).toBe("waiting");
     expect(statusFromDaemon("WAITING")).toBe("waiting");
-    expect(statusLabel(statusFromDaemon("waiting"))).toBe("waiting");
+    expect(statusWordLabel(statusWord({ status: statusFromDaemon("waiting"), daemonStatus: "waiting" }))).toBe("waiting");
     expect(statusFromDaemon("waiting_for_input")).toBe("needs_input");
   });
 

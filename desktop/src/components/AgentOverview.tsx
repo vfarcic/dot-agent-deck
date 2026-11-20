@@ -2,7 +2,8 @@ import { Children, cloneElement, createContext, isValidElement, useCallback, use
 import { Blocks, Boxes, CircleArrowUp, CircleStop, Columns3, FileCog, Filter, LayoutList, Layers, Maximize2, Network, Play, Plus, RefreshCw, RotateCcw, Server, ShieldAlert, Sparkles, SquareTerminal, Wrench, X } from "lucide-react";
 import { desktopFeaturesOf } from "../types";
 import { KEEP_WORKTREE_SUFFIX, worktreePreview } from "../lib/worktreeClose";
-import { statusLabel, type AgentSession, type AgentStatus, type ConnectionView, type DeckRuntimeState, type DeckView, type GenerateConfigResult } from "../types";
+import { type AgentSession, type AgentStatus, type ConnectionView, type DeckRuntimeState, type DeckView, type GenerateConfigResult } from "../types";
+import { STATUS_WORD_ORDER, statusWord, statusWordLabel, type StatusWord } from "../lib/statusWords";
 import { modeScopedKey, type DesktopAgentDto } from "../lib/bridge";
 import { buildDashboardFilterHeader, clearDashboardFilter, DASHBOARD_AGENT_TYPES, DASHBOARD_FILTER_TEXT_MAX, DASHBOARD_KINDS, DASHBOARD_STATUSES, dashboardFilterActive, filterDashboardAgents, removeDashboardFilterFacet, setDashboardFilter, useDashboardFilter, type DashboardFilter, type DashboardFilterFacts } from "../lib/dashboardFilter";
 import { VOICE_ACTIONS, type DashboardScroll, type NewAgentVoice, type NewAgentVoiceChannel, type VoiceActionContext, type VoiceDispatchTarget, type VoiceOverviewChannel } from "../lib/voiceActions";
@@ -380,16 +381,14 @@ function roleIndexOf(agent: OverviewAgent): number {
 }
 
 /**
- * Statuses in the order an operator scans them: what needs attention first.
- * Idle comes after every state a person has to act on (issue #1676).
+ * How many agents show each status word, in `STATUS_WORD_ORDER` (issue #2411:
+ * the daemon's words, so Thinking, Working and Compacting are counted apart,
+ * as the TUI's stats bar counts them).
  */
-// Issue #1757: Waiting after the states a person acts on, before Idle — its
-// work is not done, but nothing needs the user.
-const STATUS_ORDER: AgentStatus[] = ["running", "needs_input", "failed", "blocked", "waiting", "idle", "queued", "passed", "stopped"];
-
-export function countByStatus(agents: OverviewAgent[]): { status: AgentStatus; count: number }[] {
-  return STATUS_ORDER
-    .map((status) => ({ status, count: agents.filter((agent) => agent.status === status).length }))
+export function countByStatus(agents: OverviewAgent[]): { status: StatusWord; count: number }[] {
+  const words = agents.map(statusWord);
+  return STATUS_WORD_ORDER
+    .map((status) => ({ status, count: words.filter((word) => word === status).length }))
     .filter((entry) => entry.count > 0);
 }
 
@@ -1237,7 +1236,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   // PRD #1666 part 3, round 5-wake (Q6); issue #2387: who the deck holds the
   // doorbell for, over the decks that answered, as the counters beside it are.
   const heldOnDecks = useMemo(() => decks.filter((deck) => deck.connected).flatMap((deck) => deck.snapshot.agents), [decks]);
-  const countOf = (status: AgentStatus) => aggregate.counts.find((entry) => entry.status === status)?.count ?? 0;
+  const countOf = (status: StatusWord) => aggregate.counts.find((entry) => entry.status === status)?.count ?? 0;
   /**
    * PRD #802 M2 — the overview's "Open deck" controls and
    * its row-level open all dispatch through the action registry. The context is
@@ -1966,21 +1965,24 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
             <DeckAttention agents={heldOnDecks} from="overview" context={voiceContext} />
             {/*
               Issue #2312 follow-up: the counters are one button that names
-              only what needs someone (needs input, failed, daemons not
+              only what needs someone (needs input, error, daemons not
               answering) and opens the full set on hover, click or voice.
               Issue #1757: WAITING is counted beside IDLE because the TUI's
               stats bar counts it (CLAUDE.md rule 22).
             */}
             <DashboardCounters
-              summary={{ known, agents: aggregate.agents.length, needsInput: countOf("needs_input"), failed: countOf("failed"), decksUp: aggregate.decksUp, decksTotal: decks.length }}
+              summary={{ known, agents: aggregate.agents.length, needsInput: countOf("needs_input"), errors: countOf("error"), decksUp: aggregate.decksUp, decksTotal: decks.length }}
               open={countersOpen}
               onOpen={() => VOICE_ACTIONS.showDashboardCounters.run(voiceContext)}
               onClose={() => setCountersOpen(false)}
             >
               <OverviewInstrument label="AGENTS" testId="overview-count-agents"><OverviewCount known={known} value={aggregate.agents.length} /></OverviewInstrument>
-              <OverviewInstrument label="RUNNING" testId="overview-count-running"><OverviewCount known={known} value={countOf("running")} className="count-running" /></OverviewInstrument>
+              {/* Issue #2411: the daemon's words, each counted apart, as the TUI's stats bar counts them. */}
+              <OverviewInstrument label="WORKING" testId="overview-count-working"><OverviewCount known={known} value={countOf("working")} className="count-working" /></OverviewInstrument>
+              <OverviewInstrument label="THINKING" testId="overview-count-thinking"><OverviewCount known={known} value={countOf("thinking")} className="count-thinking" /></OverviewInstrument>
+              <OverviewInstrument label="COMPACTING" testId="overview-count-compacting"><OverviewCount known={known} value={countOf("compacting")} className="count-compacting" /></OverviewInstrument>
               <OverviewInstrument label="NEEDS INPUT" testId="overview-count-needs-input"><OverviewCount known={known} value={countOf("needs_input")} className="count-needs-input" /></OverviewInstrument>
-              <OverviewInstrument label="FAILED" testId="overview-count-failed"><OverviewCount known={known} value={countOf("failed")} className="count-failed" /></OverviewInstrument>
+              <OverviewInstrument label="ERROR" testId="overview-count-error"><OverviewCount known={known} value={countOf("error")} className="count-error" /></OverviewInstrument>
               <OverviewInstrument label="WAITING" testId="overview-count-waiting"><OverviewCount known={known} value={countOf("waiting")} className="count-waiting" /></OverviewInstrument>
               <OverviewInstrument label="IDLE" testId="overview-count-idle"><OverviewCount known={known} value={countOf("idle")} /></OverviewInstrument>
               <OverviewInstrument label="GROUPS" testId="overview-count-groups"><OverviewCount known={known} value={aggregate.groups} /></OverviewInstrument>
@@ -2159,7 +2161,7 @@ interface FleetDeck {
   shownCount: number;
   /** The agents the filter shows (all of {@link agents} while none is set): the Cards view shows their cards. */
   matchingAgents: OverviewAgent[];
-  counts: { status: AgentStatus; count: number }[];
+  counts: { status: StatusWord; count: number }[];
   connected: boolean;
 }
 
@@ -2360,7 +2362,7 @@ function DeckGroup({ deck, cardsBody, now, columns, filtering, fleetSize, overri
         {deck.connected && deck.snapshot.hostMetrics && <HostMetricsButton report={deck.snapshot.hostMetrics} deckLabel={deckName(connection)} open={hostOpen} onOpen={onOpenHost} onClose={onCloseHost} />}
         {deck.connected && deck.agents.length > 0 && (
           <div className="daemon-pips">{deck.counts.map((entry) => (
-            <span className={`status-label status-${entry.status}`} key={entry.status}>{entry.count} {statusLabel(entry.status)}</span>
+            <span className={`status-label status-${entry.status}`} key={entry.status}>{entry.count} {statusWordLabel(entry.status)}</span>
           ))}</div>
         )}
         {/*
@@ -2979,7 +2981,7 @@ function OverviewGroupCard({ group, now, columns }: { group: OverviewGroup; now:
         )}
         <span className="overview-group-count">{group.agents.length} {group.agents.length === 1 ? "agent" : "agents"}</span>
         <div className="overview-group-pips">{counts.map((entry) => (
-          <span className={`status-label status-${entry.status}`} key={entry.status}>{entry.count} {statusLabel(entry.status)}</span>
+          <span className={`status-label status-${entry.status}`} key={entry.status}>{entry.count} {statusWordLabel(entry.status)}</span>
         ))}</div>
         {/* PRD #1223 U4: the TUI's Ctrl+W on this orchestration's tab — every role, after a confirmation that names them. */}
         {stopControls && group.kind === "orchestration" && (
@@ -3102,8 +3104,8 @@ function OverviewRow({ agent, hoistedCwd, now, columns }: { agent: OverviewAgent
         // `aria-hidden` — the label beside it is already the readable value.
         return (
           <td className="overview-state" role="cell" key={column}>
-            <span className={`agent-state-mark status-${agent.status}`} aria-hidden="true" />
-            <span className={`status-label status-${agent.status}`}>{statusLabel(agent.status)}</span>
+            <span className={`agent-state-mark status-${statusWord(agent)}`} aria-hidden="true" />
+            <span className={`status-label status-${statusWord(agent)}`}>{statusWordLabel(statusWord(agent))}</span>
             {/* Issue #2387: the tile's marker, beside the status it never replaces. */}
             {agent.holdWords && <span className="held-marker" title={agent.holdWords}>{INBOX_WORDS.attentionHeld}</span>}
           </td>

@@ -590,3 +590,84 @@ fn held_for(codex: &Installed, id: &str, name: &str, draft: &str, since: usize, 
     });
     codex.expect_composer(draft);
 }
+
+// ---------------------------------------------------------------------------
+// inbox/probe/103
+// ---------------------------------------------------------------------------
+
+/// Scenario: In real interactive Codex in an installed pane, type `/cd` into a sibling project whose `.codex/config.toml` moves Codex's editor from Ctrl+G to F6, so Ctrl+G no longer opens the deck's check, then queue a sentinel task. Codex's status line names the new folder, the deck refuses its check because Codex moved to another folder, the TUI card and the desktop tile get the existing `the deck can't check this agent's input box` hold, and for the rest of the wait the deck types nothing into the pane, rings nothing and the task stays queued.
+#[spec("inbox/probe/103")]
+#[test]
+fn probe_103_live_a_codex_moved_by_cd_is_not_checked() {
+    skip_unless!(codex_installed::checkable());
+    let codex = Installed::new(&[]);
+    // A sibling of the folder Codex starts in, in the same trusted
+    // repository, outside the folders whose project files the deck reads
+    // at the spawn.
+    let moved = codex.deck.workdir().join("moved-p103");
+    std::fs::create_dir_all(moved.join(".codex")).unwrap();
+    std::fs::write(
+        moved.join(".codex/config.toml"),
+        "[tui.keymap.global]\nopen_external_editor = \"f6\"\n",
+    )
+    .unwrap();
+    codex.assert_installed();
+    codex.wait_armable();
+    let since = codex.log().len();
+    let mut person = codex.input();
+    let line = format!("/cd {}", moved.display());
+    person.write(&line);
+    codex.expect_composer(&line);
+    person.write("\r");
+    let shown = format!("· {}", moved.display());
+    assert!(
+        common::wait_until(Duration::from_secs(15), || {
+            codex
+                .screen()
+                .lines()
+                .any(|row| row.trim_end().ends_with(&shown))
+                && codex.composer().is_none_or(|c| c.is_empty())
+        }),
+        "the premise: Codex's status line names the folder `/cd` moved it to; {}",
+        codex.evidence()
+    );
+    let name = "p103-moved-1031.txt";
+    let id = codex.post(name);
+    assert!(
+        common::wait_until(BUDGET, || {
+            codex.log()[since..].lines().any(|l| {
+                l.contains("probe refused when scheduled") && l.contains("Keymap(Changed)")
+            }) && codex.record()["inbox"]["wake_hold"] == "cannot_check"
+        }),
+        "the deck refuses its check of the moved Codex and the card says cannot_check; {}",
+        codex.evidence()
+    );
+    common::wait_until(Duration::from_secs(20), || {
+        let message = codex.message(&id);
+        assert_eq!(message["state"], "queued", "{message}");
+        assert_eq!(message["deliveries"], 0, "{message}");
+        let log = codex.log();
+        assert!(
+            !log[since..].contains("doorbell rang") && !log[since..].contains("empty read applied"),
+            "no check read the box and no ring; {}",
+            codex.evidence()
+        );
+        assert!(
+            codex.ops(since).iter().all(|o| !o.deck),
+            "the deck typed nothing into the moved Codex: {:?}; {}",
+            codex.ops(since),
+            codex.evidence()
+        );
+        assert!(
+            !codex_installed::project_dir(&codex.deck)
+                .join(name)
+                .exists()
+                && !moved.join(name).exists()
+        );
+        false
+    });
+    eprintln!(
+        "103: moved by /cd, check refused Keymap(Changed), held cannot_check, nothing typed: {}",
+        codex.message(&id)
+    );
+}

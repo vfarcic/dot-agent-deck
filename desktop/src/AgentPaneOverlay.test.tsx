@@ -760,7 +760,7 @@ describe("background work on the tile and the agent screen", () => {
     expect(waiting).toHaveTextContent("1");
     expect(waiting.querySelector("strong")).toHaveClass("count-waiting");
     expect(screen.getByTestId("overview-count-idle")).toHaveTextContent("0");
-    expect(screen.getByTestId("overview-count-running")).toHaveTextContent("0");
+    expect(screen.getByTestId("overview-count-working")).toHaveTextContent("0");
   });
 
   /** Scenario: the same agent with nothing left running shows no background line at all. */

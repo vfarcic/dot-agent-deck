@@ -11968,6 +11968,14 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Does not assert:** the fourth refusal counting (`inbox/probe/101`), a real agent, the doorbell tick asking the recheck on its own, or the writer's own screen refusal.
 - **Platform coverage:** Linux.
 
+##### inbox/probe/103 — A Codex that `/cd` or `/worktree` moved to another folder is not checked again, and a status line the deck can't read holds the check.
+
+- **Layer:** fast (`tests/codex_session_cwd.rs`; `src/agent_pty_segments.rs`, Linux) over real Codex 0.164.0 frames (`tests/fixtures/codex-inbox/release-0.164.0/session-cwd/`) and pure inputs; L2 real agent, lane 2 (`tests/e2e_composer_check_codex_live.rs`, Linux): the TUI harness, a plain `codex …` pane the build installs (`tests/support/codex_installed.rs`), the production doorbell tick asking the check, the person typing through a client attached to the pane.
+- **Agent:** none in the fast tier (recorded frames); real interactive Codex on `common::codex_test_model()` in lane 2, nothing submitted.
+- **Asserts:** `probe_103_the_status_line_on_codexs_measured_screens`: the status line read off each recorded frame is exactly what Codex drew, and compared with the folder Codex started in it passes at the start and after `/cd` back, is a move after `/cd` into another folder, into one under `HOME` and after `/worktree`, and holds without a move when an 80-column pane cuts the long path with `…` or there's no `HOME` to resolve a `~`. `probe_103_no_status_line_is_read_off_codexs_ready_screen`: a screen that isn't Codex's ready box, a drawn indent and a character two columns wide give no line. `probe_103_codexs_status_line_against_the_start_folder`: Codex's spelling (`~`, `~/…` by component, absolute elsewhere, a trailing slash on `HOME`), a thread name after the folder, the folder first, another folder, a folder below the start folder, a line cut short, none or two folder items, a folder holding the separator, a doubled space, no line, no `HOME` and a non-UTF-8 start folder. With a folder beside the start folder named like it and ` · `, anything after the matching folder holds (the Greptile review's P1: Codex in `proj · copy` draws the line of `proj` with a thread named `copy`), and the folder alone still passes. `probe_103_folders_named_like_the_start_folder_and_more_are_found`: only a sibling named like the start folder followed by ` · ` counts (not the folder's own contents, `proj copy`, `projx · y` or a `proj ·` file), `/` looks in `/`, and an unreadable parent counts. `probe_103_a_moved_codex_session_holds_for_the_rest_of_the_generation`: a line the deck can't read holds that check alone; another folder holds and latches, the start folder shown again and the unchanged sources included; no folder to compare with holds; a new generation passes; a thread name after the folder passes only after a check found no such sibling, and holds once a check finds one. `probe_103_the_admitted_frame_carries_the_session_check` (source order): the request compares the status line on the marked frame, after its surface, before the deciding admission, only when the surface passes. `probe_103_live_a_codex_moved_by_cd_is_not_checked`: after `/cd` into a sibling folder whose project file moves the editor to F6, with a task queued, the check is refused `Keymap(Changed)`, the record's `wake_hold` reads `cannot_check`, and for 20 s the deck types nothing, rings nothing and the task stays queued.
+- **Does not assert:** `/resume` (the recorder's picker listed no session offline); a status line configured without the folder, or a thread name spelled as a path, against real Codex; the desktop client, which reads the same `wake_hold`.
+- **Platform coverage:** the frame and comparison tests on every platform; the source-order and lane-2 tests on Linux.
+
 ##### inbox/probe/040 — A person's Ctrl+G during the deck's check of a real Claude Code input box loses none of their typing.
 
 - **Layer:** L2 real agent, lane 2 (`tests/e2e_composer_check_claude_live.rs`, Linux): the TUI harness, one fresh deck per trial, a plain `claude …` pane the build installs (`tests/support/claude_installed.rs`), and the production doorbell tick choosing and writing the check. No e2e editor-probe assumption; the helper's e2e pause seam (`DOT_AGENT_DECK_E2E_HELPER_PAUSE`, at `start` and `ready`) and trace are driven by a releaser thread that lets every pause go at once except the trial's target.
@@ -13680,6 +13688,20 @@ The kept-on-Enter draft function moves to `tests/e2e_probe_delivery.rs` in S-21,
 - **Does not assert:** a real Codex (lane 2's `inbox/codex/009` and `010`), the untrusted-hooks path, or that the header and composer come from Codex: they are screen recognisers, and a launcher that draws the whole measured screen is not told apart.
 - **Platform coverage:** mac+linux.
 
+##### inbox/codex/029 — A Codex doorbell hook commits only what the rollout shows Codex took (issue #2346).
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`), the real wrapper, hook CLI children and the real `inbox witness` they start, a Codex rollout the test writes as Codex 0.164.0 records one, a 15 s ack-wait (a 10 s witness window).
+- **Agent:** none (synthetic Codex; no credential).
+- **Asserts:** with `transcript_path` naming an existing rollout, the real prompt hook prints the task's block as before, and the task stays Fetched for 1.5 s; it is Acknowledged with one delivery only after the rollout gains the prompt as a `user` message and that context as a `developer` message. A second task whose turn is interrupted (the rollout gains only Codex's `turn_aborted` records) stays Fetched; once the witness gives up, a later doorbell hands it over as `delivery 1.2` with the possible-repeat line, still Fetched until the rollout records that context, then Acknowledged with two deliveries. A third task whose prompt another hook blocks (the rollout gains the context as a `developer` message and no `user` message, as Codex keeps it) is Acknowledged with one delivery.
+- **Does not assert:** a real Codex's rollout or a real interrupt (`inbox/codex/031`); a payload with no `transcript_path`, which commits what it printed (`inbox/codex/018`).
+- **Platform coverage:** mac+linux.
+
+##### inbox/codex/030 — A Codex `Stop` hand-over commits only what the rollout shows Codex went on with (issue #2346).
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`), as `inbox/codex/029`.
+- **Agent:** none (synthetic Codex; no credential).
+- **Asserts:** with `transcript_path` naming an existing rollout, the real `Stop` hook prints the task as its block reason, and the task, whose body holds `<`, `>` and `&`, stays Fetched for 1.5 s; it is Acknowledged with one delivery only after the rollout gains that reason as a `user` message inside `<hook_prompt>`, its `&`, `<` and `>` escaped as Codex 0.164.0 escapes them. A second task whose turn is interrupted stays Fetched; a later `Stop` hands it over as `delivery 1.2` with the possible-repeat line, and the rollout recording that reason acknowledges it with two deliveries.
+- **Does not assert:** a real Codex's rollout or a real interrupt (`inbox/codex/032`); a payload with no `transcript_path` (`inbox/codex/019`).
+- **Platform coverage:** mac+linux.
+
 
 ### Test harness: Claude Code prompt submission
 
@@ -14652,6 +14674,22 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Does not assert:** a spool write the sandbox denies (`inbox/codex/020`), or Codex showing a failing hook's stderr.
 - **Cost:** one cheap model turn.
 - **Platform coverage:** mac+linux.
+
+##### inbox/codex/031 — Live: a doorbell hand-over Codex drops on an interrupt is not acknowledged, and is handed over again (issue #2346).
+- **Layer:** L2 real agent, lane 2 (`tests/e2e_inbox_codex_live.rs`), attached interactive PTY, the pane started with `DOT_AGENT_DECK_INBOX_TEST_HOLD_AFTER_PRINT` (an `e2e`-build knob): a deck hook that has printed a hand-over holds while a file the test owns exists, keeping open the window between the hook's write and Codex taking its output.
+- **Agent:** Codex at the installed release, cheap model from `codex_test_model()`.
+- **Asserts:** the doorbell rings (or, when a starved machine makes the deck withdraw its ring before Codex submits it, the test submits the same doorbell line itself), the prompt hook prints the task and holds; the test presses Esc in Codex's pane, Codex shows `Conversation interrupted`, and the hook is released. For 30 seconds, longer than the witness watches, the task is not acknowledged and the sentinel is not written. Once Codex takes its messages again (the deck's own ring, or a prompt the test types after 45 s), Codex writes the sentinel once and the task is settled by its receipt with two deliveries.
+- **Does not assert:** the deck's own ring (`inbox/codex/009`); which route hands the task over again; a prompt another hook blocks, whose context Codex keeps (`inbox/codex/029`, measured in the PR for #2346); the card's status after the interrupt.
+- **Platform coverage:** linux.
+- **Cost:** one or two cheap model turns.
+
+##### inbox/codex/032 — Live: a `Stop` hand-over Codex drops on an interrupt is not acknowledged, and is handed over again (issue #2346).
+- **Layer:** L2 real agent, lane 2 (`tests/e2e_inbox_codex_live.rs`), as `inbox/codex/031`.
+- **Agent:** Codex at the installed release, cheap model from `codex_test_model()`, running a slow shell directive.
+- **Asserts:** with the task posted while the directive runs, Codex's `Stop` hook prints it as its block reason and holds (`TurnEndHook` in the deck log); the test presses Esc, Codex shows `Conversation interrupted`, and the hook is released. For 30 seconds the task is not acknowledged and the sentinel is not written; once Codex takes its messages again it writes the sentinel once and the task is settled by its receipt with two deliveries.
+- **Does not assert:** which route hands the task over again; the card's status after the interrupt.
+- **Platform coverage:** linux.
+- **Cost:** two or three cheap model turns.
 
 `inbox/codex/012`–`017` are retired, and with them the Codex composer gate they pinned, its retained-draft hold, the flush of a stranded line and the cleanup CR. The deck still types into a measured Codex release, in two stages (`inbox/codex/027`); `inbox/codex/004`–`006` and `024` pin that nothing is typed into a Codex whose release the deck cannot read.
 
