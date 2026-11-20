@@ -37,8 +37,9 @@
 //! unit reported nothing. Elapsed time proves neither. Nothing in the test
 //! signals the held command: dropping the hold closes the FIFO's last writer,
 //! so a `cat` the restart left running reads end-of-file and exits, and the
-//! command runs under `timeout` ([`HOLD_BOUND`]), so a `cat` that reaches the
-//! FIFO's open only after that close exits by itself too. The FIFO's path and
+//! command runs under a bound ([`HOLD_BOUND`], kept by a `perl` alarm that a
+//! stock macOS and Linux both have), so a `cat` that reaches the FIFO's open
+//! only after that close exits by itself too. The FIFO's path and
 //! the hold's directory reach the agent's shell as single-quoted words.
 //!
 //! Cost: one short Haiku turn (one Bash command). Lane 2: it reaches a real
@@ -450,7 +451,7 @@ fn interrupted_028_a_real_agents_unit_is_listed_and_reclaimed_after_a_restart() 
             parent
                 .as_deref()
                 .is_some_and(|parent| hold.bounded_by(parent, HOLD_BOUND)),
-            "the held `cat` (pid {pid}) does not run under `timeout {}`: its parent is {parent:?}.\nThe agent's pane:\n{}",
+            "the held `cat` (pid {pid}) does not run under its {}s bound (`perl -e` of `hold::BOUND_SCRIPT`): its parent is {parent:?}.\nThe agent's pane:\n{}",
             HOLD_BOUND.as_secs(),
             pane_screen(&live, &unit_agent)
         );

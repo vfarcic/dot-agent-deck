@@ -4,7 +4,8 @@
 //!
 //! [`FifoHold::create`] makes a FIFO at an absolute path inside the run's own
 //! test root and opens it for reading and writing. The agent is handed
-//! [`FifoHold::command`], `timeout <bound> cat '<path>'`. While the hold's
+//! [`FifoHold::command`], `perl -e '<BOUND_SCRIPT>' <bound> cat '<path>'`
+//! ([`BOUND_SCRIPT`]). While the hold's
 //! endpoint is open, that `cat` opens the FIFO without waiting and then waits
 //! in its read, since a writer exists and nothing is written.
 //!
@@ -17,15 +18,17 @@
 //! - one that resolved the path before the unlink and reaches the FIFO's
 //!   open only after the close waits in that open for a writer that never
 //!   comes. Nothing the drop does can reach it, so the command itself carries
-//!   the bound: `timeout` ends it once `bound` has passed since it started.
+//!   the bound: the `perl` it runs under ends it once `bound` has passed since
+//!   it started.
 //!
 //! So every reader of the command ends within `bound` of starting, and almost
-//! always at the drop. The test signals no process; `timeout` is part of the
-//! command the agent runs, and stops only its own child.
+//! always at the drop. The test signals no process; the bounding `perl` is
+//! part of the command the agent runs, and stops only its own child.
 //! `fifo_hold_bounds_a_reader_that_opens_after_the_release` pins the third
 //! case and `fifo_hold_release_ends_its_reader_with_end_of_file` the first.
-//! The bound needs `timeout` on the agent's PATH (GNU coreutils; a stock macOS
-//! has none).
+//! The bound needs only `perl` on the agent's PATH, which a stock macOS and
+//! the Linux images here both ship; GNU `timeout`, which a stock macOS lacks,
+//! is not used.
 //!
 //! The endpoint is opened close-on-exec (the standard library's default), so
 //! no process the test spawns afterwards (a daemon, a TUI, the CLI) inherits a
@@ -50,6 +53,21 @@ pub fn shell_quote(word: &str) -> String {
     format!("'{}'", word.replace('\'', "'\\''"))
 }
 
+/// The Perl program that bounds the held `cat`, run as
+/// `perl -e BOUND_SCRIPT <secs> <program> <args>…`: a portable stand-in for
+/// GNU `timeout`. It forks, the child execs the program, and the parent waits
+/// for it. If `secs` pass first, its own alarm sends the child `SIGTERM`, reaps
+/// it and exits 124, as `timeout` does; otherwise it exits with the child's
+/// status (128 plus the signal for a child a signal ended), 127 when the
+/// program cannot be run and 125 when it cannot fork. Because it forks rather
+/// than execs, the `cat` runs as its child with this argv as its parent's,
+/// which is how [`FifoHold::bounded_by`] sees the bound is in place. It has no
+/// whitespace, so a whitespace split of `ps` output keeps it one word, and no
+/// `'`, so one pair of single quotes carries it through a shell.
+pub const BOUND_SCRIPT: &str = "$s=shift;defined($p=fork)||exit(125);$p||exec(@ARGV)||exit(127);\
+$SIG{ALRM}=sub{kill(\"TERM\",$p);waitpid($p,0);exit(124)};alarm($s);waitpid($p,0);\
+exit($?&127?128+($?&127):$?>>8)";
+
 /// The command that reads the FIFO at `path` until its writer goes, and in
 /// any case for no longer than `bound` (whole seconds, at least one).
 pub fn held_command(path: &Path, bound: Duration) -> String {
@@ -57,7 +75,8 @@ pub fn held_command(path: &Path, bound: Duration) -> String {
         .to_str()
         .unwrap_or_else(|| panic!("the hold's path is UTF-8: {}", path.display()));
     format!(
-        "timeout {} cat {}",
+        "perl -e {} {} cat {}",
+        shell_quote(BOUND_SCRIPT),
         bound.as_secs().max(1),
         shell_quote(path)
     )
@@ -132,14 +151,20 @@ impl FifoHold {
             && argv.iter().skip(1).any(|arg| Path::new(arg) == self.path)
     }
 
-    /// Whether `argv` is the `timeout` of [`FifoHold::command`] with `bound`:
-    /// the process a held `cat` runs under when its bound is in place.
+    /// Whether `argv` is the bounding `perl` of [`FifoHold::command`] with
+    /// `bound`: the process a held `cat` runs under when its bound is in
+    /// place. The program's file name is `perl`, or a versioned `perl5…` (a
+    /// stock macOS's `/usr/bin/perl` hands over to one), and it runs exactly
+    /// [`BOUND_SCRIPT`].
     pub fn bounded_by(&self, argv: &[String], bound: Duration) -> bool {
         match argv {
-            [program, secs, reader @ ..] => {
+            [program, flag, script, secs, reader @ ..] => {
                 Path::new(program)
                     .file_name()
-                    .is_some_and(|n| n == "timeout")
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n == "perl" || n.starts_with("perl5"))
+                    && flag == "-e"
+                    && script == BOUND_SCRIPT
                     && *secs == bound.as_secs().max(1).to_string()
                     && self.held_by(reader)
             }
@@ -167,6 +192,24 @@ mod tests {
 
     fn argv(words: &[&str]) -> Vec<String> {
         words.iter().map(|w| w.to_string()).collect()
+    }
+
+    /// Every process now running, as `(pid, parent pid, argv)` from `ps`,
+    /// split on whitespace as `tests/e2e_interrupted_work_live.rs` splits it.
+    fn processes() -> Vec<(u32, u32, Vec<String>)> {
+        let out = Command::new("ps")
+            .args(["-A", "-o", "pid=,ppid=,args="])
+            .output()
+            .expect("run ps");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut words = line.split_whitespace();
+                let pid = words.next()?.parse().ok()?;
+                let ppid = words.next()?.parse().ok()?;
+                Some((pid, ppid, words.map(str::to_string).collect()))
+            })
+            .collect()
     }
 
     /// Wait, bounded, for `child` to exit, and return its status.
@@ -213,29 +256,49 @@ mod tests {
             !first.held_by(&argv(&["tail", &first_path])),
             "only `cat` is the held command"
         );
+        let perl = |program: &str, secs: &str, path: &str| {
+            argv(&[program, "-e", BOUND_SCRIPT, secs, "cat", path])
+        };
         assert!(
-            !first.held_by(&argv(&["timeout", "1200", "cat", &first_path])),
-            "the bounding `timeout` is not the reader; its `cat` is"
+            !first.held_by(&perl("perl", "1200", &first_path)),
+            "the bounding `perl` is not the reader; its `cat` is"
         );
         assert!(!first.held_by(&argv(&["cat"])));
         assert!(!first.held_by(&[]));
 
         let bound = Duration::from_secs(1200);
-        assert!(first.bounded_by(&argv(&["timeout", "1200", "cat", &first_path]), bound));
-        assert!(first.bounded_by(
-            &argv(&["/usr/bin/timeout", "1200", "cat", &first_path]),
-            bound
-        ));
+        assert!(first.bounded_by(&perl("perl", "1200", &first_path), bound));
+        assert!(first.bounded_by(&perl("/usr/bin/perl", "1200", &first_path), bound));
         assert!(
-            !first.bounded_by(&argv(&["timeout", "60", "cat", &first_path]), bound),
+            first.bounded_by(&perl("/usr/bin/perl5.34", "1200", &first_path), bound),
+            "a stock macOS's versioned perl is the bound too"
+        );
+        assert!(second.bounded_by(&perl("perl", "1200", &second_path), bound));
+        assert!(
+            !first.bounded_by(&perl("perl", "60", &first_path), bound),
             "another bound is not this command's"
         );
         assert!(
-            !first.bounded_by(&argv(&["timeout", "1200", "cat", &second_path]), bound),
+            !first.bounded_by(&perl("perl", "1200", &second_path), bound),
             "a bound on another run's FIFO is not this run's"
         );
+        assert!(
+            !first.bounded_by(
+                &argv(&["perl", "-e", "exec@ARGV", "1200", "cat", &first_path]),
+                bound
+            ),
+            "another Perl program is not the bound"
+        );
+        assert!(
+            !first.bounded_by(&perl("python3", "1200", &first_path), bound),
+            "only `perl` runs the bound"
+        );
+        assert!(
+            !first.bounded_by(&argv(&["timeout", "1200", "cat", &first_path]), bound),
+            "GNU `timeout` is not this command's bound"
+        );
         assert!(!first.bounded_by(&argv(&["cat", &first_path]), bound));
-        assert!(!first.bounded_by(&argv(&["timeout", "1200"]), bound));
+        assert!(!first.bounded_by(&argv(&["perl", "-e", BOUND_SCRIPT, "1200"]), bound));
         assert!(!first.bounded_by(&[], bound));
     }
 
@@ -269,7 +332,8 @@ mod tests {
 
     /// In a directory whose name has `$`, both quotes and `;`, the held
     /// command run by `sh` reads this FIFO (its echo of a line written to
-    /// the hold proves the path arrived intact), waits while the hold lives,
+    /// the hold proves the path arrived intact), shows in `ps` as a `cat` of
+    /// it whose parent is its bound, waits while the hold lives,
     /// and exits successfully, with no signal and well inside its bound, once
     /// the hold is dropped; the FIFO is gone afterwards.
     #[test]
@@ -314,6 +378,22 @@ mod tests {
             reader.try_wait().expect("poll the reader").is_none(),
             "the reader is still waiting while the hold lives"
         );
+        // As `ps` shows it, split on whitespace: one `cat` of this FIFO, run
+        // by the bounding `perl` with this bound.
+        let all = processes();
+        let held: Vec<_> = all
+            .iter()
+            .filter(|(_, _, argv)| hold.held_by(argv))
+            .collect();
+        assert_eq!(held.len(), 1, "one `cat` of this FIFO: {held:?}");
+        let parent = all
+            .iter()
+            .find(|(pid, _, _)| *pid == held[0].1)
+            .map(|(_, _, argv)| argv);
+        assert!(
+            parent.is_some_and(|argv| hold.bounded_by(argv, Duration::from_secs(600))),
+            "the `cat` runs under its bound: its parent is {parent:?}"
+        );
 
         drop(hold);
         let status = exit_within(
@@ -331,7 +411,7 @@ mod tests {
     /// The opener the drop cannot reach: a reader that resolved the FIFO
     /// before the drop (here through a path-only descriptor it inherits) and
     /// opens it only after the drop, so no writer will ever come. The held
-    /// command still ends, by its own bound (`timeout`'s status 124, which
+    /// command still ends, by its own bound (status 124, which
     /// also shows the open really waited rather than failing or reading
     /// end-of-file), with no signal from the test.
     #[cfg(target_os = "linux")]
