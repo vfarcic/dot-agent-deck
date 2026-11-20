@@ -53,11 +53,11 @@ path = sys.argv[-1]
 with open(path, "rb") as f:
     initial = f.read()
 got = b""
-opened = now()
-closed = opened
+opened = closed = None
 mode = os.environ.get("T041_EDITOR_MODE", "read")
 if mode == "read":
     fd = os.open("/dev/tty", os.O_RDWR)
+    opened = now()
     old = termios.tcgetattr(fd)
     try:
         # TCSANOW: TCSAFLUSH, setraw's default, would discard what the
@@ -255,7 +255,10 @@ fn overlap_trials(path: Path041) {
         // attribution and timing its trace against the editor's `opened`
         // and `closed` (issue #2264).
         if !landed && let Ok(out) = std::env::var("DAD_PROBE_041_OUT") {
-            let _ = std::fs::write(format!("{out}.{}-{trial}.log", path.name), codex.log());
+            let _ = std::fs::write(
+                format!("{out}.{}-{trial}.log", path.name),
+                common::redact_credentials_for_output(&codex.log()),
+            );
         }
         assert_eq!(
             branches.first().copied(),
