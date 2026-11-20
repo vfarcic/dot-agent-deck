@@ -42,6 +42,8 @@ describe("the interrupted work wording", () => {
       expect((words as unknown as Record<string, string>)[name], name).toBe(strings.get(name));
     }
     expect(words.MAX_SHOWN_CHARS).toBe(Number(rust.match(/pub const MAX_SHOWN_CHARS: usize = (\d+);/)?.[1]));
+    /* Reviewer 4: the page size Previous reports falls back on, the daemon's. */
+    expect((words as unknown as Record<string, number>).MAX_SHOWN_REPORTS).toBe(Number(rust.match(/pub const MAX_SHOWN_REPORTS: usize = (\d+);/)?.[1]));
   });
 
   /** Scenario: the sentences the Rust helpers build — the footer, the dismiss-all question, a progress line, a reclaim's unpushed commits — read the same from the desktop's helpers, and each fixed fragment is in the Rust source. */

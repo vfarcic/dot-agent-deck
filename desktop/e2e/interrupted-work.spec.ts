@@ -11,8 +11,8 @@ import { test } from "./support/load-budget";
  * as a daemon would: the item is gone from the next list.
  */
 
-async function openDashboard(page: Page): Promise<void> {
-  await page.goto("/?fixture=1&interrupted=1");
+async function openDashboard(page: Page, interrupted = "1"): Promise<void> {
+  await page.goto(`/?fixture=1&interrupted=${interrupted}`);
   await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
   await page.getByTestId("open-overview").click();
 }
@@ -62,5 +62,90 @@ test.describe("Interrupted work", () => {
     await page.getByTestId("open-overview").click();
     await expect(page.getByTestId("daemon-group").first()).toBeVisible();
     await expect(page.getByTestId("interrupted-banner")).toHaveCount(0);
+  });
+
+  /* PRD #1790 stage 2, desktop review findings 3, 5 and 8. */
+
+  /** Scenario: with keyboard focus on one of the dialog's controls, Enter does what that control does: on Dismiss all it asks the question, on Close it closes, on Reclaim it runs the dry run, and on a row other than the selected one it opens that row's details; in an item's details, Enter on Back returns to the list rather than asking for reports. */
+  test("Enter on a focused control does what that control does", async ({ page }) => {
+    await openDashboard(page);
+    await page.getByTestId("interrupted-banner-show").click();
+    const dialog = page.getByTestId("interrupted-dialog");
+    await expect(dialog.getByTestId("interrupted-row")).toHaveCount(3);
+
+    await dialog.getByTestId("interrupted-dismiss-all-open").focus();
+    await page.keyboard.press("Enter");
+    await expect(dialog.getByTestId("interrupted-dismiss-all-question")).toBeVisible();
+    await expect(dialog.getByTestId("interrupted-details-view")).toHaveCount(0);
+    await dialog.getByTestId("interrupted-back").focus();
+    await page.keyboard.press("Enter");
+    await expect(dialog.getByTestId("interrupted-row")).toHaveCount(3);
+
+    await dialog.getByTestId("interrupted-reclaim").focus();
+    await page.keyboard.press("Enter");
+    await expect(dialog.getByTestId("interrupted-reclaim-verdict")).toContainText("Reclaim would remove its worktree and keep its branch.");
+    await dialog.getByTestId("interrupted-back").focus();
+    await page.keyboard.press("Enter");
+    await expect(dialog.getByTestId("interrupted-row")).toHaveCount(3);
+
+    await dialog.getByTestId("interrupted-row").filter({ hasText: "release-team" }).focus();
+    await page.keyboard.press("Enter");
+    await expect(dialog.getByTestId("interrupted-details-view")).toContainText("release-team");
+    await dialog.getByTestId("interrupted-back").click();
+
+    await dialog.getByTestId("interrupted-row").filter({ hasText: "fix-login" }).click();
+    await dialog.getByTestId("interrupted-details").click();
+    await expect(dialog.getByTestId("interrupted-show-reports")).toBeVisible();
+    await dialog.getByTestId("interrupted-back").focus();
+    await page.keyboard.press("Enter");
+    await expect(dialog.getByTestId("interrupted-details-view")).toHaveCount(0);
+    await expect(dialog.getByTestId("interrupted-row")).toHaveCount(3);
+
+    await dialog.getByTestId("interrupted-close").focus();
+    await page.keyboard.press("Enter");
+    await expect(dialog).toHaveCount(0);
+  });
+
+  /** Scenario: with thirty items, more than the dialog shows at once, pressing `j` moves the selection down past the last row on screen; the selected row is scrolled into view each time, so `d` dismisses the row the user can see selected. */
+  test("keeps the selected row in view as j moves it", async ({ page }) => {
+    await openDashboard(page, "many");
+    await page.getByTestId("interrupted-banner-show").click();
+    const dialog = page.getByTestId("interrupted-dialog");
+    await expect(dialog.getByTestId("interrupted-row")).toHaveCount(30);
+    for (let at = 0; at < 25; at += 1) await page.keyboard.press("j");
+    const selected = dialog.locator(".interrupted-row.is-selected");
+    await expect(selected).toContainText("extra-unit-24");
+    const box = await dialog.boundingBox();
+    const row = await selected.boundingBox();
+    expect(box && row).toBeTruthy();
+    expect(row!.y).toBeGreaterThanOrEqual(box!.y);
+    expect(row!.y + row!.height).toBeLessThanOrEqual(box!.y + box!.height + 1);
+    await page.keyboard.press("d");
+    await expect(dialog.getByTestId("interrupted-message")).toHaveText("Dismissed.");
+    await expect(dialog.getByTestId("interrupted-row").filter({ hasText: "extra-unit-24" })).toHaveCount(0);
+  });
+
+  /** Scenario: on the dashboard `I` opens the Interrupted work dialog, and `q` closes it. In the dialog, `D` followed at once by `y`, typed as one burst, asks the Dismiss all question and dismisses nothing; `n` cancels it. Asked again and given time to be read, `y` dismisses every item. */
+  test("opens with I, and a key burst cannot answer a question before it is presented", async ({ page }) => {
+    await openDashboard(page);
+    await expect(page.getByTestId("interrupted-banner")).toBeVisible();
+    await page.keyboard.press("I");
+    const dialog = page.getByTestId("interrupted-dialog");
+    await expect(dialog.getByTestId("interrupted-row")).toHaveCount(3);
+    await page.keyboard.press("q");
+    await expect(dialog).toHaveCount(0);
+    await page.keyboard.press("I");
+    await expect(dialog.getByTestId("interrupted-row")).toHaveCount(3);
+
+    await page.keyboard.type("Dyyy");
+    await expect(dialog.getByTestId("interrupted-dismiss-all-question")).toBeVisible();
+    await expect(dialog.getByTestId("interrupted-message")).toHaveCount(0);
+    await page.keyboard.press("n");
+    await expect(dialog.getByTestId("interrupted-row")).toHaveCount(3);
+
+    await page.keyboard.press("D");
+    await expect(dialog.getByTestId("interrupted-dismiss-all")).toHaveAttribute("data-presented", "true");
+    await page.keyboard.press("y");
+    await expect(dialog.getByTestId("interrupted-empty")).toBeVisible();
   });
 });

@@ -1,16 +1,18 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { StrictMode } from "react";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot } from "../data/fixture";
 import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, LOCAL_ENDPOINT_SELECTION, type DeckBridge, type DesktopSettingsDto } from "../lib/bridge";
 import { AGENTS_STOPPED_BY_RESTART } from "../lib/agentIdentity";
 import {
-  DISMISSED, INTERRUPTED_WORK_TITLE, OTHER_AGENTS_GROUP, RECLAIM_KEPT_DIRTY, RECLAIM_REMOVED, RECLAIM_WOULD_REMOVE, dismissAllQuestion, interruptedFooter,
+  DISMISSED, INTERRUPTED_WORK_TITLE, NOTHING_INTERRUPTED, OTHER_AGENTS_GROUP, RECLAIM_KEPT_DIRTY, RECLAIM_REMOVED, RECLAIM_WOULD_REMOVE, REFUSED_AMBIGUOUS, REFUSED_NOT_LISTED, dismissAllQuestion, interruptedFooter, reportRangeSentence,
   type DismissOutcome, type InterruptedItem, type InterruptedList, type InterruptedReply, type InterruptedShow, type InterruptedTarget, type ReclaimOutcome,
 } from "../lib/interruptedWork";
 import { VOICE_ACTIONS, INTERRUPTED_RECLAIM_CHECKING, type VoiceOverviewChannel, type VoiceOverviewContext } from "../lib/voiceActions";
 import { useInterruptedWork } from "../hooks/useInterruptedWork";
+import { OVERLAY_LAYER, useInertBackground } from "../hooks/useInertBackground";
 import type { AgentSession, DeckRuntimeState, DeckSnapshot } from "../types";
 
 vi.mock("./TerminalViewport", () => ({
@@ -333,9 +335,12 @@ describe("interrupted work by voice", () => {
   const commands = readFileSync(resolve("src-tauri/src/voice/commands.toml"), "utf8");
   const rowFor = (id: string) => commands.split(/^\[\[commands\]\]\s*$/m).find((chunk) => chunk.match(new RegExp(`^id\\s*=\\s*"${id}"`, "m")));
 
-  /** Scenario: showing, reclaiming, dismissing and dismissing all are spoken commands, each a `voice: true` registry entry with its row in the command table; the two confirms, the selection, the details, the report pages, Back, Close and Hide are registry entries that say why they are not. */
+  /** Scenario: showing, reclaiming, dismissing, dismissing all, an item's details, its reports and the next and previous report page are spoken commands, each a `voice: true` registry entry with its row in the command table; the three confirms, the immediate Dismiss of the button and `d`, the selection, Back, Close and Hide are registry entries that say why they are not, and none of them has a row. */
   it("registers every control, with a row for each spoken one", () => {
-    const spoken = { show_interrupted_work: "showInterruptedWork", reclaim_interrupted: "reclaimInterrupted", dismiss_interrupted: "dismissInterrupted", dismiss_all_interrupted: "dismissAllInterrupted" } as const;
+    const spoken = {
+      show_interrupted_work: "showInterruptedWork", reclaim_interrupted: "reclaimInterrupted", dismiss_interrupted: "dismissInterrupted", dismiss_all_interrupted: "dismissAllInterrupted",
+      show_interrupted_details: "showInterruptedDetails", show_interrupted_reports: "showInterruptedReports", next_interrupted_reports: "nextInterruptedReports", previous_interrupted_reports: "previousInterruptedReports",
+    } as const;
     for (const [id, invoke] of Object.entries(spoken)) {
       expect((VOICE_ACTIONS as Record<string, { voice?: true }>)[invoke].voice, invoke).toBe(true);
       const row = rowFor(id);
@@ -343,8 +348,9 @@ describe("interrupted work by voice", () => {
       expect(row).toMatch(new RegExp(`^invoke\\s*=\\s*"${invoke}"`, "m"));
       expect(row).toMatch(/^screens\s*=\s*\["overview"\]/m);
     }
-    for (const invoke of ["confirmReclaimInterrupted", "confirmDismissAllInterrupted", "selectInterruptedItem", "showInterruptedDetails", "showInterruptedReports", "backInterruptedWork", "closeInterruptedWork", "hideInterruptedWork"]) {
+    for (const invoke of ["confirmReclaimInterrupted", "confirmDismissInterrupted", "confirmDismissAllInterrupted", "dismissSelectedInterrupted", "selectInterruptedItem", "backInterruptedWork", "closeInterruptedWork", "hideInterruptedWork"]) {
       expect((VOICE_ACTIONS as Record<string, { no_voice?: string }>)[invoke].no_voice?.length ?? 0, invoke).toBeGreaterThan(20);
+      expect(commands, invoke).not.toMatch(new RegExp(`^invoke\\s*=\\s*"${invoke}"`, "m"));
     }
   });
 
@@ -379,5 +385,446 @@ describe("interrupted work by voice", () => {
     await act(async () => { VOICE_ACTIONS.dismissAllInterrupted.run({ ...published(), reportRefused }); });
     expect(screen.getByTestId("interrupted-dismiss-all-question")).toHaveTextContent(dismissAllQuestion(3));
     expect(calls.some((call) => call.verb === "dismiss")).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PRD #1790 stage 2, desktop review findings (reviewer 1-11, auditor 1-4).
+// ---------------------------------------------------------------------------
+
+/** A second, remote deck whose daemon is `process`, with no agents. */
+function remoteDeck(deckId: string, name: string, process: string): DeckSnapshot {
+  const snapshot = createFixtureSnapshot("connected");
+  return { ...snapshot, agents: [], connection: { ...snapshot.connection, deckId, deckKind: "remote", socketPath: `dev@${name}`, name, incarnation: process } };
+}
+
+/** A unit item named `name`, with an id ending in `n`. */
+function named(n: number, name: string, kind: InterruptedItem["kind"] = "unit"): InterruptedItem {
+  return item(`w-abcdefgh-${String(n).padStart(16, "0")}`, kind, name);
+}
+
+/** `recordingBridge`, with every dismissal and real reclaim held until `release` answers the oldest one. */
+function deferredBridge(state: { list: InterruptedList }) {
+  const recorded = recordingBridge(state);
+  const held: (() => void)[] = [];
+  const bridge = {
+    ...(recorded.bridge as unknown as Record<string, unknown>),
+    interruptedWorkDismiss: vi.fn(async (target: InterruptedTarget, ids: string[]) => {
+      recorded.calls.push({ verb: "dismiss", target, args: [ids] });
+      await new Promise<void>((done) => { held.push(done); });
+      state.list = { items: state.list.items.filter((candidate) => !ids.includes(candidate.id)) };
+      return answered(target, { dismissed: ids.map((id) => ({ id })), refused: [] } as DismissOutcome);
+    }),
+  } as unknown as DeckBridge;
+  return { bridge, calls: recorded.calls, release: () => held.shift()?.() };
+}
+
+/** A daemon's report pages for an item with `total` reports: page lengths by first offset, sixteen otherwise. */
+function pagedShow(base: InterruptedItem, total: number, lengths: Record<number, number> = {}) {
+  return (_id: string, from: number): InterruptedShow => {
+    const length = lengths[from] ?? Math.min(16, total - from);
+    const ids = Array.from({ length }, (_, at) => `r-${from + at + 1}`);
+    const next = from + length < total ? from + length : null;
+    return {
+      item: { ...base, reports: ids.map((report_id) => ({ report_id, kept_until_ms: KEPT_TS })), reports_omitted: total - length },
+      reports: ids.map((report_id) => ({ report_id, body: `body of ${report_id}` })),
+      reports_from: from,
+      next_reports_from: next,
+    };
+  };
+}
+
+/** The dashboard over `bridge` with its voice channel published, for the voice cases. `cover` mounts another modal over everything. */
+function voiced(bridge: DeckBridge, decks: DeckSnapshot[] = [deckOf("process-a")]) {
+  const channel: VoiceOverviewChannel = { current: undefined };
+  function Voiced({ fleet = decks, cover = false }: { fleet?: DeckSnapshot[]; cover?: boolean }) {
+    const interruptedWork = useInterruptedWork(bridge, fleet);
+    return (
+      <>
+        <AgentOverview runtime={{ ...baseRuntime(fleet[0]), fleet, ...(interruptedWork ? { interruptedWork } : {}) }} onNavigate={vi.fn()} voiceChannel={channel} />
+        {cover && <Cover />}
+      </>
+    );
+  }
+  const reportRefused = vi.fn();
+  const reportPending = vi.fn();
+  /** What the dashboard published, as a dispatch reads it, with the voice surface's reports. */
+  const context = () => ({ ...(channel.current as VoiceOverviewContext), reportRefused, reportPending });
+  return { Voiced, context, reportRefused, reportPending };
+}
+
+/** Another modal, drawn over whatever is open. */
+function Cover() {
+  const ref = useInertBackground<HTMLDivElement>(true, OVERLAY_LAYER.dialog);
+  return <div ref={ref} role="dialog" aria-modal="true" data-testid="cover-modal">over it</div>;
+}
+
+const dismissCalls = (calls: { verb: string; args: unknown[] }[]) => calls.filter((call) => call.verb === "dismiss").map((call) => call.args[0]);
+const reclaimCalls = (calls: { verb: string; args: unknown[] }[]) => calls.filter((call) => call.verb === "reclaim").map((call) => call.args);
+const showCalls = (calls: { verb: string; args: unknown[] }[]) => calls.filter((call) => call.verb === "show").map((call) => call.args[1]);
+
+describe("the dialog under React's development checks (reviewer 1)", () => {
+  /** Scenario: the app's root renders in StrictMode, which mounts every effect twice. With the dialog open there, Show reports shows the report, Reclaim's dry run shows its verdict and its confirm reclaims, and Dismiss dismisses the plain agent; each answer reaches the dialog and the refreshed list drops what went. */
+  it("acts on every answer when mounted under StrictMode", async () => {
+    const { bridge, calls } = recordingBridge({ list: three() });
+    render(<StrictMode><Overview bridge={bridge} deck={deckOf("process-a")} /></StrictMode>);
+    const dialog = await openDialog();
+    await act(async () => { fireEvent.click(within(dialog).getByTestId("interrupted-details")); });
+    await act(async () => { fireEvent.click(within(dialog).getByTestId("interrupted-show-reports")); });
+    expect(await within(dialog).findByTestId("interrupted-report-body")).toHaveTextContent("[UNTRUSTED-WORKER-REPORT:");
+    await act(async () => { fireEvent.click(within(dialog).getByTestId("interrupted-back")); });
+
+    await act(async () => { fireEvent.click(within(dialog).getByTestId("interrupted-reclaim")); });
+    expect(await within(dialog).findByTestId("interrupted-reclaim-verdict")).toHaveTextContent(RECLAIM_WOULD_REMOVE);
+    await act(async () => { fireEvent.click(within(dialog).getByTestId("interrupted-reclaim-confirm")); });
+    expect(await within(dialog).findByTestId("interrupted-message")).toHaveTextContent(RECLAIM_REMOVED);
+    await waitFor(() => expect(rows()).toHaveLength(2));
+
+    await act(async () => { fireEvent.click(rowOf(AGENT_ID)); });
+    await act(async () => { fireEvent.click(within(dialog).getByTestId("interrupted-dismiss")); });
+    expect(await within(dialog).findByTestId("interrupted-message")).toHaveTextContent(DISMISSED);
+    await waitFor(() => expect(rows()).toHaveLength(1));
+    expect(reclaimCalls(calls)).toEqual([[UNIT_ID, true], [UNIT_ID, false]]);
+    expect(dismissCalls(calls)).toEqual([[AGENT_ID]]);
+  });
+});
+
+describe("a dismissal in flight when the dialog closes (reviewer 2)", () => {
+  /** Scenario: Dismiss on the plain agent is sent and the daemon has not answered; the user closes the dialog and opens it again. The reopened dialog still waits for that dismissal — its Dismiss is disabled and `d` sends nothing — and when the daemon answers, the list is asked for again and drops the item, though no dialog of the first opening is left to ask. */
+  it("keeps it pending across closing and reopening, and refreshes the list when it answers", async () => {
+    const state = { list: three() };
+    const { bridge, calls, release } = deferredBridge(state);
+    render(<Overview bridge={bridge} deck={deckOf("process-a")} />);
+    let dialog = await openDialog();
+    await act(async () => { fireEvent.click(rowOf(AGENT_ID)); });
+    await act(async () => { fireEvent.click(within(dialog).getByTestId("interrupted-dismiss")); });
+    expect(dismissCalls(calls)).toEqual([[AGENT_ID]]);
+    await act(async () => { fireEvent.click(within(dialog).getByTestId("interrupted-close")); });
+    dialog = await openDialog();
+    await waitFor(() => expect(rows()).toHaveLength(3));
+
+    expect(within(dialog).getByTestId("interrupted-dismiss")).toBeDisabled();
+    await act(async () => { fireEvent.keyDown(dialog, { key: "d" }); });
+    await act(async () => { fireEvent.click(within(dialog).getByTestId("interrupted-dismiss")); });
+    expect(dismissCalls(calls)).toEqual([[AGENT_ID]]);
+
+    await act(async () => { release(); });
+    await waitFor(() => expect(rows()).toHaveLength(2));
+    expect(screen.getByTestId("interrupted-banner-message")).toHaveTextContent(interruptedFooter(2));
+    expect(within(dialog).getByTestId("interrupted-dismiss")).toBeEnabled();
+  });
+
+  /** Scenario: a dismissal sent to daemon process A is still waiting when the deck reconnects to process B; when A's answer comes, nothing asks process B for its list on its account. */
+  it("does not refresh another daemon process when the one it was sent to answers", async () => {
+    const state = { list: three() };
+    const { bridge, calls, release } = deferredBridge(state);
+    const { rerender } = render(<Overview bridge={bridge} deck={deckOf("process-a")} />);
+    const dialog = await openDialog();
+    await act(async () => { fireEvent.click(rowOf(AGENT_ID)); });
+    await act(async () => { fireEvent.click(within(dialog).getByTestId("interrupted-dismiss")); });
+    await act(async () => { rerender(<Overview bridge={bridge} deck={deckOf("process-b")} />); });
+    await waitFor(() => expect(calls.some((call) => call.verb === "list" && call.target.instance === "process-b")).toBe(true));
+    const before = calls.filter((call) => call.verb === "list" && call.target.instance === "process-b").length;
+    await act(async () => { release(); await Promise.resolve(); });
+    expect(calls.filter((call) => call.verb === "list" && call.target.instance === "process-b").length).toBe(before);
+  });
+});
+
+describe("report pages (reviewer 4)", () => {
+  /** Scenario: the fix-login unit has 33 kept reports, which the daemon pages 16, 16 and 1. Show reports, Next reports twice, then Previous reports asks for the pages from 0, 16, 32 and back to 16, and shows "Reports 17 to 32 of 33.". */
+  it("goes back to the page before, whatever the length of the page shown", async () => {
+    const { bridge, calls } = recordingBridge({ list: three(), show: pagedShow(unit(), 33) });
+    render(<Overview bridge={bridge} deck={deckOf("process-a")} />);
+    const dialog = await openDialog();
+    await act(async () => { fireEvent.click(within(dialog).getByTestId("interrupted-details")); });
+    await act(async () => { fireEvent.click(within(dialog).getByTestId("interrupted-show-reports")); });
+    await act(async () => { fireEvent.click(await within(dialog).findByTestId("interrupted-next-reports")); });
+    await waitFor(() => expect(within(dialog).getByTestId("interrupted-report-range")).toHaveTextContent(reportRangeSentence(17, 32, 33)));
+    await act(async () => { fireEvent.click(within(dialog).getByTestId("interrupted-next-reports")); });
+    await waitFor(() => expect(within(dialog).getByTestId("interrupted-report-range")).toHaveTextContent(reportRangeSentence(33, 33, 33)));
+    await act(async () => { fireEvent.click(within(dialog).getByTestId("interrupted-previous-reports")); });
+    await waitFor(() => expect(within(dialog).getByTestId("interrupted-report-range")).toHaveTextContent(reportRangeSentence(17, 32, 33)));
+    expect(showCalls(calls)).toEqual([0, 16, 32, 16]);
+  });
+
+  /** Scenario: the daemon cut the second page short to stay within its byte budget (16, 10, 7): Previous from the third page asks for the page from 16, the one actually shown before, not 16 reports back. */
+  it("returns to the page actually shown before when the daemon cut one short", async () => {
+    const { bridge, calls } = recordingBridge({ list: three(), show: pagedShow(unit(), 33, { 16: 10, 26: 7 }) });
+    render(<Overview bridge={bridge} deck={deckOf("process-a")} />);
+    const dialog = await openDialog();
+    await act(async () => { fireEvent.click(within(dialog).getByTestId("interrupted-details")); });
+    await act(async () => { fireEvent.click(within(dialog).getByTestId("interrupted-show-reports")); });
+    await act(async () => { fireEvent.click(await within(dialog).findByTestId("interrupted-next-reports")); });
+    await waitFor(() => expect(within(dialog).getByTestId("interrupted-report-range")).toHaveTextContent(reportRangeSentence(17, 26, 33)));
+    await act(async () => { fireEvent.click(within(dialog).getByTestId("interrupted-next-reports")); });
+    await waitFor(() => expect(within(dialog).getByTestId("interrupted-report-range")).toHaveTextContent(reportRangeSentence(27, 33, 33)));
+    await act(async () => { fireEvent.click(within(dialog).getByTestId("interrupted-previous-reports")); });
+    await waitFor(() => expect(within(dialog).getByTestId("interrupted-report-range")).toHaveTextContent(reportRangeSentence(17, 26, 33)));
+    expect(showCalls(calls)).toEqual([0, 16, 26, 16]);
+  });
+});
+
+describe("a list that failed (reviewer 7, auditor 4)", () => {
+  /** Scenario: the daemon's answer to the list request is an error whose text carries a right-to-left override, an isolate, a newline, an escape sequence and HTML-looking text. Opening the deck's dialog by voice shows the error with each of those characters spelled out, none of them live, and no HTML element made of it. */
+  it("escapes the error it shows", async () => {
+    const { bridge } = recordingBridge({ list: three() });
+    const failing = { ...(bridge as unknown as Record<string, unknown>), interruptedWorkList: vi.fn(async () => { throw new Error("bad ‮ evil ⁦ <b>bold</b>\nline\u001b[31m"); }) } as unknown as DeckBridge;
+    const voice = voiced(failing);
+    render(<voice.Voiced />);
+    await waitFor(() => expect(failing.interruptedWorkList).toHaveBeenCalled());
+    await act(async () => { VOICE_ACTIONS.showInterruptedWork.run(voice.context(), { preselectDeckId: deckOf("process-a").connection.deckId }); });
+    const note = await screen.findByTestId("interrupted-unavailable");
+    await waitFor(() => expect(note.textContent).toContain("\\u{202e}"));
+    expect(note.textContent).toContain("\\u{2066}");
+    expect(note.textContent).toContain("\\n");
+    expect(note.textContent).toContain("\\u{1b}[31m");
+    expect(note.textContent).not.toMatch(/[‮⁦\u001b\n]/);
+    expect(note.querySelector("b")).toBeNull();
+  });
+});
+
+describe("a spoken dismissal (reviewer 6, auditor 1)", () => {
+  /** Scenario: with the dialog open, "dismiss the first one" sends nothing and asks whether to dismiss fix-login, naming it; Back cancels and nothing was sent. "Dismiss scratch shell" asks about the plain agent; saying "dismiss it" again sends nothing; the person's click on the question's Dismiss dismisses exactly that item. "Dismiss the ninth one" is refused as not listed and asks nothing. */
+  it("asks about the item it names, and dismisses it only on the person's confirm", async () => {
+    const { bridge, calls } = recordingBridge({ list: three() });
+    const voice = voiced(bridge);
+    render(<voice.Voiced />);
+    await screen.findByTestId("interrupted-banner");
+    await act(async () => { VOICE_ACTIONS.showInterruptedWork.run(voice.context(), {}); });
+    await waitFor(() => expect(rows()).toHaveLength(3));
+
+    await act(async () => { VOICE_ACTIONS.dismissInterrupted.run(voice.context(), { filterText: "the first one" }); });
+    expect(dismissCalls(calls)).toEqual([]);
+    expect(voice.reportRefused).not.toHaveBeenCalled();
+    expect(screen.getByTestId("interrupted-dismiss-question")).toHaveTextContent("fix-login");
+    await act(async () => { fireEvent.click(screen.getByTestId("interrupted-back")); });
+    expect(screen.queryByTestId("interrupted-dismiss-question")).toBeNull();
+    expect(dismissCalls(calls)).toEqual([]);
+
+    await act(async () => { VOICE_ACTIONS.dismissInterrupted.run(voice.context(), { filterText: "scratch shell" }); });
+    expect(screen.getByTestId("interrupted-dismiss-question")).toHaveTextContent("scratch-shell");
+    await act(async () => { VOICE_ACTIONS.dismissInterrupted.run(voice.context(), {}); });
+    expect(dismissCalls(calls)).toEqual([]);
+    await act(async () => { fireEvent.click(screen.getByTestId("interrupted-dismiss-confirm")); });
+    expect(dismissCalls(calls)).toEqual([[AGENT_ID]]);
+    await waitFor(() => expect(rows()).toHaveLength(2));
+
+    await act(async () => { VOICE_ACTIONS.dismissInterrupted.run(voice.context(), { filterText: "the ninth one" }); });
+    expect(voice.reportRefused).toHaveBeenLastCalledWith(REFUSED_NOT_LISTED);
+    expect(screen.queryByTestId("interrupted-dismiss-question")).toBeNull();
+    expect(dismissCalls(calls)).toEqual([[AGENT_ID]]);
+  });
+
+  /** Scenario: another modal is drawn over the open dialog; a spoken dismissal, reclaim or dismiss all is refused with a sentence and changes nothing in the dialog behind it. */
+  it("refuses while another modal covers the dialog", async () => {
+    const { bridge, calls } = recordingBridge({ list: three() });
+    const voice = voiced(bridge);
+    const { rerender } = render(<voice.Voiced />);
+    await screen.findByTestId("interrupted-banner");
+    await act(async () => { VOICE_ACTIONS.showInterruptedWork.run(voice.context(), {}); });
+    await waitFor(() => expect(rows()).toHaveLength(3));
+    rerender(<voice.Voiced cover />);
+    await act(async () => { VOICE_ACTIONS.dismissInterrupted.run(voice.context(), { filterText: "the first one" }); });
+    expect(voice.reportRefused).toHaveBeenLastCalledWith(expect.any(String));
+    await act(async () => { VOICE_ACTIONS.reclaimInterrupted.run(voice.context(), { filterText: "the first one" }); });
+    await act(async () => { VOICE_ACTIONS.dismissAllInterrupted.run(voice.context()); });
+    expect(voice.reportRefused).toHaveBeenCalledTimes(3);
+    expect(screen.queryByTestId("interrupted-dismiss-question")).toBeNull();
+    expect(screen.queryByTestId("interrupted-dismiss-all-question")).toBeNull();
+    expect(dismissCalls(calls)).toEqual([]);
+    expect(reclaimCalls(calls)).toEqual([]);
+  });
+});
+
+describe("a spoken Dismiss all's report (reviewer 9)", () => {
+  /** Scenario: "dismiss all" with no dialog open is refused with the sentence that says to open it first; with the dialog open it opens the question and reports no refusal. */
+  it("reports a refusal only when no dialog is open", async () => {
+    const { bridge } = recordingBridge({ list: three() });
+    const voice = voiced(bridge);
+    render(<voice.Voiced />);
+    await screen.findByTestId("interrupted-banner");
+    await act(async () => { VOICE_ACTIONS.dismissAllInterrupted.run(voice.context()); });
+    expect(voice.reportRefused).toHaveBeenCalledWith(expect.stringContaining("Open the interrupted work first"));
+    voice.reportRefused.mockClear();
+    await act(async () => { VOICE_ACTIONS.showInterruptedWork.run(voice.context(), {}); });
+    await waitFor(() => expect(rows()).toHaveLength(3));
+    await act(async () => { VOICE_ACTIONS.dismissAllInterrupted.run(voice.context()); });
+    expect(screen.getByTestId("interrupted-dismiss-all-question")).toHaveTextContent(dismissAllQuestion(3));
+    expect(voice.reportRefused).not.toHaveBeenCalled();
+  });
+});
+
+describe("which item spoken words name (reviewer 10, auditor 3)", () => {
+  /** Run a spoken reclaim naming `said` on the open dialog, then back out of whatever it opened. */
+  async function reclaimSaid(voice: ReturnType<typeof voiced>, said: string) {
+    await act(async () => { VOICE_ACTIONS.reclaimInterrupted.run(voice.context(), { filterText: said }); });
+    const back = screen.queryByTestId("interrupted-back");
+    if (back) await act(async () => { fireEvent.click(back); });
+  }
+
+  async function openWith(list: InterruptedList) {
+    const { bridge, calls } = recordingBridge({ list });
+    const voice = voiced(bridge);
+    render(<voice.Voiced />);
+    await screen.findByTestId("interrupted-banner");
+    await act(async () => { VOICE_ACTIONS.showInterruptedWork.run(voice.context(), {}); });
+    await waitFor(() => expect(rows()).toHaveLength(list.items.length));
+    return { voice, calls };
+  }
+
+  /** Scenario: "fix login", "Fix_Login" and the branch said as "agent dispatch fix login" each name the fix-login unit, whose name and branch are spelled with a hyphen and a slash. */
+  it("matches names and branches by their words, whatever the punctuation", async () => {
+    const { voice, calls } = await openWith(three());
+    await reclaimSaid(voice, "fix login");
+    await reclaimSaid(voice, "Fix_Login");
+    await reclaimSaid(voice, "agent dispatch fix login");
+    expect(voice.reportRefused).not.toHaveBeenCalled();
+    expect(reclaimCalls(calls)).toEqual([[UNIT_ID, true], [UNIT_ID, true], [UNIT_ID, true]]);
+  });
+
+  /** Scenario: units named "fix" and "fix-login" are listed; "fix" names the unit called exactly that rather than being refused as matching both. Two units both named "dup", or "release" against "release-a" and "release-b", are refused as ambiguous and nothing is sent. */
+  it("prefers an exact name over a partial one, and refuses ties", async () => {
+    const fix = named(11, "fix");
+    const { voice, calls } = await openWith({ items: [named(12, "fix-login"), fix, named(13, "dup"), named(14, "dup"), named(15, "release-a"), named(16, "release-b")] });
+    await reclaimSaid(voice, "fix");
+    expect(reclaimCalls(calls)).toEqual([[fix.id, true]]);
+    await reclaimSaid(voice, "dup");
+    expect(voice.reportRefused).toHaveBeenLastCalledWith(REFUSED_AMBIGUOUS);
+    await reclaimSaid(voice, "release");
+    expect(voice.reportRefused).toHaveBeenLastCalledWith(REFUSED_AMBIGUOUS);
+    expect(reclaimCalls(calls)).toEqual([[fix.id, true]]);
+  });
+
+  /** Scenario: units named "two", "last" and "first" are listed in that order. "first", "two" and "last" each name one item as a position and another by its name, so each is refused as ambiguous and nothing is sent; "the second one" still names the second item. */
+  it("refuses words that are both an ordinal and another item's name", async () => {
+    const [two, last, first] = [named(21, "two"), named(22, "last"), named(23, "first")];
+    const { voice, calls } = await openWith({ items: [two, last, first] });
+    for (const said of ["first", "two", "last"]) {
+      await reclaimSaid(voice, said);
+      expect(voice.reportRefused, said).toHaveBeenLastCalledWith(REFUSED_AMBIGUOUS);
+    }
+    expect(reclaimCalls(calls)).toEqual([]);
+    await reclaimSaid(voice, "the second one");
+    expect(reclaimCalls(calls)).toEqual([[last.id, true]]);
+  });
+});
+
+describe("details and reports by voice (reviewer 11)", () => {
+  /** Scenario: "show the details of the first one" opens fix-login's details; "show its reports" asks for the first page of its 33 reports, "next page of reports" for the page from 16 and "previous page of reports" for the page from 0 again — all without a pointer. "Show the reports of release team" from the list opens that item's details and asks for its first page. */
+  it("opens an item's details and pages its reports", async () => {
+    const { bridge, calls } = recordingBridge({ list: three(), show: (id, from) => pagedShow(three().items.find((candidate) => candidate.id === id)!, 33)(id, from) });
+    const voice = voiced(bridge);
+    render(<voice.Voiced />);
+    await screen.findByTestId("interrupted-banner");
+    await act(async () => { VOICE_ACTIONS.showInterruptedWork.run(voice.context(), {}); });
+    await waitFor(() => expect(rows()).toHaveLength(3));
+
+    await act(async () => { VOICE_ACTIONS.showInterruptedDetails.run(voice.context(), { filterText: "the first one" }); });
+    expect(screen.getByTestId("interrupted-details-view")).toHaveTextContent("fix-login");
+    await act(async () => { VOICE_ACTIONS.showInterruptedReports.run(voice.context(), {}); });
+    await waitFor(() => expect(screen.getAllByTestId("interrupted-report")).toHaveLength(16));
+    await act(async () => { VOICE_ACTIONS.nextInterruptedReports.run(voice.context()); });
+    await waitFor(() => expect(screen.getByTestId("interrupted-report-range")).toHaveTextContent(reportRangeSentence(17, 32, 33)));
+    await act(async () => { VOICE_ACTIONS.previousInterruptedReports.run(voice.context()); });
+    await waitFor(() => expect(screen.getByTestId("interrupted-report-range")).toHaveTextContent(reportRangeSentence(1, 16, 33)));
+    expect(calls.filter((call) => call.verb === "show").map((call) => call.args)).toEqual([[UNIT_ID, 0], [UNIT_ID, 16], [UNIT_ID, 0]]);
+    expect(voice.reportRefused).not.toHaveBeenCalled();
+
+    await act(async () => { fireEvent.click(screen.getByTestId("interrupted-back")); });
+    await act(async () => { VOICE_ACTIONS.showInterruptedReports.run(voice.context(), { filterText: "release team" }); });
+    expect(screen.getByTestId("interrupted-details-view")).toHaveTextContent("release-team");
+    await waitFor(() => expect(calls.at(-1)).toMatchObject({ verb: "show", args: [TEAM_ID, 0] }));
+  });
+});
+
+describe("the TUI's keys on the desktop (reviewer 8, CLAUDE.md rule 22)", () => {
+  /** Wait until the open confirmation's question counts as presented. */
+  async function presented(testId: string) {
+    await waitFor(() => expect(screen.getByTestId(testId)).toHaveAttribute("data-presented", "true"), { timeout: 3_000 });
+  }
+
+  /** Scenario: on the dashboard `I` opens the one daemon's Interrupted work, as the TUI's `I` does; in the list `q` closes it; in an item's details `q` goes back to the list. With focus in a text field, `I` is typed into it and opens nothing. */
+  it("opens with I and closes or goes back with q, and leaves a text field's keys alone", async () => {
+    const { bridge } = recordingBridge({ list: three() });
+    render(<Overview bridge={bridge} deck={deckOf("process-a")} />);
+    await screen.findByTestId("interrupted-banner");
+    const field = document.createElement("input");
+    document.body.append(field);
+    field.focus();
+    await act(async () => { fireEvent.keyDown(field, { key: "I" }); });
+    expect(screen.queryByTestId("interrupted-dialog")).toBeNull();
+    field.remove();
+
+    await act(async () => { fireEvent.keyDown(document.body, { key: "I" }); });
+    const dialog = await screen.findByTestId("interrupted-dialog");
+    await waitFor(() => expect(rows()).toHaveLength(3));
+    await act(async () => { fireEvent.keyDown(dialog, { key: "Enter" }); });
+    expect(screen.getByTestId("interrupted-details-view")).toBeInTheDocument();
+    await act(async () => { fireEvent.keyDown(dialog, { key: "q" }); });
+    expect(screen.queryByTestId("interrupted-details-view")).toBeNull();
+    expect(rows()).toHaveLength(3);
+    await act(async () => { fireEvent.keyDown(dialog, { key: "q" }); });
+    expect(screen.queryByTestId("interrupted-dialog")).toBeNull();
+  });
+
+  /** Scenario: two daemons both list interrupted work; `I` opens neither and the dashboard says that several daemons have it, as voice's "show interrupted work" does. */
+  it("asks which daemon when several list items", async () => {
+    const { bridge } = recordingBridge({ list: three() });
+    const fleet = [deckOf("process-a"), remoteDeck("deck-b", "beta", "process-b")];
+    function Two() {
+      const interruptedWork = useInterruptedWork(bridge, fleet);
+      return <AgentOverview runtime={{ ...baseRuntime(fleet[0]), fleet, ...(interruptedWork ? { interruptedWork } : {}) }} onNavigate={vi.fn()} />;
+    }
+    render(<Two />);
+    await waitFor(() => expect(screen.getAllByTestId("interrupted-banner")).toHaveLength(2));
+    await act(async () => { fireEvent.keyDown(document.body, { key: "I" }); });
+    expect(screen.queryByTestId("interrupted-dialog")).toBeNull();
+    expect(screen.getByText(/Several daemons have interrupted work/)).toBeInTheDocument();
+  });
+
+  /** Scenario: `D` asks the Dismiss all question; a `y` pressed at once, before the question has been presented, dismisses nothing, and `n` cancels it. Asked again, a `y` once the question has been presented dismisses exactly the listed items. */
+  it("answers Dismiss all's question with y only once it has been presented, and n cancels", async () => {
+    const { bridge, calls } = recordingBridge({ list: three() });
+    render(<Overview bridge={bridge} deck={deckOf("process-a")} />);
+    const dialog = await openDialog();
+    await act(async () => { fireEvent.keyDown(dialog, { key: "D" }); fireEvent.keyDown(dialog, { key: "y" }); });
+    await act(async () => { fireEvent.keyDown(dialog, { key: "y" }); });
+    expect(dismissCalls(calls)).toEqual([]);
+    expect(screen.getByTestId("interrupted-dismiss-all-question")).toBeInTheDocument();
+    await act(async () => { fireEvent.keyDown(dialog, { key: "n" }); });
+    expect(screen.queryByTestId("interrupted-dismiss-all-question")).toBeNull();
+    expect(dismissCalls(calls)).toEqual([]);
+
+    await act(async () => { fireEvent.keyDown(dialog, { key: "D" }); });
+    await presented("interrupted-dismiss-all");
+    await act(async () => { fireEvent.keyDown(dialog, { key: "y" }); });
+    expect(dismissCalls(calls)).toEqual([[UNIT_ID, TEAM_ID, AGENT_ID]]);
+    await waitFor(() => expect(screen.getByTestId("interrupted-empty")).toHaveTextContent(NOTHING_INTERRUPTED));
+  });
+
+  /** Scenario: `r` runs the reclaim's dry run; once its verdict asks to confirm, a `y` before the question has been presented reclaims nothing, and one after it reclaims for real. A spoken dismissal's question is answered by `y` the same way. */
+  it("answers a reclaim's and a spoken dismissal's question with y only once presented", async () => {
+    const { bridge, calls } = recordingBridge({ list: three() });
+    const voice = voiced(bridge);
+    render(<voice.Voiced />);
+    await screen.findByTestId("interrupted-banner");
+    await act(async () => { VOICE_ACTIONS.showInterruptedWork.run(voice.context(), {}); });
+    await waitFor(() => expect(rows()).toHaveLength(3));
+    const dialog = screen.getByTestId("interrupted-dialog");
+    await act(async () => { fireEvent.keyDown(dialog, { key: "r" }); });
+    await screen.findByTestId("interrupted-reclaim-confirm");
+    await act(async () => { fireEvent.keyDown(dialog, { key: "y" }); });
+    expect(reclaimCalls(calls)).toEqual([[UNIT_ID, true]]);
+    await presented("interrupted-reclaim-view");
+    await act(async () => { fireEvent.keyDown(dialog, { key: "y" }); });
+    expect(reclaimCalls(calls)).toEqual([[UNIT_ID, true], [UNIT_ID, false]]);
+    await waitFor(() => expect(rows()).toHaveLength(2));
+
+    await act(async () => { VOICE_ACTIONS.dismissInterrupted.run(voice.context(), { filterText: "scratch shell" }); });
+    await act(async () => { fireEvent.keyDown(dialog, { key: "y" }); });
+    expect(dismissCalls(calls)).toEqual([]);
+    await presented("interrupted-dismiss-one");
+    await act(async () => { fireEvent.keyDown(dialog, { key: "y" }); });
+    expect(dismissCalls(calls)).toEqual([[AGENT_ID]]);
   });
 });

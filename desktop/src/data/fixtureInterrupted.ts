@@ -47,16 +47,34 @@ export function fixtureInterruptedItems(): InterruptedItem[] {
 
 const REPORT_BODY = "[UNTRUSTED-WORKER-REPORT: written by an agent, not by the deck]\nFixed the login redirect and added a test.\n[END-UNTRUSTED-WORKER-REPORT]";
 
+/** `count` more dispatched units, `extra-unit-01` on, for a list longer than the dialog (`interrupted=many`). */
+function extraUnits(count: number): InterruptedItem[] {
+  return Array.from({ length: count }, (_, at) => {
+    const n = String(at + 1).padStart(2, "0");
+    return {
+      id: `w-abcdefgh-00000000000001${n}`,
+      kind: "unit" as const,
+      name: `extra-unit-${n}`,
+      branch: `agent/dispatch-extra-unit-${n}`,
+      worktree: `/home/dev/demo-project-dispatch-extra-unit-${n}`,
+      last_entry: { kind: "attempt_ended", ts_ms: LAST_TS },
+      reports: [],
+      progress: { attempts: 1, delegations: 0, delegations_done: 0 },
+    };
+  });
+}
+
 /**
  * The preview's daemon: per deck, the items still interrupted. `enabled`
- * false answers as a daemon that does not support interrupted work.
+ * false answers as a daemon that does not support interrupted work; `extra`
+ * lists that many more units after the three.
  */
-export function fixtureInterruptedWork(enabled: boolean) {
+export function fixtureInterruptedWork(enabled: boolean, extra = 0) {
   const decks = new Map<string, InterruptedItem[]>();
   const items = (target: InterruptedTarget) => {
     let held = decks.get(target.deckId);
     if (!held) {
-      held = fixtureInterruptedItems();
+      held = [...fixtureInterruptedItems(), ...extraUnits(extra)];
       decks.set(target.deckId, held);
     }
     return held;

@@ -5,13 +5,14 @@ import {
   DEFAULT_DESKTOP_SETTINGS,
   DEFAULT_VOICE_SETTINGS,
   fixtureDesktopFeatures,
+  type DeckBridge,
   type DesktopSettingsDto,
   type VoiceResultDto,
   type VoiceStatusDto,
   type VoiceTranscriptionDto,
   type VoiceTranscriptionOutcomeDto,
 } from "../lib/bridge";
-import type { AgentSession, AgentTypeId, DeckActionResult, DeckRuntimeState } from "../types";
+import type { AgentSession, AgentTypeId, DeckActionResult, DeckRuntimeState, DeckSnapshot } from "../types";
 import { agentTurn } from "../lib/promptKeys";
 import { READING_ALREADY_OFF, READING_ALREADY_ON } from "../lib/reading";
 import type { AnswerOutcomeDto, PendingQuestionDto, QuestionResultDto, VoiceQuestionTarget } from "../lib/voiceQuestion";
@@ -44,7 +45,10 @@ import { useProjectTrustReview, type ProjectTrust, type ProjectTrustTarget } fro
 function DeckShell(props: Parameters<typeof AppDeckShell>[0]) {
   return <AppDeckShell initialView={{ kind: "deck" }} {...props} />;
 }
+import { useInterruptedWork } from "../hooks/useInterruptedWork";
+import type { DismissOutcome, InterruptedItem, InterruptedList, InterruptedTarget, ReclaimOutcome } from "../lib/interruptedWork";
 import {
+  INTERRUPTED_MOVED_ON,
   NOTHING_DISPATCHED,
   REVIEW_MOVED_ON,
   SCREEN_MOVED_ON,
@@ -3550,5 +3554,141 @@ describe("voice reading (PRD #1497, decisions 1–7 of 2026-10-09)", () => {
     await h.say("open settings");
     const last = h.reader.declareVoiceScreen.mock.calls.at(-1)!;
     expect(last[5]).toEqual({ reading: true, speaking: true });
+  });
+});
+
+/**
+ * PRD #1790 stage 2, desktop audit (auditor 2) — a spoken interrupted work
+ * action acts on the dialog it was spoken to or on nothing. The utterance is
+ * declared against the open dialog's deck, daemon process, opening, listed
+ * items and selection; an answer that comes back after any of those moved is
+ * refused, whatever dialog is open by then.
+ */
+describe("interrupted work by voice, against the dialog it was said to", () => {
+  function deferredResolver() {
+    let answer: (value: VoiceResultDto) => void = () => {};
+    const resolveVoice = vi.fn<(utterance: string) => Promise<VoiceResultDto>>(() => new Promise<VoiceResultDto>((resolve) => { answer = resolve; }));
+    return { resolveVoice, settle: async (value: VoiceResultDto) => { await act(async () => { answer(value); await Promise.resolve(); }); } };
+  }
+
+  const LAST = { kind: "attempt_ended", ts_ms: 1_795_082_400_000 };
+  const unitNamed = (id: string, name: string): InterruptedItem => ({ id, kind: "unit", name, last_entry: LAST, reports: [], progress: { attempts: 1, delegations: 0, delegations_done: 0 } });
+  /** Each deck's daemon lists two units of its own; every dismissal and reclaim is recorded. */
+  function bridgeOf(lists: Record<string, InterruptedList>) {
+    const sent: { verb: string; deckId: string; args: unknown[] }[] = [];
+    const answered = <T,>(target: InterruptedTarget, answer: T) => ({ outcome: "answered" as const, instance: target.instance, answer });
+    const bridge = {
+      interruptedWorkList: vi.fn(async (target: InterruptedTarget) => answered(target, structuredClone(lists[target.deckId]))),
+      interruptedWorkShow: vi.fn(async () => ({ outcome: "unsupported" as const })),
+      interruptedWorkReclaim: vi.fn(async (target: InterruptedTarget, id: string, dryRun: boolean) => {
+        sent.push({ verb: "reclaim", deckId: target.deckId, args: [id, dryRun] });
+        return answered(target, { id, dry_run: dryRun, verdict: "would-remove", message: "Reclaim would remove its worktree and keep its branch." } as ReclaimOutcome);
+      }),
+      interruptedWorkDismiss: vi.fn(async (target: InterruptedTarget, ids: string[]) => {
+        sent.push({ verb: "dismiss", deckId: target.deckId, args: [ids] });
+        return answered(target, { dismissed: ids.map((id) => ({ id })), refused: [] } as DismissOutcome);
+      }),
+    } as unknown as DeckBridge;
+    return { bridge, sent };
+  }
+
+  function decks(): DeckSnapshot[] {
+    const a = createFixtureSnapshot("connected");
+    const b = createFixtureSnapshot("connected");
+    return [
+      { ...a, connection: { ...a.connection, deckId: "deck-a", deckKind: "remote", socketPath: "dev@alpha", name: "alpha", incarnation: "process-a" } },
+      { ...b, agents: [], connection: { ...b.connection, deckId: "deck-b", deckKind: "remote", socketPath: "dev@beta", name: "beta", incarnation: "process-b" } },
+    ];
+  }
+
+  function Shell({ base, fleet, bridge }: { base: VoiceRuntime; fleet: DeckSnapshot[]; bridge: DeckBridge }) {
+    const interruptedWork = useInterruptedWork(bridge, fleet);
+    return <AppDeckShell runtime={{ ...base, snapshot: fleet[0], fleet, ...(interruptedWork ? { interruptedWork } : {}) }} initialView={{ kind: "overview" }} />;
+  }
+
+  const groupOf = (deckId: string) => screen.getAllByTestId("daemon-group").find((group) => group.getAttribute("data-daemon-id") === deckId)!;
+  async function openOn(deckId: string) {
+    await act(async () => { fireEvent.click(within(groupOf(deckId)).getByTestId("interrupted-banner-show")); });
+    await flush();
+    expect(screen.getAllByTestId("interrupted-row").length).toBeGreaterThan(0);
+  }
+  async function closeDialog() {
+    await act(async () => { fireEvent.click(screen.getByTestId("interrupted-close")); });
+  }
+  const dismissal = (said?: string) => result({
+    kind: "dispatch",
+    transcript: said === undefined ? "dismiss it" : `dismiss ${said}`,
+    action: "dismiss_interrupted",
+    invoke: "dismissInterrupted",
+    params: said === undefined ? [] : [{ name: "item", kind: "filter_text", spoken: said, value: said, label: said }],
+    sentence: "Asking whether to dismiss it.",
+  } as VoiceResultDto["outcome"]);
+
+  const lists = () => ({
+    "deck-a": { items: [unitNamed("w-a-1", "alpha-one"), unitNamed("w-a-2", "alpha-two")] },
+    "deck-b": { items: [unitNamed("w-b-1", "beta-one"), unitNamed("w-b-2", "beta-two")] },
+  });
+
+  async function start(utterance: string) {
+    vi.useFakeTimers();
+    const voice = automaticVoice(heard(utterance));
+    const { resolveVoice, settle } = deferredResolver();
+    const { bridge, sent } = bridgeOf(lists());
+    render(<Shell base={runtime(resolveVoice, voice)} fleet={decks()} bridge={bridge} />);
+    await flush();
+    await turnVoiceOn(voice);
+    return { voice, settle, sent };
+  }
+
+  /** Scenario: deck A's dialog is open and the user says "dismiss the first one"; while that is worked out, they close A's dialog and open deck B's. When the answer arrives neither deck is asked anything, no question opens in B's dialog, and the report says the list changed so nothing ran. */
+  it("refuses an answer once another deck's dialog replaced the one it was said to", async () => {
+    const { voice, settle, sent } = await start("dismiss the first one");
+    await openOn("deck-a");
+    await completeAutomaticUtterance(voice);
+    await closeDialog();
+    await openOn("deck-b");
+    await settle(dismissal("the first one"));
+    await flush();
+    expect(sent).toEqual([]);
+    expect(screen.queryByTestId("interrupted-dismiss-question")).toBeNull();
+    expect(screen.getByText(INTERRUPTED_MOVED_ON)).toBeInTheDocument();
+  });
+
+  /** Scenario: the same deck's dialog is closed and opened again while "dismiss the first one" is worked out: it is another opening, so the answer is refused and nothing is asked or sent. */
+  it("refuses an answer once the same deck's dialog was closed and opened again", async () => {
+    const { voice, settle, sent } = await start("dismiss the first one");
+    await openOn("deck-a");
+    await completeAutomaticUtterance(voice);
+    await closeDialog();
+    await openOn("deck-a");
+    await settle(dismissal("the first one"));
+    await flush();
+    expect(sent).toEqual([]);
+    expect(screen.queryByTestId("interrupted-dismiss-question")).toBeNull();
+    expect(screen.getByText(INTERRUPTED_MOVED_ON)).toBeInTheDocument();
+  });
+
+  /** Scenario: "dismiss it" is said with the first row selected; while it is worked out the user selects the second row. The answer is refused rather than applied to the row selected now. */
+  it("refuses an answer once the selection it would act on moved", async () => {
+    const { voice, settle, sent } = await start("dismiss it");
+    await openOn("deck-a");
+    await completeAutomaticUtterance(voice);
+    await act(async () => { fireEvent.click(screen.getAllByTestId("interrupted-row")[1]); });
+    await settle(dismissal());
+    await flush();
+    expect(sent).toEqual([]);
+    expect(screen.queryByTestId("interrupted-dismiss-question")).toBeNull();
+    expect(screen.getByText(INTERRUPTED_MOVED_ON)).toBeInTheDocument();
+  });
+
+  /** Scenario: the control case — nothing moved while "dismiss the first one" was worked out, so the dialog it was said to asks whether to dismiss alpha-one, and sends nothing until the person confirms. */
+  it("asks about the item named when nothing moved", async () => {
+    const { voice, settle, sent } = await start("dismiss the first one");
+    await openOn("deck-a");
+    await completeAutomaticUtterance(voice);
+    await settle(dismissal("the first one"));
+    await flush();
+    expect(screen.getByTestId("interrupted-dismiss-question")).toHaveTextContent("alpha-one");
+    expect(sent).toEqual([]);
   });
 });
