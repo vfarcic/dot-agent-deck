@@ -221,7 +221,9 @@ pub async fn is_dirty(worktree: &Path, deadline: Deadline) -> Option<bool> {
 /// [`crate::worktree_reclaim::resolve_pr_state`] reads it, with every `git`
 /// and `gh` child it runs bounded by `deadline`. `gh` is the program to run
 /// for it (`gh` on `PATH` in production). [`PrFact::Unknown`] whenever any
-/// step fails or runs out of time.
+/// step fails or runs out of time, the two lookups of where the branch is
+/// pushed included; [`PrFact::None`] only when every step answered and no
+/// pull request is the branch's.
 pub async fn pr_state(repo_dir: &Path, branch: &str, gh: &OsStr, deadline: Deadline) -> PrFact {
     use crate::worktree_reclaim::{
         GH_PR_FIELDS, PrState, parse_github_owner_repo, parse_pr_state, parse_push_remote,
@@ -237,20 +239,28 @@ pub async fn pr_state(repo_dir: &Path, branch: &str, gh: &OsStr, deadline: Deadl
     let Ok(listed) = run(Program::Other(gh), repo_dir, &args, deadline).await else {
         return PrFact::Unknown;
     };
+    // Which repositories the branch is pushed to decides whether a fork's
+    // pull request is the branch's own, so a lookup that fails is not read
+    // as "pushed nowhere" (reviewer 3): only a lookup that succeeds and finds
+    // no push remote leaves the set empty.
     let branch_ref = format!("refs/heads/{branch}");
-    let push_repos = match git(repo_dir, &push_remote_args(&branch_ref), deadline).await {
-        Ok(refs) => match parse_push_remote(&refs, &branch_ref) {
-            Some(remote) => git(
+    let Ok(refs) = git(repo_dir, &push_remote_args(&branch_ref), deadline).await else {
+        return PrFact::Unknown;
+    };
+    let push_repos = match parse_push_remote(&refs, &branch_ref) {
+        Some(remote) => {
+            let Ok(urls) = git(
                 repo_dir,
                 &["remote", "get-url", "--push", "--all", &remote],
                 deadline,
             )
             .await
-            .map(|urls| push_repos_from_urls(&urls))
-            .unwrap_or_default(),
-            None => Vec::new(),
-        },
-        Err(_) => Vec::new(),
+            else {
+                return PrFact::Unknown;
+            };
+            push_repos_from_urls(&urls)
+        }
+        None => Vec::new(),
     };
     match parse_pr_state(&String::from_utf8_lossy(&listed), branch, &push_repos) {
         PrState::Open => PrFact::Open,

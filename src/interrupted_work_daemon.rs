@@ -76,8 +76,13 @@
 //! (or of every listed item), so it is no longer listed. Kept reports are left
 //! to expire on schedule (D7). Its selector is bounded before anything is
 //! read ([`MAX_DISMISS_IDS`], [`MAX_DISMISS_ID_BYTES`], [`MAX_DISMISS_BYTES`]),
-//! the journal is indexed once per request ([`CloseSets`]), and its report
-//! lists are capped ([`crate::interrupted_work::MAX_DISMISS_REPORTED`]).
+//! the journal is indexed once per request ([`CloseSets`]), and its answer
+//! is bounded: its lists are capped
+//! ([`crate::interrupted_work::MAX_DISMISS_REPORTED`]), each dismissed item's
+//! name is cut to [`crate::interrupted_work::MAX_FIELD_BYTES`], and the whole
+//! answer is fitted to [`MAX_REPLY_BYTES`], counting the entries it leaves
+//! out ([`DismissOutcome::fit`]). The closes are written before the answer is
+//! fitted, so fitting changes what the answer names, never what was done.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -773,6 +778,7 @@ pub async fn dismiss(
                 outcome.push_refused(item.id.to_string(), RefusalReason::NotRecorded);
             }
         }
+        outcome.fit(MAX_REPLY_BYTES);
         outcome
     })
     .await;

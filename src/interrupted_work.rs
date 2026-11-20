@@ -149,8 +149,9 @@ pub struct Progress {
     /// Distinct attempts across every work of the item.
     #[serde(default)]
     pub attempts: u64,
-    /// The roles those attempts ran as, in the order first seen, at most
-    /// [`MAX_PROGRESS_ROLES`].
+    /// The roles those attempts ran as, in the order the journal first names
+    /// each (an `attempt_started`'s role, or the role a delegation's `opened`
+    /// names), across all of the item's works, at most [`MAX_PROGRESS_ROLES`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roles: Vec<String>,
     /// Delegated tasks (`opened launch=delegation`) under the item.
@@ -250,9 +251,10 @@ pub const MAX_SHOWN_REPORT_BYTES: u64 = 64 * 1024;
 /// the rest.
 pub const MAX_LISTED_ITEMS: usize = 2_000;
 
-/// The most bytes a list's or a show's JSON answer may take: half the attach
-/// protocol's 16 MiB frame bound, leaving room for the response's envelope
-/// and the Git facts a list adds after it is fitted ([`GIT_FACTS_RESERVE`]).
+/// The most bytes a list's, a show's or a dismissal's JSON answer may take:
+/// half the attach protocol's 16 MiB frame bound, leaving room for the
+/// response's envelope and the Git facts a list adds after it is fitted
+/// ([`GIT_FACTS_RESERVE`]).
 pub const MAX_REPLY_BYTES: usize = 8 * 1024 * 1024;
 
 /// The bytes a list sets aside per item for the Git facts it adds after
@@ -455,13 +457,56 @@ pub struct DismissOutcome {
 pub const MAX_DISMISS_REPORTED: usize = 256;
 
 impl DismissOutcome {
-    /// Record `item` as dismissed, within [`MAX_DISMISS_REPORTED`].
-    pub fn push_dismissed(&mut self, item: DismissedItem) {
+    /// Record `item` as dismissed, within [`MAX_DISMISS_REPORTED`], its name
+    /// cut to [`MAX_FIELD_BYTES`] as every display string a reply carries
+    /// is (a launch record's name can be far longer).
+    pub fn push_dismissed(&mut self, mut item: DismissedItem) {
         if self.dismissed.len() < MAX_DISMISS_REPORTED {
+            if let Some(name) = item.name.as_mut() {
+                cut_to(name, MAX_FIELD_BYTES);
+            }
             self.dismissed.push(item);
         } else {
             self.dismissed_omitted += 1;
         }
+    }
+
+    /// Fit the answer into at most `budget` bytes of JSON: refusals are kept
+    /// first, then dismissed items, each in order while the whole fits; the
+    /// entries left out are counted in [`Self::refused_omitted`] and
+    /// [`Self::dismissed_omitted`]. What was dismissed is already written;
+    /// this bounds only what the answer names.
+    pub fn fit(&mut self, budget: usize) {
+        let (dismissed, refused) = (self.dismissed.len(), self.refused.len());
+        // The envelope with every entry counted as omitted: the counts can
+        // only be smaller once entries are kept.
+        let mut used = json_len(&DismissOutcome {
+            dismissed: Vec::new(),
+            refused: Vec::new(),
+            refusal: self.refusal.clone(),
+            incomplete: self.incomplete,
+            dismissed_omitted: self.dismissed_omitted + dismissed,
+            refused_omitted: self.refused_omitted + refused,
+        });
+        let mut keep = |sizes: &mut dyn Iterator<Item = usize>| {
+            let mut kept = 0;
+            for size in sizes {
+                // The entry and the comma before it.
+                let size = size.saturating_add(1);
+                if used.saturating_add(size) > budget {
+                    break;
+                }
+                used += size;
+                kept += 1;
+            }
+            kept
+        };
+        let kept_refused = keep(&mut self.refused.iter().map(json_len));
+        let kept_dismissed = keep(&mut self.dismissed.iter().map(json_len));
+        self.refused.truncate(kept_refused);
+        self.refused_omitted += refused - kept_refused;
+        self.dismissed.truncate(kept_dismissed);
+        self.dismissed_omitted += dismissed - kept_dismissed;
     }
 
     /// Record a refusal of `id`, within [`MAX_DISMISS_REPORTED`].
@@ -581,6 +626,26 @@ pub const UNSUPPORTED: &str = "The running deck daemon does not support interrup
 pub const NO_DAEMON: &str = "No deck daemon is running.";
 /// Before the error of a request the daemon did not answer.
 pub const DAEMON_FAILED: &str = "The deck daemon could not answer:";
+
+/// The most characters of a value read from the journal or the daemon (a
+/// name, a branch, a path, a daemon message) one line shows.
+pub const MAX_SHOWN_CHARS: usize = 300;
+
+/// `value` made safe to show on one terminal line, as the CLI and the TUI
+/// show it: control characters (escapes, newlines) and Unicode bidi
+/// controls are written escaped (`\u{1b}`, `\u{202e}`:
+/// [`crate::untrusted_text::escape_control_and_bidi`]), so none can move the
+/// cursor or reorder the text around it, and the result is cut to
+/// [`MAX_SHOWN_CHARS`] characters, ending in `…` when it was.
+pub fn display_value(value: &str) -> String {
+    let escaped = crate::untrusted_text::escape_control_and_bidi(value);
+    let mut chars = escaped.chars();
+    let mut out: String = chars.by_ref().take(MAX_SHOWN_CHARS).collect();
+    if chars.next().is_some() {
+        out.push('…');
+    }
+    out
+}
 
 /// The word for an item's kind.
 pub fn kind_label(kind: ItemKind) -> &'static str {
@@ -788,12 +853,22 @@ pub enum Resolved<'a> {
 
 /// The listed item `query` names: its id exactly, else the one item whose
 /// name or branch equals it, or whose id ends with it.
+///
+/// A query that parses as a full work id ([`WorkId::parse`]) names that
+/// item or none (auditor N1): when the item it named is no longer listed
+/// (another client dismissed or reclaimed it), an item whose name or branch
+/// happens to be that string is not taken in its place, so a confirmed or
+/// batched action cannot land on an item the person did not confirm.
 pub fn resolve<'a>(list: &'a InterruptedList, query: &str) -> Resolved<'a> {
     let query = query.trim();
     if query.is_empty() {
         return Resolved::NotListed;
     }
-    if let Some(item) = list.items.iter().find(|item| item.id.as_str() == query) {
+    let exact = list.items.iter().find(|item| item.id.as_str() == query);
+    if WorkId::parse(query).is_some() {
+        return exact.map_or(Resolved::NotListed, Resolved::One);
+    }
+    if let Some(item) = exact {
         return Resolved::One(item);
     }
     let mut matches = list.items.iter().filter(|item| {
@@ -1143,6 +1218,8 @@ pub fn workspace_path<'a>(
 
 /// A work's `opened` line.
 struct Opened<'a> {
+    /// The line's index in the read.
+    at: usize,
     launch: Launch,
     parent: Option<&'a WorkId>,
     refs: &'a Refs,
@@ -1171,8 +1248,9 @@ struct Index<'a> {
     works: Vec<&'a WorkId>,
     opened: HashMap<&'a WorkId, Opened<'a>>,
     attempts_of: HashMap<&'a WorkId, Vec<&'a AttemptId>>,
-    /// The roles each work's attempts ran as, in the order first seen.
-    roles_of: HashMap<&'a WorkId, Vec<&'a String>>,
+    /// The roles each work's attempts ran as, each with the index in the
+    /// read of the line that first named it for that work.
+    roles_of: HashMap<&'a WorkId, Vec<(usize, &'a String)>>,
     attempt_state: HashMap<&'a AttemptId, AttemptState>,
     closes: HashMap<&'a WorkId, Vec<CloseHow>>,
     reported: Vec<Reported<'a>>,
@@ -1227,6 +1305,7 @@ impl<'a> Index<'a> {
                     ..
                 } => {
                     index.opened.entry(work).or_insert(Opened {
+                        at,
                         launch: *launch,
                         parent: parent.as_ref(),
                         refs,
@@ -1241,8 +1320,8 @@ impl<'a> Index<'a> {
                     works_of.entry(attempt).or_default().insert(work);
                     if let Some(role) = role {
                         let roles = index.roles_of.entry(work).or_default();
-                        if !roles.contains(&role) {
-                            roles.push(role);
+                        if !roles.iter().any(|(_, seen)| *seen == role) {
+                            roles.push((at, role));
                         }
                     }
                 }
@@ -1400,29 +1479,28 @@ impl<'a> Index<'a> {
         self.attempts_of.get(work).into_iter().flatten().copied()
     }
 
-    /// How far the item made of `ordered` (its root first) got.
+    /// How far the item made of `ordered` (its root first) got. Its roles
+    /// are ordered by where the journal first names each, across all of the
+    /// item's works: an attempt's `attempt_started`, or a delegation's
+    /// `opened` naming the role it was delegated to.
     fn progress(&self, ordered: &[&'a WorkId]) -> Progress {
         let mut attempts: HashSet<&AttemptId> = HashSet::new();
-        let mut roles: Vec<&String> = Vec::new();
+        let mut named: Vec<(usize, &String)> = Vec::new();
         let mut progress = Progress::default();
         for work in ordered {
             attempts.extend(self.attempts(work));
             let opened = self.opened.get(*work);
             let delegated_role = opened
                 .filter(|o| o.launch == Launch::Delegation)
-                .and_then(|o| o.refs.role.as_ref());
-            for role in self
-                .roles_of
-                .get(*work)
-                .into_iter()
-                .flatten()
-                .copied()
-                .chain(delegated_role)
-            {
-                if roles.len() < MAX_PROGRESS_ROLES && !roles.contains(&role) {
-                    roles.push(role);
-                }
-            }
+                .and_then(|o| o.refs.role.as_ref().map(|role| (o.at, role)));
+            named.extend(
+                self.roles_of
+                    .get(*work)
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .chain(delegated_role),
+            );
             if opened.is_some_and(|o| o.launch == Launch::Delegation) {
                 progress.delegations += 1;
                 if self
@@ -1432,6 +1510,16 @@ impl<'a> Index<'a> {
                 {
                     progress.delegations_done += 1;
                 }
+            }
+        }
+        named.sort_by_key(|(at, _)| *at);
+        let mut roles: Vec<&String> = Vec::new();
+        for (_, role) in named {
+            if roles.len() == MAX_PROGRESS_ROLES {
+                break;
+            }
+            if !roles.contains(&role) {
+                roles.push(role);
             }
         }
         progress.attempts = attempts.len() as u64;

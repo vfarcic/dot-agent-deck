@@ -28,22 +28,11 @@ use crate::interrupted_work::{
 };
 use crate::roles_cli::CliOutput;
 
-/// The most characters of any value read from the journal or the daemon (a
-/// name, a branch, a path, a daemon message) one line prints.
-const MAX_SHOWN_CHARS: usize = 300;
-
-/// `value` made safe to print on one terminal line: control characters
-/// (escapes, newlines) become `?`, and it is cut to [`MAX_SHOWN_CHARS`].
+/// `value` made safe to print on one terminal line: control and bidi
+/// characters escaped, cut to [`words::MAX_SHOWN_CHARS`]
+/// ([`words::display_value`], which the TUI shows values through too).
 fn shown(value: &str) -> String {
-    let mut out: String = value
-        .chars()
-        .take(MAX_SHOWN_CHARS)
-        .map(|c| if c.is_control() { '?' } else { c })
-        .collect();
-    if value.chars().count() > MAX_SHOWN_CHARS {
-        out.push('…');
-    }
-    out
+    words::display_value(value)
 }
 
 fn ok(stdout: String) -> CliOutput {

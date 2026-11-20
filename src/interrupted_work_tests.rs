@@ -1151,3 +1151,42 @@ fn a_dismissed_items_name_is_cut_to_the_field_bound() {
     let name = outcome.dismissed[0].name.as_deref().unwrap();
     assert!(name.len() <= MAX_FIELD_BYTES, "{}", name.len());
 }
+
+/// Auditor N2 / reviewer 2: a dismissal's answer is fitted to a byte budget,
+/// refusals first: what it leaves out is counted, so the counts still add up
+/// to everything the request did, and a tiny budget still answers its own
+/// fields with every entry counted.
+#[test]
+fn a_dismissal_answer_is_fitted_to_a_byte_budget_counting_what_it_leaves_out() {
+    let mut outcome = DismissOutcome::default();
+    for n in 0..100 {
+        outcome.push_dismissed(DismissedItem {
+            id: work(n).to_string(),
+            name: Some("\u{1}".repeat(MAX_FIELD_BYTES)),
+        });
+    }
+    for n in 0..10 {
+        outcome.push_refused(format!("no-such-{n}"), RefusalReason::NotListed);
+    }
+    let whole = json_len(&outcome);
+    let budget = whole / 4;
+    let mut fitted = outcome.clone();
+    fitted.fit(budget);
+    assert!(json_len(&fitted) <= budget, "{}", json_len(&fitted));
+    assert_eq!(fitted.refused.len(), 10, "refusals are kept first");
+    assert!(!fitted.dismissed.is_empty() && fitted.dismissed_omitted > 0);
+    assert_eq!(fitted.dismissed.len() + fitted.dismissed_omitted, 100);
+    assert_eq!(
+        fitted.dismissed[..],
+        outcome.dismissed[..fitted.dismissed.len()]
+    );
+
+    let mut tiny = outcome.clone();
+    tiny.fit(64);
+    assert!(tiny.dismissed.is_empty() && tiny.refused.is_empty());
+    assert_eq!((tiny.dismissed_omitted, tiny.refused_omitted), (100, 10));
+
+    let mut roomy = outcome.clone();
+    roomy.fit(MAX_REPLY_BYTES);
+    assert_eq!(roomy, outcome, "an answer that fits is left as it was");
+}
