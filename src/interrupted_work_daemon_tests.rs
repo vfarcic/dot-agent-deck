@@ -1227,7 +1227,9 @@ fn reclaim_removes_nothing_when_the_repositorys_worktree_lock_cannot_be_taken() 
 /// [`MAX_LISTED_REPORTS`]: crate::interrupted_work::MAX_LISTED_REPORTS
 #[test]
 fn show_pages_reach_every_kept_report_beyond_the_metadata_cap() {
-    use crate::interrupted_work::{ItemReport, MAX_LISTED_REPORTS, fit_list, fit_show_page};
+    use crate::interrupted_work::{
+        ItemReport, MAX_LISTED_REPORTS, fit_list, fit_show, fit_show_page,
+    };
     let total = 40;
     let mut item = InterruptedItem {
         id: WorkId::parse("w-abcdefgh-0000000000000001").unwrap(),

@@ -144,8 +144,16 @@ pub fn render_list(list: &InterruptedList) -> String {
     out
 }
 
-/// One item: its id, kind and name, then one indented line per fact.
+/// One item: its id, kind and name, then one indented line per fact. As a
+/// list carries it: its first report entries, the next page starting after
+/// them.
 pub fn render_item(item: &InterruptedItem) -> String {
+    render_item_paged(item, None)
+}
+
+/// [`render_item`] for an item a show carries, whose report entries are the
+/// page `(reports_from, next_reports_from)` of its kept reports.
+fn render_item_paged(item: &InterruptedItem, page: Option<(usize, Option<usize>)>) -> String {
     let mut out = format!("{}  {}", item.id, words::kind_label(item.kind));
     if let Some(name) = &item.name {
         out.push_str(&format!("  {}", shown(name)));
@@ -195,11 +203,35 @@ pub fn render_item(item: &InterruptedItem) -> String {
             ),
         );
     }
-    if item.reports_omitted > 0 {
-        out.push_str(&format!(
-            "    {}\n",
-            words::more_reports_sentence(item.reports_omitted, item.id.as_str())
-        ));
+    let id = item.id.as_str();
+    match page {
+        None if item.reports_omitted > 0 => {
+            out.push_str(&format!(
+                "    {} {}\n",
+                words::more_reports_sentence(item.reports_omitted, id),
+                words::next_reports_sentence(id, item.reports.len())
+            ));
+        }
+        None => {}
+        Some((from, next)) => {
+            let total = item.reports.len() + item.reports_omitted;
+            if (from > 0 || next.is_some()) && !item.reports.is_empty() {
+                out.push_str(&format!(
+                    "    {}\n",
+                    words::report_range_sentence(from + 1, from + item.reports.len(), total)
+                ));
+            }
+            // The reports after this page.
+            let after = item.reports_omitted.saturating_sub(from);
+            if after > 0 {
+                let mut line = words::more_reports_sentence(after, id);
+                if let Some(next) = next {
+                    line.push(' ');
+                    line.push_str(&words::next_reports_sentence(id, next));
+                }
+                out.push_str(&format!("    {line}\n"));
+            }
+        }
     }
     if item.cut {
         out.push_str(&format!("    {}\n", words::ITEM_CUT));
@@ -211,11 +243,21 @@ pub fn render_item(item: &InterruptedItem) -> String {
 // show
 // ---------------------------------------------------------------------------
 
-/// `interrupted show <id> [--report <report id>]`: the item and the body of
-/// its first kept reports, or of the one `report` names, as the daemon framed
-/// it (untrusted text written by an agent).
-pub async fn run_show(client: &DaemonClient, id: &str, report: Option<&str>) -> CliOutput {
-    match client.show_interrupted(id, report, None).await {
+/// `interrupted show <id> [--report <report id>] [--reports-from <n>]`: the
+/// item and the body of its first kept reports, or of the one `report`
+/// names, as the daemon framed it (untrusted text written by an agent); with
+/// `reports_from`, the page of its kept reports from the `reports_from`-th
+/// on, and their bodies.
+pub async fn run_show(
+    client: &DaemonClient,
+    id: &str,
+    report: Option<&str>,
+    reports_from: Option<usize>,
+) -> CliOutput {
+    match client
+        .show_interrupted_page(id, report, reports_from, None)
+        .await
+    {
         Ok(GatedQuery::Answered(shown)) => ok(render_show(&shown)),
         Ok(GatedQuery::Unsupported) => unsupported(),
         Err(e) => client_error(e),
@@ -228,7 +270,10 @@ pub fn render_show(show: &InterruptedShow) -> String {
     if show.incomplete {
         out.push_str(&format!("{}\n", words::LIST_INCOMPLETE));
     }
-    out.push_str(&render_item(&show.item));
+    out.push_str(&render_item_paged(
+        &show.item,
+        Some((show.reports_from, show.next_reports_from)),
+    ));
     if show.bodies_omitted > 0 {
         out.push_str(&format!(
             "{}\n",

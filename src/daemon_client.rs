@@ -3750,9 +3750,24 @@ impl DaemonClient {
         report: Option<&str>,
         pinned_instance: Option<&str>,
     ) -> Result<GatedQuery<crate::interrupted_work::InterruptedShow>, ClientError> {
+        self.show_interrupted_page(id, report, None, pinned_instance)
+            .await
+    }
+
+    /// PRD #1790 stage 2: [`Self::show_interrupted`] of one page of the
+    /// item's kept reports, from its `reports_from`-th on (reviewer 1); the
+    /// answer's `next_reports_from` says where the next page starts.
+    pub async fn show_interrupted_page(
+        &self,
+        id: &str,
+        report: Option<&str>,
+        reports_from: Option<usize>,
+        pinned_instance: Option<&str>,
+    ) -> Result<GatedQuery<crate::interrupted_work::InterruptedShow>, ClientError> {
         let request = AttachRequest::ShowInterrupted {
             id: id.to_string(),
             report: report.map(str::to_string),
+            reports_from,
         };
         let Some(resp) = self
             .interrupted_work_request(&request, pinned_instance)

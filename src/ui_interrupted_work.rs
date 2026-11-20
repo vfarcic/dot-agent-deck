@@ -13,7 +13,10 @@
 //!   ([`crate::interrupted_work::interrupted_footer`]) with `[Show]` and
 //!   `[Hide]` buttons.
 //! - **Overlay** (`UiMode::InterruptedWork`): the list, an item's details, and
-//!   the reclaim and dismiss-all confirmations.
+//!   the reclaim and dismiss-all confirmations. In the details, `Enter` shows
+//!   the first page of the item's kept reports with their text, and `n`/`p`
+//!   the next and previous page, so a report past the ones the list carries
+//!   can be reached; only the page last asked for is shown.
 //!
 //! Every sentence shown is one of the shared wording constants and helpers of
 //! [`crate::interrupted_work`] (decision D2), so the CLI, the TUI and the
@@ -43,9 +46,6 @@ const RECLAIM_TIMEOUT: Duration = Duration::from_secs(120);
 const DISMISS_TIMEOUT: Duration = Duration::from_secs(15);
 /// The overlay's widest.
 const POPUP_MAX_WIDTH: u16 = 100;
-/// The most characters of a value read from the journal or the daemon (a
-/// name, a branch, a path) one line shows.
-const MAX_SHOWN_CHARS: usize = 300;
 
 /// What a key or a click asks of the overlay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +57,10 @@ pub enum Press {
     /// `Enter`: open the selected item's details; in details, show its kept
     /// reports' text.
     Open,
+    /// `n` in details: the next page of the item's kept reports.
+    NextReports,
+    /// `p` in details: the page before.
+    PreviousReports,
     Reclaim,
     Dismiss,
     DismissAll,
@@ -73,11 +77,14 @@ pub(super) enum View {
     #[default]
     List,
     /// One item's details. `asked`: its kept reports' text was asked for.
+    /// `page`: where the page of kept reports last asked for starts; only
+    /// an answer for that page is shown.
     Details {
         id: String,
         show: Option<Box<InterruptedShow>>,
         asked: bool,
         scroll: usize,
+        page: Option<usize>,
     },
     /// Reclaim's confirmation: the dry run's outcome once it answered.
     Reclaim {
@@ -202,18 +209,11 @@ fn would_remove(outcome: &ReclaimOutcome) -> bool {
     outcome.verdict == ReclaimVerdict::WouldRemove && outcome.refusal.is_none()
 }
 
-/// `value` made safe to show on one line: control characters (escapes,
-/// newlines) become `?`, and it is cut to [`MAX_SHOWN_CHARS`].
+/// `value` made safe to show on one line: control and bidi characters
+/// escaped, cut to [`words::MAX_SHOWN_CHARS`] ([`words::display_value`], as
+/// the CLI shows it).
 fn clean(value: &str) -> String {
-    let mut out: String = value
-        .chars()
-        .take(MAX_SHOWN_CHARS)
-        .map(|c| if c.is_control() { '?' } else { c })
-        .collect();
-    if value.chars().count() > MAX_SHOWN_CHARS {
-        out.push('…');
-    }
-    out
+    words::display_value(value)
 }
 
 /// An item's name, or its branch, or its id.
@@ -387,11 +387,23 @@ pub(super) fn apply(ui: &mut UiState, answer: Answer) {
             }
         }
         Answer::Shown { id, result } => {
-            if let View::Details { id: open, show, .. } = &mut iw.view
+            if let View::Details {
+                id: open,
+                show,
+                page,
+                scroll,
+                ..
+            } = &mut iw.view
                 && *open == id
             {
                 match result {
-                    Ok(Some(shown)) => *show = Some(Box::new(shown)),
+                    // A page this view did not ask for (an earlier request
+                    // answering late) is not shown.
+                    Ok(Some(shown)) if page.is_some_and(|from| from != shown.reports_from) => {}
+                    Ok(Some(shown)) => {
+                        *show = Some(Box::new(shown));
+                        *scroll = 0;
+                    }
                     Ok(None) => iw.message = Some(words::UNSUPPORTED.to_string()),
                     Err(message) => iw.message = Some(message),
                 }
@@ -532,6 +544,8 @@ pub(super) fn handle_key(key: KeyEvent, ui: &mut UiState, kb: &KeybindingConfig)
         View::Details { .. } => match key.code {
             KeyCode::Esc | KeyCode::Char('q') => Some(Press::Back),
             KeyCode::Enter => Some(Press::Open),
+            KeyCode::Char('n') => Some(Press::NextReports),
+            KeyCode::Char('p') => Some(Press::PreviousReports),
             KeyCode::Down | KeyCode::Char('j') => Some(Press::Down),
             KeyCode::Up | KeyCode::Char('k') => Some(Press::Up),
             KeyCode::PageDown => Some(Press::PageDown),
@@ -578,6 +592,7 @@ pub(super) fn press(ui: &mut UiState, press: Press) {
                         show: None,
                         asked: false,
                         scroll: 0,
+                        page: None,
                     };
                 }
             }
@@ -619,7 +634,9 @@ pub(super) fn press(ui: &mut UiState, press: Press) {
             }
             _ => {}
         },
-        View::Details { id, asked, .. } => match press {
+        View::Details {
+            id, asked, show, ..
+        } => match press {
             Press::Down | Press::Up | Press::PageDown | Press::PageUp => {
                 if let View::Details { scroll, .. } = &mut iw.view {
                     *scroll = match press {
@@ -635,18 +652,18 @@ pub(super) fn press(ui: &mut UiState, press: Press) {
                 if asked || !has_reports {
                     return;
                 }
-                if let View::Details { asked, .. } = &mut iw.view {
-                    *asked = true;
+                request_page(iw, id, 0);
+            }
+            // Reviewer 1: every kept report can be reached, a page at a time.
+            Press::NextReports => {
+                if let Some(next) = show.and_then(|show| show.next_reports_from) {
+                    request_page(iw, id, next);
                 }
-                let instance = iw.instance.clone();
-                spawn(iw, async move {
-                    let result = bounded(
-                        SHOW_TIMEOUT,
-                        client().show_interrupted(&id, None, instance.as_deref()),
-                    )
-                    .await;
-                    Answer::Shown { id, result }
-                });
+            }
+            Press::PreviousReports => {
+                if let Some(from) = show.map(|show| show.reports_from).filter(|from| *from > 0) {
+                    request_page(iw, id, from.saturating_sub(words::MAX_SHOWN_REPORTS));
+                }
             }
             Press::Back => iw.view = View::List,
             _ => {}
@@ -671,6 +688,24 @@ pub(super) fn press(ui: &mut UiState, press: Press) {
             _ => {}
         },
     }
+}
+
+/// Ask for the page of the item `id`'s kept reports, and their text, that
+/// starts at its `from`-th report; only that page's answer is shown.
+fn request_page(iw: &mut InterruptedWork, id: String, from: usize) {
+    if let View::Details { asked, page, .. } = &mut iw.view {
+        *asked = true;
+        *page = Some(from);
+    }
+    let instance = iw.instance.clone();
+    spawn(iw, async move {
+        let result = bounded(
+            SHOW_TIMEOUT,
+            client().show_interrupted_page(&id, None, Some(from), instance.as_deref()),
+        )
+        .await;
+        Answer::Shown { id, result }
+    });
 }
 
 /// Reclaim the item `id`, or with `dry_run` ask what that would do.
@@ -1005,13 +1040,44 @@ fn details_body(
             ),
         );
     }
-    if item.reports_omitted > 0 {
-        lines.extend(wrapped(
-            &words::more_reports_sentence(item.reports_omitted, item.id.as_str()),
-            width,
-            "    ",
-            text_dim(),
-        ));
+    match show.filter(|_| asked) {
+        // A page of the item's kept reports (reviewer 1): which ones it
+        // holds, and how many come after it.
+        Some(show) => {
+            let total = item.reports.len() + item.reports_omitted;
+            if (show.reports_from > 0 || show.next_reports_from.is_some())
+                && !item.reports.is_empty()
+            {
+                lines.extend(wrapped(
+                    &words::report_range_sentence(
+                        show.reports_from + 1,
+                        show.reports_from + item.reports.len(),
+                        total,
+                    ),
+                    width,
+                    "    ",
+                    text_primary(),
+                ));
+            }
+            let after = item.reports_omitted.saturating_sub(show.reports_from);
+            if after > 0 {
+                lines.extend(wrapped(
+                    &words::more_reports_sentence(after, item.id.as_str()),
+                    width,
+                    "    ",
+                    text_dim(),
+                ));
+            }
+        }
+        None if item.reports_omitted > 0 => {
+            lines.extend(wrapped(
+                &words::more_reports_sentence(item.reports_omitted, item.id.as_str()),
+                width,
+                "    ",
+                text_dim(),
+            ));
+        }
+        None => {}
     }
     if item.cut {
         lines.extend(wrapped(words::ITEM_CUT, width, "    ", text_dim()));
@@ -1044,13 +1110,12 @@ fn details_body(
                     lines.extend(wrapped(words::REPORT_CUT, width, "  ", notice()));
                 }
                 // The daemon framed it as untrusted text written by an agent;
-                // it is shown as framed, each of its lines made safe.
+                // it is shown as framed, each of its lines made safe: tabs as
+                // spaces, control and bidi characters escaped, as
+                // `words::display_value` shows a value.
                 for line in body.lines() {
-                    let line: String = line
-                        .chars()
-                        .map(|c| if c == '\t' { ' ' } else { c })
-                        .map(|c| if c.is_control() { '?' } else { c })
-                        .collect();
+                    let line =
+                        crate::untrusted_text::escape_control_and_bidi(&line.replace('\t', " "));
                     lines.extend(wrapped(&line, width, "  ", text_dim()));
                 }
             }
@@ -1160,10 +1225,20 @@ fn hints(iw: &InterruptedWork) -> String {
             parts.push("Esc close".to_string());
             format!("  {}", parts.join(" · "))
         }
-        View::Details { id, asked, .. } => {
+        View::Details {
+            id, asked, show, ..
+        } => {
             let mut parts = Vec::new();
             if !asked && iw.item(id).is_some_and(|item| !item.reports.is_empty()) {
                 parts.push("Enter show reports".to_string());
+            }
+            if let Some(show) = show.as_deref().filter(|_| *asked) {
+                if show.next_reports_from.is_some() {
+                    parts.push("n next reports".to_string());
+                }
+                if show.reports_from > 0 {
+                    parts.push("p previous reports".to_string());
+                }
             }
             parts.push("j/k scroll".to_string());
             parts.push("Esc back".to_string());

@@ -628,6 +628,7 @@ fn the_interrupted_work_requests_round_trip_with_their_ops_and_omit_their_defaul
     let show = wire(&AttachRequest::ShowInterrupted {
         id: "w-1".into(),
         report: None,
+        reports_from: None,
     });
     assert_eq!(
         show,
@@ -635,11 +636,12 @@ fn the_interrupted_work_requests_round_trip_with_their_ops_and_omit_their_defaul
     );
     assert!(matches!(
         back(show),
-        AttachRequest::ShowInterrupted { id, report: None } if id == "w-1"
+        AttachRequest::ShowInterrupted { id, report: None, reports_from: None } if id == "w-1"
     ));
     let one = wire(&AttachRequest::ShowInterrupted {
         id: "w-1".into(),
         report: Some("r-17".into()),
+        reports_from: None,
     });
     assert_eq!(
         one,
@@ -1189,4 +1191,79 @@ fn a_dismissal_answer_is_fitted_to_a_byte_budget_counting_what_it_leaves_out() {
     let mut roomy = outcome.clone();
     roomy.fit(MAX_REPLY_BYTES);
     assert_eq!(roomy, outcome, "an answer that fits is left as it was");
+}
+
+/// Reviewer 1: a show's page is additive on the wire. The request carries
+/// `reports_from` only when a page is asked for, and the answer carries
+/// `reports_from` and `next_reports_from` only when they say something; an
+/// answer without them decodes as the first page with no next one.
+#[test]
+fn a_report_page_is_additive_and_optional_on_the_wire() {
+    use crate::daemon_protocol::AttachRequest;
+    let paged = serde_json::to_value(AttachRequest::ShowInterrupted {
+        id: "w-1".into(),
+        report: None,
+        reports_from: Some(16),
+    })
+    .unwrap();
+    assert_eq!(
+        paged,
+        serde_json::json!({"op": "show-interrupted", "id": "w-1", "reports_from": 16})
+    );
+    assert!(matches!(
+        serde_json::from_value::<AttachRequest>(paged).unwrap(),
+        AttachRequest::ShowInterrupted {
+            reports_from: Some(16),
+            ..
+        }
+    ));
+    let plain: AttachRequest =
+        serde_json::from_str(r#"{"op": "show-interrupted", "id": "w-1"}"#).unwrap();
+    assert!(matches!(
+        plain,
+        AttachRequest::ShowInterrupted {
+            reports_from: None,
+            ..
+        }
+    ));
+
+    let item = heavy_item(1, 0);
+    let first = fit_show(
+        item.clone(),
+        &[],
+        false,
+        MAX_REPLY_BYTES,
+        |_| unreachable!(),
+    );
+    let wire = serde_json::to_value(&first).unwrap();
+    assert!(wire.get("reports_from").is_none(), "{wire}");
+    assert!(wire.get("next_reports_from").is_none(), "{wire}");
+    let decoded: InterruptedShow = serde_json::from_value(wire).unwrap();
+    assert_eq!((decoded.reports_from, decoded.next_reports_from), (0, None));
+
+    let mut many = item;
+    many.reports = (0..20)
+        .map(|n| ItemReport {
+            report_id: format!("r-{n}"),
+            task_id: None,
+            unit_id: None,
+            kept_until_ms: None,
+        })
+        .collect();
+    let page = fit_show_page(
+        many,
+        Some(16),
+        &[],
+        false,
+        MAX_REPLY_BYTES,
+        |_| unreachable!(),
+    );
+    let wire = serde_json::to_value(&page).unwrap();
+    assert_eq!(wire["reports_from"], 16);
+    assert!(
+        wire.get("next_reports_from").is_none(),
+        "the last page: {wire}"
+    );
+    assert_eq!(page.item.reports.len(), 4);
+    assert_eq!(page.item.reports_omitted, 16);
 }

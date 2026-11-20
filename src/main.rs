@@ -913,6 +913,11 @@ enum InterruptedCmd {
         /// Show the text of this one of the item's kept reports, by its id.
         #[arg(long = "report", value_name = "REPORT_ID")]
         report: Option<String>,
+        /// List the item's kept reports from this one on (counted from 0),
+        /// a page at a time, with their text. Each page says where the next
+        /// one starts.
+        #[arg(long = "reports-from", value_name = "N")]
+        reports_from: Option<usize>,
     },
     /// Reclaim an item: remove its worktree, keep its branch. A worktree with
     /// uncommitted changes, or with other worktrees inside it, is kept.
@@ -4340,7 +4345,11 @@ async fn run_interrupted_cli(cmd: InterruptedCmd) -> ExitCode {
     let identity = || dot_agent_deck::close_cli::ambient_identity();
     let output = match cmd {
         InterruptedCmd::List { json, no_git } => cli::run_list(&client, json, !no_git).await,
-        InterruptedCmd::Show { id, report } => cli::run_show(&client, &id, report.as_deref()).await,
+        InterruptedCmd::Show {
+            id,
+            report,
+            reports_from,
+        } => cli::run_show(&client, &id, report.as_deref(), reports_from).await,
         InterruptedCmd::Reclaim { id, dry_run } => match identity() {
             Ok(identity) => cli::run_reclaim(&client, &id, dry_run, &identity).await,
             Err(message) => cli::identity_error_output(message),

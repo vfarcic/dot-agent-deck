@@ -11,7 +11,8 @@
 //!
 //! Keys: `I` opens the list from the dashboard (the footer's `[Show I]`, and
 //! the restart notice's list), `X` hides the footer row; in the list `j`/`k`
-//! select, `Enter` opens details (and there shows the kept reports' text),
+//! select, `Enter` opens details (and there shows the kept reports' text,
+//! with `n`/`p` for the next and previous page of them),
 //! `r` reclaims, `d` dismisses, `D` dismisses all, `Esc`/`q` close.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};

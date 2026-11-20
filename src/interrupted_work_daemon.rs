@@ -22,9 +22,11 @@
 //! [`MAX_REPLY_BYTES`] of JSON, each item at most
 //! [`crate::interrupted_work::MAX_LISTED_REPORTS`] report entries and each
 //! string at most [`crate::interrupted_work::MAX_FIELD_BYTES`]; a show bounds
-//! its report entries and bodies the same way ([`fit_list`], [`fit_show`]),
-//! and either says what it left out. A show can ask for any one of the item's
-//! reports by id. What a reclaim or a dismissal acts on is resolved from the
+//! its report entries and bodies the same way ([`fit_list`],
+//! [`fit_show_page`]), and either says what it left out. A show can ask for
+//! any one of the item's reports by id, and for its reports a page at a time
+//! (`reports_from`), each answer saying where the next page starts, so every
+//! kept report can be found past the list's cap. What a reclaim or a dismissal acts on is resolved from the
 //! unfitted list, never from what a reply carried.
 //!
 //! **Who may act.** Listing and showing are open to every caller. Reclaim and
@@ -109,7 +111,7 @@ use crate::interrupted_work::{
     CloseSets, DismissOutcome, DismissedItem, GIT_FACTS_RESERVE, GitFacts, InterruptedItem,
     InterruptedList, InterruptedShow, ItemKind, MAX_REPLY_BYTES, MAX_SHOWN_REPORT_BYTES,
     MAX_SHOWN_REPORTS, PrFact, REPORT_NOT_OF_ITEM, ReclaimOutcome, ReclaimVerdict, RefusalReason,
-    Resolved, ShownReport, derive, fit_list, fit_show, reclaim_sentence, resolve,
+    Resolved, ShownReport, derive, fit_list, fit_show_page, reclaim_sentence, resolve,
     still_interrupted,
 };
 use crate::interrupted_work_probe::{self as probe, Deadline};
@@ -255,6 +257,20 @@ pub async fn show(
     id: String,
     report: Option<String>,
 ) -> Result<InterruptedShow, String> {
+    show_page(registry, id, report, None).await
+}
+
+/// [`show`] of one page of the item's kept reports: with `reports_from`, the
+/// entries from the item's `reports_from`-th report on (at most
+/// [`MAX_SHOWN_REPORTS`]) and, without `report`, their bodies; the answer
+/// says where the next page starts
+/// ([`crate::interrupted_work::fit_show_page`]).
+pub async fn show_page(
+    registry: &AgentPtyRegistry,
+    id: String,
+    report: Option<String>,
+    reports_from: Option<usize>,
+) -> Result<InterruptedShow, String> {
     blocking(registry, move |journal, retained| {
         let snap = snapshot(&journal, retained.as_deref())
             .map_err(|e| format!("the deck could not read its work journal: {e}"))?;
@@ -267,9 +283,10 @@ pub async fn show(
                 return Err(crate::interrupted_work::REFUSED_AMBIGUOUS.to_string());
             }
         };
-        let bodies = shown_bodies_page(&item, report.as_deref(), None)?;
-        Ok(fit_show(
+        let bodies = shown_bodies_page(&item, report.as_deref(), reports_from)?;
+        Ok(fit_show_page(
             item,
+            reports_from,
             &bodies,
             snap.list.incomplete,
             MAX_REPLY_BYTES,
@@ -299,14 +316,26 @@ fn shown_bodies(item: &InterruptedItem, report: Option<&str>) -> Result<Vec<Stri
     }
 }
 
-/// [`shown_bodies`] for one page of the item's reports. Not yet paged.
+/// The report ids a show of the page starting at the item's `page`-th
+/// report reads bodies for: `report`, when one is asked for (any of the
+/// item's), else the page's entries, at most [`MAX_SHOWN_REPORTS`]
+/// ([`crate::interrupted_work::fit_show_page`] carries the same ones). With
+/// no page, [`shown_bodies`].
 fn shown_bodies_page(
     item: &InterruptedItem,
     report: Option<&str>,
     page: Option<usize>,
 ) -> Result<Vec<String>, String> {
-    let _ = page;
-    shown_bodies(item, report)
+    match (report, page) {
+        (None, Some(from)) => Ok(item
+            .reports
+            .iter()
+            .skip(from)
+            .take(MAX_SHOWN_REPORTS)
+            .map(|r| r.report_id.clone())
+            .collect()),
+        _ => shown_bodies(item, report),
+    }
 }
 
 /// One report's body, from the file the list joined it to: one not yet

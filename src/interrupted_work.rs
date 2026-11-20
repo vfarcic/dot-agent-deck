@@ -122,8 +122,10 @@ pub struct InterruptedItem {
     #[serde(default)]
     pub reports: Vec<ItemReport>,
     /// Kept reports of the item left out of [`Self::reports`] to keep the
-    /// reply bounded ([`fit_list`], [`fit_show`]); read one by its id with
-    /// [`crate::daemon_protocol::AttachRequest::ShowInterrupted`]'s `report`.
+    /// reply bounded ([`fit_list`], [`fit_show_page`]), those before a page
+    /// included; list them a page at a time with
+    /// [`crate::daemon_protocol::AttachRequest::ShowInterrupted`]'s
+    /// `reports_from`, and read one by its id with its `report`.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub reports_omitted: usize,
     /// A name, path or other string of the item was longer than
@@ -708,6 +710,21 @@ pub fn more_reports_sentence(count: usize, id: &str) -> String {
     format!("{lead}; read one with `dot-agent-deck interrupted show {id} --report <report id>`.")
 }
 
+/// How to list an item's kept reports from the `next`-th on: `dot-agent-deck
+/// interrupted show <id> --reports-from <next>`.
+pub fn next_reports_sentence(id: &str, next: usize) -> String {
+    format!("List the next ones with `dot-agent-deck interrupted show {id} --reports-from {next}`.")
+}
+
+/// Which of an item's `total` kept reports a page holds, counted from one.
+pub fn report_range_sentence(first: usize, last: usize, total: usize) -> String {
+    if first == last {
+        format!("Report {first} of {total}.")
+    } else {
+        format!("Reports {first} to {last} of {total}.")
+    }
+}
+
 /// What a dismissal that dismissed `count` items more than it named says.
 pub fn more_dismissed_sentence(count: usize) -> String {
     if count == 1 {
@@ -1163,39 +1180,71 @@ pub fn fit_list(list: &mut InterruptedList, budget: usize, reserve_per_item: usi
     list.omitted += total - kept;
 }
 
-/// Fit a show of `item` into a reply of at most `budget` bytes. The item's
-/// strings are cut to [`MAX_FIELD_BYTES`]; its report entries are kept, in
-/// order, while they take at most [`MAX_SHOWN_ENTRY_BYTES`]
-/// ([`InterruptedItem::reports_omitted`] counts the rest); then the bodies
-/// `read` answers for `bodies` (report ids) are added, in order, while the
-/// whole show fits ([`InterruptedShow::bodies_omitted`] counts the rest).
+/// Fit a show of `item` into a reply of at most `budget` bytes: the first
+/// page of its kept reports' entries, as many as take at most
+/// [`MAX_SHOWN_ENTRY_BYTES`] ([`fit_show_page`] with no page asked for).
 pub fn fit_show(
+    item: InterruptedItem,
+    bodies: &[String],
+    incomplete: bool,
+    budget: usize,
+    read: impl FnMut(&str) -> ShownReport,
+) -> InterruptedShow {
+    fit_show_page(item, None, bodies, incomplete, budget, read)
+}
+
+/// Fit a show of `item`, `item` as derived (every kept report listed), into
+/// a reply of at most `budget` bytes. The item's strings are cut to
+/// [`MAX_FIELD_BYTES`]. Its report entries are kept from the `page`-th
+/// (0 when no page is asked for), in order, while they take at most
+/// [`MAX_SHOWN_ENTRY_BYTES`] and, for a page asked for, at most
+/// [`MAX_SHOWN_REPORTS`] of them; [`InterruptedItem::reports_omitted`]
+/// counts every other report of the item, those before the page included.
+/// [`InterruptedShow::reports_from`] is where the entries start and
+/// [`InterruptedShow::next_reports_from`] where the next page would, so
+/// every kept report can be found a page at a time (reviewer 1). Then the
+/// bodies `read` answers for `bodies` (report ids) are added, in order,
+/// while the whole show fits ([`InterruptedShow::bodies_omitted`] counts the
+/// rest).
+pub fn fit_show_page(
     mut item: InterruptedItem,
+    page: Option<usize>,
     bodies: &[String],
     incomplete: bool,
     budget: usize,
     mut read: impl FnMut(&str) -> ShownReport,
 ) -> InterruptedShow {
     cut_fields(&mut item);
+    let available = item.reports.len();
+    let total = available + item.reports_omitted;
+    let from = page.unwrap_or(0).min(available);
+    item.reports.drain(..from);
+    let most = if page.is_some() {
+        MAX_SHOWN_REPORTS
+    } else {
+        usize::MAX
+    };
     let mut entries = 0usize;
     let mut kept = 0usize;
     for report in &item.reports {
         let size = json_len(report).saturating_add(1);
-        if entries.saturating_add(size) > MAX_SHOWN_ENTRY_BYTES {
+        // At least one entry, so a page always moves on.
+        if kept == most || (kept > 0 && entries.saturating_add(size) > MAX_SHOWN_ENTRY_BYTES) {
             break;
         }
         entries += size;
         kept += 1;
     }
-    item.reports_omitted += item.reports.len() - kept;
     item.reports.truncate(kept);
+    item.reports_omitted = total - kept;
+    let next = from + kept;
     let mut show = InterruptedShow {
         item,
         reports: Vec::new(),
         incomplete,
         bodies_omitted: 0,
-        reports_from: 0,
-        next_reports_from: None,
+        reports_from: from,
+        next_reports_from: (next < available).then_some(next),
     };
     let mut used = json_len(&InterruptedShow {
         bodies_omitted: bodies.len(),
@@ -1212,19 +1261,6 @@ pub fn fit_show(
         show.reports.push(shown);
     }
     show
-}
-
-/// [`fit_show`] for one page of the item's kept reports. Not yet paged.
-pub fn fit_show_page(
-    item: InterruptedItem,
-    page: Option<usize>,
-    bodies: &[String],
-    incomplete: bool,
-    budget: usize,
-    read: impl FnMut(&str) -> ShownReport,
-) -> InterruptedShow {
-    let _ = page;
-    fit_show(item, bodies, incomplete, budget, read)
 }
 
 /// The resolved directory of `workspace`: the first of `cwds` (absolute
