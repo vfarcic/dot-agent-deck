@@ -2754,9 +2754,11 @@ pub(crate) async fn worktree_lock_path(clone_dir: &Path) -> Option<PathBuf> {
 /// only binds processes that take the lock, so an add started by the user or by
 /// another tool still races us, and only the retry survives that.
 ///
-/// The wait is [`crate::platform::lock::acquire_spawn_lock_within`]'s, so a
-/// wait that runs out leaves no blocking `flock` behind in the runtime's
-/// blocking pool.
+/// The wait is [`crate::platform::lock::acquire_spawn_lock_within`]'s, so on
+/// Unix a wait that runs out leaves no blocking `flock` behind in the
+/// runtime's blocking pool. It samples the lock rather than queueing for it,
+/// so steady short holders can outlast it; creation then goes on unserialized
+/// as for any other timeout.
 async fn acquire_worktree_lock(clone_dir: &Path) -> Option<crate::platform::lock::SpawnLock> {
     use crate::platform::lock::LockWaitError;
     let path = worktree_lock_path(clone_dir).await?;
@@ -2786,7 +2788,8 @@ async fn acquire_worktree_lock(clone_dir: &Path) -> Option<crate::platform::lock
 /// Why [`acquire_worktree_lock_within`] gave up without the lock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WorktreeLockUnavailable {
-    /// Another holder kept it for the whole wait.
+    /// It was not obtained before the wait ran out
+    /// ([`crate::platform::lock::LockWaitError::Busy`]).
     Busy,
     /// It could not be taken for another reason: the lock's path could not
     /// be resolved, or its file could not be opened or locked.
@@ -2795,9 +2798,8 @@ pub(crate) enum WorktreeLockUnavailable {
 
 /// PRD #1790 stage 2: the per-repository worktree lock of `clone_dir`
 /// ([`worktree_lock_path`]), the one [`create_worktree`] takes, waiting at
-/// most `wait` for another holder to let go
-/// ([`crate::platform::lock::acquire_spawn_lock_within`], which leaves
-/// nothing waiting for the lock once it gives up). Unlike
+/// most `wait` for it ([`crate::platform::lock::acquire_spawn_lock_within`],
+/// which on Unix leaves nothing waiting for the lock once it gives up). Unlike
 /// [`acquire_worktree_lock`], whose callers go on unserialized without it,
 /// an `Err` here is for a caller that must not go on: the reclaim of an
 /// interrupted item removes nothing without it, and says which of the two

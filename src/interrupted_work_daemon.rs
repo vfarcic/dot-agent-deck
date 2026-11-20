@@ -57,13 +57,14 @@
 //! spawn reserved after the hold into an alias of the worktree is refused by
 //! it, since a spawn whose directory resolves records its canonical spelling
 //! too. It then takes the per-repository worktree lock, waiting at most
-//! [`RECLAIM_LOCK_WAIT`] for another holder to let go; when it cannot be
-//! taken nothing is removed: [`ReclaimVerdict::KeptBusy`] when a holder kept
-//! it for the whole wait, [`ReclaimVerdict::KeptCouldNotLock`] when it could
-//! not be taken for another reason (its path not resolved, its file not
-//! opened or locked). The wait tries the lock without blocking and sleeps
-//! between tries, so a reclaim that gives up leaves nothing waiting for the
-//! lock ([`crate::platform::lock::acquire_spawn_lock_within`]). That is the lock the deck takes to create
+//! [`RECLAIM_LOCK_WAIT`] for it; when it cannot be taken nothing is
+//! removed: [`ReclaimVerdict::KeptBusy`] when it was not obtained before the
+//! wait ran out, [`ReclaimVerdict::KeptCouldNotLock`] when it could not be
+//! taken for another reason (its path not resolved, its file not opened or
+//! locked). The wait tries the lock without blocking and sleeps between
+//! tries, so on Unix a reclaim that gives up leaves nothing waiting for the
+//! lock ([`crate::platform::lock::acquire_spawn_lock_within`]); it is not
+//! fair, so steady short holders can outlast it. That is the lock the deck takes to create
 //! a dispatch's worktree ([`crate::issue_dispatch_run::create_worktree`],
 //! which goes on without it after waiting 60 seconds) and to remove a
 //! worktree a spawn abandoned; removing a dispatched worktree when its agent

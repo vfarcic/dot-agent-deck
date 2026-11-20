@@ -369,8 +369,9 @@ pub enum ReclaimVerdict {
     /// marker, or another branch checked out), so nothing was removed.
     KeptChanged,
     /// Kept: the repository's worktree lock, which worktree creation and
-    /// removal take, was held by another operation for longer than the
-    /// reclaim waits, so nothing was removed.
+    /// removal take, was not obtained before the reclaim's wait ran out, so
+    /// nothing was removed. Not proof that one operation held it throughout:
+    /// the wait samples the lock, so holders taking turns end here too.
     KeptBusy,
     /// Kept: the repository's worktree lock could not be taken for another
     /// reason than another operation holding it (its path could not be
@@ -584,7 +585,7 @@ pub const RECLAIM_KEPT_COULD_NOT_CHECK: &str =
 pub const RECLAIM_REMOVE_FAILED: &str = "Kept: git could not remove its worktree.";
 pub const RECLAIM_TIMED_OUT: &str = "Removing its worktree did not finish in time; it may still be removed, and the deck records it if it is.";
 pub const RECLAIM_KEPT_CHANGED: &str = "Kept: its worktree was moved, replaced or switched to another branch while it was being reclaimed, so nothing was removed. List the interrupted work again.";
-pub const RECLAIM_KEPT_BUSY: &str = "Kept: another change to its repository's worktrees did not finish in time, so nothing was removed. Reclaim it again.";
+pub const RECLAIM_KEPT_BUSY: &str = "Kept: the deck could not get its repository's worktree lock in time, so nothing was removed. Reclaim it again.";
 pub const RECLAIM_KEPT_COULD_NOT_LOCK: &str =
     "Kept: the deck could not take its repository's worktree lock, so nothing was removed.";
 pub const RECLAIM_NOT_RECORDED: &str = "Its worktree was removed and its branch kept, but the deck could not record it, so it may be listed again.";

@@ -217,8 +217,8 @@ async fn rebind(path: &Path, state_dir: &Path) -> Option<IpcListener> {
 /// outside it could land between that client's probe and its unlink, and the
 /// client would unlink the listener just bound. The wait for the lock is
 /// bounded past a client's own wait for a daemon to start; if it runs out, or
-/// the lock cannot be taken, the bind goes ahead without it. A wait that runs
-/// out leaves nothing waiting for the lock
+/// the lock cannot be taken, the bind goes ahead without it. On Unix a wait
+/// that runs out leaves nothing waiting for the lock
 /// ([`crate::platform::lock::acquire_spawn_lock_within`]).
 async fn bind_under_spawn_lock(path: &Path, state_dir: &Path) -> io::Result<IpcListener> {
     use crate::platform::lock::LockWaitError;

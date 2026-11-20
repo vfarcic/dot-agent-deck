@@ -22,7 +22,10 @@ pub use windows::{SpawnLock, acquire_spawn_lock};
 /// Why [`acquire_spawn_lock_within`] gave up without the lock.
 #[derive(Debug)]
 pub enum LockWaitError {
-    /// Another holder kept it for the whole wait.
+    /// The lock was not obtained before the wait ran out. This says nothing
+    /// about who had it: on Unix the wait samples the lock between pauses, so
+    /// several short holders taking turns, or a wait whose attempt could not
+    /// run in time, end here as well as one holder that kept it throughout.
     Busy,
     /// It could not be taken for another reason: the lock file could not be
     /// opened or created (a directory at its path, say), or locking it failed.
@@ -32,7 +35,7 @@ pub enum LockWaitError {
 impl std::fmt::Display for LockWaitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LockWaitError::Busy => f.write_str("another holder kept the lock for the whole wait"),
+            LockWaitError::Busy => f.write_str("could not get the lock in time"),
             LockWaitError::Failed(error) => error.fmt(f),
         }
     }
@@ -46,18 +49,33 @@ const LOCK_RETRY_FIRST_PAUSE: std::time::Duration = std::time::Duration::from_mi
 #[cfg(unix)]
 const LOCK_RETRY_LONGEST_PAUSE: std::time::Duration = std::time::Duration::from_millis(200);
 
-/// [`acquire_spawn_lock`], waiting at most `wait` for another holder to let
-/// go, and telling a holder that kept it ([`LockWaitError::Busy`]) from a lock
-/// that could not be taken at all ([`LockWaitError::Failed`]).
+/// [`acquire_spawn_lock`], waiting at most `wait` for it, and telling a lock
+/// not obtained in time ([`LockWaitError::Busy`]) from a lock that could not
+/// be taken at all ([`LockWaitError::Failed`]).
 ///
-/// On Unix it tries without waiting ([`unix::try_acquire_spawn_lock`], each
-/// attempt a short blocking-pool job that returns at once) and sleeps
-/// between attempts, so giving up leaves nothing waiting for the lock. That
-/// is the point of it: [`acquire_spawn_lock`] under a `tokio::time::timeout`
-/// stops the caller waiting but leaves its blocking `flock` holding a
-/// blocking-pool thread until the holder lets go. Off Unix it is that
-/// timeout over [`acquire_spawn_lock`], whose owner thread is left waiting
-/// for the mutex when the wait runs out.
+/// On Unix it tries without waiting for a holder
+/// ([`unix::try_acquire_spawn_lock`], each attempt a blocking-pool job) and
+/// sleeps between attempts, so giving up leaves no `flock` waiting for the
+/// lock. That is the point of it: [`acquire_spawn_lock`] under a
+/// `tokio::time::timeout` stops the caller waiting but leaves its blocking
+/// `flock` holding a blocking-pool thread until the holder lets go. The wait
+/// answers by `wait` even when an attempt cannot run in time (auditor N7):
+/// an attempt still queued then is cancelled, one that starts after it does
+/// not try, and one that takes the lock after it lets go at once rather than
+/// being handed back. An attempt already inside the `open` cannot be
+/// cancelled, since `O_NONBLOCK` does not bound a slow filesystem; it lets go
+/// of what it took when it returns, and only the caller stops waiting for it.
+///
+/// **Polling is not fair** (auditor N8). A waiter sleeping between attempts
+/// is not queued in the kernel, so a newcomer can take the lock while it
+/// sleeps, and steady short holders can make it miss every release and run
+/// out. Callers live with that: worktree creation goes on without the lock
+/// after its 60 s wait, the attach rebind binds without it, and a reclaim or
+/// an abandoned-spawn removal keeps the worktree.
+///
+/// Off Unix it is that timeout over [`acquire_spawn_lock`], whose named
+/// mutex owner thread is left waiting for the mutex when the wait runs out;
+/// the no-waiter-left property above is Unix's alone.
 pub async fn acquire_spawn_lock_within(
     path: &Path,
     wait: std::time::Duration,
@@ -88,15 +106,35 @@ where
     F: Fn(&Path) -> std::io::Result<Option<SpawnLock>> + Clone + Send + 'static,
 {
     let deadline = tokio::time::Instant::now() + wait;
+    // The same deadline on the clock a blocking-pool job can read. A wait too
+    // long to represent has no deadline worth checking there.
+    let job_deadline = std::time::Instant::now().checked_add(wait);
+    let expired = move || job_deadline.is_some_and(|at| std::time::Instant::now() >= at);
     let mut pause = LOCK_RETRY_FIRST_PAUSE;
     loop {
         let attempt_path = path.to_path_buf();
         let try_once = attempt.clone();
-        match tokio::task::spawn_blocking(move || try_once(&attempt_path)).await {
-            Ok(Ok(Some(lock))) => return Ok(lock),
-            Ok(Ok(None)) => {}
-            Ok(Err(error)) => return Err(LockWaitError::Failed(error)),
-            Err(join) => return Err(LockWaitError::Failed(std::io::Error::other(join))),
+        let job = tokio::task::spawn_blocking(move || {
+            if expired() {
+                return Ok(None);
+            }
+            // A lock taken after the deadline is dropped here, which lets go
+            // of it, rather than handed to a caller that has stopped waiting.
+            Ok(try_once(&attempt_path)?.filter(|_| !expired()))
+        });
+        let cancel = job.abort_handle();
+        match tokio::time::timeout_at(deadline, job).await {
+            // Cancels the attempt if it is still queued; one already running
+            // finishes, and its lock, if any, is dropped with its unclaimed
+            // result.
+            Err(_elapsed) => {
+                cancel.abort();
+                return Err(LockWaitError::Busy);
+            }
+            Ok(Ok(Ok(Some(lock)))) if tokio::time::Instant::now() < deadline => return Ok(lock),
+            Ok(Ok(Ok(_))) => {}
+            Ok(Ok(Err(error))) => return Err(LockWaitError::Failed(error)),
+            Ok(Err(join)) => return Err(LockWaitError::Failed(std::io::Error::other(join))),
         }
         let now = tokio::time::Instant::now();
         if now >= deadline {
