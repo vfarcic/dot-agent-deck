@@ -163,12 +163,14 @@ impl Decks {
     fn dispatch(&self, caller: &Pane, unit: &str, shape: &str) -> Pane {
         inbox::status(&self.live, caller, "session_start", "codex");
         inbox::status(&self.live, caller, "thinking", "codex");
+        let before = route::messages(&self.live, caller).len();
         route::cli(
             &self.live,
             caller,
             &self.repo,
             &["dispatch", unit, "--task", "INTERRUPTED-WORK-TASK", shape],
         );
+        self.dispatch_answered(caller, unit, before);
         let suffix = format!("-dispatch-{unit}");
         let found = std::cell::RefCell::new(None);
         let budget = common::load_scaled(Duration::from_secs(20));
@@ -187,6 +189,21 @@ impl Decks {
             common::agent_records_on(&self.live.attach_socket)
         );
         route::observe(&self.live, &found.into_inner().unwrap())
+    }
+
+    /// Wait until the dispatch of `unit` that `caller` just ran has answered
+    /// it: a message beyond the `before` it already held. The `dispatch` CLI
+    /// returns once the daemon accepts the request, and the daemon answers
+    /// only when the spawn is done, so a restart before this could stop the
+    /// dispatch itself, whose rollback then removes the unit's new worktree.
+    fn dispatch_answered(&self, caller: &Pane, unit: &str, before: usize) {
+        let budget = common::load_scaled(Duration::from_secs(20));
+        assert!(
+            common::wait_until(budget, || route::messages(&self.live, caller).len()
+                > before),
+            "the dispatch of {unit} never answered its caller within {budget:?}: {:?}",
+            route::messages(&self.live, caller)
+        );
     }
 
     /// `agent`'s working directory, as the serving daemon recorded it.
@@ -665,6 +682,7 @@ fn interrupted_036_reclaim_keeps_a_directory_a_dir_dispatch_started_in() {
     let caller = decks.pane("interrupted-dir-caller");
     inbox::status(&decks.live, &caller, "session_start", "codex");
     inbox::status(&decks.live, &caller, "thinking", "codex");
+    let before = route::messages(&decks.live, &caller).len();
     route::cli(
         &decks.live,
         &caller,
@@ -698,6 +716,7 @@ fn interrupted_036_reclaim_keeps_a_directory_a_dir_dispatch_started_in() {
         common::agent_records_on(&decks.live.attach_socket)
     );
     let unit = route::observe(&decks.live, &found.into_inner().unwrap());
+    decks.dispatch_answered(&caller, UNIT, before);
     decks.journaled(&[&caller, &unit]);
     decks.restart();
     drop((caller, unit));
