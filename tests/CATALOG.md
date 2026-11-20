@@ -13361,6 +13361,13 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Does not assert:** a real Claude Code or a real blocking hook (`inbox/claude/053`); the entry's recognition rules case by case (`inbox_witness` unit tests); the daemon's guard case by case (`state` unit test `a_dropped_prompt_ends_only_the_turn_it_started`).
 - **Platform coverage:** mac+linux.
 
+##### inbox/claude/055 — A waiter a mid-turn compaction arms is held for the Stop waiter (issue #2133).
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), real hook and `inbox wait` CLI children of a synthetic Claude parent.
+- **Agent:** none (synthetic Claude parent; no credential).
+- **Asserts:** with a human prompt's turn running (card Thinking), a waiter armed by a `SessionStart` whose source is `compact` is handed nothing for a task posted then: the task stays `queued` and the waiter has not exited 2 s later. After the turn's `Stop`, the waiter that `Stop` arms exits 2 with the task's block and the task reads `fetched`.
+- **Does not assert:** a real Claude Code compaction, or the hold's bounds (`inbox_engine_tests` `a_waiter_armed_before_a_turn_or_by_its_compaction_is_held_until_the_stop_grace_or_the_ack_wait`); the older-waiter case under a real turn (`inbox/load/001`).
+- **Platform coverage:** mac+linux.
+
 ##### inbox/claude/053 — Live: a doorbell prompt another hook blocks is not acknowledged, and is handed over again (issues #2341, #2347).
 - **Layer:** L2 lane 2 (`tests/e2e_inbox_claude_live.rs`), the real TUI in a PTY, in the `claude-blocking-hook` fixture: a project `.claude/settings.json` whose own `UserPromptSubmit` hook blocks the first prompt carrying a deck doorbell line and leaves a marker. The scratch pane's armed waiter is killed, so the doorbell is the wake path.
 - **Agent:** Claude Code (Haiku).

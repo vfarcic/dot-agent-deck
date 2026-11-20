@@ -3000,6 +3000,10 @@ pub struct ReceiptArm {
     /// Part 2 §2.7: the one-shot integration a once-waiter declared
     /// ([`HOOK_INTEGRATION`]).
     pub hook_integration: Option<u32>,
+    /// Issue #2133: a once-waiter armed by a compaction's `SessionStart`
+    /// (its wait names the `compact` source), which can come in the middle
+    /// of a turn.
+    pub compaction: bool,
 }
 
 /// PRD #1666 §13 step 4: whether `component`'s streams are owned by the
@@ -3969,12 +3973,14 @@ async fn serve_receipt<R, W, P>(
 /// `handed` and `not_handed` reports. A batch line whose newline the
 /// connection never accepted reaches no waiter (it reads through
 /// [`crate::inbox_oneshot::read_frame`]), so it is not handed.
+#[allow(clippy::too_many_arguments)]
 async fn serve_once<R, W>(
     hub: Arc<InboxHub>,
     pane_id: String,
     agent_id: String,
     component: InboxComponent,
     instance: Option<u32>,
+    compaction: bool,
     reader: R,
     mut writer: W,
 ) where
@@ -4015,6 +4021,9 @@ async fn serve_once<R, W>(
                     spool,
                     now,
                 );
+                if compaction {
+                    engine::mark_compaction(&mut st, &key, first.as_ref());
+                }
                 st.waiters.entry(key.clone()).or_default().push(Waiter {
                     conn_id,
                     component,
@@ -6594,7 +6603,17 @@ pub async fn serve_waiter<R, W, P>(
                 .hook_integration
                 .is_some_and(|declared| declared >= HOOK_INTEGRATION)
             {
-                serve_once(hub, pane_id, agent_id, component, instance, reader, writer).await;
+                serve_once(
+                    hub,
+                    pane_id,
+                    agent_id,
+                    component,
+                    instance,
+                    arm.compaction,
+                    reader,
+                    writer,
+                )
+                .await;
                 return;
             }
             hub.refuse_old_hooks(&pane_id, &agent_id, component);

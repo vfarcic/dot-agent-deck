@@ -233,6 +233,8 @@ pub(super) struct Link {
     pub(super) kind: LinkKind,
     /// When it registered (issue #2133, [`Receipts::once_hold_until`]).
     pub(super) registered_at: Instant,
+    /// Issue #2133: a once-waiter a compaction's `SessionStart` armed.
+    pub(super) compaction: bool,
 }
 
 impl Link {
@@ -383,30 +385,39 @@ impl Receipts {
     }
 
     /// Issue #2133: until when a once-waiter registered at `registered` is
-    /// handed nothing, if it is held: `key`'s latest turn is still running,
-    /// or the waiter was armed before that turn ended. Claude Code takes a
-    /// wake that lands mid-turn into the running turn as a queued command: no
-    /// prompt hook runs for it, so nothing can confirm it (measured on 2.1.328
-    /// and 2.1.329), and the model may finish the turn it was on without
-    /// acting on it. A waiter armed before the turn that exits as the turn
-    /// ends did not wake Claude in three of five runs either. So the batch is
-    /// left to the waiter Claude's `Stop` hook arms when the turn ends, which
-    /// supersedes this one. A waiter armed during the turn, by the
-    /// `SessionStart` of a compaction for one, is held the same way.
+    /// handed nothing, if it is held: it was armed before `key`'s latest turn
+    /// started, or, armed by a compaction's `SessionStart` (`compaction`),
+    /// before that turn ended. Claude Code takes a wake that lands mid-turn
+    /// into the running turn as a queued command: no prompt hook runs for
+    /// it, so nothing can confirm it (measured on 2.1.328 and 2.1.329), and
+    /// the model may finish the turn it was on without acting on it. A waiter
+    /// armed before the turn that exits as the turn ends did not wake Claude
+    /// in three of five runs either. So the batch is left to the waiter
+    /// Claude's `Stop` hook arms when the turn ends, which supersedes this
+    /// one. Any other waiter armed during the turn is not held: the `Stop`
+    /// hook's own can reach the deck before that hook's Idle does.
     ///
     /// The hold ends at the earlier of one ack-wait from the turn's start,
     /// for a turn whose end the deck never sees, and [`STOP_ARM_GRACE`] after
     /// the turn ended, for an end no `Stop` hook follows (a prompt another
     /// hook blocked, #2347): the older waiter is then the only one.
-    pub(super) fn once_hold_until(&self, key: &AgentKey, registered: Instant) -> Option<Instant> {
+    pub(super) fn once_hold_until(
+        &self,
+        key: &AgentKey,
+        registered: Instant,
+        compaction: bool,
+    ) -> Option<Instant> {
         let clock = self.turns.get(key)?;
         let started = clock.started_at?;
         let cap = started + self.limits.ack_wait;
-        if clock.busy {
-            return Some(cap);
+        let ended = clock
+            .idle_since
+            .filter(|ended| !clock.busy && *ended >= started);
+        let before_end = ended.is_none_or(|ended| registered < ended);
+        if !(registered < started || (compaction && before_end)) {
+            return None;
         }
-        let ended = clock.idle_since.filter(|ended| *ended >= started)?;
-        (registered < ended).then(|| (ended + STOP_ARM_GRACE).min(cap))
+        Some(ended.map_or(cap, |ended| (ended + STOP_ARM_GRACE).min(cap)))
     }
 
     /// The generation's floor blocks delivery (§11).
@@ -494,7 +505,9 @@ impl Receipts {
                     .links
                     .values()
                     .filter(|link| matches!(link.kind, LinkKind::Once { spent: false }))
-                    .filter_map(move |link| self.once_hold_until(key, link.registered_at))
+                    .filter_map(move |link| {
+                        self.once_hold_until(key, link.registered_at, link.compaction)
+                    })
             })
             .filter(|until| *until > now)
             .min();
@@ -668,6 +681,7 @@ pub(super) fn register(
             doorbell_only,
             kind,
             registered_at: now,
+            compaction: false,
         },
     );
     info!(
@@ -933,6 +947,7 @@ pub(super) fn dispatch(st: &mut HubState, key: &AgentKey, now: Instant, out: &mu
     };
     let (rx, conn_id, budget) = (*rx, link.conn_id, link.component.inline_budget());
     let once = matches!(link.kind, LinkKind::Once { .. });
+    let (registered_at, compaction) = (link.registered_at, link.compaction);
     // Issue #2133: nothing goes to a once-waiter armed before the latest
     // turn started, within the hold ([`Receipts::once_hold_until`]): the
     // waiter armed when that turn ends takes it, or the clock hands it over
@@ -940,7 +955,7 @@ pub(super) fn dispatch(st: &mut HubState, key: &AgentKey, now: Instant, out: &mu
     if once
         && st
             .receipts
-            .once_hold_until(key, link.registered_at)
+            .once_hold_until(key, registered_at, compaction)
             .is_some_and(|until| now < until)
     {
         return;
@@ -1007,6 +1022,29 @@ fn spend(
         batch,
         spool,
     });
+}
+
+/// Issue #2133: the once-waiter `registered` names was armed by a
+/// compaction's `SessionStart` ([`Receipts::once_hold_until`]).
+pub(super) fn mark_compaction(
+    st: &mut HubState,
+    key: &AgentKey,
+    registered: Option<&InboxWaitReply>,
+) {
+    let Some(rx) = registered
+        .and_then(|reply| reply.registered.as_ref())
+        .map(|r| Rx(r.rx))
+    else {
+        return;
+    };
+    if let Some(link) = st
+        .receipts
+        .gens
+        .get_mut(key)
+        .and_then(|generation| generation.links.get_mut(&rx))
+    {
+        link.compaction = true;
+    }
 }
 
 /// Drop connection `conn_id` from `key`'s armed waiters.
