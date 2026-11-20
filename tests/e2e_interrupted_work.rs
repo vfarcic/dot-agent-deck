@@ -56,6 +56,10 @@
 dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
+// The lane-2 fixture's FIFO hold (`journal/interrupted/028`), here so its
+// deterministic tests, which reach no agent, run in lane 1 as well.
+#[path = "support/fifo_hold.rs"]
+mod fifo_hold;
 #[path = "support/work_journal.rs"]
 mod journal;
 #[path = "support/inbox_route.rs"]

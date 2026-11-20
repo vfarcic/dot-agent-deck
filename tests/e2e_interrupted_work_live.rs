@@ -27,17 +27,22 @@
 //! refuse the agent's own waiter and stall its task. Each daemon logs to a
 //! file in the test root, which a failure message quotes.
 //!
-//! The agent's command ends by reading a FIFO the test creates in the
-//! worktree and never writes to, so the command blocks until something stops
-//! it. Just before the restart the test finds that command alive among the
-//! daemon's descendants; after it, the journal must say the unit's attempt
-//! ended interrupted and that the unit reported nothing. Elapsed time proves
-//! neither.
+//! The agent's command ends by reading a FIFO ([`hold::FifoHold`]) that the
+//! test creates before the dispatch, at an absolute path inside this run's own
+//! test root, and never writes to, so the command blocks until the test lets
+//! it go. The test waits until that exact command is running among the
+//! daemon's descendants and checks it again just before the restart; after
+//! it, the journal must say the unit's attempt ended interrupted and that the
+//! unit reported nothing. Elapsed time proves neither. Nothing in the test
+//! signals the held command: dropping the hold closes the FIFO's last writer,
+//! so a `cat` the restart left running reads end-of-file and exits.
 //!
 //! Cost: one short Haiku turn (one Bash command). Lane 2: it reaches a real
 //! agent, so it runs on a developer's machine and never in CI.
 
 dot_agent_deck_test_harness::link!();
+#[path = "support/fifo_hold.rs"]
+mod hold;
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
 #[path = "support/inbox_view.rs"]
@@ -68,8 +73,8 @@ const UNIT: &str = "interrupted-live";
 /// `.dot-agent-deck/` so writing it leaves the tree clean.
 const SENTINEL: &str = "interrupted-live-sentinel-7c41.txt";
 
-/// The FIFO, beside the sentinel, that the agent's command reads last. The
-/// test creates it and never opens it for writing, so the read blocks.
+/// The file name of the FIFO the agent's command reads last, in a directory
+/// of this run's own test root; its absolute path is what identifies it.
 const HOLD: &str = "interrupted-live-hold-7c41.fifo";
 
 /// Every process now running, as `(pid, parent pid, argv)` from `ps`, which
@@ -115,27 +120,12 @@ fn descendants(ancestor: u32) -> Vec<(u32, Vec<String>)> {
         .collect()
 }
 
-/// Whether `argv` is the agent's command waiting on the FIFO: `cat` with an
-/// argument naming [`HOLD`].
-fn is_held(argv: &[String]) -> bool {
-    argv.first()
-        .is_some_and(|a| Path::new(a).file_name().is_some_and(|n| n == "cat"))
-        && argv.iter().skip(1).any(|a| a.ends_with(HOLD))
-}
-
-/// The processes under `ancestor` running the agent's held command.
-fn holding_commands(ancestor: u32) -> Vec<(u32, Vec<String>)> {
+/// The processes under `ancestor` running `cat` of exactly this run's FIFO.
+fn holding_commands(ancestor: u32, hold: &hold::FifoHold) -> Vec<(u32, Vec<String>)> {
     descendants(ancestor)
         .into_iter()
-        .filter(|(_, argv)| is_held(argv))
+        .filter(|(_, argv)| hold.held_by(argv))
         .collect()
-}
-
-/// Whether `pid` is still running the held command.
-fn still_held(pid: u32) -> bool {
-    processes()
-        .into_iter()
-        .any(|(p, _, argv)| p == pid && is_held(&argv))
 }
 
 /// Every process under `ancestor` with its argv, for a failure message.
@@ -145,21 +135,6 @@ fn process_tree(ancestor: u32) -> String {
         .map(|(pid, argv)| format!("{pid}: {}", argv.join(" ")))
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-/// SIGKILLs, by pid, the held commands a stop left running, so a failed or
-/// passed run leaves no `cat` blocked on a FIFO behind it.
-struct HeldCommands(Vec<u32>);
-impl Drop for HeldCommands {
-    fn drop(&mut self) {
-        for pid in &self.0 {
-            if still_held(*pid) {
-                // SAFETY: kill(2) on a pid this test found running its own
-                // FIFO's name, checked again just now.
-                unsafe { libc::kill(*pid as libc::pid_t, libc::SIGKILL) };
-            }
-        }
-    }
 }
 
 /// The real CLI as a person at a terminal runs it against `daemon`: no pane
@@ -233,7 +208,7 @@ fn trust_spellings(path: &Path) -> Vec<String> {
     spellings
 }
 
-/// Scenario: A stand-in dispatcher pane dispatches a `--single` unit whose agent is a real interactive Claude Code on Haiku; the deck delivers the task, which the agent acknowledges, and the agent's one command writes a uniquely named sentinel under the worktree's ignored `.dot-agent-deck/` and then blocks reading a FIFO the test never writes, which the test sees running under the daemon just before it restarts the daemon on the same state directory.
+/// Scenario: A stand-in dispatcher pane dispatches a `--single` unit whose agent is a real interactive Claude Code on Haiku; the deck delivers the task, which the agent acknowledges, and the agent's one command writes a uniquely named sentinel under the worktree's ignored `.dot-agent-deck/` and then blocks reading a FIFO the test created before the dispatch and never writes, which the test waits to see running under the daemon and checks again just before it restarts the daemon on the same state directory.
 /// After the restart the journal says the unit's attempt ended interrupted with no report, the person's `interrupted list` names the unit with its branch and worktree, the worktree is clean, and a TUI attached to the new daemon shows the "interrupted items" footer, lists the unit under "Interrupted work" after `I`, and reclaims it with `r` and `y`.
 /// The worktree is gone, the branch is kept, the footer counts one item, and the CLI no longer lists the unit.
 #[spec("journal/interrupted/028")]
@@ -308,6 +283,14 @@ fn interrupted_028_a_real_agents_unit_is_listed_and_reclaimed_after_a_restart() 
         text(&installed)
     );
 
+    // The hold, before the dispatch, so it exists whenever the agent reaches
+    // its command: in this run's own root, outside the worktree, with the
+    // agent given access to its directory. Dropping it, on a pass or a
+    // failure, releases the command (`support/fifo_hold.rs`).
+    let hold_dir = scratch.path().join("hold");
+    std::fs::create_dir_all(&hold_dir).expect("the hold's directory");
+    let hold = hold::FifoHold::create(&hold_dir.join(HOLD));
+
     let caller = route::start(&live, "interrupted-live-caller", json!({"cwd": repo}));
     inbox::status(&live, &caller, "session_start", "codex");
     inbox::status(&live, &caller, "thinking", "codex");
@@ -315,16 +298,19 @@ fn interrupted_028_a_real_agents_unit_is_listed_and_reclaimed_after_a_restart() 
     // is still in it, and has not reported, when the restart stops it: the
     // work is interrupted, not done. The command is on a line of its own, so
     // no word of the prose after it can be read as one of its arguments.
+    let hold_path = hold.path().display();
     let task = format!(
         "Use the Bash tool to run exactly this one command now, in the foreground, as one \
          command, and wait for it:\n\n\
-         `mkdir -p .dot-agent-deck && echo done > .dot-agent-deck/{SENTINEL} && cat .dot-agent-deck/{HOLD}`\n\n\
+         `mkdir -p .dot-agent-deck && echo done > .dot-agent-deck/{SENTINEL} && cat {hold_path}`\n\n\
          Do not run any other command, do not create or change any other file, and do not \
          commit."
     );
     // The deck delivers the task: no first prompt on the command line.
-    let agent_command =
-        format!("claude --ax-screen-reader --model {HAIKU_MODEL} --allowedTools Bash Read Write");
+    let agent_command = format!(
+        "claude --ax-screen-reader --model {HAIKU_MODEL} --add-dir {} --allowedTools Bash Read Write",
+        hold_dir.display()
+    );
     route::cli(
         &live,
         &caller,
@@ -357,20 +343,6 @@ fn interrupted_028_a_real_agents_unit_is_listed_and_reclaimed_after_a_restart() 
         common::agent_records_on(&live.attach_socket)
     );
     let unit_agent = spawned.into_inner().unwrap();
-    // The hold, in the worktree the unit now runs in. The agent boots and
-    // takes its task before it runs the command; should it run first, `cat`
-    // finds no FIFO and exits, and the check before the restart fails.
-    let hold_dir = worktree.join(".dot-agent-deck");
-    std::fs::create_dir_all(&hold_dir).expect("the worktree's .dot-agent-deck");
-    let hold = std::ffi::CString::new(hold_dir.join(HOLD).to_string_lossy().into_owned())
-        .expect("a path without NUL");
-    // SAFETY: mkfifo(3) on a NUL-terminated path this test owns.
-    assert_eq!(
-        unsafe { libc::mkfifo(hold.as_ptr(), 0o600) },
-        0,
-        "create the hold FIFO: {}",
-        std::io::Error::last_os_error()
-    );
     // The unit's pane id, which its inbox is keyed by.
     let unit_pane = common::agent_records_on(&live.attach_socket)
         .into_iter()
@@ -425,19 +397,29 @@ fn interrupted_028_a_real_agents_unit_is_listed_and_reclaimed_after_a_restart() 
         Some((unit["work"].clone(), unit["attempt"].clone()))
     });
 
-    // Just before the stop, the agent's command is still running: its `cat`
-    // of the FIFO is alive among the daemon's descendants.
-    let held: Vec<u32> = holding_commands(live.pid())
-        .into_iter()
-        .map(|(pid, argv)| {
-            eprintln!("held: pid {pid} runs {argv:?}");
-            pid
-        })
-        .collect();
-    let _held = HeldCommands(held.clone());
+    // The sentinel is written before `cat` starts, so wait, bounded, until
+    // the agent's `cat` of this run's FIFO is running among the daemon's
+    // descendants.
+    let held_wait = common::load_scaled(Duration::from_secs(30));
+    assert!(
+        common::wait_until(held_wait, || !holding_commands(live.pid(), &hold)
+            .is_empty()),
+        "the agent's command never reached its `cat` of {} under the daemon (pid {}) within {}s.\nIts process tree:\n{}\nThe agent's pane:\n{}",
+        hold.path().display(),
+        live.pid(),
+        held_wait.as_secs(),
+        process_tree(live.pid()),
+        pane_screen(&live, &unit_agent)
+    );
+    // Just before the stop, the agent's command is still running.
+    let held = holding_commands(live.pid(), &hold);
+    for (pid, argv) in &held {
+        eprintln!("held: pid {pid} runs {argv:?}");
+    }
     assert!(
         !held.is_empty(),
-        "the agent's command is not running before the restart: no `cat` of {HOLD} under the daemon (pid {}).\nIts process tree:\n{}\nThe agent's pane:\n{}",
+        "the agent's command is not running just before the restart: no `cat` of {} under the daemon (pid {}).\nIts process tree:\n{}\nThe agent's pane:\n{}",
+        hold.path().display(),
         live.pid(),
         process_tree(live.pid()),
         pane_screen(&live, &unit_agent)
@@ -462,12 +444,13 @@ fn interrupted_028_a_real_agents_unit_is_listed_and_reclaimed_after_a_restart() 
     assert!(next.is_alive_public(), "the next daemon must start");
     let _gone = std::mem::replace(&mut live, next);
     drop(caller);
-    for pid in &held {
-        eprintln!(
-            "held: pid {pid} after the restart: still running={}",
-            still_held(*pid)
-        );
-    }
+    // For the record only: whether a `cat` of this run's FIFO outlived the
+    // restart. Dropping `hold` releases it; nothing is signalled.
+    let outlived = processes()
+        .into_iter()
+        .filter(|(_, _, argv)| hold.held_by(argv))
+        .count();
+    eprintln!("held: after the restart, {outlived} `cat` of this run's FIFO still running");
 
     // The restart interrupted the unit's work: its attempt ended
     // `interrupted`, and its work reported nothing (a finished unit's kept
