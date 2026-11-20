@@ -67,14 +67,15 @@ function extraUnits(count: number): InterruptedItem[] {
 /**
  * The preview's daemon: per deck, the items still interrupted. `enabled`
  * false answers as a daemon that does not support interrupted work; `extra`
- * lists that many more units after the three.
+ * lists that many more units after the three; `unread` answers an empty list
+ * that says the journal could not be read whole.
  */
-export function fixtureInterruptedWork(enabled: boolean, extra = 0) {
+export function fixtureInterruptedWork(enabled: boolean, extra = 0, unread = false) {
   const decks = new Map<string, InterruptedItem[]>();
   const items = (target: InterruptedTarget) => {
     let held = decks.get(target.deckId);
     if (!held) {
-      held = [...fixtureInterruptedItems(), ...extraUnits(extra)];
+      held = unread ? [] : [...fixtureInterruptedItems(), ...extraUnits(extra)];
       decks.set(target.deckId, held);
     }
     return held;
@@ -83,7 +84,7 @@ export function fixtureInterruptedWork(enabled: boolean, extra = 0) {
   return {
     list(target: InterruptedTarget): InterruptedReply<InterruptedList> {
       if (!enabled) return { outcome: "unsupported" };
-      return answered(target, { items: items(target).map((item) => structuredClone(item)) });
+      return answered(target, { items: items(target).map((item) => structuredClone(item)), ...(unread ? { incomplete: true } : {}) });
     },
     show(target: InterruptedTarget, id: string, reportsFrom: number): InterruptedReply<InterruptedShow> {
       if (!enabled) return { outcome: "unsupported" };

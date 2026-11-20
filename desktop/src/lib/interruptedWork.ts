@@ -328,6 +328,14 @@ export const REFUSED_UNKNOWN = "Refused.";
 
 export const NOTHING_INTERRUPTED = "No interrupted work.";
 export const LIST_INCOMPLETE = "The deck could not read its whole work journal, so an item may be missing or out of date.";
+/**
+ * Verification finding N4 — the banner of a daemon whose list came back
+ * empty but incomplete: there may be work it could not read, so the banner
+ * offers Show rather than leaving that daemon with no way in. Desktop-only:
+ * the TUI holds one daemon, and its `I` opens that daemon's list whatever
+ * the answer was.
+ */
+export const INTERRUPTED_UNREAD = "The deck could not read its whole work journal, so some interrupted work may not be listed.";
 export const LABEL_ISSUE = "Issue";
 export const LABEL_BRANCH = "Branch";
 export const LABEL_WORKTREE = "Worktree";
@@ -557,6 +565,11 @@ export function orderedItems(list: InterruptedList | undefined): InterruptedItem
 /** How many items the daemon listed, those it left out included. */
 export function listedCount(list: InterruptedList | undefined): number {
   return list ? list.items.length + (list.omitted ?? 0) : 0;
+}
+
+/** Whether a daemon's list names work or, being incomplete, may hold work it could not read: what draws its banner. */
+export function mayHaveInterrupted(list: InterruptedList | undefined): boolean {
+  return listedCount(list) > 0 || list?.incomplete === true;
 }
 
 /** An item's name, or its branch, or its id, escaped. */

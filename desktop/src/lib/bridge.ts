@@ -3230,14 +3230,15 @@ class FixtureDeckBridge implements DeckBridge {
   }
   /**
    * PRD #1790 stage 2 — the preview's interrupted work, served only with
-   * `interrupted=1` in the URL, or `interrupted=many` for 27 more units than
-   * the three (a list longer than the dialog): a daemon that does not support
-   * it otherwise. Dismiss and a real reclaim remove the item for the rest of
-   * the session.
+   * `interrupted=1` in the URL, `interrupted=many` for 27 more units than
+   * the three (a list longer than the dialog), or `interrupted=unread` for an
+   * empty list that says the journal could not be read whole (verification
+   * finding N4): a daemon that does not support it otherwise. Dismiss and a
+   * real reclaim remove the item for the rest of the session.
    */
   private readonly interrupted = (() => {
     const asked = new URLSearchParams(typeof window === "undefined" ? "" : window.location.search).get("interrupted");
-    return fixtureInterruptedWork(asked === "1" || asked === "many", asked === "many" ? 27 : 0);
+    return fixtureInterruptedWork(asked === "1" || asked === "many" || asked === "unread", asked === "many" ? 27 : 0, asked === "unread");
   })();
   async interruptedWorkList(target: InterruptedTarget): Promise<InterruptedReply<InterruptedList>> {
     return this.interrupted.list(target);

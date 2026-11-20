@@ -64,6 +64,28 @@ test.describe("Interrupted work", () => {
     await expect(page.getByTestId("interrupted-banner")).toHaveCount(0);
   });
 
+  /** Scenario: several daemons each answer with an empty list that says their journal could not be read whole. Each connected daemon's section shows a banner saying some interrupted work may not be listed; `I` opens nothing and says the daemons may have interrupted work. Tabbing to one banner's Show and pressing Enter opens that daemon's dialog, which says the list is incomplete. */
+  test("offers a banner to open each daemon whose empty list is incomplete", async ({ page }) => {
+    await page.goto("/?fixture=1&state=fleet&interrupted=unread");
+    await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
+    await page.getByTestId("open-overview").click();
+    const banners = page.getByTestId("interrupted-banner");
+    await expect.poll(() => banners.count()).toBeGreaterThan(1);
+    for (const banner of await banners.all()) await expect(banner).toContainText("some interrupted work may not be listed");
+
+    await page.keyboard.press("I");
+    await expect(page.getByTestId("overview-daemon-notice")).toContainText("Several daemons may have interrupted work");
+    await expect(page.getByTestId("interrupted-dialog")).toHaveCount(0);
+
+    const second = banners.nth(1);
+    await second.getByTestId("interrupted-banner-show").focus();
+    await page.keyboard.press("Enter");
+    const dialog = page.getByTestId("interrupted-dialog");
+    await expect(dialog.getByRole("heading", { name: "Interrupted work" })).toBeVisible();
+    await expect(dialog).toContainText("The deck could not read its whole work journal, so an item may be missing or out of date.");
+    await expect(dialog.getByTestId("interrupted-row")).toHaveCount(0);
+  });
+
   /* PRD #1790 stage 2, desktop review findings 3, 5 and 8. */
 
   /** Scenario: with keyboard focus on one of the dialog's controls, Enter does what that control does: on Dismiss all it asks the question, on Close it closes, on Reclaim it runs the dry run, and on a row other than the selected one it opens that row's details; in an item's details, Enter on Back returns to the list rather than asking for reports. */

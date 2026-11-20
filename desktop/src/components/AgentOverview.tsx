@@ -33,7 +33,7 @@ import { agentSpokenName, orchestrationTitle } from "../lib/agentNames";
 import { DISPLAY_LIMITS, deckName, displayActivity, displayIdentity, displayPath, displayText, displayTitle, displayUptime, domIdentity, rendersBlank } from "../lib/displayText";
 import { HookBinaryNotices } from "./HookBinaryNotice";
 import { InterruptedWorkBanner, InterruptedWorkDialog } from "./InterruptedWork";
-import { INTERRUPTED_COVERED, listedCount, NOTHING_INTERRUPTED, shownInterruptedDialog, type InterruptedDialogControls, type InterruptedList } from "../lib/interruptedWork";
+import { INTERRUPTED_COVERED, listedCount, mayHaveInterrupted, NOTHING_INTERRUPTED, shownInterruptedDialog, type InterruptedDialogControls } from "../lib/interruptedWork";
 import { sameIncarnation } from "../lib/agentKey";
 import { AGENT_GONE_AFTER_RESTART } from "../lib/agentIdentity";
 import { inboxAttentionWords, INBOX_WORDS } from "../lib/inboxWords";
@@ -949,9 +949,14 @@ export function stopAgentConfirmation(agent: OverviewAgent, connection: Connecti
   };
 }
 
-/** PRD #1790 stage 2 — the dashboard's answer when several daemons have interrupted work and a key or spoken request named none. */
-function interruptedSeveral(names: string[], then: string): string {
-  return `Several daemons have interrupted work: ${names.join(", ")}. ${then}`;
+/**
+ * PRD #1790 stage 2 — the dashboard's answer when several daemons have
+ * interrupted work and a key or spoken request named none. `definite` is
+ * false when any of them only answered with an incomplete empty list, which
+ * says it may have work, not that it has (verification finding N4).
+ */
+function interruptedSeveral(names: string[], definite: boolean, then: string): string {
+  return `Several daemons ${definite ? "have" : "may have"} interrupted work: ${names.join(", ")}. ${then}`;
 }
 
 /**
@@ -1300,10 +1305,11 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
         read, so it is opened or named like one with work, never taken for none
         (verification finding C); its dialog says the list is incomplete.
       */
-      const mayHave = (list: InterruptedList | undefined) => listedCount(list) > 0 || list?.incomplete === true;
-      const listing = answers.filter(({ id, found }) => (found.outcome === "listed" ? found.count > 0 || found.incomplete : found.outcome !== "unsupported" && mayHave(held[id]?.list)));
+      const listing = answers.filter(({ id, found }) => (found.outcome === "listed" ? found.count > 0 || found.incomplete : found.outcome !== "unsupported" && mayHaveInterrupted(held[id]?.list)));
       if (listing.length === 1) return openDialog(listing[0].id) ? undefined : NOTHING_INTERRUPTED;
-      if (listing.length > 1) return interruptedSeveral(listing.map(({ deck }) => deckName(deck.snapshot.connection)), "Open one from its banner, or say which one.");
+      /* Each of them has a banner to open it by, an incomplete empty list's included (N4). */
+      const definite = listing.every(({ id, found }) => (found.outcome === "listed" ? found.count : listedCount(held[id]?.list)) > 0);
+      if (listing.length > 1) return interruptedSeveral(listing.map(({ deck }) => deckName(deck.snapshot.connection)), definite, "Open one from its banner, or say which one.");
       const unknown = answers.filter(({ found }) => found.outcome === "failed" || found.outcome === "superseded");
       if (unknown.length > 0) return `Could not ask ${unknown.map(({ deck }) => deckName(deck.snapshot.connection)).join(", ")} for its interrupted work; try again, or say which daemon.`;
       return NOTHING_INTERRUPTED;
@@ -1518,11 +1524,12 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       */
       const shown = decks.flatMap((deck) => {
         const id = deck.snapshot.connection.deckId;
-        return id !== undefined && listedCount(interrupted.decks[id]?.list) > 0 && !interrupted.hidden(id) ? [{ id, name: deckName(deck.snapshot.connection) }] : [];
+        const list = id !== undefined ? interrupted.decks[id]?.list : undefined;
+        return id !== undefined && mayHaveInterrupted(list) && !interrupted.hidden(id) ? [{ id, name: deckName(deck.snapshot.connection), count: listedCount(list) }] : [];
       });
       if (shown.length === 0) return;
       event.preventDefault();
-      if (shown.length > 1) setDaemonNotice(interruptedSeveral(shown.map(({ name }) => name), "Hide one with its banner's Hide."));
+      if (shown.length > 1) setDaemonNotice(interruptedSeveral(shown.map(({ name }) => name), shown.every(({ count }) => count > 0), "Hide one with its banner's Hide."));
       else VOICE_ACTIONS.hideInterruptedWork.run({ hideInterruptedWork }, shown[0].id);
     };
     window.addEventListener("keydown", onKeyDown);
@@ -1570,9 +1577,9 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   const interruptedBannerFor = (deck: (typeof decks)[number]): ReactNode | undefined => {
     const deckId = deck.snapshot.connection.deckId;
     if (!interrupted || deckId === undefined) return undefined;
-    const count = listedCount(interrupted.decks[deckId]?.list);
-    if (count === 0 || interrupted.hidden(deckId)) return undefined;
-    return <InterruptedWorkBanner deckId={deckId} count={count} controls={interruptedVoice} />;
+    const list = interrupted.decks[deckId]?.list;
+    if (!mayHaveInterrupted(list) || interrupted.hidden(deckId)) return undefined;
+    return <InterruptedWorkBanner deckId={deckId} count={listedCount(list)} controls={interruptedVoice} />;
   };
   /* The open dialog, mounted per daemon process: another process's answers never reach it. */
   const interruptedOpen = interrupted?.dialog;

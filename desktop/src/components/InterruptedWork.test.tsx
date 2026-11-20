@@ -7,7 +7,7 @@ import { createFixtureSnapshot } from "../data/fixture";
 import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, LOCAL_ENDPOINT_SELECTION, type DeckBridge, type DesktopSettingsDto } from "../lib/bridge";
 import { AGENTS_STOPPED_BY_RESTART } from "../lib/agentIdentity";
 import {
-  DISMISSED, INTERRUPTED_WORK_TITLE, LIST_INCOMPLETE, NOTHING_INTERRUPTED, OTHER_AGENTS_GROUP, RECLAIM_KEPT_DIRTY, RECLAIM_REMOVED, RECLAIM_WOULD_REMOVE, REFUSED_AMBIGUOUS, REFUSED_INCOMPLETE_READ, REFUSED_NOT_LISTED, dismissAllQuestion, interruptedFooter, reportRangeSentence,
+  DISMISSED, INTERRUPTED_UNREAD, INTERRUPTED_WORK_TITLE, LIST_INCOMPLETE, NOTHING_INTERRUPTED, OTHER_AGENTS_GROUP, RECLAIM_KEPT_DIRTY, RECLAIM_REMOVED, RECLAIM_WOULD_REMOVE, REFUSED_AMBIGUOUS, REFUSED_INCOMPLETE_READ, REFUSED_NOT_LISTED, dismissAllQuestion, interruptedFooter, reportRangeSentence,
   type DismissOutcome, type InterruptedItem, type InterruptedList, type InterruptedReply, type InterruptedShow, type InterruptedTarget, type ReclaimOutcome,
 } from "../lib/interruptedWork";
 import { VOICE_ACTIONS, INTERRUPTED_RECLAIM_CHECKING, type VoiceOverviewChannel, type VoiceOverviewContext } from "../lib/voiceActions";
@@ -971,6 +971,54 @@ describe("an incomplete empty answer is not an answer that there is none (verifi
     expect(dialog).toHaveTextContent("beta");
     await waitFor(() => expect(dialog).toHaveTextContent(LIST_INCOMPLETE));
     expect(voice.reportRefused.mock.calls.map((call) => call[0])).not.toContain(NOTHING_INTERRUPTED);
+  });
+});
+
+describe("several daemons whose lists are incomplete each offer a way in (verification finding N4)", () => {
+  /** Scenario: two daemons both answer with an empty list that says their journal could not be read whole. Each daemon's section shows a banner saying it may have interrupted work it could not list, with Show. `I` opens nothing and never says the daemons have interrupted work, only that they may have; pressing one banner's Show opens that daemon's dialog, which says the list is incomplete. */
+  it("draws a banner for each incomplete empty list, and its Show opens that daemon", async () => {
+    const lists: Record<string, InterruptedList | Error> = { "process-a": { items: [], incomplete: true }, "process-b": { items: [], incomplete: true } };
+    const { bridge, listed } = perProcessBridge(lists);
+    const fleet = [deckOf("process-a"), remoteDeck("deck-b", "beta", "process-b")];
+    const voice = voiced(bridge, fleet);
+    render(<voice.Voiced />);
+    await waitFor(() => expect(listed).toHaveLength(2));
+    await waitFor(() => expect(screen.getAllByTestId("interrupted-banner")).toHaveLength(2));
+    for (const banner of screen.getAllByTestId("interrupted-banner")) expect(banner).toHaveTextContent(INTERRUPTED_UNREAD);
+
+    await act(async () => { fireEvent.keyDown(document.body, { key: "I" }); });
+    await waitFor(() => expect(listed.length).toBeGreaterThanOrEqual(4));
+    await waitFor(() => expect(screen.getByText(/may have interrupted work/)).toBeInTheDocument());
+    const said = screen.getByText(/may have interrupted work/).textContent ?? "";
+    expect(said).toContain("beta");
+    expect(said).not.toMatch(/daemons have interrupted work/);
+    expect(screen.queryByTestId("interrupted-dialog")).toBeNull();
+
+    const beta = screen.getAllByTestId("interrupted-banner").find((banner) => banner.getAttribute("data-deck-id") === "deck-b");
+    expect(beta, "the beta daemon's section has its banner").toBeDefined();
+    await act(async () => { fireEvent.click(within(beta as HTMLElement).getByTestId("interrupted-banner-show")); });
+    const dialog = await screen.findByTestId("interrupted-dialog");
+    expect(dialog).toHaveTextContent("beta");
+    await waitFor(() => expect(dialog).toHaveTextContent(LIST_INCOMPLETE));
+  });
+
+  /** Scenario: one daemon lists a unit and another answers with an empty list that says it could not be read whole. Both sections show a banner; `I` names both, says they may have interrupted work rather than that they have it, and opens nothing. */
+  it("says may have when one of several daemons only could not read its list", async () => {
+    const lists: Record<string, InterruptedList | Error> = { "process-a": { items: [unit()] }, "process-b": { items: [], incomplete: true } };
+    const { bridge, listed } = perProcessBridge(lists);
+    const fleet = [deckOf("process-a"), remoteDeck("deck-b", "beta", "process-b")];
+    const voice = voiced(bridge, fleet);
+    render(<voice.Voiced />);
+    await waitFor(() => expect(listed).toHaveLength(2));
+    await waitFor(() => expect(screen.getAllByTestId("interrupted-banner")).toHaveLength(2));
+
+    await act(async () => { VOICE_ACTIONS.showInterruptedWork.run(voice.context(), {}); });
+    await waitFor(() => expect(voice.reportRefused).toHaveBeenCalled());
+    const said = voice.reportRefused.mock.calls.at(-1)?.[0] as string;
+    expect(said).toContain("may have interrupted work");
+    expect(said).toContain("beta");
+    expect(said).not.toMatch(/daemons have interrupted work/);
+    expect(screen.queryByTestId("interrupted-dialog")).toBeNull();
   });
 });
 

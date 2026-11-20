@@ -3,7 +3,7 @@ import { History, X } from "lucide-react";
 import { OVERLAY_LAYER, overlayAbove, useInertBackground } from "../hooks/useInertBackground";
 import type { InterruptedDeck, InterruptedWorkRuntime } from "../hooks/useInterruptedWork";
 import {
-  DAEMON_FAILED, DISMISS_ACTION, DISMISS_ALL_ACTION, INTERRUPTED_NO_NEXT_PAGE, INTERRUPTED_NO_PREVIOUS_PAGE, INTERRUPTED_NO_REPORTS, INTERRUPTED_WAIT, INTERRUPTED_WORK_TITLE, ITEM_CUT, LABEL_BRANCH, LABEL_GIT, LABEL_ISSUE,
+  DAEMON_FAILED, DISMISS_ACTION, DISMISS_ALL_ACTION, INTERRUPTED_NO_NEXT_PAGE, INTERRUPTED_UNREAD, INTERRUPTED_NO_PREVIOUS_PAGE, INTERRUPTED_NO_REPORTS, INTERRUPTED_WAIT, INTERRUPTED_WORK_TITLE, ITEM_CUT, LABEL_BRANCH, LABEL_GIT, LABEL_ISSUE,
   LABEL_LAST_ENTRY, LABEL_NESTED_WORKTREE, LABEL_PROGRESS, LABEL_REPORT, LABEL_STARTED_BY, LABEL_WORKTREE, LIST_INCOMPLETE, MAX_SHOWN_REPORTS, NOTHING_INTERRUPTED, OTHER_AGENTS_GROUP, RECLAIM_ACTION, RECLAIM_EXPLANATION,
   REFUSED_NOT_LISTED, REFUSED_PLAIN_AGENT, REPORT_CUT, REPORT_UNREADABLE, UNSUPPORTED,
   directoryLabel, dismissAllQuestion, dismissMessage, dismissOneQuestion, displayValue, formatTime, gitFactsLine, interruptedFooter, itemName, keptUntil, kindLabel, lastEntryLine, omittedSentence, orderedItems, progressFact,
@@ -16,13 +16,15 @@ import { VOICE_ACTIONS, type VoiceActionContext } from "../lib/voiceActions";
  * PRD #1790 stage 2 — the banner on a deck's section of the dashboard while
  * its daemon lists interrupted work: the TUI footer row's words, with Show
  * and Hide. Hide records nothing; the banner comes back with another daemon
- * process.
+ * process. A daemon whose list is empty but incomplete gets one too, saying
+ * work may not be listed (verification finding N4), so with several such
+ * daemons each still has a Show to open it by.
  */
 export function InterruptedWorkBanner({ deckId, count, controls }: { deckId: string; count: number; controls: Pick<VoiceActionContext, "showInterruptedWork" | "hideInterruptedWork"> }) {
   return (
-    <div className="interrupted-banner" data-testid="interrupted-banner" role="status">
+    <div className="interrupted-banner" data-testid="interrupted-banner" data-deck-id={deckId} role="status">
       <History size={14} aria-hidden="true" />
-      <span data-testid="interrupted-banner-message">{interruptedFooter(count)}</span>
+      <span data-testid="interrupted-banner-message">{count > 0 ? interruptedFooter(count) : INTERRUPTED_UNREAD}</span>
       <button type="button" className="button secondary compact" data-testid="interrupted-banner-show" onClick={() => VOICE_ACTIONS.showInterruptedWork.run(controls, { preselectDeckId: deckId })}>Show</button>
       <button type="button" className="button secondary compact" data-testid="interrupted-banner-hide" onClick={() => VOICE_ACTIONS.hideInterruptedWork.run(controls, deckId)}>Hide</button>
     </div>
