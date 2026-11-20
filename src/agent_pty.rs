@@ -10955,6 +10955,13 @@ pub struct DeliveryNotice {
     /// after all, so the card's not-delivered `Error` is lifted
     /// ([`crate::event::DELIVERY_NOTICE_CLEARED_METADATA_KEY`]).
     pub cleared: bool,
+    /// Issue #2246: the notice says how this generation's own pane ended, so
+    /// it is written after the agent stopped being live. It is still owed to
+    /// that generation's card while the generation holds its pane — exited,
+    /// with no successor published there — because that card is still on
+    /// screen. Every other notice needs the agent live
+    /// ([`AgentPtyRegistry::delivery_notice_owns_pane`]).
+    pub pane_ended: bool,
 }
 
 /// Issue #424: the daemon's sink for [`DeliveryNotice`]s, installed via
@@ -11486,8 +11493,7 @@ impl AgentPtyRegistry {
     /// Both exist because the cheap check here suppresses the overwhelmingly
     /// common case without scheduling anything at all.
     pub fn publish_delivery_notice(&self, notice: DeliveryNotice) {
-        if self.pane_current_agent_id(&notice.pane_id).as_deref() != Some(notice.agent_id.as_str())
-        {
+        if !self.delivery_notice_owns_pane(&notice) {
             tracing::debug!(
                 pane_id = %notice.pane_id,
                 delivery_id = %notice.delivery_id,
@@ -11503,6 +11509,20 @@ impl AgentPtyRegistry {
                 delivery_id = %notice.delivery_id,
                 "no delivery-notice sink installed; the report stays in the log only"
             ),
+        }
+    }
+
+    /// Whether `notice`'s agent still holds the pane it names, by the rule the
+    /// notice is owed under: the pane's LIVE agent for a delivery failure, and,
+    /// for a notice saying how the generation's own pane ended
+    /// ([`DeliveryNotice::pane_ended`], issue #2246), that generation while
+    /// nothing has been published on the pane after it — a pane closed or
+    /// respawned since belongs to nobody's card or to a successor's.
+    pub fn delivery_notice_owns_pane(&self, notice: &DeliveryNotice) -> bool {
+        if notice.pane_ended {
+            self.publication_owns_pane(&notice.pane_id, &notice.agent_id)
+        } else {
+            self.pane_current_agent_id(&notice.pane_id).as_deref() == Some(notice.agent_id.as_str())
         }
     }
 
@@ -33865,6 +33885,67 @@ mod spawn_tests {
              same reason."
         );
 
+        registry.shutdown_all();
+    }
+
+    /// Issue #2246: a notice saying how a generation's own pane ended reaches
+    /// that generation after it exited by itself, because its card is still on
+    /// screen; a delivery failure still needs the agent live. Once a successor
+    /// is published on the pane, or the generation is closed, neither reaches
+    /// it.
+    #[tokio::test]
+    async fn an_ended_pane_notice_reaches_the_exited_generation_until_the_pane_changes_hands() {
+        const PANE: &str = "issue-2246-pane";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let spawn = |command: &'static str| {
+            registry
+                .spawn_agent(SpawnOptions {
+                    command: Some(command),
+                    env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                    ..SpawnOptions::default()
+                })
+                .expect("spawn stand-in")
+        };
+        let notice = |agent_id: &str, pane_ended: bool| DeliveryNotice {
+            pane_id: PANE.to_string(),
+            agent_id: agent_id.to_string(),
+            delivery_id: "m-issue-2246".to_string(),
+            session_id: None,
+            detail: "not delivered: …".into(),
+            cleared: false,
+            pane_ended,
+        };
+        let exited = spawn("/usr/bin/true");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline && registry.live_count() > 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            registry.live_count(),
+            0,
+            "precondition: the stand-in exited"
+        );
+        assert!(registry.delivery_notice_owns_pane(&notice(&exited, true)));
+        assert!(
+            !registry.delivery_notice_owns_pane(&notice(&exited, false)),
+            "a delivery failure is owed only to a live agent"
+        );
+        assert!(!registry.delivery_notice_owns_pane(&notice("someone-else", true)));
+
+        let successor = spawn("/bin/cat");
+        assert!(
+            !registry.delivery_notice_owns_pane(&notice(&exited, true)),
+            "the pane is the successor's now"
+        );
+        assert!(registry.delivery_notice_owns_pane(&notice(&successor, false)));
+
+        registry
+            .close_agent(&successor)
+            .expect("close the successor");
+        assert!(
+            !registry.delivery_notice_owns_pane(&notice(&successor, true)),
+            "a closed generation's card is gone"
+        );
         registry.shutdown_all();
     }
 
