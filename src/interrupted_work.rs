@@ -730,7 +730,7 @@ pub const DISMISS_ALL_NEEDS_YES: &str = "Refused: there is no terminal to confir
 /// The person answered no to dismissing every item.
 pub const NOTHING_DISMISSED: &str = "Nothing was dismissed.";
 /// The running daemon does not advertise interrupted work.
-pub const UNSUPPORTED: &str = "The running deck daemon does not support interrupted work. Restart it onto this build with `dot-agent-deck daemon restart`.";
+pub const UNSUPPORTED: &str = "The running deck daemon does not support interrupted work. Stop it with `dot-agent-deck daemon restart`, then start one from this build: open the TUI, or press Start daemon in the desktop app.";
 /// No daemon answered.
 pub const NO_DAEMON: &str = "No deck daemon is running.";
 /// Before the error of a request the daemon did not answer.

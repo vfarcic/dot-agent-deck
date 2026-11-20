@@ -344,7 +344,7 @@ export const REPORT_UNREADABLE = "This report cannot be shown:";
 export const NOTHING_DISMISSED = "Nothing was dismissed.";
 export const DISMISS_STOPPED_REPLACED = "the deck daemon was replaced. List the interrupted work again.";
 export const DISMISS_STOPPED_FAILED = "the deck daemon did not answer. List the interrupted work again.";
-export const UNSUPPORTED = "The running deck daemon does not support interrupted work. Restart it onto this build with `dot-agent-deck daemon restart`.";
+export const UNSUPPORTED = "The running deck daemon does not support interrupted work. Stop it with `dot-agent-deck daemon restart`, then start one from this build: open the TUI, or press Start daemon in the desktop app.";
 export const DAEMON_FAILED = "The deck daemon could not answer:";
 export const MAX_SHOWN_CHARS = 300;
 /** `MAX_SHOWN_REPORTS`: the most reports one page shows; Previous reports falls back on it with no page to go back to. */
