@@ -211,13 +211,17 @@ impl Schedule {
     /// the estimate only moves later until an update overflows it), and
     /// nothing counts, unless it is the [`ESTIMATE_PER_FAILURE`]th such
     /// refusal since the last failure or read, which counts as one
-    /// ([`Self::failed`]). Whether it counted. Only the wait moves: the
-    /// attempt it makes due is asked of admission again, every conjunct
-    /// included.
+    /// ([`Self::failed`]) and waits the later of its backoff step and
+    /// `until` (an estimate can run up to its profile's cap ahead, past the
+    /// first step). Whether it counted. Only the wait moves: the attempt it
+    /// makes due is asked of admission again, every conjunct included.
     pub fn estimate(&mut self, now: Instant, until: Instant) -> bool {
         self.estimate = self.estimate.saturating_add(1);
         if self.estimate >= ESTIMATE_PER_FAILURE {
             self.failed(now);
+            if let Wait::Until(at) = self.wait {
+                self.wait = Wait::Until(at.max(until));
+            }
             return true;
         }
         self.wait = Wait::Until(until.max(now));
@@ -773,7 +777,7 @@ mod tests {
         assert_eq!(s, Schedule::default());
     }
 
-    /// Scenario: Refuse a schedule's attempts for the query-wait estimate alone, the estimate moving later each time, as after a few quick resizes of a Codex pane. The first three make the next attempt due exactly when the estimate it was refused for runs out, never sooner than the refusal itself, count no failure and leave the card saying the box can't be checked; the fourth counts one failure with the first backoff step. A failure of another kind clears the run, and so does a read, which also stops the card saying the box can't be checked (#2129).
+    /// Scenario: Refuse a schedule's attempts for the query-wait estimate alone, the estimate moving later each time, as after a few quick resizes of a Codex pane. The first three make the next attempt due exactly when the estimate it was refused for runs out, never sooner than the refusal itself, count no failure and leave the card saying the box can't be checked; the fourth counts one failure with the first backoff step, or with the estimate when that is further off. A failure of another kind clears the run, and so does a read, which also stops the card saying the box can't be checked (#2129).
     #[spec("inbox/probe/104")]
     #[test]
     fn probe_104_estimate_refusals_wait_for_the_estimate_and_count_every_fourth() {
@@ -795,6 +799,19 @@ mod tests {
         assert_eq!(s.failures(), 1);
         assert!(!s.due(at + BACKOFF[0] - ms(1), 0));
         assert!(s.due(at + BACKOFF[0], 0));
+
+        // The counted one waits for an estimate further off than its step
+        // (Codex's can run 120.5 s ahead), not only the step.
+        let mut s = Schedule::default();
+        for _ in 1..ESTIMATE_PER_FAILURE {
+            s.estimate(t, t);
+        }
+        let far = t + Duration::from_secs(120) + ms(500);
+        assert!(s.estimate(t, far), "the fourth in a row counts");
+        assert_eq!(s.failures(), 1);
+        assert!(!s.due(t + BACKOFF[0], 0), "not at the step alone");
+        assert!(!s.due(far - ms(1), 0));
+        assert!(s.due(far, 0), "due when the estimate runs out");
 
         // An estimate already behind the refusal is due at the refusal.
         let mut s = Schedule::default();
