@@ -131,6 +131,21 @@ impl FifoHold {
             .is_some_and(|program| Path::new(program).file_name().is_some_and(|n| n == "cat"))
             && argv.iter().skip(1).any(|arg| Path::new(arg) == self.path)
     }
+
+    /// Whether `argv` is the `timeout` of [`FifoHold::command`] with `bound`:
+    /// the process a held `cat` runs under when its bound is in place.
+    pub fn bounded_by(&self, argv: &[String], bound: Duration) -> bool {
+        match argv {
+            [program, secs, reader @ ..] => {
+                Path::new(program)
+                    .file_name()
+                    .is_some_and(|n| n == "timeout")
+                    && *secs == bound.as_secs().max(1).to_string()
+                    && self.held_by(reader)
+            }
+            _ => false,
+        }
+    }
 }
 
 impl Drop for FifoHold {
@@ -204,6 +219,24 @@ mod tests {
         );
         assert!(!first.held_by(&argv(&["cat"])));
         assert!(!first.held_by(&[]));
+
+        let bound = Duration::from_secs(1200);
+        assert!(first.bounded_by(&argv(&["timeout", "1200", "cat", &first_path]), bound));
+        assert!(first.bounded_by(
+            &argv(&["/usr/bin/timeout", "1200", "cat", &first_path]),
+            bound
+        ));
+        assert!(
+            !first.bounded_by(&argv(&["timeout", "60", "cat", &first_path]), bound),
+            "another bound is not this command's"
+        );
+        assert!(
+            !first.bounded_by(&argv(&["timeout", "1200", "cat", &second_path]), bound),
+            "a bound on another run's FIFO is not this run's"
+        );
+        assert!(!first.bounded_by(&argv(&["cat", &first_path]), bound));
+        assert!(!first.bounded_by(&argv(&["timeout", "1200"]), bound));
+        assert!(!first.bounded_by(&[], bound));
     }
 
     /// Words with `$`, both quotes, `;`, a backslash, a backtick and an

@@ -139,6 +139,15 @@ fn holding_commands(ancestor: u32, hold: &hold::FifoHold) -> Vec<(u32, Vec<Strin
         .collect()
 }
 
+/// The argv of `pid`'s parent, when both are still running.
+fn parent_argv(pid: u32) -> Option<Vec<String>> {
+    let all = processes();
+    let ppid = all.iter().find(|(p, _, _)| *p == pid)?.1;
+    all.into_iter()
+        .find(|(p, _, _)| *p == ppid)
+        .map(|(_, _, argv)| argv)
+}
+
 /// Every process under `ancestor` with its argv, for a failure message.
 fn process_tree(ancestor: u32) -> String {
     descendants(ancestor)
@@ -433,7 +442,18 @@ fn interrupted_028_a_real_agents_unit_is_listed_and_reclaimed_after_a_restart() 
     // Just before the stop, the agent's command is still running.
     let held = holding_commands(live.pid(), &hold);
     for (pid, argv) in &held {
-        eprintln!("held: pid {pid} runs {argv:?}");
+        let parent = parent_argv(*pid);
+        eprintln!("held: pid {pid} runs {argv:?} under {parent:?}");
+        // The agent ran the command as given, bound included, so this `cat`
+        // ends by itself even if it never sees the hold's release.
+        assert!(
+            parent
+                .as_deref()
+                .is_some_and(|parent| hold.bounded_by(parent, HOLD_BOUND)),
+            "the held `cat` (pid {pid}) does not run under `timeout {}`: its parent is {parent:?}.\nThe agent's pane:\n{}",
+            HOLD_BOUND.as_secs(),
+            pane_screen(&live, &unit_agent)
+        );
     }
     assert!(
         !held.is_empty(),
