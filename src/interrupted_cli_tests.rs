@@ -782,3 +782,20 @@ fn a_dismiss_all_confirmed_against_a_replaced_daemon_sends_it_nothing() {
         out.stdout
     );
 }
+
+/// Docs review R2: a dismissal the daemon refused whole because its journal
+/// read was incomplete says so and exits 1, dismissing nothing.
+#[test]
+fn a_dismissal_refused_on_an_incomplete_read_says_so() {
+    let out = render_dismiss(&DismissOutcome {
+        refusal: Some(Refusal::new(RefusalReason::IncompleteRead)),
+        ..DismissOutcome::default()
+    });
+    assert_eq!(out.code, EXIT_REFUSED);
+    assert!(out.stdout.is_empty(), "{}", out.stdout);
+    assert!(
+        out.stderr.contains(words::REFUSED_INCOMPLETE_READ),
+        "{}",
+        out.stderr
+    );
+}

@@ -33,7 +33,7 @@ import { agentSpokenName, orchestrationTitle } from "../lib/agentNames";
 import { DISPLAY_LIMITS, deckName, displayActivity, displayIdentity, displayPath, displayText, displayTitle, displayUptime, domIdentity, rendersBlank } from "../lib/displayText";
 import { HookBinaryNotices } from "./HookBinaryNotice";
 import { InterruptedWorkBanner, InterruptedWorkDialog } from "./InterruptedWork";
-import { INTERRUPTED_COVERED, listedCount, NOTHING_INTERRUPTED, shownInterruptedDialog, type InterruptedDialogControls } from "../lib/interruptedWork";
+import { INTERRUPTED_COVERED, listedCount, NOTHING_INTERRUPTED, shownInterruptedDialog, type InterruptedDialogControls, type InterruptedList } from "../lib/interruptedWork";
 import { sameIncarnation } from "../lib/agentKey";
 import { AGENT_GONE_AFTER_RESTART } from "../lib/agentIdentity";
 import { inboxAttentionWords, INBOX_WORDS } from "../lib/inboxWords";
@@ -1277,7 +1277,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     its dialog opens and asks it again, as the TUI's `I` does, even when its
     last answer listed nothing or failed; with several, each is asked again
     first. "No interrupted work" is said only when every one of them answered
-    that.
+    that with a complete list.
   */
   const showInterruptedWork = useCallback((deckId?: string): string | undefined | Promise<string | undefined> => {
     if (!interrupted) return NOTHING_INTERRUPTED;
@@ -1294,8 +1294,14 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       const id = deck.snapshot.connection.deckId as string;
       return refresh(id, false).then((found) => ({ deck, id, found }));
     })).then((answers) => {
-      /* A daemon that could not be asked again still counts the items its last answer listed. */
-      const listing = answers.filter(({ id, found }) => (found.outcome === "listed" ? found.count > 0 : found.outcome !== "unsupported" && listedCount(held[id]?.list) > 0));
+      /*
+        A daemon that could not be asked again still counts the items its last
+        answer listed. One whose list is incomplete may have work it could not
+        read, so it is opened or named like one with work, never taken for none
+        (verification finding C); its dialog says the list is incomplete.
+      */
+      const mayHave = (list: InterruptedList | undefined) => listedCount(list) > 0 || list?.incomplete === true;
+      const listing = answers.filter(({ id, found }) => (found.outcome === "listed" ? found.count > 0 || found.incomplete : found.outcome !== "unsupported" && mayHave(held[id]?.list)));
       if (listing.length === 1) return openDialog(listing[0].id) ? undefined : NOTHING_INTERRUPTED;
       if (listing.length > 1) return interruptedSeveral(listing.map(({ deck }) => deckName(deck.snapshot.connection)), "Open one from its banner, or say which one.");
       const unknown = answers.filter(({ found }) => found.outcome === "failed" || found.outcome === "superseded");

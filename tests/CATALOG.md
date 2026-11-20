@@ -817,7 +817,7 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 ##### journal/interrupted/030 — A later batch of Dismiss all that fails or is refused stops the rest and says so.
 - **Layer:** L1 in-process `TestBackend` (`tests/render_interrupted_work.rs`, seam `run_interrupted_work_seam`): every request the TUI sends is recorded instead of sent, the daemon's answers are handed in for a recorded request, keys go through the production `handle_key_event`, and each frame is drawn after the production per-frame fetch check.
 - **Agent:** none.
-- **Asserts:** over 257 items, with the first batch dismissed and the second failing (a timeout) or refused whole (`Unreadable`), no third dismissal is sent, the list is asked for again, and the overlay says `Dismissed.` and `dismiss_stopped_sentence`'s words for one item not dismissed and why.
+- **Asserts:** over 257 items, with the first batch dismissed and the second failing (a timeout) or refused whole (`Unreadable`), no third dismissal is sent, the list is asked for again, and the overlay says `Dismissed.` and `dismiss_stopped_sentence`'s words for one item not dismissed and why. When the first batch also refused one of its ids (`NotListed`) and the second failed, the overlay shows both that refusal's sentence and the stopped-batch words.
 - **Does not assert:** a failed FIRST batch, which reads as a single dismissal does (`journal/interrupted/012`).
 - **Platform coverage:** mac+linux.
 
@@ -826,6 +826,13 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 - **Agent:** none.
 - **Asserts:** over 257 items, after the first batch answered, a second batch withheld from a replaced process (unsupported), or the event stream attaching to another process before it answers, ends the dismissal: exactly two dismissals were sent, both pinned to the first daemon process, and the overlay says one item was not dismissed because the deck daemon was replaced.
 - **Does not assert:** the shared client's instance pin itself (`daemon_client` tests).
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/032 — A dismissal the daemon refuses because its journal read was incomplete says so, for one item and for Dismiss all.
+- **Layer:** L1 in-process `TestBackend` (`tests/render_interrupted_work.rs`, seam `run_interrupted_work_seam`): every request the TUI sends is recorded instead of sent, the daemon's answers are handed in for a recorded request, keys go through the production `handle_key_event`, and each frame is drawn after the production per-frame fetch check.
+- **Agent:** none.
+- **Asserts:** `d` answered by a whole refusal `IncompleteRead` shows its sentence; `D` `y` over 257 items whose first batch is refused that way shows it and sends no second batch; when only the second batch is refused, the overlay says `Dismissed.` and `dismiss_stopped_sentence`'s words for one item not dismissed with that refusal.
+- **Does not assert:** the daemon's refusal itself (`interrupted_work_daemon::tests::dismiss_refuses_a_truncated_journal_read_and_writes_no_close`).
 - **Platform coverage:** mac+linux.
 
 #### journal/compat

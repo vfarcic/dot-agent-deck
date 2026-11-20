@@ -21,7 +21,7 @@
 use crate::close_cli::{
     AmbientIdentity, EXIT_DAEMON_TOO_OLD, EXIT_OK, EXIT_REFUSED, EXIT_UNREACHABLE,
 };
-use crate::daemon_client::{ClientError, DaemonClient, GatedQuery};
+use crate::daemon_client::{ClientError, DaemonClient, GatedQuery, PinnedQuery};
 use crate::interrupted_work::{
     self as words, DismissOutcome, InterruptedItem, InterruptedList, InterruptedShow, ItemKind,
     ReclaimOutcome, ReclaimVerdict, RefusalReason,
@@ -425,7 +425,8 @@ pub enum Confirm<'a> {
 
 /// `interrupted dismiss <id>... | --all [--yes]`. Without `--yes`, `--all`
 /// lists the items first and asks; it then dismisses exactly the items it
-/// listed, so one that appears in between is not dismissed unseen.
+/// listed, so one that appears in between is not dismissed unseen, and only
+/// on the daemon process that listed them (verification finding A).
 pub async fn run_dismiss(
     client: &DaemonClient,
     args: &DismissArgs,
@@ -436,18 +437,18 @@ pub async fn run_dismiss(
         return failed(words::REFUSED_BAD_REQUEST, EXIT_REFUSED);
     }
     let claim = identity.claim();
-    let (ids, all) = if args.all && !args.yes {
+    let (ids, all, pin) = if args.all && !args.yes {
         let Confirm::Ask(ask) = confirm else {
             return failed(words::DISMISS_ALL_NEEDS_YES, EXIT_REFUSED);
         };
         // An agent is refused whatever it confirms: ask the daemon before
         // asking the person anything.
         if claim.is_some() {
-            return send_dismiss(client, Vec::new(), true, claim).await;
+            return send_dismiss(client, Vec::new(), true, claim, None).await;
         }
-        let list = match client.list_interrupted_work(false, None).await {
-            Ok(GatedQuery::Answered(list)) => list,
-            Ok(GatedQuery::Unsupported) => return unsupported(),
+        let (list, listed_by) = match client.list_interrupted_work_pinned(false, None).await {
+            Ok(PinnedQuery::Answered { value, instance }) => (value, instance),
+            Ok(PinnedQuery::Unsupported | PinnedQuery::OtherInstance) => return unsupported(),
             Err(e) => return client_error(e),
         };
         if list.items.is_empty() {
@@ -459,23 +460,31 @@ pub async fn run_dismiss(
         (
             list.items.iter().map(|item| item.id.to_string()).collect(),
             false,
+            listed_by,
         )
     } else {
-        (args.ids.clone(), args.all)
+        (args.ids.clone(), args.all, None)
     };
-    send_dismiss(client, ids, all, claim).await
+    send_dismiss(client, ids, all, claim, pin).await
 }
 
 /// Send the dismissal, `ids` in the batches the daemon admits
 /// ([`words::dismiss_batches`]: its count and byte limits), one after
-/// another, and render the outcomes together. A later batch that does not
-/// dismiss stops the rest, and the answer says so
-/// ([`DismissOutcome::stopped`]).
+/// another, and render the outcomes together. Every batch is pinned to one
+/// daemon process: `pin`, the process the confirmation's list came from, or
+/// else the process that answered the first batch. A batch that process does
+/// not answer — another process is listening, or the request was refused,
+/// failed or is not supported — stops the rest, and the answer says so
+/// ([`DismissOutcome::stopped`]). A pinned batch is checked against the
+/// process on the connection that carries it, so a replacement is sent
+/// nothing. A running daemon always names its process (`daemon serve` does
+/// not start without an identity), so a pin is always there to hold.
 async fn send_dismiss(
     client: &DaemonClient,
     ids: Vec<String>,
     all: bool,
     claim: Option<crate::daemon_protocol::CallerClaim>,
+    mut pin: Option<String>,
 ) -> CliOutput {
     let batches: Vec<Vec<String>> = if all {
         vec![Vec::new()]
@@ -485,25 +494,36 @@ async fn send_dismiss(
     let mut merged: Option<DismissOutcome> = None;
     for (n, batch) in batches.iter().enumerate() {
         let answer = client
-            .dismiss_interrupted(batch.clone(), all, claim.clone(), None)
+            .dismiss_interrupted_pinned(batch.clone(), all, claim.clone(), pin.as_deref())
             .await;
         let stop = match (answer, merged.as_mut()) {
-            (Ok(GatedQuery::Answered(outcome)), done) if outcome.refusal.is_none() => {
+            (Ok(PinnedQuery::Answered { value, instance }), done) if value.refusal.is_none() => {
+                if pin.is_none() {
+                    pin = instance;
+                }
                 match done {
-                    Some(done) => done.absorb(outcome),
-                    None => merged = Some(outcome),
+                    Some(done) => done.absorb(value),
+                    None => merged = Some(value),
                 }
                 continue;
             }
             // The first batch: as a single dismissal reads.
-            (Ok(GatedQuery::Answered(outcome)), None) => return render_dismiss(&outcome),
-            (Ok(GatedQuery::Unsupported), None) => return unsupported(),
+            (Ok(PinnedQuery::Answered { value, .. }), None) => return render_dismiss(&value),
+            (Ok(PinnedQuery::Unsupported), None) => return unsupported(),
             (Err(e), None) => return client_error(e),
-            (Ok(GatedQuery::Answered(outcome)), Some(_)) => (
+            // The process the confirmation listed was replaced before the
+            // first batch: nothing was sent.
+            (Ok(PinnedQuery::OtherInstance), None) => {
+                merged = Some(DismissOutcome::default());
+                (words::DismissStopReason::Replaced, None)
+            }
+            (Ok(PinnedQuery::Answered { value, .. }), Some(_)) => (
                 words::DismissStopReason::Refused,
-                outcome.refusal.map(|r| r.reason),
+                value.refusal.map(|r| r.reason),
             ),
-            (Ok(GatedQuery::Unsupported), Some(_)) => (words::DismissStopReason::Replaced, None),
+            (Ok(PinnedQuery::Unsupported | PinnedQuery::OtherInstance), Some(_)) => {
+                (words::DismissStopReason::Replaced, None)
+            }
             (Err(_), Some(_)) => (words::DismissStopReason::Failed, None),
         };
         let done = merged.as_mut().expect("a later batch");
@@ -543,11 +563,14 @@ pub fn render_dismiss(outcome: &DismissOutcome) -> CliOutput {
             words::more_dismissed_sentence(outcome.dismissed_omitted)
         ));
     }
-    if outcome.dismissed.is_empty() && outcome.dismissed_omitted == 0 && outcome.refused.is_empty()
-    {
+    let nothing = outcome.dismissed.is_empty() && outcome.dismissed_omitted == 0;
+    if nothing && outcome.refused.is_empty() && outcome.stopped.is_none() {
         stdout.push_str(&format!("{}\n", words::NOTHING_INTERRUPTED));
     }
     let mut stderr = String::new();
+    if nothing && outcome.stopped.is_some() {
+        stderr.push_str(&format!("{}\n", words::NOTHING_DISMISSED));
+    }
     if outcome.incomplete {
         stderr.push_str(&format!("{}\n", words::LIST_INCOMPLETE));
     }

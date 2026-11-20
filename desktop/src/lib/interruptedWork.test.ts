@@ -88,6 +88,9 @@ describe("the interrupted work wording", () => {
     expect(words.dismissMessage({ dismissed: [{ id: "w" }], refused: [] })).toBe(words.DISMISSED);
     expect(words.dismissMessage({ dismissed: [], refused: [] })).toBe(words.NOTHING_DISMISSED);
     expect(words.dismissMessage({ dismissed: [], refused: [{ id: "w", refusal: { reason: "not-listed", message: "" } }] })).toBe(words.REFUSED_NOT_LISTED);
+    /* Docs review R2: a dismissal refused whole on an incomplete journal read, one item's or a Dismiss all batch's. */
+    expect(words.dismissMessage({ dismissed: [], refused: [], refusal: { reason: "incomplete-read", message: "x" } })).toBe(words.REFUSED_INCOMPLETE_READ);
+    expect(words.dismissMessage({ dismissed: [{ id: "w" }], refused: [], stopped: { reason: "refused", refusal: "incomplete-read", not_sent: 1 } })).toBe(`${words.DISMISSED} 1 more item was not dismissed. ${words.REFUSED_INCOMPLETE_READ}`);
   });
 
   /** Scenario: Dismiss all over more items than one request names is sent in batches by the app's bridge; when a later batch stops — the daemon replaced, no answer, or refused — the sentence after "Dismissed." says how many more items were or may not have been dismissed and why, as the TUI and the CLI say it. */

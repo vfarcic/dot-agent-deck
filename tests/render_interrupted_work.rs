@@ -1893,3 +1893,52 @@ fn interrupted_031_a_replaced_daemon_stops_dismiss_all_between_batches() {
         );
     }
 }
+
+/// Scenario: The daemon refuses a dismissal whole because it could not read
+/// its whole work journal. `d` on one item, and `D` `y` over 257 items whose
+/// first batch is refused, each show "Refused: the deck could not read its
+/// whole work journal, …" and send nothing more; when only the second batch
+/// is refused, the overlay says "Dismissed." and that 1 more item was not
+/// dismissed, with the same refusal.
+#[spec("journal/interrupted/032")]
+#[test]
+fn interrupted_032_a_dismissal_refused_on_an_incomplete_read_says_so() {
+    let incomplete = || {
+        InterruptedSeamStep::Dismissed(DismissOutcome {
+            refusal: Some(Refusal::new(RefusalReason::IncompleteRead)),
+            ..DismissOutcome::default()
+        })
+    };
+    let refused = squeezed(refusal_sentence(RefusalReason::IncompleteRead));
+
+    let (shown, sent) = run(&three(), &[ch('I'), ch('d'), incomplete()]);
+    assert_eq!(dismissals(&sent).len(), 1, "{sent:?}");
+    let said = popup_text(shown.last().unwrap());
+    assert!(said.contains(&refused), "one item:\n{said}");
+
+    let (shown, sent) = run(&many(), &[ch('I'), ch('D'), ch('y'), incomplete()]);
+    assert_eq!(dismissals(&sent).len(), 1, "no second batch: {sent:?}");
+    let said = popup_text(shown.last().unwrap());
+    assert!(said.contains(&refused), "the first batch:\n{said}");
+
+    let ids = many_ids();
+    let (shown, sent) = run(
+        &many(),
+        &[
+            ch('I'),
+            ch('D'),
+            ch('y'),
+            InterruptedSeamStep::Dismissed(dismissed_all(&ids[..256])),
+            incomplete(),
+        ],
+    );
+    assert_eq!(dismissals(&sent).len(), 2, "{sent:?}");
+    let said = popup_text(shown.last().unwrap());
+    let why = squeezed(&dismiss_stopped_sentence(&DismissStopped {
+        reason: DismissStopReason::Refused,
+        refusal: Some(RefusalReason::IncompleteRead),
+        not_sent: 1,
+    }));
+    assert!(said.contains(&squeezed(DISMISSED)), "{said}");
+    assert!(said.contains(&why), "a later batch:\n{said}");
+}

@@ -721,15 +721,16 @@ pub(super) fn apply(ui: &mut UiState, answer: Answer) {
     }
 }
 
-/// The sentence for a dismissal's outcome.
+/// The sentence for a dismissal's outcome: a refusal of one of its ids, or
+/// whether anything was dismissed, then why a dismissal sent in batches
+/// stopped, when it did (verification finding B: a refusal does not hide it).
 fn dismiss_message(outcome: &DismissOutcome) -> String {
     if let Some(refusal) = &outcome.refusal {
         return words::refusal_sentence(refusal.reason).to_string();
     }
-    if let Some(refused) = outcome.refused.first() {
-        return words::refusal_sentence(refused.refusal.reason).to_string();
-    }
-    let said = if outcome.dismissed.is_empty() && outcome.dismissed_omitted == 0 {
+    let said = if let Some(refused) = outcome.refused.first() {
+        words::refusal_sentence(refused.refusal.reason)
+    } else if outcome.dismissed.is_empty() && outcome.dismissed_omitted == 0 {
         words::NOTHING_DISMISSED
     } else {
         words::DISMISSED

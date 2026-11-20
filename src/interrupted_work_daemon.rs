@@ -104,7 +104,9 @@
 //!
 //! **Dismiss** writes `closed how=dismissed` on every work of each item named
 //! (or of every listed item), so it is no longer listed. Kept reports are left
-//! to expire on schedule (D7). Its selector is bounded before anything is
+//! to expire on schedule (D7). A truncated journal read refuses the whole
+//! dismissal, as it refuses a reclaim, since it may have left out works under
+//! an item that the dismissal would then not close. Its selector is bounded before anything is
 //! read ([`MAX_DISMISS_IDS`], [`MAX_DISMISS_ID_BYTES`], [`MAX_DISMISS_BYTES`]),
 //! the journal is indexed once per request ([`CloseSets`]), and its answer
 //! is bounded: its lists are capped
@@ -951,6 +953,12 @@ pub async fn dismiss(
         let Ok(snap) = snapshot(&journal, retained.as_deref()) else {
             return refused(RefusalReason::Unreadable);
         };
+        // A truncated journal read may have left out works under an item, and
+        // a dismissal closes the works it read: refused, as reclaim is, rather
+        // than leaving those works unclosed (docs review R2).
+        if snap.read.stats.truncated {
+            return refused(RefusalReason::IncompleteRead);
+        }
         let mut outcome = DismissOutcome {
             incomplete: snap.list.incomplete,
             ..DismissOutcome::default()

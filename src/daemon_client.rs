@@ -1521,6 +1521,30 @@ pub enum GatedQuery<T> {
     Unsupported,
 }
 
+/// PRD #1790 stage 2 (verification finding A): an interrupted work request a
+/// caller may pin to one daemon process, as
+/// [`DaemonClient::dismiss_interrupted_pinned`] answers it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PinnedQuery<T> {
+    /// Answered by the daemon process `instance` (its `Hello`'s
+    /// `instance_id`).
+    Answered { value: T, instance: Option<String> },
+    /// The daemon does not advertise the verb: nothing was sent.
+    Unsupported,
+    /// The daemon is not the pinned process: nothing was sent.
+    OtherInstance,
+}
+
+/// What [`DaemonClient::interrupted_work_on`] found.
+enum InterruptedAnswer {
+    Answered {
+        response: Box<AttachResponse>,
+        instance: Option<String>,
+    },
+    Unsupported,
+    OtherInstance,
+}
+
 /// Issue #2330: the pending in-deck approval requests a `Hello` (or
 /// snapshot) reply carries, sanitized, or `None` when the daemon does not
 /// advertise [`crate::daemon_protocol::CAP_TRUST_REQUESTS`] — a client shows
@@ -3685,6 +3709,22 @@ impl DaemonClient {
         request: &AttachRequest,
         pinned_instance: Option<&str>,
     ) -> Result<Option<AttachResponse>, ClientError> {
+        Ok(
+            match self.interrupted_work_on(request, pinned_instance).await? {
+                InterruptedAnswer::Answered { response, .. } => Some(*response),
+                InterruptedAnswer::Unsupported | InterruptedAnswer::OtherInstance => None,
+            },
+        )
+    }
+
+    /// [`Self::interrupted_work_request`], telling a daemon that does not
+    /// support the request from one that is not `pinned_instance`, and
+    /// answering which daemon process (the `Hello`'s `instance_id`) answered.
+    async fn interrupted_work_on(
+        &self,
+        request: &AttachRequest,
+        pinned_instance: Option<&str>,
+    ) -> Result<InterruptedAnswer, ClientError> {
         let (mut rd, mut wr) = self.connect().await?;
         let hello = issue_command(
             &mut rd,
@@ -3697,20 +3737,80 @@ impl DaemonClient {
         )
         .await?;
         if !hello.ok {
-            return Ok(None);
+            return Ok(InterruptedAnswer::Unsupported);
         }
         let capabilities = DaemonCapabilities::from_hello(&hello);
         if !capabilities.supports(crate::daemon_protocol::CAP_INTERRUPTED_WORK)
             || !capabilities.supports(crate::daemon_protocol::CAP_HELLO_FOLLOW_ON)
         {
-            return Ok(None);
+            return Ok(InterruptedAnswer::Unsupported);
         }
         if let Some(pinned) = pinned_instance
             && hello.instance_id.as_deref() != Some(pinned)
         {
-            return Ok(None);
+            return Ok(InterruptedAnswer::OtherInstance);
         }
-        issue_command(&mut rd, &mut wr, request).await.map(Some)
+        let response = Box::new(issue_command(&mut rd, &mut wr, request).await?);
+        Ok(InterruptedAnswer::Answered {
+            response,
+            instance: hello.instance_id,
+        })
+    }
+
+    /// PRD #1790 stage 2 (verification finding A): [`Self::list_interrupted_work`],
+    /// also answering the daemon process that listed it, so a later request
+    /// can be pinned to that process.
+    pub async fn list_interrupted_work_pinned(
+        &self,
+        git: bool,
+        pinned_instance: Option<&str>,
+    ) -> Result<PinnedQuery<crate::interrupted_work::InterruptedList>, ClientError> {
+        let request = AttachRequest::ListInterruptedWork { git };
+        let (response, instance) = match self.interrupted_work_on(&request, pinned_instance).await?
+        {
+            InterruptedAnswer::Answered { response, instance } => (response, instance),
+            InterruptedAnswer::Unsupported => return Ok(PinnedQuery::Unsupported),
+            InterruptedAnswer::OtherInstance => return Ok(PinnedQuery::OtherInstance),
+        };
+        match response.interrupted_work {
+            Some(list) => Ok(PinnedQuery::Answered {
+                value: list,
+                instance,
+            }),
+            None => Err(ClientError::Server(response.error.unwrap_or_else(|| {
+                "the daemon answered ListInterruptedWork with no list".into()
+            }))),
+        }
+    }
+
+    /// PRD #1790 stage 2 (verification finding A): [`Self::dismiss_interrupted`],
+    /// telling a daemon that is not `pinned_instance` from one that does not
+    /// support the request, and answering the daemon process that dismissed.
+    /// Its capability check, its pin check and the dismissal share one
+    /// connection, so a request withheld from another process sent it nothing.
+    pub async fn dismiss_interrupted_pinned(
+        &self,
+        ids: Vec<String>,
+        all: bool,
+        caller: Option<crate::daemon_protocol::CallerClaim>,
+        pinned_instance: Option<&str>,
+    ) -> Result<PinnedQuery<crate::interrupted_work::DismissOutcome>, ClientError> {
+        let request = AttachRequest::DismissInterrupted { ids, all, caller };
+        let (response, instance) = match self.interrupted_work_on(&request, pinned_instance).await?
+        {
+            InterruptedAnswer::Answered { response, instance } => (response, instance),
+            InterruptedAnswer::Unsupported => return Ok(PinnedQuery::Unsupported),
+            InterruptedAnswer::OtherInstance => return Ok(PinnedQuery::OtherInstance),
+        };
+        match response.interrupted_dismiss {
+            Some(outcome) => Ok(PinnedQuery::Answered {
+                value: outcome,
+                instance,
+            }),
+            None => Err(ClientError::Server(response.error.unwrap_or_else(|| {
+                "the daemon answered DismissInterrupted with no outcome".into()
+            }))),
+        }
     }
 
     /// PRD #1790 stage 2: the interrupted work list

@@ -17,12 +17,14 @@ export interface InterruptedDeck {
 
 /**
  * What one list request found (final reviewer 2): how many items the process
- * lists, that it does not support interrupted work, that the request failed,
- * or that its answer was not applied because the deck left that process or a
- * newer request replaced it.
+ * lists and whether its list is incomplete (verification finding C: the
+ * process could not read its whole journal, so an empty list is not an answer
+ * that there is none), that it does not support interrupted work, that the
+ * request failed, or that its answer was not applied because the deck left
+ * that process or a newer request replaced it.
  */
 export type InterruptedFetch =
-  | { outcome: "listed"; count: number }
+  | { outcome: "listed"; count: number; incomplete: boolean }
   | { outcome: "unsupported" }
   | { outcome: "failed"; reason: string }
   | { outcome: "superseded" };
@@ -117,7 +119,10 @@ export function useInterruptedWork(bridge: DeckBridge, fleet: DeckFleet): Interr
         const items = reply.answer.items.map((item) => (item.git ? item : { ...item, git: before.list?.items.find((old) => old.id === item.id)?.git ?? item.git }));
         return { ...held, [deckId]: { instance, list: { ...reply.answer, items } } };
       });
-      if (listed) return { outcome: "listed", count: listedCount(reply.answer as InterruptedList) };
+      if (listed) {
+        const list = reply.answer as InterruptedList;
+        return { outcome: "listed", count: listedCount(list), incomplete: list.incomplete === true };
+      }
       return reply.outcome === "unsupported" ? { outcome: "unsupported" } : { outcome: "failed", reason: "the daemon's answer could not be read" };
     }, (error: unknown): InterruptedFetch => {
       if (!applies()) return superseded;

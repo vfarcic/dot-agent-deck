@@ -473,12 +473,11 @@ export function wouldRemove(outcome: ReclaimOutcome): boolean {
   return outcome.verdict === "would-remove" && !outcome.refusal;
 }
 
-/** The TUI's `dismiss_message`: the sentence for a dismissal's outcome. */
+/** The TUI's `dismiss_message`: the sentence for a dismissal's outcome — a refusal of one of its ids, or whether anything was dismissed — then why a dismissal sent in batches stopped, when it did. */
 export function dismissMessage(outcome: DismissOutcome): string {
   if (outcome.refusal) return refusalText(outcome.refusal);
   const refused = outcome.refused[0];
-  if (refused) return refusalText(refused.refusal);
-  const said = outcome.dismissed.length === 0 && !outcome.dismissed_omitted ? NOTHING_DISMISSED : DISMISSED;
+  const said = refused ? refusalText(refused.refusal) : outcome.dismissed.length === 0 && !outcome.dismissed_omitted ? NOTHING_DISMISSED : DISMISSED;
   return outcome.stopped ? `${said} ${dismissStoppedSentence(outcome.stopped)}` : said;
 }
 

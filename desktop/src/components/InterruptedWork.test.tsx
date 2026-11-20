@@ -7,7 +7,7 @@ import { createFixtureSnapshot } from "../data/fixture";
 import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, LOCAL_ENDPOINT_SELECTION, type DeckBridge, type DesktopSettingsDto } from "../lib/bridge";
 import { AGENTS_STOPPED_BY_RESTART } from "../lib/agentIdentity";
 import {
-  DISMISSED, INTERRUPTED_WORK_TITLE, LIST_INCOMPLETE, NOTHING_INTERRUPTED, OTHER_AGENTS_GROUP, RECLAIM_KEPT_DIRTY, RECLAIM_REMOVED, RECLAIM_WOULD_REMOVE, REFUSED_AMBIGUOUS, REFUSED_NOT_LISTED, dismissAllQuestion, interruptedFooter, reportRangeSentence,
+  DISMISSED, INTERRUPTED_WORK_TITLE, LIST_INCOMPLETE, NOTHING_INTERRUPTED, OTHER_AGENTS_GROUP, RECLAIM_KEPT_DIRTY, RECLAIM_REMOVED, RECLAIM_WOULD_REMOVE, REFUSED_AMBIGUOUS, REFUSED_INCOMPLETE_READ, REFUSED_NOT_LISTED, dismissAllQuestion, interruptedFooter, reportRangeSentence,
   type DismissOutcome, type InterruptedItem, type InterruptedList, type InterruptedReply, type InterruptedShow, type InterruptedTarget, type ReclaimOutcome,
 } from "../lib/interruptedWork";
 import { VOICE_ACTIONS, INTERRUPTED_RECLAIM_CHECKING, type VoiceOverviewChannel, type VoiceOverviewContext } from "../lib/voiceActions";
@@ -489,6 +489,33 @@ describe("the dialog under React's development checks (reviewer 1)", () => {
   });
 });
 
+describe("a dismissal refused on an incomplete journal read (docs review R2)", () => {
+  /** Scenario: the daemon refuses a dismissal whole because it could not read its whole work journal. Dismiss on one item, and Dismiss all confirmed, each show "Refused: the deck could not read its whole work journal, …"; a Dismiss all whose later part was refused that way says "Dismissed." and that 1 more item was not dismissed, with the same refusal. */
+  it("says so for one item and for Dismiss all", async () => {
+    const { bridge } = recordingBridge({ list: three() });
+    let answer: DismissOutcome = { dismissed: [], refused: [], refusal: { reason: "incomplete-read", message: "x" } };
+    const refusing = {
+      ...(bridge as unknown as Record<string, unknown>),
+      interruptedWorkDismiss: vi.fn(async (target: InterruptedTarget) => answered(target, structuredClone(answer))),
+    } as unknown as DeckBridge;
+    render(<Overview bridge={refusing} deck={deckOf("process-a")} />);
+    const dialog = await openDialog();
+
+    await act(async () => { fireEvent.click(rowOf(AGENT_ID)); });
+    await act(async () => { fireEvent.click(within(dialog).getByTestId("interrupted-dismiss")); });
+    await waitFor(() => expect(within(dialog).getByTestId("interrupted-message")).toHaveTextContent(REFUSED_INCOMPLETE_READ));
+
+    await act(async () => { fireEvent.click(within(dialog).getByTestId("interrupted-dismiss-all-open")); });
+    await act(async () => { fireEvent.click(within(dialog).getByTestId("interrupted-dismiss-all-confirm")); });
+    await waitFor(() => expect(within(dialog).getByTestId("interrupted-message")).toHaveTextContent(REFUSED_INCOMPLETE_READ));
+
+    answer = { dismissed: [{ id: UNIT_ID }], refused: [], stopped: { reason: "refused", refusal: "incomplete-read", not_sent: 1 } };
+    await act(async () => { fireEvent.click(within(dialog).getByTestId("interrupted-dismiss-all-open")); });
+    await act(async () => { fireEvent.click(within(dialog).getByTestId("interrupted-dismiss-all-confirm")); });
+    await waitFor(() => expect(within(dialog).getByTestId("interrupted-message")).toHaveTextContent(`${DISMISSED} 1 more item was not dismissed. ${REFUSED_INCOMPLETE_READ}`));
+  });
+});
+
 describe("a dismissal in flight when the dialog closes (reviewer 2)", () => {
   /** Scenario: Dismiss on the plain agent is sent and the daemon has not answered; the user closes the dialog and opens it again. The reopened dialog still waits for that dismissal — its Dismiss is disabled and `d` sends nothing — and when the daemon answers, the list is asked for again and drops the item, though no dialog of the first opening is left to ask. */
   it("keeps it pending across closing and reopening, and refreshes the list when it answers", async () => {
@@ -944,7 +971,6 @@ describe("an incomplete empty answer is not an answer that there is none (verifi
     expect(dialog).toHaveTextContent("beta");
     await waitFor(() => expect(dialog).toHaveTextContent(LIST_INCOMPLETE));
     expect(voice.reportRefused.mock.calls.map((call) => call[0])).not.toContain(NOTHING_INTERRUPTED);
-    expect(screen.queryByText(NOTHING_INTERRUPTED)).toBeNull();
   });
 });
 

@@ -14,6 +14,14 @@
 //! follow either. It is bounded by an entry count and a deadline, and an
 //! answer it could not finish — a bound reached, a directory it could not
 //! read — is an `Err`, which every caller reads as a reason to keep.
+//!
+//! The deadline is checked before each directory is opened, after each entry
+//! is read and before an answer is returned, so a walk that passes it never
+//! answers. It is not a deadline on a single filesystem call: a `read_dir` or
+//! entry read that blocks in the kernel is not interrupted, and the walk
+//! notices the time only once that call returns. The async wrapper stops
+//! waiting at the deadline either way; the walk on the blocking pool ends at
+//! its next check.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -66,6 +74,9 @@ fn walk_with(
         for entry in entries {
             let entry = entry.map_err(|e| format!("could not read {}: {e}", current.display()))?;
             read += 1;
+            if now() >= deadline {
+                return Err(format!("the look inside {} ran out of time", dir.display()));
+            }
             if read > max_entries {
                 return Err(format!(
                     "{} holds more than {max_entries} entries to look through",
@@ -93,6 +104,9 @@ fn walk_with(
             continue;
         }
         pending.extend(subdirs);
+    }
+    if now() >= deadline {
+        return Err(format!("the look inside {} ran out of time", dir.display()));
     }
     Ok(found)
 }
