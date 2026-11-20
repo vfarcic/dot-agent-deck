@@ -23,7 +23,14 @@ pub const CLAUDE: &str =
     "claude --model claude-haiku-4-5-20251001 --allowedTools Bash Read Write Task Agent";
 
 pub const SUBJECT: &str = "live inbox task";
+/// The window each wait gets on a quiet machine.
 pub const BUDGET: Duration = Duration::from_secs(120);
+
+/// [`BUDGET`] widened by the machine's measured contention, as the live
+/// tests' own waits are.
+pub fn budget() -> Duration {
+    common::load_scaled(BUDGET)
+}
 pub const PANE: &str = "installed-haiku";
 pub const LOG: &str = "installed-live.log";
 
@@ -131,7 +138,7 @@ impl Installed {
         deck.wait_for_string(PANE);
         let record = std::cell::RefCell::new(Value::Null);
         assert!(
-            common::wait_until(BUDGET, || {
+            common::wait_until(budget(), || {
                 *record.borrow_mut() = attach(&deck, json!({"op":"list-agents"}))["agent_records"]
                     .as_array()
                     .and_then(|rs| rs.iter().find(|r| r["display_name"] == PANE))
@@ -145,7 +152,7 @@ impl Installed {
         let agent = record["id"].as_str().unwrap().to_string();
         let found = std::cell::RefCell::new(None);
         assert!(
-            common::wait_until(BUDGET, || {
+            common::wait_until(budget(), || {
                 *found.borrow_mut() = claude_process(&deck, &agent);
                 found.borrow().is_some()
             }),
@@ -171,7 +178,7 @@ impl Installed {
     pub fn new(extra: &[(&str, &str)]) -> Self {
         let claude = Self::launch(CLAUDE, extra);
         assert!(
-            common::wait_until(BUDGET, || claude.listing()["armed"].as_u64().unwrap_or(0)
+            common::wait_until(budget(), || claude.listing()["armed"].as_u64().unwrap_or(0)
                 > 0),
             "native SessionStart waiter must arm; {}",
             claude.evidence()
@@ -179,7 +186,7 @@ impl Installed {
         let release = installed_release().expect("the installed release");
         let latched = format!("release={release}");
         assert!(
-            common::wait_until(BUDGET, || claude.log().lines().any(|line| {
+            common::wait_until(budget(), || claude.log().lines().any(|line| {
                 line.contains("pane release") && line.split_whitespace().any(|w| w == latched)
             })),
             "the deck latched the installed release {release} from the pane's header; {}",
@@ -366,13 +373,13 @@ impl Installed {
         // The shell creates the file for `>>` before printf writes the line:
         // wait for a whole line, not only for the file.
         assert!(
-            common::wait_until(BUDGET, || std::fs::read_to_string(&path)
+            common::wait_until(budget(), || std::fs::read_to_string(&path)
                 .is_ok_and(|text| text.ends_with('\n'))),
             "real Haiku must act on {id}; {}",
             self.evidence()
         );
         assert!(
-            common::wait_until(BUDGET, || self.message(id)["state"] == "acknowledged"),
+            common::wait_until(budget(), || self.message(id)["state"] == "acknowledged"),
             "message must be acknowledged; {}",
             self.evidence()
         );
@@ -397,7 +404,7 @@ impl Installed {
     /// kill that waiter, so the next task can arrive only by the doorbell.
     pub fn idle_without_waiter(&self) {
         assert!(
-            common::wait_until(BUDGET, || {
+            common::wait_until(budget(), || {
                 self.listing()["armed"].as_u64().unwrap_or(0) > 0
                     && self.record()["live"]["status"] == "Idle"
             }),
