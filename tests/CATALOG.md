@@ -8095,7 +8095,7 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 
 ##### pane/restart/001 — Restarting a crashed worker without `--force` succeeds and the role stays reachable (issue #868).
 - **Layer:** L1/fast (in-process — the real `handle_restart_role_with_state` against a daemon-owned `cat`-orchestrator + a worker stand-in that exits on its own to simulate a crash; no daemon socket, no LLM).
-- **Agent:** none (synthetic — a `sleep 0.2` worker stand-in whose natural exit is what marks its `AgentRecord` `crashed == Some(true)`, mirroring the M1 precedent test's technique).
+- **Agent:** none (synthetic — a worker stand-in that exits after 0.2 s on its first run only, so its natural exit is what marks its `AgentRecord` `crashed == Some(true)`, mirroring the M1 precedent test's technique, while the restart's replacement, the same configured command run again, stays up as `cat` for the live-agent check).
 - **Asserts:** with the worker's record marked crashed, calling the handler from the orchestrator pane with `force: false` reports `restarted: true` and no error; the worker pane is now owned by a freshly spawned agent id (not the crashed one); a subsequent `delegate_targets` lookup from the orchestrator still resolves the role to the same pane.
 - **Does not assert:** the CLI/socket layer (`dot-agent-deck pane restart`) — this calls the handler directly, bypassing it.
 - **Platform coverage:** mac+linux (unix-only).
