@@ -1077,3 +1077,141 @@ fn a_dismissal_of_items_with_oversized_names_fits_its_reply() {
         assert!(listed(&registry).await.items.is_empty());
     });
 }
+
+/// Auditor A2: right after the re-validation's first identity check, the
+/// worktree is moved aside and an exact copy of it (the same `.git`
+/// pointer, so the same git metadata directory, owner marker and branch) is
+/// put at its path. Every later Git check passes for the copy; the identity
+/// check repeated just before `git worktree remove` sees another directory,
+/// and nothing is removed or recorded.
+#[test]
+fn reclaim_removes_nothing_when_the_worktree_is_swapped_after_the_first_identity_check() {
+    rt().block_on(async {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let root_dir = std::fs::canonicalize(tmp.path()).unwrap();
+        let (_repo, wt) = repo_with_worktree(&root_dir);
+        mark(&wt);
+        let registry = registry_with_journal(&root_dir.join("state"), JournalOptions::default());
+        let (root, _) = unit(&registry, "agent/dispatch-x", Some(&wt));
+        let aside = root_dir.join("wt-aside");
+        {
+            let (wt, aside) = (wt.clone(), aside.clone());
+            seams::arm_after_first_identity(&wt.clone(), move || {
+                std::fs::rename(&wt, &aside).unwrap();
+                let out = std::process::Command::new("cp")
+                    .arg("-a")
+                    .arg(&aside)
+                    .arg(&wt)
+                    .output()
+                    .expect("cp available");
+                assert!(out.status.success(), "{out:?}");
+            });
+        }
+
+        let outcome = reclaim(&registry, root.to_string(), false, None).await;
+        assert_eq!(outcome.verdict, ReclaimVerdict::KeptChanged, "{outcome:?}");
+        assert!(!outcome.recorded);
+        assert!(aside.is_dir(), "the original worktree is kept");
+        assert!(wt.is_dir(), "the copy at its path is not removed");
+        assert!(closes(&registry).is_empty());
+        assert_eq!(listed(&registry).await.items.len(), 1);
+    });
+}
+
+/// Auditor A2: between the keep check and the re-validation, another
+/// worktree of the repository is added inside the item's worktree, under a
+/// directory Git ignores (so the outer tree still reads clean), with an
+/// unsaved file in it. The nested-worktree check is made again after the
+/// re-validation, so the tree is kept and the nested worktree named; neither
+/// it nor its file is removed.
+#[test]
+fn reclaim_keeps_a_worktree_nested_inside_it_after_the_keep_check() {
+    rt().block_on(async {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let root_dir = std::fs::canonicalize(tmp.path()).unwrap();
+        let (repo, wt) = repo_with_worktree(&root_dir);
+        mark(&wt);
+        let exclude = repo.join(".git").join("info").join("exclude");
+        std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+        let mut patterns = std::fs::read_to_string(&exclude).unwrap_or_default();
+        patterns.push_str("\n.worktrees/\n");
+        std::fs::write(&exclude, patterns).unwrap();
+        let registry = registry_with_journal(&root_dir.join("state"), JournalOptions::default());
+        let (root, _) = unit(&registry, "agent/dispatch-x", Some(&wt));
+        let nested = wt.join(".worktrees").join("nested");
+        {
+            let (repo, nested, root_dir) = (repo.clone(), nested.clone(), root_dir.clone());
+            seams::arm_before_revalidate(&wt.clone(), move || {
+                git_in(
+                    &repo,
+                    &root_dir,
+                    &[
+                        "worktree",
+                        "add",
+                        "-q",
+                        "-b",
+                        "nested",
+                        &nested.to_string_lossy(),
+                    ],
+                );
+                std::fs::write(nested.join("unsaved.txt"), "keep me").unwrap();
+            });
+        }
+
+        let outcome = reclaim(&registry, root.to_string(), false, None).await;
+        assert_eq!(
+            outcome.verdict,
+            ReclaimVerdict::KeptHoldsWorktrees,
+            "{outcome:?}"
+        );
+        assert_eq!(outcome.nested_worktrees.len(), 1, "{outcome:?}");
+        assert!(
+            nested.join("unsaved.txt").is_file(),
+            "the nested file is kept"
+        );
+        assert!(wt.is_dir());
+        assert!(closes(&registry).is_empty());
+    });
+}
+
+/// Auditor A2: a reclaim takes the repository's worktree lock (the one the
+/// deck's worktree creation and removal take) across its keep check,
+/// re-validation and removal, and fails closed when it cannot: with the lock
+/// held elsewhere, nothing is removed or recorded, and the answer says so.
+/// Once the lock is free the reclaim goes ahead.
+#[test]
+fn reclaim_removes_nothing_when_the_repositorys_worktree_lock_cannot_be_taken() {
+    rt().block_on(async {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let root_dir = std::fs::canonicalize(tmp.path()).unwrap();
+        let (repo, wt) = repo_with_worktree(&root_dir);
+        mark(&wt);
+        let registry = registry_with_journal(&root_dir.join("state"), JournalOptions::default());
+        let (root, _) = unit(&registry, "agent/dispatch-x", Some(&wt));
+        let lock_path = crate::issue_dispatch_run::worktree_lock_path(&repo)
+            .await
+            .expect("a lock path");
+        let held = crate::platform::lock::acquire_spawn_lock(&lock_path)
+            .await
+            .expect("take the lock");
+
+        let outcome = reclaim_with(
+            &registry,
+            root.to_string(),
+            false,
+            None,
+            RECLAIM_TIMEOUT,
+            Duration::from_millis(300),
+        )
+        .await;
+        assert_eq!(outcome.verdict, ReclaimVerdict::KeptBusy, "{outcome:?}");
+        assert_eq!(outcome.message, crate::interrupted_work::RECLAIM_KEPT_BUSY);
+        assert!(wt.is_dir(), "nothing was removed");
+        assert!(closes(&registry).is_empty());
+
+        drop(held);
+        let outcome = reclaim(&registry, root.to_string(), false, None).await;
+        assert_eq!(outcome.verdict, ReclaimVerdict::Removed, "{outcome:?}");
+        assert!(!wt.exists());
+    });
+}

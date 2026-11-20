@@ -2685,7 +2685,7 @@ fn is_worktree_scan_short_read(err: &str) -> bool {
 ///
 /// Returns `None` when the directory cannot be resolved (not a git repo) — the
 /// add itself then fails with git's own message, which is the better error.
-async fn worktree_lock_path(clone_dir: &Path) -> Option<PathBuf> {
+pub(crate) async fn worktree_lock_path(clone_dir: &Path) -> Option<PathBuf> {
     let common = run_git_capture(&[
         "-C",
         &clone_dir.to_string_lossy(),

@@ -357,6 +357,9 @@ pub enum ReclaimVerdict {
     /// reclaim checked (another directory at its path, a missing owner
     /// marker, or another branch checked out), so nothing was removed.
     KeptChanged,
+    /// Kept: the repository's worktree lock, which worktree creation and
+    /// removal take, could not be taken in time, so nothing was removed.
+    KeptBusy,
     /// Refused before anything was checked or removed; see
     /// [`ReclaimOutcome::refusal`].
     Refused,
@@ -564,6 +567,7 @@ pub const RECLAIM_KEPT_COULD_NOT_CHECK: &str =
 pub const RECLAIM_REMOVE_FAILED: &str = "Kept: git could not remove its worktree.";
 pub const RECLAIM_TIMED_OUT: &str = "Removing its worktree did not finish in time; it may still be removed, and the deck records it if it is.";
 pub const RECLAIM_KEPT_CHANGED: &str = "Kept: its worktree was moved, replaced or switched to another branch while it was being reclaimed, so nothing was removed. List the interrupted work again.";
+pub const RECLAIM_KEPT_BUSY: &str = "Kept: another change to its repository's worktrees did not finish in time, so nothing was removed. Reclaim it again.";
 pub const RECLAIM_NOT_RECORDED: &str = "Its worktree was removed and its branch kept, but the deck could not record it, so it may be listed again.";
 pub const DISMISSED: &str = "Dismissed.";
 
@@ -805,6 +809,7 @@ pub fn reclaim_sentence(verdict: ReclaimVerdict) -> &'static str {
         ReclaimVerdict::RemoveFailed => RECLAIM_REMOVE_FAILED,
         ReclaimVerdict::TimedOut => RECLAIM_TIMED_OUT,
         ReclaimVerdict::KeptChanged => RECLAIM_KEPT_CHANGED,
+        ReclaimVerdict::KeptBusy => RECLAIM_KEPT_BUSY,
         ReclaimVerdict::Refused | ReclaimVerdict::Unknown => REFUSED_UNKNOWN,
     }
 }

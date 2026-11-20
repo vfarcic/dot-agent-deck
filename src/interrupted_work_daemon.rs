@@ -122,6 +122,9 @@ pub const RECLAIM_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 /// The bound on the re-validation just before the removal.
 pub const REVALIDATE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long a reclaim waits for the repository's worktree lock.
+pub const RECLAIM_LOCK_WAIT: Duration = Duration::from_secs(15);
+
 /// The bound on a reclaim's removal, as `close`'s worktree cleanup has. The
 /// removal is not stopped at it, only the reply.
 pub const RECLAIM_TIMEOUT: Duration = Duration::from_secs(30);
@@ -502,6 +505,8 @@ async fn still_the_checked_worktree(checked: Checked) -> bool {
     if !same_dir {
         return false;
     }
+    #[cfg(test)]
+    seams::after_first_identity(&checked.worktree);
     let Some(facts) = probe::worktree_facts(&checked.worktree, deadline).await else {
         return false;
     };
@@ -541,6 +546,20 @@ async fn reclaim_within(
     caller: Option<&CallerClaim>,
     bound: Duration,
 ) -> ReclaimOutcome {
+    reclaim_with(registry, id, dry_run, caller, bound, RECLAIM_LOCK_WAIT).await
+}
+
+/// [`reclaim_within`], waiting at most `lock_wait` for the repository's
+/// worktree lock.
+async fn reclaim_with(
+    registry: &Arc<AgentPtyRegistry>,
+    id: String,
+    dry_run: bool,
+    caller: Option<&CallerClaim>,
+    bound: Duration,
+    lock_wait: Duration,
+) -> ReclaimOutcome {
+    let _ = lock_wait;
     // Any claim, well formed or not: see the module's "Who may act".
     if caller.is_some() {
         return ReclaimOutcome::refused(None, dry_run, RefusalReason::AgentCaller);
@@ -905,6 +924,8 @@ mod seams {
         LazyLock::new(|| Mutex::new(HashMap::new()));
     static AFTER_REMOVAL: LazyLock<Mutex<HashMap<PathBuf, Hook>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
+    static AFTER_FIRST_IDENTITY: LazyLock<Mutex<HashMap<PathBuf, Hook>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
 
     fn take(seam: &Mutex<HashMap<PathBuf, Hook>>, worktree: &Path) -> Option<Hook> {
         seam.lock()
@@ -919,6 +940,21 @@ mod seams {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(worktree.to_path_buf(), Box::new(hook));
+    }
+
+    /// Run `hook` once, right after the re-validation's first identity
+    /// check of `worktree` (canonical) passed.
+    pub(super) fn arm_after_first_identity(worktree: &Path, hook: impl FnOnce() + Send + 'static) {
+        AFTER_FIRST_IDENTITY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(worktree.to_path_buf(), Box::new(hook));
+    }
+
+    pub(super) fn after_first_identity(worktree: &Path) {
+        if let Some(hook) = take(&AFTER_FIRST_IDENTITY, worktree) {
+            hook();
+        }
     }
 
     /// Run `hook` once, after `worktree`'s removal and before it is
