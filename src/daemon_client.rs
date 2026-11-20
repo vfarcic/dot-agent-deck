@@ -8194,6 +8194,8 @@ mod tests {
                                             reports: Vec::new(),
                                             incomplete: false,
                                             bodies_omitted: 0,
+                                            reports_from: 0,
+                                            next_reports_from: None,
                                         },
                                     ),
                                     ..AttachResponse::ok()

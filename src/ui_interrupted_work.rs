@@ -75,7 +75,7 @@ pub(super) enum View {
     /// One item's details. `asked`: its kept reports' text was asked for.
     Details {
         id: String,
-        show: Option<InterruptedShow>,
+        show: Option<Box<InterruptedShow>>,
         asked: bool,
         scroll: usize,
     },
@@ -391,7 +391,7 @@ pub(super) fn apply(ui: &mut UiState, answer: Answer) {
                 && *open == id
             {
                 match result {
-                    Ok(Some(shown)) => *show = Some(shown),
+                    Ok(Some(shown)) => *show = Some(Box::new(shown)),
                     Ok(None) => iw.message = Some(words::UNSUPPORTED.to_string()),
                     Err(message) => iw.message = Some(message),
                 }
@@ -1202,7 +1202,7 @@ pub(super) fn render_overlay(
         } => {
             let item = show.as_ref().map(|s| &s.item).or_else(|| iw.item(id));
             let body = item
-                .map(|item| details_body(item, show.as_ref(), *asked, width))
+                .map(|item| details_body(item, show.as_deref(), *asked, width))
                 .unwrap_or_default();
             (body, None, None)
         }

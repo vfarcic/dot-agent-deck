@@ -267,7 +267,7 @@ pub async fn show(
                 return Err(crate::interrupted_work::REFUSED_AMBIGUOUS.to_string());
             }
         };
-        let bodies = shown_bodies(&item, report.as_deref())?;
+        let bodies = shown_bodies_page(&item, report.as_deref(), None)?;
         Ok(fit_show(
             item,
             &bodies,
@@ -297,6 +297,16 @@ fn shown_bodies(item: &InterruptedItem, report: Option<&str>) -> Result<Vec<Stri
             .map(|r| r.report_id.clone())
             .collect()),
     }
+}
+
+/// [`shown_bodies`] for one page of the item's reports. Not yet paged.
+fn shown_bodies_page(
+    item: &InterruptedItem,
+    report: Option<&str>,
+    page: Option<usize>,
+) -> Result<Vec<String>, String> {
+    let _ = page;
+    shown_bodies(item, report)
 }
 
 /// One report's body, from the file the list joined it to: one not yet

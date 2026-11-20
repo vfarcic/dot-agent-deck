@@ -222,6 +222,15 @@ pub struct InterruptedShow {
     /// id.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub bodies_omitted: usize,
+    /// The index, among all of the item's kept reports, of the first report
+    /// entry [`InterruptedItem::reports`] carries here: the page asked for
+    /// with `reports_from` ([`fit_show_page`]); `0` for the first page.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub reports_from: usize,
+    /// Where the next page of the item's kept reports starts, to ask for it
+    /// with `reports_from`; `None` when this answer reaches the last one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_reports_from: Option<usize>,
 }
 
 /// One kept report's body, for showing.
@@ -1185,6 +1194,8 @@ pub fn fit_show(
         reports: Vec::new(),
         incomplete,
         bodies_omitted: 0,
+        reports_from: 0,
+        next_reports_from: None,
     };
     let mut used = json_len(&InterruptedShow {
         bodies_omitted: bodies.len(),
@@ -1201,6 +1212,19 @@ pub fn fit_show(
         show.reports.push(shown);
     }
     show
+}
+
+/// [`fit_show`] for one page of the item's kept reports. Not yet paged.
+pub fn fit_show_page(
+    item: InterruptedItem,
+    page: Option<usize>,
+    bodies: &[String],
+    incomplete: bool,
+    budget: usize,
+    read: impl FnMut(&str) -> ShownReport,
+) -> InterruptedShow {
+    let _ = page;
+    fit_show(item, bodies, incomplete, budget, read)
 }
 
 /// The resolved directory of `workspace`: the first of `cwds` (absolute

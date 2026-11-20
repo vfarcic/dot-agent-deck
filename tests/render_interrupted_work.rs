@@ -278,6 +278,8 @@ fn interrupted_010_details_show_every_field_and_kept_reports() {
         }],
         incomplete: false,
         bodies_omitted: 0,
+        reports_from: 0,
+        next_reports_from: None,
     };
     let shown = frames(
         &only(unit()),
@@ -473,5 +475,140 @@ fn interrupted_013_the_restart_notice_leads_to_the_list() {
         shown[1].contains(INTERRUPTED_WORK_TITLE) && shown[1].contains("fix-login"),
         "`I` opens the interrupted work list:\n{}",
         shown[1]
+    );
+}
+
+fn report(n: usize) -> ItemReport {
+    ItemReport {
+        report_id: format!("r-{n}"),
+        task_id: None,
+        unit_id: None,
+        kept_until_ms: Some(KEPT_TS),
+    }
+}
+
+/// The unit holding reports `first..=last` of `total`, as a show page that
+/// starts at `first - 1`, with the body of `body_of` only.
+fn page(first: usize, last: usize, total: usize, body_of: Option<usize>) -> InterruptedShow {
+    let mut item = unit();
+    item.reports = (first..=last).map(report).collect();
+    item.reports_omitted = total - item.reports.len();
+    InterruptedShow {
+        item,
+        reports: body_of
+            .map(|n| ShownReport {
+                report_id: format!("r-{n}"),
+                body: Some(format!("[UNTRUSTED-WORKER-REPORT:\nBODY OF r-{n}\n")),
+                cut: false,
+                error: None,
+            })
+            .into_iter()
+            .collect(),
+        incomplete: false,
+        bodies_omitted: 0,
+        reports_from: first - 1,
+        next_reports_from: (last < total).then_some(last),
+    }
+}
+
+/// Scenario: A unit kept eight reports, more than its list entry carries
+/// (three, and "5 more reports are kept"). In its details `Enter` shows the
+/// first page of reports, "Reports 1 to 3 of 8.", and offers `n` for the
+/// next ones; `n` shows "Reports 4 to 6 of 8." with a report's text; a page
+/// the TUI did not ask for is not shown; `n` again reaches the last page,
+/// which offers no next one, and `p` goes back to the first.
+#[spec("journal/interrupted/016")]
+#[test]
+fn interrupted_016_details_page_through_every_kept_report() {
+    let mut listed = unit();
+    listed.reports = (1..=3).map(report).collect();
+    listed.reports_omitted = 5;
+    let shown = frames(
+        &only(listed),
+        &[
+            ch('I'),
+            key(KeyCode::Enter),
+            key(KeyCode::Enter),
+            InterruptedSeamStep::Shown(page(1, 3, 8, Some(1))),
+            ch('n'),
+            InterruptedSeamStep::Shown(page(4, 6, 8, Some(5))),
+            InterruptedSeamStep::Shown(page(7, 8, 8, None)),
+            ch('n'),
+            InterruptedSeamStep::Shown(page(7, 8, 8, None)),
+            ch('p'),
+            InterruptedSeamStep::Shown(page(1, 3, 8, Some(1))),
+        ],
+    );
+    let details = &shown[2];
+    assert!(
+        details.contains("5 more reports are kept"),
+        "the details count the reports the list left out:\n{details}"
+    );
+    let first = &shown[4];
+    at(first, "Reports 1 to 3 of 8.");
+    at(first, "n next reports");
+    assert!(!first.contains("p previous reports"), "{first}");
+    let second = &shown[6];
+    at(second, "Reports 4 to 6 of 8.");
+    at(second, &format!("{LABEL_REPORT}: r-4"));
+    at(second, "BODY OF r-5");
+    at(second, "p previous reports");
+    let unasked = &shown[7];
+    assert!(
+        unasked.contains("Reports 4 to 6 of 8.") && !unasked.contains("Reports 7 to 8 of 8."),
+        "a page the TUI did not ask for is not shown:\n{unasked}"
+    );
+    let last = &shown[9];
+    at(last, "Reports 7 to 8 of 8.");
+    at(last, &format!("{LABEL_REPORT}: r-8"));
+    assert!(!last.contains("n next reports"), "the last page:\n{last}");
+    let back = &shown[11];
+    at(back, "Reports 1 to 3 of 8.");
+}
+
+/// Scenario: A unit's name, branch, worktree and launcher, and a line of
+/// its report's text, carry Unicode bidi controls (a right-to-left override
+/// a Git branch name may hold). Neither the "Interrupted work" list nor the
+/// unit's details draw one, so nothing on screen is reordered; the text
+/// around them is still shown, and the details show a control escaped
+/// (`\u{202e}`), as the CLI does.
+#[spec("journal/interrupted/017")]
+#[test]
+fn interrupted_017_bidi_controls_from_the_journal_are_not_drawn() {
+    let bidi = |c: char| matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}' | '\u{061C}');
+    let mut evil = unit();
+    evil.name = Some("fix\u{202e}nigol".to_string());
+    evil.branch = Some("agent/\u{202e}txt.exe".to_string());
+    evil.worktree = Some("/home/me/\u{2066}code\u{2069}".to_string());
+    evil.launcher = Some("dispatcher\u{200f}".to_string());
+    let mut show = page(1, 1, 1, None);
+    show.item = evil.clone();
+    show.reports = vec![ShownReport {
+        report_id: REPORT_ID.to_string(),
+        body: Some("[UNTRUSTED-WORKER-REPORT:\nall \u{202e}done\n".to_string()),
+        cut: false,
+        error: None,
+    }];
+    let shown = frames(
+        &only(evil),
+        &[
+            ch('I'),
+            key(KeyCode::Enter),
+            key(KeyCode::Enter),
+            InterruptedSeamStep::Shown(show),
+        ],
+    );
+    for (at_step, frame) in shown.iter().enumerate() {
+        assert!(
+            !frame.chars().any(bidi),
+            "frame {at_step} draws a bidi control:\n{frame:?}"
+        );
+    }
+    assert!(shown[1].contains("nigol"), "{}", shown[1]);
+    assert!(shown[4].contains("done"), "{}", shown[4]);
+    // Shown escaped, as the CLI shows it, so the person sees it is there.
+    at(
+        &shown[2],
+        &format!("{LABEL_BRANCH}: agent/\\u{{202e}}txt.exe"),
     );
 }

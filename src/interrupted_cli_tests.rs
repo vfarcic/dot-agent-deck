@@ -132,6 +132,8 @@ fn show_prints_each_body_as_the_daemon_framed_it() {
         ],
         incomplete: false,
         bodies_omitted: 0,
+        reports_from: 0,
+        next_reports_from: None,
     };
     let text = render_show(&show);
     assert!(
@@ -384,6 +386,8 @@ fn an_item_prints_its_progress_and_how_to_read_reports_not_shown() {
         reports: vec![one],
         incomplete: false,
         bodies_omitted: 0,
+        reports_from: 0,
+        next_reports_from: None,
     };
     let text = render_show(&show);
     assert!(text.contains("seventeen"), "{text}");
@@ -458,6 +462,8 @@ fn bidi_controls_from_the_journal_cannot_reorder_the_text() {
         reports: Vec::new(),
         incomplete: false,
         bodies_omitted: 0,
+        reports_from: 0,
+        next_reports_from: None,
     });
     assert!(!live(&show), "{show:?}");
 
@@ -467,4 +473,55 @@ fn bidi_controls_from_the_journal_cannot_reorder_the_text() {
     reclaimed.nested_worktrees = vec!["/work/\u{202d}inner".into()];
     let out = render_reclaim(&reclaimed);
     assert!(!live(&out.stdout) && !live(&out.stderr), "{out:?}");
+}
+
+/// Reviewer 1: an item whose kept reports go past what the answer carries
+/// says how to list the next ones (`--reports-from`), and a show of a page
+/// says which reports it holds and where the next page starts.
+#[test]
+fn an_item_with_more_reports_points_at_the_next_page() {
+    let mut unit = item(UNIT_ID, ItemKind::Unit, "a");
+    for n in 1..=16 {
+        unit.reports.push(ItemReport {
+            report_id: format!("r-{n}"),
+            task_id: None,
+            unit_id: None,
+            kept_until_ms: None,
+        });
+    }
+    unit.reports_omitted = 24;
+    let listed = render_item(&unit);
+    assert!(
+        listed.contains(&format!(
+            "dot-agent-deck interrupted show {UNIT_ID} --reports-from 16"
+        )),
+        "{listed}"
+    );
+
+    let mut paged = unit.clone();
+    paged.reports = (17..=32)
+        .map(|n| ItemReport {
+            report_id: format!("r-{n}"),
+            task_id: None,
+            unit_id: None,
+            kept_until_ms: None,
+        })
+        .collect();
+    let page = InterruptedShow {
+        item: paged,
+        reports: Vec::new(),
+        incomplete: false,
+        bodies_omitted: 0,
+        reports_from: 16,
+        next_reports_from: Some(32),
+    };
+    let text = render_show(&page);
+    assert!(text.contains("Reports 17 to 32 of 40."), "{text}");
+    assert!(
+        text.contains(&format!(
+            "dot-agent-deck interrupted show {UNIT_ID} --reports-from 32"
+        )),
+        "{text}"
+    );
+    assert!(text.contains("Report: r-17,"), "{text}");
 }

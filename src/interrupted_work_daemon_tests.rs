@@ -1216,3 +1216,108 @@ fn reclaim_removes_nothing_when_the_repositorys_worktree_lock_cannot_be_taken() 
         assert!(!wt.exists());
     });
 }
+
+/// Reviewer 1: an item keeps more reports than a list's or a show's report
+/// entries carry. The list carries the first [`MAX_LISTED_REPORTS`] and
+/// says where the next page starts; each show page asked for with
+/// `reports_from` carries the next entries and their bodies and says where
+/// the page after it starts, until the last. Every report is found that
+/// way, and the last one, beyond the list's cap, is then read by its id.
+///
+/// [`MAX_LISTED_REPORTS`]: crate::interrupted_work::MAX_LISTED_REPORTS
+#[test]
+fn show_pages_reach_every_kept_report_beyond_the_metadata_cap() {
+    use crate::interrupted_work::{ItemReport, MAX_LISTED_REPORTS, fit_list, fit_show_page};
+    let total = 40;
+    let mut item = InterruptedItem {
+        id: WorkId::parse("w-abcdefgh-0000000000000001").unwrap(),
+        kind: ItemKind::Unit,
+        name: None,
+        issue: None,
+        repo: None,
+        branch: None,
+        worktree: None,
+        launcher: None,
+        last_entry: crate::interrupted_work::LastEntry {
+            kind: "reported".into(),
+            ts_ms: 1,
+        },
+        reports: Vec::new(),
+        reports_omitted: 0,
+        cut: false,
+        progress: crate::interrupted_work::Progress::default(),
+        git: None,
+    };
+    for n in 1..=total {
+        item.reports.push(ItemReport {
+            report_id: format!("r-{n}"),
+            task_id: None,
+            unit_id: None,
+            kept_until_ms: None,
+        });
+    }
+    let body = |report_id: &str| ShownReport {
+        report_id: report_id.to_string(),
+        body: Some(format!("BODY OF {report_id}")),
+        cut: false,
+        error: None,
+    };
+
+    let mut list = InterruptedList {
+        items: vec![item.clone()],
+        incomplete: false,
+        omitted: 0,
+    };
+    fit_list(&mut list, MAX_REPLY_BYTES, 0);
+    let listed = &list.items[0];
+    assert_eq!(listed.reports.len(), MAX_LISTED_REPORTS);
+    assert_eq!(listed.reports_omitted, total - MAX_LISTED_REPORTS);
+    let mut found: Vec<String> = listed.reports.iter().map(|r| r.report_id.clone()).collect();
+
+    let mut next = Some(listed.reports.len());
+    let mut pages = 0;
+    while let Some(from) = next {
+        pages += 1;
+        assert!(pages <= total, "paging does not end");
+        let bodies = shown_bodies_page(&item, None, Some(from)).unwrap();
+        let page = fit_show_page(
+            item.clone(),
+            Some(from),
+            &bodies,
+            false,
+            MAX_REPLY_BYTES,
+            body,
+        );
+        assert_eq!(page.reports_from, from, "the page starts where asked");
+        assert!(!page.item.reports.is_empty());
+        assert!(page.item.reports.len() <= MAX_SHOWN_REPORTS);
+        assert_eq!(
+            page.reports
+                .iter()
+                .map(|r| &r.report_id)
+                .collect::<Vec<_>>(),
+            page.item
+                .reports
+                .iter()
+                .map(|r| &r.report_id)
+                .collect::<Vec<_>>(),
+            "a page's bodies are its own entries'"
+        );
+        assert_eq!(
+            page.item.reports.len() + page.item.reports_omitted,
+            total,
+            "the rest of the item's reports are counted"
+        );
+        found.extend(page.item.reports.iter().map(|r| r.report_id.clone()));
+        next = page.next_reports_from;
+        if let Some(after) = next {
+            assert_eq!(after, from + page.item.reports.len());
+        }
+    }
+    let all: Vec<String> = (1..=total).map(|n| format!("r-{n}")).collect();
+    assert_eq!(found, all, "every report is found, once, in order");
+
+    let last = shown_bodies(&item, Some("r-40")).unwrap();
+    let shown = fit_show(item.clone(), &last, false, MAX_REPLY_BYTES, body);
+    assert_eq!(shown.reports[0].body.as_deref(), Some("BODY OF r-40"));
+}

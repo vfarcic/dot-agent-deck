@@ -716,6 +716,20 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 - **Does not assert:** a kept verdict from the TUI (`journal/interrupted/004` covers the daemon's).
 - **Platform coverage:** mac+linux.
 
+##### journal/interrupted/016 — The TUI's item details page through every kept report, past the ones the list carries.
+- **Layer:** L1 in-process `TestBackend` + `insta` (`tests/render_interrupted_work.rs`, seam `render_interrupted_work_to_buffers`): the daemon's answers are handed to the TUI where its background request delivers them, and keys go through the production `handle_key_event`.
+- **Agent:** none.
+- **Asserts:** an item listed with three report entries and five more counted says `5 more reports are kept`; `Enter` and the first page show `Reports 1 to 3 of 8.` and the hint `n next reports` but no `p previous reports`; `n` and the next page show `Reports 4 to 6 of 8.`, its first entry and a report's text, and offer `p previous reports`; a page handed in that the TUI did not ask for is not shown; `n` again reaches `Reports 7 to 8 of 8.` with no `n next reports`; `p` returns to `Reports 1 to 3 of 8.`
+- **Does not assert:** the daemon's paging (`interrupted_work_daemon` unit test `show_pages_reach_every_kept_report_beyond_the_metadata_cap`); the CLI's `--reports-from` (`interrupted_cli` unit test `an_item_with_more_reports_points_at_the_next_page`).
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/017 — The TUI draws no Unicode bidi control read from the journal or a report.
+- **Layer:** L1 in-process `TestBackend` + `insta` (`tests/render_interrupted_work.rs`, seam `render_interrupted_work_to_buffers`): the daemon's answers are handed to the TUI where its background request delivers them, and keys go through the production `handle_key_event`.
+- **Agent:** none.
+- **Asserts:** with right-to-left overrides and isolates in an item's name, branch, worktree and launcher and in a line of its report's text, no frame of the list, the details or the shown report draws a bidi control, the text around them is still shown, and the details show the branch's override escaped (`Branch: agent/\u{202e}txt.exe`), as the CLI shows it.
+- **Does not assert:** the CLI (`interrupted_cli` unit test `bidi_controls_from_the_journal_cannot_reorder_the_text`); other invisible format characters.
+- **Platform coverage:** mac+linux.
+
 #### journal/compat
 
 ##### journal/compat/001 — Lines of a newer schema or an unknown kind are skipped and kept.
