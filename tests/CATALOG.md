@@ -660,6 +660,62 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 - **Does not assert:** a partial pane identity (refused before any request, as `close` does).
 - **Platform coverage:** mac+linux.
 
+##### journal/interrupted/008 — The TUI's footer counts the interrupted items and offers `[Show I]` and `[Hide x]`.
+- **Layer:** L1 in-process `TestBackend` + `insta` (`tests/render_interrupted_work.rs`, seam `render_interrupted_work_to_buffers`): the daemon's answers are handed to the TUI where its background request delivers them, and keys go through the production `handle_key_event`.
+- **Agent:** none.
+- **Asserts:** one item reads `1 interrupted item from before the restart`, three read `3 interrupted items from before the restart` (snapshots); the row carries `[Show I]` and `[Hide x]`; an empty list draws no row; `x` hides it.
+- **Does not assert:** the attach and reconnect fetch itself (`journal/interrupted/014`); the desktop surface.
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/009 — The TUI's "Interrupted work" list puts units and orchestrations before "Other agents", and shows the selected row's progress.
+- **Layer:** L1 in-process `TestBackend` + `insta` (`tests/render_interrupted_work.rs`, seam `render_interrupted_work_to_buffers`): the daemon's answers are handed to the TUI where its background request delivers them, and keys go through the production `handle_key_event`.
+- **Agent:** none.
+- **Asserts:** `I` opens the list titled `Interrupted work`; the unit and the orchestration come before the heading `Other agents` and the plain agent after it, although the daemon listed the agent first; rows show the kind label, branch, worktree, launcher and last entry; only the selected row shows its `Progress:` line, and `j` moves it; with the plain agent selected the hints offer no reclaim and `r` changes nothing (D1); `Esc` closes.
+- **Does not assert:** scrolling a list longer than the popup; the incomplete or omitted notes.
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/010 — The TUI's item details show every field and the kept reports with "kept until", and a report's text only on demand, framed as untrusted.
+- **Layer:** L1 in-process `TestBackend` + `insta` (`tests/render_interrupted_work.rs`, seam `render_interrupted_work_to_buffers`): the daemon's answers are handed to the TUI where its background request delivers them, and keys go through the production `handle_key_event`.
+- **Agent:** none.
+- **Asserts:** `Enter` on the unit shows `Branch:`, `Worktree:`, `Started by:`, `Last entry:`, `Progress:` and `Report: <id>, kept until 2026-11-26 10:00 UTC` (snapshot) but not the report's text; `Enter` again and the daemon's show answer display the text between `[UNTRUSTED-WORKER-REPORT:` and `:END-UNTRUSTED-WORKER-REPORT]`; `Esc` goes back to the list; a plain agent's directory is labelled `Folder:`.
+- **Does not assert:** Git facts (shown only when a list carried them); a report that cannot be read.
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/011 — The TUI's reclaim shows the dry-run verdict and the unpushed commits before asking y/n, then the reclaim's sentence.
+- **Layer:** L1 in-process `TestBackend` + `insta` (`tests/render_interrupted_work.rs`, seam `render_interrupted_work_to_buffers`): the daemon's answers are handed to the TUI where its background request delivers them, and keys go through the production `handle_key_event`.
+- **Agent:** none.
+- **Asserts:** `r` on the unit and the dry-run answer show `Reclaim would remove its worktree and keep its branch.`, `remove its worktree, keep its branch`, `2 commits on its branch are on no remote; the branch keeps them.`, the branch and `y/n` (snapshot); `y` and the real answer show `Reclaimed: its worktree was removed and its branch kept.`; the refreshed, empty list removes the footer.
+- **Does not assert:** a kept or refused verdict's confirmation (no `y` offered); the daemon side (`journal/interrupted/003`, `015`).
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/012 — The TUI's `D` asks before dismissing all, and `d` dismisses the selected item.
+- **Layer:** L1 in-process `TestBackend` + `insta` (`tests/render_interrupted_work.rs`, seam `render_interrupted_work_to_buffers`): the daemon's answers are handed to the TUI where its background request delivers them, and keys go through the production `handle_key_event`.
+- **Agent:** none.
+- **Asserts:** `D` shows `Dismiss all: 3 interrupted items from before the restart? [y/N]` (snapshot) and `n` returns to the list; `d` and the daemon's answer show `Dismissed.`, and the refreshed list drops the unit and counts two.
+- **Does not assert:** `y` on dismiss all (the same dismissal path, naming every listed id); refusals.
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/013 — The TUI's restart notice list leads to the interrupted work list with the same key.
+- **Layer:** L1 in-process `TestBackend` + `insta` (`tests/render_interrupted_work.rs`, seam `render_interrupted_work_to_buffers`): the daemon's answers are handed to the TUI where its background request delivers them, and keys go through the production `handle_key_event`.
+- **Agent:** none.
+- **Asserts:** the restart notice's list keeps `The deck restarted; these agents were stopped:` and gains a line with `3 interrupted items from before the restart` and the key `I` (snapshot); `I` there opens `Interrupted work`.
+- **Does not assert:** the notice's footer row (`lifecycle/handshake/013`).
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/014 — A fresh TUI after a restart shows the footer, lists the unit, dismisses it, and stays clear after another restart.
+- **Layer:** L2 PTY/vt100 (`tests/e2e_interrupted_work.rs`): the real binary as a fresh TUI attached to the second `daemon serve` on the same state directory, after a restart that is SIGTERM to the first daemon's own pid.
+- **Agent:** synthetic routing stand-ins: a dispatcher pane and the `--single` unit it dispatches with the real `dot-agent-deck dispatch` CLI.
+- **Asserts:** the footer reads `2 interrupted items from before the restart`; `I` shows `Interrupted work` and the unit's branch; `d` shows `Dismissed.`, the branch leaves the list and the footer reads `1 interrupted item…`; `d` on the pane shows `No interrupted work.` and no footer; the CLI's list is empty; after another restart a fresh TUI shows no footer and its list says `No interrupted work.`
+- **Does not assert:** a TUI that stayed open through the restart (the reconnect fetch); dismiss all.
+- **Platform coverage:** mac+linux.
+
+##### journal/interrupted/015 — Reclaim from the TUI removes a clean, deck-created worktree after a dry-run confirmation and keeps the branch.
+- **Layer:** L2 PTY/vt100 (`tests/e2e_interrupted_work.rs`): the real binary as a fresh TUI attached to the second `daemon serve` on the same state directory, after a restart that is SIGTERM to the first daemon's own pid.
+- **Agent:** synthetic routing stand-ins: a dispatcher pane and the `--single` unit it dispatches with the real `dot-agent-deck dispatch` CLI.
+- **Asserts:** premises: the worktree carries the deck's ownership marker and is clean; `r` shows `Reclaim would remove its worktree and keep its branch.`, `remove its worktree, keep its branch` and `y/n` with the worktree still on disk; `y` shows `Reclaimed: its worktree was removed and its branch kept.` and the footer counts one; the worktree directory is gone, `git branch --list agent/dispatch-<unit>` still shows the branch and the CLI no longer lists the unit.
+- **Does not assert:** a kept verdict from the TUI (`journal/interrupted/004` covers the daemon's).
+- **Platform coverage:** mac+linux.
+
 #### journal/compat
 
 ##### journal/compat/001 — Lines of a newer schema or an unknown kind are skipped and kept.

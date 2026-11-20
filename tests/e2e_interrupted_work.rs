@@ -62,9 +62,10 @@ mod journal;
 mod route;
 
 use dot_agent_deck::interrupted_work::{
-    DISMISSED, INTERRUPTED_WORK_TITLE, KEPT_UNTIL, LABEL_PROGRESS, OTHER_AGENTS_GROUP,
-    RECLAIM_KEPT_DIRTY, RECLAIM_KEPT_HOLDS_WORKTREES, RECLAIM_REMOVED, RECLAIM_WOULD_REMOVE,
-    REFUSED_AGENT_CALLER, REPORT_NOT_OF_ITEM, interrupted_footer,
+    DISMISSED, INTERRUPTED_WORK_TITLE, KEPT_UNTIL, LABEL_PROGRESS, NOTHING_INTERRUPTED,
+    OTHER_AGENTS_GROUP, RECLAIM_EXPLANATION, RECLAIM_KEPT_DIRTY, RECLAIM_KEPT_HOLDS_WORKTREES,
+    RECLAIM_REMOVED, RECLAIM_WOULD_REMOVE, REFUSED_AGENT_CALLER, REPORT_NOT_OF_ITEM,
+    interrupted_footer,
 };
 use inbox::Pane;
 use serde_json::{Value, json};
@@ -229,6 +230,20 @@ impl Decks {
             .stdin(std::process::Stdio::null())
             .output()
             .expect("run the deck CLI as an agent")
+    }
+
+    /// A fresh TUI, the real binary in a PTY, attached to the serving daemon.
+    fn tui(&self) -> common::TuiDeck {
+        common::TuiDeck::builder()
+            .with_env(
+                "DOT_AGENT_DECK_ATTACH_SOCKET",
+                self.live.attach_socket.to_string_lossy().to_string(),
+            )
+            .with_env(
+                "DOT_AGENT_DECK_SOCKET",
+                self.live.hook_socket.to_string_lossy().to_string(),
+            )
+            .launch_with_fixture("minimal")
     }
 
     /// `interrupted list --json --no-git`, which must succeed.
@@ -827,4 +842,112 @@ fn close_verb_015_after_a_restart_close_points_at_the_interrupted_list() {
     let raw = report.to_string();
     assert!(raw.contains("unknown-unit"), "{raw}");
     assert!(raw.contains(HINT), "{raw}");
+}
+
+/// Scenario: A dispatched unit and its dispatcher pane are interrupted by a
+/// restart, and a fresh TUI attaches to the new daemon. Its footer says "2
+/// interrupted items from before the restart"; `I` opens the "Interrupted
+/// work" list naming the unit's branch; `d` dismisses the unit (the footer
+/// then counts one) and `d` again the pane, which empties the list and
+/// removes the footer. After another restart a fresh TUI shows no footer,
+/// and its list, opened with `I`, says there is no interrupted work.
+#[spec("journal/interrupted/014")]
+#[test]
+fn interrupted_014_a_fresh_tui_lists_and_dismisses_interrupted_work() {
+    const UNIT: &str = "interrupted-tui-dismiss";
+    let branch = format!("agent/dispatch-{UNIT}");
+    let mut decks = Decks::start();
+    let caller = decks.pane("interrupted-tui-caller");
+    let unit = decks.dispatch(&caller, UNIT, "--single");
+    decks.journaled(&[&caller, &unit]);
+    decks.restart();
+    drop((caller, unit));
+
+    let deck = decks.tui();
+    deck.wait_for_string(&interrupted_footer(2));
+    deck.send_keys(b"I");
+    deck.wait_until_grid("the list names the unit's branch", |g| {
+        g.contains(INTERRUPTED_WORK_TITLE) && g.contains(&branch)
+    });
+    deck.send_keys(b"d");
+    deck.wait_until_grid("the dismissed unit leaves the list", |g| {
+        g.contains(DISMISSED) && !g.contains(&branch) && g.contains(&interrupted_footer(1))
+    });
+    deck.send_keys(b"d");
+    deck.wait_until_grid("the emptied list removes the footer", |g| {
+        g.contains(NOTHING_INTERRUPTED) && !g.contains("interrupted item")
+    });
+    let after = decks.list();
+    assert!(items(&after).is_empty(), "the TUI dismissed both: {after}");
+    drop(deck);
+
+    decks.restart();
+    let fresh = decks.tui();
+    fresh.wait_for_string("No active agents");
+    fresh.send_keys(b"I");
+    fresh.wait_until_grid("the daemon answered an empty list", |g| {
+        g.contains(INTERRUPTED_WORK_TITLE) && g.contains(NOTHING_INTERRUPTED)
+    });
+    fresh.send_keys(b"\x1b");
+    fresh.wait_until_grid("the list closed", |g| !g.contains(NOTHING_INTERRUPTED));
+    let grid = fresh.snapshot_grid();
+    assert!(
+        !grid.contains("interrupted item"),
+        "dismissed work stays dismissed after a restart, so no footer:\n{grid}"
+    );
+}
+
+/// Scenario: A dispatched unit's clean, deck-created worktree is left by a
+/// restart, and a fresh TUI attaches. In the "Interrupted work" list, `r` on
+/// the unit shows the dry run's verdict ("Reclaim would remove its worktree
+/// and keep its branch.") and what reclaim means, and asks y/n, with the
+/// worktree still on disk; `y` says it was reclaimed, the worktree directory
+/// is gone, the unit's branch is kept and the footer counts only the pane.
+#[spec("journal/interrupted/015")]
+#[test]
+fn interrupted_015_reclaim_from_the_tui_removes_the_worktree_and_keeps_the_branch() {
+    const UNIT: &str = "interrupted-tui-reclaim";
+    let branch = format!("agent/dispatch-{UNIT}");
+    let mut decks = Decks::start();
+    let caller = decks.pane("interrupted-tui-reclaimer");
+    let unit = decks.dispatch(&caller, UNIT, "--single");
+    let worktree = decks.cwd_of(&unit.agent);
+    decks.journaled(&[&caller, &unit]);
+    decks.restart();
+    drop((caller, unit));
+    assert!(
+        dot_agent_deck::worktree_owner::is_marked(&worktree),
+        "premise: the deck marked the worktree it created"
+    );
+    assert_eq!(porcelain(&worktree), "", "premise: the worktree is clean");
+
+    let deck = decks.tui();
+    deck.wait_for_string(&interrupted_footer(2));
+    deck.send_keys(b"I");
+    deck.wait_until_grid("the list names the unit's branch", |g| {
+        g.contains(INTERRUPTED_WORK_TITLE) && g.contains(&branch)
+    });
+    deck.send_keys(b"r");
+    deck.wait_until_grid("the dry run's verdict and the y/n question", |g| {
+        g.contains(RECLAIM_WOULD_REMOVE) && g.contains(RECLAIM_EXPLANATION) && g.contains("y/n")
+    });
+    assert!(worktree.is_dir(), "the dry run removes nothing");
+    deck.send_keys(b"y");
+    deck.wait_until_grid("the reclaim's sentence and the refreshed footer", |g| {
+        g.contains(RECLAIM_REMOVED) && g.contains(&interrupted_footer(1))
+    });
+    assert!(
+        !worktree.exists(),
+        "reclaim removed the worktree {}",
+        worktree.display()
+    );
+    assert!(
+        branch_listed(&decks.repo, &branch),
+        "reclaim keeps the unit's branch"
+    );
+    let after = decks.list();
+    assert!(
+        unit_item(&after, UNIT).is_none(),
+        "a reclaimed item is not listed: {after}"
+    );
 }

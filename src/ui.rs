@@ -29735,6 +29735,38 @@ pub fn render_restart_notice_key_sequence_to_buffers(
     render_restart_notice_agents_key_sequence_to_buffers(&agents, mode, status, keys, width, height)
 }
 
+/// PRD #1790 stage 2 L1 seam: one step of
+/// [`render_interrupted_work_to_buffers`] — a key pressed, or a daemon answer
+/// delivered where the background request would deliver it.
+#[doc(hidden)]
+pub enum InterruptedSeamStep {
+    Key(KeyEvent),
+    Listed(crate::interrupted_work::InterruptedList),
+    Shown(crate::interrupted_work::InterruptedShow),
+    Reclaimed(crate::interrupted_work::ReclaimOutcome),
+    Dismissed(crate::interrupted_work::DismissOutcome),
+}
+
+/// PRD #1790 stage 2 L1 seam: start on an empty dashboard in `mode` whose
+/// attach fetch answered `list`, with a restart notice naming `notice` (none
+/// when empty), apply `steps` one at a time and draw each frame with the
+/// production [`render_frame`]. Returns the frame before the first step and
+/// one after each.
+///
+/// RED stub: draws nothing yet.
+#[doc(hidden)]
+pub fn render_interrupted_work_to_buffers(
+    list: &crate::interrupted_work::InterruptedList,
+    notice: &[&str],
+    mode: UiMode,
+    steps: &[InterruptedSeamStep],
+    width: u16,
+    height: u16,
+) -> Vec<ratatui::buffer::Buffer> {
+    let _ = (list, notice, mode);
+    vec![ratatui::buffer::Buffer::empty(Rect::new(0, 0, width, height)); steps.len() + 1]
+}
+
 /// [`render_restart_notice_key_sequence_to_buffers`] for a notice naming
 /// `agents`, each with its role and orchestration (PRD #1666 part 2, G-fix7e).
 #[doc(hidden)]
