@@ -270,7 +270,9 @@ impl Fixture {
     /// [`Self::with_env`] with `files` (paths relative to the daemon's HOME,
     /// which is also the pane's HOME and working directory, and contents)
     /// written before the first spawn, so the spawn's key-binding baseline
-    /// reads them.
+    /// reads them. A file the fixture already wrote, the Codex home's
+    /// `config.toml` holding the seeded hook trust, is appended to, so the
+    /// trust stays.
     pub fn with_home_files(
         kind: &'static str,
         extra: &[(&str, &str)],
@@ -644,7 +646,12 @@ impl Fixture {
         for (path, contents) in files {
             let path = f.daemon.home.join(path);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(&path, contents).unwrap();
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .unwrap();
+            std::io::Write::write_all(&mut file, contents.as_bytes()).unwrap();
         }
         f.spawn("first", false);
         f

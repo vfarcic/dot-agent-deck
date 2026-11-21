@@ -148,9 +148,11 @@ pub enum Hold {
     /// MEDIUM-B): a probe would open another editor in the person's pane.
     Editor,
     /// Codex's home lies inside a folder Codex's sandbox may write to (the
-    /// cwd, other than `<cwd>/.codex` itself, `/tmp` or `$TMPDIR`), or one
-    /// of those can't be resolved ([`codex_home_checkable`]): Codex would
-    /// write the box's file somewhere the deck doesn't read.
+    /// cwd or a root the launch adds with `writable_roots` or `--add-dir`,
+    /// other than that folder's own `.codex`, `/tmp` or `$TMPDIR`), or one
+    /// of those can't be resolved or read ([`codex_home_checkable`],
+    /// [`codex_writable_roots`]): Codex would write the box's file somewhere
+    /// the deck doesn't read.
     CodexHome,
     /// Codex's status line, on the frame the check would be admitted on,
     /// doesn't show the directory its session works in in a shape the deck
@@ -2323,36 +2325,57 @@ pub fn codex_dotenv_guard(read: &SourceRead) -> Result<(), Hold> {
 
 /// Whether a Codex whose home is `home` (`$CODEX_HOME`, else `~/.codex`, as
 /// the bound native's own environment names it: [`codex_home`]), started in
-/// `cwd` with `tmpdir` its `TMPDIR`, can be checked at all (the user's
-/// ruling Q227b on the revcxact review's STOP-1 follow-up). Codex 0.164.0
-/// hands its editor a file in the first of `$CODEX_HOME`, `~/.codex` and
-/// `<cwd>/.codex` its own sandbox can't write, and the deck reads only
-/// `$CODEX_HOME/editor`. Under `workspace-write` the cwd, `/tmp` and
-/// `$TMPDIR` are writable, a project's own top-level `.codex` is kept
-/// read-only, so a home under any of them (other than `<cwd>/.codex`
-/// itself) sends the file elsewhere: the helper is refused the file's
-/// shape, exits 1, and Codex draws `Failed to open editor` at each check.
-/// This holds such a generation before any check, so no key is typed and
-/// no helper runs.
+/// `cwd` with `tmpdir` its `TMPDIR` and `roots` the folders its launch adds
+/// to what its sandbox may write ([`codex_writable_roots`]), can be checked
+/// at all (the user's ruling Q227b on the revcxact review's STOP-1
+/// follow-up, issue #2127). Codex hands its editor a file in the first of
+/// `$CODEX_HOME`, `~/.codex` and `<cwd>/.codex` its own sandbox can't
+/// write, and the deck reads only `$CODEX_HOME/editor`. Under
+/// `workspace-write` the cwd, each added root, `/tmp` and `$TMPDIR` are
+/// writable, and a root's own top-level `.codex` is kept read-only (for an
+/// added root, when it exists, as a home that resolves does), so a home
+/// under any of them, other than a root's `.codex` itself, sends the file
+/// elsewhere: the helper is refused the file's shape, exits 1, and Codex
+/// draws `Failed to open editor` at each check. This holds such a
+/// generation before any check, so no key is typed and no helper runs.
+/// Measured on Codex 0.164.0 (`--add-dir`, absolute and relative,
+/// `writable_roots` in `config.toml` and in `-c`, an added root's own
+/// `.codex`): `docs/develop/doorbell-admission.md`, the Codex activation's
+/// item 8.
 ///
 /// Paths are compared resolved (`canonicalize`, symlinks followed): a home
-/// reached through a symlink is judged where it lands. Any of them that
-/// can't be resolved, `TMPDIR` set but empty or relative included, holds.
-/// It accepts no new path: a home outside all three is still read only as
-/// `$CODEX_HOME/editor` by the export rule. What it doesn't see: Codex's
-/// `writable_roots`, `--add-dir` and sandbox mode (a home it holds can be
-/// one Codex's sandbox wouldn't write, under `read-only` or
-/// `danger-full-access`), which can only hold more or leave the case as it
-/// was.
+/// reached through a symlink is judged where it lands. The home, the cwd,
+/// `/tmp` or a `TMPDIR` that can't be resolved, `TMPDIR` set but empty or
+/// relative included, holds. An added root that doesn't exist can't hold
+/// an existing home and is passed over; one that exists and can't be
+/// resolved holds. It accepts no new path: a home outside all of them is
+/// still read only as `$CODEX_HOME/editor` by the export rule. What it
+/// doesn't see: Codex's sandbox mode (a home it holds can be one Codex's
+/// sandbox wouldn't write, under `read-only` or `danger-full-access`, or
+/// under `/tmp` with `exclude_slash_tmp`), its read-only carve-outs other
+/// than `.codex`, and a permissions profile (`default_permissions`), which
+/// can only hold more or leave the case as it was.
 pub fn codex_home_checkable(
     home: &Path,
     cwd: &Path,
     tmpdir: Option<&std::ffi::OsStr>,
+    roots: &[PathBuf],
 ) -> Result<(), Hold> {
     let resolve = |path: &Path| std::fs::canonicalize(path).map_err(|_| Hold::CodexHome);
     let home = resolve(home)?;
-    let cwd = resolve(cwd)?;
-    if home.starts_with(&cwd) && home != cwd.join(".codex") {
+    let editor = home.join(super::path_rule::CODEX_EDITOR_DIR);
+    let mut writable = vec![resolve(cwd)?];
+    for root in roots {
+        match std::fs::canonicalize(root) {
+            Ok(root) => writable.push(root),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(Hold::CodexHome),
+        }
+    }
+    // A root inside the home's `editor` makes Codex skip the home as well.
+    if writable.iter().any(|root| {
+        (home.starts_with(root) && home != root.join(".codex")) || root.starts_with(&editor)
+    }) {
         return Err(Hold::CodexHome);
     }
     let mut temporary = vec![resolve(Path::new("/tmp"))?];
@@ -2369,6 +2392,124 @@ pub fn codex_home_checkable(
     Ok(())
 }
 
+/// The folders a Codex launch adds to what its sandbox may write, for
+/// [`codex_home_checkable`] (issue #2127): every
+/// `sandbox_workspace_write.writable_roots` in the launch's sources as the
+/// spawn read them (`read`, with their paths in `sources`) and in each
+/// `-c` of `args` (the bound agent's arguments after the program, so a
+/// launcher's own `-c` counts), and each `--add-dir` of `args`.
+///
+/// A union, not Codex's merge: a root one layer sets and a later one
+/// replaces is still held, which can only hold more. A path is taken as
+/// Codex resolves it, and where the deck can't tell which base Codex uses,
+/// under each it might: `~` and `~/…` from `home` (the bound agent's
+/// `HOME`; none to resolve them with holds), a relative path both under
+/// `cwd` and under the folder of the file that names it. A source that
+/// can't be read or parsed, a `writable_roots` that isn't a list of
+/// strings, and a `--add-dir` that isn't UTF-8 or is missing its value
+/// hold. A `writable_roots` under another table (a legacy
+/// `[profiles.<name>]`) is read too.
+pub fn codex_writable_roots(
+    sources: &CodexSources,
+    read: &CodexRead,
+    args: &[OsString],
+    cwd: &Path,
+    home: Option<&Path>,
+) -> Result<Vec<PathBuf>, Hold> {
+    let mut roots = Vec::new();
+    let mut add = |path: &str, base: Option<&Path>| -> Result<(), Hold> {
+        let path = if path == "~" {
+            home.ok_or(Hold::CodexHome)?.to_path_buf()
+        } else if let Some(rest) = path.strip_prefix("~/") {
+            home.ok_or(Hold::CodexHome)?
+                .join(rest.trim_start_matches('/'))
+        } else {
+            PathBuf::from(path)
+        };
+        if path.is_absolute() {
+            roots.push(path);
+        } else {
+            roots.push(cwd.join(&path));
+            if let Some(base) = base {
+                roots.push(base.join(&path));
+            }
+        }
+        Ok(())
+    };
+    let files = std::iter::once((&sources.config, &read.config))
+        .chain(sources.profile.iter().zip(read.profile.iter()))
+        .chain(sources.projects.iter().zip(read.projects.iter()));
+    for (path, source) in files {
+        let table = match source {
+            SourceRead::Absent => continue,
+            SourceRead::Unreadable(why) => return Err(Hold::Unreadable(*why)),
+            SourceRead::Present { contents, .. } => std::str::from_utf8(contents)
+                .map_err(|_| Hold::Unparsable)?
+                .parse::<toml::Table>()
+                .map_err(|_| Hold::Unparsable)?,
+        };
+        for root in writable_roots_in(&table)? {
+            add(root, path.parent())?;
+        }
+    }
+    // The `-c` values, read as `CodexSources` reads them for the key
+    // bindings; the home it is given names only files this doesn't read.
+    for value in CodexSources::from_launch(cwd, args, Vec::new())?.overrides {
+        for root in writable_roots_in(&override_table(&value)?)? {
+            add(root, None)?;
+        }
+    }
+    let mut words = args.iter();
+    while let Some(arg) = words.next() {
+        let Some(arg) = arg.to_str() else {
+            if arg.to_string_lossy().starts_with("--add-dir") {
+                return Err(Hold::Unparsable);
+            }
+            continue;
+        };
+        if arg == "--" {
+            break;
+        }
+        if arg == "--add-dir" {
+            let value = words
+                .next()
+                .and_then(|v| v.to_str())
+                .ok_or(Hold::Unparsable)?;
+            add(value, None)?;
+        } else if let Some(value) = arg.strip_prefix("--add-dir=") {
+            add(value, None)?;
+        }
+    }
+    Ok(roots)
+}
+
+/// Every `writable_roots` list under a `sandbox_workspace_write` table in
+/// `table`, at any depth; one that isn't a list of strings, or a
+/// `sandbox_workspace_write` that isn't a table, holds as
+/// [`Hold::Unparsable`].
+fn writable_roots_in(table: &toml::Table) -> Result<Vec<&str>, Hold> {
+    let mut found = Vec::new();
+    for (key, value) in table {
+        let toml::Value::Table(inner) = value else {
+            if key == "sandbox_workspace_write" {
+                return Err(Hold::Unparsable);
+            }
+            continue;
+        };
+        if key == "sandbox_workspace_write"
+            && let Some(roots) = inner.get("writable_roots")
+        {
+            let toml::Value::Array(roots) = roots else {
+                return Err(Hold::Unparsable);
+            };
+            for root in roots {
+                found.push(root.as_str().ok_or(Hold::Unparsable)?);
+            }
+        }
+        found.extend(writable_roots_in(inner)?);
+    }
+    Ok(found)
+}
 /// [`codex_editor_is_helper`] for Claude Code, with its selection
 /// (`EditorSelection::ClaudeCode`, M22, M23): a non-empty `VISUAL`, else a
 /// non-empty `EDITOR`, else the first of `code`, `vi` and `nano` on `PATH`,

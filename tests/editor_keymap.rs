@@ -2413,7 +2413,7 @@ fn probe_097_an_agent_whose_helper_reads_another_generation_is_held() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// Scenario: Lay out Codex homes, working folders and temporary directories on disk and ask whether such a Codex can be checked at all (the user's ruling Q227b). A home outside the working folder, the working folder's own `.codex`, and a home reached through a symlink that lands outside are checkable; a home inside the working folder (or the folder itself), one whose symlink lands inside it, one under `$TMPDIR` or `/tmp`, and anything that can't be resolved (a missing home, an empty, relative or missing `TMPDIR`) are held `CodexHome`.
+/// Scenario: Lay out Codex homes, working folders, temporary directories and folders a launch adds to what Codex may write on disk, and ask whether such a Codex can be checked at all (the user's ruling Q227b, issue #2127). A home outside the working folder and every added folder, the working folder's own `.codex`, an added folder's own `.codex`, a home reached through a symlink that lands outside, and an added folder that doesn't exist are checkable; a home inside the working folder (or the folder itself), inside an added folder (or that folder itself, or reached through a symlinked one), one whose symlink lands inside either, one with an added folder inside its `editor`, one under `$TMPDIR` or `/tmp`, and anything that can't be resolved (a missing home, an empty, relative or missing `TMPDIR`) are held `CodexHome`.
 #[spec("inbox/probe/098")]
 #[test]
 fn probe_098_a_codex_home_inside_a_folder_codex_may_write_is_held() {
@@ -2455,9 +2455,73 @@ fn probe_098_a_codex_home_inside_a_folder_codex_may_write_is_held() {
         .tempdir_in("/tmp")
         .unwrap();
     let missing = root.join("missing");
+    let added = mk(&root.join("added"));
+    let in_added = mk(&added.join("codexhome"));
+    let added_own = mk(&added.join(".codex"));
+    let added_link = root.join("added-link");
+    std::os::unix::fs::symlink(&added, &added_link).unwrap();
+    let into_added = root.join("into-added");
+    std::os::unix::fs::symlink(&in_added, &into_added).unwrap();
+    let in_editor = mk(&outside.join("editor/sub"));
 
     let held = Err(Hold::CodexHome);
     let mut wrong = Vec::new();
+    for (row, home, roots, want) in [
+        (
+            "a home outside the added folder",
+            &outside,
+            vec![added.clone()],
+            Ok(()),
+        ),
+        (
+            "the added folder's own .codex",
+            &added_own,
+            vec![added.clone()],
+            Ok(()),
+        ),
+        (
+            "an added folder that doesn't exist",
+            &outside,
+            vec![missing.clone()],
+            Ok(()),
+        ),
+        (
+            "a home inside the added folder",
+            &in_added,
+            vec![added.clone()],
+            held,
+        ),
+        ("the added folder itself", &added, vec![added.clone()], held),
+        (
+            "a home inside a symlinked added folder",
+            &in_added,
+            vec![added_link.clone()],
+            held,
+        ),
+        (
+            "a symlinked home landing in the added folder",
+            &into_added,
+            vec![added.clone()],
+            held,
+        ),
+        (
+            "an added folder inside the home's editor",
+            &outside,
+            vec![in_editor.clone()],
+            held,
+        ),
+        (
+            "a home inside the second added folder",
+            &in_added,
+            vec![elsewhere.clone(), added.clone()],
+            held,
+        ),
+    ] {
+        let got = codex_home_checkable(home, &project, None, &roots);
+        if got != want {
+            wrong.push(format!("{row}: {got:?}, want {want:?}"));
+        }
+    }
     for (row, home, cwd, tmpdir, want) in [
         (
             "a home outside the project",
@@ -2527,14 +2591,147 @@ fn probe_098_a_codex_home_inside_a_folder_codex_may_write_is_held() {
             held,
         ),
     ] {
-        let got = codex_home_checkable(home, cwd, tmpdir);
+        let got = codex_home_checkable(home, cwd, tmpdir, &[]);
         if got != want {
             wrong.push(format!("{row}: {got:?}, want {want:?}"));
         }
     }
-    let got = codex_home_checkable(in_slash_tmp.path(), &project, None);
+    let got = codex_home_checkable(in_slash_tmp.path(), &project, None, &[]);
     if got != held {
         wrong.push(format!("a home under /tmp: {got:?}"));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Scenario: Read the folders a Codex launch adds to what its sandbox may write, as the deck does before it checks the box (issue #2127): `writable_roots` under `sandbox_workspace_write` in `config.toml`, a profile file, a project file and a `-c` (as a dotted key or as a table), and each `--add-dir` in its separate and `=` forms, a relative one under the working folder and, from a file, under that file's folder too, and `~` from `HOME`. A root set in one layer and replaced in a later one still counts, nothing after `--` does, and a `writable_roots` that isn't a list of strings, a `--add-dir` with no value, a `~` with no `HOME` and a file that can't be parsed hold.
+#[spec("inbox/probe/098")]
+#[test]
+fn probe_098_the_roots_a_codex_launch_adds_are_read_from_every_source() {
+    use dot_agent_deck::composer_probe::keymap::{CodexBaseline, codex_writable_roots};
+    let dir = test_temp::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let codex_home = home.join(".codex");
+    let cwd = dir.path().join("repo");
+    for d in [&codex_home, &cwd.join(".codex")] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    std::fs::write(
+        codex_home.join("config.toml"),
+        "[sandbox_workspace_write]\nwritable_roots = [\"/from/config\", \"rel\"]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        codex_home.join("work.config.toml"),
+        "sandbox_workspace_write = { writable_roots = [\"~/from-profile\"] }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        cwd.join(".codex/config.toml"),
+        "[sandbox_workspace_write]\nwritable_roots = [\"/from/project\"]\n",
+    )
+    .unwrap();
+    let launch = args(&[
+        "-p",
+        "work",
+        "-c",
+        "sandbox_workspace_write.writable_roots=[\"/from/c\"]",
+        "--config=sandbox_workspace_write={writable_roots=[\"/from/table\"]}",
+        "--add-dir",
+        "/from/add-dir",
+        "--add-dir=../sibling",
+        "--",
+        "--add-dir",
+        "/after/dashes",
+    ]);
+    let baseline = CodexBaseline::at_spawn(&codex_home, &launch, &cwd).unwrap();
+    let roots = codex_writable_roots(
+        &baseline.sources,
+        &baseline.read,
+        &launch,
+        &cwd,
+        Some(&home),
+    )
+    .unwrap();
+    let want: Vec<PathBuf> = vec![
+        "/from/config".into(),
+        cwd.join("rel"),
+        codex_home.join("rel"),
+        home.join("from-profile"),
+        "/from/project".into(),
+        "/from/c".into(),
+        "/from/table".into(),
+        "/from/add-dir".into(),
+        cwd.join("../sibling"),
+    ];
+    let mut got = roots.clone();
+    got.sort();
+    let mut sorted = want.clone();
+    sorted.sort();
+    assert_eq!(got, sorted, "every source's roots, and nothing after --");
+
+    std::fs::remove_file(cwd.join(".codex/config.toml")).unwrap();
+    let held = |launch: &[&str], config: &str, user_home: Option<&Path>| {
+        std::fs::write(codex_home.join("config.toml"), config).unwrap();
+        let launch = args(launch);
+        let baseline = CodexBaseline::at_spawn(&codex_home, &launch, &cwd).unwrap();
+        codex_writable_roots(&baseline.sources, &baseline.read, &launch, &cwd, user_home)
+    };
+    let mut wrong = Vec::new();
+    for (row, launch, config, user_home, want) in [
+        (
+            "a root replaced in a later layer still counts",
+            vec!["-c", "sandbox_workspace_write.writable_roots=[]"],
+            "[sandbox_workspace_write]\nwritable_roots = [\"/kept\"]\n",
+            Some(home.as_path()),
+            Ok(vec![PathBuf::from("/kept")]),
+        ),
+        (
+            "a writable_roots that is a string",
+            vec![],
+            "[sandbox_workspace_write]\nwritable_roots = \"/one\"\n",
+            Some(home.as_path()),
+            Err(Hold::Unparsable),
+        ),
+        (
+            "a writable_roots holding a number",
+            vec![],
+            "[sandbox_workspace_write]\nwritable_roots = [1]\n",
+            Some(home.as_path()),
+            Err(Hold::Unparsable),
+        ),
+        (
+            "a sandbox_workspace_write that isn't a table",
+            vec!["-c", "sandbox_workspace_write=1"],
+            "",
+            Some(home.as_path()),
+            Err(Hold::Unparsable),
+        ),
+        (
+            "a --add-dir with no value",
+            vec!["--add-dir"],
+            "",
+            Some(home.as_path()),
+            Err(Hold::Unparsable),
+        ),
+        (
+            "a ~ with no HOME",
+            vec!["--add-dir", "~/x"],
+            "",
+            None,
+            Err(Hold::CodexHome),
+        ),
+        (
+            "a config.toml that can't be parsed",
+            vec![],
+            "[sandbox_workspace_write\n",
+            Some(home.as_path()),
+            Err(Hold::Unparsable),
+        ),
+    ] {
+        let got = held(&launch, config, user_home);
+        if got != want {
+            wrong.push(format!("{row}: {got:?}, want {want:?}"));
+        }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
