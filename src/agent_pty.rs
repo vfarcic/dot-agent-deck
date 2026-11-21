@@ -4554,6 +4554,19 @@ pub struct AgentRecord {
     /// Additive and optional, as [`Self::input_held`] is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_discarded: Option<crate::inbox_display::InputDiscarded>,
+    /// PRD #2119: whether [`Self::cwd`] holds a `.dot-agent-deck.toml` of its
+    /// own — a regular file or a symbolic link (a dangling one included) at
+    /// that exact directory, not one a walk up the tree would discover, and
+    /// not a directory of that name ([`crate::config_gen::existing_config`]).
+    /// Stamped at the wire boundary by [`attach_project_config_exists`], off
+    /// the async runtime and bounded, so each listing reads the disk as it is
+    /// then. `None` when the record has no cwd, when the check did not finish
+    /// in time or could not tell (a lookup error other than "not found"), or
+    /// from a daemon predating the field: clients then keep
+    /// today's Generate wording. Additive and optional, so no
+    /// `PROTOCOL_VERSION` bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_config_exists: Option<bool>,
 }
 
 impl AgentRecord {
@@ -4605,6 +4618,45 @@ pub fn attach_prompt_keys(records: &mut [AgentRecord]) {
         record.prompt_keys = record
             .reported_agent_type()
             .and_then(|agent_type| crate::agent_registry::spec(agent_type).prompt_keys.clone());
+    }
+}
+
+/// PRD #2119: stamp each record's [`AgentRecord::project_config_exists`] from
+/// the disk now. Unconditional: a record without a cwd reports unknown rather
+/// than keeping what a caller had put there.
+///
+/// The checks run off the async runtime, one per distinct directory, behind
+/// the config checks' own bound and [`crate::config_gen::CONFIG_CHECK_TIMEOUT`]
+/// ([`crate::config_gen::project_config_flags`]). A directory whose check did
+/// not finish in time, an unavailable mount for instance, or still has one
+/// outstanding from an earlier listing, reports unknown for this listing
+/// rather than holding the reply. Call it holding no registry or `AppState`
+/// lock.
+pub async fn attach_project_config_exists(records: &mut [AgentRecord]) {
+    attach_project_config_flags(records, crate::config_gen::project_config_flags).await;
+}
+
+/// [`attach_project_config_exists`] with the batch check passed in, so a test
+/// can bound it differently.
+pub(crate) async fn attach_project_config_flags<F, Fut>(records: &mut [AgentRecord], check: F)
+where
+    F: FnOnce(Vec<String>) -> Fut,
+    Fut: std::future::Future<Output = Vec<Option<bool>>>,
+{
+    let mut dirs: Vec<String> = records.iter().filter_map(|r| r.cwd.clone()).collect();
+    dirs.sort();
+    dirs.dedup();
+    let flags = check(dirs.clone()).await;
+    let answers: std::collections::HashMap<String, Option<bool>> = if flags.len() == dirs.len() {
+        dirs.into_iter().zip(flags).collect()
+    } else {
+        std::collections::HashMap::new()
+    };
+    for record in records {
+        record.project_config_exists = record
+            .cwd
+            .as_deref()
+            .and_then(|cwd| answers.get(cwd).copied().flatten());
     }
 }
 
@@ -10343,6 +10395,12 @@ struct RegistryInner {
     /// deletion. A list rather than a set so two holds on one directory each
     /// release only their own entry. See [`DirRemovalHold`].
     removal_holds: Vec<PathBuf>,
+    /// PRD #468: directories a `dispatch --dir` is checking and starting a
+    /// unit in, from before its interlock check until its spawn returns. Each
+    /// counts as in use ([`AgentPtyRegistry::dir_in_use`]), so a removal does
+    /// not take one while the unit is starting there, and a second `--dir`
+    /// dispatch into one is refused. See [`DispatchDirHold`].
+    dispatch_dir_holds: Vec<PathBuf>,
     /// PRD #1589 D4: orchestration instances a `close` is taking down. While an
     /// instance is here, [`AgentPtyRegistry::reserve_spawn`] refuses any spawn
     /// whose membership names it and the publish step refuses one that reserved
@@ -10589,6 +10647,38 @@ impl Drop for DirRemovalHold<'_> {
             inner.removal_holds.swap_remove(at);
         }
     }
+}
+
+/// PRD #468: RAII holder for a [`RegistryInner::dispatch_dir_holds`] entry,
+/// taken by [`AgentPtyRegistry::hold_dir_for_dispatch`] and released on every
+/// exit from the dispatch, a cancelled one included.
+pub struct DispatchDirHold {
+    registry: Arc<AgentPtyRegistry>,
+    dir: PathBuf,
+}
+
+impl Drop for DispatchDirHold {
+    fn drop(&mut self) {
+        // A poisoned lock leaves the hold behind, which keeps one directory
+        // counted as in use: the fail-safe direction for a deletion guard.
+        if let Some(mut inner) = self
+            .registry
+            .inner
+            .lock_in_drop(crate::lock_rank::OnPoison::Skip)
+            && let Some(at) = inner.dispatch_dir_holds.iter().position(|d| *d == self.dir)
+        {
+            inner.dispatch_dir_holds.swap_remove(at);
+        }
+    }
+}
+
+/// PRD #468: why [`AgentPtyRegistry::hold_dir_for_dispatch`] refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DispatchDirRefusal {
+    /// Another `dispatch --dir` holds this directory.
+    AlreadyHeld,
+    /// A removal holds this directory, or one it lies inside (named).
+    BeingRemoved(PathBuf),
 }
 
 /// PRD #1589 test seam: a child that has already exited and needs nothing to
@@ -10865,6 +10955,13 @@ pub struct DeliveryNotice {
     /// after all, so the card's not-delivered `Error` is lifted
     /// ([`crate::event::DELIVERY_NOTICE_CLEARED_METADATA_KEY`]).
     pub cleared: bool,
+    /// Issue #2246: the notice says how this generation's own pane ended, so
+    /// it is written after the agent stopped being live. It is still owed to
+    /// that generation's card while the generation holds its pane — exited,
+    /// with no successor published there — because that card is still on
+    /// screen. Every other notice needs the agent live
+    /// ([`AgentPtyRegistry::delivery_notice_owns_pane`]).
+    pub pane_ended: bool,
 }
 
 /// Issue #424: the daemon's sink for [`DeliveryNotice`]s, installed via
@@ -10927,6 +11024,7 @@ impl AgentPtyRegistry {
                 abandoned_turns: Vec::new(),
                 turn_seq: 0,
                 removal_holds: Vec::new(),
+                dispatch_dir_holds: Vec::new(),
                 closing_instances: HashSet::new(),
                 closing_generations: HashSet::new(),
                 ended_instances: VecDeque::new(),
@@ -11395,8 +11493,7 @@ impl AgentPtyRegistry {
     /// Both exist because the cheap check here suppresses the overwhelmingly
     /// common case without scheduling anything at all.
     pub fn publish_delivery_notice(&self, notice: DeliveryNotice) {
-        if self.pane_current_agent_id(&notice.pane_id).as_deref() != Some(notice.agent_id.as_str())
-        {
+        if !self.delivery_notice_owns_pane(&notice) {
             tracing::debug!(
                 pane_id = %notice.pane_id,
                 delivery_id = %notice.delivery_id,
@@ -11412,6 +11509,20 @@ impl AgentPtyRegistry {
                 delivery_id = %notice.delivery_id,
                 "no delivery-notice sink installed; the report stays in the log only"
             ),
+        }
+    }
+
+    /// Whether `notice`'s agent still holds the pane it names, by the rule the
+    /// notice is owed under: the pane's LIVE agent for a delivery failure, and,
+    /// for a notice saying how the generation's own pane ended
+    /// ([`DeliveryNotice::pane_ended`], issue #2246), that generation while
+    /// nothing has been published on the pane after it — a pane closed or
+    /// respawned since belongs to nobody's card or to a successor's.
+    pub fn delivery_notice_owns_pane(&self, notice: &DeliveryNotice) -> bool {
+        if notice.pane_ended {
+            self.publication_owns_pane(&notice.pane_id, &notice.agent_id)
+        } else {
+            self.pane_current_agent_id(&notice.pane_id).as_deref() == Some(notice.agent_id.as_str())
         }
     }
 
@@ -18707,6 +18818,7 @@ impl AgentPtyRegistry {
             inbox: None,
             input_held: None,
             input_discarded: None,
+            project_config_exists: None,
         }
     }
 
@@ -19094,6 +19206,7 @@ impl AgentPtyRegistry {
                 inbox: None,
                 input_held: None,
                 input_discarded: None,
+                project_config_exists: None,
             })
             .collect();
         records.sort_by_key(|r| r.id.parse::<u64>().unwrap_or(0));
@@ -20222,6 +20335,7 @@ impl AgentPtyRegistry {
                 .chain(inner.respawning_dirs.values())
                 .flatten()
                 .any(|d| path_within(d, dir))
+            || inner.dispatch_dir_holds.iter().any(|d| path_within(d, dir))
     }
 
     /// Issue #1612: [`Self::dir_in_use_locked`], asked under one acquisition of
@@ -20255,6 +20369,45 @@ impl AgentPtyRegistry {
             registry: self,
             dir: dir.to_path_buf(),
         })
+    }
+
+    /// PRD #468: hold `dir` for a `dispatch --dir` from before its interlock
+    /// check until its spawn returns. Refused when another such dispatch holds
+    /// it, or when a removal holds it or a directory it lies inside
+    /// ([`Self::hold_dir_for_removal`]). Taken under the lock removals and
+    /// spawns reserve under, so a removal that starts after it finds the
+    /// directory in use, and one already holding it is seen here. Directories
+    /// are compared by path ([`path_within`]), so pass the spelling the
+    /// worktree registry records when there is one.
+    pub fn hold_dir_for_dispatch(
+        self: &Arc<Self>,
+        dir: &std::path::Path,
+    ) -> Result<DispatchDirHold, DispatchDirRefusal> {
+        let mut inner = self.inner.lock();
+        if let Some(held) = inner
+            .removal_holds
+            .iter()
+            .find(|held| path_within(dir, held))
+        {
+            return Err(DispatchDirRefusal::BeingRemoved(held.clone()));
+        }
+        if inner.dispatch_dir_holds.iter().any(|d| d == dir) {
+            return Err(DispatchDirRefusal::AlreadyHeld);
+        }
+        inner.dispatch_dir_holds.push(dir.to_path_buf());
+        Ok(DispatchDirHold {
+            registry: Arc::clone(self),
+            dir: dir.to_path_buf(),
+        })
+    }
+
+    /// PRD #468: the directories removals hold right now, as each removal
+    /// spelled it. [`Self::hold_dir_for_dispatch`] compares them by path; a
+    /// `--dir` dispatch also resolves these off the runtime, to catch a
+    /// removal holding another spelling of its target (a symlinked parent)
+    /// whose worktree entry the removal has already taken.
+    pub fn removal_holds(&self) -> Vec<PathBuf> {
+        self.inner.lock().removal_holds.clone()
     }
 
     /// PRD #1589 D4: whether a spawn into `instance` is refused — a close is
@@ -26427,6 +26580,7 @@ mod spawn_tests {
         AgentRecord {
             input_held: None,
             input_discarded: None,
+            project_config_exists: None,
             id: "1".into(),
             pane_id_env: None,
             display_name: None,
@@ -26677,6 +26831,7 @@ mod spawn_tests {
             inbox: None,
             input_held: None,
             input_discarded: None,
+            project_config_exists: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -30147,7 +30302,6 @@ mod spawn_tests {
     /// Scenario: inbox/doorbell/046 through the real adapter: a model editor drops the deck's Enter, so the ring ends unresolved and the doorbell is suspended with uncertain_input shown, while the user has a draft of their own in the tracker. An older attempt's token reported exact by the prompt hook moves nothing; this attempt's token reported exact afterwards resolves the attempt late, lifts the suspension and clears the card, and leaves the user's draft bit as it was.
     #[spec("inbox/doorbell/046")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
-    #[ignore = "quarantined: vfarcic, #2345"]
     async fn doorbell_046_late_exact_evidence_resolves_only_its_attempt_through_the_hook_arm() {
         use crate::doorbell_txn::{Latch, Outcome, Resolution};
         use crate::inbox_display::WakeHold;
@@ -30163,6 +30317,14 @@ mod spawn_tests {
         let old_token = typed_line(&editor.typed()).unwrap()[1..7].to_string();
         editor.control.lock().unwrap().on_enter = OnEnter::Drop;
         let typed_before = editor.typed().len();
+        // The first ring ends on the hook's token, which the model editor
+        // reports before it redraws its emptied composer: under load the
+        // second ring could otherwise read the frame still holding the line
+        // and refuse as AwaitingPrompt (issue #2345), as
+        // `doorbell_050_a_ring_on_the_real_writer_submits_its_line_and_nothing_else`
+        // already waits for.
+        editor.wait_drawn("");
+        editor.wait_clean();
         let report = editor.ring().await;
         assert!(
             matches!(report.outcome, RingOutcome::Txn(Outcome::Unresolved(_))),
@@ -32048,6 +32210,7 @@ mod spawn_tests {
             inbox: None,
             input_held: None,
             input_discarded: None,
+            project_config_exists: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -33722,6 +33885,67 @@ mod spawn_tests {
              same reason."
         );
 
+        registry.shutdown_all();
+    }
+
+    /// Issue #2246: a notice saying how a generation's own pane ended reaches
+    /// that generation after it exited by itself, because its card is still on
+    /// screen; a delivery failure still needs the agent live. Once a successor
+    /// is published on the pane, or the generation is closed, neither reaches
+    /// it.
+    #[tokio::test]
+    async fn an_ended_pane_notice_reaches_the_exited_generation_until_the_pane_changes_hands() {
+        const PANE: &str = "issue-2246-pane";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let spawn = |command: &'static str| {
+            registry
+                .spawn_agent(SpawnOptions {
+                    command: Some(command),
+                    env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                    ..SpawnOptions::default()
+                })
+                .expect("spawn stand-in")
+        };
+        let notice = |agent_id: &str, pane_ended: bool| DeliveryNotice {
+            pane_id: PANE.to_string(),
+            agent_id: agent_id.to_string(),
+            delivery_id: "m-issue-2246".to_string(),
+            session_id: None,
+            detail: "not delivered: …".into(),
+            cleared: false,
+            pane_ended,
+        };
+        let exited = spawn("/usr/bin/true");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline && registry.live_count() > 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            registry.live_count(),
+            0,
+            "precondition: the stand-in exited"
+        );
+        assert!(registry.delivery_notice_owns_pane(&notice(&exited, true)));
+        assert!(
+            !registry.delivery_notice_owns_pane(&notice(&exited, false)),
+            "a delivery failure is owed only to a live agent"
+        );
+        assert!(!registry.delivery_notice_owns_pane(&notice("someone-else", true)));
+
+        let successor = spawn("/bin/cat");
+        assert!(
+            !registry.delivery_notice_owns_pane(&notice(&exited, true)),
+            "the pane is the successor's now"
+        );
+        assert!(registry.delivery_notice_owns_pane(&notice(&successor, false)));
+
+        registry
+            .close_agent(&successor)
+            .expect("close the successor");
+        assert!(
+            !registry.delivery_notice_owns_pane(&notice(&successor, true)),
+            "a closed generation's card is gone"
+        );
         registry.shutdown_all();
     }
 

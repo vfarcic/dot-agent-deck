@@ -545,6 +545,7 @@ mod tests {
         AgentRecord {
             input_held: None,
             input_discarded: None,
+            project_config_exists: None,
             id: id.into(),
             pane_id_env: Some(pane_id.into()),
             display_name: Some(format!("worker-{id}")),

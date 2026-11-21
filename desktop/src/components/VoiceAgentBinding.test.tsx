@@ -76,24 +76,32 @@ describe("a voice dispatch holds to the daemon process its agent was listed by",
   beforeEach(() => { window.localStorage.clear(); vi.useFakeTimers(); });
   afterEach(() => vi.useRealTimers());
 
-  /** Scenario: a bare stop is resolving when another agent's pane replaces the one it was said in, or its daemon restarts. No close confirmation may be opened for the new subject; the unchanged pane remains a positive control. */
-  it.each(["other-agent", "restarted", "unchanged"])("holds a paramless pane stop to its declared subject (%s)", async (change) => {
+  /// Scenario: A nameless stop or config request is resolving when another agent replaces the viewed pane, its daemon restarts, or its agent is replaced. No confirmation dispatch may target the new subject and the report explains the refusal; the unchanged pane remains a positive control.
+  it.each([
+    ["stop_agent", "confirmStopAgent", "stop"],
+    ["generate_config", "confirmGenerateConfig", "generate config"],
+  ].flatMap(([action, invoke, said]) => ["other-agent", "restarted", "replaced", "unchanged"].map((change) => ({ action, invoke, said, change }))))("desktop/config-gen/003: holds a paramless $action to its declared subject ($change)", async ({ action, invoke, said, change }) => {
     const voice = microphone();
     let release!: (answer: VoiceResultDto) => void;
     const rt = runtime(voice, () => new Promise<VoiceResultDto>((resolve) => { release = resolve; }));
     const onDispatch = vi.fn(() => ({}));
-    const pane = { deckId: "local", agentId: "a1", label: "tester", incarnation: "process-a" };
+    const pane = { deckId: "local", agentId: "a1", label: "tester", incarnation: "process-a", spawnedAtMs: 100 };
     let listed = { [agentKey("local", "a1")]: { process: "process-a" } };
     const props = { runtime: rt, screen: "agent" as const, onDispatch, selectedDeckId: "local", agentIncarnations: () => listed };
     const { rerender } = render(<VoiceControlPanel {...props} pane={pane} />);
     await turnOnVoice();
-    await speak(voice, "stop");
-    const next = change === "other-agent" ? { ...pane, agentId: "a2" } : change === "restarted" ? { ...pane, incarnation: "process-b" } : pane;
+    await speak(voice, said);
+    expect(rt.resolveVoice).toHaveBeenCalledTimes(1);
+    const next = change === "other-agent" ? { ...pane, agentId: "a2" } : change === "restarted" ? { ...pane, incarnation: "process-b" } : change === "replaced" ? { ...pane, spawnedAtMs: 200 } : pane;
     listed = { [agentKey("local", "a1")]: { process: next.incarnation } };
     rerender(<VoiceControlPanel {...props} pane={next} />);
-    await act(async () => { release({ ...STOP, outcome: { ...STOP.outcome, kind: "dispatch", transcript: "stop", action: "stop_agent", invoke: "confirmStopAgent", params: [], sentence: "Confirm closing the open agent." } }); });
+    await act(async () => { release({ ...STOP, outcome: { kind: "dispatch", transcript: said, action, invoke, params: [], sentence: "Confirm acting on the open agent." } }); });
     await flush();
     expect(onDispatch).toHaveBeenCalledTimes(change === "unchanged" ? 1 : 0);
+    if (change !== "unchanged") {
+      const refusal = change === "other-agent" ? "Nothing ran — the pane on screen changed. Say it again." : change === "restarted" ? "Nothing ran — that agent is gone (the deck restarted). Say it again." : "The agent in this pane was replaced while that was being worked out, so nothing ran. Say it again.";
+      expect(screen.getByTestId("voice-report")).toHaveTextContent(refusal);
+    }
   });
 
   /**

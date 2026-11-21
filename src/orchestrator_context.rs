@@ -2814,9 +2814,17 @@ pub struct SweepReport {
 /// `.dispatch-task-<work id>.md.tmp`, is not exempt: it is never what a
 /// restore reads, and one is left behind only by a save that died between
 /// its create and its publish, so the age bound is what removes it.
+///
+/// So are handoff briefs, `handoff-*.md` (PRD #468): an agent writes one to
+/// hand its work to a team started in the same directory with
+/// `dispatch --dir`, and the docs and the dispatcher seed name that prefix.
+/// A brief is authored content, not derived, and continuing work weeks later
+/// is exactly when its brief matters, so the age sweep a team's start runs
+/// must not take it.
 pub(crate) fn is_sweepable_coordination_name(name: &str) -> bool {
     if crate::inbox_spills::is_spill_file_name(name)
         || crate::dispatch_task::is_task_file_name(name)
+        || is_handoff_brief_name(name)
     {
         return false;
     }
@@ -2827,6 +2835,14 @@ pub(crate) fn is_sweepable_coordination_name(name: &str) -> bool {
         return rest.starts_with(&format!("{CONTEXT_FILE_NAME}.")) && rest.ends_with(".tmp");
     }
     name.ends_with(".md")
+}
+
+/// PRD #468: a handoff brief's name, `handoff-<anything>.md`, which the
+/// coordination sweep leaves alone ([`is_sweepable_coordination_name`]).
+pub(crate) fn is_handoff_brief_name(name: &str) -> bool {
+    name.strip_prefix("handoff-")
+        .and_then(|rest| rest.strip_suffix(".md"))
+        .is_some_and(|middle| !middle.is_empty())
 }
 
 /// Remove a left-over [`CONTEXT_FILE_NAME`] from the held directory when the
@@ -5895,6 +5911,8 @@ mod hygiene_tests {
         for name in [
             "prd-20-w1-redtests.md",
             "worker-task-coder.md",
+            // Only a named brief is exempt, not the bare prefix.
+            "handoff-.md",
             "work-done-reviewer.md",
             ".orchestrator-context.md.1234.0.tmp",
             // Issue #1233: a per-publish context, written once and never
@@ -5917,6 +5935,9 @@ mod hygiene_tests {
             "archive.md.bak",
             // PR #1735 (RB2-02): a deck's saved message body is the deck's.
             "inbox-message-0123abcd-1700000000000-1.md",
+            // PRD #468: a handoff brief is authored content a later team
+            // reads, whatever its age.
+            "handoff-login-bug-2026-11-20.md",
         ] {
             assert!(
                 !is_sweepable_coordination_name(name),
@@ -6617,6 +6638,12 @@ mod hygiene_tests {
         let (_root, real) = walk_fixture();
         let target = real.join("target");
         std::fs::create_dir(&target).unwrap();
+        // Owner-only, like the fixture's root: under a `umask 002` host the
+        // `mkdir` above leaves it group-writable, which the walk refuses.
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         // `l0` -> `l1` -> ... -> `l40` -> `target`: 41 links from `l0`.
         let links = 41;
         for n in 0..links {

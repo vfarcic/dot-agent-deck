@@ -27,7 +27,7 @@ export function viewBound(view: AgentView): boolean {
 }
 
 /** The agent `fleet` lists under `view`'s `(deckId, agentId)`, whatever its incarnation. */
-export function listedAgent(fleet: readonly DeckSnapshot[], view: { deckId: string; agentId: string }): AgentSession | undefined {
+function listedAgent(fleet: readonly DeckSnapshot[], view: { deckId: string; agentId: string }): AgentSession | undefined {
   return fleet.find((entry) => entry.connection.deckId === view.deckId)?.agents.find((candidate) => candidate.id === view.agentId);
 }
 

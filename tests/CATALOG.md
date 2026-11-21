@@ -1337,19 +1337,39 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 
 #### dashboard/config-gen
 
-##### dashboard/config-gen/001 — `g` on a card opens the Generate Config dialog with options Yes / No / Never.
-- **Layer:** L2.
+##### dashboard/config-gen/001 — TUI generation preserves the confirmed agent and shows shared outcome words.
+- **Layer:** L1, in-process action dispatch and rendered status row.
 - **Agent:** none.
-- **Asserts:** dialog region appears; arrow keys move between Yes / No / Never; `Enter` on No dismisses without side effects.
-- **Does not assert:** what Yes injects into the agent (covered by `orchestration/delegate/*` for delegate-driven prompt injection, and elsewhere if a non-orchestration path emerges).
+- **Asserts:** confirming generation shows the shared upgrade message and posts no locally composed fallback prompt; an unopened pane sends the agent identity captured when the dialog opened even if the card changes before Yes; a daemon refusal and a silent-daemon timeout show exactly the desktop's shared client error sentence in the status.
+- **Tests:** `config_gen_001_older_daemon_shows_upgrade_without_posting_a_fallback`, `config_gen_001_confirmation_keeps_the_agent_it_opened_for`, `config_gen_001_refusal_uses_the_desktop_failure_sentence`, and `config_gen_001_timeout_uses_the_desktop_failure_sentence` in `src/ui.rs`; mouse/keyboard dispatch and a scripted daemon exercise the real controller.
+- **Does not assert:** successful delivery (covered by `inbox/route/007`) or the shared-client capability gate (`daemon/config-gen/004`).
 - **Platform coverage:** mac+linux.
 
-##### dashboard/config-gen/002 — Picking Never adds the cwd to the suppression list and the prompt does not re-open for that directory.
-- **Layer:** L2.
+The L1 `config_gen_001_existing_config_labels_footer_and_confirmation_update` in `src/ui.rs` also renders a daemon-hydrated card for absent, false, and true `project_config_exists` values, presses `g`, and checks the Generate/Update footer, dialog title, neutral Yes/No choices and existing-config question. The true case has an insta snapshot; no client-local filesystem inference is used.
+
+##### dashboard/config-gen/002 — Existing disabled automatic-prompt settings and recorded Never state remain readable.
+- **Layer:** pure-data, fast tier.
 - **Agent:** none.
-- **Asserts:** after Never, re-opening the new-pane flow for the same cwd does not surface the auto-prompt.
-- **Does not assert:** filesystem path of the suppression list (an implementation detail).
-- **Platform coverage:** mac+linux.
+- **Asserts:** a config containing `auto_config_prompt = false` and a persisted JSON state recording a suppressed directory both deserialize and retain their values.
+- **Test:** `config_gen_002_legacy_settings_and_never_state_still_load` in `tests/render_modal_buttons.rs`.
+- **Does not assert:** automatic dialog opening or suppression behavior; the dialog is requested manually.
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/config-gen/003 — A REAL interactive Haiku agent, asked from its card with `g` and Yes, proposes a config, waits for approval, and writes a `.dot-agent-deck.toml` that `validate` accepts (issue #2119, CLAUDE.md rule 4's real-usage bar).
+- **Layer:** L2 PTY-attached, lane 2 (the real `dot-agent-deck` binary in the vt100 `TuiDeck` harness with its lazy daemon). Runtime-skipped when the `claude` CLI or credentials are absent; `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1` turns that skip into a failure. Runs on a developer's machine and nowhere in CI (CLAUDE.md rule 5).
+- **Agent:** one REAL interactive Claude Code pane pinned to Haiku (`claude --model claude-haiku-4-5-20251001 --allowedTools Bash Read Write Edit Glob Grep`, no `-p`), started over the attach socket (`StartAgent`) in the `config-gen-live` fixture, a two-file project (Makefile and README) with no `.dot-agent-deck.toml` whose only agent launcher is the uniquely named Makefile target `deck-agent-7f3a2c`. Credentials imported into the per-test HOME; `with_claude_trust_workdir()` pre-trusts the work dir.
+- **Asserts:** with the agent's pane opened (`1`, then Ctrl+D back to command mode), pressing `g` on the selected card and Enter on Yes posts one `configuration request` message, bound to the agent, whose body is the daemon-composed `config_gen_prompt` for the agent's cwd; the agent acknowledges it and ends its turn without writing the file (the prompt's present-then-wait step); Yes leaves the TUI typing into the agent's pane, and the approval typed there leads to a `.dot-agent-deck.toml` with an `[[orchestrations]]` table that the real `dot-agent-deck validate` accepts; the agent named `deck-agent-7f3a2c` in its proposal or in the file.
+- **Test:** `config_gen_003_a_real_agent_generates_a_valid_config_after_approval` in `tests/e2e_config_generation_live.rs`.
+- **Does not assert:** the exact roles or prose the model proposes; the message wire shape and the stand-in delivery (`inbox/route/007`); the verb and its capability gate (`daemon/config-gen/*`); the upgrade message on an older daemon (`dashboard/config-gen/001`); the desktop's Generate affordance.
+- **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", feature = "e2e-live", unix))]` — the attach helpers it drives are Unix-domain-socket only).
+
+##### dashboard/config-gen/004 — A REAL interactive Haiku agent updates an existing config after approval and preserves user-written content.
+- **Layer:** L2 PTY-attached, lane 2; runs locally with Claude Code credentials, never in CI. `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1` makes unavailable credentials fail instead of skip.
+- **Agent:** one real interactive Claude Code Haiku pane, using the same command, credential import and trusted work directory as `/003`, in the `config-gen-existing-live` fixture.
+- **Asserts:** the fixture's existing config passes `dot-agent-deck validate`; pressing `g` on the selected card and confirming Yes delivers a request naming that existing file with the words "already exists"; the agent acknowledges and proposes without changing the file before approval; approval typed into the focused pane requests a concrete addition, role `tester-5e1c9a` with command `make deck-agent-7f3a2c`, and produces a changed config that validates, adds that role to `user-maintenance-91b7ef`, and preserves the orchestration's original orchestrator and reviewer roles with their commands and the reviewer's distinctive user-written description byte for byte.
+- **Test:** `config_gen_004_a_real_agent_updates_a_config_preserving_user_content` in `tests/e2e_config_generation_live.rs`.
+- **Does not assert:** exact model prose or the complete proposed diff; preservation of every possible TOML field; desktop controls.
+- **Platform coverage:** mac+linux (Unix attach socket).
 
 ### Statuses
 
@@ -2313,6 +2333,40 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 - **Does not assert:** reconnect serialization (covered by `session/live/010`) or card rendering (`dashboard/pane/009`).
 - **Platform coverage:** mac+linux+windows.
 
+#### daemon/config-gen
+
+##### daemon/config-gen/001 — Hello advertises config generation without changing the protocol version.
+- **Layer:** protocol, fast tier.
+- **Agent:** none.
+- **Asserts:** the in-process daemon advertises `generate-config` alongside `inbox` and retains protocol version 12.
+- **Test:** `config_gen_001_hello_advertises_generation_without_version_bump` in `tests/daemon_protocol.rs`.
+- **Does not assert:** message delivery (`daemon/config-gen/002`).
+- **Platform coverage:** mac+linux.
+
+##### daemon/config-gen/002 — The daemon composes the exact config request for the selected pane's own directory.
+- **Layer:** protocol, fast tier.
+- **Agent:** none (in-process daemon with cat panes).
+- **Asserts:** one request reaches the target's current agent; its complete body equals `config_gen_prompt` for the daemon's target cwd, and another pane receives nothing. Creating a config before the next request switches it to read/preserve/update/approval instructions naming the exact file; ListAgents reports a fresh optional `project_config_exists` boolean for regular files in the exact cwd, excluding parent configs and directories. Older records omit the unknown flag on serialization.
+- **Tests:** `config_gen_002_daemon_posts_exact_prompt_for_target_cwd` and `config_gen_002_records_report_exact_cwd_config_file` in `tests/daemon_protocol.rs`; `prompt_existing_config_is_read_and_updated_only_after_approval` in `src/config_gen.rs` checks the compose-time prompt variant and unchanged non-file controls.
+- **Does not assert:** real-model compliance or UI confirmation (`inbox/route/007`).
+- **Platform coverage:** mac+linux.
+
+##### daemon/config-gen/003 — A missing or replaced config-generation target is refused.
+- **Layer:** protocol, fast tier.
+- **Agent:** none (in-process daemon with cat panes).
+- **Asserts:** an unknown pane and a request retaining a replaced agent's identity are refused without posting a message to the replacement; replacing an agent after the live sample while the cwd lookup is blocked is refused with both omitted and supplied expected identity, and the replacement inbox stays empty; an unchanged occupant receives one message as a control.
+- **Tests:** `config_gen_003_missing_or_replaced_target_receives_nothing` in `tests/daemon_protocol.rs`; `config_gen_003_replacement_during_directory_lookup_receives_nothing` in `src/daemon_protocol.rs`.
+- **Does not assert:** user-facing refusal wording.
+- **Platform coverage:** mac+linux.
+
+##### daemon/config-gen/004 — The shared client withholds config generation without the advertised capability.
+- **Layer:** protocol/client, fast tier.
+- **Agent:** none.
+- **Asserts:** absent, empty, and generic-inbox-only capability sets return Unsupported without connecting to the daemon.
+- **Test:** `config_gen_004_client_withholds_generation_from_older_daemon` in `tests/config_generation.rs`.
+- **Does not assert:** TUI status rendering (`dashboard/config-gen/001`).
+- **Platform coverage:** mac+linux+windows.
+
 #### daemon/status
 
 ##### daemon/status/001 — `dot-agent-deck daemon status` names a managed agent and visibly reflects a driven live status, not a placeholder identical to an agent with no session.
@@ -3154,7 +3208,7 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** the pane-focus side effect of activating the role; the Dashboard's own restore (covered by `dashboard/selection/008`).
 - **Platform coverage:** mac+linux+windows.
 
-##### tabs/orchestration/006 — In a real multi-role orchestration tab under `PaneLayout::Stacked`, non-focused roles render no collapsed title-bar frame, a non-focused role's agent keeps running with its sidebar status transitioning live, and switching focus between roles preserves each role's rendered content with no lost scrollback (PRD #311).
+##### tabs/orchestration/006 — In a real multi-role orchestration tab, non-focused roles render no collapsed title-bar frame, a non-focused role's agent keeps running with its sidebar status transitioning live, and switching focus between roles preserves each role's rendered content with no lost scrollback (PRD #311).
 - **Layer:** L2 (PTY-attached, `tests/e2e_orchestration_pane_column.rs`).
 - **Agent:** none (fixture `tests/fixtures/orch-focus-lifecycle`: a 3-role orchestration — `orchestrator` (start), `alpha`, `beta` — each printing a unique sentinel; `beta`'s script additionally self-posts real `SessionStart`/`PreToolUse` hook events via `dot-agent-deck hook --agent claude-code`, resolved to the freshly built test binary, so its sidebar status transitions Idle -> Working while its pane is not the focused/expanded slot).
 - **Asserts:** (a) with `orchestrator` focused/expanded, the settled grid carries no collapsed `Borders::TOP` title-bar frame for either non-focused role (`alpha`, `beta`) — matched by a row that, after trimming only leading blank columns, begins with the bare role name directly followed by border-fill dashes, a pattern only the collapsed-pane block itself can produce; (b) `beta`'s sidebar status card visibly transitions to `Working` purely from its own self-posted hook events while never becoming the focused pane, proving a non-focused role's agent lifecycle (PTY, hook delivery, status) is untouched by the rendering change; (c) driving `j`/`k` (Normal mode) round-trips focus orchestrator -> alpha -> beta -> alpha -> orchestrator, and each role's own sentinel text is visible again once it becomes the expanded pane, proving no lost scrollback or stale fragment across a focus switch.
@@ -4403,13 +4457,6 @@ Issue #2051: the deck's OpenCode plugin under the real, pinned OpenCode binaries
 
 #### resize/layout
 
-##### resize/layout/001 — `Ctrl+t` toggles stacked / tiled dashboard layout without dropping any agents.
-- **Layer:** L2.
-- **Agent:** none.
-- **Asserts:** after toggling, all cards are still present; the layout differs across snapshots.
-- **Does not assert:** which layout is the "default" (already a settled product call).
-- **Platform coverage:** mac+linux.
-
 ##### resize/layout/002 — On a terminal wider than `PTY_RESIZE_DIM_MAX`, a pane's local vt100 parser lands on the same capped geometry the daemon gives the child (issue #747).
 - **Layer:** L1 (pure-data `compute_frame_layout` + the real `resize_panes_to_layout` sweep over inert seam panes; no PTY, no subprocess, no daemon). Lives in `src/ui.rs`'s own `#[cfg(test)]` module because `compute_frame_layout`, `FrameLayout::pane_target_dims` and `resize_panes_to_layout` are module-private, and because the public `render_orchestration_frame_to_buffer` seam clamps its width to `RENDER_SEAM_DIM_MAX` (1024) and so cannot reach the threshold at all.
 - **Agent:** none (inert render/scroll seam panes).
@@ -4587,10 +4634,10 @@ note).
 ##### render/layout/001 — After a tab/layout switch with N panes the embedded pane's bottom rows show correct (non-stale) content — no off-by-one row shift.
 - **Layer:** L2.
 - **Agent:** none (long-lived `sleep` panes).
-- **Asserts:** with ≥1 embedded pane carrying a known bottom-row marker, after a layout change (`Ctrl+t` toggle) and quiescence, the pane's bottom row still shows its marker — not a stale fragment of the pre-switch layout, and not shifted by a row.
+- **Asserts:** with ≥1 embedded pane carrying a known bottom-row marker, after a layout change (zooming the dashboard with `z` and unzooming it — the `Ctrl+t` stacked/tiled toggle until PRD #312 removed it) and quiescence, the pane's bottom row still shows its marker — not a stale fragment of the pre-switch layout, and not shifted by a row.
 - **Does not assert:** which layout is default; the pane program's own redraw; that the defect reproduces every run.
 - **Platform coverage:** mac+linux.
-- **M1 status (PRD #84):** **Flag / invariant-check (riskiest entry).** The PRD risk row flags this symptom as possibly a vt100/parser issue below scope. The current code resizes panes on every layout-change path (`Action::ToggleLayout` routes through `resize_*_panes`), so the area/PTY mismatch that would scramble the bottom rows self-heals and is not deterministically observable through the harness. Written as an invariant guard on bottom-row content (PTY size == inner area, observed via rendered content). If it reproduces deterministically after M4+M5, that's follow-up signal — NOT a reason to re-add the clamp.
+- **M1 status (PRD #84):** **Flag / invariant-check (riskiest entry).** The PRD risk row flags this symptom as possibly a vt100/parser issue below scope. The code at the time resized panes on every layout-change path (`Action::ToggleLayout`, since removed by PRD #312, routed through `resize_*_panes`; today the per-frame `resize_panes_to_layout` pass sizes them after the zoom round trip this entry now drives), so the area/PTY mismatch that would scramble the bottom rows self-heals and is not deterministically observable through the harness. Written as an invariant guard on bottom-row content (PTY size == inner area, observed via rendered content). If it reproduces deterministically after M4+M5, that's follow-up signal — NOT a reason to re-add the clamp.
 - **Post-M5 resolution (PRD #84):** **GREEN.** Stays green after M4+M5 and now runs with the M5 contract `debug_assert!` live in debug builds: a layout toggle that left a pane's PTY out of step with its rect would trip the debug assert instead of self-healing, so the guard exercises the layout-driven resize + 1:1 render contract rather than masking the race. No deterministic bottom-row scramble survived M4+M5 — no below-scope (vt100/parser) follow-up signal, and the clamp stays removed.
 
 ##### render/layout/002 — Closing an orchestration tab leaves no stale rendered fragment.
@@ -4653,11 +4700,11 @@ without depending on the config struct API.
 
 #### keybindings/remap
 
-##### keybindings/remap/001 — A config remap of a **global** action (`toggle_layout` → `Alt+Shift+l`) takes effect on the new combo and the old default stops toggling.
+##### keybindings/remap/001 — A config remap of a **global** action (`new_pane` → `Alt+Shift+l`) takes effect on the new combo and the old default stops working.
 - **Layer:** L2.
 - **Agent:** none.
-- **Asserts:** with a `keybindings.toml` rebinding `[global] toggle_layout = "Alt+Shift+l"`, pressing `Alt+Shift+l` toggles the dashboard layout (the `Layout: …` status message appears in the bottom bar); the old default toggle key (`Ctrl+t`) no longer toggles. The remap is resolved **client-side** — the file is read on the TUI side, the TUI matches the keypress to the action, and the daemon stays binding-agnostic.
-- **Does not assert:** which layout (stacked vs tiled) is the default, exact status-message wording beyond the `Layout:` prefix, daemon-side behaviour (there is none — binding resolution is entirely client-side).
+- **Asserts:** with a `keybindings.toml` rebinding `[global] new_pane = "Alt+Shift+l"`, pressing `Alt+Shift+l` opens the New Agent directory picker (`Select Directory`); after Esc closes it, the old default (`Ctrl+n`) followed by `?` opens help and no picker. The remap is resolved **client-side** — the file is read on the TUI side, the TUI matches the keypress to the action, and the daemon stays binding-agnostic. Remapped `toggle_layout` until PRD #312 removed that action.
+- **Does not assert:** the New Agent form beyond the picker's heading, daemon-side behaviour (there is none — binding resolution is entirely client-side).
 - **Platform coverage:** mac+linux.
 
 ##### keybindings/remap/002 — A config remap of a **dashboard** action (`help` `?` → `F1`) opens the help overlay on the new key.
@@ -4680,6 +4727,13 @@ without depending on the config struct API.
 - **Asserts:** a TOML `host_metrics = "F2"` remap produces no warnings; TestBackend frames stay on the dashboard after the old `m`, show the overlay after F2, and return to the dashboard after Escape; help names F2 on its host row.
 - **Does not assert:** loading the keybindings file from disk (covered by `keybindings/remap/001` and `/002`).
 - **Platform coverage:** mac+linux+windows.
+
+##### keybindings/remap/005 — A `keybindings.toml` still setting the removed `toggle_layout` starts cleanly, says why the line is ignored, and applies the rest of the file (PRD #312).
+- **Layer:** L2 (PTY + vt100, the real binary; the warning is read from the raw output stream because it is printed before the TUI takes the screen).
+- **Agent:** none.
+- **Asserts:** with `[global] toggle_layout = "Alt+Shift+l"` and `[dashboard] help = "F1"`, the output carries the warning `'[global] toggle_layout' — ignored: the stacked/tiled layout toggle was removed`, the dashboard comes up (`No active agents`), `F1` opens help, and `Ctrl+t` produces no `Layout:` message.
+- **Does not assert:** the rest of the warning's wording (pinned by the `removed_toggle_layout_is_ignored_with_a_readable_warning` unit test in `src/keybindings.rs`); other unknown actions (their warning is unchanged).
+- **Platform coverage:** mac+linux.
 
 #### keybindings/safety
 
@@ -4707,7 +4761,7 @@ without depending on the config struct API.
 ##### keybindings/safety/004 — Mode-gating Close does not scope the other global commands.
 - **Layer:** L1 (in-process production key mapper).
 - **Agent:** none.
-- **Asserts:** Dashboard, NewPane, and ToggleLayout still resolve from PaneInput; only ClosePane falls through to PTY input.
+- **Asserts:** Dashboard and NewPane still resolve from PaneInput; only ClosePane falls through to PTY input. `Ctrl+T`, no longer bound since PRD #312, reaches the PTY as `0x14` in PaneInput and resolves nothing in command mode.
 - **Does not assert:** each action's downstream UI mutation (covered by its feature-specific tests).
 - **Platform coverage:** mac+linux+windows.
 
@@ -4716,14 +4770,14 @@ without depending on the config struct API.
 ##### keybindings/letters/001 — Each default `Ctrl+<letter>` global action has its plain letter, and a remap or a conflict takes it away.
 - **Layer:** L1 (`KeybindingConfig::plain_alias` from parsed TOML).
 - **Agent:** none.
-- **Asserts:** under the defaults `dashboard`, `new_pane`, `close_pane`, `toggle_layout`, `toggle_orchestration_lock` and `toggle_zoom` answer to `d`, `n`, `w`, `t`, `e` and `z`; the split toggle gets no `l` (which stays `move_right`), no action answers to a plain `c`, and an action already on a letter gets none; remapping an action (even to another `Ctrl` chord) removes its letter while restating the default does not; binding the letter to another action removes it, and a shifted letter does not.
+- **Asserts:** under the defaults `dashboard`, `new_pane`, `close_pane`, `toggle_orchestration_lock` and `toggle_zoom` answer to `d`, `n`, `w`, `e` and `z`; the split toggle gets no `l` (which stays `move_right`), no action answers to a plain `c`, and an action already on a letter gets none; remapping an action (even to another `Ctrl` chord) removes its letter while restating the default does not; binding the letter to another action removes it, and a shifted letter does not.
 - **Does not assert:** dispatch (covered by `keybindings/letters/002` and `/003`); the help overlay's rendering (covered by `dashboard/help/002`).
 - **Platform coverage:** mac+linux+windows.
 
 ##### keybindings/letters/002 — A plain letter performs its command in command mode and is typed into the pane in pane mode.
 - **Layer:** L1 (in-process production key mapper, `key_action_for_mode`).
 - **Agent:** none.
-- **Asserts:** in `UiMode::Normal`, plain `d`, `t`, `w`, `z` and `e` resolve to `DetachToNormal`, `ToggleLayout`, `CloseSelected`, `ToggleZoom` and `ToggleOrchestrationLock`; in `UiMode::PaneInput` each is forwarded to the pane as its own byte; `Shift` and `Alt` forms resolve nothing; after `toggle_layout` is remapped, `t` resolves nothing; in every `UiMode` other than `Normal` (a compile-time-exhaustive list), plain `d`, `t`, `w`, `z`, `e` and `n` resolve no global command — nothing, or in `PaneInput` the letter's own byte.
+- **Asserts:** in `UiMode::Normal`, plain `d`, `w`, `z` and `e` resolve to `DetachToNormal`, `CloseSelected`, `ToggleZoom` and `ToggleOrchestrationLock`; in `UiMode::PaneInput` each is forwarded to the pane as its own byte; `Shift` and `Alt` forms resolve nothing; after `close_pane` is remapped, `w` resolves nothing; plain `t`, the removed layout toggle's letter (PRD #312), resolves nothing; in every `UiMode` other than `Normal` (a compile-time-exhaustive list), plain `d`, `t`, `w`, `z`, `e` and `n` resolve no global command — nothing, or in `PaneInput` the letter's own byte.
 - **Does not assert:** the tab and experimental-flag scoping applied at the live call site (the same scoping as the chords, covered by `orchestration/lock/001` and `orchestration/layout/005`, `/007`); `n` (covered by `keybindings/letters/003`).
 - **Platform coverage:** mac+linux+windows.
 
@@ -4734,11 +4788,11 @@ without depending on the config struct API.
 - **Does not assert:** the new-agent flow that follows (covered by its own tests).
 - **Platform coverage:** mac+linux+windows.
 
-##### keybindings/letters/004 — Through the live loop, a plain `t` toggles the layout in command mode and reaches the pane's program in a pane.
+##### keybindings/letters/004 — Through the live loop, a plain `z` zooms in command mode and reaches the pane's program in a pane.
 - **Layer:** L2 (PTY + vt100, the real binary and daemon; a restored pane running `cat` as the stand-in program).
 - **Agent:** none.
-- **Asserts:** with the pane focused, `tz` and Enter are echoed back by `cat` (the line shows twice) and no `Layout:` status appears; after `Ctrl+D`, a plain `t` produces the `Layout:` status the `Ctrl+t` toggle does (PR #1672 review).
-- **Does not assert:** the other letters through the live loop (their resolution is `keybindings/letters/002`); `n` on a waiting card (`keybindings/letters/003`); what the toggled layout looks like (`render/layout/001`).
+- **Asserts:** with the pane focused, `tz` and Enter are echoed back by `cat` (the line shows twice) and no `Zoom:` status appears; after `Ctrl+D`, a plain `t` followed by a plain `z` produces the `Zoom: on` status the `Ctrl+z` chord does and no `Layout:` status (PR #1672 review; the letter was `t`, the layout toggle, until PRD #312 removed it).
+- **Does not assert:** the other letters through the live loop (their resolution is `keybindings/letters/002`); `n` on a waiting card (`keybindings/letters/003`); what the zoomed layout looks like (`render/layout/006`).
 - **Platform coverage:** mac+linux.
 
 ##### keybindings/letters/005 — Each default plain-letter command has its `Ctrl` form in command mode, and a remap or a conflict takes it away; in a pane the chord reaches the program.
@@ -4785,7 +4839,7 @@ without depending on the config struct API.
 ##### keybindings/help/001 — The help overlay is generated from the active keybinding config and shows remapped keys.
 - **Layer:** L1 (ratatui `TestBackend` + `insta` file snapshot).
 - **Agent:** none.
-- **Asserts:** rendered against a `KeybindingConfig` that remaps `toggle_layout` → `Alt+Shift+l` and `help` → `F1`, the help-overlay buffer shows those custom notations and describes Ctrl+D as a command-mode / pane-input toggle, proving the overlay is generated from the active config while retaining the corrected semantics. The default-config content guard lives at `dashboard/help/002`.
+- **Asserts:** rendered against a `KeybindingConfig` that remaps `new_pane` → `Alt+Shift+l` and `help` → `F1`, the help-overlay buffer shows those custom notations and describes Ctrl+D as a command-mode / pane-input toggle, proving the overlay is generated from the active config while retaining the corrected semantics. The default-config content guard lives at `dashboard/help/002`.
 - **Does not assert:** the overlay's exact column layout or footer wording beyond what the committed snapshot pins; behaviour with the *default* config (that is `dashboard/help/002`'s job).
 - **Platform coverage:** mac+linux+windows.
 
@@ -4794,7 +4848,7 @@ without depending on the config struct API.
 ##### keybindings/hints/001 — The hints bar is generated from the active keybinding config and shows remapped keys.
 - **Layer:** L1 (ratatui `TestBackend` + `insta`, through the same production `render_bottom_bar` path the app draws).
 - **Agent:** none.
-- **Asserts:** rendered in command mode against a config that remaps `toggle_layout` → `Alt+Shift+l`, the live button bar shows `[Toggle Layout Alt+Shift+L]` and `[Back to Pane Ctrl+D]`; the snapshot pins the complete production bar.
+- **Asserts:** rendered in command mode against a config that remaps `new_pane` → `Alt+Shift+l`, the live button bar shows `[New Agent Alt+Shift+L]` and `[Back to Pane Ctrl+D]`; the snapshot pins the complete production bar.
 - **Does not assert:** truncation behaviour at narrow widths.
 - **Platform coverage:** mac+linux+windows.
 
@@ -5865,8 +5919,8 @@ without depending on the config struct API.
 ##### orchestration/lock/010 — Global chords still fire while a worker pane is focused and the deck is locked.
 - **Layer:** L2 PTY-attached.
 - **Agent:** none (fixture `tests/fixtures/orch-deck`).
-- **Asserts:** with the non-orchestrator worker role focused and the deck LOCKED, `Ctrl+t` (`toggle_layout`) surfaces its `Layout:` status message — global chords resolve before the PTY-forward fallback the lock gates. Regression guard against an overly-broad gate.
-- **Does not assert:** the layout change itself (covered by the layout tests).
+- **Asserts:** with the non-orchestrator worker role focused and the deck LOCKED, `Ctrl+n` (`new_pane`) opens the New Agent directory picker — global chords resolve before the PTY-forward fallback the lock gates. Regression guard against an overly-broad gate. (It pressed `Ctrl+t`, `toggle_layout`, until PRD #312 removed that action.)
+- **Does not assert:** the New Agent flow itself (covered by its own tests).
 - **Platform coverage:** mac+linux.
 
 ##### orchestration/lock/011 — On a real locked pane, a reported `WaitingForInput` opens the gate and the status clearing closes it again.
@@ -6044,7 +6098,7 @@ without depending on the config struct API.
 - **Does not assert:** the full orchestration-tab frame (tab bar, side panes, stats bar); the `ORCHESTRATION_LEFT_PERCENT` width split or `grid_columns` thresholds (out of scope per PRD #147).
 - **Platform coverage:** mac+linux+windows.
 
-##### orchestration/layout/002 — In a 7-role orchestration tab with `PaneLayout::Stacked`, the focused pane's rect covers the full pane-column height and no collapsed title-bar frames are drawn for the other 6 roles (PRD #311).
+##### orchestration/layout/002 — In a 7-role orchestration tab, the focused pane's rect covers the full pane-column height and no collapsed title-bar frames are drawn for the other 6 roles (PRD #311).
 - **Layer:** L1 (in-process `compute_frame_layout` + `render_frame` driven through a real `ratatui::Terminal<TestBackend>`, via `EmbeddedPaneController::for_render_only_tests()`; no PTY, no subprocess). Lives in `src/ui.rs`'s own `#[cfg(test)]` module (same pattern as `tabs/orchestration/003-005`) because the geometry helpers under test (`pane_stack_rects`, `stacked_expanded_index`, `render_terminal_panes`) are module-private and unreachable from `tests/*.rs`.
 - **Agent:** none (7 synthetic role pane ids, no backing PTYs).
 - **Asserts:** with no pane explicitly focused (so `stacked_expanded_index` falls back to the first role, `orchestrator`), the expanded role's OUTER rect height equals the full pane-column height with no rows ceded to collapsed frames; none of the other 6 roles' pane ids appear anywhere in the rendered grid (i.e. no `Borders::TOP` collapsed title block is drawn for a non-focused pane).
@@ -6068,7 +6122,7 @@ without depending on the config struct API.
 ##### orchestration/layout/005 — `scope_orchestration_chord` claims the split toggle only on an orchestration tab in command mode, un-resolving it everywhere else so `Ctrl+l` reaches the pane's PTY as `0x0c`, and passes every other action through untouched (PRD #336, issue #439).
 - **Layer:** L1 (pure function plus `key_action_for_mode`, the public L1 seam over the same mode-aware resolver chain the event loop runs; no PTY, no render). Lives in `src/ui.rs`'s own `#[cfg(test)]` module because `scope_orchestration_chord` is module-private.
 - **Agent:** none.
-- **Asserts:** a simulated `Ctrl+l` `KeyEvent` resolves through `key_action_for_mode` to `Action::ToggleOrchestrationSplit` specifically in `UiMode::Normal`, not merely to "some action"; `Some(ToggleOrchestrationSplit)` survives `scope_orchestration_chord` only for (orchestration tab, `UiMode::Normal`) and becomes `None` off an orchestration tab in any mode, and on an orchestration tab in `PaneInput`/`Filter`/`Help`/`NewPaneForm` (so the key falls through to the `PaneInput` forwarding path). The mode half mirrors `close_pane` (PRD #241 M1), which is command-mode only so `Ctrl+w` still reaches the PTY as word-delete. Then the payoff end to end, and the half issue #439 added: the SAME chord through the SAME seam in `UiMode::PaneInput` must NOT come back as `ToggleOrchestrationSplit` and must instead forward `0x0c` to the pane's PTY as readline's clear-screen — the shape `orchestration/layout/007` asserts for `Ctrl+Z` and `0x1a`. Also that `ToggleLayout`, `DetachToNormal` and `None` pass through unchanged for every tab/mode pair, proving the guard is surgical rather than a general-purpose filter. Verified with teeth: deleting the split-toggle `scope_orchestration_chord` pass from `key_action_for_mode` — the pre-#439 state, where the seam applied only two of the three scoping passes — fails this test with `got Some(ToggleOrchestrationSplit)`, while `orchestration/layout/003` and `/007` both stay green, so this is the only test that catches it.
+- **Asserts:** a simulated `Ctrl+l` `KeyEvent` resolves through `key_action_for_mode` to `Action::ToggleOrchestrationSplit` specifically in `UiMode::Normal`, not merely to "some action"; `Some(ToggleOrchestrationSplit)` survives `scope_orchestration_chord` only for (orchestration tab, `UiMode::Normal`) and becomes `None` off an orchestration tab in any mode, and on an orchestration tab in `PaneInput`/`Filter`/`Help`/`NewPaneForm` (so the key falls through to the `PaneInput` forwarding path). The mode half mirrors `close_pane` (PRD #241 M1), which is command-mode only so `Ctrl+w` still reaches the PTY as word-delete. Then the payoff end to end, and the half issue #439 added: the SAME chord through the SAME seam in `UiMode::PaneInput` must NOT come back as `ToggleOrchestrationSplit` and must instead forward `0x0c` to the pane's PTY as readline's clear-screen — the shape `orchestration/layout/007` asserts for `Ctrl+Z` and `0x1a`. Also that `NewPane`, `DetachToNormal` and `None` pass through unchanged for every tab/mode pair, proving the guard is surgical rather than a general-purpose filter. Verified with teeth: deleting the split-toggle `scope_orchestration_chord` pass from `key_action_for_mode` — the pre-#439 state, where the seam applied only two of the three scoping passes — fails this test with `got Some(ToggleOrchestrationSplit)`, while `orchestration/layout/003` and `/007` both stay green, so this is the only test that catches it.
 - **Does not assert:** that the event loop actually calls the scoping pass (covered end-to-end by `tabs/orchestration/008`); the TAB term through `key_action_for_mode`, which is not knowable at that seam — it answers for the most permissive tab and the live call site supplies the tab kind, so the tab half is only reachable here through the pure function directly.
 - **Platform coverage:** mac+linux+windows.
 
@@ -6082,7 +6136,7 @@ without depending on the config struct API.
 ##### orchestration/layout/007 — `scope_zoom` claims the plain `z` zoom toggle only on an orchestration tab in command mode, un-resolving it everywhere else so the letter reaches the agent, and `Ctrl+Z` never becomes a second zoom binding (PRD #313).
 - **Layer:** L1 (pure function plus `key_action_for_mode`, the public L1 seam over the same mode-aware resolver chain the event loop runs; no PTY, no render). Lives in `src/ui.rs`'s own `#[cfg(test)]` module because `scope_zoom` is module-private.
 - **Agent:** none.
-- **Asserts:** a simulated plain-`z` `KeyEvent` resolves through `key_action_for_mode` to `Action::ToggleZoom` specifically, not merely to "some action"; `Some(ToggleZoom)` survives `scope_zoom` only for (orchestration tab, `UiMode::Normal`) and becomes `None` off an orchestration tab in any mode and on an orchestration tab in `PaneInput`/`Filter`/`Rename`/`Help`/`NewPaneForm`, so the keystroke falls through to the PTY-forwarding path. The mode half matters more here than it does for `orchestration/layout/005`'s `Ctrl+l`: `z` is an ORDINARY CHARACTER, so without it nobody could type the letter z at an agent. Also pins PRD #313 Open Question 1's decision by the other side — `Ctrl+Z` must NOT resolve to `ToggleZoom` in any mode and must still forward `0x1a` to the pane's PTY as job control — and that `ToggleLayout`, `ToggleOrchestrationSplit` and `None` pass through untouched for every tab/mode pair, so the guard is surgical rather than a general-purpose filter.
+- **Asserts:** a simulated plain-`z` `KeyEvent` resolves through `key_action_for_mode` to `Action::ToggleZoom` specifically, not merely to "some action"; `Some(ToggleZoom)` survives `scope_zoom` only for (orchestration tab, `UiMode::Normal`) and becomes `None` off an orchestration tab in any mode and on an orchestration tab in `PaneInput`/`Filter`/`Rename`/`Help`/`NewPaneForm`, so the keystroke falls through to the PTY-forwarding path. The mode half matters more here than it does for `orchestration/layout/005`'s `Ctrl+l`: `z` is an ORDINARY CHARACTER, so without it nobody could type the letter z at an agent. Also pins PRD #313 Open Question 1's decision by the other side — `Ctrl+Z` must NOT resolve to `ToggleZoom` in any mode and must still forward `0x1a` to the pane's PTY as job control — and that `NewPane`, `ToggleOrchestrationSplit` and `None` pass through untouched for every tab/mode pair, so the guard is surgical rather than a general-purpose filter.
 - **Does not assert:** that the event loop actually calls it (covered end-to-end by `tabs/orchestration/011`, whose PaneInput arm is the live form of the same claim); the geometry the action produces (covered by `orchestration/layout/008`).
 - **Platform coverage:** mac+linux+windows.
 
@@ -6103,21 +6157,14 @@ without depending on the config struct API.
 ##### orchestration/layout/010 — A zoomed orchestration tab's role panes get PTY dims for the FULL-width column, so the agent actually reflows (PRD #313).
 - **Layer:** L1 (`compute_frame_layout` + `FrameLayout::pane_target_dims`, the exact seam the per-frame `resize_panes_to_layout` sweep reads; no PTY, no TestBackend render).
 - **Agent:** none (two synthetic role pane ids).
-- **Asserts:** on a 100-wide frame every role pane's target PTY size is 64 inner columns unzoomed (the 66% column less its border) and 73 narrowed (matching `orchestration/layout/006`), while a ZOOMED tab targets 98 (the whole frame less its border) from either split state — including the non-focused `Stacked` role, which `pane_target_dims` sizes "as if focused" so it does not reflow twice on the way back. This is the seam that makes PRD #313's "PTY resize on zoom and unzoom" work: `agent_pty::resize()` is already called by the per-frame sweep and early-returns when neither dimension changed, so an implementation that widened only the drawn rect would leave every agent rendering at 64 columns inside a 98-column pane. Also pins that zoom reclaims WIDTH only — the row budget is identical zoomed and unzoomed — which is PRD #313's scope discipline: zoom gets the toggle and the indicator, and nothing else.
-- **Does not assert:** the SPAWN-time dims path that `orchestration/layout/006` covers for the narrow split. That path is deliberately out of reach here rather than skipped: zoom is per-tab and a newly opened tab always starts unzoomed (`orchestration/layout/009`), so a role pane can never be spawned into a zoomed tab and the spawn site has no zoomed case to get wrong. The per-frame sweep asserted here is the only seam through which a zoom reaches a PTY. Nor does it assert which panes are DRAWN: the "as if focused" dims this pins for the non-focused `Stacked` role are target PTY dims, not a claim that the pane appears on screen — it does not, and `orchestration/layout/011` is where "only the focused pane is drawn while zoomed" is pinned (there under Tiled, which is the case PRD #311 does not already cover).
-- **Platform coverage:** mac+linux+windows.
-
-##### orchestration/layout/011 — A zoomed orchestration tab draws ONLY the focused role pane even under `PaneLayout::Tiled`, and leaves the deck's stored Tiled toggle untouched (PRD #313 M1).
-- **Layer:** L1 (`dispatch_action` against a `CapturingPaneController` for the real `Ctrl+t` / `z` toggles, plus two `compute_frame_layout` passes for the geometry; no PTY, no TestBackend render). Lives in `src/ui.rs`'s own `#[cfg(test)]` module because `compute_frame_layout`, `ActiveTabView` and `PaneLayout` are module-private.
-- **Agent:** none (a THREE-role `cat` orchestration tab opened through `TabManager::open_orchestration_tab` — with only two panes "only the focused one is drawn" and "the other one happens to be empty" are the same observation, and a frame that dropped just one slot would still pass).
-- **Asserts:** pins PRD #313 M1's "sidebar and other panes are not drawn" half specifically under **Tiled**, which is the half Stacked gets for free from PRD #311 and Tiled does not. `Action::ToggleLayout` puts the deck in Tiled; `Action::ToggleZoom` then zooms the tab; resolving the layout with that stored `ui.pane_layout` hands the FOCUSED role pane the entire pane column (which `orchestration/layout/008` pins to the entire frame) while both non-focused role panes collapse to ZERO reserved height — the same "not drawn" convention PRD #311 M2 gives Stacked and `orchestration/layout/002` pins there. Re-resolving the same tab UNZOOMED still tiles all three panes across the column, so zoom overrode the frame without restacking the deck underneath. Between and after those, `ui.pane_layout` must still read `Tiled` — the half a plausible-but-wrong implementation fails, since flipping the stored toggle to Stacked on zoom and back on unzoom produces identical geometry and only breaks PRD #313's "the same key restores the previous view exactly" once anything else reads the toggle.
-- **Does not assert:** the PTY dims the undrawn Tiled panes end up with. `orchestration/layout/010` covers that seam for Stacked and its answer there is "as if focused", which is NOT in tension with the zero-height rect asserted here — target dims and drawn rects are different questions, and `pane_target_dims` exists precisely to answer the first one differently from the second. Under Tiled+zoomed both resolutions are coherent (size the undrawn pane as if focused, or leave it skipped at its pre-zoom Tiled slice), so pinning one would pin a mechanism rather than the behaviour. Also does not assert the split percentages (`orchestration/layout/008`), what is rendered into the rects (`render/layout/006`, Stacked only), or which tab the zoom belongs to (`orchestration/layout/009`).
+- **Asserts:** on a 100-wide frame every role pane's target PTY size is 64 inner columns unzoomed (the 66% column less its border) and 73 narrowed (matching `orchestration/layout/006`), while a ZOOMED tab targets 98 (the whole frame less its border) from either split state — including the non-focused role, which `pane_target_dims` sizes "as if focused" so it does not reflow twice on the way back. This is the seam that makes PRD #313's "PTY resize on zoom and unzoom" work: `agent_pty::resize()` is already called by the per-frame sweep and early-returns when neither dimension changed, so an implementation that widened only the drawn rect would leave every agent rendering at 64 columns inside a 98-column pane. Also pins that zoom reclaims WIDTH only — the row budget is identical zoomed and unzoomed — which is PRD #313's scope discipline: zoom gets the toggle and the indicator, and nothing else.
+- **Does not assert:** the SPAWN-time dims path that `orchestration/layout/006` covers for the narrow split. That path is deliberately out of reach here rather than skipped: zoom is per-tab and a newly opened tab always starts unzoomed (`orchestration/layout/009`), so a role pane can never be spawned into a zoomed tab and the spawn site has no zoomed case to get wrong. The per-frame sweep asserted here is the only seam through which a zoom reaches a PTY. Nor does it assert which panes are DRAWN: the "as if focused" dims this pins for the non-focused role are target PTY dims, not a claim that the pane appears on screen — it does not, and `orchestration/layout/002` is where "only the focused pane is drawn" is pinned.
 - **Platform coverage:** mac+linux+windows.
 
 ##### orchestration/layout/012 — The Dashboard zooms on the same terms as an orchestration tab: `(0, 100)` geometry, only the focused pane drawn, and the 33/67 default restored exactly on unzoom (PRD #313).
 - **Layer:** L1 (three `compute_frame_layout` passes over an `ActiveTabView::Dashboard`; no PTY, no TestBackend render). Lives in `src/ui.rs`'s own `#[cfg(test)]` module for the same reason its siblings do — `compute_frame_layout`, `ActiveTabView` and `FrameContent` are module-private.
 - **Agent:** none (two synthetic pane ids; the layout pass is a pure function of its inputs and spawns nothing).
-- **Asserts:** the Dashboard is the SAME SHAPE as an orchestration tab — a card sidebar beside a stack of agent panes, sharing `right_column_pane_dims` — so zoom is worth the same there and resolves the same way. Unzoomed the split is the Dashboard's own **33/67**, not orchestration's 34/66, which is what fails this test if zoom is wired to `orchestration_layout_percents` instead of `dashboard_layout_percents`. Zoomed it is `(0, 100)`: zero-width sidebar, pane column across the whole 100-column frame. Unzooming restores **33/67 exactly** rather than leaving the tab on some third geometry — PRD #313's "the same key restores the previous view exactly", asserted on the Dashboard half. Finally, under `PaneLayout::Tiled` a zoomed Dashboard hands the FOCUSED pane the entire pane column while the non-focused pane collapses to ZERO reserved height, so M1's "other panes are not drawn" half holds here through the same effective-`Stacked` resolution `orchestration/layout/011` pins for the Orchestration arm.
+- **Asserts:** the Dashboard is the SAME SHAPE as an orchestration tab — a card sidebar beside a stack of agent panes, sharing `right_column_pane_dims` — so zoom is worth the same there and resolves the same way. Unzoomed the split is the Dashboard's own **33/67**, not orchestration's 34/66, which is what fails this test if zoom is wired to `orchestration_layout_percents` instead of `dashboard_layout_percents`. Zoomed it is `(0, 100)`: zero-width sidebar, pane column across the whole 100-column frame. Unzooming restores **33/67 exactly** rather than leaving the tab on some third geometry — PRD #313's "the same key restores the previous view exactly", asserted on the Dashboard half. Finally, a zoomed Dashboard hands the FOCUSED pane the entire pane column while the non-focused pane collapses to ZERO reserved height, so M1's "other panes are not drawn" half holds here too.
 - **Does not assert:** the key that produces the toggle or its scoping (`orchestration/layout/007`); that the Dashboard's zoom flag is independent of an orchestration tab's; the `[Z]` marker on a zoomed Dashboard pane (`render/layout/006` pins the marker on the orchestration path).
 - **Platform coverage:** mac+linux+windows.
 
@@ -6622,6 +6669,29 @@ without depending on the config struct API.
 - **Does not assert:** a unit on a different agent from its dispatcher (that is `dispatch/single/002`, with stand-ins, because the harness runs only Claude Code headless); the dispatcher choosing the flags from a request in plain words (the directive gives it the command line); the completion report back to the dispatcher (`dispatch/return/006`).
 - **Platform coverage:** mac+linux, on a developer's machine only (lane 2 runs nowhere in CI).
 
+#### dispatch/dir
+
+##### dispatch/dir/001 — A unit dispatched with `--dir` into an existing worktree runs there, and closing it leaves the directory, its untracked files and its branch in place (PRD #468).
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_close_verb.rs`, the `CloseDeck` harness on the `minimal` fixture): the REAL `dot-agent-deck dispatch --dir <path> --single` and `close <name>` CLIs, each with the caller's own minted identity.
+- **Agent:** none. The identity-recording Python probes of `dispatch/close-verb/*`, which announce themselves as Claude Code and then `exec cat`.
+- **Asserts:** the dispatch succeeds into a `git worktree add` directory outside the deck's checkout, on its own branch, holding an untracked brief; the unit's record is rooted there and its card appears on the deck; the reply in the caller's inbox names the directory, its branch and that it is an existing directory; no `-dispatch-` sibling is created; after the unit reports, `close <name>` succeeds and says the directory was left in place, without pointing at `worktree reclaim`; the directory, the brief and the checked-out branch are all still there.
+- **Does not assert:** the interlock (`dispatch/dir/002`); an orchestration in an existing directory (`dispatch/dir/002`, and `dispatch::tests::e2e_only::a_dir_orchestration_starts_in_the_existing_directory_and_owns_nothing`); a `--dir` target that an earlier default dispatch created and still records, which follows that dispatch's own removal; the TUI's Ctrl+W close, which reads the same worktree registry `close` does.
+- **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]`).
+
+##### dispatch/dir/002 — A dispatcher continues in place with `dispatch --dir . --orchestration`, and a second unit into that directory is refused while the team runs (PRD #468).
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_close_verb.rs`, the `CloseDeck` harness): the REAL `dispatch --dir .` CLI run from the deck's own checkout as the caller.
+- **Agent:** none. The same identity-recording probes, as both roles of the fixture's `close-team`.
+- **Asserts:** with an untracked brief written into the caller's `.dot-agent-deck/`, the team's two roles come up rooted in the caller's own directory as roles of `close-team`, and a tab strip appears on the deck; the orchestrator context published there carries the task naming the brief; the brief is still in place, no `-dispatch-` sibling exists and the checked-out branch is unchanged. Then a second `dispatch --dir .` from the same caller is admitted by the CLI and refused by the daemon with a reply naming the directory, and starts nothing: the deck still holds exactly the caller and the two roles.
+- **Does not assert:** the interlock's other cases (a caller that is itself a role, a record spelled through a symlink: `dispatch::tests::the_interlock_*`); a real agent deciding to dispatch (`dispatch/dir/003`); delegation inside the continued team (`orchestration/dispatch/001`).
+- **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]`).
+
+##### dispatch/dir/003 — A real agent writes a brief and hands its work to a team in its own directory with `dispatch --dir .` (PRD #468).
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_dispatch_dir_live.rs`, `#![cfg(all(feature = "e2e", feature = "e2e-live", unix))]`): a real interactive agent opened as a plain pane through the new-pane form, which runs the real `dispatch` CLI itself.
+- **Agent:** Claude Code on Haiku as the agent that hands over, with imported credentials and per-folder trust; the team it starts is two `cat` roles.
+- **Asserts:** after the agent is told to write a uniquely named brief into `.dot-agent-deck/` and run `dispatch <name> --dir . --orchestration=<team> --task-file <brief>`, both roles come up rooted in the agent's own directory; the brief holds its marker where the agent wrote it; the orchestrator context published in that directory carries the brief's text; a tab strip appears; no `-dispatch-` sibling exists; and the agent is still running beside its team.
+- **Does not assert:** the agent deciding on its own that the work needs a team (the directive tells it to dispatch; escalating is the user's decision, PRD #468's scope); the team doing any work (its roles are stand-ins); the interlock (`dispatch/dir/002`).
+- **Platform coverage:** mac+linux, on a developer's machine only (lane 2 runs nowhere in CI).
+
 #### orchestration/roles
 
 ##### orchestration/roles/001 — Discover orchestrators and workers across folders through the roles CLI.
@@ -6863,7 +6933,7 @@ without depending on the config struct API.
 ##### session/restore/021 — A TUI reattaching to a warm daemon seats the rebuilt orchestration tab where the DAEMON registered its orchestrator, even where the config would seat another role (issue #523 review).
 - **Layer:** L2 (real-binary PTY via the vt100 `TuiDeck` harness, `tests/e2e_session_restore.rs`, two decks attached in turn to one external `daemon serve`).
 - **Agent:** none (both roles run `session/restore/011`'s recorder shell script, which self-posts `SessionStart` and appends its stdin to `record-<role>.log`; no LLM).
-- **Asserts:** with `session/restore/011`'s drift (the config seats `orchestrator`, index 0; the staged snapshot saved `coder`, index 1) restored into an empty external daemon, the prompt replays to `coder`'s inbox and the daemon holds exactly one `is_start_role` membership, on `coder` (both preconditions). After a detach-quit, a FRESH deck with no saved session (so no remembered focus) rebuilds the tab from the daemon's live panes; stepping Left onto the Dashboard and Right back onto the tab focuses `coder` (the switch-in fallback to the tab's seat): `PaneLayout::Stacked` expands `coder`'s pane and not `orchestrator`'s. Red before the fix, when the rebuild re-derived the seat from the config and the switch-in expanded `orchestrator`.
+- **Asserts:** with `session/restore/011`'s drift (the config seats `orchestrator`, index 0; the staged snapshot saved `coder`, index 1) restored into an empty external daemon, the prompt replays to `coder`'s inbox and the daemon holds exactly one `is_start_role` membership, on `coder` (both preconditions). After a detach-quit, a FRESH deck with no saved session (so no remembered focus) rebuilds the tab from the daemon's live panes; stepping Left onto the Dashboard and Right back onto the tab focuses `coder` (the switch-in fallback to the tab's seat): the pane column expands `coder`'s pane and not `orchestrator`'s. Red before the fix, when the rebuild re-derived the seat from the config and the switch-in expanded `orchestrator`.
 - **Does not assert:** the live-surface rebuild (`surface_one_orchestration`), which shares the seat helper `rebuilt_tab_seat` and its unit test `ui::tests::rebuilt_tab_seat_reads_only_the_panes_it_kept` (the discarded-duplicate case included); that `delegate` from the reattached tab routes (daemon-side, unchanged by a reattach); a remembered focus, which wins over the seat (`session/restore/016`); the landing frame itself, which draws card 0 when nothing is focused whatever the seat.
 - **Platform coverage:** mac+linux.
 
@@ -8048,7 +8118,7 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 
 ##### pane/restart/001 — Restarting a crashed worker without `--force` succeeds and the role stays reachable (issue #868).
 - **Layer:** L1/fast (in-process — the real `handle_restart_role_with_state` against a daemon-owned `cat`-orchestrator + a worker stand-in that exits on its own to simulate a crash; no daemon socket, no LLM).
-- **Agent:** none (synthetic — a `sleep 0.2` worker stand-in whose natural exit is what marks its `AgentRecord` `crashed == Some(true)`, mirroring the M1 precedent test's technique).
+- **Agent:** none (synthetic — a worker stand-in that exits after 0.2 s on its first run only, so its natural exit is what marks its `AgentRecord` `crashed == Some(true)`, mirroring the M1 precedent test's technique, while the restart's replacement, the same configured command run again, stays up as `cat` for the live-agent check).
 - **Asserts:** with the worker's record marked crashed, calling the handler from the orchestrator pane with `force: false` reports `restarted: true` and no error; the worker pane is now owned by a freshly spawned agent id (not the crashed one); a subsequent `delegate_targets` lookup from the orchestrator still resolves the role to the same pane.
 - **Does not assert:** the CLI/socket layer (`dot-agent-deck pane restart`) — this calls the handler directly, bypassing it.
 - **Platform coverage:** mac+linux (unix-only).
@@ -8342,14 +8412,14 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 ##### mouse/buttonbar/001 — At a comfortable width the global bar renders a button per command with its inline shortcut.
 - **Layer:** L1.
 - **Agent:** none.
-- **Asserts:** the bottom row shows `[New Agent Ctrl+N]`, `[Close Ctrl+W]`, `[Toggle Layout Ctrl+T]`, `[Help ?]`, and `[Quit Ctrl+C]`.
+- **Asserts:** the bottom row shows `[New Agent Ctrl+N]`, `[Close Ctrl+W]`, `[Help ?]`, and `[Quit Ctrl+C]`, and nothing naming `Layout` or `Ctrl+T` (PRD #312 removed that toggle).
 - **Does not assert:** click behavior (covered by `mouse/buttonbar/003`).
 - **Platform coverage:** mac+linux+windows.
 
 ##### mouse/buttonbar/002 — On a narrow/windowed terminal the full bar WRAPS to multiple rows keeping full labels (PRD #144 — no shortcut-only chips).
 - **Layer:** L1.
 - **Agent:** none (renders the full global + dashboard context bar at 80 cols into a multi-row area).
-- **Asserts:** at a narrow/windowed 80 cols the full `[Label Shortcut]` set (~133 cells) does not fit one row, so PRD #144 has the bar WRAP to multiple rows keeping the full label of every button — `[New Agent Ctrl+N]`, `[Close Ctrl+W]`, `[Toggle Layout Ctrl+T]`, `[Help ?]`, `[Quit Ctrl+C]`, and `[Schedules s]` all render somewhere across the rows — the shortcut-only `[Ctrl+N]` chip is absent, and the bar occupies ≥2 rows. Inverts the pre-#144 shortcut-only degradation.
+- **Asserts:** at a narrow/windowed 80 cols the full `[Label Shortcut]` set (~133 cells) does not fit one row, so PRD #144 has the bar WRAP to multiple rows keeping the full label of every button — `[New Agent Ctrl+N]`, `[Close Ctrl+W]`, `[Help ?]`, `[Quit Ctrl+C]`, and `[Schedules s]` all render somewhere across the rows — the shortcut-only `[Ctrl+N]` chip is absent, and the bar occupies ≥2 rows. Inverts the pre-#144 shortcut-only degradation.
 - **Does not assert:** exact column widths; which button lands on which row; the exact row count beyond "more than one".
 - **Platform coverage:** mac+linux+windows.
 
@@ -8432,14 +8502,14 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 ##### mouse/modal/001 — Modal dialog buttons fire their action like the keyboard.
 - **Layer:** L2.
 - **Agent:** none (synthetic card for config-gen; fixture `schedules.toml` via `DOT_AGENT_DECK_SCHEDULES` for the Schedules manager).
-- **Asserts:** quit-confirm `[Cancel]` dismisses (app stays), config-gen `[Never]` sets the "Config prompt suppressed" status, help `[Close]` closes the overlay, and the "Schedules" manager dialog's `[Delete]` button surfaces the definition-only delete-confirmation (`Delete schedule '<name>'?`) like pressing `d` (PRD #127 finding #4 — modal mouse parity).
+- **Asserts:** quit-confirm `[Cancel]` dismisses (app stays), config-gen offers Yes/No without Never or the obsolete automatic-prompt hint and `[No]` dismisses without preventing another manual request, help `[Close]` closes the overlay, and the "Schedules" manager dialog's `[Delete]` button surfaces the definition-only delete-confirmation (`Delete schedule '<name>'?`) like pressing `d` (PRD #127 finding #4 — modal mouse parity).
 - **Does not assert:** the destructive quit-confirm `[Detach]`/`[Stop]` (process-exit, keyboard-tested) or the star-prompt (not deterministically triggerable); the manager dialog's other clickable actions — `[Add]`/`[Edit]`/`[Run now]` — which the coder must also wire (and whose click outcomes are deferred).
 - **Platform coverage:** mac+linux.
 
 ##### mouse/modal/002 — Each modal renders explicit buttons alongside its existing selection list / hint.
 - **Layer:** L1.
 - **Agent:** none.
-- **Asserts:** quit-confirm `[Detach] [Stop] [Cancel]`, config-gen `[Yes] [No] [Never]`, star `[Star] [Snooze] [Dismiss]`, and help `[Close]` render while the existing list / hint text is still present (additive).
+- **Asserts:** quit-confirm `[Detach] [Stop] [Cancel]`, config-gen `[Yes] [No]`, star `[Star] [Snooze] [Dismiss]`, and help `[Close]` render with explanatory content; config-gen contains neither Never nor the inert automatic-prompt hint and has an insta snapshot.
 - **Does not assert:** click outcomes (covered by `mouse/modal/001`).
 - **Platform coverage:** mac+linux+windows.
 
@@ -8491,7 +8561,7 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 ##### mouse/help/001 — The `?` help overlay documents the canonical post-button-bar shortcut set.
 - **Layer:** L1.
 - **Agent:** none.
-- **Asserts:** the overlay documents the global commands the button bar advertises (Ctrl+N / Ctrl+W / Ctrl+T, `?`, Ctrl+C) plus the key dashboard / navigation actions, matched case-insensitively; its Mouse column has a `Drag` row reading `Select & copy` and a `Mouse click` row reading `Focus pane` (PRD #385 M7); the copy-mode row shows `v` by default and `x` once `[dashboard] copy_mode = "x"` is bound.
+- **Asserts:** the overlay documents the global commands the button bar advertises (Ctrl+N / Ctrl+W, `?`, Ctrl+C) and no layout toggle, plus the key dashboard / navigation actions, matched case-insensitively; its Mouse column has a `Drag` row reading `Select & copy` and a `Mouse click` row reading `Focus pane` (PRD #385 M7); the copy-mode row shows `v` by default and `x` once `[dashboard] copy_mode = "x"` is bound.
 - **Does not assert:** exact overlay layout / wording.
 - **Platform coverage:** mac+linux+windows.
 
@@ -8506,18 +8576,18 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 
 #### mouse/select
 
-##### mouse/select/001 — A drag in a pane that is not focused focuses it and copies its text in one gesture (PRD #385 M2).
+##### mouse/select/001 — A drag copies the text of the pane drawn under it, never a hidden pane's (PRD #385 M2).
 - **Layer:** L2 (real-binary PTY, SGR press / held-button motion / release, `tests/e2e_mouse_select.rs`).
 - **Agent:** none (two `bash` panes stand in for agents: one restored with `--continue`, one opened from the new-pane form with no command; each prints a shell-computed sentinel).
-- **Asserts:** with both panes tiled on the dashboard in command mode and the second one focused (thick `┃` border), one drag across the first pane's sentinel writes an OSC 52 sequence whose payload is exactly that sentinel and never the focused pane's, moves the thick border to the dragged pane, and shows the OSC 52-only status (`Sent to terminal clipboard (OSC 52)`), since the harness turns the native clipboard off.
+- **Asserts:** with the second pane focused and so the only one drawn (thick `┃` border in command mode), jumping to the first pane's card (`1`) draws that pane instead; one drag across its sentinel writes an OSC 52 sequence whose payload is exactly that sentinel and never the hidden pane's, leaves the dragged pane the one drawn, and shows the OSC 52-only status (`Sent to terminal clipboard (OSC 52)`), since the harness turns the native clipboard off.
 - **Does not assert:** the highlight's cells (`mouse/select/002`); the native clipboard write or its status wording (`clipboard/*`); orchestration-tab panes; a real agent.
 - **Platform coverage:** mac+linux.
 
-##### mouse/select/002 — A press in a pane that is not focused focuses it, and the drag highlights that pane (PRD #385 M2).
-- **Layer:** L1 (`PaneSelectionSeam`: inert panes tiled over a `TestBackend` frame, driven through the live loop's mouse functions; `insta` snapshot of the frame with the highlighted cells marked).
+##### mouse/select/002 — A drag in the drawn pane highlights that pane and nothing of the hidden one (PRD #385 M2).
+- **Layer:** L1 (`PaneSelectionSeam`: inert panes stacked in a `TestBackend` frame, only the focused one drawn, driven through the live loop's mouse functions; `insta` snapshot of the frame with the highlighted cells marked).
 - **Agent:** none.
-- **Asserts:** with pane `a` focused, a left press on pane `b`'s first cell focuses `b`; dragging four cells right highlights exactly `bravo` inside `b`'s content area and no cell of `a`.
-- **Does not assert:** copy delivery (`mouse/select/001`, `clipboard/*`); multi-click word/paragraph selection; the stacked layout, which draws only the focused pane.
+- **Asserts:** with pane `b` focused, pane `a` gets a zero-height rect and is not drawn; a left press on `b`'s first cell keeps `b` focused, and dragging four cells right highlights exactly `bravo` inside `b`'s content area, with none of `a`'s text on screen. (Until PRD #312 removed the tiled layout, this pressed a visible non-focused pane and asserted the press focused it.)
+- **Does not assert:** copy delivery (`mouse/select/001`, `clipboard/*`); multi-click word/paragraph selection.
 - **Platform coverage:** mac+linux+windows.
 
 ##### mouse/select/003 — A drag selection stays after the release and is cleared by a press, typing into its pane, a tab switch or its pane closing (PRD #385 M3).
@@ -8549,7 +8619,7 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 - **Platform coverage:** mac+linux+windows.
 
 ##### mouse/select/007 — A pane whose screen is larger than the pane copies exactly what the highlight is drawn over (PRD #385 decision 6).
-- **Layer:** L1 (`PaneSelectionSeam::tiled_with_screen`: the pane's vt100 screen sized apart from its pane, `tests/mouse_select.rs`).
+- **Layer:** L1 (`PaneSelectionSeam::stacked_with_screen`: the pane's vt100 screen sized apart from its pane, `tests/mouse_select.rs`).
 - **Agent:** none.
 - **Asserts:** with a 28 x 6 pane over a 20 x 50 screen (cursor on row 19), a drag on the first drawn row and a drag across three drawn rows copy the text the pane shows at the top-left of its screen, and the kept highlight shows that same text; with a 6 x 50 screen, the three-row drag, a double-click on a word that runs past the pane's right edge and a triple-click on the paragraph each copy only the drawn columns, matching the highlight; the triple-click on the 20 x 50 screen copies the drawn rows only.
 - **Does not assert:** a screen smaller than its pane (the cells past it are blank and trimmed from the copy); an orchestration tab, which draws panes through the same function.
@@ -8562,10 +8632,10 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 - **Does not assert:** that the banner comes back once the selection is cleared (it decays on its own timer); dialogs, which take every click while they are open.
 - **Platform coverage:** mac+linux+windows.
 
-##### mouse/select/009 — The stacked layout copies what is drawn, and a resize never leaves a highlight over other text (PRD #385 decision 6).
-- **Layer:** L1 (`PaneSelectionSeam`, stacked layout and frame resizes with the panes' screens left at their size).
+##### mouse/select/009 — The one drawn pane copies what is drawn, and a resize never leaves a highlight over other text (PRD #385 decision 6).
+- **Layer:** L1 (`PaneSelectionSeam`, two stacked panes and frame resizes with the panes' screens left at their size).
 - **Agent:** none.
-- **Asserts:** in the stacked layout, a drag on the first drawn row of a pane whose screen is larger than the pane copies `r00-ab` and the highlight shows the same; after `bravo` is copied, resizing the frame to 50 x 14, 30 x 8 or its own 40 x 12 leaves either no highlight or one showing exactly `bravo`.
+- **Asserts:** with two panes, only the focused one drawn, a drag on the first drawn row of a pane whose screen is larger than the pane copies `r00-ab` and the highlight shows the same; after `bravo` is copied, resizing the frame to 50 x 14, 30 x 8 or its own 40 x 12 leaves either no highlight or one showing exactly `bravo`.
 - **Does not assert:** that a selection survives a resize (it is cleared when its pane moves); the zoomed layout, which draws through the stacked one.
 - **Platform coverage:** mac+linux+windows.
 
@@ -8586,7 +8656,7 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 ##### mouse/select/012 — A frame that draws no pane leaves nothing to select: a drag where a hidden pane was drawn copies nothing (PRD #385 decision 6).
 - **Layer:** L1 (`PaneSelectionSeam::render_frame`: the run loop's `draw_frame` with the production layout of the active tab, `tests/mouse_select.rs`).
 - **Agent:** none.
-- **Asserts:** two orchestration role panes are drawn on their tab; after a switch to the dashboard, whose whole frame draws no pane while both keep running, a press, drag and release over the second pane's former cells copy nothing, leave the first pane focused and highlight nothing; a drag under way in a dashboard pane when the panes move to an orchestration (so the next frame draws none) copies nothing on release.
+- **Asserts:** the focused one of two orchestration role panes is drawn on their tab; after a switch to the dashboard, whose whole frame draws no pane while both keep running, a press, drag and release over that pane's former cells copy nothing, leave focus where it was and highlight nothing; a drag under way in a dashboard pane when the panes move to an orchestration (so the next frame draws none) copies nothing on release.
 - **Does not assert:** the real binary; a pane hidden while other panes are still drawn (the same post-frame check covers it).
 - **Platform coverage:** mac+linux+windows.
 
@@ -8845,7 +8915,7 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 ##### mode/chip/003 — Narrow mode chips disappear symmetrically without changing the bar's row budget.
 - **Layer:** L1 (ratatui `TestBackend` through the production bottom-bar renderer; no PTY or subprocess).
 - **Agent:** none.
-- **Asserts:** across every width 0–24, ` COMMAND ` is present if and only if ` TYPING ` is present, both are absent below the shared 10-column threshold and present at or above it, and Normal/PaneInput/Filter/Rename rendering never panics; the command bar's reserved and rendered rows remain 11/5/3/2/1 at widths 19/40/80/120/200.
+- **Asserts:** across every width 0–24, ` COMMAND ` is present if and only if ` TYPING ` is present, both are absent below the shared 10-column threshold and present at or above it, and Normal/PaneInput/Filter/Rename rendering never panics; the command bar's reserved and rendered rows remain 10/4/2/2/1 at widths 19/40/80/120/200 (one row fewer at 19, 40 and 80 than before PRD #312 removed the `[Toggle Layout]` button).
 - **Does not assert:** click dispatch, exact button placement within each wrapped row, or full-frame card geometry (covered by `render/layout/004`).
 - **Platform coverage:** mac+linux+windows.
 
@@ -8882,7 +8952,7 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 ##### mode/banner/005 — Same-drain mode edges preserve the command banner's real key semantics.
 - **Layer:** L1 (in-process production `handle_key_event` burst observer with no render between keys; no PTY or subprocess).
 - **Agent:** none (one inert focused pane).
-- **Asserts:** a queued double-`Ctrl+D` burst traverses Normal → PaneInput → Normal and re-expands the banner; `Ctrl+D` then bound `Ctrl+T` from PaneInput lands Normal → Normal and stays Collapsed; single bound `Ctrl+T`, bound-then-unbound-printable, and single PaneInput exit control rows retain their distinct Collapsed/Expanded outcomes, with the before-burst visibility pinned for every case.
+- **Asserts:** a queued double-`Ctrl+D` burst traverses Normal → PaneInput → Normal and re-expands the banner; `Ctrl+D` then bound `Ctrl+Z` (zoom) from PaneInput lands Normal → Normal and stays Collapsed; single bound `Ctrl+Z`, bound-then-unbound-printable, and single PaneInput exit control rows retain their distinct Collapsed/Expanded outcomes, with the before-burst visibility pinned for every case.
 - **Does not assert:** mouse bursts, wall-clock TTL expiry (covered by `mode/banner/003`), or rendered banner geometry.
 - **Platform coverage:** mac+linux+windows.
 
@@ -8928,7 +8998,7 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 ##### mode/scroll/005 — The cannot-scroll notice selects a safe render tier and stays transient, pane-local, and non-consuming.
 - **Layer:** L1 (in-process production wheel, boundary-sized one- and two-pane renders, single-line and rich block-tier command-banner overlays, production focus change, and full `handle_key_event` seams with injected `Instant`s and a recording child-input channel; no PTY subprocess).
 - **Agent:** none (agent-agnostic mature DECSTBM/cursor-repainting panes, including both panes in the focus-affinity frame).
-- **Asserts:** an inner pane exactly as wide as the production sentence renders the complete long tier, one column below it falls back to the centred short sentence, an inner pane exactly as wide as the short sentence still renders it without offering PageUp, and one column below that omits both tiers without modifying either border or any guard column beyond the pane — every boundary derived from the production constants' own lengths, never transcribed, so a reword cannot silently un-pin them; when the notice overlaps either the compact two-row single-line command banner or the roomy seven-row `BlockCommandModeWithSubtitle` tier, the intact notice renders exactly once as the frame's only reversed run, with no block-letter rows or `Ctrl+D to type` subtitle surviving anywhere, while the focused pane remains dimmed in command mode; after production focus moves from pane A to pane B, exactly one notice remains on A and none appears on B; the normal wide notice remains a single centred REVERSED line reporting only what was observed — this pane has no scrollback and there is nothing to scroll — without suggesting PageUp and without asserting the agent's rendering model; it clears exactly at the shared 2.5-second `COMMAND_BANNER_TTL`, refreshes without duplication through the original expiry, and clears at the refreshed expiry; the next unbound printable and bound Ctrl+D each dismiss it without losing normal child forwarding or mode transition.
+- **Asserts:** an inner pane exactly as wide as the production sentence renders the complete long tier, one column below it falls back to the centred short sentence, an inner pane exactly as wide as the short sentence still renders it without offering PageUp, and one column below that omits both tiers without modifying either border or any guard column beyond the pane — every boundary derived from the production constants' own lengths, never transcribed, so a reword cannot silently un-pin them; when the notice overlaps either the compact two-row single-line command banner or the roomy seven-row `BlockCommandModeWithSubtitle` tier, the intact notice renders exactly once as the frame's only reversed run, with no block-letter rows or `Ctrl+D to type` subtitle surviving anywhere, while the focused pane remains dimmed in command mode; after production focus moves from pane A to pane B, the frame (which draws only B) shows no notice, and once focus returns to A within the notice's lifetime the notice is still on A; the normal wide notice remains a single centred REVERSED line reporting only what was observed — this pane has no scrollback and there is nothing to scroll — without suggesting PageUp and without asserting the agent's rendering model; it clears exactly at the shared 2.5-second `COMMAND_BANNER_TTL`, refreshes without duplication through the original expiry, and clears at the refreshed expiry; the next unbound printable and bound Ctrl+D each dismiss it without losing normal child forwarding or mode transition.
 - **Does not assert:** the intermediate five-row `BlockCommand` geometry or exact block-glyph shapes (the richest seven-row tier pins whole-banner suppression); real terminal mouse-report decoding (covered by the next scanner delegation); wall-clock scheduling in the live 16ms loop; horizontal multi-column pane geometry; real-agent behavior; or that any particular agent produces the synthetic repaint pattern.
 - **Platform coverage:** mac+linux+windows.
 
@@ -11378,7 +11448,6 @@ S-21 re-oracles the attached draft/no-cap and empty-navigation functions in `tes
 - **Agent:** none at test time; the payloads are Claude Code 2.1.310's and Codex 0.164.0's and 0.160.0's, captured with the token-led line submitted.
 - **Asserts:** the token-led doorbell line is read off each agent's real prompt payload with its token and message, `exact` only when the whole prompt (whitespace aside) is that one line and `with_other_text` when it is among other text; the line naming the deck by an absolute path, a quoted path with a space or an escaped quote is the same exact ring as the recorded bare-name line (issue #1730), and one whose command is two words is no ring; an older deck's untokened line, a malformed token and an invalid message id are no ring. The hook's doorbell fetch carries the ring's token and shape only for the message the line named, and without a ring its wire is an older hook's; an unknown shape decodes as unknown. Through the real hook socket, a fetch carrying a ring reaches the pane's evidence channel with the generation its token attests, the message, the token and the shape, although its fetch granted nothing; a fetch from an older hook with no ring and one attested to another pane put nothing on the channel. A generation's latch cell moves only forward, each move on its own attempt: an attempt opens once, ends with nothing written, suspends, and is resolved by exact evidence (late, once suspended), by the user, by a withdrawal or a transcript echo; a move naming another attempt (an older one, or a later one's suspension, exact evidence, transcript echo or withdrawal on an open or a suspended cell), a backward move (`Resolved(a)` to `Suspended(a)`, a re-suspension, an older attempt reopening) and anything after retirement are refused, and retirement between an attempt's allocation and its Open move leaves it writing nothing. Attempt numbers started just below the reserved maximum use the last one once and then refuse (`attempt_exhausted`) without repeating. Exact evidence that reaches the hook arm before the suspension's compare-and-swap resolves the open attempt, the suspension then fails and the transaction reports Submitted with nothing shown. The ring correlates the last 64 attempts: the 65th evicts the first, whose late evidence is a miss, a copy taken before the eviction cannot move a later attempt's cell, an older attempt's token and a report with other text move nothing, and each entry is one packed store. A re-projection request held back past a user clear, late exact evidence or an in-pause resolution shows the state when it runs and never carries the suspension; one for a generation no longer current touches nothing, its own cell suspended or not, while the successor's shows its own state; the positive control shows the suspension, then the clear's request shows it cleared, each broadcast once. Through the real hook socket, with nothing listening on the pane's channel, a generation's own exact ring evidence moves its open attempt's latch cell to submitted on receipt, while evidence shaped with other text, or from another pane's hook, moves nothing. On the real writer, the user's own submit resolves a suspended attempt as the user's while the deck's own Enter lifts nothing, and closing the generation retires its cell for good. Through the real adapter, with a ring unresolved because the model editor dropped its Enter and a draft of the user's in the tracker, an older attempt's token reported exact moves nothing, while this attempt's token reported exact resolves it late (`late_exact`), lifts the suspension, clears the card and leaves the draft bit set.
 - **Does not assert:** a real agent's prompt hook reporting late.
-- **Quarantined:** `doorbell_046_late_exact_evidence_resolves_only_its_attempt_through_the_hook_arm` (`src/agent_pty.rs`) carries `#[ignore = "quarantined: vfarcic, #2345"]` (CLAUDE.md rule 6): its first ring read `AwaitingPrompt` once under the full release-profile lib run and passed 100 of 100 alone. Until it is lifted, the late-evidence path through the real adapter that **Asserts** describes (an older attempt's exact token moving nothing, this attempt's resolving it late as `LateExact`, lifting the suspension and clearing the card while the user's draft stays) runs in no lane; the hook arm's receipt is still covered by `doorbell_046_the_hook_arm_resolves_the_open_attempt_on_receipt` in `src/daemon.rs`. #2345 has the evidence and what lifts the quarantine.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/doorbell/047 — An empty composer alone, or a line in the transcript that is not the user's whole message, is never a submit.
@@ -11914,6 +11983,14 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Does not assert:** the fourth refusal counting (`inbox/probe/101`), a real agent, the doorbell tick asking the recheck on its own, or the writer's own screen refusal.
 - **Platform coverage:** Linux.
 
+##### inbox/probe/103 — A Codex that `/cd` or `/worktree` moved to another folder is not checked again, and a status line the deck can't read holds the check.
+
+- **Layer:** fast (`tests/codex_session_cwd.rs`; `src/agent_pty_segments.rs`, Linux) over real Codex 0.164.0 frames (`tests/fixtures/codex-inbox/release-0.164.0/session-cwd/`) and pure inputs; L2 real agent, lane 2 (`tests/e2e_composer_check_codex_live.rs`, Linux): the TUI harness, a plain `codex …` pane the build installs (`tests/support/codex_installed.rs`), the production doorbell tick asking the check, the person typing through a client attached to the pane.
+- **Agent:** none in the fast tier (recorded frames); real interactive Codex on `common::codex_test_model()` in lane 2, nothing submitted.
+- **Asserts:** `probe_103_the_status_line_on_codexs_measured_screens`: the status line read off each recorded frame is exactly what Codex drew, and compared with the folder Codex started in it passes at the start and after `/cd` back, is a move after `/cd` into another folder, into one under `HOME` and after `/worktree`, and holds without a move when an 80-column pane cuts the long path with `…` or there's no `HOME` to resolve a `~`. `probe_103_no_status_line_is_read_off_codexs_ready_screen`: a screen that isn't Codex's ready box, a drawn indent and a character two columns wide give no line. `probe_103_codexs_status_line_against_the_start_folder`: Codex's spelling (`~`, `~/…` by component, absolute elsewhere, a trailing slash on `HOME`), a thread name after the folder, the folder first, another folder, a folder below the start folder, a line cut short, none or two folder items, a folder holding the separator, a doubled space, no line, no `HOME` and a non-UTF-8 start folder. With a folder beside the start folder named like it and ` · `, anything after the matching folder holds (the Greptile review's P1: Codex in `proj · copy` draws the line of `proj` with a thread named `copy`), and the folder alone still passes. `probe_103_folders_named_like_the_start_folder_and_more_are_found`: only a sibling named like the start folder followed by ` · ` counts (not the folder's own contents, `proj copy`, `projx · y` or a `proj ·` file), `/` looks in `/`, and an unreadable parent counts. `probe_103_a_moved_codex_session_holds_for_the_rest_of_the_generation`: a line the deck can't read holds that check alone; another folder holds and latches, the start folder shown again and the unchanged sources included; no folder to compare with holds; a new generation passes; a thread name after the folder passes only after a check found no such sibling, and holds once a check finds one. `probe_103_the_admitted_frame_carries_the_session_check` (source order): the request compares the status line on the marked frame, after its surface, before the deciding admission, only when the surface passes. `probe_103_live_a_codex_moved_by_cd_is_not_checked`: after `/cd` into a sibling folder whose project file moves the editor to F6, with a task queued, the check is refused `Keymap(Changed)`, the record's `wake_hold` reads `cannot_check`, and for 20 s the deck types nothing, rings nothing and the task stays queued.
+- **Does not assert:** `/resume` (the recorder's picker listed no session offline); a status line configured without the folder, or a thread name spelled as a path, against real Codex; the desktop client, which reads the same `wake_hold`.
+- **Platform coverage:** the frame and comparison tests on every platform; the source-order and lane-2 tests on Linux.
+
 ##### inbox/probe/040 — A person's Ctrl+G during the deck's check of a real Claude Code input box loses none of their typing.
 
 - **Layer:** L2 real agent, lane 2 (`tests/e2e_composer_check_claude_live.rs`, Linux): the TUI harness, one fresh deck per trial, a plain `claude …` pane the build installs (`tests/support/claude_installed.rs`), and the production doorbell tick choosing and writing the check. No e2e editor-probe assumption; the helper's e2e pause seam (`DOT_AGENT_DECK_E2E_HELPER_PAUSE`, at `start` and `ready`) and trace are driven by a releaser thread that lets every pause go at once except the trial's target.
@@ -11926,8 +12003,7 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 
 - **Layer:** L2 real agent, lane 2 (`tests/e2e_composer_check_codex_live.rs`, Linux): the TUI harness, one fresh deck per trial, a plain `codex …` pane with its agent declared (`Direct(Codex)`, `tests/support/codex_installed.rs`), the person typing through a client attached to the pane. It runs on the build's own Codex activation (Q35-29: `Direct(Codex)` in `INSTALL_ROLLOUT`, Codex's `editor_probe` verified) with no e2e assumption; `codex_installed::checkable` reports `SKIP:` on a build without it. Each deck's `CODEX_HOME` is fresh, so its pane is Codex's first start there, and Codex's own `config.toml` writes land during the trial (the key-binding guard accepts them; no warm-up start). Codex runs in a `project` folder of the fixture's working directory that doesn't hold the deck's HOME (`codex_installed::project_dir`): Codex writes its editor file under the first of `$CODEX_HOME`, `~/.codex` and `<cwd>/.codex` its sandbox can't write, and the deck reads only `$CODEX_HOME/editor`, so a HOME inside the folder Codex works in (the harness's default) made every check `NotOwned(Shape)`, `Uncertain` (cxact's first run; `docs/develop/doorbell-admission.md`, the Codex activation's item 8).
 - **Agent:** real interactive Codex on `common::codex_test_model()`, nothing submitted.
-- **Asserts:** Codex's box is checked only while Codex draws its placeholder (admission's `placeholder_empty` conjunct), so, unlike `040`, each trial starts from a box the person typed `BASE` into and deleted: with Codex's placeholder back over that touched box, a posted task brings the deck's check, and while that check's own helper (the trace's first branch after arming must be `Armed`) is held at its pause, `EARLY`, Ctrl+G and `LATE` are typed 250 ms apart. Every trial ends with exactly `EARLYLATE` in the box and, for three seconds more, the task undelivered: the check read a box the person has typed into since, so it rings nothing. Every trial also asserts the route: the person's editor ran exactly once, opened on `EARLY`, and read exactly `LATE` from its terminal. Four paths, `DAD_PROBE_041_TRIALS` trials each (20 by default), each asserting the helper exit that defines it: `probe_041_live_delayed_report_keeps_overlapping_typing` (held 1 s before its report: one exit, `Mine { read: Empty }` with `notice: false`), `probe_041_live_failed_report_with_notice_keeps_overlapping_typing` (2.5 s, past the exchange's 2 s bound: one exit with `notice: true`), `probe_041_live_late_helper_keeps_overlapping_typing` (11 s at its start, past the 10 s trigger wait: one exit, `Mine { read: Empty }`) and `probe_041_live_killed_helper_keeps_overlapping_typing` (SIGKILLed by captured pid 1 s in: no exit). `DAD_PROBE_041_OUT` appends each row as JSON.
-- **Quarantined:** `probe_041_live_late_helper_keeps_overlapping_typing` is `#[ignore = "quarantined: vfarcic, #2264"]` (CLAUDE.md rule 6): on 2026-11-10 it failed 3 of 5 runs on a late trial with the box at `EARLY`, the person's editor having read nothing of `LATE`; #2264 has the failing row and what lifts the quarantine. Run it with `--run-ignored only`.
+- **Asserts:** Codex's box is checked only while Codex draws its placeholder (admission's `placeholder_empty` conjunct), so, unlike `040`, each trial starts from a box the person typed `BASE` into and deleted: with Codex's placeholder back over that touched box, a posted task brings the deck's check, and while that check's own helper (the trace's first branch after arming must be `Armed`) is held at its pause, `EARLY`, Ctrl+G and `LATE` are typed 250 ms apart. Every trial ends with exactly `EARLYLATE` in the box and, for three seconds more, the task undelivered: the check read a box the person has typed into since, so it rings nothing. Every trial also asserts the route: the person's editor ran exactly once, opened on `EARLY`, and read exactly `LATE` from its terminal. Four paths, `DAD_PROBE_041_TRIALS` trials each (20 by default), each asserting the helper exit that defines it: `probe_041_live_delayed_report_keeps_overlapping_typing` (held 1 s before its report: one exit, `Mine { read: Empty }` with `notice: false`), `probe_041_live_failed_report_with_notice_keeps_overlapping_typing` (2.5 s, past the exchange's 2 s bound: one exit with `notice: true`), `probe_041_live_late_helper_keeps_overlapping_typing` (11 s at its start, past the 10 s trigger wait: one exit, `Mine { read: Empty }`) and `probe_041_live_killed_helper_keeps_overlapping_typing` (SIGKILLed by captured pid 1 s in: no exit). `DAD_PROBE_041_OUT` appends each row as JSON, and a missed trial's whole deck log beside it.
 - **Does not assert:** a check over a visible draft (none is admitted); a second overlap in one pane (the person's own editor leaves the pane's writer scope open under `Hold`); Codex 0.160.0 (not installed here); the desktop client.
 - **Platform coverage:** Linux.
 
@@ -13289,7 +13365,7 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 ##### inbox/claude/051 — A doorbell hook commits only what the transcript shows Claude took (issue #2341).
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), real hook CLI children and the real `inbox witness` they start, a session transcript the test writes as Claude Code records one, a 15 s ack-wait (a 10 s witness window).
 - **Agent:** none (synthetic Claude parent; no credential).
-- **Asserts:** with `transcript_path` naming an existing transcript, the real prompt hook prints the task's block as before, and the task stays Fetched for 1.5 s; it is Acknowledged with one delivery only after the transcript gains a `hook_additional_context` attachment carrying that context. A second task whose prompt is blocked (the transcript gains only Claude's `system` entry for a blocked prompt) stays Fetched; once the witness gives up, a later doorbell hands it over as `delivery 1.2` with the possible-repeat line, still Fetched until the transcript records that context, then Acknowledged with two deliveries.
+- **Asserts:** with `transcript_path` naming an existing transcript, the real prompt hook prints the task's block as before, and the task stays Fetched for 1.5 s; it is Acknowledged with one delivery only after the transcript gains a `hook_additional_context` attachment carrying that context. A second task whose prompt is blocked (the transcript gains only Claude's `system` entry for a blocked prompt) stays Fetched; once the witness reads the block (issue #2347: at once, rather than when its window ends), a later doorbell hands it over as `delivery 1.2` with the possible-repeat line, still Fetched until the transcript records that context, then Acknowledged with two deliveries.
 - **Does not assert:** a real Claude Code's transcript or a real blocking hook (`inbox/claude/053`); a payload with no transcript, which commits what it printed (`inbox/claude/019`).
 - **Platform coverage:** mac+linux.
 
@@ -13300,11 +13376,18 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Does not assert:** a payload with no transcript, which commits at once (`inbox/claude/016`).
 - **Platform coverage:** mac+linux.
 
-##### inbox/claude/053 — Live: a doorbell prompt another hook blocks is not acknowledged, and is handed over again (issue #2341).
+##### inbox/claude/054 — A prompt another hook blocks ends the turn its hook reported (issue #2347).
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), real hook CLI children and the real `inbox witness` they start, a session transcript the test writes as Claude Code 2.1.328 records one.
+- **Agent:** none (synthetic Claude parent; no credential).
+- **Asserts:** after a `Stop` the card reads Idle; an ordinary prompt (no deck message) reported by the real prompt hook with `transcript_path` set makes it Thinking, and once the transcript gains Claude's `system` entry for that exact prompt blocked by a hook, the card reads Idle again. A prompt the transcript shows taken keeps the card Thinking, and a further prompt blocked while that turn runs leaves it Thinking for 3 s.
+- **Does not assert:** a real Claude Code or a real blocking hook (`inbox/claude/053`); the entry's recognition rules case by case (`inbox_witness` unit tests); the daemon's guard case by case (`state` unit test `a_dropped_prompt_ends_only_the_turn_it_started`).
+- **Platform coverage:** mac+linux.
+
+##### inbox/claude/053 — Live: a doorbell prompt another hook blocks is not acknowledged, and is handed over again (issues #2341, #2347).
 - **Layer:** L2 lane 2 (`tests/e2e_inbox_claude_live.rs`), the real TUI in a PTY, in the `claude-blocking-hook` fixture: a project `.claude/settings.json` whose own `UserPromptSubmit` hook blocks the first prompt carrying a deck doorbell line and leaves a marker. The scratch pane's armed waiter is killed, so the doorbell is the wake path.
 - **Agent:** Claude Code (Haiku).
-- **Asserts:** the doorbell rings and the project hook blocks its prompt (the marker); for 30 seconds, longer than the transcript witness watches, the task is not acknowledged and the sentinel is not written. After a short prompt typed into the pane, Haiku writes the sentinel exactly once and the task is acknowledged with two deliveries.
-- **Does not assert:** which route hands the task over again (the doorbell, the waiter armed at the turn's end, or a fetch Haiku runs); the deck's card while the blocked prompt leaves it reading busy.
+- **Asserts:** the doorbell rings and the project hook blocks its prompt (the marker). The card then reads Idle (issue #2347), and the doorbell's hold is `AwaitingPrompt` (its `doorbell hold` log line), since Claude Code put the blocked line back in its input box. Once the test presses Enter in the pane, sending that line, the deck's hook hands the task over again; Haiku writes the sentinel exactly once and the task is acknowledged with two deliveries.
+- **Does not assert:** a blocked prompt the user typed; the deck clearing the restored line itself, which it does not do; a box the user clears by hand, after which the doorbell holds as `NeedsFetch`.
 - **Platform coverage:** linux.
 - **Cost:** one or two cheap model turns.
 
@@ -13449,11 +13532,11 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Does not assert:** the stderr and exit status of the real hook (inbox/claude/028, /037, /043).
 - **Platform coverage:** mac+linux.
 
-##### inbox/claude/054 — Live: a conversation resumed from Claude Code's background session host takes its messages (issue #2342).
+##### inbox/claude/055 — Live: a conversation resumed from Claude Code's background session host takes its messages (issue #2342).
 - **Layer:** L2 lane 2 (`tests/e2e_inbox_claude_live.rs`), the real TUI in a PTY.
 - **Agent:** Claude Code (Haiku).
 - **Asserts:** a first sentinel-writing task is woken natively, written once and acknowledged after one hand-over in the foreground conversation; Left in the empty input box shows `Your conversation moved to the background`, a `bg-pty-host` running a conversation (`--session-id`) appears under the test's HOME, Escape (retried while Claude Code answers `Still starting`) brings the pane back to the conversation, and the background session arms a waiter for its `fork` session; a second sentinel-writing task posted then is written once and acknowledged after one hand-over (issue #2342: before the fix it went to the foreground's superseded waiter and stayed `fetched`).
-- **Test:** `claude_054_live_a_conversation_resumed_from_the_background_host_takes_its_messages` in `tests/e2e_inbox_claude_live.rs`.
+- **Test:** `claude_055_live_a_conversation_resumed_from_the_background_host_takes_its_messages` in `tests/e2e_inbox_claude_live.rs`.
 - **Does not assert:** which wake reached the resumed conversation (its waiter or the doorbell); a brand-new session started from the overview, a nested agent a tool starts, or a host of another executable, which keep the pin where it is (`a_background_session_takes_the_pin_from_its_own_foreground`, `a_claude_background_session_is_placed_by_its_ancestry_only`); a conversation returned to the foreground process; macOS; or the `/resume` command.
 - **Platform coverage:** linux.
 - **Cost:** two cheap model turns.
@@ -13463,7 +13546,7 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Agent:** Claude Code, Haiku.
 - **Asserts:** with the pane's process a `sleep` and Claude Code started by a subshell that exits, `ps` shows Claude outside that process's tree; an idle native waiter armed from Claude's own hook (outside the tree) wakes it for a posted task with no doorbell; the sentinel is appended once, the message is acknowledged after one hand-over and the card shows ✉ (PRD #1666 part 3, R-1).
 - **Test:** `claude_046_live_outside_the_recorded_tree_takes_and_acknowledges` in `tests/e2e_inbox_claude_live.rs`.
-- **Does not assert:** Claude Code's own background session host (`inbox/claude/054`) or `/resume` (a stand-in that keeps the same process relationship and environment), or other agents.
+- **Does not assert:** Claude Code's own background session host (`inbox/claude/055`) or `/resume` (a stand-in that keeps the same process relationship and environment), or other agents.
 - **Platform coverage:** mac+linux.
 
 ##### inbox/claude/011 — Idle interactive Haiku wakes natively, acts once and labels the deck task.
@@ -13626,6 +13709,20 @@ The kept-on-Enter draft function moves to `tests/e2e_probe_delivery.rs` in S-21,
 - **Agent:** none (`tests/support/codex_composer.py`, as in `inbox/codex/027`, with trusted hooks and the assumed `head_echo`). No hook is run by hand before a ring: the generation's first own hook is the prompt hook the ring's Enter brings, as with a real Codex.
 - **Asserts:** a fresh measured Codex with no own hook gets the token head, the rest and one Enter after its settle window, with the attempt logged `hook_route=false`, and the task acknowledged; a replacement whose predecessor reported Idle, and which gets a shell-idle report carrying the predecessor's session, gets no byte until it draws its own composer, then only its own task; a fresh Codex behind its update, folder-trust or hooks-review dialog gets no byte until the dialog closes, then is rung with no prompt typed; a screen with no start-up header (a resumed session's) gets no byte, logged `unknown_release`, the card holding as `cannot_type`; a launcher's own output before the Codex screen does not stop the ring, while a launcher that prints a header-shaped line in raw mode and draws no composer gets no byte, the card holding as `awaiting_prompt`; at 24 × 80, where the start-up frame has no width witness, a fresh Codex is rung on agreement after its settle window, the token head first, and the task acknowledged (issue #2262).
 - **Does not assert:** a real Codex (lane 2's `inbox/codex/009` and `010`), the untrusted-hooks path, or that the header and composer come from Codex: they are screen recognisers, and a launcher that draws the whole measured screen is not told apart.
+- **Platform coverage:** mac+linux.
+
+##### inbox/codex/029 — A Codex doorbell hook commits only what the rollout shows Codex took (issue #2346).
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`), the real wrapper, hook CLI children and the real `inbox witness` they start, a Codex rollout the test writes as Codex 0.164.0 records one, a 15 s ack-wait (a 10 s witness window).
+- **Agent:** none (synthetic Codex; no credential).
+- **Asserts:** with `transcript_path` naming an existing rollout, the real prompt hook prints the task's block as before, and the task stays Fetched for 1.5 s; it is Acknowledged with one delivery only after the rollout gains the prompt as a `user` message and that context as a `developer` message. A second task whose turn is interrupted (the rollout gains only Codex's `turn_aborted` records) stays Fetched; once the witness gives up, a later doorbell hands it over as `delivery 1.2` with the possible-repeat line, still Fetched until the rollout records that context, then Acknowledged with two deliveries. A third task whose prompt another hook blocks (the rollout gains the context as a `developer` message and no `user` message, as Codex keeps it) is Acknowledged with one delivery.
+- **Does not assert:** a real Codex's rollout or a real interrupt (`inbox/codex/031`); a payload with no `transcript_path`, which commits what it printed (`inbox/codex/018`).
+- **Platform coverage:** mac+linux.
+
+##### inbox/codex/030 — A Codex `Stop` hand-over commits only what the rollout shows Codex went on with (issue #2346).
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex.rs`), as `inbox/codex/029`.
+- **Agent:** none (synthetic Codex; no credential).
+- **Asserts:** with `transcript_path` naming an existing rollout, the real `Stop` hook prints the task as its block reason, and the task, whose body holds `<`, `>` and `&`, stays Fetched for 1.5 s; it is Acknowledged with one delivery only after the rollout gains that reason as a `user` message inside `<hook_prompt>`, its `&`, `<` and `>` escaped as Codex 0.164.0 escapes them. A second task whose turn is interrupted stays Fetched; a later `Stop` hands it over as `delivery 1.2` with the possible-repeat line, and the rollout recording that reason acknowledges it with two deliveries.
+- **Does not assert:** a real Codex's rollout or a real interrupt (`inbox/codex/032`); a payload with no `transcript_path` (`inbox/codex/019`).
 - **Platform coverage:** mac+linux.
 
 
@@ -14562,11 +14659,11 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
 
-##### inbox/route/007 — Request configuration generation from a live synthetic card through the real TUI and accept the dialog. One bound configuration prompt must be queued without typed content; after Idle its pane fetches and renders the instructions.
-- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
+##### inbox/route/007 — Confirm config generation in the attached TUI and also request it through the daemon verb; both deliver the exact prompt for the target directory.
+- **Layer:** L1 in-process action dispatch and rendered status row; L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
 - **Agent:** none.
-- **Asserts:** Request configuration generation from a live synthetic card through the real TUI and accept the dialog. One bound configuration prompt must be queued without typed content; after Idle its pane fetches and renders the instructions.
-- **Test:** `route_007_tui_config_generation_posts_bound_message` in `tests/e2e_inbox_route.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
+- **Asserts:** confirming Yes in the real TUI opens a socket-started agent's previously unopened pane in typing mode, displays its output, and sends typed approval there; confirming Yes and calling the daemon's `generate-config` verb each queue one bound message with a complete body equal to `config_gen_prompt` for the daemon-reported target cwd; after Idle its pane fetches the instructions without typed prompt content. L1 covers mouse and keyboard confirmation with successful hydration, unavailable hydration and refused bound focus: typing starts after successful focus, and a failed focus keeps the card in command mode with the sent notice visible.
+- **Tests:** `route_007_tui_config_generation_posts_bound_message` in `tests/e2e_inbox_route.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane. `route_007_sent_config_opens_an_unwired_pane_or_keeps_the_card` in `src/ui.rs`.
 - **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
 
@@ -14600,6 +14697,22 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Does not assert:** a spool write the sandbox denies (`inbox/codex/020`), or Codex showing a failing hook's stderr.
 - **Cost:** one cheap model turn.
 - **Platform coverage:** mac+linux.
+
+##### inbox/codex/031 — Live: a doorbell hand-over Codex drops on an interrupt is not acknowledged, and is handed over again (issue #2346).
+- **Layer:** L2 real agent, lane 2 (`tests/e2e_inbox_codex_live.rs`), attached interactive PTY, the pane started with `DOT_AGENT_DECK_INBOX_TEST_HOLD_AFTER_PRINT` (an `e2e`-build knob): a deck hook that has printed a hand-over holds while a file the test owns exists, keeping open the window between the hook's write and Codex taking its output.
+- **Agent:** Codex at the installed release, cheap model from `codex_test_model()`.
+- **Asserts:** the doorbell rings (or, when a starved machine makes the deck withdraw its ring before Codex submits it, the test submits the same doorbell line itself), the prompt hook prints the task and holds; the test presses Esc in Codex's pane, Codex shows `Conversation interrupted`, and the hook is released. For 30 seconds, longer than the witness watches, the task is not acknowledged and the sentinel is not written. Once Codex takes its messages again (the deck's own ring, or a prompt the test types after 45 s), Codex writes the sentinel once and the task is settled by its receipt with two deliveries.
+- **Does not assert:** the deck's own ring (`inbox/codex/009`); which route hands the task over again; a prompt another hook blocks, whose context Codex keeps (`inbox/codex/029`, measured in the PR for #2346); the card's status after the interrupt.
+- **Platform coverage:** linux.
+- **Cost:** one or two cheap model turns.
+
+##### inbox/codex/032 — Live: a `Stop` hand-over Codex drops on an interrupt is not acknowledged, and is handed over again (issue #2346).
+- **Layer:** L2 real agent, lane 2 (`tests/e2e_inbox_codex_live.rs`), as `inbox/codex/031`.
+- **Agent:** Codex at the installed release, cheap model from `codex_test_model()`, running a slow shell directive.
+- **Asserts:** with the task posted while the directive runs, Codex's `Stop` hook prints it as its block reason and holds (`TurnEndHook` in the deck log); the test presses Esc, Codex shows `Conversation interrupted`, and the hook is released. For 30 seconds the task is not acknowledged and the sentinel is not written; once Codex takes its messages again it writes the sentinel once and the task is settled by its receipt with two deliveries.
+- **Does not assert:** which route hands the task over again; the card's status after the interrupt.
+- **Platform coverage:** linux.
+- **Cost:** two or three cheap model turns.
 
 `inbox/codex/012`–`017` are retired, and with them the Codex composer gate they pinned, its retained-draft hold, the flush of a stranded line and the cleanup CR. The deck still types into a measured Codex release, in two stages (`inbox/codex/027`); `inbox/codex/004`–`006` and `024` pin that nothing is typed into a Codex whose release the deck cannot read.
 
@@ -15854,6 +15967,39 @@ These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[
 - **Asserts:** both daemons give their agent the same id (required, not assumed); with All Decks selected the window shows two connected sections, each holding only its own deck's row, with both lamps connected and the deck counter at `2/2`; after the far daemon is stopped, its section stays, reads disconnected with a disconnected lamp and lists no agents, while the local deck keeps exactly its own row and its connected lamp, and the counter reads `1/2`.
 - **Does not assert:** three or more decks, a deck waiting to report, an unconfigured deck-list row, a deck coming back, New agent or a pane on the far deck, or a far deck on another machine; the far deck shares this machine's filesystem, so it says nothing about a window rendering a far host's paths.
 - **Platform coverage:** Linux WebKitGTK only. Needs a system `sshd` (`DAD_DRIVER_SSHD`) and `libnss_wrapper.so` (`DAD_DRIVER_NSS_WRAPPER`); the scenario fails naming whichever is missing.
+
+## Desktop configuration generation scenarios
+
+These desktop Rust and Vitest tests live outside the root Rust spec scanner, as do the native desktop scenarios below.
+
+#### desktop/config-gen
+
+##### desktop/config-gen/001 — Generation reaches the selected agent's owning daemon and preserves each outcome.
+- **Layer:** fast-tier Rust socket tests and Vitest bridge tests.
+- **Agent:** none (scripted daemon).
+- **Tests:** `config_gen_001_desktop_routes_to_the_owner_and_maps_every_outcome`, `config_gen_001_desktop_refuses_a_restarted_target`, and `config_gen_001_desktop_timeout_uses_the_shared_client_failure_sentence` in `desktop/src-tauri/src/dto.rs`; `desktop/config-gen/001: …` in `desktop/src/lib/bridgeIncarnation.test.ts`.
+- **Optional field:** `agent_mapping_is_frontend_stable` in `desktop/src-tauri/src/dto.rs` also checks that daemon `project_config_exists` true/false/unknown maps to desktop `projectConfigExists` without losing the distinction.
+- **Asserts:** a named agent's request carries its pane and expected agent identity to its owning daemon even when another daemon is selected; sent, unsupported and failed outcomes use the shared crate strings; a silent daemon returns the same client timeout sentence as the TUI without a success claim; an old daemon receives no fallback and a successor process receives no acting request; IPC carries deck, agent, pane and incarnation.
+- **Does not assert:** real agents or native webview rendering.
+- **Platform coverage:** Rust socket test on Unix; Vitest on mac+linux+windows.
+
+##### desktop/config-gen/002 — Generate config uses a neutral Yes/No confirmation and shows the result.
+- **Layer:** Vitest, rendered React components with an injected runtime.
+- **Agent:** none.
+- **Tests:** `desktop/config-gen/002: …` in `desktop/src/components/AgentOverviewStop.test.tsx` and `desktop/src/lib/voiceActions.test.ts`.
+- **Existing config:** the row's accessible label and tooltip, pane-header control, confirmation title and question use Update for `projectConfigExists: true`; false and unknown retain Generate. No remains inert and Yes retains the shared outcome message.
+- **Asserts:** action on the overview row and open agent pane; TUI title and explanation; Yes/No only without destructive styling; No sends nothing; Yes preserves the captured binding, focuses the sent target and shows success; unsupported/failure show their shared text without claiming success; dismissing a pending generation and opening another agent preserves the user's navigation when success arrives late, both from the overview and from an already-open pane; an older failure cannot overwrite a newer success on either entry path; a late result for an old incarnation cannot appear in a reused agent ID's successor pane.
+- **Does not assert:** Tauri transport (covered by desktop/config-gen/001), real agents or a TUI-style desktop command-key layer (none exists).
+- **Platform coverage:** mac+linux+windows.
+
+##### desktop/config-gen/003 — Voice and clicking open the same Generate config confirmation.
+- **Layer:** fast-tier Rust voice-table/outcome tests and Vitest shell/registry tests.
+- **Agent:** none (synthetic voice resolution).
+- **Tests:** `voice_table_config_gen_003_generation_is_agent_targeted_and_only_asks` in `desktop/src-tauri/src/voice/table.rs`; `voice_outcome_config_gen_003_named_pane_requests_give_stop_style_guidance` and `voice_outcome_config_gen_003_private_names_allow_only_the_viewed_agent` in `desktop/src-tauri/src/voice/outcome.rs`; `desktop/config-gen/003: …` in `desktop/src/components/VoiceAgentBinding.test.tsx` and `desktop/src/lib/voiceActions.test.ts`, plus the latter's literal registry classification test.
+- **Update synonym:** shipped command descriptions advertise “update config”; nameless private pane requests resolve locally for both verbs; named dashboard requests reach `confirmGenerateConfig` for either verb. Vitest opens Generate/Update confirmations from either voice phrase regardless of the displayed label.
+- **Asserts:** `generate_config` names `confirmGenerateConfig`, is agent-targeted on overview/agent screens and advertises “generate config”; the registry is voice-enabled; both the control and voice dispatch open the Yes/No confirmation without sending work; naming another live agent in a pane gives stop-style guidance without confirming or sending; with names withheld, a bare pane request dispatches with no parameters and confirms the viewed process, while the dashboard still requires a target and explicit names cannot silently target the viewed agent; delayed nameless bare/model-resolved requests cannot open a confirmation or send work after a pane switch, and the voice report gives the stop-style refusal, while an unchanged pane still confirms and sends to the original agent; component tests also cover a daemon restart and same-process agent replacement during resolution.
+- **Does not assert:** real microphone capture, transcription or model intent classification.
+- **Platform coverage:** mac+linux+windows.
 
 ## Desktop native network scenarios
 

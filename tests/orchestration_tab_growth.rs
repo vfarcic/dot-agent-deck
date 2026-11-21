@@ -60,10 +60,6 @@ impl PaneController for NoopPaneController {
         Ok(RenameOutcome::applied(name))
     }
 
-    fn toggle_layout(&self) -> Result<(), PaneError> {
-        Ok(())
-    }
-
     fn write_to_pane(&self, _pane_id: &str, _text: &str) -> Result<(), PaneError> {
         Ok(())
     }

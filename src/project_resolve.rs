@@ -701,7 +701,7 @@ fn resolve_canonical_project(dir: &Path) -> Result<ResolvedProject, ProjectResol
 // Keeping the blocking work off the runtime
 // ---------------------------------------------------------------------------
 
-fn project_fs_limit() -> &'static Arc<Semaphore> {
+pub(crate) fn project_fs_limit() -> &'static Arc<Semaphore> {
     static LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
     LIMIT.get_or_init(|| Arc::new(Semaphore::new(MAX_CONCURRENT_PROJECT_READS)))
 }
@@ -733,7 +733,10 @@ where
 /// which runs a crate's tests as threads of one process, a test that holds its
 /// permits starves an unrelated test's tight deadline. The tests that pin the
 /// bound's own behaviour therefore bring a semaphore of their own.
-async fn run_bounded_in<T, F>(limit: &Arc<Semaphore>, f: F) -> Result<T, ProjectResolveError>
+pub(crate) async fn run_bounded_in<T, F>(
+    limit: &Arc<Semaphore>,
+    f: F,
+) -> Result<T, ProjectResolveError>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
@@ -2475,6 +2478,7 @@ command = "cat"
         AgentRecord {
             input_held: None,
             input_discarded: None,
+            project_config_exists: None,
             id: cwd.to_string(),
             pane_id_env: None,
             display_name: None,

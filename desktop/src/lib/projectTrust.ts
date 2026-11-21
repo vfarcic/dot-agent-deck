@@ -107,7 +107,7 @@ export const CLEAR_TRUE = "true — restarted before each task";
 export const CLEAR_FALSE = "false — keeps running between tasks";
 
 /** The deck's refusal codes this flow reads (`src/daemon_protocol.rs`). */
-export const NOT_APPROVED_CODE = "not-approved";
+const NOT_APPROVED_CODE = "not-approved";
 export const TRUST_TEXT_CHANGED_CODE = "trust-text-changed";
 
 /** One role as the dialog shows it. Every string is already escaped. */
@@ -168,7 +168,7 @@ export function isNotApproved(message: string): boolean {
 }
 
 /** An approval the deck refused because the text changed since it was shown. */
-export function isTrustTextChanged(message: string): boolean {
+function isTrustTextChanged(message: string): boolean {
   return message.includes(TRUST_TEXT_CHANGED_CODE);
 }
 
@@ -192,7 +192,7 @@ export type TrustCheck = { kind: "approved" } | { kind: "review" } | { kind: "re
 export type ApprovedStart = (approved: ProjectTrustView) => Promise<void> | void;
 
 /** Issue #2330 — the deck's own request a review answers: its number on that deck, and what asked. */
-export interface ReviewRequest {
+interface ReviewRequest {
   id: number;
   askedBy: string;
 }

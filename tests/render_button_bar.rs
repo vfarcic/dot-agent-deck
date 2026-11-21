@@ -7,16 +7,16 @@
 //! IDs `mouse/buttonbar/NNN` land here with function names
 //! `<sub-area>_<NNN>_<short_suffix>` (Decision 17).
 //!
-//! The bar exposes the five global commands, each carrying its keyboard
+//! The bar exposes the global commands, each carrying its keyboard
 //! shortcut inline so the bar doubles as a legend:
 //!   New Agent        → Ctrl+N   `[New Agent n/Ctrl+N]`
 //!   Close           → Ctrl+W   `[Close w/Ctrl+W]`
-//!   Toggle Layout   → Ctrl+T   `[Toggle Layout t/Ctrl+T]`
 //!   Help            → ?        `[Help ?]`
 //!   Quit            → Ctrl+C   `[Quit Ctrl+C]`
 //! The shortcut strings are derived from the keyboard handlers in
-//! `src/ui.rs` (`global_ctrl_action` for Ctrl+N/W/T, `Char('?')` → Help,
-//! Ctrl+C → Quit). M2 must wire the buttons to those same bindings.
+//! `src/ui.rs` (`global_ctrl_action` for Ctrl+N/W, `Char('?')` → Help,
+//! Ctrl+C → Quit). M2 must wire the buttons to those same bindings. PRD #312
+//! removed the `[Toggle Layout Ctrl+T]` button with its chord.
 
 use dot_agent_deck::keybindings::KeybindingConfig;
 use dot_agent_deck::ui::{render_button_bar_to_buffer, render_button_bar_with_bindings_to_buffer};
@@ -37,9 +37,9 @@ fn row_text(buffer: &ratatui::buffer::Buffer) -> String {
 /// Scenario: Render the global button bar into a 120-column (comfortable
 /// width) `TestBackend` buffer. The single bottom row must contain a
 /// clickable button for every global command WITH its inline shortcut —
-/// `[New Agent n/Ctrl+N]`, `[Close w/Ctrl+W]`, `[Toggle Layout t/Ctrl+T]`,
-/// `[Help ?]`, and `[Quit Ctrl+C]` — so click and keyboard expose the same
-/// five actions and the bar doubles as a legend. PRD #144 no-wrap guard:
+/// `[New Agent n/Ctrl+N]`, `[Close w/Ctrl+W]`, `[Help ?]`, and `[Quit
+/// Ctrl+C]` — so click and keyboard expose the same actions and the bar
+/// doubles as a legend, and no layout toggle is offered. PRD #144 no-wrap guard:
 /// rendering the FULL dashboard bar (global + context, ~133 cells) at a
 /// comfortably wide 200 cols into a multi-row area must leave it on a SINGLE
 /// row (no wrap) with its full labels intact — wrapping kicks in only when the
@@ -53,7 +53,6 @@ fn buttonbar_001_full_bar_has_button_per_command_with_shortcut() {
     for expected in [
         "[New Agent n/Ctrl+N]",
         "[Close w/Ctrl+W]",
-        "[Toggle Layout t/Ctrl+T]",
         "[Help ?]",
         "[Quit Ctrl+C]",
     ] {
@@ -62,6 +61,11 @@ fn buttonbar_001_full_bar_has_button_per_command_with_shortcut() {
             "button bar at 120 cols must render the {expected:?} button inline-shortcut label, got {bar:?}"
         );
     }
+    // PRD #312: the layout toggle is gone, and nothing advertises it.
+    assert!(
+        !bar.contains("Layout") && !bar.contains("Ctrl+T"),
+        "the button bar must not offer the removed layout toggle, got {bar:?}"
+    );
 
     // PRD #144 no-wrap guard: at a comfortable width the full dashboard bar
     // (global + context buttons) fits on one row, so even when handed a
@@ -87,7 +91,7 @@ fn buttonbar_001_full_bar_has_button_per_command_with_shortcut() {
 /// ~133 cells) at a narrow/windowed 80 columns into a multi-row area. PRD #144:
 /// rather than collapsing to shortcut-only chips, the bar must WRAP to multiple
 /// rows while keeping the FULL `[Label Shortcut]` form of every button — so
-/// `[New Agent n/Ctrl+N]`, `[Toggle Layout t/Ctrl+T]`, `[Quit Ctrl+C]` and the
+/// `[New Agent n/Ctrl+N]`, `[Close w/Ctrl+W]`, `[Quit Ctrl+C]` and the
 /// always-shown `[Schedules s]` all stay spelled out somewhere across the
 /// rows, the shortcut-only chip `[n/Ctrl+N]` never appears, and the bar occupies
 /// more than one row. This inverts the pre-#144 shortcut-only degradation.
@@ -101,7 +105,6 @@ fn buttonbar_002_narrow_terminal_wraps_keeping_full_labels() {
     for expected in [
         "[New Agent n/Ctrl+N]",
         "[Close w/Ctrl+W]",
-        "[Toggle Layout t/Ctrl+T]",
         "[Help ?]",
         "[Quit Ctrl+C]",
         "[Schedules s]",
@@ -145,7 +148,7 @@ fn buttonbar_005_schedules_button_present_with_zero_schedules() {
     );
 }
 
-/// Scenario: Render the FULL dashboard button set — the five global commands
+/// Scenario: Render the FULL dashboard button set — the global commands
 /// PLUS the dashboard context buttons (Filter / Rename / Generate and the
 /// always-shown Schedules button) — at 120 columns, the harness's pinned
 /// default PTY width (`DEFAULT_COLS`), into a multi-row area. The full
@@ -166,7 +169,6 @@ fn buttonbar_006_full_dashboard_set_wraps_at_default_width() {
     for expected in [
         "[New Agent n/Ctrl+N]",
         "[Close w/Ctrl+W]",
-        "[Toggle Layout t/Ctrl+T]",
         "[Help ?]",
         "[Quit Ctrl+C]",
         "[Schedules s]",
