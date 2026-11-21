@@ -1544,6 +1544,30 @@ pub enum GatedQuery<T> {
     Unsupported,
 }
 
+/// PRD #1790 stage 2 (verification finding A): an interrupted work request a
+/// caller may pin to one daemon process, as
+/// [`DaemonClient::dismiss_interrupted_pinned`] answers it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PinnedQuery<T> {
+    /// Answered by the daemon process `instance` (its `Hello`'s
+    /// `instance_id`).
+    Answered { value: T, instance: Option<String> },
+    /// The daemon does not advertise the verb: nothing was sent.
+    Unsupported,
+    /// The daemon is not the pinned process: nothing was sent.
+    OtherInstance,
+}
+
+/// What [`DaemonClient::interrupted_work_on`] found.
+enum InterruptedAnswer {
+    Answered {
+        response: Box<AttachResponse>,
+        instance: Option<String>,
+    },
+    Unsupported,
+    OtherInstance,
+}
+
 /// Issue #2330: the pending in-deck approval requests a `Hello` (or
 /// snapshot) reply carries, sanitized, or `None` when the daemon does not
 /// advertise [`crate::daemon_protocol::CAP_TRUST_REQUESTS`] — a client shows
@@ -1696,7 +1720,10 @@ pub struct DaemonClient {
     /// end state the deck holds for an agent: [`Self::post_message`],
     /// [`Self::inbox_action`], [`Self::answer_question_while`],
     /// [`Self::stop_agent`], [`Self::set_agent_label`],
-    /// [`Self::seed_last_command`] and [`Self::record_orchestrator_context`].
+    /// [`Self::seed_last_command`] and [`Self::record_orchestrator_context`];
+    /// and the interrupted-work verbs ([`Self::list_interrupted_work`] and
+    /// its siblings), which also need the daemon to advertise
+    /// [`crate::daemon_protocol::CAP_INTERRUPTED_WORK`].
     /// The gate answers "is this daemon compatible?", not "is this the daemon
     /// the agent id came from?": an agent id is a per-daemon counter, so a
     /// compatible replacement reuses it. A caller acting on an id it learned
@@ -3736,6 +3763,270 @@ impl DaemonClient {
             Some(outcomes) => Ok(GatedQuery::Answered(outcomes)),
             None => Err(ClientError::Server(resp.error.unwrap_or_else(|| {
                 "the daemon answered ListOutcomes with no listing".into()
+            }))),
+        }
+    }
+
+    /// PRD #1790 stage 2: send `request` on a connection of its own, after a
+    /// fresh `Hello{follow_on: true}` on that connection, and answer its
+    /// reply — or `None`, with no frame of it sent, unless that `Hello`
+    /// advertises [`crate::daemon_protocol::CAP_INTERRUPTED_WORK`] and
+    /// [`crate::daemon_protocol::CAP_HELLO_FOLLOW_ON`] and, when the caller
+    /// pinned a daemon process (`pinned_instance`), is from it. Pinning
+    /// matters most for reclaim and dismiss: an item id belongs to one
+    /// daemon's state directory. No cached capability set is consulted.
+    async fn interrupted_work_request(
+        &self,
+        request: &AttachRequest,
+        pinned_instance: Option<&str>,
+    ) -> Result<Option<AttachResponse>, ClientError> {
+        Ok(
+            match self.interrupted_work_on(request, pinned_instance).await? {
+                InterruptedAnswer::Answered { response, .. } => Some(*response),
+                InterruptedAnswer::Unsupported | InterruptedAnswer::OtherInstance => None,
+            },
+        )
+    }
+
+    /// [`Self::interrupted_work_request`], telling a daemon that does not
+    /// support the request from one that is not `pinned_instance`, and
+    /// answering which daemon process (the `Hello`'s `instance_id`) answered.
+    async fn interrupted_work_on(
+        &self,
+        request: &AttachRequest,
+        pinned_instance: Option<&str>,
+    ) -> Result<InterruptedAnswer, ClientError> {
+        // PR #2431 round 4 (Qodo): on a gated handle (the TUI's, the
+        // desktop's) the `Hello` this request follows is the gate's own, so a
+        // daemon on another protocol, one the handle's admission refuses, or
+        // a process other than the one it is bound to is sent nothing. An
+        // ungated handle (the one-shot CLI's) keeps its policy and checks
+        // only the capability.
+        let (mut rd, mut wr, capabilities, instance) = if self.protocol_gate || self.bound.is_some()
+        {
+            let (rd, wr, capabilities, incarnation) = self.protocol_hello(true).await?;
+            (
+                rd,
+                wr,
+                capabilities,
+                incarnation.as_deref().map(str::to_string),
+            )
+        } else {
+            let (mut rd, mut wr) = self.connect().await?;
+            let hello = issue_command(
+                &mut rd,
+                &mut wr,
+                &AttachRequest::Hello {
+                    client_version: crate::daemon_protocol::PROTOCOL_VERSION,
+                    client_build_version: None,
+                    follow_on: true,
+                },
+            )
+            .await?;
+            if !hello.ok {
+                return Ok(InterruptedAnswer::Unsupported);
+            }
+            (
+                rd,
+                wr,
+                DaemonCapabilities::from_hello(&hello),
+                hello.instance_id,
+            )
+        };
+        if !capabilities.supports(crate::daemon_protocol::CAP_INTERRUPTED_WORK)
+            || !capabilities.supports(crate::daemon_protocol::CAP_HELLO_FOLLOW_ON)
+        {
+            return Ok(InterruptedAnswer::Unsupported);
+        }
+        if let Some(pinned) = pinned_instance
+            && instance.as_deref() != Some(pinned)
+        {
+            return Ok(InterruptedAnswer::OtherInstance);
+        }
+        let response = Box::new(issue_command(&mut rd, &mut wr, request).await?);
+        Ok(InterruptedAnswer::Answered { response, instance })
+    }
+
+    /// PRD #1790 stage 2 (verification finding A): [`Self::list_interrupted_work`],
+    /// also answering the daemon process that listed it, so a later request
+    /// can be pinned to that process.
+    pub async fn list_interrupted_work_pinned(
+        &self,
+        git: bool,
+        pinned_instance: Option<&str>,
+    ) -> Result<PinnedQuery<crate::interrupted_work::InterruptedList>, ClientError> {
+        let request = AttachRequest::ListInterruptedWork { git };
+        let (response, instance) = match self.interrupted_work_on(&request, pinned_instance).await?
+        {
+            InterruptedAnswer::Answered { response, instance } => (response, instance),
+            InterruptedAnswer::Unsupported => return Ok(PinnedQuery::Unsupported),
+            InterruptedAnswer::OtherInstance => return Ok(PinnedQuery::OtherInstance),
+        };
+        match response.interrupted_work {
+            Some(list) => Ok(PinnedQuery::Answered {
+                value: list,
+                instance,
+            }),
+            None => Err(ClientError::Server(response.error.unwrap_or_else(|| {
+                "the daemon answered ListInterruptedWork with no list".into()
+            }))),
+        }
+    }
+
+    /// PRD #1790 stage 2 (verification finding A): [`Self::dismiss_interrupted`],
+    /// telling a daemon that is not `pinned_instance` from one that does not
+    /// support the request, and answering the daemon process that dismissed.
+    /// Its capability check, its pin check and the dismissal share one
+    /// connection, so a request withheld from another process sent it nothing.
+    pub async fn dismiss_interrupted_pinned(
+        &self,
+        ids: Vec<String>,
+        all: bool,
+        caller: Option<crate::daemon_protocol::CallerClaim>,
+        pinned_instance: Option<&str>,
+    ) -> Result<PinnedQuery<crate::interrupted_work::DismissOutcome>, ClientError> {
+        let request = AttachRequest::DismissInterrupted { ids, all, caller };
+        let (response, instance) = match self.interrupted_work_on(&request, pinned_instance).await?
+        {
+            InterruptedAnswer::Answered { response, instance } => (response, instance),
+            InterruptedAnswer::Unsupported => return Ok(PinnedQuery::Unsupported),
+            InterruptedAnswer::OtherInstance => return Ok(PinnedQuery::OtherInstance),
+        };
+        match response.interrupted_dismiss {
+            Some(outcome) => Ok(PinnedQuery::Answered {
+                value: outcome,
+                instance,
+            }),
+            None => Err(ClientError::Server(response.error.unwrap_or_else(|| {
+                "the daemon answered DismissInterrupted with no outcome".into()
+            }))),
+        }
+    }
+
+    /// PRD #1790 stage 2: the interrupted work list
+    /// ([`AttachRequest::ListInterruptedWork`]), with each item's Git and pull
+    /// request facts when `git` is set. [`GatedQuery::Unsupported`], with
+    /// nothing sent, from a daemon that does not advertise
+    /// [`crate::daemon_protocol::CAP_INTERRUPTED_WORK`] on a fresh `Hello`, or
+    /// that is not `pinned_instance`.
+    pub async fn list_interrupted_work(
+        &self,
+        git: bool,
+        pinned_instance: Option<&str>,
+    ) -> Result<GatedQuery<crate::interrupted_work::InterruptedList>, ClientError> {
+        let request = AttachRequest::ListInterruptedWork { git };
+        let Some(resp) = self
+            .interrupted_work_request(&request, pinned_instance)
+            .await?
+        else {
+            return Ok(GatedQuery::Unsupported);
+        };
+        match resp.interrupted_work {
+            Some(list) => Ok(GatedQuery::Answered(list)),
+            None => Err(ClientError::Server(resp.error.unwrap_or_else(|| {
+                "the daemon answered ListInterruptedWork with no list".into()
+            }))),
+        }
+    }
+
+    /// PRD #1790 stage 2: one interrupted item and its kept reports' bodies
+    /// ([`AttachRequest::ShowInterrupted`]): the first ones, or with `report`
+    /// that one of the item's. Gated as [`Self::list_interrupted_work`] is.
+    /// An id that matches no item, or a report that is not the item's, is a
+    /// [`ClientError::Server`] carrying the daemon's sentence.
+    pub async fn show_interrupted(
+        &self,
+        id: &str,
+        report: Option<&str>,
+        pinned_instance: Option<&str>,
+    ) -> Result<GatedQuery<crate::interrupted_work::InterruptedShow>, ClientError> {
+        self.show_interrupted_page(id, report, None, pinned_instance)
+            .await
+    }
+
+    /// PRD #1790 stage 2: [`Self::show_interrupted`] of one page of the
+    /// item's kept reports, from its `reports_from`-th on (reviewer 1); the
+    /// answer's `next_reports_from` says where the next page starts.
+    pub async fn show_interrupted_page(
+        &self,
+        id: &str,
+        report: Option<&str>,
+        reports_from: Option<usize>,
+        pinned_instance: Option<&str>,
+    ) -> Result<GatedQuery<crate::interrupted_work::InterruptedShow>, ClientError> {
+        let request = AttachRequest::ShowInterrupted {
+            id: id.to_string(),
+            report: report.map(str::to_string),
+            reports_from,
+        };
+        let Some(resp) = self
+            .interrupted_work_request(&request, pinned_instance)
+            .await?
+        else {
+            return Ok(GatedQuery::Unsupported);
+        };
+        match resp.interrupted_item {
+            Some(shown) => Ok(GatedQuery::Answered(shown)),
+            None => Err(ClientError::Server(resp.error.unwrap_or_else(|| {
+                "the daemon answered ShowInterrupted with no item".into()
+            }))),
+        }
+    }
+
+    /// PRD #1790 stage 2: reclaim an interrupted item — remove its worktree,
+    /// keep its branch — or with `dry_run` ask what that would do
+    /// ([`AttachRequest::ReclaimInterrupted`]). `caller` is the calling
+    /// agent's pane claim, `None` for a person; the daemon refuses an agent
+    /// (decision D4). Refusals are in the outcome, not an error. Gated as
+    /// [`Self::list_interrupted_work`] is.
+    pub async fn reclaim_interrupted(
+        &self,
+        id: &str,
+        dry_run: bool,
+        caller: Option<crate::daemon_protocol::CallerClaim>,
+        pinned_instance: Option<&str>,
+    ) -> Result<GatedQuery<crate::interrupted_work::ReclaimOutcome>, ClientError> {
+        let request = AttachRequest::ReclaimInterrupted {
+            id: id.to_string(),
+            dry_run,
+            caller,
+        };
+        let Some(resp) = self
+            .interrupted_work_request(&request, pinned_instance)
+            .await?
+        else {
+            return Ok(GatedQuery::Unsupported);
+        };
+        match resp.interrupted_reclaim {
+            Some(outcome) => Ok(GatedQuery::Answered(outcome)),
+            None => Err(ClientError::Server(resp.error.unwrap_or_else(|| {
+                "the daemon answered ReclaimInterrupted with no outcome".into()
+            }))),
+        }
+    }
+
+    /// PRD #1790 stage 2: dismiss the interrupted items `ids` name, or every
+    /// listed item with `all` ([`AttachRequest::DismissInterrupted`]).
+    /// `caller` as for [`Self::reclaim_interrupted`]. Refusals are in the
+    /// outcome, not an error. Gated as [`Self::list_interrupted_work`] is.
+    pub async fn dismiss_interrupted(
+        &self,
+        ids: Vec<String>,
+        all: bool,
+        caller: Option<crate::daemon_protocol::CallerClaim>,
+        pinned_instance: Option<&str>,
+    ) -> Result<GatedQuery<crate::interrupted_work::DismissOutcome>, ClientError> {
+        let request = AttachRequest::DismissInterrupted { ids, all, caller };
+        let Some(resp) = self
+            .interrupted_work_request(&request, pinned_instance)
+            .await?
+        else {
+            return Ok(GatedQuery::Unsupported);
+        };
+        match resp.interrupted_dismiss {
+            Some(outcome) => Ok(GatedQuery::Answered(outcome)),
+            None => Err(ClientError::Server(resp.error.unwrap_or_else(|| {
+                "the daemon answered DismissInterrupted with no outcome".into()
             }))),
         }
     }
@@ -8039,6 +8330,193 @@ mod tests {
         });
     }
 
+    /// PRD #1790 stage 2: each interrupted work verb is sent only on a
+    /// connection whose fresh `Hello` advertises `interrupted-work` and the
+    /// follow-on, from the daemon the caller pinned. A daemon without the
+    /// capability, one without the follow-on, and one answering from another
+    /// incarnation each get no verb frame, and the call answers unsupported; a
+    /// daemon that advertises both and matches is asked, once.
+    #[cfg(unix)]
+    #[test]
+    fn interrupted_work_verbs_are_sent_only_after_a_fresh_advertisement() {
+        use crate::daemon_protocol::{CAP_HELLO_FOLLOW_ON, CAP_INTERRUPTED_WORK};
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let verbs = [
+                "list-interrupted-work",
+                "show-interrupted",
+                "reclaim-interrupted",
+                "dismiss-interrupted",
+            ];
+            for verb in verbs {
+                for (capabilities, instance, pinned, asked) in [
+                    (vec![CAP_HELLO_FOLLOW_ON], "i1", Some("i1"), false),
+                    (vec![CAP_INTERRUPTED_WORK], "i1", Some("i1"), false),
+                    (
+                        vec![CAP_HELLO_FOLLOW_ON, CAP_INTERRUPTED_WORK],
+                        "i2",
+                        Some("i1"),
+                        false,
+                    ),
+                    (
+                        vec![CAP_HELLO_FOLLOW_ON, CAP_INTERRUPTED_WORK],
+                        "i1",
+                        Some("i1"),
+                        true,
+                    ),
+                    (
+                        vec![CAP_HELLO_FOLLOW_ON, CAP_INTERRUPTED_WORK],
+                        "i3",
+                        None,
+                        true,
+                    ),
+                ] {
+                    let (dir, path, listener) = {
+                        let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+                        let dir = tempfile::tempdir().unwrap();
+                        let path = dir.path().join("interrupted-daemon.sock");
+                        let listener = bind_attach_listener(&path).expect("bind scripted daemon");
+                        (dir, path, listener)
+                    };
+                    let ops = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+                    let seen = Arc::clone(&ops);
+                    let server = tokio::spawn(async move {
+                        let Ok(Ok(mut stream)) = tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            listener.accept(),
+                        )
+                        .await
+                        else {
+                            return;
+                        };
+                        while let Ok(Ok(Some((KIND_REQ, payload)))) = tokio::time::timeout(
+                            std::time::Duration::from_millis(500),
+                            read_frame(&mut stream),
+                        )
+                        .await
+                        {
+                            let request: serde_json::Value =
+                                serde_json::from_slice(&payload).unwrap();
+                            let op = request["op"].as_str().unwrap_or_default().to_string();
+                            seen.lock().unwrap().push(op.clone());
+                            let item = || crate::interrupted_work::InterruptedItem {
+                                id: crate::work_journal::WorkId::parse(
+                                    "w-abcdefgh-0000000000000001",
+                                )
+                                .unwrap(),
+                                kind: crate::interrupted_work::ItemKind::Unit,
+                                name: None,
+                                issue: None,
+                                repo: None,
+                                branch: None,
+                                worktree: None,
+                                launcher: None,
+                                last_entry: crate::interrupted_work::LastEntry {
+                                    kind: "attempt_ended".into(),
+                                    ts_ms: 1,
+                                },
+                                reports: Vec::new(),
+                                reports_omitted: 0,
+                                cut: false,
+                                progress: Default::default(),
+                                git: None,
+                            };
+                            let response = match op.as_str() {
+                                "hello" => AttachResponse {
+                                    capabilities: Some(
+                                        capabilities.iter().map(|c| c.to_string()).collect(),
+                                    ),
+                                    instance_id: Some(instance.to_string()),
+                                    ..AttachResponse::hello(PROTOCOL_VERSION)
+                                },
+                                "list-interrupted-work" => AttachResponse {
+                                    interrupted_work: Some(
+                                        crate::interrupted_work::InterruptedList::default(),
+                                    ),
+                                    ..AttachResponse::ok()
+                                },
+                                "show-interrupted" => AttachResponse {
+                                    interrupted_item: Some(
+                                        crate::interrupted_work::InterruptedShow {
+                                            item: item(),
+                                            reports: Vec::new(),
+                                            incomplete: false,
+                                            bodies_omitted: 0,
+                                            reports_from: 0,
+                                            next_reports_from: None,
+                                        },
+                                    ),
+                                    ..AttachResponse::ok()
+                                },
+                                "reclaim-interrupted" => AttachResponse {
+                                    interrupted_reclaim: Some(
+                                        crate::interrupted_work::ReclaimOutcome::refused(
+                                            None,
+                                            true,
+                                            crate::interrupted_work::RefusalReason::NotListed,
+                                        ),
+                                    ),
+                                    ..AttachResponse::ok()
+                                },
+                                "dismiss-interrupted" => AttachResponse {
+                                    interrupted_dismiss: Some(
+                                        crate::interrupted_work::DismissOutcome::default(),
+                                    ),
+                                    ..AttachResponse::ok()
+                                },
+                                _ => AttachResponse::ok(),
+                            };
+                            crate::daemon_protocol::write_resp(&mut stream, &response)
+                                .await
+                                .unwrap();
+                        }
+                    });
+                    let client = DaemonClient::new(path);
+                    let answered = match verb {
+                        "list-interrupted-work" => matches!(
+                            client.list_interrupted_work(true, pinned).await.unwrap(),
+                            GatedQuery::Answered(_)
+                        ),
+                        "show-interrupted" => matches!(
+                            client.show_interrupted("w-1", None, pinned).await.unwrap(),
+                            GatedQuery::Answered(_)
+                        ),
+                        "reclaim-interrupted" => matches!(
+                            client
+                                .reclaim_interrupted("w-1", true, None, pinned)
+                                .await
+                                .unwrap(),
+                            GatedQuery::Answered(_)
+                        ),
+                        _ => matches!(
+                            client
+                                .dismiss_interrupted(Vec::new(), true, None, pinned)
+                                .await
+                                .unwrap(),
+                            GatedQuery::Answered(_)
+                        ),
+                    };
+                    drop(client);
+                    server.await.unwrap();
+                    let ops = ops.lock().unwrap().clone();
+                    assert_eq!(ops.first().map(String::as_str), Some("hello"), "{ops:?}");
+                    let sent = ops.iter().filter(|op| op.as_str() == verb).count();
+                    assert_eq!(sent, usize::from(asked), "{verb}: {ops:?}");
+                    assert_eq!(
+                        ops.iter().filter(|op| verbs.contains(&op.as_str())).count(),
+                        sent,
+                        "{verb}: no other verb is sent: {ops:?}"
+                    );
+                    assert_eq!(answered, asked, "{verb}: {ops:?}");
+                    drop(dir);
+                }
+            }
+        });
+    }
+
     /// PRD #1223 M6 — a configured-command prepared start withholds against the
     /// two older daemons a desktop will meet: one advertising nothing (pre-PRD
     /// #819), and one advertising everything up to M7 — `start-prepared-agent`
@@ -10192,6 +10670,44 @@ mod protocol_gate_tests {
                 client.subscribe_turn_replies("7").await.map(drop),
             ),
             ("list-inbox", client.list_inbox(None).await.map(drop)),
+            // PR #2431 round 4 (Qodo): the interrupted-work verbs, which
+            // open their own `Hello`, go through the gate too.
+            (
+                "list-interrupted",
+                client.list_interrupted_work(false, None).await.map(drop),
+            ),
+            (
+                "list-interrupted-pinned",
+                client
+                    .list_interrupted_work_pinned(false, None)
+                    .await
+                    .map(drop),
+            ),
+            (
+                "show-interrupted",
+                client.show_interrupted("w-1", None, None).await.map(drop),
+            ),
+            (
+                "reclaim-interrupted",
+                client
+                    .reclaim_interrupted("w-1", false, None, None)
+                    .await
+                    .map(drop),
+            ),
+            (
+                "dismiss-interrupted",
+                client
+                    .dismiss_interrupted(vec!["w-1".into()], false, None, None)
+                    .await
+                    .map(drop),
+            ),
+            (
+                "dismiss-interrupted-pinned",
+                client
+                    .dismiss_interrupted_pinned(vec!["w-1".into()], false, None, None)
+                    .await
+                    .map(drop),
+            ),
         ]
     }
 
@@ -10235,6 +10751,10 @@ mod protocol_gate_tests {
             "subscribe-events-with-snapshot",
             "subscribe-turn-replies",
             "list-inbox",
+            "list-interrupted-work",
+            "show-interrupted",
+            "reclaim-interrupted",
+            "dismiss-interrupted",
         ] {
             assert!(
                 reached.iter().any(|r| r == op),
