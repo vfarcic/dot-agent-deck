@@ -2859,6 +2859,11 @@ fn map_opencode_event_type(event: &str, status: Option<&str>) -> Option<EventTyp
         "session.idle" => Some(EventType::Idle),
         "session.error" => Some(EventType::Error),
         "session.prompt" => Some(EventType::Thinking),
+        // PRD #82: the deck's plugin reports a compaction starting, before the
+        // summary is written: 2.x's `session.compaction.started`, 1.x's
+        // `compaction` message part (`crate::opencode_manage`). Read as Claude
+        // Code's `PreCompact` is.
+        "session.compacting" => Some(EventType::Compacting),
         "session.status" | "session.status.updated" => {
             let norm = status.map(|s| s.to_ascii_lowercase());
             match norm.as_deref() {
@@ -6509,6 +6514,16 @@ mod tests {
         assert_eq!(
             build_opencode_event(failed).unwrap().event_type,
             EventType::Error
+        );
+    }
+
+    /// PRD #82: the deck's OpenCode plugin reports a compaction starting as
+    /// `session.compacting`, which reads as Claude Code's `PreCompact` does.
+    #[test]
+    fn map_opencode_session_compacting() {
+        assert_eq!(
+            map_opencode_event_type("session.compacting", None),
+            Some(EventType::Compacting)
         );
     }
 

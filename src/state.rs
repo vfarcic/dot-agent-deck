@@ -1692,6 +1692,18 @@ impl std::fmt::Display for RearmedContextRefusal {
     }
 }
 
+/// PRD #82: a re-arm of an orchestration's coordinator the daemon owes, as
+/// [`AppState::orchestrator_rearm_due`] found it: the coordinator's pane, the
+/// agent generation the event came from (the post is bound to it), and the
+/// context file the daemon records for the orchestration, which the re-arm
+/// republishes ([`crate::orchestrator_context::republish_orchestrator_context`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrchestratorRearm {
+    pub pane_id: String,
+    pub agent_id: String,
+    pub recorded: std::path::PathBuf,
+}
+
 /// Issue #1395 item 2: delete an ended orchestration's context file off the
 /// caller's thread — on Tokio's blocking pool when a runtime is current, else
 /// on a plain thread — so [`AppState::unregister_pane`], which runs under the
@@ -11342,6 +11354,64 @@ impl AppState {
                 })
     }
 
+    /// PRD #82: whether `event`, reported by `agent_id`, owes the coordinator it
+    /// came from a re-arm of its role — the daemon's own, which reaches every
+    /// orchestration it records a context file for whether or not a client is
+    /// attached (dispatched and headless orchestrations, and those the desktop
+    /// started).
+    ///
+    /// Asked under the state write lock that applies `event`, BEFORE the apply,
+    /// so a compaction is told from a repeat of one: the triggers are the TUI
+    /// re-arm's (`crate::ui`), applied per event rather than per frame —
+    ///
+    /// - **a compaction**, `Compacting`, unless the pane already reads
+    ///   `Compacting` (one compaction, one re-arm);
+    /// - **a `/clear`**, a Claude Code `SessionStart` carrying
+    ///   [`crate::event::CLEAR_SESSION_START_METADATA_KEY`] = `clear`.
+    ///
+    /// Only for the registered orchestrator seat of an orchestration the daemon
+    /// records a context file for: an orchestration a TUI started with `Ctrl+n`
+    /// has none (the TUI published it), and that TUI re-arms it. Not for a Pi
+    /// coordinator, whose role is seeded at spawn rather than posted. The caller
+    /// passes only a report it attributed to the pane's own live agent: not
+    /// unproven, not the daemon's own, not a subagent's.
+    pub fn orchestrator_rearm_due(
+        &self,
+        event: &AgentEvent,
+        agent_id: &str,
+    ) -> Option<OrchestratorRearm> {
+        let pane_id = event.pane_id.as_deref()?;
+        let trigger = match event.event_type {
+            // The pane's sessions, not the one the event names: the daemon
+            // can hold the pane's card under another session id than a
+            // report carries, which is also how the TUI's edge reads it.
+            EventType::Compacting => !self.sessions.values().any(|s| {
+                s.pane_id.as_deref() == Some(pane_id) && s.status == SessionStatus::Compacting
+            }),
+            EventType::SessionStart => {
+                event.agent_type == AgentType::ClaudeCode
+                    && event
+                        .metadata
+                        .get(crate::event::CLEAR_SESSION_START_METADATA_KEY)
+                        .map(String::as_str)
+                        == Some(crate::event::CLEAR_SESSION_START_METADATA_VALUE)
+            }
+            _ => false,
+        };
+        if !trigger || event.agent_type == AgentType::Pi {
+            return None;
+        }
+        let recorded = Some(pane_id)
+            .filter(|pane| self.orchestrator_pane_ids.contains(*pane))
+            .and_then(|pane| self.pane_orchestration_map.get(pane))
+            .and_then(|identity| self.orchestration_context_paths.get(identity))?;
+        Some(OrchestratorRearm {
+            pane_id: pane_id.to_string(),
+            agent_id: agent_id.to_string(),
+            recorded: recorded.clone(),
+        })
+    }
+
     /// Issue #1445: the context file a re-arm report from `pane_id` would
     /// replace — the newest file recorded for the orchestration that pane is
     /// the coordinator of — provided `reported` could follow it. Read-only, so
@@ -18525,6 +18595,119 @@ mod tests {
         state
             .pane_orchestration_map
             .insert(pane_id.to_string(), identity);
+    }
+
+    /// Scenario: the daemon decides which events owe an orchestration's
+    /// coordinator its role again. A compaction or a Claude Code `/clear` on
+    /// the coordinator of an orchestration with a recorded context file does,
+    /// once per compaction; the same events on a worker, on a coordinator whose
+    /// file the daemon does not record (a TUI `Ctrl+n` start), on a Pi
+    /// coordinator, a Codex-tagged `/clear`, or any other event do not (PRD #82).
+    #[test]
+    fn a_compaction_or_clear_on_a_recorded_coordinator_is_owed_a_rearm() {
+        let event = |pane: &str, event_type: EventType, agent_type: AgentType| AgentEvent {
+            session_id: format!("s-{pane}"),
+            agent_type,
+            event_type,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some(pane.to_string()),
+            agent_id: Some(format!("agent-{pane}")),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            background: None,
+            background_revision: None,
+        };
+        let clear = |pane: &str, agent_type: AgentType| {
+            let mut e = event(pane, EventType::SessionStart, agent_type);
+            e.metadata.insert(
+                crate::event::CLEAR_SESSION_START_METADATA_KEY.to_string(),
+                crate::event::CLEAR_SESSION_START_METADATA_VALUE.to_string(),
+            );
+            e
+        };
+        let recorded = std::path::PathBuf::from(
+            "/p/.dot-agent-deck/orchestrator-context-0123456789abcdef0123456789abcdef.md",
+        );
+        let mut state = AppState::default();
+        // `a0` coordinates `a`, whose file is recorded; `a1` is its worker;
+        // `b0` coordinates `b`, which records none.
+        for (pane, identity, coordinator) in [
+            ("a0", instance("a"), true),
+            ("a1", instance("a"), false),
+            ("b0", instance("b"), true),
+        ] {
+            state
+                .pane_orchestration_map
+                .insert(pane.to_string(), identity);
+            if coordinator {
+                state.orchestrator_pane_ids.insert(pane.to_string());
+            }
+        }
+        state.record_orchestration_context(&instance("a"), recorded.clone());
+
+        let due = |state: &AppState, e: &AgentEvent| {
+            state.orchestrator_rearm_due(e, e.agent_id.as_deref().unwrap())
+        };
+        let compacting = event("a0", EventType::Compacting, AgentType::ClaudeCode);
+        assert_eq!(
+            due(&state, &compacting),
+            Some(OrchestratorRearm {
+                pane_id: "a0".into(),
+                agent_id: "agent-a0".into(),
+                recorded: recorded.clone(),
+            })
+        );
+        assert!(due(&state, &clear("a0", AgentType::ClaudeCode)).is_some());
+        assert!(
+            due(
+                &state,
+                &event("a0", EventType::Compacting, AgentType::Codex)
+            )
+            .is_some(),
+            "a Codex compaction re-arms as Claude Code's does"
+        );
+
+        for (why, e) in [
+            (
+                "a worker",
+                event("a1", EventType::Compacting, AgentType::ClaudeCode),
+            ),
+            (
+                "no recorded file",
+                event("b0", EventType::Compacting, AgentType::ClaudeCode),
+            ),
+            (
+                "a Pi coordinator",
+                event("a0", EventType::Compacting, AgentType::Pi),
+            ),
+            ("a Codex /clear", clear("a0", AgentType::Codex)),
+            (
+                "a plain start",
+                event("a0", EventType::SessionStart, AgentType::ClaudeCode),
+            ),
+            (
+                "another event",
+                event("a0", EventType::Idle, AgentType::ClaudeCode),
+            ),
+        ] {
+            assert_eq!(due(&state, &e), None, "{why}");
+        }
+
+        // A second report of the same compaction is not a second compaction.
+        state.apply_event(event("a0", EventType::SessionStart, AgentType::ClaudeCode));
+        state.apply_event(compacting.clone());
+        assert_eq!(
+            state.sessions.get("s-a0").map(|s| s.status.clone()),
+            Some(SessionStatus::Compacting),
+            "premise: the first report was applied"
+        );
+        assert_eq!(due(&state, &compacting), None);
     }
 
     fn instance(id: &str) -> OrchestrationIdentity {

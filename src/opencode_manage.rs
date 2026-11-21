@@ -271,7 +271,7 @@ fn existing_plugin_artifacts() -> Vec<PathBuf> {
 /// file at its pin, so it writes its own template. Only a daemon built with
 /// this check keeps from downgrading: one built before it writes its own
 /// template as it always did.
-const PLUGIN_TEMPLATE_REVISION: u32 = 3;
+const PLUGIN_TEMPLATE_REVISION: u32 = 4;
 
 /// Render the plugin JavaScript with `BINARY_PATH` pinned to `binary_path`.
 ///
@@ -1411,6 +1411,19 @@ const handleEvent = async (event, directory, client) => {
     return;
   }
   if (eventType === "message.part.updated") {
+    // PRD #82: 1.x opens a compaction, manual or automatic, with a
+    // `compaction` part on the user message that asks for it, before the
+    // summary is written (measured on 1.19.5). It is reported as the session
+    // compacting, as 2.x's `session.compaction.started` is, so the deck can
+    // give an orchestrator its role back after the summary.
+    const part = event?.properties?.part;
+    if (part?.type === "compaction" && part.sessionID) {
+      await handleEvent(
+        { type: "session.compacting", properties: { sessionID: part.sessionID } },
+        directory,
+        client
+      );
+    }
     handleMessagePartUpdated(event, directory);
     return;
   }
@@ -1873,6 +1886,11 @@ const v2TranslateOne = (event, directory) => {
       return { type: "session.status", properties: { sessionID, status: data.status } };
     case "session.idle":
       return { type: "session.idle", properties: { sessionID } };
+    // PRD #82: a compaction starting, manual or automatic, before the summary
+    // is written (measured on 2.2.7); 1.x's `compaction` part is reported the
+    // same way (handleEvent).
+    case "session.compaction.started":
+      return { type: "session.compacting", properties: { sessionID } };
     case "session.deleted":
       return { type: "session.deleted", properties: { sessionID, info: { id: sessionID } } };
     case "session.execution.started":
@@ -9049,6 +9067,51 @@ check(inboxIdsIn("[dot-agent-deck message " + A + " from x]\nhead"), [A], "an un
             .collect()
     }
 
+    /// Scenario: OpenCode 1.x compacts a session (the sequence measured on
+    /// 1.19.5 for `POST /session/<id>/summarize`): the user message that asks
+    /// for it carries a `compaction` part before the summary is written. The
+    /// plugin reports the session compacting there, before `session.compacted`
+    /// and the idle that ends it, and the part is not reported as a typed
+    /// prompt (PRD #82).
+    #[cfg(unix)]
+    #[test]
+    fn opencode_v1_reports_a_compaction_starting() {
+        let Some(payloads) = run_plugin_driver(
+            r#"
+const hooks = await plugin({ directory: "/work" });
+const send = (type, properties) => hooks.event({ event: { type, properties } });
+await send("session.created", { sessionID: "root", info: { id: "root", directory: "/work" } });
+await send("message.updated", { sessionID: "root", info: { id: "cu", sessionID: "root", role: "user" } });
+await send("message.part.updated", { sessionID: "root", part: { id: "cp", sessionID: "root", messageID: "cu", type: "compaction", auto: false } });
+await send("session.status", { sessionID: "root", status: { type: "busy" } });
+await send("message.updated", { sessionID: "root", info: { id: "sa", sessionID: "root", role: "assistant", summary: true } });
+await send("session.compacted", { sessionID: "root" });
+await send("session.status", { sessionID: "root", status: { type: "idle" } });
+await send("session.idle", { sessionID: "root" });
+"#,
+            &[],
+        ) else {
+            return;
+        };
+        let events: Vec<String> = payloads
+            .iter()
+            .filter(|p| p["session_id"] == "root")
+            .map(|p| p["event"].as_str().unwrap_or("").to_string())
+            .collect();
+        let compacting = events.iter().filter(|e| *e == "session.compacting").count();
+        assert_eq!(compacting, 1, "{events:?}");
+        let start = events.iter().position(|e| e == "session.compacting");
+        let idle = events.iter().position(|e| e == "session.idle");
+        assert!(
+            matches!((start, idle), (Some(c), Some(i)) if c < i),
+            "compacting before the idle that ends the compaction: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| e == "session.prompt"),
+            "a compaction part is not a typed prompt: {events:?}"
+        );
+    }
+
     /// PRD #1497 audit AU-B1: a subagent's child session (`parentID` naming
     /// the root, same directory) streams its own assistant text interleaved
     /// with the root's turn and goes idle first. Its text never reaches any
@@ -10938,8 +11001,8 @@ await wait(1500);
     fn the_template_revision_is_bumped_with_the_template() {
         use sha2::Digest;
         const RECORDED: (u32, &str) = (
-            3,
-            "1c6fdda00d6759bf5a35f09c5d6961ebd4602553562d1cca8698df747f401408",
+            4,
+            "ac67f367b4351adcd47456191f5d7196eb883ba6948b7826030681310eb4abd6",
         );
         let digest = sha2::Sha256::digest(plugin_template("/opt/dot-agent-deck").as_bytes());
         let digest: String = digest.iter().map(|b| format!("{b:02x}")).collect();
@@ -12848,6 +12911,62 @@ await sleep(200);"#,
             .collect();
         assert!(!events.contains(&"question.asked"), "{payloads:#?}");
         assert!(events.contains(&"question.replied"), "{payloads:#?}");
+    }
+
+    /// Scenario: OpenCode 2.x compacts a session (the sequence measured on
+    /// 2.2.7 for `POST /api/session/<id>/compact`). The plugin reports the
+    /// compaction starting as `session.compacting`, after the turn's busy
+    /// report and before its end, once, for the root session; a subagent's
+    /// compaction is not reported as the root's (PRD #82).
+    #[cfg(unix)]
+    #[test]
+    fn opencode_v2_reports_a_compaction_starting() {
+        let Some((payloads, _)) = run_v2_driver(
+            r#"parents.c9 = "s1";
+await sleep(50);
+await emit("session.inbox.enqueued", { sessionID: "s1", inboxID: "i1", item: { type: "compaction" } });
+await emit("session.execution.started", { sessionID: "s1" });
+await emit("session.inbox.delivered", { sessionID: "s1", inboxID: "i1" });
+await emit("session.compaction.started", { sessionID: "s1", reason: "manual", inputID: "i1" });
+await emit("session.compaction.delta", { sessionID: "s1", text: "summary" });
+await emit("session.compaction.ended", { sessionID: "s1", reason: "manual", text: "summary" });
+await emit("session.execution.succeeded", { sessionID: "s1" });
+await emit("session.execution.started", { sessionID: "c9" });
+await emit("session.compaction.started", { sessionID: "c9", reason: "auto" });
+await emit("session.execution.succeeded", { sessionID: "c9" });
+await emit("location.shutdown", {});"#,
+        ) else {
+            return;
+        };
+        let seq: Vec<(String, String, String)> = payloads
+            .iter()
+            .map(|p| {
+                (
+                    p["session_id"].as_str().unwrap_or("").to_string(),
+                    p["event"].as_str().unwrap_or("").to_string(),
+                    p["status"].as_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect();
+        let at = |event: &str, status: &str| {
+            seq.iter()
+                .position(|(s, e, st)| s == "s1" && e == event && st == status)
+        };
+        let compacting: Vec<_> = seq
+            .iter()
+            .filter(|(_, e, _)| e == "session.compacting")
+            .collect();
+        assert_eq!(compacting.len(), 1, "one compaction, one report: {seq:?}");
+        assert_eq!(compacting[0].0, "s1", "{seq:?}");
+        let (busy, start, idle) = (
+            at("session.status", "busy"),
+            at("session.compacting", ""),
+            at("session.status", "idle"),
+        );
+        assert!(
+            matches!((busy, start, idle), (Some(b), Some(c), Some(i)) if b < c && c < i),
+            "busy, then compacting, then idle: {seq:?}"
+        );
     }
 
     /// The event stream real OpenCode 2.2.5 sends (measured with `opencode

@@ -432,6 +432,27 @@ Claude Code suggests your next prompt after each turn, and each suggestion costs
 
 **TUI:** `Ctrl+w` on the orchestration tab, after a confirmation. **Desktop:** the group's **Close** button, after a confirmation that lists the roles (**Close all N roles**). Either stops every role's agent.
 
+### When the orchestrator's conversation is compacted or cleared
+
+A long session compacts the orchestrator's conversation into a summary, and `/clear` empties it. Either can lose the orchestrator its role, and an orchestrator that has lost it can start doing the work itself instead of delegating it. So each time it happens, the deck sends the orchestrator its role again: its `prompt_template`, the workers and how to delegate, and its task if it was given one, with an instruction to carry on coordinating the work under way and to delegate the next step rather than doing it. The message reaches the orchestrator after the summary, and the orchestrator reads its role file again. You do nothing, and nothing is shown for it.
+
+Who sends it depends on how the orchestration was started, not on which client you are watching:
+
+- **Started from the desktop app, by `dot-agent-deck dispatch`, or by a schedule:** the deck sends it, whether or not the TUI or the desktop app is attached. It sends the instructions the orchestration was started with, so a change to `.dot-agent-deck.toml` since then reaches the orchestrator only when you start the orchestration again.
+- **Opened in the TUI with `Ctrl+n`:** the TUI sends it, while a TUI is attached, from the orchestration's configuration as you approved it ([Approving Project Commands](project-trust.md#an-orchestrators-instructions-after-compaction-or-clear)). When no TUI is attached, nothing is sent.
+
+| Orchestrator | After a compaction | After `/clear` |
+|---|---|---|
+| Claude Code | yes | yes |
+| Codex | yes | no |
+| OpenCode | yes | no |
+| Pi | no | no |
+| Devin | no | no |
+
+A Pi orchestrator is given its role when it starts rather than as a message, and the deck does not send it again. After a `/clear`, the deck re-sends the role to a Claude Code orchestrator only, and re-sending the role to a Devin orchestrator is not supported yet. Where the table says no, remind the orchestrator yourself: type `Read .dot-agent-deck/orchestrator-context-<id>.md again and carry on coordinating`, naming the newest `orchestrator-context-*.md` in the orchestration's `.dot-agent-deck/` directory.
+
+The role reaches the orchestrator, but whether it follows it is up to the model. If it still does work itself, say so in its pane; [Quick setup](#quick-setup) writes an orchestrator `prompt_template` that opens with what the orchestrator may and may not do itself, which helps.
+
 ## How delegation works
 
 1. The orchestrator runs `dot-agent-deck delegate --to <role> --task-file <file>` (or `--task "<text>"`).
@@ -752,7 +773,7 @@ The deck keeps its hand-off files in `.dot-agent-deck/` inside the orchestration
 
 | File | Written when | Contents |
 |---|---|---|
-| `orchestrator-context-<id>.md` | when an orchestration starts, and again each time the orchestrator's conversation is compacted or cleared while the orchestration is open in the TUI and approved as its file now reads ([Approving Project Commands](project-trust.md#an-orchestrators-instructions-after-compaction-or-clear); the desktop app does not rewrite it) | What the orchestrator is told: its `prompt_template`, the available workers, how to delegate, and its task if it was given one. |
+| `orchestrator-context-<id>.md` | when an orchestration starts, and again each time the orchestrator's conversation is compacted or cleared ([When the orchestrator's conversation is compacted or cleared](#when-the-orchestrators-conversation-is-compacted-or-cleared)) | What the orchestrator is told: its `prompt_template`, the available workers, how to delegate, and its task if it was given one. |
 | `worker-task-<role>.md` | each delegation | The task for that role, overwritten by the next one. |
 | `work-done-<role>.md` | each `work-done` for a delegated task | The worker's last report. |
 | other `*.md` files | when an agent writes them | Longer context an orchestrator passes by file. |
