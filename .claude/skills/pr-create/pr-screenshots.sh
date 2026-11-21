@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # Host screenshots for a pull request's description (issue #2438).
 #
-#   .claude/skills/pr-create/pr-screenshots.sh <pr-number> <image>...
+#   .claude/skills/pr-create/pr-screenshots.sh <pr-number> <image>[=<alt text>]...
+#
+# Pass one image per client that has the feature, each with the alt text the PR
+# body should carry: what the frame shows, not its file name. An image given
+# without `=<alt text>` prints with an `ALT TEXT NEEDED` placeholder to replace.
 #
 # GitHub has no API for the image uploads its web editor does, so the images go
 # to a branch of their own, `pr-screenshots`, which shares no history with
@@ -17,8 +21,17 @@
 # push; the push is then rejected as a non-fast-forward, and the script fetches
 # again and rebuilds its commit on the new tip, up to five times.
 #
-# PR_SCREENSHOTS_REMOTE overrides the remote (default `origin`); a path or URL
-# works too, which is how the script is tried against a scratch bare repo.
+# The printed URLs name the GitHub repository the images were pushed to, read
+# from the remote's URL, so a contributor whose `origin` is a fork gets links
+# into the fork, which a pull request on the upstream repository displays as
+# long as the fork is public. PR_SCREENSHOTS_REMOTE overrides the remote
+# (default `origin`); a remote that is not a GitHub URL, such as the path of a
+# scratch bare repository the script is tried against, needs
+# PR_SCREENSHOTS_REPO=<owner>/<repo> to name the repository its URLs point at.
+#
+# Every input must be a regular file, not a symlink, whose first bytes are a
+# PNG, JPEG, GIF or WebP signature: the branch is public, and a file that only
+# carries an image's extension could be anything readable on this machine.
 
 set -euo pipefail
 
@@ -26,7 +39,7 @@ branch=pr-screenshots
 remote=${PR_SCREENSHOTS_REMOTE:-origin}
 
 if [ "$#" -lt 2 ]; then
-  echo "usage: $0 <pr-number> <image>..." >&2
+  echo "usage: $0 <pr-number> <image>[=<alt text>]..." >&2
   exit 2
 fi
 pr=$1
@@ -35,8 +48,25 @@ case "$pr" in
   '' | *[!0-9]*) echo "ERROR: the PR number must be digits, got: $pr" >&2; exit 2 ;;
 esac
 
-declare -a names=()
-for f in "$@"; do
+# The bytes an image of each accepted kind starts with (hex), checked against
+# the file's content rather than its name.
+image_signature() {
+  local head
+  head=$(od -An -tx1 -N12 -- "$1" | tr -d ' \n')
+  case "$head" in
+    89504e470d0a1a0a*) return 0 ;;                 # PNG
+    ffd8ff*) return 0 ;;                           # JPEG
+    474946383761* | 474946383961*) return 0 ;;     # GIF87a, GIF89a
+    52494646????????57454250) return 0 ;;          # RIFF....WEBP
+  esac
+  return 1
+}
+
+declare -a files=() names=() alts=()
+for arg in "$@"; do
+  f=${arg%%=*}
+  if [ "$f" = "$arg" ]; then alt=""; else alt=${arg#*=}; fi
+  if [ -L "$f" ]; then echo "ERROR: a symlink, not an image file: $f" >&2; exit 2; fi
   [ -f "$f" ] || { echo "ERROR: no such file: $f" >&2; exit 2; }
   name=$(basename -- "$f")
   case "$name" in
@@ -46,13 +76,33 @@ for f in "$@"; do
     *.png | *.jpg | *.jpeg | *.gif | *.webp) ;;
     *) echo "ERROR: not a .png, .jpg, .jpeg, .gif or .webp image: $name" >&2; exit 2 ;;
   esac
+  image_signature "$f" || { echo "ERROR: its content is not a PNG, JPEG, GIF or WebP image: $f" >&2; exit 2; }
+  case "$alt" in
+    *[\]\[]* | *$'\n'*) echo "ERROR: alt text may not contain brackets or a newline: $alt" >&2; exit 2 ;;
+  esac
   for seen in "${names[@]+"${names[@]}"}"; do
     [ "$seen" != "$name" ] || { echo "ERROR: two files named $name" >&2; exit 2; }
   done
+  files+=("$f")
   names+=("$name")
+  alts+=("${alt:-ALT TEXT NEEDED: say what $name shows}")
 done
 
-repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
+# The repository the URLs name is the one the push goes to.
+if [ -n "${PR_SCREENSHOTS_REPO:-}" ]; then
+  repo=$PR_SCREENSHOTS_REPO
+else
+  url=$(git remote get-url "$remote" 2>/dev/null || printf '%s' "$remote")
+  repo=$(printf '%s\n' "$url" | sed -nE 's#^(https://github\.com/|ssh://git@github\.com/|git@github\.com:)([^/]+/[^/]+)$#\2#p' | sed -E 's#\.git$##; s#/$##')
+  if [ -z "$repo" ]; then
+    echo "ERROR: $remote ($url) is not a GitHub repository; set PR_SCREENSHOTS_REPO=<owner>/<repo> to the repository the images are served from" >&2
+    exit 2
+  fi
+fi
+case "$repo" in
+  */*) ;;
+  *) echo "ERROR: not an <owner>/<repo>: $repo" >&2; exit 2 ;;
+esac
 tmp=$(mktemp -d)
 tip_ref=refs/pr-screenshots-upload/tip-$$
 cleanup() {
@@ -77,8 +127,8 @@ for attempt in 1 2 3 4 5; do
     git read-tree --empty
   fi
   i=0
-  for f in "$@"; do
-    blob=$(git hash-object -w -- "$f")
+  for f in "${files[@]}"; do
+    blob=$(git hash-object -w --no-filters -- "$f")
     git update-index --add --cacheinfo "100644,$blob,$pr/${names[$i]}"
     i=$((i + 1))
   done
@@ -101,6 +151,8 @@ for attempt in 1 2 3 4 5; do
   sleep $((attempt * 2))
 done
 
+i=0
 for name in "${names[@]}"; do
-  echo "![${name%.*}](https://raw.githubusercontent.com/$repo/$commit/$pr/$name)"
+  echo "![${alts[$i]}](https://raw.githubusercontent.com/$repo/$commit/$pr/$name)"
+  i=$((i + 1))
 done

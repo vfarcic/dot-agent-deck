@@ -34,10 +34,12 @@ This file is **project-local and owned by this repository** — it was forked ou
 **Then put the screenshots from step 1 in the body**, now that the PR has a number:
 
 ```sh
-.claude/skills/pr-create/pr-screenshots.sh <n> <scratch>/<scenario>-tui.png <scratch>/<scenario>-desktop.png
+.claude/skills/pr-create/pr-screenshots.sh <n> \
+  "<scratch>/<scenario>-tui.png=<what the TUI frame shows>" \
+  "<scratch>/<scenario>-desktop.png=<what the desktop frame shows>"
 ```
 
-It pushes the images to the `pr-screenshots` branch, which is never merged, and prints one Markdown image line per file. Put them in a `## Screenshots` section under a `**TUI:**` and a `**Desktop:**` label, with a sentence saying what each shows, and update the body with `gh pr edit <n> --body-file <file>`. When a later push changes what the screen shows, capture and upload again and replace the lines; a body showing an older state than the head is wrong.
+Pass only the images of the clients that have the feature: a TUI-only screen is one `-tui.png`, a desktop-only one is one `-desktop.png`. The text after `=` becomes the image's alt text, so write what the frame shows (the screen, its state, the thing that changed), not the file name; an image passed without it prints with an `ALT TEXT NEEDED` placeholder to replace. The script refuses a symlink and any file whose content is not a PNG, JPEG, GIF or WebP image, pushes the images to the `pr-screenshots` branch of the repository `origin` points at (never merged), and prints one Markdown image line per file. Put them in a `## Screenshots` section, each under a `**TUI:**` or `**Desktop:**` label for the client it shows, and update the body with `gh pr edit <n> --body-file <file>`. When a later push changes what the screen shows, capture and upload again and replace the lines; a body showing an older state than the head is wrong.
 
 Then `gh pr edit <n> --add-reviewer <the other maintainer>` — but **request review last**, after CI and the automated review have settled, you have pushed the fixes, and every finding is answered (step 4's two checks). `dismiss_stale_reviews_on_push` voids an approval when you push new commits (a `gh pr update-branch` merge was measured not to), so asking early buys a guaranteed second round trip.
 
