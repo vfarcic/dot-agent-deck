@@ -5250,6 +5250,31 @@ impl PaneController for EmbeddedPaneController {
         }
     }
 
+    /// Issue #2454: told on the daemon process the card was learned from, in
+    /// the background so opening a pane never waits on it. A daemon that does
+    /// not advertise the verb is sent nothing; a failure is only logged, as
+    /// the card then keeps its reason until the agent publishes again.
+    fn note_card_opened(&self, card: &BoundPane) {
+        let client = self.held_client(card);
+        let pane_id = card.pane_id.clone();
+        self.runtime.spawn(async move {
+            match tokio::time::timeout(HYDRATE_LIST_TIMEOUT, client.agent_opened(&pane_id, None))
+                .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => tracing::debug!(
+                    pane_id = %pane_id,
+                    error = %error,
+                    "could not tell the daemon the agent was opened"
+                ),
+                Err(_) => tracing::debug!(
+                    pane_id = %pane_id,
+                    "the daemon did not answer agent-opened in time"
+                ),
+            }
+        });
+    }
+
     fn local_pane_is_cards(&self, card: &BoundPane) -> bool {
         matches!(self.local_pane_for(card), LocalPaneFor::Card)
     }

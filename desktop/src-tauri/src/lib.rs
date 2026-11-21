@@ -2345,6 +2345,39 @@ async fn desktop_generate_config<R: tauri::Runtime>(
     .await)
 }
 
+/// Issue #2454: tell the daemon that owns agent `agent_id` (in `pane_id`) on
+/// deck `deck_id` that the user opened it — its full-window pane or its
+/// overlay — which deals with the `waiting`, `done` or `failed` reason its card
+/// report raised. Bound to `incarnation`, the daemon process that listed the
+/// agent, so a successor that reused the ids is sent nothing. A daemon that
+/// does not advertise the verb is sent nothing either, and its cards keep the
+/// reason until the agent publishes again. Best effort: a failure is only
+/// logged, and a daemon that does not answer in time is left, since nothing the
+/// user sees depends on the answer.
+#[tauri::command]
+async fn desktop_agent_opened(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    deck_id: String,
+    agent_id: String,
+    pane_id: String,
+    incarnation: Option<String>,
+) -> Result<(), String> {
+    ensure_main_webview(&webview)?;
+    validate_agent_id(&agent_id)?;
+    let scope = crate::dto::DeckScope::resolve(Some(&deck_id))?;
+    let daemon = state.daemon.trusted(scope.endpoint()).await?;
+    daemon.require_compatible()?;
+    let client = daemon.client.bound_to(Incarnation::from(incarnation));
+    let request = client.agent_opened(&pane_id, Some(&agent_id));
+    if let Ok(Err(error)) =
+        tokio::time::timeout(crate::daemon_bridge::DECK_REPLY_TIMEOUT, request).await
+    {
+        eprintln!("desktop agent-opened: not delivered: {error}");
+    }
+    Ok(())
+}
+
 /// [`desktop_generate_config`] minus the webview.
 async fn generate_config_on(
     state: &DesktopState,
@@ -7562,6 +7595,7 @@ pub fn run() {
             desktop_list_directories,
             desktop_inbox_action,
             desktop_generate_config,
+            desktop_agent_opened,
             agent_cards_consume,
             agent_cards_list,
             agent_card_invoke,

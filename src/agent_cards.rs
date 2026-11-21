@@ -993,6 +993,22 @@ struct StoredReport {
     report: AgentReport,
     published_at: DateTime<Utc>,
     publishes: u64,
+    /// Issue #2454: the user has dealt with this report's `waiting`, `done` or
+    /// `failed` status since it was published — the agent started working
+    /// again, or the user opened the agent — so it no longer makes the card
+    /// need the user. A new publish starts unset.
+    dealt_with: bool,
+}
+
+/// Issue #2454: the report statuses that make a card need the user until the
+/// user deals with them.
+fn report_needs_you(status: ReportStatus) -> Option<&'static str> {
+    match status {
+        ReportStatus::Waiting => Some("waiting"),
+        ReportStatus::Done => Some("done"),
+        ReportStatus::Failed => Some("failed"),
+        ReportStatus::Working => None,
+    }
 }
 
 /// One agent generation as the deck sees it, gathered before projection.
@@ -1242,13 +1258,11 @@ fn project_entry(
     if unanswered > 0 {
         reasons.push("question".into());
     }
-    if let Some(r) = report {
-        match r.report.status_or_default() {
-            ReportStatus::Waiting => reasons.push("waiting".into()),
-            ReportStatus::Done => reasons.push("done".into()),
-            ReportStatus::Failed => reasons.push("failed".into()),
-            ReportStatus::Working => {}
-        }
+    // A report's reason lasts until the user deals with it (issue #2454).
+    if let Some(r) = report.filter(|r| !r.dealt_with)
+        && let Some(reason) = report_needs_you(r.report.status_or_default())
+    {
+        reasons.push(reason.into());
     }
     if status == "blocked" {
         reasons.push("blocked".into());
@@ -2043,9 +2057,58 @@ impl CardStore {
             report,
             published_at: Utc::now(),
             publishes: slot.publishes,
+            dealt_with: false,
         });
         slot.answered.clear();
         slot.epoch = epoch;
+    }
+
+    /// Issue #2454: mark the report of the generation `agent_id` in `pane_id`
+    /// dealt with, when its status is one that makes the card need the user
+    /// (`waiting`, `done`, `failed`) and it is not marked already. Answers
+    /// whether anything changed. The live reasons (stopped, a question,
+    /// blocked) are not the report's and are untouched.
+    fn mark_dealt_with(&self, pane_id: &str, agent_id: &str) -> bool {
+        let mut inner = self.lock();
+        let Some(report) = inner
+            .slots
+            .get_mut(&entry_key(pane_id, agent_id))
+            .and_then(|slot| slot.report.as_mut())
+        else {
+            return false;
+        };
+        if report.dealt_with || report_needs_you(report.report.status_or_default()).is_none() {
+            return false;
+        }
+        report.dealt_with = true;
+        true
+    }
+
+    /// Whether the report of `agent_id` in `pane_id` is marked dealt with;
+    /// `None` when there is no report.
+    #[cfg(test)]
+    pub(crate) fn report_dealt_with_for_test(&self, pane_id: &str, agent_id: &str) -> Option<bool> {
+        self.lock()
+            .slots
+            .get(&entry_key(pane_id, agent_id))
+            .and_then(|slot| slot.report.as_ref())
+            .map(|report| report.dealt_with)
+    }
+
+    /// Issue #2454: the agent `agent_id` in `pane_id` started working again
+    /// (its pane went from a stopped status into a turn), which deals with
+    /// the report it last published. Called by the daemon's hook ingest under
+    /// the state lock, so it takes only the store's own lock; the change
+    /// reaches clients with the next refresh's doorbell.
+    pub fn note_turn_started(&self, pane_id: &str, agent_id: &str) {
+        if self.mark_dealt_with(pane_id, agent_id) {
+            tracing::debug!(
+                target: "agent_cards",
+                pane_id,
+                agent_id,
+                "the agent started working again; its report no longer needs the user"
+            );
+        }
     }
 
     fn record_delivery(&self, key: &str, record: CardDeliveryRecord) {
@@ -2430,6 +2493,36 @@ pub fn spawn_watcher(
             }
         }
     })
+}
+
+/// Issue #2454: the user opened the agent in `pane_id` in a client, which
+/// deals with the reason its card report raised. `agent_id` is the generation
+/// the client showed, when it knows one; nothing changes when the pane's
+/// current agent is another, or the pane has none. A change is announced like
+/// any other, by a refresh and its doorbell.
+pub async fn agent_opened(
+    registry: &Arc<AgentPtyRegistry>,
+    state: &crate::state::SharedState,
+    pane_id: &str,
+    agent_id: Option<&str>,
+) {
+    let Some(current) = registry.pane_current_agent_id(pane_id) else {
+        return;
+    };
+    if agent_id.is_some_and(|named| named != current) {
+        return;
+    }
+    let store = registry.agent_cards();
+    let _turn = store.serial.lock().await;
+    if store.mark_dealt_with(pane_id, &current) {
+        tracing::debug!(
+            target: "agent_cards",
+            pane_id,
+            agent_id = %current,
+            "the user opened the agent; its report no longer needs the user"
+        );
+        refresh_in_turn(registry, state).await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3156,6 +3249,7 @@ mod tests {
                 report: report(json),
                 published_at: Utc::now(),
                 publishes: 1,
+                dealt_with: false,
             }),
             ..Slot::default()
         }
@@ -3574,6 +3668,164 @@ mod tests {
 
         store.publish("p1", "1", report(r#"{"summary": "Back."}"#));
         assert_eq!(project(&store).report.unwrap().revision, 3);
+    }
+
+    /// Issue #2454: a report's `waiting`, `done` or `failed` reason clears
+    /// once the agent starts working again, and only the report's reason: a
+    /// newer report raises its reason again, and a `working` report or no
+    /// report has nothing to clear.
+    #[test]
+    fn a_report_reason_clears_when_the_agent_starts_working_again() {
+        let catalog = resolve(None);
+        let store = CardStore::default();
+        let project = |store: &CardStore| {
+            let inner = store.lock();
+            one(
+                &project_all(&[facts("1", "p1")], &inner.slots, &catalog, &[], "i"),
+                "p1/1",
+            )
+        };
+        // Nothing published: nothing to clear, and nothing breaks.
+        store.note_turn_started("p1", "1");
+        assert!(!project(&store).needs_you);
+
+        for (status, reason) in [
+            ("waiting", "waiting"),
+            ("done", "done"),
+            ("failed", "failed"),
+        ] {
+            store.publish(
+                "p1",
+                "1",
+                report(&format!(r#"{{"status": "{status}", "summary": "s"}}"#)),
+            );
+            let raised = project(&store);
+            assert_eq!(raised.needs_you_reasons, [reason], "{status}");
+            store.note_turn_started("p1", "1");
+            let cleared = project(&store);
+            assert!(
+                !cleared.needs_you,
+                "{status}: {:?}",
+                cleared.needs_you_reasons
+            );
+            // The report itself is kept: only its reason is dealt with.
+            assert_eq!(cleared.report.as_ref().unwrap().status, status);
+            // Another generation in another pane is not this one.
+            store.note_turn_started("p2", "1");
+        }
+        // A newer report raises its reason again.
+        store.publish(
+            "p1",
+            "1",
+            report(r#"{"status": "done", "summary": "again"}"#),
+        );
+        assert_eq!(project(&store).needs_you_reasons, ["done"]);
+        // A `working` report raised nothing, so nothing is marked on it, and
+        // the `done` that follows it still needs the user.
+        store.publish("p1", "1", report(r#"{"status": "working"}"#));
+        assert!(!store.mark_dealt_with("p1", "1"));
+        store.publish("p1", "1", report(r#"{"status": "done"}"#));
+        assert_eq!(project(&store).needs_you_reasons, ["done"]);
+    }
+
+    /// Issue #2454: dealing with a report leaves the live reasons alone — an
+    /// agent that stopped, or a question still unanswered on its card, needs
+    /// the user whatever was done about its report.
+    #[test]
+    fn dealing_with_a_report_leaves_the_live_reasons() {
+        let catalog = resolve(None);
+        let store = CardStore::default();
+        let mut stopped = facts("1", "p1");
+        stopped.stopped = true;
+        store.publish("p1", "1", report(r#"{"status": "failed"}"#));
+        store.publish(
+            "p2",
+            "2",
+            report(
+                r#"{"status": "waiting", "questions": [{"id": "q", "text": "Which?", "options": [{"id": "a", "label": "A"}]}]}"#,
+            ),
+        );
+        let project = |store: &CardStore| {
+            let inner = store.lock();
+            project_all(
+                &[stopped.clone(), facts("2", "p2")],
+                &inner.slots,
+                &catalog,
+                &[],
+                "i",
+            )
+        };
+        let before = project(&store);
+        assert_eq!(
+            one(&before, "p1/1").needs_you_reasons,
+            ["stopped", "failed"]
+        );
+        assert_eq!(
+            one(&before, "p2/2").needs_you_reasons,
+            ["question", "waiting"]
+        );
+        assert!(store.mark_dealt_with("p1", "1"));
+        assert!(store.mark_dealt_with("p2", "2"));
+        assert!(!store.mark_dealt_with("p2", "2"), "already dealt with");
+        let after = project(&store);
+        assert_eq!(one(&after, "p1/1").needs_you_reasons, ["stopped"]);
+        assert_eq!(one(&after, "p2/2").needs_you_reasons, ["question"]);
+    }
+
+    /// Issue #2454: the user opening the agent (`agent-opened`) clears its
+    /// report's reason for the pane's current agent only, and the refresh it
+    /// runs shows the change; a request naming another generation, or a pane
+    /// with no agent, changes nothing.
+    #[tokio::test]
+    async fn opening_the_agent_clears_its_report_reason() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let state: crate::state::SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let agent = registry.insert_idle_member_for_test("p1", "team-1", true);
+        let key = entry_key("p1", &agent);
+        let needs_you = |list: &AgentCardList| {
+            list.entries
+                .iter()
+                .find(|e| e.key == key)
+                .expect("the agent's card")
+                .needs_you_reasons
+                .clone()
+        };
+        let reply = publish(
+            &registry,
+            &state,
+            "p1",
+            &agent,
+            report(r#"{"status": "done"}"#),
+        )
+        .await;
+        assert!(reply.accepted, "{reply:?}");
+        assert_eq!(needs_you(&refresh(&registry, &state).await), ["done"]);
+
+        agent_opened(&registry, &state, "p1", Some("not-the-agent")).await;
+        agent_opened(&registry, &state, "no-such-pane", None).await;
+        assert_eq!(
+            needs_you(&refresh(&registry, &state).await),
+            ["done"],
+            "another generation's open, or an unknown pane's, dealt with this report"
+        );
+
+        agent_opened(&registry, &state, "p1", Some(&agent)).await;
+        assert!(needs_you(&refresh(&registry, &state).await).is_empty());
+
+        // A newer report raises it again, and an open without the agent's id
+        // (the TUI's) deals with it too.
+        publish(
+            &registry,
+            &state,
+            "p1",
+            &agent,
+            report(r#"{"status": "waiting"}"#),
+        )
+        .await;
+        assert_eq!(needs_you(&refresh(&registry, &state).await), ["waiting"]);
+        agent_opened(&registry, &state, "p1", None).await;
+        assert!(needs_you(&refresh(&registry, &state).await).is_empty());
     }
 
     /// Audit F5: an entry keeps a bounded number and size of deliveries,

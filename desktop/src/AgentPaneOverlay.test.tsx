@@ -311,7 +311,7 @@ describe("agent pane overlay", () => {
     expect(setShownTerminals).toHaveBeenLastCalledWith([]);
     setShownTerminals.mockClear();
 
-    fireEvent.click(screen.getByRole("button", { name: "Open Plan / architecture agent" }));
+    fireEvent.click(screen.getByRole("row", { name: "Open Plan / architecture agent" }));
     expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
     expect(setShownTerminals).toHaveBeenCalledTimes(1);
     expect(setShownTerminals).toHaveBeenLastCalledWith([{ deckId: FIXTURE_DAEMON_ID, agentId: "planner" }]);
@@ -321,6 +321,45 @@ describe("agent pane overlay", () => {
     expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
     expect(setShownTerminals).toHaveBeenCalledTimes(1);
     expect(setShownTerminals).toHaveBeenLastCalledWith([]);
+  });
+
+  /**
+   * Scenario: open Planner from the overview's row and from the deck's tile,
+   * closing it in between, and re-render while it is open. Each open tells
+   * Planner's daemon once that the user opened it (issue #2454: that clears
+   * the "Needs you" its card report raised), with the agent's deck, id, pane
+   * and the process that listed it; re-renders and closing tell it nothing.
+   */
+  it("tells the agent's daemon once per open that the user opened it", () => {
+    const agentOpened = vi.fn(async () => undefined);
+    const initial = runtime({ agentOpened });
+    const snapshot = { ...initial.snapshot, agents: initial.snapshot.agents.map((agent) => ({ ...agent, incarnation: "process-a", paneId: `pane-${agent.id}` })) };
+    const shown = { ...initial, snapshot, fleet: [snapshot] } as DeckRuntimeState;
+    const { rerender } = render(<DeckShell runtime={shown} initialView={{ kind: "overview" }} />);
+    expect(agentOpened).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("row", { name: "Open Plan / architecture agent" }));
+    expect(agentOpened).toHaveBeenCalledTimes(1);
+    expect(agentOpened).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, "planner", "pane-planner", "process-a");
+    rerender(<DeckShell runtime={{ ...shown }} initialView={{ kind: "overview" }} />);
+    expect(agentOpened).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Back to dashboard" }));
+    expect(agentOpened).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole("row", { name: "Open Plan / architecture agent" }));
+    expect(agentOpened).toHaveBeenCalledTimes(2);
+  });
+
+  /** Scenario: the deck's tile opens Planner's overlay; that open is reported too. */
+  it("tells the agent's daemon when its overlay opens from the deck", () => {
+    const agentOpened = vi.fn(async () => undefined);
+    const initial = runtime({ agentOpened });
+    const snapshot = { ...initial.snapshot, agents: initial.snapshot.agents.map((agent) => ({ ...agent, incarnation: "process-a", paneId: `pane-${agent.id}` })) };
+    render(<DeckShell runtime={{ ...initial, snapshot, fleet: [snapshot] } as DeckRuntimeState} />);
+    expect(agentOpened).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Open Plan / architecture agent" }));
+    expect(agentOpened).toHaveBeenCalledTimes(1);
+    expect(agentOpened).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, "planner", "pane-planner", "process-a");
   });
 
   /** Scenario: close the viewed agent from either screen origin, reading the kept-worktree warning and cancelling once first. The daemon receives the captured target only after confirmation; its refreshed listing removes the pane and returns to the dashboard, not an empty agent screen. */

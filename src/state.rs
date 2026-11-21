@@ -4958,6 +4958,12 @@ impl AppState {
             .and_then(|pane_id| self.pane_hook_session.get(pane_id).cloned());
         let (event_session_id, event_timestamp) = (event.session_id.clone(), event.timestamp);
         let turn_failed = ends_turn_on_error(&event);
+        // Issue #2454: whether this event can start the agent's next turn — an
+        // agent's own report, not a frame the daemon synthesized (a shelled-out
+        // command's `ShellBusy` says nothing about the agent moving on) — and
+        // the pane's status before it, to see the turn start.
+        let may_start_turn = !event.is_daemon_synthetic();
+        let status_before = pane_id.as_deref().and_then(|pane| self.pane_status(pane));
         let applied = self.apply_event_reporting(event, attested_agent);
         let Some(pane_id) = pane_id else {
             return;
@@ -4993,6 +4999,19 @@ impl AppState {
             };
         if !from_current_generation {
             return;
+        }
+        // Issue #2454: the agent started working again — its pane went from a
+        // status that is not a turn in progress into one that is. That deals
+        // with the waiting, done or failed reason its card report raised.
+        if may_start_turn
+            && !status_before.as_ref().is_some_and(is_turn_in_progress)
+            && self
+                .pane_status(&pane_id)
+                .as_ref()
+                .is_some_and(is_turn_in_progress)
+            && let Some(agent_id) = live_agent_id.as_deref()
+        {
+            registry.agent_cards().note_turn_started(&pane_id, agent_id);
         }
         // Every current report re-keys the record to the pane's live agent, so
         // `agent_id` always names whose sessions it holds — including the
@@ -5279,6 +5298,15 @@ enum StopKind {
     WaitingOnDelegation,
     /// Issue #2099: the worker's turn ended on an error.
     Failed,
+}
+
+/// Issue #2454: a status that is a turn in progress — the agent thinking,
+/// working or compacting — as opposed to one where it has stopped for now.
+fn is_turn_in_progress(status: &SessionStatus) -> bool {
+    matches!(
+        status,
+        SessionStatus::Thinking | SessionStatus::Working | SessionStatus::Compacting
+    )
 }
 
 /// Issue #2099: whether `event` is an agent reporting that its turn ended on
@@ -17864,6 +17892,72 @@ mod tests {
         assert_eq!(record.agent_id.as_deref(), Some(successor.as_str()));
         assert!(record.sessions.is_empty());
         published.shutdown_all();
+    }
+
+    /// Issue #2454: the agent starting its next turn — its pane going from a
+    /// stopped status into Thinking, Working or Compacting — deals with the
+    /// `done` its card report raised. Moving between two busy statuses inside
+    /// one turn does not, and neither does a daemon-synthesized `ShellBusy`,
+    /// which says a command is running, not that the agent moved on.
+    #[test]
+    fn the_agent_starting_its_next_turn_deals_with_its_card_report() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent = registry.insert_idle_member_for_test("pane", "team-1", true);
+        let event = |event_type: EventType, secs: i64| AgentEvent {
+            session_id: "s1".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: DateTime::<Utc>::UNIX_EPOCH + chrono::TimeDelta::seconds(secs),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some("pane".into()),
+            agent_id: Some(agent.clone()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            background: None,
+            background_revision: None,
+        };
+        let dealt_with = || {
+            registry
+                .agent_cards()
+                .report_dealt_with_for_test("pane", &agent)
+        };
+        let done = || crate::agent_cards::AgentReport::parse_json(r#"{"status": "done"}"#).unwrap();
+        let mut state = AppState::default();
+        state.managed_pane_ids.insert("pane".into());
+        state.apply_event_watching_waiting(event(EventType::SessionStart, 1), &registry);
+        state.apply_event_watching_waiting(event(EventType::Thinking, 2), &registry);
+        // The agent publishes `done` from inside its turn.
+        registry.agent_cards().publish("pane", &agent, done());
+        state.apply_event_watching_waiting(event(EventType::ToolStart, 3), &registry);
+        assert_eq!(state.pane_status("pane"), Some(SessionStatus::Working));
+        assert_eq!(dealt_with(), Some(false), "a move inside the turn");
+        state.apply_event_watching_waiting(event(EventType::Idle, 4), &registry);
+        assert_eq!(dealt_with(), Some(false), "the turn ending");
+        state.apply_event_watching_waiting(event(EventType::ShellBusy, 5), &registry);
+        assert_eq!(
+            state.pane_status("pane"),
+            Some(SessionStatus::Working),
+            "precondition: ShellBusy moved the pane into Working"
+        );
+        assert_eq!(dealt_with(), Some(false), "a synthesized ShellBusy");
+        state.apply_event_watching_waiting(event(EventType::ShellIdle, 6), &registry);
+        assert_ne!(
+            state.pane_status("pane"),
+            Some(SessionStatus::Working),
+            "precondition: the pane is out of its turn again"
+        );
+        // The user replies: the next turn starts.
+        state.apply_event_watching_waiting(event(EventType::Thinking, 7), &registry);
+        assert_eq!(dealt_with(), Some(true));
+        // A newer report is not dealt with by the turn it was published in.
+        registry.agent_cards().publish("pane", &agent, done());
+        state.apply_event_watching_waiting(event(EventType::ToolStart, 8), &registry);
+        assert_eq!(dealt_with(), Some(false));
     }
 
     /// Issue #447 (Qodo, #1347): the waiting watch's record of the hook sessions

@@ -1,6 +1,6 @@
 import { expect } from "@playwright/test";
 import { test } from "./support/load-budget";
-import { enterDeck } from "./support/overview";
+import { enterDeck, ROW_EDGE } from "./support/overview";
 
 /**
  * `aria-modal="true"` made true, in the only tier that can tell.
@@ -37,7 +37,7 @@ test.describe("the agent pane is a real modal", () => {
   /** Scenario: Close agent opens an interactive confirmation above the inert pane; Escape cancels it without leaving the pane, and confirming returns to the dashboard with that agent removed. */
   test("closes the viewed agent through a reachable confirmation, then returns to the dashboard", async ({ page }) => {
     await page.goto("/?fixture=1&state=docs");
-    await page.getByRole("button", { name: "Open Desktop implementation agent" }).click();
+    await page.getByRole("row", { name: "Open Desktop implementation agent" }).click({ position: ROW_EDGE });
     const pane = page.getByTestId("agent-pane-overlay");
     const stop = pane.getByRole("button", { name: "Close agent", exact: true });
     await stop.click();
@@ -53,14 +53,14 @@ test.describe("the agent pane is a real modal", () => {
     await expect(pane).toHaveCount(0);
     await expect(confirmation).toHaveCount(0);
     await expect(page.getByRole("region", { name: "Agent dashboard" })).toBeVisible();
-    await expect(page.getByRole("button", { name: "Open Desktop implementation agent" })).toHaveCount(0);
+    await expect(page.getByRole("row", { name: "Open Desktop implementation agent" })).toHaveCount(0);
   });
 
   /** Scenario: open a PR from the full-screen agent pane in a real browser. The frontmost toolbar accepts focus and clicks while the underlying pane is inert. */
   test("keeps the PR toolbar interactive above the agent pane", async ({ page }) => {
     await page.goto("/?fixture=1&state=docs-pr");
     await page.getByTestId("open-overview").click();
-    await page.getByRole("button", { name: "Open Desktop implementation agent" }).click();
+    await page.getByRole("row", { name: "Open Desktop implementation agent" }).click({ position: ROW_EDGE });
     const pane = page.getByTestId("agent-pane-overlay");
     await expect(pane).toBeVisible();
     await pane.getByTestId("pr-badge-2").click();

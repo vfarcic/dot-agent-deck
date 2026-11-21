@@ -29,7 +29,7 @@ By default a row shows **Status**, **Agent**, **Uptime** and **Working directory
 | Column | What it shows |
 | --- | --- |
 | **Status** | The agent's status (below), with its colour mark. |
-| **Agent** | The agent's name, and its role in an orchestration. Cannot be removed. |
+| **Agent** | The agent's name, and its role in an orchestration, followed by its badges: **ORCHESTRATOR**, the pull request, and an amber **Needs you** when its card needs you ([Agent Cards](agent-cards.md#what-a-card-shows); hover it to see why). Cannot be removed, so those badges show whichever columns you hide. |
 | **Last activity** | How long ago the daemon last saw the agent do anything. Blank when the daemon has not reported it, for example for agents under a restarted daemon. |
 | **Uptime** | How long the agent's process has been running. For an orchestration worker that was restarted, the age of its current process. |
 | **CLI** | The program the agent runs, as the daemon reports it (`claude`, `codex`, …). |
@@ -37,6 +37,8 @@ By default a row shows **Status**, **Agent**, **Uptime** and **Working directory
 | **Tools** | How many tool calls the agent has reported. |
 | **Working directory** | Where the agent runs. |
 | **Last prompt** | The last prompt sent to the agent. |
+
+At the right end of a row are its **Close** button (`Close <name> agent`) and, when agent cards are offered, its **⋯** menu. They stay in the same place on every row, with or without a **Needs you** badge.
 
 **Restore defaults** in the Columns menu goes back to the four default columns. The choice is remembered by the app on this computer, in the app's own storage, not in the [settings file](settings.md#the-settings-file). The TUI has no column choice: its cards pick their density from the terminal's size.
 
@@ -87,7 +89,7 @@ See [Orchestration → Delivery](../orchestration.md#delivery-in-the-tui-and-des
 
 To watch or talk to one agent:
 
-1. Click its row, or its open control (`Open <name> agent`). Its live terminal opens in a full-window pane over the Dashboard.
+1. Click its row. From the keyboard, press `Tab` until the row is focused (each row is one stop, read out as `Open <name> agent`, followed by its own buttons) and press `Enter` or `Space`. Its live terminal opens in a full-window pane over the Dashboard. Opening an agent also clears the **Needs you** its card raised for a report that it is waiting, done or failed ([Agent Cards](agent-cards.md#what-a-card-shows)).
 2. Type into the terminal as you would into the TUI's pane. [Keys typed into an agent's terminal](settings.md#keys-typed-into-an-agents-terminal) says which keys reach the agent, including your platform's editing and paste shortcuts.
 3. When the agent's output is longer than the terminal, a scrollbar stays on the terminal's right edge, so you can see that there is more above and how far back you are. Scroll up to read earlier output.
 4. To copy the agent's output, drag across it with the mouse. Some agents, such as Codex, OpenCode and Claude Code in its fullscreen mode, handle the mouse themselves: they highlight what you drag across and copy it when you release the button, so the text is on your clipboard with nothing more to press. Otherwise the terminal highlights the text, and you copy it with your system's copy key: `⌘C` on macOS, `Ctrl+Shift+C` on Linux, and `Ctrl+C` or `Ctrl+Shift+C` on Windows. On Windows, `Ctrl+C` copies only while text is highlighted and then clears the highlight, so pressing it again interrupts the agent. On macOS and Linux, plain `Ctrl+C` always goes to the agent as an interrupt, even while text is highlighted.
@@ -140,11 +142,11 @@ To sign out, use [Settings → GitHub → Sign out of GitHub](settings.md#github
 
 ### In the TUI
 
-The TUI shows the same pull request on the agent's card, as `#1234` with a glyph for its state and its review on the card's bottom border (see [Session Management → What a TUI card shows](../session-management.md#what-a-tui-card-shows)), and `o` opens the selected card's pull request in your system browser rather than inside the TUI. The desktop app has no `o` key, because it has no keyboard selection of a row: click the badge or say "open the PR for" and the agent's name instead.
+The TUI shows the same pull request on the agent's card, as `#1234` with a glyph for its state and its review on the card's bottom border (see [Session Management → What a TUI card shows](../session-management.md#what-a-tui-card-shows)), and `o` opens the selected card's pull request in your system browser rather than inside the TUI. The desktop app has no `o` key: a focused row's keys open the agent, so click the badge or say "open the PR for" and the agent's name instead.
 
 ## Generate a config with an agent
 
-To have an agent write the project's `.dot-agent-deck.toml` for you, press **Generate config** on its row (the file icon, `Generate config with <name> agent`) or in the header of its pane, or, with voice on, say "generate config with" and the agent's name ("generate config" alone in its pane). The **Generate .dot-agent-deck.toml** dialog asks whether to instruct the agent to analyse the project and create one: **Yes** sends the request, **No** sends nothing. After **Yes** the agent's pane opens and shows `Config request sent to the agent's inbox.`, and the agent proposes a config in its pane and writes it once you approve. Pressing **No** while the dialog says `Sending…` closes it without taking the request back, and the app stays where you are. When the request cannot be sent, the Dashboard or the pane says why, for example `This daemon is too old to generate a config. Upgrade the daemon to use Generate config.` In the TUI, select the agent's card in command mode and press `g`.
+To have an agent write the project's `.dot-agent-deck.toml` for you, open its pane and press **Generate config** in the pane's header, or, with voice on, say "generate config with" and the agent's name ("generate config" alone in its pane). The **Generate .dot-agent-deck.toml** dialog asks whether to instruct the agent to analyse the project and create one: **Yes** sends the request, **No** sends nothing. After **Yes** the agent's pane opens and shows `Config request sent to the agent's inbox.`, and the agent proposes a config in its pane and writes it once you approve. Pressing **No** while the dialog says `Sending…` closes it without taking the request back, and the app stays where you are. When the request cannot be sent, the Dashboard or the pane says why, for example `This daemon is too old to generate a config. Upgrade the daemon to use Generate config.` In the TUI, select the agent's card in command mode and press `g`.
 
 When the agent's project already has a `.dot-agent-deck.toml`, the button reads **Update config** (`Update config with <name> agent`), the dialog is titled **Update .dot-agent-deck.toml** and asks whether to instruct the agent to analyse the project and update the existing config, and "update config" works by voice as "generate config" does. The agent then reads the existing file and proposes changes to it, keeping what you wrote unless you agree to drop it, and edits it only after you approve. The TUI's footer shows `[Update g]` in the same case. When the deck can't tell whether the file exists, for example because the project is on a network drive that stopped answering, the button reads **Generate config** and the dialog asks whether to instruct the agent to check the project for `.dot-agent-deck.toml` and create it, or propose updates to it if it already exists, in both clients. [Orchestration → Quick setup](../orchestration.md#quick-setup) has the steps, the screenshots and what each message means.
 

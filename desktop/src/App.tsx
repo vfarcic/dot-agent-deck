@@ -576,6 +576,25 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     if (agentView && !viewBound(agentView) && paneAgent) setView(() => ({ ...agentView, incarnation: paneAgent.incarnation }));
   }, [agentView, paneAgent, setView]);
   /**
+   * Issue #2454 — opening an agent (its full-window pane from the dashboard, or
+   * its overlay on the deck) tells its daemon, once per open, which clears the
+   * "Needs you" the agent's card report raised. Sent when the view's agent
+   * resolves to a listed record, bound to the process that listed it; leaving
+   * the view forgets it, so opening the same agent again tells the daemon again.
+   */
+  const agentOpened = runtime.agentOpened;
+  const openedSent = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    if (!agentView || !paneAgent) {
+      if (!agentView) openedSent.current = undefined;
+      return;
+    }
+    const key = `${agentView.deckId}\u0000${paneAgent.id}\u0000${paneAgent.incarnation ?? ""}`;
+    if (openedSent.current === key || !agentOpened || !paneAgent.paneId) return;
+    openedSent.current = key;
+    agentOpened(agentView.deckId, paneAgent.id, paneAgent.paneId, paneAgent.incarnation).catch(() => undefined);
+  }, [agentOpened, agentView, paneAgent]);
+  /**
    * Issue #1143 — the last record this pane's deck gave, so the pane can still
    * be a pane while that deck is not answering.
    *

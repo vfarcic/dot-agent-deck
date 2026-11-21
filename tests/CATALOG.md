@@ -14854,6 +14854,20 @@ The TUI renders no cards in this slice (the desktop app does; `docs/desktop/agen
 - **Does not assert:** a custom action that collides with a later catalog name (the catalog's definition wins).
 - **Platform coverage:** mac+linux.
 
+##### agent-report/state/003 — Opening an agent in the TUI deals with its report's needs-you (issue #2454).
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_agent_cards.rs`).
+- **Agent:** one synthetic routing stand-in under the TUI's daemon; no real agent.
+- **Asserts:** a `done` report makes `card list` read `needs_you_reasons: ["done"]`; pressing `1` on the TUI's dashboard opens the agent's pane and the card then reads `needs_you: false` with the `done` report and its summary kept; a newer `waiting` report reads `["waiting"]` again.
+- **Does not assert:** the desktop's open (`desktop_agent_opened`, covered by the daemon unit test `agent_cards::tests::opening_the_agent_clears_its_report_reason` and the desktop's vitest), Enter on a selected card (the same `note_card_opened` call), or a daemon without the `agent-opened` capability (the client sends nothing; `cross-version` runs that pairing).
+- **Platform coverage:** mac+linux.
+
+##### agent-report/state/004 — The agent's next turn deals with its report's needs-you (issue #2454).
+- **Layer:** L2 headless, lane 1 (`tests/e2e_agent_cards.rs`).
+- **Agent:** one synthetic routing stand-in whose hook events are posted by the test; no real agent.
+- **Asserts:** a `waiting` report published inside a turn that then ends reads `["waiting"]`; a `thinking` event starting the next turn makes it read `needs_you: false` with the report kept; a `done` published inside that running turn still reads `["done"]` after a `tool_start` in the same turn, with status `working`.
+- **Does not assert:** a daemon-synthesized `ShellBusy` (unit test `state::tests::the_agent_starting_its_next_turn_deals_with_its_card_report`), or the live reasons, which no report clears (`agent_cards::tests::dealing_with_a_report_leaves_the_live_reasons`).
+- **Platform coverage:** mac+linux.
+
 #### agent-report/catalog
 
 ##### agent-report/catalog/001 — The catalog merges the user's entries over the defaults and validates reports.
@@ -16259,7 +16273,7 @@ The desktop half of PRD #2374's agent cards. These are Vitest + Testing Library 
 ##### desktop/agent-cards/005 — Table rows carry the daemon's needs-you marker and a menu that shows the card.
 - **Test:** vitest `desktop/agent-cards/005: …` in `desktop/src/components/AgentCardsContract.test.tsx`.
 - **Layer:** desktop component (jsdom), Table view.
-- **Asserts:** `overview-needs-you` appears on exactly the rows whose entry has `needs_you`, whatever their status; the row's ⋯ menu opens without navigating, holds Show card and the daemon's primary action by label (no primary item when it is `open`); Show card opens that entry's overlay, which then walks the daemon's order; clicking the row itself still opens the agent.
+- **Asserts:** `overview-needs-you` appears on exactly the rows whose entry has `needs_you`, whatever their status (since issue #2454 it is a badge in the name cell, which `OverviewCards.test.tsx` places after the PR badge and outside the row's controls); the row's ⋯ menu opens without navigating, holds Show card and the daemon's primary action by label (no primary item when it is `open`); Show card opens that entry's overlay, which then walks the daemon's order; clicking the row itself still opens the agent.
 - **Does not assert:** the menu's keyboard dismissal beyond Escape; the row primary's send (covered by 003's path).
 
 ##### desktop/agent-cards/006 — The view is remembered per client, and a broken storage falls back to the table.
