@@ -346,7 +346,7 @@ pub const RESTART_AFTER: &str = "Then restart the affected agents.";
 /// of its agents ([`repair_before_spawn`]): an agent with a startup install
 /// whose hook config can be read back, other than OpenCode, whose plugin is
 /// rewritten before every start anyway (PRD #1666 §11). Today: Claude Code,
-/// Codex and Devin.
+/// Codex, Devin and Antigravity.
 pub fn repairs_before_spawn(agent: &AgentType) -> bool {
     let spec = crate::agent_registry::spec(agent);
     *agent != AgentType::OpenCode
@@ -856,8 +856,13 @@ mod tests {
     /// and a readable hook config is repaired before it starts, except
     /// OpenCode, whose plugin is rewritten before every start already.
     #[test]
-    fn the_agents_repaired_before_a_start_are_claude_codex_and_devin() {
-        for agent in [AgentType::ClaudeCode, AgentType::Codex, AgentType::Devin] {
+    fn the_agents_repaired_before_a_start_are_claude_codex_devin_and_antigravity() {
+        for agent in [
+            AgentType::ClaudeCode,
+            AgentType::Codex,
+            AgentType::Devin,
+            AgentType::Antigravity,
+        ] {
             assert!(repairs_before_spawn(&agent), "{agent:?}");
         }
         for agent in [AgentType::OpenCode, AgentType::Pi, AgentType::None] {

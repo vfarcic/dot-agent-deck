@@ -542,9 +542,17 @@ export default {id:'deck-test-route',tui:async(api)=>{
                     && p["data"]["state"]["input"]["command"] == "sleep 30"
             });
             let Some(call) = call else { return false };
-            if !composer::sleep_tool_visible(&self.screen())
-                || !composer::sleep_tool_visible(&self.deck.snapshot_grid())
-            {
+            // OpenCode 2.3's default verbosity draws no `$ sleep 30` heading
+            // while the shell runs, only `⠇ Running command…` over its ctrl+b
+            // hint, so there the running call above names the command and the
+            // screen shows a foreground command running (issue #2445). Before
+            // 2.3 the exact heading is still required.
+            let shell_visible = |screen: &str| {
+                composer::sleep_tool_visible(screen)
+                    || (common::opencode_test_version().is_ok_and(|v| v >= (2, 3, 0))
+                        && composer::foreground_command_visible(screen))
+            };
+            if !shell_visible(&self.screen()) || !shell_visible(&self.deck.snapshot_grid()) {
                 return false;
             }
             *running_call.borrow_mut() = call.clone();

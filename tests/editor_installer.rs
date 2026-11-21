@@ -309,10 +309,12 @@ fn probe_064_a_turned_off_agent_is_never_installed() {
     let claude_off = DoorbellSwitch {
         claude: false,
         codex: true,
+        antigravity: true,
     };
     let codex_off = DoorbellSwitch {
         claude: true,
         codex: false,
+        antigravity: true,
     };
     let on = DoorbellSwitch::default();
     assert_eq!(

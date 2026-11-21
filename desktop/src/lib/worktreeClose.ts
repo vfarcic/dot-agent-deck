@@ -12,8 +12,8 @@ export interface KeptWorktree {
 
 /**
  * What the close dialog learns before it asks (`desktop_worktree_close_preview`).
- * `keepWorktree` is the dispatched worktree to offer "…, keep worktree" for
- * (issue #1958): set only when the deck can keep and the closed panes own a
+ * `keepWorktree` is the dispatched worktree to offer "Keep the worktree" for
+ * (issue #1958, a checkbox since issue #2436): set only when the deck can keep and the closed panes own a
  * recorded worktree, `null` otherwise — so an older deck never offers it.
  */
 export interface WorktreeCloseReport {
@@ -22,9 +22,6 @@ export interface WorktreeCloseReport {
 }
 
 export const NO_WORKTREE_CLOSE_REPORT: WorktreeCloseReport = { kept: null, keepWorktree: null };
-
-/** The suffix both clients add to a close choice that keeps the worktree (issue #1958, CLAUDE.md rule 22). */
-export const KEEP_WORKTREE_SUFFIX = ", keep worktree";
 
 export interface WorktreeKeptNotice extends KeptWorktree {
   deckId: string;

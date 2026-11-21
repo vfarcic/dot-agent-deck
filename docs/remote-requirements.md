@@ -45,7 +45,7 @@ To identify the host, `remote add` reads only `uname -s -m`; it does not check t
 - A POSIX shell and the standard tools `uname`, `mkdir`, `chmod` and `mv`.
 - **`curl`**, used by `remote add` and `remote upgrade` to download the release binary. Not needed when Homebrew installed the deck, or with `--no-install`.
 - **`git`**, for the project you clone there. The deck itself does not need it to start.
-- **The agent CLI** for each agent you will run, the runtime it needs, and its credentials, all available to the account the daemon runs as. The deck starts agents but does not install them. Claude Code, OpenCode, Pi, Codex and Devin have status reporting in the deck; other interactive terminal programs can run in a pane without it.
+- **The agent CLI** for each agent you will run, the runtime it needs, and its credentials, all available to the account the daemon runs as. The deck starts agents but does not install them. Claude Code, OpenCode, Pi, Codex, Devin and Antigravity have status reporting in the deck; other interactive terminal programs can run in a pane without it.
 
   | Agent | Install (one option) |
   |---|---|
@@ -54,8 +54,9 @@ To identify the host, `remote add` reads only `uname -s -m`; it does not check t
   | Pi | `npm install -g @earendil-works/pi-coding-agent` (needs Node.js) |
   | Codex | `npm install -g @openai/codex` (needs Node.js) |
   | Devin | the vendor's install instructions; `devin` must end up on `PATH` |
+  | Antigravity | `curl -fsSL https://antigravity.google/cli/install.sh \| bash`, then run `agy` once on the host, over `ssh`, to complete its first-run screens and sign in ([Antigravity CLI](installation.md#antigravity-cli)) |
 
-  The daemon reads `PATH` from your login shell when it starts (it runs `$SHELL` as an interactive login shell), so a directory added to `PATH` in `~/.bashrc` or `~/.zshrc` is found. If an agent still fails to start with a bare command, see [A bare command fails to spawn](troubleshooting.md#a-bare-command-like-claude-opencode-pi-codex-or-devin-fails-to-spawn).
+  The daemon reads `PATH` from your login shell when it starts (it runs `$SHELL` as an interactive login shell), so a directory added to `PATH` in `~/.bashrc` or `~/.zshrc` is found. If an agent still fails to start with a bare command, see [A bare command fails to spawn](troubleshooting.md#a-bare-command-like-claude-opencode-pi-codex-devin-or-agy-fails-to-spawn).
 
 - Optional: **`bash`, `timeout`, `head` and `od`**, used by `remote doctor`'s `ForwardBound` check for a reverse tunnel. Without them that check reports `UNKNOWN`. `remote doctor`'s `AllowTcpForwarding` and `ClientAliveInterval` checks run `sshd -T`, which usually needs root; without it they report `UNKNOWN`.
 - Optional: a container runtime, only if your agents run containers.

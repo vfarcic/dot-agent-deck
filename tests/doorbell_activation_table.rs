@@ -479,7 +479,7 @@ fn doorbell_053_every_recorded_dialog_leaves_the_token_head_inert() {
 #[spec("inbox/doorbell/053")]
 #[test]
 fn doorbell_053_the_shipped_facts_verdicts() {
-    assert_eq!(AGENT_FACTS.len(), 2);
+    assert_eq!(AGENT_FACTS.len(), 3);
     assert_eq!(AGENT_FACTS[0], CLAUDE_FACTS);
     assert_eq!(AGENT_FACTS[1], CODEX_FACTS);
     for facts in &AGENT_FACTS {
@@ -535,6 +535,27 @@ fn doorbell_053_the_shipped_facts_verdicts() {
     assert_eq!(
         CODEX_FACTS.editor_probe,
         Measurement::Verified(CODEX_EDITOR_PROBE)
+    );
+}
+
+/// Scenario: Ask the shipped activation table about the measured Antigravity 1.5.9 release. Its measured agent facts admit a doorbell, including through the generation verdict, so an idle orchestration role can receive its first task before SessionStart.
+#[spec("inbox/doorbell/053")]
+#[test]
+fn doorbell_053_antigravity_measured_release_admits_a_doorbell() {
+    let agent: AgentType = serde_json::from_str("\"antigravity\"").unwrap();
+    let got = verdict(&AGENT_FACTS, &agent, "1.5.9");
+    assert!(
+        matches!(got, Activation::Go { .. }),
+        "measured Antigravity 1.5.9 must admit the idle doorbell: {got:?}"
+    );
+    assert_eq!(
+        generation_activation(
+            &AGENT_FACTS,
+            Some(&agent),
+            &known("1.5.9"),
+            &DoorbellSwitch::default()
+        ),
+        got
     );
 }
 

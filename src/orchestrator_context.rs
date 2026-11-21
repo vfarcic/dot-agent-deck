@@ -6864,6 +6864,12 @@ mod hygiene_tests {
         let (_root, real) = walk_fixture();
         let target = real.join("target");
         std::fs::create_dir(&target).unwrap();
+        // Owner-only, like the fixture's root: under a `umask 002` host the
+        // `mkdir` above leaves it group-writable, which the walk refuses.
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         // `l0` -> `l1` -> ... -> `l40` -> `target`: 41 links from `l0`.
         let links = 41;
         for n in 0..links {

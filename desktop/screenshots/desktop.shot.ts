@@ -27,6 +27,33 @@ desktopScenario("dashboard-empty", async (page) => {
   await expect(page.getByTestId("overview-first-run")).toBeVisible();
 });
 
+// The same synthetic permission stop as the TUI capture: one Antigravity
+// agent, with its own wording beneath the tile's Needs Input status.
+desktopScenario("antigravity-needs-input", async (page) => {
+  // Use xterm's supported DOM renderer: the sandbox's headless WebGL
+  // canvas stays blank even after its buffer contains the permission menu.
+  await page.addInitScript(() => {
+    const getContext = HTMLCanvasElement.prototype.getContext;
+    Object.defineProperty(HTMLCanvasElement.prototype, "getContext", {
+      value(...args: unknown[]) {
+        if (typeof args[0] === "string" && args[0].includes("webgl")) return null;
+        return Reflect.apply(getContext, this, args);
+      },
+    });
+  });
+  await page.goto("/?fixture=1&state=docs-antigravity");
+  await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
+  await page.getByRole("button", { name: "Open probe agent" }).click();
+  await expect(page.getByTestId("agent-pane-overlay")).toBeVisible();
+  const tile = page.getByTestId("agent-tile-antigravity");
+  await expect(tile).toBeVisible();
+  await expect(tile.getByTestId("status-reason-1")).toHaveText("Approve Bash: rm -f probe.txt");
+  await expect(tile.getByText("needs input", { exact: true })).toBeVisible();
+  await expect(tile.getByTestId("question-badge-1")).toBeVisible();
+  await expect(tile.getByTestId("question-badge-1")).toContainText("QUESTION");
+  await expect(tile.locator(".xterm-rows")).toContainText("Esc to cancel");
+});
+
 desktopScenario("pull-request-badge", async (page) => {
   await overview(page, "docs-pr");
   await expect(page.locator(".overview-row")).toHaveCount(1);

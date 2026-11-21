@@ -1966,7 +1966,9 @@ fn replay_transaction(
                     let accepted = match &job {
                         Job::Line(text) => text.len(),
                         Job::Cr => 1,
-                        Job::Deletes(_) => panic!("unexpected cleanup write: {job:?}"),
+                        Job::Deletes(_) | Job::Clears(_) => {
+                            panic!("unexpected cleanup write: {job:?}")
+                        }
                     };
                     events.push_back(Event::JobStarted);
                     events.push_back(Event::JobEnded { accepted, ok: true });

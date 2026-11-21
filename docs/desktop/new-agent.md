@@ -2,8 +2,6 @@
 
 **New agent** starts something on a daemon: a single agent, an orchestration from a project's `.dot-agent-deck.toml`, a dispatcher, or an agent that helps you write a schedule. It is the desktop counterpart of the TUI's `Ctrl+n` form and offers the same kinds of start.
 
-![The New agent dialog over the Dashboard: the Local daemon chosen under Daemon, a directory chosen in the browser with Use this directory beside it, and the form below with Dir, the Mode chips (No mode selected), Name pre-filled from the directory, an empty Command, and Discard and Create agent](/img/new-agent-desktop.png)
-
 ## Start an agent
 
 1. On the [Dashboard](dashboard.md), press **New agent** at the top, or `Ctrl+N` / `⌘N` (not while an agent pane is open or a text field has focus). A daemon section's own **New agent** button does the same with that daemon already chosen.
@@ -64,7 +62,7 @@ If a project defines two orchestrations with the same name, both chips are shown
 
 **Name** names the agent, or the orchestration run. It is pre-filled with the directory's name. For an orchestration, a name a live orchestration already uses on that daemon is refused, and if the directory already runs an orchestration on that daemon you are warned that the two share its role files and working tree.
 
-**Command** is what the agent runs, typically `claude`, `opencode`, `pi`, `codex` or `devin`. It is pre-filled from the chosen daemon's [`default_command`](../configuration.md#set-the-command-new-agents-start-with) when one is set, otherwise from the last command started from a New agent form on that daemon, in this app or in the TUI. Each daemon remembers its own, so it survives restarting the app or the daemon. A daemon from a release before this one does not remember it: there the field is pre-filled with the command this app last started an agent with on that daemon since the app was opened. Left empty:
+**Command** is what the agent runs, typically `claude`, `opencode`, `pi`, `codex`, `devin` or `agy` (Antigravity). It is pre-filled from the chosen daemon's [`default_command`](../configuration.md#set-the-command-new-agents-start-with) when one is set, otherwise from the last command started from a New agent form on that daemon, in this app or in the TUI. Each daemon remembers its own, so it survives restarting the app or the daemon. A daemon from a release before this one does not remember it: there the field is pre-filled with the command this app last started an agent with on that daemon since the app was opened. Left empty:
 
 - with **No mode**, it starts the daemon's default shell;
 - with **schedule**, **schedule: issues** or **dispatcher**, it starts the daemon's `default_command`, or `claude` when none is set. The field's placeholder names the command.

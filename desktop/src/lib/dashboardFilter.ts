@@ -75,6 +75,7 @@ export const DASHBOARD_AGENT_TYPES: readonly { id: AgentTypeId; label: string }[
   { id: "open_code", label: "OpenCode" },
   { id: "pi", label: "Pi" },
   { id: "devin", label: "Devin" },
+  { id: "antigravity", label: "Antigravity" },
 ];
 
 /** A fresh filter that shows everything. */
