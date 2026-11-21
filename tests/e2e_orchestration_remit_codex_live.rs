@@ -22,7 +22,7 @@ mod installed;
 mod live;
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::TuiDeck;
 use dot_agent_deck::agent_pty::{AgentRecord, TabMembership};
@@ -34,11 +34,23 @@ const READS: &str = "remit_reads_2435_c0d3.txt";
 const LOG: &str = "remit-codex-live.log";
 const ORCHESTRATION: &str = "remit-compaction-codex";
 
-/// Each step's wait: one model round trip (a startup turn, a compaction's
-/// summary call, the turn after it) plus Codex's start-up. Kept inside the
-/// test's nextest window (`.config/nextest.toml`), so a step that never
-/// happens fails with its evidence rather than being killed without any.
+/// Each step's wait at most: one model round trip (a startup turn, a
+/// compaction's summary call, the turn after it) plus Codex's start-up.
 const BUDGET: Duration = Duration::from_secs(120);
+
+/// Every wait together, from the test's first line. It stays under both the
+/// test's nextest window (5 x 60 s, `.config/nextest.toml`) and the 300 s
+/// lifetime of the deck's daemon, so a run that is slow at any step fails at
+/// that step with its evidence rather than being killed without any. A
+/// passing run took 64-73 s.
+const TOTAL: Duration = Duration::from_secs(260);
+
+/// What is left of [`TOTAL`] for the next wait, capped at [`BUDGET`].
+fn left(deadline: Instant) -> Duration {
+    deadline
+        .saturating_duration_since(Instant::now())
+        .min(BUDGET)
+}
 
 fn reads(dir: &Path) -> usize {
     std::fs::read_to_string(dir.join(READS))
@@ -104,7 +116,7 @@ fn kind(entry: &serde_json::Value) -> String {
     )
 }
 
-fn orchestrator(deck: &TuiDeck) -> AgentRecord {
+fn orchestrator(deck: &TuiDeck, deadline: Instant) -> AgentRecord {
     let is_start = |record: &AgentRecord| {
         matches!(
             record.tab_membership,
@@ -115,7 +127,7 @@ fn orchestrator(deck: &TuiDeck) -> AgentRecord {
         )
     };
     assert!(
-        common::wait_until(BUDGET, || {
+        common::wait_until(left(deadline), || {
             common::agent_records_on(deck.attach_socket_path())
                 .iter()
                 .any(|r| is_start(r) && r.pane_id_env.is_some())
@@ -160,6 +172,8 @@ fn write_orchestration(deck: &TuiDeck) {
 #[spec("orchestration/remit/015")]
 #[test]
 fn orchestration_remit_015_real_codex_compaction_reassert_lands_after_the_summary() {
+    // Counted from before the Codex preflight, which spends the same window.
+    let deadline = Instant::now() + TOTAL;
     skip_unless!(codex_installed::checkable());
     let release = codex_installed::installed_release().unwrap();
     eprintln!("orchestration/remit/015: Codex {release}");
@@ -169,7 +183,7 @@ fn orchestration_remit_015_real_codex_compaction_reassert_lands_after_the_summar
         .with_env("PATH", common::path_with_binary_dir())
         .with_env("DOT_AGENT_DECK_LOG", LOG)
         .launch_with_fixture("minimal");
-    assert!(deck.wait_for_grid_string_within("No active agents", BUDGET));
+    assert!(deck.wait_for_grid_string_within("No active agents", left(deadline)));
     // The deck's Codex hooks trusted in the sandbox's `CODEX_HOME`, as an
     // install the user ran earlier would have left them.
     live::prepare(&deck);
@@ -194,7 +208,7 @@ fn orchestration_remit_015_real_codex_compaction_reassert_lands_after_the_summar
     deck.send_keys(b"\r");
     deck.send_keys(b"\r");
     deck.wait_for_absence("[Submit]");
-    let coordinator = orchestrator(&deck);
+    let coordinator = orchestrator(&deck, deadline);
     let pane = coordinator.pane_id_env.clone().expect("orchestrator pane");
     let log = || std::fs::read_to_string(deck.workdir().join(LOG)).unwrap_or_default();
     let evidence = || {
@@ -215,13 +229,13 @@ fn orchestration_remit_015_real_codex_compaction_reassert_lands_after_the_summar
     // The startup read: the spawn-time pointer reached Codex through its
     // inbox and it followed the role file once.
     assert!(
-        common::wait_until(BUDGET, || reads(&dir) >= 1),
+        common::wait_until(left(deadline), || reads(&dir) >= 1),
         "the orchestrator never recorded reading its role file\n{}",
         evidence()
     );
     // Its startup turn has ended (Codex's `Stop` hook).
     assert!(
-        common::wait_until(BUDGET, || events.snapshot().iter().rev().any(|e| {
+        common::wait_until(left(deadline), || events.snapshot().iter().rev().any(|e| {
             e.pane_id.as_deref() == Some(pane.as_str())
                 && e.event_type == EventType::Idle
                 && !e.is_from_subagent()
@@ -241,15 +255,17 @@ fn orchestration_remit_015_real_codex_compaction_reassert_lands_after_the_summar
 
     // Codex's `PreCompact` hook reaches the deck as `Compacting`.
     assert!(
-        common::wait_until(BUDGET, || events.snapshot().iter().skip(seen).any(|e| {
-            e.pane_id.as_deref() == Some(pane.as_str()) && e.event_type == EventType::Compacting
-        })),
+        common::wait_until(left(deadline), || events.snapshot().iter().skip(seen).any(
+            |e| {
+                e.pane_id.as_deref() == Some(pane.as_str()) && e.event_type == EventType::Compacting
+            }
+        )),
         "Codex's compaction never reached the deck as Compacting\n{}",
         evidence()
     );
     // The re-assert published exactly one fresh role file.
     assert!(
-        common::wait_until(BUDGET, || context_files(&dir).len() > before.len()),
+        common::wait_until(left(deadline), || context_files(&dir).len() > before.len()),
         "no role file was published for the re-assert; before {before:?}\n{}",
         evidence()
     );
@@ -262,7 +278,7 @@ fn orchestration_remit_015_real_codex_compaction_reassert_lands_after_the_summar
 
     // After the summary the orchestrator followed the re-assert.
     assert!(
-        common::wait_until(BUDGET, || reads(&dir) >= 2),
+        common::wait_until(left(deadline), || reads(&dir) >= 2),
         "the orchestrator did not read its role file again after /compact\n{}",
         evidence()
     );
@@ -274,7 +290,7 @@ fn orchestration_remit_015_real_codex_compaction_reassert_lands_after_the_summar
     // follows.
     let home = deck.home_dir().to_path_buf();
     let found = std::cell::RefCell::new(String::new());
-    let landed_after = common::wait_until(Duration::from_secs(30), || {
+    let landed_after = common::wait_until(left(deadline).min(Duration::from_secs(30)), || {
         let mut found = found.borrow_mut();
         found.clear();
         rollouts(&home).iter().any(|path| {
