@@ -4500,7 +4500,7 @@ describe("PRD #802 D5 — a spoken stop opens a confirmation; a spoken start sta
     expect(runAction).toHaveBeenCalledWith({ type: "stop_agent", deckId: snapshot.connection.deckId, agentId: target.id });
   });
 
-  /** Scenario: with typing off, a whole spoken stop on the agent screen opens the same confirmation as Close agent. Cancelling leaves its pane open; confirming closes the viewed role alone and returns to the dashboard. */
+  /** Scenario: with typing off, a whole spoken stop on the agent screen opens the same confirmation as Close agent. Cancelling leaves its pane open; confirming Close agent closes the viewed role alone and returns to the dashboard. */
   it.each(["stop", "stop it", "stop that", "close this agent"])("confirms %s on the agent screen without stopping anything by voice alone", async (utterance) => {
     const voice = microphone([]);
     const { deck, runAction, snapshot } = d5Deck(voice);
@@ -4511,7 +4511,9 @@ describe("PRD #802 D5 — a spoken stop opens a confirmation; a spoken start sta
     voice.deliver(utterance);
     await completeUtterance();
     expect(confirmation()).toHaveTextContent("Close lead?");
-    expect(confirmation()).toHaveTextContent("leaving the orchestration one role short");
+    // Issue #2436: the orchestrator's dialog also offers closing the whole orchestration.
+    expect(confirmation()).toHaveTextContent("Close agent stops only lead, the orchestrator, leaving the other roles with nothing coordinating them.");
+    expect(within(confirmation()!).getByRole("button", { name: "Close orchestration" })).toBeEnabled();
     expect(runAction).not.toHaveBeenCalled();
     fireEvent.click(within(confirmation()!).getByRole("button", { name: "Cancel" }));
     expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();

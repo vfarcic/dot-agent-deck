@@ -4,7 +4,9 @@
 //! starts with the deck's hooks in `~/.claude/settings.json`, even when Claude
 //! Code was set up, or the deck copy its hooks named was deleted, after the
 //! daemon started; and hooks that already name the deck are not rewritten
-//! when an agent starts.
+//! when an agent starts. `hooks/install/035` is the Antigravity counterpart:
+//! an `agy` installed after the daemon started, whose `~/.gemini/config/
+//! hooks.json` gets the deck's one named hook before the agent starts.
 //!
 //! `daemon serve` installs Claude Code's hooks when it starts (issue #1157,
 //! `hooks/install/009`). Before an agent starts it runs that install again
@@ -354,5 +356,162 @@ fn install_030_a_malformed_claude_settings_file_is_left_alone_and_the_refusal_lo
     assert!(
         log.contains(&*deck.settings.to_string_lossy()),
         "the refusal must name the settings file it left alone; log:\n{log}"
+    );
+}
+
+/// The Antigravity hook command's suffix (`antigravity_hooks_manage`).
+const AGY_SUFFIX: &str = " hook --agent antigravity";
+
+/// Scenario: Start a headless `daemon serve` whose `PATH` holds a directory with
+/// no `agy` in it, so its startup install writes no Antigravity hook, then put
+/// an `agy` stand-in there (Antigravity installed after the deck started) with
+/// a `~/.gemini/config/hooks.json` holding only a hook of the user's own, and
+/// fire a scheduled task that runs it. The agent must start with the deck's one
+/// `dot-agent-deck` hook pinned to the daemon's install and the user's hook kept
+/// byte for byte; a second start must not rewrite the file.
+#[spec("hooks/install/035")]
+#[test]
+fn install_035_an_antigravity_agent_set_up_after_the_daemon_starts_with_its_hook() {
+    let tempdir = common::harness_tempdir().expect("scratch tempdir");
+    let scratch = tempdir.path().to_path_buf();
+    let bin = scratch.join("agy-bin");
+    std::fs::create_dir_all(&bin).expect("create the stand-in's bindir");
+    let standin = bin.join("agy");
+    let spawns = scratch.join("spawns");
+    std::fs::create_dir_all(&spawns).expect("create the spawn record dir");
+    let toml: String = (1..=2)
+        .map(|n| {
+            format!(
+                "[[scheduled_tasks]]\n\
+                 name = \"phase-{n}\"\n\
+                 cron = \"0 0 1 1 *\"\n\
+                 working_dir = \"{work}\"\n\
+                 command = \"{command}\"\n\
+                 prompt = \"ISSUE-1973-AGY-PHASE-{n}\"\n\
+                 enabled = true\n",
+                work = scratch.display(),
+                command = standin.display(),
+            )
+        })
+        .collect();
+    // The stand-in's directory first, and no directory holding a host `agy`,
+    // so the startup install finds none and the per-start repair finds only
+    // the stand-in.
+    let host = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(
+        std::iter::once(bin.clone())
+            .chain(std::env::split_paths(&host).filter(|dir| !dir.join("agy").exists())),
+    )
+    .expect("join the daemon's PATH");
+    let path = path.to_string_lossy().into_owned();
+    let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &[("PATH", &path)]);
+    let hooks = daemon
+        .home
+        .join(".gemini")
+        .join("config")
+        .join("hooks.json");
+    assert!(
+        !daemon.home.join(".gemini").exists(),
+        "precondition: with no agy on its PATH, the daemon's startup install creates no ~/.gemini"
+    );
+
+    // The user's own hook, with spacing the deck must not normalise.
+    let users = "{\n  \"mine\":   {\"PreToolUse\": [ {\"matcher\": \"*\", \"command\": \"true issue-1973-agy-own\"} ]}\n}\n";
+    let users_value =
+        "{\"PreToolUse\": [ {\"matcher\": \"*\", \"command\": \"true issue-1973-agy-own\"} ]}";
+    std::fs::create_dir_all(hooks.parent().unwrap()).expect("set up ~/.gemini/config");
+    std::fs::write(&hooks, users).expect("seed the user's hooks.json");
+    std::fs::write(
+        &standin,
+        format!(
+            "#!/bin/sh\n\
+             case \"$1\" in --version|-v) echo '1.5.9'; exit 0;; esac\n\
+             dir='{spawns}'\n\
+             n=$(ls \"$dir\" | grep -c '^spawn-')\n\
+             cat '{hooks}' > \"$dir/tmp-$$\"\n\
+             mv \"$dir/tmp-$$\" \"$dir/spawn-$n\"\n\
+             exec sleep 600\n",
+            spawns = spawns.display(),
+            hooks = hooks.display(),
+        ),
+    )
+    .expect("write the stand-in");
+    std::fs::set_permissions(&standin, std::fs::Permissions::from_mode(0o755))
+        .expect("make the stand-in executable");
+
+    let spawn = |phase: usize| {
+        daemon
+            .run_now(&format!("phase-{phase}"))
+            .expect("run the scheduled task now");
+        let record = spawns.join(format!("spawn-{}", phase - 1));
+        assert!(
+            common::wait_until(WAIT, || record.is_file()),
+            "the scheduled agy stand-in for phase-{phase} never started; agents: {:?}",
+            daemon.agent_records()
+        );
+        std::fs::read_to_string(&record).expect("read what the stand-in saw")
+    };
+
+    let seen = spawn(1);
+    let doc: serde_json::Value = serde_json::from_str(&seen)
+        .unwrap_or_else(|e| panic!("hooks.json does not parse ({e}):\n{seen}"));
+    let ours = doc.get("dot-agent-deck").unwrap_or_else(|| {
+        panic!(
+            "the agent started with no deck hook in hooks.json: the daemon did not install \
+             Antigravity's hook before it started (issue #1973):\n{seen}"
+        )
+    });
+    let mut commands = Vec::new();
+    fn collect(value: &serde_json::Value, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => map.iter().for_each(|(key, child)| {
+                if key == "command"
+                    && let Some(text) = child.as_str()
+                {
+                    out.push(text.to_string());
+                }
+                collect(child, out);
+            }),
+            serde_json::Value::Array(items) => items.iter().for_each(|i| collect(i, out)),
+            _ => {}
+        }
+    }
+    collect(ours, &mut commands);
+    let durable = daemon
+        .home
+        .join(".local")
+        .join("bin")
+        .join("dot-agent-deck");
+    assert!(
+        !commands.is_empty()
+            && commands.iter().all(|c| {
+                c.strip_suffix(AGY_SUFFIX)
+                    .map(|word| {
+                        word.strip_prefix(dot_agent_deck::platform::paths::HOOK_BIN_OVERRIDE_PREFIX)
+                            .unwrap_or(word)
+                            .trim_matches('\'')
+                            == durable.to_string_lossy()
+                    })
+                    .unwrap_or(false)
+            }),
+        "every deck hook must run the daemon's install `{}`; the agent saw {commands:?}",
+        durable.display()
+    );
+    assert!(
+        seen.contains(users_value),
+        "the user's own hook must be kept byte for byte:\n{seen}"
+    );
+
+    let installed = file_identity(&hooks);
+    let again = spawn(2);
+    assert_eq!(
+        again,
+        String::from_utf8_lossy(&installed.0),
+        "the second agent must see the hook the first start installed"
+    );
+    assert!(
+        file_identity(&hooks) == installed,
+        "starting another Antigravity agent rewrote hooks.json (bytes, inode or mtime \
+         changed) although its hook already named the deck"
     );
 }

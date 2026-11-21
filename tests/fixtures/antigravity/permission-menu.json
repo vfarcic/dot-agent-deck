@@ -1,0 +1,19 @@
+{
+  "agy_version": "1.5.9",
+  "measured_on": "2026-11-16",
+  "source": "Real interactive agy in an isolated seeded HOME, --mode auto, permissions enabled. The scratch filename is normalized to match the captured OSC permission fixture. Only the screen carries these labels; the OSC msg is the prompt below.",
+  "prompt": "Approve Bash: rm -f probe.txt",
+  "options": [
+    {"key": "1", "label": "Yes, run command"},
+    {"key": "2", "label": "Yes, and always allow in this conversation for commands that start with 'rm -f probe.txt'"},
+    {"key": "3", "label": "Yes, and always allow for commands that start with 'rm -f probe.txt' (Persist to settings.json)"},
+    {"key": "4", "label": "No, cancel"}
+  ],
+  "create": {
+    "prompt": "Approve Edit: Write: /work/probe.txt",
+    "options": [
+      {"key": "1", "label": "Yes, allow creation"},
+      {"key": "2", "label": "No, deny creation"}
+    ]
+  }
+}

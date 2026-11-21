@@ -289,6 +289,16 @@ export function useOverlayStackEmpty(): boolean {
 }
 
 /**
+ * PRD #211 — whether no overlay above `layer` ({@link OVERLAY_LAYER}) is open,
+ * kept current as overlays come and go: for a dialog that opens on its own
+ * over the agent's pane it belongs to (the Antigravity notice), and must not
+ * come up over anything drawn above that pane.
+ */
+export function useNoOverlayAbove(layer: number): boolean {
+  return useSyncExternalStore(subscribeToStack, () => ordered().every((entry) => entry.layer <= layer));
+}
+
+/**
  * Issue #2330 — whether no overlay is open at all, read NOW rather than at the
  * last render: for an effect that opens a dialog on its own, so that an
  * overlay put on the stack earlier in the same commit (the star reminder,

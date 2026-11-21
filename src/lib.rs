@@ -14,11 +14,16 @@ compile_error!(
 );
 
 // Shared by the per-agent hook-config adapters (`codex_hooks_manage`,
-// `devin_hooks_manage`); nothing outside the crate calls it.
+// `devin_hooks_manage`, `antigravity_hooks_manage`); nothing outside the
+// crate calls it.
 mod agent_hook_config;
 pub mod agent_notice;
 pub mod agent_pty;
 pub mod agent_registry;
+// PRD #211: the Antigravity CLI's hook installer.
+pub mod antigravity_hooks_manage;
+// PRD #211: the Antigravity experimental notice's words, shared by both clients.
+pub mod antigravity_notice;
 pub mod attach_recovery;
 pub mod authoring_seeds;
 pub mod bounded_read;
@@ -203,6 +208,8 @@ pub mod scheduler;
 pub mod self_upgrade;
 pub mod spawn;
 pub mod state;
+// PRD #211: agent status read from OSC 7501 sequences in a pane's output.
+pub mod status_osc;
 pub mod submitted_prompt;
 // PRD #1401: the TUI's `o` key, which hands a wire URL to the system browser.
 pub mod system_browser;

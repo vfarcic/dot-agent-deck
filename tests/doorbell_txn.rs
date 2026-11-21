@@ -336,6 +336,7 @@ impl World {
             Job::Line(text) => (text.clone(), text.clone()),
             Job::Cr => ("\r".to_string(), "<CR>".to_string()),
             Job::Deletes(count) => ("\u{7f}".repeat(*count), format!("<DEL×{count}>")),
+            Job::Clears(count) => ("\u{15}".repeat(*count), format!("<^U×{count}>")),
         }
     }
 

@@ -8,7 +8,7 @@ This page takes you from nothing to one agent running in the deck, then points t
 - **The TUI** (`dot-agent-deck`) is a terminal client of that daemon. Quitting it can leave the agents running.
 - **The desktop app** (alpha) is a second client of the same daemon. An agent started from either client shows up in both. It covers the dashboard, starting agents, several daemons at once, settings and voice control; see [Desktop app](desktop/index.md). It can start a daemon itself; this guide starts with the TUI.
 
-The deck tracks the status of five agents: [Claude Code](https://www.anthropic.com/claude-code) (`claude`), [OpenCode](https://opencode.ai) (`opencode`), [Pi](https://github.com/earendil-works/pi) (`pi`), [Codex](https://github.com/openai/codex) (`codex`) and [Devin](https://devin.ai) (`devin`). A pane can run any other command too, without status tracking.
+The deck tracks the status of six agents: [Claude Code](https://www.anthropic.com/claude-code) (`claude`), [OpenCode](https://opencode.ai) (`opencode`), [Pi](https://github.com/earendil-works/pi) (`pi`), [Codex](https://github.com/openai/codex) (`codex`), [Devin](https://devin.ai) (`devin`) and Google's [Antigravity CLI](https://antigravity.google/docs/getting-started?tab=cli) (`agy`). A pane can run any other command too, without status tracking. Install and sign in to each agent yourself; for Antigravity, run `agy` once in a terminal outside the deck to finish its first-run screens and sign in ([Installation → Antigravity CLI](installation.md#antigravity-cli)).
 
 ## Step 1: Install
 
@@ -77,7 +77,7 @@ On startup the deck installs its status hooks for the agents it detects (see [In
 
 ![The desktop app's New agent dialog over the Dashboard: the Local daemon chosen under Daemon, a directory chosen in the browser, the Mode chips with No mode selected, the Name pre-filled from the directory, an empty Command field, and Discard and Create agent](/img/new-agent-desktop.png)
 
-**Check:** a card (TUI) or row (desktop) appears for the agent. After you give the agent a prompt, its status moves from **Idle** to **Thinking** or **Working** (desktop: **idle** to **running**). If the status never changes while the agent visibly works, its hooks are not reaching the daemon; see [Troubleshooting → Hooks](troubleshooting.md#hooks). If the pane shows a `command not found` error for a bare `claude`, `codex` and so on, see [Troubleshooting](troubleshooting.md#a-bare-command-like-claude-opencode-pi-codex-or-devin-fails-to-spawn).
+**Check:** a card (TUI) or row (desktop) appears for the agent. After you give the agent a prompt, its status moves from **Idle** to **Thinking** or **Working** (desktop: **idle** to **running**). If the status never changes while the agent visibly works, its hooks are not reaching the daemon; see [Troubleshooting → Hooks](troubleshooting.md#hooks). If the pane shows a `command not found` error for a bare `claude`, `codex` and so on, see [Troubleshooting](troubleshooting.md#a-bare-command-like-claude-opencode-pi-codex-devin-or-agy-fails-to-spawn).
 
 **TUI:**
 

@@ -1,0 +1,17 @@
+{
+  "artifactDirectoryPath": "/home/user/.gemini/antigravity-cli/brain/00000000-0000-4000-8000-000000000002",
+  "continuationActive": false,
+  "conversationId": "00000000-0000-4000-8000-000000000002",
+  "cwd": "/home/user/project",
+  "error": "generating and executing: request failed: Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse\": proxyconnect tcp: dial tcp 127.0.0.1:9: connect: connection refused",
+  "executionNum": 0,
+  "fullyIdle": true,
+  "hookEventName": "Stop",
+  "lastUserInput": "Say hi.",
+  "modelName": "gemini-3.8-flash-low",
+  "terminationReason": "ERROR",
+  "transcriptPath": "/home/user/.gemini/antigravity-cli/brain/00000000-0000-4000-8000-000000000002/.system_generated/logs/transcript_full.jsonl",
+  "workspacePaths": [
+    "/home/user/project"
+  ]
+}

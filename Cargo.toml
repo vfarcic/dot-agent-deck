@@ -48,7 +48,7 @@ default-run = "dot-agent-deck"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
 tracing = "0.1"
