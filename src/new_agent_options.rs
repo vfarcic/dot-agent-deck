@@ -512,7 +512,7 @@ mod tests {
         }
         assert_eq!(
             agents.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
-            vec!["claude", "opencode", "pi", "codex", "devin"]
+            vec!["claude", "opencode", "pi", "codex", "devin", "agy"]
         );
     }
 

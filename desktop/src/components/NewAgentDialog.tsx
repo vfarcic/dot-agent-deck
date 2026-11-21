@@ -39,6 +39,7 @@ import {
 import type { AuthoringKind, DaemonOrchestration, DeckDirectoryEntry, DeckDirectoryListing, DeckRuntimeState, NewAgentOption, NewAgentOptions, NewAgentOrchestrations } from "../types";
 import type { NewAgentVoiceChannel, VoiceDispatchTarget } from "../lib/voiceActions";
 import { draftHasEdits, draftWorthKeeping, type NO_MODE_ID, type NewAgentDraft } from "../lib/newAgentDraft";
+import { announceNewAgentStart } from "../lib/antigravityNotice";
 
 /**
  * What the dialog needs from the runtime. The two queries are REQUIRED here
@@ -1621,6 +1622,11 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
         ...(agentName ? { displayName: agentName } : {}),
         ...(authoringKind ? { authoringKind } : {}),
       });
+      // PRD #211: a start the deck accepted counts towards the Antigravity
+      // notice when it starts Antigravity — the crate decides that from the
+      // command, as the TUI's New Agent submit does. Only this plain start
+      // announces: an orchestration's roles, a restore and a dispatch do not.
+      if (result.ok !== false) announceNewAgentStart(startCommand.trim() ? startCommand : undefined);
       if (result.agentId === undefined) {
         onNotAppeared({ deckName: deck.name, agentName });
         return;

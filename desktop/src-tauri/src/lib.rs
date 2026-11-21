@@ -1,4 +1,6 @@
 mod agent_view;
+// PRD #211: the Antigravity experimental notice, the TUI's in the desktop's dialog.
+mod antigravity_notice;
 mod appearance;
 mod daemon_bridge;
 mod decks;
@@ -7555,6 +7557,8 @@ pub fn run() {
             trust_review::desktop_deny_trust_request,
             star_prompt::desktop_star_prompt_launch,
             star_prompt::desktop_star_prompt_choose,
+            antigravity_notice::desktop_antigravity_notice_start,
+            antigravity_notice::desktop_antigravity_notice_choose,
             desktop_list_directories,
             desktop_inbox_action,
             desktop_generate_config,

@@ -5,6 +5,7 @@ import { statusWord, statusWordLabel } from "./statusWords";
 import {
   buildDashboardFilterHeader,
   clearDashboardFilter,
+  DASHBOARD_AGENT_TYPES,
   DASHBOARD_STATUSES,
   dashboardFilterFromParams,
   filterDashboardAgents,
@@ -65,6 +66,16 @@ describe("dashboard filter", () => {
     ["open_code", ["schedule"]], ["pi", ["issues"]],
   ] as const)("shows only agent type %s", (agentType, expected) => {
     expect(ids(filter({ agentTypes: [agentType] }))).toEqual(expected);
+  });
+
+  /// Scenario: choose the Antigravity and Devin agent types against a fleet that also runs Claude Code. Each keeps only its own agent, and the Antigravity option is offered under its registry label (PRD #211).
+  it("shows only Antigravity agents and offers the type by its label", () => {
+    const fleet = [agent("claude"), agent("devin", { agentType: "devin" }), agent("agy", { agentType: "antigravity" })];
+    expect(ids(filter({ agentTypes: ["antigravity"] }), fleet)).toEqual(["agy"]);
+    expect(ids(filter({ agentTypes: ["devin"] }), fleet)).toEqual(["devin"]);
+    expect(ids(filter({ agentTypes: ["antigravity", "claude_code"] }), fleet)).toEqual(["claude", "agy"]);
+    expect(DASHBOARD_AGENT_TYPES).toContainEqual({ id: "antigravity", label: "Antigravity" });
+    expect(dashboardFilterFromParams([{ name: "agent_type", value: "antigravity" }]).agentTypes).toEqual(["antigravity"]);
   });
 
   /// Scenario: select one or several daemons whose agents may have the same per-daemon id. Filtering preserves both identities when both daemons are selected.

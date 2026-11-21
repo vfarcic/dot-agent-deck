@@ -214,6 +214,7 @@ pub fn agent_display_name(agent: &AgentType) -> &'static str {
         AgentType::OpenCode => "OpenCode",
         AgentType::Codex => "Codex",
         AgentType::Devin => "Devin",
+        AgentType::Antigravity => "Antigravity",
         AgentType::Pi => "Pi",
         _ => "an agent",
     }
@@ -226,6 +227,7 @@ fn agent_cli_name(agent: &AgentType) -> Option<&'static str> {
         AgentType::OpenCode => Some("opencode"),
         AgentType::Codex => Some("codex"),
         AgentType::Devin => Some("devin"),
+        AgentType::Antigravity => Some("antigravity"),
         _ => None,
     }
 }

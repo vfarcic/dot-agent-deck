@@ -21,5 +21,10 @@
     "interrupt": [{ "bytes": "\u001b", "pauseAfterMs": 0 }],
     "clear": { "bytes": "\u0015", "presses": "per_line" },
     "deleteChar": { "bytes": "\u007f", "maxLiteralWriteChars": 1000 }
+  },
+  "antigravity": {
+    "interrupt": [{ "bytes": "\u001b", "pauseAfterMs": 0 }],
+    "clear": { "bytes": "\u0015", "presses": "per_line" },
+    "deleteChar": { "bytes": "\u007f", "maxPressesPerWrite": 1, "pauseBetweenWritesMs": 20 }
   }
 }

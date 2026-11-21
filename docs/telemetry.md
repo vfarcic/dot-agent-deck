@@ -112,7 +112,7 @@ A run starts when the deck starts an agent in a pane and ends when the agent exi
 | --- | --- |
 | `deck.run.id` | A new unique id for this run. The agent gets the same id, which is how its own telemetry joins the run ([below](#agents-own-telemetry)). |
 | `deck.pane.id` | The pane the agent ran in. |
-| `deck.agent` | The agent: `claude`, `opencode`, `codex`, `pi`, `devin`, or `none` for a command the deck does not recognise as an agent. When the deck does not recognise the command that started the run, such as a launcher script or a plain shell you then start an agent from, the run takes the agent its hooks report once they report one. An agent the deck recognised when the run started stays that agent, whatever its hooks say. |
+| `deck.agent` | The agent: `claude`, `opencode`, `codex`, `pi`, `devin`, `agy` (Antigravity), or `none` for a command the deck does not recognise as an agent. When the deck does not recognise the command that started the run, such as a launcher script or a plain shell you then start an agent from, the run takes the agent its hooks report once they report one. An agent the deck recognised when the run started stays that agent, whatever its hooks say. |
 | `deck.agent.source` | Where `deck.agent` came from: `spawn` when the deck knew the agent as it started the run, `hook` when it learned it from the agent's hooks. Absent when the run stayed `none`. |
 | `deck.role` | The orchestration role, for an agent in an orchestration. |
 | `deck.orchestration.name` | The orchestration's name. |
@@ -222,9 +222,10 @@ Where each agent's figures come from:
 | OpenCode | Each reply's tokens, as OpenCode hands them to the deck's OpenCode plugin. | OpenCode's own figure. Subscription providers report 0, which is sent as `unavailable` with `subscription_zero`. | `no_channel` | OpenCode's last reply. |
 | Pi | Each reply's tokens, as Pi hands them to the deck's Pi extension. | Pi's own estimate. | `no_channel` | Pi's last reply. |
 | Devin | `no_channel` | `no_channel` | `no_channel` | `unknown`, `measured` |
+| Antigravity | `no_channel` | `no_channel` | `no_channel` | `unknown`, `measured` |
 | A command the deck does not recognise as an agent | `no_channel` | `no_channel` | `no_channel` | Its exit status, `measured`: `completed` for 0, `failed` with `error.type` `nonzero_exit` for any other status, `interrupted` when you closed its pane or the daemon stopped, `unknown` when a signal ended it. |
 
-**Devin usage is unavailable: its reported token counts have not been verified against a signed-in session; missing values are not zero.**
+**Devin usage is unavailable: its reported token counts have not been verified against a signed-in session; missing values are not zero.** Antigravity usage is unavailable too: the deck reads none of `agy`'s usage yet.
 
 How the run ended, for an agent: the agent's own last turn decides when it completed, failed or was interrupted (`provider_reported`). When its record stops in the middle of a turn, a run you closed or that the daemon stopped is `interrupted`, and one that ended any other way is `unknown` (`measured`). So an agent that exits by itself after finishing its work is `completed`, and a crash in the middle of a turn is `unknown`, not `failed`.
 
@@ -307,6 +308,7 @@ Which agents report their shell commands:
 | OpenCode | Yes, its `bash` tool. |
 | Codex | Yes, its shell tool, through the hooks the deck installs for Codex. Codex does not report where each argument of a command ends, so for Codex the deck sends the program only, never a word, and no program either when the word naming it is not plain or it is not certain which word is the program. For the same reason Codex spans name one command at most: `deck.operation.commands` holds that program alone, and there is no wrapped command. |
 | Devin | Yes, its `exec` tool. |
+| Antigravity | No. |
 | Pi | Yes, its `bash` tool, through the deck's Pi extension. |
 
 ### `agent.ci`
@@ -433,6 +435,7 @@ The deck also switches on each supported agent's own telemetry, with no setup fr
 | Codex | Yes: the deck turns on its traces and metrics; its logs stay off. | Yes. | Name an exporter in Codex's own configuration. |
 | Devin | Yes: the deck gives each Devin run a configuration that turns on its events and metrics. | Yes, by the configuration the deck writes; not yet confirmed against a signed-in Devin. | `"enabled": false` in the `otel` block of Devin's configuration, or `OTEL_LOGS_EXPORTER=none` and `OTEL_METRICS_EXPORTER=none`. |
 | Pi | Yes: the deck's Pi extension sends Pi's usage. | Yes. | `DOT_AGENT_DECK_PI_TELEMETRY=0` |
+| Antigravity | The deck turns nothing on for `agy`. Whether `agy` sends anything from the `OTEL_*` variables it is given has not been checked. | Not checked. | Not checked. |
 
 Each agent's data appears under its own service name, for example `claude-code` or `pi`. The sections below say how to keep each one off in full; each "keep it off" setting goes in the daemon's environment, or in the agent's own configuration where it says so, and leaves the deck's own spans on.
 

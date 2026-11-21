@@ -714,6 +714,8 @@ button.deck-attention-name { text-decoration: underline; text-underline-offset: 
    so it wraps rather than being cut, as the TUI card wraps it. */
 .agent-identity p.agent-config-notice, .agent-config-notice { color: var(--teal-deep); font-size: var(--text-sm); white-space: normal; overflow-wrap: anywhere; }
 .agent-identity p.agent-delivery-notice, .agent-delivery-notice { color: var(--red); font-family: "JetBrains Mono", monospace; font-size: var(--text-sm); white-space: normal; overflow-wrap: anywhere; }
+/* PRD #211: what an agent waiting on the user says it waits on. Its error reason takes the delivery notice's style. */
+.agent-identity p.agent-status-reason, .agent-status-reason { color: var(--amber); font-family: "JetBrains Mono", monospace; font-size: var(--text-sm); white-space: normal; overflow-wrap: anywhere; }
 /* Issue #1678: background work still running after the turn ended. Ink rather
    than --muted, as the TUI draws it in its primary text colour: it is a reading
    about now, not a label. */
@@ -1217,7 +1219,8 @@ button.deck-attention-name { text-decoration: underline; text-underline-offset: 
 /* PRD #2174 — the star reminder: the confirm card, with the repository under the invitation and each button's key. */
 .star-icon { width: 38px; height: 38px; margin: 2px auto 10px; display: grid; place-items: center; border-radius: 50%; color: var(--teal); background: var(--teal-soft); }
 .confirm-dialog p.star-repo { margin-top: -8px; color: var(--ink); text-decoration: underline; }
-.star-dialog .button kbd { padding: 0 4px; border: 1px solid currentColor; border-radius: 3px; font: inherit; opacity: .7; }
+.star-dialog .button kbd,
+.antigravity-notice-dialog .button kbd { padding: 0 4px; border: 1px solid currentColor; border-radius: 3px; font: inherit; opacity: .7; }
 /* PRD #1487 M5 — the Upgrade / Replace daemon dialog: the confirm card, plus its stages and stop lists. */
 .upgrade-dialog { width: min(440px, 100%); }
 .upgrade-icon { width: 38px; height: 38px; margin: 2px auto 10px; display: grid; place-items: center; border-radius: 50%; color: var(--green); background: var(--green-soft); }

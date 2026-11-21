@@ -71,6 +71,11 @@ pub struct GenerationDoorbell {
     /// A first attempt was admitted: later rings do not wait for the settle
     /// window (plan §4.4).
     first_admitted: AtomicBool,
+    /// PRD #211: the last ring that wrote used the misrendered-echo
+    /// withdrawal ([`crate::doorbell_txn::Txn::allow_gap_withdrawal`]), so
+    /// the next one may not: a second misrendered echo in a row stays
+    /// suspended rather than withdrawing and ringing again.
+    gap_withdrawn: AtomicBool,
     /// The e2e build's stand-in editor's executable and the stand-in profile
     /// selected for this generation, when one was.
     #[cfg(feature = "e2e")]
@@ -111,6 +116,7 @@ impl GenerationDoorbell {
             master: master.and_then(duplicate),
             unwrapped_anchor: OnceLock::new(),
             first_admitted: AtomicBool::new(false),
+            gap_withdrawn: AtomicBool::new(false),
             #[cfg(feature = "e2e")]
             standin: None,
             on_moved: OnceLock::new(),
@@ -274,6 +280,37 @@ impl GenerationDoorbell {
         master_canonical(self.master.as_ref()?.as_raw_fd())
     }
 
+    /// PRD #211 (audit B3): whether the pane's PTY master has room for a
+    /// write now, asked without waiting (`poll` with a zero timeout). A
+    /// screen-witnessed answer key is written only after this says yes, so
+    /// its one-byte `write(2)` is not started on a master already full while
+    /// the output lock is held. The room is not reserved: a write that blocks
+    /// after it is the accepted limit `agent_pty::write_witnessed` names.
+    /// `false` with no master to ask, or on any error.
+    pub fn master_has_room(&self) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let Some(master) = self.master.as_ref() else {
+                return false;
+            };
+            let mut fds = libc::pollfd {
+                fd: master.as_raw_fd(),
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            // SAFETY: one pollfd on a descriptor this struct owns, no wait.
+            let ready = unsafe { libc::poll(&mut fds, 1, 0) };
+            ready == 1
+                && fds.revents & libc::POLLOUT != 0
+                && fds.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) == 0
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
     /// An unwrapped generation's first Clean frame showing the empty ready
     /// composer, at `now_ns`: the settle anchor, set once.
     pub fn note_ready_frame(&self, now_ns: u64) {
@@ -316,6 +353,18 @@ impl GenerationDoorbell {
     /// An attempt was admitted.
     pub fn admitted(&self) {
         self.first_admitted.store(true, Ordering::Release);
+    }
+
+    /// PRD #211: the next ring may use the misrendered-echo withdrawal: the
+    /// last ring that wrote did not.
+    pub fn gap_withdrawal_allowed(&self) -> bool {
+        !self.gap_withdrawn.load(Ordering::Acquire)
+    }
+
+    /// A ring that wrote ended; `used` when it started the misrendered-echo
+    /// withdrawal. A ring that wrote nothing leaves this as it was.
+    pub fn ring_wrote(&self, used: bool) {
+        self.gap_withdrawn.store(used, Ordering::Release);
     }
 }
 
@@ -564,6 +613,7 @@ mod tests {
                 DoorbellSwitch {
                     claude: false,
                     codex: true,
+                    antigravity: true,
                 },
                 vec![AgentType::ClaudeCode],
             ),
@@ -571,6 +621,7 @@ mod tests {
                 DoorbellSwitch {
                     claude: true,
                     codex: false,
+                    antigravity: true,
                 },
                 vec![AgentType::Codex],
             ),
@@ -578,6 +629,7 @@ mod tests {
                 DoorbellSwitch {
                     claude: false,
                     codex: false,
+                    antigravity: true,
                 },
                 vec![AgentType::ClaudeCode, AgentType::Codex],
             ),

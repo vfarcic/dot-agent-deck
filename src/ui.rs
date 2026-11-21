@@ -391,6 +391,12 @@ pub enum UiMode {
     /// session. Nothing of it is spawned while this is open. Its state lives in
     /// `UiState::trust_prompt`.
     TrustPrompt,
+    /// PRD #211: the Antigravity experimental notice, shown after a New Agent
+    /// start of Antigravity on the first start and every
+    /// [`crate::antigravity_notice::NOTICE_INTERVAL`]th after. It owns the
+    /// keyboard, so nothing typed reaches the new pane behind it; closing it
+    /// returns to `UiState::antigravity_notice_resume`.
+    AntigravityNotice,
 }
 
 /// Describes which panes to render and how to lay them out, based on the active tab.
@@ -1751,6 +1757,26 @@ fn orchestrator_remit_pane_is_compacting<'a>(
     })
 }
 
+/// PRD #82: the timestamp of the newest `Compacting` event recorded on the
+/// orchestrator start-role pane's own (non-placeholder) sessions, from the
+/// main thread rather than a subagent. The compaction re-arm reads it beside
+/// the status ([`orchestrator_remit_pane_is_compacting`]) because a status
+/// can move on before any frame sees it.
+fn orchestrator_remit_pane_latest_compacting<'a>(
+    sessions: impl Iterator<Item = &'a SessionState>,
+    start_pane_id: &str,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    sessions
+        .filter(|s| s.pane_id.as_deref() == Some(start_pane_id) && s.agent_type != AgentType::None)
+        .filter_map(|s| {
+            s.recent_events.iter().rev().find_map(|e| {
+                (e.event_type == EventType::Compacting && !e.is_from_subagent())
+                    .then_some(e.timestamp)
+            })
+        })
+        .max()
+}
+
 /// Pure policy: the timestamp of the most recent clear-originated
 /// `SessionStart` recorded against the orchestrator start-role pane's own
 /// (non-placeholder) session, if one is still present in its retained
@@ -2274,6 +2300,25 @@ struct UiState {
     form_button_rects: Vec<(Action, Rect)>,
     /// Star-prompt state for the "star the repo" reminder dialog.
     star_prompt_state: config::StarPromptState,
+    /// PRD #211: the mode the Antigravity notice returns to when it closes —
+    /// where the New Agent start would have left the user without it.
+    antigravity_notice_resume: UiMode,
+    /// PRD #211: the quit flow on screen was opened by `Ctrl+C` from the
+    /// Antigravity notice, so cancelling it returns to the notice, still
+    /// unanswered, rather than to command mode. Set by
+    /// [`open_quit_confirm`] each time the quit confirmation opens — `true`
+    /// from the notice, `false` from everywhere else — and kept while the
+    /// flow moves between the quit and Stop confirmations. Cleared when the
+    /// flow ends without quitting: by [`cancel_quit_confirm`], and by a Stop
+    /// that failed ([`perform_stop_and_quit`]).
+    quit_confirm_over_antigravity_notice: bool,
+    /// PRD #211: a notice due while the star reminder is open, shown once
+    /// that closes (one dialog at a time).
+    antigravity_notice_pending: bool,
+    /// PRD #211: this process's session over the notice's state file, shared
+    /// with the desktop app ([`config::antigravity_notice_path`]). It holds
+    /// what could not be saved, and says the first problem once.
+    antigravity_notice: config::AntigravityNoticeSession,
     /// The pane of the pending config-gen modal prompt. PRD #1666 part 2
     /// (G-fix6): the pane id with the daemon process its card was learned
     /// from, so the request is posted there or nowhere. PRD #2119: no
@@ -2324,6 +2369,13 @@ struct UiState {
     /// the moment the status is next observed as anything else, which
     /// re-arms detection for a possible later compaction.
     orchestration_remit_compacting: HashSet<TabId>,
+    /// PRD #82: for each orchestration tab, the timestamp of the newest
+    /// `Compacting` event on its start-role pane that the compaction re-arm
+    /// has already counted. The status can be `Compacting` for less than a
+    /// frame — OpenCode 1.x reports the session busy within milliseconds of
+    /// the compaction starting (measured on 1.19.5) — so the loop also reads
+    /// the event itself, and this keeps one event from counting twice.
+    orchestration_remit_compacting_event_at: HashMap<TabId, chrono::DateTime<chrono::Utc>>,
     /// For each orchestration tab, the timestamp of the most recent
     /// clear-originated `SessionStart` the remit re-arm loop has already
     /// reacted to on the start-role pane, if any. A `SessionStart` is a
@@ -2745,6 +2797,12 @@ impl UiState {
             drawn_pane_rects: Vec::new(),
             last_click: None,
             star_prompt_state: config::StarPromptState::default(),
+            antigravity_notice_resume: UiMode::PaneInput,
+            quit_confirm_over_antigravity_notice: false,
+            antigravity_notice_pending: false,
+            antigravity_notice: config::AntigravityNoticeSession::new(
+                config::antigravity_notice_path(),
+            ),
             config_gen_target: None,
             config_gen_agent: None,
             config_gen_exists: None,
@@ -2756,6 +2814,7 @@ impl UiState {
             stop_confirm_agent_count: 0,
             orchestration_prompted: HashSet::new(),
             orchestration_remit_compacting: HashSet::new(),
+            orchestration_remit_compacting_event_at: HashMap::new(),
             orchestration_remit_clear_reasserted_at: HashMap::new(),
             orchestration_remit_clear_tab_anchor_at: HashMap::new(),
             orchestration_remit_clear_retry_at: HashMap::new(),
@@ -4607,7 +4666,7 @@ fn adopt_surfaced_context_path(
     bucket: &OrchestrationHydrationBucket,
 ) {
     if let Some(path) = bucket.context_path.clone() {
-        tab_manager.set_orchestration_context_path(tab_index, Some(path));
+        tab_manager.set_daemon_recorded_context_path(tab_index, path);
     }
 }
 
@@ -4648,7 +4707,7 @@ fn adopt_context_path_into_owning_tab(
         context_path: None, ..
     }) = tab_manager.tabs().get(owner)
     {
-        tab_manager.set_orchestration_context_path(owner, Some(PathBuf::from(path)));
+        tab_manager.set_daemon_recorded_context_path(owner, PathBuf::from(path));
     }
 }
 
@@ -5589,6 +5648,14 @@ pub enum Action {
     StarSnooze,
     /// PRD #80 M5: star-prompt `[Dismiss]` — stop asking permanently (== `d`).
     StarDismiss,
+    /// PRD #211: Antigravity notice `[Open issues]` — open the new-issue
+    /// page (== `o`).
+    AntigravityNoticeOpen,
+    /// PRD #211: Antigravity notice `[Later]` — close it until the next
+    /// interval (== `l` / Esc).
+    AntigravityNoticeLater,
+    /// PRD #211: Antigravity notice `[Don't show again]` (== `d`).
+    AntigravityNoticeDismiss,
     /// PRD #80 M6: filter-row `[Apply]` — commit the filter and return to
     /// Normal, KEEPING the typed filter text (== Enter in filter mode).
     ApplyFilter,
@@ -7740,16 +7807,38 @@ fn handle_quit_confirm_key(key: KeyEvent, ui: &mut UiState, managed_agents_count
                 }
             }
             _ => {
-                ui.mode = UiMode::Normal;
+                cancel_quit_confirm(ui);
                 Action::Continue
             }
         },
         KeyCode::Esc => {
-            ui.mode = UiMode::Normal;
+            cancel_quit_confirm(ui);
             Action::Continue
         }
         _ => Action::Continue,
     }
+}
+
+/// Open the quit confirmation with its first choice selected. Every way into
+/// it goes through here, so `over_antigravity_notice` — `true` only for
+/// `Ctrl+C` on the Antigravity notice — is what a Cancel returns to, never a
+/// value left by an earlier quit flow (PRD #211).
+fn open_quit_confirm(ui: &mut UiState, over_antigravity_notice: bool) {
+    ui.quit_confirm_selected = 0;
+    ui.quit_confirm_over_antigravity_notice = over_antigravity_notice;
+    ui.mode = UiMode::QuitConfirm;
+}
+
+/// Cancel the quit confirmation: back to the Antigravity notice when that is
+/// what `Ctrl+C` left (PRD #211: the notice is still unanswered, and it
+/// returns where the start left the user once it is answered), else to
+/// command mode.
+fn cancel_quit_confirm(ui: &mut UiState) {
+    ui.mode = if std::mem::take(&mut ui.quit_confirm_over_antigravity_notice) {
+        UiMode::AntigravityNotice
+    } else {
+        UiMode::Normal
+    };
 }
 
 /// PRD #92 F1: secondary y/n confirmation when the user picks Stop in
@@ -8109,25 +8198,137 @@ fn handle_star_prompt_key(key: KeyEvent, ui: &mut UiState) -> Action {
         KeyCode::Char('s') => {
             let msg = star_repo_and_report();
             let saved = ui.star_prompt_state.dismiss_permanently();
-            ui.mode = UiMode::Normal;
+            close_star_prompt(ui);
             ui.status_message = Some((msg, std::time::Instant::now()));
             report_star_save(ui, saved);
             Action::Continue
         }
         KeyCode::Char('l') | KeyCode::Esc => {
             let saved = ui.star_prompt_state.snooze();
-            ui.mode = UiMode::Normal;
+            close_star_prompt(ui);
             report_star_save(ui, saved);
             Action::Continue
         }
         KeyCode::Char('d') => {
             let saved = ui.star_prompt_state.dismiss_permanently();
-            ui.mode = UiMode::Normal;
+            close_star_prompt(ui);
             report_star_save(ui, saved);
             Action::Continue
         }
         _ => Action::Continue,
     }
+}
+
+/// Close the star reminder, opening the Antigravity notice when one waited
+/// behind it (PRD #211: one dialog at a time).
+fn close_star_prompt(ui: &mut UiState) {
+    ui.mode = UiMode::Normal;
+    if std::mem::take(&mut ui.antigravity_notice_pending) {
+        open_antigravity_notice(ui);
+    }
+}
+
+/// PRD #211: count a user-started Antigravity start and, when it is one the
+/// notice shows at, open it over the new pane. Called from the New Agent
+/// form's successful non-orchestration start only, so orchestration and
+/// dispatch spawns, restores and `agy` typed into a shell never count.
+fn record_antigravity_start(ui: &mut UiState) {
+    let start = ui.antigravity_notice.record_start();
+    if let Some(problem) = start.problem {
+        ui.status_message = Some((problem, std::time::Instant::now()));
+    }
+    if start.show {
+        open_antigravity_notice(ui);
+    }
+}
+
+/// Open the Antigravity notice over whatever the user is in, which it returns
+/// to; behind the star reminder when that is open.
+fn open_antigravity_notice(ui: &mut UiState) {
+    match ui.mode {
+        UiMode::StarPrompt => ui.antigravity_notice_pending = true,
+        UiMode::AntigravityNotice => {}
+        mode => {
+            ui.antigravity_notice_resume = mode;
+            ui.mode = UiMode::AntigravityNotice;
+        }
+    }
+}
+
+/// Close the Antigravity notice, returning where the start left the user.
+fn close_antigravity_notice(ui: &mut UiState) {
+    ui.mode = ui.antigravity_notice_resume;
+}
+
+/// Open the repository's new-issue page and build the status message for
+/// whichever way that went.
+fn open_antigravity_issues_and_report() -> String {
+    crate::antigravity_notice::open_issues_message(open_antigravity_issues())
+}
+
+/// Open the repository's new-issue page; whether the browser opened.
+#[cfg(not(test))]
+fn open_antigravity_issues() -> bool {
+    open::that(crate::antigravity_notice::new_issue_url()).is_ok()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times a unit test made Open issues open the browser, which it
+    /// never does for real.
+    static ANTIGRAVITY_ISSUES_OPENED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn open_antigravity_issues() -> bool {
+    ANTIGRAVITY_ISSUES_OPENED.with(|opened| opened.set(opened.get() + 1));
+    false
+}
+
+/// PRD #211: the notice's three choices, shared by its keys and buttons.
+fn choose_antigravity_notice(ui: &mut UiState, choice: Action) {
+    match choice {
+        Action::AntigravityNoticeOpen => {
+            let msg = open_antigravity_issues_and_report();
+            close_antigravity_notice(ui);
+            ui.status_message = Some((msg, std::time::Instant::now()));
+        }
+        // Closes whether or not it could be saved: the session holds it
+        // until the deck restarts, and says why once, as the desktop does.
+        Action::AntigravityNoticeDismiss => {
+            let problem = ui.antigravity_notice.dismiss_permanently();
+            close_antigravity_notice(ui);
+            if let Some(why) = problem {
+                ui.status_message = Some((why, std::time::Instant::now()));
+            }
+        }
+        // Later saves nothing: the showing was recorded with the start.
+        _ => close_antigravity_notice(ui),
+    }
+}
+
+fn handle_antigravity_notice_key(key: KeyEvent, ui: &mut UiState) -> Action {
+    // A key with Ctrl, Alt or a platform modifier held chooses nothing, as in
+    // the desktop app: such a chord was meant for something else (`Ctrl+D` is
+    // command mode's), and `d` makes a permanent choice. `Ctrl+C`'s quit flow
+    // is taken before this handler is reached.
+    if key.modifiers.intersects(
+        KeyModifiers::CONTROL
+            | KeyModifiers::ALT
+            | KeyModifiers::SUPER
+            | KeyModifiers::META
+            | KeyModifiers::HYPER,
+    ) {
+        return Action::Continue;
+    }
+    let choice = match key.code {
+        KeyCode::Char('o') => Action::AntigravityNoticeOpen,
+        KeyCode::Char('l') | KeyCode::Esc => Action::AntigravityNoticeLater,
+        KeyCode::Char('d') => Action::AntigravityNoticeDismiss,
+        _ => return Action::Continue,
+    };
+    choose_antigravity_notice(ui, choice);
+    Action::Continue
 }
 
 fn handle_config_gen_prompt_key(key: KeyEvent, ui: &mut UiState) -> Action {
@@ -9323,8 +9524,7 @@ fn handle_normal_key(
     // Ctrl+C from dashboard: show quit confirmation. PRD #40 safety net —
     // hardcoded and checked first so it can never be remapped or unbound.
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        ui.quit_confirm_selected = 0;
-        ui.mode = UiMode::QuitConfirm;
+        open_quit_confirm(ui, false);
         return Action::Continue;
     }
 
@@ -9558,8 +9758,7 @@ fn observe_command_mode_edge(ui: &mut UiState, now: std::time::Instant) {
 
 fn handle_filter_key(key: KeyEvent, ui: &mut UiState) -> Action {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        ui.quit_confirm_selected = 0;
-        ui.mode = UiMode::QuitConfirm;
+        open_quit_confirm(ui, false);
         return Action::Continue;
     }
     match key.code {
@@ -9596,8 +9795,7 @@ fn handle_help_key(key: KeyEvent, ui: &mut UiState) -> Action {
 /// own binding close it; Ctrl+C keeps its PRD #40 safety net.
 fn handle_inbox_attention_key(key: KeyEvent, ui: &mut UiState, kb: &KeybindingConfig) -> Action {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        ui.quit_confirm_selected = 0;
-        ui.mode = UiMode::QuitConfirm;
+        open_quit_confirm(ui, false);
         return Action::Continue;
     }
     match key.code {
@@ -9617,8 +9815,7 @@ fn handle_inbox_attention_key(key: KeyEvent, ui: &mut UiState, kb: &KeybindingCo
 /// and leave the notice; Ctrl+C keeps its PRD #40 safety net.
 fn handle_restart_notice_key(key: KeyEvent, ui: &mut UiState, kb: &KeybindingConfig) -> Action {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        ui.quit_confirm_selected = 0;
-        ui.mode = UiMode::QuitConfirm;
+        open_quit_confirm(ui, false);
         return Action::Continue;
     }
     match key.code {
@@ -9726,8 +9923,7 @@ fn poll_inbox_attention(ui: &mut UiState, snapshot: &AppState) {
 /// opens the quit flow, as from every other modal.
 fn handle_host_metrics_key(key: KeyEvent, ui: &mut UiState, kb: &KeybindingConfig) -> Action {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        ui.quit_confirm_selected = 0;
-        ui.mode = UiMode::QuitConfirm;
+        open_quit_confirm(ui, false);
         return Action::Continue;
     }
     if matches!(key.code, KeyCode::Esc | KeyCode::Char('q'))
@@ -10133,8 +10329,7 @@ fn handle_rename_key(
     _selected_session_id: Option<&str>,
 ) -> Action {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        ui.quit_confirm_selected = 0;
-        ui.mode = UiMode::QuitConfirm;
+        open_quit_confirm(ui, false);
         return Action::Continue;
     }
     match key.code {
@@ -10168,8 +10363,7 @@ fn handle_rename_key(
 
 fn handle_dir_picker_key(key: KeyEvent, ui: &mut UiState) -> Action {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        ui.quit_confirm_selected = 0;
-        ui.mode = UiMode::QuitConfirm;
+        open_quit_confirm(ui, false);
         return Action::Continue;
     }
     let picker = match ui.dir_picker.as_mut() {
@@ -10505,6 +10699,25 @@ fn build_new_pane_request(form: &NewPaneFormState, default_command: &str) -> New
     }
 }
 
+/// The agent a non-orchestration New Agent start runs, inferred from the
+/// command it actually spawns (PRD #76 M2.13), which is also what PRD #211's
+/// Antigravity notice counts by.
+///
+/// `req.command` is already the spawned command: [`build_new_pane_request`]
+/// resolves a built-in option's empty Command field to `default_command`
+/// (then `claude`), so an empty field there counts as whatever that resolves
+/// to. A plain start's empty field stays empty, and the daemon runs its
+/// default shell for it (`agent_pty`'s no-command fallback), which is no
+/// agent: `default_command` only pre-fills that field, it is never
+/// substituted at spawn.
+fn new_pane_spawn_agent_type(req: &NewPaneRequest) -> Option<AgentType> {
+    if req.command.is_empty() {
+        None
+    } else {
+        AgentType::from_command(Some(req.command.as_str()))
+    }
+}
+
 /// Issue #555: the daemon refused an orchestration start because its run
 /// title is already held by another live orchestration in the same directory
 /// — the case the form's own check could not see, since its snapshot of live
@@ -10534,8 +10747,7 @@ fn restore_form_after_title_refusal(ui: &mut UiState, mut form: NewPaneFormState
 
 fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> Action {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        ui.quit_confirm_selected = 0;
-        ui.mode = UiMode::QuitConfirm;
+        open_quit_confirm(ui, false);
         return Action::Continue;
     }
     // PRD #170 M2.1: snapshot the configured default command before the mutable
@@ -10732,7 +10944,13 @@ fn global_action_for_mode(kb: &KeybindingConfig, mode: UiMode, key: &KeyEvent) -
     // tab switch or a new pane cannot slip in under an upgrade's question.
     // PRD #1885: so does the trust prompt: nothing may open, switch or spawn
     // under a question about what is about to run.
-    if mode == UiMode::CloseConfirm || mode == UiMode::Upgrade || mode == UiMode::TrustPrompt {
+    // PRD #211: and so does the Antigravity notice, which opens over a pane
+    // the user was about to type into: no key may act behind it.
+    if mode == UiMode::CloseConfirm
+        || mode == UiMode::Upgrade
+        || mode == UiMode::TrustPrompt
+        || mode == UiMode::AntigravityNotice
+    {
         return None;
     }
     let resolved = global_action(kb, key).or_else(|| {
@@ -11058,6 +11276,8 @@ fn modal_owns_clicks(mode: &UiMode) -> bool {
             | UiMode::CloseConfirm
             | UiMode::ConfigGenPrompt
             | UiMode::StarPrompt
+            // PRD #211: its buttons live in `modal_button_rects` too.
+            | UiMode::AntigravityNotice
             | UiMode::Help
             // PRD #1258 M3: the host overlay's [Close] button lives
             // in `modal_button_rects`, like help's.
@@ -11103,6 +11323,8 @@ fn overlay_blocks_mouse(mode: &UiMode) -> bool {
         | UiMode::CloseConfirm
         | UiMode::ConfigGenPrompt
         | UiMode::StarPrompt
+        // PRD #211: the Antigravity notice covers the pane it opened over.
+        | UiMode::AntigravityNotice
         | UiMode::Help
         | UiMode::DirPicker
         | UiMode::NewPaneForm
@@ -11344,6 +11566,9 @@ fn perform_stop_and_quit(ui: &mut UiState, pane: &dyn PaneController) -> Flow {
             ui.mode = UiMode::Normal;
             ui.stop_confirm_selected = 0;
             ui.quit_confirm_selected = 0;
+            // PRD #211: the quit flow ended here, so a later one does not
+            // return to a notice this one was opened from.
+            ui.quit_confirm_over_antigravity_notice = false;
             Flow::Continue
         }
     }
@@ -11921,8 +12146,7 @@ fn dispatch_action(
         }
         Action::Quit => return Flow::Break,
         Action::RequestQuit => {
-            ui.quit_confirm_selected = 0;
-            ui.mode = UiMode::QuitConfirm;
+            open_quit_confirm(ui, false);
         }
         Action::DetachAndQuit => {
             // M2.5: emit explicit `KIND_DETACH` frames for every
@@ -12457,13 +12681,12 @@ fn dispatch_action(
                     // a remote reconnect's hydration carries it; the local
                     // placeholder stays at `None` until the first `SessionStart`
                     // hook fires (pre-M2.13 contract).
-                    let spawn_agent_type = if req.command.is_empty() {
-                        None
-                    } else {
-                        AgentType::from_command(Some(req.command.as_str()))
-                    };
-                    // PRD #20 M8: Wrapper-strategy agents (Codex now; Gemini
-                    // later) launch WRAPPED so their stdout is monitored
+                    let spawn_agent_type = new_pane_spawn_agent_type(&req);
+                    // PRD #211: a user-started Antigravity start counts towards
+                    // the experimental notice, once the daemon accepts it.
+                    let starts_antigravity = spawn_agent_type == Some(AgentType::Antigravity);
+                    // PRD #20 M8: Wrapper-strategy agents (Codex is the only
+                    // one) launch WRAPPED so their stdout is monitored
                     // transparently, but the wrap is applied by the DAEMON, not
                     // here: this command goes out BARE with `spawn_agent_type` as
                     // `StartAgent.agent_type`, and `agent_pty`'s common spawn
@@ -12613,6 +12836,11 @@ fn dispatch_action(
                             // this path — commit the submit candidate as the
                             // global last-command.
                             ui.commit_pending_last_command();
+                            // PRD #211: over the new pane, which it returns
+                            // focus to when it closes.
+                            if starts_antigravity {
+                                record_antigravity_start(ui);
+                            }
                         }
                         Err(e) => {
                             ui.status_message =
@@ -12642,14 +12870,20 @@ fn dispatch_action(
             ui.stop_confirm_selected = 0;
             ui.mode = UiMode::StopConfirm;
         }
-        // quit-confirm [Cancel]: return to the dashboard.
+        // A modal's [Cancel]: back to the dashboard, except the quit
+        // confirmation's, which returns to the Antigravity notice when it was
+        // opened from it (PRD #211, [`cancel_quit_confirm`]).
         Action::DismissModal => {
             // PRD #241 review F1: disarm the close confirmation on the way out
             // so a later `ConfirmCloseSelected` can never replay a target the
             // user already declined. Harmless for every other modal.
             ui.close_confirm_target = None;
             ui.confirm_choices_drawn = None;
-            ui.mode = UiMode::Normal;
+            if ui.mode == UiMode::QuitConfirm {
+                cancel_quit_confirm(ui);
+            } else {
+                ui.mode = UiMode::Normal;
+            }
         }
         // config-gen [Yes]: send the prompt to the pending target pane.
         Action::ConfigGenConfirm => {
@@ -12669,21 +12903,27 @@ fn dispatch_action(
         Action::StarConfirm => {
             let msg = star_repo_and_report();
             let saved = ui.star_prompt_state.dismiss_permanently();
-            ui.mode = UiMode::Normal;
+            close_star_prompt(ui);
             ui.status_message = Some((msg, std::time::Instant::now()));
             report_star_save(ui, saved);
         }
         // star-prompt [Snooze]: snooze (== `l` / Esc).
         Action::StarSnooze => {
             let saved = ui.star_prompt_state.snooze();
-            ui.mode = UiMode::Normal;
+            close_star_prompt(ui);
             report_star_save(ui, saved);
         }
         // star-prompt [Dismiss]: stop asking permanently (== `d`).
         Action::StarDismiss => {
             let saved = ui.star_prompt_state.dismiss_permanently();
-            ui.mode = UiMode::Normal;
+            close_star_prompt(ui);
             report_star_save(ui, saved);
+        }
+        // PRD #211: the Antigravity notice's buttons (== `o`, `l`, `d`).
+        choice @ (Action::AntigravityNoticeOpen
+        | Action::AntigravityNoticeLater
+        | Action::AntigravityNoticeDismiss) => {
+            choose_antigravity_notice(ui, choice);
         }
         // ===== PRD #80 M6: inline-edit button actions =====
         // filter [Apply]: commit and keep the typed filter (== Enter).
@@ -13566,6 +13806,51 @@ fn rearm_trust_gate(
     }
 }
 
+/// PRD #82: who re-arms the coordinator on `start_pane_id` after a compaction
+/// or `/clear`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RearmOwner {
+    /// The daemon has not said yet; the re-arm waits.
+    Asking,
+    /// The daemon does; this TUI stands down.
+    Daemon,
+    /// This TUI does.
+    Tui,
+}
+
+/// PRD #82: the daemon re-arms the coordinator when the tab's file is one the
+/// daemon records, and the file the daemon records for it now (a newer one
+/// after each of its re-arms) passes every check the daemon's own read of it
+/// applies (`orchestrator_context::recorded_context_is_republishable`: the
+/// deck's own per-publish file, not a symlink, within the size cap). The
+/// daemon re-arms only from that file, since it holds no approved config to
+/// publish from, so when retention or a person has removed or replaced it this
+/// TUI re-arms instead, from its trust-checked config, as it did before the
+/// daemon could. Asks the daemon without blocking: callers ask once per
+/// compaction or `/clear`, and wait while the answer is
+/// [`RearmOwner::Asking`].
+fn orchestrator_rearm_owner(
+    recorded_by_daemon: bool,
+    pane: &dyn PaneController,
+    start_pane_id: &str,
+) -> RearmOwner {
+    use crate::pane::DaemonRearmFile;
+    if !recorded_by_daemon {
+        return RearmOwner::Tui;
+    }
+    match pane.daemon_rearm_file(start_pane_id) {
+        DaemonRearmFile::Asking => RearmOwner::Asking,
+        DaemonRearmFile::NotDaemon => RearmOwner::Tui,
+        DaemonRearmFile::File(file) => {
+            if crate::orchestrator_context::recorded_context_is_republishable(&file) {
+                RearmOwner::Daemon
+            } else {
+                RearmOwner::Tui
+            }
+        }
+    }
+}
+
 /// Issue #1395: a compaction or `/clear` re-arm that could not read the tab's
 /// own context file re-sends the coordinator its role and protocol with no
 /// task ([`crate::orchestrator_context::reassert_orchestrator_prompt`]). Say so
@@ -14264,8 +14549,7 @@ fn handle_key_event(
     if ui.mode == UiMode::CopyMode {
         action = Some(if is_ctrl_c {
             leave_copy_mode(ui);
-            ui.quit_confirm_selected = 0;
-            ui.mode = UiMode::QuitConfirm;
+            open_quit_confirm(ui, false);
             Action::Continue
         } else {
             handle_copy_mode_key(key, ui)
@@ -14450,6 +14734,14 @@ fn handle_key_event(
                 gated
             }
             UiMode::StarPrompt => handle_star_prompt_key(key, ui),
+            // PRD #211: `Ctrl+C` keeps its PRD #40 safety net. The notice is
+            // not answered by it: cancelling the quit dialog comes back to
+            // the notice, which still returns where the start left the user.
+            UiMode::AntigravityNotice if is_ctrl_c => {
+                open_quit_confirm(ui, true);
+                Action::Continue
+            }
+            UiMode::AntigravityNotice => handle_antigravity_notice_key(key, ui),
             UiMode::ConfigGenPrompt => handle_config_gen_prompt_key(key, ui),
             UiMode::QuitConfirm => {
                 // PRD #92 F1: the dialog needs to know the
@@ -14479,8 +14771,7 @@ fn handle_key_event(
             UiMode::CloseConfirm if is_ctrl_c => {
                 ui.close_confirm_target = None;
                 ui.confirm_choices_drawn = None;
-                ui.quit_confirm_selected = 0;
-                ui.mode = UiMode::QuitConfirm;
+                open_quit_confirm(ui, false);
                 Action::Continue
             }
             UiMode::CloseConfirm => handle_close_confirm_key(&mut ui.close_confirm, key),
@@ -14499,8 +14790,7 @@ fn handle_key_event(
                 {
                     ui.upgrade_dialog = None;
                 }
-                ui.quit_confirm_selected = 0;
-                ui.mode = UiMode::QuitConfirm;
+                open_quit_confirm(ui, false);
                 Action::Continue
             }
             UiMode::Upgrade => handle_upgrade_key(key, ui),
@@ -14510,8 +14800,7 @@ fn handle_key_event(
             // the quit flow cancels the prompt, approving and spawning nothing.
             UiMode::TrustPrompt if is_ctrl_c => {
                 cancel_trust_prompt(ui);
-                ui.quit_confirm_selected = 0;
-                ui.mode = UiMode::QuitConfirm;
+                open_quit_confirm(ui, false);
                 Action::Continue
             }
             UiMode::TrustPrompt => handle_trust_prompt_key(key, ui),
@@ -15120,8 +15409,9 @@ pub fn run_tui(
                     }
                     // Issue #1395 item 1: re-arm this tab from the file its
                     // coordinator was started with, as a Ctrl+n tab does.
-                    tab_manager
-                        .set_orchestration_context_path(tab_index, bucket.context_path.clone());
+                    if let Some(path) = bucket.context_path.clone() {
+                        tab_manager.set_daemon_recorded_context_path(tab_index, path);
+                    }
                     if let Some(warning) = drift_warning {
                         surface_orchestration_config_drift(
                             &mut ui,
@@ -15921,6 +16211,7 @@ pub fn run_tui(
                 config,
                 cwd,
                 context_path,
+                context_recorded_by_daemon,
                 ..
             } = tab
             {
@@ -15928,11 +16219,30 @@ pub fn run_tui(
                 // Order-independent lookup — see
                 // `orchestrator_remit_pane_is_compacting`'s doc comment for
                 // why `.find()` over `snapshot.sessions.values()` was wrong.
-                let is_compacting = orchestrator_remit_pane_is_compacting(
+                let compacting_now = orchestrator_remit_pane_is_compacting(
                     snapshot.sessions.values(),
                     &start_pane_id,
                 );
-
+                // PRD #82: or a `Compacting` event this tab has not counted
+                // yet, whose status the pane may already have left. Events
+                // older than the tab (the anchor the `/clear` loop below uses)
+                // are not this tab's to answer.
+                let tab_anchor = *ui
+                    .orchestration_remit_clear_tab_anchor_at
+                    .entry(*id)
+                    .or_insert_with(Utc::now);
+                let compacting_event = orchestrator_remit_pane_latest_compacting(
+                    snapshot.sessions.values(),
+                    &start_pane_id,
+                )
+                .filter(|at| *at >= tab_anchor);
+                let unseen_event = compacting_event
+                    .filter(|at| ui.orchestration_remit_compacting_event_at.get(id) != Some(at));
+                let is_compacting = compacting_now || unseen_event.is_some();
+                // PRD #82: set while the daemon has not yet said whether it
+                // re-arms this coordinator; the compaction stays unanswered
+                // and uncounted until it has.
+                let mut asking_daemon = false;
                 if is_compacting {
                     // Eligibility no longer requires
                     // `orchestration_prompted.contains(id)`. That condition
@@ -15960,10 +16270,27 @@ pub fn run_tui(
                         .map(|r| AgentType::from_command(Some(&r.command)) == Some(AgentType::Pi))
                         .unwrap_or(false);
 
-                    if !ui.orchestration_remit_compacting.contains(id)
+                    let edge_open = !ui.orchestration_remit_compacting.contains(id)
                         && no_delivery_pending
                         && !ui.orchestration_remit_abandoned.contains(id)
-                        && !start_role_is_pi
+                        && !start_role_is_pi;
+                    // PRD #82: the daemon re-arms an orchestration whose
+                    // context file it records, attached client or not;
+                    // re-arming it here as well would send the coordinator its
+                    // role twice. Asked only on the compaction's edge, after
+                    // the cheap checks, and never waited on.
+                    let owner = if edge_open {
+                        orchestrator_rearm_owner(
+                            *context_recorded_by_daemon,
+                            &*pane,
+                            &start_pane_id,
+                        )
+                    } else {
+                        RearmOwner::Tui
+                    };
+                    asking_daemon = owner == RearmOwner::Asking;
+                    if edge_open
+                        && owner == RearmOwner::Tui
                         // Re-run the spawn-time write-then-point pair
                         // instead of injecting the bare pointer constant, so
                         // a re-assertion (a) verifies the context file
@@ -16019,9 +16346,14 @@ pub fn run_tui(
                         replace_orchestration_context_path(context_path, published.context_path);
                         ui.orchestration_prompted.remove(id);
                     }
-                    ui.orchestration_remit_compacting.insert(*id);
+                    if !asking_daemon {
+                        ui.orchestration_remit_compacting.insert(*id);
+                    }
                 } else {
                     ui.orchestration_remit_compacting.remove(id);
+                }
+                if !asking_daemon && let Some(at) = compacting_event {
+                    ui.orchestration_remit_compacting_event_at.insert(*id, at);
                 }
             }
         }
@@ -16058,6 +16390,7 @@ pub fn run_tui(
                 config,
                 cwd,
                 context_path,
+                context_recorded_by_daemon,
                 ..
             } = tab
             {
@@ -16098,14 +16431,6 @@ pub fn run_tui(
                         .map(|r| AgentType::from_command(Some(&r.command)) == Some(AgentType::Pi))
                         .unwrap_or(false);
 
-                    // Permanently excluded tabs are marked SEEN regardless of
-                    // outcome this frame — neither condition can ever
-                    // change, so there is nothing to gain by re-evaluating
-                    // them on every subsequent frame this same event
-                    // remains the latest one.
-                    let permanently_excluded =
-                        ui.orchestration_remit_abandoned.contains(id) || start_role_is_pi;
-
                     // A persistently failing `prepare_orchestrator_prompt`
                     // (deleted/unmounted cwd, read-only fs, disk full) must
                     // not be retried every frame at the render loop's ~62 Hz
@@ -16120,7 +16445,35 @@ pub fn run_tui(
                                     >= CLEAR_REASSERT_RETRY_FLOOR
                             });
 
-                    if no_delivery_pending
+                    // Permanently excluded tabs are marked SEEN regardless of
+                    // outcome this frame — neither condition can ever
+                    // change, so there is nothing to gain by re-evaluating
+                    // them on every subsequent frame this same event
+                    // remains the latest one.
+                    // PRD #82: as in the compaction loop above. Asked only
+                    // once nothing else holds this `/clear` back, so a frame
+                    // waiting on a pending prompt or the retry floor does
+                    // not ask again; while the daemon has not answered, the
+                    // `/clear` waits, neither answered nor marked seen.
+                    let owner = if no_delivery_pending
+                        && retry_floor_ok
+                        && !ui.orchestration_remit_abandoned.contains(id)
+                        && !start_role_is_pi
+                    {
+                        orchestrator_rearm_owner(
+                            *context_recorded_by_daemon,
+                            &*pane,
+                            &start_pane_id,
+                        )
+                    } else {
+                        RearmOwner::Tui
+                    };
+                    let permanently_excluded = ui.orchestration_remit_abandoned.contains(id)
+                        || start_role_is_pi
+                        || owner == RearmOwner::Daemon;
+                    if owner == RearmOwner::Asking {
+                        // Wait for the daemon's answer.
+                    } else if no_delivery_pending
                         && !permanently_excluded
                         && retry_floor_ok
                         && !rearm_trust_gate(&mut ui, &*pane, config, cwd)
@@ -18109,6 +18462,7 @@ mod deck_attention_tests {
                 zoomed: false,
                 orchestration_id: None,
                 context_path: None,
+                context_recorded_by_daemon: false,
             },
         ]
     }
@@ -19357,6 +19711,9 @@ fn draw_modal(frame: &mut Frame, area: Rect, ui: &mut UiState) {
     }
     if ui.mode == UiMode::StarPrompt {
         confirmation = Some(render_star_prompt(frame, area));
+    }
+    if ui.mode == UiMode::AntigravityNotice {
+        confirmation = Some(render_antigravity_notice(frame, area));
     }
     if ui.mode == UiMode::ConfigGenPrompt {
         confirmation = Some(render_config_gen_prompt(
@@ -21589,6 +21946,9 @@ fn confirmation_awaits_frame(ui: &UiState) -> bool {
             | UiMode::StopConfirm
             | UiMode::ConfigGenPrompt
             | UiMode::StarPrompt
+            // PRD #211: nor does input typed before the Antigravity notice
+            // was on screen answer it.
+            | UiMode::AntigravityNotice
             // PRD #1885: input typed before the trust prompt was on screen
             // never approves it.
             | UiMode::TrustPrompt
@@ -21625,6 +21985,16 @@ fn refuse_undrawn_choice(key: &KeyEvent, ui: &UiState) -> Option<Action> {
         UiMode::StarPrompt => {
             let choice = match key.code {
                 KeyCode::Char('s') => 0,
+                KeyCode::Char('l') => 1,
+                KeyCode::Char('d') => 2,
+                _ => return None,
+            };
+            return (!shown.contains(choice)).then_some(Action::Continue);
+        }
+        // PRD #211: the same rule for the Antigravity notice's `o`, `l`, `d`.
+        UiMode::AntigravityNotice => {
+            let choice = match key.code {
+                KeyCode::Char('o') => 0,
                 KeyCode::Char('l') => 1,
                 KeyCode::Char('d') => 2,
                 _ => return None,
@@ -22080,6 +22450,135 @@ fn render_star_prompt(frame: &mut Frame, area: Rect) -> ConfirmDrawing {
     let inner = popup_area.inner(ratatui::layout::Margin::new(1, 1));
     let (line, labels) = STAR_PROMPT_KEYS;
     let row = key_line.and_then(|n| inner.y.checked_add(n));
+    let cells = labels
+        .iter()
+        .map(|label| {
+            let offset = line.find(label).and_then(|i| u16::try_from(i).ok());
+            let x = offset.and_then(|i| inner.x.checked_add(2)?.checked_add(i));
+            (
+                x.unwrap_or(inner.x),
+                row.filter(|_| x.is_some()),
+                (*label).to_string(),
+            )
+        })
+        .collect();
+    ConfirmDrawing {
+        buttons: render_confirm_buttons(frame, &buttons, btn_row),
+        choices: ConfirmChoices { inner, cells },
+    }
+}
+
+/// PRD #211: the Antigravity notice's key line, and the choices on it in key
+/// order: Open issues, Later, Don't show again.
+const ANTIGRAVITY_NOTICE_KEYS: (&str, [&str; 3]) = (
+    "o Open issues  l Later  d Don't show again",
+    ["o Open issues", "l Later", "d Don't show again"],
+);
+
+/// Greedy word wrap of `text` into lines of at most `width` columns; a word
+/// longer than `width` gets a line of its own.
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for word in text.split_whitespace() {
+        match lines.last_mut() {
+            Some(line) if line.chars().count() + 1 + word.chars().count() <= width => {
+                line.push(' ');
+                line.push_str(word);
+            }
+            _ => lines.push(word.to_string()),
+        }
+    }
+    lines
+}
+
+/// PRD #211: the Antigravity notice. As wide as its request needs, capped
+/// by the terminal, where the request wraps.
+fn render_antigravity_notice(frame: &mut Frame, area: Rect) -> ConfirmDrawing {
+    use crate::antigravity_notice::{BODY, TITLE, issues_display};
+    /// The two-space indent, the borders, and a column of right margin.
+    const CHROME: u16 = 2 + 2 + 1;
+    let issues = issues_display();
+    let widest = [BODY, issues.as_str(), ANTIGRAVITY_NOTICE_KEYS.0, TITLE]
+        .iter()
+        .map(|line| u16::try_from(line.chars().count()).unwrap_or(u16::MAX))
+        .max()
+        .unwrap_or(0)
+        .saturating_add(CHROME);
+    let popup_width = widest.min(area.width.saturating_sub(4));
+    let body = wrap_words(BODY, usize::from(popup_width.saturating_sub(CHROME)).max(1));
+
+    let mut text = vec![Line::from("")];
+    text.extend(
+        body.iter()
+            .map(|line| Line::styled(format!("  {line}"), text_primary())),
+    );
+    text.extend([
+        Line::from(""),
+        Line::styled(
+            format!("  {issues}"),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::UNDERLINED),
+        ),
+        Line::from(""),
+        Line::styled(format!("  {}", ANTIGRAVITY_NOTICE_KEYS.0), text_primary()),
+    ]);
+    // Where the key line puts each of its choices, so the frame as flushed
+    // can be read back for which of them it shows (issue #1799's rule).
+    let key_line = u16::try_from(text.len() - 1).ok();
+    // The text, the button row and the two borders.
+    let wanted = u16::try_from(text.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(3);
+    let popup_height = wanted.min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+    let block = Block::default()
+        .title(format!(" {TITLE} "))
+        .title_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow));
+    frame.render_widget(Paragraph::new(text).block(block), popup_area);
+
+    let buttons = [
+        Button::new(
+            crate::antigravity_notice::OPEN_ISSUES,
+            "",
+            Action::AntigravityNoticeOpen,
+            true,
+        ),
+        Button::new(
+            crate::antigravity_notice::LATER,
+            "",
+            Action::AntigravityNoticeLater,
+            true,
+        ),
+        Button::new(
+            crate::antigravity_notice::DONT_SHOW_AGAIN,
+            "",
+            Action::AntigravityNoticeDismiss,
+            true,
+        ),
+    ];
+    let btn_row = Rect {
+        x: popup_area.x + 1,
+        y: popup_area.y + popup_area.height.saturating_sub(2),
+        width: popup_area.width.saturating_sub(2),
+        height: 1,
+    };
+    let inner = popup_area.inner(ratatui::layout::Margin::new(1, 1));
+    let (line, labels) = ANTIGRAVITY_NOTICE_KEYS;
+    // A key line the popup cut off shows none of its choices.
+    let row = key_line
+        .filter(|n| *n < inner.height.saturating_sub(1))
+        .and_then(|n| inner.y.checked_add(n));
     let cells = labels
         .iter()
         .map(|label| {
@@ -25282,6 +25781,17 @@ fn render_session_card(
         attention.push((
             notice.to_string(),
             Style::default().fg(palette::status_color(&SessionStatus::Error)),
+        ));
+    }
+
+    // PRD #211: the agent's own words for its Error or Needs Input — the error
+    // a failed turn reported, or what it waits on when it raised no question
+    // the deck reads — under `Dir:` like the deck's reasons above, in the
+    // status's colour. The desktop tile shows the same row.
+    if !is_placeholder && let Some(reason) = session.status_reason() {
+        attention.push((
+            reason,
+            Style::default().fg(palette::status_color(&session.status)),
         ));
     }
 
@@ -35865,6 +36375,18 @@ mod tests {
                 "/work/codex-project",
                 "4",
             ),
+            (
+                "devin-session",
+                AgentType::Devin,
+                "/work/devin-project",
+                "5",
+            ),
+            (
+                "antigravity-session",
+                AgentType::Antigravity,
+                "/work/antigravity-project",
+                "6",
+            ),
         ] {
             state.apply_event(AgentEvent {
                 session_id: session_id.to_string(),
@@ -35897,6 +36419,8 @@ mod tests {
             ("opencode-session", "frontend"),
             ("pi-session", "test-runner"),
             ("codex-session", "wrapped-worker"),
+            ("devin-session", "devin-worker"),
+            ("antigravity-session", "agy-worker"),
         ] {
             ui.display_names
                 .insert(session_id.to_string(), display_name.to_string());
@@ -36153,58 +36677,92 @@ mod tests {
         );
     }
 
-    /// Scenario: From the dashboard, press `/` and type `type:codex` through the
-    /// normal filter-input handlers, then render the resulting card list. The
-    /// visible dashboard must contain the Codex card and hide the Claude Code,
-    /// OpenCode, and Pi cards.
+    /// Scenario: Render a mixed deck containing every supported agent, then press `/` and type each agent's `type:` filter through the normal input handlers. Each filter must keep only its agent's card visible, including Antigravity, whose filter also accepts uppercase spelling and an additional matching text term.
     #[spec("dashboard/filter/004")]
     #[test]
     fn filter_004_slash_type_filter_narrows_rendered_cards() {
         let (state, mut ui) = typed_filter_fixture();
-        let action = handle_normal_key(
-            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
-            &mut ui,
-            state.sessions.len(),
-            None,
-            &KeybindingConfig::default(),
-        );
-        assert!(matches!(action, Action::EnterFilter));
-        ui.mode = UiMode::Filter;
-        for c in "type:codex".chars() {
-            handle_filter_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), &mut ui);
-        }
-
-        let filtered = filter_sessions(&state, &ui);
-        let cards: Vec<(&SessionState, Option<&str>)> = filtered
-            .iter()
-            .map(|(id, session)| (*session, ui.display_names.get(*id).map(String::as_str)))
-            .collect();
-        let buffer = render_dashboard_cards_to_buffer(
-            &cards,
-            ui.selected_index,
-            CardDensityKind::Normal,
-            0,
-            Utc::now(),
-            100,
-        );
-        let visible: String = (0..buffer.area().height)
-            .map(|y| {
-                (0..buffer.area().width)
-                    .map(|x| buffer[(x, y)].symbol())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        assert!(
-            visible.contains("wrapped-worker"),
-            "typing type:codex must leave the Codex card visible:\n{visible}"
-        );
-        for hidden in ["planner", "frontend", "test-runner"] {
-            assert!(
-                !visible.contains(hidden),
-                "typing type:codex must hide the {hidden} card:\n{visible}"
+        let render = |ui: &UiState| {
+            let filtered = filter_sessions(&state, ui);
+            let cards: Vec<(&SessionState, Option<&str>)> = filtered
+                .iter()
+                .map(|(id, session)| (*session, ui.display_names.get(*id).map(String::as_str)))
+                .collect();
+            let buffer = render_dashboard_cards_to_buffer(
+                &cards,
+                ui.selected_index,
+                CardDensityKind::Normal,
+                0,
+                Utc::now(),
+                100,
             );
+            (0..buffer.area().height)
+                .map(|y| {
+                    (0..buffer.area().width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let names = [
+            "planner",
+            "frontend",
+            "test-runner",
+            "wrapped-worker",
+            "devin-worker",
+            "agy-worker",
+        ];
+        let unfiltered = render(&ui);
+        for name in names {
+            assert!(
+                unfiltered.contains(name),
+                "the unfiltered dashboard must show {name}:\n{unfiltered}"
+            );
+        }
+        assert!(
+            unfiltered.contains("Antigravity"),
+            "Antigravity must have a visible badge before filtering:\n{unfiltered}"
+        );
+
+        for (query, expected) in [
+            ("type:claude", "planner"),
+            ("type:opencode", "frontend"),
+            ("type:pi", "test-runner"),
+            ("type:codex", "wrapped-worker"),
+            ("type:devin", "devin-worker"),
+            ("type:antigravity", "agy-worker"),
+            ("TYPE:ANTIGRAVITY", "agy-worker"),
+            ("type:antigravity agy-worker", "agy-worker"),
+        ] {
+            ui.filter_text.clear();
+            ui.mode = UiMode::Normal;
+            let action = handle_normal_key(
+                KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+                &mut ui,
+                state.sessions.len(),
+                None,
+                &KeybindingConfig::default(),
+            );
+            assert!(matches!(action, Action::EnterFilter));
+            ui.mode = UiMode::Filter;
+            for c in query.chars() {
+                handle_filter_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), &mut ui);
+            }
+            let visible = render(&ui);
+            for name in names {
+                assert_eq!(
+                    visible.contains(name),
+                    name == expected,
+                    "typing {query:?} must show only {expected}, checking {name}:\n{visible}"
+                );
+            }
+            if expected == "agy-worker" {
+                assert!(
+                    visible.contains("Antigravity"),
+                    "the filtered Antigravity card must retain its badge:\n{visible}"
+                );
+            }
         }
     }
 
@@ -41253,6 +41811,181 @@ mod tests {
         assert!(!should_reassert_orchestrator_remit(&SessionStatus::Unknown));
     }
 
+    /// Scenario: the daemon records an orchestration's role file and says it
+    /// re-arms coordinators. The TUI leaves the re-arm to it while the file the
+    /// daemon records NOW is one the daemon can read, waits while the daemon
+    /// has not answered, and takes the re-arm back once that file is gone or
+    /// has been replaced by a symlink the daemon refuses to follow (PRD #82).
+    #[test]
+    fn the_tui_rearms_when_the_daemon_cannot_read_its_role_file() {
+        struct RearmingDaemon(crate::pane::DaemonRearmFile);
+        impl PaneController for RearmingDaemon {
+            fn create_pane(&self, _: Option<&str>, _: Option<&str>) -> Result<String, PaneError> {
+                Ok(String::new())
+            }
+            fn write_to_pane(&self, _: &str, _: &str) -> Result<(), PaneError> {
+                Ok(())
+            }
+            fn close_pane(&self, _: &str) -> Result<(), PaneError> {
+                Ok(())
+            }
+            fn rename_pane(
+                &self,
+                _: &str,
+                name: &str,
+            ) -> Result<crate::pane::RenameOutcome, PaneError> {
+                Ok(crate::pane::RenameOutcome::applied(name))
+            }
+            fn focus_pane(&self, _: &str) -> Result<(), PaneError> {
+                Ok(())
+            }
+            fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, PaneError> {
+                Ok(Vec::new())
+            }
+            fn resize_pane(
+                &self,
+                _: &str,
+                _: crate::pane::PaneDirection,
+                _: u16,
+            ) -> Result<(), PaneError> {
+                Ok(())
+            }
+            fn name(&self) -> &str {
+                "rearming-daemon"
+            }
+            fn is_available(&self) -> bool {
+                true
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn daemon_rearm_file(&self, _: &str) -> crate::pane::DaemonRearmFile {
+                self.0.clone()
+            }
+        }
+        use crate::pane::DaemonRearmFile;
+        let project = tempfile::tempdir().unwrap();
+        let context_dir = project.path().join(".dot-agent-deck");
+        std::fs::create_dir(&context_dir).unwrap();
+        let file = context_dir.join("orchestrator-context-0123456789abcdef0123456789abcdef.md");
+        std::fs::write(&file, "role").unwrap();
+        let daemon = |answer| RearmingDaemon(answer);
+        let names = |path: &std::path::Path| daemon(DaemonRearmFile::File(path.to_path_buf()));
+
+        assert_eq!(
+            orchestrator_rearm_owner(true, &names(&file), "1"),
+            RearmOwner::Daemon
+        );
+        assert_eq!(
+            orchestrator_rearm_owner(true, &daemon(DaemonRearmFile::Asking), "1"),
+            RearmOwner::Asking
+        );
+        // A tab whose file the daemon does not record stays the TUI's, and so
+        // does one whose daemon names no file for it.
+        assert_eq!(
+            orchestrator_rearm_owner(false, &names(&file), "1"),
+            RearmOwner::Tui
+        );
+        assert_eq!(
+            orchestrator_rearm_owner(true, &daemon(DaemonRearmFile::NotDaemon), "1"),
+            RearmOwner::Tui
+        );
+
+        // A symlink in the recorded file's place, even to a readable file.
+        let elsewhere = project.path().join("elsewhere.md");
+        std::fs::write(&elsewhere, "role").unwrap();
+        std::fs::remove_file(&file).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&elsewhere, &file).unwrap();
+            assert_eq!(
+                orchestrator_rearm_owner(true, &names(&file), "1"),
+                RearmOwner::Tui
+            );
+            std::fs::remove_file(&file).unwrap();
+        }
+
+        // The recorded file gone.
+        assert_eq!(
+            orchestrator_rearm_owner(true, &names(&file), "1"),
+            RearmOwner::Tui
+        );
+    }
+
+    /// Scenario: OpenCode 1.x reports a session busy within milliseconds of
+    /// its compaction starting, so the start-role pane can read `Thinking` on
+    /// the first frame that sees it. The compaction re-arm still finds the
+    /// `Compacting` event in the pane's recent events (the newest one, from
+    /// the main thread, not a subagent's, not a placeholder's) (PRD #82).
+    #[test]
+    fn remit_finds_a_compaction_the_status_has_already_left() {
+        let at = |secs| chrono::DateTime::from_timestamp(secs, 0).unwrap();
+        let event = |event_type, secs, subagent: bool| {
+            let mut e = AgentEvent {
+                session_id: "s".into(),
+                agent_type: AgentType::OpenCode,
+                event_type,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: at(secs),
+                user_prompt: None,
+                metadata: Default::default(),
+                pane_id: Some("orch-pane".into()),
+                agent_id: None,
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+                background: None,
+                background_revision: None,
+            };
+            if subagent {
+                e.metadata.insert(
+                    crate::event::SUBAGENT_ID_METADATA_KEY.to_string(),
+                    "child".to_string(),
+                );
+            }
+            e
+        };
+        let mut sessions: HashMap<String, SessionState> = HashMap::new();
+        let mut real = SessionState {
+            pane_id: Some("orch-pane".to_string()),
+            agent_type: AgentType::OpenCode,
+            ..make_session(SessionStatus::Thinking)
+        };
+        real.recent_events
+            .push_back(event(EventType::Thinking, 10, false));
+        real.recent_events
+            .push_back(event(EventType::Compacting, 20, false));
+        real.recent_events
+            .push_back(event(EventType::Thinking, 21, false));
+        real.recent_events
+            .push_back(event(EventType::Compacting, 30, true));
+        sessions.insert("real".into(), real);
+        let mut placeholder = SessionState {
+            pane_id: Some("orch-pane".to_string()),
+            agent_type: AgentType::None,
+            ..make_session(SessionStatus::Thinking)
+        };
+        placeholder
+            .recent_events
+            .push_back(event(EventType::Compacting, 40, false));
+        sessions.insert("placeholder".into(), placeholder);
+
+        assert!(
+            !orchestrator_remit_pane_is_compacting(sessions.values(), "orch-pane"),
+            "premise: the status has already left Compacting"
+        );
+        assert_eq!(
+            orchestrator_remit_pane_latest_compacting(sessions.values(), "orch-pane"),
+            Some(at(20))
+        );
+        assert_eq!(
+            orchestrator_remit_pane_latest_compacting(sessions.values(), "other-pane"),
+            None
+        );
+    }
+
     // Pure policy: `orchestrator_remit_pane_is_compacting` must find the
     // REAL, tagged session on the start-role pane and ignore (a) a
     // co-resident placeholder on the SAME pane and (b) a Compacting session
@@ -42366,6 +43099,7 @@ mod tests {
             UiMode::CloseConfirm,
             UiMode::ConfigGenPrompt,
             UiMode::StarPrompt,
+            UiMode::AntigravityNotice,
             UiMode::Help,
             UiMode::DirPicker,
             UiMode::NewPaneForm,
@@ -45353,7 +46087,8 @@ mod tests {
             | UiMode::InboxAttention
             | UiMode::RestartNotice
             | UiMode::CopyMode
-            | UiMode::TrustPrompt => mode,
+            | UiMode::TrustPrompt
+            | UiMode::AntigravityNotice => mode,
         }
     }
 
@@ -45380,6 +46115,7 @@ mod tests {
             UiMode::RestartNotice,
             UiMode::CopyMode,
             UiMode::TrustPrompt,
+            UiMode::AntigravityNotice,
         ]
         .into_iter()
         .map(assert_exhaustive_ui_mode)
@@ -49716,6 +50452,7 @@ mod tests {
             UiMode::CloseConfirm,
             UiMode::ConfigGenPrompt,
             UiMode::StarPrompt,
+            UiMode::AntigravityNotice,
             UiMode::Help,
             UiMode::DirPicker,
             UiMode::NewPaneForm,
@@ -50590,6 +51327,583 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// PRD #211: a New Agent start is told apart by the command it spawns,
+    /// not by what was typed. With `default_command = "agy"`, a built-in
+    /// option's empty Command field starts `agy` and is an Antigravity start;
+    /// a plain start's empty field starts the daemon's shell and is not; and a
+    /// typed `agy` is one either way.
+    #[test]
+    fn antigravity_start_is_told_by_the_spawned_command() {
+        let form = |command: &str| {
+            NewPaneFormState::new(
+                PathBuf::from("/tmp"),
+                String::new(),
+                command.to_string(),
+                vec![],
+            )
+        };
+        let spawned = |f: &NewPaneFormState| {
+            let req = build_new_pane_request(f, "  agy  ");
+            (req.command.clone(), new_pane_spawn_agent_type(&req))
+        };
+
+        // A plain start with an empty field runs the shell: no agent.
+        assert_eq!(spawned(&form("")), (String::new(), None));
+        // A plain start of a typed `agy`.
+        assert_eq!(
+            spawned(&form("agy")),
+            ("agy".to_string(), Some(AgentType::Antigravity))
+        );
+
+        // Every built-in option resolves an empty field to `default_command`
+        // (trimmed), so it starts `agy`.
+        let mut f = form("");
+        let mut builtins = Vec::new();
+        for _ in 0..8 {
+            f.select_next_mode();
+            if let Some(builtin) = f.selected_builtin()
+                && !builtins.contains(&builtin)
+            {
+                builtins.push(builtin);
+                assert_eq!(
+                    spawned(&f),
+                    ("agy".to_string(), Some(AgentType::Antigravity)),
+                    "{builtin:?}"
+                );
+            }
+        }
+        assert!(
+            builtins.contains(&BuiltinOption::Schedule)
+                && builtins.contains(&BuiltinOption::Dispatcher),
+            "the Mode row offered {builtins:?}"
+        );
+
+        // A built-in option with another command typed starts that command.
+        let mut f = form("claude");
+        f.select_next_mode();
+        assert!(f.selected_builtin().is_some());
+        assert_eq!(
+            spawned(&f),
+            ("claude".to_string(), Some(AgentType::ClaudeCode))
+        );
+    }
+
+    /// PRD #211: a UI whose Antigravity notice state is a scratch file, and
+    /// whose star reminder state is another, so no test touches the user's.
+    fn notice_ui(dir: &std::path::Path) -> UiState {
+        let mut ui = default_ui();
+        ui.antigravity_notice = config::AntigravityNoticeSession::new(dir.join("notice.json"));
+        ui.star_prompt_state = config::StarPromptState::load_from(dir.join("star.json"));
+        ui
+    }
+
+    /// PRD #211: the first Antigravity start opens the notice over the new
+    /// pane; Later, Escape and Don't show again close it back into the pane,
+    /// and only Don't show again saves anything.
+    #[test]
+    fn antigravity_notice_choices_return_to_the_pane() {
+        for code in [KeyCode::Char('l'), KeyCode::Esc, KeyCode::Char('d')] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut ui = notice_ui(dir.path());
+            ui.mode = UiMode::PaneInput;
+            record_antigravity_start(&mut ui);
+            assert_eq!(ui.mode, UiMode::AntigravityNotice, "{code:?}");
+            assert!(matches!(
+                handle_antigravity_notice_key(KeyEvent::from(code), &mut ui),
+                Action::Continue
+            ));
+            assert_eq!(ui.mode, UiMode::PaneInput, "{code:?} left focus elsewhere");
+            assert!(ui.status_message.is_none(), "{code:?}");
+            let (state, _) =
+                config::AntigravityNoticeState::load_from(ui.antigravity_notice.path());
+            assert_eq!(
+                state.permanently_dismissed,
+                code == KeyCode::Char('d'),
+                "{code:?}"
+            );
+        }
+    }
+
+    /// PRD #211: a key that is not a choice does nothing and keeps the notice
+    /// open, and no global shortcut acts behind it.
+    #[test]
+    fn antigravity_notice_owns_the_keyboard() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ui = notice_ui(dir.path());
+        ui.mode = UiMode::AntigravityNotice;
+        for code in [KeyCode::Char('z'), KeyCode::Enter, KeyCode::Char('s')] {
+            handle_antigravity_notice_key(KeyEvent::from(code), &mut ui);
+            assert_eq!(ui.mode, UiMode::AntigravityNotice, "{code:?}");
+        }
+        let kb = KeybindingConfig::default();
+        for key in [
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+        ] {
+            assert!(
+                global_action_for_mode(&kb, UiMode::AntigravityNotice, &key).is_none(),
+                "{key:?} acted behind the notice"
+            );
+        }
+    }
+
+    /// PRD #211: only the start the notice is due at opens it.
+    #[test]
+    fn antigravity_notice_opens_only_when_due() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ui = notice_ui(dir.path());
+        ui.mode = UiMode::PaneInput;
+        record_antigravity_start(&mut ui);
+        handle_antigravity_notice_key(KeyEvent::from(KeyCode::Char('l')), &mut ui);
+        for _ in 2..=100 {
+            record_antigravity_start(&mut ui);
+            assert_eq!(ui.mode, UiMode::PaneInput);
+        }
+        record_antigravity_start(&mut ui);
+        assert_eq!(ui.mode, UiMode::AntigravityNotice, "the 101st start");
+    }
+
+    /// PRD #211: a notice due while the star reminder is open waits behind
+    /// it, and opens once the reminder closes — one dialog at a time.
+    #[test]
+    fn antigravity_notice_waits_behind_the_star_reminder() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ui = notice_ui(dir.path());
+        ui.mode = UiMode::StarPrompt;
+        record_antigravity_start(&mut ui);
+        assert_eq!(ui.mode, UiMode::StarPrompt, "both dialogs at once");
+        handle_star_prompt_key(KeyEvent::from(KeyCode::Char('l')), &mut ui);
+        assert_eq!(ui.mode, UiMode::AntigravityNotice);
+        handle_antigravity_notice_key(KeyEvent::from(KeyCode::Esc), &mut ui);
+        assert_eq!(ui.mode, UiMode::Normal, "back where the star reminder left");
+    }
+
+    /// PRD #211: a state file that cannot be saved is said once per process,
+    /// and the notice still shows.
+    #[test]
+    fn antigravity_notice_problem_is_said_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, "").unwrap();
+        let mut ui = notice_ui(dir.path());
+        ui.antigravity_notice = config::AntigravityNoticeSession::new(blocker.join("notice.json"));
+        ui.mode = UiMode::PaneInput;
+        record_antigravity_start(&mut ui);
+        assert_eq!(ui.mode, UiMode::AntigravityNotice);
+        assert!(
+            ui.status_message.take().is_some(),
+            "the problem was not said"
+        );
+        handle_antigravity_notice_key(KeyEvent::from(KeyCode::Char('l')), &mut ui);
+        record_antigravity_start(&mut ui);
+        assert!(ui.status_message.is_none(), "the problem was said twice");
+        assert_eq!(
+            ui.mode,
+            UiMode::PaneInput,
+            "the unsaved first showing was forgotten: the next start showed again"
+        );
+    }
+
+    /// PRD #211: a Don't show again that cannot be saved closes the notice,
+    /// as in the desktop app, says why once, and holds for the rest of the
+    /// session: none of the next 150 starts shows the notice.
+    #[test]
+    fn antigravity_notice_unsaved_dismissal_holds_for_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, "").unwrap();
+        let mut ui = notice_ui(dir.path());
+        ui.antigravity_notice = config::AntigravityNoticeSession::new(blocker.join("notice.json"));
+        ui.mode = UiMode::AntigravityNotice;
+        handle_antigravity_notice_key(KeyEvent::from(KeyCode::Char('d')), &mut ui);
+        assert_eq!(ui.mode, UiMode::PaneInput, "the notice stayed open");
+        let said = ui.status_message.take().map(|(why, _)| why);
+        assert!(
+            said.as_deref()
+                .is_some_and(|why| why.contains("Antigravity notice")),
+            "{said:?}"
+        );
+        for start in 1..=150 {
+            record_antigravity_start(&mut ui);
+            assert_eq!(
+                ui.mode,
+                UiMode::PaneInput,
+                "start {start} showed the notice"
+            );
+        }
+        assert!(ui.status_message.is_none(), "the problem was said twice");
+    }
+
+    /// PRD #211 (Qodo finding on PR #2370, and the review of its fix):
+    /// `Ctrl+C` on a notice opened over the new pane's input opens the quit
+    /// dialog, and every way of cancelling that flow — Escape, Enter on
+    /// Cancel, the `[Cancel]` button, and Stop's No by `n`, by Enter and by
+    /// Escape followed by Escape — comes back to the notice, still unanswered:
+    /// the state file is byte for byte what the start saved and no byte
+    /// reached the pane. Answering it then returns to the pane, its focus
+    /// never moved. A quit dialog opened from command mode still cancels to
+    /// command mode, after one opened from the notice as well (controls), and
+    /// so does one opened by the footer's Quit button after a confirmed Stop
+    /// from the notice failed: the failed flow does not leave its origin
+    /// behind.
+    #[test]
+    fn antigravity_notice_cancelled_quit_returns_to_the_notice() {
+        use tokio::sync::RwLock;
+        enum Step {
+            Key(KeyEvent),
+            Click(Action),
+        }
+        /// A way through the quit flow, built afresh for each use.
+        type Steps = fn() -> Vec<Step>;
+        let key = |code: KeyCode| Step::Key(KeyEvent::from(code));
+        let ctrl_c = || Step::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        let area = Rect::new(0, 0, 80, 24);
+        // No daemon behind it, so a confirmed Stop fails; the child input is
+        // kept so anything forwarded to the pane is seen.
+        let (ctrl, mut child_input) = EmbeddedPaneController::for_scroll_seam_with_focused_pane(
+            "seam-pane",
+            22,
+            78,
+            b"",
+            false,
+        );
+        let pc = Arc::new(ctrl);
+        let state: SharedState = Arc::new(RwLock::new(AppState::default()));
+        // One pane-backed agent, so Stop asks its own confirmation.
+        let snapshot = dashboard_snapshot(1);
+        // Like the notice, a dialog takes input once its choices are drawn,
+        // so every step is taken over a fresh frame.
+        let run = |ui: &mut UiState, tab_manager: &mut TabManager, steps: Vec<Step>| {
+            let mut flow = Flow::Continue;
+            for step in steps {
+                draw_sized(ui, area.width, area.height);
+                flow = match step {
+                    Step::Key(key) => {
+                        handle_key_event(key, ui, &*pc, &state, tab_manager, &snapshot, &[], area)
+                    }
+                    Step::Click(action) => dispatch_action(
+                        action,
+                        ui,
+                        &*pc,
+                        &state,
+                        tab_manager,
+                        &snapshot,
+                        &[],
+                        None,
+                        area,
+                    ),
+                };
+            }
+            flow
+        };
+        let notice_over_pane = |dir: &std::path::Path| {
+            let mut ui = notice_ui(dir);
+            ui.mode = UiMode::PaneInput;
+            record_antigravity_start(&mut ui);
+            assert_eq!(ui.mode, UiMode::AntigravityNotice, "precondition");
+            let saved = std::fs::read(ui.antigravity_notice.path()).expect("the start was saved");
+            (ui, saved)
+        };
+
+        let routes: [(&str, Steps); 6] = [
+            ("Esc", || vec![Step::Key(KeyEvent::from(KeyCode::Esc))]),
+            ("Enter on Cancel", || {
+                [KeyCode::Down, KeyCode::Down, KeyCode::Enter]
+                    .map(|code| Step::Key(KeyEvent::from(code)))
+                    .into()
+            }),
+            ("[Cancel]", || vec![Step::Click(Action::DismissModal)]),
+            ("Stop, then n, then Esc", || {
+                [
+                    KeyCode::Down,
+                    KeyCode::Enter,
+                    KeyCode::Char('n'),
+                    KeyCode::Esc,
+                ]
+                .map(|code| Step::Key(KeyEvent::from(code)))
+                .into()
+            }),
+            ("Stop, then Enter on No, then Esc", || {
+                [KeyCode::Down, KeyCode::Enter, KeyCode::Enter, KeyCode::Esc]
+                    .map(|code| Step::Key(KeyEvent::from(code)))
+                    .into()
+            }),
+            ("Stop, then Esc, then Esc", || {
+                [KeyCode::Down, KeyCode::Enter, KeyCode::Esc, KeyCode::Esc]
+                    .map(|code| Step::Key(KeyEvent::from(code)))
+                    .into()
+            }),
+        ];
+        for (route, steps) in routes {
+            let dir = tempfile::tempdir().unwrap();
+            let mut tab_manager = TabManager::new(pc.clone());
+            let (mut ui, saved) = notice_over_pane(dir.path());
+
+            run(&mut ui, &mut tab_manager, vec![ctrl_c()]);
+            assert_eq!(ui.mode, UiMode::QuitConfirm, "{route}: Ctrl+C");
+            let flow = run(&mut ui, &mut tab_manager, steps());
+            assert_eq!(flow, Flow::Continue, "{route}: quit");
+            assert_eq!(
+                ui.mode,
+                UiMode::AntigravityNotice,
+                "{route}: cancelling quit did not come back to the notice"
+            );
+            assert_eq!(
+                std::fs::read(ui.antigravity_notice.path()).unwrap(),
+                saved,
+                "{route}: the notice's state was saved again"
+            );
+            assert!(
+                child_input.drain_bytes().is_empty(),
+                "{route}: input reached the pane"
+            );
+
+            // The notice takes a choice only once its choices are drawn.
+            let rows = draw_sized(&mut ui, area.width, area.height);
+            assert!(
+                on_screen(&rows, ANTIGRAVITY_NOTICE_KEYS.0),
+                "{route}: the notice is not drawn:\n{}",
+                rows.join("\n")
+            );
+            run(&mut ui, &mut tab_manager, vec![key(KeyCode::Char('l'))]);
+            assert_eq!(
+                ui.mode,
+                UiMode::PaneInput,
+                "{route}: Later did not return to the pane"
+            );
+            assert_eq!(
+                pc.focused_pane_id().as_deref(),
+                Some("seam-pane"),
+                "{route}: the pane's focus moved"
+            );
+            assert!(
+                child_input.drain_bytes().is_empty(),
+                "{route}: input reached the pane"
+            );
+
+            // Control: a quit dialog from command mode cancels to command
+            // mode, after one from the notice as well as on its own.
+            ui.mode = UiMode::Normal;
+            run(&mut ui, &mut tab_manager, vec![ctrl_c()]);
+            assert_eq!(ui.mode, UiMode::QuitConfirm, "{route}: control Ctrl+C");
+            run(&mut ui, &mut tab_manager, steps());
+            assert_eq!(ui.mode, UiMode::Normal, "{route}: control");
+        }
+
+        // A confirmed Stop from the notice that fails ends that quit flow in
+        // command mode; a quit dialog the footer's Quit button opens next,
+        // with no key typed in between, cancels to command mode too.
+        let dir = tempfile::tempdir().unwrap();
+        let mut tab_manager = TabManager::new(pc.clone());
+        let (mut ui, saved) = notice_over_pane(dir.path());
+        let flow = run(
+            &mut ui,
+            &mut tab_manager,
+            vec![
+                ctrl_c(),
+                key(KeyCode::Down),
+                key(KeyCode::Enter),
+                key(KeyCode::Char('y')),
+            ],
+        );
+        assert_eq!(flow, Flow::Continue, "the failed Stop quit");
+        assert_eq!(ui.mode, UiMode::Normal, "the failed Stop");
+        assert!(
+            ui.status_message
+                .as_ref()
+                .is_some_and(|(message, _)| message.starts_with("Stop failed")),
+            "the Stop did not fail: {:?}",
+            ui.status_message
+        );
+        assert!(
+            !ui.quit_confirm_over_antigravity_notice,
+            "the failed Stop left the quit flow's origin behind"
+        );
+        run(
+            &mut ui,
+            &mut tab_manager,
+            vec![Step::Click(Action::RequestQuit)],
+        );
+        assert_eq!(ui.mode, UiMode::QuitConfirm, "the Quit button");
+        run(
+            &mut ui,
+            &mut tab_manager,
+            vec![Step::Click(Action::DismissModal)],
+        );
+        assert_eq!(
+            ui.mode,
+            UiMode::Normal,
+            "the Quit button's dialog cancelled to the notice the failed Stop left"
+        );
+        assert_eq!(
+            std::fs::read(ui.antigravity_notice.path()).unwrap(),
+            saved,
+            "the notice's state was saved again"
+        );
+        assert!(
+            child_input.drain_bytes().is_empty(),
+            "input reached the pane"
+        );
+    }
+
+    /// PRD #211: with the notice drawn, `o`, `l`, `d` and `Esc` with `Ctrl`,
+    /// `Alt` or a platform modifier held choose nothing through the TUI's key
+    /// funnel — the notice stays open, nothing is saved and no browser opens —
+    /// as in the desktop app. `Ctrl+C` still leaves for the quit flow, and the
+    /// plain key still chooses (controls).
+    #[test]
+    fn antigravity_notice_modified_keys_choose_nothing() {
+        use tokio::sync::RwLock;
+        let dir = tempfile::tempdir().unwrap();
+        let pc = Arc::new(OpenTabPC::new());
+        let mut tab_manager = TabManager::new(pc.clone());
+        let state: SharedState = Arc::new(RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+        let press = |ui: &mut UiState, tab_manager: &mut TabManager, key: KeyEvent| {
+            handle_key_event(
+                key,
+                ui,
+                &*pc,
+                &state,
+                tab_manager,
+                &snapshot,
+                &[],
+                Rect::new(0, 0, 80, 24),
+            )
+        };
+        let opened = || ANTIGRAVITY_ISSUES_OPENED.with(std::cell::Cell::get);
+        let mut ui = notice_ui(dir.path());
+        ui.mode = UiMode::AntigravityNotice;
+        let rows = draw_sized(&mut ui, 80, 24);
+        assert!(
+            on_screen(&rows, ANTIGRAVITY_NOTICE_KEYS.0),
+            "precondition:\n{}",
+            rows.join("\n")
+        );
+        let before = opened();
+        for modifiers in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::SUPER,
+            KeyModifiers::META,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ] {
+            for code in [
+                KeyCode::Char('o'),
+                KeyCode::Char('l'),
+                KeyCode::Char('d'),
+                KeyCode::Esc,
+            ] {
+                let key = KeyEvent::new(code, modifiers);
+                assert_eq!(press(&mut ui, &mut tab_manager, key), Flow::Continue);
+                assert_eq!(ui.mode, UiMode::AntigravityNotice, "{key:?} chose");
+            }
+        }
+        assert_eq!(opened(), before, "a modified o opened the browser");
+        let (saved, _) = config::AntigravityNoticeState::load_from(ui.antigravity_notice.path());
+        assert!(!saved.permanently_dismissed, "a modified d dismissed it");
+
+        press(
+            &mut ui,
+            &mut tab_manager,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(ui.mode, UiMode::QuitConfirm, "Ctrl+C lost its quit flow");
+
+        ui.mode = UiMode::AntigravityNotice;
+        draw_sized(&mut ui, 80, 24);
+        press(
+            &mut ui,
+            &mut tab_manager,
+            KeyEvent::from(KeyCode::Char('l')),
+        );
+        assert_eq!(ui.mode, UiMode::PaneInput, "the plain key did not choose");
+    }
+
+    /// PRD #211: the notice's keys, under `prompt/star/001`'s rule — at a
+    /// height that cuts its key line off, `o`, `l` and `d` choose nothing and
+    /// Escape still closes it; at 80×24 each reaches it, its words are on
+    /// screen and its buttons are clickable. Before its first frame none of
+    /// the three reaches it.
+    #[test]
+    fn antigravity_notice_keys_are_refused_while_their_choices_are_not_drawn() {
+        let keys = [KeyCode::Char('o'), KeyCode::Char('l'), KeyCode::Char('d')];
+        let reached = |ui: &mut UiState, code: KeyCode| {
+            let mut reached = false;
+            guarded(ui, code, |_, _| {
+                reached = true;
+                Action::Continue
+            });
+            reached
+        };
+        let open = || {
+            let mut ui = default_ui();
+            ui.mode = UiMode::AntigravityNotice;
+            ui
+        };
+        for (height, drawn) in [(9u16, false), (24, true)] {
+            let mut ui = open();
+            let rows = draw_sized(&mut ui, 80, height);
+            let shown = rows.join("\n");
+            assert_eq!(
+                on_screen(&rows, ANTIGRAVITY_NOTICE_KEYS.0),
+                drawn,
+                "{height}: precondition:\n{shown}"
+            );
+            for code in keys {
+                assert_eq!(
+                    reached(&mut ui, code),
+                    drawn,
+                    "{height}: {code:?} with its choice drawn={drawn}:\n{shown}"
+                );
+            }
+            assert!(
+                reached(&mut ui, KeyCode::Esc),
+                "{height}: Esc is the way back"
+            );
+            if drawn {
+                assert!(
+                    on_screen(&rows, crate::antigravity_notice::TITLE),
+                    "{shown}"
+                );
+                assert!(
+                    on_screen(&rows, &crate::antigravity_notice::issues_display()),
+                    "{shown}"
+                );
+                for action in ["Open", "Later", "Dismiss"] {
+                    assert!(
+                        ui.modal_button_rects.iter().any(|(a, _)| match action {
+                            "Open" => matches!(a, Action::AntigravityNoticeOpen),
+                            "Later" => matches!(a, Action::AntigravityNoticeLater),
+                            _ => matches!(a, Action::AntigravityNoticeDismiss),
+                        }),
+                        "{height}: [{action}] is not clickable:\n{shown}"
+                    );
+                }
+            }
+
+            let mut ui = open();
+            assert!(confirmation_awaits_frame(&ui), "{height}: not drawn yet");
+            for code in keys {
+                assert!(
+                    !reached(&mut ui, code),
+                    "{height}: {code:?} answered the notice before its first frame"
+                );
+            }
+        }
+    }
+
+    /// PRD #211: the request wraps on a narrow terminal and every word of it
+    /// is still drawn.
+    #[test]
+    fn antigravity_notice_wraps_its_request() {
+        let lines = wrap_words(crate::antigravity_notice::BODY, 40);
+        assert!(lines.len() > 1);
+        assert!(lines.iter().all(|line| line.chars().count() <= 40));
+        assert_eq!(lines.join(" "), crate::antigravity_notice::BODY);
     }
 
     /// Scenario: the user opens the directory picker on a list with `alpha` selected. In a frame so short that the popup shows its current directory but no entry, Enter, `l` and Right open nothing while Space still picks the current directory it shows; in one too short to show even that, Space picks nothing either. At 80×24, where `alpha` is on screen, Enter opens it; with room for one entry, `j` and Enter in one burst open nothing until `beta` is drawn.
