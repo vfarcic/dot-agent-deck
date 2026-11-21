@@ -787,6 +787,8 @@ impl UpgradePlan {
                 crate::repo_identity::URL
             ))),
         }
+        // Issue #2064: a release collector beside a downloaded CLI moves with it.
+        lines.extend(super::collector::plan_line(self));
         if let Some(stable) = self
             .stable_switch
             .as_ref()

@@ -31,7 +31,8 @@ use std::time::Duration;
 
 use common::TuiDeck;
 use fake_releases::{
-    FakeReleases, cli_asset, release_script, release_script_recording, sha256_hex,
+    FakeReleases, cli_asset, collector_asset, collector_script, release_script,
+    release_script_recording, sha256_hex,
 };
 use spec::spec;
 
@@ -718,5 +719,248 @@ fn cli_upgrade_007_ctrl_c_after_the_version_check_exits_leaves_the_binary() {
     assert!(
         stdout.trim_end().ends_with("Cancelled."),
         "{stdout}\n{stderr}"
+    );
+}
+
+/// The collector's systemd user service, as the stand-in `systemctl` names it.
+const COLLECTOR_SERVICE: &str = "dot-agent-deck-collector.service";
+
+/// A server offering [`RELEASE`] with the CLI's release script and the
+/// collector's ([`collector_script`]), both listed in its `checksums.txt`, and
+/// the collector's served bytes. `None` on a platform with no collector asset
+/// (macOS), where the collector tests print `SKIP:`.
+fn release_with_collector() -> Option<(FakeReleases, Vec<u8>)> {
+    let Some(collector_name) = collector_asset() else {
+        println!("SKIP: the collector ships for Linux only");
+        return None;
+    };
+    let asset = release_script(RELEASE);
+    let collector = collector_script(RELEASE);
+    let manifest = format!(
+        "{}  {}\n{}  {collector_name}\n",
+        sha256_hex(&asset),
+        cli_asset(),
+        sha256_hex(&collector)
+    );
+    let server = FakeReleases::start_with(
+        RELEASE,
+        asset,
+        vec![(collector_name.to_string(), collector.clone())],
+        manifest,
+    );
+    Some((server, collector))
+}
+
+/// An old release collector at `path`.
+fn old_collector(path: &Path) -> Vec<u8> {
+    use std::os::unix::fs::PermissionsExt;
+    let old = collector_script(OLD_VERSION);
+    std::fs::write(path, &old).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    old
+}
+
+/// A stand-in `systemctl` in the sandbox's `PATH` ([`sandbox_env`]) that
+/// reports the collector's user service as running `runs`, accepts a
+/// `try-restart` of it, and records every invocation in `log`. Never the
+/// machine's own: the sandbox `PATH` holds nothing else.
+fn stand_in_systemctl(dir: &Path, runs: &Path, log: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = dir.join("sandbox-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let (runs, log) = (
+        runs.to_str().expect("UTF-8 path"),
+        log.to_str().expect("UTF-8 path"),
+    );
+    assert!(!runs.contains('\'') && !log.contains('\''));
+    let script = format!(
+        "#!/bin/sh\necho \"$*\" >> '{log}'\ncase \"$*\" in\n  '--user show {COLLECTOR_SERVICE} '*) printf 'LoadState=loaded\\nActiveState=active\\nExecStart={{ path={runs} ; argv[]={runs} ; }}\\n' ;;\n  '--user try-restart {COLLECTOR_SERVICE}') exit 0 ;;\n  *) exit 1 ;;\nesac\n"
+    );
+    let systemctl = bin.join("systemctl");
+    std::fs::write(&systemctl, script).unwrap();
+    std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Scenario: Run `dot-agent-deck upgrade --yes` as an old copy in a writable folder that also holds an old release `dot-agent-deck-collector`, with a stand-in `systemctl` reporting the collector's user service running that file. The plan says the collector moves too; the upgrade replaces the collector with the served one after checking it, restarts the service with `systemctl --user try-restart`, and says both.
+#[spec("upgrade/cli-upgrade/009")]
+#[test]
+fn cli_upgrade_009_a_collector_beside_the_cli_is_upgraded_and_its_service_restarted() {
+    let Some((server, collector)) = release_with_collector() else {
+        return;
+    };
+    let dir = common::harness_tempdir().expect("tempdir");
+    let exe = writable_install(dir.path());
+    let beside = exe.with_file_name("dot-agent-deck-collector");
+    old_collector(&beside);
+    let log = dir.path().join("systemctl.log");
+    stand_in_systemctl(dir.path(), &beside, &log);
+
+    let out = run_upgrade(&server, &exe, dir.path(), &["--yes"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("A resource collector (dot-agent-deck-collector) from a release in the same folder is upgraded to v9.9.9 too"),
+        "the plan said so before confirming\n{stdout}"
+    );
+    assert_eq!(std::fs::read(&beside).unwrap(), collector, "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "Upgraded the resource collector at {} from v{OLD_VERSION} to v{RELEASE}, checked the same way.",
+            beside.display()
+        )),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "Restarted the {COLLECTOR_SERVICE} user service, so it now runs v{RELEASE}."
+        )),
+        "{stdout}"
+    );
+    let ran = invocations(&log);
+    assert_eq!(
+        ran.last().map(String::as_str),
+        Some(format!("--user try-restart {COLLECTOR_SERVICE}").as_str()),
+        "{ran:?}"
+    );
+}
+
+/// Scenario: Run `dot-agent-deck upgrade --yes` as an old copy in a writable folder with no collector in it and none on PATH. The CLI is upgraded, no collector is created, and the output says there was none to upgrade.
+#[spec("upgrade/cli-upgrade/010")]
+#[test]
+fn cli_upgrade_010_no_collector_beside_the_cli_installs_none() {
+    let Some((server, _)) = release_with_collector() else {
+        return;
+    };
+    let dir = common::harness_tempdir().expect("tempdir");
+    let exe = writable_install(dir.path());
+    let beside = exe.with_file_name("dot-agent-deck-collector");
+
+    let out = run_upgrade(&server, &exe, dir.path(), &["--yes"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert!(
+        stdout.contains(&format!("Upgraded {} to v{RELEASE}.", exe.display())),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "No resource collector (dot-agent-deck-collector) is in {}, so none was upgraded.",
+            exe.parent().unwrap().display()
+        )),
+        "{stdout}"
+    );
+    assert!(!beside.exists(), "the upgrade must not install a collector");
+}
+
+/// Scenario: Run `dot-agent-deck upgrade --yes` as an old copy in a writable folder, with an old collector in another folder that is on PATH and none beside the CLI. The CLI is upgraded; the other collector is named, left byte for byte as it was, and the output says to upgrade it the way it was installed.
+#[spec("upgrade/cli-upgrade/011")]
+#[test]
+fn cli_upgrade_011_a_collector_elsewhere_on_path_is_left_alone() {
+    let Some((server, _)) = release_with_collector() else {
+        return;
+    };
+    let dir = common::harness_tempdir().expect("tempdir");
+    let exe = writable_install(dir.path());
+    let bin = dir.path().join("sandbox-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let elsewhere = bin.join("dot-agent-deck-collector");
+    let old = old_collector(&elsewhere);
+
+    let out = run_upgrade(&server, &exe, dir.path(), &["--yes"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "The resource collector first on your PATH, {}, v{OLD_VERSION}, is not in the upgraded CLI's folder, so it was left as it is.",
+            elsewhere.display()
+        )),
+        "{stdout}"
+    );
+    assert_eq!(std::fs::read(&elsewhere).unwrap(), old, "left alone");
+    assert!(!exe.with_file_name("dot-agent-deck-collector").exists());
+}
+
+/// Scenario: Run `dot-agent-deck upgrade --yes` as an old copy in a folder the user cannot write, which also holds an old release collector. Both downloads are checked and staged, the collector is left as it was, and the output gives the command that installs the staged collector over it and says a running collector keeps its old version until restarted.
+#[spec("upgrade/cli-upgrade/012")]
+#[test]
+fn cli_upgrade_012_a_collector_in_a_read_only_folder_is_staged_with_its_command() {
+    use std::os::unix::fs::PermissionsExt;
+    if common::effective_uid() == 0 {
+        println!("SKIP: root can write any folder, so nothing is staged");
+        return;
+    }
+    let Some((server, _)) = release_with_collector() else {
+        return;
+    };
+    let dir = common::harness_tempdir().expect("tempdir");
+    let exe = writable_install(dir.path());
+    let beside = exe.with_file_name("dot-agent-deck-collector");
+    let old = old_collector(&beside);
+    let bin = exe.parent().unwrap().to_path_buf();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let out = run_upgrade(&server, &exe, dir.path(), &["--yes"]);
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert_eq!(std::fs::read(&beside).unwrap(), old, "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "Downloaded and checked v{RELEASE} of the resource collector at {}, which you cannot write to.",
+            beside.display()
+        )),
+        "{stdout}"
+    );
+    let install = stdout
+        .lines()
+        .find(|line| {
+            line.contains("sudo install -m 0755")
+                && line.ends_with(&format!(" {}", beside.display()))
+        })
+        .unwrap_or_else(|| panic!("the collector's install command\n{stdout}"));
+    assert!(install.contains("sha256sum -c -"), "{install}");
+    assert!(
+        stdout.contains(
+            "Once it is installed, a collector that was already running from it keeps running"
+        ),
+        "{stdout}"
+    );
+}
+
+/// Scenario: Start the TUI as an old copy in a writable folder that also holds an old release collector, with a stand-in `systemctl` reporting the collector's service running it. The dialog's plan says the collector moves too; choosing Upgrade replaces the CLI and the collector with the served release, and the dialog says the collector was upgraded and its service restarted.
+#[spec("upgrade/tui-upgrade/004")]
+#[test]
+fn tui_upgrade_004_the_dialog_upgrades_the_collector_beside_the_cli() {
+    let Some((server, collector)) = release_with_collector() else {
+        return;
+    };
+    let dir = common::harness_tempdir().expect("tempdir");
+    let exe = writable_install(dir.path());
+    let beside = exe.with_file_name("dot-agent-deck-collector");
+    old_collector(&beside);
+    let log = dir.path().join("systemctl.log");
+    stand_in_systemctl(dir.path(), &beside, &log);
+
+    let deck = deck(&server, &exe, dir.path(), &[]);
+    deck.wait_for_string("u to upgrade");
+    deck.send_keys(b"u");
+    deck.wait_for_string(&format!("Upgrade to v{RELEASE}"));
+    deck.wait_for_string("A resource collector (dot-agent-deck-collector)");
+    deck.send_keys(b"\x1b[B");
+    deck.wait_for_string("> Upgrade");
+    deck.send_keys(b"\r");
+    assert!(
+        wait_for_file(&beside, &collector, Duration::from_secs(60)),
+        "the confirmed upgrade must replace {} with the served collector\n{}",
+        beside.display(),
+        deck.snapshot_grid()
+    );
+    deck.wait_for_string("Upgraded the resource collector");
+    deck.wait_for_string("Restarted the dot-agent-deck-collector.service");
+    let ran = invocations(&log);
+    assert!(
+        ran.iter()
+            .any(|line| line == &format!("--user try-restart {COLLECTOR_SERVICE}")),
+        "{ran:?}"
     );
 }
