@@ -535,7 +535,7 @@ enum AntigravityInbox {
     Nothing,
     /// Print this doorbell answer, then report the event as usual.
     #[cfg(unix)]
-    Print(HookOutput),
+    Print(Box<HookOutput>),
     /// Hand this over as the `Stop`'s continue; one written and flushed whole
     /// goes on with the turn and reports nothing.
     #[cfg(unix)]
@@ -608,7 +608,9 @@ fn antigravity_inbox_hooks(
                         None,
                     )
                 })
-                .map_or(AntigravityInbox::Nothing, AntigravityInbox::Print)
+                .map_or(AntigravityInbox::Nothing, |output| {
+                    AntigravityInbox::Print(Box::new(output))
+                })
         }
         #[cfg(unix)]
         Some("Stop") if antigravity_stop_may_continue(&payload) => {
