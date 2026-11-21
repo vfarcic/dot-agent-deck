@@ -28,14 +28,14 @@ export interface SelfUpgradeLine {
 }
 
 /** Whether build provenance will be checked for a plan, said before Upgrade. */
-export interface SelfUpgradeProvenance {
+interface SelfUpgradeProvenance {
   checked: boolean;
   /** Why not, when it will not be. */
   reason: string | null;
 }
 
 /** The crate's `PlanAction`, kebab-case. */
-export type SelfUpgradeAction =
+type SelfUpgradeAction =
   | "up-to-date"
   | "notify-only"
   | "show-command"

@@ -786,6 +786,7 @@ mod tests {
                 },
                 kind,
                 dispatched_at_ms: 1,
+                existing_dir: false,
             });
         }
         let run = |pane: &str, agent: &str, orchestration: Option<&str>| tracker::RunGeneration {

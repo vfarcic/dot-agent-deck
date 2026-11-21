@@ -21,8 +21,8 @@ expression: shown
  │  j/k scroll · c dismiss · Esc to close                                     │ 
  └────────────────────────────────────────────────────────────────────────────┘ 
                                                                                 
+                                                                                
 The deck restarted; these agents were stopped: nightly-dependency-upgrade-for-th
                                                           [Agents a] [Dismiss c]
- COMMAND  [Command Mode Ctrl+D] [New Agent Ctrl+N] [Close Ctrl+W]               
-[Toggle Layout Ctrl+T] [Help ?] [Quit Ctrl+C] [Filter /] [Rename r] [Generate g]
-[Schedules s]
+ COMMAND  [Command Mode Ctrl+D] [New Agent Ctrl+N] [Close Ctrl+W] [Help ?]      
+[Quit Ctrl+C] [Filter /] [Rename r] [Generate g] [Schedules s]

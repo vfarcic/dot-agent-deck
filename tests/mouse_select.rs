@@ -2,8 +2,8 @@
 //! selects in, where the highlight is drawn, how long it stays, and that it
 //! never shows text other than what was copied.
 //!
-//! Driven through `PaneSelectionSeam`, which tiles inert panes over a
-//! `TestBackend` frame and feeds mouse reports and keys to the functions the
+//! Driven through `PaneSelectionSeam`, which stacks inert panes in a
+//! `TestBackend` frame (only the focused one drawn, as on the dashboard) and feeds mouse reports and keys to the functions the
 //! live event loop calls. Copies are collected by the seam, never delivered,
 //! so no test here reaches a clipboard.
 
@@ -18,10 +18,11 @@ use spec::spec;
 const LEFT_PANE: &[u8] = b"alpha-left-text";
 const RIGHT_PANE: &[u8] = b"bravo-right-text";
 
-/// Two panes, `a` and `b`, tiled over a 40x12 frame, with `focused` focused.
+/// Two panes, `a` and `b`, stacked in a 40x12 frame, with `focused` focused:
+/// only `focused` is drawn, over the whole frame (PRD #311, #312).
 fn two_panes(focused: &str) -> PaneSelectionSeam {
     let mut seam =
-        PaneSelectionSeam::tiled(40, 12, &[("a", LEFT_PANE), ("b", RIGHT_PANE)], focused);
+        PaneSelectionSeam::stacked(40, 12, &[("a", LEFT_PANE), ("b", RIGHT_PANE)], focused);
     seam.render();
     seam
 }
@@ -114,20 +115,21 @@ fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
 
-/// Scenario: Two panes are tiled and the first is focused. A left press in the second pane focuses it and starts a selection there in the same gesture, and dragging along its first row highlights exactly those cells of that pane, never the previously focused one.
+/// Scenario: Two panes are stacked and the second is focused, so it is the one drawn, over the whole frame. A left press in it starts a selection, and dragging along its first row highlights exactly those cells of that pane; the first pane, not drawn, shows no highlight anywhere.
 #[spec("mouse/select/002")]
 #[test]
-fn select_002_a_press_in_a_non_focused_pane_focuses_it_and_selects_there() {
-    let mut seam = two_panes("a");
+fn select_002_a_drag_in_the_drawn_pane_highlights_only_that_pane() {
+    let mut seam = two_panes("b");
     let a = seam.pane_rect("a");
     let b = seam.pane_rect("b");
+    assert_eq!(a.height, 0, "the pane that is not focused is not drawn");
     let (x, y) = first_cell(b);
 
     press(&mut seam, x, y);
     assert_eq!(
         seam.focused_pane_id().as_deref(),
         Some("b"),
-        "a press in a pane that is not focused must focus it"
+        "a press in the drawn pane keeps it focused"
     );
     drag(&mut seam, x + 4, y);
     let buf = seam.render();
@@ -139,14 +141,14 @@ fn select_002_a_press_in_a_non_focused_pane_focuses_it_and_selects_there() {
         "the highlight must be on the pane the drag was made in ({b:?}), got {cells:?}"
     );
     assert!(
-        !cells.iter().any(|&cell| inside_content(a, cell)),
-        "the highlight must not be on the previously focused pane"
+        !frame_with_highlight(&buf).contains("alpha"),
+        "the pane that is not focused must not be drawn"
     );
     assert_eq!(highlighted_text(&buf), "bravo");
     insta::assert_snapshot!(frame_with_highlight(&buf));
 }
 
-/// Scenario: A drag across the second pane's first word copies `bravo` and the highlight stays on screen after the release. Each of these then removes it: the next mouse press, a key typed into that pane, a tab switch, and that pane closing. Esc typed into the pane goes to its program and leaves the highlight in place.
+/// Scenario: Of two panes, the second is focused and drawn. A drag across its first word copies `bravo` and the highlight stays on screen after the release. Each of these then removes it: the next mouse press, a key typed into that pane, a tab switch, and that pane closing. Esc typed into the pane goes to its program and leaves the highlight in place.
 #[spec("mouse/select/003")]
 #[test]
 fn select_003_a_drag_selection_stays_until_something_clears_it() {
@@ -160,15 +162,15 @@ fn select_003_a_drag_selection_stays_until_something_clears_it() {
         "the highlight must stay after the drag is released"
     );
 
-    // The next mouse press clears it, wherever it lands.
-    let (ax, ay) = first_cell(seam.pane_rect("a"));
+    // The next mouse press clears it, wherever it lands — here on another row
+    // of the same pane.
     let b = seam.pane_rect("b");
+    let (ax, ay) = (b.x + 1, b.y + 3);
+    let bravo_row = b.y + 1;
     press(&mut seam, ax, ay);
     let buf = seam.render();
     assert!(
-        !highlighted(&buf)
-            .iter()
-            .any(|&cell| inside_content(b, cell)),
+        !highlighted(&buf).iter().any(|&(_, y)| y == bravo_row),
         "the next press must clear the selection:\n{}",
         frame_with_highlight(&buf)
     );
@@ -328,7 +330,7 @@ fn triple_click(seam: &mut PaneSelectionSeam, col: u16, row: u16) {
 fn select_007_a_screen_larger_than_its_pane_copies_what_is_drawn() {
     // Taller and wider: the cursor is on row 19, far below the drawn rows.
     let tall = wide_lines(20);
-    let mut seam = PaneSelectionSeam::tiled_with_screen(30, 8, &[("a", &tall)], "a", 20, 50);
+    let mut seam = PaneSelectionSeam::stacked_with_screen(30, 8, &[("a", &tall)], "a", 20, 50);
     seam.render();
     let (x, y) = first_cell(seam.pane_rect("a"));
     press(&mut seam, x, y);
@@ -345,7 +347,7 @@ fn select_007_a_screen_larger_than_its_pane_copies_what_is_drawn() {
     // As tall as the pane, only wider: the rows already line up, so this is
     // the columns alone.
     let six = wide_lines(6);
-    let mut seam = PaneSelectionSeam::tiled_with_screen(30, 8, &[("a", &six)], "a", 6, 50);
+    let mut seam = PaneSelectionSeam::stacked_with_screen(30, 8, &[("a", &six)], "a", 6, 50);
     seam.render();
     let (x, y) = first_cell(seam.pane_rect("a"));
     press(&mut seam, x + 4, y);
@@ -372,7 +374,7 @@ fn select_007_a_screen_larger_than_its_pane_copies_what_is_drawn() {
         "a triple-click on a paragraph wider than the pane",
     );
 
-    let mut seam = PaneSelectionSeam::tiled_with_screen(30, 8, &[("a", &tall)], "a", 20, 50);
+    let mut seam = PaneSelectionSeam::stacked_with_screen(30, 8, &[("a", &tall)], "a", 20, 50);
     seam.render();
     triple_click(&mut seam, x + 6, y + 1);
     assert_highlight_is_the_copy(
@@ -398,7 +400,7 @@ fn select_008_a_selection_over_the_command_banner_or_a_notice_shows_the_pane_tex
     let expected = lines.join("\n");
 
     for overlay in ["the COMMAND MODE banner", "the cannot-scroll notice"] {
-        let mut seam = PaneSelectionSeam::tiled(44, 9, &[("a", &bytes)], "a");
+        let mut seam = PaneSelectionSeam::stacked(44, 9, &[("a", &bytes)], "a");
         if overlay == "the COMMAND MODE banner" {
             seam.command_mode(true);
         } else {
@@ -428,14 +430,19 @@ fn select_008_a_selection_over_the_command_banner_or_a_notice_shows_the_pane_tex
     }
 }
 
-/// Scenario: In the stacked layout, the one drawn pane's screen is larger than the pane, and a drag on its first drawn row copies exactly the highlighted text. Separately, a frame resize after a copy (the pane's screen not resized yet) never leaves a highlight showing anything other than what was copied.
+/// Scenario: Of two stacked panes, the one drawn has a screen larger than the pane, and a drag on its first drawn row copies exactly the highlighted text. Separately, a frame resize after a copy (the pane's screen not resized yet) never leaves a highlight showing anything other than what was copied.
 #[spec("mouse/select/009")]
 #[test]
 fn select_009_stacked_and_resized_panes_copy_and_show_the_same_text() {
     let tall = wide_lines(20);
-    let mut seam =
-        PaneSelectionSeam::tiled_with_screen(30, 12, &[("a", b"other"), ("b", &tall)], "b", 20, 50);
-    seam.stack();
+    let mut seam = PaneSelectionSeam::stacked_with_screen(
+        30,
+        12,
+        &[("a", b"other"), ("b", &tall)],
+        "b",
+        20,
+        50,
+    );
     seam.render();
     let (x, y) = first_cell(seam.pane_rect("b"));
     press(&mut seam, x, y);
@@ -503,7 +510,7 @@ fn select_010_a_drag_over_wide_glyphs_copies_what_it_highlights() {
         ),
     ];
     for (what, from, to, expected) in cases {
-        let mut seam = PaneSelectionSeam::tiled(40, 8, &[("a", "你AB 漢字x".as_bytes())], "a");
+        let mut seam = PaneSelectionSeam::stacked(40, 8, &[("a", "你AB 漢字x".as_bytes())], "a");
         seam.render();
         let (x, y) = first_cell(seam.pane_rect("a"));
         press(&mut seam, x + from, y);
@@ -548,7 +555,7 @@ fn select_010_a_drag_over_joined_emoji_and_flags_copies_what_it_highlights() {
         ("the letters after a flag", "🇺🇸AB", 2, 3, "AB"),
     ];
     for (what, text, from, to, expected) in cases {
-        let mut seam = PaneSelectionSeam::tiled(40, 8, &[("a", text.as_bytes())], "a");
+        let mut seam = PaneSelectionSeam::stacked(40, 8, &[("a", text.as_bytes())], "a");
         seam.render();
         let (x, y) = first_cell(seam.pane_rect("a"));
         press(&mut seam, x + from, y);
@@ -613,7 +620,7 @@ fn select_010_a_drag_from_or_to_either_half_of_a_wide_glyph_highlights_what_it_c
         ),
     ];
     for (what, text, from, to, expected) in cases {
-        let mut seam = PaneSelectionSeam::tiled(40, 8, &[("a", text.as_bytes())], "a");
+        let mut seam = PaneSelectionSeam::stacked(40, 8, &[("a", text.as_bytes())], "a");
         seam.render();
         let (x, y) = first_cell(seam.pane_rect("a"));
         press(&mut seam, x + from, y);
@@ -631,10 +638,10 @@ fn select_010_a_drag_from_or_to_either_half_of_a_wide_glyph_highlights_what_it_c
     }
 }
 
-/// Two orchestration role panes, `a` focused, drawn by a whole frame of the
-/// orchestration tab.
+/// Two orchestration role panes, `b` focused and so the one drawn, by a whole
+/// frame of the orchestration tab.
 fn orchestration_panes() -> PaneSelectionSeam {
-    let mut seam = PaneSelectionSeam::tiled(60, 16, &[("a", LEFT_PANE), ("b", RIGHT_PANE)], "a")
+    let mut seam = PaneSelectionSeam::stacked(60, 16, &[("a", LEFT_PANE), ("b", RIGHT_PANE)], "b")
         .on_orchestration_tab();
     let buf = seam.render_frame();
     assert!(
@@ -645,7 +652,7 @@ fn orchestration_panes() -> PaneSelectionSeam {
     seam
 }
 
-/// Scenario: Two orchestration panes are drawn on their tab, then the user switches to the dashboard, which draws no pane while both keep running. A drag over blank dashboard space where the second pane used to be copies nothing and focuses no pane; and a drag already under way in a dashboard pane when that pane moves to an orchestration copies nothing on release.
+/// Scenario: An orchestration's focused role pane is drawn on its tab, then the user switches to the dashboard, which draws no pane while both role panes keep running. A drag over blank dashboard space where that pane used to be copies nothing and changes no focus; and a drag already under way in a dashboard pane when that pane moves to an orchestration copies nothing on release.
 #[spec("mouse/select/012")]
 #[test]
 fn select_012_a_frame_with_no_pane_leaves_nothing_to_select() {
@@ -671,7 +678,7 @@ fn select_012_a_frame_with_no_pane_leaves_nothing_to_select() {
     );
     assert_eq!(
         seam.focused_pane_id().as_deref(),
-        Some("a"),
+        Some("b"),
         "no focus change"
     );
     let buf = seam.render_frame();
@@ -682,7 +689,7 @@ fn select_012_a_frame_with_no_pane_leaves_nothing_to_select() {
     );
 
     // A drag under way when its pane stops being drawn.
-    let mut seam = PaneSelectionSeam::tiled(60, 16, &[("a", LEFT_PANE), ("b", RIGHT_PANE)], "a");
+    let mut seam = PaneSelectionSeam::stacked(60, 16, &[("a", LEFT_PANE), ("b", RIGHT_PANE)], "b");
     seam.render_frame();
     let rect = seam.drawn_pane_rect("b").expect("the dashboard drew `b`");
     let (x, y) = first_cell(rect);

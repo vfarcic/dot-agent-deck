@@ -4,7 +4,7 @@
 //! only manifest through the full spawned-binary layout/resize pipeline.
 //!
 //! Each test spawns the real `dot-agent-deck` binary inside an isolated PTY,
-//! drives a layout-changing event (terminal enlarge, layout toggle, pane
+//! drives a layout-changing event (terminal enlarge, zoom toggle, pane
 //! close), and asserts a render-contract invariant on the
 //! settled grid through the `vt100` parser. No LLM tokens are spent — panes
 //! run `sleep` or the fixture's synthetic orchestration roles.
@@ -12,7 +12,7 @@
 //! IMPORTANT (PRD #84, and the PRD's own "race-y resize timing" note): these
 //! reproducers were written against the PRE-M4 (pre-rework) code, which
 //! resized every embedded pane's PTY on *every* layout-change path
-//! (`Event::Resize`, `Action::ToggleLayout` → `resize_*_panes`, tab
+//! (`Event::Resize`, the since-removed layout toggle → `resize_*_panes`, tab
 //! open/close). In that pre-rework state the scramble /
 //! empty-band symptoms were transient one-frame races that self-healed once
 //! the path's resize fired, and so were NOT deterministically observable
@@ -91,17 +91,16 @@ fn render_001_enlarge_fills_new_width() {
 /// Scenario: Launch the deck at 120×32 with a `--continue` pane running
 /// `sleep 600`, detach to the dashboard (Ctrl+D → Normal mode), and confirm
 /// the restored No-agent pane's card body (`Launch an agent`) is rendered.
-/// Toggle the dashboard pane layout with `Ctrl+t` (stacked ↔ tiled), waiting
-/// for the `Layout:` status to acknowledge the toggle. After the layout change
-/// the pane's representation must stay intact — its card body is still
-/// rendered, not dropped and not overwritten by a stale fragment of the
-/// pre-toggle layout. Invariant guard (riskiest catalog entry): the bottom-row
-/// scramble the PRD describes is transient (the toggle path resizes panes via
-/// `resize_*_panes`), so this pins the observable "pane survives a layout
+/// Zoom the dashboard with `z` and unzoom it with `z` again, waiting for the
+/// `Zoom: on` and `Zoom: off` status messages. After the layout change the
+/// pane's representation must stay intact — its card body is rendered again,
+/// not dropped and not overwritten by a stale fragment of the zoomed layout. Invariant guard (riskiest catalog entry): the bottom-row
+/// scramble the PRD describes is transient (the resize pass sizes panes from
+/// the new layout), so this pins the observable "pane survives a layout
 /// change intact" invariant; GREEN target at M4/M5.
 #[spec("render/layout/001")]
 #[test]
-fn layout_001_toggle_layout_keeps_pane_intact() {
+fn layout_001_layout_change_keeps_pane_intact() {
     // PRD #127: 200 cols so the Normal-mode bar renders the FULL labeled
     // `[New Agent n/Ctrl+N]` (at the default 120 it collapses to `[Ctrl+N]`
     // chips once the always-shown Schedules button is included).
@@ -115,12 +114,16 @@ fn layout_001_toggle_layout_keeps_pane_intact() {
     // The restored No-agent pane's card body anchors the assertion.
     deck.wait_for_string("Launch an agent");
 
-    // Toggle the dashboard pane layout.
-    deck.send_bytes(b"\x14"); // Ctrl+t → ToggleLayout
-    deck.wait_for_string("Layout:"); // toggle acknowledged
+    // Change the dashboard's layout: zoom it, then unzoom it. PRD #312
+    // removed the stacked/tiled toggle (`Ctrl+t`) this used to press; zoom is
+    // the layout change left on the dashboard.
+    deck.send_bytes(b"z");
+    deck.wait_for_string("Zoom: on");
+    deck.send_bytes(b"z");
+    deck.wait_for_string("Zoom: off");
 
     // Invariant: the pane card body is still rendered after the layout change.
-    deck.wait_until_grid("pane card intact after layout toggle", |g| {
+    deck.wait_until_grid("pane card intact after layout change", |g| {
         g.contains("Launch an agent")
     });
 }

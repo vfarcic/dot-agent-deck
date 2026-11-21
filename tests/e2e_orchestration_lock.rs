@@ -276,10 +276,10 @@ fn lock_009_ctrl_e_scoped_to_command_mode_on_real_panes() {
 }
 
 /// Scenario: Open a real orchestration tab, focus the non-orchestrator
-/// "worker" role while the deck is LOCKED, then press `Ctrl+t`
-/// (`toggle_layout`) and confirm it still fires and surfaces its `Layout: …`
-/// status message — global chords resolve before the PTY-forward fallback the
-/// lock gates. Regression guard against an overly-broad gate implementation.
+/// "worker" role while the deck is LOCKED, then press `Ctrl+n` (`new_pane`)
+/// and confirm it still fires and opens the New Agent directory picker — global chords
+/// resolve before the PTY-forward fallback the lock gates. Regression guard
+/// against an overly-broad gate implementation.
 #[spec("orchestration/lock/010")]
 #[test]
 fn lock_010_global_chord_unaffected_by_lock_state() {
@@ -295,8 +295,9 @@ fn lock_010_global_chord_unaffected_by_lock_state() {
     // Focus the non-orchestrator worker role — still LOCKED, the default.
     focus_worker_role(&deck);
 
-    deck.send_bytes(b"\x14"); // Ctrl+t (toggle_layout)
-    deck.wait_for_string("Layout:");
+    // PRD #312 removed `toggle_layout`, the chord this used to press.
+    deck.send_bytes(b"\x0e"); // Ctrl+n (new_pane)
+    deck.wait_for_string("Select Directory");
 }
 
 /// The `orch-deck` / `orch-lock-live` fixtures' worker role pane's full daemon

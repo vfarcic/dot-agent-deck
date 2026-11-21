@@ -155,6 +155,30 @@ pub fn list_targets_response(cwd: Option<&Path>) -> crate::event::ListTargetsRes
     }
 }
 
+/// PRD #468: [`list_targets_response`] for `--list-targets --dir <path>` —
+/// the targets of that directory's config, which is the one a
+/// `dispatch --dir <path>` resolves from. A path that is not absolute or not an
+/// existing directory is reported as an error rather than listed as having no
+/// orchestrations.
+pub fn list_targets_response_for_dir(dir: &str) -> crate::event::ListTargetsResponse {
+    let checked = if Path::new(dir).is_absolute() {
+        resolve_existing_dir(Path::new(dir))
+    } else {
+        Err(format!("--dir {dir}: the daemon needs an absolute path"))
+    };
+    match checked {
+        Ok(dir) => list_targets_response(Some(&dir)),
+        Err(e) => crate::event::ListTargetsResponse {
+            rendered: format!(
+                "Could not list the targets of that directory, so its orchestrations are \
+                 unknown:\n  {e}\n"
+            ),
+            orchestrations: Vec::new(),
+            error: Some(e),
+        },
+    }
+}
+
 /// The command a single-agent dispatch runs.
 ///
 /// `SpawnRequest.command: None` means `$SHELL` in the spawn path, so passing None
@@ -676,6 +700,184 @@ async fn create_dispatch_worktree(
     .await
 }
 
+/// PRD #468: a `dispatch --dir <path>` target as an absolute, symlink-free
+/// path, refused unless it names an existing directory. The CLI calls it
+/// against its own working directory before sending; the daemon calls it again
+/// on the path it receives, which the CLI made absolute.
+pub fn resolve_existing_dir(path: &Path) -> Result<PathBuf, String> {
+    if path.as_os_str().is_empty() {
+        return Err("--dir needs a path; use `--dir .` for the directory you are in".to_string());
+    }
+    let dir = std::fs::canonicalize(path).map_err(|e| format!("--dir {}: {e}", path.display()))?;
+    if !dir.is_dir() {
+        return Err(format!("--dir {}: not a directory", path.display()));
+    }
+    Ok(dir)
+}
+
+/// PRD #468: a checked `--dir` target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExistingDir {
+    /// The target with every symlink resolved: what the interlock and the
+    /// config read compare against and read from.
+    canonical: PathBuf,
+    /// Where the unit is rooted: the spelling of a worktree the deck records
+    /// for removal that names the same directory, else [`Self::canonical`].
+    /// The removal guards compare a recorded worktree with the agents rooted in
+    /// it by spelling, so a unit rooted at another spelling of the same
+    /// directory would not hold it against that worktree's cleanup, and the
+    /// last close of the earlier unit could remove the directory under it
+    /// (Qodo on PR #2424; a symlinked parent such as macOS `/var`).
+    spawn_at: PathBuf,
+}
+
+/// PRD #468: check the `--dir` value the daemon received and choose where the
+/// unit is rooted ([`ExistingDir`]). Blocking: it canonicalizes paths.
+fn place_in_existing_dir(dir: &str, recorded: &[PathBuf]) -> Result<ExistingDir, String> {
+    if !Path::new(dir).is_absolute() {
+        return Err(format!("--dir {dir}: the daemon needs an absolute path"));
+    }
+    let canonical = resolve_existing_dir(Path::new(dir))?;
+    let spawn_at = recorded
+        .iter()
+        .find(|worktree| std::fs::canonicalize(worktree).is_ok_and(|c| c == canonical))
+        .cloned()
+        .unwrap_or_else(|| canonical.clone());
+    Ok(ExistingDir {
+        canonical,
+        spawn_at,
+    })
+}
+
+/// The most coordination files the interlock's refusal names; the rest are
+/// counted.
+const MAX_NAMED_COORDINATION_FILES: usize = 5;
+
+/// PRD #468: the interlock's verdict on a `--dir` target — `Some(reason)` when
+/// the dispatch must be refused because other live agents already work there.
+///
+/// Two units in one directory share its coordination files (the workers'
+/// `work-done-<role>.md`, its `.dot-agent-deck/` sweep) and an orchestration's
+/// identity, which is keyed by directory (#156), so a second one is refused
+/// rather than allowed to overwrite the first one's. "Live"
+/// comes from the daemon's own records, not from the files: a finished
+/// orchestration leaves its files behind, and refusing on those would refuse
+/// exactly the continuation `--dir` exists for.
+///
+/// The caller does not count against its own directory when it is a single
+/// agent, since `--dir .` from a single agent is the in-place continuation the
+/// PRD describes. A caller that is a role of an orchestration rooted there
+/// does count: its orchestration's coordination files are the ones a second
+/// unit would overwrite.
+///
+/// `canonical` resolves a recorded directory the way [`resolve_existing_dir`]
+/// resolved `dir`, so a record spelled through a symlink still matches.
+fn occupied_dir_refusal(
+    records: &[crate::agent_pty::AgentRecord],
+    dir: &Path,
+    caller_agent_id: Option<&str>,
+    canonical: impl Fn(&Path) -> PathBuf,
+) -> Option<String> {
+    use crate::agent_pty::TabMembership;
+    let occupants: Vec<&crate::agent_pty::AgentRecord> = records
+        .iter()
+        .filter(|r| {
+            let caller_as_single = caller_agent_id == Some(r.id.as_str())
+                && !matches!(r.tab_membership, Some(TabMembership::Orchestration { .. }));
+            !caller_as_single
+        })
+        .filter(|r| {
+            crate::issue_dispatch_run::worktree_of_record(r)
+                .is_some_and(|rooted| canonical(&rooted) == dir)
+        })
+        .collect();
+    if occupants.is_empty() {
+        return None;
+    }
+    let mut names: Vec<String> = occupants
+        .iter()
+        .map(|r| {
+            let label = r
+                .display_name
+                .clone()
+                .or_else(|| r.pane_id_env.clone())
+                .unwrap_or_else(|| r.id.clone());
+            crate::config_validation::escape_field_for_log(
+                &label,
+                crate::config_validation::MAX_QUOTED_VALUE_CHARS,
+            )
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    let files = coordination_files_in(dir);
+    let files_clause = if files.is_empty() {
+        String::new()
+    } else {
+        format!(", and it holds {}", files.join(", "))
+    };
+    Some(format!(
+        "{dir} already holds a live agent's coordination files: {count} other live agent(s) \
+         work there ({names}){files_clause}. Two units in one directory overwrite each other's \
+         coordination files, so this dispatch was refused and nothing was started. Wait for \
+         them to finish and close them, or dispatch without --dir to start in a new worktree.",
+        dir = dir.display(),
+        count = occupants.len(),
+        names = names.join(", "),
+    ))
+}
+
+/// The coordination files `dir/.dot-agent-deck/` holds, for the interlock's
+/// refusal: the orchestrator context files (`orchestrator-context-<hex>.md`,
+/// and the fixed name an older deck wrote) and each `work-done-<role>.md`,
+/// sorted, at most [`MAX_NAMED_COORDINATION_FILES`] named.
+fn coordination_files_in(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir.join(".dot-agent-deck")) else {
+        return Vec::new();
+    };
+    let mut found: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|name| {
+            name.ends_with(".md")
+                && (name == crate::orchestrator_context::CONTEXT_FILE_NAME
+                    || name.starts_with(crate::orchestrator_context::CONTEXT_FILE_PREFIX)
+                    || name.starts_with("work-done-"))
+        })
+        .collect();
+    found.sort();
+    let total = found.len();
+    let mut named: Vec<String> = found
+        .into_iter()
+        .take(MAX_NAMED_COORDINATION_FILES)
+        .map(|name| {
+            format!(
+                ".dot-agent-deck/{}",
+                crate::config_validation::escape_field_for_log(
+                    &name,
+                    crate::config_validation::MAX_QUOTED_VALUE_CHARS,
+                )
+            )
+        })
+        .collect();
+    if total > MAX_NAMED_COORDINATION_FILES {
+        named.push(format!("{} more", total - MAX_NAMED_COORDINATION_FILES));
+    }
+    named
+}
+
+/// PRD #468: the branch checked out in a `--dir` target, for the reply and the
+/// unit's record. `None` when it is not a git checkout, is detached, or git
+/// could not answer — a label, so a failed probe only drops it.
+async fn checked_out_branch(dir: &Path) -> Option<String> {
+    let dir = dir.to_string_lossy();
+    let head = run_git_capture(&["-C", &dir, "rev-parse", "--abbrev-ref", "HEAD"])
+        .await
+        .ok()?;
+    let head = head.trim();
+    (!head.is_empty() && head != "HEAD").then(|| head.to_string())
+}
+
 /// Whether `dir` is the top of its git working tree — where a unit cut from it
 /// starts. A probe that fails answers `false`, which only withholds the
 /// dispatcher's relative command from the unit.
@@ -926,6 +1128,7 @@ fn dispatch_prompt(
 /// [`crate::spawn::post_seed`]), and nothing confirms the agent read it.
 pub const SPAWNED_OPENING: &str = "dispatch: spawned isolated";
 
+/// [`handle_dispatch_at`] with no `--dir`: the unit gets a new worktree.
 pub async fn handle_dispatch(
     ctx: &DispatchContext,
     name: &str,
@@ -933,10 +1136,75 @@ pub async fn handle_dispatch(
     shape: Option<&crate::event::DispatchShape>,
     launch: LaunchChoice<'_>,
 ) -> DispatchResult {
+    handle_dispatch_at(ctx, name, task, shape, launch, None).await
+}
+
+/// Start a dispatched unit.
+///
+/// `dir` is PRD #468's `dispatch --dir`, the absolute path the CLI resolved.
+/// `None` cuts a new worktree from the caller's `HEAD` and records it for
+/// removal when the unit closes, as every dispatch did before. `Some` starts
+/// the unit in that existing directory: it creates no worktree, records
+/// nothing for removal (so no close removes it on this dispatch's account),
+/// reads the orchestration config from that directory, and is refused when
+/// other live agents already work there ([`occupied_dir_refusal`]).
+pub async fn handle_dispatch_at(
+    ctx: &DispatchContext,
+    name: &str,
+    task: &str,
+    shape: Option<&crate::event::DispatchShape>,
+    launch: LaunchChoice<'_>,
+    dir: Option<&str>,
+) -> DispatchResult {
     let paths = derive_dispatch_paths(&ctx.working_dir, name);
     let clone_dir = ctx.working_dir.clone();
+    // PRD #468: the existing directory a `--dir` dispatch starts in, checked
+    // before anything else so a bad path costs nothing. The CLI sends it
+    // absolute; a relative one would resolve against the DAEMON's directory,
+    // so it is refused rather than guessed at.
+    // The filesystem checks run off the runtime (Qodo on PR #2424): a slow
+    // or network-mounted path must not hold a runtime worker.
+    let existing = match dir {
+        None => None,
+        Some(dir) => {
+            let raw = dir.to_string();
+            let recorded: Vec<PathBuf> = ctx
+                .worktrees
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .keys()
+                .cloned()
+                .collect();
+            let placed =
+                tokio::task::spawn_blocking(move || place_in_existing_dir(&raw, &recorded))
+                    .await
+                    .unwrap_or_else(|e| Err(format!("--dir {dir}: the check could not run ({e})")));
+            match placed {
+                Ok(placed) => Some(placed),
+                Err(e) => {
+                    return DispatchResult {
+                        worktree_dir: PathBuf::from(dir),
+                        success: false,
+                        message: format!("dispatch: {e}"),
+                        unit_id: None,
+                    };
+                }
+            }
+        }
+    };
+    let existing_dir = existing.as_ref().map(|placed| placed.canonical.clone());
+    // Where the unit runs, and whose config it is resolved from: the new
+    // worktree and the caller's checkout by default, the target directory
+    // itself with `--dir`. Decided for `--dir` on 2026-11-20 (PRD #468 M2):
+    // the target is a live directory whose config the unit will actually run
+    // with, uncommitted edits included, so it is the one that applies.
+    let unit_dir = existing
+        .as_ref()
+        .map(|placed| placed.spawn_at.clone())
+        .unwrap_or_else(|| paths.worktree_dir.clone());
+    let config_dir = existing_dir.clone().unwrap_or_else(|| clone_dir.clone());
     let refuse = |message: String| DispatchResult {
-        worktree_dir: paths.worktree_dir.clone(),
+        worktree_dir: unit_dir.clone(),
         success: false,
         message: format!("dispatch: {message}"),
         unit_id: None,
@@ -954,6 +1222,80 @@ pub async fn handle_dispatch(
         Err(e) => return refuse(e),
     };
     let shape = shape.as_ref();
+
+    // PRD #468 M3: the interlock. A `--dir` target where other live agents
+    // already work is refused before anything is read or started there. The
+    // directory is held in the registry first, until this function returns,
+    // by which time the unit's agents are in the registry the next check
+    // reads: so two `--dir` dispatches into one directory cannot both pass,
+    // and a worktree cleanup counts the directory as in use meanwhile instead
+    // of removing it under the starting unit (Qodo on PR #2424). The hold is
+    // taken on the unit's own spelling, which is what removals compare.
+    let _hold = match &existing_dir {
+        None => None,
+        Some(dir) => {
+            let hold = match ctx.registry.hold_dir_for_dispatch(&unit_dir) {
+                Ok(hold) => hold,
+                Err(crate::agent_pty::DispatchDirRefusal::AlreadyHeld) => {
+                    return refuse(format!(
+                        "another dispatch is starting a unit in {} right now, so this one was \
+                         refused and nothing was started for it. Wait for that dispatch's reply.",
+                        dir.display()
+                    ));
+                }
+                Err(crate::agent_pty::DispatchDirRefusal::BeingRemoved(held)) => {
+                    return refuse(format!(
+                        "{} is being removed (the deck is cleaning up {}), so nothing was \
+                         started there",
+                        dir.display(),
+                        held.display()
+                    ));
+                }
+            };
+            let records = ctx.registry.agent_records_for_worktree_cleanup();
+            // Read after the hold: a removal holding another spelling of the
+            // target (its worktree entry already taken, so the spelling choice
+            // above could not find it) was taken before the hold, and is
+            // caught below by resolving it (Qodo on PR #2424).
+            let removing = ctx.registry.removal_holds();
+            let caller = ctx.caller.as_ref().map(|c| c.agent_id.clone());
+            let target = dir.clone();
+            let refusal = tokio::task::spawn_blocking(move || {
+                if let Some(held) = removing.iter().find(|held| {
+                    std::fs::canonicalize(held).is_ok_and(|held| target.starts_with(held))
+                }) {
+                    return Some(format!(
+                        "{} is being removed (the deck is cleaning up {}), so nothing was \
+                         started there",
+                        target.display(),
+                        held.display()
+                    ));
+                }
+                // A removal that finished before the hold was taken has
+                // already deleted the directory; none can start now.
+                if !target.is_dir() {
+                    return Some(format!(
+                        "--dir {}: the directory no longer exists, so nothing was started",
+                        target.display()
+                    ));
+                }
+                occupied_dir_refusal(&records, &target, caller.as_deref(), |p| {
+                    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+                })
+            })
+            .await
+            .unwrap_or_else(|e| {
+                Some(format!(
+                    "the check for live agents in {} could not run ({e}), so nothing was started",
+                    dir.display()
+                ))
+            });
+            if let Some(refusal) = refusal {
+                return refuse(refusal);
+            }
+            Some(hold)
+        }
+    };
 
     // Resolve the shape from the CALLER's repo config, BEFORE any git work.
     //
@@ -980,11 +1322,18 @@ pub async fn handle_dispatch(
         .and_then(|caller| ctx.registry.configured_launch_of(&caller.agent_id));
     // A unit starts at its worktree's root. A dispatcher started below its
     // repository's root with `./agent.sh` would hand its unit a path that names
-    // nothing there, so such a command is not passed on.
+    // nothing there, so such a command is not passed on. A `--dir` unit starts
+    // in its target, so the path names the same thing only when that is the
+    // dispatcher's own directory.
     if dispatcher_launch
         .as_ref()
         .is_some_and(|d| names_a_relative_path(&d.command))
-        && !starts_at_repository_root(&clone_dir).await
+        && !match &existing_dir {
+            None => starts_at_repository_root(&clone_dir).await,
+            Some(dir) => tokio::fs::canonicalize(&clone_dir)
+                .await
+                .is_ok_and(|caller| &caller == dir),
+        }
     {
         tracing::debug!(
             "dispatch: the caller's command names a relative path and the caller is below the \
@@ -998,7 +1347,7 @@ pub async fn handle_dispatch(
         ctx.default_command.as_deref(),
     );
     let single_command = single_launch.command.clone();
-    let caller_config = crate::spawn::load_config_for_dir(&clone_dir);
+    let caller_config = crate::spawn::load_config_for_dir(&config_dir);
     // Issue #704: when the caller named no orchestration and the config left the
     // choice to file order, the reply says which one was opened and what else was
     // there. This message is written straight into the caller's pane and repeated
@@ -1009,13 +1358,13 @@ pub async fn handle_dispatch(
     let default_note = match shape {
         None | Some(crate::event::DispatchShape::Orchestration { name: None }) => caller_config
             .as_ref()
-            .and_then(|c| crate::project_config::default_orchestration(c, &clone_dir))
+            .and_then(|c| crate::project_config::default_orchestration(c, &config_dir))
             .and_then(|chosen| chosen.diagnostic()),
         _ => None,
     };
     let resolved_target = match crate::spawn::decide_target_with_override(
         caller_config.as_ref(),
-        &clone_dir,
+        &config_dir,
         Some(single_command.as_str()),
         shape_override_of(shape).as_ref(),
     ) {
@@ -1028,14 +1377,7 @@ pub async fn handle_dispatch(
             }
         }
         Ok(t) => t,
-        Err(e) => {
-            return DispatchResult {
-                worktree_dir: paths.worktree_dir.clone(),
-                success: false,
-                message: format!("dispatch: {e}"),
-                unit_id: None,
-            };
-        }
+        Err(e) => return refuse(e.to_string()),
     };
 
     // PRD #1885: a dispatched orchestration runs, unattended, only when its text
@@ -1047,7 +1389,7 @@ pub async fn handle_dispatch(
     // in-deck request this refusal raises.
     if let crate::spawn::SpawnTarget::Orchestration { config, .. } = &resolved_target
         && let Some(refusal) = crate::spawn::approval_refusal(
-            &clone_dir,
+            &config_dir,
             config,
             "dispatch",
             ctx.caller.as_ref().map(|caller| {
@@ -1060,72 +1402,19 @@ pub async fn handle_dispatch(
         )
         .await
     {
-        return DispatchResult {
-            worktree_dir: paths.worktree_dir.clone(),
-            success: false,
-            message: format!("dispatch: {refusal}"),
-            unit_id: None,
-        };
+        return refuse(refusal);
     }
 
-    // Read once, and the worktree is cut from exactly this sha, so the base the
-    // reply names is the unit's base. See [`resolve_dispatch_base`].
-    let base = resolve_dispatch_base(&clone_dir).await;
-
-    match create_dispatch_worktree(&clone_dir, &paths, name, base.as_ref()).await {
-        Ok(WorktreeCreation::Created) => {}
-        Ok(WorktreeCreation::AlreadyClaimed) => {
-            return DispatchResult {
-                worktree_dir: paths.worktree_dir.clone(),
-                success: false,
-                message: format!(
-                    "dispatch: worktree {} is already claimed by another dispatch. \
-                     Wait for it to finish, or dispatch under a different name.",
-                    paths.worktree_dir.display()
-                ),
-                unit_id: None,
-            };
-        }
-        // The worktree dir is GONE but its branch survived — `git worktree
-        // remove` never deletes the branch, so this is the ordinary state after a
-        // previous dispatch of the same name was cleaned up. Say so, and name
-        // both fixes: the branch is not deleted implicitly because it may hold
-        // that dispatch's committed work.
-        Ok(WorktreeCreation::BranchExists) => {
-            return DispatchResult {
-                worktree_dir: paths.worktree_dir.clone(),
-                success: false,
-                message: format!(
-                    "dispatch: branch {branch} already exists from an earlier dispatch named \
-                     '{name}' (its worktree is already gone). That branch may hold committed \
-                     work, so it is left alone. Dispatch under a different name, or run \
-                     `git -C {clone} branch -D {branch}` first if you are done with it.",
-                    branch = paths.branch,
-                    name = name,
-                    clone = clone_dir.display(),
-                ),
-                unit_id: None,
-            };
-        }
-        Err(e) => {
-            return DispatchResult {
-                worktree_dir: paths.worktree_dir.clone(),
-                success: false,
-                message: format!("dispatch: failed to create worktree: {e}"),
-                unit_id: None,
-            };
-        }
-    }
-
-    // `RemovalPolicy::KeepIfDirty`: this worktree is a sibling of the user's own
-    // checkout and its name was chosen by an LLM, so closing the tab must not
-    // destroy uncommitted work. See [`RemovalPolicy`].
-    record_worktree(
-        &ctx.worktrees,
-        &paths.worktree_dir,
-        &clone_dir,
-        RemovalPolicy::KeepIfDirty,
-    );
+    // PRD #468: a `--dir` dispatch creates and records nothing; it only reads
+    // which branch its target has checked out, for the reply and the record.
+    let (base, branch) = match &existing_dir {
+        Some(dir) => (None, checked_out_branch(dir).await),
+        None => match create_and_record_worktree(ctx, &paths, &clone_dir, name).await {
+            Ok(base) => (base, Some(paths.branch.clone())),
+            Err(refused) => return refused,
+        },
+    };
+    let branch_label = branch.clone().unwrap_or_default();
 
     // PRD #2374: the agent-card catalog is appended to the TASK, before the
     // shape branch, so the single-agent prompt and an orchestration's task
@@ -1138,23 +1427,22 @@ pub async fn handle_dispatch(
         &with_catalog,
         &resolved_target,
         &dispatch_report_path(name, &next_report_nonce()),
-        crate::worktree_owner::main_worktree_if_linked(&paths.worktree_dir).as_deref(),
+        crate::worktree_owner::main_worktree_if_linked(&unit_dir).as_deref(),
     );
 
     // PRD #1889: the dispatch's work, a child of the dispatcher's. Its
     // `opened` is held until the unit is registered, so it names the unit.
-    let work_id = ctx.registry.work().dispatch_minted(
-        ctx.caller_work.as_ref(),
-        &paths.branch,
-        &paths.worktree_dir,
-    );
+    let work_id =
+        ctx.registry
+            .work()
+            .dispatch_minted(ctx.caller_work.as_ref(), &branch_label, &unit_dir);
     // PRD #1790: the task as the dispatcher gave it, saved beside the
     // worktree under the unit's work id, so a restore can hand it back.
-    crate::dispatch_task::save_or_warn(&paths.worktree_dir, work_id.as_ref(), task).await;
+    crate::dispatch_task::save_or_warn(&unit_dir, work_id.as_ref(), task).await;
     let req = SpawnRequest {
         work_id: work_id.clone(),
         task_name: format!("dispatch-{name}"),
-        working_dir: paths.worktree_dir.to_string_lossy().into_owned(),
+        working_dir: unit_dir.to_string_lossy().into_owned(),
         // A real agent command, never `None` — see `resolve_single_unit_launch`.
         // Ignored when the dispatch starts an orchestration (role commands win).
         command: Some(single_command),
@@ -1183,7 +1471,7 @@ pub async fn handle_dispatch(
         Some(caller) => {
             // Issue #1981: the runs the unit's agents open are named after it
             // from their start, so one that ends at once still carries it.
-            let naming = crate::telemetry::begin_dispatch(&ctx.registry, name, &paths.worktree_dir);
+            let naming = crate::telemetry::begin_dispatch(&ctx.registry, name, &unit_dir);
             let spawned = crate::spawn::spawn_dispatched_unit(
                 req,
                 &ctx.registry,
@@ -1193,13 +1481,14 @@ pub async fn handle_dispatch(
                 ctx.state.as_ref(),
                 crate::dispatched_units::UnitOrigin {
                     name: name.to_string(),
-                    worktree: paths.worktree_dir.clone(),
-                    branch: paths.branch.clone(),
+                    worktree: unit_dir.clone(),
+                    branch: branch_label.clone(),
                     clone_dir: clone_dir.clone(),
                     dispatcher: crate::dispatched_units::Dispatcher {
                         pane_id: caller.pane_id.clone(),
                         agent_id: caller.agent_id.clone(),
                     },
+                    existing_dir: existing_dir.is_some(),
                 },
                 caller.clone(),
             )
@@ -1247,7 +1536,7 @@ pub async fn handle_dispatch(
             // unit's completion report inside the spawn, before the task was
             // delivered — see `crate::spawn::spawn_dispatched_unit`.
             DispatchResult {
-                worktree_dir: paths.worktree_dir.clone(),
+                worktree_dir: unit_dir.clone(),
                 success: true,
                 unit_id: handle.unit_id.clone(),
                 // Report what was ACTUALLY opened, from the spawn's own verdict.
@@ -1267,18 +1556,29 @@ pub async fn handle_dispatch(
                 // `/issue-queue` intersects with the merged branches before a
                 // `close --all` — instead of reconstructing it from the name.
                 message: {
-                    let opened = match &handle.kind {
-                        SpawnKind::Orchestration { name: orch } => format!(
-                            "{SPAWNED_OPENING} orchestration '{orch}' for '{name}' in {} on branch {}",
-                            paths.worktree_dir.display(),
-                            paths.branch
-                        ),
-                        SpawnKind::SingleAgent => format!(
-                            "{SPAWNED_OPENING} agent for '{name}' in {} on branch {}",
-                            paths.worktree_dir.display(),
-                            paths.branch
-                        ),
+                    //
+                    // PRD #468: a `--dir` unit names its directory as an
+                    // existing one, the branch only when one is checked out
+                    // there, and says this dispatch will not remove it.
+                    let what = match &handle.kind {
+                        SpawnKind::Orchestration { name: orch } => {
+                            format!("orchestration '{orch}'")
+                        }
+                        SpawnKind::SingleAgent => "agent".to_string(),
                     };
+                    let mut opened = format!(
+                        "{SPAWNED_OPENING} {what} for '{name}' in {}",
+                        unit_dir.display()
+                    );
+                    if let Some(branch) = &branch {
+                        opened.push_str(&format!(" on branch {branch}"));
+                    }
+                    if existing_dir.is_some() {
+                        opened.push_str(
+                            " (an existing directory: this dispatch created no worktree there \
+                             and will not remove it)",
+                        );
+                    }
                     let mut msg = match &base {
                         Some(base) => format!("{opened}, cut from {}", base.description),
                         None => opened,
@@ -1295,6 +1595,21 @@ pub async fn handle_dispatch(
                 },
             }
         }
+        // PRD #468: a `--dir` unit's directory is not this dispatch's, so a
+        // failed spawn runs no rollback and removes nothing. The deck's own
+        // files the attempt already wrote under `.dot-agent-deck/` (the saved
+        // task, a published context) stay, so the reply claims no more than
+        // that.
+        Err(e) if existing_dir.is_some() => DispatchResult {
+            message: format!(
+                "dispatch: spawn failed: {e} (no worktree or branch was created, and {} was not \
+                 removed)",
+                unit_dir.display()
+            ),
+            worktree_dir: unit_dir,
+            success: false,
+            unit_id: None,
+        },
         Err(e) => {
             let outcome = rollback_dispatched_worktree(
                 &ctx.registry,
@@ -1314,6 +1629,77 @@ pub async fn handle_dispatch(
             }
         }
     }
+}
+
+/// The default dispatch's placement: cut the unit's worktree from the caller's
+/// `HEAD` and record it for removal when the unit closes. Answers the base it
+/// was cut from (for the reply), or the refusal to return when it could not be
+/// created.
+async fn create_and_record_worktree(
+    ctx: &DispatchContext,
+    paths: &DispatchPaths,
+    clone_dir: &Path,
+    name: &str,
+) -> Result<Option<DispatchBase>, DispatchResult> {
+    // Read once, and the worktree is cut from exactly this sha, so the base the
+    // reply names is the unit's base. See [`resolve_dispatch_base`].
+    let base = resolve_dispatch_base(clone_dir).await;
+
+    match create_dispatch_worktree(clone_dir, paths, name, base.as_ref()).await {
+        Ok(WorktreeCreation::Created) => {}
+        Ok(WorktreeCreation::AlreadyClaimed) => {
+            return Err(DispatchResult {
+                worktree_dir: paths.worktree_dir.clone(),
+                success: false,
+                message: format!(
+                    "dispatch: worktree {} is already claimed by another dispatch. \
+                     Wait for it to finish, or dispatch under a different name.",
+                    paths.worktree_dir.display()
+                ),
+                unit_id: None,
+            });
+        }
+        // The worktree dir is GONE but its branch survived — `git worktree
+        // remove` never deletes the branch, so this is the ordinary state after a
+        // previous dispatch of the same name was cleaned up. Say so, and name
+        // both fixes: the branch is not deleted implicitly because it may hold
+        // that dispatch's committed work.
+        Ok(WorktreeCreation::BranchExists) => {
+            return Err(DispatchResult {
+                worktree_dir: paths.worktree_dir.clone(),
+                success: false,
+                message: format!(
+                    "dispatch: branch {branch} already exists from an earlier dispatch named \
+                     '{name}' (its worktree is already gone). That branch may hold committed \
+                     work, so it is left alone. Dispatch under a different name, or run \
+                     `git -C {clone} branch -D {branch}` first if you are done with it.",
+                    branch = paths.branch,
+                    name = name,
+                    clone = clone_dir.display(),
+                ),
+                unit_id: None,
+            });
+        }
+        Err(e) => {
+            return Err(DispatchResult {
+                worktree_dir: paths.worktree_dir.clone(),
+                success: false,
+                message: format!("dispatch: failed to create worktree: {e}"),
+                unit_id: None,
+            });
+        }
+    }
+
+    // `RemovalPolicy::KeepIfDirty`: this worktree is a sibling of the user's own
+    // checkout and its name was chosen by an LLM, so closing the tab must not
+    // destroy uncommitted work. See [`RemovalPolicy`].
+    record_worktree(
+        &ctx.worktrees,
+        &paths.worktree_dir,
+        clone_dir,
+        RemovalPolicy::KeepIfDirty,
+    );
+    Ok(base)
 }
 
 /// The note `handle_dispatch` appends to a failed dispatch's message, saying
@@ -2899,6 +3285,139 @@ mod tests {
                 "the composed file must arbitrate between the template and the task:\n{content}"
             );
         }
+
+        /// PRD #468: an orchestration dispatched with `--dir` starts in that
+        /// existing directory, from that directory's config (uncommitted, so
+        /// only the live directory has it), and creates and records nothing:
+        /// no sibling worktree, no branch, no entry for any close to remove.
+        /// While its roles still run there, a second `--dir` dispatch into the
+        /// same directory is refused by the interlock and starts nothing.
+        ///
+        /// Roles run `cat`, like the test above; spawning real PTYs is why
+        /// this sits in the e2e tier.
+        #[tokio::test]
+        async fn a_dir_orchestration_starts_in_the_existing_directory_and_owns_nothing() {
+            let tmp = crate::test_temp::tempdir().unwrap();
+            let repo = tmp.path().join("repo");
+            init_repo_in(tmp.path(), &repo);
+            let target = tmp.path().join("continuation");
+            init_repo_in(tmp.path(), &target);
+            git_in(
+                tmp.path(),
+                &target,
+                &["checkout", "-qb", "feature/analysis"],
+            );
+            std::fs::write(
+                target.join(".dot-agent-deck.toml"),
+                "[[orchestrations]]\nname = \"continue-team\"\n\n\
+                 [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n\n\
+                 [[orchestrations.roles]]\nname = \"worker\"\ncommand = \"cat\"\ndescription = \"Does the work\"\n",
+            )
+            .unwrap();
+            std::fs::write(target.join("brief-a1b2.md"), "the analysis so far").unwrap();
+            crate::project_trust::approve_all_for_test(&target);
+
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
+            let ctx = DispatchContext {
+                caller_work: None,
+                working_dir: repo.clone(),
+                registry: registry.clone(),
+                event_tx,
+                worktrees: new_worktree_registry(),
+                default_command: None,
+                state: None,
+                caller: None,
+            };
+            let target_arg = std::fs::canonicalize(&target)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            let result = handle_dispatch_at(
+                &ctx,
+                "continue",
+                "Implement what brief-a1b2.md concludes.",
+                Some(&crate::event::DispatchShape::Orchestration { name: None }),
+                LaunchChoice::default(),
+                Some(&target_arg),
+            )
+            .await;
+            let second = handle_dispatch_at(
+                &ctx,
+                "continue-again",
+                "task",
+                Some(&crate::event::DispatchShape::Orchestration { name: None }),
+                LaunchChoice::default(),
+                Some(&target_arg),
+            )
+            .await;
+            let records_after_second = registry.agent_records().len();
+            registry.shutdown_all();
+
+            assert!(
+                result.success,
+                "the --dir dispatch must start: {}",
+                result.message
+            );
+            assert_eq!(result.worktree_dir, Path::new(&target_arg));
+            assert!(
+                result.message.starts_with(SPAWNED_OPENING)
+                    && result.message.contains("orchestration 'continue-team'")
+                    && result.message.contains(&format!(
+                        "in {target_arg} on branch feature/analysis (an existing directory"
+                    )),
+                "the reply names the directory, its branch and that it is an existing one: {}",
+                result.message
+            );
+            assert!(
+                !result.message.contains("cut from"),
+                "a --dir unit was cut from nothing: {}",
+                result.message
+            );
+            let context_dir = target.join(".dot-agent-deck");
+            let has_context = std::fs::read_dir(&context_dir)
+                .expect("the orchestration wrote into the target's .dot-agent-deck")
+                .filter_map(Result::ok)
+                .any(|entry| {
+                    entry.file_name().to_str().is_some_and(|name| {
+                        name.starts_with(crate::orchestrator_context::CONTEXT_FILE_PREFIX)
+                    })
+                });
+            assert!(
+                has_context,
+                "the orchestrator context is published in the target"
+            );
+            assert!(
+                ctx.worktrees.lock().unwrap().is_empty(),
+                "a --dir dispatch records nothing for removal"
+            );
+            assert!(
+                !derive_dispatch_paths(&repo, "continue")
+                    .worktree_dir
+                    .exists(),
+                "and creates no sibling worktree"
+            );
+            assert!(!branch_exists(tmp.path(), &repo, "agent/dispatch-continue"));
+            assert!(target.join("brief-a1b2.md").exists());
+
+            assert!(
+                !second.success,
+                "a second unit into a directory the first still runs in must be refused: {}",
+                second.message
+            );
+            assert!(
+                second
+                    .message
+                    .contains("already holds a live agent's coordination files")
+                    && second.message.contains(&target_arg),
+                "{}",
+                second.message
+            );
+            assert_eq!(
+                records_after_second, 2,
+                "the refused dispatch started nothing beside the first one's two roles"
+            );
+        }
     }
 
     /// Issue #1065 — the other half of the test above, at the same altitude: the
@@ -3447,6 +3966,7 @@ mod tests {
                     pane_id: "disp".to_string(),
                     agent_id: "nobody".to_string(),
                 },
+                existing_dir: false,
             };
             let caller = crate::dispatch_return::DispatchCaller {
                 pane_id: "disp".to_string(),
@@ -3710,6 +4230,7 @@ mod tests {
                     pane_id: "disp".to_string(),
                     agent_id: "nobody".to_string(),
                 },
+                existing_dir: false,
             };
             let caller = crate::dispatch_return::DispatchCaller {
                 pane_id: "disp".to_string(),
@@ -4318,6 +4839,448 @@ mod tests {
             !branch_exists(tmp.path(), &repo, "agent/dispatch-ambiguous-unit"),
             "no branch may be left behind either"
         );
+    }
+
+    // --- `dispatch --dir` (PRD #468) ---
+
+    /// Minimal [`crate::agent_pty::AgentRecord`] for the interlock tests (the
+    /// struct has no `Default`); only `id`, `display_name`, `cwd` and
+    /// `tab_membership` matter to [`occupied_dir_refusal`].
+    fn dir_record(
+        id: &str,
+        name: &str,
+        cwd: &Path,
+        membership: Option<crate::agent_pty::TabMembership>,
+    ) -> crate::agent_pty::AgentRecord {
+        crate::agent_pty::AgentRecord {
+            input_held: None,
+            input_discarded: None,
+            project_config_exists: None,
+            id: id.into(),
+            pane_id_env: Some(format!("pane-{id}")),
+            display_name: Some(name.into()),
+            cwd: Some(cwd.to_string_lossy().into_owned()),
+            tab_membership: membership,
+            agent_type: None,
+            rows: 24,
+            cols: 80,
+            live: None,
+            spawned_at_ms: None,
+            cli_name: None,
+            prompt_keys: None,
+            crashed: None,
+            orchestrator_context_path: None,
+            authoring_kind: None,
+            inbox: None,
+        }
+    }
+
+    fn orchestration_role(cwd: &Path, role: &str) -> crate::agent_pty::TabMembership {
+        crate::agent_pty::TabMembership::Orchestration {
+            name: "team".into(),
+            role_index: 0,
+            role_name: role.into(),
+            is_start_role: role == "orchestrator",
+            orchestration_cwd: Some(cwd.to_string_lossy().into_owned()),
+            display_title: None,
+            orchestration_id: None,
+        }
+    }
+
+    fn canonical(p: &Path) -> PathBuf {
+        std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+    }
+
+    #[test]
+    fn dir_resolves_to_an_existing_directory_and_refuses_anything_else() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let dir = tmp.path().join("work");
+        std::fs::create_dir(&dir).unwrap();
+        assert_eq!(resolve_existing_dir(&dir).unwrap(), canonical(&dir));
+
+        let file = tmp.path().join("a-file");
+        std::fs::write(&file, "x").unwrap();
+        let err = resolve_existing_dir(&file).unwrap_err();
+        assert!(err.contains("not a directory"), "{err}");
+
+        let missing = tmp.path().join("missing");
+        let err = resolve_existing_dir(&missing).unwrap_err();
+        assert!(err.contains(&missing.display().to_string()), "{err}");
+
+        let err = resolve_existing_dir(Path::new("")).unwrap_err();
+        assert!(
+            err.contains("--dir ."),
+            "an empty --dir says how to name here: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dir_through_a_symlink_resolves_to_the_directory_it_names() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let dir = tmp.path().join("work");
+        std::fs::create_dir(&dir).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        assert_eq!(resolve_existing_dir(&link).unwrap(), canonical(&dir));
+    }
+
+    /// Scenario: the interlock is asked about a directory where nobody, only
+    /// the calling single agent, or an agent elsewhere runs. None of these is
+    /// refused: `--dir .` from a single agent is the continuation `--dir`
+    /// exists for.
+    #[test]
+    fn the_interlock_admits_an_empty_directory_and_a_single_callers_own() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let dir = canonical(tmp.path());
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+
+        assert_eq!(occupied_dir_refusal(&[], &dir, None, canonical), None);
+        let caller = dir_record("7", "analyst", &dir, None);
+        assert_eq!(
+            occupied_dir_refusal(&[caller], &dir, Some("7"), canonical),
+            None,
+            "a single caller dispatching into its own directory is admitted"
+        );
+        let other = dir_record("8", "other", &elsewhere, None);
+        assert_eq!(
+            occupied_dir_refusal(&[other], &dir, Some("7"), canonical),
+            None,
+            "an agent in another directory does not occupy this one"
+        );
+    }
+
+    /// Scenario: another live agent works in the target directory, which also
+    /// holds an orchestrator context file and a worker's report. The refusal
+    /// names the directory, the agent and the files it found.
+    #[test]
+    fn the_interlock_refuses_a_directory_another_live_agent_works_in() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let dir = canonical(tmp.path());
+        std::fs::create_dir(dir.join(".dot-agent-deck")).unwrap();
+        for file in [
+            "orchestrator-context-0123456789abcdef0123456789abcdef.md",
+            "work-done-coder.md",
+            "unrelated.md",
+        ] {
+            std::fs::write(dir.join(".dot-agent-deck").join(file), "x").unwrap();
+        }
+        let records = [
+            dir_record("7", "analyst", &dir, None),
+            dir_record("9", "busy-worker", &dir, None),
+        ];
+        let refusal = occupied_dir_refusal(&records, &dir, Some("7"), canonical)
+            .expect("another live agent in the directory must be refused");
+        assert!(refusal.contains(&dir.display().to_string()), "{refusal}");
+        assert!(refusal.contains("busy-worker"), "{refusal}");
+        assert!(
+            !refusal.contains("analyst"),
+            "the caller is not one of the occupants: {refusal}"
+        );
+        assert!(refusal.contains("1 other live agent"), "{refusal}");
+        assert!(
+            refusal.contains(
+                ".dot-agent-deck/orchestrator-context-0123456789abcdef0123456789abcdef.md"
+            ) && refusal.contains(".dot-agent-deck/work-done-coder.md"),
+            "the coordination files it found are named: {refusal}"
+        );
+        assert!(!refusal.contains("unrelated.md"), "{refusal}");
+        assert!(refusal.contains("without --dir"), "{refusal}");
+    }
+
+    /// Scenario: the caller is a role of an orchestration rooted in the target
+    /// directory, and dispatches into it. That orchestration's coordination
+    /// files are the ones a second unit would overwrite, so it is refused even
+    /// with no other agent there.
+    #[test]
+    fn the_interlock_refuses_a_caller_whose_orchestration_is_rooted_there() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let dir = canonical(tmp.path());
+        let records = [dir_record(
+            "7",
+            "orchestrator",
+            &dir,
+            Some(orchestration_role(&dir, "orchestrator")),
+        )];
+        assert!(occupied_dir_refusal(&records, &dir, Some("7"), canonical).is_some());
+    }
+
+    /// An agent whose recorded directory names the target through a symlink
+    /// still occupies it.
+    #[cfg(unix)]
+    #[test]
+    fn the_interlock_matches_a_record_spelled_through_a_symlink() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let dir = tmp.path().join("work");
+        std::fs::create_dir(&dir).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        let records = [dir_record("9", "via-link", &link, None)];
+        assert!(occupied_dir_refusal(&records, &canonical(&dir), None, canonical).is_some());
+    }
+
+    /// A directory held by one `--dir` dispatch cannot be held by a second
+    /// until the first lets go, counts as in use so a worktree cleanup cannot
+    /// take it meanwhile, and cannot be held while a removal holds it.
+    #[test]
+    fn a_dir_being_started_is_held_against_a_second_dispatch_and_a_removal() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let dir = canonical(tmp.path());
+        let first = registry
+            .hold_dir_for_dispatch(&dir)
+            .expect("a free directory is held");
+        assert_eq!(
+            registry.hold_dir_for_dispatch(&dir).err(),
+            Some(crate::agent_pty::DispatchDirRefusal::AlreadyHeld),
+            "a second dispatch is refused"
+        );
+        assert!(
+            registry.dir_in_use(&dir),
+            "a starting unit's directory is in use"
+        );
+        assert!(
+            registry.hold_dir_for_removal(&dir).is_none(),
+            "so a worktree cleanup does not take it"
+        );
+        drop(first);
+        assert!(
+            !registry.dir_in_use(&dir),
+            "released when the dispatch returns"
+        );
+
+        let removal = registry
+            .hold_dir_for_removal(&dir)
+            .expect("an unused directory can be held for removal");
+        assert_eq!(
+            registry.hold_dir_for_dispatch(&dir.join("sub")).err(),
+            Some(crate::agent_pty::DispatchDirRefusal::BeingRemoved(
+                dir.clone()
+            )),
+            "a directory inside one being removed is refused"
+        );
+        drop(removal);
+        assert!(registry.hold_dir_for_dispatch(&dir).is_ok());
+    }
+
+    /// Scenario: a cleanup already holds a worktree for removal under a
+    /// symlinked spelling, its registry entry taken, when a `--dir` dispatch
+    /// arrives with the resolved path. The lexical hold check cannot see it,
+    /// so the dispatch is refused by resolving the removal's spelling.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_dir_dispatch_is_refused_while_another_spelling_is_being_removed() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo_in(tmp.path(), &repo);
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(real.join("wt")).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let removal = registry
+            .hold_dir_for_removal(&link.join("wt"))
+            .expect("an unused worktree is held for removal");
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
+        let ctx = DispatchContext {
+            caller_work: None,
+            working_dir: repo.clone(),
+            registry: registry.clone(),
+            event_tx,
+            worktrees: new_worktree_registry(),
+            default_command: None,
+            state: None,
+            caller: None,
+        };
+        let resolved = canonical(&real.join("wt")).to_string_lossy().into_owned();
+        let result = handle_dispatch_at(
+            &ctx,
+            "into-removal",
+            "task",
+            Some(&crate::event::DispatchShape::SingleAgent),
+            LaunchChoice::default(),
+            Some(&resolved),
+        )
+        .await;
+        assert!(!result.success, "{}", result.message);
+        assert!(
+            result.message.contains("is being removed"),
+            "{}",
+            result.message
+        );
+        assert!(registry.agent_records().is_empty(), "nothing was started");
+        drop(removal);
+        assert!(
+            !registry.dir_in_use(Path::new(&resolved)),
+            "the dispatch's hold was released"
+        );
+    }
+
+    /// Scenario: a worktree the deck records is spelled through a symlinked
+    /// parent, and `--dir` arrives with the resolved path. The unit is rooted
+    /// at the recorded spelling, so the removal guards, which compare by
+    /// spelling, count it against that worktree's cleanup.
+    #[cfg(unix)]
+    #[test]
+    fn a_dir_unit_is_rooted_at_the_spelling_of_a_recorded_worktree() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(real.join("wt")).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let recorded = link.join("wt");
+        let resolved = canonical(&real.join("wt"));
+
+        let placed =
+            place_in_existing_dir(&resolved.to_string_lossy(), std::slice::from_ref(&recorded))
+                .expect("an existing directory is placed");
+        assert_eq!(placed.canonical, resolved);
+        assert_eq!(placed.spawn_at, recorded, "rooted at the recorded spelling");
+
+        let unrecorded = place_in_existing_dir(&resolved.to_string_lossy(), &[]).unwrap();
+        assert_eq!(unrecorded.spawn_at, resolved, "else at the resolved path");
+        let err = place_in_existing_dir("relative", &[]).unwrap_err();
+        assert!(err.contains("absolute"), "{err}");
+    }
+
+    /// Scenario: `--dir` names a relative path, or a file. The dispatch is
+    /// refused before anything else, and no worktree is created.
+    #[tokio::test]
+    async fn a_dir_that_is_not_an_absolute_directory_is_refused_creating_nothing() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo_in(tmp.path(), &repo);
+        let file = tmp.path().join("a-file");
+        std::fs::write(&file, "x").unwrap();
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
+        let ctx = DispatchContext {
+            caller_work: None,
+            working_dir: repo.clone(),
+            registry: Arc::new(AgentPtyRegistry::new()),
+            event_tx,
+            worktrees: new_worktree_registry(),
+            default_command: None,
+            state: None,
+            caller: None,
+        };
+        for (dir, says) in [
+            ("relative/path".to_string(), "absolute"),
+            (file.to_string_lossy().into_owned(), "not a directory"),
+        ] {
+            let result = handle_dispatch_at(
+                &ctx,
+                "dir-unit",
+                "task",
+                Some(&crate::event::DispatchShape::SingleAgent),
+                LaunchChoice::default(),
+                Some(&dir),
+            )
+            .await;
+            assert!(!result.success, "{dir}: {}", result.message);
+            assert!(
+                result.message.starts_with("dispatch: ") && result.message.contains(says),
+                "{dir}: {}",
+                result.message
+            );
+        }
+        assert!(
+            !derive_dispatch_paths(&repo, "dir-unit")
+                .worktree_dir
+                .exists(),
+            "a refused --dir dispatch creates no worktree"
+        );
+        assert!(!branch_exists(tmp.path(), &repo, "agent/dispatch-dir-unit"));
+        assert!(ctx.worktrees.lock().unwrap().is_empty());
+    }
+
+    /// PRD #468 M2: a `--dir` dispatch resolves its orchestration from the
+    /// TARGET directory's config, not the caller's. The caller's repo offers
+    /// `caller-team`, the target offers `target-team`; asking for the caller's
+    /// is refused naming the target's, before anything is created.
+    #[tokio::test]
+    async fn a_dir_dispatch_resolves_orchestrations_from_the_target_directory() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo_in(tmp.path(), &repo);
+        let team = |name: &str| {
+            format!(
+                "[[orchestrations]]\nname = \"{name}\"\n\n\
+                 [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n"
+            )
+        };
+        std::fs::write(repo.join(".dot-agent-deck.toml"), team("caller-team")).unwrap();
+        let target = tmp.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join(".dot-agent-deck.toml"), team("target-team")).unwrap();
+
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
+        let ctx = DispatchContext {
+            caller_work: None,
+            working_dir: repo.clone(),
+            registry: Arc::new(AgentPtyRegistry::new()),
+            event_tx,
+            worktrees: new_worktree_registry(),
+            default_command: None,
+            state: None,
+            caller: None,
+        };
+        let target_arg = canonical(&target).to_string_lossy().into_owned();
+        let result = handle_dispatch_at(
+            &ctx,
+            "dir-team",
+            "task",
+            Some(&crate::event::DispatchShape::Orchestration {
+                name: Some("caller-team".into()),
+            }),
+            LaunchChoice::default(),
+            Some(&target_arg),
+        )
+        .await;
+        assert!(!result.success, "{}", result.message);
+        assert!(
+            result.message.contains("target-team"),
+            "the refusal offers the target directory's orchestrations: {}",
+            result.message
+        );
+        assert_eq!(result.worktree_dir, canonical(&target));
+        assert!(
+            !derive_dispatch_paths(&repo, "dir-team")
+                .worktree_dir
+                .exists()
+        );
+        assert!(ctx.worktrees.lock().unwrap().is_empty());
+
+        let listing = list_targets_response_for_dir(&target_arg);
+        assert_eq!(listing.error, None, "{}", listing.rendered);
+        assert!(
+            listing.rendered.contains("target-team"),
+            "{}",
+            listing.rendered
+        );
+        assert!(
+            !listing.rendered.contains("caller-team"),
+            "{}",
+            listing.rendered
+        );
+        let refused = list_targets_response_for_dir("relative");
+        assert!(refused.error.is_some() && refused.orchestrations.is_empty());
+    }
+
+    /// The `dir` field is additive: an older CLI's dispatch, with no `dir`,
+    /// still parses as a default dispatch, and a dispatch with none serializes
+    /// without the key, byte for byte what an older CLI sends.
+    #[test]
+    fn dispatch_signal_dir_is_additive_and_omitted_when_absent() {
+        let legacy = r#"{"message_type":"dispatch","pane_id":"p1","name":"unit",
+                         "task":"do it","timestamp":"2026-08-08T00:00:00Z"}"#;
+        let msg: crate::event::DaemonMessage = serde_json::from_str(legacy).unwrap();
+        let crate::event::DaemonMessage::Dispatch(sig) = msg else {
+            panic!("expected a dispatch message");
+        };
+        assert_eq!(sig.dir, None);
+        let json = serde_json::to_string(&crate::event::DaemonMessage::Dispatch(sig)).unwrap();
+        assert!(!json.contains("\"dir\""), "{json}");
     }
 
     /// The wire choice maps onto the spawn override, and ABSENT stays absent —

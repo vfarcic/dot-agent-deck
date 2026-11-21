@@ -136,7 +136,7 @@ function runRefits(): void {
  * The subset of the xterm buffer API the snapshot needs — kept minimal so
  * tests can hand in a fake without a DOM-mounted terminal.
  */
-export interface SnapshotBufferLine {
+interface SnapshotBufferLine {
   isWrapped: boolean;
   translateToString(trimRight?: boolean): string;
 }
