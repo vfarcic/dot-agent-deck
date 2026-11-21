@@ -483,16 +483,21 @@ fn codex_numbered(grid: &Grid, row: u16) -> bool {
 
 /// Append Codex's next wrapped row to the text read so far. Codex wraps a
 /// long line at a space, which the row break replaces, or right after a
-/// hyphen, which keeps its place with no space after it: measured on live
-/// Codex 0.164.0, which drew the deck's line naming
-/// `…/dad-tests-3260328-xsMumn/…` as `…/dad-tests-3260328-` over
-/// `xsMumn/…` (`inbox/codex/009`, 2026-11-10, issue #1730). So a row that
-/// ends in `-` joins the next with nothing between them, and any other row
-/// with one space. The reading is the deck's own line exactly when the rows
-/// came from wrapping it; a draft whose own text has a hyphen before a space
+/// hyphen or a slash, which keeps its place with no space after it. Its
+/// composer wraps with `textwrap`'s default options (`Options::new(width)`,
+/// `tui/src/bottom_pane/textarea/wrapping.rs` at `rust-v0.164.0`), whose
+/// Unicode line-break word separator allows a break after `-` and after `/`
+/// inside a word. Both were measured on live Codex 0.164.0, drawing the
+/// deck's line naming its absolute path: `…/dad-tests-3260328-` over
+/// `xsMumn/…` (`inbox/codex/009`, 2026-11-10, issue #1730), and
+/// `…/deck-under-test/` over `dot-agent-deck inbox fetch`
+/// (`inbox/probe/043`, 2026-11-20). So a row that ends in `-` or `/` joins
+/// the next with nothing between them, and any other row with one space.
+/// The reading is the deck's own line exactly when the rows came from
+/// wrapping it; a draft whose own text has a hyphen or slash before a space
 /// at the wrap point reads without that space, as text the deck did not type.
 pub fn codex_join_wrapped(text: &mut String, next: &str) {
-    if !text.ends_with('-') {
+    if !(text.ends_with('-') || text.ends_with('/')) {
         text.push(' ');
     }
     text.push_str(next);

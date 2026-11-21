@@ -13,7 +13,7 @@ use dot_agent_deck::doorbell_screen::{
 };
 use dot_agent_deck::event::AgentType;
 use dot_agent_deck::release_scanner::{
-    HEADER_RECOGNISERS, ReleaseScanner, ScanLatch, latch_byte_at_a_time,
+    HEADER_RECOGNISERS, ReleaseScanner, ScanLatch, VERSION_CHARS_MAX, latch_byte_at_a_time,
 };
 use semver::Version;
 use spec::spec;
@@ -320,7 +320,7 @@ fn latch_of(bytes: &[u8]) -> ScanLatch {
     scanner.latch().clone()
 }
 
-/// Scenario: Feed header-like text in other shapes and positions: the Codex header one column off, without its `(v`, with a pre-release tag or unterminated, and Claude Code's header at another column or with a pre-release tag. None latches; a Claude Code version written in pieces latches once, complete, without a conflict.
+/// Scenario: Feed header-like text in other shapes and positions: the Codex header one column off, without its `(v`, with a malformed pre-release or build tag, or unterminated, and Claude Code's header at another column or with a malformed tag. None latches; a Claude Code version written in pieces latches once, complete, without a conflict.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_release_recogniser_negatives() {
@@ -333,7 +333,12 @@ fn doorbell_036_release_recogniser_negatives() {
         codex(4, "OpenAI Codex (v0.164.0)"),
         codex(6, "OpenAI Codex (v0.164.0)"),
         codex(5, "OpenAI Codex v0.164.0"),
-        codex(5, "OpenAI Codex (v0.165.0-alpha.1)"),
+        codex(5, "OpenAI Codex (v0.165.0-)"),
+        codex(5, "OpenAI Codex (v0.165.0-alpha..1)"),
+        codex(5, "OpenAI Codex (v0.165.0-alpha.01)"),
+        codex(5, "OpenAI Codex (v0.165.0+)"),
+        codex(5, "OpenAI Codex (v0.165.0-alpha_1)"),
+        codex(5, "OpenAI Codex (v0.165.0-alpha.1"),
         codex(5, "OpenAI Codex (v0.164)"),
         codex(5, "OpenAI Codex (v0.164.0"),
         codex(5, "OpenAI codex (v0.164.0)"),
@@ -354,7 +359,10 @@ fn doorbell_036_release_recogniser_negatives() {
     for bytes in [
         claude(10, "Claude Code v2.1.310"),
         claude(11, "Claude Code  v2.1.310"),
-        claude(11, "Claude Code v2.1.310-beta.2"),
+        claude(11, "Claude Code v2.1.310-"),
+        claude(11, "Claude Code v2.1.310-beta..2"),
+        claude(11, "Claude Code v2.1.310+"),
+        claude(11, "Claude Code v2.1.310-beta_2"),
         claude(11, "Claude Code 2.1.310"),
     ] {
         assert_eq!(
@@ -378,24 +386,103 @@ fn doorbell_036_release_recogniser_negatives() {
     ));
 }
 
-/// Scenario: Read the `--version` output a lane-2 measurement gets from an installed Claude Code or Codex: a bare release, a pre-release, a build tag and no version. Only a bare release is usable; then the same versions are drawn in each agent's start-up header, and the deck's release scanner latches exactly the versions the measurements accept.
+/// Scenario: Draw each agent's start-up header with a bare release, a pre-release (`-beta.1`, `-alpha.1`, `-rc.1`, and Codex's own `-alpha.17.1`), build metadata (`+abc`) and both (`-rc.1+abc`), and write a Claude Code pre-release in pieces. Each latches the whole SemVer version, tags included, at the header's completing byte, and a piece-written one only once complete (issue #2128). A version at the length cap latches; one character over it, or a tag run across a 500-column row, latches nothing.
+#[spec("inbox/doorbell/036")]
+#[test]
+fn doorbell_036_release_recogniser_latches_pre_releases_and_builds() {
+    for version in [
+        "0.164.0",
+        "2.1.310",
+        "2.1.330-beta.1",
+        "0.172.0-alpha.1",
+        "0.172.0-rc.1",
+        "0.162.0-alpha.17.1",
+        "2.1.330+abc",
+        "0.172.0-rc.1+abc.2",
+        "2.1.330-x-y.1",
+    ] {
+        let want = Version::parse(version).unwrap();
+        for (agent, header) in [
+            (
+                AgentType::Codex,
+                format!("\x1b[2;6HOpenAI Codex (v{version})\r\n"),
+            ),
+            (
+                AgentType::ClaudeCode,
+                format!("\x1b[2;12HClaude Code v{version}\r\n"),
+            ),
+        ] {
+            let bytes = header.as_bytes();
+            // The header completes at its terminator: `)` for Codex, the
+            // carriage return that moves the cursor off Claude Code's.
+            let completing = header.find(')').map_or(bytes.len() - 1, |i| i + 1) as u64;
+            assert_eq!(
+                latch_of(bytes),
+                ScanLatch::Latched {
+                    agent: agent.clone(),
+                    release: want.clone(),
+                    at: completing,
+                },
+                "{agent:?} {version}"
+            );
+            assert_eq!(
+                latch_byte_at_a_time(bytes, 24, 80),
+                Some(latch_of(bytes)),
+                "{agent:?} {version}, a byte at a time"
+            );
+        }
+    }
+    // A version of exactly VERSION_CHARS_MAX characters latches; one more,
+    // or a run of tag characters filling a wide row, latches nothing.
+    let at_cap = format!("2.1.330-{}", "a".repeat(VERSION_CHARS_MAX - 8));
+    let over_cap = format!("{at_cap}b");
+    let wide = format!("0.1.0-{}", "a".repeat(400));
+    let wide_latch = |header: String| {
+        let mut scanner = ReleaseScanner::new(4, 500, HEADER_RECOGNISERS).unwrap();
+        scanner.feed(header.as_bytes());
+        scanner.latch().clone()
+    };
+    assert!(matches!(
+        wide_latch(format!("\x1b[2;6HOpenAI Codex (v{at_cap})\r\n")),
+        ScanLatch::Latched { release, .. } if release.to_string() == at_cap
+    ));
+    for version in [&over_cap, &wide] {
+        for header in [
+            format!("\x1b[2;6HOpenAI Codex (v{version})\r\n"),
+            format!("\x1b[2;12HClaude Code v{version}\r\n"),
+        ] {
+            assert_eq!(wide_latch(header), ScanLatch::Pending, "{version}");
+        }
+    }
+    let mut scanner = ReleaseScanner::new(24, 80, HEADER_RECOGNISERS).unwrap();
+    for piece in ["\x1b[2;12HClaude Code\x1b[24Gv2.1.330", "-", "be", "ta.1"] {
+        scanner.feed(piece.as_bytes());
+        assert_eq!(scanner.latch(), &ScanLatch::Pending, "after {piece:?}");
+    }
+    scanner.feed(b"\r");
+    assert!(matches!(
+        scanner.latch(),
+        ScanLatch::Latched { release, .. } if *release == Version::parse("2.1.330-beta.1").unwrap()
+    ));
+}
+
+/// Scenario: Read the `--version` output a lane-2 measurement gets from an installed Claude Code or Codex: a bare release, a pre-release, a build tag and no version. Every SemVer release is usable, tagged or not; then the same versions are drawn in each agent's start-up header, and the deck's release scanner latches exactly the versions the measurements accept.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_installed_release_shape_follows_the_release_scanner() {
     use installed_release::{VersionShape, version_shape};
     let release = |v: &str| VersionShape::Release(v.to_string());
-    let tagged = |v: &str| VersionShape::Tagged(v.to_string());
     for (program, output, expected) in [
         ("claude", "2.1.319 (Claude Code)\n", release("2.1.319")),
         (
             "claude",
             "2.1.320-beta.1 (Claude Code)\n",
-            tagged("2.1.320-beta.1"),
+            release("2.1.320-beta.1"),
         ),
         (
             "claude",
             "2.1.320+abc (Claude Code)\n",
-            tagged("2.1.320+abc"),
+            release("2.1.320+abc"),
         ),
         ("claude", "Claude Code 2.1.319\n", VersionShape::NoRelease),
         ("claude", "", VersionShape::NoRelease),
@@ -403,7 +490,7 @@ fn doorbell_036_installed_release_shape_follows_the_release_scanner() {
         (
             "codex",
             "codex-cli 0.165.0-alpha.2\n",
-            tagged("0.165.0-alpha.2"),
+            release("0.165.0-alpha.2"),
         ),
         ("codex", "codex-cli\n", VersionShape::NoRelease),
     ] {
@@ -414,7 +501,7 @@ fn doorbell_036_installed_release_shape_follows_the_release_scanner() {
         );
     }
     // What a measurement accepts is exactly what the deck latches from the
-    // same version in the agent's header: a bare release, nothing tagged.
+    // same version in the agent's header: any SemVer release, tags included.
     for version in [
         "2.1.319",
         "0.164.0",
@@ -457,7 +544,7 @@ fn holds(profile: &ScreenProfile, grid: &Grid, line: &str) -> Option<ComposerTex
     profile.holds(grid, line)
 }
 
-/// Scenario: Read the recorded Codex 0.164.0 and 0.160.0 composer sessions at the empty composer, after the deck's line was written, after its Enter, after the deletes, and for a prefix of the line still arriving; then draw a line naming the deck's absolute path wrapped over three rows as live Codex wraps it, once at a space and once right after a hyphen. The profile sees the empty ready composer with its placeholder, the exact line with the cursor after it, the submitted line as a transcript user message and not as composer text, the prefix as a prefix, the placeholder back after the deletes, and the wrapped line as exactly the deck's line.
+/// Scenario: Read the recorded Codex 0.164.0 and 0.160.0 composer sessions at the empty composer, after the deck's line was written, after its Enter, after the deletes, and for a prefix of the line still arriving; then draw a line naming the deck's absolute path wrapped over three rows as live Codex wraps it, once at a space and once right after a hyphen, and again wrapped right after a slash. The profile sees the empty ready composer with its placeholder, the exact line with the cursor after it, the submitted line as a transcript user message and not as composer text, the prefix as a prefix, the placeholder back after the deletes, and the wrapped line as exactly the deck's line.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_codex_composer_over_real_frames() {
@@ -550,6 +637,38 @@ fn doorbell_036_codex_composer_over_real_frames() {
         assert_eq!(
             strict_withdrawal(p, &wrapped, &long),
             Ok(long.chars().count())
+        );
+        // The same line wrapped right after a slash, as live Codex 0.164.0
+        // drew `…/deck-under-test/` over `dot-agent-deck inbox fetch` in a
+        // 140-column pane (inbox/probe/043, 2026-11-20): the row ends in `/`
+        // and the next starts the binary's name, with no space between them.
+        let rows = [
+            "(gavzpw) dot-agent-deck: message m-bcdgo54g-46917b8c190e9bb9 waiting, run:",
+            "/var/tmp/dad-e2e-1000/dad-tests-3260328-xsMumn/deck-under-test/",
+            "dot-agent-deck inbox fetch",
+        ];
+        let long = format!("{} {}{}", rows[0], rows[1], rows[2]);
+        let mut bytes = trace.bytes[..empty_end].to_vec();
+        bytes.extend_from_slice(
+            format!(
+                "\x1b[{};3H\x1b[0m{}\x1b[K\x1b[{};1H  {}\x1b[K\x1b[{};1H  {}\x1b[K\x1b[{};1H\x1b[K\x1b[{};{}H",
+                row + 1,
+                rows[0],
+                row + 2,
+                rows[1],
+                row + 3,
+                rows[2],
+                row + 4,
+                row + 3,
+                3 + rows[2].chars().count(),
+            )
+            .as_bytes(),
+        );
+        let wrapped = Grid::parse(&bytes, trace.rows, trace.cols);
+        assert_eq!(
+            holds(p, &wrapped, &long),
+            Some(ComposerText::Exact),
+            "{stem}: a line wrapped after a slash is the line"
         );
     }
 }

@@ -566,12 +566,6 @@ fn facts_admit(release: &str) -> bool {
 fn claude_facts_admit_installed_release() -> Result<(), String> {
     let installed = installed_claude_release()?;
     eprintln!("Claude Code release under test: {installed}");
-    if semver::Version::parse(&installed).is_ok_and(|v| !v.pre.is_empty()) {
-        return Err(format!(
-            "Claude Code {installed} is a pre-release, whose start-up header the deck does not \
-             latch (`unknown_release`): the doorbell does not type into it"
-        ));
-    }
     if facts_admit(&installed) {
         Ok(())
     } else {
