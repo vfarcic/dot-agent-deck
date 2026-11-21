@@ -349,9 +349,10 @@ async fn upgrade(
     asset: &str,
 ) -> Report {
     let version = plan.latest.as_str();
-    // The CLI is current once this step runs, so a later upgrade plans it as
-    // up to date and does not come back for the collector: the user replaces
-    // it by hand instead of being told to try again.
+    // Once the CLI is installed (now, or by the staged command the user
+    // runs), a later upgrade plans it as up to date and does not come back
+    // for the collector (#2465): the user replaces it by hand instead of
+    // being told to try again.
     let failed = |error: UpgradeError| Report {
         lines: vec![
             PlanLine::Text(format!(
