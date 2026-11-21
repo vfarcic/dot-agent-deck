@@ -601,7 +601,9 @@ pub(crate) fn plan_line(plan: &UpgradePlan) -> Option<PlanLine> {
     Some(PlanLine::Text(line))
 }
 
-#[cfg(test)]
+// The fake host's `PATH`, links and the tests' scripts are Unix-only, and
+// native Windows is unsupported (#164); the collector is Linux-only anyway.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::self_upgrade::detect::{InstallMethod, Installation, Platform, Tools};
@@ -794,7 +796,6 @@ mod tests {
     /// A collector the CLI's folder only links to, one a system package owns,
     /// one already at the release and one with no release version are left
     /// alone.
-    #[cfg(unix)]
     #[test]
     fn collector_004_a_collector_installed_another_way_is_left_alone() {
         let linked = collector_at(
@@ -945,7 +946,6 @@ mod tests {
     /// A user service running the replaced file is restarted; one running
     /// another file, or none, is not, and the result says a running
     /// collector keeps the old version.
-    #[cfg(unix)]
     #[test]
     fn collector_008_restarts_only_the_service_that_runs_the_replaced_file() {
         let restart_line = format!("{SYSTEMCTL} --user try-restart {COLLECTOR_SERVICE}");
@@ -1046,7 +1046,6 @@ mod tests {
     /// `--version`, replaced, and its running user service restarted. A
     /// download that does not match the manifest leaves it as it was and
     /// fails the step.
-    #[cfg(unix)]
     #[test]
     fn collector_009_upgrades_and_restarts_a_collector_beside_the_cli() {
         let dir = tempfile::tempdir().unwrap();
@@ -1158,7 +1157,6 @@ mod tests {
     }
 
     /// A staging root an upgrade accepts: a private directory of the user's.
-    #[cfg(unix)]
     fn prepare(root: &Path) {
         use std::os::unix::fs::PermissionsExt;
         std::fs::create_dir_all(root).unwrap();
