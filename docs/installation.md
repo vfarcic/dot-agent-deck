@@ -533,6 +533,8 @@ The result says nothing about hooks when Homebrew did not reach the new release,
 
 The [resource collector](telemetry.md#cpu-memory-and-disk-per-run) (`dot-agent-deck-collector`, Linux only) is a separate program. When the TUI, `dot-agent-deck upgrade` or the desktop app upgrades a CLI that was downloaded from a release, it also looks in the CLI's own directory for the collector, and the plan says so before you confirm. A Homebrew or Nix install upgrades the collector with its package, so for those the result says nothing about it.
 
+The collector moves only when the CLI beside it does. The copy doing the upgrade is what upgrades the collector, so the upgrade that first brings this in, made from a release without it, leaves the collector as it was; so does an upgrade whose collector step failed. Once the CLI is current, upgrading again does not come back for the collector: replace it by hand, the way [Install the collector](telemetry.md#install-the-collector) shows, or let the next release move both.
+
 | What the result says | What it means | What to do |
 |---|---|---|
 | `Upgraded the resource collector at <path> from v<old> to v<new>, checked the same way.` | The collector beside the CLI was downloaded, checked like the CLI (the checksum, the build provenance when `gh` can check it, and its version) and replaced. | Nothing, unless the next line says a collector keeps running the old version. |
@@ -545,7 +547,7 @@ The [resource collector](telemetry.md#cpu-memory-and-disk-per-run) (`dot-agent-d
 | `The resource collector first on your PATH, <path>, … is not in the upgraded CLI's folder, so it was left as it is.` | A collector elsewhere, such as a source build or another install method, is not this upgrade's to replace. | Upgrade it the way you installed it. |
 | `The resource collector at <path> was left as it is: …` | The file beside the CLI is a link to a collector installed elsewhere, or a system package owns it. | Upgrade it the way you installed it. |
 | `The resource collector at <path> already runs v<new>, so it was left as it is.` or `… does not report a release version, so it was left as it is.` | It is already current, or it is a build that does not know its version. | Nothing. |
-| `The resource collector at <path> was not upgraded and stays on v<old>: …` | Its download or a check failed, so the file was left as it was. The CLI's own upgrade still stands. | Try the upgrade again later; see [When an upgrade fails](#when-an-upgrade-fails) for the reason given. `dot-agent-deck upgrade` exits non-zero. |
+| `The resource collector at <path> was not upgraded and stays on v<old>: …`, then `Replace it by hand: …` | Its download or a check failed, so the file was left as it was. The CLI's own upgrade still stands, so upgrading again does not come back for the collector. `dot-agent-deck upgrade` exits non-zero. | Fix what the reason names ([When an upgrade fails](#when-an-upgrade-fails)), then replace the collector by hand as the next line says, the way [Install the collector](telemetry.md#install-the-collector) shows. |
 
 When the upgraded desktop app finds the daemon on this machine running the older release, it restarts the daemon onto its own version as the TUI does, asking first when agents are running ([Desktop app → Daemons → Upgrade the CLI and the daemon on this machine](desktop/daemons.md#upgrade-the-cli-and-the-daemon-on-this-machine)); if its Dashboard says **Incompatible daemon**, see [Keep the app and the daemon on the same release](#keep-the-app-and-the-daemon-on-the-same-release).
 

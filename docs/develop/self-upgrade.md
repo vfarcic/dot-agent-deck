@@ -47,6 +47,8 @@ A release ships `dot-agent-deck-collector-linux-{amd64,arm64}` beside the CLI's 
 
 **Cancellation and exit status.** Every await in `after_upgrade` is a download before the collector changes, as in `execute`. The CLI runs it inside the same signal-forwarding window as the copy's own upgrade (`upgrade_each`), under a `select!` on the interrupt (`collector_blocking`), and `atomic_replace` asks `Host::cancelled` right before the rename. A failed collector upgrade makes `dot-agent-deck upgrade` exit non-zero (`Report::ok`); it never turns the CLI's own outcome into a failure, and the TUI and the desktop app show it as a line in a successful result.
 
+**Not covered: a collector behind a current CLI.** The step runs only after an outcome that changed the CLI, so the first upgrade to a release with this step (made from an older deck) and an upgrade whose collector step failed both leave a current CLI beside an old collector, which no later plan offers; the failure line therefore says to replace it by hand rather than to try again. Offering a collector-only upgrade needs check-time detection and a plan kind every client handles: issue #2465.
+
 **Tests never touch a real collector or service.** The step runs its commands, `systemctl` included, through the `Host`, asks it every question about the machine, and writes only the collector beside the CLI the plan names and its own staging folder; the unit tests use `FakeHost` and a temporary folder, the L2 tests (`upgrade/cli-upgrade/009`–`012`, `upgrade/tui-upgrade/004`) put a stand-in `systemctl` in the sandbox `PATH`, which holds nothing else, and the desktop test `self_upgrade_042` puts one in the test's login `PATH`.
 
 ## Detection

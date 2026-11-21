@@ -349,11 +349,17 @@ async fn upgrade(
     asset: &str,
 ) -> Report {
     let version = plan.latest.as_str();
+    // The CLI is current once this step runs, so a later upgrade plans it as
+    // up to date and does not come back for the collector: the user replaces
+    // it by hand instead of being told to try again.
     let failed = |error: UpgradeError| Report {
-        lines: vec![PlanLine::Text(format!(
-            "The resource collector at {} was not upgraded and stays on v{previous}: {error}",
-            path.display()
-        ))],
+        lines: vec![
+            PlanLine::Text(format!(
+                "The resource collector at {} was not upgraded and stays on v{previous}: {error}",
+                path.display()
+            )),
+            PlanLine::Text(manual_line(asset, version, path)),
+        ],
         ok: false,
     };
     let mut staging = match Staging::create(staging_root, version) {
@@ -419,14 +425,23 @@ async fn upgrade(
                     lines.push(PlanLine::Command(command));
                 }
                 None => lines.push(PlanLine::Text(format!(
-                    "Its path cannot be shown safely in a command, so install it by hand: download `{asset}` from release v{version}, check it against checksums.txt, and replace {} with it.",
-                    path.display()
+                    "Its path cannot be shown safely in a command. {}",
+                    manual_line(asset, version, path)
                 ))),
             }
             lines.extend(restart_later(host, path, previous));
             Report::said(lines)
         }
     }
+}
+
+/// How to replace the collector at `path` by hand with `asset` of release
+/// `version`.
+fn manual_line(asset: &str, version: &str, path: &Path) -> String {
+    format!(
+        "Replace it by hand: download `{asset}` from release v{version}, check it against that release's checksums.txt, and save it over {}.",
+        path.display()
+    )
 }
 
 /// What systemd says about the collector's user service.
@@ -1131,6 +1146,12 @@ mod tests {
         assert!(lines[0].contains("stays on v0.49.3"), "{lines:?}");
         assert!(
             lines[0].contains("does not match checksums.txt"),
+            "{lines:?}"
+        );
+        // A later upgrade sees the CLI current and does not come back for the
+        // collector, so the result says how to replace it by hand.
+        assert!(
+            lines[1].starts_with("Replace it by hand: download `dot-agent-deck-collector-linux-amd64` from release v0.49.5"),
             "{lines:?}"
         );
         assert_eq!(std::fs::read(&beside).unwrap(), b"old collector");
