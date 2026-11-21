@@ -4666,11 +4666,17 @@ fn a_registered_set_too_large_to_index_is_refused_before_it_is_built() {
 /// is missing.
 #[test]
 fn the_credential_crosses_the_harness_env_clear() {
-    assert!(
-        INHERIT_PASS.contains(&ANTHROPIC_API_KEY_ENV),
-        "the credential a key-authorised lane-2 run depends on no longer \
-         reaches a deck-spawned agent: {INHERIT_PASS:?}"
-    );
+    for key in [ANTHROPIC_API_KEY_ENV, "GEMINI_API_KEY"] {
+        assert!(
+            INHERIT_PASS.contains(&key),
+            "the credential a key-authorised lane-2 run depends on no longer \
+             reaches a deck-spawned agent: {key}; {INHERIT_PASS:?}"
+        );
+        assert!(
+            AGENT_CREDENTIAL_ENV.contains(&key),
+            "synthetic decks must be able to suppress the forwarded credential: {key}"
+        );
+    }
 }
 
 // -----------------------------------------------------------------------

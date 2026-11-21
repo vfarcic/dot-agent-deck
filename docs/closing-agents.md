@@ -108,6 +108,7 @@ Without a terminal you cannot be shown a confirmation dialog, so `close` refuses
 
 - **Pi** does not report **Needs Input** or **Blocked**, so a Pi agent at a prompt or out of credit is not refused as busy.
 - **Devin** does not report **Blocked** or **Error**.
+- **Antigravity** does not report **Blocked**. An `agy` started from a shell inside a pane reports **Needs Input** only from its first prompt on ([Installation → Antigravity CLI](installation.md#antigravity-cli)), so before that one at a start-up question is not refused as busy.
 - **Codex** reports its status fully when the deck's Codex hooks are trusted. When they are not (see [Codex events not showing](troubleshooting.md#codex-events-not-showing)), a Codex agent reads **Idle** once its screen has been still for about three seconds, including while a permission prompt waits for an answer, so it is not refused as busy.
 
 An agent whose status the deck has not heard yet is not refused as busy either. Read the `--dry-run` output, or the agent's card, when it matters.

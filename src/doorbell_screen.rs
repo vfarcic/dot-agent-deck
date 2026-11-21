@@ -1041,6 +1041,227 @@ pub static CLAUDE_PROFILE: ScreenProfile = ScreenProfile {
 };
 
 // ---------------------------------------------------------------------------
+// Antigravity CLI (`agy` 1.5.9, measured 2026-11-16, PRD #211)
+// ---------------------------------------------------------------------------
+
+/// Antigravity's composer indent: text starts two cells in, after `> `, and
+/// a wrapped line's later rows start there too.
+const ANTIGRAVITY_INDENT: u16 = 2;
+
+/// The hints Antigravity draws in an empty composer, one per agent mode that
+/// has one (the default mode's is empty). Measured on 1.5.9 in the 256-colour
+/// `terminal` scheme, where it draws them in bright black; its colour schemes
+/// change that colour, so the hint is read by its text.
+const ANTIGRAVITY_PLACEHOLDERS: [&str; 3] = [
+    "Auto mode: edits & safe commands auto-approved (shift+tab to cycle)",
+    "Plan mode: research & plan only",
+    "Accept-edits mode: file edits auto-approved",
+];
+
+fn antigravity_placeholder(text: &str) -> bool {
+    ANTIGRAVITY_PLACEHOLDERS.contains(&text)
+}
+
+/// The composer: `>` at column 0, then a blank, on the row below a
+/// full-width rule ([`claude_rule`]), its text from column 2 and the rows
+/// below it up to the next full-width rule. Measured on 1.5.9 at 80, 120 and
+/// 175 columns: a line too long for the row wraps at a blank, and its next
+/// row starts two cells in, so rows are joined with one space; a later row
+/// that does not start at that indent, or a blank row among them, is content
+/// the text does not show ([`Composer::hidden`]). The hint is reported as
+/// `dim`, the placeholder style the profile reads ([`antigravity_placeholder`]).
+///
+/// The cursor sits right after the text, or at column 2 of an empty
+/// composer, in every measured frame.
+fn antigravity_composer(grid: &Grid) -> Option<Composer> {
+    let prompt_row = (1..grid.rows).rev().find(|&r| {
+        grid.cell(r, 0).is_some_and(|c| c.text == ">")
+            && grid.cell(r, 1).is_none_or(|c| c.text.trim().is_empty())
+            && claude_rule(grid, r - 1)
+    })?;
+    let close = (prompt_row + 1..grid.rows).find(|&r| claude_rule(grid, r))?;
+    let mut text = grid.text_from(prompt_row, ANTIGRAVITY_INDENT);
+    let mut last_row = prompt_row;
+    let mut hidden = false;
+    for row in prompt_row + 1..close {
+        let next = grid.text_from(row, 0);
+        let indented = next
+            .strip_prefix("  ")
+            .filter(|rest| !rest.starts_with(' ') && !rest.is_empty());
+        match indented {
+            Some(rest) if !hidden && !text.is_empty() => {
+                text.push(' ');
+                text.push_str(rest);
+                last_row = row;
+            }
+            _ => hidden = true,
+        }
+    }
+    let placeholder = antigravity_placeholder(&text);
+    let end_col = if last_row == prompt_row {
+        ANTIGRAVITY_INDENT
+            + grid
+                .text_from(prompt_row, ANTIGRAVITY_INDENT)
+                .chars()
+                .count() as u16
+    } else {
+        grid.text_from(last_row, 0).chars().count() as u16
+    };
+    let cursor_at_end = if text.is_empty() || placeholder {
+        grid.cursor == (prompt_row, ANTIGRAVITY_INDENT)
+    } else {
+        grid.cursor == (last_row, end_col)
+    };
+    Some(Composer {
+        prompt_row,
+        last_row,
+        text,
+        dim: placeholder,
+        cursor_at_end,
+        hidden,
+    })
+}
+
+/// The ready screen: the composer framed by two full-width rules, and
+/// `? for shortcuts` at the start of the row under the lower one, which
+/// Antigravity hides while its composer holds text (measured on 1.5.9).
+fn antigravity_ready(grid: &Grid) -> bool {
+    let Some(composer) = antigravity_composer(grid) else {
+        return false;
+    };
+    let Some(close) = (composer.last_row + 1..grid.rows).find(|&r| claude_rule(grid, r)) else {
+        return false;
+    };
+    grid.text_from(close + 1, 0).starts_with("? for shortcuts")
+}
+
+/// The rows `agy` 1.5.9 draws around its permission menus' choices: the
+/// command menu's and the file-creation menu's two frame rows (measured
+/// 2026-11-16 and 2026-11-17; the same rows `question::antigravity_deny_shown`
+/// reads).
+const ANTIGRAVITY_MENU_FRAME_ROWS: [&str; 4] = [
+    "Requesting permission for:",
+    "Run this command?",
+    "Create file",
+    "Allow creation of this file?",
+];
+
+/// The hint `agy` 1.5.9 draws on the row under a menu's last choice, in
+/// both measured menus (`↑/↓ Navigate · …`).
+const ANTIGRAVITY_MENU_HINT: &str = "\u{2191}/\u{2193} Navigate";
+
+/// One choice row of an Antigravity menu: `> N. …` for the highlighted one,
+/// `  N. …` for the others. Whether it is highlighted, and its number.
+fn antigravity_choice(text: &str) -> Option<(bool, u32)> {
+    let trimmed = text.trim_start();
+    let (cursor, rest) = match trimmed.strip_prefix("> ") {
+        Some(rest) => (true, rest),
+        None => (false, trimmed),
+    };
+    let digits = rest.chars().take_while(char::is_ascii_digit).count();
+    if digits == 0 || !rest[digits..].starts_with(". ") {
+        return None;
+    }
+    rest[..digits].parse().ok().map(|n| (cursor, n))
+}
+
+/// Antigravity's dialogs. Its start-up dialogs (colour scheme, terms, folder
+/// trust, sign-in) are drawn on the alternate screen, where the main screen
+/// never is (measured on 1.5.9), and every such screen is unrecognised. Its
+/// permission menus are drawn inline, where a digit acts at once, and are
+/// read by their structure, outside the composer's box (whose text a person
+/// may begin with `1. …`): a row of either measured menu's frame, or a run of
+/// choice rows numbered 1, 2, … on consecutive rows, exactly one of them
+/// highlighted with `> `, framed as both measured menus are, by a question
+/// ending in `?` on the row above or the `↑/↓ Navigate` hint on the row
+/// below. None was seen after the ready composer, so every such screen is
+/// unrecognised, and the doorbell types into none of them.
+fn antigravity_dialog(grid: &Grid) -> Option<Dialog> {
+    if grid.alternate_screen {
+        return Some(Dialog::Unrecognised);
+    }
+    let composer = antigravity_composer(grid).map(|c| {
+        let close = (c.prompt_row + 1..grid.rows)
+            .find(|&r| claude_rule(grid, r))
+            .unwrap_or(c.last_row + 1);
+        c.prompt_row..close
+    });
+    let outside = |r: u16| composer.as_ref().is_none_or(|rows| !rows.contains(&r));
+    let rows: Vec<Option<String>> = (0..grid.rows)
+        .map(|r| outside(r).then(|| grid.text_from(r, 0)))
+        .collect();
+    let row = |r: usize| rows.get(r).and_then(|t| t.as_deref());
+    if rows
+        .iter()
+        .flatten()
+        .any(|text| ANTIGRAVITY_MENU_FRAME_ROWS.contains(&text.trim()))
+    {
+        return Some(Dialog::Unrecognised);
+    }
+    let mut r = 0;
+    while r < rows.len() {
+        if row(r).and_then(antigravity_choice).map(|(_, n)| n) != Some(1) {
+            r += 1;
+            continue;
+        }
+        let first = r;
+        let mut cursors = 0;
+        let mut next = 1;
+        while let Some((cursor, n)) = row(r).and_then(antigravity_choice) {
+            if n != next {
+                break;
+            }
+            cursors += usize::from(cursor);
+            next += 1;
+            r += 1;
+        }
+        let choices = r - first;
+        let asked = first
+            .checked_sub(1)
+            .and_then(row)
+            .is_some_and(|text| text.trim_end().ends_with('?'));
+        let hinted =
+            row(r).is_some_and(|text| text.trim_start().starts_with(ANTIGRAVITY_MENU_HINT));
+        if choices >= 2 && cursors == 1 && (asked || hinted) {
+            return Some(Dialog::Unrecognised);
+        }
+        r = first + 1;
+    }
+    None
+}
+
+/// How Antigravity shows a submitted message in its transcript was not
+/// measured, so no transcript line is read as one.
+fn antigravity_transcript_user_line(_grid: &Grid, _line: &str) -> bool {
+    false
+}
+
+/// Antigravity 1.5.9: the main screen, drawn inline; after each of two
+/// resizes, one of them a one-column nudge, it cleared the screen
+/// (`ESC[2J ESC[3J ESC[H`) and redrew it whole within a second, its rules
+/// across the new width. It sends no cursor position query.
+pub static ANTIGRAVITY_PROFILE: ScreenProfile = ScreenProfile {
+    id: "antigravity-2026-11",
+    composer: antigravity_composer,
+    ready: antigravity_ready,
+    placeholder: antigravity_placeholder,
+    dialog: antigravity_dialog,
+    transcript_user_line: antigravity_transcript_user_line,
+    redraw_marker: b"\x1b[2J",
+    width_witness: claude_width_witness,
+    pair_witness: no_pair_witness,
+    agreement: false,
+    min_cols: 80,
+    cpr_wait_end: crate::composer_probe::query_ledger::CprWaitEnd::Counted,
+    redraw: crate::composer_probe::query_wait::RedrawTiming {
+        per_size_change: std::time::Duration::from_millis(1000),
+        margin: std::time::Duration::from_millis(500),
+        cap: std::time::Duration::from_secs(10),
+        waits_on: &[],
+    },
+};
+
+// ---------------------------------------------------------------------------
 // The e2e build's stand-in (`tests/support/empty_composer.py`)
 // ---------------------------------------------------------------------------
 
@@ -1427,7 +1648,7 @@ fn standin_arguments(_pid: u32) -> Option<Vec<Vec<u8>>> {
 
 /// The profile a record names.
 pub fn profile(id: &str) -> Option<&'static ScreenProfile> {
-    [&CODEX_PROFILE, &CLAUDE_PROFILE]
+    [&CODEX_PROFILE, &CLAUDE_PROFILE, &ANTIGRAVITY_PROFILE]
         .into_iter()
         .find(|p| p.id == id)
 }
@@ -1583,6 +1804,7 @@ pub fn profile_for_agent(
     match agent? {
         crate::event::AgentType::Codex => Some(&CODEX_PROFILE),
         crate::event::AgentType::ClaudeCode => Some(&CLAUDE_PROFILE),
+        crate::event::AgentType::Antigravity => Some(&ANTIGRAVITY_PROFILE),
         _ => None,
     }
 }
@@ -1857,5 +2079,294 @@ mod e2e_only_standin_tests {
         short.extend_from_slice(b"/bin/sh\0sh\0-c\0");
         assert_eq!(parse_procargs2(&short), None);
         assert_eq!(parse_procargs2(b"\x01\0"), None);
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod antigravity_tests {
+    use super::*;
+
+    const PLACEHOLDER: &str = "Auto mode: edits & safe commands auto-approved (shift+tab to cycle)";
+    const LINE: &str = "(abcdfg) dot-agent-deck: message m-k3xzq2ab-0f3c9a71d2e4b850 waiting, run: /home/me/.local/bin/dot-agent-deck inbox fetch";
+
+    /// A frame drawn as `agy` 1.5.9 draws its main screen (measured
+    /// 2026-11-16): its header, the start-up notice, the composer between two
+    /// full-width rules holding `rows` (`> ` then each wrapped row's text),
+    /// a footer, and the cursor at `cursor` (1-based row and column).
+    fn frame(cols: u16, rows: &[&str], footer: &str, cursor: (u16, u16)) -> Grid {
+        let rule = "\u{2500}".repeat(cols as usize);
+        let mut bytes = format!(
+            "\x1b[2J\x1b[H\r\n      \x1b[94;1mAntigravity CLI 1.5.9\x1b[m\r\n\r\n \u{2503} Auto is now the default agent mode\r\n \u{2503} esc to dismiss\r\n\x1b[90m{rule}\x1b[m\r\n"
+        );
+        for row in rows {
+            bytes.push_str(row);
+            bytes.push_str("\r\n");
+        }
+        bytes.push_str(&format!("\x1b[90m{rule}\x1b[m\r\n{footer}"));
+        bytes.push_str(&format!("\x1b[{};{}H", cursor.0, cursor.1));
+        Grid::parse(bytes.as_bytes(), 30, cols)
+    }
+
+    /// The main screen with `rows` drawn from its top, the cursor parked
+    /// under them, as `agy` 1.5.9 draws a permission menu inline.
+    fn menu(rows: &[&str]) -> Grid {
+        let mut bytes = String::from("\x1b[2J\x1b[H");
+        for row in rows {
+            bytes.push_str(row);
+            bytes.push_str("\r\n");
+        }
+        Grid::parse(bytes.as_bytes(), 30, 120)
+    }
+
+    /// PRD #211 (PR #2370 review, Qodo 2): a composer whose text starts like a
+    /// numbered choice, one row or wrapped over two, is a draft, not a
+    /// dialog; so is a numbered list in the transcript above the ready
+    /// composer. The measured menus are dialogs by their structure — the
+    /// file-creation menu, a command menu with its frame rows scrolled away,
+    /// one with the highlight moved to another choice — and so is a frame row
+    /// alone.
+    #[test]
+    fn antigravity_menus_are_read_by_their_structure_not_a_numbered_draft() {
+        let agy = &ANTIGRAVITY_PROFILE;
+        let draft = frame(120, &["> 1. fix the login bug"], "", (7, 23));
+        assert_eq!((agy.dialog)(&draft), None);
+        assert_eq!(
+            agy.holds(&draft, "1. fix the login bug"),
+            Some(ComposerText::Exact)
+        );
+        let wrapped = frame(
+            80,
+            &["> 1. fix the login bug", "  2. then rerun the tests?"],
+            "",
+            (8, 27),
+        );
+        assert_eq!(
+            (agy.dialog)(&wrapped),
+            None,
+            "a draft wrapped over two rows"
+        );
+        let transcript = Grid::parse(
+            format!(
+                "\x1b[2J\x1b[HWhich should I do first?\r\n> 1. fix the login bug\r\n  2. rerun the tests\r\n\x1b[90m{rule}\x1b[m\r\n>\r\n\x1b[90m{rule}\x1b[m\r\n? for shortcuts\x1b[5;3H",
+                rule = "\u{2500}".repeat(120)
+            )
+            .as_bytes(),
+            30,
+            120,
+        );
+        assert!((agy.ready)(&transcript));
+        assert_eq!(
+            (agy.dialog)(&transcript),
+            Some(Dialog::Unrecognised),
+            "a highlighted, numbered run under a question reads as a menu"
+        );
+        let numbered = Grid::parse(
+            format!(
+                "\x1b[2J\x1b[HDone. Next steps:\r\n1. fix the login bug\r\n2. rerun the tests\r\n\x1b[90m{rule}\x1b[m\r\n>\r\n\x1b[90m{rule}\x1b[m\r\n? for shortcuts\x1b[5;3H",
+                rule = "\u{2500}".repeat(120)
+            )
+            .as_bytes(),
+            30,
+            120,
+        );
+        assert_eq!(
+            (agy.dialog)(&numbered),
+            None,
+            "a numbered list with no highlight is not a menu"
+        );
+        assert!(agy.empty_and_ready(&numbered));
+
+        let creation = menu(&[
+            "Create file",
+            &"\u{2500}".repeat(120),
+            "/work/project/probe-create.txt  +1",
+            "  1  +  PROBE",
+            "Allow creation of this file?",
+            "> 1. Yes, allow creation",
+            "  2. No, deny creation",
+            "  \u{2191}/\u{2193} Navigate \u{b7} f full diff",
+            "esc to cancel",
+        ]);
+        assert_eq!((agy.dialog)(&creation), Some(Dialog::Unrecognised));
+        let choices_only = menu(&[
+            "  1. Yes, run command",
+            "  2. Yes, and always allow in this conversation",
+            "  3. Yes, and always allow (Persist to settings.json)",
+            "> 4. No, cancel",
+            "  \u{2191}/\u{2193} Navigate \u{b7} tab Amend \u{b7} ctrl+g edit/expand command",
+        ]);
+        assert_eq!(
+            (agy.dialog)(&choices_only),
+            Some(Dialog::Unrecognised),
+            "the highlight on the last choice, under the hint"
+        );
+        let frame_row = menu(&["Requesting permission for:", "   rm -f probe.txt"]);
+        assert_eq!((agy.dialog)(&frame_row), Some(Dialog::Unrecognised));
+    }
+
+    /// PRD #211: the ready composer shows its agent mode's hint, in any
+    /// colour, and is empty and ready; a typed line is held exactly while the
+    /// cursor follows it; a line `agy` wrapped at a blank with its two-cell
+    /// indent reads as that line.
+    #[test]
+    fn antigravity_ready_composer_hint_and_echo() {
+        let agy = &ANTIGRAVITY_PROFILE;
+        let ready = frame(
+            120,
+            &[&format!(">\x1b[90m {PLACEHOLDER}\x1b[m")],
+            "\x1b[90m? for shortcuts\x1b[m",
+            (7, 3),
+        );
+        assert!(agy.empty_and_ready(&ready));
+        assert!(agy.placeholder_empty(&ready));
+        assert_eq!((agy.dialog)(&ready), None);
+
+        let typed = frame(
+            175,
+            &[&format!("> {LINE}")],
+            "",
+            (7, 3 + LINE.chars().count() as u16),
+        );
+        assert_eq!(agy.holds(&typed, LINE), Some(ComposerText::Exact));
+        assert!(!agy.empty_and_ready(&typed));
+        // The cursor elsewhere in the box: the text may hold more.
+        let moved = frame(175, &[&format!("> {LINE}")], "", (7, 5));
+        assert_eq!(agy.holds(&moved, LINE), Some(ComposerText::Other));
+
+        let (first, second) = LINE.split_at(LINE.find(" /home").unwrap());
+        let wrapped = frame(
+            80,
+            &[&format!("> {first}"), &format!("  {}", &second[1..])],
+            "",
+            (8, 3 + second.len() as u16 - 1),
+        );
+        assert_eq!(agy.holds(&wrapped, LINE), Some(ComposerText::Exact));
+        let unindented = frame(80, &[&format!("> {first}"), &second[1..]], "", (8, 1));
+        assert_eq!(agy.holds(&unindented, LINE), Some(ComposerText::Other));
+    }
+
+    /// After Ctrl+U `agy` 1.5.9 leaves a blank composer with no hint: empty
+    /// while the cursor sits at its start, but no placeholder confirms it. A
+    /// screen with no footer hint, a numbered choice or the alternate screen
+    /// is not the ready composer.
+    #[test]
+    fn antigravity_blank_composer_dialogs_and_other_screens() {
+        let agy = &ANTIGRAVITY_PROFILE;
+        let blank = frame(120, &[">"], "? for shortcuts", (7, 3));
+        assert!(agy.empty_and_ready(&blank));
+        assert!(!agy.placeholder_empty(&blank));
+
+        let no_footer = frame(120, &[">"], "", (7, 3));
+        assert!(!agy.empty_and_ready(&no_footer));
+
+        let permission = menu(&[
+            "Command",
+            &"\u{2500}".repeat(120),
+            "Requesting permission for:",
+            "   rm -f probe.txt",
+            "Run this command?",
+            "> 1. Yes, run command",
+            "  2. Yes, and always allow in this conversation for commands that start with 'rm -f probe.txt'",
+            "  3. Yes, and always allow for commands that start with 'rm -f probe.txt' (Persist to settings.json)",
+            "  4. No, cancel",
+            "  \u{2191}/\u{2193} Navigate \u{b7} tab Amend \u{b7} ctrl+g edit/expand command",
+            "esc to cancel",
+        ]);
+        assert_eq!((agy.dialog)(&permission), Some(Dialog::Unrecognised));
+        assert!(!agy.empty_and_ready(&permission));
+
+        let alternate = Grid::parse(b"\x1b[?1049h  > Yes, I trust this folder", 30, 120);
+        assert_eq!((agy.dialog)(&alternate), Some(Dialog::Unrecognised));
+
+        assert_eq!(
+            profile_for_agent(Some(&crate::event::AgentType::Antigravity)).map(|p| p.id),
+            Some("antigravity-2026-11")
+        );
+        assert_eq!(profile("antigravity-2026-11").map(|p| p.id), Some(agy.id));
+    }
+
+    /// Real `agy` 1.5.9's output, 143 × 40, measured 2026-11-17: its ready
+    /// screen in Auto mode, a 145-character doorbell line typed in one write
+    /// and echoed whole (not misrendered), then one DEL per write, 20 ms
+    /// apart, for each of its characters, sent by the measurement, not by a
+    /// doorbell transaction
+    /// (`tests/fixtures/antigravity/composer-after-paced-deletes.bin`). It
+    /// shows what `agy` draws once such deletes took the whole line; the
+    /// deck's own withdrawal of a line that long at that pace does not fit a
+    /// transaction's deadline and is not started.
+    pub(crate) const PACED_DELETES: &[u8] =
+        include_bytes!("../tests/fixtures/antigravity/composer-after-paced-deletes.bin");
+    /// Where the line had been echoed whole, before the first DEL.
+    pub(crate) const PACED_DELETES_TYPED: usize = 4954;
+    pub(crate) const PACED_DELETES_LINE: &str = "(oomimg) dot-agent-deck: message m-cj3oiiqh-3213cd9b5291441a waiting, run: /var/tmp/agy-measure-vESMu6/deck-under-test/dot-agent-deck inbox fetch";
+
+    /// PRD #211: after paced deletes of the whole line `agy` draws a bare `>` with
+    /// the cursor at its start and `? for shortcuts` back under it — no
+    /// mode hint, even in Auto mode, whose hint the ready screen showed. The
+    /// frame the doorbell reads is that blank composer, no placeholder, no
+    /// dialog, which is what a gap withdrawal on a profile with no measured
+    /// placeholder is confirmed by (`doorbell_txn::Txn::confirm_withdrawn`).
+    #[test]
+    fn antigravity_paced_deletes_leave_a_blank_composer() {
+        let agy = &ANTIGRAVITY_PROFILE;
+        let typed = Grid::parse(&PACED_DELETES[..PACED_DELETES_TYPED], 40, 143);
+        assert_eq!(
+            agy.holds(&typed, PACED_DELETES_LINE),
+            Some(ComposerText::Exact)
+        );
+
+        let deleted = Grid::parse(PACED_DELETES, 40, 143);
+        assert!(agy.empty_and_ready(&deleted));
+        assert!(!agy.placeholder_empty(&deleted), "no hint comes back");
+        let read = super::frame(agy, &deleted, 0, true, None);
+        assert_eq!(read.dialog, None);
+        let composer = read.composer.expect("the ready composer");
+        assert_eq!(composer.text, "");
+        assert!(composer.cursor_at_end, "the cursor at the composer's start");
+        assert!(!composer.placeholder && !composer.hidden && !composer.selection);
+    }
+
+    /// Real `agy` 1.5.9's output, 143 × 40, measured 2026-11-17
+    /// (`tests/fixtures/antigravity/composer-after-clear.bin`): its ready
+    /// screen in Auto mode with the start-up mode notice up, a 166-character
+    /// doorbell line typed in one write and echoed whole on two rows, then
+    /// ONE Ctrl+U, sent by the measurement. It is the frame the doorbell's
+    /// clear withdrawal (`doorbell_txn::Txn::clear_lines`) is confirmed on.
+    pub(crate) const CLEAR: &[u8] =
+        include_bytes!("../tests/fixtures/antigravity/composer-after-clear.bin");
+    /// Where the line had been echoed whole, before the Ctrl+U.
+    pub(crate) const CLEAR_TYPED: usize = 5072;
+    pub(crate) const CLEAR_LINE: &str = "(oomimg) dot-agent-deck: message m-cj3oiiqh-3213cd9b5291441a waiting, run: /var/tmp/agy-measure-no7iLg/deck-under-test-0123456789abcdefghij/dot-agent-deck inbox fetch";
+
+    /// PRD #211: one Ctrl+U empties the whole logical line, both of its
+    /// wrapped rows, and leaves the frame paced deletes leave: a bare `>`
+    /// with the cursor at its start, no mode hint, `? for shortcuts` back
+    /// under the box.
+    #[test]
+    fn antigravity_one_clear_empties_a_wrapped_line() {
+        let agy = &ANTIGRAVITY_PROFILE;
+        assert_eq!(CLEAR_LINE.chars().count(), 166);
+        let typed = Grid::parse(&CLEAR[..CLEAR_TYPED], 40, 143);
+        assert_eq!(agy.holds(&typed, CLEAR_LINE), Some(ComposerText::Exact));
+        let rows = super::frame(agy, &typed, 0, true, None);
+        assert!(
+            rows.composer.is_some_and(|c| c.text == CLEAR_LINE),
+            "one logical line, wrapped onto two rows"
+        );
+
+        let cleared = Grid::parse(CLEAR, 40, 143);
+        assert!(agy.empty_and_ready(&cleared));
+        assert!(!agy.placeholder_empty(&cleared), "no hint comes back");
+        let read = super::frame(agy, &cleared, 0, true, None);
+        assert_eq!(read.dialog, None);
+        let composer = read.composer.as_ref().expect("the ready composer");
+        assert_eq!(composer.text, "", "nothing of either row is left");
+        assert!(composer.cursor_at_end, "the cursor at the composer's start");
+        assert!(!composer.placeholder && !composer.hidden && !composer.selection);
+        let paced = super::frame(agy, &Grid::parse(PACED_DELETES, 40, 143), 0, true, None);
+        assert_eq!(
+            paced.composer, read.composer,
+            "the frame paced deletes leave"
+        );
     }
 }

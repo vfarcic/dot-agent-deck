@@ -18,7 +18,7 @@ The Schedules manager exists only in the TUI. In the desktop app, a schedule's r
 ## Before you start
 
 - **A running daemon.** Starting the TUI (`dot-agent-deck`) starts one if none is running. The `schedule` subcommands do not start one. Check with `dot-agent-deck daemon status`, which reports a missing daemon rather than starting it.
-- **An agent command.** A plain schedule needs the command that launches your agent, for example `claude`, `opencode`, `pi`, `codex` or `devin`, or a wrapper that ends up running one of them (`devbox run agent`). Any other command runs, but the deck cannot show its status.
+- **An agent command.** A plain schedule needs the command that launches your agent, for example `claude`, `opencode`, `pi`, `codex`, `devin` or `agy`, or a wrapper that ends up running one of them (`devbox run agent`). Any other command runs, but the deck cannot show its status.
 - **For issue dispatch only:** the GitHub CLI `gh`, installed and signed in (`gh auth status` succeeds), and `git`, both on the daemon's `PATH`. Read access to the repository is enough to dispatch. To [claim](#claims-on-github) the issues it dispatches, the account `gh` is signed in with also needs to add labels and comments to the repository's issues: write access to the repository covers the whole claim, including creating its label, and an account that can apply labels and comment but not create labels can claim once the `agent-deck/claimed` label exists.
 
 ## Schedule a prompt with the CLI

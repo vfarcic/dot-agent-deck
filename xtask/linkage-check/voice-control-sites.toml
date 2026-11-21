@@ -119,6 +119,12 @@ reason = "Dismisses the toast with the star reminder's sentence (thanks, or wher
 [[site]]
 file = "desktop/src/App.tsx"
 handler = "onClick"
+code = "onDismissAntigravity"
+reason = "Dismisses the toast with the Antigravity notice's sentence (thanks, or where to report): a dismissal. The notice's choices go through `VOICE_ACTIONS` (PRD #211)."
+
+[[site]]
+file = "desktop/src/App.tsx"
+handler = "onClick"
 code = "onDismissTrust"
 reason = "Dismisses the toast saying what an in-deck approval request's review did (approved, declined, answered elsewhere): a dismissal. The review's Approve and Deny go through `approveProjectCommands` and `cancelProjectCommands` (issue #2330)."
 

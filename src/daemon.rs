@@ -888,6 +888,9 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // delivery as state on the pane's card instead of typing a diagnostic line
     // into the agent's input buffer. See `install_delivery_notice_sink`.
     install_delivery_notice_sink(&pty_registry, state.clone(), event_tx.clone());
+    // PRD #211: the status an agent writes to its terminal (OSC 7501), read
+    // by each pane's reader thread and applied by the monitor below.
+    let status_signals = install_status_signal_sink(&pty_registry);
     let client_count = daemon.client_count;
     let idle_shutdown = daemon.idle_shutdown;
     let scheduler = daemon.scheduler;
@@ -1111,6 +1114,17 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         })
     };
 
+    // PRD #211: unconditional; it waits on the reader threads' channel and
+    // runs no timer unless a sign-in signal is being held back.
+    let status_osc_handle = {
+        let registry = pty_registry.clone();
+        let monitor_state = state.clone();
+        let monitor_event_tx = event_tx.clone();
+        tokio::spawn(async move {
+            run_status_osc_monitor(registry, monitor_state, monitor_event_tx, status_signals).await;
+        })
+    };
+
     // PRD #1666 part 3 (Q35-20e): unconditional — every attached client's
     // card follows the typing the deck holds for its pane. Waits on the
     // registry's display notice, so it runs no timer while nothing is held.
@@ -1179,6 +1193,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     }
     shell_activity_handle.abort();
     codex_rollout_handle.abort();
+    status_osc_handle.abort();
     input_held_handle.abort();
     opencode_mode_handle.abort();
     pull_request_handle.abort();
@@ -1970,6 +1985,32 @@ async fn ingest_hook_event(
     unproven: bool,
     attested_agent: Option<String>,
 ) {
+    ingest_hook_line(
+        state,
+        event_tx,
+        registry,
+        event,
+        unproven,
+        attested_agent,
+        std::time::Instant::now(),
+    )
+    .await;
+}
+
+/// [`ingest_hook_event`] for an event whose line the hook loop read whole at
+/// `read_at`, before it waited for the events ordered ahead of it. PRD #211
+/// (PR #2370 review P1, audit S2): what an Antigravity hook says about the
+/// keys a person typed is bound to what had been typed by `read_at`, not by
+/// whenever its turn came.
+async fn ingest_hook_line(
+    state: &SharedState,
+    event_tx: &broadcast::Sender<BroadcastMsg>,
+    registry: &Arc<AgentPtyRegistry>,
+    event: AgentEvent,
+    unproven: bool,
+    attested_agent: Option<String>,
+    read_at: std::time::Instant,
+) {
     let untagged_claim = match (&attested_agent, &event.agent_id, &event.pane_id) {
         (Some(owner), None, Some(pane)) => Some((owner.clone(), pane.clone())),
         _ => None,
@@ -1990,8 +2031,51 @@ async fn ingest_hook_event(
     {
         registry.close_release_window(owner);
     }
+    // PRD #211 (PR #2370 review, Greptile P1; review P1; audit S2):
+    // Antigravity has no editor probe to read its box empty again after a
+    // person typed in it, so its own main-session hooks, attested to the
+    // generation and accepted, are among what does. `PreInvocation` on a
+    // turn's first model call says `agy` took a submitted prompt: when a
+    // person's Enter written before this line was read is still the last
+    // thing that entered the box, that submit emptied it. A later call of the
+    // same turn, a `Stop` continue's included, carries no prompt. And that
+    // first call, a call's `PostToolUse` and the turn's `Stop` each say a
+    // permission prompt is no longer up, which settles menu keys typed at it
+    // before this line was read, even when `agy`'s own older status is then
+    // refused for repainting the card this hook moved on.
+    let antigravity_witness = (event.agent_type == crate::event::AgentType::Antigravity
+        && !unproven
+        && !event.is_status_signal()
+        && !event.is_from_subagent())
+    .then(|| attested_agent.clone())
+    .flatten()
+    .map(|owner| {
+        let first_call = event.user_prompt.is_some();
+        let departs = first_call
+            || matches!(
+                event.event_type,
+                crate::event::EventType::ToolEnd
+                    | crate::event::EventType::Idle
+                    | crate::event::EventType::Error
+            );
+        (owner, first_call, departs)
+    });
     let event_type = event.event_type.clone();
     let claimed_pane = event.pane_id.clone();
+    // PRD #211 (third review B2): an Antigravity call, which a permission
+    // prompt already shown may be waiting for.
+    let call = (event.agent_type == crate::event::AgentType::Antigravity
+        && event_type == crate::event::EventType::ToolStart
+        && !unproven
+        && !event.is_status_signal()
+        && !event.is_from_subagent())
+    .then(|| {
+        event
+            .pane_id
+            .clone()
+            .zip(event.agent_id.clone().or_else(|| attested_agent.clone()))
+    })
+    .flatten();
     // Issue #2347: a dropped prompt's report the guard refuses is expected,
     // and logged there; it says nothing about the token's generation. One
     // the generation re-check refused still warns (PR #2405 review).
@@ -2011,6 +2095,22 @@ async fn ingest_hook_event(
         },
     )
     .await;
+    if ingested && let Some((owner, first_call, departs)) = antigravity_witness {
+        if first_call {
+            registry.note_prompt_taken(&owner, read_at);
+        }
+        if departs {
+            registry.note_menu_answer_taken(
+                &owner,
+                read_at,
+                crate::composer_probe::epoch::Departure::Hook,
+            );
+        }
+    }
+    if ingested && let Some((pane_id, agent_id)) = call {
+        rebuild_antigravity_permission_question(state, event_tx, registry, &pane_id, &agent_id)
+            .await;
+    }
     if !ingested
         && (!prompt_not_taken || generation_replaced.load(std::sync::atomic::Ordering::Relaxed))
     {
@@ -2442,6 +2542,14 @@ where
         debug!(
             pane_id = ?question_pane.as_deref().map(escape_id_for_log),
             "question: a question from a session the pane has moved past is not applied"
+        );
+    }
+    // PRD #211 (audit, CWE-345): an Antigravity permission question that is no
+    // longer bound to the call its agent's hook reported is not offered.
+    if state.strip_unbound_antigravity_question(&mut event) {
+        debug!(
+            pane_id = ?question_pane.as_deref().map(escape_id_for_log),
+            "question: an Antigravity prompt no longer bound to its tool call is answered by keyboard"
         );
     }
     // PRD #1631 (audit A4): the question's revision is the daemon's, stamped
@@ -3269,6 +3377,11 @@ fn admit_producer_event(event: &mut AgentEvent) {
     event
         .metadata
         .remove(crate::event::DELIVERY_NOTICE_CLEARED_METADATA_KEY);
+    // PRD #211: nor does a producer say its frame is the agent's terminal
+    // status; the OSC reader is the daemon's own.
+    event
+        .metadata
+        .remove(crate::event::STATUS_SIGNAL_METADATA_KEY);
     // PRD #1666 S6: nor does a producer say a prompt is the deck's own
     // message; the raw-event ingress stamps that after this, and no other
     // ingress does.
@@ -3592,6 +3705,919 @@ async fn run_codex_rollout_monitor(
         for failure in failures {
             report_codex_rollout_failure(&state, &event_tx, &registry, failure).await;
         }
+    }
+}
+
+/// PRD #211 (audit, CWE-400/770): the most OSC 7501 signals one generation
+/// may have waiting for [`run_status_osc_monitor`]. A pane writing them faster
+/// than the daemon applies them keeps only its latest ones: each signal states
+/// the agent's whole status, so the latest wins, and the signals kept are in
+/// the order they were written — a trailing permission prompt or sign-in
+/// signal, which the card has to see, is among them.
+pub(crate) const MAX_PENDING_STATUS_SIGNALS: usize = 16;
+
+/// PRD #211 (second review, findings 2 and 5): the longest an OSC 7501 signal
+/// stays parked behind a hook event of its generation that was received before
+/// the signal was read and is still being ingested
+/// ([`run_status_osc_monitor`]). Longer than the predecessor wait and the
+/// hook's own acknowledgement deadline; an ingest still in flight past it is
+/// held up on something else, such as the pane's question lifecycle or the
+/// state lock, neither of which is bounded by this wait. The signal is then
+/// applied on a task of its own, never by the monitor itself.
+const STATUS_SIGNAL_HOOK_WAIT: Duration = Duration::from_secs(10);
+
+/// PRD #211 (second review, finding 5): how often the monitor looks again at
+/// generations whose signals are parked.
+const STATUS_SIGNAL_PARK_TICK: Duration = Duration::from_millis(5);
+
+/// PRD #211 (second review, finding 2): one hook event attested to generation
+/// `owner`, whose line the hook loop read whole at `at`
+/// ([`AgentPtyRegistry::note_hook_receipt`]) and, when this is dropped,
+/// ingested ([`AgentPtyRegistry::note_hook_applied`]) — whether the hook loop
+/// applied it, refused it or stopped reading.
+struct HookReceipt {
+    registry: Arc<AgentPtyRegistry>,
+    owner: String,
+    at: std::time::Instant,
+}
+
+impl HookReceipt {
+    fn note(registry: &Arc<AgentPtyRegistry>, owner: &str, at: std::time::Instant) -> Self {
+        registry.note_hook_receipt(owner, at);
+        Self {
+            registry: Arc::clone(registry),
+            owner: owner.to_string(),
+            at,
+        }
+    }
+}
+
+impl Drop for HookReceipt {
+    fn drop(&mut self) {
+        self.registry.note_hook_applied(&self.owner, self.at);
+    }
+}
+
+/// PRD #211 (audit, CWE-400/770): the most generations with signals waiting.
+/// Reached only by a burst across that many live panes; past it the
+/// generation that has waited longest loses what it had waiting.
+pub(crate) const MAX_PENDING_STATUS_GENERATIONS: usize = 1024;
+
+/// PRD #211 (audit, CWE-400/770): the OSC 7501 signals waiting for
+/// [`run_status_osc_monitor`], coalesced per generation and bounded by
+/// [`MAX_PENDING_STATUS_SIGNALS`] and [`MAX_PENDING_STATUS_GENERATIONS`], so a
+/// pane flooding its terminal with valid signals cannot grow the daemon's
+/// memory or starve the other panes. Pushing never blocks the reader thread
+/// beyond one short mutex hold.
+#[derive(Default)]
+pub(crate) struct StatusSignalQueue {
+    pending: std::sync::Mutex<PendingStatus>,
+    ready: tokio::sync::Notify,
+    /// Test seam: how many times [`run_status_osc_monitor`] has woken.
+    #[cfg(test)]
+    wakes: std::sync::atomic::AtomicU64,
+    /// Test seam: how many [`StatusApply`] tasks are running.
+    #[cfg(test)]
+    applies_running: std::sync::atomic::AtomicUsize,
+    /// Test seam: how many [`StatusApply`] tasks have been spawned.
+    #[cfg(test)]
+    applies_spawned: std::sync::atomic::AtomicUsize,
+}
+
+#[derive(Default)]
+struct PendingStatus {
+    /// Each generation's waiting signals, with when it first had any waiting.
+    by_generation: std::collections::HashMap<(String, String), (u64, PendingSignals)>,
+    next: u64,
+    /// Signals dropped to the bounds since the last report of it.
+    dropped: u64,
+}
+
+/// One generation's OSC 7501 signals waiting in a [`StatusSignalQueue`], each
+/// with when its pane's reader read it: the receipt-order witness a signal is
+/// applied under ([`report_status_update`]).
+pub(crate) struct PendingSignals {
+    pub(crate) pane_id: String,
+    pub(crate) agent_id: String,
+    pub(crate) agent_type: crate::event::AgentType,
+    /// In the order they were written, each with the reader epoch it was
+    /// read under.
+    pub(crate) signals: Vec<(crate::status_osc::OscSignal, std::time::Instant, u64)>,
+}
+
+impl StatusSignalQueue {
+    /// Queue `signals`, coalesced into what the same generation already has
+    /// waiting.
+    pub(crate) fn push(&self, signals: crate::agent_pty::StatusSignals) {
+        {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            let key = (signals.pane_id.clone(), signals.agent_id.clone());
+            let at = pending.next;
+            let mut dropped = 0;
+            if !pending.by_generation.contains_key(&key)
+                && pending.by_generation.len() >= MAX_PENDING_STATUS_GENERATIONS
+                && let Some(oldest) = pending
+                    .by_generation
+                    .iter()
+                    .min_by_key(|(_, (at, _))| *at)
+                    .map(|(key, _)| key.clone())
+            {
+                dropped += pending
+                    .by_generation
+                    .remove(&oldest)
+                    .map_or(0, |(_, waiting)| waiting.signals.len() as u64);
+            }
+            let (_, waiting) = pending.by_generation.entry(key).or_insert_with(|| {
+                (
+                    at,
+                    PendingSignals {
+                        pane_id: signals.pane_id.clone(),
+                        agent_id: signals.agent_id.clone(),
+                        agent_type: signals.agent_type.clone(),
+                        signals: Vec::new(),
+                    },
+                )
+            });
+            let (seen_at, epoch) = (signals.seen_at, signals.epoch);
+            waiting.signals.extend(
+                signals
+                    .signals
+                    .into_iter()
+                    .map(|signal| (signal, seen_at, epoch)),
+            );
+            waiting.agent_type = signals.agent_type;
+            let excess = waiting
+                .signals
+                .len()
+                .saturating_sub(MAX_PENDING_STATUS_SIGNALS);
+            if excess > 0 {
+                waiting.signals.drain(..excess);
+                dropped += excess as u64;
+            }
+            pending.next += 1;
+            pending.dropped += dropped;
+        }
+        self.ready.notify_one();
+    }
+
+    /// Everything waiting, each generation's signals in the order they were
+    /// written and the generations in the order they first had any waiting,
+    /// with how many signals the bounds dropped since the last take.
+    pub(crate) fn take(&self) -> (Vec<PendingSignals>, u64) {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let mut batches: Vec<(u64, PendingSignals)> = pending
+            .by_generation
+            .drain()
+            .map(|(_, batch)| batch)
+            .collect();
+        batches.sort_by_key(|(at, _)| *at);
+        let dropped = std::mem::take(&mut pending.dropped);
+        (
+            batches.into_iter().map(|(_, batch)| batch).collect(),
+            dropped,
+        )
+    }
+
+    /// How many signals are waiting.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        let pending = self.pending.lock().unwrap();
+        pending
+            .by_generation
+            .values()
+            .map(|(_, batch)| batch.signals.len())
+            .sum()
+    }
+
+    /// Wait until something has been pushed since the last wait returned.
+    async fn ready(&self) {
+        self.ready.notified().await;
+    }
+}
+
+/// PRD #211: route every pane's OSC 7501 status ([`crate::status_osc`]) from
+/// its reader thread to [`run_status_osc_monitor`] through a bounded,
+/// coalescing [`StatusSignalQueue`]. The push never blocks the reader, and each
+/// generation's signals stay in the order they were read.
+fn install_status_signal_sink(registry: &Arc<AgentPtyRegistry>) -> Arc<StatusSignalQueue> {
+    let queue = Arc::new(StatusSignalQueue::default());
+    let sink = Arc::clone(&queue);
+    registry.set_status_signal_sink(Arc::new(move |signals| sink.push(signals)));
+    queue
+}
+
+/// PRD #211: apply the status agents write to their terminals as OSC 7501
+/// sequences, each as ONE event through [`ingest_event_unless`] — the path,
+/// lock order and broadcast a hook's report takes, so a hook event and a
+/// signal land in the order the daemon received them, and the later one wins.
+///
+/// A `blocked:kind=auth` is held back by [`crate::status_osc::AuthSettle`]
+/// until it has stood for [`crate::status_osc::AUTH_SETTLE`] from the moment
+/// its pane's reader read it; any other signal from the pane discards it. Before
+/// a held signal is shown, every signal already queued is taken in first, so a
+/// busy monitor never shows one whose `idle` was already waiting.
+///
+/// PRD #211 (second review, findings 2 and 5): a signal read while a hook
+/// event of its generation, received before it, is still being ingested is
+/// PARKED with the rest of that generation's signals, and applied once that
+/// event is in — the `PreToolUse` a permission prompt is bound to among them —
+/// however long its ingest takes, up to [`STATUS_SIGNAL_HOOK_WAIT`], and past
+/// it is applied anyway. While one generation is parked the monitor goes on
+/// serving every other, and looks at the parked ones again every
+/// [`STATUS_SIGNAL_PARK_TICK`].
+///
+/// PRD #211 (third review B2, audit S3; fourth review): the monitor applies
+/// no signal itself. The signals of a generation it lets through are applied
+/// by a task of that generation's ([`StatusApply`]), which waits for the
+/// pane's question lifecycle, and the generation's later signals wait for that
+/// task, in order. So a pane whose lifecycle is held — by a hook received
+/// before the signal, after it, or none — holds up its own status, not
+/// another pane's; the state lock, which every apply takes, is shared. The
+/// task is cancelled with its generation's entry. What a permission prompt
+/// asks is worked out under that lifecycle, at the apply
+/// ([`report_status_update`]), and a call that lands after its prompt was
+/// applied without one gets the question then
+/// ([`rebuild_antigravity_permission_question`]). A held sign-in signal whose
+/// moment has come is not looked at while its generation has signals parked
+/// or an apply running, so the monitor never wakes for it in a loop (audit
+/// suggestion 1).
+///
+/// Each iteration takes what the [`StatusSignalQueue`] holds, which its bounds
+/// cap, and skips the signals of a generation that no longer holds its pane,
+/// dropping any it held back or parked (audit, CWE-400/770); a generation
+/// keeps at most [`MAX_PENDING_STATUS_SIGNALS`] parked.
+///
+/// No internal shutdown signal: aborted in `run_daemon_with`'s cleanup.
+async fn run_status_osc_monitor(
+    registry: Arc<AgentPtyRegistry>,
+    state: SharedState,
+    event_tx: broadcast::Sender<BroadcastMsg>,
+    signals: Arc<StatusSignalQueue>,
+) {
+    // Only the generations holding a sign-in signal back, or with signals
+    // parked behind an in-flight hook, have an entry.
+    let mut waiting: std::collections::HashMap<(String, String), WaitingSignals> =
+        std::collections::HashMap::new();
+    let current = |(pane_id, agent_id): &(String, String)| {
+        registry.pane_current_agent_id(pane_id).as_deref() == Some(agent_id.as_str())
+    };
+    loop {
+        // A held sign-in signal is due only where it can be applied now: not
+        // behind parked signals or an apply still running, which the park
+        // tick serves.
+        let due = waiting
+            .values()
+            .filter(|entry| entry.parked.is_empty() && !entry.applying())
+            .filter_map(|entry| entry.settle.due_at())
+            .min();
+        let parked = waiting
+            .values()
+            .any(|entry| !entry.parked.is_empty() || entry.applying());
+        let park_tick = async {
+            if parked {
+                tokio::time::sleep(STATUS_SIGNAL_PARK_TICK).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+        let settle_due = async {
+            match due {
+                Some(at) => {
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            () = signals.ready() => {}
+            () = settle_due => {}
+            () = park_tick => {}
+        }
+        #[cfg(test)]
+        signals
+            .wakes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (batches, dropped) = signals.take();
+        if dropped > 0 {
+            tracing::warn!(
+                dropped,
+                "status osc: signals arrived faster than they were applied; kept each pane's latest"
+            );
+        }
+        waiting.retain(|key, _| current(key));
+        let mut order: Vec<(String, String)> = Vec::new();
+        for batch in batches {
+            let key = (batch.pane_id.clone(), batch.agent_id.clone());
+            if !current(&key) {
+                continue;
+            }
+            let entry = waiting
+                .entry(key.clone())
+                .or_insert_with(|| WaitingSignals::new(batch.agent_type.clone()));
+            entry.agent_type = batch.agent_type;
+            entry.parked.extend(batch.signals);
+            let excess = entry
+                .parked
+                .len()
+                .saturating_sub(MAX_PENDING_STATUS_SIGNALS);
+            entry.parked.drain(..excess);
+            order.push(key);
+        }
+        // The generations with nothing new, in any order, after those that
+        // just read something, in the order they read it.
+        for key in waiting.keys() {
+            if !order.contains(key) {
+                order.push(key.clone());
+            }
+        }
+        for key in order {
+            let Some(mut entry) = waiting.remove(&key) else {
+                continue;
+            };
+            let now = std::time::Instant::now();
+            // PRD #211 (second review, finding 4): what the reader read before
+            // it was last turned on or off is not applied, and a sign-in
+            // signal held from then goes with it.
+            let reader = registry.status_reader_epoch(&key.1);
+            if reader != Some(entry.epoch) {
+                entry.settle = crate::status_osc::AuthSettle::default();
+                // Fourth review: an apply of what the old reader read is
+                // cancelled, so the new reader's signals do not wait for it.
+                entry.apply = None;
+            }
+            entry.parked.retain(|(_, _, epoch)| Some(*epoch) == reader);
+            if let Some(epoch) = reader {
+                entry.epoch = epoch;
+            }
+            // Third review B2, fourth review: an apply of this generation
+            // still running holds the rest back, so they land in order.
+            let mut ready: Vec<(crate::status_osc::StatusUpdate, std::time::Instant)> = Vec::new();
+            while !entry.applying()
+                && let Some((signal, seen_at, _)) = entry.parked.front()
+            {
+                let seen_at = *seen_at;
+                if registry.hook_in_flight_before(&key.1, seen_at)
+                    && entry
+                        .parked_since
+                        .is_none_or(|since| now.duration_since(since) < STATUS_SIGNAL_HOOK_WAIT)
+                {
+                    entry.parked_since.get_or_insert(now);
+                    break;
+                }
+                let timed_out = entry
+                    .parked_since
+                    .take()
+                    .is_some_and(|since| now.duration_since(since) >= STATUS_SIGNAL_HOOK_WAIT);
+                let update = entry.settle.signal(signal, seen_at);
+                entry.parked.pop_front();
+                let Some(update) = update else {
+                    continue;
+                };
+                ready.push((update, seen_at));
+                if timed_out {
+                    tracing::warn!(
+                        pane_id = %escape_id_for_log(&key.0),
+                        agent_id = %escape_id_for_log(&key.1),
+                        "status osc: a hook event received before this signal is still being \
+                         ingested; applying the signal without waiting longer"
+                    );
+                    // The signals after it are looked at again once it is in.
+                    break;
+                }
+            }
+            if entry.parked.is_empty()
+                && !entry.applying()
+                && entry
+                    .settle
+                    .due_at()
+                    .is_some_and(|at| at <= std::time::Instant::now())
+                && let Some(held) = entry.settle.poll(std::time::Instant::now())
+            {
+                ready.push(held);
+            }
+            if !ready.is_empty() {
+                entry.apply = Some(StatusApply::spawn(
+                    &signals,
+                    report_status_updates(
+                        state.clone(),
+                        event_tx.clone(),
+                        Arc::clone(&registry),
+                        key.clone(),
+                        entry.agent_type.clone(),
+                        ready,
+                        entry.epoch,
+                    ),
+                ));
+            }
+            if !entry.parked.is_empty() || entry.settle.due_at().is_some() || entry.applying() {
+                waiting.insert(key, entry);
+            }
+        }
+    }
+}
+
+/// PRD #211: one generation's OSC 7501 signals the monitor has not applied
+/// yet — a sign-in signal it holds back, those parked behind a hook event
+/// still being ingested, and the apply of those it let through
+/// ([`run_status_osc_monitor`]).
+struct WaitingSignals {
+    agent_type: crate::event::AgentType,
+    settle: crate::status_osc::AuthSettle,
+    /// In the order they were written, each with when it was read.
+    parked: std::collections::VecDeque<(crate::status_osc::OscSignal, std::time::Instant, u64)>,
+    /// The reader epoch the signals applied last were read under.
+    epoch: u64,
+    /// Since when the first of `parked` has waited for a hook event.
+    parked_since: Option<std::time::Instant>,
+    /// Fourth review: the apply of this generation's signals let through
+    /// last, on a task of its own. Cancelled when the entry is dropped.
+    apply: Option<StatusApply>,
+}
+
+impl WaitingSignals {
+    fn new(agent_type: crate::event::AgentType) -> Self {
+        Self {
+            agent_type,
+            settle: crate::status_osc::AuthSettle::default(),
+            parked: std::collections::VecDeque::new(),
+            parked_since: None,
+            epoch: 0,
+            apply: None,
+        }
+    }
+
+    /// Whether an apply of this generation's is still running.
+    fn applying(&self) -> bool {
+        self.apply.as_ref().is_some_and(StatusApply::running)
+    }
+}
+
+/// PRD #211 (fourth review): the task applying some of one generation's OSC
+/// 7501 signals ([`report_status_updates`]), owned by that generation's
+/// [`WaitingSignals`]. Dropping it aborts the task: a generation that no
+/// longer holds its pane (`waiting.retain`), a reader turned on or off afresh
+/// (an epoch change) and the monitor's own abort each cancel an apply still
+/// waiting for its pane's lifecycle, rather than leave it waiting with the
+/// daemon's state. An abort cannot cut one event's apply in half: what an
+/// event changes is applied under the `AppState` write lock with no wait in
+/// between ([`ingest_event_core`]); the updates after it are not applied.
+struct StatusApply {
+    task: tokio::task::JoinHandle<()>,
+    done: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl StatusApply {
+    /// Run `apply`, then mark it done and wake the monitor, which then looks
+    /// again at what waited behind it.
+    fn spawn(
+        signals: &Arc<StatusSignalQueue>,
+        apply: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Self {
+        #[cfg(test)]
+        let running = StatusApplyRunning::new(signals);
+        let signals = Arc::clone(signals);
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        Self {
+            task: tokio::spawn({
+                let done = Arc::clone(&done);
+                async move {
+                    #[cfg(test)]
+                    let _running = running;
+                    apply.await;
+                    done.store(true, std::sync::atomic::Ordering::Release);
+                    signals.ready.notify_one();
+                }
+            }),
+            done,
+        }
+    }
+
+    fn running(&self) -> bool {
+        !self.done.load(std::sync::atomic::Ordering::Acquire) && !self.task.is_finished()
+    }
+}
+
+impl Drop for StatusApply {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Test seam: counts a [`StatusApply`] task as running from its spawn until
+/// its future is dropped, finished or aborted.
+#[cfg(test)]
+struct StatusApplyRunning(Arc<StatusSignalQueue>);
+
+#[cfg(test)]
+impl StatusApplyRunning {
+    fn new(signals: &Arc<StatusSignalQueue>) -> Self {
+        signals
+            .applies_spawned
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        signals
+            .applies_running
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(Arc::clone(signals))
+    }
+}
+
+#[cfg(test)]
+impl Drop for StatusApplyRunning {
+    fn drop(&mut self) {
+        self.0
+            .applies_running
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// PRD #211 (fourth review): apply `updates`, the signals of generation `key`
+/// that the monitor let through, in the order they were read, each with
+/// [`report_status_update`]. Run on a task of its own ([`StatusApply`]), since
+/// each waits for the pane's question lifecycle, which a hook event's ingest
+/// holds, among others: the monitor goes on serving every other generation
+/// meanwhile.
+async fn report_status_updates(
+    state: SharedState,
+    event_tx: broadcast::Sender<BroadcastMsg>,
+    registry: Arc<AgentPtyRegistry>,
+    key: (String, String),
+    agent_type: crate::event::AgentType,
+    updates: Vec<(crate::status_osc::StatusUpdate, std::time::Instant)>,
+    epoch: u64,
+) {
+    for (update, seen_at) in updates {
+        report_status_update(
+            &state,
+            &event_tx,
+            &registry,
+            &key,
+            &agent_type,
+            update,
+            seen_at,
+            Some(epoch),
+        )
+        .await;
+    }
+}
+
+/// PRD #211 (audit suggestion): the release of `agent_type` whose answer
+/// digits a permission question of generation `agent_id` may offer, as
+/// `(major, minor, patch)`: the one that generation drew in its own start-up
+/// header ([`answer_release`]).
+fn pane_agent_release(
+    registry: &AgentPtyRegistry,
+    agent_id: &str,
+    agent_type: &crate::event::AgentType,
+) -> Option<(u64, u64, u64)> {
+    answer_release(
+        registry.spawn_agent_type(agent_id).as_ref(),
+        registry.latched_release(agent_id, agent_type),
+    )
+}
+
+/// PRD #211: [`pane_agent_release`] from what the generation was spawned as
+/// and the release it latched. `None`, so every answer is keyboard-only, when
+/// it latched none (no header the release scanner read, or two different
+/// ones: the agent on the daemon's PATH is not evidence of what runs in the
+/// pane), and always for a generation spawned as a shell, whatever its
+/// session latched: an `agy` resumed there (`agy --conversation=<id>`) fires
+/// no `SessionStart` and draws its header where the deck does not read it, so
+/// nothing tells that its release is the one latched before.
+fn answer_release(
+    spawned_as: Option<&crate::event::AgentType>,
+    latched: Option<crate::doorbell_activation::LatchedRelease>,
+) -> Option<(u64, u64, u64)> {
+    spawned_as?;
+    match latched? {
+        crate::doorbell_activation::LatchedRelease::Known(version) => {
+            Some((version.major, version.minor, version.patch))
+        }
+        _ => None,
+    }
+}
+
+/// PRD #211: one OSC 7501 status update as the event the card applies, filed
+/// under the pane's current hook generation (or, before the agent's first hook,
+/// the pane's card), and applied only while the generation that wrote it still
+/// holds the pane.
+///
+/// Every update is marked [`crate::event::STATUS_SIGNAL_METADATA_KEY`]: `working`
+/// is a `Thinking` that [`crate::state::AppState::apply_event`] applies only to
+/// a card that is not already busy, keeping its active tool. A Needs
+/// Input is a `PermissionRequest`: the agent's message rides as
+/// [`crate::event::STATUS_REASON_METADATA_KEY`], which the card shows, and a
+/// permission prompt whose menu the agent's tables know also carries that
+/// menu as the pending question ([`crate::question::antigravity_permission`]).
+/// A repeat of the prompt already pending keeps its question id.
+///
+/// `seen_at` is when the pane's reader read the signal. A hook event attested
+/// to the same generation and received after it is newer evidence, so the
+/// signal is dropped rather than applied over that event's status and
+/// question (review: a queued `working` must not turn a newer tool's Working
+/// into Thinking). Asked under the `AppState` write lock, with the rest of
+/// the drop rule. A hook of the same generation received before the signal
+/// was read and still being ingested is not waited for here: the monitor
+/// parks the signal until that hook is in ([`run_status_osc_monitor`]).
+#[allow(clippy::too_many_arguments)]
+async fn report_status_update(
+    state: &SharedState,
+    event_tx: &broadcast::Sender<BroadcastMsg>,
+    registry: &Arc<AgentPtyRegistry>,
+    (pane_id, agent_id): &(String, String),
+    agent_type: &crate::event::AgentType,
+    update: crate::status_osc::StatusUpdate,
+    seen_at: std::time::Instant,
+    epoch: Option<u64>,
+) {
+    use crate::event::EventType;
+    use crate::status_osc::StatusUpdate;
+    let moves_on = matches!(update, StatusUpdate::Working | StatusUpdate::Idle);
+    let prompts = matches!(
+        update,
+        StatusUpdate::NeedsInput(_) | StatusUpdate::Permission(_)
+    );
+    let (event_type, reason, permission) = match update {
+        StatusUpdate::Working => (EventType::Thinking, None, false),
+        StatusUpdate::Idle => (EventType::Idle, None, false),
+        StatusUpdate::Error(message) => (EventType::Error, message, false),
+        StatusUpdate::NeedsInput(message) => (EventType::PermissionRequest, message, false),
+        StatusUpdate::Permission(message) => (EventType::PermissionRequest, message, true),
+    };
+    // Third review B2: what the prompt asks is worked out under the pane's
+    // question lifecycle, which a hook event's ingest holds, so a call that
+    // was being ingested when the signal was read is in by now if it was
+    // waiting for the lifecycle — not read from the state before it.
+    let lifecycle = registry.question_answers().lock_lifecycle(pane_id).await;
+    let (session_id, question, prompting) = {
+        let state = state.read().await;
+        let session_id = state
+            .pane_hook_session_id(pane_id)
+            .or_else(|| state.pane_session_id(pane_id))
+            .unwrap_or_else(|| pane_id.clone());
+        // PRD #211 (PR #2370 review, Greptile P1): the card is on a prompt of
+        // this generation's, which this signal may be leaving.
+        let prompting = state.sessions.get(&session_id).is_some_and(|session| {
+            session.agent_id.as_deref() == Some(agent_id.as_str())
+                && session.status == crate::state::SessionStatus::WaitingForInput
+        });
+        let question = match (permission, reason.as_deref()) {
+            (true, Some(prompt)) => {
+                antigravity_status_question(&state, registry, pane_id, agent_id, agent_type, prompt)
+            }
+            _ => None,
+        };
+        (session_id, question, prompting)
+    };
+    let event = status_signal_event(
+        session_id,
+        agent_type,
+        event_type,
+        reason,
+        pane_id,
+        agent_id,
+        question.as_ref(),
+    );
+    let superseded = std::sync::atomic::AtomicBool::new(false);
+    let ingested =
+        ingest_event_in_lifecycle(state, event_tx, registry, &lifecycle, event, None, |_| {
+            if registry.pane_current_agent_id(pane_id).as_deref() != Some(agent_id.as_str()) {
+                return true;
+            }
+            // PRD #211 (second review, finding 4): read by a reader since turned
+            // off, or turned on afresh for another session.
+            if epoch.is_some_and(|epoch| registry.status_reader_epoch(agent_id) != Some(epoch)) {
+                return true;
+            }
+            let newer = registry.hook_received_after(agent_id, seen_at);
+            superseded.store(newer, std::sync::atomic::Ordering::Relaxed);
+            newer
+        })
+        .await;
+    drop(lifecycle);
+    // PRD #211 (PR #2370 review, Greptile P1): Antigravity has no editor
+    // probe to read its box empty again, so `agy`'s own status says what the
+    // keys typed at a prompt did. The deck notes when that status first put
+    // the card on a permission prompt or dialog; when it then leaves it for a
+    // working or idle turn, menu keys (digits, Enter, arrows, Escape) that
+    // are all that was entered since the box was untouched answered the
+    // prompt, so the box is untouched still.
+    //
+    // Review P1: a signal refused only because a newer hook of the same
+    // generation took the card on first is still that generation's report,
+    // read by its current reader after whatever it reads after, so it is as
+    // good a witness that the prompt was left as one applied; the card's
+    // repaint is a separate question. A signal of a generation no longer
+    // holding the pane, or of a reader since turned off, witnesses nothing.
+    if *agent_type == crate::event::AgentType::Antigravity {
+        let ordered = ingested || superseded.load(std::sync::atomic::Ordering::Relaxed);
+        if ingested && prompts {
+            registry.note_prompt_shown(agent_id, seen_at);
+        } else if moves_on && ordered {
+            registry.note_menu_answer_taken(
+                agent_id,
+                seen_at,
+                crate::composer_probe::epoch::Departure::Status {
+                    card_on_prompt: ingested && prompting,
+                },
+            );
+        }
+    }
+    if !ingested {
+        tracing::debug!(
+            pane_id = %escape_id_for_log(pane_id),
+            agent_id = %escape_id_for_log(agent_id),
+            superseded = superseded.load(std::sync::atomic::Ordering::Relaxed),
+            "status osc: dropped a signal older than a hook event, or from a generation that no longer holds its pane"
+        );
+    }
+}
+
+/// PRD #211: the question an Antigravity permission prompt `prompt` from
+/// generation `agent_id` asks, read under the pane's question lifecycle and
+/// `state`'s lock. Audit (CWE-345/451): the signal says only that a prompt is
+/// up. What it approves, and the menu, come from the call this generation's
+/// own `PreToolUse` reported; the digits are those of the release this pane's
+/// `agy` drew in its header ([`pane_agent_release`]). A repeat of the prompt
+/// already pending keeps its question id. `None`, the prompt answered at the
+/// keyboard, for any other agent and when no such call backs it; with the
+/// call but no latched release, or in a generation spawned as a shell, the
+/// question is asked with keyboard-only answers.
+fn antigravity_status_question(
+    state: &crate::state::AppState,
+    registry: &AgentPtyRegistry,
+    pane_id: &str,
+    agent_id: &str,
+    agent_type: &crate::event::AgentType,
+    prompt: &str,
+) -> Option<crate::question::PendingQuestion> {
+    if *agent_type != crate::event::AgentType::Antigravity {
+        return None;
+    }
+    let pending_id = state
+        .pending_question_for(agent_id, Some(pane_id))
+        .map(|(_, question)| question)
+        .filter(|question| {
+            question
+                .questions
+                .first()
+                .is_some_and(|q| q.prompt == prompt)
+        })
+        .map(|question| question.id);
+    let version = pane_agent_release(registry, agent_id, agent_type);
+    let call = state.antigravity_call(pane_id, agent_id);
+    match crate::question::antigravity_permission(
+        pending_id.unwrap_or_else(crate::question::mint_question_id),
+        prompt,
+        call.as_ref(),
+        chrono::Utc::now().timestamp_millis(),
+        version,
+    ) {
+        Ok(question) => Some(question),
+        Err(why) => {
+            tracing::info!(
+                pane_id = %escape_id_for_log(pane_id),
+                agent_id = %escape_id_for_log(agent_id),
+                reason = %why,
+                "status osc: permission prompt is answered by keyboard"
+            );
+            None
+        }
+    }
+}
+
+/// PRD #211: the event an OSC 7501 status update is applied as
+/// ([`report_status_update`]), marked
+/// [`crate::event::STATUS_SIGNAL_METADATA_KEY`], carrying the agent's message
+/// as [`crate::event::STATUS_REASON_METADATA_KEY`] and `question` when there is
+/// one.
+fn status_signal_event(
+    session_id: String,
+    agent_type: &crate::event::AgentType,
+    event_type: crate::event::EventType,
+    reason: Option<String>,
+    pane_id: &str,
+    agent_id: &str,
+    question: Option<&crate::question::PendingQuestion>,
+) -> AgentEvent {
+    let mut metadata = std::collections::HashMap::from([(
+        crate::event::STATUS_SIGNAL_METADATA_KEY.to_string(),
+        crate::event::STATUS_SIGNAL_METADATA_VALUE.to_string(),
+    )]);
+    if let Some(reason) = reason {
+        metadata.insert(crate::event::STATUS_REASON_METADATA_KEY.to_string(), reason);
+    }
+    let mut event = AgentEvent {
+        session_id,
+        agent_type: agent_type.clone(),
+        event_type,
+        tool_name: None,
+        tool_detail: None,
+        cwd: None,
+        timestamp: chrono::Utc::now(),
+        user_prompt: None,
+        metadata,
+        pane_id: Some(pane_id.to_string()),
+        agent_id: Some(agent_id.to_string()),
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+        background: None,
+        background_revision: None,
+    };
+    if let Some(question) = question {
+        event.set_question(question);
+    }
+    event
+}
+
+/// PRD #211 (third review B2): an Antigravity call that `agent_id`'s
+/// `PreToolUse` reported on `pane_id` landed while the pane's card is on the
+/// Needs Input of that generation's own permission prompt, applied with no
+/// question — its signal was applied before the call was in. The prompt gets
+/// its question now, from the call, exactly as it would have had the call been
+/// in first; nothing changes when the card has moved on, already has a
+/// question, or the prompt is not this call's.
+async fn rebuild_antigravity_permission_question(
+    state: &SharedState,
+    event_tx: &broadcast::Sender<BroadcastMsg>,
+    registry: &Arc<AgentPtyRegistry>,
+    pane_id: &str,
+    agent_id: &str,
+) {
+    use crate::event::{AgentType, EventType};
+    // The prompt this card shows from the generation's own terminal signal,
+    // when it is on that prompt with no question.
+    let unasked = |state: &crate::state::AppState| -> Option<(String, String)> {
+        if state
+            .pending_question_for(agent_id, Some(pane_id))
+            .is_some()
+        {
+            return None;
+        }
+        let session_id = state.pane_hook_session_id(pane_id)?;
+        let session = state.sessions.get(&session_id)?;
+        if session.agent_id.as_deref() != Some(agent_id)
+            || session.status != crate::state::SessionStatus::WaitingForInput
+        {
+            return None;
+        }
+        let asked = session.recent_events.iter().rev().find(|event| {
+            matches!(
+                event.event_type,
+                EventType::PermissionRequest | EventType::WaitingForInput
+            )
+        })?;
+        if !asked.is_status_signal()
+            || asked.agent_type != AgentType::Antigravity
+            || asked.agent_id.as_deref() != Some(agent_id)
+        {
+            return None;
+        }
+        let prompt = asked
+            .metadata
+            .get(crate::event::STATUS_REASON_METADATA_KEY)?
+            .clone();
+        Some((session_id, prompt))
+    };
+    let lifecycle = registry.question_answers().lock_lifecycle(pane_id).await;
+    let (session_id, prompt, question) = {
+        let state = state.read().await;
+        let Some((session_id, prompt)) = unasked(&state) else {
+            return;
+        };
+        let Some(question) = antigravity_status_question(
+            &state,
+            registry,
+            pane_id,
+            agent_id,
+            &AgentType::Antigravity,
+            &prompt,
+        ) else {
+            return;
+        };
+        (session_id, prompt, question)
+    };
+    let event = status_signal_event(
+        session_id,
+        &AgentType::Antigravity,
+        EventType::PermissionRequest,
+        Some(prompt.clone()),
+        pane_id,
+        agent_id,
+        Some(&question),
+    );
+    let rebuilt =
+        ingest_event_in_lifecycle(state, event_tx, registry, &lifecycle, event, None, |s| {
+            registry.pane_current_agent_id(pane_id).as_deref() != Some(agent_id)
+                || unasked(s).is_none_or(|(_, still)| still != prompt)
+        })
+        .await;
+    if rebuilt {
+        tracing::info!(
+            pane_id = %escape_id_for_log(pane_id),
+            agent_id = %escape_id_for_log(agent_id),
+            "status osc: a permission prompt applied before its call got its question once the call landed"
+        );
     }
 }
 
@@ -5795,8 +6821,8 @@ fn fetch_budget(req: &crate::event::InboxFetchRequest) -> Option<crate::event::I
 /// PRD #1666 part 3 (H4): the hook component an `inbox_receipt_fetch` is
 /// served as, or `None` when the receipt verb does not serve it (it is
 /// refused `unsupported`, nothing issued). A hook names its component, and one
-/// without it is Claude Code's prompt hook (part 2's); only Claude Code's and
-/// Codex's hooks fetch this way. A model-run `inbox fetch` names none: it is
+/// without it is Claude Code's prompt hook (part 2's); only Claude Code's,
+/// Codex's and, since PRD #211, Antigravity's hooks fetch this way. A model-run `inbox fetch` names none: it is
 /// served as the hook of the generation's agent, `agent`, the spawn's type
 /// else the one its hooks reported (a routing hint for the budget and the
 /// log, not authority: the fetch is admitted like any other). A fetch a
@@ -5815,13 +6841,14 @@ fn receipt_fetch_component(
             Some(AgentType::ClaudeCode) => InboxComponent::ClaudeHooks,
             Some(AgentType::Codex) => InboxComponent::CodexHooks,
             Some(AgentType::Devin) => InboxComponent::DevinHooks,
+            Some(AgentType::Antigravity) => InboxComponent::AntigravityHooks,
             _ => InboxComponent::Other,
         }),
         InboxFetchConsumer::DoorbellHook | InboxFetchConsumer::TurnEndHook => {
             match req.component.unwrap_or(InboxComponent::ClaudeHooks) {
-                component @ (InboxComponent::ClaudeHooks | InboxComponent::CodexHooks) => {
-                    Some(component)
-                }
+                component @ (InboxComponent::ClaudeHooks
+                | InboxComponent::CodexHooks
+                | InboxComponent::AntigravityHooks) => Some(component),
                 _ => None,
             }
         }
@@ -5883,6 +6910,7 @@ fn legacy_hook_component(
         Some(AgentType::ClaudeCode) => InboxComponent::ClaudeHooks,
         Some(AgentType::Codex) => InboxComponent::CodexHooks,
         Some(AgentType::Devin) => InboxComponent::DevinHooks,
+        Some(AgentType::Antigravity) => InboxComponent::AntigravityHooks,
         _ => match registry.inbox().announced_component(&req.pane_id, agent_id) {
             Some(InboxComponent::ClaudeHooks | InboxComponent::ClaudeWaiter) => {
                 InboxComponent::ClaudeHooks
@@ -6380,11 +7408,27 @@ async fn run_hook_loop_with_limits(
                                 break;
                             }
                         };
+                        // PRD #211 (PR #2370 review, Qodo 1): when this line
+                        // was read whole, the receipt-order witness of the
+                        // event it carries (`AgentPtyRegistry::note_hook_receipt`).
+                        // Not the connection's accept: a producer that
+                        // connects before an OSC 7501 signal is read and
+                        // writes its line after it sent the newer report, and
+                        // an accept-time witness would let that signal be
+                        // applied over it.
+                        let line_read_at = std::time::Instant::now();
                         // Issue #1664: a raw event waits for the events of its
                         // session or pane accepted ahead of it, and holds its
                         // turn until this line is handled; an `inbox_announce`
                         // keeps the place for the event after it, and anything
                         // else gives it up. See `crate::hook_event_order`.
+                        // PRD #211 (second review, finding 2): an event
+                        // attested to a generation is received from the moment
+                        // its line is read, before it waits for the events
+                        // ahead of it, so a status signal read meanwhile waits
+                        // for it (`run_status_osc_monitor`). The guard marks it
+                        // ingested whichever way this line's handling ends.
+                        let mut hook_receipt: Option<HookReceipt> = None;
                         let _event_turn = crate::hook_event_order::turn_for_line(
                             &mut event_order_ticket,
                             &line,
@@ -6392,6 +7436,10 @@ async fn run_hook_loop_with_limits(
                             // refuses, or admits unattested, holds nobody's
                             // attested event back.
                             &*pty_registry,
+                            |owner| {
+                                hook_receipt =
+                                    Some(HookReceipt::note(&pty_registry, owner, line_read_at));
+                            },
                         )
                         .await;
                         if let Ok(msg) = serde_json::from_str::<DaemonMessage>(&line) {
@@ -8374,6 +9422,9 @@ async fn run_hook_loop_with_limits(
                             // daemon ever learns the true type. Upgrade-only
                             // inside the registry; a no-op when the type is
                             // `None` or the pane id is unknown/absent.
+                            // PRD #211 (review): the generation this connection's event is
+                            // attested to, whose receipt is noted below and its ingest after.
+
                             if let Some(ref pane_id) = event.pane_id {
                                 // A SessionStart naming a pane this daemon never
                                 // spawned is always wrong, and silently so: it
@@ -8427,6 +9478,61 @@ async fn run_hook_loop_with_limits(
                                             .or(event.agent_id.as_deref()),
                                         &event.agent_type,
                                     );
+                                }
+                                // PRD #211 (review): an event attested to its
+                                // generation is newer than any OSC 7501 signal
+                                // that generation's reader read before this
+                                // event's line was read, so that signal is
+                                // not applied over it. And an agent that
+                                // reports its status that way, started from a
+                                // shell in the pane, is read from here on: its
+                                // own hook, attested by the pane's token, says
+                                // what runs there.
+                                if let Some(owner) = attested_agent.as_deref() {
+                                    if hook_receipt
+                                        .as_ref()
+                                        .is_none_or(|receipt| receipt.owner != owner)
+                                    {
+                                        hook_receipt = Some(HookReceipt::note(
+                                            &pty_registry,
+                                            owner,
+                                            line_read_at,
+                                        ));
+                                    }
+                                    let change = (event.agent_type
+                                        != crate::event::AgentType::None)
+                                        .then(|| {
+                                            pty_registry.note_own_agent_hook(
+                                                pane_id,
+                                                owner,
+                                                &event.agent_type,
+                                                &event.session_id,
+                                                event.event_type
+                                                    == crate::event::EventType::SessionEnd,
+                                                event.event_type
+                                                    == crate::event::EventType::SessionStart,
+                                            )
+                                        })
+                                        .flatten();
+                                    match change {
+                                        Some(crate::agent_pty::ShellReaderChange::Started {
+                                            agent,
+                                            release,
+                                        }) => info!(
+                                            pane_id = %escape_id_for_log(pane_id),
+                                            agent_id = %escape_id_for_log(owner),
+                                            agent_type = ?agent,
+                                            release = ?release.map(|v| v.to_string()),
+                                            "status osc: reading the status of an agent session its own hooks named in the shell"
+                                        ),
+                                        Some(crate::agent_pty::ShellReaderChange::Ended) => info!(
+                                            pane_id = %escape_id_for_log(pane_id),
+                                            agent_id = %escape_id_for_log(owner),
+                                            agent_type = ?event.agent_type,
+                                            "status osc: stopped reading the shell's agent status: its session ended or another agent's began"
+                                        ),
+                                        None => {}
+                                    }
                                 }
                             }
                             // Fan out to subscribed attach connections and
@@ -8485,15 +9591,17 @@ async fn run_hook_loop_with_limits(
                                     stamped,
                                 );
                             }
-                            ingest_hook_event(
+                            ingest_hook_line(
                                 &state,
                                 &event_tx,
                                 &pty_registry,
                                 event,
                                 unproven,
                                 attested_agent,
+                                line_read_at,
                             )
                             .await;
+                            drop(hook_receipt);
                         } else {
                             // PRD #1666 part 3 (Q87): on a registered composer
                             // connection a line it can't parse, half an
@@ -22473,3 +23581,1437 @@ mod held_confirmation_deadline_tests;
 #[cfg(all(test, unix))]
 #[path = "daemon_hook_event_order_tests.rs"]
 mod hook_event_order_tests;
+
+#[cfg(test)]
+mod antigravity_answer_release_tests {
+    //! PRD #211: an Antigravity permission question offers deck answers only
+    //! in a generation spawned as `agy` ([`answer_release`]).
+    use super::*;
+    use crate::doorbell_activation::LatchedRelease;
+    use crate::event::AgentType;
+    use crate::question::{AnswerChannel, AntigravityCall, PendingQuestion};
+
+    fn question(release: Option<(u64, u64, u64)>) -> PendingQuestion {
+        let call = AntigravityCall {
+            tool: "run_command",
+            use_id: Some("call-1"),
+            subject: "echo agy-probe-1",
+        };
+        crate::question::antigravity_permission(
+            "q".into(),
+            "Approve Bash: echo agy-probe-1",
+            Some(&call),
+            1,
+            release,
+        )
+        .expect("the call backs the prompt")
+    }
+
+    fn agy_1_5_9() -> Option<LatchedRelease> {
+        Some(LatchedRelease::Known(semver::Version::new(1, 5, 9)))
+    }
+
+    /// A generation spawned as a shell, whose `agy` session latched release
+    /// 1.5.9, still gets a question whose every option, the grants and Deny
+    /// alike, is answered at the keyboard; a generation spawned as `agy`
+    /// with the same release keeps the options the deck can answer.
+    #[test]
+    fn a_shell_generation_gets_keyboard_only_answers_whatever_release_it_latched() {
+        let shell = question(answer_release(None, agy_1_5_9()));
+        assert_eq!(shell.channel, AnswerChannel::Unsupported);
+        let options = &shell.questions[0].options;
+        assert!(!options.is_empty());
+        assert!(
+            options.iter().all(|o| o.keyboard_only),
+            "every answer keyboard-only in a shell: {options:?}"
+        );
+
+        let spawned = question(answer_release(Some(&AgentType::Antigravity), agy_1_5_9()));
+        assert_eq!(spawned.channel, AnswerChannel::Keys);
+        assert!(
+            spawned.questions[0]
+                .options
+                .iter()
+                .any(|o| !o.keyboard_only),
+            "a generation spawned as agy keeps answerable options"
+        );
+    }
+
+    /// Spawned as `agy` but with no release latched, or two different ones,
+    /// the answers are keyboard-only too.
+    #[test]
+    fn without_a_known_release_the_answers_are_keyboard_only() {
+        let agy = Some(&AgentType::Antigravity);
+        assert_eq!(answer_release(agy, None), None);
+        assert_eq!(answer_release(agy, Some(LatchedRelease::Unseen)), None);
+        assert_eq!(answer_release(agy, Some(LatchedRelease::Conflict)), None);
+        assert_eq!(answer_release(agy, agy_1_5_9()), Some((1, 5, 9)));
+    }
+}
+
+/// PRD #211 (audit, CWE-400/770): the OSC 7501 status queue's bounds.
+#[cfg(test)]
+mod status_signal_queue_tests {
+    use super::{MAX_PENDING_STATUS_GENERATIONS, MAX_PENDING_STATUS_SIGNALS, StatusSignalQueue};
+    use crate::agent_pty::StatusSignals;
+    use crate::event::AgentType;
+    use crate::status_osc::{OscSignal, OscState};
+    use std::time::Instant;
+
+    fn signal(state: OscState, kind: Option<&str>) -> OscSignal {
+        OscSignal {
+            state,
+            kind: kind.map(str::to_string),
+            app: Some("antigravity".to_string()),
+            msg: None,
+        }
+    }
+
+    fn batch(pane: &str, signals: Vec<OscSignal>) -> StatusSignals {
+        StatusSignals {
+            pane_id: pane.to_string(),
+            agent_id: format!("{pane}-agent"),
+            agent_type: AgentType::Antigravity,
+            signals,
+            seen_at: Instant::now(),
+            epoch: 0,
+        }
+    }
+
+    /// A pane flooding valid short signals keeps the queue at its bound, keeps
+    /// its latest signals in order — a trailing permission prompt survives —
+    /// and leaves another pane's signal waiting to be applied.
+    #[test]
+    fn a_flood_stays_bounded_and_another_pane_is_still_served() {
+        let queue = StatusSignalQueue::default();
+        queue.push(batch("quiet", vec![signal(OscState::Idle, None)]));
+        for _ in 0..100_000 {
+            queue.push(batch(
+                "loud",
+                vec![
+                    signal(OscState::Working, None),
+                    signal(OscState::Idle, None),
+                ],
+            ));
+            assert!(queue.len() <= MAX_PENDING_STATUS_SIGNALS + 1);
+        }
+        queue.push(batch(
+            "loud",
+            vec![signal(OscState::Blocked, Some("permission"))],
+        ));
+        let (batches, dropped) = queue.take();
+        assert!(dropped >= 200_000 - MAX_PENDING_STATUS_SIGNALS as u64);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(
+            batches[0].pane_id, "quiet",
+            "the first to wait is served first"
+        );
+        let signals = |at: usize| -> Vec<OscSignal> {
+            batches[at]
+                .signals
+                .iter()
+                .map(|(signal, _, _)| signal.clone())
+                .collect()
+        };
+        assert_eq!(signals(0), vec![signal(OscState::Idle, None)]);
+        assert_eq!(signals(1).len(), MAX_PENDING_STATUS_SIGNALS);
+        assert_eq!(
+            signals(1).last(),
+            Some(&signal(OscState::Blocked, Some("permission")))
+        );
+        assert_eq!(queue.len(), 0);
+    }
+
+    /// Past the generation bound, the one that has waited longest loses what
+    /// it had waiting; the count never grows past it.
+    #[test]
+    fn the_generations_waiting_are_bounded() {
+        let queue = StatusSignalQueue::default();
+        for pane in 0..MAX_PENDING_STATUS_GENERATIONS + 10 {
+            queue.push(batch(
+                &format!("p{pane}"),
+                vec![signal(OscState::Idle, None)],
+            ));
+        }
+        let (batches, dropped) = queue.take();
+        assert_eq!(batches.len(), MAX_PENDING_STATUS_GENERATIONS);
+        assert_eq!(dropped, 10);
+        assert_eq!(batches[0].pane_id, "p10");
+    }
+}
+
+/// PRD #211 (review): an OSC 7501 signal is ordered against hook events by
+/// when the pane's reader read it, not by when the monitor gets to apply it.
+#[cfg(all(test, unix))]
+mod status_signal_order_tests {
+    use super::*;
+    use crate::agent_pty::{DOT_AGENT_DECK_PANE_ID, SpawnOptions};
+    use crate::event::AgentType;
+    use crate::status_osc::StatusUpdate;
+    use std::time::{Duration, Instant};
+
+    const PANE: &str = "agy-order";
+
+    struct Fixture {
+        registry: Arc<AgentPtyRegistry>,
+        state: SharedState,
+        event_tx: broadcast::Sender<BroadcastMsg>,
+        owner: String,
+    }
+
+    impl Fixture {
+        async fn start() -> Self {
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let owner = registry
+                .spawn_agent(SpawnOptions {
+                    command: Some("/bin/cat"),
+                    env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                        DOT_AGENT_DECK_PANE_ID.to_string(),
+                        PANE.to_string(),
+                    )]),
+                    agent_type: Some(AgentType::Antigravity),
+                    ..SpawnOptions::default()
+                })
+                .expect("spawn stand-in");
+            let state: SharedState =
+                Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+            state.write().await.register_pane(PANE.to_string());
+            let (event_tx, _rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+            Self {
+                registry,
+                state,
+                event_tx,
+                owner,
+            }
+        }
+
+        /// The hook loop's part for one Antigravity hook: its line was read
+        /// at `read_at`, then the event is applied.
+        async fn hook(&self, fixture: &str, read_at: Instant) {
+            let input = std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/antigravity")
+                    .join(fixture),
+            )
+            .unwrap();
+            let mut event = crate::hook::hook_payload_event("antigravity", &input).unwrap();
+            event.pane_id = Some(PANE.to_string());
+            event.agent_id = Some(self.owner.clone());
+            self.registry.note_hook_receipt(&self.owner, read_at);
+            ingest_event(&self.state, &self.event_tx, &self.registry, event).await;
+            self.registry.note_hook_applied(&self.owner, read_at);
+        }
+
+        /// The monitor applying a signal the reader read at `seen_at`.
+        async fn signal(&self, update: StatusUpdate, seen_at: Instant) {
+            report_status_update(
+                &self.state,
+                &self.event_tx,
+                &self.registry,
+                &(PANE.to_string(), self.owner.clone()),
+                &AgentType::Antigravity,
+                update,
+                seen_at,
+                None,
+            )
+            .await;
+        }
+
+        async fn status(&self) -> crate::state::SessionStatus {
+            let state = self.state.read().await;
+            let session = state
+                .pane_hook_session_id(PANE)
+                .expect("a hook named the card");
+            state.sessions[&session].status.clone()
+        }
+
+        async fn question(&self) -> bool {
+            self.state
+                .read()
+                .await
+                .pending_question_for(&self.owner, Some(PANE))
+                .is_some()
+        }
+    }
+
+    /// Scenario: the reader reads `idle`, and before the monitor applies it a
+    /// newer `PreToolUse` arrives and is applied. The late `idle` leaves the
+    /// tool's Working card alone; a signal read after that hook still applies.
+    #[tokio::test]
+    async fn a_signal_read_before_a_newer_hook_does_not_overwrite_it() {
+        let deck = Fixture::start().await;
+        let start = Instant::now();
+        deck.hook("pre-invocation.json", start).await;
+        let read = start + Duration::from_millis(5);
+        // The slow path: the signal waits while a newer hook lands first.
+        let accepted = read + Duration::from_millis(5);
+        deck.hook("pre-tool-use-run-command.json", accepted).await;
+        assert_eq!(deck.status().await, crate::state::SessionStatus::Working);
+        deck.signal(StatusUpdate::Idle, read).await;
+        assert_eq!(
+            deck.status().await,
+            crate::state::SessionStatus::Working,
+            "an idle read before the tool's PreToolUse repainted its card"
+        );
+        deck.signal(StatusUpdate::Idle, accepted + Duration::from_millis(1))
+            .await;
+        assert_eq!(
+            deck.status().await,
+            crate::state::SessionStatus::Idle,
+            "a signal read after the hook is the newer report"
+        );
+    }
+
+    /// Scenario: a permission prompt is read, its call ends with a
+    /// `PostToolUse` that is applied first, and only then does the monitor
+    /// reach the prompt. It raises no Needs Input and no question.
+    #[tokio::test]
+    async fn a_permission_read_before_its_calls_end_raises_nothing() {
+        let deck = Fixture::start().await;
+        let start = Instant::now();
+        deck.hook("pre-invocation.json", start).await;
+        deck.hook(
+            "pre-tool-use-run-command.json",
+            start + Duration::from_millis(1),
+        )
+        .await;
+        let read = start + Duration::from_millis(5);
+        deck.hook(
+            "post-tool-use-run-command.json",
+            read + Duration::from_millis(5),
+        )
+        .await;
+        let after_post = deck.status().await;
+        deck.signal(
+            StatusUpdate::Permission(Some("Approve Bash: echo agy-probe-1".into())),
+            read,
+        )
+        .await;
+        assert_eq!(deck.status().await, after_post);
+        assert_ne!(after_post, crate::state::SessionStatus::WaitingForInput);
+        assert!(!deck.question().await);
+    }
+}
+
+/// PRD #211 (second review, findings 2 and 5): OSC 7501 signals parked behind
+/// a hook event still being ingested, through the real hook loop and the
+/// real status monitor.
+#[cfg(all(test, unix))]
+mod status_signal_park_tests {
+    use super::*;
+    use crate::agent_pty::{DOT_AGENT_DECK_PANE_ID, SpawnOptions, StatusSignals};
+    use crate::event::AgentType;
+    use crate::state::SessionStatus;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::time::{Duration, Instant};
+    use tokio::net::{UnixListener, UnixStream};
+
+    /// `Approve Bash: echo agy-probe-1`, the command of the
+    /// `pre-tool-use-run-command.json` fixture, as `agy` signals its prompt.
+    const PERMISSION: &[u8] = b"\x1b]7501;state=blocked:kind=permission:app=antigravity:msg=QXBwcm92ZSBCYXNoOiBlY2hvIGFneS1wcm9iZS0x\x07";
+    const IDLE: &[u8] = b"\x1b]7501;state=idle:app=antigravity\x07";
+
+    struct Deck {
+        _dir: tempfile::TempDir,
+        sock: std::path::PathBuf,
+        registry: Arc<AgentPtyRegistry>,
+        state: SharedState,
+        signals: Arc<StatusSignalQueue>,
+        /// Each pane and the generation on it.
+        panes: Vec<(String, String)>,
+        tasks: Vec<tokio::task::JoinHandle<()>>,
+        _ownership: Arc<dyn crate::state::AgentOwnership>,
+    }
+
+    impl Deck {
+        async fn start(panes: &[&str]) -> Self {
+            Self::start_as(panes, Some(AgentType::Antigravity)).await
+        }
+
+        /// `start`, each pane's generation spawned as `agent_type` (`None`:
+        /// a shell, whose reader its agent's own hooks turn on).
+        async fn start_as(panes: &[&str], agent_type: Option<AgentType>) -> Self {
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let panes: Vec<(String, String)> = panes
+                .iter()
+                .map(|pane| {
+                    let agent = registry
+                        .spawn_agent(SpawnOptions {
+                            command: Some("/bin/cat"),
+                            env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                                DOT_AGENT_DECK_PANE_ID.to_string(),
+                                pane.to_string(),
+                            )]),
+                            agent_type: agent_type.clone(),
+                            ..SpawnOptions::default()
+                        })
+                        .expect("spawn stand-in");
+                    (pane.to_string(), agent)
+                })
+                .collect();
+            let mut app = crate::state::AppState::default();
+            let ownership: Arc<dyn crate::state::AgentOwnership> = registry.clone();
+            app.set_agent_ownership(Arc::downgrade(&ownership));
+            let state: SharedState = Arc::new(tokio::sync::RwLock::new(app));
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let sock = dir.path().join("hook.sock");
+            let listener = IpcListener::from_tokio_listener(UnixListener::bind(&sock).unwrap());
+            let (event_tx, _rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+            let signals = Arc::new(StatusSignalQueue::default());
+            let hook_loop = tokio::spawn({
+                let (registry, state, event_tx) =
+                    (registry.clone(), state.clone(), event_tx.clone());
+                let wtr = crate::issue_dispatch_run::new_worktree_registry();
+                async move {
+                    let _ = run_hook_loop(
+                        listener,
+                        state,
+                        event_tx,
+                        registry,
+                        Arc::new(Notify::new()),
+                        wtr,
+                    )
+                    .await;
+                }
+            });
+            let monitor = tokio::spawn(run_status_osc_monitor(
+                registry.clone(),
+                state.clone(),
+                event_tx,
+                Arc::clone(&signals),
+            ));
+            Self {
+                _dir: dir,
+                sock,
+                registry,
+                state,
+                signals,
+                panes,
+                tasks: vec![hook_loop, monitor],
+                _ownership: ownership,
+            }
+        }
+
+        /// Write pane `index`'s generation's `fixture` hook on a connection
+        /// of its own, left open.
+        async fn hook(&self, index: usize, fixture: &str) -> UnixStream {
+            let (pane, agent) = &self.panes[index];
+            let input = std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/antigravity")
+                    .join(fixture),
+            )
+            .unwrap();
+            let mut event = crate::hook::hook_payload_event("antigravity", &input).unwrap();
+            event.session_id = format!("agy-park-{index}");
+            event.pane_id = Some(pane.clone());
+            event.agent_id = Some(agent.clone());
+            let token = self.registry.hook_token_of(agent).expect("pane token");
+            let line = crate::event::agent_event_line(&event, Some(&token)).unwrap();
+            let mut stream = UnixStream::connect(&self.sock).await.unwrap();
+            stream
+                .write_all(format!("{line}\n").as_bytes())
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            stream
+        }
+
+        /// Pane `index`'s reader reading `bytes` now.
+        fn signal(&self, index: usize, bytes: &[u8]) {
+            let (pane, agent) = &self.panes[index];
+            let mut found = Vec::new();
+            crate::status_osc::Osc7501Scanner::new("antigravity").scan(bytes, &mut found);
+            assert!(!found.is_empty());
+            self.signals.push(StatusSignals {
+                pane_id: pane.clone(),
+                agent_id: agent.clone(),
+                agent_type: AgentType::Antigravity,
+                signals: found,
+                seen_at: Instant::now(),
+                epoch: self.registry.status_reader_epoch(agent).unwrap(),
+            });
+        }
+
+        async fn card(&self, index: usize) -> Option<(SessionStatus, bool)> {
+            let (pane, agent) = &self.panes[index];
+            let state = self.state.read().await;
+            let session = state.pane_hook_session_id(pane)?;
+            Some((
+                state.sessions.get(&session)?.status.clone(),
+                state.pending_question_for(agent, Some(pane)).is_some(),
+            ))
+        }
+
+        async fn card_within(
+            &self,
+            index: usize,
+            budget: Duration,
+            wanted: impl Fn(&(SessionStatus, bool)) -> bool,
+        ) -> Option<(SessionStatus, bool)> {
+            let deadline = tokio::time::Instant::now() + budget;
+            loop {
+                let card = self.card(index).await;
+                if card.as_ref().is_some_and(&wanted) || tokio::time::Instant::now() >= deadline {
+                    return card;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+
+        /// Pane `index`'s turn started: its `PreInvocation` applied.
+        async fn thinking(&self, index: usize) {
+            let _start = self.hook(index, "session-start.json").await;
+            let _turn = self.hook(index, "pre-invocation.json").await;
+            let card = self
+                .card_within(index, Duration::from_secs(5), |(status, _)| {
+                    *status == SessionStatus::Thinking
+                })
+                .await;
+            assert_eq!(card.map(|c| c.0), Some(SessionStatus::Thinking));
+        }
+
+        async fn until_in_flight(&self, index: usize) {
+            let agent = &self.panes[index].1;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !self.registry.hook_in_flight_before(agent, Instant::now()) {
+                assert!(Instant::now() < deadline, "the hook was never received");
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+    }
+
+    impl Drop for Deck {
+        fn drop(&mut self) {
+            for task in &self.tasks {
+                task.abort();
+            }
+            self.registry.shutdown_all();
+        }
+    }
+
+    /// Scenario: an Antigravity `PreToolUse` reaches the hook socket and its
+    /// ingest is held up — the pane's question lifecycle is held for 700 ms —
+    /// while the permission prompt it leads to is read from the terminal. The
+    /// prompt waits for the call however long that takes, then shows Needs
+    /// Input with an answerable question bound to it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_permission_waits_for_its_calls_held_up_ingest() {
+        let deck = Deck::start(&["agy-park-a"]).await;
+        deck.thinking(0).await;
+        let held = deck
+            .registry
+            .question_answers()
+            .lock_lifecycle("agy-park-a")
+            .await;
+        let _call = deck.hook(0, "pre-tool-use-run-command.json").await;
+        deck.until_in_flight(0).await;
+        deck.signal(0, PERMISSION);
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_eq!(
+            deck.card(0).await,
+            Some((SessionStatus::Thinking, false)),
+            "the prompt was applied ahead of the call it is bound to"
+        );
+        drop(held);
+        let card = deck
+            .card_within(0, Duration::from_secs(5), |(_, question)| *question)
+            .await;
+        assert_eq!(
+            card,
+            Some((SessionStatus::WaitingForInput, true)),
+            "the prompt is bound to the call ingested ahead of it"
+        );
+    }
+
+    /// Scenario: a person types a line into an Antigravity pane and presses
+    /// Enter, which leaves its input box touched. A `PreInvocation` of a later
+    /// model call (`invocationNum` 1) leaves it touched; the turn's first
+    /// call's `PreInvocation` on the hook socket makes it untouched again. A
+    /// key typed after that touches it once more, and another taken prompt
+    /// reported then does not undo that.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_prompt_the_agent_took_after_a_persons_enter_untouches_its_box() {
+        let deck = Deck::start(&["agy-park-submit"]).await;
+        let (pane, agent) = deck.panes[0].clone();
+        deck.registry
+            .write_user_bytes(&pane, &agent, b"say hi\r")
+            .await
+            .unwrap();
+        assert!(deck.registry.input_touched(&agent));
+        let _start = deck.hook(0, "session-start.json").await;
+        let _later = deck.hook(0, "pre-invocation-after-continue.json").await;
+        let card = deck
+            .card_within(0, Duration::from_secs(5), |(status, _)| {
+                *status == SessionStatus::Thinking
+            })
+            .await;
+        assert_eq!(card.map(|c| c.0), Some(SessionStatus::Thinking));
+        assert!(
+            deck.registry.input_touched(&agent),
+            "a later call's hook is no submit"
+        );
+        let _first = deck.hook(0, "pre-invocation.json").await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while deck.registry.input_touched(&agent) {
+            assert!(
+                Instant::now() < deadline,
+                "the first call's hook left the box touched"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        deck.registry
+            .write_user_bytes(&pane, &agent, b"x")
+            .await
+            .unwrap();
+        assert!(deck.registry.input_touched(&agent));
+        assert!(
+            !deck.registry.note_prompt_taken(&agent, Instant::now()),
+            "a key after the submit"
+        );
+        assert!(deck.registry.input_touched(&agent));
+    }
+
+    /// Scenario: two Antigravity panes each show a permission prompt, and a
+    /// person answers each with the digit `1`; one pane's input box was
+    /// untouched before, the other's had a key typed into it. When `agy`
+    /// reports `idle` after the answer, the first box is untouched again and
+    /// the second stays touched.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_digit_answering_a_prompt_leaves_an_untouched_box_untouched() {
+        let deck = Deck::start(&["agy-park-answer", "agy-park-typed"]).await;
+        deck.thinking(0).await;
+        deck.thinking(1).await;
+        let (typed_pane, typed_agent) = deck.panes[1].clone();
+        deck.registry
+            .write_user_bytes(&typed_pane, &typed_agent, b"x")
+            .await
+            .unwrap();
+        for index in 0..2 {
+            deck.signal(index, PERMISSION);
+            let card = deck
+                .card_within(index, Duration::from_secs(5), |(status, _)| {
+                    *status == SessionStatus::WaitingForInput
+                })
+                .await;
+            assert_eq!(card.map(|c| c.0), Some(SessionStatus::WaitingForInput));
+            let (pane, agent) = deck.panes[index].clone();
+            deck.registry
+                .write_user_bytes(&pane, &agent, b"1")
+                .await
+                .unwrap();
+            assert!(deck.registry.input_touched(&agent));
+            deck.signal(index, IDLE);
+            let card = deck
+                .card_within(index, Duration::from_secs(5), |(status, _)| {
+                    *status == SessionStatus::Idle
+                })
+                .await;
+            assert_eq!(card.map(|c| c.0), Some(SessionStatus::Idle));
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while deck.registry.input_touched(&deck.panes[0].1) {
+            assert!(
+                Instant::now() < deadline,
+                "the answer left the untouched box touched"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            deck.registry.input_touched(&typed_agent),
+            "a box touched before the answer stays touched"
+        );
+    }
+
+    /// Scenario: three Antigravity panes with untouched input boxes each show
+    /// a permission prompt; a person answers the first with Enter, the second
+    /// with Down, Down, Enter, and types `y` then Enter into the third. When
+    /// `agy` reports `idle` after the answer, the first two boxes are
+    /// untouched again and the third stays touched.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn menu_keys_answering_a_prompt_leave_an_untouched_box_untouched() {
+        let deck = Deck::start(&["agy-menu-enter", "agy-menu-arrows", "agy-menu-letter"]).await;
+        let answers: [&[&[u8]]; 3] = [&[b"\r"], &[b"\x1b[B", b"\x1b[B", b"\r"], &[b"y", b"\r"]];
+        for (index, keys) in answers.iter().enumerate() {
+            deck.thinking(index).await;
+            deck.signal(index, PERMISSION);
+            let card = deck
+                .card_within(index, Duration::from_secs(5), |(status, _)| {
+                    *status == SessionStatus::WaitingForInput
+                })
+                .await;
+            assert_eq!(card.map(|c| c.0), Some(SessionStatus::WaitingForInput));
+            let (pane, agent) = deck.panes[index].clone();
+            for key in keys.iter() {
+                deck.registry
+                    .write_user_bytes(&pane, &agent, key)
+                    .await
+                    .unwrap();
+            }
+            assert!(deck.registry.input_touched(&agent));
+            deck.signal(index, IDLE);
+            let card = deck
+                .card_within(index, Duration::from_secs(5), |(status, _)| {
+                    *status == SessionStatus::Idle
+                })
+                .await;
+            assert_eq!(card.map(|c| c.0), Some(SessionStatus::Idle));
+        }
+        for index in 0..2 {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while deck.registry.input_touched(&deck.panes[index].1) {
+                assert!(
+                    Instant::now() < deadline,
+                    "the answer left untouched box {index} touched"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        assert!(
+            deck.registry.input_touched(&deck.panes[2].1),
+            "a letter typed at the prompt leaves the box touched"
+        );
+    }
+
+    /// Pane `index`'s reader's read of `bytes` now, not yet handed to the
+    /// monitor.
+    fn read_signal(deck: &Deck, index: usize, bytes: &[u8]) -> StatusSignals {
+        let (pane, agent) = &deck.panes[index];
+        let mut found = Vec::new();
+        crate::status_osc::Osc7501Scanner::new("antigravity").scan(bytes, &mut found);
+        assert!(!found.is_empty());
+        StatusSignals {
+            pane_id: pane.clone(),
+            agent_id: agent.clone(),
+            agent_type: AgentType::Antigravity,
+            signals: found,
+            seen_at: Instant::now(),
+            epoch: deck.registry.status_reader_epoch(agent).unwrap(),
+        }
+    }
+
+    async fn until_untouched(deck: &Deck, index: usize, why: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while deck.registry.input_touched(&deck.panes[index].1) {
+            assert!(Instant::now() < deadline, "{why}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Scenario: two Antigravity panes with untouched input boxes each show a
+    /// permission prompt, and a person answers each with `1`. Each pane's
+    /// reader reads `agy`'s `working` next, but before the monitor applies it
+    /// a newer hook of the same generation is applied — the call's
+    /// `PostToolUse` on one pane, the turn's `Stop` on the other — and takes
+    /// the card off Needs Input. The older `working` is then refused for the
+    /// card, and `idle` follows. Both boxes are untouched again, so the next
+    /// queued message may ring.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_answer_overtaken_by_a_newer_hook_leaves_an_untouched_box_untouched() {
+        const WORKING: &[u8] = b"\x1b]7501;state=working:app=antigravity\x07";
+        let deck = Deck::start(&["agy-overtaken-post", "agy-overtaken-stop"]).await;
+        for (index, hook) in ["post-tool-use-run-command.json", "stop.json"]
+            .into_iter()
+            .enumerate()
+        {
+            deck.thinking(index).await;
+            deck.signal(index, PERMISSION);
+            let card = deck
+                .card_within(index, Duration::from_secs(5), |(status, _)| {
+                    *status == SessionStatus::WaitingForInput
+                })
+                .await;
+            assert_eq!(card.map(|c| c.0), Some(SessionStatus::WaitingForInput));
+            let (pane, agent) = deck.panes[index].clone();
+            deck.registry
+                .write_user_bytes(&pane, &agent, b"1")
+                .await
+                .unwrap();
+            assert!(deck.registry.input_touched(&agent));
+            let working = read_signal(&deck, index, WORKING);
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            let _newer = deck.hook(index, hook).await;
+            let card = deck
+                .card_within(index, Duration::from_secs(5), |(status, _)| {
+                    *status != SessionStatus::WaitingForInput
+                })
+                .await;
+            assert_ne!(
+                card.map(|c| c.0),
+                Some(SessionStatus::WaitingForInput),
+                "the newer {hook} did not take the card off the prompt"
+            );
+            deck.signals.push(working);
+            deck.signal(index, IDLE);
+            let card = deck
+                .card_within(index, Duration::from_secs(5), |(status, _)| {
+                    *status == SessionStatus::Idle
+                })
+                .await;
+            assert_eq!(card.map(|c| c.0), Some(SessionStatus::Idle));
+            until_untouched(
+                &deck,
+                index,
+                &format!("an answer overtaken by {hook} left the box touched"),
+            )
+            .await;
+        }
+    }
+
+    /// Scenario: three Antigravity panes with untouched input boxes each show
+    /// a permission prompt. A person presses Enter and Up in one write on the
+    /// first, Enter then Up on the second, and Escape then Up on the third:
+    /// the Up after the key that answered the prompt reaches the composer,
+    /// where it can recall an earlier prompt. `agy` reports `idle` for the
+    /// answer before anything is redrawn. All three boxes stay touched, so a
+    /// queued message does not ring into them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_key_after_the_answering_key_keeps_the_box_touched() {
+        let deck =
+            Deck::start(&["agy-after-enter-up", "agy-enter-then-up", "agy-esc-then-up"]).await;
+        let answers: [&[&[u8]]; 3] = [&[b"\r\x1b[A"], &[b"\r", b"\x1b[A"], &[b"\x1b", b"\x1b[A"]];
+        for (index, keys) in answers.iter().enumerate() {
+            deck.thinking(index).await;
+            deck.signal(index, PERMISSION);
+            let card = deck
+                .card_within(index, Duration::from_secs(5), |(status, _)| {
+                    *status == SessionStatus::WaitingForInput
+                })
+                .await;
+            assert_eq!(card.map(|c| c.0), Some(SessionStatus::WaitingForInput));
+            let (pane, agent) = deck.panes[index].clone();
+            for key in keys.iter() {
+                deck.registry
+                    .write_user_bytes(&pane, &agent, key)
+                    .await
+                    .unwrap();
+            }
+            deck.signal(index, IDLE);
+            let card = deck
+                .card_within(index, Duration::from_secs(5), |(status, _)| {
+                    *status == SessionStatus::Idle
+                })
+                .await;
+            assert_eq!(card.map(|c| c.0), Some(SessionStatus::Idle));
+        }
+        // Give a wrong reset every chance to land before the verdict.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        for index in 0..3 {
+            assert!(
+                deck.registry.input_touched(&deck.panes[index].1),
+                "a key after the answer left box {index} untouched"
+            );
+        }
+    }
+
+    /// Scenario: a person types a line into an Antigravity pane and presses
+    /// Enter. The turn's first-call `PreInvocation` line is read, but its
+    /// ingest is held up; meanwhile the person types another line ending in
+    /// Enter. Once the held-up hook is applied the box stays touched: the
+    /// hook was read before the newer Enter and cannot speak for it. A later
+    /// first-call hook, read after it, can.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_delayed_prompt_hook_leaves_a_newer_enter_touched() {
+        let deck = Deck::start(&["agy-park-delayed-submit"]).await;
+        let (pane, agent) = deck.panes[0].clone();
+        let _start = deck.hook(0, "session-start.json").await;
+        let card = deck
+            .card_within(0, Duration::from_secs(5), |(status, _)| {
+                *status == SessionStatus::Idle
+            })
+            .await;
+        assert!(card.is_some(), "the session never started");
+        deck.registry
+            .write_user_bytes(&pane, &agent, b"say hi\r")
+            .await
+            .unwrap();
+        let held = deck.registry.question_answers().lock_lifecycle(&pane).await;
+        let _first = deck.hook(0, "pre-invocation.json").await;
+        deck.until_in_flight(0).await;
+        deck.registry
+            .write_user_bytes(&pane, &agent, b"and again\r")
+            .await
+            .unwrap();
+        drop(held);
+        let card = deck
+            .card_within(0, Duration::from_secs(5), |(status, _)| {
+                *status == SessionStatus::Thinking
+            })
+            .await;
+        assert_eq!(card.map(|c| c.0), Some(SessionStatus::Thinking));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            deck.registry.input_touched(&agent),
+            "a hook read before the newer Enter untouched the box"
+        );
+        let _next = deck.hook(0, "pre-invocation.json").await;
+        until_untouched(&deck, 0, "a hook read after the Enter left it touched").await;
+    }
+
+    /// Scenario: an Antigravity hook's connection is accepted, then the
+    /// pane's reader reads `idle`, then the hook writes its `PreToolUse` line
+    /// and it is applied, and only then does the monitor reach the `idle`.
+    /// The card stays Working: the line was read after the signal, so the
+    /// signal is the older report, whenever the connection was accepted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_signal_read_between_a_hooks_accept_and_its_line_does_not_overwrite_it() {
+        let deck = Deck::start(&["agy-park-late"]).await;
+        deck.thinking(0).await;
+        let (pane, agent) = deck.panes[0].clone();
+        let input = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/antigravity/pre-tool-use-run-command.json"),
+        )
+        .unwrap();
+        let mut event = crate::hook::hook_payload_event("antigravity", &input).unwrap();
+        event.session_id = "agy-park-0".to_string();
+        event.pane_id = Some(pane.clone());
+        event.agent_id = Some(agent.clone());
+        let token = deck.registry.hook_token_of(&agent).expect("pane token");
+        let line = crate::event::agent_event_line(&event, Some(&token)).unwrap();
+        let mut stream = UnixStream::connect(&deck.sock).await.unwrap();
+        // The hook loop accepts the connection while it sends nothing.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut found = Vec::new();
+        crate::status_osc::Osc7501Scanner::new("antigravity").scan(IDLE, &mut found);
+        let read = StatusSignals {
+            pane_id: pane.clone(),
+            agent_id: agent.clone(),
+            agent_type: AgentType::Antigravity,
+            signals: found,
+            seen_at: Instant::now(),
+            epoch: deck.registry.status_reader_epoch(&agent).unwrap(),
+        };
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        stream
+            .write_all(format!("{line}\n").as_bytes())
+            .await
+            .unwrap();
+        stream.flush().await.unwrap();
+        let card = deck
+            .card_within(0, Duration::from_secs(5), |(status, _)| {
+                *status == SessionStatus::Working
+            })
+            .await;
+        assert_eq!(card.map(|c| c.0), Some(SessionStatus::Working));
+        deck.signals.push(read);
+        let card = deck
+            .card_within(0, Duration::from_secs(1), |(status, _)| {
+                *status == SessionStatus::Idle
+            })
+            .await;
+        assert_eq!(
+            card.map(|c| c.0),
+            Some(SessionStatus::Working),
+            "an idle read before the hook's line repainted its card"
+        );
+        drop(stream);
+    }
+
+    /// Scenario: a connection to the hook socket opens and sends nothing, so
+    /// an Antigravity `PreToolUse` that arrives after it waits out the
+    /// predecessor wait before it is ingested. The permission prompt read
+    /// meanwhile waits too, and is bound to that call once it is in.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_permission_waits_for_a_call_waiting_on_a_silent_predecessor() {
+        let deck = Deck::start(&["agy-park-b"]).await;
+        deck.thinking(0).await;
+        let _silent = UnixStream::connect(&deck.sock).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let started = Instant::now();
+        let _call = deck.hook(0, "pre-tool-use-run-command.json").await;
+        deck.until_in_flight(0).await;
+        deck.signal(0, PERMISSION);
+        let card = deck
+            .card_within(0, Duration::from_secs(10), |(_, question)| *question)
+            .await;
+        assert_eq!(card, Some((SessionStatus::WaitingForInput, true)));
+        assert!(
+            started.elapsed() >= Duration::from_millis(500),
+            "the call did not wait behind the silent connection: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Scenario: one Antigravity pane's `PreToolUse` is held up in its ingest
+    /// with its permission prompt parked behind it, and another pane reports
+    /// `idle` meanwhile. The other pane's card turns Idle promptly; the first
+    /// pane's prompt still lands, bound, once its call is in.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_parked_pane_does_not_hold_back_another_panes_status() {
+        let deck = Deck::start(&["agy-park-c", "agy-park-d"]).await;
+        deck.thinking(0).await;
+        deck.thinking(1).await;
+        let held = deck
+            .registry
+            .question_answers()
+            .lock_lifecycle("agy-park-c")
+            .await;
+        let _call = deck.hook(0, "pre-tool-use-run-command.json").await;
+        deck.until_in_flight(0).await;
+        deck.signal(0, PERMISSION);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let asked = Instant::now();
+        deck.signal(1, IDLE);
+        let other = deck
+            .card_within(1, Duration::from_secs(5), |(status, _)| {
+                *status == SessionStatus::Idle
+            })
+            .await;
+        assert_eq!(other.map(|c| c.0), Some(SessionStatus::Idle));
+        assert!(
+            asked.elapsed() < Duration::from_millis(300),
+            "the other pane waited behind the parked one: {:?}",
+            asked.elapsed()
+        );
+        assert_eq!(deck.card(0).await, Some((SessionStatus::Thinking, false)));
+        drop(held);
+        let card = deck
+            .card_within(0, Duration::from_secs(5), |(_, question)| *question)
+            .await;
+        assert_eq!(card, Some((SessionStatus::WaitingForInput, true)));
+    }
+    /// `Approve Bash: echo other`: a prompt for another command than the
+    /// fixture's call.
+    const OTHER_PERMISSION: &[u8] = b"\x1b]7501;state=blocked:kind=permission:app=antigravity:msg=QXBwcm92ZSBCYXNoOiBlY2hvIG90aGVy\x07";
+    const AUTH: &[u8] = b"\x1b]7501;state=blocked:kind=auth:app=antigravity\x07";
+
+    impl Deck {
+        /// Whether pane `index`'s pending question is the fixture call's own
+        /// permission menu, bound to that call. (This stand-in draws no `agy`
+        /// header, so its digits stay keyboard-only: what the deck types for
+        /// a known release is covered by the question tests.)
+        async fn bound_to_the_call(&self, index: usize) -> bool {
+            let (pane, agent) = &self.panes[index];
+            self.state
+                .read()
+                .await
+                .pending_question_for(agent, Some(pane))
+                .is_some_and(|(_, question)| {
+                    question.kind == crate::question::QuestionKind::Permission
+                        && question.questions[0].options.len() == 4
+                        && question.tool.as_ref().is_some_and(|tool| {
+                            tool.use_id.as_deref() == Some("call_0000000000000000001")
+                                && tool.detail.as_deref() == Some("echo agy-probe-1")
+                        })
+                })
+        }
+    }
+
+    /// Scenario: one Antigravity pane's `PreToolUse` is held up in its ingest
+    /// — its pane's question lifecycle held — past the hook's own
+    /// acknowledgement deadline and past the 10 s the permission prompt read
+    /// behind it waits. Meanwhile another pane reports `idle`, before and after
+    /// that wait ran out, and its card turns Idle promptly each time; the first
+    /// pane's card does not show the prompt yet. Once the hold ends, the call
+    /// is in and the prompt shows Needs Input with the call's own question.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_prompt_past_its_wait_neither_loses_its_question_nor_holds_back_another_pane() {
+        let deck = Deck::start(&["agy-park-e", "agy-park-f"]).await;
+        deck.thinking(0).await;
+        deck.thinking(1).await;
+        let held = deck
+            .registry
+            .question_answers()
+            .lock_lifecycle("agy-park-e")
+            .await;
+        let _call = deck.hook(0, "pre-tool-use-run-command.json").await;
+        deck.until_in_flight(0).await;
+        deck.signal(0, PERMISSION);
+        let other_reports = |status: &'static [u8], wanted: SessionStatus| {
+            let deck = &deck;
+            async move {
+                let asked = Instant::now();
+                deck.signal(1, status);
+                let card = deck
+                    .card_within(1, Duration::from_secs(5), |(status, _)| *status == wanted)
+                    .await;
+                assert_eq!(card.map(|c| c.0), Some(wanted));
+                assert!(
+                    asked.elapsed() < Duration::from_millis(300),
+                    "the other pane waited behind the held one: {:?}",
+                    asked.elapsed()
+                );
+            }
+        };
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        other_reports(IDLE, SessionStatus::Idle).await;
+        tokio::time::sleep(
+            STATUS_SIGNAL_HOOK_WAIT - Duration::from_secs(6) + Duration::from_secs(1),
+        )
+        .await;
+        other_reports(
+            b"\x1b]7501;state=working:app=antigravity\x07",
+            SessionStatus::Thinking,
+        )
+        .await;
+        other_reports(IDLE, SessionStatus::Idle).await;
+        assert_eq!(
+            deck.card(0).await,
+            Some((SessionStatus::Thinking, false)),
+            "the prompt was applied ahead of the call it is bound to"
+        );
+        drop(held);
+        let card = deck
+            .card_within(0, Duration::from_secs(5), |(_, question)| *question)
+            .await;
+        assert_eq!(card, Some((SessionStatus::WaitingForInput, true)));
+        assert!(
+            deck.bound_to_the_call(0).await,
+            "the question is the call's own menu"
+        );
+    }
+
+    /// Scenario: an Antigravity permission prompt is read with no call of its
+    /// generation's in, so its card shows Needs Input answered at the
+    /// keyboard. The `PreToolUse` for that very command then lands, and the
+    /// card gets that call's own question, still on Needs Input. A
+    /// prompt for another command than the call that lands gets none.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_call_that_lands_after_its_prompt_gives_the_prompt_its_question() {
+        for (prompt, bound) in [(PERMISSION, true), (OTHER_PERMISSION, false)] {
+            let deck = Deck::start(&["agy-park-g"]).await;
+            deck.thinking(0).await;
+            deck.signal(0, prompt);
+            let card = deck
+                .card_within(0, Duration::from_secs(5), |(status, _)| {
+                    *status == SessionStatus::WaitingForInput
+                })
+                .await;
+            assert_eq!(card, Some((SessionStatus::WaitingForInput, false)));
+            let _call = deck.hook(0, "pre-tool-use-run-command.json").await;
+            let card = deck
+                .card_within(0, Duration::from_secs(3), |(_, question)| *question)
+                .await;
+            assert_eq!(
+                card,
+                Some((SessionStatus::WaitingForInput, bound)),
+                "{bound}"
+            );
+            assert_eq!(deck.bound_to_the_call(0).await, bound);
+        }
+    }
+
+    /// Scenario: an Antigravity pane holds a sign-in signal back, then a
+    /// `PreToolUse` of its generation is held up in its ingest with a
+    /// permission prompt parked behind it, and the sign-in signal's moment
+    /// comes and goes while it waits. The monitor keeps to its pace rather
+    /// than waking for that moment over and over, another pane's `idle` is
+    /// applied promptly meanwhile, and once the hold ends the prompt lands,
+    /// bound.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_held_sign_in_behind_a_parked_prompt_does_not_spin_the_monitor() {
+        let deck = Deck::start(&["agy-park-h", "agy-park-i"]).await;
+        deck.thinking(0).await;
+        deck.thinking(1).await;
+        deck.signal(0, AUTH);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let held = deck
+            .registry
+            .question_answers()
+            .lock_lifecycle("agy-park-h")
+            .await;
+        let _call = deck.hook(0, "pre-tool-use-run-command.json").await;
+        deck.until_in_flight(0).await;
+        deck.signal(0, PERMISSION);
+        tokio::time::sleep(crate::status_osc::AUTH_SETTLE + Duration::from_millis(300)).await;
+        let wakes = || {
+            deck.signals
+                .wakes
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+        let before = wakes();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let woke = wakes() - before;
+        // Its park tick paces it at about 200 a second.
+        assert!(woke < 1_000, "the monitor woke {woke} times in a second");
+        let asked = Instant::now();
+        deck.signal(1, IDLE);
+        let other = deck
+            .card_within(1, Duration::from_secs(5), |(status, _)| {
+                *status == SessionStatus::Idle
+            })
+            .await;
+        assert_eq!(other.map(|c| c.0), Some(SessionStatus::Idle));
+        assert!(
+            asked.elapsed() < Duration::from_millis(300),
+            "the other pane waited: {:?}",
+            asked.elapsed()
+        );
+        assert_eq!(deck.card(0).await, Some((SessionStatus::Thinking, false)));
+        drop(held);
+        let card = deck
+            .card_within(0, Duration::from_secs(5), |(_, question)| *question)
+            .await;
+        assert_eq!(card, Some((SessionStatus::WaitingForInput, true)));
+    }
+
+    impl Deck {
+        fn applies(&self) -> (usize, usize) {
+            (
+                self.signals
+                    .applies_spawned
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                self.signals
+                    .applies_running
+                    .load(std::sync::atomic::Ordering::SeqCst),
+            )
+        }
+
+        /// Wait until `wanted` holds of [`Self::applies`], panicking after 5 s.
+        async fn applies_until(&self, wanted: impl Fn((usize, usize)) -> bool, what: &str) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !wanted(self.applies()) {
+                assert!(
+                    Instant::now() < deadline,
+                    "{what}: (spawned, running) = {:?}",
+                    self.applies()
+                );
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+
+        /// The status-signal events pane `index`'s card applied, oldest first.
+        async fn signal_events(&self, index: usize) -> Vec<crate::event::EventType> {
+            let pane = &self.panes[index].0;
+            let state = self.state.read().await;
+            let Some(session) = state.pane_hook_session_id(pane) else {
+                return Vec::new();
+            };
+            state
+                .sessions
+                .get(&session)
+                .map_or_else(Vec::new, |session| {
+                    session
+                        .recent_events
+                        .iter()
+                        .filter(|event| event.is_status_signal())
+                        .map(|event| event.event_type.clone())
+                        .collect()
+                })
+        }
+    }
+
+    /// Scenario: one Antigravity pane's question lifecycle is held with no hook
+    /// of its in flight, and it reports `idle` — once on its own, once with a
+    /// hook of its generation received after the signal. Another pane reports
+    /// `idle` meanwhile and its card turns Idle promptly, while the first
+    /// pane's card does not move until the hold ends: then it turns Idle, or,
+    /// with the later hook in, stays on that hook's Thinking.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_held_pane_holds_up_only_its_own_status() {
+        for later_hook in [false, true] {
+            let deck = Deck::start(&["agy-hold-a", "agy-hold-b"]).await;
+            deck.thinking(0).await;
+            deck.thinking(1).await;
+            let held = deck
+                .registry
+                .question_answers()
+                .lock_lifecycle("agy-hold-a")
+                .await;
+            assert!(
+                !deck
+                    .registry
+                    .hook_in_flight_before(&deck.panes[0].1, Instant::now())
+            );
+            deck.signal(0, IDLE);
+            let _later = if later_hook {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let hook = deck.hook(0, "pre-invocation.json").await;
+                deck.until_in_flight(0).await;
+                Some(hook)
+            } else {
+                None
+            };
+            // The first pane's apply is under way, waiting for its pane.
+            deck.applies_until(|(_, running)| running >= 1, "its apply never started")
+                .await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let asked = Instant::now();
+            deck.signal(1, IDLE);
+            let other = deck
+                .card_within(1, Duration::from_secs(5), |(status, _)| {
+                    *status == SessionStatus::Idle
+                })
+                .await;
+            assert_eq!(
+                other.map(|c| c.0),
+                Some(SessionStatus::Idle),
+                "{later_hook}"
+            );
+            assert!(
+                asked.elapsed() < Duration::from_millis(300),
+                "the other pane waited behind the held one ({later_hook}): {:?}",
+                asked.elapsed()
+            );
+            assert_eq!(
+                deck.card(0).await,
+                Some((SessionStatus::Thinking, false)),
+                "{later_hook}"
+            );
+            drop(held);
+            deck.applies_until(|(_, running)| running == 0, "its apply never ended")
+                .await;
+            let wanted = if later_hook {
+                SessionStatus::Thinking
+            } else {
+                SessionStatus::Idle
+            };
+            let card = deck
+                .card_within(0, Duration::from_secs(5), |(status, _)| *status == wanted)
+                .await;
+            assert_eq!(card.map(|c| c.0), Some(wanted), "{later_hook}");
+            if later_hook {
+                assert!(
+                    !deck
+                        .registry
+                        .hook_in_flight_before(&deck.panes[0].1, Instant::now()),
+                    "the later hook is in"
+                );
+                assert!(
+                    !deck
+                        .signal_events(0)
+                        .await
+                        .contains(&crate::event::EventType::Idle),
+                    "the signal read before the later hook was applied over it"
+                );
+            }
+        }
+    }
+
+    /// Scenario: an Antigravity pane's question lifecycle is held while it
+    /// reports `idle`, so that apply waits; then the pane's agent closes. The
+    /// waiting apply is cancelled while the lifecycle is still held, and once
+    /// the hold ends the card has applied nothing from it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_waiting_apply_is_cancelled_when_its_generation_goes() {
+        let deck = Deck::start(&["agy-cancel-a"]).await;
+        deck.thinking(0).await;
+        let held = deck
+            .registry
+            .question_answers()
+            .lock_lifecycle("agy-cancel-a")
+            .await;
+        deck.signal(0, IDLE);
+        deck.applies_until(|(_, running)| running == 1, "its apply never started")
+            .await;
+        deck.registry.close_agent(&deck.panes[0].1).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while deck
+            .registry
+            .pane_current_agent_id("agy-cancel-a")
+            .is_some()
+        {
+            assert!(Instant::now() < deadline, "the agent never went");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        deck.applies_until(|(_, running)| running == 0, "the apply was not cancelled")
+            .await;
+        drop(held);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !deck
+                .signal_events(0)
+                .await
+                .contains(&crate::event::EventType::Idle),
+            "the gone generation's signal was applied"
+        );
+    }
+
+    /// Scenario: in a shell pane, `agy`'s own hooks turn the status reader on,
+    /// and with the pane's question lifecycle held it reports `idle`, so that
+    /// apply waits. A new `agy` invocation then starts there and its prompt
+    /// is read. The old apply is cancelled and the new one starts while the
+    /// lifecycle is still held, so it waits for nothing of the old reader's;
+    /// once the hold ends the card shows the new prompt and never the old
+    /// `idle`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_waiting_apply_is_cancelled_when_its_reader_restarts() {
+        let deck = Deck::start_as(&["agy-cancel-b"], None).await;
+        deck.thinking(0).await;
+        let (pane, agent) = deck.panes[0].clone();
+        let first = deck.registry.status_reader_epoch(&agent);
+        let held = deck
+            .registry
+            .question_answers()
+            .lock_lifecycle("agy-cancel-b")
+            .await;
+        deck.signal(0, IDLE);
+        deck.applies_until(|applies| applies == (1, 1), "its apply never started")
+            .await;
+        assert!(
+            deck.registry
+                .note_own_agent_hook(
+                    &pane,
+                    &agent,
+                    &AgentType::Antigravity,
+                    "agy-park-0",
+                    false,
+                    true,
+                )
+                .is_some(),
+            "the new invocation turned a fresh reader on"
+        );
+        assert_ne!(deck.registry.status_reader_epoch(&agent), first);
+        deck.signal(0, OTHER_PERMISSION);
+        deck.applies_until(
+            |applies| applies == (2, 1),
+            "the new reader's apply waited for the old one",
+        )
+        .await;
+        drop(held);
+        let card = deck
+            .card_within(0, Duration::from_secs(5), |(status, _)| {
+                *status == SessionStatus::WaitingForInput
+            })
+            .await;
+        assert_eq!(card.map(|c| c.0), Some(SessionStatus::WaitingForInput));
+        assert_eq!(
+            deck.signal_events(0).await,
+            vec![crate::event::EventType::PermissionRequest],
+            "the old reader's signal was applied"
+        );
+    }
+
+    /// Scenario: an Antigravity pane's `PreToolUse` is held up in its ingest
+    /// past the 10 s its permission prompt waits, so the prompt's apply goes
+    /// ahead and waits for the pane; the pane then reports `idle`. Once the
+    /// hold ends the call is in, the prompt lands with its question, and the
+    /// `idle` lands after it: the card ends Idle.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_later_idle_lands_after_the_late_prompt_ahead_of_it() {
+        let deck = Deck::start(&["agy-order-a"]).await;
+        deck.thinking(0).await;
+        let held = deck
+            .registry
+            .question_answers()
+            .lock_lifecycle("agy-order-a")
+            .await;
+        let _call = deck.hook(0, "pre-tool-use-run-command.json").await;
+        deck.until_in_flight(0).await;
+        deck.signal(0, PERMISSION);
+        tokio::time::sleep(STATUS_SIGNAL_HOOK_WAIT + Duration::from_millis(500)).await;
+        deck.applies_until(|(_, running)| running == 1, "the late prompt's apply")
+            .await;
+        deck.signal(0, IDLE);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(deck.applies(), (1, 1), "the idle went ahead of the prompt");
+        assert_eq!(deck.card(0).await, Some((SessionStatus::Thinking, false)));
+        drop(held);
+        let card = deck
+            .card_within(0, Duration::from_secs(5), |(status, _)| {
+                *status == SessionStatus::Idle
+            })
+            .await;
+        assert_eq!(card.map(|c| c.0), Some(SessionStatus::Idle));
+        assert_eq!(
+            deck.signal_events(0).await,
+            vec![
+                crate::event::EventType::PermissionRequest,
+                crate::event::EventType::Idle
+            ],
+            "the prompt and the idle after it, in that order"
+        );
+    }
+}

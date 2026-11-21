@@ -1176,6 +1176,43 @@ describe("voice control panel", () => {
       }
     });
 
+    /// Scenario: open an Antigravity agent, whose served delete key is one press per write 20 ms apart, dictate a short phrase and say "scratch that". Each delete goes out in a write of its own, one per dictated character, and the report says the words were removed.
+    it("paces scratch deletes one per write for an agent served a per-write cap (PRD #211)", async () => {
+      const { say, write, target, keyboard } = await startPrompt("antigravity");
+      const keys = FIXTURE_PROMPT_KEYS.antigravity!.deleteChar;
+      expect(keys.maxPressesPerWrite).toBe(1);
+      await keyboard("\r");
+      await say("agy words");
+      await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_SUBMIT_SETTLE_MS); });
+      write.mockClear();
+      await say("scratch that");
+      await act(async () => { await vi.advanceTimersByTimeAsync(keys.pauseBetweenWritesMs! * "agy words ".length * 2); });
+      await flush();
+      expect(write.mock.calls).toEqual(Array.from("agy words ", () => guardedWrite(target, keys.bytes)));
+      expect(report()).toHaveTextContent(/Removed .*agy words.*from Planner's prompt\./);
+    });
+
+    /// Scenario: open an Antigravity agent, dictate a phrase and say "scratch that", then type by hand after the first paced delete has gone out. The remaining deletes are not sent, the report says removing stopped partway, and a second "scratch that" has nothing left to remove.
+    it("stops paced scratch deletes when the prompt changes partway and forgets the prompt (PRD #211)", async () => {
+      const { say, write, target, keyboard } = await startPrompt("antigravity");
+      const keys = FIXTURE_PROMPT_KEYS.antigravity!.deleteChar;
+      await keyboard("\r");
+      await say("agy words");
+      await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_SUBMIT_SETTLE_MS); });
+      write.mockClear();
+      await say("scratch that");
+      expect(write.mock.calls).toEqual([guardedWrite(target, keys.bytes)]);
+      await keyboard("x");
+      await act(async () => { await vi.advanceTimersByTimeAsync(keys.pauseBetweenWritesMs! * 20); });
+      await flush();
+      expect(write.mock.calls.filter(([, data]) => data === keys.bytes), "no delete after the keyboard edit").toHaveLength(1);
+      expect(report()).toHaveTextContent(/Stopped removing .*agy words.* partway/);
+      write.mockClear();
+      await say("scratch that");
+      expect(write).not.toHaveBeenCalled();
+      expect(report()).toHaveTextContent(/Nothing to scratch/);
+    });
+
     /// Scenario: scratch waits behind an unfinished voice write while the user types a private draft by hand. Releasing the write leaves the keyboard text intact, sends no deletion bytes, and reports refusal.
     it("refuses queued scratch after keyboard input changes the prompt revision", async () => {
       const { say, write, target, keyboard } = await startPrompt();

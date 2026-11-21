@@ -777,6 +777,8 @@ pub(crate) mod tests {
                 "star_repo".to_string(),
                 "remind_star_later".to_string(),
                 "dismiss_star_prompt".to_string(),
+                "open_antigravity_issues".to_string(),
+                "dismiss_antigravity_notice".to_string(),
                 "stop_agent".to_string(),
                 "generate_config".to_string(),
                 "close_orchestration".to_string(),

@@ -8,6 +8,7 @@ import { agentKey, boundAgentKey } from "../lib/agentKey";
 import { LaunchCleanupError } from "../lib/actionError";
 import type { ProjectTrustTarget } from "../lib/projectTrust";
 import type { StarChoice } from "../lib/starPrompt";
+import type { NoticeChoice } from "../lib/antigravityNotice";
 import { applyTerminalChunk } from "../lib/terminalBuffer";
 import { deckName } from "../lib/displayText";
 import type { WorktreeKeptEntry } from "../lib/worktreeClose";
@@ -465,6 +466,9 @@ export function useDeckRuntime(): DeckRuntimeState {
   // doubles) leaves both absent, and the app never shows the reminder.
   const starPromptLaunch = useMemo(() => (typeof bridge.starPromptLaunch === "function" ? () => bridge.starPromptLaunch!() : undefined), [bridge]);
   const starPromptChoose = useMemo(() => (typeof bridge.starPromptChoose === "function" ? (choice: StarChoice) => bridge.starPromptChoose!(choice) : undefined), [bridge]);
+  // PRD #211: the Antigravity notice, on the same terms.
+  const antigravityNoticeStart = useMemo(() => (typeof bridge.antigravityNoticeStart === "function" ? (command: string | undefined) => bridge.antigravityNoticeStart!(command) : undefined), [bridge]);
+  const antigravityNoticeChoose = useMemo(() => (typeof bridge.antigravityNoticeChoose === "function" ? (choice: NoticeChoice) => bridge.antigravityNoticeChoose!(choice) : undefined), [bridge]);
   // PRD #1487 M5: Upgrade and Replace daemon. Their outcome — kept running,
   // failed while installing — is the dialog's to show, not the global error
   // toast's, so these bypass `runAction` too. A bridge without the verbs (some
@@ -692,6 +696,8 @@ export function useDeckRuntime(): DeckRuntimeState {
     ...(denyTrustRequest ? { denyTrustRequest } : {}),
     ...(starPromptLaunch ? { starPromptLaunch } : {}),
     ...(starPromptChoose ? { starPromptChoose } : {}),
+    ...(antigravityNoticeStart ? { antigravityNoticeStart } : {}),
+    ...(antigravityNoticeChoose ? { antigravityNoticeChoose } : {}),
     getSettings,
     saveSettings,
     testEndpoint,
