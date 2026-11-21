@@ -51,7 +51,7 @@ The desktop app has two things the TUI does not: one Dashboard over several daem
 
 ## Upgrade the app
 
-The app checks for a newer release when it starts and every 6 hours while it runs. When the app itself is behind, two things appear:
+The app checks for a newer release when it starts, every 6 hours while it runs, and when you come back to its window after an hour or more without a check, such as after the laptop slept. When the app itself is behind, two things appear:
 
 - an upgrade button, an arrow in a circle, at the bottom of the rail, on every screen. Hovering it shows, for example, `Agent Deck (desktop app): update available: v0.47.0 (current: v0.46.0)`.
 - a banner with the same text at the top of the Dashboard, with an **Upgrade…** button and a dismiss button. Dismissing it hides it until a newer release appears or the app restarts; the rail button stays.

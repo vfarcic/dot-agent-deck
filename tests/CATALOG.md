@@ -7548,6 +7548,13 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Does not assert:** running the refresh (`self_upgrade::agent_hooks` unit tests, `inbox/claude/048`), or the desktop dialog (`local_upgrade_008`–`010`).
 - **Platform coverage:** mac+linux+windows.
 
+##### upgrade/upgrade-dialog/016 — A terminal focus-in re-checks only when the last check is an hour old.
+- **Layer:** L1 (pure `upgrade_dialog::focus_check_due`, `FOCUS_RECHECK_FLOOR`, `focus_recheck_floor`).
+- **Agent:** none.
+- **Asserts:** the floor is one hour and `focus_recheck_floor()` is it; a focus-in is due with no check started yet, not due within the hour, due at the hour and after five hours, and due when the wall clock moved backwards (issue #2450).
+- **Does not assert:** the checker loop reacting to a real focus-in (`upgrade/tui-upgrade/004`), the desktop app's focus re-check (`desktop/src/hooks/useSelfUpgradeCheck.test.ts`, `self_upgrade_check_006`–`007`).
+- **Platform coverage:** mac+linux+windows.
+
 #### upgrade/tui-upgrade
 
 ##### upgrade/tui-upgrade/001 — The badge's key opens the dialog, and confirming replaces the running copy's binary with the served release.
@@ -7569,6 +7576,13 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Agent:** none.
 - **Asserts:** no badge while the server's newest release is the running version; after the server publishes a newer one, the badge appears within 30 s without a restart.
 - **Does not assert:** the production 6-hour interval (`upgrade/upgrade-dialog/006` pins the constant).
+- **Platform coverage:** mac+linux.
+
+##### upgrade/tui-upgrade/004 — A terminal focus-in re-checks for a release published while the TUI runs.
+- **Layer:** L2 (lane 1, real TUI under portable-pty, fake release server whose newest release changes mid-test, the production re-check interval, the `e2e`-only focus re-check floor seam at 0 s, a focus-in report `ESC [ I` written to the PTY).
+- **Agent:** none.
+- **Asserts:** no badge while the server's newest release is the running version; after the server publishes a newer one and the terminal reports focus-in, the badge appears within 30 s, long before the 6-hour interval (issue #2450).
+- **Does not assert:** the one-hour floor itself (`upgrade/upgrade-dialog/016`), a real suspend and resume.
 - **Platform coverage:** mac+linux.
 
 #### upgrade/cli-upgrade

@@ -2,7 +2,7 @@ import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { FALLBACK_RECHECK_SECS, type SelfUpgradeApi, type SelfUpgradeCheck } from "../lib/selfUpgrade";
-import { useSelfUpgradeCheck } from "./useSelfUpgradeCheck";
+import { FOCUS_RECHECK_FLOOR_SECS, useSelfUpgradeCheck } from "./useSelfUpgradeCheck";
 
 const CHECK: SelfUpgradeCheck = {
   checkId: 1,
@@ -21,6 +21,16 @@ function apiWith(check: SelfUpgradeApi["check"]): SelfUpgradeApi {
 
 /** Let the pending check's promise settle. */
 const settle = () => act(async () => { await Promise.resolve(); });
+
+/** The machine slept for `ms`: the wall clock moved, and no timer advanced. */
+const sleepFor = (ms: number) => vi.setSystemTime(Date.now() + ms);
+
+/** The window came back: it gained focus and its page became visible again. */
+const comeBack = () => act(async () => {
+  window.dispatchEvent(new Event("focus"));
+  document.dispatchEvent(new Event("visibilitychange"));
+  await Promise.resolve();
+});
 
 describe("useSelfUpgradeCheck", () => {
   beforeEach(() => vi.useFakeTimers());
@@ -74,13 +84,61 @@ describe("useSelfUpgradeCheck", () => {
     expect(result.current.check?.latest).toBe("0.48.0");
   });
 
-  /** Scenario: Unmounting stops the periodic check. */
+  /** Scenario: The laptop sleeps for five hours, so the six-hour timer has not moved, and the user brings the window back: the app checks again straight away, once, though focus and visibility both report it. */
+  it("self_upgrade_check_006 the window coming back after a long sleep checks again", async () => {
+    const api = apiWith(async () => ({ ...CHECK, recheckAfterSecs: 6 * 60 * 60 }));
+    renderHook(() => useSelfUpgradeCheck(api));
+    await settle();
+    expect(api.check).toHaveBeenCalledTimes(1);
+
+    sleepFor(5 * 60 * 60 * 1000);
+    await comeBack();
+    expect(api.check).toHaveBeenCalledTimes(2);
+  });
+
+  /** Scenario: The user switches away and back within the hour after a check: nothing is asked, so switching windows does not query GitHub repeatedly; once the last check is an hour old, coming back checks. */
+  it("self_upgrade_check_007 coming back within the hour of the last check asks nothing", async () => {
+    const api = apiWith(async () => ({ ...CHECK, recheckAfterSecs: 6 * 60 * 60 }));
+    renderHook(() => useSelfUpgradeCheck(api));
+    await settle();
+
+    sleepFor(FOCUS_RECHECK_FLOOR_SECS * 1000 - 1);
+    await comeBack();
+    expect(api.check).toHaveBeenCalledTimes(1);
+
+    sleepFor(1);
+    await comeBack();
+    expect(api.check).toHaveBeenCalledTimes(2);
+    await comeBack();
+    expect(api.check).toHaveBeenCalledTimes(2);
+  });
+
+  /** Scenario: The page becomes hidden (the window minimised) after an hour: nothing is checked until it is shown again. */
+  it("self_upgrade_check_008 a page becoming hidden does not check", async () => {
+    const api = apiWith(async () => CHECK);
+    renderHook(() => useSelfUpgradeCheck(api));
+    await settle();
+    sleepFor(FOCUS_RECHECK_FLOOR_SECS * 1000 * 2);
+    const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+    try {
+      await act(async () => { document.dispatchEvent(new Event("visibilitychange")); });
+      expect(api.check).toHaveBeenCalledTimes(1);
+    } finally {
+      visibility.mockRestore();
+    }
+    await comeBack();
+    expect(api.check).toHaveBeenCalledTimes(2);
+  });
+
+  /** Scenario: Unmounting stops the periodic check, and the window coming back no longer checks either. */
   it("self_upgrade_check_004 stops checking once unmounted", async () => {
     const api = apiWith(async () => CHECK);
     const { unmount } = renderHook(() => useSelfUpgradeCheck(api));
     await settle();
     unmount();
     await act(async () => { vi.advanceTimersByTime(CHECK.recheckAfterSecs * 1000 * 3); });
+    sleepFor(FOCUS_RECHECK_FLOOR_SECS * 1000 * 2);
+    await comeBack();
     expect(api.check).toHaveBeenCalledTimes(1);
   });
 });

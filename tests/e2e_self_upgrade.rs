@@ -256,6 +256,41 @@ fn tui_upgrade_003_periodic_recheck_notices_a_new_release() {
     );
 }
 
+/// Scenario: Start the TUI with the six-hour re-check interval, a focus re-check floor of zero, and a fake release server whose newest release is the version the TUI runs, so no badge shows; then publish a newer release and have the terminal report focus-in, as it does when the user comes back to the window after the laptop slept. The badge appears without waiting for the interval.
+#[spec("upgrade/tui-upgrade/004")]
+#[test]
+fn tui_upgrade_004_focus_in_rechecks_for_a_new_release() {
+    let version = RELEASE;
+    let (asset, manifest) = release(true);
+    let server = FakeReleases::start(OLD_VERSION, asset, manifest);
+    let dir = common::harness_tempdir().expect("tempdir");
+    let exe = writable_install(dir.path());
+
+    let deck = deck(
+        &server,
+        &exe,
+        dir.path(),
+        &[("DOT_AGENT_DECK_TEST_FOCUS_RECHECK_FLOOR_SECS", "0")],
+    );
+    deck.wait_for_string("No active agents");
+    let badge_shown = common::wait_until(Duration::from_secs(2), || {
+        deck.snapshot_grid().contains("update available")
+    });
+    assert!(!badge_shown, "{}", deck.snapshot_grid());
+
+    server.set_latest(version);
+    // What a terminal sends on focus-in once focus reporting is enabled.
+    deck.send_bytes(b"\x1b[I");
+    assert!(
+        deck.wait_for_grid_string_within(
+            &format!("update available: v{version}"),
+            Duration::from_secs(30)
+        ),
+        "a focus-in must check again once the floor has passed\n{}",
+        deck.snapshot_grid()
+    );
+}
+
 /// Scenario: Run `dot-agent-deck upgrade --check` as an old copy in a writable folder against a fake release server. It prints the plan — the headline, the in-place replacement and that provenance will not be checked — and changes nothing.
 #[spec("upgrade/cli-upgrade/001")]
 #[test]
