@@ -147,7 +147,7 @@ fn codex_stranded_doorbell_line_is_recognised_only_in_the_composer() {
     }
 }
 
-/// Scenario: Show Codex's composer holding exactly the doorbell's line shape, but naming a message other than the one the deck rang, or holding the deck's own line with the cursor anywhere but right after it, or with no model line below it. None of them may be flushed: the match is bound to the deck's outstanding line at Codex's edit cursor, not to anything shaped like a doorbell.
+/// Scenario: Show Codex's composer holding exactly the doorbell's line shape, but naming a message other than the one the deck rang, or holding the deck's own line with the cursor anywhere but right after it, or with no model line below it. None of them may be flushed: the match is bound to the deck's outstanding line at Codex's edit cursor, not to anything shaped like a doorbell. The deck's own line naming its absolute path, wrapped right after a hyphen or right after a slash as Codex wraps it, is still its line.
 #[test]
 fn codex_stranded_line_is_bound_to_the_decks_own_line_and_the_edit_cursor() {
     let placeholder = include_str!("fixtures/codex-inbox/composer.txt");
@@ -230,6 +230,20 @@ fn codex_stranded_line_is_bound_to_the_decks_own_line_and_the_edit_cursor() {
     assert!(
         codex_composer_holds_doorbell_line(&wrapped, cursor_below_composer(&wrapped), path_line),
         "and with the cursor on the empty row below it"
+    );
+    // Codex also wraps right after a slash (live inbox/probe/043,
+    // 2026-11-20), so those two rows join with no space too.
+    let wrapped = rows(
+        &placeholder
+            .replace(
+                "Ask Codex to do anything",
+                " dot-agent-deck: message m-oj4hazfz-6d18338071ac2788 waiting, run: /var/tmp/dad-e2e-1000/dad-tests-3260328-xsMumn/deck-under-test/\n  dot-agent-deck inbox fetch",
+            )
+            .replace("? for shortcuts", ""),
+    );
+    assert!(
+        codex_composer_holds_doorbell_line(&wrapped, cursor_after_composer(&wrapped), path_line),
+        "the deck's line wrapped after a slash is its line"
     );
 }
 

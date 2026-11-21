@@ -72,9 +72,13 @@ pub enum VersionEnd {
     BlankPassed,
 }
 
-/// One measured start-up header: `text` at `col` on `row`, then a version
-/// `MAJOR.MINOR.PATCH` (digits only: a pre-release tag does not match), then
-/// `end`.
+/// One measured start-up header: `text` at `col` on `row`, then a SemVer
+/// version, `MAJOR.MINOR.PATCH` with an optional pre-release (`-beta.1`) and
+/// build (`+abc`), then `end`. A pre-release build latches like a release
+/// (issue #2128): the doorbell's admission ([`crate::doorbell_activation`])
+/// and the composer probe's permission read the agent's facts, not which
+/// release latched, and `InputGrammar::of`'s measured grammar is for the bare
+/// 2.1.310 and 2.1.312 only, so a tagged one reads strictly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeaderRecogniser {
     pub agent: AgentType,
@@ -109,6 +113,14 @@ pub const CLAUDE_HEADER: HeaderRecogniser = HeaderRecogniser {
     text: "Claude Code v",
     end: VersionEnd::BlankPassed,
 };
+
+/// The most characters a header's version may have, tags included. The
+/// longest measured is Codex's `0.162.0-alpha.17.1` (18). The scanner reads a
+/// header after every byte, and its work budget prices the byte's parse, not
+/// that read, so the read must stay bounded: without a cap a row of
+/// `OpenAI Codex (v0.1.0-aaaa…` would be re-read whole at each byte, across
+/// a grid up to [`SCANNER_CELLS_MAX`] cells wide.
+pub const VERSION_CHARS_MAX: usize = 64;
 
 /// Antigravity's header (PRD #211), measured on `agy` 1.5.9 at 80 and 175
 /// columns, in a fresh pane and in its redraws after two resizes: a blank
@@ -173,10 +185,39 @@ impl HeaderRecogniser {
                 break;
             }
             version.push(c);
+            if version.len() > VERSION_CHARS_MAX {
+                return None;
+            }
             col += 1;
         }
         if dots != 2 || digits_in_part == 0 {
             return None;
+        }
+        // Then a SemVer pre-release (`-beta.1`, `-alpha.17.1`) and build
+        // (`+abc`), each optional, in that order (issue #2128). Their cells
+        // are read as SemVer's identifier characters and the whole version is
+        // checked by `Version::parse` below, so `2.1.310-` or `-beta..1`
+        // latches nothing.
+        for marker in ['-', '+'] {
+            if cell_char(screen, row, col)? != marker {
+                continue;
+            }
+            version.push(marker);
+            if version.len() > VERSION_CHARS_MAX {
+                return None;
+            }
+            col += 1;
+            loop {
+                let c = cell_char(screen, row, col)?;
+                if !(c.is_ascii_alphanumeric() || c == '.' || c == '-') {
+                    break;
+                }
+                version.push(c);
+                if version.len() > VERSION_CHARS_MAX {
+                    return None;
+                }
+                col += 1;
+            }
         }
         let end = cell_char(screen, row, col)?;
         let ended = match self.end {
