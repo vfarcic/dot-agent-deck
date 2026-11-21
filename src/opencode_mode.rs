@@ -422,20 +422,26 @@ pub enum SpawnProbe {
 /// ([`SpawnProbe::Owed`]), ask the `opencode` its pane's PATH resolves to,
 /// else the one `daemon_path` resolves to, `--version` through `detect`,
 /// exactly as a wrapper's spawn does
-/// ([`crate::opencode_version::probe_path_opencode_with`]). In production
-/// `detect` is [`crate::opencode_version::detect`], which records the answer
-/// by file identity and asks an unchanged file once, so this costs a PATH
-/// walk per look once answered; [`evaluate`] then finds the version only for
-/// a client that runs that very file ([`crate::opencode_version::recorded_version`]).
-/// The deck chooses the file from the PATH it handed the pane, never from
-/// the process table. Blocking.
+/// ([`crate::opencode_version::probe_path_opencode_with`]), once per distinct
+/// PATH. In production `detect` is [`crate::opencode_version::detect`], which
+/// records the answer by file identity and reuses it while the file is
+/// unchanged and the answer is cached, asking again a minute after a probe
+/// that did not complete; [`evaluate`] then finds the version only for a
+/// client that runs that very file
+/// ([`crate::opencode_version::recorded_version`]). The deck chooses the file
+/// from the PATH it handed the pane, never from the process table. Blocking:
+/// [`run_monitor`] runs it beside its looks, not before them, so a slow
+/// `--version` delays no pane's notices.
 pub fn probe_owed(
     watched: &[Watched],
     daemon_path: Option<&std::ffi::OsStr>,
     detect: &dyn Fn(&Path, Option<&std::ffi::OsStr>) -> Option<Version>,
 ) {
+    let mut asked = HashSet::new();
     for w in watched {
-        if let SpawnProbe::Owed { path } = &w.spawn_probe {
+        if let SpawnProbe::Owed { path } = &w.spawn_probe
+            && asked.insert(path.as_deref().or(daemon_path))
+        {
             crate::opencode_version::probe_path_opencode_with(
                 path.as_deref().or(daemon_path),
                 daemon_path,
@@ -443,6 +449,37 @@ pub fn probe_owed(
             );
         }
     }
+}
+
+/// Issue #2445: start [`probe_owed`] for `watched` on a blocking thread of its
+/// own, unless one is still running (`running`) or no agent is owed a probe.
+/// Its answers are recorded for the next look; a hung probe holds back only
+/// the next batch, never the looks.
+fn spawn_owed_probes(watched: &[Watched], running: &std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    use std::sync::atomic::Ordering;
+    let owed: Vec<Watched> = watched
+        .iter()
+        .filter(|w| matches!(w.spawn_probe, SpawnProbe::Owed { .. }))
+        .cloned()
+        .collect();
+    if owed.is_empty() || running.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    struct Done(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for Done {
+        fn drop(&mut self) {
+            self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let done = Done(running.clone());
+    tokio::task::spawn_blocking(move || {
+        let _done = done;
+        probe_owed(
+            &owed,
+            std::env::var_os("PATH").as_deref(),
+            &crate::opencode_version::detect,
+        );
+    });
 }
 
 /// What the daemon remembers between samples: when it first saw each agent's
@@ -682,8 +719,8 @@ pub fn evaluate(
 /// stalls this watch and nothing else, and never starts a second one. It
 /// never runs a binary it finds in the process table: versions come only from
 /// a probe's record ([`evaluate`]), of a file the deck chose from the PATH it
-/// handed the pane, at the spawn or, for an undeclared wrapper, before each
-/// look ([`probe_owed`], issue #2445). A wrapper-started client whose version
+/// handed the pane, at the spawn or, for an undeclared wrapper, beside its
+/// looks ([`probe_owed`], issue #2445). A wrapper-started client whose version
 /// that record gives has its generation remembered
 /// ([`crate::opencode_manage::remember_layout`], in the deck's own state, not
 /// in OpenCode's config), for the next install that has no command to look
@@ -693,6 +730,7 @@ pub async fn run_monitor(
     state: crate::state::SharedState,
 ) {
     let mut watch = Watch::default();
+    let owed_probes = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut ticker = tokio::time::interval(POLL_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -737,15 +775,11 @@ pub async fn run_monitor(
                 }
             }
         }
+        // Issue #2445: the version an undeclared wrapper's spawn did not
+        // record, for a later look.
+        spawn_owed_probes(&watched, &owed_probes);
         let spawned_clients = watch.spawned_clients.clone();
         let job = tokio::task::spawn_blocking(move || {
-            // Issue #2445: before the look, so a client found on it already
-            // has the version an undeclared wrapper's spawn did not record.
-            probe_owed(
-                &watched,
-                std::env::var_os("PATH").as_deref(),
-                &crate::opencode_version::detect,
-            );
             let roots: Vec<i32> = watched.iter().map(|w| w.root_pid).collect();
             let rows = sample(&roots)?;
             let notices = evaluate(
@@ -1373,8 +1407,25 @@ mod tests {
             spawn_probe: SpawnProbe::Owed { path: None },
             ..owed.clone()
         };
-        probe_owed(&[no_path], Some(&daemon_path), &detect);
+        probe_owed(std::slice::from_ref(&no_path), Some(&daemon_path), &detect);
         assert_eq!(*asked.borrow(), vec![daemon_bin.join("opencode")]);
+
+        // Several panes on one PATH are asked once per batch.
+        asked.borrow_mut().clear();
+        let sibling = Watched {
+            agent_id: "agent-b".to_string(),
+            ..owed.clone()
+        };
+        probe_owed(
+            &[owed.clone(), no_path, sibling],
+            Some(&daemon_path),
+            &detect,
+        );
+        assert_eq!(
+            *asked.borrow(),
+            vec![client_exe.clone(), daemon_bin.join("opencode")],
+            "one probe per distinct PATH"
+        );
 
         // A spawn that probed is asked nothing here.
         asked.borrow_mut().clear();

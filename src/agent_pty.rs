@@ -23687,12 +23687,6 @@ mod spawn_tests {
         registry.shutdown_all();
     }
 
-    /// Issue #1602: the registry keeps the command a pane was CONFIGURED with —
-    /// as the caller gave it, before `spawn` wraps it in `$SHELL -c` — so a
-    /// `dispatch --single` unit can be started the same way. The type is the
-    /// spawn's own when it had one, else what the pane's hooks taught it, and a
-    /// `$SHELL` pane offers nothing.
-    #[cfg(unix)]
     /// Scenario: a pane started by an undeclared wrapper is not watched as
     /// OpenCode until its own hooks reveal OpenCode; from then it is, and
     /// carries the probe its spawn did not run, with the PATH the spawn handed
@@ -23733,6 +23727,12 @@ mod spawn_tests {
         registry.close_agent(&agent).expect("close the pane");
     }
 
+    /// Issue #1602: the registry keeps the command a pane was CONFIGURED with —
+    /// as the caller gave it, before `spawn` wraps it in `$SHELL -c` — so a
+    /// `dispatch --single` unit can be started the same way. The type is the
+    /// spawn's own when it had one, else what the pane's hooks taught it, and a
+    /// `$SHELL` pane offers nothing.
+    #[cfg(unix)]
     #[test]
     fn configured_launch_of_reports_the_configured_command_and_its_agent() {
         let launch = |command: &str, agent_type: Option<AgentType>| ConfiguredLaunch {
