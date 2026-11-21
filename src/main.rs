@@ -39,6 +39,10 @@ enum CliAgent {
     /// shell `dot-agent-deck hook --agent devin` and are ingested by the
     /// [`dot_agent_deck::hook`] `"devin"` arm.
     Devin,
+    /// PRD #211: Google's Antigravity CLI (`agy`). Its hooks shell
+    /// `dot-agent-deck hook --agent antigravity` with camelCase payloads of
+    /// its own, ingested by the [`dot_agent_deck::hook`] `"antigravity"` arm.
+    Antigravity,
 }
 
 impl CliAgent {
@@ -52,6 +56,7 @@ impl CliAgent {
             CliAgent::Opencode => dot_agent_deck::event::AgentType::OpenCode,
             CliAgent::Codex => dot_agent_deck::event::AgentType::Codex,
             CliAgent::Devin => dot_agent_deck::event::AgentType::Devin,
+            CliAgent::Antigravity => dot_agent_deck::event::AgentType::Antigravity,
         }
     }
 }
@@ -118,8 +123,17 @@ enum Commands {
         #[arg(long)]
         supersede: bool,
     },
-    /// Create a git worktree and start an isolated line of work inside it.
-    /// Agent-callable, one step (PRD #220).
+    /// Create a git worktree and start an isolated line of work inside it, or,
+    /// with --dir, start the unit in a directory that already exists.
+    /// Agent-callable, one step (PRD #220, PRD #468).
+    ///
+    /// Without --dir, the worktree is a sibling of this checkout,
+    /// `../<repo>-dispatch-<name>`, on branch `agent/dispatch-<name>`, cut from
+    /// this checkout's HEAD; closing the unit removes it when it has no
+    /// uncommitted changes. With --dir, no worktree or branch is created and closing the
+    /// unit leaves the directory in place: the unit starts in that directory
+    /// (`--dir .` continues the work right where you are), and it is refused
+    /// when other live agents already work there.
     ///
     /// Exit status when starting a unit: 0 means the daemon admitted the
     /// request, or gave no answer this build can check (an older daemon, or
@@ -146,8 +160,8 @@ enum Commands {
     /// the daemon did not answer, or could not read this repo's config or this
     /// pane's directory. The reason is printed.
     Dispatch {
-        /// Short name for the dispatch unit (used for worktree naming).
-        /// Omit it only with --list-targets.
+        /// Short name for the dispatch unit. It names the unit's tab and, without
+        /// --dir, its worktree and branch. Omit it only with --list-targets.
         #[arg(required_unless_present = "list_targets")]
         name: Option<String>,
         /// Task description with context, file paths, and constraints.
@@ -189,6 +203,15 @@ enum Commands {
         /// --single does. Mutually exclusive with --orchestration.
         #[arg(long, value_name = "NAME", conflicts_with = "orchestration")]
         agent: Option<String>,
+        /// Start the unit in this existing directory instead of a new worktree
+        /// (`--dir .` for the directory you are in). No worktree or branch is created, and
+        /// closing the unit leaves the directory in place (unless it is an
+        /// earlier unit's worktree, which keeps that unit's cleanup). The
+        /// orchestrations on offer are that directory's. Refused when other
+        /// live agents already work in it. With --list-targets, list that
+        /// directory's targets.
+        #[arg(long, value_name = "PATH")]
+        dir: Option<String>,
         /// Print the spawn targets available in this repo, then exit. Ask the
         /// user which one they want before dispatching.
         ///
@@ -330,6 +353,21 @@ enum Commands {
     Inbox {
         #[command(subcommand)]
         action: InboxAction,
+    },
+    /// Interrupted work: the dispatched units, orchestrations and agents a
+    /// daemon restart stopped, and reports left for a caller that is gone.
+    /// List them, show one with its kept reports, reclaim a unit's worktree
+    /// (remove the worktree, keep the branch) or dismiss items from the list.
+    ///
+    /// Reclaim and dismiss are for a person: run from an agent's pane, they
+    /// are refused.
+    ///
+    /// Exit status: 0 done; 1 refused, kept, not listed or failed; 2 the
+    /// running daemon does not support interrupted work; 3 no deck daemon is
+    /// running.
+    Interrupted {
+        #[command(subcommand)]
+        cmd: InterruptedCmd,
     },
     /// Your agent card in the deck's overview: publish it, list every card,
     /// print the catalog of fields and actions, or act on a card.
@@ -877,6 +915,57 @@ enum WorktreeCmd {
     },
 }
 
+/// PRD #1790 stage 2: `dot-agent-deck interrupted …`. See
+/// [`dot_agent_deck::interrupted_cli`].
+#[derive(Subcommand)]
+enum InterruptedCmd {
+    /// List the interrupted work, newest first, with each item's id.
+    List {
+        /// Print the daemon's list as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Leave out each item's Git and pull request facts, so no `git` or
+        /// `gh` runs.
+        #[arg(long = "no-git")]
+        no_git: bool,
+    },
+    /// Show one item, and the text of the reports kept for it.
+    Show {
+        /// The item's id, or its unique name, branch or id suffix.
+        id: String,
+        /// Show the text of this one of the item's kept reports, by its id.
+        #[arg(long = "report", value_name = "REPORT_ID")]
+        report: Option<String>,
+        /// List the item's kept reports from this one on (counted from 0),
+        /// a page at a time, with their text. Each page says where the next
+        /// one starts.
+        #[arg(long = "reports-from", value_name = "N")]
+        reports_from: Option<usize>,
+    },
+    /// Reclaim an item: remove its worktree, keep its branch. A worktree with
+    /// uncommitted changes, or with other worktrees inside it, is kept.
+    Reclaim {
+        /// The item's id, or its unique name, branch or id suffix.
+        id: String,
+        /// Say what reclaiming would do, and change nothing.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+    },
+    /// Dismiss items: stop listing them. Their worktrees, branches and kept
+    /// reports are left as they are.
+    Dismiss {
+        /// The items' ids, or their unique names, branches or id suffixes.
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        ids: Vec<String>,
+        /// Dismiss every listed item. Asks first unless --yes.
+        #[arg(long)]
+        all: bool,
+        /// With --all: dismiss without asking.
+        #[arg(long, requires = "all")]
+        yes: bool,
+    },
+}
+
 /// PRD #2374: `dot-agent-deck card …`. See [`dot_agent_deck::agent_cards_cli`].
 #[derive(Subcommand)]
 enum CardAction {
@@ -1182,6 +1271,19 @@ enum ConfigAction {
 /// file** (issue #328): a FIFO with no writer would otherwise block the CLI
 /// forever inside `open`, and a character device such as `/dev/zero` never
 /// ends. See [`read_task_input`].
+/// PRD #468: `dispatch --dir <path>` as the absolute path the daemon is sent,
+/// resolved against this process's working directory and checked to be an
+/// existing directory ([`dot_agent_deck::dispatch::resolve_existing_dir`]).
+fn resolve_dispatch_dir(path: &str) -> Result<String, String> {
+    let dir = dot_agent_deck::dispatch::resolve_existing_dir(std::path::Path::new(path))?;
+    dir.into_os_string().into_string().map_err(|dir| {
+        format!(
+            "--dir {}: the path is not valid UTF-8, which the daemon cannot be sent",
+            std::path::Path::new(&dir).display()
+        )
+    })
+}
+
 fn resolve_task(
     task: Option<String>,
     task_file: Option<String>,
@@ -1820,6 +1922,7 @@ fn main() -> ExitCode {
                 CliAgent::Opencode => "opencode",
                 CliAgent::Codex => "codex",
                 CliAgent::Devin => "devin",
+                CliAgent::Antigravity => "antigravity",
             };
             handle_hook(agent_str)
         }
@@ -2047,6 +2150,7 @@ fn main() -> ExitCode {
             orchestration,
             command,
             agent,
+            dir,
             list_targets,
         }) => {
             let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
@@ -2056,6 +2160,17 @@ fn main() -> ExitCode {
                         "Error: DOT_AGENT_DECK_PANE_ID environment variable not set.\n\
                          This command should be run from within a dot-agent-deck managed pane."
                     );
+                    return ExitCode::FAILURE;
+                }
+            };
+            // PRD #468: `--dir` is resolved HERE, against this process's own
+            // directory, because that is what a path typed at this shell
+            // means (`--dir .` is where the caller stands). The daemon gets an
+            // absolute path and checks it again.
+            let dir = match dir.as_deref().map(resolve_dispatch_dir).transpose() {
+                Ok(dir) => dir,
+                Err(e) => {
+                    eprintln!("Error: {e}");
                     return ExitCode::FAILURE;
                 }
             };
@@ -2073,6 +2188,7 @@ fn main() -> ExitCode {
                     dot_agent_deck::event::ListTargetsRequest {
                         pane_id,
                         token: dot_agent_deck::hook_provenance::token_from_env(),
+                        dir: dir.clone(),
                     },
                 );
                 let json = match serde_json::to_string(&req) {
@@ -2173,6 +2289,7 @@ fn main() -> ExitCode {
                     token: dot_agent_deck::hook_provenance::token_from_env(),
                     command: command.as_deref().map(|c| c.trim().to_string()),
                     agent: agent.as_deref().map(|a| a.trim().to_string()),
+                    dir,
                 };
                 if !launch.is_empty() {
                     return report_dispatch_with_launch(
@@ -2215,6 +2332,7 @@ fn main() -> ExitCode {
             run_work_done(pane_id, task, done, task_id)
         }
         Some(Commands::Card { action }) => run_card_cli(action),
+        Some(Commands::Interrupted { cmd }) => run_interrupted_cli(cmd),
         Some(Commands::Inbox { action }) => match action {
             InboxAction::Fetch {
                 doorbell: Some(id),
@@ -4265,6 +4383,49 @@ fn print_cli_output(output: dot_agent_deck::roles_cli::CliOutput) -> ExitCode {
     print!("{}", output.stdout);
     eprint!("{}", output.stderr);
     ExitCode::from(output.code)
+}
+
+/// `dot-agent-deck interrupted …` — PRD #1790 stage 2. Connect-only, like
+/// `close`: a daemon it just started would know of nothing interrupted. The
+/// request building and rendering live in [`dot_agent_deck::interrupted_cli`].
+#[tokio::main]
+async fn run_interrupted_cli(cmd: InterruptedCmd) -> ExitCode {
+    use dot_agent_deck::interrupted_cli as cli;
+    use std::io::{BufRead, IsTerminal, Write};
+    let client = DaemonClient::new(client_attach_socket_path());
+    let identity = || dot_agent_deck::close_cli::ambient_identity();
+    let output = match cmd {
+        InterruptedCmd::List { json, no_git } => cli::run_list(&client, json, !no_git).await,
+        InterruptedCmd::Show {
+            id,
+            report,
+            reports_from,
+        } => cli::run_show(&client, &id, report.as_deref(), reports_from).await,
+        InterruptedCmd::Reclaim { id, dry_run } => match identity() {
+            Ok(identity) => cli::run_reclaim(&client, &id, dry_run, &identity).await,
+            Err(message) => cli::identity_error_output(message),
+        },
+        InterruptedCmd::Dismiss { ids, all, yes } => match identity() {
+            Ok(identity) => {
+                let args = cli::DismissArgs { ids, all, yes };
+                let mut ask = |question: &str| {
+                    eprint!("{question}");
+                    let _ = std::io::stderr().flush();
+                    let mut answer = String::new();
+                    std::io::stdin().lock().read_line(&mut answer).is_ok()
+                        && matches!(answer.trim(), "y" | "Y" | "yes" | "Yes" | "YES")
+                };
+                let confirm = if std::io::stdin().is_terminal() {
+                    cli::Confirm::Ask(&mut ask)
+                } else {
+                    cli::Confirm::NoTerminal
+                };
+                cli::run_dismiss(&client, &args, &identity, confirm).await
+            }
+            Err(message) => cli::identity_error_output(message),
+        },
+    };
+    print_cli_output(output)
 }
 
 /// `dot-agent-deck card …` — PRD #2374. See [`dot_agent_deck::agent_cards_cli`].

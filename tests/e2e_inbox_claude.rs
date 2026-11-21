@@ -1397,10 +1397,17 @@ fn claude_031_the_deck_answers_its_receipts_and_refuses_what_they_do_not_serve()
     };
     let answer = ask("question", "inbox_receipts", json!({}));
     assert_eq!(answer["one_shot_receipts"], 1, "{answer}");
-    // PRD #1666 part 3 (H4): and the senders it serves beyond Claude Code's.
+    // PRD #1666 part 3 (H4): and the senders it serves beyond Claude Code's,
+    // Antigravity's hooks among them since PRD #211.
     assert_eq!(
         answer["one_shot_senders"],
-        json!(["claude_waiter", "claude_hooks", "codex_hooks", "cli"]),
+        json!([
+            "claude_waiter",
+            "claude_hooks",
+            "codex_hooks",
+            "antigravity_hooks",
+            "cli"
+        ]),
         "{answer}"
     );
     for (tag, verb, extra) in [
@@ -1662,4 +1669,44 @@ fn claude_054_a_prompt_another_hook_blocks_ends_the_turn_its_hook_reported() {
         "a prompt blocked mid-turn ends no turn: {}",
         record(&daemon, &pane)
     );
+}
+
+/// Scenario: A scripted Claude Code's turn ends, then a human prompt starts another, and in the middle of it the real waiter is armed by a compaction's SessionStart. A task posted then is not handed to that waiter: it stays queued and the waiter has not exited two seconds later. When the turn ends, the waiter its Stop arms is handed the task, exiting 2 with its block.
+#[spec("inbox/claude/055")]
+#[test]
+fn claude_055_a_waiter_a_mid_turn_compaction_arms_is_held_for_the_stop_waiter() {
+    let daemon = daemon(&[]);
+    let pane = parent(&daemon, "claude-compact");
+    let status_is = |want: &str| {
+        common::wait_until(common::load_scaled(Duration::from_secs(20)), || {
+            card_status(&daemon, &pane) == want
+        })
+    };
+    run_hook(&pane, "stop", payload(&pane, "Stop"));
+    assert!(status_is("Idle"), "{}", record(&daemon, &pane));
+    let mut human = payload(&pane, "UserPromptSubmit");
+    human["prompt"] = json!(HUMAN);
+    run_hook(&pane, "human", human);
+    assert!(status_is("Thinking"), "{}", record(&daemon, &pane));
+    wait(&pane, "compact", "compact");
+    armed(&daemon, &pane, 1);
+    let id = post(&daemon, &pane, NATIVE_BODY);
+    assert!(
+        !common::wait_until(Duration::from_secs(2), || sidecar(&pane, "result-compact")
+            .exists()),
+        "a waiter a mid-turn compaction armed is handed nothing during the turn: {}",
+        record(&daemon, &pane)
+    );
+    state(&daemon, &pane, &id, "queued");
+    run_hook(&pane, "end", payload(&pane, "Stop"));
+    let mut stop = payload(&pane, "Stop");
+    stop["source"] = json!("stop");
+    command(&pane, "after", "wait", stop);
+    let delivered = result(&pane, "after");
+    assert_eq!(delivered["code"], 2, "{delivered}");
+    assert!(
+        delivered["stderr"].as_str().unwrap().contains(&id),
+        "{delivered}"
+    );
+    state(&daemon, &pane, &id, "fetched");
 }

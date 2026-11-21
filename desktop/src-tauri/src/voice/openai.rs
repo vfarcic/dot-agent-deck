@@ -75,7 +75,7 @@ use crate::model_service::TokenCeiling;
 use super::prompt::{action_enum, commands_state, data_turn, param_names};
 use super::remote::truncated_at;
 use super::resolver::{IntentAnswer, IntentError, IntentRequest};
-use super::schema::{AnnotatedCommand, TOOL_INSTRUCTIONS, TOOL_NAME};
+use super::schema::{AnnotatedCommand, CHAIN_INSTRUCTIONS, TOOL_INSTRUCTIONS, TOOL_NAME};
 
 /// What `params` is described as to the model.
 const PARAMS_DESCRIPTION: &str = "The params the chosen action declares, as the user referred to \
@@ -108,9 +108,34 @@ const PARAMS_DESCRIPTION: &str = "The params the chosen action declares, as the 
 /// list's names are the table's, so a row that adds a param adds a name
 /// without anyone editing this file.
 pub fn response_schema(commands: &[AnnotatedCommand]) -> Value {
+    let param = json!({
+        "type": "object",
+        "properties": {
+            "name": { "type": "string", "enum": param_names(commands) },
+            "value": { "type": "string" },
+        },
+        "required": ["name", "value"],
+        "additionalProperties": false,
+    });
     json!({
         "type": "object",
         "properties": {
+            // PRD #1184: first, as M1 measured it — the order strict mode
+            // generates in. `null` for every single command.
+            "steps": {
+                "type": ["array", "null"],
+                "description": CHAIN_INSTRUCTIONS,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": action_enum(commands) },
+                        "params": { "type": "array", "items": param.clone() },
+                        "said": { "type": "string" },
+                    },
+                    "required": ["action", "params", "said"],
+                    "additionalProperties": false,
+                },
+            },
             "action": {
                 "type": "string",
                 "description": "The id of the action to run, or `none` when nothing listed matches.",
@@ -119,18 +144,10 @@ pub fn response_schema(commands: &[AnnotatedCommand]) -> Value {
             "params": {
                 "type": "array",
                 "description": PARAMS_DESCRIPTION,
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "name": { "type": "string", "enum": param_names(commands) },
-                        "value": { "type": "string" },
-                    },
-                    "required": ["name", "value"],
-                    "additionalProperties": false,
-                },
+                "items": param,
             },
         },
-        "required": ["action", "params"],
+        "required": ["steps", "action", "params"],
         "additionalProperties": false,
     })
 }
@@ -330,6 +347,14 @@ mod tests {
                 "add_daemon",
                 "show_host_metrics",
                 "show_dashboard_counters",
+                "show_interrupted_work",
+                "reclaim_interrupted",
+                "dismiss_interrupted",
+                "dismiss_all_interrupted",
+                "show_interrupted_details",
+                "show_interrupted_reports",
+                "next_interrupted_reports",
+                "previous_interrupted_reports",
                 "switch_deck",
                 "voice_off",
                 "list_commands",
@@ -369,6 +394,8 @@ mod tests {
                 "star_repo",
                 "remind_star_later",
                 "dismiss_star_prompt",
+                "open_antigravity_issues",
+                "dismiss_antigravity_notice",
                 "stop_agent",
                 "generate_config",
                 "close_orchestration",

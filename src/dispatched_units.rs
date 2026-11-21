@@ -245,6 +245,10 @@ pub struct NewUnit {
     pub worktree: PathBuf,
     pub branch: String,
     pub clone_dir: PathBuf,
+    /// PRD #468: the unit was dispatched with `--dir` into a directory that
+    /// already existed, so `worktree` is not the dispatch's own and a close
+    /// does not report it as a worktree the deck lost track of.
+    pub existing_dir: bool,
     pub dispatcher: Dispatcher,
     pub kind: UnitKind,
     pub dispatched_at_ms: i64,
@@ -260,6 +264,10 @@ pub struct UnitOrigin {
     pub worktree: PathBuf,
     pub branch: String,
     pub clone_dir: PathBuf,
+    /// PRD #468: the unit was dispatched with `--dir` into a directory that
+    /// already existed, so `worktree` is not the dispatch's own and a close
+    /// does not report it as a worktree the deck lost track of.
+    pub existing_dir: bool,
     pub dispatcher: Dispatcher,
 }
 
@@ -274,6 +282,7 @@ impl UnitOrigin {
             dispatcher: self.dispatcher,
             kind,
             dispatched_at_ms,
+            existing_dir: self.existing_dir,
         }
     }
 }
@@ -292,6 +301,10 @@ pub struct DispatchedUnit {
     pub worktree: PathBuf,
     pub branch: String,
     pub clone_dir: PathBuf,
+    /// PRD #468: the unit was dispatched with `--dir` into a directory that
+    /// already existed, so `worktree` is not the dispatch's own and a close
+    /// does not report it as a worktree the deck lost track of.
+    pub existing_dir: bool,
     pub dispatcher: Dispatcher,
     pub kind: UnitKind,
     pub dispatched_at_ms: i64,
@@ -425,6 +438,7 @@ impl DispatchedUnits {
             dispatched_at_ms: unit.dispatched_at_ms,
             completed_at_ms: None,
             state: UnitState::Running,
+            existing_dir: unit.existing_dir,
         });
         id
     }
@@ -637,7 +651,8 @@ impl DispatchedUnits {
         }
         Err(Refused::new(
             RefusalReason::UnknownUnit,
-            "no live unit has that name (units are not remembered across a daemon restart)",
+            "no live unit has that name (units are not remembered across a daemon restart; \
+             `dot-agent-deck interrupted list` shows the ones a restart interrupted)",
         ))
     }
 
@@ -662,8 +677,9 @@ impl DispatchedUnits {
             return Err(already_ended(stone));
         }
         let message = if self.is_foreign_id(id) {
-            "that unit id was issued by a daemon that has since restarted; nothing it \
-             recorded is known to this one"
+            "that unit id was issued by a daemon that has since restarted, and its live unit \
+             registration did not survive the restart. `dot-agent-deck interrupted list` \
+             shows the work a restart interrupted"
         } else {
             "no live unit has that id"
         };
@@ -904,6 +920,7 @@ mod tests {
                 agent_id: agent.to_string(),
             },
             dispatched_at_ms: 1,
+            existing_dir: false,
         }
     }
 
@@ -1109,6 +1126,26 @@ mod tests {
         let refused = after.resolve_id(&id).expect_err("foreign id");
         assert_eq!(refused.reason, RefusalReason::UnknownUnit);
         assert!(refused.message.contains("restarted"), "{}", refused.message);
+    }
+
+    /// Final review, reviewer 4: the refusal of a unit id a restarted daemon
+    /// issued says what was lost, the live unit registration, and points at
+    /// the interrupted work list, which the work journal survives to feed. It
+    /// does not claim that nothing the earlier daemon recorded is known.
+    #[test]
+    fn a_foreign_unit_refusal_names_only_the_lost_live_registration() {
+        let mut before = DispatchedUnits::with_epoch("aaaaaa");
+        let id = before.register(single("fix", "a", "p1", "1"));
+        let after = DispatchedUnits::with_epoch("bbbbbb");
+        let refused = after.resolve_id(&id).expect_err("foreign id");
+        assert_eq!(refused.reason, RefusalReason::UnknownUnit);
+        let message = &refused.message;
+        assert!(!message.contains("nothing it recorded"), "{message}");
+        assert!(message.contains("live unit registration"), "{message}");
+        assert!(
+            message.contains("`dot-agent-deck interrupted list`"),
+            "{message}"
+        );
     }
 
     #[test]

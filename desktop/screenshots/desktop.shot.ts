@@ -9,8 +9,8 @@ import { desktopScenario } from "./support";
  */
 
 /** Load a fixture state and open the agent dashboard through its rail control. */
-async function overview(page: Page, state: "docs" | "docs-fleet" | "docs-pr" | "docs-generate" | "docs-restart" | "empty"): Promise<void> {
-  await page.goto(`/?fixture=1&state=${state}`);
+async function overview(page: Page, state: "docs" | "docs-fleet" | "docs-pr" | "docs-generate" | "docs-restart" | "empty", query = ""): Promise<void> {
+  await page.goto(`/?fixture=1&state=${state}${query}`);
   await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
   await page.getByTestId("open-overview").click();
 }
@@ -25,6 +25,33 @@ desktopScenario("dashboard", async (page) => {
 desktopScenario("dashboard-empty", async (page) => {
   await overview(page, "empty");
   await expect(page.getByTestId("overview-first-run")).toBeVisible();
+});
+
+// The same synthetic permission stop as the TUI capture: one Antigravity
+// agent, with its own wording beneath the tile's Needs Input status.
+desktopScenario("antigravity-needs-input", async (page) => {
+  // Use xterm's supported DOM renderer: the sandbox's headless WebGL
+  // canvas stays blank even after its buffer contains the permission menu.
+  await page.addInitScript(() => {
+    const getContext = HTMLCanvasElement.prototype.getContext;
+    Object.defineProperty(HTMLCanvasElement.prototype, "getContext", {
+      value(...args: unknown[]) {
+        if (typeof args[0] === "string" && args[0].includes("webgl")) return null;
+        return Reflect.apply(getContext, this, args);
+      },
+    });
+  });
+  await page.goto("/?fixture=1&state=docs-antigravity");
+  await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
+  await page.getByRole("button", { name: "Open probe agent" }).click();
+  await expect(page.getByTestId("agent-pane-overlay")).toBeVisible();
+  const tile = page.getByTestId("agent-tile-antigravity");
+  await expect(tile).toBeVisible();
+  await expect(tile.getByTestId("status-reason-1")).toHaveText("Approve Bash: rm -f probe.txt");
+  await expect(tile.getByText("needs input", { exact: true })).toBeVisible();
+  await expect(tile.getByTestId("question-badge-1")).toBeVisible();
+  await expect(tile.getByTestId("question-badge-1")).toContainText("QUESTION");
+  await expect(tile.locator(".xterm-rows")).toContainText("Esc to cancel");
 });
 
 desktopScenario("pull-request-badge", async (page) => {
@@ -108,11 +135,32 @@ desktopScenario("generate-config", async (page) => {
 });
 
 // The two agents the TUI `restart-notice` image names, stopped by a restart of
-// the fixture's `docs-restart` deck after its first listing was shown.
+// the fixture's `docs-restart` deck after its first listing was shown. The
+// preview daemon also lists interrupted work (`interrupted=1`), so the notice
+// carries its line and Show button (PRD #1790 stage 2).
 desktopScenario("restart-notice", async (page) => {
-  await overview(page, "docs-restart");
-  await expect(page.getByTestId("restart-toast")).toHaveText("The deck restarted; these agents were stopped: api-fix, docs-review.");
+  await overview(page, "docs-restart", "&interrupted=1");
+  const toast = page.getByTestId("restart-toast");
+  await expect(toast).toContainText("The deck restarted; these agents were stopped: api-fix, docs-review.");
+  await expect(toast.getByTestId("restart-toast-interrupted")).toContainText("3 interrupted items from before the restart");
+  await expect(toast.getByTestId("restart-toast-interrupted-show")).toBeVisible();
   await expect(page.locator(".overview-row")).toHaveCount(0);
+});
+
+// PRD #1790 stage 2 — the "Interrupted work" dialog over the docs dashboard,
+// opened from the deck's banner: the preview daemon's three items
+// (`desktop/src/data/fixtureInterrupted.ts`), the unit `fix-login` selected.
+desktopScenario("interrupted-work", async (page) => {
+  await page.goto("/?fixture=1&state=docs&interrupted=1");
+  await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
+  await page.getByTestId("open-overview").click();
+  await expect(page.getByTestId("interrupted-banner")).toContainText("3 interrupted items from before the restart");
+  await page.getByTestId("interrupted-banner-show").click();
+  const dialog = page.getByTestId("interrupted-dialog");
+  await expect(dialog.getByTestId("interrupted-row")).toHaveCount(3);
+  await dialog.getByTestId("interrupted-row").filter({ hasText: "fix-login" }).click();
+  await expect(dialog.getByTestId("interrupted-reclaim")).toBeVisible();
+  await expect(dialog.getByTestId("interrupted-other-agents")).toHaveText("Other agents");
 });
 
 /** Select the fixture project's directory in the shared New agent form. */

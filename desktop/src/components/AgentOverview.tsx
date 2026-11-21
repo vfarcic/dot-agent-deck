@@ -1,7 +1,7 @@
-import { Children, cloneElement, createContext, isValidElement, useCallback, useContext, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type MouseEvent, type ReactNode } from "react";
+import { Children, cloneElement, createContext, isValidElement, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent, type ReactNode } from "react";
 import { Blocks, Boxes, CircleArrowUp, CircleStop, Columns3, FileCog, Filter, LayoutList, Layers, Maximize2, Network, Play, Plus, RefreshCw, RotateCcw, Server, ShieldAlert, Sparkles, SquareTerminal, Wrench, X } from "lucide-react";
 import { desktopFeaturesOf } from "../types";
-import { KEEP_WORKTREE_SUFFIX, worktreePreview } from "../lib/worktreeClose";
+import { worktreePreview } from "../lib/worktreeClose";
 import { type AgentSession, type AgentStatus, type ConnectionView, type DeckRuntimeState, type DeckView, type GenerateConfigResult } from "../types";
 import { STATUS_WORD_ORDER, statusWord, statusWordLabel, type StatusWord } from "../lib/statusWords";
 import { modeScopedKey, type DesktopAgentDto } from "../lib/bridge";
@@ -33,6 +33,8 @@ import { numberKey, type VoiceNumberedEntryDto, type VoiceNumberedSectionDto } f
 import { agentSpokenName, orchestrationTitle } from "../lib/agentNames";
 import { DISPLAY_LIMITS, deckName, displayActivity, displayIdentity, displayPath, displayText, displayTitle, displayUptime, domIdentity, rendersBlank } from "../lib/displayText";
 import { HookBinaryNotices } from "./HookBinaryNotice";
+import { InterruptedWorkBanner, InterruptedWorkDialog } from "./InterruptedWork";
+import { INTERRUPTED_COVERED, listedCount, mayHaveInterrupted, NOTHING_INTERRUPTED, shownInterruptedDialog, type InterruptedDialogControls } from "../lib/interruptedWork";
 import { sameIncarnation } from "../lib/agentKey";
 import { AGENT_GONE_AFTER_RESTART } from "../lib/agentIdentity";
 import { inboxAttentionWords, INBOX_WORDS } from "../lib/inboxWords";
@@ -789,6 +791,16 @@ export function modalOpen(): boolean {
 }
 
 /**
+ * PR #2431 round 5 — whether a modal other than the Interrupted work dialog
+ * is open. A request to show interrupted work may turn that dialog to another
+ * daemon's list, so it never blocks one; Settings, a confirmation, or any
+ * modal drawn over the dialog still does.
+ */
+function modalOtherThanInterruptedOpen(): boolean {
+  return [...document.querySelectorAll("[aria-modal='true']")].some((modal) => !modal.classList.contains("interrupted-dialog"));
+}
+
+/**
  * The most dashboard rows that carry a number: the most items a numbered list
  * may declare to voice (`MAX_VOICE_NUMBERED_ENTRIES` in `src-tauri/src/lib.rs`,
  * which refuses a longer list and with it every voice command on the screen).
@@ -922,30 +934,95 @@ export function stopTargetName(agent: OverviewAgent): string {
   return displayIdentity(raw, DISPLAY_LIMITS.name, unnamedAgentLabel(agent));
 }
 
-/** One-agent close flow shared by the dashboard row and full-window pane (issue #1402). The target is captured when the question opens, including its daemon process. */
-export function stopAgentConfirmation(agent: OverviewAgent, connection: ConnectionView, runAction: DeckRuntimeState["runAction"], onStopped?: () => void, previewWorktreeClose?: DeckRuntimeState["previewWorktreeClose"]): ConfirmState {
+/**
+ * Issue #2436 — the orchestration `agent` is a role of, as its card on the
+ * dashboard lists it, from the agents its deck reports. `undefined` for an
+ * agent outside an orchestration, and for a role whose deck reported no
+ * `orchestrationId`: `groupAgents` puts such a role in a group of its own, so
+ * its other roles cannot be told apart and "close the orchestration" would
+ * stop this role alone (Qodo, PR #2437). That role's dialog keeps the
+ * single-role warning instead.
+ */
+export function orchestrationOf(agent: OverviewAgent, deckAgents: readonly OverviewAgent[]): OverviewGroup | undefined {
+  if (agent.tab.kind !== "orchestration" || agent.tab.orchestrationId === undefined) return undefined;
+  const key = agentKey(agent);
+  return groupAgents([...deckAgents]).find((group) => group.kind === "orchestration" && group.agents.some((member) => agentKey(member) === key));
+}
+
+/** A `stop_orchestration` role: the agent the deck closes, the name its report uses, and the daemon process that listed it. */
+type OrchestrationStopRole = { agentId: string; name: string; incarnation?: string };
+
+/**
+ * What closing a whole orchestration stops and how it is worded: the group's
+ * own Close and an orchestration role's Close dialog (issue #2436) read the
+ * same copy, so both name the orchestration and every role it stops.
+ */
+export function orchestrationCloseOf(group: OverviewGroup, connection: ConnectionView): { title: string; body: string; label: string; roles: OrchestrationStopRole[] } {
+  const roles = group.agents.map((agent) => ({ agentId: agent.id, name: stopTargetName(agent), ...(agent.incarnation ? { incarnation: agent.incarnation } : {}) }));
+  const title = displayIdentity(group.title, DISPLAY_LIMITS.name, unnamedGroupLabel(group));
+  const count = roles.length === 1 ? "its 1 role" : `all ${roles.length} of its roles`;
+  return {
+    title,
+    roles,
+    label: roles.length === 1 ? "Close 1 role" : `Close all ${roles.length} roles`,
+    body: `This stops every role of this orchestration on ${deckName(connection)} — ${count}: ${roles.map((role) => role.name).join(", ")}. Unsaved terminal work in any of them may be interrupted.`,
+  };
+}
+
+/**
+ * One-agent close flow shared by the dashboard row and full-window pane (issue #1402). The target is captured when the question opens, including its daemon process.
+ *
+ * Issue #2436: for a role of an orchestration (`orchestration`, from
+ * {@link orchestrationOf}), the dialog also offers closing the whole
+ * orchestration — the group Close's `stop_orchestration` over the same roles.
+ * On the orchestrator that is the choice the dialog leads with, since closing
+ * it alone leaves the workers with nothing coordinating them; on any other
+ * role closing only that agent leads. Every role of an orchestration shares
+ * one worktree, so the agent's own worktree preview answers for both closes,
+ * and the "Keep the worktree" box applies to whichever is pressed.
+ */
+export function stopAgentConfirmation(agent: OverviewAgent, connection: ConnectionView, runAction: DeckRuntimeState["runAction"], onStopped?: () => void, previewWorktreeClose?: DeckRuntimeState["previewWorktreeClose"], orchestration?: OverviewGroup): ConfirmState {
   const name = stopTargetName(agent);
-  const roleWarning = agent.tab.kind === "orchestration"
-    ? " This closes only this role, leaving the orchestration one role short. Other roles keep running."
-    : "";
-  const stop = async (keepWorktree: boolean) => {
+  const settle = async (action: Parameters<DeckRuntimeState["runAction"]>[0]) => {
     try {
-      const result = await runAction({ type: "stop_agent", deckId: agent.daemonId, agentId: agent.id, incarnation: agent.incarnation, ...(keepWorktree ? { keepWorktree: true } : {}) });
+      const result = await runAction(action);
       if (result.ok) onStopped?.();
     } catch {
       // The runtime files the refusal under its global error; keep the agent's view.
     }
   };
-  const label = "Close agent";
-  return {
+  const base = {
     title: `Close ${name}?`,
-    body: `This sends a stop request to ${name} on ${deckName(connection)}. Unsaved terminal work may be interrupted.${roleWarning}`,
-    label,
+    label: "Close agent",
     busyLabel: "Stopping…",
     worktreePreview: worktreePreview({ previewWorktreeClose }, agent.daemonId, [agent]),
-    action: () => stop(false),
-    // Issue #1958: offered by the dialog only when the preview names a worktree the deck can keep.
-    keepWorktree: { label: `${label}${KEEP_WORKTREE_SUFFIX}`, action: () => stop(true) },
+    action: ({ keepWorktree }: { keepWorktree: boolean }) => settle({ type: "stop_agent", deckId: agent.daemonId, agentId: agent.id, incarnation: agent.incarnation, ...(keepWorktree ? { keepWorktree: true } : {}) }),
+    // Issue #1958: the dialog offers the box only when the preview names a worktree the deck can keep.
+    keepWorktree: true,
+  };
+  const interrupted = "Unsaved terminal work may be interrupted.";
+  const group = orchestration?.agents.some((member) => agentKey(member) === agentKey(agent)) ? orchestration : undefined;
+  if (!group) {
+    const roleWarning = agent.tab.kind === "orchestration"
+      ? " This closes only this role, leaving the orchestration one role short. Other roles keep running."
+      : "";
+    return { ...base, body: `This sends a stop request to ${name} on ${deckName(connection)}. ${interrupted}${roleWarning}` };
+  }
+  const whole = orchestrationCloseOf(group, connection);
+  const count = whole.roles.length === 1 ? "its 1 role" : `all ${whole.roles.length} of its roles`;
+  const everyRole = `Close orchestration stops every role of ${whole.title} on ${deckName(connection)} — ${count}: ${whole.roles.map((role) => role.name).join(", ")}.`;
+  const orchestrator = agent.tab.kind === "orchestration" && agent.tab.isStartRole;
+  const onlyThis = orchestrator
+    ? `Close agent stops only ${name}, the orchestrator, leaving the other roles with nothing coordinating them.`
+    : `Close agent stops only ${name}, leaving ${whole.title} one role short; its other roles keep running.`;
+  return {
+    ...base,
+    body: orchestrator ? `${everyRole} ${onlyThis} ${interrupted}` : `${onlyThis} ${everyRole} ${interrupted}`,
+    alternative: {
+      label: "Close orchestration",
+      primary: orchestrator,
+      action: ({ keepWorktree }) => settle({ type: "stop_orchestration", deckId: agent.daemonId, roles: whole.roles, ...(keepWorktree ? { keepWorktree: true } : {}) }),
+    },
   };
 }
 
@@ -1040,6 +1117,16 @@ export function generateConfigConfirmation(agent: Pick<OverviewAgent, "daemonId"
 type GenerateConfigControls = Pick<VoiceActionContext, "confirmGenerateConfig" | "reportRefused">;
 
 const GenerateConfigContext = createContext<GenerateConfigControls | undefined>(undefined);
+
+/**
+ * PRD #1790 stage 2 — the dashboard's answer when several daemons have
+ * interrupted work and a key or spoken request named none. `definite` is
+ * false when any of them only answered with an incomplete empty list, which
+ * says it may have work, not that it has (verification finding N4).
+ */
+function interruptedSeveral(names: string[], definite: boolean, then: string): string {
+  return `Several daemons ${definite ? "have" : "may have"} interrupted work: ${names.join(", ")}. ${then}`;
+}
 
 /**
  * The fleet at a glance: every agent the desktop can see, grouped the way the
@@ -1397,6 +1484,115 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   }, [decks]);
   const closeHostMetrics = useCallback((deckId: string) => setHostOpen((open) => (open === deckId ? undefined : open)), []);
   /*
+    PRD #1790 stage 2 — each deck's interrupted work: its banner while its
+    daemon lists any, and the "Interrupted work" dialog, whose state the
+    runtime holds so the restart notice can open it too. The open dialog
+    publishes its calls here, for its buttons' registry entries and voice.
+  */
+  const interrupted = runtime.interruptedWork;
+  const interruptedControls = useRef<InterruptedDialogControls | undefined>(undefined);
+  /*
+    Final reviewer 2 — `I`, the restart notice's Show and "show interrupted
+    work" never decide from a list held from before: with one daemon to ask,
+    its dialog opens and asks it again, as the TUI's `I` does, even when its
+    last answer listed nothing or failed; with several, each is asked again
+    first. "No interrupted work" is said only when every one of them answered
+    that with a complete list.
+  */
+  /*
+    PR #2431 round 4 (Qodo) — which request to show interrupted work is the
+    newest. Asking several daemons again takes a round trip, and by its end
+    the person may have moved on: asked again, opened or closed a dialog,
+    left the dashboard. Each of those moves this on, and an answer to an
+    older request opens nothing and says nothing.
+  */
+  const showRequest = useRef(0);
+  useEffect(() => () => { showRequest.current += 1; }, []);
+  const openInterruptedDialog = interrupted?.dialog;
+  useEffect(() => { showRequest.current += 1; }, [openInterruptedDialog]);
+  const showInterruptedWork = useCallback((deckId?: string): string | undefined | Promise<string | undefined> => {
+    const request = ++showRequest.current;
+    if (!interrupted) return NOTHING_INTERRUPTED;
+    if (deckId !== undefined) return interrupted.openDialog(deckId) ? undefined : NOTHING_INTERRUPTED;
+    const held = interrupted.decks;
+    const asked = decks.filter((deck) => {
+      const id = deck.snapshot.connection.deckId;
+      return deck.connected && id !== undefined && held[id] !== undefined && !held[id].unsupported;
+    });
+    if (asked.length === 0) return NOTHING_INTERRUPTED;
+    if (asked.length === 1) return interrupted.openDialog(asked[0].snapshot.connection.deckId as string) ? undefined : NOTHING_INTERRUPTED;
+    const { openDialog, refresh, reveal } = interrupted;
+    return Promise.all(asked.map((deck) => {
+      const id = deck.snapshot.connection.deckId as string;
+      return refresh(id, false).then((found) => ({ deck, id, found }));
+    })).then((answers) => {
+      /*
+        The person moved on, or another modal now covers the dashboard: this
+        answer is not theirs any more. An Interrupted work dialog open since
+        the request is the one it asked for and may be turned to another
+        daemon (PR #2431 round 5); one opened or closed meanwhile moved the
+        request on above.
+      */
+      if (showRequest.current !== request || modalOtherThanInterruptedOpen()) return undefined;
+      /*
+        A daemon that could not be asked again still counts the items its last
+        answer listed. One whose list is incomplete may have work it could not
+        read, so it is opened or named like one with work, never taken for none
+        (verification finding C); its dialog says the list is incomplete.
+      */
+      const listing = answers.filter(({ id, found }) => (found.outcome === "listed" ? found.count > 0 || found.incomplete : found.outcome !== "unsupported" && mayHaveInterrupted(held[id]?.list)));
+      if (listing.length === 1) return openDialog(listing[0].id) ? undefined : NOTHING_INTERRUPTED;
+      /*
+        Each of them has a banner to open it by, an incomplete empty list's
+        included (N4); one its Hide put away is brought back first, so the
+        banner the answer points at is on screen for a keyboard or mouse
+        user, not only reachable by voice (verification R2).
+      */
+      const definite = listing.every(({ id, found }) => (found.outcome === "listed" ? found.count : listedCount(held[id]?.list)) > 0);
+      if (listing.length > 1) {
+        reveal(listing.map(({ id }) => id));
+        return interruptedSeveral(listing.map(({ deck }) => deckName(deck.snapshot.connection)), definite, "Open one from its banner, or say which one.");
+      }
+      const unknown = answers.filter(({ found }) => found.outcome === "failed" || found.outcome === "superseded");
+      if (unknown.length > 0) return `Could not ask ${unknown.map(({ deck }) => deckName(deck.snapshot.connection)).join(", ")} for its interrupted work; try again, or say which daemon.`;
+      return NOTHING_INTERRUPTED;
+    });
+  }, [decks, interrupted]);
+  const hideInterruptedWork = useCallback((deckId: string) => interrupted?.hide(deckId), [interrupted]);
+  /*
+    What voice reaches: the open dialog's calls, refused while no dialog is
+    open (reviewer 9: an action's own `undefined` answer is its success, never
+    taken for that), and while another modal is drawn over the dialog
+    (auditor 2). The utterance's binding to the dialog it was said to is the
+    voice surface's gate (`shownInterruptedToken`).
+  */
+  const interruptedDialog = useMemo<InterruptedDialogControls>(() => {
+    const first = "Open the interrupted work first: say “show interrupted work”.";
+    const reach = <T,>(act: (controls: InterruptedDialogControls) => T): T | string => {
+      const open = interruptedControls.current;
+      if (!open) return first;
+      if (shownInterruptedDialog()?.covered()) return INTERRUPTED_COVERED;
+      return act(open);
+    };
+    return {
+      reclaim: (said) => reach((open) => open.reclaim(said)),
+      confirmReclaim: () => reach((open) => open.confirmReclaim()),
+      dismiss: () => reach((open) => open.dismiss()),
+      askDismiss: (said) => reach((open) => open.askDismiss(said)),
+      confirmDismiss: () => reach((open) => open.confirmDismiss()),
+      dismissAll: () => reach((open) => open.dismissAll()),
+      confirmDismissAll: () => reach((open) => open.confirmDismissAll()),
+      select: (id) => { reach((open) => open.select(id)); },
+      openDetails: (which) => reach((open) => open.openDetails(which)),
+      showReports: (said) => reach((open) => open.showReports(said)),
+      nextReports: () => reach((open) => open.nextReports()),
+      previousReports: () => reach((open) => open.previousReports()),
+      back: () => { reach((open) => open.back()); },
+      close: () => { reach((open) => open.close()); },
+    };
+  }, []);
+  const interruptedVoice = useMemo(() => ({ showInterruptedWork, hideInterruptedWork }), [hideInterruptedWork, showInterruptedWork]);
+  /*
     PR #1672 — the open popover goes with its button. A daemon that
     disconnects or stops sending figures loses its Host button, and the
     popover is closed with it, so it does not reappear unasked when they come
@@ -1492,6 +1688,10 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
          published only while it is open. */
       ...(newAgent ? {} : { showDashboardCounters }),
       ...(countersOpen ? { closeDashboardCounters: () => setCountersOpen(false) } : {}),
+      /* PRD #1790 stage 2 — interrupted work: opening a daemon's dialog, and
+         the open dialog's reclaim and dismissals, while the runtime offers
+         it; withheld while the New agent dialog is open over the dashboard. */
+      ...(interrupted && !newAgent ? { showInterruptedWork, hideInterruptedWork, interruptedDialog } : {}),
       /* PRD #2374 — the cards' members, only while the runtime offers cards;
          `closeAgentCard` only while a card is open. */
       ...(cards.shown ? cards.voice : {}),
@@ -1539,6 +1739,52 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [agentPaneOpen, newAgent, newAgentAvailable, voiceContext]);
+  /*
+    PRD #1790 stage 2 (reviewer 8, CLAUDE.md rule 22) — `I`, the TUI's
+    Interrupted work key: opens the dialog of the daemon that lists items, as
+    its banner's Show does, asking again first (final reviewer 2); with
+    several, the dashboard says so, as voice's "show interrupted work" does.
+    `X` hides a banner. Both stand down where the Ctrl+N shortcut does, and
+    under any modal.
+
+    A layout effect, not a passive one: the listener reads the banners'
+    state from its closure, and a passive effect re-registers it only in a
+    task React schedules after the commit, so a key pressed once the banners
+    were drawn but before that task ran was handled against the state before
+    them (`X` with two banners up did nothing). A layout effect runs inside
+    the commit, so the listener always matches what is drawn.
+  */
+  useLayoutEffect(() => {
+    if (!interrupted || agentPaneOpen || newAgent) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if ((event.key !== "I" && event.key !== "X") || event.ctrlKey || event.metaKey || event.altKey || event.defaultPrevented) return;
+      const target = event.target;
+      if (target instanceof Element && target.matches("input, textarea, select, [contenteditable='true'], .xterm-helper-textarea")) return;
+      if (modalOpen()) return;
+      if (event.key === "I") {
+        event.preventDefault();
+        VOICE_ACTIONS.showInterruptedWork.run({ showInterruptedWork, reportRefused: setDaemonNotice }, {});
+        return;
+      }
+      /*
+        Final reviewer 3 — `X`, the TUI's Hide: hides the one banner on the
+        dashboard, as its Hide button does, and dismisses nothing. With
+        several banners up it hides none and says so, as `I` does, since no
+        key says which one was meant.
+      */
+      const shown = decks.flatMap((deck) => {
+        const id = deck.snapshot.connection.deckId;
+        const list = id !== undefined ? interrupted.decks[id]?.list : undefined;
+        return id !== undefined && mayHaveInterrupted(list) && !interrupted.hidden(id) ? [{ id, name: deckName(deck.snapshot.connection), count: listedCount(list) }] : [];
+      });
+      if (shown.length === 0) return;
+      event.preventDefault();
+      if (shown.length > 1) setDaemonNotice(interruptedSeveral(shown.map(({ name }) => name), shown.every(({ count }) => count > 0), "Hide one with its banner's Hide."));
+      else VOICE_ACTIONS.hideInterruptedWork.run({ hideInterruptedWork }, shown[0].id);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [agentPaneOpen, decks, hideInterruptedWork, interrupted, newAgent, showInterruptedWork]);
   /**
    * PRD #1105 M5 — the overview's entry point into an agent's pane.
    *
@@ -1577,6 +1823,21 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     if (cards.mode !== "cards" || !deck.connected || deckId === undefined || !cards.decksWithCards.has(deckId)) return undefined;
     return cards.placed.filter((card) => card.deckId === deckId && (!filtering || cardMatchesFilter(card, deck.matchingAgents)));
   };
+  /* PRD #1790 stage 2 — a deck's banner, while its daemon lists interrupted work and it was not hidden for this process. */
+  const interruptedBannerFor = (deck: (typeof decks)[number]): ReactNode | undefined => {
+    const deckId = deck.snapshot.connection.deckId;
+    if (!interrupted || deckId === undefined) return undefined;
+    const list = interrupted.decks[deckId]?.list;
+    if (!mayHaveInterrupted(list) || interrupted.hidden(deckId)) return undefined;
+    return <InterruptedWorkBanner deckId={deckId} count={listedCount(list)} controls={interruptedVoice} />;
+  };
+  /* The open dialog, mounted per daemon process: another process's answers never reach it. */
+  const interruptedOpen = interrupted?.dialog;
+  const interruptedDeck = interruptedOpen ? interrupted?.decks[interruptedOpen.deckId] : undefined;
+  const interruptedDeckName = interruptedOpen ? decks.find((deck) => deck.snapshot.connection.deckId === interruptedOpen.deckId) : undefined;
+  const interruptedDialogView = interrupted && interruptedOpen && interruptedDeck && interruptedDeck.instance === interruptedOpen.instance
+    ? <InterruptedWorkDialog key={`${interruptedOpen.deckId}:${interruptedOpen.instance}`} deckLabel={interruptedDeckName ? deckName(interruptedDeckName.snapshot.connection) : ""} deck={interruptedDeck} target={interruptedOpen} runtime={interrupted} controlsRef={interruptedControls} />
+    : undefined;
   const cardsBodyFor = (deck: (typeof decks)[number]): ReactNode | undefined => {
     const shown = cardsOnScreen(deck);
     const deckId = deck.snapshot.connection.deckId;
@@ -1789,25 +2050,23 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       stopAgent: (agent) => {
         const deck = deckOf(agent.daemonId);
         if (!deck) return;
-        setConfirm(stopAgentConfirmation(agent, deck.connection, runtime.runAction, undefined, runtime.previewWorktreeClose));
+        // Issue #2436: the whole deck's roles, not only the rows a dashboard filter shows.
+        setConfirm(stopAgentConfirmation(agent, deck.connection, runtime.runAction, undefined, runtime.previewWorktreeClose, orchestrationOf(agent, deck.agents.map(toOverviewAgent))));
       },
       closeOrchestration: (group) => {
         const deckId = group.agents[0]?.daemonId;
         const deck = deckId === undefined ? undefined : deckOf(deckId);
         if (deckId === undefined || !deck) return;
-        const roles = group.agents.map((agent) => ({ agentId: agent.id, name: stopTargetName(agent), ...(agent.incarnation ? { incarnation: agent.incarnation } : {}) }));
-        const title = displayIdentity(group.title, DISPLAY_LIMITS.name, unnamedGroupLabel(group));
-        const count = roles.length === 1 ? "its 1 role" : `all ${roles.length} of its roles`;
-        const label = roles.length === 1 ? "Close 1 role" : `Close all ${roles.length} roles`;
+        const { title, body, label, roles } = orchestrationCloseOf(group, deck.connection);
         setConfirm({
           title: `Close ${title}?`,
-          body: `This stops every role of this orchestration on ${deckName(deck.connection)} — ${count}: ${roles.map((role) => role.name).join(", ")}. Unsaved terminal work in any of them may be interrupted.`,
+          body,
           label,
           busyLabel: "Stopping…",
           worktreePreview: worktreePreview(runtime, deckId, group.agents),
-          action: () => run({ type: "stop_orchestration", deckId, roles }),
           // Issue #1958: the keep goes on every role's stop; the crate fans it out.
-          keepWorktree: { label: `${label}${KEEP_WORKTREE_SUFFIX}`, action: () => run({ type: "stop_orchestration", deckId, roles, keepWorktree: true }) },
+          action: ({ keepWorktree }) => run({ type: "stop_orchestration", deckId, roles, ...(keepWorktree ? { keepWorktree: true } : {}) }),
+          keepWorktree: true,
         });
       },
     };
@@ -2134,11 +2393,13 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
               hostOpen={deck.snapshot.connection.deckId !== undefined && hostOpen === deck.snapshot.connection.deckId}
               onOpenHost={() => VOICE_ACTIONS.showHostMetrics.run(voiceContext, { preselectDeckId: deck.snapshot.connection.deckId })}
               onCloseHost={() => { if (deck.snapshot.connection.deckId !== undefined) closeHostMetrics(deck.snapshot.connection.deckId); }}
+              interruptedBanner={interruptedBannerFor(deck)}
             />
           ))}
         </section>
       </main>
       {cards.overlay && <AgentCardOverlay {...cards.overlay} notice={cards.notice} controls={cards.clickControls} />}
+      {interruptedDialogView}
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}
       {upgrade && <UpgradeDialog target={upgrade} runtime={runtime} onClose={() => setUpgrade(undefined)} />}
       {localUpgrade && <LocalUpgradeFlow {...localUpgrade} runtime={runtime} onClose={() => { setLocalUpgrade(undefined); selfUpgrade?.onClosed?.(); }} />}
@@ -2251,7 +2512,9 @@ function startErrorKey(deckId: string | undefined): string {
   return deckId ?? "";
 }
 
-function DeckGroup({ deck, cardsBody, now, columns, filtering, fleetSize, overrideError, startError, onOpenDeck, onAddDaemon, onReconnect, onStartDaemon, onConnectAnyway, onUpgrade, upgradeLabel, upgradeTitle, onStopDaemon, stopDaemonReason, onReplaceDaemon, onNewAgent, hostOpen, onOpenHost, onCloseHost }: {
+function DeckGroup({ deck, cardsBody, now, columns, filtering, fleetSize, overrideError, startError, onOpenDeck, onAddDaemon, onReconnect, onStartDaemon, onConnectAnyway, onUpgrade, upgradeLabel, upgradeTitle, onStopDaemon, stopDaemonReason, onReplaceDaemon, onNewAgent, hostOpen, onOpenHost, onCloseHost, interruptedBanner }: {
+  /** PRD #1790 stage 2 — this deck's interrupted work banner, while its daemon lists any. */
+  interruptedBanner?: ReactNode;
   deck: FleetDeck;
   /** PRD #2374 — in the Cards view, this deck's cards, shown in place of its agent table. */
   cardsBody?: ReactNode;
@@ -2416,6 +2679,9 @@ function DeckGroup({ deck, cardsBody, now, columns, filtering, fleetSize, overri
 
       {/* Issue #1637: this deck's agents' hooks run an older dot-agent-deck. */}
       {deck.connected && <HookBinaryNotices notices={connection.hookBinaryNotices} />}
+
+      {/* PRD #1790 stage 2: what a restart of this deck's daemon left behind. */}
+      {deck.connected && interruptedBanner}
 
       <div className="daemon-group-body">
         {cardsBody ?? <DaemonBody

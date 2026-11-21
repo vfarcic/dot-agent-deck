@@ -6,7 +6,7 @@ import { test } from "./support/load-budget";
 
 const LONG_PATH = `/home/dev/${"nested-project-directory/".repeat(90)}dispatch-kept-tail`;
 
-/** [name, the dirty kept-worktree note's path, the worktree the keep choice is offered for]. */
+/** [name, the dirty kept-worktree note's path, the worktree the "Keep the worktree" box is offered for]. */
 const CASES = [
   ["no warning", null, null],
   ["short path", "/home/dev/dispatch-kept", null],
@@ -18,7 +18,7 @@ const CASES = [
 
 for (const [name, path, keepPath] of CASES) {
   const offerKeep = keepPath !== null;
-  /** Scenario: close a dispatched agent in a short window, reading either no warning or a short/long kept-worktree path, with or without the "Close agent, keep worktree" choice. Every button remains fully on screen; the long warning can be scrolled to its identifying tail, Cancel leaves the agent alone, and Close (or the keep choice) sends its stop request. */
+  /** Scenario: close a dispatched agent in a short window, reading either no warning or a short/long kept-worktree path, with or without the "Keep the worktree" checkbox. Every button and the checkbox remain fully on screen; the long warning can be scrolled to its identifying tail, Cancel leaves the agent alone, and Close sends its stop request, keeping the worktree when the box is ticked. */
   test(`close confirmation stays reachable with ${name}`, async ({ page }) => {
     await page.setViewportSize({ width: 640, height: 320 });
     // Exercise the live preview through Tauri's IPC seam, with no real daemon.
@@ -67,7 +67,7 @@ for (const [name, path, keepPath] of CASES) {
     const confirmation = page.getByRole("alertdialog");
     const cancel = confirmation.getByRole("button", { name: "Cancel", exact: true });
     const close = confirmation.getByRole("button", { name: "Close agent", exact: true });
-    const keep = confirmation.getByRole("button", { name: "Close agent, keep worktree", exact: true });
+    const keep = confirmation.getByRole("checkbox", { name: "Keep the worktree", exact: true });
     await expect(close).toBeEnabled();
     if (offerKeep) await expect(keep).toBeEnabled();
     else await expect(keep).toHaveCount(0);
@@ -96,7 +96,8 @@ for (const [name, path, keepPath] of CASES) {
     await expect(confirmation).toHaveCount(0);
     await expect(stop).toBeVisible();
     await stop.click();
-    await (offerKeep ? keep : close).click();
+    if (offerKeep) await keep.check();
+    await close.click();
     await expect(confirmation).toHaveCount(0);
     await expect(stop).toHaveCount(0);
     const stops = await page.evaluate(() => (window as unknown as { __stops?: { keepWorktree?: boolean }[] }).__stops ?? []);

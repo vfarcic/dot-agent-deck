@@ -281,6 +281,18 @@ slow-timeout = { period = "60s", terminate-after = 30 }
 filter = 'test(=doorbell_010_live_ctrl_c_during_a_check_leaves_claude_running)'
 slow-timeout = { period = "60s", terminate-after = 40 }
 
+# Issue #2133: on a box starved by other work (load1 39 to 58 on 16 CPUs),
+# `doorbell_010_live_history_enter_recovers_the_doorbell` and
+# `claude_014_live_killed_waiter_falls_back_to_injection` each failed a fixed
+# 120s agent window in a full run and passed alone. Their waits now take
+# `load_scaled` of that window, so a starved run outlasts the 180s default:
+# history_enter was SIGKILLed at 180s with load1 58 at +60s. 8 x 60s lets a
+# scaled wait report its own message first. The filters track the test
+# function names; update them with any rename.
+[[profile.default.overrides]]
+filter = 'test(=doorbell_010_live_history_enter_recovers_the_doorbell) | test(=claude_014_live_killed_waiter_falls_back_to_injection)'
+slow-timeout = { period = "60s", terminate-after = 8 }
+
 # PRD #1631: `codex/hooks/001` drives one real interactive Codex turn, behind
 # `check_codex_available`'s preflight. In that PRD's lane-2 run, on a box with
 # `io full` near 70%, its isolated retry spent over 120s in the preflight, ran
@@ -404,6 +416,15 @@ slow-timeout = { period = "60s", terminate-after = 6 }
 [[profile.default.overrides]]
 filter = 'test(close_verb_008_real_dispatcher_closes_its_reported_single_unit)'
 slow-timeout = { period = "60s", terminate-after = 15 }
+
+# PRD #1790 stage 2: `journal/interrupted/028` waits up to 240s for a real
+# interactive Haiku unit's one Bash command, then restarts the daemon (up to
+# 30s), and drives a fresh TUI through the list and a reclaim. The default
+# 3 x 60s window kills it before the sentinel assertion can print why. Scoped
+# by the TEST FUNCTION name, so keep it in lockstep with a rename.
+[[profile.default.overrides]]
+filter = 'test(interrupted_028_a_real_agents_unit_is_listed_and_reclaimed_after_a_restart)'
+slow-timeout = { period = "60s", terminate-after = 8 }
 
 # Issue #2260: `dispatch/return/030` adds a second unit turn (the update)
 # after the real dispatch and report. Its phase waits are dispatcher ready

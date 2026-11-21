@@ -1,0 +1,215 @@
+{
+  "agy_version": "1.5.9",
+  "sequences": [
+    {
+      "observed": "fresh HOME, onboarding",
+      "bytes": "\u001b]7501;state=blocked:kind=auth:app=antigravity:msg=U2lnbiBpbiByZXF1aXJlZA==\u0007",
+      "body": "state=blocked:kind=auth:app=antigravity:msg=U2lnbiBpbiByZXF1aXJlZA==",
+      "state": "blocked",
+      "kind": "auth",
+      "app": "antigravity",
+      "msg_base64": "U2lnbiBpbiByZXF1aXJlZA==",
+      "msg_decoded": "Sign in required",
+      "terminator": "BEL"
+    },
+    {
+      "observed": "fresh HOME, onboarding",
+      "bytes": "\u001b]7501;state=blocked:kind=question:app=antigravity:msg=RmluaXNoIHNldHVw\u0007",
+      "body": "state=blocked:kind=question:app=antigravity:msg=RmluaXNoIHNldHVw",
+      "state": "blocked",
+      "kind": "question",
+      "app": "antigravity",
+      "msg_base64": "RmluaXNoIHNldHVw",
+      "msg_decoded": "Finish setup",
+      "terminator": "BEL"
+    },
+    {
+      "observed": "fresh HOME, onboarding",
+      "bytes": "\u001b]7501;state=blocked:kind=permission:app=antigravity:msg=VHJ1c3QgdGhpcyBmb2xkZXI/\u0007",
+      "body": "state=blocked:kind=permission:app=antigravity:msg=VHJ1c3QgdGhpcyBmb2xkZXI/",
+      "state": "blocked",
+      "kind": "permission",
+      "app": "antigravity",
+      "msg_base64": "VHJ1c3QgdGhpcyBmb2xkZXI/",
+      "msg_decoded": "Trust this folder?",
+      "terminator": "BEL"
+    },
+    {
+      "observed": "fresh HOME, onboarding",
+      "bytes": "\u001b]7501;state=idle:app=antigravity\u0007",
+      "body": "state=idle:app=antigravity",
+      "state": "idle",
+      "kind": null,
+      "app": "antigravity",
+      "msg_base64": null,
+      "msg_decoded": null,
+      "terminator": "BEL"
+    },
+    {
+      "observed": "seeded HOME, turns",
+      "bytes": "\u001b]7501;state=working:app=antigravity\u0007",
+      "body": "state=working:app=antigravity",
+      "state": "working",
+      "kind": null,
+      "app": "antigravity",
+      "msg_base64": null,
+      "msg_decoded": null,
+      "terminator": "BEL"
+    },
+    {
+      "observed": "seeded HOME, turns",
+      "bytes": "\u001b]7501;state=done:app=antigravity:msg=RE9ORQ==\u0007",
+      "body": "state=done:app=antigravity:msg=RE9ORQ==",
+      "state": "done",
+      "kind": null,
+      "app": "antigravity",
+      "msg_base64": "RE9ORQ==",
+      "msg_decoded": "DONE",
+      "terminator": "BEL"
+    },
+    {
+      "observed": "seeded HOME, turns",
+      "bytes": "\u001b]7501;state=blocked:kind=permission:app=antigravity:msg=QXBwcm92ZSBCYXNoOiBybSAtZiBwcm9iZS50eHQ=\u0007",
+      "body": "state=blocked:kind=permission:app=antigravity:msg=QXBwcm92ZSBCYXNoOiBybSAtZiBwcm9iZS50eHQ=",
+      "state": "blocked",
+      "kind": "permission",
+      "app": "antigravity",
+      "msg_base64": "QXBwcm92ZSBCYXNoOiBybSAtZiBwcm9iZS50eHQ=",
+      "msg_decoded": "Approve Bash: rm -f probe.txt",
+      "terminator": "BEL"
+    },
+    {
+      "observed": "seeded HOME, turns",
+      "bytes": "\u001b]7501;state=blocked:kind=permission:app=antigravity:msg=QXBwcm92ZSBCYXNoOiBybSAtZiBwcm9iZTIudHh0\u0007",
+      "body": "state=blocked:kind=permission:app=antigravity:msg=QXBwcm92ZSBCYXNoOiBybSAtZiBwcm9iZTIudHh0",
+      "state": "blocked",
+      "kind": "permission",
+      "app": "antigravity",
+      "msg_base64": "QXBwcm92ZSBCYXNoOiBybSAtZiBwcm9iZTIudHh0",
+      "msg_decoded": "Approve Bash: rm -f probe2.txt",
+      "terminator": "BEL"
+    },
+    {
+      "observed": "seeded HOME, turns",
+      "bytes": "\u001b]7501;state=blocked:kind=permission:app=antigravity:msg=QXBwcm92ZSBCYXNoOiBybSAtZiBwcm9iZTMudHh0\u0007",
+      "body": "state=blocked:kind=permission:app=antigravity:msg=QXBwcm92ZSBCYXNoOiBybSAtZiBwcm9iZTMudHh0",
+      "state": "blocked",
+      "kind": "permission",
+      "app": "antigravity",
+      "msg_base64": "QXBwcm92ZSBCYXNoOiBybSAtZiBwcm9iZTMudHh0",
+      "msg_decoded": "Approve Bash: rm -f probe3.txt",
+      "terminator": "BEL"
+    },
+    {
+      "observed": "network failure mid-session",
+      "bytes": "\u001b]7501;state=error:app=antigravity:msg=VGhlcmUgd2FzIGEgbmV0d29yayBpc3N1ZSBjb25uZWN0aW5nIHRvIHRoZSBzZXJ2ZXIsIHBsZWFzZSB0cnkgYWdhaW4u\u0007",
+      "body": "state=error:app=antigravity:msg=VGhlcmUgd2FzIGEgbmV0d29yayBpc3N1ZSBjb25uZWN0aW5nIHRvIHRoZSBzZXJ2ZXIsIHBsZWFzZSB0cnkgYWdhaW4u",
+      "state": "error",
+      "kind": null,
+      "app": "antigravity",
+      "msg_base64": "VGhlcmUgd2FzIGEgbmV0d29yayBpc3N1ZSBjb25uZWN0aW5nIHRvIHRoZSBzZXJ2ZXIsIHBsZWFzZSB0cnkgYWdhaW4u",
+      "msg_decoded": "There was a network issue connecting to the server, please try again.",
+      "terminator": "BEL"
+    },
+    {
+      "observed": "AGY_CLI_OSC7501 unset",
+      "bytes": "\u001b]7501;?\u0007",
+      "body": "?",
+      "state": "?",
+      "kind": null,
+      "app": null,
+      "msg_base64": null,
+      "msg_decoded": null,
+      "terminator": "BEL"
+    }
+  ],
+  "note": "Every sequence is ESC ] 7501 ; <body> BEL. Fields are colon-separated key=value pairs; msg is base64 (standard alphabet, padded). 'bytes' spells ESC and BEL as JSON escapes. 'scenarios' lists the bodies in the order agy wrote them, with the input that caused each step in brackets; a done msg is the turn's final reply, base64-encoded, shown here decoded.",
+  "scenarios": {
+    "startup_seeded_home": [
+      "state=blocked:kind=auth:app=antigravity:msg=<Sign in required>",
+      "state=idle:app=antigravity"
+    ],
+    "startup_fresh_home": [
+      "state=blocked:kind=auth:app=antigravity:msg=<Sign in required>",
+      "state=blocked:kind=question:app=antigravity:msg=<Finish setup>",
+      "[colour scheme, then Terms & Data Use answered]",
+      "state=blocked:kind=permission:app=antigravity:msg=<Trust this folder?>",
+      "[Yes, I trust this folder]",
+      "state=idle:app=antigravity"
+    ],
+    "startup_untrusted_folder": [
+      "state=blocked:kind=auth:app=antigravity:msg=<Sign in required>",
+      "state=blocked:kind=permission:app=antigravity:msg=<Trust this folder?>",
+      "[No, exit]",
+      "state=idle:app=antigravity",
+      "[process exits]"
+    ],
+    "turn": [
+      "[Enter]",
+      "state=working:app=antigravity",
+      "state=done:app=antigravity:msg=<final reply>",
+      "[first keystroke into the composer]",
+      "state=idle:app=antigravity"
+    ],
+    "turn_with_stop_continue": [
+      "[Enter]",
+      "state=working:app=antigravity",
+      "state=done:app=antigravity:msg=<reply to the continuation>"
+    ],
+    "permission_approve": [
+      "[Enter]",
+      "state=working:app=antigravity",
+      "state=blocked:kind=permission:app=antigravity:msg=<Approve Bash: rm -f probe2.txt>",
+      "[1]",
+      "state=working:app=antigravity",
+      "state=done:app=antigravity:msg=<final reply>"
+    ],
+    "permission_decline": [
+      "[Enter]",
+      "state=working:app=antigravity",
+      "state=blocked:kind=permission:app=antigravity:msg=<Approve Bash: rm -f probe.txt>",
+      "[4]",
+      "state=working:app=antigravity",
+      "state=idle:app=antigravity"
+    ],
+    "permission_esc": [
+      "[Enter]",
+      "state=working:app=antigravity",
+      "state=blocked:kind=permission:app=antigravity:msg=<Approve Bash: rm -f probe3.txt>",
+      "[Esc]",
+      "state=idle:app=antigravity"
+    ],
+    "esc_mid_turn": [
+      "state=working:app=antigravity",
+      "[Esc]",
+      "state=idle:app=antigravity",
+      "state=done:app=antigravity:msg=<last assistant text of the turn>",
+      "state=idle:app=antigravity"
+    ],
+    "ctrl_c_mid_turn": [
+      "state=working:app=antigravity",
+      "[Ctrl+C]",
+      "state=idle:app=antigravity",
+      "state=done:app=antigravity:msg=<Task complete>",
+      "state=idle:app=antigravity"
+    ],
+    "network_error_mid_session": [
+      "[Enter]",
+      "state=working:app=antigravity",
+      "state=error:app=antigravity:msg=<There was a network issue connecting to the server, please try again.>"
+    ],
+    "config_error_no_hook": [
+      "[Enter]",
+      "state=error:app=antigravity:msg=<failed to construct executor: plan model not specified; you must specify a valid model>"
+    ],
+    "exit_ctrl_d_twice": [
+      "[Ctrl+D]",
+      "[Ctrl+D]",
+      "state=idle:app=antigravity",
+      "[process exits 0]"
+    ],
+    "env_unset": [
+      "?  (the probe ESC ] 7501 ; ? BEL, once at start-up; nothing else follows when the terminal does not answer)"
+    ]
+  }
+}

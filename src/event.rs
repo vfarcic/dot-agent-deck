@@ -96,6 +96,13 @@ pub enum AgentType {
     /// resolved from the `devin` binary basename through the registry
     /// ([`crate::agent_registry`]).
     Devin,
+    /// Google's Antigravity CLI (`agy`, PRD #211) — a `NativeHooks` agent
+    /// like Devin. Serializes to `"antigravity"` (snake_case); resolved from
+    /// the `agy` binary basename through the registry
+    /// ([`crate::agent_registry`]). A reader older than this variant decodes
+    /// `"antigravity"` to [`AgentType::None`] through the `#[serde(other)]`
+    /// catch-all below.
+    Antigravity,
     /// "No recognized agent type." Produced by [`AgentType::from_command`] for
     /// any unrecognized binary, mapped to `Option::None` by
     /// [`crate::state::SessionState::live_snapshot`], and rendered as the "No
@@ -495,6 +502,43 @@ pub const SURFACED_INBOX_METADATA_KEY: &str = "surfaced_inbox";
 /// controls is interpolated into it — the same rule that governed the in-pane
 /// notice this replaced, kept because the text still reaches a human.
 pub const DELIVERY_NOTICE_METADATA_KEY: &str = "delivery_notice";
+
+/// Metadata key: the agent's own words for why its card is in Error or Needs
+/// Input (PRD #211) — the error a failed turn reported, or what the agent is
+/// waiting on when it raised no question the deck can read. Shown on the card
+/// beside the status it explains ([`crate::state::SessionState::status_reason`]).
+///
+/// Set by the hook CLI from an Antigravity `Stop` that ended in an error, and
+/// by the daemon from the agent's OSC 7501 status ([`crate::status_osc`]).
+/// Agent-derived text: bounded and stripped of control characters where it is
+/// produced and again where a card reads it. It rides the free-form `metadata`
+/// map, so a consumer that does not know the key ignores it.
+pub const STATUS_REASON_METADATA_KEY: &str = "status_reason";
+
+/// `AgentEvent.metadata` key marking an event the DAEMON authored from the
+/// status an agent writes to its terminal (OSC 7501, PRD #211,
+/// [`crate::status_osc`]) rather than from one of the agent's hooks. Its one
+/// effect is on `working`, a `Thinking` that moves only a card that is not
+/// already busy and keeps the active tool ([`AgentEvent::is_status_signal`]).
+/// Daemon-owned: the hook socket strips it from every producer frame.
+pub const STATUS_SIGNAL_METADATA_KEY: &str = "status_signal";
+
+/// The one [`STATUS_SIGNAL_METADATA_KEY`] value: the OSC 7501 reader.
+pub const STATUS_SIGNAL_METADATA_VALUE: &str = "osc7501";
+
+/// PRD #211 (audit, CWE-345/451): `AgentEvent.metadata` key carrying what an
+/// Antigravity tool call acts on, exactly as `agy`'s `PreToolUse` gave it —
+/// `run_command`'s `CommandLine` or `write_file`'s `Path` — unaltered, so the
+/// daemon can bind an OSC 7501 permission prompt to the call it is for and
+/// authorize from the original text rather than from the signal's cleaned
+/// display copy ([`crate::question::antigravity_permission`]). Set by the
+/// hook CLI only when it is at most [`TOOL_SUBJECT_MAX_BYTES`]; a longer one
+/// is left out, and its prompt is answered at the keyboard. Additive like
+/// [`SUBAGENT_ID_METADATA_KEY`]: an older daemon ignores it.
+pub const TOOL_SUBJECT_METADATA_KEY: &str = "tool_subject";
+
+/// The longest [`TOOL_SUBJECT_METADATA_KEY`] value the hook CLI sends.
+pub const TOOL_SUBJECT_MAX_BYTES: usize = 4096;
 
 /// `AgentEvent.metadata` key marking the `Thinking` event the DAEMON authors
 /// when a message it reported not delivered ([`DELIVERY_NOTICE_METADATA_KEY`])
@@ -1564,6 +1608,14 @@ impl AgentEvent {
                 .is_some_and(|v| v == DELIVERY_NOTICE_CLEARED_METADATA_VALUE)
     }
 
+    /// PRD #211: whether the daemon built this event from the agent's OSC 7501
+    /// terminal status ([`STATUS_SIGNAL_METADATA_KEY`]).
+    pub fn is_status_signal(&self) -> bool {
+        self.metadata
+            .get(STATUS_SIGNAL_METADATA_KEY)
+            .is_some_and(|v| v == STATUS_SIGNAL_METADATA_VALUE)
+    }
+
     pub fn is_quota_block_lift(&self) -> bool {
         self.event_type == EventType::Idle
             && self
@@ -2561,6 +2613,12 @@ pub struct ListTargetsRequest {
     /// `changelog.d/1077.breaking.md`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    /// PRD #468: `dispatch --list-targets --dir <path>` — list the targets of
+    /// that directory's config, the one a `dispatch --dir <path>` resolves
+    /// from, instead of the pane's. Additive optional, same as
+    /// [`DispatchSignal::dir`]: an older daemon ignores it and lists the pane's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
 }
 
 /// PRD #220: the daemon's reply to a [`DaemonMessage::ListTargets`], one JSON
@@ -3541,6 +3599,20 @@ pub struct DispatchSignal {
     /// agent's default command. Same gate as [`Self::command`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// PRD #468: `dispatch --dir <path>` — the existing directory to start the
+    /// unit in, as an absolute path the CLI resolved. Present, the daemon
+    /// creates no worktree and registers nothing for removal
+    /// ([`crate::dispatch::handle_dispatch_at`]); absent, it cuts a worktree
+    /// from the caller's `HEAD` as every dispatch did before.
+    ///
+    /// **Additive optional on the hook socket, so it does NOT move
+    /// [`crate::daemon_protocol::PROTOCOL_VERSION`].** A daemon that predates it
+    /// ignores the key and cuts a fresh worktree instead. The maintainer decided
+    /// on 2026-11-04 not to gate on that (the CLI and the daemon are upgraded
+    /// together), so unlike [`Self::command`] it is sent without asking the
+    /// daemon first, and that case is no `.breaking.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -3614,6 +3686,12 @@ pub enum InboxComponent {
     PiExtension,
     CodexHooks,
     DevinHooks,
+    /// PRD #211: the deck's Antigravity CLI (`agy`) hook. Its `SessionStart`
+    /// announces it with turn-end wake; its `PreInvocation` answers a doorbell
+    /// line and its `Stop` hands over at a turn's end, both as one-shot
+    /// receivers. Additive: a reader older than it decodes it to
+    /// [`InboxComponent::Other`].
+    AntigravityHooks,
     /// A value a later CLI added. Read so a new component does not make the
     /// whole request unparseable.
     #[serde(other)]
@@ -3625,11 +3703,16 @@ impl InboxComponent {
     /// Claude caps hook output at 10,000 characters. Codex middle-truncates a
     /// hook's text at about 2,500 tokens and spills the whole of it to a
     /// group-readable file, so its budget is counted in UTF-8 bytes, which
-    /// stay under that for prose and code (PRD #1666 S7).
+    /// stay under that for prose and code (PRD #1666 S7). Antigravity's hooks
+    /// print their hand-over inside JSON too: measured on `agy` 1.5.9, a `Stop`
+    /// `reason` is cut from its end at about 48 KB, and the ceiling of a
+    /// `PreInvocation` injection was not measured, so its budget is a third of
+    /// that, in UTF-8 bytes of the whole JSON (PRD #211).
     pub fn inline_budget(self) -> InboxBudget {
         match self {
             InboxComponent::ClaudeWaiter | InboxComponent::ClaudeHooks => InboxBudget::Chars(9_000),
             InboxComponent::CodexHooks => InboxBudget::Bytes(6_000),
+            InboxComponent::AntigravityHooks => InboxBudget::Bytes(16_000),
             InboxComponent::OpenCodePlugin
             | InboxComponent::OpenCodeMini
             | InboxComponent::PiExtension
@@ -4083,6 +4166,10 @@ pub enum InboxOneShotSender {
     ClaudeHooks,
     /// Codex's prompt and `Stop` hooks.
     CodexHooks,
+    /// PRD #211: Antigravity's `PreInvocation` and `Stop` hooks. A daemon
+    /// older than it reads [`InboxOneShotSender::Unknown`] and does not name
+    /// it among the senders it serves, so the hook hands nothing over there.
+    AntigravityHooks,
     /// `dot-agent-deck inbox fetch`, run by the agent's model.
     Cli,
     /// A sender a later deck names. Read so a new one does not make the whole
@@ -5210,6 +5297,58 @@ mod tests {
         );
     }
 
+    // PRD #211: `Antigravity` is a new wire value. It round-trips through its
+    // own `"antigravity"` name, and a reader built before it existed decodes
+    // it to that reader's neutral `None` instead of failing the whole event.
+    #[test]
+    fn antigravity_agent_type_round_trips_and_an_older_reader_decodes_it_to_none() {
+        assert_eq!(
+            serde_json::to_string(&AgentType::Antigravity).unwrap(),
+            "\"antigravity\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentType>("\"antigravity\"").unwrap(),
+            AgentType::Antigravity
+        );
+        assert_eq!(
+            AgentType::from_command(Some("/usr/local/bin/agy --flag")),
+            Some(AgentType::Antigravity)
+        );
+
+        // `AgentType` exactly as it stood before PRD #211.
+        #[derive(Debug, Deserialize, PartialEq)]
+        #[serde(rename_all = "snake_case")]
+        enum OlderAgentType {
+            ClaudeCode,
+            OpenCode,
+            Pi,
+            Codex,
+            Devin,
+            #[serde(other)]
+            None,
+        }
+        #[derive(Debug, Deserialize)]
+        struct OlderEvent {
+            agent_type: OlderAgentType,
+        }
+
+        let event: AgentEvent = serde_json::from_str(
+            r#"{
+                "session_id": "agy-1",
+                "agent_type": "antigravity",
+                "event_type": "thinking",
+                "timestamp": "2026-11-16T10:00:00Z"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(event.agent_type, AgentType::Antigravity);
+        let wire = serde_json::to_string(&event).unwrap();
+        let older: OlderEvent = serde_json::from_str(&wire).unwrap();
+        assert_eq!(older.agent_type, OlderAgentType::None);
+        let newer: AgentEvent = serde_json::from_str(&wire).unwrap();
+        assert_eq!(newer.agent_type, AgentType::Antigravity);
+    }
+
     #[test]
     fn parse_open_code_event() {
         let json = r#"{
@@ -5715,10 +5854,12 @@ mod tests {
                 token: None,
                 command: None,
                 agent: None,
+                dir: None,
             }),
             DaemonMessage::ListTargets(ListTargetsRequest {
                 pane_id: "p".into(),
                 token: None,
+                dir: None,
             }),
             DaemonMessage::RestartRole(RestartRoleSignal {
                 pane_id: "p".into(),

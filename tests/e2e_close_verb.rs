@@ -307,6 +307,81 @@ os.execvp("cat", ["cat"])
         );
     }
 
+    /// PRD #468: dispatch `name` with `--dir <dir_arg>`, running the CLI from
+    /// the deck's checkout as `caller`, and wait until its members — every agent other
+    /// than `caller` rooted in `root` — are ready. Nothing is pushed onto
+    /// `worktrees`: a `--dir` dispatch creates no directory for the test to
+    /// reclaim.
+    fn dispatch_into(
+        &self,
+        caller: &AgentRecord,
+        name: &str,
+        team: bool,
+        dir_arg: &str,
+        root: &Path,
+        task: &str,
+    ) -> Vec<AgentRecord> {
+        let output = self.cli(
+            Some(caller),
+            self.deck.workdir(),
+            &[
+                "dispatch",
+                name,
+                "--dir",
+                dir_arg,
+                "--task",
+                task,
+                if team {
+                    "--orchestration=close-team"
+                } else {
+                    "--single"
+                },
+            ],
+        );
+        assert_exit("dispatch --dir", &output, 0);
+        let root = std::fs::canonicalize(root).expect("canonical --dir root");
+        let members = || {
+            self.records()
+                .into_iter()
+                .filter(|r| r.id != caller.id)
+                .filter(|r| {
+                    r.cwd
+                        .as_deref()
+                        .is_some_and(|cwd| std::fs::canonicalize(cwd).is_ok_and(|cwd| cwd == root))
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            common::wait_until(WAIT, || {
+                let roles = members();
+                roles.len() == if team { 2 } else { 1 } && roles.iter().all(|r| self.probe_ready(r))
+            }),
+            "the --dir unit never became ready in {}\ncaller inbox:\n{}\n{}",
+            root.display(),
+            self.inbox_text(caller.pane_id_env.as_deref().expect("caller pane")),
+            self.deck.snapshot_grid()
+        );
+        let mut roles = members();
+        roles.sort_by_key(|r| !is_orchestrator(r));
+        roles
+    }
+
+    /// The sibling a default dispatch of `name` would have created.
+    fn default_worktree_of(&self, name: &str) -> PathBuf {
+        self.deck
+            .workdir()
+            .parent()
+            .expect("fixture parent")
+            .join(format!(
+                "{}-dispatch-{name}",
+                self.deck
+                    .workdir()
+                    .file_name()
+                    .expect("fixture name")
+                    .to_string_lossy()
+            ))
+    }
+
     fn assert_present(&self, members: &[AgentRecord]) {
         let records = self.records();
         assert!(
@@ -1157,4 +1232,193 @@ fn close_verb_013_orchestration_of_keep_worktree_keeps_the_shared_tree() {
     test.assert_gone(&members);
     assert_kept_with_sentinel(&worktree, &sentinel, &json.to_string());
     test.assert_present(&[caller]);
+}
+
+fn checked_out_branch(dir: &Path, sandbox_root: &Path) -> String {
+    let out = common::fixture_git(dir, sandbox_root)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .expect("read the checked-out branch");
+    assert_exit("rev-parse HEAD", &out, 0);
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Scenario: Make a git worktree of the fixture repo on its own branch,
+/// outside the deck's checkout, holding an untracked brief. A dispatcher
+/// starts a single unit there with `dispatch --dir`: the unit's card appears
+/// on the deck, rooted in that directory, the reply names the directory and
+/// its branch, and no `-dispatch-` sibling worktree is created. After the unit
+/// reports and its dispatcher closes it, the close says the directory was left
+/// in place, and the directory, its brief and its branch are all still there.
+#[spec("dispatch/dir/001")]
+#[test]
+fn dispatch_dir_001_a_unit_runs_in_an_existing_directory_that_outlives_its_close() {
+    const UNIT: &str = "dir-single";
+    const BRANCH: &str = "work/existing-line";
+    let test = CloseDeck::new();
+    let target = test.scratch.path().join("existing-line");
+    let add = common::fixture_git(test.deck.workdir(), test.deck.workdir())
+        .args(["worktree", "add", "-q", "-b", BRANCH])
+        .arg(&target)
+        .output()
+        .expect("create the existing worktree");
+    assert_exit("git worktree add", &add, 0);
+    let brief = target.join("brief-468-e1f0.md");
+    std::fs::write(&brief, "what the earlier agent found").expect("write the brief");
+
+    let caller = test.open_caller("caller");
+    let caller_pane = caller.pane_id_env.clone().expect("caller pane");
+    let target_arg = target.to_string_lossy().into_owned();
+    let members = test.dispatch_into(
+        &caller,
+        UNIT,
+        false,
+        &target_arg,
+        &target,
+        "Wait for terminal completion from the test.",
+    );
+    assert_eq!(
+        members[0].display_name.as_deref(),
+        Some(format!("dispatch-{UNIT}").as_str())
+    );
+    let canonical_target = std::fs::canonicalize(&target).expect("canonical target");
+    assert!(
+        common::wait_until(WAIT, || test.inbox_text(&caller_pane).contains(&format!(
+            "dispatch: spawned isolated agent for '{UNIT}' in {} on branch {BRANCH} \
+             (an existing directory",
+            canonical_target.display()
+        ))),
+        "the reply must name the existing directory and its branch.\nCaller inbox:\n{}",
+        test.inbox_text(&caller_pane)
+    );
+    assert!(
+        common::wait_until(WAIT, || test
+            .deck
+            .snapshot_grid()
+            .contains(&format!("dispatch-{UNIT}"))),
+        "the --dir unit's card never appeared on the deck.\nGrid:\n{}",
+        test.deck.snapshot_grid()
+    );
+    assert!(
+        !test.default_worktree_of(UNIT).exists(),
+        "a --dir dispatch must not create a sibling worktree"
+    );
+
+    test.report_done(&members[0]);
+    let output = test.close(Some(&caller), &[UNIT]);
+    assert_exit("close the --dir unit", &output, 0);
+    let text = output_text(&output);
+    assert!(
+        text.contains("left in place") && !text.contains("worktree reclaim"),
+        "the close must say the directory was left in place, not point at reclaim:\n{text}"
+    );
+    test.assert_gone(&members);
+    assert!(
+        target.is_dir(),
+        "the target directory must survive the close"
+    );
+    assert!(brief.is_file(), "and so must the untracked brief in it");
+    assert_eq!(checked_out_branch(&target, test.deck.workdir()), BRANCH);
+    test.assert_present(&[caller]);
+}
+
+/// Scenario: A dispatcher in the deck's own checkout writes an untracked brief
+/// there, then dispatches the stand-in team into its own directory with
+/// `dispatch --dir . --orchestration=close-team`, naming the brief in its
+/// task. Both roles come up as an orchestration tab rooted in that same
+/// checkout, the orchestrator's context carries the brief's name, and no
+/// `-dispatch-` sibling is created. A second `dispatch --dir .` while the team
+/// still runs is refused with a reply naming the directory, and starts nothing.
+#[spec("dispatch/dir/002")]
+#[test]
+fn dispatch_dir_002_a_dispatcher_continues_in_place_and_a_second_unit_is_refused() {
+    const UNIT: &str = "dir-continue";
+    let test = CloseDeck::new();
+    let workdir = test.deck.workdir().to_path_buf();
+    let branch_before = checked_out_branch(&workdir, &workdir);
+    let brief_name = "handoff-468-c0ffee.md";
+    std::fs::create_dir_all(workdir.join(".dot-agent-deck")).expect("create .dot-agent-deck");
+    let brief = workdir.join(".dot-agent-deck").join(brief_name);
+    std::fs::write(&brief, "the analysis the team continues from").expect("write the brief");
+
+    let caller = test.open_caller("caller");
+    let caller_pane = caller.pane_id_env.clone().expect("caller pane");
+    let task = format!("Continue from the brief at .dot-agent-deck/{brief_name}.");
+    let members = test.dispatch_into(&caller, UNIT, true, ".", &workdir, &task);
+    assert!(is_orchestrator(&members[0]), "missing start role");
+    assert!(
+        members.iter().all(|r| matches!(
+            &r.tab_membership,
+            Some(TabMembership::Orchestration { name, .. }) if name == "close-team"
+        )),
+        "both members must be roles of the dispatched team: {members:?}"
+    );
+    assert!(
+        common::wait_until(WAIT, || test.deck.snapshot_grid().contains("Dashboard")),
+        "the continuation never became a tab on the deck.\nGrid:\n{}",
+        test.deck.snapshot_grid()
+    );
+    let context_names_the_brief = || {
+        std::fs::read_dir(workdir.join(".dot-agent-deck"))
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("orchestrator-context-"))
+            })
+            .any(|e| std::fs::read_to_string(e.path()).is_ok_and(|t| t.contains(brief_name)))
+    };
+    assert!(
+        common::wait_until(WAIT, context_names_the_brief),
+        "the orchestrator's context in the dispatcher's own directory must carry the task \
+         naming the brief"
+    );
+    assert!(
+        brief.is_file(),
+        "the brief is still where the dispatcher wrote it"
+    );
+    assert!(!test.default_worktree_of(UNIT).exists());
+    assert_eq!(checked_out_branch(&workdir, &workdir), branch_before);
+
+    let canonical = std::fs::canonicalize(&workdir).expect("canonical workdir");
+    let refused = test.cli(
+        Some(&caller),
+        &workdir,
+        &[
+            "dispatch",
+            "dir-collide",
+            "--dir",
+            ".",
+            "--task",
+            "Never starts.",
+            "--single",
+        ],
+    );
+    assert_exit(
+        "second dispatch --dir is admitted, then refused",
+        &refused,
+        0,
+    );
+    let refusal = format!(
+        "dispatch: {} already holds a live agent's coordination files",
+        canonical.display()
+    );
+    assert!(
+        common::wait_until(WAIT, || test.inbox_text(&caller_pane).contains(&refusal)),
+        "the second unit into a directory the team runs in must be refused.\nCaller inbox:\n{}",
+        test.inbox_text(&caller_pane)
+    );
+    let records = test.records();
+    assert_eq!(
+        records.len(),
+        3,
+        "the refused dispatch started nothing beside the caller and the team: {:?}",
+        records
+            .iter()
+            .map(|r| (r.display_name.clone(), r.cwd.clone()))
+            .collect::<Vec<_>>()
+    );
+    test.assert_present(&members);
 }

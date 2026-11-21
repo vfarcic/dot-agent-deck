@@ -106,7 +106,7 @@ use crate::secrets::{Secret, SecretId, SecretStore, load_off_runtime};
 
 use super::prompt::{action_enum, commands_state, data_turn, param_names};
 use super::resolver::{IntentAnswer, IntentError, IntentRequest, IntentResolver, ResolveFuture};
-use super::schema::{AnnotatedCommand, TOOL_INSTRUCTIONS, TOOL_NAME};
+use super::schema::{AnnotatedCommand, CHAIN_INSTRUCTIONS, TOOL_INSTRUCTIONS, TOOL_NAME};
 
 /// The API version header this request shape was measured against.
 const API_VERSION: &str = "2023-06-01";
@@ -509,6 +509,26 @@ pub fn tool_definition(commands: &[AnnotatedCommand]) -> Value {
         "input_schema": {
             "type": "object",
             "properties": {
+                // PRD #1184: the chain shape, as M1 measured it on this
+                // protocol — see [`CHAIN_INSTRUCTIONS`].
+                "steps": {
+                    "type": ["array", "null"],
+                    "description": CHAIN_INSTRUCTIONS,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "action": { "type": "string", "enum": action_enum(commands) },
+                            "params": {
+                                "type": "object",
+                                "properties": properties.clone(),
+                                "additionalProperties": false,
+                            },
+                            "said": { "type": "string" },
+                        },
+                        "required": ["action", "said"],
+                        "additionalProperties": false,
+                    },
+                },
                 "action": {
                     "type": "string",
                     "description": "The id of the action to run, or `none` when nothing listed matches.",
@@ -820,6 +840,14 @@ mod tests {
                 "add_daemon",
                 "show_host_metrics",
                 "show_dashboard_counters",
+                "show_interrupted_work",
+                "reclaim_interrupted",
+                "dismiss_interrupted",
+                "dismiss_all_interrupted",
+                "show_interrupted_details",
+                "show_interrupted_reports",
+                "next_interrupted_reports",
+                "previous_interrupted_reports",
                 "switch_deck",
                 "voice_off",
                 "list_commands",
@@ -859,6 +887,8 @@ mod tests {
                 "star_repo",
                 "remind_star_later",
                 "dismiss_star_prompt",
+                "open_antigravity_issues",
+                "dismiss_antigravity_notice",
                 "stop_agent",
                 "generate_config",
                 "close_orchestration",

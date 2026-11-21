@@ -1,4 +1,6 @@
 mod agent_view;
+// PRD #211: the Antigravity experimental notice, the TUI's in the desktop's dialog.
+mod antigravity_notice;
 mod appearance;
 mod daemon_bridge;
 mod decks;
@@ -15,6 +17,7 @@ mod endpoint_tunnels;
 #[cfg(test)]
 mod features_lock;
 mod generation;
+mod interrupted_work;
 // The local deck's address, read in one place so the tests have one seam to move
 // it with instead of the process-wide environment variable (issue #1078).
 mod local_deck;
@@ -1952,6 +1955,101 @@ async fn agent_cards_list_on(
         GatedQuery::Answered(answer) => Ok(Some(DesktopAgentCards::new(scope.endpoint(), answer))),
         GatedQuery::Unsupported => Ok(None),
     }
+}
+
+/// PRD #1790 stage 2: deck `deck_id`'s interrupted work, from daemon
+/// process `instance_id` (the deck's connection's incarnation), with each
+/// item's Git and pull request facts when `git` is set. `unsupported` when
+/// that daemon does not advertise `interrupted-work` or is another process.
+#[tauri::command]
+async fn interrupted_work_list(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    deck_id: String,
+    instance_id: String,
+    git: bool,
+) -> Result<
+    crate::dto::InterruptedWorkReply<dot_agent_deck::interrupted_work::InterruptedList>,
+    String,
+> {
+    ensure_main_webview(&webview)?;
+    let scope = crate::dto::DeckScope::resolve(Some(&deck_id))?;
+    let daemon = state.daemon.trusted(scope.endpoint()).await?;
+    daemon.require_compatible()?;
+    crate::interrupted_work::list(&daemon.client, &instance_id, git).await
+}
+
+/// PRD #1790 stage 2: one interrupted item of deck `deck_id` and a page of
+/// its kept reports' text, from its `reports_from`-th on, or with `report`
+/// that one report — a report past the ones the list carries included.
+#[tauri::command]
+async fn interrupted_work_show(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    deck_id: String,
+    instance_id: String,
+    id: String,
+    report: Option<String>,
+    reports_from: Option<usize>,
+) -> Result<
+    crate::dto::InterruptedWorkReply<dot_agent_deck::interrupted_work::InterruptedShow>,
+    String,
+> {
+    ensure_main_webview(&webview)?;
+    let scope = crate::dto::DeckScope::resolve(Some(&deck_id))?;
+    let daemon = state.daemon.trusted(scope.endpoint()).await?;
+    daemon.require_compatible()?;
+    crate::interrupted_work::show(
+        &daemon.client,
+        &instance_id,
+        &id,
+        report.as_deref(),
+        reports_from,
+    )
+    .await
+}
+
+/// PRD #1790 stage 2: reclaim interrupted item `id` of deck `deck_id` —
+/// remove its worktree, keep its branch — or with `dry_run` ask what that
+/// would do. Sent with no pane claim: the desktop is the person's client.
+#[tauri::command]
+async fn interrupted_work_reclaim(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    deck_id: String,
+    instance_id: String,
+    id: String,
+    dry_run: bool,
+) -> Result<
+    crate::dto::InterruptedWorkReply<dot_agent_deck::interrupted_work::ReclaimOutcome>,
+    String,
+> {
+    ensure_main_webview(&webview)?;
+    let scope = crate::dto::DeckScope::resolve(Some(&deck_id))?;
+    let daemon = state.daemon.trusted(scope.endpoint()).await?;
+    daemon.require_compatible()?;
+    crate::interrupted_work::reclaim(&daemon.client, &instance_id, &id, dry_run).await
+}
+
+/// PRD #1790 stage 2: dismiss exactly the interrupted items `ids` name on
+/// deck `deck_id` — Dismiss all sends the ids it listed, never "all". Sent
+/// with no pane claim.
+#[tauri::command]
+async fn interrupted_work_dismiss(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    deck_id: String,
+    instance_id: String,
+    ids: Vec<String>,
+) -> Result<
+    crate::dto::InterruptedWorkReply<dot_agent_deck::interrupted_work::DismissOutcome>,
+    String,
+> {
+    ensure_main_webview(&webview)?;
+    let scope = crate::dto::DeckScope::resolve(Some(&deck_id))?;
+    let daemon = state.daemon.trusted(scope.endpoint()).await?;
+    daemon.require_compatible()?;
+    crate::interrupted_work::dismiss(&daemon.client, &instance_id, ids).await
 }
 
 /// PRD #2374: invoke action `action_id` of the card of agent `agent_id` in
@@ -7565,12 +7663,18 @@ pub fn run() {
             trust_review::desktop_deny_trust_request,
             star_prompt::desktop_star_prompt_launch,
             star_prompt::desktop_star_prompt_choose,
+            antigravity_notice::desktop_antigravity_notice_start,
+            antigravity_notice::desktop_antigravity_notice_choose,
             desktop_list_directories,
             desktop_inbox_action,
             desktop_generate_config,
             agent_cards_consume,
             agent_cards_list,
             agent_card_invoke,
+            interrupted_work_list,
+            interrupted_work_show,
+            interrupted_work_reclaim,
+            interrupted_work_dismiss,
             desktop_new_agent_options,
             desktop_bootstrap,
             desktop_reconnect_deck,

@@ -1334,6 +1334,46 @@ mod tests {
                     "showDashboardCounters",
                     vec!["overview"]
                 ),
+                (
+                    "show_interrupted_work",
+                    "showInterruptedWork",
+                    vec!["overview"]
+                ),
+                (
+                    "reclaim_interrupted",
+                    "reclaimInterrupted",
+                    vec!["overview"]
+                ),
+                (
+                    "dismiss_interrupted",
+                    "dismissInterrupted",
+                    vec!["overview"]
+                ),
+                (
+                    "dismiss_all_interrupted",
+                    "dismissAllInterrupted",
+                    vec!["overview"]
+                ),
+                (
+                    "show_interrupted_details",
+                    "showInterruptedDetails",
+                    vec!["overview"]
+                ),
+                (
+                    "show_interrupted_reports",
+                    "showInterruptedReports",
+                    vec!["overview"]
+                ),
+                (
+                    "next_interrupted_reports",
+                    "nextInterruptedReports",
+                    vec!["overview"]
+                ),
+                (
+                    "previous_interrupted_reports",
+                    "previousInterruptedReports",
+                    vec!["overview"]
+                ),
                 ("switch_deck", "switchDeck", vec!["deck", "overview"]),
                 // No screens: see the row's own comment — stopping must never
                 // be unavailable.
@@ -1435,6 +1475,18 @@ mod tests {
                 (
                     "dismiss_star_prompt",
                     "dismissStarPrompt",
+                    vec!["deck", "overview", "agent"]
+                ),
+                // PRD #211: the Antigravity notice's two rows, on the star
+                // reminder's screens (its Later is `close`).
+                (
+                    "open_antigravity_issues",
+                    "openAntigravityIssues",
+                    vec!["deck", "overview", "agent"]
+                ),
+                (
+                    "dismiss_antigravity_notice",
+                    "dismissAntigravityNotice",
                     vec!["deck", "overview", "agent"]
                 ),
                 // PRD #802 D5's set: each only opens a confirmation.
@@ -2393,7 +2445,9 @@ mod tests {
                 // the app says so.
                 "star_repo",
                 "remind_star_later",
-                "dismiss_star_prompt"
+                "dismiss_star_prompt",
+                "open_antigravity_issues",
+                "dismiss_antigravity_notice"
             ]
         );
         assert_eq!(
@@ -2409,6 +2463,14 @@ mod tests {
                 "add_daemon",
                 "show_host_metrics",
                 "show_dashboard_counters",
+                "show_interrupted_work",
+                "reclaim_interrupted",
+                "dismiss_interrupted",
+                "dismiss_all_interrupted",
+                "show_interrupted_details",
+                "show_interrupted_reports",
+                "next_interrupted_reports",
+                "previous_interrupted_reports",
                 "switch_deck",
                 "voice_off",
                 "list_commands",
@@ -2431,6 +2493,8 @@ mod tests {
                 "star_repo",
                 "remind_star_later",
                 "dismiss_star_prompt",
+                "open_antigravity_issues",
+                "dismiss_antigravity_notice",
                 // PRD #802 D5's two stops: on the overview, where their
                 // controls are. Each only opens a confirmation, and so does
                 // PRD #2119's Generate config between them.
@@ -2477,6 +2541,8 @@ mod tests {
                 "star_repo",
                 "remind_star_later",
                 "dismiss_star_prompt",
+                "open_antigravity_issues",
+                "dismiss_antigravity_notice",
                 // Issue #1402: ask to close the agent shown in the pane.
                 "stop_agent",
                 // PRD #2119: ask the pane's agent to generate the config.
@@ -3232,7 +3298,8 @@ mod tests {
     /// agent references (`open_agent`, `open_pr`, `stop_agent`), the daemon
     /// a required `deck` may be read from ([`super::super::outcome`]'s
     /// `names_the_daemon`: `switch_deck`, `choose_deck`) and the daemon the
-    /// Host figures are asked for (`show_host_metrics`). A list anywhere else
+    /// Host figures and the interrupted work are asked for
+    /// (`show_host_metrics`, `show_interrupted_work`). A list anywhere else
     /// would be read by nothing.
     #[test]
     fn voice_table_action_words_are_the_reference_readers_set() {
@@ -3247,6 +3314,7 @@ mod tests {
             vec![
                 "open_agent",
                 "show_host_metrics",
+                "show_interrupted_work",
                 "switch_deck",
                 "open_pr",
                 "choose_deck",

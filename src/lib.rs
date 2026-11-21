@@ -14,11 +14,16 @@ compile_error!(
 );
 
 // Shared by the per-agent hook-config adapters (`codex_hooks_manage`,
-// `devin_hooks_manage`); nothing outside the crate calls it.
+// `devin_hooks_manage`, `antigravity_hooks_manage`); nothing outside the
+// crate calls it.
 mod agent_hook_config;
 pub mod agent_notice;
 pub mod agent_pty;
 pub mod agent_registry;
+// PRD #211: the Antigravity CLI's hook installer.
+pub mod antigravity_hooks_manage;
+// PRD #211: the Antigravity experimental notice's words, shared by both clients.
+pub mod antigravity_notice;
 pub mod attach_recovery;
 pub mod authoring_seeds;
 pub mod bounded_read;
@@ -142,6 +147,14 @@ pub mod init;
 pub mod injected_prompt;
 // PRD #1666 part 3 round 5-wake: a wrapper's samples of its agent's line discipline.
 pub mod input_mode;
+// PRD #1790 stage 2: the `dot-agent-deck interrupted` command group.
+pub mod interrupted_cli;
+// PRD #1790 stage 2: the interrupted work list, derived from the work journal.
+pub mod interrupted_work;
+// PRD #1790 stage 2: the daemon side of the interrupted work verbs.
+pub mod interrupted_work_daemon;
+// PRD #1790 stage 2: the bounded `git` and `gh` children of those verbs.
+pub mod interrupted_work_probe;
 pub mod issue_dispatch;
 pub mod issue_dispatch_run;
 pub mod jsonc_edit;
@@ -152,7 +165,10 @@ pub mod launch_records;
 pub mod lifetime_tag;
 pub mod lock_rank;
 pub mod logging;
+// PRD #1790 stage 2 (final review, auditor 1): Git working trees of any
+// repository lying inside a worktree a removal would delete.
 pub mod login_shell;
+pub mod nested_git_trees;
 // PRD #1223 M2: what the daemon reports about itself to a new-agent form.
 pub mod new_agent_options;
 pub mod opencode_manage;
@@ -207,6 +223,8 @@ pub mod scheduler;
 pub mod self_upgrade;
 pub mod spawn;
 pub mod state;
+// PRD #211: agent status read from OSC 7501 sequences in a pane's output.
+pub mod status_osc;
 pub mod submitted_prompt;
 // PRD #1401: the TUI's `o` key, which hands a wire URL to the system browser.
 pub mod system_browser;
