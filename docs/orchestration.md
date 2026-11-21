@@ -418,7 +418,7 @@ Claude Code suggests your next prompt after each turn, and each suggestion costs
 
 ### Closing an orchestration
 
-**TUI:** `Ctrl+w` on the orchestration tab, after a confirmation. **Desktop:** the group's **Close** button, after a confirmation that lists the roles (**Close all N roles**). Either stops every role's agent.
+**TUI:** `Ctrl+w` on the orchestration tab, after a confirmation. **Desktop:** the group's **Close** button, after a confirmation that lists the roles (**Close all N roles**), or **Close orchestration** in any role's own close confirmation, which also offers **Close agent** to close only that role. Either stops every role's agent.
 
 ### When the orchestrator's conversation is compacted or cleared
 

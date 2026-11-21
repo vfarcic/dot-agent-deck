@@ -817,8 +817,14 @@ reason = "Confirmation dialog Confirm button: runs the destructive action the op
 [[site]]
 file = "desktop/src/components/ConfirmDialog.tsx"
 handler = "onClick"
-code = "() => run(\"keep\", keep.action)"
-reason = "Confirmation dialog's second confirm, the close that keeps the dispatched worktree (`Close agent, keep worktree` / `Close all N roles, keep worktree`, issue #1958): runs the destructive close the opener staged, like the Confirm button. Kept manual by design for the same reason: voice raises the same confirmation (`stop_agent`, `close_orchestration`) and the user picks which close by hand."
+code = "() => run(\"alternative\", alternative.action)"
+reason = "Confirmation dialog's second close (issue #2436: `Close orchestration` on an orchestration role's Close dialog): runs the destructive close the opener staged, like the Confirm button. Kept manual by design for the same reason: voice raises the same confirmation (`stop_agent`, and `close_orchestration` for the group's Close) and the user picks which close by hand."
+
+[[site]]
+file = "desktop/src/components/ConfirmDialog.tsx"
+handler = "onChange"
+code = "(event) => setKeepChecked({ state, checked: event.target.checked })"
+reason = "Confirmation dialog's \"Keep the worktree\" checkbox (issues #1958 and #2436): an option of the close the user is confirming, which stops nothing by itself. It is part of answering the confirmation, which PRD #802 D5 keeps manual: voice raises the confirmation and the user answers it by hand."
 
 # --- desktop/src/components/DashboardCounters.tsx ---
 
