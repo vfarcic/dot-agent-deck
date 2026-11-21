@@ -49,6 +49,20 @@ function deckKeeping(initial: DeckPrompt[] = []) {
   return { access, held: () => held };
 }
 
+/** Let queued promise chains run, without depending on timers (some tests fake them). */
+async function settle() {
+  await act(async () => {
+    for (let index = 0; index < 10; index += 1) await Promise.resolve();
+  });
+}
+
+/** A promise the test settles by hand. */
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
 beforeEach(() => window.localStorage.clear());
 afterEach(() => vi.useRealTimers());
 
@@ -104,10 +118,12 @@ describe("usePromptLibrary (issue #824)", () => {
     expect(result.current.prompts).toEqual([prompt("a", "a", "fix")]);
     expect(deck.access.savePrompt).not.toHaveBeenCalled();
     await act(async () => { vi.advanceTimersByTime(PROMPT_SAVE_DELAY_MS); });
+    await settle();
     expect(deck.access.savePrompt).toHaveBeenCalledTimes(1);
     expect(deck.access.savePrompt).toHaveBeenCalledWith("deck-1", prompt("a", "a", "fix"));
 
     act(() => result.current.removePrompt("a"));
+    await settle();
     expect(deck.access.deletePrompt).toHaveBeenCalledWith("deck-1", "a");
     expect(result.current.prompts).toEqual([]);
     // Nothing went back to this device.
@@ -121,8 +137,102 @@ describe("usePromptLibrary (issue #824)", () => {
 
     act(() => result.current.updatePrompt("a", { name: "Typed before switching" }));
     rerender({ deckId: "deck-2" });
-    expect(deck.access.savePrompt).toHaveBeenCalledWith("deck-1", prompt("a", "Typed before switching"));
+    await waitFor(() => expect(deck.access.savePrompt).toHaveBeenCalledWith("deck-1", prompt("a", "Typed before switching")));
     await waitFor(() => expect(deck.access.listPrompts).toHaveBeenLastCalledWith("deck-2"));
+  });
+
+  it("sends a delete only after the save before it has answered, so a removed prompt stays removed", async () => {
+    const deck = deckKeeping([prompt("a")]);
+    const slowSave = deferred<DeckPromptLibrary>();
+    deck.access.savePrompt.mockImplementationOnce(() => slowSave.promise);
+    const { result } = renderHook(() => usePromptLibrary({ deckId: "deck-1", ...deck.access }));
+    await waitFor(() => expect(result.current.source).toEqual({ kind: "deck" }));
+
+    act(() => result.current.updatePrompt("a", { body: "edited" }));
+    act(() => result.current.flushPending());
+    await settle();
+    expect(deck.access.savePrompt).toHaveBeenCalledTimes(1);
+    act(() => result.current.removePrompt("a"));
+    await settle();
+    expect(deck.access.deletePrompt).not.toHaveBeenCalled();
+    slowSave.resolve({ kind: "deck", prompts: [prompt("a", "a", "edited")] });
+    await settle();
+    expect(deck.access.deletePrompt).toHaveBeenCalledWith("deck-1", "a");
+  });
+
+  it("sends a new prompt's first edit only after its creation has answered", async () => {
+    const deck = deckKeeping();
+    const slowCreate = deferred<DeckPromptLibrary>();
+    deck.access.savePrompt.mockImplementationOnce(() => slowCreate.promise);
+    const { result } = renderHook(() => usePromptLibrary({ deckId: "deck-1", ...deck.access }));
+    await waitFor(() => expect(result.current.source).toEqual({ kind: "deck" }));
+
+    let id: string | undefined;
+    act(() => { id = result.current.addPrompt(); });
+    act(() => result.current.updatePrompt(id!, { body: "typed" }));
+    act(() => result.current.flushPending());
+    await settle();
+    expect(deck.access.savePrompt).toHaveBeenCalledTimes(1);
+    slowCreate.resolve({ kind: "deck", prompts: [] });
+    await settle();
+    expect(deck.access.savePrompt).toHaveBeenCalledTimes(2);
+    expect(deck.access.savePrompt.mock.calls[1]?.[1]).toMatchObject({ id, body: "typed" });
+  });
+
+  it("sends a pending edit when the page is hidden", async () => {
+    const deck = deckKeeping([prompt("a")]);
+    const { result } = renderHook(() => usePromptLibrary({ deckId: "deck-1", ...deck.access }));
+    await waitFor(() => expect(result.current.source).toEqual({ kind: "deck" }));
+
+    act(() => result.current.updatePrompt("a", { name: "Typed just before closing" }));
+    act(() => { window.dispatchEvent(new Event("pagehide")); });
+    await settle();
+    expect(deck.access.savePrompt).toHaveBeenCalledWith("deck-1", prompt("a", "Typed just before closing"));
+  });
+
+  it("keeps a device copy edited while the hand-over was in flight", async () => {
+    storeOnDevice([prompt("a")]);
+    const deck = deckKeeping();
+    const slowSeed = deferred<DeckPromptLibrary>();
+    deck.access.seedPrompts.mockImplementationOnce(() => slowSeed.promise);
+    const { result } = renderHook(() => usePromptLibrary({ deckId: "deck-1", ...deck.access }));
+    await waitFor(() => expect(deck.access.seedPrompts).toHaveBeenCalled());
+
+    // Edited on this device (another window, or an older deck) meanwhile.
+    storeOnDevice([prompt("a", "edited meanwhile")]);
+    slowSeed.resolve({ kind: "deck", prompts: [prompt("a")] });
+    await waitFor(() => expect(result.current.source).toEqual({ kind: "deck" }));
+    expect(deviceCopy()).toEqual([prompt("a", "edited meanwhile")]);
+  });
+
+  it("hands the library to one deck at a time, so a quick switch cannot copy it into two", async () => {
+    storeOnDevice([prompt("a")]);
+    const first = deckKeeping();
+    const slowSeed = deferred<DeckPromptLibrary>();
+    first.access.seedPrompts.mockImplementationOnce(() => slowSeed.promise);
+    const second = deckKeeping();
+    const access = (deckId: string | undefined) => ({ deckId, ...(deckId === "deck-2" ? second.access : first.access) });
+    const { result, rerender } = renderHook(({ deckId }) => usePromptLibrary(access(deckId)), { initialProps: { deckId: "deck-1" as string | undefined } });
+    await waitFor(() => expect(first.access.seedPrompts).toHaveBeenCalled());
+
+    rerender({ deckId: "deck-2" });
+    await waitFor(() => expect(result.current.source).toEqual({ kind: "deck" }));
+    expect(second.access.seedPrompts).not.toHaveBeenCalled();
+    slowSeed.resolve({ kind: "deck", prompts: [prompt("a")] });
+    await waitFor(() => expect(deviceCopy()).toBeNull());
+  });
+
+  it("moves the prompts a daemon can keep and leaves a too-large one on this device, named", async () => {
+    const huge = prompt("big", "Huge context dump", "x".repeat(64 * 1024 + 1));
+    storeOnDevice([prompt("a"), huge]);
+    const deck = deckKeeping();
+    const { result } = renderHook(() => usePromptLibrary({ deckId: "deck-1", ...deck.access }));
+
+    await waitFor(() => expect(result.current.notice).toContain("Moved 1 prompt"));
+    expect(deck.access.seedPrompts).toHaveBeenCalledWith("deck-1", [prompt("a")]);
+    expect(result.current.notice).toContain("Huge context dump");
+    expect(result.current.prompts).toEqual([prompt("a")]);
+    expect(deviceCopy()).toEqual([huge]);
   });
 
   it("shows no library and allows no edit with no single daemon selected", () => {

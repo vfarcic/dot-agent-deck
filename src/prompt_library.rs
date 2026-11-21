@@ -259,6 +259,16 @@ impl PromptLibraryStore {
         }
     }
 
+    /// An empty store persisting to `path`, without reading it — for a daemon
+    /// whose load could not run. Its first change replaces the file.
+    pub fn load_empty(path: PathBuf) -> Self {
+        Self {
+            path,
+            snapshot: RwLock::new(Snapshot::default()),
+            writer: Mutex::new(()),
+        }
+    }
+
     /// The file this store persists to.
     pub fn path(&self) -> &Path {
         &self.path
@@ -308,18 +318,18 @@ impl PromptLibraryStore {
     /// holds is skipped, never overwritten, so a seed cannot undo an edit
     /// another client made; a later duplicate within `prompts` is skipped too.
     ///
-    /// **All or nothing:** if any prompt is refused by [`check_prompt`], or the
-    /// result would exceed the library's limits, nothing is added and the
-    /// refusal is returned, so the client knows to keep its own copy.
+    /// **All or nothing:** if any prompt it would add is refused by
+    /// [`check_prompt`], or the result would exceed the library's limits,
+    /// nothing is added and the refusal is returned, so the client knows to keep
+    /// its own copy. A prompt it skips is not checked, so a copy the library
+    /// already holds cannot block the rest.
     pub fn seed(&self, prompts: Vec<Prompt>) -> Result<LibraryOutcome, String> {
-        for prompt in &prompts {
-            check_prompt(prompt)?;
-        }
         let mut snapshot = self.write_snapshot();
         let mut next = snapshot.prompts.clone();
         let mut added = false;
         for prompt in prompts {
             if next.iter().all(|held| held.id != prompt.id) {
+                check_prompt(&prompt)?;
                 next.push(prompt);
                 added = true;
             }

@@ -456,7 +456,8 @@ export function useDeckRuntime(): DeckRuntimeState {
   const listDirectories = useCallback((deckId: string, path?: string, options?: DeckListingOptions) => (options ? bridge.listDirectories(deckId, path, options) : bridge.listDirectories(deckId, path)), [bridge]);
   const newAgentOptions = useCallback((deckId: string) => bridge.newAgentOptions(deckId), [bridge]);
   // Issue #824 — async, so a render-only test bridge without these methods
-  // rejects (and the library falls back to this device) instead of throwing.
+  // rejects instead of throwing during render; the library then reads as
+  // unavailable, as it does for a deck that could not be asked.
   const listPrompts = useCallback(async (deckId: string) => bridge.listPrompts(deckId), [bridge]);
   const savePrompt = useCallback(async (deckId: string, prompt: DeckPrompt) => bridge.savePrompt(deckId, prompt), [bridge]);
   const deletePrompt = useCallback(async (deckId: string, id: string) => bridge.deletePrompt(deckId, id), [bridge]);

@@ -9430,12 +9430,6 @@ async fn record_last_command(state: &SharedState, command: &str) {
     }
 }
 
-/// Issue #1540: write the store's current value to disk on a detached blocking
-/// task, so no reply waits for the state directory. The store writes whatever
-/// value is newest when the task runs and skips one already on disk, so tasks
-/// finishing out of order cannot leave an older command on disk. A failure is
-/// logged under `verb` with the store's error, which names a path and never the
-/// command.
 /// Issue #824: answer a prompt-library verb — run `change` on the daemon's
 /// store, answer the library as it stands afterwards, and when the library
 /// changed write it to disk on a detached blocking task, so the reply never
@@ -9468,6 +9462,12 @@ fn prompt_library_reply(
     }
 }
 
+/// Issue #1540: write the store's current value to disk on a detached blocking
+/// task, so no reply waits for the state directory. The store writes whatever
+/// value is newest when the task runs and skips one already on disk, so tasks
+/// finishing out of order cannot leave an older command on disk. A failure is
+/// logged under `verb` with the store's error, which names a path and never the
+/// command.
 fn persist_last_command(store: Arc<crate::last_command::LastCommandStore>, verb: &'static str) {
     drop(tokio::task::spawn_blocking(move || {
         if let Err(error) = store.persist() {

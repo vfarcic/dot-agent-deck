@@ -44,18 +44,41 @@ function writeDevicePrompts(prompts: DeckPrompt[]) {
   }
 }
 
-function removeDevicePrompts() {
-  try {
-    window.localStorage.removeItem(PROMPTS_STORAGE_KEY);
-  } catch {
-    // Nothing to do: a key that cannot be removed cannot be read either.
-  }
-}
-
 function mintPromptId(): string {
   return typeof crypto.randomUUID === "function"
     ? crypto.randomUUID()
     : `prompt-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+/**
+ * The daemon's per-prompt limits (`src/prompt_library.rs`), in UTF-8 bytes. A
+ * prompt kept on this device before decks owned the library had none, so one
+ * over a limit is left on this device rather than sent, where it would refuse
+ * the whole hand-over.
+ */
+const MAX_ID_BYTES = 128;
+const MAX_NAME_BYTES = 512;
+const MAX_BODY_BYTES = 64 * 1024;
+const MAX_NOTE_BYTES = 4 * 1024;
+
+function byteLength(text: string): number {
+  return new TextEncoder().encode(text).length;
+}
+
+/** Whether a daemon would take `prompt` (its library-wide limits aside). */
+export function fitsDaemonLimits(prompt: DeckPrompt): boolean {
+  return prompt.id.length > 0
+    && byteLength(prompt.id) <= MAX_ID_BYTES
+    // eslint-disable-next-line no-control-regex
+    && !/[\u0000-\u001f\u007f-\u009f]/.test(prompt.id)
+    && byteLength(prompt.name) <= MAX_NAME_BYTES
+    && byteLength(prompt.body) <= MAX_BODY_BYTES
+    && byteLength(prompt.note ?? "") <= MAX_NOTE_BYTES;
+}
+
+function shortName(prompt: DeckPrompt): string {
+  const name = prompt.name.trim() || "Untitled prompt";
+  return name.length > 40 ? `${name.slice(0, 39)}…` : name;
 }
 
 function errorText(error: unknown): string {
@@ -113,9 +136,18 @@ function plural(count: number): string {
  * removed and it is tried again on the next load.
  *
  * Edits show at once and are saved to the deck {@link PROMPT_SAVE_DELAY_MS}
- * after the last keystroke; a pending save is sent when the deck changes or
- * the app closes the library. A deck from before the library keeps the old
+ * after the last keystroke; a pending save is sent at once when the deck
+ * changes, when the page is hidden or unloaded, and on {@link flushPending}
+ * (the panel's close). Every change sent to a daemon — add, save, delete —
+ * goes through one queue, one request at a time, so the daemon applies them in
+ * the order the user made them. A deck from before the library keeps the old
  * behaviour: the library on this device, written on every change.
+ *
+ * The hand-over removes the device copy only if it is still exactly what was
+ * sent, so an edit made on this device while the deck was answering is kept;
+ * and only one hand-over runs at a time, so a quick switch between two decks
+ * cannot copy the library into both. A prompt larger than a daemon keeps is
+ * not sent, stays on this device, and is named in the notice.
  */
 export function usePromptLibrary(access: PromptLibraryAccess = {}) {
   const { deckId, listPrompts, savePrompt, deletePrompt, seedPrompts } = access;
@@ -128,13 +160,23 @@ export function usePromptLibrary(access: PromptLibraryAccess = {}) {
   promptsRef.current = state.prompts;
   const saveRef = useRef(savePrompt);
   saveRef.current = savePrompt;
+  const deleteRef = useRef(deletePrompt);
+  deleteRef.current = deletePrompt;
   const pending = useRef(new Map<string, { deckId: string; timer: ReturnType<typeof setTimeout> }>());
+  /** Every daemon change, chained, so each is sent after the one before it has answered. */
+  const queue = useRef<Promise<void>>(Promise.resolve());
+  /** A hand-over is waiting on a deck: no other deck may start one meanwhile. */
+  const handingOver = useRef(false);
 
   const reportSaveFailure = useCallback((error: unknown) => {
     setNotice(`Not saved to the daemon: ${errorText(error)}`);
   }, []);
 
-  /** Send the pending save for `id` now, to the deck it was made on. */
+  const enqueue = useCallback((change: () => Promise<unknown>) => {
+    queue.current = queue.current.then(change).then(() => undefined, reportSaveFailure);
+  }, [reportSaveFailure]);
+
+  /** Queue the pending save for `id` now, to the deck it was made on, with the text as it stands. */
   const flush = useCallback((id: string) => {
     const entry = pending.current.get(id);
     if (!entry) return;
@@ -142,8 +184,26 @@ export function usePromptLibrary(access: PromptLibraryAccess = {}) {
     pending.current.delete(id);
     const prompt = promptsRef.current.find((candidate) => candidate.id === id);
     const save = saveRef.current;
-    if (prompt && save) save(entry.deckId, prompt).catch(reportSaveFailure);
-  }, [reportSaveFailure]);
+    if (prompt && save) enqueue(() => save(entry.deckId, { ...prompt }));
+  }, [enqueue]);
+
+  /** Queue every pending save now — for the panel's close and the page going away. */
+  const flushPending = useCallback(() => {
+    for (const id of [...pending.current.keys()]) flush(id);
+  }, [flush]);
+
+  useEffect(() => {
+    const onHide = () => flushPending();
+    const onVisibility = () => { if (document.visibilityState === "hidden") flushPending(); };
+    window.addEventListener("pagehide", onHide);
+    window.addEventListener("beforeunload", onHide);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      window.removeEventListener("pagehide", onHide);
+      window.removeEventListener("beforeunload", onHide);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [flushPending]);
 
   useEffect(() => {
     if (onDevice) return;
@@ -168,18 +228,34 @@ export function usePromptLibrary(access: PromptLibraryAccess = {}) {
         return;
       }
       const held = readDevicePrompts();
-      if (!held.length || !seedPrompts) {
+      if (!held.length || !seedPrompts || handingOver.current) {
         if (current) setState({ prompts: library.prompts, source: { kind: "deck" } });
         return;
       }
+      const sent = held.filter(fitsDaemonLimits);
+      const tooLarge = held.filter((prompt) => !fitsDaemonLimits(prompt));
+      const tooLargeNotice = tooLarge.length
+        ? ` ${plural(tooLarge.length)} larger than a daemon keeps stayed on this device: ${tooLarge.map(shortName).join(", ")}.`
+        : "";
+      if (!sent.length) {
+        if (current) {
+          setState({ prompts: library.prompts, source: { kind: "deck" } });
+          setNotice(tooLargeNotice.trim());
+        }
+        return;
+      }
+      const snapshot = JSON.stringify(held);
+      handingOver.current = true;
       try {
-        const seeded = await seedPrompts(deckId, held);
-        // Removed even if the user has moved on: the deck has taken them.
-        if (seeded.kind === "deck") removeDevicePrompts();
+        const seeded = await seedPrompts(deckId, sent);
+        // Settled even if the user has moved on, since the deck has taken them
+        // — but only over the copy that was sent: anything edited on this
+        // device meanwhile is kept, and is offered again on the next load.
+        if (seeded.kind === "deck" && JSON.stringify(readDevicePrompts()) === snapshot) writeDevicePrompts(tooLarge);
         if (!current) return;
         if (seeded.kind === "deck") {
           setState({ prompts: seeded.prompts, source: { kind: "deck" } });
-          setNotice(`Moved ${plural(held.length)} kept on this device into this daemon's library.`);
+          setNotice(`Moved ${plural(sent.length)} kept on this device into this daemon's library.${tooLargeNotice}`);
         } else {
           setState({ prompts: readDevicePrompts(), source: { kind: "device", reason: "older-deck" } });
         }
@@ -187,6 +263,8 @@ export function usePromptLibrary(access: PromptLibraryAccess = {}) {
         if (!current) return;
         setState({ prompts: library.prompts, source: { kind: "deck" } });
         setNotice(`The ${plural(held.length)} kept on this device could not be moved to this daemon: ${errorText(error)} They stay on this device, and the move is tried again the next time this library loads.`);
+      } finally {
+        handingOver.current = false;
       }
     })();
     const saves = pending.current;
@@ -208,7 +286,8 @@ export function usePromptLibrary(access: PromptLibraryAccess = {}) {
     if (!editable) return undefined;
     const prompt: DeckPrompt = { id: mintPromptId(), name: "New prompt", body: "", note: "" };
     setState((current) => ({ ...current, prompts: [...current.prompts, prompt] }));
-    if (onDeck && savePrompt) savePrompt(deckId, prompt).catch(reportSaveFailure);
+    const save = savePrompt;
+    if (onDeck && save) enqueue(() => save(deckId, prompt));
     return prompt.id;
   };
 
@@ -229,8 +308,9 @@ export function usePromptLibrary(access: PromptLibraryAccess = {}) {
       pending.current.delete(id);
     }
     setState((current) => ({ ...current, prompts: current.prompts.filter((prompt) => prompt.id !== id) }));
-    if (onDeck && deletePrompt) deletePrompt(deckId, id).catch(reportSaveFailure);
+    const remove = deleteRef.current;
+    if (onDeck && remove) enqueue(() => remove(deckId, id));
   };
 
-  return { prompts: state.prompts, source: state.source, notice, addPrompt, updatePrompt, removePrompt };
+  return { prompts: state.prompts, source: state.source, notice, addPrompt, updatePrompt, removePrompt, flushPending };
 }

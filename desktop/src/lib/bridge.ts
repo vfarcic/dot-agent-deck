@@ -2561,13 +2561,6 @@ export function normalizeDesktopFeatures(value: unknown): DesktopFeatures {
 }
 
 /**
- * Fixture mode's answer to {@link DeckBridge.desktopFeatures}: all OFF, the
- * shipped default, unless the preview URL carries `?experimental=1` (or
- * `true`) — the seam the vitest and Playwright suites use to see the gated
- * surfaces, following `?state=`, `?older=` and `?nonunix=`. Read per call, so a
- * test that rewrites the URL sees the new answer without a new bridge.
- */
-/**
  * Issue #824 — read a prompt-library reply field by field: a `deck` reply's
  * prompts keep only entries with the four fields' types, and anything that is
  * not a recognisable reply is an error rather than an empty library, so a
@@ -2585,6 +2578,13 @@ export function normalizePromptLibrary(value: unknown): DeckPromptLibrary {
   return { kind: "deck", prompts };
 }
 
+/**
+ * Fixture mode's answer to {@link DeckBridge.desktopFeatures}: all OFF, the
+ * shipped default, unless the preview URL carries `?experimental=1` (or
+ * `true`) — the seam the vitest and Playwright suites use to see the gated
+ * surfaces, following `?state=`, `?older=` and `?nonunix=`. Read per call, so a
+ * test that rewrites the URL sees the new answer without a new bridge.
+ */
 export function fixtureDesktopFeatures(search = window.location.search): DesktopFeatures {
   const requested = new URLSearchParams(search).get("experimental")?.trim().toLowerCase();
   if (requested !== "1" && requested !== "true") return { ...DEFAULT_DESKTOP_FEATURES };

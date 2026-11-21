@@ -2109,7 +2109,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
   // Issue #824 — the prompt library is the selected daemon's, so it follows
   // the deck: none under All Decks or while no deck is connected.
   const promptDeckId = !allDecks && snapshot.connection.status === "connected" ? orchestrationDeckId : undefined;
-  const { prompts, source: promptSource, notice: promptNotice, addPrompt, updatePrompt, removePrompt } = usePromptLibrary({
+  const { prompts, source: promptSource, notice: promptNotice, addPrompt, updatePrompt, removePrompt, flushPending: flushPromptSaves } = usePromptLibrary({
     deckId: promptDeckId,
     listPrompts: runtime.listPrompts,
     savePrompt: runtime.savePrompt,
@@ -2995,7 +2995,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
         prompts={prompts}
         selectedId={selectedPromptId}
         onSelect={setSelectedPromptId}
-        onClose={() => setOverlay("prompts", false)}
+        onClose={() => { flushPromptSaves(); setOverlay("prompts", false); }}
         source={promptSource}
         notice={promptNotice}
         onAdd={() => { const id = addPrompt(); if (id) setSelectedPromptId(id); }}

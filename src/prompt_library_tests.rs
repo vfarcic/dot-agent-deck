@@ -251,3 +251,20 @@ fn a_stale_persist_never_overwrites_a_newer_one() {
     store.persist().unwrap();
     assert_eq!(store_in(&dir).list(), vec![prompt("a", "A", "2")]);
 }
+
+/// A copy of a prompt the library already holds is skipped before it is
+/// checked, so an oversized stale copy cannot block the rest of a seed.
+#[test]
+fn a_skipped_copy_is_not_checked() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store_in(&dir);
+    store.save(prompt("a", "A", "held")).unwrap();
+    let oversized_copy = prompt("a", "A", &"x".repeat(MAX_PROMPT_BODY_BYTES + 1));
+    store
+        .seed(vec![oversized_copy, prompt("b", "B", "2")])
+        .unwrap();
+    assert_eq!(
+        store.list(),
+        vec![prompt("a", "A", "held"), prompt("b", "B", "2")]
+    );
+}
