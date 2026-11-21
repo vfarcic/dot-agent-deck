@@ -1,0 +1,36 @@
+---
+source: tests/render_interrupted_work.rs
+expression: confirm
+---
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+     ┌ Interrupted work ────────────────────────────────────────────────────────────────────────────────┐     
+     │                                                                                                  │     
+     │  Reclaim fix-login · Unit                                                                        │     
+     │  Reclaim: remove its worktree, keep its branch                                                   │     
+     │                                                                                                  │     
+     │  Reclaim would remove its worktree and keep its branch.                                          │     
+     │    Worktree: /home/me/code/app-dispatch-fix-login                                                │     
+     │    Branch: agent/dispatch-fix-login                                                              │     
+     │  2 commits on its branch are on no remote; the branch keeps them.                                │     
+     │                                                                                                  │     
+     │  Reclaim? y/n                                                                                    │     
+     │                                                                                                  │     
+     │  y reclaim · n back                                                                              │     
+     └──────────────────────────────────────────────────────────────────────────────────────────────────┘     
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+1 interrupted item from before the restart                                                   [Show I] [Hide X]
+ COMMAND  [Command Mode Ctrl+D] [New Agent Ctrl+N] [Close Ctrl+W] [Help ?] [Quit Ctrl+C] [Filter /] [Rename r]
+[Generate g] [Schedules s]

@@ -1412,6 +1412,62 @@ fn a_scheduled_issue_dispatch_closes_with_what_it_started_or_leaves_nothing() {
     assert_eq!(tracker.book_sizes().launches, 0);
 }
 
+/// PR #2431 round 5: a launch this daemon's shutdown cut short is kept open
+/// once something of it was written — a scheduled issue dispatch's pane, or
+/// a dispatch's orchestration, whose held `opened` is written now — so the
+/// next daemon lists it as interrupted work. One that wrote nothing is
+/// forgotten, as a failed launch is, and answers that nothing was kept.
+#[test]
+fn a_launch_the_shutdown_cut_short_stays_open_once_something_of_it_was_written() {
+    let state = crate::test_temp::tempdir().unwrap();
+    let tracker = tracker(state.path());
+    let fire = tracker.open(Launch::ScheduleFire, None, Refs::default(), None);
+
+    // A scheduled issue dispatch whose single agent came up.
+    let single = issue_launch(&tracker, fire.as_ref());
+    tracker
+        .resolve_spawn(Some(&single), Some("i-1"), None, None)
+        .kept()
+        .unwrap();
+    tracker.attempt_started(&single, "1", Some("i-1"), None);
+    assert!(tracker.launch_interrupted(&single));
+    tracker.pane_closed("i-1");
+    assert_eq!(
+        kinds_of(&lines(&tracker, state.path()), &single),
+        ["opened", "attempt_started"],
+        "no `closed`, even when its pane goes"
+    );
+
+    // A dispatch whose orchestration's first role came up before its unit
+    // was registered: its own `opened`, still held, is written.
+    let team = tracker
+        .dispatch_minted(None, "agent/dispatch-team", Path::new("/tmp/team"))
+        .unwrap();
+    let orch = tracker
+        .resolve_spawn(
+            Some(&team),
+            Some("o-1"),
+            Some(&orchestration("orch-cut", "orchestrator")),
+            None,
+        )
+        .kept()
+        .unwrap();
+    tracker.attempt_started(&orch, "2", Some("o-1"), Some("orchestrator"));
+    assert!(tracker.launch_interrupted(&team));
+    let read = lines(&tracker, state.path());
+    assert_eq!(kinds_of(&read, &team), ["opened"]);
+    assert_eq!(kinds_of(&read, &orch), ["opened", "attempt_started"]);
+
+    // Nothing started: nothing written, nothing kept.
+    let quiet = tracker
+        .dispatch_minted(None, "agent/dispatch-quiet", Path::new("/tmp/quiet"))
+        .unwrap();
+    assert!(!tracker.launch_interrupted(&quiet));
+    assert!(kinds_of(&lines(&tracker, state.path()), &quiet).is_empty());
+    let sizes = tracker.book_sizes();
+    assert_eq!((sizes.launches, sizes.pending_units), (0, 0));
+}
+
 /// Qodo finding 1 (second round) on PR #2248: a `dispatch` with no caller
 /// spawns without registering a unit, so no unit's end can close its work.
 /// It closes with what it spawned instead: a single agent's pane, or the

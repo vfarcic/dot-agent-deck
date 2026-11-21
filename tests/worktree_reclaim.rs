@@ -1393,6 +1393,70 @@ fn worktree_reclaim_013_a_merged_pr_from_the_fork_the_branch_is_pushed_to_is_thi
     );
 }
 
+/// Scenario: A deck-owned, MERGED, clean worktree — one `reclaim --yes`
+/// would remove — holds, under a git-ignored `.worktrees/`, a linked worktree
+/// of an independent second repository with an unsaved file. Its own
+/// repository's `git worktree list` does not know that one, and `git status`
+/// does not see it. `worktree reclaim --yes` keeps the worktree, says it holds
+/// other worktrees naming the nested one, and the nested worktree and its file
+/// survive.
+#[spec("worktree/reclaim/014")]
+#[test]
+#[cfg(unix)]
+fn worktree_reclaim_014_a_worktree_holding_another_repositorys_worktree_is_kept() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree_with_commit("wt-holder", "feat/holder");
+    fx.set_pr_state("feat/holder", "MERGED");
+    fx.mark_owned(&wt);
+    let exclude = fx.repo.join(".git").join("info").join("exclude");
+    std::fs::create_dir_all(exclude.parent().unwrap()).expect("info dir");
+    let mut patterns = std::fs::read_to_string(&exclude).unwrap_or_default();
+    patterns.push_str("\n.worktrees/\n");
+    std::fs::write(&exclude, patterns).expect("write exclude");
+
+    let other = fx._scratch.path().join("other-repo");
+    std::fs::create_dir_all(&other).expect("create the other repo");
+    git(&other, &["init", "--initial-branch=main", "--quiet"]);
+    git(
+        &other,
+        &["commit", "--quiet", "--allow-empty", "-m", "other"],
+    );
+    let child = wt.join(".worktrees").join("other-child");
+    git(
+        &other,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "other-child",
+            &child.to_string_lossy(),
+        ],
+    );
+    std::fs::write(child.join("unsaved.txt"), "keep me\n").expect("write the unsaved file");
+
+    let entry = verdict_entry(&fx, "wt-holder");
+    assert_eq!(entry["verdict"], "keep", "{entry}");
+
+    let out = fx.run(&["worktree", "reclaim", "--yes"]);
+    let text = combined(&out);
+    assert!(
+        wt.is_dir(),
+        "a worktree holding another repository's worktree must be kept:\n{text}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(child.join("unsaved.txt"))
+            .ok()
+            .as_deref(),
+        Some("keep me\n"),
+        "the nested worktree's unsaved file survives:\n{text}"
+    );
+    assert!(
+        text.contains("holds other worktrees") && text.contains("other-child"),
+        "the report says why, naming the nested worktree:\n{text}"
+    );
+}
+
 /// The `worktree list --json` entry whose `path` contains `needle`, panicking
 /// with the whole document when it is absent — used by `011` to take the same
 /// measurement twice, before and after the marker is truncated, and by `012`
