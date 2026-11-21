@@ -115,6 +115,542 @@ pub(crate) struct OpenCodeHookInput {
     _extra: HashMap<String, Value>,
 }
 
+/// PRD #211: the stdin JSON of an Antigravity CLI (`agy`) hook. Its fields are
+/// camelCase, and every one is lenient for the reason
+/// [`ClaudeCodeHookInput::source`] gives: a strange shape costs that field,
+/// never the event. Measured on `agy` 1.5.9 (`tests/fixtures/antigravity/`).
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AntigravityHookInput {
+    #[serde(default, deserialize_with = "lenient_string")]
+    hook_event_name: Option<String>,
+    #[serde(default, deserialize_with = "lenient_string")]
+    conversation_id: Option<String>,
+    #[serde(default, deserialize_with = "lenient_string")]
+    cwd: Option<String>,
+    /// The user's prompt of the turn, on every event of it.
+    #[serde(default, deserialize_with = "lenient_string")]
+    last_user_input: Option<String>,
+    /// `PreInvocation`'s 0-based model call within the turn's loop.
+    #[serde(default)]
+    invocation_num: Option<Value>,
+    /// `PreToolUse` / `PostToolUse`: `{id, name, args}`.
+    #[serde(default, deserialize_with = "lenient_object")]
+    tool_call: Option<Value>,
+    /// `Stop`: `NO_TOOL_CALL` for an ordinary turn end, `ERROR` for a failed
+    /// model request.
+    #[serde(default, deserialize_with = "lenient_string")]
+    termination_reason: Option<String>,
+    /// `Stop` with `ERROR`: what failed. Empty on a `PostToolUse` that
+    /// succeeded.
+    #[serde(default, deserialize_with = "lenient_string")]
+    error: Option<String>,
+}
+
+/// PRD #211: an Antigravity hook payload as the [`AgentEvent`] the deck
+/// ingests, through the shared Claude-shaped builder. `None` for an event
+/// that moves no card:
+///
+/// - `SessionStart` (fired with the first prompt of a conversation) →
+///   `SessionStart`;
+/// - `PreInvocation` → the turn's `Thinking`, as every agent's prompt is,
+///   carrying `lastUserInput` as the prompt on its first model call
+///   (`invocationNum` 0) only, so a later call in the same turn records no
+///   second prompt;
+/// - `PreToolUse` / `PostToolUse` → `ToolStart` / `ToolEnd`;
+/// - `Stop` → `Idle`, or `Error` carrying its `error` text as the card's
+///   [`crate::event::STATUS_REASON_METADATA_KEY`] when `terminationReason` is
+///   `ERROR`;
+/// - `PostInvocation` and anything else → nothing.
+fn antigravity_hook_event(input: &str) -> Option<AgentEvent> {
+    let payload: AntigravityHookInput = serde_json::from_str(input).ok()?;
+    let session_id = payload.conversation_id.filter(|id| !id.is_empty())?;
+    let tool_call = payload.tool_call.as_ref();
+    let tool = |key: &str| {
+        tool_call
+            .and_then(|call| call.get(key))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    let (hook_event_name, prompt) = match payload.hook_event_name.as_deref()? {
+        "SessionStart" => ("SessionStart", None),
+        "PreInvocation" => {
+            let first = payload
+                .invocation_num
+                .as_ref()
+                .and_then(Value::as_u64)
+                .is_none_or(|n| n == 0);
+            (
+                "UserPromptSubmit",
+                payload.last_user_input.filter(|_| first),
+            )
+        }
+        "PreToolUse" => ("PreToolUse", None),
+        "PostToolUse" => ("PostToolUse", None),
+        "Stop" if payload.termination_reason.as_deref() == Some("ERROR") => ("StopFailure", None),
+        "Stop" => ("Stop", None),
+        _ => return None,
+    };
+    let tool_events = matches!(hook_event_name, "PreToolUse" | "PostToolUse");
+    let reason = (hook_event_name == "StopFailure")
+        .then(|| {
+            payload
+                .error
+                .as_deref()
+                .map(crate::status_osc::clean_message)
+        })
+        .flatten()
+        .filter(|reason| !reason.is_empty());
+    let mut event = build_event_typed_with_version(
+        ClaudeCodeHookInput {
+            session_id,
+            hook_event_name: hook_event_name.to_string(),
+            cwd: payload.cwd,
+            tool_name: tool_events.then(|| tool("name")).flatten(),
+            tool_input: tool_events
+                .then(|| tool_call.and_then(|call| call.get("args")).cloned())
+                .flatten(),
+            tool_use_id: tool_events.then(|| tool("id")).flatten(),
+            prompt,
+            ..Default::default()
+        },
+        AgentType::Antigravity,
+        &|| None,
+    )?;
+    if let Some(reason) = reason {
+        event
+            .metadata
+            .insert(crate::event::STATUS_REASON_METADATA_KEY.to_string(), reason);
+    }
+    // Audit (CWE-345/451): what the call acts on, unaltered, for the daemon
+    // to bind and authorize a permission prompt from.
+    if tool_events
+        && let Some(subject) = antigravity_tool_subject(tool_call)
+        && subject.len() <= crate::event::TOOL_SUBJECT_MAX_BYTES
+    {
+        event.metadata.insert(
+            crate::event::TOOL_SUBJECT_METADATA_KEY.to_string(),
+            subject.to_string(),
+        );
+    }
+    Some(event)
+}
+
+/// PRD #211: what an Antigravity tool call acts on, as its payload gave it:
+/// `run_command`'s `CommandLine`, `write_file`'s `Path`. `None` for any other
+/// tool, whose permission menu was not measured.
+fn antigravity_tool_subject(tool_call: Option<&Value>) -> Option<&str> {
+    let call = tool_call?;
+    let arg = match call.get("name").and_then(Value::as_str)? {
+        "run_command" => "CommandLine",
+        "write_file" => "Path",
+        _ => return None,
+    };
+    call.get("args")?.get(arg)?.as_str()
+}
+
+/// PRD #211: what an Antigravity hook prints. `agy` wants a JSON object from
+/// every hook that exits 0; `{"decision":"allow"}` on `PreToolUse` defers to
+/// the next hook or `agy`'s own policy (measured: it does not suppress a
+/// permission prompt), and `{}` everywhere else changes nothing.
+fn antigravity_hook_output(input: &str) -> &'static str {
+    let event = serde_json::from_str::<Value>(input).ok();
+    match event
+        .as_ref()
+        .and_then(|payload| payload.get("hookEventName"))
+        .and_then(Value::as_str)
+    {
+        Some("PreToolUse") => r#"{"decision":"allow"}"#,
+        _ => "{}",
+    }
+}
+
+/// PRD #211: an Antigravity hook. Its hooks file is shared by the Antigravity
+/// App and IDE, so outside a deck pane this does nothing but answer. In one,
+/// it does the inbox's part ([`antigravity_inbox_hooks`]), prints the
+/// hand-over or the plain answer, and reports the event, its `SessionStart`'s
+/// announcement first on the same connection. A `Stop` whose hand-over went
+/// on with the turn reports nothing: the turn is not over, and the doorbell
+/// must not ring while `agy` works on what it was just given. It always exits
+/// 0: `agy` only logs a failing hook.
+fn handle_antigravity_hook() -> ExitCode {
+    let input = read_stdin().unwrap_or_default();
+    if crate::inbox_prompt::in_deck_pane()
+        && let Some(mut event) = antigravity_hook_event(&input)
+    {
+        let mut announce = None;
+        let mut answered = false;
+        let mut turn_goes_on = false;
+        if !crate::inbox_oneshot::stands_in_for_pre_inbox_hooks() {
+            match antigravity_inbox_hooks(&input, &mut event, &mut announce) {
+                AntigravityInbox::Nothing => {}
+                #[cfg(unix)]
+                AntigravityInbox::Print(output) => answered = output.print_handed(),
+                #[cfg(unix)]
+                AntigravityInbox::TurnEnd(injection) => {
+                    let ran = injection.print();
+                    answered = ran.handed_any();
+                    turn_goes_on = ran.continues_turn();
+                }
+            }
+        }
+        // PRD #211 (review): a turn that ended, and was not handed mail to go
+        // on with, carries its final reply for the deck's reading subscribers.
+        let reply = (!turn_goes_on)
+            .then(|| antigravity_turn_reply(&input))
+            .flatten();
+        let report = |announce: Option<String>, ingested: bool| {
+            // Issue #318: present this pane's hook capability token.
+            let token = crate::hook_provenance::token_from_env();
+            if let Ok(json) = crate::event::agent_event_line(&event, token.as_deref())
+                .and_then(|line| with_turn_reply(line, reply.as_ref()))
+            {
+                let _ = match announce {
+                    Some(announce) => send_lines_and_drain(&format!("{announce}\n{json}")),
+                    None if ingested => send_lines_and_drain(&json),
+                    None => send_to_socket(&json),
+                };
+            }
+        };
+        // A `PreToolUse` is reported before `agy` has its answer, and the
+        // answer waits until the daemon has ingested it — it closes the
+        // connection once the line is handled, within `SIGNAL_ACK_TIMEOUT` —
+        // so the call is the daemon's before the permission prompt `agy`
+        // raises for it once it has its answer (second review, finding 2: its
+        // OSC 7501 signal is bound to that call).
+        let report_first = event.event_type == crate::event::EventType::ToolStart;
+        if report_first && !turn_goes_on {
+            report(announce.take(), true);
+        }
+        if !answered {
+            print_antigravity_answer(&input);
+        }
+        if !report_first && !turn_goes_on {
+            report(announce, false);
+        }
+        return ExitCode::SUCCESS;
+    }
+    print_antigravity_answer(&input);
+    ExitCode::SUCCESS
+}
+
+/// PRD #211 (review): how much of the end of `agy`'s transcript the hook reads
+/// for a turn's reply. The reply is the last line, and one longer than this is
+/// not read: the deck keeps at most
+/// [`crate::daemon_protocol::MAX_TURN_REPLY_BYTES`] of it, and the file grows
+/// with the whole conversation.
+const ANTIGRAVITY_TRANSCRIPT_TAIL_BYTES: u64 = 256 * 1024;
+
+/// PRD #211 (review): the final reply of the Antigravity turn `input` ends,
+/// for the deck's reading subscribers. Only a `Stop` that ended the turn
+/// normally (`NO_TOOL_CALL`) ends one; the caller asks only for a `Stop` that
+/// was not handed mail to go on with. `agy`'s payload carries no reply, but its
+/// transcript (`transcriptPath`, `transcript_full.jsonl`) already holds the
+/// turn's last step when `Stop` runs, measured on `agy` 1.5.9: one JSON object
+/// per line, the reply being a `"source":"MODEL"`, `"type":"PLANNER_RESPONSE"`
+/// step whose `content` is its text. `None` when the transcript cannot say:
+/// not `agy`'s own transcript of this conversation
+/// ([`antigravity_transcript_of`]), unreadable, its last line not such a step
+/// (a tool call, a system message), or longer than
+/// [`ANTIGRAVITY_TRANSCRIPT_TAIL_BYTES`].
+fn antigravity_turn_reply(input: &str) -> Option<crate::daemon_protocol::FinalReply> {
+    let home = std::env::var_os("HOME")?;
+    antigravity_turn_reply_in(input, std::path::Path::new(&home))
+}
+
+/// [`antigravity_turn_reply`] for a user whose home is `home`.
+fn antigravity_turn_reply_in(
+    input: &str,
+    home: &std::path::Path,
+) -> Option<crate::daemon_protocol::FinalReply> {
+    let payload: Value = serde_json::from_str(input).ok()?;
+    if payload.get("hookEventName").and_then(Value::as_str) != Some("Stop")
+        || payload.get("terminationReason").and_then(Value::as_str) != Some("NO_TOOL_CALL")
+    {
+        return None;
+    }
+    let file = antigravity_transcript_of(
+        home,
+        payload.get("conversationId")?.as_str()?,
+        payload.get("transcriptPath")?.as_str()?,
+    )?;
+    let text = antigravity_transcript_reply(&last_line_of(file)?)?;
+    Some(crate::turn_reply::normalize(
+        crate::daemon_protocol::FinalReply {
+            turn_id: None,
+            text,
+            failed: false,
+        },
+    ))
+}
+
+/// PRD #211 (second review, finding 7; audit B2, S2): where `agy` keeps a
+/// conversation's full transcript, under the user's home, as measured on
+/// 1.5.9: `.gemini/antigravity-cli/brain/<conversationId>/` then these.
+const ANTIGRAVITY_TRANSCRIPT_LAYOUT: [&str; 4] = [".gemini", "antigravity-cli", "brain", ""];
+const ANTIGRAVITY_TRANSCRIPT_TAIL: [&str; 3] =
+    [".system_generated", "logs", "transcript_full.jsonl"];
+
+/// PRD #211 (second review, finding 7; audit B2, S2): the transcript `agy`
+/// keeps of conversation `conversation`, opened for reading, when `path` —
+/// the payload's `transcriptPath` — names exactly that file under `home`:
+/// `<home>/.gemini/antigravity-cli/brain/<conversation>/.system_generated/
+/// logs/transcript_full.jsonl`, written as an absolute path with no `.` or
+/// `..`. Every directory below `home` and the file itself are opened one by
+/// one relative to the one before, refusing a symbolic link at each step, and
+/// the file without blocking: it must be a regular file, so a named pipe
+/// there cannot hold the hook. `None` otherwise, and on any platform without
+/// those opens.
+#[cfg(unix)]
+fn antigravity_transcript_of(
+    home: &std::path::Path,
+    conversation: &str,
+    path: &str,
+) -> Option<std::fs::File> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    use std::os::unix::ffi::OsStrExt as _;
+    let well_formed = !conversation.is_empty()
+        && conversation.len() <= 128
+        && conversation
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if !well_formed || !home.is_absolute() {
+        return None;
+    }
+    let components: Vec<&str> = ANTIGRAVITY_TRANSCRIPT_LAYOUT
+        .iter()
+        .map(|part| if part.is_empty() { conversation } else { part })
+        .chain(ANTIGRAVITY_TRANSCRIPT_TAIL)
+        .collect();
+    let mut expected = home.to_path_buf();
+    expected.extend(&components);
+    if std::path::Path::new(path) != expected
+        || std::path::Path::new(path).components().any(|c| {
+            !matches!(
+                c,
+                std::path::Component::RootDir | std::path::Component::Normal(_)
+            )
+        })
+    {
+        return None;
+    }
+    let open_at = |dir: Option<&OwnedFd>, name: &std::ffi::OsStr, flags| -> Option<OwnedFd> {
+        let name = std::ffi::CString::new(name.as_bytes()).ok()?;
+        let at = dir.map_or(libc::AT_FDCWD, |dir| dir.as_raw_fd());
+        // SAFETY: `name` is a NUL-terminated string that outlives the call,
+        // and `at` is a descriptor this function owns or `AT_FDCWD`.
+        let fd = unsafe { libc::openat(at, name.as_ptr(), flags | libc::O_CLOEXEC) };
+        // SAFETY: a descriptor `openat` just returned, owned by nothing else.
+        (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) })
+    };
+    // The home directory itself may be reached through a link (`/home` on
+    // some systems is one); nothing below it may.
+    let mut dir = open_at(None, home.as_os_str(), libc::O_RDONLY | libc::O_DIRECTORY)?;
+    let (file_name, dirs) = components.split_last()?;
+    for part in dirs {
+        dir = open_at(
+            Some(&dir),
+            std::ffi::OsStr::new(part),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+        )?;
+    }
+    let file = open_at(
+        Some(&dir),
+        std::ffi::OsStr::new(file_name),
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+    )?;
+    let file = std::fs::File::from(file);
+    file.metadata().ok()?.is_file().then_some(file)
+}
+
+#[cfg(not(unix))]
+fn antigravity_transcript_of(
+    _home: &std::path::Path,
+    _conversation: &str,
+    _path: &str,
+) -> Option<std::fs::File> {
+    None
+}
+
+/// The last non-empty line of `file`, a regular file, read from at most its
+/// last [`ANTIGRAVITY_TRANSCRIPT_TAIL_BYTES`]; `None` when that tail holds no
+/// whole line.
+fn last_line_of(mut file: std::fs::File) -> Option<String> {
+    use std::io::{Read as _, Seek as _};
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let start = metadata
+        .len()
+        .saturating_sub(ANTIGRAVITY_TRANSCRIPT_TAIL_BYTES);
+    file.seek(std::io::SeekFrom::Start(start)).ok()?;
+    let mut tail = Vec::new();
+    file.take(ANTIGRAVITY_TRANSCRIPT_TAIL_BYTES)
+        .read_to_end(&mut tail)
+        .ok()?;
+    let tail = String::from_utf8_lossy(&tail);
+    let trimmed = tail.trim_end_matches(['\n', '\r']);
+    let line = match trimmed.rfind('\n') {
+        Some(at) => &trimmed[at + 1..],
+        // The whole tail is one line: whole only if it is the whole file.
+        None if start == 0 => trimmed,
+        None => return None,
+    };
+    (!line.trim().is_empty()).then(|| line.to_owned())
+}
+
+/// The reply one `agy` transcript line records, when it is the model's final
+/// response: `"source":"MODEL"`, `"type":"PLANNER_RESPONSE"`, no tool calls,
+/// and its `content` text (empty when it has none, a turn that ended with
+/// nothing to read).
+fn antigravity_transcript_reply(line: &str) -> Option<String> {
+    let step: Value = serde_json::from_str(line).ok()?;
+    if step.get("source").and_then(Value::as_str) != Some("MODEL")
+        || step.get("type").and_then(Value::as_str) != Some("PLANNER_RESPONSE")
+        || step
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .is_some_and(|calls| !calls.is_empty())
+    {
+        return None;
+    }
+    Some(
+        step.get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+    )
+}
+
+/// [`antigravity_hook_output`] on stdout.
+fn print_antigravity_answer(input: &str) {
+    let mut out = std::io::stdout();
+    let _ = writeln!(out, "{}", antigravity_hook_output(input));
+    let _ = out.flush();
+}
+
+/// What the deck's Antigravity hook does for the inbox with one payload.
+enum AntigravityInbox {
+    Nothing,
+    /// Print this doorbell answer, then report the event as usual.
+    #[cfg(unix)]
+    Print(Box<HookOutput>),
+    /// Hand this over as the `Stop`'s continue; one written and flushed whole
+    /// goes on with the turn and reports nothing.
+    #[cfg(unix)]
+    TurnEnd(crate::inbox_prompt::OneShotInjection),
+}
+
+/// PRD #211: Antigravity's side of the inbox, for one hook payload in a deck
+/// pane, on Codex's model ([`codex_inbox_hooks`]): an idle `agy` is woken by
+/// the doorbell, and its hooks, not its model, take the messages for it.
+///
+/// - `SessionStart`, which `agy` fires with the first prompt of a
+///   conversation, queues an `inbox_announce` `TurnEnd` line, sent ahead of
+///   the status event.
+/// - `PreInvocation` on the turn's first model call (`invocationNum` 0)
+///   answers a doorbell line in `lastUserInput` with the waiting content as
+///   an injected system message ([`deck_prompt_submit`],
+///   [`crate::inbox_prompt::Envelope::Inject`]). A later call of the same
+///   turn carries the same `lastUserInput`, including the call a `Stop`
+///   continue starts, and hands nothing over again.
+/// - `Stop` that ended the turn normally (`NO_TOOL_CALL`) hands over what is
+///   waiting as `{"decision":"continue","reason":…}`, so `agy` goes on with
+///   it. One that ended in an `ERROR` hands over nothing: the mail stays
+///   queued for the next turn's end or the doorbell. Neither does one at
+///   `agy`'s continue cap ([`antigravity_stop_may_continue`]): `agy` would
+///   ignore that continue, so the turn ends Idle and the doorbell delivers.
+///
+/// Both hand-overs are one-shot receipt receivers under
+/// [`crate::event::InboxComponent::AntigravityHooks`], headed by
+/// [`crate::inbox_hub::AGENT_FRAMING`], their whole JSON within its byte
+/// budget. A daemon older than that component refuses them, and the hook
+/// then prints its plain answer: nothing is handed over there. Unix only, as
+/// Claude Code's and Codex's are.
+fn antigravity_inbox_hooks(
+    input: &str,
+    event: &mut AgentEvent,
+    announce: &mut Option<String>,
+) -> AntigravityInbox {
+    let Ok(payload) = serde_json::from_str::<Value>(input) else {
+        return AntigravityInbox::Nothing;
+    };
+    #[cfg(not(unix))]
+    let _ = event;
+    match payload.get("hookEventName").and_then(Value::as_str) {
+        Some("SessionStart") => {
+            *announce = inbox_announce(
+                crate::event::InboxComponent::AntigravityHooks,
+                crate::event::InboxWake::TurnEnd,
+            );
+            AntigravityInbox::Nothing
+        }
+        #[cfg(unix)]
+        Some("PreInvocation") => {
+            let first_call = payload
+                .get("invocationNum")
+                .is_none_or(|n| n.as_u64() == Some(0));
+            payload
+                .get("lastUserInput")
+                .and_then(Value::as_str)
+                .filter(|_| first_call)
+                .and_then(|prompt| {
+                    deck_prompt_submit(
+                        prompt,
+                        crate::event::InboxComponent::AntigravityHooks,
+                        crate::inbox_hub::AGENT_FRAMING,
+                        &crate::inbox_prompt::Envelope::Inject,
+                        event,
+                        // No transcript witness reads Antigravity's session:
+                        // its prompt hook commits what it wrote, as Codex's
+                        // does.
+                        None,
+                    )
+                })
+                .map_or(AntigravityInbox::Nothing, |output| {
+                    AntigravityInbox::Print(Box::new(output))
+                })
+        }
+        #[cfg(unix)]
+        Some("Stop") if antigravity_stop_may_continue(&payload) => {
+            crate::inbox_prompt::one_shot_injection(
+                crate::inbox_prompt::HookHandOver {
+                    component: crate::event::InboxComponent::AntigravityHooks,
+                    consumer: crate::event::InboxFetchConsumer::TurnEndHook,
+                    rung: None,
+                    ring: None,
+                    envelope: &crate::inbox_prompt::Envelope::Continue,
+                    framing: crate::inbox_hub::AGENT_FRAMING,
+                },
+                std::time::Instant::now() + crate::inbox_prompt::prompt_receipts_wait(),
+            )
+            .map_or(AntigravityInbox::Nothing, AntigravityInbox::TurnEnd)
+        }
+        _ => AntigravityInbox::Nothing,
+    }
+}
+
+/// PRD #211: how many `Stop` continues in a row `agy` honours. Measured on
+/// `agy` 1.5.9: it fires `Stop` with `executionNum` 0 through 10 and acts on a
+/// continue from the first ten, but ignores the one the eleventh returns and
+/// ends the turn.
+pub(crate) const ANTIGRAVITY_STOP_CONTINUE_CAP: u64 = 10;
+
+/// PRD #211: whether a `Stop` may hand over the mail waiting for its pane as
+/// a continue. Only an ordinary turn end (`NO_TOOL_CALL`) whose continue
+/// `agy` will still act on may: past [`ANTIGRAVITY_STOP_CONTINUE_CAP`] the
+/// mail would be acknowledged and then discarded, so it stays queued and the
+/// turn ends Idle, where the doorbell delivers it in a fresh turn. A `Stop`
+/// with no `executionNum` is the first of its turn.
+fn antigravity_stop_may_continue(payload: &Value) -> bool {
+    payload.get("terminationReason").and_then(Value::as_str) == Some("NO_TOOL_CALL")
+        && payload
+            .get("executionNum")
+            .and_then(Value::as_u64)
+            .is_none_or(|n| n < ANTIGRAVITY_STOP_CONTINUE_CAP)
+}
+
 /// [`lenient_string`] for a JSON object: anything else is `None`.
 fn lenient_object<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
     Ok(Option::<Value>::deserialize(d)?.filter(Value::is_object))
@@ -171,6 +707,9 @@ pub(crate) fn hook_payload_event(agent: &str, input: &str) -> Option<AgentEvent>
                 question_agent_version(&AgentType::Devin)
             })
         }
+        // PRD #211: Antigravity's payloads are camelCase and name their own
+        // events; see [`antigravity_hook_event`].
+        "antigravity" => antigravity_hook_event(input),
         _ => {
             let hook_input: ClaudeCodeHookInput = serde_json::from_str(input).ok()?;
             build_event_typed_with_version(hook_input, AgentType::ClaudeCode, &|| {
@@ -291,6 +830,9 @@ fn question_version_line(program: &str) -> Option<String> {
 }
 
 pub fn handle_hook(agent: &str) -> ExitCode {
+    if agent == "antigravity" {
+        return handle_antigravity_hook();
+    }
     let input = match read_stdin() {
         Some(s) if !s.is_empty() => s,
         _ => return ExitCode::SUCCESS,
@@ -499,6 +1041,9 @@ fn claude_inbox_hooks(
                 prompt,
                 crate::event::InboxComponent::ClaudeHooks,
                 crate::inbox_hub::SESSION_FRAMING,
+                &crate::inbox_prompt::Envelope::Context {
+                    hook_event_name: "UserPromptSubmit".to_string(),
+                },
                 event,
                 mark.clone(),
             );
@@ -566,6 +1111,20 @@ impl HookOutput {
             #[cfg(unix)]
             witness: None,
         }
+    }
+
+    /// Write the output, as [`Self::print`] does, and say whether any of it
+    /// was written: a one-shot hand-over whose blocks its fence refused whole
+    /// writes nothing at all.
+    #[cfg(unix)]
+    fn print_handed(self) -> bool {
+        if let Some(one_shot) = self.one_shot {
+            return one_shot.print().handed_any();
+        }
+        let mut out = std::io::stdout();
+        writeln!(out, "{}", self.stdout)
+            .and_then(|()| out.flush())
+            .is_ok()
     }
 
     /// Write the output. A one-shot hand-over commits what it wrote in full,
@@ -694,6 +1253,9 @@ fn codex_inbox_hooks(
                     prompt,
                     crate::event::InboxComponent::CodexHooks,
                     framing,
+                    &crate::inbox_prompt::Envelope::Context {
+                        hook_event_name: "UserPromptSubmit".to_string(),
+                    },
                     event,
                     crate::inbox_witness::TranscriptMark::of_payload(&payload),
                 )
@@ -735,9 +1297,11 @@ fn codex_inbox_hooks(
 }
 
 /// PRD #1666 S6: the `UserPromptSubmit` side of the inbox, agent-neutral so
-/// every agent whose hook accepts `hookSpecificOutput.additionalContext`
-/// shares it (Claude Code, and Codex since S7), each with its `component`'s
-/// budget and the `framing` that heads an injection. An ordinary prompt costs
+/// every agent whose prompt hook can hand the model text shares it (Claude
+/// Code, Codex since S7, Antigravity since PRD #211), each with its
+/// `component`'s budget, the `framing` that heads an injection and the
+/// `envelope` its hook prints it in (`hookSpecificOutput.additionalContext`
+/// for Claude Code and Codex, an injected system message for Antigravity). An ordinary prompt costs
 /// a local scan and no daemon call. A doorbell line fetches only while the
 /// message it names is queued.
 ///
@@ -749,6 +1313,7 @@ pub fn deck_prompt_submit(
     prompt: &str,
     component: crate::event::InboxComponent,
     framing: &str,
+    envelope: &crate::inbox_prompt::Envelope,
     event: &mut AgentEvent,
     transcript: Option<crate::inbox_witness::TranscriptMark>,
 ) -> Option<HookOutput> {
@@ -787,9 +1352,6 @@ pub fn deck_prompt_submit(
     }
     #[cfg(unix)]
     {
-        let envelope = crate::inbox_prompt::Envelope::Context {
-            hook_event_name: "UserPromptSubmit".to_string(),
-        };
         let ring = crate::inbox_prompt::ring_of(prompt);
         let injection = ids.rung.first().and_then(|rung| {
             crate::inbox_prompt::one_shot_injection(
@@ -798,7 +1360,7 @@ pub fn deck_prompt_submit(
                     consumer: crate::event::InboxFetchConsumer::DoorbellHook,
                     rung: Some(rung),
                     ring: ring.as_ref(),
-                    envelope: &envelope,
+                    envelope,
                     framing,
                 },
                 receipts_by,
@@ -823,7 +1385,7 @@ pub fn deck_prompt_submit(
     // doorbell does not deliver to Claude Code or Codex on Windows yet.
     #[cfg(not(unix))]
     {
-        let _ = (component, framing, witness);
+        let _ = (component, framing, envelope, witness);
         crate::inbox_prompt::mark_event(event, &ids, &[]);
         None
     }
@@ -1698,6 +2260,30 @@ fn extract_tool_detail(tool_name: Option<&str>, tool_input: Option<&Value>) -> O
         // the tool NAME is documented, so a shape we guessed wrong must still
         // yield a useful detail rather than none. Devin's other tools (`read`,
         // `edit`, `grep`, …) are left to the generic branch for the same reason.
+        // PRD #211: Antigravity's tools, as measured on `agy` 1.5.9
+        // (`run_command {CommandLine}`, `write_file` / `read_file {Path}`) and
+        // as its docs name the others. An unexpected shape falls through to
+        // the first string, as `exec` does.
+        "run_command"
+        | "write_file"
+        | "read_file"
+        | "view_file"
+        | "write_to_file"
+        | "replace_file_content"
+        | "multi_replace_file_content"
+        | "grep_search" => {
+            let key = match tool_name? {
+                "run_command" => "CommandLine",
+                "write_file" | "read_file" => "Path",
+                "view_file" => "AbsolutePath",
+                "grep_search" => "Query",
+                _ => "TargetFile",
+            };
+            match input.get(key).and_then(|v| v.as_str()) {
+                Some(value) => truncate(value.lines().next().unwrap_or(value), 120),
+                None => truncate(input.values().find_map(|v| v.as_str())?, 80),
+            }
+        }
         "exec" => match input.get("command").and_then(|v| v.as_str()) {
             Some(cmd) => truncate(cmd.lines().next().unwrap_or(cmd), 120),
             None => truncate(input.values().find_map(|v| v.as_str())?, 80),
@@ -2273,6 +2859,11 @@ fn map_opencode_event_type(event: &str, status: Option<&str>) -> Option<EventTyp
         "session.idle" => Some(EventType::Idle),
         "session.error" => Some(EventType::Error),
         "session.prompt" => Some(EventType::Thinking),
+        // PRD #82: the deck's plugin reports a compaction starting, before the
+        // summary is written: 2.x's `session.compaction.started`, 1.x's
+        // `compaction` message part (`crate::opencode_manage`). Read as Claude
+        // Code's `PreCompact` is.
+        "session.compacting" => Some(EventType::Compacting),
         "session.status" | "session.status.updated" => {
             let norm = status.map(|s| s.to_ascii_lowercase());
             match norm.as_deref() {
@@ -3928,6 +4519,377 @@ mod tests {
     use super::*;
     use spec::spec;
 
+    /// PRD #211: a captured Antigravity hook payload.
+    fn agy(name: &str) -> String {
+        std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/antigravity")
+                .join(name),
+        )
+        .unwrap()
+    }
+
+    /// PRD #211 (audit, CWE-345/451): a command or file-write call carries
+    /// what it acts on unaltered, for the daemon to bind the permission prompt
+    /// to; a subject longer than the bound is left out.
+    #[test]
+    fn antigravity_tool_calls_carry_their_original_subject() {
+        let subject = |input: &str| {
+            hook_payload_event("antigravity", input)
+                .unwrap()
+                .metadata
+                .get(crate::event::TOOL_SUBJECT_METADATA_KEY)
+                .cloned()
+        };
+        assert_eq!(
+            subject(&agy("pre-tool-use-run-command.json")).as_deref(),
+            Some("echo agy-probe-1")
+        );
+        assert_eq!(
+            subject(&agy("pre-tool-use-write-file.json")).as_deref(),
+            Some("/home/user/project/probe.txt")
+        );
+        let mut multi: Value = serde_json::from_str(&agy("pre-tool-use-run-command.json")).unwrap();
+        multi["toolCall"]["args"]["CommandLine"] = "echo a\nrm -rf ./b".into();
+        assert_eq!(
+            subject(&multi.to_string()).as_deref(),
+            Some("echo a\nrm -rf ./b")
+        );
+        multi["toolCall"]["args"]["CommandLine"] =
+            "x".repeat(crate::event::TOOL_SUBJECT_MAX_BYTES + 1).into();
+        assert_eq!(subject(&multi.to_string()), None);
+        multi["toolCall"]["name"] = "web_fetch".into();
+        assert_eq!(subject(&multi.to_string()), None);
+    }
+
+    #[test]
+    fn antigravity_hooks_map_to_the_events_a_card_reads() {
+        let event = |name: &str| hook_payload_event("antigravity", &agy(name));
+
+        let start = event("session-start.json").expect("SessionStart");
+        assert_eq!(start.event_type, EventType::SessionStart);
+        assert_eq!(start.agent_type, AgentType::Antigravity);
+        assert_eq!(start.session_id, "00000000-0000-4000-8000-000000000001");
+
+        let prompt = event("pre-invocation.json").expect("first model call");
+        assert_eq!(prompt.event_type, EventType::Thinking);
+        assert!(
+            prompt
+                .user_prompt
+                .as_deref()
+                .is_some_and(|p| p.starts_with("Run the shell command:")),
+            "{prompt:?}"
+        );
+        // A later model call of the same loop records no second prompt.
+        let again = event("pre-invocation-after-continue.json").expect("re-entered loop");
+        assert_eq!(again.event_type, EventType::Thinking);
+        assert_eq!(again.user_prompt, None);
+
+        let tool = event("pre-tool-use-run-command.json").expect("PreToolUse");
+        assert_eq!(tool.event_type, EventType::ToolStart);
+        assert_eq!(tool.tool_name.as_deref(), Some("run_command"));
+        assert_eq!(tool.tool_detail.as_deref(), Some("echo agy-probe-1"));
+        assert!(tool.metadata.contains_key("tool_use_id"));
+        let write = event("pre-tool-use-write-file.json").expect("PreToolUse");
+        assert_eq!(write.tool_name.as_deref(), Some("write_file"));
+        assert_eq!(
+            write.tool_detail.as_deref(),
+            Some("/home/user/project/probe.txt")
+        );
+        let ended = event("post-tool-use-run-command.json").expect("PostToolUse");
+        assert_eq!(ended.event_type, EventType::ToolEnd);
+        assert_eq!(ended.tool_name.as_deref(), Some("run_command"));
+
+        let stop = event("stop.json").expect("Stop");
+        assert_eq!(stop.event_type, EventType::Idle);
+        assert!(
+            !stop
+                .metadata
+                .contains_key(crate::event::STATUS_REASON_METADATA_KEY)
+        );
+        let failed = event("stop-error.json").expect("Stop ERROR");
+        assert_eq!(failed.event_type, EventType::Error);
+        assert!(
+            failed.metadata[crate::event::STATUS_REASON_METADATA_KEY]
+                .starts_with("generating and executing:"),
+            "{failed:?}"
+        );
+
+        assert!(event("post-invocation.json").is_none());
+        assert!(hook_payload_event("antigravity", "{\"hookEventName\":\"Stop\"}").is_none());
+        assert!(hook_payload_event("antigravity", "not json").is_none());
+    }
+
+    #[test]
+    fn antigravity_hooks_answer_with_a_json_object() {
+        assert_eq!(
+            antigravity_hook_output(&agy("pre-tool-use-run-command.json")),
+            r#"{"decision":"allow"}"#
+        );
+        for name in ["session-start.json", "pre-invocation.json", "stop.json"] {
+            assert_eq!(antigravity_hook_output(&agy(name)), "{}");
+        }
+        assert_eq!(antigravity_hook_output(""), "{}");
+    }
+
+    /// PRD #211 (review): a finished Antigravity turn's reply is the last
+    /// step of its transcript, as measured on `agy` 1.5.9: after a tool call,
+    /// and after a `Stop` continue the turn went on with. A turn whose
+    /// transcript does not end in the model's reply, an `ERROR` turn, and a
+    /// transcript that is not one, claim no reply.
+    #[test]
+    fn antigravity_turn_reply_is_the_transcripts_last_model_response() {
+        let home = tempfile::tempdir().unwrap();
+        let conversation = "00000000-0000-4000-8000-000000000001";
+        let logs = agy_transcript_dir(home.path(), conversation);
+        let transcript = logs.join("transcript_full.jsonl");
+        let stop = |base: &str| agy_stop_naming(base, conversation, &transcript);
+        let reply_of = |input: &str| antigravity_turn_reply_in(input, home.path());
+        let write = |body: &str| std::fs::write(&transcript, body).unwrap();
+        write(&agy("transcript-full-tool-turn.jsonl"));
+        let reply = reply_of(&stop("stop.json")).expect("a reply");
+        assert_eq!(
+            reply.text,
+            "The command successfully printed `agy-probe-77`, DONE-77."
+        );
+        assert!(!reply.failed);
+        write(&agy("transcript-full-after-continue.jsonl"));
+        assert_eq!(
+            reply_of(&stop("stop.json")).unwrap().text,
+            "CONTINUED-REPLY-8812",
+            "the reply is what the turn ended on, after its continue"
+        );
+        assert_eq!(
+            reply_of(&stop("stop-error.json")),
+            None,
+            "an ERROR Stop is not a finished turn"
+        );
+        assert_eq!(reply_of(&agy("pre-invocation.json")), None);
+
+        // The transcript ends on a tool call or a system message: no reply.
+        let lines: Vec<&str> = agy("transcript-full-tool-turn.jsonl")
+            .leak()
+            .lines()
+            .collect();
+        write(&lines[..2].join("\n"));
+        assert_eq!(reply_of(&stop("stop.json")), None);
+        let continued_lines: Vec<String> = agy("transcript-full-after-continue.jsonl")
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        write(&continued_lines[..5].join("\n"));
+        assert_eq!(reply_of(&stop("stop.json")), None);
+        // A partial final line, and a final line that is not UTF-8.
+        write(&format!(
+            "{}\n{{\"source\":\"MODEL\",\"type\":\"PLANN",
+            lines[5]
+        ));
+        assert_eq!(reply_of(&stop("stop.json")), None);
+        let mut invalid = format!("{}\n", lines[5]).into_bytes();
+        invalid.extend_from_slice(
+            b"{\"source\":\"MODEL\",\"type\":\"PLANNER_RESPONSE\",\"content\":\"\xff\xfe\"}\n",
+        );
+        std::fs::write(&transcript, &invalid).unwrap();
+        assert!(
+            reply_of(&stop("stop.json")).is_none_or(|reply| !reply.text.contains("DONE-77")),
+            "an invalid last line claims no earlier reply"
+        );
+        // Not there.
+        std::fs::remove_file(&transcript).unwrap();
+        assert_eq!(reply_of(&stop("stop.json")), None);
+        // A long conversation is read from its end only, and a last line
+        // longer than that tail claims nothing.
+        let filler = format!("{}\n", "x".repeat(1024));
+        let mut body = filler.repeat(1024);
+        body.push_str(lines[5]);
+        body.push('\n');
+        write(&body);
+        assert_eq!(
+            reply_of(&stop("stop.json")).unwrap().text,
+            "The command successfully printed `agy-probe-77`, DONE-77."
+        );
+        let huge = serde_json::json!({"source":"MODEL","type":"PLANNER_RESPONSE",
+            "content":"y".repeat(ANTIGRAVITY_TRANSCRIPT_TAIL_BYTES as usize)});
+        write(&format!("{filler}{huge}\n"));
+        assert_eq!(reply_of(&stop("stop.json")), None);
+    }
+
+    /// `<home>/.gemini/antigravity-cli/brain/<conversation>/.system_generated/logs`,
+    /// created.
+    fn agy_transcript_dir(home: &std::path::Path, conversation: &str) -> std::path::PathBuf {
+        let logs = home
+            .join(".gemini/antigravity-cli/brain")
+            .join(conversation)
+            .join(".system_generated/logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        logs
+    }
+
+    /// The `base` fixture's payload naming `conversation` and `transcript`.
+    fn agy_stop_naming(base: &str, conversation: &str, transcript: &std::path::Path) -> String {
+        let mut payload: Value = serde_json::from_str(&agy(base)).unwrap();
+        payload["conversationId"] = Value::from(conversation);
+        payload["transcriptPath"] = Value::from(transcript.to_str().unwrap());
+        payload.to_string()
+    }
+
+    /// Scenario: a `Stop` names a transcript that is not `agy`'s own file for
+    /// the payload's conversation — a link to a file elsewhere, a relative
+    /// path, one climbing out with `..`, another conversation's transcript, a
+    /// file outside the home's layout, or a directory on the way that is a
+    /// link — each holding a model reply. None of them is read as the turn's
+    /// reply.
+    #[cfg(unix)]
+    #[test]
+    fn antigravity_turn_reply_reads_only_agys_own_transcript() {
+        let home = tempfile::tempdir().unwrap();
+        let conversation = "00000000-0000-4000-8000-000000000001";
+        let logs = agy_transcript_dir(home.path(), conversation);
+        let own = logs.join("transcript_full.jsonl");
+        let body = agy("transcript-full-tool-turn.jsonl");
+        let reply_of = |transcript: &std::path::Path, conversation: &str| {
+            antigravity_turn_reply_in(
+                &agy_stop_naming("stop.json", conversation, transcript),
+                home.path(),
+            )
+        };
+        // The control: agy's own file is read.
+        std::fs::write(&own, &body).unwrap();
+        assert!(reply_of(&own, conversation).is_some());
+
+        // A link at the transcript's own name, to a file outside the layout.
+        let outside = home.path().join("outside.txt");
+        std::fs::write(&outside, &body).unwrap();
+        std::fs::remove_file(&own).unwrap();
+        std::os::unix::fs::symlink(&outside, &own).unwrap();
+        assert_eq!(reply_of(&own, conversation), None, "a linked transcript");
+        std::fs::remove_file(&own).unwrap();
+        std::fs::write(&own, &body).unwrap();
+
+        // Relative, and climbing with `..` to the same file.
+        let relative = own.strip_prefix("/").unwrap();
+        assert_eq!(reply_of(relative, conversation), None, "a relative path");
+        let climbing = logs.join("../logs/transcript_full.jsonl");
+        assert_eq!(reply_of(&climbing, conversation), None, "a path with ..");
+
+        // Another conversation's transcript, named by this one's payload.
+        let other = "00000000-0000-4000-8000-000000000002";
+        let other_file = agy_transcript_dir(home.path(), other).join("transcript_full.jsonl");
+        std::fs::write(&other_file, &body).unwrap();
+        assert_eq!(
+            reply_of(&other_file, conversation),
+            None,
+            "another conversation's"
+        );
+        // A conversation id that is not one component.
+        assert_eq!(
+            reply_of(&own, "../brain"),
+            None,
+            "a traversing conversation id"
+        );
+        // A file elsewhere under the home.
+        let stray = home.path().join("transcript_full.jsonl");
+        std::fs::write(&stray, &body).unwrap();
+        assert_eq!(reply_of(&stray, conversation), None, "outside agy's layout");
+
+        // A directory on the way that is a link to one elsewhere.
+        let elsewhere = home.path().join("elsewhere");
+        std::fs::create_dir_all(elsewhere.join(".system_generated/logs")).unwrap();
+        std::fs::write(
+            elsewhere.join(".system_generated/logs/transcript_full.jsonl"),
+            &body,
+        )
+        .unwrap();
+        let linked = "00000000-0000-4000-8000-000000000003";
+        std::os::unix::fs::symlink(
+            &elsewhere,
+            home.path()
+                .join(".gemini/antigravity-cli/brain")
+                .join(linked),
+        )
+        .unwrap();
+        let through_link = home
+            .path()
+            .join(".gemini/antigravity-cli/brain")
+            .join(linked)
+            .join(".system_generated/logs/transcript_full.jsonl");
+        assert_eq!(reply_of(&through_link, linked), None, "a linked directory");
+    }
+
+    /// Scenario: `agy`'s transcript path holds a named pipe with no writer.
+    /// The `Stop` hook's reply read gives up at once instead of waiting for a
+    /// writer, so the hook goes on to answer `agy`.
+    #[cfg(unix)]
+    #[test]
+    fn antigravity_turn_reply_does_not_wait_on_a_fifo() {
+        let home = tempfile::tempdir().unwrap();
+        let conversation = "00000000-0000-4000-8000-000000000001";
+        let fifo = agy_transcript_dir(home.path(), conversation).join("transcript_full.jsonl");
+        let name = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: a NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let input = agy_stop_naming("stop.json", conversation, &fifo);
+        let home_path = home.path().to_path_buf();
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(antigravity_turn_reply_in(&input, &home_path));
+        });
+        let reply = finished
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the reply read waited on a pipe with no writer");
+        assert_eq!(reply, None);
+    }
+
+    /// PRD #211: `agy` honours a `Stop` continue at `executionNum` 0–9 and
+    /// ignores the one returned at 10, so a `Stop` there takes no mail: the
+    /// hook prints its plain answer, the turn ends Idle, and the mail stays
+    /// queued for the doorbell's fresh turn.
+    #[test]
+    fn antigravity_stop_takes_no_mail_at_the_continue_cap() {
+        let stop = |patch: Value| {
+            let mut payload: Value = serde_json::from_str(&agy("stop.json")).unwrap();
+            payload.as_object_mut().unwrap().extend(
+                patch
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone())),
+            );
+            payload
+        };
+        for n in 0..ANTIGRAVITY_STOP_CONTINUE_CAP {
+            assert!(
+                antigravity_stop_may_continue(&stop(serde_json::json!({"executionNum": n}))),
+                "executionNum {n} still continues"
+            );
+        }
+        for n in [10, 11, 50] {
+            let payload = stop(serde_json::json!({"executionNum": n}));
+            assert!(
+                !antigravity_stop_may_continue(&payload),
+                "executionNum {n} is past agy's cap and must hand over nothing"
+            );
+            let mut event = hook_payload_event("antigravity", &payload.to_string()).unwrap();
+            assert_eq!(event.event_type, EventType::Idle, "the turn ends Idle");
+            let mut announce = None;
+            assert!(matches!(
+                antigravity_inbox_hooks(&payload.to_string(), &mut event, &mut announce),
+                AntigravityInbox::Nothing
+            ));
+            assert_eq!(
+                antigravity_hook_output(&payload.to_string()),
+                "{}",
+                "the plain answer, no continue"
+            );
+        }
+        assert!(antigravity_stop_may_continue(&stop(
+            serde_json::json!({"executionNum": null})
+        )));
+        assert!(!antigravity_stop_may_continue(
+            &serde_json::from_str(&agy("stop-error.json")).unwrap()
+        ));
+    }
+
     /// Issue #1182: what the pane's card, the desktop overview and the prompt
     /// history show for a seeded Claude agent. Before this they showed
     /// `<pasted_content id="239f">You a…` — the producer's wrapper, spending a
@@ -5552,6 +6514,16 @@ mod tests {
         assert_eq!(
             build_opencode_event(failed).unwrap().event_type,
             EventType::Error
+        );
+    }
+
+    /// PRD #82: the deck's OpenCode plugin reports a compaction starting as
+    /// `session.compacting`, which reads as Claude Code's `PreCompact` does.
+    #[test]
+    fn map_opencode_session_compacting() {
+        assert_eq!(
+            map_opencode_event_type("session.compacting", None),
+            Some(EventType::Compacting)
         );
     }
 
@@ -8714,6 +9686,7 @@ mod gated_send_tests {
             token: Some("tok".into()),
             command: Some("devbox run oc-big".into()),
             agent: Some("opencode".into()),
+            dir: None,
             timestamp: chrono::Utc::now(),
         }
     }

@@ -133,6 +133,7 @@ pub const ONE_SHOT_SENDERS: &[crate::event::InboxOneShotSender] = &[
     crate::event::InboxOneShotSender::ClaudeWaiter,
     crate::event::InboxOneShotSender::ClaudeHooks,
     crate::event::InboxOneShotSender::CodexHooks,
+    crate::event::InboxOneShotSender::AntigravityHooks,
     crate::event::InboxOneShotSender::Cli,
 ];
 
@@ -386,6 +387,17 @@ struct Waiter {
     tx: mpsc::Sender<WaiterSignal>,
 }
 
+/// Audit F3: an agent generation's pinned native receiver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PinnedReceiver {
+    /// The component process admitted as the receiver.
+    instance: u32,
+    /// Issue #2342: the foreground process whose conversation the receiver
+    /// serves: the Claude Code process whose background session `instance`
+    /// runs ([`ReceiptArm::background_origin`]), else `instance` itself.
+    origin: u32,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Announcement {
     wake: InboxWake,
@@ -405,7 +417,9 @@ pub struct DoorbellFacts {
     /// Live waiters armed for the agent.
     pub armed: usize,
     /// When the agent's component last announced `Native` wake-up, if that is
-    /// what it announced.
+    /// what it announced, or, if later, when a once-waiter of it was last
+    /// issued a batch: that waiter's wake is on its way, and a ring typed
+    /// while Claude takes it up is left in its composer (issue #2133).
     pub native_announced_at: Option<Instant>,
     /// PRD #1666 §11: the generation's integration is incompatible, so its
     /// doorbell stays silent: no fetch could hand it anything.
@@ -517,9 +531,15 @@ struct HubState {
     /// Oldest first, so the newest is `last()`.
     waiters: HashMap<AgentKey, Vec<Waiter>>,
     announced: HashMap<AgentKey, Announcement>,
+    /// Issue #2133: when a once-waiter of the generation was last issued a
+    /// batch. Its wake is on its way, so it holds the doorbell for the arm
+    /// grace as an announcement does ([`DoorbellFacts::native_announced_at`]).
+    waiter_spent: HashMap<AgentKey, Instant>,
     /// Audit F3: each agent generation's native receiver — the component
-    /// process that first armed or announced for it ([`InboxHub::arm`]).
-    receivers: HashMap<AgentKey, u32>,
+    /// process that first armed or announced for it ([`InboxHub::arm`]), or
+    /// the Claude Code background session that conversation moved to (issue
+    /// #2342, [`HubState::admit_receiver`]).
+    receivers: HashMap<AgentKey, PinnedReceiver>,
     next_conn: u64,
     /// Where state changes are broadcast to attached clients, once the daemon
     /// has installed its event channel ([`InboxHub::set_broadcast`]).
@@ -850,12 +870,53 @@ impl HubState {
     /// one is pinned the first arrival wins, and a Claude below the waiter
     /// gate never announces, so its generation is pinned by whatever arms
     /// first.
-    fn admit_receiver(&mut self, key: &AgentKey, instance: Option<u32>) -> Result<(), ArmError> {
-        match (self.receivers.get(key), instance) {
-            (Some(pinned), Some(instance)) if *pinned == instance => Ok(()),
+    ///
+    /// Issue #2342: the one move the pin makes. Claude Code moves a
+    /// conversation into a background session (Left in an empty input box),
+    /// which then runs in another process, and only that process can wake it.
+    /// A waiter whose process the daemon placed as such a session, started by
+    /// the foreground process `background_origin`
+    /// ([`ReceiptArm::background_origin`]), takes the pin over when that is
+    /// the pinned receiver's own origin. It is decided under the lock its
+    /// registration takes, so the move and the arm are one step, and the
+    /// registration supersedes the waiter it replaced. No other instance
+    /// takes the pin, the previous one included.
+    fn admit_receiver(
+        &mut self,
+        key: &AgentKey,
+        instance: Option<u32>,
+        background_origin: Option<u32>,
+    ) -> Result<(), ArmError> {
+        match (self.receivers.get(key).copied(), instance) {
+            (Some(pinned), Some(instance)) if pinned.instance == instance => Ok(()),
+            (Some(pinned), Some(instance)) if background_origin == Some(pinned.origin) => {
+                info!(
+                    pane_id = %key.0,
+                    from = pinned.instance,
+                    to = instance,
+                    origin = pinned.origin,
+                    "inbox: the receiver moved to the conversation's Claude Code background session"
+                );
+                self.receivers.insert(
+                    key.clone(),
+                    PinnedReceiver {
+                        instance,
+                        origin: pinned.origin,
+                    },
+                );
+                Ok(())
+            }
             (Some(_), _) => Err(ArmError::OtherInstance),
             (None, Some(instance)) => {
-                self.receivers.insert(key.clone(), instance);
+                // A background session that pins first keeps its foreground
+                // as the origin, so a later session of it can take over.
+                self.receivers.insert(
+                    key.clone(),
+                    PinnedReceiver {
+                        instance,
+                        origin: background_origin.unwrap_or(instance),
+                    },
+                );
                 Ok(())
             }
             (None, None) => Ok(()),
@@ -873,6 +934,7 @@ impl InboxHub {
                 inbox: Inbox::new(deck, limits),
                 waiters: HashMap::new(),
                 announced: HashMap::new(),
+                waiter_spent: HashMap::new(),
                 receivers: HashMap::new(),
                 next_conn: 1,
                 broadcast: None,
@@ -2011,7 +2073,7 @@ impl InboxHub {
     ) -> Result<(), ArmError> {
         let mut st = self.lock();
         let key = (pane_id.to_string(), agent_id.to_string());
-        st.admit_receiver(&key, instance)?;
+        st.admit_receiver(&key, instance, None)?;
         st.announced.insert(
             key,
             Announcement {
@@ -2155,6 +2217,7 @@ impl InboxHub {
             }
         }
         st.announced.remove(&key);
+        st.waiter_spent.remove(&key);
         st.receivers.remove(&key);
         st.rings.remove(&key);
         st.agent_notices.remove(&key);
@@ -2481,7 +2544,8 @@ impl InboxHub {
                 .announced
                 .get(&key)
                 .filter(|a| a.wake == InboxWake::Native)
-                .map(|a| a.at),
+                .map(|a| a.at)
+                .max(st.waiter_spent.get(&key).copied()),
             blocked: st.receipts.blocked(&key),
         }
     }
@@ -2991,6 +3055,17 @@ pub struct ReceiptArm {
     /// Part 2 §2.7: the one-shot integration a once-waiter declared
     /// ([`HOOK_INTEGRATION`]).
     pub hook_integration: Option<u32>,
+    /// Issue #2342: for a Claude once-waiter whose session continues a
+    /// conversation, the foreground Claude Code process that started the
+    /// background session its receiver instance runs, as the daemon read it
+    /// from the instance's ancestry. The receiver pin moves to the instance
+    /// when this is the pinned receiver's origin
+    /// ([`HubState::admit_receiver`]).
+    pub background_origin: Option<u32>,
+    /// Issue #2133: a once-waiter armed by a compaction's `SessionStart`
+    /// (its wait names the `compact` source), which can come in the middle
+    /// of a turn.
+    pub compaction: bool,
 }
 
 /// PRD #1666 §13 step 4: whether `component`'s streams are owned by the
@@ -3584,6 +3659,7 @@ impl InboxHub {
             }
             InboxComponent::CodexHooks => Some(crate::event::AgentType::Codex),
             InboxComponent::DevinHooks => Some(crate::event::AgentType::Devin),
+            InboxComponent::AntigravityHooks => Some(crate::event::AgentType::Antigravity),
             _ => None,
         };
         let mut st = self.lock();
@@ -3820,7 +3896,7 @@ async fn serve_receipt<R, W, P>(
     let (tx, mut signals) = mpsc::channel(engine::RECEIPT_SIGNAL_CAPACITY);
     let registered = {
         let mut st = hub.lock();
-        if let Err(error) = st.admit_receiver(&key, instance) {
+        if let Err(error) = st.admit_receiver(&key, instance, None) {
             Err(error)
         } else {
             let conn_id = st.next_conn;
@@ -3960,12 +4036,15 @@ async fn serve_receipt<R, W, P>(
 /// `handed` and `not_handed` reports. A batch line whose newline the
 /// connection never accepted reaches no waiter (it reads through
 /// [`crate::inbox_oneshot::read_frame`]), so it is not handed.
+#[allow(clippy::too_many_arguments)]
 async fn serve_once<R, W>(
     hub: Arc<InboxHub>,
     pane_id: String,
     agent_id: String,
     component: InboxComponent,
     instance: Option<u32>,
+    background_origin: Option<u32>,
+    compaction: bool,
     reader: R,
     mut writer: W,
 ) where
@@ -3988,7 +4067,7 @@ async fn serve_once<R, W>(
     let (tx, mut signals) = mpsc::channel(engine::RECEIPT_SIGNAL_CAPACITY);
     let registered = {
         let mut st = hub.lock();
-        match st.admit_receiver(&key, instance) {
+        match st.admit_receiver(&key, instance, background_origin) {
             Err(error) => Err(error),
             Ok(()) => {
                 let conn_id = st.next_conn;
@@ -4006,6 +4085,9 @@ async fn serve_once<R, W>(
                     spool,
                     now,
                 );
+                if compaction {
+                    engine::mark_compaction(&mut st, &key, first.as_ref());
+                }
                 st.waiters.entry(key.clone()).or_default().push(Waiter {
                     conn_id,
                     component,
@@ -5422,12 +5504,19 @@ fn owe_card_notice(st: &mut HubState, event: &InboxEvent) {
     if st.card_notice_sink.is_none() || event.state != StateName::Undeliverable {
         return;
     }
-    let detail = match event.undeliverable_reason {
-        Some(UndeliverableReason::MaxDeliver) => NOTICE_MAX_DELIVER.into(),
-        Some(UndeliverableReason::AgentExited) => event_termination(st, event)
-            .unwrap_or(&PaneTermination::Unknown)
-            .card_notice()
-            .into(),
+    // Issue #2246: an `agent_exited` notice is written once the agent is no
+    // longer live, so it is marked as one about the pane ending; it reaches
+    // the exited generation's card, which stays on screen until something
+    // takes the pane.
+    let (detail, pane_ended) = match event.undeliverable_reason {
+        Some(UndeliverableReason::MaxDeliver) => (NOTICE_MAX_DELIVER.into(), false),
+        Some(UndeliverableReason::AgentExited) => (
+            event_termination(st, event)
+                .unwrap_or(&PaneTermination::Unknown)
+                .card_notice()
+                .into(),
+            true,
+        ),
         _ => return,
     };
     let Some(recipient) = event.recipient.as_ref() else {
@@ -5443,6 +5532,7 @@ fn owe_card_notice(st: &mut HubState, event: &InboxEvent) {
         session_id: None,
         detail,
         cleared: false,
+        pane_ended,
     });
 }
 
@@ -5695,6 +5785,7 @@ fn settle_late_ack(st: &mut HubState, event: &InboxEvent) {
         session_id: None,
         detail: crate::inbox_display::NOTICE_DELIVERED_LATE.into(),
         cleared: true,
+        pane_ended: false,
     });
 }
 
@@ -6585,7 +6676,18 @@ pub async fn serve_waiter<R, W, P>(
                 .hook_integration
                 .is_some_and(|declared| declared >= HOOK_INTEGRATION)
             {
-                serve_once(hub, pane_id, agent_id, component, instance, reader, writer).await;
+                serve_once(
+                    hub,
+                    pane_id,
+                    agent_id,
+                    component,
+                    instance,
+                    arm.background_origin,
+                    arm.compaction,
+                    reader,
+                    writer,
+                )
+                .await;
                 return;
             }
             hub.refuse_old_hooks(&pane_id, &agent_id, component);
@@ -6739,6 +6841,19 @@ mod tests {
             agent: &str,
             instance: Option<u32>,
         ) -> (OnceWaiter, InboxWaitReply) {
+            Self::open_from(hub, pane, agent, instance, None).await
+        }
+
+        /// [`Self::open`], from a Claude Code background session the
+        /// foreground process `background_origin` started
+        /// ([`ReceiptArm::background_origin`]).
+        async fn open_from(
+            hub: &Arc<InboxHub>,
+            pane: &str,
+            agent: &str,
+            instance: Option<u32>,
+            background_origin: Option<u32>,
+        ) -> (OnceWaiter, InboxWaitReply) {
             use tokio::io::AsyncBufReadExt;
             let (client, server) = tokio::io::duplex(1 << 16);
             let (read, write) = tokio::io::split(server);
@@ -6751,6 +6866,7 @@ mod tests {
                 instance,
                 ReceiptArm {
                     hook_integration: Some(HOOK_INTEGRATION),
+                    background_origin,
                     ..ReceiptArm::default()
                 },
                 tokio::io::BufReader::new(read),
@@ -6850,6 +6966,114 @@ mod tests {
             "a successor generation pins its own receiver"
         );
         successor.close().await;
+    }
+
+    /// Issue #2342: once a Claude Code conversation moves to a background
+    /// session, the waiter of the process that runs it takes the pin over
+    /// from the foreground process that started that session, and the
+    /// foreground's waiter is superseded, so a message goes to the session.
+    /// The pin then refuses the foreground, a session another process
+    /// started, and any instance that arrives without a background origin;
+    /// a second background session of the same foreground takes it again.
+    #[tokio::test]
+    async fn a_background_session_takes_the_pin_from_its_own_foreground() {
+        let hub = Arc::new(hub());
+        let refused = ArmError::OtherInstance.code();
+        let (foreground, armed) = OnceWaiter::open(&hub, "p", "a", Some(100)).await;
+        assert!(
+            armed.registered.is_some(),
+            "the foreground pins the receiver"
+        );
+
+        // A session another process started, and one without an origin, meet
+        // the pin.
+        for origin in [Some(999), Some(300), None] {
+            let (gone, other) = OnceWaiter::open_from(&hub, "p", "a", Some(300), origin).await;
+            assert_eq!(other.refused.as_deref(), Some(refused), "{origin:?}");
+            gone.close().await;
+        }
+
+        let (mut session, armed) =
+            OnceWaiter::open_from(&hub, "p", "a", Some(300), Some(100)).await;
+        assert!(
+            armed.registered.is_some(),
+            "the foreground's background session takes the pin: {armed:?}"
+        );
+        let mut foreground = foreground;
+        assert!(
+            foreground
+                .next()
+                .await
+                .is_some_and(|reply| reply.superseded),
+            "the foreground's waiter is superseded"
+        );
+        assert!(foreground.next().await.is_none(), "and ends");
+        foreground.close().await;
+        assert_eq!(hub.armed("p", "a"), 1);
+
+        hub.post_direct(Recipient::bound("p", "a"), content("for the session"))
+            .unwrap();
+        let batch = session
+            .next()
+            .await
+            .and_then(|reply| reply.messages)
+            .expect("the session is handed the message");
+        assert!(
+            batch.iter().any(|d| d.text.contains("for the session")),
+            "{batch:?}"
+        );
+        session.close().await;
+
+        // The pin moved: the foreground meets it now, as does an announce
+        // from it.
+        let (gone, other) = OnceWaiter::open(&hub, "p", "a", Some(100)).await;
+        assert_eq!(other.refused.as_deref(), Some(refused));
+        gone.close().await;
+        assert_eq!(
+            hub.announce(
+                "p",
+                "a",
+                InboxWake::Native,
+                InboxComponent::ClaudeHooks,
+                Some(100)
+            ),
+            Err(ArmError::OtherInstance)
+        );
+        let (again, armed) = OnceWaiter::open(&hub, "p", "a", Some(300)).await;
+        assert!(armed.registered.is_some(), "the session arms again");
+        again.close().await;
+
+        // Another background session of the same foreground takes it again.
+        let (next, armed) = OnceWaiter::open_from(&hub, "p", "a", Some(400), Some(100)).await;
+        assert!(armed.registered.is_some(), "{armed:?}");
+        next.close().await;
+        let (gone, other) = OnceWaiter::open(&hub, "p", "a", Some(300)).await;
+        assert_eq!(other.refused.as_deref(), Some(refused));
+        gone.close().await;
+    }
+
+    /// Issue #2342: a background session whose waiter pins a generation
+    /// first records the foreground that started it as the origin, so a
+    /// later session of that foreground takes the pin over, and the
+    /// foreground itself still meets the pin.
+    #[tokio::test]
+    async fn a_background_session_that_pins_first_keeps_its_foreground_as_origin() {
+        let hub = Arc::new(hub());
+        let (first, armed) = OnceWaiter::open_from(&hub, "p", "a", Some(300), Some(100)).await;
+        assert!(armed.registered.is_some(), "{armed:?}");
+        first.close().await;
+        let (next, armed) = OnceWaiter::open_from(&hub, "p", "a", Some(400), Some(100)).await;
+        assert!(
+            armed.registered.is_some(),
+            "a later session of the same foreground takes over: {armed:?}"
+        );
+        next.close().await;
+        let (gone, other) = OnceWaiter::open(&hub, "p", "a", Some(100)).await;
+        assert_eq!(
+            other.refused.as_deref(),
+            Some(ArmError::OtherInstance.code())
+        );
+        gone.close().await;
     }
 
     /// PR #1735 second review: a reserved answer's room is the deck's last
@@ -7181,6 +7405,107 @@ mod tests {
         );
         older.close().await;
         newer.close().await;
+    }
+
+    /// Issue #2133: a once waiter armed at the last Idle is not handed a
+    /// message posted once a turn has started, even by a clock tick, and
+    /// stays armed with the message still queued, also after the turn ends;
+    /// the clock wakes no later than the hold's end. The waiter armed when
+    /// the turn ends supersedes it and is handed the batch, and the spent
+    /// waiter then holds the doorbell for the arm grace from that moment.
+    #[tokio::test]
+    async fn a_waiter_armed_before_the_turn_is_held_for_the_one_armed_after_it() {
+        use crate::agent_pty::{TurnEdge, TurnSeen};
+        let hub = Arc::new(hub());
+        let (mut older, armed) = OnceWaiter::open(&hub, "p", "a", None).await;
+        assert!(armed.registered.is_some());
+        let started = Instant::now();
+        let edge = |seq, edge| TurnSeen { seq, edge };
+        hub.note_turn("p", "a", edge(1, TurnEdge::Started), started);
+        let id = hub
+            .post_direct(Recipient::bound("p", "a"), content("mid-turn"))
+            .unwrap()
+            .to_string();
+        hub.tick();
+        let quiet = Duration::from_millis(300);
+        assert!(
+            tokio::time::timeout(quiet, older.lines.next_line())
+                .await
+                .is_err(),
+            "nothing goes to the older waiter while the turn is under way"
+        );
+        let facts = hub.doorbell_facts("p", "a");
+        assert_eq!((facts.armed, facts.queued), (1, vec![id.clone()]));
+        assert!(
+            hub.clock_deadline().is_some_and(
+                |at| at > Instant::now() && at <= started + crate::inbox::DEFAULT_ACK_WAIT
+            ),
+            "the clock wakes no later than the hold's end"
+        );
+        hub.note_turn("p", "a", edge(2, TurnEdge::Ended), Instant::now());
+        hub.tick();
+        assert!(
+            tokio::time::timeout(quiet, older.lines.next_line())
+                .await
+                .is_err(),
+            "nor once the turn is over: it was armed before the turn"
+        );
+        let before_spend = Instant::now();
+        let (mut newer, armed) = OnceWaiter::open(&hub, "p", "a", None).await;
+        assert!(armed.registered.is_some());
+        assert!(older.next().await.is_some_and(|reply| reply.superseded));
+        let batch = newer.next().await.and_then(|reply| reply.messages);
+        let batch = batch.expect("the waiter armed after the turn takes the batch");
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].id, id);
+        let facts = hub.doorbell_facts("p", "a");
+        assert_eq!(facts.armed, 0, "spent by its batch");
+        assert!(
+            facts
+                .native_announced_at
+                .is_some_and(|at| at >= before_spend),
+            "the spend holds the doorbell for the arm grace: {facts:?}"
+        );
+        older.close().await;
+        newer.close().await;
+    }
+
+    /// Issue #2133: the hold lasts one ack-wait from the turn's start, so
+    /// when no newer waiter arms, the older one is handed the batch by the
+    /// clock once the hold runs out.
+    #[tokio::test]
+    async fn a_waiter_armed_before_the_turn_is_handed_its_batch_once_the_hold_runs_out() {
+        use crate::agent_pty::{TurnEdge, TurnSeen};
+        let ack_wait = Duration::from_millis(200);
+        let limits = InboxLimits {
+            ack_wait,
+            ..InboxLimits::default()
+        };
+        let hub = Arc::new(InboxHub::new(deck(), limits, DEFAULT_KEEPALIVE));
+        let (mut waiter, armed) = OnceWaiter::open(&hub, "p", "a", None).await;
+        assert!(armed.registered.is_some());
+        let started = Instant::now();
+        let seen = TurnSeen {
+            seq: 1,
+            edge: TurnEdge::Started,
+        };
+        hub.note_turn("p", "a", seen, started);
+        let id = hub
+            .post_direct(Recipient::bound("p", "a"), content("late"))
+            .unwrap()
+            .to_string();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), waiter.lines.next_line())
+                .await
+                .is_err(),
+            "held inside the hold"
+        );
+        tokio::time::sleep((started + ack_wait).saturating_duration_since(Instant::now())).await;
+        hub.tick();
+        let batch = waiter.next().await.and_then(|reply| reply.messages);
+        let batch = batch.expect("past the hold, the older waiter is handed the batch");
+        assert_eq!(batch[0].id, id);
+        waiter.close().await;
     }
 
     /// PR #1735 fifth review (N1), part 2 §1.3: Claude's prompt hook commits

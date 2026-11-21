@@ -495,6 +495,22 @@ screen = "overview"
 action = "dismiss_star_prompt"
 outcome = "dispatch"
 
+# PRD #211 — the Antigravity notice's two rows, by their buttons' labels, over
+# the new agent's pane where the notice shows.
+[[fixtures]]
+name = "open-antigravity-issues-by-its-label"
+utterance = "open issues"
+screen = "agent"
+action = "open_antigravity_issues"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dismiss-antigravity-notice-by-its-label"
+utterance = "don't show again"
+screen = "agent"
+action = "dismiss_antigravity_notice"
+outcome = "dispatch"
+
 # Issue #1263 — the deck field once the dialog is open. Over a dialog with no
 # form yet, and over a live form (where a different deck clears the directory);
 # the field's label said with a deck's name; and the deck screen, where there is
@@ -3004,3 +3020,50 @@ utterance = "scroll to the bottom"
 screen = "pull_request"
 action = "scroll_to_bottom"
 outcome = "dispatch"
+
+# PRD #1184: chains of commands from one utterance. Each step is checked on
+# its own words, on the screen the steps before it leave.
+[[fixtures]]
+name = "chain-overview-then-tester"
+utterance = "open the overview and then the tester"
+screen = "deck"
+action = "open_overview"
+outcome = "chain"
+steps = ["open_overview", "open_agent"]
+
+[[fixtures]]
+name = "chain-dashboard-then-reviewer"
+utterance = "show the dashboard then open the reviewer"
+screen = "deck"
+action = "open_overview"
+outcome = "chain"
+steps = ["open_overview", "open_agent"]
+
+[[fixtures]]
+name = "chain-three-form-choices"
+utterance = "make it a dispatcher, use codex and name it triage bot"
+screen = "overview"
+form = true
+action = "choose_mode"
+outcome = "chain"
+steps = ["choose_mode", "choose_agent_type", "name_new_agent"]
+
+# The chain that must refuse mid-chain: opening the tester leaves its pane,
+# where no directory can be opened, so step 2 refuses and nothing runs —
+# never the tester opened on its own.
+[[fixtures]]
+name = "chain-refused-mid-chain-tester-then-directory"
+utterance = "open the tester and then open the docs directory"
+screen = "overview"
+action = "none"
+outcome = "no_match"
+refusal = true
+
+# A dictation is never split: "and then commit" is part of what is typed.
+[[fixtures]]
+name = "chain-dictation-is-not-split"
+utterance = "type run the tests and then commit"
+screen = "agent"
+action = "dictate_to_agent"
+outcome = "dispatch"
+dictate_prefix = "type"

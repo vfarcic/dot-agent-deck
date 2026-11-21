@@ -27,14 +27,10 @@ The app reaches a remote daemon through an ssh tunnel, using the `ssh` program o
    - open **Settings** in the rail, choose **Daemons** and press **Add a daemon**.
 
    Fill in the fields (below), check the **Daemon name** the app suggests or type your own, and press **Add this daemon**. The daemon is added and chosen, and the Dashboard shows it; from then on, changes to its fields are saved in **Settings → Daemons** as you make them. From the Dashboard the form opens in a dialog over the screen you were on: **Cancel**, `Escape` or a click outside closes it without adding anything. If you registered the host with `dot-agent-deck remote add` while the app was open, restart the app to see it; it is then already listed.
-
-   ![The Add a daemon dialog over the empty Dashboard: Daemon name, Host filled in as build-box, User as dev, Port 22, Key file, Jump host and Daemon socket, with Cancel and Add this daemon](/img/add-daemon-desktop.png)
 4. **Press Test connection.** It is in **Settings → Daemons**: open **Settings** in the rail, choose **Daemons**, and choose the daemon you added (it is already chosen when you added it there). **Test connection** checks the daemon and, when **Daemon socket** is empty, finds the socket path on the host and saves it.
 5. **Choose the daemon** in the Dashboard's **Daemon** selector, or choose **All daemons**.
 
 **Check it worked:** **Test connection** reports `<daemon> answered and is compatible with this app.`, and on the Dashboard the daemon's section lists its agents (or **No agents are running yet**) instead of a title such as **Daemon disconnected**.
-
-![Settings → Daemons with a remote daemon named build, its address build-box beside the name, chosen in the Daemon row beside All daemons and This machine; below it the Daemon name field reads build with a Rename button, Host is filled in, the other fields show their placeholders, and Test connection is not yet pressed](/img/settings-daemons-desktop.png)
 
 A remote daemon has these fields:
 
@@ -147,7 +143,7 @@ It does not appear when the daemon runs the same release as the app, when the da
 
 1. A dialog says what it will do, for example `This installs 0.45.0 on build-box (its daemon runs 0.44.0 now) and restarts the daemon onto it.` Press **Upgrade**, or **Cancel** to do nothing.
 2. The dialog shows its progress: **Installing the new version**, **Restarting the daemon**, **Checking the new daemon answers**.
-3. If agents or orchestration roles are running on that daemon, it stops before restarting and lists every one the restart would stop, by name, with its pane and directory where the daemon knows them.
+3. If agents or orchestration roles are running on that daemon, the dialog stops before restarting, asks **Restart and stop these?** and lists every one the restart would stop, by name, with its pane and directory where the daemon knows them.
    - **Restart now** stops exactly those and restarts the daemon onto the new version.
    - **Keep current daemon**, the default, stops nothing: the new version stays installed, the old daemon keeps running your agents, and it runs the new version the next time it restarts. Closing the dialog or pressing `Escape` at this point is the same as **Keep current daemon**.
    - If what is running changes while you decide, nothing is stopped and the dialog shows the new list and asks again.
@@ -168,8 +164,6 @@ It does not appear when the daemon runs the same release as the app, when the da
 | **Upgrade failed** | A step failed, and the dialog says which one and why. When the install failed, the old daemon keeps running; if the new version landed before a later step failed (reinstalling the hooks, or recording it in the deck list), the dialog says it is installed. If the new binary was put in place but did not pass its version check, the reason says it `was replaced`, and the dialog names what is installed now: the version the check read, or `An unverified build`. When the restart failed, the new version is installed and the old daemon keeps running, unless the dialog says it `may have stopped`: then the daemon's answer to the restart never arrived and the old daemon no longer answers, so press **Reconnect** to see what is running now. | Fix what the reason names, then press **Upgrade** again. `dot-agent-deck remote doctor <name>` diagnoses the ssh setup and the install of a host. If it failed while checking the restarted daemon, see [Restarted, but the new daemon did not answer](#restarted-but-the-new-daemon-did-not-answer). |
 | **Upgrade stopped unexpectedly** | The upgrade stopped before it could report how far it got, so the new version may or may not be installed, and the daemon may or may not have restarted. The panes you had open on that daemon's agents close. | Press **Reconnect** to see which daemon is answering now, then press **Upgrade** again if it still runs the old version. |
 
-![The Upgrade dialog over the Dashboard for the remote daemon dev@build-box, titled Restart and stop these?: Installing the new version is ticked, Restarting the daemon is in progress, and the dialog lists the three agents the restart would stop, each with its directory, above a Keep current daemon button and a red Restart now button](/img/daemon-upgrade-desktop.png)
-
 **Check it worked:** the daemon's section shows its agents again (or **No agents are running yet**) and no longer offers **Upgrade**.
 
 The app installs over ssh from this computer, the way `remote upgrade` does, so the host needs what `remote add` needs: `curl` to download the release, or a Homebrew install of the deck, which it then upgrades with `brew` ([Remote Environment Requirements](../remote-requirements.md)). If the daemon is no longer in the deck list (`remotes.toml`), for example because it was removed with the CLI, the app says so and suggests `dot-agent-deck remote add`, or `dot-agent-deck remote upgrade` from a terminal. Pressing **Upgrade** again while an upgrade of the same daemon is running is refused.
@@ -183,14 +177,6 @@ When the reason ends with `and it is still the daemon that was asked to restart`
 ## Upgrade the CLI and the daemon on this machine
 
 Three things on this machine can fall behind: the desktop app, the `dot-agent-deck` CLI on your `PATH`, which the TUI, your terminal commands and agent hooks run, and the daemon. The **Local daemon** section of the Dashboard offers **Upgrade** whenever the CLI or daemon is behind, as a remote daemon's section does for that machine. Its name and hover text name everything it covers, including the app when that comes first. When the app itself is behind, the banner at the top of the Dashboard and the rail's upgrade button appear too, and they run this same upgrade, starting with the app ([Desktop App → Upgrade the app](index.md#upgrade-the-app)).
-
-**TUI:**
-
-![The TUI's Upgrade to v0.47.0 dialog, opened with u from the footer notice dot-agent-deck CLI: update available: v0.47.0 (current: v0.46.0): the plan for the CLI, a downloaded binary at /home/dev/.local/bin/dot-agent-deck, saying what upgrading downloads and checks and that upgrading does not restart the daemon on this machine, then the question Upgrade dot-agent-deck CLI to v0.47.0? with Cancel selected above Upgrade](/img/self-upgrade-tui.png)
-
-**Desktop:**
-
-![The desktop Dashboard with no update banner, the Local daemon section's Upgrade button, and the Upgrade to v0.47.0 dialog it opened: the plan for the dot-agent-deck CLI installed with Homebrew, saying upgrading runs brew update, then brew upgrade dot-agent-deck, the line Upgrading the CLI does not restart the daemon on this machine, so its agents keep running, and the question Upgrade dot-agent-deck CLI to v0.47.0? with Cancel and Upgrade buttons](/img/local-cli-upgrade-desktop.png)
 
 **Pressing Upgrade on the Local daemon section:**
 

@@ -173,7 +173,9 @@ pub enum ClearPresses {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeleteCharKey {
     /// The key that deletes one character. `DEL` (`0x7f`) in every measured
-    /// agent; bursts of 150 in one write were exact.
+    /// agent. Bursts of 150 in one write were exact in Claude Code, Codex,
+    /// OpenCode and Pi; Antigravity's must be paced
+    /// ([`Self::max_presses_per_write`]).
     pub bytes: Cow<'static, str>,
     /// The longest single unbracketed write, in characters, that this agent is
     /// measured to keep as typed text — so that pressing [`Self::bytes`] once
@@ -188,8 +190,30 @@ pub struct DeleteCharKey {
     /// M1), so a sender applies `min(800, this)` — the per-agent value exists so
     /// that policy is a client decision that can be revisited against the
     /// deck's own measurement rather than baked into the wire.
+    ///
+    /// PRD #211: on an agent whose deletes are paced
+    /// ([`Self::max_presses_per_write`]) it is that per-write cap instead,
+    /// and the agent claims no collapse limit. A client that predates pacing
+    /// sends a write's deletes in one burst, and it applies this bound: so it
+    /// removes only a write that one paced write's presses delete, and
+    /// refuses a longer one rather than burst deletes the agent drops. A
+    /// client that paces takes no bound from it.
+    /// `paced_deletes_bound_a_burst_client_to_one_write` keeps the two equal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_literal_write_chars: Option<u32>,
+    /// The most presses of [`Self::bytes`] to put in one write; `None` where
+    /// a whole burst was measured exact. Antigravity (`agy` 1.5.9) dropped
+    /// some deletes from a single write of 50 and of 2290, while 101 deletes
+    /// each written on its own 20 ms apart removed exactly 101 characters, so
+    /// its deletes go one per write (PRD #211). An additive field: a client
+    /// that does not know it bursts its deletes, which
+    /// [`Self::max_literal_write_chars`] keeps to one write's worth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_presses_per_write: Option<u32>,
+    /// How long to wait between two writes of one deletion, in milliseconds;
+    /// `None` where no pause is needed. 20 ms for Antigravity, as measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_between_writes_ms: Option<u32>,
 }
 
 /// `ESC`: the interrupt key in every measured agent.
@@ -339,6 +363,22 @@ pub struct AgentSpec {
     /// ([`crate::question::answer_keys`]). `None` for an agent with no such
     /// menus (Pi, whose dialogs report their own options) and the placeholder.
     pub questions: Option<&'static QuestionTables>,
+    /// PRD #211: the agent writes its own status to its terminal as an OSC
+    /// 7501 sequence ([`crate::status_osc`]), and the daemon reads it from the
+    /// pane's output. `None` leaves the reader off, which costs a pane nothing.
+    pub status_osc7501: Option<StatusOsc7501>,
+}
+
+/// PRD #211 ([`AgentSpec::status_osc7501`]): how one agent reports its status
+/// through OSC 7501.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatusOsc7501 {
+    /// The `app=` value the agent's sequences carry. A sequence naming any
+    /// other app is not this agent's and is ignored.
+    pub app: &'static str,
+    /// The environment variable, and its value, that asks the agent to emit
+    /// the sequences. The deck sets it on every pane it starts for the agent.
+    pub enable_env: (&'static str, &'static str),
 }
 
 /// PRD #1666 part 3, Q28 ([`AgentSpec::first_hook`]): when an agent's own
@@ -415,6 +455,9 @@ pub enum MenuKind {
     ChoiceAppended,
     /// Claude Code's plan approval.
     Plan,
+    /// Antigravity's approval of a file it is about to write, a menu of its
+    /// own beside its command [`MenuKind::Permission`] menu.
+    FileCreation,
 }
 
 #[derive(Debug)]
@@ -670,6 +713,53 @@ pub static DEVIN_QUESTIONS: QuestionTables = QuestionTables {
     }],
 };
 
+/// Antigravity (`agy`), verified on 1.5.9 (PRD #211, 2026-11-16, real
+/// interactive `agy` in an isolated HOME). No hook reports its permission
+/// prompts: the OSC 7501 `blocked:kind=permission` signal carries the
+/// question (`Approve Bash: <command>`, `Approve Edit: Write: <path>`) and
+/// never the options, which are only drawn on screen. Each option is picked
+/// by its digit, with no Enter; Esc cancels too. `{detail}` is the command
+/// the signal names. The menu also offers Amend (Tab) and editing the command
+/// (Ctrl+G), which are not answers and are not listed.
+pub static ANTIGRAVITY_QUESTIONS: QuestionTables = QuestionTables {
+    verified_from: (1, 5, 9),
+    verified_on: (1, 5, 9),
+    menus: &[
+        MenuTable {
+            menu: MenuKind::Permission,
+            options: &[
+                table_option("Yes, run command", AllowOnce, Some("1")),
+                scoped(
+                    table_option(
+                        "Yes, and always allow in this conversation for commands that start with '{detail}'",
+                        AllowAlways,
+                        Some("2"),
+                    ),
+                    "commands that start with '{detail}', for the rest of this conversation",
+                ),
+                scoped(
+                    table_option(
+                        "Yes, and always allow for commands that start with '{detail}' (Persist to settings.json)",
+                        AllowAlways,
+                        Some("3"),
+                    ),
+                    "commands that start with '{detail}', in every later conversation too (saved to Antigravity's settings.json)",
+                ),
+                table_option("No, cancel", Deny, Some("4")),
+            ],
+        },
+        MenuTable {
+            // Drawn for a `write_file` call, including one that overwrites an
+            // existing file [observed].
+            menu: MenuKind::FileCreation,
+            options: &[
+                table_option("Yes, allow creation", AllowOnce, Some("1")),
+                table_option("No, deny creation", Deny, Some("2")),
+            ],
+        },
+    ],
+};
+
 // PRD #20 finding #15: per-agent adapters that normalize each incumbent
 // module's signature to the spec's handler shape. Keeping them here (as the
 // values the statics point at) is what makes dispatch spec-resolved.
@@ -693,6 +783,12 @@ fn devin_install() -> Result<(), String> {
 }
 fn devin_uninstall() -> Result<(), String> {
     crate::devin_hooks_manage::uninstall()
+}
+fn antigravity_install() -> Result<(), String> {
+    crate::antigravity_hooks_manage::install()
+}
+fn antigravity_uninstall() -> Result<(), String> {
+    crate::antigravity_hooks_manage::uninstall()
 }
 /// PRD #20 §4.2.1: `dot-agent-deck hooks install --agent codex` — write the deck's
 /// `hooks.json` into the active Codex home and record scoped, hash-pinned trust
@@ -855,6 +951,8 @@ pub static CLAUDE_CODE: AgentSpec = AgentSpec {
         delete_char: DeleteCharKey {
             bytes: Cow::Borrowed(DEL),
             max_literal_write_chars: Some(800),
+            max_presses_per_write: None,
+            pause_between_writes_ms: None,
         },
     }),
     doorbell_composer: None,
@@ -865,6 +963,7 @@ pub static CLAUDE_CODE: AgentSpec = AgentSpec {
     doorbell_ready_screen: Some(claude_prompt_on_screen),
     first_hook: FirstHook::BeforePrompt,
     questions: Some(&CLAUDE_CODE_QUESTIONS),
+    status_osc7501: None,
 };
 
 /// PRD #1666 part 2 (`inbox/doorbell/008`): do `rows`, one trimmed screen row
@@ -935,6 +1034,8 @@ pub static OPEN_CODE: AgentSpec = AgentSpec {
         delete_char: DeleteCharKey {
             bytes: Cow::Borrowed(DEL),
             max_literal_write_chars: None,
+            max_presses_per_write: None,
+            pause_between_writes_ms: None,
         },
     }),
     doorbell_composer: None,
@@ -942,6 +1043,7 @@ pub static OPEN_CODE: AgentSpec = AgentSpec {
     doorbell_ready_screen: None,
     first_hook: FirstHook::BeforePrompt,
     questions: Some(&OPEN_CODE_QUESTIONS),
+    status_osc7501: None,
 };
 
 /// Pi — bundled-extension strategy (shipped, PRD #201).
@@ -975,6 +1077,8 @@ pub static PI: AgentSpec = AgentSpec {
         delete_char: DeleteCharKey {
             bytes: Cow::Borrowed(DEL),
             max_literal_write_chars: None,
+            max_presses_per_write: None,
+            pause_between_writes_ms: None,
         },
     }),
     doorbell_composer: None,
@@ -982,6 +1086,7 @@ pub static PI: AgentSpec = AgentSpec {
     doorbell_ready_screen: None,
     first_hook: FirstHook::BeforePrompt,
     questions: None,
+    status_osc7501: None,
 };
 
 /// Codex — stdout-wrapper strategy (PRD #20 M7). The first agent to use the
@@ -1029,6 +1134,8 @@ pub static CODEX: AgentSpec = AgentSpec {
         delete_char: DeleteCharKey {
             bytes: Cow::Borrowed(DEL),
             max_literal_write_chars: Some(1000),
+            max_presses_per_write: None,
+            pause_between_writes_ms: None,
         },
     }),
     // PRD #1666 S7: Codex's wrapper reports raw input while its start
@@ -1039,6 +1146,7 @@ pub static CODEX: AgentSpec = AgentSpec {
     // PRD #1666 part 3, Q28: its SessionStart comes with its first prompt.
     first_hook: FirstHook::WithFirstPrompt,
     questions: Some(&CODEX_QUESTIONS),
+    status_osc7501: None,
 };
 
 /// PRD #1666 S7 (decision A): whether `rows` — a pane's screen, one trimmed
@@ -1253,6 +1361,87 @@ pub static DEVIN: AgentSpec = AgentSpec {
     doorbell_ready_screen: None,
     first_hook: FirstHook::BeforePrompt,
     questions: Some(&DEVIN_QUESTIONS),
+    status_osc7501: None,
+};
+
+/// Google's Antigravity CLI (`agy`, PRD #211) — native-hooks strategy, like
+/// [`DEVIN`]. Its process comm is `agy`, the binary is `agy`.
+///
+/// Its status comes from its hooks and from the OSC 7501 sequences it writes
+/// to its terminal ([`AgentSpec::status_osc7501`]): no hook reports a
+/// permission prompt or an interrupted turn. The doorbell types into it under
+/// its measured screen profile ([`crate::doorbell_screen::ANTIGRAVITY_PROFILE`])
+/// once that status reads Idle. Its hook installer
+/// ([`crate::antigravity_hooks_manage`]) owns one named hook in `agy`'s global
+/// `~/.gemini/config/hooks.json`. Its permission menus are answered by keys
+/// from [`ANTIGRAVITY_QUESTIONS`].
+pub static ANTIGRAVITY: AgentSpec = AgentSpec {
+    agent_type: AgentType::Antigravity,
+    label: "Antigravity",
+    detect_basenames: &["agy"],
+    default_command: Some("agy"),
+    strategy: Some(IntegrationStrategy::NativeHooks),
+    // A named ANSI colour not used by Claude (LightMagenta), OpenCode
+    // (LightGreen), Pi (LightCyan), Codex (LightYellow) or Devin (LightBlue),
+    // and never the neutral DarkGray reserved for the "No agent" placeholder.
+    badge_color: Color::LightRed,
+    hook_install: Some(antigravity_install),
+    hook_uninstall: Some(antigravity_uninstall),
+    materialize: None,
+    startup_auto_install: Some(crate::antigravity_hooks_manage::auto_install),
+    configured_pins: Some(crate::antigravity_hooks_manage::configured_pins),
+    refresh_install: Some(crate::antigravity_hooks_manage::refresh_install),
+    // PRD #211, measured on `agy` 1.5.9 (2026-11-16, isolated interactive
+    // HOME): one ESC interrupts a running turn and keeps the agent; one
+    // Ctrl+U removes one logical line, however far it wraps, and 300 in one
+    // write still cleared; one DEL removes one character, but a single write
+    // of 50 or 2290 DELs left part of the text behind, while 101 DELs written
+    // one at a time 20 ms apart removed exactly 101. No paste collapse was
+    // observed, so the literal-write field carries the per-write cap a
+    // client that bursts its deletes must stay within
+    // ([`DeleteCharKey::max_literal_write_chars`]). Ctrl+C quits on a second
+    // press, so it is never sent. The doorbell submits with CR; to withdraw
+    // its own line it reads the delete pacing and, because a doorbell
+    // line's paced deletes outlast its deadline, presses Ctrl+U once for
+    // the one logical line instead (re-measured 2026-11-17: one press
+    // emptied a 166-character line wrapped onto two rows at 143 columns, a
+    // press on the empty composer drew nothing, and two in one write did
+    // what one did).
+    prompt_keys: Some(PromptKeys {
+        interrupt: Cow::Borrowed(&SINGLE_ESC),
+        clear: ClearKey {
+            bytes: Cow::Borrowed(CTRL_U),
+            presses: ClearPresses::PerLine,
+            max_presses_per_write: None,
+            pause_between_writes_ms: None,
+        },
+        delete_char: DeleteCharKey {
+            bytes: Cow::Borrowed(DEL),
+            max_literal_write_chars: Some(1),
+            max_presses_per_write: Some(1),
+            pause_between_writes_ms: Some(20),
+        },
+    }),
+    // Its own terminal status says when a dialog is up (Needs Input), so the
+    // doorbell needs no screen of its own to wait for.
+    doorbell_composer: None,
+    doorbell_stranded_line: None,
+    doorbell_ready_screen: None,
+    // PRD #211: its hooks first fire with the first prompt (`SessionStart`
+    // with it, measured), but its terminal status writes `idle` as its
+    // composer appears, and that report is its own: the readiness the doorbell
+    // waits for. Before it, a generation is not rung on its screen alone.
+    first_hook: FirstHook::BeforePrompt,
+    // PRD #211: its command and file-creation permission menus, answered by
+    // one digit each; the menus come from its OSC 7501 `blocked` signal
+    // ([`crate::question::antigravity_permission`]).
+    questions: Some(&ANTIGRAVITY_QUESTIONS),
+    // Measured on `agy` 1.5.9: `AGY_CLI_OSC7501=on` makes it emit at once,
+    // terminated by BEL, every sequence carrying `app=antigravity`.
+    status_osc7501: Some(StatusOsc7501 {
+        app: "antigravity",
+        enable_env: ("AGY_CLI_OSC7501", "on"),
+    }),
 };
 
 /// Neutral entry for the "no recognized agent" placeholder. Not a real agent:
@@ -1282,12 +1471,13 @@ pub static NONE: AgentSpec = AgentSpec {
     doorbell_ready_screen: None,
     first_hook: FirstHook::BeforePrompt,
     questions: None,
+    status_osc7501: None,
 };
 
 /// All SHIPPED, detectable agents, in a stable order. Excludes the neutral
 /// [`NONE`] placeholder — it is not a detectable agent and has no strategy to
 /// dispatch. Detection and startup auto-install iterate this slice.
-pub static ALL: &[&AgentSpec] = &[&CLAUDE_CODE, &OPEN_CODE, &PI, &CODEX, &DEVIN];
+pub static ALL: &[&AgentSpec] = &[&CLAUDE_CODE, &OPEN_CODE, &PI, &CODEX, &DEVIN, &ANTIGRAVITY];
 
 /// The registry entry for a given agent type. Total: every [`AgentType`]
 /// variant — including the neutral [`AgentType::None`] — maps to an entry, so
@@ -1299,6 +1489,7 @@ pub fn spec(agent_type: &AgentType) -> &'static AgentSpec {
         AgentType::Pi => &PI,
         AgentType::Codex => &CODEX,
         AgentType::Devin => &DEVIN,
+        AgentType::Antigravity => &ANTIGRAVITY,
         AgentType::None => &NONE,
     }
 }
@@ -1565,6 +1756,12 @@ mod tests {
              command-agnostically (PRD #20 §4.2.1)"
         );
         assert!(
+            spec(&AgentType::Antigravity).startup_auto_install.is_some()
+                && spec(&AgentType::Antigravity).hook_install.is_some()
+                && spec(&AgentType::Antigravity).hook_uninstall.is_some(),
+            "Antigravity installs its named global hook at startup and on request (PRD #211)"
+        );
+        assert!(
             spec(&AgentType::None).startup_auto_install.is_none(),
             "the neutral placeholder has no startup install step"
         );
@@ -1634,7 +1831,8 @@ mod tests {
                 &AgentType::OpenCode,
                 &AgentType::Pi,
                 &AgentType::Codex,
-                &AgentType::Devin
+                &AgentType::Devin,
+                &AgentType::Antigravity
             ]
         );
         assert!(!ALL.iter().any(|spec| spec.agent_type == AgentType::None));
@@ -1716,6 +1914,16 @@ mod tests {
                 "a shipped agent's badge should not reuse the neutral placeholder colour"
             );
         }
+        // PRD #211: no two shipped agents share a badge colour.
+        for (i, a) in ALL.iter().enumerate() {
+            for b in &ALL[i + 1..] {
+                assert_ne!(
+                    a.badge_color, b.badge_color,
+                    "{} and {} share a badge colour",
+                    a.label, b.label
+                );
+            }
+        }
     }
 
     fn keys(agent_type: AgentType) -> &'static PromptKeys {
@@ -1732,9 +1940,8 @@ mod tests {
         }
     }
 
-    /// PRD #1541: each measured agent's keys, pinned by value against the
-    /// verified table in the PRD. A change here is a re-measurement — update
-    /// the versions in [`PromptKeys`]'s doc comment with it.
+    /// Scenario: Read each measured agent's prompt keys, including Antigravity, and compare the interrupt, clear and delete values with the verified interactive measurements.
+    /// A change here is a re-measurement; update the versions in [`PromptKeys`]'s doc comment with it (PRD #1541).
     #[test]
     fn prompt_keys_match_the_verified_table() {
         let claude = keys(AgentType::ClaudeCode);
@@ -1776,6 +1983,20 @@ mod tests {
         assert_eq!(pi.clear.pause_between_writes_ms, None);
         assert_eq!(pi.delete_char.bytes, "\x7f");
         assert_eq!(pi.delete_char.max_literal_write_chars, None);
+
+        // agy 1.5.9, isolated interactive HOME, 2026-11-16: one ESC
+        // interrupts; one Ctrl+U removes a logically single-line draft even
+        // when wrapped; 300 Ctrl+U in one write still clears; one DEL removes
+        // one character; 101 separate DEL writes 20 ms apart remove exactly
+        // 101 characters. Bulk delete measurements left residual input even
+        // at 50 characters, so this table does not invent a literal-write cap.
+        let antigravity = keys(AgentType::Antigravity);
+        assert_eq!(antigravity.interrupt.as_ref(), &[step("\x1b", 0)]);
+        assert_eq!(antigravity.clear.bytes, "\x15");
+        assert_eq!(antigravity.clear.presses, ClearPresses::PerLine);
+        assert_eq!(antigravity.clear.max_presses_per_write, None);
+        assert_eq!(antigravity.clear.pause_between_writes_ms, None);
+        assert_eq!(antigravity.delete_char.bytes, "\x7f");
     }
 
     /// PRD #1541: Devin is unsupported until measured logged in, and the
@@ -1891,6 +2112,159 @@ mod tests {
         assert!(pi["clear"].get("max_presses_per_write").is_none());
         assert!(pi["clear"].get("pause_between_writes_ms").is_none());
         assert!(pi["delete_char"].get("max_literal_write_chars").is_none());
+    }
+
+    /// PRD #211: Antigravity's deletes are served paced — one per write,
+    /// 20 ms apart, as measured on `agy` 1.5.9 — and the pace is additive on
+    /// the wire: absent for every other agent, and a record without it still
+    /// decodes.
+    #[test]
+    fn antigravity_deletes_are_served_paced() {
+        let antigravity = keys(AgentType::Antigravity);
+        assert_eq!(antigravity.delete_char.max_presses_per_write, Some(1));
+        assert_eq!(antigravity.delete_char.pause_between_writes_ms, Some(20));
+        assert_eq!(antigravity.delete_char.max_literal_write_chars, Some(1));
+        let value = serde_json::to_value(antigravity).unwrap();
+        assert_eq!(
+            value["delete_char"],
+            serde_json::json!({"bytes": "\u{7f}", "max_literal_write_chars": 1, "max_presses_per_write": 1, "pause_between_writes_ms": 20})
+        );
+        for agent in [
+            AgentType::ClaudeCode,
+            AgentType::Codex,
+            AgentType::OpenCode,
+            AgentType::Pi,
+        ] {
+            let value = serde_json::to_value(keys(agent)).unwrap();
+            assert!(value["delete_char"].get("max_presses_per_write").is_none());
+            assert!(
+                value["delete_char"]
+                    .get("pause_between_writes_ms")
+                    .is_none()
+            );
+        }
+        let older: DeleteCharKey =
+            serde_json::from_value(serde_json::json!({"bytes": "\u{7f}"})).unwrap();
+        assert_eq!(older.max_presses_per_write, None);
+        assert_eq!(older.pause_between_writes_ms, None);
+    }
+
+    /// PRD #211: an agent whose deletes are paced serves its per-write cap as
+    /// its literal-write bound, so a client that predates pacing, and sends a
+    /// write's deletes in one burst, never sends more of them in one write
+    /// than the agent keeps.
+    #[test]
+    fn paced_deletes_bound_a_burst_client_to_one_write() {
+        for spec in ALL {
+            let Some(keys) = spec.prompt_keys.as_ref() else {
+                continue;
+            };
+            if let Some(cap) = keys.delete_char.max_presses_per_write {
+                assert_eq!(
+                    keys.delete_char.max_literal_write_chars,
+                    Some(cap),
+                    "{}: a paced agent's literal-write bound is its per-write cap",
+                    spec.label
+                );
+            }
+        }
+    }
+
+    /// PRD #211, the reviewer's contract finding: a desktop built before
+    /// pacing existed, attached to this daemon, reads Antigravity's served
+    /// keys by its own rules — the pre-branch `map_prompt_keys` allowlist in
+    /// `desktop/src-tauri/src/dto.rs` and the pre-branch "scratch that" in
+    /// `VoiceControlPanel.tsx`, which refuses a write longer than
+    /// `min(800, maxLiteralWriteChars)` and otherwise writes
+    /// `deleteChar.bytes.repeat(length)` at once. Those rules, frozen here,
+    /// applied to the JSON this daemon serves, never send a burst longer than
+    /// the agent's per-write cap, while its interrupt and clear still map.
+    #[test]
+    fn a_pre_pacing_client_never_bursts_antigravity_deletes() {
+        // The pre-branch wire types: unknown fields are ignored, as there.
+        #[derive(Deserialize)]
+        struct OldStep {
+            bytes: String,
+            pause_after_ms: u32,
+        }
+        #[derive(Deserialize)]
+        struct OldClear {
+            bytes: String,
+            presses: ClearPresses,
+            #[serde(default)]
+            max_presses_per_write: Option<u32>,
+            #[serde(default)]
+            pause_between_writes_ms: Option<u32>,
+        }
+        #[derive(Deserialize)]
+        struct OldDelete {
+            bytes: String,
+            #[serde(default)]
+            max_literal_write_chars: Option<u32>,
+        }
+        #[derive(Deserialize)]
+        struct OldKeys {
+            interrupt: Vec<OldStep>,
+            clear: OldClear,
+            delete_char: OldDelete,
+        }
+        // The pre-branch `map_prompt_keys`: `Some(literal limit)` when the
+        // set reaches the panel.
+        fn old_map(keys: &OldKeys) -> Option<Option<u32>> {
+            if keys.interrupt.is_empty() || keys.interrupt.len() > 2 {
+                return None;
+            }
+            if keys.interrupt.iter().any(|step| step.bytes != "\x1b")
+                || keys
+                    .interrupt
+                    .iter()
+                    .map(|step| u64::from(step.pause_after_ms))
+                    .sum::<u64>()
+                    > 2_000
+            {
+                return None;
+            }
+            if keys.clear.bytes != "\x15" || !["\x7f", "\x08"].contains(&&*keys.delete_char.bytes) {
+                return None;
+            }
+            let total: u64 = match keys.clear.presses {
+                ClearPresses::PerWrappedRow => 64,
+                ClearPresses::PerLine => 32,
+                ClearPresses::Unknown => return None,
+            };
+            let per_write = match keys.clear.max_presses_per_write {
+                Some(0) => return None,
+                Some(cap) => u64::from(cap),
+                None => total,
+            };
+            if (total.div_ceil(per_write) - 1)
+                * u64::from(keys.clear.pause_between_writes_ms.unwrap_or(0))
+                > 3_000
+            {
+                return None;
+            }
+            Some(keys.delete_char.max_literal_write_chars)
+        }
+        // The pre-branch scratch: the one write of deletes it sends for a
+        // dictated write of `chars` characters, or `None` when it refuses.
+        fn old_scratch(limit: Option<u32>, chars: u32) -> Option<u32> {
+            (chars <= 800u32.min(limit.unwrap_or(800))).then_some(chars)
+        }
+
+        let served = keys(AgentType::Antigravity);
+        let cap = served.delete_char.max_presses_per_write.expect("paced");
+        let old: OldKeys = serde_json::from_value(serde_json::to_value(served).unwrap()).unwrap();
+        let limit = old_map(&old).expect("an old client still gets interrupt and clear");
+        for chars in 1..=900 {
+            if let Some(burst) = old_scratch(limit, chars) {
+                assert!(
+                    burst <= cap,
+                    "an old client would burst {burst} deletes into agy in one write"
+                );
+            }
+        }
+        assert_eq!(old_scratch(limit, 1), Some(1), "one character is one write");
+        assert_eq!(old_scratch(limit, 2), None, "longer is refused, not burst");
     }
 
     /// PRD #1541: a clear rule a NEWER daemon names decodes as `Unknown`

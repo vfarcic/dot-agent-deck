@@ -44,6 +44,13 @@ pub const SHARED_GRACE: Duration = Duration::from_secs(10);
 /// and keeps it armed while OpenCode runs, idle or not.
 pub const SILENT_GRACE: Duration = Duration::from_secs(45);
 
+/// Issue #2441: the first OpenCode version whose private server runs the
+/// shell tool's commands under a process daemon (`opencode-pty daemon`, its
+/// direct child in a session of its own). Measured: 2.3.2 has it, 2.2.7 runs
+/// each command as the server's direct child instead; the 2.3.0 release notes
+/// already describe shell commands running through the process daemon.
+pub const PROCESS_DAEMON_FLOOR: Version = (2, 3, 0);
+
 /// One process, as much of it as the sample read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcRow {
@@ -65,6 +72,11 @@ pub struct Client {
     /// that is an OpenCode `serve --stdio` ([`private_server`]). `None` when
     /// it has none.
     pub private_server: Option<i32>,
+    /// Issue #2441: the pid of its private server's process daemon: the
+    /// first (breadth first) direct child of the private server that runs
+    /// OpenCode's `opencode-pty` executable as `daemon` ([`process_daemon`]).
+    /// `None` when it has none, or has no private server.
+    pub process_daemon: Option<i32>,
 }
 
 /// OpenCode subcommands that are not an agent session (1.x and 2.x `--help`).
@@ -155,6 +167,32 @@ fn private_server(row: &ProcRow) -> bool {
     is_opencode(row) && row.argv.as_deref().is_some_and(serves_stdio)
 }
 
+/// Issue #2441: whether `exe`, a process's executable as the system reports
+/// it, is OpenCode's process daemon
+/// ([`crate::platform::proc::OPENCODE_PROCESS_DAEMON`]; measured on 2.3.2 as
+/// `~/.cache/opencode/bin/opencode-pty/<ver>/opencode-pty`), with the
+/// `(deleted)` suffix of a binary replaced in place dropped as
+/// [`exe_is_opencode`] does.
+pub fn exe_is_process_daemon(exe: &Path) -> bool {
+    file_name(exe).is_some_and(|name| {
+        let name = name.strip_suffix(" (deleted)").unwrap_or(name);
+        name.strip_suffix(".exe").unwrap_or(name) == crate::platform::proc::OPENCODE_PROCESS_DAEMON
+    })
+}
+
+/// Issue #2441: whether `row` is OpenCode's process daemon, by its executable
+/// ([`exe_is_process_daemon`], never by its arguments alone) and its
+/// subcommand, `daemon`, the first word after the program (measured on
+/// 2.3.2: `opencode-pty daemon --runtime-dir <dir> --name <uuid>`).
+fn process_daemon(row: &ProcRow) -> bool {
+    row.exe.as_deref().is_some_and(exe_is_process_daemon)
+        && row
+            .argv
+            .as_deref()
+            .and_then(|argv| argv.get(1))
+            .is_some_and(|word| word == "daemon")
+}
+
 /// Whether process `pid`'s stdin and stdout are both sockets. An OpenCode 2
 /// private server's are, a socketpair with its client (measured on 2.2.5).
 /// This is a heuristic, not a binding: a process a tool starts can have
@@ -217,13 +255,19 @@ pub fn find_client(rows: &[ProcRow], root: i32) -> Option<Client> {
             && !opencode_pids.contains(&row.ppid)
             && !subcommand(row).is_some_and(|sub| NOT_A_SESSION.contains(&sub))
     })?;
+    let server = tree
+        .iter()
+        .find(|row| row.ppid == client.pid && private_server(row))
+        .map(|row| row.pid);
     Some(Client {
         pid: client.pid,
         exe: client.exe.clone(),
-        private_server: tree
-            .iter()
-            .find(|row| row.ppid == client.pid && private_server(row))
-            .map(|row| row.pid),
+        private_server: server,
+        process_daemon: server.and_then(|server| {
+            tree.iter()
+                .find(|row| row.ppid == server && process_daemon(row))
+                .map(|row| row.pid)
+        }),
     })
 }
 
@@ -292,7 +336,11 @@ pub fn sample(roots: &[i32]) -> Option<Vec<ProcRow>> {
             continue;
         };
         row.exe = crate::platform::proc::executable_of(pid);
-        if row.exe.as_deref().is_some_and(exe_is_opencode) {
+        if row
+            .exe
+            .as_deref()
+            .is_some_and(|exe| exe_is_opencode(exe) || exe_is_process_daemon(exe))
+        {
             row.argv = arguments_of(pid);
         }
     }
@@ -342,14 +390,96 @@ pub(crate) fn arguments_of(_pid: u32) -> Option<Vec<String>> {
 }
 
 /// One OpenCode agent the daemon watches: its pane, its registry id, the
-/// pid its process tree hangs from, and the version the spawn-time probe read
-/// from the binary its command names directly (`None` for a wrapper).
+/// pid its process tree hangs from, the version the spawn-time probe read
+/// from the binary its command names directly (`None` for a wrapper), and
+/// whether that spawn probed at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Watched {
     pub pane_id: String,
     pub agent_id: String,
     pub root_pid: i32,
     pub spawn_version: Option<Version>,
+    pub spawn_probe: SpawnProbe,
+}
+
+/// Issue #2445: whether an agent's spawn asked its OpenCode `--version`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpawnProbe {
+    /// The spawn knew it started OpenCode (a declared type, or a command
+    /// whose basename names it) and probed then.
+    Done,
+    /// The spawn did not know: an undeclared wrapper (`devbox run oc`, a
+    /// script) whose own hooks revealed OpenCode later. The `opencode` the
+    /// PATH the deck handed the pane resolves to (`path`, `None` when it
+    /// handed none) is owed the probe a wrapper spawn gets
+    /// ([`probe_owed`]), or no client's version would ever be known and its
+    /// private server would count as a background command for the pane's
+    /// life.
+    Owed { path: Option<std::ffi::OsString> },
+}
+
+/// Issue #2445: for every watched agent whose spawn did not probe
+/// ([`SpawnProbe::Owed`]), ask the `opencode` its pane's PATH resolves to,
+/// else the one `daemon_path` resolves to, `--version` through `detect`,
+/// exactly as a wrapper's spawn does
+/// ([`crate::opencode_version::probe_path_opencode_with`]), once per distinct
+/// PATH. In production `detect` is [`crate::opencode_version::detect`], which
+/// records the answer by file identity and reuses it while the file is
+/// unchanged and the answer is cached, asking again a minute after a probe
+/// that did not complete; [`evaluate`] then finds the version only for a
+/// client that runs that very file
+/// ([`crate::opencode_version::recorded_version`]). The deck chooses the file
+/// from the PATH it handed the pane, never from the process table. Blocking:
+/// [`run_monitor`] runs it beside its looks, not before them, so a slow
+/// `--version` delays no pane's notices.
+pub fn probe_owed(
+    watched: &[Watched],
+    daemon_path: Option<&std::ffi::OsStr>,
+    detect: &dyn Fn(&Path, Option<&std::ffi::OsStr>) -> Option<Version>,
+) {
+    let mut asked = HashSet::new();
+    for w in watched {
+        if let SpawnProbe::Owed { path } = &w.spawn_probe
+            && asked.insert(path.as_deref().or(daemon_path))
+        {
+            crate::opencode_version::probe_path_opencode_with(
+                path.as_deref().or(daemon_path),
+                daemon_path,
+                detect,
+            );
+        }
+    }
+}
+
+/// Issue #2445: start [`probe_owed`] for `watched` on a blocking thread of its
+/// own, unless one is still running (`running`) or no agent is owed a probe.
+/// Its answers are recorded for the next look; a hung probe holds back only
+/// the next batch, never the looks.
+fn spawn_owed_probes(watched: &[Watched], running: &std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    use std::sync::atomic::Ordering;
+    let owed: Vec<Watched> = watched
+        .iter()
+        .filter(|w| matches!(w.spawn_probe, SpawnProbe::Owed { .. }))
+        .cloned()
+        .collect();
+    if owed.is_empty() || running.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    struct Done(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for Done {
+        fn drop(&mut self) {
+            self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let done = Done(running.clone());
+    tokio::task::spawn_blocking(move || {
+        let _done = done;
+        probe_owed(
+            &owed,
+            std::env::var_os("PATH").as_deref(),
+            &crate::opencode_version::detect,
+        );
+    });
 }
 
 /// What the daemon remembers between samples: when it first saw each agent's
@@ -497,9 +627,11 @@ pub const REPORT_SLACK: Duration = Duration::from_secs(10);
 ///   taken to be the spawn's, so one that replaced it before the watch's
 ///   first look still gets the spawn's version. In production `version_of` is
 ///   [`crate::opencode_version::recorded_version`], which only reads what a
-///   spawn-time probe recorded (a direct command's binary, or the `opencode`
-///   a wrapper's PATH resolves to) and runs nothing, so a client running a
-///   file no spawn probed has an unknown version (and gets neither the
+///   probe recorded (a direct command's binary, or the `opencode` a
+///   wrapper's PATH resolves to, asked at its spawn or, for an undeclared
+///   wrapper that its hooks revealed later, by [`probe_owed`]) and runs
+///   nothing, so a client running a file no probe asked has an unknown
+///   version (and gets neither the
 ///   shared-service nor the unsupported-version notice). A wrapper-started
 ///   client whose version is known this way has its generation queued on
 ///   `watch` ([`Watch::take_confirmed`]).
@@ -545,6 +677,10 @@ pub fn evaluate(
                     // a tool starting `opencode serve --stdio` is this shape.
                     // Recomputed on every look, so a client that changed (or
                     // whose version is no longer known) loses it here.
+                    // Issue #2441: and its process daemon, only on a known
+                    // 2.3 or later: before 2.3 there is none, and the shell
+                    // tool runs its commands as the server's direct children,
+                    // so a tool could start that shape.
                     match (version.map(Major::of), client.private_server) {
                         (Some(Major::V2), Some(server_pid)) => {
                             watch.servers.insert(
@@ -552,6 +688,9 @@ pub fn evaluate(
                                 crate::platform::proc::AgentServer {
                                     client_pid: client.pid,
                                     server_pid,
+                                    process_daemon_pid: client.process_daemon.filter(|_| {
+                                        version.is_some_and(|v| v >= PROCESS_DAEMON_FLOOR)
+                                    }),
                                 },
                             );
                         }
@@ -578,9 +717,11 @@ pub fn evaluate(
 /// only of a change). Takes no sample while no OpenCode agent runs. One
 /// sample at a time: a sample that stalls (a `ps` stuck on a hung filesystem)
 /// stalls this watch and nothing else, and never starts a second one. It
-/// never runs a binary it finds: versions come only from the spawn-time
-/// probe's record ([`evaluate`]). A wrapper-started client whose version that
-/// record gives has its generation remembered
+/// never runs a binary it finds in the process table: versions come only from
+/// a probe's record ([`evaluate`]), of a file the deck chose from the PATH it
+/// handed the pane, at the spawn or, for an undeclared wrapper, beside its
+/// looks ([`probe_owed`], issue #2445). A wrapper-started client whose version
+/// that record gives has its generation remembered
 /// ([`crate::opencode_manage::remember_layout`], in the deck's own state, not
 /// in OpenCode's config), for the next install that has no command to look
 /// at.
@@ -589,6 +730,7 @@ pub async fn run_monitor(
     state: crate::state::SharedState,
 ) {
     let mut watch = Watch::default();
+    let owed_probes = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut ticker = tokio::time::interval(POLL_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -633,6 +775,9 @@ pub async fn run_monitor(
                 }
             }
         }
+        // Issue #2445: the version an undeclared wrapper's spawn did not
+        // record, for a later look.
+        spawn_owed_probes(&watched, &owed_probes);
         let spawned_clients = watch.spawned_clients.clone();
         let job = tokio::task::spawn_blocking(move || {
             let roots: Vec<i32> = watched.iter().map(|w| w.root_pid).collect();
@@ -821,6 +966,7 @@ mod tests {
             pid: 1,
             exe: None,
             private_server: private_server.then_some(2),
+            process_daemon: None,
         }
     }
 
@@ -910,6 +1056,7 @@ mod tests {
             agent_id: "agent-a".to_string(),
             root_pid: 100,
             spawn_version,
+            spawn_probe: SpawnProbe::Done,
         };
         let unprobed = |_: &Path| None;
         let t0 = std::time::Instant::now();
@@ -959,6 +1106,7 @@ mod tests {
             agent_id: "agent-a".to_string(),
             root_pid: 100,
             spawn_version: None,
+            spawn_probe: SpawnProbe::Done,
         }];
         let v2 = |_: &Path| Some((2, 2, 5));
         let mut watch = Watch::default();
@@ -1023,6 +1171,7 @@ mod tests {
             agent_id: format!("agent-{pane}"),
             root_pid: root,
             spawn_version: None,
+            spawn_probe: SpawnProbe::Done,
         };
         let all = [watched("a", 100), watched("b", 300), watched("c", 400)];
         let t0 = std::time::Instant::now();
@@ -1074,6 +1223,7 @@ mod tests {
             agent_id: "agent-a".to_string(),
             root_pid: 100,
             spawn_version: None,
+            spawn_probe: SpawnProbe::Done,
         }];
         let v2 = |_: &Path| Some((2, 2, 5));
         let mut watch = Watch::default();
@@ -1151,5 +1301,151 @@ mod tests {
             watch.seen_for("a", 11, t0 + Duration::from_secs(9)),
             Duration::ZERO
         );
+    }
+
+    /// Scenario: an OpenCode 2 started by an undeclared wrapper, whose own
+    /// hooks revealed it after its spawn (which therefore probed nothing),
+    /// runs a client with a private server. The watch asks the `opencode` the
+    /// pane's PATH resolves to `--version` once, before its look, so the look
+    /// names the private server instead of leaving it to count as a
+    /// background command; a pane whose spawn already probed is asked
+    /// nothing, and a client running another file stays unknown (issue
+    /// #2445).
+    #[cfg(unix)]
+    #[test]
+    fn an_undeclared_wrappers_owed_probe_names_its_private_server() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = crate::test_temp::tempdir().unwrap();
+        let pane_bin = dir.path().join("pane-bin");
+        let daemon_bin = dir.path().join("daemon-bin");
+        let elsewhere = dir.path().join("elsewhere");
+        for bin_dir in [&pane_bin, &daemon_bin, &elsewhere] {
+            std::fs::create_dir_all(bin_dir).unwrap();
+            let bin = bin_dir.join("opencode");
+            crate::test_isolation::write_script(
+                &bin,
+                format!("#!/bin/sh\n# {}\n", bin_dir.display()),
+            )
+            .unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let client_exe = pane_bin.join("opencode");
+        let rows = |exe: &Path| {
+            let exe = exe.to_str().unwrap();
+            vec![
+                row(1, 0, "/sbin/init", &[]),
+                row(100, 1, "/usr/bin/dash", &[]),
+                row(102, 100, exe, &["opencode", "--standalone", "--auto"]),
+                row(
+                    103,
+                    102,
+                    exe,
+                    &["opencode", "serve", "--stdio", "--port", "0"],
+                ),
+            ]
+        };
+        let owed = Watched {
+            pane_id: "a".to_string(),
+            agent_id: "agent-a".to_string(),
+            root_pid: 100,
+            spawn_version: None,
+            spawn_probe: SpawnProbe::Owed {
+                path: Some(pane_bin.clone().into_os_string()),
+            },
+        };
+        let asked = std::cell::RefCell::new(Vec::new());
+        let detect = |path: &Path, _: Option<&std::ffi::OsStr>| {
+            asked.borrow_mut().push(path.to_path_buf());
+            crate::opencode_version::detect_with(path, |_| Some("opencode v2.2.7".to_string()))
+        };
+        let daemon_path = daemon_bin.clone().into_os_string();
+        let none = HashMap::new();
+        let t0 = std::time::Instant::now();
+
+        let mut watch = Watch::default();
+        evaluate(
+            std::slice::from_ref(&owed),
+            &rows(&client_exe),
+            &mut watch,
+            t0,
+            &crate::opencode_version::recorded_version,
+            &none,
+        );
+        assert_eq!(
+            watch.private_server("agent-a"),
+            None,
+            "nothing probed yet: the version is unknown"
+        );
+
+        probe_owed(std::slice::from_ref(&owed), Some(&daemon_path), &detect);
+        assert_eq!(
+            *asked.borrow(),
+            vec![client_exe.clone()],
+            "the pane's PATH wins"
+        );
+        evaluate(
+            std::slice::from_ref(&owed),
+            &rows(&client_exe),
+            &mut watch,
+            t0,
+            &crate::opencode_version::recorded_version,
+            &none,
+        );
+        assert_eq!(
+            watch.private_server("agent-a"),
+            Some(crate::platform::proc::AgentServer {
+                client_pid: 102,
+                server_pid: 103,
+                process_daemon_pid: None,
+            }),
+            "the probed file's client has its private server named"
+        );
+
+        // A pane handed no PATH is probed on the daemon's.
+        asked.borrow_mut().clear();
+        let no_path = Watched {
+            spawn_probe: SpawnProbe::Owed { path: None },
+            ..owed.clone()
+        };
+        probe_owed(std::slice::from_ref(&no_path), Some(&daemon_path), &detect);
+        assert_eq!(*asked.borrow(), vec![daemon_bin.join("opencode")]);
+
+        // Several panes on one PATH are asked once per batch.
+        asked.borrow_mut().clear();
+        let sibling = Watched {
+            agent_id: "agent-b".to_string(),
+            ..owed.clone()
+        };
+        probe_owed(
+            &[owed.clone(), no_path, sibling],
+            Some(&daemon_path),
+            &detect,
+        );
+        assert_eq!(
+            *asked.borrow(),
+            vec![client_exe.clone(), daemon_bin.join("opencode")],
+            "one probe per distinct PATH"
+        );
+
+        // A spawn that probed is asked nothing here.
+        asked.borrow_mut().clear();
+        let probed = Watched {
+            spawn_probe: SpawnProbe::Done,
+            ..owed.clone()
+        };
+        probe_owed(&[probed], Some(&daemon_path), &detect);
+        assert!(asked.borrow().is_empty());
+
+        // A client running a file nobody probed is still unknown.
+        let mut watch = Watch::default();
+        evaluate(
+            std::slice::from_ref(&owed),
+            &rows(&elsewhere.join("opencode")),
+            &mut watch,
+            t0,
+            &crate::opencode_version::recorded_version,
+            &none,
+        );
+        assert_eq!(watch.private_server("agent-a"), None);
     }
 }

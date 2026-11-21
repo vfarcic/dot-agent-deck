@@ -22,7 +22,7 @@
 #      with --remote-exec, DAD_REMOTE_EXEC)
 #      for non-interactive shells and systemd --user,
 #      so the deck daemon finds every agent and every agent inherits the same environment
-#   5. agents (claude, opencode 2.x, codex, pi, devin; a pinned opencode 1.x off PATH for tests), sem, the rwx CLI,
+#   5. agents (claude, opencode 2.x, codex, pi, devin, agy; a pinned opencode 1.x off PATH for tests), sem, the rwx CLI,
 #      dot-agent-deck, `hooks install`
 #   6. with --relay: the relay container and the dot-agent-deck-collector user service
 #   7. the optional repo (with --desktop, Playwright's browsers for it)
@@ -552,7 +552,7 @@ step "agents"
 # installed some other way is left alone, and a binary that answers nothing
 # readable is reported, not replaced, since a broken 2.x cannot be told from
 # anything else that way.
-OPENCODE_2_VERSION=2.2.7
+OPENCODE_2_VERSION=2.3.2
 OPENCODE_2_DIR="$HOME/.local/share/dot-agent-deck/opencode-2"
 OPENCODE_2_BIN="$OPENCODE_2_DIR/node_modules/.bin/opencode"
 OC_BIN="$HOME/.opencode/bin/opencode"
@@ -632,6 +632,43 @@ fi
 # no input and judge by whether the binary landed.
 if ! have devin; then
   bash -c "$(curl -fsSL https://cli.devin.ai/install.sh)" </dev/null || [ -x "$HOME/.local/bin/devin" ]
+fi
+# Google's Antigravity CLI, `agy` (PRD #211). Google's installer
+# (https://antigravity.google/cli/install.sh) ends by running `agy install`,
+# which appends an unmarked PATH line to ~/.bashrc and ~/.profile; layer 4
+# already puts ~/.local/bin on every PATH, so this does the installer's other
+# steps itself: read the platform's manifest, download the tarball it names,
+# check it against the manifest's sha512, and put its `antigravity` binary at
+# ~/.local/bin/agy. The manifest names only the latest release, so there is no
+# pin to keep. `agy` updates itself in the background, so a present binary is
+# never reinstalled, and its auto-update is left on. A failure warns and the
+# run goes on: nothing later in this script needs `agy`.
+AGY_BIN="$HOME/.local/bin/agy"
+AGY_MANIFESTS=https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests
+install_agy() (
+  # Called from an `||` list, where bash ignores `set -e`, so every step
+  # checks its own status.
+  case "$BIN_ARCH" in
+    amd64|arm64) ;;
+    *) echo "  warning: no Antigravity CLI build for $(uname -m); skipped"; return 0 ;;
+  esac
+  manifest="$(curl -fsSL "$AGY_MANIFESTS/linux_$BIN_ARCH.json")" || return 1
+  field() { printf '%s\n' "$manifest" | sed -n 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1; }
+  url="$(field url)"; sha512="$(field sha512)"
+  case "$url" in https://*.tar.gz) ;; *) echo "  warning: the Antigravity CLI manifest names no https tarball: '$url'"; return 1 ;; esac
+  [[ "$sha512" =~ ^[0-9a-f]{128}$ ]] || { echo "  warning: the Antigravity CLI manifest carries no sha512"; return 1; }
+  stage="$(mktemp -d)" || return 1
+  trap 'rm -rf "$stage"' EXIT
+  curl -fsSL -o "$stage/agy.tar.gz" "$url" || return 1
+  printf '%s  %s\n' "$sha512" "$stage/agy.tar.gz" | sha512sum -c --quiet - ||
+    { echo "  warning: the Antigravity CLI tarball does not match its manifest's sha512"; return 1; }
+  tar -xzf "$stage/agy.tar.gz" -C "$stage" antigravity || return 1
+  mkdir -p "$(dirname "$AGY_BIN")" &&
+    install -m 0755 "$stage/antigravity" "$AGY_BIN.part" &&
+    mv "$AGY_BIN.part" "$AGY_BIN"
+)
+if [ ! -e "$AGY_BIN" ]; then
+  install_agy || { rm -f "$AGY_BIN.part"; echo "  warning: could not install the Antigravity CLI (agy); skipped (run this script again to retry)"; }
 fi
 have sem   || curl -fsSL https://storage.googleapis.com/sem-cli-releases/get.sh | bash
 # The rwx CLI, for this repo's RWX CI backend and remote sandbox
@@ -876,7 +913,7 @@ fi
 # -------- 8. what is left for the operator -----------------------------------
 
 step "versions"
-for c in dot-agent-deck claude opencode codex pi devin sem rwx docker node devbox git gh; do
+for c in dot-agent-deck claude opencode codex pi devin agy sem rwx docker node devbox git gh; do
   v=MISSING
   if have "$c"; then
     case "$c" in sem|devbox) v="$("$c" version 2>/dev/null | head -n1)" ;; *) v="$("$c" --version 2>/dev/null | head -n1)" ;; esac
@@ -893,6 +930,15 @@ check codex    '[ -s ~/.codex/auth.json ]'                    'codex login'
 check opencode '[ -s ~/.local/share/opencode/auth.json ]'     'opencode auth login'
 check pi       '[ -s ~/.pi/agent/auth.json ]'                 'pi   (then /login)'
 check devin    '[ -s ~/.local/share/devin/credentials.toml ]' 'devin   (follow its login prompt)'
+# agy counts as logged in when its Google-account sign-in file is present and
+# non-empty, or when its API-key setup (the one to use inside the deck) is in
+# place. agy keeps the sign-in in the OS keyring when there is one and falls
+# back to that file only on a box without a keyring, so a sign-in kept in a
+# keyring is invisible to this check: on such a box a signed-in agy may still be
+# listed here as needing a login.
+# shellcheck disable=SC2016  # eval'd inside check()
+have agy && check agy '[ -s ~/.gemini/antigravity-cli/antigravity-oauth-token ] || { [ -n "${GEMINI_API_KEY:-}" ] && grep -Eq "\"modelProvider\"[[:space:]]*:[[:space:]]*\"gemini\"" ~/.gemini/antigravity-cli/settings.json; }' \
+  'agy   (then sign in with a Google account) or, for use inside the deck, an API key: set {"modelProvider": "gemini"} in ~/.gemini/antigravity-cli/settings.json and export GEMINI_API_KEY'
 check gh       'gh auth status'                               'gh auth login && gh auth setup-git'
 have rwx && check rwx 'rwx whoami'                            'rwx login'
 if [ "$USE_VALS_FLAG" = 1 ]; then

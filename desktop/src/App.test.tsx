@@ -2186,7 +2186,7 @@ describe("ControlDeck", () => {
     expect(screen.queryByTestId("worktree-kept-toast")).toBeNull();
   });
 
-  /** Scenario (issue #1958): close the selected dispatched agent from the deck toolbar with "Close agent, keep worktree"; the stop carries the keep. */
+  /** Scenario (issues #1958 and #2436): close the selected dispatched agent from the deck toolbar with "Keep the worktree" ticked; the stop carries the keep. */
   it("closes from the toolbar keeping the worktree", async () => {
     const snapshot = createFixtureSnapshot("connected");
     snapshot.agents[0].paneId = "pane-toolbar";
@@ -2196,9 +2196,31 @@ describe("ControlDeck", () => {
     render(<ControlDeck runtime={rt} />);
     fireEvent.click(screen.getByRole("button", { name: "Close Planner" }));
     const dialog = screen.getByRole("alertdialog");
-    const keep = await within(dialog).findByRole("button", { name: "Close agent, keep worktree" });
-    await act(async () => fireEvent.click(keep));
+    fireEvent.click(await within(dialog).findByRole("checkbox", { name: "Keep the worktree" }));
+    await act(async () => fireEvent.click(within(dialog).getByRole("button", { name: "Close agent" })));
     expect(rt.runAction).toHaveBeenCalledExactlyOnceWith({ type: "stop_agent", deckId: FIXTURE_DAEMON_ID, agentId: "planner", incarnation: "process-toolbar", keepWorktree: true });
+  });
+
+  /**
+   * Scenario (issue #2436): on the Daemons screen, with a worker (planner, selected) of
+   * a two-role orchestration led by builder, and press its toolbar Close. The confirmation
+   * leads with Close agent and also offers Close orchestration; pressing
+   * Close orchestration sends one `stop_orchestration` over both roles and the
+   * screen's notice names the orchestration.
+   */
+  it("closes the selected role's whole orchestration from the toolbar", async () => {
+    const snapshot = createFixtureSnapshot("connected");
+    const tab = (roleName: string, roleIndex: number, isStartRole: boolean) => ({ kind: "orchestration" as const, orchestrationId: "orc-2436", name: "review", roleName, roleIndex, isStartRole });
+    snapshot.agents = snapshot.agents.filter((agent) => agent.id === "planner" || agent.id === "builder").map((agent) => ({ ...agent, incarnation: "process-a", tab: agent.id === "planner" ? tab("planner", 1, false) : tab("builder", 0, true) }));
+    const rt = runtime({ snapshot });
+    render(<ControlDeck runtime={rt} />);
+    fireEvent.click(screen.getByRole("button", { name: "Close Planner" }));
+    const dialog = screen.getByRole("alertdialog");
+    expect(dialog).toHaveTextContent("Close agent stops only planner, leaving review one role short; its other roles keep running.");
+    expect(within(dialog).getByRole("button", { name: "Close agent" })).toHaveClass("leads");
+    await act(async () => fireEvent.click(within(dialog).getByRole("button", { name: "Close orchestration" })));
+    expect(rt.runAction).toHaveBeenCalledExactlyOnceWith({ type: "stop_orchestration", deckId: FIXTURE_DAEMON_ID, roles: [{ agentId: "builder", name: "builder", incarnation: "process-a" }, { agentId: "planner", name: "planner", incarnation: "process-a" }] });
+    expect(await screen.findByText("review close requested.")).toBeInTheDocument();
   });
 
   /** Scenario: The narrow layout keeps its agent summary visible, then opens the Events drawer on demand. */

@@ -52,6 +52,9 @@ import {
   VOICE_DICTATION_TICK_MS,
   VOICE_JOIN_WINDOW_MS,
   VOICE_STATUS_POLL_MS,
+  VOICE_CHAIN_SETTLE_MS,
+  chainDropped,
+  chainStopped,
 } from "./VoiceControlPanel";
 
 /**
@@ -3739,6 +3742,15 @@ describe("the rest of the New agent form, by voice (PRD #1223)", () => {
          command is kept only when the transcript holds it, and the value is
          the transcript's words less the sentence's full stop. "with flags"
          stands for a model that added one: refused, nothing dispatched. */
+      /* PRD #1184 — a chain of two form steps, as Rust answers it: No mode,
+         then an agent type, both judged on the form as declared. */
+      if (utterance === "back to no mode and use claude") {
+        const steps = [
+          { said: "back to no mode", action: "choose_mode", invoke: "chooseNewAgentMode", params: [{ name: "mode", kind: "mode_ref", spoken: "no mode", value: "none", label: "No mode" }], sentence: "Mode: No mode.", screen: "overview" },
+          { said: "use claude", action: "choose_agent_type", invoke: "chooseNewAgentType", params: [{ name: "agent_type", kind: "agent_type_ref", spoken: "claude", value: "claude", label: "Claude Code" }], sentence: "Command set to Claude Code's default command.", screen: "overview" },
+        ] as Extract<VoiceResultDto["outcome"], { kind: "chain" }>["steps"];
+        return { resolveMs: 21, backend: "stub", outcome: { kind: "chain", transcript: utterance, steps, sentence: "Mode: No mode, then command set to Claude Code's default command." } };
+      }
       const commandOpener = ["set the command to ", "make the command "].find((opener) => utterance.toLowerCase().startsWith(opener));
       if (commandOpener !== undefined) {
         if (!form && !options.forced) return unavailable("set_new_agent_command", "setting the command needs a daemon and a directory chosen in the New agent dialog; choose those first");
@@ -3926,6 +3938,31 @@ describe("the rest of the New agent form, by voice (PRD #1223)", () => {
     expect(screen.getByTestId("voice-report")).toHaveTextContent(COMMAND_HIDDEN_BY_ORCHESTRATION);
     fireEvent.click(screen.getByTestId("new-agent-mode-none"));
     expect(screen.getByTestId("new-agent-command")).toHaveValue("bash");
+  });
+
+  /**
+   * Scenario (PRD #1184, Greptile on PR #2417): with the review orchestration
+   * chosen, say "back to no mode and use claude". The second step runs only
+   * once the first one's form change has landed, so it fills Command instead
+   * of being refused as if the orchestration were still chosen.
+   */
+  it("runs a chain's second form step against the form the first one left", async () => {
+    const voice = microphone([]);
+    const { deck } = formDeck(voice);
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnVoiceOn();
+    await openForm();
+
+    voice.deliver("mode orch: review");
+    await completeUtterance();
+    voice.deliver("back to no mode and use claude");
+    await completeUtterance();
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_CHAIN_SETTLE_MS * 2); });
+    await flush();
+
+    expect(screen.getByTestId("voice-report")).not.toHaveTextContent(COMMAND_HIDDEN_BY_ORCHESTRATION);
+    expect(pressedMode()).toBe("none");
+    expect(screen.getByTestId("new-agent-command")).toHaveValue("claude --model haiku");
   });
 
   /** Scenario: an agent the daemon does not offer is refused, and Command is left alone. */
@@ -4463,7 +4500,7 @@ describe("PRD #802 D5 — a spoken stop opens a confirmation; a spoken start sta
     expect(runAction).toHaveBeenCalledWith({ type: "stop_agent", deckId: snapshot.connection.deckId, agentId: target.id });
   });
 
-  /** Scenario: with typing off, a whole spoken stop on the agent screen opens the same confirmation as Close agent. Cancelling leaves its pane open; confirming closes the viewed role alone and returns to the dashboard. */
+  /** Scenario: with typing off, a whole spoken stop on the agent screen opens the same confirmation as Close agent. Cancelling leaves its pane open; confirming Close agent closes the viewed role alone and returns to the dashboard. */
   it.each(["stop", "stop it", "stop that", "close this agent"])("confirms %s on the agent screen without stopping anything by voice alone", async (utterance) => {
     const voice = microphone([]);
     const { deck, runAction, snapshot } = d5Deck(voice);
@@ -4474,7 +4511,9 @@ describe("PRD #802 D5 — a spoken stop opens a confirmation; a spoken start sta
     voice.deliver(utterance);
     await completeUtterance();
     expect(confirmation()).toHaveTextContent("Close lead?");
-    expect(confirmation()).toHaveTextContent("leaving the orchestration one role short");
+    // Issue #2436: the orchestrator's dialog also offers closing the whole orchestration.
+    expect(confirmation()).toHaveTextContent("Close agent stops only lead, the orchestrator, leaving the other roles with nothing coordinating them.");
+    expect(within(confirmation()!).getByRole("button", { name: "Close orchestration" })).toBeEnabled();
     expect(runAction).not.toHaveBeenCalled();
     fireEvent.click(within(confirmation()!).getByRole("button", { name: "Cancel" }));
     expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
@@ -5571,5 +5610,179 @@ describe("switch deck by voice, against settings edited mid-flight", () => {
     const report = screen.getByTestId("voice-report");
     expect(report).toHaveTextContent("Showing deploy@build-box.");
     expect(report).not.toHaveTextContent("try again");
+  });
+});
+
+describe("chains of commands from one utterance (PRD #1184)", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const PLANNER: VoiceResolvedParamDto[] = [
+    { name: "agent", kind: "agent_ref", spoken: "planner", value: "planner", label: "Planner" },
+  ];
+  const SAID = "open the overview and then the planner";
+
+  type ChainStep = Extract<VoiceResultDto["outcome"], { kind: "chain" }>["steps"][number];
+  function chain(steps: ChainStep[], sentence: string, transcript = SAID): VoiceResultDto {
+    return { resolveMs: 21, backend: "stub", outcome: { kind: "chain", transcript, steps, sentence } };
+  }
+  const OVERVIEW_STEP: ChainStep = { said: "open the overview", action: "open_overview", invoke: "openOverview", params: [], sentence: "Opening the agent dashboard.", screen: "deck" };
+  const PLANNER_STEP: ChainStep = { said: "the planner", action: "open_agent", invoke: "openAgent", params: PLANNER, sentence: "Opening Planner.", screen: "overview" };
+
+  /** Let a chain's later steps find the screen the earlier ones moved to. */
+  async function settle() {
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_CHAIN_SETTLE_MS * 2); });
+    await flush();
+  }
+
+  /**
+   * Scenario: on the Daemons screen, say "open the overview and then the
+   * planner". Both steps run in order — the dashboard, then the Planner's
+   * pane over it — the row reports both, and one Undo puts the Daemons
+   * screen back.
+   */
+  it("runs every step, reports them together, and undoes the whole chain", async () => {
+    const voice = microphone([SAID]);
+    const resolveVoice: ResolveVoice = vi.fn(async () => chain([OVERVIEW_STEP, PLANNER_STEP], "Opening the agent dashboard, then opening Planner."));
+    render(<DeckShell runtime={runtime(resolveVoice, voice)} />);
+
+    await turnVoiceOn();
+    await completeUtterance();
+    await settle();
+
+    expect(screen.getByTestId("agent-pane-overlay")).toBeInTheDocument();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Opening the agent dashboard, then opening Planner.");
+    const undo = screen.getByRole("button", { name: "Undo" });
+    fireEvent.click(undo);
+    await flush();
+    expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
+    expect(screen.queryByTestId("overview-table-region")).toBeNull();
+  });
+
+  /**
+   * Scenario: a chain whose second step was judged on a screen the first one
+   * does not lead to. The first step runs; the second never finds its
+   * screen, so it does not run, and the row says which step stopped and which
+   * ran — never a silent partial chain, and no Undo.
+   */
+  it("stops at a step whose screen never arrives and says what ran", async () => {
+    const voice = microphone([SAID]);
+    const resolveVoice: ResolveVoice = vi.fn(async () => chain([OVERVIEW_STEP, { ...PLANNER_STEP, screen: "agent" }], "Opening the agent dashboard, then opening Planner."));
+    render(<DeckShell runtime={runtime(resolveVoice, voice)} />);
+
+    await turnVoiceOn();
+    await completeUtterance();
+    await settle();
+
+    expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
+    expect(screen.getByTestId("overview-table-region")).toBeVisible();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(
+      "Step 2 (“the planner”) was refused: you moved to another screen. Step 1 (“open the overview”) ran.",
+    );
+    expect(screen.queryByRole("button", { name: "Undo" })).toBeNull();
+  });
+
+  /**
+   * Scenario: a chain whose last step opens Settings, which moves no view.
+   * Both steps run, and no Undo is offered, because an Undo that restored the
+   * view would leave Settings open — not the whole chain reversed.
+   */
+  it("offers no Undo when a step did not move the view", async () => {
+    const voice = microphone(["open the overview and then settings"]);
+    const resolveVoice: ResolveVoice = vi.fn(async () => chain([
+      OVERVIEW_STEP,
+      { said: "settings", action: "open_settings", invoke: "openSettings", params: [], sentence: "Opening Settings.", screen: "overview" },
+    ], "Opening the agent dashboard, then opening Settings.", "open the overview and then settings"));
+    render(<DeckShell runtime={runtime(resolveVoice, voice)} />);
+
+    await turnVoiceOn();
+    await completeUtterance();
+    await settle();
+
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Opening the agent dashboard, then opening Settings.");
+    expect(screen.queryByRole("button", { name: "Undo" })).toBeNull();
+  });
+});
+
+describe("a chain paused on a numbered choice (PRD #1184)", () => {
+  beforeEach(() => { window.localStorage.clear(); vi.useFakeTimers(); });
+  afterEach(() => vi.useRealTimers());
+
+  const SAID = "open the overview and then the agent";
+  const first = { name: "agent", kind: "agent_ref", spoken: "the agent", value: "planner", label: "Plan / architecture", names: ["planner"] as string[] } as const;
+  const second = { name: "agent", kind: "agent_ref", spoken: "the agent", value: "builder", label: "Desktop implementation", names: ["builder"] as string[] } as const;
+  type ChainStep = Extract<VoiceResultDto["outcome"], { kind: "chain" }>["steps"][number];
+  const choice = {
+    kind: "param_ambiguous", transcript: "the agent", action: "open_agent", invoke: "openAgent", param: "agent", spoken: "the agent",
+    matches: [first.label, second.label], candidates: [first, second], params: [], reports: [`Opening ${first.label}.`, `Opening ${second.label}.`],
+    sentence: `Heard: “the agent” — “the agent” matches more than one agent: ${first.label}, ${second.label}.`,
+  } as Extract<VoiceResultDto["outcome"], { kind: "param_ambiguous" }>;
+  const steps: ChainStep[] = [
+    { said: "open the overview", action: "open_overview", invoke: "openOverview", params: [], sentence: "Opening the agent dashboard.", screen: "deck" },
+    { said: "the agent", action: "open_agent", invoke: "openAgent", params: [], sentence: "“the agent” matches more than one agent", screen: "overview", choice },
+  ];
+  const answer: VoiceResultDto = { resolveMs: 21, backend: "stub", outcome: { kind: "chain", transcript: SAID, steps, sentence: "Opening the agent dashboard, then: which agent." } };
+
+  async function pause() {
+    const voice = microphone([SAID]);
+    render(<DeckShell runtime={runtime(vi.fn(async () => answer), voice)} />);
+    await turnVoiceOn();
+    await completeUtterance();
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_CHAIN_SETTLE_MS * 2); });
+    await flush();
+    return screen.getByRole("dialog", { name: "Which agent?" });
+  }
+
+  /**
+   * Scenario: "open the overview and then the agent" from the Daemons screen,
+   * where "the agent" matches two agents. The dashboard opens and the chain
+   * pauses on "Which agent?"; choosing the second opens that agent, the row
+   * reports both steps, and one Undo puts the Daemons screen back.
+   */
+  it("runs the step before the choice, then the chosen one, and undoes both", async () => {
+    const dialog = await pause();
+    expect(screen.getByTestId("overview-table-region")).toBeVisible();
+    await act(async () => { fireEvent.click(within(dialog).getByRole("button", { name: `2. ${second.label}` })); await Promise.resolve(); });
+    await flush();
+    expect(within(screen.getByTestId("agent-pane-overlay")).getByTestId(`terminal-${second.value}`)).toBeVisible();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(`Opening the agent dashboard, then opening ${second.label}.`);
+    fireEvent.click(screen.getByRole("button", { name: "Undo" }));
+    await flush();
+    expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
+    expect(screen.queryByTestId("overview-table-region")).toBeNull();
+  });
+
+  /**
+   * Scenario: the same chain, with its choice cancelled. Nothing more runs,
+   * and the row says that the dashboard step ran and the rest was dropped.
+   */
+  it("drops the rest of the chain when the choice is cancelled, and says what ran", async () => {
+    const dialog = await pause();
+    await act(async () => { fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" })); await Promise.resolve(); });
+    await flush();
+    expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Step 1 (\u201copen the overview\u201d) ran; the rest of that sentence was not done.");
+  });
+});
+
+describe("chainStopped (PRD #1184)", () => {
+  /** Scenario: a choice that ends unanswered keeps its reason and says what ran before it. */
+  it("says which steps ran when a chain's choice ends unanswered", () => {
+    expect(chainDropped("Choice closed.", [])).toBe("Choice closed. Nothing from that sentence ran.");
+    expect(chainDropped("Choice expired.", ["open the overview"])).toBe("Choice expired. Step 1 (\u201copen the overview\u201d) ran; the rest of that sentence was not done.");
+  });
+
+  /** Scenario: the stop report names the step, its reason and every step that ran, in order. */
+  it("names the step that stopped and the steps that ran", () => {
+    expect(chainStopped(0, "open the tester", "No agent here is called that.", [])).toBe("Step 1 (“open the tester”) was refused: No agent here is called that. Nothing ran.");
+    expect(chainStopped(2, "name it triage", "the form closed", ["make it a dispatcher", "use codex"])).toBe(
+      "Step 3 (“name it triage”) was refused: the form closed. Steps 1 (“make it a dispatcher”) and 2 (“use codex”) ran.",
+    );
   });
 });

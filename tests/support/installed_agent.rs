@@ -8,9 +8,8 @@
 //! Each test runs its agent's credential preflight first
 //! (`skip_unless!(common::check_claude_available())` or the Codex one), then
 //! [`or_skip`] over [`claude`] or [`codex`]: no executable on the `PATH`,
-//! one whose `--version` names no release, or one whose release carries a
-//! pre-release or build tag (which the deck's release scanner cannot latch,
-//! [`installed_release`]), prints `SKIP: [e2e] …` and the test returns;
+//! or one whose `--version` names no release ([`installed_release`]), prints
+//! `SKIP: [e2e] …` and the test returns;
 //! `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1` turns that into a failure (CLAUDE.md
 //! rule 5).
 #![allow(dead_code)] // Each test file uses its own subset.
@@ -136,12 +135,6 @@ fn installed(program: &'static str) -> Result<Installed, String> {
     let text = String::from_utf8_lossy(&output.stdout).into_owned();
     let release = match installed_release::version_shape(program, &text) {
         installed_release::VersionShape::Release(release) => release,
-        installed_release::VersionShape::Tagged(version) => {
-            return Err(format!(
-                "{program} {version} is a pre-release or build-tagged build the deck does \
-                 not support: nothing measured"
-            ));
-        }
         installed_release::VersionShape::NoRelease => {
             return Err(format!(
                 "`{} --version` printed no release: {text:?}",

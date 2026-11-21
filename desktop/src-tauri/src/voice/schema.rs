@@ -182,6 +182,41 @@ pub const TOOL_INSTRUCTIONS: &str = "Pick the Agent Deck action the user asked f
     create, run — is answered by an action that starts or opens it, however urgently it is said. Write no prose; the app writes what the \
     user reads.";
 
+/// The description of the answer's `steps` field (PRD #1184): how to answer
+/// an utterance that asks for two or three things one after another.
+///
+/// # It lives in the schema, never in the system prompt
+///
+/// PRD #1184's M1 measured two places for it. With these rules in the system
+/// prompt (and its "ONE action" preamble changed) single commands regressed
+/// on the default backend: "Close the agent" became a stop in 6 of 6 runs
+/// against 0 of 5 unpatched (2026-09-29). Carried only as this field's
+/// description, the system prompt byte for byte unchanged, the regression
+/// was smaller then, and on the 345-phrase manifest of 2026-11-19 it was not
+/// measurable at all: 4.0 failures per full run against 3.8 unpatched, five
+/// runs each side by side, the same fixtures failing in both. So a change
+/// here is a change to every utterance's answer, and is re-measured against
+/// the whole manifest before it ships.
+///
+/// # The model marks steps; the app decides what a chain is
+///
+/// The rules below ask for the shape. None of them is relied on:
+/// [`super::chain`] holds every `said` to the transcript, refuses a sentence
+/// with a word of contrast in it, and checks each step on its own words, so
+/// a model that splits what it should not still runs nothing it was not
+/// asked for.
+pub const CHAIN_INSTRUCTIONS: &str = "`steps`: almost every utterance asks for ONE thing — \
+    answer it with `action` and `params` as above and set `steps` to null. Only when one \
+    utterance asks for TWO OR THREE separate actions to be done one after another (\"open \
+    the overview and then the tester\") ALSO list them in `steps`, in the order they were \
+    said, at most three, and set `action` and `params` to those of the FIRST step. Each step \
+    has its own `action` and `params`, and `said`: the words of the utterance that asked for \
+    that step, COPIED from the utterance exactly — contiguous, in the utterance's order, no \
+    word added, dropped, changed or reordered — and never including the joining words \
+    between two steps (\"and\", \"then\", \"and then\"). Words that offer ALTERNATIVES \
+    or EXCLUSIONS (\"or\", \"not\", \"instead\", \"rather than\", \"except\") never \
+    make two steps: that is one action, or `none`.";
+
 /// One row as the model sees it, with its availability on the screen the
 /// request was built for.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -426,6 +461,8 @@ mod tests {
                 "star_repo".to_string(),
                 "remind_star_later".to_string(),
                 "dismiss_star_prompt".to_string(),
+                "open_antigravity_issues".to_string(),
+                "dismiss_antigravity_notice".to_string(),
                 "stop_agent".to_string(),
                 "generate_config".to_string(),
                 "close_orchestration".to_string(),
@@ -536,6 +573,8 @@ mod tests {
                 "star_repo",
                 "remind_star_later",
                 "dismiss_star_prompt",
+                "open_antigravity_issues",
+                "dismiss_antigravity_notice",
                 "stop_agent",
                 "generate_config",
                 "close_orchestration",
@@ -767,6 +806,8 @@ mod tests {
                 ("star_repo".to_string(), true),
                 ("remind_star_later".to_string(), true),
                 ("dismiss_star_prompt".to_string(), true),
+                ("open_antigravity_issues".to_string(), true),
+                ("dismiss_antigravity_notice".to_string(), true),
                 ("stop_agent".to_string(), false),
                 ("generate_config".to_string(), false),
                 ("close_orchestration".to_string(), false),
@@ -843,6 +884,8 @@ mod tests {
                 ("star_repo".to_string(), true),
                 ("remind_star_later".to_string(), true),
                 ("dismiss_star_prompt".to_string(), true),
+                ("open_antigravity_issues".to_string(), true),
+                ("dismiss_antigravity_notice".to_string(), true),
                 // The D5 stops: on the overview with the New agent dialog
                 // closed (#1260), and each only opens a confirmation.
                 ("stop_agent".to_string(), true),
@@ -917,6 +960,8 @@ mod tests {
                 ("star_repo".to_string(), true),
                 ("remind_star_later".to_string(), true),
                 ("dismiss_star_prompt".to_string(), true),
+                ("open_antigravity_issues".to_string(), true),
+                ("dismiss_antigravity_notice".to_string(), true),
                 ("stop_agent".to_string(), true),
                 ("generate_config".to_string(), true),
                 ("close_orchestration".to_string(), false),

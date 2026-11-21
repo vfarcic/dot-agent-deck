@@ -85,6 +85,38 @@ pub struct IntentAnswer {
     pub action: String,
     #[serde(default, deserialize_with = "params_without_nulls")]
     pub params: BTreeMap<String, String>,
+    /// PRD #1184: the ordered steps of an utterance that asked for two or
+    /// three things one after another, each with the words of the transcript
+    /// it came from. `None` (or one step) for every other answer, which is
+    /// then the single action above, exactly as before chains existed. What
+    /// the app accepts of it is [`super::chain`]'s to decide; the model only
+    /// marks the steps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steps: Option<Vec<IntentStep>>,
+}
+
+/// One step of a chain (PRD #1184): an action and its params as in
+/// [`IntentAnswer`], and `said`, the words of the transcript that asked for
+/// this step, which the app holds to the transcript before it believes them
+/// ([`super::chain::spans`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct IntentStep {
+    pub action: String,
+    #[serde(default, deserialize_with = "params_without_nulls")]
+    pub params: BTreeMap<String, String>,
+    #[serde(default)]
+    pub said: String,
+}
+
+impl IntentStep {
+    /// This step as a single answer, for the checks a single pick goes through.
+    pub fn answer(&self) -> IntentAnswer {
+        IntentAnswer {
+            action: self.action.clone(),
+            params: self.params.clone(),
+            steps: None,
+        }
+    }
 }
 
 /// [`IntentAnswer::params`] as either shape arrives — an object, with its
@@ -167,6 +199,7 @@ impl IntentAnswer {
         Self {
             action: super::table::NO_MATCH_ACTION.to_string(),
             params: BTreeMap::new(),
+            steps: None,
         }
     }
 
@@ -174,6 +207,7 @@ impl IntentAnswer {
         Self {
             action: action.into(),
             params: BTreeMap::new(),
+            steps: None,
         }
     }
 
@@ -184,6 +218,18 @@ impl IntentAnswer {
 
     pub fn is_no_match(&self) -> bool {
         self.action == super::table::NO_MATCH_ACTION
+    }
+
+    /// The steps of a chain: `Some` only for two or more, since one step is
+    /// the single answer the top level already carries.
+    pub fn chain(&self) -> Option<&[IntentStep]> {
+        self.steps.as_deref().filter(|steps| steps.len() >= 2)
+    }
+
+    /// The same answer as a chain of `steps`, for a scripted backend.
+    pub fn with_steps(mut self, steps: Vec<IntentStep>) -> Self {
+        self.steps = Some(steps);
+        self
     }
 }
 

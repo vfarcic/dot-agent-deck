@@ -315,14 +315,24 @@ fn doorbell_053_key_effects_and_own_settle() {
     );
 }
 
-/// Scenario: Ask about Codex releases nobody measured, near and far from the recorded ones (newer minors at distance 1 to 5, patches, another major, an older release), with complete facts and with incomplete facts. Every latched release gets the agent's facts: Go with complete facts, the facts' own unmet requirement with incomplete ones; with no facts for Codex at all it is agent_not_supported.
+/// Scenario: Ask about Codex releases nobody measured, near and far from the recorded ones (newer minors at distance 1 to 5, patches, another major, an older release, and pre-release and build-tagged builds), with complete facts and with incomplete facts. Every latched release gets the agent's facts: Go with complete facts, the facts' own unmet requirement with incomplete ones; with no facts for Codex at all it is agent_not_supported.
 #[spec("inbox/doorbell/053")]
 #[test]
 fn doorbell_053_every_release_of_an_agent_gets_its_facts() {
     let facts = [complete(CODEX, 2)];
     for release in [
-        "0.164.0", "0.165.0", "0.168.9", "0.169.0", "0.164.1", "0.164.9", "1.0.0", "0.159.9",
+        "0.164.0",
+        "0.165.0",
+        "0.168.9",
+        "0.169.0",
+        "0.164.1",
+        "0.164.9",
+        "1.0.0",
+        "0.159.9",
         "0.1.0",
+        "0.172.0-alpha.2",
+        "0.162.0-alpha.17.1",
+        "0.164.0+abc",
     ] {
         assert_eq!(
             verdict(&facts, &CODEX, release),
@@ -335,7 +345,7 @@ fn doorbell_053_every_release_of_an_agent_gets_its_facts() {
         );
     }
     let facts = [incomplete(CODEX, 2)];
-    for release in ["0.164.0", "0.165.0", "1.0.0"] {
+    for release in ["0.164.0", "0.165.0", "1.0.0", "0.172.0-alpha.2"] {
         assert_eq!(
             no_go(&verdict(&facts, &CODEX, release)),
             Some(NoGo::UnverifiedMeasurement("echo")),
@@ -350,12 +360,20 @@ fn doorbell_053_every_release_of_an_agent_gets_its_facts() {
     assert_eq!(NoGo::AgentNotSupported.clause(), "agent_not_supported");
 }
 
-/// Scenario: Ask about Claude Code releases nobody measured (a patch, a minor, a major, an older one) and about agents with no facts, in a table that has Claude Code's facts. Each Claude Code release gets Claude Code's facts and is Go; OpenCode, Pi and Devin are agent_not_supported whatever release they latch.
+/// Scenario: Ask about Claude Code releases nobody measured (a patch, a minor, a major, an older one, a pre-release and a build-tagged one) and about agents with no facts, in a table that has Claude Code's facts. Each Claude Code release gets Claude Code's facts and is Go; OpenCode, Pi and Devin are agent_not_supported whatever release they latch.
 #[spec("inbox/doorbell/053")]
 #[test]
 fn doorbell_053_claude_releases_get_claudes_facts_and_other_agents_none() {
     let facts = [complete(CLAUDE, 0)];
-    for release in ["2.1.310", "2.1.311", "2.2.0", "3.0.0", "2.0.1"] {
+    for release in [
+        "2.1.310",
+        "2.1.311",
+        "2.2.0",
+        "3.0.0",
+        "2.0.1",
+        "2.1.330-beta.1",
+        "2.1.310-rc.1+abc",
+    ] {
         assert!(
             matches!(verdict(&facts, &CLAUDE, release), Activation::Go { .. }),
             "{release}"
@@ -461,7 +479,7 @@ fn doorbell_053_every_recorded_dialog_leaves_the_token_head_inert() {
 #[spec("inbox/doorbell/053")]
 #[test]
 fn doorbell_053_the_shipped_facts_verdicts() {
-    assert_eq!(AGENT_FACTS.len(), 2);
+    assert_eq!(AGENT_FACTS.len(), 3);
     assert_eq!(AGENT_FACTS[0], CLAUDE_FACTS);
     assert_eq!(AGENT_FACTS[1], CODEX_FACTS);
     for facts in &AGENT_FACTS {
@@ -517,6 +535,27 @@ fn doorbell_053_the_shipped_facts_verdicts() {
     assert_eq!(
         CODEX_FACTS.editor_probe,
         Measurement::Verified(CODEX_EDITOR_PROBE)
+    );
+}
+
+/// Scenario: Ask the shipped activation table about the measured Antigravity 1.5.9 release. Its measured agent facts admit a doorbell, including through the generation verdict, so an idle orchestration role can receive its first task before SessionStart.
+#[spec("inbox/doorbell/053")]
+#[test]
+fn doorbell_053_antigravity_measured_release_admits_a_doorbell() {
+    let agent: AgentType = serde_json::from_str("\"antigravity\"").unwrap();
+    let got = verdict(&AGENT_FACTS, &agent, "1.5.9");
+    assert!(
+        matches!(got, Activation::Go { .. }),
+        "measured Antigravity 1.5.9 must admit the idle doorbell: {got:?}"
+    );
+    assert_eq!(
+        generation_activation(
+            &AGENT_FACTS,
+            Some(&agent),
+            &known("1.5.9"),
+            &DoorbellSwitch::default()
+        ),
+        got
     );
 }
 

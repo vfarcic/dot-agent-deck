@@ -718,13 +718,13 @@ fn status_waiting_006_inbox_waiter_is_not_a_background_command() {
     );
 }
 
-/// Scenario: Classify an OpenCode 2 pane's process table, shaped as measured on OpenCode 2.2.5 (the client on the pane, its private server `<path>/opencode serve --stdio --port 0` as its direct child in a POSIX session of its own, the deck's inbox watcher in the server's session), given the client/server pair the daemon's OpenCode watch identified. That server and its session are not a background command; every other process counts as before: a command below the server, a `serve --stdio` a tool starts below or beside it, one a wrapper shell starts, a server whose command line was not read or no longer reads as a server, and anything on a pane with no identified server (OpenCode 1.x, an unknown version), even when its command text quotes `opencode serve --stdio`.
+/// Scenario: Classify an OpenCode 2 pane's process table, shaped as measured on OpenCode 2.2.5 (the client on the pane, its private server `<path>/opencode serve --stdio --port 0` as its direct child in a POSIX session of its own, the deck's inbox watcher in the server's session), given the client/server pair the daemon's OpenCode watch identified. That server and its session are not a background command; every other process counts as before: a command below the server, a `serve --stdio` a tool starts below or beside it, one a wrapper shell starts, a server whose command line was not read or no longer reads as a server, and anything on a pane with no identified server (OpenCode 1.x, an unknown version), even when its command text quotes `opencode serve --stdio`. On OpenCode 2.3 (measured on 2.3.2) the server's identified process daemon, `opencode-pty daemon`, is not a command either, but each command it runs in its session is one, once.
 #[spec("status/waiting/016")]
 #[test]
 fn status_waiting_016_opencode_own_server_is_not_a_background_command() {
     use dot_agent_deck::platform::proc::{
-        AgentServer, is_opencode_private_server_command, qualifying_command_sessions,
-        qualifying_command_sessions_with_server,
+        AgentServer, is_opencode_private_server_command, is_opencode_process_daemon_command,
+        qualifying_command_sessions, qualifying_command_sessions_with_server,
     };
     use std::collections::HashSet;
 
@@ -739,6 +739,7 @@ fn status_waiting_016_opencode_own_server_is_not_a_background_command() {
     let identified = Some(AgentServer {
         client_pid: CLIENT,
         server_pid: SERVER,
+        process_daemon_pid: None,
     });
     let row = |pid: i32, ppid: i32, sid: i32, argv: Option<&str>| ProcessInfo {
         pid,
@@ -844,6 +845,7 @@ fn status_waiting_016_opencode_own_server_is_not_a_background_command() {
             Some(AgentServer {
                 client_pid: CLIENT,
                 server_pid: 80160,
+                process_daemon_pid: None,
             })
         ),
         Some(HashSet::from([SERVER, FORGED_SID])),
@@ -903,6 +905,138 @@ fn status_waiting_016_opencode_own_server_is_not_a_background_command() {
         qualifying_command_sessions(&opencode_1, CLIENT, &[]),
     );
 
+    // Issue #2441: OpenCode 2.3's process daemon, as measured on 2.3.2
+    // (2026-11-21): the server's direct child `<cache>/opencode-pty/<ver>/opencode-pty
+    // daemon --runtime-dir <state>/opencode/pty --name <uuid>`, leader of a
+    // session of its own, started with the first shell command and alive for
+    // the rest of the agent's life. The shell tool's commands run as ITS
+    // direct children, in ITS session, each a process group of its own; a
+    // backgrounded one outlives the turn.
+    const DAEMON: i32 = 80170;
+    const FG_COMMAND: i32 = 80171;
+    const BG_COMMAND: i32 = 80173;
+    const NESTED_SID: i32 = 80174;
+    const DAEMON_ARGV: &str = "/home/user/.cache/opencode/bin/opencode-pty/0.6.0-3a781ac5ff8bc189/opencode-pty daemon --runtime-dir /home/user/.local/state/opencode/pty --name 4628760d-cc01-4ad7-b17b-8e37284da23c";
+    let with_daemon = |daemon: i32| {
+        Some(AgentServer {
+            client_pid: CLIENT,
+            server_pid: SERVER,
+            process_daemon_pid: Some(daemon),
+        })
+    };
+    let opencode_2_3 = || {
+        let mut table = standalone();
+        table.push(row(DAEMON, SERVER, DAEMON, Some(DAEMON_ARGV)));
+        table
+    };
+    assert_eq!(
+        count(&opencode_2_3(), CLIENT, identified),
+        Some(HashSet::from([DAEMON])),
+        "premise: with the server alone identified, the idle daemon is the phantom `Background: 1 command`"
+    );
+    assert_eq!(
+        count(&opencode_2_3(), CLIENT, with_daemon(DAEMON)),
+        Some(HashSet::new()),
+        "OpenCode's own process daemon, running nothing, is not a background command"
+    );
+
+    // What the daemon runs counts, once per command: a foreground `bash -c`
+    // with its child, and a backgrounded `sleep` beside it, both in the
+    // daemon's session.
+    let mut table = opencode_2_3();
+    table.push(row(FG_COMMAND, DAEMON, DAEMON, None));
+    table.push(row(80172, FG_COMMAND, DAEMON, None));
+    table.push(row(BG_COMMAND, DAEMON, DAEMON, None));
+    assert_eq!(
+        count(&table, CLIENT, with_daemon(DAEMON)),
+        Some(HashSet::from([FG_COMMAND, BG_COMMAND])),
+        "each command the daemon runs counts, once"
+    );
+    // A command that detaches into a session of its own below one of them
+    // counts as a command of its own, and what runs in its session does not
+    // count again.
+    table.push(row(
+        NESTED_SID,
+        80172,
+        NESTED_SID,
+        Some("/bin/sh -c sleep 60"),
+    ));
+    table.push(row(80175, NESTED_SID, NESTED_SID, None));
+    assert_eq!(
+        count(&table, CLIENT, with_daemon(DAEMON)),
+        Some(HashSet::from([FG_COMMAND, BG_COMMAND, NESTED_SID])),
+        "a session nested below a daemon command is a command of its own"
+    );
+
+    // The daemon starts with the agent's first shell command, and the watch
+    // names it on its next look, up to five seconds later. Until then the
+    // daemon itself counts, but each command below it already counts under
+    // the key it keeps once the daemon is named, so a command first sampled
+    // during the turn is still the same command after the naming (and stays
+    // awaited), rather than a new one first seen after the turn.
+    let mut table = opencode_2_3();
+    table.push(row(BG_COMMAND, DAEMON, DAEMON, None));
+    // Measured on 2.3.2 (status/waiting/009): the watch can name the server
+    // only in the same look as the daemon, so the command keeps its key from
+    // before any naming too.
+    assert_eq!(
+        count(&table, CLIENT, None),
+        Some(HashSet::from([SERVER, DAEMON, BG_COMMAND])),
+        "with nothing named, the server and the daemon count, and the command keeps its own key"
+    );
+    assert_eq!(
+        count(&table, CLIENT, identified),
+        Some(HashSet::from([DAEMON, BG_COMMAND])),
+        "before the watch names it, the daemon counts and its command keeps its own key"
+    );
+    assert_eq!(
+        count(&table, CLIENT, with_daemon(DAEMON)),
+        Some(HashSet::from([BG_COMMAND])),
+        "once named, the daemon drops out and the command keeps that key"
+    );
+
+    // Not the daemon, so it counts as before: a second `opencode-pty daemon`
+    // child of the server the watch did not name; the named pid whose command
+    // line was not read, or no longer reads as the daemon's; a named pid whose
+    // parent is not the server (a command's child); and a daemon below a
+    // server the scan did not bear out.
+    let mut table = opencode_2_3();
+    table.push(row(80180, SERVER, 80180, Some(DAEMON_ARGV)));
+    assert_eq!(
+        count(&table, CLIENT, with_daemon(DAEMON)),
+        Some(HashSet::from([80180])),
+        "a second daemon is not the named one"
+    );
+    for unread in [
+        CommandLine::Unavailable,
+        CommandLine::NotSampled,
+        CommandLine::Read("/bin/bash -c sleep 60".to_string()),
+    ] {
+        let mut table = opencode_2_3();
+        table.last_mut().unwrap().command_line = unread.clone();
+        table.push(row(FG_COMMAND, DAEMON, DAEMON, None));
+        assert_eq!(
+            count(&table, CLIENT, with_daemon(DAEMON)),
+            Some(HashSet::from([DAEMON])),
+            "{unread:?}: an unrecognised daemon counts, with what it runs"
+        );
+    }
+    let mut table = standalone();
+    table.push(row(80190, SERVER, 80190, Some("/bin/bash -c ./x")));
+    table.push(row(80191, 80190, 80191, Some(DAEMON_ARGV)));
+    assert_eq!(
+        count(&table, CLIENT, with_daemon(80191)),
+        Some(HashSet::from([80190, 80191])),
+        "a daemon a command started is a command"
+    );
+    let mut table = opencode_2_3();
+    table[1].command_line = CommandLine::Unavailable;
+    assert_eq!(
+        count(&table, CLIENT, with_daemon(DAEMON)),
+        Some(HashSet::from([SERVER, DAEMON])),
+        "an unread server vouches for no daemon"
+    );
+
     // The command-line re-check reads words in place, not substrings.
     for server in [
         SERVER_ARGV,
@@ -927,9 +1061,30 @@ fn status_waiting_016_opencode_own_server_is_not_a_background_command() {
             "{not_server}"
         );
     }
+    for daemon in [
+        DAEMON_ARGV,
+        "opencode-pty daemon",
+        "C:/Users/u/.cache/opencode/bin/opencode-pty/0.6.0/opencode-pty.exe daemon --name x",
+    ] {
+        assert!(is_opencode_process_daemon_command(daemon), "{daemon}");
+    }
+    for not_daemon in [
+        "/bin/bash -c opencode-pty daemon",
+        "python3 x.py opencode-pty daemon",
+        "/x/opencode-pty-evil daemon",
+        "/x/opencode-pty run daemon",
+        "opencode daemon",
+        "opencode-pty",
+        "",
+    ] {
+        assert!(
+            !is_opencode_process_daemon_command(not_daemon),
+            "{not_daemon}"
+        );
+    }
 }
 
-/// Scenario: The daemon's OpenCode watch looks at a pane's process tree (executables and arguments, as it samples them) and names the private server the shell-activity scan may exempt. It names one only for a client whose version is known to be 2.x, and only that client's first direct child whose executable is OpenCode and whose arguments are `serve --stdio`: not on OpenCode 1.x (where a tool can start that shape as the client's child), not for an unknown version, not a process that only forged a server's arguments, not one a wrapper shell started, and not a second server. Fed into the scan, the named server is exempted and a forged one beside it still counts.
+/// Scenario: The daemon's OpenCode watch looks at a pane's process tree (executables and arguments, as it samples them) and names the private server the shell-activity scan may exempt. It names one only for a client whose version is known to be 2.x, and only that client's first direct child whose executable is OpenCode and whose arguments are `serve --stdio`: not on OpenCode 1.x (where a tool can start that shape as the client's child), not for an unknown version, not a process that only forged a server's arguments, not one a wrapper shell started, and not a second server; for a client known to be 2.3 or later it also names the server's first direct child running the `opencode-pty` executable as `daemon`, OpenCode's process daemon. Fed into the scan, the named server and daemon are exempted while a forged server beside them, and a command the daemon runs, still count.
 #[spec("status/waiting/017")]
 #[test]
 fn status_waiting_017_the_watch_names_only_a_known_opencode_2s_own_server() {
@@ -967,6 +1122,7 @@ fn status_waiting_017_the_watch_names_only_a_known_opencode_2s_own_server() {
         agent_id: "agent-p".to_string(),
         root_pid: 100,
         spawn_version,
+        spawn_probe: dot_agent_deck::opencode_mode::SpawnProbe::Done,
     };
     let unprobed = |_: &Path| None;
     let identify = |rows: &[ProcRow], spawn_version| {
@@ -988,6 +1144,7 @@ fn status_waiting_017_the_watch_names_only_a_known_opencode_2s_own_server() {
         Some(AgentServer {
             client_pid: 101,
             server_pid: 102,
+            process_daemon_pid: None,
         }),
         "a known 2.x client's private server"
     );
@@ -1064,6 +1221,98 @@ fn status_waiting_017_the_watch_names_only_a_known_opencode_2s_own_server() {
         Some(HashSet::from([102, 103])),
         "with no identity, both count"
     );
+
+    // Issue #2441: OpenCode 2.3's process daemon, as measured on 2.3.2: the
+    // private server's direct child running `opencode-pty daemon`, named with
+    // the server for a client known to be 2.3 or later.
+    const PTY: &str =
+        "/home/user/.cache/opencode/bin/opencode-pty/0.6.0-3a781ac5ff8bc189/opencode-pty";
+    let daemon_argv: &[&str] = &[
+        PTY,
+        "daemon",
+        "--runtime-dir",
+        "/home/user/.local/state/opencode/pty",
+        "--name",
+        "4628760d-cc01-4ad7-b17b-8e37284da23c",
+    ];
+    let with_daemon = || {
+        let mut rows = tree();
+        rows.push(proc_row(106, 102, PTY, daemon_argv));
+        rows
+    };
+    let named = |daemon: Option<i32>| {
+        Some(AgentServer {
+            client_pid: 101,
+            server_pid: 102,
+            process_daemon_pid: daemon,
+        })
+    };
+    assert_eq!(
+        identify(&with_daemon(), Some((2, 3, 2))),
+        named(Some(106)),
+        "a known 2.3 client's server's process daemon"
+    );
+    assert_eq!(identify(&with_daemon(), Some((2, 3, 0))), named(Some(106)));
+    assert_eq!(
+        identify(&with_daemon(), Some((2, 2, 7))),
+        named(None),
+        "before 2.3 there is no daemon, and a server's direct child is a tool's command"
+    );
+    let deleted = format!("{PTY} (deleted)");
+    let mut replaced = tree();
+    replaced.push(proc_row(106, 102, &deleted, daemon_argv));
+    assert_eq!(
+        identify(&replaced, Some((2, 3, 2))),
+        named(Some(106)),
+        "a daemon whose binary was replaced in place"
+    );
+    // Not the daemon: another executable with the daemon's arguments, the
+    // daemon's executable with another subcommand, or one the client or the
+    // wrapper shell started rather than the server.
+    let other_subcommand: &[&str] = &[PTY, "run"];
+    for (ppid, exe, argv) in [
+        (102, "/usr/bin/python3", daemon_argv),
+        (102, PTY, other_subcommand),
+        (101, PTY, daemon_argv),
+        (100, PTY, daemon_argv),
+    ] {
+        let mut rows = tree();
+        rows.push(proc_row(107, ppid, exe, argv));
+        assert_eq!(
+            identify(&rows, Some((2, 3, 2))),
+            named(None),
+            "{exe} {argv:?} below {ppid}"
+        );
+    }
+    // A second daemon child of the server is not the one named.
+    let mut two = with_daemon();
+    two.push(proc_row(107, 102, PTY, daemon_argv));
+    assert_eq!(
+        identify(&two, Some((2, 3, 2))),
+        named(Some(106)),
+        "the first only"
+    );
+
+    // Fed into the scan: the named daemon is exempt, and a command it runs in
+    // its session counts.
+    let mut table = vec![
+        info(100, 1, 100, None),
+        info(101, 100, 100, None),
+        info(102, 101, 102, Some(&server_argv.join(" "))),
+        info(106, 102, 106, Some(&daemon_argv.join(" "))),
+    ];
+    let identified = identify(&with_daemon(), Some((2, 3, 2)));
+    assert_eq!(
+        qualifying_command_sessions_with_server(&table, 100, &[], identified),
+        Some(HashSet::new()),
+        "the named server and daemon are exempt"
+    );
+    table.push(info(108, 106, 106, None));
+    assert_eq!(
+        qualifying_command_sessions_with_server(&table, 100, &[], identified),
+        Some(HashSet::from([108])),
+        "a command the daemon runs counts"
+    );
 }
 
 /// Scenario: A pane started directly on OpenCode 2.x has its client and private server identified by the daemon's OpenCode watch; then, without a respawn, another client takes the pane — a new process running a 1.x binary, a new process whose version the deck never recorded, or the same process `exec`ing a 1.x binary — and that client starts a tool command `opencode serve --stdio` as its direct child in a session of its own. The spawn's 2.x version no longer vouches for the pane's client, so the watch names no private server and the shell-activity scan counts that tool command (and what runs in its session), while the original client, still the one the deck started, keeps its own server exempt.
@@ -1091,6 +1340,7 @@ fn status_waiting_018_a_replacement_client_does_not_inherit_the_spawns_version()
         agent_id: "agent-p".to_string(),
         root_pid: 100,
         spawn_version: Some((2, 2, 5)),
+        spawn_probe: dot_agent_deck::opencode_mode::SpawnProbe::Done,
     }];
     // Only the 1.x binary has a recorded version of its own; the 2.x client's
     // is known from the spawn, and `UNPROBED` from nothing.
@@ -1158,6 +1408,7 @@ fn status_waiting_018_a_replacement_client_does_not_inherit_the_spawns_version()
             Some(AgentServer {
                 client_pid: 101,
                 server_pid: 102,
+                process_daemon_pid: None,
             }),
             "{name}: premise, the spawn's own 2.x client and its server"
         );
@@ -1192,6 +1443,7 @@ fn status_waiting_018_a_replacement_client_does_not_inherit_the_spawns_version()
         Some(AgentServer {
             client_pid: 101,
             server_pid: 102,
+            process_daemon_pid: None,
         })
     );
     assert_eq!(
@@ -1201,6 +1453,7 @@ fn status_waiting_018_a_replacement_client_does_not_inherit_the_spawns_version()
             AgentServer {
                 client_pid: 101,
                 server_pid: 102,
+                process_daemon_pid: None,
             }
         )]
     );

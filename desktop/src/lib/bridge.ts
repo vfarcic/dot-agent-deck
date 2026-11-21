@@ -21,6 +21,7 @@ import type { AnswerOutcomeDto, PendingQuestionDto, QuestionResultDto, QuestionS
 import { pullRequestFromDto } from "./pullRequest";
 import type { ProjectTrust, ProjectTrustTarget } from "./projectTrust";
 import { STAR_THANKS, type StarChoice } from "./starPrompt";
+import { NOTICE_THANKS, noticeStartFrom, type NoticeChoice, type NoticeStart } from "./antigravityNotice";
 import { DEFAULT_DESKTOP_FEATURES, UNREPORTED } from "../types";
 import type { HandoffEdge,
   AgentBackground,
@@ -415,6 +416,13 @@ export interface DesktopAgentDto {
    * `agentFromDto` keeps it only beside `status: "error"` and as a display copy.
    */
   deliveryNotice?: string;
+  /**
+   * PRD #211 — the agent's own words for its `error` or `waiting_for_input`
+   * status: the error a failed turn reported, or what it waits on. Agent text;
+   * `agentFromDto` keeps it only beside one of those statuses and as a display
+   * copy.
+   */
+  statusReason?: string;
   /**
    * PRD #1631: the question this agent is waiting on
    * (`SessionSnapshot.pending_question`), every text field scrubbed by the
@@ -1228,6 +1236,14 @@ function withDeckIdentityKeys(result: VoiceResultDto): VoiceResultDto {
   if (result.outcome.kind === "param_ambiguous" && result.outcome.candidates) {
     return { ...result, outcome: { ...result.outcome, candidates: result.outcome.candidates.map(keyed) } };
   }
+  /* PRD #1184 — and so does a chain's switch step. */
+  if (result.outcome.kind === "chain") {
+    return { ...result, outcome: { ...result.outcome, steps: result.outcome.steps.map((step) => ({
+      ...step,
+      params: step.params.map(keyed),
+      ...(step.choice ? { choice: { ...step.choice, candidates: step.choice.candidates?.map(keyed) } } : {}),
+    })) } };
+  }
   if (result.outcome.kind !== "dispatch") return result;
   return { ...result, outcome: { ...result.outcome, params: result.outcome.params.map(keyed) } };
 }
@@ -1269,7 +1285,32 @@ export type VoiceOutcomeDto =
   | { kind: "transcription_failed"; detail: string; sentence: string }
   /** PRD #1497 D8 — heard while the app was speaking and not a way of
       silencing it: nothing ran and nothing was sent anywhere. */
-  | { kind: "dropped"; transcript: string; sentence: string };
+  | { kind: "dropped"; transcript: string; sentence: string }
+  /** PRD #1184 — an utterance answered as two or three steps that the app
+      would not run: a chain rule refused it, or one of its steps could not
+      run on the screen the earlier steps would leave. Nothing ran. */
+  | { kind: "chain_refused"; transcript: string; sentence: string }
+  /** PRD #1184 — two or three steps that passed every check, run in order by
+      the panel (`runChain`). `sentence` reports them all; a step that cannot
+      run when its turn comes stops the chain, and the panel says which. */
+  | { kind: "chain"; transcript: string; steps: VoiceChainStepDto[]; sentence: string };
+
+/**
+ * PRD #1184 — one step of a `chain` outcome: a dispatch, the user's words for
+ * it (`said`, quoted when it stops the chain) and the screen it was judged on,
+ * which the panel holds the screen to before running any step after the first.
+ */
+export interface VoiceChainStepDto {
+  said: string;
+  action: string;
+  invoke: string;
+  params: VoiceResolvedParamDto[];
+  sentence: string;
+  screen: VoiceScreen;
+  /** A step that matched several things: the numbered choice the chain
+      pauses on when this step's turn comes. At most one step carries one. */
+  choice?: Extract<VoiceOutcomeDto, { kind: "param_ambiguous" }>;
+}
 
 /**
  * One utterance's outcome, plus what it cost (`voice::VoiceResult`).
@@ -2362,6 +2403,21 @@ export interface DeckBridge {
    */
   starPromptChoose?(choice: StarChoice): Promise<string | undefined>;
   /**
+   * PRD #211 — a New agent start of `command` succeeded: whether it shows the
+   * Antigravity notice, and the first problem with its state file to say. The
+   * crate counts it only when the command starts Antigravity, in the notice
+   * state the TUI shares. Optional so a test double need not serve it; a
+   * runtime without it never shows the notice.
+   */
+  antigravityNoticeStart?(command: string | undefined): Promise<NoticeStart>;
+  /**
+   * PRD #211 — the user's choice in the Antigravity notice. Resolves Open
+   * issues' sentence (thanks, or where to go when the browser did not open),
+   * why a Don't show again could not be saved the first time there is a
+   * problem to say, and nothing otherwise.
+   */
+  antigravityNoticeChoose?(choice: NoticeChoice): Promise<string | undefined>;
+  /**
    * Issue #1198 — which of the app's experimental surfaces to show: the
    * desktop process's own flag, read through its `features::show_desktop_*`
    * wrappers. The runtime asks ONCE at startup (`useDeckRuntime`), and the
@@ -2902,6 +2958,9 @@ function agentFromDto(agent: DesktopAgentDto, index: number, daemonId: string): 
     ...(agent.status === "error" && agent.deliveryNotice
       ? { deliveryNotice: displayText(agent.deliveryNotice, DISPLAY_LIMITS.prompt) }
       : {}),
+    ...((agent.status === "error" || agent.status === "waiting_for_input") && agent.statusReason
+      ? { statusReason: displayText(agent.statusReason, DISPLAY_LIMITS.prompt) }
+      : {}),
     ...(agent.pendingQuestion ? { pendingQuestion: agent.pendingQuestion } : {}),
     ...(inputHeld ? { inputHeld } : {}),
     ...(agent.inputDiscarded === true ? { inputDiscarded: true } : {}),
@@ -3199,7 +3258,7 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
  * reachable from the URL — the previous inline `||` chain had to be edited in
  * lockstep with the fixture and was not.
  */
-const FIXTURE_STATES: readonly FixtureState[] = ["connected", "crowded", "disconnected", "error", "empty", "fleet", "docs", "docs-pr", "docs-generate", "docs-fleet", "voice-pages", "upgrade", "upgrade-error", "hook-notice", "docs-question", "docs-restart"];
+const FIXTURE_STATES: readonly FixtureState[] = ["connected", "crowded", "disconnected", "error", "empty", "fleet", "docs", "docs-pr", "docs-generate", "docs-fleet", "voice-pages", "upgrade", "upgrade-error", "hook-notice", "docs-question", "docs-restart", "docs-antigravity"];
 
 class FixtureDeckBridge implements DeckBridge {
   readonly mode = "fixture" as const;
@@ -4161,6 +4220,21 @@ class FixtureDeckBridge implements DeckBridge {
     await Promise.resolve();
     this.starAnswered = true;
     return choice === "star" ? STAR_THANKS : undefined;
+  }
+
+  /**
+   * PRD #211 — `?antigravity-notice=1` plays a start the Antigravity notice
+   * shows at, for a command that starts `agy`; any other preview shows none.
+   */
+  async antigravityNoticeStart(command: string | undefined): Promise<NoticeStart> {
+    await Promise.resolve();
+    const startsAgy = (command ?? "").trim().split(/\s+/)[0]?.split("/").pop() === "agy";
+    return { show: startsAgy && new URLSearchParams(window.location.search).get("antigravity-notice") === "1" };
+  }
+
+  async antigravityNoticeChoose(choice: NoticeChoice): Promise<string | undefined> {
+    await Promise.resolve();
+    return choice === "open" ? NOTICE_THANKS : undefined;
   }
 
   async newAgentOrchestrations(deckId: string, path: string): Promise<NewAgentOrchestrations> {
@@ -6169,6 +6243,17 @@ export class TauriDeckBridge implements DeckBridge {
   async starPromptChoose(choice: StarChoice): Promise<string | undefined> {
     const invoke = await this.getInvoke();
     const message = await invoke<unknown>("desktop_star_prompt_choose", { choice });
+    return typeof message === "string" ? message : undefined;
+  }
+
+  async antigravityNoticeStart(command: string | undefined): Promise<NoticeStart> {
+    const invoke = await this.getInvoke();
+    return noticeStartFrom(await invoke<unknown>("desktop_antigravity_notice_start", { command: command ?? null }));
+  }
+
+  async antigravityNoticeChoose(choice: NoticeChoice): Promise<string | undefined> {
+    const invoke = await this.getInvoke();
+    const message = await invoke<unknown>("desktop_antigravity_notice_choose", { choice });
     return typeof message === "string" ? message : undefined;
   }
 

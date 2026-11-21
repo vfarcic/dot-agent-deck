@@ -5,7 +5,7 @@
 //! the agent's screen is one the deck knows: its empty composer, how it echoes
 //! the line, which of its dialogs can appear after it is ready, and what each
 //! key of the line does inside them. Those facts belong to an **agent**
-//! ([`AGENT_FACTS`]: Claude Code and Codex), not to one of its releases: a
+//! ([`AGENT_FACTS`]: Claude Code, Codex and Antigravity), not to one of its releases: a
 //! release nobody measured is assumed to behave like its agent's facts until a
 //! measurement shows otherwise. [`activation`] turns a generation's agent and
 //! its start-up header's latch ([`crate::release_scanner`]) into a verdict:
@@ -18,8 +18,8 @@
 //! 2. no single header was latched → `unknown_release` (or the latch's own
 //!    clause, `release_conflict`, `scanner_geometry` or `scanner_budget`). The
 //!    latch is a per-generation check that the agent drew its start-up screen
-//!    when it started; any `MAJOR.MINOR.PATCH` latches, and which one is not
-//!    read here;
+//!    when it started; any SemVer version latches, a pre-release or build
+//!    included (issue #2128), and which one is not read here;
 //! 3. the agent's facts decide ([`facts_verdict`]: the required facts, then no
 //!    first-stage byte committing in any known dialog, then `head_echo` when
 //!    the line is staged, then the settle cap).
@@ -611,8 +611,8 @@ pub fn parse_assumed_editor_probes(list: &str) -> Result<Vec<(AgentType, Version
             "claude" => AgentType::ClaudeCode,
             _ => return Err(unknown()),
         };
-        // A pre-release or build is refused: a header the scanner latches
-        // is a bare release, so such an entry could never match one.
+        // A pre-release or build is refused: the entries name releases the
+        // e2e stand-ins' headers draw, and every one of those is bare.
         let release = Version::parse(release)
             .ok()
             .filter(|v| v.pre.is_empty() && v.build.is_empty())
@@ -770,8 +770,58 @@ pub const CODEX_FACTS: AgentFacts<'static> = AgentFacts {
     editor_probe: Measurement::Verified(CODEX_EDITOR_PROBE),
 };
 
+/// Antigravity's facts (PRD #211), from `agy` 1.5.9 as measured on
+/// 2026-11-16 (`.dot-agent-deck/g211-agy-measurements.md` and the screen
+/// captures behind [`crate::doorbell_screen::ANTIGRAVITY_PROFILE`]): its ready
+/// composer between two full-width rules, with its agent mode's hint in it; the
+/// deck's line, typed in two writes with the start-up "Auto is now the default
+/// agent mode" notice still up, echoed exactly with the cursor after it, wrapped
+/// at a blank with a two-cell indent at 80 columns; Enter submits it, and its
+/// `PreInvocation` hook carries it whole as `lastUserInput`; one DEL removes one
+/// character; Ctrl+U leaves a blank composer, not the hint, so a withdrawal
+/// cannot be confirmed. No dialog appeared after the ready composer in the
+/// launches that reached it: its start-up dialogs come before it, on the
+/// alternate screen, and its permission prompt only inside a turn, which its
+/// terminal status reports as Needs Input. So the line is never staged and the
+/// first ring waits for no settle window. Its input is read raw, which each
+/// ring checks on the pane's own terminal. Few launches, not the dozens Claude
+/// Code's and Codex's facts rest on; a release that breaks them is held by the
+/// facts' own checks at each ring.
+pub const ANTIGRAVITY_FACTS: AgentFacts<'static> = AgentFacts {
+    agent: AgentType::Antigravity,
+    profile: "antigravity-2026-11",
+    ready_composer: Measurement::Verified(()),
+    echo: Measurement::Verified(()),
+    submit_route: Measurement::Verified(()),
+    layout: Measurement::Verified(()),
+    key_effects: Measurement::Verified(&[]),
+    first_modal: Measurement::Verified(FirstModal::NoneObserved { launches: 5 }),
+    input_mode: Measurement::Verified(()),
+    release_recogniser: Measurement::Verified(()),
+    // A launch, a typed line and two resizes wrote 15 KB, far inside the
+    // scanner's and the evidence parser's per-push budgets.
+    parser_cost: Measurement::Verified(()),
+    // Nothing commits in any dialog, so the line is never staged.
+    head_echo: Measurement::Absent,
+    placeholder_empty: Measurement::Failed,
+    delete_key: Measurement::Verified(()),
+    // How its transcript shows a submitted message was not measured; its
+    // prompt hook reports the line instead.
+    transcript_echo: Measurement::Absent,
+    // No editor probe, so no check reads a box a person touched empty again.
+    // What does is `agy`'s own report of what the last key did: a first-call
+    // `PreInvocation`, its line read after a person's Enter, with nothing
+    // entered since (`GenerationInput::reconcile_human_submit`), or its
+    // status or a hook of its own saying it left a prompt, read after one run
+    // of menu keys (arrows, then one digit, Enter or lone Escape, and nothing
+    // after it) was typed into a box untouched when the prompt appeared, or a
+    // lone digit into an untouched box
+    // (`GenerationInput::reconcile_menu_answer`).
+    editor_probe: Measurement::Absent,
+};
+
 /// The facts the doorbell's admission reads, one set per agent it types into.
-pub static AGENT_FACTS: [AgentFacts<'static>; 2] = [CLAUDE_FACTS, CODEX_FACTS];
+pub static AGENT_FACTS: [AgentFacts<'static>; 3] = [CLAUDE_FACTS, CODEX_FACTS, ANTIGRAVITY_FACTS];
 
 // ---------------------------------------------------------------------------
 // The recorded measurements (M1, M2; 2026-10-24 onwards): conformance inputs.
