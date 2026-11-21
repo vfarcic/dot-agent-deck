@@ -4145,10 +4145,12 @@ fn drain_ended_roles(state: &SharedState, ui: &mut UiState) {
 }
 
 /// Issue #1965: forget every remembered exited role whose key is no role pane
-/// of an open orchestration tab — the tab closed, the role was replaced, or the
-/// report arrived before its tab was built (the periodic listing brings it
-/// again). Keeps the map to what a card on screen can show.
-fn prune_ended_roles(ui: &mut UiState, tab_manager: &TabManager) {
+/// of an open orchestration tab — the tab closed, or the report arrived before
+/// its tab was built (the periodic listing brings it again) — and every one
+/// whose pane this controller now holds under another agent: a `pane restart`
+/// started a fresh agent there, and the card must reach it again. Keeps the
+/// map to what a card on screen can show.
+fn prune_ended_roles(ui: &mut UiState, tab_manager: &TabManager, pane: &dyn PaneController) {
     if ui.ended_role_slots.is_empty() {
         return;
     }
@@ -4162,8 +4164,12 @@ fn prune_ended_roles(ui: &mut UiState, tab_manager: &TabManager) {
         .flatten()
         .map(String::as_str)
         .collect();
-    ui.ended_role_slots
-        .retain(|key, _| open.contains(key.as_str()));
+    ui.ended_role_slots.retain(|key, held| {
+        open.contains(key.as_str())
+            && pane
+                .pane_agent_id(key)
+                .is_none_or(|agent| agent == held.role.agent_id)
+    });
 }
 
 /// Issue #1965: the exited role remembered for a card's pane, unless the card
@@ -16047,7 +16053,7 @@ pub fn run_tui(
         process_restart_drops(&state, pane.as_ref(), &mut tab_manager, &mut ui);
         // Issue #1965: a role whose agent exited says which role and why.
         drain_ended_roles(&state, &mut ui);
-        prune_ended_roles(&mut ui, &tab_manager);
+        prune_ended_roles(&mut ui, &tab_manager, pane.as_ref());
         // Issue #717: report a dispatched worktree the daemon actually left
         // on disk. Queued by the event subscriber, drained here because the
         // status line is `UiState`.
@@ -38334,8 +38340,8 @@ mod tests {
         }
         assert_eq!(ui.ended_role_slots.len(), MAX_ENDED_ROLE_SLOTS);
         let pc = Arc::new(OpenTabPC::new());
-        let tab_manager = TabManager::new(pc);
-        prune_ended_roles(&mut ui, &tab_manager);
+        let tab_manager = TabManager::new(pc.clone());
+        prune_ended_roles(&mut ui, &tab_manager, &*pc);
         assert!(
             ui.ended_role_slots.is_empty(),
             "no open tab holds those panes"
