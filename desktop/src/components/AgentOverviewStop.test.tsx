@@ -195,15 +195,16 @@ describe("stopping from the overview (PRD #1223 U4)", () => {
     open();
     await waitFor(() => expect(within(confirmation()!).getByRole("button", { name: kind === "agent" ? "Close agent" : "Close all 2 roles" })).toBeEnabled());
     expect(confirmation()).not.toHaveTextContent("KEPT");
-    expect(within(confirmation()!).queryByRole("button", { name: /keep worktree/ })).toBeNull();
+    expect(within(confirmation()!).queryByRole("checkbox")).toBeNull();
   });
 
   /**
-   * Scenario (issue #1958): close a remote dispatched agent, or its whole team,
-   * whose deck can keep the worktree. The confirmation offers Cancel, the close,
-   * and "…, keep worktree", in that order; pressing the keep button sends the
-   * stop with `keepWorktree: true` — for an orchestration, one
-   * `stop_orchestration` the crate fans out to every role with the keep.
+   * Scenario (issues #1958 and #2436): close a remote dispatched agent, or its
+   * whole team, whose deck can keep the worktree. The confirmation shows an
+   * unticked "Keep the worktree" checkbox and no extra keep button; ticking it
+   * and pressing the close sends the stop with `keepWorktree: true` — for an
+   * orchestration, one `stop_orchestration` the crate fans out to every role
+   * with the keep.
    */
   it.each(["agent", "orchestration"] as const)("offers a close that keeps the worktree of a remote %s and sends the keep", async (kind) => {
     const path = "/home/build/project-dispatch-1958";
@@ -211,17 +212,59 @@ describe("stopping from the overview (PRD #1223 U4)", () => {
     const runAction = vi.fn(async (): Promise<DeckActionResult> => ({ ok: true }));
     render(<AgentOverview runtime={{ ...runtime(runAction), previewWorktreeClose: preview }} onNavigate={vi.fn()} />);
     fireEvent.click(kind === "agent"
-      ? within(row(FIXTURE_REMOTE_DAEMON_ID, "41")).getByTestId("overview-stop-agent")
+      ? within(row(FIXTURE_REMOTE_DAEMON_ID, "42")).getByTestId("overview-stop-agent")
       : screen.getByRole("button", { name: "Close demo-project-orchestrator-1 orchestration" }));
     const close = kind === "agent" ? "Close agent" : "Close all 2 roles";
-    const keep = await within(confirmation()!).findByRole("button", { name: `${close}, keep worktree` });
-    expect(within(confirmation()!).getAllByRole("button").map((button) => button.textContent)).toEqual(["Cancel", close, `${close}, keep worktree`]);
+    const keep = await within(confirmation()!).findByRole("checkbox", { name: "Keep the worktree" });
+    expect(keep).not.toBeChecked();
+    expect(within(confirmation()!).getAllByRole("button").map((button) => button.textContent)).toEqual(kind === "agent" ? ["Cancel", close, "Close orchestration"] : ["Cancel", close]);
     expect(runAction).not.toHaveBeenCalled();
-    await act(async () => fireEvent.click(keep));
+    fireEvent.click(keep);
+    await act(async () => fireEvent.click(within(confirmation()!).getByRole("button", { name: close })));
     expect(runAction).toHaveBeenCalledExactlyOnceWith(kind === "agent"
-      ? { type: "stop_agent", deckId: FIXTURE_REMOTE_DAEMON_ID, agentId: "41", incarnation: "listed-process-a", keepWorktree: true }
+      ? { type: "stop_agent", deckId: FIXTURE_REMOTE_DAEMON_ID, agentId: "42", incarnation: "listed-process-a", keepWorktree: true }
       : { type: "stop_orchestration", deckId: FIXTURE_REMOTE_DAEMON_ID, roles: [{ agentId: "41", name: "planner", incarnation: "listed-process-a" }, { agentId: "42", name: "builder", incarnation: "listed-process-a" }], keepWorktree: true });
     expect(confirmation()).toBeNull();
+  });
+
+  /**
+   * Scenario (issue #2436): press Close on the orchestrator's row (planner).
+   * The confirmation names the orchestration and both its roles, and offers
+   * Close agent and Close orchestration, leading with Close orchestration.
+   * Pressing it sends one `stop_orchestration` over both roles — what the
+   * group's Close sends.
+   */
+  it("leads the orchestrator's close with closing the whole orchestration", async () => {
+    const runAction = vi.fn(async (): Promise<DeckActionResult> => ({ ok: true }));
+    render(<AgentOverview runtime={runtime(runAction)} onNavigate={vi.fn()} />);
+    fireEvent.click(within(row(FIXTURE_REMOTE_DAEMON_ID, "41")).getByTestId("overview-stop-agent"));
+    expect(confirmation()).toHaveTextContent("Close orchestration stops every role of demo-project-orchestrator-1 on dev@build-box — all 2 of its roles: planner, builder.");
+    expect(confirmation()).toHaveTextContent("Close agent stops only planner, the orchestrator, leaving the other roles with nothing coordinating them.");
+    const whole = within(confirmation()!).getByRole("button", { name: "Close orchestration" });
+    expect(whole).toHaveClass("leads");
+    expect(within(confirmation()!).getByRole("button", { name: "Close agent" })).not.toHaveClass("leads");
+    await act(async () => fireEvent.click(whole));
+    expect(runAction).toHaveBeenCalledExactlyOnceWith({ type: "stop_orchestration", deckId: FIXTURE_REMOTE_DAEMON_ID, roles: [{ agentId: "41", name: "planner", incarnation: "listed-process-a" }, { agentId: "42", name: "builder", incarnation: "listed-process-a" }] });
+    expect(confirmation()).toBeNull();
+  });
+
+  /**
+   * Scenario (issue #2436): press Close on a worker's row (builder). The
+   * confirmation says Close agent leaves the orchestration one role short and
+   * leads with it; Close orchestration is offered beside it. Pressing Close
+   * agent stops the builder alone.
+   */
+  it("leads a worker's close with closing only that agent", async () => {
+    const runAction = vi.fn(async (): Promise<DeckActionResult> => ({ ok: true }));
+    render(<AgentOverview runtime={runtime(runAction)} onNavigate={vi.fn()} />);
+    fireEvent.click(within(row(FIXTURE_REMOTE_DAEMON_ID, "42")).getByTestId("overview-stop-agent"));
+    expect(confirmation()).toHaveTextContent("Close agent stops only builder, leaving demo-project-orchestrator-1 one role short; its other roles keep running.");
+    expect(confirmation()).toHaveTextContent("Close orchestration stops every role of demo-project-orchestrator-1 on dev@build-box — all 2 of its roles: planner, builder.");
+    const one = within(confirmation()!).getByRole("button", { name: "Close agent" });
+    expect(one).toHaveClass("leads");
+    expect(within(confirmation()!).getByRole("button", { name: "Close orchestration" })).not.toHaveClass("leads");
+    await act(async () => fireEvent.click(one));
+    expect(runAction).toHaveBeenCalledExactlyOnceWith({ type: "stop_agent", deckId: FIXTURE_REMOTE_DAEMON_ID, agentId: "42", incarnation: "listed-process-a" });
   });
 
   /**
@@ -240,7 +283,7 @@ describe("stopping from the overview (PRD #1223 U4)", () => {
     fireEvent.click(stop);
     expect(confirmation()).toHaveTextContent("Close planner?");
     expect(confirmation()).toHaveTextContent("dev@build-box");
-    expect(confirmation()).toHaveTextContent("This closes only this role, leaving the orchestration one role short. Other roles keep running.");
+    expect(confirmation()).toHaveTextContent("Close agent stops only planner, the orchestrator, leaving the other roles with nothing coordinating them.");
     fireEvent.click(within(confirmation()!).getByRole("button", { name: "Cancel" }));
     expect(confirmation()).toBeNull();
     expect(runAction).not.toHaveBeenCalled();

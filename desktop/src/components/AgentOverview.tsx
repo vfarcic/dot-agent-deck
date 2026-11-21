@@ -1,7 +1,7 @@
 import { Children, cloneElement, createContext, isValidElement, useCallback, useContext, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type MouseEvent, type ReactNode } from "react";
 import { Blocks, Boxes, CircleArrowUp, CircleStop, Columns3, FileCog, Filter, LayoutList, Layers, Maximize2, Network, Play, Plus, RefreshCw, RotateCcw, Server, ShieldAlert, Sparkles, SquareTerminal, Wrench, X } from "lucide-react";
 import { desktopFeaturesOf } from "../types";
-import { KEEP_WORKTREE_SUFFIX, worktreePreview } from "../lib/worktreeClose";
+import { worktreePreview } from "../lib/worktreeClose";
 import { type AgentSession, type AgentStatus, type ConnectionView, type DeckRuntimeState, type DeckView, type GenerateConfigResult } from "../types";
 import { STATUS_WORD_ORDER, statusWord, statusWordLabel, type StatusWord } from "../lib/statusWords";
 import { modeScopedKey, type DesktopAgentDto } from "../lib/bridge";
@@ -922,30 +922,91 @@ export function stopTargetName(agent: OverviewAgent): string {
   return displayIdentity(raw, DISPLAY_LIMITS.name, unnamedAgentLabel(agent));
 }
 
-/** One-agent close flow shared by the dashboard row and full-window pane (issue #1402). The target is captured when the question opens, including its daemon process. */
-export function stopAgentConfirmation(agent: OverviewAgent, connection: ConnectionView, runAction: DeckRuntimeState["runAction"], onStopped?: () => void, previewWorktreeClose?: DeckRuntimeState["previewWorktreeClose"]): ConfirmState {
+/**
+ * Issue #2436 — the orchestration `agent` is a role of, as its card on the
+ * dashboard lists it, from the agents its deck reports. `undefined` for an
+ * agent outside an orchestration.
+ */
+export function orchestrationOf(agent: OverviewAgent, deckAgents: readonly OverviewAgent[]): OverviewGroup | undefined {
+  if (agent.tab.kind !== "orchestration") return undefined;
+  const key = agentKey(agent);
+  return groupAgents([...deckAgents]).find((group) => group.kind === "orchestration" && group.agents.some((member) => agentKey(member) === key));
+}
+
+/** A `stop_orchestration` role: the agent the deck closes, the name its report uses, and the daemon process that listed it. */
+type OrchestrationStopRole = { agentId: string; name: string; incarnation?: string };
+
+/**
+ * What closing a whole orchestration stops and how it is worded: the group's
+ * own Close and an orchestration role's Close dialog (issue #2436) read the
+ * same copy, so both name the orchestration and every role it stops.
+ */
+export function orchestrationCloseOf(group: OverviewGroup, connection: ConnectionView): { title: string; body: string; label: string; roles: OrchestrationStopRole[] } {
+  const roles = group.agents.map((agent) => ({ agentId: agent.id, name: stopTargetName(agent), ...(agent.incarnation ? { incarnation: agent.incarnation } : {}) }));
+  const title = displayIdentity(group.title, DISPLAY_LIMITS.name, unnamedGroupLabel(group));
+  const count = roles.length === 1 ? "its 1 role" : `all ${roles.length} of its roles`;
+  return {
+    title,
+    roles,
+    label: roles.length === 1 ? "Close 1 role" : `Close all ${roles.length} roles`,
+    body: `This stops every role of this orchestration on ${deckName(connection)} — ${count}: ${roles.map((role) => role.name).join(", ")}. Unsaved terminal work in any of them may be interrupted.`,
+  };
+}
+
+/**
+ * One-agent close flow shared by the dashboard row and full-window pane (issue #1402). The target is captured when the question opens, including its daemon process.
+ *
+ * Issue #2436: for a role of an orchestration (`orchestration`, from
+ * {@link orchestrationOf}), the dialog also offers closing the whole
+ * orchestration — the group Close's `stop_orchestration` over the same roles.
+ * On the orchestrator that is the choice the dialog leads with, since closing
+ * it alone leaves the workers with nothing coordinating them; on any other
+ * role closing only that agent leads. Every role of an orchestration shares
+ * one worktree, so the agent's own worktree preview answers for both closes,
+ * and the "Keep the worktree" box applies to whichever is pressed.
+ */
+export function stopAgentConfirmation(agent: OverviewAgent, connection: ConnectionView, runAction: DeckRuntimeState["runAction"], onStopped?: () => void, previewWorktreeClose?: DeckRuntimeState["previewWorktreeClose"], orchestration?: OverviewGroup): ConfirmState {
   const name = stopTargetName(agent);
-  const roleWarning = agent.tab.kind === "orchestration"
-    ? " This closes only this role, leaving the orchestration one role short. Other roles keep running."
-    : "";
-  const stop = async (keepWorktree: boolean) => {
+  const settle = async (action: Parameters<DeckRuntimeState["runAction"]>[0]) => {
     try {
-      const result = await runAction({ type: "stop_agent", deckId: agent.daemonId, agentId: agent.id, incarnation: agent.incarnation, ...(keepWorktree ? { keepWorktree: true } : {}) });
+      const result = await runAction(action);
       if (result.ok) onStopped?.();
     } catch {
       // The runtime files the refusal under its global error; keep the agent's view.
     }
   };
-  const label = "Close agent";
-  return {
+  const base = {
     title: `Close ${name}?`,
-    body: `This sends a stop request to ${name} on ${deckName(connection)}. Unsaved terminal work may be interrupted.${roleWarning}`,
-    label,
+    label: "Close agent",
     busyLabel: "Stopping…",
     worktreePreview: worktreePreview({ previewWorktreeClose }, agent.daemonId, [agent]),
-    action: () => stop(false),
-    // Issue #1958: offered by the dialog only when the preview names a worktree the deck can keep.
-    keepWorktree: { label: `${label}${KEEP_WORKTREE_SUFFIX}`, action: () => stop(true) },
+    action: ({ keepWorktree }: { keepWorktree: boolean }) => settle({ type: "stop_agent", deckId: agent.daemonId, agentId: agent.id, incarnation: agent.incarnation, ...(keepWorktree ? { keepWorktree: true } : {}) }),
+    // Issue #1958: the dialog offers the box only when the preview names a worktree the deck can keep.
+    keepWorktree: true,
+  };
+  const interrupted = "Unsaved terminal work may be interrupted.";
+  const group = orchestration?.agents.some((member) => agentKey(member) === agentKey(agent)) ? orchestration : undefined;
+  if (!group) {
+    const roleWarning = agent.tab.kind === "orchestration"
+      ? " This closes only this role, leaving the orchestration one role short. Other roles keep running."
+      : "";
+    return { ...base, body: `This sends a stop request to ${name} on ${deckName(connection)}. ${interrupted}${roleWarning}` };
+  }
+  const whole = orchestrationCloseOf(group, connection);
+  const count = whole.roles.length === 1 ? "its 1 role" : `all ${whole.roles.length} of its roles`;
+  const everyRole = `Close orchestration stops every role of ${whole.title} on ${deckName(connection)} — ${count}: ${whole.roles.map((role) => role.name).join(", ")}.`;
+  const orchestrator = agent.tab.kind === "orchestration" && agent.tab.isStartRole;
+  const onlyThis = orchestrator
+    ? `Close agent stops only ${name}, the orchestrator, leaving the other roles with nothing coordinating them.`
+    : `Close agent stops only ${name}, leaving ${whole.title} one role short; its other roles keep running.`;
+  return {
+    ...base,
+    body: orchestrator ? `${everyRole} ${onlyThis} ${interrupted}` : `${onlyThis} ${everyRole} ${interrupted}`,
+    alternative: {
+      label: "Close orchestration",
+      primary: orchestrator,
+      action: ({ keepWorktree }) => settle({ type: "stop_orchestration", deckId: agent.daemonId, roles: whole.roles, ...(keepWorktree ? { keepWorktree: true } : {}) }),
+    },
   };
 }
 
@@ -1769,25 +1830,23 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       stopAgent: (agent) => {
         const deck = deckOf(agent.daemonId);
         if (!deck) return;
-        setConfirm(stopAgentConfirmation(agent, deck.connection, runtime.runAction, undefined, runtime.previewWorktreeClose));
+        // Issue #2436: the whole deck's roles, not only the rows a dashboard filter shows.
+        setConfirm(stopAgentConfirmation(agent, deck.connection, runtime.runAction, undefined, runtime.previewWorktreeClose, orchestrationOf(agent, deck.agents.map(toOverviewAgent))));
       },
       closeOrchestration: (group) => {
         const deckId = group.agents[0]?.daemonId;
         const deck = deckId === undefined ? undefined : deckOf(deckId);
         if (deckId === undefined || !deck) return;
-        const roles = group.agents.map((agent) => ({ agentId: agent.id, name: stopTargetName(agent), ...(agent.incarnation ? { incarnation: agent.incarnation } : {}) }));
-        const title = displayIdentity(group.title, DISPLAY_LIMITS.name, unnamedGroupLabel(group));
-        const count = roles.length === 1 ? "its 1 role" : `all ${roles.length} of its roles`;
-        const label = roles.length === 1 ? "Close 1 role" : `Close all ${roles.length} roles`;
+        const { title, body, label, roles } = orchestrationCloseOf(group, deck.connection);
         setConfirm({
           title: `Close ${title}?`,
-          body: `This stops every role of this orchestration on ${deckName(deck.connection)} — ${count}: ${roles.map((role) => role.name).join(", ")}. Unsaved terminal work in any of them may be interrupted.`,
+          body,
           label,
           busyLabel: "Stopping…",
           worktreePreview: worktreePreview(runtime, deckId, group.agents),
-          action: () => run({ type: "stop_orchestration", deckId, roles }),
           // Issue #1958: the keep goes on every role's stop; the crate fans it out.
-          keepWorktree: { label: `${label}${KEEP_WORKTREE_SUFFIX}`, action: () => run({ type: "stop_orchestration", deckId, roles, keepWorktree: true }) },
+          action: ({ keepWorktree }) => run({ type: "stop_orchestration", deckId, roles, ...(keepWorktree ? { keepWorktree: true } : {}) }),
+          keepWorktree: true,
         });
       },
     };

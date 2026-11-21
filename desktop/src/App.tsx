@@ -34,12 +34,12 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { AgentOverview, CONFIRMATION_ALREADY_OPEN, DASHBOARD_COVERED, GENERATE_CONFIG_NO_PANE, GENERATE_CONFIRMATION_ALREADY_OPEN, GENERATE_FOR_THIS_AGENT, GENERATE_TARGET_GONE, GENERATE_TARGET_RESTARTED, generateConfigConfirmation, modalOpen, STOP_TARGET_GONE, STOP_TARGET_RESTARTED, stopAgentConfirmation, toOverviewAgent } from "./components/AgentOverview";
-import { KEEP_WORKTREE_SUFFIX, worktreePreview, type WorktreeKeptEntry } from "./lib/worktreeClose";
+import { AgentOverview, CONFIRMATION_ALREADY_OPEN, DASHBOARD_COVERED, GENERATE_CONFIG_NO_PANE, GENERATE_CONFIRMATION_ALREADY_OPEN, GENERATE_FOR_THIS_AGENT, GENERATE_TARGET_GONE, GENERATE_TARGET_RESTARTED, generateConfigConfirmation, modalOpen, orchestrationCloseOf, orchestrationOf, STOP_TARGET_GONE, STOP_TARGET_RESTARTED, stopAgentConfirmation, toOverviewAgent } from "./components/AgentOverview";
+import { worktreePreview, type WorktreeKeptEntry } from "./lib/worktreeClose";
 import { KeptWorktreeText } from "./components/KeptWorktreeText";
 import { NavigationRail, type RailContext } from "./components/NavigationRail";
 import { AgentTile, shownPanelTab, type AgentTileProps } from "./components/AgentTile";
-import { ConfirmDialog, type ConfirmState } from "./components/ConfirmDialog";
+import { ConfirmDialog, type ConfirmAction, type ConfirmChoice, type ConfirmState } from "./components/ConfirmDialog";
 import { UpgradeDialog, type UpgradeTarget } from "./components/UpgradeDialog";
 import { DeckSelector, chooseDeckSelection } from "./components/DeckSelector";
 import { AddDaemonDialog, AddDaemonOpener } from "./components/AddDaemonDialog";
@@ -974,14 +974,16 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     if ("incarnation" in target && !sameIncarnation(target.incarnation, paneAgent.incarnation)) return STOP_TARGET_RESTARTED;
     // voice-registry-exempt: a confirmed stop succeeded; retire that subject's view without dismissing a newer pane
     const stopped = () => setView((current) => current === agentView ? { kind: "overview" } : current);
-    const question = stopAgentConfirmation(toOverviewAgent(paneAgent), paneDeck.connection, runtime.runAction, stopped, runtime.previewWorktreeClose);
-    const tracked = (stop: () => Promise<void>) => async () => {
+    const overviewAgent = toOverviewAgent(paneAgent);
+    // Issue #2436: a role of an orchestration is also offered closing the whole orchestration.
+    const question = stopAgentConfirmation(overviewAgent, paneDeck.connection, runtime.runAction, stopped, runtime.previewWorktreeClose, orchestrationOf(overviewAgent, paneDeck.agents.map(toOverviewAgent)));
+    const tracked = (stop: ConfirmAction) => async (choice: ConfirmChoice) => {
       const attempt = { view: agentView };
       stoppingAttempt.current = attempt;
-      try { await stop(); } finally { if (stoppingAttempt.current === attempt) stoppingAttempt.current = undefined; }
+      try { await stop(choice); } finally { if (stoppingAttempt.current === attempt) stoppingAttempt.current = undefined; }
     };
-    // Issue #1958: the keep-worktree close is the same stop, tracked the same way.
-    setAgentStopConfirm({ ...question, ownerView: agentView, action: tracked(question.action), ...(question.keepWorktree ? { keepWorktree: { ...question.keepWorktree, action: tracked(question.keepWorktree.action) } } : {}) });
+    // Issue #2436: closing the whole orchestration is a stop of this agent too, tracked the same way.
+    setAgentStopConfirm({ ...question, ownerView: agentView, action: tracked(question.action), ...(question.alternative ? { alternative: { ...question.alternative, action: tracked(question.alternative.action) } } : {}) });
     return undefined;
   }, [agentView, confirmationOpen, paneAgent, paneDeck, paneDeckAttachable, runtime.runAction]);
   const agentStopContext = agentView && paneDeckAttachable && paneAgent ? {
@@ -2394,15 +2396,34 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
       });
       return;
     }
+    const deckId = snapshot.connection.deckId ?? "";
+    const overviewAgent = toOverviewAgent(selectedAgent);
+    const orchestration = orchestrationOf(overviewAgent, snapshot.agents.map(toOverviewAgent));
+    if (orchestration) {
+      // Issue #2436: a role of an orchestration gets the dashboard's and the pane's choices and words, with this screen's notice.
+      const requested = (action: DeckAction) => action.type === "stop_orchestration" ? `${orchestrationCloseOf(orchestration, snapshot.connection).title} close requested.` : `${selectedAgent.role} close requested.`;
+      const announced: DeckRuntimeState["runAction"] = async (action) => {
+        try {
+          const result = await runtime.runAction(action);
+          setNotice(requested(action));
+          return result;
+        } catch (cause) {
+          setNotice(cause instanceof Error ? cause.message : String(cause));
+          throw cause;
+        }
+      };
+      setConfirm(stopAgentConfirmation(overviewAgent, snapshot.connection, announced, undefined, runtime.previewWorktreeClose, orchestration));
+      return;
+    }
     setConfirm({
       title: `Close ${selectedAgent.role}?`,
       body: `This sends a stop request to ${selectedAgent.displayName}. Unsaved terminal work may be interrupted.`,
       label: "Close agent",
       busyLabel: "Stopping…",
-      worktreePreview: worktreePreview(runtime, snapshot.connection.deckId ?? "", [selectedAgent]),
-      action: async () => { await perform({ type: "stop_agent", deckId: snapshot.connection.deckId ?? "", agentId: selectedAgent.id, incarnation: selectedAgent.incarnation }, `${selectedAgent.role} close requested.`); },
-      // Issue #1958: shown only when the preview names a worktree the deck can keep.
-      keepWorktree: { label: `Close agent${KEEP_WORKTREE_SUFFIX}`, action: async () => { await perform({ type: "stop_agent", deckId: snapshot.connection.deckId ?? "", agentId: selectedAgent.id, incarnation: selectedAgent.incarnation, keepWorktree: true }, `${selectedAgent.role} close requested.`); } },
+      worktreePreview: worktreePreview(runtime, deckId, [selectedAgent]),
+      action: async ({ keepWorktree }) => { await perform({ type: "stop_agent", deckId, agentId: selectedAgent.id, incarnation: selectedAgent.incarnation, ...(keepWorktree ? { keepWorktree: true } : {}) }, `${selectedAgent.role} close requested.`); },
+      // Issue #1958: the box is shown only when the preview names a worktree the deck can keep.
+      keepWorktree: true,
     });
   };
 
