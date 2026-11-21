@@ -31,6 +31,7 @@ git push -u origin <branch>
 rwx run .rwx/ci.yml                # prints the run's URL; its last segment is the run id
 rwx results <run-id>               # the outcome, per task
 rwx logs <task-attempt-id>         # one task's log, for a red
+scripts/rwx-junit.sh <run-id>      # every test task's JUnit file (rwx.md, "Per-test results")
 ```
 
 What it does not run: `cross-version` (RWX cannot, see [rwx.md](rwx.md); the pull request runs it on GitHub), `build-macos` (RWX has no macOS runners), and the advisory `release-lib`, which is its own run definition (`rwx run .rwx/release-lib.yml`). It spends RWX credits instead of GitHub minutes. The flags of `rwx run` (whether it can wait for the run, for one) are not written down here because this change was made on a machine without the CLI: read `rwx run --help`.

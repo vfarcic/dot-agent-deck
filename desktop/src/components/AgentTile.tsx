@@ -9,6 +9,7 @@ import {
   CircleDot,
   CircleStop,
   FileCode2,
+  FileCog,
   GitCompareArrows,
   Handshake,
   Maximize2,
@@ -18,7 +19,8 @@ import {
   Unplug,
   X,
 } from "lucide-react";
-import { statusLabel, UNREPORTED } from "../types";
+import { UNREPORTED } from "../types";
+import { statusWord, statusWordLabel } from "../lib/statusWords";
 import type {
   AgentPanePresentation,
   AgentSession,
@@ -33,10 +35,10 @@ import type {
 } from "../types";
 import { terminalInputState, type AgentRecordFreshness, type NoTerminalState } from "../lib/terminalInput";
 import { blockedReasonText } from "../lib/blockedReason";
-import { attentionReason, inboxActionText, inboxBadge, inboxNotice, inputHeldText, INBOX_WORDS } from "../lib/inboxWords";
+import { attentionReason, inboxActionText, inboxAttentionWords, inboxBadge, inboxNotice, inputHeldText, INBOX_WORDS } from "../lib/inboxWords";
 import { displayBackgroundWork, displayUptime } from "../lib/displayText";
 import { agentTitle } from "../lib/agentNames";
-import { OVERVIEW_CLOCK_TICK_MS } from "./AgentOverview";
+import { configActionVerb, OVERVIEW_CLOCK_TICK_MS } from "./AgentOverview";
 import { OutputReader } from "./OutputReader";
 import { PullRequestBadge } from "./PullRequestBadge";
 import { OpenPullRequest } from "../lib/prBrowser";
@@ -274,6 +276,13 @@ export interface AgentTileProps {
   /** Ask to end the agent, separately from the view-only Back control (issue #1402). */
   stopContext?: Pick<VoiceActionContext, "confirmStopAgent" | "reportRefused">;
   /**
+   * PRD #2119 — the open pane's Generate config: `context` is what its button
+   * dispatches `VOICE_ACTIONS.confirmGenerateConfig` through, and `notice` is
+   * the outcome of a request sent for this agent, shown in the pane so it is
+   * not hidden behind it.
+   */
+  generateConfig?: { context?: Pick<VoiceActionContext, "confirmGenerateConfig" | "reportRefused">; notice?: string };
+  /**
    * PRD #1666 §6.4 — Retry or Cancel one deck message the tile lists, at the
    * revision it shows. Supplied only where a daemon can answer: without it the
    * rows show no buttons, as a control that does nothing must not exist.
@@ -357,8 +366,10 @@ export function AgentTile({
   panePresent,
   onClose,
   stopContext,
+  generateConfig,
   onInboxAction,
 }: AgentTileProps) {
+  const generateContext = generateConfig?.context;
   /* PRD #1401 — the badge opens the in-app browser where the shell offers one. */
   const openPullRequest = useContext(OpenPullRequest);
   /* PRD #1666 part 2 (G-fix6): keystrokes and sizes carry the incarnation of
@@ -444,9 +455,10 @@ export function AgentTile({
     void onRename(agent.id, next, agent.incarnation);
   };
 
-  // The daemon's `error` is merged into `failed` for grouping; the card says
-  // what the daemon said, the word the TUI's card uses (CLAUDE.md rule 22).
-  const tileStatusLabel = agent.daemonStatus === "error" ? "error" : statusLabel(agent.status);
+  // Issue #2411: the daemon's word, the one the TUI's card uses (CLAUDE.md
+  // rule 22), never the column the deck merges it into.
+  const tileStatus = statusWord(agent);
+  const tileStatusLabel = statusWordLabel(tileStatus);
   /*
     Issue #1798 — the title names the agent: its name, after its run's title
     for an orchestration agent. Every accessible name on the tile is built from
@@ -475,6 +487,9 @@ export function AgentTile({
     fixture ? agent.model : undefined,
   ].filter((part): part is string => Boolean(part));
   const badge = inboxBadge(agent.inbox);
+  /* Issue #2387: the deck holds a message for this agent — the header names
+     exactly the agents this marks (`heldAgents`). */
+  const holdWords = inboxAttentionWords(agent.inbox);
   const inboxNoticeRow = inboxNotice(agent.inbox);
   const inputHeldRow = inputHeldText(agent.inputHeld, agent.inputDiscarded === true);
   const attention = agent.inbox?.attention ?? [];
@@ -506,7 +521,7 @@ export function AgentTile({
     >
       <header className="agent-header">
         <div className="agent-identity">
-          <span className={`agent-state-mark status-${agent.status}${held ? " is-held" : ""}`} aria-hidden="true" />
+          <span className={`agent-state-mark status-${tileStatus}${held ? " is-held" : ""}`} aria-hidden="true" />
           <div>
             {/*
               Issue #1798 — one line: the agent's name, the muted facts that
@@ -558,7 +573,16 @@ export function AgentTile({
                 takes, and half of them are not verbs — `last seen passed` and
                 `last seen queued` do not parse, where `last seen: passed` does.
               */}
-              <span className={`status-label status-${agent.status}${held ? " is-held" : ""}`}>{held ? `last seen: ${tileStatusLabel}` : tileStatusLabel}</span>
+              <span className={`status-label status-${tileStatus}${held ? " is-held" : ""}`}>{held ? `last seen: ${tileStatusLabel}` : tileStatusLabel}</span>
+              {/*
+                Issue #2387 — beside the status, never instead of it: the status
+                is what the agent is doing, this is what the deck is doing. Its
+                hover gives the hold's words, the ones the header's name gives.
+                A held record (a daemon that is not answering) keeps the marker
+                as part of its past report, greyed like its status, so no agent
+                the header could ever name is drawn without it.
+              */}
+              {holdWords && <span className={`held-marker${held ? " is-held" : ""}`} data-testid={`held-marker-${agent.id}`} title={held ? `last seen: ${holdWords}` : holdWords}>{INBOX_WORDS.attentionHeld}</span>}
               {/* PRD #1401 — the agent's pull request, when the daemon found one. */}
               {agent.pullRequest && (
                 <PullRequestBadge
@@ -594,6 +618,10 @@ export function AgentTile({
                 messages waiting on the user's Retry or Cancel. */}
             {/* PRD #1666 part 3 (Q35, core §7): the deck holds what the user
                 typed into this pane, and says why — the TUI card's row. */}
+            {/* PRD #2119: what became of Generate config for this agent. */}
+            {generateConfig?.notice && (
+              <p className="agent-config-notice" role="status" data-testid={`config-notice-${agent.id}`}>{generateConfig.notice}</p>
+            )}
             {inputHeldRow && !held && (
               <p className="agent-inbox-notice" data-testid={`input-held-${agent.id}`}>{inputHeldRow}</p>
             )}
@@ -632,6 +660,22 @@ export function AgentTile({
               onClick={onOpen}
             ><Maximize2 size={13} /></button>
           )}
+          {/* PRD #2119 — Update config when the daemon reports the project already has one; each label written out whole for the voice table's label check. */}
+          {generateContext && (configActionVerb(agent) === "Update" ? (
+            <button
+              className="agent-generate-config-control"
+              title="Update config"
+              onMouseDown={(event) => event.stopPropagation()}
+              onClick={() => VOICE_ACTIONS.confirmGenerateConfig.run(generateContext, { deckId: agent.daemonId, agentId: agent.id, incarnation: agent.incarnation, from: "overview" })}
+            ><FileCog size={14} aria-hidden="true" /> Update config</button>
+          ) : (
+            <button
+              className="agent-generate-config-control"
+              title="Generate config"
+              onMouseDown={(event) => event.stopPropagation()}
+              onClick={() => VOICE_ACTIONS.confirmGenerateConfig.run(generateContext, { deckId: agent.daemonId, agentId: agent.id, incarnation: agent.incarnation, from: "overview" })}
+            ><FileCog size={14} aria-hidden="true" /> Generate config</button>
+          ))}
           {stopContext && (
             <button
               className="agent-stop-control"

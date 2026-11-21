@@ -47,6 +47,13 @@
 //!   entrypoint that rule doesn't predict (another script under the same
 //!   interpreter, or another interpreter) is refused
 //!   "executable differs: expected <agent_type>".
+//! * An entrypoint that replaces itself (issue #2337: npm Codex 0.169.0's
+//!   `codex.js` `execve`s the native under Node 23.11 or later): a native
+//!   at the entrypoint's PID, with no entrypoint above it, is `A` when its
+//!   executable is a file inside the pinned script's own package (the
+//!   directory below the last `node_modules` on the script's real path),
+//!   and refused "executable differs: expected <agent_type>" when it is
+//!   beside the package, as npm's hoisted platform package is.
 //! * e2e-only `DOT_AGENT_DECK_E2E_DISCOVERY_REJECT_UID=1` forces ONLY the
 //!   foreign-uid refusal at that production validator. It cannot supply an
 //!   accepted uid or skip any other validation. This covers the fail-closed
@@ -1330,6 +1337,9 @@ fn hosted_shape(f: &Fixture, ready: &Value, hosted: Hosted) {
                 cmdline(shell)
             );
         }
+        Hosted::InPlace | Hosted::InPlaceOutside => {
+            unreachable!("an in-place shape is certified by in_place_shape")
+        }
     }
     assert!(
         argv[2..].iter().any(|arg| arg == "--live-segments-fixture"),
@@ -1342,13 +1352,91 @@ fn hosted_shape(f: &Fixture, ready: &Value, hosted: Hosted) {
     );
 }
 
+/// The launched history has the in-place shape `hosted` names (issue #2337),
+/// checked from `/proc`: the entrypoint ran the genuine script under the
+/// shebang's interpreter and then replaced itself with a native, so the
+/// native agent runs at the entrypoint's own PID, as the deck wrapper's
+/// child, with no entrypoint above it, inside the npm package for
+/// [`Hosted::InPlace`] and beside it for [`Hosted::InPlaceOutside`].
+/// Certifies the fixture only.
+fn in_place_shape(f: &Fixture, ready: &Value, hosted: Hosted) {
+    let entry = live::read_json(&f.path("launcher-ready"));
+    let native_pid = ready["pid"].as_u64().unwrap();
+    assert_eq!(
+        entry["pid"].as_u64(),
+        Some(native_pid),
+        "the native agent replaced the entrypoint in place"
+    );
+    let package = f.native_executable().parent().unwrap().join("npm");
+    let genuine = package.join("lib").join("entry.py");
+    let argv: Vec<String> = entry["argv"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|arg| arg.as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        fs::canonicalize(&argv[0]).unwrap(),
+        genuine,
+        "the entrypoint ran the genuine script"
+    );
+    assert_eq!(
+        fs::read_link(package.join("bin").join(f.kind)).unwrap(),
+        PathBuf::from("../lib/entry.py"),
+        "through npm's symlink"
+    );
+    assert!(
+        package.join("package.json").is_file(),
+        "an installed package"
+    );
+    assert_eq!(
+        f.native_executable().parent().unwrap().file_name(),
+        Some(std::ffi::OsStr::new("node_modules")),
+        "installed in a node_modules"
+    );
+    let wrapper = parent_pid(native_pid);
+    assert_eq!(
+        cmdline(wrapper).get(1).map(String::as_str),
+        Some("wrap"),
+        "the deck wrapper's own child, no entrypoint above it: {:?}",
+        cmdline(wrapper)
+    );
+    let exe = fs::read_link(format!("/proc/{native_pid}/exe")).unwrap();
+    assert_eq!(
+        exe,
+        f.launched_executable(),
+        "the native named for the shape"
+    );
+    assert_eq!(
+        exe.starts_with(&package),
+        hosted == Hosted::InPlace,
+        "inside the package only for the genuine in-place shape: {}",
+        exe.display()
+    );
+    let native = cmdline(native_pid);
+    assert_eq!(native[0], exe.to_str().unwrap(), "codex.js's argv[0]");
+    assert_eq!(
+        native[1..],
+        argv[1..],
+        "the entrypoint passes its arguments to the native agent"
+    );
+    assert!(
+        native.iter().any(|arg| arg == "--live-segments-fixture"),
+        "the launch's own arguments: {native:?}"
+    );
+}
+
 fn hosted_control(hosted: Hosted) {
     // No candidate barrier: an entrypoint that doesn't match its shebang may
     // be refused before discovery finds a candidate below it.
     let f = hosted_fixture(hosted, false);
     pending(&f, Route::Launcher);
     let ready = launch(&f);
-    hosted_shape(&f, &ready, hosted);
+    if hosted.in_place() {
+        in_place_shape(&f, &ready, hosted);
+    } else {
+        hosted_shape(&f, &ready, hosted);
+    }
     let reason = mismatch_reason(f.kind);
     assert!(
         common::wait_until(WAIT, || status(&f)["reason"] == reason),
@@ -1405,7 +1493,27 @@ fn probe_035_npm_codex_other_interpreter_cannot_get_permission() {
     hosted_control(Hosted::OtherInterpreter);
 }
 
-/// Scenario: Start the npm-style Codex pane in its genuine, other-script, other-interpreter and devbox-launcher shapes without any discovery interface, launch each, and type into the pane. Each must show the shape it names in /proc (the native codex copy as the entrypoint's child, on no spawn PATH entry) and a live composer echoing human input.
+/// Scenario: Start a declared Codex pane by bare name whose npm-style entrypoint, like npm Codex 0.169.0's `codex.js` under Node 23.11 or later, replaces itself with the native copy inside its own package through `execve` instead of spawning it (issue #2337), so no entrypoint is left above the native. Pause discovery at the candidate and release it, then type into the box. The native, at the entrypoint's PID, must be published as A, become Armable, and the real installed helper must check its touched empty box.
+#[spec("inbox/probe/035")]
+#[test]
+fn probe_035_npm_codex_that_execs_in_place_binds_inside_its_package_and_checks() {
+    let f = hosted_fixture(Hosted::InPlace, true);
+    pending(&f, Route::Launcher);
+    let ready = launch(&f);
+    in_place_shape(&f, &ready, Hosted::InPlace);
+    arrived(&f, &ready);
+    release(&f);
+    bound_to(&f, &ready, executable_identity(f.launched_executable()));
+}
+
+/// Scenario: Start the same npm-style Codex pane, but its entrypoint replaces itself in place with the native copy beside its package rather than inside it (npm's hoisted shape). The pane must get an executable-mismatch reason, no gen-G identity, no Armable permission and no helper check.
+#[spec("inbox/probe/035")]
+#[test]
+fn probe_035_npm_codex_that_execs_a_native_outside_its_package_cannot_get_permission() {
+    hosted_control(Hosted::InPlaceOutside);
+}
+
+/// Scenario: Start the npm-style Codex pane in its genuine, other-script, other-interpreter, devbox-launcher and two in-place shapes without any discovery interface, launch each, and type into the pane. Each must show the shape it names in /proc (the native codex copy as the entrypoint's child, on no spawn PATH entry, or the native in the entrypoint's place, inside or beside its package) and a live composer echoing human input.
 #[spec("inbox/probe/035")]
 #[test]
 fn probe_035_fixture_npm_codex_shapes_launch_their_native_child() {
@@ -1414,10 +1522,16 @@ fn probe_035_fixture_npm_codex_shapes_launch_their_native_child() {
         Hosted::OtherScript,
         Hosted::OtherInterpreter,
         Hosted::LauncherPath,
+        Hosted::InPlace,
+        Hosted::InPlaceOutside,
     ] {
         let f = hosted_fixture(hosted, false);
         let ready = launch(&f);
-        hosted_shape(&f, &ready, hosted);
+        if hosted.in_place() {
+            in_place_shape(&f, &ready, hosted);
+        } else {
+            hosted_shape(&f, &ready, hosted);
+        }
         let entry = live::read_json(&f.path("launcher-ready"));
         assert_eq!(ready["editors"], entry["editors"]);
         let mut human = f.connect();

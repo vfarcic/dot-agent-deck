@@ -22,6 +22,12 @@ pub mod agent_registry;
 pub mod attach_recovery;
 pub mod authoring_seeds;
 pub mod bounded_read;
+// PRD #2374: the agent-card catalog (defaults + the user's `[catalog]`).
+pub mod card_catalog;
+// PRD #2374: agent cards — the report an agent publishes and the entry the daemon computes.
+pub mod agent_cards;
+// PRD #2374: the `card` command group.
+pub mod agent_cards_cli;
 pub mod build_id;
 pub mod build_version_handshake;
 // PRD #385: a pane selection copied to the native clipboard and OSC 52.
@@ -63,6 +69,7 @@ pub mod devin_hooks_manage;
 pub mod directory_listing;
 pub mod dispatch;
 pub mod dispatch_return;
+pub mod dispatch_task;
 // PRD #1666 S4: the fixed one-line doorbell for an agent with no armed inbox component.
 pub mod doorbell;
 // PRD #1666 part 3 round 5-wake: which agent releases the doorbell may type into.
@@ -139,6 +146,7 @@ pub mod jsonc_edit;
 pub mod keybindings;
 // Issue #1540: the deck's last New-agent-form command, owned by the daemon.
 pub mod last_command;
+pub mod launch_records;
 pub mod lifetime_tag;
 pub mod lock_rank;
 pub mod logging;

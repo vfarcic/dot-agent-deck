@@ -42,6 +42,10 @@ struct Script {
     /// Issue #1958: a `Hello` is read and never answered, the connection held
     /// open — a deck that accepts and then goes quiet.
     silent_hello: bool,
+    generate_capability: Option<bool>,
+    generate_reply: Option<AttachResponse>,
+    silent_generate: bool,
+    generate_requests: Vec<serde_json::Value>,
 }
 
 /// A deck whose daemon restarts at its socket as the same build. Every request
@@ -174,6 +178,16 @@ impl RestartingDeck {
                             let request: serde_json::Value =
                                 serde_json::from_slice(&payload).unwrap_or_default();
                             let op = request["op"].as_str().unwrap_or_default().to_string();
+                            if op == "generate-config" {
+                                script
+                                    .lock()
+                                    .unwrap()
+                                    .generate_requests
+                                    .push(request.clone());
+                                if script.lock().unwrap().silent_generate {
+                                    std::future::pending::<()>().await;
+                                }
+                            }
                             if op == "stop-agent" {
                                 script.lock().unwrap().stop_requests.push(request.clone());
                             }
@@ -199,6 +213,19 @@ impl RestartingDeck {
                                 *script.lock().unwrap().hellos.entry(process).or_default() += 1;
                                 follow_on = request["follow_on"] == true;
                                 let mut hello = hello_from(process);
+                                if let Some(advertise) = script.lock().unwrap().generate_capability
+                                {
+                                    let capabilities = hello.capabilities.get_or_insert_default();
+                                    capabilities.retain(|cap| {
+                                        cap != dot_agent_deck::daemon_protocol::CAP_GENERATE_CONFIG
+                                    });
+                                    if advertise {
+                                        capabilities.push(
+                                            dot_agent_deck::daemon_protocol::CAP_GENERATE_CONFIG
+                                                .into(),
+                                        );
+                                    }
+                                }
                                 if let Some(advertise) = script.lock().unwrap().keep_capability {
                                     let capabilities = hello.capabilities.get_or_insert_default();
                                     capabilities.retain(|cap| {
@@ -230,7 +257,18 @@ impl RestartingDeck {
                                     recorded.lock().unwrap().push((process, op.clone()));
                                 }
                                 let live = script.lock().unwrap().live.clone();
-                                let reply = with_live(serve(&op), live);
+                                let reply = if op == "generate-config" {
+                                    script
+                                        .lock()
+                                        .unwrap()
+                                        .generate_reply
+                                        .clone()
+                                        .unwrap_or_else(|| {
+                                            AttachResponse::with_id("m-config".into())
+                                        })
+                                } else {
+                                    with_live(serve(&op), live)
+                                };
                                 // The restart lands before the reply is
                                 // written: no connection the client opens
                                 // after reading it reaches `process`, and a
@@ -287,6 +325,21 @@ impl RestartingDeck {
 
     pub(crate) fn endpoint(&self) -> Endpoint {
         Endpoint::Local(LocalEndpoint::at(&self.socket))
+    }
+
+    pub(crate) fn config_generation(&self, advertised: bool, reply: Option<AttachResponse>) {
+        let mut script = self.script.lock().unwrap();
+        script.generate_capability = Some(advertised);
+        script.generate_reply = reply;
+        script.generate_requests.clear();
+    }
+
+    pub(crate) fn config_requests(&self) -> Vec<serde_json::Value> {
+        self.script.lock().unwrap().generate_requests.clone()
+    }
+
+    pub(crate) fn silence_config_generation(&self) {
+        self.script.lock().unwrap().silent_generate = true;
     }
 
     /// The daemon restarts now, as the process `next`.

@@ -219,6 +219,12 @@ pub(crate) struct DesktopState {
     /// `'static` spawned task that outlives any borrow of this state; it holds
     /// its own handle and invalidates through it when its event stream ends.
     pub(crate) daemon: Arc<DaemonLinks>,
+    /// PRD #2374 (PR #2378 review): each deck's agents as the snapshot the
+    /// app last showed for it carried them, by deck id — written by
+    /// `emit_snapshot`, removed for a deck whose last snapshot was not
+    /// connected. Voice reads the other daemons' agents from here, so no
+    /// utterance waits on another daemon.
+    pub(crate) shown_agents: Mutex<HashMap<String, Vec<crate::dto::DesktopAgent>>>,
     /// PRD #741 M7: the live `ssh -N -L` children, keyed by endpoint.
     ///
     /// **Beside [`DaemonLinks`], never inside it.** A `TrustedDaemon` is
@@ -290,6 +296,16 @@ pub(crate) struct DesktopState {
     /// while the watcher is between subscriptions is still seen. Entries go
     /// with their deck in [`Self::retain_watchers`].
     refetch: Mutex<HashMap<EndpointIdentity, tokio::sync::watch::Sender<u64>>>,
+    /// PRD #2374: whether the webview consumes agent cards. `false` until the
+    /// webview calls `agent_cards_consume`; from then on every deck watcher
+    /// subscribes with the card doorbells and pushes cards, and
+    /// `agent_cards_list` reads them. Until then no watcher asks a daemon for
+    /// cards. The bridge decides from this request.
+    ///
+    /// A [`tokio::sync::watch`] for [`Self::selection`]'s reason: a watcher
+    /// already subscribed without the doorbells observes the request as an
+    /// edge and re-subscribes with them.
+    agent_cards: tokio::sync::watch::Sender<bool>,
     /// PRD #1223 M4: the command each deck last started a plain agent with from
     /// this app, which the New agent form prefills when the deck configures no
     /// `default_command` — the TUI's `last_command`, kept **per deck** because
@@ -382,10 +398,12 @@ impl Default for DesktopState {
             watchers: Mutex::new(HashMap::new()),
             watcher_claims: Generation::default(),
             daemon: Arc::clone(&daemon),
+            shown_agents: Mutex::new(HashMap::new()),
             tunnels: daemon.tunnels(),
             voice_answer_leases: crate::voice::lease::AnswerLeases::default(),
             selection: tokio::sync::watch::Sender::new(0),
             refetch: Mutex::new(HashMap::new()),
+            agent_cards: tokio::sync::watch::Sender::new(false),
             last_commands: Mutex::new(HashMap::new()),
             window_focus: Arc::new(Mutex::new(WindowFocus::default())),
             saved_selections: crate::selection_saves::SavedSelections::default(),
@@ -518,7 +536,8 @@ impl DesktopState {
     /// that deck reaches the webview — needs a running Tauri app to observe and
     /// is not pinned by any test here; it is stated rather than claimed.
     pub(crate) fn retain_watchers(&self, observed: &HashSet<EndpointIdentity>) {
-        self.watchers().retain(|deck, claim| {
+        let mut watchers = self.watchers();
+        watchers.retain(|deck, claim| {
             if observed.contains(deck) {
                 return true;
             }
@@ -527,8 +546,41 @@ impl DesktopState {
             }
             false
         });
+        // PRD #2374 (PR #2378 review): a departed deck's agents leave the
+        // cache voice reads with its watcher, under the same lock
+        // [`Self::record_shown_agents`] records under, so a snapshot still in
+        // flight from the aborted watcher cannot put them back.
+        let kept: HashSet<String> = observed.iter().map(EndpointIdentity::wire_id).collect();
+        self.shown_agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|deck, _| kept.contains(deck));
+        drop(watchers);
         self.refetch_senders()
             .retain(|deck, _| observed.contains(deck));
+    }
+
+    /// PRD #2374 (PR #2378 review) — record the agents `deck`'s watcher
+    /// showed, for voice ([`Self::shown_agents`]): kept while the deck is
+    /// connected, removed otherwise — and only from the watcher whose claim
+    /// `token` is the deck's current one, so a watcher that was retired, or
+    /// replaced when the deck left and rejoined, records nothing. Under the
+    /// watchers lock, so the check and the write cannot interleave with
+    /// [`Self::retain_watchers`] or a new claim: a rejoined deck contributes
+    /// nothing until its new watcher's first connected snapshot.
+    pub(crate) fn record_shown_agents(
+        &self,
+        deck: &EndpointIdentity,
+        token: u64,
+        connected: bool,
+        agents: &[crate::dto::DesktopAgent],
+    ) {
+        let watchers = self.watchers();
+        if !watchers.get(deck).is_some_and(|claim| claim.token == token) {
+            return;
+        }
+        crate::record_shown_agents(&self.shown_agents, &deck.wire_id(), connected, agents);
+        drop(watchers);
     }
 
     /// The refetch signal map, poison-tolerant for the reason
@@ -565,6 +617,26 @@ impl DesktopState {
         if let Some(sender) = self.refetch_senders().get(deck) {
             sender.send_modify(|generation| *generation += 1);
         }
+    }
+
+    /// PRD #2374: the webview consumes agent cards from now on. See
+    /// [`Self::agent_cards`]. Idempotent: a second request moves nothing, so
+    /// no watcher re-subscribes for it.
+    pub(crate) fn consume_agent_cards(&self) {
+        self.agent_cards
+            .send_if_modified(|wanted| !std::mem::replace(wanted, true));
+    }
+
+    /// Whether the webview asked for agent cards ([`Self::consume_agent_cards`]).
+    pub(crate) fn agent_cards_consumed(&self) -> bool {
+        *self.agent_cards.borrow()
+    }
+
+    /// Subscribe a deck watcher to the card request. Taken before its task is
+    /// spawned, like [`Self::refetch_signal`], so a request landing the moment
+    /// after is an edge this receiver observes.
+    pub(crate) fn agent_cards_signal(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.agent_cards.subscribe()
     }
 
     /// Record the command a plain agent was just started with on `deck` (PRD
@@ -1870,6 +1942,69 @@ mod tests {
             !watcher_b.has_changed().unwrap(),
             "the deck that stayed keeps its"
         );
+    }
+
+    /// PRD #2374 (PR #2378 review) — the agents voice reaches on other daemons.
+    ///
+    /// Scenario: deck A is watched and deck B is not. A connected snapshot of A
+    /// is recorded and one of B is not. Deck A then leaves the fleet: its
+    /// agents leave the cache with its watcher, a snapshot of it still in
+    /// flight records nothing, and when A is watched again it has nothing
+    /// cached until a connected snapshot of it arrives.
+    #[cfg(unix)]
+    #[test]
+    fn a_decks_shown_agents_live_and_leave_with_its_watcher() {
+        let state = DesktopState::default();
+        let deck_a = fixture_deck("/tmp/dot-agent-deck-shown-a.sock").identity();
+        let deck_b = fixture_deck("/tmp/dot-agent-deck-shown-b.sock").identity();
+        let a = deck_a.wire_id();
+        let coder = [crate::voice::fixtures::agent(
+            "1",
+            Some("Coder"),
+            "claude_code",
+        )];
+        let cached = |state: &DesktopState| {
+            state
+                .shown_agents
+                .lock()
+                .unwrap()
+                .get(&a)
+                .map(|agents| agents.len())
+        };
+
+        let first = state.start_watcher_once_for(&deck_a).expect("claimed");
+        state.record_shown_agents(&deck_a, first, true, &coder);
+        state.record_shown_agents(&deck_b, first, true, &coder);
+        assert_eq!(cached(&state), Some(1));
+        assert!(
+            state
+                .shown_agents
+                .lock()
+                .unwrap()
+                .get(&deck_b.wire_id())
+                .is_none(),
+            "an unwatched deck records nothing"
+        );
+
+        state.retain_watchers(&HashSet::new());
+        assert_eq!(cached(&state), None, "it leaves with its watcher");
+        state.record_shown_agents(&deck_a, first, true, &coder);
+        assert_eq!(cached(&state), None, "a late snapshot cannot put it back");
+
+        let second = state
+            .start_watcher_once_for(&deck_a)
+            .expect("claimed again");
+        assert_eq!(cached(&state), None, "nothing until its first snapshot");
+        state.record_shown_agents(&deck_a, first, true, &coder);
+        assert_eq!(
+            cached(&state),
+            None,
+            "the retired watcher records nothing under the new claim"
+        );
+        state.record_shown_agents(&deck_a, second, true, &coder);
+        assert_eq!(cached(&state), Some(1));
+        state.record_shown_agents(&deck_a, second, false, &coder);
+        assert_eq!(cached(&state), None, "a deck that stops answering has none");
     }
 
     /// PRD #1223 M4 — the New agent form's per-deck last command.

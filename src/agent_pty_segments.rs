@@ -939,7 +939,9 @@ pub(super) fn end_probe_segment(
 /// writer does, unless the writer refused only the screen's freshness
 /// ([`writer_refusal_counts`], A-20d-11), which counts one failure only for
 /// every [`crate::composer_probe::probe::MOVED_PER_FAILURE`]th such refusal
-/// in a row. A failed write answers its own
+/// in a row, or only the query-wait estimate, which a size change or query
+/// since scheduling moved and which counts as it does when scheduled
+/// ([`scheduling_refused`], #2129). A failed write answers its own
 /// reason, never an admission refusal's. A lapse retry counts no failure
 /// here: its asker decides.
 /// Shared with the release oracle.
@@ -973,10 +975,14 @@ pub(super) fn probe_ended(
                 "probe refused at the writer"
             );
             if ask != ProbeAsk::Lapse {
-                if writer_refusal_counts(refusal) {
-                    input.probe_failed(Instant::now());
-                } else {
-                    input.probe_moved(Instant::now());
+                let now = Instant::now();
+                match refusal {
+                    // #2129: a query wait started since scheduling.
+                    ProbeRefusal::Admission(
+                        crate::composer_probe::admission::Refusal::Estimate(until),
+                    ) => input.probe_estimate(now, until),
+                    _ if writer_refusal_counts(refusal) => input.probe_failed(now),
+                    _ => input.probe_moved(now),
                 }
             }
             ProbeOutcome::Refused(format!("{refusal:?}"))
@@ -992,7 +998,15 @@ pub(super) fn probe_ended(
 /// [`crate::composer_probe::probe::SURFACE_PER_FAILURE`]th in a row
 /// (`Schedule::surface`, #2147): after a person's key the agent is usually
 /// still drawing, and the attempt it makes due is admitted only if the
-/// screen then shows the composer. Every other refusal counts, as before. A
+/// screen then shows the composer. A refusal for the query-wait estimate
+/// alone (O5's `Estimate`: every other conjunct passed, the screen
+/// included) makes the next attempt due when that estimate runs out and
+/// counts a failure only for every
+/// [`crate::composer_probe::probe::ESTIMATE_PER_FAILURE`]th in a row
+/// (`Schedule::estimate`, #2129): a few quick resizes chain Codex's
+/// cursor-query waits, the refresh nudge's edges move the estimate while the
+/// attempt waits for it, and the full backoff step that refusal cost delayed
+/// the check by 30 s. Every other refusal counts, as before. A
 /// lapse retry's refusal counts nothing here: its asker decides.
 #[cfg(target_os = "linux")]
 pub(super) fn scheduling_refused(
@@ -1004,10 +1018,12 @@ pub(super) fn scheduling_refused(
     if ask == ProbeAsk::Lapse {
         return;
     }
-    if refusal == crate::composer_probe::admission::Refusal::Surface {
-        input.probe_surface(now);
-    } else {
-        input.probe_failed(now);
+    match refusal {
+        crate::composer_probe::admission::Refusal::Surface => input.probe_surface(now),
+        crate::composer_probe::admission::Refusal::Estimate(until) => {
+            input.probe_estimate(now, until);
+        }
+        _ => input.probe_failed(now),
     }
 }
 
@@ -1021,8 +1037,9 @@ pub(super) fn scheduling_refused(
 /// only [`crate::composer_probe::probe::MOVED_PER_FAILURE`] such refusals in
 /// a row, the last of which counts one failure, so an agent that draws
 /// inside every window is backed off rather than asked at every tick (the
-/// revd21 review's U3-1, `Schedule::moved`). Every other refusal at the
-/// writer counts, as before. A lapse retry's refusal is counted by its
+/// revd21 review's U3-1, `Schedule::moved`). An estimate refusal
+/// ([`probe_ended`] routes it before asking this, #2129) waits for its
+/// estimate instead. Every other refusal at the writer counts, as before. A lapse retry's refusal is counted by its
 /// asker, the doorbell tick, which sees only that it was refused, so a
 /// lapse retry refused for the screen still counts.
 #[cfg(target_os = "linux")]
@@ -1126,11 +1143,15 @@ fn probe_gate_scheduled() {
 /// - Codex's (120.5 s, a resize storm chaining 2 s CPR waits) is not. A
 ///   bound taken from its profile would let one request keep the doorbell
 ///   silent for two minutes; this one keeps it to about ten seconds, and
-///   then the refusal counts one failure: the next attempt waits the first
+///   then the request answers the refusal: the next attempt is due when the
+///   estimate it was refused for runs out, and only every fourth such
+///   refusal in a row counts one failure, whose next attempt waits the first
 ///   backoff step (30 s, `crate::composer_probe::probe::BACKOFF`), or comes
-///   at once on a person's op, and the waits continue. Broken after three
-///   is presentation only. O5 is availability, not safety (A1 §4.4), so
-///   neither choice moves what may be typed.
+///   at once on a person's op, and the waits continue (`scheduling_refused`,
+///   #2129; before it, every such refusal counted, and three quick resizes
+///   of a Codex pane no client answered cursor queries for cost the check
+///   30 s). Broken after three is presentation only. O5 is availability,
+///   not safety (A1 §4.4), so neither choice moves what may be typed.
 ///
 /// `probe_059_an_estimate_past_the_o5_bound_is_answered_without_a_wait`
 /// pins both halves: the bound against each profile, and a request past it
@@ -1228,7 +1249,8 @@ impl AgentPtyRegistry {
                 }
             },
             move |keymap| async move {
-                let surface = surface_shows_composer(hr.agent.as_ref(), hr.bus.clean_frame());
+                let surface =
+                    surface_shows_composer(hr.agent.as_ref(), hr.bus.clean_frame().as_ref());
                 let w = hr.writer.lock().await;
                 let now = Instant::now();
                 let status = hr.gate.gate.status();
@@ -1262,7 +1284,17 @@ impl AgentPtyRegistry {
         // still stands (U3-03, R-D-U2-01).
         let marked = h.bus.clean_frame_marked();
         let mark = marked.as_ref().map(|(_, mark)| *mark);
-        let surface = surface_shows_composer(h.agent.as_ref(), marked.map(|(grid, _)| grid));
+        let frame = marked.map(|(grid, _)| grid);
+        let surface = surface_shows_composer(h.agent.as_ref(), frame.as_ref());
+        // Issue #2130: on the frame the check is admitted on, Codex's status
+        // line must still show the directory the generation was bound in.
+        // Asked only of a frame that shows the composer, so a box holding a
+        // draft is still refused for the screen, not counted as a failure.
+        let keymap = if surface {
+            keymap.and_then(|()| h.observer.session(frame.as_ref()))
+        } else {
+            keymap
+        };
         let now = Instant::now();
         let status = h.gate.gate.status();
         let (fence, lapsed_e0) = input.admission_fence(status.fenced, status.held_ops, now);
@@ -1407,19 +1439,18 @@ impl AgentPtyRegistry {
 #[cfg(target_os = "linux")]
 fn surface_shows_composer(
     agent: Option<&AgentType>,
-    frame: Option<crate::doorbell_screen::Grid>,
+    frame: Option<&crate::doorbell_screen::Grid>,
 ) -> bool {
     let (Some(profile), Some(grid)) = (crate::doorbell_screen::profile_for_agent(agent), frame)
     else {
         return false;
     };
-    if grid.cols < profile.min_cols || (profile.dialog)(&grid).is_some() || !(profile.ready)(&grid)
-    {
+    if grid.cols < profile.min_cols || (profile.dialog)(grid).is_some() || !(profile.ready)(grid) {
         return false;
     }
     match agent {
-        Some(AgentType::Codex) => profile.placeholder_empty(&grid),
-        _ => (profile.composer)(&grid).is_some(),
+        Some(AgentType::Codex) => profile.placeholder_empty(grid),
+        _ => (profile.composer)(grid).is_some(),
     }
 }
 
@@ -2307,6 +2338,209 @@ mod tests {
         }
     }
 
+    /// A Codex generation on its measured profile, spawned at `spawn`, with
+    /// records and segments attached, its box touched by a person.
+    #[cfg(target_os = "linux")]
+    fn touched_codex(spawn: Instant) -> Arc<crate::composer_probe::epoch::GenerationInput> {
+        use crate::composer_probe::epoch::{GenerationInput, Writer};
+        use crate::composer_probe::record::{EcPolicy, Records};
+        use crate::doorbell_screen::CODEX_PROFILE;
+        let input = Arc::new(GenerationInput::profiled(
+            CODEX_PROFILE.cpr_wait_end,
+            Some(&CODEX_PROFILE.redraw),
+            spawn,
+        ));
+        assert!(input.attach_records(Records::new(5, EcPolicy::Hold, spawn)));
+        assert!(input.attach_segments(5, crate::composer_probe::segments::Agent::Codex));
+        input.enqueue(Writer::Human, b"x");
+        input
+    }
+
+    /// The doorbell tick's checks of `input` from `from` on, against O5
+    /// alone (every other conjunct passing, as on the measured box), with
+    /// Codex's cursor queries `queries` noted in order as the clock reaches
+    /// each: each check asked waits once for an estimate inside
+    /// [`O5_WAIT`], as [`scheduling_reads`] does, and is then admitted or
+    /// refused, the refusal counted by `refuse`. Every instant a check was
+    /// asked, and the one admitted, if any before `from + limit`.
+    #[cfg(target_os = "linux")]
+    fn checks_against_o5(
+        input: &crate::composer_probe::epoch::GenerationInput,
+        queries: &mut dyn Iterator<Item = Instant>,
+        from: Instant,
+        limit: Duration,
+        refuse: &dyn Fn(&crate::composer_probe::epoch::GenerationInput, Instant, Instant),
+    ) -> (Vec<Instant>, Option<Instant>) {
+        use crate::composer_probe::admission::{Refusal, o5};
+        use crate::composer_probe::epoch::OutputNote;
+        use crate::composer_probe::gate::Status;
+        use crate::composer_probe::query_ledger::QueryKind;
+        let mut queries = queries.peekable();
+        let mut feed = |to: Instant| {
+            while let Some(q) = queries.next_if(|q| *q <= to) {
+                input.on_output(&[OutputNote::Query(QueryKind::Cpr)], q);
+            }
+        };
+        let mut asks = Vec::new();
+        let mut at = from;
+        while let Some((t, _)) = next_ask(
+            input,
+            Status::default(),
+            at,
+            limit.saturating_sub(at - from),
+        ) {
+            asks.push(t);
+            feed(t);
+            let mut now = t;
+            let mut waited = false;
+            loop {
+                match o5(input.query_wait_estimate(), now) {
+                    Ok(()) => return (asks, Some(now)),
+                    Err(Refusal::Estimate(until)) if !waited && until - now <= O5_WAIT => {
+                        waited = true;
+                        feed(until);
+                        now = until;
+                    }
+                    Err(Refusal::Estimate(until)) => {
+                        refuse(input, now, until);
+                        break;
+                    }
+                    Err(other) => panic!("O5 alone refuses only for the estimate: {other:?}"),
+                }
+            }
+            at = now;
+        }
+        (asks, None)
+    }
+
+    /// Scenario: A person touched and emptied a real Codex box in a pane no client answers cursor queries for (the TUI alone), the pane is resized three times 200 ms apart, and a task is posted 200 ms later; Codex asks one cursor query per resize, each about 2 s after the last, as measured on Codex 0.164.0. The doorbell tick's first check waits once for the query-wait estimate, which Codex's next query moves on while it waits, so it is refused for the estimate. Counted as a failure, as before the fix, the next check waits the first backoff step and comes 30 s or more after the post; now it is due when the estimate runs out and is admitted within about seven seconds of the post, the same check two seconds earlier than the backoff ever allows (#2129, CX-5h).
+    #[cfg(target_os = "linux")]
+    #[spec("inbox/probe/104")]
+    #[test]
+    fn probe_104_a_resize_burst_delays_a_codex_check_by_seconds_not_a_backoff_step() {
+        use crate::composer_probe::probe::BACKOFF;
+        let ms = Duration::from_millis;
+        let horizon = Duration::from_secs(5 * 60);
+        // Measured (the issue's CX-5h, re-run on this branch's base): 36 s
+        // with N = 3 against 3 s with N = 0. A check within this bound costs
+        // the burst no more than Codex's own chained waits.
+        const AFTER_THE_WAITS: Duration = Duration::from_secs(7);
+        let deliver =
+            |refuse: &dyn Fn(&crate::composer_probe::epoch::GenerationInput, Instant, Instant)| {
+                let spawn = Instant::now();
+                let input = touched_codex(spawn);
+                let r0 = spawn + Duration::from_secs(10);
+                for i in 0..3 {
+                    input.size_change(r0 + ms(200 * i));
+                }
+                let posted = r0 + ms(600);
+                let mut queries = (0..3).map(|i| r0 + ms(50) + Duration::from_secs(2) * i);
+                let (asks, admitted) =
+                    checks_against_o5(&input, &mut queries, posted, horizon, refuse);
+                let admitted = admitted.expect("the check is admitted once the waits ran out");
+                (admitted - posted, asks.len(), input)
+            };
+        // Before #2129: the estimate refusal counted as a failure.
+        let (before, before_asks, _) = deliver(&|input, now, _| input.probe_failed(now));
+        assert!(
+            before >= BACKOFF[0],
+            "the old schedule waited a backoff step: {before:?}"
+        );
+        assert_eq!(before_asks, 2, "one refused check, then the retry");
+        // Now: the next check is due when the estimate runs out.
+        let (after, after_asks, input) = deliver(&|input, now, until| {
+            scheduling_refused(
+                input,
+                crate::composer_probe::admission::Refusal::Estimate(until),
+                ProbeAsk::First,
+                now,
+            )
+        });
+        assert!(
+            after <= AFTER_THE_WAITS,
+            "the check after the burst came {after:?} after the post"
+        );
+        assert_eq!(after_asks, 2, "one refused check, then the admitted one");
+        assert!(
+            !input.probe_retrying(),
+            "the estimate refusal counted no failure"
+        );
+    }
+
+    /// Scenario: Codex keeps asking an unanswered cursor query every two seconds (a resize storm that never settles), so the query-wait estimate is always ahead and every check the doorbell tick asks is refused for it, with nobody typing. Nothing is ever admitted, no check is asked before the estimate it was last refused for ran out, at most four checks come between two long waits, and the long waits still follow the backoff steps (30 s, 2 min, 10 min), with the observer reported broken after the third failure (#2129).
+    #[cfg(target_os = "linux")]
+    #[spec("inbox/probe/104")]
+    #[test]
+    fn probe_104_an_estimate_that_never_runs_out_still_backs_off() {
+        use crate::composer_probe::probe::{BACKOFF, BROKEN_AFTER, ESTIMATE_PER_FAILURE};
+        let tick = crate::doorbell::DEFAULT_TICK;
+        let horizon = Duration::from_secs(20 * 60);
+        let spawn = Instant::now();
+        let input = touched_codex(spawn);
+        let start = spawn + Duration::from_secs(10);
+        let mut queries = (0..).map(|i| start + Duration::from_secs(2) * i);
+        // Each refusal: when it came and the estimate it was refused for.
+        let refused = std::cell::RefCell::new(Vec::new());
+        let (asks, admitted) = checks_against_o5(
+            &input,
+            &mut queries,
+            start,
+            horizon,
+            &|input, now, until| {
+                refused.borrow_mut().push((now, until));
+                scheduling_refused(
+                    input,
+                    crate::composer_probe::admission::Refusal::Estimate(until),
+                    ProbeAsk::First,
+                    now,
+                );
+            },
+        );
+        assert_eq!(admitted, None, "an estimate always ahead admits nothing");
+        let refused = refused.into_inner();
+        assert_eq!(refused.len(), asks.len(), "every check asked is refused");
+        // From each refusal to the next check asked.
+        let gaps: Vec<Duration> = refused
+            .iter()
+            .zip(asks.iter().skip(1))
+            .map(|(&(now, until), &ask)| {
+                assert!(ask >= until, "a check before the estimate ran out");
+                ask - now
+            })
+            .collect();
+        let mut run = 0;
+        for gap in &gaps {
+            if *gap >= BACKOFF[0] {
+                run = 0;
+            } else {
+                run += 1;
+                assert!(
+                    run < ESTIMATE_PER_FAILURE,
+                    "at most four checks between long waits: {gaps:?}"
+                );
+            }
+        }
+        let long: Vec<Duration> = gaps.iter().copied().filter(|g| *g >= BACKOFF[0]).collect();
+        assert!(
+            long.len() >= BACKOFF.len(),
+            "every backoff step is reached: {gaps:?}"
+        );
+        for (step, gap) in BACKOFF.iter().zip(&long) {
+            assert!(
+                *gap >= *step && *gap <= *step + tick,
+                "the long waits follow the backoff steps: {gaps:?}"
+            );
+        }
+        let at = *asks.last().unwrap();
+        let (_, failures, broken) = input
+            .advance_schedule_for_e2e(Duration::ZERO, at)
+            .expect("a live schedule");
+        assert!(
+            failures >= BROKEN_AFTER && broken,
+            "the persistent refusal is counted ({failures} failures)"
+        );
+    }
+
     /// Scenario: For Claude and Codex, a probe is written past the trigger's wait with no helper seen and nothing held behind it, and the agent may be waiting for a cursor report (`B` holds). Only Claude's reads as lapsed, so only Claude's lapse retry reaches admission's lapse checks, where `B` refuses it; Codex's is refused as having no lapsed probe to supersede, before any lapse check, whatever `B` says (O-20.7c: the lapse retry's checks are Claude's alone, though an attempt carries no agent).
     #[cfg(target_os = "linux")]
     #[spec("inbox/probe/030")]
@@ -2556,7 +2790,7 @@ mod tests {
             human_ticket: false,
             boundary: Boundary::Ground,
             keymap: Ok(()),
-            surface: surface_shows_composer(Some(&AgentType::ClaudeCode), Some(grid)),
+            surface: surface_shows_composer(Some(&AgentType::ClaudeCode), Some(&grid)),
         };
         assert!(scheduled.surface, "scheduled at the main composer");
         let ledger = crate::ingress_ledger::IngressLedger::new();
@@ -2778,6 +3012,43 @@ mod tests {
         );
         assert_eq!(request.matches("observer.keymap()").count(), 1);
         assert_eq!(request.matches("scheduling_reads(").count(), 1);
+    }
+
+    /// Scenario: A source-order check, not a behaviour check: read the probe request's source and find that the check it admits compares Codex's status line on the frame the writer will hold it to, after reading that frame's surface and before the admission that decides, and only for a frame that shows the input box. The lane-2 test `probe_103_live_a_codex_moved_by_cd_is_not_checked` runs the behaviour against real Codex.
+    #[cfg(target_os = "linux")]
+    #[spec("inbox/probe/103")]
+    #[test]
+    fn probe_103_the_admitted_frame_carries_the_session_check() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/agent_pty_segments.rs"),
+        )
+        .unwrap();
+        let request = source
+            .split("pub(crate) async fn composer_probe(")
+            .nth(1)
+            .and_then(|rest| rest.split("let claim = Arc::new(").next())
+            .expect("the probe request");
+        let reads = request
+            .find("scheduling_reads(")
+            .expect("the scheduling reads");
+        let marked = request
+            .find("h.bus.clean_frame_marked()")
+            .expect("the marked frame");
+        let surface = request
+            .find("surface_shows_composer(h.agent.as_ref(), frame.as_ref())")
+            .expect("the surface read from the marked frame");
+        let session = request
+            .find("h.observer.session(frame.as_ref())")
+            .expect("the session check on the marked frame");
+        let admits = request
+            .find("h.observer.admits(&outside, now)")
+            .expect("the deciding admission");
+        assert!(reads < marked && marked < surface && surface < session && session < admits);
+        assert!(
+            request[surface..session].contains("if surface {"),
+            "asked only of a frame that shows the input box"
+        );
+        assert_eq!(request.matches(".session(").count(), 1);
     }
 
     /// Scenario: Compare the O5 wait's one bound with how far ahead each screen profile's redraw estimate can run, then run the scheduling reads with a first pass refused by an estimate just past the bound. Claude Code's estimate always fits inside the bound and Codex's can run past it, and a request refused past the bound answers that refusal at once, asking once and sleeping not at all (A-20d-8's decision, written at `O5_WAIT`).

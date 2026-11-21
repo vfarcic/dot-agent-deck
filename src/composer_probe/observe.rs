@@ -2549,6 +2549,31 @@ mod linux {
             }
         }
 
+        /// Issue #2130: whether the frame a check is admitted on, `frame`,
+        /// still shows a Codex generation working in the directory it was
+        /// bound in, by Codex's status line
+        /// ([`crate::composer_probe::keymap::CodexReads::session`]). Another
+        /// directory holds this check and every later one as changed; a
+        /// status line it can't read, or no frame, holds this one. A Claude
+        /// generation has nothing to compare and passes; no evidence holds as
+        /// unmeasured, as [`Self::keymap`] does. No I/O.
+        pub fn session(
+            &self,
+            frame: Option<&crate::doorbell_screen::Grid>,
+        ) -> Result<(), crate::composer_probe::keymap::Hold> {
+            use crate::composer_probe::keymap::Hold;
+            match self.keymap.get() {
+                Some(KeymapEvidence::Codex { reads, .. }) => reads.session(
+                    frame
+                        .and_then(crate::doorbell_screen::codex_status_line)
+                        .as_deref(),
+                ),
+                Some(KeymapEvidence::Claude { .. }) => Ok(()),
+                Some(KeymapEvidence::Held(hold)) => Err(*hold),
+                None => Err(Hold::Unmeasured),
+            }
+        }
+
         /// The keymap evidence for `agent` under `probe` (O-20.7b), built
         /// from the sources read before the spawn (A-20d-1b), so a change
         /// made between the spawn and this settlement holds rather than
@@ -2644,8 +2669,19 @@ mod linux {
                         keymap::codex_home_checkable(&home, cwd, env("TMPDIR").as_deref())
                             .map(|()| codex)
                     }) {
+                    // Issue #2130: the directory its status line is
+                    // compared with at each admission, and the `HOME` Codex
+                    // spells it from.
                     Ok(codex) => KeymapEvidence::Codex {
-                        reads: Box::new(keymap::CodexReads::new(codex)),
+                        reads: Box::new(keymap::CodexReads::with_session(
+                            codex,
+                            cwd.map(|cwd| keymap::CodexSession {
+                                cwd: cwd.to_path_buf(),
+                                home: env("HOME")
+                                    .filter(|home| !home.is_empty())
+                                    .map(std::path::PathBuf::from),
+                            }),
+                        )),
                         precedence: probe.keymap_sources,
                     },
                     Err(hold) => KeymapEvidence::Held(hold),

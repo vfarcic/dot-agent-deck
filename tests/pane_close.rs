@@ -356,6 +356,7 @@ async fn handle_connection(
                     vec![AgentRecord {
                         input_held: None,
                         input_discarded: None,
+                        project_config_exists: None,
                         id: replacement_id,
                         pane_id_env: pane_id_env.lock().unwrap().clone(),
                         display_name: None,
@@ -956,10 +957,6 @@ impl PaneController for DelayedCloseController {
 
     fn rename_pane(&self, _pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError> {
         Ok(RenameOutcome::applied(name))
-    }
-
-    fn toggle_layout(&self) -> Result<(), PaneError> {
-        Ok(())
     }
 
     fn write_to_pane(&self, _pane_id: &str, _text: &str) -> Result<(), PaneError> {

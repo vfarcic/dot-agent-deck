@@ -1265,12 +1265,16 @@ mod tests {
                 "agent_ref",
                 "agent_status",
                 "agent_type_ref",
+                "card_action",
                 "command_text",
                 "deck_ref",
                 "dir_ref",
                 "filter_text",
                 "mode_ref",
+                "needs_you_filter",
                 "orchestration_ref",
+                "overview_mode",
+                "reply_text",
                 "spoken_prefix",
             ]
             .into_iter()

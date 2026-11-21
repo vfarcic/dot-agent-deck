@@ -57,7 +57,7 @@ Round 1's issues also give the cost, the type (which sets when the change takes 
 | --- | --- | --- |
 | Honeycomb, environment `test` | the Honeycomb MCP server (`.mcp.json`): `run_query`, `list_spans`, `get_span_details`, `get_triggers`, `list_boards` | datasets `dot-agent-deck`, `claude-code`, `codex_cli_rs`, `opencode`, `pi`, `metrics`, `renovate`. If the server is unavailable, stop: round 1 deliberately did not substitute Dash0, which started mid-window (2026-10-31 14:46 UTC) |
 | GitHub | `gh api` (REST) and GraphQL | PR dump with reviews, threads, comments and timeline; `ci.yml` runs and per-attempt jobs; JUnit artifacts of GitHub runs |
-| RWX | `rwx runs list --repository dot-agent-deck --definition .rwx/ci.yml --json`, `rwx results <run-id> --json`, `rwx logs <task-attempt-id>` | per-test results only from the task logs (see traps) |
+| RWX | `rwx runs list --repository dot-agent-deck --definition .rwx/ci.yml --json`, `rwx results <run-id> --json`, `scripts/rwx-junit.sh <run-id> <dir>`, `rwx logs <task-attempt-id>` | per-test results from each test task's `junit.xml` artifact for runs after #2101 merged; from the task logs before that (see traps) |
 | Builds, coverage, mutants | `rwx sandbox exec -- <command>` with `DAD_REMOTE_EXEC=rwx`, never locally on the shared box | a snapshot of the code at a commit, not of the window: say so in the comment |
 
 ## Traps
@@ -91,7 +91,7 @@ Round 1's issues also give the cost, the type (which sets when the change takes 
 
 ### RWX
 
-- **Round 1 got per-test results from task logs.** `rwx results` gave task outcomes, not JUnit, so round 1 parsed nextest's `PASS/FAIL/FLAKY/TRY n … [ t s] binary test` lines from `rwx logs`, and recovered no TypeScript per-test data (#2101).
+- **Round 1 got per-test results from task logs.** `rwx results` gave task outcomes, not JUnit, so round 1 parsed nextest's `PASS/FAIL/FLAKY/TRY n … [ t s] binary test` lines from `rwx logs`, and recovered no TypeScript per-test data. Since #2101, each test task of `.rwx/ci.yml` (nextest, Vitest, Playwright, the desktop driver) keeps its JUnit file as a `junit.xml` artifact, and `scripts/rwx-junit.sh <run-id> <dir>` downloads them ([rwx.md](rwx.md#per-test-results)); a run from before that merged has none, so a window that spans the merge still needs the log route for its older runs.
 - **The e2e shards also run the fast tier,** because the archive is built with `--workspace --features e2e`. Per-test counts from the shards include the library tests (#2091).
 
 ### Compile measurements in the sandbox
@@ -144,6 +144,8 @@ gh api "repos/vfarcic/dot-agent-deck/actions/workflows/pr-review-batch.yml/runs?
 # or the window is incomplete
 rwx runs list --repository dot-agent-deck --definition .rwx/ci.yml --limit 100 --json [--cursor <NextCursor>]
 rwx results <run-id> --json
+# per-test JUnit of every test task (runs after #2101 merged; `missing` before)
+scripts/rwx-junit.sh <run-id> <dir>
 rwx logs <task-attempt-id> --output <dir>
 ```
 

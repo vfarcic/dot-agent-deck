@@ -235,6 +235,7 @@ pub struct Composer {
 }
 
 /// The measured screen of one agent, across the releases its record lists.
+#[derive(Clone, Copy)]
 pub struct ScreenProfile {
     pub id: &'static str,
     /// The composer, wherever it is drawn, or `None` when the screen shows
@@ -264,6 +265,13 @@ pub struct ScreenProfile {
     /// ([`crate::evidence_state`]), so the screen is the agent's whichever of
     /// the two it drew for.
     pub pair_witness: fn(&vt100::Screen) -> bool,
+    /// Whether a frame with no witness counts, once the bytes since the
+    /// parser started read the same at every width the terminal has had in
+    /// the generation, at one row count (issue #2262,
+    /// [`crate::evidence_state`]). For an agent whose screen can show no
+    /// witness for a long time: Codex in a pane under 32 rows draws no logo
+    /// before its first prompt.
+    pub agreement: bool,
     /// The narrowest pane the measurements cover; a narrower one refuses.
     pub min_cols: u16,
     /// How the agent ends a wait for a cursor position report, which decides
@@ -560,6 +568,41 @@ fn codex_ready(grid: &Grid) -> bool {
         && (footer_text.starts_with("? for shortcuts") || footer_text.contains("· ? for shortcuts"))
 }
 
+/// Codex's status line on its ready screen (issue #2130): the row just above
+/// the `? for shortcuts` row, below the composer, read from Codex's indent
+/// with its trailing blanks removed (`<model> <reasoning> · <directory>` by
+/// default, measured on 0.164.0 at 50 × 200 and 24 × 80, with and without a
+/// `/cd` or `/worktree`). `None` when the screen isn't [`codex_ready`], the
+/// row is blank or isn't below the composer, something is drawn in the
+/// indent, or a cell holds anything but one printable character one column
+/// wide: a wide character's second cell reads as nothing, which would
+/// misspell the line, so a line holding one isn't read at all.
+pub fn codex_status_line(grid: &Grid) -> Option<String> {
+    use unicode_width::UnicodeWidthChar;
+    if !codex_ready(grid) {
+        return None;
+    }
+    let composer = codex_composer(grid)?;
+    let row = grid.last_drawn_row()?.checked_sub(1)?;
+    if row <= composer.last_row
+        || (0..CODEX_INDENT).any(|c| grid.cell(row, c).is_none_or(|cell| !cell.blank()))
+    {
+        return None;
+    }
+    let cells = grid.cells.get(row as usize)?;
+    let mut line = String::new();
+    for cell in cells.iter().skip(CODEX_INDENT as usize) {
+        let mut chars = cell.text.chars();
+        match (chars.next(), chars.next()) {
+            (None, _) => line.push(' '),
+            (Some(c), None) if !c.is_control() && c.width() == Some(1) => line.push(c),
+            _ => return None,
+        }
+    }
+    let line = line.trim_end();
+    (!line.is_empty()).then(|| line.to_string())
+}
+
 /// Codex's dialogs (update, folder trust, hooks review, measured): a bold
 /// title at row 1, column 2, and a highlighted choice — `›` at column 0,
 /// bold and inverse, then `N.` — drawn to the right edge. Text that merely
@@ -678,6 +721,7 @@ pub static CODEX_PROFILE: ScreenProfile = ScreenProfile {
     redraw_marker: b"\x1b[?2026h\x1b[1;1H\x1b[J",
     width_witness: codex_width_witness,
     pair_witness: codex_logo,
+    agreement: true,
     min_cols: 80,
     // P-WE: every production CPR wait in `codex-rs/tui` ends before the next
     // `?2026h` its own control flow writes (M-WE checks it on the binaries).
@@ -983,6 +1027,7 @@ pub static CLAUDE_PROFILE: ScreenProfile = ScreenProfile {
     redraw_marker: b"\x1b[2J\x1b[H",
     width_witness: claude_width_witness,
     pair_witness: no_pair_witness,
+    agreement: false,
     min_cols: 80,
     cpr_wait_end: crate::composer_probe::query_ledger::CprWaitEnd::Counted,
     // A full redraw within 9 ms of each of the 10 resizes and 10 nudges
@@ -1131,6 +1176,7 @@ pub static STANDIN_PROFILE: ScreenProfile = ScreenProfile {
     redraw_marker: b"\x1b[2J\x1b[H",
     width_witness: standin_width_witness,
     pair_witness: no_pair_witness,
+    agreement: false,
     min_cols: 40,
     cpr_wait_end: crate::composer_probe::query_ledger::CprWaitEnd::Counted,
     // The stand-in's contract: it reads its size between 25 ms waits for
@@ -1160,6 +1206,7 @@ pub static STANDIN_CPR_PROFILE: ScreenProfile = ScreenProfile {
     redraw_marker: b"\x1b[2J\x1b[H",
     width_witness: standin_width_witness,
     pair_witness: no_pair_witness,
+    agreement: false,
     min_cols: 40,
     cpr_wait_end: crate::composer_probe::query_ledger::CprWaitEnd::Counted,
     redraw: crate::composer_probe::query_wait::RedrawTiming {

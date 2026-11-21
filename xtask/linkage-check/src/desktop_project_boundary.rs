@@ -113,6 +113,17 @@ pub const DESKTOP_BOUNDARY_RULE: &str = "client-side project resolution in the d
 /// boundary and should be argued in the PR that does it — which is the point of
 /// stating the allowed set rather than the forbidden one.
 const ALLOWED_ROOT_MODULES: &[&str] = &[
+    // PRD #2374, argued rather than added quietly. The desktop names the
+    // agent cards' WIRE types here — `AgentCardList`, `AgentCardEntry` and
+    // `CardActionResult` — which it passes to the webview as the daemon sent
+    // them (CLAUDE.md rule 18: the desktop computes nothing about a card). A
+    // desktop-side copy of those shapes would be a second definition to keep
+    // in step with the daemon's. The module also holds the daemon's card
+    // store, which reads the USER config's `[catalog]` (never a project's) and
+    // which the desktop does not call. Checked against this rule's lines: it
+    // resolves no project, names no FORBIDDEN_SYMBOL or project-state literal,
+    // and contains no `std::env::current_dir` — all zero for it.
+    "agent_cards",
     "agent_pty",
     "agent_registry",
     // PRD #1223 M7, argued rather than added quietly. The desktop names ONE

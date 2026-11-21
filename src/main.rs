@@ -118,8 +118,17 @@ enum Commands {
         #[arg(long)]
         supersede: bool,
     },
-    /// Create a git worktree and start an isolated line of work inside it.
-    /// Agent-callable, one step (PRD #220).
+    /// Create a git worktree and start an isolated line of work inside it, or,
+    /// with --dir, start the unit in a directory that already exists.
+    /// Agent-callable, one step (PRD #220, PRD #468).
+    ///
+    /// Without --dir, the worktree is a sibling of this checkout,
+    /// `../<repo>-dispatch-<name>`, on branch `agent/dispatch-<name>`, cut from
+    /// this checkout's HEAD; closing the unit removes it when it has no
+    /// uncommitted changes. With --dir, no worktree or branch is created and closing the
+    /// unit leaves the directory in place: the unit starts in that directory
+    /// (`--dir .` continues the work right where you are), and it is refused
+    /// when other live agents already work there.
     ///
     /// Exit status when starting a unit: 0 means the daemon admitted the
     /// request, or gave no answer this build can check (an older daemon, or
@@ -146,8 +155,8 @@ enum Commands {
     /// the daemon did not answer, or could not read this repo's config or this
     /// pane's directory. The reason is printed.
     Dispatch {
-        /// Short name for the dispatch unit (used for worktree naming).
-        /// Omit it only with --list-targets.
+        /// Short name for the dispatch unit. It names the unit's tab and, without
+        /// --dir, its worktree and branch. Omit it only with --list-targets.
         #[arg(required_unless_present = "list_targets")]
         name: Option<String>,
         /// Task description with context, file paths, and constraints.
@@ -189,6 +198,15 @@ enum Commands {
         /// --single does. Mutually exclusive with --orchestration.
         #[arg(long, value_name = "NAME", conflicts_with = "orchestration")]
         agent: Option<String>,
+        /// Start the unit in this existing directory instead of a new worktree
+        /// (`--dir .` for the directory you are in). No worktree or branch is created, and
+        /// closing the unit leaves the directory in place (unless it is an
+        /// earlier unit's worktree, which keeps that unit's cleanup). The
+        /// orchestrations on offer are that directory's. Refused when other
+        /// live agents already work in it. With --list-targets, list that
+        /// directory's targets.
+        #[arg(long, value_name = "PATH")]
+        dir: Option<String>,
         /// Print the spawn targets available in this repo, then exit. Ask the
         /// user which one they want before dispatching.
         ///
@@ -330,6 +348,16 @@ enum Commands {
     Inbox {
         #[command(subcommand)]
         action: InboxAction,
+    },
+    /// Your agent card in the deck's overview: publish it, list every card,
+    /// print the catalog of fields and actions, or act on a card.
+    ///
+    /// Exit status: 0 done; 1 refused, invalid input or failed (the message
+    /// names a stable [code]); 2 the running daemon does not support agent
+    /// cards; 3 no deck daemon is running.
+    Card {
+        #[command(subcommand)]
+        action: CardAction,
     },
     /// Report an agent lifecycle state, a submitted prompt or a tool call so
     /// the pane's card updates (PRD #201 M1.2, issue #622). Used by an agent's
@@ -867,6 +895,104 @@ enum WorktreeCmd {
     },
 }
 
+/// PRD #2374: `dot-agent-deck card …`. See [`dot_agent_deck::agent_cards_cli`].
+#[derive(Subcommand)]
+enum CardAction {
+    /// Publish or replace this agent's card: status, one-line summary, fields,
+    /// questions for the user and actions it suggests. Every publish replaces
+    /// the whole card and notifies no one; it is not a completion report.
+    /// Runs inside a deck pane.
+    ///
+    /// --file takes a JSON report (TOML with a .toml extension or --format
+    /// toml), for example:
+    ///
+    /// {"status": "waiting", "summary": "PR is ready",
+    ///  "fields": [{"name": "pull-request", "value": "#123"}],
+    ///  "questions": [{"id": "base", "text": "Which base branch?",
+    ///                 "options": [{"id": "main", "label": "main"}]}],
+    ///  "actions": [{"name": "merge"},
+    ///              {"name": "rerun", "label": "Re-run tests", "prompt": "Re-run the tests."}]}
+    ///
+    /// status is one of working, waiting, done, failed. `card catalog` lists
+    /// the fields and actions the deck knows; others are shown as custom.
+    Publish {
+        /// Read the whole report from this file (`-` for stdin).
+        #[arg(
+            long,
+            value_name = "PATH",
+            conflicts_with_all = ["status", "summary", "fields", "actions", "clear"]
+        )]
+        file: Option<String>,
+        /// The format of --file: json or toml (default: from the extension;
+        /// stdin is JSON).
+        #[arg(long, value_name = "FORMAT", requires = "file", value_parser = ["json", "toml"])]
+        format: Option<String>,
+        /// working, waiting, done or failed.
+        #[arg(long, value_name = "STATUS", conflicts_with = "clear")]
+        status: Option<String>,
+        /// One line about what you are doing.
+        #[arg(long, value_name = "TEXT", conflicts_with = "clear")]
+        summary: Option<String>,
+        /// A field, NAME=VALUE (repeatable). Lists and custom-typed fields
+        /// need --file.
+        #[arg(long = "field", value_name = "NAME=VALUE", conflicts_with = "clear")]
+        fields: Vec<String>,
+        /// Suggest a catalog action by name (repeatable). Custom actions need
+        /// --file.
+        #[arg(long = "action", value_name = "NAME", conflicts_with = "clear")]
+        actions: Vec<String>,
+        /// Remove your report: the card shows only what the deck knows, as
+        /// before you first published.
+        #[arg(long)]
+        clear: bool,
+        /// Print the card's key and revision as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print every live card as JSON: what each agent reported and what the
+    /// deck computed (status, needs-you, actions with their exact prompts).
+    List,
+    /// Print the catalog of card fields and actions, with their descriptions.
+    Catalog {
+        /// Print the resolved catalog as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Invoke one action of one card (what the desktop app's buttons do). Runs
+    /// from the user's shell, not from an agent's pane. Every value comes from
+    /// `card list`: the card's key, the action's id and token, and the list's
+    /// instance_id.
+    Act {
+        /// The card, as `card list` keys it: <PANE_ID>/<AGENT_ID>.
+        #[arg(long, value_name = "PANE_ID/AGENT_ID")]
+        entry: String,
+        /// The action id, as `card list` shows it.
+        #[arg(long, value_name = "ACTION_ID")]
+        action: String,
+        /// The action's `token`, as `card list` shows it: the version of the
+        /// action you reviewed. If the agent changed the action since, nothing
+        /// is sent ([stale_action]).
+        #[arg(long, value_name = "TOKEN")]
+        token: String,
+        /// The list's `instance_id`: the deck daemon that listed the card. If
+        /// the daemon was restarted since, nothing is sent ([daemon_replaced]).
+        #[arg(long = "instance", value_name = "INSTANCE_ID")]
+        instance: String,
+        /// Confirm an action that asks for confirmation.
+        #[arg(long)]
+        confirm: bool,
+        /// The text a `reply` sends.
+        #[arg(long, value_name = "TEXT", conflicts_with = "text_file")]
+        text: Option<String>,
+        /// Read the reply text from a file (`-` for stdin).
+        #[arg(long = "text-file", value_name = "PATH")]
+        text_file: Option<String>,
+        /// Print the daemon's result as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[derive(Subcommand)]
 enum InboxAction {
     /// Print every message waiting for you, framed as from the deck, and
@@ -1074,6 +1200,19 @@ enum ConfigAction {
 /// file** (issue #328): a FIFO with no writer would otherwise block the CLI
 /// forever inside `open`, and a character device such as `/dev/zero` never
 /// ends. See [`read_task_input`].
+/// PRD #468: `dispatch --dir <path>` as the absolute path the daemon is sent,
+/// resolved against this process's working directory and checked to be an
+/// existing directory ([`dot_agent_deck::dispatch::resolve_existing_dir`]).
+fn resolve_dispatch_dir(path: &str) -> Result<String, String> {
+    let dir = dot_agent_deck::dispatch::resolve_existing_dir(std::path::Path::new(path))?;
+    dir.into_os_string().into_string().map_err(|dir| {
+        format!(
+            "--dir {}: the path is not valid UTF-8, which the daemon cannot be sent",
+            std::path::Path::new(&dir).display()
+        )
+    })
+}
+
 fn resolve_task(
     task: Option<String>,
     task_file: Option<String>,
@@ -1939,6 +2078,7 @@ fn main() -> ExitCode {
             orchestration,
             command,
             agent,
+            dir,
             list_targets,
         }) => {
             let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
@@ -1948,6 +2088,17 @@ fn main() -> ExitCode {
                         "Error: DOT_AGENT_DECK_PANE_ID environment variable not set.\n\
                          This command should be run from within a dot-agent-deck managed pane."
                     );
+                    return ExitCode::FAILURE;
+                }
+            };
+            // PRD #468: `--dir` is resolved HERE, against this process's own
+            // directory, because that is what a path typed at this shell
+            // means (`--dir .` is where the caller stands). The daemon gets an
+            // absolute path and checks it again.
+            let dir = match dir.as_deref().map(resolve_dispatch_dir).transpose() {
+                Ok(dir) => dir,
+                Err(e) => {
+                    eprintln!("Error: {e}");
                     return ExitCode::FAILURE;
                 }
             };
@@ -1965,6 +2116,7 @@ fn main() -> ExitCode {
                     dot_agent_deck::event::ListTargetsRequest {
                         pane_id,
                         token: dot_agent_deck::hook_provenance::token_from_env(),
+                        dir: dir.clone(),
                     },
                 );
                 let json = match serde_json::to_string(&req) {
@@ -2065,6 +2217,7 @@ fn main() -> ExitCode {
                     token: dot_agent_deck::hook_provenance::token_from_env(),
                     command: command.as_deref().map(|c| c.trim().to_string()),
                     agent: agent.as_deref().map(|a| a.trim().to_string()),
+                    dir,
                 };
                 if !launch.is_empty() {
                     return report_dispatch_with_launch(
@@ -2106,6 +2259,7 @@ fn main() -> ExitCode {
             };
             run_work_done(pane_id, task, done, task_id)
         }
+        Some(Commands::Card { action }) => run_card_cli(action),
         Some(Commands::Inbox { action }) => match action {
             InboxAction::Fetch {
                 doorbell: Some(id),
@@ -4158,6 +4312,92 @@ fn print_cli_output(output: dot_agent_deck::roles_cli::CliOutput) -> ExitCode {
     ExitCode::from(output.code)
 }
 
+/// `dot-agent-deck card …` — PRD #2374. See [`dot_agent_deck::agent_cards_cli`].
+fn run_card_cli(action: CardAction) -> ExitCode {
+    use dot_agent_deck::agent_cards_cli as cli;
+    let output = match action {
+        CardAction::Publish {
+            file,
+            format,
+            status,
+            summary,
+            fields,
+            actions,
+            clear,
+            json,
+        } => cli::run_publish(
+            &cli::PublishArgs {
+                file,
+                format: format.as_deref().and_then(cli::ReportFormat::parse),
+                status,
+                summary,
+                fields,
+                actions,
+                clear,
+                json,
+            },
+            daemon_card_catalog,
+        ),
+        CardAction::List => run_card_attach(|client| async move { cli::run_list(&client).await }),
+        CardAction::Catalog { json } => {
+            run_card_attach(move |client| async move { cli::run_catalog(&client, json).await })
+        }
+        CardAction::Act {
+            entry,
+            action,
+            token,
+            instance,
+            confirm,
+            text,
+            text_file,
+            json,
+        } => {
+            let args = cli::ActArgs {
+                entry,
+                action,
+                token,
+                instance,
+                confirm,
+                text,
+                text_file,
+                json,
+            };
+            let in_pane = std::env::var(DOT_AGENT_DECK_PANE_ID).is_ok_and(|v| !v.trim().is_empty());
+            run_card_attach(move |client| async move {
+                cli::run_act(&client, &args, in_pane, std::io::stdin()).await
+            })
+        }
+    };
+    print_cli_output(output)
+}
+
+/// The catalog the running daemon resolves cards with, for typing `card
+/// publish --field` values; `None` when it cannot say.
+#[tokio::main]
+async fn daemon_card_catalog() -> Option<dot_agent_deck::card_catalog::ResolvedCatalog> {
+    let client = DaemonClient::new(client_attach_socket_path());
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.agent_card_catalog(),
+    )
+    .await
+    {
+        Ok(Ok(dot_agent_deck::daemon_client::GatedQuery::Answered(catalog))) => Some(catalog),
+        _ => None,
+    }
+}
+
+/// Run one `card` subcommand against the attach socket. Connect-only, like
+/// `close`: a card command against a daemon it just started would find none.
+#[tokio::main]
+async fn run_card_attach<F, Fut>(run: F) -> dot_agent_deck::roles_cli::CliOutput
+where
+    F: FnOnce(DaemonClient) -> Fut,
+    Fut: std::future::Future<Output = dot_agent_deck::roles_cli::CliOutput>,
+{
+    run(DaemonClient::new(client_attach_socket_path())).await
+}
+
 /// `dot-agent-deck roles` — issue #1947. See [`dot_agent_deck::roles_cli`].
 #[tokio::main]
 async fn run_roles_cli(
@@ -4401,7 +4641,14 @@ async fn run_daemon_serve_cli(
     // request once it is approved elsewhere or its text changes. Here rather
     // than in `run_daemon_with`, for the reason the pin refresh above is: an
     // in-process test daemon shares this process's one hub.
-    dot_agent_deck::trust_requests::install(daemon.event_tx.clone());
+    // Issue #2348: and it tells each agent it refused the answer, through
+    // that agent's inbox.
+    dot_agent_deck::trust_requests::install(
+        daemon.event_tx.clone(),
+        Some(dot_agent_deck::trust_requests::inbox_sink(
+            std::sync::Arc::downgrade(&daemon.pty_registry),
+        )),
+    );
     let trust_sweep = tokio::spawn(dot_agent_deck::trust_requests::run_sweep());
     let result = run_daemon_with(&path, daemon).await;
     pin_refresh.abort();

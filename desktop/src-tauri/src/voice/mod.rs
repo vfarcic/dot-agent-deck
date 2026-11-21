@@ -41,6 +41,7 @@
 //! are what the panel will call.
 
 pub mod capture;
+pub mod chain;
 pub mod choice;
 mod command_text;
 pub mod dictation;
@@ -67,6 +68,9 @@ pub mod table;
 pub mod transcribe;
 pub mod wake;
 
+#[cfg(test)]
+#[path = "chain_tests.rs"]
+mod chain_tests;
 #[cfg(test)]
 #[path = "choice_tests.rs"]
 mod choice_tests;
@@ -130,7 +134,34 @@ pub struct VoiceDeck {
     /// it when the agents voice can reach are on another one. At most one deck
     /// carries it; none does when that deck is not in the observed fleet.
     pub holds_agents: bool,
+    /// PRD #2374 (PR #2378 review): this daemon's own agents, for a deck that
+    /// does NOT [`Self::holds_agents`] — the other daemons on the dashboard
+    /// under All daemons. A spoken `agent_ref` is resolved against each
+    /// daemon's agents in turn ([`super::outcome`]'s `resolve_agent_ref_across`)
+    /// and a match here carries this deck's id. Empty for the deck that holds
+    /// the agents, whose agents are the `agents` voice is handed, and for
+    /// every deck when only one daemon is on screen.
+    pub agents: DeckAgents,
 }
+
+/// [`VoiceDeck::agents`]: a daemon's agents, compared by their ids alone, so
+/// a deck still compares equal to itself while [`DesktopAgent`] has no
+/// equality of its own.
+#[derive(Debug, Clone, Default)]
+pub struct DeckAgents(pub Vec<DesktopAgent>);
+
+impl PartialEq for DeckAgents {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.len() == other.0.len()
+            && self
+                .0
+                .iter()
+                .zip(&other.0)
+                .all(|(one, two)| one.id == two.id)
+    }
+}
+
+impl Eq for DeckAgents {}
 
 impl VoiceDeck {
     /// Whether the New agent dialog would preselect this deck if asked to.
@@ -395,7 +426,7 @@ pub use choice::{ChoiceAnswer, ChoiceLive, MAX_CHOICES};
 pub use hold::VoiceHold;
 pub use meaning::{MeaningRequest, MeaningVerdict, Strictness};
 pub use outcome::{
-    ChoiceMatch, DeckRefMatch, DirRefMatch, FILTER_DASHBOARD_ROW, ResolvedParam,
+    ChainStep, ChoiceMatch, DeckRefMatch, DirRefMatch, FILTER_DASHBOARD_ROW, ResolvedParam,
     SHOW_HOST_METRICS_ROW, SWITCH_DECK_ROW, VoiceDeckIdentity, VoiceDeckSelection, VoiceOutcome,
     VoiceResult, address_deck_switch, handle_utterance, handle_utterance_after_local_intercepts,
     handle_utterance_with, handle_utterance_with_dictation, handle_utterance_with_modes,
@@ -681,6 +712,7 @@ pub mod test_support {
             answer_settlements: Vec::new(),
             tab: DesktopTab::Dashboard,
             pull_request: None,
+            project_config_exists: None,
             incarnation: Default::default(),
         }
     }

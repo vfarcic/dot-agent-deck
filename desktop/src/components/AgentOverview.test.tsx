@@ -17,7 +17,8 @@ import "../styles.css";
 import stylesheetSource from "../styles.css?raw";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureFleet, createFixtureSnapshot, FIXTURE_DAEMON_ID, FIXTURE_PENDING_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID, FIXTURE_UNREACHABLE_DAEMON_ID } from "../data/fixture";
-import { DEFAULT_DESKTOP_SETTINGS, type DesktopSettingsDto, PENDING_DECK_MESSAGE, fixtureDesktopFeatures, pendingDeckSnapshot, unconfiguredDeckSnapshot } from "../lib/bridge";
+import { DEFAULT_DESKTOP_SETTINGS, type DesktopSettingsDto, PENDING_DECK_MESSAGE, fixtureDesktopFeatures, pendingDeckSnapshot, statusFromDaemon, unconfiguredDeckSnapshot } from "../lib/bridge";
+import { tuiStatusWords } from "../test/tuiStatusWords";
 import { DISPLAY_LIMITS } from "../lib/displayText";
 import { UNREPORTED } from "../types";
 import type { AgentSession, DeckRuntimeState, DeckSnapshot, DeckView } from "../types";
@@ -483,7 +484,7 @@ function groupCard(kind: OverviewGroupKind, id: string): HTMLElement {
 }
 
 /** Every fleet instrument in the header, in the order the top bar shows them. */
-const COUNTERS = ["agents", "running", "needs-input", "failed", "idle", "groups"] as const;
+const COUNTERS = ["agents", "working", "needs-input", "error", "idle", "groups"] as const;
 
 function counterText(): string[] {
   return COUNTERS.map((name) => screen.getByTestId(`overview-count-${name}`).querySelector("strong")?.textContent ?? "");
@@ -595,7 +596,8 @@ describe("AgentOverview", () => {
 
     const coder = screen.getByTestId(`overview-agent-${agentKey({ daemonId: FIXTURE_DAEMON_ID, id: "2" })}`);
     expect(coder).toHaveTextContent("coder");
-    expect(coder).toHaveTextContent("running");
+    // Issue #2411: the daemon's word for the fixture's working agent, not the merged "running".
+    expect(coder).toHaveTextContent("working");
     expect(coder).toHaveTextContent("claude");
     expect(coder).toHaveTextContent("edit");
     expect(coder).toHaveTextContent("desktop/src/components/AgentOverview.tsx");
@@ -1510,21 +1512,32 @@ describe("AgentOverview", () => {
   });
 
   /**
-   * Scenario: render an agent for each write lease the daemon can report, then
-   * one whose lease is the daemon's `"unknown"` sentinel. The three reported
-   * values print; the sentinel prints nothing, and in particular does not print
-   * the word "unknown" on a screen that promises no placeholders.
+   * Scenario (issue #2353): render an agent for each write lease the daemon can
+   * report, then one whose lease is the daemon's `"unknown"` sentinel. `read`
+   * and `none` — input typed here would not reach the agent — print with their
+   * hover text; `write`, the ordinary case, prints nothing; the sentinel prints
+   * nothing either, and in particular not the word "unknown" on a screen that
+   * promises no placeholders.
    */
-  it("prints a reported write lease and nothing for the absent one", () => {
-    for (const lease of ["write", "read", "none"] as const) {
+  it("prints a write lease only when input would not reach the agent", () => {
+    const hover = {
+      read: "History-only: the daemon can replay this session but cannot deliver input to it.",
+      none: "View-only: the daemon has no handle it can write to or resume.",
+    } as const;
+    for (const lease of ["read", "none"] as const) {
       const { unmount } = renderOverview({ snapshot: snapshotWithAgent({ writeLease: lease, tab: { kind: "dashboard" } }) });
-      expect(document.querySelector(".overview-lease")).toHaveTextContent(lease);
+      const chip = document.querySelector(".overview-lease");
+      expect(chip).toHaveTextContent(lease);
+      expect(chip).toHaveAttribute("title", hover[lease]);
       unmount();
     }
 
-    const { container } = renderOverview({ snapshot: snapshotWithAgent({ writeLease: "unknown", tab: { kind: "dashboard" } }) });
-    expect(document.querySelector(".overview-lease")).toBeNull();
-    expect([container.textContent ?? "", ...titlesOf(container)].join(" ~ ")).not.toContain("unknown");
+    for (const lease of ["write", "unknown"] as const) {
+      const { container, unmount } = renderOverview({ snapshot: snapshotWithAgent({ writeLease: lease, tab: { kind: "dashboard" } }) });
+      expect(document.querySelector(".overview-lease")).toBeNull();
+      expect([container.textContent ?? "", ...titlesOf(container)].join(" ~ ")).not.toMatch(lease === "write" ? /writable target/ : /unknown/);
+      unmount();
+    }
   });
 
   /**
@@ -3411,7 +3424,7 @@ describe("AgentOverview across a fleet (PRD #742 M4)", () => {
 describe("Waiting in the status counts (issue #1757)", () => {
   /**
    * Scenario: count a group holding one agent of each of Idle, Waiting,
-   * Blocked and Running. Waiting is counted as its own status, after the
+   * Blocked and Working. Waiting is counted as its own status, after the
    * states a person has to act on and the working one, and before Idle: its
    * work is not done, but nothing needs the user.
    */
@@ -3419,10 +3432,59 @@ describe("Waiting in the status counts (issue #1757)", () => {
     const of = (status: string) => ({ status }) as unknown as OverviewAgent;
     const counts = countByStatus([of("idle"), of("waiting"), of("blocked"), of("running"), of("waiting")]);
     expect(counts).toEqual([
-      { status: "running", count: 1 },
+      { status: "working", count: 1 },
       { status: "blocked", count: 1 },
       { status: "waiting", count: 2 },
       { status: "idle", count: 1 },
     ]);
+  });
+});
+
+describe("The daemon's status words (issue #2411)", () => {
+  beforeEach(() => window.localStorage.clear());
+
+  /**
+   * Scenario: open the overview with one agent in each status the daemon
+   * reports. Every row's status cell, and every count beside its group, reads
+   * the word the TUI's card shows for that status: Thinking, Working and
+   * Compacting each by name, and Error rather than Failed.
+   */
+  it("shows each agent's status in the word the daemon and the TUI use", () => {
+    const words = tuiStatusWords();
+    const base = createFixtureSnapshot("crowded");
+    const template = base.agents[0] as AgentSession;
+    const agents: AgentSession[] = Object.keys(words).map((wire) => ({
+      ...template,
+      id: `status-${wire}`,
+      displayName: `agent ${wire}`,
+      status: statusFromDaemon(wire),
+      daemonStatus: wire as AgentSession["daemonStatus"],
+    }));
+    renderOverview({ snapshot: { ...base, agents } });
+
+    const shown = Object.fromEntries(agents.map((agent) => {
+      const label = screen.getByTestId(`overview-agent-${agentDomKey(agent)}`).querySelector(".overview-state .status-label");
+      return [agent.daemonStatus!, label?.textContent?.toLowerCase()];
+    }));
+    expect(shown).toEqual(words);
+
+    // Each count says how many agents show that word, so Thinking, Working
+    // and Compacting are counted apart, as the TUI's stats bar counts them.
+    const expected = new Map<string, number>();
+    for (const word of Object.values(words)) expected.set(word, (expected.get(word) ?? 0) + 1);
+    const want = [...expected].map(([word, count]) => `${count} ${word}`).sort();
+    for (const selector of [".daemon-pips", ".overview-group-pips"]) {
+      const pips = [...document.querySelectorAll(`${selector} .status-label`)].map((pip) => pip.textContent!.toLowerCase());
+      expect(pips.sort(), selector).toEqual(want);
+    }
+
+    // The counters above the table use the same words, and none of the
+    // desktop's merged ones.
+    const counter = (name: string) => screen.getByTestId(`overview-count-${name}`).querySelector("strong")?.textContent;
+    for (const name of ["working", "thinking", "compacting", "needs-input", "error", "waiting"]) expect(counter(name), name).toBe("1");
+    expect(counter("idle")).toBe(String(expected.get("idle")));
+    expect(screen.queryByTestId("overview-count-running")).toBeNull();
+    expect(screen.queryByTestId("overview-count-failed")).toBeNull();
+    expect(screen.getByTestId("dashboard-counters-popover").textContent).not.toMatch(/RUNNING|FAILED/);
   });
 });

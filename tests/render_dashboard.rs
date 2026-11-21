@@ -921,7 +921,7 @@ fn inbox_hold_card(extra: serde_json::Value) -> String {
     buffer_to_text(&buffer)
 }
 
-/// Scenario: Render waiting messages with each doorbell hold, including needs-fetch and cannot-check, and show its shared reason on the notice row. Unknown holds use the generic stalled words; standalone input warnings remain visible with no messages.
+/// Scenario: Render waiting messages with each doorbell hold, including needs-fetch, cannot-check and a busy agent that sent nothing (no-activity), and show its shared reason on the notice row. Unknown holds use the generic stalled words; standalone input warnings remain visible with no messages.
 #[spec("inbox/status/030")]
 #[test]
 fn status_030_card_says_why_the_doorbell_holds() {
@@ -942,9 +942,10 @@ fn status_030_card_says_why_the_doorbell_holds() {
         "dialog_during_ring",
         "needs_fetch",
         "cannot_check",
+        "no_activity",
     ] {
         let extra = serde_json::json!({"wake_stalled": true, "wake_hold": hold});
-        let rendered = if matches!(hold, "needs_fetch" | "cannot_check") {
+        let rendered = if matches!(hold, "needs_fetch" | "cannot_check" | "no_activity") {
             probe_card_updates(&[(serde_json::json!({}), extra)]).remove(0)
         } else {
             inbox_hold_card(extra)
@@ -5815,7 +5816,7 @@ fn status_011_live_subscriber_updates_the_rendered_inbox_card() {
             };
             assert!(matches!(
                 request,
-                AttachRequest::SubscribeEvents
+                AttachRequest::SubscribeEvents { .. }
             ));
             write_frame(&mut stream, KIND_RESP, &serde_json::to_vec(&AttachResponse::ok()).unwrap())
                 .await.unwrap();

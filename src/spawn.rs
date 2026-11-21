@@ -684,7 +684,7 @@ pub async fn refuse_unless_approved(
     // caller of this is a scheduled task (a fire, Run now, an issue dispatch).
     let asked_by = format!("scheduled task '{task_name}'");
     let Some(refusal) =
-        approval_refusal_asked_by(config_dir, orchestration, task_name, &asked_by).await
+        approval_refusal_asked_by(config_dir, orchestration, task_name, &asked_by, None).await
     else {
         return Ok(());
     };
@@ -698,13 +698,15 @@ pub async fn refuse_unless_approved(
 /// PRD #1885: the refusal for starting `orchestration` of the config in
 /// `config_dir`, logged at warn under `path`, or `None` when its text is the
 /// approved text. Reads the approval store again, off the runtime's threads; a
-/// check that cannot finish refuses.
+/// check that cannot finish refuses. `caller` is the agent that asked, told
+/// the in-deck answer when the user gives it (issue #2348).
 pub async fn approval_refusal(
     config_dir: &Path,
     orchestration: &crate::project_config::OrchestrationConfig,
     path: &str,
+    caller: Option<crate::trust_requests::RefusedCaller>,
 ) -> Option<String> {
-    approval_refusal_asked_by(config_dir, orchestration, path, path).await
+    approval_refusal_asked_by(config_dir, orchestration, path, path, caller).await
 }
 
 /// [`approval_refusal`], naming `asked_by` as what tried to start it in the
@@ -714,6 +716,7 @@ pub async fn approval_refusal_asked_by(
     orchestration: &crate::project_config::OrchestrationConfig,
     path: &str,
     asked_by: &str,
+    caller: Option<crate::trust_requests::RefusedCaller>,
 ) -> Option<String> {
     let (dir, orch) = (config_dir.to_path_buf(), orchestration.clone());
     let check = match tokio::task::spawn_blocking(move || {
@@ -736,7 +739,7 @@ pub async fn approval_refusal_asked_by(
     crate::project_trust::log_refusal(path, &check);
     // Issue #2330: in the serving daemon, ask the attached clients for the
     // approval, and say so.
-    crate::trust_requests::refusal_for(&check, asked_by)
+    crate::trust_requests::refusal_for(&check, asked_by, caller.as_ref())
 }
 
 async fn spawn_with_unit(
@@ -1391,7 +1394,7 @@ async fn spawn_with_unit(
                     &orchestration_id,
                     // Issue #1395: the file this spawn published for its
                     // orchestrator — the same value recorded above — so a live
-                    // tab re-arms from it rather than from the mirror.
+                    // tab re-arms from it.
                     context_path.as_deref(),
                 );
                 // …and give every role card its ROLE NAME, the same way the
@@ -3352,6 +3355,7 @@ mod tests {
                     pane_id: "disp".to_string(),
                     agent_id: "nobody".to_string(),
                 },
+                existing_dir: false,
             };
             let caller = crate::dispatch_return::DispatchCaller {
                 pane_id: "disp".to_string(),
@@ -3681,6 +3685,7 @@ mod tests {
                     pane_id: "disp".to_string(),
                     agent_id: "nobody".to_string(),
                 },
+                existing_dir: false,
             };
             let caller = crate::dispatch_return::DispatchCaller {
                 pane_id: "disp".to_string(),
@@ -4641,6 +4646,7 @@ mod tests {
         crate::agent_pty::AgentRecord {
             input_held: None,
             input_discarded: None,
+            project_config_exists: None,
             id: "7".into(),
             pane_id_env: pane_id.map(str::to_string),
             display_name: display_name.map(str::to_string),

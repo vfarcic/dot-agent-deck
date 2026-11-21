@@ -356,7 +356,7 @@ test.describe("the fleet view (PRD #742 M4)", () => {
 
       await button.hover();
       await expect(popover).toBeVisible();
-      for (const name of ["agents", "running", "needs-input", "failed", "waiting", "idle", "groups", "decks"]) {
+      for (const name of ["agents", "working", "thinking", "compacting", "needs-input", "error", "waiting", "idle", "groups", "decks"]) {
         await expect(page.getByTestId(`overview-count-${name}`), `${name} is not in the popover`).toBeVisible();
       }
       // Down onto the list itself: it stays open on the way.
@@ -379,10 +379,13 @@ test.describe("the fleet view (PRD #742 M4)", () => {
       await expect(button).toHaveAttribute("aria-expanded", "false");
       await page.mouse.move(5, 790);
 
-      for (const width of [1440, 1240, 1239, 1101, 1100, 961, 681, 400]) {
+      for (const width of [1440, 1439, 1181, 1180, 961, 681, 400]) {
         await page.setViewportSize({ width, height: 800 });
         await expect(button, `the counters button is off screen at ${width}px`).toBeInViewport();
         await button.hover();
+        // The list is `display: none` until the pointer-enter re-render shows it,
+        // and a box read before that is null, which reads as off the left edge.
+        await expect(popover, `the counters do not open on hover at ${width}px`).toBeVisible();
         const box = await popover.boundingBox();
         expect((box?.x ?? 0) + (box?.width ?? 0), `the counters run off the right edge at ${width}px`).toBeLessThanOrEqual(width);
         expect(box?.x ?? -1, `the counters run off the left edge at ${width}px`).toBeGreaterThanOrEqual(0);

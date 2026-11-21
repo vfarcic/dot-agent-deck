@@ -246,6 +246,7 @@ async fn handle_connection(
             records.lock().unwrap().push(AgentRecord {
                 input_held: None,
                 input_discarded: None,
+                project_config_exists: None,
                 id: id.clone(),
                 pane_id_env,
                 display_name,
@@ -281,7 +282,7 @@ async fn handle_connection(
                 while read_frame(&mut stream).await.ok().flatten().is_some() {}
             }
         }
-        AttachRequest::SubscribeEvents => {
+        AttachRequest::SubscribeEvents { .. } => {
             write_resp(&mut stream, &AttachResponse::ok())
                 .await
                 .expect("reply to SubscribeEvents");
@@ -342,6 +343,7 @@ fn orchestration_record(
     AgentRecord {
         input_held: None,
         input_discarded: None,
+        project_config_exists: None,
         id: agent_id.to_string(),
         pane_id_env: Some(pane_id.to_string()),
         display_name: Some(format!("{orchestration}-{role_name}")),

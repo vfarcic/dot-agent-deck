@@ -1,4 +1,4 @@
-import { createFixtureFleet, DOCS_TRUST_ORCHESTRATION, DOCS_TRUST_REMOVED_ROLES, DOCS_TRUST_ROLES, createFixtureStartedAgent, FIXTURE_RESTART_AFTER_MS, restartedFixtureSnapshot, DEFAULT_PROFILES, FIXTURE_APP_VERSION, FIXTURE_DAEMON_VERSION, FIXTURE_UPGRADE_STEP_MS, FIXTURE_DEFAULT_COMMANDS, FIXTURE_EXPERIMENTAL_DECKS, FIXTURE_HOMES, fixtureAgentRegistry, fixtureDirectoryTree, fixtureProjectOrchestrations, FIXTURE_ROLE_COMMANDS, fixtureVoiceCommands, nextFixtureAgentId, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureQuestion, resolveFixtureVoice, type FixtureState } from "../data/fixture";
+import { createFixtureFleet, docsAgentCards, DOCS_TRUST_ORCHESTRATION, DOCS_TRUST_REMOVED_ROLES, DOCS_TRUST_ROLES, createFixtureStartedAgent, FIXTURE_RESTART_AFTER_MS, restartedFixtureSnapshot, DEFAULT_PROFILES, FIXTURE_APP_VERSION, FIXTURE_DAEMON_VERSION, FIXTURE_UPGRADE_STEP_MS, FIXTURE_DEFAULT_COMMANDS, FIXTURE_EXPERIMENTAL_DECKS, FIXTURE_HOMES, fixtureAgentRegistry, fixtureDirectoryTree, fixtureProjectOrchestrations, FIXTURE_ROLE_COMMANDS, fixtureVoiceCommands, nextFixtureAgentId, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureQuestion, resolveFixtureVoice, type FixtureState } from "../data/fixture";
 import { voicePagesDirectory, voicePagesOrchestrations } from "../data/fixtureCrowded";
 import { actionErrorFrom, LaunchCleanupError, startDaemonErrorFrom } from "./actionError";
 import { PartialSettingsSaveError, partialSettingsSave } from "./settingsError";
@@ -44,10 +44,16 @@ import type { HandoffEdge,
   DeckListingOptions,
   DeckSnapshot,
   DesktopFeatures,
+  AgentCardEntry,
+  AgentCardsSnapshot,
+  AgentCardTarget,
+  CardActionOptions,
+  CardActionResult,
   DisconnectedReason,
   EvidenceItem,
   HostMetricsReport,
   InboxActionResult,
+  GenerateConfigResult,
   InboxActionVerb,
   InboxAttentionItem,
   NewAgentOptions,
@@ -441,6 +447,12 @@ export interface DesktopAgentDto {
    * or predates the field.
    */
   pullRequest?: PullRequestInfoDto;
+  /**
+   * PRD #2119 — whether the agent's project already holds a
+   * `.dot-agent-deck.toml`, copied through from `AgentRecord`. Absent or null
+   * when the daemon did not say.
+   */
+  projectConfigExists?: boolean | null;
   /**
    * The desktop crate's `DesktopTab` is structurally identical to the app
    * model's `AgentTab`, so the DTO reuses it and `agentFromDto` copies the
@@ -1158,10 +1170,11 @@ export interface VoiceResolvedParamDto {
    */
   names?: string[];
   /**
-   * PR #1451 round 3, change 3 — on an `agent_ref` chosen by its number on
-   * the dashboard alone: the deck that agent is on, since those rows span
-   * every deck where a resolved agent is the selected deck's. Never sent by
-   * Rust.
+   * On an `agent_ref`: the deck that agent is on. Set for one chosen by its
+   * number on the dashboard (PR #1451 round 3, change 3), whose rows span every
+   * deck, and by Rust for one resolved while other daemons' agents were in
+   * reach under All daemons (PRD #2374, `ResolvedParam::deck_id`). Absent: the
+   * selected deck's agent.
    */
   deckId?: string;
   /**
@@ -1215,6 +1228,14 @@ function withDeckIdentityKeys(result: VoiceResultDto): VoiceResultDto {
   if (result.outcome.kind === "param_ambiguous" && result.outcome.candidates) {
     return { ...result, outcome: { ...result.outcome, candidates: result.outcome.candidates.map(keyed) } };
   }
+  /* PRD #1184 — and so does a chain's switch step. */
+  if (result.outcome.kind === "chain") {
+    return { ...result, outcome: { ...result.outcome, steps: result.outcome.steps.map((step) => ({
+      ...step,
+      params: step.params.map(keyed),
+      ...(step.choice ? { choice: { ...step.choice, candidates: step.choice.candidates?.map(keyed) } } : {}),
+    })) } };
+  }
   if (result.outcome.kind !== "dispatch") return result;
   return { ...result, outcome: { ...result.outcome, params: result.outcome.params.map(keyed) } };
 }
@@ -1256,7 +1277,32 @@ export type VoiceOutcomeDto =
   | { kind: "transcription_failed"; detail: string; sentence: string }
   /** PRD #1497 D8 — heard while the app was speaking and not a way of
       silencing it: nothing ran and nothing was sent anywhere. */
-  | { kind: "dropped"; transcript: string; sentence: string };
+  | { kind: "dropped"; transcript: string; sentence: string }
+  /** PRD #1184 — an utterance answered as two or three steps that the app
+      would not run: a chain rule refused it, or one of its steps could not
+      run on the screen the earlier steps would leave. Nothing ran. */
+  | { kind: "chain_refused"; transcript: string; sentence: string }
+  /** PRD #1184 — two or three steps that passed every check, run in order by
+      the panel (`runChain`). `sentence` reports them all; a step that cannot
+      run when its turn comes stops the chain, and the panel says which. */
+  | { kind: "chain"; transcript: string; steps: VoiceChainStepDto[]; sentence: string };
+
+/**
+ * PRD #1184 — one step of a `chain` outcome: a dispatch, the user's words for
+ * it (`said`, quoted when it stops the chain) and the screen it was judged on,
+ * which the panel holds the screen to before running any step after the first.
+ */
+export interface VoiceChainStepDto {
+  said: string;
+  action: string;
+  invoke: string;
+  params: VoiceResolvedParamDto[];
+  sentence: string;
+  screen: VoiceScreen;
+  /** A step that matched several things: the numbered choice the chain
+      pauses on when this step's turn comes. At most one step carries one. */
+  choice?: Extract<VoiceOutcomeDto, { kind: "param_ambiguous" }>;
+}
 
 /**
  * One utterance's outcome, plus what it cost (`voice::VoiceResult`).
@@ -2376,7 +2422,70 @@ export interface DeckBridge {
    * answers `stale` to the second of two clients acting at once.
    */
   inboxAction?(target: AgentTarget, item: { paneId: string; messageId: string; revision: number }, verb: InboxActionVerb): Promise<InboxActionResult>;
+  /**
+   * PRD #2119 — Generate config (`desktop_generate_config`): the daemon that
+   * owns the agent posts the configuration request to its inbox, bound to the
+   * daemon process that listed it. Optional: a bridge without it offers no
+   * control.
+   */
+  generateConfig?(deckId: string, agentId: string, paneId: string, incarnation?: string): Promise<GenerateConfigResult>;
+  /**
+   * PRD #2374 — tell the app's backend that this webview consumes agent cards
+   * (`agent_cards_consume`), called once, by the surface that renders them.
+   * Until it is called the backend subscribes to no card doorbell,
+   * pushes no cards and `agentCards` answers `null`. Optional: a bridge
+   * without it (the browser preview) needs no request.
+   */
+  consumeAgentCards?(): Promise<void>;
+  /**
+   * PRD #2374 — one deck's agent cards (`agent_cards_list`), or `null` when
+   * its daemon does not support cards (show that deck's table only) or the
+   * webview has not called `consumeAgentCards`.
+   * Optional: a bridge without it shows no cards.
+   */
+  agentCards?(deckId: string): Promise<AgentCardsSnapshot | null>;
+  /**
+   * PRD #2374 — every deck's cards as each changes (`desktop://agent-cards`),
+   * pushed on connect, on a card's doorbell and every few seconds.
+   */
+  subscribeAgentCards?(listener: (snapshot: AgentCardsSnapshot) => void): Promise<Unsubscribe>;
+  /**
+   * PRD #2374 — invoke one action of one card (`agent_card_invoke`). The
+   * daemon resolves, refuses and performs it; `actionToken` is the version of
+   * the action the user was shown, and the daemon refuses a changed one
+   * (`stale_action`); `confirm` only after the user confirmed an action whose
+   * `confirm` is set, `text` only for `reply`. `requestId` names the press
+   * (one is minted when absent), so repeating it sends nothing again. The
+   * call is bound to the daemon process that listed the card
+   * (`target.instanceId`): a successor is sent nothing (`daemon_replaced`).
+   */
+  invokeCardAction?(target: AgentCardTarget, actionId: string, options: CardActionOptions): Promise<CardActionResult>;
   dispose(): Promise<void>;
+}
+
+/** PRD #2374 — a fresh id for one card-action press. */
+export function newCardRequestId(): string {
+  const bytes = new Uint8Array(16);
+  globalThis.crypto.getRandomValues(bytes);
+  return `card-${Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("")}`;
+}
+
+/**
+ * PRD #2374 — read a `desktop://agent-cards` / `agent_cards_list` payload,
+ * or `null` when it is not one. Only the envelope is checked: the entries are
+ * the daemon's, rendered as received.
+ */
+export function normalizeAgentCards(value: unknown): AgentCardsSnapshot | null {
+  if (typeof value !== "object" || value === null) return null;
+  const record = value as Record<string, unknown>;
+  if (typeof record.deckId !== "string" || !Array.isArray(record.entries)) return null;
+  return {
+    deckId: record.deckId,
+    instanceId: typeof record.instanceId === "string" ? record.instanceId : "",
+    revision: typeof record.revision === "number" ? record.revision : 0,
+    entries: record.entries as AgentCardEntry[],
+    catalogErrors: Array.isArray(record.catalogErrors) ? record.catalogErrors.filter((e): e is string => typeof e === "string") : [],
+  };
 }
 
 /**
@@ -2573,6 +2682,7 @@ const WAKE_HOLDS = new Set([
   "dialog_during_ring",
   "needs_fetch",
   "cannot_check",
+  "no_activity",
 ]);
 /** PRD #1666 part 3 (Q35): the hold causes this build names; any other reads as `unknown`. */
 const HOLD_CAUSES = new Set(["filesystem", "writable_directory", "foreign_owner", "acl", "export_file", "io"]);
@@ -2831,6 +2941,8 @@ function agentFromDto(agent: DesktopAgentDto, index: number, daemonId: string): 
     ...(answerSettlements.length > 0 ? { answerSettlements } : {}),
     // PRD #1401 — the badge. Checked, not copied: see `pullRequestFromDto`.
     ...(pullRequest ? { pullRequest } : {}),
+    // PRD #2119 — only a boolean the daemon sent; anything else is unknown.
+    ...(typeof agent.projectConfigExists === "boolean" ? { projectConfigExists: agent.projectConfigExists } : {}),
     ...(background ? { background } : {}),
     rows: agent.rows,
     cols: agent.cols,
@@ -3120,7 +3232,7 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
  * reachable from the URL — the previous inline `||` chain had to be edited in
  * lockstep with the fixture and was not.
  */
-const FIXTURE_STATES: readonly FixtureState[] = ["connected", "crowded", "disconnected", "error", "empty", "fleet", "docs", "docs-pr", "docs-fleet", "voice-pages", "upgrade", "upgrade-error", "hook-notice", "docs-question", "docs-restart"];
+const FIXTURE_STATES: readonly FixtureState[] = ["connected", "crowded", "disconnected", "error", "empty", "fleet", "docs", "docs-pr", "docs-generate", "docs-fleet", "voice-pages", "upgrade", "upgrade-error", "hook-notice", "docs-question", "docs-restart"];
 
 class FixtureDeckBridge implements DeckBridge {
   readonly mode = "fixture" as const;
@@ -3131,6 +3243,34 @@ class FixtureDeckBridge implements DeckBridge {
    */
   async inboxAction(): Promise<InboxActionResult> {
     return { outcome: "applied" };
+  }
+  /**
+   * PRD #2119: the preview answers Generate config as a daemon that posted the
+   * request would, with the sentence the app shows for it. Nothing is sent.
+   */
+  async generateConfig(): Promise<GenerateConfigResult> {
+    return { outcome: "sent", messageId: "m-fixture-config", message: "Config request sent to the agent's inbox." };
+  }
+  /**
+   * PRD #2374 — the `agent-cards` docs scene's card list: served only for
+   * `/?fixture=1&state=docs&cards=1`, so no other fixture scene shows cards,
+   * needs-you bells or row menus. Every other deck and scene answers as a
+   * daemon without cards does.
+   */
+  async agentCards(deckId: string): Promise<AgentCardsSnapshot | null> {
+    const params = new URLSearchParams(window.location.search);
+    if (this.fixtureState !== "docs" || params.get("cards") !== "1") return null;
+    const cards = docsAgentCards();
+    return cards.deckId === deckId ? cards : null;
+  }
+  /** The preview's cards never change, so there is nothing to push. */
+  async subscribeAgentCards(): Promise<Unsubscribe> {
+    return () => undefined;
+  }
+  /** The preview answers a card action as a daemon that queued it would; nothing changes in the fixture's state. */
+  async invokeCardAction(_target: AgentCardTarget, actionId: string, options: CardActionOptions): Promise<CardActionResult> {
+    if (actionId === "close" || actionId === "close-keep-worktree") return { request_id: options.requestId ?? newCardRequestId(), outcome: "refused", code: "client_side_action", message: "the preview closes no agent" };
+    return { request_id: options.requestId ?? newCardRequestId(), outcome: "sent", message_id: "m-fixture-card" };
   }
   /**
    * The whole fixture fleet, selected deck first (PRD #742 M4). One entry for
@@ -5605,7 +5745,8 @@ export class TauriDeckBridge implements DeckBridge {
     /* Rust hands back the entry exactly as offered; the offered one is
        returned, so its identity keeps the keys it was given on the way in. */
     if (answer.kind !== "selected") return answer;
-    const candidate = offered.find((entry) => entry.value === answer.candidate.value);
+    /* PRD #2374 (PR #2378 review): two offered agents can share an id on two daemons. */
+    const candidate = offered.find((entry) => entry.value === answer.candidate.value && entry.deckId === answer.candidate.deckId);
     return candidate ? { kind: "selected", candidate } : { kind: "refused" };
   }
 
@@ -5869,6 +6010,45 @@ export class TauriDeckBridge implements DeckBridge {
     // Issue #1240: `options` only when given, so a PRD #1223 listing is the
     // same invoke it always was.
     return invoke<DeckDirectoryListing>("desktop_list_directories", { deckId, path: path ?? null, ...(options ? { options } : {}) });
+  }
+
+  /** PRD #2119: the deck, pane, agent and process the confirmation captured, untouched. */
+  async generateConfig(deckId: string, agentId: string, paneId: string, incarnation?: string): Promise<GenerateConfigResult> {
+    const invoke = await this.getInvoke();
+    return invoke<GenerateConfigResult>("desktop_generate_config", { deckId, agentId, paneId, incarnation: incarnation ?? null });
+  }
+
+  async consumeAgentCards(): Promise<void> {
+    const invoke = await this.getInvoke();
+    await invoke<null>("agent_cards_consume");
+  }
+
+  async agentCards(deckId: string): Promise<AgentCardsSnapshot | null> {
+    const invoke = await this.getInvoke();
+    return normalizeAgentCards(await invoke<unknown>("agent_cards_list", { deckId }));
+  }
+
+  async subscribeAgentCards(listener: (snapshot: AgentCardsSnapshot) => void): Promise<Unsubscribe> {
+    const { listen } = await import("@tauri-apps/api/event");
+    return listen<unknown>("desktop://agent-cards", (event) => {
+      const snapshot = normalizeAgentCards(event.payload);
+      if (snapshot) listener(snapshot);
+    });
+  }
+
+  async invokeCardAction(target: AgentCardTarget, actionId: string, options: CardActionOptions): Promise<CardActionResult> {
+    const invoke = await this.getInvoke();
+    return invoke<CardActionResult>("agent_card_invoke", {
+      deckId: target.deckId,
+      paneId: target.paneId,
+      agentId: target.agentId,
+      actionId,
+      actionToken: options.actionToken,
+      confirm: options.confirm === true,
+      text: options.text ?? null,
+      requestId: options.requestId ?? newCardRequestId(),
+      instanceId: target.instanceId,
+    });
   }
 
   async inboxAction(target: AgentTarget, item: { paneId: string; messageId: string; revision: number }, verb: InboxActionVerb): Promise<InboxActionResult> {

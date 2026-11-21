@@ -17,7 +17,9 @@
 //! into and emptied, which Codex draws with its placeholder, and `043`
 //! holds a visible draft with nothing typed, then checks the emptied box.
 //!
-//! `041` needs no model turn (nothing is submitted); `043` delivers tasks.
+//! `041` needs no model turn (nothing is submitted); `043` delivers tasks,
+//! one of them in a pane under 32 rows, where Codex draws no witness before
+//! its first prompt (issue #2262).
 #[path = "support/codex_installed.rs"]
 mod codex_installed;
 dot_agent_deck_test_harness::link!();
@@ -41,16 +43,21 @@ use std::time::{Duration, Instant};
 /// The user's editor: a terminal program that reads what the person types
 /// into it (`read`, until `LATE` or `T041_EDITOR_WAIT` seconds) and appends
 /// the printable bytes to the file, or empties the file (`empty`). Each run
-/// appends one JSON line to `T041_EDITOR_LOG`.
+/// appends one JSON line to `T041_EDITOR_LOG`, with when it opened its
+/// terminal and when it stopped reading, so a `LATE` it never read shows
+/// whether its window ran out or the bytes never came (issue #2264).
 const EDITOR: &str = r#"#!/usr/bin/env python3
-import json, os, select, sys, termios, time, tty
+import datetime, json, os, select, sys, termios, time, tty
+now = lambda: datetime.datetime.now(datetime.timezone.utc).isoformat()
 path = sys.argv[-1]
 with open(path, "rb") as f:
     initial = f.read()
 got = b""
+opened = closed = None
 mode = os.environ.get("T041_EDITOR_MODE", "read")
 if mode == "read":
     fd = os.open("/dev/tty", os.O_RDWR)
+    opened = now()
     old = termios.tcgetattr(fd)
     try:
         # TCSANOW: TCSAFLUSH, setraw's default, would discard what the
@@ -68,6 +75,7 @@ if mode == "read":
                     break
                 got += chunk
     finally:
+        closed = now()
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
         os.close(fd)
     body = initial[:-1] if initial.endswith(b"\n") else initial
@@ -79,7 +87,8 @@ with open(path, "wb") as f:
 with open(os.environ["T041_EDITOR_LOG"], "a") as f:
     f.write(json.dumps({"mode": mode, "initial": initial.decode(errors="replace"),
                         "read_hex": got.hex(), "final": text.decode(errors="replace"),
-                        "pid": os.getpid(), "ppid": os.getppid()}) + "\n")
+                        "pid": os.getpid(), "ppid": os.getppid(),
+                        "opened": opened, "closed": closed}) + "\n")
 "#;
 
 /// The user's editor and its log, in a directory of the test's own.
@@ -242,6 +251,15 @@ fn overlap_trials(path: Path041) {
             "deliveries": message["deliveries"],
         });
         eprintln!("041 {} {row}", path.name);
+        // A missed trial's whole deck log, for reading its helper records'
+        // attribution and timing its trace against the editor's `opened`
+        // and `closed` (issue #2264).
+        if !landed && let Ok(out) = std::env::var("DAD_PROBE_041_OUT") {
+            let _ = std::fs::write(
+                format!("{out}.{}-{trial}.log", path.name),
+                common::redact_credentials_for_output(&codex.log()),
+            );
+        }
         assert_eq!(
             branches.first().copied(),
             Some("Armed"),
@@ -261,7 +279,8 @@ fn overlap_trials(path: Path041) {
         assert_eq!(
             codex.composer().as_deref(),
             Some("EARLYLATE"),
-            "trial {trial}: nothing but the person's typing reached the box; {row}"
+            "trial {trial}: nothing but the person's typing reached the box; {row}; {}",
+            codex.evidence()
         );
         // The route, not only the box: Ctrl+G opened the person's editor once,
         // on the box as typed before it, and LATE reached that editor.
@@ -279,7 +298,8 @@ fn overlap_trials(path: Path041) {
         assert_eq!(
             runs[0]["read_hex"].as_str().and_then(unhex).as_deref(),
             Some(&b"LATE"[..]),
-            "trial {trial}: LATE reaches the person's editor; {row}"
+            "trial {trial}: LATE reaches the person's editor; {row}; {}",
+            codex.evidence()
         );
         match path.exit {
             // The box was empty when the check's byte reached Codex: what
@@ -376,7 +396,6 @@ fn probe_041_live_failed_report_with_notice_keeps_overlapping_typing() {
 /// Scenario: As the delayed case, but the check's helper is held for 11 seconds at its very start, before it reads anything, past the ten-second wait after which the deck counts the check's byte as unanswered. Every trial must still end with exactly EARLYLATE in Codex's input box and the task undelivered, the person's editor having opened once and read LATE, and the helper still reports the box it read empty.
 #[spec("inbox/probe/041")]
 #[test]
-#[ignore = "quarantined: vfarcic, #2264"]
 fn probe_041_live_late_helper_keeps_overlapping_typing() {
     overlap_trials(Path041 {
         name: "late-helper",
@@ -486,6 +505,69 @@ fn probe_043_live_a_touched_box_with_a_client_attached_is_checked_and_delivered(
     }
 }
 
+/// Scenario: In real interactive Codex in an installed pane 27 rows by 162 columns, where Codex draws no start-up logo before its first prompt (issue #2262's pane), with a test-owned client attached that answers Codex's cursor position queries, type a draft into the box and delete it before Codex has had any prompt, then queue a sentinel task. The deck checks the touched box, reads it empty, rings, and the task is acted on and acknowledged after exactly one hand-over, where before the fix every check was refused until someone sent Codex a prompt.
+#[spec("inbox/probe/043")]
+#[test]
+fn probe_043_live_a_touched_box_in_a_short_pane_is_checked_before_any_prompt() {
+    skip_unless!(codex_installed::checkable());
+    let codex = Installed::sized(&[], (27, 162));
+    codex.assert_installed();
+    codex.wait_armable();
+    let record = codex.record();
+    assert_eq!(
+        (record["rows"].as_u64(), record["cols"].as_u64()),
+        (Some(27), Some(162)),
+        "{record}"
+    );
+    assert!(
+        !codex
+            .screen()
+            .chars()
+            .any(|c| ('\u{2800}'..='\u{28ff}').contains(&c)),
+        "the premise: no logo in a pane under 32 rows; {}",
+        codex.evidence()
+    );
+    let answerer = CprAnswerer::attach(codex.deck.attach_socket_path(), &codex.pane.agent, 27, 162);
+    let mut person = codex.input();
+    let draft = "p043-short-draft";
+    person.write(draft);
+    codex.expect_composer(draft);
+    person.write(&"\x7f".repeat(draft.len()));
+    let since = codex.log().len();
+    let name = "p043-short-0432.txt";
+    let id = codex.post(name);
+    let delivered = common::wait_until(BUDGET, || {
+        codex_installed::project_dir(&codex.deck)
+            .join(name)
+            .exists()
+    });
+    assert!(
+        delivered,
+        "the touched box in a short pane must be checked and the task delivered; {}",
+        codex.evidence()
+    );
+    codex.done(&id, name);
+    let log = codex.log()[since..].to_string();
+    let at = |needle: &str| log.lines().position(|l| l.contains(needle));
+    let (written, applied, rang) = (
+        log.lines()
+            .position(|l| l.contains("doorbell tick probe") && l.contains("outcome=Written")),
+        at("empty read applied"),
+        at("doorbell rang"),
+    );
+    assert!(
+        matches!((written, applied, rang), (Some(w), Some(a), Some(r)) if w < a && a < r),
+        "a check of the emptied box, its empty read, then the ring \
+         (written={written:?}, applied={applied:?}, rang={rang:?}); {}",
+        codex.evidence()
+    );
+    eprintln!(
+        "043 short pane: checked, one delivery: {}; cpr answers {}",
+        codex.message(&id),
+        answerer.answered()
+    );
+}
+
 /// For three seconds the task stays queued with no delivery, the draft is
 /// exactly as typed whenever the box is drawn, no doorbell rang, and the
 /// deck wrote nothing to the pane but one-byte checks.
@@ -524,4 +606,204 @@ fn held_for(codex: &Installed, id: &str, name: &str, draft: &str, since: usize, 
         false
     });
     codex.expect_composer(draft);
+}
+
+// ---------------------------------------------------------------------------
+// inbox/probe/104
+// ---------------------------------------------------------------------------
+
+/// Scenario: In real interactive Codex in an installed 40 × 140 pane of a deck with only the TUI attached, so nothing answers Codex's cursor position queries, type a draft into the box and delete it, wait until the pane's screen has been unchanged for two seconds, resize the pane three times 200 ms apart, toggling its width by one column, and queue a sentinel task 200 ms later. A check is refused because Codex's cursor-query waits may not have run out, and the next one is written within 15 seconds of the post, where before the fix one refused check waited the 30 s backoff (about 36 s), and the task is acted on and acknowledged after exactly one hand-over. Codex chains those waits over a burst only some of the time, so the test runs up to five fresh decks, each held to the bound, and reads as skipped, a failure under DOT_AGENT_DECK_REQUIRE_REAL_E2E, when none reached the refusal (#2129, CX-5h).
+#[spec("inbox/probe/104")]
+#[test]
+fn probe_104_live_a_touched_box_after_a_resize_burst_is_checked_within_seconds() {
+    skip_unless!(codex_installed::checkable());
+    // Up to this many fresh decks, until one burst reaches the refusal.
+    const TRIALS: usize = 5;
+    let hit = (1..=TRIALS).any(resize_burst_trial);
+    // Whether Codex chains its cursor-query waits over a burst is Codex's
+    // to decide, and it varies: on 2026-11-20, on this build and harness, 9
+    // of 9 bursts did between 01:29 and 02:05 UTC and 2 of 31 between 02:15
+    // and 03:10; the cause was not found. A burst that doesn't is checked
+    // as fast with or without the fix. Every trial above held the bound; a
+    // run where none reached the refusal didn't verify the path, which reads
+    // as unverified, not green, under `DOT_AGENT_DECK_REQUIRE_REAL_E2E`. The
+    // fast tier drives that path itself
+    // (`probe_104_a_resize_burst_delays_a_codex_check_by_seconds_not_a_backoff_step`).
+    skip_unless!(if hit {
+        Ok(())
+    } else {
+        Err(format!(
+            "in {TRIALS} bursts Codex chained no cursor-query waits, so no check was refused \
+             for the estimate and the path #2129 fixed was not reached"
+        ))
+    });
+}
+
+/// One `probe_104_live_…` trial on a fresh deck: the check is written
+/// within the bound and the task delivered once. Whether a check was
+/// refused for the query-wait estimate before the written one.
+fn resize_burst_trial(trial: usize) -> bool {
+    // Measured on this branch: 5.9 to 6.2 s where the burst reached the
+    // refusal, against 36.1 s before it and 3.1 to 3.4 s with no resize.
+    // Inside the doorbell's first re-ring with room for a loaded
+    // machine, and well short of the 30 s backoff step a counted failure
+    // waits.
+    const BOUND: Duration = Duration::from_secs(15);
+    let codex = Installed::new(&[]);
+    codex.assert_installed();
+    codex.wait_armable();
+    let mut person = codex.input();
+    let draft = format!("p104-draft-{trial}");
+    person.write(&draft);
+    codex.expect_composer(&draft);
+    person.write(&"\x7f".repeat(draft.len()));
+    codex.expect_composer("");
+    // A quiet box: the pane's screen unchanged for two seconds.
+    let quiet = std::cell::RefCell::new((codex.screen(), Instant::now()));
+    assert!(
+        common::wait_until(Duration::from_secs(30), || {
+            let screen = codex.screen();
+            let mut quiet = quiet.borrow_mut();
+            if screen != quiet.0 {
+                *quiet = (screen, Instant::now());
+            }
+            quiet.1.elapsed() >= Duration::from_secs(2)
+        }),
+        "trial {trial}: the emptied box must go quiet before the burst; {}",
+        codex.evidence()
+    );
+    // The burst's own schedule (CX-5h's): one-column resizes 200 ms apart
+    // and the task 200 ms after the last, the scenario rather than a wait
+    // for any state.
+    const GAP: Duration = Duration::from_millis(200);
+    let start = Instant::now();
+    for (n, cols) in [139, 140, 139].into_iter().enumerate() {
+        helper_pause::until(start + GAP * n as u32);
+        let reply = inbox::attach(
+            &codex.deck,
+            json!({"op": "resize", "id": codex.pane.agent, "rows": 40, "cols": cols}),
+        );
+        assert_eq!(reply["ok"], true, "resize: {reply}");
+    }
+    helper_pause::until(start + GAP * 3);
+    let since = codex.log().len();
+    let name = format!("p104-burst-104{trial}.txt");
+    let posted = Instant::now();
+    let id = codex.post(&name);
+    let is_written = |l: &str| l.contains("doorbell tick probe") && l.contains("outcome=Written");
+    assert!(
+        common::wait_until(BUDGET, || codex.log()[since..].lines().any(is_written)),
+        "trial {trial}: the touched box must be checked after the burst; {}",
+        codex.evidence()
+    );
+    let after = posted.elapsed();
+    let log = codex.log()[since..].to_string();
+    assert!(
+        after <= BOUND,
+        "trial {trial}: the check came {after:?} after the post, past {BOUND:?}; refusals:\n{}\n{}",
+        log.lines()
+            .filter(|l| l.contains("probe refused") || l.contains("doorbell tick probe"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        codex.evidence()
+    );
+    // The path the fix is about: a check refused for the query-wait
+    // estimate before the written one.
+    let refused = log
+        .lines()
+        .position(|l| l.contains("probe refused when scheduled") && l.contains("refusal=Estimate"));
+    let written = log.lines().position(is_written);
+    let hit = matches!((refused, written), (Some(r), Some(w)) if r < w);
+    codex.done(&id, &name);
+    eprintln!(
+        "104 trial {trial}: checked {after:?} after the post, refused for the estimate first: \
+         {hit}, one delivery: {}\n{}",
+        codex.message(&id),
+        log.lines()
+            .filter(|l| l.contains("probe refused") || l.contains("doorbell tick probe"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    hit
+}
+
+// ---------------------------------------------------------------------------
+// inbox/probe/103
+// ---------------------------------------------------------------------------
+
+/// Scenario: In real interactive Codex in an installed pane, type `/cd` into a sibling project whose `.codex/config.toml` moves Codex's editor from Ctrl+G to F6, so Ctrl+G no longer opens the deck's check, then queue a sentinel task. Codex's status line names the new folder, the deck refuses its check because Codex moved to another folder, the TUI card and the desktop tile get the existing `the deck can't check this agent's input box` hold, and for the rest of the wait the deck types nothing into the pane, rings nothing and the task stays queued.
+#[spec("inbox/probe/103")]
+#[test]
+fn probe_103_live_a_codex_moved_by_cd_is_not_checked() {
+    skip_unless!(codex_installed::checkable());
+    let codex = Installed::new(&[]);
+    // A sibling of the folder Codex starts in, in the same trusted
+    // repository, outside the folders whose project files the deck reads
+    // at the spawn.
+    let moved = codex.deck.workdir().join("moved-p103");
+    std::fs::create_dir_all(moved.join(".codex")).unwrap();
+    std::fs::write(
+        moved.join(".codex/config.toml"),
+        "[tui.keymap.global]\nopen_external_editor = \"f6\"\n",
+    )
+    .unwrap();
+    codex.assert_installed();
+    codex.wait_armable();
+    let since = codex.log().len();
+    let mut person = codex.input();
+    let line = format!("/cd {}", moved.display());
+    person.write(&line);
+    codex.expect_composer(&line);
+    person.write("\r");
+    let shown = format!("· {}", moved.display());
+    assert!(
+        common::wait_until(Duration::from_secs(15), || {
+            codex
+                .screen()
+                .lines()
+                .any(|row| row.trim_end().ends_with(&shown))
+                && codex.composer().is_none_or(|c| c.is_empty())
+        }),
+        "the premise: Codex's status line names the folder `/cd` moved it to; {}",
+        codex.evidence()
+    );
+    let name = "p103-moved-1031.txt";
+    let id = codex.post(name);
+    assert!(
+        common::wait_until(BUDGET, || {
+            codex.log()[since..].lines().any(|l| {
+                l.contains("probe refused when scheduled") && l.contains("Keymap(Changed)")
+            }) && codex.record()["inbox"]["wake_hold"] == "cannot_check"
+        }),
+        "the deck refuses its check of the moved Codex and the card says cannot_check; {}",
+        codex.evidence()
+    );
+    common::wait_until(Duration::from_secs(20), || {
+        let message = codex.message(&id);
+        assert_eq!(message["state"], "queued", "{message}");
+        assert_eq!(message["deliveries"], 0, "{message}");
+        let log = codex.log();
+        assert!(
+            !log[since..].contains("doorbell rang") && !log[since..].contains("empty read applied"),
+            "no check read the box and no ring; {}",
+            codex.evidence()
+        );
+        assert!(
+            codex.ops(since).iter().all(|o| !o.deck),
+            "the deck typed nothing into the moved Codex: {:?}; {}",
+            codex.ops(since),
+            codex.evidence()
+        );
+        assert!(
+            !codex_installed::project_dir(&codex.deck)
+                .join(name)
+                .exists()
+                && !moved.join(name).exists()
+        );
+        false
+    });
+    eprintln!(
+        "103: moved by /cd, check refused Keymap(Changed), held cannot_check, nothing typed: {}",
+        codex.message(&id)
+    );
 }

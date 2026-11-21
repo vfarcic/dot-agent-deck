@@ -51,6 +51,17 @@ pub enum EventType {
     /// session's current `last_activity`, so even that reader's activity clock
     /// does not move.
     PullRequest,
+    /// PRD #2374: the DAEMON's doorbell that an agent card changed — created,
+    /// updated or removed. Synthesized only by [`crate::agent_cards`] and
+    /// broadcast straight onto the fan-out; the hook socket drops a producer's
+    /// copy. A **doorbell, not a payload**: its metadata names the card
+    /// ([`crate::agent_cards::AGENT_CARD_KEY_METADATA_KEY`]), its new revision
+    /// and whether it was removed, and a client re-reads `list-agent-cards`.
+    ///
+    /// Status-neutral: [`crate::state::AppState::apply_event`] ignores it. An
+    /// older reader decodes it as [`EventType::Unknown`], the `PullRequest`
+    /// precedent, so no `PROTOCOL_VERSION` bump.
+    AgentCard,
     /// PRD #370 / precedent PRD #201 (`AgentType`'s identical retrofit):
     /// forward-compat catch-all for a future/unknown `event_type` string on
     /// the wire, so a build newer than THIS one can add further variants
@@ -1059,6 +1070,25 @@ pub const QUESTION_RELEASED_BY_DECK_METADATA_KEY: &str = "question_released_by_d
 /// when it counts hook latency. Nothing outside telemetry reads it.
 pub const RECEIVED_BY_DECK_AT_METADATA_KEY: &str = "received_by_deck_at_ns";
 
+/// Issue #2347: on the `Thinking` Claude Code's prompt hook reports in a deck
+/// pane, a nonce naming that one prompt. Claude can still drop the prompt
+/// after the hook reported it (another `UserPromptSubmit` hook blocks it),
+/// and then runs no turn and fires no `Stop`; the transcript witness
+/// ([`crate::inbox_witness`]) reports that with
+/// [`PROMPT_NOT_TAKEN_METADATA_KEY`] and the same nonce.
+pub const PROMPT_TURN_METADATA_KEY: &str = "prompt_turn";
+
+/// Issue #2347: on an `Idle` the transcript witness sends, the nonce of the
+/// prompt Claude Code dropped ([`PROMPT_TURN_METADATA_KEY`]). The daemon
+/// applies it only while the turn that prompt's `Thinking` started is still
+/// the pane's latest news, and drops it otherwise
+/// (`crate::state::AppState::admit_prompt_not_taken`).
+pub const PROMPT_NOT_TAKEN_METADATA_KEY: &str = "prompt_not_taken";
+
+/// Issue #2347: the version of the guarded [`PROMPT_NOT_TAKEN_METADATA_KEY`]
+/// report a daemon advertises in [`InboxWaitReply::prompt_not_taken`].
+pub const PROMPT_NOT_TAKEN_REPORTS: u32 = 1;
+
 /// Where a permission prompt stands, on the events the OpenCode hook builds
 /// from one: `pending` on the ask, [`PERMISSION_STATE_REPLIED`] on the answer.
 /// PRD #1631: a question form's answer or dismissal is marked replied too.
@@ -1306,6 +1336,14 @@ impl AgentEvent {
     /// behaviour.
     pub fn is_from_subagent(&self) -> bool {
         self.metadata.contains_key(SUBAGENT_ID_METADATA_KEY)
+    }
+
+    /// Issue #2347: the nonce of the Claude Code prompt this witness `Idle`
+    /// reports dropped ([`PROMPT_NOT_TAKEN_METADATA_KEY`]), if it is one.
+    pub fn prompt_not_taken(&self) -> Option<&str> {
+        self.metadata
+            .get(PROMPT_NOT_TAKEN_METADATA_KEY)
+            .map(String::as_str)
     }
 
     /// Issue #1678: is this a subagent's answered permission prompt — a
@@ -1586,7 +1624,10 @@ impl AgentEvent {
     pub fn is_daemon_synthetic(&self) -> bool {
         matches!(
             self.event_type,
-            EventType::ShellBusy | EventType::ShellIdle | EventType::PullRequest
+            EventType::ShellBusy
+                | EventType::ShellIdle
+                | EventType::PullRequest
+                | EventType::AgentCard
         ) || self.metadata.contains_key(DELIVERY_NOTICE_METADATA_KEY)
             || self
                 .metadata
@@ -1869,6 +1910,14 @@ pub enum DaemonMessage {
     /// and answers nothing.
     #[serde(rename = "composer_invocation")]
     ComposerInvocation(ComposerInvocationRequest),
+    /// PRD #2374: an agent publishes its card's report. **Withheld unless
+    /// the daemon answered the same connection's [`HookCapabilitiesRequest`]
+    /// with [`AGENT_CARD`]** ([`crate::hook::confirms_agent_card`]). Answered
+    /// with one [`CardPublishReply`]. Additive on the unversioned hook socket,
+    /// so it does NOT move the attach `PROTOCOL_VERSION`; an older daemon is
+    /// never sent it.
+    #[serde(rename = "card_publish")]
+    CardPublish(CardPublishRequest),
 }
 
 impl DaemonMessage {
@@ -1904,6 +1953,7 @@ impl DaemonMessage {
             DaemonMessage::InboxComplete(r) | DaemonMessage::InboxRelease(r) => &r.pane_id,
             DaemonMessage::Question(s) => &s.pane_id,
             DaemonMessage::ComposerInvocation(r) => &r.pane_id,
+            DaemonMessage::CardPublish(r) => &r.pane_id,
         }
     }
 
@@ -1935,6 +1985,7 @@ impl DaemonMessage {
             DaemonMessage::InboxComplete(r) | DaemonMessage::InboxRelease(r) => r.token.as_deref(),
             DaemonMessage::Question(s) => s.token.as_deref(),
             DaemonMessage::ComposerInvocation(r) => r.token.as_deref(),
+            DaemonMessage::CardPublish(r) => r.token.as_deref(),
         }
     }
 
@@ -1961,6 +2012,10 @@ impl DaemonMessage {
             // needs a token that attests an agent, as the inbox verbs do.
             | DaemonMessage::ComposerInvocation(_)
             | DaemonMessage::Ack(_) => true,
+            // PRD #2374: checked in its own arm against the agent it names
+            // (`hook_provenance::classify_event`), so a refusal carries the
+            // provenance gate's own codes.
+            DaemonMessage::CardPublish(_) => false,
             DaemonMessage::Delegate(_)
             | DaemonMessage::WorkDone(_)
             | DaemonMessage::HookCapabilities(_)
@@ -2003,6 +2058,7 @@ impl DaemonMessage {
             | DaemonMessage::Ack(_)
             | DaemonMessage::InputMode(_)
             | DaemonMessage::ComposerInvocation(_)
+            | DaemonMessage::CardPublish(_)
             | DaemonMessage::Question(_) => None,
         };
         claimed.filter(|id| !id.is_empty())
@@ -2037,6 +2093,7 @@ impl DaemonMessage {
             DaemonMessage::InboxRelease(_) => "inbox_release",
             DaemonMessage::Question(_) => "question",
             DaemonMessage::ComposerInvocation(_) => "composer_invocation",
+            DaemonMessage::CardPublish(_) => "card_publish",
         }
     }
 
@@ -2093,6 +2150,9 @@ impl DaemonMessage {
             }
             DaemonMessage::WorkDoneTask(_) => {
                 serde_json::to_string(&WorkDoneTaskReply::refused(reason, message))
+            }
+            DaemonMessage::CardPublish(_) => {
+                serde_json::to_string(&CardPublishReply::refused(reason, message))
             }
             DaemonMessage::WorkDone(_)
             | DaemonMessage::Dispatch(_)
@@ -2176,6 +2236,7 @@ impl DaemonMessage {
             | DaemonMessage::Ack(_)
             | DaemonMessage::Question(_)
             | DaemonMessage::ComposerInvocation(_)
+            | DaemonMessage::CardPublish(_)
             | DaemonMessage::InboxWait(_)
             | DaemonMessage::InboxAnnounce(_)
             | DaemonMessage::InboxFetch(_)
@@ -2500,6 +2561,12 @@ pub struct ListTargetsRequest {
     /// `changelog.d/1077.breaking.md`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    /// PRD #468: `dispatch --list-targets --dir <path>` — list the targets of
+    /// that directory's config, the one a `dispatch --dir <path>` resolves
+    /// from, instead of the pane's. Additive optional, same as
+    /// [`DispatchSignal::dir`]: an older daemon ignores it and lists the pane's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
 }
 
 /// PRD #220: the daemon's reply to a [`DaemonMessage::ListTargets`], one JSON
@@ -2698,7 +2765,8 @@ pub struct PreparedOrchestration {
     /// `.dot-agent-deck/orchestrator-context.md`. A client that built its own
     /// copy would be holding a second, driftable spelling of a file only the
     /// daemon wrote — and, against a current daemon, would point the coordinator
-    /// at the shared compatibility mirror rather than at its own brief.
+    /// at that fixed path, which no current deck writes (issue #1395), rather
+    /// than at its own brief.
     ///
     /// Additive on a response type, exactly like
     /// [`ResolvedProject::config_revision`]: `#[serde(default)]`, so an older
@@ -3479,6 +3547,20 @@ pub struct DispatchSignal {
     /// agent's default command. Same gate as [`Self::command`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// PRD #468: `dispatch --dir <path>` — the existing directory to start the
+    /// unit in, as an absolute path the CLI resolved. Present, the daemon
+    /// creates no worktree and registers nothing for removal
+    /// ([`crate::dispatch::handle_dispatch_at`]); absent, it cuts a worktree
+    /// from the caller's `HEAD` as every dispatch did before.
+    ///
+    /// **Additive optional on the hook socket, so it does NOT move
+    /// [`crate::daemon_protocol::PROTOCOL_VERSION`].** A daemon that predates it
+    /// ignores the key and cuts a fresh worktree instead. The maintainer decided
+    /// on 2026-11-04 not to gate on that (the CLI and the daemon are upgraded
+    /// together), so unlike [`Self::command`] it is sent without asking the
+    /// daemon first, and that case is no `.breaking.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -4235,6 +4317,13 @@ pub struct InboxWaitReply {
     /// Code's support (part 2's daemon answers it and serves no other).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub one_shot_senders: Vec<InboxOneShotSender>,
+    /// Issue #2347: with [`Self::one_shot_receipts`], the version of the
+    /// guarded dropped-prompt report this daemon applies
+    /// ([`PROMPT_NOT_TAKEN_REPORTS`]). Additive and optional: the transcript
+    /// witness sends no such report to a daemon whose answer lacks it, since
+    /// that daemon would apply it as a plain `Idle`, unguarded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_not_taken: Option<u32>,
 }
 
 impl InboxWaitReply {
@@ -4469,6 +4558,11 @@ pub struct HookCapabilitiesReply {
     /// named it, so a daemon that would ignore them gets no dispatch at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_launch: Option<u32>,
+    /// PRD #2374: this daemon stores agent cards
+    /// ([`DaemonMessage::CardPublish`]) at this version ([`AGENT_CARD`]). The
+    /// CLI sends a publish only on the connection whose answer named it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_card: Option<u32>,
     /// On a refusal (the provenance gate), its stable code and sentence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
@@ -4490,6 +4584,57 @@ pub const EDITOR_FRONTIER: u32 = 1;
 /// A sender requires equality ([`HookCapabilitiesReply::dispatch_launch`]),
 /// never `>=`.
 pub const DISPATCH_LAUNCH: u32 = 1;
+
+/// PRD #2374: the version of [`DaemonMessage::CardPublish`] this build speaks.
+/// A sender requires equality ([`HookCapabilitiesReply::agent_card`]), never
+/// `>=`.
+pub const AGENT_CARD: u32 = 1;
+
+/// PRD #2374: an agent publishes (or replaces) its card's report —
+/// `dot-agent-deck card publish`. Sent only on a connection whose
+/// [`HookCapabilitiesReply`] named [`AGENT_CARD`]; answered with one
+/// [`CardPublishReply`]. Touches neither the inbox nor the work-done update
+/// budget.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CardPublishRequest {
+    pub pane_id: String,
+    /// The agent the sender speaks for (`DOT_AGENT_DECK_AGENT_ID`); refused
+    /// when it is not the one the token attests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    pub report: crate::agent_cards::AgentReport,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// PRD #2374: the answer to a [`CardPublishRequest`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CardPublishReply {
+    pub accepted: bool,
+    /// The card's key, `<pane>/<agent>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// The card's revision after the publish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+impl CardPublishReply {
+    /// A refusal with its stable `code` and the sentence the agent reads.
+    pub fn refused(code: &str, message: &str) -> Self {
+        CardPublishReply {
+            accepted: false,
+            code: Some(code.to_string()),
+            message: Some(message.to_string()),
+            ..Default::default()
+        }
+    }
+}
 
 /// PRD #1666 part 3 (Q35-12; amendment 3 §3.2, amendment 6 §2.3): what the
 /// editor helper reports after its editor phase, as one line on the
@@ -5590,10 +5735,12 @@ mod tests {
                 token: None,
                 command: None,
                 agent: None,
+                dir: None,
             }),
             DaemonMessage::ListTargets(ListTargetsRequest {
                 pane_id: "p".into(),
                 token: None,
+                dir: None,
             }),
             DaemonMessage::RestartRole(RestartRoleSignal {
                 pane_id: "p".into(),

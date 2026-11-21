@@ -2256,7 +2256,7 @@ impl TuiDeck {
     /// so this accessor is Unix-gated like the harness it exposes.
     #[cfg(unix)]
     pub fn subscribe_events(&self) -> EventSub {
-        EventSub::open(&self.attach_socket).expect("open SubscribeEvents stream")
+        EventSub::open(&self.attach_socket, false).expect("open SubscribeEvents stream")
     }
 
     /// Issue #701: type `prompt` into a real interactive Claude Code pane that
@@ -5112,7 +5112,7 @@ pub fn orchestration_pane_left_edge(grid: &str) -> Option<usize> {
 /// when no such expanded box is on the grid.
 ///
 /// The general form of [`orchestration_pane_left_edge`], which is just this
-/// with `"orchestrator"`. Under `PaneLayout::Stacked` only the FOCUSED role's
+/// with `"orchestrator"`. Only the FOCUSED role's
 /// pane is drawn, so a test that has jumped focus to a non-start role has no
 /// `orchestrator` box to anchor on and needs to name the role it focused
 /// (PRD #313's zoom coverage does exactly that). Kept as ONE scan rather than a
@@ -5193,8 +5193,8 @@ pub fn orchestration_pane_column(grid: &str) -> Option<String> {
 /// Crop every row of `grid` to the pane column of the role pane drawn for
 /// `role`, dropping the sidebar to its left. The general form of
 /// [`orchestration_pane_column`], for the same reason
-/// [`role_pane_left_edge`] is the general form of its wrapper: under
-/// `PaneLayout::Stacked` only the FOCUSED role's pane is drawn, so a test that
+/// [`role_pane_left_edge`] is the general form of its wrapper:
+/// only the FOCUSED role's pane is drawn, so a test that
 /// jumped focus to a non-start role has no `orchestrator` box to crop on.
 /// Returns `None` on the same two preconditions as [`role_pane_left_edge`].
 pub fn role_pane_column(grid: &str, role: &str) -> Option<String> {
@@ -5532,9 +5532,10 @@ static CONTAINED_DECK: OnceLock<ContainedDeck> = OnceLock::new();
 ///
 /// A **hard link**, not a symlink: Linux's `/proc/self/exe` resolves a symlink
 /// back to cargo's build directory, while a hard link is reported by the name it
-/// was executed through. A copy is the fallback where the temp root is on
-/// another filesystem than the build directory; it costs the binary's size once
-/// per test process. Either way this changes the pathname the deck reports, and
+/// was executed through. Where the temp root is on another filesystem than the
+/// build directory, the link is taken from one copy per build kept beside the
+/// per-process roots ([`link_shared_copy`], issue #2343), and a copy of its own
+/// is the last fallback. Either way this changes the pathname the deck reports, and
 /// nothing else: the hard link shares the build artifact's inode, and a
 /// same-user agent is not sandboxed from the checkout by never being told its
 /// path. One per process rather than per test HOME, so the
@@ -5547,6 +5548,160 @@ static CONTAINED_DECK: OnceLock<ContainedDeck> = OnceLock::new();
 #[allow(dead_code)]
 pub fn contained_deck_binary() -> &'static Path {
     &contained_deck().binary
+}
+
+/// The directory, beside the per-process roots in the harness temp base, that
+/// holds [`link_shared_copy`]'s one copy of the build under test. Not a
+/// `dad-tests-` name: no process owns it, so `cargo xtask clean-e2e-tmp`, which
+/// decides by the owning PID, leaves it alone.
+const SHARED_DECK_DIR: &str = "dad-deck-under-test";
+
+/// Issue #2343: hard-link `binary` to a copy of `built` shared by every test
+/// process of this temp base, made once per build, for a temp root on another
+/// filesystem than the build directory.
+///
+/// **Why.** nextest runs one process per test, and [`contained_deck`] runs in
+/// each of them. With the build directory and the temp base on different
+/// filesystems, the hard link fails with `EXDEV`, and a copy per process wrote
+/// the whole binary (192 MB in a debug `e2e` build) once per test. That is the
+/// normal layout under `scripts/rwx-export-root.sh`, whose temp base sits on
+/// RWX's task-data XFS while `target/` stays on the task's overlay. Measured in
+/// the RWX sandbox on 2026-11-19, the first wave of 16 test processes of
+/// `tests/e2e_probe_delivery.rs` took dirty memory from 0.8 GB to 5.1 GB in
+/// half a second. That started writeback at once, pressure-stall `io full`
+/// held at about 100 %, and the fixture daemons sat in `fsync`
+/// (`xfs_log_force` → `xlog_wait_on_iclog`) behind it. Their `start-agent`
+/// answers then missed the 10-second wait, and 7 to 11 of the file's 36 tests
+/// failed per run. One copy per build removes that write load, and with it the
+/// stall. The waits are not what was wrong, so none was raised.
+///
+/// The copy is named by a hash of the build's path, then the build's device,
+/// inode, size, modification and change times, so a rebuild gets a fresh copy
+/// rather than reusing a stale one. Making it, and linking from it, happen
+/// under an exclusive `flock` on a file beside it, so the processes that start
+/// together wait for one copy rather than each making their own. Making a copy
+/// removes the copy of an earlier build from the same path, and only that, so
+/// two checkouts testing against one base keep one copy each instead of
+/// evicting each other's. Processes that linked a removed copy keep their own
+/// links, so removing it does not break a run in progress. The
+/// directory must be ours and `0o700`, as the per-process roots are.
+///
+/// `Err` on any step; the caller then copies as before, so this only ever
+/// saves work and never decides what runs.
+#[cfg(unix)]
+fn link_shared_copy(built: &Path, binary: &Path) -> std::io::Result<()> {
+    let base = harness_temp_root().parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "the harness temp root has no parent",
+        )
+    })?;
+    link_through_shared_copy(&base.join(SHARED_DECK_DIR), built, binary)
+}
+
+/// [`link_shared_copy`] with the shared directory given, so the harness's unit
+/// tests can run it in a directory of their own.
+#[cfg(unix)]
+pub(crate) fn link_through_shared_copy(
+    dir: &Path,
+    built: &Path,
+    binary: &Path,
+) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Err(e) if e.kind() != ErrorKind::AlreadyExists => return Err(e),
+        _ => {}
+    }
+    let meta = std::fs::symlink_metadata(dir)?;
+    if !meta.file_type().is_dir() {
+        return Err(Error::other(format!(
+            "{} is not a directory",
+            dir.display()
+        )));
+    }
+    if let Some(why) = private_dir_objection(
+        meta.uid(),
+        meta.permissions().mode() & 0o7777,
+        effective_uid(),
+    ) {
+        return Err(Error::other(format!("{} is {why}", dir.display())));
+    }
+
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(dir.join("lock"))?;
+    // SAFETY: `flock(2)` on a descriptor this function owns; the lock goes
+    // when `lock` is dropped, or with the process.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(Error::last_os_error());
+    }
+
+    let source = std::fs::metadata(built)?;
+    // One slot per build path, so two checkouts or profiles testing against
+    // one base keep a copy each instead of evicting each other's. FNV-1a,
+    // which unlike `DefaultHasher` names a path the same in every toolchain.
+    let slot = {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::fs::canonicalize(built).unwrap_or_else(|_| built.to_path_buf());
+        path.as_os_str()
+            .as_bytes()
+            .iter()
+            .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+            })
+    };
+    let name = format!(
+        "dot-agent-deck-{slot:016x}-{:x}-{:x}-{:x}-{}.{:09}-{}.{:09}",
+        source.dev(),
+        source.ino(),
+        source.size(),
+        source.mtime(),
+        source.mtime_nsec(),
+        source.ctime(),
+        source.ctime_nsec(),
+    );
+    let shared = dir.join(&name);
+    let usable = std::fs::symlink_metadata(&shared).is_ok_and(|m| {
+        m.file_type().is_file() && m.uid() == effective_uid() && m.size() == source.size()
+    });
+    if !usable {
+        // This slot's earlier build, and a copy a process of it died making.
+        let ours = [
+            format!("dot-agent-deck-{slot:016x}-"),
+            format!(".partial-{slot:016x}-"),
+        ];
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let entry_name = entry.file_name();
+            let entry_name = entry_name.to_string_lossy();
+            if ours.iter().any(|prefix| entry_name.starts_with(prefix)) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+        let partial = dir.join(format!(".partial-{slot:016x}-{}", std::process::id()));
+        std::fs::copy(built, &partial)?;
+        std::fs::rename(&partial, &shared)?;
+    }
+    std::fs::hard_link(&shared, binary)?;
+    drop(lock);
+    if std::fs::metadata(binary)?.size() != source.size() {
+        let _ = std::fs::remove_file(binary);
+        return Err(Error::other("the shared copy is not the build's size"));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn link_shared_copy(_built: &Path, _binary: &Path) -> std::io::Result<()> {
+    Err(std::io::ErrorKind::Unsupported.into())
 }
 
 /// The directory [`contain_path`] puts on `PATH`: it holds only a
@@ -5571,7 +5726,8 @@ fn contained_deck() -> &'static ContainedDeck {
         let name = format!("dot-agent-deck{}", std::env::consts::EXE_SUFFIX);
         let binary = dir.join(&name);
         let built = Path::new(deck_binary_path());
-        if std::fs::hard_link(built, &binary).is_err() {
+        if std::fs::hard_link(built, &binary).is_err() && link_shared_copy(built, &binary).is_err()
+        {
             std::fs::copy(built, &binary).unwrap_or_else(|e| {
                 panic!(
                     "link or copy the binary under test {} to {}: {e}",
@@ -8167,6 +8323,8 @@ pub fn import_devin_credentials(test_home: &Path) -> std::io::Result<Vec<String>
 /// `check_*_available()` helpers — extracted so the BoolNot trait
 /// from M2 can be retired (M3.1 auditor Nit 5).
 fn cli_invocable(bin: &str) -> bool {
+    // Issue #2132: a preflight can run before anything else in the harness.
+    assert_agent_bin_pin_usable();
     std::process::Command::new(bin)
         .arg("--version")
         .stdin(std::process::Stdio::null())
@@ -8230,6 +8388,10 @@ pub fn require_real_e2e() -> bool {
 /// checked out, including ones predating this marker.
 #[doc(hidden)]
 pub fn _skip_if_err(result: Result<(), String>) -> bool {
+    // Issue #2132: a `DAD_AGENT_BIN` the constructor refused must not turn into
+    // a skip, or into a pass on whatever agent `PATH` held, in a test whose
+    // preflight runs an agent by name before any other harness call.
+    assert_agent_bin_pin_usable();
     // Issue #502/#785 audit S1. The narrowest choke point that covers every
     // runtime credential preflight: `skip_unless!` is what wraps each
     // `check_*_available` call, so a test that gates on a credential passes
@@ -10089,6 +10251,135 @@ pub unsafe fn detach_before_main() {
     let _ = CLEARED_BEFORE_MAIN.set(leaked);
 }
 
+/// Issue #2132: names a directory of agent executables (`claude`, `codex`,
+/// `opencode`, `pi`, or links to them) that a test run must use before any
+/// other copy on `PATH`. Set it on the command that runs the tests:
+/// `DAD_AGENT_BIN=~/pinned cargo test-e2e-live <filter>`.
+///
+/// It exists because `PATH` order is not the caller's to decide: `devbox run`
+/// puts `~/.local/bin` first inside every devbox layer (`devbox.json`'s
+/// `init_hook`), so a `PATH` prefix set before `devbox run -- cargo …`, or
+/// before a launcher such as `devbox run codex-big` starts the agent that runs
+/// the tests, is put second. An ordinary variable survives those launchers
+/// where a `PATH` prefix does not (`docs/develop/local-run.md` measured the
+/// same for `DAD_DEV_BIN`), and [`pin_agent_bin_before_main`] applies it inside
+/// the test process, after every launcher has had its turn.
+pub const AGENT_BIN_ENV: &str = "DAD_AGENT_BIN";
+
+/// The directory [`pin_agent_bin_before_main`] put first on this process's
+/// `PATH`, or why it refused [`AGENT_BIN_ENV`]'s value. Unset when the
+/// variable was not set.
+static AGENT_BIN_PIN: OnceLock<Result<PathBuf, String>> = OnceLock::new();
+
+/// Issue #2132: put [`AGENT_BIN_ENV`]'s directory first on this test process's
+/// `PATH`, before `main`.
+///
+/// One change to the process's own `PATH` is what makes the pin hold for every
+/// lookup at once. The harness and the test files read `PATH` in many places —
+/// the credential preflights run `claude --version` and `codex login status`
+/// by name, the `--version` readers that print the release under test, every
+/// deck's environment (`INHERIT_PASS`), [`path_with_binary_dir`], and the
+/// `PATH`s the test files build themselves — and the agent a deck spawns
+/// resolves on the deck's `PATH`, so the release the deck latches from the
+/// agent's header is the pinned one too.
+///
+/// A value that is empty or only whitespace is treated as unset. One that is
+/// not an absolute path to an existing directory changes nothing here and is
+/// recorded instead, so that [`assert_agent_bin_pin_usable`] fails the test at
+/// its first harness call or agent preflight: a pin that silently fell back to
+/// `PATH` order would run the very release it was set to avoid.
+///
+/// Called from the constructor [`link!`] defines in each test binary, after
+/// [`detach_before_main`]. Prints nothing: stderr is not promised to be usable
+/// before `main`.
+///
+/// # Safety
+///
+/// Call it only from a pre-main constructor, before any thread exists: it
+/// writes the process environment.
+#[doc(hidden)]
+pub unsafe fn pin_agent_bin_before_main() {
+    let Some(raw) = std::env::var_os(AGENT_BIN_ENV) else {
+        return;
+    };
+    if raw.to_string_lossy().trim().is_empty() {
+        return;
+    }
+    let pin = agent_bin_dir(Path::new(&raw));
+    if let Ok(dir) = &pin {
+        let host = std::env::var_os("PATH").unwrap_or_default();
+        let joined =
+            std::env::join_paths(std::iter::once(dir.clone()).chain(std::env::split_paths(&host)));
+        match joined {
+            // SAFETY: a constructor runs before `main`, so no other thread
+            // exists and nothing can observe the environment mid-write (see
+            // `detach_before_main`).
+            Ok(path) => unsafe { std::env::set_var("PATH", path) },
+            Err(e) => {
+                let _ = AGENT_BIN_PIN.set(Err(format!(
+                    "{AGENT_BIN_ENV}={} cannot be put on PATH: {e}",
+                    dir.display()
+                )));
+                return;
+            }
+        }
+    }
+    let _ = AGENT_BIN_PIN.set(pin);
+}
+
+/// [`pin_agent_bin_before_main`]'s check of [`AGENT_BIN_ENV`]'s value: an
+/// absolute path to an existing directory, returned as given (not
+/// canonicalized, so a pin directory of links resolves each link the way the
+/// spawned agent's `PATH` lookup will).
+pub(crate) fn agent_bin_dir(raw: &Path) -> Result<PathBuf, String> {
+    if !raw.is_absolute() {
+        return Err(format!(
+            "{AGENT_BIN_ENV}={} is not an absolute path; name the directory that holds the \
+             agent executables to run, e.g. {AGENT_BIN_ENV}=$HOME/pinned",
+            raw.display()
+        ));
+    }
+    if !raw.is_dir() {
+        return Err(format!(
+            "{AGENT_BIN_ENV}={} is not a directory; it names the directory that holds the \
+             agent executables to run (`claude`, `codex`, …), not one executable",
+            raw.display()
+        ));
+    }
+    // `contain_path` drops these from every `PATH` the harness gives a deck, so
+    // a pin there would reach the preflight but not the pane: the preflight
+    // would check one agent while the pane ran another.
+    if is_inside_checkout(&resolved_entry(raw)) || is_deck_telemetry_shim_dir(raw) {
+        return Err(format!(
+            "{AGENT_BIN_ENV}={} is inside the checkout or a deck's telemetry shim directory, \
+             which the harness keeps out of every deck's PATH, so the agent a pane runs would \
+             not be the pinned one; put the pin directory outside the checkout",
+            raw.display()
+        ));
+    }
+    Ok(raw.to_path_buf())
+}
+
+/// The directory [`AGENT_BIN_ENV`] pinned first on this process's `PATH`, when
+/// it was set and usable.
+pub fn agent_bin_pin() -> Option<&'static Path> {
+    match AGENT_BIN_PIN.get() {
+        Some(Ok(dir)) => Some(dir.as_path()),
+        _ => None,
+    }
+}
+
+/// Panic when [`AGENT_BIN_ENV`] was set to a value [`pin_agent_bin_before_main`]
+/// refused. Not a skip, even without `DOT_AGENT_DECK_REQUIRE_REAL_E2E`: the
+/// variable is set only by someone asking for a particular agent release, and
+/// running whatever `PATH` holds instead would answer a question they did not
+/// ask.
+pub fn assert_agent_bin_pin_usable() {
+    if let Some(Err(why)) = AGENT_BIN_PIN.get() {
+        panic!("{why}");
+    }
+}
+
 /// Issue #668: the wrapped-agent lifetime bound, in a file small enough for the
 /// test binaries that deliberately do NOT link this harness to
 /// `#[path]`-include on their own. For a binary that links this harness, the
@@ -10132,7 +10423,8 @@ pub mod child_lifetime_bound;
 /// root, so `common::…` and `crate::common::…` paths read as they did when the
 /// harness was a module. It imports [`skip_unless!`] there, where test bodies
 /// call it unqualified. And it defines, **inside the test binary**, the
-/// pre-main constructor that runs [`detach_before_main`] (issue #1473) and
+/// pre-main constructor that runs [`detach_before_main`] (issue #1473),
+/// [`pin_agent_bin_before_main`] (issue #2132) and
 /// [`child_lifetime_bound::pin_before_main`] (issue #678), and hands this
 /// crate the compile-time values only the test crate can see
 /// ([`register_test_crate`]).
@@ -10168,6 +10460,7 @@ macro_rules! link {
                 // exists yet — the condition both functions document.
                 unsafe {
                     $crate::detach_before_main();
+                    $crate::pin_agent_bin_before_main();
                     $crate::child_lifetime_bound::pin_before_main();
                 }
                 $crate::register_test_crate(
@@ -10197,6 +10490,7 @@ ctor::declarative::ctor! {
         // SAFETY: a pre-main constructor, so no other thread exists yet.
         unsafe {
             detach_before_main();
+            pin_agent_bin_before_main();
             child_lifetime_bound::pin_before_main();
         }
         // Cargo builds no `dot-agent-deck` binary for this crate's own tests
@@ -11732,6 +12026,9 @@ pub fn harness_temp_root() -> &'static Path {
             // through, so a binary that names this crate without `link!` fails
             // here, before it can spawn anything.
             assert_linked_before_main();
+            // Issue #2132: a `DAD_AGENT_BIN` the constructor refused fails here,
+            // before the test runs an agent `PATH` order chose instead.
+            assert_agent_bin_pin_usable();
             // Issue #701: this is the choke point every harness temp dir passes
             // through, including headless tests that never obtain a grid, so it
             // is where the panic hook — and with it the load baseline — gets
@@ -12581,7 +12878,7 @@ impl DaemonProc {
     /// live (the initial `KIND_RESP` was read), so no subsequent broadcast is
     /// missed. All polling lives here in the harness (Decision 21).
     pub fn subscribe_events(&self) -> EventSub {
-        EventSub::open(&self.attach_socket).expect("open SubscribeEvents stream")
+        EventSub::open(&self.attach_socket, false).expect("open SubscribeEvents stream")
     }
 }
 
@@ -12605,14 +12902,20 @@ impl EventSub {
     /// `daemon serve`, whose [`DaemonProc::subscribe_events`] is this. Returns
     /// once the subscription is provably live, like that one.
     pub fn subscribe(attach_socket: &Path) -> Self {
-        Self::open(attach_socket).expect("open SubscribeEvents stream")
+        Self::open(attach_socket, false).expect("open SubscribeEvents stream")
+    }
+
+    /// [`Self::subscribe`], opted into the agent-card doorbells (PRD #2374),
+    /// which a plain subscription is never sent.
+    pub fn subscribe_with_agent_cards(attach_socket: &Path) -> Self {
+        Self::open(attach_socket, true).expect("open SubscribeEvents stream")
     }
 
     /// Send a `SubscribeEvents` request, read the `KIND_RESP` ack synchronously
     /// (so the daemon's per-connection broadcast receiver exists before we
     /// return — nothing broadcast afterward can be missed), then spawn a reader
     /// thread collecting `BroadcastMsg::Event` frames.
-    fn open(attach_socket: &Path) -> std::io::Result<Self> {
+    fn open(attach_socket: &Path, agent_cards: bool) -> std::io::Result<Self> {
         use dot_agent_deck::daemon_protocol::{KIND_EVENT, KIND_REQ, KIND_RESP};
         use dot_agent_deck::event::BroadcastMsg;
 
@@ -12620,9 +12923,10 @@ impl EventSub {
         stream.set_read_timeout(Some(Duration::from_millis(200)))?;
         stream.set_write_timeout(Some(Duration::from_secs(5)))?;
 
-        let payload =
-            serde_json::to_vec(&dot_agent_deck::daemon_protocol::AttachRequest::SubscribeEvents)
-                .expect("serialize SubscribeEvents");
+        let payload = serde_json::to_vec(
+            &dot_agent_deck::daemon_protocol::AttachRequest::SubscribeEvents { agent_cards },
+        )
+        .expect("serialize SubscribeEvents");
         let mut header = [0u8; 5];
         header[0] = KIND_REQ;
         header[1..5].copy_from_slice(&(payload.len() as u32).to_be_bytes());
@@ -12917,7 +13221,7 @@ fn count_occurrences(hay: &[u8], needle: &[u8]) -> usize {
 #[cfg(unix)]
 #[allow(dead_code)]
 pub fn subscribe_events_on(socket: &Path) -> EventSub {
-    EventSub::open(socket).expect("open SubscribeEvents stream")
+    EventSub::open(socket, false).expect("open SubscribeEvents stream")
 }
 
 /// Send one `AttachRequest` over a daemon attach socket and read back the

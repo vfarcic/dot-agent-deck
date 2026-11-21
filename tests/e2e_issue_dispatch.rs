@@ -2417,6 +2417,15 @@ fn dispatch_009_multirole_orchestration_cleanup_refcount() {
     let reviewer = daemon
         .wait_for_agent_where(|r| role_in(r, "reviewer", &wt), w())
         .expect("the reviewer role must spawn into the same issue worktree");
+    // A role's record appears before the dispatch has finished starting the
+    // orchestration; a close in that window aborts the whole dispatch ("it
+    // was closed while it was starting"), which removes the worktree for
+    // another reason than this test's (two CI attempts on PR #2407, 0.3 s
+    // after the record). Close only once the dispatch is done.
+    assert!(
+        daemon.wait_for_stderr_contains("dispatched issue #7", w()),
+        "the dispatch must finish starting both roles"
+    );
 
     // Close ONE role (the reviewer). The worktree must SURVIVE — the
     // orchestrator role is still live in it.
@@ -3290,7 +3299,7 @@ fn config_trust_schedule_006_an_unnamed_orchestration_dispatches_once_the_clone_
     );
 }
 
-/// Scenario: Fire an orchestration-shaped `issue_dispatch` task for one open issue of a stub repository. The work journal must open a `launch=schedule_fire` work naming the schedule and, as its child, a `launch=issue_dispatch` work carrying the issue number, repository, `agent/issue-<n>` branch and the issue's worktree, whose dispatched pane is an attempt of that issue's work (or of an orchestration opened under it). Then SIGTERM the daemon by its own pid and start a new one on the same state directory: every attempt that was live must end `how=interrupted`, and walking up its work's `parent` chain must still reach that issue's work with its issue, repository and branch.
+/// Scenario: Fire an orchestration-shaped `issue_dispatch` task for one open issue of a stub repository; the journal must link the schedule, issue and dispatched pane, while the substituted task is saved in the issue's worktree as an ignored, untracked file rather than in the journal. Then SIGTERM the daemon by its own pid and start a new one on the same state directory: the saved task must survive unchanged, every live attempt must end `how=interrupted`, and its parent chain must still reach that issue's work with its issue, repository and branch.
 #[spec("journal/launch/005")]
 #[test]
 fn journal_launch_005_issue_dispatch_opens_one_child_work_per_issue() {
@@ -3355,6 +3364,46 @@ fn journal_launch_005_issue_dispatch_opens_one_child_work_per_issue() {
         "workspace must be the issue's worktree {:?}: {issue}",
         journal::workspace_spellings(&daemon.home, &paths.worktree_dir)
     );
+    let task_path = paths
+        .worktree_dir
+        .join(".dot-agent-deck")
+        .join(format!("dispatch-task-{issue_work}.md"));
+    let task = std::fs::read_to_string(&task_path).unwrap_or_else(|error| {
+        panic!(
+            "scheduled issue dispatch must save its task at {}: {error}",
+            task_path.display()
+        )
+    });
+    assert!(
+        task.contains("JOURNAL-ISSUE-7") && !task.contains("{{issue_number}}"),
+        "the saved task must contain the substituted issue number: {task:?}"
+    );
+    let relative = task_path.strip_prefix(&paths.worktree_dir).unwrap();
+    let ignored = common::fixture_git(&paths.worktree_dir, &daemon.home)
+        .args(["check-ignore", "-q", "--"])
+        .arg(relative)
+        .output()
+        .expect("git check-ignore for the issue's saved task");
+    assert!(
+        ignored.status.success(),
+        "the saved issue task must be ignored and untracked: {ignored:?}"
+    );
+    let status = common::fixture_git(&paths.worktree_dir, &daemon.home)
+        .args(["status", "--porcelain", "--ignored", "--"])
+        .arg(relative)
+        .output()
+        .expect("git status for the issue's saved task");
+    assert!(status.status.success(), "git status: {status:?}");
+    let status_text = String::from_utf8(status.stdout).unwrap();
+    assert!(
+        !status_text.is_empty() && status_text.lines().all(|line| line.starts_with("!! ")),
+        "the task must appear only as ignored, with no tracked or untracked changes: {status_text:?}"
+    );
+    let journal_text = journal::dump(&state);
+    assert!(
+        !journal_text.contains("JOURNAL-ISSUE-"),
+        "the journal must hold no issue task text:\n{journal_text}"
+    );
     let attempt = journal::wait_for(&state, "the issue pane's `attempt_started`", |l| {
         journal::attempt_of(l, &agent.id).cloned()
     });
@@ -3414,6 +3463,16 @@ fn journal_launch_005_issue_dispatch_opens_one_child_work_per_issue() {
         },
     );
     let lines = journal::lines(&state);
+    assert_eq!(
+        std::fs::read_to_string(&task_path).expect("the saved issue task must survive restart"),
+        task,
+        "the saved issue task must remain unchanged after restart"
+    );
+    let journal_text = journal::dump(&state);
+    assert!(
+        !journal_text.contains("JOURNAL-ISSUE-"),
+        "the journal must hold no issue task text after restart:\n{journal_text}"
+    );
     for end in &ends {
         let work = end["work"].as_str().unwrap_or_default();
         let chain = journal::ancestry(&lines, work);

@@ -1043,6 +1043,18 @@ pub struct HookGeneration {
     pub established_ms: i64,
 }
 
+/// Issue #2389: what changes on a card when the deck applies a frame to it,
+/// as [`AppState::agent_status_and_activity`] reads it. Either half moving is
+/// activity: [`SessionState::last_activity`] moves for any frame stamped later
+/// than the card's newest, and [`SessionState::last_native_hook_at`] for every
+/// frame of the agent's own hooks whatever its stamp, so an agent whose clock
+/// lags a stamp the card already holds still counts as active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CardActivity {
+    pub newest_stamp: DateTime<Utc>,
+    pub native_hook_at: Option<std::time::Instant>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionState {
     pub session_id: String,
@@ -1868,6 +1880,16 @@ impl std::fmt::Debug for AgentOwnershipOracle {
     }
 }
 
+/// Issue #2347: the Claude Code prompt that started a pane's current turn
+/// ([`AppState::admit_prompt_not_taken`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PromptTurnOpen {
+    /// The prompt's nonce ([`crate::event::PROMPT_TURN_METADATA_KEY`]).
+    nonce: String,
+    /// The session its `Thinking` reported.
+    session_id: String,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct AppState {
     pub sessions: HashMap<String, SessionState>,
@@ -1878,6 +1900,10 @@ pub struct AppState {
     /// it. Forgotten with the pane, so it does not grow by one entry per pane
     /// id ever seen.
     pane_event_epochs: HashMap<String, u64>,
+    /// Issue #2347: per pane, the Claude Code prompt whose `Thinking` started
+    /// the turn the card now shows, while nothing else has arrived from the
+    /// pane since ([`Self::admit_prompt_not_taken`]). Daemon-side only.
+    prompt_turns: HashMap<String, PromptTurnOpen>,
     /// PRD #1666 part 2 (`inbox/doorbell/008`): per pane, what each recent
     /// agent generation's OWN hooks have shown of its readiness for input,
     /// newest generation first and at most [`MAX_READINESS_GENERATIONS`] of
@@ -1914,6 +1940,12 @@ pub struct AppState {
     /// a failed integration refresh among them — while it spawns it, before
     /// the client has its card; the surfacing start carries them.
     pane_inboxes: HashMap<String, PaneInbox>,
+    /// PRD #2119: per pane, the agent the daemon last listed on it and whether
+    /// that agent's project already holds a `.dot-agent-deck.toml`
+    /// ([`crate::agent_pty::AgentRecord::project_config_exists`]), as of the
+    /// last listing this client read ([`Self::take_project_config_flags`]).
+    /// No entry is unknown. Forgotten with the pane.
+    pane_project_config: HashMap<String, (String, bool)>,
     /// PRD #1666 part 3 (Q35-20e): the daemon's latest word on held typing,
     /// by pane, at most [`MAX_PENDING_INPUT_HELD`] (the oldest word goes
     /// first), kept apart from the pane's account, which a close drops. A
@@ -3156,7 +3188,7 @@ fn is_frame_breaking(c: char) -> bool {
 /// invisible marks that reorder or hide surrounding text without changing a
 /// byte of it. Split out for [`frame_untrusted_report_for_file`], which keeps a
 /// report's brackets and line structure but must not keep these.
-fn rewrites_how_text_reads(c: char) -> bool {
+pub(crate) fn rewrites_how_text_reads(c: char) -> bool {
     c.is_control()
         || matches!(
             c,
@@ -4646,6 +4678,71 @@ impl AppState {
         self.trust_requests = Some(list);
     }
 
+    /// Issue #2347: the daemon's guard on a Claude Code prompt that another
+    /// `UserPromptSubmit` hook blocked after the deck's own hook reported it.
+    /// Called for every event the daemon admits from a producer, before it
+    /// is applied; `false` means drop the event unapplied.
+    ///
+    /// A `Thinking` carrying [`crate::event::PROMPT_TURN_METADATA_KEY`],
+    /// reported by the pane's own agent while its card was not busy, opens
+    /// that prompt's turn. Any other event from the pane, save the daemon's
+    /// own frames and the wrapper's output readings, closes it. The witness's
+    /// `Idle` carrying [`crate::event::PROMPT_NOT_TAKEN_METADATA_KEY`] is
+    /// admitted only while the turn its nonce opened is still open, so it
+    /// ends no turn the prompt did not start: one already under way when the
+    /// prompt arrived, or one something else has reported on since.
+    pub fn admit_prompt_not_taken(&mut self, event: &AgentEvent, unproven: bool) -> bool {
+        let Some(pane_id) = event.pane_id.as_deref() else {
+            return event.prompt_not_taken().is_none();
+        };
+        if let Some(nonce) = event.prompt_not_taken() {
+            // A report for another prompt, a late one included, leaves the
+            // open turn alone: that prompt's own report may still come.
+            let admitted = !unproven
+                && event.event_type == EventType::Idle
+                && !event.is_from_subagent()
+                && self
+                    .prompt_turns
+                    .get(pane_id)
+                    .is_some_and(|open| open.nonce == nonce && open.session_id == event.session_id);
+            if admitted {
+                self.prompt_turns.remove(pane_id);
+            }
+            return admitted;
+        }
+        if event.is_daemon_synthetic() || event.is_wrapper_output_classified() {
+            return true;
+        }
+        let opens = !unproven
+            && event.event_type == EventType::Thinking
+            && !event.is_from_subagent()
+            && self.pane_status(pane_id).is_some_and(|status| {
+                !matches!(
+                    status,
+                    SessionStatus::Thinking | SessionStatus::Working | SessionStatus::Compacting
+                )
+            });
+        match event
+            .metadata
+            .get(crate::event::PROMPT_TURN_METADATA_KEY)
+            .filter(|_| opens)
+        {
+            Some(nonce) => {
+                self.prompt_turns.insert(
+                    pane_id.to_string(),
+                    PromptTurnOpen {
+                        nonce: nonce.clone(),
+                        session_id: event.session_id.clone(),
+                    },
+                );
+            }
+            None => {
+                self.prompt_turns.remove(pane_id);
+            }
+        }
+        true
+    }
+
     /// The status of the session currently bound to `pane_id`, read the way
     /// [`Self::pane_session_id`] picks that session.
     fn pane_status(&self, pane_id: &str) -> Option<SessionStatus> {
@@ -5649,25 +5746,42 @@ impl ProjectConfigs {
 
     /// PRD #1885: the refusal for spawning from orchestration `name` of `dir`'s
     /// config, logged at warn under `path`, or `None` when it is approved.
-    pub(crate) fn trust_refusal(&self, path: &str, dir: &str, name: &str) -> Option<String> {
+    ///
+    /// `caller` is the agent whose `path` (`pane restart`, `pane spawn`,
+    /// `delegate`) this is, told the answer once the user answers the
+    /// in-deck request (issue #2348).
+    pub(crate) fn trust_refusal(
+        &self,
+        path: &str,
+        dir: &str,
+        name: &str,
+        caller: Option<&crate::trust_requests::RefusedCaller>,
+    ) -> Option<String> {
         let check = self.trust_check(dir, name)?;
         crate::project_trust::log_refusal(path, &check);
         // Issue #2330: in the serving daemon, ask the attached clients for
         // the approval, and say so.
-        crate::trust_requests::refusal_for(&check, path)
+        crate::trust_requests::refusal_for(&check, path, caller)
     }
 
     /// PRD #1885: [`Self::trust_refusal`] for a `delegate` sent from
     /// `caller_pane`, logged at warn naming that pane, so the daemon log says
     /// which orchestrator's delegate was refused.
+    ///
+    /// `caller_agent` is the agent in `caller_pane`, when one is registered
+    /// there: it is told the answer once the user answers the in-deck request
+    /// (issue #2348).
     pub(crate) fn delegate_trust_refusal(
         &self,
         caller_pane: &str,
+        caller_agent: Option<&str>,
         dir: &str,
         name: &str,
     ) -> Option<String> {
         let check = self.trust_check(dir, name)?;
-        let refusal = crate::trust_requests::refusal_for(&check, "delegate")?;
+        let caller = caller_agent
+            .map(|agent| crate::trust_requests::RefusedCaller::new(caller_pane, agent, "delegate"));
+        let refusal = crate::trust_requests::refusal_for(&check, "delegate", caller.as_ref())?;
         warn!(
             pane_id = %escape_id_for_log(caller_pane),
             orchestration = %escape_id_for_log(name),
@@ -6283,7 +6397,12 @@ async fn dispatch_one_owned(
     let role_config_indexed = match (cwd.as_deref(), orchestration.as_ref()) {
         (Some(c), Some(identity)) => {
             let configs = ProjectConfigs::load(vec![c.to_owned()]).await;
-            trust_refusal = configs.trust_refusal("delegate", c, identity.name());
+            // Issue #2348: the orchestrator whose delegate this is hears the
+            // in-deck answer.
+            let caller = orchestrator_agent_id.as_deref().map(|agent| {
+                crate::trust_requests::RefusedCaller::new(&orchestrator_pane_id, agent, "delegate")
+            });
+            trust_refusal = configs.trust_refusal("delegate", c, identity.name(), caller.as_ref());
             lookup_orchestration_role_indexed(&configs, c, identity.name(), &target_role)
         }
         _ => None,
@@ -8383,6 +8502,18 @@ impl AppState {
     }
 
     pub fn agent_status(&self, agent_id: &str, pane_id: &str) -> Option<SessionStatus> {
+        self.agent_status_and_activity(agent_id, pane_id)
+            .map(|(status, _)| status)
+    }
+
+    /// Issue #2389: [`Self::agent_status`] and the same card's
+    /// [`CardActivity`], which the doorbell reads to tell an agent still at
+    /// work from a busy reading nothing has refreshed.
+    pub fn agent_status_and_activity(
+        &self,
+        agent_id: &str,
+        pane_id: &str,
+    ) -> Option<(SessionStatus, CardActivity)> {
         self.sessions
             .values()
             .filter(|s| {
@@ -8393,7 +8524,15 @@ impl AppState {
                     .cmp(&b.last_activity)
                     .then_with(|| a.session_id.cmp(&b.session_id))
             })
-            .map(|s| s.status.clone())
+            .map(|s| {
+                (
+                    s.status.clone(),
+                    CardActivity {
+                        newest_stamp: s.last_activity,
+                        native_hook_at: s.last_native_hook_at,
+                    },
+                )
+            })
     }
 
     /// Register a pane ID as managed by our app.
@@ -8777,6 +8916,7 @@ impl AppState {
         self.waiting_superseded_sessions.remove(pane_id);
         self.pane_event_epochs.remove(pane_id);
         self.pane_doorbell_ready.remove(pane_id);
+        self.prompt_turns.remove(pane_id);
     }
 
     /// Issue #697: apply the daemon's announcement that it evicted the unproven
@@ -9465,11 +9605,13 @@ impl AppState {
         // reused pane id surfaces with its own.
         self.pane_surfaced_agent_seq.remove(pane_id);
         self.pane_inboxes.remove(pane_id);
+        self.pane_project_config.remove(pane_id);
         // PRD #1666: and its doorbell epoch. A successor restarting the count
         // at 0 cannot satisfy an admission captured for the previous agent:
         // the doorbell's writer re-checks the agent that owns the pane.
         self.pane_event_epochs.remove(pane_id);
         self.pane_doorbell_ready.remove(pane_id);
+        self.prompt_turns.remove(pane_id);
         if !self
             .sessions
             .values()
@@ -10158,6 +10300,37 @@ impl AppState {
         // PRD #1666 §2.8: the reply's inbox counts are each card's new
         // starting point, now that its live fields are.
         self.take_inbox_snapshot(records);
+        self.take_project_config_flags(records);
+    }
+
+    /// PRD #2119: the daemon's word, from a listing of its agents, on which
+    /// agents' projects already hold a `.dot-agent-deck.toml`. Each listed pane
+    /// takes its record's value; a record that does not say (no cwd, an older
+    /// daemon) leaves the pane unknown.
+    pub fn take_project_config_flags(&mut self, records: &[crate::agent_pty::AgentRecord]) {
+        for record in records {
+            let Some(pane_id) = record.pane_id_env.as_deref() else {
+                continue;
+            };
+            match record.project_config_exists {
+                Some(exists) => {
+                    self.pane_project_config
+                        .insert(pane_id.to_string(), (record.id.clone(), exists));
+                }
+                None => {
+                    self.pane_project_config.remove(pane_id);
+                }
+            }
+        }
+    }
+
+    /// PRD #2119: whether the daemon last reported that `session`'s project
+    /// already holds a `.dot-agent-deck.toml`. `None` when it has not said for
+    /// this card's agent.
+    pub fn project_config_exists(&self, session: &SessionState) -> Option<bool> {
+        let pane_id = session.pane_id.as_deref()?;
+        let (agent_id, exists) = self.pane_project_config.get(pane_id)?;
+        (session.agent_id.as_deref() == Some(agent_id.as_str())).then_some(*exists)
     }
 
     /// PRD #1666 §2.8: the daemon's agents, read in order with the event
@@ -10404,20 +10577,20 @@ impl AppState {
         })
     }
 
-    /// PRD #1666 part 3, round 5-wake (Q6): every pane whose current agent
-    /// generation the deck holds the doorbell for, with the words the
-    /// deck-wide attention item gives its hold
-    /// ([`crate::inbox_display::CardInbox::attention_words`]). Read from the
-    /// pane's account, which a generation change replaces, so a predecessor's
-    /// hold never marks its successor.
-    pub fn held_inbox_panes(&self) -> std::collections::BTreeMap<&str, String> {
-        self.pane_inboxes
-            .iter()
-            .filter_map(|(pane_id, inbox)| {
-                inbox
-                    .card()
-                    .attention_words()
-                    .map(|words| (pane_id.as_str(), words))
+    /// Issue #2387: every card the deck holds a message for, with the words
+    /// its `held` marker and the deck-wide attention item give the hold
+    /// ([`crate::inbox_display::CardInbox::attention_words`]). Read from each
+    /// card's own inbox ([`SessionState::card_inbox`]), the one that draws the
+    /// marker, so the header can never count an agent no card marks: a pane
+    /// account with no card on screen is not counted.
+    pub fn held_cards(&self) -> Vec<(&SessionState, String)> {
+        self.sessions
+            .values()
+            .filter_map(|session| {
+                session
+                    .card_inbox()
+                    .and_then(|inbox| inbox.attention_words())
+                    .map(|words| (session, words))
             })
             .collect()
     }
@@ -11338,8 +11511,10 @@ impl AppState {
         self.managed_pane_ids.remove(pane_id);
         self.pane_surfaced_agent_seq.remove(pane_id);
         self.pane_inboxes.remove(pane_id);
+        self.pane_project_config.remove(pane_id);
         self.pane_event_epochs.remove(pane_id);
         self.pane_doorbell_ready.remove(pane_id);
+        self.prompt_turns.remove(pane_id);
         self.pane_role_map.remove(pane_id);
         self.pane_cwd_map.remove(pane_id);
         self.orchestrator_pane_ids.remove(pane_id);
@@ -11685,6 +11860,12 @@ impl AppState {
         // refusal delivers nothing and the orchestrator's `delegate` fails with
         // the reason and the command that approves it.
         if let Some(identity) = orchestration.as_ref() {
+            // Issue #2348 (PR #2351 review): the agent the sender's capability
+            // attested, not whoever holds the pane after the config read; the
+            // pane's current agent only for an unattested call.
+            let caller_agent = sender_agent_id
+                .map(str::to_owned)
+                .or_else(|| registry.pane_current_agent_id(&signal.pane_id));
             let mut checked: Vec<&str> = Vec::new();
             for (_, pane_id) in &targets {
                 let Some(cwd) = self.pane_cwd_map.get(pane_id).map(String::as_str) else {
@@ -11694,9 +11875,12 @@ impl AppState {
                     continue;
                 }
                 checked.push(cwd);
-                if let Some(refusal) =
-                    configs.delegate_trust_refusal(&signal.pane_id, cwd, identity.name())
-                {
+                if let Some(refusal) = configs.delegate_trust_refusal(
+                    &signal.pane_id,
+                    caller_agent.as_deref(),
+                    cwd,
+                    identity.name(),
+                ) {
                     return DelegateResponse {
                         error: Some(refusal),
                         ..Default::default()
@@ -12444,7 +12628,21 @@ pub async fn handle_restart_role_with_state(
         // only from an approved orchestration — judged on the same read whose
         // command the restart would run.
         if let (Some(c), Some(identity)) = (cwd.as_deref(), orchestration.as_ref())
-            && let Some(refusal) = configs.trust_refusal("pane restart", c, identity.name())
+            && let Some(refusal) = configs.trust_refusal(
+                "pane restart",
+                c,
+                identity.name(),
+                registry
+                    .pane_current_agent_id(&signal.pane_id)
+                    .map(|agent| {
+                        crate::trust_requests::RefusedCaller::new(
+                            &signal.pane_id,
+                            agent,
+                            "pane restart",
+                        )
+                    })
+                    .as_ref(),
+            )
         {
             return RestartRoleResponse {
                 error: Some(refusal),
@@ -12721,7 +12919,21 @@ pub async fn handle_spawn_role_with_state(
         // PRD #1885: spawning a role runs its command, unattended, so only from
         // an approved orchestration — judged on the read the spawn would run.
         if let Some(c) = cwd.as_deref()
-            && let Some(refusal) = configs.trust_refusal("pane spawn", c, identity.name())
+            && let Some(refusal) = configs.trust_refusal(
+                "pane spawn",
+                c,
+                identity.name(),
+                registry
+                    .pane_current_agent_id(&signal.pane_id)
+                    .map(|agent| {
+                        crate::trust_requests::RefusedCaller::new(
+                            &signal.pane_id,
+                            agent,
+                            "pane spawn",
+                        )
+                    })
+                    .as_ref(),
+            )
         {
             return SpawnRoleResponse {
                 error: Some(refusal),
@@ -13430,6 +13642,11 @@ impl AppState {
         // ever lands on a card that already exists.
         if let Some(pull_request) = event.pull_request_report() {
             self.apply_pull_request_report(&event, pull_request);
+            return AppliedEvent::Rejected;
+        }
+        // PRD #2374: an agent card's doorbell tells clients to re-read the
+        // cards; it is about no session and changes none.
+        if event.event_type == EventType::AgentCard {
             return AppliedEvent::Rejected;
         }
         // Issue #697: the daemon evicted an outside agent's card to stay within
@@ -14417,6 +14634,15 @@ impl AppState {
                     )
                 })
             });
+            // Issue #2246: the deck's notice standing on the ending card. An
+            // agent's final `SessionEnd` can be applied after the notice saying
+            // how its pane ended, and the placeholder below must not lose it:
+            // an exited agent has no later report to explain its card.
+            let ended_notice = self
+                .sessions
+                .get(&event.session_id)
+                .and_then(|session| session.delivery_notice())
+                .map(str::to_string);
             // Issue #1678 (R2): the ending spawn's card's newest background copy,
             // scoped to that spawn, so the placeholder restored below can keep
             // the replay barrier (see the restore).
@@ -14472,6 +14698,17 @@ impl AppState {
                     && let Some(placeholder) = self.sessions.get_mut(&placeholder_id)
                 {
                     placeholder.display_name = Some(name);
+                }
+                // Issue #2246: the same agent's placeholder keeps the deck's
+                // notice, and its Error, until the agent reports again — its
+                // next conversation's start ends it as any newer report does.
+                if let Some(notice) = ended_notice
+                    && let Some(placeholder) = self.sessions.get_mut(&placeholder_id)
+                    && placeholder.agent_id.is_some()
+                    && placeholder.agent_id == agent_id_of_ended
+                {
+                    placeholder.status = SessionStatus::Error;
+                    push_delivery_notice_carrier(placeholder, notice);
                 }
                 // Issue #1678 (R2): the same spawn's restored placeholder holds
                 // the ending card's newest copy, so an older snapshot or frame
@@ -15473,6 +15710,8 @@ impl AppState {
             }
             // PRD #1401: returned early at the top of `apply_event_unsettled`.
             EventType::PullRequest => false,
+            // PRD #2374: returned early at the top of `apply_event_unsettled`.
+            EventType::AgentCard => false,
             EventType::SessionEnd => unreachable!(),
         };
         // Issue #714: the reason exists only beside the status it explains.
@@ -16062,7 +16301,7 @@ mod tests {
                 NotBesideTheRecordedContext,
             ),
             (
-                "the mirror",
+                "the retired fixed path",
                 "a0",
                 std::path::PathBuf::from("/p/.dot-agent-deck/orchestrator-context.md"),
                 NotBesideTheRecordedContext,
@@ -18814,6 +19053,48 @@ mod tests {
     /// shell-activity pair) landing on the same card later moves
     /// `last_activity` but leaves it where it was, so it cannot vouch for an
     /// OpenCode whose plugin stopped reporting.
+    /// Issue #2389 (Qodo on PR #2393): a hook whose producer stamp is behind
+    /// the card's newest leaves `last_activity` where it was, and still moves
+    /// the card's activity the doorbell's quiet clock reads, through its
+    /// arrival.
+    #[test]
+    fn a_hook_stamped_behind_the_card_still_moves_its_activity() {
+        let event = |event_type, timestamp| AgentEvent {
+            session_id: "s1".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp,
+            user_prompt: None,
+            metadata: HashMap::new(),
+            pane_id: Some("orchestrator".to_string()),
+            agent_id: Some("agent-1".to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            background: None,
+            background_revision: None,
+        };
+        let mut state = AppState::default();
+        state.register_pane("orchestrator".to_string());
+        let ahead = Utc::now() + chrono::Duration::minutes(5);
+        state.apply_event(event(EventType::SessionStart, ahead));
+        state.apply_event(event(EventType::Thinking, ahead));
+        let (status, first) = state
+            .agent_status_and_activity("agent-1", "orchestrator")
+            .expect("the card");
+        assert_eq!(status, SessionStatus::Thinking);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        state.apply_event(event(EventType::ToolStart, Utc::now()));
+        let (_, second) = state
+            .agent_status_and_activity("agent-1", "orchestrator")
+            .expect("the card");
+        assert_eq!(second.newest_stamp, first.newest_stamp, "the stamp stays");
+        assert_ne!(second, first, "the hook's arrival is activity");
+    }
+
     #[test]
     fn only_a_native_frame_moves_the_last_native_hook_instant() {
         let event = |event_type| AgentEvent {
@@ -23383,6 +23664,56 @@ mod tests {
         assert_eq!(card.live_snapshot().delivery_notice, None);
     }
 
+    /// Issue #2246: an agent's final `SessionEnd` can be applied after the
+    /// deck's notice saying how its pane ended. The placeholder that replaces
+    /// the ended card keeps the notice, so an exited agent's card still says
+    /// why its message was not delivered; the same agent's next conversation
+    /// ends it, as any newer report of the agent's does.
+    #[test]
+    fn a_delivery_notice_outlives_the_session_end_until_the_agent_reports_again() {
+        let notice = "not delivered: the command started in the agent's pane exited (code 7) before taking this message";
+        let mut state = AppState::default();
+        state.register_pane("pane-q".to_string());
+        state.apply_event(quota_event(EventType::SessionStart, 1));
+        let mut report = quota_event(EventType::Error, 2);
+        report.agent_type = AgentType::None;
+        report.tool_name = None;
+        report.tool_detail = Some(notice.to_string());
+        report.metadata.insert(
+            crate::event::DELIVERY_NOTICE_METADATA_KEY.to_string(),
+            notice.to_string(),
+        );
+        state.apply_daemon_report_event(report);
+        state.apply_event(quota_event(EventType::SessionEnd, 3));
+        let card = |state: &AppState| {
+            state
+                .sessions
+                .values()
+                .find(|s| s.pane_id.as_deref() == Some("pane-q"))
+                .cloned()
+                .expect("the pane keeps a card")
+        };
+        let placeholder = card(&state);
+        assert_eq!(placeholder.delivery_notice(), Some(notice));
+        assert_eq!(
+            placeholder.live_snapshot().delivery_notice.as_deref(),
+            Some(notice)
+        );
+
+        let mut next = quota_event(EventType::SessionStart, 4);
+        next.session_id = "gen-q-2".to_string();
+        state.apply_event(next);
+        assert_eq!(card(&state).delivery_notice(), None);
+
+        // A card the deck had no notice on gets none from the end.
+        let mut quiet = AppState::default();
+        quiet.register_pane("pane-q".to_string());
+        quiet.apply_event(quota_event(EventType::SessionStart, 1));
+        quiet.apply_event(quota_event(EventType::SessionEnd, 2));
+        assert_eq!(card(&quiet).delivery_notice(), None);
+        assert_ne!(card(&quiet).status, SessionStatus::Error);
+    }
+
     /// PRD #1666 long-turn delivery: the daemon's "delivered after all" event
     /// lifts the card's not-delivered Error to Thinking, and only that Error:
     /// an Error the agent reported, or a card in any other status, keeps its
@@ -26070,5 +26401,139 @@ mod tests {
                 .map(|e| &e.tool_detail),
             "the most recently active card keeps its newest report whole"
         );
+    }
+
+    /// Issue #2347: a Claude Code event from pane `p` for the prompt-turn
+    /// guard, with `metadata` added.
+    fn prompt_turn_event(event_type: EventType, metadata: &[(&str, &str)]) -> AgentEvent {
+        AgentEvent {
+            session_id: "s".into(),
+            agent_type: AgentType::ClaudeCode,
+            event_type,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: metadata
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+            pane_id: Some("p".into()),
+            agent_id: Some("a".into()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            background: None,
+            background_revision: None,
+        }
+    }
+
+    /// Issue #2347: what the daemon does with one event: the guard first,
+    /// then the apply. Answers whether it was applied.
+    fn ingest_prompt_turn(state: &mut AppState, event: AgentEvent, unproven: bool) -> bool {
+        if !state.admit_prompt_not_taken(&event, unproven) {
+            return false;
+        }
+        state.apply_event(event);
+        true
+    }
+
+    /// Scenario: An idle Claude Code card gets a prompt's `Thinking` carrying a nonce, and then the witness's `Idle` naming that nonce: the Idle is applied and the card reads Idle, and a second copy of it is refused. A prompt that arrives while the card is already busy, one followed by another report, a report naming another nonce or session, and an unproven one are each refused, and the card keeps reading busy; a late report for an earlier prompt does not stop the newer prompt's own report from ending its turn.
+    #[test]
+    fn a_dropped_prompt_ends_only_the_turn_it_started() {
+        use crate::event::{
+            PROMPT_NOT_TAKEN_METADATA_KEY as GONE, PROMPT_TURN_METADATA_KEY as TURN,
+        };
+        let idle_card = || {
+            let mut state = AppState::default();
+            for event_type in [EventType::SessionStart, EventType::Idle] {
+                assert!(ingest_prompt_turn(
+                    &mut state,
+                    prompt_turn_event(event_type, &[]),
+                    false
+                ));
+            }
+            assert_eq!(state.pane_status("p"), Some(SessionStatus::Idle));
+            state
+        };
+        let thinking = |nonce: &str| prompt_turn_event(EventType::Thinking, &[(TURN, nonce)]);
+        let gone = |nonce: &str| prompt_turn_event(EventType::Idle, &[(GONE, nonce)]);
+
+        let mut state = idle_card();
+        assert!(ingest_prompt_turn(&mut state, thinking("n1"), false));
+        assert_eq!(state.pane_status("p"), Some(SessionStatus::Thinking));
+        assert!(ingest_prompt_turn(&mut state, gone("n1"), false));
+        assert_eq!(state.pane_status("p"), Some(SessionStatus::Idle));
+        assert!(
+            !ingest_prompt_turn(&mut state, gone("n1"), false),
+            "a turn ends once"
+        );
+
+        // A prompt that arrived mid-turn started nothing.
+        let mut state = idle_card();
+        assert!(ingest_prompt_turn(
+            &mut state,
+            prompt_turn_event(EventType::Thinking, &[]),
+            false
+        ));
+        assert!(ingest_prompt_turn(&mut state, thinking("n2"), false));
+        assert!(!ingest_prompt_turn(&mut state, gone("n2"), false));
+        assert_eq!(state.pane_status("p"), Some(SessionStatus::Thinking));
+
+        // Anything the agent reported since closes the prompt's turn.
+        let mut state = idle_card();
+        assert!(ingest_prompt_turn(&mut state, thinking("n3"), false));
+        assert!(ingest_prompt_turn(
+            &mut state,
+            prompt_turn_event(EventType::ToolStart, &[]),
+            false
+        ));
+        assert!(!ingest_prompt_turn(&mut state, gone("n3"), false));
+        assert_eq!(state.pane_status("p"), Some(SessionStatus::Working));
+
+        // The daemon's own frames leave it open.
+        let mut state = idle_card();
+        assert!(ingest_prompt_turn(&mut state, thinking("n4"), false));
+        assert!(state.admit_prompt_not_taken(&prompt_turn_event(EventType::ShellIdle, &[]), false));
+        assert!(ingest_prompt_turn(&mut state, gone("n4"), false));
+        assert_eq!(state.pane_status("p"), Some(SessionStatus::Idle));
+
+        // Another nonce, another session, a subagent's or an unproven report
+        // names no turn this prompt started.
+        let mut other_session = gone("n5");
+        other_session.session_id = "other".into();
+        let mut subagent = gone("n5");
+        subagent
+            .metadata
+            .insert(crate::event::SUBAGENT_ID_METADATA_KEY.into(), "x".into());
+        for (report, unproven) in [
+            (gone("n6"), false),
+            (other_session, false),
+            (subagent, false),
+            (gone("n5"), true),
+        ] {
+            let mut state = idle_card();
+            assert!(ingest_prompt_turn(&mut state, thinking("n5"), false));
+            assert!(
+                !ingest_prompt_turn(&mut state, report.clone(), unproven),
+                "{report:?}"
+            );
+            assert_eq!(state.pane_status("p"), Some(SessionStatus::Thinking));
+        }
+
+        // An unproven prompt opens nothing.
+        let mut state = idle_card();
+        assert!(ingest_prompt_turn(&mut state, thinking("n7"), true));
+        assert!(!ingest_prompt_turn(&mut state, gone("n7"), false));
+
+        // A late report for an earlier prompt leaves the newer prompt's turn
+        // open for that prompt's own report (PR #2405 review).
+        let mut state = idle_card();
+        assert!(ingest_prompt_turn(&mut state, thinking("n8"), false));
+        assert!(!ingest_prompt_turn(&mut state, gone("late"), false));
+        assert_eq!(state.pane_status("p"), Some(SessionStatus::Thinking));
+        assert!(ingest_prompt_turn(&mut state, gone("n8"), false));
+        assert_eq!(state.pane_status("p"), Some(SessionStatus::Idle));
     }
 }

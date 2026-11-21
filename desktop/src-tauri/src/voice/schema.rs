@@ -137,7 +137,8 @@ pub const TOOL_INSTRUCTIONS: &str = "Pick the Agent Deck action the user asked f
     about each agent: `mode` (such as dispatcher), `agent_type`, `directory` (its \
     working directory's name), `orchestration` (its run's title) and `newest_rank` \
     (1 is the agent that started last); `agents_daemon` is the daemon they are all \
-    on. A user refers to an agent by state as readily as by name — \"the one that \
+    on, and `agents_on_other_daemons`, when present, lists each other daemon's \
+    agents the same way under its `daemon` label. A user refers to an agent by state as readily as by name — \"the one that \
     is stuck\" — so resolve such a reference against those fields and answer with \
     that agent's `label`. For an agent the user named by mode, agent type, \
     directory, orchestration, daemon, start order or what it was asked to do — \
@@ -180,6 +181,41 @@ pub const TOOL_INSTRUCTIONS: &str = "Pick the Agent Deck action the user asked f
     asked to stop, however urgently. A request to start something — launch, start, \
     create, run — is answered by an action that starts or opens it, however urgently it is said. Write no prose; the app writes what the \
     user reads.";
+
+/// The description of the answer's `steps` field (PRD #1184): how to answer
+/// an utterance that asks for two or three things one after another.
+///
+/// # It lives in the schema, never in the system prompt
+///
+/// PRD #1184's M1 measured two places for it. With these rules in the system
+/// prompt (and its "ONE action" preamble changed) single commands regressed
+/// on the default backend: "Close the agent" became a stop in 6 of 6 runs
+/// against 0 of 5 unpatched (2026-09-29). Carried only as this field's
+/// description, the system prompt byte for byte unchanged, the regression
+/// was smaller then, and on the 345-phrase manifest of 2026-11-19 it was not
+/// measurable at all: 4.0 failures per full run against 3.8 unpatched, five
+/// runs each side by side, the same fixtures failing in both. So a change
+/// here is a change to every utterance's answer, and is re-measured against
+/// the whole manifest before it ships.
+///
+/// # The model marks steps; the app decides what a chain is
+///
+/// The rules below ask for the shape. None of them is relied on:
+/// [`super::chain`] holds every `said` to the transcript, refuses a sentence
+/// with a word of contrast in it, and checks each step on its own words, so
+/// a model that splits what it should not still runs nothing it was not
+/// asked for.
+pub const CHAIN_INSTRUCTIONS: &str = "`steps`: almost every utterance asks for ONE thing — \
+    answer it with `action` and `params` as above and set `steps` to null. Only when one \
+    utterance asks for TWO OR THREE separate actions to be done one after another (\"open \
+    the overview and then the tester\") ALSO list them in `steps`, in the order they were \
+    said, at most three, and set `action` and `params` to those of the FIRST step. Each step \
+    has its own `action` and `params`, and `said`: the words of the utterance that asked for \
+    that step, COPIED from the utterance exactly — contiguous, in the utterance's order, no \
+    word added, dropped, changed or reordered — and never including the joining words \
+    between two steps (\"and\", \"then\", \"and then\"). Words that offer ALTERNATIVES \
+    or EXCLUSIONS (\"or\", \"not\", \"instead\", \"rather than\", \"except\") never \
+    make two steps: that is one action, or `none`.";
 
 /// One row as the model sees it, with its availability on the screen the
 /// request was built for.
@@ -426,7 +462,17 @@ mod tests {
                 "remind_star_later".to_string(),
                 "dismiss_star_prompt".to_string(),
                 "stop_agent".to_string(),
+                "generate_config".to_string(),
                 "close_orchestration".to_string(),
+                "set_overview_mode".to_string(),
+                "show_agent_card".to_string(),
+                "next_agent_card".to_string(),
+                "previous_agent_card".to_string(),
+                "next_needs_you_card".to_string(),
+                "filter_needs_you_cards".to_string(),
+                "close_agent_card".to_string(),
+                "run_card_action".to_string(),
+                "reply_to_agent_card".to_string(),
                 "none".to_string(),
             ]
         );
@@ -526,7 +572,17 @@ mod tests {
                 "remind_star_later",
                 "dismiss_star_prompt",
                 "stop_agent",
+                "generate_config",
                 "close_orchestration",
+                "set_overview_mode",
+                "show_agent_card",
+                "next_agent_card",
+                "previous_agent_card",
+                "next_needs_you_card",
+                "filter_needs_you_cards",
+                "close_agent_card",
+                "run_card_action",
+                "reply_to_agent_card",
                 "none"
             ]
         );
@@ -747,7 +803,17 @@ mod tests {
                 ("remind_star_later".to_string(), true),
                 ("dismiss_star_prompt".to_string(), true),
                 ("stop_agent".to_string(), false),
+                ("generate_config".to_string(), false),
                 ("close_orchestration".to_string(), false),
+                ("set_overview_mode".to_string(), false),
+                ("show_agent_card".to_string(), false),
+                ("next_agent_card".to_string(), false),
+                ("previous_agent_card".to_string(), false),
+                ("next_needs_you_card".to_string(), false),
+                ("filter_needs_you_cards".to_string(), false),
+                ("close_agent_card".to_string(), false),
+                ("run_card_action".to_string(), false),
+                ("reply_to_agent_card".to_string(), false),
             ]
         );
         assert_eq!(
@@ -815,7 +881,18 @@ mod tests {
                 // The D5 stops: on the overview with the New agent dialog
                 // closed (#1260), and each only opens a confirmation.
                 ("stop_agent".to_string(), true),
+                ("generate_config".to_string(), true),
                 ("close_orchestration".to_string(), true),
+                // PRD #2374: the agent cards, on the dashboard only.
+                ("set_overview_mode".to_string(), true),
+                ("show_agent_card".to_string(), true),
+                ("next_agent_card".to_string(), true),
+                ("previous_agent_card".to_string(), true),
+                ("next_needs_you_card".to_string(), true),
+                ("filter_needs_you_cards".to_string(), true),
+                ("close_agent_card".to_string(), true),
+                ("run_card_action".to_string(), true),
+                ("reply_to_agent_card".to_string(), true),
             ]
         );
         assert_eq!(
@@ -876,7 +953,17 @@ mod tests {
                 ("remind_star_later".to_string(), true),
                 ("dismiss_star_prompt".to_string(), true),
                 ("stop_agent".to_string(), true),
+                ("generate_config".to_string(), true),
                 ("close_orchestration".to_string(), false),
+                ("set_overview_mode".to_string(), false),
+                ("show_agent_card".to_string(), false),
+                ("next_agent_card".to_string(), false),
+                ("previous_agent_card".to_string(), false),
+                ("next_needs_you_card".to_string(), false),
+                ("filter_needs_you_cards".to_string(), false),
+                ("close_agent_card".to_string(), false),
+                ("run_card_action".to_string(), false),
+                ("reply_to_agent_card".to_string(), false),
             ]
         );
     }
