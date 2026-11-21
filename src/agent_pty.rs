@@ -21722,6 +21722,7 @@ mod tests {
         let server = |client_pid, server_pid| AgentServer {
             client_pid,
             server_pid,
+            process_daemon_pid: None,
         };
         let held = |id: &str| registry.inner.lock().agents[id].opencode_private_server;
 

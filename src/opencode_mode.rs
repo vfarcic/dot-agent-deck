@@ -44,6 +44,13 @@ pub const SHARED_GRACE: Duration = Duration::from_secs(10);
 /// and keeps it armed while OpenCode runs, idle or not.
 pub const SILENT_GRACE: Duration = Duration::from_secs(45);
 
+/// Issue #2441: the first OpenCode version whose private server runs the
+/// shell tool's commands under a process daemon (`opencode-pty daemon`, its
+/// direct child in a session of its own). Measured: 2.3.2 has it, 2.2.7 runs
+/// each command as the server's direct child instead; the 2.3.0 release notes
+/// already describe shell commands running through the process daemon.
+pub const PROCESS_DAEMON_FLOOR: Version = (2, 3, 0);
+
 /// One process, as much of it as the sample read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcRow {
@@ -65,6 +72,11 @@ pub struct Client {
     /// that is an OpenCode `serve --stdio` ([`private_server`]). `None` when
     /// it has none.
     pub private_server: Option<i32>,
+    /// Issue #2441: the pid of its private server's process daemon: the
+    /// first (breadth first) direct child of the private server that runs
+    /// OpenCode's `opencode-pty` executable as `daemon` ([`process_daemon`]).
+    /// `None` when it has none, or has no private server.
+    pub process_daemon: Option<i32>,
 }
 
 /// OpenCode subcommands that are not an agent session (1.x and 2.x `--help`).
@@ -155,6 +167,32 @@ fn private_server(row: &ProcRow) -> bool {
     is_opencode(row) && row.argv.as_deref().is_some_and(serves_stdio)
 }
 
+/// Issue #2441: whether `exe`, a process's executable as the system reports
+/// it, is OpenCode's process daemon
+/// ([`crate::platform::proc::OPENCODE_PROCESS_DAEMON`]; measured on 2.3.2 as
+/// `~/.cache/opencode/bin/opencode-pty/<ver>/opencode-pty`), with the
+/// `(deleted)` suffix of a binary replaced in place dropped as
+/// [`exe_is_opencode`] does.
+pub fn exe_is_process_daemon(exe: &Path) -> bool {
+    file_name(exe).is_some_and(|name| {
+        let name = name.strip_suffix(" (deleted)").unwrap_or(name);
+        name.strip_suffix(".exe").unwrap_or(name) == crate::platform::proc::OPENCODE_PROCESS_DAEMON
+    })
+}
+
+/// Issue #2441: whether `row` is OpenCode's process daemon, by its executable
+/// ([`exe_is_process_daemon`], never by its arguments alone) and its
+/// subcommand, `daemon`, the first word after the program (measured on
+/// 2.3.2: `opencode-pty daemon --runtime-dir <dir> --name <uuid>`).
+fn process_daemon(row: &ProcRow) -> bool {
+    row.exe.as_deref().is_some_and(exe_is_process_daemon)
+        && row
+            .argv
+            .as_deref()
+            .and_then(|argv| argv.get(1))
+            .is_some_and(|word| word == "daemon")
+}
+
 /// Whether process `pid`'s stdin and stdout are both sockets. An OpenCode 2
 /// private server's are, a socketpair with its client (measured on 2.2.5).
 /// This is a heuristic, not a binding: a process a tool starts can have
@@ -217,13 +255,19 @@ pub fn find_client(rows: &[ProcRow], root: i32) -> Option<Client> {
             && !opencode_pids.contains(&row.ppid)
             && !subcommand(row).is_some_and(|sub| NOT_A_SESSION.contains(&sub))
     })?;
+    let server = tree
+        .iter()
+        .find(|row| row.ppid == client.pid && private_server(row))
+        .map(|row| row.pid);
     Some(Client {
         pid: client.pid,
         exe: client.exe.clone(),
-        private_server: tree
-            .iter()
-            .find(|row| row.ppid == client.pid && private_server(row))
-            .map(|row| row.pid),
+        private_server: server,
+        process_daemon: server.and_then(|server| {
+            tree.iter()
+                .find(|row| row.ppid == server && process_daemon(row))
+                .map(|row| row.pid)
+        }),
     })
 }
 
@@ -292,7 +336,11 @@ pub fn sample(roots: &[i32]) -> Option<Vec<ProcRow>> {
             continue;
         };
         row.exe = crate::platform::proc::executable_of(pid);
-        if row.exe.as_deref().is_some_and(exe_is_opencode) {
+        if row
+            .exe
+            .as_deref()
+            .is_some_and(|exe| exe_is_opencode(exe) || exe_is_process_daemon(exe))
+        {
             row.argv = arguments_of(pid);
         }
     }
@@ -545,6 +593,10 @@ pub fn evaluate(
                     // a tool starting `opencode serve --stdio` is this shape.
                     // Recomputed on every look, so a client that changed (or
                     // whose version is no longer known) loses it here.
+                    // Issue #2441: and its process daemon, only on a known
+                    // 2.3 or later: before 2.3 there is none, and the shell
+                    // tool runs its commands as the server's direct children,
+                    // so a tool could start that shape.
                     match (version.map(Major::of), client.private_server) {
                         (Some(Major::V2), Some(server_pid)) => {
                             watch.servers.insert(
@@ -552,6 +604,9 @@ pub fn evaluate(
                                 crate::platform::proc::AgentServer {
                                     client_pid: client.pid,
                                     server_pid,
+                                    process_daemon_pid: client.process_daemon.filter(|_| {
+                                        version.is_some_and(|v| v >= PROCESS_DAEMON_FLOOR)
+                                    }),
                                 },
                             );
                         }
@@ -821,6 +876,7 @@ mod tests {
             pid: 1,
             exe: None,
             private_server: private_server.then_some(2),
+            process_daemon: None,
         }
     }
 

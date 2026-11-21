@@ -21457,6 +21457,7 @@ mod tests {
         let identified = Some(AgentServer {
             client_pid: CLIENT,
             server_pid: SERVER,
+            process_daemon_pid: None,
         });
         let before = vec![
             row(CLIENT, 1, CLIENT, CommandLine::NotSampled),
