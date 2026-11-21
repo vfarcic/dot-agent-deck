@@ -444,7 +444,7 @@ fn mode_chip_003_narrow_threshold_is_symmetric_and_preserves_row_budget() {
         );
     }
 
-    for (width, reserved_rows) in [(19, 11), (40, 5), (80, 3), (120, 2), (200, 1)] {
+    for (width, reserved_rows) in [(19, 10), (40, 4), (80, 2), (120, 2), (200, 1)] {
         let tall_bar = render_button_bar_for_mode_to_buffer(&config, UiMode::Normal, width, 16);
         assert_eq!(
             nonblank_rows(&tall_bar),
@@ -937,7 +937,9 @@ fn mode_banner_004_degraded_and_collapsed_states_never_escape_the_pane() {
 fn mode_banner_005_same_drain_mode_edges_preserve_banner_semantics() {
     let config = KeybindingConfig::default();
     let ctrl_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
-    let ctrl_t = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
+    // A bound command key that leaves the deck in command mode: zoom. (PRD
+    // #312 removed `Ctrl+T`, the layout toggle this used to press.)
+    let ctrl_z = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL);
     let printable = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
 
     let cases = [
@@ -952,7 +954,7 @@ fn mode_banner_005_same_drain_mode_edges_preserve_banner_semantics() {
         (
             "bound key immediately after PaneInput exits",
             UiMode::PaneInput,
-            vec![ctrl_d, ctrl_t],
+            vec![ctrl_d, ctrl_z],
             vec![UiMode::Normal, UiMode::Normal],
             CommandBannerVisibility::Hidden,
             CommandBannerVisibility::Collapsed,
@@ -960,7 +962,7 @@ fn mode_banner_005_same_drain_mode_edges_preserve_banner_semantics() {
         (
             "single bound command key",
             UiMode::Normal,
-            vec![ctrl_t],
+            vec![ctrl_z],
             vec![UiMode::Normal],
             CommandBannerVisibility::Expanded,
             CommandBannerVisibility::Collapsed,
@@ -968,7 +970,7 @@ fn mode_banner_005_same_drain_mode_edges_preserve_banner_semantics() {
         (
             "unbound printable after a bound command key",
             UiMode::Normal,
-            vec![ctrl_t, printable],
+            vec![ctrl_z, printable],
             vec![UiMode::Normal, UiMode::Normal],
             CommandBannerVisibility::Expanded,
             CommandBannerVisibility::Expanded,
@@ -2029,25 +2031,21 @@ fn mode_scroll_005_cannot_scroll_notice_renders_refreshes_and_dismisses_without_
         "focused command pane behind the block-tier notice",
     );
 
+    // PRD #312: only the focused pane is drawn, so the affinity is observed one
+    // pane at a time — the notice is not handed to the pane focus moves to, and
+    // it is still on the pane that armed it when focus comes back.
     let affinity = &observed.pane_affinity;
-    let first_pane_text = rect_to_text(&affinity.render, affinity.first_pane_rect);
-    let second_pane_text = rect_to_text(&affinity.render, affinity.second_pane_rect);
+    let second_focused_text = buffer_to_text(&affinity.second_focused_render);
+    let first_refocused_text = buffer_to_text(&affinity.first_refocused_render);
     assert_eq!(
-        first_pane_text.matches(SCROLL_NOTICE_TEXT).count(),
-        1,
-        "after focus moves away, the notice must remain on the pane that armed it:\n{first_pane_text}"
-    );
-    assert_eq!(
-        second_pane_text.matches(SCROLL_NOTICE_TEXT).count(),
+        second_focused_text.matches(SCROLL_NOTICE_TEXT).count(),
         0,
-        "the newly focused pane must not inherit another pane's notice:\n{second_pane_text}"
+        "the newly focused pane must not inherit another pane's notice:\n{second_focused_text}"
     );
     assert_eq!(
-        buffer_to_text(&affinity.render)
-            .matches(SCROLL_NOTICE_TEXT)
-            .count(),
+        first_refocused_text.matches(SCROLL_NOTICE_TEXT).count(),
         1,
-        "the two-pane frame must contain exactly one notice, on its arming pane"
+        "when focus comes back, the notice must still be on the pane that armed it:\n{first_refocused_text}"
     );
 
     assert!(

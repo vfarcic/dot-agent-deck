@@ -52,7 +52,7 @@ export function observeRestarts(held: HeldListings, fleet: DeckFleet): { held: M
 }
 
 /** How the notice names `agent`: its label, and its role and run when it is an orchestration's. */
-export function stoppedAgent(agent: AgentSession): StoppedAgent {
+function stoppedAgent(agent: AgentSession): StoppedAgent {
   if (agent.tab.kind !== "orchestration") return { label: agent.displayName };
   return { label: agent.displayName, role: agent.tab.roleName, orchestration: orchestrationTitle(agent.tab) };
 }

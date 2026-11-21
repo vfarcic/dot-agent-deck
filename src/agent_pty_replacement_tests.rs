@@ -936,6 +936,7 @@ async fn work_done_056_a_dispatch_unwinding_through_registration_leaves_a_live_d
             pane_id: "w056-caller".to_string(),
             agent_id: caller_agent.clone(),
         },
+        existing_dir: false,
     };
     let caller = super::dispatch_lifecycle_tests::caller("w056-caller", &caller_agent, "w056");
     let task = tokio::spawn(async move {

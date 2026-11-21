@@ -1814,6 +1814,16 @@ async fn close_one(
                 cleanup_worktree(worktree, registry, worktrees, event_tx).await
             });
         }
+        // PRD #468: a `--dir` unit's directory was never this dispatch's, so
+        // the deck holding no record of it is the expected state, not a tree it
+        // lost track of: it is reported as left in place, with no pointer to
+        // `worktree reclaim`.
+        if let (Some(unit), Some(verdict)) = (target.unit.as_ref(), out.worktree_verdict.as_mut())
+            && unit.existing_dir
+            && verdict.verdict == WorktreeVerdictKind::NotRecorded
+        {
+            verdict.verdict = WorktreeVerdictKind::ExistingDirectory;
+        }
     }
     drop(gates);
     Attempt::Done(out)
@@ -2066,6 +2076,7 @@ mod tests {
                     agent_id: agent.to_string(),
                 },
                 dispatched_at_ms: 1,
+                existing_dir: false,
             })
         }
 
@@ -2093,6 +2104,7 @@ mod tests {
                     terminal_agent_id: agent.to_string(),
                 },
                 dispatched_at_ms: 1,
+                existing_dir: false,
             })
         }
 
@@ -4899,6 +4911,7 @@ mod tests {
                 agent_id: agent.clone(),
             },
             dispatched_at_ms: 1,
+            existing_dir: false,
         });
         deck.report_done(name, &agent);
         (agent, id, wt)
@@ -4977,6 +4990,7 @@ mod tests {
                 terminal_agent_id: o.clone(),
             },
             dispatched_at_ms: 1,
+            existing_dir: false,
         });
         deck.report_done("t-o", &o);
         let pane = |p: &str| CloseSelector::Pane { pane_id: p.into() };
@@ -5490,6 +5504,7 @@ mod tests {
                             agent_id: format!("gone-{name}-{n}"),
                         },
                         dispatched_at_ms: 1,
+                        existing_dir: false,
                     });
                 }
             }
@@ -5574,6 +5589,7 @@ mod tests {
                         terminal_agent_id: "gone".to_string(),
                     },
                     dispatched_at_ms: 1,
+                    existing_dir: false,
                 });
             }
         }

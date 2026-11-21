@@ -1228,7 +1228,8 @@ impl AgentPtyRegistry {
                 }
             },
             move |keymap| async move {
-                let surface = surface_shows_composer(hr.agent.as_ref(), hr.bus.clean_frame());
+                let surface =
+                    surface_shows_composer(hr.agent.as_ref(), hr.bus.clean_frame().as_ref());
                 let w = hr.writer.lock().await;
                 let now = Instant::now();
                 let status = hr.gate.gate.status();
@@ -1262,7 +1263,17 @@ impl AgentPtyRegistry {
         // still stands (U3-03, R-D-U2-01).
         let marked = h.bus.clean_frame_marked();
         let mark = marked.as_ref().map(|(_, mark)| *mark);
-        let surface = surface_shows_composer(h.agent.as_ref(), marked.map(|(grid, _)| grid));
+        let frame = marked.map(|(grid, _)| grid);
+        let surface = surface_shows_composer(h.agent.as_ref(), frame.as_ref());
+        // Issue #2130: on the frame the check is admitted on, Codex's status
+        // line must still show the directory the generation was bound in.
+        // Asked only of a frame that shows the composer, so a box holding a
+        // draft is still refused for the screen, not counted as a failure.
+        let keymap = if surface {
+            keymap.and_then(|()| h.observer.session(frame.as_ref()))
+        } else {
+            keymap
+        };
         let now = Instant::now();
         let status = h.gate.gate.status();
         let (fence, lapsed_e0) = input.admission_fence(status.fenced, status.held_ops, now);
@@ -1407,19 +1418,18 @@ impl AgentPtyRegistry {
 #[cfg(target_os = "linux")]
 fn surface_shows_composer(
     agent: Option<&AgentType>,
-    frame: Option<crate::doorbell_screen::Grid>,
+    frame: Option<&crate::doorbell_screen::Grid>,
 ) -> bool {
     let (Some(profile), Some(grid)) = (crate::doorbell_screen::profile_for_agent(agent), frame)
     else {
         return false;
     };
-    if grid.cols < profile.min_cols || (profile.dialog)(&grid).is_some() || !(profile.ready)(&grid)
-    {
+    if grid.cols < profile.min_cols || (profile.dialog)(grid).is_some() || !(profile.ready)(grid) {
         return false;
     }
     match agent {
-        Some(AgentType::Codex) => profile.placeholder_empty(&grid),
-        _ => (profile.composer)(&grid).is_some(),
+        Some(AgentType::Codex) => profile.placeholder_empty(grid),
+        _ => (profile.composer)(grid).is_some(),
     }
 }
 
@@ -2556,7 +2566,7 @@ mod tests {
             human_ticket: false,
             boundary: Boundary::Ground,
             keymap: Ok(()),
-            surface: surface_shows_composer(Some(&AgentType::ClaudeCode), Some(grid)),
+            surface: surface_shows_composer(Some(&AgentType::ClaudeCode), Some(&grid)),
         };
         assert!(scheduled.surface, "scheduled at the main composer");
         let ledger = crate::ingress_ledger::IngressLedger::new();
@@ -2778,6 +2788,43 @@ mod tests {
         );
         assert_eq!(request.matches("observer.keymap()").count(), 1);
         assert_eq!(request.matches("scheduling_reads(").count(), 1);
+    }
+
+    /// Scenario: A source-order check, not a behaviour check: read the probe request's source and find that the check it admits compares Codex's status line on the frame the writer will hold it to, after reading that frame's surface and before the admission that decides, and only for a frame that shows the input box. The lane-2 test `probe_103_live_a_codex_moved_by_cd_is_not_checked` runs the behaviour against real Codex.
+    #[cfg(target_os = "linux")]
+    #[spec("inbox/probe/103")]
+    #[test]
+    fn probe_103_the_admitted_frame_carries_the_session_check() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/agent_pty_segments.rs"),
+        )
+        .unwrap();
+        let request = source
+            .split("pub(crate) async fn composer_probe(")
+            .nth(1)
+            .and_then(|rest| rest.split("let claim = Arc::new(").next())
+            .expect("the probe request");
+        let reads = request
+            .find("scheduling_reads(")
+            .expect("the scheduling reads");
+        let marked = request
+            .find("h.bus.clean_frame_marked()")
+            .expect("the marked frame");
+        let surface = request
+            .find("surface_shows_composer(h.agent.as_ref(), frame.as_ref())")
+            .expect("the surface read from the marked frame");
+        let session = request
+            .find("h.observer.session(frame.as_ref())")
+            .expect("the session check on the marked frame");
+        let admits = request
+            .find("h.observer.admits(&outside, now)")
+            .expect("the deciding admission");
+        assert!(reads < marked && marked < surface && surface < session && session < admits);
+        assert!(
+            request[surface..session].contains("if surface {"),
+            "asked only of a frame that shows the input box"
+        );
+        assert_eq!(request.matches(".session(").count(), 1);
     }
 
     /// Scenario: Compare the O5 wait's one bound with how far ahead each screen profile's redraw estimate can run, then run the scheduling reads with a first pass refused by an estimate just past the bound. Claude Code's estimate always fits inside the bound and Codex's can run past it, and a request refused past the bound answers that refusal at once, asking once and sleeping not at all (A-20d-8's decision, written at `O5_WAIT`).

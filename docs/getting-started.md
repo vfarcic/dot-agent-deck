@@ -93,7 +93,7 @@ On startup the deck installs its status hooks for the agents it detects (see [In
 
 - `Ctrl+d` switches between the two.
 - In command mode, `j`/`k` select a card, `Enter` or `1`–`9` focus a pane, and `?` shows every shortcut.
-- `Ctrl+t` switches between showing only the focused pane (stacked, the default) and showing every pane (tiled).
+- The pane column shows the focused agent's pane at full height; focusing another card shows its pane instead, and `Ctrl+z` gives the pane the whole frame.
 - To copy text out of a pane, drag across it; in command mode `v` opens copy mode (the chip reads ` COPY `) to select with the keyboard. See [Copying text](keyboard-shortcuts.md#copying-text).
 - Everything is clickable too: the buttons along the bottom carry their shortcuts.
 

@@ -1,5 +1,6 @@
 //! Issue #2341: Claude Code's prompt hook commits a deck message only once
-//! the session transcript shows Claude took the prompt that carried it.
+//! the session transcript shows Claude took the prompt that carried it, and
+//! since issue #2346 Codex's two hand-overs do the same (below).
 //!
 //! A `UserPromptSubmit` hook that writes a block in full has not delivered
 //! it: Claude Code can still discard the prompt after the hook exits — when
@@ -53,6 +54,38 @@
 //! `promptSubmitEnding.ending.kind` is `blocked_by_hook` and whose content
 //! ends with `Original prompt: ` and the prompt exactly as the hook received
 //! it; no `Stop` hook ran.
+//!
+//! Issue #2346: Codex's two hand-overs, its prompt hook's context and its
+//! `Stop` hook's block reason, go through the same witness, reading the
+//! session's rollout file, which Codex's hook payloads name as
+//! `transcript_path` too. Measured on Codex 0.164.0 (the PR's description
+//! has the runs):
+//!
+//! - Codex writes the rollout, at that path, before its first prompt's
+//!   hooks run, so the mark is the file's length then.
+//! - A prompt it takes is a `response_item` whose `payload` is a `message`
+//!   of role `user`, its text an `input_text` part; the context a prompt
+//!   hook added follows as a `message` of role `developer` (its
+//!   `content_item_kinds` `hooks.additional_context`), about 0.2 s after the
+//!   hooks start.
+//! - A `Stop` block reason it goes on with is a `message` of role `user`
+//!   whose text is the reason inside `<hook_prompt hook_run_id="stop:…">` and
+//!   `</hook_prompt>`, with `&`, `<` and `>` escaped as XML entities. A
+//!   block's opener and closer hold none of those, so the block is still
+//!   found whole.
+//! - A prompt another `UserPromptSubmit` hook blocks, by its JSON decision or
+//!   by exiting 2, leaves no `user` message, but Codex still records the
+//!   context the deck's hook added as the `developer` message, and the model
+//!   sees it on its next turn (asked, it named that context's sentinel). So
+//!   that context is committed: the model has it.
+//! - A turn the user interrupts (Esc) after the deck's hook printed and
+//!   before Codex took the output leaves neither the prompt, the context nor
+//!   the `Stop` reason, only a `turn_aborted` record: what the hook printed
+//!   is then not committed, and is handed out again.
+//!
+//! So for Codex a `user` or `developer` message carrying a block whole is
+//! what the model took ([`entry_texts`]). A witness for Codex carries no
+//! [`PromptTurn`]: the turn half above reads Claude Code's entries only.
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -106,12 +139,12 @@ pub struct TranscriptMark {
 }
 
 impl TranscriptMark {
-    /// The mark of a Claude Code hook payload's `transcript_path`: an
-    /// absolute path to a `.jsonl` file, at its current length, or at 0 when
-    /// it does not exist yet (a session's first prompt: Claude Code creates
-    /// the transcript, and its folder, only once it records that prompt,
-    /// blocked or taken). `None` for anything else, and the hook then commits
-    /// what it writes itself (module docs).
+    /// The mark of a Claude Code or Codex hook payload's `transcript_path`:
+    /// an absolute path to a `.jsonl` file, at its current length, or at 0
+    /// when it does not exist yet (a session's first prompt: Claude Code
+    /// creates the transcript, and its folder, only once it records that
+    /// prompt, blocked or taken). `None` for anything else, and the hook then
+    /// commits what it writes itself (module docs).
     pub fn of_payload(payload: &Value) -> Option<TranscriptMark> {
         let path = PathBuf::from(payload.get("transcript_path")?.as_str()?);
         if !path.is_absolute() || path.extension() != Some(std::ffi::OsStr::new("jsonl")) {
@@ -228,6 +261,14 @@ pub struct Plan {
     /// Issue #2347: the prompt whose turn the witness settles.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn: Option<PromptTurn>,
+    /// Issue #2346: the receipts sender the witness commits as, the hook's
+    /// own: Claude Code's prompt hook, or Codex's hooks.
+    #[serde(default = "claude_hooks")]
+    pub sender: crate::event::InboxOneShotSender,
+}
+
+fn claude_hooks() -> crate::event::InboxOneShotSender {
+    crate::event::InboxOneShotSender::ClaudeHooks
 }
 
 impl Plan {
@@ -256,12 +297,35 @@ pub fn window(hold: Duration) -> Duration {
 }
 
 /// The texts of one transcript entry that are in the model's context because
-/// Claude took them: a `user` entry's prompt (a string, or its `text`
-/// parts), and the context a hook added (`attachment` of type
-/// `hook_additional_context`). Nothing else counts: a `system` entry that
-/// quotes a blocked prompt, a queued notification, a request log.
+/// the agent took them. For Claude Code: a `user` entry's prompt (a string,
+/// or its `text` parts), and the context a hook added (`attachment` of type
+/// `hook_additional_context`); nothing else counts: a `system` entry that
+/// quotes a blocked prompt, a queued notification, a request log. For Codex
+/// (issue #2346): the `input_text` parts of a `response_item` `message` of
+/// role `user` (a prompt, or a `Stop` reason it went on with) or `developer`
+/// (a hook's context); nothing else counts: the model's own messages, a tool
+/// call's output, an `event_msg` echoing an item.
 pub fn entry_texts(entry: &Value) -> Vec<&str> {
     match entry.get("type").and_then(Value::as_str) {
+        Some("response_item") => entry
+            .get("payload")
+            .filter(|payload| {
+                payload.get("type").and_then(Value::as_str) == Some("message")
+                    && matches!(
+                        payload.get("role").and_then(Value::as_str),
+                        Some("user" | "developer")
+                    )
+            })
+            .and_then(|payload| payload.get("content"))
+            .and_then(Value::as_array)
+            .map(|parts| {
+                parts
+                    .iter()
+                    .filter(|part| part.get("type").and_then(Value::as_str) == Some("input_text"))
+                    .filter_map(|part| part.get("text").and_then(Value::as_str))
+                    .collect()
+            })
+            .unwrap_or_default(),
         Some("user") => entry
             .get("message")
             .and_then(|message| message.get("content"))
@@ -298,8 +362,10 @@ fn strings(value: &Value) -> Vec<&str> {
     }
 }
 
-/// The exact attempts one transcript line shows Claude took, whole
-/// ([`crate::inbox_prompt::delivered`] over [`entry_texts`]).
+/// The exact attempts one transcript line shows the agent took, whole
+/// ([`crate::inbox_prompt::delivered`] over [`entry_texts`]). An entry's
+/// texts are read one by one and also joined, as the model reads them, so a
+/// block an agent records across two parts of one message is still whole.
 pub fn witnessed_in_line(line: &[u8]) -> Vec<InboxAttemptRef> {
     if line.len() > MAX_LINE || !contains(line, NEEDLE) {
         return Vec::new();
@@ -307,8 +373,10 @@ pub fn witnessed_in_line(line: &[u8]) -> Vec<InboxAttemptRef> {
     let Ok(entry) = serde_json::from_slice::<Value>(line) else {
         return Vec::new();
     };
+    let texts = entry_texts(&entry);
+    let joined = (texts.len() > 1).then(|| texts.concat());
     let mut out: Vec<InboxAttemptRef> = Vec::new();
-    for text in entry_texts(&entry) {
+    for text in texts.iter().copied().chain(joined.as_deref()) {
         for at in crate::inbox_prompt::delivered(text) {
             if !out.contains(&at) {
                 out.push(at);
@@ -460,7 +528,7 @@ impl Scanner {
 /// What [`watch`] saw.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Watched {
-    /// The attempts the transcript showed Claude took, by the deadline.
+    /// The attempts the transcript showed the agent took, by the deadline.
     Found(Vec<InboxAttemptRef>),
     /// The transcript never existed while the witness watched: Claude
     /// Code keeps none for this session, so nothing can witness.
@@ -571,7 +639,7 @@ pub fn spawn(
         .map(drop)
 }
 
-/// `dot-agent-deck inbox witness --plan <json>`: watch, commit what Claude
+/// `dot-agent-deck inbox witness --plan <json>`: watch, commit what the agent
 /// took, then report the hook's batch on the connection it was handed.
 pub fn run(plan: &str) -> ExitCode {
     let Ok(plan) = serde_json::from_str::<Plan>(plan) else {
@@ -630,7 +698,7 @@ fn run_unix(plan: Plan) {
     let commit = || {
         crate::inbox_prompt::commit_exact_quietly(
             found.clone(),
-            crate::event::InboxOneShotSender::ClaudeHooks,
+            plan.sender,
             Instant::now() + crate::inbox_prompt::prompt_receipts_wait(),
         )
     };
@@ -734,6 +802,91 @@ mod tests {
             assert_eq!(found, want, "{entry}");
         }
         assert!(witnessed_in_line(b"{not json [dot-agent-deck message ").is_empty());
+    }
+
+    /// A Codex 0.164.0 rollout `response_item` message of `role` carrying
+    /// `text`, as measured (issue #2346).
+    fn codex_message(role: &str, text: &str, kind: &str, hook: bool) -> Value {
+        json!({"timestamp":"2026-11-19T23:10:00.420Z","type":"response_item",
+            "payload":{"type":"message","id":"msg_x","role":role,
+                "content":[{"type":"input_text","text":text}],
+                "internal_chat_message_metadata_passthrough":{"turn_id":"t",
+                    "content_item_kinds":[kind],
+                    "content_item_metadata":[{"provenance":{"type":if hook {"harness"} else {"user"},"hook":hook}}]}}})
+    }
+
+    /// Scenario: Read Codex rollout lines of every kind Codex 0.164.0 writes around a hand-over carrying a deck block: the prompt as a user message, a prompt hook's context as a developer message, a `Stop` reason it went on with as a user message wrapping the reason in `<hook_prompt>` with XML-escaped text, the model's own reply quoting the block, a tool's output, the `event_msg` items echoing the prompt and the `Stop` reason, and the `turn_aborted` note an interrupt leaves. Only the three messages the model took count, and only for a block that is whole, which it still is when one message holds it in two parts.
+    #[test]
+    fn only_what_codex_took_witnesses_a_block() {
+        let whole = block(ID, 1, 2);
+        let escaped = format!(
+            "<hook_prompt hook_run_id=\"stop:2:/h/hooks.json\">framing\n[dot-agent-deck message {ID} delivery 1.2 from a &lt;b&gt;&amp;\"x'&lt;/b&gt; deck]\nReply &lt;i&gt;&amp;amp;&lt;/i&gt;\n[end of dot-agent-deck message {ID}]</hook_prompt>"
+        );
+        let counted = [
+            codex_message("user", &format!("a prompt {whole}"), "user.text", false),
+            codex_message(
+                "developer",
+                &format!("framing\n{whole}"),
+                "hooks.additional_context",
+                true,
+            ),
+            codex_message("user", &escaped, "unknown", true),
+        ];
+        let (head, tail) = whole.split_at(whole.len() / 2);
+        let mut split = codex_message("developer", head, "hooks.additional_context", true);
+        split["payload"]["content"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type":"input_text","text":tail}));
+        for entry in counted.into_iter().chain([split]) {
+            assert_eq!(
+                witnessed_in_line(&line(entry.clone())),
+                vec![at(ID, 1, 2)],
+                "{entry}"
+            );
+        }
+        let not_counted = [
+            json!({"type":"response_item","payload":{"type":"message","role":"assistant",
+                "content":[{"type":"output_text","text":whole}]}}),
+            json!({"type":"response_item","payload":{"type":"message","role":"developer",
+                "content":[{"type":"output_text","text":whole}]}}),
+            json!({"type":"response_item","payload":{"type":"custom_tool_call_output",
+                "call_id":"c","output":whole}}),
+            json!({"type":"event_msg","payload":{"type":"item_completed","item":{"type":"UserMessage",
+                "content":[{"type":"text","text":whole}]}}}),
+            json!({"type":"event_msg","payload":{"type":"item_completed","item":{"type":"HookPrompt",
+                "fragments":[{"text":whole,"hookRunId":"stop:2:/h/hooks.json"}]}}}),
+            json!({"type":"event_msg","payload":{"type":"turn_aborted","reason":"interrupted"}}),
+            codex_message(
+                "user",
+                &format!("[dot-agent-deck message {ID} delivery 1.2 from x]\nno closer"),
+                "user.text",
+                false,
+            ),
+        ];
+        for entry in not_counted {
+            assert!(
+                witnessed_in_line(&line(entry.clone())).is_empty(),
+                "{entry}"
+            );
+        }
+    }
+
+    /// Scenario: Read a witness plan written without a sender, as a hook from before issue #2346 starts one, and one written for Codex's hooks. The first commits as Claude Code's prompt hook; the second keeps Codex's hooks through its command line.
+    #[test]
+    fn a_plan_names_the_sender_it_commits_as() {
+        let mark = TranscriptMark {
+            path: PathBuf::from("/t.jsonl"),
+            offset: 3,
+        };
+        let plan: Plan = serde_json::from_value(json!({"transcript":mark,"within_ms":5})).unwrap();
+        assert_eq!(plan.sender, crate::event::InboxOneShotSender::ClaudeHooks);
+        let codex = Plan {
+            sender: crate::event::InboxOneShotSender::CodexHooks,
+            ..plan
+        };
+        let back: Plan = serde_json::from_str(&serde_json::to_string(&codex).unwrap()).unwrap();
+        assert_eq!(back, codex);
     }
 
     /// Scenario: A FIFO stands where the transcript was to be created. The scanner opens it without blocking, reads nothing from it, and a watch for an attempt still ends at its deadline.

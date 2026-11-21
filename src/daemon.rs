@@ -3792,11 +3792,15 @@ fn install_delivery_notice_sink(
             })
         }));
     let weak_registry = Arc::downgrade(registry);
+    // Issue #2246: a notice saying how a pane ended is published from that
+    // pane's reader thread, which is no runtime thread, so the task is spawned
+    // on the daemon's runtime, captured here, rather than on the caller's.
+    let runtime = tokio::runtime::Handle::current();
     registry.set_delivery_notice_sink(std::sync::Arc::new(move |notice| {
         let state = state.clone();
         let event_tx = event_tx.clone();
         let registry = weak_registry.clone();
-        tokio::spawn(async move {
+        runtime.spawn(async move {
             // ONE write lock for the whole operation: re-validate, resolve
             // the target card, broadcast, apply. Nothing sampled here can go
             // stale before the event lands, which is the difference between
@@ -3805,9 +3809,7 @@ fn install_delivery_notice_sink(
             let Some(registry) = registry.upgrade() else {
                 return;
             };
-            if registry.pane_current_agent_id(&notice.pane_id).as_deref()
-                != Some(notice.agent_id.as_str())
-            {
+            if !registry.delivery_notice_owns_pane(&notice) {
                 tracing::debug!(
                     pane_id = %notice.pane_id,
                     delivery_id = %notice.delivery_id,
@@ -7471,7 +7473,10 @@ async fn run_hook_loop_with_limits(
                                         ),
                                     };
                                     let task = signal.task.as_deref().unwrap_or_default();
-                                    let result = dispatch::handle_dispatch(
+                                    // PRD #468: `dispatch --dir` starts the unit
+                                    // in that existing directory instead of a
+                                    // new worktree.
+                                    let result = dispatch::handle_dispatch_at(
                                         &ctx,
                                         &signal.name,
                                         task,
@@ -7480,6 +7485,7 @@ async fn run_hook_loop_with_limits(
                                             command: signal.command.as_deref(),
                                             agent: signal.agent.as_deref(),
                                         },
+                                        signal.dir.as_deref(),
                                     )
                                     .await;
 
@@ -8088,11 +8094,20 @@ async fn run_hook_loop_with_limits(
                                     info!(
                                         pane_id = %escape_id_for_log(&req.pane_id),
                                         resolved_cwd = ?cwd,
+                                        dir = ?req.dir,
                                         "Received list-targets request"
                                     );
-                                    let resp = crate::dispatch::list_targets_response(
-                                        cwd.as_deref().map(std::path::Path::new),
-                                    );
+                                    // PRD #468: `--list-targets --dir <path>`
+                                    // lists that directory's targets, the config
+                                    // a `dispatch --dir <path>` resolves from.
+                                    let resp = match req.dir.as_deref() {
+                                        Some(dir) => {
+                                            crate::dispatch::list_targets_response_for_dir(dir)
+                                        }
+                                        None => crate::dispatch::list_targets_response(
+                                            cwd.as_deref().map(std::path::Path::new),
+                                        ),
+                                    };
                                     if let Ok(json) = serde_json::to_string(&resp) {
                                         let line = format!("{json}\n");
                                         if write_hook_reply(&mut write_half, &line, idle_timeout)
@@ -10196,6 +10211,7 @@ mod hook_ingestion_tests {
             session_id: None,
             detail: "a spawn-time prompt was written into this pane but the daemon is already watching its maximum number of unconfirmed deliveries, so this one is NOT being confirmed or retried; check whether the pane acted on its task".into(),
             cleared: false,
+            pane_ended: false,
         });
         let report = tokio::time::timeout(Duration::from_millis(300), async {
             loop {
@@ -10278,6 +10294,7 @@ mod hook_ingestion_tests {
             }
             .into(),
             cleared,
+            pane_ended: false,
         };
         let next_event = |rx: &mut broadcast::Receiver<BroadcastMsg>| {
             let rx = rx.resubscribe();
@@ -10330,6 +10347,74 @@ mod hook_ingestion_tests {
         assert!(
             !next.is_delivery_notice_cleared() && next.event_type == crate::event::EventType::Error,
             "a card that no longer shows the notice gets no lift: {next:?}"
+        );
+    }
+
+    /// Issue #2246: an agent whose pane command exited by itself still has
+    /// its card, and the notice saying how the pane ended reaches it through
+    /// the production sink — published, as the pane's reader thread publishes
+    /// it, from a thread that is no runtime thread. A delivery failure for the
+    /// same exited agent is still dropped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_ended_pane_notice_reaches_the_exited_agents_card() {
+        const PANE_ID: &str = "issue-2246-ended";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent_id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/usr/bin/true"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE_ID.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the recipient pane");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline && registry.live_count() > 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(registry.live_count(), 0, "precondition: the pane ended");
+        let daemon_state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let (event_tx, mut attached_rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+        install_delivery_notice_sink(&registry, daemon_state.clone(), event_tx.clone());
+        let detail = "not delivered: the command started in the agent's pane exited (code 7) before taking this message";
+        let notice = |pane_ended| DeliveryNotice {
+            pane_id: PANE_ID.to_string(),
+            agent_id: agent_id.clone(),
+            delivery_id: "m-issue-2246".to_string(),
+            session_id: None,
+            detail: detail.into(),
+            cleared: false,
+            pane_ended,
+        };
+        let failure = notice(false);
+        let ended = notice(true);
+        let publisher = registry.clone();
+        std::thread::spawn(move || {
+            publisher.publish_delivery_notice(failure);
+            publisher.publish_delivery_notice(ended);
+        })
+        .join()
+        .expect("publishing from a plain thread does not panic");
+        let event = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(BroadcastMsg::Event(event)) = attached_rx.recv().await
+                    && event.pane_id.as_deref() == Some(PANE_ID)
+                {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("the ended-pane notice is broadcast");
+        registry.shutdown_all();
+        assert_eq!(event.event_type, crate::event::EventType::Error);
+        assert_eq!(event.agent_id.as_deref(), Some(agent_id.as_str()));
+        assert_eq!(
+            event
+                .metadata
+                .get(crate::event::DELIVERY_NOTICE_METADATA_KEY)
+                .map(String::as_str),
+            Some(detail),
+            "only the ended-pane notice reaches the exited agent's card"
         );
     }
 
@@ -16307,6 +16392,7 @@ mod hook_ingestion_tests {
             token: Some(fx.orchestrator_token.clone()),
             command: None,
             agent: None,
+            dir: None,
         });
         let line = format!("{}\n", serde_json::to_string(&msg).unwrap());
         let mut stream = UnixStream::connect(&fx.sock).await.expect("connect");

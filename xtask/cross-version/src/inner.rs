@@ -3352,7 +3352,7 @@ fn confirm_command_mode(
 ///
 /// From command mode a digit jumps to that role's card, and `focus_deck`
 /// re-enters `PaneInput` on success — so one digit both selects the pane and
-/// makes it the one keystrokes reach. `PaneLayout::Stacked` draws only the
+/// makes it the one keystrokes reach. the deck draws only the
 /// focused role's pane and fuses its title into the box corner as `┌<role>`, so
 /// that string together with a `TYPING` footer is what confirms the jump landed.
 /// The digit is the role's position in the fixture, which is the card order.
