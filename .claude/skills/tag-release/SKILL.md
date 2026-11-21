@@ -91,7 +91,33 @@ gh run watch "$run"
 
 Run IDs increase, so "the lowest id greater than the one that existed before I dispatched" is this dispatch's run even when others queue behind it. Capture `before` **before** the `gh workflow run` in Step 3.
 
-Then report to the user: the tag, its URL, and that `release.yml` is now running and will generate the release notes from the fragments. `ci.yml` also runs against the tagged tree, because the pin commit deliberately carries no skip marker — a red there is worth surfacing even though nothing gates on it.
+### Then watch `release.yml` to the end
+
+**A tag is not a release.** The tag push starts `release.yml`, which builds, publishes the GitHub Release and the Homebrew and Scoop manifests, and publishes the docs. The release is done when that run has finished and its outcome has been read, not when the tag exists. Until then, report it to the user as in progress and name the run. Stopping at the tag leaves the "tag landed but `release.yml` failed" case below for whoever next notices a missing download.
+
+Find the run by its tag, not as the newest run: `release.yml` serialises on a `release` concurrency group, and it also runs from `workflow_dispatch`.
+
+```bash
+tag=v<X.Y.Z>
+until rel=$(gh run list --workflow=release.yml --branch "$tag" --event push --limit 1 \
+              --json databaseId --jq '.[0].databaseId // empty') && [ -n "$rel" ]; do
+  sleep 10
+done
+gh run watch "$rel" --exit-status >/dev/null; gh run view "$rel" --json conclusion,jobs \
+  --jq '.conclusion, (.jobs[] | select(.conclusion != "success") | "\(.name): \(.conclusion)")'
+gh release view "$tag" --json isDraft,publishedAt,assets --jq '"draft=\(.isDraft) published=\(.publishedAt)", (.assets[].name)'
+```
+
+It runs long: the macOS builds queue for runners and `desktop-sign` (notarisation) has `timeout-minutes: 180`. Run the watch in the background and report back when it ends rather than ending the session on it.
+
+Then read the outcome:
+
+- **Every job `success`, and the Release published (`draft=false`) with a CLI archive for every target the `build` matrix lists:** the release is done. Report the Release URL and the run.
+- **`prepare`, `build` or `finalize` failed:** the CLI did not ship, or shipped incomplete (`finalize` publishes the GitHub Release, then the Homebrew formula and the Scoop manifest). Go to "If it fails halfway" below, choosing its branch by whether `prepare` finished.
+- **Only desktop jobs (`desktop-bundle`, `desktop-sign`, `desktop-publish`) failed:** the CLI shipped and the desktop alpha assets did not (CLAUDE.md rule 18: the CLI ships even when the bundle does not). Report which assets are missing and why. Rebuilding them is the user's call.
+- **`docs` or `attest` failed:** the binaries shipped. Report the failed job, because the published docs or the CLI's provenance attestations are missing until it is re-run.
+
+`ci.yml` also runs against the tagged tree, because the pin commit deliberately carries no skip marker. A red there is worth surfacing even though nothing gates on it.
 
 ## If it fails halfway
 
