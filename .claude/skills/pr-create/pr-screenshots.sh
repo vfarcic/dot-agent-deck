@@ -22,7 +22,8 @@
 # again and rebuilds its commit on the new tip, up to five times.
 #
 # The printed URLs name the GitHub repository the images were pushed to, read
-# from the remote's URL, so a contributor whose `origin` is a fork gets links
+# from the remote's URL (https, with or without credentials, `git@github.com:`, or
+# `ssh://` with or without a port), so a contributor whose `origin` is a fork gets links
 # into the fork, which a pull request on the upstream repository displays as
 # long as the fork is public. PR_SCREENSHOTS_REMOTE overrides the remote
 # (default `origin`); a remote that is not a GitHub URL, such as the path of a
@@ -93,7 +94,7 @@ if [ -n "${PR_SCREENSHOTS_REPO:-}" ]; then
   repo=$PR_SCREENSHOTS_REPO
 else
   url=$(git remote get-url "$remote" 2>/dev/null || printf '%s' "$remote")
-  repo=$(printf '%s\n' "$url" | sed -nE 's#^(https://github\.com/|ssh://git@github\.com/|git@github\.com:)([^/]+/[^/]+)$#\2#p' | sed -E 's#\.git$##; s#/$##')
+  repo=$(printf '%s\n' "$url" | sed -nE 's#^(https://([^@/]+@)?github\.com/|ssh://git@github\.com(:[0-9]+)?/|git@github\.com:)([^/]+/[^/]+)$#\4#p' | sed -E 's#\.git$##; s#/$##')
   if [ -z "$repo" ]; then
     echo "ERROR: $remote ($url) is not a GitHub repository; set PR_SCREENSHOTS_REPO=<owner>/<repo> to the repository the images are served from" >&2
     exit 2
