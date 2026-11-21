@@ -86,10 +86,12 @@ until run=$(gh run list --workflow=tag-release.yml --limit 20 --json databaseId 
               --jq "[.[].databaseId] | map(select(. > ${before})) | min // empty") && [ -n "$run" ]; do
   sleep 3
 done
-gh run watch "$run"
+gh run watch "$run" --exit-status >/dev/null; gh run view "$run" --json conclusion --jq .conclusion
 ```
 
 Run IDs increase, so "the lowest id greater than the one that existed before I dispatched" is this dispatch's run even when others queue behind it. Capture `before` **before** the `gh workflow run` in Step 3.
+
+**Go on only when that run's conclusion is `success`.** Any other conclusion means no tag was pushed, or the pin landed and the tag push failed, so no `release.yml` run will start and the lookup below would find nothing. Read the run's log and go to "If it fails halfway".
 
 ### Then watch `release.yml` to the end
 
@@ -99,22 +101,26 @@ Find the run by its tag, not as the newest run: `release.yml` serialises on a `r
 
 ```bash
 tag=v<X.Y.Z>
-until rel=$(gh run list --workflow=release.yml --branch "$tag" --event push --limit 1 \
-              --json databaseId --jq '.[0].databaseId // empty') && [ -n "$rel" ]; do
+rel=""
+for _ in $(seq 1 30); do   # five minutes; the run normally appears within seconds of the tag push
+  rel=$(gh run list --workflow=release.yml --branch "$tag" --event push --limit 1 \
+          --json databaseId --jq '.[0].databaseId // empty') || rel=""
+  [ -n "$rel" ] && break
   sleep 10
 done
+[ -n "$rel" ] || { echo "no release.yml run for $tag"; exit 1; }
 gh run watch "$rel" --exit-status >/dev/null; gh run view "$rel" --json conclusion,jobs \
   --jq '.conclusion, (.jobs[] | select(.conclusion != "success") | "\(.name): \(.conclusion)")'
 gh release view "$tag" --json isDraft,publishedAt,assets --jq '"draft=\(.isDraft) published=\(.publishedAt)", (.assets[].name)'
 ```
 
-It runs long: the macOS builds queue for runners and `desktop-sign` (notarisation) has `timeout-minutes: 180`. Run the watch in the background and report back when it ends rather than ending the session on it.
+It runs long: the macOS builds queue for runners and `desktop-sign` (notarisation) has `timeout-minutes: 180`. Run the watch in the background and report back when it ends rather than ending the session on it. If the lookup ends with `no release.yml run`, the tag exists and nothing built it: report that, with the tag, rather than waiting longer.
 
 Then read the outcome:
 
 - **Every job `success`, and the Release published (`draft=false`) with a CLI archive for every target the `build` matrix lists:** the release is done. Report the Release URL and the run.
 - **`prepare`, `build` or `finalize` failed:** the CLI did not ship, or shipped incomplete (`finalize` publishes the GitHub Release, then the Homebrew formula and the Scoop manifest). Go to "If it fails halfway" below, choosing its branch by whether `prepare` finished.
-- **Only desktop jobs (`desktop-bundle`, `desktop-sign`, `desktop-publish`) failed:** the CLI shipped and the desktop alpha assets did not (CLAUDE.md rule 18: the CLI ships even when the bundle does not). Report which assets are missing and why. Rebuilding them is the user's call.
+- **Only desktop jobs (`desktop-bundle`, `desktop-sign`, `desktop-publish`) failed:** the CLI shipped (CLAUDE.md rule 18: the CLI ships even when the bundle does not), and some desktop alpha assets may have too. `desktop-publish` uploads whichever platform's bundle exists, so a failed macOS leg or signing step can still leave the Linux `.deb` published, and the job can fail after an upload. Read the Release's asset list to see which desktop assets are there, and report what shipped, what is missing, and the failed job's reason. Rebuilding the missing ones is the user's call.
 - **`docs` or `attest` failed:** the binaries shipped. Report the failed job, because the published docs or the CLI's provenance attestations are missing until it is re-run.
 
 `ci.yml` also runs against the tagged tree, because the pin commit deliberately carries no skip marker. A red there is worth surfacing even though nothing gates on it.
