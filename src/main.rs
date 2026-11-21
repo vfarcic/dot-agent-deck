@@ -39,6 +39,10 @@ enum CliAgent {
     /// shell `dot-agent-deck hook --agent devin` and are ingested by the
     /// [`dot_agent_deck::hook`] `"devin"` arm.
     Devin,
+    /// PRD #211: Google's Antigravity CLI (`agy`). Its hooks shell
+    /// `dot-agent-deck hook --agent antigravity` with camelCase payloads of
+    /// its own, ingested by the [`dot_agent_deck::hook`] `"antigravity"` arm.
+    Antigravity,
 }
 
 impl CliAgent {
@@ -52,6 +56,7 @@ impl CliAgent {
             CliAgent::Opencode => dot_agent_deck::event::AgentType::OpenCode,
             CliAgent::Codex => dot_agent_deck::event::AgentType::Codex,
             CliAgent::Devin => dot_agent_deck::event::AgentType::Devin,
+            CliAgent::Antigravity => dot_agent_deck::event::AgentType::Antigravity,
         }
     }
 }
@@ -1917,6 +1922,7 @@ fn main() -> ExitCode {
                 CliAgent::Opencode => "opencode",
                 CliAgent::Codex => "codex",
                 CliAgent::Devin => "devin",
+                CliAgent::Antigravity => "antigravity",
             };
             handle_hook(agent_str)
         }

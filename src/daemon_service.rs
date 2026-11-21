@@ -72,6 +72,7 @@ pub const CARRIED_ENV: &[&str] = &[
 pub const CARRIED_SCALAR_ENV: &[&str] = &[
     crate::doorbell_switch::CLAUDE_ENV,
     crate::doorbell_switch::CODEX_ENV,
+    crate::doorbell_switch::ANTIGRAVITY_ENV,
 ];
 
 /// The service manager `daemon install` targets.

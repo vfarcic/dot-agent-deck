@@ -48,7 +48,7 @@ export const FIXTURE_UNREACHABLE_DAEMON_ID = "ci@runner-7";
 export const FIXTURE_PENDING_DAEMON_ID = "ops@edge-3";
 
 /** Which scenario `createFixtureFleet` builds; selected by `?state=`. */
-export type FixtureState = "connected" | "disconnected" | "error" | "empty" | "crowded" | "fleet" | "docs" | "docs-pr" | "docs-generate" | "docs-fleet" | "voice-pages" | "upgrade" | "upgrade-error" | "hook-notice" | "docs-question" | "docs-restart";
+export type FixtureState = "connected" | "disconnected" | "error" | "empty" | "crowded" | "fleet" | "docs" | "docs-pr" | "docs-generate" | "docs-fleet" | "voice-pages" | "upgrade" | "upgrade-error" | "hook-notice" | "docs-question" | "docs-restart" | "docs-antigravity";
 
 /**
  * PRD #1487 M5 — the versions the `upgrade` scenarios play: this app's, and the
@@ -225,6 +225,7 @@ const FIXTURE_AGENT_TYPES: Record<string, AgentTypeId> = {
   codex: "codex",
   pi: "pi",
   devin: "devin",
+  agy: "antigravity",
 };
 
 export function fixtureAgentIdentity(cli: string | undefined, status: AgentStatus): Pick<AgentSession, "agentType" | "turn" | "promptKeys"> {
@@ -666,6 +667,7 @@ export function fixtureAgentRegistry(): NewAgentOption[] {
     { id: "pi", displayName: "Pi", defaultCommand: "pi" },
     { id: "codex", displayName: "Codex", defaultCommand: "codex" },
     { id: "devin", displayName: "Devin", defaultCommand: "devin" },
+    { id: "agy", displayName: "Antigravity", defaultCommand: "agy" },
   ];
 }
 
@@ -1382,6 +1384,47 @@ function hookNoticeFleet(): DeckSnapshot[] {
 }
 
 export function createFixtureSnapshot(state: FixtureState = "connected"): DeckSnapshot {
+  if (state === "docs-antigravity") {
+    const snapshot = createFixtureSnapshot("docs");
+    return {
+      ...snapshot,
+      repo: "demo-project",
+      worktree: "/workspace/demo-project",
+      agents: [{
+        ...crowdedAgent({ id: "1", displayName: "probe", role: "Antigravity", cli: "agy", status: "needs_input", cwd: "/workspace/demo-project", toolCount: 0, upForMinutes: 0, quietForMinutes: 0, tab: { kind: "dashboard" } }),
+        model: "",
+        statusReason: "Approve Bash: rm -f probe.txt",
+        pendingQuestion: {
+          id: "q-antigravity-permission",
+          kind: "permission",
+          channel: "keys",
+          questions: [{
+            prompt: "Approve Bash: rm -f probe.txt",
+            multiSelect: false,
+            options: [
+              { index: 1, label: "Yes, run command", role: "allow_once", answerable: true },
+              { index: 2, label: "Yes, and always allow in this conversation for commands that start with 'rm -f probe.txt'", role: "allow_always", answerable: true, scope: "this conversation" },
+              { index: 3, label: "Yes, and always allow for commands that start with 'rm -f probe.txt' (Persist to settings.json)", role: "allow_always", answerable: true, scope: "settings.json" },
+              { index: 4, label: "No, cancel", role: "deny", answerable: true },
+            ],
+          }],
+          tool: { name: "Bash", detail: "rm -f probe.txt" },
+          answerable: true,
+          raisedAtMs: Date.now(),
+        },
+        // The same permission menu replayed by tests/fixtures/antigravity/agy.
+        transcript: [
+          "\u001b[2J\u001b[HApprove Bash: rm -f probe.txt",
+          "  1. Yes, run command",
+          "  2. Yes, and always allow in this conversation for commands that start with 'rm -f probe.txt'",
+          "  3. Yes, and always allow for commands that start with 'rm -f probe.txt' (Persist to settings.json)",
+          "  4. No, cancel",
+          "Esc to cancel",
+          "",
+        ].join("\r\n"),
+      }],
+    };
+  }
   if (state === "docs-pr") {
     const snapshot = createFixtureSnapshot("docs");
     return {

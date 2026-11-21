@@ -542,6 +542,20 @@ export type VoiceActionContext = {
   remindStarLater: () => string | undefined;
   dismissStarPrompt: () => string | undefined;
   /**
+   * PRD #211 — the Antigravity experimental notice's three buttons: Open
+   * issues (open the repository's new-issue page), Later (show it again at
+   * the next interval) and Don't show again. Each answers `undefined` when it
+   * chose, or the sentence saying why not: the notice is not showing, or
+   * something is drawn over it.
+   *
+   * **Served by the SHELL**, which shows the notice after a New agent start
+   * of Antigravity (`chooseShownAntigravityNotice` in
+   * `lib/antigravityNotice.ts`).
+   */
+  openAntigravityIssues: () => string | undefined;
+  remindAntigravityLater: () => string | undefined;
+  dismissAntigravityNotice: () => string | undefined;
+  /**
    * PRD #802 D5 — the two voice members that lead to a STOP, and the one rule
    * they share: **each can only OPEN a confirmation.** Neither runs a deck
    * action; the confirmation's own button does, pressed by the user. So a
@@ -1700,6 +1714,40 @@ export const VOICE_ACTIONS = {
     },
   },
 
+  /* PRD #211 — the Antigravity notice's buttons, which voice may press for
+     the reason it may press the star reminder's: each acts only while the
+     notice is showing, and none starts or stops anything. Later has no row of
+     its own: it is what voice's `close` does to the notice, as `Esc` is. */
+  openAntigravityIssues: {
+    label: "Open the issues page from the Antigravity notice",
+    voice: true,
+    needs: ["openAntigravityIssues"],
+    run: (context: Pick<VoiceActionContext, "openAntigravityIssues"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.openAntigravityIssues();
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  remindAntigravityLater: {
+    label: "Close the Antigravity notice until the next interval",
+    no_voice: "the notice's Later and its `Escape`; the notice is on the overlay stack, so voice's `close` (\"cancel\", \"never mind\", \"close it\") closes it as the thing on top, which is Later, through `closeTopmost` — a row of its own would compete with the star reminder's `remind_star_later` for the same word \"later\", for a dialog `close` already answers. It is voice-reachable through that entry",
+    needs: ["remindAntigravityLater"],
+    run: (context: Pick<VoiceActionContext, "remindAntigravityLater"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.remindAntigravityLater();
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  dismissAntigravityNotice: {
+    label: "Stop the Antigravity notice from showing again",
+    voice: true,
+    needs: ["dismissAntigravityNotice"],
+    run: (context: Pick<VoiceActionContext, "dismissAntigravityNotice"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.dismissAntigravityNotice();
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
   /* PRD #802 D5 — the two rows that STOP something. Each entry calls a member
      that can only OPEN a confirmation (see the members' own comment on
      `VoiceActionContext`), so voice never reaches `runAction` for a stop: the
@@ -2084,7 +2132,7 @@ export type VoiceScreenContext = Omit<VoiceActionContext, keyof VoicePanelContex
  * on the overview and over the Runs screen on the deck. Its Cancel is reached
  * through `close`, so the shell publishes only its approve.
  */
-export type VoiceShellContext = Pick<VoiceActionContext, "closeSettings" | "closeOverlay" | "switchDeck" | "openAddDaemon" | "turnPage" | "approveProjectCommands" | "cancelProjectCommands" | "starRepo" | "remindStarLater" | "dismissStarPrompt" | keyof PullRequestContext>;
+export type VoiceShellContext = Pick<VoiceActionContext, "closeSettings" | "closeOverlay" | "switchDeck" | "openAddDaemon" | "turnPage" | "approveProjectCommands" | "cancelProjectCommands" | "starRepo" | "remindStarLater" | "dismissStarPrompt" | "openAntigravityIssues" | "remindAntigravityLater" | "dismissAntigravityNotice" | keyof PullRequestContext>;
 
 /**
  * PRD #1401 — the pull request browser's members, which the SHELL serves: the

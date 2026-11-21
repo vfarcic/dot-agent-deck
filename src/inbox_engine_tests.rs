@@ -42,6 +42,8 @@ const INTEGRATION: ReceiptArm = ReceiptArm {
     doorbell_only: false,
     resumed: false,
     hook_integration: None,
+    background_origin: None,
+    compaction: false,
 };
 
 /// The component's end of one receipt stream.
@@ -3721,6 +3723,8 @@ fn once_waiter_fenced(
                 component: InboxComponent::ClaudeWaiter,
                 doorbell_only: true,
                 kind: engine::LinkKind::Once { spent: true },
+                registered_at: t,
+                compaction: false,
             },
         );
         rx
@@ -5915,5 +5919,77 @@ async fn boundary_076_possession_reported_with_the_check_is_fresh_at_the_check()
             );
             peer.close().await;
         }
+    }
+}
+
+/// Issue #2133: a once-waiter armed before the latest turn started is held
+/// until one ack-wait from that start while the turn runs, and once the turn
+/// has ended, until the `Stop` arm grace after its end if that comes sooner.
+/// One armed during the turn is held the same way only when a compaction's
+/// SessionStart armed it; another (the `Stop` hook's own, reaching the deck
+/// before its Idle) is not, and nor is the waiter armed after the turn.
+#[test]
+fn a_waiter_armed_before_a_turn_or_by_its_compaction_is_held_until_the_stop_grace_or_the_ack_wait()
+{
+    use crate::agent_pty::TurnEdge::{Ended, Started};
+    let key: AgentKey = ("p".into(), "a".into());
+    for ack_wait in [Duration::from_secs(60), Duration::from_secs(3)] {
+        let hub = hub_with(Duration::from_secs(30), ack_wait);
+        let t = Instant::now();
+        let before = t.checked_sub(Duration::from_secs(1)).unwrap();
+        let during = t + Duration::from_millis(500);
+        let held = |registered, compaction| {
+            hub.lock()
+                .receipts
+                .once_hold_until(&key, registered, compaction)
+        };
+        assert_eq!(held(before, false), None, "{ack_wait:?}: no turn yet");
+        hub.note_turn("p", "a", turn(1, Started), t);
+        assert_eq!(
+            held(before, false),
+            Some(t + ack_wait),
+            "{ack_wait:?}: while it runs"
+        );
+        assert_eq!(
+            held(during, true),
+            Some(t + ack_wait),
+            "{ack_wait:?}: its compaction's"
+        );
+        assert_eq!(
+            held(during, false),
+            None,
+            "{ack_wait:?}: armed during it otherwise"
+        );
+        let ended = t + Duration::from_secs(2);
+        hub.note_turn("p", "a", turn(2, Ended), ended);
+        let until = Some((ended + engine::STOP_ARM_GRACE).min(t + ack_wait));
+        assert_eq!(
+            held(before, false),
+            until,
+            "{ack_wait:?}: older, once it ended"
+        );
+        assert_eq!(
+            held(during, true),
+            until,
+            "{ack_wait:?}: compaction's, once it ended"
+        );
+        assert_eq!(
+            held(during, false),
+            None,
+            "{ack_wait:?}: armed during it otherwise"
+        );
+        assert_eq!(
+            held(ended, true),
+            None,
+            "{ack_wait:?}: a compaction after it"
+        );
+        assert_eq!(held(ended, false), None, "{ack_wait:?}: armed by its Stop");
+        let next = ended + Duration::from_secs(1);
+        hub.note_turn("p", "a", turn(3, Started), next);
+        assert_eq!(
+            held(ended, false),
+            Some(next + ack_wait),
+            "{ack_wait:?}: the next turn holds the waiter its Stop armed"
+        );
     }
 }

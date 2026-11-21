@@ -1,4 +1,5 @@
 import { act, fireEvent, render, renderHook, screen, waitFor, within } from "@testing-library/react";
+import { useState } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot } from "./data/fixture";
 import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, LOCAL_ENDPOINT_SELECTION, type DesktopSettingsDto } from "./lib/bridge";
@@ -101,7 +102,7 @@ describe("the star reminder dialog", () => {
   it.each<[string, StarChoice]>([[STAR, "star"], [LATER, "later"], [DONT_ASK_AGAIN, "dismiss"]])("makes the choice of its %s button", (label, choice) => {
     const onChoose = vi.fn();
     render(<StarPromptDialog onChoose={onChoose} />);
-    fireEvent.click(screen.getByRole("button", { name: new RegExp(`${label}$`) }));
+    fireEvent.click(screen.getByRole("button", { name: new RegExp(`${label}$`) }), { detail: 1 });
     expect(onChoose).toHaveBeenCalledExactlyOnceWith(choice);
   });
 
@@ -115,6 +116,60 @@ describe("the star reminder dialog", () => {
     expect(onChoose).not.toHaveBeenCalled();
     await keysReady(dialog);
     fireEvent.keyDown(dialog, { key: "d" });
+    expect(onChoose).toHaveBeenCalledExactlyOnceWith("dismiss");
+  });
+
+  /** Scenario: a control behind the reminder has focus when the reminder opens, and the user answers it with `l`. Focus goes back to that control (PRD #211). */
+  it("gives focus back to what had it when it closes", async () => {
+    function Host() {
+      const [open, setOpen] = useState(false);
+      return <>
+        <button data-testid="opener" onClick={() => setOpen(true)}>opener</button>
+        {open && <StarPromptDialog onChoose={() => setOpen(false)} />}
+      </>;
+    }
+    render(<Host />);
+    const opener = screen.getByTestId("opener");
+    opener.focus();
+    fireEvent.click(opener, { detail: 1 });
+    const dialog = screen.getByRole("alertdialog");
+    expect(dialog).toHaveFocus();
+    await keysReady(dialog);
+    fireEvent.keyDown(dialog, { key: "l" });
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(opener).toHaveFocus();
+  });
+
+  /** Scenario: with the reminder open, before and after its keys arm, the user presses keys the app binds at the window (`?`, a digit, `Ctrl+K`) with focus on the reminder and on the page behind it. None reaches the window (PRD #211). */
+  it("lets no key reach the window behind it", async () => {
+    const behind = vi.fn();
+    window.addEventListener("keydown", behind);
+    try {
+      render(<StarPromptDialog onChoose={vi.fn()} />);
+      const dialog = screen.getByRole("alertdialog");
+      const keys = [{ key: "?" }, { key: "1" }, { key: "k", ctrlKey: true }];
+      for (const target of [dialog, document.body]) for (const key of keys) fireEvent.keyDown(target, key);
+      await keysReady(dialog);
+      for (const target of [dialog, document.body]) for (const key of keys) fireEvent.keyDown(target, key);
+      expect(behind).not.toHaveBeenCalled();
+    } finally {
+      window.removeEventListener("keydown", behind);
+    }
+  });
+
+  /** Scenario: the reminder opens while the user is typing, focus is on Don't ask again, and the next key is Enter. It presses nothing before the keys arm, and the click a key makes is refused; once armed, it chooses (PRD #211). */
+  it("lets no Enter press a button before its keys arm", async () => {
+    const onChoose = vi.fn();
+    render(<StarPromptDialog onChoose={onChoose} />);
+    const dialog = screen.getByRole("alertdialog");
+    const dismiss = within(dialog).getByRole("button", { name: `d ${DONT_ASK_AGAIN}` });
+    dismiss.focus();
+    expect(fireEvent.keyDown(dismiss, { key: "Enter" })).toBe(false);
+    fireEvent.click(dismiss, { detail: 0 });
+    expect(onChoose).not.toHaveBeenCalled();
+    await keysReady(dialog);
+    expect(fireEvent.keyDown(dismiss, { key: "Enter" })).toBe(true);
+    fireEvent.click(dismiss, { detail: 0 });
     expect(onChoose).toHaveBeenCalledExactlyOnceWith("dismiss");
   });
 
@@ -217,7 +272,7 @@ describe("the star reminder in the app", () => {
   /** Scenario: the user stars from the reminder on the deck screen. The app shows the sentence the runtime answers, as the TUI's status line does, until it is dismissed. */
   it("shows Star's sentence in the toast", async () => {
     render(<DeckShell runtime={runtimeOf({ starPromptLaunch: vi.fn(async () => true), starPromptChoose: vi.fn(async () => STAR_THANKS) })} initialView={{ kind: "deck" }} />);
-    fireEvent.click(within(await screen.findByTestId("star-prompt-dialog")).getByRole("button", { name: `s ${STAR}` }));
+    fireEvent.click(within(await screen.findByTestId("star-prompt-dialog")).getByRole("button", { name: `s ${STAR}` }), { detail: 1 });
     const toast = await screen.findByTestId("star-toast");
     expect(toast).toHaveTextContent(STAR_THANKS);
     fireEvent.click(within(toast).getByRole("button", { name: "Dismiss star message" }));

@@ -126,6 +126,20 @@ const ALLOWED_ROOT_MODULES: &[&str] = &[
     "agent_cards",
     "agent_pty",
     "agent_registry",
+    // PRD #211, argued rather than added quietly, on the star reminder's
+    // terms (`star_prompt` below). The desktop's Antigravity experimental
+    // notice names the words the TUI's notice shows (`TITLE`, `BODY`, the
+    // three choices, `issues_display`, `open_issues_message`) and the
+    // new-issue page Open issues opens, so both clients say the same thing in
+    // the same words (CLAUDE.md rule 22). The notice's state is
+    // `config::AntigravityNoticeState`, already allowlisted with `config`: by
+    // default a per-user file in the user's config directory, resolved from no
+    // project (`DOT_AGENT_DECK_ANTIGRAVITY_NOTICE` can point it elsewhere).
+    // Checked against this rule's lines: the module holds constants and
+    // `format!` calls; it reads no file, resolves no project, names no
+    // FORBIDDEN_SYMBOL or project-state literal, and contains no
+    // `std::env::current_dir` — all zero for it.
+    "antigravity_notice",
     // PRD #1223 M7, argued rather than added quietly. The desktop names ONE
     // item here, `AuthoringKind` — the closed wire enum `StartAgent`'s
     // `authoring_kind` carries — because `DaemonClient::start_authoring_agent`

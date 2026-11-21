@@ -10,8 +10,11 @@
 //! A [`ReleaseScanner`] is a `vt100` parser of its own at the pane's size,
 //! with no scrollback, fed every byte of the pane's output from the
 //! generation's first byte. **After every byte** it checks the row the cursor
-//! is on, and only that row, against each [`HeaderRecogniser`]: the anchor
-//! cell first, the rest of the span only on an anchor hit. The parser keeps
+//! is on, and the row a byte moved it off, against each [`HeaderRecogniser`]:
+//! the anchor cell first, the rest of the span only on an anchor hit. The row
+//! left is what reads a header whose last cell the agent leaves with a bare
+//! line feed (Antigravity, PRD #211): until then the cursor sits on the cell
+//! after its version, which may still be written. The parser keeps
 //! its state across calls, so the grid states the scanner passes through, and
 //! with them what it latches, depend on the bytes alone and never on how the
 //! PTY reader split them.
@@ -69,9 +72,13 @@ pub enum VersionEnd {
     BlankPassed,
 }
 
-/// One measured start-up header: `text` at `col` on `row`, then a version
-/// `MAJOR.MINOR.PATCH` (digits only: a pre-release tag does not match), then
-/// `end`.
+/// One measured start-up header: `text` at `col` on `row`, then a SemVer
+/// version, `MAJOR.MINOR.PATCH` with an optional pre-release (`-beta.1`) and
+/// build (`+abc`), then `end`. A pre-release build latches like a release
+/// (issue #2128): the doorbell's admission ([`crate::doorbell_activation`])
+/// and the composer probe's permission read the agent's facts, not which
+/// release latched, and `InputGrammar::of`'s measured grammar is for the bare
+/// 2.1.310 and 2.1.312 only, so a tagged one reads strictly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeaderRecogniser {
     pub agent: AgentType,
@@ -107,8 +114,29 @@ pub const CLAUDE_HEADER: HeaderRecogniser = HeaderRecogniser {
     end: VersionEnd::BlankPassed,
 };
 
+/// The most characters a header's version may have, tags included. The
+/// longest measured is Codex's `0.162.0-alpha.17.1` (18). The scanner reads a
+/// header after every byte, and its work budget prices the byte's parse, not
+/// that read, so the read must stay bounded: without a cap a row of
+/// `OpenAI Codex (v0.1.0-aaaa…` would be re-read whole at each byte, across
+/// a grid up to [`SCANNER_CELLS_MAX`] cells wide.
+pub const VERSION_CHARS_MAX: usize = 64;
+
+/// Antigravity's header (PRD #211), measured on `agy` 1.5.9 at 80 and 175
+/// columns, in a fresh pane and in its redraws after two resizes: a blank
+/// row, then `Antigravity CLI 1.5.9` at row 1, column 18, right of its logo,
+/// left with a bare line feed (`agy` runs its terminal raw).
+pub const ANTIGRAVITY_HEADER: HeaderRecogniser = HeaderRecogniser {
+    agent: AgentType::Antigravity,
+    row: 1,
+    col: 18,
+    text: "Antigravity CLI ",
+    end: VersionEnd::BlankPassed,
+};
+
 /// Every header the deck recognises.
-pub const HEADER_RECOGNISERS: &[HeaderRecogniser] = &[CODEX_HEADER, CLAUDE_HEADER];
+pub const HEADER_RECOGNISERS: &[HeaderRecogniser] =
+    &[CODEX_HEADER, CLAUDE_HEADER, ANTIGRAVITY_HEADER];
 
 /// A cell's text, with an untouched cell read as a blank.
 fn cell_char(screen: &vt100::Screen, row: u16, col: u16) -> Option<char> {
@@ -157,10 +185,39 @@ impl HeaderRecogniser {
                 break;
             }
             version.push(c);
+            if version.len() > VERSION_CHARS_MAX {
+                return None;
+            }
             col += 1;
         }
         if dots != 2 || digits_in_part == 0 {
             return None;
+        }
+        // Then a SemVer pre-release (`-beta.1`, `-alpha.17.1`) and build
+        // (`+abc`), each optional, in that order (issue #2128). Their cells
+        // are read as SemVer's identifier characters and the whole version is
+        // checked by `Version::parse` below, so `2.1.310-` or `-beta..1`
+        // latches nothing.
+        for marker in ['-', '+'] {
+            if cell_char(screen, row, col)? != marker {
+                continue;
+            }
+            version.push(marker);
+            if version.len() > VERSION_CHARS_MAX {
+                return None;
+            }
+            col += 1;
+            loop {
+                let c = cell_char(screen, row, col)?;
+                if !(c.is_ascii_alphanumeric() || c == '.' || c == '-') {
+                    break;
+                }
+                version.push(c);
+                if version.len() > VERSION_CHARS_MAX {
+                    return None;
+                }
+                col += 1;
+            }
         }
         let end = cell_char(screen, row, col)?;
         let ended = match self.end {
@@ -246,6 +303,9 @@ pub struct ReleaseScanner {
     /// The limit a byte would have passed. Set once; the scanner is fed
     /// nothing after it.
     over: Option<WorkLimit>,
+    /// The cursor's row at the last check, so the row a byte moves the cursor
+    /// off is checked once more as it is left.
+    cursor_row: u16,
 }
 
 fn within_budget(rows: u16, cols: u16) -> Result<(), OverBudget> {
@@ -271,6 +331,7 @@ impl ReleaseScanner {
             fed: 0,
             latch: ScanLatch::Pending,
             over: None,
+            cursor_row: 0,
         })
     }
 
@@ -320,7 +381,13 @@ impl ReleaseScanner {
         }
         let screen = self.parser.screen();
         let (row, _) = screen.cursor_position();
-        for recogniser in self.recognisers {
+        let left = std::mem::replace(&mut self.cursor_row, row);
+        let rows = [Some(row), (left != row).then_some(left)];
+        for (recogniser, row) in self
+            .recognisers
+            .iter()
+            .flat_map(|r| rows.into_iter().flatten().map(move |row| (r, row)))
+        {
             let Some(release) = recogniser.read(screen, row) else {
                 continue;
             };
@@ -647,5 +714,39 @@ impl ReleaseCapture {
             }
             _ => LatchedRelease::Unseen,
         }
+    }
+}
+
+#[cfg(test)]
+mod antigravity_tests {
+    use super::*;
+
+    /// PRD #211: Antigravity 1.5.9's start-up header, as measured at 175
+    /// columns (a blank row, its logo, then the bold header ended by a line
+    /// feed), latches its release.
+    #[test]
+    fn the_measured_antigravity_header_latches_its_release() {
+        let mut scanner = ReleaseScanner::new(48, 175, HEADER_RECOGNISERS).unwrap();
+        scanner.feed(
+            "\x1b[J\n\x1b[6C\u{2584}\u{2580}\u{2580}\u{2584}\x1b[m        \x1b[94;1mAntigravity CLI 1.5.9\x1b[m\n\x1b[34D\u{2580}"
+                .as_bytes(),
+        );
+        assert!(
+            matches!(
+                scanner.latch(),
+                ScanLatch::Latched { agent: AgentType::Antigravity, release, .. }
+                    if *release == Version::new(1, 5, 9)
+            ),
+            "{:?}",
+            scanner.latch()
+        );
+    }
+
+    /// The same words anywhere else on the screen are not the header.
+    #[test]
+    fn antigravity_words_off_the_header_row_latch_nothing() {
+        let mut scanner = ReleaseScanner::new(48, 175, &[ANTIGRAVITY_HEADER]).unwrap();
+        scanner.feed(b"\r\n\r\n\r\n      Antigravity CLI 1.5.9\r\n");
+        assert_eq!(scanner.latch(), &ScanLatch::Pending);
     }
 }

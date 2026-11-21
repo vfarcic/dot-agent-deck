@@ -82,6 +82,11 @@ pub const SCENARIOS: &[Scenario] = &[
         clients: &[Client::Tui, Client::Desktop],
     },
     Scenario {
+        name: "antigravity-needs-input",
+        description: "An Antigravity agent waiting for permission, with its reason beneath the status.",
+        clients: &[Client::Tui, Client::Desktop],
+    },
+    Scenario {
         name: "pull-request-badge",
         description: "An agent with open pull request #1234 awaiting review, on its TUI card and desktop Dashboard row.",
         clients: &[Client::Tui, Client::Desktop],

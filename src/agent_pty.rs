@@ -2319,6 +2319,14 @@ pub struct AgentBus {
     /// The agent the generation was spawned as, whose release alone sets its
     /// input grammar (Q83); `None` keeps it strict.
     spawned_as: Option<AgentType>,
+    /// PRD #211 (review): when the hook loop read the line of the latest
+    /// event attested to this generation. An OSC 7501 signal its
+    /// reader read before then is older than that event, and is not applied
+    /// over it ([`AgentPtyRegistry::hook_received_after`]).
+    hook_receipt: Mutex<Option<Instant>>,
+    /// PRD #211 (review): the line-read instant of the latest such event the
+    /// hook loop has finished ingesting ([`AgentPtyRegistry::note_hook_applied`]).
+    hook_applied: Mutex<Option<Instant>>,
 }
 
 /// Test seam: [`AgentBus`]'s hook for the next push that moves the release
@@ -2342,6 +2350,9 @@ struct PushCost {
     /// The generation's release latch changed, or its window closed: its
     /// re-projection is due (plan §3.4′).
     latch_changed: bool,
+    /// PRD #211: the push completed OSC 7501 status sequences, which
+    /// [`AgentBus::take_status_signals`] hands over.
+    status_signals: bool,
 }
 
 struct AgentBusState {
@@ -2370,6 +2381,62 @@ struct AgentBusState {
     /// lock before it is published. Nothing reads it yet, nor the input
     /// epoch it notes into (Q35-06).
     output_hook: crate::composer_probe::paste_mode::OutputHook,
+    /// PRD #211: the OSC 7501 status reader, and the agent it reads for: on
+    /// from the spawn for a generation spawned as an agent whose registry
+    /// entry switches it on
+    /// ([`crate::agent_registry::AgentSpec::status_osc7501`]), or, for one
+    /// started from a shell in the pane, while a session of that agent its
+    /// own hooks attested to the generation is the one active there
+    /// ([`AgentBus::shell_agent_hook`]). `None` for every other, which then
+    /// scans nothing.
+    status_osc: Option<(AgentType, crate::status_osc::Osc7501Scanner)>,
+    /// PRD #211: the status sequences read and not yet handed over, in byte
+    /// order. Only the reader thread pushes, and it takes them after each
+    /// push, so they leave in the order the agent wrote them.
+    status_signals: Vec<crate::status_osc::OscSignal>,
+    /// PRD #211 (second review, finding 4): moves each time the reader is
+    /// turned on or off. A signal read under one value is not applied once
+    /// the reader has moved past it ([`AgentPtyRegistry::status_reader_epoch`]).
+    status_epoch: u64,
+    /// PRD #211 (second review, findings 3 and 4): in a generation spawned as
+    /// no agent — a shell — the session of an OSC 7501 agent whose own hooks
+    /// named it, and what its own header said. `None` while none is.
+    shell_session: Option<ShellAgentSession>,
+    /// How many bytes the generation has written, and that count at the last
+    /// hook of an agent's own the shell's generation was named in: a new
+    /// session's header is read from the bytes after it.
+    output_total: u64,
+    shell_mark: u64,
+    /// The terminal's size, for the scan of a new session's header.
+    size: (u16, u16),
+}
+
+/// PRD #211 (second review, findings 3 and 4): an OSC 7501 agent's session
+/// running in a shell's generation, as its own attested hooks named it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShellAgentSession {
+    agent: AgentType,
+    session_id: String,
+    /// The release this session's own header showed, read from the output
+    /// written since the previous hook of an agent's own in the shell; `None`
+    /// when none was read there.
+    release: Option<semver::Version>,
+}
+
+/// PRD #211 (second review, findings 3 and 4): what an agent's own hook did
+/// to the OSC 7501 reader of a shell's generation
+/// ([`AgentPtyRegistry::note_own_agent_hook`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShellReaderChange {
+    /// A new session of an agent that reports through OSC 7501: its reader is
+    /// on, fresh, with the release its own header showed.
+    Started {
+        agent: AgentType,
+        release: Option<semver::Version>,
+    },
+    /// The session read ended, or another agent's session became active: the
+    /// reader is off and what it had read is dropped.
+    Ended,
 }
 
 impl AgentBusState {
@@ -2441,6 +2508,13 @@ impl AgentBus {
                 evidence: crate::evidence_state::EvidenceState::new(profile, rows, cols),
                 release: crate::release_scanner::ReleaseCapture::start(rows, cols),
                 output_hook,
+                status_osc: None,
+                status_signals: Vec::new(),
+                status_epoch: 0,
+                shell_session: None,
+                output_total: 0,
+                shell_mark: 0,
+                size: (rows, cols),
             }),
             label: String::new(),
             #[cfg(test)]
@@ -2450,15 +2524,184 @@ impl AgentBus {
             input,
             composer_bell,
             spawned_as: None,
+            hook_receipt: Mutex::new(None),
+            hook_applied: Mutex::new(None),
         }
     }
 
-    /// The bus for a generation spawned as `agent` (Q83).
+    /// The bus for a generation spawned as `agent` (Q83). PRD #211: an agent
+    /// that reports its status through OSC 7501 gets the reader for it.
     pub fn spawned_as(self, agent: Option<AgentType>) -> Self {
-        Self {
+        let mut bus = Self {
             spawned_as: agent,
             ..self
+        };
+        let reader = bus.spawned_as.as_ref().and_then(|agent| {
+            crate::agent_registry::spec(agent)
+                .status_osc7501
+                .map(|osc| {
+                    (
+                        agent.clone(),
+                        crate::status_osc::Osc7501Scanner::new(osc.app),
+                    )
+                })
+        });
+        bus.state.get_mut().unwrap().status_osc = reader;
+        bus
+    }
+
+    /// PRD #211 (second review, findings 3 and 4): a hook of `agent`'s own,
+    /// for its session `session_id`, attested to this generation — spawned as
+    /// no agent, a shell — named its pane (`ends`: the hook ends that
+    /// session; `starts`: it is the session's `SessionStart`). The OSC 7501
+    /// reader follows the agent invocation active in the shell:
+    ///
+    /// - a new invocation of an agent that reports through OSC 7501 turns a
+    ///   fresh reader on for it, drops whatever the previous one read, and
+    ///   reads that invocation's release off its own header, in the bytes
+    ///   written since the previous hook of an agent's own here — unknown
+    ///   when none was drawn there. A new session is a new invocation, and so
+    ///   is every `SessionStart`, even of a session already running here
+    ///   (audit B3c). So is a header of another release drawn since the
+    ///   session's previous hook, when no different header is there with it;
+    /// - its end, or any other agent's hook, turns the reader off and drops
+    ///   what it read.
+    ///
+    /// The reader is never turned on by the pane's output itself.
+    ///
+    /// Fourth audit, suggestion 3 (measured on `agy` 1.5.9): an `agy` resumed
+    /// with `--conversation=<id>` fires no `SessionStart` and its first hook
+    /// reports the same session id. It redraws its header, as the exiting
+    /// `agy` reprints its own, but in the captured shell run neither was on
+    /// the row [`crate::release_scanner::ANTIGRAVITY_HEADER`] reads, so
+    /// [`Self::header_since_mark`] read none. Such a resume is not detected:
+    /// it keeps the reader, its epoch and the earlier invocation's release,
+    /// when one was read. That release authorises no answer: a permission
+    /// question in a generation spawned as a shell is keyboard-only whatever
+    /// release was latched (`daemon::answer_release`). This does not
+    /// authenticate the process.
+    fn shell_agent_hook(
+        &self,
+        agent: &AgentType,
+        session_id: &str,
+        ends: bool,
+        starts: bool,
+    ) -> Option<ShellReaderChange> {
+        let osc = crate::agent_registry::spec(agent).status_osc7501;
+        let mut state = self.state.lock().unwrap();
+        let state = &mut *state;
+        let mut same = state
+            .shell_session
+            .as_ref()
+            .map(|session| session.agent == *agent && session.session_id == session_id);
+        if same == Some(true) && osc.is_some() && !ends {
+            // Audit B3c: a new invocation of the same session is read afresh.
+            let restarted = starts
+                || Self::header_since_mark(state, agent).is_some_and(|drawn| {
+                    state
+                        .shell_session
+                        .as_ref()
+                        .is_none_or(|session| session.release.as_ref() != Some(&drawn))
+                });
+            if restarted {
+                same = Some(false);
+            }
         }
+        let change = match (osc, same) {
+            (Some(_), Some(true)) if !ends => None,
+            (Some(osc), _) if !ends => {
+                let release = Self::header_since_mark(state, agent);
+                state.status_osc = Some((
+                    agent.clone(),
+                    crate::status_osc::Osc7501Scanner::new(osc.app),
+                ));
+                state.status_signals.clear();
+                state.status_epoch += 1;
+                state.shell_session = Some(ShellAgentSession {
+                    agent: agent.clone(),
+                    session_id: session_id.to_string(),
+                    release: release.clone(),
+                });
+                Some(ShellReaderChange::Started {
+                    agent: agent.clone(),
+                    release,
+                })
+            }
+            (Some(_), Some(false) | None) => None,
+            (_, Some(_)) => {
+                state.status_osc = None;
+                state.status_signals.clear();
+                state.status_epoch += 1;
+                state.shell_session = None;
+                Some(ShellReaderChange::Ended)
+            }
+            (None, None) => None,
+        };
+        state.shell_mark = state.output_total;
+        change
+    }
+
+    /// The release of `agent` a header in the bytes written since the shell's
+    /// last hook of an agent's own shows, read by a fresh, bounded scanner;
+    /// `None` when the ring no longer holds where they start, or they show no
+    /// such header, or two.
+    fn header_since_mark(state: &AgentBusState, agent: &AgentType) -> Option<semver::Version> {
+        let fresh = state.output_total.saturating_sub(state.shell_mark);
+        let held = state.scrollback.len() as u64;
+        if fresh == 0 || fresh > held {
+            return None;
+        }
+        let start = (held - fresh) as usize;
+        let take = (fresh.min(crate::release_scanner::RELEASE_WINDOW_BYTES)) as usize;
+        let bytes: Vec<u8> = state
+            .scrollback
+            .range(start..start + take)
+            .copied()
+            .collect();
+        let (rows, cols) = state.size;
+        let mut scanner = crate::release_scanner::ReleaseScanner::new(
+            rows,
+            cols,
+            crate::release_scanner::HEADER_RECOGNISERS,
+        )
+        .ok()?;
+        scanner.feed(&bytes);
+        match scanner.latch() {
+            crate::release_scanner::ScanLatch::Latched {
+                agent: seen,
+                release,
+                ..
+            } if seen == agent && scanner.over_budget().is_none() => Some(release.clone()),
+            _ => None,
+        }
+    }
+
+    /// PRD #211 (second review, finding 3): the release of `agent` the
+    /// session read in this shell's generation drew in its own header.
+    fn shell_release_for(&self, agent: &AgentType) -> crate::doorbell_activation::LatchedRelease {
+        let state = self.state.lock().unwrap();
+        match &state.shell_session {
+            Some(ShellAgentSession {
+                agent: running,
+                release: Some(release),
+                ..
+            }) if running == agent => {
+                crate::doorbell_activation::LatchedRelease::Known(release.clone())
+            }
+            _ => crate::doorbell_activation::LatchedRelease::Unseen,
+        }
+    }
+
+    /// PRD #211: the OSC 7501 status sequences read since the last call, in
+    /// the order the agent wrote them, with the agent the reader reads for.
+    fn take_status_signals(&self) -> Option<(AgentType, Vec<crate::status_osc::OscSignal>, u64)> {
+        let mut state = self.state.lock().unwrap();
+        let signals = std::mem::take(&mut state.status_signals);
+        let epoch = state.status_epoch;
+        state
+            .status_osc
+            .as_ref()
+            .map(|(agent, _)| (agent.clone(), signals, epoch))
     }
 
     /// PRD #1666 part 3 (Q35-14b): the generation's release for `agent`, as
@@ -2551,6 +2794,19 @@ impl AgentBus {
         let scanner = state.release.last_push();
         state.live_modes.feed(&arc);
         state.output_hook.on_output(&arc);
+        // PRD #211: off for every agent that does not report through OSC
+        // 7501, so this is one branch for them.
+        let status_signals = match state.status_osc.as_mut() {
+            Some((_, reader)) => {
+                let mut found = Vec::new();
+                reader.scan(&arc, &mut found);
+                let any = !found.is_empty();
+                state.status_signals.extend(found);
+                any
+            }
+            None => false,
+        };
+        state.output_total += arc.len() as u64;
         for &b in arc.iter() {
             state.scrollback.push_back(b);
         }
@@ -2590,6 +2846,7 @@ impl AgentBus {
             evidence_ns,
             scanner,
             latch_changed,
+            status_signals,
         }
     }
 
@@ -2765,6 +3022,7 @@ impl AgentBus {
             .evidence
             .edge(crate::evidence_state::EdgeReason::Resize, rows, cols);
         let release = state.release.resize(rows, cols);
+        state.size = (rows, cols);
         let epoch = state.evidence.layout_epoch();
         drop(state);
         if let Some(event) = release {
@@ -2814,6 +3072,9 @@ impl AgentBus {
             Ok(()) => state.release.resize(rows, cols),
             Err(_) => None,
         };
+        if result.is_ok() {
+            state.size = (rows, cols);
+        }
         let epoch = state.evidence.layout_epoch();
         drop(state);
         if let Some(event) = release {
@@ -2883,6 +3144,27 @@ impl AgentBus {
     /// one hold (R-D-U2-01).
     pub fn frame_unchanged(&self, mark: crate::evidence_state::FrameMark) -> bool {
         self.state.lock().unwrap().evidence.frame_unchanged(mark)
+    }
+
+    /// PRD #211 (audit B3): run `commit` while the Clean frame `mark` was
+    /// read from still stands, holding the output lock through it, so no
+    /// output the reader takes and no layout edge can land between the check
+    /// and `commit` (both take this lock). The lock is only tried: `None`,
+    /// running nothing, when anything else holds it now, when the frame
+    /// moved, or when it is poisoned. `commit` must not wait on anything: it
+    /// runs under the lock every output push takes.
+    fn commit_if_frame_unchanged<R>(
+        &self,
+        mark: crate::evidence_state::FrameMark,
+        commit: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let state = self.state.try_lock().ok()?;
+        if !state.evidence.frame_unchanged(mark) {
+            return None;
+        }
+        let committed = commit();
+        drop(state);
+        Some(committed)
     }
 
     /// The current frame, read losslessly, while the evidence state is Clean.
@@ -3410,6 +3692,25 @@ fn pump_reader(
             && let (Some(registry), Some(pane)) = (registry.upgrade(), pane_id_env.as_deref())
         {
             registry.request_reprojection(pane, &agent_id);
+        }
+        // PRD #211: the agent's own status reports, handed to the daemon in
+        // the order they were written.
+        if cost.status_signals {
+            let seen_at = Instant::now();
+            if let (Some(registry), Some(pane), Some((agent, signals, epoch))) = (
+                registry.upgrade(),
+                pane_id_env.as_deref(),
+                bus.take_status_signals(),
+            ) {
+                registry.publish_status_signals(StatusSignals {
+                    pane_id: pane.to_string(),
+                    agent_id: agent_id.clone(),
+                    agent_type: agent,
+                    signals,
+                    seen_at,
+                    epoch,
+                });
+            }
         }
     };
     // PRD #1666 part 3 (Q35-20a): on Linux the reader also takes drain
@@ -5953,6 +6254,16 @@ impl PaneWriter {
             // An answer is never a reply to a query: it passes no fence.
             |_, _| false,
             |frame| {
+                // PRD #211 (audit B3): a key authorised by the screen it was
+                // checked against is not held for later, when that screen
+                // may be gone.
+                if frame
+                    .answer
+                    .as_ref()
+                    .is_some_and(|answer| answer.gate.screen.is_some())
+                {
+                    return false;
+                }
                 // As a person's held frame: in flight and its epoch moved
                 // from acceptance. Q16-1: whether the planner cuts it is
                 // decided again here, in the same hold of the epoch's lock
@@ -5996,6 +6307,18 @@ impl PaneWriter {
                 queued();
                 return Ok(AnswerWrite::Full);
             }
+            Admission::Refused(frame)
+                if frame
+                    .answer
+                    .as_ref()
+                    .is_some_and(|answer| answer.gate.screen.is_some()) =>
+            {
+                if let Some(ticket) = frame.ticket {
+                    ticket.refuse(ANSWER_SCREEN_NOT_HELD);
+                }
+                queued();
+                return Ok(AnswerWrite::NotDeferred);
+            }
             Admission::Refused(frame) => {
                 // Q16-1: a liability went out after the read above.
                 if let Some(ticket) = frame.ticket {
@@ -6019,6 +6342,12 @@ impl PaneWriter {
                     .is_some_and(|inner| inner.is::<AnswerSuperseded>()) =>
             {
                 return Ok(AnswerWrite::Superseded);
+            }
+            PtyJobOutcome::Done(PtyJobDone { result: Err(e), .. })
+                if e.get_ref()
+                    .is_some_and(|inner| inner.is::<AnswerScreenNotHeld>()) =>
+            {
+                return Ok(AnswerWrite::ScreenMoved);
             }
             PtyJobOutcome::Done(done) => done.result?,
             PtyJobOutcome::Gone => return Err(PtyWriterThread::gone()),
@@ -6959,7 +7288,22 @@ impl PtyWriterThread {
                             done
                         }
                         PtyOp::Answer(buf, mut gate) => {
-                            if gate.still_pending() {
+                            let pending = gate.still_pending();
+                            if pending && let Some(witness) = gate.screen.as_ref() {
+                                // PRD #211 (audit B3): checked once more,
+                                // and written, under the output lock.
+                                let mut done = write_witnessed(
+                                    inner.as_mut(),
+                                    &buf,
+                                    witness,
+                                    &recorder,
+                                    &mut tracking,
+                                );
+                                if done.result.is_ok() {
+                                    done.flushed = Some(inner.flush());
+                                }
+                                done
+                            } else if pending {
                                 let mut done = write_all_recorded(
                                     inner.as_mut(),
                                     &buf,
@@ -7476,6 +7820,101 @@ impl Tracking<'_> {
             let input = self.input;
             natives.written(written, |seq| input.enter_native(seq, Instant::now()));
         }
+    }
+}
+
+/// PRD #211 (audit B3): write a screen-witnessed answer key — one byte — only
+/// while the frame its check read still stands, with the check and the
+/// `write(2)` in one hold of the output lock ([`AgentBus::commit_if_frame_unchanged`]),
+/// so no output the reader takes and no resize can land between them.
+///
+/// The output lock is only tried, and the byte is written only when the PTY
+/// master reports room for it
+/// ([`crate::doorbell_generation::GenerationDoorbell::master_has_room`]): this
+/// does not wait for the lock, for a frame that moved or for room. A held
+/// lock, a moved frame, no room, a key of more than one byte, a pane with no
+/// master to ask, and a `write(2)` interrupted (`EINTR`) or refused for room
+/// (`EAGAIN`) all write nothing and report [`AnswerScreenNotHeld`]
+/// ([`commit_answer_byte`]); none of them is tried again.
+///
+/// Accepted availability limit (fourth audit, suggestion 1): the master stays
+/// a blocking descriptor — the reader shares its file description, so its
+/// `O_NONBLOCK` is not toggled here — and room reported by `poll` is not
+/// reserved. A one-byte `write(2)` that blocks after `POLLOUT` (the master's
+/// output stopped in between, as `TCOOFF` does) blocks with the output lock
+/// held, so the reader, the screen queries and a resize of this pane wait
+/// until it returns. What this cannot see is output the agent wrote that the
+/// reader has not taken in yet.
+fn write_witnessed(
+    w: &mut (dyn std::io::Write + Send),
+    buf: &[u8],
+    witness: &ScreenWitness,
+    recorder: &InputRecorder,
+    tracking: &mut Tracking<'_>,
+) -> PtyJobDone {
+    let not_held = || PtyJobDone {
+        accepted: 0,
+        result: Err(std::io::Error::other(AnswerScreenNotHeld)),
+        flushed: None,
+    };
+    // Test seam: after the PTY thread's gate check, before the commit.
+    #[cfg(test)]
+    recorder.pause_at(PtyWritePause::BeforeWrite);
+    if buf.len() != 1 {
+        return not_held();
+    }
+    let has_room = || {
+        recorder
+            .doorbell
+            .as_ref()
+            .is_some_and(|doorbell| doorbell.master_has_room())
+    };
+    let wrote = witness.bus.commit_if_frame_unchanged(witness.mark, || {
+        if !has_room() {
+            return None;
+        }
+        Some(commit_answer_byte(w, buf))
+    });
+    let n = match wrote.flatten() {
+        None | Some(Ok(0)) => return not_held(),
+        Some(Ok(n)) => n.min(buf.len()),
+        Some(Err(e)) => {
+            return PtyJobDone {
+                accepted: 0,
+                result: Err(e),
+                flushed: None,
+            };
+        }
+    };
+    tracking.written(&buf[..n]);
+    #[cfg(test)]
+    recorder.pause_at(PtyWritePause::AfterWrite);
+    #[cfg(test)]
+    recorder.pause_at(PtyWritePause::BeforeRecord);
+    recorder.record(ByteSource::Answer, &buf[..n]);
+    PtyJobDone {
+        accepted: n,
+        result: Ok(()),
+        flushed: None,
+    }
+}
+
+/// PRD #211 (fourth audit, suggestion 1): the one `write(2)` of a
+/// screen-witnessed answer key, under the output lock
+/// ([`write_witnessed`]). A write interrupted by a signal (`EINTR`) or refused
+/// for room (`EAGAIN`) took nothing and is not tried again under the lock:
+/// `Ok(0)`, which refuses the answer as written nothing.
+fn commit_answer_byte(w: &mut (dyn std::io::Write + Send), buf: &[u8]) -> std::io::Result<usize> {
+    match w.write(buf) {
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+            ) =>
+        {
+            Ok(0)
+        }
+        other => other,
     }
 }
 
@@ -8058,10 +8497,35 @@ pub(crate) struct AnswerGate {
     /// it and written the keys or not, or when they are dropped unwritten.
     /// So it outlives a handler that stopped waiting for them.
     reservation: Option<AnswerReservation>,
+    /// PRD #211 (audit B3): for a key whose authority is that the agent's
+    /// screen showed the menu it answers, the frame that check read. The key
+    /// is written only while no output has changed that frame since; it is
+    /// never held behind a fence ([`PaneWriter::write_answer`]).
+    screen: Option<ScreenWitness>,
     /// Test seam: the PTY thread stops here before its check — see
     /// [`QuestionAnswers::arm_barrier`] and [`ANSWER_KEY_ON_PTY_THREAD`].
     #[cfg(test)]
     pause: Option<QuestionBarrier>,
+}
+
+/// PRD #211 (audit B3): the agent's screen as one answer's check read it — a
+/// Clean frame of the generation's evidence state, marked where it stood in
+/// the output and the layout ([`crate::evidence_state::FrameMark`]).
+/// PRD #211 (audit B3): whether a screen's rows show what an answer's key
+/// answers ([`AgentPtyRegistry::write_answer_keys`]).
+pub(crate) type ScreenPredicate<'a> = dyn Fn(&[String]) -> bool + Send + Sync + 'a;
+
+pub(crate) struct ScreenWitness {
+    bus: Arc<AgentBus>,
+    mark: crate::evidence_state::FrameMark,
+}
+
+impl ScreenWitness {
+    /// Whether the frame the check read is still the screen: Clean, the same
+    /// layout, no output taken since.
+    fn holds(&self) -> bool {
+        self.bus.frame_unchanged(self.mark)
+    }
 }
 
 impl AnswerGate {
@@ -8078,11 +8542,20 @@ impl AnswerGate {
             .unwrap()
             .get(&self.pane_id)
             .is_some_and(|seen| seen.id == self.question_id && seen.revision == self.revision)
+            && self.screen.as_ref().is_none_or(ScreenWitness::holds)
     }
 }
 
 /// How [`PaneWriter::write_answer`] ended when the PTY thread did not fail.
 pub(crate) enum AnswerWrite {
+    /// PRD #211 (audit B3): a fence held the pane's input, and a key whose
+    /// authority is the screen it was checked against is not held.
+    NotDeferred,
+    /// PRD #211 (audit B3): at its commit, a screen-witnessed key found the
+    /// frame its check read moved, the output lock taken, or the PTY with no
+    /// room, or its `write(2)` was interrupted or refused for room: nothing
+    /// was written ([`write_witnessed`]).
+    ScreenMoved,
     /// The keys are written; the human-input sequence number they were
     /// committed at.
     Written(u64),
@@ -8201,6 +8674,12 @@ impl KeyNotWritten {
 /// Ctrl+G candidate is refused while a check is open or a liability is out.
 pub(crate) const ANSWER_HOLDS_CTRL_G: &str = "the answer contains a key the deck can't hold safely";
 
+/// PRD #211 (audit B3): an answer checked against the agent's screen that the
+/// deck could not type while that screen stood: the screen changed, or the
+/// pane's input was held.
+pub(crate) const ANSWER_SCREEN_NOT_HELD: &str =
+    "the agent's screen changed after the deck checked the menu, so the answer was not typed";
+
 /// The error a PTY thread reports for an answer whose [`AnswerGate`] no longer
 /// held — told apart from a failed write by its type.
 #[derive(Debug)]
@@ -8213,6 +8692,19 @@ impl std::fmt::Display for AnswerSuperseded {
 }
 
 impl std::error::Error for AnswerSuperseded {}
+
+/// PRD #211 (audit B3): the error a PTY thread reports for a screen-witnessed
+/// answer key it did not write at its commit ([`write_witnessed`]).
+#[derive(Debug)]
+struct AnswerScreenNotHeld;
+
+impl std::fmt::Display for AnswerScreenNotHeld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(ANSWER_SCREEN_NOT_HELD)
+    }
+}
+
+impl std::error::Error for AnswerScreenNotHeld {}
 
 /// Test seam: the barrier name an [`AnswerGate`] stops the PTY thread at.
 #[cfg(test)]
@@ -8458,6 +8950,7 @@ impl QuestionAnswers {
             question_id: question_id.to_string(),
             revision,
             reservation: None,
+            screen: None,
             #[cfg(test)]
             pause: self
                 .barriers
@@ -8727,6 +9220,9 @@ pub struct AgentPtyRegistry {
     /// `None` for a registry with no owning daemon (in-process unit tests),
     /// where publishing is a silent no-op. See [`DeliveryNotice`].
     delivery_notice_sink: Mutex<Option<DeliveryNoticeSink>>,
+    /// PRD #211: where the OSC 7501 status a pane's agent writes is reported.
+    /// `None` for a registry with no owning daemon, which drops it.
+    status_signal_sink: Mutex<Option<StatusSignalSink>>,
     /// PRD #126: delegations that are still awaiting a `work-done` plus the set
     /// of panes currently mid-close. Both live under ONE mutex so "mark this
     /// pane closing AND drop its outstanding records" is a single atomic
@@ -10992,6 +11488,30 @@ pub struct DeliveryNotice {
 /// broadcast, neither of which the registry owns.
 pub type DeliveryNoticeSink = Arc<dyn Fn(DeliveryNotice) + Send + Sync>;
 
+/// PRD #211: OSC 7501 status sequences one generation wrote, read off its PTY
+/// output by the reader thread ([`crate::status_osc`]).
+#[derive(Debug, Clone)]
+pub struct StatusSignals {
+    pub pane_id: String,
+    /// The generation that wrote them.
+    pub agent_id: String,
+    /// What it was spawned as: the agent whose registry entry switched the
+    /// reader on.
+    pub agent_type: AgentType,
+    /// In the order they were written.
+    pub signals: Vec<crate::status_osc::OscSignal>,
+    /// When the reader read them.
+    pub seen_at: Instant,
+    /// The reader's epoch when it read them
+    /// ([`AgentPtyRegistry::status_reader_epoch`]).
+    pub epoch: u64,
+}
+
+/// PRD #211: the daemon's sink for [`StatusSignals`], installed via
+/// [`AgentPtyRegistry::set_status_signal_sink`]. Called on the reader thread,
+/// so it must not block.
+pub type StatusSignalSink = Arc<dyn Fn(StatusSignals) + Send + Sync>;
+
 impl Default for AgentPtyRegistry {
     fn default() -> Self {
         Self::new()
@@ -11098,6 +11618,7 @@ impl AgentPtyRegistry {
             ),
             agent_cards: crate::agent_cards::CardStore::default(),
             delivery_notice_sink: Mutex::new(None),
+            status_signal_sink: Mutex::new(None),
             delegations: crate::lock_rank::RankedMutex::new(DelegationTracker::default()),
             delegation_seq: AtomicU64::new(1),
             dispatch_returns: crate::lock_rank::RankedMutex::new(
@@ -11239,6 +11760,7 @@ impl AgentPtyRegistry {
         question_id: &str,
         revision: Option<u64>,
         keys: &[u8],
+        screen: Option<&ScreenPredicate<'_>>,
         revalidate: impl FnOnce() -> Fut,
         held: impl FnOnce() -> HeldFut,
     ) -> Result<KeyWritten, KeyNotWritten>
@@ -11277,12 +11799,29 @@ impl AgentPtyRegistry {
                 SettlementOutcome::Superseded,
             );
         }
+        // PRD #211 (audit B3): the screen this key's authority rests on, read
+        // here under the writer and the lifecycle, and carried to the PTY
+        // thread's last check before the write.
+        let witness = match screen {
+            Some(shows) => match self.screen_witness(agent_id) {
+                Some((rows, witness)) if shows(&rows) => Some(witness),
+                _ => {
+                    return refuse(
+                        ticket,
+                        ANSWER_SCREEN_NOT_HELD,
+                        SettlementOutcome::Superseded,
+                    );
+                }
+            },
+            None => None,
+        };
         self.question_answers
             .barrier("answer_keys:revalidated")
             .await;
         let mut gate = self
             .question_answers
             .answer_gate(pane_id, question_id, revision);
+        gate.screen = witness;
         gate.reservation =
             Some(
                 self.question_answers
@@ -11302,6 +11841,13 @@ impl AgentPtyRegistry {
                 ));
             }
             Ok(AnswerWrite::Refused) => return Err(failed(ANSWER_HOLDS_CTRL_G)),
+            Ok(AnswerWrite::NotDeferred) => return Err(failed(ANSWER_SCREEN_NOT_HELD)),
+            Ok(AnswerWrite::ScreenMoved) => {
+                return Err(KeyNotWritten::now(
+                    ANSWER_SCREEN_NOT_HELD,
+                    SettlementOutcome::Superseded,
+                ));
+            }
             Ok(AnswerWrite::Full) => return Err(failed(ANSWER_INPUT_FULL)),
             Ok(AnswerWrite::Exited) => {
                 return Err(KeyNotWritten::now(
@@ -11492,6 +12038,22 @@ impl AgentPtyRegistry {
     /// (every in-process unit test) simply drops notices.
     pub fn set_delivery_notice_sink(&self, sink: DeliveryNoticeSink) {
         *self.delivery_notice_sink.lock().unwrap() = Some(sink);
+    }
+
+    /// PRD #211: install the daemon's sink for [`StatusSignals`]. A registry
+    /// without one drops them.
+    pub fn set_status_signal_sink(&self, sink: StatusSignalSink) {
+        *self.status_signal_sink.lock().unwrap() = Some(sink);
+    }
+
+    /// PRD #211: hand a generation's OSC 7501 status to the daemon. Whether
+    /// the generation still holds its pane is checked where the status is
+    /// applied, under the lock that applies it.
+    pub fn publish_status_signals(&self, signals: StatusSignals) {
+        let sink = self.status_signal_sink.lock().unwrap().clone();
+        if let Some(sink) = sink {
+            sink(signals);
+        }
     }
 
     /// Issue #424 (reviewer blocker 3): report a delivery failure against the
@@ -13481,6 +14043,56 @@ impl AgentPtyRegistry {
         input.is_some_and(|input| input.touched())
     }
 
+    /// PRD #211 (PR #2370 review, Greptile P1 and audit S2): generation
+    /// `agent_id`'s own prompt hook, attested to it and accepted, whose line
+    /// was read at `read_at`, reported that the agent took a submitted prompt
+    /// on a turn's first model call. When the last op to enter its box is a
+    /// person's that ended in Enter, written at or before `read_at`, the box
+    /// is untouched again
+    /// ([`crate::composer_probe::epoch::GenerationInput::reconcile_human_submit`]).
+    /// Whether it applied; `false` for a generation that is gone.
+    pub fn note_prompt_taken(&self, agent_id: &str, read_at: Instant) -> bool {
+        self.generation_input(agent_id)
+            .is_some_and(|input| input.reconcile_human_submit(read_at))
+    }
+
+    /// PRD #211 (PR #2370 review): generation `agent_id`'s own terminal
+    /// status, read at `seen_at`, put its card on a permission prompt or
+    /// dialog ([`crate::composer_probe::epoch::GenerationInput::note_prompt_shown`]).
+    pub fn note_prompt_shown(&self, agent_id: &str, seen_at: Instant) {
+        if let Some(input) = self.generation_input(agent_id) {
+            input.note_prompt_shown(seen_at);
+        }
+    }
+
+    /// PRD #211 (PR #2370 review, Greptile P1; review P1): a witness of
+    /// generation `agent_id`'s own, read at `read_at`, that it left a
+    /// permission prompt or dialog. When what was entered into its box since
+    /// it was untouched is the menu keys that answered it, the box stays
+    /// untouched
+    /// ([`crate::composer_probe::epoch::GenerationInput::reconcile_menu_answer`]).
+    /// Whether it applied; `false` for a generation that is gone.
+    pub fn note_menu_answer_taken(
+        &self,
+        agent_id: &str,
+        read_at: Instant,
+        departure: crate::composer_probe::epoch::Departure,
+    ) -> bool {
+        self.generation_input(agent_id)
+            .is_some_and(|input| input.reconcile_menu_answer(read_at, departure))
+    }
+
+    fn generation_input(
+        &self,
+        agent_id: &str,
+    ) -> Option<Arc<crate::composer_probe::epoch::GenerationInput>> {
+        let inner = self.inner.lock();
+        inner
+            .agents
+            .get(agent_id)
+            .map(|agent| Arc::clone(agent.bus.input()))
+    }
+
     /// PRD #1666 part 3 (plan §5.1, Q35-21): the pane's open paste, whether
     /// generation `agent_id`'s box is touched and whether the deck can check
     /// it, and how many of its agent's turns have ended, for the doorbell's
@@ -13612,6 +14224,188 @@ impl AgentPtyRegistry {
         if let Some(bus) = bus {
             bus.close_release(crate::release_scanner::WindowClose::FirstPrompt);
         }
+    }
+
+    /// PRD #211 (review): the hook loop read, at `at`, the line of an event
+    /// attested to generation `agent_id`. Kept as the latest such instant.
+    pub fn note_hook_receipt(&self, agent_id: &str, at: Instant) {
+        let bus = {
+            let inner = self.inner.lock();
+            match inner.agents.get(agent_id) {
+                Some(agent) => Arc::clone(&agent.bus),
+                None => return,
+            }
+        };
+        let mut receipt = bus.hook_receipt.lock().unwrap();
+        if receipt.is_none_or(|latest| latest < at) {
+            *receipt = Some(at);
+        }
+    }
+
+    /// PRD #211 (review): the hook loop finished ingesting the event attested
+    /// to generation `agent_id` whose line it read at `at`, whether
+    /// it applied it or refused it.
+    pub fn note_hook_applied(&self, agent_id: &str, at: Instant) {
+        let Some(bus) = self.generation_bus(agent_id) else {
+            return;
+        };
+        let mut applied = bus.hook_applied.lock().unwrap();
+        if applied.is_none_or(|latest| latest < at) {
+            *applied = Some(at);
+        }
+    }
+
+    /// PRD #211 (review): whether a hook event attested to generation
+    /// `agent_id`, read at or before `at`, has not been ingested yet. An
+    /// OSC 7501 signal read at `at` is newer than that event, and is applied
+    /// after it.
+    pub fn hook_in_flight_before(&self, agent_id: &str, at: Instant) -> bool {
+        let Some(bus) = self.generation_bus(agent_id) else {
+            return false;
+        };
+        let Some(received) = *bus.hook_receipt.lock().unwrap() else {
+            return false;
+        };
+        let applied = *bus.hook_applied.lock().unwrap();
+        received <= at && applied.is_none_or(|applied| applied < received)
+    }
+
+    fn generation_bus(&self, agent_id: &str) -> Option<Arc<AgentBus>> {
+        let inner = self.inner.lock();
+        inner
+            .agents
+            .get(agent_id)
+            .map(|agent| Arc::clone(&agent.bus))
+    }
+
+    /// PRD #211 (review): whether a hook event attested to generation
+    /// `agent_id` was received after `at`, the instant its OSC 7501 reader
+    /// read a signal: that signal is then older than the event, and the
+    /// event's status and question stand.
+    pub fn hook_received_after(&self, agent_id: &str, at: Instant) -> bool {
+        let bus = {
+            let inner = self.inner.lock();
+            match inner.agents.get(agent_id) {
+                Some(agent) => Arc::clone(&agent.bus),
+                None => return false,
+            }
+        };
+        bus.hook_receipt
+            .lock()
+            .unwrap()
+            .is_some_and(|latest| latest > at)
+    }
+
+    /// PRD #211 (second review, findings 3 and 4): an event of `agent`'s own
+    /// hooks, for its session `session_id`, attested to generation
+    /// `agent_id`, named pane `pane_id` (`ends`: it ends that session;
+    /// `starts`: it is a `SessionStart`, which starts a new invocation even of
+    /// a session already running there). In a
+    /// generation spawned as no agent — a shell — the OSC 7501 reader follows
+    /// the agent session active there ([`AgentBus::shell_agent_hook`]): on,
+    /// fresh, for a new session of an agent that reports that way, with the
+    /// release its own header showed; off, with what it read dropped, at that
+    /// session's end or at any other agent's hook. Only while the generation
+    /// still speaks for the pane. A generation spawned as an agent keeps the
+    /// reader its spawn gave it. What changed, if anything.
+    pub fn note_own_agent_hook(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        agent: &AgentType,
+        session_id: &str,
+        ends: bool,
+        starts: bool,
+    ) -> Option<ShellReaderChange> {
+        let bus = {
+            let inner = self.inner.lock();
+            let record = inner.agents.get(agent_id)?;
+            if record.pane_id_env.as_deref() != Some(pane_id)
+                || !Self::generation_speaks_for_pane(&inner, agent_id, record, pane_id)
+                || record.spawn_agent_type.is_some()
+            {
+                return None;
+            }
+            Arc::clone(&record.bus)
+        };
+        bus.shell_agent_hook(agent, session_id, ends, starts)
+    }
+
+    /// PRD #211 (second review, finding 4): generation `agent_id`'s OSC 7501
+    /// reader epoch, which moves each time its reader is turned on or off;
+    /// `None` when the registry holds no such generation.
+    pub fn status_reader_epoch(&self, agent_id: &str) -> Option<u64> {
+        let bus = self.generation_bus(agent_id)?;
+        let epoch = bus.state.lock().unwrap().status_epoch;
+        Some(epoch)
+    }
+
+    /// PRD #211 (audit suggestion): the release of `agent` that generation
+    /// `agent_id` drew in its own output, as its release scanner latched it.
+    /// `None` when the registry holds no such generation.
+    pub fn latched_release(
+        &self,
+        agent_id: &str,
+        agent: &AgentType,
+    ) -> Option<crate::doorbell_activation::LatchedRelease> {
+        let (bus, shell) = {
+            let inner = self.inner.lock();
+            let record = inner.agents.get(agent_id)?;
+            (Arc::clone(&record.bus), record.spawn_agent_type.is_none())
+        };
+        // PRD #211 (second review, finding 3): in a shell, the release is the
+        // one the agent session running there now drew, never the
+        // generation's first header.
+        if shell {
+            return Some(bus.shell_release_for(agent));
+        }
+        let release = bus.state.lock().unwrap().release.latched_for(agent);
+        Some(release)
+    }
+
+    /// PRD #211 (audit, CWE-345): the rows generation `agent_id`'s screen
+    /// shows now, read losslessly while its evidence state is Clean
+    /// ([`AgentBus::clean_frame`]). `None` when there is no such generation or
+    /// its screen cannot be read faithfully now.
+    pub fn screen_rows(&self, agent_id: &str) -> Option<Vec<String>> {
+        let bus = {
+            let inner = self.inner.lock();
+            Arc::clone(&inner.agents.get(agent_id)?.bus)
+        };
+        let grid = bus.clean_frame()?;
+        Some((0..grid.rows).map(|row| grid.text_from(row, 0)).collect())
+    }
+
+    /// PRD #211 (audit B3): [`Self::screen_rows`], with the witness of the
+    /// frame they were read from.
+    pub(crate) fn screen_witness(&self, agent_id: &str) -> Option<(Vec<String>, ScreenWitness)> {
+        let bus = {
+            let inner = self.inner.lock();
+            Arc::clone(&inner.agents.get(agent_id)?.bus)
+        };
+        let (grid, mark) = bus.clean_frame_marked()?;
+        let rows = (0..grid.rows).map(|row| grid.text_from(row, 0)).collect();
+        Some((rows, ScreenWitness { bus, mark }))
+    }
+
+    /// Test seam: take `agent_id`'s output lock on another thread and hold it
+    /// until the returned sender is dropped or sent on — as the reader does
+    /// while it takes output in. Returns once the lock is held.
+    #[cfg(test)]
+    pub(crate) fn hold_output_lock_for_test(&self, agent_id: &str) -> std::sync::mpsc::Sender<()> {
+        let bus = {
+            let inner = self.inner.lock();
+            Arc::clone(&inner.agents.get(agent_id).expect("a running agent").bus)
+        };
+        let (held_tx, held) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let _state = bus.state.lock().unwrap();
+            let _ = held_tx.send(());
+            let _ = released.recv();
+        });
+        held.recv().expect("the output lock is held");
+        release
     }
 
     /// `agent_id`'s release capture ([`AgentBus::release`]).
@@ -14950,6 +15744,23 @@ impl AgentPtyRegistry {
                 spool.to_string_lossy().into_owned(),
             ));
         }
+        // PRD #211: an agent that reports its status through OSC 7501 is asked
+        // to on every pane the deck starts, whatever the pane's command, so
+        // one started from a shell there reports it too. The daemon reads it
+        // from a generation spawned as that agent ([`AgentBus::spawned_as`]),
+        // or, in a shell, while that agent's own hooks name a session of it
+        // there ([`Self::note_own_agent_hook`]). The variable is Antigravity's
+        // own opt-in (`AGY_CLI_OSC7501`), and the sequences a pane carries
+        // that the deck does not read are an OSC that vt100 and the deck's
+        // clients ignore.
+        for osc in crate::agent_registry::ALL
+            .iter()
+            .filter_map(|spec| spec.status_osc7501)
+        {
+            let (name, value) = osc.enable_env;
+            opts.env.retain(|(k, _)| k != name);
+            opts.env.push((name.to_string(), value.to_string()));
+        }
 
         // Capture the full env vec and the requested PTY size BEFORE
         // `spawn(opts)` consumes the options. Stored on `RunningAgent`
@@ -15099,10 +15910,11 @@ impl AgentPtyRegistry {
         } else {
             None
         };
-        // Issue #1973: a Claude Code, Codex or Devin generation's hooks are
-        // repaired before its child starts when they name no deck (the agent
-        // was set up after this daemon's startup install ran) or a deck copy
-        // that is gone, so the agent reports its status from its first turn.
+        // Issue #1973: a Claude Code, Codex, Devin or Antigravity generation's
+        // hooks are repaired before its child starts when they name no deck
+        // (the agent was set up after this daemon's startup install ran) or a
+        // deck copy that is gone, so the agent reports its status from its
+        // first turn.
         // Hooks that already name a usable deck are left as they are: they
         // live in the user's own config, which the deck does not rewrite on
         // every start. OpenCode's plugin is refreshed above.
@@ -19348,11 +20160,27 @@ impl AgentPtyRegistry {
                 if !opencode_spawn(declared, agent.spawn_command.as_deref()) {
                     return None;
                 }
+                // Issue #2445: the spawn probed only when it already knew it
+                // started OpenCode (the same test as the spawn site's, on the
+                // type the spawn declared); a type a hook revealed later
+                // leaves that probe owed, with the PATH the spawn handed the
+                // pane.
+                let spawn_probe = if opencode_spawn(
+                    agent.spawn_agent_type.as_ref(),
+                    agent.spawn_command.as_deref(),
+                ) {
+                    crate::opencode_mode::SpawnProbe::Done
+                } else {
+                    crate::opencode_mode::SpawnProbe::Owed {
+                        path: overlay_value(&agent.spawn_env, "PATH").map(Into::into),
+                    }
+                };
                 Some(crate::opencode_mode::Watched {
                     pane_id: agent.pane_id_env.clone()?,
                     agent_id: agent_id.clone(),
                     root_pid: i32::try_from(agent.child.process_id()?).ok()?,
                     spawn_version: agent.opencode_spawn_version,
+                    spawn_probe,
                 })
             })
             .collect()
@@ -21816,6 +22644,7 @@ mod tests {
         let server = |client_pid, server_pid| AgentServer {
             client_pid,
             server_pid,
+            process_daemon_pid: None,
         };
         let held = |id: &str| registry.inner.lock().agents[id].opencode_private_server;
 
@@ -22950,6 +23779,46 @@ mod spawn_tests {
             assert!(matches!(err, AgentPtyError::Resize(_)));
         }
         registry.shutdown_all();
+    }
+
+    /// Scenario: a pane started by an undeclared wrapper is not watched as
+    /// OpenCode until its own hooks reveal OpenCode; from then it is, and
+    /// carries the probe its spawn did not run, with the PATH the spawn handed
+    /// it, so the watch can learn its client's version (issue #2445).
+    #[test]
+    fn a_hook_revealed_opencode_wrapper_is_watched_with_its_probe_owed() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("sh -c 'exec cat'"),
+                env: vec![
+                    (
+                        DOT_AGENT_DECK_PANE_ID.to_string(),
+                        "pane-wrapper".to_string(),
+                    ),
+                    ("PATH".to_string(), "/pane/bin:/usr/bin:/bin".to_string()),
+                ],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the wrapper-shaped pane");
+        assert!(
+            registry.opencode_watch_list().is_empty(),
+            "an undeclared wrapper is not known to run OpenCode yet"
+        );
+        registry.set_agent_type("pane-wrapper", &AgentType::OpenCode);
+        let watched = registry.opencode_watch_list();
+        assert_eq!(watched.len(), 1, "{watched:?}");
+        assert_eq!(watched[0].agent_id, agent);
+        assert_eq!(watched[0].pane_id, "pane-wrapper");
+        assert_eq!(watched[0].spawn_version, None);
+        assert_eq!(
+            watched[0].spawn_probe,
+            crate::opencode_mode::SpawnProbe::Owed {
+                path: Some("/pane/bin:/usr/bin:/bin".into())
+            },
+            "the spawn probed nothing, so the watch owes the probe on its PATH"
+        );
+        registry.close_agent(&agent).expect("close the pane");
     }
 
     /// Issue #1602: the registry keeps the command a pane was CONFIGURED with —
@@ -26697,6 +27566,7 @@ mod spawn_tests {
                 blocked: None,
                 hook_generation: None,
                 delivery_notice: None,
+                status_reason: None,
                 pending_question: None,
                 pull_request: None,
                 pull_request_revision: None,
@@ -35343,13 +36213,13 @@ mod spawn_tests {
         );
     }
 
-    /// Issue #1973: a spawn that starts Claude Code, declared or found by its
-    /// command's basename, or Devin, asks for that agent's hooks to be
-    /// repaired before its child starts; a command that is no known agent
-    /// asks for nothing.
+    /// Issue #1973: a spawn that starts Claude Code or Antigravity, declared or
+    /// found by its command's basename (`claude`, `agy`), or Devin, asks for
+    /// that agent's hooks to be repaired before its child starts; a command
+    /// that is no known agent asks for nothing.
     #[cfg(unix)]
     #[test]
-    fn a_claude_code_or_devin_spawn_asks_for_its_hooks_to_be_repaired() {
+    fn a_claude_code_devin_or_antigravity_spawn_asks_for_its_hooks_to_be_repaired() {
         use std::os::unix::fs::PermissionsExt;
         let registry = Arc::new(AgentPtyRegistry::new());
         let bin = tempfile::tempdir().unwrap();
@@ -35357,6 +36227,10 @@ mod spawn_tests {
         crate::test_isolation::write_script(&claude, "#!/bin/sh\nexec cat\n").unwrap();
         std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
         let claude = claude.display().to_string();
+        let agy = bin.path().join("agy");
+        crate::test_isolation::write_script(&agy, "#!/bin/sh\nexec cat\n").unwrap();
+        std::fs::set_permissions(&agy, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let agy = agy.display().to_string();
         let spawn = |command: &str, agent_type: Option<AgentType>| {
             registry
                 .spawn_agent(SpawnOptions {
@@ -35373,12 +36247,16 @@ mod spawn_tests {
         spawn("cat", Some(AgentType::ClaudeCode));
         spawn(&claude, None);
         spawn("cat", Some(AgentType::Devin));
+        spawn("cat", Some(AgentType::Antigravity));
+        spawn(&agy, None);
         assert_eq!(
             registry.hook_repairs_for_test(),
             vec![
                 AgentType::ClaudeCode,
                 AgentType::ClaudeCode,
-                AgentType::Devin
+                AgentType::Devin,
+                AgentType::Antigravity,
+                AgentType::Antigravity
             ]
         );
     }
@@ -37118,5 +37996,851 @@ mod spawn_tests {
         );
 
         registry.shutdown_all();
+    }
+}
+
+/// PRD #211 (second review, findings 3 and 4): an OSC 7501 agent started from
+/// a shell — its reader and its release follow the agent session its own
+/// hooks name.
+#[cfg(test)]
+mod shell_agent_session_tests {
+    use super::*;
+
+    /// `agy`'s start-up header for `release`, drawn from the top-left cell as
+    /// measured on 1.5.9.
+    fn header(release: &str) -> Vec<u8> {
+        format!(
+            "\x1b[H\x1b[J\n\x1b[6C\u{2584}\u{2580}\u{2580}\u{2584}\x1b[m        \x1b[94;1mAntigravity CLI {release}\x1b[m\n\x1b[34D\u{2580}\r\n"
+        )
+        .into_bytes()
+    }
+
+    const PERMISSION: &[u8] = b"\x1b]7501;state=blocked:kind=permission:app=antigravity:msg=QXBwcm92ZSBCYXNoOiBybSAtZiBwcm9iZS50eHQ=\x07";
+
+    fn release(bus: &AgentBus) -> Option<String> {
+        match bus.shell_release_for(&AgentType::Antigravity) {
+            crate::doorbell_activation::LatchedRelease::Known(v) => Some(v.to_string()),
+            _ => None,
+        }
+    }
+
+    fn reads_osc(bus: &AgentBus) -> bool {
+        bus.push(PERMISSION.to_vec());
+        bus.take_status_signals()
+            .is_some_and(|(_, signals, _)| !signals.is_empty())
+    }
+
+    /// Scenario: in one shell, `agy` 1.5.9 runs a session, exits, and
+    /// another `agy` that draws 1.6.0 starts a new session; then a third
+    /// whose header is not read. Each session's release is its own header's,
+    /// and the third's is unknown rather than the first's.
+    #[test]
+    fn each_shell_agy_session_has_its_own_release() {
+        let bus = AgentBus::new();
+        bus.push(b"$ agy\r\n".to_vec());
+        bus.push(header("1.5.9"));
+        assert!(matches!(
+            bus.shell_agent_hook(&AgentType::Antigravity, "conv-1", false, false),
+            Some(ShellReaderChange::Started { .. })
+        ));
+        assert_eq!(release(&bus).as_deref(), Some("1.5.9"));
+        // Later hooks of the same session change nothing.
+        assert_eq!(
+            bus.shell_agent_hook(&AgentType::Antigravity, "conv-1", false, false),
+            None
+        );
+        bus.push(b"bye\r\n$ agy\r\n".to_vec());
+        bus.push(header("1.6.0"));
+        bus.shell_agent_hook(&AgentType::Antigravity, "conv-2", false, false);
+        assert_eq!(
+            release(&bus).as_deref(),
+            Some("1.6.0"),
+            "the second agy's release is its own header's"
+        );
+        bus.push(b"bye\r\n$ agy\r\n  no header here\r\n".to_vec());
+        bus.shell_agent_hook(&AgentType::Antigravity, "conv-3", false, false);
+        assert_eq!(
+            release(&bus),
+            None,
+            "an agy whose header was not read inherits no earlier release"
+        );
+    }
+
+    /// Scenario: in one shell, `agy` 1.5.9 runs conversation C and exits with
+    /// no hook; a newer `agy` then runs C again, drawing 1.6.0, and a
+    /// `SessionStart` arrives under the same conversation id (a real `agy`
+    /// 1.5.9 resumed with `--conversation` fires none). Its
+    /// release is its own header's and its reader is a fresh one, so what
+    /// the old reader read is dropped. A third start of C whose header is not
+    /// read is unknown rather than 1.6.0. A later hook of the session with a
+    /// header of another release drawn since is a new invocation too, while
+    /// one with no new header changes nothing.
+    #[test]
+    fn a_session_start_under_the_same_shell_agy_conversation_inherits_no_release() {
+        let bus = AgentBus::new();
+        bus.push(b"$ agy\r\n".to_vec());
+        bus.push(header("1.5.9"));
+        bus.shell_agent_hook(&AgentType::Antigravity, "conv-c", false, true);
+        assert_eq!(release(&bus).as_deref(), Some("1.5.9"));
+        let first_epoch = bus.state.lock().unwrap().status_epoch;
+        // Read by the 1.5.9 reader, not handed over, when the resume lands.
+        bus.push(PERMISSION.to_vec());
+        bus.push(b"$ agy --conversation=conv-c\r\n".to_vec());
+        bus.push(header("1.6.0"));
+        assert!(matches!(
+            bus.shell_agent_hook(&AgentType::Antigravity, "conv-c", false, true),
+            Some(ShellReaderChange::Started { .. })
+        ));
+        assert_eq!(
+            release(&bus).as_deref(),
+            Some("1.6.0"),
+            "the resumed conversation's release is its own header's"
+        );
+        assert_ne!(bus.state.lock().unwrap().status_epoch, first_epoch);
+        assert!(
+            bus.take_status_signals()
+                .is_some_and(|(_, signals, _)| signals.is_empty()),
+            "what the earlier invocation's reader read is dropped"
+        );
+
+        bus.push(b"$ agy --conversation=conv-c\r\n  no header here\r\n".to_vec());
+        bus.shell_agent_hook(&AgentType::Antigravity, "conv-c", false, true);
+        assert_eq!(
+            release(&bus),
+            None,
+            "a resume whose header was not read is unknown, not the previous release"
+        );
+
+        // No `SessionStart`: a header of another release is new startup
+        // evidence; none at all is the same invocation.
+        bus.push(header("1.6.1"));
+        assert!(matches!(
+            bus.shell_agent_hook(&AgentType::Antigravity, "conv-c", false, false),
+            Some(ShellReaderChange::Started { .. })
+        ));
+        assert_eq!(release(&bus).as_deref(), Some("1.6.1"));
+        assert_eq!(
+            bus.shell_agent_hook(&AgentType::Antigravity, "conv-c", false, false),
+            None
+        );
+        assert_eq!(release(&bus).as_deref(), Some("1.6.1"));
+    }
+
+    /// Scenario: in one shell, `agy` 1.5.9 runs conversation C, and prints
+    /// its resume command and its header again; a header of the same release
+    /// is then drawn where the deck reads one, and the next hook of C, with no
+    /// `SessionStart`, arrives. A header of the release already read is no
+    /// new invocation: the reader, its epoch and the release 1.5.9 stay.
+    #[test]
+    fn a_same_release_header_under_the_same_session_keeps_the_reader() {
+        let bus = AgentBus::new();
+        bus.push(b"$ agy\r\n".to_vec());
+        bus.push(header("1.5.9"));
+        bus.shell_agent_hook(&AgentType::Antigravity, "conv-c", false, true);
+        let epoch = bus.state.lock().unwrap().status_epoch;
+        // The exit: the resume command, then the header reprinted, no clear.
+        bus.push(
+            b"\r\nResume with -c (or command below):\r\nagy --conversation=conv-c\r\n\n\x1b[6C\xe2\x96\x84\x1b[m        \x1b[94;1mAntigravity CLI 1.5.9\x1b[m\r\n$ agy --conversation=conv-c\r\n"
+                .to_vec(),
+        );
+        bus.push(header("1.5.9"));
+        assert_eq!(
+            bus.shell_agent_hook(&AgentType::Antigravity, "conv-c", false, false),
+            None
+        );
+        assert_eq!(bus.state.lock().unwrap().status_epoch, epoch);
+        assert_eq!(release(&bus).as_deref(), Some("1.5.9"));
+    }
+
+    /// Scenario: in one shell, another agent's hooks report first, then `agy`
+    /// starts and its session's hooks arrive. Its reader turns on and its
+    /// release is read from its own header.
+    #[test]
+    fn agy_after_another_agent_in_the_shell_is_read() {
+        let bus = AgentBus::new();
+        assert_eq!(
+            bus.shell_agent_hook(&AgentType::ClaudeCode, "claude-1", false, false),
+            None
+        );
+        assert!(!reads_osc(&bus), "no reader before agy's own hook");
+        bus.push(b"$ agy\r\n".to_vec());
+        bus.push(header("1.5.9"));
+        bus.shell_agent_hook(&AgentType::Antigravity, "conv-1", false, false);
+        assert_eq!(release(&bus).as_deref(), Some("1.5.9"));
+        assert!(reads_osc(&bus));
+    }
+
+    /// Scenario: in one shell, `agy` runs a session, then another agent's
+    /// hook reports, then the pane writes a permission OSC 7501 sequence.
+    /// The reader is off: the sequence is not read, the epoch moved, and no
+    /// release is held. The same holds after the session's own end.
+    #[test]
+    fn the_shell_reader_stops_at_another_agents_hook_and_at_the_end() {
+        let bus = AgentBus::new();
+        bus.push(header("1.5.9"));
+        bus.shell_agent_hook(&AgentType::Antigravity, "conv-1", false, false);
+        let on = bus.state.lock().unwrap().status_epoch;
+        // Read, not yet handed over, when the other agent's hook lands.
+        bus.push(PERMISSION.to_vec());
+        assert_eq!(
+            bus.shell_agent_hook(&AgentType::ClaudeCode, "claude-1", false, false),
+            Some(ShellReaderChange::Ended)
+        );
+        assert!(
+            bus.take_status_signals().is_none(),
+            "what it read is dropped"
+        );
+        assert!(!reads_osc(&bus), "a sequence after another agent's hook");
+        assert_ne!(bus.state.lock().unwrap().status_epoch, on);
+        assert_eq!(release(&bus), None);
+
+        bus.push(header("1.5.9"));
+        bus.shell_agent_hook(&AgentType::Antigravity, "conv-2", false, false);
+        assert!(reads_osc(&bus));
+        assert_eq!(
+            bus.shell_agent_hook(&AgentType::Antigravity, "conv-2", true, false),
+            Some(ShellReaderChange::Ended)
+        );
+        assert!(!reads_osc(&bus), "a sequence after the session's end");
+    }
+
+    /// Scenario: a shell pane whose output carries an OSC 7501 sequence
+    /// before any agent's hook named it: nothing is read.
+    #[test]
+    fn shell_output_before_any_hook_is_not_read() {
+        let bus = AgentBus::new();
+        bus.push(header("1.5.9"));
+        assert!(!reads_osc(&bus));
+        assert_eq!(release(&bus), None);
+    }
+}
+
+#[cfg(test)]
+mod paced_withdrawal_tests {
+    //! PRD #211 (audit suggestion 3): a doorbell transaction's paced
+    //! withdrawal ([`crate::doorbell_txn::Txn::pace_deletes`]) on the real
+    //! pane writer, through a PTY writer that, as `agy` was measured to,
+    //! loses deletes sent in one burst.
+    use super::*;
+    use crate::doorbell_txn::{
+        Action, Admission, Caps, ComposerView, ECHO_WAIT, Event, Frame, Job, Outcome, Seam,
+        SeamRead,
+    };
+
+    /// The pane's PTY writer as `agy` takes it: a write holding several
+    /// deletes reaches the agent as one of them, the rest dropped though the
+    /// PTY took them. Each write's bytes are recorded.
+    struct BurstDropper {
+        inner: Box<dyn std::io::Write + Send>,
+        writes: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl std::io::Write for BurstDropper {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.writes.lock().unwrap().push(buf.to_vec());
+            if buf.iter().filter(|&&b| b == 0x7f).count() > 1 {
+                self.inner.write_all(&[0x7f])?;
+            } else {
+                self.inner.write_all(buf)?;
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    /// The composer as the agent holds it once `typed` reached it: the line
+    /// misrendered with `agy`'s seven-column gap until a delete went in, then
+    /// what the deletes left.
+    struct Composer {
+        typed: std::path::PathBuf,
+        line: String,
+    }
+
+    impl Seam for Composer {
+        fn read(&mut self) -> Option<SeamRead> {
+            let typed = std::fs::read(&self.typed).unwrap_or_default();
+            let deletes = typed.iter().filter(|&&b| b == 0x7f).count();
+            let count = self.line.chars().count();
+            let text: String = if typed.is_empty() {
+                String::new()
+            } else if deletes == 0 {
+                let at = self.line.char_indices().nth(35).unwrap().0;
+                format!("{}       {}", &self.line[..at], &self.line[at..])
+            } else {
+                self.line
+                    .chars()
+                    .take(count.saturating_sub(deletes))
+                    .collect()
+            };
+            Some(SeamRead {
+                watermark: 0,
+                job_mark: 0,
+                frame: Frame {
+                    epoch: 0,
+                    clean: true,
+                    composer: Some(ComposerView {
+                        placeholder: text.is_empty() && typed.is_empty(),
+                        text,
+                        cursor_at_end: true,
+                        selection: false,
+                        hidden: false,
+                    }),
+                    ..Frame::default()
+                },
+                mode: Ok(()),
+                open: true,
+            })
+        }
+    }
+
+    /// Ring once on a raw `cat` pane whose writer is a [`BurstDropper`],
+    /// the misrendered echo withdrawn at `pace` (`None`: in one burst), on a
+    /// clock of the test's own from admission. Returns the outcome, each
+    /// write the PTY was handed, and the bytes that reached the agent.
+    async fn ring(pace: Option<Duration>) -> (Outcome, Vec<Vec<u8>>, Vec<u8>) {
+        let dir = tempfile::tempdir().unwrap();
+        let typed = dir.path().join("typed");
+        std::fs::write(&typed, b"").unwrap();
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let command = format!("stty raw -echo && exec cat > '{}'", typed.display());
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some(&command),
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "pane-paced-withdrawal".to_string(),
+                )]),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the pane");
+        let doorbell = registry.generation_doorbell(&id).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while doorbell.unwrapped_mode().is_err() {
+            assert!(Instant::now() < deadline, "the pane never went raw");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let real = registry
+            .replace_agent_writer_for_test(&id, Box::new(std::io::sink()))
+            .await;
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let _sink = registry
+            .replace_agent_writer_for_test(
+                &id,
+                Box::new(BurstDropper {
+                    inner: real,
+                    writes: Arc::clone(&writes),
+                }),
+            )
+            .await;
+        let bell = crate::doorbell_generation::GenerationDoorbell::new(
+            false,
+            #[cfg(unix)]
+            None,
+        );
+        let t0 = Instant::now();
+        let admission = Admission {
+            activation: Ok(()),
+            mode: Ok(()),
+            ledger_idle: true,
+            watermark: 0,
+            job_mark: 0,
+            frame: Frame {
+                epoch: 0,
+                clean: true,
+                composer: Some(ComposerView {
+                    text: String::new(),
+                    cursor_at_end: true,
+                    placeholder: true,
+                    selection: false,
+                    hidden: false,
+                }),
+                ..Frame::default()
+            },
+            nudge_in_flight: false,
+            settling: false,
+            submit_route: true,
+            still_admitted: true,
+            command: "dot-agent-deck".to_string(),
+        };
+        let mut draws = [3u8, 1, 4, 1, 5, 9, 2, 6].into_iter().cycle();
+        let caps = Caps {
+            delete_key: true,
+            placeholder: false,
+            hook_route: true,
+            transcript_route: false,
+            staged_head: None,
+        };
+        let mut txn = crate::doorbell_txn::admit(
+            &admission,
+            bell.counter(),
+            bell.ring(),
+            bell.cell(),
+            || draws.next().unwrap(),
+            &crate::inbox::MessageId::parse("m-k3xzq2ab-0f3c9a71d2e4b850").unwrap(),
+            caps,
+            t0,
+        )
+        .expect("admitted");
+        txn.allow_gap_withdrawal();
+        if let Some(pace) = pace {
+            txn.pace_deletes(1, pace);
+        }
+        let mut seam = Composer {
+            typed: typed.clone(),
+            line: txn.line().to_string(),
+        };
+        let writer = registry.agent_writer(&id).expect("the pane's writer");
+        let mut now = t0;
+        let mut actions = txn.start(&mut seam, now);
+        let outcome = loop {
+            if let Some(outcome) = actions.iter().find_map(|a| match a {
+                Action::Release(outcome) => Some(*outcome),
+                _ => None,
+            }) {
+                break outcome;
+            }
+            let queued = actions.iter().find_map(|a| match a {
+                Action::Enqueue(job, claim) => Some((job.clone(), Arc::clone(claim))),
+                _ => None,
+            });
+            let wake = actions.iter().find_map(|a| match a {
+                Action::WakeAt(at) => Some(*at),
+                _ => None,
+            });
+            actions = match queued {
+                Some((job, claim)) => {
+                    let bytes = match &job {
+                        Job::Line(text) => text.clone().into_bytes(),
+                        Job::Cr => b"\r".to_vec(),
+                        Job::Deletes(n) => vec![0x7f; *n],
+                        Job::Clears(n) => vec![0x15; *n],
+                    };
+                    let expected = std::fs::metadata(&typed).unwrap().len() as usize
+                        + match &job {
+                            Job::Deletes(_) | Job::Clears(_) if pace.is_none() => 1,
+                            _ => bytes.len(),
+                        };
+                    let mut queued = writer
+                        .lock()
+                        .await
+                        .queue_ring_job(
+                            bytes,
+                            claim,
+                            crate::composer_probe::epoch::DeckJobId::ring(txn.attempt()),
+                        )
+                        .expect("the writer thread runs");
+                    let (accepted, ok) = queued.done().await.expect("the job ran");
+                    // What the agent took is on file before the next look.
+                    let until = Instant::now() + Duration::from_secs(5);
+                    while (std::fs::metadata(&typed).unwrap().len() as usize) < expected {
+                        assert!(Instant::now() < until, "the bytes never reached the agent");
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                    txn.on(Event::JobStarted, &mut seam, now);
+                    if matches!(job, Job::Line(_)) {
+                        // The echo is judged once its wait is over.
+                        let ended = txn.on(Event::JobEnded { accepted, ok }, &mut seam, now);
+                        assert!(
+                            ended.iter().all(|a| !matches!(a, Action::Release(_))),
+                            "{ended:?}"
+                        );
+                        now = t0 + ECHO_WAIT;
+                        let frame = seam.read().unwrap().frame;
+                        txn.on(Event::Frame(frame), &mut seam, now)
+                    } else {
+                        txn.on(Event::JobEnded { accepted, ok }, &mut seam, now)
+                    }
+                }
+                None => {
+                    now = wake.map_or(now + Duration::from_millis(10), |at| at.max(now));
+                    let frame = seam.read().unwrap().frame;
+                    txn.on(Event::Frame(frame), &mut seam, now)
+                }
+            };
+        };
+        let reached = std::fs::read(&typed).unwrap();
+        registry.shutdown_all();
+        let writes = writes.lock().unwrap().clone();
+        (outcome, writes, reached)
+    }
+
+    /// Scenario: the deck types its doorbell line into a pane whose agent
+    /// draws it with a seven-column gap, and whose PTY writer loses all but
+    /// one delete of a write that holds several, as `agy` was measured to.
+    /// Withdrawn at a pace of one delete per write, every delete is its own
+    /// write on the real pane writer, every one reaches the agent, and the
+    /// blank composer confirms the withdrawal. Sent in one burst, the same
+    /// withdrawal leaves the line in the box and the attempt unresolved.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn paced_withdrawal_deletes_each_reach_an_agent_that_drops_a_burst() {
+        let (outcome, writes, reached) = ring(Some(Duration::from_millis(5))).await;
+        assert_eq!(outcome, Outcome::Withdrawn, "{writes:?}");
+        let line = &writes[0];
+        assert!(line.starts_with(b"(") && !line.contains(&0x7f));
+        let deletes = &writes[1..];
+        assert_eq!(
+            deletes.len(),
+            String::from_utf8_lossy(line).chars().count(),
+            "one write per character typed"
+        );
+        assert!(deletes.iter().all(|write| write == &[0x7f]), "{deletes:?}");
+        assert_eq!(
+            reached.iter().filter(|&&b| b == 0x7f).count(),
+            deletes.len(),
+            "every delete reached the agent"
+        );
+        assert!(!reached.contains(&b'\r'), "nothing was submitted");
+
+        let (outcome, writes, reached) = ring(None).await;
+        assert!(
+            matches!(outcome, Outcome::Unresolved(_)),
+            "a burst the agent drops is not confirmed: {outcome:?}"
+        );
+        assert_eq!(writes.len(), 2, "the line, then every delete in one write");
+        assert_eq!(reached.iter().filter(|&&b| b == 0x7f).count(), 1);
+    }
+
+    /// The composer of an `agy` that takes Ctrl+U, as the pane's PTY got
+    /// it: empty until the line reached it, then the line drawn with the
+    /// seven-column gap, and empty again once a Ctrl+U went in. Its marks
+    /// are the pane's real ingress ledger's.
+    struct ClearingComposer {
+        typed: std::path::PathBuf,
+        line: String,
+        ledger: Arc<crate::ingress_ledger::IngressLedger>,
+    }
+
+    impl Seam for ClearingComposer {
+        fn read(&mut self) -> Option<SeamRead> {
+            let typed = std::fs::read(&self.typed).unwrap_or_default();
+            let text = if typed.is_empty() || typed.contains(&0x15) {
+                String::new()
+            } else {
+                let at = self.line.char_indices().nth(35).unwrap().0;
+                format!("{}       {}", &self.line[..at], &self.line[at..])
+            };
+            let marks = self.ledger.marks();
+            Some(SeamRead {
+                watermark: marks.watermark,
+                job_mark: marks.job_mark,
+                frame: Frame {
+                    epoch: 0,
+                    clean: true,
+                    composer: Some(ComposerView {
+                        placeholder: false,
+                        text,
+                        cursor_at_end: true,
+                        selection: false,
+                        hidden: false,
+                    }),
+                    ..Frame::default()
+                },
+                mode: Ok(()),
+                open: true,
+            })
+        }
+    }
+
+    /// Scenario: the deck rings a raw `cat` pane served Antigravity's keys,
+    /// holding the pane's real writer for the whole transaction as a ring
+    /// does, and the agent draws the typed line with a seven-column gap. A
+    /// person's draft is written to the same pane while the ring holds the
+    /// writer, so it waits behind it. The mismatched echo is withdrawn with
+    /// exactly one Ctrl+U in its own write, no Enter is sent, and once the
+    /// ring releases the writer the person's draft reaches the pane intact,
+    /// after the Ctrl+U.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn a_clear_withdrawal_with_a_human_draft_waiting_sends_one_ctrl_u_then_the_draft() {
+        const DRAFT: &[u8] = b"my own draft, typed while the deck held the pane";
+        let dir = tempfile::tempdir().unwrap();
+        let typed = dir.path().join("typed");
+        std::fs::write(&typed, b"").unwrap();
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let pane = "pane-clear-withdrawal".to_string();
+        let command = format!("stty raw -echo && exec cat > '{}'", typed.display());
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some(&command),
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    pane.clone(),
+                )]),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the pane");
+        let doorbell = registry.generation_doorbell(&id).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while doorbell.unwrapped_mode().is_err() {
+            assert!(Instant::now() < deadline, "the pane never went raw");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let real = registry
+            .replace_agent_writer_for_test(&id, Box::new(std::io::sink()))
+            .await;
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let _sink = registry
+            .replace_agent_writer_for_test(
+                &id,
+                Box::new(BurstDropper {
+                    inner: real,
+                    writes: Arc::clone(&writes),
+                }),
+            )
+            .await;
+        let ledger = registry.ingress_ledger(&id).expect("the pane's ledger");
+        let marks = ledger.marks();
+        let bell = crate::doorbell_generation::GenerationDoorbell::new(
+            false,
+            #[cfg(unix)]
+            None,
+        );
+        let t0 = Instant::now();
+        let admission = Admission {
+            activation: Ok(()),
+            mode: Ok(()),
+            ledger_idle: true,
+            watermark: marks.watermark,
+            job_mark: marks.job_mark,
+            frame: Frame {
+                epoch: 0,
+                clean: true,
+                composer: Some(ComposerView {
+                    text: String::new(),
+                    cursor_at_end: true,
+                    placeholder: false,
+                    selection: false,
+                    hidden: false,
+                }),
+                ..Frame::default()
+            },
+            nudge_in_flight: false,
+            settling: false,
+            submit_route: true,
+            still_admitted: true,
+            command: "dot-agent-deck".to_string(),
+        };
+        let mut draws = [3u8, 1, 4, 1, 5, 9, 2, 6].into_iter().cycle();
+        let caps = Caps {
+            delete_key: true,
+            placeholder: false,
+            hook_route: true,
+            transcript_route: false,
+            staged_head: None,
+        };
+        let mut txn = crate::doorbell_txn::admit(
+            &admission,
+            bell.counter(),
+            bell.ring(),
+            bell.cell(),
+            || draws.next().unwrap(),
+            &crate::inbox::MessageId::parse("m-k3xzq2ab-0f3c9a71d2e4b850").unwrap(),
+            caps,
+            t0,
+        )
+        .expect("admitted");
+        txn.allow_gap_withdrawal();
+        txn.serve_keys(
+            crate::agent_registry::spec(&crate::event::AgentType::Antigravity)
+                .prompt_keys
+                .as_ref()
+                .expect("Antigravity's keys"),
+        );
+        let mut seam = ClearingComposer {
+            typed: typed.clone(),
+            line: txn.line().to_string(),
+            ledger: Arc::clone(&ledger),
+        };
+        // The ring's hold on the writer, for the whole transaction.
+        let writer = registry.agent_writer(&id).expect("the pane's writer");
+        let held = writer.lock().await;
+        let mut human: Option<tokio::task::JoinHandle<Result<(), &'static str>>> = None;
+        let mut jobs = Vec::new();
+        let mut now = t0;
+        let mut actions = txn.start(&mut seam, now);
+        let outcome = loop {
+            if let Some(outcome) = actions.iter().find_map(|a| match a {
+                Action::Release(outcome) => Some(*outcome),
+                _ => None,
+            }) {
+                break outcome;
+            }
+            assert!(now < t0 + Duration::from_secs(10), "the ring never ended");
+            let queued = actions.iter().find_map(|a| match a {
+                Action::Enqueue(job, claim) => Some((job.clone(), Arc::clone(claim))),
+                _ => None,
+            });
+            let wake = actions.iter().find_map(|a| match a {
+                Action::WakeAt(at) => Some(*at),
+                _ => None,
+            });
+            actions = match queued {
+                Some((job, claim)) => {
+                    jobs.push(job.clone());
+                    let bytes = match &job {
+                        Job::Line(text) => text.clone().into_bytes(),
+                        Job::Cr => b"\r".to_vec(),
+                        Job::Deletes(n) => vec![0x7f; *n],
+                        Job::Clears(n) => vec![0x15; *n],
+                    };
+                    let expected = std::fs::metadata(&typed).unwrap().len() as usize + bytes.len();
+                    let mut queued = held
+                        .queue_ring_job(
+                            bytes,
+                            claim,
+                            crate::composer_probe::epoch::DeckJobId::ring(txn.attempt()),
+                        )
+                        .expect("the writer thread runs");
+                    let (accepted, ok) = queued.done().await.expect("the job ran");
+                    let until = Instant::now() + Duration::from_secs(5);
+                    while (std::fs::metadata(&typed).unwrap().len() as usize) < expected {
+                        assert!(Instant::now() < until, "the bytes never reached the agent");
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                    txn.on(Event::JobStarted, &mut seam, now);
+                    if matches!(job, Job::Line(_)) {
+                        // The person starts typing once the line is in: their
+                        // operation is admitted and waits for the writer the
+                        // ring holds.
+                        human = Some({
+                            let registry = Arc::clone(&registry);
+                            let (pane, id) = (pane.clone(), id.clone());
+                            tokio::spawn(async move {
+                                registry.write_user_bytes(&pane, &id, DRAFT).await
+                            })
+                        });
+                        let until = Instant::now() + Duration::from_secs(5);
+                        while ledger.marks().watermark == marks.watermark {
+                            assert!(Instant::now() < until, "the draft was never admitted");
+                            tokio::time::sleep(Duration::from_millis(2)).await;
+                        }
+                        let ended = txn.on(Event::JobEnded { accepted, ok }, &mut seam, now);
+                        assert!(
+                            ended.iter().all(|a| !matches!(a, Action::Release(_))),
+                            "{ended:?}"
+                        );
+                        now = t0 + ECHO_WAIT;
+                        let frame = seam.read().unwrap().frame;
+                        txn.on(Event::Frame(frame), &mut seam, now)
+                    } else {
+                        txn.on(Event::JobEnded { accepted, ok }, &mut seam, now)
+                    }
+                }
+                None => {
+                    now = wake.map_or(now + Duration::from_millis(10), |at| at.max(now));
+                    let frame = seam.read().unwrap().frame;
+                    txn.on(Event::Frame(frame), &mut seam, now)
+                }
+            };
+        };
+        assert_eq!(outcome, Outcome::Withdrawn, "{jobs:?}");
+        assert!(txn.gap_withdrew());
+        let line = txn.line().to_string();
+        assert_eq!(jobs, vec![Job::Line(line.clone()), Job::Clears(1)]);
+        assert_eq!(
+            std::fs::read(&typed).unwrap(),
+            [line.as_bytes(), b"\x15"].concat(),
+            "nothing of the draft is written while the ring holds the writer"
+        );
+        drop(held);
+        human
+            .expect("the draft was sent")
+            .await
+            .unwrap()
+            .expect("the draft's write");
+        let until = Instant::now() + Duration::from_secs(5);
+        while (std::fs::metadata(&typed).unwrap().len() as usize) < line.len() + 1 + DRAFT.len() {
+            assert!(Instant::now() < until, "the draft never reached the agent");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let reached = std::fs::read(&typed).unwrap();
+        assert_eq!(reached, [line.as_bytes(), b"\x15", DRAFT].concat());
+        assert_eq!(
+            reached.iter().filter(|&&b| b == 0x15).count(),
+            1,
+            "one Ctrl+U"
+        );
+        assert!(!reached.contains(&b'\r'), "no Enter");
+        assert!(!reached.contains(&0x7f), "no delete");
+        let writes = writes.lock().unwrap().clone();
+        assert_eq!(
+            writes,
+            vec![line.into_bytes(), vec![0x15], DRAFT.to_vec()],
+            "the line, one Ctrl+U in its own write, then the draft intact"
+        );
+        registry.shutdown_all();
+    }
+}
+
+/// PRD #211 (fourth audit, suggestion 1): the one-byte commit of a
+/// screen-witnessed answer key ([`commit_answer_byte`]).
+#[cfg(test)]
+mod answer_byte_tests {
+    use super::commit_answer_byte;
+    use std::io::{Error, ErrorKind, Write};
+
+    /// A writer that fails its first `failures.len()` writes with those
+    /// kinds, then takes everything, counting each call.
+    struct Scripted {
+        failures: Vec<ErrorKind>,
+        calls: usize,
+        taken: Vec<u8>,
+    }
+
+    impl Write for Scripted {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.calls += 1;
+            if let Some(kind) = (!self.failures.is_empty()).then(|| self.failures.remove(0)) {
+                return Err(Error::from(kind));
+            }
+            self.taken.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Scenario: the one `write(2)` of an answer key is interrupted by a
+    /// signal, or refused for room. The key is not written and the write is
+    /// not tried again: the commit reports nothing written, which refuses the
+    /// answer.
+    #[test]
+    fn an_interrupted_or_full_commit_refuses_the_answer_without_retrying() {
+        for kind in [ErrorKind::Interrupted, ErrorKind::WouldBlock] {
+            let mut w = Scripted {
+                failures: vec![kind],
+                calls: 0,
+                taken: Vec::new(),
+            };
+            let wrote = commit_answer_byte(&mut w, b"1");
+            assert_eq!(wrote.ok(), Some(0), "{kind:?}");
+            assert_eq!(w.calls, 1, "{kind:?}: tried again under the lock");
+            assert!(w.taken.is_empty(), "{kind:?}");
+        }
+    }
+
+    /// Scenario: the commit's write succeeds, or fails for another reason. The
+    /// byte is written once, or the error is reported as it is.
+    #[test]
+    fn a_commit_writes_the_byte_once_or_reports_its_error() {
+        let mut w = Scripted {
+            failures: Vec::new(),
+            calls: 0,
+            taken: Vec::new(),
+        };
+        assert_eq!(commit_answer_byte(&mut w, b"1").ok(), Some(1));
+        assert_eq!((w.calls, w.taken.as_slice()), (1, b"1".as_slice()));
+        let mut w = Scripted {
+            failures: vec![ErrorKind::BrokenPipe],
+            calls: 0,
+            taken: Vec::new(),
+        };
+        let wrote = commit_answer_byte(&mut w, b"1");
+        assert_eq!(wrote.map_err(|e| e.kind()), Err(ErrorKind::BrokenPipe));
+        assert_eq!(w.calls, 1);
     }
 }

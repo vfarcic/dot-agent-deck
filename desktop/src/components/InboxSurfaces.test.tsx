@@ -335,6 +335,23 @@ describe("inbox cards and handoff rail (S13)", () => {
     expect(tile.getByText(notice)).toBeVisible();
   });
 
+  /// Scenario: The desktop reads a deck whose snapshot holds an agent in Error with the error its failed turn reported, then one waiting on the user with what it waits on, then one Idle that still carries a reason. The tile shows the reason beside Error and Needs Input, as the TUI's card does, and never beside Idle.
+  it("shows the agent's own reason beside Error and Needs Input only", () => {
+    const show = (status: string, statusReason: string) => {
+      const dto = snapshot();
+      Object.assign(dto.agents[0], { status, statusReason });
+      return render(card(mapDesktopSnapshot(dto).agents[0]));
+    };
+    const failed = show("error", "There was a network issue connecting to the server, please try again.");
+    expect(within(screen.getByRole("article")).getByText(/network issue connecting/)).toBeVisible();
+    failed.unmount();
+    const waiting = show("waiting_for_input", "Approve Bash: rm -f probe.txt");
+    expect(within(screen.getByRole("article")).getByText("Approve Bash: rm -f probe.txt")).toBeVisible();
+    waiting.unmount();
+    show("idle", "Approve Bash: rm -f probe.txt");
+    expect(within(screen.getByRole("article")).queryByText("Approve Bash: rm -f probe.txt")).toBeNull();
+  });
+
   /// Scenario: Posting a message paints its subject and a queued delegation in the live rail.
   it("renders a queued inbox post as delegated with the shared queued word", () => {
     render(<HandoffRail handoffs={applyHandoffEvent([], inbox("queued"))} />);

@@ -609,6 +609,125 @@ fn held_for(codex: &Installed, id: &str, name: &str, draft: &str, since: usize, 
 }
 
 // ---------------------------------------------------------------------------
+// inbox/probe/104
+// ---------------------------------------------------------------------------
+
+/// Scenario: In real interactive Codex in an installed 40 × 140 pane of a deck with only the TUI attached, so nothing answers Codex's cursor position queries, type a draft into the box and delete it, wait until the pane's screen has been unchanged for two seconds, resize the pane three times 200 ms apart, toggling its width by one column, and queue a sentinel task 200 ms later. A check is refused because Codex's cursor-query waits may not have run out, and the next one is written within 15 seconds of the post, where before the fix one refused check waited the 30 s backoff (about 36 s), and the task is acted on and acknowledged after exactly one hand-over. Codex chains those waits over a burst only some of the time, so the test runs up to five fresh decks, each held to the bound, and reads as skipped, a failure under DOT_AGENT_DECK_REQUIRE_REAL_E2E, when none reached the refusal (#2129, CX-5h).
+#[spec("inbox/probe/104")]
+#[test]
+fn probe_104_live_a_touched_box_after_a_resize_burst_is_checked_within_seconds() {
+    skip_unless!(codex_installed::checkable());
+    // Up to this many fresh decks, until one burst reaches the refusal.
+    const TRIALS: usize = 5;
+    let hit = (1..=TRIALS).any(resize_burst_trial);
+    // Whether Codex chains its cursor-query waits over a burst is Codex's
+    // to decide, and it varies: on 2026-11-20, on this build and harness, 9
+    // of 9 bursts did between 01:29 and 02:05 UTC and 2 of 31 between 02:15
+    // and 03:10; the cause was not found. A burst that doesn't is checked
+    // as fast with or without the fix. Every trial above held the bound; a
+    // run where none reached the refusal didn't verify the path, which reads
+    // as unverified, not green, under `DOT_AGENT_DECK_REQUIRE_REAL_E2E`. The
+    // fast tier drives that path itself
+    // (`probe_104_a_resize_burst_delays_a_codex_check_by_seconds_not_a_backoff_step`).
+    skip_unless!(if hit {
+        Ok(())
+    } else {
+        Err(format!(
+            "in {TRIALS} bursts Codex chained no cursor-query waits, so no check was refused \
+             for the estimate and the path #2129 fixed was not reached"
+        ))
+    });
+}
+
+/// One `probe_104_live_…` trial on a fresh deck: the check is written
+/// within the bound and the task delivered once. Whether a check was
+/// refused for the query-wait estimate before the written one.
+fn resize_burst_trial(trial: usize) -> bool {
+    // Measured on this branch: 5.9 to 6.2 s where the burst reached the
+    // refusal, against 36.1 s before it and 3.1 to 3.4 s with no resize.
+    // Inside the doorbell's first re-ring with room for a loaded
+    // machine, and well short of the 30 s backoff step a counted failure
+    // waits.
+    const BOUND: Duration = Duration::from_secs(15);
+    let codex = Installed::new(&[]);
+    codex.assert_installed();
+    codex.wait_armable();
+    let mut person = codex.input();
+    let draft = format!("p104-draft-{trial}");
+    person.write(&draft);
+    codex.expect_composer(&draft);
+    person.write(&"\x7f".repeat(draft.len()));
+    codex.expect_composer("");
+    // A quiet box: the pane's screen unchanged for two seconds.
+    let quiet = std::cell::RefCell::new((codex.screen(), Instant::now()));
+    assert!(
+        common::wait_until(Duration::from_secs(30), || {
+            let screen = codex.screen();
+            let mut quiet = quiet.borrow_mut();
+            if screen != quiet.0 {
+                *quiet = (screen, Instant::now());
+            }
+            quiet.1.elapsed() >= Duration::from_secs(2)
+        }),
+        "trial {trial}: the emptied box must go quiet before the burst; {}",
+        codex.evidence()
+    );
+    // The burst's own schedule (CX-5h's): one-column resizes 200 ms apart
+    // and the task 200 ms after the last, the scenario rather than a wait
+    // for any state.
+    const GAP: Duration = Duration::from_millis(200);
+    let start = Instant::now();
+    for (n, cols) in [139, 140, 139].into_iter().enumerate() {
+        helper_pause::until(start + GAP * n as u32);
+        let reply = inbox::attach(
+            &codex.deck,
+            json!({"op": "resize", "id": codex.pane.agent, "rows": 40, "cols": cols}),
+        );
+        assert_eq!(reply["ok"], true, "resize: {reply}");
+    }
+    helper_pause::until(start + GAP * 3);
+    let since = codex.log().len();
+    let name = format!("p104-burst-104{trial}.txt");
+    let posted = Instant::now();
+    let id = codex.post(&name);
+    let is_written = |l: &str| l.contains("doorbell tick probe") && l.contains("outcome=Written");
+    assert!(
+        common::wait_until(BUDGET, || codex.log()[since..].lines().any(is_written)),
+        "trial {trial}: the touched box must be checked after the burst; {}",
+        codex.evidence()
+    );
+    let after = posted.elapsed();
+    let log = codex.log()[since..].to_string();
+    assert!(
+        after <= BOUND,
+        "trial {trial}: the check came {after:?} after the post, past {BOUND:?}; refusals:\n{}\n{}",
+        log.lines()
+            .filter(|l| l.contains("probe refused") || l.contains("doorbell tick probe"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        codex.evidence()
+    );
+    // The path the fix is about: a check refused for the query-wait
+    // estimate before the written one.
+    let refused = log
+        .lines()
+        .position(|l| l.contains("probe refused when scheduled") && l.contains("refusal=Estimate"));
+    let written = log.lines().position(is_written);
+    let hit = matches!((refused, written), (Some(r), Some(w)) if r < w);
+    codex.done(&id, &name);
+    eprintln!(
+        "104 trial {trial}: checked {after:?} after the post, refused for the estimate first: \
+         {hit}, one delivery: {}\n{}",
+        codex.message(&id),
+        log.lines()
+            .filter(|l| l.contains("probe refused") || l.contains("doorbell tick probe"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    hit
+}
+
+// ---------------------------------------------------------------------------
 // inbox/probe/103
 // ---------------------------------------------------------------------------
 

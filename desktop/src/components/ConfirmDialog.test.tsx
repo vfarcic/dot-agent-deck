@@ -45,38 +45,81 @@ describe("ConfirmDialog on the overlay stack", () => {
   });
 
   /**
-   * Scenario (issue #1958): a close whose preview names a worktree the deck can
-   * keep shows a third button after Cancel and the close; pressing it runs the
-   * keep action, not the close, and closes the confirmation. Without a named
-   * worktree — or with no keep action to run — the dialog stays two buttons.
+   * Scenario (issues #1958 and #2436): a close whose preview names a worktree
+   * the deck can keep shows an unticked "Keep the worktree" checkbox under the
+   * preview, beside two buttons; pressing Close with it ticked runs the close
+   * with the keep, and closes the confirmation. Without a named worktree — or
+   * for a confirmation that cannot keep one — there is no checkbox.
    */
-  it("offers the keep-worktree close only when the preview names a worktree to keep", async () => {
+  it("offers the keep-worktree checkbox only when the preview names a worktree to keep", async () => {
     const action = vi.fn(async () => {});
-    const keepAction = vi.fn(async () => {});
-    const keepWorktree = { label: "Close agent, keep worktree", action: keepAction };
-    const offered: ConfirmState = { ...STATE, action, keepWorktree, worktreePreview: async () => ({ kept: null, keepWorktree: "/w/unit" }) };
+    const offered: ConfirmState = { ...STATE, action, keepWorktree: true, worktreePreview: async () => ({ kept: null, keepWorktree: "/w/unit" }) };
     const onClose = vi.fn();
-    const { rerender } = render(<ConfirmDialog state={offered} onClose={onClose} />);
-    expect(screen.queryByRole("button", { name: "Close agent, keep worktree" })).toBeNull();
-    const keep = await screen.findByRole("button", { name: "Close agent, keep worktree" });
-    expect(screen.getAllByRole("button").map((button) => button.textContent)).toEqual(["Cancel", "Close agent", "Close agent, keep worktree"]);
-    expect(keep).toHaveAttribute("title", "Keeps /w/unit");
-    await act(async () => fireEvent.click(keep));
-    expect(keepAction).toHaveBeenCalledOnce();
-    expect(action).not.toHaveBeenCalled();
+    const first = render(<ConfirmDialog state={offered} onClose={onClose} />);
+    expect(screen.queryByRole("checkbox")).toBeNull();
+    const keep = await screen.findByRole("checkbox", { name: "Keep the worktree" });
+    expect(keep).not.toBeChecked();
+    expect(keep.closest("label")).toHaveAttribute("title", "Keeps /w/unit");
+    expect(screen.getAllByRole("button").map((button) => button.textContent)).toEqual(["Cancel", "Close agent"]);
+    fireEvent.click(keep);
+    expect(keep).toBeChecked();
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Close agent" })));
+    expect(action).toHaveBeenCalledExactlyOnceWith({ keepWorktree: true });
     expect(onClose).toHaveBeenCalledOnce();
 
+    first.unmount();
+
+    /* A newer confirmation starts unticked, and an unticked close does not keep. */
+    const fresh = vi.fn(async () => {});
+    const unticked: ConfirmState = { ...offered, title: "Close tester?", action: fresh };
+    const { rerender } = render(<ConfirmDialog state={offered} onClose={onClose} />);
+    fireEvent.click(await screen.findByRole("checkbox", { name: "Keep the worktree" }));
+    rerender(<ConfirmDialog state={unticked} onClose={onClose} />);
+    expect(await screen.findByRole("checkbox", { name: "Keep the worktree" })).not.toBeChecked();
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Close agent" })));
+    expect(fresh).toHaveBeenCalledExactlyOnceWith({ keepWorktree: false });
+    rerender(<></>);
+
     for (const state of [
-      { ...STATE, action, keepWorktree, worktreePreview: async () => ({ kept: null, keepWorktree: null }) },
-      { ...STATE, action, keepWorktree, worktreePreview: async () => { throw new Error("daemon unavailable"); } },
+      { ...STATE, action, keepWorktree: true, worktreePreview: async () => ({ kept: null, keepWorktree: null }) },
+      { ...STATE, action, keepWorktree: true, worktreePreview: async () => { throw new Error("daemon unavailable"); } },
       { ...STATE, action, worktreePreview: async () => ({ kept: null, keepWorktree: "/w/unit" }) },
-      { ...STATE, action, keepWorktree },
+      { ...STATE, action, keepWorktree: true },
     ] satisfies ConfirmState[]) {
       rerender(<ConfirmDialog state={state} onClose={onClose} />);
       await screen.findByRole("button", { name: "Close agent" });
       await act(async () => undefined);
+      expect(screen.queryByRole("checkbox")).toBeNull();
       expect(screen.getAllByRole("button").map((button) => button.textContent)).toEqual(["Cancel", "Close agent"]);
     }
+  });
+
+  /**
+   * Scenario (issue #2436): a confirmation with a second close shows three
+   * buttons in one row — Cancel, the close and the second close — and fills
+   * whichever the opener leads with. Pressing the second close runs only its
+   * own action, with the keep-worktree box's answer.
+   */
+  it("offers a second close and leads with the one the opener chose", async () => {
+    const action = vi.fn(async () => {});
+    const whole = vi.fn(async () => {});
+    const state: ConfirmState = { ...STATE, action, keepWorktree: true, worktreePreview: async () => ({ kept: null, keepWorktree: "/w/unit" }), alternative: { label: "Close orchestration", action: whole } };
+    const onClose = vi.fn();
+    const { rerender } = render(<ConfirmDialog state={state} onClose={onClose} />);
+    await screen.findByRole("checkbox", { name: "Keep the worktree" });
+    expect(screen.getAllByRole("button").map((button) => button.textContent)).toEqual(["Cancel", "Close agent", "Close orchestration"]);
+    expect(screen.getByRole("button", { name: "Close agent" })).toHaveClass("leads");
+    expect(screen.getByRole("button", { name: "Close orchestration" })).not.toHaveClass("leads");
+
+    const led: ConfirmState = { ...state, alternative: { label: "Close orchestration", action: whole, primary: true } };
+    rerender(<ConfirmDialog state={led} onClose={onClose} />);
+    expect(await screen.findByRole("button", { name: "Close orchestration" })).toHaveClass("leads");
+    expect(screen.getByRole("button", { name: "Close agent" })).not.toHaveClass("leads");
+    fireEvent.click(await screen.findByRole("checkbox", { name: "Keep the worktree" }));
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Close orchestration" })));
+    expect(whole).toHaveBeenCalledExactlyOnceWith({ keepWorktree: true });
+    expect(action).not.toHaveBeenCalled();
+    expect(onClose).toHaveBeenCalledOnce();
   });
 
   /** Scenario: With a confirmation open, the rest of the window is inert and voice's "close" is its Cancel; once it is gone the window is live again. */

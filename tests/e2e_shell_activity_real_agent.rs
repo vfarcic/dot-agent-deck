@@ -1271,7 +1271,7 @@ fn status_waiting_008_real_claude_background_command_reads_waiting_until_it_exit
     settle_after_exit(&deck, &events, &agent_id, "status-waiting-008", running_at);
 }
 
-/// Scenario: Start real interactive OpenCode on the harness's cheap test model through Ctrl+N and ask it to run one shell command with the shell tool's background option — a minute of pings, then touching a uniquely named sentinel — and to end its turn at once. After OpenCode's idle report the rendered card reads Waiting with `Background: 1 command` while the sentinel is still absent; once the command exits on its own and writes the sentinel, the card settles on Idle with the background line gone (after any turn OpenCode starts to report the finished command).
+/// Scenario: Start real interactive OpenCode on the harness's cheap test model through Ctrl+N and ask it to run one shell command with the shell tool's background option — a minute of pings, then touching a uniquely named sentinel — and to end its turn at once. After OpenCode's idle report the rendered card reads Waiting with `Background: 1 command` while the sentinel is still absent; once the command exits on its own and writes the sentinel, the card settles on Idle with the background line gone (after any turn OpenCode starts to report the finished command). On OpenCode 2.3 or later the command must have run under OpenCode's process daemon (`opencode-pty daemon`), which is still running when the card settles on Idle.
 #[spec("status/waiting/009")]
 #[test]
 fn status_waiting_009_real_opencode_background_command_reads_waiting_until_it_exits() {
@@ -1369,6 +1369,22 @@ fn status_waiting_009_real_opencode_background_command_reads_waiting_until_it_ex
         describe_events_since(&events, &agent_id, typed_at),
         deck.snapshot_grid()
     );
+    // Issue #2441: from OpenCode 2.3 the command runs under OpenCode's process
+    // daemon (`opencode-pty daemon`, in a session of its own, alive for the
+    // rest of the agent's life), and the card above counted exactly one
+    // command while it runs. Asserted, so a run on 2.3 proves it exercised the
+    // daemon rather than passing on a tree without one; the Idle the card must
+    // reach below, with the daemon still alive, is the issue's symptom.
+    if common::opencode_test_version().is_ok_and(|version| version >= (2, 3, 0)) {
+        assert!(
+            sessions
+                .iter()
+                .any(|session| session.contains("opencode-pty daemon")
+                    && session.contains("ping -c 60")),
+            "OpenCode 2.3 or later must run the command under its process daemon; detached \
+             sessions: {sessions:#?}"
+        );
+    }
     // The watermark the completion-wake observation keeps events from, taken
     // before the sentinel is found absent below, so it precedes the exit.
     let running_at = chrono::Utc::now();
@@ -1384,6 +1400,16 @@ fn status_waiting_009_real_opencode_background_command_reads_waiting_until_it_ex
         deck.snapshot_grid()
     );
     settle_after_exit(&deck, &events, &agent_id, "status-waiting-009", running_at);
+    if common::opencode_test_version().is_ok_and(|version| version >= (2, 3, 0)) {
+        let sessions = detached_sessions_report();
+        assert!(
+            sessions
+                .iter()
+                .any(|session| session.contains("opencode-pty daemon")),
+            "the card settled on Idle only after OpenCode's process daemon had exited, so the \
+             run proves nothing about the daemon being exempt; detached sessions: {sessions:#?}"
+        );
+    }
 }
 
 /// Codex's empty-composer placeholder — see `CODEX_COMPOSER_READY` in
