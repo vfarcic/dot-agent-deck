@@ -6,6 +6,8 @@ import {
   confirmInboxActionFor,
   INBOX_CONFIRMATION_ALREADY_OPEN,
   INBOX_NEEDS_ONE_DAEMON,
+  INBOX_STOPPED_CLOSED,
+  INBOX_STOPPED_GONE,
   INBOX_TARGET_GONE,
   INBOX_TARGET_RESTARTED,
   inboxActionConfirmation,
@@ -94,9 +96,46 @@ describe("a spoken Retry or Cancel on deck messages (issue #2148)", () => {
       [{ paneId: "worker", messageId: "m-1", revision: 4 }, "cancel"],
       [{ paneId: "worker", messageId: "m-2", revision: 9 }, "cancel"],
     ]);
-    expect(onAnswer).toHaveBeenCalledWith(
-      `Cancel for Coder: from the orchestrator: “review m-1”: ${INBOX_WORDS.cancelApplied}; from the orchestrator: “review m-2”: ${INBOX_WORDS.actionStale}.`,
-    );
+    expect(onAnswer).toHaveBeenCalledWith(`Cancel for Coder: ${INBOX_WORDS.cancelApplied} (1); ${INBOX_WORDS.actionStale} (1).`);
+  });
+
+  /// Scenario: A Retry confirmation covers thirty messages and every one is sent again; the outcome is one short sentence counting them, not thirty sentences the toast would cut off.
+  it("reports a long run as one counted outcome the toast can show whole", async () => {
+    const many = Array.from({ length: 30 }, (_, index) => item(`m-${index}`, "uncertain"));
+    const onAnswer = vi.fn();
+    const question = confirmation(inboxActionConfirmation("retry", agentWith(many), vi.fn(async () => ({ outcome: "applied" })), onAnswer));
+    await question.action({ keepWorktree: false });
+    expect(onAnswer).toHaveBeenCalledWith(`Retry for Coder: ${INBOX_WORDS.retryApplied} (30).`);
+  });
+
+  /// Scenario: The user presses Cancel messages on a confirmation covering three messages and closes it while the first is being cancelled; the run stops there and says how far it got and why.
+  it("stops a pressed run once its confirmation is closed", async () => {
+    const agent = agentWith([item("m-1", "uncertain"), item("m-2", "uncertain"), item("m-3", "uncertain")]);
+    let confirm: ConfirmState | undefined;
+    const inboxAction = vi.fn(async () => {
+      confirm = undefined;
+      return { outcome: "applied" };
+    });
+    const onAnswer = vi.fn();
+    const question = confirmation(confirmInboxActionFor("cancel", { deckId: agent.daemonId, agentId: agent.id, incarnation: "process-a" },
+      { agents: [agent], allDecks: false, confirmationOpen: false, inboxAction }, onAnswer, () => ({ agents: [agent], allDecks: false, confirm })));
+    confirm = question;
+    await question.action({ keepWorktree: false });
+    expect(inboxAction).toHaveBeenCalledTimes(1);
+    expect(onAnswer).toHaveBeenCalledWith(`Cancel for Coder stopped after 1 of 3 messages, because ${INBOX_STOPPED_CLOSED}: ${INBOX_WORDS.cancelApplied} (1).`);
+  });
+
+  /// Scenario: A Retry confirmation stays open while the user selects another daemon, then its Retry is pressed; nothing is sent to the daemon no longer on screen.
+  it("sends nothing once the agent is no longer on the Daemons screen", async () => {
+    const agent = agentWith([item("m-1", "uncertain")]);
+    const inboxAction = vi.fn(async () => ({ outcome: "applied" }));
+    const onAnswer = vi.fn();
+    let question: ConfirmState | undefined;
+    question = confirmation(confirmInboxActionFor("retry", { deckId: agent.daemonId, agentId: agent.id, incarnation: "process-a" },
+      { agents: [agent], allDecks: false, confirmationOpen: false, inboxAction }, onAnswer, () => ({ agents: [], allDecks: false, confirm: question })));
+    await question.action({ keepWorktree: false });
+    expect(inboxAction).not.toHaveBeenCalled();
+    expect(onAnswer).toHaveBeenCalledWith(`Retry for Coder sent nothing: ${INBOX_STOPPED_GONE}.`);
   });
 
   /// Scenario: The deck screen is asked to confirm a spoken Retry while a confirmation is open, under All daemons, for an agent no longer listed and for one whose daemon restarted; each is refused in words and nothing opens.

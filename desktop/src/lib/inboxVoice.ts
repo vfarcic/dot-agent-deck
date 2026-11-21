@@ -55,15 +55,37 @@ function messageLine(item: InboxAttentionItem): string {
 type InboxAction = (target: AgentTarget, item: { paneId: string; messageId: string; revision: number }, verb: InboxActionVerb) => Promise<InboxActionResult>;
 
 /**
+ * Why a confirmation already pressed should send nothing more, read before
+ * each message it covers: the user closed it, or the agent it was asked
+ * about is no longer on the Daemons screen (another daemon was selected,
+ * or its daemon restarted). `undefined` while it should go on.
+ */
+export type InboxStillWanted = (question: ConfirmState) => string | undefined;
+
+/** The confirmation was closed while its messages were being sent (PR #2458 review). */
+export const INBOX_STOPPED_CLOSED = "the confirmation was closed";
+/** The agent left the screen between the question and the press, or during the run. */
+export const INBOX_STOPPED_GONE = "that agent is no longer on the Daemons screen";
+
+/** One result per distinct outcome, with its count when several messages share it, so the toast stays short however many messages the run covered. */
+function summary(outcomes: readonly string[], many: boolean): string {
+  const counts = new Map<string, number>();
+  for (const outcome of outcomes) counts.set(outcome, (counts.get(outcome) ?? 0) + 1);
+  return [...counts].map(([text, count]) => (many ? `${text} (${count})` : text)).join("; ");
+}
+
+/**
  * The confirmation a spoken Retry or Cancel opens for `agent`, or the sentence
- * saying why none opens. `onAnswer` hears one sentence once every message
- * covered has been answered, in the row's own words for each outcome.
+ * saying why none opens. `onAnswer` hears one sentence once the run ends: each
+ * distinct outcome in the row's own words, counted, and, when `stillWanted`
+ * stopped it early, how far it got and why.
  */
 export function inboxActionConfirmation(
   verb: InboxActionVerb,
   agent: Pick<AgentSession, "id" | "daemonId" | "displayName" | "tab" | "paneId" | "incarnation" | "inbox">,
   inboxAction: InboxAction,
   onAnswer: (sentence: string) => void,
+  stillWanted: InboxStillWanted = () => undefined,
 ): ConfirmState | string {
   const name = agentTitle(agent).shown;
   const waiting = agent.inbox?.attention ?? [];
@@ -79,23 +101,32 @@ export function inboxActionConfirmation(
     ? " One more message is out of attempts, so it is left for Cancel."
     : ` ${skipped} more messages are out of attempts, so they are left for Cancel.`;
   const target: AgentTarget = { deckId: agent.daemonId, agentId: agent.id, incarnation: agent.incarnation };
+  const Verb = verb === "retry" ? "Retry" : "Cancel";
   const action = async () => {
-    const answers: string[] = [];
+    const outcomes: string[] = [];
+    let stopped: string | undefined;
     for (const item of items) {
+      stopped = stillWanted(question);
+      if (stopped !== undefined) break;
       let text: string;
       try {
         const result = await inboxAction(target, { paneId, messageId: item.messageId, revision: item.revision }, verb);
         text = inboxActionText(verb, result.outcome);
       } catch (cause) {
-        text = cause instanceof Error ? cause.message : String(cause);
+        text = `failed: ${displayText(cause instanceof Error ? cause.message : String(cause), DISPLAY_LIMITS.name)}`;
       }
-      answers.push(many ? `${messageLine(item)}: ${text}` : text);
+      outcomes.push(text);
     }
-    const said = answers.join("; ");
-    onAnswer(`${verb === "retry" ? "Retry" : "Cancel"} for ${name}: ${said}.`);
+    if (stopped === undefined) {
+      onAnswer(`${Verb} for ${name}: ${summary(outcomes, many)}.`);
+    } else if (outcomes.length === 0) {
+      onAnswer(`${Verb} for ${name} sent nothing: ${stopped}.`);
+    } else {
+      onAnswer(`${Verb} for ${name} stopped after ${outcomes.length} of ${items.length} messages, because ${stopped}: ${summary(outcomes, true)}.`);
+    }
   };
-  if (verb === "retry") {
-    return {
+  const question: ConfirmState = verb === "retry"
+    ? {
       title: `Retry ${noun} to ${name}?`,
       body: `The deck sends ${many ? "each one" : "it"} again, marked as a possible repeat, so ${name} may get ${many ? "a message" : "it"} twice: ${list}.${skippedNote}`,
       label: "Retry",
@@ -103,33 +134,47 @@ export function inboxActionConfirmation(
       cancelLabel: "No",
       neutral: true,
       action,
+    }
+    : {
+      title: `Cancel ${noun} to ${name}?`,
+      body: `The deck stops delivering ${many ? "them" : "it"}, and cannot take back a copy ${name} already has: ${list}.`,
+      label: many ? "Cancel messages" : "Cancel message",
+      busyLabel: "Cancelling…",
+      cancelLabel: many ? "Keep them" : "Keep it",
+      action,
     };
-  }
-  return {
-    title: `Cancel ${noun} to ${name}?`,
-    body: `The deck stops delivering ${many ? "them" : "it"}, and cannot take back a copy ${name} already has: ${list}.`,
-    label: many ? "Cancel messages" : "Cancel message",
-    busyLabel: "Cancelling…",
-    cancelLabel: many ? "Keep them" : "Keep it",
-    action,
-  };
+  return question;
 }
+
+/** What the deck screen shows now, read again before each message a pressed confirmation sends. */
+export type InboxScreenNow = { agents: readonly AgentSession[]; allDecks: boolean; confirm: ConfirmState | undefined };
 
 /**
  * The deck screen's `confirmInboxAction`, minus the screen: finds the agent a
  * voice target names among the agents the screen shows, and answers the
- * confirmation to open or the sentence saying why not.
+ * confirmation to open or the sentence saying why not. `now` is read before
+ * each message once the confirmation is pressed, so a confirmation the user
+ * closed, or one left open while another daemon was selected or the agent's
+ * daemon restarted, sends nothing more (PR #2458 review).
  */
 export function confirmInboxActionFor(
   verb: InboxActionVerb,
   target: { deckId?: string; agentId: string; incarnation?: string },
   screen: { agents: readonly AgentSession[]; allDecks: boolean; confirmationOpen: boolean; inboxAction?: InboxAction },
   onAnswer: (sentence: string) => void,
+  now?: () => InboxScreenNow,
 ): ConfirmState | string {
   if (screen.confirmationOpen) return INBOX_CONFIRMATION_ALREADY_OPEN;
   if (screen.allDecks) return INBOX_NEEDS_ONE_DAEMON;
   const agent = screen.agents.find((candidate) => candidate.id === target.agentId && (target.deckId === undefined || candidate.daemonId === target.deckId));
   if (!agent || !screen.inboxAction) return INBOX_TARGET_GONE;
   if ("incarnation" in target && !sameIncarnation(target.incarnation, agent.incarnation)) return INBOX_TARGET_RESTARTED;
-  return inboxActionConfirmation(verb, agent, screen.inboxAction, onAnswer);
+  const stillWanted: InboxStillWanted = (question) => {
+    if (!now) return undefined;
+    const shown = now();
+    if (shown.confirm !== question) return INBOX_STOPPED_CLOSED;
+    const here = !shown.allDecks && shown.agents.some((candidate) => candidate.daemonId === agent.daemonId && candidate.id === agent.id && sameIncarnation(candidate.incarnation, agent.incarnation));
+    return here ? undefined : INBOX_STOPPED_GONE;
+  };
+  return inboxActionConfirmation(verb, agent, screen.inboxAction, onAnswer, stillWanted);
 }
