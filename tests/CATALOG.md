@@ -16641,9 +16641,9 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 - **Does not assert:** the lookup (`agent-report/refs/001`); the in-app browser itself (018 opens it through the shell); real browser label geometry.
 
 ##### desktop/agent-cards/014 — Pending, unavailable and stale references say so.
-- **Test:** vitest `desktop/agent-cards/014: …` in `desktop/src/components/AgentCardsTree.test.tsx`.
+- **Test:** vitest `desktop/agent-cards/014: …` (two tests) in `desktop/src/components/AgentCardsTree.test.tsx`.
 - **Layer:** desktop component (jsdom).
-- **Asserts:** a pending reference reads `#7 · checking…` with a tooltip saying the deck has not looked it up yet; a `not_found` one reads `not found or private` with the daemon's detail in its tooltip and no button; an `unrecognised` one reads `not a GitHub reference` with the agent's claim in its tooltip; a stale one keeps its badge with its last checked state, is marked `stale`, and its tooltip says when it was last checked.
+- **Asserts:** a pending reference reads `#7 · checking…` with a tooltip saying the deck has not looked it up yet; a `not_found` one reads `not found or private` with the daemon's detail in its tooltip and no button; an `unrecognised` one reads `not a GitHub reference` with the agent's claim in its tooltip; a stale one keeps its badge with its last checked state, is marked `stale`, and its tooltip says when it was last checked. A pending and a `not_found` reference that already carry an address are drawn as text with no button, and a click on that text opens no page and opens the card's overlay.
 - **Does not assert:** the daemon's failure classification (`agent-report/refs/002`).
 
 ##### desktop/agent-cards/015 — Needs you only opens the path to every card that needs you and fades the rest.
@@ -16722,7 +16722,7 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 - **Test:** Playwright `desktop/agent-cards/027` in `desktop/e2e/agent-cards-tree.spec.ts`, against `cards=tree` with a pushed long name and an issue with eight labels, plus a separate single over-wide label regression.
 - **Layer:** desktop browser (production build, `vite preview`) at 375 and 1440 px.
 - **Asserts:** the long name's first character starts inside its button's content box, its text is cut with `overflow: hidden` and `text-overflow: ellipsis`, and its box ends before Close; Close has a positive width and lies wholly inside the card. The labels line stays 18 px high, shows at least one but fewer than eight labels in their original order, draws each visible chip whole inside the line and clear of `+N`, counts the hidden labels with `+N`, and shows the first label's repository colour. A single valid 50-character label wider than the line is hidden whole and counted by `+1`; any drawn chip has `scrollWidth <= clientWidth`. No root moves or resizes, and the page does not scroll sideways.
-- **Does not assert:** the pixels of the ellipsis glyph; the docs screenshot (`site/static/img/agent-cards-desktop.png`).
+- **Does not assert:** the pixels of the ellipsis glyph; the `agent-cards` screenshot scenario's image.
 
 ## Desktop native driver scenarios
 

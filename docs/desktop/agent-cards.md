@@ -17,9 +17,9 @@ A card is marked **Needs you** when its agent stopped, is asking a question in i
 
 The Dashboard's top bar has a **Table | Cards** switch. **Table** is the Dashboard you know. **Cards** shows the cards. The app remembers your choice in this window's storage, so the next time you open the Dashboard it shows the same view.
 
-![The Dashboard's Cards view: under the Local daemon's header, two cards side by side, the Plan / architecture orchestrator, whose tree is open, and a standalone agent that needs input, each with a Close button; under the orchestrator, joined by a line, its two roles, one showing its checked pull request #18421 and the other its checked issue #18436 with the issue's labels under it](/img/agent-cards-desktop.png)
-
 ## The tree of cards
+
+Under each daemon's header, the Cards view shows a row of small cards of the same size, one for each agent nothing else started. Each card's top line has the agent's name, **Needs you** when it needs you, an arrow when it has agents under it, and the **×** Close button at its right end. Under that line are what the agent is and its status, then its checked pull requests and issues, then an issue's labels. A closed card with agents under it also has a coloured bar and a line such as "4 under it · 1 needs you". When you open a card with its arrow, the cards of the agents under it appear in a row below it, joined to it by a line, and the cards in the top row stay where they were.
 
 The Cards view starts with the agents nothing else started: a dispatcher, an orchestration you started yourself (its orchestrator's card), and an agent you started on its own. The agents they started are under them:
 

@@ -398,6 +398,24 @@ describe("desktop/agent-cards — the Cards tree (issue #2418)", () => {
   });
 
   /// Scenario: read the unit's references the deck could not check, or has not yet. A pending one says it is being checked, a not-found one says "not found or private", one that is not a GitHub reference says so, each with the reason in its tooltip and no link; a stale one keeps its badge but is marked stale, with when it was last checked in its tooltip.
+  /// Scenario: click the text of a reference the deck has not checked yet, and of one it could not find, on a card whose daemon already gave both an address. Neither text opens a page; each click reaches the card and opens its overlay, as a click anywhere else on the card does.
+  it("desktop/agent-cards/014: a reference shown as text, with an address, lets a click through to the card's overlay", () => {
+    const pendingWithUrl: AgentCardCheckedRef = { field: "pull-request", kind: "pull_request", claim: "o/r#9", repo: "o/r", number: 9, url: "https://github.com/o/r/pull/9", result: { status: "pending" } };
+    const card = entry("5", "unit", { checked_refs: [pendingWithUrl, PR_NOT_FOUND] });
+    for (const status of ["pending", "unavailable"]) {
+      const view = cardsView(runtime([card]));
+      const reference = within(cardOf(card.key)).getAllByTestId("agent-card-ref").find((node) => node.getAttribute("data-ref-status") === status);
+      if (!reference) throw new Error(`no ${status} reference`);
+      expect(within(reference).queryByRole("button")).toBeNull();
+      const text = reference.querySelector(".agent-card-ref-text");
+      if (!(text instanceof HTMLElement)) throw new Error(`no text on the ${status} reference`);
+      fireEvent.click(text);
+      expect(openReference).not.toHaveBeenCalled();
+      expect(screen.getByTestId("agent-card-overlay").getAttribute("data-card-key")).toBe(card.key);
+      view.unmount();
+    }
+  });
+
   it("desktop/agent-cards/014: pending, unavailable and stale references say so", () => {
     cardsView();
     fireEvent.click(toggle(QUEUE));

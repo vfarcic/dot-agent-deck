@@ -76,13 +76,17 @@ export function CardReference({ card, reference, controls, scope = "card", hidde
   const id = scope === "overlay" ? "agent-card-overlay" : "agent-card";
   const stale = view.status === "stale" ? <small className="agent-card-ref-stale">stale</small> : null;
   let body: ReactNode;
+  /* Whether `body` is a control that opens the reference's page. */
+  let opensPage = false;
   if (view.status === "checked" || view.status === "stale") {
     if (view.kind === "pull_request" && "pullRequest" in view) {
+      opensPage = Boolean(url);
       body = <PullRequestBadge pullRequest={view.pullRequest} testId={`${id}-pr`} onOpen={url ? () => VOICE_ACTIONS.openCardPullRequest.run(controls, { ...cardRef(card), referenceUrl: url }) : undefined} />;
     } else if ("number" in view) {
       const StateIcon = ISSUE_STATE_ICON[view.state] ?? QuestionIcon;
       const label = `Issue #${view.number}: ${view.state}`;
       const content = <><StateIcon className="pr-badge-state" size={11} aria-hidden="true" /><span className="pr-badge-number">#{view.number}</span></>;
+      opensPage = Boolean(url);
       body = url
         ? <button type="button" className={`pr-badge issue-badge issue-state-${domIdentity(view.state)}`} data-testid={`${id}-issue`} data-issue-state={view.state} aria-label={label} title={`${label} — open it in the app`} onMouseDown={(event) => event.stopPropagation()} onClick={() => VOICE_ACTIONS.openCardIssue.run(controls, { ...cardRef(card), referenceUrl: url })}>{content}</button>
         : <span className={`pr-badge issue-badge issue-state-${domIdentity(view.state)}`} data-testid={`${id}-issue`} data-issue-state={view.state} role="img" aria-label={label}>{content}</span>;
@@ -91,8 +95,10 @@ export function CardReference({ card, reference, controls, scope = "card", hidde
     body = <small className="agent-card-ref-text">{displayText(view.text, DISPLAY_LIMITS.name)}</small>;
   }
   /* A badge that opens a page does only that: its click does not reach the
-     card, which would open the overlay too (issue #2418, D12). */
-  if (url && body) body = <span className="agent-card-control" onClick={(event) => event.stopPropagation()}>{body}</span>;
+     card, which would open the overlay too (issue #2418, D12). Text saying a
+     reference is still to be checked, or why it cannot be, opens nothing, so
+     its click reaches the card and opens the overlay like the rest of it. */
+  if (opensPage) body = <span className="agent-card-control" onClick={(event) => event.stopPropagation()}>{body}</span>;
   return (
     <span className={`agent-card-ref is-${view.status}${hidden ? " is-overflow" : ""}`} data-testid={scope === "overlay" ? "agent-card-overlay-ref-badge" : "agent-card-ref"} data-field={reference.field} data-kind={reference.kind} data-ref-status={view.status} data-overflow={hidden ? "true" : undefined} aria-hidden={hidden ? true : undefined} title={displayTitle(view.title)}>
       {body}{stale}

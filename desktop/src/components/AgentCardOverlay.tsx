@@ -46,7 +46,22 @@ export function AgentCardOverlay({ card, lastName, position, count, step, result
   const ref = useInertBackground<HTMLElement>(true, OVERLAY_LAYER.dialog, () => { controls.closeAgentCard(); });
   const [reply, setReply] = useState("");
   const cardKey = card ? `${card.deckId}\u0000${card.entry.instance_id}\u0000${card.entry.key}` : undefined;
-  useEffect(() => { setReply(""); }, [cardKey]);
+  /* Once the daemon has sent a reply from the box, the box empties, so a
+     second press cannot send the same words again (issue #2418, Qodo); a
+     reply that failed or was refused stays in the box to be retried. The
+     words are taken when the reply's answer turns pending, the render after
+     Send reply was pressed; words typed while it was sending stay. */
+  const replyAnswer = card ? results[card.entry.actions.find((action) => action.id === "reply")?.token ?? ""] : undefined;
+  const sendingReply = useRef<string | undefined>(undefined);
+  useEffect(() => { setReply(""); sendingReply.current = undefined; }, [cardKey]);
+  useEffect(() => {
+    if (replyAnswer?.outcome === "pending") { sendingReply.current = reply; return; }
+    const sent = sendingReply.current;
+    if (sent === undefined || replyAnswer === undefined) return;
+    sendingReply.current = undefined;
+    if (replyAnswer.outcome === "sent") setReply((current) => (current === sent ? "" : current));
+    // `reply` is read as it was when the answer changed, so it is not a dependency.
+  }, [replyAnswer]);
   /* A spoken reply opens this step with its words in the box, to be read,
      edited and sent by hand. */
   useEffect(() => { if (step?.kind === "reply" && step.text !== undefined) setReply(step.text); }, [step]);

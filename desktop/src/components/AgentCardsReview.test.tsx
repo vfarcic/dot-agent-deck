@@ -213,6 +213,59 @@ describe("agent cards: what is sent is what was shown (PRD #2374 review round 1)
     expect(within(fields).getByText("agent says")).toBeInTheDocument();
   });
 
+  /// Scenario: type a reply in the card overlay and press Send reply. While it is sending, a second press sends nothing; once the daemon has sent it the box is empty, so the same words cannot go twice, and a second reply typed after that empties the box again once sent.
+  it("Send reply empties the box once the reply is sent, and a press while sending sends nothing (issue #2418, Qodo)", async () => {
+    const answers: Array<(outcome: string) => void> = [];
+    const invoke = vi.fn((_target: unknown, _actionId: string, options: { requestId?: string }) => new Promise((resolve) => { answers.push((outcome) => resolve({ request_id: options.requestId ?? "r", outcome, message_id: "m-1" })); }));
+    render(<AgentOverview runtime={runtime([entry("7", "coder")], invoke as never)} onNavigate={vi.fn()} />);
+    fireEvent.click(within(row()).getByTestId("overview-row-menu"));
+    fireEvent.click(within(row()).getByTestId("overview-row-show-card"));
+    const box = screen.getByTestId("agent-card-reply-text") as HTMLTextAreaElement;
+    const send = () => screen.getByTestId("agent-card-reply-send");
+
+    fireEvent.change(box, { target: { value: "use main" } });
+    await act(async () => { fireEvent.click(send()); });
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(send()).toBeDisabled();
+    await act(async () => { fireEvent.click(send()); });
+    expect(invoke).toHaveBeenCalledTimes(1);
+    await act(async () => { answers[0]("sent"); });
+    expect(box.value).toBe("");
+    expect(send()).toBeDisabled();
+    await act(async () => { fireEvent.click(send()); });
+    expect(invoke).toHaveBeenCalledTimes(1);
+
+    fireEvent.change(box, { target: { value: "and rebase" } });
+    await act(async () => { fireEvent.click(send()); });
+    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(invoke).toHaveBeenLastCalledWith(expect.anything(), "reply", expect.objectContaining({ text: "and rebase" }));
+    await act(async () => { answers[1]("sent"); });
+    expect(box.value).toBe("");
+  });
+
+  /// Scenario: type a reply and press Send reply, and let the daemon refuse it, then let the send fail outright. Each time the words stay in the box and Send reply is enabled, so the user can send them again.
+  it("a reply the daemon refused, or that failed, stays in the box to be retried (issue #2418, Qodo)", async () => {
+    const invoke = vi.fn()
+      .mockResolvedValueOnce({ request_id: "r1", outcome: "refused", code: "busy", message: "the agent is busy" })
+      .mockRejectedValueOnce(new Error("the daemon went away"))
+      .mockResolvedValueOnce({ request_id: "r3", outcome: "sent", message_id: "m-3" });
+    render(<AgentOverview runtime={runtime([entry("7", "coder")], invoke as never)} onNavigate={vi.fn()} />);
+    fireEvent.click(within(row()).getByTestId("overview-row-menu"));
+    fireEvent.click(within(row()).getByTestId("overview-row-show-card"));
+    const box = screen.getByTestId("agent-card-reply-text") as HTMLTextAreaElement;
+    const send = () => screen.getByTestId("agent-card-reply-send");
+    fireEvent.change(box, { target: { value: "use main" } });
+    for (const calls of [1, 2]) {
+      await act(async () => { fireEvent.click(send()); });
+      expect(invoke).toHaveBeenCalledTimes(calls);
+      expect(box.value).toBe("use main");
+      expect(send()).toBeEnabled();
+    }
+    await act(async () => { fireEvent.click(send()); });
+    expect(invoke).toHaveBeenCalledTimes(3);
+    expect(box.value).toBe("");
+  });
+
   it("the overlay lists what was sent from the card, with the exact text, after the report stopped offering it (decision (a))", () => {
     const card = entry("7", "coder", {
       recent_deliveries: [{ action_id: "go", label: "Go ahead", text: "Run\tthe tests.", token: "tok-old", outcome: "sent", message_id: "m-42", state: "delivered", detail: null, at: "2026-11-17T10:00:00Z" }],
