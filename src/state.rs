@@ -2190,6 +2190,12 @@ pub struct AppState {
     /// early-stamped one look alike by time. By NAME they do not — the old one
     /// is a session this pane has already left.
     waiting_superseded_sessions: HashMap<String, SupersededSessions>,
+    /// Issue #2454 (Qodo on PR #2460): the panes whose current
+    /// `WaitingForInput` began after their turn had ended — a turn that opened
+    /// on a permission prompt, or an idle agent's prompt notification — so
+    /// leaving it into work is the agent's next turn. A pause that began inside
+    /// a turn is not here, and leaving it resumes that turn.
+    pauses_after_turn_end: HashSet<String>,
     /// Maps pane_id → orchestration role name (set when orchestration tab opens).
     pub pane_role_map: HashMap<String, String>,
     /// Maps pane_id → working directory for orchestration panes.
@@ -5019,22 +5025,33 @@ impl AppState {
         if !from_current_generation {
             return;
         }
-        // Issue #2454: the agent started working again — its pane went from a
-        // status where its turn had ended into one that is a turn in progress.
-        // That deals with the waiting, done or failed reason its card report
-        // raised. Leaving a permission prompt or a subagent's wait resumes the
-        // same turn, so it does not (Qodo on PR #2460).
-        if may_start_turn
-            && !status_before
-                .as_ref()
-                .is_some_and(|s| is_turn_in_progress(s) || pauses_a_turn(s))
-            && self
-                .pane_status(&pane_id)
-                .as_ref()
-                .is_some_and(is_turn_in_progress)
-            && let Some(agent_id) = live_agent_id.as_deref()
-        {
-            registry.agent_cards().note_turn_started(&pane_id, agent_id);
+        // Issue #2454: the agent started working again — its pane went into a
+        // turn in progress from a status where its turn had ended, or from a
+        // pause (a permission prompt, a subagent's wait) that itself began after
+        // the turn had ended. That deals with the waiting, done or failed reason
+        // its card report raised. Leaving a pause that began inside a turn
+        // resumes that turn, so it does not (Qodo on PR #2460).
+        if may_start_turn {
+            let status_after = self.pane_status(&pane_id);
+            let ended = |s: &Option<SessionStatus>| {
+                !s.as_ref()
+                    .is_some_and(|s| is_turn_in_progress(s) || pauses_a_turn(s))
+            };
+            let paused_after_end = self.pauses_after_turn_end.remove(&pane_id);
+            // Whether the turn had ended before this event: an ended status,
+            // or a pause that itself began after the turn had ended.
+            let after_turn_end = ended(&status_before)
+                || (status_before.as_ref().is_some_and(pauses_a_turn) && paused_after_end);
+            let turn_started =
+                after_turn_end && status_after.as_ref().is_some_and(is_turn_in_progress);
+            // A pause entered from an ended turn, or one continuing such a
+            // pause, keeps that record; one entered from work does not.
+            if after_turn_end && status_after.as_ref().is_some_and(pauses_a_turn) {
+                self.pauses_after_turn_end.insert(pane_id.clone());
+            }
+            if turn_started && let Some(agent_id) = live_agent_id.as_deref() {
+                registry.agent_cards().note_turn_started(&pane_id, agent_id);
+            }
         }
         // Every current report re-keys the record to the pane's live agent, so
         // `agent_id` always names whose sessions it holds — including the
@@ -11785,6 +11802,7 @@ impl AppState {
         // Issue #447 (Qodo, #1347): the waiting watch's history is about THIS
         // pane's conversations, so a pane reusing the id must not inherit it.
         self.waiting_superseded_sessions.remove(pane_id);
+        self.pauses_after_turn_end.remove(pane_id);
         if let Some(identity) = self.pane_orchestration_map.remove(pane_id) {
             // Issue #555 / #962: the title goes when the last pane of its
             // orchestration does.
@@ -18006,9 +18024,27 @@ mod tests {
         state.apply_event_watching_waiting(event(EventType::Idle, 10), &registry);
         state.apply_event_watching_waiting(event(EventType::Thinking, 11), &registry);
         assert_eq!(dealt_with(), Some(true));
+        // A next turn that opens on a permission prompt is a next turn: the
+        // prompt began after the turn ended, so the work it lets through is the
+        // agent moving on.
+        registry.agent_cards().publish("pane", &agent, done());
+        state.apply_event_watching_waiting(event(EventType::Idle, 13), &registry);
+        state.apply_event_watching_waiting(event(EventType::PermissionRequest, 14), &registry);
+        assert_eq!(
+            state.pane_status("pane"),
+            Some(SessionStatus::WaitingForInput),
+            "precondition: the new turn opened on a permission prompt"
+        );
+        assert_eq!(dealt_with(), Some(false), "the prompt alone is not work");
+        state.apply_event_watching_waiting(event(EventType::ToolEnd, 15), &registry);
+        assert_eq!(
+            dealt_with(),
+            Some(true),
+            "a turn that opened on a permission prompt"
+        );
         // A newer report is not dealt with by the turn it was published in.
         registry.agent_cards().publish("pane", &agent, done());
-        state.apply_event_watching_waiting(event(EventType::ToolStart, 12), &registry);
+        state.apply_event_watching_waiting(event(EventType::ToolStart, 16), &registry);
         assert_eq!(dealt_with(), Some(false));
     }
 
