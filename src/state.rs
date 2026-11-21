@@ -5001,10 +5001,14 @@ impl AppState {
             return;
         }
         // Issue #2454: the agent started working again — its pane went from a
-        // status that is not a turn in progress into one that is. That deals
-        // with the waiting, done or failed reason its card report raised.
+        // status where its turn had ended into one that is a turn in progress.
+        // That deals with the waiting, done or failed reason its card report
+        // raised. Leaving a permission prompt or a subagent's wait resumes the
+        // same turn, so it does not (Qodo on PR #2460).
         if may_start_turn
-            && !status_before.as_ref().is_some_and(is_turn_in_progress)
+            && !status_before
+                .as_ref()
+                .is_some_and(|s| is_turn_in_progress(s) || pauses_a_turn(s))
             && self
                 .pane_status(&pane_id)
                 .as_ref()
@@ -5307,6 +5311,13 @@ fn is_turn_in_progress(status: &SessionStatus) -> bool {
         status,
         SessionStatus::Thinking | SessionStatus::Working | SessionStatus::Compacting
     )
+}
+
+/// Issue #2454 (Qodo on PR #2460): a status a turn passes through without
+/// ending — a permission prompt or a subagent's wait (`WaitingForInput`) —
+/// so leaving it resumes the turn rather than starting the next one.
+fn pauses_a_turn(status: &SessionStatus) -> bool {
+    matches!(status, SessionStatus::WaitingForInput)
 }
 
 /// Issue #2099: whether `event` is an agent reporting that its turn ended on
@@ -17895,10 +17906,11 @@ mod tests {
     }
 
     /// Issue #2454: the agent starting its next turn — its pane going from a
-    /// stopped status into Thinking, Working or Compacting — deals with the
-    /// `done` its card report raised. Moving between two busy statuses inside
-    /// one turn does not, and neither does a daemon-synthesized `ShellBusy`,
-    /// which says a command is running, not that the agent moved on.
+    /// status where its turn ended into Thinking, Working or Compacting —
+    /// deals with the `done` its card report raised. Moving between two busy
+    /// statuses inside one turn does not, nor does answering a permission
+    /// prompt inside it, nor a daemon-synthesized `ShellBusy`, which says a
+    /// command is running, not that the agent moved on.
     #[test]
     fn the_agent_starting_its_next_turn_deals_with_its_card_report() {
         let registry = Arc::new(AgentPtyRegistry::new());
@@ -17951,12 +17963,33 @@ mod tests {
             Some(SessionStatus::Working),
             "precondition: the pane is out of its turn again"
         );
-        // The user replies: the next turn starts.
+        // A permission prompt raised and answered inside one turn resumes it.
         state.apply_event_watching_waiting(event(EventType::Thinking, 7), &registry);
+        assert_eq!(dealt_with(), Some(true), "the next turn");
+        registry.agent_cards().publish("pane", &agent, done());
+        state.apply_event_watching_waiting(event(EventType::PermissionRequest, 8), &registry);
+        assert_eq!(
+            state.pane_status("pane"),
+            Some(SessionStatus::WaitingForInput),
+            "precondition: the permission prompt paused the turn"
+        );
+        // Approved: the call it asked about runs and ends inside the turn.
+        state.apply_event_watching_waiting(event(EventType::ToolEnd, 9), &registry);
+        assert!(
+            state
+                .pane_status("pane")
+                .as_ref()
+                .is_some_and(is_turn_in_progress),
+            "precondition: the turn resumed, {:?}",
+            state.pane_status("pane")
+        );
+        assert_eq!(dealt_with(), Some(false), "a permission prompt answered");
+        state.apply_event_watching_waiting(event(EventType::Idle, 10), &registry);
+        state.apply_event_watching_waiting(event(EventType::Thinking, 11), &registry);
         assert_eq!(dealt_with(), Some(true));
         // A newer report is not dealt with by the turn it was published in.
         registry.agent_cards().publish("pane", &agent, done());
-        state.apply_event_watching_waiting(event(EventType::ToolStart, 8), &registry);
+        state.apply_event_watching_waiting(event(EventType::ToolStart, 12), &registry);
         assert_eq!(dealt_with(), Some(false));
     }
 

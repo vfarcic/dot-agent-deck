@@ -2351,9 +2351,9 @@ async fn desktop_generate_config<R: tauri::Runtime>(
 /// report raised. Bound to `incarnation`, the daemon process that listed the
 /// agent, so a successor that reused the ids is sent nothing. A daemon that
 /// does not advertise the verb is sent nothing either, and its cards keep the
-/// reason until the agent publishes again. Best effort: a failure is only
-/// logged, and a daemon that does not answer in time is left, since nothing the
-/// user sees depends on the answer.
+/// reason until the agent publishes again, and that is an `Ok`. A failure or a
+/// daemon that does not answer in time is an `Err`, which the webview tries
+/// again a few times while the agent stays open.
 #[tauri::command]
 async fn desktop_agent_opened(
     webview: Webview,
@@ -2370,12 +2370,16 @@ async fn desktop_agent_opened(
     daemon.require_compatible()?;
     let client = daemon.client.bound_to(Incarnation::from(incarnation));
     let request = client.agent_opened(&pane_id, Some(&agent_id));
-    if let Ok(Err(error)) =
-        tokio::time::timeout(crate::daemon_bridge::DECK_REPLY_TIMEOUT, request).await
-    {
-        eprintln!("desktop agent-opened: not delivered: {error}");
+    match tokio::time::timeout(crate::daemon_bridge::DECK_REPLY_TIMEOUT, request).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(safe_message(error.to_string())),
+        Err(_) => Err(safe_message(
+            dot_agent_deck::daemon_client::ClientError::TimedOut(
+                crate::daemon_bridge::DECK_REPLY_TIMEOUT,
+            )
+            .to_string(),
+        )),
     }
-    Ok(())
 }
 
 /// [`desktop_generate_config`] minus the webview.

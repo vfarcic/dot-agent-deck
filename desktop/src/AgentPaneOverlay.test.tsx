@@ -47,7 +47,7 @@ vi.mock("./components/AgentTile", async () => {
   };
 });
 
-import { DeckShell as AppDeckShell } from "./App";
+import { AGENT_OPENED_ATTEMPTS, AGENT_OPENED_RETRY_MS, DeckShell as AppDeckShell } from "./App";
 import { AgentTile } from "./components/AgentTile";
 
 /** Existing deck-specific cases enter the deck explicitly after the app default changes. */
@@ -348,6 +348,37 @@ describe("agent pane overlay", () => {
     expect(agentOpened).toHaveBeenCalledTimes(1);
     fireEvent.click(screen.getByRole("row", { name: "Open Plan / architecture agent" }));
     expect(agentOpened).toHaveBeenCalledTimes(2);
+  });
+
+  /**
+   * Scenario: open Planner while its daemon fails every report of the open.
+   * The app sends it again after a pause, at most AGENT_OPENED_ATTEMPTS times
+   * in all; and once the user goes back to the dashboard, a failure sends no
+   * further attempt.
+   */
+  it("tries a failed report of an open again, a bounded number of times, while the agent stays open", async () => {
+    vi.useFakeTimers();
+    try {
+      const agentOpened = vi.fn(async () => { throw new Error("the deck did not answer"); });
+      const initial = runtime({ agentOpened });
+      const snapshot = { ...initial.snapshot, agents: initial.snapshot.agents.map((agent) => ({ ...agent, incarnation: "process-a", paneId: `pane-${agent.id}` })) };
+      render(<DeckShell runtime={{ ...initial, snapshot, fleet: [snapshot] } as DeckRuntimeState} initialView={{ kind: "overview" }} />);
+      fireEvent.click(screen.getByRole("row", { name: "Open Plan / architecture agent" }));
+      for (let n = 0; n < AGENT_OPENED_ATTEMPTS + 2; n += 1) {
+        await act(async () => { await vi.advanceTimersByTimeAsync(AGENT_OPENED_RETRY_MS); });
+      }
+      expect(agentOpened).toHaveBeenCalledTimes(AGENT_OPENED_ATTEMPTS);
+
+      agentOpened.mockClear();
+      fireEvent.click(screen.getByRole("button", { name: "Back to dashboard" }));
+      fireEvent.click(screen.getByRole("row", { name: "Open Plan / architecture agent" }));
+      expect(agentOpened).toHaveBeenCalledTimes(1);
+      fireEvent.click(screen.getByRole("button", { name: "Back to dashboard" }));
+      await act(async () => { await vi.advanceTimersByTimeAsync(AGENT_OPENED_RETRY_MS * 3); });
+      expect(agentOpened).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   /** Scenario: the deck's tile opens Planner's overlay; that open is reported too. */

@@ -102,4 +102,29 @@ test.describe("a dashboard row's Needs you and keyboard open (issue #2454)", () 
     await page.keyboard.press("Space");
     await expect(overlay).toBeVisible();
   });
+
+  /**
+   * Scenario: open the same table in a narrow window, where the Agent column
+   * is at its smallest. Every agent's name still shows some of its text beside
+   * its badges, and a Needs you badge gives way (cut short) before the name or
+   * the row's controls do, never reaching into the controls.
+   */
+  test("a narrow Agent column keeps each name visible beside its badges", async ({ page }) => {
+    await page.setViewportSize({ width: 560, height: 800 });
+    await openCardsScene(page);
+    const all = rows(page);
+    const count = await all.count();
+    expect(count).toBeGreaterThan(0);
+    for (let at = 0; at < count; at += 1) {
+      const row = all.nth(at);
+      const name = await box(row.locator(".overview-agent-name strong"));
+      expect(name.width, `row ${at}'s name keeps room for its text`).toBeGreaterThanOrEqual(20);
+      const badge = row.getByTestId("overview-needs-you");
+      if (await badge.count()) {
+        const badgeBox = await box(badge);
+        const actions = await box(row.locator(".overview-row-actions"));
+        expect(badgeBox.x + badgeBox.width).toBeLessThanOrEqual(actions.x + 0.5);
+      }
+    }
+  });
 });

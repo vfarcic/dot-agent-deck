@@ -5254,13 +5254,13 @@ impl PaneController for EmbeddedPaneController {
     /// the background so opening a pane never waits on it. A daemon that does
     /// not advertise the verb is sent nothing; a failure is only logged, as
     /// the card then keeps its reason until the agent publishes again.
-    fn note_card_opened(&self, card: &BoundPane) {
+    fn note_card_opened(&self, card: &BoundPane, agent_id: Option<&str>) {
         let client = self.held_client(card);
         let pane_id = card.pane_id.clone();
+        let agent_id = agent_id.map(str::to_string);
         self.runtime.spawn(async move {
-            match tokio::time::timeout(HYDRATE_LIST_TIMEOUT, client.agent_opened(&pane_id, None))
-                .await
-            {
+            let request = client.agent_opened(&pane_id, agent_id.as_deref());
+            match tokio::time::timeout(HYDRATE_LIST_TIMEOUT, request).await {
                 Ok(Ok(_)) => {}
                 Ok(Err(error)) => tracing::debug!(
                     pane_id = %pane_id,

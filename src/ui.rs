@@ -8829,7 +8829,7 @@ fn focus_deck(
             match focus_result {
                 Ok(()) => {
                     // Issue #2454: opening the agent deals with its report.
-                    pane.note_card_opened(&card);
+                    pane.note_card_opened(&card, session.agent_id.as_deref());
                     ui.mode = UiMode::PaneInput;
                     ui.status_message = Some((
                         format!(
@@ -11639,7 +11639,7 @@ fn send_config_gen_prompt(
             match focus {
                 Ok(()) => {
                     // Issue #2454: the pane opened, as Enter would open it.
-                    pane.note_card_opened(card);
+                    pane.note_card_opened(card, agent);
                     ui.mode = UiMode::PaneInput;
                 }
                 Err(error) => tracing::debug!(
@@ -12260,7 +12260,7 @@ fn dispatch_action(
                     match focus_result {
                         Ok(()) => {
                             // Issue #2454: opening the agent deals with its report.
-                            pane.note_card_opened(&card);
+                            pane.note_card_opened(&card, session.agent_id.as_deref());
                             ui.mode = UiMode::PaneInput;
                             ui.status_message = Some((
                                 format!(

@@ -1674,6 +1674,8 @@ button.deck-attention-name { text-decoration: underline; text-underline-offset: 
 .overview-row .agent-state-mark { display: block; margin: 0; }
 .overview-agent-name { min-width: 0; display: flex; align-items: baseline; gap: 6px; }
 .overview-agent-name strong { overflow: hidden; font-size: var(--text-base); font-weight: 680; text-overflow: ellipsis; white-space: nowrap; }
+/* Issue #2454 (Qodo on PR #2460): the name keeps room for a few characters however many badges share its cell; the badges give way first. */
+.overview-agent-name strong { min-width: 5ch; }
 .overview-role-index { flex: 0 0 auto; color: var(--faint); font-family: "JetBrains Mono", monospace; font-size: var(--text-base); font-style: normal; }
 .overview-role-name { overflow: hidden; color: var(--faint); font-size: var(--text-base); font-style: normal; text-overflow: ellipsis; white-space: nowrap; }
 /* Scoped to the overview on purpose: `.coordinator-badge` is also used by
@@ -2182,7 +2184,7 @@ button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-
 .agent-card-reply textarea { width: 100%; min-height: 70px; padding: 7px; border: 1px solid var(--line-strong); border-radius: 5px; color: var(--ink); background: var(--paper); font: inherit; font-size: var(--text-base); resize: vertical; }
 .agent-card-gone { margin: 0; padding: 14px; border: 1px dashed var(--line); border-radius: 6px; color: var(--muted); text-align: center; }
 /* Issue #2454 — the daemon's Needs you as a name-cell badge, shaped like `.overview-lease` and the ORCHESTRATOR badge beside it. */
-.overview-needs-you { flex: 0 0 auto; padding: 1px 4px; border-radius: 2px; color: var(--amber); background: var(--amber-soft); font-size: var(--text-xs); font-weight: 800; letter-spacing: .08em; text-transform: uppercase; white-space: nowrap; }
+.overview-needs-you { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; padding: 1px 4px; border-radius: 2px; color: var(--amber); background: var(--amber-soft); font-size: var(--text-xs); font-weight: 800; letter-spacing: .08em; text-transform: uppercase; white-space: nowrap; }
 .overview-card-menu { position: relative; flex: 0 0 auto; }
 .overview-card-menu-button { width: 20px; height: 20px; display: grid; place-items: center; border: 1px solid transparent; border-radius: 4px; color: var(--faint); background: transparent; cursor: pointer; }
 .overview-card-menu-button:hover, .overview-card-menu-button:focus-visible, .overview-card-menu-button[aria-expanded="true"] { color: var(--teal); border-color: var(--teal-focus); background: var(--teal-soft); }

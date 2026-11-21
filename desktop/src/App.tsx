@@ -112,6 +112,11 @@ import { agentSpokenName } from "./lib/agentNames";
 import { questionAgentName } from "./lib/voiceQuestion";
 import { planStoredRoleOrder, reconcileRoleOrder } from "./lib/roleOrder";
 
+/** Issue #2454: how many times one open of an agent is reported before giving up. */
+export const AGENT_OPENED_ATTEMPTS = 3;
+/** Issue #2454: the wait before a failed report of an open is sent again. */
+export const AGENT_OPENED_RETRY_MS = 2000;
+
 const ORCHESTRATION_STORAGE_KEY = modeScopedKey("dot-agent-deck.desktop.orchestration-preview.v1");
 /**
  * Where the saved role order lived before issue #1045 renamed the desktop's
@@ -581,18 +586,30 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    * "Needs you" the agent's card report raised. Sent when the view's agent
    * resolves to a listed record, bound to the process that listed it; leaving
    * the view forgets it, so opening the same agent again tells the daemon again.
+   * A send that fails is tried again while the same view stays open, at most
+   * {@link AGENT_OPENED_ATTEMPTS} times in all (Qodo on PR #2460).
    */
   const agentOpened = runtime.agentOpened;
   const openedSent = useRef<string | undefined>(undefined);
+  useEffect(() => () => { openedSent.current = undefined; }, []);
   useEffect(() => {
     if (!agentView || !paneAgent) {
       if (!agentView) openedSent.current = undefined;
       return;
     }
     const key = `${agentView.deckId}\u0000${paneAgent.id}\u0000${paneAgent.incarnation ?? ""}`;
-    if (openedSent.current === key || !agentOpened || !paneAgent.paneId) return;
+    const paneId = paneAgent.paneId;
+    if (openedSent.current === key || !agentOpened || !paneId) return;
     openedSent.current = key;
-    agentOpened(agentView.deckId, paneAgent.id, paneAgent.paneId, paneAgent.incarnation).catch(() => undefined);
+    const { deckId } = agentView;
+    const { id, incarnation } = paneAgent;
+    const send = (attempt: number) => {
+      agentOpened(deckId, id, paneId, incarnation).catch(() => {
+        if (attempt >= AGENT_OPENED_ATTEMPTS || openedSent.current !== key) return;
+        window.setTimeout(() => { if (openedSent.current === key) send(attempt + 1); }, AGENT_OPENED_RETRY_MS);
+      });
+    };
+    send(1);
   }, [agentOpened, agentView, paneAgent]);
   /**
    * Issue #1143 — the last record this pane's deck gave, so the pane can still
