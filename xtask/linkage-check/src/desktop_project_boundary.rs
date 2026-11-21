@@ -272,6 +272,18 @@ const ALLOWED_ROOT_MODULES: &[&str] = &[
     // `std::env::current_dir` — all zero for it.
     "login_shell",
     "platform",
+    // Issue #824, argued rather than added quietly. The desktop names ONE
+    // item here, the `Prompt` wire type, which the shared `DaemonClient`'s
+    // prompt-library verbs take and return; the desktop converts it to its
+    // own camelCase DTO and back. A desktop-side copy would be a second
+    // definition of the wire shape to keep in step with the daemon's. The
+    // module's store reads and writes `prompts.toml` in the DAEMON's state
+    // directory, never a project's, and the desktop does not call it. Checked
+    // against this rule's lines: it resolves no project, reads no project
+    // state file, names no FORBIDDEN_SYMBOL or project-state literal in code
+    // (its doc comment names `.dot-agent-deck.toml` only to say nothing is
+    // written there), and contains no `std::env::current_dir`.
+    "prompt_library",
     // PRD #1401, argued rather than added quietly. The desktop names
     // `PullRequestInfo` here — the type `SessionSnapshot.pull_request` carries,
     // which `dto::DesktopAgent` copies through to the webview as is — so the
