@@ -53,11 +53,7 @@ On startup the deck installs its status hooks for the agents it detects (see [In
 
 **Check:** on a first run the TUI shows an empty dashboard reading `No active agents. Press Ctrl+n to create an agent.`, with a row of buttons along the bottom and a ` COMMAND ` chip at its left.
 
-![The TUI with no agents: “No active agents. Press Ctrl+n to create an agent.” above the command bar, which starts with a COMMAND chip](/img/dashboard-empty-tui.png)
-
-**Desktop app instead:** install it ([Installation → Desktop app](installation.md#desktop-app)), keep a daemon running (the TUI above is enough; see [How the desktop app gets a daemon](installation.md#how-the-desktop-app-gets-a-daemon)) and open **Agent Deck**. **Check:** the Dashboard says **No agents are running yet** and offers **New agent**. If it says **Daemon disconnected** with **Start daemon**, no daemon is running; press **Start daemon** and confirm.
-
-![The desktop app's dashboard with no agents: “No agents are running yet”, with New agent and Add a daemon](/img/dashboard-empty-desktop.png)
+**Desktop app instead:** install it ([Installation → Desktop app](installation.md#desktop-app)), keep a daemon running (the TUI above is enough; see [How the desktop app gets a daemon](installation.md#how-the-desktop-app-gets-a-daemon)) and open **Agent Deck**. **Check:** the Dashboard says **No agents are running yet** and offers **New agent**, plus **Add a daemon** while this machine is the only daemon you have added. If it says **Daemon disconnected** with **Start daemon**, no daemon is running; press **Start daemon** and confirm.
 
 ## Step 3: Start an agent
 
@@ -67,25 +63,13 @@ On startup the deck installs its status hooks for the agents it detects (see [In
 2. Move with `j`/`k` (or the arrow keys), open the highlighted directory with `l` or `Enter`, and go up with `h`. When you are inside the directory the agent should work in, press `Space` to choose it. (`Enter` on a directory with no subdirectories also chooses it.)
 3. In the **New Agent** form, leave **Mode** on `No mode` and press `Enter` to move to **Name** (pre-filled from the directory), then `Enter` again to move to **Command**. Type the command, for example `claude`, and press `Enter` to submit. `Tab` / `Shift+Tab` also move between fields, and `Esc` cancels.
 
-![The TUI's New Agent form over the dashboard: the chosen directory at the top, a Mode row with No mode selected and an orchestration, schedule and dispatcher as the other choices, then the Name field pre-filled from the directory, an empty Command field, and Submit and Cancel](/img/new-agent-tui.png)
-
 **Desktop:**
 
 1. Click **New agent** (or press `Ctrl+N` / `⌘N` on the Dashboard).
 2. Choose the daemon, browse to a directory and press **Use this directory**.
 3. Leave **Mode** on **No mode**, check **Name** and **Command** (pre-filled from `default_command` or your last command), and press **Create agent**. See [Desktop app → New agent](desktop/new-agent.md).
 
-![The desktop app's New agent dialog over the Dashboard: the Local daemon chosen under Daemon, a directory chosen in the browser, the Mode chips with No mode selected, the Name pre-filled from the directory, an empty Command field, and Discard and Create agent](/img/new-agent-desktop.png)
-
-**Check:** a card (TUI) or row (desktop) appears for the agent. After you give the agent a prompt, its status moves from **Idle** to **Thinking** or **Working** (desktop: **idle** to **running**). If the status never changes while the agent visibly works, its hooks are not reaching the daemon; see [Troubleshooting → Hooks](troubleshooting.md#hooks). If the pane shows a `command not found` error for a bare `claude`, `codex` and so on, see [Troubleshooting](troubleshooting.md#a-bare-command-like-claude-opencode-pi-codex-devin-or-agy-fails-to-spawn).
-
-**TUI:**
-
-![The TUI with four agents: a column of agent cards on the left, each with its status (Idle, Working, Needs Input), directory and last prompt, and the focused agent's terminal pane on the right](/img/dashboard-tui.png)
-
-**Desktop:**
-
-![The desktop app's dashboard with four agents in one daemon section, each row showing its status (running or waiting), name and uptime, and New agent, Columns and Refresh at the top](/img/dashboard-desktop.png)
+**Check:** a card (TUI) or row (desktop) appears for the agent. After you give the agent a prompt, its status moves from **Idle** to **Thinking** or **Working**, in both clients. The TUI shows each agent as a card in a column on the left, with its status, directory and last prompt, beside the focused agent's terminal pane; the desktop app shows one row per agent under its daemon's section, with its status, name and uptime. If the status never changes while the agent visibly works, its hooks are not reaching the daemon; see [Troubleshooting → Hooks](troubleshooting.md#hooks). If the pane shows a `command not found` error for a bare `claude`, `codex` and so on, see [Troubleshooting](troubleshooting.md#a-bare-command-like-claude-opencode-pi-codex-devin-or-agy-fails-to-spawn).
 
 ## Step 4: Type into the agent, and come back
 

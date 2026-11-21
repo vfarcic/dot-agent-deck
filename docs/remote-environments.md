@@ -372,8 +372,6 @@ The desktop app shows a remote daemon's agents alongside the local ones, reached
 3. In the app, choose **Add a daemon…** at the bottom of the Dashboard's **Daemon** selector (or open **Settings → Daemons** and press **Add a daemon**), fill in **Host** (and **User**, **Port**, **Key file** or **Jump host** as needed), check the suggested **Daemon name**, and press **Add this daemon**. Then, in **Settings → Daemons** with the new daemon chosen, press **Test connection**, which also finds the daemon's socket.
 4. Pick the daemon in the **Daemon** selector on the Dashboard, or **All daemons**.
 
-![Settings → Daemons with a remote daemon named build, its address build-box beside the name, chosen in the Daemon row beside All daemons and This machine; below it the Daemon name field reads build with a Rename button, Host is filled in, the other fields show their placeholders, and Test connection is not yet pressed](/img/settings-daemons-desktop.png)
-
 [Daemons](desktop/daemons.md) explains the fields and every **Test connection** result. The app runs ssh non-interactively too, so the same key and host-key rules as `remote add` apply.
 
 ### One list of remotes for both clients

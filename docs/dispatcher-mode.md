@@ -29,9 +29,7 @@ Before you start: the project directory is a git repository with at least one co
 
 ## Start a unit
 
-Tell the dispatcher what to start: *"Start work on the login timeout bug."* Here is a dispatcher in the TUI asked for a standing loop of units rather than a single one; in the desktop app the same conversation happens in the dispatcher agent's terminal.
-
-![A dispatcher pane in the TUI. The request asks for three dispatched agents or teams at a time, counting the two already running, and a stop at twenty in total; the dispatcher reads it back as a standing loop that keeps three units running, dispatches a fresh one each time a slot frees, and stops once twenty have been dispatched, with eighteen more to go](img/dispatch.webp)
+Tell the dispatcher what to start: *"Start work on the login timeout bug."* You can also ask for more than one unit at a time, for example *"keep three units running and stop at twenty in total"*; the dispatcher is an agent, so it reads such a request back to you and carries it out as it understands it. In the TUI and the desktop app alike, this conversation happens in the dispatcher agent's terminal.
 
 Each unit starts as a **single agent** or as a **full orchestration** defined in the project's `.dot-agent-deck.toml`. The dispatcher asks you which, once for each unit, because the right shape depends on the work: *"work on these three features"* often wants a team per feature, *"verify these three PRs"* one agent each. One answer can cover several units if you give one. When the project defines no orchestrations, `single` is the only choice and it does not ask.
 

@@ -85,8 +85,6 @@ Things to know when changing schedules:
 
 ### The TUI's Schedules manager
 
-![The TUI's Schedules manager with one schedule: its row shows the name, the status disabled and a next fire of —, above the Add, Edit, Delete, Run now and Toggle buttons](/img/schedules-tui.png)
-
 Each row shows the schedule's name, a status and its next run time. The statuses are taken when the dialog opens and refreshed after a run-now:
 
 | Status | Meaning |
