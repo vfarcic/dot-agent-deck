@@ -2156,7 +2156,7 @@ struct UiState {
     /// says so instead of removing it as stale. Inert once its tab closes: a
     /// dead-slot id is minted from the orchestration instance's own id, which
     /// no later instance reuses.
-    ended_role_slots: HashMap<String, crate::ended_role::EndedRole>,
+    ended_role_slots: HashMap<String, RememberedEndedRole>,
     /// Maps pane_id → launch metadata for auto-save/restore.
     pane_metadata: HashMap<String, config::SavedPane>,
     config: DashboardConfig,
@@ -4074,10 +4074,46 @@ pub fn is_dead_slot_pane_id(pane_id: &str) -> bool {
     pane_id.starts_with(DEAD_SLOT_PREFIX)
 }
 
-/// Issue #1965: at most this many exited roles are remembered for cards. A
-/// report past it is dropped rather than growing the map without bound; the
-/// card it was for keeps the plain `No agent` look it had before.
+/// Issue #1965: at most this many exited roles are remembered for cards. The
+/// map is pruned to the role panes of the open tabs every frame
+/// ([`prune_ended_roles`]), so it holds that many only with that many role
+/// panes open; past it, a report for a key not already held is dropped and its
+/// card keeps the plain `No agent` look it had before.
 const MAX_ENDED_ROLE_SLOTS: usize = 256;
+
+/// Issue #1965: an exited role remembered for a card, with the daemon process
+/// that reported it. Pane ids are a per-daemon counter, so a report from one
+/// process says nothing about a pane another process numbers the same way.
+#[derive(Debug, Clone)]
+struct RememberedEndedRole {
+    role: crate::ended_role::EndedRole,
+    from: crate::daemon_client::Incarnation,
+}
+
+/// Issue #1965: remember `role` under `key`, bounded by
+/// [`MAX_ENDED_ROLE_SLOTS`]. A report the deck has not settled yet (no
+/// termination) never replaces a settled one for the same agent generation: a
+/// listing read before the pane's reader finished can arrive after the
+/// broadcast that carried the settled report.
+fn remember_ended_role(
+    ui: &mut UiState,
+    key: String,
+    role: crate::ended_role::EndedRole,
+    from: crate::daemon_client::Incarnation,
+) {
+    if let Some(held) = ui.ended_role_slots.get(&key) {
+        if held.role.agent_id == role.agent_id
+            && held.role.termination.is_some()
+            && role.termination.is_none()
+        {
+            return;
+        }
+    } else if ui.ended_role_slots.len() >= MAX_ENDED_ROLE_SLOTS {
+        return;
+    }
+    ui.ended_role_slots
+        .insert(key, RememberedEndedRole { role, from });
+}
 
 /// Issue #1965: take the exited roles the daemon announced since the last
 /// frame (`BroadcastMsg::RoleEnded`, and the periodic listing's `ended_roles`,
@@ -4092,7 +4128,7 @@ const MAX_ENDED_ROLE_SLOTS: usize = 256;
 /// pane's reader settled it gets the settled one.
 fn drain_ended_roles(state: &SharedState, ui: &mut UiState) {
     let ended = state.blocking_write().take_ended_roles();
-    for role in ended {
+    for (role, from) in ended {
         let dead_slot = role.orchestration_id.as_ref().map(|id| {
             dead_slot_pane_id(
                 &crate::state::OrchestrationIdentity {
@@ -4103,39 +4139,64 @@ fn drain_ended_roles(state: &SharedState, ui: &mut UiState) {
             )
         });
         for key in std::iter::once(role.pane_id.clone()).chain(dead_slot) {
-            if ui.ended_role_slots.len() >= MAX_ENDED_ROLE_SLOTS
-                && !ui.ended_role_slots.contains_key(&key)
-            {
-                continue;
-            }
-            ui.ended_role_slots.insert(key, role.clone());
+            remember_ended_role(ui, key, role.clone(), from.clone());
         }
     }
 }
 
+/// Issue #1965: forget every remembered exited role whose key is no role pane
+/// of an open orchestration tab — the tab closed, the role was replaced, or the
+/// report arrived before its tab was built (the periodic listing brings it
+/// again). Keeps the map to what a card on screen can show.
+fn prune_ended_roles(ui: &mut UiState, tab_manager: &TabManager) {
+    if ui.ended_role_slots.is_empty() {
+        return;
+    }
+    let open: HashSet<&str> = tab_manager
+        .tabs()
+        .iter()
+        .filter_map(|tab| match tab {
+            Tab::Orchestration { role_pane_ids, .. } => Some(role_pane_ids),
+            _ => None,
+        })
+        .flatten()
+        .map(String::as_str)
+        .collect();
+    ui.ended_role_slots
+        .retain(|key, _| open.contains(key.as_str()));
+}
+
 /// Issue #1965: the exited role remembered for a card's pane, unless the card
 /// has since been taken by another agent (a `pane restart` started a fresh
-/// one there).
+/// one there) or was learned from another daemon process than the report.
 fn ended_role_for<'a>(
     ui: &'a UiState,
     pane_id: &str,
     agent_id: Option<&str>,
+    learned_from: &crate::daemon_client::Incarnation,
 ) -> Option<&'a crate::ended_role::EndedRole> {
     ui.ended_role_slots
         .get(pane_id)
-        .filter(|ended| agent_id.is_none_or(|agent| agent == ended.agent_id))
+        .filter(|held| agent_id.is_none_or(|agent| agent == held.role.agent_id))
+        .filter(|held| {
+            held.from.is_unnamed()
+                || learned_from.is_unnamed()
+                || held.from.same_process(learned_from)
+        })
+        .map(|held| &held.role)
 }
 
 /// Issue #1965: for each synthetic dead slot in `role_pane_ids`, remember the
 /// role whose agent exited there, so its card says which role died and why.
 /// Matched on the orchestration instance's id and the role's index, the two
 /// keys the slot itself was minted from; a slot with no reported role keeps
-/// its plain `No agent` card.
+/// its plain `No agent` card. `from` is the daemon process `ended` came from.
 fn remember_ended_roles(
     ui: &mut UiState,
     role_pane_ids: &[Option<String>],
     orchestration_id: &str,
     ended: &[crate::ended_role::EndedRole],
+    from: &crate::daemon_client::Incarnation,
 ) {
     for (role_index, slot) in role_pane_ids.iter().enumerate() {
         let Some(slot) = slot.as_deref().filter(|p| is_dead_slot_pane_id(p)) else {
@@ -4145,7 +4206,7 @@ fn remember_ended_roles(
             role.role_index == role_index
                 && role.orchestration_id.as_deref() == Some(orchestration_id)
         }) {
-            ui.ended_role_slots.insert(slot.to_string(), role.clone());
+            remember_ended_role(ui, slot.to_string(), role.clone(), from.clone());
         }
     }
 }
@@ -5358,7 +5419,13 @@ fn surface_one_orchestration(
             // Issue #1965: say which role died and why on its dead slot.
             if !dead_slot_ids.is_empty() {
                 let ended = embedded.ended_roles(learned_from);
-                remember_ended_roles(ui, &role_pane_ids, &bucket.orchestration_id, &ended);
+                remember_ended_roles(
+                    ui,
+                    &role_pane_ids,
+                    &bucket.orchestration_id,
+                    &ended,
+                    learned_from,
+                );
             }
             let mut st = state.blocking_write();
             // Seed placeholder cards for synthetic dead slots only (live roles
@@ -8877,7 +8944,13 @@ fn apply_stream_rejection_feedback(
 /// stale-card removal.
 fn ended_role_selected(ui: &mut UiState, session: &SessionState) -> bool {
     let Some(headline) = session.pane_id.as_deref().and_then(|pane_id| {
-        ended_role_for(ui, pane_id, session.agent_id.as_deref()).map(|e| e.headline())
+        ended_role_for(
+            ui,
+            pane_id,
+            session.agent_id.as_deref(),
+            &session.incarnation,
+        )
+        .map(|e| e.headline())
     }) else {
         return false;
     };
@@ -15543,6 +15616,7 @@ pub fn run_tui(
                             &role_pane_ids,
                             &bucket.orchestration_id,
                             &ended,
+                            &learned_from,
                         );
                     }
                     let mut st = state.blocking_write();
@@ -15973,6 +16047,7 @@ pub fn run_tui(
         process_restart_drops(&state, pane.as_ref(), &mut tab_manager, &mut ui);
         // Issue #1965: a role whose agent exited says which role and why.
         drain_ended_roles(&state, &mut ui);
+        prune_ended_roles(&mut ui, &tab_manager);
         // Issue #717: report a dispatched worktree the daemon actually left
         // on disk. Queued by the event subscriber, drained here because the
         // status line is `UiState`.
@@ -19177,11 +19252,14 @@ fn render_card_grid(
                 .is_some_and(|id| ui.idle_settling.contains_key(*id));
             // Issue #1965: a dead slot whose role the daemon reported exited
             // says which role it was and why.
-            if let Some(ended) = session
-                .pane_id
-                .as_deref()
-                .and_then(|pane_id| ended_role_for(ui, pane_id, session.agent_id.as_deref()))
-            {
+            if let Some(ended) = session.pane_id.as_deref().and_then(|pane_id| {
+                ended_role_for(
+                    ui,
+                    pane_id,
+                    session.agent_id.as_deref(),
+                    &session.incarnation,
+                )
+            }) {
                 render_ended_role_card(frame, card_area, ended, is_selected, card_number, ui.mode);
                 ui.card_rects.push((flat_index, card_area));
                 continue;
@@ -38132,16 +38210,28 @@ mod tests {
         let mut slots = vec![Some("live-pane".to_string()), None];
         let dead = assign_synthetic_dead_slot_ids(&mut slots, &identity);
         let mut ui = default_ui();
-        remember_ended_roles(&mut ui, &slots, "orch-1965", &[ended_reviewer()]);
+        remember_ended_roles(
+            &mut ui,
+            &slots,
+            "orch-1965",
+            &[ended_reviewer()],
+            &crate::daemon_client::Incarnation::UNNAMED,
+        );
         assert_eq!(
             ui.ended_role_slots
                 .get(&dead[0])
-                .map(|r| r.role_name.as_str()),
+                .map(|r| r.role.role_name.as_str()),
             Some("reviewer")
         );
         // Another instance's report, or another role's, fills no slot.
         let mut other = default_ui();
-        remember_ended_roles(&mut other, &slots, "orch-other", &[ended_reviewer()]);
+        remember_ended_roles(
+            &mut other,
+            &slots,
+            "orch-other",
+            &[ended_reviewer()],
+            &crate::daemon_client::Incarnation::UNNAMED,
+        );
         assert!(other.ended_role_slots.is_empty());
 
         let mut st = AppState::default();
@@ -38180,25 +38270,83 @@ mod tests {
     #[test]
     fn an_announced_exited_role_reaches_its_card_until_another_agent_holds_the_pane() {
         let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
-        state.blocking_write().queue_ended_role(ended_reviewer());
+        let deck_a = crate::daemon_client::Incarnation::from(Some("deck-a".to_string()));
+        let deck_b = crate::daemon_client::Incarnation::from(Some("deck-b".to_string()));
+        state
+            .blocking_write()
+            .queue_ended_role(ended_reviewer(), deck_a.clone());
         let mut ui = default_ui();
         drain_ended_roles(&state, &mut ui);
         assert!(state.blocking_read().pending_ended_roles.is_empty());
         assert_eq!(
-            ended_role_for(&ui, "7", Some("7")).map(|r| r.reason()),
+            ended_role_for(&ui, "7", Some("7"), &deck_a).map(|r| r.reason()),
             Some("its command exited (code 1)".to_string())
         );
-        assert!(ended_role_for(&ui, "7", None).is_some());
+        assert!(ended_role_for(&ui, "7", None, &deck_a).is_some());
         assert!(
-            ended_role_for(&ui, "7", Some("8")).is_none(),
+            ended_role_for(&ui, "7", Some("8"), &deck_a).is_none(),
             "a successor's card is not the exited role's"
+        );
+        assert!(
+            ended_role_for(&ui, "7", None, &deck_b).is_none(),
+            "a card another daemon process numbers 7 is not the exited role's"
         );
         // The same role's dead slot, as a rebuilt tab mints it, gets it too.
         let slot = dead_slot_pane_id(&test_identity("orch-1965", "mixed"), 1);
         assert_eq!(
-            ended_role_for(&ui, &slot, None).map(|r| r.agent_id.as_str()),
+            ended_role_for(&ui, &slot, None, &deck_a).map(|r| r.agent_id.as_str()),
             Some("7")
         );
+
+        // A listing read before the pane's reader settled the exit, arriving
+        // after the broadcast that carried it, keeps the settled report.
+        let mut unsettled = ended_reviewer();
+        unsettled.termination = None;
+        unsettled.last_output.clear();
+        state
+            .blocking_write()
+            .queue_ended_role(unsettled, deck_a.clone());
+        drain_ended_roles(&state, &mut ui);
+        assert_eq!(
+            ended_role_for(&ui, "7", None, &deck_a).map(|r| r.reason()),
+            Some("its command exited (code 1)".to_string())
+        );
+        assert_eq!(
+            ended_role_for(&ui, &slot, None, &deck_a).map(|r| r.last_output.len()),
+            Some(2)
+        );
+    }
+
+    /// Scenario: reports for role panes no open orchestration tab holds — a
+    /// closed tab's, or a role announced before its tab exists — are
+    /// forgotten every frame, and the map is bounded, so it cannot fill up
+    /// over a long session and stop taking new reports (issue #1965).
+    #[test]
+    fn exited_role_reports_are_pruned_to_open_tabs_and_bounded() {
+        let mut ui = default_ui();
+        for i in 0..(MAX_ENDED_ROLE_SLOTS + 10) {
+            remember_ended_role(
+                &mut ui,
+                format!("gone-{i}"),
+                ended_reviewer(),
+                crate::daemon_client::Incarnation::UNNAMED,
+            );
+        }
+        assert_eq!(ui.ended_role_slots.len(), MAX_ENDED_ROLE_SLOTS);
+        let pc = Arc::new(OpenTabPC::new());
+        let tab_manager = TabManager::new(pc);
+        prune_ended_roles(&mut ui, &tab_manager);
+        assert!(
+            ui.ended_role_slots.is_empty(),
+            "no open tab holds those panes"
+        );
+        remember_ended_role(
+            &mut ui,
+            "7".into(),
+            ended_reviewer(),
+            crate::daemon_client::Incarnation::UNNAMED,
+        );
+        assert_eq!(ui.ended_role_slots.len(), 1, "a new report is taken again");
     }
 
     /// Scenario: press Enter on the card of a role the daemon reported exited.
@@ -38216,7 +38364,12 @@ mod tests {
         let filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
         let mut ui = default_ui();
         ui.selected_index = Some(0);
-        ui.ended_role_slots.insert("p0".into(), ended_reviewer());
+        remember_ended_role(
+            &mut ui,
+            "p0".into(),
+            ended_reviewer(),
+            crate::daemon_client::Incarnation::UNNAMED,
+        );
 
         dispatch_action(
             Action::Focus,
@@ -38239,7 +38392,12 @@ mod tests {
 
         // The digit jump says the same.
         let mut ui = default_ui();
-        ui.ended_role_slots.insert("p0".into(), ended_reviewer());
+        remember_ended_role(
+            &mut ui,
+            "p0".into(),
+            ended_reviewer(),
+            crate::daemon_client::Incarnation::UNNAMED,
+        );
         focus_deck(0, &mut ui, &filtered, &snapshot, &state, &*pc);
         assert!(state.blocking_read().sessions.contains_key("s0"));
         assert_eq!(

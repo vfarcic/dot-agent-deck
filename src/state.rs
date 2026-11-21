@@ -2333,7 +2333,7 @@ pub struct AppState {
     /// announced them (`BroadcastMsg::RoleEnded`), for the render loop to put
     /// on their cards. Bounded at [`MAX_PENDING_ENDED_ROLES`]; the oldest goes
     /// first when a burst outruns the render loop.
-    pub pending_ended_roles: Vec<crate::ended_role::EndedRole>,
+    pub pending_ended_roles: Vec<(crate::ended_role::EndedRole, Incarnation)>,
     /// PRD #1401: how a pull request launch from the `o` key settled — the
     /// launch's number and the status-line message for it — waiting for the
     /// render loop. Filled by the thread that watches the browser
@@ -9634,17 +9634,19 @@ impl AppState {
         self.pending_worktree_kept = Some(kept);
     }
 
-    /// Issue #1965: record an orchestration role whose agent exited, for the
-    /// render loop to put on its card.
-    pub fn queue_ended_role(&mut self, role: crate::ended_role::EndedRole) {
+    /// Issue #1965: record an orchestration role whose agent exited, as the
+    /// daemon process `from` reported it, for the render loop to put on its
+    /// card.
+    pub fn queue_ended_role(&mut self, role: crate::ended_role::EndedRole, from: Incarnation) {
         if self.pending_ended_roles.len() >= MAX_PENDING_ENDED_ROLES {
             self.pending_ended_roles.remove(0);
         }
-        self.pending_ended_roles.push(role);
+        self.pending_ended_roles.push((role, from));
     }
 
-    /// Issue #1965: the exited roles queued since the last call, oldest first.
-    pub fn take_ended_roles(&mut self) -> Vec<crate::ended_role::EndedRole> {
+    /// Issue #1965: the exited roles queued since the last call, oldest first,
+    /// each with the daemon process that reported it.
+    pub fn take_ended_roles(&mut self) -> Vec<(crate::ended_role::EndedRole, Incarnation)> {
         std::mem::take(&mut self.pending_ended_roles)
     }
 

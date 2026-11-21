@@ -1691,7 +1691,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     const shown = cardsOnScreen(deck);
     const deckId = deck.snapshot.connection.deckId;
     if (shown === undefined || deckId === undefined) return undefined;
-    return <AgentCardsDeckBody deckId={deckId} cards={shown} needsYouOnly={cards.needsYouOnly} controls={cards.controls} results={cards.resultsFor} />;
+    return <AgentCardsDeckBody deckId={deckId} cards={shown} needsYouOnly={cards.needsYouOnly} controls={cards.controls} results={cards.resultsFor} endedRoles={deck.snapshot.endedRoles} />;
   };
   const cards = useAgentCardsView({ runtime, decks: cardDeckList, openAgent: openCardAgent });
   const [confirm, setConfirm] = useState<ConfirmState>();

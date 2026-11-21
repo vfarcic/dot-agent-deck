@@ -19662,12 +19662,15 @@ impl AgentPtyRegistry {
     /// are.
     pub fn ended_roles(&self) -> Vec<crate::ended_role::EndedRole> {
         let inner = self.inner.lock();
-        let pane_has_live_agent = |pane_id: &str| {
-            inner.agents.values().any(|other| {
-                other.pane_id_env.as_deref() == Some(pane_id)
-                    && !other.exited.load(Ordering::SeqCst)
-            })
-        };
+        // One pass, so the listing stays linear in the registry however many
+        // exited entries it holds.
+        let live_panes: std::collections::HashSet<&str> = inner
+            .agents
+            .values()
+            .filter(|other| !other.exited.load(Ordering::SeqCst))
+            .filter_map(|other| other.pane_id_env.as_deref())
+            .collect();
+        let pane_has_live_agent = |pane_id: &str| live_panes.contains(pane_id);
         let mut ended: Vec<(u64, crate::ended_role::EndedRole)> = inner
             .agents
             .iter()

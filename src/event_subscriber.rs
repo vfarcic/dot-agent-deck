@@ -128,7 +128,7 @@ async fn refresh_project_config_flags(
             // missed while no stream was open, or a report that was not yet
             // settled when it was sent, reaches its card from this listing.
             for role in listing.ended_roles {
-                st.queue_ended_role(role);
+                st.queue_ended_role(role, answered.clone());
             }
         }
     }
@@ -255,7 +255,9 @@ pub async fn run(client: DaemonClient, state: SharedState, config: SubscriberCon
                     // Issue #1965: an orchestration role's agent exited. The
                     // render loop puts why on the role's card.
                     Ok(Some(BroadcastMsg::RoleEnded(role))) => {
-                        state.write().await.queue_ended_role(role);
+                        let mut st = state.write().await;
+                        let from = st.stream_incarnation.clone();
+                        st.queue_ended_role(role, from);
                     }
                     // PRD #741 M8 (issue #801 item 3): a `kind` tag this
                     // build does not know, from a newer daemon. Ignored

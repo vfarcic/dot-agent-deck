@@ -1675,6 +1675,10 @@ button.deck-attention-name { text-decoration: underline; text-underline-offset: 
 .overview-ended-output { min-width: 0; display: grid; gap: 2px; }
 .overview-ended-output-label { color: var(--muted); font-size: var(--text-xs); }
 .overview-ended-output pre { margin: 0; overflow-x: auto; color: var(--ink); font-family: "JetBrains Mono", monospace; font-size: var(--text-xs); white-space: pre; }
+.agent-card-ended { display: grid; gap: 2px; min-width: 0; }
+.agent-card-ended-reason { margin: 0; color: var(--red-ink); font-size: var(--text-base); }
+.agent-card-ended-label { color: var(--muted); font-size: var(--text-xs); }
+.agent-card-ended pre { margin: 0; overflow-x: auto; color: var(--ink); font-family: "JetBrains Mono", monospace; font-size: var(--text-xs); white-space: pre; }
 /* The status cell carries BOTH the mark and the word, because they render the
    same field and two columns for one datum is what the column picker made
    absurd (PRD #745 M12). The mark needs to be a block for its 8px box to apply
