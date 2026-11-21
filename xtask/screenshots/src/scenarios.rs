@@ -213,7 +213,12 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "restart-notice",
-        description: "The deck restarted while the client was attached: the notice naming the two agents the restart stopped, api-fix and docs-review, in the TUI's footer row and the desktop's corner notice, over a deck now running none.",
+        description: "The deck restarted while the client was attached: the notice naming the two agents the restart stopped, api-fix and docs-review, in the TUI's footer row and the desktop's corner notice, over a deck now running none; the desktop's preview daemon also lists interrupted work, so its notice adds that line with a Show button (PRD #1790).",
+        clients: &[Client::Tui, Client::Desktop],
+    },
+    Scenario {
+        name: "interrupted-work",
+        description: "What a deck restart left behind: the Interrupted work list, opened with `I` in the TUI and from the dashboard banner in the desktop app, listing a dispatched unit, an orchestration and a plain agent under Other agents (PRD #1790).",
         clients: &[Client::Tui, Client::Desktop],
     },
     Scenario {

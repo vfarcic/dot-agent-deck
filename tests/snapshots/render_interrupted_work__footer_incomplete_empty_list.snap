@@ -1,0 +1,36 @@
+---
+source: tests/render_interrupted_work.rs
+expression: "hidden[0]"
+---
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                              No active agents. Press Ctrl+n to create an agent.                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+The deck could not read its whole work journal, so some interrupted work may not be listed.  [Show I] [Hide X]
+ COMMAND  [Back to Pane d/Ctrl+D] [New Agent n/Ctrl+N] [Close w/Ctrl+W] [Help ?] [Quit Ctrl+C] [Filter /]     
+[Rename r] [Generate g] [Schedules s]

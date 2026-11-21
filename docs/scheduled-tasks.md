@@ -228,7 +228,7 @@ Dispatched tabs stay open until you close them. **Closing an issue's tab with Cl
 
 To stop an issue's agents but keep its worktree, for example to start an agent in it again later, choose **Close, keep worktree** in the TUI's close confirmation (`Ctrl+W`, or the tab's `[×]`), or tick **Keep the worktree** in the desktop app's close confirmation before you close. The worktree then stays on disk whatever its state. While it exists the issue stays claimed: a run that considers the issue skips it, as it does any issue whose worktree exists. `dot-agent-deck worktree reclaim` keeps a worktree whose pull request has not merged, so when you want the schedule to take the issue again, remove the worktree yourself with `git -C <clone> worktree remove .worktrees/issue-<n>`, adding `--force` to discard uncommitted changes in it.
 
-After the daemon restarts, closing such a tab no longer removes the worktree. Remove it yourself with `git -C <clone> worktree remove .worktrees/issue-<n>`, or that issue stays skipped.
+After the daemon restarts, closing such a tab no longer removes the worktree. An issue dispatch the restart stopped is listed in [Interrupted Work](interrupted-work.md), whose **Reclaim** removes its worktree and keeps its branch, keeping a worktree with uncommitted changes. You can also remove it yourself with `git -C <clone> worktree remove .worktrees/issue-<n>`. Until the worktree is gone, that issue stays skipped.
 
 An issue that is still open after its pull request merged or closed has no open pull request any more, so once its worktree is gone a later run dispatches it again on the existing branch. Close the issue (or remove the label your schedule's `label` filter selects) to stop that.
 
