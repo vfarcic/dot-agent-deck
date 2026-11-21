@@ -600,16 +600,28 @@ pub fn superseded_generation() {
         ("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0"),
     ]);
     let (orch, old) = team(&daemon, true);
+    // The live generation in the worker's pane that is none of `not`, once
+    // there is one. Polled: since issue #2110 a `clear = true` restart that
+    // follows another within the spacing is held back, so the superseding
+    // delegate's reply (which waits for its post only up to a bound) can come
+    // before the pane is on its successor, or while the pane is between two.
+    let successor = |not: &[&str]| {
+        let find = || {
+            common::agent_records_on(daemon.attach_socket())
+                .into_iter()
+                .find(|r| {
+                    r.pane_id_env.as_deref() == Some(&old.id)
+                        && !not.contains(&r.id.as_str())
+                        && r.crashed != Some(true)
+                })
+        };
+        common::wait_until(Duration::from_secs(15), || find().is_some());
+        find().expect("clear delegate must leave a live successor")
+    };
     let first = delegate(&daemon, &orch, TASK, false);
+    let replaced = successor(&[old.agent.as_str()]);
     let second = delegate(&daemon, &orch, "ROUTE-REPLACEMENT-TASK", true);
-    let record = common::agent_records_on(daemon.attach_socket())
-        .into_iter()
-        .find(|r| {
-            r.pane_id_env.as_deref() == Some(&old.id)
-                && r.id != old.agent
-                && r.crashed != Some(true)
-        })
-        .expect("clear delegate must leave a live successor");
+    let record = successor(&[old.agent.as_str(), replaced.id.as_str()]);
     let new = observe(&daemon, &record.id);
     assert_eq!(count(&daemon, &new, 1)[0]["id"], second);
     let block = notice(&daemon, &orch, &second).to_string();

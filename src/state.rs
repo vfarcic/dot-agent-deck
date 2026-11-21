@@ -6701,22 +6701,35 @@ async fn dispatch_one_owned(
         // was admitted, its room reserved and its body saved above, so no
         // refusal of its content can follow.
         registry.inbox().supersede_delegates_to(&pane_id);
-        // Issue #2110: wait for this start's slot, so a worker handed a task
-        // together with others starts a spacing after the previous one rather
-        // than in the same second. After the supersede above, so the tasks it
-        // retires end as superseded at once rather than lingering through the
-        // wait into an undelivered notice (`orchestration/delegate/025`). The
-        // `delegate` was answered before this task ran, so the wait holds back
-        // only this worker (and, through the pane's dispatch lock, a later
-        // delegate to the same pane).
-        let paced = registry.role_start_pacer().wait_for_slot().await;
-        if !paced.is_zero() {
+        // Issue #2110: take this restart's turn, so a worker handed a task
+        // together with others starts its fresh agent at least a spacing after
+        // the previous paced one rather than in the same second. After the
+        // supersede above, so the tasks it retires end as superseded at once
+        // rather than lingering through the wait into an undelivered notice
+        // (`orchestration/delegate/025`). The `delegate` handler waits at most
+        // `DELEGATE_POST_WAIT` for this post and then replies anyway, so the
+        // wait can hold that reply for that long and no longer; past it, the
+        // wait holds back only this worker (and, through the pane's dispatch
+        // lock, a later delegate to the same pane).
+        // The generation being replaced keeps running while this restart is
+        // held back. A waiting episode it opened is about work just superseded,
+        // so it must not turn into a notice to the orchestrator meanwhile.
+        let paced = registry
+            .role_start_pacer()
+            .acquire(|| {
+                if let Some(old_agent) = registry.pane_current_agent_id(&pane_id) {
+                    registry.cancel_waiting_notice(&pane_id, &old_agent);
+                }
+            })
+            .await;
+        if !paced.wait().is_zero() {
             tracing::info!(
                 role = %target_role,
                 pane_id = %pane_id,
-                waited_ms = u64::try_from(paced.as_millis()).unwrap_or(u64::MAX),
-                "delegate: spaced the worker's restart after another worker's start"
+                waited_ms = u64::try_from(paced.wait().as_millis()).unwrap_or(u64::MAX),
+                "delegate: spacing the worker's restart after another worker's start"
             );
+            paced.until_due().await;
         }
         #[cfg(test)]
         gate_pass(&CLEAR_RESPAWN_GATES, &pane_id).await;
@@ -6728,6 +6741,7 @@ async fn dispatch_one_owned(
                 agent_id: new_agent_id,
                 recreated,
             }) => {
+                paced.started();
                 if let Some(state) = state.as_ref() {
                     spawn_lift_replaced_quota_blocks(
                         state.clone(),
@@ -6801,6 +6815,9 @@ async fn dispatch_one_owned(
                 worker_agent_id = Some(new_agent_id);
             }
             Err(e) => {
+                // No agent started, so the next paced restart counts from the
+                // last one that did.
+                drop(paced);
                 if let (Some(state), Some(identity)) = (state.as_ref(), title_reservation.as_ref())
                 {
                     state
@@ -20311,13 +20328,15 @@ mod tests {
         registry.shutdown_all();
     }
 
-    /// Scenario (issue #2110): the orchestrator hands tasks to two
-    /// `clear = true` workers at the same moment. The second worker's restart
-    /// begins at least the configured spacing after the first's, rather than
-    /// in the same instant, and both tasks are still posted to their workers.
+    /// Scenario (issue #2110, PR #2459 review): the orchestrator hands tasks to
+    /// two `clear = true` workers one after the other. The first worker's old
+    /// agent ignores SIGTERM and SIGHUP and reads no input, so stopping it takes the whole
+    /// termination grace;
+    /// the second's stops at once. The two fresh agents are still spawned at
+    /// least the configured spacing apart, and both tasks are posted.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
-    async fn role_start_pacing_005_two_clear_delegates_at_once_restart_a_spacing_apart() {
+    async fn role_start_pacing_005_fresh_workers_spawn_a_spacing_apart_despite_a_slow_teardown() {
         let spacing = crate::role_start_pacing::role_start_spacing();
         if spacing.is_zero() {
             eprintln!(
@@ -20330,71 +20349,120 @@ mod tests {
         let cwd = dir.path().to_str().unwrap().to_string();
         let registry = Arc::new(AgentPtyRegistry::new());
         let orch = stand_in_in(&registry, "p2110-orch", Some(&cwd));
-        let workers = ["p2110-w1", "p2110-w2"];
-        let mut reached = Vec::new();
-        let mut releases = Vec::new();
-        for worker in workers {
-            let _ = stand_in_in(&registry, worker, Some(&cwd));
-            let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
-            let (go, go_rx) = tokio::sync::oneshot::channel();
-            CLEAR_RESPAWN_GATES
-                .lock()
-                .unwrap()
-                .push((worker.to_string(), reached_tx, go_rx));
-            reached.push(reached_rx);
-            releases.push(go);
-        }
-        let dispatches: Vec<_> = workers
-            .iter()
-            .map(|worker| {
-                tokio::spawn(dispatch_clear_task(
-                    registry.clone(),
-                    "p2110-orch".into(),
-                    orch.clone(),
-                    worker.to_string(),
-                    format!("the task for {worker}"),
-                    cwd.clone(),
-                ))
+        let (slow, fast) = ("p2110-slow", "p2110-fast");
+        // A script run as the pane's own child, so no shell without the trap
+        // sits between the signal and the stand-in (`delegate/034`'s shape).
+        let script = dir.path().join("p2110-unkillable.sh");
+        crate::test_isolation::write_script(
+            &script,
+            "#!/bin/sh\ntrap '' TERM HUP\nprintf P2110-ARMED\nexec sleep 3600\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let slow_agent = registry
+            .spawn_agent(crate::agent_pty::SpawnOptions {
+                command: script.to_str(),
+                cwd: Some(&cwd),
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                    slow.to_string(),
+                )]),
+                ..crate::agent_pty::SpawnOptions::default()
             })
-            .collect();
-        // Each gate sits after the pacing wait, immediately before the
-        // restart, so the instant it is reached is when that restart begins.
-        // Either worker may take the first slot, so each gate is timed on its
-        // own task rather than awaited in order.
-        let timers: Vec<_> = reached
-            .into_iter()
-            .map(|rx| {
-                tokio::spawn(async move {
-                    rx.await.expect("the dispatch reaches the restart");
-                    std::time::Instant::now()
-                })
-            })
-            .collect();
-        let mut restarts = Vec::new();
-        for timer in timers {
-            let at = tokio::time::timeout(spacing * 4, timer)
-                .await
-                .expect("both restarts begin within a few spacings")
-                .unwrap();
-            restarts.push(at);
-        }
-        for go in releases {
-            go.send(()).unwrap();
-        }
+            .expect("spawn the SIGTERM-ignoring stand-in");
+        // The marker is printed after the trap, so a SIGTERM sent once it shows
+        // cannot reach a shell that has not installed it yet (issue #709).
+        let armed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let screen = registry.snapshot(&slow_agent).unwrap_or_default();
+                if screen.windows(11).any(|w| w == b"P2110-ARMED") {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        });
+        armed.await.expect("the slow stand-in installs its trap");
+        let fast_old = stand_in_in(&registry, fast, Some(&cwd));
+        // The fast worker's old agent has a waiting episode open, as a worker
+        // sitting at a prompt would (Qodo, PR #2459): a notice about it must not
+        // fire for work its paced restart has already superseded.
+        let episode = registry
+            .arm_waiting_notice(fast, &fast_old, std::time::Duration::from_secs(60), false)
+            .expect("an episode opens for the fast worker's old agent")
+            .seq;
+
+        // The slow worker takes the first turn and is held at the gate just
+        // before its restart, so the fast one asks for its turn while the
+        // slow one holds it.
+        let (reached_tx, reached) = tokio::sync::oneshot::channel();
+        let (go, go_rx) = tokio::sync::oneshot::channel();
+        CLEAR_RESPAWN_GATES
+            .lock()
+            .unwrap()
+            .push((slow.to_string(), reached_tx, go_rx));
+        let dispatch = |worker: &str| {
+            tokio::spawn(dispatch_clear_task(
+                registry.clone(),
+                "p2110-orch".into(),
+                orch.clone(),
+                worker.to_string(),
+                format!("the task for {worker}"),
+                cwd.clone(),
+            ))
+        };
+        let slow_dispatch = dispatch(slow);
+        tokio::time::timeout(spacing * 4, reached)
+            .await
+            .expect("the slow worker reaches its restart")
+            .unwrap();
+        let fast_dispatch = dispatch(fast);
+        go.send(()).unwrap();
+        // The fast worker is in its paced wait once the slow one has its fresh
+        // agent, and keeps its old agent until the wait is over.
+        tokio::time::timeout(spacing * 4, async {
+            while registry.pane_current_agent_id(slow).as_deref() == Some(slow_agent.as_str()) {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the slow worker gets its fresh agent");
+        assert_eq!(
+            registry.pane_current_agent_id(fast).as_deref(),
+            Some(fast_old.as_str()),
+            "precondition: the fast worker is still waiting for its slot"
+        );
+        assert!(
+            !registry.waiting_notice_is_current(fast, episode),
+            "the old agent's waiting episode must be closed while its restart waits"
+        );
         let mut posted = Vec::new();
-        for dispatch in dispatches {
-            posted.push(dispatch.await.unwrap());
+        for task in [slow_dispatch, fast_dispatch] {
+            posted.push(
+                tokio::time::timeout(spacing * 6, task)
+                    .await
+                    .expect("both restarts finish")
+                    .unwrap(),
+            );
         }
 
-        restarts.sort();
-        let gap = restarts[1] - restarts[0];
-        // The slot is reserved from one clock reading and slept for with
-        // tokio's timer, which may wake a millisecond early.
+        let spawned_at = |pane: &str| {
+            let agent = registry
+                .pane_current_agent_id(pane)
+                .expect("the pane has a fresh agent");
+            registry
+                .agent_record_any(&agent)
+                .and_then(|record| record.spawned_at_ms)
+                .expect("the fresh agent records when it spawned")
+        };
+        let gap_ms = (spawned_at(fast) - spawned_at(slow)).unsigned_abs();
+        // `spawned_at_ms` is wall-clock milliseconds, and the pacer measures on
+        // the monotonic clock, so allow a few milliseconds between the two.
         assert!(
-            gap + std::time::Duration::from_millis(20) >= spacing,
-            "the second restart began {gap:?} after the first; the spacing is {spacing:?}"
+            u128::from(gap_ms) + 20 >= spacing.as_millis(),
+            "the fresh agents spawned {gap_ms} ms apart; the spacing is {spacing:?}"
         );
-        for (worker, id) in workers.iter().zip(&posted) {
+        for (worker, id) in [slow, fast].iter().zip(&posted) {
             assert_eq!(
                 listed_state(&registry, worker, id),
                 Some(crate::inbox::StateName::Queued),
