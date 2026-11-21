@@ -202,6 +202,15 @@ pub enum Tab {
         /// project (`agent_pty::is_own_context_path`). Left `None`, the tab
         /// re-arms with no task and the TUI says so (issue #1395).
         context_path: Option<std::path::PathBuf>,
+        /// PRD #82: whether [`Self::Orchestration::context_path`] came from the
+        /// daemon's record of this orchestration's start role, which means the
+        /// daemon records a context file for it and, when it advertises
+        /// [`crate::daemon_protocol::CAP_REARM_ORCHESTRATOR`], re-arms its
+        /// coordinator itself. The TUI then leaves the re-arm to the daemon, so
+        /// the coordinator is not sent its role twice. `false` for a tab the
+        /// TUI's `Ctrl+n` opened: the TUI published its file, the daemon
+        /// records none, and the TUI re-arms it.
+        context_recorded_by_daemon: bool,
     },
 }
 
@@ -1093,6 +1102,7 @@ impl TabManager {
             // Issue #1233: set by the caller that published the context
             // (`set_orchestration_context_path`), which knows the file.
             context_path: None,
+            context_recorded_by_daemon: false,
         });
 
         let index = self.tabs.len() - 1;
@@ -1111,6 +1121,22 @@ impl TabManager {
     ) {
         if let Some(Tab::Orchestration { context_path, .. }) = self.tabs.get_mut(index) {
             *context_path = path;
+        }
+    }
+
+    /// PRD #82: [`Self::set_orchestration_context_path`] for a path taken from
+    /// the daemon's record of the orchestration's start role (issue #1395),
+    /// which also marks the tab as one whose context file the daemon records
+    /// ([`Tab::Orchestration`]'s `context_recorded_by_daemon`).
+    pub fn set_daemon_recorded_context_path(&mut self, index: usize, path: std::path::PathBuf) {
+        if let Some(Tab::Orchestration {
+            context_path,
+            context_recorded_by_daemon,
+            ..
+        }) = self.tabs.get_mut(index)
+        {
+            *context_path = Some(path);
+            *context_recorded_by_daemon = true;
         }
     }
 
@@ -1339,6 +1365,7 @@ impl TabManager {
             // Set afterwards from the daemon's record of the start role, when it
             // has one (`set_orchestration_context_path`, issue #1395).
             context_path: None,
+            context_recorded_by_daemon: false,
         });
 
         let index = self.tabs.len() - 1;
@@ -2691,6 +2718,7 @@ mod tests {
             zoomed: false,
             orchestration_id: None,
             context_path: None,
+            context_recorded_by_daemon: false,
         };
         let idx = crate::ui::sync_and_derive_selection(&mut orch, None, filtered, None);
         assert_eq!(idx, Some(0));
@@ -2726,6 +2754,7 @@ mod tests {
             zoomed: false,
             orchestration_id: None,
             context_path: None,
+            context_recorded_by_daemon: false,
         };
         assert_eq!(
             crate::ui::sync_and_derive_selection(&mut dup_tab, None, dup, Some(1)),

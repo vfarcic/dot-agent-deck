@@ -26,9 +26,16 @@ A `[[modes]]` block is ignored with a warning, so never propose one.
    - **Tune each role's `prompt_template`**: start from the library's suggestion, then fill in project-specific details — the actual test command, the spec directory path, the release command name. Keep tuning minimal; the library text is already good for most cases. **Don't leave test/lint instructions vague:** the `coder`/`tester` templates should point the worker at the project's actual test/lint commands and any output-redirect or log-handling convention its contributor/agent-instruction files (`CONTRIBUTING.md`, `CLAUDE.md`, `AGENTS.md`, `.cursorrules`, etc.) define. The worker runs in-repo with full tools and its own instruction files, so it can discover and confirm the current commands itself — name them if you already know them, as a starting hint rather than a frozen literal that goes stale if the project changes them.
    - **Compose the orchestrator's `prompt_template`** from the selected workers. Cover three things:
      - **Workflow shape**: who runs first, what runs in parallel (e.g. reviewer + auditor in parallel after coder), where the user-validation gate sits. **Default to a pre-release human gate**: before delegating to `release`, the orchestrator summarizes what to validate end-to-end and STOPs for explicit user confirmation. This is the safe default for most projects — but it is a default, not a law: if the project's context or the user's stated workflow calls for autonomous release (e.g. trunk-based auto-merge, a solo maintainer who wants hands-off shipping), propose relaxing or dropping it at the proposal step (step 4). Reference any spec directory you discovered.
-     - **Role boundary**: the orchestrator NEVER does *implementation, review, or audit* work — that's worker territory. It MAY run lightweight *coordination* slash commands the project provides (progress tracking, task navigation, status reporting) directly between delegations, without delegating, when those exist. Actions with side effects on shared state — push, merge, tag, publish — are better handled by a dedicated worker (typically `release`): `clear = false` lets it resume after a CI flake without restarting the whole flow, and a restricted-scope prompt prevents the agent from sliding into source edits when something goes wrong.
+     - **Role boundary, written FIRST** (see mandatory callout below).
      - **Context-handoff rule** (see mandatory callout below).
    - Always include an orchestrator role with `start = true`. Validate: exactly one `start = true`, at least 2 roles, all role names unique and non-empty (no `..`, `/`, `\`), all commands non-empty.
+
+   **Role boundary (MANDATORY, and the FIRST paragraph of the orchestrator's `prompt_template`).** An orchestrator drifts into doing the work itself as a long session wears on, and most after its conversation is compacted, so the boundary opens the template rather than sitting under the workflow, and it names the exceptions before the rule, so a strict reading never forbids them. In this order:
+   - **What it may do itself**, by name: the coordination commands the project provides (progress tracking, task navigation, status reporting — the slash commands you found in step 1, e.g. `/prd-next`), reading the spec or plan to decide what to delegate next, writing task files for delegations, and asking the user at its gates. Name each command; an unnamed carve-out reads as forbidden.
+   - **What it never does**: implementation, review or audit work, however small — a one-line fix, a quick check of a worker's diff, a re-run of a failed test. That is worker territory; it delegates it. When unsure whether a step is coordination or work, it delegates.
+   - **Its gates survive**: the user-validation gates in the workflow below still apply after the conversation is compacted or cleared.
+
+   Actions with side effects on shared state — push, merge, tag, publish — are better handled by a dedicated worker (typically `release`): `clear = false` lets it resume after a CI flake without restarting the whole flow, and a restricted-scope prompt prevents the agent from sliding into source edits when something goes wrong.
 
    **Context-handoff rule (MANDATORY in the orchestrator's `prompt_template`).** Workers cold-start with `clear = true` by default — they have NO memory of prior conversation, no access to other workers' outputs, and no shared scratchpad. Whatever the orchestrator sends as the task — passed with `--task-file` or with `--task` — is the entire context the worker has, plus the worker's own `prompt_template`. The composed orchestrator `prompt_template` MUST therefore include rules along these lines (adapt the wording to the project, but cover all three points):
 
@@ -115,7 +122,9 @@ name = "orchestrator"
 command = "claude"
 start = true
 prompt_template = """
-You coordinate the team. You NEVER do work yourself — only delegate to the available agents.
+You coordinate the team.
+
+Role boundary: you MAY read the spec to decide what to delegate next, write task files for delegations, and ask the user at the gates below. You NEVER do implementation, review or audit work yourself, however small — delegate it to the available agents. When unsure whether a step is coordination or work, delegate it. These rules and the gates below still apply after your conversation is compacted or cleared.
 
 Workflow:
 - Delegate implementation to coder.
