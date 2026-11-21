@@ -124,6 +124,12 @@ async fn refresh_project_config_flags(
         let mut st = state.write().await;
         if answered.same_process(&stream) && answered.same_process(&st.stream_incarnation) {
             st.take_project_config_flags(&listing.records);
+            // Issue #1965: the exited roles too, so a `role_ended` broadcast
+            // missed while no stream was open, or a report that was not yet
+            // settled when it was sent, reaches its card from this listing.
+            for role in listing.ended_roles {
+                st.queue_ended_role(role);
+            }
         }
     }
 }

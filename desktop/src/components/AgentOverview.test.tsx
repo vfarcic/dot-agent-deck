@@ -3545,6 +3545,18 @@ describe("an orchestration role whose agent exited (issue #1965)", () => {
     expect(within(group).queryByTestId("overview-close-orchestration")).not.toBeInTheDocument();
   });
 
+  /// Scenario: With a dashboard filter active, the exited rows have no agent for the filter to match, so they are left out,
+  /// including a group made only of exited roles; clearing the filter brings them back.
+  it("leaves exited rows out of a filtered dashboard", () => {
+    window.history.replaceState({}, "", "/?fixture=1");
+    renderOverviewWithStoredColumns(undefined, { snapshot: deckWithEndedRole() });
+    expect(screen.getAllByTestId("overview-ended-role").length).toBeGreaterThan(0);
+    fireEvent.change(screen.getByRole("textbox", { name: "Filter agents" }), { target: { value: "Coder" } });
+    expect(screen.queryByTestId("overview-ended-role")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Show all" }));
+    expect(screen.getAllByTestId("overview-ended-role").length).toBeGreaterThan(0);
+  });
+
   /// Scenario: The exited role's index is now held by a live agent (the role was restarted). The group shows the live agent only.
   it("shows no exited row for a role a live agent holds again", () => {
     window.history.replaceState({}, "", "/?fixture=1");

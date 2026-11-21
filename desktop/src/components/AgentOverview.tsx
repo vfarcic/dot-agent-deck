@@ -1295,7 +1295,9 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     const deckAgents = deck.agents.map(toOverviewAgent);
     const groups = withEndedRoles(groupAgents(deckAgents), deck.endedRoles);
     const matchingAgents = filtering ? filterDashboardAgents(deckAgents, filter, overviewFilterFacts) : deckAgents;
-    const shown = filtering ? withEndedRoles(groupAgents(matchingAgents), deck.endedRoles) : groups;
+    // Issue #1965: an exited role has no agent for a filter to match, so a
+    // filtered view leaves the exited rows out; Show all brings them back.
+    const shown = filtering ? groupAgents(matchingAgents) : groups;
     return {
       key: fleetMemberKey(deck.connection.deckId, at),
       snapshot: deck,

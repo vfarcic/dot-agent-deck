@@ -4080,19 +4080,36 @@ pub fn is_dead_slot_pane_id(pane_id: &str) -> bool {
 const MAX_ENDED_ROLE_SLOTS: usize = 256;
 
 /// Issue #1965: take the exited roles the daemon announced since the last
-/// frame (`BroadcastMsg::RoleEnded`) and remember each under its pane, so the
-/// role's card says which role it was and why. This is how a role that dies
-/// at spawn in a tab this TUI opened is told apart from a quiet one: its pane
-/// keeps its last frame and nothing else about it changes.
+/// frame (`BroadcastMsg::RoleEnded`, and the periodic listing's `ended_roles`,
+/// which recovers one missed while no stream was open) and remember each under
+/// its pane, so the role's card says which role it was and why. This is how a
+/// role that dies at spawn in a tab this TUI opened is told apart from a quiet
+/// one: its pane keeps its last frame and nothing else about it changes.
+///
+/// Each is remembered under the role's dead-slot id too, minted from the same
+/// orchestration identity and role index a rebuilt tab mints it from
+/// ([`dead_slot_pane_id`]), so a dead slot whose report was read before its
+/// pane's reader settled it gets the settled one.
 fn drain_ended_roles(state: &SharedState, ui: &mut UiState) {
     let ended = state.blocking_write().take_ended_roles();
     for role in ended {
-        if ui.ended_role_slots.len() >= MAX_ENDED_ROLE_SLOTS
-            && !ui.ended_role_slots.contains_key(&role.pane_id)
-        {
-            continue;
+        let dead_slot = role.orchestration_id.as_ref().map(|id| {
+            dead_slot_pane_id(
+                &crate::state::OrchestrationIdentity {
+                    id: id.clone(),
+                    name: role.orchestration_name.clone(),
+                },
+                role.role_index,
+            )
+        });
+        for key in std::iter::once(role.pane_id.clone()).chain(dead_slot) {
+            if ui.ended_role_slots.len() >= MAX_ENDED_ROLE_SLOTS
+                && !ui.ended_role_slots.contains_key(&key)
+            {
+                continue;
+            }
+            ui.ended_role_slots.insert(key, role.clone());
         }
-        ui.ended_role_slots.insert(role.pane_id.clone(), role);
     }
 }
 
@@ -38156,7 +38173,8 @@ mod tests {
     }
 
     /// Scenario: the daemon announces that the reviewer role exited; the next
-    /// frame remembers it under the role's pane, so its card says why. Once
+    /// frame remembers it under the role's pane and under the dead slot a
+    /// rebuilt tab would give the role, so its card says why. Once
     /// another agent holds that pane (a `pane restart`), the report no longer
     /// applies to the card (issue #1965).
     #[test]
@@ -38174,6 +38192,12 @@ mod tests {
         assert!(
             ended_role_for(&ui, "7", Some("8")).is_none(),
             "a successor's card is not the exited role's"
+        );
+        // The same role's dead slot, as a rebuilt tab mints it, gets it too.
+        let slot = dead_slot_pane_id(&test_identity("orch-1965", "mixed"), 1);
+        assert_eq!(
+            ended_role_for(&ui, &slot, None).map(|r| r.agent_id.as_str()),
+            Some("7")
         );
     }
 
