@@ -6738,6 +6738,107 @@ fn receiver_instance(
     claimed
 }
 
+/// Issue #2342: the foreground Claude Code process whose background session
+/// the receiver instance `instance` runs, read from its ancestry; `None` when
+/// `instance` is not placed as one.
+///
+/// Claude Code moves a conversation to the background (Left in an empty input
+/// box) by starting `claude daemon run --origin transient --spawned-by …` as a
+/// child of the foreground process; that starts `claude bg-pty-host … --
+/// claude --session-id …` (with `--fork-session --resume <transcript>` on
+/// 2.1.329), whose child runs the conversation and its hooks (measured by
+/// `inbox/claude/056` on 2.1.328 and 2.1.329): conversation → `bg-pty-host`
+/// → `daemon run` → foreground. This answers the foreground only when that
+/// shape holds: `instance`'s parent names `bg-pty-host` among the first words
+/// of its command line, that one's parent names `daemon` followed by `run`,
+/// the foreground, the `daemon run` and the host run one executable, the
+/// conversation runs that one or another in its directory, and none of them
+/// is init. A process, an argument list or an executable that cannot be read
+/// answers `None`.
+///
+/// What it places is a shape, not a provenance: a process the agent runs that
+/// `exec`s the agent's own executable as `daemon run`, which then starts a
+/// `bg-pty-host`, leaves the same tree, and `/proc` keeps no record of what a
+/// process ran before its last `exec` (audit D1's accepted scope). A nested
+/// agent a tool starts runs under the tool's shell, not under that pair.
+fn claude_background_origin(
+    instance: u32,
+    parent_of: impl Fn(u32) -> Option<u32>,
+    executable_of: impl Fn(u32) -> Option<std::path::PathBuf>,
+    arguments_of: impl Fn(u32) -> Option<Vec<String>>,
+) -> Option<u32> {
+    /// How far into a process's arguments its role is looked for: past the
+    /// executable, and an interpreter's script where one runs it.
+    const HEAD: usize = 4;
+    // Words, not arguments: Claude Code rewrites a `bg-pty-host`'s title, so
+    // its whole command line reads back as one argument with spaces in it
+    // (measured on 2.1.328).
+    let head = |pid: u32| -> Option<Vec<String>> {
+        Some(
+            arguments_of(pid)?
+                .iter()
+                .flat_map(|arg| arg.split_whitespace())
+                .take(HEAD)
+                .map(str::to_string)
+                .collect(),
+        )
+    };
+    let host = parent_of(instance).filter(|&pid| pid > 1)?;
+    let daemon = parent_of(host).filter(|&pid| pid > 1)?;
+    let origin = parent_of(daemon).filter(|&pid| pid > 1)?;
+    if !head(host)?.iter().any(|arg| arg == "bg-pty-host") {
+        return None;
+    }
+    if !head(daemon)?
+        .windows(2)
+        .any(|pair| pair[0] == "daemon" && pair[1] == "run")
+    {
+        return None;
+    }
+    // The foreground starts its `daemon run` with its own executable, which
+    // starts the host with it; the host may run the conversation from a newer
+    // copy in the same directory, as Claude Code installs each release as
+    // `…/claude/versions/<version>`.
+    let exe = executable_of(daemon)?;
+    if executable_of(host)? != exe || executable_of(origin)? != exe {
+        return None;
+    }
+    let conversation = executable_of(instance)?;
+    if conversation != exe && conversation.parent() != exe.parent() {
+        return None;
+    }
+    Some(origin)
+}
+
+/// Issue #2342: [`claude_background_origin`] for a waiter's receiver
+/// instance, asked only of Claude Code's once-waiter whose hook names a
+/// session that continues a conversation (`fork` or `resume`): a background
+/// session reports `fork` once it takes the conversation over, and a brand-new
+/// one only `startup`.
+fn waiter_background_origin(
+    req: &crate::event::InboxWaitRequest,
+    instance: Option<u32>,
+    lookups: &ProcessLookups,
+) -> Option<u32> {
+    let continues = req
+        .session
+        .as_ref()
+        .and_then(|session| session.source.as_deref())
+        .is_some_and(|source| matches!(source, "fork" | "resume"));
+    if req.component != crate::event::InboxComponent::ClaudeWaiter
+        || req.mode != crate::event::InboxWaitMode::Once
+        || !continues
+    {
+        return None;
+    }
+    claude_background_origin(
+        instance?,
+        lookups.parent_of,
+        lookups.executable_of,
+        lookups.arguments_of,
+    )
+}
+
 /// Whether `exe` is a POSIX-style shell, by its file name.
 fn is_shell(exe: &std::path::Path) -> bool {
     let name = exe.file_name().and_then(|name| name.to_str()).unwrap_or("");
@@ -7853,11 +7954,23 @@ async fn run_hook_loop_with_limits(
                                     // idle timeout: a waiter is idle by design, and
                                     // the waiter pool bounds it instead.
                                     drop(permit.take());
+                                    let background_origin =
+                                        waiter_background_origin(&req, instance, &PLATFORM_LOOKUPS);
+                                    if let Some(origin) = background_origin {
+                                        info!(
+                                            pane_id = %escape_id_for_log(&req.pane_id),
+                                            instance = ?instance,
+                                            origin,
+                                            "inbox wait: the receiver runs a Claude Code background \
+                                             session"
+                                        );
+                                    }
                                     let arm = crate::inbox_hub::ReceiptArm {
                                         adapter_integration: req.adapter_integration,
                                         doorbell_only: req.doorbell_only,
                                         resumed: req.resumed,
                                         hook_integration: req.hook_integration,
+                                        background_origin,
                                         compaction: req
                                             .session
                                             .as_ref()
@@ -14941,6 +15054,185 @@ mod hook_ingestion_tests {
             Err(ComponentRefusal::Unidentified)
         );
         assert_eq!(resolve(Evidence::BestEffort), Ok(Some(50)));
+    }
+
+    /// Issue #2342: a Claude Code background session is placed by its exact
+    /// ancestry, measured on 2.1.328: the conversation, under a
+    /// `bg-pty-host`, under the `daemon run` the foreground process started.
+    /// Its receiver is admitted as itself, and its origin is that foreground.
+    /// A nested agent a tool starts, the same pair under a tool's shell, a
+    /// pair of another executable, a `daemon` that is not `run`, a spare
+    /// host's sibling that is not a `bg-pty-host`, a conversation whose
+    /// executable is not beside the host's, and an unreadable process answer
+    /// no origin; a conversation run from an update beside it is placed.
+    #[test]
+    fn a_claude_background_session_is_placed_by_its_ancestry_only() {
+        // 1 ── 2 deck ── 10 claude (the pane's agent)
+        //   10 ── 20 claude daemon run ──┬── 30 claude bg-pty-host ── 40 claude ── 41 sh ── 42 CLI
+        //                                └── 31 claude bg-spare ── 43 claude
+        //   10 ── 50 bash (a tool) ── 51 claude (nested) ── 52 sh ── 53 CLI
+        //   10 ── 60 bash (a tool) ── 61 claude daemon run ── 62 claude bg-pty-host ── 63 claude
+        //   10 ── 70 node daemon run ── 71 node bg-pty-host ── 72 claude
+        //   10 ── 80 claude daemon status ── 81 claude bg-pty-host ── 82 claude
+        //   20 ── 32 claude bg-pty-host ──┬── 44 claude 2.1.329 (an update beside it)
+        //                                 └── 45 /tmp/other
+        let parents = |pid: u32| match pid {
+            2 => Some(1),
+            10 => Some(2),
+            20 | 50 | 60 | 70 | 80 => Some(10),
+            30..=32 => Some(20),
+            44 | 45 => Some(32),
+            40 => Some(30),
+            41 => Some(40),
+            42 => Some(41),
+            43 => Some(31),
+            51 => Some(50),
+            52 => Some(51),
+            53 => Some(52),
+            61 => Some(60),
+            62 => Some(61),
+            63 => Some(62),
+            71 => Some(70),
+            72 => Some(71),
+            81 => Some(80),
+            82 => Some(81),
+            _ => None,
+        };
+        let executables = |pid: u32| {
+            Some(std::path::PathBuf::from(match pid {
+                10 | 20 | 30 | 31 | 32 | 40 | 43 | 51 | 61 | 62 | 63 | 72 | 80 | 81 | 82 => {
+                    "/home/u/.local/share/claude/versions/2.1.328"
+                }
+                44 => "/home/u/.local/share/claude/versions/2.1.329",
+                45 => "/tmp/other",
+                50 | 60 => "/bin/bash",
+                70 | 71 => "/usr/bin/node",
+                41 | 52 => "/bin/sh",
+                2 | 42 | 53 => "/opt/dot-agent-deck",
+                _ => return None,
+            }))
+        };
+        let arguments = |pid: u32| {
+            let argv: &[&str] = match pid {
+                10 => &["claude", "--model", "haiku"],
+                20 | 61 => &[
+                    "/home/u/.local/share/claude/versions/2.1.328",
+                    "daemon",
+                    "run",
+                    "--origin",
+                    "transient",
+                ],
+                // A rewritten title reads back as one argument.
+                30 => &["claude bg-pty-host --bg-pty-host /tmp/x.sock 119 47 -- claude"],
+                32 | 62 | 71 | 81 => &["claude", "bg-pty-host", "--bg-pty-host", "/tmp/x.sock"],
+                31 => &["claude", "bg-spare", "--bg-spare", "/tmp/y.sock"],
+                40 | 44 | 45 | 63 | 72 | 82 => &[
+                    "/home/u/.local/share/claude/versions/2.1.328",
+                    "--session-id",
+                    "1853d433",
+                ],
+                43 => &["claude", "bg-spare"],
+                51 => &["claude", "-p", "hello"],
+                70 => &["node", "daemon", "run"],
+                80 => &["claude", "daemon", "status"],
+                _ => return None,
+            };
+            Some(argv.iter().map(|arg| arg.to_string()).collect::<Vec<_>>())
+        };
+        let origin = |instance| claude_background_origin(instance, parents, executables, arguments);
+        assert_eq!(origin(40), Some(10), "the measured background session");
+        assert_eq!(origin(44), Some(10), "a conversation run from an update");
+        for instance in [10, 43, 45, 51, 63, 72, 82, 99] {
+            assert_eq!(origin(instance), None, "{instance}");
+        }
+        let unreadable = |pid: u32| if pid == 30 { None } else { arguments(pid) };
+        assert_eq!(
+            claude_background_origin(40, parents, executables, unreadable),
+            None
+        );
+
+        // Its hooks' shell resolves to the session, as the foreground's do to
+        // the foreground.
+        let descends = |pid, root| crate::platform::proc::descends_from_with(pid, root, parents);
+        assert_eq!(
+            admit_component(
+                peer(42, Some(true)),
+                Some(41),
+                Some(10),
+                ComponentUse::Receiver,
+                Evidence::Required,
+                descends,
+                parents,
+                executables,
+            ),
+            Ok(Some(40))
+        );
+
+        // Asked only of Claude Code's once-waiter whose session continues a
+        // conversation.
+        let lookups = ProcessLookups {
+            descends: |_, _| None,
+            parent_of: |pid| match pid {
+                40 => Some(30),
+                30 => Some(20),
+                20 => Some(10),
+                _ => None,
+            },
+            executable_of: |_| Some(std::path::PathBuf::from("/opt/claude")),
+            started: |_| None,
+            arguments_of: |pid| {
+                let argv: &[&str] = match pid {
+                    30 => &["claude", "bg-pty-host"],
+                    20 => &["claude", "daemon", "run"],
+                    _ => &["claude"],
+                };
+                Some(argv.iter().map(|arg| arg.to_string()).collect())
+            },
+            stdio_is_sockets: |_| false,
+        };
+        let wait = |component, mode, source: Option<&str>| crate::event::InboxWaitRequest {
+            pane_id: "p".into(),
+            agent_id: None,
+            token: None,
+            component,
+            component_version: None,
+            mode,
+            session: Some(crate::event::InboxWaitSession {
+                source: source.map(str::to_string),
+                session_id: None,
+            }),
+            pid: None,
+            adapter_integration: None,
+            doorbell_only: false,
+            resumed: false,
+            hook_integration: None,
+        };
+        use crate::event::{InboxComponent::*, InboxWaitMode::*};
+        for source in ["fork", "resume"] {
+            let req = wait(ClaudeWaiter, Once, Some(source));
+            assert_eq!(
+                waiter_background_origin(&req, Some(40), &lookups),
+                Some(10),
+                "{source}"
+            );
+            assert_eq!(waiter_background_origin(&req, None, &lookups), None);
+        }
+        for req in [
+            wait(ClaudeWaiter, Once, Some("startup")),
+            wait(ClaudeWaiter, Once, Some("clear")),
+            wait(ClaudeWaiter, Once, None),
+            wait(ClaudeWaiter, Stream, Some("fork")),
+            wait(OpenCodePlugin, Stream, Some("fork")),
+        ] {
+            assert_eq!(
+                waiter_background_origin(&req, Some(40), &lookups),
+                None,
+                "{:?} {:?} {:?}",
+                req.component,
+                req.mode,
+                req.session
+            );
+        }
     }
 
     /// PRD #1666 part 3, round 2 (round 1's U3): a walk from the agent that
