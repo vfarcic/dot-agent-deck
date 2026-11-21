@@ -277,4 +277,23 @@ test.describe("Interrupted work", () => {
     await expect(dialog.getByTestId("interrupted-row")).toHaveCount(3);
     await expect(dialog.locator(".interrupted-row.is-selected")).toContainText("fix-login");
   });
+
+  /** Scenario: open the dashboard of a deck that restarts while the app watches it, with interrupted work listed; the restart notice in the corner adds "3 interrupted items from before the restart" with a Show button whose whole label is on one line, and Show opens the "Interrupted work" dialog. */
+  test("the restart notice's Show is a whole button that opens the dialog", async ({ page }) => {
+    await page.goto("/?fixture=1&state=docs-restart&interrupted=1");
+    await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
+    await page.getByTestId("open-overview").click();
+    const hint = page.getByTestId("restart-toast").getByTestId("restart-toast-interrupted");
+    await expect(hint).toContainText("3 interrupted items from before the restart");
+    const show = hint.getByTestId("restart-toast-interrupted-show");
+    await expect(show).toHaveText("Show");
+    // PR #2431 round 7: the toast's 22 px close-button rule once squeezed this
+    // button to one letter, wrapping "Show" down the toast.
+    const fits = await show.evaluate((el) => el.scrollWidth <= el.clientWidth && el.scrollHeight <= el.clientHeight);
+    expect(fits, "Show's label overflows its button").toBe(true);
+    const lineHeight = await show.evaluate((el) => parseFloat(getComputedStyle(el).fontSize) * 2);
+    expect((await show.boundingBox())!.height).toBeLessThan(lineHeight + 16);
+    await show.click();
+    await expect(page.getByTestId("interrupted-dialog").getByRole("heading", { name: "Interrupted work" })).toBeVisible();
+  });
 });

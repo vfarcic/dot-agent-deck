@@ -2214,3 +2214,5 @@ button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-
 .interrupted-note, .interrupted-message { margin: 0; overflow-wrap: anywhere; }
 .interrupted-confirm p { margin: 0 0 6px; overflow-wrap: anywhere; }
 .toast-hint { display: block; margin-top: 4px; }
+/* PR #2431 round 7: the hint's Show is a labelled button, not the toast's 22 px close button, so it takes back the size, frame and fill `.toast button` sets for that one. */
+.toast .toast-hint .button { width: auto; height: auto; display: inline-flex; vertical-align: middle; border: 1px solid var(--line-strong); white-space: nowrap; }
