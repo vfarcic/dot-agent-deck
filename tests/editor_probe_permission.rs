@@ -182,7 +182,7 @@ fn doorbell_053_permission_needs_the_header_a_verified_record_and_the_root() {
     );
 }
 
-/// Scenario: Ask for the permission to arm on every recorded release and on releases nobody measured, with the facts as shipped and with no e2e assumption read. Every Claude Code release, whose editor probe the Claude activation verified, and every Codex release, whose editor probe the Codex activation verified (0.160.0, never measured, among them), can arm: each waits while its root is looked for, is armable once the root is bound, and is inert when it is never bound.
+/// Scenario: Ask for the permission to arm on every recorded release and on releases nobody measured, pre-releases among them, with the facts as shipped and with no e2e assumption read. Every Claude Code release, whose editor probe the Claude activation verified, and every Codex release, whose editor probe the Codex activation verified (0.160.0, never measured, among them), can arm: each waits while its root is looked for, is armable once the root is bound, and is inert when it is never bound.
 #[spec("inbox/doorbell/053")]
 #[test]
 fn doorbell_053_only_the_activated_release_is_armable() {
@@ -190,7 +190,12 @@ fn doorbell_053_only_the_activated_release_is_armable() {
     let releases: Vec<(AgentType, Version)> = RECORDED_RELEASES
         .iter()
         .map(|r| (r.measured.agent.clone(), r.release.clone()))
-        .chain([(CLAUDE, v("2.1.320")), (CODEX, v("0.170.0"))])
+        .chain([
+            (CLAUDE, v("2.1.320")),
+            (CODEX, v("0.170.0")),
+            (CLAUDE, v("2.1.330-beta.1")),
+            (CODEX, v("0.172.0-alpha.2")),
+        ])
         .collect();
     for (agent, release) in &releases {
         let header = LatchedRelease::Known(release.clone());

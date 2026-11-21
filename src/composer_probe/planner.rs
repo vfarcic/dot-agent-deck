@@ -327,7 +327,9 @@ pub enum InputGrammar {
 
 impl InputGrammar {
     /// The grammar of `agent`'s `release`: the measured one only for the
-    /// releases read from source.
+    /// releases read from source. `Version`'s equality includes its
+    /// pre-release and build, so a tagged 2.1.310 (`-beta.1`, `+abc`) is
+    /// none of them and reads strictly (issue #2128).
     pub fn of(agent: &crate::event::AgentType, release: &semver::Version) -> Self {
         let measured = [
             semver::Version::new(2, 1, 310),
