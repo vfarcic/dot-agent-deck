@@ -6,7 +6,7 @@ import { type AgentSession, type AgentStatus, type ConnectionView, type DeckRunt
 import { STATUS_WORD_ORDER, statusWord, statusWordLabel, type StatusWord } from "../lib/statusWords";
 import { modeScopedKey, type DesktopAgentDto } from "../lib/bridge";
 import { buildDashboardFilterHeader, clearDashboardFilter, DASHBOARD_AGENT_TYPES, DASHBOARD_FILTER_TEXT_MAX, DASHBOARD_KINDS, DASHBOARD_STATUSES, dashboardFilterActive, filterDashboardAgents, removeDashboardFilterFacet, setDashboardFilter, useDashboardFilter, type DashboardFilter, type DashboardFilterFacts } from "../lib/dashboardFilter";
-import { VOICE_ACTIONS, type DashboardScroll, type NewAgentVoice, type NewAgentVoiceChannel, type VoiceActionContext, type VoiceDispatchTarget, type VoiceOverviewChannel } from "../lib/voiceActions";
+import { VOICE_ACTIONS, type AgentViewTarget, type DashboardScroll, type NewAgentVoice, type NewAgentVoiceChannel, type VoiceActionContext, type VoiceDispatchTarget, type VoiceOverviewChannel } from "../lib/voiceActions";
 import { DECK_STATE_FALLBACK, deckUnavailableReason, isNewAgentShortcut } from "../lib/newAgent";
 import { ConfirmDialog, type ConfirmState } from "./ConfirmDialog";
 import { UpgradeDialog, type UpgradeTarget } from "./UpgradeDialog";
@@ -1581,7 +1581,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     const shown = cardsOnScreen(deck);
     const deckId = deck.snapshot.connection.deckId;
     if (shown === undefined || deckId === undefined) return undefined;
-    return <AgentCardsDeckBody deckId={deckId} cards={shown} tree={cards.treeFor(deckId)} openCards={cards.openCards} needsYouOnly={cards.needsYouOnly} controls={cards.clickControls} results={cards.resultsFor} />;
+    return <AgentCardsDeckBody deckId={deckId} cards={shown} tree={cards.treeFor(deckId)} openCards={cards.openCards} needsYouOnly={cards.needsYouOnly} controls={cardControls} results={cards.resultsFor} openTarget={cardOpenTarget} />;
   };
   const openCardReference = useContext(OpenCardReference);
   /* Issue #2418 — whether the dashboard filter keeps a card off the Cards
@@ -1594,6 +1594,16 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     };
   }, [decks, filtering]);
   const cards = useAgentCardsView({ runtime, decks: cardDeckList, openAgent: openCardAgent, openReference: openCardReference, hiddenByFilter: cardHiddenByFilter });
+  /* Issue #2418 (D12) — a card's name opens its agent through `openAgent`
+     with the same members a table row's click uses, so the two cannot open
+     different things. */
+  const cardControls = useMemo(() => ({ ...cards.clickControls, navigate: voiceContext.navigate, revealAgent: voiceContext.revealAgent }), [cards.clickControls, voiceContext]);
+  const cardOpenTarget = useCallback((card: PlacedCard): AgentViewTarget => {
+    const agent = decks.find((deck) => deck.snapshot.connection.deckId === card.deckId)?.agents.find((candidate) => candidate.id === card.entry.agent_id);
+    return agent
+      ? { deckId: agent.daemonId, agentId: agent.id, from: "overview", incarnation: agent.incarnation }
+      : { deckId: card.deckId, agentId: card.entry.agent_id, from: "overview", ...(card.entry.instance_id ? { incarnation: card.entry.instance_id } : {}) };
+  }, [decks]);
   const [confirm, setConfirm] = useState<ConfirmState>();
   /* The confirmation on screen as of the last render, read by an answer that
      arrives after it: a Generate config the user dismissed with No must not

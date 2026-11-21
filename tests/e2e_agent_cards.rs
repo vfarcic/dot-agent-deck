@@ -44,6 +44,17 @@ const MERGE_PROMPT: &str =
 const EXPLAIN_PROMPT: &str =
     "Explain in a few sentences what you did and what you need from me, then update your card.";
 
+/// Issue #2418 (D15): Explain is no longer a default action, so the tests
+/// that need an action the catalog offers on every card add it the way a user
+/// would, to their own catalog with `always = true`. [`daemon_with_config`]
+/// appends it to every config it writes.
+fn explain_action_config() -> String {
+    format!(
+        "\n[[catalog.actions]]\nname = \"explain\"\ndescription = \"Ask the agent to explain what it did and what it needs.\"\nprompt = {}\nalways = true\n",
+        toml::Value::String(EXPLAIN_PROMPT.into())
+    )
+}
+
 fn catalog_config() -> String {
     format!(
         "[[catalog.actions]]\nname = \"deploy\"\ndescription = \"Offer when the change is ready to deploy.\"\nprompt = {}\nlabel = \"Deploy it\"\nconfirm = true\n",
@@ -51,13 +62,15 @@ fn catalog_config() -> String {
     )
 }
 
-/// A headless daemon whose user config is `config`, plus the tempdir holding
-/// it. Only the daemon reads it: the agent's CLI leaves catalog membership to
-/// the daemon (product decision (b)), so [`as_agent`] passes no config.
+/// A headless daemon whose user config is `config` plus
+/// [`explain_action_config`], and the tempdir holding it. Only the daemon
+/// reads it: the agent's CLI leaves catalog membership to the daemon (product
+/// decision (b)), so [`as_agent`] passes no config.
 fn daemon_with_config(config: &str) -> (common::DaemonProc, tempfile::TempDir) {
     let dir = common::harness_tempdir().expect("config tempdir");
     let path = dir.path().join("config.toml");
-    std::fs::write(&path, config).expect("write user config");
+    std::fs::write(&path, format!("{config}{}", explain_action_config()))
+        .expect("write user config");
     let path = path.to_string_lossy().into_owned();
     let daemon = inbox::daemon_unbound(&[("DOT_AGENT_DECK_CONFIG", path.as_str())]);
     (daemon, dir)
@@ -672,18 +685,20 @@ fn catalog_block(endpoint: &impl Endpoint) -> String {
     text(&out.stdout)
 }
 
-/// Scenario: With a user config whose catalog adds a `risk` field and a
-/// `ship` action and removes `merge`, `card catalog` prints the agent-card
-/// block naming them and not `merge`, and `--json` lists the same. A
+/// Scenario: With a user config whose catalog adds a `risk` field, a `ship`
+/// action and an always-offered `explain` action and removes `merge`, `card
+/// catalog` prints the agent-card block naming `risk` and `ship` and neither
+/// `merge` nor `explain`, and `--json` lists the same names. A
 /// dispatcher then dispatches a single-agent unit and a one-role team: the
 /// single agent's seeded task and the team's published orchestrator context
 /// file both carry that block verbatim.
 #[spec("agent-report/catalog/002")]
 #[test]
 fn catalog_002_catalog_prints_and_dispatched_tasks_carry_it() {
-    let mut test = UnitDeck::new(
-        "[catalog]\nremove = [\"merge\"]\n\n[[catalog.fields]]\nname = \"risk\"\ndescription = \"How risky the change is: low, medium or high.\"\ntype = \"text\"\n\n[[catalog.actions]]\nname = \"ship\"\ndescription = \"Offer when the work is ready to release.\"\nprompt = \"Release it following this project's procedure, then update your card.\"\nlabel = \"Ship it\"\nconfirm = true\n",
-    );
+    let mut test = UnitDeck::new(&format!(
+        "[catalog]\nremove = [\"merge\"]\n\n[[catalog.fields]]\nname = \"risk\"\ndescription = \"How risky the change is: low, medium or high.\"\ntype = \"text\"\n\n[[catalog.actions]]\nname = \"ship\"\ndescription = \"Offer when the work is ready to release.\"\nprompt = \"Release it following this project's procedure, then update your card.\"\nlabel = \"Ship it\"\nconfirm = true\n{}",
+        explain_action_config()
+    ));
     let block = catalog_block(&test.deck);
     assert!(block.starts_with("## Your agent card\n"), "{block}");
     for line in [
@@ -733,7 +748,7 @@ fn catalog_002_catalog_prints_and_dispatched_tasks_carry_it() {
             "risk"
         ]
     );
-    assert_eq!(names("actions"), ["go-ahead", "explain", "ship"]);
+    assert_eq!(names("actions"), ["go-ahead", "ship", "explain"]);
     let ship = resolved["actions"]
         .as_array()
         .unwrap()
@@ -1417,7 +1432,11 @@ fn actions_003_a_changed_action_sends_nothing_from_the_old_card() {
         DEPLOY_PROMPT,
         "DEPLOY-PROMPT-7f3a: deploy it to production now, then update your card.",
     );
-    std::fs::write(config_path(&cfg), edited).expect("edit the user config");
+    std::fs::write(
+        config_path(&cfg),
+        format!("{edited}{}", explain_action_config()),
+    )
+    .expect("edit the user config");
     let out = act_with(
         &daemon,
         &k,
@@ -1542,7 +1561,7 @@ fn wait_until(what: &str, ok: impl Fn() -> bool) {
 fn actions_005_overlapping_repeats_of_one_request_post_once() {
     let dir = common::harness_tempdir().expect("config tempdir");
     let config = dir.path().join("config.toml");
-    std::fs::write(&config, "").expect("write user config");
+    std::fs::write(&config, explain_action_config()).expect("write user config");
     let config = config.to_string_lossy().into_owned();
     let daemon = inbox::daemon_unbound(&[
         ("DOT_AGENT_DECK_CONFIG", config.as_str()),
@@ -1626,7 +1645,10 @@ fn state_002_a_changed_catalog_applies_to_published_cards() {
 
     std::fs::write(
         config_path(&cfg),
-        "[catalog]\nremove = [\"merge\"]\n\n[[catalog.fields]]\nname = \"progress\"\ndescription = \"How far along, in percent.\"\ntype = \"number\"\n",
+        format!(
+            "[catalog]\nremove = [\"merge\"]\n\n[[catalog.fields]]\nname = \"progress\"\ndescription = \"How far along, in percent.\"\ntype = \"number\"\n{}",
+            explain_action_config()
+        ),
     )
     .expect("edit the user config");
     let e = wait_entry(&daemon, &k, "without merge", |e| {

@@ -911,7 +911,6 @@ function docsCardAction(id: string, overrides: Partial<AgentCardAction>): AgentC
 
 function docsDeckActions(): AgentCardAction[] {
   return [
-    docsCardAction("explain", { label: "Explain", prompt: "Explain in a few sentences what you did and what you need from me, then update your card.", prompt_source: "catalog", icon: "help-circle" }),
     docsCardAction("reply", { label: "Reply", text_input: true, source: "deck", placement: "detail", icon: "message-square" }),
     docsCardAction("open", { label: "Open", kind: "open", source: "deck", placement: "detail", icon: "terminal" }),
     docsCardAction("close", { label: "Close", kind: "close", confirm: true, source: "deck", placement: "detail", icon: "x" }),
@@ -969,6 +968,12 @@ export function docsAgentCards(): AgentCardsSnapshot {
     }),
     docsCard("2", "Desktop implementation", {
       agent_type: "codex", status: "working", group: DOCS_CARDS_TEAM, parent: "docs-pane-1/1",
+      checked_refs: [{
+        field: "issue", kind: "issue", claim: "#18436", repo: "acme/checkout", number: 18436, url: "https://github.com/acme/checkout/issues/18436",
+        result: { status: "checked", state: "open", title: "Let customers retry a failed payment", checked_at: DOCS_REPORTED_AT, stale: false, labels: [
+          { name: "enhancement", color: "a2eeef" }, { name: "payments", color: "0e8a16" }, { name: "needs design", color: "d876e3" }, { name: "frontend", color: "1d76db" },
+        ] },
+      }],
       relations: { orchestration: { id: "docs-checkout", label: "checkout-retry", role: "builder", is_orchestrator: false } },
       report: { source: "agent", status: "working", summary: "Adding the retry button to the checkout view.", published_at: DOCS_REPORTED_AT, revision: 5 },
       fields: [

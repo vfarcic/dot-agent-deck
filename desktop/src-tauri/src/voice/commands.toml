@@ -2561,7 +2561,7 @@ try_saying  = "open the issue on {agent}'s card"
 [[commands]]
 id          = "run_card_action"
 description = """Press one of the buttons on an agent's card: an action the agent or the deck
-offers (such as "Merge it", "Go ahead", "Explain") or an answer to a question the agent asked on
+offers (such as "Merge it", "Go ahead", "Close") or an answer to a question the agent asked on
 its card. Use when the user names both the action and the agent — "send merge it to the coder",
 "press go ahead on the tester's card", "answer main to the coder". Set `agent` to the user's
 words for the agent and `action` to the button's label as the user said it. A catalog action is

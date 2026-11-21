@@ -1,6 +1,6 @@
 # Agent Cards
 
-Agent cards are a view of the desktop app's Dashboard. Each agent the daemon runs gets a card that says what it is doing, whether it needs you, which pull requests and issues it reported, and the actions you can take on it, such as answering its question or telling it to go ahead. The cards are laid out as a tree: you see the agents you started, and you open one to see the agents it started. You read many agents at a glance and act on the one that needs you without opening its terminal.
+Agent cards are a view of the desktop app's Dashboard. Each agent the daemon runs gets a card that says what it is doing, whether it needs you, and which pull requests and issues it reported. Click a card to open it and act on it, such as answering its question or telling it to go ahead. The cards are laid out as a tree: you see the agents you started, and you open one to see the agents it started. You read many agents at a glance and act on the one that needs you without opening its terminal.
 
 ## What a card shows
 
@@ -17,7 +17,7 @@ A card is marked **Needs you** when its agent stopped, is asking a question in i
 
 The Dashboard's top bar has a **Table | Cards** switch. **Table** is the Dashboard you know. **Cards** shows the cards. The app remembers your choice in this window's storage, so the next time you open the Dashboard it shows the same view.
 
-![The Dashboard's Cards view: under the Local daemon's header, two cards side by side, the Plan / architecture orchestrator, whose tree is open, and a standalone agent that needs input; under the orchestrator, joined by a line, its two roles, one of them showing its checked pull request #18421 and its main button, “Yes, behind a flag” shortened to fit, marked **agent says**](/img/agent-cards-desktop.png)
+![The Dashboard's Cards view: under the Local daemon's header, two cards side by side, the Plan / architecture orchestrator, whose tree is open, and a standalone agent that needs input, each with a Close button; under the orchestrator, joined by a line, its two roles, one showing its checked pull request #18421 and the other its checked issue #18436 with the issue's labels under it](/img/agent-cards-desktop.png)
 
 ## The tree of cards
 
@@ -59,22 +59,25 @@ A daemon from a release before the tree was added sends no tree: the app shows i
 
 Each card has fixed-size lines, so cards line up and stay the same size whatever their agents report. A line too long for the card is cut short, and hovering it shows all of it.
 
-- **The agent's name.** Click it to open the card overlay.
-- **What it is** — dispatcher, orchestrator, role or agent — then its status in the same words as the table and the TUI, and its agent type, such as Claude Code or Codex.
+- **The agent's name.** Click it to open the agent's terminal, as clicking its row in the Table view does.
+- **What it is** — dispatcher, orchestrator, role or agent — then its status in the same words as the table and the TUI.
 - **Needs you**, when it does.
 - **The pull requests and issues the agent reported, as the deck checked them** (see [Pull requests and issues on a card](#pull-requests-and-issues-on-a-card)). When there are more than fit, **+N** at the end of the line counts the rest; press it to open the card's overlay at its list of every one.
+- **An issue's labels**, under the pull requests and issues, as small chips with a dot in each label's colour on GitHub. When there are more than fit, **+N** counts the rest, and hovering it names them; the overlay lists them all. Labels are for reading: clicking one does what clicking the card does.
 - **The bar and count** of the agents under it, on a card that has any.
-- **One main button**, the action the agent most needs from you: the answer to its question or an action it suggested. When there is nothing for you to answer or press, the card has no button; click its name to open it. Beside the button, on the same line, is the start of the exact text it sends, and hovering shows all of it. An action the agent wrote itself is marked **agent says**. The button sends straight away only an action whose text comes from your catalog and that does not ask you to confirm first. For anything else, such as an action the agent wrote, or an answer to its question, the button sends nothing yet: it opens the card at a step showing the whole text, and you send it from there. After you send it, the card says whether the message was sent and, later, whether the agent took it.
+- **Close**, the **×** button, which closes the agent exactly as **Close** in the overlay does: it shows what is still pending and asks before it closes anything. It is disabled when the overlay's **Close** would be, and hovering it says why. It is the only action on the card.
 
-The agent's summary, progress, next step and other fields are not on the card: they are in its overlay.
+Click anywhere else on a card to open its overlay, which has everything the agent reported and every action you can take. From the keyboard, press `Tab` to reach a card's controls: its name, its status line, which opens the overlay, its pull request and issue badges, **+N**, the tree's arrow and **Close**. Each control does only its own thing: clicking a badge opens its page, not the overlay.
+
+The agent's summary, progress, next step, agent type (such as Claude Code or Codex) and other fields are not on the card: they are in its overlay.
 
 Each daemon keeps its own section with its header, so its **Stop daemon**, **Upgrade**, host figures and **New agent** buttons are there in both views, and its cards are below the header.
 
-In the Table view, a row whose card needs you shows a bell next to the agent's name, and the row's **⋯** menu has **Show card**, which opens that agent's card, and the card's main action. The menu shows only the action's name, so choosing it sends nothing yet: it opens the card at a step that shows exactly what the action sends, and you send it from there. Clicking the row itself still opens the agent's terminal, as before.
+In the Table view, a row whose card needs you shows a bell next to the agent's name, and the row's **⋯** menu has **Show card**, which opens that agent's card, and the action the agent most needs from you, such as the answer to its question. The menu shows only the action's name, so choosing it sends nothing yet: it opens the card at a step that shows exactly what the action sends, and you send it from there. Clicking the row itself still opens the agent's terminal, as before.
 
 ## Pull requests and issues on a card
 
-When an agent reports a pull request or an issue on its card, the deck looks it up on GitHub itself and shows what GitHub says, not what the agent wrote. A pull request shows the same badge as the Dashboard's [pull request badge](dashboard.md#pull-requests): its state, its CI checks and its review. An issue shows its number and whether it is open or closed. Hover a badge to read it in words, with when the deck checked it and what the agent wrote. The deck checks open pull requests and issues again from time to time, and eventually stops checking one that is merged or closed.
+When an agent reports a pull request or an issue on its card, the deck looks it up on GitHub itself and shows what GitHub says, not what the agent wrote. A pull request shows the same badge as the Dashboard's [pull request badge](dashboard.md#pull-requests): its state, its CI checks and its review. An issue shows its number and whether it is open or closed, and its labels, in their GitHub colours, on the line under it. A label whose colour the app cannot use is shown in a neutral grey. Hover a badge to read it in words, with when the deck checked it and what the agent wrote. The deck checks open pull requests and issues again from time to time, and eventually stops checking one that is merged or closed.
 
 Click a badge to open GitHub's page for it inside the app, as the Dashboard's pull request badge does (see [Read a pull request in the app](dashboard.md#read-a-pull-request-in-the-app)). The card overlay closes so that the page is in front. This works on a stopped agent's card as well, for as long as the daemon lists that card. If the page cannot be opened, the app says why, on the overlay or above the cards: for example, "That card is no longer on its daemon, so its page was not opened."
 
@@ -96,17 +99,18 @@ Until the first lookup finishes, the badge reads **checking…**. A badge marked
 
 ## The card overlay
 
-Click a card's name, or **Show card** in a row's menu, to open the card overlay. It shows everything on the card: the deck's status and the pull request of the agent's branch, the agent's report and every field, each question with its answers as buttons, and every action with the exact text it sends to the agent, why it is disabled when it is, and what happened to the last time you pressed it. **Sent from this card** lists the last actions you sent the agent, each with the exact text and whether it was delivered, and keeps them after the agent's card stops offering those actions.
+Click a card anywhere but its name and buttons, or **Show card** in a row's menu, to open the card overlay. It starts with what you need to answer the agent: its summary, its questions with their answers as buttons, and a box to reply in your own words. Below those are the pull requests and issues it reported, every field, and every action with the exact text it sends to the agent, why it is disabled when it is, and what happened to the last time you pressed it. Its header has the deck's status and the agent's type. **Sent from this card** lists the last actions you sent the agent, each with the exact text and whether it was delivered, and keeps them after the agent's card stops offering those actions.
 
-**Pull requests and issues**, marked **deck checked**, lists every pull request and issue the agent reported, in the order of its fields. Each one has its badge, which opens it as on the card, what the deck found (for example `Issue #3: closed`, or a pull request's state, review and CI) with its title on GitHub, when the deck checked it, that the check may be out of date, that it is still to be checked, or why it cannot be checked, and what the agent wrote, marked **agent says**.
+**Pull requests and issues**, marked **deck checked**, lists every pull request and issue the agent reported, in the order of its fields. Each one has its badge, which opens it as on the card, what the deck found (for example `Issue #3: closed`, or a pull request's state, review and CI) with its title on GitHub, every label of an issue, when the deck checked it, that the check may be out of date, that it is still to be checked, or why it cannot be checked, and what the agent wrote, marked **agent says**.
 
-The text an action sends is shown exactly as it is sent. Characters you could not otherwise see, such as a tab, a character that changes the direction of the text around it, or one that joins or alters the characters next to it, are shown as a boxed code between `⟦` and `⟧`, like `⟦tab⟧` or `⟦U+202E⟧`, with a note under the text saying what the codes mean; hover a code to see what it stands for. Nothing is left out. A `⟦` the agent typed is itself shown as the code `⟦U+27E6⟧`, so ordinary text can never pass for one of these codes, and text such as `\t` that the agent typed is shown as the plain characters it is.
+The text an action sends is shown exactly as it is sent, set off as a quotation under the action's button. Characters you could not otherwise see, such as a tab, a character that changes the direction of the text around it, or one that joins or alters the characters next to it, are shown as a boxed code between `⟦` and `⟧`, like `⟦tab⟧` or `⟦U+202E⟧`, with a note under the text saying what the codes mean; hover a code to see what it stands for. Nothing is left out. A `⟦` the agent typed is itself shown as the code `⟦U+27E6⟧`, so ordinary text can never pass for one of these codes, and text such as `\t` that the agent typed is shown as the plain characters it is.
 
 - **[** and **]**, or the arrow buttons, move to the previous and next card without closing the overlay, in the tree's order: each agent comes after the one that started it, and cards inside a closed tree are included. **n**, or **Next needing you**, jumps to the next card that needs you. **Escape** or the **×** closes it.
 - The overlay updates while it is open: when the agent publishes a new report or a message is delivered, you see it straight away. If the agent is closed while you look at its card, the overlay says "This agent was closed." and you can move on to the next card.
+- An action whose text the agent wrote, such as one it suggested that is not in your catalog or an answer to one of its questions, does not send when you press its button: the overlay opens a step at its top that shows the whole text, and **Send** there sends it. Actions from your catalog send when you press them.
 - An action marked **Asks you to confirm first**, and both ways of closing the agent, show you exactly what will be sent or done and ask before doing it. Closing tells you what is still pending, such as an unanswered question or an open pull request.
 - If the agent changes an action while you are looking at it, the confirm step shows the new text, says it changed, and sends nothing until you confirm you have read it. A button pressed after the agent changed its action is refused, and nothing is sent; look at the card again and press it once more if you still want it.
-- **Reply** opens a box where you write your own message. It is sent to the agent exactly as you typed it.
+- The reply box is there whenever the agent can take a reply: type your own message and press **Send reply**. It is sent to the agent exactly as you typed it. **Reply** among the actions puts the cursor in that box.
 - **Open** closes the card and opens the agent's terminal pane. **Close** closes the agent, and **Close, keep worktree** closes a dispatched agent but keeps its copy of the repository, when it has one.
 - Actions that send the agent a message are disabled while the agent is not running, and the overlay says so.
 - What happened to a message you sent reads **Queued for the agent**, **Delivered to the agent**, **Not delivered** with the reason, or **Delivery uncertain** when the deck cannot tell whether the agent got it, or has run out of attempts to send it, or has seen the agent hold it for a long time without starting on it. An uncertain message is also in the agent's inbox, where you can retry or cancel it.
@@ -127,7 +131,8 @@ With voice control on, you can say:
 | "next one that needs me" | Jumps to the next card that needs you. |
 | "only the ones that need me", "show all cards" | Turns **Needs you only** on or off. |
 | "close the card" | Closes the card overlay. |
-| "press go ahead on the coder's card", "answer main to the coder" | Presses that action or answer, named by the label on its button. |
+| "open the coder" | Opens that agent's terminal, as clicking its name on its card does. |
+| "press go ahead on the coder's card", "answer main to the coder", "press close on the coder's card" | Presses that action or answer, named by the label on its button. Close opens the card at its confirm step, as the card's **×** does. |
 | "reply to the coder use the main branch" | Opens that agent's card with your words in its **Reply** box, for you to read, change and send with **Send reply**. |
 
 When the agent reported more than one pull request, or more than one issue, voice opens the first one the deck could check; click a badge to open another. If the dashboard's filter hides the card whose tree you asked to open, the app opens it anyway and tells you to clear the filter to see it.
@@ -144,7 +149,7 @@ When the deck dispatches work, the task it gives the agent explains how to keep 
 
 ## Choose the fields and actions agents use
 
-The fields agents fill in and the actions they can offer you come from a catalog. The deck has defaults: the fields `progress`, `next-step`, `details`, `pull-request`, `issue` and `links`, and the actions **Go ahead**, **Merge it** and **Explain**. `dot-agent-deck card catalog` prints the catalog the daemon uses.
+The fields agents fill in and the actions they can offer you come from a catalog. The deck has defaults: the fields `progress`, `next-step`, `details`, `pull-request`, `issue` and `links`, and the actions **Go ahead** and **Merge it**. `dot-agent-deck card catalog` prints the catalog the daemon uses. Earlier releases also had an **Explain** action on every card; to keep it, add it to your catalog as the example below shows. A `remove = ["explain"]` you wrote to hide it still works and needs no change; the deck ignores it without a warning.
 
 Change it with a `[catalog]` table in your user configuration file, `~/.config/dot-agent-deck/config.toml` (or the file `DOT_AGENT_DECK_CONFIG` names). The daemon reads that file, so for a daemon on another machine it is the file on that machine. Edits apply to the next card read or publish, with no restart.
 
@@ -168,6 +173,12 @@ label = "Ship it"                  # optional
 placement = "card"                 # optional
 confirm = true                     # optional: ask before sending
 always = false                     # optional: true offers it on every card, suggested or not
+
+[[catalog.actions]]                # the Explain action earlier releases offered on every card
+name = "explain"
+description = "Ask the agent to explain what it did and what it needs."
+prompt = "Explain in a few sentences what you did and what you need from me, then update your card."
+always = true
 ```
 
 - A field or action with the same `name` as a default replaces it whole; a new name is added after the defaults.
@@ -184,7 +195,7 @@ Agents can also report fields and actions that are not in the catalog. You see t
 
 ## In the TUI
 
-The TUI does not show cards, and it does not draw the tree. Its dashboard keeps showing each agent's status as before. From any shell on the machine, `dot-agent-deck card list` prints every card as JSON, with the same status, needs-you reasons and actions the app shows, and `dot-agent-deck card act` presses one action. Each card in the list also carries the tree the app draws: `parent` names the key of the card that started it (a card with no `parent` is in the top row), `kind` says whether it is a dispatcher, orchestrator, role or agent, `rollup` counts the agents under it by status with the most urgent one and how many need you, and `checked_refs` lists the pull requests and issues the agent reported, each with what the agent wrote and what the deck found. The cards are listed in the tree's order, each one before the agents it started.
+The TUI does not show cards, and it does not draw the tree. Its dashboard keeps showing each agent's status as before. From any shell on the machine, `dot-agent-deck card list` prints every card as JSON, with the same status, needs-you reasons and actions the app shows, and `dot-agent-deck card act` presses one action. Each card in the list also carries the tree the app draws: `parent` names the key of the card that started it (a card with no `parent` is in the top row), `kind` says whether it is a dispatcher, orchestrator, role or agent, `rollup` counts the agents under it by status with the most urgent one and how many need you, and `checked_refs` lists the pull requests and issues the agent reported, each with what the agent wrote and what the deck found, including an issue's `labels`. The cards are listed in the tree's order, each one before the agents it started.
 
 ```sh
 dot-agent-deck card act --entry <key> --action <id> --token <token> --instance <instance_id>

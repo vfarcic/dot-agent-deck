@@ -500,13 +500,7 @@ fn issue_json(repo: &str, number: u64, state: &str, title: &str) -> String {
 const PR_ARGV_FIELDS: &str =
     "number,state,isDraft,reviewDecision,url,headRefName,statusCheckRollup,title";
 
-/// Scenario: An agent working in a clone of `test-org/test-repo` publishes a
-/// card naming pull request `#41` and issue `other-org/other-repo#7`, which
-/// the daemon's stand-in `gh` says are a merged pull request whose CI failed
-/// and a closed issue. `card list` shows each claim exactly as the agent wrote
-/// it beside the deck's check: merged with failing CI and approved, closed,
-/// both with canonical github.com links, and the daemon asked `gh` once for
-/// each and did not ask again in the seconds after, once they were settled.
+/// Scenario: An agent publishes a card naming a pull request and an issue that the daemon's stand-in `gh` says are merged with failing CI and closed, respectively. `card list` keeps the claims beside the checked states, canonical links and bounded issue labels, dropping invalid label colours and truncating long names. The daemon reads each reference once, with labels in the same issue lookup, and does not read these settled references again.
 #[spec("agent-report/refs/001")]
 #[test]
 fn refs_001_reported_references_show_the_decks_own_check() {
@@ -529,17 +523,27 @@ fn refs_001_reported_references_show_the_decks_own_check() {
         ),
         "",
     );
+    let long_label_name = "é".repeat(500);
+    let mut labels = vec![
+        json!({"name": "bug", "color": "d73a4a"}),
+        json!({"name": "neutral", "color": "red; background:url(https://example.com)"}),
+        json!({"name": long_label_name, "color": "A1b2C3"}),
+    ];
+    labels.extend((0..100).map(|n| json!({"name": format!("extra-{n}"), "color": "123456"})));
+    let mut issue_answer: Value = serde_json::from_str(&issue_json(
+        "other-org/other-repo",
+        7,
+        "CLOSED",
+        "REFS-001 widget is missing",
+    ))
+    .unwrap();
+    issue_answer["labels"] = json!(labels);
     deck.answer(
         "issue",
         "other-org/other-repo",
         7,
         0,
-        &issue_json(
-            "other-org/other-repo",
-            7,
-            "CLOSED",
-            "REFS-001 widget is missing",
-        ),
+        &issue_answer.to_string(),
         "",
     );
     let agent = deck.agent("refs-agent", &deck.repo);
@@ -607,6 +611,34 @@ fn refs_001_reported_references_show_the_decks_own_check() {
     assert_eq!(issue["result"]["title"], "REFS-001 widget is missing");
     assert!(issue["result"].get("ci").is_none(), "{issue:#}");
     assert!(issue["result"].get("review").is_none(), "{issue:#}");
+    let labels = issue["result"]["labels"].as_array().unwrap_or_else(|| {
+        panic!("card list must show the issue labels from the same lookup: {issue:#}")
+    });
+    assert_eq!(
+        labels.len(),
+        20,
+        "the issue keeps at most 20 labels: {labels:#?}"
+    );
+    assert_eq!(labels[0], json!({"name": "bug", "color": "d73a4a"}));
+    assert_eq!(
+        labels[1],
+        json!({"name": "neutral"}),
+        "an invalid colour is omitted, not the label"
+    );
+    assert_eq!(
+        labels[2]["name"],
+        "é".repeat(50),
+        "names are capped in characters, without breaking Unicode"
+    );
+    assert_eq!(labels[2]["color"], "A1b2C3");
+    assert_eq!(
+        labels[19]["name"], "extra-16",
+        "label order survives the cap"
+    );
+    assert!(
+        pr["result"].get("labels").is_none(),
+        "PR labels are outside this feature: {pr:#}"
+    );
 
     // The agent's own field values are unchanged beside the deck's check.
     let doc = list(&deck.daemon);
@@ -639,7 +671,7 @@ fn refs_001_reported_references_show_the_decks_own_check() {
     // does not read them again.
     // Sorted, as the calls are below: the two lookups run side by side.
     let expected = [
-        "issue view 7 --repo other-org/other-repo --json number,state,title,url".to_string(),
+        "issue view 7 --repo other-org/other-repo --json number,state,title,url,labels".to_string(),
         format!("pr view 41 --repo {ORIGIN_REPO} --json {PR_ARGV_FIELDS}"),
     ];
     let mut calls = deck.lookups();

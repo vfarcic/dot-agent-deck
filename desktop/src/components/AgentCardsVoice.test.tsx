@@ -155,7 +155,8 @@ function renderSpoken(outcome: VoiceResultDto["outcome"], { secondDeck, entries 
   let delivered = false;
   const status = (state: VoiceStatusDto["state"]): VoiceStatusDto => ({ state, capturedMs: 900, maxMs: 30_000, capped: false, available: true, backend: "remote" });
   const resolveVoice = vi.fn(async (): Promise<VoiceResultDto> => ({ outcome, resolveMs: null, backend: "stub" }));
-  const snapshot = createFixtureSnapshot("connected");
+  const base = createFixtureSnapshot("connected");
+  const snapshot = { ...base, connection: { ...base.connection, incarnation: INSTANCE }, agents: base.agents.map((agent) => ({ ...agent, incarnation: INSTANCE })) };
   const agent = snapshot.agents[0];
   const card = cardFor(agent.id, "voice-card-agent");
   const settings = settingsStore();
@@ -229,7 +230,7 @@ describe("desktop/agent-cards/008 — the cards by voice (PRD #2374)", () => {
     window.localStorage.clear();
   });
 
-  /// Scenario: read the action registry and the command table the crate embeds. Each of the nine card controls is `voice: true` with one overview row that invokes it under the contract's row id and param names; the confirm step's send and the row menu are kept off voice with a reason and no row.
+  /// Scenario: read the action registry and the command table the crate embeds. The card controls and shared name-open entry are voice-enabled on overview with the expected row ids and parameter names; the confirm step's send and the row menu are kept off voice with a reason and no row.
   it("desktop/agent-cards/008: every new card control is voice: true with its commands.toml row", () => {
     const rows = commandRows();
     const registry = VOICE_ACTIONS as unknown as Record<string, { voice?: boolean; no_voice?: string }>;
@@ -246,6 +247,32 @@ describe("desktop/agent-cards/008 — the cards by voice (PRD #2374)", () => {
       expect((registry[kept]?.no_voice ?? "").trim().length, `${kept} carries a no_voice reason`).toBeGreaterThan(0);
       expect(rows.filter((row) => row.invoke === kept)).toEqual([]);
     }
+    expect(VOICE_ACTIONS.openAgent.voice).toBe(true);
+    const open = rows.filter((row) => row.invoke === "openAgent");
+    expect(open.map((row) => row.id)).toEqual(["open_agent"]);
+    expect(open[0].screens).toContain("overview");
+    expect(open[0].params).toEqual([{ name: "agent", kind: "agent_ref" }]);
+  });
+
+  /// Scenario: open the agent using the name on its compact card, or by saying "open the voice card agent". Both dispatch the shared open-agent action and show the agent's terminal, without opening its card overlay or sending a card action.
+  it.each(["name", "voice"] as const)("desktop/agent-cards/008: opening by %s uses the shared voice action and shows the agent terminal", async (method) => {
+    const agentId = createFixtureSnapshot("connected").agents[0].id;
+    const sharedOpen = vi.spyOn(VOICE_ACTIONS.openAgent, "run");
+    try {
+      const { invokeCardAction, resolveVoice } = renderSpoken({
+        kind: "dispatch", transcript: "open the voice card agent", action: "open_agent", invoke: "openAgent",
+        params: [{ name: "agent", kind: "agent_ref", spoken: "the voice card agent", value: agentId, label: "voice-card-agent" }],
+        sentence: "Opening voice-card-agent.",
+      } as VoiceResultDto["outcome"]);
+      if (method === "voice") await speak(resolveVoice);
+      else await act(async () => { fireEvent.click(screen.getByText("voice-card-agent", { selector: "button" })); });
+      await waitFor(() => expect(screen.getByTestId(`terminal-${agentId}`)).toBeInTheDocument());
+      expect(sharedOpen).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ deckId: FIXTURE_DAEMON_ID, agentId, from: "overview" }));
+      expect(screen.queryByTestId("agent-card-overlay")).toBeNull();
+      expect(invokeCardAction).not.toHaveBeenCalled();
+    } finally {
+      sharedOpen.mockRestore();
+    }
   });
 
   /// Scenario: say "press merge it on the voice card agent's card", where Merge it asks for confirmation. The card's overlay opens at its confirm step showing the exact prompt and what is pending, and nothing is sent.
@@ -260,13 +287,25 @@ describe("desktop/agent-cards/008 — the cards by voice (PRD #2374)", () => {
     expect(invokeCardAction).not.toHaveBeenCalled();
   });
 
-  /// Scenario: say "press close on the voice card agent's card". The overlay opens at the close confirmation and the agent is not closed.
-  it("desktop/agent-cards/008: a spoken close only opens its confirmation", async () => {
-    const { card, invokeCardAction, resolveVoice } = renderSpoken(runCardAction(createFixtureSnapshot("connected").agents[0].id, "Close", "press close on the voice card agent's card"));
-    await speak(resolveVoice);
-    await waitFor(() => expect(screen.getByTestId("agent-card-confirm")).toBeInTheDocument());
-    expect(screen.getByTestId("agent-card-overlay").getAttribute("data-card-key")).toBe(card.key);
-    expect(invokeCardAction).not.toHaveBeenCalled();
+  /// Scenario: press the compact card's Close icon, or say "press close on the voice card agent's card". Both use the card-action registry entry and show Close's confirmation without closing the agent or opening its terminal.
+  it.each(["icon", "voice"] as const)("desktop/agent-cards/008: Close by %s uses the shared action and only opens its confirmation", async (method) => {
+    const sharedClose = vi.spyOn(VOICE_ACTIONS.runCardAction, "run");
+    try {
+      const { card, invokeCardAction, resolveVoice } = renderSpoken(runCardAction(createFixtureSnapshot("connected").agents[0].id, "Close", "press close on the voice card agent's card"));
+      if (method === "voice") await speak(resolveVoice);
+      else {
+        const article = document.querySelector<HTMLElement>(`article[data-card-key="${card.key}"]`)!;
+        fireEvent.click(within(article).getByRole("button", { name: /^Close(?: voice-card-agent(?:'s agent)?)?$/ }));
+      }
+      await waitFor(() => expect(screen.getByTestId("agent-card-confirm")).toBeInTheDocument());
+      expect(sharedClose).toHaveBeenCalledTimes(1);
+      expect(screen.getByTestId("agent-card-overlay").getAttribute("data-card-key")).toBe(card.key);
+      expect(screen.getByRole("alertdialog", { name: "Close?" })).toHaveTextContent("This closes voice-card-agent.");
+      expect(invokeCardAction).not.toHaveBeenCalled();
+      expect(screen.queryByTestId(`terminal-${card.agent_id}`)).toBeNull();
+    } finally {
+      sharedClose.mockRestore();
+    }
   });
 
   /// Scenario: say "press go ahead on the voice card agent's card", a catalog prompt action that needs no confirmation. Exactly that action of that card is sent once, unconfirmed.

@@ -23,6 +23,8 @@
 //!   [`ISSUE_VIEW_FIELDS`]. GitHub numbers issues and pull requests in one
 //!   sequence, and `gh issue view` answers a pull request's number too (with
 //!   a `MERGED` state and a `/pull/` URL), which is read as that pull request.
+//!   The same lookup reads an issue's labels (round 2, D13), bounded by
+//!   [`MAX_LABELS`] and [`MAX_LABEL_NAME_CHARS`]; no second call is made.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
@@ -32,6 +34,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use tracing::{debug, warn};
 
+use crate::agent_cards::IssueLabel;
 use crate::agent_pty::AgentPtyRegistry;
 use crate::github_refs::{GithubReference, ReferenceKind, ResolvedReference};
 use crate::pull_request::{
@@ -47,7 +50,14 @@ pub const PR_VIEW_FIELDS: &str =
     "number,state,isDraft,reviewDecision,url,headRefName,statusCheckRollup,title";
 
 /// The `--json` fields of an issue lookup.
-pub const ISSUE_VIEW_FIELDS: &str = "number,state,title,url";
+pub const ISSUE_VIEW_FIELDS: &str = "number,state,title,url,labels";
+
+/// The most labels a checked issue keeps, in the order `gh` lists them.
+pub const MAX_LABELS: usize = 20;
+
+/// The longest label name a card carries, in characters. GitHub's own limit
+/// is 50, so this cuts only what GitHub would not have let through.
+pub const MAX_LABEL_NAME_CHARS: usize = 50;
 
 /// The arguments of `gh issue view` for issue `number` of `repo_slug`.
 pub fn gh_issue_view_args<'a>(number: &'a str, repo_slug: &'a str) -> [&'a str; 7] {
@@ -69,6 +79,8 @@ pub struct RefAnswer {
     pub ci: Option<PullRequestChecks>,
     pub review: Option<PullRequestReview>,
     pub title: Option<String>,
+    /// An issue's labels, bounded ([`labels_of`]); empty for a pull request.
+    pub labels: Vec<IssueLabel>,
     /// The page GitHub names for it — for an issue number that is a pull
     /// request, the pull request's.
     pub url: String,
@@ -107,6 +119,48 @@ fn title_of(json: &str) -> Option<String> {
     let title = serde_json::from_str::<Titled>(json).ok()?.title?;
     let title = escape_control_and_bidi(title.trim());
     (!title.is_empty()).then(|| title.chars().take(MAX_TITLE_CHARS).collect())
+}
+
+#[derive(serde::Deserialize)]
+struct Labelled {
+    #[serde(default)]
+    labels: serde_json::Value,
+}
+
+/// A label colour as GitHub gives it: exactly six hex digits, no `#`.
+fn label_color(value: Option<&serde_json::Value>) -> Option<String> {
+    let color = value?.as_str()?;
+    (color.len() == 6 && color.bytes().all(|b| b.is_ascii_hexdigit())).then(|| color.to_string())
+}
+
+/// The labels in `gh issue view --json labels` output, as a card keeps them
+/// (D13): repository text, so each name is trimmed, escaped and cut to
+/// [`MAX_LABEL_NAME_CHARS`], a label with no usable name is skipped, at most
+/// [`MAX_LABELS`] are kept, and a colour that is not six hex digits is
+/// dropped while its label stays. A `labels` value that is not a list reads
+/// as none rather than failing the lookup.
+pub fn labels_of(json: &str) -> Vec<IssueLabel> {
+    let Ok(Labelled { labels }) = serde_json::from_str::<Labelled>(json) else {
+        return Vec::new();
+    };
+    let Some(labels) = labels.as_array() else {
+        return Vec::new();
+    };
+    labels
+        .iter()
+        .filter_map(|label| {
+            let name = label.get("name")?.as_str()?;
+            let name = escape_control_and_bidi(name.trim());
+            if name.is_empty() {
+                return None;
+            }
+            Some(IssueLabel {
+                name: name.chars().take(MAX_LABEL_NAME_CHARS).collect(),
+                color: label_color(label.get("color")),
+            })
+        })
+        .take(MAX_LABELS)
+        .collect()
 }
 
 /// The page a lookup of `asked` answered with `url`, as its canonical
@@ -161,6 +215,7 @@ pub fn parse_pr_reference(
         ci: pr.checks,
         review: pr.review,
         title: title_of(json),
+        labels: Vec::new(),
         url,
         checked_at: now,
     })
@@ -196,11 +251,20 @@ pub fn parse_issue_reference(
         _ => return Err("gh answered an issue state this build does not know".into()),
     };
     let url = answered_page(&issue.url, asked, false)?;
+    // Issues only (D13): a number GitHub answers as a pull request keeps no
+    // labels; a pull request's labels are a later step.
+    let is_issue_page = ResolvedReference::from_github_url(&url)
+        .is_some_and(|page| page.kind == ReferenceKind::Issue);
     Ok(RefAnswer {
         state,
         ci: None,
         review: None,
         title: title_of(json),
+        labels: if is_issue_page {
+            labels_of(json)
+        } else {
+            Vec::new()
+        },
         url,
         checked_at: now,
     })
@@ -365,6 +429,7 @@ pub fn check_reference(
                 title: answer.title.clone(),
                 checked_at: answer.checked_at,
                 stale: entry.is_stale(),
+                labels: answer.labels.clone(),
             }
         }
         // Review A3: the card says why in fixed words; what `gh` printed
@@ -934,9 +999,89 @@ mod tests {
                 "--repo",
                 "o/r",
                 "--json",
-                "number,state,title,url"
+                "number,state,title,url,labels"
             ]
         );
+    }
+
+    /// Issue #2418 (D13): an issue's labels come from the same lookup,
+    /// bounded and validated as untrusted repository text.
+    #[test]
+    fn an_issue_lookup_keeps_its_labels_bounded_and_validated() {
+        let issue = r##"{"number": 3, "state": "OPEN", "title": "Bug",
+            "url": "https://github.com/o/r/issues/3",
+            "labels": [
+                {"name": "bug", "color": "d73a4a", "id": "x", "description": "d"},
+                {"name": "  needs triage  ", "color": "#ededed"},
+                {"name": "no colour"},
+                {"name": "short", "color": "abc"},
+                {"name": "not hex", "color": "zzzzzz"},
+                {"name": "", "color": "ffffff"},
+                {"name": "   "},
+                {"color": "ffffff"},
+                {"name": 7},
+                {"name": "esc\u001b[31m", "color": "00FF00"}
+            ]}"##;
+        let asked = resolved("o/r", ReferenceKind::Issue, 3);
+        let answer = parse_issue_reference(issue, &asked, at()).unwrap();
+        let label = |name: &str, color: Option<&str>| IssueLabel {
+            name: name.into(),
+            color: color.map(str::to_string),
+        };
+        assert_eq!(
+            answer.labels,
+            [
+                label("bug", Some("d73a4a")),
+                label("needs triage", None),
+                label("no colour", None),
+                label("short", None),
+                label("not hex", None),
+                label(&escape_control_and_bidi("esc\u{1b}[31m"), Some("00FF00")),
+            ]
+        );
+        assert!(!answer.labels[5].name.contains('\u{1b}'));
+
+        // A pull request's number answered through the issue lookup keeps
+        // none: pull request labels are a later step.
+        let pr = r#"{"number": 4, "state": "OPEN", "title": "PR",
+            "url": "https://github.com/o/r/pull/4",
+            "labels": [{"name": "bug", "color": "d73a4a"}]}"#;
+        let answer =
+            parse_issue_reference(pr, &resolved("o/r", ReferenceKind::Issue, 4), at()).unwrap();
+        assert!(answer.labels.is_empty());
+
+        // No labels key, or one that is not a list, is no labels rather than
+        // a failed lookup.
+        for json in [
+            r#"{"number": 3, "state": "OPEN", "url": "https://github.com/o/r/issues/3"}"#,
+            r#"{"number": 3, "state": "OPEN", "url": "https://github.com/o/r/issues/3", "labels": null}"#,
+            r#"{"number": 3, "state": "OPEN", "url": "https://github.com/o/r/issues/3", "labels": "bug"}"#,
+        ] {
+            let answer = parse_issue_reference(json, &asked, at()).expect(json);
+            assert!(answer.labels.is_empty(), "{json}");
+        }
+    }
+
+    #[test]
+    fn labels_are_capped_in_count_and_name_length() {
+        let long = "x".repeat(MAX_LABEL_NAME_CHARS + 30);
+        let mut labels = vec![
+            serde_json::json!({"name": ""}),
+            serde_json::json!({"name": long, "color": "123456"}),
+        ];
+        labels.extend((0..MAX_LABELS + 5).map(|i| serde_json::json!({"name": format!("l{i}")})));
+        let json = serde_json::json!({"labels": labels}).to_string();
+        let kept = labels_of(&json);
+        assert_eq!(kept.len(), MAX_LABELS, "skipped labels do not count");
+        assert_eq!(kept[0].name.chars().count(), MAX_LABEL_NAME_CHARS);
+        assert_eq!(kept[0].color.as_deref(), Some("123456"));
+        assert_eq!(kept[1].name, "l0", "kept in gh's order");
+        assert_eq!(kept[MAX_LABELS - 1].name, format!("l{}", MAX_LABELS - 2));
+        // A multi-byte name is cut on characters, not bytes.
+        let wide = "é".repeat(MAX_LABEL_NAME_CHARS + 1);
+        let kept = labels_of(&serde_json::json!({"labels": [{"name": wide}]}).to_string());
+        assert_eq!(kept[0].name, "é".repeat(MAX_LABEL_NAME_CHARS));
+        assert!(labels_of("not json").is_empty());
     }
 
     /// D4/D5: what a reference checks out as, from the claim to the cache.
@@ -1015,6 +1160,7 @@ mod tests {
             ci: None,
             review: None,
             title: Some("T".into()),
+            labels: Vec::new(),
             url: "https://github.com/o/r/pull/5".into(),
             checked_at: at(),
         };
@@ -1144,6 +1290,7 @@ mod tests {
             }),
             review: None,
             title: None,
+            labels: Vec::new(),
             url: "https://github.com/o/r/pull/1".into(),
             checked_at: at(),
         };
@@ -1310,6 +1457,7 @@ mod tests {
             ci: None,
             review: None,
             title: None,
+            labels: Vec::new(),
             url: key.url(),
             checked_at: at(),
         };
@@ -1617,6 +1765,7 @@ mod tests {
             ci: None,
             review: None,
             title: None,
+            labels: Vec::new(),
             url: kept.url(),
             checked_at: at(),
         };
@@ -1659,6 +1808,7 @@ mod tests {
             ci: None,
             review: None,
             title: None,
+            labels: Vec::new(),
             url: shown.url(),
             checked_at: at(),
         };

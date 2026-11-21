@@ -4,7 +4,7 @@ import { useLayoutEffect, useMemo, useState } from "react";
 import { placedCardKey, type CardResults, type PlacedCard } from "../lib/agentCards";
 import { cardKinds, cardTree, needsYouPath, type CardNode } from "../lib/agentCardsTree";
 import { DISPLAY_LIMITS, displayText, domIdentity } from "../lib/displayText";
-import { VOICE_ACTIONS, type VoiceActionContext } from "../lib/voiceActions";
+import { VOICE_ACTIONS, type AgentViewTarget, type VoiceActionContext } from "../lib/voiceActions";
 import { AgentCard, type CardControls, type CardPlace } from "./AgentCard";
 
 /**
@@ -59,7 +59,7 @@ function TreeLevel({ nodes, depth, top, view, above }: { nodes: readonly CardNod
         const open = node.children.length > 0 && view.openCards.has(key);
         return (
           <li key={key}>
-            <AgentCard card={node.card} controls={view.controls} results={view.results?.(node.card)} place={view.place(node, depth, open)} />
+            <AgentCard card={node.card} controls={view.controls} results={view.results?.(node.card)} place={view.place(node, depth, open)} openTarget={view.openTarget} />
             {open && <TreeLevel nodes={node.children} depth={depth + 1} view={view} above={new Set([...above, key])} />}
           </li>
         );
@@ -74,6 +74,7 @@ interface TreeView {
   controls: CardControls;
   results?: (card: PlacedCard) => CardResults;
   place: (node: CardNode, depth: number, open: boolean) => CardPlace;
+  openTarget?: (card: PlacedCard) => AgentViewTarget;
 }
 
 /**
@@ -162,7 +163,7 @@ function layoutRow(row: HTMLElement) {
  * user nor lead to one. A daemon older than the tree has its cards drawn as
  * roots, with a note saying why.
  */
-export function AgentCardsDeckBody({ deckId, cards, tree, openCards, needsYouOnly, controls, results }: {
+export function AgentCardsDeckBody({ deckId, cards, tree, openCards, needsYouOnly, controls, results, openTarget }: {
   deckId: string;
   cards: readonly PlacedCard[];
   /** Whether this deck's daemon builds the card tree. */
@@ -171,8 +172,10 @@ export function AgentCardsDeckBody({ deckId, cards, tree, openCards, needsYouOnl
   openCards: ReadonlySet<string>;
   needsYouOnly: boolean;
   controls: CardControls;
-  /** The last answer to each action pressed on a card, to show under its primary button. */
+  /** The last answer to each action pressed on a card, for its Close control's tooltip. */
   results?: (card: PlacedCard) => CardResults;
+  /** What a card's name opens: the dashboard's own target for that agent, so it is the one its table row opens (issue #2418, D12). */
+  openTarget?: (card: PlacedCard) => AgentViewTarget;
 }) {
   /* The frame as a state, set by its ref: it is not mounted while there are
      no cards to show, so measuring follows it in and out — a deck that starts
@@ -204,6 +207,7 @@ export function AgentCardsDeckBody({ deckId, cards, tree, openCards, needsYouOnl
     openCards,
     controls,
     results,
+    openTarget,
     place: (node, depth, open) => ({
       depth,
       kind: kinds.get(placedCardKey(node.card)) ?? "agent",
@@ -225,7 +229,7 @@ export function AgentCardsDeckBody({ deckId, cards, tree, openCards, needsYouOnl
               <div className="agent-cards-roots" data-testid="agent-cards-roots" style={{ gridTemplateColumns: `repeat(${columns}, minmax(0, ${CARD_WIDTH}px))` }}>
                 {row.map((node) => {
                   const open = node.children.length > 0 && openCards.has(placedCardKey(node.card));
-                  return <AgentCard key={placedCardKey(node.card)} card={node.card} controls={controls} results={results?.(node.card)} place={view.place(node, 0, open)} />;
+                  return <AgentCard key={placedCardKey(node.card)} card={node.card} controls={controls} results={results?.(node.card)} place={view.place(node, 0, open)} openTarget={openTarget} />;
                 })}
               </div>
               {opened.map(({ node, col }) => (

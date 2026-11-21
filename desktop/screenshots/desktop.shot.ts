@@ -75,7 +75,8 @@ desktopScenario("agent-cards", async (page) => {
   await expect(page.locator("article[data-card-key][data-depth='0']")).toHaveCount(2);
   await page.getByRole("button", { name: "Open Plan / architecture's tree" }).click();
   await expect(page.locator("article[data-card-key]")).toHaveCount(4);
-  await expect(page.getByTestId("agent-card-primary").first()).toHaveText("Go ahead");
+  await expect(page.getByTestId("agent-card-issue-label").first()).toHaveText("enhancement");
+  await expect(page.getByRole("button", { name: "Close Plan / architecture", exact: true })).toBeVisible();
 });
 
 // PRD #1258 — the same fixed host the TUI `host-metrics` image shows

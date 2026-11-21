@@ -388,3 +388,60 @@ export function referenceDetail(ref: AgentCardCheckedRef): ReferenceDetail {
   }
   return { note: view.title, claim: ref.claim };
 }
+
+/** Issue #2418 (D13) — one issue label as a card draws it: its name, and its colour only when that is six hex digits. */
+export interface IssueLabelView {
+  name: string;
+  /** Six lowercase hex digits, no `#`; absent for a label drawn neutral. */
+  color?: string;
+}
+
+/**
+ * Issue #2418 (D13; round 2, R2-A2) — the most labels a card keeps for one
+ * issue, and the most characters of a label's name: the daemon's own caps
+ * (`MAX_LABELS`, `MAX_LABEL_NAME_CHARS` in `src/reference_check.rs`).
+ */
+export const MAX_ISSUE_LABELS = 20;
+export const MAX_ISSUE_LABEL_NAME_CHARS = 50;
+/** How many entries of a `labels` array are looked at, unusable ones included, before the rest are ignored. */
+const MAX_ISSUE_LABEL_ENTRIES_SCANNED = MAX_ISSUE_LABELS * 5;
+
+/**
+ * Issue #2418 (D13) — a checked issue's labels, in the daemon's order. The
+ * daemon already bounds and validates them; this checks again, since they are
+ * repository text and the desktop does not rely on a daemon it may not have
+ * built (round 2, R2-A2): at most `MAX_ISSUE_LABEL_ENTRIES_SCANNED` entries
+ * are looked at, a label without a usable name is skipped, a name is cut to
+ * `MAX_ISSUE_LABEL_NAME_CHARS` characters, at most `MAX_ISSUE_LABELS` are
+ * kept, and a colour that is not exactly six hex digits is dropped, so the
+ * label is drawn neutral. A pull request, or a reference not (or no longer
+ * freshly) checked, has none here — a stale check keeps the labels it last
+ * read.
+ */
+export function issueLabels(ref: AgentCardCheckedRef): IssueLabelView[] {
+  if (ref.kind !== "issue" || ref.result.status !== "checked") return [];
+  const labels = (ref.result as { labels?: unknown }).labels;
+  if (!Array.isArray(labels)) return [];
+  const kept: IssueLabelView[] = [];
+  const scanned = Math.min(labels.length, MAX_ISSUE_LABEL_ENTRIES_SCANNED);
+  for (let index = 0; index < scanned && kept.length < MAX_ISSUE_LABELS; index += 1) {
+    const label: unknown = labels[index];
+    if (typeof label !== "object" || label === null) continue;
+    const { name, color } = label as { name?: unknown; color?: unknown };
+    if (typeof name !== "string") continue;
+    const cut = cutLabelName(name);
+    if (cut === "") continue;
+    kept.push({ name: cut, ...(typeof color === "string" && /^[0-9a-fA-F]{6}$/.test(color) ? { color: color.toLowerCase() } : {}) });
+  }
+  return kept;
+}
+
+/** A label's name, trimmed and cut to `MAX_ISSUE_LABEL_NAME_CHARS` characters, without reading past what that needs. */
+function cutLabelName(name: string): string {
+  // A character is at most two UTF-16 units, so four times the limit in
+  // units holds at least twice the limit in characters: enough to cut at the
+  // limit without splitting a very long name into characters first.
+  const start = name.length - name.trimStart().length;
+  const head = name.slice(start, start + MAX_ISSUE_LABEL_NAME_CHARS * 4);
+  return Array.from(head).slice(0, MAX_ISSUE_LABEL_NAME_CHARS).join("").trimEnd();
+}

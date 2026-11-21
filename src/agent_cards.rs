@@ -876,6 +876,16 @@ pub struct CheckedReference {
     pub result: CheckResult,
 }
 
+/// Issue #2418 (D13): one label of a checked issue, as the daemon kept it.
+/// Repository text, so untrusted: the daemon caps the name's length and
+/// keeps `color` only when it is six hex digits (`d73a4a`, no `#`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssueLabel {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+}
+
 /// Issue #2418 (D5): what the deck's own lookup of a reference found.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -901,6 +911,10 @@ pub enum CheckResult {
         /// succeeded rather than a fresh one.
         #[serde(default)]
         stale: bool,
+        /// An issue's labels, read in the same lookup and bounded by the
+        /// daemon (round 2, D13). A pull request carries none.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        labels: Vec<IssueLabel>,
     },
     /// The deck could not check it.
     Unavailable {
@@ -3542,7 +3556,12 @@ mod tests {
 
     #[test]
     fn an_entry_resolves_actions_needs_you_and_primary() {
-        let catalog = resolve(None);
+        // Explain is no longer a default (#2418 D15): a user catalog adds it,
+        // always offered, so the always-offered step keeps its place below.
+        let catalog = resolve(Some(
+            "[[catalog.actions]]\nname = \"explain\"\ndescription = \"d\"\nprompt = \"Explain.\"\nalways = true\n",
+        ));
+        assert!(catalog.errors.is_empty(), "{:?}", catalog.errors);
         let mut slots = HashMap::new();
         slots.insert(
             "p1/1".to_string(),
@@ -4255,6 +4274,7 @@ mod tests {
                     ci: None,
                     review: None,
                     title: None,
+                    labels: Vec::new(),
                     url: format!("https://github.com/{repo}/pull/7"),
                     checked_at: Utc::now(),
                 },
@@ -4301,6 +4321,44 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// Issue #2418 (D13): a checked issue's labels ride the `checked` result
+    /// as `labels: [{name, color}]`, `color` omitted when the daemon kept none
+    /// and `labels` omitted when empty, and a result from a daemon that sends
+    /// no labels still reads.
+    #[test]
+    fn a_checked_issues_labels_are_an_optional_wire_field() {
+        let checked = |labels: Vec<IssueLabel>| CheckResult::Checked {
+            state: crate::pull_request_info::PullRequestState::Open,
+            ci: None,
+            review: None,
+            title: None,
+            checked_at: "2026-11-21T10:00:00Z".parse().unwrap(),
+            stale: false,
+            labels,
+        };
+        let with = serde_json::to_value(checked(vec![
+            IssueLabel {
+                name: "bug".into(),
+                color: Some("d73a4a".into()),
+            },
+            IssueLabel {
+                name: "plain".into(),
+                color: None,
+            },
+        ]))
+        .unwrap();
+        assert_eq!(
+            with["labels"],
+            serde_json::json!([{"name": "bug", "color": "d73a4a"}, {"name": "plain"}])
+        );
+        let without = serde_json::to_value(checked(Vec::new())).unwrap();
+        assert!(without.get("labels").is_none(), "{without}");
+        let older: CheckResult = serde_json::from_value(without).unwrap();
+        assert_eq!(older, checked(Vec::new()));
+        let back: CheckResult = serde_json::from_value(with).unwrap();
+        assert!(matches!(back, CheckResult::Checked { labels, .. } if labels.len() == 2));
     }
 
     #[test]

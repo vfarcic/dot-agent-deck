@@ -1,7 +1,8 @@
+import "../styles.css";
 import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureFleet, createFixtureStartedAgent, FIXTURE_DAEMON_ID } from "../data/fixture";
-import { isIssueUrl, referenceUrl } from "../lib/agentCardsTree";
+import { isIssueUrl, issueLabels, referenceUrl } from "../lib/agentCardsTree";
 import { clearDashboardFilter, setDashboardFilter } from "../lib/dashboardFilter";
 import { OpenCardReference, type CardReferenceTarget } from "../lib/prBrowser";
 import { DEFAULT_DESKTOP_FEATURES, type AgentCardCheckedRef, type AgentCardEntry, type AgentCardsSnapshot, type DeckFleet, type DeckRuntimeState } from "../types";
@@ -58,9 +59,16 @@ const PR_MERGED: AgentCardCheckedRef = {
   field: "pull-request", kind: "pull_request", claim: "#24180", repo: "vfarcic/dot-agent-deck", number: 24180, url: "https://github.com/vfarcic/dot-agent-deck/pull/24180",
   result: { status: "checked", state: "merged", ci: { state: "failing", passing: 3, failing: 1, pending: 0, skipped: 0 }, review: "approved", title: "Cards, first slice", checked_at: "2026-11-20T10:00:00Z", stale: false },
 };
+const ISSUE_LABELS = [
+  { name: "bug", color: "d73a4a" },
+  { name: "neutral", color: "not-a-colour" },
+  { name: "help wanted", color: "008672" },
+  { name: "documentation", color: "0075ca" },
+  { name: "long-tail-label", color: "bfdadc" },
+];
 const ISSUE_CLOSED: AgentCardCheckedRef = {
   field: "issue", kind: "issue", claim: "o/r#3", repo: "o/r", number: 3, url: "https://github.com/o/r/issues/3",
-  result: { status: "checked", state: "closed", title: "An issue", checked_at: "2026-11-20T10:00:00Z", stale: false },
+  result: { status: "checked", state: "closed", title: "An issue", checked_at: "2026-11-20T10:00:00Z", stale: false, labels: ISSUE_LABELS },
 };
 const PR_PENDING: AgentCardCheckedRef = { field: "pull-request", kind: "pull_request", claim: "#7", number: 7, result: { status: "pending" } };
 const PR_NOT_FOUND: AgentCardCheckedRef = { field: "pr-two", kind: "pull_request", claim: "o/r#8", repo: "o/r", number: 8, url: "https://github.com/o/r/pull/8", result: { status: "unavailable", reason: "not_found", detail: "GraphQL: Could not resolve to a PullRequest" } };
@@ -185,13 +193,16 @@ describe("desktop/agent-cards — the Cards tree (issue #2418)", () => {
     expect(toggle(QUEUE).getAttribute("aria-expanded")).toBe("false");
     expect(toggle(QUEUE).getAttribute("aria-label")).toBe("Open queue's tree");
 
-    fireEvent.click(toggle(QUEUE));
+    toggle(QUEUE).focus();
+    expect(document.activeElement).toBe(toggle(QUEUE));
+    fireEvent.click(toggle(QUEUE), { detail: 0 });
     expect(toggle(QUEUE).getAttribute("aria-expanded")).toBe("true");
     const band = screen.getByTestId("agent-cards-band");
     expect(band.getAttribute("data-root-key")).toBe(QUEUE.key);
     expect([...band.querySelectorAll("article[data-card-key]")].map((node) => node.getAttribute("data-card-key"))).toEqual([LEAD.key, UNIT.key]);
     expect(cardOf(LEAD.key).getAttribute("data-depth")).toBe("1");
     expect(roots()).toEqual([QUEUE.key, SOLO.key, TRIAGE.key]);
+    expect(screen.queryByTestId("agent-card-overlay")).toBeNull();
 
     fireEvent.click(toggle(LEAD));
     expect([...band.querySelectorAll("article[data-card-key]")].map((node) => node.getAttribute("data-card-key"))).toEqual([LEAD.key, CODER.key, TESTER.key, UNIT.key]);
@@ -221,11 +232,12 @@ describe("desktop/agent-cards — the Cards tree (issue #2418)", () => {
     expect(cardOf(QUEUE.key).getAttribute("data-tone")).toBe("idle");
   });
 
-  /// Scenario: with the dispatcher's tree open, the daemon sends a new list in which only the dispatcher's roll-up changed (an error appeared under it) and one role's status moved. The bar, the totals and the colour follow the new roll-up, the role's card shows its new status, and the tree stays open.
+  /// Scenario: with the dispatcher's tree open, the daemon changes a roll-up and a child's status. The bar, totals and colour follow the update, and the child's status button announces its kind and current status before and after the change while the tree stays open.
   it("desktop/agent-cards/011: roll-ups and statuses update live, and the tree stays open", () => {
     const live = runtime();
     const view = cardsView(live);
     fireEvent.click(toggle(TRIAGE));
+    expect(within(cardOf(STUCK.key)).getByTestId("agent-card-details")).toHaveAccessibleName(/agent.*blocked/);
     expect(cardOf(QUEUE.key).getAttribute("data-tone")).toBe("needs_input");
     const queue = { ...QUEUE, revision: 2, rollup: { total: 5, worst: "error", counts: { error: 1, working: 2, idle: 2 }, needs_you: 2 } };
     const stuck = { ...STUCK, revision: 2, status: "working", needs_you: false, needs_you_reasons: [] };
@@ -236,9 +248,11 @@ describe("desktop/agent-cards — the Cards tree (issue #2418)", () => {
     // triage's own tree is still open and its child shows its new status.
     expect(toggle(TRIAGE).getAttribute("aria-expanded")).toBe("true");
     expect(within(cardOf(STUCK.key)).getByTestId("agent-card-status").textContent).toBe("working");
+    expect(within(cardOf(STUCK.key)).getByTestId("agent-card-details")).toHaveAccessibleName(/agent.*working/);
+    expect(within(cardOf(STUCK.key)).getByTestId("agent-card-details")).not.toHaveAccessibleName(/blocked/);
   });
 
-  /// Scenario: open the trees and read the cards. Each shows its name, its kind (dispatcher, orchestrator, role or agent), its agent type, its status in the daemon's words and the needs-you marker; what the agent said, its progress and its next step are not on the card, and clicking the card's name opens the overlay, which still shows them.
+  /// Scenario: open the trees and read the cards. Each shows its name, its kind (dispatcher, orchestrator, role or agent), its status in the daemon's words and the needs-you marker, with no agent type; what the agent said, its progress and its next step are not on the card, and clicking the card body opens the overlay, which still shows them and the agent type.
   it("desktop/agent-cards/012: a compact card shows who and what, in the daemon's words, and the overlay keeps what the agent said", () => {
     cardsView();
     fireEvent.click(toggle(QUEUE));
@@ -249,9 +263,9 @@ describe("desktop/agent-cards — the Cards tree (issue #2418)", () => {
     expect(text(CODER, "agent-card-kind")).toBe("role");
     expect(text(UNIT, "agent-card-kind")).toBe("agent");
     expect(text(SOLO, "agent-card-kind")).toBe("agent");
-    expect(text(CODER, "agent-card-agent-type")).toBe("Codex");
-    expect(text(UNIT, "agent-card-agent-type")).toBe("OpenCode");
-    expect(text(QUEUE, "agent-card-agent-type")).toBe("Claude Code");
+    for (const card of [QUEUE, CODER, UNIT]) {
+      expect(within(cardOf(card.key)).queryByText(/^(Codex|OpenCode|Claude Code)$/)).toBeNull();
+    }
     // The daemon's words, as the table and the TUI show them.
     expect(text(CODER, "agent-card-status")).toBe("working");
     expect(text(TESTER, "agent-card-status")).toBe("needs input");
@@ -263,12 +277,13 @@ describe("desktop/agent-cards — the Cards tree (issue #2418)", () => {
     expect(within(cardOf(QUEUE.key)).queryByText("SAID-QUEUE-SUMMARY")).toBeNull();
     expect(within(cardOf(QUEUE.key)).queryByText("PROGRESS-QUEUE")).toBeNull();
     expect(within(cardOf(QUEUE.key)).queryByText("NEXT-STEP-QUEUE")).toBeNull();
-    fireEvent.click(within(cardOf(QUEUE.key)).getByTestId("agent-card-show"));
+    fireEvent.click(within(cardOf(QUEUE.key)).getByTestId("agent-card-details"));
     const overlay = screen.getByTestId("agent-card-overlay");
     expect(overlay.getAttribute("data-card-key")).toBe(QUEUE.key);
     expect(within(overlay).getByText("SAID-QUEUE-SUMMARY")).toBeInTheDocument();
     expect(within(overlay).getByText("PROGRESS-QUEUE")).toBeInTheDocument();
     expect(within(overlay).getByText("NEXT-STEP-QUEUE")).toBeInTheDocument();
+    expect(within(overlay).getByText("Claude Code")).toBeInTheDocument();
   });
 
   /// Scenario: open the dispatcher and read the unit's card, whose agent claimed pull request #24180 and issue o/r#3. The pull request badge shows the deck's check — merged, CI failing, approved — and the issue badge shows it closed; clicking each opens its GitHub page through the app, with the checked address.
@@ -281,7 +296,9 @@ describe("desktop/agent-cards — the Cards tree (issue #2418)", () => {
     expect(pr.getAttribute("data-pr-checks")).toBe("failing");
     expect(pr.getAttribute("data-pr-review")).toBe("approved");
     expect(pr.getAttribute("aria-label")).toContain("#24180");
-    act(() => { fireEvent.click(pr); });
+    pr.focus();
+    expect(document.activeElement).toBe(pr);
+    act(() => { fireEvent.click(pr, { detail: 0 }); });
     expect(openReference).toHaveBeenCalledWith({ deckId: FIXTURE_DAEMON_ID, instanceId: INSTANCE, cardKey: UNIT.key, kind: "pull_request", number: 24180, url: PR_MERGED.url });
     // A click on a badge does not open the card's overlay.
     expect(screen.queryByTestId("agent-card-overlay")).toBeNull();
@@ -289,8 +306,95 @@ describe("desktop/agent-cards — the Cards tree (issue #2418)", () => {
     const issue = within(unit).getByTestId("agent-card-issue");
     expect(issue.getAttribute("data-issue-state")).toBe("closed");
     expect(issue.getAttribute("aria-label")).toContain("#3");
-    act(() => { fireEvent.click(issue); });
+    issue.focus();
+    expect(document.activeElement).toBe(issue);
+    act(() => { fireEvent.click(issue, { detail: 0 }); });
     expect(openReference).toHaveBeenLastCalledWith({ deckId: FIXTURE_DAEMON_ID, instanceId: INSTANCE, cardKey: UNIT.key, kind: "issue", number: 3, url: ISSUE_CLOSED.url });
+    expect(screen.queryByTestId("agent-card-overlay")).toBeNull();
+  });
+
+  /// Scenario: read an issue's labels on its compact card. The repo's valid colour decorates its label, an invalid colour uses the same neutral appearance as a missing colour, and the display-only chips are not keyboard controls.
+  it("desktop/agent-cards/013: issue label chips use the repo colour and invalid colours fall back to neutral", () => {
+    const reference: AgentCardCheckedRef = { ...ISSUE_CLOSED, result: { ...ISSUE_CLOSED.result, status: "checked", state: "closed", checked_at: "2026-11-20T10:00:00Z", stale: false, labels: [ISSUE_LABELS[0], ISSUE_LABELS[1], { name: "no colour" }] } };
+    const card = entry("5", "unit", { checked_refs: [reference] });
+    cardsView(runtime([card]));
+    expect(within(cardOf(card.key)).getByText("bug")).toBeInTheDocument();
+    const line = within(cardOf(card.key)).getByTestId("agent-card-issue-labels");
+    const chips = within(line).getAllByTestId("agent-card-issue-label");
+    expect(chips.map((chip) => chip.textContent)).toEqual(["bug", "neutral", "no colour"]);
+    const decoration = (chip: HTMLElement) => [chip, ...chip.querySelectorAll<HTMLElement>("*")].map((node) => {
+      const style = getComputedStyle(node);
+      return [style.color, style.backgroundColor, style.borderColor].join(";");
+    }).join(";");
+    expect(decoration(chips[0])).toContain("rgb(215, 58, 74)"); // theme-invariant: the repo's supplied label colour is the same in either theme.
+    expect(decoration(chips[1])).toBe(decoration(chips[2]));
+    expect(line.querySelector("button, a, [role='button'], [tabindex='0']")).toBeNull();
+  });
+
+  /// Scenario: give the issue's label line room for two chips and the overflow count. Two labels remain visible and +3 accounts for the others, while opening the card's overlay lists all five labels without an overflow cap.
+  it("desktop/agent-cards/013: labels that do not fit are counted by +N and the overlay lists them all", () => {
+    // jsdom has no layout: model a 200 px label line with 60 px chips and 6 px gaps.
+    vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockImplementation(function width(this: HTMLElement) { return this.dataset.testid === "agent-card-issue-labels" ? 200 : 0; });
+    vi.spyOn(HTMLElement.prototype, "offsetWidth", "get").mockImplementation(function width(this: HTMLElement) { return this.dataset.testid === "agent-card-issue-label" ? 60 : 0; });
+    vi.spyOn(HTMLElement.prototype, "offsetLeft", "get").mockImplementation(function left(this: HTMLElement) { return this.dataset.testid === "agent-card-issue-label" ? [...(this.parentElement?.children ?? [])].indexOf(this) * 66 : 0; });
+    const card = entry("5", "unit", { checked_refs: [ISSUE_CLOSED] });
+    cardsView(runtime([card]));
+    const article = cardOf(card.key);
+    expect(within(article).getByText("bug")).toBeInTheDocument();
+    const line = within(article).getByTestId("agent-card-issue-labels");
+    const chips = within(line).getAllByTestId("agent-card-issue-label");
+    expect(chips.filter((chip) => chip.getAttribute("aria-hidden") !== "true").map((chip) => chip.textContent)).toEqual(["bug", "neutral"]);
+    expect(within(line).getByText("+3")).toBeInTheDocument();
+    fireEvent.click(article);
+    const section = within(screen.getByRole("dialog", { name: "unit" })).getByRole("region", { name: "Pull requests and issues" });
+    for (const label of ISSUE_LABELS) expect(within(section).getByText(label.name)).toBeVisible();
+    expect(within(section).queryByText(/^\+\d+$/)).toBeNull();
+  });
+
+  /// Scenario: a malformed daemon sends too many issue labels or one overlong name. The helper accepts only 20 names of at most 50 characters, and both the compact card and overlay create chips only for those bounded labels, including hidden overflow chips.
+  it.each([
+    { surface: "helper", count: 100 }, { surface: "helper", count: 1 },
+    { surface: "rendered card", count: 100 }, { surface: "rendered card", count: 1 },
+  ])("desktop/agent-cards/013: oversized issue labels are bounded in the $surface with $count labels (R2-A2)", ({ surface, count }) => {
+    const labels = Array.from({ length: count }, (_, at) => ({ name: `label-${at}-` + "x".repeat(100), color: "D73A4A" }));
+    const reference: AgentCardCheckedRef = { ...ISSUE_CLOSED, result: { status: "checked", state: "closed", checked_at: "2026-11-20T10:00:00Z", stale: false, labels } };
+    const accepted = issueLabels(reference);
+    const expected = labels.slice(0, 20).map((label) => label.name.slice(0, 50));
+    if (surface === "helper") {
+      expect(accepted).toHaveLength(Math.min(count, 20));
+      expect(accepted.map((label) => label.name)).toEqual(expected);
+      expect(accepted.every((label) => label.color === "d73a4a")).toBe(true);
+      return;
+    }
+    // Model the same narrow label line as the overflow scenario above.
+    vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockImplementation(function width(this: HTMLElement) { return this.dataset.testid === "agent-card-issue-labels" ? 200 : 0; });
+    vi.spyOn(HTMLElement.prototype, "offsetWidth", "get").mockImplementation(function width(this: HTMLElement) { return this.dataset.testid === "agent-card-issue-label" ? 60 : 0; });
+    vi.spyOn(HTMLElement.prototype, "offsetLeft", "get").mockImplementation(function left(this: HTMLElement) { return this.dataset.testid === "agent-card-issue-label" ? [...(this.parentElement?.children ?? [])].indexOf(this) * 66 : 0; });
+    cardsView(runtime([entry("5", "unit", { checked_refs: [reference] })]));
+    const article = cardOf(key("5"));
+    const chips = within(article).getAllByTestId("agent-card-issue-label");
+    expect(chips).toHaveLength(Math.min(count, 20));
+    expect(chips.map((chip) => chip.textContent)).toEqual(expected);
+    if (count > 20) {
+      expect(chips.filter((chip) => chip.getAttribute("aria-hidden") === "true")).toHaveLength(18);
+      expect(within(article).getByTestId("agent-card-issue-labels-more")).toHaveTextContent("+18");
+    }
+    expect(article.textContent).not.toContain("label-20-");
+    fireEvent.click(article);
+    const section = screen.getByTestId("agent-card-overlay-refs");
+    const overlayChips = within(section).getAllByTestId("agent-card-overlay-issue-label");
+    expect(overlayChips).toHaveLength(Math.min(count, 20));
+    expect(overlayChips.map((chip) => chip.textContent)).toEqual(expected);
+  });
+
+  /// Scenario: a malformed daemon puts a usable label after 1,000 invalid entries. The desktop stops its bounded scan before that distant entry and creates no label chips for it.
+  it("desktop/agent-cards/013: malformed label entries cannot make the desktop scan an unbounded tail (R2-A2)", () => {
+    const labels = [...Array.from({ length: 1000 }, () => ({ name: "" })), { name: "UNBOUNDED_SCAN_SENTINEL" }];
+    const reference: AgentCardCheckedRef = { ...ISSUE_CLOSED, result: { status: "checked", state: "open", checked_at: "2026-11-20T10:00:00Z", stale: false, labels } };
+    expect(issueLabels(reference)).toEqual([]);
+    cardsView(runtime([entry("5", "unit", { checked_refs: [reference] })]));
+    expect(screen.queryAllByTestId("agent-card-issue-label")).toHaveLength(0);
+    expect(screen.queryByText("UNBOUNDED_SCAN_SENTINEL")).toBeNull();
   });
 
   /// Scenario: read the unit's references the deck could not check, or has not yet. A pending one says it is being checked, a not-found one says "not found or private", one that is not a GitHub reference says so, each with the reason in its tooltip and no link; a stale one keeps its badge but is marked stale, with when it was last checked in its tooltip.
@@ -595,7 +699,7 @@ describe("desktop/agent-cards — the Cards tree (issue #2418)", () => {
   it("desktop/agent-cards/025: the overlay lists every checked reference with its state, its notes and the agent's claim, and opens them", () => {
     cardsView();
     fireEvent.click(toggle(QUEUE));
-    fireEvent.click(within(cardOf(UNIT.key)).getByTestId("agent-card-show"));
+    fireEvent.click(within(cardOf(UNIT.key)).getByTestId("agent-card-details"));
     const section = within(screen.getByTestId("agent-card-overlay")).getByRole("region", { name: "Pull requests and issues" });
     const items = within(section).getAllByTestId("agent-card-overlay-ref");
     expect(items.map((item) => item.getAttribute("data-field"))).toEqual(["pull-request", "issue", "pull-request", "pr-two", "issue-two", "pr-three"]);
@@ -611,6 +715,7 @@ describe("desktop/agent-cards — the Cards tree (issue #2418)", () => {
     expect(within(merged).getByText("agent says")).toBeInTheDocument();
     expect(text(closed, "agent-card-overlay-ref-checked")).toBe("Issue #3: closed");
     expect(text(closed, "agent-card-overlay-ref-claim")).toContain("o/r#3");
+    for (const label of ISSUE_LABELS) expect(within(closed).getByText(label.name)).toBeVisible();
 
     // Still to be checked, not found (with the daemon's detail), not a GitHub reference: said, and no link.
     expect(text(pending, "agent-card-overlay-ref-note")).toMatch(/not looked #7 up yet/);

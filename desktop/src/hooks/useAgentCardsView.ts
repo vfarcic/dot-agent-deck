@@ -264,12 +264,17 @@ export function useAgentCardsView({ runtime, decks, openAgent, openReference, hi
         setOpen({ key: placedCardKey(card), name: card.entry.name, step: { kind: "confirm", actionId: action.id, token: action.token } });
         return undefined;
       }
-      // A control that showed the text names the definition it showed (its
-      // token). Without one — voice names an action by its label — text the
-      // agent wrote is shown at the review step and sent only from there.
-      if (wanted.token === undefined && !sendableUnread(action)) {
+      // Text the catalog did not write (the agent's, or an answer quoting its
+      // question) is shown whole at the review step and sent only from there,
+      // whoever pressed (audit A4; issue #2418 round 2, R2-A1). A control's
+      // token names the definition it drew, not that its text was on screen:
+      // the overlay draws a prompt under its button, where the end of a long
+      // one can lie below the overlay's visible part. So the token is never a
+      // reason to skip this step; only the prompt's source is.
+      if (!sendableUnread(action)) {
         setOpen({ key: placedCardKey(card), name: card.entry.name, step: { kind: "confirm", actionId: action.id, token: action.token } });
-        return agentWrittenReview(displayText(action.label, DISPLAY_LIMITS.name), name);
+        // A button press sees the step open; voice is told why it did.
+        return wanted.token === undefined ? agentWrittenReview(displayText(action.label, DISPLAY_LIMITS.name), name) : undefined;
       }
       send(card, action, wanted.token !== undefined ? { token: wanted.token } : {});
       return undefined;

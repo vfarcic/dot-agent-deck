@@ -870,6 +870,16 @@ export interface AgentCardRollup {
   needs_you: number;
 }
 
+/**
+ * Issue #2418 (D13) — one label of a checked issue: repository text, so
+ * untrusted. `color` is GitHub's six hex digits without `#` when the daemon
+ * kept one; the app checks it again before drawing with it.
+ */
+interface AgentCardIssueLabel {
+  name: string;
+  color?: string;
+}
+
 /** Issue #2418 — what the deck's own lookup of a reported reference found, on the daemon's host. */
 type AgentCardCheckResult =
   | { status: "pending" }
@@ -883,6 +893,8 @@ type AgentCardCheckResult =
     checked_at: string;
     /** A later lookup failed: this is the last answer that succeeded, not a fresh one. */
     stale: boolean;
+    /** An issue's labels, as the daemon bounded them (issue #2418, D13); absent when it has none and for a pull request. */
+    labels?: AgentCardIssueLabel[];
   }
   | {
     status: "unavailable";

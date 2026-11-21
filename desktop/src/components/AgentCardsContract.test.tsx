@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureFleet, createFixtureStartedAgent, FIXTURE_DAEMON_ID } from "../data/fixture";
 import { DEFAULT_DESKTOP_FEATURES, type AgentCardAction, type AgentCardEntry, type AgentCardsSnapshot, type DeckFleet, type DeckRuntimeState } from "../types";
 import { AgentOverview, agentKey } from "./AgentOverview";
+import { VOICE_ACTIONS } from "../lib/voiceActions";
 
 /*
  * PRD #2374 — the spec tests of the desktop half of the agent-cards contract
@@ -147,7 +148,7 @@ const ORDER = [ZULU, ALPHA, MIKE, BRAVO, YANKEE];
 
 function fleet(entries: AgentCardEntry[] = ORDER): DeckFleet {
   const deck = createFixtureFleet("fleet")[0];
-  const agents = entries.map((card) => createFixtureStartedAgent({ id: card.agent_id, daemonId: FIXTURE_DAEMON_ID, displayName: card.name, command: "claude", cwd: "/w" }));
+  const agents = entries.map((card) => ({ ...createFixtureStartedAgent({ id: card.agent_id, daemonId: FIXTURE_DAEMON_ID, displayName: card.name, command: "claude", cwd: "/w" }), incarnation: INSTANCE }));
   return [{ ...deck, agents }];
 }
 
@@ -187,7 +188,7 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}, entries: AgentCardEn
 /** The cards on screen, by the key the daemon gave each, in screen order. */
 const cardNodes = () => [...document.querySelectorAll("article[data-card-key]")];
 const shownKeys = () => cardNodes().map((node) => node.getAttribute("data-card-key"));
-const shownNames = () => screen.getAllByTestId("agent-card-show").map((button) => button.textContent);
+const shownNames = () => cardNodes().map((card) => card.getAttribute("aria-label")?.replace(/, needs you$/, ""));
 const cardOf = (key: string) => {
   const found = cardNodes().find((node) => node.getAttribute("data-card-key") === key);
   if (!(found instanceof HTMLElement)) throw new Error(`no card ${key} on screen`);
@@ -254,60 +255,120 @@ describe("desktop/agent-cards — the dashboard renders what the daemon sent (PR
     expect(cardNodes().filter((node) => node.getAttribute("data-faded") === "true")).toEqual([]);
   });
 
-  /// Scenario: press each card's primary button. The button is the action the daemon named primary (not the first one) and shows its label, with its prompt beneath cut to 60 characters and whole in the hover title; pressing it sends that entry's key and action id; a primary the daemon disabled on a running agent is a disabled button naming the reason and sends nothing; a primary that asks for confirmation opens the overlay's confirm step with the prompt and the pending detail, and sends only from that step, confirmed.
-  it("desktop/agent-cards/003: the primary action sends the daemon's action, shows its prompt, and asks first when it must", async () => {
-    const live = runtime();
-    const first = cardsView(live);
-
-    const zuluPrimary = within(cardOf(ZULU.key)).getByTestId("agent-card-primary");
-    expect(zuluPrimary.textContent).toBe("Merge it");
-    const preview = zuluPrimary.parentElement!.querySelector(".agent-card-prompt")!;
-    expect(preview.textContent).toBe(`${LONG_PROMPT.slice(0, 59)}…`);
-    expect(preview.textContent!.length).toBe(60);
-    expect(preview.getAttribute("title")).toBe(LONG_PROMPT);
-    await act(async () => { fireEvent.click(zuluPrimary); });
-    expect(live.invokeCardAction).toHaveBeenCalledTimes(1);
+  /// Scenario: read a card with a primary action and press its icon-only Close control. The primary action is absent; Close shows the same confirmation and sends the same token as Close in the overlay, while a daemon-disabled Close stays disabled and sends nothing.
+  it("desktop/agent-cards/003: the compact card keeps only Close, with the overlay's confirmation, token and disabled states", async () => {
+    const close = action("close", { label: "Close", kind: "close", prompt: null, source: "deck", placement: "detail", confirm: true, confirm_detail: "This removes the worktree.", token: "close-round-two" });
+    const card = { ...ZULU, actions: [...ZULU.actions.filter((a) => a.id !== "close"), close] };
+    const live = runtime({}, [card]);
+    const view = cardsView(live);
+    expect(within(cardOf(card.key)).queryByRole("button", { name: "Merge it" })).toBeNull();
+    expect(within(cardOf(card.key)).queryByText(LONG_PROMPT)).toBeNull();
+    const closeButton = within(cardOf(card.key)).getByRole("button", { name: /^Close(?: zulu(?:'s agent)?)?$/ });
+    expect(closeButton.textContent).toBe("");
+    expect(closeButton.title).toMatch(/Close/);
+    closeButton.focus();
+    expect(document.activeElement).toBe(closeButton);
+    fireEvent.click(closeButton, { detail: 0 });
+    expect(live.invokeCardAction).not.toHaveBeenCalled();
+    const confirmation = screen.getByRole("alertdialog", { name: "Close?" });
+    expect(confirmation).toHaveTextContent("This closes zulu.");
+    expect(confirmation).toHaveTextContent("This removes the worktree.");
+    await act(async () => { fireEvent.click(within(confirmation).getByRole("button", { name: "Close" })); });
     expect(live.invokeCardAction).toHaveBeenCalledWith(
-      { deckId: FIXTURE_DAEMON_ID, instanceId: INSTANCE, paneId: "pane-31", agentId: "31" },
-      "merge",
-      expect.objectContaining({ requestId: expect.any(String) }),
+      { deckId: FIXTURE_DAEMON_ID, instanceId: INSTANCE, paneId: card.pane_id, agentId: card.agent_id },
+      "close", expect.objectContaining({ confirm: true, actionToken: close.token }),
     );
-    expect(vi.mocked(live.invokeCardAction!).mock.calls[0][2]?.confirm).not.toBe(true);
-    expect(within(cardOf(ZULU.key)).getByTestId("agent-card-result").textContent).toContain("m-contract-1");
 
-    // Disabled by the daemon although the agent is running.
-    const mikePrimary = within(cardOf(MIKE.key)).getByTestId("agent-card-primary");
-    expect(mikePrimary.textContent).toBe("Ship it");
-    expect(mikePrimary).toBeDisabled();
-    expect(within(cardOf(MIKE.key)).getByText("the agent is not running")).toBeInTheDocument();
-    fireEvent.click(mikePrimary);
-    expect(live.invokeCardAction).toHaveBeenCalledTimes(1);
-
-    // A confirm primary: the step first, nothing sent until it is confirmed.
-    const confirmable = entry("36", "oscar", {
-      status: "working",
-      actions: [action("deploy", { label: "Deploy", prompt: "Deploy to staging.", confirm: true, confirm_detail: "Still pending: open pull request #12." }), ...deckActions()],
-      primary_action_id: "deploy",
-    });
-    const second = runtime({}, [confirmable]);
-    first.unmount();
-    cardsView(second);
-    fireEvent.click(within(cardOf(confirmable.key)).getByTestId("agent-card-primary"));
-    expect(second.invokeCardAction).not.toHaveBeenCalled();
-    expect(overlay().getAttribute("data-card-key")).toBe(confirmable.key);
-    const step = screen.getByTestId("agent-card-confirm");
-    expect(step.textContent).toContain("Deploy to staging.");
-    expect(step.textContent).toContain("Still pending: open pull request #12.");
+    // The overlay's Close uses the same definition, rather than another close path.
+    fireEvent.keyDown(overlay(), { key: "Escape" });
+    fireEvent.click(cardOf(card.key));
+    fireEvent.click(within(overlay()).getByTestId("agent-card-action-close"));
     await act(async () => { fireEvent.click(screen.getByTestId("agent-card-confirm-send")); });
-    expect(second.invokeCardAction).toHaveBeenCalledTimes(1);
-    expect(second.invokeCardAction).toHaveBeenCalledWith(expect.objectContaining({ agentId: "36", paneId: "pane-36" }), "deploy", expect.objectContaining({ confirm: true }));
+    expect(vi.mocked(live.invokeCardAction!).mock.calls[1].slice(0, 2)).toEqual(vi.mocked(live.invokeCardAction!).mock.calls[0].slice(0, 2));
+    expect(vi.mocked(live.invokeCardAction!).mock.calls[1][2]).toMatchObject({ confirm: true, actionToken: close.token });
+    view.unmount();
+
+    const disabled = { ...card, actions: [action("close", { ...close, enabled: false, disabled_reason: "agent_stopped" })] };
+    const stopped = runtime({}, [disabled]);
+    cardsView(stopped);
+    const disabledClose = within(cardOf(card.key)).getByRole("button", { name: /^Close(?: zulu(?:'s agent)?)?$/ });
+    expect(disabledClose).toBeDisabled();
+    expect(disabledClose.title).toContain("the agent is not running");
+    fireEvent.click(disabledClose);
+    expect(stopped.invokeCardAction).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("agent-card-overlay")).toBeNull();
+  });
+
+  /// Scenario: open an agent from its table row, then switch to Cards and press its name. Both open the same agent through the shared open-agent action; pressing the card body instead opens its overlay, with no agent navigation and no nested interactive controls.
+  it("desktop/agent-cards/005: a card's name opens the same agent as its table row and its body opens only the overlay", () => {
+    const navigate = vi.fn();
+    const open = vi.spyOn(VOICE_ACTIONS.openAgent, "run");
+    render(<AgentOverview runtime={runtime({}, [ZULU])} onNavigate={navigate} />);
+    const row = screen.getByTestId(`overview-agent-${agentKey({ daemonId: FIXTURE_DAEMON_ID, id: ZULU.agent_id })}`);
+    fireEvent.click(row.querySelector("td:last-child") ?? row);
+    expect(navigate).toHaveBeenCalledTimes(1);
+    const rowView = navigate.mock.calls[0][0];
+    const rowTarget = open.mock.calls[0][1];
+    navigate.mockClear();
+    open.mockClear();
+    fireEvent.click(screen.getByRole("radio", { name: "Cards" }));
+    const card = cardOf(ZULU.key);
+    const name = within(card).getByTestId("agent-card-open-agent");
+    expect(name).toHaveAccessibleName(/zulu/);
+    name.focus();
+    expect(document.activeElement).toBe(name);
+    fireEvent.click(name, { detail: 0 });
+    expect(open).toHaveBeenCalledTimes(1);
+    expect(open.mock.calls[0][1]).toEqual(rowTarget);
+    expect(navigate).toHaveBeenCalledExactlyOnceWith(rowView);
+    expect(screen.queryByTestId("agent-card-overlay")).toBeNull();
+    navigate.mockClear();
+    const details = within(card).getByRole("button", { name: /agent working: show zulu's card/i });
+    details.focus();
+    expect(document.activeElement).toBe(details);
+    fireEvent.click(details, { detail: 0 });
+    expect(screen.getByRole("dialog", { name: "zulu" })).toBeInTheDocument();
+    fireEvent.keyDown(overlay(), { key: "Escape" });
+    fireEvent.click(card);
+    expect(screen.getByRole("dialog", { name: "zulu" })).toBeInTheDocument();
+    expect(navigate).not.toHaveBeenCalled();
+    expect(card.querySelector("button button, button a, a button, [role='button'] button, [role='button'] a")).toBeNull();
+  });
+
+  /// Scenario: open a card whose agent reported a summary and an open question with two options. The reply field is already visible, and the summary, question/options and reply precede fields, other actions and deliveries; typing and sending uses the offered reply action.
+  it("desktop/agent-cards/004: the overlay leads with summary, question, options and a directly visible reply field", async () => {
+    const card: AgentCardEntry = { ...ZULU, recent_deliveries: [{ action_id: "merge", label: "Merge it", text: "Earlier reply", token: "prior-token", outcome: "sent", message_id: "m-prior", state: "delivered", detail: null, at: "2026-11-17T00:00:00Z" }], questions: [{ id: "base", text: "Which base branch?", source: "agent", answered: null, options: [
+      { id: "main", label: "Use main", action_id: "question/base/main" },
+      { id: "release", label: "Use release", action_id: "question/base/release" },
+    ] }], actions: [...ZULU.actions, action("question/base/main", { label: "Use main" }), action("question/base/release", { label: "Use release" })] };
+    const live = runtime({}, [card]);
+    cardsView(live);
+    fireEvent.click(within(cardOf(card.key)).getByTestId("agent-card-details"));
+    const dialog = screen.getByRole("dialog", { name: "zulu" });
+    const summary = within(dialog).getByText(ZULU.report!.summary!);
+    const question = within(dialog).getByText("Which base branch?");
+    const main = within(dialog).getByRole("button", { name: "Use main" });
+    const release = within(dialog).getByRole("button", { name: "Use release" });
+    const reply = within(dialog).getByRole("textbox", { name: "Reply to zulu" });
+    const before = (a: HTMLElement, b: HTMLElement) => expect(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+    before(summary, question);
+    before(question, main);
+    before(main, reply);
+    before(release, reply);
+    before(reply, within(dialog).getByRole("region", { name: "Fields" }));
+    before(reply, within(dialog).getByRole("region", { name: "Actions" }));
+    before(reply, within(dialog).getByRole("region", { name: "Sent from this card" }));
+    expect(live.invokeCardAction).not.toHaveBeenCalled();
+    fireEvent.change(reply, { target: { value: "Use the release branch." } });
+    await act(async () => { fireEvent.click(within(dialog).getByRole("button", { name: "Send reply" })); });
+    expect(live.invokeCardAction).toHaveBeenCalledWith(expect.objectContaining({ agentId: ZULU.agent_id }), "reply", expect.objectContaining({ text: "Use the release branch." }));
   });
 
   /// Scenario: open a card's overlay and move with `]`, `[` and `n` and the buttons. It walks the daemon's display order (wrapping), `n` lands only on daemon-marked cards, the overlay shows every action with its full prompt and the agent-says / deck-checked labels, a new list re-renders the open card in place, a list without its key shows "This agent was closed." while navigation still works, and Escape closes it.
   it("desktop/agent-cards/004: the overlay navigates in display order, updates live, and survives its agent closing", () => {
     const live = runtime();
     const view = cardsView(live);
-    fireEvent.click(within(cardOf(ALPHA.key)).getByTestId("agent-card-show"));
+    fireEvent.click(within(cardOf(ALPHA.key)).getByTestId("agent-card-details"));
     expect(overlay().getAttribute("data-card-key")).toBe(ALPHA.key);
     expect(within(overlay()).getByRole("heading", { level: 2 }).textContent).toBe("alpha");
     expect(within(overlay()).getByText("2 of 5")).toBeInTheDocument();
