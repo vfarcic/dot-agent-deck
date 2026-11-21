@@ -13,7 +13,9 @@
 //! program is not an OpenCode binary (`devbox run oc-big`, `env FOO=1
 //! opencode`) is [`SpawnTarget::Wrapper`]: its version is unknown at spawn,
 //! and its argv is never rewritten. The `opencode` its PATH resolves to is
-//! probed too ([`probe_path_opencode`]), so that once the daemon's watch sees
+//! probed too ([`probe_path_opencode`]), at the spawn, or by the daemon's
+//! watch once the pane's hooks reveal OpenCode when the wrapper declared no
+//! agent (`crate::opencode_mode::probe_owed`), so that once the watch sees
 //! the pane's client run that very file, its version is known
 //! ([`recorded_version`]).
 
