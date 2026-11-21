@@ -15429,10 +15429,10 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 ##### inbox/opencode/018 — Real busy OpenCode shows QUEUED and executes native delegates in order.
 - **Layer:** L2 PTY-attached real agent, lane 2 (`tests/e2e_inbox_opencode_live.rs`).
 - **Agent:** interactive OpenCode 1.x or 2.x (`DOT_AGENT_DECK_OPENCODE_TEST_BIN`), Haiku from `opencode_test_model()`, scratch HOME/XDG and cwd outside the repository; real delegate CLI and branch-installed plugins.
-- **Asserts:** A genuine slow tool followed by a delegate, visible QUEUED (1.x only: 2.x draws no such label), exact append order and acknowledgement.
+- **Asserts:** A genuine slow tool followed by a delegate, visible QUEUED (1.x only: 2.x draws no such label), exact append order and acknowledgement. Precondition: the slow tool ran in the foreground (OpenCode 2's shell tool takes a `background` option that ends the turn at once); a backgrounded call fails as a named setup flake, not as a wrong order.
 - **Does not assert:** Escape cancellation and ack-wait redelivery.
 - **Cost:** cheap real-agent turns, sequential locally with strict preflight.
-- **Red on OpenCode 2.3.2 (2026-11-21, #2446):** the delegate is delivered (the card reads Idle with `✉ delivered`) but never carried out, so `order.txt` holds only `0`; it failed in a batch and alone on a quiet machine, and passes on 2.2.7, the pinned version. Not quarantined: it is green on the version the repository pins, and #2446 blocks the bump to 2.3 (#2299).
+- **Found and fixed (OpenCode 2.3.2, 2026-11-21, #2446):** the test was wrong, not the deck. Asked only to "use the shell", the 2.3.2 model ran the busy command with `background: true`, so the turn ended at once and the delegate arrived on an idle agent. The delegate ran at once and appended `1`, and 30 seconds later the backgrounded command's truncating `printf '0\n' >` overwrote it, which read as a task never carried out. The prompt now asks for the foreground, the busy command appends with `>>` so an early delegate can no longer be erased, and the precondition above names a backgrounded call. Green on 2.3.2 and 2.2.7.
 
 ##### inbox/opencode/019 — A real OpenCode child view returns to the root to execute a delegate.
 - **Layer:** L2 PTY-attached real agent, lane 2 (`tests/e2e_inbox_opencode_live.rs`).
