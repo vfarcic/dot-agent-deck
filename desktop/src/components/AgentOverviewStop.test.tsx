@@ -249,6 +249,22 @@ describe("stopping from the overview (PRD #1223 U4)", () => {
   });
 
   /**
+   * Scenario (Qodo, PR #2437): the deck reports two orchestration roles with no
+   * orchestration id, so the app cannot tell which roles belong together.
+   * Pressing Close on one row offers only Close agent, with the warning that
+   * the other roles keep running, and never a Close orchestration that would
+   * stop that one role alone.
+   */
+  it("offers no whole-orchestration close when the deck reports no orchestration id", () => {
+    const runAction = vi.fn(async (): Promise<DeckActionResult> => ({ ok: true }));
+    const idless = fleetWithOrchestration().map((deck) => ({ ...deck, agents: deck.agents.map((agent) => agent.tab.kind === "orchestration" ? { ...agent, tab: { ...agent.tab, orchestrationId: undefined } } : agent) }));
+    render(<AgentOverview runtime={runtime(runAction, idless)} onNavigate={vi.fn()} />);
+    fireEvent.click(within(row(FIXTURE_REMOTE_DAEMON_ID, "42")).getByTestId("overview-stop-agent"));
+    expect(confirmation()).toHaveTextContent("This closes only this role, leaving the orchestration one role short. Other roles keep running.");
+    expect(within(confirmation()!).getAllByRole("button").map((button) => button.textContent)).toEqual(["Cancel", "Close agent"]);
+  });
+
+  /**
    * Scenario (issue #2436): press Close on a worker's row (builder). The
    * confirmation says Close agent leaves the orchestration one role short and
    * leads with it; Close orchestration is offered beside it. Pressing Close

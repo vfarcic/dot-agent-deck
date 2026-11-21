@@ -925,10 +925,14 @@ export function stopTargetName(agent: OverviewAgent): string {
 /**
  * Issue #2436 — the orchestration `agent` is a role of, as its card on the
  * dashboard lists it, from the agents its deck reports. `undefined` for an
- * agent outside an orchestration.
+ * agent outside an orchestration, and for a role whose deck reported no
+ * `orchestrationId`: `groupAgents` puts such a role in a group of its own, so
+ * its other roles cannot be told apart and "close the orchestration" would
+ * stop this role alone (Qodo, PR #2437). That role's dialog keeps the
+ * single-role warning instead.
  */
 export function orchestrationOf(agent: OverviewAgent, deckAgents: readonly OverviewAgent[]): OverviewGroup | undefined {
-  if (agent.tab.kind !== "orchestration") return undefined;
+  if (agent.tab.kind !== "orchestration" || agent.tab.orchestrationId === undefined) return undefined;
   const key = agentKey(agent);
   return groupAgents([...deckAgents]).find((group) => group.kind === "orchestration" && group.agents.some((member) => agentKey(member) === key));
 }
