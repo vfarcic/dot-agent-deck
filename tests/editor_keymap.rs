@@ -2721,7 +2721,7 @@ fn probe_099_claude_settings_a_parser_could_read_differently_hold() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// Scenario: Judge Claude Code settings documents whose `env` moves where Claude Code reads its configuration (the revcxfix2 review's LOW-1): `CLAUDE_CONFIG_DIR` (which, set there, moved where the pinned 2.1.318 read `keybindings.json` from, measured in a sandbox) and `HOME`, in any case, hold `Unmeasured`; names that only contain them, and a value naming a home folder, pass.
+/// Scenario: Judge Claude Code settings documents whose `env` moves where Claude Code reads its configuration (the revcxfix2 review's LOW-1): `CLAUDE_CONFIG_DIR` (which, set there, moved where the pinned 2.1.318 read `keybindings.json` from, measured in a sandbox), `HOME` and `CLAUDE_CODE_REMOTE_SETTINGS_PATH` (where an internal build caches server-managed settings, issue #2131), in any case, hold `Unmeasured`; names that only contain them, and a value naming a home folder, pass.
 #[spec("inbox/probe/099")]
 #[test]
 fn probe_099_claude_settings_env_moving_its_config_holds() {
@@ -2732,6 +2732,11 @@ fn probe_099_claude_settings_env_moving_its_config_holds() {
         (
             "CLAUDE_CONFIG_DIR",
             r#"{"env": {"CLAUDE_CONFIG_DIR": "/x"}}"#,
+            moved,
+        ),
+        (
+            "CLAUDE_CODE_REMOTE_SETTINGS_PATH",
+            r#"{"env": {"claude_code_remote_settings_path": "/x.json"}}"#,
             moved,
         ),
         ("HOME", r#"{"env": {"A": "1", "HOME": "/x"}}"#, moved),
@@ -2849,6 +2854,122 @@ fn probe_099_claude_settings_env_naming_a_deck_variable_holds() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// Scenario: Judge Claude Code settings documents that configure a policy helper, an executable Claude Code runs as it starts whose output's `env` it applies (issue #2131: with one named by `/etc/claude-code/managed-settings.json`, 2.1.318 and 2.1.330 opened the editor its output named on Ctrl+G, measured in a sandbox). `policyHelper`, `policyHelpers` (a per-system map, or one holding only a static payload) in any case, at the top or nested, hold `Editor`, also beside an `env` with no editor; another helper (`apiKeyHelper`) and the name only in a value pass.
+#[spec("inbox/probe/099")]
+#[test]
+fn probe_099_claude_settings_naming_a_policy_helper_hold() {
+    use dot_agent_deck::composer_probe::keymap::{claude_env_guard, claude_env_member};
+    let editor = Err(Hold::Editor);
+    let mut wrong = Vec::new();
+    for (row, document, want) in [
+        (
+            "policyHelper",
+            r#"{"policyHelper": {"path": "/usr/local/bin/policy"}}"#,
+            editor,
+        ),
+        (
+            "policyHelpers per system",
+            r#"{"policyHelpers": {"linux": {"path": "/usr/local/bin/policy"}}}"#,
+            editor,
+        ),
+        (
+            "a static payload only",
+            r#"{"policyHelpers": {"default": {"model": "x"}}}"#,
+            editor,
+        ),
+        (
+            "beside an env with no editor",
+            r#"{"env": {"A": "1"}, "policyHelper": {"path": "/p"}}"#,
+            editor,
+        ),
+        ("lower case", r#"{"policyhelper": {"path": "/p"}}"#, editor),
+        (
+            "nested",
+            r#"{"x": {"PolicyHelpers": {"linux": {"path": "/p"}}}}"#,
+            editor,
+        ),
+        (
+            "another helper",
+            r#"{"apiKeyHelper": "/bin/key", "env": {"A": "1"}}"#,
+            Ok(()),
+        ),
+        (
+            "only in a value",
+            r#"{"model": "policyHelper", "statusLine": {"command": "policyHelpers"}}"#,
+            Ok(()),
+        ),
+    ] {
+        let read = vec![(
+            PathBuf::from("managed-settings.json"),
+            claude_env_member(document.as_bytes()),
+        )];
+        let got = claude_env_guard(&read);
+        if got != want {
+            wrong.push(format!("{row}: {got:?}, want {want:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Scenario: Judge the server-managed settings Claude Code 2.1.330 caches for an organisation sign-in in `~/.claude/state/hybrid-settings.json`, whose `settings` member is the settings document (issue #2131). An `env` there naming `VISUAL` or a policy helper there holds `Editor`, and an `env` naming `HOME` holds `Unmeasured`; a `settings` that isn't an object, or named twice, holds `Editor`; no `settings`, a `settings` with no `env`, an empty file and an `env` beside `settings` rather than in it (which Claude does not apply) pass.
+#[spec("inbox/probe/099")]
+#[test]
+fn probe_099_claude_organisation_cached_settings_are_read() {
+    use dot_agent_deck::composer_probe::keymap::{claude_env_guard, claude_settings_member_env};
+    let editor = Err(Hold::Editor);
+    let mut wrong = Vec::new();
+    for (row, document, want) in [
+        (
+            "VISUAL in settings' env",
+            r#"{"organizationUuid": "u", "settings": {"env": {"VISUAL": "nvim"}}, "fetchedAt": 1}"#,
+            editor,
+        ),
+        (
+            "a policy helper in settings",
+            r#"{"organizationUuid": "u", "settings": {"policyHelper": {"path": "/p"}}}"#,
+            editor,
+        ),
+        (
+            "HOME in settings' env",
+            r#"{"organizationUuid": "u", "settings": {"env": {"HOME": "/x"}}}"#,
+            Err(Hold::Unmeasured),
+        ),
+        (
+            "settings not an object",
+            r#"{"organizationUuid": "u", "settings": 1}"#,
+            editor,
+        ),
+        (
+            "settings twice",
+            r#"{"settings": {}, "settings": {"env": {"HOME": "/x"}}}"#,
+            editor,
+        ),
+        ("not an object", r#"[1]"#, editor),
+        ("no settings", r#"{"organizationUuid": "u"}"#, Ok(())),
+        (
+            "settings with no env",
+            r#"{"organizationUuid": "u", "settings": {"model": "x", "env": {"A": "1"}}}"#,
+            Ok(()),
+        ),
+        ("empty", "", Ok(())),
+        (
+            "an env beside settings",
+            r#"{"env": {"HOME": "/x"}, "settings": {"model": "x"}}"#,
+            Ok(()),
+        ),
+    ] {
+        let read = vec![(
+            PathBuf::from("hybrid-settings.json"),
+            claude_settings_member_env(document.as_bytes()),
+        )];
+        let got = claude_env_guard(&read);
+        if got != want {
+            wrong.push(format!("{row}: {got:?}, want {want:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// A Claude Code HOME and working directory, each under the private test
 /// base, for [`claude_env_sources`].
 struct ClaudeHome {
@@ -2887,7 +3008,7 @@ impl ClaudeHome {
     }
 }
 
-/// Scenario: Lay out a Claude Code HOME and a working directory inside a git repository on disk, and put `{"env": {"VISUAL": …}}` in each file Claude Code copies an `env` map from, one at a time: the user's `settings.json` and `cowork_settings.json`, the cached server-managed `remote-settings.json`, `~/.claude.json` and its other-endpoint names, the legacy `~/.claude/.config.json`, the working directory's `.claude/settings.json` and `.claude/settings.local.json`, and the repository root's `.claude/settings.local.json`. Each holds `Editor`, and so do a file that can't be read, a directory where a file belongs, a file past the size bound and a symlink to a file naming `VISUAL`; with every file absent, or present with no `env` (server-managed settings as Claude Code caches them included), a dangling symlink included, the box can be checked.
+/// Scenario: Lay out a Claude Code HOME and a working directory inside a git repository on disk, and put `{"env": {"VISUAL": …}}` in each file Claude Code copies an `env` map from, one at a time: the user's `settings.json` and `cowork_settings.json`, the cached server-managed `remote-settings.json`, `~/.claude.json` and its other-endpoint names, the legacy `~/.claude/.config.json`, the working directory's `.claude/settings.json` and `.claude/settings.local.json`, and the repository root's `.claude/settings.local.json`. Each holds `Editor`; so does a policy helper named in `remote-settings.json`, and an `env` naming `HOME` in the `settings` of the organisation sign-in's cached `state/hybrid-settings.json`, under each endpoint's name, holds `Unmeasured` (issue #2131); and so do a file that can't be read, a directory where a file belongs, a file past the size bound and a symlink to a file naming `VISUAL`; with every file absent, or present with no `env` (server-managed settings as Claude Code caches them included), a dangling symlink included, the box can be checked.
 #[spec("inbox/probe/099")]
 #[test]
 fn probe_099_each_file_claude_takes_an_env_from_is_read() {
@@ -2922,6 +3043,40 @@ fn probe_099_each_file_claude_takes_an_env_from_is_read() {
         }
         std::fs::remove_file(&path).unwrap();
     }
+    // The organisation sign-in's cached settings, under each endpoint's name
+    // (issue #2131): the settings document is the file's `settings` member.
+    for suffix in ["", "-custom-oauth", "-staging-oauth", "-local-oauth"] {
+        let path = claude
+            .home
+            .join(format!(".claude/state/hybrid-settings{suffix}.json"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        write(
+            &path,
+            r#"{"organizationUuid": "u", "settings": {"env": {"HOME": "/x"}}}"#,
+        );
+        if claude.judge() != Err(Hold::Unmeasured) {
+            wrong.push(format!("HOME in {} passed", path.display()));
+        }
+        write(
+            &path,
+            r#"{"organizationUuid": "u", "settings": {"env": {"DAD_UNRELATED": "1"}}}"#,
+        );
+        if claude.judge() != Ok(()) {
+            wrong.push(format!("no editor in {} held", path.display()));
+        }
+        std::fs::remove_file(&path).unwrap();
+    }
+    // Server-managed settings naming a policy helper, whose output no file
+    // holds (issue #2131).
+    let remote = claude.home.join(".claude/remote-settings.json");
+    write(
+        &remote,
+        r#"{"policyHelpers": {"linux": {"path": "/usr/local/bin/policy"}}}"#,
+    );
+    if claude.judge() != Err(Hold::Editor) {
+        wrong.push("a policy helper in remote-settings.json passed".into());
+    }
+    std::fs::remove_file(&remote).unwrap();
     let settings = claude.home.join(".claude/settings.json");
     let mut held = |row: &str, judge: Result<(), Hold>| {
         if judge != Err(Hold::Editor) {
@@ -3007,7 +3162,7 @@ fn probe_099_claude_managed_drop_ins_are_read() {
     assert_eq!(judge(), Err(Hold::Editor), "more drop-ins than the bound");
 }
 
-/// Scenario: Ask where Claude Code takes `env` maps from for environments and launches the deck can't follow: a `CLAUDE_CONFIG_DIR`, no `HOME` and a relative working directory are `Unmeasured`; `--settings` and `--project-config-root`, separate or with `=`, are found on the launch's arguments, and other arguments are not.
+/// Scenario: Ask where Claude Code takes `env` maps from for environments and launches the deck can't follow: a `CLAUDE_CONFIG_DIR`, no `HOME`, a `CLAUDE_CODE_REMOTE_SETTINGS_PATH` (empty included) and a relative working directory are `Unmeasured`; `--settings` and `--project-config-root`, separate or with `=`, are found on the launch's arguments, and other arguments are not.
 #[spec("inbox/probe/099")]
 #[test]
 fn probe_099_claude_env_sources_it_cannot_follow() {
@@ -3025,6 +3180,16 @@ fn probe_099_claude_env_sources_it_cannot_follow() {
     assert_eq!(
         claude_env_sources(|_: &str| None, Path::new("/w")).err(),
         Some(Hold::Unmeasured)
+    );
+    let remote_moved = |name: &str| match name {
+        "HOME" => Some(OsString::from("/home/u")),
+        "CLAUDE_CODE_REMOTE_SETTINGS_PATH" => Some(OsString::new()),
+        _ => None,
+    };
+    assert_eq!(
+        claude_env_sources(remote_moved, Path::new("/w")).err(),
+        Some(Hold::Unmeasured),
+        "CLAUDE_CODE_REMOTE_SETTINGS_PATH, empty included"
     );
     assert_eq!(
         claude_env_sources(home, Path::new("w")).err(),
