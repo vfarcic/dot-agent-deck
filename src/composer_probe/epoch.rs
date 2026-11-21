@@ -2022,6 +2022,17 @@ impl GenerationInput {
         }
     }
 
+    /// Admission refused a due attempt at `now` only because the query-wait
+    /// estimate `until` is still ahead
+    /// ([`super::probe::Schedule::estimate`], #2129): the next is due at
+    /// `until`, and only every [`super::probe::ESTIMATE_PER_FAILURE`]th in a
+    /// row is a failure.
+    pub fn probe_estimate(&self, now: Instant, until: Instant) {
+        if let Some(live) = self.state.lock_recovering().live.as_mut() {
+            live.schedule.estimate(now, until);
+        }
+    }
+
     /// The writer refused a due attempt at `now` only because the screen
     /// moved since its scheduling ([`super::probe::Schedule::moved`]): a
     /// failure only for every [`super::probe::MOVED_PER_FAILURE`]th in a

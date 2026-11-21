@@ -415,20 +415,44 @@ impl Default for DashboardConfig {
 
 impl DashboardConfig {
     pub fn load() -> Self {
-        let path = config_path();
-        match std::fs::read_to_string(&path) {
+        let (config, warning) = Self::load_reporting_from(&config_path());
+        if let Some(warning) = warning {
+            eprintln!("{warning}");
+        }
+        config
+    }
+
+    /// [`Self::load`] from `path`, returning the line it prints on stderr
+    /// instead of printing it: a file that does not parse, or one that cannot
+    /// be read. Either way the config is [`Self::default`].
+    ///
+    /// Issue #2156 item 2: a `config.toml`, or a folder above it, that is a
+    /// link whose target is missing is a file that cannot be read, not an
+    /// absent one, decided as [`read_dashboard_config_bounded`] decides it.
+    /// So `config get` says so on stderr where it used to print the default
+    /// silently while the daemon held the doorbell off.
+    fn load_reporting_from(path: &Path) -> (Self, Option<String>) {
+        let unreadable = |reason: &dyn std::fmt::Display| {
+            Some(format!(
+                "Failed to read config at {}: {reason}",
+                path.display()
+            ))
+        };
+        match std::fs::read_to_string(path) {
             Ok(contents) => match toml::from_str(&contents) {
-                Ok(config) => config,
-                Err(err) => {
-                    eprintln!("Invalid config at {}: {err}", path.display());
-                    Self::default()
-                }
+                Ok(config) => (config, None),
+                Err(err) => (
+                    Self::default(),
+                    Some(format!("Invalid config at {}: {err}", path.display())),
+                ),
             },
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Self::default(),
-            Err(err) => {
-                eprintln!("Failed to read config at {}: {err}", path.display());
-                Self::default()
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                match config_not_found_verdict(path) {
+                    Ok(()) => (Self::default(), None),
+                    Err(reason) => (Self::default(), unreadable(&reason)),
+                }
             }
+            Err(err) => (Self::default(), unreadable(&err)),
         }
     }
 
@@ -776,8 +800,7 @@ fn read_dashboard_config_bounded(path: &Path) -> Result<Option<String>, String> 
     let file = match options.open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return after_open_not_found(std::fs::symlink_metadata(path).map(|m| m.file_type()))
-                .and_then(|_| missing_config_folder_verdict(path));
+            return config_not_found_verdict(path).map(|()| None);
         }
         Err(e) => return Err(format!("open failed: {e}")),
     };
@@ -791,6 +814,19 @@ fn read_dashboard_config_bounded(path: &Path) -> Result<Option<String>, String> 
         ));
     }
     crate::bounded_read::read_capped(file, MAX_DASHBOARD_CONFIG_BYTES, "config file").map(Some)
+}
+
+/// Whether an open or read of the config at `path` that failed with `NotFound`
+/// found an absent config (`Ok`), or one that is there but cannot be read
+/// (`Err`, with a short reason): [`after_open_not_found`] on the path itself,
+/// then [`missing_config_folder_verdict`] on the folders above it. Shared by
+/// [`read_dashboard_config_bounded`] and [`DashboardConfig::load`], so the
+/// daemon and `config get` tell a first run from a dangling link the same way
+/// (issue #2156).
+fn config_not_found_verdict(path: &Path) -> Result<(), String> {
+    after_open_not_found(std::fs::symlink_metadata(path).map(|m| m.file_type()))
+        .and_then(|_| missing_config_folder_verdict(path))
+        .map(|_| ())
 }
 
 /// [`read_dashboard_config_bounded`]'s verdict once the open failed with
@@ -4007,6 +4043,111 @@ answer = 42
                 .is_symlink()
         );
         assert!(!dir.path().join("unmounted").exists());
+    }
+
+    /// Issue #2156 item 2: `config get` (and every other [`DashboardConfig::load`]
+    /// caller) says a config it cannot read through a link whose target is
+    /// missing — at `config.toml` or at a folder above it — rather than
+    /// printing the default silently while the daemon's bounded read holds the
+    /// doorbell off. Both readers agree on every case: a missing file in a
+    /// real folder, and a missing folder below a real one (a first run), are
+    /// absent to both and warned of by neither.
+    #[cfg(unix)]
+    #[test]
+    fn a_config_load_says_a_dangling_link_cannot_be_read_as_the_daemon_does() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let file_link = dir.path().join("file-link.toml");
+        std::os::unix::fs::symlink(dir.path().join("gone/config.toml"), &file_link).unwrap();
+        let folder = dir.path().join("folder-link");
+        std::os::unix::fs::symlink(dir.path().join("unmounted"), &folder).unwrap();
+        let through_folder = folder.join("config.toml");
+
+        for (path, reason) in [
+            (
+                file_link.clone(),
+                "it is a link whose target is missing".to_string(),
+            ),
+            (
+                through_folder.clone(),
+                format!(
+                    "the folder {} is a link whose target is missing",
+                    folder.display()
+                ),
+            ),
+        ] {
+            let (config, warning) = DashboardConfig::load_reporting_from(&path);
+            assert_eq!(
+                warning,
+                Some(format!(
+                    "Failed to read config at {}: {reason}",
+                    path.display()
+                ))
+            );
+            assert_eq!(config.get_field("doorbell.claude").unwrap(), "true");
+            assert_eq!(
+                DashboardConfig::load_bounded_status_from(&path).file,
+                ConfigFile::Failed,
+                "{}",
+                path.display()
+            );
+        }
+
+        for absent in [
+            dir.path().join("config.toml"),
+            dir.path().join("first-run/dot-agent-deck/config.toml"),
+        ] {
+            assert_eq!(
+                DashboardConfig::load_reporting_from(&absent).1,
+                None,
+                "{}",
+                absent.display()
+            );
+            assert_eq!(
+                DashboardConfig::load_bounded_status_from(&absent).file,
+                ConfigFile::Absent
+            );
+        }
+
+        // A file that does not parse is still reported as before.
+        let invalid = dir.path().join("invalid.toml");
+        std::fs::write(&invalid, "not = = toml").unwrap();
+        let warning = DashboardConfig::load_reporting_from(&invalid).1.unwrap();
+        assert!(warning.starts_with("Invalid config at "), "{warning}");
+    }
+
+    /// Issue #2156 item 3, the gap as it stands: a mount point whose volume
+    /// is not mounted is a real, empty folder, which is what a test without
+    /// root can stage. Both readers take it for a first run and `config set`
+    /// writes the defaults plus the key into it, where the mounted volume
+    /// will hide it. Comparing the folder's device with its parent's does not
+    /// tell it apart: it is the same device while nothing is mounted, as for
+    /// any ordinary folder; only a mounted volume shows a different one.
+    #[cfg(unix)]
+    #[test]
+    fn an_unmounted_mount_point_reads_and_saves_as_a_first_run() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = crate::test_temp::tempdir().unwrap();
+        let mount_point = dir.path().join("dot-agent-deck");
+        std::fs::create_dir(&mount_point).unwrap();
+        let path = mount_point.join("config.toml");
+
+        assert_eq!(DashboardConfig::load_reporting_from(&path).1, None);
+        assert_eq!(
+            DashboardConfig::load_bounded_status_from(&path).file,
+            ConfigFile::Absent
+        );
+        assert_eq!(
+            std::fs::metadata(&mount_point).unwrap().dev(),
+            std::fs::metadata(dir.path()).unwrap().dev(),
+            "an unmounted mount point is on its parent's device"
+        );
+
+        let mut config = DashboardConfig::default();
+        config.set_field("doorbell.claude", "false").unwrap();
+        config.save_to(&path).unwrap();
+        let written = DashboardConfig::load_reporting_from(&path).0;
+        assert_eq!(written.get_field("doorbell.claude").unwrap(), "false");
+        assert_eq!(written.get_field("doorbell.codex").unwrap(), "true");
     }
 
     /// The pure trust rule the ancestor walk stops on (issue #577). Split out
