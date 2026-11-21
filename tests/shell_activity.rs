@@ -1122,6 +1122,7 @@ fn status_waiting_017_the_watch_names_only_a_known_opencode_2s_own_server() {
         agent_id: "agent-p".to_string(),
         root_pid: 100,
         spawn_version,
+        spawn_probe: dot_agent_deck::opencode_mode::SpawnProbe::Done,
     };
     let unprobed = |_: &Path| None;
     let identify = |rows: &[ProcRow], spawn_version| {
@@ -1339,6 +1340,7 @@ fn status_waiting_018_a_replacement_client_does_not_inherit_the_spawns_version()
         agent_id: "agent-p".to_string(),
         root_pid: 100,
         spawn_version: Some((2, 2, 5)),
+        spawn_probe: dot_agent_deck::opencode_mode::SpawnProbe::Done,
     }];
     // Only the 1.x binary has a recorded version of its own; the 2.x client's
     // is known from the spawn, and `UNPROBED` from nothing.

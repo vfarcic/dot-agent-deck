@@ -42,6 +42,60 @@ pub fn sleep_tool_visible(screen: &str) -> bool {
     })
 }
 
+/// What OpenCode 2.3 draws for a running foreground shell at its default
+/// transcript verbosity (`low`, the default since 2.3.0), measured on 2.3.2
+/// (issue #2445): a spinner row, `⠇ Running command…`, and under it the hint
+/// [`FOREGROUND_WORK_HINT`]; no `$ <command>` heading. The command is named
+/// only once it ends (`↳ Shell finished · <command>`).
+pub const RUNNING_COMMAND: &str = "Running command…";
+
+/// The hint OpenCode 2.3 draws under a running foreground command.
+pub const FOREGROUND_WORK_HINT: &str = "Press ctrl+b to move running work to the background";
+
+/// Whether `screen` shows OpenCode 2.3's running foreground command: a row
+/// that is a braille spinner and [`RUNNING_COMMAND`] alone (in a pane, or in
+/// an attached deck's row, whose borders are ignored), and the whole
+/// [`FOREGROUND_WORK_HINT`]. It names no command, so a caller pairs it with
+/// the transcript's running call.
+pub fn foreground_command_visible(screen: &str) -> bool {
+    let running = screen.lines().any(|line| {
+        let Some((before, after)) = line.rsplit_once(RUNNING_COMMAND) else {
+            return false;
+        };
+        after
+            .trim_matches(|c: char| c.is_whitespace() || c == '│')
+            .is_empty()
+            && before
+                .trim_end()
+                .chars()
+                .next_back()
+                .is_some_and(|marker| ('\u{2801}'..='\u{28ff}').contains(&marker))
+    });
+    running && screen.contains(FOREGROUND_WORK_HINT)
+}
+
+/// Scenario: Read OpenCode 2.3's running foreground command, a spinner row reading Running command… over the ctrl+b hint, in an independent pane and in an attached deck row. Either row alone, the row without its spinner, more text on it, or a hint cut short must not count.
+#[test]
+fn running_foreground_command_needs_its_spinner_row_and_whole_hint() {
+    let pane = "     I'll run sleep 30 in the foreground as requested.\n\n     ⠇ Running command…\n\n     Press ctrl+b to move running work to the background\n";
+    assert!(foreground_command_visible(pane));
+    let deck = "┃Prmt: Run sleep 30 once…┃│     ⠇ Running command…            │\n┃  bash — sleep 30        ┃│     Press ctrl+b to move running work to the background   │\n";
+    assert!(foreground_command_visible(deck));
+    assert!(!foreground_command_visible("     ⠇ Running command…\n"));
+    assert!(!foreground_command_visible(
+        "     Press ctrl+b to move running work to the background\n"
+    ));
+    assert!(!foreground_command_visible(
+        &pane.replace("⠇ Running", "Running")
+    ));
+    assert!(!foreground_command_visible(
+        &pane.replace("Running command…", "Running command… sleep 300")
+    ));
+    assert!(!foreground_command_visible(
+        &pane.replace("the background", "the backgro…")
+    ));
+}
+
 /// Scenario: Read the real OpenCode tool heading while bash runs sleep 30, with a spinner in place of its dollar sign, in both an independent pane and an attached deck row. The priming prompt, other commands and longer sleep commands must not count as the visible tool.
 #[test]
 fn running_sleep_heading_is_distinct_from_the_priming_prompt() {

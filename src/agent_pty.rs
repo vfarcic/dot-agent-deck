@@ -20136,11 +20136,27 @@ impl AgentPtyRegistry {
                 if !opencode_spawn(declared, agent.spawn_command.as_deref()) {
                     return None;
                 }
+                // Issue #2445: the spawn probed only when it already knew it
+                // started OpenCode (the same test as the spawn site's, on the
+                // type the spawn declared); a type a hook revealed later
+                // leaves that probe owed, with the PATH the spawn handed the
+                // pane.
+                let spawn_probe = if opencode_spawn(
+                    agent.spawn_agent_type.as_ref(),
+                    agent.spawn_command.as_deref(),
+                ) {
+                    crate::opencode_mode::SpawnProbe::Done
+                } else {
+                    crate::opencode_mode::SpawnProbe::Owed {
+                        path: overlay_value(&agent.spawn_env, "PATH").map(Into::into),
+                    }
+                };
                 Some(crate::opencode_mode::Watched {
                     pane_id: agent.pane_id_env.clone()?,
                     agent_id: agent_id.clone(),
                     root_pid: i32::try_from(agent.child.process_id()?).ok()?,
                     spawn_version: agent.opencode_spawn_version,
+                    spawn_probe,
                 })
             })
             .collect()
@@ -23669,6 +23685,46 @@ mod spawn_tests {
             assert!(matches!(err, AgentPtyError::Resize(_)));
         }
         registry.shutdown_all();
+    }
+
+    /// Scenario: a pane started by an undeclared wrapper is not watched as
+    /// OpenCode until its own hooks reveal OpenCode; from then it is, and
+    /// carries the probe its spawn did not run, with the PATH the spawn handed
+    /// it, so the watch can learn its client's version (issue #2445).
+    #[test]
+    fn a_hook_revealed_opencode_wrapper_is_watched_with_its_probe_owed() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("sh -c 'exec cat'"),
+                env: vec![
+                    (
+                        DOT_AGENT_DECK_PANE_ID.to_string(),
+                        "pane-wrapper".to_string(),
+                    ),
+                    ("PATH".to_string(), "/pane/bin:/usr/bin:/bin".to_string()),
+                ],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the wrapper-shaped pane");
+        assert!(
+            registry.opencode_watch_list().is_empty(),
+            "an undeclared wrapper is not known to run OpenCode yet"
+        );
+        registry.set_agent_type("pane-wrapper", &AgentType::OpenCode);
+        let watched = registry.opencode_watch_list();
+        assert_eq!(watched.len(), 1, "{watched:?}");
+        assert_eq!(watched[0].agent_id, agent);
+        assert_eq!(watched[0].pane_id, "pane-wrapper");
+        assert_eq!(watched[0].spawn_version, None);
+        assert_eq!(
+            watched[0].spawn_probe,
+            crate::opencode_mode::SpawnProbe::Owed {
+                path: Some("/pane/bin:/usr/bin:/bin".into())
+            },
+            "the spawn probed nothing, so the watch owes the probe on its PATH"
+        );
+        registry.close_agent(&agent).expect("close the pane");
     }
 
     /// Issue #1602: the registry keeps the command a pane was CONFIGURED with —
