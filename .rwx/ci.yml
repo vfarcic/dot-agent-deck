@@ -562,6 +562,12 @@ tasks:
     if: ${{ tasks.backend.values.nix == 'true' }}
     use: [code, nix-install]
     tool-cache: ci-nix-v1
+    # RWX's default task timeout is 10 minutes, as for `test` above. Run
+    # 01a1faaa88ed7f05 (PR #2434) spent 6.5 minutes building the dependency
+    # derivation and was killed at 10 minutes in the release build that
+    # follows it. 30m leaves room for a run that builds both, while still
+    # bounding a wedged run.
+    timeout: 30m
     env:
       NIX_CONFIG: experimental-features = nix-command flakes
     run: nix flake check -L --all-systems
