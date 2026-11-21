@@ -416,7 +416,9 @@ pub struct DoorbellFacts {
     /// Live waiters armed for the agent.
     pub armed: usize,
     /// When the agent's component last announced `Native` wake-up, if that is
-    /// what it announced.
+    /// what it announced, or, if later, when a once-waiter of it was last
+    /// issued a batch: that waiter's wake is on its way, and a ring typed
+    /// while Claude takes it up is left in its composer (issue #2133).
     pub native_announced_at: Option<Instant>,
     /// PRD #1666 §11: the generation's integration is incompatible, so its
     /// doorbell stays silent: no fetch could hand it anything.
@@ -528,6 +530,10 @@ struct HubState {
     /// Oldest first, so the newest is `last()`.
     waiters: HashMap<AgentKey, Vec<Waiter>>,
     announced: HashMap<AgentKey, Announcement>,
+    /// Issue #2133: when a once-waiter of the generation was last issued a
+    /// batch. Its wake is on its way, so it holds the doorbell for the arm
+    /// grace as an announcement does ([`DoorbellFacts::native_announced_at`]).
+    waiter_spent: HashMap<AgentKey, Instant>,
     /// Audit F3: each agent generation's native receiver — the component
     /// process that first armed or announced for it ([`InboxHub::arm`]), or
     /// the Claude Code background session that conversation moved to (issue
@@ -927,6 +933,7 @@ impl InboxHub {
                 inbox: Inbox::new(deck, limits),
                 waiters: HashMap::new(),
                 announced: HashMap::new(),
+                waiter_spent: HashMap::new(),
                 receivers: HashMap::new(),
                 next_conn: 1,
                 broadcast: None,
@@ -2209,6 +2216,7 @@ impl InboxHub {
             }
         }
         st.announced.remove(&key);
+        st.waiter_spent.remove(&key);
         st.receivers.remove(&key);
         st.rings.remove(&key);
         st.agent_notices.remove(&key);
@@ -2535,7 +2543,8 @@ impl InboxHub {
                 .announced
                 .get(&key)
                 .filter(|a| a.wake == InboxWake::Native)
-                .map(|a| a.at),
+                .map(|a| a.at)
+                .max(st.waiter_spent.get(&key).copied()),
             blocked: st.receipts.blocked(&key),
         }
     }
@@ -3052,6 +3061,10 @@ pub struct ReceiptArm {
     /// when this is the pinned receiver's origin
     /// ([`HubState::admit_receiver`]).
     pub background_origin: Option<u32>,
+    /// Issue #2133: a once-waiter armed by a compaction's `SessionStart`
+    /// (its wait names the `compact` source), which can come in the middle
+    /// of a turn.
+    pub compaction: bool,
 }
 
 /// PRD #1666 §13 step 4: whether `component`'s streams are owned by the
@@ -4029,6 +4042,7 @@ async fn serve_once<R, W>(
     component: InboxComponent,
     instance: Option<u32>,
     background_origin: Option<u32>,
+    compaction: bool,
     reader: R,
     mut writer: W,
 ) where
@@ -4069,6 +4083,9 @@ async fn serve_once<R, W>(
                     spool,
                     now,
                 );
+                if compaction {
+                    engine::mark_compaction(&mut st, &key, first.as_ref());
+                }
                 st.waiters.entry(key.clone()).or_default().push(Waiter {
                     conn_id,
                     component,
@@ -6664,6 +6681,7 @@ pub async fn serve_waiter<R, W, P>(
                     component,
                     instance,
                     arm.background_origin,
+                    arm.compaction,
                     reader,
                     writer,
                 )
@@ -7385,6 +7403,107 @@ mod tests {
         );
         older.close().await;
         newer.close().await;
+    }
+
+    /// Issue #2133: a once waiter armed at the last Idle is not handed a
+    /// message posted once a turn has started, even by a clock tick, and
+    /// stays armed with the message still queued, also after the turn ends;
+    /// the clock wakes no later than the hold's end. The waiter armed when
+    /// the turn ends supersedes it and is handed the batch, and the spent
+    /// waiter then holds the doorbell for the arm grace from that moment.
+    #[tokio::test]
+    async fn a_waiter_armed_before_the_turn_is_held_for_the_one_armed_after_it() {
+        use crate::agent_pty::{TurnEdge, TurnSeen};
+        let hub = Arc::new(hub());
+        let (mut older, armed) = OnceWaiter::open(&hub, "p", "a", None).await;
+        assert!(armed.registered.is_some());
+        let started = Instant::now();
+        let edge = |seq, edge| TurnSeen { seq, edge };
+        hub.note_turn("p", "a", edge(1, TurnEdge::Started), started);
+        let id = hub
+            .post_direct(Recipient::bound("p", "a"), content("mid-turn"))
+            .unwrap()
+            .to_string();
+        hub.tick();
+        let quiet = Duration::from_millis(300);
+        assert!(
+            tokio::time::timeout(quiet, older.lines.next_line())
+                .await
+                .is_err(),
+            "nothing goes to the older waiter while the turn is under way"
+        );
+        let facts = hub.doorbell_facts("p", "a");
+        assert_eq!((facts.armed, facts.queued), (1, vec![id.clone()]));
+        assert!(
+            hub.clock_deadline().is_some_and(
+                |at| at > Instant::now() && at <= started + crate::inbox::DEFAULT_ACK_WAIT
+            ),
+            "the clock wakes no later than the hold's end"
+        );
+        hub.note_turn("p", "a", edge(2, TurnEdge::Ended), Instant::now());
+        hub.tick();
+        assert!(
+            tokio::time::timeout(quiet, older.lines.next_line())
+                .await
+                .is_err(),
+            "nor once the turn is over: it was armed before the turn"
+        );
+        let before_spend = Instant::now();
+        let (mut newer, armed) = OnceWaiter::open(&hub, "p", "a", None).await;
+        assert!(armed.registered.is_some());
+        assert!(older.next().await.is_some_and(|reply| reply.superseded));
+        let batch = newer.next().await.and_then(|reply| reply.messages);
+        let batch = batch.expect("the waiter armed after the turn takes the batch");
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].id, id);
+        let facts = hub.doorbell_facts("p", "a");
+        assert_eq!(facts.armed, 0, "spent by its batch");
+        assert!(
+            facts
+                .native_announced_at
+                .is_some_and(|at| at >= before_spend),
+            "the spend holds the doorbell for the arm grace: {facts:?}"
+        );
+        older.close().await;
+        newer.close().await;
+    }
+
+    /// Issue #2133: the hold lasts one ack-wait from the turn's start, so
+    /// when no newer waiter arms, the older one is handed the batch by the
+    /// clock once the hold runs out.
+    #[tokio::test]
+    async fn a_waiter_armed_before_the_turn_is_handed_its_batch_once_the_hold_runs_out() {
+        use crate::agent_pty::{TurnEdge, TurnSeen};
+        let ack_wait = Duration::from_millis(200);
+        let limits = InboxLimits {
+            ack_wait,
+            ..InboxLimits::default()
+        };
+        let hub = Arc::new(InboxHub::new(deck(), limits, DEFAULT_KEEPALIVE));
+        let (mut waiter, armed) = OnceWaiter::open(&hub, "p", "a", None).await;
+        assert!(armed.registered.is_some());
+        let started = Instant::now();
+        let seen = TurnSeen {
+            seq: 1,
+            edge: TurnEdge::Started,
+        };
+        hub.note_turn("p", "a", seen, started);
+        let id = hub
+            .post_direct(Recipient::bound("p", "a"), content("late"))
+            .unwrap()
+            .to_string();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), waiter.lines.next_line())
+                .await
+                .is_err(),
+            "held inside the hold"
+        );
+        tokio::time::sleep((started + ack_wait).saturating_duration_since(Instant::now())).await;
+        hub.tick();
+        let batch = waiter.next().await.and_then(|reply| reply.messages);
+        let batch = batch.expect("past the hold, the older waiter is handed the batch");
+        assert_eq!(batch[0].id, id);
+        waiter.close().await;
     }
 
     /// PR #1735 fifth review (N1), part 2 §1.3: Claude's prompt hook commits
