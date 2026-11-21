@@ -51,6 +51,7 @@ fn hold_answer(registry: &AgentPtyRegistry, id: &str, bytes: &[u8]) {
             question_id: "q".into(),
             revision: None,
             reservation: None,
+            screen: None,
             pause: None,
         },
         reply,

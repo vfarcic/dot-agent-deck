@@ -288,6 +288,7 @@ mod tests {
             blocked: None,
             hook_generation: None,
             delivery_notice: None,
+            status_reason: None,
             pending_question: None,
             pull_request: None,
             pull_request_revision: None,

@@ -1,0 +1,20 @@
+# Fixture for the live OpenCode compaction re-assert (orchestration/remit/014,
+# tests/e2e_orchestration_remit_live.rs, PRD #82 M2/M4). The orchestrator is a
+# REAL interactive OpenCode on the test model; the test writes
+# `run-orchestrator.sh` at run time, because the command line differs between
+# OpenCode 1.x and 2.x (`common::opencode_interactive_command`). Its role text
+# makes every read of its role file one line in a sentinel file. The worker is
+# a `cat` stub: nothing is delegated.
+[[orchestrations]]
+name = "remit-compaction-opencode"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "./run-orchestrator.sh"
+agent = "opencode"
+start = true
+prompt_template = "This orchestration keeps a read log for the deck while it checks that coordinators keep their role, and that log is all the work there is, so there is nothing to delegate and no work-done to send. Each time you read this role file, including when the deck asks you to read it again later, record the read by running this command once with the shell: echo REMIT-READ >> remit_reads_82_5c1e.txt and then reply REMIT-ACK- followed immediately by 82-5c1e with no space, and wait. Create or edit no other file."
+
+[[orchestrations.roles]]
+name = "worker"
+command = "cat"

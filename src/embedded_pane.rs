@@ -803,6 +803,15 @@ pub struct EmbeddedPaneController {
     /// costs one already-clear sweep and never a missed dismissal. Both writers
     /// run on the TUI thread, so the swap-then-sweep cannot lose an arm.
     any_scroll_notice_armed: Arc<AtomicBool>,
+    /// PRD #82: per start-role pane, the question
+    /// [`PaneController::daemon_rearm_file`] has out to the daemon: `None`
+    /// while it is unanswered, then the answer until the render thread
+    /// collects it, with when it arrived: one left uncollected longer than
+    /// [`DAEMON_REARM_FILE_TIMEOUT`] is dropped and asked again, so a later
+    /// compaction never acts on an earlier one's answer.
+    #[allow(clippy::type_complexity)]
+    rearm_file_questions:
+        Arc<Mutex<HashMap<String, Option<(crate::pane::DaemonRearmFile, std::time::Instant)>>>>,
 }
 
 /// Issue #1540 — what the attached daemon said about the New agent form's
@@ -873,6 +882,11 @@ impl LastCommandReader {
 /// PRD #1885: the bound on one trust-state or approval request. The daemon
 /// reads one project config through its bounded reader for either.
 const TRUST_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// PRD #82: how long [`PaneController::daemon_rearm_file`] waits for the
+/// daemon to name the context file it re-arms a coordinator from, off the
+/// render thread, before it counts the daemon as not re-arming.
+const DAEMON_REARM_FILE_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub type HostMetricsAnswer = Result<crate::daemon_client::HostMetricsReport, String>;
 
@@ -1155,6 +1169,7 @@ impl EmbeddedPaneController {
             rename_refusals: Arc::new(Mutex::new(Vec::new())),
             rename_baselines: Arc::new(Mutex::new(HashMap::new())),
             any_scroll_notice_armed: Arc::new(AtomicBool::new(false)),
+            rearm_file_questions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -5613,6 +5628,58 @@ impl PaneController for EmbeddedPaneController {
             let client = client.bound_to_current().await?;
             client.deny_trust_request(id, &digest).await
         })
+    }
+
+    fn daemon_rearm_file(&self, pane_id: &str) -> crate::pane::DaemonRearmFile {
+        use crate::pane::DaemonRearmFile;
+        let client = self.held_client(&BoundPane::held_by_controller(pane_id));
+        if !client
+            .cached_capabilities()
+            .is_some_and(|caps| caps.supports(crate::daemon_protocol::CAP_REARM_ORCHESTRATOR))
+        {
+            return DaemonRearmFile::NotDaemon;
+        }
+        let mut questions = self
+            .rearm_file_questions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match questions.get(pane_id) {
+            Some(None) => return DaemonRearmFile::Asking,
+            Some(Some((_, at))) if at.elapsed() <= DAEMON_REARM_FILE_TIMEOUT => {
+                return questions
+                    .remove(pane_id)
+                    .flatten()
+                    .map_or(DaemonRearmFile::NotDaemon, |(answer, _)| answer);
+            }
+            Some(Some(_)) | None => {}
+        }
+        questions.insert(pane_id.to_string(), None);
+        drop(questions);
+        let questions = self.rearm_file_questions.clone();
+        let pane = pane_id.to_string();
+        // A daemon that does not answer in time counts as not re-arming, so the
+        // TUI re-arms instead.
+        drop(self.runtime.spawn(async move {
+            let listed =
+                tokio::time::timeout(DAEMON_REARM_FILE_TIMEOUT, client.list_agents()).await;
+            let answer = listed
+                .ok()
+                .and_then(Result::ok)
+                .and_then(|records| {
+                    records
+                        .into_iter()
+                        .find(|record| record.pane_id_env.as_deref() == Some(pane.as_str()))
+                })
+                .and_then(|record| record.orchestrator_context_path)
+                .map_or(DaemonRearmFile::NotDaemon, |path| {
+                    DaemonRearmFile::File(std::path::PathBuf::from(path))
+                });
+            questions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(pane, Some((answer, std::time::Instant::now())));
+        }));
+        DaemonRearmFile::Asking
     }
 
     fn report_orchestrator_context(&self, pane_id: &str, context_path: &std::path::Path) {

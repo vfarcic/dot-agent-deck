@@ -13,7 +13,7 @@
 //! keystrokes through the TUI, which has key handling of its own.
 //!
 //! Claude Code on Haiku has a test per key, asserted against its framed input
-//! row. Codex and OpenCode (each on its cheap test model) have one test each
+//! row. Codex, OpenCode and Antigravity (each on its cheap test model) have one test each
 //! that runs all three keys in one session, asserted on the whole pane, since
 //! their input boxes are drawn differently. Pi is not covered — see the
 //! catalog's `prompt/voice-keys` section for why.
@@ -23,6 +23,8 @@
 //! OpenCode, Codex and Pi delivering each turn only once.
 
 dot_agent_deck_test_harness::link!();
+#[path = "support/antigravity_live.rs"]
+mod antigravity;
 
 use std::time::{Duration, Instant};
 
@@ -124,6 +126,38 @@ impl PaneWriter {
         self.input
             .write_steps(chunks.iter().map(|chunk| (chunk.as_str(), between)));
         writes
+    }
+
+    /// Scratch the dictated characters with the same cap and pause the
+    /// desktop reads from the daemon. Agents without pacing keep one write.
+    fn delete_chars(&mut self, keys: &PromptKeys, presses: usize) {
+        if presses == 0 {
+            return;
+        }
+        let per_write = keys
+            .delete_char
+            .max_presses_per_write
+            .map_or(presses, |cap| cap as usize)
+            .max(1);
+        let mut chunks = Vec::new();
+        let mut left = presses;
+        while left > 0 {
+            let now = left.min(per_write);
+            chunks.push(keys.delete_char.bytes.repeat(now));
+            left -= now;
+        }
+        let between = Duration::from_millis(u64::from(
+            keys.delete_char.pause_between_writes_ms.unwrap_or(0),
+        ));
+        self.input
+            .write_steps(chunks.iter().enumerate().map(|(index, chunk)| {
+                let pause = if index + 1 < chunks.len() {
+                    between
+                } else {
+                    Duration::ZERO
+                };
+                (chunk.as_str(), pause)
+            }));
     }
 }
 
@@ -396,7 +430,7 @@ fn exercise_reading_reply(
     assert_running(deck, agent_id, "the completed reading turn");
 }
 
-/// Scenario: Open a real interactive OpenCode pane on the cheap test model with a uniquely named sentinel file and subscribe before asking it to discover the filename. Its successful final reply must contain the sentinel, appear in the attached pane, and arrive exactly once during a five-second duplicate-delivery check.
+/// Scenario: Open a real interactive OpenCode pane on the cheap test model with a uniquely named sentinel file, wait for its submit-ready mode line, and subscribe before asking it to discover the filename. Its successful final reply must contain the sentinel, appear in the attached pane, and arrive exactly once during a five-second duplicate-delivery check.
 #[spec("voice/reading-reply/004")]
 #[test]
 fn reading_reply_004_real_opencode_delivers_sentinel_once_to_subscribed_client() {
@@ -405,7 +439,7 @@ fn reading_reply_004_real_opencode_delivers_sentinel_once_to_subscribed_client()
     const SENTINEL: &str = "reading_reply_sentinel_opencode_b6d9.txt";
     let launch = AgentLaunch {
         name: "reading-reply-opencode",
-        ready: "Ask anything",
+        ready: common::OPENCODE_SUBMIT_READY,
         resubmit_until_empty: false,
     };
     let command = common::opencode_interactive_command(false, false, "");
@@ -769,8 +803,20 @@ fn launch_agent(
     command: &str,
     sentinel: &str,
 ) -> (TuiDeck, String, PromptKeys) {
+    launch_agent_with_home(builder, fixture, launch, command, sentinel, |_| {})
+}
+
+fn launch_agent_with_home(
+    builder: common::TuiDeckBuilder,
+    fixture: &str,
+    launch: &AgentLaunch,
+    command: &str,
+    sentinel: &str,
+    seed_home: impl FnOnce(&TuiDeck),
+) -> (TuiDeck, String, PromptKeys) {
     let deck = builder.with_pty_size(180, 45).launch_with_fixture(fixture);
     deck.wait_for_string("No active agents");
+    seed_home(&deck);
     std::fs::write(deck.workdir().join(sentinel), "prompt keys sentinel\n")
         .expect("write the sentinel file");
     deck.send_keys(b"\x0e");
@@ -855,7 +901,7 @@ fn exercise_prompt_keys(
     deck.wait_until_grid_then_hold("the kept word and the tail", BEFORE_SUBMIT, |grid| {
         grid.contains("tail 8b31")
     });
-    writer.write(&keys.delete_char.bytes.repeat(TAIL.chars().count()));
+    writer.delete_chars(keys, TAIL.chars().count());
     writer.write(NEXT);
     let joined = format!("{KEPT}{NEXT}");
     deck.wait_until_grid_then_hold("exactly the tail removed", BEFORE_SUBMIT, |grid| {
@@ -877,12 +923,27 @@ fn exercise_prompt_keys(
     assert_running(deck, agent_id, "the clear");
 
     // Interrupt: the list stops growing and the agent keeps running.
-    submit(
-        &mut writer,
-        "Write the numbers from 1 to 600 as a numbered list, each followed by one full sentence \
-         about that number. Do not use any tools and do not stop early.",
-        "Write the numbers",
-    );
+    // Flash can refuse a 600-item repetitive counting request. A practical
+    // gardening guide supplies benign, varied content while still streaming
+    // long enough to interrupt after the first five numbered items.
+    let (long_task, task_marker, last_item) = if launch.name == "voicekeys-antigravity" {
+        (
+            "Write a beginner gardening guide as a numbered list of 120 useful tips, numbered 1. \
+             through 120. Cover soil, watering, sunlight, seeds, vegetables, herbs, flowers, \
+             containers, compost and seasonal care. Give two short practical sentences per tip. \
+             Start directly with item 1. and write the guide in your reply without using tools.",
+            "Write a beginner gardening guide",
+            120,
+        )
+    } else {
+        (
+            "Write the numbers from 1 to 600 as a numbered list, each followed by one full sentence \
+             about that number. Do not use any tools and do not stop early.",
+            "Write the numbers",
+            600,
+        )
+    };
+    submit(&mut writer, long_task, task_marker);
     assert!(
         deck.wait_for_grid_predicate_within(
             Duration::from_secs(120),
@@ -909,7 +970,7 @@ fn exercise_prompt_keys(
     );
     let reached = reached.get();
     assert!(
-        reached < 600,
+        reached < last_item,
         "the turn finished rather than being interrupted:\n{}",
         deck.snapshot_grid()
     );
@@ -957,12 +1018,7 @@ fn prompt_voice_keys_004_codex_honours_the_served_keys() {
     exercise_prompt_keys(&launch, &deck, &agent_id, &keys, SENTINEL);
 }
 
-/// Scenario: Start a genuine interactive OpenCode pane on the cheap test model,
-/// read the keys the daemon serves for it, and write them on an attach stream
-/// as the desktop does — the interrupt's two Esc writes with the served pause
-/// between them: delete removes exactly a dictated tail, clear empties the
-/// prompt, interrupt stops a long numbered list mid-way, and a follow-up prompt
-/// naming a fixture file is answered with the agent still running.
+/// Scenario: Start a genuine interactive OpenCode pane on the cheap test model and wait for its submit-ready mode line. Write the daemon's served keys on an attach stream as the desktop does: delete removes exactly a dictated tail, clear empties the prompt, interrupt stops a long numbered list mid-way, and a follow-up prompt naming a fixture file is answered with the agent still running.
 #[spec("prompt/voice-keys/005")]
 #[test]
 fn prompt_voice_keys_005_opencode_honours_the_served_keys() {
@@ -971,7 +1027,7 @@ fn prompt_voice_keys_005_opencode_honours_the_served_keys() {
     const SENTINEL: &str = "voicekeys_parity_sentinel_opencode_7f15.txt";
     let launch = AgentLaunch {
         name: "voicekeys-opencode",
-        ready: "Ask anything",
+        ready: common::OPENCODE_SUBMIT_READY,
         resubmit_until_empty: false,
     };
     let command = common::opencode_interactive_command(false, false, "");
@@ -983,4 +1039,46 @@ fn prompt_voice_keys_005_opencode_honours_the_served_keys() {
         "OpenCode's interrupt is Esc, a pause, Esc: {keys:?}"
     );
     exercise_prompt_keys(&launch, &deck, &agent_id, &keys, SENTINEL);
+}
+
+/// Scenario: Open genuine interactive Antigravity on the cheap Flash model with credentials and onboarding seeded into an isolated HOME, dismissing its first-run announcement even when it arrives after the composer. Write the keys served by the daemon through the desktop's attach stream, respecting its delete cap and pause: delete removes exactly the draft tail, clear empties the draft, interrupt stops a visibly streaming beginner gardening guide, and the next turn reports the fixture sentinel with the agent still running.
+#[spec("prompt/voice-keys/006")]
+#[test]
+fn prompt_voice_keys_006_antigravity_honours_the_served_keys() {
+    skip_unless!(antigravity::check_antigravity_available());
+    const SENTINEL: &str = "voicekeys_parity_sentinel_antigravity_936a.txt";
+    let launch = AgentLaunch {
+        name: "voicekeys-antigravity",
+        ready: "? for shortcuts",
+        resubmit_until_empty: false,
+    };
+    let command = format!(
+        "agy --mode auto --dangerously-skip-permissions --model {}",
+        antigravity::antigravity_test_model()
+    );
+    let builder = TuiDeck::builder()
+        .with_env("PATH", common::path_with_binary_dir())
+        .with_env("AGY_CLI_DISABLE_AUTO_UPDATE", "true");
+    let (deck, id, keys) =
+        launch_agent_with_home(builder, "minimal", &launch, &command, SENTINEL, |deck| {
+            antigravity::seed_home(deck.home_dir(), deck.workdir()).unwrap()
+        });
+    // The composer can paint before this asynchronous first-run announcement.
+    // Wait for it rather than relying on a single launch-time snapshot; older
+    // versions that do not show it can still proceed after the bounded wait.
+    if deck.wait_for_grid_string_within(
+        "Auto is now the default agent mode",
+        Duration::from_secs(10),
+    ) {
+        let mut writer = PaneWriter::attach(deck.attach_socket_path(), &id);
+        writer.write("\x1b");
+        deck.wait_until_grid("the first-run announcement dismissed", |grid| {
+            !grid.contains("Auto is now the default agent mode")
+        });
+    }
+    // agy 1.5.9 (2026-11-16): one DEL works; 101 individual writes
+    // 20 ms apart removed exactly 101 characters, while raw bursts of 50
+    // and 2290 left residual input. Keep exercising the client write path
+    // here so serving the bytes alone cannot hide a broken scratch-that.
+    exercise_prompt_keys(&launch, &deck, &id, &keys, SENTINEL);
 }

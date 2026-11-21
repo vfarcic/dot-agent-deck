@@ -24,19 +24,20 @@ A newer daemon can report a status this build does not know; both the TUI and th
 
 The first five statuses come from each agent's hooks, plugin or extension, and how finely an agent separates them depends on what it reports: Pi's extension, for example, reports **Thinking**, **Working** while a tool runs, **Idle**, and **Needs Input** while a dialog another Pi extension shows is waiting; Pi asks no permission prompts of its own. Error, Blocked and when Needs Input appears depend on the agent:
 
-| Status | Claude Code | Codex | OpenCode | Pi | Devin |
-|---|---|---|---|---|---|
-| **Error** for a failed provider turn | Yes, 2.1.78 or newer | Yes, a few seconds after the failure | Yes | No | No |
-| **Blocked** | Yes, 2.1.78 or newer | Yes | Yes, once OpenCode stops retrying (it shows **Thinking** while it retries) | No | No |
-| A subagent's permission prompt told apart from the main agent's | Yes | Yes | Yes | No | No |
-| **Needs Input** for a permission prompt | Yes | Yes | Yes | Pi asks none of its own | Yes |
-| **Needs Input** for a multiple-choice question or form | Yes | Yes, in Plan mode | Yes | Yes, for dialogs other Pi extensions show | Unverified |
-| The question and its options known to the deck, so it can be [answered by voice](desktop/voice.md#which-questions-each-agent-can-answer-by-voice) | Yes, 2.1.136 or newer | Yes | Yes; on OpenCode 2, forms only in its full interface, not in `opencode mini` | Yes, for dialogs other Pi extensions show | Permission prompts only, untested |
+| Status | Claude Code | Codex | OpenCode | Pi | Devin | Antigravity |
+|---|---|---|---|---|---|---|
+| **Error** for a failed provider turn | Yes, 2.1.78 or newer | Yes, a few seconds after the failure | Yes | No | No | Yes, with `agy`'s message |
+| **Blocked** | Yes, 2.1.78 or newer | Yes | Yes, once OpenCode stops retrying (it shows **Thinking** while it retries) | No | No | No |
+| A subagent's permission prompt told apart from the main agent's | Yes | Yes | Yes | No | No | No |
+| **Needs Input** for a permission prompt | Yes | Yes | Yes | Pi asks none of its own | Yes | Yes, with what it asks |
+| **Needs Input** for a multiple-choice question or form | Yes | Yes, in Plan mode | Yes | Yes, for dialogs other Pi extensions show | Unverified | Unverified |
+| The question and its options known to the deck, so it can be [answered by voice](desktop/voice.md#which-questions-each-agent-can-answer-by-voice) | Yes, 2.1.136 or newer | Yes | Yes; on OpenCode 2, forms only in its full interface, not in `opencode mini` | Yes, for dialogs other Pi extensions show | Permission prompts only, untested | Permission prompts |
 
-- A Codex card follows Codex's hooks the way a Claude Code card does. In the TUI it shows **Idle** from the moment Codex starts until you send a prompt, **Thinking** and **Working** (with the tool) during the turn, **Needs Input** while a permission prompt is on screen, and **Idle** again when the turn ends, however much Codex redraws its screen (in the desktop app: **idle**, **running** while the turn runs, **needs input** at a permission prompt, and **idle** again). That needs the deck's Codex hooks to be trusted. When they are not (see [Troubleshooting → Codex events not showing](troubleshooting.md#codex-events-not-showing)), the card can only tell whether Codex's screen is changing: the TUI shows **Thinking** while Codex is drawing, including while you type into it and for a few seconds after it starts, and **Idle** once the screen has been still for about three seconds. In that case it shows no tool, no prompt and no **Needs Input**, and a turn waiting on a permission prompt reads **Idle**.
+- A Codex card follows Codex's hooks the way a Claude Code card does. In the TUI it shows **Idle** from the moment Codex starts until you send a prompt, **Thinking** and **Working** (with the tool) during the turn, **Needs Input** while a permission prompt is on screen, and **Idle** again when the turn ends, however much Codex redraws its screen (the desktop app shows the same words). That needs the deck's Codex hooks to be trusted. When they are not (see [Troubleshooting → Codex events not showing](troubleshooting.md#codex-events-not-showing)), the card can only tell whether Codex's screen is changing: the TUI shows **Thinking** while Codex is drawing, including while you type into it and for a few seconds after it starts, and **Idle** once the screen has been still for about three seconds. In that case it shows no tool, no prompt and no **Needs Input**, and a turn waiting on a permission prompt reads **Idle**.
 - A Codex pane whose command runs `codex` directly reports its own status, in the TUI and the desktop app alike. When you run Codex through a launcher, script or alias, that launcher has to start Codex without its shared background server, or two panes can report as one: see [Troubleshooting → Two Codex panes report as one](troubleshooting.md#two-codex-panes-report-as-one).
 - For Claude Code, Error and Blocked need the `StopFailure` hook, which the deck installs only when `claude --version` reports 2.1.78 or newer. After upgrading Claude Code to 2.1.78 or newer, run `dot-agent-deck hooks install` (or restart the daemon) to add it.
 - For Claude Code, the question and its options need the `PermissionRequest` hook, which the deck installs only when `claude --version` reports 2.1.136 or newer. Older versions still show **Needs Input**, without the question. After upgrading, run `dot-agent-deck hooks install` (or restart the daemon) to add it.
+- An Antigravity card follows `agy`'s hook and `agy`'s own status report. It shows **Idle** once `agy`'s input box is up, **Thinking** while the model works, **Working** with the tool while one runs, **Needs Input** while `agy` waits for a permission, a sign-in or a folder-trust answer, **Error** when a turn fails, and **Idle** again when the turn ends or you interrupt it (the desktop app shows the same words). Next to **Needs Input** and **Error** the card shows `agy`'s own words, such as `Approve Bash: rm -f probe.txt` or `Sign in required`: in the TUI under `Dir:`, in the desktop app on the agent's tile. An `agy` started from a shell inside a pane shows **Needs Input** and an interrupted turn from its first prompt on, once its hook tells the deck that `agy` runs there; before that prompt its card does not show a start-up question such as `Trust this folder?`. The deck reads no usage limit from `agy`, so an Antigravity card never shows **Blocked**; a turn that fails shows **Error** with `agy`'s message. See [Installation → Antigravity CLI](installation.md#antigravity-cli).
 - Pi's dialogs are known through behaviour Pi does not document, checked with Pi 0.87.1; a later Pi release may stop it working. Whether Devin reports its multiple-choice questions has not been checked.
 - On OpenCode 2, a form asked in `opencode mini`, or one with a question that appears only after another is answered, a hidden field or a field OpenCode fills in from elsewhere, shows **Needs Input** and is answered in OpenCode's pane; in `mini` the card says `answer this form in OpenCode: <the form's title>`. See [OpenCode 1.x and 2.x](installation.md#opencode-1x-and-2x).
 - OpenCode reaching Anthropic through an Anthropic "credit balance is too low" error does not turn the card Blocked; that error carries no marker the deck can read.
@@ -61,7 +62,8 @@ Each client has its own setting and sends its own notification, so with both ope
 Limits:
 
 - **Claude Code:** the deck can answer a question for about 24 days of waiting, the longest Claude Code keeps the deck's hook running; after that, answer it in Claude Code's pane. After upgrading the deck, restart the daemon or run `dot-agent-deck hooks install` so Claude Code's hook gets the longer wait.
-- **Codex, OpenCode and Pi:** the deck sets no limit; it answers the question whenever you do.
+- **Codex, OpenCode, Pi and Antigravity:** the deck sets no limit; it answers the question whenever you do.
+- **An `agy` started from a shell inside a pane:** its card shows the permission prompt, but the deck offers no answers for it, in either client or by voice; answer it in the pane. Start `agy` as the pane's command to answer from the deck.
 - **More than 64 questions waiting at once:** a question past that number still shows **Needs Input**, without the badge or the notification, and is answered in the agent's pane.
 
 ### Work left running after a turn
@@ -98,16 +100,16 @@ A command that has been running for hours is easy to spot this way. To stop it, 
 
 What each agent reports:
 
-| | Claude Code | Codex | OpenCode | Pi | Devin |
-|---|---|---|---|---|---|
-| Background commands | Yes | Yes | Yes | Yes | Yes |
-| Background subagents | Yes | Yes | Yes | No | No |
-| **Waiting** while a command it started in its last turn runs | Yes | Yes | Yes | Yes | Yes |
+| | Claude Code | Codex | OpenCode | Pi | Devin | Antigravity |
+|---|---|---|---|---|---|---|
+| Background commands | Yes | Yes | Yes | Yes | Yes | Yes |
+| Background subagents | Yes | Yes | Yes | No | No | No |
+| **Waiting** while a command it started in its last turn runs | Yes | Yes | Yes | Yes | Yes | Yes |
 
 - On Windows, background commands are not counted for any agent; subagents still are. So no card reads **Waiting** on Windows.
 - **Waiting** says only that the agent started the command in that turn and that it is still running, not that the agent will pick up its result by itself when it ends.
 - An OpenCode subagent counts while its session is working, and stops counting when that session finishes, fails or is deleted.
-- The deck's Pi extension and Devin hooks do not report subagents, so a Pi or Devin card counts commands only.
+- The deck's Pi extension and the Devin and Antigravity hooks do not report subagents, so a Pi, Devin or Antigravity card counts commands only.
 - Until an agent has reported a status of its own, a command it runs can still turn its card **Working**, and no `Background:` line appears.
 - A TUI or desktop app older than the daemon does not show the line and can show such a card as **Working**. With a daemon older than the app, cards behave the same way: a command left running turns the card **Working**, with no `Background:` line.
 - A TUI or desktop app that shows the `Background:` line but not **Waiting** shows a **Waiting** card as **Idle** with the line. With a daemon that does not report **Waiting**, a newer app shows such a card as **Idle** with the line too.
@@ -128,7 +130,7 @@ The `Prmt:` line on a TUI card shows `✉ <subject>` for a deck message. Its `Se
 
 Long turns affect delivery in both clients:
 
-- OpenCode and Pi can keep a message queued behind a busy turn without a not-delivered error during that wait, and do not receive another copy. Claude Code, with hooks from the same release as the deck, waits the same way: a message it has taken waits for its turn to end, and the deck neither sends it again nor reports it not delivered while the turn runs. With older hooks the deck cannot confirm this wait, so a message waiting behind a turn longer than about five minutes can be reported not delivered before it arrives.
+- OpenCode and Pi can keep a message queued behind a busy turn without a not-delivered error during that wait, and do not receive another copy. Claude Code, with hooks from the same release as the deck, waits the same way: a message it has taken waits for its turn to end, and the deck neither sends it again nor reports it not delivered while the turn runs. A message that arrives during a Claude Code turn is held by the deck until the turn ends, for up to about a minute, so Claude Code takes it up as a task of its own. With older hooks the deck cannot confirm this wait, so a message waiting behind a turn longer than about five minutes can be reported not delivered before it arrives.
 - A task reported as not delivered can still arrive, so check the agent's pane before posting it again. If it arrives after all, the orchestrator may be told, and the TUI card or desktop tile may leave its delivery error state once no other delivery error remains.
 - A message Claude Code (with hooks from the deck's release), OpenCode or Pi has kept for an hour without starting on it shows a one-time reminder with **Retry** and **Cancel**; it is not an error, and the agent may still be working on it.
 
@@ -205,7 +207,7 @@ The desktop app shows the same pull request as a badge with icons on the agent's
 
 *This section is about the TUI. The desktop app lists the agents the daemon started, so an agent you start yourself has no card there.*
 
-An agent you start yourself, outside the deck, still gets a card when its hooks report to the deck. Such a card is removed when that agent's session ends, rather than being left behind as an empty card. The deck keeps up to 256 of these cards at a time: when another arrives beyond that, the one that has been quiet the longest is removed, and it comes back the next time that agent starts a session. Cards of agents the running daemon started never count toward that limit and are never removed to make room. An agent that kept running across a daemon restart was started by the previous daemon, so in a TUI you open after the restart it counts as one of these cards. A TUI that stayed open through the restart keeps the card it already had for that agent instead: the card keeps updating, does not count toward the limit and is never removed to make room, and when the agent's session ends the card stays and shows Idle, still marked orphaned if the agent belonged to an orchestration, rather than disappearing. A TUI older than the daemon leaves an empty card for the pane where one of these cards is removed.
+An agent you start yourself, outside the deck, still gets a card when its hooks report to the deck. Antigravity is the exception: the deck's hook does nothing in an `agy` started outside the deck, so that `agy` gets no card. Such a card is removed when that agent's session ends, rather than being left behind as an empty card. The deck keeps up to 256 of these cards at a time: when another arrives beyond that, the one that has been quiet the longest is removed, and it comes back the next time that agent starts a session. Cards of agents the running daemon started never count toward that limit and are never removed to make room. An agent that kept running across a daemon restart was started by the previous daemon, so in a TUI you open after the restart it counts as one of these cards. A TUI that stayed open through the restart keeps the card it already had for that agent instead: the card keeps updating, does not count toward the limit and is never removed to make room, and when the agent's session ends the card stays and shows Idle, still marked orphaned if the agent belonged to an orchestration, rather than disappearing. A TUI older than the daemon leaves an empty card for the pane where one of these cards is removed.
 
 ## Check the machine a deck runs on
 

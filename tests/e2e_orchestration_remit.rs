@@ -1245,7 +1245,7 @@ fn orchestration_remit_010_reattached_tab_rearms_from_the_latest_rearm() {
         &pane_id,
         &agent_id,
         &second_path,
-        &deck,
+        Some(&deck),
     );
     assert!(
         content.contains(first_brief),
@@ -1449,7 +1449,7 @@ fn orchestration_remit_011_a_tab_without_its_own_context_rearms_without_a_task_a
         &pane_id,
         &agent_id,
         &rearmed_path,
-        &deck,
+        Some(&deck),
     );
     assert!(
         !content.contains(LEFT_OVER_TASK) && !content.contains("## Your task"),
@@ -1578,7 +1578,7 @@ fn read_announced_context(
     pane_id: &str,
     agent_id: &str,
     path: &std::path::Path,
-    deck: &TuiDeck,
+    deck: Option<&TuiDeck>,
 ) -> String {
     let name = path
         .file_name()
@@ -1607,7 +1607,7 @@ fn read_announced_context(
             .into_iter()
             .map(|message| (message.to, message.bind_agent, message.text))
             .collect::<Vec<_>>(),
-        deck.snapshot_grid()
+        deck.map(TuiDeck::snapshot_grid).unwrap_or_default()
     );
     std::fs::read_to_string(path).expect("read the announced context file")
 }
@@ -1820,7 +1820,7 @@ fn assert_attached_tab_rearms_from_own_context(live_surface: bool) -> RearmedRun
         &pane_id,
         &record.id,
         &rearmed_path,
-        &deck,
+        Some(&deck),
     );
     assert!(
         content.contains(first_brief) && !content.contains(second_brief),
@@ -1842,4 +1842,238 @@ fn assert_attached_tab_rearms_from_own_context(live_surface: bool) -> RearmedRun
         title,
         agent_ids,
     }
+}
+
+/// What the daemon's re-arm posts, and nothing a startup remit says: the
+/// resume line names why the role is re-sent (PRD #82).
+#[cfg(unix)]
+const RESUME_POINTER: &str = "your context was just compacted or cleared";
+
+/// Scenario: Prepare and start an orchestration over the daemon socket with no
+/// TUI or desktop attached, as a dispatch does. A compaction on its coordinator,
+/// a second report of that same compaction, a later compaction and a Claude
+/// Code /clear are injected; the daemon alone re-sends the coordinator its role
+/// with its brief once for each compaction and the /clear, posting the resume
+/// line to its inbox and recording each new file. A TUI then attaches, and one
+/// more compaction is still re-armed exactly once.
+#[spec("orchestration/remit/013")]
+#[test]
+#[cfg(unix)]
+fn orchestration_remit_013_the_daemon_rearms_a_coordinator_no_client_is_watching() {
+    const BRIEF: &str = "HEADLESS-BRIEF-remit013";
+    const TITLE: &str = "Headless run";
+    const RUN_ID: &str = "remit-headless-013";
+    let daemon = common::spawn_daemon_serve_with_env(
+        None,
+        "0",
+        &[("DOT_AGENT_DECK_HOOK_PROVENANCE", "warn")],
+    );
+    let project = common::harness_tempdir().expect("create headless orchestration project");
+    std::fs::write(
+        project.path().join(".dot-agent-deck.toml"),
+        include_str!("fixtures/remit-reassert-orchestration/.dot-agent-deck.toml"),
+    )
+    .expect("write orchestration config");
+    write_executable(
+        &project.path().join("orchestrator-remit.sh"),
+        ORCHESTRATOR_REMIT_SCRIPT,
+    );
+    daemon.approve_project_trust(project.path());
+    let cwd = std::fs::canonicalize(project.path()).expect("canonical project path");
+    let cwd_wire = cwd.to_string_lossy().into_owned();
+    let context_dir = cwd.join(".dot-agent-deck");
+    let prepared = daemon
+        .send_attach_request(&AttachRequest::PrepareWorkflow {
+            path: cwd_wire.clone(),
+            orchestration: "remit-reassert".into(),
+            task: BRIEF.into(),
+            config_revision: None,
+        })
+        .expect("prepare over the daemon socket");
+    assert!(prepared.ok, "prepare failed: {:?}", prepared.error);
+    let prepared = prepared.workflow_prepared.expect("prepared binding");
+    for (role_index, role) in prepared.roles.iter().enumerate() {
+        let response = daemon
+            .send_attach_request(&AttachRequest::StartPreparedAgent {
+                prep_token: prepared.token.clone(),
+                command: Some(
+                    if role.start {
+                        "./orchestrator-remit.sh"
+                    } else {
+                        "cat"
+                    }
+                    .into(),
+                ),
+                cwd: Some(cwd_wire.clone()),
+                rows: 24,
+                cols: 80,
+                env: vec![(
+                    "DOT_AGENT_DECK_PANE_ID".into(),
+                    format!("{RUN_ID}-{role_index}"),
+                )],
+                display_name: Some(role.name.clone()),
+                tab_membership: Some(TabMembership::Orchestration {
+                    name: "remit-reassert".into(),
+                    role_index,
+                    role_name: role.name.clone(),
+                    is_start_role: role.start,
+                    orchestration_cwd: Some(cwd_wire.clone()),
+                    display_title: Some(TITLE.into()),
+                    orchestration_id: Some(RUN_ID.into()),
+                }),
+                agent_type: None,
+                seed: None,
+                use_configured_command: false,
+            })
+            .expect("start prepared role over the daemon socket");
+        assert!(
+            response.ok,
+            "start {} failed: {:?}",
+            role.name, response.error
+        );
+    }
+    let record = role_agent_record(&daemon.attach_socket, "orchestrator");
+    let pane_id = record.pane_id_env.clone().expect("start role pane id");
+    let agent_id = record.id.clone();
+    let worker = role_agent_record(&daemon.attach_socket, "worker");
+    assert!(
+        wait_for_applied(
+            &daemon.attach_socket,
+            &pane_id,
+            INJECTED_EVENT_APPLIED_TIMEOUT,
+            |s| s.live_target.is_some()
+        ),
+        "the start role did not publish its live target"
+    );
+    let resumes = || view::count_containing(&daemon.attach_socket, &pane_id, RESUME_POINTER);
+    assert_eq!(resumes(), 0, "premise: nothing was re-armed yet");
+
+    let inject = |event: AgentEvent| {
+        common::write_hook_line(
+            &daemon.hook_socket,
+            &serde_json::to_string(&event).expect("serialize event"),
+        )
+        .expect("inject an event into the daemon");
+    };
+    let compaction =
+        |session: &str| synthetic_event(EventType::Compacting, session, &pane_id, &agent_id);
+    // Each re-arm publishes one new file, records it, and posts the resume
+    // line naming it to the coordinator, bound to its agent.
+    let expect_rearm = |before: &std::collections::HashSet<std::path::PathBuf>,
+                        resumes_before: usize,
+                        what: &str|
+     -> std::path::PathBuf {
+        let new = || -> Vec<std::path::PathBuf> {
+            context_files(&context_dir)
+                .into_iter()
+                .filter(|path| !before.contains(path))
+                .collect()
+        };
+        assert!(
+            common::wait_until(REASSERTION_DELIVERY_TIMEOUT, || !new().is_empty()
+                && resumes() > resumes_before),
+            "{what}: the daemon did not re-arm the coordinator; new files {:?}, inbox {:?}",
+            new(),
+            view::messages(&daemon.attach_socket, &pane_id)
+                .into_iter()
+                .map(|m| m.text)
+                .collect::<Vec<_>>()
+        );
+        let new = new();
+        assert_eq!(new.len(), 1, "{what}: one re-arm, one new file: {new:?}");
+        let path = new.into_iter().next().unwrap();
+        let content =
+            read_announced_context(&daemon.attach_socket, &pane_id, &agent_id, &path, None);
+        assert!(
+            content.contains(BRIEF),
+            "{what}: the brief travels:\n{content}"
+        );
+        assert_record_follows(&daemon.attach_socket, &path);
+        path
+    };
+    let quiet = |before: &std::collections::HashSet<std::path::PathBuf>,
+                 resumes_before: usize,
+                 what: &str| {
+        assert!(
+            !common::wait_until(DELIVERY_SETTLE_QUIET_WINDOW, || {
+                context_files(&context_dir).len() > before.len() || resumes() > resumes_before
+            }),
+            "{what} must not re-arm again"
+        );
+    };
+
+    // A compaction, then a second report of it while it is still compacting.
+    let before = context_files(&context_dir);
+    inject(compaction("remit013-first"));
+    let first = expect_rearm(&before, 0, "the first compaction");
+    let before = context_files(&context_dir);
+    inject(compaction("remit013-first"));
+    quiet(&before, 1, "a second report of the same compaction");
+    // A worker's compaction is not the coordinator's.
+    inject(synthetic_event(
+        EventType::Compacting,
+        "remit013-worker",
+        worker.pane_id_env.as_deref().expect("worker pane id"),
+        &worker.id,
+    ));
+    quiet(&before, 1, "a worker's compaction");
+
+    // A later compaction, after the coordinator moved on.
+    inject(synthetic_event(
+        EventType::Thinking,
+        "remit013-first",
+        &pane_id,
+        &agent_id,
+    ));
+    assert!(
+        wait_for_applied(
+            &daemon.attach_socket,
+            &pane_id,
+            INJECTED_EVENT_APPLIED_TIMEOUT,
+            |s| s.status != dot_agent_deck::state::SessionStatus::Compacting
+        ),
+        "the coordinator did not move off Compacting"
+    );
+    let before = context_files(&context_dir);
+    inject(compaction("remit013-first"));
+    let second = expect_rearm(&before, 1, "a later compaction");
+    assert_ne!(first, second);
+
+    // A Claude Code /clear.
+    let mut clear = synthetic_event(
+        EventType::SessionStart,
+        "remit013-clear",
+        &pane_id,
+        &agent_id,
+    );
+    clear.agent_type = AgentType::ClaudeCode;
+    clear.metadata.insert(
+        CLEAR_SESSION_START_METADATA_KEY.to_string(),
+        CLEAR_SESSION_START_METADATA_VALUE.to_string(),
+    );
+    let before = context_files(&context_dir);
+    inject(clear);
+    expect_rearm(&before, 2, "a /clear");
+
+    // A TUI attaches. It leaves the re-arm of this tab to the daemon, so a
+    // compaction is still re-armed once, not once by each.
+    let deck = TuiDeck::builder()
+        .with_pty_size(120, 40)
+        .with_env(
+            "DOT_AGENT_DECK_ATTACH_SOCKET",
+            daemon.attach_socket.to_string_lossy().to_string(),
+        )
+        .with_env(
+            "DOT_AGENT_DECK_SOCKET",
+            daemon.hook_socket.to_string_lossy().to_string(),
+        )
+        .launch_with_fixture("minimal");
+    deck.wait_until_grid("the headless orchestration's tab", |grid| {
+        grid.lines().next().is_some_and(|tabs| tabs.contains(TITLE))
+    });
+    let before = context_files(&context_dir);
+    inject(compaction("remit013-attached"));
+    expect_rearm(&before, 3, "a compaction with a TUI attached");
+    let before = context_files(&context_dir);
+    quiet(&before, 4, "the attached TUI");
 }

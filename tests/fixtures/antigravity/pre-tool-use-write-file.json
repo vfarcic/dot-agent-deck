@@ -1,0 +1,21 @@
+{
+  "artifactDirectoryPath": "/home/user/.gemini/antigravity-cli/brain/00000000-0000-4000-8000-000000000001",
+  "conversationId": "00000000-0000-4000-8000-000000000001",
+  "cwd": "/home/user/project",
+  "hookEventName": "PreToolUse",
+  "lastUserInput": "Create a file named probe.txt containing the single word hello. Then reply with just DONE.",
+  "modelName": "gemini-3.8-flash-low",
+  "stepIdx": 8,
+  "toolCall": {
+    "args": {
+      "Content": "hello",
+      "Path": "/home/user/project/probe.txt"
+    },
+    "id": "call_0000000000000000002",
+    "name": "write_file"
+  },
+  "transcriptPath": "/home/user/.gemini/antigravity-cli/brain/00000000-0000-4000-8000-000000000001/.system_generated/logs/transcript_full.jsonl",
+  "workspacePaths": [
+    "/home/user/project"
+  ]
+}

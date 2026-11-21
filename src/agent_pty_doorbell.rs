@@ -417,7 +417,10 @@ impl AgentPtyRegistry {
             delete_key: verified(record.delete_key.verified().is_some()),
             placeholder: verified(record.placeholder_empty.verified().is_some()),
             hook_route: hook_route
-                && matches!(agent, Some(AgentType::ClaudeCode | AgentType::Codex)),
+                && matches!(
+                    agent,
+                    Some(AgentType::ClaudeCode | AgentType::Codex | AgentType::Antigravity)
+                ),
             transcript_route: record.transcript_echo.verified().is_some(),
             // Q27: the first stage is the token head alone.
             staged_head: staged.then_some(crate::doorbell_screen::TOKEN_HEAD_CHARS),
@@ -867,6 +870,25 @@ impl AgentPtyRegistry {
         };
         let typing = typing.expect("an admitted attempt has its typing");
         generation.doorbell.admitted();
+        // PRD #211: Antigravity's composer was measured drawing the deck's
+        // line, every byte of which it took, with a seven-column gap. Such an
+        // echo is withdrawn and rung again once, never on the ring right
+        // after one that did (`Txn::allow_gap_withdrawal`). The other agents'
+        // echoes were never measured misrendered, so theirs stay suspended.
+        if matches!(generation.agent, Some(AgentType::Antigravity))
+            && generation.doorbell.gap_withdrawal_allowed()
+        {
+            txn.allow_gap_withdrawal();
+        }
+        // PRD #211: a withdrawal presses the agent's served keys at their
+        // served pace (`Txn::serve_keys`).
+        if let Some(keys) = generation
+            .agent
+            .as_ref()
+            .and_then(|agent| crate::agent_registry::spec(agent).prompt_keys.as_ref())
+        {
+            txn.serve_keys(keys);
+        }
         if generation.doorbell.counter().exhausted() {
             // That was the generation's last attempt number (Q18): from now
             // its typed doorbell is refused, which WAKE reports.
@@ -1033,6 +1055,9 @@ impl AgentPtyRegistry {
             pending.push_back(frame.map_or(txn::Event::Tick, txn::Event::Frame));
             next = pending.pop_front();
         };
+        if !matches!(outcome, txn::Outcome::NothingWritten(_)) {
+            generation.doorbell.ring_wrote(txn.gap_withdrew());
+        }
         // PRD #1666 part 3 (Q35-21, R3 §3.5): Submitted, with no human job
         // since admission: the deck's own verified submit makes the box
         // untouched again, under the writer, iff the ring's own op is the
@@ -1090,6 +1115,7 @@ impl AgentPtyRegistry {
             ?outcome,
             cr_reached = txn.cr_reached(),
             withdrawal = ?txn.withdrawal_cause(),
+            gap_withdrawal = txn.gap_withdrew(),
             admission_lost = txn.admission_was_lost(),
             unresolved_at = ?txn.unresolved_at(),
             marks = ?generation.ledger.marks(),
@@ -1146,6 +1172,9 @@ impl AgentPtyRegistry {
                         txn::Job::Line(text) => text.into_bytes(),
                         txn::Job::Cr => b"\r".to_vec(),
                         txn::Job::Deletes(n) => vec![0x7f; n],
+                        // `Txn::serve_keys` sets the clear key only where it
+                        // is Ctrl+U.
+                        txn::Job::Clears(n) => vec![0x15; n],
                     };
                     tracing::debug!(
                         target: "doorbell",

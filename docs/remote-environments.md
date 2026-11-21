@@ -327,7 +327,7 @@ Run the suggested `remote upgrade`. A different message, `Remote 'my-vm' rejecte
 Agents report their status and orchestration events to the daemon on the same host, over a local socket. Nothing crosses the network, so a dropped connection cannot lose them.
 
 - `remote add` and `remote upgrade` run `hooks install`, which covers Claude Code.
-- Every time the deck starts on the host (each `connect`, or `daemon serve`), it writes hooks or plugins for each of Claude Code, OpenCode, Codex and Devin that it detects on the host (Claude Code and OpenCode by their configuration directory, Codex and Devin by their command on `PATH`). Pi needs no hook: its extension is set up when a Pi agent starts.
+- Every time the deck starts on the host (each `connect`, or `daemon serve`), it writes hooks or plugins for each of Claude Code, OpenCode, Codex, Devin and Antigravity that it detects on the host (Claude Code and OpenCode by their configuration directory, Codex, Devin and Antigravity by their command, `agy` for Antigravity, on `PATH`). Pi needs no hook: its extension is set up when a Pi agent starts.
 
 If you install an agent on the host while connected, reconnect, or install its hooks on the host directly:
 
@@ -335,7 +335,7 @@ If you install an agent on the host while connected, reconnect, or install its h
 ssh deck@198.51.100.10 '~/.local/bin/dot-agent-deck hooks install --agent opencode'
 ```
 
-`--agent` takes `claude-code` (the default), `opencode`, `codex` or `devin`. If a card never leaves its first status, see [Hooks](troubleshooting.md#hooks).
+`--agent` takes `claude-code` (the default), `opencode`, `codex`, `devin` or `antigravity`. If a card never leaves its first status, see [Hooks](troubleshooting.md#hooks).
 
 ## Pull requests on the remote
 

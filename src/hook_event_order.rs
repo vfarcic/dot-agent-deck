@@ -232,8 +232,9 @@ struct OrderedFields {
 /// the standing the provenance gate will give it (`None`: refused).
 #[derive(Debug, PartialEq, Eq)]
 enum LineKind {
-    /// A raw `AgentEvent`, with its session and pane.
-    Event(Keys, Option<Standing>),
+    /// A raw `AgentEvent`, with its session and pane, and the generation its
+    /// token attests it to.
+    Event(Keys, Option<Standing>, Option<String>),
     /// An `inbox_announce`, which a `SessionStart` hook sends ahead of its
     /// event on the same connection, with the pane it names.
     Announce(String, Option<Standing>),
@@ -279,12 +280,17 @@ fn line_kind(line: &str, directory: &impl HookTokenDirectory, policy: Policy) ->
         presented.as_deref(),
         directory,
     );
+    let attested = match &provenance {
+        Provenance::Attested { agent_id, .. } => Some(agent_id.clone()),
+        _ => None,
+    };
     LineKind::Event(
         Keys {
             session,
             pane: fields.pane_id,
         },
         Standing::of(&provenance, policy),
+        attested,
     )
 }
 
@@ -298,21 +304,28 @@ fn line_kind(line: &str, directory: &impl HookTokenDirectory, policy: Policy) ->
 /// There is no turn for any of those.
 ///
 /// The line is classified before the future is returned, so the future holds
-/// nothing of `line` or `directory`.
+/// nothing of `line` or `directory`. PRD #211 (second review, finding 2): a
+/// raw event attested to a generation is handed to `attested`, with that
+/// generation, before the future is returned — before it waits for anything
+/// ahead of it.
 pub(crate) fn turn_for_line<'a>(
     ticket: &'a mut Option<Ticket>,
     line: &str,
     directory: &impl HookTokenDirectory,
+    attested: impl FnOnce(&str),
 ) -> impl Future<Output = Option<Turn>> + Send + 'a {
     let kind = ticket
         .is_some()
         .then(|| line_kind(line, directory, crate::hook_provenance::policy()));
+    if let Some(LineKind::Event(_, Some(_), Some(owner))) = &kind {
+        attested(owner);
+    }
     turn_for_kind(ticket, kind)
 }
 
 async fn turn_for_kind(ticket: &mut Option<Ticket>, kind: Option<LineKind>) -> Option<Turn> {
     let (keys, standing) = match kind? {
-        LineKind::Event(keys, Some(standing)) => (keys, standing),
+        LineKind::Event(keys, Some(standing), _) => (keys, standing),
         LineKind::Announce(pane, Some(standing)) => {
             if let Some(ticket) = ticket.as_ref() {
                 ticket
@@ -321,7 +334,7 @@ async fn turn_for_kind(ticket: &mut Option<Ticket>, kind: Option<LineKind>) -> O
             }
             return None;
         }
-        LineKind::Event(_, None) | LineKind::Announce(_, None) | LineKind::Other => {
+        LineKind::Event(_, None, _) | LineKind::Announce(_, None) | LineKind::Other => {
             ticket.take();
             return None;
         }
@@ -442,7 +455,7 @@ mod tests {
         ticket: &'a mut Option<Ticket>,
         line: &str,
     ) -> impl Future<Output = Option<Turn>> + Send + 'a {
-        turn_for_line(ticket, line, &Directory)
+        turn_for_line(ticket, line, &Directory, |_| {})
     }
 
     fn event(session: &str, pane: Option<&str>) -> String {

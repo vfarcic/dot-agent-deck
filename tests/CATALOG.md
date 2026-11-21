@@ -719,8 +719,8 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 
 ##### dashboard/pane/008 — Agent cards retain their registry-colored type badges even when they have friendly display names (PRD #20 M7, review finding 9).
 - **Layer:** L1 (ratatui `TestBackend` + color-aware `insta` snapshot).
-- **Agent:** none (synthetic Claude Code, OpenCode, Pi, and Codex `SessionState` fixtures, including friendly display names).
-- **Asserts:** the unnamed Codex card and named cards for all four shipped agents contain their registry identity; every badge cell uses that registry entry's `badge_color`; complete color-aware buffers are snapshotted.
+- **Agent:** none (synthetic Claude Code, OpenCode, Pi, Codex, Devin, Antigravity and unidentified `SessionState` fixtures, including friendly display names).
+- **Asserts:** the unnamed Codex card and named Claude Code, OpenCode, Pi and Codex cards contain their registry identity; every badge cell uses that registry entry's `badge_color`; complete color-aware buffers are snapshotted. A friendly-named Antigravity card shows the exact `Antigravity` badge with a uniform foreground distinct from the rendered badges of all five existing agents and the unidentified placeholder.
 - **Does not assert:** wrapper event delivery or real Codex execution (covered by `codex/wrap/001` and `codex/live/001`).
 - **Platform coverage:** mac+linux+windows.
 
@@ -1128,15 +1128,15 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 
 ##### dashboard/filter/003 — `type:<agent>` filters mixed sessions by registry identity and composes with ordinary text (PRD #20 M9).
 - **Layer:** L1 (in-process `filter_sessions` pure-data matrix).
-- **Agent:** none (synthetic Claude Code, OpenCode, Pi, and Codex session states).
+- **Agent:** none (synthetic Claude Code, OpenCode, Pi, Codex, Devin and Antigravity session states).
 - **Asserts:** `type:claude`, `type:claudecode`, `type:opencode`, `type:pi`, and `type:codex` each select only that agent; type matching is case-insensitive; a remaining text term is ANDed with the type; conflicting `type:codex type:claude` constraints use true AND semantics and yield no matches; an unknown type yields no matches; plain id/cwd/status/display-name matching is unchanged.
 - **Does not assert:** the rendered dashboard result (covered by `dashboard/filter/004`).
 - **Platform coverage:** mac+linux+windows.
 
-##### dashboard/filter/004 — Typing `type:codex` in the `/` search visibly narrows the dashboard to Codex cards (PRD #20 M9).
+##### dashboard/filter/004 — Typing `type:<agent>` in the `/` search visibly narrows the dashboard to that agent's cards (PRD #20 M9, PRD #211).
 - **Layer:** L1 (in-process keyboard handlers + ratatui `TestBackend` dashboard render).
-- **Agent:** none (synthetic Claude Code, OpenCode, Pi, and Codex session states).
-- **Asserts:** `/` enters filter mode; typing `type:codex` through the filter input leaves the Codex card visible and hides every non-Codex card in the rendered buffer.
+- **Agent:** none (synthetic Claude Code, OpenCode, Pi, Codex, Devin and Antigravity session states).
+- **Asserts:** the unfiltered dashboard shows all six cards with Antigravity's badge present; `/` enters filter mode; typing each agent's `type:` query through the filter input leaves only that agent's card visible in the rendered buffer. Antigravity's query is case-insensitive, composes with an ordinary matching text term, and keeps its badge visible after filtering.
 - **Does not assert:** accepting or clearing the filter (covered by `dashboard/filter/002` and `dashboard/selection/004`).
 - **Platform coverage:** mac+linux+windows.
 
@@ -2871,6 +2871,13 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** OpenCode's own interrupt wording.
 - **Platform coverage:** mac+linux.
 
+##### prompt/voice-keys/006 — A real Antigravity pane honours the daemon's delete, clear and interrupt keys.
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_prompt_keys_live.rs`).
+- **Agent:** Real interactive `agy` on the cheap Flash model, isolated credentials and seeded onboarding, with tools pre-approved for the bounded fixture task.
+- **Asserts:** The keys arrive through `ListAgents`; raw attach input follows the served delete cap and pause to remove exactly a dictated tail, clears a draft, interrupts a visibly streaming numbered list before completion and leaves the agent running to answer a follow-up with the fixture sentinel name. The first-run announcement is dismissed even if it arrives after the composer.
+- **Does not assert:** The permission menu, covered separately by `question/live/009`.
+- **Platform coverage:** mac+linux.
+
 #### prompt/quit
 
 ##### prompt/quit/001 — `Ctrl+c` from command mode opens the quit confirmation dialog with three options: **Detach** (default), **Stop**, **Cancel**.
@@ -3770,6 +3777,30 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** the 1.x TUI half (`dot-agent-deck-tui.js` and its `tui.json` entry), covered by the unit tests `opencode_every_layout_installs_the_same_files` and `opencode_alternating_generations_rewrite_nothing`; a machine with no global root, where 1.x keeps the legacy fan-out until the next install (unit-tested in `opencode_a_legacy_only_machine_converges_on_the_global_root`); a real OpenCode 1.x.
 - **Platform coverage:** mac+linux.
 
+##### hooks/install/032 — Antigravity hook installation preserves user content and disabled state through reinstall and uninstall.
+- **Layer:** fast-tier CLI subprocess against isolated HOME (`tests/scratch_binary_hook_install.rs`), mac+linux, as hooks/install/007.
+- **Agent:** offline `agy` PATH stub; no credentials.
+- **Asserts:** exactly one named deck key in `~/.gemini/config/hooks.json`, five measured event arrays with wildcard tool matchers, raw user value bytes and `enabled:false` preserved, structurally idempotent reinstall after an agent rewrite, uninstall removes just the deck key.
+- **Does not assert:** real agent invocation (antigravity/live/001–002).
+
+##### hooks/install/033 — Malformed Antigravity hook JSON is backed up and left untouched.
+- **Layer:** fast-tier CLI subprocess against isolated HOME (`tests/scratch_binary_hook_install.rs`), mac+linux.
+- **Agent:** offline `agy` PATH stub.
+- **Asserts:** install errors, original bytes remain, a byte-identical backup exists beside hooks.json.
+- **Does not assert:** unreadable files or disk exhaustion.
+
+##### hooks/install/034 — Shell-quoted Antigravity hooks safely run outside a deck pane.
+- **Layer:** fast-tier CLI subprocess plus sh execution in the global config directory (`tests/scratch_binary_hook_install.rs`), mac+linux.
+- **Agent:** offline `agy` PATH stub and real hook CLI.
+- **Asserts:** a deck path containing spaces and a quote runs through sh for each of the five installed handlers, with exit 0 and `{}` or PreToolUse's allow response when no pane env exists; no project daemon/inbox state appears.
+- **Does not assert:** hook delivery inside a deck pane (antigravity/inbox/*).
+
+##### hooks/install/031 — Automatic startup detects Antigravity through agy on PATH.
+- **Layer:** fast-tier daemon subprocess against isolated HOME (`tests/scratch_binary_hook_install.rs`), mac+linux, as hooks/install/015.
+- **Agent:** offline `agy` PATH stub, absent then present.
+- **Asserts:** absent agy writes no Gemini hook file; detected agy receives a named global hook without a pre-existing Gemini folder; a fresh key leaves enabled unspecified.
+- **Does not assert:** startup TUI notices or a real agy invocation.
+
 ##### hooks/install/027 — Switching OpenCode between 1.x and 2.x rewrites no plugin file, and `--standalone` follows the version (PRD #2050).
 - **Layer:** as `hooks/install/025`, three scheduled tasks fired in turn.
 - **Agent:** the same stand-in, replaced by a new file between spawns (1.x, then 2.x, then 1.x), as an installer replaces the binary, so a version cache keyed on the file sees each change.
@@ -3781,7 +3812,7 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Layer:** L2 headless e2e, lane 1 (`tests/e2e_daemon_hook_repair.rs`), the real `daemon serve` from `common::spawn_daemon_serve_with_env` with a durable `~/.local/bin/dot-agent-deck` in an isolated HOME and no `~/.claude` when it starts; no TUI is started.
 - **Agent:** none; a stand-in `claude`, first on the daemon's `PATH` and run as a scheduled task's command through `RunNow`, answers `--version` and exits, and otherwise copies `~/.claude/settings.json` (or `absent`) the moment it starts.
 - **Asserts:** with no `~/.claude` at daemon start no `settings.json` is written; after `~/.claude` is created, the first scheduled Claude Code agent starts with deck hook commands that all run the daemon's `~/.local/bin/dot-agent-deck`; a second scheduled start sees the same file and leaves its bytes, inode and mtime unchanged.
-- **Does not assert:** a real Claude Code reading the hooks; Codex and Devin, which take the same path (unit-tested in `hooks_refresh::tests::the_agents_repaired_before_a_start_are_claude_codex_and_devin` and `agent_pty::spawn_tests::a_claude_code_or_devin_spawn_asks_for_its_hooks_to_be_repaired`); a settings file the deck cannot write, which is logged (unit-tested in `hooks_refresh::tests::the_repair_runs_the_install_only_when_the_pins_need_it`); a launcher command with no declared agent type, which is not checked.
+- **Does not assert:** a real Claude Code reading the hooks; Codex and Devin, which take the same path (unit-tested in `hooks_refresh::tests::the_agents_repaired_before_a_start_are_claude_codex_devin_and_antigravity` and `agent_pty::spawn_tests::a_claude_code_devin_or_antigravity_spawn_asks_for_its_hooks_to_be_repaired`); Antigravity (`hooks/install/035`); a settings file the deck cannot write, which is logged (unit-tested in `hooks_refresh::tests::the_repair_runs_the_install_only_when_the_pins_need_it`); a launcher command with no declared agent type, which is not checked.
 - **Platform coverage:** mac+linux.
 
 ##### hooks/install/029 — A Claude Code agent whose hooks name a deleted copy of the deck starts with them repaired, keeping the user's own hooks and settings (issue #1973).
@@ -3796,6 +3827,13 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Agent:** as `hooks/install/028`.
 - **Asserts:** after the daemon started, `~/.claude/settings.json` is seeded with text that is not valid JSON; the scheduled Claude Code stand-in starts and sees that text unchanged, the file still holds it afterwards, and the deck's log has a line saying Claude Code's hooks could not be repaired before it started, and names the settings file.
 - **Does not assert:** the wording `hooks refresh` prints for the same file (`hooks/install/019`); a file the deck cannot read for permissions, which takes the same path.
+- **Platform coverage:** mac+linux.
+
+##### hooks/install/035 — An Antigravity agent a headless daemon starts from a scheduled task starts with the deck's hook, even when `agy` was installed after the daemon started, keeping the user's own hooks byte for byte, and a hook that already names the deck is not rewritten (issue #1973, PRD #211).
+- **Layer:** L2 headless e2e, lane 1 (`tests/e2e_daemon_hook_repair.rs`), the real `daemon serve` from `common::spawn_daemon_serve_with_env` with a durable `~/.local/bin/dot-agent-deck` in an isolated HOME; its `PATH` starts with a directory that holds no `agy` when it starts; no TUI is started.
+- **Agent:** none; a stand-in `agy`, put in that directory after the daemon started and run as a scheduled task's command through `RunNow`, answers `--version` and otherwise copies `~/.gemini/config/hooks.json` the moment it starts.
+- **Asserts:** with no `agy` at daemon start no `~/.gemini` is created; after the stand-in and a `hooks.json` holding one user hook are put in place, the first scheduled agent starts with a `dot-agent-deck` key whose commands all run the daemon's `~/.local/bin/dot-agent-deck`, and the user's hook value with its original spacing; a second scheduled start sees the same file and leaves its bytes, inode and mtime unchanged.
+- **Does not assert:** a real `agy` reading the hook (`antigravity/live/*`); a deleted-copy pin or a malformed `hooks.json`, which take the Claude Code path of `hooks/install/029`/`030` and the installer's own refusal (`hooks/install/033`).
 - **Platform coverage:** mac+linux.
 
 #### hooks/opencode-real
@@ -6064,7 +6102,7 @@ without depending on the config struct API.
 ##### orchestration/remit/008 — A hydrated start-role tab re-arms from its own unique context file.
 - **Layer:** L2 lane 1 (real-binary PTY TUI attached after a headless daemon starts a prepared orchestration).
 - **Agent:** synthetic shell start role and `cat` worker; no credential.
-- **Asserts:** two preparations in one project each publish their own file, the later one holding the later brief, and no fixed-path `orchestrator-context.md` is written (issue #1395). After the earlier start-role pane is hydrated into a fresh TUI, its compaction publishes a new context containing only the earlier brief.
+- **Asserts:** two preparations in one project each publish their own file, the later one holding the later brief, and no fixed-path `orchestrator-context.md` is written (issue #1395). After the earlier start-role pane is hydrated into a fresh TUI, its compaction publishes a new context containing only the earlier brief. Since PRD #82 that re-arm is the daemon's own (the daemon records this orchestration's file, and the TUI leaves the re-arm to it); `009` and `010` read it the same way.
 - **Does not assert:** a real agent or the `/clear` trigger, which shares the re-arm helper with compaction.
 - **Platform coverage:** mac+linux (`#[cfg(unix)]`).
 
@@ -6087,6 +6125,29 @@ without depending on the config struct API.
 - **Agent:** synthetic shell start role and `cat` worker, as `008`; no credential.
 - **Asserts:** the daemon's record of the start role names no context file (the premise: an unprepared start records none). A fixed-path `.dot-agent-deck/orchestrator-context.md` carrying a sentinel task, as an older deck left it, is still present when the start role is compacted. The TUI's status line then shows `re-sent to its coordinator without a task`, and the new per-publish context the start role is pointed at carries neither the sentinel nor any `## Your task` section (issue #1395).
 - **Does not assert:** the `/clear` trigger, which shares the re-arm helper and its notice; an own context file that cannot be read, which the same notice reports with its reason (unit tests `reassert_refuses_an_unsafe_own_context_file_and_carries_no_task` and `reassert_with_a_missing_own_file_does_not_deliver_another_brief` in `src/orchestrator_context.rs`); the retention sweep removing the left-over copy (`the_sweep_removes_only_aged_coordination_documents`).
+- **Platform coverage:** mac+linux (`#[cfg(unix)]`).
+
+##### orchestration/remit/012 — A real Claude Code orchestrator compacted with `/compact` gets its role back after the summary, not before it (PRD #82 M2).
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_orchestration_remit_live.rs`, `orchestration_remit_012_real_claude_compaction_reassert_lands_after_the_summary`).
+- **Fixture:** `tests/fixtures/remit-compaction-live`; the orchestration is opened with the TUI's `Ctrl+n`, so the TUI's re-arm is the one under test. Credentials are imported and trust is pre-seeded in the isolated HOME.
+- **Agent:** REAL interactive Claude Code on Haiku (`claude-haiku-4-5-20251001`) as the orchestrator, Bash/Read/Write allowed; the worker is a `cat` stub. Runtime-skipped without CLI/credentials unless strict real-e2e enforcement is enabled.
+- **Asserts:** the orchestrator reads its role file once at startup (one line in `remit_reads_82_5c1e.txt`) and its startup turn ends; `/compact` typed into its pane reaches the deck as `Compacting`; exactly one new per-publish role file is published; the orchestrator then records a second read; and in its transcript the new file's name appears in no user or assistant turn before the `compact_boundary` entry, reaches the conversation after it as a user turn, and is then read with a tool call. (Measured on Claude Code 2.1.329: the re-assert is handed over while compaction runs and Claude Code queues it, a `queue-operation` record, until the summary is in place.)
+- **Does not assert:** the orchestrator's behaviour after the re-assert (delegating, carve-outs, gates — the PRD's Validation milestone); an orchestration the daemon re-arms (`013`); OpenCode or Codex.
+- **Platform coverage:** mac+linux (`#[cfg(unix)]`).
+
+##### orchestration/remit/013 — The daemon re-arms the coordinator of an orchestration no client is watching, once per compaction or `/clear`, and an attached TUI does not add a second re-arm (PRD #82).
+- **Layer:** L2 lane 1 (real binary: a headless daemon starts a prepared orchestration; a PTY-attached TUI joins for the last phase).
+- **Agent:** synthetic shell start role and `cat` worker, as `008`; no credential.
+- **Asserts:** with nothing attached, a `Compacting` on the coordinator makes the daemon publish exactly one new per-publish context file carrying the run's brief, move its record (`ListAgents`) to it, and post the resume line (`your context was just compacted or cleared`) naming it to the coordinator's inbox; a second report of the same compaction, and a worker's compaction, re-arm nothing within a quiet window; a later compaction (after the coordinator reported `Thinking`) and a Claude Code `/clear` each re-arm once more. After a TUI attaches and shows the run's tab, one more compaction is re-armed exactly once, and nothing follows it.
+- **Does not assert:** a TUI `Ctrl+n` orchestration, which the daemon records no file for and the TUI re-arms (`001`-`007`, `011`, `012`); an older TUI, which does not leave the re-arm to the daemon and re-arms as well (the cross-version note in PRD #82's progress record); the desktop app, which starts orchestrations through the same preparation and does no re-arm of its own.
+- **Platform coverage:** mac+linux (`#[cfg(unix)]`).
+
+##### orchestration/remit/014 — A real OpenCode orchestrator compacted with `/compact` gets its role back after the summary (PRD #82 M2/M4).
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_orchestration_remit_live.rs`, `orchestration_remit_014_real_opencode_compaction_reassert_follows_the_summary`).
+- **Fixture:** `tests/fixtures/remit-compaction-opencode-live`; the test writes `run-orchestrator.sh` with `common::opencode_interactive_command`, so `DOT_AGENT_DECK_OPENCODE_TEST_BIN` picks 1.x or 2.x. Opened with the TUI's `Ctrl+n`.
+- **Agent:** REAL interactive OpenCode on the test model as the orchestrator (the deck's plugin installed by the declared spawn); the worker is a `cat` stub. Runtime-skipped without OpenCode or credentials unless strict real-e2e enforcement is enabled.
+- **Asserts:** the orchestrator reads its role file once at startup and its turn ends; `/compact` typed into its pane reaches the deck as `Compacting` (the plugin's report of the compaction starting); exactly one new per-publish role file is published; the orchestrator records a second read; the re-assert posted to its inbox names the new file; and a read of a role file follows the `Compacting` report (the event's shortened tool detail can cut an absolute path before the file name, as OpenCode 1.x's does, so the read is matched by its `.dot-agent-deck/orches…` prefix). The new file exists only from the compaction's start and the model takes no turn while writing the summary, so that read is a turn after the summary. Passed against OpenCode 2.2.7 (the queued re-assert runs in the same execution right after the compaction, with no idle between) and 1.19.5 (the session reports busy within milliseconds of the compaction part, which is why the TUI's re-arm reads the `Compacting` event and not only the status).
+- **Does not assert:** OpenCode's stored transcript order; an automatic (overflow) compaction; the orchestrator's behaviour after the re-assert (the Validation milestone).
 - **Platform coverage:** mac+linux (`#[cfg(unix)]`).
 
 #### orchestration/layout
@@ -6762,6 +6823,14 @@ without depending on the config struct API.
 - **Asserts:** every pane round-trips its own `orchestration_id` through the daemon echo; the partition yields TWO buckets (tab A, tab B) rather than one merged bucket, each holding exactly its own two panes; the two buckets' `OrchestrationIdentity`s differ; rebuilding every bucket produces two orchestration tabs with each pane owned by exactly one tab; and (PRD #140 review) a dead role slot in each tab mints a DISTINCT synthetic dead-slot id with its own placeholder card — pre-fix the `(cwd, orchestration_name)`-keyed id aliased across the two partitioned tabs onto one shared card.
 - **Does not assert:** live delegate/work-done routing across the reattach (that is `orchestration/route/001` and the `src/state.rs` routing unit tests); PTY attach or scrollback replay of the rebuilt panes; the same-cwd spawn warning (`orchestration/guard/001`); the on-disk snapshot restore branch.
 - **Platform coverage:** linux+mac (the suite is `#![cfg(unix)]` — the mock attach servers bind Unix-domain sockets; Windows port tracked by #164).
+
+##### orchestration/route/003 — An Antigravity orchestration role receives its first delegate after OSC idle and returns its work-done report.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_antigravity_inbox.rs`), attached TUI, real daemon, PTYs, hook and work-done CLIs.
+- **Agent:** none; the shared Antigravity replay stand-in and existing routing orchestrator stand-in.
+- **Asserts:** the configured Antigravity role receives no input before idle, through the launch auth signal and a pending permission; the idle doorbell carries no task bytes, its hook displays the delegated task in the role pane's PTY scrollback (even when the work-done footer pushes it above the viewport), and the worker's task-scoped work-done reaches its orchestrator with Untrusted framing.
+- **Does not assert:** a model deciding to delegate or perform the work, or multi-tab isolation (route/001).
+- **Platform coverage:** mac+linux.
 
 #### orchestration/orphan
 
@@ -7997,6 +8066,228 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Does not assert:** exact model phrasing or token usage.
 - **Platform coverage:** mac+linux (real-agent tier is local-only).
 - **Cost note:** one minimal mini-model availability probe plus one short interactive directory-listing/file-write turn.
+
+#### antigravity/live
+
+##### antigravity/live/001 — A real attached Antigravity writes a sentinel with visible Working and Idle status.
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_antigravity_live.rs`), mac+linux; developer credentials required.
+- **Agent:** real interactive `agy`, default `gemini-3.8-flash-low`, overridable with `DOT_AGENT_DECK_ANTIGRAVITY_TEST_MODEL`; availability probes that same model.
+- **Asserts:** isolated token copy (mode 600) or `GEMINI_API_KEY`, seeded onboarding and workspace trust reach the real composer; a prompt typed through the attached TUI creates a unique sentinel with the requested content and the Antigravity card shows its submitted prompt and goes Working then Idle.
+- **Does not assert:** the installer (hooks/install/031–034), permissions, quota exhaustion or real subagents.
+
+##### antigravity/live/002 — A real Antigravity worker receives a delegated task and reports completion.
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_antigravity_live.rs`), mac+linux; developer credentials required.
+- **Agent:** real interactive `agy` worker on the same cheap model as 001; synthetic orchestration start role runs the real inbox CLI.
+- **Asserts:** delegation before the worker's first prompt reaches real Antigravity through the production wake/delivery path, creates a unique sentinel, and a real worker-run `work-done --task-id` reaches the orchestrator as a framed untrusted report with the task id.
+- **Does not assert:** a real orchestrator model or multi-worker scheduling.
+
+#### antigravity/inbox
+
+##### antigravity/inbox/001 — First-prompt doorbell uses Antigravity's nested system-message envelope and re-entry takes no second delivery.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_antigravity_inbox.rs`), real PTY, daemon and hook CLI.
+- **Agent:** none; the shared captured-hook replay stand-in `tests/fixtures/antigravity/agy`.
+- **Asserts:** an OSC-idle pane receives its first doorbell before SessionStart; PreInvocation returns exactly `injectSteps[].systemMessage.systemMessage` with framed content; invocation 1 with the same input leaves later mail queued and the original receipt committed once.
+- **Does not assert:** a real model interpreting the system message.
+- **Platform coverage:** mac+linux.
+
+##### antigravity/inbox/002 — A busy Antigravity receives pending mail at ordinary Stop using decision continue.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_antigravity_inbox.rs`), real PTY, daemon and hook CLI.
+- **Agent:** none; captured Antigravity hook replay.
+- **Asserts:** SessionStart announces turn-end wake; ordinary Stop returns exactly `decision: continue` and the framed reason, commits the delivery once, and an empty re-entered Stop injects nothing; no doorbell input during hand-over. At `executionNum: 10`, Stop prints no continue, leaves mail queued and delivers it on the next doorbell turn.
+- **Does not assert:** a real model reaching the continuation limit.
+- **Platform coverage:** mac+linux.
+
+##### antigravity/inbox/003 — Error Stop retains mail for the next ordinary Stop.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_antigravity_inbox.rs`), real PTY, daemon and hook CLI.
+- **Agent:** none; captured Antigravity hook replay.
+- **Asserts:** ERROR prints no hand-over and leaves the task queued; a subsequent NO_TOOL_CALL Stop returns continue with that same framed task and commits its receipt once.
+- **Does not assert:** network error recovery by a real model.
+- **Platform coverage:** mac+linux.
+
+##### antigravity/inbox/004 — A misrendered doorbell echo is withdrawn and the retained mail is delivered once on retry.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_antigravity_inbox.rs`), real PTY, daemon and hook CLI.
+- **Agent:** captured-hook Antigravity stand-in; its first doorbell echo inserts seven display columns without dropping input bytes.
+- **Asserts:** the mismatched attempt is withdrawn without a submitted line; a later faithful doorbell visibly delivers the retained task, with one submission and one acknowledged receipt delivery.
+- **Does not assert:** the cause of the real agent's intermittent render desynchronisation or a real model's response.
+- **Platform coverage:** mac+linux.
+
+##### antigravity/inbox/005 — Human permission answers leave later idle doorbells usable.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_antigravity_inbox.rs`), attached input, real PTY, daemon and hook CLI.
+- **Agent:** captured-hook Antigravity stand-in.
+- **Asserts:** a person answers a visible permission menu through the deck input path; after the turn ends Idle, a subsequently queued task visibly reaches the worker exactly once, with one doorbell submission and one acknowledged receipt delivery.
+- **Does not assert:** real model permission handling or a genuine model's turn timing.
+- **Platform coverage:** mac+linux.
+
+##### antigravity/inbox/006 — Numbered output permits delivery while a real permission menu blocks it.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_antigravity_inbox.rs`), real PTY, daemon and hook CLI.
+- **Agent:** captured-hook Antigravity stand-in with numbered task output above the ready composer.
+- **Asserts:** a visible numbered permission menu holds pending mail despite idle; clearing it to numbered scrollback/output above an empty composer permits visible delivery exactly once.
+- **Does not assert:** real model output rendering or permission acceptance.
+- **Platform coverage:** mac+linux.
+
+##### antigravity/inbox/007 — Folder-trust answers leave later delegation usable while a typed draft holds it.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_antigravity_inbox.rs`), attached input, real PTY, daemon and hook CLI.
+- **Agent:** captured-hook Antigravity stand-in with the measured alternate-screen folder-trust dialog and permission OSC.
+- **Asserts:** Enter and Down, Down, Enter dismiss the dialog; subsequently delegated tasks visibly reach the worker once with one acknowledged receipt delivery. A letter typed into an idle composer holds delegated mail without additional input. Enter followed by Up in one attached write recalls history after the idle OSC; that visible draft holds queued delegation without doorbell bytes in the input log.
+- **Does not assert:** real model trust handling or permission acceptance.
+- **Platform coverage:** mac+linux.
+
+##### antigravity/inbox/008 — Tool and Stop hooks before permission-answer status leave later delegation usable.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_antigravity_inbox.rs`), attached input, real PTY, daemon and hook CLI.
+- **Agent:** captured-hook Antigravity stand-in.
+- **Asserts:** after PreToolUse and a visible permission menu, a person answers 1 through attached input; PostToolUse and Stop each precede working then idle OSCs, and a later delegated task visibly reaches the worker exactly once with one acknowledged receipt delivery.
+- **Does not assert:** a real model's scheduling or an OSC read before a newer hook but applied afterwards; the daemon regression covers that ordering directly.
+- **Platform coverage:** mac+linux.
+
+#### antigravity/notice
+
+##### antigravity/notice/001 — The first user-started Antigravity shows its experimental notice.
+
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_antigravity_notice.rs`).
+- **Agent:** captured Antigravity stand-in `tests/fixtures/antigravity/agy`.
+- **Asserts:** starting through the TUI's New Agent form with fresh state shows the experimental title, feedback request, repository issues address and Open issues, Later and Don't show again choices.
+- **Does not assert:** opening a browser or desktop rendering.
+- **Platform coverage:** mac+linux.
+
+##### antigravity/notice/002 — Dialog keys stay out of the Antigravity pane and Escape restores focus.
+
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_antigravity_notice.rs`).
+- **Agent:** captured Antigravity stand-in with its raw input log.
+- **Asserts:** an unrelated letter and the dismissing Escape leave the stand-in's input log unchanged; a marker typed afterward reaches its composer through the attached TUI.
+- **Platform coverage:** mac+linux.
+
+##### antigravity/notice/003 — Later delays the notice until the hundredth subsequent Antigravity start.
+
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_antigravity_notice.rs`).
+- **Agent:** captured Antigravity stand-in.
+- **Asserts:** Later after the first start persists the showing count; the second start and the 99th since the showing have no notice, while the 100th since that showing does. Separate TUI launches share a scratch state file.
+- **Platform coverage:** mac+linux.
+
+##### antigravity/notice/004 — Don't show again persists across a later due Antigravity start.
+
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_antigravity_notice.rs`).
+- **Agent:** captured Antigravity stand-in.
+- **Asserts:** pressing `d` dismisses the dialog and saves a permanent choice; preserving that choice while advancing the start count past the interval keeps a subsequent start free of the notice.
+- **Platform coverage:** mac+linux.
+
+##### antigravity/notice/005 — Other agents neither show nor advance the Antigravity notice.
+
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_antigravity_notice.rs`).
+- **Agent:** Claude-labelled stand-in from the Antigravity fixture.
+- **Asserts:** starting `./claude` through New Agent shows the pane without the Antigravity notice and leaves its scratch start counter at zero.
+- **Platform coverage:** mac+linux.
+
+##### antigravity/notice/006 — The TUI honours a permanent choice saved in the shared state file.
+
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_antigravity_notice.rs`).
+- **Agent:** captured Antigravity stand-in.
+- **Asserts:** a permanent choice seeded in the clients' shared scratch state file suppresses a due notice when Antigravity starts through the TUI.
+- **Does not assert:** the future shared Rust state API or the desktop dialog; this scenario seeds its JSON directly.
+- **Platform coverage:** mac+linux.
+
+##### antigravity/notice/007 — A failed New Agent creation does not count.
+
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_antigravity_notice.rs`).
+- **Agent:** absent executable named `agy` in the scratch workspace.
+- **Asserts:** New Agent reports creation failure, shows no experimental notice and preserves a counter due for its next notice.
+- **Platform coverage:** mac+linux.
+
+##### antigravity/notice/008 — Antigravity typed into a shell does not count.
+
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_antigravity_notice.rs`).
+- **Agent:** captured Antigravity stand-in, launched by typing `./agy` into a shell pane.
+- **Asserts:** after `./agy` starts from the shell and replays its captured SessionStart hook, the card identifies Antigravity without the experimental notice and the due start counter stays unchanged.
+- **Platform coverage:** mac+linux.
+
+##### antigravity/notice/009 — An Antigravity orchestration role does not count.
+
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_antigravity_notice.rs`).
+- **Agent:** captured Antigravity stand-in, configured as an orchestration's Antigravity starting role.
+- **Asserts:** opening the orchestration from New Agent starts its composer without the notice and preserves the due start counter.
+- **Platform coverage:** mac+linux.
+
+##### antigravity/notice/010 — Restoring an Antigravity pane does not count.
+
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_antigravity_notice.rs`).
+- **Agent:** captured Antigravity stand-in in a saved session staged by `with_continue_session`.
+- **Asserts:** restore opens the Antigravity composer without the notice and preserves the due start counter.
+- **Platform coverage:** mac+linux.
+
+##### antigravity/notice/011 — An empty authoring Command counts its resolved Antigravity default.
+
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_antigravity_notice.rs`).
+- **Agent:** captured Antigravity stand-in, configured as `default_command`.
+- **Asserts:** clearing the prefilled Command field in New Agent's Schedule mode still starts Antigravity, advances the counter to one and shows its first experimental notice.
+- **Does not assert:** ordinary empty Command starts, which launch a shell, or Schedule authoring with a real model.
+- **Platform coverage:** mac+linux.
+
+#### antigravity/status
+
+##### antigravity/status/001 — Captured Antigravity hooks drive the visible prompt, running command and ordinary turn end.
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_antigravity_status.rs`).
+- **Agent:** executable `agy` stand-in replaying the sanitized 1.5.9 payloads through the real hook CLI.
+- **Asserts:** PreInvocation shows Thinking with the prompt; PreToolUse shows Working with `run_command` and its command; Stop `NO_TOOL_CALL` shows Idle after PostToolUse.
+- **Does not assert:** real hook emission, file-tool argument extraction, or orchestration delivery.
+- **Platform coverage:** mac+linux (unix-only file).
+
+##### antigravity/status/002 — A failed Antigravity Stop hook shows Error with its text.
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_antigravity_status.rs`).
+- **Agent:** `agy` stand-in replaying captured `stop-error.json` through the real hook CLI.
+- **Asserts:** the attached dashboard card reads Error and includes the captured error text, which the stand-in never prints.
+- **Does not assert:** a real network failure or quota classification.
+- **Platform coverage:** mac+linux (unix-only file).
+
+##### antigravity/status/003 — OSC permission questions show the measured menu, accept its answer keys and clear on recovery.
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_antigravity_status.rs`).
+- **Agent:** `agy` stand-in replaying measured OSC 7501 bytes and the command permission menu measured on real `agy` 1.5.9.
+- **Asserts:** Needs Input includes the decoded question; working and idle clear it. Tool-bound command permissions offer the four measured labels and roles; each client answer writes its measured digit without Enter and visibly resumes the pane, while both always-allow options require confirmation and describe their scopes. Tool-bound file creation offers its measured two choices and sends digit 1 or 2; folder trust is not an answerable command menu. Forged edit OSC over a Bash menu, missing PreToolUse and completed PostToolUse offer no answerable question and answering types no bytes; a composer redraw refuses an otherwise valid answer with an explanation. A long multiline command renders the measured Command-menu wording: grants are refused without typing, while Deny passes the screen check, writes exactly digit 4 and clears the question.
+- **Does not assert:** real model compliance or remembering a permission in a subsequent turn (`question/live/009` covers real Allow Once).
+- **Platform coverage:** mac+linux (unix-only file).
+
+##### antigravity/status/004 — OSC alone ends interrupted turns, completes turns and reports terminal errors.
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_antigravity_status.rs`).
+- **Agent:** `agy` stand-in replaying a captured PreToolUse hook and measured working, idle, done and error OSC signals, without sending a Stop hook.
+- **Asserts:** OSC working preserves Working with the command while a hook-started tool runs; from Idle it shows Thinking before each ending; idle and done show Idle, and error shows Error with decoded text.
+- **Does not assert:** a real Esc/Ctrl+C keystroke or distinguishing interrupted done messages from final replies.
+- **Platform coverage:** mac+linux (unix-only file).
+
+##### antigravity/status/005 — Startup auth transients stay hidden while persistent auth needs input.
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_antigravity_status.rs`).
+- **Agent:** `agy` stand-in replaying captured auth and idle signals 60 ms apart, the upper measured launch gap.
+- **Asserts:** 1 ms samples of the rendered dashboard for two seconds show neither Needs Input nor Blocked for transient auth; Idle follows; persistent auth shows Needs Input with decoded sign-in text and returns to Idle after sign-in.
+- **Does not assert:** a particular debounce implementation, real sign-in, or statuses shorter than the sampling interval.
+- **Platform coverage:** mac+linux (unix-only file).
+
+##### antigravity/status/006 — Other agent panes ignore Antigravity OSC 7501 status.
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_antigravity_status.rs`).
+- **Agent:** Claude Code launcher using the same replay driver and a genuine-shaped Claude PreToolUse hook.
+- **Asserts:** Working and the Claude command remain visible after foreign permission, idle, done and error OSC signals, with no foreign question.
+- **Does not assert:** a real Claude session or every other supported agent.
+- **Platform coverage:** mac+linux (unix-only file).
+
+##### antigravity/status/007 — Rejected end hooks leave the current command permission answerable.
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_antigravity_status.rs`).
+- **Agent:** captured-hook Antigravity stand-in with an unrecognized capability on predecessor-shaped end hooks.
+- **Asserts:** after a current PreToolUse and permission signal, rejected PostToolUse and SessionEnd leave Needs Input with the question visible; Allow Once still sends exactly digit 1 and visibly returns to Idle.
+- **Does not assert:** a genuinely displaced generation's issued capability (`state::tests::antigravity_call_survives_a_displaced_generations_events` covers generation retirement) or a real model.
+- **Platform coverage:** mac+linux (unix-only file).
+
+#### antigravity/shell
+
+##### antigravity/shell/001 — Antigravity started from a shell in a pane shows Needs Input and an interrupted turn once its hooks name it.
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_antigravity_shell.rs`).
+- **Agent:** `agy` stand-in typed at a plain `sh` pane's prompt, replaying captured hooks and measured OSC 7501 permission and idle signals.
+- **Asserts:** the pane's environment carries `AGY_CLI_OSC7501=on`; a permission signal before any hook shows no Needs Input; after `SessionStart` and `PreInvocation` the Antigravity card shows Thinking, then Needs Input with the decoded question for a hook-bound permission signal. That question has channel `Unsupported`, and all four options (grants and Deny) are keyboard-only; client attempts at Allow once and Deny each return `Refused(KeyboardOnly)`, send zero bytes to the stand-in's input log and leave Needs Input visible. An idle signal clears the question and shows Idle. Once a Claude-shaped hook takes over the same shell pane, the daemon session snapshot reports active tool `Bash` with detail `echo claude-control`; Antigravity permission, idle, done and error signals each preserve that active tool and Working with the Claude command and no foreign question on the card.
+- **Does not assert:** a real `agy`, voice parsing, or start-up dialogs shown before the first prompt.
+- **Platform coverage:** mac+linux (unix-only file).
 
 #### codex/status
 
@@ -10137,6 +10428,14 @@ Since PRD #1666 S5 the deck types nothing into the orchestrator: its idle, waiti
 - **Does not assert:** desktop reading controls, summaries, speech, permission/error announcements, failed turns, or other agents' reply sources.
 - **Platform coverage:** mac+linux (`e2e,e2e-live,unix`-gated `e2e_prompt_keys_live.rs`); requires local Pi and `ANTHROPIC_API_KEY` and runs nowhere in CI.
 
+##### voice/reading-reply/007 — Antigravity transcript replies reach the reading subscriber only when the turn finishes.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_antigravity_inbox.rs`), production reading subscription, daemon and real hook CLI.
+- **Agent:** captured-hook Antigravity stand-in with a sanitized measured JSONL transcript; no model.
+- **Asserts:** a workspace transcript publishes no reply; a plain Stop with its conversation-matching transcript in the isolated HOME publishes its final reply once with the pane's identity; a Stop handed queued mail returns continue without an interim reply, and the final continued Stop publishes the new final text once with an increasing sequence.
+- **Does not assert:** real Antigravity transcript timing, desktop speech or summaries generated by a model.
+- **Platform coverage:** mac+linux.
+
 #### voice/desktop-phrases
 
 Live real-backend tests in `desktop/src-tauri/tests/voice_phrase_fixtures.rs`, named here by test because linkage-check does not walk the desktop crate, as in `question/desktop`. **Layer:** L2 backend integration, lane 2 by nature: these call the shipping default Commands backend (currently OpenAI `gpt-5-mini`) with the developer's credential. Opt in locally with `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1`; the live backend calls never run in CI and skip during ordinary `cargo test-fast` runs. These tests exercise command outcomes and meaning verdicts, without a rendered desktop or PTY-attached agent.
@@ -11495,6 +11794,7 @@ S-21 re-oracles the attached draft/no-cap and empty-navigation functions in `tes
 - **Platform coverage:** mac+linux.
 
 ##### inbox/doorbell/053 — The activation table decides each agent from its facts, rule by rule, and every recorded release conforms to its agent's facts.
+- **Antigravity:** the shipped table includes Antigravity, and measured release 1.5.9 is Go through both the activation table and the generation verdict (`doorbell_053_antigravity_measured_release_admits_a_doorbell`).
 - **Gate removal (gaterm):** until PRD #1666 part 3's `gaterm` unit the table decided each release from a record of its own and held every release without one as `unmeasured_release` (SC-00). The deck now types into every release of Claude Code and Codex on that agent's facts; the per-release records are conformance inputs (`RECORDED_RELEASES`). The edited assertions are listed in that unit's report; `docs/develop/doorbell-admission.md` says what an unrecorded release is trusted on.
 - **Layer:** Fast (`tests/doorbell_activation_table.rs`, `tests/editor_probe_permission.rs`), pure (`src/doorbell_activation.rs`, `src/composer_probe/mod.rs`).
 - **Agent:** none.
@@ -13391,6 +13691,13 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Does not assert:** a real Claude Code or a real blocking hook (`inbox/claude/053`); the entry's recognition rules case by case (`inbox_witness` unit tests); the daemon's guard case by case (`state` unit test `a_dropped_prompt_ends_only_the_turn_it_started`).
 - **Platform coverage:** mac+linux.
 
+##### inbox/claude/055 — A waiter a mid-turn compaction arms is held for the Stop waiter (issue #2133).
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), real hook and `inbox wait` CLI children of a synthetic Claude parent.
+- **Agent:** none (synthetic Claude parent; no credential).
+- **Asserts:** with a human prompt's turn running (card Thinking), a waiter armed by a `SessionStart` whose source is `compact` is handed nothing for a task posted then: the task stays `queued` and the waiter has not exited 2 s later. After the turn's `Stop`, the waiter that `Stop` arms exits 2 with the task's block and the task reads `fetched`.
+- **Does not assert:** a real Claude Code compaction, or the hold's bounds (`inbox_engine_tests` `a_waiter_armed_before_a_turn_or_by_its_compaction_is_held_until_the_stop_grace_or_the_ack_wait`); the older-waiter case under a real turn (`inbox/load/001`).
+- **Platform coverage:** mac+linux.
+
 ##### inbox/claude/053 — Live: a doorbell prompt another hook blocks is not acknowledged, and is handed over again (issues #2341, #2347).
 - **Layer:** L2 lane 2 (`tests/e2e_inbox_claude_live.rs`), the real TUI in a PTY, in the `claude-blocking-hook` fixture: a project `.claude/settings.json` whose own `UserPromptSubmit` hook blocks the first prompt carrying a deck doorbell line and leaves a marker. The scratch pane's armed waiter is killed, so the doorbell is the wake path.
 - **Agent:** Claude Code (Haiku).
@@ -14218,8 +14525,8 @@ The desktop half of answering by voice. These tests live in the desktop crate (`
 
 - **question/desktop/018** — vitest `question/desktop/018: %s presses nothing while a question waits`, `question/desktop/018: %s still submits with no question waiting` (each over "go ahead", "send it" and "enter"), `question/desktop/018: a dictation types nothing while a question waits`, `question/desktop/018: a dictation still types with no question waiting`, `question/desktop/018: a countdown presses nothing once a question arrives`, `question/desktop/018: the refusal names an orchestration agent by its run title`, `question/desktop/018: $said presses nothing while a question waits` (over "interrupt", "clear the prompt" and "scratch that") and `question/desktop/018: the refusal names what to do for each way voice cannot answer` (`desktop/src/components/VoiceControlPanel.test.tsx`, PRD #1631): with the open agent waiting on a permission prompt and the utterance `not_answer` to it, voice writes nothing into the pane — a resolved submit presses no Enter, "type run the tests" writes no bytes and starts no countdown, and interrupt, clear and scratch press no keys — and the row says the agent is waiting on a question, to answer it by saying an option or its number — listing them with their numbers — or use the keyboard, and nothing is sent to the question; an agent that is a role of an orchestration run is named there, and in the name the question's own sentences are given, by its run's title and its name ("prd-1401 Planner", issue #1668); a countdown over words typed before the question arrived ends without pressing Enter; the wording helper's advice is pinned for each case (voice, with and without options to list, a hidden terminal, a question voice cannot answer), and typing mode no longer counts as a case (PR #1698, `question/desktop/029`–`030`); with no question waiting each send phrase still presses Enter at once (issue #1246) and a dictation still types and sends. The submit and dictation resolutions are stubbed at the runtime seam, so `desktop_voice_resolve`'s own choice of the row is not exercised here, and the hidden-terminal wording is pinned on the helper alone, since the pane gate refuses a hidden terminal first.
 - **question/desktop/019** — `question_desktop_019_a_forgotten_cancel_still_stops_its_send` (`voice/lease.rs`) and vitest `question/desktop/019: every lease is numbered above the one before` (`desktop/src/components/VoiceQuestion.test.tsx`, PR #1698 review): a cancel that reached Rust before its send and was then pushed out by more cancels than Rust keeps still stops that send — it begins dead and nothing is written — while a cancel still kept holds, the panel's next answer is sent, and a name that is not a lease begins dead; the panel numbers each lease above the one before, with the clock standing still or stepping back, and within a safe integer.
-- **question/desktop/020** — `question_desktop_020_an_option_is_chosen_by_its_number` (PR #1698): against each agent's real option list, built by the daemon's own producers from the captured payloads — Claude Code 2.1.296's Bash prompt (Yes, the keyboard-only "Yes, and switch to auto mode", No), Codex's approval, OpenCode's unnumbered permission row, a Pi `select` and Devin's documented prompt — "2"/"two"/"second"/"option two"/"option 2"/"number two"/"the second one"/"um, two please" (and Claude's "1", Devin's "8") choose the option the agent draws with that number, matched in the desktop with no model call; Claude's "two", which is the auto-mode option where Claude draws it and No where it does not, is refused saying to say No by name; "the last one" is the last option; a number no option has is refused naming the options with their numbers.
-- **question/desktop/021** — `question_desktop_021_part_of_one_label_chooses_it`: a part only one label has chooses it — Codex's "proceed", "don't ask again", "no, and tell codex", OpenCode's "always", Pi's "production please"; "auto mode", "switch to auto mode", "yes, switch to auto mode" on Claude's prompt name the keyboard-only option and are refused as such, while a misspelt "swich to auto mode" is no part of a permission prompt's label and goes to the model (issue #1725); words not all in a label ("the nowhere one") go to the model; OpenCode's always option still raises its confirmation.
+- **question/desktop/020** — `question_desktop_020_an_option_is_chosen_by_its_number` (PR #1698): against Claude Code's, Codex's, OpenCode's and Pi's option lists built from captured payloads, Devin's documented prompt and Antigravity 1.5.9's measured command-menu fixture, spoken numbers and ordinals choose the option the agent draws with that number without a model call, including Antigravity's fourth option, No, cancel. Claude's ambiguous "two" is refused with an instruction to say No by name; "the last one" picks the last option, and unavailable numbers are refused while listing the available choices.
+- **question/desktop/021** — `question_desktop_021_part_of_one_label_chooses_it`: distinctive label fragments select Codex's proceed/always/no choices, OpenCode's always, Pi's production and Antigravity's run-command/conversation-only/persisted/cancel choices. Claude's keyboard-only auto-mode labels are refused; misspellings and words absent from the labels go to the model (issue #1725), and OpenCode's always option still raises its confirmation.
 - **question/desktop/022** — `question_desktop_022_a_whole_label_wins_and_the_countdown_names_it` (the user's case): "Yes", "yes.", "yes please", "um, yes", "Yes, do it", "YES" on Claude's prompt choose Yes, not "Yes, and switch to auto mode"; the countdown names the option sent — "“Yes” (allow once) — git push origin main", "“No” (deny) — …" — and does for Codex, OpenCode, Devin and a Pi choice, and OpenCode's always option as "(always allow)".
 - **question/desktop/023** — `question_desktop_023_words_that_fit_several_options_choose_none`: "yes and" to Claude Code (its always option and the auto-mode one) and "allow for" to Devin (three keyboard-only options) fit several options, none allowing once, and are no whole label, so nothing is chosen and the refusal names them — with their numbers, except the auto-mode option's, whose number depends on whether Claude draws it, and then says "say more of its words"; "yes proceed" and "allow once" choose one; a number naming one option by its place and another by its label is refused as ambiguous.
 - **question/desktop/024** — `question_desktop_024_words_that_match_nothing_choose_nothing`: "go to the overview" matches no option of any agent's prompt, so the (stub) model is asked, once, and its `not_answer` goes on to command handling; a model answer the question cannot take is refused naming the options — Claude's Yes with its number, No by name alone.
@@ -14469,6 +14776,13 @@ The desktop half of answering by voice. These tests live in the desktop crate (`
 - **Agent:** real interactive Claude Code, pinned Haiku 4.5, imported developer credentials and pre-seeded project trust.
 - **Asserts:** the `PermissionRequest` hook the deck installed carries `PERMISSION_REQUEST_HOOK_TIMEOUT_SECS`; with `notifications.question_after_minutes = 1` the card shows `QUESTION` and the prompt's age, exactly one OSC 9 notification arrives after a minute and no second one; the prompt, still held, is allowed through the client and the command creates its sentinel.
 - **Does not assert:** a wait past the old one-hour cap, which would take an hour.
+- **Platform coverage:** mac+linux.
+
+##### question/live/009 — A real Antigravity permission is answered once and the command completes.
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_antigravity_live.rs`).
+- **Agent:** Real interactive `agy` on the cheap Flash model in an isolated HOME, using the shipped hook installer and retaining permission prompts.
+- **Asserts:** A directive to remove a unique scratch sentinel draws the real permission menu before removal; the daemon offers its measured Allow Once option on the keys channel, the client answers it, the sentinel is removed and the turn finishes Idle.
+- **Does not assert:** Account or folder-trust setup menus, or remembered permission scopes.
 - **Platform coverage:** mac+linux.
 
 #### question/escalate
@@ -15547,7 +15861,7 @@ Manual merge gate: opt in with `DOT_AGENT_DECK_INBOX_LOAD_TEST=1` only when sche
 ##### inbox/load/001 — Claude Haiku inbox delivery under deliberate CPU pressure.
 - **Layer:** L2 lane 2 (`tests/e2e_inbox_load.rs`, `load_001_claude_acknowledges_seed_idle_busy_and_clear_under_cpu_pressure`), real binary and PTY-attached TuiDeck.
 - **Agent:** Real interactive Claude Haiku, established inbox live fixtures, isolated HOME.
-- **Asserts:** 25 messages across genuine spawn seed, idle, a sleep-tool turn and /clear all become Acknowledged and create their unique sentinel files within a 240-second agent window. Three busy-loop processes per available CPU run throughout and are killed/reaped using captured children in Drop; PSI load context is emitted on success and failure; vt100 bottom rows contain no stranded doorbell line or message opener after settling. **One exception, accepted as model variance (issue #2133):** the first busy message is posted while Claude is in the user's `sleep 30` turn, and Claude sometimes receives it mid-turn and ends the turn without running its command. That message alone may have no sentinel file, and only when the deck still did its part: the message is acknowledged with `plugin_confirmed`, and the deck log shows it handed alone to a once-waiter during the turn, and exactly one commit, applying one attempt, logged before the next once-waiter batch (the commit line names no message, so a commit after the next hand-over does not count). A sentinel that does exist must still hold the exact text, and every other message (busy 1–9, seed, idle, /clear) must be acted on as before. Plain unit tests in the same file check that a lost delivery (not acknowledged, no such hand-over in the log, or a commit only after the next hand-over) still fails.
+- **Asserts:** 25 messages across genuine spawn seed, idle, a sleep-tool turn and /clear all become Acknowledged and create their unique sentinel files within a 240-second agent window. Three busy-loop processes per available CPU run throughout and are killed/reaped using captured children in Drop; PSI load context is emitted on success and failure; vt100 bottom rows contain no stranded doorbell line or message opener after settling. **The user's turn holds Claude's waiter (issue #2133):** the busy messages are posted while Claude is in the user's `sleep 30` turn, with the waiter armed at the Idle before it still registered. The deck log must show no batch handed to a once-waiter before that turn's Idle: Claude Code 2.1.328 takes a mid-turn wake into the running turn as a queued command, which no prompt hook confirms and which Haiku sometimes left unacted, so the deck holds it for the waiter armed when the turn ends. The /clear phase posts its messages only once the waiter the clear's own SessionStart arms (its wait names the `clear` source) is registered, not the one the busy turn's Stop arms just before it: messages posted to that one raced the clear and were lost to the test's six-minute ack-wait in 2 of 7 runs. Plain unit tests in the same file check that a batch logged before the pane's Idle (or before only another pane's Idle) is caught, and that only the clear's own waiter opens the /clear phase.
 - **Does not assert:** Persistence across daemon restart, exact model prose, or load-test execution in normal verification; only the scheduled opt-in run exercises the loaded scenario.
 - **Platform coverage:** mac+linux, local credentials only; never CI.
 

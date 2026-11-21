@@ -23,6 +23,7 @@ const AGENT_TYPE_LABELS: Record<AgentTypeId, string | undefined> = {
   codex: "Codex",
   pi: "Pi",
   devin: "Devin",
+  antigravity: "Antigravity",
   none: undefined,
 };
 
