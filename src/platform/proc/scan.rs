@@ -249,6 +249,17 @@ pub const MEASURED_SHELL_TOOL_SHAPES: &[ShellToolShape] = &[CLAUDE_BASH_TOOL_SHA
 ///   taken for the server, and so is the server after an `exec` that keeps
 ///   that command line.
 ///
+/// Issue #2441: OpenCode 2.3 adds a process daemon below the server, measured
+/// on 2.3.2 as the server's direct child `<cache>/opencode-pty/<ver>/opencode-pty
+/// daemon --runtime-dir <state>/opencode/pty --name <uuid>`, leading a session
+/// of its own from the first shell command for the rest of the agent's life.
+/// The watch names it ([`Self::process_daemon_pid`]) by its executable, for a
+/// client known to be 2.3 or later, and the scan re-checks it as it does the
+/// server ([`has_process_daemon_shape`]). Unlike the server it runs the
+/// shell tool's commands **in its own session**, so the walk re-roots at it
+/// and still counts each of its direct children there as a command
+/// ([`walk_with_reference_session`]).
+///
 /// On 2.x a tool's processes run under the private server (measured), so none
 /// of them is the client's child. Until the watch has looked at a new pane (it
 /// samples every [`crate::opencode_mode::POLL_INTERVAL`]), or when any check
@@ -260,6 +271,10 @@ pub struct AgentServer {
     pub client_pid: i32,
     /// The client's private server.
     pub server_pid: i32,
+    /// Issue #2441: the server's process daemon (`opencode-pty daemon`), for
+    /// a client known to be OpenCode 2.3 or later. `None` when the watch named
+    /// none.
+    pub process_daemon_pid: Option<i32>,
 }
 
 /// Issue #1757: whether `command_line`, a sampled command line (`ps` joins
@@ -629,7 +644,7 @@ pub fn command_sessions_in_pane(
 /// its inner stage. A pair only merges two sessions in the displayed count;
 /// both stay in the raw set ([`CommandSessions`]).
 fn codex_linux_sandbox_pairs(
-    walk: &[(&ProcessInfo, i32)],
+    walk: &[Walked<'_>],
     table: &[ProcessInfo],
     sessions: &HashSet<i32>,
 ) -> HashMap<i32, i32> {
@@ -643,7 +658,12 @@ fn codex_linux_sandbox_pairs(
         _ => None,
     };
     let mut pairs = HashMap::new();
-    for (outer, reference) in walk {
+    for Walked {
+        row: outer,
+        reference,
+        ..
+    } in walk
+    {
         if outer.session_id <= 0
             || outer.pid != outer.session_id
             || !sessions.contains(&outer.session_id)
@@ -677,28 +697,37 @@ fn codex_linux_sandbox_pairs(
 /// ([`walk_with_reference_session`]): the body of
 /// [`qualifying_command_sessions_with_server`].
 fn qualifying_sessions_of_walk(
-    walk: &[(&ProcessInfo, i32)],
+    walk: &[Walked<'_>],
     table: &[ProcessInfo],
     root_pid: i32,
     shapes: &[ShellToolShape],
 ) -> HashSet<i32> {
+    // Issue #2441: the commands below a process daemon the walk re-rooted at
+    // (one the watch named) are not detached from it, so the cross-check below
+    // never sees them; they count by the key the walk gave them. A named
+    // daemon exists only on an OpenCode pane, which has no shapes, so this
+    // adds nothing on a pane with shapes in practice.
+    let rerooted_commands = walk
+        .iter()
+        .filter(|walked| !walked.is_detached())
+        .filter_map(|walked| walked.daemon_command);
     // A row whose session id could not be read is unclassifiable, not
     // "different" — counting it as different would turn an exit racing the
     // sample into a false `Working`.
     let detached = walk
         .iter()
-        .filter(|(row, reference)| row.session_id > 0 && row.session_id != *reference)
-        .map(|(row, _)| *row);
+        .filter(|walked| walked.is_detached())
+        .map(|walked| walked.row);
     // The structural test has already answered. `shapes` is the optional argv
     // cross-check on top of it, and an empty `shapes` means the caller asked for
-    // the structural test alone — in which case no command line is consulted at
-    // all, which is why a pane whose agent kind has never been measured costs no
-    // argv read even while it is busy.
+    // the structural test alone — in which case no command line is consulted
+    // here, beyond the OpenCode server and process-daemon shapes the walk read
+    // from rows the sample had already read (issue #2441).
     if shapes.is_empty() {
-        return detached.map(|row| row.session_id).collect();
+        return walk.iter().filter_map(Walked::command).collect();
     }
     let session_of: HashMap<i32, i32> = table.iter().map(|row| (row.pid, row.session_id)).collect();
-    let mut sessions = HashSet::new();
+    let mut sessions: HashSet<i32> = rerooted_commands.collect();
     // The cross-check consults the SESSION-BOUNDARY subset, not every detached
     // descendant — see [`shell_tool_candidates`] for why that is both correct
     // for the measured shape and the difference between reading one command
@@ -765,8 +794,8 @@ pub fn detached_descendants(table: &[ProcessInfo], root_pid: i32) -> Option<Vec<
             // A row whose session id could not be read is unclassifiable, not
             // "different" — counting it as different would turn an exit racing
             // the sample into a false `Working`.
-            .filter(|(row, reference)| row.session_id > 0 && row.session_id != *reference)
-            .map(|(row, _)| row.pid)
+            .filter(Walked::is_detached)
+            .map(|walked| walked.row.pid)
             .collect(),
     )
 }
@@ -802,6 +831,91 @@ fn is_identified_agent_server(
             .is_some_and(is_opencode_private_server_command)
 }
 
+/// Issue #2441: whether `row` has the shape of an OpenCode private server's
+/// process daemon in this sample: the leader of a session of its own whose
+/// sampled command line is an OpenCode process daemon's
+/// ([`is_opencode_process_daemon_command`]), below `parent`, a process in
+/// another session whose sampled command line is an OpenCode private server's
+/// ([`is_opencode_private_server_command`]). Both are session boundaries of
+/// the plain walk, so both command lines are read whenever the pane is
+/// sampled (issue #862). Any of that failing, or unread, is "not the daemon".
+///
+/// The shape alone exempts nothing: it only keys each command the process
+/// runs in its session on its own ([`walk_with_reference_session`]), which
+/// can split a count but never hide a command. The process itself is exempt
+/// only when the watch named both it and its server
+/// ([`AgentServer::process_daemon_pid`]).
+fn has_process_daemon_shape(row: &ProcessInfo, parent: Option<&ProcessInfo>) -> bool {
+    row.session_leader
+        && row.session_id > 0
+        && row
+            .command_line
+            .read()
+            .is_some_and(is_opencode_process_daemon_command)
+        && parent.is_some_and(|parent| {
+            parent.pid == row.ppid
+                && parent.session_id > 0
+                && parent.session_id != row.session_id
+                && parent
+                    .command_line
+                    .read()
+                    .is_some_and(is_opencode_private_server_command)
+        })
+}
+
+/// Issue #2441: whether `command_line`, a sampled command line (`ps` joins
+/// argv with spaces), runs OpenCode's process daemon: the program word's file
+/// name is `opencode-pty` and the next word is `daemon`, as measured on
+/// OpenCode 2.3.2 (`<cache>/opencode/bin/opencode-pty/<ver>/opencode-pty daemon
+/// --runtime-dir <state>/opencode/pty --name <uuid>`). Words in fixed
+/// positions, not substrings: `bash -c 'opencode-pty daemon'` is not it. Only
+/// ever a re-check of a daemon the watch identified by executable
+/// ([`AgentServer::process_daemon_pid`]); a program path with a space in it
+/// fails it, which counts the daemon (visible) rather than hiding a command.
+pub fn is_opencode_process_daemon_command(command_line: &str) -> bool {
+    let mut words = command_line.split_whitespace();
+    words
+        .next()
+        .and_then(|program| program.rsplit('/').next())
+        .is_some_and(|name| name.strip_suffix(".exe").unwrap_or(name) == OPENCODE_PROCESS_DAEMON)
+        && words.next() == Some("daemon")
+}
+
+/// Issue #2441: the file name of OpenCode's process daemon's executable, as
+/// measured on 2.3.2 (`~/.cache/opencode/bin/opencode-pty/<ver>/opencode-pty`).
+pub const OPENCODE_PROCESS_DAEMON: &str = "opencode-pty";
+
+/// One row of a pane's walk ([`walk_with_reference_session`]).
+#[derive(Debug, Clone, Copy)]
+struct Walked<'a> {
+    row: &'a ProcessInfo,
+    /// The session `row` is compared against.
+    reference: i32,
+    /// Issue #2441: the command `row` belongs to when it runs in the session
+    /// of a process with an OpenCode process daemon's shape
+    /// ([`has_process_daemon_shape`]): the pid of the daemon's direct child on
+    /// its branch, which stands for that command where a session id would
+    /// anywhere else. `None` everywhere else, the daemon's own row included.
+    daemon_command: Option<i32>,
+}
+
+impl Walked<'_> {
+    /// Whether `row` is in another session than the one it is compared
+    /// against. A row whose session id could not be read is unclassifiable,
+    /// not "different".
+    fn is_detached(&self) -> bool {
+        self.row.session_id > 0 && self.row.session_id != self.reference
+    }
+
+    /// The key of the command `row` counts toward, if it counts: the process
+    /// daemon's command it belongs to ([`Self::daemon_command`]), else its own
+    /// session when it is detached.
+    fn command(&self) -> Option<i32> {
+        self.daemon_command
+            .or_else(|| self.is_detached().then_some(self.row.session_id))
+    }
+}
+
 /// [`descendants`] of `root_pid`, each paired with the session id it must be
 /// compared against: `root_pid`'s own, except below a nested terminal session
 /// ([`is_nested_terminal_session`]) or, issue #1757, the agent's identified
@@ -813,13 +927,29 @@ fn is_identified_agent_server(
 /// beside it, is a command like any other. `None` has
 /// [`detached_descendants`]'s meaning.
 ///
+/// Issue #2441: OpenCode 2.3's process daemon runs the shell tool's commands
+/// as its direct children **in its own session**. So below any process with
+/// the daemon's shape ([`has_process_daemon_shape`]) each direct child in the
+/// daemon's session is a command of its own, keyed by its pid, and every row
+/// below it still in that session belongs to it ([`Walked::daemon_command`]).
+/// A row below it in another session counts by its own session, as anywhere
+/// else. The walk re-roots at the daemon, so the daemon itself is not a
+/// command, only when it is the one `server` names
+/// ([`AgentServer::process_daemon_pid`]) and its parent is the server this
+/// walk identified; until then the daemon counts by its own session. The
+/// keying does not wait for the naming, because a command's key must not
+/// change when the watch looks (every [`crate::opencode_mode::POLL_INTERVAL`]):
+/// the daemon starts with the agent's first shell command, and the watch can
+/// name the server and the daemon only after it, and a command whose key
+/// changed would read as a new command first seen after its turn.
+///
 /// Same visited-set walk as [`descendants`], for the same reason: it must
 /// terminate on a cycle.
 fn walk_with_reference_session(
     table: &[ProcessInfo],
     root_pid: i32,
     server: Option<AgentServer>,
-) -> Option<Vec<(&ProcessInfo, i32)>> {
+) -> Option<Vec<Walked<'_>>> {
     let session_of: HashMap<i32, i32> = if server.is_some() {
         table.iter().map(|row| (row.pid, row.session_id)).collect()
     } else {
@@ -835,10 +965,15 @@ fn walk_with_reference_session(
     }
     let mut visited: HashSet<i32> = HashSet::new();
     visited.insert(root_pid);
-    let mut queue: VecDeque<(i32, i32)> = VecDeque::new();
-    queue.push_back((root_pid, root.session_id));
+    let row_of: HashMap<i32, &ProcessInfo> = table.iter().map(|row| (row.pid, row)).collect();
+    let mut identified_server: Option<i32> = None;
+    let mut daemons: HashSet<i32> = HashSet::new();
+    // Each queued row: its pid, the session its children are compared
+    // against, and the daemon command it belongs to.
+    let mut queue: VecDeque<(i32, i32, Option<i32>)> = VecDeque::new();
+    queue.push_back((root_pid, root.session_id, None));
     let mut out = Vec::new();
-    while let Some((pid, reference)) = queue.pop_front() {
+    while let Some((pid, reference, parent_command)) = queue.pop_front() {
         let Some(kids) = children.get(&pid) else {
             continue;
         };
@@ -849,13 +984,39 @@ fn walk_with_reference_session(
             let is_server = server.is_some_and(|server| {
                 is_identified_agent_server(kid, reference, &session_of, server)
             });
-            let reference = if is_server || is_nested_terminal_session(kid) {
+            let parent = row_of.get(&pid).copied();
+            let is_daemon = !is_server && has_process_daemon_shape(kid, parent);
+            let is_named_daemon = is_daemon
+                && identified_server == Some(pid)
+                && server.is_some_and(|server| server.process_daemon_pid == Some(kid.pid));
+            if is_server {
+                identified_server = Some(kid.pid);
+            }
+            if is_daemon {
+                daemons.insert(kid.pid);
+            }
+            // In its parent's session, below a daemon: one of the daemon's
+            // commands, keyed by the daemon's direct child on its branch.
+            let in_parent_session = kid.session_id > 0
+                && parent.is_some_and(|parent| parent.session_id == kid.session_id);
+            let daemon_command = if is_daemon || !in_parent_session {
+                None
+            } else if daemons.contains(&pid) {
+                Some(kid.pid)
+            } else {
+                parent_command
+            };
+            let reference = if is_server || is_named_daemon || is_nested_terminal_session(kid) {
                 kid.session_id
             } else {
                 reference
             };
-            out.push((*kid, reference));
-            queue.push_back((kid.pid, reference));
+            out.push(Walked {
+                row: kid,
+                reference,
+                daemon_command,
+            });
+            queue.push_back((kid.pid, reference, daemon_command));
         }
     }
     Some(out)
@@ -909,8 +1070,8 @@ pub fn shell_tool_candidates(table: &[ProcessInfo], root_pid: i32) -> Option<Vec
         // for `qualifying_command_sessions_with_server` to recognise it.
         walk_with_reference_session(table, root_pid, None)?
             .into_iter()
-            .filter(|(row, reference)| row.session_id > 0 && row.session_id != *reference)
-            .map(|(row, _)| row)
+            .filter(Walked::is_detached)
+            .map(|walked| walked.row)
             .filter(|row| {
                 session_of
                     .get(&row.ppid)

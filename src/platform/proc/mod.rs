@@ -46,9 +46,10 @@ mod windows;
 
 pub use scan::{
     AgentServer, CLAUDE_BASH_TOOL_SHAPE, CommandLine, CommandSessions, CommandWrapper,
-    MEASURED_SHELL_TOOL_SHAPES, ProcessInfo, ShellToolShape, command_line_targets,
-    command_sessions_in_pane, descendant_shell_activity, descendants, detached_descendants,
-    fill_command_lines, is_opencode_private_server_command, qualifying_command_sessions,
+    MEASURED_SHELL_TOOL_SHAPES, OPENCODE_PROCESS_DAEMON, ProcessInfo, ShellToolShape,
+    command_line_targets, command_sessions_in_pane, descendant_shell_activity, descendants,
+    detached_descendants, fill_command_lines, is_opencode_private_server_command,
+    is_opencode_process_daemon_command, qualifying_command_sessions,
     qualifying_command_sessions_in_pane, qualifying_command_sessions_with_server,
     shell_tool_candidates,
 };
