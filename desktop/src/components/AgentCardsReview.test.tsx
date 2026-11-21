@@ -266,6 +266,51 @@ describe("agent cards: what is sent is what was shown (PRD #2374 review round 1)
     expect(box.value).toBe("");
   });
 
+  /// Scenario: type a reply and press Send reply, then change the words in the box while it is sending. Once the daemon has sent the first reply, the changed words stay in the box.
+  it("words typed while a reply is sending stay in the box once it is sent (issue #2418, Qodo)", async () => {
+    const answers: Array<(outcome: string) => void> = [];
+    const invoke = vi.fn((_target: unknown, _actionId: string, options: { requestId?: string }) => new Promise((resolve) => { answers.push((outcome) => resolve({ request_id: options.requestId ?? "r", outcome, message_id: "m-1" })); }));
+    render(<AgentOverview runtime={runtime([entry("7", "coder")], invoke as never)} onNavigate={vi.fn()} />);
+    fireEvent.click(within(row()).getByTestId("overview-row-menu"));
+    fireEvent.click(within(row()).getByTestId("overview-row-show-card"));
+    const box = screen.getByTestId("agent-card-reply-text") as HTMLTextAreaElement;
+    fireEvent.change(box, { target: { value: "use main" } });
+    await act(async () => { fireEvent.click(screen.getByTestId("agent-card-reply-send")); });
+    fireEvent.change(box, { target: { value: "use main, then rebase" } });
+    await act(async () => { answers[0]("sent"); });
+    expect(box.value).toBe("use main, then rebase");
+  });
+
+  /// Scenario: send a reply on one card and keep it sending, move to the next card and type words there without sending, move back and type the same words into the first card's empty box. When the first card's reply is sent, those new words stay in its box, since they were never sent.
+  it("a reply sent before moving away does not empty a new draft typed on returning, even with the same words (issue #2418 review, merge P2)", async () => {
+    const answers: Array<(outcome: string) => void> = [];
+    const invoke = vi.fn((_target: unknown, _actionId: string, options: { requestId?: string }) => new Promise((resolve) => { answers.push((outcome) => resolve({ request_id: options.requestId ?? "r", outcome, message_id: "m-1" })); }));
+    render(<AgentOverview runtime={runtime([entry("7", "coder"), entry("8", "tester")], invoke as never)} onNavigate={vi.fn()} />);
+    fireEvent.click(within(row()).getByTestId("overview-row-menu"));
+    fireEvent.click(within(row()).getByTestId("overview-row-show-card"));
+    const overlay = () => screen.getByTestId("agent-card-overlay");
+    const box = () => screen.getByTestId("agent-card-reply-text") as HTMLTextAreaElement;
+    const first = overlay().getAttribute("data-card-key");
+
+    fireEvent.change(box(), { target: { value: "first reply" } });
+    await act(async () => { fireEvent.click(screen.getByTestId("agent-card-reply-send")); });
+    expect(invoke).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByTestId("agent-card-next"));
+    expect(overlay().getAttribute("data-card-key")).not.toBe(first);
+    expect(box().value).toBe("");
+    fireEvent.change(box(), { target: { value: "yes" } });
+
+    fireEvent.click(screen.getByTestId("agent-card-previous"));
+    expect(overlay().getAttribute("data-card-key")).toBe(first);
+    expect(box().value).toBe("");
+    fireEvent.change(box(), { target: { value: "yes" } });
+
+    await act(async () => { answers[0]("sent"); });
+    expect(box().value).toBe("yes");
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
+
   it("the overlay lists what was sent from the card, with the exact text, after the report stopped offering it (decision (a))", () => {
     const card = entry("7", "coder", {
       recent_deliveries: [{ action_id: "go", label: "Go ahead", text: "Run\tthe tests.", token: "tok-old", outcome: "sent", message_id: "m-42", state: "delivered", detail: null, at: "2026-11-17T10:00:00Z" }],

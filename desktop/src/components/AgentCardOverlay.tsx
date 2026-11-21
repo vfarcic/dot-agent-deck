@@ -48,20 +48,35 @@ export function AgentCardOverlay({ card, lastName, position, count, step, result
   const cardKey = card ? `${card.deckId}\u0000${card.entry.instance_id}\u0000${card.entry.key}` : undefined;
   /* Once the daemon has sent a reply from the box, the box empties, so a
      second press cannot send the same words again (issue #2418, Qodo); a
-     reply that failed or was refused stays in the box to be retried. The
-     words are taken when the reply's answer turns pending, the render after
-     Send reply was pressed; words typed while it was sending stay. */
-  const replyAnswer = card ? results[card.entry.actions.find((action) => action.id === "reply")?.token ?? ""] : undefined;
-  const sendingReply = useRef<string | undefined>(undefined);
+     reply that failed or was refused stays in the box to be retried, and
+     words typed while it was sending stay. The words are recorded when Send
+     reply sends them, with the card and the action token they went to and
+     the answer that token held before, so only the answer to that send can
+     empty the box. Leaving the card forgets them: the box starts empty on
+     every card, and an answer seen again on returning is not a new send
+     (issue #2418 review, merge P2). */
+  const sendingReply = useRef<{ cardKey: string; token: string; text: string; before: CardResults[string] | undefined } | undefined>(undefined);
   useEffect(() => { setReply(""); sendingReply.current = undefined; }, [cardKey]);
   useEffect(() => {
-    if (replyAnswer?.outcome === "pending") { sendingReply.current = reply; return; }
-    const sent = sendingReply.current;
-    if (sent === undefined || replyAnswer === undefined) return;
+    const sending = sendingReply.current;
+    if (sending === undefined || sending.cardKey !== cardKey) return;
+    const answer = results[sending.token];
+    if (answer === undefined || answer === sending.before || answer.outcome === "pending") return;
     sendingReply.current = undefined;
-    if (replyAnswer.outcome === "sent") setReply((current) => (current === sent ? "" : current));
-    // `reply` is read as it was when the answer changed, so it is not a dependency.
-  }, [replyAnswer]);
+    if (answer.outcome === "sent") setReply((current) => (current === sending.text ? "" : current));
+  }, [results, cardKey]);
+  /* The Send reply button's controls: the overlay's own, with the reply
+     recorded once the deck has taken it to send. */
+  const replyControls: CardOverlayControls = {
+    ...controls,
+    replyToAgentCard: (target, text, sendNow) => {
+      const token = card?.entry.actions.find((action) => action.id === "reply")?.token;
+      const before = token === undefined ? undefined : results[token];
+      const refused = controls.replyToAgentCard(target, text, sendNow);
+      if (refused === undefined && sendNow === true && cardKey !== undefined && token !== undefined) sendingReply.current = { cardKey, token, text, before };
+      return refused;
+    },
+  };
   /* A spoken reply opens this step with its words in the box, to be read,
      edited and sent by hand. */
   useEffect(() => { if (step?.kind === "reply" && step.text !== undefined) setReply(step.text); }, [step]);
@@ -221,7 +236,7 @@ export function AgentCardOverlay({ card, lastName, position, count, step, result
                   onChange={(event) => setReply(event.target.value)}
                 />
                 <div className="agent-card-reply-buttons">
-                  <button type="button" className="button primary compact" data-testid="agent-card-reply-send" disabled={!replyAction.enabled || reply.trim() === "" || results[replyAction.token]?.outcome === "pending"} onClick={() => VOICE_ACTIONS.replyToAgentCard.run(controls, { ...cardRef(card), cardReplyText: reply, cardReplySend: true })}>Send reply</button>
+                  <button type="button" className="button primary compact" data-testid="agent-card-reply-send" disabled={!replyAction.enabled || reply.trim() === "" || results[replyAction.token]?.outcome === "pending"} onClick={() => VOICE_ACTIONS.replyToAgentCard.run(replyControls, { ...cardRef(card), cardReplyText: reply, cardReplySend: true })}>Send reply</button>
                 </div>
               </section>
             )}
