@@ -14,7 +14,7 @@ The agent set is a **curated, compiled-in registry** ([`src/agent_registry.rs`](
 So the two shapes of "add an agent" are:
 
 - **Reuse a shipped strategy** → a registry entry (+ any strategy-specific *data*, e.g. a wrapper rule set) + a release. This is the cheap, common path. Codex, Gemini, and any other stdout-emitting CLI are this.
-- **Introduce a genuinely new mechanism** → implement a new [`IntegrationStrategy`] **once**, then it is a registry entry thereafter. Aider's log-watcher is this: the *first* log-watcher agent pays for the strategy; the second is config.
+- **Introduce a genuinely new mechanism** → implement a new [`IntegrationStrategy`] **once**, then it is a registry entry thereafter: the *first* agent on a new mechanism pays for the strategy; the second is config.
 
 ## The four shipped integration strategies
 
@@ -211,10 +211,10 @@ Adding an agent is only "done" when it is covered at every layer the shipped age
 
 ## Follow-up agents built on this seam
 
-Two follow-up PRDs build directly on the PRD #20 machinery documented here:
+One follow-up PRD builds directly on the PRD #20 machinery documented here:
 
 - **Gemini** — a **wrapper**-strategy agent, so a thin registry entry + a Gemini-specific `classify_line` rule set + detection + e2e. It reuses `dot-agent-deck wrap` wholesale; the PRD is small *because the wrapper strategy already exists*.
-- **Aider** — introduces the **new log-watcher** strategy (`dot-agent-deck watch --agent aider --log <path>` tailing Aider's structured logs into `AgentEvent`s). That PRD carries the one-time log-watcher `IntegrationStrategy` implementation; every log-watching agent after it is back on the cheap path.
+An Aider adapter on a new log-watcher strategy was planned here too ([PRD #212](https://github.com/vfarcic/dot-agent-deck/issues/212)). The maintainer closed it on 2026-11-20 without building it, so there is no log-watcher strategy; the PRD's comments keep the research into Aider's analytics log and `--notifications-command`.
 
 ### Devin — the second `NativeHooks` agent
 

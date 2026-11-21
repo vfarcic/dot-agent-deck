@@ -118,7 +118,7 @@ export function terminalInputState(agent: AgentSession): TerminalInputState {
  * mounted, so there is nothing to type into and nothing a lease could say about
  * it. One sentence, and it is this one.
  */
-export type NoTerminalReason = "unreachable-deck";
+type NoTerminalReason = "unreachable-deck";
 
 export interface NoTerminalState {
   /** Rendered as `data-terminal-state`. `"attached"` is the absence of this. */

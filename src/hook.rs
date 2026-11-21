@@ -8729,6 +8729,7 @@ mod gated_send_tests {
             token: Some("tok".into()),
             command: Some("devbox run oc-big".into()),
             agent: Some("opencode".into()),
+            dir: None,
             timestamp: chrono::Utc::now(),
         }
     }

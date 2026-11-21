@@ -36,7 +36,7 @@ import type { DeckRuntimeState } from "../types";
 export const READING_NOT_IN_THIS_RUNTIME = "Reading is not available: this app cannot read an agent's turns here.";
 
 /** A recording segment {@link UseReadingMode.takeSegment} ended, while its `voiceStop` is pending. */
-export interface StoppedSegment {
+interface StoppedSegment {
   /** Whether the app spoke during the segment so far. */
   overlapped: () => boolean;
   /**

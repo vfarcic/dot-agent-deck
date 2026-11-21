@@ -14,7 +14,7 @@
 import type { PendingQuestionDto } from "./voiceQuestion";
 
 /** The badge's word, as the TUI card spells it. */
-export const QUESTION_BADGE_WORD = "QUESTION";
+const QUESTION_BADGE_WORD = "QUESTION";
 
 /** `format_elapsed` from `src/ui.rs`, for a span of whole seconds. */
 export function formatElapsedSeconds(totalSeconds: number): string {

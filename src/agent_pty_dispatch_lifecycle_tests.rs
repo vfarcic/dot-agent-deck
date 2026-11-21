@@ -115,6 +115,7 @@ fn origin(
             pane_id: caller_pane.to_string(),
             agent_id: caller_agent.to_string(),
         },
+        existing_dir: false,
     }
 }
 
