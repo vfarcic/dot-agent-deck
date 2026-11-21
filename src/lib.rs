@@ -194,6 +194,7 @@ pub mod project_resolve;
 // PRD #1885: remembered approvals of a project's orchestration commands and prompts.
 pub mod project_trust;
 // Issue #1884: the bounded macOS retry of PTY allocation.
+pub mod prompt_library;
 pub mod pty_open_retry;
 // PRD #1401: the pull request an agent's work produced, on the session wire.
 pub mod pull_request;

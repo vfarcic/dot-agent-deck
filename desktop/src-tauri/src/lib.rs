@@ -29,6 +29,7 @@ mod local_deck;
 mod model_service;
 /// PRD #1401: the in-app pull request browser.
 mod pr_browser;
+mod prompt_library;
 // PRD #802 M4 — the credential seam PRD #803 M5 named, over the OS keychain.
 // Not voice-specific, so it is a module of its own rather than one under
 // `voice`: the rule it serves is #803's and any later feature needing a
@@ -7656,6 +7657,10 @@ pub fn run() {
             antigravity_notice::desktop_antigravity_notice_start,
             antigravity_notice::desktop_antigravity_notice_choose,
             desktop_list_directories,
+            prompt_library::desktop_list_prompts,
+            prompt_library::desktop_save_prompt,
+            prompt_library::desktop_delete_prompt,
+            prompt_library::desktop_seed_prompts,
             desktop_inbox_action,
             desktop_generate_config,
             agent_cards_consume,

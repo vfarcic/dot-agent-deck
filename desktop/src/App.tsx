@@ -2106,7 +2106,16 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
   // sit open while another run takes the title (PR #1333 review).
   const orchestrationLiveTitlesRef = useRef(orchestrationLiveTitles);
   orchestrationLiveTitlesRef.current = orchestrationLiveTitles;
-  const { prompts, addPrompt, updatePrompt, removePrompt } = usePromptLibrary();
+  // Issue #824 — the prompt library is the selected daemon's, so it follows
+  // the deck: none under All Decks or while no deck is connected.
+  const promptDeckId = !allDecks && snapshot.connection.status === "connected" ? orchestrationDeckId : undefined;
+  const { prompts, source: promptSource, notice: promptNotice, addPrompt, updatePrompt, removePrompt } = usePromptLibrary({
+    deckId: promptDeckId,
+    listPrompts: runtime.listPrompts,
+    savePrompt: runtime.savePrompt,
+    deletePrompt: runtime.deletePrompt,
+    seedPrompts: runtime.seedPrompts,
+  });
   const [profileOrder, setProfileOrder] = useState<string[]>([]); // voice-registry-exempt: the orchestration editor's draft role order, edited inside that panel
 
   // PRD #743: applied on LOAD as well as on change. Keeping it in one effect
@@ -2987,9 +2996,11 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
         selectedId={selectedPromptId}
         onSelect={setSelectedPromptId}
         onClose={() => setOverlay("prompts", false)}
-        onAdd={() => setSelectedPromptId(addPrompt())}
+        source={promptSource}
+        notice={promptNotice}
+        onAdd={() => { const id = addPrompt(); if (id) setSelectedPromptId(id); }}
         onUpdate={updatePrompt}
-        onRemove={(id) => { removePrompt(id); setNotice("Prompt removed from this device's library."); }}
+        onRemove={(id) => { removePrompt(id); setNotice(promptSource.kind === "deck" ? "Prompt removed from this daemon's library." : "Prompt removed from this device's library."); }}
       />
       <ProfilesPanel open={profilesOpen} profiles={profiles} onClose={() => setOverlay("profiles", false)} onUpdate={updateProfile} onReset={resetProfiles} onSaved={() => setNotice("Agent profile draft saved locally. Project TOML is unchanged.")} />
       <OrchestrationPanel key={activeProject?.path ?? "runtime-orchestration"} open={orchestrationOpen} profiles={profiles} order={profileOrder} mode={mode} project={activeProject} onChooseProject={() => { setOverlay("orchestration", false); VOICE_ACTIONS.openProjects.run(voiceContext); }} onClose={() => setOverlay("orchestration", false)} onToggle={(id) => { const profile = profiles.find((item) => item.id === id); if (profile) updateProfile(id, { enabled: !profile.enabled }); }} onMove={moveStage} onLaunch={requestLaunch} platformIssue={orchestrationPlatformIssue} capabilityIssue={snapshot.connection.projectActionsReason} prompts={prompts} allDecks={allDecks} liveTitles={orchestrationLiveTitles} liveDirectories={orchestrationLiveDirectories} deckId={orchestrationDeckId} />

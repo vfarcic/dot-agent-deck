@@ -907,6 +907,16 @@ export interface DeckPrompt {
   note?: string;
 }
 
+/**
+ * Issue #824 — a deck's prompt library as its daemon keeps it, in order, or
+ * the deck's answer that it keeps none (`unsupported`: a daemon from before the
+ * library, which was sent nothing). The app keeps its own copy only for such a
+ * deck.
+ */
+export type DeckPromptLibrary =
+  | { kind: "deck"; prompts: DeckPrompt[] }
+  | { kind: "unsupported" };
+
 export interface WorkflowStage {
   id: string;
   label: string;
@@ -1970,6 +1980,16 @@ export interface DeckRuntimeState {
   listDirectories?: (deckId: string, path?: string, options?: DeckListingOptions) => Promise<DeckDirectoryListing>;
   /** PRD #1223 M4 — what the New agent form needs to know about the deck `deckId` names. */
   newAgentOptions?: (deckId: string) => Promise<NewAgentOptions>;
+  /**
+   * Issue #824 — the prompt library of the deck `deckId` names, and the three
+   * ways to change it; each resolves the library as it stands afterwards.
+   * Optional for the reason the two above are: a runtime without them keeps
+   * the library on this device, as the app did before decks owned it.
+   */
+  listPrompts?: (deckId: string) => Promise<DeckPromptLibrary>;
+  savePrompt?: (deckId: string, prompt: DeckPrompt) => Promise<DeckPromptLibrary>;
+  deletePrompt?: (deckId: string, id: string) => Promise<DeckPromptLibrary>;
+  seedPrompts?: (deckId: string, prompts: DeckPrompt[]) => Promise<DeckPromptLibrary>;
   /**
    * PRD #1223 M6 — the orchestrations the New agent form can offer for `path`
    * on the deck `deckId` names. Optional for the reason the two above are; a

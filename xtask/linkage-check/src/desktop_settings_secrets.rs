@@ -684,7 +684,8 @@ const PINNED_TS_FIELDS: [(&str, &str, &str); 33] = [
 /// rediscovering.
 ///
 /// Whether each of these *belongs* in `localStorage` is issue #824's question,
-/// not this check's. What this check refuses is a **new** one arriving
+/// not this check's; `docs/develop/desktop-gui.md` ("Every webview storage
+/// key, classified") records the answer for each. What this check refuses is a **new** one arriving
 /// unnoticed — including one holding a credential, which is the half of PRD
 /// #803's rule that had no enforcement at all.
 /// `PROJECTS_STORAGE_KEY` (`dot-agent-deck.desktop.projects.v1`) was the sixth
@@ -718,6 +719,10 @@ const PINNED_STORAGE_KEYS: [(&str, &str, bool); 8] = [
         "dot-agent-deck.desktop.workflow-preview.v1",
         true,
     ),
+    // Issue #824 — the prompt library is the daemon's now. The key stays
+    // pinned because `usePromptLibrary` still reads it once, to hand an
+    // existing library to a deck that keeps prompts, and writes it for a deck
+    // from before the library.
     (
         "PROMPTS_STORAGE_KEY",
         "dot-agent-deck.desktop.prompts.v1",
