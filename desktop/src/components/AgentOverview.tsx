@@ -2,7 +2,7 @@ import { Children, cloneElement, createContext, isValidElement, useCallback, use
 import { Blocks, Boxes, CircleArrowUp, CircleStop, Columns3, FileCog, Filter, LayoutList, Layers, Maximize2, Network, Play, Plus, RefreshCw, RotateCcw, Server, ShieldAlert, Sparkles, SquareTerminal, Wrench, X } from "lucide-react";
 import { desktopFeaturesOf } from "../types";
 import { worktreePreview } from "../lib/worktreeClose";
-import { type AgentSession, type AgentStatus, type ConnectionView, type DeckRuntimeState, type DeckView, type GenerateConfigResult } from "../types";
+import { type AgentSession, type AgentStatus, type ConnectionView, type DeckRuntimeState, type DeckView, type EndedRole, type GenerateConfigResult } from "../types";
 import { STATUS_WORD_ORDER, statusWord, statusWordLabel, type StatusWord } from "../lib/statusWords";
 import { modeScopedKey, type DesktopAgentDto } from "../lib/bridge";
 import { buildDashboardFilterHeader, clearDashboardFilter, DASHBOARD_AGENT_TYPES, DASHBOARD_FILTER_TEXT_MAX, DASHBOARD_KINDS, DASHBOARD_STATUSES, dashboardFilterActive, filterDashboardAgents, removeDashboardFilterFacet, setDashboardFilter, useDashboardFilter, type DashboardFilter, type DashboardFilterFacts } from "../lib/dashboardFilter";
@@ -36,6 +36,7 @@ import { HookBinaryNotices } from "./HookBinaryNotice";
 import { sameIncarnation } from "../lib/agentKey";
 import { AGENT_GONE_AFTER_RESTART } from "../lib/agentIdentity";
 import { inboxAttentionWords, INBOX_WORDS } from "../lib/inboxWords";
+import { ENDED_ROLE_WORDS, endedRolesOf } from "../lib/endedRoles";
 import { DeckAttention } from "./DeckAttention";
 import { useAgentCardsView, type AgentCardsView } from "../hooks/useAgentCardsView";
 import type { PlacedCard } from "../lib/agentCards";
@@ -235,6 +236,48 @@ export interface OverviewGroup {
    */
   orchestrationCwd?: string;
   agents: OverviewAgent[];
+  /**
+   * Issue #1965 — this orchestration's roles whose agent exited, which
+   * `agents` no longer lists: drawn after the live rows, saying which role it
+   * was and why, as the TUI's card for the same role does. Only orchestration
+   * groups have them.
+   */
+  endedRoles?: EndedRole[];
+}
+
+/**
+ * Issue #1965 — `groups` with each orchestration's exited roles attached, from
+ * the deck's own reply.
+ */
+export function withEndedRoles(groups: OverviewGroup[], endedRoles: readonly EndedRole[] | undefined): OverviewGroup[] {
+  if (!endedRoles?.length) return groups;
+  const withRows = groups.map((group) => {
+    if (group.kind !== "orchestration") return group;
+    const ended = endedRolesOf(endedRoles, group.id, new Set(group.agents.map(roleIndexOf)));
+    return ended.length ? { ...group, endedRoles: ended } : group;
+  });
+  // An orchestration every role of which has exited has no live agent to
+  // build its group from, so it gets one of its own, headed as the TUI's tab
+  // is, after the orchestrations that still have live roles.
+  const covered = new Set(groups.flatMap((group) => (group.kind === "orchestration" && group.id !== undefined ? [group.id] : [])));
+  const orphaned = new Map<string, OverviewGroup>();
+  for (const role of endedRoles) {
+    const id = role.orchestrationId;
+    if (id === undefined || covered.has(id) || orphaned.has(id)) continue;
+    orphaned.set(id, {
+      id,
+      key: groupKey("orchestration", id),
+      kind: "orchestration",
+      title: orchestrationTitle({ name: role.orchestrationName, displayTitle: role.displayTitle }),
+      subtitle: role.displayTitle ? role.orchestrationName : undefined,
+      agents: [],
+      endedRoles: endedRolesOf(endedRoles, id, new Set()),
+    });
+  }
+  if (!orphaned.size) return withRows;
+  const lastOrchestration = withRows.map((group) => group.kind).lastIndexOf("orchestration");
+  const at = lastOrchestration >= 0 ? lastOrchestration + 1 : withRows.filter((group) => group.kind === "standalone").length;
+  return [...withRows.slice(0, at), ...orphaned.values(), ...withRows.slice(at)];
 }
 
 /**
@@ -1250,9 +1293,9 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   const filtering = dashboardFilterActive(filter);
   const decks = useMemo(() => fleet.map((deck, at): FleetDeck => {
     const deckAgents = deck.agents.map(toOverviewAgent);
-    const groups = groupAgents(deckAgents);
+    const groups = withEndedRoles(groupAgents(deckAgents), deck.endedRoles);
     const matchingAgents = filtering ? filterDashboardAgents(deckAgents, filter, overviewFilterFacts) : deckAgents;
-    const shown = filtering ? groupAgents(matchingAgents) : groups;
+    const shown = filtering ? withEndedRoles(groupAgents(matchingAgents), deck.endedRoles) : groups;
     return {
       key: fleetMemberKey(deck.connection.deckId, at),
       snapshot: deck,
@@ -2675,7 +2718,9 @@ function DaemonBody({ agents, sections, filtering, now, columns, connection, mes
     return <p className="overview-filter-empty" data-testid="overview-filter-empty">{filterDaemonName(connection)}: no matching agents</p>;
   }
 
-  if (!agents.length) {
+  // Issue #1965: a deck whose only orchestration roles have exited still has
+  // their rows to show.
+  if (!agents.length && !sections.some((section) => section.group.endedRoles?.length)) {
     /*
       One full-width row rather than a centred card (issue #2312 follow-up):
       a healthy daemon with nothing to show is not worth a third of the
@@ -3047,7 +3092,8 @@ function OverviewGroupCard({ group, now, columns }: { group: OverviewGroup; now:
           <span className={`status-label status-${entry.status}`} key={entry.status}>{entry.count} {statusWordLabel(entry.status)}</span>
         ))}</div>
         {/* PRD #1223 U4: the TUI's Ctrl+W on this orchestration's tab — every role, after a confirmation that names them. */}
-        {stopControls && group.kind === "orchestration" && (
+        {/* Issue #1965: a group whose roles have all exited has no agent left to stop. */}
+        {stopControls && group.kind === "orchestration" && group.agents.length > 0 && (
           <button
             type="button"
             className="button secondary compact overview-close-orchestration"
@@ -3073,9 +3119,39 @@ function OverviewGroupCard({ group, now, columns }: { group: OverviewGroup; now:
         </thead>
         <tbody className="overview-rows" role="rowgroup">
           {group.agents.map((agent) => <OverviewRow key={agentDomKey(agent)} agent={agent} hoistedCwd={hoistedCwd} now={now} columns={columns} />)}
+          {group.endedRoles?.map((role) => <EndedRoleRow key={`ended-${role.agentId}`} role={role} />)}
         </tbody>
       </table>
     </article>
+  );
+}
+
+/**
+ * Issue #1965 — an orchestration role whose agent exited: which role, the
+ * `Exited` status, why, and the last lines its pane showed. A row with no
+ * control: there is no terminal to open, since the role's agent is gone, so it
+ * carries nothing to click, and the voice surfaces have nothing to reach
+ * (CLAUDE.md rule 23). Spans every column, whichever are on screen.
+ */
+function EndedRoleRow({ role }: { role: EndedRole }) {
+  const name = displayIdentity(role.roleName, DISPLAY_LIMITS.name, `role ${role.roleIndex + 1}`);
+  const reason = displayText(role.reason, DISPLAY_LIMITS.title);
+  return (
+    <tr className="overview-row overview-row-ended" role="row" data-status="failed" data-testid="overview-ended-role" title={displayText(role.headline, DISPLAY_LIMITS.title)}>
+      <td role="cell" className="overview-ended-cell">
+        <div className="overview-ended-head">
+          <strong className="overview-ended-name">{name}</strong>
+          <span className="status-label status-failed">{ENDED_ROLE_WORDS.status}</span>
+          <span className="overview-ended-reason">{reason}</span>
+        </div>
+        {role.lastOutput.length > 0 && (
+          <div className="overview-ended-output">
+            <span className="overview-ended-output-label">{ENDED_ROLE_WORDS.lastOutput}:</span>
+            <pre>{role.lastOutput.map((line) => displayText(line, DISPLAY_LIMITS.title)).join("\n")}</pre>
+          </div>
+        )}
+      </td>
+    </tr>
   );
 }
 

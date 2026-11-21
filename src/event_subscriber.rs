@@ -246,6 +246,11 @@ pub async fn run(client: DaemonClient, state: SharedState, config: SubscriberCon
                     Ok(Some(BroadcastMsg::TrustRequests(list))) => {
                         state.write().await.apply_trust_requests(list);
                     }
+                    // Issue #1965: an orchestration role's agent exited. The
+                    // render loop puts why on the role's card.
+                    Ok(Some(BroadcastMsg::RoleEnded(role))) => {
+                        state.write().await.queue_ended_role(role);
+                    }
                     // PRD #741 M8 (issue #801 item 3): a `kind` tag this
                     // build does not know, from a newer daemon. Ignored
                     // rather than escalated — there is no payload to act

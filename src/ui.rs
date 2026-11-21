@@ -2149,6 +2149,14 @@ struct UiState {
     /// Only orchestration ROLE panes can carry a declaration, so they are the
     /// only panes ever inserted — at spawn and on session restore.
     pane_declared_agent: HashMap<String, AgentType>,
+    /// Issue #1965: dead-slot pane id ([`dead_slot_pane_id`]) → the role whose
+    /// agent exited there, as the daemon reported it
+    /// ([`crate::ended_role::EndedRole`]). Its card says the role exited and
+    /// why ([`render_ended_role_card`]) instead of `No agent`, and selecting it
+    /// says so instead of removing it as stale. Inert once its tab closes: a
+    /// dead-slot id is minted from the orchestration instance's own id, which
+    /// no later instance reuses.
+    ended_role_slots: HashMap<String, crate::ended_role::EndedRole>,
     /// Maps pane_id → launch metadata for auto-save/restore.
     pane_metadata: HashMap<String, config::SavedPane>,
     config: DashboardConfig,
@@ -2773,6 +2781,7 @@ impl UiState {
             pending_reveal: None,
             renamed_from: HashMap::new(),
             pane_declared_agent: HashMap::new(),
+            ended_role_slots: HashMap::new(),
             pane_metadata: HashMap::new(),
             config,
             keybindings,
@@ -4065,6 +4074,65 @@ pub fn is_dead_slot_pane_id(pane_id: &str) -> bool {
     pane_id.starts_with(DEAD_SLOT_PREFIX)
 }
 
+/// Issue #1965: at most this many exited roles are remembered for cards. A
+/// report past it is dropped rather than growing the map without bound; the
+/// card it was for keeps the plain `No agent` look it had before.
+const MAX_ENDED_ROLE_SLOTS: usize = 256;
+
+/// Issue #1965: take the exited roles the daemon announced since the last
+/// frame (`BroadcastMsg::RoleEnded`) and remember each under its pane, so the
+/// role's card says which role it was and why. This is how a role that dies
+/// at spawn in a tab this TUI opened is told apart from a quiet one: its pane
+/// keeps its last frame and nothing else about it changes.
+fn drain_ended_roles(state: &SharedState, ui: &mut UiState) {
+    let ended = state.blocking_write().take_ended_roles();
+    for role in ended {
+        if ui.ended_role_slots.len() >= MAX_ENDED_ROLE_SLOTS
+            && !ui.ended_role_slots.contains_key(&role.pane_id)
+        {
+            continue;
+        }
+        ui.ended_role_slots.insert(role.pane_id.clone(), role);
+    }
+}
+
+/// Issue #1965: the exited role remembered for a card's pane, unless the card
+/// has since been taken by another agent (a `pane restart` started a fresh
+/// one there).
+fn ended_role_for<'a>(
+    ui: &'a UiState,
+    pane_id: &str,
+    agent_id: Option<&str>,
+) -> Option<&'a crate::ended_role::EndedRole> {
+    ui.ended_role_slots
+        .get(pane_id)
+        .filter(|ended| agent_id.is_none_or(|agent| agent == ended.agent_id))
+}
+
+/// Issue #1965: for each synthetic dead slot in `role_pane_ids`, remember the
+/// role whose agent exited there, so its card says which role died and why.
+/// Matched on the orchestration instance's id and the role's index, the two
+/// keys the slot itself was minted from; a slot with no reported role keeps
+/// its plain `No agent` card.
+fn remember_ended_roles(
+    ui: &mut UiState,
+    role_pane_ids: &[Option<String>],
+    orchestration_id: &str,
+    ended: &[crate::ended_role::EndedRole],
+) {
+    for (role_index, slot) in role_pane_ids.iter().enumerate() {
+        let Some(slot) = slot.as_deref().filter(|p| is_dead_slot_pane_id(p)) else {
+            continue;
+        };
+        if let Some(role) = ended.iter().rev().find(|role| {
+            role.role_index == role_index
+                && role.orchestration_id.as_deref() == Some(orchestration_id)
+        }) {
+            ui.ended_role_slots.insert(slot.to_string(), role.clone());
+        }
+    }
+}
+
 /// Fill missing role slots in `role_pane_ids` with synthetic dead-slot
 /// pane ids. Returns the list of synthetic ids that were assigned (in
 /// `role_index` order) so callers can later seed placeholder sessions
@@ -5269,6 +5337,11 @@ fn surface_one_orchestration(
                     "live orchestration surface: {warning}"
                 );
                 surface_orchestration_config_drift(ui, tab_manager.tabs().get(tab_index), warning);
+            }
+            // Issue #1965: say which role died and why on its dead slot.
+            if !dead_slot_ids.is_empty() {
+                let ended = embedded.ended_roles(learned_from);
+                remember_ended_roles(ui, &role_pane_ids, &bucket.orchestration_id, &ended);
             }
             let mut st = state.blocking_write();
             // Seed placeholder cards for synthetic dead slots only (live roles
@@ -8779,6 +8852,22 @@ fn apply_stream_rejection_feedback(
 }
 
 /// Select deck at `idx` and focus its pane. Returns `true` if idx was valid.
+/// Issue #1965: a selected role card whose role the daemon reported exited is
+/// not a stale card and has no live terminal to enter: it is where the deck
+/// shows which role died, so selecting it says why, in the card's own words
+/// ([`crate::ended_role::EndedRole::headline`]), keeps it, and attempts no
+/// attach. `false` for any other pane, which keeps the attach and the
+/// stale-card removal.
+fn ended_role_selected(ui: &mut UiState, session: &SessionState) -> bool {
+    let Some(headline) = session.pane_id.as_deref().and_then(|pane_id| {
+        ended_role_for(ui, pane_id, session.agent_id.as_deref()).map(|e| e.headline())
+    }) else {
+        return false;
+    };
+    ui.status_message = Some((headline, std::time::Instant::now()));
+    true
+}
+
 fn focus_deck(
     idx: usize,
     ui: &mut UiState,
@@ -8819,6 +8908,9 @@ fn focus_deck(
             // learned from only.
             // G-fix7: and a local pane under the same id focuses only when it
             // is the card's own.
+            if ended_role_selected(ui, session) {
+                return true;
+            }
             let card = crate::pane::BoundPane::new(pane_id.clone(), session.incarnation.clone());
             let mut focus_result = pane.focus_card(&card);
             if let Err(PaneError::CommandFailed(_)) = focus_result
@@ -12207,6 +12299,8 @@ fn dispatch_action(
                 // can't accept live input, so don't enter PaneInput.
                 if let Some(msg) = non_live_input_feedback(session.writable()) {
                     ui.status_message = Some((msg.to_string(), std::time::Instant::now()));
+                } else if ended_role_selected(ui, session) {
+                    // Issue #1965: an exited role's card says why and stays.
                 } else if let Some(ref pane_id) = session.pane_id {
                     if let Some(tab_idx) = tab_manager.tab_index_for_pane(pane_id) {
                         // PRD #83: snapshot the SOURCE tab's focus before
@@ -15419,6 +15513,21 @@ pub fn run_tui(
                             warning,
                         );
                     }
+                    // Issue #1965: say which role died and why on its dead
+                    // slot, from the daemon process these panes came from.
+                    if !dead_slot_synthetic_ids.is_empty() {
+                        let learned_from = hydrated
+                            .first()
+                            .map(|h| h.incarnation.clone())
+                            .unwrap_or(crate::daemon_client::Incarnation::UNNAMED);
+                        let ended = embedded.ended_roles(&learned_from);
+                        remember_ended_roles(
+                            &mut ui,
+                            &role_pane_ids,
+                            &bucket.orchestration_id,
+                            &ended,
+                        );
+                    }
                     let mut st = state.blocking_write();
                     // CodeRabbit PR #118 finding #3: seed placeholder
                     // sessions for dead slots only after the tab has
@@ -15845,6 +15954,8 @@ pub fn run_tui(
         // PRD #1666 part 2 (G-fix7c): drop what a deck restart took, before the
         // snapshot below derives this frame's selection and names.
         process_restart_drops(&state, pane.as_ref(), &mut tab_manager, &mut ui);
+        // Issue #1965: a role whose agent exited says which role and why.
+        drain_ended_roles(&state, &mut ui);
         // Issue #717: report a dispatched worktree the daemon actually left
         // on disk. Queued by the event subscriber, drained here because the
         // status line is `UiState`.
@@ -19047,6 +19158,17 @@ fn render_card_grid(
             let settling = ids
                 .get(col_idx)
                 .is_some_and(|id| ui.idle_settling.contains_key(*id));
+            // Issue #1965: a dead slot whose role the daemon reported exited
+            // says which role it was and why.
+            if let Some(ended) = session
+                .pane_id
+                .as_deref()
+                .and_then(|pane_id| ended_role_for(ui, pane_id, session.agent_id.as_deref()))
+            {
+                render_ended_role_card(frame, card_area, ended, is_selected, card_number, ui.mode);
+                ui.card_rects.push((flat_index, card_area));
+                continue;
+            }
             render_session_card(
                 frame,
                 card_area,
@@ -25407,6 +25529,86 @@ fn card_border_glyph(is_selected: bool, mode: UiMode) -> (BorderType, Modifier) 
         Modifier::BOLD
     };
     (BorderType::Thick, emphasis)
+}
+
+/// Issue #1965: the card of an orchestration role whose agent exited, in place
+/// of the `No agent` placeholder its dead slot used to show. The title names
+/// the role, the right-hand badge reads [`crate::ended_role::STATUS`] in the
+/// Error colour, and the body says why ([`crate::ended_role::EndedRole::reason`])
+/// and, where rows are left, the last lines the pane showed under
+/// [`crate::ended_role::LAST_OUTPUT`]. The words are the desktop row's
+/// (`tests/fixtures/ended-role.json`).
+fn render_ended_role_card(
+    frame: &mut Frame,
+    area: Rect,
+    ended: &crate::ended_role::EndedRole,
+    is_selected: bool,
+    card_number: Option<u8>,
+    mode: UiMode,
+) {
+    let error = palette::status_color(&SessionStatus::Error);
+    let title_bold = text_primary().add_modifier(Modifier::BOLD);
+    let num_prefix = card_number.map(|n| format!("{n} ")).unwrap_or_default();
+    let sel_prefix = if is_selected { "▸ " } else { "" };
+    let badge = format!(" {} ", crate::ended_role::STATUS);
+    let badge_width = unicode_width::UnicodeWidthStr::width(badge.as_str());
+    let max_title = (area.width as usize).saturating_sub(badge_width + 2);
+    let title = truncate_styled_segments(
+        vec![
+            (format!(" {sel_prefix}{num_prefix}"), title_bold),
+            (format!("{} ", ended.role_name), title_bold),
+        ],
+        max_title,
+    );
+    let base_border_style = if is_selected {
+        Style::default().fg(palette::SELECTED)
+    } else {
+        Style::default().fg(error)
+    };
+    let (border_type, border_emphasis) = card_border_glyph(is_selected, mode);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(border_type)
+        .border_style(base_border_style.add_modifier(border_emphasis))
+        .title(Line::from(title))
+        .title(
+            Line::from(Span::styled(
+                badge,
+                Style::default().fg(error).add_modifier(Modifier::BOLD),
+            ))
+            .alignment(ratatui::layout::Alignment::Right),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let rows = inner.height as usize;
+    let width = inner.width as usize;
+    if rows == 0 || width == 0 {
+        return;
+    }
+    let line = |text: String, style: Style| {
+        Line::from(truncate_styled_segments(vec![(text, style)], width))
+    };
+    let mut lines = vec![line(ended.reason(), Style::default().fg(error))];
+    let output = &ended.last_output;
+    if !output.is_empty() && rows >= 2 {
+        let room = rows - 1;
+        if room >= 2 {
+            lines.push(line(
+                format!("{}:", crate::ended_role::LAST_OUTPUT),
+                text_dim(),
+            ));
+            let shown = output.len().min(room - 1);
+            for text in &output[output.len() - shown..] {
+                lines.push(line(text.clone(), text_primary()));
+            }
+        } else if let Some(last) = output.last() {
+            lines.push(line(
+                format!("{}: {last}", crate::ended_role::LAST_OUTPUT),
+                text_dim(),
+            ));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -37832,6 +38034,194 @@ mod tests {
             "a card with no backing daemon pane must still be cleaned up"
         );
         assert!(!entered, "a failed attach must not enter PaneInput mode");
+    }
+
+    /// Issue #1965: the reviewer role of the `mixed` orchestration, whose
+    /// command exited with code 1 after printing Pi's extension error.
+    fn ended_reviewer() -> crate::ended_role::EndedRole {
+        crate::ended_role::EndedRole {
+            pane_id: "7".into(),
+            agent_id: "7".into(),
+            role_index: 1,
+            role_name: "reviewer".into(),
+            orchestration_id: Some("orch-1965".into()),
+            orchestration_name: "mixed".into(),
+            display_title: None,
+            termination: Some(crate::inbox_display::PaneTermination::PaneCommandExited {
+                code: 1,
+                reported_by: crate::inbox_display::TerminationSource::Deck,
+            }),
+            last_output: vec![
+                "Error: Failed to load extension".into(),
+                "Cannot find module './usage-file.ts'".into(),
+            ],
+        }
+    }
+
+    fn ended_role_card_text(width: u16, height: u16, selected: bool) -> String {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_ended_role_card(
+                    frame,
+                    Rect::new(0, 0, width, height),
+                    &ended_reviewer(),
+                    selected,
+                    Some(2),
+                    UiMode::Normal,
+                );
+            })
+            .unwrap();
+        buffer_to_string(terminal.backend().buffer())
+    }
+
+    /// Scenario: draw the card of an orchestration role whose command exited
+    /// at spawn, 60 columns wide at the Normal density. It names the role,
+    /// reads `Exited` where a live card shows its status, says the command
+    /// exited with code 1, and shows the last lines the pane printed under
+    /// `Last output:`, in the words the desktop's row uses (issue #1965).
+    #[test]
+    fn an_exited_role_card_names_the_role_and_why_it_ended() {
+        insta::assert_snapshot!(ended_role_card_text(60, 8, false), @r"
+        ┌ 2 reviewer ────────────────────────────────────── Exited ┐
+        │its command exited (code 1)                               │
+        │Last output:                                              │
+        │Error: Failed to load extension                           │
+        │Cannot find module './usage-file.ts'                      │
+        │                                                          │
+        │                                                          │
+        └──────────────────────────────────────────────────────────┘
+        ");
+    }
+
+    /// Scenario: the same card at the Minimal density (one body row) keeps
+    /// the reason, and selected it carries the `▸` marker like any card.
+    #[test]
+    fn a_minimal_exited_role_card_keeps_the_reason() {
+        let card = ended_role_card_text(48, 3, true);
+        assert!(card.contains("▸ 2 reviewer"), "{card}");
+        assert!(card.contains("Exited"), "{card}");
+        assert!(card.contains("its command exited (code 1)"), "{card}");
+    }
+
+    /// Scenario: a dead slot of an orchestration tab whose role the daemon
+    /// reported exited is drawn through the live card grid: it shows the
+    /// role's `Exited` card instead of `No agent` and a truncated synthetic
+    /// pane id (issue #1965).
+    #[test]
+    fn the_card_grid_draws_a_reported_dead_slot_as_its_exited_role() {
+        let identity = test_identity("orch-1965", "mixed");
+        let mut slots = vec![Some("live-pane".to_string()), None];
+        let dead = assign_synthetic_dead_slot_ids(&mut slots, &identity);
+        let mut ui = default_ui();
+        remember_ended_roles(&mut ui, &slots, "orch-1965", &[ended_reviewer()]);
+        assert_eq!(
+            ui.ended_role_slots
+                .get(&dead[0])
+                .map(|r| r.role_name.as_str()),
+            Some("reviewer")
+        );
+        // Another instance's report, or another role's, fills no slot.
+        let mut other = default_ui();
+        remember_ended_roles(&mut other, &slots, "orch-other", &[ended_reviewer()]);
+        assert!(other.ended_role_slots.is_empty());
+
+        let mut st = AppState::default();
+        let sid = st.insert_placeholder_session(dead[0].clone(), Some("/work".into()), None, None);
+        let session = st.sessions[&sid].clone();
+        let backend = ratatui::backend::TestBackend::new(60, 12);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_card_grid(
+                    frame,
+                    Rect::new(0, 0, 60, 12),
+                    &mut ui,
+                    &[&session],
+                    &[&sid],
+                    1,
+                    0,
+                    Utc::now(),
+                    None,
+                );
+            })
+            .unwrap();
+        let text = buffer_to_string(terminal.backend().buffer());
+        assert!(text.contains("reviewer"), "{text}");
+        assert!(text.contains("Exited"), "{text}");
+        assert!(text.contains("its command exited (code 1)"), "{text}");
+        assert!(!text.contains("No agent"), "{text}");
+        assert!(!text.contains("pane-__dead"), "{text}");
+    }
+
+    /// Scenario: the daemon announces that the reviewer role exited; the next
+    /// frame remembers it under the role's pane, so its card says why. Once
+    /// another agent holds that pane (a `pane restart`), the report no longer
+    /// applies to the card (issue #1965).
+    #[test]
+    fn an_announced_exited_role_reaches_its_card_until_another_agent_holds_the_pane() {
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        state.blocking_write().queue_ended_role(ended_reviewer());
+        let mut ui = default_ui();
+        drain_ended_roles(&state, &mut ui);
+        assert!(state.blocking_read().pending_ended_roles.is_empty());
+        assert_eq!(
+            ended_role_for(&ui, "7", Some("7")).map(|r| r.reason()),
+            Some("its command exited (code 1)".to_string())
+        );
+        assert!(ended_role_for(&ui, "7", None).is_some());
+        assert!(
+            ended_role_for(&ui, "7", Some("8")).is_none(),
+            "a successor's card is not the exited role's"
+        );
+    }
+
+    /// Scenario: press Enter on the card of a role the daemon reported exited.
+    /// The attach fails as it does for any dead slot, but the card is kept and
+    /// the status line says which role exited and why, instead of `Removed
+    /// stale agent` (issue #1965).
+    #[test]
+    fn enter_on_an_exited_role_keeps_its_card_and_says_why() {
+        use tokio::sync::RwLock;
+
+        let pc = Arc::new(UnwiredPC::new(false));
+        let mut tab_manager = TabManager::new(pc.clone());
+        let snapshot = dashboard_snapshot(1);
+        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
+        let filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
+        let mut ui = default_ui();
+        ui.selected_index = Some(0);
+        ui.ended_role_slots.insert("p0".into(), ended_reviewer());
+
+        dispatch_action(
+            Action::Focus,
+            &mut ui,
+            &*pc,
+            &state,
+            &mut tab_manager,
+            &snapshot,
+            &filtered,
+            Some("s0"),
+            Rect::new(0, 0, 80, 24),
+        );
+
+        assert!(state.blocking_read().sessions.contains_key("s0"));
+        assert!(!matches!(ui.mode, UiMode::PaneInput));
+        assert_eq!(
+            ui.status_message.as_ref().map(|(m, _)| m.as_str()),
+            Some("reviewer exited: its command exited (code 1)")
+        );
+
+        // The digit jump says the same.
+        let mut ui = default_ui();
+        ui.ended_role_slots.insert("p0".into(), ended_reviewer());
+        focus_deck(0, &mut ui, &filtered, &snapshot, &state, &*pc);
+        assert!(state.blocking_read().sessions.contains_key("s0"));
+        assert_eq!(
+            ui.status_message.as_ref().map(|(m, _)| m.as_str()),
+            Some("reviewer exited: its command exited (code 1)")
+        );
     }
 
     /// Scenario: Open a second (Orchestration) tab so a tab switch is possible, arm the

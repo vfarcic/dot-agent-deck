@@ -4307,6 +4307,18 @@ pub struct AttachResponse {
     /// cannot answer the question at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestration_roles: Option<Vec<crate::state::OrchestrationRoleRecord>>,
+    /// Issue #1965: the orchestration roles whose agent exited on its own and
+    /// whose pane nobody closed yet ([`crate::agent_pty::AgentPtyRegistry::ended_roles`]),
+    /// with how each pane ended and the last lines it showed. Populated on the
+    /// [`AttachRequest::ListAgents`] reply, beside the live records that no
+    /// longer list them, so a client can show which role died and why instead
+    /// of dropping it.
+    ///
+    /// Additive and optional, so no [`PROTOCOL_VERSION`] bump: an older client
+    /// ignores the key, and a client reading an older daemon's reply gets
+    /// `None` and shows what it showed before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_roles: Option<Vec<crate::ended_role::EndedRole>>,
     /// Issue #1637: the agents whose hooks run a `dot-agent-deck` older than
     /// this daemon (or that this deck could not install hooks for, issue
     /// #1157), with what to do about each. Set on the [`AttachRequest::Hello`]
@@ -7115,6 +7127,8 @@ async fn handle_connection(
             crate::agent_pty::attach_project_config_exists(&mut records).await;
             let mut resp = AttachResponse::agent_records(records);
             resp.orchestration_roles = Some(orchestration_roles);
+            // Issue #1965: the roles the live records above no longer list.
+            resp.ended_roles = Some(registry.ended_roles());
             // Issue #887: the client's only observable of the schedule seed the
             // daemon's project list draws on. See `AttachResponse::schedule_revision`.
             resp.schedule_revision = Some(scheduler.revision());

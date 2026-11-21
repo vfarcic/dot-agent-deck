@@ -92,6 +92,7 @@ pub mod composer_probe;
 pub mod embedded_pane;
 // PRD #1419 Decision 4: the user docs embedded at build time for `docs [topic]`.
 pub mod embedded_docs;
+pub mod ended_role;
 // Issue #1121: the endpoint I/O that `platform::paths`' pure resolvers must not
 // do — creating the owner-only fallback directory, and the connect side's
 // read-only probe of the pre-#1121 endpoint spelling.

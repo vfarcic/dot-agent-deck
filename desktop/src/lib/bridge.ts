@@ -25,6 +25,7 @@ import { NOTICE_THANKS, noticeStartFrom, type NoticeChoice, type NoticeStart } f
 import { DEFAULT_DESKTOP_FEATURES, UNREPORTED } from "../types";
 import type { HandoffEdge,
   AgentBackground,
+  EndedRole,
   AgentBlocked,
   AgentInbox,
   HookBinaryNotice,
@@ -255,6 +256,8 @@ export interface DesktopSnapshotDto {
    * connected deck is kept.
    */
   hostMetrics?: HostMetricsReport;
+  /** Issue #1965 — see `DeckSnapshot.endedRoles`. Absent when there are none. */
+  endedRoles?: EndedRole[];
 }
 
 /** One configured-but-unaddressed deck (PRD #742 M12). */
@@ -3201,6 +3204,8 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
     // PRD #1258 M4: a connected deck keeps its last host answer through a
     // snapshot that carries none; a deck that is not connected shows none.
     ...(hostMetrics === undefined ? {} : { hostMetrics }),
+    // Issue #1965: only a connected deck's reply says which roles exited.
+    ...(dto.connection.status === "connected" && dto.endedRoles?.length ? { endedRoles: dto.endedRoles } : {}),
     connection: {
       status: dto.connection.status === "incompatible" ? "error" : dto.connection.status,
       deckId: dto.connection.deckId,
