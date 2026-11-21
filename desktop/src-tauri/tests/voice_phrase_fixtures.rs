@@ -205,6 +205,10 @@ struct PhraseFixture {
     /// and its casing and punctuation are its own.
     #[serde(default)]
     dictate_prefix: Option<String>,
+    /// PRD #1184: on a `chain` fixture, the action of every step, in order
+    /// (`action` is the first). Empty for every other fixture.
+    #[serde(default)]
+    steps: Vec<String>,
     /// The text a `filter_text` param must resolve to — what the directory
     /// Filter box would be set to (PR #1451 round 3, change 5). The app
     /// lowercases it, so it is written lowercase here and compared exactly.
@@ -248,6 +252,10 @@ enum OutcomeKind {
     ResolutionFailed,
     TranscriptionFailed,
     Dropped,
+    /// PRD #1184: an utterance answered as steps the app would not run.
+    ChainRefused,
+    /// PRD #1184: an utterance answered as steps to run in order.
+    Chain,
 }
 
 impl fmt::Display for OutcomeKind {
@@ -264,6 +272,8 @@ impl fmt::Display for OutcomeKind {
             Self::ResolutionFailed => "resolution_failed",
             Self::TranscriptionFailed => "transcription_failed",
             Self::Dropped => "dropped",
+            Self::ChainRefused => "chain_refused",
+            Self::Chain => "chain",
         })
     }
 }
@@ -332,6 +342,15 @@ fn observed(outcome: &VoiceOutcome) -> (Option<&str>, OutcomeKind, Option<&str>)
         VoiceOutcome::ResolutionFailed { .. } => (None, OutcomeKind::ResolutionFailed, None),
         VoiceOutcome::TranscriptionFailed { .. } => (None, OutcomeKind::TranscriptionFailed, None),
         VoiceOutcome::Dropped { .. } => (None, OutcomeKind::Dropped, None),
+        // Nothing ran, which a fixture states as the no-match action.
+        VoiceOutcome::ChainRefused { .. } => {
+            (Some(NO_MATCH_ACTION), OutcomeKind::ChainRefused, None)
+        }
+        VoiceOutcome::Chain { steps, .. } => (
+            steps.first().map(|step| step.action.as_str()),
+            OutcomeKind::Chain,
+            None,
+        ),
     }
 }
 
@@ -1531,6 +1550,29 @@ fn validate_fixtures(fixtures: &FixtureManifest, world: &PlantedWorld) {
     } = world;
     let form_choices = new_agent_form.form.as_ref().expect("planted");
     for fixture in &fixtures.fixtures {
+        // PRD #1184: a chain fixture names every step, the first being its
+        // `action`, and each a row of the table.
+        assert_eq!(
+            fixture.outcome == OutcomeKind::Chain,
+            !fixture.steps.is_empty(),
+            "{}: a `chain` fixture lists its `steps`, and only a chain fixture does",
+            fixture.name
+        );
+        if fixture.outcome == OutcomeKind::Chain {
+            assert_eq!(
+                fixture.steps.first(),
+                Some(&fixture.action),
+                "{}",
+                fixture.name
+            );
+            for step in &fixture.steps {
+                assert!(
+                    table().row(step).is_some(),
+                    "{}: no row {step}",
+                    fixture.name
+                );
+            }
+        }
         if fixture.outcome == OutcomeKind::Dispatch {
             let row = table()
                 .row(&fixture.action)
@@ -1790,10 +1832,14 @@ async fn run_fixtures(fixtures: FixtureManifest) {
             )),
             Ok(answer) => {
                 let (actual_action, actual_outcome, actual_agent) = observed(&answer.outcome);
+                // PRD #1184: a refused chain runs nothing, so it is a safe
+                // refusal too.
                 let safe_refusal = fixture.refusal
                     && matches!(
                         actual_outcome,
-                        OutcomeKind::NoMatch | OutcomeKind::ActionUngrounded
+                        OutcomeKind::NoMatch
+                            | OutcomeKind::ActionUngrounded
+                            | OutcomeKind::ChainRefused
                     );
                 let action_matches = safe_refusal || actual_action == Some(fixture.action.as_str());
                 let agent_matches = match fixture.resolved_agent.as_deref() {
@@ -1937,10 +1983,14 @@ async fn run_fixtures(fixtures: FixtureManifest) {
                             .iter()
                             .any(|candidate| candidate == id)
                     });
+                let steps_match = fixture.steps.is_empty()
+                    || matches!(&answer.outcome, VoiceOutcome::Chain { steps, .. }
+                        if steps.iter().map(|step| step.action.as_str()).eq(fixture.steps.iter().map(String::as_str)));
                 let outcome_matches = safe_refusal
                     || (actual_outcome == fixture.outcome && candidates_match)
                     || settled_tie;
                 if action_matches
+                    && steps_match
                     && outcome_matches
                     && agent_matches
                     && deck_matches

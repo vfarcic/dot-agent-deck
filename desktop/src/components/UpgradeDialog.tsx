@@ -31,7 +31,7 @@ export interface UpgradeTarget {
 /** Why voice's "close" leaves the dialog up while the upgrade runs (issue #1709). */
 export const UPGRADE_RUNNING_CLOSE_BLOCKED = "The upgrade is still running. The dialog can be closed once it has finished.";
 /** Why it leaves the dialog up while an answer to its question is on its way. */
-export const UPGRADE_ANSWERING_CLOSE_BLOCKED = "Your answer is on its way. The dialog can be closed once it has arrived.";
+const UPGRADE_ANSWERING_CLOSE_BLOCKED = "Your answer is on its way. The dialog can be closed once it has arrived.";
 
 /** Which question an answer is for: the run, and the question within it. */
 type QuestionRef = Pick<UpgradeDecisionEvent, "upgradeId" | "questionId">;

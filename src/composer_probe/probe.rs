@@ -34,7 +34,16 @@
 //! once [`SURFACE_PER_FAILURE`] of them come in a row ([`Schedule::surface`],
 //! #2147): the agent is usually still drawing after a person's key, and a
 //! full backoff step there delayed the check by 30 s and made a later lapse
-//! the second failure. After [`BROKEN_AFTER`] failures in a
+//! the second failure. A refusal when scheduled only because the
+//! agent's query waits may not have run out (admission's O5 `Estimate`,
+//! every other conjunct having passed, the screen included) makes the next
+//! attempt due when the estimate says they have, and counts as a failure
+//! only once [`ESTIMATE_PER_FAILURE`] of them come in a row
+//! ([`Schedule::estimate`], #2129): a few quick resizes of a Codex pane no
+//! client answers cursor queries for chain its waits, the deck's own
+//! refresh nudge moves the estimate again while the attempt waits for it,
+//! and a full backoff step there delayed the check by 30 s. After
+//! [`BROKEN_AFTER`] failures in a
 //! row the generation's observer is broken, which its caller shows and logs;
 //! the waits go on as above, and a person's op makes one fresh attempt due
 //! at once, so a repaired daemon or a transient failure recovers. R2 §6.8's
@@ -116,6 +125,15 @@ pub const SURFACE_RECHECK: Duration = Duration::from_secs(2);
 /// after `SURFACE_PER_FAILURE - 1` rechecks that write nothing.
 pub const SURFACE_PER_FAILURE: u32 = 4;
 
+/// How many refusals in a row when scheduled for the query-wait estimate
+/// alone count as one failure ([`Schedule::estimate`], #2129): the last of
+/// them backs the schedule off as any failure does, so an agent whose
+/// estimate keeps moving (a resize storm, or a query it keeps asking
+/// unanswered) still walks the backoff steps, each after
+/// `ESTIMATE_PER_FAILURE - 1` attempts that write nothing, none sooner than
+/// the estimate it was refused for.
+pub const ESTIMATE_PER_FAILURE: u32 = 4;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Wait {
     /// Due now.
@@ -140,6 +158,9 @@ pub struct Schedule {
     /// Refusals when scheduled for the screen alone since the last failure
     /// or read ([`Self::surface`]).
     surface: u32,
+    /// Refusals for the query-wait estimate alone since the last failure or
+    /// read ([`Self::estimate`]).
+    estimate: u32,
 }
 
 impl Default for Schedule {
@@ -150,6 +171,7 @@ impl Default for Schedule {
             broken: false,
             moved: 0,
             surface: 0,
+            estimate: 0,
         }
     }
 }
@@ -175,10 +197,35 @@ impl Schedule {
         self.failures
     }
 
-    /// Whether the last attempt failed or was refused for the screen, so
-    /// the box can't be checked until the next: what the card shows.
+    /// Whether the last attempt failed or was refused for the screen or the
+    /// query-wait estimate, so the box can't be checked until the next: what
+    /// the card shows.
     pub fn failing(&self) -> bool {
-        self.failures > 0 || self.surface > 0
+        self.failures > 0 || self.surface > 0 || self.estimate > 0
+    }
+
+    /// Admission refused an attempt at `now` only because the query-wait
+    /// estimate `until` is still ahead (O5, #2129): every other conjunct,
+    /// the screen included, passed. The next attempt is due at `until`, no
+    /// sooner than `now` (admission refuses every attempt before it, since
+    /// the estimate only moves later until an update overflows it), and
+    /// nothing counts, unless it is the [`ESTIMATE_PER_FAILURE`]th such
+    /// refusal since the last failure or read, which counts as one
+    /// ([`Self::failed`]) and waits the later of its backoff step and
+    /// `until` (an estimate can run up to its profile's cap ahead, past the
+    /// first step). Whether it counted. Only the wait moves: the attempt it
+    /// makes due is asked of admission again, every conjunct included.
+    pub fn estimate(&mut self, now: Instant, until: Instant) -> bool {
+        self.estimate = self.estimate.saturating_add(1);
+        if self.estimate >= ESTIMATE_PER_FAILURE {
+            self.failed(now);
+            if let Wait::Until(at) = self.wait {
+                self.wait = Wait::Until(at.max(until));
+            }
+            return true;
+        }
+        self.wait = Wait::Until(until.max(now));
+        false
     }
 
     /// Admission refused an attempt at `now` when it was scheduled only
@@ -218,6 +265,7 @@ impl Schedule {
     pub fn failed(&mut self, now: Instant) {
         self.moved = 0;
         self.surface = 0;
+        self.estimate = 0;
         self.failures = self.failures.saturating_add(1);
         if self.failures >= BROKEN_AFTER {
             self.broken = true;
@@ -234,6 +282,7 @@ impl Schedule {
     pub fn non_empty(&mut self, now: Instant, epoch: u64) {
         self.moved = 0;
         self.surface = 0;
+        self.estimate = 0;
         self.failures = 0;
         self.broken = false;
         self.wait = now
@@ -728,6 +777,70 @@ mod tests {
         assert_eq!(s, Schedule::default());
     }
 
+    /// Scenario: Refuse a schedule's attempts for the query-wait estimate alone, the estimate moving later each time, as after a few quick resizes of a Codex pane. The first three make the next attempt due exactly when the estimate it was refused for runs out, never sooner than the refusal itself, count no failure and leave the card saying the box can't be checked; the fourth counts one failure with the first backoff step, or with the estimate when that is further off. A failure of another kind clears the run, and so does a read, which also stops the card saying the box can't be checked (#2129).
+    #[spec("inbox/probe/104")]
+    #[test]
+    fn probe_104_estimate_refusals_wait_for_the_estimate_and_count_every_fourth() {
+        assert_eq!(ESTIMATE_PER_FAILURE, 4);
+        let ms = Duration::from_millis;
+        let t = Instant::now();
+        let mut s = Schedule::default();
+        let mut at = t;
+        for n in 1..ESTIMATE_PER_FAILURE {
+            let until = at + ms(4500);
+            assert!(!s.estimate(at, until), "refusal {n} counts nothing");
+            assert_eq!(s.failures(), 0, "refusal {n}");
+            assert!(s.failing(), "refusal {n}: the card holds");
+            assert!(!s.due(until - ms(1), 0), "refusal {n}: not before");
+            assert!(s.due(until, 0), "refusal {n}: due when it runs out");
+            at = until;
+        }
+        assert!(s.estimate(at, at + ms(4500)), "the fourth in a row counts");
+        assert_eq!(s.failures(), 1);
+        assert!(!s.due(at + BACKOFF[0] - ms(1), 0));
+        assert!(s.due(at + BACKOFF[0], 0));
+
+        // The counted one waits for an estimate further off than its step
+        // (Codex's can run 120.5 s ahead), not only the step.
+        let mut s = Schedule::default();
+        for _ in 1..ESTIMATE_PER_FAILURE {
+            s.estimate(t, t);
+        }
+        let far = t + Duration::from_secs(120) + ms(500);
+        assert!(s.estimate(t, far), "the fourth in a row counts");
+        assert_eq!(s.failures(), 1);
+        assert!(!s.due(t + BACKOFF[0], 0), "not at the step alone");
+        assert!(!s.due(far - ms(1), 0));
+        assert!(s.due(far, 0), "due when the estimate runs out");
+
+        // An estimate already behind the refusal is due at the refusal.
+        let mut s = Schedule::default();
+        assert!(!s.estimate(t + ms(10), t));
+        assert!(!s.due(t + ms(9), 0));
+        assert!(s.due(t + ms(10), 0));
+
+        // A failure of another kind clears the run.
+        let mut s = Schedule::default();
+        for _ in 1..ESTIMATE_PER_FAILURE {
+            s.estimate(t, t);
+        }
+        s.failed(t);
+        assert!(!s.estimate(t, t), "the run started again");
+        assert_eq!(s.failures(), 1, "and keeps the failures");
+
+        // A read clears it, and the card with it.
+        let mut s = Schedule::default();
+        s.estimate(t, t + ms(100));
+        s.non_empty(t, 3);
+        assert!(!s.failing(), "a non-empty read: the card says a draft");
+        for _ in 1..ESTIMATE_PER_FAILURE {
+            assert!(!s.estimate(t, t), "the run started again after the read");
+        }
+        s.empty();
+        assert!(!s.failing());
+        assert_eq!(s, Schedule::default());
+    }
+
     /// Q105b.2: the e2e clock offset moves only the pending wait, `Until`
     /// and `Epoch` alike, by exactly what it is given; the failures,
     /// `broken`, an epoch wait's epoch and the other waits stay as they are.
@@ -770,6 +883,7 @@ mod tests {
                 broken: false,
                 moved: 0,
                 surface: 0,
+                estimate: 0,
             };
             other.advance(BACKOFF_LAST);
             assert_eq!(other.wait, wait, "{wait:?} is no pending instant");

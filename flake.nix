@@ -378,7 +378,7 @@
               default = { };
               example = lib.literalExpression ''
                 {
-                  global = { toggle_layout = "Alt+Shift+l"; new_pane = ""; };
+                  global = { toggle_zoom = "Ctrl+Alt+z"; new_pane = ""; };
                   dashboard.help = "F1";
                 }
               '';

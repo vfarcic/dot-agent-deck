@@ -19,7 +19,7 @@ import { agentSpokenName } from "./agentNames";
 import type { AgentSession, AnswerSettlement } from "../types";
 
 /** One option of a pending question, as the desktop crate projects it. Every text field is the agent's own, already scrubbed. */
-export type PendingQuestionOptionDto = {
+type PendingQuestionOptionDto = {
   /** 1-based, the number the agent shows beside it. */
   index: number;
   label: string;
@@ -35,7 +35,7 @@ export type PendingQuestionOptionDto = {
 };
 
 /** One question of a pending question. */
-export type PendingQuestionItemDto = {
+type PendingQuestionItemDto = {
   prompt: string;
   header?: string;
   multiSelect: boolean;
@@ -76,7 +76,7 @@ export type QuestionSelectionDto = { questionIndex: number; optionIndices: numbe
 export type QuestionTextSlotDto = { questionIndex: number; optionIndex: number };
 
 /** What one utterance did to the question (`voice::question::QuestionVerdict`). */
-export type QuestionVerdictDto =
+type QuestionVerdictDto =
   | {
     kind: "answered";
     /** The WHOLE form after this utterance — it replaces the panel's copy. */
@@ -110,7 +110,7 @@ export type AnswerOutcomeDto = {
  * cut is made here instead, where {@link agentSpokenName} takes it from the
  * run's title first, so a long title never cuts off the agent's own name.
  */
-export const QUESTION_AGENT_NAME_MAX_CHARS = 120;
+const QUESTION_AGENT_NAME_MAX_CHARS = 120;
 
 /**
  * Issue #1668 — what a question sentence calls the agent waiting on it: an
@@ -159,7 +159,7 @@ function chosen(question: PendingQuestionDto, selection: QuestionSelectionDto): 
  * Size → Large". Rust's `sent_line`, which says the same of an answer whose
  * report came back; this says it of one a settlement confirmed later.
  */
-export function sentLine(question: PendingQuestionDto, form: QuestionSelectionDto[]): string {
+function sentLine(question: PendingQuestionDto, form: QuestionSelectionDto[]): string {
   const single = question.questions.length === 1 && form.length === 1 && form[0].optionIndices.length === 1
     ? chosen(question, form[0])[0]
     : undefined;
@@ -210,7 +210,7 @@ export const QUESTION_SAY_CONFIRM = "Say “confirm” to always allow, or “ca
 export const QUESTION_COUNTDOWN_STOPPED = " — stopped because you spoke. Say the answer again to send it.";
 
 /** Any other reason a running answer countdown was called off. */
-export function questionCalledOff(why: string): string {
+function questionCalledOff(why: string): string {
   return `Nothing was sent — ${why}.`;
 }
 

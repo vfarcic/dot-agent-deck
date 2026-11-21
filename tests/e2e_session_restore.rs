@@ -310,7 +310,7 @@ fn restore_001_no_flag_startup_restores_panes_from_snapshot() {
     // the embedded pane column taking two thirds of the row, a card fits about
     // ten characters of name, so the original `restored-alpha` / `restored-beta`
     // rendered as `restored-…` and `restored-be…`. That still passed only because
-    // `PaneLayout::Stacked` used to draw a collapsed 1-row frame per non-focused
+    // the pane column used to draw a collapsed 1-row frame per non-focused
     // pane, whose title spelled out the second pane's full name in the pane
     // column. PRD #311 removes those frames — only the focused pane is drawn — so
     // the full `restored-beta` is no longer anywhere on screen and a full-name
@@ -1017,7 +1017,7 @@ fn restore_021_reattach_seats_the_tab_where_the_daemon_registered_its_orchestrat
     // with nothing focused, which the deck draws as card 0 whatever the seat —
     // so the seat is observed where it decides focus: switching INTO the tab
     // falls back to `role_pane_ids[start_role_index]`
-    // (`restore_focus_on_switch_in`), and `PaneLayout::Stacked` draws only the
+    // (`restore_focus_on_switch_in`), and the deck draws only the
     // focused role's pane.
     let second = launch(&shared.path().join("no-session.toml"));
     second.wait_for_string("2 agent(s)");
@@ -1459,7 +1459,7 @@ fn launch_deck_against(daemon: &common::DaemonProc, session_file: &Path) -> TuiD
 }
 
 /// The role name fused into the top border of the ONE expanded role-pane box.
-/// `PaneLayout::Stacked` draws only the FOCUSED role's pane (PRD #311), so this
+/// the deck draws only the FOCUSED role's pane (PRD #311), so this
 /// answers "which role is the deck focused on", and `None` means no
 /// orchestration role pane is expanded at all (the Dashboard tab).
 fn focused_role_pane(grid: &str) -> Option<&'static str> {
