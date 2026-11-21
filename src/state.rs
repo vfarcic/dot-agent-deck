@@ -2194,8 +2194,10 @@ pub struct AppState {
     /// `WaitingForInput` began after their turn had ended — a turn that opened
     /// on a permission prompt, or an idle agent's prompt notification — so
     /// leaving it into work is the agent's next turn. A pause that began inside
-    /// a turn is not here, and leaving it resumes that turn.
-    pauses_after_turn_end: HashSet<String>,
+    /// a turn is not here, and leaving it resumes that turn. The value is
+    /// when the pause began (the daemon's clock), which is when that turn
+    /// began: a report published after it belongs to the turn.
+    pauses_after_turn_end: HashMap<String, DateTime<Utc>>,
     /// Maps pane_id → orchestration role name (set when orchestration tab opens).
     pub pane_role_map: HashMap<String, String>,
     /// Maps pane_id → working directory for orchestration panes.
@@ -5037,20 +5039,32 @@ impl AppState {
                 !s.as_ref()
                     .is_some_and(|s| is_turn_in_progress(s) || pauses_a_turn(s))
             };
-            let paused_after_end = self.pauses_after_turn_end.remove(&pane_id);
-            // Whether the turn had ended before this event: an ended status,
-            // or a pause that itself began after the turn had ended.
-            let after_turn_end = ended(&status_before)
-                || (status_before.as_ref().is_some_and(pauses_a_turn) && paused_after_end);
-            let turn_started =
-                after_turn_end && status_after.as_ref().is_some_and(is_turn_in_progress);
-            // A pause entered from an ended turn, or one continuing such a
-            // pause, keeps that record; one entered from work does not.
-            if after_turn_end && status_after.as_ref().is_some_and(pauses_a_turn) {
-                self.pauses_after_turn_end.insert(pane_id.clone());
-            }
-            if turn_started && let Some(agent_id) = live_agent_id.as_deref() {
-                registry.agent_cards().note_turn_started(&pane_id, agent_id);
+            let paused_since = self
+                .pauses_after_turn_end
+                .remove(&pane_id)
+                .filter(|_| status_before.as_ref().is_some_and(pauses_a_turn));
+            // When the turn now under way began, if the turn had ended before
+            // this event: now, after an ended status, or when a pause that
+            // itself followed the end of the turn began. A report published
+            // after that belongs to this turn (Qodo on PR #2460).
+            let turn_began_at = if ended(&status_before) {
+                Some(Utc::now())
+            } else {
+                paused_since
+            };
+            if let Some(began_at) = turn_began_at {
+                if status_after.as_ref().is_some_and(pauses_a_turn) {
+                    // A pause entered from an ended turn, or one continuing
+                    // such a pause, keeps that record; one entered from work
+                    // does not.
+                    self.pauses_after_turn_end.insert(pane_id.clone(), began_at);
+                } else if status_after.as_ref().is_some_and(is_turn_in_progress)
+                    && let Some(agent_id) = live_agent_id.as_deref()
+                {
+                    registry
+                        .agent_cards()
+                        .note_turn_started(&pane_id, agent_id, began_at);
+                }
             }
         }
         // Every current report re-keys the record to the pane's live agent, so
@@ -18042,9 +18056,20 @@ mod tests {
             Some(true),
             "a turn that opened on a permission prompt"
         );
+        // A report published while that opening prompt was pending — the
+        // prompt asked to run the publish itself — belongs to the new turn.
+        state.apply_event_watching_waiting(event(EventType::Idle, 16), &registry);
+        state.apply_event_watching_waiting(event(EventType::PermissionRequest, 17), &registry);
+        registry.agent_cards().publish("pane", &agent, done());
+        state.apply_event_watching_waiting(event(EventType::ToolEnd, 18), &registry);
+        assert_eq!(
+            dealt_with(),
+            Some(false),
+            "a report published inside the turn its permission prompt opened"
+        );
         // A newer report is not dealt with by the turn it was published in.
         registry.agent_cards().publish("pane", &agent, done());
-        state.apply_event_watching_waiting(event(EventType::ToolStart, 16), &registry);
+        state.apply_event_watching_waiting(event(EventType::ToolStart, 19), &registry);
         assert_eq!(dealt_with(), Some(false));
     }
 

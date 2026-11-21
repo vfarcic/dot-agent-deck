@@ -2066,9 +2066,15 @@ impl CardStore {
     /// Issue #2454: mark the report of the generation `agent_id` in `pane_id`
     /// dealt with, when its status is one that makes the card need the user
     /// (`waiting`, `done`, `failed`) and it is not marked already. Answers
-    /// whether anything changed. The live reasons (stopped, a question,
-    /// blocked) are not the report's and are untouched.
-    fn mark_dealt_with(&self, pane_id: &str, agent_id: &str) -> bool {
+    /// whether anything changed. With `published_before`, only a report
+    /// published before that moment is marked. The live reasons (stopped, a
+    /// question, blocked) are not the report's and are untouched.
+    fn mark_dealt_with(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        published_before: Option<DateTime<Utc>>,
+    ) -> bool {
         let mut inner = self.lock();
         let Some(report) = inner
             .slots
@@ -2077,7 +2083,10 @@ impl CardStore {
         else {
             return false;
         };
-        if report.dealt_with || report_needs_you(report.report.status_or_default()).is_none() {
+        if report.dealt_with
+            || report_needs_you(report.report.status_or_default()).is_none()
+            || published_before.is_some_and(|at| report.published_at >= at)
+        {
             return false;
         }
         report.dealt_with = true;
@@ -2095,13 +2104,14 @@ impl CardStore {
             .map(|report| report.dealt_with)
     }
 
-    /// Issue #2454: the agent `agent_id` in `pane_id` started working again
-    /// (its pane went from a stopped status into a turn), which deals with
-    /// the report it last published. Called by the daemon's hook ingest under
-    /// the state lock, so it takes only the store's own lock; the change
-    /// reaches clients with the next refresh's doorbell.
-    pub fn note_turn_started(&self, pane_id: &str, agent_id: &str) {
-        if self.mark_dealt_with(pane_id, agent_id) {
+    /// Issue #2454: the agent `agent_id` in `pane_id` started its next turn
+    /// at `turn_began_at` (the daemon's clock), which deals with a report it
+    /// published before then; a report published since belongs to this turn
+    /// and keeps its reason. Called by the daemon's hook ingest under the
+    /// state lock, so it takes only the store's own lock; the change reaches
+    /// clients with the next refresh's doorbell.
+    pub fn note_turn_started(&self, pane_id: &str, agent_id: &str, turn_began_at: DateTime<Utc>) {
+        if self.mark_dealt_with(pane_id, agent_id, Some(turn_began_at)) {
             tracing::debug!(
                 target: "agent_cards",
                 pane_id,
@@ -2514,7 +2524,7 @@ pub async fn agent_opened(
     }
     let store = registry.agent_cards();
     let _turn = store.serial.lock().await;
-    if store.mark_dealt_with(pane_id, &current) {
+    if store.mark_dealt_with(pane_id, &current, None) {
         tracing::debug!(
             target: "agent_cards",
             pane_id,
@@ -3686,7 +3696,7 @@ mod tests {
             )
         };
         // Nothing published: nothing to clear, and nothing breaks.
-        store.note_turn_started("p1", "1");
+        store.note_turn_started("p1", "1", Utc::now());
         assert!(!project(&store).needs_you);
 
         for (status, reason) in [
@@ -3701,7 +3711,7 @@ mod tests {
             );
             let raised = project(&store);
             assert_eq!(raised.needs_you_reasons, [reason], "{status}");
-            store.note_turn_started("p1", "1");
+            store.note_turn_started("p1", "1", Utc::now());
             let cleared = project(&store);
             assert!(
                 !cleared.needs_you,
@@ -3711,7 +3721,7 @@ mod tests {
             // The report itself is kept: only its reason is dealt with.
             assert_eq!(cleared.report.as_ref().unwrap().status, status);
             // Another generation in another pane is not this one.
-            store.note_turn_started("p2", "1");
+            store.note_turn_started("p2", "1", Utc::now());
         }
         // A newer report raises its reason again.
         store.publish(
@@ -3723,7 +3733,7 @@ mod tests {
         // A `working` report raised nothing, so nothing is marked on it, and
         // the `done` that follows it still needs the user.
         store.publish("p1", "1", report(r#"{"status": "working"}"#));
-        assert!(!store.mark_dealt_with("p1", "1"));
+        assert!(!store.mark_dealt_with("p1", "1", None));
         store.publish("p1", "1", report(r#"{"status": "done"}"#));
         assert_eq!(project(&store).needs_you_reasons, ["done"]);
     }
@@ -3764,9 +3774,12 @@ mod tests {
             one(&before, "p2/2").needs_you_reasons,
             ["question", "waiting"]
         );
-        assert!(store.mark_dealt_with("p1", "1"));
-        assert!(store.mark_dealt_with("p2", "2"));
-        assert!(!store.mark_dealt_with("p2", "2"), "already dealt with");
+        assert!(store.mark_dealt_with("p1", "1", None));
+        assert!(store.mark_dealt_with("p2", "2", None));
+        assert!(
+            !store.mark_dealt_with("p2", "2", None),
+            "already dealt with"
+        );
         let after = project(&store);
         assert_eq!(one(&after, "p1/1").needs_you_reasons, ["stopped"]);
         assert_eq!(one(&after, "p2/2").needs_you_reasons, ["question"]);
