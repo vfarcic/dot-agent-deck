@@ -568,12 +568,7 @@ fn copymode_keys_003_an_oversized_screen_and_a_shrink_while_selected() {
     assert_eq!(shown, "VISIBLE0\nV", "{}", frame_with_marks(&buf));
 
     // Shrink while a selection is open.
-    let lines: Vec<u8> = (0..12)
-        .map(|n| format!("row{n:02}-abcdefghijklmnopqrstuvwxyz"))
-        .collect::<Vec<_>>()
-        .join("\r\n")
-        .into_bytes();
-    let mut seam = CopyModeSeam::new(40, 14, &lines);
+    let mut seam = CopyModeSeam::new(40, 14, &long_rows(12));
     seam.render();
     chars(&mut seam, "v");
     // On rows the smaller pane still draws: a selection the shrink leaves
