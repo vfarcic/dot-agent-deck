@@ -4166,10 +4166,25 @@ fn prune_ended_roles(ui: &mut UiState, tab_manager: &TabManager, pane: &dyn Pane
         .collect();
     ui.ended_role_slots.retain(|key, held| {
         open.contains(key.as_str())
-            && pane
-                .pane_agent_id(key)
-                .is_none_or(|agent| agent == held.role.agent_id)
+            && !superseded_by(&held.role.agent_id, pane.pane_agent_id(key).as_deref())
     });
+}
+
+/// Issue #1965: whether the agent the pane is attached to locally is a newer
+/// generation than the exited one a report is about, so the report no longer
+/// describes the pane. A daemon numbers its agents from one counter, so a
+/// larger id is a later generation. An attachment still on an OLDER
+/// generation — a restarted role that exited again before the pane
+/// reattached — keeps the new report. Ids that are not numbers are compared
+/// for equality only.
+fn superseded_by(ended_agent: &str, attached: Option<&str>) -> bool {
+    let Some(attached) = attached else {
+        return false;
+    };
+    match (attached.parse::<u64>(), ended_agent.parse::<u64>()) {
+        (Ok(attached), Ok(ended)) => attached > ended,
+        _ => attached != ended_agent,
+    }
 }
 
 /// Issue #1965: the exited role remembered for a card's pane, unless the card
@@ -38321,6 +38336,29 @@ mod tests {
             ended_role_for(&ui, &slot, None, &deck_a).map(|r| r.last_output.len()),
             Some(2)
         );
+    }
+
+    /// Scenario: a report for an exited generation stays while the pane is
+    /// still attached to that generation or an older one (a restarted role
+    /// that exited again before the pane reattached), and goes once the pane
+    /// is attached to a newer one (issue #1965).
+    #[test]
+    fn an_exited_role_report_is_superseded_only_by_a_newer_generation() {
+        assert!(!superseded_by("7", None), "no local attachment");
+        assert!(
+            !superseded_by("7", Some("7")),
+            "still the exited generation"
+        );
+        assert!(
+            !superseded_by("9", Some("7")),
+            "the pane still holds the generation before the one that exited"
+        );
+        assert!(
+            superseded_by("7", Some("9")),
+            "a restart's newer generation"
+        );
+        assert!(superseded_by("a", Some("b")));
+        assert!(!superseded_by("a", Some("a")));
     }
 
     /// Scenario: reports for role panes no open orchestration tab holds — a
