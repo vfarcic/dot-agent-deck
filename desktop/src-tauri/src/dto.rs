@@ -852,6 +852,13 @@ pub struct DesktopAgent {
     /// `status: "error"`, and scrubbed here like every other daemon text.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delivery_notice: Option<String>,
+    /// PRD #211: the agent's own words for its `error` or
+    /// `waiting_for_input` status (`SessionSnapshot::status_reason`) — the
+    /// error a failed turn reported, or what it waits on. Present only beside
+    /// one of those statuses, and scrubbed here like every other agent text.
+    /// The TUI card's reason row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_reason: Option<String>,
     /// PRD #1631: the question this agent is waiting on
     /// (`SessionSnapshot.pending_question`), every text field made safe to
     /// show, with whether each option can be answered by voice. Absent when
@@ -1088,6 +1095,15 @@ pub struct DesktopDeleteCharKey {
     pub bytes: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_literal_write_chars: Option<u32>,
+    /// PRD #211: the most deletes in one write, when the agent drops some
+    /// from a larger burst (Antigravity: one); absent where a whole burst is
+    /// exact.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_presses_per_write: Option<u32>,
+    /// PRD #211: how long to wait between two writes of one deletion; absent
+    /// where no pause is needed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pause_between_writes_ms: Option<u32>,
 }
 
 /// PRD #1631: the webview's view of the daemon's
@@ -2277,6 +2293,7 @@ fn agent_type_name(agent_type: &AgentType) -> &'static str {
         AgentType::Pi => "pi",
         AgentType::Codex => "codex",
         AgentType::Devin => "devin",
+        AgentType::Antigravity => "antigravity",
         AgentType::None => "none",
     }
 }
@@ -2295,6 +2312,10 @@ const PROMPT_KEY_DELETE_CHAR: [&str; 2] = ["\x7f", "\x08"];
 const PROMPT_KEY_INTERRUPT_BUDGET_MS: u64 = 2_000;
 /// PRD #1541: the most a clear may pause in total between its writes.
 const PROMPT_KEY_CLEAR_BUDGET_MS: u64 = 3_000;
+/// PRD #211: the longest pause a deletion may take between two of its writes.
+/// Antigravity's measured 20 ms, with room for a slower agent; past this a
+/// "scratch that" of a long dictation would take minutes.
+const PROMPT_KEY_DELETE_PAUSE_MAX_MS: u32 = 100;
 /// PRD #1541: how many times the panel presses the clear key, by rule — a
 /// mirror of `VOICE_CLEAR_PRESSES` in `desktop/src/components/VoiceControlPanel.tsx`,
 /// which a clear's pause budget is computed against; the two must move
@@ -2364,6 +2385,14 @@ pub(crate) fn map_prompt_keys(
     if clear_pause > PROMPT_KEY_CLEAR_BUDGET_MS {
         return None;
     }
+    if keys.delete_char.max_presses_per_write == Some(0)
+        || keys
+            .delete_char
+            .pause_between_writes_ms
+            .is_some_and(|pause| pause > PROMPT_KEY_DELETE_PAUSE_MAX_MS)
+    {
+        return None;
+    }
     Some(DesktopPromptKeys {
         interrupt: keys
             .interrupt
@@ -2381,7 +2410,16 @@ pub(crate) fn map_prompt_keys(
         },
         delete_char: DesktopDeleteCharKey {
             bytes: keys.delete_char.bytes.to_string(),
-            max_literal_write_chars: keys.delete_char.max_literal_write_chars,
+            // PRD #211: on a paced key this is the per-write cap, the bound a
+            // client that bursts its deletes needs; this client paces, and the
+            // agent claims no collapse limit
+            // (`agent_registry::DeleteCharKey::max_literal_write_chars`).
+            max_literal_write_chars: keys
+                .delete_char
+                .max_literal_write_chars
+                .filter(|_| keys.delete_char.max_presses_per_write.is_none()),
+            max_presses_per_write: keys.delete_char.max_presses_per_write,
+            pause_between_writes_ms: keys.delete_char.pause_between_writes_ms,
         },
     })
 }
@@ -2587,6 +2625,16 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
         .and_then(|snapshot| snapshot.delivery_notice.as_deref())
         .map(safe_display_text)
         .filter(|notice| !notice.is_empty());
+    let status_reason = live
+        .filter(|snapshot| {
+            matches!(
+                snapshot.status,
+                SessionStatus::Error | SessionStatus::WaitingForInput
+            )
+        })
+        .and_then(|snapshot| snapshot.status_reason.as_deref())
+        .map(safe_display_text)
+        .filter(|reason| !reason.is_empty());
     let pending_question = live
         .and_then(|snapshot| snapshot.pending_question.as_ref())
         .map(map_pending_question);
@@ -2651,6 +2699,7 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
         authoring_kind: record.authoring_kind,
         inbox,
         delivery_notice,
+        status_reason,
         pending_question,
         input_held,
         input_discarded,
@@ -4603,6 +4652,7 @@ mod tests {
                 blocked: None,
                 hook_generation: None,
                 delivery_notice: None,
+                status_reason: None,
                 pending_question: None,
                 pull_request: None,
                 pull_request_revision: None,
@@ -4923,8 +4973,8 @@ mod tests {
             .expect("a measured agent carries prompt keys")
     }
 
-    /// PRD #1541: the daemon's prompt keys reach the webview in its camelCase
-    /// vocabulary, with the bytes unchanged and an absent limit absent.
+    /// Scenario: Project the daemon's Claude Code, OpenCode and Antigravity prompt keys into the webview's camelCase vocabulary.
+    /// The key bytes stay unchanged and absent limits stay absent (PRD #1541).
     #[test]
     fn prompt_keys_are_copied_from_the_daemon_in_the_webview_shape() {
         let mut record = fixture_record();
@@ -4965,6 +5015,53 @@ mod tests {
                 .get("maxLiteralWriteChars")
                 .is_none()
         );
+
+        let mut record = fixture_record();
+        record.agent_type = Some(AgentType::Antigravity);
+        record.live.as_mut().unwrap().agent_type = Some(AgentType::Antigravity);
+        record.prompt_keys = Some(registry_keys(AgentType::Antigravity));
+        let value = serde_json::to_value(map_agent(record)).unwrap();
+        assert_eq!(value["agentType"], "antigravity");
+        assert_eq!(
+            value["promptKeys"]["interrupt"],
+            serde_json::json!([
+                {"bytes": "\u{1b}", "pauseAfterMs": 0}
+            ])
+        );
+        assert_eq!(
+            value["promptKeys"]["clear"],
+            serde_json::json!({
+                "bytes": "\u{15}", "presses": "per_line"
+            })
+        );
+        assert_eq!(value["promptKeys"]["deleteChar"]["bytes"], "\u{7f}");
+    }
+
+    /// PRD #211: Antigravity's paced deletes reach the webview — one delete
+    /// per write, 20 ms apart — and a pace past the bound, or a zero cap,
+    /// drops the whole set rather than reaching the panel.
+    #[test]
+    fn delete_pacing_is_copied_within_its_bounds() {
+        let keys = registry_keys(AgentType::Antigravity);
+        // The served literal-write bound is for a client that bursts its
+        // deletes; this one paces them, so it is not carried.
+        assert_eq!(keys.delete_char.max_literal_write_chars, Some(1));
+        let mapped = serde_json::to_value(map_prompt_keys(&keys).unwrap()).unwrap();
+        assert_eq!(
+            mapped["deleteChar"],
+            serde_json::json!({"bytes": "\u{7f}", "maxPressesPerWrite": 1, "pauseBetweenWritesMs": 20})
+        );
+        let mut slow = keys.clone();
+        slow.delete_char.pause_between_writes_ms = Some(PROMPT_KEY_DELETE_PAUSE_MAX_MS + 1);
+        assert_eq!(map_prompt_keys(&slow), None);
+        let mut zero = keys;
+        zero.delete_char.max_presses_per_write = Some(0);
+        assert_eq!(map_prompt_keys(&zero), None);
+        let codex =
+            serde_json::to_value(map_prompt_keys(&registry_keys(AgentType::Codex)).unwrap())
+                .unwrap();
+        assert!(codex["deleteChar"].get("maxPressesPerWrite").is_none());
+        assert!(codex["deleteChar"].get("pauseBetweenWritesMs").is_none());
     }
 
     /// PRD #1541: a record the daemon served no keys for has none in the

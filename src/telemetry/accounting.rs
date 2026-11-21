@@ -470,14 +470,14 @@ pub enum UsageSource {
 /// The [`UsageSource`] for a run of `agent`. Devin's own telemetry is
 /// documented to carry token counts, but the deck receives none of it and
 /// found no local record of Devin's usage, so a Devin run has no channel;
-/// nor has an arbitrary command.
+/// nor has an arbitrary command. Antigravity has none wired yet (PRD #211).
 pub fn usage_source(agent: &crate::event::AgentType) -> UsageSource {
     use crate::event::AgentType;
     match agent {
         AgentType::ClaudeCode => UsageSource::ClaudeTranscript,
         AgentType::Codex => UsageSource::CodexRollout,
         AgentType::Pi | AgentType::OpenCode => UsageSource::UsageFile,
-        AgentType::Devin | AgentType::None => UsageSource::NoChannel,
+        AgentType::Devin | AgentType::Antigravity | AgentType::None => UsageSource::NoChannel,
     }
 }
 

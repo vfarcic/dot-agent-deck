@@ -66,8 +66,6 @@ The TUI checks on the same schedule and shows a notice at the right end of its f
 
 The rail button and **Upgrade…** open a dialog titled **Upgrade to v<new>**, with the app's plan: which version you have, how the app was installed, and what upgrading it does, including whether the download's build provenance will be checked (it is when the [GitHub CLI](https://cli.github.com/) is installed and logged in; the checksum is always checked). When the `dot-agent-deck` CLI on this machine is behind too, the CLI's plan follows the app's, and the dialog says `The dot-agent-deck CLI here is behind too, so it follows Agent Deck, …`, so that one upgrade keeps the app, the CLI and the daemon on one release. When the only `dot-agent-deck` on this machine is the one inside the app, there is no CLI step: it is upgraded with the app. [Installation → What upgrading does for each install method](../installation.md#what-upgrading-does-for-each-install-method) lists every case. The **Local daemon** section's **Upgrade** opens the same dialog.
 
-![The Upgrade to v0.47.0 dialog over the Dashboard, whose banner reads Agent Deck (desktop app): update available: v0.47.0 (current: v0.46.0) beside an Upgrade… button, with the upgrade button lit at the bottom of the rail: the plan for the app installed from a .dmg in /Applications, saying what upgrading downloads and checks, below it the plan for the dot-agent-deck CLI installed with Homebrew, saying upgrading runs brew update, then brew upgrade dot-agent-deck, the line The dot-agent-deck CLI here is behind too, so it follows Agent Deck, and the question Upgrade Agent Deck (desktop app) to v0.47.0? with Cancel and Upgrade buttons](/img/self-upgrade-desktop.png)
-
 1. The dialog asks, for example, `Upgrade Agent Deck (desktop app) to v0.47.0?`. Press **Upgrade**, or **Cancel**. **Cancel** has the focus, as in the TUI, so `Enter` alone never upgrades anything. Nothing changes until you press **Upgrade**: **Cancel**, `Escape` or a click outside the dialog before then close it having done nothing.
 2. While it upgrades, the plan says **Upgrading…** and the dialog cannot be closed. The dialog keeps the plan it opened with: a check that finishes while it is open does not change it, and **Upgrade** carries out exactly the plan shown.
 3. The result appears under the plan. When the CLI is behind too, the dialog then asks about it, for example `Upgrade dot-agent-deck CLI to v0.47.0?`, with its own **Cancel**, and upgrades it with its own install method: `brew upgrade` for Homebrew, on a Mac or on Linux, or a checked download for a downloaded binary.
@@ -98,15 +96,9 @@ Upgrading does not stop the daemon or its agents. When the restarted app finds t
 
 ## The star reminder
 
-About once every 10 launches, the app asks when it starts whether you would like to star the dot-agent-deck repository on GitHub. The dialog, **Enjoying dot-agent-deck?**, offers three choices, with the same keys as the TUI's star prompt:
+About once every 10 launches, the app asks when it starts whether you would like to star the dot-agent-deck repository on GitHub. The dialog, **Enjoying dot-agent-deck?**, offers three choices, with the same keys as the TUI's star prompt.
 
-**TUI:**
-
-![The TUI's star prompt over an empty dashboard: the title Enjoying dot-agent-deck?, the lines If you find dot-agent-deck useful, please consider starring the repo!, the address github.com/vfarcic/dot-agent-deck, the key line s Star, l Later, d Don't ask again, and the buttons Star, Snooze and Dismiss](/img/star-prompt-tui.png)
-
-**Desktop:**
-
-![The desktop app's Enjoying dot-agent-deck? dialog over an empty Dashboard, with the same two lines and address and the buttons d Don't ask again, l Later and s Star](/img/star-prompt-desktop.png)
+Both clients show the same title and the lines `If you find dot-agent-deck useful,` / `please consider starring the repo!`, with the address `github.com/vfarcic/dot-agent-deck`. The TUI's prompt also lists the keys, `s Star  l Later  d Don't ask again`, and labels its clickable buttons **Star**, **Snooze** (Later) and **Dismiss** (Don't ask again); the desktop dialog's buttons are named as in this table:
 
 | Button | Key | What it does |
 |---|---|---|

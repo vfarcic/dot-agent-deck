@@ -4,9 +4,10 @@
 //! ([`crate::doorbell_activation::AGENT_FACTS`]), so a new agent release is
 //! typed into before anyone has measured it. A user who meets a release that
 //! breaks it turns it off for that agent until a deck release fixes the
-//! facts: `doorbell.claude` / `doorbell.codex` in the deck's `config.toml`
-//! ([`crate::config::DoorbellConfig`]), or `DOT_AGENT_DECK_DOORBELL_CLAUDE` /
-//! `DOT_AGENT_DECK_DOORBELL_CODEX`, which win over the file the way
+//! facts: `doorbell.claude` / `doorbell.codex` / `doorbell.antigravity` in the
+//! deck's `config.toml` ([`crate::config::DoorbellConfig`]), or
+//! `DOT_AGENT_DECK_DOORBELL_CLAUDE` / `DOT_AGENT_DECK_DOORBELL_CODEX` /
+//! `DOT_AGENT_DECK_DOORBELL_ANTIGRAVITY`, which win over the file the way
 //! `DOT_AGENT_DECK_EXPERIMENTAL` wins over its own.
 //!
 //! The daemon reads it once per agent it starts ([`at_spawn`]): installation
@@ -15,7 +16,7 @@
 //! value for its life, so a change applies to agents started after it. A
 //! `config.toml` that is there but cannot be used (malformed, a wrong-typed
 //! value, too large, unreadable, a link whose target is missing, or in a config folder that is
-//! such a link) holds the doorbell off for both agents rather
+//! such a link) holds the doorbell off for every agent rather
 //! than falling back to the default of on: the file may be the one that turned
 //! an agent off, and the variables still win over it. Off,
 //! the generation's verdict is `turned_off` (`NoGo::TurnedOff`), whatever its
@@ -27,20 +28,24 @@ use crate::event::AgentType;
 pub const CLAUDE_ENV: &str = "DOT_AGENT_DECK_DOORBELL_CLAUDE";
 /// The variable that overrides `doorbell.codex`.
 pub const CODEX_ENV: &str = "DOT_AGENT_DECK_DOORBELL_CODEX";
+/// The variable that overrides `doorbell.antigravity` (PRD #211).
+pub const ANTIGRAVITY_ENV: &str = "DOT_AGENT_DECK_DOORBELL_ANTIGRAVITY";
 
 /// Whether the doorbell is on, per agent that has one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DoorbellSwitch {
     pub claude: bool,
     pub codex: bool,
+    pub antigravity: bool,
 }
 
 impl Default for DoorbellSwitch {
-    /// Both on.
+    /// All on.
     fn default() -> Self {
         Self {
             claude: true,
             codex: true,
+            antigravity: true,
         }
     }
 }
@@ -53,6 +58,7 @@ impl DoorbellSwitch {
         match agent {
             AgentType::ClaudeCode => self.claude,
             AgentType::Codex => self.codex,
+            AgentType::Antigravity => self.antigravity,
             _ => true,
         }
     }
@@ -69,13 +75,14 @@ impl DoorbellSwitch {
         Self {
             claude: read(CLAUDE_ENV, config.claude),
             codex: read(CODEX_ENV, config.codex),
+            antigravity: read(ANTIGRAVITY_ENV, config.antigravity),
         }
     }
 
     /// The switch from a read of the deck's `config.toml`
     /// ([`crate::config::DashboardConfig::load_bounded_status`]) under `env`'s
     /// overrides ([`Self::resolve`]). A file that is there but could not be
-    /// used holds the doorbell off for both agents: its defaults are on, and
+    /// used holds the doorbell off for every agent: its defaults are on, and
     /// the file may be the one that turned an agent off.
     pub fn from_load(
         load: &crate::config::BoundedLoad,
@@ -84,6 +91,7 @@ impl DoorbellSwitch {
         let held = crate::config::DoorbellConfig {
             claude: false,
             codex: false,
+            antigravity: false,
         };
         let file = match load.file {
             crate::config::ConfigFile::Failed => &held,
@@ -106,8 +114,8 @@ pub fn parse_state(value: &str) -> Option<bool> {
 
 /// The switch for an agent the daemon is starting now: the deck's
 /// `config.toml`, read with the daemon's bounded reader, under the
-/// environment's overrides. A file that is there but cannot be used holds both
-/// agents off ([`DoorbellSwitch::from_load`]); its warning is in the daemon's
+/// environment's overrides. A file that is there but cannot be used holds
+/// every agent off ([`DoorbellSwitch::from_load`]); its warning is in the daemon's
 /// log.
 #[cfg(not(test))]
 pub fn at_spawn() -> DoorbellSwitch {
@@ -141,6 +149,7 @@ mod tests {
         let claude_off = DoorbellConfig {
             claude: false,
             codex: true,
+            antigravity: true,
         };
         let s = DoorbellSwitch::resolve(&claude_off, none);
         assert!(!s.allows(&AgentType::ClaudeCode));
@@ -161,6 +170,7 @@ mod tests {
                 let config = DoorbellConfig {
                     claude: file,
                     codex: file,
+                    antigravity: file,
                 };
                 let s = DoorbellSwitch::resolve(&config, |name| {
                     (name == CODEX_ENV).then(|| value.to_string())
@@ -172,6 +182,7 @@ mod tests {
         let all_off = DoorbellSwitch {
             claude: false,
             codex: false,
+            antigravity: false,
         };
         for agent in [
             AgentType::None,
@@ -181,6 +192,77 @@ mod tests {
         ] {
             assert!(all_off.allows(&agent), "{agent:?}");
         }
+    }
+
+    /// PRD #211: Antigravity's switch is the same surface as Claude's and
+    /// Codex's: on by default, `doorbell.antigravity` turns it off, and
+    /// `DOT_AGENT_DECK_DOORBELL_ANTIGRAVITY` wins over the file in either
+    /// direction, leaving the other agents' switches alone. A config that is
+    /// there but cannot be used holds it off with the others.
+    #[test]
+    fn antigravity_has_its_own_doorbell_switch() {
+        use crate::config::{ConfigFile, DashboardConfig};
+        let none = |_: &str| None;
+        assert!(DoorbellSwitch::default().allows(&AgentType::Antigravity));
+        assert!(DoorbellConfig::default().antigravity);
+
+        let file_off = DoorbellConfig {
+            antigravity: false,
+            ..DoorbellConfig::default()
+        };
+        let s = DoorbellSwitch::resolve(&file_off, none);
+        assert!(!s.allows(&AgentType::Antigravity));
+        assert!(s.allows(&AgentType::ClaudeCode) && s.allows(&AgentType::Codex));
+
+        for (value, file, expect) in [
+            ("1", false, true),
+            ("on", false, true),
+            ("0", true, false),
+            ("OFF", true, false),
+            ("maybe", false, false),
+            ("maybe", true, true),
+        ] {
+            let config = DoorbellConfig {
+                antigravity: file,
+                ..DoorbellConfig::default()
+            };
+            let s = DoorbellSwitch::resolve(&config, |name| {
+                (name == ANTIGRAVITY_ENV).then(|| value.to_string())
+            });
+            assert_eq!(s.antigravity, expect, "{value:?} over {file}");
+            assert!(
+                s.claude && s.codex,
+                "the Antigravity variable leaves the others alone"
+            );
+        }
+        let s = DoorbellSwitch::resolve(&DoorbellConfig::default(), |name| {
+            (name == CLAUDE_ENV || name == CODEX_ENV).then(|| "0".to_string())
+        });
+        assert!(s.antigravity, "the other variables leave Antigravity alone");
+
+        let dir = tempfile::tempdir().unwrap();
+        let valid = dir.path().join("valid.toml");
+        std::fs::write(&valid, "[doorbell]\nantigravity = false\n").unwrap();
+        let load = DashboardConfig::load_bounded_status_from(&valid);
+        assert_eq!(load.file, ConfigFile::Read);
+        assert_eq!(
+            DoorbellSwitch::from_load(&load, none),
+            DoorbellSwitch {
+                claude: true,
+                codex: true,
+                antigravity: false
+            }
+        );
+        let broken = dir.path().join("broken.toml");
+        std::fs::write(&broken, "[doorbell\nantigravity = true\n").unwrap();
+        let load = DashboardConfig::load_bounded_status_from(&broken);
+        assert_eq!(load.file, ConfigFile::Failed);
+        assert!(!DoorbellSwitch::from_load(&load, none).antigravity);
+        assert!(
+            DoorbellSwitch::from_load(&load, |var| (var == ANTIGRAVITY_ENV).then(|| "1".into()))
+                .antigravity,
+            "the variable still wins"
+        );
     }
 
     /// Scenario: Read the doorbell switch from a `config.toml` that is absent, valid, malformed, has a wrong-typed value, or is over the size limit. An absent file leaves both agents on and a valid one says what it says; a file that is there but can't be used holds the doorbell off for both agents rather than falling back to on, and a variable still wins over that.
@@ -193,6 +275,7 @@ mod tests {
         let off = DoorbellSwitch {
             claude: false,
             codex: false,
+            antigravity: false,
         };
 
         let absent = DashboardConfig::load_bounded_status_from(&dir.path().join("absent.toml"));
@@ -211,7 +294,8 @@ mod tests {
             DoorbellSwitch::from_load(&load, none),
             DoorbellSwitch {
                 claude: true,
-                codex: false
+                codex: false,
+                antigravity: true
             }
         );
 
@@ -233,7 +317,8 @@ mod tests {
                 codex_on,
                 DoorbellSwitch {
                     claude: false,
-                    codex: true
+                    codex: true,
+                    antigravity: false
                 },
                 "{name}: the variable still wins"
             );
@@ -252,6 +337,7 @@ mod tests {
         let off = DoorbellSwitch {
             claude: false,
             codex: false,
+            antigravity: false,
         };
 
         let nothing = dir.path().join("nothing.toml");
@@ -283,7 +369,8 @@ mod tests {
             DoorbellSwitch::from_load(&load, none),
             DoorbellSwitch {
                 claude: false,
-                codex: true
+                codex: true,
+                antigravity: true
             }
         );
 
@@ -312,7 +399,8 @@ mod tests {
                 DoorbellSwitch::from_load(&load, |var| (var == CLAUDE_ENV).then(|| "on".into())),
                 DoorbellSwitch {
                     claude: true,
-                    codex: false
+                    codex: false,
+                    antigravity: false
                 },
                 "{name}: the variable still wins"
             );
@@ -331,6 +419,7 @@ mod tests {
         let off = DoorbellSwitch {
             claude: false,
             codex: false,
+            antigravity: false,
         };
 
         // First runs: the config folder, and the folders above it, are simply
@@ -404,7 +493,8 @@ mod tests {
                 DoorbellSwitch::from_load(&load, |var| (var == CODEX_ENV).then(|| "1".into())),
                 DoorbellSwitch {
                     claude: false,
-                    codex: true
+                    codex: true,
+                    antigravity: false
                 },
                 "{name}: the variable still wins"
             );

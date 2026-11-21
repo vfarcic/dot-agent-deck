@@ -1,0 +1,302 @@
+#!/usr/bin/python3
+"""Synthetic agy: replay captured hooks and OSC bytes, never call a model."""
+
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+import select
+import tty
+import termios
+import re
+import signal
+import textwrap
+import base64
+
+
+if "--version" in sys.argv:
+    print("Antigravity CLI 1.5.9")
+    sys.exit(0)
+root = Path.cwd()
+sequences = json.loads((root / "osc7501-sequences.json").read_text())["sequences"]
+(root / "replay-ready").touch()
+tty.setraw(0, termios.TCSANOW)
+(root / "replay-pid").write_text(str(os.getpid()))
+capture = (root / "input.bytes").open("ab", buffering=0)
+line = bytearray()
+state = "booting"
+placeholder = True
+permission_menu = None
+permission_prompt = ""
+trust_dialog = False
+trust_selected = 0
+trust_escape = bytearray()
+composer_escape = bytearray()
+history_prompt = ""
+answer_hook = None
+misrender_next_echo = False
+misrendering_echo = False
+output_text = ""
+
+
+def redraw():
+    global misrender_next_echo, misrendering_echo, placeholder
+    width = os.get_terminal_size(0).columns
+    if trust_dialog:
+        options = ["Yes, I trust this folder", "No, exit"]
+        choices = "\r\n".join(
+            ("> " if index == trust_selected else "  ") + label
+            for index, label in enumerate(options)
+        )
+        sys.stdout.write("\033[2J\033[HDo you trust the contents of this project?\r\n"
+                         "Antigravity CLI requires permission to read, edit, and execute files here.\r\n"
+                         + choices + "\r\n↑/↓ Navigate · enter Confirm\r\n")
+        sys.stdout.flush()
+        return
+    if permission_menu is not None:
+        menu = json.loads((root / "permission-menu.json").read_text())
+        if permission_menu not in (True, "multiline"):
+            menu = menu[permission_menu]
+        options = "\r\n".join(
+            f"  {option['key']}. {option['label']}" for option in menu["options"]
+        )
+        if permission_menu == "multiline":
+            # Measured Command-menu wording, with wrapped command content.
+            command = permission_prompt.removeprefix("Approve Bash: ")
+            rendered = "\r\n".join(
+                "   " + part
+                for line in command.splitlines()
+                for part in textwrap.wrap(line, width=max(1, width - 3))
+            )
+            heading = "Command\r\n" + "─" * width + "\r\nRequesting permission for:\r\n" + rendered + "\r\nRun this command?"
+            sys.stdout.write("\033[2J\033[H" + heading + "\r\n" + options + "\r\n  ↑/↓ Navigate · tab Amend · ctrl+g edit/expand command\r\nesc to cancel\r\n")
+        else:
+            sys.stdout.write("\033[2J\033[H" + permission_prompt + "\r\n" + options + "\r\nEsc to cancel\r\n")
+        sys.stdout.flush()
+        return
+    content = line.decode(errors="replace")
+    if misrender_next_echo and re.match(r"^\([a-z]{6}\) dot-agent-deck: message ", content):
+        misrender_next_echo = False
+        misrendering_echo = True
+    if misrendering_echo:
+        if content:
+            # Every input byte was received: only the rendered composer has
+            # the measured seven-column gap, until the deck withdraws it.
+            content = content[:35] + "       " + content[35:]
+            (root / "mismatched-echo.json").write_text(json.dumps({
+                "received": line.decode(), "rendered": content,
+            }))
+        else:
+            misrendering_echo = False
+            placeholder = True
+            submitted_lines = (root / "submitted.jsonl")
+            (root / "echo-withdrawn.json").write_text(json.dumps({
+                "submitted_before_withdrawal": len(submitted_lines.read_text().splitlines())
+                if submitted_lines.exists() else 0,
+            }))
+    hint = "Auto mode: edits & safe commands auto-approved (shift+tab to cycle)"
+    rows = textwrap.wrap(content or (hint if placeholder else ""), width=max(1, width - 2)) or [""]
+    composer = "\r\n  ".join(rows)
+    if not line and placeholder:
+        composer = "\033[90m" + composer + "\033[0m"
+    # Real agy leaves its offset header with LF alone. The scanner must see
+    # that row depart, rather than relying on a CR or a top-left stand-in.
+    sys.stdout.write("\033[2J\033[3J\033[H\033[2;19HAntigravity CLI 1.5.9\n"
+                     + "\r                  Gemini 3.8 Flash (Low)\r\n"
+                     + (output_text.replace("\n", "\r\n") + "\r\n" if output_text else "")
+                     + ((root / "delivered.txt").read_text().replace("\n", "\r\n") + "\r\n" if (root / "delivered.txt").exists() else "")
+                     + "─" * width + "\r\n> " + composer + "\r\n"
+                     + "─" * width + "\r\n\033[90m? for shortcuts\033[0m")
+    # Move back from the footer to the composer, including wrapped input.
+    # Placeholder text is not input: its cursor stays just after `> `.
+    cursor_col = min(width, 3 + len(rows[-1])) if line else 3
+    cursor_up = 2 if line else len(rows) + 1
+    sys.stdout.write(f"\033[{cursor_up}A\033[{cursor_col}G")
+    sys.stdout.flush()
+
+
+def replay(action):
+    global state, permission_menu, permission_prompt, misrender_next_echo, output_text, trust_dialog, trust_selected, history_prompt, answer_hook
+    if "hook" in action:
+        payload = json.loads((root / action["hook"]).read_text())
+        # The capture's workspace is sanitized; retain its measured event shape
+        # but point it at this test's real isolated workspace.
+        payload["cwd"] = str(root)
+        payload["workspacePaths"] = [str(root)]
+        payload.update(action.get("payload", {}))
+        agent = action.get("agent", "antigravity")
+        if agent == "claude-code":
+            payload = {
+                "session_id": "osc-unrelated-agent-control",
+                "hook_event_name": "PreToolUse",
+                "cwd": str(root),
+                "tool_name": "Bash",
+                "tool_input": {"command": "echo claude-control"},
+            }
+        hook_env = dict(os.environ)
+        hook_env.update(action.get("env", {}))
+        result = subprocess.run(
+            [os.environ["AGY_TEST_DECK_BIN"], "hook", "--agent", agent],
+            input=json.dumps(payload), text=True, capture_output=True, check=False, env=hook_env,
+        )
+        with (root / "hook-replay.log").open("a") as log:
+            log.write(f'{action["hook"]}: exit={result.returncode}\n{result.stdout}\n{result.stderr}\n')
+        if "tag" in action:
+            result_path = root / (action["tag"] + ".json")
+            temporary = result_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps({
+                "code": result.returncode, "stdout": result.stdout, "stderr": result.stderr,
+            }))
+            temporary.replace(result_path)
+        return result.stdout
+    elif "osc" in action:
+        sequence = next(
+            item for item in sequences
+            if item["state"] == action["osc"]
+            and item["kind"] == action.get("kind")
+            and ("msg" not in action or item["msg_decoded"] == action["msg"])
+        )
+        sys.stdout.write(sequence["bytes"])
+        sys.stdout.flush()
+        state = action["osc"]
+        with (root / "osc-history.jsonl").open("a") as history:
+            history.write(json.dumps(action) + "\n")
+    elif "pause_ms" in action:
+        time.sleep(action["pause_ms"] / 1000)
+    elif "synthetic_permission_osc" in action:
+        # Deliberately untrusted text for permission forgery regressions;
+        # measured OSC replays above still come from the captured fixture.
+        encoded = base64.b64encode(action["synthetic_permission_osc"].encode()).decode()
+        sys.stdout.write(f"\033]7501;state=blocked:kind=permission:app=antigravity:msg={encoded}\007")
+        sys.stdout.flush()
+        state = "blocked"
+    elif "misrender_echo_once" in action:
+        misrender_next_echo = True
+    elif "trust_dialog" in action:
+        trust_dialog = True
+        trust_selected = 0
+        history_prompt = action.get("history_prompt", "")
+        sys.stdout.write("\033[?1049h")
+        redraw()
+        replay({"osc": "blocked", "kind": "permission", "msg": "Trust this folder?"})
+    elif "redraw_composer" in action:
+        permission_menu = None
+        redraw()
+    elif "output" in action:
+        output_text = action["output"]
+        redraw()
+    elif "permission_menu" in action:
+        permission_menu = action["permission_menu"]
+        answer_hook = action.get("answer_hook")
+        menu = json.loads((root / "permission-menu.json").read_text())
+        if permission_menu not in (True, "multiline"):
+            menu = menu[permission_menu]
+        permission_prompt = action.get("prompt", menu["prompt"])
+        redraw()
+        if permission_menu is not True:
+            # The label source is a measured menu, with this fixture's own
+            # isolated path in place of the real measurement's scratch path.
+            encoded = base64.b64encode(permission_prompt.encode()).decode()
+            sys.stdout.write(f"\033]7501;state=blocked:kind=permission:app=antigravity:msg={encoded}\007")
+            sys.stdout.flush()
+            state = "blocked"
+    else:
+        raise ValueError(action)
+
+
+def submitted(value):
+    if not re.match(r"^\([a-z]{6}\) dot-agent-deck: message ", value):
+        return
+    with (root / "submitted.jsonl").open("a") as log:
+        log.write(json.dumps({"line": value, "state": state}) + "\n")
+    replay({"hook": "session-start.json"})
+    stdout = replay({"hook": "pre-invocation.json", "payload": {"lastUserInput": value}, "tag": "doorbell-answer"})
+    try:
+        blocks = json.loads(stdout)["injectSteps"][0]["systemMessage"]["systemMessage"]
+    except (ValueError, KeyError, IndexError, TypeError):
+        return
+    (root / "delivered.txt").write_text(blocks)
+    sys.stdout.write("\r\n" + blocks.replace("\n", "\r\n") + "\r\n")
+    sys.stdout.flush()
+    if (root / "complete-delegate").exists():
+        task = re.search(r"\[dot-agent-deck message (m-[^ ]+) delivery ", blocks)
+        if task:
+            result = subprocess.run([
+                os.environ["AGY_TEST_DECK_BIN"], "work-done", "--task-id", task[1],
+                "--task", "AGY-ROLE-REPORT-e871: delegated work complete",
+            ], text=True, capture_output=True, check=False)
+            (root / "completion.json").write_text(json.dumps({
+                "code": result.returncode, "stdout": result.stdout, "stderr": result.stderr,
+            }))
+
+
+signal.signal(signal.SIGWINCH, lambda _signal, _frame: redraw())
+redraw()
+step = 0
+while True:
+    if select.select([0], [], [], 0.01)[0]:
+        chunk = os.read(0, 4096)
+        if not chunk:
+            break
+        capture.write(chunk)
+        with (root / "input-history.jsonl").open("a") as history:
+            history.write(json.dumps({"state": state, "bytes": list(chunk)}) + "\n")
+        for c in chunk:
+            if trust_dialog:
+                if c == 27 or trust_escape:
+                    trust_escape.append(c)
+                    if bytes(trust_escape) in (b"\x1b[A", b"\x1b[B"):
+                        trust_selected = (trust_selected + 1) % 2
+                        trust_escape.clear()
+                elif c == 13 and trust_selected == 0:
+                    trust_dialog = False
+                    sys.stdout.write("\033[?1049l")
+                    (root / "delivered.txt").write_text("AGY-FOLDER-TRUSTED")
+                    replay({"osc": "idle"})
+            elif permission_menu is not None:
+                if c in (49, 50, 51, 52):
+                    (root / "permission-answer.txt").write_text(chr(c))
+                    permission_menu = None
+                    (root / "delivered.txt").write_text(f"AGY-PERMISSION-ANSWER-{chr(c)}")
+                    if answer_hook:
+                        replay({"hook": answer_hook, "tag": "answer-hook"})
+                    replay({"osc": "working"})
+                    replay({"osc": "idle"})
+            elif history_prompt and (c == 27 or composer_escape):
+                composer_escape.append(c)
+                if bytes(composer_escape) == b"\x1b[A":
+                    # A single attached write may answer the dialog and then
+                    # recall history after its idle OSC has left the PTY.
+                    line[:] = history_prompt.encode()
+                    placeholder = False
+                    composer_escape.clear()
+                elif len(composer_escape) >= 3:
+                    composer_escape.clear()
+            elif c == 13:
+                value = line.decode(errors="replace")
+                line.clear()
+                placeholder = True
+                submitted(value)
+            elif c == 21:
+                line.clear()
+                placeholder = False
+            elif c in (8, 127):
+                placeholder = False
+                while line and line[-1] & 0xC0 == 0x80:
+                    line.pop()
+                if line:
+                    line.pop()
+            elif c >= 32:
+                placeholder = False
+                line.append(c)
+        redraw()
+    request = root / f"request-{step}.json"
+    if not request.exists():
+        time.sleep(0.01)
+        continue
+    for action in json.loads(request.read_text()):
+        replay(action)
+    (root / f"replayed-{step}").touch()
+    step += 1

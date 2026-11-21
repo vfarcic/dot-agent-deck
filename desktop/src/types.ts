@@ -1016,7 +1016,7 @@ export type AgentTab =
  * unrecognised command and any type a newer daemon names that this app does
  * not know.
  */
-export type AgentTypeId = "claude_code" | "open_code" | "pi" | "codex" | "devin" | "none";
+export type AgentTypeId = "claude_code" | "open_code" | "pi" | "codex" | "devin" | "antigravity" | "none";
 
 /**
  * PRD #1541 — whether the agent is in the middle of a turn, from the daemon's
@@ -1054,8 +1054,11 @@ export interface PromptKeys {
    * The key that deletes one character, and the longest single write (in
    * characters) the agent keeps as typed text — absent where no limit was
    * observed. Voice applies its own 800-character ceiling on top (PRD #1541).
+   * Never more than `maxPressesPerWrite` deletes in one write, when present,
+   * and `pauseBetweenWritesMs` between two writes of one deletion, when
+   * present (Antigravity drops deletes from a larger burst, PRD #211).
    */
-  deleteChar: { bytes: string; maxLiteralWriteChars?: number };
+  deleteChar: { bytes: string; maxLiteralWriteChars?: number; maxPressesPerWrite?: number; pauseBetweenWritesMs?: number };
 }
 
 /**
@@ -1247,6 +1250,12 @@ export interface AgentSession {
    * only while the daemon reports the agent in error.
    */
   deliveryNotice?: string;
+  /**
+   * HONEST. PRD #211: the agent's own words for its error or Needs Input — the
+   * error a failed turn reported, or what it waits on. A display copy, present
+   * only while the daemon reports one of those statuses.
+   */
+  statusReason?: string;
   /**
    * HONEST. PRD #1631: the question the agent is waiting on, from the daemon's
    * snapshot. Every text field is the agent's own words, scrubbed by the
@@ -1984,6 +1993,13 @@ export interface DeckRuntimeState {
    */
   starPromptLaunch?: () => Promise<boolean>;
   starPromptChoose?: (choice: import("./lib/starPrompt").StarChoice) => Promise<string | undefined>;
+  /**
+   * PRD #211 — whether a New agent start of a command shows the Antigravity
+   * notice, and the user's choice in it. Optional for the same reason; a
+   * runtime without them never shows the notice.
+   */
+  antigravityNoticeStart?: (command: string | undefined) => Promise<import("./lib/antigravityNotice").NoticeStart>;
+  antigravityNoticeChoose?: (choice: import("./lib/antigravityNotice").NoticeChoice) => Promise<string | undefined>;
   /** The desktop app's own settings, and where they live (PRD #803). */
   getSettings: () => Promise<import("./lib/bridge").DesktopSettingsSnapshotDto>;
   /**

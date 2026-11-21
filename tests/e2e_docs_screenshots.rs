@@ -697,6 +697,68 @@ fn docs_screenshot_dashboard_empty() {
     });
 }
 
+/// Scenario: Restore the synthetic Antigravity CLI and replay its permission menu and blocked status signal. Capture the dashboard card showing Needs Input with the permission reason under Dir beside the matching menu in its pane.
+#[test]
+#[ignore = "docs-screenshot generator: run it with `cargo docs-screenshots`"]
+fn docs_screenshot_antigravity_needs_input() {
+    html_dir();
+    const REASON: &str = "Approve Bash: rm -f probe.txt";
+    let deck = launch_fixture_with("antigravity", |builder| {
+        builder
+            .with_env(
+                "AGY_TEST_DECK_BIN",
+                common::contained_deck_binary().display().to_string(),
+            )
+            .with_continue_session("probe", "./agy")
+    });
+    deck.wait_for_string("[Command Mode Ctrl+D]");
+    assert!(common::wait_for_path(
+        &deck.workdir().join("replay-ready"),
+        Duration::from_secs(15)
+    ));
+    let actions = serde_json::json!([
+        {"hook": "session-start.json", "payload": {
+            "cwd": "/home/dev/demo-project",
+            "workspacePaths": ["/home/dev/demo-project"]
+        }},
+        {"permission_menu": true},
+        {"osc": "blocked", "kind": "permission", "msg": REASON}
+    ]);
+    let request = deck.workdir().join("request-0.json");
+    let temporary = request.with_extension("tmp");
+    std::fs::write(&temporary, actions.to_string()).expect("write permission replay");
+    std::fs::rename(temporary, request).expect("publish complete permission replay");
+    deck.wait_for_string(REASON);
+    deck.send_bytes(b"\x04");
+    let page = deck.capture_screen_when("antigravity-needs-input", |screen| {
+        let grid = screen.contents();
+        (grid.contains("Needs Input")
+            && grid.contains("Dir:  demo-project")
+            && grid.matches(REASON).count() == 2
+            && grid.contains("1. Yes, run command")
+            && !grid.contains("COMMAND MODE")
+            && !STARTUP_HOOK_NOTES.iter().any(|note| grid.contains(note)))
+        .then(|| {
+            render_page(
+                screen,
+                "antigravity-needs-input (TUI)",
+                &RenderOptions::default(),
+            )
+        })
+    });
+    for leak in [
+        "/tmp/",
+        "/var/tmp",
+        "dad-tests-",
+        "dad-e2e-",
+        env!("CARGO_MANIFEST_DIR"),
+        deck.workdir().to_str().expect("UTF-8 sandbox path"),
+    ] {
+        assert!(!page.contains(leak), "{leak} reaches the image");
+    }
+    write_page("antigravity-needs-input", &page);
+}
+
 /// Scenario: Open a stand-in implementation agent on a fixture GitHub branch
 /// whose strict offline gh stub reports open PR #1234 with passing CI awaiting
 /// review. Capture the dashboard only when its card badge and fixed pane
