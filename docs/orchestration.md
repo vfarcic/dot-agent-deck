@@ -74,9 +74,7 @@ The orchestrator and the workers hand tasks and reports to each other through fi
 4. On the **Mode** field, press `Left`/`Right` (or `h`/`l`) until it shows `Orch: team`. The Command field disappears: each role runs its own `command`.
 5. Press `Enter`.
 
-A new tab opens with one pane per role. The role cards are in the left sidebar, and the orchestrator's pane is focused.
-
-![The demo-loop orchestration tab with both roles at work: the tab bar shows Dashboard and demo-loop, two role cards are stacked in the left sidebar, planner (Claude Code, reading src/checkout/flow.ts, Last: 2s) and builder (Codex, editing src/checkout/RetryPayment.tsx, Last: 3s), both Working, and the orchestrator role, planner, carries the ORCHESTRATOR badge on its card and is selected with its pane active on the right](/img/orchestration-tui.png)
+A new tab named after the orchestration opens beside **Dashboard**, with one pane per role. The role cards are stacked in the left sidebar, the orchestrator's card carries an **ORCHESTRATOR** badge, and the orchestrator's pane is focused.
 
 **Desktop:**
 
@@ -87,9 +85,7 @@ A new tab opens with one pane per role. The role cards are in the left sidebar, 
 
 The first time you start an orchestration, and again after its roles' commands, descriptions or prompts change, both clients show **Review project commands** before anything starts: read what each role will run and be told, then press `a` in the TUI or **Approve and start** in the desktop app. Schedules and dispatched units can start it only after you have approved it. See [Approving Project Commands](project-trust.md).
 
-The Dashboard shows an **ORCHESTRATION** group with a numbered row per role and an **ORCHESTRATOR** badge on the orchestrator. Click a row to open that role's terminal. See [Desktop app → Dashboard](desktop/dashboard.md) and [New agent](desktop/new-agent.md).
-
-![The desktop app's Dashboard with an activated orchestration: below the standalone agents, an ORCHESTRATION group named demo-loop with a Close button and a numbered row per role, 01 planner carrying the ORCHESTRATOR badge and 02 builder](/img/orchestration-desktop.png)
+The Dashboard shows an **ORCHESTRATION** group with a numbered row per role and an **ORCHESTRATOR** badge on the orchestrator. Click a row to open that role's terminal. The group carries the orchestration's name and a **Close** button. See [Desktop app → Dashboard](desktop/dashboard.md) and [New agent](desktop/new-agent.md).
 
 **Check:** run `dot-agent-deck daemon status`. It prints one row per agent with the columns `PANE AGENT ROLE STATUS TOOL INBOX WAKE LABEL CWD`. The three roles appear with ROLE `orchestrator (orchestrator)`, `coder` and `reviewer`, and CWD is the project directory. `(orchestrator)` marks the role that may delegate.
 
@@ -123,14 +119,6 @@ Instead of writing the file yourself, you can ask an agent that is already runni
 4. The deck sends the agent a [deck message](#delivery-in-the-tui-and-desktop-app) asking it to analyse the project, pick roles from the [role library](#role-library), find the commands that launch agents in this project (devbox scripts, Makefile targets, bare `claude`, `opencode`, `pi`, `codex` or `devin`), and propose a config. Both clients say `Config request sent to the agent's inbox.` and bring the agent in front of you: the TUI focuses its pane, so what you type next goes to the agent, and the desktop app opens its pane. In the desktop app, pressing **No** while the dialog says `Sending…` closes it but does not take the request back; the app then leaves you where you are instead of opening the agent's pane.
 5. Read the proposal in the agent's pane and tell the agent what to change. It writes `.dot-agent-deck.toml` to the project directory only after you approve the proposal. When the file already exists, the agent reads it first and proposes changes to it rather than a new file, keeping what you wrote unless you agree to drop it. This is decided when you press **Yes**: if the file exists by then, the agent is asked to update it, whichever word the control showed. If `.dot-agent-deck.toml` is a symbolic link, the agent edits the file it points to and keeps the link; if the link points to a file that does not exist, the agent tells you so and writes nothing.
 6. Run `dot-agent-deck validate`.
-
-**TUI:**
-
-![The TUI's Generate .dot-agent-deck.toml dialog over the dashboard, asking whether to instruct the agent to analyse the project and create a config, with Yes selected and No below it](./img/generate-config-tui.png)
-
-**Desktop:**
-
-![The desktop app's Generate .dot-agent-deck.toml dialog over the agent dashboard, with the same question and No and Yes buttons](./img/generate-config-desktop.png)
 
 The request reaches the agent the way any deck message does, so every supported agent can take it; [Which agents wake for messages](#which-agents-wake-for-messages) says when one needs a prompt from you first. Devin, for example, takes it only when you ask it in its pane to run `dot-agent-deck inbox fetch`. If the agent's card or tile says its message is waiting, do what it says.
 
@@ -519,7 +507,7 @@ If the replacement cannot start, or exits before taking the task, the orchestrat
 
 Tasks, worker reports, dispatch results, scheduled prompts and deck notices wait in the recipient's inbox. The installed hooks, plugin or extension hand them to the agent and acknowledge receipt. A successful `delegate` means the task was accepted; delivery and finishing the work are separate steps.
 
-Both clients show `✉N queued` while messages await acknowledgement and `✉ delivered` after receipt when nothing remains pending. On a TUI card that line sits beside the status, moves to the right end of the `Dir:` row where it would cut the agent's name short, and shortens to `✉N` on a narrow card ([Message delivery](session-management.md#message-delivery)). If messages wait longer than a wake-up normally takes while the agent is not working, both clients show `✉N waiting to wake: send it a prompt`. That happens when nothing the deck can do wakes the agent, for example when the agent did not answer the doorbell. Send the agent any prompt: the agent takes its messages at the start or end of its next turn, and the badge goes back to `✉N queued` or `✉ delivered`. When the deck can tell what is keeping the doorbell from ringing, the card and the tile say so instead, under the agent's directory, and the badge keeps only the count:
+Both clients show `✉N queued` while messages await acknowledgement and `✉ delivered` after receipt when nothing remains pending. On a TUI card that line sits beside the status, moves to the right end of the `Dir:` row where it would cut the agent's name short, and shortens to `✉N` on a narrow card ([Message delivery](session-management.md#message-delivery)). In the desktop app it is on the agent's tile and in its open pane. If messages wait longer than a wake-up normally takes while the agent is not working, both clients show `✉N waiting to wake: send it a prompt`. That happens when nothing the deck can do wakes the agent, for example when the agent did not answer the doorbell. Send the agent any prompt: the agent takes its messages at the start or end of its next turn, and the badge goes back to `✉N queued` or `✉ delivered`. When the deck can tell what is keeping the doorbell from ringing, the card and the tile say so instead, under the agent's directory, and the badge keeps only the count:
 
 - `✉N waiting: there may be an unsent draft. Send it or clear it.` Something was typed into the agent's input box and the deck's check of the box found it not empty: text, spaces or empty lines you left there. Send it, or clear it with whatever keys you like; the deck checks the box again and the doorbell goes ahead once it is empty. The deck checks the input box of Claude Code running on Linux when it started Claude Code directly in the pane, not through a launcher script, provided it has somewhere safe to keep its helper ([how the check works](#how-the-deck-checks-claude-codes-input-box)), and of Codex running on Linux when it started Codex in the pane, directly or through a launcher ([how it checks Codex](#how-the-deck-checks-codexs-input-box)). For any other agent, and on macOS, you see one of the lines below instead.
 - `✉N waiting: ask the agent to run dot-agent-deck inbox fetch; reinstall the deck integration to restore automatic delivery` Something was typed into the input box of a Claude Code agent whose box the deck can't check, for example one started through a launcher script, or any Claude Code on macOS, where the deck has no input-box check yet, so the deck doesn't type its doorbell into it again until the agent restarts, and every later message waits the same way. Ask the agent, in its pane, to run `dot-agent-deck inbox fetch`, or send it a prompt: it takes its messages at that turn. Clearing the box yourself doesn't make the deck ring. Claude Code's own wake-up delivers without the doorbell: run `dot-agent-deck hooks install`, then restart Claude Code from the deck once it has taken its messages ([Which agents wake for messages](#which-agents-wake-for-messages)).
@@ -543,14 +531,6 @@ For a Pi agent there is one more case. When the deck has handed Pi a message and
 - **Retry** sends the message again, marked as a possible repeat. If Pi did have the first copy, it may now see the message twice; the repeat asks it to continue rather than restart work it already began.
 - **Cancel** stops the deck delivering the message. A copy Pi already has stays with it; when Pi may already have the message, a delegated task's orchestrator is told the task may already have reached the worker.
 
-**TUI:**
-
-![A Pi card named builder whose first prompt may not have reached the agent, with the Deck messages list open over the dashboard: the selected row names the sender and subject, shows the whole explanation and offers Retry and Cancel](/img/inbox-attention-tui.png)
-
-**Desktop:**
-
-![The same Pi agent's tile, listing its first prompt with the whole explanation and Retry and Cancel buttons](/img/inbox-attention-desktop.png)
-
 Choose what happens next, for any of these messages:
 
 - In the TUI, select the card and press `i` to open **Deck messages**. Each row names who sent the message and its subject. The selected row shows its whole explanation, which says what Retry would do; the other rows show the start of theirs. Press `r` to **Retry** (send it again, marked as a possible repeat) or `c` to **Cancel** (stop delivering it); `j`/`k` move between rows and Escape closes the list. When the window is too small to show the selected row's whole explanation, `r` sends nothing and says `make the window taller to see what Retry does` or `make the window wider to see what Retry does`; make the terminal window larger, or its font smaller, then press `r` again.
@@ -569,16 +549,6 @@ Long turns affect delivery the same way in the TUI and the desktop app:
 - If the deck reported a task as not delivered, check the agent's pane before posting it again: the agent may take it after all. When it does, the orchestrator may be told that the task arrived, and the agent's TUI card or desktop tile may leave its delivery error state once no other delivery error remains. Go by the pane, not by whether that notice arrives.
 - If the orchestrator was told a task has not reached its worker, it is asked to check the worker's pane before delegating the task again. If the worker then picks it up, the orchestrator may be told the task arrived after all.
 - OpenCode, Pi and Claude Code with hooks from the deck's release keep a message queued this way for as long as the busy turn lasts, with no time limit. After an hour without the agent starting on it, the card shows the one-time reminder described above. An offered job waits the same way; see [Announcements and pooled jobs](#announcements-and-pooled-jobs).
-
-**TUI:**
-
-![Planner and builder working in demo-loop, each with one queued inbox message beside its role card, the planner's card carrying the ORCHESTRATOR badge](/img/agent-messaging-tui.png)
-
-**Desktop:**
-
-The Daemons view below has experimental features enabled. The inbox badge also appears in an agent's open pane.
-
-![The same planner and builder working in demo-loop, each with one queued inbox message on its tile](/img/agent-messaging-desktop.png)
 
 The desktop app's handoff rail shows `delegated · queued`, `delivered · working`, `work-done` or `not delivered` for worker handoffs. The rail is a desktop surface; TUI users follow the cards and the orchestrator's pane.
 

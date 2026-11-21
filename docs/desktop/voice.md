@@ -149,8 +149,6 @@ When the agent shows an option whose label starts with another's, the whole labe
 
 **With [reading](#reading) on, you hear the question before you answer it.** When an agent asks for permission, the app says so at once, with the numbers you can answer with, for example "The coder is asking for permission: Bash: cargo publish. Say 1 for Yes, or say No.", or "Asking for permission: Bash: cargo publish. Say 1 for Yes, or say No." when that agent's pane is open, so you know what to say without watching the screen. Options that have to be answered in the pane are left out, which is why a number can be skipped, and an option whose number depends on what the agent shows is said by name only. For a form, you hear the first question's options. Open that agent's pane if it is not open already, and answer once the app has finished speaking. While the app is speaking only "stop" and "quiet" are heard, so an answer said over it is not taken: say it again when the app is quiet, or say "stop" first. Speaking still stops an answer's countdown, and "cancel" still calls off an answer that is being sent. You normally hear each prompt once, but now and then the app may say a prompt a second time or not say it at all, so when an agent's row shows **needs input** and you have not heard why, open its pane to see what it is asking. Once you have answered a prompt by voice the app does not say it any more, even if it was still waiting to be said; the agent's other news and other agents' speech are still said. Answering does not change reading: the agent's next turn is read as usual.
 
-![The pane of the Codex agent Desktop implementation, with Codex asking whether to run npm install --save-dev msw, its three options listed in the pane, and at the bottom of the window the voice row after "go ahead" was heard: “Yes, proceed” (allow once) — npm install --save-dev msw — sending in 5 s, with a Cancel button](/img/voice-question-desktop.png)
-
 Once every question has an answer, the row shows it with a five-second countdown that names the option it will send, as the agent labels it, for example *“Yes” (allow once) — touch notes.txt — sending in 5 s. Say “cancel” to stop.* When the app hears you start speaking, the countdown stops — *stopped because you spoke. Say the answer again to send it.* — before it works out what you said, and nothing is sent until you give a complete answer again, which starts a new countdown. Speech that starts in the very last moment may come too late to stop it. Press **Cancel** to call it off without speaking. When the countdown ends, the row shows *sending…* until the deck has answered the agent, and **Cancel** still works until then; then the row says what it sent: *Allowed: touch notes.txt*, *Denied: touch notes.txt*, or *Answered: Colour → Red; Sizes → Small, Large*. If you cancel after the answer already reached the agent, the row says so: *Too late to cancel — Allowed: touch notes.txt*. Always read the countdown: the app picks the option it thinks your words chose, and it can pick wrongly — for example "Yes" for something you said about something else. What the countdown shows is exactly what will be sent, and speaking or **Cancel** stops it.
 
 **Always allow.** Choosing an "always" option opens a confirmation, **Always allow?**, that says what it will always allow, for example *This will always allow access to /work/proj for the rest of this session. Confirm?* Press **Confirm**, or say "confirm" or "always allow" again, and the countdown starts. "Yes", "sure" or "OK" does not confirm it: the confirmation stays open and the row says *Say “confirm” to always allow, or “cancel”.* Press **Cancel**, close the confirmation, or say "cancel" or "no", and nothing is sent. The deck grants exactly what the confirmation names; when it cannot say what an agent's "always" option would grant, or the grant is too long to show in full, that option has to be chosen in the pane.
@@ -208,8 +206,6 @@ Once the New agent dialog has a daemon and a directory chosen, say "set the comm
 While voice is on, the lists you can choose from by voice show a number before each item: the agents on the dashboard, the agent tiles on the Daemons screen, the daemons, directories and modes in the New agent dialog, and the entries of the **Daemon** selector while its menu is open, **All daemons** included. With voice off, they look as they always do.
 
 Each list is numbered from 1. When several lists are visible together, as in the New agent dialog, each has its own numbers: the daemons 1, 2…, the directories 1, 2… (with `..` for the folder above as 1), and the modes 1, 2…. On the dashboard the agents of every daemon are one list, numbered top to bottom, and a number stays with its row wherever the dashboard is scrolled. While an agent's pane, the New agent dialog or the **Daemon** menu is open, only what is in front is numbered. A list shown in pages is numbered from 1 on every page; see [Long lists are shown in pages](#long-lists-are-shown-in-pages).
-
-![The agent dashboard with voice on: each agent row starts with a number, 1 to 6, counting on from one daemon's agents to the next](/img/voice-numbers-desktop.png)
 
 - **Say the list and the number**: "directory 3", "select directory 13", "daemon 1", "choose mode 2", "agent 3" or "open agent 3". "Folder" works for directory, "deck" for daemon, and you can start with "select", "choose", "pick", "open", "enter", "go to" or "switch to". The item showing that number in that list is chosen as if you had clicked it: an agent opens, a daemon or mode is chosen, a directory opens (`..` goes up).
 - **Say the number on its own**: "three", "3", "number three", "the third one" or "the last one". When only one list on screen shows that number, its item is chosen straight away. When several do, for example directory 3 and mode 3, the app asks which one you meant, listing them as "Directory 3: scratch" and "Mode 3: Review".
@@ -286,8 +282,6 @@ On the dashboard, say **"show the counters"**, **"show the stats"** or ask "how 
 
 While voice is on, a list that does not fit in the window is shown a page at a time instead of scrolling, so everything you can choose by voice is on screen. This applies to the directories and the modes in the New agent dialog and the agent tiles on the Daemons screen. The dashboard is not split into pages; it scrolls (see [Scrolling the dashboard](#scrolling-the-dashboard)). A list that fits is shown whole, as before. With voice off, every list scrolls as it always has. The daemons in the New agent dialog are never split into pages: every daemon that can take a new agent is always shown in full.
 
-![The New agent dialog with voice on: the daemons, the directories and the modes are each numbered from 1, the directories fill the dialog in five columns, and "Page 1 of 3" shows beside the Directory heading](/img/voice-pages-desktop.png)
-
 - **Each page fills the space the list has.** Directories and modes are laid out in as many columns as fit, and a short list uses only the columns it needs, so a few long directory names are shown whole. A name that is cut short shows in full when you hover over it. The Daemons screen shows four tiles per page, the four the `1`–`4` keys select.
 - **"Page 2 of 3"** shows beside a list that has pages: next to the **Directory** heading or under **Mode** in the New agent dialog, and above the tiles on the Daemons screen.
 - **Say "next page" or "previous page"** to turn it ("go to the next page" and "go back a page" work too). On the last page, the first page, or a screen with no pages, nothing moves and the app says why. In the New agent dialog, the directories turn until you choose one, and then the modes do.
@@ -296,9 +290,7 @@ While voice is on, a list that does not fit in the window is shown a page at a t
 
 ## When a command matches several things
 
-If what you said names more than one thing on screen, for example "open the agent" with several agents on the dashboard, the app does not guess. A dialog opens in the middle of the screen, over whatever is there (an agent's pane or the New agent dialog included), asking which one you meant. It lists the matches as a numbered list, with a **Cancel** button and a countdown, and waits for you to choose. The row at the bottom keeps showing what the app heard.
-
-![The agent dashboard with voice on and "open the agent" heard: a dialog in the middle of the screen asks "Which agent?", lists 1. Plan / architecture and 2. Desktop implementation, and shows a 20 s countdown and a Cancel button, while the row at the bottom says what was heard](/img/voice-choice-desktop.png)
+If what you said names more than one thing on screen, for example "open the agent" with several agents on the dashboard, the app does not guess. A dialog opens in the middle of the screen, over whatever is there (an agent's pane or the New agent dialog included), asking which one you meant, for example **Which agent?**. It lists the matches as a numbered list, with a **Cancel** button and a countdown, and waits for you to choose. The row at the bottom keeps showing what the app heard.
 
 - **Say the number**: "two", "2", "number two", "option two", "the second one" or "the last one", on its own.
 - **Say the name** of one of the listed entries on its own, such as "Desktop implementation". A sentence that only contains a listed name, such as "stop Planner", is not an answer: the list closes and that sentence runs as a new command.
@@ -324,8 +316,6 @@ A list is not offered while a confirmation is open, or when more than nine thing
 When you want to dictate a longer prompt, you do not have to start every sentence with "type". Open the agent's pane and say "type on" (or "typing on", "start typing", "dictation on", "start dictation", "keep typing", "talking on", "start talking", "speaking on", "start speaking", "dictate on", "writing on", "start writing"). Say it on its own: "I was talking on the phone" does not start typing mode. From then on, everything you say is typed into that agent's prompt, word for word, until you stop.
 
 While typing mode is on:
-
-![An agent's pane with typing mode on: "Typing to Desktop implementation" at the top edge of the window, and at the bottom of the window the Voice on button, a Stop typing button and the reminder "Typing to Desktop implementation. Say “type off” to stop, “send it” to send."](/img/voice-typing-mode-desktop.png)
 
 - **Typing to** *agent* is shown at the top edge of the window, beside **Reading aloud** when [reading](#reading) is on, and beside the Voice button, with a reminder of what to say to stop and to send, and a **Stop typing** button.
 - Nothing is sent to the agent until you say "send it" (or "send", "submit", "submit it", "enter", "press enter", "go ahead", "end", "that is the end", "finished", "the prompt is finished") on its own, or press `Enter` yourself. After a send, typing mode stays on, so you can dictate the next prompt the same way.
@@ -393,8 +383,6 @@ Everywhere else, each sentence starts with the agent's name: "Tester: all 42 tes
 
 ### Turn it on
 
-![Settings → Voice scrolled to reading: Reading set to Off with one sentence saying what it sends where, and Speech source set to Auto with its description](/img/settings-voice-reading-desktop.png)
-
 Reading has one switch, **Reading** in **Settings → Voice**, and it is off until you turn it on. Read [What is sent where](#what-is-sent-where) first: with reading on, the agents' replies leave your machine. Turn it on either way:
 
 - set **Reading** to **On** in **Settings → Voice**; or
@@ -441,8 +429,6 @@ A daemon lets at most 32 agents be read at once, counting every open window of t
 Reading needs a daemon that reports finished turns. Under an older one, the app says once for that daemon, not once for each of its agents: "Reading is not available: this deck's daemon is too old to report finished turns. Update dot-agent-deck on that machine." That machine is the one the daemon runs on. The agents of the other daemons you view are still read. A Pi agent whose deck is older than reading keeps its status and card as before; only its turns cannot be read.
 
 ## Settings → Voice
-
-![Settings → Voice with the default services: Speech on this machine, through a local speech container, Language set to English, and Commands through an OpenAI-compatible API, each with its Endpoint and Model, the sentences saying what Commands sends, then Send on-screen names set to On and Max tokens](/img/settings-voice-desktop.png)
 
 | Row | What it sets | Default |
 | --- | --- | --- |

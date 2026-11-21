@@ -2,8 +2,6 @@
 
 The **Agent dashboard** is the desktop app's main screen and the one it opens on: every agent on the daemons you are watching, one row each. It is the desktop counterpart of the TUI's dashboard, which shows the same agents as cards (see [Session Management](../session-management.md)).
 
-![The desktop app's dashboard with four agents in one daemon section, each row showing its status, name and uptime](/img/dashboard-desktop.png)
-
 The Dashboard can also show each agent as a card that says what it reported, whether it needs you and what you can do about it: see [Agent Cards](agent-cards.md).
 
 ## Check what is running
@@ -23,8 +21,6 @@ Each daemon being shown gets its own section, headed with its name (**Local daem
 Beside the daemon's name, a small **Host** button shows how the machine that daemon runs on is doing: green when its disk, load and memory are fine, amber with **Host: warning** or red with **Host: critical** when one of them is not. Click it, or `Tab` to it and press `Enter`, to open **Host of this deck**: free disk space, load per core and memory, each coloured the same way, with `(warning)` or `(critical)` after a figure that needs attention. Its **X** button, `Esc` or a click elsewhere closes it. With voice on, saying "show host" opens it too, and "close" or "close host" closes it ([Voice Control → Checking a daemon's machine](voice.md#checking-a-daemons-machine)). A daemon from an older release opens it saying **Host metrics are not available from this deck** instead. The TUI shows the same figures when you press `m`. [Session Management → Check the machine a deck runs on](../session-management.md#check-the-machine-a-deck-runs-on) explains each row and how to change the limits.
 
 Each group header shows how many agents it holds, how many are in each status, and the working directory most of its agents share. A row shows its own directory only when it differs from that.
-
-![The Dashboard with two daemons, each in its own section with its own New agent button: Local daemon with four agents and a remote daemon, dev@build-box, with two; the counters button at the top reads 6 agents and 1 needs input, adding up the agents of both](/img/dashboard-fleet-desktop.png)
 
 ## Rows and columns
 
@@ -61,8 +57,6 @@ A daemon none of whose agents match shows one line in its place, for example `bu
 
 The filter stays while you move between screens and lasts until you clear it or quit the app; the next time the app starts, the Dashboard shows every agent. You can also set and clear it [by voice](voice.md#filtering-the-dashboard). The TUI's dashboard has no filter.
 
-![The Dashboard filtered to working agents: two daemons filtered to working agents: the line under the header reads Showing 3 of 6 agents · Working, with a remove control beside Working and a Show all button, while the counters button above still counts all six agents](/img/dashboard-filter-desktop.png)
-
 ## Statuses
 
 The desktop app shows a status in the same word the TUI's cards use, on the table, the cards, the tiles and the counters:
@@ -97,7 +91,7 @@ To watch or talk to one agent:
 2. Type into the terminal as you would into the TUI's pane. [Keys typed into an agent's terminal](settings.md#keys-typed-into-an-agents-terminal) says which keys reach the agent, including your platform's editing and paste shortcuts.
 3. When the agent's output is longer than the terminal, a scrollbar stays on the terminal's right edge, so you can see that there is more above and how far back you are. Scroll up to read earlier output.
 4. To copy the agent's output, drag across it with the mouse. Some agents, such as Codex, OpenCode and Claude Code in its fullscreen mode, handle the mouse themselves: they highlight what you drag across and copy it when you release the button, so the text is on your clipboard with nothing more to press. Otherwise the terminal highlights the text, and you copy it with your system's copy key: `⌘C` on macOS, `Ctrl+Shift+C` on Linux, and `Ctrl+C` or `Ctrl+Shift+C` on Windows. On Windows, `Ctrl+C` copies only while text is highlighted and then clears the highlight, so pressing it again interrupts the agent. On macOS and Linux, plain `Ctrl+C` always goes to the agent as an interrupt, even while text is highlighted.
-5. Press **Back to dashboard**, or `Escape` when you are not typing in the terminal, to close the pane. The agent keeps running.
+5. Press **Back to dashboard**, the **×** at the right end of the pane's header, or `Escape` when you are not typing in the terminal, to close the pane. The agent keeps running.
 
 To ask the agent to write the project's `.dot-agent-deck.toml`, press **Generate config** in the pane's header, which reads **Update config** when the project already has one ([Generate a config with an agent](#generate-a-config-with-an-agent)).
 
@@ -113,8 +107,6 @@ The pane's header is one line. It names the agent by the name its row shows, whi
 
 Between the header and the terminal, the pane shows the agent's assignment and two readings: **TIME**, how long the agent has been running (hover it for the exact time it started), and **TOOLS**, how many tool calls it has reported. TIME reads `—` when the daemon did not say when it started the agent.
 
-![An agent's full-window pane: its one-line header reads Desktop implementation, codex in muted text, and Working, with a red Close agent stop-icon button and a separate Back to dashboard cross in the header; its assignment, readings and Terminal tab appear below, with the agent's live output](/img/agent-pane-desktop.png)
-
 What can go wrong in the pane:
 
 - **"No terminal here: the desktop has no live connection to <daemon>…"**: the agent's daemon stopped answering. The header then shows the last status the app saw. The terminal comes back on its own when the daemon answers again.
@@ -128,14 +120,6 @@ When an agent works on a branch that has a pull request on GitHub, the app shows
 The TUI shows the same badge on the bottom border of the agent's card, as glyphs in the same order: the number, the state, the CI result (`✓` passed, `✗` failed, `●` running) and the review (`✓` approved, `±` changes requested, `◉` review required) on a filled cell, for example `#1234 ⊙ ✓ ◉`. The TUI has no tooltip, so it shows no counts; see [Session Management → Pull request badge](../session-management.md#pull-request-badge) for every glyph.
 
 The badge appears by itself: you do not link the pull request. An agent gets one when its working directory is a git repository with a GitHub `origin`, it is on a branch other than the repository's default branch, and that branch has a pull request. The badge follows the pull request, so a review, a CI result or a merge shows up on it within about a minute. If you expect a badge and there is none, see [Troubleshooting → An agent has a pull request but no badge](../troubleshooting.md#an-agent-has-a-pull-request-but-no-badge).
-
-**TUI:**
-
-![TUI card showing open pull request #1234 with passing CI, awaiting review, beside the implementation agent's pane](/img/pull-request-badge-tui.png)
-
-**Desktop:**
-
-![Dashboard row showing the implementation agent's open pull request #1234 with passing CI, awaiting review](/img/pull-request-badge-desktop.png)
 
 ### Read a pull request in the app
 
@@ -189,7 +173,5 @@ A daemon section shows one of these instead of its agents:
 | **Incompatible daemon** | A daemon answered, but it and the app are different versions, so the app will not use it. The message says which of the two is older, and either that the app has not connected because it could misread what the daemon reports, or that the two cannot work together at all. | Update the older of the two (see [Installation → Keep the app and the daemon on the same release](../installation.md#keep-the-app-and-the-daemon-on-the-same-release)). The note says what each of its buttons does: **Upgrade**, offered when a remote daemon is older than the app, installs the app's version there and restarts the daemon, asking before it stops any running agent ([Daemons → Upgrade a remote daemon](daemons.md#upgrade-a-remote-daemon)); **Replace daemon**, offered on the daemon on this machine, stops it and starts the daemon that came with the app, asking before it stops any running agent; **Open daemons** goes to the Daemons screen; **Connect anyway**, offered only when the message says the app could misread the daemon (never when the two cannot work together), uses the daemon as it is until you quit the app, though some of what it shows may be wrong. The choice covers the whole app session, not only this daemon: until you quit, the app also uses any other daemon it would refuse for the same reason, on any deck, including one that replaces this daemon later; **Reconnect** tries again. **Technical details** under the message shows the exact versions, for a bug report. |
 | **Desktop bridge error** | The app could not read the daemon's agents, and no daemon answered for it to judge. This is a problem on the app's side, not a version difference. | Press **Reconnect**. If it keeps happening, restart the app. |
 | **No agents are running yet** | The daemon is running and has no agents. This is what a fresh install looks like. It is one line across the daemon's section, with a **New agent** button. | Press **New agent**. While this machine is the only daemon you have added, the note also offers **Add a daemon**, which opens the form for adding a daemon on another machine ([Daemons](daemons.md#watch-a-daemon-on-another-machine)). |
-
-![The desktop app's dashboard with a running daemon and no agents: “No agents are running yet”, with New agent and Add a daemon](/img/dashboard-empty-desktop.png)
 
 When a daemon restarts while the app is connected to it, the agents it was running can no longer be reached, so the app removes their tiles and open panes and shows one notice in the corner naming each of them, with its role and orchestration, such as `The deck restarted; these agents were stopped: coder (worker in team), api-fix.` The notice lists every agent, scrolling when the list is long, and stays until you close it with its `×`; agents a later restart stops join it. Nothing is stopped or deleted to remove them. The TUI shows the same notice above its footer. See [The deck restarted and its agents disappeared](../troubleshooting.md#the-deck-restarted-and-its-agents-disappeared).
