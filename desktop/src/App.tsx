@@ -84,6 +84,7 @@ import { usePager, VoicePagingContext, type VoicePaging } from "./hooks/useVoice
 import { NO_NUMBERED_LIST, sameNumberedSections, type VoiceNumberedEntryDto, type VoiceNumberedListDto, type VoiceNumberedSectionDto } from "./lib/voiceNumbers";
 import { offPageSentence, offPageTarget, pageMarker, pageSlice, pageTurnRefusal, type VoiceOffPageItem, type VoicePager } from "./lib/voicePages";
 import { agentKey, boundAgentKey, sameIncarnation } from "./lib/agentKey";
+import { confirmInboxActionFor } from "./lib/inboxVoice";
 import { dashboardFilterFromParams } from "./lib/dashboardFilter";
 import { VOICE_ACTIONS, dispatchVoiceAction, saysCommand, type DashboardScroll, type DeckOverlay, type NewAgentVoice, type VoiceContextChannel, type VoiceDispatchContext, type VoiceDispatchTarget, type VoiceOverviewContext, type VoicePanelContext, type VoiceScreenContext, type PullRequestContext } from "./lib/voiceActions";
 import { terminalInputState, unreachableDeckTerminalState } from "./lib/terminalInput";
@@ -2265,6 +2266,24 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
    */
   const closeOverlays = () => DECK_OVERLAYS.forEach((overlay) => setOverlay(overlay, false));
   /**
+   * Issue #2148 — a spoken Retry or Cancel on an agent's deck messages: the
+   * confirmation listing them, which this screen draws as it draws its other
+   * confirmations, and whose button sends each one; the outcome is the toast's.
+   * The tile's own Retry and Cancel act on their one message directly.
+   *
+   * Defined here rather than inside the context below on purpose: `confirm`
+   * and the toast are not capabilities this member owns (every action that
+   * asks first opens `confirm`, and every outcome reports through the toast),
+   * so their setters must not become registry-owned by being named there.
+   */
+  const confirmInboxAction: VoiceScreenContext["confirmInboxAction"] = (verb, target) => {
+    const question = confirmInboxActionFor(verb, target, { agents: snapshot.agents, allDecks, confirmationOpen, inboxAction: runtime.inboxAction }, (sentence) => setNotice(sentence));
+    if (typeof question === "string") return question;
+    setConfirm(question);
+    return undefined;
+  };
+
+  /**
    * PRD #802 M2 — the deck's half of the action registry's context, and the one
    * place the rail buttons, the palette entries, the tile's open/close pair and
    * (since PRD #1195 M1) the in-panel controls reach their state from.
@@ -2308,6 +2327,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
       setTerminalFocus((current) => ({ agentId, token: (current?.token ?? 0) + 1 }));
     },
     advanceFixture: () => { void perform({ type: "advance_fixture" }); },
+    confirmInboxAction,
   };
 
   /**

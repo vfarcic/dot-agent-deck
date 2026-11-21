@@ -1,4 +1,4 @@
-import type { DeckView } from "../types";
+import type { DeckView, InboxActionVerb } from "../types";
 import type { VoiceDeckIdentityDto } from "./bridge";
 import { clearDashboardFilter, setDashboardFilter, type DashboardFilter } from "./dashboardFilter";
 import type { CardStep, OverviewMode } from "./agentCards";
@@ -567,6 +567,17 @@ export type VoiceActionContext = {
    * saying why it did not.
    */
   confirmGenerateConfig: (target: VoiceDispatchTarget) => string | undefined;
+  /**
+   * Issue #2148 — Retry or Cancel the deck messages waiting on the user for
+   * the agent an `agent_ref` resolved to, as the Daemons screen's tile lists
+   * them: OPEN a confirmation listing every message the verb covers, by
+   * sender and subject. Like the stops it only asks; the confirmation's
+   * button sends each Retry or Cancel, bound to the message revisions shown.
+   * Served by the deck screen, whose tiles draw the messages. Answers
+   * `undefined` when it opened the confirmation, or the sentence saying why
+   * it did not.
+   */
+  confirmInboxAction: (verb: InboxActionVerb, target: VoiceDispatchTarget) => string | undefined;
   /**
    * PRD #1401 — open GitHub's page for one agent's pull request in the app's
    * own browser, over the screen. Answers `undefined` when it opened, or the
@@ -1595,6 +1606,29 @@ export const VOICE_ACTIONS = {
     needs: ["confirmGenerateConfig", "reportRefused"],
     run: (context: Pick<VoiceActionContext, "confirmGenerateConfig" | "reportRefused">, target: VoiceDispatchTarget) => {
       const refused = context.confirmGenerateConfig(target);
+      if (refused !== undefined) context.reportRefused(refused);
+    },
+  },
+
+  /* Issue #2148 — Retry and Cancel on an agent's deck messages that wait on
+     the user, by voice. Each only OPENS the confirmation listing them; a
+     row's own Retry or Cancel button acts on its one message directly. */
+  confirmRetryInboxMessage: {
+    label: "Ask to retry the deck messages waiting on one agent",
+    voice: true,
+    needs: ["confirmInboxAction", "reportRefused"],
+    run: (context: Pick<VoiceActionContext, "confirmInboxAction" | "reportRefused">, target: VoiceDispatchTarget) => {
+      const refused = context.confirmInboxAction("retry", target);
+      if (refused !== undefined) context.reportRefused(refused);
+    },
+  },
+
+  confirmCancelInboxMessage: {
+    label: "Ask to cancel the deck messages waiting on one agent",
+    voice: true,
+    needs: ["confirmInboxAction", "reportRefused"],
+    run: (context: Pick<VoiceActionContext, "confirmInboxAction" | "reportRefused">, target: VoiceDispatchTarget) => {
+      const refused = context.confirmInboxAction("cancel", target);
       if (refused !== undefined) context.reportRefused(refused);
     },
   },
