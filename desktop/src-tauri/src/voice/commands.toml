@@ -681,9 +681,9 @@ action_words = ["host", "resource", "usage", "disk", "machine", "memory", "cpu",
 # **The button's label is in the description** (the label rule,
 # `docs/develop/voice-first-design.md`): its accessible name starts
 # "Counters", it reads "<n> agents" and, when something needs someone,
-# "<n> needs input", "<n> failed" or "<up>/<total> daemons". The popover's own
-# words — agents, running, needs input, failed, waiting, idle, groups,
-# daemons — are the rest.
+# "<n> needs input", "<n> error" or "<up>/<total> daemons". The popover's own
+# words — agents, working, thinking, compacting, needs input, error, waiting,
+# idle, groups, daemons — are the rest (issue #2411: the daemon's status words).
 #
 # `screens = ["overview"]` and `requires = ["new_agent_dialog_closed"]` for
 # `show_host_metrics`' reason: the button is on the agent dashboard only, and
@@ -692,11 +692,11 @@ action_words = ["host", "resource", "usage", "disk", "machine", "memory", "cpu",
 [[commands]]
 id          = "show_dashboard_counters"
 description = """Open the agent dashboard's counters: the popover that the Counters button at the top of
-the dashboard opens, listing how many agents there are in total, running, needing input, failed,
-waiting and idle, how many groups, and how many daemons are answering. Use for counters, show the
-counters, show counts, stats, statistics, totals, summary, how many agents are there, how many are
-running, how many need input, how many failed, how many daemons are answering. This only OPENS the
-counters: it starts, stops and changes nothing. A request to close or hide them is `close`, not this
+the dashboard opens, listing how many agents there are in total, working, thinking, compacting,
+needing input, in error, waiting and idle, how many groups, and how many daemons are answering. Use
+for counters, show the counters, show counts, stats, statistics, totals, summary, how many agents are
+there, how many are running, how many are working, how many need input, how many failed, how many
+have an error, how many daemons are answering. This only OPENS the counters: it starts, stops and changes nothing. A request to close or hide them is `close`, not this
 one. It is not `show_host_metrics`, which shows one machine's disk, memory and load, and not
 `filter_dashboard`, which changes which agents are listed."""
 invoke      = "showDashboardCounters"

@@ -9,7 +9,7 @@ The Dashboard can also show each agent as a card that says what it reported, whe
 ## Check what is running
 
 1. Choose what to watch with the **Daemon** selector under the title: **All daemons**, **This machine** (the default on a fresh install), or one remote daemon. To add a daemon on another machine, choose **Add a daemon…** at the bottom of the selector ([Daemons](daemons.md#watch-a-daemon-on-another-machine)).
-2. Read the counters button at the top, beside **New agent**. It shows how many agents the daemons that answered are running, for example `7 agents`, and adds a count only when something needs you: amber `1 needs input`, red `1 failed`, and red `2/4 daemons` when some of the daemons shown have not answered. Hover over it, or click it, to see every count: **AGENTS**, **RUNNING**, **NEEDS INPUT**, **FAILED**, **WAITING**, **IDLE** and **GROUPS** count the agents on the daemons that answered, and **DAEMONS** reads `<answered>/<shown>`, for example `1/1` for one healthy daemon. When no daemon answered, the counts read `—`. After a click the list stays open until you click the button again, press `Esc` or click elsewhere; with voice on, "show the counters" opens it ([Voice Control → Checking the counters](voice.md#checking-the-counters)). In a window narrower than 1240 pixels the button shows its numbers without the words. The TUI's dashboard shows the same counts on one line.
+2. Read the counters button at the top, beside **New agent**. It shows how many agents the daemons that answered are running, for example `7 agents`, and adds a count only when something needs you: amber `1 needs input`, red `1 error`, and red `2/4 daemons` when some of the daemons shown have not answered. Hover over it, or click it, to see every count: **AGENTS**, **WORKING**, **THINKING**, **COMPACTING**, **NEEDS INPUT**, **ERROR**, **WAITING**, **IDLE** and **GROUPS** count the agents on the daemons that answered, and **DAEMONS** reads `<answered>/<shown>`, for example `1/1` for one healthy daemon. When no daemon answered, the counts read `—`. After a click the list stays open until you click the button again, press `Esc` or click elsewhere; with voice on, "show the counters" opens it ([Voice Control → Checking the counters](voice.md#checking-the-counters)). In a window narrower than 1240 pixels the button shows its numbers without the words. The TUI's dashboard shows the same counts on one line.
 3. Read the rows. Each daemon has its own section (below); press **Refresh** to reconnect to the daemons and read their agent lists again. When there are more daemons and agents than fit the window, a scrollbar stays on the right edge: its length shows how much of the dashboard is on screen and its position shows where you are. Scroll with the mouse, the trackpad or the keyboard, or, with voice on, [by voice](voice.md#scrolling-the-dashboard).
 
 ## One section per daemon
@@ -55,7 +55,7 @@ Dispatchers, schedule agents and schedule: issues agents are the agents started 
 
 An agent is shown when it matches everything you chose: the text, and one of the ticked entries in each list you ticked something in. For example, ticking **Working** and **Thinking** under Status and **Codex** under Agent type shows the Codex agents that are working or thinking.
 
-While a filter is set, a line under the header says how much of the fleet you are looking at, for example `Showing 4 of 11 agents · Working · Dispatchers`. Each part of the filter has its own remove control on that line, and **Show all** clears the whole filter in one click. The counters in the header (**AGENTS**, **RUNNING**, **NEEDS INPUT**, **FAILED**, **WAITING**, **IDLE**, **GROUPS** and **DAEMONS**) always count the whole fleet, not only the agents the filter shows.
+While a filter is set, a line under the header says how much of the fleet you are looking at, for example `Showing 4 of 11 agents · Working · Dispatchers`. Each part of the filter has its own remove control on that line, and **Show all** clears the whole filter in one click. The counters in the header (**AGENTS**, **WORKING**, **THINKING**, **COMPACTING**, **NEEDS INPUT**, **ERROR**, **WAITING**, **IDLE**, **GROUPS** and **DAEMONS**) always count the whole fleet, not only the agents the filter shows.
 
 A daemon none of whose agents match shows one line in its place, for example `build-box: no matching agents`, and so does an orchestration or other group with no matching agents, so nothing disappears without a word.
 
@@ -65,16 +65,17 @@ The filter stays while you move between screens and lasts until you clear it or 
 
 ## Statuses
 
-The desktop app shows six statuses. Each covers one or more of the words the TUI shows on its cards:
+The desktop app shows a status in the same word the TUI's cards use, on the table, the cards, the tiles and the counters:
 
-| Desktop | TUI | Meaning |
-| --- | --- | --- |
-| **RUNNING** | Thinking, Working, Compacting | The agent is busy. An agent that has reported no status at all yet, for example a plain shell or an agent whose hooks are not installed, also shows **RUNNING**. |
-| **NEEDS INPUT** | Needs Input | The agent is waiting for you: a permission answer or other input. Answer it in its pane, or from the app or by voice when the deck knows the question; its row then shows `QUESTION` and how long it has waited, and the app sends one notification once it has waited 10 minutes ([When a question waits](../session-management.md#when-a-question-waits)). |
-| **WAITING** | Waiting | The agent's turn ended while a command it started in that turn is still running. Its mark is hollow, in **RUNNING**'s colour: its work is not finished, but nothing needs you. It turns **IDLE** when the command ends. Open its pane to see what is still running ([Work left running after a turn](../session-management.md#work-left-running-after-a-turn)). |
-| **IDLE** | Idle | The agent finished its turn and is waiting for its next prompt. Commands it left running from an earlier turn, and subagents it left running, keep it **IDLE**; open its pane to see what is still running. A status this build does not recognise, from a newer daemon, also shows **IDLE**, as it does in the TUI. |
-| **error** (counted under **FAILED**) | Error | Something went wrong, including a message the deck could not deliver. Read the notice and open the pane. |
-| **BLOCKED** | Blocked | The agent's provider refused it because a usage limit or credit pool is exhausted. Open the agent's pane to see which limit, and when it resets if the provider says. |
+| Status | Meaning |
+| --- | --- |
+| **THINKING**, **WORKING**, **COMPACTING** | The agent is busy: reasoning, running a tool, or compacting its conversation. |
+| **NEEDS INPUT** | The agent is waiting for you: a permission answer or other input. Answer it in its pane, or from the app or by voice when the deck knows the question; its row then shows `QUESTION` and how long it has waited, and the app sends one notification once it has waited 10 minutes ([When a question waits](../session-management.md#when-a-question-waits)). |
+| **WAITING** | The agent's turn ended while a command it started in that turn is still running. Its mark is hollow, in **WORKING**'s colour: its work is not finished, but nothing needs you. It turns **IDLE** when the command ends. Open its pane to see what is still running ([Work left running after a turn](../session-management.md#work-left-running-after-a-turn)). |
+| **IDLE** | The agent finished its turn and is waiting for its next prompt. Commands it left running from an earlier turn, and subagents it left running, keep it **IDLE**; open its pane to see what is still running. A status this build does not recognise, from a newer daemon, also shows **IDLE**, as it does in the TUI. |
+| **ERROR** | Something went wrong, including a message the deck could not deliver. Read the notice and open the pane. |
+| **BLOCKED** | The agent's provider refused it because a usage limit or credit pool is exhausted. Open the agent's pane to see which limit, and when it resets if the provider says. |
+| **RUNNING** | The agent has reported no status at all yet, for example a plain shell or an agent whose hooks are not installed. The counters do not count it under a status, only under **AGENTS**. |
 
 What each status means, and which agents can report Blocked, is on [Session Management → Session Statuses](../session-management.md#session-statuses). An agent that stays **RUNNING** when it is clearly idle usually has no hooks reporting to the daemon; see [Troubleshooting → Hooks](../troubleshooting.md#hooks).
 
@@ -112,7 +113,7 @@ The pane's header is one line. It names the agent by the name its row shows, whi
 
 Between the header and the terminal, the pane shows the agent's assignment and two readings: **TIME**, how long the agent has been running (hover it for the exact time it started), and **TOOLS**, how many tool calls it has reported. TIME reads `—` when the daemon did not say when it started the agent.
 
-![An agent's full-window pane: its one-line header reads Desktop implementation, codex in muted text, and Running, with a red Close agent stop-icon button and a separate Back to dashboard cross in the header; its assignment, readings and Terminal tab appear below, with the agent's live output](/img/agent-pane-desktop.png)
+![An agent's full-window pane: its one-line header reads Desktop implementation, codex in muted text, and Working, with a red Close agent stop-icon button and a separate Back to dashboard cross in the header; its assignment, readings and Terminal tab appear below, with the agent's live output](/img/agent-pane-desktop.png)
 
 What can go wrong in the pane:
 

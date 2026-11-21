@@ -5424,12 +5424,19 @@ fn owe_card_notice(st: &mut HubState, event: &InboxEvent) {
     if st.card_notice_sink.is_none() || event.state != StateName::Undeliverable {
         return;
     }
-    let detail = match event.undeliverable_reason {
-        Some(UndeliverableReason::MaxDeliver) => NOTICE_MAX_DELIVER.into(),
-        Some(UndeliverableReason::AgentExited) => event_termination(st, event)
-            .unwrap_or(&PaneTermination::Unknown)
-            .card_notice()
-            .into(),
+    // Issue #2246: an `agent_exited` notice is written once the agent is no
+    // longer live, so it is marked as one about the pane ending; it reaches
+    // the exited generation's card, which stays on screen until something
+    // takes the pane.
+    let (detail, pane_ended) = match event.undeliverable_reason {
+        Some(UndeliverableReason::MaxDeliver) => (NOTICE_MAX_DELIVER.into(), false),
+        Some(UndeliverableReason::AgentExited) => (
+            event_termination(st, event)
+                .unwrap_or(&PaneTermination::Unknown)
+                .card_notice()
+                .into(),
+            true,
+        ),
         _ => return,
     };
     let Some(recipient) = event.recipient.as_ref() else {
@@ -5445,6 +5452,7 @@ fn owe_card_notice(st: &mut HubState, event: &InboxEvent) {
         session_id: None,
         detail,
         cleared: false,
+        pane_ended,
     });
 }
 
@@ -5697,6 +5705,7 @@ fn settle_late_ack(st: &mut HubState, event: &InboxEvent) {
         session_id: None,
         detail: crate::inbox_display::NOTICE_DELIVERED_LATE.into(),
         cleared: true,
+        pane_ended: false,
     });
 }
 

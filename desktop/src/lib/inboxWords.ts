@@ -190,7 +190,7 @@ export const INBOX_WORDS = {
  * PRD #1666 part 3 (R-2): the card's notice for a refusal with `code`, the
  * row the TUI's card and Deck messages picker print too.
  */
-export function admissionRefusedText(code: string): string {
+function admissionRefusedText(code: string): string {
   const causes: Record<string, string> = INBOX_WORDS.admissionCauses;
   const cause = Object.prototype.hasOwnProperty.call(causes, code) ? causes[code] : undefined;
   return cause

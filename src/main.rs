@@ -123,8 +123,17 @@ enum Commands {
         #[arg(long)]
         supersede: bool,
     },
-    /// Create a git worktree and start an isolated line of work inside it.
-    /// Agent-callable, one step (PRD #220).
+    /// Create a git worktree and start an isolated line of work inside it, or,
+    /// with --dir, start the unit in a directory that already exists.
+    /// Agent-callable, one step (PRD #220, PRD #468).
+    ///
+    /// Without --dir, the worktree is a sibling of this checkout,
+    /// `../<repo>-dispatch-<name>`, on branch `agent/dispatch-<name>`, cut from
+    /// this checkout's HEAD; closing the unit removes it when it has no
+    /// uncommitted changes. With --dir, no worktree or branch is created and closing the
+    /// unit leaves the directory in place: the unit starts in that directory
+    /// (`--dir .` continues the work right where you are), and it is refused
+    /// when other live agents already work there.
     ///
     /// Exit status when starting a unit: 0 means the daemon admitted the
     /// request, or gave no answer this build can check (an older daemon, or
@@ -151,8 +160,8 @@ enum Commands {
     /// the daemon did not answer, or could not read this repo's config or this
     /// pane's directory. The reason is printed.
     Dispatch {
-        /// Short name for the dispatch unit (used for worktree naming).
-        /// Omit it only with --list-targets.
+        /// Short name for the dispatch unit. It names the unit's tab and, without
+        /// --dir, its worktree and branch. Omit it only with --list-targets.
         #[arg(required_unless_present = "list_targets")]
         name: Option<String>,
         /// Task description with context, file paths, and constraints.
@@ -194,6 +203,15 @@ enum Commands {
         /// --single does. Mutually exclusive with --orchestration.
         #[arg(long, value_name = "NAME", conflicts_with = "orchestration")]
         agent: Option<String>,
+        /// Start the unit in this existing directory instead of a new worktree
+        /// (`--dir .` for the directory you are in). No worktree or branch is created, and
+        /// closing the unit leaves the directory in place (unless it is an
+        /// earlier unit's worktree, which keeps that unit's cleanup). The
+        /// orchestrations on offer are that directory's. Refused when other
+        /// live agents already work in it. With --list-targets, list that
+        /// directory's targets.
+        #[arg(long, value_name = "PATH")]
+        dir: Option<String>,
         /// Print the spawn targets available in this repo, then exit. Ask the
         /// user which one they want before dispatching.
         ///
@@ -1187,6 +1205,19 @@ enum ConfigAction {
 /// file** (issue #328): a FIFO with no writer would otherwise block the CLI
 /// forever inside `open`, and a character device such as `/dev/zero` never
 /// ends. See [`read_task_input`].
+/// PRD #468: `dispatch --dir <path>` as the absolute path the daemon is sent,
+/// resolved against this process's working directory and checked to be an
+/// existing directory ([`dot_agent_deck::dispatch::resolve_existing_dir`]).
+fn resolve_dispatch_dir(path: &str) -> Result<String, String> {
+    let dir = dot_agent_deck::dispatch::resolve_existing_dir(std::path::Path::new(path))?;
+    dir.into_os_string().into_string().map_err(|dir| {
+        format!(
+            "--dir {}: the path is not valid UTF-8, which the daemon cannot be sent",
+            std::path::Path::new(&dir).display()
+        )
+    })
+}
+
 fn resolve_task(
     task: Option<String>,
     task_file: Option<String>,
@@ -2053,6 +2084,7 @@ fn main() -> ExitCode {
             orchestration,
             command,
             agent,
+            dir,
             list_targets,
         }) => {
             let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
@@ -2062,6 +2094,17 @@ fn main() -> ExitCode {
                         "Error: DOT_AGENT_DECK_PANE_ID environment variable not set.\n\
                          This command should be run from within a dot-agent-deck managed pane."
                     );
+                    return ExitCode::FAILURE;
+                }
+            };
+            // PRD #468: `--dir` is resolved HERE, against this process's own
+            // directory, because that is what a path typed at this shell
+            // means (`--dir .` is where the caller stands). The daemon gets an
+            // absolute path and checks it again.
+            let dir = match dir.as_deref().map(resolve_dispatch_dir).transpose() {
+                Ok(dir) => dir,
+                Err(e) => {
+                    eprintln!("Error: {e}");
                     return ExitCode::FAILURE;
                 }
             };
@@ -2079,6 +2122,7 @@ fn main() -> ExitCode {
                     dot_agent_deck::event::ListTargetsRequest {
                         pane_id,
                         token: dot_agent_deck::hook_provenance::token_from_env(),
+                        dir: dir.clone(),
                     },
                 );
                 let json = match serde_json::to_string(&req) {
@@ -2179,6 +2223,7 @@ fn main() -> ExitCode {
                     token: dot_agent_deck::hook_provenance::token_from_env(),
                     command: command.as_deref().map(|c| c.trim().to_string()),
                     agent: agent.as_deref().map(|a| a.trim().to_string()),
+                    dir,
                 };
                 if !launch.is_empty() {
                     return report_dispatch_with_launch(

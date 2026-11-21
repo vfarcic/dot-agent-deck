@@ -2613,6 +2613,12 @@ pub struct ListTargetsRequest {
     /// `changelog.d/1077.breaking.md`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    /// PRD #468: `dispatch --list-targets --dir <path>` — list the targets of
+    /// that directory's config, the one a `dispatch --dir <path>` resolves
+    /// from, instead of the pane's. Additive optional, same as
+    /// [`DispatchSignal::dir`]: an older daemon ignores it and lists the pane's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
 }
 
 /// PRD #220: the daemon's reply to a [`DaemonMessage::ListTargets`], one JSON
@@ -3593,6 +3599,20 @@ pub struct DispatchSignal {
     /// agent's default command. Same gate as [`Self::command`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// PRD #468: `dispatch --dir <path>` — the existing directory to start the
+    /// unit in, as an absolute path the CLI resolved. Present, the daemon
+    /// creates no worktree and registers nothing for removal
+    /// ([`crate::dispatch::handle_dispatch_at`]); absent, it cuts a worktree
+    /// from the caller's `HEAD` as every dispatch did before.
+    ///
+    /// **Additive optional on the hook socket, so it does NOT move
+    /// [`crate::daemon_protocol::PROTOCOL_VERSION`].** A daemon that predates it
+    /// ignores the key and cuts a fresh worktree instead. The maintainer decided
+    /// on 2026-11-04 not to gate on that (the CLI and the daemon are upgraded
+    /// together), so unlike [`Self::command`] it is sent without asking the
+    /// daemon first, and that case is no `.breaking.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -5834,10 +5854,12 @@ mod tests {
                 token: None,
                 command: None,
                 agent: None,
+                dir: None,
             }),
             DaemonMessage::ListTargets(ListTargetsRequest {
                 pane_id: "p".into(),
                 token: None,
+                dir: None,
             }),
             DaemonMessage::RestartRole(RestartRoleSignal {
                 pane_id: "p".into(),

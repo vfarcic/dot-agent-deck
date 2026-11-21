@@ -1044,6 +1044,37 @@ pub const ENV_TEST_HOOK_INTEGRATION: &str = "DOT_AGENT_DECK_INBOX_TEST_HOOK_INTE
 /// byte, as a hook killed between its grant and its print would.
 pub const ENV_TEST_EXIT_AFTER_GRANT: &str = "DOT_AGENT_DECK_INBOX_TEST_EXIT_AFTER_GRANT";
 
+/// TEST knob, read only by a build with the `e2e` feature: a path. Codex's
+/// hook, once it has printed a hand-over, waits while a file is there, for at
+/// most [`TEST_HOLD_MAX`], before it exits: the window in which the agent can
+/// still drop what the hook printed (issue #2346), held open so a test can
+/// interrupt the agent in it. A hook that holds first creates the file's
+/// path with `.held` appended, so the test knows it is in the window.
+pub const ENV_TEST_HOLD_AFTER_PRINT: &str = "DOT_AGENT_DECK_INBOX_TEST_HOLD_AFTER_PRINT";
+
+/// The longest [`ENV_TEST_HOLD_AFTER_PRINT`] holds a hook.
+pub const TEST_HOLD_MAX: Duration = Duration::from_secs(60);
+
+/// Hold this hook while [`ENV_TEST_HOLD_AFTER_PRINT`]'s file is there. Does
+/// nothing without the `e2e` feature, or with the knob unset.
+pub fn hold_after_print() {
+    #[cfg(feature = "e2e")]
+    if let Some(path) = std::env::var_os(ENV_TEST_HOLD_AFTER_PRINT).filter(|path| !path.is_empty())
+    {
+        let path = std::path::PathBuf::from(path);
+        if !path.exists() {
+            return;
+        }
+        let mut held = path.clone().into_os_string();
+        held.push(".held");
+        let _ = std::fs::write(held, b"");
+        let until = Instant::now() + TEST_HOLD_MAX;
+        while path.exists() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
 /// The one-shot integration this process declares (part 2 §2.7). A process
 /// that declares none stands in for an older dot-agent-deck, and speaks the
 /// legacy verbs as one would: it asks no `inbox_receipts` question and sends

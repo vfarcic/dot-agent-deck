@@ -567,7 +567,6 @@ pub trait PaneController: Send + Sync {
     /// the raw user input verbatim. See [`RenameOutcome`] for the
     /// three states.
     fn rename_pane(&self, pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError>;
-    fn toggle_layout(&self) -> Result<(), PaneError>;
     fn write_to_pane(&self, pane_id: &str, text: &str) -> Result<(), PaneError>;
     /// Issue #1445: tell the daemon that the orchestrator in `pane_id` has just
     /// been re-armed from `context_path`, so the context file it records for

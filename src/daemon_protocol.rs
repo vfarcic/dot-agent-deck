@@ -4091,6 +4091,11 @@ pub enum WorktreeVerdictKind {
     /// it, which removing it would delete; [`WorktreeVerdict::nested_worktrees`]
     /// names them. An older CLI decodes it as [`Self::Unknown`].
     KeptHoldsWorktrees,
+    /// PRD #468: left in place: the unit was dispatched with `--dir` into a
+    /// directory that already existed, and the deck holds no record of it to
+    /// remove (its dispatch recorded none). An older CLI decodes it as
+    /// [`Self::Unknown`].
+    ExistingDirectory,
     #[serde(other)]
     Unknown,
 }

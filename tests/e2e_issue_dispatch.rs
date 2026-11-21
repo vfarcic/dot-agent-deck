@@ -2417,6 +2417,15 @@ fn dispatch_009_multirole_orchestration_cleanup_refcount() {
     let reviewer = daemon
         .wait_for_agent_where(|r| role_in(r, "reviewer", &wt), w())
         .expect("the reviewer role must spawn into the same issue worktree");
+    // A role's record appears before the dispatch has finished starting the
+    // orchestration; a close in that window aborts the whole dispatch ("it
+    // was closed while it was starting"), which removes the worktree for
+    // another reason than this test's (two CI attempts on PR #2407, 0.3 s
+    // after the record). Close only once the dispatch is done.
+    assert!(
+        daemon.wait_for_stderr_contains("dispatched issue #7", w()),
+        "the dispatch must finish starting both roles"
+    );
 
     // Close ONE role (the reviewer). The worktree must SURVIVE — the
     // orchestrator role is still live in it.

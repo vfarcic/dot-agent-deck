@@ -5137,7 +5137,7 @@ pub fn orchestration_pane_left_edge(grid: &str) -> Option<usize> {
 /// when no such expanded box is on the grid.
 ///
 /// The general form of [`orchestration_pane_left_edge`], which is just this
-/// with `"orchestrator"`. Under `PaneLayout::Stacked` only the FOCUSED role's
+/// with `"orchestrator"`. Only the FOCUSED role's
 /// pane is drawn, so a test that has jumped focus to a non-start role has no
 /// `orchestrator` box to anchor on and needs to name the role it focused
 /// (PRD #313's zoom coverage does exactly that). Kept as ONE scan rather than a
@@ -5218,8 +5218,8 @@ pub fn orchestration_pane_column(grid: &str) -> Option<String> {
 /// Crop every row of `grid` to the pane column of the role pane drawn for
 /// `role`, dropping the sidebar to its left. The general form of
 /// [`orchestration_pane_column`], for the same reason
-/// [`role_pane_left_edge`] is the general form of its wrapper: under
-/// `PaneLayout::Stacked` only the FOCUSED role's pane is drawn, so a test that
+/// [`role_pane_left_edge`] is the general form of its wrapper:
+/// only the FOCUSED role's pane is drawn, so a test that
 /// jumped focus to a non-start role has no `orchestrator` box to crop on.
 /// Returns `None` on the same two preconditions as [`role_pane_left_edge`].
 pub fn role_pane_column(grid: &str, role: &str) -> Option<String> {

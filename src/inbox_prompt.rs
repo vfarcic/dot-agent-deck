@@ -641,10 +641,13 @@ impl OneShotInjection {
 /// Issue #2341: what Claude Code's prompt hook leaves to the transcript
 /// witness ([`crate::inbox_witness`]): where the transcript ended when the
 /// hook started, and the once-waiter attempts the prompt itself carries.
+/// Codex's prompt and `Stop` hooks leave the same (issue #2346).
 #[cfg(unix)]
 #[derive(Debug)]
 pub struct Witness {
     pub mark: crate::inbox_witness::TranscriptMark,
+    /// The receipts sender the hook is, and the witness commits as.
+    pub sender: crate::event::InboxOneShotSender,
     pub native: Vec<InboxAttemptRef>,
     /// The prompt's shared receipts budget, for a commit made at once when
     /// no witness can be started.
@@ -671,13 +674,10 @@ impl Witness {
             degraded: None,
             native: self.native.clone(),
             turn: self.turn,
+            sender: self.sender,
         };
         if crate::inbox_witness::spawn(&plan, None).is_err() {
-            commit_exact(
-                self.native,
-                crate::event::InboxOneShotSender::ClaudeHooks,
-                self.receipts_by,
-            );
+            commit_exact(self.native, self.sender, self.receipts_by);
         }
     }
 }
@@ -690,7 +690,8 @@ fn duration_ms(duration: std::time::Duration) -> u64 {
 #[cfg(unix)]
 impl OneShotInjection {
     /// Issue #2341: [`Self::print`] for Claude Code's prompt hook when the
-    /// session transcript can witness what Claude took. The blocks are
+    /// session transcript can witness what Claude took, and for Codex's
+    /// prompt and `Stop` hooks when its rollout can (issue #2346). The blocks are
     /// written as `print` writes them, but committed only by the witness this
     /// starts, which takes over the hook's receipt connection; the prompt's
     /// own once-waiter attempts go to the same witness. If no witness can be
@@ -740,17 +741,14 @@ impl OneShotInjection {
                 degraded: pending.degraded.clone(),
                 native: witness.native.clone(),
                 turn: witness.turn.clone(),
+                sender: witness.sender,
             };
             if crate::inbox_witness::spawn(&plan, Some(stream)).is_ok() {
                 return pending.ran();
             }
             self.connection.take_back();
         }
-        commit_exact(
-            witness.native,
-            crate::event::InboxOneShotSender::ClaudeHooks,
-            witness.receipts_by,
-        );
+        commit_exact(witness.native, witness.sender, witness.receipts_by);
         self.batch.commit_now(&mut self.connection, pinned, pending)
     }
 }

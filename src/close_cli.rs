@@ -407,6 +407,9 @@ fn verdict_text(kind: WorktreeVerdictKind) -> &'static str {
         }
         WorktreeVerdictKind::KeptOnRequest => "kept on request",
         WorktreeVerdictKind::KeptHoldsWorktrees => "kept: holds other worktrees",
+        WorktreeVerdictKind::ExistingDirectory => {
+            "left in place: the unit was dispatched into this existing directory"
+        }
         WorktreeVerdictKind::Unknown => "unknown",
     }
 }

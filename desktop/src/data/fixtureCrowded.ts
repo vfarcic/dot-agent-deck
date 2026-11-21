@@ -29,8 +29,8 @@ export function voicePagesFleet(base: DeckSnapshot): DeckSnapshot[] {
 }
 
 /** Issue #1494 — `folder-01` holds only these, each too long for one column of a wide page, short enough for the whole width. */
-export const VOICE_PAGES_FEW_DIRECTORY = `${VOICE_PAGES_HOME}/folder-01`;
-export const VOICE_PAGES_FEW_DIRECTORY_NAMES = [
+const VOICE_PAGES_FEW_DIRECTORY = `${VOICE_PAGES_HOME}/folder-01`;
+const VOICE_PAGES_FEW_DIRECTORY_NAMES = [
   "customer-onboarding-service-integration-tests",
   "payments-reconciliation-batch-worker-archive",
   "observability-dashboards-and-alerting-rules",

@@ -34,9 +34,9 @@ fn buffer_text_lower(buffer: &ratatui::buffer::Buffer) -> String {
 
 /// Scenario: Render the `?` help overlay into a tall (110×60) `TestBackend`
 /// buffer so all of its multi-section content fits, then assert it documents
-/// the canonical shortcut set: the five global commands the button bar
-/// advertises (New Agent Ctrl+N, Close Ctrl+W, Toggle Layout Ctrl+T, Help ?,
-/// Quit Ctrl+C) and the key dashboard / navigation actions (filter `/`,
+/// the canonical shortcut set: the global commands the button bar
+/// advertises (New Agent Ctrl+N, Close Ctrl+W, Help ?, Quit Ctrl+C), and
+/// no layout toggle, and the key dashboard / navigation actions (filter `/`,
 /// rename, generate, tab switching, card nav). The labels must name agents
 /// and the schedule manager consistently. Ctrl+D is documented under Global as
 /// "Toggle command / pane". The Mouse column says a drag selects and copies
@@ -53,10 +53,9 @@ fn help_001_overlay_documents_canonical_shortcut_set() {
 
     // Each entry: (token, human description for the failure message).
     let required: &[(&str, &str)] = &[
-        // Five global commands the M2 button bar advertises.
+        // The global commands the M2 button bar advertises.
         ("ctrl+n", "New Agent (Ctrl+N)"),
         ("ctrl+w", "Close (Ctrl+W)"),
-        ("ctrl+t", "Toggle Layout (Ctrl+T)"),
         ("ctrl+c", "Quit (Ctrl+C)"),
         ("?", "Help (?)"),
         // Dashboard context commands (M4 buttons) + their keys.
@@ -77,6 +76,11 @@ fn help_001_overlay_documents_canonical_shortcut_set() {
     assert!(
         missing.is_empty(),
         "help overlay is missing these canonical shortcuts/commands: {missing:?}\n--- rendered overlay ---\n{buf}"
+    );
+    // PRD #312: the layout toggle is gone, and the reference must not list it.
+    assert!(
+        !buf.contains("toggle layout") && !buf.contains("ctrl+t"),
+        "help overlay must not document the removed layout toggle\n{buf}"
     );
     for label in [
         "create new agent",

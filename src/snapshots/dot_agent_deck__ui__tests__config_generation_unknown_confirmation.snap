@@ -25,4 +25,4 @@ expression: dialog
 
 
  0 active  │  0 tools
- COMMAND  [Command Mode Ctrl+D] [New Agent Ctrl+N] [Close Ctrl+W] [Toggle Layout Ctrl+T] [Help ?] [Quit Ctrl+C] [Filter /] [Rename r] [Generate g] [Schedules s]
+ COMMAND  [Command Mode Ctrl+D] [New Agent Ctrl+N] [Close Ctrl+W] [Help ?] [Quit Ctrl+C] [Filter /] [Rename r] [Generate g] [Schedules s]

@@ -245,6 +245,10 @@ pub struct NewUnit {
     pub worktree: PathBuf,
     pub branch: String,
     pub clone_dir: PathBuf,
+    /// PRD #468: the unit was dispatched with `--dir` into a directory that
+    /// already existed, so `worktree` is not the dispatch's own and a close
+    /// does not report it as a worktree the deck lost track of.
+    pub existing_dir: bool,
     pub dispatcher: Dispatcher,
     pub kind: UnitKind,
     pub dispatched_at_ms: i64,
@@ -260,6 +264,10 @@ pub struct UnitOrigin {
     pub worktree: PathBuf,
     pub branch: String,
     pub clone_dir: PathBuf,
+    /// PRD #468: the unit was dispatched with `--dir` into a directory that
+    /// already existed, so `worktree` is not the dispatch's own and a close
+    /// does not report it as a worktree the deck lost track of.
+    pub existing_dir: bool,
     pub dispatcher: Dispatcher,
 }
 
@@ -274,6 +282,7 @@ impl UnitOrigin {
             dispatcher: self.dispatcher,
             kind,
             dispatched_at_ms,
+            existing_dir: self.existing_dir,
         }
     }
 }
@@ -292,6 +301,10 @@ pub struct DispatchedUnit {
     pub worktree: PathBuf,
     pub branch: String,
     pub clone_dir: PathBuf,
+    /// PRD #468: the unit was dispatched with `--dir` into a directory that
+    /// already existed, so `worktree` is not the dispatch's own and a close
+    /// does not report it as a worktree the deck lost track of.
+    pub existing_dir: bool,
     pub dispatcher: Dispatcher,
     pub kind: UnitKind,
     pub dispatched_at_ms: i64,
@@ -425,6 +438,7 @@ impl DispatchedUnits {
             dispatched_at_ms: unit.dispatched_at_ms,
             completed_at_ms: None,
             state: UnitState::Running,
+            existing_dir: unit.existing_dir,
         });
         id
     }
@@ -904,6 +918,7 @@ mod tests {
                 agent_id: agent.to_string(),
             },
             dispatched_at_ms: 1,
+            existing_dir: false,
         }
     }
 
