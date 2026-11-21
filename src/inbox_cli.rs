@@ -58,6 +58,7 @@ fn component_for(agent: &str) -> InboxComponent {
         "pi" => InboxComponent::PiExtension,
         "codex" => InboxComponent::CodexHooks,
         "devin" => InboxComponent::DevinHooks,
+        "antigravity" => InboxComponent::AntigravityHooks,
         _ => InboxComponent::Other,
     }
 }

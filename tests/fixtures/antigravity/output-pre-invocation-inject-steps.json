@@ -1,0 +1,9 @@
+{
+  "injectSteps": [
+    {
+      "systemMessage": {
+        "systemMessage": "The secret word is PELICAN-77."
+      }
+    }
+  ]
+}

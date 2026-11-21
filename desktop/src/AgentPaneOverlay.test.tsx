@@ -364,7 +364,7 @@ describe("agent pane overlay", () => {
     expect(screen.getByRole("region", { name: "Agent dashboard" })).toBeVisible();
   });
 
-  /** Scenario (issue #1958): close the viewed dispatched agent with "Close agent, keep worktree". The daemon receives the captured stop with the keep, and once it is confirmed the pane returns to the dashboard as an ordinary close does. */
+  /** Scenario (issues #1958 and #2436): close the viewed dispatched agent with "Keep the worktree" ticked. The daemon receives the captured stop with the keep, and once it is confirmed the pane returns to the dashboard as an ordinary close does. */
   it("closes the viewed agent keeping its worktree and returns to the dashboard", async () => {
     const initial = runtime();
     const snapshot = { ...initial.snapshot, agents: initial.snapshot.agents.map((agent) => ({ ...agent, incarnation: "process-a", paneId: `pane-${agent.id}` })) };
@@ -376,13 +376,48 @@ describe("agent pane overlay", () => {
     const { rerender } = render(<DeckShell runtime={rt} initialView={view} />);
     fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByRole("button", { name: "Close agent" }));
     const dialog = screen.getByRole("alertdialog");
-    fireEvent.click(await within(dialog).findByRole("button", { name: "Close agent, keep worktree" }));
+    fireEvent.click(await within(dialog).findByRole("checkbox", { name: "Keep the worktree" }));
+    fireEvent.click(within(dialog).getByRole("button", { name: "Close agent" }));
     expect(runAction).toHaveBeenCalledExactlyOnceWith({ type: "stop_agent", deckId: FIXTURE_DAEMON_ID, agentId: "planner", incarnation: "process-a", keepWorktree: true });
     const ended = { ...snapshot, agents: snapshot.agents.filter((agent) => agent.id !== "planner") };
     rerender(<DeckShell runtime={{ ...rt, snapshot: ended, fleet: [ended] }} initialView={view} />);
     await act(async () => settle({ ok: true }));
     expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
     expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+  });
+
+  /**
+   * Scenario (issue #2436): open the orchestrator (planner) of a two-role
+   * orchestration and press Close agent. The confirmation offers Close agent
+   * and Close orchestration, leading with Close orchestration; pressing it
+   * sends one `stop_orchestration` over both roles, and once it is confirmed
+   * the pane returns to the dashboard.
+   */
+  it("closes the whole orchestration from the orchestrator's pane", async () => {
+    const initial = runtime();
+    const tab = (roleName: string, roleIndex: number, isStartRole: boolean) => ({ kind: "orchestration" as const, orchestrationId: "orc-2436", name: "review", roleName, roleIndex, isStartRole });
+    const roles: Record<string, ReturnType<typeof tab>> = { planner: tab("planner", 0, true), builder: tab("builder", 1, false) };
+    const snapshot = { ...initial.snapshot, agents: initial.snapshot.agents.flatMap((agent) => roles[agent.id] ? [{ ...agent, incarnation: "process-a", paneId: `pane-${agent.id}`, tab: roles[agent.id] }] : []) };
+    let settle!: (result: DeckActionResult) => void;
+    const runAction = vi.fn(() => new Promise<DeckActionResult>((resolve) => { settle = resolve; }));
+    const rt = { ...initial, snapshot, fleet: [snapshot], runAction };
+    const view = { kind: "agent" as const, deckId: FIXTURE_DAEMON_ID, agentId: "planner", incarnation: "process-a", from: "overview" as const };
+    const { rerender } = render(<DeckShell runtime={rt} initialView={view} />);
+    fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByRole("button", { name: "Close agent" }));
+    const dialog = screen.getByRole("alertdialog");
+    expect(dialog).toHaveTextContent("Close orchestration stops every role of review");
+    expect(dialog).toHaveTextContent("all 2 of its roles: planner, builder.");
+    expect(within(dialog).getAllByRole("button").map((button) => button.textContent)).toEqual(["Cancel", "Close agent", "Close orchestration"]);
+    const whole = within(dialog).getByRole("button", { name: "Close orchestration" });
+    expect(whole).toHaveClass("leads");
+    fireEvent.click(whole);
+    expect(runAction).toHaveBeenCalledExactlyOnceWith({ type: "stop_orchestration", deckId: FIXTURE_DAEMON_ID, roles: [{ agentId: "planner", name: "planner", incarnation: "process-a" }, { agentId: "builder", name: "builder", incarnation: "process-a" }] });
+    const ended = { ...snapshot, agents: [] };
+    rerender(<DeckShell runtime={{ ...rt, snapshot: ended, fleet: [ended] }} initialView={view} />);
+    await act(async () => settle({ ok: true }));
+    expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Agent dashboard" })).toBeVisible();
   });
 
   /** Scenario: an agent disappears while its close confirmation is awaiting a click. The pane and its confirmation close together, without sending the captured stop request. */

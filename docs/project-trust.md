@@ -26,14 +26,6 @@ The review is titled **Review project commands** and shows:
 - **Daemon:** in the desktop app, the daemon the orchestration would start on. The approval is recorded on that daemon and the orchestration starts there. If you switch to another daemon while the review is open, the review closes and nothing starts. If you switch before pressing **Approve and start**, nothing is approved either. If you switch after pressing it, the approval may already be recorded on the daemon you started from, and the app tells you the `dot-agent-deck trust revoke` command to run on that daemon's host to undo it.
 - **Removed since you approved it:** the roles your approval had that the file no longer defines.
 
-**TUI:**
-
-![The TUI's Review project commands prompt for the orchestration team in /home/dev/demo-project, State changed since you approved it: the orchestrator role unmarked, the coder role marked changed with its command now claude --model opus, the tester role marked new, each with its command, start, clear, description and prompt rows, then Removed since you approved it: reviewer, and the footer a approve and start, Esc cancel, arrow keys scroll](/img/project-trust-tui.png)
-
-**Desktop:**
-
-![The desktop app's Review project commands dialog over the agent dashboard, showing the same review: Daemon: Local daemon, the project /home/dev/demo-project, orchestration team, State changed since you approved it, the orchestrator, coder (changed) and tester (new) roles with their command, start, clear, description and prompt, Removed since you approved it: reviewer, and the Cancel and Approve and start buttons](/img/project-trust-desktop.png)
-
 Read the commands and prompts as what they are: commands that will run as you, and instructions your agents will follow. Characters that could hide or disguise text, such as terminal control sequences, are shown as escapes (for example `\u{1b}`) rather than obeyed, in both clients, on the command line and in the refusal messages described below.
 
 ## Answer it
@@ -132,7 +124,7 @@ Other issues, on the default branch, keep dispatching meanwhile.
 
 ### An orchestrator's instructions after compaction or `/clear`
 
-In the TUI, when the orchestrator's conversation is compacted, or you clear it with `/clear`, the deck sends the orchestrator its instructions again (its prompt, the workers and how to delegate). It sends them only when the orchestration is approved as its file now reads. If the file changed since you approved it, or the orchestration was never approved, nothing is sent and the TUI's status line says why, for example:
+When the orchestrator's conversation is compacted, or you clear it with `/clear`, the deck sends the orchestrator its instructions again (its prompt, the workers and how to delegate); [Orchestration](orchestration.md#when-the-orchestrators-conversation-is-compacted-or-cleared) says when. For an orchestration started from the desktop app, by `dispatch` or by a schedule, it sends the instructions that were approved when the orchestration started, and nothing on this page applies. For one you opened in the TUI with `Ctrl+n`, the TUI sends them only when the orchestration is approved as its file now reads. If the file changed since you approved it, or the orchestration was never approved, nothing is sent and the TUI's status line says why, for example:
 
 ```text
 Orchestration 'team': its instructions were not sent to its coordinator again, because its config changed since you approved it. Review and approve it from a terminal outside the deck with: dot-agent-deck trust approve /home/you/code/demo --orchestration team
@@ -148,7 +140,7 @@ Orchestration 'team': instructions re-sent to its coordinator without a task (th
 
 That happens for an orchestration you opened with `Ctrl+n` and came back to after detaching, or from a second TUI, which never had a task to send; and for any orchestration whose file was deleted, by hand or because it was more than 14 days old. If the orchestrator was working on a task, give it the task again.
 
-The desktop app does not send the orchestrator's instructions again after compaction or `/clear`, so this does not apply there.
+The desktop app sends nothing of its own, and shows none of these messages: an orchestration it started gets its instructions from the deck, as above.
 
 ## Manage approvals from the command line
 

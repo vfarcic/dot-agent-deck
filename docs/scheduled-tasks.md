@@ -18,7 +18,7 @@ The Schedules manager exists only in the TUI. In the desktop app, a schedule's r
 ## Before you start
 
 - **A running daemon.** Starting the TUI (`dot-agent-deck`) starts one if none is running. The `schedule` subcommands do not start one. Check with `dot-agent-deck daemon status`, which reports a missing daemon rather than starting it.
-- **An agent command.** A plain schedule needs the command that launches your agent, for example `claude`, `opencode`, `pi`, `codex` or `devin`, or a wrapper that ends up running one of them (`devbox run agent`). Any other command runs, but the deck cannot show its status.
+- **An agent command.** A plain schedule needs the command that launches your agent, for example `claude`, `opencode`, `pi`, `codex`, `devin` or `agy`, or a wrapper that ends up running one of them (`devbox run agent`). Any other command runs, but the deck cannot show its status.
 - **For issue dispatch only:** the GitHub CLI `gh`, installed and signed in (`gh auth status` succeeds), and `git`, both on the daemon's `PATH`. Read access to the repository is enough to dispatch. To [claim](#claims-on-github) the issues it dispatches, the account `gh` is signed in with also needs to add labels and comments to the repository's issues: write access to the repository covers the whole claim, including creating its label, and an account that can apply labels and comment but not create labels can claim once the `agent-deck/claimed` label exists.
 
 ## Schedule a prompt with the CLI
@@ -84,8 +84,6 @@ Things to know when changing schedules:
 - **`update` cannot change issue-dispatch settings** (`repo`, `max_per_run`, `label`, `query`). Remove the schedule and add it again, or edit the file and run `schedule reload`.
 
 ### The TUI's Schedules manager
-
-![The TUI's Schedules manager with one schedule: its row shows the name, the status disabled and a next fire of —, above the Add, Edit, Delete, Run now and Toggle buttons](/img/schedules-tui.png)
 
 Each row shows the schedule's name, a status and its next run time. The statuses are taken when the dialog opens and refreshed after a run-now:
 
@@ -228,7 +226,7 @@ Each claim comment states the `claim_ttl_hours` of the schedule that wrote it, a
 
 Dispatched tabs stay open until you close them. **Closing an issue's tab with Close removes its worktree with `git worktree remove --force`, which discards uncommitted changes in it, including in any worktree created inside it.** Commit or push anything you want to keep first, or keep the worktree (below). The branch and the clone stay, and the issue becomes eligible again on the next run unless it has an open pull request.
 
-To stop an issue's agents but keep its worktree, for example to start an agent in it again later, choose **Close, keep worktree** in the TUI's close confirmation (`Ctrl+W`, or the tab's `[×]`), or **Close agent, keep worktree** or **Close all N roles, keep worktree** in the desktop app's close confirmation. The worktree then stays on disk whatever its state. While it exists the issue stays claimed: a run that considers the issue skips it, as it does any issue whose worktree exists. `dot-agent-deck worktree reclaim` keeps a worktree whose pull request has not merged, so when you want the schedule to take the issue again, remove the worktree yourself with `git -C <clone> worktree remove .worktrees/issue-<n>`, adding `--force` to discard uncommitted changes in it.
+To stop an issue's agents but keep its worktree, for example to start an agent in it again later, choose **Close, keep worktree** in the TUI's close confirmation (`Ctrl+W`, or the tab's `[×]`), or tick **Keep the worktree** in the desktop app's close confirmation before you close. The worktree then stays on disk whatever its state. While it exists the issue stays claimed: a run that considers the issue skips it, as it does any issue whose worktree exists. `dot-agent-deck worktree reclaim` keeps a worktree whose pull request has not merged, so when you want the schedule to take the issue again, remove the worktree yourself with `git -C <clone> worktree remove .worktrees/issue-<n>`, adding `--force` to discard uncommitted changes in it.
 
 After the daemon restarts, closing such a tab no longer removes the worktree. Remove it yourself with `git -C <clone> worktree remove .worktrees/issue-<n>`, or that issue stays skipped.
 

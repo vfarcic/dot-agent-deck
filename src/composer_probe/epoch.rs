@@ -221,6 +221,20 @@ impl InputEpoch {
         applies
     }
 
+    /// PRD #211 (PR #2370 review, Greptile P1): the agent's own report says
+    /// what the foreign op at `at` did to the box — took it as a submitted
+    /// prompt, or answered a menu with it — and leaves it empty. The box is
+    /// observed empty again iff that op is still the last one, foreign, and
+    /// the epoch is not exhausted. Whether it applied.
+    pub fn reconcile_last_foreign(&mut self, at: u64) -> bool {
+        let applies =
+            !self.exhausted && self.epoch == at && self.owner.is_none() && self.last_foreign == at;
+        if applies {
+            self.observed = self.epoch;
+        }
+        applies
+    }
+
     /// PRD #1666 part 3 (Q35-21, R3 §3.5): the ring's `Submitted` (or
     /// placeholder-confirmed `Withdrawn`) reconcile. The box becomes empty
     /// through the ring's last op iff that
@@ -391,6 +405,103 @@ struct State {
     /// Its segments and what they read, attached with the records (Q35-20).
     live: Option<Live>,
     retired: bool,
+    /// PRD #211 (PR #2370 review, Greptile P1): the latest of a person's ops
+    /// that ended in Enter (`\r`), the op that may have submitted the box
+    /// ([`GenerationInput::reconcile_human_submit`]). Stale once any later op
+    /// moves the epoch past it.
+    human_submit: Option<HumanSubmit>,
+    /// PRD #211 (PR #2370 review, Greptile P1): the unbroken run of a
+    /// person's or a voice answer's menu-key ops ([`menu_keys`]) that began
+    /// in a box untouched just before its first op, keys that may have
+    /// answered a permission menu ([`GenerationInput::reconcile_menu_answer`]).
+    /// Ended by any other op, by any key after its action key, and by a new
+    /// prompt after that key; resolved by an ordered witness that the agent
+    /// left its prompt.
+    menu_run: Option<MenuRun>,
+    /// PRD #211 (PR #2370 review): when the agent's own status first put its
+    /// card on the prompt that is up now
+    /// ([`GenerationInput::note_prompt_shown`]); cleared by a witness that
+    /// the agent left it ([`GenerationInput::reconcile_menu_answer`]).
+    prompt_at: Option<Instant>,
+}
+
+/// [`State::human_submit`]: a person's op that ended in Enter.
+#[derive(Debug, Clone, Copy)]
+struct HumanSubmit {
+    /// The epoch it moved the box to.
+    epoch: u64,
+    /// When it was written.
+    at: Instant,
+}
+
+/// PRD #211 (PR #2370 review): what says the agent left the prompt a run of
+/// menu keys may have answered ([`GenerationInput::reconcile_menu_answer`]).
+/// Either is the generation's own, ordered against the run by the instant it
+/// was read; the caller passes neither for a signal or hook of another
+/// generation, or of a reader since turned off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Departure {
+    /// The agent's terminal status left the prompt for a working or idle
+    /// turn, whether its card was repainted with it or a newer hook of the
+    /// generation had already taken the card on. `card_on_prompt`: it was
+    /// applied to a card that was on the prompt.
+    Status { card_on_prompt: bool },
+    /// A main-session hook of the generation that a prompt cannot still be
+    /// up through: a call's end, the turn's end, or the first model call of
+    /// a turn.
+    Hook,
+}
+
+/// [`State::menu_run`]: an unbroken run of menu-key ops into a box that was
+/// untouched before the first of them.
+#[derive(Debug, Clone, Copy)]
+struct MenuRun {
+    /// When its first op was written.
+    started_at: Instant,
+    /// The epoch its last op moved the box to.
+    last: u64,
+    /// When its last op was written.
+    last_at: Instant,
+    /// It is one op of one digit: PR #2370's numbered answer, which counts
+    /// whether or not the deck saw the prompt appear.
+    lone_digit: bool,
+    /// Its last op ended in an action key ([`MenuKeys::Act`]): the run is
+    /// complete, and any op after it ends it.
+    acted: bool,
+}
+
+/// PRD #211 (PR #2370 review, audit S1): what one op of menu keys does at a
+/// menu ([`menu_keys`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MenuKeys {
+    /// Arrow keys only: they move the menu's highlight and leave it up.
+    Navigate,
+    /// Arrows, if any, then one action key that accepts or dismisses the
+    /// menu: a digit, Enter (`\r`), or an Escape on its own.
+    Act,
+}
+
+/// PRD #211 (PR #2370 review): whether `bytes` is nothing but the keys a
+/// person answers a menu with, and whether they end in the key that acts
+/// on it. The arrow keys in either cursor mode (`ESC [ A`–`D`,
+/// `ESC O A`–`D`) navigate; a digit or Enter (`\r`) after them, or an
+/// Escape as the whole op, acts. A key after the action key reaches
+/// whatever the menu's answer left focused, the composer included (audit
+/// S1), so an op with one is not menu keys; nor is a paste, a printable
+/// non-digit or any other sequence.
+fn menu_keys(bytes: &[u8]) -> Option<MenuKeys> {
+    if bytes == [0x1b] {
+        return Some(MenuKeys::Act);
+    }
+    let mut rest = bytes;
+    while let [0x1b, b'[' | b'O', b'A'..=b'D', tail @ ..] = rest {
+        rest = tail;
+    }
+    match rest {
+        [] if !bytes.is_empty() => Some(MenuKeys::Navigate),
+        [b'\r' | b'0'..=b'9'] => Some(MenuKeys::Act),
+        _ => None,
+    }
 }
 
 /// The most explanations [`Live::explained`] banks, and the most unexplained
@@ -1003,12 +1114,41 @@ fn plan_locked(state: &mut State, writer: Writer, bytes: &[u8], plan: Option<Pla
                 Writer::Deck(job) => Some(job),
                 Writer::UnnamedDeck | Writer::Human | Writer::Answer => None,
             };
+            let untouched_before = !state.epoch.touched();
+            let before = state.epoch.epoch();
             let moved_to = state.epoch.record(owner);
             if owner.is_none()
                 && let Some(live) = state.live.as_mut()
             {
                 live.last_foreign_op = moved_to;
             }
+            let now = Instant::now();
+            if writer == Writer::Human && bytes.last() == Some(&b'\r') {
+                state.human_submit = Some(HumanSubmit {
+                    epoch: moved_to,
+                    at: now,
+                });
+            }
+            let keys = if person { menu_keys(bytes) } else { None };
+            state.menu_run = match (keys, state.menu_run.take()) {
+                (None, _) => None,
+                (Some(keys), _) if untouched_before => Some(MenuRun {
+                    started_at: now,
+                    last: moved_to,
+                    last_at: now,
+                    lone_digit: matches!(bytes, [digit] if digit.is_ascii_digit()),
+                    acted: keys == MenuKeys::Act,
+                }),
+                // Audit S1: only navigation may come before the action key.
+                (Some(keys), Some(run)) if run.last == before && !run.acted => Some(MenuRun {
+                    last: moved_to,
+                    last_at: now,
+                    lone_digit: false,
+                    acted: keys == MenuKeys::Act,
+                    ..run
+                }),
+                _ => None,
+            };
             tracing::debug!(
                 target: "composer_probe",
                 ?writer,
@@ -1148,6 +1288,9 @@ impl GenerationInput {
                 records: None,
                 live: None,
                 retired: false,
+                human_submit: None,
+                menu_run: None,
+                prompt_at: None,
             }),
             moved: tokio::sync::Notify::new(),
             output_offset: AtomicU64::new(0),
@@ -1359,6 +1502,101 @@ impl GenerationInput {
     pub fn reconcile_ring(&self, ring: DeckJobId, admitted_at: u64) -> bool {
         let mut state = self.state.lock_recovering();
         !state.retired && state.epoch.reconcile_ring(ring, admitted_at)
+    }
+
+    /// PRD #211 (PR #2370 review, Greptile P1 and audit S2): the agent's own
+    /// prompt hook, whose line the daemon read at `read_at`, reported on the
+    /// first model call of a turn that it took a submitted prompt
+    /// (Antigravity's `PreInvocation`, `invocationNum` 0). That hook can
+    /// attest only a submit written before its line was read: when the last
+    /// op to enter the box is a person's that ended in Enter, written at or
+    /// before `read_at`, that Enter is the submit the agent took, and the box
+    /// is empty again ([`InputEpoch::reconcile_last_foreign`]). Refused once
+    /// retired, when any op came after that one, when it was written after
+    /// the line was read (a newer Enter the hook cannot speak for), or when
+    /// the last op was the deck's or ended in anything else. Whether it
+    /// applied.
+    pub fn reconcile_human_submit(&self, read_at: Instant) -> bool {
+        let mut state = self.state.lock_recovering();
+        let Some(submit) = state.human_submit else {
+            return false;
+        };
+        !state.retired && submit.at <= read_at && state.epoch.reconcile_last_foreign(submit.epoch)
+    }
+
+    /// PRD #211 (PR #2370 review): the agent's own terminal status, read at
+    /// `seen_at`, put its card on a permission prompt or dialog. Keeps the
+    /// first such time until a witness says the agent left the prompt
+    /// ([`Self::reconcile_menu_answer`]). A prompt read after a run of menu
+    /// keys reached its action key is a new prompt: that run's evidence is
+    /// discarded, and the box stays touched.
+    pub fn note_prompt_shown(&self, seen_at: Instant) {
+        let mut state = self.state.lock_recovering();
+        match state.menu_run {
+            Some(run) if run.acted && run.last_at <= seen_at => {
+                state.menu_run = None;
+                state.prompt_at = Some(seen_at);
+            }
+            _ => {
+                state.prompt_at.get_or_insert(seen_at);
+            }
+        }
+    }
+
+    /// PRD #211 (PR #2370 review, Greptile P1; review P1; audit S1): a
+    /// witness of the generation's own, read at `read_at`, that the agent
+    /// left its permission prompt or dialog ([`Departure`]). When everything
+    /// entered into the box since it was last untouched is one run of menu
+    /// keys ([`menu_keys`]), a person's or a voice answer's, that ended in
+    /// its action key and was all written before the witness was read, the
+    /// menu took them as its answer and the box is as untouched as it was,
+    /// provided either the deck saw the prompt appear before the first of
+    /// those keys, or they are one lone digit and the witness is a status
+    /// applied to a card on the prompt. A digit that reached the composer
+    /// instead shows there as the visible character it is, which the
+    /// screen's empty-composer check reads. Arrows alone never reset the box:
+    /// an Up in an empty composer can recall a history entry into it.
+    ///
+    /// A witness read before the prompt appeared says nothing about it and
+    /// changes nothing. One read after the prompt but before the run's last
+    /// key says the prompt was left before that key, which then did not
+    /// answer it: the run is discarded and the box stays touched. A witness
+    /// that cannot reconcile a run with no prompt seen keeps it for one that
+    /// can. Otherwise the witness resolves the prompt and the run, whether or
+    /// not it reconciled them. So a newer hook that took the card off the
+    /// prompt before the agent's older status was applied leaves the
+    /// evidence to whichever of them is read after the answer. Refused once
+    /// retired, or when any op came after the run. Whether it applied.
+    pub fn reconcile_menu_answer(&self, read_at: Instant, departure: Departure) -> bool {
+        let mut state = self.state.lock_recovering();
+        if state.retired {
+            state.menu_run = None;
+            state.prompt_at = None;
+            return false;
+        }
+        let prompt_at = state.prompt_at;
+        if prompt_at.is_some_and(|at| read_at < at) {
+            return false;
+        }
+        let Some(run) = state.menu_run else {
+            state.prompt_at = None;
+            return false;
+        };
+        let card_vouches = run.lone_digit
+            && departure
+                == (Departure::Status {
+                    card_on_prompt: true,
+                });
+        if prompt_at.is_none() && !card_vouches {
+            return false;
+        }
+        state.menu_run = None;
+        state.prompt_at = None;
+        let seen_first = prompt_at.is_some_and(|at| at <= run.started_at);
+        run.acted
+            && run.last_at <= read_at
+            && (seen_first || card_vouches)
+            && state.epoch.reconcile_last_foreign(run.last)
     }
 
     /// Apply a probe's observation (R3 §3.4); refused once retired.
@@ -1781,6 +2019,17 @@ impl GenerationInput {
     pub fn probe_surface(&self, now: Instant) {
         if let Some(live) = self.state.lock_recovering().live.as_mut() {
             live.schedule.surface(now);
+        }
+    }
+
+    /// Admission refused a due attempt at `now` only because the query-wait
+    /// estimate `until` is still ahead
+    /// ([`super::probe::Schedule::estimate`], #2129): the next is due at
+    /// `until`, and only every [`super::probe::ESTIMATE_PER_FAILURE`]th in a
+    /// row is a failure.
+    pub fn probe_estimate(&self, now: Instant, until: Instant) {
+        if let Some(live) = self.state.lock_recovering().live.as_mut() {
+            live.schedule.estimate(now, until);
         }
     }
 
@@ -2649,6 +2898,378 @@ impl GenerationInput {
 mod tests {
     use super::*;
     use spec::spec;
+    use std::time::Duration;
+
+    /// The witnesses [`GenerationInput::reconcile_menu_answer`] is offered.
+    const ON_CARD: Departure = Departure::Status {
+        card_on_prompt: true,
+    };
+    const OFF_CARD: Departure = Departure::Status {
+        card_on_prompt: false,
+    };
+    const HOOK: Departure = Departure::Hook;
+
+    /// PRD #211 (PR #2370 review, Greptile P1): a person's op ending in Enter,
+    /// with nothing after it, is the submit the agent's prompt hook speaks
+    /// for, and only that: an op after it, an Enter inside a longer op, a
+    /// voice answer's Enter and the deck's own bytes leave the box touched.
+    #[test]
+    fn only_a_persons_last_enter_is_the_submit_a_prompt_hook_speaks_for() {
+        let input = GenerationInput::default();
+        input.enqueue(Writer::Human, b"hello");
+        assert!(input.touched());
+        assert!(
+            !input.reconcile_human_submit(Instant::now()),
+            "no Enter yet"
+        );
+        input.enqueue(Writer::Human, b"\r");
+        assert!(input.touched(), "the Enter alone proves nothing");
+        assert!(input.reconcile_human_submit(Instant::now()));
+        assert!(!input.touched(), "the agent took the submit");
+
+        input.enqueue(Writer::Human, b"x");
+        assert!(input.touched());
+        assert!(
+            !input.reconcile_human_submit(Instant::now()),
+            "typed after the submit"
+        );
+
+        input.enqueue(Writer::Human, b"a\rb");
+        assert!(
+            !input.reconcile_human_submit(Instant::now()),
+            "text after the Enter"
+        );
+        input.enqueue(Writer::Answer, b"\r");
+        assert!(
+            !input.reconcile_human_submit(Instant::now()),
+            "a voice answer's Enter"
+        );
+        input.enqueue(Writer::Human, b"y\r");
+        input.enqueue(Writer::UnnamedDeck, b"z");
+        assert!(
+            !input.reconcile_human_submit(Instant::now()),
+            "the deck's bytes after it"
+        );
+        assert!(input.touched());
+
+        input.enqueue(Writer::Human, b"\r");
+        input.retire();
+        assert!(
+            !input.reconcile_human_submit(Instant::now()),
+            "a retired generation"
+        );
+    }
+
+    /// PRD #211 (PR #2370 review, audit S2): a first-call hook whose line was
+    /// read before a person's newer Enter cannot speak for that Enter, which
+    /// keeps the box touched however late the hook is reconciled; a hook read
+    /// after it can.
+    #[test]
+    fn a_hook_read_before_a_newer_enter_leaves_that_enter_touched() {
+        let input = GenerationInput::default();
+        input.enqueue(Writer::Human, b"first\r");
+        let read_at = Instant::now();
+        std::thread::sleep(Duration::from_millis(2));
+        input.enqueue(Writer::Human, b"second\r");
+        assert!(
+            !input.reconcile_human_submit(read_at),
+            "the delayed hook reconciled a newer Enter"
+        );
+        assert!(input.touched());
+        assert!(input.reconcile_human_submit(Instant::now()));
+        assert!(!input.touched());
+    }
+
+    /// PRD #211 (PR #2370 review, Greptile P1): a lone digit, a person's or a
+    /// voice answer's, typed into an untouched box before the agent's status
+    /// left its prompt leaves the box untouched; a digit into a touched box,
+    /// an op after the digit, two digits in one op with no prompt seen, a
+    /// status read before the digit was written and a card not on the prompt
+    /// do not.
+    #[test]
+    fn a_lone_digit_into_an_untouched_box_is_a_menu_answer() {
+        let input = GenerationInput::default();
+        assert!(!input.touched());
+        let before = Instant::now() - Duration::from_millis(1);
+        input.enqueue(Writer::Human, b"1");
+        assert!(input.touched());
+        assert!(
+            !input.reconcile_menu_answer(before, ON_CARD),
+            "a status read before the digit"
+        );
+        assert!(input.touched());
+
+        let input = GenerationInput::default();
+        input.enqueue(Writer::Human, b"1");
+        assert!(
+            !input.reconcile_menu_answer(Instant::now(), OFF_CARD),
+            "the card was not on the prompt"
+        );
+        assert!(
+            !input.reconcile_menu_answer(Instant::now(), HOOK),
+            "a hook, with no prompt seen"
+        );
+        assert!(input.touched());
+        assert!(
+            input.reconcile_menu_answer(Instant::now(), ON_CARD),
+            "kept for a status that can vouch for it"
+        );
+        assert!(!input.touched());
+
+        input.enqueue(Writer::Answer, b"4");
+        assert!(
+            input.reconcile_menu_answer(Instant::now(), ON_CARD),
+            "a voice answer"
+        );
+        input.enqueue(Writer::Human, b"12");
+        assert!(
+            !input.reconcile_menu_answer(Instant::now(), ON_CARD),
+            "two digits"
+        );
+        input.enqueue(Writer::Human, b"1");
+        assert!(
+            !input.reconcile_menu_answer(Instant::now(), ON_CARD),
+            "a digit into a touched box"
+        );
+        assert!(input.touched());
+
+        let fresh = GenerationInput::default();
+        fresh.enqueue(Writer::Human, b"1");
+        fresh.enqueue(Writer::Human, b" ");
+        assert!(
+            !fresh.reconcile_menu_answer(Instant::now(), ON_CARD),
+            "an op after the digit"
+        );
+        let deck = GenerationInput::default();
+        deck.enqueue(Writer::UnnamedDeck, b"1");
+        assert!(
+            !deck.reconcile_menu_answer(Instant::now(), ON_CARD),
+            "the deck's own bytes"
+        );
+    }
+
+    /// PRD #211 (PR #2370 review): a box `keys` were typed into while
+    /// a prompt the agent's status reported was up, untouched before it, and
+    /// whether it is untouched again once that status leaves the prompt.
+    fn after_prompt_keys(keys: &[&[u8]]) -> bool {
+        let input = GenerationInput::default();
+        input.note_prompt_shown(Instant::now());
+        for key in keys {
+            input.enqueue(Writer::Human, key);
+        }
+        assert!(input.touched());
+        let applied = input.reconcile_menu_answer(Instant::now(), ON_CARD);
+        assert_eq!(applied, !input.touched());
+        applied
+    }
+
+    /// PRD #211 (PR #2370 review): Enter alone, Down, Down, Enter (in either
+    /// cursor mode, in separate ops or one), Escape, a digit after arrows and
+    /// the deck's own answer keys, typed into an untouched box while the
+    /// agent's prompt is up, leave it untouched once the agent's status
+    /// leaves the prompt.
+    #[test]
+    fn menu_keys_answering_a_prompt_leave_an_untouched_box_untouched() {
+        assert!(after_prompt_keys(&[b"\r"]), "Enter alone");
+        assert!(
+            after_prompt_keys(&[b"\x1b[B", b"\x1b[B", b"\r"]),
+            "Down, Down, Enter"
+        );
+        assert!(
+            after_prompt_keys(&[b"\x1b[B\x1b[B\r"]),
+            "Down, Down, Enter in one op"
+        );
+        assert!(
+            after_prompt_keys(&[b"\x1bOB", b"\x1bOA", b"\r"]),
+            "the arrows in application cursor mode"
+        );
+        assert!(after_prompt_keys(&[b"\x1b"]), "Escape");
+        assert!(
+            after_prompt_keys(&[b"\x1b[C", b"\x1b[D", b"2"]),
+            "Right, Left, 2"
+        );
+
+        let answer = GenerationInput::default();
+        answer.note_prompt_shown(Instant::now());
+        answer.enqueue(Writer::Human, b"\x1b[B");
+        answer.enqueue(Writer::Answer, b"\r");
+        assert!(
+            answer.reconcile_menu_answer(Instant::now(), ON_CARD),
+            "a person's arrow, then the deck's answer"
+        );
+        assert!(!answer.touched());
+
+        // A second prompt of the same generation is answered the same way.
+        answer.note_prompt_shown(Instant::now());
+        answer.enqueue(Writer::Human, b"\r");
+        assert!(answer.reconcile_menu_answer(Instant::now(), ON_CARD));
+        assert!(!answer.touched());
+    }
+
+    /// PRD #211 (PR #2370 review, audit S1): a menu-key run ends at its first
+    /// action key — a digit, Enter or a lone Escape — so any key after it,
+    /// in the same op or a later one, reaches whatever the answer left
+    /// focused and keeps the box touched: Enter then Up, Escape then Up, two
+    /// digits. Arrows alone never reset it.
+    #[test]
+    fn a_key_after_the_action_key_keeps_the_box_touched() {
+        assert!(!after_prompt_keys(&[b"\r\x1b[A"]), "Enter, Up in one op");
+        assert!(!after_prompt_keys(&[b"\r", b"\x1b[A"]), "Enter, then Up");
+        assert!(!after_prompt_keys(&[b"\x1b", b"\x1b[A"]), "Escape, then Up");
+        assert!(!after_prompt_keys(&[b"12"]), "two digits in one op");
+        assert!(!after_prompt_keys(&[b"1", b"2"]), "two digits");
+        assert!(!after_prompt_keys(&[b"1", b"\r"]), "a digit, then Enter");
+        assert!(!after_prompt_keys(&[b"1\r"]), "a digit and Enter in one op");
+        assert!(!after_prompt_keys(&[b"\x1b[A"]), "Up alone");
+        assert!(
+            !after_prompt_keys(&[b"\x1b[B", b"\x1b[A"]),
+            "Down, Up, no action key"
+        );
+
+        // A hook witness is held to the same boundary.
+        let hooked = GenerationInput::default();
+        hooked.note_prompt_shown(Instant::now());
+        hooked.enqueue(Writer::Human, b"\r");
+        hooked.enqueue(Writer::Human, b"\x1b[A");
+        assert!(!hooked.reconcile_menu_answer(Instant::now(), HOOK));
+        assert!(hooked.touched());
+    }
+
+    /// PRD #211 (PR #2370 review P1): the prompt and the answer are kept
+    /// until a witness read after the answer's last key says the prompt was
+    /// left: a newer hook of the generation, or the agent's older status that
+    /// a newer hook kept off the card. Either settles the answer once; a
+    /// witness read before the prompt appeared changes nothing, and one read
+    /// between the prompt and the answer's last key discards the answer.
+    #[test]
+    fn a_prompt_answer_survives_a_newer_hook_until_an_ordered_witness() {
+        // Permission, `1`, then a newer `PostToolUse` read before the older
+        // `working` is applied: the hook settles it, the refused `working`
+        // and the `idle` after it change nothing.
+        let input = GenerationInput::default();
+        input.note_prompt_shown(Instant::now());
+        input.enqueue(Writer::Human, b"1");
+        let working_read = Instant::now();
+        assert!(input.reconcile_menu_answer(Instant::now(), HOOK));
+        assert!(!input.touched());
+        assert!(!input.reconcile_menu_answer(working_read, OFF_CARD));
+        assert!(!input.reconcile_menu_answer(Instant::now(), ON_CARD));
+        assert!(!input.touched());
+
+        // The same with the older `working` processed first, refused for
+        // the card: it still settles the answer.
+        let input = GenerationInput::default();
+        input.note_prompt_shown(Instant::now());
+        input.enqueue(Writer::Human, b"1");
+        assert!(input.reconcile_menu_answer(Instant::now(), OFF_CARD));
+        assert!(!input.touched());
+
+        // A witness read before the prompt appeared keeps the evidence.
+        let input = GenerationInput::default();
+        let stale = Instant::now();
+        std::thread::sleep(Duration::from_millis(2));
+        input.note_prompt_shown(Instant::now());
+        input.enqueue(Writer::Human, b"\x1b[B\r");
+        assert!(!input.reconcile_menu_answer(stale, HOOK));
+        assert!(input.touched());
+        assert!(input.reconcile_menu_answer(Instant::now(), OFF_CARD));
+        assert!(!input.touched());
+
+        // A witness read between the prompt and the answer's last key: the
+        // prompt was left before that key, which then answered nothing.
+        let input = GenerationInput::default();
+        let shown = Instant::now() - Duration::from_millis(10);
+        input.note_prompt_shown(shown);
+        input.enqueue(Writer::Human, b"\x1b[B");
+        let left = Instant::now();
+        std::thread::sleep(Duration::from_millis(2));
+        input.enqueue(Writer::Human, b"\r");
+        assert!(!input.reconcile_menu_answer(left, HOOK));
+        assert!(!input.reconcile_menu_answer(Instant::now(), ON_CARD));
+        assert!(input.touched());
+
+        // A new prompt read after the answer's action key discards it.
+        let input = GenerationInput::default();
+        input.note_prompt_shown(Instant::now());
+        input.enqueue(Writer::Human, b"1");
+        input.note_prompt_shown(Instant::now());
+        assert!(!input.reconcile_menu_answer(Instant::now(), HOOK));
+        assert!(input.touched());
+
+        // A prompt repeated while only arrows were pressed is the same
+        // prompt: the run goes on.
+        let input = GenerationInput::default();
+        input.note_prompt_shown(Instant::now());
+        input.enqueue(Writer::Human, b"\x1b[B");
+        input.note_prompt_shown(Instant::now());
+        input.enqueue(Writer::Human, b"\r");
+        assert!(input.reconcile_menu_answer(Instant::now(), HOOK));
+        assert!(!input.touched());
+    }
+
+    /// PRD #211 (PR #2370 review): a printable letter, a paste or another
+    /// sequence among the keys, keys typed into a box already touched before
+    /// the prompt, keys typed before the deck saw the prompt appear, and
+    /// keys with no status leaving the prompt leave the box touched.
+    #[test]
+    fn other_input_at_a_prompt_leaves_the_box_touched() {
+        assert!(!after_prompt_keys(&[b"y"]), "a printable letter");
+        assert!(
+            !after_prompt_keys(&[b"\x1b[B", b"y", b"\r"]),
+            "a printable letter between menu keys"
+        );
+        assert!(!after_prompt_keys(&[b"\x1b[200~1\x1b[201~"]), "a paste");
+        assert!(!after_prompt_keys(&[b"\x1b[3~"]), "Delete");
+        assert!(!after_prompt_keys(&[b"\x1b\x1b"]), "two Escapes in one op");
+        assert!(
+            !after_prompt_keys(&[b"\x1b[B\x1b"]),
+            "an Escape after an arrow"
+        );
+        assert!(!after_prompt_keys(&[b"\n"]), "a line feed");
+
+        let touched = GenerationInput::default();
+        touched.enqueue(Writer::Human, b"x");
+        touched.note_prompt_shown(Instant::now());
+        touched.enqueue(Writer::Human, b"\x1b[B");
+        touched.enqueue(Writer::Human, b"\r");
+        assert!(
+            !touched.reconcile_menu_answer(Instant::now(), ON_CARD),
+            "menu keys into a box touched before the prompt"
+        );
+        assert!(touched.touched());
+
+        let early = GenerationInput::default();
+        early.enqueue(Writer::Human, b"\x1b[B");
+        early.note_prompt_shown(Instant::now() + Duration::from_millis(1));
+        early.enqueue(Writer::Human, b"\r");
+        assert!(
+            !early.reconcile_menu_answer(Instant::now(), ON_CARD),
+            "a key typed before the prompt appeared"
+        );
+        assert!(early.touched());
+
+        let unseen = GenerationInput::default();
+        unseen.enqueue(Writer::Human, b"\r");
+        assert!(
+            !unseen.reconcile_menu_answer(Instant::now(), ON_CARD),
+            "Enter with no prompt seen"
+        );
+
+        let stays = GenerationInput::default();
+        stays.note_prompt_shown(Instant::now());
+        stays.enqueue(Writer::Human, b"\x1b[B");
+        stays.enqueue(Writer::Human, b"\r");
+        assert!(stays.touched(), "no status left the prompt");
+
+        let deck = GenerationInput::default();
+        deck.note_prompt_shown(Instant::now());
+        deck.enqueue(Writer::Human, b"\r");
+        deck.enqueue(Writer::UnnamedDeck, b"\r");
+        assert!(
+            !deck.reconcile_menu_answer(Instant::now(), ON_CARD),
+            "the deck's own bytes after the key"
+        );
+    }
 
     /// Scenario: Bring the epoch to its last value, record one more op, and offer the probe that owns it an observation. The epoch stays at its last value, the box stays touched, and the observation doesn't apply.
     #[spec("inbox/probe/002")]

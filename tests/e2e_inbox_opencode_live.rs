@@ -101,17 +101,52 @@ fn opencode_017_live_fresh_launch_avoids_older_roots_and_uses_argv_model() {
     );
 }
 
-/// Scenario: While OpenCode executes a slow real shell tool, delegate an append task. The TUI must show QUEUED (OpenCode 1.x; 2.x draws no such label) and the delegated task must append only after the current tool, then visibly reply and acknowledge the inbox delivery.
+/// Scenario: While OpenCode executes a slow real shell tool in the foreground, delegate an append task. The TUI must show QUEUED (OpenCode 1.x; 2.x draws no such label) and the delegated task must append only after the current tool, then visibly reply and acknowledge the inbox delivery.
 #[spec("inbox/opencode/018")]
 #[test]
 fn opencode_018_live_busy_delegates_show_queued_and_execute_in_order() {
     skip_unless!(live::available());
     let op = OpenCode::new(false, 0, true);
     let path = &op.work;
-    let mut input=op.input(&format!("Use the shell to run exactly: printf started > '{}/busy-start'; sleep 30; printf '0\\n' > '{}/order.txt'. Then reply BUSY-DONE.",path.display(),path.display()));
+    // `>>`, not `>`: were the delegate to run before the busy command ends,
+    // `>` would erase its `1` and read as a task never carried out (#2446).
+    let mut input=op.input(&format!("Use the shell, in the foreground and not in the background, to run exactly: printf started > '{}/busy-start'; sleep 30; printf '0\\n' >> '{}/order.txt'. Then reply BUSY-DONE.",path.display(),path.display()));
     op.wait_screen("busy-start");
     input.write("\r");
     common::wait_for_file_trimmed_eq(&path.join("busy-start"), "started", BUDGET).unwrap();
+    // OpenCode 2's shell tool takes a `background` option that ends the turn
+    // at once, so a delegate sent next lands on an idle agent instead of a
+    // busy one. On 2.3.2 the model chose it for this command when the prompt
+    // did not ask for the foreground (#2446).
+    let busy = std::cell::RefCell::new(serde_json::Value::Null);
+    assert!(
+        common::wait_until(BUDGET, || {
+            *busy.borrow_mut() = op.transcript()["part"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| {
+                    p["data"]["type"] == "tool"
+                        && p["data"]["state"]["input"]["command"]
+                            .as_str()
+                            .is_some_and(|c| c.contains("busy-start"))
+                })
+                .cloned()
+                .unwrap_or_default();
+            !busy.borrow().is_null()
+        }),
+        "the busy shell call must be in the transcript; {}",
+        op.evidence()
+    );
+    let busy = busy.into_inner();
+    assert_ne!(
+        busy["data"]["state"]["input"]["background"],
+        true,
+        "precondition: the model ran the busy command in the BACKGROUND despite the prompt \
+         asking for the foreground, so its turn ended at once and the delegate cannot arrive \
+         mid-turn (a model flake in setup, before any deck delivery): {busy}; {}",
+        op.evidence()
+    );
     let first = op.delegate_body(&format!(
         "Use the shell to run exactly: printf '1\\n' >> '{}/order.txt'. Then reply FIRST-DONE.",
         path.display()

@@ -6,6 +6,14 @@ import { sanitizeText } from "../lib/displayText";
 import type { WorktreeCloseReport } from "../lib/worktreeClose";
 import { KeptWorktreeText } from "./KeptWorktreeText";
 
+/** What a close button passes its action: whether the "Keep the worktree" box was ticked (issue #2436). */
+export interface ConfirmChoice {
+  keepWorktree: boolean;
+}
+
+/** A confirmation's act. Most ignore the choice; a close that can keep its worktree reads it. */
+export type ConfirmAction = (choice: ConfirmChoice) => Promise<void>;
+
 /**
  * One irreversible-enough act, described in the terms the user needs to decide.
  * Every consumer of this dialog states the RISK in `body` rather than restating
@@ -18,15 +26,23 @@ export interface ConfirmState {
   body: string;
   label: string;
   busyLabel: string;
-  action: () => Promise<void>;
+  action: ConfirmAction;
   worktreePreview?: () => Promise<WorktreeCloseReport>;
   /**
-   * Issue #1958: a second confirm — the close that KEEPS the dispatched
-   * worktree — drawn as a third button after the confirm. Shown only when
-   * `worktreePreview` names a worktree to keep, which it does only for a deck
-   * that can keep one, so an older deck never offers it.
+   * Issue #1958, drawn as a checkbox since issue #2436: the close can keep the
+   * dispatched worktree. The dialog shows "Keep the worktree" under the
+   * worktree preview only when `worktreePreview` names a worktree to keep,
+   * which it does only for a deck that can keep one, so an older deck never
+   * offers it. Every close button then runs its action with the box's answer.
    */
-  keepWorktree?: { label: string; action: () => Promise<void> };
+  keepWorktree?: boolean;
+  /**
+   * Issue #2436: a second close beside `label`'s — an orchestration role's
+   * dialog offers closing the whole orchestration — drawn after it, so the
+   * dialog has three buttons at most. `primary` marks it as the choice the
+   * dialog leads with (filled); otherwise `label`'s close is.
+   */
+  alternative?: { label: string; action: ConfirmAction; primary?: boolean };
   /**
    * PRD #2119: a question that changes nothing irreversible — Generate config
    * asks an agent to write a file the user can review — is drawn without the
@@ -46,11 +62,14 @@ export interface ConfirmState {
  * `alertdialog` role, same busy latch.
  */
 export function ConfirmDialog({ state, onClose }: { state: ConfirmState; onClose: () => void }) {
-  const [busy, setBusy] = useState<"confirm" | "keep">();
+  const [busy, setBusy] = useState<"confirm" | "alternative">();
   const [preview, setPreview] = useState<{ state: ConfirmState; report: WorktreeCloseReport | null }>();
+  /* The box's answer, for the confirmation it was given on: a newer one starts unticked. */
+  const [keepChecked, setKeepChecked] = useState<{ state: ConfirmState; checked: boolean }>();
   const report = preview?.state === state ? preview.report : null;
   const kept = report?.kept ?? null;
   const keepPath = state.keepWorktree ? report?.keepWorktree ?? null : null;
+  const keepWorktree = keepPath !== null && keepChecked?.state === state && keepChecked.checked;
   const checking = Boolean(state.worktreePreview && preview?.state !== state);
   useEffect(() => {
     if (!state.worktreePreview) return;
@@ -80,12 +99,15 @@ export function ConfirmDialog({ state, onClose }: { state: ConfirmState; onClose
     shown.current = state;
     return () => { shown.current = undefined; };
   }, [state]);
-  const run = (which: "confirm" | "keep", action: () => Promise<void>) => {
+  const run = (which: "confirm" | "alternative", action: ConfirmAction) => {
     setBusy(which);
     const asked = state;
-    void action().finally(() => { if (shown.current === asked) onClose(); });
+    void action({ keepWorktree }).finally(() => { if (shown.current === asked) onClose(); });
   };
   const confirm = () => run("confirm", state.action);
-  const keep = state.keepWorktree;
-  return <div ref={placed} className="dialog-backdrop" role="presentation" onMouseDown={onClose}><section ref={ref} tabIndex={-1} className={`confirm-dialog${kept ? " has-worktree-preview" : ""}`} role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" onMouseDown={(event) => event.stopPropagation()}>{!state.neutral && <div className="danger-icon"><CircleStop size={20} /></div>}<h2 id="confirm-title">{state.title}</h2><p>{state.body}</p>{kept && <p className="worktree-close-preview"><KeptWorktreeText kept={kept} /></p>}<div><button className="button secondary" onClick={onClose}>{state.cancelLabel ?? "Cancel"}</button><button className={`button ${state.neutral ? "primary" : "danger"}`} disabled={Boolean(busy) || checking} onClick={confirm}>{busy === "confirm" ? state.busyLabel : checking ? "Checking worktree…" : state.label}</button>{keep && keepPath && <button className="button danger" title={`Keeps ${sanitizeText(keepPath)}`} disabled={Boolean(busy)} onClick={() => run("keep", keep.action)}>{busy === "keep" ? state.busyLabel : keep.label}</button>}</div></section></div>;
+  const alternative = state.alternative;
+  /* Issue #2436: with two closes, the one the dialog leads with is filled and the other outlined. */
+  const leads = (which: "confirm" | "alternative") => alternative !== undefined && (which === "alternative") === Boolean(alternative.primary);
+  const tone = state.neutral ? "primary" : "danger";
+  return <div ref={placed} className="dialog-backdrop" role="presentation" onMouseDown={onClose}><section ref={ref} tabIndex={-1} className={`confirm-dialog confirm-question${kept ? " has-worktree-preview" : ""}`} role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" onMouseDown={(event) => event.stopPropagation()}>{!state.neutral && <div className="danger-icon"><CircleStop size={20} /></div>}<h2 id="confirm-title">{state.title}</h2><p>{state.body}</p>{kept && <p className="worktree-close-preview"><KeptWorktreeText kept={kept} /></p>}{keepPath && <label className="keep-worktree-option" title={`Keeps ${sanitizeText(keepPath)}`}><input type="checkbox" checked={keepWorktree} disabled={Boolean(busy)} onChange={(event) => setKeepChecked({ state, checked: event.target.checked })} /> Keep the worktree</label>}<div><button className="button secondary" onClick={onClose}>{state.cancelLabel ?? "Cancel"}</button><button className={`button ${tone}${leads("confirm") ? " leads" : ""}`} disabled={Boolean(busy) || checking} onClick={confirm}>{busy === "confirm" ? state.busyLabel : checking ? "Checking worktree…" : state.label}</button>{alternative && <button className={`button ${tone}${leads("alternative") ? " leads" : ""}`} disabled={Boolean(busy) || checking} onClick={() => run("alternative", alternative.action)}>{busy === "alternative" ? state.busyLabel : alternative.label}</button>}</div></section></div>;
 }

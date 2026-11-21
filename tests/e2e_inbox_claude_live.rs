@@ -14,7 +14,17 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 const SUBJECT: &str = "live inbox task";
-const BUDGET: Duration = Duration::from_secs(120);
+/// The agent window each wait gets on a quiet machine.
+const BASE_BUDGET: Duration = Duration::from_secs(120);
+
+/// [`BASE_BUDGET`] widened by the machine's measured contention: a real
+/// Haiku and the deck's input-box check both slow down on a starved box, and
+/// at a one-minute load average of about 50 on 16 CPUs a fixed window let
+/// `claude_014` and `doorbell_010_live_history_enter` fail where each passed
+/// alone (issue #2133's lane-2 runs).
+fn budget() -> Duration {
+    common::load_scaled(BASE_BUDGET)
+}
 
 struct Claude {
     pane: inbox::Pane,
@@ -84,7 +94,7 @@ impl Claude {
         deck.wait_for_string("inbox-haiku");
         let record = std::cell::RefCell::new(Value::Null);
         assert!(
-            common::wait_until(BUDGET, || {
+            common::wait_until(budget(), || {
                 *record.borrow_mut() = attach(&deck, json!({"op":"list-agents"}))["agent_records"]
                     .as_array()
                     .and_then(|rs| rs.iter().find(|r| r["display_name"] == "inbox-haiku"))
@@ -114,7 +124,7 @@ impl Claude {
             log_name: "inbox-live.log",
         };
         assert!(
-            common::wait_until(BUDGET, || result.listing()["armed"].as_u64().unwrap_or(0)
+            common::wait_until(budget(), || result.listing()["armed"].as_u64().unwrap_or(0)
                 > 0),
             "native SessionStart waiter must arm; {}",
             result.evidence()
@@ -367,13 +377,13 @@ impl Claude {
         // The shell creates the file for `>>` before printf writes the line:
         // wait for a whole line, not only for the file.
         assert!(
-            common::wait_until(BUDGET, || std::fs::read_to_string(&path)
+            common::wait_until(budget(), || std::fs::read_to_string(&path)
                 .is_ok_and(|text| text.ends_with('\n'))),
             "real Haiku must act on {id}; {}",
             self.evidence()
         );
         assert!(
-            common::wait_until(BUDGET, || self.listing()["messages"]
+            common::wait_until(budget(), || self.listing()["messages"]
                 .as_array()
                 .unwrap()
                 .iter()
@@ -438,7 +448,7 @@ fn claude_011_live_idle_native_wake() {
     claude.deck.wait_for_strings_in_order_then_any_within(
         &["Thinking", "Working"],
         &["Bash"],
-        BUDGET,
+        budget(),
     );
     claude.done(&id, name, true);
     claude.assert_witnessed(&id, true);
@@ -459,7 +469,7 @@ fn claude_012_live_busy_fold_at_stop() {
         work.join("busy-finished-781d.txt").display()
     ));
     assert!(
-        common::wait_until(BUDGET, || claude
+        common::wait_until(budget(), || claude
             .deck
             .workdir()
             .join("busy-started-781d.txt")
@@ -502,7 +512,7 @@ fn claude_013_live_clear_waiters_claim_once() {
             .count()
     };
     assert!(
-        common::wait_until(BUDGET, || registered() >= 1),
+        common::wait_until(budget(), || registered() >= 1),
         "startup must arm a waiter; {}",
         claude.evidence()
     );
@@ -510,12 +520,12 @@ fn claude_013_live_clear_waiters_claim_once() {
         let seen = registered();
         claude.deck.send_bytes(b"/clear\r");
         assert!(
-            common::wait_until(BUDGET, || registered() > seen),
+            common::wait_until(budget(), || registered() > seen),
             "the {clear} clear must arm another waiter; {}",
             claude.evidence()
         );
         assert!(
-            common::wait_until(BUDGET, || claude.listing()["armed"] == 1),
+            common::wait_until(budget(), || claude.listing()["armed"] == 1),
             "the newer waiter takes the older one's place; {}",
             claude.evidence()
         );
@@ -624,12 +634,14 @@ fn claude_053_live_a_blocked_doorbell_prompt_is_not_acknowledged_and_is_handed_o
     let id = claude.post(&claude.directive(name));
     let marker = claude.deck.workdir().join("doorbell-blocked-once.marker");
     assert!(
-        common::wait_until(BUDGET, || marker.exists()),
+        common::wait_until(budget(), || marker.exists()),
         "the doorbell must ring and the project hook block its prompt; {}",
         claude.evidence()
     );
+    // The daemon logs the ring as it settles, which can land after the
+    // project hook wrote its marker on a starved box (issue #2133's runs).
     assert!(
-        claude.log().contains("doorbell rang"),
+        common::wait_until(budget(), || claude.log().contains("doorbell rang")),
         "{}",
         claude.evidence()
     );
@@ -648,7 +660,7 @@ fn claude_053_live_a_blocked_doorbell_prompt_is_not_acknowledged_and_is_handed_o
     // box, which the deck does not type over, so the card says the task
     // awaits a prompt. Before, it kept reading busy and said nothing.
     assert!(
-        common::wait_until(BUDGET, || {
+        common::wait_until(budget(), || {
             claude.record()["live"]["status"] == "Idle"
                 && claude
                     .log()
@@ -662,13 +674,13 @@ fn claude_053_live_a_blocked_doorbell_prompt_is_not_acknowledged_and_is_handed_o
     // the task over again.
     claude.deck.send_keys(b"\r");
     assert!(
-        common::wait_until(BUDGET, || std::fs::read_to_string(&sentinel)
+        common::wait_until(budget(), || std::fs::read_to_string(&sentinel)
             .is_ok_and(|text| text.ends_with('\n'))),
         "real Haiku must act on {id} once it is handed over again; {}",
         claude.evidence()
     );
     assert!(
-        common::wait_until(BUDGET, || message()["state"] == "acknowledged"),
+        common::wait_until(budget(), || message()["state"] == "acknowledged"),
         "the task must be acknowledged; {}",
         claude.evidence()
     );
@@ -701,7 +713,7 @@ fn claude_050_live_turned_off_doorbell_is_held_and_a_prompt_delivers() {
     // The cause is proved, not assumed: the installed release latched, and
     // the doorbell held as turned_off.
     let latched = format!("release={release}");
-    let saw_latch = common::wait_until(BUDGET, || {
+    let saw_latch = common::wait_until(budget(), || {
         claude
             .log()
             .lines()
@@ -721,14 +733,14 @@ fn claude_050_live_turned_off_doorbell_is_held_and_a_prompt_delivers() {
     }
     kill_trial_waiter(&claude);
     assert!(
-        common::wait_until(BUDGET, || claude.listing()["armed"].as_u64() == Some(0)),
+        common::wait_until(budget(), || claude.listing()["armed"].as_u64() == Some(0)),
         "the waiter must go; {}",
         claude.evidence()
     );
     let name = "turned-off-doorbell-4d17b2.txt";
     let id = claude.post(&claude.directive(name));
     assert!(
-        common::wait_until(BUDGET, || {
+        common::wait_until(budget(), || {
             claude
                 .log()
                 .lines()
@@ -761,7 +773,7 @@ fn claude_050_live_turned_off_doorbell_is_held_and_a_prompt_delivers() {
     assert!(
         claude.deck.wait_for_grid_string_within(
             dot_agent_deck::inbox_display::WAKE_HOLD_CANNOT_TYPE,
-            BUDGET
+            budget()
         ),
         "the card shows the words; {}",
         claude.evidence()
@@ -796,14 +808,14 @@ fn doorbell_039_live_typing_while_line_lands() {
     let name = "typing-while-line-lands-39a1.txt";
     let id = claude.post(&claude.directive(name));
     assert!(
-        common::wait_until(BUDGET, || root.join("after-line.reached").exists()),
+        common::wait_until(budget(), || root.join("after-line.reached").exists()),
         "the ring must reach its line; {}",
         claude.evidence()
     );
     let typed = "user-text-while-deck-types-39a1";
     claude.deck.send_keys(typed.as_bytes());
     assert!(
-        common::wait_until(BUDGET, || std::fs::read_to_string(
+        common::wait_until(budget(), || std::fs::read_to_string(
             root.join("observations")
         )
         .unwrap_or_default()
@@ -860,7 +872,7 @@ fn fallback_ready_with(claude: Claude, label: &str) -> Claude {
     // A completed model action alone can precede its Stop hook. Wait for the
     // next native waiter and genuine Idle before disabling native delivery.
     assert!(
-        common::wait_until(BUDGET, || {
+        common::wait_until(budget(), || {
             claude.listing()["armed"].as_u64().unwrap_or(0) > 0
                 && claude.record()["live"]["status"] == "Idle"
         }),
@@ -936,7 +948,7 @@ fn empty_editor_fallback(label: &str, erase_draft: bool) {
     } else {
         // Diagnose the hold, and leave the real agent settled before failing.
         claude.deck.send_keys(b"\x15");
-        common::wait_until(BUDGET, || claude.deck.workdir().join(&name).exists())
+        common::wait_until(budget(), || claude.deck.workdir().join(&name).exists())
     };
     assert!(
         delivered,
@@ -952,7 +964,7 @@ fn empty_editor_fallback(label: &str, erase_draft: bool) {
     );
 }
 
-/// Scenario: Complete a fallback task in interactive Haiku, then press Left in its empty composer to open the background-session overview and queue another task. For five seconds the input row must remain exactly empty with unchanged captured input bytes, the task queued and zero deliveries. This is a GREEN regression guard on the part-3 head because navigation sets the draft bit; after the fix the unrecognised overview must still hold delivery.
+/// Scenario: Complete a fallback task in interactive Haiku, then press Left in its empty composer to open the background-session overview and queue another task. For five seconds the input row must remain exactly empty with unchanged captured input bytes and the deck must type nothing; the task stays queued with zero deliveries unless the background session the conversation moved to took the deck's receiver over and was handed it there (issue #2342). This is a GREEN regression guard on the part-3 head because navigation sets the draft bit; after the fix the unrecognised overview must still hold the doorbell.
 #[spec("inbox/doorbell/010")]
 #[test]
 #[cfg(target_os = "linux")]
@@ -980,6 +992,9 @@ fn doorbell_010_live_left_opens_overview_and_the_line_is_not_typed_there() {
     );
     let input = || std::fs::read(claude.deck.workdir().join("overview-input.log")).unwrap();
     let before_left = input();
+    // Issue #2342: the receiver can move to the background session before
+    // the observation below starts, so its log line is looked for from here.
+    let log_before_left = claude.log().len();
     claude.deck.send_keys(b"\x1b[D");
     assert!(
         common::wait_until(Duration::from_secs(10), || shows_overview(
@@ -1009,7 +1024,12 @@ fn doorbell_010_live_left_opens_overview_and_the_line_is_not_typed_there() {
     let since = claude.log().len();
     let name = "overview-held-7e91.txt";
     let id = claude.post(&claude.directive(name));
+    // Issue #2342: Left moves the conversation to Claude Code's background
+    // session, whose waiter takes the deck's receiver over and may be handed
+    // the task there. That is delivery to the conversation, not typing into
+    // the overview: what this test guards is that nothing is typed.
     let leaked = std::cell::Cell::new(false);
+    let left_queue = std::cell::Cell::new(false);
     // A bounded observation: the closure never asks to stop, so it samples
     // for the whole five seconds.
     common::wait_until(Duration::from_secs(5), || {
@@ -1034,14 +1054,20 @@ fn doorbell_010_live_left_opens_overview_and_the_line_is_not_typed_there() {
                     || line.contains("doorbell sent its cleanup CR")
                     || line.contains("pane_write:")
             })
-            || !shows_overview(&grid)
-            || claude.deck.workdir().join(name).exists()
-            || message["state"] != "queued"
-            || message["deliveries"] != 0;
+            || !shows_overview(&grid);
         leaked.set(leaked.get() || seen);
+        left_queue.set(
+            left_queue.get()
+                || claude.deck.workdir().join(name).exists()
+                || message["state"] != "queued"
+                || message["deliveries"] != 0,
+        );
         false
     });
     let leaked = leaked.get();
+    let left_queue = left_queue.get();
+    let moved = claude.log()[log_before_left..]
+        .contains("inbox: the receiver moved to the conversation's Claude Code background session");
     let listing = claude.listing();
     let message = listing["messages"]
         .as_array()
@@ -1051,16 +1077,17 @@ fn doorbell_010_live_left_opens_overview_and_the_line_is_not_typed_there() {
         .unwrap();
     let evidence = claude.evidence();
     eprintln!(
-        "overview observation: leaked={leaked}; input ledger unchanged={}; empty input row={empty_row:?}; message={message}; pane=\n{}",
+        "overview observation: leaked={leaked}; left the queue={left_queue}; receiver moved to the background session={moved}; input ledger unchanged={}; empty input row={empty_row:?}; message={message}; pane=\n{}",
         input() == input_before,
         claude.pane_grid()
     );
     assert!(
-        !leaked
-            && input() == input_before
-            && message["state"] == "queued"
-            && message["deliveries"] == 0,
+        !leaked && input() == input_before,
         "deck must not type its line or act on Enter in the overview; {evidence}"
+    );
+    assert!(
+        !left_queue || moved,
+        "the task may leave the queue only through the background session's own waiter; {evidence}"
     );
 }
 
@@ -1081,7 +1108,7 @@ fn doorbell_010_live_kept_draft_stays_held() {
                 format!("{draft} Reply exactly HISTORY-READY and end your turn. Do not use tools.");
             claude.deck.send_keys(format!("{prompt}\r").as_bytes());
             assert!(
-                common::wait_until(BUDGET, || {
+                common::wait_until(budget(), || {
                     claude.listing()["armed"].as_u64().unwrap_or(0) > 0
                         && claude.record()["live"]["status"] == "Idle"
                 }),
@@ -1133,7 +1160,7 @@ fn recalled_draft_trial(claude: &Claude, draft: &str) -> Value {
     let since = claude.log().len();
     let id = claude.post(&claude.directive(name));
     assert!(
-        common::wait_until(BUDGET, || claude.record()["inbox"]["wake_hold"]
+        common::wait_until(budget(), || claude.record()["inbox"]["wake_hold"]
             == "cannot_check"
             && claude.log()[since..].lines().any(|l| l
                 .contains("probe refused when scheduled")
@@ -1217,7 +1244,7 @@ fn checked_and_held(
     since: usize,
 ) -> (Option<String>, (u16, u16)) {
     assert!(
-        common::wait_until(BUDGET, || claude.record()["inbox"]["wake_hold"]
+        common::wait_until(budget(), || claude.record()["inbox"]["wake_hold"]
             == "possible_draft"),
         "a check must read the box non-empty and hold the task; {}",
         claude.evidence()
@@ -1500,7 +1527,7 @@ fn doorbell_010_live_blanks_enter_and_an_unrelated_turn_stay_held() {
         claude.evidence()
     );
     assert!(
-        common::wait_until(BUDGET, || claude.listing()["armed"].as_u64().unwrap_or(0)
+        common::wait_until(budget(), || claude.listing()["armed"].as_u64().unwrap_or(0)
             > 0),
         "the native waiter must be armed; {}",
         claude.evidence()
@@ -1556,7 +1583,7 @@ fn doorbell_010_live_blanks_enter_and_an_unrelated_turn_stay_held() {
     let turn_id = claude.post(&claude.directive(turn));
     claude.done(&turn_id, turn, true);
     assert!(
-        common::wait_until(BUDGET, || {
+        common::wait_until(budget(), || {
             claude.listing()["armed"].as_u64().unwrap_or(0) > 0
                 && claude.record()["live"]["status"] == "Idle"
         }),
@@ -1846,7 +1873,7 @@ fn ctrl_c_trial(claude: &Claude, trial: usize) -> bool {
     let name = format!("ctrl-c-check-{trial}-5d2a.txt");
     let id = claude.post(&claude.directive(&name));
     assert!(
-        common::wait_until(BUDGET, || claude.record()["inbox"]["wake_hold"]
+        common::wait_until(budget(), || claude.record()["inbox"]["wake_hold"]
             == "possible_draft"
             && claude.checks(start).iter().any(|c| c == "Written")),
         "trial {trial}: a check must hold the task behind the draft; {}",
@@ -1899,7 +1926,7 @@ fn ctrl_c_trial(claude: &Claude, trial: usize) -> bool {
     // As the control turn: the next native waiter, killed, so the next
     // trial's task is held and delivered by the doorbell.
     assert!(
-        common::wait_until(BUDGET, || {
+        common::wait_until(budget(), || {
             claude.listing()["armed"].as_u64().unwrap_or(0) > 0
                 && claude.record()["live"]["status"] == "Idle"
         }),
@@ -1920,7 +1947,7 @@ fn doorbell_010_live_history_enter_recovers_the_doorbell() {
     let claude = fallback_ready("history-enter");
     let idle_again = |what: &str| {
         assert!(
-            common::wait_until(BUDGET, || {
+            common::wait_until(budget(), || {
                 claude.listing()["armed"].as_u64().unwrap_or(0) > 0
                     && claude.record()["live"]["status"] == "Idle"
             }),
@@ -1949,7 +1976,7 @@ fn doorbell_010_live_history_enter_recovers_the_doorbell() {
         false
     } else {
         claude.deck.send_keys(b"\x05\x15");
-        common::wait_until(BUDGET, || claude.deck.workdir().join(name).exists())
+        common::wait_until(budget(), || claude.deck.workdir().join(name).exists())
     };
     assert!(
         delivered,
@@ -2105,7 +2132,7 @@ fn claude_046_live_outside_the_recorded_tree_takes_and_acknowledges() {
     claude.deck.wait_for_strings_in_order_then_any_within(
         &["Thinking", "Working"],
         &["Bash"],
-        BUDGET,
+        budget(),
     );
     claude.done(&id, name, true);
 }
@@ -2123,7 +2150,7 @@ fn start_claude(deck: &common::TuiDeck, name: &str) -> inbox::Pane {
     let agent = reply["id"].as_str().unwrap().to_string();
     let record = std::cell::RefCell::new(Value::Null);
     assert!(
-        common::wait_until(BUDGET, || {
+        common::wait_until(budget(), || {
             *record.borrow_mut() = attach(deck, json!({"op":"list-agents"}))["agent_records"]
                 .as_array()
                 .and_then(|rs| rs.iter().find(|r| r["id"] == agent.as_str()))
@@ -2203,7 +2230,7 @@ fn claude_049_live_hooks_refreshed_after_an_upgrade_deliver() {
             .unwrap_or(Value::Null)
     };
     assert!(
-        common::wait_until(BUDGET, || notice() == "hooks_too_old"),
+        common::wait_until(budget(), || notice() == "hooks_too_old"),
         "the stale agent's card names its hooks; {}",
         claude.evidence()
     );
@@ -2243,7 +2270,7 @@ fn claude_049_live_hooks_refreshed_after_an_upgrade_deliver() {
         log_name: claude.log_name,
     };
     assert!(
-        common::wait_until(BUDGET, || fresh.listing()["armed"].as_u64().unwrap_or(0)
+        common::wait_until(budget(), || fresh.listing()["armed"].as_u64().unwrap_or(0)
             > 0),
         "the refreshed waiter arms; {}",
         fresh.evidence()
@@ -2252,6 +2279,162 @@ fn claude_049_live_hooks_refreshed_after_an_upgrade_deliver() {
     let id = fresh.post(&fresh.directive(name));
     fresh.done(&id, name, true);
     fresh.assert_witnessed(&id, true);
+}
+
+/// The pids of the processes running under `home` (their `HOME`) whose
+/// command line includes the word `arg`. Words, not arguments: Claude Code
+/// rewrites a `bg-pty-host`'s title into one argument with spaces in it.
+fn home_processes(home: &std::path::Path, arg: &str) -> Vec<i32> {
+    let home = format!("HOME={}", home.display());
+    let mut pids = Vec::new();
+    for entry in std::fs::read_dir("/proc").unwrap().flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
+            continue;
+        };
+        let cmd = std::fs::read(entry.path().join("cmdline")).unwrap_or_default();
+        let env = std::fs::read(entry.path().join("environ")).unwrap_or_default();
+        if cmd
+            .split(|c| *c == 0 || c.is_ascii_whitespace())
+            .any(|a| a == arg.as_bytes())
+            && env.split(|c| *c == 0).any(|v| v == home.as_bytes())
+        {
+            pids.push(pid);
+        }
+    }
+    pids
+}
+
+/// Kills Claude Code's background session processes (its `daemon run
+/// --spawned-by …`, `bg-pty-host` and `bg-spare`) under the test's own HOME
+/// when the test ends: they outlive the pane's agent, so the deck's teardown
+/// does not reach them.
+struct BackgroundHostReaper(PathBuf);
+
+impl Drop for BackgroundHostReaper {
+    fn drop(&mut self) {
+        for arg in ["--spawned-by", "bg-pty-host", "bg-spare"] {
+            for pid in home_processes(&self.0, arg) {
+                // SAFETY: a plain `kill(2)` on a process whose HOME is this
+                // test's own temporary HOME.
+                unsafe {
+                    libc::kill(pid, libc::SIGTERM);
+                }
+            }
+        }
+    }
+}
+
+/// Scenario: Genuine interactive Haiku in a deck pane is woken by a sentinel-writing task and does it. The user then presses Left in the empty input box, which moves the conversation to Claude Code's background session host, and Escape, which brings it back resumed in that host. A second sentinel-writing task posted then must reach the resumed conversation: Claude writes the second sentinel once and the task is acknowledged after one hand-over.
+#[spec("inbox/claude/056")]
+#[test]
+fn claude_056_live_a_conversation_resumed_from_the_background_host_takes_its_messages() {
+    skip_unless!(common::check_claude_available());
+    let claude = Claude::new();
+    let _hosts = BackgroundHostReaper(claude.deck.home_dir().to_path_buf());
+
+    // A first task in the foreground conversation.
+    let first = "foreground-task-3c8e51.txt";
+    let id = claude.post(&claude.directive(first));
+    claude.done(&id, first, true);
+    assert!(
+        common::wait_until(budget(), || {
+            claude.listing()["armed"].as_u64().unwrap_or(0) > 0
+                && claude.record()["live"]["status"] == "Idle"
+        }),
+        "the first turn must finish and its waiter re-arm; {}",
+        claude.evidence()
+    );
+    claude.expect_composer("");
+
+    // Left in the empty input box moves the conversation to a background
+    // session, run by a `bg-pty-host` Claude Code starts for it; Escape
+    // returns to it there. Claude Code answers an Escape that comes before the
+    // session runs with "Still starting", so retry.
+    claude.deck.send_keys(b"\x1b[D");
+    assert!(
+        common::wait_until(Duration::from_secs(20), || shows_overview(
+            &claude.pane_grid()
+        )),
+        "Left must move the conversation to the background; {}",
+        claude.evidence()
+    );
+    let home = claude.deck.home_dir().to_path_buf();
+    let conversation_hosts = || {
+        home_processes(&home, "bg-pty-host")
+            .into_iter()
+            .filter(|pid| {
+                std::fs::read(format!("/proc/{pid}/cmdline"))
+                    .unwrap_or_default()
+                    .split(|c| *c == 0 || c.is_ascii_whitespace())
+                    .any(|arg| arg == b"--session-id")
+            })
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        common::wait_until(Duration::from_secs(60), || !conversation_hosts().is_empty()),
+        "the conversation must run in a bg-pty-host under the test HOME; {}",
+        claude.evidence()
+    );
+    for host in conversation_hosts() {
+        let argv = std::fs::read(format!("/proc/{host}/cmdline")).unwrap_or_default();
+        eprintln!(
+            "background session host {host}: {}",
+            String::from_utf8_lossy(&argv).replace('\0', " ")
+        );
+    }
+    // One Escape: a surplus one in the session opens a Claude Code dialog
+    // ("Esc to cancel"), behind which the session takes no wake. Only while
+    // Claude Code answers "Still starting" is it pressed again.
+    claude.deck.send_keys(b"\x1b");
+    let pressed = std::cell::Cell::new(std::time::Instant::now());
+    let returned = common::wait_until(Duration::from_secs(60), || {
+        let grid = claude.pane_grid();
+        if grid.contains("Still starting") {
+            if pressed.get().elapsed() >= Duration::from_secs(2) {
+                claude.deck.send_keys(b"\x1b");
+                pressed.set(std::time::Instant::now());
+            }
+            return false;
+        }
+        !shows_overview(&grid) && claude.composer().is_some()
+    });
+    assert!(
+        returned,
+        "Escape must bring the conversation back; {}",
+        claude.evidence()
+    );
+    // The background session takes the conversation over (`SessionStart`
+    // with source `fork`) and arms its waiter.
+    assert!(
+        common::wait_until(budget(), || claude
+            .log()
+            .lines()
+            .any(|line| line.contains("Received inbox wait")
+                && line.contains("source=Some(\"fork\")"))),
+        "the background session's fork must arm a waiter; {}",
+        claude.evidence()
+    );
+    // The forked session is ready for the next task: its waiter is armed and
+    // its empty input box is on screen, with no dialog over it.
+    assert!(
+        common::wait_until(budget(), || claude.listing()["armed"].as_u64().unwrap_or(0)
+            > 0
+            && claude.composer().as_deref() == Some("")),
+        "the background session must be armed with its empty input box on screen; {}",
+        claude.evidence()
+    );
+
+    // A second task must reach the resumed conversation.
+    let second = "resumed-task-9a42d7.txt";
+    let id = claude.post(&claude.directive(second));
+    claude.done(&id, second, false);
+    assert!(
+        claude.log().contains(
+            "inbox: the receiver moved to the conversation's Claude Code background session"
+        ),
+        "the background session must have taken the receiver over; {}",
+        claude.evidence()
+    );
 }
 
 /// Whether `grid` shows Claude Code's background-session overview by its
