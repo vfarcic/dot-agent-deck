@@ -968,6 +968,33 @@ fn status_waiting_016_opencode_own_server_is_not_a_background_command() {
         "a session nested below a daemon command is a command of its own"
     );
 
+    // The daemon starts with the agent's first shell command, and the watch
+    // names it on its next look, up to five seconds later. Until then the
+    // daemon itself counts, but each command below it already counts under
+    // the key it keeps once the daemon is named, so a command first sampled
+    // during the turn is still the same command after the naming (and stays
+    // awaited), rather than a new one first seen after the turn.
+    let mut table = opencode_2_3();
+    table.push(row(BG_COMMAND, DAEMON, DAEMON, None));
+    // Measured on 2.3.2 (status/waiting/009): the watch can name the server
+    // only in the same look as the daemon, so the command keeps its key from
+    // before any naming too.
+    assert_eq!(
+        count(&table, CLIENT, None),
+        Some(HashSet::from([SERVER, DAEMON, BG_COMMAND])),
+        "with nothing named, the server and the daemon count, and the command keeps its own key"
+    );
+    assert_eq!(
+        count(&table, CLIENT, identified),
+        Some(HashSet::from([DAEMON, BG_COMMAND])),
+        "before the watch names it, the daemon counts and its command keeps its own key"
+    );
+    assert_eq!(
+        count(&table, CLIENT, with_daemon(DAEMON)),
+        Some(HashSet::from([BG_COMMAND])),
+        "once named, the daemon drops out and the command keeps that key"
+    );
+
     // Not the daemon, so it counts as before: a second `opencode-pty daemon`
     // child of the server the watch did not name; the named pid whose command
     // line was not read, or no longer reads as the daemon's; a named pid whose
@@ -1057,7 +1084,7 @@ fn status_waiting_016_opencode_own_server_is_not_a_background_command() {
     }
 }
 
-/// Scenario: The daemon's OpenCode watch looks at a pane's process tree (executables and arguments, as it samples them) and names the private server the shell-activity scan may exempt. It names one only for a client whose version is known to be 2.x, and only that client's first direct child whose executable is OpenCode and whose arguments are `serve --stdio`: not on OpenCode 1.x (where a tool can start that shape as the client's child), not for an unknown version, not a process that only forged a server's arguments, not one a wrapper shell started, and not a second server. Fed into the scan, the named server is exempted and a forged one beside it still counts. For a client known to be 2.3 or later it also names the server's first direct child running the `opencode-pty` executable as `daemon`, OpenCode's process daemon, and fed into the scan that daemon is exempt while a command it runs counts.
+/// Scenario: The daemon's OpenCode watch looks at a pane's process tree (executables and arguments, as it samples them) and names the private server the shell-activity scan may exempt. It names one only for a client whose version is known to be 2.x, and only that client's first direct child whose executable is OpenCode and whose arguments are `serve --stdio`: not on OpenCode 1.x (where a tool can start that shape as the client's child), not for an unknown version, not a process that only forged a server's arguments, not one a wrapper shell started, and not a second server; for a client known to be 2.3 or later it also names the server's first direct child running the `opencode-pty` executable as `daemon`, OpenCode's process daemon. Fed into the scan, the named server and daemon are exempted while a forged server beside them, and a command the daemon runs, still count.
 #[spec("status/waiting/017")]
 #[test]
 fn status_waiting_017_the_watch_names_only_a_known_opencode_2s_own_server() {
