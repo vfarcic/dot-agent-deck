@@ -1,7 +1,7 @@
 #![cfg(all(feature = "e2e", feature = "e2e-live"))]
 
 //! PRD #311 — L2 (real-binary PTY) coverage for the Orchestration tab's
-//! `PaneLayout::Stacked` pane column: removing the non-focused roles'
+//! pane column: removing the non-focused roles'
 //! collapsed 1-row title frames must not touch agent lifecycle. Every role's
 //! PTY stays open, keeps running, and keeps reporting status regardless of
 //! whether its pane is currently drawn.
@@ -96,13 +96,13 @@ fn open_orchestration(deck: &TuiDeck) {
 }
 
 /// Scenario: Open the `orch-focus-lifecycle` fixture's 3-role orchestration
-/// (`orchestrator` start role, plus `alpha` and `beta`) in the deck's default
-/// `PaneLayout::Stacked`. (b) Confirm a non-focused role keeps running and its
+/// (`orchestrator` start role, plus `alpha` and `beta`) in the deck's pane
+/// column. (b) Confirm a non-focused role keeps running and its
 /// sidebar status transitions live: `beta`'s status card goes from idle to
 /// `Working` purely through its own self-posted hook events while its pane is
 /// NOT the expanded/focused slot. (a) Assert the settled grid carries NO
 /// collapsed title-bar frame for either non-focused role (`alpha`, `beta`) —
-/// PRD #311 removes that arm of `PaneLayout::Stacked` entirely. (c) Drive `j`
+/// PRD #311 removes those frames entirely. (c) Drive `j`
 /// twice (Normal mode) to move the deck's focus orchestrator -> alpha -> beta,
 /// then `k` twice back to orchestrator, asserting each role's own sentinel
 /// text is visible once it becomes the focused/expanded pane — proving no lost
@@ -141,12 +141,12 @@ fn orchestration_006_stacked_pane_column_hides_collapsed_frames_while_agents_sta
     assert!(
         !has_collapsed_frame(&grid, "alpha"),
         "non-focused role 'alpha' must not render a collapsed title-bar frame \
-         in PaneLayout::Stacked:\n{grid}"
+         in the pane column:\n{grid}"
     );
     assert!(
         !has_collapsed_frame(&grid, "beta"),
         "non-focused role 'beta' must not render a collapsed title-bar frame \
-         in PaneLayout::Stacked:\n{grid}"
+         in the pane column:\n{grid}"
     );
 
     // (c) Switching focus between roles preserves each agent's rendered
@@ -342,7 +342,7 @@ const ZOOM_MARKER: &str = "[Z]";
 
 /// Column of the box drawn for the role pane named `role`, or `None` when no
 /// such expanded box is on the grid. [`orchestrator_box_edge`] is this with
-/// `"orchestrator"`; under `PaneLayout::Stacked` only the FOCUSED role's pane is
+/// `"orchestrator"`; only the FOCUSED role's pane is
 /// drawn, so a test that has jumped focus to a non-start role (as the real-agent
 /// zoom test below does) has to name the role it focused. The scan itself lives
 /// in the harness, for the same one-copy reason recorded there.

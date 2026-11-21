@@ -1,11 +1,12 @@
 #![cfg(feature = "e2e")]
 
-//! PRD #385 M2 — selection follows the pointer, not the focused pane.
+//! PRD #385 M2 — a drag copies the text of the pane it is made in.
 //!
-//! Two shell panes sit side by side on the dashboard, each having printed its
-//! own uniquely named sentinel. A drag across the pane that is NOT focused must
-//! focus that pane and copy its text in the same gesture. The shells stand in
-//! for agents: what is selected is screen text, whichever program wrote it.
+//! Two shell panes sit on the dashboard, each having printed its own uniquely
+//! named sentinel. Only the focused pane is drawn (PRD #311, #312), so a drag
+//! across the drawn pane must copy that pane's text and never the hidden one's.
+//! The shells stand in for agents: what is selected is screen text, whichever
+//! program wrote it.
 //!
 //! The harness runs the deck with the native clipboard switched off
 //! (`DOT_AGENT_DECK_NATIVE_CLIPBOARD=0`) and its PTY is the deck's controlling
@@ -56,14 +57,10 @@ fn pane_is_focused(grid: &str, text: &str) -> bool {
     left_border_of(grid, text) == Some('┃')
 }
 
-fn pane_is_unfocused(grid: &str, text: &str) -> bool {
-    left_border_of(grid, text) == Some('│')
-}
-
-/// Scenario: Two shell panes are tiled on the dashboard, each having printed its own sentinel, and the one opened second is focused in command mode. A single mouse drag across the other pane's sentinel focuses that pane and copies exactly its sentinel: the OSC 52 sequence carries that pane's text, never the focused pane's, and the status line reports the OSC 52-only send.
+/// Scenario: Two shell panes on the dashboard have each printed their own sentinel, and the one opened second is focused, so it is the one drawn. Jumping to the first pane's card brings that pane on screen instead, and a single mouse drag across its sentinel copies exactly that sentinel: the OSC 52 sequence carries the drawn pane's text, never the hidden pane's, and the status line reports the OSC 52-only send.
 #[spec("mouse/select/001")]
 #[test]
-fn select_001_a_drag_in_a_non_focused_pane_focuses_it_and_copies_its_text() {
+fn select_001_a_drag_copies_the_drawn_pane_text_never_a_hidden_pane() {
     let deck = TuiDeck::builder()
         .with_pty_size(200, 40)
         .with_continue_session("seltarget", "bash --noprofile --norc")
@@ -110,16 +107,21 @@ fn select_001_a_drag_in_a_non_focused_pane_focuses_it_and_copies_its_text() {
     deck.send_bytes(b"echo SELFOC-$((7*8))-keepout\r");
     deck.wait_for_string(focused_text);
 
-    // Command mode, tiled: both panes on screen, `selfocused` wearing the thick
-    // border that marks focus in command mode.
+    // A pane border directly left of `text`: the pane that printed it is drawn.
+    let drawn = |g: &str, text: &str| matches!(left_border_of(g, text), Some('│' | '┃'));
+
+    // Command mode: only the focused pane, `selfocused`, is drawn, wearing the
+    // thick border that marks focus in command mode.
     deck.send_bytes(b"\x04"); // Ctrl+D → command mode
     deck.wait_for_string("[New Agent n/Ctrl+N]");
-    deck.send_bytes(b"\x14"); // Ctrl+T → tiled
-    deck.wait_until_grid("both panes tiled, `selfocused` focused", |g| {
-        g.contains(target_text)
-            && g.contains(focused_text)
-            && pane_is_focused(g, focused_text)
-            && pane_is_unfocused(g, target_text)
+    deck.wait_until_grid("only `selfocused` drawn, focused", |g| {
+        pane_is_focused(g, focused_text) && !drawn(g, target_text)
+    });
+
+    // Jump to the first card: its pane becomes the one drawn.
+    deck.send_bytes(b"1");
+    deck.wait_until_grid("only the target pane drawn", |g| {
+        drawn(g, target_text) && !drawn(g, focused_text)
     });
 
     // One gesture: drag across the target pane's sentinel.
@@ -134,10 +136,10 @@ fn select_001_a_drag_in_a_non_focused_pane_focuses_it_and_copies_its_text() {
         "the drag copied the focused pane's text instead of the pane under the pointer"
     );
     deck.wait_until_grid(
-        "the target pane took focus and the status reports the OSC 52 send",
+        "the target pane is still the one drawn and the status reports the OSC 52 send",
         |g| {
-            pane_is_focused(g, target_text)
-                && pane_is_unfocused(g, focused_text)
+            drawn(g, target_text)
+                && !drawn(g, focused_text)
                 && g.contains("Sent to terminal clipboard (OSC 52)")
         },
     );

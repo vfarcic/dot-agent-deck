@@ -28,13 +28,12 @@ use common::TuiDeck;
 use spec::spec;
 
 /// Scenario: Stage a `keybindings.toml` that rebinds the global
-/// `toggle_layout` action from its REAL default `Ctrl+t` to
-/// `Alt+Shift+l`, launch the deck against the `minimal` fixture, and
-/// press `Alt+Shift+l`. The dashboard layout should toggle
-/// (stacked <-> tiled), surfacing a `Layout: …` status message in the
-/// bottom bar. Then press the old real default toggle key (`Ctrl+t`) and
-/// confirm it no longer toggles — proving the binding was resolved
-/// client-side from the config rather than from the hardcoded default.
+/// `new_pane` action from its default `Ctrl+n` to `Alt+Shift+l`, launch the
+/// deck against the `minimal` fixture, and press `Alt+Shift+l`. The New Agent
+/// directory picker should open. Close it, then press the old default
+/// (`Ctrl+n`) followed by `?`, and confirm the help overlay opens with no
+/// picker — proving the binding was resolved client-side from the config
+/// rather than from the hardcoded default.
 #[spec("keybindings/remap/001")]
 #[test]
 fn remap_001_global_action_rebind() {
@@ -42,15 +41,12 @@ fn remap_001_global_action_rebind() {
     // GLOBAL action takes effect on the new combo and removes the old
     // default. Bindings resolve CLIENT-SIDE: the file lives under the
     // TUI client's HOME and the TUI event loop matches the keypress.
-    //
-    // The REAL default for toggle_layout in this build is Ctrl+t (the
-    // dashboard hints bar reads "Ctrl+t: layout"), NOT the Alt+t named in
-    // the stale PRD body — so the old-key negative check below presses
-    // Ctrl+t.
+    // PRD #312 removed `toggle_layout`, which this test used to remap;
+    // `new_pane` is a global action with an equally visible effect.
     let deck = TuiDeck::builder()
         .with_keybindings_toml(
             "[global]\n\
-             toggle_layout = \"Alt+Shift+l\"\n",
+             new_pane = \"Alt+Shift+l\"\n",
         )
         .launch_with_fixture("minimal");
 
@@ -59,26 +55,56 @@ fn remap_001_global_action_rebind() {
     // Alt+Shift+l: Alt sends an ESC prefix; Shift+l is the uppercase
     // `L`. One write so crossterm decodes it as a single chord.
     deck.send_keys(b"\x1bL");
+    deck.wait_for_string("Select Directory");
+    deck.send_keys(b"\x1b"); // Esc closes the picker
+    deck.wait_for_absence("Select Directory");
 
-    // The toggle handler sets a `Layout: stacked` / `Layout: tiled`
-    // status message — capital-L-plus-colon is unique to that message
-    // (the hints bar uses lowercase "layout"). Its appearance proves
-    // the remapped key fired the toggle. RED today: the deck ignores
-    // keybindings.toml, so Alt+Shift+l does nothing and this times out.
-    deck.wait_for_string("Layout:");
-
-    // The OLD default toggle key (Ctrl+t) must no longer toggle once the
-    // action has been rebound. Press it, then a known-default sentinel
-    // (`?` opens help) so we can prove both keys were processed in
-    // order; a second toggle would have produced "Layout: stacked".
-    deck.send_keys(b"\x14"); // Ctrl+t
+    // The OLD default (Ctrl+n) must no longer open the picker once the action
+    // has been rebound. Press it, then a known-default sentinel (`?` opens
+    // help) so we can prove both keys were processed in order.
+    deck.send_keys(b"\x0e"); // Ctrl+n
     deck.send_keys(b"?"); // help (default binding, unchanged)
     deck.wait_for_string("Create new agent");
     assert!(
-        !deck.snapshot_grid().contains("Layout: stacked"),
-        "old default Ctrl+t still toggled the layout after the action was \
-         rebound to Alt+Shift+l — client-side resolution should have \
+        !deck.snapshot_grid().contains("Select Directory"),
+        "old default Ctrl+n still opened the New Agent picker after the action \
+         was rebound to Alt+Shift+l — client-side resolution should have \
          replaced the default binding.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+}
+
+/// Scenario: Stage a `keybindings.toml` written before the layout toggle was
+/// removed, setting `toggle_layout` alongside a `help` remap, and launch the
+/// deck against the `minimal` fixture. It must start normally, print a
+/// warning naming `toggle_layout` and saying it was removed, and still apply
+/// the rest of the file: `F1` opens the help overlay. `Ctrl+t` then toggles
+/// nothing — no `Layout:` message appears.
+#[spec("keybindings/remap/005")]
+#[test]
+fn remap_005_removed_toggle_layout_starts_with_a_readable_warning() {
+    let deck = TuiDeck::builder()
+        .with_keybindings_toml(
+            "[global]\n\
+             toggle_layout = \"Alt+Shift+l\"\n\
+             [dashboard]\n\
+             help = \"F1\"\n",
+        )
+        .launch_with_fixture("minimal");
+
+    // The warning is printed before the TUI takes the screen, so it is in the
+    // raw output stream rather than the settled grid.
+    deck.wait_for_stream_string(
+        "[global] toggle_layout' — ignored: the stacked/tiled layout toggle was removed",
+    );
+    deck.wait_for_string("No active agents");
+
+    deck.send_keys(b"\x14"); // Ctrl+t
+    deck.send_keys(b"\x1bOP"); // F1 under TERM=xterm-256color
+    deck.wait_for_string("Create new agent");
+    assert!(
+        !deck.snapshot_grid().contains("Layout:"),
+        "Ctrl+t must not toggle a layout any more.\nGrid:\n{}",
         deck.snapshot_grid()
     );
 }
@@ -305,8 +331,10 @@ fn scheduler_001_lowercase_s_opens_manager() {
 
 /// Scenario: Launch the deck with a restored pane running `cat`, which opens
 /// focused, and type `tz` and Enter into it: `cat` echoes `tz` back and the
-/// layout does not change. Press `Ctrl+D` for command mode, then a plain `t`:
-/// the layout toggles and the bar says `Layout:`, as `Ctrl+t` would.
+/// deck does not zoom. Press `Ctrl+D` for command mode, then a plain `t`,
+/// which names nothing since the layout toggle was removed, and a plain `z`:
+/// the deck zooms and the bar says `Zoom: on`, as `Ctrl+z` would, with no
+/// `Layout:` message.
 #[spec("keybindings/letters/004")]
 #[test]
 fn letters_004_plain_letter_acts_in_command_mode_and_reaches_the_pane_program() {
@@ -318,8 +346,7 @@ fn letters_004_plain_letter_acts_in_command_mode_and_reaches_the_pane_program() 
     deck.wait_for_string("[Command Mode Ctrl+D]");
 
     // In the pane, `t` and `z` are the program's: the tty echoes the line as
-    // typed and `cat` prints it back, so it shows twice, and neither letter
-    // toggles the layout or zooms.
+    // typed and `cat` prints it back, so it shows twice, and `z` does not zoom.
     deck.send_bytes(b"tz\r");
     deck.wait_until_grid("cat echoed the typed letters", |g| {
         // A row of the pane is its text between the pane's `│` borders.
@@ -329,16 +356,23 @@ fn letters_004_plain_letter_acts_in_command_mode_and_reaches_the_pane_program() 
             >= 2
     });
     assert!(
-        !deck.snapshot_grid().contains("Layout:"),
-        "a `t` typed into the pane toggled the layout\n{}",
+        !deck.snapshot_grid().contains("Zoom:"),
+        "a `z` typed into the pane zoomed the deck\n{}",
         deck.snapshot_grid()
     );
 
-    // In command mode the same plain `t` is the layout toggle.
+    // In command mode the same plain `z` is the zoom toggle. PRD #312: `t`
+    // was the layout toggle's letter and now does nothing.
     deck.send_bytes(b"\x04"); // Ctrl+D → command mode
     deck.wait_for_string("[New Agent n/Ctrl+N]");
     deck.send_bytes(b"t");
-    deck.wait_for_string("Layout:");
+    deck.send_bytes(b"z");
+    deck.wait_for_string("Zoom: on");
+    assert!(
+        !deck.snapshot_grid().contains("Layout:"),
+        "a plain `t` in command mode must not toggle a layout\n{}",
+        deck.snapshot_grid()
+    );
 }
 
 /// Scenario: Launch the deck with a restored pane running `cat`, which opens
