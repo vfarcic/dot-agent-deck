@@ -6701,6 +6701,23 @@ async fn dispatch_one_owned(
         // was admitted, its room reserved and its body saved above, so no
         // refusal of its content can follow.
         registry.inbox().supersede_delegates_to(&pane_id);
+        // Issue #2110: wait for this start's slot, so a worker handed a task
+        // together with others starts a spacing after the previous one rather
+        // than in the same second. After the supersede above, so the tasks it
+        // retires end as superseded at once rather than lingering through the
+        // wait into an undelivered notice (`orchestration/delegate/025`). The
+        // `delegate` was answered before this task ran, so the wait holds back
+        // only this worker (and, through the pane's dispatch lock, a later
+        // delegate to the same pane).
+        let paced = registry.role_start_pacer().wait_for_slot().await;
+        if !paced.is_zero() {
+            tracing::info!(
+                role = %target_role,
+                pane_id = %pane_id,
+                waited_ms = u64::try_from(paced.as_millis()).unwrap_or(u64::MAX),
+                "delegate: spaced the worker's restart after another worker's start"
+            );
+        }
         #[cfg(test)]
         gate_pass(&CLEAR_RESPAWN_GATES, &pane_id).await;
         match registry
@@ -20291,6 +20308,99 @@ mod tests {
                 .any(|m| m.subject == "task refused"),
             "the orchestrator was told its task was refused"
         );
+        registry.shutdown_all();
+    }
+
+    /// Scenario (issue #2110): the orchestrator hands tasks to two
+    /// `clear = true` workers at the same moment. The second worker's restart
+    /// begins at least the configured spacing after the first's, rather than
+    /// in the same instant, and both tasks are still posted to their workers.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn role_start_pacing_005_two_clear_delegates_at_once_restart_a_spacing_apart() {
+        let spacing = crate::role_start_pacing::role_start_spacing();
+        if spacing.is_zero() {
+            eprintln!(
+                "SKIP: {} turns the spacing off in this environment",
+                crate::role_start_pacing::DOT_AGENT_DECK_ROLE_START_SPACING_MS
+            );
+            return;
+        }
+        let dir = clear_role_dir();
+        let cwd = dir.path().to_str().unwrap().to_string();
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let orch = stand_in_in(&registry, "p2110-orch", Some(&cwd));
+        let workers = ["p2110-w1", "p2110-w2"];
+        let mut reached = Vec::new();
+        let mut releases = Vec::new();
+        for worker in workers {
+            let _ = stand_in_in(&registry, worker, Some(&cwd));
+            let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+            let (go, go_rx) = tokio::sync::oneshot::channel();
+            CLEAR_RESPAWN_GATES
+                .lock()
+                .unwrap()
+                .push((worker.to_string(), reached_tx, go_rx));
+            reached.push(reached_rx);
+            releases.push(go);
+        }
+        let dispatches: Vec<_> = workers
+            .iter()
+            .map(|worker| {
+                tokio::spawn(dispatch_clear_task(
+                    registry.clone(),
+                    "p2110-orch".into(),
+                    orch.clone(),
+                    worker.to_string(),
+                    format!("the task for {worker}"),
+                    cwd.clone(),
+                ))
+            })
+            .collect();
+        // Each gate sits after the pacing wait, immediately before the
+        // restart, so the instant it is reached is when that restart begins.
+        // Either worker may take the first slot, so each gate is timed on its
+        // own task rather than awaited in order.
+        let timers: Vec<_> = reached
+            .into_iter()
+            .map(|rx| {
+                tokio::spawn(async move {
+                    rx.await.expect("the dispatch reaches the restart");
+                    std::time::Instant::now()
+                })
+            })
+            .collect();
+        let mut restarts = Vec::new();
+        for timer in timers {
+            let at = tokio::time::timeout(spacing * 4, timer)
+                .await
+                .expect("both restarts begin within a few spacings")
+                .unwrap();
+            restarts.push(at);
+        }
+        for go in releases {
+            go.send(()).unwrap();
+        }
+        let mut posted = Vec::new();
+        for dispatch in dispatches {
+            posted.push(dispatch.await.unwrap());
+        }
+
+        restarts.sort();
+        let gap = restarts[1] - restarts[0];
+        // The slot is reserved from one clock reading and slept for with
+        // tokio's timer, which may wake a millisecond early.
+        assert!(
+            gap + std::time::Duration::from_millis(20) >= spacing,
+            "the second restart began {gap:?} after the first; the spacing is {spacing:?}"
+        );
+        for (worker, id) in workers.iter().zip(&posted) {
+            assert_eq!(
+                listed_state(&registry, worker, id),
+                Some(crate::inbox::StateName::Queued),
+                "the task for {worker} is posted to its replacement"
+            );
+        }
         registry.shutdown_all();
     }
 
