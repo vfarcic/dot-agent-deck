@@ -122,68 +122,52 @@ fn codex_cli_listing(deck: &TuiDeck, pane: &Pane, work: &Path, ids: &[(String, S
     }
 }
 
-/// `key=value` from a deck log line in tracing's plain format.
-fn log_field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
-    line.split_whitespace()
-        .find_map(|token| token.strip_prefix(key)?.strip_prefix('='))
-}
+/// The line the deck logs for each batch a once-waiter is handed.
+const ONCE_BATCH: &str = "inbox: a batch went to a once-waiter";
 
-/// Whether the deck log written since the busy batch was posted shows the
-/// mid-turn hand-over of issue #2133: the first batch to a once-waiter
-/// carried exactly one message, and busy 0's own hand-over window, which runs
-/// from that batch line to the next once-waiter batch line (or the end of the
-/// log), holds exactly one exact-commit report, applying its one attempt.
-/// The commit line names no message, so the window is what ties the commit to
-/// busy 0: a commit after the next batch belongs to another hand-over. When
-/// busy 0 instead waits for the next Idle, the first batch carries it together
-/// with the rest, and this is false.
-fn handed_alone_mid_turn(log_since_busy: &str) -> bool {
-    const BATCH: &str = "inbox: a batch went to a once-waiter";
-    let mut lines = log_since_busy.lines();
-    let Some(batch) = lines.by_ref().find(|line| line.contains(BATCH)) else {
-        return false;
-    };
-    if log_field(batch, "count") != Some("1") {
-        return false;
-    }
-    let mut commits = lines
-        .take_while(|line| !line.contains(BATCH))
-        .filter(|line| line.contains("Received a prompt's exact commits"));
-    match (commits.next(), commits.next()) {
-        (Some(commit), None) => {
-            log_field(commit, "attempts") == Some("1") && log_field(commit, "applied") == Some("1")
+/// Issue #2133: whether the deck log written since the busy batch was posted
+/// shows a batch handed to a once-waiter before the busy turn's end (the
+/// Idle event `pane_id` reported). Claude Code takes such a wake into the
+/// running turn, where nothing confirms it and the model may end the turn
+/// without acting on it, so the deck holds the batch until the turn ends.
+fn handed_before_turn_end(log_since_busy: &str, pane_id: &str) -> bool {
+    let idle = format!("event_type=Idle pane_id=Some(\"{pane_id}\")");
+    for line in log_since_busy.lines() {
+        if line.contains(ONCE_BATCH) {
+            return true;
         }
-        _ => false,
+        if line.contains(&idle) {
+            return false;
+        }
     }
+    false
 }
 
-/// The one message `load_001` may leave unacted (issue #2133): Claude busy
-/// message 0, posted 0.2 s into the user's `sleep 30` turn, goes to the
-/// once-waiter still registered from the previous Idle and is surfaced
-/// mid-turn; the deck confirms it, but Haiku may end its turn without running
-/// its command (2 of 5 quiet runs). The deck's half of the contract still
-/// holds, so the excuse demands it: the message acknowledged by the plugin,
-/// the deck log showing that hand-over, and no sentinel at all (a sentinel
-/// that exists must be exact, as for every other message).
-struct MidTurnExcuse {
-    id: String,
-    log: PathBuf,
-    from: usize,
+/// Whether a deck log line is the wait of the waiter a `/clear`'s own
+/// SessionStart arms (its wait names the `clear` source).
+fn is_clear_wait(line: &str) -> bool {
+    line.contains("Received inbox wait") && line.contains("source=Some(\"clear\")")
 }
 
-impl MidTurnExcuse {
-    fn covers(&self, id: &str, message: &Value, sentinel: &Path) -> bool {
-        let log = std::fs::read(&self.log).unwrap_or_default();
-        let since = String::from_utf8_lossy(log.get(self.from..).unwrap_or_default());
-        id == self.id && excused_unacted(message, sentinel.exists(), &since)
-    }
+/// How many waits of a `/clear`'s waiter the deck log shows.
+fn clear_waits(log: &str) -> usize {
+    log.lines().filter(|line| is_clear_wait(line)).count()
 }
 
-fn excused_unacted(message: &Value, sentinel_exists: bool, log_since_busy: &str) -> bool {
-    message["state"] == "acknowledged"
-        && message["ack_how"] == "plugin_confirmed"
-        && !sentinel_exists
-        && handed_alone_mid_turn(log_since_busy)
+/// Whether the deck log shows a once-waiter registered after the clear wait
+/// numbered `before + 1`: the waiter the `/clear` typed after `before` such
+/// waits armed. The busy turn's Stop arms a waiter just before the clear, and
+/// a batch posted to that one races the clear (issue #2133).
+fn armed_after_clear_wait(log: &str, before: usize) -> bool {
+    let mut seen = 0;
+    log.lines().any(|line| {
+        if is_clear_wait(line) {
+            seen += 1;
+        }
+        seen > before
+            && line.contains("receipt receiver registered")
+            && line.contains("once_waiter")
+    })
 }
 
 fn delivered(
@@ -193,7 +177,6 @@ fn delivered(
     ids: &[(String, String, usize)],
     deadline: Instant,
     doorbell_only: bool,
-    excuse: Option<&MidTurnExcuse>,
 ) {
     let passed = common::wait_until(remaining(deadline), || {
         ids.iter().all(|(id, phase, n)| {
@@ -208,7 +191,7 @@ fn delivered(
             // its Stop hook hands messages over at a turn's end, so a message
             // left queued is a lost delivery, not an explained one. Accepting
             // `queued` here let a run with nothing acknowledged pass at once.
-            acknowledged && (acted || excuse.is_some_and(|e| e.covers(id, &m, &sentinel)))
+            acknowledged && acted
         })
     });
     assert!(
@@ -218,20 +201,6 @@ fn delivered(
         deck.snapshot_grid(),
         common::load_context::failure_report()
     );
-    if let Some(e) = excuse {
-        let sentinels = ids
-            .iter()
-            .filter(|(id, _, _)| *id == e.id)
-            .map(|(_, phase, n)| work.join(format!("inbox-load-{phase}-{n}-49ab.txt")));
-        for sentinel in sentinels {
-            if !sentinel.exists() {
-                eprintln!(
-                    "inbox load: message {} acknowledged mid-turn and not acted on by the model (#2133)",
-                    e.id
-                );
-            }
-        }
-    }
     if doorbell_only {
         codex_cli_listing(deck, pane, work, ids);
     }
@@ -380,7 +349,7 @@ fn seeds(deck: &TuiDeck, work: &Path, kind: &str, deadline: Instant, doorbell_on
             n,
         ));
     }
-    delivered(deck, &seeded, work, &ids, deadline, doorbell_only, None);
+    delivered(deck, &seeded, work, &ids, deadline, doorbell_only);
     idle(deck, &seeded, deadline);
     clean_composer(deck, &seeded, deadline);
 }
@@ -410,7 +379,7 @@ fn exercise(deck: &TuiDeck, pane: &Pane, work: &Path, kind: &str, doorbell_only:
         idle(deck, pane, deadline);
     }
     let idle_ids = batch(deck, pane, work, "idle", 5);
-    delivered(deck, pane, work, &idle_ids, deadline, doorbell_only, None);
+    delivered(deck, pane, work, &idle_ids, deadline, doorbell_only);
     idle(deck, pane, deadline);
     let started = work.join("inbox-load-busy-start-49ab.txt");
     let ended = work.join("inbox-load-busy-end-49ab.txt");
@@ -479,45 +448,38 @@ fn exercise(deck: &TuiDeck, pane: &Pane, work: &Path, kind: &str, doorbell_only:
         !ended.exists(),
         "busy messages must be sent while sleep is still running"
     );
-    // Issue #2133: for Claude only, busy 0 may be confirmed mid-turn and
-    // left unacted by the model; see `MidTurnExcuse`. Busy 1-9 are not.
-    let excuse = (kind == "claude_code").then(|| MidTurnExcuse {
-        id: busy_ids[0].0.clone(),
-        log: deck_log,
-        from: log_before_busy,
-    });
-    delivered(
-        deck,
-        pane,
-        work,
-        &busy_ids,
-        deadline,
-        doorbell_only,
-        excuse.as_ref(),
-    );
+    delivered(deck, pane, work, &busy_ids, deadline, doorbell_only);
+    if kind == "claude_code" {
+        let log = std::fs::read(&deck_log).unwrap_or_default();
+        let since = String::from_utf8_lossy(log.get(log_before_busy..).unwrap_or_default());
+        assert!(
+            !handed_before_turn_end(&since, &pane.id),
+            "issue #2133: a message posted during the user's turn must wait for the turn's end, not go to the once-waiter armed at the Idle before it:\n{since}"
+        );
+    }
     idle(deck, pane, deadline);
     if kind == "claude_code" {
         // A clear's SessionStart arms a waiter that takes the place of the
         // one before it, so the armed count stays at one (inbox/claude/013):
-        // count registrations in the deck's log rather than the live count.
-        let registered = || {
-            std::fs::read_to_string(deck.workdir().join("deck.log"))
-                .unwrap_or_default()
-                .lines()
-                .filter(|line| {
-                    line.contains("receipt receiver registered") && line.contains("once_waiter")
-                })
-                .count()
-        };
-        let before_clear = registered();
+        // read the deck's log rather than the live count. Only the waiter the
+        // clear's own SessionStart arms counts (its wait names the `clear`
+        // source): the busy turn's Stop arms one too, just before, and a
+        // batch posted to that one races the clear (issue #2133).
+        let log = || std::fs::read_to_string(deck.workdir().join("deck.log")).unwrap_or_default();
+        let before_clear = clear_waits(&log());
         input.write("/clear\r");
         assert!(
-            common::wait_until(remaining(deadline), || registered() > before_clear
-                && inbox::listing(deck, pane)["armed"].as_u64().unwrap_or(0) > 0),
+            common::wait_until(remaining(deadline), || armed_after_clear_wait(
+                &log(),
+                before_clear
+            ) && inbox::listing(deck, pane)["armed"]
+                .as_u64()
+                .unwrap_or(0)
+                > 0),
             "clear must arm another native waiter"
         );
         let clear_ids = batch(deck, pane, work, "clear", 5);
-        delivered(deck, pane, work, &clear_ids, deadline, false, None);
+        delivered(deck, pane, work, &clear_ids, deadline, false);
         idle(deck, pane, deadline);
     }
     clean_composer(deck, pane, deadline);
@@ -602,7 +564,7 @@ fn codex_fixture() -> (TuiDeck, Pane) {
     (deck, pane)
 }
 
-/// Scenario: Under three busy-loop processes per CPU, run real interactive Claude Haiku through spawn seed, idle, a sleep-tool turn and /clear, asking it to execute each message's command before replying with its output. Every one of at least 25 messages must be acknowledged and create its sentinel before the agent deadline, with no deck text stranded in the composer. One exception (issue #2133, model variance): the first busy message may be left unacted only when it is acknowledged by the plugin, has no sentinel, and the deck log shows it handed alone to a once-waiter during the user's turn, because Haiku sometimes ends that turn without acting on it.
+/// Scenario: Under three busy-loop processes per CPU, run real interactive Claude Haiku through spawn seed, idle, a sleep-tool turn and /clear, asking it to execute each message's command before replying with its output. Every one of at least 25 messages must be acknowledged and create its sentinel before the agent deadline, with no deck text stranded in the composer, and the deck log must show that nothing posted during the user's sleep turn went to Claude's waiter before that turn ended (issue #2133).
 #[spec("inbox/load/001")]
 #[test]
 fn load_001_claude_acknowledges_seed_idle_busy_and_clear_under_cpu_pressure() {
@@ -646,102 +608,54 @@ fn load_004_codex_never_loses_seed_idle_or_busy_messages_under_cpu_pressure() {
     exercise(&deck, &pane, deck.workdir(), "codex", true);
 }
 
-/// Pure checks of `MidTurnExcuse`'s decision (issue #2133): the exact shape
-/// passes, and each way a lost or different delivery could look fails.
-const HANDED_ALONE: &str = "\
-2026-11-06T10:00:00.1Z  INFO dot_agent_deck::inbox_hub: inbox: a batch went to a once-waiter conn_id=7 count=1
-2026-11-06T10:00:00.2Z  INFO dot_agent_deck::daemon: Received a prompt's exact commits pane_id=1 attempts=1 applied=1 degraded=false
-2026-11-06T10:00:31.0Z  INFO dot_agent_deck::inbox_hub: inbox: a batch went to a once-waiter conn_id=8 count=9
+/// Pure checks of `handed_before_turn_end` (issue #2133).
+#[test]
+fn a_batch_after_the_busy_turns_idle_is_not_mid_turn() {
+    let held = "\
+2026-11-19T21:49:24.7Z  INFO dot_agent_deck::inbox_hub: inbox: message posted message_id=m-1 pane_id=1
+2026-11-19T21:49:57.0Z  INFO dot_agent_deck::daemon: Received event session_id=s event_type=Idle pane_id=Some(\"1\") agent_type=ClaudeCode tool_name=None tool_detail=None
+2026-11-19T21:49:57.1Z  INFO dot_agent_deck::inbox_hub: inbox: a batch went to a once-waiter conn_id=7 count=10
 ";
-
-fn confirmed() -> Value {
-    json!({"id":"m-busy-0", "state":"acknowledged", "ack_how":"plugin_confirmed"})
+    assert!(!handed_before_turn_end(held, "1"));
 }
 
 #[test]
-fn mid_turn_excuse_accepts_the_logged_hand_over_with_no_sentinel() {
-    assert!(excused_unacted(&confirmed(), false, HANDED_ALONE));
+fn a_batch_before_the_busy_turns_idle_is_mid_turn() {
+    let mid_turn = "\
+2026-11-19T21:49:24.7Z  INFO dot_agent_deck::inbox_hub: inbox: a batch went to a once-waiter conn_id=5 count=1
+2026-11-19T21:49:57.0Z  INFO dot_agent_deck::daemon: Received event session_id=s event_type=Idle pane_id=Some(\"1\") agent_type=ClaudeCode tool_name=None tool_detail=None
+2026-11-19T21:49:57.1Z  INFO dot_agent_deck::inbox_hub: inbox: a batch went to a once-waiter conn_id=7 count=9
+";
+    assert!(handed_before_turn_end(mid_turn, "1"));
+    // Another pane's Idle does not end this pane's turn.
+    let other_pane = "\
+2026-11-19T21:49:24.7Z  INFO dot_agent_deck::daemon: Received event session_id=s event_type=Idle pane_id=Some(\"load-seed\") agent_type=ClaudeCode tool_name=None tool_detail=None
+2026-11-19T21:49:25.0Z  INFO dot_agent_deck::inbox_hub: inbox: a batch went to a once-waiter conn_id=5 count=1
+";
+    assert!(handed_before_turn_end(other_pane, "1"));
 }
 
+/// Pure checks of the `/clear` gate (issue #2133): the busy turn's Stop
+/// waiter does not count, the clear's own does once it is registered.
 #[test]
-fn mid_turn_excuse_refuses_a_message_that_is_not_acknowledged() {
-    for state in ["queued", "delivered", "undeliverable"] {
-        let m = json!({"id":"m-busy-0", "state":state, "ack_how":"plugin_confirmed"});
-        assert!(!excused_unacted(&m, false, HANDED_ALONE), "{state}");
-    }
-    let unconfirmed = json!({"id":"m-busy-0", "state":"acknowledged", "ack_how":"prompt_observed"});
-    assert!(!excused_unacted(&unconfirmed, false, HANDED_ALONE));
-}
-
-#[test]
-fn mid_turn_excuse_refuses_a_delivery_the_log_does_not_show() {
-    // No once-waiter batch at all: a lost delivery.
-    assert!(!excused_unacted(&confirmed(), false, ""));
-    // Busy 0 waited for the next Idle with the rest: no excuse is owed.
-    let together = "inbox: a batch went to a once-waiter conn_id=8 count=10\n\
-Received a prompt's exact commits pane_id=1 attempts=10 applied=10 degraded=false\n";
-    assert!(!excused_unacted(&confirmed(), false, together));
-    // Handed alone, but the deck never applied its commit.
-    let unapplied = "inbox: a batch went to a once-waiter conn_id=7 count=1\n\
-Received a prompt's exact commits pane_id=1 attempts=1 applied=0 degraded=false\n";
-    assert!(!excused_unacted(&confirmed(), false, unapplied));
-    // A commit logged before the hand-over does not count for it.
-    let commit_first = "Received a prompt's exact commits pane_id=1 attempts=1 applied=1 degraded=false\n\
-inbox: a batch went to a once-waiter conn_id=7 count=1\n";
-    assert!(!excused_unacted(&confirmed(), false, commit_first));
-}
-
-#[test]
-fn mid_turn_excuse_counts_only_a_commit_inside_busy_0s_own_hand_over() {
-    // Busy 0 handed alone, its commit never reported; the only applied
-    // single-attempt commit belongs to the NEXT once-waiter batch.
-    let unrelated = "inbox: a batch went to a once-waiter conn_id=7 count=1\n\
-inbox: a batch went to a once-waiter conn_id=8 count=1\n\
-Received a prompt's exact commits pane_id=1 attempts=1 applied=1 degraded=false\n";
-    assert!(!excused_unacted(&confirmed(), false, unrelated));
-    // The same with busy 0's own commit unapplied inside its window.
-    let own_unapplied = "inbox: a batch went to a once-waiter conn_id=7 count=1\n\
-Received a prompt's exact commits pane_id=1 attempts=1 applied=0 degraded=false\n\
-inbox: a batch went to a once-waiter conn_id=8 count=1\n\
-Received a prompt's exact commits pane_id=1 attempts=1 applied=1 degraded=false\n";
-    assert!(!excused_unacted(&confirmed(), false, own_unapplied));
-    // Two commits inside the window: not the one-message shape claimed.
-    let two = "inbox: a batch went to a once-waiter conn_id=7 count=1\n\
-Received a prompt's exact commits pane_id=1 attempts=1 applied=1 degraded=false\n\
-Received a prompt's exact commits pane_id=1 attempts=1 applied=1 degraded=false\n";
-    assert!(!excused_unacted(&confirmed(), false, two));
-    // The commit inside the window excuses, whatever follows the next batch,
-    // and with no next batch the window runs to the end of the log.
-    let inside = "inbox: a batch went to a once-waiter conn_id=7 count=1\n\
-Received a prompt's exact commits pane_id=1 attempts=1 applied=1 degraded=false\n\
-inbox: a batch went to a once-waiter conn_id=8 count=9\n\
-Received a prompt's exact commits pane_id=1 attempts=9 applied=9 degraded=false\n";
-    assert!(excused_unacted(&confirmed(), false, inside));
-    let to_the_end = "inbox: a batch went to a once-waiter conn_id=7 count=1\n\
-Received a prompt's exact commits pane_id=1 attempts=1 applied=1 degraded=false\n";
-    assert!(excused_unacted(&confirmed(), false, to_the_end));
-}
-
-#[test]
-fn mid_turn_excuse_refuses_a_sentinel_that_exists() {
-    // A present sentinel is judged as acted or not by its exact content.
-    assert!(!excused_unacted(&confirmed(), true, HANDED_ALONE));
-}
-
-#[test]
-fn mid_turn_excuse_covers_only_its_own_message() {
-    let dir = common::harness_tempdir().unwrap();
-    let log = dir.path().join("deck.log");
-    let before = "inbox: a batch went to a once-waiter conn_id=1 count=1\n";
-    std::fs::write(&log, format!("{before}{HANDED_ALONE}")).unwrap();
-    let excuse = MidTurnExcuse {
-        id: "m-busy-0".into(),
-        log,
-        from: before.len(),
-    };
-    let absent = dir.path().join("inbox-load-busy-0-49ab.txt");
-    assert!(excuse.covers("m-busy-0", &confirmed(), &absent));
-    assert!(!excuse.covers("m-busy-1", &confirmed(), &absent));
-    std::fs::write(&absent, "wrong").unwrap();
-    assert!(!excuse.covers("m-busy-0", &confirmed(), &absent));
+fn only_the_clears_own_waiter_opens_the_clear_phase() {
+    let stop = "\
+2026-11-19T22:56:55.0105Z  INFO dot_agent_deck::daemon: Received inbox wait pane_id=1 mode=Once component=ClaudeWaiter source=None pid=Some(1)
+2026-11-19T22:56:55.0107Z  INFO dot_agent_deck::inbox_hub::engine: inbox: receipt receiver registered pane_id=1 rx=5 slot=\"once_waiter\" resume=0 correctable=0
+";
+    assert_eq!(clear_waits(stop), 0);
+    assert!(!armed_after_clear_wait(stop, 0));
+    let waiting = format!(
+        "{stop}2026-11-19T22:56:55.6464Z  INFO dot_agent_deck::daemon: Received inbox wait pane_id=1 mode=Once component=ClaudeWaiter source=Some(\"clear\") pid=Some(2)\n"
+    );
+    assert!(!armed_after_clear_wait(&waiting, 0), "not registered yet");
+    let armed = format!(
+        "{waiting}2026-11-19T22:56:55.6466Z  INFO dot_agent_deck::inbox_hub::engine: inbox: receipt receiver registered pane_id=1 rx=6 slot=\"once_waiter\" resume=0 correctable=0\n"
+    );
+    assert!(armed_after_clear_wait(&armed, 0));
+    assert_eq!(clear_waits(&armed), 1);
+    assert!(
+        !armed_after_clear_wait(&armed, 1),
+        "a later clear needs its own"
+    );
 }

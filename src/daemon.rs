@@ -6810,6 +6810,11 @@ async fn run_hook_loop_with_limits(
                                         doorbell_only: req.doorbell_only,
                                         resumed: req.resumed,
                                         hook_integration: req.hook_integration,
+                                        compaction: req
+                                            .session
+                                            .as_ref()
+                                            .and_then(|s| s.source.as_deref())
+                                            == Some("compact"),
                                     };
                                     crate::inbox_hub::serve_waiter(
                                         hub,
