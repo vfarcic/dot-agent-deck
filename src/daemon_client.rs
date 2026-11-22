@@ -4257,7 +4257,8 @@ impl DaemonClient {
     async fn follow_on_connection(
         &self,
         capability: &str,
-    ) -> Result<Option<(TransportReadHalf, TransportWriteHalf, DaemonCapabilities)>, ClientError> {
+    ) -> Result<Option<(TransportReadHalf, TransportWriteHalf, DaemonCapabilities)>, ClientError>
+    {
         let supported = |caps: &DaemonCapabilities| {
             caps.supports(capability) && caps.supports(crate::daemon_protocol::CAP_HELLO_FOLLOW_ON)
         };
