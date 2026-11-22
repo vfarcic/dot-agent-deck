@@ -111,6 +111,8 @@ import { DEFAULT_VOICE_SETTINGS, isWorkUnderWay, modeScopedKey } from "./lib/bri
 import { READING_LABEL_MAX_CHARS, type ReadingAgent } from "./lib/reading";
 import { agentSpokenName } from "./lib/agentNames";
 import { questionAgentName } from "./lib/voiceQuestion";
+import { PANE_COVERED, PANE_TERMINAL_HIDDEN, scrollAgentPane } from "./lib/paneScroll";
+import { getTerminal } from "./lib/terminalRegistry";
 import { planStoredRoleOrder, reconcileRoleOrder } from "./lib/roleOrder";
 
 const ORCHESTRATION_STORAGE_KEY = modeScopedKey("dot-agent-deck.desktop.orchestration-preview.v1");
@@ -1364,13 +1366,28 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
          PRD #1401 — while the pull request browser is open it is what is in
          front, so the four scrolls move its PAGE instead, from outside it (a
          fixed script per direction, and nothing read back), unless one of the
-         app's own dialogs is over the browser. */
+         app's own dialogs is over the browser.
+
+         Issue #1673 — with an agent's pane open and no pull request over it,
+         the pane is what is in front, so the four scrolls move the pane
+         (`scrollAgentPane`: the PageUp / PageDown the agent scrolls itself by,
+         or the terminal's own history), never the dashboard behind it. */
       ...(prBrowser
         ? { scrollDashboard: (move: DashboardScroll) => {
           if (pullRequestBrowserCovered()) return PULL_REQUEST_COVERED;
           void onPrBrowserPage(prBrowser.opened, prBrowserHost.scroll(move));
           return undefined;
         } }
+        : agentView
+          ? { scrollDashboard: (move: DashboardScroll) => {
+            /* The pane is itself an `aria-modal` overlay, so `modalOpen()` is
+               always true here; what matters is whether anything is drawn
+               OVER it — a raised sheet, a dialog, a confirmation, the Daemon
+               menu. Settings beneath the pane leaves the pane in front. */
+            if (dialogLayerUp() || confirmationOpen || overlayAbove(document.querySelector(".agent-pane-overlay"))) return PANE_COVERED;
+            if (!voicePane || voicePane.terminalHidden) return PANE_TERMINAL_HIDDEN;
+            return scrollAgentPane(getTerminal(voicePane.deckId, voicePane.agentId, voicePane.incarnation), move, voicePane.inputBlocked);
+          } }
         : overviewVoiceContext.current?.scrollDashboard
           ? { scrollDashboard: (move: DashboardScroll) => (dialogLayerUp() || confirmationOpen || overlaysOpen.settings || modalOpen() ? DASHBOARD_COVERED : overviewVoiceContext.current?.scrollDashboard?.(move)) }
           : {}),
@@ -1419,7 +1436,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     if (!dispatchVoiceAction(outcome.invoke, context, target)) return undefined;
     // voice-registry-exempt: the Undo beside a voice report, restoring exactly the view that dispatch replaced
     return moved ? { undo: () => setView(previous) } : {};
-  }, [agentView, base, closeAgent, confirmationOpen, confirmPaneStop, dialogLayerUp, features.showDeck, onPrBrowserPage, overlaysOpen.settings, paneAgent, prBrowser, prBrowserHost, pullRequestContext, railContext, readPager, screen, selectedDeckId, setOverlay, view]);
+  }, [agentView, base, closeAgent, confirmationOpen, confirmPaneStop, dialogLayerUp, features.showDeck, onPrBrowserPage, overlaysOpen.settings, paneAgent, prBrowser, prBrowserHost, pullRequestContext, railContext, readPager, screen, selectedDeckId, setOverlay, view, voicePane]);
   /** PRD #1223 — what the directory browser shows, read at declaration time. */
   const readDirectories = useCallback(() => newAgentVoice.current?.directories, []);
   /** PRD #1223 — what the New agent dialog shows besides its browser, while it is open. */

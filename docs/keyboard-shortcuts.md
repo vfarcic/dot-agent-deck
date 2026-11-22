@@ -1,6 +1,6 @@
 # Keyboard Shortcuts
 
-Everything on this page is the TUI's, except [Editing an agent's prompt](#editing-an-agents-prompt), which works the same in both clients. The desktop app has its own shortcuts, listed on [Desktop app → Settings](desktop/settings.md#keyboard-shortcuts); `keybindings.toml` does not affect it.
+Everything on this page is the TUI's, except [Editing an agent's prompt](#editing-an-agents-prompt), which works the same in both clients, and [Scrolling back through a pane](#scrolling-back-through-a-pane), which also says how the desktop app scrolls a pane. The desktop app has its own shortcuts, listed on [Desktop app → Settings](desktop/settings.md#keyboard-shortcuts); `keybindings.toml` does not affect it.
 
 Press `?` in command mode to see the shortcuts in the TUI. The overlay and the bottom button bar are generated from your active [keybindings](#customizing-keybindings), so they show your real keys.
 
@@ -140,11 +140,14 @@ Command mode. If you are typing in a pane, press `Ctrl+D` first.
 
 What there is to scroll depends on what the program in the pane writes:
 
-- **Agents that keep their own transcript and handle the mouse**, such as `claude`: while you are typing in the pane, the wheel and scroll keys go to the agent and it scrolls its own history.
-- **Agents that redraw their whole screen in place**, such as `codex`: nothing scrolls off the top, so the deck has no history to show. A scroll in command mode briefly shows `Nothing to scroll — this pane has no scrollback to move through` (`Nothing to scroll — no scrollback` in a narrow pane). It clears after a moment or on your next key, and that key still does what it normally does.
+- **Agents that keep their own transcript and handle the mouse**: Claude Code with its full-screen interface (`"tui": "fullscreen"`), Codex, OpenCode and Pi. While you are typing in the pane, the wheel and scroll keys go to the agent and it scrolls its own history, also while it is working. In command mode the deck has no copy of that history to scroll.
+- **Agents that write their output into the terminal**, such as Claude Code with its default interface: the deck keeps the history, and the wheel and `PageUp` / `PageDown` in command mode scroll it.
+- **Agents that redraw their whole screen in place without keeping a transcript**: nothing scrolls off the top, so the deck has no history to show. A scroll in command mode briefly shows `Nothing to scroll — this pane has no scrollback to move through` (`Nothing to scroll — no scrollback` in a narrow pane). It clears after a moment or on your next key, and that key still does what it normally does.
 - **A full-screen program or dialog in the pane** (a picker, a permission dialog, an editor): scrolling does nothing, with no message, until it closes; the history is still there afterwards.
 
 A pane the deck starts is empty at first, so there is nothing above the agent's first output to scroll back to.
+
+In the desktop app an agent's pane scrolls the same way: `PageUp` / `PageDown` in the pane go to the agent; the wheel goes to the agent when it handles the mouse, and otherwise scrolls the pane's history, as `Shift+PageUp` / `Shift+PageDown` do. The desktop app also scrolls a pane by voice; see [Scrolling an agent's pane](desktop/voice.md#scrolling-an-agents-pane).
 
 ## Copying text
 

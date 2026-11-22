@@ -980,10 +980,11 @@ mod tests {
                 ("next_page".to_string(), false),
                 ("previous_page".to_string(), false),
                 // Scrolling the dashboard: `overview` with the New agent dialog closed (issue #1492).
-                ("scroll_down".to_string(), false),
-                ("scroll_up".to_string(), false),
-                ("scroll_to_top".to_string(), false),
-                ("scroll_to_bottom".to_string(), false),
+                // Issue #1673: the four scrolls move the open pane.
+                ("scroll_down".to_string(), true),
+                ("scroll_up".to_string(), true),
+                ("scroll_to_top".to_string(), true),
+                ("scroll_to_bottom".to_string(), true),
                 // PRD #1401: `open_pr` is the dashboard's and the agent screen's, the hand-off the browser's own.
                 ("open_pr".to_string(), true),
                 ("open_pr_in_browser".to_string(), false),

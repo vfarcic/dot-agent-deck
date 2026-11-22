@@ -5,6 +5,8 @@ import { PrBrowserHostContext, type PrBrowserHost } from "./lib/prBrowser";
 import { PullRequestBadge } from "./components/PullRequestBadge";
 import { pullRequestFromDto, pullRequestLabel } from "./lib/pullRequest";
 import type { DeckActionResult, DeckRuntimeState } from "./types";
+import type { Terminal } from "@xterm/xterm";
+import { registerTerminal, unregisterTerminal } from "./lib/terminalRegistry";
 
 vi.mock("./components/TerminalViewport", () => ({
   TerminalViewport: ({ agentId }: { agentId: string }) => <pre data-testid={`terminal-${agentId}`}>terminal</pre>,
@@ -1294,5 +1296,133 @@ describe("PRD #1401 — when a sheet is raised", () => {
     expect.soft(screen.queryByTestId("pr-browser")).not.toBeInTheDocument();
     expect.soft(screen.getByTestId("settings-panel").parentElement, "nothing is beneath it any more").not.toHaveClass("is-raised");
     expect(screen.getByRole("button", { name: "Dashboard" }).closest("[inert]"), "and it fences nothing").toBeNull();
+  });
+});
+
+describe("issue #1673 — the four scrolls over an agent's pane", () => {
+  function fakeTerminal(type: "normal" | "alternate", baseY = 0, viewportY = baseY) {
+    return {
+      buffer: { active: { type, baseY, viewportY } },
+      input: vi.fn(),
+      scrollPages: vi.fn(),
+      scrollToTop: vi.fn(),
+      scrollToBottom: vi.fn(),
+    };
+  }
+
+  function renderPane(terminal: ReturnType<typeof fakeTerminal>, outcome: VoiceResultDto["outcome"], overrides: Partial<DeckRuntimeState> = {}, initialView: Parameters<typeof DeckShell>[0]["initialView"] = agentView) {
+    registerTerminal(DECK, "7", terminal as unknown as Terminal, undefined);
+    const { host } = fakeHost();
+    const voice = voiceRuntime(outcome);
+    render(
+      <PrBrowserHostContext.Provider value={host}>
+        <DeckShell runtime={runtime([withPr], { ...voice.overrides, ...overrides })} initialView={initialView} />
+      </PrBrowserHostContext.Provider>,
+    );
+    return { host, voice, unregister: () => unregisterTerminal(DECK, "7", terminal as unknown as Terminal, undefined) };
+  }
+
+  /**
+   * Scenario: Coder 7's pane is open and its agent is on the alternate screen,
+   * as Claude Code, Codex, OpenCode and Pi are. "scroll up" and "scroll down"
+   * send the pane PageUp and PageDown, the keys the agent scrolls itself by,
+   * and the voice surface declares the agent screen.
+   */
+  it.each([
+    ["scroll_up", "scrollUp", "scroll up", "\x1b[5~"],
+    ["scroll_down", "scrollDown", "scroll down", "\x1b[6~"],
+  ] as const)("sends the scroll key for %s over a pane on the alternate screen", async (action, invoke, said, key) => {
+    const terminal = fakeTerminal("alternate");
+    const { host, voice, unregister } = renderPane(terminal, dispatchOutcome(action, invoke, said, "Scrolling."));
+    try {
+      fireEvent.click(screen.getByTestId("voice-trigger"));
+      await waitFor(() => expect(terminal.input).toHaveBeenCalledWith(key, true));
+      expect(voice.declareVoiceScreen.mock.calls.some(([declared]) => declared === "agent")).toBe(true);
+      expect(host.scroll, "no pull request is open, so nothing reaches the page").not.toHaveBeenCalled();
+    } finally {
+      unregister();
+    }
+  });
+
+  /** Scenario: the same over Coder 7's pane opened from the deck screen: "scroll up" sends it PageUp. */
+  it("sends PageUp over a pane opened from the deck screen", async () => {
+    const terminal = fakeTerminal("alternate");
+    const { unregister } = renderPane(terminal, dispatchOutcome("scroll_up", "scrollUp", "scroll up", "Scrolling up."), { desktopFeatures: fixtureDesktopFeatures("?experimental=1") }, { kind: "agent", deckId: DECK, agentId: "7", from: "deck" });
+    try {
+      fireEvent.click(screen.getByTestId("voice-trigger"));
+      await waitFor(() => expect(terminal.input).toHaveBeenCalledWith("\x1b[5~", true));
+    } finally {
+      unregister();
+    }
+  });
+
+  /** Scenario: "scroll to the top" over a pane on the alternate screen sends nothing and says to scroll a screen at a time. */
+  it("answers scroll to the top over a pane on the alternate screen without sending a key", async () => {
+    const terminal = fakeTerminal("alternate");
+    const { unregister } = renderPane(terminal, dispatchOutcome("scroll_to_top", "scrollToTop", "scroll to the top", "Scrolled to the top."));
+    try {
+      fireEvent.click(screen.getByTestId("voice-trigger"));
+      await waitFor(() => expect(screen.queryAllByText(/scrolls a screen at a time/).length).toBeGreaterThan(0));
+      expect(terminal.input).not.toHaveBeenCalled();
+    } finally {
+      unregister();
+    }
+  });
+
+  /** Scenario: a pane on the main screen with no history answers the TUI's notice. */
+  it("answers the TUI's notice over a pane with nothing to scroll", async () => {
+    const terminal = fakeTerminal("normal");
+    const { unregister } = renderPane(terminal, dispatchOutcome("scroll_up", "scrollUp", "scroll up", "Scrolling up."));
+    try {
+      fireEvent.click(screen.getByTestId("voice-trigger"));
+      await waitFor(() => expect(screen.queryAllByText(/Nothing to scroll — this pane has no scrollback to move through/).length).toBeGreaterThan(0));
+      expect(terminal.input).not.toHaveBeenCalled();
+      expect(terminal.scrollPages).not.toHaveBeenCalled();
+    } finally {
+      unregister();
+    }
+  });
+
+  /** Scenario: a pane on the main screen with history above scrolls that history; no key reaches the agent. */
+  it("scrolls the terminal's own history over a pane on the main screen", async () => {
+    const terminal = fakeTerminal("normal", 200, 200);
+    const { unregister } = renderPane(terminal, dispatchOutcome("scroll_up", "scrollUp", "scroll up", "Scrolling up."));
+    try {
+      fireEvent.click(screen.getByTestId("voice-trigger"));
+      await waitFor(() => expect(terminal.scrollPages).toHaveBeenCalledWith(-1));
+      expect(terminal.input).not.toHaveBeenCalled();
+    } finally {
+      unregister();
+    }
+  });
+
+  /** Scenario: on the deck screen with the command menu shown (it is behind the experimental flag), Settings opened over Coder 7's pane from it is in front, so "scroll up" sends the pane nothing and says to close what is over it. */
+  it("sends nothing while Settings is open over the pane", async () => {
+    const terminal = fakeTerminal("alternate");
+    const { unregister } = renderPane(terminal, dispatchOutcome("scroll_up", "scrollUp", "scroll up", "Scrolling up."), { desktopFeatures: fixtureDesktopFeatures("?experimental=1") }, { kind: "agent", deckId: DECK, agentId: "7", from: "deck" });
+    try {
+      fireEvent.keyDown(document.body, { key: "k", ctrlKey: true });
+      fireEvent.click(await screen.findByRole("button", { name: /Open settings/ }));
+      await act(async () => { await Promise.resolve(); });
+      fireEvent.click(screen.getByTestId("voice-trigger"));
+      await waitFor(() => expect(screen.queryAllByText(/open over the agent's pane, so it was not scrolled/).length).toBeGreaterThan(0));
+      expect(terminal.input).not.toHaveBeenCalled();
+    } finally {
+      unregister();
+    }
+  });
+
+  /** Scenario: with the pane's pull request open over it, "scroll down" scrolls the page, which is in front, and sends the pane nothing. */
+  it("scrolls a pull request open over the pane, not the pane", async () => {
+    const terminal = fakeTerminal("alternate");
+    const { host, unregister } = renderPane(terminal, dispatchOutcome("scroll_down", "scrollDown", "scroll down", "Scrolling."));
+    try {
+      fireEvent.click(screen.getByTestId("pr-badge-7"));
+      fireEvent.click(screen.getByTestId("voice-trigger"));
+      await waitFor(() => expect(host.scroll).toHaveBeenCalledWith("down"));
+      expect(terminal.input).not.toHaveBeenCalled();
+    } finally {
+      unregister();
+    }
   });
 });
