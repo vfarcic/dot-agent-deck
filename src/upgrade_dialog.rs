@@ -253,17 +253,33 @@ pub async fn run(plan: UpgradePlan, this_tui: bool) -> RunResult {
     let handle = tokio::runtime::Handle::current();
     let result = tokio::task::spawn_blocking(move || {
         let host = SystemHost::default();
+        let (source, staging_root) = (
+            ReleaseSource::from_build(),
+            PlanOptions::default_staging_root(),
+        );
         let outcome = handle.block_on(crate::self_upgrade::execute::execute(
             &host,
             &plan,
-            &ReleaseSource::from_build(),
-            &PlanOptions::default_staging_root(),
+            &source,
+            &staging_root,
         ));
         match outcome {
             Ok(outcome) => {
+                // Issue #2064: a release collector beside the CLI moves with it.
+                let mut after = handle
+                    .block_on(crate::self_upgrade::collector::after_upgrade(
+                        &host,
+                        &plan,
+                        &outcome,
+                        &source,
+                        &staging_root,
+                    ))
+                    .lines;
                 // R-3: a CLI the upgrade installed refreshes the agents' hooks.
-                let hooks = crate::self_upgrade::agent_hooks::after_upgrade(&host, &plan, &outcome);
-                RunResult::from_outcome_and_hooks(&plan, &outcome, hooks, this_tui)
+                after.extend(crate::self_upgrade::agent_hooks::after_upgrade(
+                    &host, &plan, &outcome,
+                ));
+                RunResult::from_outcome_and_hooks(&plan, &outcome, after, this_tui)
             }
             Err(error) => RunResult::from_error(&error),
         }
