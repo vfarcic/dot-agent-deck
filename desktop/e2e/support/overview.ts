@@ -244,3 +244,11 @@ export async function rects(locator: Locator): Promise<DOMRect[]> {
  * horizontal offset, which is the failure this tier exists to catch.
  */
 export const ALIGNMENT_TOLERANCE_PX = 0.5;
+
+/**
+ * Where to click a Dashboard row to open its agent (issue #2454): a point in
+ * the row's own left padding, so the click lands on the row and never on one
+ * of its controls. A plain `click()` aims at the row's centre, which in a wide
+ * name cell can be its Close button.
+ */
+export const ROW_EDGE = { x: 4, y: 4 } as const;

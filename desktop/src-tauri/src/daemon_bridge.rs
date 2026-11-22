@@ -1538,12 +1538,23 @@ pub(crate) async fn bounded_reply<T, E: std::fmt::Display>(
     what: &str,
     reply: impl std::future::Future<Output = Result<T, E>>,
 ) -> Result<T, String> {
-    match tokio::time::timeout(DECK_REPLY_TIMEOUT, reply).await {
+    bounded_reply_within(what, DECK_REPLY_TIMEOUT, reply).await
+}
+
+/// [`bounded_reply`] at `timeout`, for a verb the daemon itself bounds at
+/// longer than [`DECK_REPLY_TIMEOUT`] (PRD #1790 stage 2: a list with its Git
+/// facts, a reclaim's checks and removal).
+pub(crate) async fn bounded_reply_within<T, E: std::fmt::Display>(
+    what: &str,
+    timeout: Duration,
+    reply: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, String> {
+    match tokio::time::timeout(timeout, reply).await {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(error)) => Err(safe_message(error.to_string())),
         Err(_) => Err(safe_message(format!(
             "the daemon took the connection but did not answer {what} within {}s",
-            DECK_REPLY_TIMEOUT.as_secs()
+            timeout.as_secs()
         ))),
     }
 }

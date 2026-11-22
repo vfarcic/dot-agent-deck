@@ -707,6 +707,206 @@ report      = "Showing the counters."
 asks_to     = "show the dashboard's counters"
 try_saying  = "show the counters"
 
+# PRD #1790 stage 2 — a daemon's interrupted work, by voice: what a restart of
+# its daemon left behind (dispatched units, orchestrations, issue dispatches,
+# and plain agents under "Other agents"). The banner's Show and the restart
+# notice's Show dispatch the same registry entry (`showInterruptedWork`), so
+# this row exposes the click rather than a second route to the dialog.
+#
+# **Which daemon** is resolved as `show_host_metrics`' is: an optional
+# `deck_ref` against every observed daemon; with none named, the one daemon
+# whose banner shows opens, and with several the dashboard says which ones
+# and asks the user to name one.
+#
+# `screens = ["overview"]` and `requires = ["new_agent_dialog_closed"]` for
+# `show_host_metrics`' reason: the banners are on the agent dashboard only,
+# and the New agent dialog is modal over them. Opening the list changes
+# nothing.
+[[commands]]
+id          = "show_interrupted_work"
+description = """Open a daemon's Interrupted work: the dialog that the Show button on the "N interrupted
+items from before the restart" banner opens, listing what a restart of the deck daemon left behind —
+dispatched units, orchestrations, issue dispatches and other agents, with their branches, worktrees
+and kept reports. Use for show interrupted work, interrupted items, what was interrupted, what did
+the restart leave behind, show the leftovers, open interrupted work. When the user names the daemon
+(which a user may also call a deck), set `deck` to the daemon they meant, exactly as listed in
+`decks`; otherwise leave `deck` out. This only OPENS the list: it reclaims and dismisses nothing.
+It is not `show_host_metrics`, not `show_dashboard_counters` and not `open_agent`."""
+invoke      = "showInterruptedWork"
+screens     = ["overview"]
+requires    = ["new_agent_dialog_closed"]
+unavailable_hint = "interrupted work opens from the agent dashboard, once the agent's pane and the New agent dialog are closed"
+report      = "Showing the interrupted work."
+asks_to     = "show a daemon's interrupted work"
+try_saying  = "show interrupted work"
+action_words = ["interrupted", "leftovers", "restart"]
+
+  [[commands.params]]
+  name     = "deck"
+  kind     = "deck_ref"
+  optional = true
+
+# PRD #1790 stage 2 — Reclaim in the Interrupted work dialog: it removes the
+# item's worktree and keeps its branch. **Voice runs the dry run only**: the
+# report reads its verdict back ("Reclaim would remove its worktree and keep
+# its branch.", or why it would be kept), and the removal waits for the
+# person's click on the dialog's Reclaim confirm (PRD #802 D5), exactly as the
+# button's own route does.
+#
+# The optional `item` names which item: an ordinal ("the second one", "the
+# last one") or the item's name or branch, the user's own words held to the
+# transcript (`filter_text`). Without it, the selected row. A plain agent has
+# no worktree the deck created, and is refused in the deck's own words.
+[[commands]]
+id          = "reclaim_interrupted"
+description = """In the open Interrupted work dialog, Reclaim an interrupted item — remove its worktree,
+keep its branch: this checks what reclaiming would do and reads the verdict back, then the user
+confirms on screen. Use for reclaim, reclaim it, reclaim the second one, reclaim fix-login, remove its
+worktree, clean up that worktree. Set `item` to the words the user used for which item, and only
+those: an ordinal ("second", "the last one", "number three") or the item's name or branch as they
+said it; leave `item` out when they named none. Never add a name the user did not say. It is not
+`dismiss_interrupted`, which only hides an item, and not `close`."""
+invoke      = "reclaimInterrupted"
+screens     = ["overview"]
+requires    = ["new_agent_dialog_closed"]
+unavailable_hint = "reclaiming works in the Interrupted work dialog on the agent dashboard; say “show interrupted work” first"
+report      = "Checking what reclaiming it would do."
+asks_to     = "reclaim an interrupted item"
+try_saying  = "reclaim the first one"
+
+  [[commands.params]]
+  name     = "item"
+  kind     = "filter_text"
+  optional = true
+
+# PRD #1790 stage 2 — Dismiss in the Interrupted work dialog: takes one item
+# off the list for good (its reports stay until they expire). **Voice asks
+# the question only** (desktop review R6/A1): the dialog asks whether to
+# dismiss the item the words name, naming it and bound to its id, and the
+# dismissal waits for the person's click or `y` on that question (PRD #802
+# D5). The Dismiss button and `d` dismiss the selected row at once, as the
+# TUI's `d` does; they are a registry entry of their own
+# (`dismissSelectedInterrupted`), not this row. `item` as
+# `reclaim_interrupted`'s.
+[[commands]]
+id          = "dismiss_interrupted"
+description = """In the open Interrupted work dialog, ask to Dismiss one interrupted item: the dialog asks whether
+to take that item off the list, naming it, and the user confirms on screen. Its branch, worktree and
+reports are left alone. Use for dismiss, dismiss it, dismiss the second one, dismiss scratch-shell,
+forget that one, remove it from the list. Set `item` to the words the user used for which item, and
+only those: an ordinal ("second", "the last one") or the item's name or branch as they said it; leave
+`item` out when they named none. Never add a name the user did not say. It is not
+`dismiss_all_interrupted`, which asks about every item, and not `reclaim_interrupted`."""
+invoke      = "dismissInterrupted"
+screens     = ["overview"]
+requires    = ["new_agent_dialog_closed"]
+unavailable_hint = "dismissing works in the Interrupted work dialog on the agent dashboard; say “show interrupted work” first"
+report      = "Asking whether to dismiss it."
+asks_to     = "dismiss an interrupted item"
+try_saying  = "dismiss the first one"
+
+  [[commands.params]]
+  name     = "item"
+  kind     = "filter_text"
+  optional = true
+
+# PRD #1790 stage 2 — Dismiss all in the Interrupted work dialog. **Voice asks
+# the question only** ("Dismiss all: N interrupted items from before the
+# restart? [y/N]"): the dismissal waits for the person's click on the
+# dialog's Dismiss all confirm (PRD #802 D5), and dismisses exactly the items
+# the question named.
+[[commands]]
+id          = "dismiss_all_interrupted"
+description = """In the open Interrupted work dialog, ask to Dismiss all: the dialog asks whether to take
+every listed interrupted item off the list, and the user confirms on screen. Use for dismiss all,
+dismiss everything, clear the list, forget all of them. It is not `dismiss_interrupted`, which takes
+one item, and not `clear_dashboard_filter`."""
+invoke      = "dismissAllInterrupted"
+screens     = ["overview"]
+requires    = ["new_agent_dialog_closed"]
+unavailable_hint = "dismissing works in the Interrupted work dialog on the agent dashboard; say “show interrupted work” first"
+report      = "Asking to dismiss every interrupted item."
+asks_to     = "dismiss every interrupted item"
+try_saying  = "dismiss all"
+
+# PRD #1790 stage 2 (desktop review R11, CLAUDE.md rule 23) — an item's
+# details in the Interrupted work dialog: what its Details button and Enter
+# open. They are shown to read on screen; voice reads nothing aloud. `item`
+# as `reclaim_interrupted`'s; without it, the selected row.
+[[commands]]
+id          = "show_interrupted_details"
+description = """In the open Interrupted work dialog, open one interrupted item's details: its branch, worktree,
+who started it, its last entry, progress, Git facts and kept reports. Use for show its details, details
+of the second one, open fix-login, what is in that one, more about it. Set `item` to the words the user
+used for which item, and only those: an ordinal ("second", "the last one") or the item's name or branch
+as they said it; leave `item` out when they named none. Never add a name the user did not say. It is
+not `show_interrupted_reports`, which shows the reports' text, and not `open_agent`."""
+invoke      = "showInterruptedDetails"
+screens     = ["overview"]
+requires    = ["new_agent_dialog_closed"]
+unavailable_hint = "an item's details open from the Interrupted work dialog on the agent dashboard; say “show interrupted work” first"
+report      = "Showing its details."
+asks_to     = "show an interrupted item's details"
+try_saying  = "show the details of the first one"
+
+  [[commands.params]]
+  name     = "item"
+  kind     = "filter_text"
+  optional = true
+
+# PRD #1790 stage 2 (desktop review R11) — Show reports in the Interrupted
+# work dialog: the first page of an item's kept reports' text, on screen.
+# `item` as `reclaim_interrupted`'s; without it, the item whose details are
+# open, or the selected row.
+[[commands]]
+id          = "show_interrupted_reports"
+description = """In the open Interrupted work dialog, show the text of an interrupted item's kept reports, the
+first page of them, on screen. Use for show its reports, show the reports, read the report of the first
+one, what did it report. Set `item` to the words the user used for which item, and only those: an
+ordinal or the item's name or branch as they said it; leave `item` out when they named none. Never add
+a name the user did not say. It is not `next_interrupted_reports` and not `show_interrupted_details`."""
+invoke      = "showInterruptedReports"
+screens     = ["overview"]
+requires    = ["new_agent_dialog_closed"]
+unavailable_hint = "reports show in an item's details in the Interrupted work dialog on the agent dashboard; say “show interrupted work” first"
+report      = "Showing its reports."
+asks_to     = "show an interrupted item's reports"
+try_saying  = "show its reports"
+
+  [[commands.params]]
+  name     = "item"
+  kind     = "filter_text"
+  optional = true
+
+# PRD #1790 stage 2 (desktop review R11) — Next reports and Previous reports
+# in an interrupted item's details: the report pages the buttons, `n` and `p`
+# turn. Previous goes back to the page shown before.
+[[commands]]
+id          = "next_interrupted_reports"
+description = """In an interrupted item's details in the Interrupted work dialog, show the next page of its
+kept reports. Use for next reports, next page of reports, more reports, the reports after these. It is
+not `next_page`, which turns a list on screen, and not `previous_interrupted_reports`."""
+invoke      = "nextInterruptedReports"
+screens     = ["overview"]
+requires    = ["new_agent_dialog_closed"]
+unavailable_hint = "report pages turn in an item's details in the Interrupted work dialog on the agent dashboard"
+report      = "Showing the next reports."
+asks_to     = "show the next page of an interrupted item's reports"
+try_saying  = "next reports"
+
+[[commands]]
+id          = "previous_interrupted_reports"
+description = """In an interrupted item's details in the Interrupted work dialog, show the previous page of its
+kept reports, the one shown before. Use for previous reports, previous page of reports, back to the
+earlier reports. It is not `previous_page`, which turns a list on screen, and not `next_interrupted_reports`."""
+invoke      = "previousInterruptedReports"
+screens     = ["overview"]
+requires    = ["new_agent_dialog_closed"]
+unavailable_hint = "report pages turn in an item's details in the Interrupted work dialog on the agent dashboard"
+report      = "Showing the previous reports."
+asks_to     = "show the previous page of an interrupted item's reports"
+try_saying  = "previous reports"
+
 # PRD #1195 M3 — the Deck selector at the top of the deck and the overview, by
 # voice. The drop-down dispatches through the same registry entry
 # (`switchDeck`), so this row exposes the click rather than a second route to

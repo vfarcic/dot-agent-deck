@@ -934,7 +934,7 @@ describe("PRD #1401 — what close closes with the pull request browser open", (
     const { host } = fakeHost();
     const voice = renderAt(host, { kind: "overview" });
     fireEvent.click(screen.getByRole("button", { name: "Settings" }));
-    fireEvent.click(screen.getByRole("button", { name: "Open Coder 7 agent" }));
+    fireEvent.click(screen.getByRole("row", { name: "Open Coder 7 agent" }));
     fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByTestId("pr-badge-7"));
     await act(async () => { await Promise.resolve(); });
 
@@ -963,7 +963,7 @@ describe("PRD #1401 — what close closes with the pull request browser open", (
     const beneath = fakeHost();
     const voice = renderAt(beneath.host, { kind: "overview" }, {}, scroll);
     fireEvent.click(screen.getByRole("button", { name: "Settings" }));
-    fireEvent.click(screen.getByRole("button", { name: "Open Coder 7 agent" }));
+    fireEvent.click(screen.getByRole("row", { name: "Open Coder 7 agent" }));
     fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByTestId("pr-badge-7"));
     await act(async () => { await Promise.resolve(); });
     fireEvent.click(screen.getByTestId("voice-trigger"));

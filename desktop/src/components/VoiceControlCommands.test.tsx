@@ -58,6 +58,15 @@ import {
 } from "./VoiceControlPanel";
 
 /**
+ * Issue #2454 — an agent's open route: its deck tile's Open button, or on the
+ * Dashboard the agent's row, which is itself the open route since the row lost
+ * its Open icon.
+ */
+function openAgentControl(options: { name: string | RegExp; hidden?: boolean }): HTMLElement {
+  return screen.queryByRole("button", options) ?? screen.getByRole("row", options);
+}
+
+/**
  * PRD #802 — the rows that are not navigation.
  *
  * `VoiceControlPanel.test.tsx` beside this one owns the microphone's own state
@@ -536,7 +545,7 @@ describe("PRD #1261 numbered choice over the original voice command", () => {
     await turnVoiceOn();
     await completeUtterance();
     expect(entry(2, second.label)).toBeVisible();
-    fireEvent.click(screen.getByRole("button", { name: `Open ${first.label} agent` }));
+    fireEvent.click(screen.getByRole("row", { name: `Open ${first.label} agent` }));
     voice.deliver("type on");
     await completeUtterance();
     expect(screen.getByTestId("voice-dictating")).toHaveTextContent(first.label);
@@ -600,7 +609,7 @@ describe("PRD #1261 numbered choice over the original voice command", () => {
   it("closes only the dialog on Escape over an open agent pane, and gives the pane its focus back", async () => {
     const voice = microphone([]);
     setup(voice, noMatch);
-    fireEvent.click(screen.getByRole("button", { name: `Open ${first.label} agent` }));
+    fireEvent.click(screen.getByRole("row", { name: `Open ${first.label} agent` }));
     const pane = screen.getByTestId("agent-pane-overlay");
     await flush();
     expect(pane.contains(document.activeElement)).toBe(true);
@@ -1455,7 +1464,7 @@ describe("typing into the open agent", () => {
     if (!coder || !snapshot.connection.deckId) throw new Error("Coder fixture missing its agent or deck id");
     const deck = runtime(speaking({ [said]: dictated(said, "type") }), voice, { snapshot, fleet: [snapshot] });
     render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
-    fireEvent.click(screen.getByRole("button", { name: /open coder agent/i }));
+    fireEvent.click(screen.getByRole("row", { name: /open coder agent/i }));
     await turnVoiceOn();
     voice.deliver(said);
     await completeUtterance();
@@ -1486,7 +1495,7 @@ describe("typing into the open agent", () => {
     const snapshot = createFixtureSnapshot("crowded");
     const deck = runtime(resolveVoice, voice, { snapshot, fleet: [snapshot] });
     render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
-    fireEvent.click(screen.getByRole("button", { name: /open coder agent/i }));
+    fireEvent.click(screen.getByRole("row", { name: /open coder agent/i }));
     await turnVoiceOn();
     voice.deliver(said);
     await completeUtterance();
@@ -1514,7 +1523,7 @@ describe("typing into the open agent", () => {
     if (!coder || !snapshot.connection.deckId) throw new Error("Coder fixture missing its agent or deck id");
     const deck = runtime(speaking({ [said]: dictated(said, "type") }), voice, { snapshot, fleet: [snapshot], sendTerminalInput });
     render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
-    fireEvent.click(screen.getByRole("button", { name: /open coder agent/i }));
+    fireEvent.click(screen.getByRole("row", { name: /open coder agent/i }));
     await turnVoiceOn();
     voice.deliver(said);
     await completeUtterance();
@@ -1802,14 +1811,14 @@ describe("typing into the open agent", () => {
     const snapshot = createFixtureSnapshot("connected");
     const deck = runtime(resolveVoice, voice, { snapshot, fleet: [snapshot] });
     render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
-    fireEvent.click(screen.getByRole("button", { name: /open plan \/ architecture agent/i }));
+    fireEvent.click(screen.getByRole("row", { name: /open plan \/ architecture agent/i }));
     expect(within(screen.getByTestId("agent-pane-overlay")).getByTestId("terminal-planner")).toBeVisible();
     await turnVoiceOn();
     voice.deliver(said);
     await completeUtterance();
     expect(resolveVoice).toHaveBeenCalledWith(said);
 
-    fireEvent.click(screen.getByRole("button", { name: /open desktop implementation agent/i, hidden: true }));
+    fireEvent.click(openAgentControl({ name: /open desktop implementation agent/i, hidden: true }));
     expect(within(screen.getByTestId("agent-pane-overlay")).getByTestId("terminal-builder")).toBeVisible();
     await act(async () => { settle(dictated(said, "type")); await Promise.resolve(); });
     await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS * 2); });
@@ -2014,7 +2023,7 @@ describe("sticky dictation in the open agent pane", () => {
   }
 
   async function enter(voice: ReturnType<typeof microphone>) {
-    fireEvent.click(screen.getByRole("button", { name: /open (PRD 745 · agent dashboard \/ )?coder agent/i }));
+    fireEvent.click(openAgentControl({ name: /open (PRD 745 · agent dashboard \/ )?coder agent/i }));
     await turnVoiceOn();
     expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
     voice.deliver("type on");
@@ -2709,7 +2718,7 @@ describe("sticky dictation in the open agent pane", () => {
     const snapshot = createFixtureSnapshot("crowded");
     const deck = runtime(resolveVoice, voice, { snapshot, fleet: [snapshot] });
     const { rerender } = render(<DeckShell runtime={deck} initialView={initialView} />);
-    fireEvent.click(screen.getByRole("button", { name: /open (PRD 745 · agent dashboard \/ )?coder agent/i }));
+    fireEvent.click(openAgentControl({ name: /open (PRD 745 · agent dashboard \/ )?coder agent/i }));
     await turnVoiceOn();
     const pane = screen.getByTestId("agent-pane-overlay");
     await act(async () => { fireEvent.click(within(pane).getByRole("tab", { name: "Diff" })); });
@@ -2836,7 +2845,7 @@ describe("sticky dictation in the open agent pane", () => {
     const snapshot = createFixtureSnapshot("crowded");
     const deck = runtime(resolveVoice, voice, { snapshot, fleet: [snapshot] });
     render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
-    fireEvent.click(screen.getByRole("button", { name: /open coder agent/i }));
+    fireEvent.click(openAgentControl({ name: /open coder agent/i }));
     await turnVoiceOn();
     voice.deliver("type on");
     await completeUtterance();

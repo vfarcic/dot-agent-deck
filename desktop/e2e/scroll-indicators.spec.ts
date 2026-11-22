@@ -1,5 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
-import { selectOverview } from "./support/overview";
+import { selectOverview, ROW_EDGE } from "./support/overview";
 
 /**
  * Issue #1492 — the dashboard and an agent's output are each one page taller
@@ -62,14 +62,14 @@ test.describe("scroll indicators", () => {
   /** Scenario: an agent pane whose output is taller than its terminal shows the terminal's scrollbar while the pointer is elsewhere; a pane whose output fits shows none. */
   test("an agent terminal's scrollbar is shown at rest only when it has output to scroll", async ({ page }) => {
     await openDashboard(page, 420);
-    await page.getByRole("button", { name: "Open Desktop implementation agent" }).click();
+    await page.getByRole("row", { name: "Open Desktop implementation agent" }).click({ position: ROW_EDGE });
     const short = await terminalScrollbar(page);
     expect(short.slider).toBeLessThan(short.track);
     expect(short.opacity).toBe(1);
 
     await page.getByRole("button", { name: "Back to dashboard" }).click();
     await page.setViewportSize({ width: 1280, height: 1200 });
-    await page.getByRole("button", { name: "Open Desktop implementation agent" }).click();
+    await page.getByRole("row", { name: "Open Desktop implementation agent" }).click({ position: ROW_EDGE });
     const tall = await terminalScrollbar(page);
     expect(tall.opacity).toBe(0);
   });

@@ -9,8 +9,8 @@ import { desktopScenario } from "./support";
  */
 
 /** Load a fixture state and open the agent dashboard through its rail control. */
-async function overview(page: Page, state: "docs" | "docs-fleet" | "docs-pr" | "docs-generate" | "docs-restart" | "empty"): Promise<void> {
-  await page.goto(`/?fixture=1&state=${state}`);
+async function overview(page: Page, state: "docs" | "docs-fleet" | "docs-pr" | "docs-generate" | "docs-restart" | "empty", query = ""): Promise<void> {
+  await page.goto(`/?fixture=1&state=${state}${query}`);
   await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
   await page.getByTestId("open-overview").click();
 }
@@ -43,7 +43,7 @@ desktopScenario("antigravity-needs-input", async (page) => {
   });
   await page.goto("/?fixture=1&state=docs-antigravity");
   await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
-  await page.getByRole("button", { name: "Open probe agent" }).click();
+  await page.getByRole("row", { name: "Open probe agent" }).click({ position: { x: 4, y: 4 } });
   await expect(page.getByTestId("agent-pane-overlay")).toBeVisible();
   const tile = page.getByTestId("agent-tile-antigravity");
   await expect(tile).toBeVisible();
@@ -118,12 +118,14 @@ desktopScenario("host-metrics", async (page) => {
 });
 
 // PRD #2119 — the Generate config confirmation the TUI `generate-config` image
-// shows, opened from the Plan / architecture row's button: the fixture's
-// `docs-generate` state, whose one agent has a pane.
+// shows, opened from the Plan / architecture agent's pane (issue #2454 took the
+// button off the Dashboard row): the fixture's `docs-generate` state, whose one
+// agent has a pane.
 desktopScenario("generate-config", async (page) => {
   await overview(page, "docs-generate");
   await expect(page.locator(".overview-row")).toHaveCount(1);
-  await page.getByRole("button", { name: "Generate config with Plan / architecture agent" }).click();
+  await page.getByRole("row", { name: "Open Plan / architecture agent" }).click({ position: { x: 4, y: 4 } });
+  await page.getByTestId("agent-pane-overlay").getByRole("button", { name: "Generate config", exact: true }).click();
   const dialog = page.getByRole("alertdialog", { name: "Generate .dot-agent-deck.toml" });
   await expect(dialog).toBeVisible();
   await expect(dialog).toContainText("No orchestration config found for this project.");
@@ -132,11 +134,32 @@ desktopScenario("generate-config", async (page) => {
 });
 
 // The two agents the TUI `restart-notice` image names, stopped by a restart of
-// the fixture's `docs-restart` deck after its first listing was shown.
+// the fixture's `docs-restart` deck after its first listing was shown. The
+// preview daemon also lists interrupted work (`interrupted=1`), so the notice
+// carries its line and Show button (PRD #1790 stage 2).
 desktopScenario("restart-notice", async (page) => {
-  await overview(page, "docs-restart");
-  await expect(page.getByTestId("restart-toast")).toHaveText("The deck restarted; these agents were stopped: api-fix, docs-review.");
+  await overview(page, "docs-restart", "&interrupted=1");
+  const toast = page.getByTestId("restart-toast");
+  await expect(toast).toContainText("The deck restarted; these agents were stopped: api-fix, docs-review.");
+  await expect(toast.getByTestId("restart-toast-interrupted")).toContainText("3 interrupted items from before the restart");
+  await expect(toast.getByTestId("restart-toast-interrupted-show")).toBeVisible();
   await expect(page.locator(".overview-row")).toHaveCount(0);
+});
+
+// PRD #1790 stage 2 — the "Interrupted work" dialog over the docs dashboard,
+// opened from the deck's banner: the preview daemon's three items
+// (`desktop/src/data/fixtureInterrupted.ts`), the unit `fix-login` selected.
+desktopScenario("interrupted-work", async (page) => {
+  await page.goto("/?fixture=1&state=docs&interrupted=1");
+  await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
+  await page.getByTestId("open-overview").click();
+  await expect(page.getByTestId("interrupted-banner")).toContainText("3 interrupted items from before the restart");
+  await page.getByTestId("interrupted-banner-show").click();
+  const dialog = page.getByTestId("interrupted-dialog");
+  await expect(dialog.getByTestId("interrupted-row")).toHaveCount(3);
+  await dialog.getByTestId("interrupted-row").filter({ hasText: "fix-login" }).click();
+  await expect(dialog.getByTestId("interrupted-reclaim")).toBeVisible();
+  await expect(dialog.getByTestId("interrupted-other-agents")).toHaveText("Other agents");
 });
 
 /** Select the fixture project's directory in the shared New agent form. */
@@ -203,7 +226,7 @@ desktopScenario("star-prompt", async (page) => {
 
 desktopScenario("agent-pane", async (page) => {
   await overview(page, "docs");
-  await page.getByRole("button", { name: "Open Desktop implementation agent" }).click();
+  await page.getByRole("row", { name: "Open Desktop implementation agent" }).click({ position: { x: 4, y: 4 } });
   await expect(page.getByTestId("agent-pane-overlay")).toBeVisible();
   await expect(page.locator(".xterm-screen canvas").first()).toBeVisible();
   await expect(page.getByTestId("agent-pane-overlay").getByRole("button", { name: "Close agent", exact: true })).toBeVisible();
@@ -350,7 +373,7 @@ desktopScenario("voice-typing-mode", async (page) => {
   await page.goto("/?fixture=1&state=docs&voice=type%20on");
   await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
   await page.getByTestId("open-overview").click();
-  await page.getByRole("button", { name: "Open Desktop implementation agent" }).click();
+  await page.getByRole("row", { name: "Open Desktop implementation agent" }).click({ position: { x: 4, y: 4 } });
   await expect(page.getByTestId("agent-pane-overlay")).toBeVisible();
   await expect(page.locator(".xterm-screen canvas").first()).toBeVisible();
   await page.getByTestId("voice-trigger").click();
@@ -404,7 +427,7 @@ desktopScenario("voice-question", async (page) => {
   await page.goto("/?fixture=1&state=docs-question&voice=go%20ahead");
   await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
   await page.getByTestId("open-overview").click();
-  await page.getByRole("button", { name: "Open Desktop implementation agent" }).click();
+  await page.getByRole("row", { name: "Open Desktop implementation agent" }).click({ position: { x: 4, y: 4 } });
   await expect(page.getByTestId("agent-pane-overlay")).toBeVisible();
   await expect(page.locator(".xterm-screen canvas").first()).toBeVisible();
   await page.getByTestId("voice-trigger").click();
