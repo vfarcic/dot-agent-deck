@@ -10,11 +10,14 @@
 //! delegated subtree, has only those.
 //!
 //! A run is matched to its cgroup through its own processes: the cgroup one
-//! of its members is in must be named `run-<its deck.run.id>`. So a cgroup is
-//! read only for a run that has a live member in it, and a run that ended is
-//! not read again; what its detached processes use after that is not sent.
+//! of its members is in must be named `run-<its deck.run.id>`. The path is
+//! kept, so the sample that reports the run ended reads it once more and its
+//! final figures include what the run used since the previous sample. After
+//! that the run is not reported, so what processes still left in its cgroup
+//! use from then on is not sent.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use super::aggregate::{RunKey, Sample};
 use super::config::Temporality;
@@ -74,49 +77,67 @@ pub fn is_run_cgroup(path: &str, run_id: &str) -> bool {
 /// The cgroup figures carried from one sample to the next.
 #[derive(Debug, Default)]
 pub struct RunCgroups {
+    /// Each run's cgroup, once found.
+    paths: HashMap<RunKey, PathBuf>,
     last: HashMap<RunKey, (u64, u64)>,
 }
 
 impl RunCgroups {
-    /// Read the cgroup of each live run in `sample` through `read`, given the
-    /// run's id and its members, and answer the points to send. A run whose
-    /// cgroup was not found this sample keeps its last reading for the next
-    /// delta. Ended runs are forgotten.
+    /// Read the cgroup of each run in `sample` and answer the points to send.
+    /// A run's cgroup is found once, through `locate` given its id and live
+    /// members, and read through `read`, every sample that reports the run,
+    /// the one that reports it ended included; then the run is forgotten. A
+    /// run whose cgroup could not be read this sample keeps its last reading
+    /// for the next delta.
     pub fn update(
         &mut self,
         sample: &Sample,
-        mut read: impl FnMut(&str, &[u32]) -> Option<CgroupReading>,
+        mut locate: impl FnMut(&str, &[u32]) -> Option<PathBuf>,
+        mut read: impl FnMut(&Path) -> Option<CgroupReading>,
     ) -> HashMap<RunKey, CgroupPoint> {
         let mut points = HashMap::new();
         for run in &sample.runs {
             let key = run.key();
+            if !self.paths.contains_key(&key)
+                && !run.ended
+                && let Some(path) = locate(&run.identity.run_id, &run.members)
+            {
+                self.paths.insert(key.clone(), path);
+            }
+            let reading = self.paths.get(&key).and_then(|path| read(path));
             if run.ended {
-                self.last.remove(&key);
+                self.paths.remove(&key);
+                let previous = self.last.remove(&key);
+                if let Some(reading) = reading {
+                    points.insert(key, point(reading, previous));
+                }
                 continue;
             }
-            let Some(reading) = read(&run.identity.run_id, &run.members) else {
+            let Some(reading) = reading else {
                 continue;
             };
             let previous = self.last.get(&key).copied();
-            let delta_usec = match previous {
-                // A cgroup's usage only grows; a smaller one is a different
-                // cgroup under the same name, counted from its start.
-                Some((usec, _)) if reading.cpu_usec >= usec => reading.cpu_usec - usec,
-                _ => reading.cpu_usec,
-            };
             self.last
                 .insert(key.clone(), (reading.cpu_usec, sample.time_unix_nanos));
-            points.insert(
-                key,
-                CgroupPoint {
-                    reading,
-                    cpu_seconds: reading.cpu_usec as f64 / 1e6,
-                    cpu_seconds_delta: delta_usec as f64 / 1e6,
-                    previous_unix_nanos: previous.map(|(_, at)| at),
-                },
-            );
+            points.insert(key, point(reading, previous));
         }
         points
+    }
+}
+
+/// A reading as a point, given the previous one's usage and time.
+fn point(reading: CgroupReading, previous: Option<(u64, u64)>) -> CgroupPoint {
+    let delta_usec = match previous {
+        // A cgroup's usage only grows; a smaller one is a different cgroup
+        // under the same name, counted from its start.
+        Some((usec, _)) if reading.cpu_usec >= usec => reading.cpu_usec - usec,
+        _ => reading.cpu_usec,
+    };
+    CgroupPoint {
+        reading,
+        cpu_seconds: reading.cpu_usec as f64 / 1e6,
+        cpu_seconds_delta: delta_usec as f64 / 1e6,
+        previous_unix_nanos: previous.map(|(_, at)| at),
     }
 }
 
@@ -201,35 +222,39 @@ fn cgroup_metrics(
     out
 }
 
-/// Read the cgroup of run `run_id` through its `members`, oldest first: the
-/// first member found in a cgroup named for the run. At most a few members
-/// are tried, since every process of a run that has a cgroup is in it.
+/// The cgroup of run `run_id`, found through its `members`, oldest first:
+/// the first member in a cgroup named for the run. At most a few members are
+/// tried, since every process of a run that has a cgroup is in it.
 #[cfg(target_os = "linux")]
-pub fn read(run_id: &str, members: &[u32]) -> Option<CgroupReading> {
-    use std::fs;
+pub fn locate(run_id: &str, members: &[u32]) -> Option<PathBuf> {
     for pid in members.iter().take(4) {
-        let Ok(own) = fs::read_to_string(format!("/proc/{pid}/cgroup")) else {
+        let Ok(own) = std::fs::read_to_string(format!("/proc/{pid}/cgroup")) else {
             continue;
         };
         let path = crate::run_cgroup::unified_path(&own)?;
-        if !is_run_cgroup(path, run_id) {
-            continue;
+        if is_run_cgroup(path, run_id) {
+            return Some(Path::new("/sys/fs/cgroup").join(path.trim_start_matches('/')));
         }
-        let dir = std::path::Path::new("/sys/fs/cgroup").join(path.trim_start_matches('/'));
-        let cpu_usec = cpu_usage_usec(&fs::read_to_string(dir.join("cpu.stat")).ok()?)?;
-        let memory_current = fs::read_to_string(dir.join("memory.current"))
-            .ok()
-            .and_then(|t| t.trim().parse().ok());
-        let memory_anon = fs::read_to_string(dir.join("memory.stat"))
-            .ok()
-            .and_then(|t| memory_anon(&t));
-        return Some(CgroupReading {
-            cpu_usec,
-            memory_current,
-            memory_anon,
-        });
     }
     None
+}
+
+/// Read the cgroup at `dir`: `None` once it is gone.
+#[cfg(target_os = "linux")]
+pub fn read_at(dir: &Path) -> Option<CgroupReading> {
+    use std::fs;
+    let cpu_usec = cpu_usage_usec(&fs::read_to_string(dir.join("cpu.stat")).ok()?)?;
+    let memory_current = fs::read_to_string(dir.join("memory.current"))
+        .ok()
+        .and_then(|t| t.trim().parse().ok());
+    let memory_anon = fs::read_to_string(dir.join("memory.stat"))
+        .ok()
+        .and_then(|t| memory_anon(&t));
+    Some(CgroupReading {
+        cpu_usec,
+        memory_current,
+        memory_anon,
+    })
 }
 
 #[cfg(test)]
@@ -305,32 +330,49 @@ mod tests {
     #[test]
     fn run_cgroups_103_cpu_is_cumulative_and_its_delta_is_since_the_last_read() {
         let mut cgroups = RunCgroups::default();
-        let first = cgroups.update(&sample(10, vec![run(RUN, false)]), |_, _| {
+        let found = |_: &str, _: &[u32]| Some(PathBuf::from("/cg/run"));
+        let first = cgroups.update(&sample(10, vec![run(RUN, false)]), found, |_| {
             Some(reading(2_000_000))
         });
         let key = run(RUN, false).key();
         assert_eq!(first[&key].cpu_seconds, 2.0);
         assert_eq!(first[&key].cpu_seconds_delta, 2.0);
         assert_eq!(first[&key].previous_unix_nanos, None);
-        // Not found this sample: no point, and the last reading stays.
+        // Not readable this sample: no point, and the last reading stays.
         assert!(
             cgroups
-                .update(&sample(20, vec![run(RUN, false)]), |_, _| None)
+                .update(&sample(20, vec![run(RUN, false)]), found, |_| None)
                 .is_empty()
         );
-        let third = cgroups.update(&sample(30, vec![run(RUN, false)]), |_, _| {
-            Some(reading(5_500_000))
-        });
+        // Found once: a later sample reads the kept path.
+        let third = cgroups.update(
+            &sample(30, vec![run(RUN, false)]),
+            |_, _| panic!("located again"),
+            |path| (path == Path::new("/cg/run")).then(|| reading(5_500_000)),
+        );
         assert_eq!(third[&key].cpu_seconds, 5.5);
         assert_eq!(third[&key].cpu_seconds_delta, 3.5);
         assert_eq!(third[&key].previous_unix_nanos, Some(10));
-        // An ended run is not read, and is forgotten.
-        let ended = cgroups.update(&sample(40, vec![run(RUN, true)]), |_, _| panic!("read"));
-        assert!(ended.is_empty());
-        let again = cgroups.update(&sample(50, vec![run(RUN, false)]), |_, _| {
+        // The sample that reports the run ended reads it once more, so its
+        // final figures carry what it used since the last one; then it is
+        // forgotten.
+        let ended = cgroups.update(&sample(40, vec![run(RUN, true)]), found, |_| {
+            Some(reading(6_000_000))
+        });
+        assert_eq!(ended[&key].cpu_seconds, 6.0);
+        assert_eq!(ended[&key].cpu_seconds_delta, 0.5);
+        let again = cgroups.update(&sample(50, vec![run(RUN, false)]), found, |_| {
             Some(reading(1_000_000))
         });
         assert_eq!(again[&key].cpu_seconds_delta, 1.0);
+        assert_eq!(again[&key].previous_unix_nanos, None);
+        // An ended run whose cgroup was never found reads nothing.
+        let mut fresh = RunCgroups::default();
+        assert!(
+            fresh
+                .update(&sample(60, vec![run(RUN, true)]), found, |_| panic!("read"))
+                .is_empty()
+        );
     }
 
     #[test]
@@ -348,8 +390,11 @@ mod tests {
         };
         let mut request = build_request(&sample, &HashMap::new(), &[], &settings, None);
         let before: Vec<usize> = request.resources.iter().map(|r| r.metrics.len()).collect();
-        let points =
-            RunCgroups::default().update(&sample, |id, _| (id == RUN).then(|| reading(1_500_000)));
+        let points = RunCgroups::default().update(
+            &sample,
+            |id, _| (id == RUN).then(|| PathBuf::from("/cg/run")),
+            |_| Some(reading(1_500_000)),
+        );
         add_to_request(&mut request, &sample, &points, Temporality::Cumulative);
         let names = |i: usize| -> Vec<&str> {
             request.resources[i].metrics[before[i]..]

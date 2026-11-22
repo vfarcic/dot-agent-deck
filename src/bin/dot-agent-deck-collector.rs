@@ -35,8 +35,9 @@ mod linux {
 
     use bytes::Bytes;
     use clap::{Parser, Subcommand};
+    use dot_agent_deck::telemetry::collector::aggregate::RunKey;
     use dot_agent_deck::telemetry::collector::aggregate::{Aggregator, ProcessSample, Sample};
-    use dot_agent_deck::telemetry::collector::cgroup::{self, RunCgroups};
+    use dot_agent_deck::telemetry::collector::cgroup::{self, CgroupPoint, RunCgroups};
     use dot_agent_deck::telemetry::collector::config::{Export, Settings};
     use dot_agent_deck::telemetry::collector::discovery::{self, Discovery, FIRST_SIGHT_WAIT};
     use dot_agent_deck::telemetry::collector::disk::{
@@ -373,6 +374,9 @@ mod linux {
         /// Issue #1897: the cgroup figures of runs the deck started in a
         /// cgroup of their own.
         run_cgroups: RunCgroups,
+        /// The cgroup points of the last sample, read beside its processes
+        /// so they carry its time rather than when the request is built.
+        cgroup_points: HashMap<RunKey, CgroupPoint>,
         /// `None` when no lookup thread could start: then no run has a
         /// worktree and no disk is walked.
         discovery: Option<Discovery>,
@@ -444,6 +448,7 @@ mod linux {
                 },
                 run_worktrees: RunWorktrees::default(),
                 run_cgroups: RunCgroups::default(),
+                cgroup_points: HashMap::new(),
                 discovery,
                 disks,
                 last_incomplete_log: None,
@@ -489,6 +494,9 @@ mod linux {
             // process it holds started after it.
             let processes = processes();
             let sample = self.aggregator.step(now_unix_nanos(), processes);
+            self.cgroup_points = self
+                .run_cgroups
+                .update(&sample, cgroup::locate, cgroup::read_at);
             let cwds = working_directories(&sample, cwd_of);
             let (members, in_use) = match &mut self.discovery {
                 Some(discovery) => {
@@ -530,7 +538,7 @@ mod linux {
                 &self.settings,
                 self.host.as_deref(),
             );
-            let cgroups = self.run_cgroups.update(sample, cgroup::read);
+            let cgroups = std::mem::take(&mut self.cgroup_points);
             cgroup::add_to_request(&mut request, sample, &cgroups, self.settings.temporality);
             self.run_worktrees.forget_ended(sample);
             request

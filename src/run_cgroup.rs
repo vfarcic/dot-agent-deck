@@ -122,11 +122,17 @@ pub fn delegated(show_output: &str) -> bool {
     show_output.trim() == "yes"
 }
 
-/// The `cgroup.subtree_control` line enabling those of `cpu`, `memory` and
-/// `pids` that `cgroup.controllers` lists, or `None` when it lists none.
+/// The `cgroup.subtree_control` line enabling those of `memory` and `pids`
+/// that `cgroup.controllers` lists, or `None` when it lists neither.
+///
+/// Never `cpu`: CPU time is in every cgroup's `cpu.stat` without it, and
+/// enabling it would give each agent's cgroup an equal `cpu.weight`, so a
+/// busy machine would share CPU between runs instead of between threads as
+/// it did before (Qodo on PR #2475). `memory` and `pids` set no limit by
+/// default; they only count.
 pub fn controllers_to_enable(available: &str) -> Option<String> {
     let have: Vec<&str> = available.split_whitespace().collect();
-    let wanted: Vec<String> = ["cpu", "memory", "pids"]
+    let wanted: Vec<String> = ["memory", "pids"]
         .iter()
         .filter(|c| have.contains(c))
         .map(|c| format!("+{c}"))
@@ -296,7 +302,7 @@ mod linux {
                 }
                 Err(e) if attempt == 9 => tracing::warn!(
                     base = %base.display(),
-                    "cannot enable the cpu, memory and pids controllers for agent cgroups yet ({e}); \
+                    "cannot enable the memory and pids controllers for agent cgroups yet ({e}); \
                      their CPU is counted, their memory only once this succeeds, tried again every minute"
                 ),
                 Err(_) => std::thread::sleep(Duration::from_millis(100)),
@@ -315,7 +321,7 @@ mod linux {
         Ok(cgroups)
     }
 
-    /// Hand `cpu`, `memory` and `pids`, those `base` has, to its children. On
+    /// Hand `memory` and `pids`, those `base` has, to its children. On
     /// a refusal, the error names the processes still in `base`.
     fn enable_controllers(base: &Path) -> Result<(), String> {
         let available =
@@ -468,7 +474,7 @@ mod linux {
                 enabled = true;
                 tracing::info!(
                     base = %base.display(),
-                    "the cpu, memory and pids controllers are enabled for agent cgroups"
+                    "the memory and pids controllers are enabled for agent cgroups"
                 );
             }
             empty_last_time = sweep(base, &empty_last_time, |dir| {
@@ -629,8 +635,10 @@ mod tests {
     fn run_cgroups_005_only_available_controllers_are_enabled() {
         assert_eq!(
             controllers_to_enable("cpu memory pids\n").as_deref(),
-            Some("+cpu +memory +pids")
+            Some("+memory +pids"),
+            "cpu would change how runs share the CPU"
         );
+        assert_eq!(controllers_to_enable("cpu io\n"), None);
         assert_eq!(
             controllers_to_enable("memory io\n").as_deref(),
             Some("+memory")
