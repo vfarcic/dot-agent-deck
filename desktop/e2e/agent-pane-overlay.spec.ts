@@ -1,5 +1,5 @@
 import { expect, test, type Locator, type Page } from "@playwright/test";
-import { enterDeck, openOverview } from "./support/overview";
+import { enterDeck, openOverview, ROW_EDGE } from "./support/overview";
 
 interface TerminalLayout {
   paneContentWidth: number;
@@ -190,7 +190,7 @@ test.describe("agent pane overlay", () => {
     await expect(page.locator(".terminal-viewport")).toHaveCount(0);
     const originalOverview = await overview.elementHandle();
     expect(originalOverview, "the overview has no table-region node to preserve").not.toBeNull();
-    await page.getByRole("button", { name: "Open Plan / architecture agent" }).click();
+    await page.getByRole("row", { name: "Open Plan / architecture agent" }).click({ position: ROW_EDGE });
 
     const overlay = page.getByTestId("agent-pane-overlay");
     await expect(overlay).toBeVisible();
@@ -205,7 +205,7 @@ test.describe("agent pane overlay", () => {
     await page.keyboard.press("Escape");
     await expect(overlay).toHaveCount(0);
     await expect(overview).toBeVisible();
-    await expect(page.getByRole("button", { name: "Open Plan / architecture agent" })).toBeVisible();
+    await expect(page.getByRole("row", { name: "Open Plan / architecture agent" })).toBeVisible();
   });
 
   /**
@@ -220,7 +220,7 @@ test.describe("agent pane overlay", () => {
     await page.getByTestId("deck-selector-option-all").click();
     await expect(page.getByTestId("deck-selector-current")).toHaveText("All daemons");
 
-    await page.getByRole("button", { name: "Open Nightly build watch agent" }).click();
+    await page.getByRole("row", { name: "Open Nightly build watch agent" }).click({ position: ROW_EDGE });
 
     const overlay = page.getByTestId("agent-pane-overlay");
     await expect(overlay).toBeVisible();
