@@ -9,7 +9,6 @@ expression: text
                                                                                                                         
                                                                                                                         
                                                                                                                         
-                                                                                                                        
   ┌ Upgrade to v0.47.0 ──────────────────────────────────────────────────────────────────────────────────────────────┐  
   │                                                                                                                  │  
   │ Agent Deck (desktop app): update available: v0.47.0 (current: v0.46.0)                                           │  
@@ -24,6 +23,8 @@ expression: text
   │ release v0.47.0, checks it, and replaces /home/u/.local/bin/dot-agent-deck.                                      │  
   │ Its checksum is checked against the release's checksum file. Build provenance will NOT be checked: the GitHub    │  
   │ CLI (`gh`) is not installed.                                                                                     │  
+  │ A resource collector (dot-agent-deck-collector) from a release in the same folder is upgraded to v0.47.0 too,    │  
+  │ checked the same way, and its systemd user service is restarted when it runs that file.                          │  
   │ Upgrading does not restart the daemon on this machine, so its agents keep running. The next time you start the   │  
   │ TUI, it restarts a daemon running another version onto its own, asking first when agents are running on it.      │  
   │                                                                                                                  │  

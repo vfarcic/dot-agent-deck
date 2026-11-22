@@ -1,0 +1,16 @@
+# Fixture for issue #1965 Part 2: an orchestration role whose command dies at
+# spawn, as `devbox run pi-sol` did when Pi's extension failed to load. The
+# `reviewer` prints a uniquely named sentinel line and exits 7 at once; the
+# orchestrator is a `cat` stand-in that stays alive, so the tab has a live
+# role and the reviewer's card is the one that must say it exited and why.
+[[orchestrations]]
+name = "demo-orch"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "cat"
+start = true
+
+[[orchestrations.roles]]
+name = "reviewer"
+command = "sh -c 'echo ended-role-sentinel-1965; exit 7'"

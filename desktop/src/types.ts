@@ -1425,6 +1425,26 @@ export interface HostMetrics {
  */
 export type HostMetricsReport = { status: "available"; metrics: HostMetrics } | { status: "not-available" };
 
+/**
+ * Issue #1965 — an orchestration role whose agent exited, as its daemon reported
+ * it. `reason` and `headline` are the daemon crate's words, the ones the TUI's
+ * card shows; `lastOutput` is the last lines its pane showed, sanitised by the
+ * crate and treated as display text here.
+ */
+export interface EndedRole {
+  paneId: string;
+  agentId: string;
+  roleIndex: number;
+  roleName: string;
+  orchestrationId?: string;
+  /** The orchestration's name and display title, to head its group when no live role of it is left. */
+  orchestrationName: string;
+  displayTitle?: string;
+  reason: string;
+  headline: string;
+  lastOutput: string[];
+}
+
 export interface DeckSnapshot {
   runId: string;
   repo: string;
@@ -1468,6 +1488,12 @@ export interface DeckSnapshot {
   hostMetrics?: HostMetricsReport;
   stages: WorkflowStage[];
   agents: AgentSession[];
+  /**
+   * Issue #1965 — the orchestration roles whose agent exited and whose pane
+   * nobody closed yet, which `agents` no longer lists. Absent from a daemon
+   * that does not report them, and in fixture mode.
+   */
+  endedRoles?: EndedRole[];
   evidence: EvidenceItem[];
   /** Live delegation edges (handoff-visibility PRD D2), newest first. */
   handoffs: HandoffEdge[];

@@ -230,6 +230,16 @@ action_words = ["open", "show", "see", "focus", "enlarge", "zoom", "look", "watc
   name = "agent"
   kind = "agent_ref"
 
+# Issue #2138 — the "HOW MANY" sentence is for fixture `show-counters-how-many`
+# ("how many agents are running", on the dashboard): this row's "asks which
+# agents are running" took it from `show_dashboard_counters` (issue #2312's
+# row, added after it) in 18 of 20 runs against `gpt-5-mini`; with the
+# sentence, 20 of 20, and `open-overview-running` ("which agents are
+# running?") stays this row's, 10 of 10 (2026-11-21). Re-measure it after
+# any change to this table, which can move fixtures that share no row with
+# it: the "reset" clause below, on its own, sent "browse docs" to
+# `open_new_agent` in 16 of 30 replays of that fixture as it stood then, with
+# the listing declared and the dialog not (23 of 30 went to `open_dir` before).
 [[commands]]
 id          = "open_overview"
 description = """Leave the Daemons screen and show the agent dashboard: every agent of the daemons
@@ -237,8 +247,9 @@ the Daemon selector is showing, in one list, with each one's status and activity
 selection — with the selector on one daemon it shows that daemon's agents only — so a request to
 select, switch to or show all daemons is `switch_deck`, not this one. Use when the user asks to see
 everything, all the agents, the whole fleet, the dashboard (the label of the rail's Dashboard
-button) or the overview, or asks which agents are running or what needs attention. It keeps
-the dashboard's filter as it is: "show everything", "show all agents", "clear the filter" and
+button) or the overview, or asks which agents are running or what needs attention.
+A question about HOW MANY agents there are, are running or need something is `show_dashboard_counters`, not this one.
+It keeps the dashboard's filter as it is: "show everything", "show all agents", "clear the filter" and
 "reset" ask for the WHOLE dashboard, unfiltered, and are `clear_dashboard_filter`, which opens the
 dashboard too."""
 invoke      = "openOverview"
@@ -360,7 +371,7 @@ description = """Clear the agent dashboard's filter and show the whole dashboard
 unfiltered — opening the dashboard from any other screen as well. Only when the user asks for
 EVERYTHING, all agents or no filter: a request for the dashboard that says none of that is
 `open_overview`, even where that cannot run. Use for show everything, show
-all agents, show all, clear the filter, remove the filter, unfiltered, or reset. With no filter
+all agents, show all, clear the filter, remove the filter, unfiltered, or reset — a bare "reset" said on its own means THIS one. With no filter
 set it simply opens the dashboard, as `open_overview` does. Filtering to some agents is
 `filter_dashboard`; opening one agent is `open_agent`. Clearing an agent's PROMPT — "clear the
 prompt", "clear it", "clear everything" in an agent's pane — is `clear_prompt`, not this one.
@@ -384,6 +395,12 @@ report      = "Showing every agent."
 # of THIS row (8 in 8 for "show the dashboard"); naming it without quoting it:
 # 0 in 8. "Show me everything", "show everything", "show all agents", "clear
 # the filter", "remove the filter" and "reset" stay 8 in 8 (2026-10-20).
+#
+# Issue #2138 — the bare-"reset" clause is for fixture `dashboard-clear-reset`:
+# the meaning check read "reset" alone as naming nothing to reset and listed no
+# action in 5 of 30 replays, and the fixture was refused in 3 of 20 runs (and
+# timed out in a fourth); with it, 30 of 30 replays and 20 of 20 runs
+# (2026-11-21, `gpt-5-mini`).
 asks_to     = "clear the agent dashboard's filter"
 try_saying  = "show everything"
 
