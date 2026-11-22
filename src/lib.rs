@@ -92,6 +92,7 @@ pub mod composer_probe;
 pub mod embedded_pane;
 // PRD #1419 Decision 4: the user docs embedded at build time for `docs [topic]`.
 pub mod embedded_docs;
+pub mod ended_role;
 // Issue #1121: the endpoint I/O that `platform::paths`' pure resolvers must not
 // do — creating the owner-only fallback directory, and the connect side's
 // read-only probe of the pre-#1121 endpoint spelling.
@@ -107,6 +108,8 @@ pub mod event_subscriber;
 // PRD #1666 part 3 round 5-wake: whether a parsed frame was drawn for the PTY's current width.
 pub mod evidence_state;
 pub mod features;
+// Issue #2418: strict parsing of the PR/issue references agents report on cards.
+pub mod github_refs;
 pub mod guarded;
 // PRD #1105 M11: when the TUI claims focus on its daemon (terminal focus-in and
 // throttled input).
@@ -145,6 +148,14 @@ pub mod init;
 pub mod injected_prompt;
 // PRD #1666 part 3 round 5-wake: a wrapper's samples of its agent's line discipline.
 pub mod input_mode;
+// PRD #1790 stage 2: the `dot-agent-deck interrupted` command group.
+pub mod interrupted_cli;
+// PRD #1790 stage 2: the interrupted work list, derived from the work journal.
+pub mod interrupted_work;
+// PRD #1790 stage 2: the daemon side of the interrupted work verbs.
+pub mod interrupted_work_daemon;
+// PRD #1790 stage 2: the bounded `git` and `gh` children of those verbs.
+pub mod interrupted_work_probe;
 pub mod issue_dispatch;
 pub mod issue_dispatch_run;
 pub mod jsonc_edit;
@@ -155,7 +166,10 @@ pub mod launch_records;
 pub mod lifetime_tag;
 pub mod lock_rank;
 pub mod logging;
+// PRD #1790 stage 2 (final review, auditor 1): Git working trees of any
+// repository lying inside a worktree a removal would delete.
 pub mod login_shell;
+pub mod nested_git_trees;
 // PRD #1223 M2: what the daemon reports about itself to a new-agent form.
 pub mod new_agent_options;
 pub mod opencode_manage;
@@ -187,9 +201,11 @@ pub mod pty_open_retry;
 // PRD #1401: the pull request an agent's work produced, on the session wire.
 pub mod pull_request;
 pub mod pull_request_info;
+// Issue #2418: the daemon's own check of the PR/issue references cards name.
 pub mod question;
 pub mod quota_block;
 pub mod quota_signals;
+pub mod reference_check;
 // PRD #1666 part 3 round 5-wake: an agent's release, read off its start-up header.
 pub mod release_scanner;
 pub mod remote;
@@ -199,6 +215,8 @@ pub mod remote_tunnel;
 pub mod repo_identity;
 pub mod report_recovery;
 pub mod retained_store;
+// Issue #2110: spacing between orchestration workers' agent starts.
+pub mod role_start_pacing;
 pub mod roles_cli;
 pub mod schedule_cli;
 // PRD #1885: a schedule's last fire, when it was refused as not approved.

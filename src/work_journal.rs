@@ -332,6 +332,43 @@ impl Workspace {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// PRD #1790 stage 2: the absolute path this workspace names, with a
+    /// leading `~` expanded against `home`. `None` when it names no absolute
+    /// path: a relative spelling (`.`, which [`Self::resolve`] writes for an
+    /// empty path), or a `~` with no meaningful home to expand it against.
+    ///
+    /// The redaction is lossy, so this is the path the line most likely
+    /// meant, not a proof: a caller that has an absolute path recorded for
+    /// the same place (a launch record's `cwd`) prefers that one
+    /// ([`Self::matches_path_with_home`]).
+    pub fn to_path_with_home(&self, home: &Path) -> Option<PathBuf> {
+        let text = self.0.as_str();
+        let rest = if text == "~" {
+            Some("")
+        } else {
+            text.strip_prefix("~/")
+        };
+        if let Some(rest) = rest {
+            if !home.is_absolute() || !home_is_meaningful(home) {
+                return None;
+            }
+            let mut path = home.to_path_buf();
+            for part in rest.split('/').filter(|part| !part.is_empty()) {
+                path.push(part);
+            }
+            return Some(path);
+        }
+        let path = Path::new(text);
+        path.is_absolute().then(|| path.to_path_buf())
+    }
+
+    /// PRD #1790 stage 2: whether `path` is written as this workspace when
+    /// redacted against `home`: the check that a recorded absolute path names
+    /// the same place before it is preferred to [`Self::to_path_with_home`].
+    pub fn matches_path_with_home(&self, path: &Path, home: &Path) -> bool {
+        path.is_absolute() && Self::from_path_with_home(path, home).as_ref() == Some(self)
+    }
 }
 
 /// `path` with `.` dropped and `..` taken back over the component before it,
@@ -452,6 +489,17 @@ pub enum CloseHow {
     TaskDone,
     FireDone,
     OrchestrationEnded,
+    /// PRD #1790 stage 2: a person dismissed the work from the interrupted
+    /// work list. Written on the listed root and every descendant of it that
+    /// had no `closed`, so nothing under it is listed again. An older daemon
+    /// cannot decode this value: it skips the line as unparsable (it does not
+    /// stop launch-record pruning), so after a downgrade it would list the
+    /// work again.
+    Dismissed,
+    /// PRD #1790 stage 2: a person reclaimed the work (its worktree was
+    /// removed, its branch kept). Written as [`CloseHow::Dismissed`] is, and
+    /// read by an older daemon the same way.
+    Reclaimed,
 }
 
 /// External references of a work. Every field is optional.

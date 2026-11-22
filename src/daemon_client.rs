@@ -1138,6 +1138,11 @@ pub struct AgentListing {
     /// client may read it — and, in particular, that it is comparable only
     /// against earlier values from the same connection.
     pub schedule_revision: Option<u64>,
+    /// Issue #1965: the orchestration roles whose agent exited and whose pane
+    /// is still open, sanitised at the wire boundary
+    /// ([`crate::ended_role::EndedRole::sanitized`]). Empty from a daemon that
+    /// does not report them.
+    pub ended_roles: Vec<crate::ended_role::EndedRole>,
     /// PRD #1666 part 2 (G-fix4): the daemon process that answered, from the
     /// `Hello` on the listing's own connection — what a client binds an action
     /// on one of these records to ([`DaemonClient::bound_to`]). `None` from an
@@ -1544,6 +1549,63 @@ pub enum GatedQuery<T> {
     Unsupported,
 }
 
+/// Issue #2418: the agent cards a daemon listed, and whether it builds the
+/// card tree.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentCardsAnswer {
+    pub list: crate::agent_cards::AgentCardList,
+    /// The daemon advertised [`crate::daemon_protocol::CAP_AGENT_CARDS_TREE`]:
+    /// each entry's `parent`, `rollup` and `checked_refs` are its own, and
+    /// the list is in the tree's order. `false` for an older daemon, whose
+    /// cards a client draws as roots with no roll-up.
+    pub tree: bool,
+}
+
+/// Issue #2418: the client side of the tree's gate. Against a daemon whose
+/// `capabilities` do not name [`crate::daemon_protocol::CAP_AGENT_CARDS_TREE`],
+/// any `parent`, `kind`, `rollup` or `checked_refs` an entry carries is dropped
+/// rather than drawn: those names mean the tree only from a daemon that says
+/// it builds one.
+pub fn tree_gate(
+    mut list: crate::agent_cards::AgentCardList,
+    capabilities: &DaemonCapabilities,
+) -> AgentCardsAnswer {
+    let tree = capabilities.supports(crate::daemon_protocol::CAP_AGENT_CARDS_TREE);
+    if !tree {
+        for entry in &mut list.entries {
+            entry.parent = None;
+            entry.kind = None;
+            entry.rollup = None;
+            entry.checked_refs.clear();
+        }
+    }
+    AgentCardsAnswer { list, tree }
+}
+
+/// PRD #1790 stage 2 (verification finding A): an interrupted work request a
+/// caller may pin to one daemon process, as
+/// [`DaemonClient::dismiss_interrupted_pinned`] answers it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PinnedQuery<T> {
+    /// Answered by the daemon process `instance` (its `Hello`'s
+    /// `instance_id`).
+    Answered { value: T, instance: Option<String> },
+    /// The daemon does not advertise the verb: nothing was sent.
+    Unsupported,
+    /// The daemon is not the pinned process: nothing was sent.
+    OtherInstance,
+}
+
+/// What [`DaemonClient::interrupted_work_on`] found.
+enum InterruptedAnswer {
+    Answered {
+        response: Box<AttachResponse>,
+        instance: Option<String>,
+    },
+    Unsupported,
+    OtherInstance,
+}
+
 /// Issue #2330: the pending in-deck approval requests a `Hello` (or
 /// snapshot) reply carries, sanitized, or `None` when the daemon does not
 /// advertise [`crate::daemon_protocol::CAP_TRUST_REQUESTS`] — a client shows
@@ -1696,7 +1758,10 @@ pub struct DaemonClient {
     /// end state the deck holds for an agent: [`Self::post_message`],
     /// [`Self::inbox_action`], [`Self::answer_question_while`],
     /// [`Self::stop_agent`], [`Self::set_agent_label`],
-    /// [`Self::seed_last_command`] and [`Self::record_orchestrator_context`].
+    /// [`Self::seed_last_command`] and [`Self::record_orchestrator_context`];
+    /// and the interrupted-work verbs ([`Self::list_interrupted_work`] and
+    /// its siblings), which also need the daemon to advertise
+    /// [`crate::daemon_protocol::CAP_INTERRUPTED_WORK`].
     /// The gate answers "is this daemon compatible?", not "is this the daemon
     /// the agent id came from?": an agent id is a per-daemon counter, so a
     /// compatible replacement reuses it. A caller acting on an id it learned
@@ -2120,6 +2185,12 @@ impl DaemonClient {
             ));
         }
         let schedule_revision = resp.schedule_revision;
+        let ended_roles: Vec<crate::ended_role::EndedRole> = resp
+            .ended_roles
+            .unwrap_or_default()
+            .into_iter()
+            .map(crate::ended_role::EndedRole::sanitized)
+            .collect();
         if let Some(mut records) = resp.agent_records {
             for rec in &mut records {
                 sanitize_record_tab_membership(rec);
@@ -2127,6 +2198,7 @@ impl DaemonClient {
             return Ok(AgentListing {
                 records,
                 schedule_revision,
+                ended_roles,
                 incarnation,
             });
         }
@@ -2167,6 +2239,7 @@ impl DaemonClient {
                 })
                 .collect(),
             schedule_revision,
+            ended_roles,
             incarnation,
         })
     }
@@ -3740,6 +3813,270 @@ impl DaemonClient {
         }
     }
 
+    /// PRD #1790 stage 2: send `request` on a connection of its own, after a
+    /// fresh `Hello{follow_on: true}` on that connection, and answer its
+    /// reply — or `None`, with no frame of it sent, unless that `Hello`
+    /// advertises [`crate::daemon_protocol::CAP_INTERRUPTED_WORK`] and
+    /// [`crate::daemon_protocol::CAP_HELLO_FOLLOW_ON`] and, when the caller
+    /// pinned a daemon process (`pinned_instance`), is from it. Pinning
+    /// matters most for reclaim and dismiss: an item id belongs to one
+    /// daemon's state directory. No cached capability set is consulted.
+    async fn interrupted_work_request(
+        &self,
+        request: &AttachRequest,
+        pinned_instance: Option<&str>,
+    ) -> Result<Option<AttachResponse>, ClientError> {
+        Ok(
+            match self.interrupted_work_on(request, pinned_instance).await? {
+                InterruptedAnswer::Answered { response, .. } => Some(*response),
+                InterruptedAnswer::Unsupported | InterruptedAnswer::OtherInstance => None,
+            },
+        )
+    }
+
+    /// [`Self::interrupted_work_request`], telling a daemon that does not
+    /// support the request from one that is not `pinned_instance`, and
+    /// answering which daemon process (the `Hello`'s `instance_id`) answered.
+    async fn interrupted_work_on(
+        &self,
+        request: &AttachRequest,
+        pinned_instance: Option<&str>,
+    ) -> Result<InterruptedAnswer, ClientError> {
+        // PR #2431 round 4 (Qodo): on a gated handle (the TUI's, the
+        // desktop's) the `Hello` this request follows is the gate's own, so a
+        // daemon on another protocol, one the handle's admission refuses, or
+        // a process other than the one it is bound to is sent nothing. An
+        // ungated handle (the one-shot CLI's) keeps its policy and checks
+        // only the capability.
+        let (mut rd, mut wr, capabilities, instance) = if self.protocol_gate || self.bound.is_some()
+        {
+            let (rd, wr, capabilities, incarnation) = self.protocol_hello(true).await?;
+            (
+                rd,
+                wr,
+                capabilities,
+                incarnation.as_deref().map(str::to_string),
+            )
+        } else {
+            let (mut rd, mut wr) = self.connect().await?;
+            let hello = issue_command(
+                &mut rd,
+                &mut wr,
+                &AttachRequest::Hello {
+                    client_version: crate::daemon_protocol::PROTOCOL_VERSION,
+                    client_build_version: None,
+                    follow_on: true,
+                },
+            )
+            .await?;
+            if !hello.ok {
+                return Ok(InterruptedAnswer::Unsupported);
+            }
+            (
+                rd,
+                wr,
+                DaemonCapabilities::from_hello(&hello),
+                hello.instance_id,
+            )
+        };
+        if !capabilities.supports(crate::daemon_protocol::CAP_INTERRUPTED_WORK)
+            || !capabilities.supports(crate::daemon_protocol::CAP_HELLO_FOLLOW_ON)
+        {
+            return Ok(InterruptedAnswer::Unsupported);
+        }
+        if let Some(pinned) = pinned_instance
+            && instance.as_deref() != Some(pinned)
+        {
+            return Ok(InterruptedAnswer::OtherInstance);
+        }
+        let response = Box::new(issue_command(&mut rd, &mut wr, request).await?);
+        Ok(InterruptedAnswer::Answered { response, instance })
+    }
+
+    /// PRD #1790 stage 2 (verification finding A): [`Self::list_interrupted_work`],
+    /// also answering the daemon process that listed it, so a later request
+    /// can be pinned to that process.
+    pub async fn list_interrupted_work_pinned(
+        &self,
+        git: bool,
+        pinned_instance: Option<&str>,
+    ) -> Result<PinnedQuery<crate::interrupted_work::InterruptedList>, ClientError> {
+        let request = AttachRequest::ListInterruptedWork { git };
+        let (response, instance) = match self.interrupted_work_on(&request, pinned_instance).await?
+        {
+            InterruptedAnswer::Answered { response, instance } => (response, instance),
+            InterruptedAnswer::Unsupported => return Ok(PinnedQuery::Unsupported),
+            InterruptedAnswer::OtherInstance => return Ok(PinnedQuery::OtherInstance),
+        };
+        match response.interrupted_work {
+            Some(list) => Ok(PinnedQuery::Answered {
+                value: list,
+                instance,
+            }),
+            None => Err(ClientError::Server(response.error.unwrap_or_else(|| {
+                "the daemon answered ListInterruptedWork with no list".into()
+            }))),
+        }
+    }
+
+    /// PRD #1790 stage 2 (verification finding A): [`Self::dismiss_interrupted`],
+    /// telling a daemon that is not `pinned_instance` from one that does not
+    /// support the request, and answering the daemon process that dismissed.
+    /// Its capability check, its pin check and the dismissal share one
+    /// connection, so a request withheld from another process sent it nothing.
+    pub async fn dismiss_interrupted_pinned(
+        &self,
+        ids: Vec<String>,
+        all: bool,
+        caller: Option<crate::daemon_protocol::CallerClaim>,
+        pinned_instance: Option<&str>,
+    ) -> Result<PinnedQuery<crate::interrupted_work::DismissOutcome>, ClientError> {
+        let request = AttachRequest::DismissInterrupted { ids, all, caller };
+        let (response, instance) = match self.interrupted_work_on(&request, pinned_instance).await?
+        {
+            InterruptedAnswer::Answered { response, instance } => (response, instance),
+            InterruptedAnswer::Unsupported => return Ok(PinnedQuery::Unsupported),
+            InterruptedAnswer::OtherInstance => return Ok(PinnedQuery::OtherInstance),
+        };
+        match response.interrupted_dismiss {
+            Some(outcome) => Ok(PinnedQuery::Answered {
+                value: outcome,
+                instance,
+            }),
+            None => Err(ClientError::Server(response.error.unwrap_or_else(|| {
+                "the daemon answered DismissInterrupted with no outcome".into()
+            }))),
+        }
+    }
+
+    /// PRD #1790 stage 2: the interrupted work list
+    /// ([`AttachRequest::ListInterruptedWork`]), with each item's Git and pull
+    /// request facts when `git` is set. [`GatedQuery::Unsupported`], with
+    /// nothing sent, from a daemon that does not advertise
+    /// [`crate::daemon_protocol::CAP_INTERRUPTED_WORK`] on a fresh `Hello`, or
+    /// that is not `pinned_instance`.
+    pub async fn list_interrupted_work(
+        &self,
+        git: bool,
+        pinned_instance: Option<&str>,
+    ) -> Result<GatedQuery<crate::interrupted_work::InterruptedList>, ClientError> {
+        let request = AttachRequest::ListInterruptedWork { git };
+        let Some(resp) = self
+            .interrupted_work_request(&request, pinned_instance)
+            .await?
+        else {
+            return Ok(GatedQuery::Unsupported);
+        };
+        match resp.interrupted_work {
+            Some(list) => Ok(GatedQuery::Answered(list)),
+            None => Err(ClientError::Server(resp.error.unwrap_or_else(|| {
+                "the daemon answered ListInterruptedWork with no list".into()
+            }))),
+        }
+    }
+
+    /// PRD #1790 stage 2: one interrupted item and its kept reports' bodies
+    /// ([`AttachRequest::ShowInterrupted`]): the first ones, or with `report`
+    /// that one of the item's. Gated as [`Self::list_interrupted_work`] is.
+    /// An id that matches no item, or a report that is not the item's, is a
+    /// [`ClientError::Server`] carrying the daemon's sentence.
+    pub async fn show_interrupted(
+        &self,
+        id: &str,
+        report: Option<&str>,
+        pinned_instance: Option<&str>,
+    ) -> Result<GatedQuery<crate::interrupted_work::InterruptedShow>, ClientError> {
+        self.show_interrupted_page(id, report, None, pinned_instance)
+            .await
+    }
+
+    /// PRD #1790 stage 2: [`Self::show_interrupted`] of one page of the
+    /// item's kept reports, from its `reports_from`-th on (reviewer 1); the
+    /// answer's `next_reports_from` says where the next page starts.
+    pub async fn show_interrupted_page(
+        &self,
+        id: &str,
+        report: Option<&str>,
+        reports_from: Option<usize>,
+        pinned_instance: Option<&str>,
+    ) -> Result<GatedQuery<crate::interrupted_work::InterruptedShow>, ClientError> {
+        let request = AttachRequest::ShowInterrupted {
+            id: id.to_string(),
+            report: report.map(str::to_string),
+            reports_from,
+        };
+        let Some(resp) = self
+            .interrupted_work_request(&request, pinned_instance)
+            .await?
+        else {
+            return Ok(GatedQuery::Unsupported);
+        };
+        match resp.interrupted_item {
+            Some(shown) => Ok(GatedQuery::Answered(shown)),
+            None => Err(ClientError::Server(resp.error.unwrap_or_else(|| {
+                "the daemon answered ShowInterrupted with no item".into()
+            }))),
+        }
+    }
+
+    /// PRD #1790 stage 2: reclaim an interrupted item — remove its worktree,
+    /// keep its branch — or with `dry_run` ask what that would do
+    /// ([`AttachRequest::ReclaimInterrupted`]). `caller` is the calling
+    /// agent's pane claim, `None` for a person; the daemon refuses an agent
+    /// (decision D4). Refusals are in the outcome, not an error. Gated as
+    /// [`Self::list_interrupted_work`] is.
+    pub async fn reclaim_interrupted(
+        &self,
+        id: &str,
+        dry_run: bool,
+        caller: Option<crate::daemon_protocol::CallerClaim>,
+        pinned_instance: Option<&str>,
+    ) -> Result<GatedQuery<crate::interrupted_work::ReclaimOutcome>, ClientError> {
+        let request = AttachRequest::ReclaimInterrupted {
+            id: id.to_string(),
+            dry_run,
+            caller,
+        };
+        let Some(resp) = self
+            .interrupted_work_request(&request, pinned_instance)
+            .await?
+        else {
+            return Ok(GatedQuery::Unsupported);
+        };
+        match resp.interrupted_reclaim {
+            Some(outcome) => Ok(GatedQuery::Answered(outcome)),
+            None => Err(ClientError::Server(resp.error.unwrap_or_else(|| {
+                "the daemon answered ReclaimInterrupted with no outcome".into()
+            }))),
+        }
+    }
+
+    /// PRD #1790 stage 2: dismiss the interrupted items `ids` name, or every
+    /// listed item with `all` ([`AttachRequest::DismissInterrupted`]).
+    /// `caller` as for [`Self::reclaim_interrupted`]. Refusals are in the
+    /// outcome, not an error. Gated as [`Self::list_interrupted_work`] is.
+    pub async fn dismiss_interrupted(
+        &self,
+        ids: Vec<String>,
+        all: bool,
+        caller: Option<crate::daemon_protocol::CallerClaim>,
+        pinned_instance: Option<&str>,
+    ) -> Result<GatedQuery<crate::interrupted_work::DismissOutcome>, ClientError> {
+        let request = AttachRequest::DismissInterrupted { ids, all, caller };
+        let Some(resp) = self
+            .interrupted_work_request(&request, pinned_instance)
+            .await?
+        else {
+            return Ok(GatedQuery::Unsupported);
+        };
+        match resp.interrupted_dismiss {
+            Some(outcome) => Ok(GatedQuery::Answered(outcome)),
+            None => Err(ClientError::Server(resp.error.unwrap_or_else(|| {
+                "the daemon answered DismissInterrupted with no outcome".into()
+            }))),
+        }
+    }
+
     /// PRD #1589 — send [`AttachRequest::CloseAgents`] and return the daemon's
     /// report. Refusals are in the report, not an error.
     ///
@@ -3915,20 +4252,35 @@ impl DaemonClient {
     /// [`crate::daemon_protocol::CAP_HELLO_FOLLOW_ON`], left open for one card
     /// request, or `None` when the daemon advertises either not — and then
     /// nothing follows the `Hello`. On a gated or bound handle the `Hello` is
-    /// the handle's own protocol check.
+    /// the handle's own protocol check. Also answers what that `Hello`
+    /// advertised.
     async fn agent_cards_connection(
         &self,
-    ) -> Result<Option<(TransportReadHalf, TransportWriteHalf)>, ClientError> {
+    ) -> Result<Option<(TransportReadHalf, TransportWriteHalf, DaemonCapabilities)>, ClientError>
+    {
+        self.follow_on_connection(crate::daemon_protocol::CAP_AGENT_CARDS)
+            .await
+    }
+
+    /// A connection whose own `Hello` advertised `capability` and
+    /// [`crate::daemon_protocol::CAP_HELLO_FOLLOW_ON`], left open for one
+    /// request, or `None` when the daemon advertises either not — and then
+    /// nothing follows the `Hello` ([`Self::agent_cards_connection`]). Also
+    /// answers what that `Hello` advertised.
+    async fn follow_on_connection(
+        &self,
+        capability: &str,
+    ) -> Result<Option<(TransportReadHalf, TransportWriteHalf, DaemonCapabilities)>, ClientError>
+    {
         let supported = |caps: &DaemonCapabilities| {
-            caps.supports(crate::daemon_protocol::CAP_AGENT_CARDS)
-                && caps.supports(crate::daemon_protocol::CAP_HELLO_FOLLOW_ON)
+            caps.supports(capability) && caps.supports(crate::daemon_protocol::CAP_HELLO_FOLLOW_ON)
         };
         if self.protocol_gate || self.bound.is_some() {
             if !supported(&self.capabilities().await?) {
                 return Ok(None);
             }
             let (rd, wr, caps, _) = self.protocol_hello(true).await?;
-            return Ok(supported(&caps).then_some((rd, wr)));
+            return Ok(supported(&caps).then_some((rd, wr, caps)));
         }
         let (mut rd, mut wr) = self.connect().await?;
         let hello = issue_command(
@@ -3949,7 +4301,7 @@ impl DaemonClient {
             ));
         }
         let caps = DaemonCapabilities::from_hello(&hello);
-        Ok(supported(&caps).then_some((rd, wr)))
+        Ok(supported(&caps).then_some((rd, wr, caps)))
     }
 
     /// PRD #2374: every live agent card, as the daemon computed it, in
@@ -3959,7 +4311,19 @@ impl DaemonClient {
     pub async fn list_agent_cards(
         &self,
     ) -> Result<GatedQuery<crate::agent_cards::AgentCardList>, ClientError> {
-        let Some((mut rd, mut wr)) = self.agent_cards_connection().await? else {
+        Ok(match self.list_agent_cards_tree().await? {
+            GatedQuery::Answered(cards) => GatedQuery::Answered(cards.list),
+            GatedQuery::Unsupported => GatedQuery::Unsupported,
+        })
+    }
+
+    /// Issue #2418: [`Self::list_agent_cards`], with whether the daemon
+    /// builds the card tree ([`crate::daemon_protocol::CAP_AGENT_CARDS_TREE`],
+    /// read from the `Hello` on the list's own connection). Gated by
+    /// [`tree_gate`], so a daemon that does not advertise the tree hands the
+    /// caller no tree fields to draw from.
+    pub async fn list_agent_cards_tree(&self) -> Result<GatedQuery<AgentCardsAnswer>, ClientError> {
+        let Some((mut rd, mut wr, caps)) = self.agent_cards_connection().await? else {
             return Ok(GatedQuery::Unsupported);
         };
         let resp = issue_command(&mut rd, &mut wr, &AttachRequest::ListAgentCards).await?;
@@ -3970,8 +4334,43 @@ impl DaemonClient {
             ));
         }
         resp.agent_cards
-            .map(GatedQuery::Answered)
+            .map(|list| GatedQuery::Answered(tree_gate(list, &caps)))
             .ok_or_else(|| ClientError::Malformed("list-agent-cards answered no cards".into()))
+    }
+
+    /// Issue #2454: tell the daemon the user opened the agent in `pane_id`
+    /// (`agent_id` naming the generation shown, when known), which deals with
+    /// the reason its card report raised. **Withheld unless the daemon's
+    /// `Hello` on the same connection advertised
+    /// [`crate::daemon_protocol::CAP_AGENT_OPENED`]**, answering
+    /// [`GatedQuery::Unsupported`] without sending anything: an older daemon's
+    /// cards keep the reason until the agent publishes again.
+    pub async fn agent_opened(
+        &self,
+        pane_id: &str,
+        agent_id: Option<&str>,
+    ) -> Result<GatedQuery<()>, ClientError> {
+        let Some((mut rd, mut wr, _)) = self
+            .follow_on_connection(crate::daemon_protocol::CAP_AGENT_OPENED)
+            .await?
+        else {
+            return Ok(GatedQuery::Unsupported);
+        };
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::AgentOpened {
+                pane_id: pane_id.to_string(),
+                agent_id: agent_id.map(str::to_string),
+            },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error.unwrap_or_else(|| "agent-opened failed".into()),
+            ));
+        }
+        Ok(GatedQuery::Answered(()))
     }
 
     /// PRD #2374: the resolved agent-card catalog. Withheld like
@@ -3979,7 +4378,7 @@ impl DaemonClient {
     pub async fn agent_card_catalog(
         &self,
     ) -> Result<GatedQuery<crate::card_catalog::ResolvedCatalog>, ClientError> {
-        let Some((mut rd, mut wr)) = self.agent_cards_connection().await? else {
+        let Some((mut rd, mut wr, _)) = self.agent_cards_connection().await? else {
             return Ok(GatedQuery::Unsupported);
         };
         let resp = issue_command(&mut rd, &mut wr, &AttachRequest::AgentCardCatalog).await?;
@@ -4013,7 +4412,7 @@ impl DaemonClient {
         text: Option<&str>,
     ) -> Result<GatedQuery<crate::agent_cards::CardActionResult>, ClientError> {
         let bound = self.bound_to(Incarnation::from(Some(target.instance_id.clone())));
-        let Some((mut rd, mut wr)) = bound.agent_cards_connection().await? else {
+        let Some((mut rd, mut wr, _)) = bound.agent_cards_connection().await? else {
             return Ok(GatedQuery::Unsupported);
         };
         let resp = issue_command(
@@ -4782,6 +5181,12 @@ impl EventSubscription {
                         // `trust_requests_of` does for `Hello`.
                         Ok(BroadcastMsg::TrustRequests(list)) => {
                             return Ok(Some(BroadcastMsg::TrustRequests(list.sanitized())));
+                        }
+                        // Issue #1965: an exited role carries the pane's last
+                        // output, which is untrusted text bound for a card;
+                        // sanitised here, as `list_agents_detailed` does.
+                        Ok(BroadcastMsg::RoleEnded(role)) => {
+                            return Ok(Some(BroadcastMsg::RoleEnded(role.sanitized())));
                         }
                         Ok(msg) => return Ok(Some(msg)),
                         Err(e) => {
@@ -6801,6 +7206,125 @@ mod tests {
         });
     }
 
+    /// Issue #2418 (T8) — the daemon advertises `agent-cards-tree` beside
+    /// `agent-cards`, and a client reads the tree only from a daemon whose
+    /// `Hello` on the list's own connection named it: against one that
+    /// lists cards but does not, the list is answered and is not a tree.
+    #[cfg(unix)]
+    #[test]
+    fn the_card_tree_is_read_only_from_a_daemon_that_advertises_it() {
+        use crate::daemon_protocol::{
+            CAP_AGENT_CARDS, CAP_AGENT_CARDS_TREE, CAP_HELLO_FOLLOW_ON, DAEMON_CAPABILITIES,
+        };
+        assert!(DAEMON_CAPABILITIES.contains(&CAP_AGENT_CARDS));
+        assert!(DAEMON_CAPABILITIES.contains(&CAP_AGENT_CARDS_TREE));
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        runtime.block_on(async {
+            let cards = Some(&[CAP_AGENT_CARDS, CAP_HELLO_FOLLOW_ON][..]);
+            assert_eq!(agent_card_request_inner(cards, 0).await, (true, 1));
+            assert_eq!(
+                agent_card_request_inner(cards, 3).await,
+                (false, 1),
+                "listed, but not a tree"
+            );
+            let tree = Some(&[CAP_AGENT_CARDS, CAP_HELLO_FOLLOW_ON, CAP_AGENT_CARDS_TREE][..]);
+            assert_eq!(agent_card_request_inner(tree, 3).await, (true, 1));
+            // The tree capability alone lists nothing.
+            let alone = Some(&[CAP_AGENT_CARDS_TREE, CAP_HELLO_FOLLOW_ON][..]);
+            assert_eq!(agent_card_request_inner(alone, 3).await, (false, 0));
+        });
+    }
+
+    /// Issue #2418 (T8) — [`tree_gate`] keeps the tree fields from a daemon
+    /// that advertises the tree and drops them from one that does not, so a
+    /// client never draws a parent or roll-up the daemon did not vouch for.
+    #[test]
+    fn the_tree_gate_drops_tree_fields_a_daemon_did_not_advertise() {
+        use crate::daemon_protocol::{CAP_AGENT_CARDS, CAP_AGENT_CARDS_TREE};
+        let entry: crate::agent_cards::AgentCardEntry = serde_json::from_value(serde_json::json!({
+            "key": "p/2", "instance_id": "i", "pane_id": "p", "agent_id": "2",
+            "name": "coder", "status": "working", "needs_you": false,
+            "needs_you_reasons": [],
+            "group": {"id": "standalone", "kind": "standalone"},
+            "primary_action_id": "open",
+            "facts": {"source": "deck"},
+            "parent": "d/1",
+            "rollup": {"total": 1, "worst": "idle", "counts": {"idle": 1}, "needs_you": 0},
+            "checked_refs": [{"field": "pull-request", "kind": "pull_request", "claim": "#3",
+                              "result": {"status": "pending"}}],
+            "revision": 1, "updated_at": "2026-11-20T10:00:00Z",
+        }))
+        .expect("an entry with the tree fields decodes");
+        let list = crate::agent_cards::AgentCardList {
+            instance_id: "i".into(),
+            revision: 1,
+            entries: vec![entry],
+            catalog_errors: Vec::new(),
+        };
+        let caps = |list: &[&str]| {
+            DaemonCapabilities::from_hello(&AttachResponse {
+                capabilities: Some(list.iter().map(|c| c.to_string()).collect()),
+                ..AttachResponse::hello(PROTOCOL_VERSION)
+            })
+        };
+        let kept = tree_gate(
+            list.clone(),
+            &caps(&[CAP_AGENT_CARDS, CAP_AGENT_CARDS_TREE]),
+        );
+        assert!(kept.tree);
+        assert_eq!(kept.list, list);
+        let dropped = tree_gate(list.clone(), &caps(&[CAP_AGENT_CARDS]));
+        assert!(!dropped.tree);
+        let e = &dropped.list.entries[0];
+        assert!(e.parent.is_none() && e.rollup.is_none() && e.checked_refs.is_empty());
+        assert_eq!(e.status, "working", "the rest of the entry is untouched");
+        let older = tree_gate(list, &DaemonCapabilities::absent());
+        assert!(!older.tree);
+    }
+
+    /// Issue #2418 review (desktop 6) — a card's `kind` is a tree field like
+    /// `parent`: [`tree_gate`] keeps it from a daemon that advertises the tree
+    /// and drops it from one that does not.
+    #[test]
+    fn the_tree_gate_drops_a_kind_the_daemon_did_not_advertise() {
+        use crate::daemon_protocol::{CAP_AGENT_CARDS, CAP_AGENT_CARDS_TREE};
+        let entry: crate::agent_cards::AgentCardEntry = serde_json::from_value(serde_json::json!({
+            "key": "d/1", "instance_id": "i", "pane_id": "d", "agent_id": "1",
+            "name": "dispatcher", "status": "idle", "needs_you": false,
+            "needs_you_reasons": [],
+            "group": {"id": "dispatcher:d/1", "kind": "dispatcher"},
+            "primary_action_id": "open",
+            "facts": {"source": "deck"},
+            "kind": "dispatcher",
+            "revision": 1, "updated_at": "2026-11-20T10:00:00Z",
+        }))
+        .expect("an entry with a kind decodes");
+        assert_eq!(entry.kind.as_deref(), Some("dispatcher"));
+        let list = crate::agent_cards::AgentCardList {
+            instance_id: "i".into(),
+            revision: 1,
+            entries: vec![entry],
+            catalog_errors: Vec::new(),
+        };
+        let caps = |list: &[&str]| {
+            DaemonCapabilities::from_hello(&AttachResponse {
+                capabilities: Some(list.iter().map(|c| c.to_string()).collect()),
+                ..AttachResponse::hello(PROTOCOL_VERSION)
+            })
+        };
+        let kept = tree_gate(
+            list.clone(),
+            &caps(&[CAP_AGENT_CARDS, CAP_AGENT_CARDS_TREE]),
+        );
+        assert_eq!(kept.list.entries[0].kind.as_deref(), Some("dispatcher"));
+        let dropped = tree_gate(list, &caps(&[CAP_AGENT_CARDS]));
+        assert!(dropped.list.entries[0].kind.is_none());
+    }
+
     /// PRD #2374 (review B3) — `invoke_card_action` binds itself to the
     /// daemon process that listed the card: against a daemon whose `Hello`
     /// names another process, nothing follows the `Hello` and the call fails
@@ -6917,6 +7441,11 @@ mod tests {
         let client = DaemonClient::new(path);
         let answered = match method {
             0 => matches!(client.list_agent_cards().await, Ok(GatedQuery::Answered(_))),
+            // Issue #2418: answered AND read as a tree.
+            3 => matches!(
+                client.list_agent_cards_tree().await,
+                Ok(GatedQuery::Answered(AgentCardsAnswer { tree: true, .. }))
+            ),
             1 => matches!(
                 client.agent_card_catalog().await,
                 Ok(GatedQuery::Answered(_))
@@ -7989,6 +8518,193 @@ mod tests {
                 assert_eq!(listed, usize::from(asked), "{ops:?}");
                 assert_eq!(matches!(answer, GatedQuery::Answered(_)), asked, "{ops:?}");
                 drop(dir);
+            }
+        });
+    }
+
+    /// PRD #1790 stage 2: each interrupted work verb is sent only on a
+    /// connection whose fresh `Hello` advertises `interrupted-work` and the
+    /// follow-on, from the daemon the caller pinned. A daemon without the
+    /// capability, one without the follow-on, and one answering from another
+    /// incarnation each get no verb frame, and the call answers unsupported; a
+    /// daemon that advertises both and matches is asked, once.
+    #[cfg(unix)]
+    #[test]
+    fn interrupted_work_verbs_are_sent_only_after_a_fresh_advertisement() {
+        use crate::daemon_protocol::{CAP_HELLO_FOLLOW_ON, CAP_INTERRUPTED_WORK};
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let verbs = [
+                "list-interrupted-work",
+                "show-interrupted",
+                "reclaim-interrupted",
+                "dismiss-interrupted",
+            ];
+            for verb in verbs {
+                for (capabilities, instance, pinned, asked) in [
+                    (vec![CAP_HELLO_FOLLOW_ON], "i1", Some("i1"), false),
+                    (vec![CAP_INTERRUPTED_WORK], "i1", Some("i1"), false),
+                    (
+                        vec![CAP_HELLO_FOLLOW_ON, CAP_INTERRUPTED_WORK],
+                        "i2",
+                        Some("i1"),
+                        false,
+                    ),
+                    (
+                        vec![CAP_HELLO_FOLLOW_ON, CAP_INTERRUPTED_WORK],
+                        "i1",
+                        Some("i1"),
+                        true,
+                    ),
+                    (
+                        vec![CAP_HELLO_FOLLOW_ON, CAP_INTERRUPTED_WORK],
+                        "i3",
+                        None,
+                        true,
+                    ),
+                ] {
+                    let (dir, path, listener) = {
+                        let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+                        let dir = tempfile::tempdir().unwrap();
+                        let path = dir.path().join("interrupted-daemon.sock");
+                        let listener = bind_attach_listener(&path).expect("bind scripted daemon");
+                        (dir, path, listener)
+                    };
+                    let ops = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+                    let seen = Arc::clone(&ops);
+                    let server = tokio::spawn(async move {
+                        let Ok(Ok(mut stream)) = tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            listener.accept(),
+                        )
+                        .await
+                        else {
+                            return;
+                        };
+                        while let Ok(Ok(Some((KIND_REQ, payload)))) = tokio::time::timeout(
+                            std::time::Duration::from_millis(500),
+                            read_frame(&mut stream),
+                        )
+                        .await
+                        {
+                            let request: serde_json::Value =
+                                serde_json::from_slice(&payload).unwrap();
+                            let op = request["op"].as_str().unwrap_or_default().to_string();
+                            seen.lock().unwrap().push(op.clone());
+                            let item = || crate::interrupted_work::InterruptedItem {
+                                id: crate::work_journal::WorkId::parse(
+                                    "w-abcdefgh-0000000000000001",
+                                )
+                                .unwrap(),
+                                kind: crate::interrupted_work::ItemKind::Unit,
+                                name: None,
+                                issue: None,
+                                repo: None,
+                                branch: None,
+                                worktree: None,
+                                launcher: None,
+                                last_entry: crate::interrupted_work::LastEntry {
+                                    kind: "attempt_ended".into(),
+                                    ts_ms: 1,
+                                },
+                                reports: Vec::new(),
+                                reports_omitted: 0,
+                                cut: false,
+                                progress: Default::default(),
+                                git: None,
+                            };
+                            let response = match op.as_str() {
+                                "hello" => AttachResponse {
+                                    capabilities: Some(
+                                        capabilities.iter().map(|c| c.to_string()).collect(),
+                                    ),
+                                    instance_id: Some(instance.to_string()),
+                                    ..AttachResponse::hello(PROTOCOL_VERSION)
+                                },
+                                "list-interrupted-work" => AttachResponse {
+                                    interrupted_work: Some(
+                                        crate::interrupted_work::InterruptedList::default(),
+                                    ),
+                                    ..AttachResponse::ok()
+                                },
+                                "show-interrupted" => AttachResponse {
+                                    interrupted_item: Some(
+                                        crate::interrupted_work::InterruptedShow {
+                                            item: item(),
+                                            reports: Vec::new(),
+                                            incomplete: false,
+                                            bodies_omitted: 0,
+                                            reports_from: 0,
+                                            next_reports_from: None,
+                                        },
+                                    ),
+                                    ..AttachResponse::ok()
+                                },
+                                "reclaim-interrupted" => AttachResponse {
+                                    interrupted_reclaim: Some(
+                                        crate::interrupted_work::ReclaimOutcome::refused(
+                                            None,
+                                            true,
+                                            crate::interrupted_work::RefusalReason::NotListed,
+                                        ),
+                                    ),
+                                    ..AttachResponse::ok()
+                                },
+                                "dismiss-interrupted" => AttachResponse {
+                                    interrupted_dismiss: Some(
+                                        crate::interrupted_work::DismissOutcome::default(),
+                                    ),
+                                    ..AttachResponse::ok()
+                                },
+                                _ => AttachResponse::ok(),
+                            };
+                            crate::daemon_protocol::write_resp(&mut stream, &response)
+                                .await
+                                .unwrap();
+                        }
+                    });
+                    let client = DaemonClient::new(path);
+                    let answered = match verb {
+                        "list-interrupted-work" => matches!(
+                            client.list_interrupted_work(true, pinned).await.unwrap(),
+                            GatedQuery::Answered(_)
+                        ),
+                        "show-interrupted" => matches!(
+                            client.show_interrupted("w-1", None, pinned).await.unwrap(),
+                            GatedQuery::Answered(_)
+                        ),
+                        "reclaim-interrupted" => matches!(
+                            client
+                                .reclaim_interrupted("w-1", true, None, pinned)
+                                .await
+                                .unwrap(),
+                            GatedQuery::Answered(_)
+                        ),
+                        _ => matches!(
+                            client
+                                .dismiss_interrupted(Vec::new(), true, None, pinned)
+                                .await
+                                .unwrap(),
+                            GatedQuery::Answered(_)
+                        ),
+                    };
+                    drop(client);
+                    server.await.unwrap();
+                    let ops = ops.lock().unwrap().clone();
+                    assert_eq!(ops.first().map(String::as_str), Some("hello"), "{ops:?}");
+                    let sent = ops.iter().filter(|op| op.as_str() == verb).count();
+                    assert_eq!(sent, usize::from(asked), "{verb}: {ops:?}");
+                    assert_eq!(
+                        ops.iter().filter(|op| verbs.contains(&op.as_str())).count(),
+                        sent,
+                        "{verb}: no other verb is sent: {ops:?}"
+                    );
+                    assert_eq!(answered, asked, "{verb}: {ops:?}");
+                    drop(dir);
+                }
             }
         });
     }
@@ -10146,6 +10862,44 @@ mod protocol_gate_tests {
                 client.subscribe_turn_replies("7").await.map(drop),
             ),
             ("list-inbox", client.list_inbox(None).await.map(drop)),
+            // PR #2431 round 4 (Qodo): the interrupted-work verbs, which
+            // open their own `Hello`, go through the gate too.
+            (
+                "list-interrupted",
+                client.list_interrupted_work(false, None).await.map(drop),
+            ),
+            (
+                "list-interrupted-pinned",
+                client
+                    .list_interrupted_work_pinned(false, None)
+                    .await
+                    .map(drop),
+            ),
+            (
+                "show-interrupted",
+                client.show_interrupted("w-1", None, None).await.map(drop),
+            ),
+            (
+                "reclaim-interrupted",
+                client
+                    .reclaim_interrupted("w-1", false, None, None)
+                    .await
+                    .map(drop),
+            ),
+            (
+                "dismiss-interrupted",
+                client
+                    .dismiss_interrupted(vec!["w-1".into()], false, None, None)
+                    .await
+                    .map(drop),
+            ),
+            (
+                "dismiss-interrupted-pinned",
+                client
+                    .dismiss_interrupted_pinned(vec!["w-1".into()], false, None, None)
+                    .await
+                    .map(drop),
+            ),
         ]
     }
 
@@ -10189,6 +10943,10 @@ mod protocol_gate_tests {
             "subscribe-events-with-snapshot",
             "subscribe-turn-replies",
             "list-inbox",
+            "list-interrupted-work",
+            "show-interrupted",
+            "reclaim-interrupted",
+            "dismiss-interrupted",
         ] {
             assert!(
                 reached.iter().any(|r| r == op),

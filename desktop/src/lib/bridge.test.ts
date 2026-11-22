@@ -1620,6 +1620,25 @@ describe("TauriDeckBridge", () => {
     expect(mapDesktopSnapshot(structuredClone(snapshot)).scheduleRevision).toBeUndefined();
   });
 
+  /// Scenario: A connected deck's reply lists an orchestration role whose agent exited; the mapped snapshot carries it for the
+  /// overview to draw. A deck that is not connected, and a reply that lists none, carry none.
+  it("carries the exited orchestration roles of a connected deck only (issue #1965)", async () => {
+    const { mapDesktopSnapshot } = await import("./bridge");
+    const endedRoles = [{ paneId: "4", agentId: "4", roleIndex: 1, roleName: "reviewer", orchestrationId: "run", orchestrationName: "orch", reason: "its command exited (code 1)", headline: "reviewer exited: its command exited (code 1)", lastOutput: ["boom"] }];
+    const connected = structuredClone(snapshot);
+    connected.connection.status = "connected";
+    connected.endedRoles = endedRoles;
+    expect(mapDesktopSnapshot(connected).endedRoles).toEqual(endedRoles);
+
+    const disconnected = structuredClone(connected);
+    disconnected.connection.status = "disconnected";
+    expect(mapDesktopSnapshot(disconnected).endedRoles).toBeUndefined();
+
+    const none = structuredClone(snapshot);
+    none.connection.status = "connected";
+    expect(mapDesktopSnapshot(none).endedRoles).toBeUndefined();
+  });
+
   /**
    * The M8 audit's cwd finding. `src/agent_pty.rs` accepts any non-empty,
    * bounded, control-free working directory, so `"Unavailable"` — the daemon's

@@ -228,6 +228,16 @@ action_words = ["open", "show", "see", "focus", "enlarge", "zoom", "look", "watc
   name = "agent"
   kind = "agent_ref"
 
+# Issue #2138 — the "HOW MANY" sentence is for fixture `show-counters-how-many`
+# ("how many agents are running", on the dashboard): this row's "asks which
+# agents are running" took it from `show_dashboard_counters` (issue #2312's
+# row, added after it) in 18 of 20 runs against `gpt-5-mini`; with the
+# sentence, 20 of 20, and `open-overview-running` ("which agents are
+# running?") stays this row's, 10 of 10 (2026-11-21). Re-measure it after
+# any change to this table, which can move fixtures that share no row with
+# it: the "reset" clause below, on its own, sent "browse docs" to
+# `open_new_agent` in 16 of 30 replays of that fixture as it stood then, with
+# the listing declared and the dialog not (23 of 30 went to `open_dir` before).
 [[commands]]
 id          = "open_overview"
 description = """Leave the Daemons screen and show the agent dashboard: every agent of the daemons
@@ -235,8 +245,9 @@ the Daemon selector is showing, in one list, with each one's status and activity
 selection — with the selector on one daemon it shows that daemon's agents only — so a request to
 select, switch to or show all daemons is `switch_deck`, not this one. Use when the user asks to see
 everything, all the agents, the whole fleet, the dashboard (the label of the rail's Dashboard
-button) or the overview, or asks which agents are running or what needs attention. It keeps
-the dashboard's filter as it is: "show everything", "show all agents", "clear the filter" and
+button) or the overview, or asks which agents are running or what needs attention.
+A question about HOW MANY agents there are, are running or need something is `show_dashboard_counters`, not this one.
+It keeps the dashboard's filter as it is: "show everything", "show all agents", "clear the filter" and
 "reset" ask for the WHOLE dashboard, unfiltered, and are `clear_dashboard_filter`, which opens the
 dashboard too."""
 invoke      = "openOverview"
@@ -358,7 +369,7 @@ description = """Clear the agent dashboard's filter and show the whole dashboard
 unfiltered — opening the dashboard from any other screen as well. Only when the user asks for
 EVERYTHING, all agents or no filter: a request for the dashboard that says none of that is
 `open_overview`, even where that cannot run. Use for show everything, show
-all agents, show all, clear the filter, remove the filter, unfiltered, or reset. With no filter
+all agents, show all, clear the filter, remove the filter, unfiltered, or reset — a bare "reset" said on its own means THIS one. With no filter
 set it simply opens the dashboard, as `open_overview` does. Filtering to some agents is
 `filter_dashboard`; opening one agent is `open_agent`. Clearing an agent's PROMPT — "clear the
 prompt", "clear it", "clear everything" in an agent's pane — is `clear_prompt`, not this one.
@@ -382,6 +393,12 @@ report      = "Showing every agent."
 # of THIS row (8 in 8 for "show the dashboard"); naming it without quoting it:
 # 0 in 8. "Show me everything", "show everything", "show all agents", "clear
 # the filter", "remove the filter" and "reset" stay 8 in 8 (2026-10-20).
+#
+# Issue #2138 — the bare-"reset" clause is for fixture `dashboard-clear-reset`:
+# the meaning check read "reset" alone as naming nothing to reset and listed no
+# action in 5 of 30 replays, and the fixture was refused in 3 of 20 runs (and
+# timed out in a fourth); with it, 30 of 30 replays and 20 of 20 runs
+# (2026-11-21, `gpt-5-mini`).
 asks_to     = "clear the agent dashboard's filter"
 try_saying  = "show everything"
 
@@ -706,6 +723,206 @@ unavailable_hint = "the counters open from the agent dashboard, once the agent's
 report      = "Showing the counters."
 asks_to     = "show the dashboard's counters"
 try_saying  = "show the counters"
+
+# PRD #1790 stage 2 — a daemon's interrupted work, by voice: what a restart of
+# its daemon left behind (dispatched units, orchestrations, issue dispatches,
+# and plain agents under "Other agents"). The banner's Show and the restart
+# notice's Show dispatch the same registry entry (`showInterruptedWork`), so
+# this row exposes the click rather than a second route to the dialog.
+#
+# **Which daemon** is resolved as `show_host_metrics`' is: an optional
+# `deck_ref` against every observed daemon; with none named, the one daemon
+# whose banner shows opens, and with several the dashboard says which ones
+# and asks the user to name one.
+#
+# `screens = ["overview"]` and `requires = ["new_agent_dialog_closed"]` for
+# `show_host_metrics`' reason: the banners are on the agent dashboard only,
+# and the New agent dialog is modal over them. Opening the list changes
+# nothing.
+[[commands]]
+id          = "show_interrupted_work"
+description = """Open a daemon's Interrupted work: the dialog that the Show button on the "N interrupted
+items from before the restart" banner opens, listing what a restart of the deck daemon left behind —
+dispatched units, orchestrations, issue dispatches and other agents, with their branches, worktrees
+and kept reports. Use for show interrupted work, interrupted items, what was interrupted, what did
+the restart leave behind, show the leftovers, open interrupted work. When the user names the daemon
+(which a user may also call a deck), set `deck` to the daemon they meant, exactly as listed in
+`decks`; otherwise leave `deck` out. This only OPENS the list: it reclaims and dismisses nothing.
+It is not `show_host_metrics`, not `show_dashboard_counters` and not `open_agent`."""
+invoke      = "showInterruptedWork"
+screens     = ["overview"]
+requires    = ["new_agent_dialog_closed"]
+unavailable_hint = "interrupted work opens from the agent dashboard, once the agent's pane and the New agent dialog are closed"
+report      = "Showing the interrupted work."
+asks_to     = "show a daemon's interrupted work"
+try_saying  = "show interrupted work"
+action_words = ["interrupted", "leftovers", "restart"]
+
+  [[commands.params]]
+  name     = "deck"
+  kind     = "deck_ref"
+  optional = true
+
+# PRD #1790 stage 2 — Reclaim in the Interrupted work dialog: it removes the
+# item's worktree and keeps its branch. **Voice runs the dry run only**: the
+# report reads its verdict back ("Reclaim would remove its worktree and keep
+# its branch.", or why it would be kept), and the removal waits for the
+# person's click on the dialog's Reclaim confirm (PRD #802 D5), exactly as the
+# button's own route does.
+#
+# The optional `item` names which item: an ordinal ("the second one", "the
+# last one") or the item's name or branch, the user's own words held to the
+# transcript (`filter_text`). Without it, the selected row. A plain agent has
+# no worktree the deck created, and is refused in the deck's own words.
+[[commands]]
+id          = "reclaim_interrupted"
+description = """In the open Interrupted work dialog, Reclaim an interrupted item — remove its worktree,
+keep its branch: this checks what reclaiming would do and reads the verdict back, then the user
+confirms on screen. Use for reclaim, reclaim it, reclaim the second one, reclaim fix-login, remove its
+worktree, clean up that worktree. Set `item` to the words the user used for which item, and only
+those: an ordinal ("second", "the last one", "number three") or the item's name or branch as they
+said it; leave `item` out when they named none. Never add a name the user did not say. It is not
+`dismiss_interrupted`, which only hides an item, and not `close`."""
+invoke      = "reclaimInterrupted"
+screens     = ["overview"]
+requires    = ["new_agent_dialog_closed"]
+unavailable_hint = "reclaiming works in the Interrupted work dialog on the agent dashboard; say “show interrupted work” first"
+report      = "Checking what reclaiming it would do."
+asks_to     = "reclaim an interrupted item"
+try_saying  = "reclaim the first one"
+
+  [[commands.params]]
+  name     = "item"
+  kind     = "filter_text"
+  optional = true
+
+# PRD #1790 stage 2 — Dismiss in the Interrupted work dialog: takes one item
+# off the list for good (its reports stay until they expire). **Voice asks
+# the question only** (desktop review R6/A1): the dialog asks whether to
+# dismiss the item the words name, naming it and bound to its id, and the
+# dismissal waits for the person's click or `y` on that question (PRD #802
+# D5). The Dismiss button and `d` dismiss the selected row at once, as the
+# TUI's `d` does; they are a registry entry of their own
+# (`dismissSelectedInterrupted`), not this row. `item` as
+# `reclaim_interrupted`'s.
+[[commands]]
+id          = "dismiss_interrupted"
+description = """In the open Interrupted work dialog, ask to Dismiss one interrupted item: the dialog asks whether
+to take that item off the list, naming it, and the user confirms on screen. Its branch, worktree and
+reports are left alone. Use for dismiss, dismiss it, dismiss the second one, dismiss scratch-shell,
+forget that one, remove it from the list. Set `item` to the words the user used for which item, and
+only those: an ordinal ("second", "the last one") or the item's name or branch as they said it; leave
+`item` out when they named none. Never add a name the user did not say. It is not
+`dismiss_all_interrupted`, which asks about every item, and not `reclaim_interrupted`."""
+invoke      = "dismissInterrupted"
+screens     = ["overview"]
+requires    = ["new_agent_dialog_closed"]
+unavailable_hint = "dismissing works in the Interrupted work dialog on the agent dashboard; say “show interrupted work” first"
+report      = "Asking whether to dismiss it."
+asks_to     = "dismiss an interrupted item"
+try_saying  = "dismiss the first one"
+
+  [[commands.params]]
+  name     = "item"
+  kind     = "filter_text"
+  optional = true
+
+# PRD #1790 stage 2 — Dismiss all in the Interrupted work dialog. **Voice asks
+# the question only** ("Dismiss all: N interrupted items from before the
+# restart? [y/N]"): the dismissal waits for the person's click on the
+# dialog's Dismiss all confirm (PRD #802 D5), and dismisses exactly the items
+# the question named.
+[[commands]]
+id          = "dismiss_all_interrupted"
+description = """In the open Interrupted work dialog, ask to Dismiss all: the dialog asks whether to take
+every listed interrupted item off the list, and the user confirms on screen. Use for dismiss all,
+dismiss everything, clear the list, forget all of them. It is not `dismiss_interrupted`, which takes
+one item, and not `clear_dashboard_filter`."""
+invoke      = "dismissAllInterrupted"
+screens     = ["overview"]
+requires    = ["new_agent_dialog_closed"]
+unavailable_hint = "dismissing works in the Interrupted work dialog on the agent dashboard; say “show interrupted work” first"
+report      = "Asking to dismiss every interrupted item."
+asks_to     = "dismiss every interrupted item"
+try_saying  = "dismiss all"
+
+# PRD #1790 stage 2 (desktop review R11, CLAUDE.md rule 23) — an item's
+# details in the Interrupted work dialog: what its Details button and Enter
+# open. They are shown to read on screen; voice reads nothing aloud. `item`
+# as `reclaim_interrupted`'s; without it, the selected row.
+[[commands]]
+id          = "show_interrupted_details"
+description = """In the open Interrupted work dialog, open one interrupted item's details: its branch, worktree,
+who started it, its last entry, progress, Git facts and kept reports. Use for show its details, details
+of the second one, open fix-login, what is in that one, more about it. Set `item` to the words the user
+used for which item, and only those: an ordinal ("second", "the last one") or the item's name or branch
+as they said it; leave `item` out when they named none. Never add a name the user did not say. It is
+not `show_interrupted_reports`, which shows the reports' text, and not `open_agent`."""
+invoke      = "showInterruptedDetails"
+screens     = ["overview"]
+requires    = ["new_agent_dialog_closed"]
+unavailable_hint = "an item's details open from the Interrupted work dialog on the agent dashboard; say “show interrupted work” first"
+report      = "Showing its details."
+asks_to     = "show an interrupted item's details"
+try_saying  = "show the details of the first one"
+
+  [[commands.params]]
+  name     = "item"
+  kind     = "filter_text"
+  optional = true
+
+# PRD #1790 stage 2 (desktop review R11) — Show reports in the Interrupted
+# work dialog: the first page of an item's kept reports' text, on screen.
+# `item` as `reclaim_interrupted`'s; without it, the item whose details are
+# open, or the selected row.
+[[commands]]
+id          = "show_interrupted_reports"
+description = """In the open Interrupted work dialog, show the text of an interrupted item's kept reports, the
+first page of them, on screen. Use for show its reports, show the reports, read the report of the first
+one, what did it report. Set `item` to the words the user used for which item, and only those: an
+ordinal or the item's name or branch as they said it; leave `item` out when they named none. Never add
+a name the user did not say. It is not `next_interrupted_reports` and not `show_interrupted_details`."""
+invoke      = "showInterruptedReports"
+screens     = ["overview"]
+requires    = ["new_agent_dialog_closed"]
+unavailable_hint = "reports show in an item's details in the Interrupted work dialog on the agent dashboard; say “show interrupted work” first"
+report      = "Showing its reports."
+asks_to     = "show an interrupted item's reports"
+try_saying  = "show its reports"
+
+  [[commands.params]]
+  name     = "item"
+  kind     = "filter_text"
+  optional = true
+
+# PRD #1790 stage 2 (desktop review R11) — Next reports and Previous reports
+# in an interrupted item's details: the report pages the buttons, `n` and `p`
+# turn. Previous goes back to the page shown before.
+[[commands]]
+id          = "next_interrupted_reports"
+description = """In an interrupted item's details in the Interrupted work dialog, show the next page of its
+kept reports. Use for next reports, next page of reports, more reports, the reports after these. It is
+not `next_page`, which turns a list on screen, and not `previous_interrupted_reports`."""
+invoke      = "nextInterruptedReports"
+screens     = ["overview"]
+requires    = ["new_agent_dialog_closed"]
+unavailable_hint = "report pages turn in an item's details in the Interrupted work dialog on the agent dashboard"
+report      = "Showing the next reports."
+asks_to     = "show the next page of an interrupted item's reports"
+try_saying  = "next reports"
+
+[[commands]]
+id          = "previous_interrupted_reports"
+description = """In an interrupted item's details in the Interrupted work dialog, show the previous page of its
+kept reports, the one shown before. Use for previous reports, previous page of reports, back to the
+earlier reports. It is not `previous_page`, which turns a list on screen, and not `next_interrupted_reports`."""
+invoke      = "previousInterruptedReports"
+screens     = ["overview"]
+requires    = ["new_agent_dialog_closed"]
+unavailable_hint = "report pages turn in an item's details in the Interrupted work dialog on the agent dashboard"
+report      = "Showing the previous reports."
+asks_to     = "show the previous page of an interrupted item's reports"
+try_saying  = "previous reports"
 
 # PRD #1195 M3 — the Deck selector at the top of the deck and the overview, by
 # voice. The drop-down dispatches through the same registry entry
@@ -2426,8 +2643,8 @@ must_name   = ["orchestration", "run", "every role", "all roles", "all the roles
 [[commands]]
 id          = "set_overview_mode"
 description = """Switch the agent dashboard between its two views: the table (one row per agent)
-and the cards (one card per agent, grouped by dispatcher or orchestration, showing what each
-agent reported and what it needs). Use when the user asks to show cards, the card view, switch to
+and the cards (one card per agent, the agents each one started in a tree under it, showing what
+each agent is doing and what it needs). Use when the user asks to show cards, the card view, switch to
 cards, show the table, the list view, or back to the table. Set `view` to "table" or "cards".
 Showing the dashboard itself is `open_overview`; filtering its rows is `filter_dashboard`."""
 invoke      = "setOverviewMode"
@@ -2497,8 +2714,8 @@ try_saying  = "next one that needs me"
 
 [[commands]]
 id          = "filter_needs_you_cards"
-description = """Turn the cards view's Needs you filter on or off: on shows only the agents' cards
-that need the user, off shows every card. Use for only the ones that need me, show only the cards
+description = """Turn the cards view's Needs you only on or off: on opens the way to every agent's
+card that needs the user and fades the others, off shows every card as usual. Use for only the ones that need me, show only the cards
 that need me, just the ones needing my attention (`needs_you` = "on"), or show all cards, every card,
 clear the needs you filter (`needs_you` = "off"). It shows the cards view when turned on. Filtering the
 table by status is `filter_dashboard`."""
@@ -2524,10 +2741,83 @@ report      = "Closed the card."
 asks_to     = "close the open card"
 try_saying  = "close the card"
 
+# Issue #2418 — the Cards tree. Opening and closing the tree under a card
+# changes what the dashboard shows and sends nothing; opening a card's pull
+# request or issue opens the app's GitHub browser on the address the deck
+# itself checked, never on the agent's own text.
+[[commands]]
+id          = "open_card_tree"
+description = """In the agent dashboard's cards, open the TREE under one agent's card: show the
+agents it started (a dispatcher's units, an orchestrator's roles) under it. Use for open the
+dispatcher's tree, expand the queue, show what is under the coder, show the agents under the
+orchestrator. Set `agent` to the user's words for the agent whose tree to open. Opening the card's
+own overlay is `show_agent_card`; opening an agent's terminal pane is `open_agent`."""
+invoke      = "openCardTree"
+screens     = ["overview"]
+unavailable_hint = "a card's tree opens on the agent dashboard's cards"
+report      = "Opened {agent}'s tree."
+asks_to     = "show the agents under one agent's card"
+try_saying  = "open {agent}'s tree"
+
+  [[commands.params]]
+  name = "agent"
+  kind = "agent_ref"
+
+[[commands]]
+id          = "close_card_tree"
+description = """In the agent dashboard's cards, close the TREE under one agent's card, hiding the
+agents it started. Use for close the dispatcher's tree, collapse the queue, hide what is under the
+orchestrator. Set `agent` to the user's words for the agent whose tree to close. Closing the card
+overlay is `close_agent_card`."""
+invoke      = "closeCardTree"
+screens     = ["overview"]
+unavailable_hint = "a card's tree closes on the agent dashboard's cards"
+report      = "Closed {agent}'s tree."
+asks_to     = "hide the agents under one agent's card"
+try_saying  = "close {agent}'s tree"
+
+  [[commands.params]]
+  name = "agent"
+  kind = "agent_ref"
+
+[[commands]]
+id          = "open_card_pull_request"
+description = """Open, in the app's GitHub browser, the pull request an agent reported on its CARD,
+as the deck checked it. Use when the user names an agent's card and its pull request — "open the
+pull request on the coder's card", "show the PR the tester reported". The pull request of the
+agent's own branch, from its badge on the dashboard or its pane, is `open_pr`. Set `agent` to the
+user's words for the agent."""
+invoke      = "openCardPullRequest"
+screens     = ["overview"]
+unavailable_hint = "a card's pull request opens from the agent dashboard's cards"
+report      = "Opening the pull request on {agent}'s card."
+asks_to     = "open the pull request an agent reported on its card"
+try_saying  = "open the pull request on {agent}'s card"
+
+  [[commands.params]]
+  name = "agent"
+  kind = "agent_ref"
+
+[[commands]]
+id          = "open_card_issue"
+description = """Open, in the app's GitHub browser, the issue an agent reported on its CARD, as the
+deck checked it. Use for open the issue on the coder's card, show the tester's issue, which issue
+is the dispatcher's unit working on. Set `agent` to the user's words for the agent."""
+invoke      = "openCardIssue"
+screens     = ["overview"]
+unavailable_hint = "a card's issue opens from the agent dashboard's cards"
+report      = "Opening the issue on {agent}'s card."
+asks_to     = "open the issue an agent reported on its card"
+try_saying  = "open the issue on {agent}'s card"
+
+  [[commands.params]]
+  name = "agent"
+  kind = "agent_ref"
+
 [[commands]]
 id          = "run_card_action"
 description = """Press one of the buttons on an agent's card: an action the agent or the deck
-offers (such as "Merge it", "Go ahead", "Explain") or an answer to a question the agent asked on
+offers (such as "Merge it", "Go ahead", "Close") or an answer to a question the agent asked on
 its card. Use when the user names both the action and the agent — "send merge it to the coder",
 "press go ahead on the tester's card", "answer main to the coder". Set `agent` to the user's
 words for the agent and `action` to the button's label as the user said it. A catalog action is

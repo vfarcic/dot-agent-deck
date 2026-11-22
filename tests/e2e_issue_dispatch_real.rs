@@ -32,9 +32,10 @@
 //! `DISPATCH_E2E_SENTINEL.md`; a `.dot-agent-deck.toml` with an
 //! `[[orchestrations]] name = "issue-work"` whose roles are `orchestrator`
 //! (`start = true`) and `worker`, BOTH `claude --model
-//! claude-haiku-4-5-20251001 --allowedTools Bash`, the orchestrator's
-//! `prompt_template` instructing it to delegate the task to the worker via
-//! `dot-agent-deck delegate --to worker --task "<TASK>"`; and a PERMANENT open
+//! claude-haiku-4-5-20251001 --allowedTools Bash` (the orchestrator's
+//! `prompt_template` does not reach this start path: an issue dispatch hands
+//! the schedule prompt over verbatim, so that prompt carries the `delegate`
+//! command); and a PERMANENT open
 //! issue #1 labelled `agent-dispatch-test`. The schedule filters on that label
 //! with `max_per_run = 1`, so ONLY issue #1 is ever enumerated — the run is
 //! deterministic against a fixed remote.
@@ -79,6 +80,8 @@
 //! per CLAUDE.md rule 4 — it is NOT looped for flakiness.
 
 dot_agent_deck_test_harness::link!();
+#[path = "support/inbox_view.rs"]
+mod inbox_view;
 
 use std::time::Duration;
 
@@ -100,15 +103,18 @@ const ORCH_TAB_NAME: &str = "issue-work";
 /// fixture the lazily-spawned daemon loads via `DOT_AGENT_DECK_SCHEDULES`. The
 /// cron never fires on its own (Jan 1 00:00) — the fire is driven by `RunNow`.
 /// `label` + `max_per_run = 1` pin enumeration to the single permanent issue #1.
-/// The `prompt` is the TASK handed to the orchestrator (which it must delegate
-/// to the worker): a directive list-files command robust to LLM phrasing.
+/// The `prompt` is the TASK handed to the orchestrator, verbatim: an issue
+/// dispatch composes no orchestrator context around it, so the prompt itself
+/// tells the orchestrator to delegate, with the exact `delegate` command, and
+/// not to do the listing itself. Without that it listed the files itself, the
+/// worker stayed idle, and the test's sentinel check passed regardless.
 fn dispatch_schedule_toml(working_dir: &str) -> String {
     format!(
         "[[scheduled_tasks]]\n\
          name = \"{SCHEDULE_NAME}\"\n\
          cron = \"0 0 1 1 *\"\n\
          working_dir = \"{working_dir}\"\n\
-         prompt = \"List every file in the current directory using the Bash tool (ls -a) and print each filename verbatim, one per line, with no other commentary.\"\n\
+         prompt = \"You coordinate a worker and do no work yourself: do not list or read any file. Run exactly this one Bash command to hand the task to the worker, then wait: dot-agent-deck delegate --to worker --task 'List every file in the current directory using the Bash tool (ls -a) and print each filename verbatim, one per line, with no other commentary.'\"\n\
          enabled = true\n\
          \n\
          [scheduled_tasks.issue_dispatch]\n\
@@ -117,6 +123,41 @@ fn dispatch_schedule_toml(working_dir: &str) -> String {
          max_per_run = 1\n\
          \n"
     )
+}
+
+/// The agent id and the pane id (which an inbox is keyed by) of the agent
+/// whose card is titled `role` now. Asked again each time: a delegation with
+/// `clear = true` respawns the worker under a new agent id in the same pane.
+fn role_agent(deck: &TuiDeck, role: &str) -> Option<(String, String)> {
+    common::agent_records_on(deck.attach_socket_path())
+        .into_iter()
+        .find(|r| r.display_name.as_deref() == Some(role))
+        .and_then(|r| Some((r.id, r.pane_id_env?)))
+}
+
+/// `agent`'s pane as its own screen now reads.
+fn pane_screen(deck: &TuiDeck, agent: &str) -> String {
+    let rows = std::num::NonZeroU16::new(40).expect("non-zero");
+    let cols = std::num::NonZeroU16::new(160).expect("non-zero");
+    let mut parser = vt100::Parser::new(rows, cols, 0);
+    parser.process(&common::pane_snapshot_on(deck.attach_socket_path(), agent));
+    parser.screen().contents()
+}
+
+/// Whether the inbox of the worker's pane `pane` holds a task sent from the
+/// orchestrator's pane `orchestrator` that the worker acknowledged: the
+/// delegation, as the worker received it. Matched by the sender's pane, not
+/// its role: on this start path the sender carries no role name.
+fn worker_took_a_delegated_task(deck: &TuiDeck, pane: &str, orchestrator: &str) -> bool {
+    inbox_view::messages(deck.attach_socket_path(), pane)
+        .into_iter()
+        .any(|message| {
+            message.state == dot_agent_deck::inbox::StateName::Acknowledged
+                && matches!(
+                    &message.from,
+                    dot_agent_deck::inbox::Sender::Agent { pane_id, .. } if pane_id == orchestrator
+                )
+        })
 }
 
 /// Fire a registered task on the deck's own daemon via the `RunNow` control
@@ -171,7 +212,7 @@ fn remote_branch_exists(branch: &str) -> Option<bool> {
 
 /// Scenario: Launch an attached deck with a schedule targeting permanent live GitHub issue #1 and fire it via RunNow; the first fire clones the fixture and is refused on the never-approved clone, as `schedule list` shows, so approve the clone with `trust approve` and fire again to spawn its interactive Haiku orchestration.
 /// After the agents register as `orchestrator` and `worker`, require an `issue-work` orchestration tab to appear in the attached TUI without reconnecting.
-/// Switch to that tab to best-effort observe the worker listing the sentinel file, then best-effort probe that no `agent/issue-1` branch was pushed.
+/// Require the worker to hold an acknowledged task from the orchestrator, which the schedule prompt tells to delegate, and its own pane to show the sentinel file, then best-effort probe that no `agent/issue-1` branch was pushed.
 #[spec("scheduler/dispatch/013")]
 #[test]
 fn dispatch_013_orchestration_surfaces_and_delegates() {
@@ -347,22 +388,41 @@ fn dispatch_013_orchestration_surfaces_and_delegates() {
         deck.snapshot_grid()
     );
 
-    // ---- Below here runs only once the tab assertion above passes. It is the
-    // visible narrative — best-effort, NOT gating, so LLM/timing variance can't make the
-    // load-bearing assertion above flaky. ----
-
     // Switch from the Dashboard to the freshly-surfaced orchestration tab (`l` =
     // "move right / next tab") so its role panes render — the orchestrator
     // delegating to the worker, the worker listing the cloned repo's files.
     deck.send_keys(b"l");
 
-    // The committed sentinel filename should appear once the worker (delegated to
-    // by the orchestrator) runs `ls` inside the cloned per-issue worktree. Logged,
-    // not asserted: the multi-agent delegation chain is too LLM/timing-dependent
-    // to hard-gate.
-    let saw_sentinel = deck.wait_for_stream_string_within(SENTINEL, Duration::from_secs(150));
-    eprintln!(
-        "narrative (soft): sentinel {SENTINEL:?} seen in orchestration panes = {saw_sentinel}"
+    // The delegation, asserted where only it can show: the WORKER holds an
+    // acknowledged task from the orchestrator, and the sentinel is on the
+    // worker's own screen. Seeing the sentinel anywhere in the tab's stream
+    // proved nothing: the orchestrator could list the files itself, and in
+    // three runs on 2026-11-20 it did, with the worker idle.
+    const DELEGATION_WAIT: Duration = Duration::from_secs(150);
+    let (_, orchestrator_pane) =
+        role_agent(&deck, "orchestrator").expect("the orchestrator registered above");
+    let worker_shows_it = || {
+        role_agent(&deck, "worker").is_some_and(|(agent, pane)| {
+            worker_took_a_delegated_task(&deck, &pane, &orchestrator_pane)
+                && pane_screen(&deck, &agent).contains(SENTINEL)
+        })
+    };
+    assert!(
+        common::wait_until(DELEGATION_WAIT, worker_shows_it),
+        "within {}s the worker must hold an acknowledged task from the orchestrator and \
+         show {SENTINEL:?} on its own screen.\nWorker: {:?}\nWorker inbox: {:?}\n\
+         Worker screen:\n{}\nOrchestrator screen:\n{}",
+        DELEGATION_WAIT.as_secs(),
+        role_agent(&deck, "worker"),
+        role_agent(&deck, "worker")
+            .map(|(_, pane)| inbox_view::messages(deck.attach_socket_path(), &pane))
+            .unwrap_or_default(),
+        role_agent(&deck, "worker")
+            .map(|(agent, _)| pane_screen(&deck, &agent))
+            .unwrap_or_default(),
+        role_agent(&deck, "orchestrator")
+            .map(|(agent, _)| pane_screen(&deck, &agent))
+            .unwrap_or_default()
     );
 
     // Agents are instructed not to push or open PRs. Probe (best-effort) for a

@@ -1982,6 +1982,10 @@ struct PromptTurnOpen {
     session_id: String,
 }
 
+/// Issue #1965: how many announced exited roles [`AppState::pending_ended_roles`]
+/// holds for the render loop.
+pub const MAX_PENDING_ENDED_ROLES: usize = 64;
+
 #[derive(Debug, Default, Clone)]
 pub struct AppState {
     pub sessions: HashMap<String, SessionState>,
@@ -2190,6 +2194,14 @@ pub struct AppState {
     /// early-stamped one look alike by time. By NAME they do not — the old one
     /// is a session this pane has already left.
     waiting_superseded_sessions: HashMap<String, SupersededSessions>,
+    /// Issue #2454 (Qodo on PR #2460): the panes whose current
+    /// `WaitingForInput` began after their turn had ended — a turn that opened
+    /// on a permission prompt, or an idle agent's prompt notification — so
+    /// leaving it into work is the agent's next turn. A pause that began inside
+    /// a turn is not here, and leaving it resumes that turn. The value is
+    /// when the pause began (the daemon's clock), which is when that turn
+    /// began: a report published after it belongs to the turn.
+    pauses_after_turn_end: HashMap<String, DateTime<Utc>>,
     /// Maps pane_id → orchestration role name (set when orchestration tab opens).
     pub pane_role_map: HashMap<String, String>,
     /// Maps pane_id → working directory for orchestration panes.
@@ -2325,6 +2337,11 @@ pub struct AppState {
     /// holding a queue of them would invite the unbounded growth
     /// `pending_orchestration_surfaces` needs a cap for.
     pub pending_worktree_kept: Option<crate::issue_dispatch_run::KeptWorktree>,
+    /// Issue #1965: orchestration roles whose agent exited, as the daemon
+    /// announced them (`BroadcastMsg::RoleEnded`), for the render loop to put
+    /// on their cards. Bounded at [`MAX_PENDING_ENDED_ROLES`]; the oldest goes
+    /// first when a burst outruns the render loop.
+    pub pending_ended_roles: Vec<(crate::ended_role::EndedRole, Incarnation)>,
     /// PRD #1401: how a pull request launch from the `o` key settled — the
     /// launch's number and the status-line message for it — waiting for the
     /// render loop. Filled by the thread that watches the browser
@@ -3474,6 +3491,25 @@ pub(crate) fn frame_untrusted_report_for_file(summary: &str) -> String {
         "\n"
     };
     format!("{REPORT_FRAME_OPEN}\n{body}{separator}{REPORT_FRAME_CLOSE}\n")
+}
+
+/// PRD #1790 stage 2: the report inside a file body that
+/// [`frame_untrusted_report_for_file`] framed, without its marker lines;
+/// `None` when `framed` does not open and close with them. A reader that shows
+/// a saved report frames what this answers again rather than trusting the
+/// file's own frame, since a same-user process can write a file in that
+/// format; an unframed body is framed whole. With `cut` (the text is the
+/// start of a longer file, so its closing line was not read) only the opening
+/// line is required.
+pub(crate) fn strip_report_file_frame(framed: &str, cut: bool) -> Option<&str> {
+    let opened = framed.strip_prefix(REPORT_FRAME_OPEN)?.strip_prefix('\n')?;
+    if cut {
+        return Some(opened);
+    }
+    let inner = opened
+        .strip_suffix('\n')?
+        .strip_suffix(REPORT_FRAME_CLOSE)?;
+    Some(inner.strip_suffix('\n').unwrap_or(inner))
 }
 
 /// Text another agent wrote, made safe to read as written: CRLF becomes LF,
@@ -4958,6 +4994,12 @@ impl AppState {
             .and_then(|pane_id| self.pane_hook_session.get(pane_id).cloned());
         let (event_session_id, event_timestamp) = (event.session_id.clone(), event.timestamp);
         let turn_failed = ends_turn_on_error(&event);
+        // Issue #2454: whether this event can start the agent's next turn — an
+        // agent's own report, not a frame the daemon synthesized (a shelled-out
+        // command's `ShellBusy` says nothing about the agent moving on) — and
+        // the pane's status before it, to see the turn start.
+        let may_start_turn = !event.is_daemon_synthetic();
+        let status_before = pane_id.as_deref().and_then(|pane| self.pane_status(pane));
         let applied = self.apply_event_reporting(event, attested_agent);
         let Some(pane_id) = pane_id else {
             return;
@@ -4993,6 +5035,46 @@ impl AppState {
             };
         if !from_current_generation {
             return;
+        }
+        // Issue #2454: the agent started working again — its pane went into a
+        // turn in progress from a status where its turn had ended, or from a
+        // pause (a permission prompt, a subagent's wait) that itself began after
+        // the turn had ended. That deals with the waiting, done or failed reason
+        // its card report raised. Leaving a pause that began inside a turn
+        // resumes that turn, so it does not (Qodo on PR #2460).
+        if may_start_turn {
+            let status_after = self.pane_status(&pane_id);
+            let ended = |s: &Option<SessionStatus>| {
+                !s.as_ref()
+                    .is_some_and(|s| is_turn_in_progress(s) || pauses_a_turn(s))
+            };
+            let paused_since = self
+                .pauses_after_turn_end
+                .remove(&pane_id)
+                .filter(|_| status_before.as_ref().is_some_and(pauses_a_turn));
+            // When the turn now under way began, if the turn had ended before
+            // this event: now, after an ended status, or when a pause that
+            // itself followed the end of the turn began. A report published
+            // after that belongs to this turn (Qodo on PR #2460).
+            let turn_began_at = if ended(&status_before) {
+                Some(Utc::now())
+            } else {
+                paused_since
+            };
+            if let Some(began_at) = turn_began_at {
+                if status_after.as_ref().is_some_and(pauses_a_turn) {
+                    // A pause entered from an ended turn, or one continuing
+                    // such a pause, keeps that record; one entered from work
+                    // does not.
+                    self.pauses_after_turn_end.insert(pane_id.clone(), began_at);
+                } else if status_after.as_ref().is_some_and(is_turn_in_progress)
+                    && let Some(agent_id) = live_agent_id.as_deref()
+                {
+                    registry
+                        .agent_cards()
+                        .note_turn_started(&pane_id, agent_id, began_at);
+                }
+            }
         }
         // Every current report re-keys the record to the pane's live agent, so
         // `agent_id` always names whose sessions it holds — including the
@@ -5279,6 +5361,22 @@ enum StopKind {
     WaitingOnDelegation,
     /// Issue #2099: the worker's turn ended on an error.
     Failed,
+}
+
+/// Issue #2454: a status that is a turn in progress — the agent thinking,
+/// working or compacting — as opposed to one where it has stopped for now.
+fn is_turn_in_progress(status: &SessionStatus) -> bool {
+    matches!(
+        status,
+        SessionStatus::Thinking | SessionStatus::Working | SessionStatus::Compacting
+    )
+}
+
+/// Issue #2454 (Qodo on PR #2460): a status a turn passes through without
+/// ending — a permission prompt or a subagent's wait (`WaitingForInput`) —
+/// so leaving it resumes the turn rather than starting the next one.
+fn pauses_a_turn(status: &SessionStatus) -> bool {
+    matches!(status, SessionStatus::WaitingForInput)
 }
 
 /// Issue #2099: whether `event` is an agent reporting that its turn ended on
@@ -6701,6 +6799,36 @@ async fn dispatch_one_owned(
         // was admitted, its room reserved and its body saved above, so no
         // refusal of its content can follow.
         registry.inbox().supersede_delegates_to(&pane_id);
+        // Issue #2110: take this restart's turn, so a worker handed a task
+        // together with others starts its fresh agent at least a spacing after
+        // the previous paced one rather than in the same second. After the
+        // supersede above, so the tasks it retires end as superseded at once
+        // rather than lingering through the wait into an undelivered notice
+        // (`orchestration/delegate/025`). The `delegate` handler waits at most
+        // `DELEGATE_POST_WAIT` for this post and then replies anyway, so the
+        // wait can hold that reply for that long and no longer; past it, the
+        // wait holds back only this worker (and, through the pane's dispatch
+        // lock, a later delegate to the same pane).
+        // The generation being replaced keeps running while this restart is
+        // held back. A waiting episode it opened is about work just superseded,
+        // so it must not turn into a notice to the orchestrator meanwhile.
+        let paced = registry
+            .role_start_pacer()
+            .acquire(|| {
+                if let Some(old_agent) = registry.pane_current_agent_id(&pane_id) {
+                    registry.cancel_waiting_notice(&pane_id, &old_agent);
+                }
+            })
+            .await;
+        if !paced.wait().is_zero() {
+            tracing::info!(
+                role = %target_role,
+                pane_id = %pane_id,
+                waited_ms = u64::try_from(paced.wait().as_millis()).unwrap_or(u64::MAX),
+                "delegate: spacing the worker's restart after another worker's start"
+            );
+            paced.until_due().await;
+        }
         #[cfg(test)]
         gate_pass(&CLEAR_RESPAWN_GATES, &pane_id).await;
         match registry
@@ -6711,6 +6839,7 @@ async fn dispatch_one_owned(
                 agent_id: new_agent_id,
                 recreated,
             }) => {
+                paced.started();
                 if let Some(state) = state.as_ref() {
                     spawn_lift_replaced_quota_blocks(
                         state.clone(),
@@ -6784,6 +6913,9 @@ async fn dispatch_one_owned(
                 worker_agent_id = Some(new_agent_id);
             }
             Err(e) => {
+                // No agent started, so the next paced restart counts from the
+                // last one that did.
+                drop(paced);
                 if let (Some(state), Some(identity)) = (state.as_ref(), title_reservation.as_ref())
                 {
                     state
@@ -8205,6 +8337,38 @@ impl AppState {
         agent_id: &str,
         pane_id: Option<&str>,
     ) -> Option<SessionSnapshot> {
+        self.live_session_state_for(agent_id, pane_id).map(|s| {
+            let mut snapshot = s.live_snapshot();
+            // Issue #1678: the daemon's record is the authority, including
+            // a change no event carried (an exited spawn's work retired).
+            if let Some(track) = self.background_tracks.get(&s.session_id) {
+                snapshot.background = track.published;
+                snapshot.background_revision = (track.revision > 0).then_some(track.revision);
+            }
+            // Issue #532: the pane's generation, so a reconnecting TUI
+            // adopts the daemon's answer. See
+            // [`SessionSnapshot::hook_generation`].
+            snapshot.hook_generation = pane_id
+                .and_then(|pane| self.pane_hook_session.get(pane))
+                .map(|(session_id, established_at)| HookGeneration {
+                    session_id: session_id.clone(),
+                    established_ms: established_at.timestamp_millis(),
+                });
+            // PRD #1666 part 3 (Q35-17): this generation's settled held
+            // answers.
+            snapshot.answer_settlements =
+                self.answer_settlements_at(agent_id, std::time::Instant::now());
+            snapshot
+        })
+    }
+
+    /// The session [`Self::live_session_for`] joins to the record `agent_id`
+    /// in `pane_id`: the same match and the same tie-break.
+    fn live_session_state_for(
+        &self,
+        agent_id: &str,
+        pane_id: Option<&str>,
+    ) -> Option<&SessionState> {
         self.sessions
             .values()
             .filter(|s| s.agent_id.as_deref() == Some(agent_id) && s.pane_id.as_deref() == pane_id)
@@ -8213,29 +8377,14 @@ impl AppState {
                     .cmp(&b.last_activity)
                     .then_with(|| a.session_id.cmp(&b.session_id))
             })
-            .map(|s| {
-                let mut snapshot = s.live_snapshot();
-                // Issue #1678: the daemon's record is the authority, including
-                // a change no event carried (an exited spawn's work retired).
-                if let Some(track) = self.background_tracks.get(&s.session_id) {
-                    snapshot.background = track.published;
-                    snapshot.background_revision = (track.revision > 0).then_some(track.revision);
-                }
-                // Issue #532: the pane's generation, so a reconnecting TUI
-                // adopts the daemon's answer. See
-                // [`SessionSnapshot::hook_generation`].
-                snapshot.hook_generation = pane_id
-                    .and_then(|pane| self.pane_hook_session.get(pane))
-                    .map(|(session_id, established_at)| HookGeneration {
-                        session_id: session_id.clone(),
-                        established_ms: established_at.timestamp_millis(),
-                    });
-                // PRD #1666 part 3 (Q35-17): this generation's settled held
-                // answers.
-                snapshot.answer_settlements =
-                    self.answer_settlements_at(agent_id, std::time::Instant::now());
-                snapshot
-            })
+    }
+
+    /// Issue #2418: the working directory the live session
+    /// [`Self::live_session_for`] picks reports, or `None` when it has none
+    /// or reported none. A card's bare `#N` reference resolves against it,
+    /// as the branch badge resolves a session's branch.
+    pub fn live_session_cwd_for(&self, agent_id: &str, pane_id: Option<&str>) -> Option<String> {
+        self.live_session_state_for(agent_id, pane_id)?.cwd.clone()
     }
 
     /// PRD #1666 part 3 (Q35-17, OQ6): record that an answer `generation`'s
@@ -9623,6 +9772,22 @@ impl AppState {
     /// field's docs.
     pub fn queue_worktree_kept(&mut self, kept: crate::issue_dispatch_run::KeptWorktree) {
         self.pending_worktree_kept = Some(kept);
+    }
+
+    /// Issue #1965: record an orchestration role whose agent exited, as the
+    /// daemon process `from` reported it, for the render loop to put on its
+    /// card.
+    pub fn queue_ended_role(&mut self, role: crate::ended_role::EndedRole, from: Incarnation) {
+        if self.pending_ended_roles.len() >= MAX_PENDING_ENDED_ROLES {
+            self.pending_ended_roles.remove(0);
+        }
+        self.pending_ended_roles.push((role, from));
+    }
+
+    /// Issue #1965: the exited roles queued since the last call, oldest first,
+    /// each with the daemon process that reported it.
+    pub fn take_ended_roles(&mut self) -> Vec<(crate::ended_role::EndedRole, Incarnation)> {
+        std::mem::take(&mut self.pending_ended_roles)
     }
 
     /// PRD #1401: record how pull request launch `launch` settled, for the
@@ -11727,6 +11892,7 @@ impl AppState {
         // Issue #447 (Qodo, #1347): the waiting watch's history is about THIS
         // pane's conversations, so a pane reusing the id must not inherit it.
         self.waiting_superseded_sessions.remove(pane_id);
+        self.pauses_after_turn_end.remove(pane_id);
         if let Some(identity) = self.pane_orchestration_map.remove(pane_id) {
             // Issue #555 / #962: the title goes when the last pane of its
             // orchestration does.
@@ -17866,6 +18032,123 @@ mod tests {
         published.shutdown_all();
     }
 
+    /// Issue #2454: the agent starting its next turn — its pane going from a
+    /// status where its turn ended into Thinking, Working or Compacting —
+    /// deals with the `done` its card report raised. Moving between two busy
+    /// statuses inside one turn does not, nor does answering a permission
+    /// prompt inside it, nor a daemon-synthesized `ShellBusy`, which says a
+    /// command is running, not that the agent moved on.
+    #[test]
+    fn the_agent_starting_its_next_turn_deals_with_its_card_report() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent = registry.insert_idle_member_for_test("pane", "team-1", true);
+        let event = |event_type: EventType, secs: i64| AgentEvent {
+            session_id: "s1".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: DateTime::<Utc>::UNIX_EPOCH + chrono::TimeDelta::seconds(secs),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some("pane".into()),
+            agent_id: Some(agent.clone()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            background: None,
+            background_revision: None,
+        };
+        let dealt_with = || {
+            registry
+                .agent_cards()
+                .report_dealt_with_for_test("pane", &agent)
+        };
+        let done = || crate::agent_cards::AgentReport::parse_json(r#"{"status": "done"}"#).unwrap();
+        let mut state = AppState::default();
+        state.managed_pane_ids.insert("pane".into());
+        state.apply_event_watching_waiting(event(EventType::SessionStart, 1), &registry);
+        state.apply_event_watching_waiting(event(EventType::Thinking, 2), &registry);
+        // The agent publishes `done` from inside its turn.
+        registry.agent_cards().publish("pane", &agent, done());
+        state.apply_event_watching_waiting(event(EventType::ToolStart, 3), &registry);
+        assert_eq!(state.pane_status("pane"), Some(SessionStatus::Working));
+        assert_eq!(dealt_with(), Some(false), "a move inside the turn");
+        state.apply_event_watching_waiting(event(EventType::Idle, 4), &registry);
+        assert_eq!(dealt_with(), Some(false), "the turn ending");
+        state.apply_event_watching_waiting(event(EventType::ShellBusy, 5), &registry);
+        assert_eq!(
+            state.pane_status("pane"),
+            Some(SessionStatus::Working),
+            "precondition: ShellBusy moved the pane into Working"
+        );
+        assert_eq!(dealt_with(), Some(false), "a synthesized ShellBusy");
+        state.apply_event_watching_waiting(event(EventType::ShellIdle, 6), &registry);
+        assert_ne!(
+            state.pane_status("pane"),
+            Some(SessionStatus::Working),
+            "precondition: the pane is out of its turn again"
+        );
+        // A permission prompt raised and answered inside one turn resumes it.
+        state.apply_event_watching_waiting(event(EventType::Thinking, 7), &registry);
+        assert_eq!(dealt_with(), Some(true), "the next turn");
+        registry.agent_cards().publish("pane", &agent, done());
+        state.apply_event_watching_waiting(event(EventType::PermissionRequest, 8), &registry);
+        assert_eq!(
+            state.pane_status("pane"),
+            Some(SessionStatus::WaitingForInput),
+            "precondition: the permission prompt paused the turn"
+        );
+        // Approved: the call it asked about runs and ends inside the turn.
+        state.apply_event_watching_waiting(event(EventType::ToolEnd, 9), &registry);
+        assert!(
+            state
+                .pane_status("pane")
+                .as_ref()
+                .is_some_and(is_turn_in_progress),
+            "precondition: the turn resumed, {:?}",
+            state.pane_status("pane")
+        );
+        assert_eq!(dealt_with(), Some(false), "a permission prompt answered");
+        state.apply_event_watching_waiting(event(EventType::Idle, 10), &registry);
+        state.apply_event_watching_waiting(event(EventType::Thinking, 11), &registry);
+        assert_eq!(dealt_with(), Some(true));
+        // A next turn that opens on a permission prompt is a next turn: the
+        // prompt began after the turn ended, so the work it lets through is the
+        // agent moving on.
+        registry.agent_cards().publish("pane", &agent, done());
+        state.apply_event_watching_waiting(event(EventType::Idle, 13), &registry);
+        state.apply_event_watching_waiting(event(EventType::PermissionRequest, 14), &registry);
+        assert_eq!(
+            state.pane_status("pane"),
+            Some(SessionStatus::WaitingForInput),
+            "precondition: the new turn opened on a permission prompt"
+        );
+        assert_eq!(dealt_with(), Some(false), "the prompt alone is not work");
+        state.apply_event_watching_waiting(event(EventType::ToolEnd, 15), &registry);
+        assert_eq!(
+            dealt_with(),
+            Some(true),
+            "a turn that opened on a permission prompt"
+        );
+        // A report published while that opening prompt was pending — the
+        // prompt asked to run the publish itself — belongs to the new turn.
+        state.apply_event_watching_waiting(event(EventType::Idle, 16), &registry);
+        state.apply_event_watching_waiting(event(EventType::PermissionRequest, 17), &registry);
+        registry.agent_cards().publish("pane", &agent, done());
+        state.apply_event_watching_waiting(event(EventType::ToolEnd, 18), &registry);
+        assert_eq!(
+            dealt_with(),
+            Some(false),
+            "a report published inside the turn its permission prompt opened"
+        );
+        // A newer report is not dealt with by the turn it was published in.
+        registry.agent_cards().publish("pane", &agent, done());
+        state.apply_event_watching_waiting(event(EventType::ToolStart, 19), &registry);
+        assert_eq!(dealt_with(), Some(false));
+    }
+
     /// Issue #447 (Qodo, #1347): the waiting watch's record of the hook sessions
     /// a pane has moved past is dropped when the pane is unregistered, so a
     /// closed pane leaves nothing behind and a later pane reusing its id starts
@@ -20291,6 +20574,150 @@ mod tests {
                 .any(|m| m.subject == "task refused"),
             "the orchestrator was told its task was refused"
         );
+        registry.shutdown_all();
+    }
+
+    /// Scenario (issue #2110, PR #2459 review): the orchestrator hands tasks to
+    /// two `clear = true` workers one after the other. The first worker's old
+    /// agent ignores SIGTERM and SIGHUP and reads no input, so stopping it takes the whole
+    /// termination grace;
+    /// the second's stops at once. The two fresh agents are still spawned at
+    /// least the configured spacing apart, and both tasks are posted.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn role_start_pacing_005_fresh_workers_spawn_a_spacing_apart_despite_a_slow_teardown() {
+        let spacing = crate::role_start_pacing::role_start_spacing();
+        if spacing.is_zero() {
+            eprintln!(
+                "SKIP: {} turns the spacing off in this environment",
+                crate::role_start_pacing::DOT_AGENT_DECK_ROLE_START_SPACING_MS
+            );
+            return;
+        }
+        let dir = clear_role_dir();
+        let cwd = dir.path().to_str().unwrap().to_string();
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let orch = stand_in_in(&registry, "p2110-orch", Some(&cwd));
+        let (slow, fast) = ("p2110-slow", "p2110-fast");
+        // A script run as the pane's own child, so no shell without the trap
+        // sits between the signal and the stand-in (`delegate/034`'s shape).
+        let script = dir.path().join("p2110-unkillable.sh");
+        crate::test_isolation::write_script(
+            &script,
+            "#!/bin/sh\ntrap '' TERM HUP\nprintf P2110-ARMED\nexec sleep 3600\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let slow_agent = registry
+            .spawn_agent(crate::agent_pty::SpawnOptions {
+                command: script.to_str(),
+                cwd: Some(&cwd),
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                    slow.to_string(),
+                )]),
+                ..crate::agent_pty::SpawnOptions::default()
+            })
+            .expect("spawn the SIGTERM-ignoring stand-in");
+        // The marker is printed after the trap, so a SIGTERM sent once it shows
+        // cannot reach a shell that has not installed it yet (issue #709).
+        let armed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let screen = registry.snapshot(&slow_agent).unwrap_or_default();
+                if screen.windows(11).any(|w| w == b"P2110-ARMED") {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        });
+        armed.await.expect("the slow stand-in installs its trap");
+        let fast_old = stand_in_in(&registry, fast, Some(&cwd));
+        // The fast worker's old agent has a waiting episode open, as a worker
+        // sitting at a prompt would (Qodo, PR #2459): a notice about it must not
+        // fire for work its paced restart has already superseded.
+        let episode = registry
+            .arm_waiting_notice(fast, &fast_old, std::time::Duration::from_secs(60), false)
+            .expect("an episode opens for the fast worker's old agent")
+            .seq;
+
+        // The slow worker takes the first turn and is held at the gate just
+        // before its restart, so the fast one asks for its turn while the
+        // slow one holds it.
+        let (reached_tx, reached) = tokio::sync::oneshot::channel();
+        let (go, go_rx) = tokio::sync::oneshot::channel();
+        CLEAR_RESPAWN_GATES
+            .lock()
+            .unwrap()
+            .push((slow.to_string(), reached_tx, go_rx));
+        let dispatch = |worker: &str| {
+            tokio::spawn(dispatch_clear_task(
+                registry.clone(),
+                "p2110-orch".into(),
+                orch.clone(),
+                worker.to_string(),
+                format!("the task for {worker}"),
+                cwd.clone(),
+            ))
+        };
+        let slow_dispatch = dispatch(slow);
+        tokio::time::timeout(spacing * 4, reached)
+            .await
+            .expect("the slow worker reaches its restart")
+            .unwrap();
+        let fast_dispatch = dispatch(fast);
+        go.send(()).unwrap();
+        // The fast worker is in its paced wait once the slow one has its fresh
+        // agent, and keeps its old agent until the wait is over.
+        tokio::time::timeout(spacing * 4, async {
+            while registry.pane_current_agent_id(slow).as_deref() == Some(slow_agent.as_str()) {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the slow worker gets its fresh agent");
+        assert_eq!(
+            registry.pane_current_agent_id(fast).as_deref(),
+            Some(fast_old.as_str()),
+            "precondition: the fast worker is still waiting for its slot"
+        );
+        assert!(
+            !registry.waiting_notice_is_current(fast, episode),
+            "the old agent's waiting episode must be closed while its restart waits"
+        );
+        let mut posted = Vec::new();
+        for task in [slow_dispatch, fast_dispatch] {
+            posted.push(
+                tokio::time::timeout(spacing * 6, task)
+                    .await
+                    .expect("both restarts finish")
+                    .unwrap(),
+            );
+        }
+
+        let spawned_at = |pane: &str| {
+            let agent = registry
+                .pane_current_agent_id(pane)
+                .expect("the pane has a fresh agent");
+            registry
+                .agent_record_any(&agent)
+                .and_then(|record| record.spawned_at_ms)
+                .expect("the fresh agent records when it spawned")
+        };
+        let gap_ms = (spawned_at(fast) - spawned_at(slow)).unsigned_abs();
+        // `spawned_at_ms` is wall-clock milliseconds, and the pacer measures on
+        // the monotonic clock, so allow a few milliseconds between the two.
+        assert!(
+            u128::from(gap_ms) + 20 >= spacing.as_millis(),
+            "the fresh agents spawned {gap_ms} ms apart; the spacing is {spacing:?}"
+        );
+        for (worker, id) in [slow, fast].iter().zip(&posted) {
+            assert_eq!(
+                listed_state(&registry, worker, id),
+                Some(crate::inbox::StateName::Queued),
+                "the task for {worker} is posted to its replacement"
+            );
+        }
         registry.shutdown_all();
     }
 
@@ -27496,5 +27923,50 @@ mod tests {
         assert_eq!(state.pane_status("p"), Some(SessionStatus::Thinking));
         assert!(ingest_prompt_turn(&mut state, gone("n8"), false));
         assert_eq!(state.pane_status("p"), Some(SessionStatus::Idle));
+    }
+
+    /// Issue #2418 (review R1): the folder a card's bare `#N` resolves in is
+    /// the one reported by the session [`AppState::live_session_for`] joins —
+    /// the same pane and generation, the newest of several — and another
+    /// generation in the same pane is not read.
+    #[test]
+    fn the_live_cwd_comes_from_the_joined_session() {
+        let mut state = AppState::default();
+        state.register_pane("p".into());
+        state.apply_event(
+            serde_json::from_value::<AgentEvent>(serde_json::json!({
+                "session_id": "base", "pane_id": "p", "agent_id": "g1",
+                "agent_type": "claude_code", "event_type": "session_start",
+                "cwd": "/base", "timestamp": Utc::now()
+            }))
+            .unwrap(),
+        );
+        let template = state.sessions.values().next().cloned().unwrap();
+        state.sessions.clear();
+        let at = |secs: i64| DateTime::<Utc>::from_timestamp(1_800_000_000 + secs, 0).unwrap();
+        for (id, agent, cwd, secs) in [
+            ("old", "g1", Some("/old"), 1),
+            ("new", "g1", Some("/new"), 2),
+            // Another generation in the same pane, newer than both.
+            ("other", "g2", Some("/other"), 3),
+            ("quiet", "g3", None, 4),
+        ] {
+            let mut session = template.clone();
+            session.session_id = id.into();
+            session.agent_id = Some(agent.into());
+            session.cwd = cwd.map(str::to_string);
+            session.last_activity = at(secs);
+            state.sessions.insert(id.into(), session);
+        }
+        assert!(state.live_session_for("g1", Some("p")).is_some());
+        let cwd = state.live_session_cwd_for("g1", Some("p"));
+        assert_eq!(cwd.as_deref(), Some("/new"));
+        assert_eq!(
+            state.live_session_cwd_for("g2", Some("p")).as_deref(),
+            Some("/other")
+        );
+        assert_eq!(state.live_session_cwd_for("g3", Some("p")), None);
+        assert_eq!(state.live_session_cwd_for("g1", Some("q")), None);
+        assert_eq!(state.live_session_cwd_for("g4", Some("p")), None);
     }
 }

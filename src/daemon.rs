@@ -862,6 +862,8 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     let telemetry = crate::telemetry::start_for_daemon(&event_tx, &pty_registry);
     // PRD #1666 S3: every inbox state change reaches attached clients.
     pty_registry.inbox().set_broadcast(event_tx.clone());
+    // Issue #1965: an orchestration role's exit reaches attached clients.
+    pty_registry.set_ended_role_broadcast(event_tx.clone());
     // PRD #2374: agent cards ring their doorbells on the same fan-out, and
     // offer "close, keeping the worktree" for agents with a dispatched one.
     pty_registry
@@ -1154,7 +1156,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // repository; the `git` probes that find each session's branch still run
     // for every live session with a working directory, once an interval and
     // sooner after a turn ends.
-    let pull_request_handle = {
+    let (pull_request_handle, reference_check_handle) = {
         let registry = pty_registry.clone();
         let monitor_state = state.clone();
         let monitor_event_tx = event_tx.clone();
@@ -1163,15 +1165,29 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
                 .ok()
                 .as_deref(),
         );
-        tokio::spawn(async move {
+        // Issue #2418: the job bound the daemon's background GitHub lookups
+        // share; a clone goes to each monitor that runs `git` or `gh` for one.
+        let github_jobs = crate::pull_request::new_job_bound();
+        // Issue #2418 (D4): the deck's own check of the pull requests and
+        // issues agents report on their cards, on the same bound and
+        // interval. It runs `git` for a folder and `gh` for a reference only
+        // while a card names one.
+        let references = tokio::spawn(crate::reference_check::run_reference_monitor(
+            registry.clone(),
+            interval,
+            github_jobs.clone(),
+        ));
+        let badge = tokio::spawn(async move {
             crate::pull_request::run_pull_request_monitor(
                 registry,
                 monitor_state,
                 monitor_event_tx,
                 interval,
+                github_jobs,
             )
             .await;
-        })
+        });
+        (badge, references)
     };
 
     let result = run_hook_loop(
@@ -1197,6 +1213,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     input_held_handle.abort();
     opencode_mode_handle.abort();
     pull_request_handle.abort();
+    reference_check_handle.abort();
     scheduler_handle.abort();
     inbox_ticker.abort();
     agent_cards_watcher.abort();
@@ -1585,8 +1602,7 @@ fn make_schedule_callback(
                         info!(task = %req.task_name, "restart called off; firing again");
                     }
                     Err(e) => {
-                        // Already surfaced via the notifier; log for the operator.
-                        warn!(error = %e, "scheduled spawn failed");
+                        log_scheduled_spawn_error(&req.task_name, &e);
                         break;
                     }
                 }
@@ -1599,6 +1615,20 @@ fn make_schedule_callback(
             }
         })
     })
+}
+
+/// The operator's log line for scheduled fire `task`, whose spawn returned
+/// `error`. A failed spawn was already surfaced through the notifier. PR #2431
+/// round 6: one this daemon's shutdown cut short after its agents came up is
+/// an interruption, not a failure, and announced nothing.
+fn log_scheduled_spawn_error(task: &str, error: &crate::spawn::SpawnError) {
+    match error {
+        crate::spawn::SpawnError::ShutdownWhileStarting => info!(
+            task = %task,
+            "scheduled fire interrupted: the deck stopped while it was starting"
+        ),
+        _ => warn!(error = %error, "scheduled spawn failed"),
+    }
 }
 
 /// PRD #1885: forget `task`'s recorded refusal as a new fire of it starts, off
@@ -9799,6 +9829,69 @@ mod orphan_watchdog_tests {
         // which is WHY the watchdog must be left OFF for detached production /
         // TuiDeck daemons — only the harness's non-detached daemons enable it.
         assert!(should_exit_orphaned(1, 1));
+    }
+}
+
+/// PR #2431 round 6: what the scheduled spawn callback logs for each outcome.
+#[cfg(test)]
+mod scheduled_spawn_log_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = CapturedLog;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn logged(error: &crate::spawn::SpawnError) -> String {
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing_subscriber::filter::LevelFilter::DEBUG)
+            .with_ansi(false)
+            .finish();
+        let guard = crate::test_isolation::capture_tracing_on_this_thread(subscriber);
+        log_scheduled_spawn_error("nightly", error);
+        drop(guard);
+        String::from_utf8(captured.0.lock().unwrap().clone()).unwrap()
+    }
+
+    /// Scenario: a scheduled fire's spawn is cut short by the daemon stopping
+    /// after its agents came up. The operator's log says the fire was
+    /// interrupted, not that its spawn failed.
+    #[test]
+    fn a_fire_the_shutdown_cut_short_is_logged_as_interrupted() {
+        let line = logged(&crate::spawn::SpawnError::ShutdownWhileStarting);
+        assert!(line.contains("interrupted"), "{line}");
+        assert!(line.contains("nightly"), "names the fire: {line}");
+        assert!(!line.contains("spawn failed"), "{line}");
+        assert!(
+            !line.contains("WARN"),
+            "an interruption is not a warning: {line}"
+        );
+    }
+
+    /// Scenario: any other spawn error is still logged as a failed spawn.
+    #[test]
+    fn any_other_spawn_error_is_still_logged_as_a_failure() {
+        let line = logged(&crate::spawn::SpawnError::Agent("boom".to_string()));
+        assert!(line.contains("scheduled spawn failed"), "{line}");
+        assert!(line.contains("boom"), "{line}");
     }
 }
 

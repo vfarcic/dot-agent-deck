@@ -1,0 +1,10 @@
+{
+  "status": "Exited",
+  "lastOutput": "Last output",
+  "headline": "{role} exited: {reason}",
+  "reasons": {
+    "pane_command_exited": "its command exited (code {code})",
+    "connection_ended": "the deck's connection to its pane ended",
+    "unknown": "its pane ended"
+  }
+}

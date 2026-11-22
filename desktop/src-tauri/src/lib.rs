@@ -17,6 +17,7 @@ mod endpoint_tunnels;
 #[cfg(test)]
 mod features_lock;
 mod generation;
+mod interrupted_work;
 // The local deck's address, read in one place so the tests have one seam to move
 // it with instead of the process-wide environment variable (issue #1078).
 mod local_deck;
@@ -1864,16 +1865,23 @@ pub(crate) struct DesktopAgentCards {
     revision: u64,
     entries: Vec<dot_agent_deck::agent_cards::AgentCardEntry>,
     catalog_errors: Vec<String>,
+    /// Issue #2418: the daemon advertised the card tree, so each entry's
+    /// `parent`, `rollup` and `checked_refs` are its own (the shared client
+    /// drops them otherwise). `false` for an older daemon, whose cards the
+    /// webview draws as roots with no roll-up.
+    tree: bool,
 }
 
 impl DesktopAgentCards {
-    fn new(endpoint: &Endpoint, list: dot_agent_deck::agent_cards::AgentCardList) -> Self {
+    fn new(endpoint: &Endpoint, answer: dot_agent_deck::daemon_client::AgentCardsAnswer) -> Self {
+        let list = answer.list;
         Self {
             deck_id: crate::dto::deck_wire_id(endpoint),
             instance_id: list.instance_id,
             revision: list.revision,
             entries: list.entries,
             catalog_errors: list.catalog_errors,
+            tree: answer.tree,
         }
     }
 }
@@ -1887,13 +1895,13 @@ async fn emit_agent_cards(app: &AppHandle, endpoint: &Endpoint, links: &DaemonLi
     if daemon.require_compatible().is_err() {
         return;
     }
-    if let Ok(GatedQuery::Answered(list)) =
-        crate::daemon_bridge::bounded_reply("ListAgentCards", daemon.client.list_agent_cards())
+    if let Ok(GatedQuery::Answered(answer)) =
+        crate::daemon_bridge::bounded_reply("ListAgentCards", daemon.client.list_agent_cards_tree())
             .await
     {
         let _ = app.emit(
             "desktop://agent-cards",
-            DesktopAgentCards::new(endpoint, list),
+            DesktopAgentCards::new(endpoint, answer),
         );
     }
 }
@@ -1938,12 +1946,110 @@ async fn agent_cards_list_on(
     let scope = crate::dto::DeckScope::resolve(Some(deck_id))?;
     let daemon = state.daemon.trusted(scope.endpoint()).await?;
     daemon.require_compatible()?;
-    match crate::daemon_bridge::bounded_reply("ListAgentCards", daemon.client.list_agent_cards())
-        .await?
+    match crate::daemon_bridge::bounded_reply(
+        "ListAgentCards",
+        daemon.client.list_agent_cards_tree(),
+    )
+    .await?
     {
-        GatedQuery::Answered(list) => Ok(Some(DesktopAgentCards::new(scope.endpoint(), list))),
+        GatedQuery::Answered(answer) => Ok(Some(DesktopAgentCards::new(scope.endpoint(), answer))),
         GatedQuery::Unsupported => Ok(None),
     }
+}
+
+/// PRD #1790 stage 2: deck `deck_id`'s interrupted work, from daemon
+/// process `instance_id` (the deck's connection's incarnation), with each
+/// item's Git and pull request facts when `git` is set. `unsupported` when
+/// that daemon does not advertise `interrupted-work` or is another process.
+#[tauri::command]
+async fn interrupted_work_list(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    deck_id: String,
+    instance_id: String,
+    git: bool,
+) -> Result<
+    crate::dto::InterruptedWorkReply<dot_agent_deck::interrupted_work::InterruptedList>,
+    String,
+> {
+    ensure_main_webview(&webview)?;
+    let scope = crate::dto::DeckScope::resolve(Some(&deck_id))?;
+    let daemon = state.daemon.trusted(scope.endpoint()).await?;
+    daemon.require_compatible()?;
+    crate::interrupted_work::list(&daemon.client, &instance_id, git).await
+}
+
+/// PRD #1790 stage 2: one interrupted item of deck `deck_id` and a page of
+/// its kept reports' text, from its `reports_from`-th on, or with `report`
+/// that one report — a report past the ones the list carries included.
+#[tauri::command]
+async fn interrupted_work_show(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    deck_id: String,
+    instance_id: String,
+    id: String,
+    report: Option<String>,
+    reports_from: Option<usize>,
+) -> Result<
+    crate::dto::InterruptedWorkReply<dot_agent_deck::interrupted_work::InterruptedShow>,
+    String,
+> {
+    ensure_main_webview(&webview)?;
+    let scope = crate::dto::DeckScope::resolve(Some(&deck_id))?;
+    let daemon = state.daemon.trusted(scope.endpoint()).await?;
+    daemon.require_compatible()?;
+    crate::interrupted_work::show(
+        &daemon.client,
+        &instance_id,
+        &id,
+        report.as_deref(),
+        reports_from,
+    )
+    .await
+}
+
+/// PRD #1790 stage 2: reclaim interrupted item `id` of deck `deck_id` —
+/// remove its worktree, keep its branch — or with `dry_run` ask what that
+/// would do. Sent with no pane claim: the desktop is the person's client.
+#[tauri::command]
+async fn interrupted_work_reclaim(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    deck_id: String,
+    instance_id: String,
+    id: String,
+    dry_run: bool,
+) -> Result<
+    crate::dto::InterruptedWorkReply<dot_agent_deck::interrupted_work::ReclaimOutcome>,
+    String,
+> {
+    ensure_main_webview(&webview)?;
+    let scope = crate::dto::DeckScope::resolve(Some(&deck_id))?;
+    let daemon = state.daemon.trusted(scope.endpoint()).await?;
+    daemon.require_compatible()?;
+    crate::interrupted_work::reclaim(&daemon.client, &instance_id, &id, dry_run).await
+}
+
+/// PRD #1790 stage 2: dismiss exactly the interrupted items `ids` name on
+/// deck `deck_id` — Dismiss all sends the ids it listed, never "all". Sent
+/// with no pane claim.
+#[tauri::command]
+async fn interrupted_work_dismiss(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    deck_id: String,
+    instance_id: String,
+    ids: Vec<String>,
+) -> Result<
+    crate::dto::InterruptedWorkReply<dot_agent_deck::interrupted_work::DismissOutcome>,
+    String,
+> {
+    ensure_main_webview(&webview)?;
+    let scope = crate::dto::DeckScope::resolve(Some(&deck_id))?;
+    let daemon = state.daemon.trusted(scope.endpoint()).await?;
+    daemon.require_compatible()?;
+    crate::interrupted_work::dismiss(&daemon.client, &instance_id, ids).await
 }
 
 /// PRD #2374: invoke action `action_id` of the card of agent `agent_id` in
@@ -2343,6 +2449,43 @@ async fn desktop_generate_config<R: tauri::Runtime>(
         &Incarnation::from(incarnation),
     )
     .await)
+}
+
+/// Issue #2454: tell the daemon that owns agent `agent_id` (in `pane_id`) on
+/// deck `deck_id` that the user opened it — its full-window pane or its
+/// overlay — which deals with the `waiting`, `done` or `failed` reason its card
+/// report raised. Bound to `incarnation`, the daemon process that listed the
+/// agent, so a successor that reused the ids is sent nothing. A daemon that
+/// does not advertise the verb is sent nothing either, and its cards keep the
+/// reason until the agent publishes again, and that is an `Ok`. A failure or a
+/// daemon that does not answer in time is an `Err`, which the webview tries
+/// again a few times while the agent stays open.
+#[tauri::command]
+async fn desktop_agent_opened(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    deck_id: String,
+    agent_id: String,
+    pane_id: String,
+    incarnation: Option<String>,
+) -> Result<(), String> {
+    ensure_main_webview(&webview)?;
+    validate_agent_id(&agent_id)?;
+    let scope = crate::dto::DeckScope::resolve(Some(&deck_id))?;
+    let daemon = state.daemon.trusted(scope.endpoint()).await?;
+    daemon.require_compatible()?;
+    let client = daemon.client.bound_to(Incarnation::from(incarnation));
+    let request = client.agent_opened(&pane_id, Some(&agent_id));
+    match tokio::time::timeout(crate::daemon_bridge::DECK_REPLY_TIMEOUT, request).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(safe_message(error.to_string())),
+        Err(_) => Err(safe_message(
+            dot_agent_deck::daemon_client::ClientError::TimedOut(
+                crate::daemon_bridge::DECK_REPLY_TIMEOUT,
+            )
+            .to_string(),
+        )),
+    }
 }
 
 /// [`desktop_generate_config`] minus the webview.
@@ -7562,9 +7705,14 @@ pub fn run() {
             desktop_list_directories,
             desktop_inbox_action,
             desktop_generate_config,
+            desktop_agent_opened,
             agent_cards_consume,
             agent_cards_list,
             agent_card_invoke,
+            interrupted_work_list,
+            interrupted_work_show,
+            interrupted_work_reclaim,
+            interrupted_work_dismiss,
             desktop_new_agent_options,
             desktop_bootstrap,
             desktop_reconnect_deck,

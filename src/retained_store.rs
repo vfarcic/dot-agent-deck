@@ -283,6 +283,173 @@ pub fn parse_adopted_name(name: &str) -> Option<(&str, i64, AdoptedState)> {
     Some((id, deadline.parse().ok()?, state))
 }
 
+// ---------------------------------------------------------------------------
+// Kept reports (PRD #1790 stage 2)
+// ---------------------------------------------------------------------------
+
+/// The most directory entries one [`RetainedStore::kept_reports`] looks at:
+/// the entries of `files/` and of every run's directory in it, together.
+pub const MAX_KEPT_LISTED: usize = 65_536;
+
+/// The most of a kept report's file [`RetainedStore::read_kept_report`] is
+/// meant to be asked for: the largest file adoption accepts.
+pub const MAX_KEPT_BODY_BYTES: u64 = MAX_ADOPTABLE_FILE;
+
+/// Where a kept report's file is in its lifetime, as far as its name (and,
+/// for this run's own file, its inventory) says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeptState {
+    /// `r-<report>.md`: a file the run whose directory holds it wrote. The
+    /// state is this run's inventory's for a file of this run, and `None`
+    /// for another live run's, whose inventory is not read here.
+    Own(Option<OwnState>),
+    /// `r-<report>.d<deadline>.<state>.md`: adopted from a run that ended,
+    /// in the state that run left it in. Never [`AdoptedState::Orphaned`]:
+    /// such a file is not a report and is not listed.
+    Adopted(AdoptedState),
+}
+
+/// One kept report file, from its name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeptReport {
+    pub report_id: String,
+    /// The run whose directory (`files/<run>/`) holds it, which owns it.
+    pub run: String,
+    /// Its file name in that directory.
+    pub name: String,
+    pub state: KeptState,
+    /// When the store removes it, in milliseconds since the Unix epoch: an
+    /// adopted file's deadline, or an own file's acknowledgement or
+    /// recovery time plus its retention. `None` while it is held with no
+    /// deadline (an own file still pinned, or another run's).
+    pub kept_until_ms: Option<u64>,
+}
+
+impl KeptReport {
+    /// The report `name` names in `run`'s directory, with `own` the state
+    /// this run's inventory holds for it (pass `None` for another run's);
+    /// `None` when the name is neither an own nor an adopted report's, or it
+    /// is an orphan (a failed attempt's leftover, never a report).
+    pub fn from_name(run: &str, name: &str, own: Option<OwnState>) -> Option<Self> {
+        let millis = |secs: i64| u64::try_from(secs).ok().map(|s| s.saturating_mul(1000));
+        if let Some(id) = parse_own_name(name) {
+            if own == Some(OwnState::OrphanUnlink) {
+                return None;
+            }
+            let kept_until_ms = match own {
+                Some(OwnState::Acknowledged(at)) => millis(at.saturating_add(secs(ACK_RETENTION))),
+                Some(OwnState::Recovered(at)) => {
+                    millis(at.saturating_add(secs(RECOVERY_RETENTION)))
+                }
+                _ => None,
+            };
+            return Some(KeptReport {
+                report_id: id.to_string(),
+                run: run.to_string(),
+                name: name.to_string(),
+                state: KeptState::Own(own),
+                kept_until_ms,
+            });
+        }
+        let (id, deadline, state) = parse_adopted_name(name)?;
+        if state == AdoptedState::Orphaned {
+            return None;
+        }
+        Some(KeptReport {
+            report_id: id.to_string(),
+            run: run.to_string(),
+            name: name.to_string(),
+            state: KeptState::Adopted(state),
+            kept_until_ms: millis(deadline),
+        })
+    }
+
+    /// Whether the report's message was acknowledged: read by the agent it
+    /// was for, so it is not one left for a caller that is gone.
+    pub fn acknowledged(&self) -> bool {
+        matches!(
+            self.state,
+            KeptState::Own(Some(OwnState::Acknowledged(_)))
+                | KeptState::Adopted(AdoptedState::Acknowledged)
+        )
+    }
+
+    /// Whether it was adopted from a run that ended in a state other than
+    /// acknowledged (pinned, recovered or unlisted): a report whose caller's
+    /// run is gone without having read it.
+    pub fn adopted_unread(&self) -> bool {
+        matches!(
+            self.state,
+            KeptState::Adopted(
+                AdoptedState::Pinned | AdoptedState::Recovered | AdoptedState::Unlisted
+            )
+        )
+    }
+
+    /// Whether the file itself says its report was left for a caller that is
+    /// gone: adopted unread from a run that ended ([`Self::adopted_unread`]),
+    /// or this run's own file in state recovered — a report the inbox
+    /// accepted and then set aside when its caller went away, whose journal
+    /// line still says it went to the inbox.
+    pub fn left_for_gone_caller(&self) -> bool {
+        self.adopted_unread() || matches!(self.state, KeptState::Own(Some(OwnState::Recovered(_))))
+    }
+}
+
+/// What [`RetainedStore::kept_reports`] found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KeptReports {
+    /// Sorted by report id, then run.
+    pub reports: Vec<KeptReport>,
+    /// The listing did not see everything: it stopped at
+    /// [`MAX_KEPT_LISTED`], a directory could not be listed, this run's
+    /// inventory could not be read, or the store cannot be used. A report
+    /// missing from `reports` may still be kept.
+    pub incomplete: bool,
+}
+
+/// A kept report's file, read for showing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeptBody {
+    /// Its attribution, when the first two lines are a magic line and an
+    /// envelope. Its producer-supplied strings are untrusted.
+    pub envelope: Option<Envelope>,
+    /// The report, framed as untrusted worker-authored text
+    /// ([`crate::state::frame_untrusted_report_for_file`]).
+    pub framed: String,
+    /// The file was longer than the bound it was read with, so `framed`
+    /// holds its start only.
+    pub cut: bool,
+}
+
+impl KeptBody {
+    /// `bytes`, the start of a retained file, as a body to show. The text
+    /// after the envelope and its blank line is unframed when it carries the
+    /// file frame and framed again; a file that does not parse is framed
+    /// whole, with no envelope.
+    fn parse(bytes: &[u8], cut: bool) -> Self {
+        let text = String::from_utf8_lossy(bytes);
+        let attributed = text
+            .split_once('\n')
+            .filter(|(magic, _)| *magic == MAGIC)
+            .and_then(|(_, rest)| rest.split_once('\n'))
+            .and_then(|(envelope, rest)| {
+                let envelope: Envelope = serde_json::from_str(envelope).ok()?;
+                Some((envelope, rest.strip_prefix('\n').unwrap_or(rest)))
+            });
+        let (envelope, body) = match attributed {
+            Some((envelope, body)) => (Some(envelope), body),
+            None => (None, text.as_ref()),
+        };
+        let inner = crate::state::strip_report_file_frame(body, cut).unwrap_or(body);
+        KeptBody {
+            envelope,
+            framed: crate::state::frame_untrusted_report_for_file(inner),
+            cut,
+        }
+    }
+}
+
 fn valid_run_id(id: &str) -> bool {
     id.len() == 32
         && id
@@ -1678,6 +1845,148 @@ impl RetainedStore {
     pub fn own_state(&self, report_id: &str) -> Option<OwnState> {
         let st = self.state.try_lock().ok()?;
         st.own.get(&own_name(report_id)).map(|file| file.state)
+    }
+
+    // -- kept reports (PRD #1790 stage 2) -----------------------------------
+
+    /// PRD #1790 stage 2: every report file kept under `files/*/`, this run's
+    /// and every other run's, from the file names alone: no file is opened
+    /// and nothing is moved, so a live run's directory is only listed. An
+    /// adopted file's state and deadline come from its name; this run's own
+    /// file's state from its inventory; another live run's own file's state
+    /// is not known here. Attempts' temporary names and names that parse as
+    /// neither form are left out. At most [`MAX_KEPT_LISTED`] entries are
+    /// looked at, across `files/` and every run directory in it
+    /// ([`Self::kept_reports_within`]); [`KeptReports::incomplete`] says when
+    /// the listing stopped at that, failed, or the store cannot be used.
+    pub fn kept_reports(&self) -> KeptReports {
+        self.kept_reports_within(MAX_KEPT_LISTED)
+    }
+
+    /// [`Self::kept_reports`] looking at no more than `budget` directory
+    /// entries. One budget covers both levels: every entry of `files/` (a run
+    /// directory, an invalid name, one that cannot be opened) and every entry
+    /// inside a run directory is charged before it is used, and the listing
+    /// stops, [`KeptReports::incomplete`], as soon as it is spent, so neither
+    /// many run directories nor many reports can make it look further.
+    pub fn kept_reports_within(&self, budget: usize) -> KeptReports {
+        let mut out = KeptReports::default();
+        let Some(dirs) = &self.dirs else {
+            out.incomplete = true;
+            return out;
+        };
+        let mut runs = match dirs.files.stream() {
+            Ok(runs) => runs,
+            Err(_) => {
+                out.incomplete = true;
+                return out;
+            }
+        };
+        let own: HashMap<String, OwnState> = match self.state.try_lock() {
+            Ok(st) => st
+                .own
+                .iter()
+                .map(|(name, file)| (name.clone(), file.state))
+                .collect(),
+            Err(_) => {
+                out.incomplete = true;
+                HashMap::new()
+            }
+        };
+        let mut looked = 0usize;
+        // Charge one entry; `false` once the budget is spent.
+        let mut charge = |out: &mut KeptReports| {
+            if looked >= budget {
+                out.incomplete = true;
+                return false;
+            }
+            looked += 1;
+            true
+        };
+        'runs: while let Some(run) = runs.next_name() {
+            if !charge(&mut out) {
+                break;
+            }
+            let Ok(run) = run else {
+                out.incomplete = true;
+                continue;
+            };
+            let Some(run) = run.to_str().filter(|run| valid_run_id(run)) else {
+                continue;
+            };
+            let dir = match dirs.files.child(run, false) {
+                Ok(dir) => dir,
+                Err(_) => {
+                    out.incomplete = true;
+                    continue;
+                }
+            };
+            let mut stream = match dir.stream() {
+                Ok(stream) => stream,
+                Err(_) => {
+                    out.incomplete = true;
+                    continue;
+                }
+            };
+            while let Some(name) = stream.next_name() {
+                if !charge(&mut out) {
+                    break 'runs;
+                }
+                let Ok(name) = name else {
+                    out.incomplete = true;
+                    continue;
+                };
+                let Some(name) = name.to_str() else {
+                    continue;
+                };
+                let own_state = (run == self.run_id).then(|| own.get(name).copied());
+                if let Some(report) = KeptReport::from_name(run, name, own_state.flatten()) {
+                    out.reports.push(report);
+                }
+            }
+        }
+        out.reports
+            .sort_by(|a, b| (&a.report_id, &a.run).cmp(&(&b.report_id, &b.run)));
+        out
+    }
+
+    /// PRD #1790 stage 2: the body of `report`'s file (one
+    /// [`Self::kept_reports`] listed), read through the store's verified
+    /// directories without following a link, at most `max_bytes` of it, and
+    /// framed as untrusted worker-authored text the way a `work-done` report
+    /// saved to a file is ([`crate::state::frame_untrusted_report_for_file`],
+    /// #508/#509): the file's own frame is not trusted, since a same-user
+    /// process can write one, so the text inside it is framed again. The
+    /// envelope is `None` when the file's first two lines are not a magic
+    /// line and an envelope (show it as unattributed); its producer-supplied
+    /// strings are untrusted too. `NotFound` when the file was renamed or
+    /// removed since it was listed (an adoption or a sweep): list again.
+    pub fn read_kept_report(&self, report: &KeptReport, max_bytes: u64) -> io::Result<KeptBody> {
+        let Some(dirs) = &self.dirs else {
+            return Err(io::Error::other(
+                self.unusable
+                    .clone()
+                    .unwrap_or_else(|| "the store cannot be used".to_string()),
+            ));
+        };
+        if !valid_run_id(&report.run)
+            || KeptReport::from_name(&report.run, &report.name, None).is_none()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a kept report's name",
+            ));
+        }
+        let file = dirs
+            .files
+            .child(&report.run, false)?
+            .open_regular(&report.name)?;
+        let mut bytes = Vec::new();
+        file.take(max_bytes.saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        let cut = bytes.len() as u64 > max_bytes;
+        bytes.truncate(usize::try_from(max_bytes).unwrap_or(usize::MAX));
+        Ok(KeptBody::parse(&bytes, cut))
     }
 
     // -- dispatch results (plan §3.2) --------------------------------------

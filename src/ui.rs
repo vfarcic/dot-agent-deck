@@ -391,6 +391,11 @@ pub enum UiMode {
     /// session. Nothing of it is spawned while this is open. Its state lives in
     /// `UiState::trust_prompt`.
     TrustPrompt,
+    /// PRD #1790 stage 2: the "Interrupted work" list — the work a deck
+    /// restart left behind — opened by the `interrupted_work` key (default
+    /// `I`), the footer's `[Show]` button or the restart notice's list. Its
+    /// state lives in `UiState::interrupted`.
+    InterruptedWork,
     /// PRD #211: the Antigravity experimental notice, shown after a New Agent
     /// start of Antigravity on the first start and every
     /// [`crate::antigravity_notice::NOTICE_INTERVAL`]th after. It owns the
@@ -1980,6 +1985,10 @@ struct UiState {
     /// room for them, until the user dismisses it — agents later drops take
     /// join it meanwhile.
     restart_notice: Option<RestartNotice>,
+    /// PRD #1790 stage 2: the interrupted work list the daemon answered, the
+    /// overlay's view of it and the footer row's state
+    /// ([`interrupted_work_view`]).
+    interrupted: interrupted_work_view::InterruptedWork,
     /// PRD #1885: the open trust prompt (`UiMode::TrustPrompt`).
     trust_prompt: Option<TrustPromptState>,
     /// PRD #1885: saved orchestrations the startup restore held back because
@@ -2149,6 +2158,14 @@ struct UiState {
     /// Only orchestration ROLE panes can carry a declaration, so they are the
     /// only panes ever inserted — at spawn and on session restore.
     pane_declared_agent: HashMap<String, AgentType>,
+    /// Issue #1965: dead-slot pane id ([`dead_slot_pane_id`]) → the role whose
+    /// agent exited there, as the daemon reported it
+    /// ([`crate::ended_role::EndedRole`]). Its card says the role exited and
+    /// why ([`render_ended_role_card`]) instead of `No agent`, and selecting it
+    /// says so instead of removing it as stale. Inert once its tab closes: a
+    /// dead-slot id is minted from the orchestration instance's own id, which
+    /// no later instance reuses.
+    ended_role_slots: HashMap<String, RememberedEndedRole>,
     /// Maps pane_id → launch metadata for auto-save/restore.
     pane_metadata: HashMap<String, config::SavedPane>,
     config: DashboardConfig,
@@ -2735,6 +2752,7 @@ impl UiState {
             selected_index: Some(0),
             last_focused_pane_id: None,
             restart_notice: None,
+            interrupted: Default::default(),
             trust_prompt: None,
             pending_trust_restores: std::collections::VecDeque::new(),
             declined_trust_restores: Vec::new(),
@@ -2773,6 +2791,7 @@ impl UiState {
             pending_reveal: None,
             renamed_from: HashMap::new(),
             pane_declared_agent: HashMap::new(),
+            ended_role_slots: HashMap::new(),
             pane_metadata: HashMap::new(),
             config,
             keybindings,
@@ -4065,6 +4084,164 @@ pub fn is_dead_slot_pane_id(pane_id: &str) -> bool {
     pane_id.starts_with(DEAD_SLOT_PREFIX)
 }
 
+/// Issue #1965: at most this many exited roles are remembered for cards. The
+/// map is pruned to the role panes of the open tabs every frame
+/// ([`prune_ended_roles`]), so it holds that many only with that many role
+/// panes open; past it, a report for a key not already held is dropped and its
+/// card keeps the plain `No agent` look it had before.
+const MAX_ENDED_ROLE_SLOTS: usize = 256;
+
+/// Issue #1965: an exited role remembered for a card, with the daemon process
+/// that reported it. Pane ids are a per-daemon counter, so a report from one
+/// process says nothing about a pane another process numbers the same way.
+#[derive(Debug, Clone)]
+struct RememberedEndedRole {
+    role: crate::ended_role::EndedRole,
+    from: crate::daemon_client::Incarnation,
+}
+
+/// Issue #1965: remember `role` under `key`, bounded by
+/// [`MAX_ENDED_ROLE_SLOTS`]. A report the deck has not settled yet (no
+/// termination) never replaces a settled one for the same agent generation: a
+/// listing read before the pane's reader finished can arrive after the
+/// broadcast that carried the settled report.
+fn remember_ended_role(
+    ui: &mut UiState,
+    key: String,
+    role: crate::ended_role::EndedRole,
+    from: crate::daemon_client::Incarnation,
+) {
+    if let Some(held) = ui.ended_role_slots.get(&key) {
+        if held.role.agent_id == role.agent_id
+            && held.role.termination.is_some()
+            && role.termination.is_none()
+        {
+            return;
+        }
+    } else if ui.ended_role_slots.len() >= MAX_ENDED_ROLE_SLOTS {
+        return;
+    }
+    ui.ended_role_slots
+        .insert(key, RememberedEndedRole { role, from });
+}
+
+/// Issue #1965: take the exited roles the daemon announced since the last
+/// frame (`BroadcastMsg::RoleEnded`, and the periodic listing's `ended_roles`,
+/// which recovers one missed while no stream was open) and remember each under
+/// its pane, so the role's card says which role it was and why. This is how a
+/// role that dies at spawn in a tab this TUI opened is told apart from a quiet
+/// one: its pane keeps its last frame and nothing else about it changes.
+///
+/// Each is remembered under the role's dead-slot id too, minted from the same
+/// orchestration identity and role index a rebuilt tab mints it from
+/// ([`dead_slot_pane_id`]), so a dead slot whose report was read before its
+/// pane's reader settled it gets the settled one.
+fn drain_ended_roles(state: &SharedState, ui: &mut UiState) {
+    let ended = state.blocking_write().take_ended_roles();
+    for (role, from) in ended {
+        let dead_slot = role.orchestration_id.as_ref().map(|id| {
+            dead_slot_pane_id(
+                &crate::state::OrchestrationIdentity {
+                    id: id.clone(),
+                    name: role.orchestration_name.clone(),
+                },
+                role.role_index,
+            )
+        });
+        for key in std::iter::once(role.pane_id.clone()).chain(dead_slot) {
+            remember_ended_role(ui, key, role.clone(), from.clone());
+        }
+    }
+}
+
+/// Issue #1965: forget every remembered exited role whose key is no role pane
+/// of an open orchestration tab — the tab closed, or the report arrived before
+/// its tab was built (the periodic listing brings it again) — and every one
+/// whose pane this controller now holds under another agent: a `pane restart`
+/// started a fresh agent there, and the card must reach it again. Keeps the
+/// map to what a card on screen can show.
+fn prune_ended_roles(ui: &mut UiState, tab_manager: &TabManager, pane: &dyn PaneController) {
+    if ui.ended_role_slots.is_empty() {
+        return;
+    }
+    let open: HashSet<&str> = tab_manager
+        .tabs()
+        .iter()
+        .filter_map(|tab| match tab {
+            Tab::Orchestration { role_pane_ids, .. } => Some(role_pane_ids),
+            _ => None,
+        })
+        .flatten()
+        .map(String::as_str)
+        .collect();
+    ui.ended_role_slots.retain(|key, held| {
+        open.contains(key.as_str())
+            && !superseded_by(&held.role.agent_id, pane.pane_agent_id(key).as_deref())
+    });
+}
+
+/// Issue #1965: whether the agent the pane is attached to locally is a newer
+/// generation than the exited one a report is about, so the report no longer
+/// describes the pane. A daemon numbers its agents from one counter, so a
+/// larger id is a later generation. An attachment still on an OLDER
+/// generation — a restarted role that exited again before the pane
+/// reattached — keeps the new report. Ids that are not numbers are compared
+/// for equality only.
+fn superseded_by(ended_agent: &str, attached: Option<&str>) -> bool {
+    let Some(attached) = attached else {
+        return false;
+    };
+    match (attached.parse::<u64>(), ended_agent.parse::<u64>()) {
+        (Ok(attached), Ok(ended)) => attached > ended,
+        _ => attached != ended_agent,
+    }
+}
+
+/// Issue #1965: the exited role remembered for a card's pane, unless the card
+/// has since been taken by another agent (a `pane restart` started a fresh
+/// one there) or was learned from another daemon process than the report.
+fn ended_role_for<'a>(
+    ui: &'a UiState,
+    pane_id: &str,
+    agent_id: Option<&str>,
+    learned_from: &crate::daemon_client::Incarnation,
+) -> Option<&'a crate::ended_role::EndedRole> {
+    ui.ended_role_slots
+        .get(pane_id)
+        .filter(|held| agent_id.is_none_or(|agent| agent == held.role.agent_id))
+        .filter(|held| {
+            held.from.is_unnamed()
+                || learned_from.is_unnamed()
+                || held.from.same_process(learned_from)
+        })
+        .map(|held| &held.role)
+}
+
+/// Issue #1965: for each synthetic dead slot in `role_pane_ids`, remember the
+/// role whose agent exited there, so its card says which role died and why.
+/// Matched on the orchestration instance's id and the role's index, the two
+/// keys the slot itself was minted from; a slot with no reported role keeps
+/// its plain `No agent` card. `from` is the daemon process `ended` came from.
+fn remember_ended_roles(
+    ui: &mut UiState,
+    role_pane_ids: &[Option<String>],
+    orchestration_id: &str,
+    ended: &[crate::ended_role::EndedRole],
+    from: &crate::daemon_client::Incarnation,
+) {
+    for (role_index, slot) in role_pane_ids.iter().enumerate() {
+        let Some(slot) = slot.as_deref().filter(|p| is_dead_slot_pane_id(p)) else {
+            continue;
+        };
+        if let Some(role) = ended.iter().rev().find(|role| {
+            role.role_index == role_index
+                && role.orchestration_id.as_deref() == Some(orchestration_id)
+        }) {
+            remember_ended_role(ui, slot.to_string(), role.clone(), from.clone());
+        }
+    }
+}
+
 /// Fill missing role slots in `role_pane_ids` with synthetic dead-slot
 /// pane ids. Returns the list of synthetic ids that were assigned (in
 /// `role_index` order) so callers can later seed placeholder sessions
@@ -5270,6 +5447,17 @@ fn surface_one_orchestration(
                 );
                 surface_orchestration_config_drift(ui, tab_manager.tabs().get(tab_index), warning);
             }
+            // Issue #1965: say which role died and why on its dead slot.
+            if !dead_slot_ids.is_empty() {
+                let ended = embedded.ended_roles(learned_from);
+                remember_ended_roles(
+                    ui,
+                    &role_pane_ids,
+                    &bucket.orchestration_id,
+                    &ended,
+                    learned_from,
+                );
+            }
             let mut st = state.blocking_write();
             // Seed placeholder cards for synthetic dead slots only (live roles
             // get their card from the agent's own SessionStart hook).
@@ -5782,6 +5970,14 @@ pub enum Action {
     DismissRestartNotice,
     /// PRD #1666 part 2 (G-fix7d): scroll the list by this many lines.
     RestartNoticeScroll(isize),
+    /// PRD #1790 stage 2: open the interrupted work list — its key (default
+    /// `I`) and the footer's `[Show]` button.
+    OpenInterruptedWork,
+    /// PRD #1790 stage 2: hide the interrupted work footer row — its key
+    /// (default `X`) and its `[Hide]` button.
+    HideInterruptedWork,
+    /// PRD #1790 stage 2: a key or click in the interrupted work list.
+    InterruptedWork(interrupted_work_view::Press),
     /// Issue #1635: open the upgrade dialog. Shared by the `open_upgrade` key
     /// (default `u`) and a click on the footer's update badge.
     OpenUpgrade,
@@ -8779,6 +8975,28 @@ fn apply_stream_rejection_feedback(
 }
 
 /// Select deck at `idx` and focus its pane. Returns `true` if idx was valid.
+/// Issue #1965: a selected role card whose role the daemon reported exited is
+/// not a stale card and has no live terminal to enter: it is where the deck
+/// shows which role died, so selecting it says why, in the card's own words
+/// ([`crate::ended_role::EndedRole::headline`]), keeps it, and attempts no
+/// attach. `false` for any other pane, which keeps the attach and the
+/// stale-card removal.
+fn ended_role_selected(ui: &mut UiState, session: &SessionState) -> bool {
+    let Some(headline) = session.pane_id.as_deref().and_then(|pane_id| {
+        ended_role_for(
+            ui,
+            pane_id,
+            session.agent_id.as_deref(),
+            &session.incarnation,
+        )
+        .map(|e| e.headline())
+    }) else {
+        return false;
+    };
+    ui.status_message = Some((headline, std::time::Instant::now()));
+    true
+}
+
 fn focus_deck(
     idx: usize,
     ui: &mut UiState,
@@ -8819,6 +9037,9 @@ fn focus_deck(
             // learned from only.
             // G-fix7: and a local pane under the same id focuses only when it
             // is the card's own.
+            if ended_role_selected(ui, session) {
+                return true;
+            }
             let card = crate::pane::BoundPane::new(pane_id.clone(), session.incarnation.clone());
             let mut focus_result = pane.focus_card(&card);
             if let Err(PaneError::CommandFailed(_)) = focus_result
@@ -8828,6 +9049,8 @@ fn focus_deck(
             }
             match focus_result {
                 Ok(()) => {
+                    // Issue #2454: opening the agent deals with its report.
+                    pane.note_card_opened(&card, session.agent_id.as_deref());
                     ui.mode = UiMode::PaneInput;
                     ui.status_message = Some((
                         format!(
@@ -9640,6 +9863,16 @@ fn handle_normal_key(
             return Action::DismissRestartNotice;
         }
     }
+    // PRD #1790 stage 2: the interrupted work list (default `I`), and hiding
+    // its footer row (default `X`) while the footer shows it.
+    if kb.matches(KbAction::InterruptedWork, &key) {
+        return Action::OpenInterruptedWork;
+    }
+    if interrupted_work_view::footer_sentence(ui).is_some()
+        && kb.matches(KbAction::HideInterruptedWork, &key)
+    {
+        return Action::HideInterruptedWork;
+    }
     // Issue #1635: open the upgrade dialog the footer badge names (default
     // `u`), shared with a click on the badge.
     if pressed(KbAction::OpenUpgrade) {
@@ -9820,6 +10053,12 @@ fn handle_restart_notice_key(key: KeyEvent, ui: &mut UiState, kb: &KeybindingCon
     }
     match key.code {
         _ if kb.matches(KbAction::DismissRestartNotice, &key) => Action::DismissRestartNotice,
+        // PRD #1790 stage 2: the list's line leading to the interrupted work.
+        _ if kb.matches(KbAction::InterruptedWork, &key)
+            && interrupted_work_view::may_have_interrupted(ui) =>
+        {
+            Action::OpenInterruptedWork
+        }
         KeyCode::Esc | KeyCode::Char('q') => Action::CloseRestartNotice,
         _ if kb.matches(KbAction::RestartNotice, &key) => Action::CloseRestartNotice,
         KeyCode::Down | KeyCode::Char('j') => Action::RestartNoticeScroll(1),
@@ -11287,6 +11526,8 @@ fn modal_owns_clicks(mode: &UiMode) -> bool {
             // PRD #1666 part 2 (G-fix7d): and the restart
             // notice list's.
             | UiMode::RestartNotice
+            // PRD #1790 stage 2: and the interrupted work list's.
+            | UiMode::InterruptedWork
             // PRD #127 finding #4: the Schedules dialog is a
             // topmost modal too — its [Add]/[Edit]/[Delete]/[Run now]
             // buttons live in `modal_button_rects` and any miss is
@@ -11340,6 +11581,8 @@ fn overlay_blocks_mouse(mode: &UiMode) -> bool {
         | UiMode::InboxAttention
         // PRD #1666 part 2 (G-fix7d): so is the restart notice's list.
         | UiMode::RestartNotice
+        // PRD #1790 stage 2: and the interrupted work list.
+        | UiMode::InterruptedWork
         // PRD #385 M5: copy mode's pane shows a frozen screen, so the wheel
         // must not scroll the live one behind it (the run loop ignores the
         // mouse in copy mode altogether).
@@ -11635,7 +11878,11 @@ fn send_config_gen_prompt(
                 focus = pane.focus_card(card);
             }
             match focus {
-                Ok(()) => ui.mode = UiMode::PaneInput,
+                Ok(()) => {
+                    // Issue #2454: the pane opened, as Enter would open it.
+                    pane.note_card_opened(card, agent);
+                    ui.mode = UiMode::PaneInput;
+                }
                 Err(error) => tracing::debug!(
                     pane_id = %pane_id,
                     error = %error,
@@ -12207,6 +12454,8 @@ fn dispatch_action(
                 // can't accept live input, so don't enter PaneInput.
                 if let Some(msg) = non_live_input_feedback(session.writable()) {
                     ui.status_message = Some((msg.to_string(), std::time::Instant::now()));
+                } else if ended_role_selected(ui, session) {
+                    // Issue #1965: an exited role's card says why and stays.
                 } else if let Some(ref pane_id) = session.pane_id {
                     if let Some(tab_idx) = tab_manager.tab_index_for_pane(pane_id) {
                         // PRD #83: snapshot the SOURCE tab's focus before
@@ -12253,6 +12502,8 @@ fn dispatch_action(
                     }
                     match focus_result {
                         Ok(()) => {
+                            // Issue #2454: opening the agent deals with its report.
+                            pane.note_card_opened(&card, session.agent_id.as_deref());
                             ui.mode = UiMode::PaneInput;
                             ui.status_message = Some((
                                 format!(
@@ -13177,6 +13428,11 @@ fn dispatch_action(
                 ui.mode = UiMode::Normal;
             }
         }
+        Action::OpenInterruptedWork => {
+            interrupted_work_view::open(ui, &snapshot.stream_incarnation)
+        }
+        Action::HideInterruptedWork => interrupted_work_view::hide_footer(ui),
+        Action::InterruptedWork(press) => interrupted_work_view::press(ui, press),
         Action::RestartNoticeScroll(by) => {
             if let Some(notice) = ui.restart_notice.as_mut() {
                 // The overlay clamps it to the last screenful when it draws.
@@ -14779,6 +15035,7 @@ fn handle_key_event(
             UiMode::HostMetrics => handle_host_metrics_key(key, ui, &kb),
             UiMode::InboxAttention => handle_inbox_attention_key(key, ui, &kb),
             UiMode::RestartNotice => handle_restart_notice_key(key, ui, &kb),
+            UiMode::InterruptedWork => interrupted_work_view::handle_key(key, ui, &kb),
             // Issue #1635: `Ctrl+C` keeps its PRD #40 safety net here too, even
             // while an upgrade runs; the running upgrade's dialog is kept so the
             // upgrade key reopens it on the same run.
@@ -15419,6 +15676,22 @@ pub fn run_tui(
                             warning,
                         );
                     }
+                    // Issue #1965: say which role died and why on its dead
+                    // slot, from the daemon process these panes came from.
+                    if !dead_slot_synthetic_ids.is_empty() {
+                        let learned_from = hydrated
+                            .first()
+                            .map(|h| h.incarnation.clone())
+                            .unwrap_or(crate::daemon_client::Incarnation::UNNAMED);
+                        let ended = embedded.ended_roles(&learned_from);
+                        remember_ended_roles(
+                            &mut ui,
+                            &role_pane_ids,
+                            &bucket.orchestration_id,
+                            &ended,
+                            &learned_from,
+                        );
+                    }
                     let mut st = state.blocking_write();
                     // CodeRabbit PR #118 finding #3: seed placeholder
                     // sessions for dead slots only after the tab has
@@ -15647,11 +15920,22 @@ pub fn run_tui(
             // Infer the agent type once so both the daemon registry and the
             // local placeholder identify a recognized command immediately.
             let agent_type = AgentType::from_command(cmd);
+            // Issue #2421: a saved name the rename gate would apply rides on
+            // the start itself, so the daemon names the agent as it creates
+            // it. A start that outlasts the controller's bound on its reply
+            // still creates the agent, and that agent reaches the dashboard
+            // from the daemon's record; renamed only after a successful start,
+            // it reached it under its command. `resolve_display_name` keeps an
+            // applied label as it is, so the pane's own name is the same one.
+            let saved_label = match RenameOutcome::applied(&saved_pane.name) {
+                RenameOutcome::Applied(label) => Some(label),
+                RenameOutcome::Cleared | RenameOutcome::Rejected => None,
+            };
             match pane.create_pane_with_options(
                 cmd,
                 Some(&saved_pane.dir),
                 AgentSpawnOptions {
-                    display_name: None,
+                    display_name: saved_label.as_deref(),
                     tab_membership: None,
                     rows,
                     cols,
@@ -15689,7 +15973,11 @@ pub fn run_tui(
                         );
                     }
                     if !saved_pane.name.is_empty() {
-                        if let Err(e) = pane.rename_pane(&new_id, &saved_pane.name) {
+                        // A name the start did not carry — blank, or one the
+                        // gate refuses — goes through the rename as before.
+                        if saved_label.is_none()
+                            && let Err(e) = pane.rename_pane(&new_id, &saved_pane.name)
+                        {
                             ui.session_warnings.push(format!(
                                 "Warning: failed to rename pane '{}': {e}",
                                 saved_pane.name
@@ -15845,6 +16133,9 @@ pub fn run_tui(
         // PRD #1666 part 2 (G-fix7c): drop what a deck restart took, before the
         // snapshot below derives this frame's selection and names.
         process_restart_drops(&state, pane.as_ref(), &mut tab_manager, &mut ui);
+        // Issue #1965: a role whose agent exited says which role and why.
+        drain_ended_roles(&state, &mut ui);
+        prune_ended_roles(&mut ui, &tab_manager, pane.as_ref());
         // Issue #717: report a dispatched worktree the daemon actually left
         // on disk. Queued by the event subscriber, drained here because the
         // status line is `UiState`.
@@ -15864,6 +16155,11 @@ pub fn run_tui(
         // Issue #1635: the latest release check, and the result of an
         // upgrade the dialog started.
         sync_upgrade_state(&mut ui, &snapshot, &state);
+        // PRD #1790 stage 2: fetch the interrupted work once per daemon
+        // process the event stream is attached to, and take the answers that
+        // arrived.
+        interrupted_work_view::sync(&mut ui, &snapshot.stream_incarnation);
+        interrupted_work_view::drain(&mut ui);
 
         // Apply pending pane names to sessions that have appeared
         if !ui.pane_names.is_empty() {
@@ -16682,6 +16978,13 @@ pub fn run_tui(
             // event is handled below exactly as it was before.
             if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
                 embedded.report_focus(&ev, std::time::Instant::now());
+            }
+
+            // Issue #2450: a terminal focus-in lets the upgrade checker check
+            // again when its last check is more than an hour old, since its
+            // interval timer does not advance while the machine sleeps.
+            if matches!(ev, Event::FocusGained) {
+                crate::upgrade_dialog::focus_gained();
             }
 
             // PRD #84 M4 (invariant 4): a terminal resize is now just a
@@ -19047,6 +19350,20 @@ fn render_card_grid(
             let settling = ids
                 .get(col_idx)
                 .is_some_and(|id| ui.idle_settling.contains_key(*id));
+            // Issue #1965: a dead slot whose role the daemon reported exited
+            // says which role it was and why.
+            if let Some(ended) = session.pane_id.as_deref().and_then(|pane_id| {
+                ended_role_for(
+                    ui,
+                    pane_id,
+                    session.agent_id.as_deref(),
+                    &session.incarnation,
+                )
+            }) {
+                render_ended_role_card(frame, card_area, ended, is_selected, card_number, ui.mode);
+                ui.card_rects.push((flat_index, card_area));
+                continue;
+            }
             render_session_card(
                 frame,
                 card_area,
@@ -19635,12 +19952,15 @@ fn render_overlays(frame: &mut Frame, ui: &mut UiState) {
     ui.form_field_rects.clear();
     ui.form_chip_rects.clear();
     ui.form_button_rects.clear();
-    if ui.mode == UiMode::RestartNotice
-        && let Some(notice) = ui.restart_notice.as_mut()
-    {
+    if ui.mode == UiMode::RestartNotice && ui.restart_notice.is_some() {
         // The notice's own list: nothing it would cover needs to stay in view.
         let full = frame.area();
-        ui.modal_button_rects = render_restart_notice_overlay(frame, full, notice, &ui.keybindings);
+        // PRD #1790 stage 2: with a line leading to the interrupted work.
+        let hint = interrupted_work_view::restart_notice_hint(ui);
+        if let Some(notice) = ui.restart_notice.as_mut() {
+            ui.modal_button_rects =
+                render_restart_notice_overlay(frame, full, notice, &ui.keybindings, hint);
+        }
     }
     // PRD #241 review F5, G-fix7g: an open confirmation's drawing becomes the
     // record of which choices this frame shows. The record is the render gate:
@@ -19669,6 +19989,13 @@ fn draw_modal(frame: &mut Frame, area: Rect, ui: &mut UiState) {
     // G-fix7i: a confirmation's buttons are not click targets yet, nor its
     // choices counted: both wait for the frame as flushed.
     let mut confirmation = None;
+    // PRD #1790 stage 2: the interrupted work list; its reclaim and dismiss
+    // all questions are confirmations.
+    if ui.mode == UiMode::InterruptedWork {
+        let (buttons, question) = interrupted_work_view::render_overlay(frame, area, ui);
+        ui.modal_button_rects = buttons;
+        confirmation = question;
+    }
     if ui.mode == UiMode::DirPicker {
         // Capture the picker's row/button rects after the `dir_picker` borrow
         // ends so they can be stored back on `ui`.
@@ -19812,6 +20139,9 @@ fn draw_modal(frame: &mut Frame, area: Rect, ui: &mut UiState) {
 fn record_flushed_confirmation(ui: &mut UiState, flushed: &Buffer) {
     ui.confirm_choices_drawn = match ui.confirm_drawing.take() {
         Some((mode, drawing)) => {
+            if mode == UiMode::InterruptedWork {
+                interrupted_work_view::record_question(ui, &drawing.choices, flushed);
+            }
             let (shown, buttons) = drawing.read_back(flushed);
             ui.modal_button_rects = buttons;
             Some((mode, shown))
@@ -21438,7 +21768,9 @@ fn bottom_bar_rows(ui: &UiState, width: u16, frame_height: u16) -> u16 {
                 restart_notice_keys_act(ui.mode),
                 width,
             )
-        });
+        })
+        // PRD #1790 stage 2: and the interrupted work's row, below it.
+        + interrupted_work_view::footer_rows(ui, interrupted_keys_act(ui.mode), width);
     // Reserve at most `frame_height - 1` rows so the content region keeps ≥1 row.
     rows.min(frame_height.saturating_sub(1))
 }
@@ -21460,7 +21792,7 @@ fn render_bottom_bar(
         restart_notice_rows(notice, &ui.keybindings, keys, area.width)
     });
     ui.restart_notice_area = None;
-    let (area, notice_rects) = match ui.restart_notice.as_ref() {
+    let (area, mut notice_rects) = match ui.restart_notice.as_ref() {
         Some(notice) if notice_rows > 0 && area.height > notice_rows => {
             let rows = Rect {
                 height: notice_rows,
@@ -21477,8 +21809,42 @@ fn render_bottom_bar(
         }
         _ => (area, Vec::new()),
     };
+    // PRD #1790 stage 2: the interrupted work's footer row, below the restart
+    // notice's, on the same terms; a modal overlay is laid out above both.
+    let interrupted_keys = interrupted_keys_act(ui.mode);
+    let interrupted_rows = interrupted_work_view::footer_rows(ui, interrupted_keys, area.width);
+    let area = if interrupted_rows > 0 && area.height > interrupted_rows {
+        let rows = Rect {
+            height: interrupted_rows,
+            ..area
+        };
+        notice_rects.extend(interrupted_work_view::render_footer(
+            frame,
+            ui,
+            interrupted_keys,
+            rows,
+        ));
+        ui.restart_notice_area = Some(match ui.restart_notice_area {
+            Some(notice) => notice.union(rows),
+            None => rows,
+        });
+        Rect {
+            y: area.y + interrupted_rows,
+            height: area.height - interrupted_rows,
+            ..area
+        }
+    } else {
+        area
+    };
     render_bottom_bar_below_notice(frame, ui, area, has_pane_control, extra_buttons);
     ui.button_rects.extend(notice_rects);
+}
+
+/// PRD #1790 stage 2: whether the interrupted work footer's keys act in
+/// `mode` — command mode and the list's own overlay, as the restart notice's
+/// do ([`restart_notice_keys_act`]).
+fn interrupted_keys_act(mode: UiMode) -> bool {
+    matches!(mode, UiMode::Normal | UiMode::InterruptedWork)
 }
 
 fn render_bottom_bar_below_notice(
@@ -21952,7 +22318,8 @@ fn confirmation_awaits_frame(ui: &UiState) -> bool {
             // PRD #1885: input typed before the trust prompt was on screen
             // never approves it.
             | UiMode::TrustPrompt
-    ) || (ui.mode == UiMode::ScheduledTasks && ui.scheduled_delete_confirm))
+    ) || (ui.mode == UiMode::ScheduledTasks && ui.scheduled_delete_confirm)
+        || interrupted_work_view::asks(ui))
         && !ui
             .confirm_choices_drawn
             .is_some_and(|(mode, _)| mode == ui.mode)
@@ -22005,6 +22372,15 @@ fn refuse_undrawn_choice(key: &KeyEvent, ui: &UiState) -> Option<Action> {
         // PRD #1885: `a` approves only once a frame showed its label.
         UiMode::TrustPrompt => {
             let refused = key.code == KeyCode::Char('a') && !shown.contains(0);
+            return refused.then_some(Action::Continue);
+        }
+        // PRD #1790 stage 2: reclaim's and dismiss all's `y` only once
+        // flushed frames showed every row of the question, in one frame or
+        // over several as it was scrolled through.
+        UiMode::InterruptedWork => {
+            let refused = interrupted_work_view::asks(ui)
+                && matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y'))
+                && !interrupted_work_view::question_shown(ui);
             return refused.then_some(Action::Continue);
         }
         _ => {}
@@ -23023,6 +23399,15 @@ fn render_help_overlay(
             ),
             "Restart notice: list / dismiss",
         ),
+        // PRD #1790 stage 2: the work a deck restart left behind.
+        help_key_line(
+            &format!(
+                "{} / {}",
+                n(KbAction::InterruptedWork),
+                n(KbAction::HideInterruptedWork)
+            ),
+            "Interrupted work: list / hide",
+        ),
         // PRD #341 M5: command mode is a real read-only inspect mode — the wheel
         // and these keys scroll the focused pane's own scrollback without ever
         // reaching the agent.
@@ -23778,6 +24163,7 @@ fn render_restart_notice_overlay(
     area: Rect,
     notice: &mut RestartNotice,
     keybindings: &KeybindingConfig,
+    interrupted_hint: Option<String>,
 ) -> Vec<(Action, Rect)> {
     let entries: Vec<String> = notice
         .agents
@@ -23815,16 +24201,26 @@ fn render_restart_notice_overlay(
     // The opening words and a blank row, the rows, then a blank row, the
     // button row and the hint: plus the border. Counted in `usize` and clamped
     // before narrowing.
+    // PRD #1790 stage 2: rows more for the line leading to the interrupted
+    // work, when there is any, wrapped to the popup (an incomplete list's
+    // sentence is longer than a count's).
+    let hint_lines: Vec<String> = interrupted_hint
+        .as_deref()
+        .map(|hint| {
+            crate::upgrade_dialog::wrap(hint, usize::from(popup_width.saturating_sub(2 + 2)))
+        })
+        .unwrap_or_default();
+    let hint_rows = hint_lines.len();
     let popup_height = rows
         .len()
-        .saturating_add(opening.len() + 1 + 3 + 2)
+        .saturating_add(opening.len() + 1 + 3 + 2 + hint_rows)
         .min(usize::from(area.height.saturating_sub(2))) as u16;
     let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
     let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(x, y, popup_width, popup_height);
 
     frame.render_widget(Clear, popup_area);
-    let footer_height: u16 = 2;
+    let footer_height: u16 = 2 + hint_rows as u16;
     let inner_height = popup_height.saturating_sub(2);
     let shown =
         usize::from(inner_height.saturating_sub(footer_height)).saturating_sub(opening.len() + 1);
@@ -23884,19 +24280,22 @@ fn render_restart_notice_overlay(
     if footer_area.height == 0 {
         return Vec::new();
     }
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(""),
-            Line::styled(
-                format!(
-                    "  j/k scroll · {} dismiss · Esc to close",
-                    display_notation(keybindings, KbAction::DismissRestartNotice)
-                ),
-                text_primary(),
+    let mut footer_lines = vec![
+        Line::from(""),
+        Line::styled(
+            format!(
+                "  j/k scroll · {} dismiss · Esc to close",
+                display_notation(keybindings, KbAction::DismissRestartNotice)
             ),
-        ]),
-        footer_area,
+            text_primary(),
+        ),
+    ];
+    footer_lines.extend(
+        hint_lines
+            .into_iter()
+            .map(|row| Line::styled(format!("  {row}"), Style::default().fg(Color::Yellow))),
     );
+    frame.render_widget(Paragraph::new(footer_lines), footer_area);
     let buttons = [
         Button::new(
             "Dismiss",
@@ -25407,6 +25806,86 @@ fn card_border_glyph(is_selected: bool, mode: UiMode) -> (BorderType, Modifier) 
         Modifier::BOLD
     };
     (BorderType::Thick, emphasis)
+}
+
+/// Issue #1965: the card of an orchestration role whose agent exited, in place
+/// of the `No agent` placeholder its dead slot used to show. The title names
+/// the role, the right-hand badge reads [`crate::ended_role::STATUS`] in the
+/// Error colour, and the body says why ([`crate::ended_role::EndedRole::reason`])
+/// and, where rows are left, the last lines the pane showed under
+/// [`crate::ended_role::LAST_OUTPUT`]. The words are the desktop row's
+/// (`tests/fixtures/ended-role.json`).
+fn render_ended_role_card(
+    frame: &mut Frame,
+    area: Rect,
+    ended: &crate::ended_role::EndedRole,
+    is_selected: bool,
+    card_number: Option<u8>,
+    mode: UiMode,
+) {
+    let error = palette::status_color(&SessionStatus::Error);
+    let title_bold = text_primary().add_modifier(Modifier::BOLD);
+    let num_prefix = card_number.map(|n| format!("{n} ")).unwrap_or_default();
+    let sel_prefix = if is_selected { "▸ " } else { "" };
+    let badge = format!(" {} ", crate::ended_role::STATUS);
+    let badge_width = unicode_width::UnicodeWidthStr::width(badge.as_str());
+    let max_title = (area.width as usize).saturating_sub(badge_width + 2);
+    let title = truncate_styled_segments(
+        vec![
+            (format!(" {sel_prefix}{num_prefix}"), title_bold),
+            (format!("{} ", ended.role_name), title_bold),
+        ],
+        max_title,
+    );
+    let base_border_style = if is_selected {
+        Style::default().fg(palette::SELECTED)
+    } else {
+        Style::default().fg(error)
+    };
+    let (border_type, border_emphasis) = card_border_glyph(is_selected, mode);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(border_type)
+        .border_style(base_border_style.add_modifier(border_emphasis))
+        .title(Line::from(title))
+        .title(
+            Line::from(Span::styled(
+                badge,
+                Style::default().fg(error).add_modifier(Modifier::BOLD),
+            ))
+            .alignment(ratatui::layout::Alignment::Right),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let rows = inner.height as usize;
+    let width = inner.width as usize;
+    if rows == 0 || width == 0 {
+        return;
+    }
+    let line = |text: String, style: Style| {
+        Line::from(truncate_styled_segments(vec![(text, style)], width))
+    };
+    let mut lines = vec![line(ended.reason(), Style::default().fg(error))];
+    let output = &ended.last_output;
+    if !output.is_empty() && rows >= 2 {
+        let room = rows - 1;
+        if room >= 2 {
+            lines.push(line(
+                format!("{}:", crate::ended_role::LAST_OUTPUT),
+                text_dim(),
+            ));
+            let shown = output.len().min(room - 1);
+            for text in &output[output.len() - shown..] {
+                lines.push(line(text.clone(), text_primary()));
+            }
+        } else if let Some(last) = output.last() {
+            lines.push(line(
+                format!("{}: {last}", crate::ended_role::LAST_OUTPUT),
+                text_dim(),
+            ));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -30041,6 +30520,289 @@ pub fn render_restart_notice_key_sequence_to_buffers(
         })
         .collect();
     render_restart_notice_agents_key_sequence_to_buffers(&agents, mode, status, keys, width, height)
+}
+
+/// PRD #1790 stage 2 L1 seam: one step of [`run_interrupted_work_seam`] — a
+/// key pressed, a daemon answer delivered where the background request would
+/// deliver it, or the event stream attaching to a daemon process.
+#[doc(hidden)]
+pub enum InterruptedSeamStep {
+    Key(KeyEvent),
+    /// These steps, one after another, with no frame drawn before, between or
+    /// after them; one frame is drawn when the last is done.
+    Burst(Vec<InterruptedSeamStep>),
+    /// The newest list request answered this list.
+    Listed(crate::interrupted_work::InterruptedList),
+    /// The newest show request answered this page.
+    Shown(crate::interrupted_work::InterruptedShow),
+    /// The newest reclaim request of this outcome's `dry_run` answered it.
+    Reclaimed(crate::interrupted_work::ReclaimOutcome),
+    /// The newest dismissal answered this.
+    Dismissed(crate::interrupted_work::DismissOutcome),
+    /// The newest request of this kind failed with this message (a timeout,
+    /// say).
+    Failed(InterruptedSeamKind, String),
+    /// The newest request of this kind answered that the daemon does not
+    /// support interrupted work.
+    Unsupported(InterruptedSeamKind),
+    /// The request at this index of [`InterruptedSeamRun::sent`] answered as
+    /// the inner step says, however long ago it was sent.
+    AnswerTo(usize, Box<InterruptedSeamStep>),
+    /// The TUI's event stream attached to the daemon process of this name
+    /// (the seam starts attached to [`INTERRUPTED_SEAM_FIRST_DAEMON`]).
+    Attach(String),
+}
+
+/// PRD #1790 stage 2 L1 seam: the daemon process the seam starts attached to.
+#[doc(hidden)]
+pub const INTERRUPTED_SEAM_FIRST_DAEMON: &str = "seam-daemon-1";
+
+/// PRD #1790 stage 2 L1 seam: what kind of request an answer step answers.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterruptedSeamKind {
+    List,
+    Show,
+    Reclaim,
+    Dismiss,
+}
+
+/// PRD #1790 stage 2: a request the TUI sends the daemon about interrupted
+/// work. The L1 seam records these rather than sending them.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InterruptedSeamRequest {
+    List { git: bool },
+    Show { id: String, reports_from: usize },
+    Reclaim { id: String, dry_run: bool },
+    Dismiss { ids: Vec<String>, all: bool },
+}
+
+impl InterruptedSeamRequest {
+    pub fn kind(&self) -> InterruptedSeamKind {
+        match self {
+            InterruptedSeamRequest::List { .. } => InterruptedSeamKind::List,
+            InterruptedSeamRequest::Show { .. } => InterruptedSeamKind::Show,
+            InterruptedSeamRequest::Reclaim { .. } => InterruptedSeamKind::Reclaim,
+            InterruptedSeamRequest::Dismiss { .. } => InterruptedSeamKind::Dismiss,
+        }
+    }
+}
+
+/// PRD #1790 stage 2: a request, and the daemon process it is pinned to.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterruptedSeamSent {
+    pub instance: Option<String>,
+    pub request: InterruptedSeamRequest,
+}
+
+/// PRD #1790 stage 2 L1 seam: what [`run_interrupted_work_seam`] drew and
+/// what the TUI sent.
+#[doc(hidden)]
+pub struct InterruptedSeamRun {
+    /// The frame before the first step, and one after each.
+    pub frames: Vec<ratatui::buffer::Buffer>,
+    /// Every request the TUI sent, in order: the attach fetch first.
+    pub sent: Vec<InterruptedSeamSent>,
+}
+
+/// PRD #1790 stage 2 L1 seam: [`run_interrupted_work_seam`] with the default
+/// keys, answering only its frames.
+#[doc(hidden)]
+pub fn render_interrupted_work_to_buffers(
+    list: &crate::interrupted_work::InterruptedList,
+    notice: &[&str],
+    mode: UiMode,
+    steps: &[InterruptedSeamStep],
+    width: u16,
+    height: u16,
+) -> Vec<ratatui::buffer::Buffer> {
+    run_interrupted_work_seam(
+        list,
+        notice,
+        mode,
+        &KeybindingConfig::default(),
+        steps,
+        width,
+        height,
+    )
+    .frames
+}
+
+/// PRD #1790 stage 2 L1 seam: start on an empty dashboard in `mode`, with
+/// `keybindings`, attached to [`INTERRUPTED_SEAM_FIRST_DAEMON`] whose attach
+/// fetch answered `list`, with a restart notice naming `notice` (none when
+/// empty), apply `steps` one at a time — a key through the production
+/// [`handle_key_event`], an answer where the background request delivers it
+/// — and draw each frame with the production [`render_frame`], after the
+/// production per-frame fetch check. No request reaches a daemon: each is
+/// recorded, and the daemon says only what the steps hand in.
+#[doc(hidden)]
+pub fn run_interrupted_work_seam(
+    list: &crate::interrupted_work::InterruptedList,
+    notice: &[&str],
+    mode: UiMode,
+    keybindings: &KeybindingConfig,
+    steps: &[InterruptedSeamStep],
+    width: u16,
+    height: u16,
+) -> InterruptedSeamRun {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use std::sync::Arc;
+
+    let ctrl: Arc<EmbeddedPaneController> =
+        Arc::new(EmbeddedPaneController::for_render_seam_with_focused_pane(
+            BURST_SEAM_PANE_ID,
+            SCROLL_SEAM_ROWS,
+            SCROLL_SEAM_COLS,
+            b"",
+        ));
+    let mut tab_manager = TabManager::new(ctrl.clone() as Arc<dyn PaneController>);
+    let shared: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+    let state = AppState::default();
+    let mut ui = UiState::new(DashboardConfig::default(), keybindings.clone());
+    if !notice.is_empty() {
+        let mut stopped = RestartNotice::default();
+        for (i, label) in notice.iter().enumerate() {
+            stopped.join(
+                StoppedIdentity {
+                    pane: Some(format!("restart-seam-{i}")),
+                    key: None,
+                    agent: Some(i.to_string()),
+                    process: crate::daemon_client::Incarnation::from(Some("replaced".to_string())),
+                },
+                crate::daemon_client::StoppedAgent {
+                    label: (*label).to_string(),
+                    role: None,
+                    orchestration: None,
+                },
+            );
+        }
+        ui.restart_notice = Some(stopped);
+    }
+    let mut attached =
+        crate::daemon_client::Incarnation::from(Some(INTERRUPTED_SEAM_FIRST_DAEMON.to_string()));
+    interrupted_work_view::seam_record(&mut ui);
+    interrupted_work_view::sync(&mut ui, &attached);
+    if let Some(answer) =
+        interrupted_work_view::seam_answer(&ui, Some(0), &InterruptedSeamStep::Listed(list.clone()))
+    {
+        interrupted_work_view::apply(&mut ui, answer);
+    }
+    ui.mode = mode;
+    // A fixed instant: the dashboard has no cards, so nothing measures against it.
+    let wall_now = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).expect("fixed instant");
+    let frame_area = Rect::new(0, 0, width, height);
+    let tab_view = ActiveTabView::Dashboard {
+        exclude_pane_ids: vec![],
+        zoomed: false,
+    };
+    let tab_bar = TabBarInfo {
+        show: false,
+        labels: vec!["Dashboard".into()],
+        active_index: 0,
+        orchestration_statuses: vec![],
+    };
+    let pane_ids: Vec<String> = Vec::new();
+    let mut terminal =
+        Terminal::new(TestBackend::new(width, height)).expect("TestBackend should construct");
+
+    let mut draw = |ui: &mut UiState, attached: &crate::daemon_client::Incarnation| {
+        // The event loop's check, before each frame.
+        interrupted_work_view::sync(ui, attached);
+        let bar_rows = bottom_bar_rows(ui, width, height);
+        let layout =
+            compute_frame_layout(frame_area, &tab_view, &tab_bar, &pane_ids, None, bar_rows);
+        let filtered = filter_sessions(&state, ui);
+        let completed = terminal
+            .draw(|frame| {
+                render_frame(
+                    frame, &state, ui, &filtered, 0, true, &*ctrl, &tab_view, &tab_bar, &layout,
+                    wall_now,
+                );
+            })
+            .expect("TestBackend draw should succeed");
+        record_flushed_confirmation(ui, completed.buffer);
+        terminal.backend().buffer().clone()
+    };
+
+    let mut frames = Vec::with_capacity(steps.len() + 1);
+    frames.push(draw(&mut ui, &attached));
+    for step in steps {
+        seam_interrupted_step(
+            &mut ui,
+            step,
+            &mut attached,
+            &ctrl,
+            &shared,
+            &mut tab_manager,
+            &state,
+            frame_area,
+        );
+        frames.push(draw(&mut ui, &attached));
+    }
+    InterruptedSeamRun {
+        frames,
+        sent: interrupted_work_view::seam_sent(&ui),
+    }
+}
+
+/// One step of [`run_interrupted_work_seam`], with no frame drawn.
+#[allow(clippy::too_many_arguments)]
+fn seam_interrupted_step(
+    ui: &mut UiState,
+    step: &InterruptedSeamStep,
+    attached: &mut crate::daemon_client::Incarnation,
+    ctrl: &EmbeddedPaneController,
+    shared: &SharedState,
+    tab_manager: &mut TabManager,
+    state: &AppState,
+    frame_area: Rect,
+) {
+    match step {
+        InterruptedSeamStep::Key(key) => {
+            let filtered = filter_sessions(state, ui);
+            let _ = handle_key_event(
+                *key,
+                ui,
+                ctrl,
+                shared,
+                tab_manager,
+                state,
+                &filtered,
+                frame_area,
+            );
+        }
+        InterruptedSeamStep::Burst(steps) => {
+            for step in steps {
+                seam_interrupted_step(
+                    ui,
+                    step,
+                    attached,
+                    ctrl,
+                    shared,
+                    tab_manager,
+                    state,
+                    frame_area,
+                );
+            }
+        }
+        InterruptedSeamStep::Attach(process) => {
+            *attached = crate::daemon_client::Incarnation::from(Some(process.clone()));
+        }
+        InterruptedSeamStep::AnswerTo(index, answer) => {
+            if let Some(answer) = interrupted_work_view::seam_answer(ui, Some(*index), answer) {
+                interrupted_work_view::apply(ui, answer);
+            }
+        }
+        answer => {
+            if let Some(answer) = interrupted_work_view::seam_answer(ui, None, answer) {
+                interrupted_work_view::apply(ui, answer);
+            }
+        }
+    }
 }
 
 /// [`render_restart_notice_key_sequence_to_buffers`] for a notice naming
@@ -37832,6 +38594,304 @@ mod tests {
             "a card with no backing daemon pane must still be cleaned up"
         );
         assert!(!entered, "a failed attach must not enter PaneInput mode");
+    }
+
+    /// Issue #1965: the reviewer role of the `mixed` orchestration, whose
+    /// command exited with code 1 after printing Pi's extension error.
+    fn ended_reviewer() -> crate::ended_role::EndedRole {
+        crate::ended_role::EndedRole {
+            pane_id: "7".into(),
+            agent_id: "7".into(),
+            role_index: 1,
+            role_name: "reviewer".into(),
+            orchestration_id: Some("orch-1965".into()),
+            orchestration_name: "mixed".into(),
+            display_title: None,
+            termination: Some(crate::inbox_display::PaneTermination::PaneCommandExited {
+                code: 1,
+                reported_by: crate::inbox_display::TerminationSource::Deck,
+            }),
+            last_output: vec![
+                "Error: Failed to load extension".into(),
+                "Cannot find module './usage-file.ts'".into(),
+            ],
+        }
+    }
+
+    fn ended_role_card_text(width: u16, height: u16, selected: bool) -> String {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_ended_role_card(
+                    frame,
+                    Rect::new(0, 0, width, height),
+                    &ended_reviewer(),
+                    selected,
+                    Some(2),
+                    UiMode::Normal,
+                );
+            })
+            .unwrap();
+        buffer_to_string(terminal.backend().buffer())
+    }
+
+    /// Scenario: draw the card of an orchestration role whose command exited
+    /// at spawn, 60 columns wide at the Normal density. It names the role,
+    /// reads `Exited` where a live card shows its status, says the command
+    /// exited with code 1, and shows the last lines the pane printed under
+    /// `Last output:`, in the words the desktop's row uses (issue #1965).
+    #[test]
+    fn an_exited_role_card_names_the_role_and_why_it_ended() {
+        insta::assert_snapshot!(ended_role_card_text(60, 8, false), @r"
+        ┌ 2 reviewer ────────────────────────────────────── Exited ┐
+        │its command exited (code 1)                               │
+        │Last output:                                              │
+        │Error: Failed to load extension                           │
+        │Cannot find module './usage-file.ts'                      │
+        │                                                          │
+        │                                                          │
+        └──────────────────────────────────────────────────────────┘
+        ");
+    }
+
+    /// Scenario: the same card at the Minimal density (one body row) keeps
+    /// the reason, and selected it carries the `▸` marker like any card.
+    #[test]
+    fn a_minimal_exited_role_card_keeps_the_reason() {
+        let card = ended_role_card_text(48, 3, true);
+        assert!(card.contains("▸ 2 reviewer"), "{card}");
+        assert!(card.contains("Exited"), "{card}");
+        assert!(card.contains("its command exited (code 1)"), "{card}");
+    }
+
+    /// Scenario: a dead slot of an orchestration tab whose role the daemon
+    /// reported exited is drawn through the live card grid: it shows the
+    /// role's `Exited` card instead of `No agent` and a truncated synthetic
+    /// pane id (issue #1965).
+    #[test]
+    fn the_card_grid_draws_a_reported_dead_slot_as_its_exited_role() {
+        let identity = test_identity("orch-1965", "mixed");
+        let mut slots = vec![Some("live-pane".to_string()), None];
+        let dead = assign_synthetic_dead_slot_ids(&mut slots, &identity);
+        let mut ui = default_ui();
+        remember_ended_roles(
+            &mut ui,
+            &slots,
+            "orch-1965",
+            &[ended_reviewer()],
+            &crate::daemon_client::Incarnation::UNNAMED,
+        );
+        assert_eq!(
+            ui.ended_role_slots
+                .get(&dead[0])
+                .map(|r| r.role.role_name.as_str()),
+            Some("reviewer")
+        );
+        // Another instance's report, or another role's, fills no slot.
+        let mut other = default_ui();
+        remember_ended_roles(
+            &mut other,
+            &slots,
+            "orch-other",
+            &[ended_reviewer()],
+            &crate::daemon_client::Incarnation::UNNAMED,
+        );
+        assert!(other.ended_role_slots.is_empty());
+
+        let mut st = AppState::default();
+        let sid = st.insert_placeholder_session(dead[0].clone(), Some("/work".into()), None, None);
+        let session = st.sessions[&sid].clone();
+        let backend = ratatui::backend::TestBackend::new(60, 12);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_card_grid(
+                    frame,
+                    Rect::new(0, 0, 60, 12),
+                    &mut ui,
+                    &[&session],
+                    &[&sid],
+                    1,
+                    0,
+                    Utc::now(),
+                    None,
+                );
+            })
+            .unwrap();
+        let text = buffer_to_string(terminal.backend().buffer());
+        assert!(text.contains("reviewer"), "{text}");
+        assert!(text.contains("Exited"), "{text}");
+        assert!(text.contains("its command exited (code 1)"), "{text}");
+        assert!(!text.contains("No agent"), "{text}");
+        assert!(!text.contains("pane-__dead"), "{text}");
+    }
+
+    /// Scenario: the daemon announces that the reviewer role exited; the next
+    /// frame remembers it under the role's pane and under the dead slot a
+    /// rebuilt tab would give the role, so its card says why. Once
+    /// another agent holds that pane (a `pane restart`), the report no longer
+    /// applies to the card (issue #1965).
+    #[test]
+    fn an_announced_exited_role_reaches_its_card_until_another_agent_holds_the_pane() {
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let deck_a = crate::daemon_client::Incarnation::from(Some("deck-a".to_string()));
+        let deck_b = crate::daemon_client::Incarnation::from(Some("deck-b".to_string()));
+        state
+            .blocking_write()
+            .queue_ended_role(ended_reviewer(), deck_a.clone());
+        let mut ui = default_ui();
+        drain_ended_roles(&state, &mut ui);
+        assert!(state.blocking_read().pending_ended_roles.is_empty());
+        assert_eq!(
+            ended_role_for(&ui, "7", Some("7"), &deck_a).map(|r| r.reason()),
+            Some("its command exited (code 1)".to_string())
+        );
+        assert!(ended_role_for(&ui, "7", None, &deck_a).is_some());
+        assert!(
+            ended_role_for(&ui, "7", Some("8"), &deck_a).is_none(),
+            "a successor's card is not the exited role's"
+        );
+        assert!(
+            ended_role_for(&ui, "7", None, &deck_b).is_none(),
+            "a card another daemon process numbers 7 is not the exited role's"
+        );
+        // The same role's dead slot, as a rebuilt tab mints it, gets it too.
+        let slot = dead_slot_pane_id(&test_identity("orch-1965", "mixed"), 1);
+        assert_eq!(
+            ended_role_for(&ui, &slot, None, &deck_a).map(|r| r.agent_id.as_str()),
+            Some("7")
+        );
+
+        // A listing read before the pane's reader settled the exit, arriving
+        // after the broadcast that carried it, keeps the settled report.
+        let mut unsettled = ended_reviewer();
+        unsettled.termination = None;
+        unsettled.last_output.clear();
+        state
+            .blocking_write()
+            .queue_ended_role(unsettled, deck_a.clone());
+        drain_ended_roles(&state, &mut ui);
+        assert_eq!(
+            ended_role_for(&ui, "7", None, &deck_a).map(|r| r.reason()),
+            Some("its command exited (code 1)".to_string())
+        );
+        assert_eq!(
+            ended_role_for(&ui, &slot, None, &deck_a).map(|r| r.last_output.len()),
+            Some(2)
+        );
+    }
+
+    /// Scenario: a report for an exited generation stays while the pane is
+    /// still attached to that generation or an older one (a restarted role
+    /// that exited again before the pane reattached), and goes once the pane
+    /// is attached to a newer one (issue #1965).
+    #[test]
+    fn an_exited_role_report_is_superseded_only_by_a_newer_generation() {
+        assert!(!superseded_by("7", None), "no local attachment");
+        assert!(
+            !superseded_by("7", Some("7")),
+            "still the exited generation"
+        );
+        assert!(
+            !superseded_by("9", Some("7")),
+            "the pane still holds the generation before the one that exited"
+        );
+        assert!(
+            superseded_by("7", Some("9")),
+            "a restart's newer generation"
+        );
+        assert!(superseded_by("a", Some("b")));
+        assert!(!superseded_by("a", Some("a")));
+    }
+
+    /// Scenario: reports for role panes no open orchestration tab holds — a
+    /// closed tab's, or a role announced before its tab exists — are
+    /// forgotten every frame, and the map is bounded, so it cannot fill up
+    /// over a long session and stop taking new reports (issue #1965).
+    #[test]
+    fn exited_role_reports_are_pruned_to_open_tabs_and_bounded() {
+        let mut ui = default_ui();
+        for i in 0..(MAX_ENDED_ROLE_SLOTS + 10) {
+            remember_ended_role(
+                &mut ui,
+                format!("gone-{i}"),
+                ended_reviewer(),
+                crate::daemon_client::Incarnation::UNNAMED,
+            );
+        }
+        assert_eq!(ui.ended_role_slots.len(), MAX_ENDED_ROLE_SLOTS);
+        let pc = Arc::new(OpenTabPC::new());
+        let tab_manager = TabManager::new(pc.clone());
+        prune_ended_roles(&mut ui, &tab_manager, &*pc);
+        assert!(
+            ui.ended_role_slots.is_empty(),
+            "no open tab holds those panes"
+        );
+        remember_ended_role(
+            &mut ui,
+            "7".into(),
+            ended_reviewer(),
+            crate::daemon_client::Incarnation::UNNAMED,
+        );
+        assert_eq!(ui.ended_role_slots.len(), 1, "a new report is taken again");
+    }
+
+    /// Scenario: press Enter on the card of a role the daemon reported exited.
+    /// The attach fails as it does for any dead slot, but the card is kept and
+    /// the status line says which role exited and why, instead of `Removed
+    /// stale agent` (issue #1965).
+    #[test]
+    fn enter_on_an_exited_role_keeps_its_card_and_says_why() {
+        use tokio::sync::RwLock;
+
+        let pc = Arc::new(UnwiredPC::new(false));
+        let mut tab_manager = TabManager::new(pc.clone());
+        let snapshot = dashboard_snapshot(1);
+        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
+        let filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
+        let mut ui = default_ui();
+        ui.selected_index = Some(0);
+        remember_ended_role(
+            &mut ui,
+            "p0".into(),
+            ended_reviewer(),
+            crate::daemon_client::Incarnation::UNNAMED,
+        );
+
+        dispatch_action(
+            Action::Focus,
+            &mut ui,
+            &*pc,
+            &state,
+            &mut tab_manager,
+            &snapshot,
+            &filtered,
+            Some("s0"),
+            Rect::new(0, 0, 80, 24),
+        );
+
+        assert!(state.blocking_read().sessions.contains_key("s0"));
+        assert!(!matches!(ui.mode, UiMode::PaneInput));
+        assert_eq!(
+            ui.status_message.as_ref().map(|(m, _)| m.as_str()),
+            Some("reviewer exited: its command exited (code 1)")
+        );
+
+        // The digit jump says the same.
+        let mut ui = default_ui();
+        remember_ended_role(
+            &mut ui,
+            "p0".into(),
+            ended_reviewer(),
+            crate::daemon_client::Incarnation::UNNAMED,
+        );
+        focus_deck(0, &mut ui, &filtered, &snapshot, &state, &*pc);
+        assert!(state.blocking_read().sessions.contains_key("s0"));
+        assert_eq!(
+            ui.status_message.as_ref().map(|(m, _)| m.as_str()),
+            Some("reviewer exited: its command exited (code 1)")
+        );
     }
 
     /// Scenario: Open a second (Orchestration) tab so a tab switch is possible, arm the
@@ -46088,6 +47148,7 @@ mod tests {
             | UiMode::RestartNotice
             | UiMode::CopyMode
             | UiMode::TrustPrompt
+            | UiMode::InterruptedWork
             | UiMode::AntigravityNotice => mode,
         }
     }
@@ -46115,6 +47176,7 @@ mod tests {
             UiMode::RestartNotice,
             UiMode::CopyMode,
             UiMode::TrustPrompt,
+            UiMode::InterruptedWork,
             UiMode::AntigravityNotice,
         ]
         .into_iter()
@@ -50461,6 +51523,7 @@ mod tests {
             UiMode::Upgrade,
             UiMode::InboxAttention,
             UiMode::RestartNotice,
+            UiMode::InterruptedWork,
         ] {
             let routed_first = matches!(mode, UiMode::DirPicker | UiMode::NewPaneForm);
             assert_eq!(
@@ -53148,6 +54211,10 @@ mod one_shot_protocol_gate_tests {
 #[cfg(all(test, unix))]
 #[path = "ui_panic_teardown_tests.rs"]
 mod panic_teardown_tests;
+
+// PRD #1790 stage 2: the interrupted work list, its footer row and overlay.
+#[path = "ui_interrupted_work.rs"]
+mod interrupted_work_view;
 
 /// Issue #1913: a deck restart that reuses an orchestration tab's pane ids.
 #[cfg(all(test, unix))]

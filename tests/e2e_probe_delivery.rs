@@ -907,6 +907,20 @@ fn probe_099_a_claude_whose_settings_env_sets_a_deck_variable_is_held_without_a_
     held_for_the_editor(&f, false);
 }
 
+/// Scenario: Start a Claude Code stand-in whose cached server-managed settings (`~/.claude/remote-settings.json`) name a policy helper, a program Claude Code runs as it starts and whose output's `env` it applies, so `VISUAL` can be set where no file shows it (issue #2131), then type and delete text in its box and queue mail. The deck must type nothing, not even its check's Ctrl+G: the card says `cannot_check`, the log names the `Keymap(Editor)` hold, and the mail waits.
+#[spec("inbox/probe/099")]
+#[test]
+fn probe_099_a_claude_whose_managed_settings_name_a_policy_helper_is_held_without_a_check() {
+    let f = with_home_files(
+        "claude",
+        &[(
+            ".claude/remote-settings.json",
+            r#"{"policyHelpers": {"linux": {"path": "/usr/local/bin/policy"}}}"#,
+        )],
+    );
+    held_for_the_editor(&f, false);
+}
+
 /// Scenario: Start a Codex stand-in whose home's `.env` file sets `VISUAL`, which Codex loads into its own environment as it starts, then type and delete text in its box and queue mail. The deck must type nothing, not even its check's Ctrl+G: the card and the attached TUI say `cannot_check`, the log names the `Keymap(Editor)` hold, and the mail waits.
 #[spec("inbox/probe/100")]
 #[test]

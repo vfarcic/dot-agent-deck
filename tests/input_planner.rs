@@ -410,7 +410,7 @@ fn probe_076_an_inside_to_inside_write_leaves_a_waiter_waiting() {
     }
 }
 
-/// Scenario: Only a Claude Code 2.1.310 or 2.1.312 release, latched for a generation spawned as Claude Code, reads with the measured grammar; another Claude release, Codex, a generation of no known agent, a conflicting header, a header not seen and a scanner dropped before one all read strictly, and the latch is asked about the generation's own agent.
+/// Scenario: Only a Claude Code 2.1.310 or 2.1.312 release, latched for a generation spawned as Claude Code, reads with the measured grammar; another Claude release, a pre-release or build-tagged 2.1.310 or 2.1.312 (issue #2128), Codex, a generation of no known agent, a conflicting header, a header not seen and a scanner dropped before one all read strictly, and the latch is asked about the generation's own agent.
 #[spec("inbox/probe/076")]
 #[test]
 fn probe_076_the_grammar_follows_the_latched_release() {
@@ -429,6 +429,24 @@ fn probe_076_the_grammar_follows_the_latched_release() {
         InputGrammar::of(&AgentType::ClaudeCode, &v(314)),
         InputGrammar::Strict
     );
+    // A tagged build of a source-read release is another build: its
+    // tokenizer was not read, so it reads strictly.
+    for tagged in [
+        "2.1.310-beta.1",
+        "2.1.312-alpha.1",
+        "2.1.310-rc.1",
+        "2.1.312+abc",
+        "2.1.310-rc.1+abc",
+    ] {
+        assert_eq!(
+            InputGrammar::of(
+                &AgentType::ClaudeCode,
+                &semver::Version::parse(tagged).unwrap()
+            ),
+            InputGrammar::Strict,
+            "{tagged}"
+        );
+    }
     assert_eq!(
         InputGrammar::of(&AgentType::Codex, &semver::Version::new(0, 164, 0)),
         InputGrammar::Strict

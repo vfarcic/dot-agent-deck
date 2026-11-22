@@ -99,6 +99,7 @@ import { desktopFeaturesOf, type AgentTarget, type DeckFleet, type DeckRuntimeSt
 import { agentKey, boundAgentKey, sameIncarnation } from "../lib/agentKey";
 import { AGENT_GONE_AFTER_RESTART } from "../lib/agentIdentity";
 import { shownReviewToken } from "../lib/projectTrust";
+import { shownInterruptedToken } from "../lib/interruptedWork";
 
 /**
  * How long an Undo stays on offer, in milliseconds.
@@ -240,6 +241,13 @@ export const DIALOG_MOVED_ON = "The New agent dialog changed while that was bein
  * never approves another.
  */
 export const REVIEW_MOVED_ON = "The project commands review changed while that was being worked out, so nothing ran. Review what is shown and say it again.";
+/**
+ * PRD #1790 stage 2 (auditor 2) — an answer for the "Interrupted work"
+ * dialog whose dialog moved while it was worked out: another deck's or
+ * another opening, another daemon process, other items listed, another row
+ * selected, or another view. Nothing ran.
+ */
+export const INTERRUPTED_MOVED_ON = "The interrupted work list changed while that was being worked out, so nothing ran. Say it again.";
 
 /**
  * Whether two New agent declarations are the same CONTEXT for grounding — the
@@ -1158,6 +1166,12 @@ type VoiceContext = {
    * approves the review it was spoken against or nothing.
    */
   trustReview?: string;
+  /**
+   * PRD #1790 stage 2 (auditor 2): the "Interrupted work" dialog on screen,
+   * as its token (`shownInterruptedToken`), or `undefined` with none. An
+   * answer that acts on the dialog is refused when it moved.
+   */
+  interrupted?: string;
 };
 
 /**
@@ -1175,7 +1189,7 @@ type Touches = { answer?: true; pane?: AgentAddress; agent?: { deckId: string | 
  * daemon process listing the agent's id: the agent is gone with its deck's
  * restart, and its `why` is the TUI's sentence for it.
  */
-type Lost = { code: "screen" | "dialog" | "review" | "mode" | "confirmation" | "pane" | "replaced" | "restarted" | "blocked" | "hidden" | "deck" | "agent" | "gone"; why: string };
+type Lost = { code: "screen" | "dialog" | "review" | "interrupted" | "mode" | "confirmation" | "pane" | "replaced" | "restarted" | "blocked" | "hidden" | "deck" | "agent" | "gone"; why: string };
 
 /**
  * PRD #1260/#1261 review, rounds 4-5 — THE gate. Every side effect an
@@ -1259,6 +1273,13 @@ function contextLost(was: VoiceContext, now: VoiceContext, touches: Touches): Lo
 const AGENT_TARGETING_KINDS: ReadonlySet<string> = new Set(["agent_ref", "orchestration_ref"]);
 
 /**
+ * PRD #1790 stage 2 (auditor 2) — the invokes that act on the open
+ * "Interrupted work" dialog: every registry entry that needs it. Read from the
+ * registry, so a new dialog row is gated without being listed here.
+ */
+const INTERRUPTED_DIALOG_INVOKES: ReadonlySet<string> = new Set(Object.entries(VOICE_ACTIONS as Record<string, { needs: readonly string[] }>).filter(([, entry]) => entry.needs.includes("interruptedDialog")).map(([invoke]) => invoke));
+
+/**
  * The invokes that, said on the agent screen without an `agent_ref`, act on
  * the pane on screen: issue #1402's whole "stop", and PRD #2119's nameless
  * "generate config". {@link dispatchLost} holds each to the pane it was said in.
@@ -1284,6 +1305,10 @@ function dispatchLost(was: VoiceContext, now: VoiceContext, params: readonly Voi
     const moved = contextLost(was, now, { agent: was.pane });
     if (moved) return moved;
   }
+  /* PRD #1790 stage 2 (auditor 2) — an action on the Interrupted work dialog
+     acts on the dialog it was said to, as its deck, process, opening, items,
+     selection and view stood, or on nothing. */
+  if (invoke !== undefined && INTERRUPTED_DIALOG_INVOKES.has(invoke) && now.interrupted !== was.interrupted) return { code: "interrupted", why: "the interrupted work list changed" };
   /* PR #1451 (Qodo) — a deck named in the outcome is chosen relative to the
      deck selected when it was declared; once that moved, the choice is stale
      whatever it names, exactly as an agent target on the old deck is. */
@@ -1324,6 +1349,7 @@ function answerRefusal(lost: Lost): string {
   if (lost.code === "screen") return SCREEN_MOVED_ON;
   if (lost.code === "dialog") return DIALOG_MOVED_ON;
   if (lost.code === "review") return REVIEW_MOVED_ON;
+  if (lost.code === "interrupted") return INTERRUPTED_MOVED_ON;
   if (lost.code === "mode") return VOICE_MODE_MOVED_ON;
   if (lost.code === "replaced") return VOICE_PANE_REPLACED;
   return voiceNothingRan(lost.why);
@@ -1334,6 +1360,7 @@ function choiceRefusal(lost: Lost): string {
   if (lost.code === "screen") return VOICE_CHOICE_SCREEN_MOVED_ON;
   if (lost.code === "dialog") return VOICE_CHOICE_DIALOG_MOVED_ON;
   if (lost.code === "review") return REVIEW_MOVED_ON;
+  if (lost.code === "interrupted") return INTERRUPTED_MOVED_ON;
   if (lost.code === "deck") return VOICE_CHOICE_DECK_MOVED_ON;
   if (lost.code === "agent") return VOICE_CHOICE_AGENT_REPLACED;
   if (lost.code === "gone") return VOICE_CHOICE_AGENT_GONE;
@@ -2272,6 +2299,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       .filter(({ connection }) => connection.deckId !== undefined && connection.status === "connected")
       .map(({ connection }) => [connection.deckId as string, connection.incarnation])),
     trustReview: shownReviewToken(),
+    interrupted: shownInterruptedToken(),
   }), []);
   /** Take the numbered list on screen as the one heard, with the context it stands in. */
   const hearNumbers = useCallback(() => {
