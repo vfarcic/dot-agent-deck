@@ -597,7 +597,14 @@ fn upgrade_dialog_007_a_long_command_is_reached_by_scrolling_never_cut() {
     let mut dialog = UpgradeDialog::new(vec![staged.clone()]);
     render_at(&mut dialog, 80, 24);
     dialog.handle_key(key(KeyCode::Down));
-    assert_eq!(dialog.handle_key(key(KeyCode::Enter)), Effect::Run(0));
+    // The plan is longer than the dialog at 80×24, so Enter first pages
+    // through it to the question (issue #2064 added the collector's line).
+    let mut presses = 0;
+    while dialog.handle_key(key(KeyCode::Enter)) != Effect::Run(0) {
+        presses += 1;
+        assert!(presses < 30, "Upgrade never ran");
+        render_at(&mut dialog, 80, 24);
+    }
     dialog.finish(0, RunResult::from_outcome(&staged, &outcome, true));
 
     let first = render_at(&mut dialog, 80, 24);

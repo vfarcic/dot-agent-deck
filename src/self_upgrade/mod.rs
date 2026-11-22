@@ -20,6 +20,9 @@
 //!    right before a staged file is installed.
 //! 5. [`execute`] — downloading the release assets and carrying a confirmed
 //!    plan out.
+//! 6. After an upgrade that changed a downloaded CLI: [`collector`] upgrades a
+//!    release resource collector in the same folder (issue #2064), and
+//!    [`agent_hooks`] refreshes the agents' hooks from the installed copy.
 //!
 //! Nothing here upgrades anything on its own: a plan is something a client
 //! shows and the user confirms ([`cli`] is the `dot-agent-deck upgrade`
@@ -33,6 +36,7 @@
 
 pub mod agent_hooks;
 pub mod cli;
+pub mod collector;
 pub mod detect;
 pub mod discover;
 pub mod execute;
