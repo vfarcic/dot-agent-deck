@@ -211,6 +211,8 @@ pub mod remote_tunnel;
 pub mod repo_identity;
 pub mod report_recovery;
 pub mod retained_store;
+// Issue #2110: spacing between orchestration workers' agent starts.
+pub mod role_start_pacing;
 pub mod roles_cli;
 pub mod schedule_cli;
 // PRD #1885: a schedule's last fire, when it was refused as not approved.
