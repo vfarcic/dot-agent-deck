@@ -2116,6 +2116,12 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
     deletePrompt: runtime.deletePrompt,
     seedPrompts: runtime.seedPrompts,
   });
+  // Issue #824 — however the Prompts panel closes (its button, Escape, a voice
+  // action that dismisses every overlay), a pending edit is saved now rather
+  // than on its timer.
+  useEffect(() => {
+    if (!promptsOpen) flushPromptSaves();
+  }, [promptsOpen, flushPromptSaves]);
   const [profileOrder, setProfileOrder] = useState<string[]>([]); // voice-registry-exempt: the orchestration editor's draft role order, edited inside that panel
 
   // PRD #743: applied on LOAD as well as on change. Keeping it in one effect
@@ -2995,7 +3001,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
         prompts={prompts}
         selectedId={selectedPromptId}
         onSelect={setSelectedPromptId}
-        onClose={() => { flushPromptSaves(); setOverlay("prompts", false); }}
+        onClose={() => setOverlay("prompts", false)}
         source={promptSource}
         notice={promptNotice}
         onAdd={() => { const id = addPrompt(); if (id) setSelectedPromptId(id); }}
