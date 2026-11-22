@@ -226,7 +226,7 @@ test.describe("a confirmation on the dashboard (issue #1709)", () => {
   test("close dismisses the confirmation and stops nothing", async ({ page }) => {
     await load(page, "connected", ["close this"]);
     await selectOverview(page);
-    const openPlanner = page.getByRole("button", { name: "Open Plan / architecture agent" });
+    const openPlanner = page.getByRole("row", { name: "Open Plan / architecture agent" });
     await page.getByRole("button", { name: "Close Plan / architecture agent" }).click();
     const confirm = page.getByRole("alertdialog");
     await expect(confirm).toBeVisible();
@@ -290,7 +290,7 @@ test.describe("sheets, the agent pane and the pull request page", () => {
     await selectOverview(page);
     await page.getByRole("complementary", { name: "Primary navigation" }).getByRole("button", { name: "Settings" }).click();
     await expect(settings(page)).toBeVisible();
-    await page.getByRole("button", { name: "Open Desktop implementation agent" }).press("Enter");
+    await page.getByRole("row", { name: "Open Desktop implementation agent" }).press("Enter");
     await expect(pane(page)).toBeVisible();
     await pane(page).getByTestId("pr-badge-2").click();
     const browser = page.getByTestId("pr-browser");

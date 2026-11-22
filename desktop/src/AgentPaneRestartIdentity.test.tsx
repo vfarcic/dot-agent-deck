@@ -81,7 +81,7 @@ const expectRestartNotice = () => {
   return notice;
 };
 
-const openPlanner = (name = "Plan / architecture") => fireEvent.click(screen.getByRole("button", { name: `Open ${name} agent` }));
+const openPlanner = (name = "Plan / architecture") => fireEvent.click(screen.getByRole("row", { name: `Open ${name} agent` }));
 
 describe("an open pane across a deck restart that reuses its agent id", () => {
   beforeEach(() => window.localStorage.clear());

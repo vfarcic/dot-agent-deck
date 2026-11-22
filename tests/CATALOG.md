@@ -7770,7 +7770,7 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 ##### upgrade/upgrade-dialog/007 — A command too long for the dialog is reached by scrolling, never cut off.
 - **Layer:** L1 (dialog state machine + `TestBackend` at 80×24), a staged outcome whose staging path is long but under `plan::MAX_SHOWN_PATH_CHARS`.
 - **Agent:** none.
-- **Asserts:** the dialog shows `↑ more` / `↓ more` markers and names `PgUp/PgDn` in its hint; paging with PageUp/PageDown reaches every row of the core's install command, its `sha256sum -c -` check included, and every short line of the plan and the outcome.
+- **Asserts:** Enter reaches Upgrade once the plan has been paged through (the collector's line, issue #2064, made it longer than the dialog); the dialog shows `↑ more` / `↓ more` markers and names `PgUp/PgDn` in its hint; paging with PageUp/PageDown reaches every row of the core's install command, its `sha256sum -c -` check included, and every short line of the plan and the outcome.
 - **Does not assert:** the mouse wheel, which calls the same `scroll_by` from the run loop.
 - **Platform coverage:** mac+linux+windows.
 
@@ -7838,6 +7838,13 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Asserts:** the footer shows `dot-agent-deck CLI: update available: v<release> (current: v0.0.1)` and `u to upgrade`; `u` opens `Upgrade to v<release>` with the in-place plan, `Upgrading does not restart the daemon on this machine` (issue #1753), `Build provenance will NOT be checked` and `> Cancel`; the file is untouched until Down + Enter; then it becomes the served bytes, the installed file is last run as `hooks refresh --json`, and the dialog shows `Upgraded …`, the provenance result, the refresh's report (PRD #1666 part 3, R-3) and the restart line; Escape closes it.
 - **Does not assert:** provenance verification with an authenticated `gh`, the desktop app's upgrade, a real GitHub release.
 - **Platform coverage:** mac+linux.
+
+##### upgrade/tui-upgrade/004 — Confirming the dialog also upgrades the release collector beside the CLI and restarts its service.
+- **Layer:** L2 (lane 1, real TUI under portable-pty, fake release server serving the CLI's and the collector's release scripts under one manifest, an old collector script beside the running copy, and a stand-in `systemctl` in the sandbox `PATH` reporting `dot-agent-deck-collector.service` running that file and recording its invocations).
+- **Agent:** none.
+- **Asserts:** the dialog's plan names `A resource collector (dot-agent-deck-collector)` before confirming; after Down + Enter the collector file becomes the served collector, the dialog shows `Upgraded the resource collector` and `Restarted the dot-agent-deck-collector.service`, and the stand-in was run with `--user try-restart dot-agent-deck-collector.service` (issue #2064).
+- **Does not assert:** a real systemd user manager, the collector-absent and collector-elsewhere cases (`upgrade/cli-upgrade/010`, `011`, and `self_upgrade::collector` unit tests), the desktop app (`self_upgrade_042`).
+- **Platform coverage:** linux (prints `SKIP:` on macOS, where the collector does not ship).
 
 ##### upgrade/tui-upgrade/002 — A copy installed with Nix is told what to do and offered no confirmation.
 - **Layer:** L2 (lane 1, real TUI under portable-pty, fake release server, a faked `/nix/store` path).
@@ -7910,6 +7917,34 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Asserts:** the installed file is unchanged byte for byte and no temporary file is left beside it; the release script ran once (`--version`) and never again; no `Upgraded`; a `` `…--version` failed: `` line saying it was cancelled; non-zero exit; `Cancelled.` as the last line.
 - **Does not assert:** the refusal to start a command once interrupted and the teardown-window signal (`self_upgrade::cli` unit tests `cli_007`–`cli_009`), the detach of a cancelled app swap (`execute_034`).
 - **Platform coverage:** mac+linux.
+
+##### upgrade/cli-upgrade/009 — `upgrade --yes` upgrades a release collector beside the CLI and restarts the user service that runs it.
+- **Layer:** L2 (lane 1, real subprocess, fake release server serving the CLI's and the collector's release scripts under one `checksums.txt`, an old collector script beside the CLI, and a stand-in `systemctl` in the sandbox `PATH` reporting `dot-agent-deck-collector.service` active with that file as `ExecStart`).
+- **Agent:** none.
+- **Asserts:** exit 0; the plan says the collector in the same folder is upgraded too; the collector is the served collector byte for byte; `Upgraded the resource collector at <path> from v0.0.1 to v<release>, checked the same way.` and `Restarted the dot-agent-deck-collector.service user service, so it now runs v<release>.`; the stand-in's last invocation is `--user try-restart dot-agent-deck-collector.service` (issue #2064).
+- **Does not assert:** a real systemd user manager, a service running another file or none, a failed restart, a collector download that fails its checksum (`self_upgrade::collector` unit tests `collector_008`, `collector_009`).
+- **Platform coverage:** linux (prints `SKIP:` on macOS).
+
+##### upgrade/cli-upgrade/010 — With no collector beside the CLI, `upgrade --yes` installs none and says so.
+- **Layer:** L2 (lane 1, real subprocess, fake release server that also serves a collector asset).
+- **Agent:** none.
+- **Asserts:** exit 0; the CLI is upgraded; `No resource collector (dot-agent-deck-collector) is in <folder>, so none was upgraded.`; no collector file is created (issue #2064).
+- **Does not assert:** the TUI and desktop clients, which run the same core step (`self_upgrade::collector` unit test `collector_003`).
+- **Platform coverage:** linux (prints `SKIP:` on macOS).
+
+##### upgrade/cli-upgrade/011 — A collector elsewhere on PATH is named and left alone.
+- **Layer:** L2 (lane 1, real subprocess, fake release server, an old collector script in the sandbox `PATH` folder and none beside the CLI).
+- **Agent:** none.
+- **Asserts:** exit 0; `The resource collector first on your PATH, <path>, v0.0.1, is not in the upgraded CLI's folder, so it was left as it is.`; that collector is unchanged byte for byte and none is created beside the CLI (issue #2064).
+- **Does not assert:** a collector the CLI's folder links to elsewhere, or one a system package owns (`self_upgrade::collector` unit test `collector_004`).
+- **Platform coverage:** linux (prints `SKIP:` on macOS).
+
+##### upgrade/cli-upgrade/012 — A collector in a folder the user cannot write is downloaded, checked and staged with its install command.
+- **Layer:** L2 (lane 1, real subprocess, fake release server serving both release scripts; the install's folder, holding the CLI and an old collector, made read-only).
+- **Agent:** none.
+- **Asserts:** exit 0; the collector is unchanged; `Downloaded and checked v<release> of the resource collector at <path>, which you cannot write to.`; a `sudo install -m 0755 … <path>` line with its `sha256sum -c -` check; and that a running collector keeps its old version until restarted once installed (issue #2064).
+- **Does not assert:** the desktop app's password prompt, which installs the CLI and leaves the same command for the collector. Prints `SKIP:` when run as root, which can write the folder.
+- **Platform coverage:** linux (prints `SKIP:` on macOS).
 
 ### Remote diagnostics (PRD #345)
 
@@ -15139,6 +15174,20 @@ The TUI renders no cards in this slice (the desktop app does; `docs/desktop/agen
 - **Does not assert:** a custom action that collides with a later catalog name (the catalog's definition wins).
 - **Platform coverage:** mac+linux.
 
+##### agent-report/state/003 — Opening an agent in the TUI deals with its report's needs-you (issue #2454).
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_agent_cards.rs`).
+- **Agent:** one synthetic routing stand-in under the TUI's daemon; no real agent.
+- **Asserts:** a `done` report makes `card list` read `needs_you_reasons: ["done"]`; pressing `1` on the TUI's dashboard opens the agent's pane and the card then reads `needs_you: false` with the `done` report and its summary kept; a newer `waiting` report reads `["waiting"]` again.
+- **Does not assert:** the desktop's open (`desktop_agent_opened`, covered by the daemon unit test `agent_cards::tests::opening_the_agent_clears_its_report_reason` and the desktop's vitest), Enter on a selected card (the same `note_card_opened` call), or a daemon without the `agent-opened` capability (the client sends nothing; `cross-version` runs that pairing).
+- **Platform coverage:** mac+linux.
+
+##### agent-report/state/004 — The agent's next turn deals with its report's needs-you (issue #2454).
+- **Layer:** L2 headless, lane 1 (`tests/e2e_agent_cards.rs`).
+- **Agent:** one synthetic routing stand-in whose hook events are posted by the test; no real agent.
+- **Asserts:** a `waiting` report published inside a turn that then ends reads `["waiting"]`; a `thinking` event starting the next turn makes it read `needs_you: false` with the report kept; a `done` published inside that running turn still reads `["done"]` after a `tool_start` in the same turn, with status `working`.
+- **Does not assert:** a daemon-synthesized `ShellBusy` (unit test `state::tests::the_agent_starting_its_next_turn_deals_with_its_card_report`), or the live reasons, which no report clears (`agent_cards::tests::dealing_with_a_report_leaves_the_live_reasons`).
+- **Platform coverage:** mac+linux.
+
 #### agent-report/catalog
 
 ##### agent-report/catalog/001 — The catalog merges the user's entries over the defaults and validates reports.
@@ -16544,7 +16593,7 @@ The desktop half of PRD #2374's agent cards. These are Vitest + Testing Library 
 ##### desktop/agent-cards/005 — Table rows carry the daemon's needs-you marker and a menu that shows the card.
 - **Test:** vitest `desktop/agent-cards/005: …` in `desktop/src/components/AgentCardsContract.test.tsx`.
 - **Layer:** desktop component (jsdom), Table view.
-- **Asserts:** `overview-needs-you` appears on exactly the rows whose entry has `needs_you`, whatever their status; the row's ⋯ menu opens without navigating, holds Show card and the daemon's primary action by label (no primary item when it is `open`); Show card opens that entry's overlay, which then walks the daemon's order; clicking the row itself still opens the agent.
+- **Asserts:** `overview-needs-you` appears on exactly the rows whose entry has `needs_you`, whatever their status (since issue #2454 it is a badge in the name cell, which `OverviewCards.test.tsx` places after the PR badge and outside the row's controls); the row's ⋯ menu opens without navigating, holds Show card and the daemon's primary action by label (no primary item when it is `open`); Show card opens that entry's overlay, which then walks the daemon's order; clicking the row itself still opens the agent.
 - **Does not assert:** the menu's keyboard dismissal beyond Escape; the row primary's send (covered by 003's path).
 
 ##### desktop/agent-cards/006 — The view is remembered per client, and a broken storage falls back to the table.
