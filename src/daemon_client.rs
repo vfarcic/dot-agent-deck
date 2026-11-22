@@ -4245,9 +4245,21 @@ impl DaemonClient {
         &self,
     ) -> Result<Option<(TransportReadHalf, TransportWriteHalf, DaemonCapabilities)>, ClientError>
     {
+        self.follow_on_connection(crate::daemon_protocol::CAP_AGENT_CARDS)
+            .await
+    }
+
+    /// A connection whose own `Hello` advertised `capability` and
+    /// [`crate::daemon_protocol::CAP_HELLO_FOLLOW_ON`], left open for one
+    /// request, or `None` when the daemon advertises either not — and then
+    /// nothing follows the `Hello` ([`Self::agent_cards_connection`]). Also
+    /// answers what that `Hello` advertised.
+    async fn follow_on_connection(
+        &self,
+        capability: &str,
+    ) -> Result<Option<(TransportReadHalf, TransportWriteHalf, DaemonCapabilities)>, ClientError> {
         let supported = |caps: &DaemonCapabilities| {
-            caps.supports(crate::daemon_protocol::CAP_AGENT_CARDS)
-                && caps.supports(crate::daemon_protocol::CAP_HELLO_FOLLOW_ON)
+            caps.supports(capability) && caps.supports(crate::daemon_protocol::CAP_HELLO_FOLLOW_ON)
         };
         if self.protocol_gate || self.bound.is_some() {
             if !supported(&self.capabilities().await?) {
@@ -4310,6 +4322,41 @@ impl DaemonClient {
         resp.agent_cards
             .map(|list| GatedQuery::Answered(tree_gate(list, &caps)))
             .ok_or_else(|| ClientError::Malformed("list-agent-cards answered no cards".into()))
+    }
+
+    /// Issue #2454: tell the daemon the user opened the agent in `pane_id`
+    /// (`agent_id` naming the generation shown, when known), which deals with
+    /// the reason its card report raised. **Withheld unless the daemon's
+    /// `Hello` on the same connection advertised
+    /// [`crate::daemon_protocol::CAP_AGENT_OPENED`]**, answering
+    /// [`GatedQuery::Unsupported`] without sending anything: an older daemon's
+    /// cards keep the reason until the agent publishes again.
+    pub async fn agent_opened(
+        &self,
+        pane_id: &str,
+        agent_id: Option<&str>,
+    ) -> Result<GatedQuery<()>, ClientError> {
+        let Some((mut rd, mut wr, _)) = self
+            .follow_on_connection(crate::daemon_protocol::CAP_AGENT_OPENED)
+            .await?
+        else {
+            return Ok(GatedQuery::Unsupported);
+        };
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::AgentOpened {
+                pane_id: pane_id.to_string(),
+                agent_id: agent_id.map(str::to_string),
+            },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error.unwrap_or_else(|| "agent-opened failed".into()),
+            ));
+        }
+        Ok(GatedQuery::Answered(()))
     }
 
     /// PRD #2374: the resolved agent-card catalog. Withheld like

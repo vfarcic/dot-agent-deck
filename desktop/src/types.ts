@@ -1969,6 +1969,13 @@ export interface DeckRuntimeState {
    */
   generateConfig?: (deckId: string, agentId: string, paneId: string, incarnation?: string) => Promise<GenerateConfigResult>;
   /**
+   * Issue #2454 — tell the daemon the user opened agent `agentId` in pane
+   * `paneId` on deck `deckId` (as the daemon process `incarnation` listed it),
+   * which clears the "Needs you" its card report raised. Absent where no
+   * daemon can answer.
+   */
+  agentOpened?: (deckId: string, agentId: string, paneId: string, incarnation?: string) => Promise<void>;
+  /**
    * PRD #2374 — each deck's agent cards, by deck id, as its daemon last sent
    * them. A deck whose daemon has no cards has no key here. Absent where the
    * bridge offers no cards (a render-only test runtime).

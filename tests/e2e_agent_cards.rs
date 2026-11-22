@@ -1101,6 +1101,87 @@ fn state_001_exit_keeps_a_stopped_card_and_close_removes_it() {
     );
 }
 
+/// Scenario: A stand-in agent under a TUI's daemon reports a turn and
+/// publishes a `done` card, so `card list` marks it needing the user. The user
+/// presses `1` on the TUI's dashboard to open that agent's pane; the card no
+/// longer needs the user while its `done` report stays, and the agent's next
+/// `waiting` report marks it again.
+#[spec("agent-report/state/003")]
+#[test]
+fn state_003_opening_the_agent_in_the_tui_deals_with_its_report() {
+    let deck = common::TuiDeck::builder()
+        .with_pty_size(160, 45)
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active agents");
+    let pane = route::start(&deck, "card-open", json!({}));
+    inbox::status(&deck, &pane, "session_start", "codex");
+    inbox::status(&deck, &pane, "idle", "codex");
+    deck.wait_for_absence("No active agents");
+    let k = key(&pane);
+    publish(
+        &deck,
+        &pane,
+        deck.cwd(),
+        &json!({"status": "done", "summary": "CARD-OPEN-DONE-3b7e"}),
+    );
+    wait_entry(&deck, &k, "needing the user for its done report", |e| {
+        e["needs_you_reasons"] == json!(["done"])
+    });
+
+    deck.send_keys(b"1");
+    let e = wait_entry(&deck, &k, "dealt with by the open", |e| {
+        e["needs_you"] == false
+    });
+    assert_eq!(e["needs_you_reasons"], json!([]), "{e:#}");
+    assert_eq!(e["report"]["status"], "done", "the report is kept: {e:#}");
+    assert_eq!(e["report"]["summary"], "CARD-OPEN-DONE-3b7e", "{e:#}");
+
+    publish(&deck, &pane, deck.cwd(), &json!({"status": "waiting"}));
+    wait_entry(&deck, &k, "needing the user for its new report", |e| {
+        e["needs_you_reasons"] == json!(["waiting"])
+    });
+}
+
+/// Scenario: A stand-in agent reports a turn, publishes a `waiting` card from
+/// inside it and ends the turn, so `card list` marks it needing the user. Its
+/// hooks then report the next turn starting (the user replied); the card no
+/// longer needs the user, while a turn that was already running when a newer
+/// `done` was published does not deal with that one.
+#[spec("agent-report/state/004")]
+#[test]
+fn state_004_the_agents_next_turn_deals_with_its_report() {
+    let (daemon, _cfg) = daemon_with_config("");
+    let pane = route::start(&daemon, "card-turn", json!({}));
+    let k = key(&pane);
+    inbox::status(&daemon, &pane, "session_start", "codex");
+    inbox::status(&daemon, &pane, "thinking", "codex");
+    publish(&daemon, &pane, daemon.cwd(), &json!({"status": "waiting"}));
+    inbox::status(&daemon, &pane, "idle", "codex");
+    wait_entry(
+        &daemon,
+        &k,
+        "needing the user for its waiting report",
+        |e| e["needs_you_reasons"] == json!(["waiting"]),
+    );
+
+    inbox::status(&daemon, &pane, "thinking", "codex");
+    let e = wait_entry(&daemon, &k, "dealt with by the next turn", |e| {
+        e["needs_you"] == false
+    });
+    assert_eq!(
+        e["report"]["status"], "waiting",
+        "the report is kept: {e:#}"
+    );
+
+    // Published inside the turn now running: that turn does not deal with it.
+    publish(&daemon, &pane, daemon.cwd(), &json!({"status": "done"}));
+    inbox::status(&daemon, &pane, "tool_start", "codex");
+    let e = wait_entry(&daemon, &k, "needing the user for its done report", |e| {
+        e["needs_you_reasons"] == json!(["done"])
+    });
+    assert_eq!(e["status"], "working", "{e:#}");
+}
+
 /// Scenario: An orchestrator and a worker stand-in run under a real daemon;
 /// the worker publishes a question and suggests `merge` and a confirm-only
 /// `deploy`. `card act` sends `merge`'s exact prompt to the worker's inbox

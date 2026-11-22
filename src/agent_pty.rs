@@ -9491,6 +9491,26 @@ pub(crate) const FAULT_SPAWN_BEFORE_PUBLISH: &str = "spawn-before-publish";
 /// `Fail` makes it fail ((f1)'s seam).
 pub(crate) const FAULT_SPAWN_FAILS: &str = "spawn-fails";
 
+/// TEST knob, read only by a build with the `e2e` feature: every fresh spawn
+/// waits this many milliseconds before it starts, as the first installed
+/// spawn of a daemon does while it copies its editor helper (issue #2421), so
+/// a test can make a client's start outlast the client's bound on its reply.
+/// A respawn does not wait.
+pub const ENV_TEST_SPAWN_DELAY_MS: &str = "DOT_AGENT_DECK_TEST_SPAWN_DELAY_MS";
+
+#[cfg(feature = "e2e")]
+fn test_spawn_delay() -> Option<Duration> {
+    std::env::var(ENV_TEST_SPAWN_DELAY_MS)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+}
+
+#[cfg(not(feature = "e2e"))]
+fn test_spawn_delay() -> Option<Duration> {
+    None
+}
+
 /// PRD #1666 part 3, round 5: the replacement's abort fault point: `Fail`
 /// drops its ticket with no transition ((f5a)'s seam).
 pub(crate) const FAULT_ABORT_SKIPPED: &str = "abort-skipped";
@@ -15383,6 +15403,13 @@ impl AgentPtyRegistry {
         // reservation ((f1)'s seam).
         if self.fault_point(FAULT_SPAWN_FAILS) {
             return Err(AgentPtyError::Spawn("injected spawn failure (test)".into()));
+        }
+        // Issue #2421's test seam: a fresh spawn as slow as a first installed
+        // one on a loaded machine.
+        if matches!(admission, Admission::Fresh)
+            && let Some(delay) = test_spawn_delay()
+        {
+            std::thread::sleep(delay);
         }
 
         // Capture the caller-supplied `DOT_AGENT_DECK_PANE_ID` *before*

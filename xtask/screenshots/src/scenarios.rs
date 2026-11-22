@@ -118,7 +118,7 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "generate-config",
-        description: "The Generate .dot-agent-deck.toml confirmation, Yes and No, opened on one agent: in the TUI with `g` on its card beside its pane, on the desktop from its Dashboard row's Generate config button.",
+        description: "The Generate .dot-agent-deck.toml confirmation, Yes and No, opened on one agent: in the TUI with `g` on its card beside its pane, on the desktop from the Generate config button in its pane's header.",
         clients: &[Client::Tui, Client::Desktop],
     },
     Scenario {
