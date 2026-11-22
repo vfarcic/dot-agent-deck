@@ -19023,7 +19023,7 @@ mod tests {
     /// included — whose control has a voice row, with that row. `docs/develop/voice-first-design.md`
     /// section 5 has the rule; the labels left out on purpose are listed there
     /// with their reasons.
-    const CONTROL_LABELS: [ControlLabel; 40] = [
+    const CONTROL_LABELS: [ControlLabel; 38] = [
         // PRD #2174 — the star reminder's three buttons, each its own row.
         // Shown at startup over the dashboard, never over the New agent form.
         ControlLabel {
@@ -19229,7 +19229,9 @@ mod tests {
             over_the_form: false,
         },
         ControlLabel {
-            source: "aria-label={`Open ${name} agent`}",
+            // Issue #2454: the dashboard row's own accessible name, now that
+            // the row (not an icon) is the keyboard route that opens it.
+            source: "const rowName = openAgent ? `Open ${name} agent` : name;",
             file: AGENT_OVERVIEW_TSX,
             said: "Open tester agent",
             row: "open_agent",
@@ -19288,15 +19290,9 @@ mod tests {
             row: "close",
             over_the_form: false,
         },
-        // PRD #2119 — Generate config on a dashboard row ("Generate config
-        // with <name> agent") and in the open pane ("Generate config").
-        ControlLabel {
-            source: "aria-label={`Generate config with ${name} agent`}",
-            file: AGENT_OVERVIEW_TSX,
-            said: "Generate config with tester agent",
-            row: "generate_config",
-            over_the_form: false,
-        },
+        // PRD #2119 — Generate config in the open pane ("Generate config").
+        // Issue #2454 took the dashboard row's button away; voice still
+        // reaches the row's agent by name ("generate config with the tester").
         ControlLabel {
             source: "<FileCog size={14} aria-hidden=\"true\" /> Generate config</button>",
             file: AGENT_TILE_TSX,
@@ -19304,14 +19300,7 @@ mod tests {
             row: "generate_config",
             over_the_form: false,
         },
-        // The same two controls when the project already has a config.
-        ControlLabel {
-            source: "aria-label={`Update config with ${name} agent`}",
-            file: AGENT_OVERVIEW_TSX,
-            said: "Update config with tester agent",
-            row: "generate_config",
-            over_the_form: false,
-        },
+        // The same control when the project already has a config.
         ControlLabel {
             source: "<FileCog size={14} aria-hidden=\"true\" /> Update config</button>",
             file: AGENT_TILE_TSX,
