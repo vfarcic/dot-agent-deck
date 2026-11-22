@@ -1,12 +1,12 @@
 {
   "$schema": "https://raw.githubusercontent.com/jetify-com/devbox/0.16.0/.schema/devbox.schema.json",
   "packages": {
-    "vals":                         "0.47.0",
+    "vals":                         "0.51.1",
     "go-task":                      "3.53.1",
     "git":                          "2.56.0",
     "upcloud-cli":                  "3.37.0",
     "openstackclient":              "10.5.0",
-    "gh":                           "2.104.0",
+    "gh":                           "2.105.0",
     "asciinema":                    "3.2.1",
     "cargo-nextest":                "0.9.149",
     "rustc":                        "1.99.1",
