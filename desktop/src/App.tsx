@@ -111,7 +111,7 @@ import { DEFAULT_VOICE_SETTINGS, isWorkUnderWay, modeScopedKey } from "./lib/bri
 import { READING_LABEL_MAX_CHARS, type ReadingAgent } from "./lib/reading";
 import { agentSpokenName } from "./lib/agentNames";
 import { questionAgentName } from "./lib/voiceQuestion";
-import { PANE_AGENT_GONE, PANE_COVERED, PANE_TERMINAL_HIDDEN, scrollAgentPane } from "./lib/paneScroll";
+import { PANE_AGENT_GONE, PANE_COVERED, PANE_TERMINAL_HIDDEN, paneScrollFailed, scrollAgentPane } from "./lib/paneScroll";
 import { getTerminal } from "./lib/terminalRegistry";
 import { planStoredRoleOrder, reconcileRoleOrder } from "./lib/roleOrder";
 
@@ -1392,7 +1392,15 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
                voice's own scroll is not a hand edit of the prompt (Qodo on
                PR #2476). `dispatchLost` already held this to the pane the
                utterance was said over. */
-            return scrollAgentPane(getTerminal(voicePane.deckId, voicePane.agentId, voicePane.incarnation), move, (key) => { void runtime.sendTerminalInput(target, key).catch(() => undefined); }, voicePane.inputBlocked);
+            /* A write that fails after the report went out replaces it with
+               why, rather than leaving "Scrolling up." standing over a pane
+               that did not move (Qodo on PR #2476). */
+            const sendKey = (key: string) => {
+              void runtime.sendTerminalInput(target, key).catch((cause: unknown) => {
+                panelVoiceContext.current?.reportRefused?.(paneScrollFailed(cause));
+              });
+            };
+            return scrollAgentPane(getTerminal(voicePane.deckId, voicePane.agentId, voicePane.incarnation), move, sendKey, voicePane.inputBlocked);
           } }
         : overviewVoiceContext.current?.scrollDashboard
           ? { scrollDashboard: (move: DashboardScroll) => (dialogLayerUp() || confirmationOpen || overlaysOpen.settings || modalOpen() ? DASHBOARD_COVERED : overviewVoiceContext.current?.scrollDashboard?.(move)) }

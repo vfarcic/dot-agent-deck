@@ -302,9 +302,12 @@ fn mode_scroll_010_default_claude_leaves_history_the_deck_scrolls() {
     deck.wait_until_grid("command mode", |grid| {
         grid.lines().any(|line| line.starts_with(" COMMAND "))
     });
-    // Pressed until the view moves: the first key after Ctrl+D can be taken
-    // by the command-mode banner rather than reach the scroll (observed while
-    // writing this test, with a plain `seq` pane as well; #2477).
+    // Pressed until the view moves: the first PageUp after Ctrl+D can be lost
+    // (observed while writing this test, with a plain `seq` pane as well).
+    // That is #2477, a separate TUI defect; this test is about whether default
+    // Claude leaves history to scroll, so it does not pin the first press.
+    // The fix for #2477 owns the single-press regression test, and should
+    // turn this loop back into one press.
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         deck.send_keys(PAGE_UP.as_bytes());

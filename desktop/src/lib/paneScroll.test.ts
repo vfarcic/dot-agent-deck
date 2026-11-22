@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { PAGE_DOWN, PAGE_UP, PANE_AT_BOTTOM, PANE_AT_TOP, PANE_NOTHING_TO_SCROLL, PANE_SCROLLS_BY_SCREEN, PANE_TERMINAL_HIDDEN, scrollAgentPane, type ScrollablePane } from "./paneScroll";
+import { paneScrollFailed, PAGE_DOWN, PAGE_UP, PANE_AT_BOTTOM, PANE_AT_TOP, PANE_NOTHING_TO_SCROLL, PANE_SCROLLS_BY_SCREEN, PANE_TERMINAL_HIDDEN, scrollAgentPane, type ScrollablePane } from "./paneScroll";
 
 function pane(type: "normal" | "alternate", baseY = 0, viewportY = baseY) {
   return {
@@ -75,5 +75,11 @@ describe("issue #1673 — scrolling an agent's pane by voice", () => {
   /** Scenario: no terminal mounted for the pane. */
   it("says the terminal is not showing when the pane has none", () => {
     expect(scrollAgentPane(undefined, "up", idle)).toBe(PANE_TERMINAL_HIDDEN);
+  });
+
+  /** Scenario: a failed write's reason becomes one sentence, with no doubled full stop. */
+  it("words a failed write as one sentence", () => {
+    expect(paneScrollFailed(new Error("the terminal detached."))).toBe("The pane was not scrolled: the terminal detached.");
+    expect(paneScrollFailed("no socket")).toBe("The pane was not scrolled: no socket.");
   });
 });

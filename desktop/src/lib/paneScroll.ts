@@ -36,6 +36,12 @@ export const PANE_TERMINAL_HIDDEN = "The agent's terminal is not showing, so it 
 export const PANE_COVERED = "Something is open over the agent's pane, so it was not scrolled. Close it first.";
 export const PANE_AGENT_GONE = "The agent in this pane is no longer shown, so nothing was scrolled.";
 
+/** Why a scroll key sent to the agent did not arrive, as the voice row says it. */
+export function paneScrollFailed(cause: unknown): string {
+  const why = cause instanceof Error ? cause.message : String(cause);
+  return `The pane was not scrolled: ${why.replace(/\.$/, "")}.`;
+}
+
 /** PageUp and PageDown as a terminal sends them, and as the TUI forwards them (`keyevent_to_bytes`). */
 export const PAGE_UP = "\x1b[5~";
 export const PAGE_DOWN = "\x1b[6~";

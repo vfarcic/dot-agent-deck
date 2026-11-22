@@ -1357,6 +1357,19 @@ describe("issue #1673 — the four scrolls over an agent's pane", () => {
     }
   });
 
+  /** Scenario: the scroll key's write to the agent fails (its terminal detached); the voice row says the pane was not scrolled and why, instead of leaving "Scrolling up." standing. */
+  it("reports a scroll whose write to the agent failed", async () => {
+    const terminal = fakeTerminal("alternate");
+    const { sent, unregister } = renderPane(terminal, dispatchOutcome("scroll_up", "scrollUp", "scroll up", "Scrolling up."));
+    sent.mockRejectedValueOnce(new Error("the terminal detached"));
+    try {
+      fireEvent.click(screen.getByTestId("voice-trigger"));
+      await waitFor(() => expect(screen.queryAllByText(/The pane was not scrolled: the terminal detached\./).length).toBeGreaterThan(0));
+    } finally {
+      unregister();
+    }
+  });
+
   /** Scenario: "scroll to the top" over a pane on the alternate screen sends nothing and says to scroll a screen at a time. */
   it("answers scroll to the top over a pane on the alternate screen without sending a key", async () => {
     const terminal = fakeTerminal("alternate");
