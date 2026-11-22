@@ -1138,6 +1138,11 @@ pub struct AgentListing {
     /// client may read it — and, in particular, that it is comparable only
     /// against earlier values from the same connection.
     pub schedule_revision: Option<u64>,
+    /// Issue #1965: the orchestration roles whose agent exited and whose pane
+    /// is still open, sanitised at the wire boundary
+    /// ([`crate::ended_role::EndedRole::sanitized`]). Empty from a daemon that
+    /// does not report them.
+    pub ended_roles: Vec<crate::ended_role::EndedRole>,
     /// PRD #1666 part 2 (G-fix4): the daemon process that answered, from the
     /// `Hello` on the listing's own connection — what a client binds an action
     /// on one of these records to ([`DaemonClient::bound_to`]). `None` from an
@@ -2147,6 +2152,12 @@ impl DaemonClient {
             ));
         }
         let schedule_revision = resp.schedule_revision;
+        let ended_roles: Vec<crate::ended_role::EndedRole> = resp
+            .ended_roles
+            .unwrap_or_default()
+            .into_iter()
+            .map(crate::ended_role::EndedRole::sanitized)
+            .collect();
         if let Some(mut records) = resp.agent_records {
             for rec in &mut records {
                 sanitize_record_tab_membership(rec);
@@ -2154,6 +2165,7 @@ impl DaemonClient {
             return Ok(AgentListing {
                 records,
                 schedule_revision,
+                ended_roles,
                 incarnation,
             });
         }
@@ -2194,6 +2206,7 @@ impl DaemonClient {
                 })
                 .collect(),
             schedule_revision,
+            ended_roles,
             incarnation,
         })
     }
@@ -5119,6 +5132,12 @@ impl EventSubscription {
                         // `trust_requests_of` does for `Hello`.
                         Ok(BroadcastMsg::TrustRequests(list)) => {
                             return Ok(Some(BroadcastMsg::TrustRequests(list.sanitized())));
+                        }
+                        // Issue #1965: an exited role carries the pane's last
+                        // output, which is untrusted text bound for a card;
+                        // sanitised here, as `list_agents_detailed` does.
+                        Ok(BroadcastMsg::RoleEnded(role)) => {
+                            return Ok(Some(BroadcastMsg::RoleEnded(role.sanitized())));
                         }
                         Ok(msg) => return Ok(Some(msg)),
                         Err(e) => {
