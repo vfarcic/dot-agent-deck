@@ -632,29 +632,44 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    * the view forgets it, so opening the same agent again tells the daemon again.
    * A send that fails is tried again while the same view stays open, at most
    * {@link AGENT_OPENED_ATTEMPTS} times in all (Qodo on PR #2460).
+   *
+   * Each open is its own object, and a retry checks that object by identity,
+   * not the agent's key: reopening the same agent makes a new open, so a retry
+   * still pending from the open the user left sends nothing, and leaving an
+   * open cancels its pending retry (PR #2430 review: a stale retry otherwise
+   * cleared a Needs you raised after the reopen).
    */
   const agentOpened = runtime.agentOpened;
-  const openedSent = useRef<string | undefined>(undefined);
-  useEffect(() => () => { openedSent.current = undefined; }, []);
+  const openedSent = useRef<{ key: string; retry?: number } | undefined>(undefined);
+  const forgetOpen = useCallback(() => {
+    if (openedSent.current?.retry !== undefined) window.clearTimeout(openedSent.current.retry);
+    openedSent.current = undefined;
+  }, []);
+  useEffect(() => forgetOpen, [forgetOpen]);
   useEffect(() => {
     if (!agentView || !paneAgent) {
-      if (!agentView) openedSent.current = undefined;
+      if (!agentView) forgetOpen();
       return;
     }
     const key = `${agentView.deckId}\u0000${paneAgent.id}\u0000${paneAgent.incarnation ?? ""}`;
     const paneId = paneAgent.paneId;
-    if (openedSent.current === key || !agentOpened || !paneId) return;
-    openedSent.current = key;
+    if (openedSent.current?.key === key || !agentOpened || !paneId) return;
+    forgetOpen();
+    const open: { key: string; retry?: number } = { key };
+    openedSent.current = open;
     const { deckId } = agentView;
     const { id, incarnation } = paneAgent;
     const send = (attempt: number) => {
       agentOpened(deckId, id, paneId, incarnation).catch(() => {
-        if (attempt >= AGENT_OPENED_ATTEMPTS || openedSent.current !== key) return;
-        window.setTimeout(() => { if (openedSent.current === key) send(attempt + 1); }, AGENT_OPENED_RETRY_MS);
+        if (attempt >= AGENT_OPENED_ATTEMPTS || openedSent.current !== open) return;
+        open.retry = window.setTimeout(() => {
+          open.retry = undefined;
+          if (openedSent.current === open) send(attempt + 1);
+        }, AGENT_OPENED_RETRY_MS);
       });
     };
     send(1);
-  }, [agentOpened, agentView, paneAgent]);
+  }, [agentOpened, agentView, paneAgent, forgetOpen]);
   /**
    * Issue #1143 — the last record this pane's deck gave, so the pane can still
    * be a pane while that deck is not answering.

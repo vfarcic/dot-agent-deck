@@ -431,6 +431,37 @@ describe("agent pane overlay", () => {
     }
   });
 
+  /**
+   * Scenario: open Planner while its daemon fails that report, go back to the
+   * dashboard and open Planner again before the retry is due, this time with
+   * the daemon answering. The second open is reported once, and the first
+   * open's pending retry sends nothing: two opens, two reports, so a stale
+   * retry cannot clear a Needs you the agent raised after the second open
+   * (PR #2430 review).
+   */
+  it("sends no retry for an open the user left, even after reopening the same agent", async () => {
+    vi.useFakeTimers();
+    try {
+      let fail = true;
+      const agentOpened = vi.fn(async () => { if (fail) throw new Error("the deck did not answer"); });
+      const initial = runtime({ agentOpened });
+      const snapshot = { ...initial.snapshot, agents: initial.snapshot.agents.map((agent) => ({ ...agent, incarnation: "process-a", paneId: `pane-${agent.id}` })) };
+      render(<DeckShell runtime={{ ...initial, snapshot, fleet: [snapshot] } as DeckRuntimeState} initialView={{ kind: "overview" }} />);
+      fireEvent.click(screen.getByRole("row", { name: "Open Plan / architecture agent" }));
+      await act(async () => {});
+      expect(agentOpened).toHaveBeenCalledTimes(1);
+
+      fireEvent.click(screen.getByRole("button", { name: "Back to dashboard" }));
+      fail = false;
+      fireEvent.click(screen.getByRole("row", { name: "Open Plan / architecture agent" }));
+      expect(agentOpened).toHaveBeenCalledTimes(2);
+      await act(async () => { await vi.advanceTimersByTimeAsync(AGENT_OPENED_RETRY_MS * (AGENT_OPENED_ATTEMPTS + 1)); });
+      expect(agentOpened).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   /** Scenario: the deck's tile opens Planner's overlay; that open is reported too. */
   it("tells the agent's daemon when its overlay opens from the deck", () => {
     const agentOpened = vi.fn(async () => undefined);
