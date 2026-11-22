@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use super::collector;
 use super::detect::{self, CopyKind};
 use super::discover::{self, OtherCopy};
 use super::execute::{self, ReleaseSource};
@@ -408,21 +409,42 @@ async fn upgrade_each(
         if !confirmed(plan, args, &mut answers, out) {
             continue;
         }
-        let result = {
+        let (result, collector) = {
             let _listening = interrupt.listen();
-            execute_blocking(
+            let result = execute_blocking(
                 host.clone(),
                 plan.clone(),
                 source.clone(),
                 staging_root,
                 interrupt.clone(),
             )
-            .await
+            .await;
+            // Issue #2064: a release collector beside the CLI moves with it,
+            // under the same cancellation as the copy's own upgrade.
+            let collector = match &result {
+                Ok(outcome) if !interrupt.is_set() => Some(
+                    collector_blocking(
+                        host.clone(),
+                        plan.clone(),
+                        outcome.clone(),
+                        source.clone(),
+                        staging_root,
+                        interrupt.clone(),
+                    )
+                    .await,
+                ),
+                _ => None,
+            };
+            (result, collector)
         };
         match result {
             Ok(outcome) => {
                 say_items(out, &outcome.items());
                 ok &= outcome.upgraded();
+                if let Some(collector) = collector {
+                    say_items(out, &collector.lines);
+                    ok &= collector.ok;
+                }
                 // R-3: a CLI the upgrade installed refreshes the agents' hooks.
                 let (hooks_host, hooks_plan) = (host.clone(), plan.clone());
                 let hooks = tokio::task::spawn_blocking(move || {
@@ -475,6 +497,32 @@ async fn execute_blocking(
     })
     .await
     .unwrap_or_else(|e| Err(UpgradeError::Io(e.to_string())))
+}
+
+/// [`collector::after_upgrade`] on a blocking thread, as [`execute_blocking`]
+/// runs the copy's own upgrade: once `interrupt` is set while it waits on a
+/// download, it is dropped there, before the collector is changed.
+async fn collector_blocking(
+    host: Arc<dyn Host>,
+    plan: UpgradePlan,
+    outcome: execute::Outcome,
+    source: ReleaseSource,
+    staging_root: &std::path::Path,
+    interrupt: Interrupt,
+) -> collector::Report {
+    let handle = tokio::runtime::Handle::current();
+    let staging_root = staging_root.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        handle.block_on(async {
+            tokio::select! {
+                biased;
+                report = collector::after_upgrade(&*host, &plan, &outcome, &source, &staging_root) => report,
+                () = interrupt.until_set() => collector::Report::cancelled(),
+            }
+        })
+    })
+    .await
+    .unwrap_or_else(|e| collector::Report::failed(&e.to_string()))
 }
 
 fn confirmed(

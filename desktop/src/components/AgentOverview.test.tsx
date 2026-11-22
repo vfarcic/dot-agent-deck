@@ -1739,22 +1739,28 @@ describe("AgentOverview", () => {
   });
 
   /**
-   * Scenario: render the terminal-free overview and activate the Planner
-   * card's keyboard-reachable open control. It navigates with the card's
-   * composite identity and overview origin without mounting a terminal itself.
+   * Scenario: render the terminal-free overview, give the Planner row focus
+   * and press Enter, then Space (issue #2454: the row itself is the keyboard
+   * route, named "Open Plan / architecture agent"). Each key navigates once with
+   * the row's composite identity and overview origin, without mounting a
+   * terminal on the overview.
    */
-  it("opens an overview card as an agent view without putting a terminal on the overview", () => {
+  it("opens an overview row as an agent view from the keyboard without putting a terminal on the overview", () => {
     const onNavigate = vi.fn();
     window.localStorage.setItem(OVERVIEW_COLUMNS_STORAGE_KEY, JSON.stringify({ columns: ALL_OVERVIEW_COLUMNS }));
     render(<AgentOverview runtime={runtime({ snapshot: createFixtureSnapshot("connected") })} onNavigate={onNavigate} />);
 
-    const card = screen.getByTestId(`overview-agent-${agentKey({ daemonId: FIXTURE_DAEMON_ID, id: "planner" })}`);
-    const open = within(card).getByRole("button", { name: "Open Plan / architecture agent" });
-    expect(open.tagName).toBe("BUTTON");
-    open.focus();
-    expect(open).toHaveFocus();
+    const row = screen.getByRole("row", { name: "Open Plan / architecture agent" });
+    expect(row).toBe(screen.getByTestId(`overview-agent-${agentKey({ daemonId: FIXTURE_DAEMON_ID, id: "planner" })}`));
+    expect(row.tagName).toBe("TR");
+    expect(row).not.toHaveAttribute("role", "button");
+    row.focus();
+    expect(row).toHaveFocus();
 
-    fireEvent.click(open);
+    fireEvent.keyDown(row, { key: "Enter" });
+    expect(onNavigate).toHaveBeenCalledOnce();
+    onNavigate.mockClear();
+    fireEvent.keyDown(row, { key: " " });
     expect(onNavigate).toHaveBeenCalledOnce();
     expect(onNavigate).toHaveBeenCalledWith({
       kind: "agent",
@@ -1809,25 +1815,28 @@ describe("AgentOverview", () => {
   });
 
   /**
-   * Scenario: click a row's own open control, then the icon glyph inside it,
-   * which is what a mouse actually lands on. Each click opens the pane exactly
-   * once, rather than once for the control and again for the row around it.
+   * Scenario (issue #2454): press Enter and Space on the Planner row's Close
+   * button, other keys and modified Enter on the row itself, and Tab through the
+   * rows. A key on the row's own control is that control's and opens nothing, the
+   * row opens only for a plain Enter or Space, and each row is one Tab stop
+   * followed by its Close, in row order — no Open or Generate config icon in
+   * between.
    */
-  it("opens the pane once, not twice, when the row's own open control is clicked", () => {
+  it("opens a row only for a plain Enter or Space on the row itself, one Tab stop per agent", () => {
     const onNavigate = vi.fn();
-    render(<AgentOverview runtime={runtime({ snapshot: createFixtureSnapshot("connected") })} onNavigate={onNavigate} />);
+    const { container } = render(<AgentOverview runtime={runtime({ snapshot: createFixtureSnapshot("connected") })} onNavigate={onNavigate} />);
 
-    const card = screen.getByTestId(`overview-agent-${agentKey({ daemonId: FIXTURE_DAEMON_ID, id: "planner" })}`);
-    const open = within(card).getByRole("button", { name: "Open Plan / architecture agent" });
-    const glyph = open.querySelector("svg");
-    expect(glyph).not.toBeNull();
+    const row = screen.getByTestId(`overview-agent-${agentKey({ daemonId: FIXTURE_DAEMON_ID, id: "planner" })}`);
+    const close = within(row).getByRole("button", { name: "Close Plan / architecture agent" });
+    for (const key of ["Enter", " "]) fireEvent.keyDown(close, { key });
+    for (const init of [{ key: "a" }, { key: "Escape" }, { key: "Enter", ctrlKey: true }, { key: "Enter", shiftKey: true }, { key: "Enter", altKey: true }, { key: "Enter", metaKey: true }, { key: "Enter", repeat: true }]) fireEvent.keyDown(row, init);
+    expect(onNavigate).not.toHaveBeenCalled();
 
-    for (const target of [open, glyph!]) {
-      onNavigate.mockClear();
-      fireEvent.click(target);
-      expect(onNavigate).toHaveBeenCalledOnce();
-      expect(onNavigate).toHaveBeenCalledWith({ kind: "agent", deckId: FIXTURE_DAEMON_ID, agentId: "planner", from: "overview" });
-    }
+    expect(within(row).queryByRole("button", { name: /^Open /i })).toBeNull();
+    expect(within(row).queryByRole("button", { name: /config with/i })).toBeNull();
+    const stops = [...container.querySelectorAll<HTMLElement>(".overview-row, .overview-row button")].filter((element) => element.tabIndex >= 0);
+    const rows = [...container.querySelectorAll(".overview-row")];
+    expect(stops.map((element) => element.tagName === "TR" ? "row" : element.className)).toEqual(rows.flatMap(() => ["row", "overview-stop-agent"]));
   });
 
   /**
@@ -1934,9 +1943,9 @@ describe("AgentOverview", () => {
   });
 
   /**
-   * Scenario: list every interactive element in every row of three fixtures,
-   * which is the open control and the stop control (PRD #1223 U4) and nothing
-   * else; then put one of each kind of
+   * Scenario: list every interactive element inside every row of three
+   * fixtures, which is the stop control (PRD #1223 U4) and nothing else — the
+   * row is its own open route (issue #2454); then put one of each kind of
    * control into a row and click it. Each control gets its own click and none
    * of them opens the pane.
    */
@@ -1958,7 +1967,7 @@ describe("AgentOverview", () => {
       const { container, unmount } = render(<AgentOverview runtime={runtime(overrides)} onNavigate={vi.fn()} />);
       for (const row of container.querySelectorAll(".overview-row")) {
         const controls = [...row.querySelectorAll(INTERACTIVE)];
-        expect(controls.map((control) => control.className)).toEqual(["overview-open-agent", "overview-stop-agent"]);
+        expect(controls.map((control) => control.className)).toEqual(["overview-stop-agent"]);
         rowsSeen += 1;
       }
       unmount();
@@ -2552,7 +2561,7 @@ describe("DeckShell", () => {
     render(<DeckShell runtime={runtime({ snapshot: createFixtureSnapshot("connected") })} />);
     await waitFor(() => expect(screen.getByTestId("overview-table-region")).toBeVisible());
 
-    fireEvent.click(screen.getByRole("button", { name: "Open Plan / architecture agent" }));
+    fireEvent.click(screen.getByRole("row", { name: "Open Plan / architecture agent" }));
     expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
     fireEvent.keyDown(window, { key: "Escape" });
     expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
@@ -2685,7 +2694,7 @@ describe("DeckShell", () => {
     expect(rail()).toHaveLength(1);
     expect(entries()).toEqual(deckEntries);
 
-    fireEvent.click(screen.getByRole("button", { name: "Open Plan / architecture agent" }));
+    fireEvent.click(screen.getByRole("row", { name: "Open Plan / architecture agent" }));
     expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
     expect(rail()).toHaveLength(1);
     expect(entries()).toEqual(deckEntries);
@@ -2702,7 +2711,7 @@ describe("DeckShell", () => {
 
     fireEvent.click(screen.getByTestId("open-overview"));
     expect(current()).toBe("Dashboard");
-    fireEvent.click(screen.getByRole("button", { name: "Open Plan / architecture agent" }));
+    fireEvent.click(screen.getByRole("row", { name: "Open Plan / architecture agent" }));
     expect(current()).toBe("Dashboard");
   });
 
@@ -3257,7 +3266,7 @@ describe("AgentOverview across a fleet (PRD #742 M4)", () => {
    * withdrawn is the daemon SWITCH — this screen moves no selection, and
    * `writes no settings document when a pane opens or closes` is its guard.
    */
-  it("offers an open control on every row, whichever deck the agent is on", () => {
+  it("makes every row an open route, whichever deck the agent is on", () => {
     const onNavigate = vi.fn();
     const fleet = createFixtureFleet("fleet");
     window.localStorage.setItem(OVERVIEW_COLUMNS_STORAGE_KEY, JSON.stringify({ columns: ALL_OVERVIEW_COLUMNS }));
@@ -3272,10 +3281,9 @@ describe("AgentOverview across a fleet (PRD #742 M4)", () => {
 
     for (const agent of [...local.agents, ...remote.agents]) {
       const row = screen.getByTestId(`overview-agent-${agentDomKey(agent)}`);
-      const open = within(row).getByRole("button", { name: `Open ${agent.displayName} agent` });
-      expect(open).toBeVisible();
-      expect(open.tagName).toBe("BUTTON");
-      expect(open).not.toBeDisabled();
+      expect(row).toHaveAccessibleName(`Open ${agent.displayName} agent`);
+      expect(row).toBeVisible();
+      expect(row).toHaveAttribute("tabindex", "0");
     }
 
     /*
@@ -3285,7 +3293,7 @@ describe("AgentOverview across a fleet (PRD #742 M4)", () => {
       same-id namesake.
     */
     const stranger = remote.agents[0];
-    fireEvent.click(screen.getByRole("button", { name: `Open ${stranger.displayName} agent` }));
+    fireEvent.keyDown(screen.getByRole("row", { name: `Open ${stranger.displayName} agent` }), { key: "Enter" });
     expect(onNavigate).toHaveBeenCalledOnce();
     expect(onNavigate).toHaveBeenCalledWith({
       kind: "agent",

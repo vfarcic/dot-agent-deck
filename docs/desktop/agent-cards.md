@@ -13,6 +13,8 @@ An agent that has reported nothing yet still has a card, with its deck-checked s
 
 A card is marked **Needs you** when its agent stopped, is asking a question in its terminal or on its card, says it is waiting for you, done or failed, or is blocked. Hover the mark to see which.
 
+The mark for a report that the agent is waiting, done or failed goes away once you have dealt with it: when the agent starts working again after that report (you replied, or it moved on by itself), or when you open the agent after it (its pane in the desktop app, from the Dashboard or the deck, or in the TUI). The card keeps the report; only the mark goes. The agent's next waiting, done or failed report marks it again. The other reasons stay for as long as they are true: a stopped agent, an unanswered question and a block keep the mark however often you open the agent. With a daemon from an earlier release, the mark stays until the agent publishes a new report.
+
 ## Switch between the table and the cards
 
 The Dashboard's top bar has a **Table | Cards** switch. **Table** is the Dashboard you know. **Cards** shows a grid of cards. The app remembers your choice in this window's storage, so the next time you open the Dashboard it shows the same view.
@@ -26,7 +28,7 @@ In the Cards view:
 - Each card has one main button, the action the agent most needs from you: the answer to its question, an action it suggested, or **Open** when it needs nothing. Under the button is the start of the exact text it sends, and hovering shows all of it. An action the agent wrote itself is marked **agent says**, as are its fields. When the agent wrote the text and the card shows only the start of it, the button sends nothing yet: it opens the card at a step showing the whole text, and you send it from there. After you press it, the card says whether the message was sent and, later, whether the agent took it.
 - Each daemon keeps its own section with its header, so its **Stop daemon**, **Upgrade**, host figures and **New agent** buttons are there in both views, and its cards are below the header. A daemon from a release before cards were added has no cards and keeps its usual table.
 
-In the Table view, a row whose card needs you shows a bell next to the agent's name, and the row's **⋯** menu has **Show card**, which opens that agent's card, and the card's main action. The menu shows only the action's name, so choosing it sends nothing yet: it opens the card at a step that shows exactly what the action sends, and you send it from there. Clicking the row itself still opens the agent's terminal, as before.
+In the Table view, a row whose card needs you shows an amber **Needs you** badge after the agent's name and its pull request badge; hover it to see why. The badge is not a button: clicking it opens the agent like the rest of the row. The row's **⋯** menu has **Show card**, which opens that agent's card, and the card's main action. The menu shows only the action's name, so choosing it sends nothing yet: it opens the card at a step that shows exactly what the action sends, and you send it from there. Clicking the row itself still opens the agent's terminal, as before, and so does `Enter` or `Space` on a row focused with `Tab`.
 
 ## The card overlay
 
@@ -111,7 +113,7 @@ Agents can also report fields and actions that are not in the catalog. You see t
 
 ## In the TUI
 
-The TUI does not show cards. Its dashboard keeps showing each agent's status as before. From any shell on the machine, `dot-agent-deck card list` prints every card as JSON, with the same status, needs-you reasons and actions the app shows, and `dot-agent-deck card act` presses one action:
+The TUI does not show cards. Its dashboard keeps showing each agent's status as before. Opening an agent's pane in the TUI (`Enter` on its card, or its number) counts as opening it, so it clears the same **Needs you** in `card list` and in the desktop app. From any shell on the machine, `dot-agent-deck card list` prints every card as JSON, with the same status, needs-you reasons and actions the app shows, and `dot-agent-deck card act` presses one action:
 
 ```sh
 dot-agent-deck card act --entry <key> --action <id> --token <token> --instance <instance_id>

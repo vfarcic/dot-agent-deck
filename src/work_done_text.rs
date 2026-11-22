@@ -272,17 +272,18 @@ pub fn unconfirmed(task_id: Option<&str>, terminal: bool) -> String {
 }
 
 /// The rest of a success line whose recipient is gone: the report was saved
-/// as a file, and where to read about it. Round 6's recovery screen does not
-/// ship yet, so this names no screen.
+/// as a file, and where to read about it: the CLI, and the interrupted work
+/// list the TUI and the desktop app show (PRD #1790 stage 2).
 fn saved_for_recovery(report_id: Option<&str>) -> String {
     let saved = match report_id {
         Some(id) => format!("the deck saved the report to a file, report {id}."),
         None => "the deck saved the report to a file.".to_string(),
     };
     format!(
-        "{saved} The TUI and the desktop app cannot show or list saved reports yet; \
-         `dot-agent-deck docs troubleshooting`, section \"Saved results and reports\", says \
-         where the file is."
+        "{saved} `dot-agent-deck interrupted list` can list a saved report with the work \
+         that sent it, and `dot-agent-deck interrupted show <id>` shows it; so does Interrupted work \
+         in the TUI and the desktop app. `dot-agent-deck docs troubleshooting`, section \
+         \"Saved results and reports\", says where the file is."
     )
 }
 
@@ -386,10 +387,11 @@ mod tests {
 
     #[test]
     fn recovered_reports_name_their_id_and_the_troubleshooting_section() {
-        let tail = "the deck saved the report to a file, report 0123abcd. The TUI and the \
-                    desktop app cannot show or list saved reports yet; `dot-agent-deck docs \
-                    troubleshooting`, section \"Saved results and reports\", says where the \
-                    file is.";
+        let tail = "the deck saved the report to a file, report 0123abcd. `dot-agent-deck \
+                    interrupted list` can list a saved report with the work that sent it, and \
+                    `dot-agent-deck interrupted show <id>` shows it; so does Interrupted work \
+                    in the TUI and the desktop app. `dot-agent-deck docs troubleshooting`, \
+                    section \"Saved results and reports\", says where the file is.";
         let cases = [
             (
                 WorkDoneDisposition::Accepted,
@@ -435,7 +437,9 @@ mod tests {
         reply.report_id = None;
         let line = cli_answer(&reply, Some("m-1"), false).stdout.unwrap();
         assert!(
-            line.contains("so the deck saved the report to a file. The TUI"),
+            line.contains(
+                "so the deck saved the report to a file. `dot-agent-deck interrupted list`"
+            ),
             "{line}"
         );
         assert!(!line.contains("Deck notices"), "{line}");
