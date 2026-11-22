@@ -34,6 +34,9 @@ export const PANE_AT_TOP = "The pane is already at the top.";
 export const PANE_AT_BOTTOM = "The pane is already at the bottom.";
 export const PANE_TERMINAL_HIDDEN = "The agent's terminal is not showing, so it was not scrolled. Switch back to its terminal first.";
 export const PANE_COVERED = "Something is open over the agent's pane, so it was not scrolled. Close it first.";
+/** The rows' own reports (`commands.toml`), said once the key has gone to the agent. */
+export const PANE_SCROLLING_UP = "Scrolling up.";
+export const PANE_SCROLLING_DOWN = "Scrolling down.";
 export const PANE_AGENT_GONE = "The agent in this pane is no longer shown, so nothing was scrolled.";
 
 /** Why a scroll key sent to the agent did not arrive, as the voice row says it. */

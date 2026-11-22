@@ -111,7 +111,7 @@ import { DEFAULT_VOICE_SETTINGS, isWorkUnderWay, modeScopedKey } from "./lib/bri
 import { READING_LABEL_MAX_CHARS, type ReadingAgent } from "./lib/reading";
 import { agentSpokenName } from "./lib/agentNames";
 import { questionAgentName } from "./lib/voiceQuestion";
-import { PANE_AGENT_GONE, PANE_COVERED, PANE_TERMINAL_HIDDEN, paneScrollFailed, scrollAgentPane } from "./lib/paneScroll";
+import { PAGE_UP, PANE_AGENT_GONE, PANE_COVERED, PANE_SCROLLING_DOWN, PANE_SCROLLING_UP, PANE_TERMINAL_HIDDEN, paneScrollFailed, scrollAgentPane } from "./lib/paneScroll";
 import { getTerminal } from "./lib/terminalRegistry";
 import { planStoredRoleOrder, reconcileRoleOrder } from "./lib/roleOrder";
 
@@ -1392,13 +1392,17 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
                voice's own scroll is not a hand edit of the prompt (Qodo on
                PR #2476). `dispatchLost` already held this to the pane the
                utterance was said over. */
-            /* A write that fails after the report went out replaces it with
-               why, rather than leaving "Scrolling up." standing over a pane
-               that did not move (Qodo on PR #2476). */
+            /* The write settles after the dispatch returns, so its sentence
+               goes through `reportPending`, called here inside the row's
+               `run`: the resolver's "Scrolling up." is not shown, and the
+               row then says the scroll happened or why it did not, unless a
+               newer utterance has reported since (Qodo on PR #2476). */
             const sendKey = (key: string) => {
-              void runtime.sendTerminalInput(target, key).catch((cause: unknown) => {
-                panelVoiceContext.current?.reportRefused?.(paneScrollFailed(cause));
-              });
+              const work = runtime.sendTerminalInput(target, key).then(() => undefined, (cause: unknown) => paneScrollFailed(cause));
+              const sentence = key === PAGE_UP ? PANE_SCROLLING_UP : PANE_SCROLLING_DOWN;
+              const reportPending = panelVoiceContext.current?.reportPending;
+              if (reportPending) reportPending(sentence, work, sentence);
+              else void work;
             };
             return scrollAgentPane(getTerminal(voicePane.deckId, voicePane.agentId, voicePane.incarnation), move, sendKey, voicePane.inputBlocked);
           } }
