@@ -4867,6 +4867,37 @@ mod tests {
         assert_eq!(one(&after, "p2/2").needs_you_reasons, ["question"]);
     }
 
+    /// Issue #2418 on top of #2454: a role whose `done` report was dealt with
+    /// stops counting in its orchestrator's roll-up, so the closed card above
+    /// it no longer says something under it needs the user, and a new report
+    /// counts again.
+    #[test]
+    fn a_dealt_with_report_leaves_its_starters_rollup() {
+        let catalog = resolve(None);
+        let store = CardStore::default();
+        store.publish("r1", "7", report(r#"{"status": "done"}"#));
+        let agents = [
+            with_status(role("6", "o1", "orch-a", "orchestrator", true), "Idle"),
+            with_status(role("7", "r1", "orch-a", "coder", false), "Idle"),
+        ];
+        let rollup = |store: &CardStore| {
+            let inner = store.lock();
+            let entries = project_all(&agents, &inner.slots, &catalog, &[], "i");
+            (
+                one(&entries, "r1/7").needs_you,
+                one(&entries, "o1/6")
+                    .rollup
+                    .expect("the role is under its orchestrator")
+                    .needs_you,
+            )
+        };
+        assert_eq!(rollup(&store), (true, 1));
+        assert!(store.mark_dealt_with("r1", "7", None));
+        assert_eq!(rollup(&store), (false, 0));
+        store.publish("r1", "7", report(r#"{"status": "done"}"#));
+        assert_eq!(rollup(&store), (true, 1));
+    }
+
     /// Issue #2454: the user opening the agent (`agent-opened`) clears its
     /// report's reason for the pane's current agent only, and the refresh it
     /// runs shows the change; a request naming another generation, or a pane

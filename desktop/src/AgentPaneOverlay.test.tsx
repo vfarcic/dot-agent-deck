@@ -5,7 +5,7 @@ import type { AgentTileProps } from "./components/AgentTile";
 import { OVERVIEW_CLOCK_TICK_MS } from "./components/AgentOverview";
 import { createFixtureFleet, createFixtureSnapshot, FIXTURE_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID } from "./data/fixture";
 import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, mapDesktopSnapshot, type DesktopAgentDto, type DesktopSettingsDto } from "./lib/bridge";
-import type { AgentTarget, DeckActionResult, DeckRuntimeState } from "./types";
+import type { AgentCardEntry, AgentTarget, DeckActionResult, DeckRuntimeState } from "./types";
 
 /**
  * Two spies, because the property PRD #1105 M3 needs is about BUILDS and the
@@ -348,6 +348,56 @@ describe("agent pane overlay", () => {
     expect(agentOpened).toHaveBeenCalledTimes(1);
     fireEvent.click(screen.getByRole("row", { name: "Open Plan / architecture agent" }));
     expect(agentOpened).toHaveBeenCalledTimes(2);
+  });
+
+  /**
+   * Scenario: switch the dashboard to Cards, where Planner's compact card
+   * needs you because it reported done, and press the card's name. The app
+   * opens Planner's pane and tells its daemon the user opened it, with the
+   * same deck, agent, pane and process as opening it from the table row does
+   * (issue #2418 on top of #2454), so the card's Needs you is dealt with the
+   * same way.
+   */
+  it("tells the agent's daemon it was opened when the user opens it from its card's name", () => {
+    const agentOpened = vi.fn(async () => undefined);
+    const initial = runtime({ agentOpened });
+    const snapshot = { ...initial.snapshot, agents: initial.snapshot.agents.map((agent) => ({ ...agent, incarnation: "process-a", paneId: `pane-${agent.id}` })) };
+    const planner = snapshot.agents.find((agent) => agent.id === "planner")!;
+    const card: AgentCardEntry = {
+      key: "pane-planner/planner",
+      instance_id: "process-a",
+      pane_id: "pane-planner",
+      agent_id: "planner",
+      agent_type: "claude_code",
+      name: planner.displayName ?? "Plan / architecture",
+      status: "idle",
+      needs_you: true,
+      needs_you_reasons: ["done"],
+      group: { id: "standalone", kind: "standalone", label: null },
+      relations: {},
+      report: { source: "agent", status: "done", summary: "Finished the plan", published_at: "2026-11-22T00:00:00Z", revision: 1 },
+      fields: [],
+      questions: [],
+      actions: [],
+      primary_action_id: "open",
+      facts: { source: "deck", pull_request: null },
+      revision: 1,
+      updated_at: "2026-11-22T00:00:00Z",
+    };
+    const shown = {
+      ...initial,
+      snapshot,
+      fleet: [snapshot],
+      agentCards: { [FIXTURE_DAEMON_ID]: { deckId: FIXTURE_DAEMON_ID, instanceId: "process-a", revision: 1, entries: [card], catalogErrors: [], tree: true } },
+    } as DeckRuntimeState;
+    render(<DeckShell runtime={shown} initialView={{ kind: "overview" }} />);
+    fireEvent.click(screen.getByRole("radio", { name: "Cards" }));
+    expect(agentOpened).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByTestId("agent-card-open-agent"));
+    expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
+    expect(agentOpened).toHaveBeenCalledTimes(1);
+    expect(agentOpened).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, "planner", "pane-planner", "process-a");
   });
 
   /**
