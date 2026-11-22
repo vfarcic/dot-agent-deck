@@ -862,6 +862,8 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     let telemetry = crate::telemetry::start_for_daemon(&event_tx, &pty_registry);
     // PRD #1666 S3: every inbox state change reaches attached clients.
     pty_registry.inbox().set_broadcast(event_tx.clone());
+    // Issue #1965: an orchestration role's exit reaches attached clients.
+    pty_registry.set_ended_role_broadcast(event_tx.clone());
     // PRD #2374: agent cards ring their doorbells on the same fan-out, and
     // offer "close, keeping the worktree" for agents with a dispatched one.
     pty_registry

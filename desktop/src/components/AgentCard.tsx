@@ -6,7 +6,8 @@ import { cardStatusClass, cardStatusLabel, disabledReasonSentence, exactTextSegm
 import { cardTone, issueLabels, referenceUrl, referenceView, rollupSegments, rollupSentence, type CardKind, type IssueLabelView } from "../lib/agentCardsTree";
 import { DISPLAY_LIMITS, displayIdentity, displayText, displayTitle, domIdentity } from "../lib/displayText";
 import { VOICE_ACTIONS, type AgentViewTarget, type VoiceActionContext } from "../lib/voiceActions";
-import type { AgentCardCheckedRef, AgentCardRollup } from "../types";
+import { endedRoleLine } from "../lib/endedRoles";
+import type { AgentCardCheckedRef, AgentCardRollup, EndedRole } from "../types";
 import { PullRequestBadge } from "./PullRequestBadge";
 
 /**
@@ -246,14 +247,22 @@ export interface CardPlace {
  * wrapper that keeps its click from reaching the card. The status line is a
  * button with no handler of its own, so the keyboard reaches the overlay too:
  * its click is the card's. No control is nested in another.
+ *
+ * Issue #1965: an exited orchestration role's card says why on its status
+ * line, after the daemon's status word, in the words its table row and the
+ * TUI's card use: `Exited: <reason>` and its last output. The line truncates
+ * like every other, so a report arriving never resizes the card; the overlay
+ * shows the reason and the last output in full.
  */
-export function AgentCard({ card, controls, results, place, openTarget }: {
+export function AgentCard({ card, controls, results, place, openTarget, ended }: {
   card: PlacedCard;
   controls: CardControls;
   results?: CardResults;
   place: CardPlace;
   /** What the name opens: the target the dashboard's table row opens for this agent (D12); without one, the card's own deck, agent and daemon process. */
   openTarget?: (card: PlacedCard) => AgentViewTarget;
+  /** Issue #1965 — the exited orchestration role this card is for, when its agent exited on its own. */
+  ended?: EndedRole;
 }) {
   const { entry } = card;
   const name = displayIdentity(entry.name, DISPLAY_LIMITS.name, entry.pane_id);
@@ -276,7 +285,8 @@ export function AgentCard({ card, controls, results, place, openTarget }: {
      never resizes a card or moves a root (issue #2418 review). A cut line's
      text is in its tooltip. References and labels that do not fit are not
      cut: a `+N` counts them, and the overlay lists them all. */
-  const metaTitle = `${place.kind} · ${statusText} — show ${name}'s card`;
+  const endedText = ended ? endedRoleLine(ended) : undefined;
+  const metaTitle = `${place.kind} · ${statusText}${endedText ? ` · ${endedText}` : ""} — show ${name}'s card`;
   return (
     <article
       className={`agent-card tone-${tone}${entry.needs_you ? " needs-you" : ""}${place.faded ? " is-faded" : ""}`}
@@ -330,9 +340,10 @@ export function AgentCard({ card, controls, results, place, openTarget }: {
       </header>
       {/* No handler of its own: its click (a press of Enter or Space included) is the card's, which opens the overlay.
           Its name starts with the kind and status it shows, so a screen reader announces them and a spoken label of what is visible matches it (round 2 review). */}
-      <button type="button" className="agent-card-meta" data-testid="agent-card-details" aria-label={`${place.kind} ${statusText}: show ${name}'s card`} title={displayTitle(metaTitle)}>
+      <button type="button" className="agent-card-meta" data-testid="agent-card-details" aria-label={`${place.kind} ${statusText}${endedText ? `, ${endedText}` : ""}: show ${name}'s card`} title={displayTitle(metaTitle)}>
         <span className="agent-card-kind" data-testid="agent-card-kind">{place.kind}</span>
         <span className={`status-label card-status ${cardStatusClass(entry.status)}`} data-testid="agent-card-status">{statusText}</span>
+        {ended && endedText && <span className="agent-card-ended" data-testid="agent-card-ended" title={displayTitle(ended.headline)}>{endedText}</span>}
       </button>
       {place.tree && (refs.length > 0
         ? <CardReferences card={card} refs={refs} name={name} controls={controls} />

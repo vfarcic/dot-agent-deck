@@ -92,6 +92,7 @@ pub mod composer_probe;
 pub mod embedded_pane;
 // PRD #1419 Decision 4: the user docs embedded at build time for `docs [topic]`.
 pub mod embedded_docs;
+pub mod ended_role;
 // Issue #1121: the endpoint I/O that `platform::paths`' pure resolvers must not
 // do — creating the owner-only fallback directory, and the connect side's
 // read-only probe of the pre-#1121 endpoint spelling.
@@ -214,6 +215,8 @@ pub mod remote_tunnel;
 pub mod repo_identity;
 pub mod report_recovery;
 pub mod retained_store;
+// Issue #2110: spacing between orchestration workers' agent starts.
+pub mod role_start_pacing;
 pub mod roles_cli;
 pub mod schedule_cli;
 // PRD #1885: a schedule's last fire, when it was refused as not approved.

@@ -1982,6 +1982,10 @@ struct PromptTurnOpen {
     session_id: String,
 }
 
+/// Issue #1965: how many announced exited roles [`AppState::pending_ended_roles`]
+/// holds for the render loop.
+pub const MAX_PENDING_ENDED_ROLES: usize = 64;
+
 #[derive(Debug, Default, Clone)]
 pub struct AppState {
     pub sessions: HashMap<String, SessionState>,
@@ -2333,6 +2337,11 @@ pub struct AppState {
     /// holding a queue of them would invite the unbounded growth
     /// `pending_orchestration_surfaces` needs a cap for.
     pub pending_worktree_kept: Option<crate::issue_dispatch_run::KeptWorktree>,
+    /// Issue #1965: orchestration roles whose agent exited, as the daemon
+    /// announced them (`BroadcastMsg::RoleEnded`), for the render loop to put
+    /// on their cards. Bounded at [`MAX_PENDING_ENDED_ROLES`]; the oldest goes
+    /// first when a burst outruns the render loop.
+    pub pending_ended_roles: Vec<(crate::ended_role::EndedRole, Incarnation)>,
     /// PRD #1401: how a pull request launch from the `o` key settled — the
     /// launch's number and the status-line message for it — waiting for the
     /// render loop. Filled by the thread that watches the browser
@@ -6790,6 +6799,36 @@ async fn dispatch_one_owned(
         // was admitted, its room reserved and its body saved above, so no
         // refusal of its content can follow.
         registry.inbox().supersede_delegates_to(&pane_id);
+        // Issue #2110: take this restart's turn, so a worker handed a task
+        // together with others starts its fresh agent at least a spacing after
+        // the previous paced one rather than in the same second. After the
+        // supersede above, so the tasks it retires end as superseded at once
+        // rather than lingering through the wait into an undelivered notice
+        // (`orchestration/delegate/025`). The `delegate` handler waits at most
+        // `DELEGATE_POST_WAIT` for this post and then replies anyway, so the
+        // wait can hold that reply for that long and no longer; past it, the
+        // wait holds back only this worker (and, through the pane's dispatch
+        // lock, a later delegate to the same pane).
+        // The generation being replaced keeps running while this restart is
+        // held back. A waiting episode it opened is about work just superseded,
+        // so it must not turn into a notice to the orchestrator meanwhile.
+        let paced = registry
+            .role_start_pacer()
+            .acquire(|| {
+                if let Some(old_agent) = registry.pane_current_agent_id(&pane_id) {
+                    registry.cancel_waiting_notice(&pane_id, &old_agent);
+                }
+            })
+            .await;
+        if !paced.wait().is_zero() {
+            tracing::info!(
+                role = %target_role,
+                pane_id = %pane_id,
+                waited_ms = u64::try_from(paced.wait().as_millis()).unwrap_or(u64::MAX),
+                "delegate: spacing the worker's restart after another worker's start"
+            );
+            paced.until_due().await;
+        }
         #[cfg(test)]
         gate_pass(&CLEAR_RESPAWN_GATES, &pane_id).await;
         match registry
@@ -6800,6 +6839,7 @@ async fn dispatch_one_owned(
                 agent_id: new_agent_id,
                 recreated,
             }) => {
+                paced.started();
                 if let Some(state) = state.as_ref() {
                     spawn_lift_replaced_quota_blocks(
                         state.clone(),
@@ -6873,6 +6913,9 @@ async fn dispatch_one_owned(
                 worker_agent_id = Some(new_agent_id);
             }
             Err(e) => {
+                // No agent started, so the next paced restart counts from the
+                // last one that did.
+                drop(paced);
                 if let (Some(state), Some(identity)) = (state.as_ref(), title_reservation.as_ref())
                 {
                     state
@@ -9729,6 +9772,22 @@ impl AppState {
     /// field's docs.
     pub fn queue_worktree_kept(&mut self, kept: crate::issue_dispatch_run::KeptWorktree) {
         self.pending_worktree_kept = Some(kept);
+    }
+
+    /// Issue #1965: record an orchestration role whose agent exited, as the
+    /// daemon process `from` reported it, for the render loop to put on its
+    /// card.
+    pub fn queue_ended_role(&mut self, role: crate::ended_role::EndedRole, from: Incarnation) {
+        if self.pending_ended_roles.len() >= MAX_PENDING_ENDED_ROLES {
+            self.pending_ended_roles.remove(0);
+        }
+        self.pending_ended_roles.push((role, from));
+    }
+
+    /// Issue #1965: the exited roles queued since the last call, oldest first,
+    /// each with the daemon process that reported it.
+    pub fn take_ended_roles(&mut self) -> Vec<(crate::ended_role::EndedRole, Incarnation)> {
+        std::mem::take(&mut self.pending_ended_roles)
     }
 
     /// PRD #1401: record how pull request launch `launch` settled, for the
@@ -20515,6 +20574,150 @@ mod tests {
                 .any(|m| m.subject == "task refused"),
             "the orchestrator was told its task was refused"
         );
+        registry.shutdown_all();
+    }
+
+    /// Scenario (issue #2110, PR #2459 review): the orchestrator hands tasks to
+    /// two `clear = true` workers one after the other. The first worker's old
+    /// agent ignores SIGTERM and SIGHUP and reads no input, so stopping it takes the whole
+    /// termination grace;
+    /// the second's stops at once. The two fresh agents are still spawned at
+    /// least the configured spacing apart, and both tasks are posted.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn role_start_pacing_005_fresh_workers_spawn_a_spacing_apart_despite_a_slow_teardown() {
+        let spacing = crate::role_start_pacing::role_start_spacing();
+        if spacing.is_zero() {
+            eprintln!(
+                "SKIP: {} turns the spacing off in this environment",
+                crate::role_start_pacing::DOT_AGENT_DECK_ROLE_START_SPACING_MS
+            );
+            return;
+        }
+        let dir = clear_role_dir();
+        let cwd = dir.path().to_str().unwrap().to_string();
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let orch = stand_in_in(&registry, "p2110-orch", Some(&cwd));
+        let (slow, fast) = ("p2110-slow", "p2110-fast");
+        // A script run as the pane's own child, so no shell without the trap
+        // sits between the signal and the stand-in (`delegate/034`'s shape).
+        let script = dir.path().join("p2110-unkillable.sh");
+        crate::test_isolation::write_script(
+            &script,
+            "#!/bin/sh\ntrap '' TERM HUP\nprintf P2110-ARMED\nexec sleep 3600\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let slow_agent = registry
+            .spawn_agent(crate::agent_pty::SpawnOptions {
+                command: script.to_str(),
+                cwd: Some(&cwd),
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                    slow.to_string(),
+                )]),
+                ..crate::agent_pty::SpawnOptions::default()
+            })
+            .expect("spawn the SIGTERM-ignoring stand-in");
+        // The marker is printed after the trap, so a SIGTERM sent once it shows
+        // cannot reach a shell that has not installed it yet (issue #709).
+        let armed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let screen = registry.snapshot(&slow_agent).unwrap_or_default();
+                if screen.windows(11).any(|w| w == b"P2110-ARMED") {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        });
+        armed.await.expect("the slow stand-in installs its trap");
+        let fast_old = stand_in_in(&registry, fast, Some(&cwd));
+        // The fast worker's old agent has a waiting episode open, as a worker
+        // sitting at a prompt would (Qodo, PR #2459): a notice about it must not
+        // fire for work its paced restart has already superseded.
+        let episode = registry
+            .arm_waiting_notice(fast, &fast_old, std::time::Duration::from_secs(60), false)
+            .expect("an episode opens for the fast worker's old agent")
+            .seq;
+
+        // The slow worker takes the first turn and is held at the gate just
+        // before its restart, so the fast one asks for its turn while the
+        // slow one holds it.
+        let (reached_tx, reached) = tokio::sync::oneshot::channel();
+        let (go, go_rx) = tokio::sync::oneshot::channel();
+        CLEAR_RESPAWN_GATES
+            .lock()
+            .unwrap()
+            .push((slow.to_string(), reached_tx, go_rx));
+        let dispatch = |worker: &str| {
+            tokio::spawn(dispatch_clear_task(
+                registry.clone(),
+                "p2110-orch".into(),
+                orch.clone(),
+                worker.to_string(),
+                format!("the task for {worker}"),
+                cwd.clone(),
+            ))
+        };
+        let slow_dispatch = dispatch(slow);
+        tokio::time::timeout(spacing * 4, reached)
+            .await
+            .expect("the slow worker reaches its restart")
+            .unwrap();
+        let fast_dispatch = dispatch(fast);
+        go.send(()).unwrap();
+        // The fast worker is in its paced wait once the slow one has its fresh
+        // agent, and keeps its old agent until the wait is over.
+        tokio::time::timeout(spacing * 4, async {
+            while registry.pane_current_agent_id(slow).as_deref() == Some(slow_agent.as_str()) {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the slow worker gets its fresh agent");
+        assert_eq!(
+            registry.pane_current_agent_id(fast).as_deref(),
+            Some(fast_old.as_str()),
+            "precondition: the fast worker is still waiting for its slot"
+        );
+        assert!(
+            !registry.waiting_notice_is_current(fast, episode),
+            "the old agent's waiting episode must be closed while its restart waits"
+        );
+        let mut posted = Vec::new();
+        for task in [slow_dispatch, fast_dispatch] {
+            posted.push(
+                tokio::time::timeout(spacing * 6, task)
+                    .await
+                    .expect("both restarts finish")
+                    .unwrap(),
+            );
+        }
+
+        let spawned_at = |pane: &str| {
+            let agent = registry
+                .pane_current_agent_id(pane)
+                .expect("the pane has a fresh agent");
+            registry
+                .agent_record_any(&agent)
+                .and_then(|record| record.spawned_at_ms)
+                .expect("the fresh agent records when it spawned")
+        };
+        let gap_ms = (spawned_at(fast) - spawned_at(slow)).unsigned_abs();
+        // `spawned_at_ms` is wall-clock milliseconds, and the pacer measures on
+        // the monotonic clock, so allow a few milliseconds between the two.
+        assert!(
+            u128::from(gap_ms) + 20 >= spacing.as_millis(),
+            "the fresh agents spawned {gap_ms} ms apart; the spacing is {spacing:?}"
+        );
+        for (worker, id) in [slow, fast].iter().zip(&posted) {
+            assert_eq!(
+                listed_state(&registry, worker, id),
+                Some(crate::inbox::StateName::Queued),
+                "the task for {worker} is posted to its replacement"
+            );
+        }
         registry.shutdown_all();
     }
 

@@ -1666,6 +1666,22 @@ button.deck-attention-name { text-decoration: underline; text-underline-offset: 
 .overview-row:first-child { border-top: 0; }
 .overview-row:hover { background: var(--paper); }
 .overview-row[data-status="failed"] { background: var(--red-soft); }
+/* Issue #1965: an orchestration role whose agent exited. One cell across every
+   column, whichever are on screen: it has no agent to fill them with. */
+.overview-row-ended .overview-ended-cell { grid-column: 1 / -1; min-width: 0; display: grid; gap: 4px; }
+.overview-ended-head { min-width: 0; display: flex; align-items: baseline; gap: 8px; }
+.overview-ended-name { flex: 0 0 auto; font-size: var(--text-base); font-weight: 680; }
+.overview-ended-reason { min-width: 0; overflow: hidden; color: var(--red-ink); font-size: var(--text-base); text-overflow: ellipsis; white-space: nowrap; }
+.overview-ended-output { min-width: 0; display: grid; gap: 2px; }
+.overview-ended-output-label { color: var(--muted); font-size: var(--text-xs); }
+.overview-ended-output pre { margin: 0; overflow-x: auto; color: var(--ink); font-family: "JetBrains Mono", monospace; font-size: var(--text-xs); white-space: pre; }
+/* Issue #1965 on the compact card (issue #2418): the reason sits on the card's
+   one-line status line, which truncates it; the overlay shows it in full. */
+.agent-card-ended { color: var(--red-ink); }
+.agent-card-ended-full { display: grid; gap: 2px; min-width: 0; }
+.agent-card-ended-reason { margin: 0; color: var(--red-ink); font-size: var(--text-base); }
+.agent-card-ended-label { color: var(--muted); font-size: var(--text-xs); }
+.agent-card-ended-full pre { margin: 0; overflow-x: auto; color: var(--ink); font-family: "JetBrains Mono", monospace; font-size: var(--text-xs); white-space: pre; }
 /* The status cell carries BOTH the mark and the word, because they render the
    same field and two columns for one datum is what the column picker made
    absurd (PRD #745 M12). The mark needs to be a block for its 8px box to apply

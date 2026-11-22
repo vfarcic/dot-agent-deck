@@ -6,7 +6,8 @@ import { actionLabel, cardStatusClass, cardStatusLabel, deliverySentence, format
 import { DISPLAY_LIMITS, displayIdentity, displayText, displayTitle, domIdentity } from "../lib/displayText";
 import { agentTypeText, issueLabels, referenceDetail, referenceView } from "../lib/agentCardsTree";
 import { VOICE_ACTIONS, type VoiceActionContext } from "../lib/voiceActions";
-import type { AgentCardAction, AgentCardCheckedRef } from "../types";
+import { ENDED_ROLE_WORDS } from "../lib/endedRoles";
+import type { AgentCardAction, AgentCardCheckedRef, EndedRole } from "../types";
 import { CardReference, cardRef, ExactText, ExactTextNote, IssueLabelChip, SourceBadge, type ReferenceControls } from "./AgentCard";
 
 /** The members the overlay's controls dispatch through. */
@@ -28,7 +29,7 @@ export type CardOverlayControls = Pick<VoiceActionContext, "showAgentCard" | "st
  * `card` is `undefined` once the agent it showed is gone: the overlay says so
  * and keeps its navigation, so the next card is one key away.
  */
-export function AgentCardOverlay({ card, lastName, position, count, step, results, tree, notice, controls }: {
+export function AgentCardOverlay({ card, lastName, position, count, step, results, tree, notice, controls, ended }: {
   card: PlacedCard | undefined;
   /** The name of the card that was open, for the closed notice. */
   lastName: string;
@@ -42,6 +43,8 @@ export function AgentCardOverlay({ card, lastName, position, count, step, result
   /** Why the last thing pressed did not happen (issue #2418 review, F2): said here, since the overlay covers the dashboard's banner. */
   notice?: string;
   controls: CardOverlayControls;
+  /** Issue #1965 — the exited orchestration role this card is for: the overlay says why and shows its last output in full. */
+  ended?: EndedRole;
 }) {
   const ref = useInertBackground<HTMLElement>(true, OVERLAY_LAYER.dialog, () => { controls.closeAgentCard(); });
   const [reply, setReply] = useState("");
@@ -189,6 +192,18 @@ export function AgentCardOverlay({ card, lastName, position, count, step, result
 
         {entry && card && (
           <div className="agent-card-overlay-body">
+            {ended && (
+              <section className="agent-card-section agent-card-ended-full" aria-label="Why this role exited" data-testid="agent-card-overlay-ended" title={displayTitle(ended.headline)}>
+                <h3>{ENDED_ROLE_WORDS.status} <SourceBadge source="deck" /></h3>
+                <p className="agent-card-ended-reason">{displayText(ended.reason, DISPLAY_LIMITS.title)}</p>
+                {ended.lastOutput.length > 0 && (
+                  <>
+                    <span className="agent-card-ended-label">{ENDED_ROLE_WORDS.lastOutput}:</span>
+                    <pre>{ended.lastOutput.map((line) => displayText(line, DISPLAY_LIMITS.title)).join("\n")}</pre>
+                  </>
+                )}
+              </section>
+            )}
             {entry.report
               ? (
                 <section className="agent-card-section" aria-label="What the agent reported">
