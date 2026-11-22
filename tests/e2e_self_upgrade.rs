@@ -258,9 +258,9 @@ fn tui_upgrade_003_periodic_recheck_notices_a_new_release() {
 }
 
 /// Scenario: Start the TUI with the six-hour re-check interval, a focus re-check floor of zero, and a fake release server whose newest release is the version the TUI runs, so no badge shows; then publish a newer release and have the terminal report focus-in, as it does when the user comes back to the window after the laptop slept. The badge appears without waiting for the interval.
-#[spec("upgrade/tui-upgrade/004")]
+#[spec("upgrade/tui-upgrade/005")]
 #[test]
-fn tui_upgrade_004_focus_in_rechecks_for_a_new_release() {
+fn tui_upgrade_005_focus_in_rechecks_for_a_new_release() {
     let version = RELEASE;
     let (asset, manifest) = release(true);
     let server = FakeReleases::start(OLD_VERSION, asset, manifest);
