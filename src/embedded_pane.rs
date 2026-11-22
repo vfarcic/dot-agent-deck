@@ -2716,6 +2716,45 @@ impl EmbeddedPaneController {
         }
     }
 
+    /// Issue #1965: the orchestration roles whose agent exited, as the daemon
+    /// `learned_from` names lists them (`ListAgents`' `ended_roles`). Empty
+    /// when the listing fails, times out, comes from another daemon process,
+    /// or comes from a daemon that does not report them: a role with nothing
+    /// here keeps the plain `No agent` card it had before.
+    pub fn ended_roles(
+        &self,
+        learned_from: &crate::daemon_client::Incarnation,
+    ) -> Vec<crate::ended_role::EndedRole> {
+        // Unbound, as `hydrate_from_daemon`'s listing is: the answer is checked
+        // against `learned_from` below instead, so a listing from another
+        // daemon process is read as reporting nothing.
+        let list_client = self.client.clone();
+        match self.runtime.block_on(async move {
+            tokio::time::timeout(HYDRATE_LIST_TIMEOUT, list_client.list_agents_detailed()).await
+        }) {
+            Ok(Ok(listing)) => {
+                let same_process = learned_from.is_unnamed()
+                    || listing
+                        .incarnation
+                        .as_ref()
+                        .is_some_and(|answered| answered.same_process(learned_from));
+                if same_process {
+                    listing.ended_roles
+                } else {
+                    Vec::new()
+                }
+            }
+            Ok(Err(e)) => {
+                tracing::debug!(error = %e, "ended_roles: list_agents failed");
+                Vec::new()
+            }
+            Err(_) => {
+                tracing::debug!("ended_roles: list_agents timed out");
+                Vec::new()
+            }
+        }
+    }
+
     pub fn hydrate_pane(&self, card: &BoundPane) -> bool {
         let pane_id = card.pane_id.as_str();
         if self.panes.lock().unwrap().contains_key(pane_id) {

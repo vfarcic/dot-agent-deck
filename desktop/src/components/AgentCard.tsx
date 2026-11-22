@@ -1,3 +1,5 @@
+import type { EndedRole } from "../types";
+import { ENDED_ROLE_WORDS } from "../lib/endedRoles";
 import { BellRing } from "lucide-react";
 
 import { actionLabel, cardStatusLabel, deliverySentence, disabledReasonSentence, exactTextSegments, exactTextString, hasMarkers, MARKER_CLOSE, MARKER_OPEN, markerTitle, resultSentence, type CardResults, fieldValueText, needsYouSentence, placedCardKey, primaryAction, primaryNeedsReview, promptPreview, type PlacedCard } from "../lib/agentCards";
@@ -55,7 +57,7 @@ export function ExactTextNote({ text }: { text: string }) {
  * entry as received; nothing here decides status, needs-you or which action
  * is primary.
  */
-export function AgentCard({ card, controls, results }: { card: PlacedCard; controls: CardControls; results?: CardResults }) {
+export function AgentCard({ card, controls, results, ended }: { card: PlacedCard; controls: CardControls; results?: CardResults; ended?: EndedRole }) {
   const { entry } = card;
   const name = displayIdentity(entry.name, DISPLAY_LIMITS.name, entry.pane_id);
   const primary = primaryAction(entry);
@@ -83,6 +85,18 @@ export function AgentCard({ card, controls, results }: { card: PlacedCard; contr
         <span className={`status-label card-status status-${domIdentity(entry.status)}`} title="Status checked by the deck">{cardStatusLabel(entry.status)}</span>
         {entry.needs_you && <span className="agent-card-needs-you" data-testid="agent-card-needs-you" title={needsYou}><BellRing size={11} aria-hidden="true" />Needs you</span>}
       </header>
+      {/* Issue #1965: an exited orchestration role says why, in the words its table row and the TUI's card use. */}
+      {ended && (
+        <div className="agent-card-ended" data-testid="agent-card-ended" title={displayText(ended.headline, DISPLAY_LIMITS.title)}>
+          <p className="agent-card-ended-reason">{ENDED_ROLE_WORDS.status}: {displayText(ended.reason, DISPLAY_LIMITS.title)}</p>
+          {ended.lastOutput.length > 0 && (
+            <>
+              <span className="agent-card-ended-label">{ENDED_ROLE_WORDS.lastOutput}:</span>
+              <pre>{ended.lastOutput.map((line) => displayText(line, DISPLAY_LIMITS.title)).join("\n")}</pre>
+            </>
+          )}
+        </div>
+      )}
       {summary && <p className="agent-card-summary"><SourceBadge source="agent" /> <span>{summary}</span></p>}
       {entry.report === null && <p className="agent-card-summary is-empty">No report from this agent yet.</p>}
       {fields.length > 0 && <SourceBadgeRow />}

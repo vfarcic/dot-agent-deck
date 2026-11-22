@@ -209,6 +209,17 @@ const ALLOWED_ROOT_MODULES: &[&str] = &[
     // file, names no FORBIDDEN_SYMBOL or project-state literal, and contains no
     // `std::env::current_dir` — all zero for it.
     "deck_list",
+    // Issue #1965, argued rather than added quietly. The desktop names
+    // `EndedRole`, the wire record of an orchestration role whose agent exited
+    // (`ListAgents`' `ended_roles` and the `role_ended` broadcast), and its
+    // `reason` / `headline`, the words both clients show for it (CLAUDE.md rule
+    // 22). A desktop-side copy would be a second definition of the record and
+    // a second list of its words, the drift `tests/fixtures/ended-role.json`
+    // exists to catch. Checked against this rule's lines: the module is a serde
+    // type, its words and a sanitiser; it reads no file, resolves no project,
+    // names no FORBIDDEN_SYMBOL or project-state literal, and contains no
+    // `std::env::current_dir` — all zero for it.
+    "ended_role",
     "event",
     // Issue #1198, argued rather than added quietly. The desktop names two
     // things here: the six `show_desktop_*` wrappers, one per surface the

@@ -6258,6 +6258,16 @@ without depending on the config struct API.
 - **Does not assert:** the locked behaviour itself (`orchestration/lock/008`); that the focus steering is gated too (no automatic focus movement is asserted here).
 - **Platform coverage:** mac+linux.
 
+#### orchestration/ended-role
+
+##### orchestration/ended-role/001 — A role whose command dies at spawn says which role exited and why on its card, and selecting the card keeps it (issue #1965).
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_ended_role.rs`; the REAL `dot-agent-deck` binary through the vt100 `TuiDeck` harness with its lazy daemon). Synthetic stand-ins.
+- **Agent:** none. The `ended-role-at-spawn` fixture's orchestrator is `cat`; its `reviewer` is `sh -c 'echo ended-role-sentinel-1965; exit 7'`, which prints a uniquely named sentinel line and exits at once, as a launcher that fails to load the agent does.
+- **Asserts:** after opening the orchestration through the `Ctrl+n` form, the reviewer's card names the role, reads `Exited`, says `its command exited (code 7)` and shows the sentinel under `Last output:`, and is not titled `pane-__dead`; pressing its number in command mode puts `reviewer exited: its command exited (code 7)` on the status line and keeps the card (no `Removed stale agent`). On a failure it prints the daemon's `ListAgents` `ended_roles`, which separates a daemon that never recorded the exit from a TUI that never showed it.
+- **Why it exists:** a role that died at spawn left a `No agent` card (`pane-__dead` when it was rebuilt as a dead slot) that selecting deleted as stale, with no word of which role died or why. Red before the fix: the card read `No agent · reviewer` for the whole wait while the daemon already listed the exit, because the role's pane keeps its attach open and nothing told the TUI the agent was gone; the daemon's `role_ended` broadcast is what closes it.
+- **Does not assert:** the dead-slot shape a reconnect or a daemon-started (dispatched) orchestration produces, which the L1 tests `the_card_grid_draws_a_reported_dead_slot_as_its_exited_role` and `enter_on_an_exited_role_keeps_its_card_and_says_why` in `src/ui.rs` cover; the desktop's row for the same role (`desktop/src/components/AgentOverview.test.tsx`); a real agent.
+- **Platform coverage:** mac+linux (unix-only PTY/UDS, `sh` stand-in role).
+
 #### orchestration/focus
 
 ##### orchestration/focus/001 — Auto-focus follows the lowest-order `WaitingForInput` role pane on the active tab, and never touches another tab.

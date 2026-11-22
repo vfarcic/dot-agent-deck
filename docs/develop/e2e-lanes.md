@@ -213,6 +213,33 @@ Retention targets ten archived runs per test, pruning eligible runs oldest first
 
 For Claude sessions in the effective child HOME (including a builder override beneath the harness temporary root), `provenance.json` includes `claude_sessions`: each entry records `permissionMode` (the latest mode observed in that session's transcript), `permission_modes` (distinct observed modes in order), `version`, `model` (latest observed) and `models` (distinct observed models). The source is the isolated `.claude/projects/**/*.jsonl` session records, rather than the requested mode/model in settings or command-line arguments. On Unix the collector traverses from the sandbox root with directory-relative, no-follow opens for intermediate components and leaf files; it reads from those opened descriptors instead of reopening checked paths. Missing observations remain `null` or an empty array; they do not establish a default mode. Successful Claude runs retain this provenance even without cast recording. The walk considers up to 4,096 entries through six subdirectory levels and keeps the newest 256 transcripts encountered (relative path breaks timestamp ties). Collection reads at most a 1 MiB tail per file and 16 MiB total, stopping at each file's length snapshot even if it grows. Records exceeding 64 KiB are skipped without retaining their full contents. Shortened transcripts and skipped oversized records set `truncated`; I/O errors also set `read_error`. `collection_truncated` marks file, traversal or aggregate-budget omissions on the returned observations. Mode history covers the collected suffix. It copies metadata, not the transcript's prompts or tool content, and the provenance passes through the same registered-value redactor as the other artifacts.
 
+### Claude Code's permission mode in lane 2
+
+**`tests/e2e_inbox_claude_live.rs` pins Claude Code's permission mode on the command line (`--permission-mode default`)** (issue #1815), for the tests that start Claude Code through its `claude_command()`; the ones that go through `tests/support/claude_installed.rs` run that file's own command, which passes no mode. The harness imports the host's `~/.claude/settings.json` with its hooks stripped, and that file can set `permissions.defaultMode: "auto"`; the command-line flag wins over it, so a developer's own default no longer decides what mode the file's tests run in. Measured on Claude Code 2.1.330: with `permissions.defaultMode: "auto"` in settings, `--permission-mode default` starts the session in `default`.
+
+**Auto mode is model-gated, and the pinned model cannot run it.** On Claude Code 2.1.330, `claude-haiku-4-5-20251001` (the model the live inbox tests pin) starts in `permissionMode: default` when asked for `auto`, whether by `--permission-mode auto` or by `permissions.defaultMode` in settings, and `claude -p` printed no warning. `claude-haiku-5-5` (what the `haiku` alias resolved to), `claude-sonnet-5-5` and `claude-sonnet-4-6` start in `auto`. So a host default of auto could not take effect on that model on 2.1.330, the other live Claude tests that pin it included, which is why the issue's earlier attempts could not activate it again. Read the effective mode from `provenance.json`'s `claude_sessions` (above), never from the flag a run passed.
+
+**Auto mode is measured on demand, not covered by default.** Three environment variables, read by the test process, change the command `claude_command()` builds:
+
+| Variable | Values | Effect |
+| --- | --- | --- |
+| `DAD_E2E_CLAUDE_MODEL` | a model id or alias (letters, digits, `-`, `.`) | replaces `claude-haiku-4-5-20251001` |
+| `DAD_E2E_CLAUDE_PERMISSION_MODE` | `default` (the default) or `auto` | the `--permission-mode` passed |
+| `DAD_E2E_CLAUDE_ALLOWED_TOOLS` | unset, or `none` | `none` drops `--allowedTools Bash Read Write`, so in auto mode Claude Code's own permission handling decides whether the task's Bash call runs; in `default` mode that call would wait on a prompt |
+
+For example: `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1 DAD_E2E_CLAUDE_MODEL=claude-haiku-5-5 DAD_E2E_CLAUDE_PERMISSION_MODE=auto DAD_E2E_CLAUDE_ALLOWED_TOOLS=none cargo test-e2e-live -E 'test(/^claude_01[12]_live_/)' --retries 0`. Rerun that when a Claude Code release changes auto mode, or when the deck changes how a message is framed for Claude Code.
+
+**The measurement (2026-11-21, Claude Code 2.1.330, `--retries 0`, `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1`)**: `claude_011_live_idle_native_wake` (idle wake) and `claude_012_live_busy_fold_at_stop` (busy, handed over at turn end) run together, one pair per round. A trial counts as complied when the test passed, which needs the agent to have run the task's Bash append and the message to be acknowledged once. The mode column is what each session's transcript recorded.
+
+| Model | Recorded mode | `--allowedTools` | Idle | Busy |
+| --- | --- | --- | --- | --- |
+| `claude-haiku-5-5` | `auto` | passed | 10/10 | 10/10 |
+| `claude-haiku-5-5` | `auto` | dropped | 10/10 | 10/10 |
+| `claude-haiku-5-5` | `default` | passed | 10/10 | 10/10 |
+| `claude-haiku-4-5-20251001` | `default` | passed | 5/5 | 5/5 |
+
+No refusal was seen in 70 trials, 40 of them with auto mode recorded as active. That bounds the rate; it does not prove the rate is zero, and it says nothing about the 2.1.308 refusal that opened the issue, whose mode was never established. So the fixture pins `default` rather than covering both modes: the pinned model cannot run auto, a second model doubles the file's cost for a difference the measurement did not find, and the lane is more useful when a red cannot come from the host's settings.
+
 ## Where a rendered credential can go, and what stops it
 
 Lane 2 hands a real credential to a process that draws a terminal, and everything that terminal draws is captured somewhere. The #785 audit walked those sinks; one was open, and the fixes below close it and its two neighbours.
