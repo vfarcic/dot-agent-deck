@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { openOverview } from "./support/overview";
+import { openOverview, ROW_EDGE } from "./support/overview";
 
 /**
  * The narrow-window trap, in the one engine pair that evaluates media queries.
@@ -27,7 +27,7 @@ test.describe("agent pane overlay at 400x780 phone", () => {
    */
   test("keeps the terminal and the tab strip the tile's phone rules hide", async ({ page }) => {
     await openOverview(page, "connected");
-    await page.getByRole("button", { name: "Open Plan / architecture agent" }).click();
+    await page.getByRole("row", { name: "Open Plan / architecture agent" }).click({ position: ROW_EDGE });
 
     const overlay = page.getByTestId("agent-pane-overlay");
     await expect(overlay).toBeVisible();
