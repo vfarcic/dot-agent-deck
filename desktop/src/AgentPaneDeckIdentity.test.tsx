@@ -127,7 +127,7 @@ function harness(
 }
 
 /** The overview's open control for one agent, named as the row renders it. */
-const openControl = (name: string) => screen.getByRole("button", { name: `Open ${name} agent` });
+const openControl = (name: string) => screen.getByRole("row", { name: `Open ${name} agent` });
 
 /**
  * PRD #1105 — the pane names a daemon as well as an agent, and everything it
@@ -500,7 +500,7 @@ describe("agent pane identity fence", () => {
       (agent) => agent.id === "planner" ? { ...agent, status: "running", writeLease: "write" } : agent,
     );
     render(<DeckShell runtime={deck.runtime("local")} initialView={{ kind: "deck" }} />);
-    fireEvent.click(openControl("Plan / architecture"));
+    fireEvent.click(screen.getByRole("button", { name: "Open Plan / architecture agent" }));
     const pane = screen.getByTestId("agent-pane-overlay");
     fireEvent.click(screen.getByTestId("voice-trigger"));
     const stop = await screen.findByRole("button", { name: "Stop typing" });

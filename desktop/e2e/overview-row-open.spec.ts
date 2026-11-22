@@ -13,18 +13,19 @@ import { openOverview, showAllColumns } from "./support/overview";
  * across a prompt still reaches the row as a `click` (so the guard is doing
  * something rather than never being reached), and whether the selection is
  * still non-collapsed at that moment. The hover is the third, because jsdom has
- * no pointer and never matches `:hover`.
+ * no pointer and never matches `:hover`; the focus ring a keyboard user sees on
+ * the row is the fourth.
  */
 
-/** The row carrying one agent's open control, found by that control's name. */
+/** One agent's row, found by its accessible name (issue #2454: the row is the open route). */
 function rowFor(page: Page, displayName: string): Locator {
-  return page.locator(".overview-row").filter({ has: page.getByRole("button", { name: `Open ${displayName} agent`, exact: true }) });
+  return page.getByRole("row", { name: `Open ${displayName} agent`, exact: true });
 }
 
 test.describe("overview row opens the agent pane", () => {
   /**
    * Scenario: open the overview and click the Planner row's status word, away
-   * from its open control. That agent's pane opens over the overview, which
+   * from its Close control. That agent's pane opens over the overview, which
    * stays mounted and terminal-free below it.
    */
   test("a click on a row's text opens that agent's pane", async ({ page }) => {
@@ -87,33 +88,31 @@ test.describe("overview row opens the agent pane", () => {
 
   /**
    * Scenario: point at a failed agent's row, whose red background hides the
-   * ordinary row hover. The row shows a pointer, and hovering its text lights
-   * the open control exactly as hovering the control itself does.
+   * ordinary row hover, then reach the same row from the keyboard. The row and
+   * its text show a pointer, and with keyboard focus the row draws a focus ring
+   * over its red background (issue #2454: the row is the keyboard route, so it
+   * has to show where focus is).
    */
-  test("a row reads as clickable, including a failed one", async ({ page }) => {
+  test("a row reads as clickable and focusable, including a failed one", async ({ page }) => {
     await openOverview(page, "crowded");
 
     const row = rowFor(page, "release");
     await expect(row).toHaveAttribute("data-status", "failed");
     const status = row.locator(".overview-state .status-label");
-    const open = row.getByRole("button", { name: "Open release agent", exact: true });
-    const look = () => open.evaluate((node) => {
+    const ring = () => row.evaluate((node) => {
       const style = getComputedStyle(node);
-      return `${style.color} | ${style.backgroundColor} | ${style.borderTopColor}`;
+      return `${style.outlineStyle} ${style.outlineWidth}`;
     });
 
     expect(await row.evaluate((node) => getComputedStyle(node).cursor)).toBe("pointer");
     expect(await status.evaluate((node) => getComputedStyle(node).cursor)).toBe("pointer");
 
-    await page.mouse.move(0, 0);
-    const resting = await look();
-    await open.hover();
-    const underPointer = await look();
-    expect(underPointer).not.toBe(resting);
-
-    await page.mouse.move(0, 0);
-    await expect.poll(look).toBe(resting);
-    await status.hover();
-    await expect.poll(look).toBe(underPointer);
+    const resting = await ring();
+    await row.focus();
+    await page.keyboard.press("Tab");
+    await page.keyboard.press("Shift+Tab");
+    await expect(row).toBeFocused();
+    await expect.poll(ring).not.toBe(resting);
+    expect(await ring()).toMatch(/^solid /);
   });
 });

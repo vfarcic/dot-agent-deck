@@ -108,7 +108,7 @@ Instead of writing the file yourself, you can ask an agent that is already runni
 1. Start an agent on the project directory with **Mode** left on **No mode**: `Ctrl+n` in the TUI, **New agent** in the desktop app ([Desktop app → New agent](desktop/new-agent.md)).
 2. Ask that agent to generate the config:
    - **TUI:** press `Ctrl+d` to enter command mode, select the agent's card and press `g`, or click **Generate** in the footer.
-   - **Desktop:** press the **Generate config** button on the agent's row on the Dashboard (`Generate config with <name>`), or **Generate config** in the header of the agent's pane. With voice on, say **"generate config with"** and the agent's name on the Dashboard, or **"generate config"** in its pane ([Voice Control → Generating a config](desktop/voice.md#generating-a-config)).
+   - **Desktop:** open the agent's pane from the Dashboard and press **Generate config** in its header. With voice on, say **"generate config with"** and the agent's name on the Dashboard, or **"generate config"** in its pane ([Voice Control → Generating a config](desktop/voice.md#generating-a-config)).
 
    A dialog titled **Generate .dot-agent-deck.toml** asks whether to instruct your agent to analyse the project and create one.
 
@@ -485,7 +485,7 @@ A role "reaches no worker" when it is not in the file, when it is the orchestrat
 
 | Outcome | Exit status | Printed |
 |---|---|---|
-| The task's report was taken | 0 | `Reported task <id> to the orchestrator.`, or, when the orchestrator is no longer running, that the deck saved the report to a file, with the report's id. The TUI and the desktop app cannot show or list saved reports yet; [Saved results and reports](troubleshooting.md#saved-results-and-reports) says where the file is |
+| The task's report was taken | 0 | `Reported task <id> to the orchestrator.`, or, when the orchestrator is no longer running, that the deck saved the report to a file, with the report's id. The report is listed with the worker's work in [Interrupted Work](interrupted-work.md), in the TUI, the desktop app and `dot-agent-deck interrupted list`; [Saved results and reports](troubleshooting.md#saved-results-and-reports) says where the file is |
 | The same report was already taken | 0 | `Task <id> was already reported; nothing new was sent.` |
 | A different report for a task already reported | non-zero | `Task <id> was already reported; this different report was NOT delivered. …` |
 | No `--task-id` | 0 | `Sent to the orchestrator as a note that completes no task. …` |

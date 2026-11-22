@@ -53,6 +53,11 @@ title = "Closing Agents"
 description = "Close dispatched units, one agent or a whole orchestration with dot-agent-deck close, from a shell or a dispatcher agent: what is refused, what happens to worktrees, and the TUI and desktop equivalents."
 
 [[page]]
+slug = "interrupted-work"
+title = "Interrupted Work"
+description = "What a deck restart left behind — units, orchestrations, issue dispatches, other agents and the reports nobody received — and how to list it, reclaim its worktrees and dismiss it from the TUI, the desktop app, voice or the CLI."
+
+[[page]]
 slug = "scheduled-tasks"
 title = "Schedules"
 description = "Run a prompt on a cron schedule, or dispatch agents onto open GitHub issues: set up, check, troubleshoot, plus the full schedules.toml, cron and schedule CLI reference."

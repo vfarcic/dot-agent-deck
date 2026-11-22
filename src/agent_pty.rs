@@ -9496,6 +9496,26 @@ pub(crate) const FAULT_SPAWN_BEFORE_PUBLISH: &str = "spawn-before-publish";
 /// `Fail` makes it fail ((f1)'s seam).
 pub(crate) const FAULT_SPAWN_FAILS: &str = "spawn-fails";
 
+/// TEST knob, read only by a build with the `e2e` feature: every fresh spawn
+/// waits this many milliseconds before it starts, as the first installed
+/// spawn of a daemon does while it copies its editor helper (issue #2421), so
+/// a test can make a client's start outlast the client's bound on its reply.
+/// A respawn does not wait.
+pub const ENV_TEST_SPAWN_DELAY_MS: &str = "DOT_AGENT_DECK_TEST_SPAWN_DELAY_MS";
+
+#[cfg(feature = "e2e")]
+fn test_spawn_delay() -> Option<Duration> {
+    std::env::var(ENV_TEST_SPAWN_DELAY_MS)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+}
+
+#[cfg(not(feature = "e2e"))]
+fn test_spawn_delay() -> Option<Duration> {
+    None
+}
+
 /// PRD #1666 part 3, round 5: the replacement's abort fault point: `Fail`
 /// drops its ticket with no transition ((f5a)'s seam).
 pub(crate) const FAULT_ABORT_SKIPPED: &str = "abort-skipped";
@@ -10991,6 +11011,16 @@ struct RegistryInner {
     /// each one's [`PaneDiscard::retired_seq`]. Bumped under the registry
     /// lock, so it orders retirements as they happened.
     discard_seq: u64,
+    /// PR #2431 round 6: the generations this registry's shutdown drain
+    /// stopped while they were still running, written in the lock hold that
+    /// drains them. A generation whose stream had already ended on its own
+    /// (`crashed`), or that a close removed before the drain, is not here.
+    /// Read by [`AgentPtyRegistry::stopped_by_shutdown`]. Only filled once the
+    /// registry is shutting down, so it never outgrows one drain.
+    stopped_by_shutdown: HashSet<String>,
+    /// PR #2431 round 6: the shutdown drain has run, so
+    /// [`Self::stopped_by_shutdown`] is final.
+    shutdown_drained: bool,
 }
 
 /// Issue #454: RAII holder for a [`RegistryInner::pending_spawns`] entry.
@@ -11339,6 +11369,11 @@ fn path_within(path: &std::path::Path, dir: &std::path::Path) -> bool {
 /// is not a directory. The only directories held for removal are abandoned
 /// issue-dispatch worktrees inside the daemon's clones, which are none of those
 /// unless the daemon or its environment was pointed into one.
+///
+/// PRD #1790 stage 2: each directory that resolves through a symlink or a
+/// `..` to another spelling is recorded in that canonical spelling too, so a
+/// hold on a worktree's canonical path refuses a start through an alias of it
+/// (a symlink to the worktree), and a removal sees an agent started that way.
 fn spawn_dirs(cwd: Option<&str>, tab_membership: Option<&TabMembership>) -> Vec<PathBuf> {
     let orchestration_cwd = match tab_membership {
         Some(TabMembership::Orchestration {
@@ -11347,19 +11382,26 @@ fn spawn_dirs(cwd: Option<&str>, tab_membership: Option<&TabMembership>) -> Vec<
         _ => None,
     };
     let mut base = None;
-    cwd.into_iter()
-        .chain(orchestration_cwd)
-        .map(|dir| {
-            let dir = PathBuf::from(dir);
-            if dir.is_absolute() {
-                return dir;
-            }
+    let mut out: Vec<PathBuf> = Vec::new();
+    for dir in cwd.into_iter().chain(orchestration_cwd) {
+        let dir = PathBuf::from(dir);
+        let dir = if dir.is_absolute() {
+            dir
+        } else {
             match base.get_or_insert_with(|| std::env::current_dir().ok()) {
                 Some(base) => base.join(dir),
                 None => dir,
             }
-        })
-        .collect()
+        };
+        let canonical = std::fs::canonicalize(&dir).ok();
+        out.push(dir);
+        if let Some(canonical) = canonical
+            && !out.contains(&canonical)
+        {
+            out.push(canonical);
+        }
+    }
+    out
 }
 
 /// Issue #454 round-3 review (blocker 1): RAII holder for a
@@ -11559,6 +11601,8 @@ impl AgentPtyRegistry {
                 exit_waiters: HashMap::new(),
                 input_discarded: HashMap::new(),
                 discard_seq: 0,
+                stopped_by_shutdown: HashSet::new(),
+                shutdown_drained: false,
             }),
             dispatch_mutexes: Mutex::new(HashMap::new()),
             dispatch_order_mutexes: Mutex::new(HashMap::new()),
@@ -15371,6 +15415,13 @@ impl AgentPtyRegistry {
         // reservation ((f1)'s seam).
         if self.fault_point(FAULT_SPAWN_FAILS) {
             return Err(AgentPtyError::Spawn("injected spawn failure (test)".into()));
+        }
+        // Issue #2421's test seam: a fresh spawn as slow as a first installed
+        // one on a loaded machine.
+        if matches!(admission, Admission::Fresh)
+            && let Some(delay) = test_spawn_delay()
+        {
+            std::thread::sleep(delay);
         }
 
         // Capture the caller-supplied `DOT_AGENT_DECK_PANE_ID` *before*
@@ -21178,6 +21229,32 @@ impl AgentPtyRegistry {
             || inner.dispatch_dir_holds.iter().any(|d| path_within(d, dir))
     }
 
+    /// PRD #1790 stage 2: every directory something this registry runs or is
+    /// starting is rooted in — the ones [`Self::dir_in_use_locked`] compares —
+    /// as recorded, copied out under one acquisition of the registry lock so
+    /// the caller can resolve each one (symlinks, `..`) without holding it.
+    pub fn rooted_dirs_snapshot(&self) -> Vec<PathBuf> {
+        let inner = self.inner.lock();
+        let mut out: Vec<PathBuf> = Vec::new();
+        for agent in inner.agents.values() {
+            if !agent.exited.load(Ordering::SeqCst) {
+                out.extend(agent.rooted_dirs());
+            }
+        }
+        for agent in inner.unconfirmed_agents.values() {
+            out.extend(agent.root_dirs.iter().cloned());
+        }
+        out.extend(
+            inner
+                .pending_spawn_dirs
+                .values()
+                .chain(inner.respawning_dirs.values())
+                .flatten()
+                .cloned(),
+        );
+        out
+    }
+
     /// Issue #1612: [`Self::dir_in_use_locked`], asked under one acquisition of
     /// the registry lock. A spawn publishing in between cannot fall between its
     /// reservation and its record, because its reservation is released under
@@ -22298,20 +22375,30 @@ impl AgentPtyRegistry {
             }
             let fields = &mut *inner;
             let retired = &mut fields.retired_hook_tokens;
+            let stopped = &mut fields.stopped_by_shutdown;
             let mut children: Vec<ShutdownChild> = fields
                 .agents
                 .drain()
                 .map(|(id, agent)| {
                     retired.record(&agent.hook_token, agent.pane_id_env.as_deref(), &id);
                     agent.removal.closed();
+                    // PR #2431 round 6: a generation whose reader had not seen
+                    // its stream end is one this drain stops. Its reader then
+                    // finds it removed and closed, which ends its attempt as
+                    // interrupted by the shutdown.
+                    if agent.crashed != Some(true) {
+                        stopped.insert(id.clone());
+                    }
                     agent.into()
                 })
                 .collect();
-            inner.unconfirmed_agents.retain(|_, agent| {
+            let stopped = &mut fields.stopped_by_shutdown;
+            fields.unconfirmed_agents.retain(|id, agent| {
                 let Some(pending) = agent.child.take() else {
                     return true;
                 };
                 pending.removal.closed();
+                stopped.insert(id.clone());
                 children.push(ShutdownChild {
                     child: pending.child,
                     process_group: pending.process_group,
@@ -22319,7 +22406,41 @@ impl AgentPtyRegistry {
                 });
                 false
             });
+            fields.shutdown_drained = true;
             return children;
+        }
+    }
+
+    /// PR #2431 round 6: whether this registry's shutdown drain stopped every
+    /// generation in `agent_ids` while it was still running — so each one's
+    /// attempt ends as interrupted by the shutdown. False when the registry
+    /// is not shutting down, when `agent_ids` is empty, and for a generation
+    /// that a close removed before the drain or whose stream had already
+    /// ended on its own. Waits, within the drain's own settle bound, for a
+    /// drain that set the shutdown latch but has not run yet.
+    pub(crate) async fn stopped_by_shutdown<'a>(
+        &self,
+        agent_ids: impl IntoIterator<Item = &'a str>,
+    ) -> bool {
+        let agent_ids: Vec<&str> = agent_ids.into_iter().collect();
+        if agent_ids.is_empty() || !self.is_shutting_down() {
+            return false;
+        }
+        let deadline =
+            Instant::now() + AGENT_TERMINATE_GRACE + FORCE_REAP_DEADLINE + Duration::from_secs(1);
+        loop {
+            {
+                let inner = self.inner.lock();
+                if inner.shutdown_drained {
+                    return agent_ids
+                        .iter()
+                        .all(|id| inner.stopped_by_shutdown.contains(*id));
+                }
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(FORCE_REAP_POLL_INTERVAL).await;
         }
     }
 

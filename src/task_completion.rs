@@ -88,7 +88,9 @@ pub(crate) const FAULT_AFTER_HANDOVER: &str = "work-done-after-handover";
 /// the doorbell's is, holds markers: `<seam>.armed` makes the next pass of
 /// that pause point write `<seam>.reached` and wait for `<seam>.release`, and
 /// `<seam>.fault` makes the next pass of that fault point fail. Only the
-/// `work-done-*` seams read them. Built only with the `e2e` feature.
+/// `work-done-*` seams and the spawn's `dispatch-seed` pause
+/// ([`crate::spawn::PAUSE_DISPATCH_SEED`]) read them. Built only with the
+/// `e2e` feature.
 #[cfg(feature = "e2e")]
 pub(crate) mod e2e_seams {
     use std::time::Duration;
@@ -99,7 +101,7 @@ pub(crate) mod e2e_seams {
     const RELEASE_WAIT: Duration = Duration::from_secs(30);
 
     fn root(name: &str) -> Option<std::path::PathBuf> {
-        if !name.starts_with("work-done-") {
+        if !name.starts_with("work-done-") && name != crate::spawn::PAUSE_DISPATCH_SEED {
             return None;
         }
         crate::doorbell::test_control_dir(VAR)

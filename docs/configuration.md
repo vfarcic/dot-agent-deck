@@ -167,7 +167,7 @@ Errors include: an orchestration with fewer than two roles, not exactly one role
 Instead of starting from the template, you can ask an agent that is already running in the project to write the file for you, from the TUI or the desktop app.
 
 1. Start an agent in the project.
-2. Ask it to generate the config: in the TUI, select its card in command mode and press `g` (or click **Generate** in the footer); in the desktop app, press **Generate config** on the agent's row on the Dashboard or in its pane, or say "generate config with" and its name.
+2. Ask it to generate the config: in the TUI, select its card in command mode and press `g` (or click **Generate** in the footer); in the desktop app, press **Generate config** in the agent's pane, or say "generate config with" and its name.
 3. A dialog titled **Generate .dot-agent-deck.toml** opens in both clients. Choose **Yes** to send the agent the request, or **No** (or `Esc`) to close it and send nothing.
 4. The agent's pane comes to the front and the agent proposes a config. Tell it what to change; it writes the file after you approve.
 5. Run `dot-agent-deck validate` in the project, then start an agent there and choose the orchestration under **Mode** in the New agent form of either client.
