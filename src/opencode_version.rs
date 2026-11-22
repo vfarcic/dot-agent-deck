@@ -181,7 +181,8 @@ const MAX_CACHE_ENTRIES: usize = 64;
 ///
 /// A spawn's reply waits for this probe, so it must fit inside the shortest
 /// bound a client puts on a start: the TUI's
-/// [`crate::embedded_pane::CREATE_PANE_START_TIMEOUT`] (5 s), asserted there.
+/// [`crate::embedded_pane::CREATE_PANE_START_TIMEOUT`] (15 s since issue
+/// #2421, 5 s before it), asserted there.
 /// At 5 s a binary whose `--version` hung timed the TUI's start out, and the
 /// agent came up on the dashboard unattached and without the name it was
 /// started under (session/restore/014). A probe that runs out of time leaves
