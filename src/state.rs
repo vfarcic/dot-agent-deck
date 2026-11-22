@@ -8337,6 +8337,38 @@ impl AppState {
         agent_id: &str,
         pane_id: Option<&str>,
     ) -> Option<SessionSnapshot> {
+        self.live_session_state_for(agent_id, pane_id).map(|s| {
+            let mut snapshot = s.live_snapshot();
+            // Issue #1678: the daemon's record is the authority, including
+            // a change no event carried (an exited spawn's work retired).
+            if let Some(track) = self.background_tracks.get(&s.session_id) {
+                snapshot.background = track.published;
+                snapshot.background_revision = (track.revision > 0).then_some(track.revision);
+            }
+            // Issue #532: the pane's generation, so a reconnecting TUI
+            // adopts the daemon's answer. See
+            // [`SessionSnapshot::hook_generation`].
+            snapshot.hook_generation = pane_id
+                .and_then(|pane| self.pane_hook_session.get(pane))
+                .map(|(session_id, established_at)| HookGeneration {
+                    session_id: session_id.clone(),
+                    established_ms: established_at.timestamp_millis(),
+                });
+            // PRD #1666 part 3 (Q35-17): this generation's settled held
+            // answers.
+            snapshot.answer_settlements =
+                self.answer_settlements_at(agent_id, std::time::Instant::now());
+            snapshot
+        })
+    }
+
+    /// The session [`Self::live_session_for`] joins to the record `agent_id`
+    /// in `pane_id`: the same match and the same tie-break.
+    fn live_session_state_for(
+        &self,
+        agent_id: &str,
+        pane_id: Option<&str>,
+    ) -> Option<&SessionState> {
         self.sessions
             .values()
             .filter(|s| s.agent_id.as_deref() == Some(agent_id) && s.pane_id.as_deref() == pane_id)
@@ -8345,29 +8377,14 @@ impl AppState {
                     .cmp(&b.last_activity)
                     .then_with(|| a.session_id.cmp(&b.session_id))
             })
-            .map(|s| {
-                let mut snapshot = s.live_snapshot();
-                // Issue #1678: the daemon's record is the authority, including
-                // a change no event carried (an exited spawn's work retired).
-                if let Some(track) = self.background_tracks.get(&s.session_id) {
-                    snapshot.background = track.published;
-                    snapshot.background_revision = (track.revision > 0).then_some(track.revision);
-                }
-                // Issue #532: the pane's generation, so a reconnecting TUI
-                // adopts the daemon's answer. See
-                // [`SessionSnapshot::hook_generation`].
-                snapshot.hook_generation = pane_id
-                    .and_then(|pane| self.pane_hook_session.get(pane))
-                    .map(|(session_id, established_at)| HookGeneration {
-                        session_id: session_id.clone(),
-                        established_ms: established_at.timestamp_millis(),
-                    });
-                // PRD #1666 part 3 (Q35-17): this generation's settled held
-                // answers.
-                snapshot.answer_settlements =
-                    self.answer_settlements_at(agent_id, std::time::Instant::now());
-                snapshot
-            })
+    }
+
+    /// Issue #2418: the working directory the live session
+    /// [`Self::live_session_for`] picks reports, or `None` when it has none
+    /// or reported none. A card's bare `#N` reference resolves against it,
+    /// as the branch badge resolves a session's branch.
+    pub fn live_session_cwd_for(&self, agent_id: &str, pane_id: Option<&str>) -> Option<String> {
+        self.live_session_state_for(agent_id, pane_id)?.cwd.clone()
     }
 
     /// PRD #1666 part 3 (Q35-17, OQ6): record that an answer `generation`'s
@@ -27906,5 +27923,50 @@ mod tests {
         assert_eq!(state.pane_status("p"), Some(SessionStatus::Thinking));
         assert!(ingest_prompt_turn(&mut state, gone("n8"), false));
         assert_eq!(state.pane_status("p"), Some(SessionStatus::Idle));
+    }
+
+    /// Issue #2418 (review R1): the folder a card's bare `#N` resolves in is
+    /// the one reported by the session [`AppState::live_session_for`] joins —
+    /// the same pane and generation, the newest of several — and another
+    /// generation in the same pane is not read.
+    #[test]
+    fn the_live_cwd_comes_from_the_joined_session() {
+        let mut state = AppState::default();
+        state.register_pane("p".into());
+        state.apply_event(
+            serde_json::from_value::<AgentEvent>(serde_json::json!({
+                "session_id": "base", "pane_id": "p", "agent_id": "g1",
+                "agent_type": "claude_code", "event_type": "session_start",
+                "cwd": "/base", "timestamp": Utc::now()
+            }))
+            .unwrap(),
+        );
+        let template = state.sessions.values().next().cloned().unwrap();
+        state.sessions.clear();
+        let at = |secs: i64| DateTime::<Utc>::from_timestamp(1_800_000_000 + secs, 0).unwrap();
+        for (id, agent, cwd, secs) in [
+            ("old", "g1", Some("/old"), 1),
+            ("new", "g1", Some("/new"), 2),
+            // Another generation in the same pane, newer than both.
+            ("other", "g2", Some("/other"), 3),
+            ("quiet", "g3", None, 4),
+        ] {
+            let mut session = template.clone();
+            session.session_id = id.into();
+            session.agent_id = Some(agent.into());
+            session.cwd = cwd.map(str::to_string);
+            session.last_activity = at(secs);
+            state.sessions.insert(id.into(), session);
+        }
+        assert!(state.live_session_for("g1", Some("p")).is_some());
+        let cwd = state.live_session_cwd_for("g1", Some("p"));
+        assert_eq!(cwd.as_deref(), Some("/new"));
+        assert_eq!(
+            state.live_session_cwd_for("g2", Some("p")).as_deref(),
+            Some("/other")
+        );
+        assert_eq!(state.live_session_cwd_for("g3", Some("p")), None);
+        assert_eq!(state.live_session_cwd_for("g1", Some("q")), None);
+        assert_eq!(state.live_session_cwd_for("g4", Some("p")), None);
     }
 }

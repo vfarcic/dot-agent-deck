@@ -1865,16 +1865,23 @@ pub(crate) struct DesktopAgentCards {
     revision: u64,
     entries: Vec<dot_agent_deck::agent_cards::AgentCardEntry>,
     catalog_errors: Vec<String>,
+    /// Issue #2418: the daemon advertised the card tree, so each entry's
+    /// `parent`, `rollup` and `checked_refs` are its own (the shared client
+    /// drops them otherwise). `false` for an older daemon, whose cards the
+    /// webview draws as roots with no roll-up.
+    tree: bool,
 }
 
 impl DesktopAgentCards {
-    fn new(endpoint: &Endpoint, list: dot_agent_deck::agent_cards::AgentCardList) -> Self {
+    fn new(endpoint: &Endpoint, answer: dot_agent_deck::daemon_client::AgentCardsAnswer) -> Self {
+        let list = answer.list;
         Self {
             deck_id: crate::dto::deck_wire_id(endpoint),
             instance_id: list.instance_id,
             revision: list.revision,
             entries: list.entries,
             catalog_errors: list.catalog_errors,
+            tree: answer.tree,
         }
     }
 }
@@ -1888,13 +1895,13 @@ async fn emit_agent_cards(app: &AppHandle, endpoint: &Endpoint, links: &DaemonLi
     if daemon.require_compatible().is_err() {
         return;
     }
-    if let Ok(GatedQuery::Answered(list)) =
-        crate::daemon_bridge::bounded_reply("ListAgentCards", daemon.client.list_agent_cards())
+    if let Ok(GatedQuery::Answered(answer)) =
+        crate::daemon_bridge::bounded_reply("ListAgentCards", daemon.client.list_agent_cards_tree())
             .await
     {
         let _ = app.emit(
             "desktop://agent-cards",
-            DesktopAgentCards::new(endpoint, list),
+            DesktopAgentCards::new(endpoint, answer),
         );
     }
 }
@@ -1939,10 +1946,13 @@ async fn agent_cards_list_on(
     let scope = crate::dto::DeckScope::resolve(Some(deck_id))?;
     let daemon = state.daemon.trusted(scope.endpoint()).await?;
     daemon.require_compatible()?;
-    match crate::daemon_bridge::bounded_reply("ListAgentCards", daemon.client.list_agent_cards())
-        .await?
+    match crate::daemon_bridge::bounded_reply(
+        "ListAgentCards",
+        daemon.client.list_agent_cards_tree(),
+    )
+    .await?
     {
-        GatedQuery::Answered(list) => Ok(Some(DesktopAgentCards::new(scope.endpoint(), list))),
+        GatedQuery::Answered(answer) => Ok(Some(DesktopAgentCards::new(scope.endpoint(), answer))),
         GatedQuery::Unsupported => Ok(None),
     }
 }

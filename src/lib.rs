@@ -108,6 +108,8 @@ pub mod event_subscriber;
 // PRD #1666 part 3 round 5-wake: whether a parsed frame was drawn for the PTY's current width.
 pub mod evidence_state;
 pub mod features;
+// Issue #2418: strict parsing of the PR/issue references agents report on cards.
+pub mod github_refs;
 pub mod guarded;
 // PRD #1105 M11: when the TUI claims focus on its daemon (terminal focus-in and
 // throttled input).
@@ -199,9 +201,11 @@ pub mod pty_open_retry;
 // PRD #1401: the pull request an agent's work produced, on the session wire.
 pub mod pull_request;
 pub mod pull_request_info;
+// Issue #2418: the daemon's own check of the PR/issue references cards name.
 pub mod question;
 pub mod quota_block;
 pub mod quota_signals;
+pub mod reference_check;
 // PRD #1666 part 3 round 5-wake: an agent's release, read off its start-up header.
 pub mod release_scanner;
 pub mod remote;

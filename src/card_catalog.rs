@@ -238,14 +238,7 @@ fn field(
     }
 }
 
-fn action(
-    name: &str,
-    label: &str,
-    prompt: &str,
-    icon: &str,
-    description: &str,
-    always: bool,
-) -> CatalogAction {
+fn action(name: &str, label: &str, prompt: &str, icon: &str, description: &str) -> CatalogAction {
     CatalogAction {
         name: name.to_string(),
         label: label.to_string(),
@@ -254,7 +247,9 @@ fn action(
         icon: Some(icon.to_string()),
         placement: Placement::Card,
         confirm: false,
-        always,
+        // No default is always offered (#2418 D15 removed Explain, the one
+        // that was); a user's catalog can still set `always`.
+        always: false,
         source: CatalogSource::Default,
     }
 }
@@ -307,6 +302,11 @@ pub fn default_fields() -> Vec<CatalogField> {
     ]
 }
 
+/// Names that were deck defaults once and are no longer (issue #2418 D15:
+/// `explain`). A user's `remove` entry naming one still says what it always
+/// said, so it is ignored rather than reported as naming no default.
+pub const RETIRED_DEFAULT_NAMES: &[&str] = &["explain"];
+
 /// The deck's default actions, in catalog order.
 pub fn default_actions() -> Vec<CatalogAction> {
     vec![
@@ -316,7 +316,6 @@ pub fn default_actions() -> Vec<CatalogAction> {
             "Go ahead.",
             "play",
             "Offer when you are waiting for the user's approval to continue.",
-            false,
         ),
         action(
             "merge",
@@ -324,15 +323,6 @@ pub fn default_actions() -> Vec<CatalogAction> {
             "Merge it, following this project's own merge procedure, then update your card.",
             "git-merge",
             "Offer when your work is ready to merge.",
-            false,
-        ),
-        action(
-            "explain",
-            "Explain",
-            "Explain in a few sentences what you did and what you need from me, then update your card.",
-            "help-circle",
-            "Ask the agent to explain what it did and what it needs.",
-            true,
         ),
     ]
 }
@@ -806,7 +796,9 @@ pub fn resolve(user_config_toml: Option<&str>) -> ResolvedCatalog {
                 let before = resolved.fields.len() + resolved.actions.len();
                 resolved.fields.retain(|f| f.name != name);
                 resolved.actions.retain(|a| a.name != name);
-                if resolved.fields.len() + resolved.actions.len() == before {
+                if resolved.fields.len() + resolved.actions.len() == before
+                    && !RETIRED_DEFAULT_NAMES.contains(&name)
+                {
                     errors.push(format!(
                         "catalog.remove: {:?} names no deck default field or action",
                         truncate_chars(name, MAX_NAME_CHARS + 8)
@@ -941,7 +933,7 @@ mod tests {
                 "links"
             ]
         );
-        assert_eq!(names_a(&c), ["go-ahead", "merge", "explain"]);
+        assert_eq!(names_a(&c), ["go-ahead", "merge"]);
         assert!(c.errors.is_empty());
         assert_eq!(c.field("next-step").unwrap().label, "Next step");
         assert_eq!(c.field("details").unwrap().placement, Placement::Detail);
@@ -949,7 +941,10 @@ mod tests {
             c.field("pull-request").unwrap().field_type,
             FieldType::PullRequest
         );
-        assert!(c.action("explain").unwrap().always);
+        // Issue #2418 (D15): Explain is no longer a default, and no default
+        // is always offered.
+        assert!(c.action("explain").is_none());
+        assert!(c.actions.iter().all(|a| !a.always));
         assert_eq!(c.action("merge").unwrap().label, "Merge it");
         // A config with no `[catalog]` is the defaults too.
         assert_eq!(resolve(Some("default_command = \"claude\"\n")), c);
@@ -1001,11 +996,51 @@ confirm = true
         assert_eq!(progress.icon, None, "replaced whole, not merged key by key");
         assert_eq!(progress.source, CatalogSource::User);
         assert_eq!(c.field("risk").unwrap().label, "Risk");
-        assert_eq!(names_a(&c), ["go-ahead", "explain", "ship"]);
+        assert_eq!(names_a(&c), ["go-ahead", "ship"]);
         let ship = c.action("ship").unwrap();
         assert!(ship.confirm);
         assert!(!ship.always);
         assert_eq!(ship.placement, Placement::Card);
+    }
+
+    /// Issue #2418 (D15): Explain left the defaults, but a user who wants it
+    /// back adds it to their own catalog, `always` included.
+    #[test]
+    fn a_user_catalog_can_add_an_always_offered_action() {
+        let c = resolve(Some(
+            r#"
+[[catalog.actions]]
+name = "explain"
+description = "Ask the agent to explain what it did and what it needs."
+prompt = "Explain in a few sentences what you did and what you need from me, then update your card."
+always = true
+"#,
+        ));
+        assert!(c.errors.is_empty(), "{:?}", c.errors);
+        assert_eq!(names_a(&c), ["go-ahead", "merge", "explain"]);
+        let explain = c.action("explain").unwrap();
+        assert!(explain.always);
+        assert_eq!(explain.source, CatalogSource::User);
+    }
+
+    /// Issue #2418 round 2 review: a config written while Explain was a
+    /// default, removing it, still resolves without an error, and Explain
+    /// stays off; a name that never was a default is still reported.
+    #[test]
+    fn removing_the_retired_explain_default_is_a_silent_no_op() {
+        let c = resolve(Some("[catalog]\nremove = [\"explain\"]\n"));
+        assert!(c.errors.is_empty(), "{:?}", c.errors);
+        assert_eq!(c, resolve(None));
+        assert!(c.action("explain").is_none());
+
+        let c = resolve(Some(
+            "[catalog]\nremove = [\"explain\", \"merge\", \"nope\"]\n",
+        ));
+        assert_eq!(names_a(&c), ["go-ahead"]);
+        assert_eq!(
+            c.errors,
+            ["catalog.remove: \"nope\" names no deck default field or action"]
+        );
     }
 
     #[test]
@@ -1100,7 +1135,7 @@ prompt = "p"
         assert_eq!(c.errors.len(), 10, "{joined}");
         // The one valid entry applied, as its first spelling.
         assert_eq!(c.field("ok").unwrap().field_type, FieldType::Number);
-        assert_eq!(names_a(&c), ["go-ahead", "merge", "explain"]);
+        assert_eq!(names_a(&c), ["go-ahead", "merge"]);
     }
 
     /// PRD #2374 (review finding): a syntax error in another table does not
@@ -1154,7 +1189,7 @@ prompt = '''Hold.
             c.field("risk").unwrap().description,
             "How risky the change is."
         );
-        assert_eq!(names_a(&c), ["go-ahead", "explain", "ship", "hold"]);
+        assert_eq!(names_a(&c), ["go-ahead", "ship", "hold"]);
         assert_eq!(
             c.action("ship").unwrap().prompt,
             "Ship it.\n[not a header]\nThen update your card."
@@ -1169,7 +1204,7 @@ prompt = '''Hold.
         let c = resolve(Some("x = \"\n[catalog]\nremove = [\"merge\"\n"));
         assert_eq!(c.errors.len(), 1, "{:?}", c.errors);
         assert!(c.errors[0].starts_with("catalog: the user config could not be read as TOML"));
-        assert_eq!(names_a(&c), ["go-ahead", "merge", "explain"]);
+        assert_eq!(names_a(&c), ["go-ahead", "merge"]);
     }
 
     /// PRD #2374 (review finding, round 5): a multi-line string may close with
@@ -1226,7 +1261,7 @@ remove = [\"merge\"]
                 "{:?}",
                 c.errors
             );
-            assert_eq!(names_a(&c), ["go-ahead", "merge", "explain"], "{config}");
+            assert_eq!(names_a(&c), ["go-ahead", "merge"], "{config}");
         }
 
         // The same closing runs before, and inside, a real catalog leave it
@@ -1244,13 +1279,13 @@ prompt = \"\"\"Ship \"it\"\"\"\"\"
 [later]
 x = '''
 [catalog]
-remove = [\"explain\"]
+remove = [\"go-ahead\"]
 '''
 ";
         let c = resolve(Some(config));
         assert_eq!(c.errors.len(), 1, "{:?}", c.errors);
         assert!(c.errors[0].ends_with("but fix the file"), "{:?}", c.errors);
-        assert_eq!(names_a(&c), ["go-ahead", "explain", "ship"]);
+        assert_eq!(names_a(&c), ["go-ahead", "ship"]);
         assert_eq!(c.action("ship").unwrap().prompt, "Ship \"it\"\"");
     }
 
@@ -1259,7 +1294,7 @@ remove = [\"explain\"]
         let c = resolve(Some("[catalog\nremove = 1"));
         assert_eq!(c.errors.len(), 1);
         assert!(c.errors[0].starts_with("catalog: the user config could not be read as TOML"));
-        assert_eq!(names_a(&c), ["go-ahead", "merge", "explain"]);
+        assert_eq!(names_a(&c), ["go-ahead", "merge"]);
         let c = resolve(Some("catalog = 3\n"));
         assert_eq!(c.errors, ["catalog: [catalog] must be a table"]);
     }
@@ -1290,6 +1325,18 @@ remove = [\"explain\"]
         assert!(text.contains(
             "Actions you can suggest (the user's button sends you the prompt shown):\n- `go-ahead`: Offer when you are waiting for the user's approval to continue.\n- `merge`: Offer when your work is ready to merge.\n"
         ));
+        assert!(
+            !text.contains("`explain`"),
+            "Explain is not a default (#2418)"
+        );
+        // An action the user's catalog marks `always` is offered on every
+        // card, so it is not one the agent suggests.
+        let with_always = resolve(Some(
+            "[[catalog.actions]]\nname = \"explain\"\ndescription = \"d\"\nprompt = \"Explain.\"\nalways = true\n",
+        ));
+        assert!(with_always.errors.is_empty(), "{:?}", with_always.errors);
+        let text = dispatch_text(&with_always, "dad");
+        assert!(text.contains("- `merge`: "));
         assert!(!text.contains("`explain`"), "always actions are not listed");
         assert!(text.ends_with(
             "\nYou may also report fields and actions that are not listed; the user sees them as custom.\n"

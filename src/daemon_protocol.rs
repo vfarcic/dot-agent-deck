@@ -1286,6 +1286,17 @@ pub const CAP_KEEP_WORKTREE: &str = "keep-worktree";
 /// platform: none of the three arms is `#[cfg]`-gated.
 pub const CAP_AGENT_CARDS: &str = "agent-cards";
 
+/// Capability string for issue #2418's card tree: the optional `parent`,
+/// `rollup` and `checked_refs` of each [`crate::agent_cards::AgentCardEntry`]
+/// that [`AttachRequest::ListAgentCards`] answers, and the list's order (each
+/// card before the cards under it, in spawn order). No new verb and no
+/// [`PROTOCOL_VERSION`] bump: the fields are additive and optional, and an
+/// older daemon simply sends none. A client draws the tree only when the
+/// `Hello` on the list's connection named this
+/// ([`crate::daemon_client::DaemonClient::list_agent_cards_tree`]), and
+/// otherwise draws every card as a root. Advertised on every platform.
+pub const CAP_AGENT_CARDS_TREE: &str = "agent-cards-tree";
+
 /// Capability string for [`AttachRequest::AgentOpened`] (issue #2454): a
 /// client tells the daemon the user opened an agent's pane, which deals with
 /// the `waiting`, `done` or `failed` reason the agent's card report raised.
@@ -1521,6 +1532,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_PROJECT_TRUST,
     CAP_TRUST_REQUESTS,
     CAP_AGENT_CARDS,
+    CAP_AGENT_CARDS_TREE,
     CAP_INTERRUPTED_WORK,
     CAP_REARM_ORCHESTRATOR,
     CAP_AGENT_OPENED,
@@ -1554,6 +1566,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_PROJECT_TRUST,
     CAP_TRUST_REQUESTS,
     CAP_AGENT_CARDS,
+    CAP_AGENT_CARDS_TREE,
     CAP_INTERRUPTED_WORK,
     CAP_REARM_ORCHESTRATOR,
     CAP_AGENT_OPENED,

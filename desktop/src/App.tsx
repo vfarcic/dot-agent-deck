@@ -51,7 +51,8 @@ import { ProfilesPanel, ProjectsPanel, PromptLibraryPanel, OrchestrationPanel } 
 import { SettingsSheet } from "./components/SettingsSheet";
 import { VoiceControlPanel, type AgentIncarnation, type VoicePane } from "./components/VoiceControlPanel";
 import { PullRequestBrowser, pullRequestBrowserCovered, type PullRequestBrowserSession } from "./components/PullRequestBrowser";
-import { OpenPullRequest, PrBrowserHostContext } from "./lib/prBrowser";
+import { OpenCardReference, OpenPullRequest, PrBrowserHostContext, type CardReferenceTarget } from "./lib/prBrowser";
+import { openableReference } from "./lib/agentCardsTree";
 import { LocalUpgradeFlow } from "./components/LocalUpgradeFlow";
 import { SelfUpgradeBanner, SelfUpgradeRailButton, noticeOf } from "./components/SelfUpgradeNotice";
 import { tauriSelfUpgradeApi } from "./lib/selfUpgrade";
@@ -170,12 +171,54 @@ const PROJECT_STALE_PREPARATION_CODE = "stale-preparation: ";
 const PROJECT_UNSUPPORTED_PLATFORM_CODE = "unsupported-platform: ";
 /** PRD #1401 — what opening a pull request answers when its agent is no longer listed. */
 export const PULL_REQUEST_AGENT_GONE = "That agent is no longer on its daemon.";
+/** Issue #2418 — what opening a card's checked reference answers when its daemon no longer lists that card. */
+const CARD_REFERENCE_GONE = "That card is no longer on its daemon, so its page was not opened.";
+/** Issue #2418 — …when the card's daemon is not answering. */
+const CARD_REFERENCE_DECK_SILENT = "That card's daemon is not answering, so its page was not opened.";
+/** Issue #2418 — …when the card no longer carries that reference as the deck checked it. */
+const cardReferenceChanged = (name: string, what: string) => `${name}'s card no longer shows that ${what} as the deck checked it, so it was not opened.`;
 /** PRD #1401 — "open it in the browser" with no pull request open. */
 export const PULL_REQUEST_NONE_OPEN = "No pull request is open.";
 /** PRD #1401 — a spoken scroll while one of the app's dialogs is over the pull request. */
 export const PULL_REQUEST_COVERED = "Close what is in front of the pull request first.";
-/** PRD #1401 — a pull request in the in-app browser: the view it opened over, and which frame it is in. */
-type OpenPrBrowser = PullRequestBrowserSession & { over: DeckView; opened: number };
+/**
+ * PRD #1401 — a pull request in the in-app browser: the view it opened over,
+ * and which frame it is in. Issue #2418 — `card` when a card's checked
+ * reference opened it: the card it came from, which it lasts as long as its
+ * daemon lists, whether or not that card's agent is still running.
+ */
+type OpenPrBrowser = PullRequestBrowserSession & { over: DeckView; opened: number; card?: { instanceId: string; key: string } };
+
+/**
+ * An accepted open, from the pull request badge or a card's reference, given
+ * the page on screen (`open`) and any switch still waiting (`pending`). With
+ * no page open it opens one, numbered from `opened`. With the page on
+ * another address, or a switch waiting, it is a switch, which the page makes
+ * and only then the toolbar shows (`switchPrBrowser`). With the page already
+ * on that address and nothing waiting, the page is not reloaded, but the
+ * session takes the new request's subject (its name, deck, agent, and whether
+ * a card owns it), so the browser closes with what asked for it last rather
+ * than with whatever first opened the address (issue #2418 review).
+ */
+function admitPrBrowser(open: OpenPrBrowser | undefined, pending: OpenPrBrowser | undefined, wanted: Omit<OpenPrBrowser, "opened">, opened: { current: number }): { show: OpenPrBrowser; switchTo?: undefined } | { show?: undefined; switchTo: OpenPrBrowser } {
+  if (!open) {
+    opened.current += 1;
+    return { show: { ...wanted, opened: opened.current } };
+  }
+  if (pending || open.url !== wanted.url) return { switchTo: { ...wanted, opened: open.opened } };
+  return { show: { ...wanted, opened: open.opened } };
+}
+
+/**
+ * Issue #2418 — the card a checked reference names, as its deck's daemon lists
+ * it now: by deck, the daemon process that listed it, and its key. Only from a
+ * daemon that builds the card tree, whose checked references are its own.
+ */
+function listedCard(cards: DeckRuntimeState["agentCards"], target: Pick<CardReferenceTarget, "deckId" | "instanceId" | "cardKey">) {
+  const snapshot = cards?.[target.deckId];
+  if (!snapshot?.tree) return undefined;
+  return snapshot.entries.find((entry) => entry.instance_id === target.instanceId && entry.key === target.cardKey);
+}
 const DESKTOP_EVIDENCE_QUERY = "(min-width: 1260px)";
 
 function evidenceOpenOnFirstLoad(): boolean {
@@ -589,29 +632,44 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    * the view forgets it, so opening the same agent again tells the daemon again.
    * A send that fails is tried again while the same view stays open, at most
    * {@link AGENT_OPENED_ATTEMPTS} times in all (Qodo on PR #2460).
+   *
+   * Each open is its own object, and a retry checks that object by identity,
+   * not the agent's key: reopening the same agent makes a new open, so a retry
+   * still pending from the open the user left sends nothing, and leaving an
+   * open cancels its pending retry (PR #2430 review: a stale retry otherwise
+   * cleared a Needs you raised after the reopen).
    */
   const agentOpened = runtime.agentOpened;
-  const openedSent = useRef<string | undefined>(undefined);
-  useEffect(() => () => { openedSent.current = undefined; }, []);
+  const openedSent = useRef<{ key: string; retry?: number } | undefined>(undefined);
+  const forgetOpen = useCallback(() => {
+    if (openedSent.current?.retry !== undefined) window.clearTimeout(openedSent.current.retry);
+    openedSent.current = undefined;
+  }, []);
+  useEffect(() => forgetOpen, [forgetOpen]);
   useEffect(() => {
     if (!agentView || !paneAgent) {
-      if (!agentView) openedSent.current = undefined;
+      if (!agentView) forgetOpen();
       return;
     }
     const key = `${agentView.deckId}\u0000${paneAgent.id}\u0000${paneAgent.incarnation ?? ""}`;
     const paneId = paneAgent.paneId;
-    if (openedSent.current === key || !agentOpened || !paneId) return;
-    openedSent.current = key;
+    if (openedSent.current?.key === key || !agentOpened || !paneId) return;
+    forgetOpen();
+    const open: { key: string; retry?: number } = { key };
+    openedSent.current = open;
     const { deckId } = agentView;
     const { id, incarnation } = paneAgent;
     const send = (attempt: number) => {
       agentOpened(deckId, id, paneId, incarnation).catch(() => {
-        if (attempt >= AGENT_OPENED_ATTEMPTS || openedSent.current !== key) return;
-        window.setTimeout(() => { if (openedSent.current === key) send(attempt + 1); }, AGENT_OPENED_RETRY_MS);
+        if (attempt >= AGENT_OPENED_ATTEMPTS || openedSent.current !== open) return;
+        open.retry = window.setTimeout(() => {
+          open.retry = undefined;
+          if (openedSent.current === open) send(attempt + 1);
+        }, AGENT_OPENED_RETRY_MS);
       });
     };
     send(1);
-  }, [agentOpened, agentView, paneAgent]);
+  }, [agentOpened, agentView, paneAgent, forgetOpen]);
   /**
    * Issue #1143 — the last record this pane's deck gave, so the pane can still
    * be a pane while that deck is not answering.
@@ -917,16 +975,27 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       const pullRequest = agent.pullRequest;
       if (!pullRequest) return `${name} has no pull request.`;
       if (!pullRequest.url) return `${name}'s pull request #${pullRequest.number} has no github.com address the app can open.`;
-      const wanted = { deckId: target.deckId, agentId: target.agentId, agentLabel: agent.displayName, number: pullRequest.number, url: pullRequest.url, over: view };
-      /* With a page open this is a switch, which the page makes and only then
-         the toolbar shows (`switchPrBrowser`); the page already on it, with
-         no other switch waiting, needs nothing. */
-      if (prBrowser) {
-        if (prBrowserRequest || prBrowser.url !== wanted.url) setPrBrowserRequest({ ...wanted, opened: prBrowser.opened });
-      } else {
-        prBrowserOpened.current += 1;
-        setPrBrowser({ ...wanted, opened: prBrowserOpened.current });
-      }
+      const admitted = admitPrBrowser(prBrowser, prBrowserRequest, { deckId: target.deckId, agentId: target.agentId, agentLabel: agent.displayName, number: pullRequest.number, url: pullRequest.url, over: view }, prBrowserOpened);
+      if (admitted.switchTo) setPrBrowserRequest(admitted.switchTo);
+      else setPrBrowser(admitted.show);
+      return undefined;
+    },
+    /* Issue #2418 — a pull request or issue a card's agent reported, at the
+       address the deck checked. Allowed and named from the CARD as its
+       daemon lists it now, not from the deck's running agents: the deck
+       keeps the card of an agent that stopped and was not closed, and that
+       card's references open too (review F2). The pull request badge's own path above is
+       unchanged. */
+    openCheckedReference: (target) => {
+      const deck = runtime.fleet.find((entry) => entry.connection.deckId === target.deckId);
+      if (deck?.connection.status !== "connected") return CARD_REFERENCE_DECK_SILENT;
+      const card = listedCard(runtime.agentCards, target);
+      if (!card) return CARD_REFERENCE_GONE;
+      const reference = (card.checked_refs ?? []).find((candidate) => candidate.kind === target.kind && openableReference(candidate) && candidate.number === target.number && candidate.url === target.url);
+      if (!reference) return cardReferenceChanged(displayText(card.name, DISPLAY_LIMITS.name), target.kind === "issue" ? "issue" : "pull request");
+      const admitted = admitPrBrowser(prBrowser, prBrowserRequest, { deckId: target.deckId, agentId: card.agent_id, agentLabel: card.name, number: target.number, url: target.url, kind: target.kind, card: { instanceId: card.instance_id, key: card.key }, over: view }, prBrowserOpened);
+      if (admitted.switchTo) setPrBrowserRequest(admitted.switchTo);
+      else setPrBrowser(admitted.show);
       return undefined;
     },
     /* Closed only once the system browser has the page: a hand-off that
@@ -942,7 +1011,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     },
     closePullRequest: closePrBrowser,
     pullRequestBack: () => { if (prBrowser) void onPrBrowserPage(prBrowser.opened, prBrowserHost.back()); },
-  }), [closePrBrowser, forgetPrBrowser, onPrBrowserPage, prBrowser, prBrowserHost, prBrowserRequest, runtime.fleet, view]);
+  }), [closePrBrowser, forgetPrBrowser, onPrBrowserPage, prBrowser, prBrowserHost, prBrowserRequest, runtime.agentCards, runtime.fleet, view]);
   /* The page has moved to `request`, or failed to: the toolbar names it only
      once the host has it there, and a failure is said under the toolbar of
      the pull request still on screen. The host runs its calls in order, so a
@@ -960,8 +1029,15 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   const openPullRequest = useCallback((target: { deckId: string; agentId: string }) => VOICE_ACTIONS.openPullRequest.run(pullRequestContext, target), [pullRequestContext]);
   const prBrowserDeck = prBrowser ? runtime.fleet.find((entry) => entry.connection.deckId === prBrowser.deckId) : undefined;
   /* Gone from a deck that is ANSWERING — a deck that is not reports no agents
-     at all, which is not evidence the agent ended (see `paneAgentRetired`). */
-  const prBrowserAgentGone = prBrowser !== undefined && prBrowserDeck?.connection.status === "connected" && !prBrowserDeck.agents.some((agent) => agent.id === prBrowser.agentId);
+     at all, which is not evidence the agent ended (see `paneAgentRetired`).
+     A page a card's reference opened goes with the CARD, once a list from
+     its daemon no longer holds it: its agent stopping is not that, since
+     the deck keeps a stopped agent's card until it is closed (issue #2418
+     review, F2). */
+  const prBrowserCards = prBrowser?.card ? runtime.agentCards?.[prBrowser.deckId] : undefined;
+  const prBrowserAgentGone = prBrowser !== undefined && prBrowserDeck?.connection.status === "connected" && (prBrowser.card
+    ? prBrowserCards !== undefined && listedCard(runtime.agentCards, { deckId: prBrowser.deckId, instanceId: prBrowser.card.instanceId, cardKey: prBrowser.card.key }) === undefined
+    : !prBrowserDeck.agents.some((agent) => agent.id === prBrowser.agentId));
   const prBrowserViewLeft = prBrowser !== undefined && JSON.stringify(prBrowser.over) !== JSON.stringify(view);
   useEffect(() => {
     /* The browser's subject went away (its agent ended, or the view it was
@@ -1591,6 +1667,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   const starReady = !connectionBanner && !confirmationOpen && !localUpgrade.pending && !selfUpgradeOpen && !newAgentOpen && !choiceOpen && !overlaysOpen.settings && !prBrowser;
   return (
     <OpenPullRequest.Provider value={openPullRequest}>
+    <OpenCardReference.Provider value={pullRequestContext.openCheckedReference}>
     <VoiceOn.Provider value={voiceOn}>
       <AddDaemonOpener.Provider value={openAddDaemon}>
       <VoiceNumberingContext.Provider value={numbering}>
@@ -1635,6 +1712,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       </VoiceNumberingContext.Provider>
       </AddDaemonOpener.Provider>
     </VoiceOn.Provider>
+    </OpenCardReference.Provider>
     </OpenPullRequest.Provider>
   );
 }

@@ -1512,6 +1512,14 @@ mod tests {
                     vec!["overview"]
                 ),
                 ("close_agent_card", "closeAgentCard", vec!["overview"]),
+                ("open_card_tree", "openCardTree", vec!["overview"]),
+                ("close_card_tree", "closeCardTree", vec!["overview"]),
+                (
+                    "open_card_pull_request",
+                    "openCardPullRequest",
+                    vec!["overview"]
+                ),
+                ("open_card_issue", "openCardIssue", vec!["overview"]),
                 ("run_card_action", "runCardAction", vec!["overview"]),
                 ("reply_to_agent_card", "replyToAgentCard", vec!["overview"]),
             ]
@@ -2501,6 +2509,10 @@ mod tests {
                 "next_needs_you_card",
                 "filter_needs_you_cards",
                 "close_agent_card",
+                "open_card_tree",
+                "close_card_tree",
+                "open_card_pull_request",
+                "open_card_issue",
                 "run_card_action",
                 "reply_to_agent_card"
             ]
