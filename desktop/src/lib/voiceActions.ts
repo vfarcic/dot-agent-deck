@@ -1100,7 +1100,7 @@ export const VOICE_ACTIONS = {
   },
 
   scrollToTop: {
-    label: "Scroll the agent dashboard, or a pull request open in the app, to its top",
+    label: "Scroll to the top: the agent dashboard, a pull request open in the app, or the history an open agent's pane keeps in the app",
     voice: true,
     needs: ["scrollDashboard", "reportRefused"],
     run: (context: Pick<VoiceActionContext, "scrollDashboard" | "reportRefused">) => {
@@ -1110,7 +1110,7 @@ export const VOICE_ACTIONS = {
   },
 
   scrollToBottom: {
-    label: "Scroll the agent dashboard, or a pull request open in the app, to its bottom",
+    label: "Scroll to the bottom: the agent dashboard, a pull request open in the app, or the history an open agent's pane keeps in the app",
     voice: true,
     needs: ["scrollDashboard", "reportRefused"],
     run: (context: Pick<VoiceActionContext, "scrollDashboard" | "reportRefused">) => {

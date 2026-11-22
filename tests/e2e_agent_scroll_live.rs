@@ -196,20 +196,20 @@ fn launch_claude(name: &str, fullscreen: bool) -> (TuiDeck, String, tempfile::Te
     // The renderer is pinned either way, from a settings FILE rather than an
     // inline JSON argument, so no quoting stands between it and claude: the
     // harness copies the host's `~/.claude/settings.json` into the test HOME,
-    // and a host that sets `"tui"` would otherwise choose it. As in
+    // and a host that sets `"tui"` would otherwise choose it. The file sits in
+    // claude's working directory and is named relative to it, so the command
+    // line carries no path that a space in the harness's temp root could split. As in
     // `mode/live/003`, the setting alone does not force the full-screen
     // renderer after a launch claude thinks crashed; the variable does.
     let renderer = if fullscreen { "fullscreen" } else { "default" };
-    let settings = scratch.path().join(format!("scroll-live-{renderer}.json"));
-    std::fs::write(&settings, format!("{{\"tui\":\"{renderer}\"}}"))
+    let settings = format!("scroll-live-{renderer}.json");
+    std::fs::write(repo.join(&settings), format!("{{\"tui\":\"{renderer}\"}}"))
         .expect("write the renderer settings");
     if fullscreen {
         env.push(("CLAUDE_CODE_NO_FLICKER".into(), "1".into()));
     }
-    let command = format!(
-        "claude --model {HAIKU_MODEL} --settings {} --allowedTools Bash Read",
-        settings.display()
-    );
+    let command =
+        format!("claude --model {HAIKU_MODEL} --settings {settings} --allowedTools Bash Read");
     let response = common::attach_request_on(
         deck.attach_socket_path(),
         &AttachRequest::StartAgent {
@@ -304,7 +304,7 @@ fn mode_scroll_010_default_claude_leaves_history_the_deck_scrolls() {
     });
     // Pressed until the view moves: the first key after Ctrl+D can be taken
     // by the command-mode banner rather than reach the scroll (observed while
-    // writing this test, with a plain `seq` pane as well).
+    // writing this test, with a plain `seq` pane as well; #2477).
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         deck.send_keys(PAGE_UP.as_bytes());

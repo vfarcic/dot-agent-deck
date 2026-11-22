@@ -38,7 +38,7 @@ What you can do by voice, by screen:
 | Anywhere, including an agent's pane | Close what is open over the screen (a pane, Settings, a dialog, a confirmation, an upgrade dialog, an agent's output Reader, a daemon's Host figures); list the commands; turn [reading](#reading) on and off; silence the app's speech ("quiet"); turn voice off; [show the whole, unfiltered dashboard](#filtering-the-dashboard) |
 | Dashboard | Open Settings; [add a daemon](daemons.md#watch-a-daemon-on-another-machine), such as "add a deck", which opens the Add a daemon form; switch which daemon the app shows, such as "switch daemon to build", or show them all with "select all daemons"; [open a daemon's Host figures](#checking-a-daemons-machine); [open the dashboard's counters](#checking-the-counters); open an agent's pane; open New agent; [scroll the dashboard](#scrolling-the-dashboard); [filter the dashboard](#filtering-the-dashboard); [open an agent's pull request](#pull-requests); [ask an agent to generate the project's config](#generating-a-config); stop an agent or close an orchestration (the app shows the same confirmation as the buttons, and nothing stops until you confirm by hand) |
 | New agent dialog | Choose the daemon; open a directory, go up, use the directory shown; [filter the directories](#filtering-directories) or clear the filter; choose a Mode chip or the agent to run; set the Name; [set the Command](#setting-the-command); start; discard |
-| An agent's pane | Type into the agent's prompt; submit it; turn [typing mode](#typing-mode) on and off; with typing off, say "stop" or "close this agent" on its own to ask to close the open agent (confirm by hand); in typing mode, [interrupt the agent, clear its prompt, or scratch what you last dictated](#interrupt-clear-and-scratch-that); [answer the question the agent is waiting on](#answering-an-agents-question); [scroll back through what the agent wrote](#scrolling-an-agents-pane); [open its pull request, or another agent's](#pull-requests); with typing off, [ask it to generate the project's config](#generating-a-config) |
+| An agent's pane | Type into the agent's prompt; submit it; turn [typing mode](#typing-mode) on and off; with typing off, say "stop" or "close this agent" on its own to ask to close the open agent (confirm by hand); in typing mode, [interrupt the agent, clear its prompt, or scratch what you last dictated](#interrupt-clear-and-scratch-that); [answer the question the agent is waiting on](#answering-an-agents-question); with typing off, [scroll back through what the agent wrote](#scrolling-an-agents-pane); [open its pull request, or another agent's](#pull-requests); with typing off, [ask it to generate the project's config](#generating-a-config) |
 | A pull request page | [Scroll it, open it in your system browser, or close it](#pull-requests) |
 | Review project commands | [Approve the commands shown and start the orchestration, or cancel](#approving-project-commands) |
 | The star reminder | [Star the repository, be reminded later, or stop being asked](#the-star-reminder) |
@@ -235,13 +235,15 @@ Scrolling the dashboard by voice works on the dashboard itself, not while the Ne
 
 ## Scrolling an agent's pane
 
-With an agent's pane open, **"scroll up"** and **"scroll down"** move back and forward through what the agent wrote, about a screen at a time, including while the agent is still working. They do what `PageUp` and `PageDown` do when you press them in the pane:
+With an agent's pane open and [typing mode](#typing-mode) off, **"scroll up"** and **"scroll down"** move back and forward through what the agent wrote, about a screen at a time, including while the agent is still working. They do what `PageUp` and `PageDown` do when you press them in the pane:
 
 - **Claude Code with its full-screen interface, Codex, OpenCode and Pi** keep their own history, and the agent scrolls it.
 - **Claude Code with its default interface** writes its output into the pane's history, and the words scroll that history, as the wheel does.
 - When the pane has nothing to scroll, nothing moves and the app says `Nothing to scroll — this pane has no scrollback to move through`, the same message the TUI shows.
 - **"scroll to the top"** and **"scroll to the bottom"** do not move an agent's pane, because agents use different keys to jump to either end; the app says to scroll a screen at a time instead. In a pane that shows its history in the app's terminal, such as Claude Code with its default interface, they do go to the top or the bottom.
-- Devin has not been checked. If its pane has nothing to scroll, the app says so.
+- Devin has not been checked, so scrolling a Devin pane by voice is not verified.
+
+In typing mode, the words are typed into the agent's prompt like the rest of what you say; turn typing mode off to scroll.
 
 When the agent's pull request is open over the pane, the words scroll the pull request page instead. When something else is open over the pane, such as Settings or a dialog, nothing scrolls and the app says to close it first. Over a pane, say "scroll down" rather than "next page" or "page down", which are for lists shown a page at a time.
 

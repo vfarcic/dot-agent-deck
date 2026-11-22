@@ -10,9 +10,12 @@ import type { DashboardScroll } from "./voiceActions";
  * TUI's notice is (PRD #611):
  *
  * - **Alternate screen**: the program in the pane owns its view, so "scroll
- *   up / down" is the PageUp / PageDown a user would press in the pane. It goes
- *   through `terminal.input`, the pane's own input path, so a read-only pane
- *   and the other input gates apply to it as they do to a key. "Scroll to the
+ *   up / down" is the PageUp / PageDown a user would press in the pane, written
+ *   to the agent by `sendKey`. The caller writes it straight to the agent
+ *   rather than through the terminal's `onData`, so voice does not record its
+ *   own scroll as a hand edit of the prompt (which would end "scratch that"
+ *   for what was dictated); `inputBlocked` is what stands in for the input
+ *   gates there. "Scroll to the
  *   top / bottom" moves nothing: the agents disagree on the key for it
  *   (Ctrl+Home for some, Home for another), and sending every candidate would
  *   type keys into some agents' prompts.
@@ -31,6 +34,7 @@ export const PANE_AT_TOP = "The pane is already at the top.";
 export const PANE_AT_BOTTOM = "The pane is already at the bottom.";
 export const PANE_TERMINAL_HIDDEN = "The agent's terminal is not showing, so it was not scrolled. Switch back to its terminal first.";
 export const PANE_COVERED = "Something is open over the agent's pane, so it was not scrolled. Close it first.";
+export const PANE_AGENT_GONE = "The agent in this pane is no longer shown, so nothing was scrolled.";
 
 /** PageUp and PageDown as a terminal sends them, and as the TUI forwards them (`keyevent_to_bytes`). */
 export const PAGE_UP = "\x1b[5~";
@@ -39,19 +43,18 @@ export const PAGE_DOWN = "\x1b[6~";
 /** The part of an xterm `Terminal` this reads and moves. */
 export type ScrollablePane = {
   buffer: { active: { type: "normal" | "alternate"; baseY: number; viewportY: number } };
-  input(data: string, wasUserInput?: boolean): void;
   scrollPages(pageCount: number): void;
   scrollToTop(): void;
   scrollToBottom(): void;
 };
 
-export function scrollAgentPane(terminal: ScrollablePane | undefined, move: DashboardScroll, inputBlocked?: string): string | undefined {
+export function scrollAgentPane(terminal: ScrollablePane | undefined, move: DashboardScroll, sendKey: (key: string) => void, inputBlocked?: string): string | undefined {
   if (!terminal) return PANE_TERMINAL_HIDDEN;
   const buffer = terminal.buffer.active;
   if (buffer.type === "alternate") {
     if (move === "top" || move === "bottom") return PANE_SCROLLS_BY_SCREEN;
     if (inputBlocked) return `The pane was not scrolled: ${inputBlocked}`;
-    terminal.input(move === "up" ? PAGE_UP : PAGE_DOWN, true);
+    sendKey(move === "up" ? PAGE_UP : PAGE_DOWN);
     return undefined;
   }
   if (buffer.baseY <= 0) return PANE_NOTHING_TO_SCROLL;

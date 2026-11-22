@@ -9599,15 +9599,15 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 
 ##### mode/scroll/009 — A REAL full-screen Claude Code scrolls its own transcript on PageUp / PageDown written to its pane (issue #1673).
 - **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_agent_scroll_live.rs`; the keys are written on an attach stream as `KIND_STREAM_IN` frames, the way the desktop writes what its terminal sends; asserted on the rendered vt100 grid as the numbers at the start of a pane line).
-- **Agent:** REAL interactive Claude Code on Haiku (`claude-haiku-4-5-20251001`, `--settings '{"tui":"fullscreen"}'` with `CLAUDE_CODE_NO_FLICKER=1`, `--allowedTools Bash Read`, no `-p`), started with `StartAgent`, credentials imported and the work directory's trust seeded.
+- **Agent:** REAL interactive Claude Code on Haiku (`claude-haiku-4-5-20251001`, `--settings` naming a file in its working directory that sets `"tui": "fullscreen"`, with `CLAUDE_CODE_NO_FLICKER=1`, `--allowedTools Bash Read`, no `-p`), started with `StartAgent`, credentials imported and the work directory's trust seeded.
 - **Asserts:** after the agent types the integers 1 to 150 and the screen settles, a written `ESC[5~` takes 150 off the screen while earlier numbers show; repeated `ESC[6~` brings 150 back; the agent is still registered and not `crashed`. This is the route the desktop's voice "scroll up" / "scroll down" take over a pane on the alternate screen.
 - **Does not assert:** the desktop app itself (its routing is `desktop/src/lib/paneScroll.test.ts` and `PullRequestBrowser.test.tsx`'s issue #1673 block); how many lines one PageUp moves; the wheel; mid-turn scrolling (measured by hand for the issue, not pinned).
 - **Platform coverage:** mac+linux.
 
 ##### mode/scroll/010 — A REAL Claude Code on its default renderer leaves its output in the history the deck scrolls (issue #1673).
 - **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_agent_scroll_live.rs`; the prompt is written on an attach stream, PageUp is pressed in the TUI's command mode; asserted on the rendered vt100 grid).
-- **Agent:** REAL interactive Claude Code on Haiku with `--settings '{"tui":"default"}'` (inline renderer), `--allowedTools Bash Read`, started with `StartAgent`.
-- **Asserts:** after the agent types 1 to 150 and the screen settles, Ctrl+D then PageUp in command mode takes 150 off the screen while earlier numbers show, with no `Nothing to scroll` notice, and the agent is still running. This is the TUI's half of the route the desktop takes for a pane on the main screen with history (it scrolls its own terminal history).
+- **Agent:** REAL interactive Claude Code on Haiku with `--settings` naming a file that sets `"tui": "default"` (inline renderer; the harness copies the host's `settings.json`, so the renderer is pinned), `--allowedTools Bash Read`, started with `StartAgent`.
+- **Asserts:** after the agent types 1 to 150 and the screen settles, Ctrl+D then PageUp in command mode (pressed until the view moves, because the first press after Ctrl+D can be lost, #2477) takes 150 off the screen while earlier numbers show, with no `Nothing to scroll` notice, and the agent is still running. This is the TUI's half of the route the desktop takes for a pane on the main screen with history (it scrolls its own terminal history).
 - **Does not assert:** that the desktop's xterm.js keeps the same history (it is fed the same bytes; not driven here); that PageUp written to the agent does nothing (measured for the issue, not pinned).
 - **Platform coverage:** mac+linux.
 
