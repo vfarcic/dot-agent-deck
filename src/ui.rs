@@ -16980,6 +16980,13 @@ pub fn run_tui(
                 embedded.report_focus(&ev, std::time::Instant::now());
             }
 
+            // Issue #2450: a terminal focus-in lets the upgrade checker check
+            // again when its last check is more than an hour old, since its
+            // interval timer does not advance while the machine sleeps.
+            if matches!(ev, Event::FocusGained) {
+                crate::upgrade_dialog::focus_gained();
+            }
+
             // PRD #84 M4 (invariant 4): a terminal resize is now just a
             // re-render trigger. The pre-draw `resize_panes_to_layout` at the
             // top of the next loop iteration recomputes the layout and commits
