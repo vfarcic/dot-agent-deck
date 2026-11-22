@@ -21,6 +21,8 @@ import type { AnswerOutcomeDto, PendingQuestionDto, QuestionResultDto, QuestionS
 import { pullRequestFromDto } from "./pullRequest";
 import type { ProjectTrust, ProjectTrustTarget } from "./projectTrust";
 import { STAR_THANKS, type StarChoice } from "./starPrompt";
+import { fixtureInterruptedWork } from "../data/fixtureInterrupted";
+import { isDismissOutcome, isInterruptedList, isInterruptedShow, isReclaimOutcome, normalizeInterruptedReply, type DismissOutcome, type InterruptedList, type InterruptedReply, type InterruptedShow, type InterruptedTarget, type ReclaimOutcome } from "./interruptedWork";
 import { NOTICE_THANKS, noticeStartFrom, type NoticeChoice, type NoticeStart } from "./antigravityNotice";
 import { DEFAULT_DESKTOP_FEATURES, UNREPORTED } from "../types";
 import type { HandoffEdge,
@@ -2483,6 +2485,21 @@ export interface DeckBridge {
    * (`target.instanceId`): a successor is sent nothing (`daemon_replaced`).
    */
   invokeCardAction?(target: AgentCardTarget, actionId: string, options: CardActionOptions): Promise<CardActionResult>;
+  /**
+   * PRD #1790 stage 2 — one deck's interrupted work (`interrupted_work_list`):
+   * what a restart of its daemon left behind, from daemon process
+   * `target.instance`, with each item's Git and pull request facts when `git`
+   * is set. `unsupported` from a daemon that does not advertise it, or is
+   * another process; the app shows nothing then. Optional: a bridge without it
+   * shows no interrupted work.
+   */
+  interruptedWorkList?(target: InterruptedTarget, git: boolean): Promise<InterruptedReply<InterruptedList>>;
+  /** PRD #1790 stage 2 — one item and a page of its kept reports' text (`interrupted_work_show`), from its `reportsFrom`-th on. */
+  interruptedWorkShow?(target: InterruptedTarget, id: string, reportsFrom: number): Promise<InterruptedReply<InterruptedShow>>;
+  /** PRD #1790 stage 2 — reclaim one item, or with `dryRun` ask what that would do (`interrupted_work_reclaim`). The person's client: no pane claim. */
+  interruptedWorkReclaim?(target: InterruptedTarget, id: string, dryRun: boolean): Promise<InterruptedReply<ReclaimOutcome>>;
+  /** PRD #1790 stage 2 — dismiss exactly the items `ids` name (`interrupted_work_dismiss`); Dismiss all passes the ids it listed. */
+  interruptedWorkDismiss?(target: InterruptedTarget, ids: string[]): Promise<InterruptedReply<DismissOutcome>>;
   dispose(): Promise<void>;
 }
 
@@ -3292,6 +3309,30 @@ class FixtureDeckBridge implements DeckBridge {
   /** The preview's cards never change, so there is nothing to push. */
   async subscribeAgentCards(): Promise<Unsubscribe> {
     return () => undefined;
+  }
+  /**
+   * PRD #1790 stage 2 — the preview's interrupted work, served only with
+   * `interrupted=1` in the URL, `interrupted=many` for 27 more units than
+   * the three (a list longer than the dialog), or `interrupted=unread` for an
+   * empty list that says the journal could not be read whole (verification
+   * finding N4): a daemon that does not support it otherwise. Dismiss and a
+   * real reclaim remove the item for the rest of the session.
+   */
+  private readonly interrupted = (() => {
+    const asked = new URLSearchParams(typeof window === "undefined" ? "" : window.location.search).get("interrupted");
+    return fixtureInterruptedWork(asked === "1" || asked === "many" || asked === "unread", asked === "many" ? 27 : 0, asked === "unread");
+  })();
+  async interruptedWorkList(target: InterruptedTarget): Promise<InterruptedReply<InterruptedList>> {
+    return this.interrupted.list(target);
+  }
+  async interruptedWorkShow(target: InterruptedTarget, id: string, reportsFrom: number): Promise<InterruptedReply<InterruptedShow>> {
+    return this.interrupted.show(target, id, reportsFrom);
+  }
+  async interruptedWorkReclaim(target: InterruptedTarget, id: string, dryRun: boolean): Promise<InterruptedReply<ReclaimOutcome>> {
+    return this.interrupted.reclaim(target, id, dryRun);
+  }
+  async interruptedWorkDismiss(target: InterruptedTarget, ids: string[]): Promise<InterruptedReply<DismissOutcome>> {
+    return this.interrupted.dismiss(target, ids);
   }
   /** The preview answers a card action as a daemon that queued it would; nothing changes in the fixture's state. */
   async invokeCardAction(_target: AgentCardTarget, actionId: string, options: CardActionOptions): Promise<CardActionResult> {
@@ -6062,6 +6103,26 @@ export class TauriDeckBridge implements DeckBridge {
   async consumeAgentCards(): Promise<void> {
     const invoke = await this.getInvoke();
     await invoke<null>("agent_cards_consume");
+  }
+
+  async interruptedWorkList(target: InterruptedTarget, git: boolean): Promise<InterruptedReply<InterruptedList>> {
+    const invoke = await this.getInvoke();
+    return normalizeInterruptedReply(await invoke<unknown>("interrupted_work_list", { deckId: target.deckId, instanceId: target.instance, git }), isInterruptedList);
+  }
+
+  async interruptedWorkShow(target: InterruptedTarget, id: string, reportsFrom: number): Promise<InterruptedReply<InterruptedShow>> {
+    const invoke = await this.getInvoke();
+    return normalizeInterruptedReply(await invoke<unknown>("interrupted_work_show", { deckId: target.deckId, instanceId: target.instance, id, report: null, reportsFrom }), isInterruptedShow);
+  }
+
+  async interruptedWorkReclaim(target: InterruptedTarget, id: string, dryRun: boolean): Promise<InterruptedReply<ReclaimOutcome>> {
+    const invoke = await this.getInvoke();
+    return normalizeInterruptedReply(await invoke<unknown>("interrupted_work_reclaim", { deckId: target.deckId, instanceId: target.instance, id, dryRun }), isReclaimOutcome);
+  }
+
+  async interruptedWorkDismiss(target: InterruptedTarget, ids: string[]): Promise<InterruptedReply<DismissOutcome>> {
+    const invoke = await this.getInvoke();
+    return normalizeInterruptedReply(await invoke<unknown>("interrupted_work_dismiss", { deckId: target.deckId, instanceId: target.instance, ids }), isDismissOutcome);
   }
 
   async agentCards(deckId: string): Promise<AgentCardsSnapshot | null> {

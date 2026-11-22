@@ -217,17 +217,23 @@ async fn rebind(path: &Path, state_dir: &Path) -> Option<IpcListener> {
 /// outside it could land between that client's probe and its unlink, and the
 /// client would unlink the listener just bound. The wait for the lock is
 /// bounded past a client's own wait for a daemon to start; if it runs out, or
-/// the lock cannot be taken, the bind goes ahead without it.
+/// the lock cannot be taken, the bind goes ahead without it. On Unix a wait
+/// that runs out leaves nothing waiting for the lock
+/// ([`crate::platform::lock::acquire_spawn_lock_within`]).
 async fn bind_under_spawn_lock(path: &Path, state_dir: &Path) -> io::Result<IpcListener> {
+    use crate::platform::lock::LockWaitError;
     let wait = crate::daemon_attach::daemon_start_poll_timeout() + SPAWN_LOCK_EXTRA_WAIT;
     let lock = match crate::platform::fsperm::ensure_owner_only_dir(state_dir) {
-        Ok(()) => tokio::time::timeout(
-            wait,
-            crate::platform::lock::acquire_spawn_lock(&state_dir.join("spawn.lock")),
-        )
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "waited too long"))
-        .and_then(|taken| taken),
+        Ok(()) => {
+            crate::platform::lock::acquire_spawn_lock_within(&state_dir.join("spawn.lock"), wait)
+                .await
+                .map_err(|e| match e {
+                    LockWaitError::Busy => {
+                        io::Error::new(io::ErrorKind::TimedOut, "waited too long")
+                    }
+                    LockWaitError::Failed(e) => e,
+                })
+        }
         Err(e) => Err(e),
     };
     if let Err(e) = &lock {
