@@ -1,3 +1,4 @@
+import type { EndedRole } from "../types";
 import { BellRing } from "lucide-react";
 
 import { groupCards, type CardResults, type PlacedCard } from "../lib/agentCards";
@@ -45,13 +46,20 @@ export function AgentCardsToolbar({ cards, needsYouOnly, controls }: {
  * in the daemon's order. The Needs you filter hides the cards the daemon did
  * not mark.
  */
-export function AgentCardsDeckBody({ deckId, cards, needsYouOnly, controls, results }: {
+/** Issue #1965 — the exited role a card is for: the same pane and the same agent generation. */
+function endedRoleOfCard(endedRoles: readonly EndedRole[] | undefined, card: PlacedCard): EndedRole | undefined {
+  return endedRoles?.find((role) => role.paneId === card.entry.pane_id && role.agentId === card.entry.agent_id);
+}
+
+export function AgentCardsDeckBody({ deckId, cards, needsYouOnly, controls, results, endedRoles }: {
   deckId: string;
   cards: readonly PlacedCard[];
   needsYouOnly: boolean;
   controls: CardControls;
   /** The last answer to each action pressed on a card, to show under its primary button. */
   results?: (card: PlacedCard) => CardResults;
+  /** Issue #1965 — this deck's exited orchestration roles, whose stopped cards say why. */
+  endedRoles?: readonly EndedRole[];
 }) {
   const groups = groupCards([...cards], needsYouOnly);
   if (groups.length === 0) return null;
@@ -65,7 +73,7 @@ export function AgentCardsDeckBody({ deckId, cards, needsYouOnly, controls, resu
             <span className="agent-cards-group-count" data-testid="agent-cards-group-count">{group.total} {group.total === 1 ? "agent" : "agents"} · {group.needYou} {group.needYou === 1 ? "needs" : "need"} you</span>
           </h3>
           <div className="agent-cards-grid">
-            {group.cards.map((card) => <AgentCard key={`${card.entry.instance_id}\u0000${card.entry.key}`} card={card} controls={controls} results={results?.(card)} />)}
+            {group.cards.map((card) => <AgentCard key={`${card.entry.instance_id}\u0000${card.entry.key}`} card={card} controls={controls} results={results?.(card)} ended={endedRoleOfCard(endedRoles, card)} />)}
           </div>
         </section>
       ))}

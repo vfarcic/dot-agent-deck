@@ -177,6 +177,11 @@ pub(crate) enum FetchReason {
     /// (`AgentRecord::input_held`, `AgentRecord::input_discarded`), as the
     /// inbox counts do, so the next refresh re-reads it.
     InputHeld,
+    /// Issue #1965: an orchestration role's agent exited. Its record has left
+    /// the live list and joined `ended_roles`, which the next refresh reads,
+    /// so the tile becomes the role's exited row without waiting for the
+    /// periodic reconcile.
+    RoleEnded,
     /// The periodic reconciliation, which is the only thing that catches a
     /// silent removal.
     Reconcile,
@@ -194,6 +199,11 @@ pub(crate) struct AgentView {
     /// never pairs a fresh revision with a stale list. `None` from a daemon that
     /// reports none.
     schedule_revision: Option<u64>,
+    /// Issue #1965: the orchestration roles whose agent exited, from the same
+    /// reply as `records`, replayed on the cached path beside them. No event
+    /// says a pane's command exited, so a role moves from `records` to here
+    /// only on a full fetch.
+    ended_roles: Vec<dot_agent_deck::ended_role::EndedRole>,
     /// PRD #1666 part 2 (G-fix4): the daemon process the same reply came from,
     /// stamped on every row rendered from `records` so an action on one of
     /// them reaches that process or nothing. Rows an event fold changes keep
@@ -230,6 +240,7 @@ impl Default for AgentView {
         Self {
             records: Vec::new(),
             schedule_revision: None,
+            ended_roles: Vec::new(),
             incarnation: None,
             fold: AppState::default(),
             due: Some(FetchReason::Initial),
@@ -263,6 +274,7 @@ impl AgentView {
         // across a subscription gap would let the picker conclude "unchanged"
         // from a number this view is no longer entitled to report.
         self.schedule_revision = None;
+        self.ended_roles.clear();
         self.incarnation = None;
         // PRD #1258 M4: a new subscription may be a different daemon process.
         self.host_metrics = None;
@@ -352,6 +364,8 @@ impl AgentView {
             // an unknown kind in a tight loop therefore costs one `ListAgents`
             // per coalescing window, which is what an equally busy known kind
             // costs.
+            // Issue #1965: see `FetchReason::RoleEnded`.
+            BroadcastMsg::RoleEnded(_) => self.mark(FetchReason::RoleEnded),
             BroadcastMsg::Unknown => self.mark(FetchReason::UnknownBroadcast),
         }
     }
@@ -437,6 +451,7 @@ impl AgentView {
         let AgentListing {
             records,
             schedule_revision,
+            ended_roles,
             incarnation,
         } = listing;
         let mut fold = AppState::default();
@@ -461,6 +476,7 @@ impl AgentView {
         self.fold = fold;
         self.records = records;
         self.schedule_revision = schedule_revision;
+        self.ended_roles = ended_roles;
         self.incarnation = incarnation;
         self.due = None;
         self.fetched_at = Some(now);
@@ -500,6 +516,12 @@ impl AgentView {
         self.schedule_revision
     }
 
+    /// Issue #1965: the exited orchestration roles from the reply that
+    /// installed the current list.
+    pub(crate) fn ended_roles(&self) -> &[dot_agent_deck::ended_role::EndedRole] {
+        &self.ended_roles
+    }
+
     /// PRD #1666 part 2 (G-fix4): the daemon process the reply that installed
     /// the current list came from — see the field.
     pub(crate) fn incarnation(&self) -> Option<&Incarnation> {
@@ -537,6 +559,7 @@ mod tests {
         AgentListing {
             records,
             schedule_revision: None,
+            ended_roles: Vec::new(),
             incarnation: None,
         }
     }
@@ -622,6 +645,44 @@ mod tests {
             "the fold must have moved the rendered status"
         );
         assert_eq!(view.fetch_count(), 1, "only the install fetched");
+    }
+
+    /// Scenario: install one orchestration role, then receive the daemon's
+    /// word that its agent exited (issue #1965). The word makes the next
+    /// refresh fetch; installing the reply that fetch returns, with the role
+    /// gone from the records and listed as ended, the view serves the ended
+    /// role, and a resubscribe discards it with the list.
+    #[test]
+    fn an_ended_role_makes_the_list_that_carries_it_fetched() {
+        let now = Instant::now();
+        let mut view = AgentView::default();
+        view.install(listing(vec![record("7", "pane-7")]), now);
+        let ended = dot_agent_deck::ended_role::EndedRole {
+            pane_id: "pane-7".into(),
+            agent_id: "7".into(),
+            role_index: 1,
+            role_name: "reviewer".into(),
+            orchestration_id: Some("orch-1".into()),
+            orchestration_name: "mixed".into(),
+            display_title: None,
+            termination: None,
+            last_output: Vec::new(),
+        };
+        view.apply(&BroadcastMsg::RoleEnded(ended.clone()));
+        assert_eq!(view.needs_fetch(now), Some(FetchReason::RoleEnded));
+
+        view.install(
+            AgentListing {
+                records: Vec::new(),
+                schedule_revision: None,
+                ended_roles: vec![ended.clone()],
+                incarnation: None,
+            },
+            now,
+        );
+        assert_eq!(view.ended_roles(), std::slice::from_ref(&ended));
+        view.resubscribed();
+        assert!(view.ended_roles().is_empty());
     }
 
     /// Scenario: install one agent that has sent no hook, then receive the
@@ -1185,6 +1246,7 @@ mod tests {
             AgentListing {
                 records: vec![record("7", "pane-7")],
                 schedule_revision: Some(4),
+                ended_roles: Vec::new(),
                 incarnation: None,
             },
             now,
@@ -1210,6 +1272,7 @@ mod tests {
             AgentListing {
                 records: vec![record("7", "pane-7")],
                 schedule_revision: Some(9),
+                ended_roles: Vec::new(),
                 incarnation: None,
             },
             now,

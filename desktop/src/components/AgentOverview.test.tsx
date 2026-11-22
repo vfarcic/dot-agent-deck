@@ -20,6 +20,7 @@ import { createFixtureFleet, createFixtureSnapshot, FIXTURE_DAEMON_ID, FIXTURE_P
 import { DEFAULT_DESKTOP_SETTINGS, type DesktopSettingsDto, PENDING_DECK_MESSAGE, fixtureDesktopFeatures, pendingDeckSnapshot, statusFromDaemon, unconfiguredDeckSnapshot } from "../lib/bridge";
 import { tuiStatusWords } from "../test/tuiStatusWords";
 import { DISPLAY_LIMITS } from "../lib/displayText";
+import { ENDED_ROLE_WORDS } from "../lib/endedRoles";
 import { UNREPORTED } from "../types";
 import type { AgentSession, DeckRuntimeState, DeckSnapshot, DeckView } from "../types";
 
@@ -3494,5 +3495,84 @@ describe("The daemon's status words (issue #2411)", () => {
     expect(screen.queryByTestId("overview-count-running")).toBeNull();
     expect(screen.queryByTestId("overview-count-failed")).toBeNull();
     expect(screen.getByTestId("dashboard-counters-popover").textContent).not.toMatch(/RUNNING|FAILED/);
+  });
+});
+
+describe("an orchestration role whose agent exited (issue #1965)", () => {
+  beforeEach(() => window.localStorage.clear());
+
+  function deckWithEndedRole(): DeckSnapshot {
+    const snapshot = createFixtureSnapshot("connected");
+    const seed = snapshot.agents[0] as AgentSession;
+    snapshot.agents = [
+      { ...seed, id: "coder", displayName: "Coder", tab: { kind: "orchestration", name: "mixed", orchestrationId: "mixed-run", roleName: "coder", roleIndex: 0, isStartRole: true } },
+    ];
+    snapshot.endedRoles = [
+      // Another orchestration's exited role, which this group must not show.
+      { paneId: "9", agentId: "9", roleIndex: 1, roleName: "elsewhere", orchestrationId: "other-run", orchestrationName: "other", reason: "its pane ended", headline: "elsewhere exited: its pane ended", lastOutput: [] },
+      { paneId: "4", agentId: "4", roleIndex: 1, roleName: "reviewer", orchestrationId: "mixed-run", orchestrationName: "mixed", reason: "its command exited (code 1)", headline: "reviewer exited: its command exited (code 1)", lastOutput: ["Error: Failed to load extension", "Cannot find module './usage-file.ts'"] },
+    ];
+    return snapshot;
+  }
+
+  /// Scenario: A connected deck runs an orchestration whose reviewer role's command exited at spawn. The orchestration's group
+  /// shows a row for the reviewer saying Exited, why (its exit code) and the last lines its pane printed, beside the live coder,
+  /// and not another orchestration's exited role.
+  it("shows the exited role, why it ended and its last output in its orchestration's group", () => {
+    window.history.replaceState({}, "", "/?fixture=1");
+    renderOverview({ snapshot: deckWithEndedRole() });
+    const mixed = screen.getAllByTestId(/^overview-group-orchestration/).find((group) => group.textContent?.includes("Coder")) as HTMLElement;
+    const ended = within(mixed).getAllByTestId("overview-ended-role");
+    expect(ended).toHaveLength(1);
+    const row = ended[0] as HTMLElement;
+    expect(row).toHaveTextContent("reviewer");
+    expect(row).toHaveTextContent(ENDED_ROLE_WORDS.status);
+    expect(row).toHaveTextContent("its command exited (code 1)");
+    expect(row).toHaveTextContent(`${ENDED_ROLE_WORDS.lastOutput}:`);
+    expect(row).toHaveTextContent("Cannot find module './usage-file.ts'");
+    expect(row).toHaveAttribute("title", "reviewer exited: its command exited (code 1)");
+    expect(within(row).queryByRole("button")).not.toBeInTheDocument();
+    // Another orchestration's exited role is not drawn in this group.
+    expect(within(mixed).queryByText("elsewhere")).not.toBeInTheDocument();
+  });
+
+  /// Scenario: Every role of an orchestration has exited, so no live agent is left to group them by. The dashboard still shows
+  /// the orchestration, headed by its title, with each role's Exited row in role order.
+  it("gives an orchestration whose roles have all exited a group of its own", () => {
+    window.history.replaceState({}, "", "/?fixture=1");
+    const snapshot = deckWithEndedRole();
+    snapshot.agents = [];
+    snapshot.endedRoles = [
+      { paneId: "5", agentId: "5", roleIndex: 1, roleName: "reviewer", orchestrationId: "solo-run", orchestrationName: "solo", displayTitle: "Release review", reason: "its command exited (code 1)", headline: "reviewer exited: its command exited (code 1)", lastOutput: [] },
+      { paneId: "4", agentId: "4", roleIndex: 0, roleName: "coder", orchestrationId: "solo-run", orchestrationName: "solo", displayTitle: "Release review", reason: "its command exited (code 2)", headline: "coder exited: its command exited (code 2)", lastOutput: [] },
+    ];
+    renderOverview({ snapshot });
+    const group = screen.getByTestId(/^overview-group-orchestration/);
+    expect(within(group).getByRole("heading", { level: 3 })).toHaveTextContent("Release review");
+    expect(within(group).getAllByTestId("overview-ended-role").map((row) => row.querySelector(".overview-ended-name")?.textContent)).toEqual(["coder", "reviewer"]);
+    expect(within(group).queryByTestId("overview-close-orchestration")).not.toBeInTheDocument();
+  });
+
+  /// Scenario: With a dashboard filter active, the exited rows have no agent for the filter to match, so they are left out,
+  /// including a group made only of exited roles; clearing the filter brings them back.
+  it("leaves exited rows out of a filtered dashboard", () => {
+    window.history.replaceState({}, "", "/?fixture=1");
+    renderOverviewWithStoredColumns(undefined, { snapshot: deckWithEndedRole() });
+    expect(screen.getAllByTestId("overview-ended-role").length).toBeGreaterThan(0);
+    fireEvent.change(screen.getByRole("textbox", { name: "Filter agents" }), { target: { value: "Coder" } });
+    expect(screen.queryByTestId("overview-ended-role")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Show all" }));
+    expect(screen.getAllByTestId("overview-ended-role").length).toBeGreaterThan(0);
+  });
+
+  /// Scenario: The exited role's index is now held by a live agent (the role was restarted). The group shows the live agent only.
+  it("shows no exited row for a role a live agent holds again", () => {
+    window.history.replaceState({}, "", "/?fixture=1");
+    const snapshot = deckWithEndedRole();
+    const seed = snapshot.agents[0] as AgentSession;
+    snapshot.agents.push({ ...seed, id: "reviewer-2", displayName: "Reviewer", tab: { kind: "orchestration", name: "mixed", orchestrationId: "mixed-run", roleName: "reviewer", roleIndex: 1, isStartRole: false } });
+    renderOverview({ snapshot });
+    const mixed = screen.getAllByTestId(/^overview-group-orchestration/).find((group) => group.textContent?.includes("Coder")) as HTMLElement;
+    expect(within(mixed).queryByTestId("overview-ended-role")).not.toBeInTheDocument();
   });
 });
