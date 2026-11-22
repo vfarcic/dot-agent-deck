@@ -1286,6 +1286,16 @@ pub const CAP_KEEP_WORKTREE: &str = "keep-worktree";
 /// platform: none of the three arms is `#[cfg]`-gated.
 pub const CAP_AGENT_CARDS: &str = "agent-cards";
 
+/// Capability string for [`AttachRequest::AgentOpened`] (issue #2454): a
+/// client tells the daemon the user opened an agent's pane, which deals with
+/// the `waiting`, `done` or `failed` reason the agent's card report raised.
+/// Sent only by [`crate::daemon_client::DaemonClient::agent_opened`], after a
+/// `Hello` on the same connection named this, so no [`PROTOCOL_VERSION`]
+/// bump: an older daemon is sent nothing, and its cards keep the reason until
+/// the agent publishes again, as before. Advertised on every platform: the
+/// arm is not `#[cfg]`-gated.
+pub const CAP_AGENT_OPENED: &str = "agent-opened";
+
 /// Capability string for [`AttachRequest::ListOutcomes`] (PRD #1666 part 3,
 /// round 5, plan D10): the deck's recovery rows — reports and dispatch results
 /// set aside because their recipient was gone. Sent only by
@@ -1513,6 +1523,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_AGENT_CARDS,
     CAP_INTERRUPTED_WORK,
     CAP_REARM_ORCHESTRATOR,
+    CAP_AGENT_OPENED,
 ];
 #[cfg(not(unix))]
 pub const DAEMON_CAPABILITIES: &[&str] = &[
@@ -1545,6 +1556,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_AGENT_CARDS,
     CAP_INTERRUPTED_WORK,
     CAP_REARM_ORCHESTRATOR,
+    CAP_AGENT_OPENED,
 ];
 
 // ---------------------------------------------------------------------------
@@ -3575,6 +3587,20 @@ pub enum AttachRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         text: Option<String>,
     },
+    /// Issue #2454: the user opened the agent in `pane_id` — its pane in the
+    /// desktop app's overlay or full window, or in the TUI. That deals with
+    /// the `waiting`, `done` or `failed` reason its card report raised, so
+    /// the card stops needing the user until the agent publishes again.
+    /// `agent_id`, when given, names the generation the client showed: the
+    /// daemon does nothing when the pane's current agent is another. The
+    /// answer is a plain `ok`, whether or not a card changed. **Withheld
+    /// unless the daemon advertises [`CAP_AGENT_OPENED`]** on the connection
+    /// that carries it, so no [`PROTOCOL_VERSION`] bump.
+    AgentOpened {
+        pane_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+    },
     /// PRD #1666 part 3 (Q35-14b, OQ10): the `e2e` build's control of an
     /// installed generation's arm page: `operation` `publish` or `withdraw`
     /// puts up or takes back its one test liability through the records and
@@ -4385,6 +4411,18 @@ pub struct AttachResponse {
     /// cannot answer the question at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestration_roles: Option<Vec<crate::state::OrchestrationRoleRecord>>,
+    /// Issue #1965: the orchestration roles whose agent exited on its own and
+    /// whose pane nobody closed yet ([`crate::agent_pty::AgentPtyRegistry::ended_roles`]),
+    /// with how each pane ended and the last lines it showed. Populated on the
+    /// [`AttachRequest::ListAgents`] reply, beside the live records that no
+    /// longer list them, so a client can show which role died and why instead
+    /// of dropping it.
+    ///
+    /// Additive and optional, so no [`PROTOCOL_VERSION`] bump: an older client
+    /// ignores the key, and a client reading an older daemon's reply gets
+    /// `None` and shows what it showed before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_roles: Option<Vec<crate::ended_role::EndedRole>>,
     /// Issue #1637: the agents whose hooks run a `dot-agent-deck` older than
     /// this daemon (or that this deck could not install hooks for, issue
     /// #1157), with what to do about each. Set on the [`AttachRequest::Hello`]
@@ -7210,6 +7248,8 @@ async fn handle_connection(
             crate::agent_pty::attach_project_config_exists(&mut records).await;
             let mut resp = AttachResponse::agent_records(records);
             resp.orchestration_roles = Some(orchestration_roles);
+            // Issue #1965: the roles the live records above no longer list.
+            resp.ended_roles = Some(registry.ended_roles());
             // Issue #887: the client's only observable of the schedule seed the
             // daemon's project list draws on. See `AttachResponse::schedule_revision`.
             resp.schedule_revision = Some(scheduler.revision());
@@ -8419,6 +8459,11 @@ async fn handle_connection(
                 ..AttachResponse::ok()
             };
             write_resp(&mut stream, &resp).await?
+        }
+        AttachRequest::AgentOpened { pane_id, agent_id } => {
+            crate::agent_cards::agent_opened(&registry, &state, &pane_id, agent_id.as_deref())
+                .await;
+            write_resp(&mut stream, &AttachResponse::ok()).await?
         }
         AttachRequest::AgentCardCatalog => {
             let catalog = registry.agent_cards().catalog();

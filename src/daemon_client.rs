@@ -1138,6 +1138,11 @@ pub struct AgentListing {
     /// client may read it — and, in particular, that it is comparable only
     /// against earlier values from the same connection.
     pub schedule_revision: Option<u64>,
+    /// Issue #1965: the orchestration roles whose agent exited and whose pane
+    /// is still open, sanitised at the wire boundary
+    /// ([`crate::ended_role::EndedRole::sanitized`]). Empty from a daemon that
+    /// does not report them.
+    pub ended_roles: Vec<crate::ended_role::EndedRole>,
     /// PRD #1666 part 2 (G-fix4): the daemon process that answered, from the
     /// `Hello` on the listing's own connection — what a client binds an action
     /// on one of these records to ([`DaemonClient::bound_to`]). `None` from an
@@ -2147,6 +2152,12 @@ impl DaemonClient {
             ));
         }
         let schedule_revision = resp.schedule_revision;
+        let ended_roles: Vec<crate::ended_role::EndedRole> = resp
+            .ended_roles
+            .unwrap_or_default()
+            .into_iter()
+            .map(crate::ended_role::EndedRole::sanitized)
+            .collect();
         if let Some(mut records) = resp.agent_records {
             for rec in &mut records {
                 sanitize_record_tab_membership(rec);
@@ -2154,6 +2165,7 @@ impl DaemonClient {
             return Ok(AgentListing {
                 records,
                 schedule_revision,
+                ended_roles,
                 incarnation,
             });
         }
@@ -2194,6 +2206,7 @@ impl DaemonClient {
                 })
                 .collect(),
             schedule_revision,
+            ended_roles,
             incarnation,
         })
     }
@@ -4210,9 +4223,20 @@ impl DaemonClient {
     async fn agent_cards_connection(
         &self,
     ) -> Result<Option<(TransportReadHalf, TransportWriteHalf)>, ClientError> {
+        self.follow_on_connection(crate::daemon_protocol::CAP_AGENT_CARDS)
+            .await
+    }
+
+    /// A connection whose own `Hello` advertised `capability` and
+    /// [`crate::daemon_protocol::CAP_HELLO_FOLLOW_ON`], left open for one
+    /// request, or `None` when the daemon advertises either not — and then
+    /// nothing follows the `Hello` ([`Self::agent_cards_connection`]).
+    async fn follow_on_connection(
+        &self,
+        capability: &str,
+    ) -> Result<Option<(TransportReadHalf, TransportWriteHalf)>, ClientError> {
         let supported = |caps: &DaemonCapabilities| {
-            caps.supports(crate::daemon_protocol::CAP_AGENT_CARDS)
-                && caps.supports(crate::daemon_protocol::CAP_HELLO_FOLLOW_ON)
+            caps.supports(capability) && caps.supports(crate::daemon_protocol::CAP_HELLO_FOLLOW_ON)
         };
         if self.protocol_gate || self.bound.is_some() {
             if !supported(&self.capabilities().await?) {
@@ -4263,6 +4287,41 @@ impl DaemonClient {
         resp.agent_cards
             .map(GatedQuery::Answered)
             .ok_or_else(|| ClientError::Malformed("list-agent-cards answered no cards".into()))
+    }
+
+    /// Issue #2454: tell the daemon the user opened the agent in `pane_id`
+    /// (`agent_id` naming the generation shown, when known), which deals with
+    /// the reason its card report raised. **Withheld unless the daemon's
+    /// `Hello` on the same connection advertised
+    /// [`crate::daemon_protocol::CAP_AGENT_OPENED`]**, answering
+    /// [`GatedQuery::Unsupported`] without sending anything: an older daemon's
+    /// cards keep the reason until the agent publishes again.
+    pub async fn agent_opened(
+        &self,
+        pane_id: &str,
+        agent_id: Option<&str>,
+    ) -> Result<GatedQuery<()>, ClientError> {
+        let Some((mut rd, mut wr)) = self
+            .follow_on_connection(crate::daemon_protocol::CAP_AGENT_OPENED)
+            .await?
+        else {
+            return Ok(GatedQuery::Unsupported);
+        };
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::AgentOpened {
+                pane_id: pane_id.to_string(),
+                agent_id: agent_id.map(str::to_string),
+            },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error.unwrap_or_else(|| "agent-opened failed".into()),
+            ));
+        }
+        Ok(GatedQuery::Answered(()))
     }
 
     /// PRD #2374: the resolved agent-card catalog. Withheld like
@@ -5073,6 +5132,12 @@ impl EventSubscription {
                         // `trust_requests_of` does for `Hello`.
                         Ok(BroadcastMsg::TrustRequests(list)) => {
                             return Ok(Some(BroadcastMsg::TrustRequests(list.sanitized())));
+                        }
+                        // Issue #1965: an exited role carries the pane's last
+                        // output, which is untrusted text bound for a card;
+                        // sanitised here, as `list_agents_detailed` does.
+                        Ok(BroadcastMsg::RoleEnded(role)) => {
+                            return Ok(Some(BroadcastMsg::RoleEnded(role.sanitized())));
                         }
                         Ok(msg) => return Ok(Some(msg)),
                         Err(e) => {

@@ -27,6 +27,7 @@ import { NOTICE_THANKS, noticeStartFrom, type NoticeChoice, type NoticeStart } f
 import { DEFAULT_DESKTOP_FEATURES, UNREPORTED } from "../types";
 import type { HandoffEdge,
   AgentBackground,
+  EndedRole,
   AgentBlocked,
   AgentInbox,
   HookBinaryNotice,
@@ -257,6 +258,8 @@ export interface DesktopSnapshotDto {
    * connected deck is kept.
    */
   hostMetrics?: HostMetricsReport;
+  /** Issue #1965 — see `DeckSnapshot.endedRoles`. Absent when there are none. */
+  endedRoles?: EndedRole[];
 }
 
 /** One configured-but-unaddressed deck (PRD #742 M12). */
@@ -2455,6 +2458,14 @@ export interface DeckBridge {
    */
   generateConfig?(deckId: string, agentId: string, paneId: string, incarnation?: string): Promise<GenerateConfigResult>;
   /**
+   * Issue #2454 — tell the daemon that owns the agent that the user opened it
+   * (`desktop_agent_opened`), which clears the "Needs you" its card report
+   * raised (waiting, done or failed). Best effort, bound to the daemon process
+   * that listed the agent. Optional: a bridge without it (the browser preview)
+   * sends nothing.
+   */
+  agentOpened?(deckId: string, agentId: string, paneId: string, incarnation?: string): Promise<void>;
+  /**
    * PRD #2374 — tell the app's backend that this webview consumes agent cards
    * (`agent_cards_consume`), called once, by the surface that renders them.
    * Until it is called the backend subscribes to no card doorbell,
@@ -3218,6 +3229,8 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
     // PRD #1258 M4: a connected deck keeps its last host answer through a
     // snapshot that carries none; a deck that is not connected shows none.
     ...(hostMetrics === undefined ? {} : { hostMetrics }),
+    // Issue #1965: only a connected deck's reply says which roles exited.
+    ...(dto.connection.status === "connected" && dto.endedRoles?.length ? { endedRoles: dto.endedRoles } : {}),
     connection: {
       status: dto.connection.status === "incompatible" ? "error" : dto.connection.status,
       deckId: dto.connection.deckId,
@@ -6098,6 +6111,12 @@ export class TauriDeckBridge implements DeckBridge {
   async generateConfig(deckId: string, agentId: string, paneId: string, incarnation?: string): Promise<GenerateConfigResult> {
     const invoke = await this.getInvoke();
     return invoke<GenerateConfigResult>("desktop_generate_config", { deckId, agentId, paneId, incarnation: incarnation ?? null });
+  }
+
+  /** Issue #2454: the deck, pane, agent and process of the agent the user opened. */
+  async agentOpened(deckId: string, agentId: string, paneId: string, incarnation?: string): Promise<void> {
+    const invoke = await this.getInvoke();
+    await invoke<null>("desktop_agent_opened", { deckId, agentId, paneId, incarnation: incarnation ?? null });
   }
 
   async consumeAgentCards(): Promise<void> {

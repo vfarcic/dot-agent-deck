@@ -1982,6 +1982,10 @@ struct PromptTurnOpen {
     session_id: String,
 }
 
+/// Issue #1965: how many announced exited roles [`AppState::pending_ended_roles`]
+/// holds for the render loop.
+pub const MAX_PENDING_ENDED_ROLES: usize = 64;
+
 #[derive(Debug, Default, Clone)]
 pub struct AppState {
     pub sessions: HashMap<String, SessionState>,
@@ -2190,6 +2194,14 @@ pub struct AppState {
     /// early-stamped one look alike by time. By NAME they do not — the old one
     /// is a session this pane has already left.
     waiting_superseded_sessions: HashMap<String, SupersededSessions>,
+    /// Issue #2454 (Qodo on PR #2460): the panes whose current
+    /// `WaitingForInput` began after their turn had ended — a turn that opened
+    /// on a permission prompt, or an idle agent's prompt notification — so
+    /// leaving it into work is the agent's next turn. A pause that began inside
+    /// a turn is not here, and leaving it resumes that turn. The value is
+    /// when the pause began (the daemon's clock), which is when that turn
+    /// began: a report published after it belongs to the turn.
+    pauses_after_turn_end: HashMap<String, DateTime<Utc>>,
     /// Maps pane_id → orchestration role name (set when orchestration tab opens).
     pub pane_role_map: HashMap<String, String>,
     /// Maps pane_id → working directory for orchestration panes.
@@ -2325,6 +2337,11 @@ pub struct AppState {
     /// holding a queue of them would invite the unbounded growth
     /// `pending_orchestration_surfaces` needs a cap for.
     pub pending_worktree_kept: Option<crate::issue_dispatch_run::KeptWorktree>,
+    /// Issue #1965: orchestration roles whose agent exited, as the daemon
+    /// announced them (`BroadcastMsg::RoleEnded`), for the render loop to put
+    /// on their cards. Bounded at [`MAX_PENDING_ENDED_ROLES`]; the oldest goes
+    /// first when a burst outruns the render loop.
+    pub pending_ended_roles: Vec<(crate::ended_role::EndedRole, Incarnation)>,
     /// PRD #1401: how a pull request launch from the `o` key settled — the
     /// launch's number and the status-line message for it — waiting for the
     /// render loop. Filled by the thread that watches the browser
@@ -4977,6 +4994,12 @@ impl AppState {
             .and_then(|pane_id| self.pane_hook_session.get(pane_id).cloned());
         let (event_session_id, event_timestamp) = (event.session_id.clone(), event.timestamp);
         let turn_failed = ends_turn_on_error(&event);
+        // Issue #2454: whether this event can start the agent's next turn — an
+        // agent's own report, not a frame the daemon synthesized (a shelled-out
+        // command's `ShellBusy` says nothing about the agent moving on) — and
+        // the pane's status before it, to see the turn start.
+        let may_start_turn = !event.is_daemon_synthetic();
+        let status_before = pane_id.as_deref().and_then(|pane| self.pane_status(pane));
         let applied = self.apply_event_reporting(event, attested_agent);
         let Some(pane_id) = pane_id else {
             return;
@@ -5012,6 +5035,46 @@ impl AppState {
             };
         if !from_current_generation {
             return;
+        }
+        // Issue #2454: the agent started working again — its pane went into a
+        // turn in progress from a status where its turn had ended, or from a
+        // pause (a permission prompt, a subagent's wait) that itself began after
+        // the turn had ended. That deals with the waiting, done or failed reason
+        // its card report raised. Leaving a pause that began inside a turn
+        // resumes that turn, so it does not (Qodo on PR #2460).
+        if may_start_turn {
+            let status_after = self.pane_status(&pane_id);
+            let ended = |s: &Option<SessionStatus>| {
+                !s.as_ref()
+                    .is_some_and(|s| is_turn_in_progress(s) || pauses_a_turn(s))
+            };
+            let paused_since = self
+                .pauses_after_turn_end
+                .remove(&pane_id)
+                .filter(|_| status_before.as_ref().is_some_and(pauses_a_turn));
+            // When the turn now under way began, if the turn had ended before
+            // this event: now, after an ended status, or when a pause that
+            // itself followed the end of the turn began. A report published
+            // after that belongs to this turn (Qodo on PR #2460).
+            let turn_began_at = if ended(&status_before) {
+                Some(Utc::now())
+            } else {
+                paused_since
+            };
+            if let Some(began_at) = turn_began_at {
+                if status_after.as_ref().is_some_and(pauses_a_turn) {
+                    // A pause entered from an ended turn, or one continuing
+                    // such a pause, keeps that record; one entered from work
+                    // does not.
+                    self.pauses_after_turn_end.insert(pane_id.clone(), began_at);
+                } else if status_after.as_ref().is_some_and(is_turn_in_progress)
+                    && let Some(agent_id) = live_agent_id.as_deref()
+                {
+                    registry
+                        .agent_cards()
+                        .note_turn_started(&pane_id, agent_id, began_at);
+                }
+            }
         }
         // Every current report re-keys the record to the pane's live agent, so
         // `agent_id` always names whose sessions it holds — including the
@@ -5298,6 +5361,22 @@ enum StopKind {
     WaitingOnDelegation,
     /// Issue #2099: the worker's turn ended on an error.
     Failed,
+}
+
+/// Issue #2454: a status that is a turn in progress — the agent thinking,
+/// working or compacting — as opposed to one where it has stopped for now.
+fn is_turn_in_progress(status: &SessionStatus) -> bool {
+    matches!(
+        status,
+        SessionStatus::Thinking | SessionStatus::Working | SessionStatus::Compacting
+    )
+}
+
+/// Issue #2454 (Qodo on PR #2460): a status a turn passes through without
+/// ending — a permission prompt or a subagent's wait (`WaitingForInput`) —
+/// so leaving it resumes the turn rather than starting the next one.
+fn pauses_a_turn(status: &SessionStatus) -> bool {
+    matches!(status, SessionStatus::WaitingForInput)
 }
 
 /// Issue #2099: whether `event` is an agent reporting that its turn ended on
@@ -9644,6 +9723,22 @@ impl AppState {
         self.pending_worktree_kept = Some(kept);
     }
 
+    /// Issue #1965: record an orchestration role whose agent exited, as the
+    /// daemon process `from` reported it, for the render loop to put on its
+    /// card.
+    pub fn queue_ended_role(&mut self, role: crate::ended_role::EndedRole, from: Incarnation) {
+        if self.pending_ended_roles.len() >= MAX_PENDING_ENDED_ROLES {
+            self.pending_ended_roles.remove(0);
+        }
+        self.pending_ended_roles.push((role, from));
+    }
+
+    /// Issue #1965: the exited roles queued since the last call, oldest first,
+    /// each with the daemon process that reported it.
+    pub fn take_ended_roles(&mut self) -> Vec<(crate::ended_role::EndedRole, Incarnation)> {
+        std::mem::take(&mut self.pending_ended_roles)
+    }
+
     /// PRD #1401: record how pull request launch `launch` settled, for the
     /// render loop to put on the status line. Launches settle in any order, so
     /// an outcome for an earlier launch than the one already waiting is
@@ -11746,6 +11841,7 @@ impl AppState {
         // Issue #447 (Qodo, #1347): the waiting watch's history is about THIS
         // pane's conversations, so a pane reusing the id must not inherit it.
         self.waiting_superseded_sessions.remove(pane_id);
+        self.pauses_after_turn_end.remove(pane_id);
         if let Some(identity) = self.pane_orchestration_map.remove(pane_id) {
             // Issue #555 / #962: the title goes when the last pane of its
             // orchestration does.
@@ -17883,6 +17979,123 @@ mod tests {
         assert_eq!(record.agent_id.as_deref(), Some(successor.as_str()));
         assert!(record.sessions.is_empty());
         published.shutdown_all();
+    }
+
+    /// Issue #2454: the agent starting its next turn — its pane going from a
+    /// status where its turn ended into Thinking, Working or Compacting —
+    /// deals with the `done` its card report raised. Moving between two busy
+    /// statuses inside one turn does not, nor does answering a permission
+    /// prompt inside it, nor a daemon-synthesized `ShellBusy`, which says a
+    /// command is running, not that the agent moved on.
+    #[test]
+    fn the_agent_starting_its_next_turn_deals_with_its_card_report() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent = registry.insert_idle_member_for_test("pane", "team-1", true);
+        let event = |event_type: EventType, secs: i64| AgentEvent {
+            session_id: "s1".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: DateTime::<Utc>::UNIX_EPOCH + chrono::TimeDelta::seconds(secs),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some("pane".into()),
+            agent_id: Some(agent.clone()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            background: None,
+            background_revision: None,
+        };
+        let dealt_with = || {
+            registry
+                .agent_cards()
+                .report_dealt_with_for_test("pane", &agent)
+        };
+        let done = || crate::agent_cards::AgentReport::parse_json(r#"{"status": "done"}"#).unwrap();
+        let mut state = AppState::default();
+        state.managed_pane_ids.insert("pane".into());
+        state.apply_event_watching_waiting(event(EventType::SessionStart, 1), &registry);
+        state.apply_event_watching_waiting(event(EventType::Thinking, 2), &registry);
+        // The agent publishes `done` from inside its turn.
+        registry.agent_cards().publish("pane", &agent, done());
+        state.apply_event_watching_waiting(event(EventType::ToolStart, 3), &registry);
+        assert_eq!(state.pane_status("pane"), Some(SessionStatus::Working));
+        assert_eq!(dealt_with(), Some(false), "a move inside the turn");
+        state.apply_event_watching_waiting(event(EventType::Idle, 4), &registry);
+        assert_eq!(dealt_with(), Some(false), "the turn ending");
+        state.apply_event_watching_waiting(event(EventType::ShellBusy, 5), &registry);
+        assert_eq!(
+            state.pane_status("pane"),
+            Some(SessionStatus::Working),
+            "precondition: ShellBusy moved the pane into Working"
+        );
+        assert_eq!(dealt_with(), Some(false), "a synthesized ShellBusy");
+        state.apply_event_watching_waiting(event(EventType::ShellIdle, 6), &registry);
+        assert_ne!(
+            state.pane_status("pane"),
+            Some(SessionStatus::Working),
+            "precondition: the pane is out of its turn again"
+        );
+        // A permission prompt raised and answered inside one turn resumes it.
+        state.apply_event_watching_waiting(event(EventType::Thinking, 7), &registry);
+        assert_eq!(dealt_with(), Some(true), "the next turn");
+        registry.agent_cards().publish("pane", &agent, done());
+        state.apply_event_watching_waiting(event(EventType::PermissionRequest, 8), &registry);
+        assert_eq!(
+            state.pane_status("pane"),
+            Some(SessionStatus::WaitingForInput),
+            "precondition: the permission prompt paused the turn"
+        );
+        // Approved: the call it asked about runs and ends inside the turn.
+        state.apply_event_watching_waiting(event(EventType::ToolEnd, 9), &registry);
+        assert!(
+            state
+                .pane_status("pane")
+                .as_ref()
+                .is_some_and(is_turn_in_progress),
+            "precondition: the turn resumed, {:?}",
+            state.pane_status("pane")
+        );
+        assert_eq!(dealt_with(), Some(false), "a permission prompt answered");
+        state.apply_event_watching_waiting(event(EventType::Idle, 10), &registry);
+        state.apply_event_watching_waiting(event(EventType::Thinking, 11), &registry);
+        assert_eq!(dealt_with(), Some(true));
+        // A next turn that opens on a permission prompt is a next turn: the
+        // prompt began after the turn ended, so the work it lets through is the
+        // agent moving on.
+        registry.agent_cards().publish("pane", &agent, done());
+        state.apply_event_watching_waiting(event(EventType::Idle, 13), &registry);
+        state.apply_event_watching_waiting(event(EventType::PermissionRequest, 14), &registry);
+        assert_eq!(
+            state.pane_status("pane"),
+            Some(SessionStatus::WaitingForInput),
+            "precondition: the new turn opened on a permission prompt"
+        );
+        assert_eq!(dealt_with(), Some(false), "the prompt alone is not work");
+        state.apply_event_watching_waiting(event(EventType::ToolEnd, 15), &registry);
+        assert_eq!(
+            dealt_with(),
+            Some(true),
+            "a turn that opened on a permission prompt"
+        );
+        // A report published while that opening prompt was pending — the
+        // prompt asked to run the publish itself — belongs to the new turn.
+        state.apply_event_watching_waiting(event(EventType::Idle, 16), &registry);
+        state.apply_event_watching_waiting(event(EventType::PermissionRequest, 17), &registry);
+        registry.agent_cards().publish("pane", &agent, done());
+        state.apply_event_watching_waiting(event(EventType::ToolEnd, 18), &registry);
+        assert_eq!(
+            dealt_with(),
+            Some(false),
+            "a report published inside the turn its permission prompt opened"
+        );
+        // A newer report is not dealt with by the turn it was published in.
+        registry.agent_cards().publish("pane", &agent, done());
+        state.apply_event_watching_waiting(event(EventType::ToolStart, 19), &registry);
+        assert_eq!(dealt_with(), Some(false));
     }
 
     /// Issue #447 (Qodo, #1347): the waiting watch's record of the hook sessions

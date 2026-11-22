@@ -1666,6 +1666,19 @@ button.deck-attention-name { text-decoration: underline; text-underline-offset: 
 .overview-row:first-child { border-top: 0; }
 .overview-row:hover { background: var(--paper); }
 .overview-row[data-status="failed"] { background: var(--red-soft); }
+/* Issue #1965: an orchestration role whose agent exited. One cell across every
+   column, whichever are on screen: it has no agent to fill them with. */
+.overview-row-ended .overview-ended-cell { grid-column: 1 / -1; min-width: 0; display: grid; gap: 4px; }
+.overview-ended-head { min-width: 0; display: flex; align-items: baseline; gap: 8px; }
+.overview-ended-name { flex: 0 0 auto; font-size: var(--text-base); font-weight: 680; }
+.overview-ended-reason { min-width: 0; overflow: hidden; color: var(--red-ink); font-size: var(--text-base); text-overflow: ellipsis; white-space: nowrap; }
+.overview-ended-output { min-width: 0; display: grid; gap: 2px; }
+.overview-ended-output-label { color: var(--muted); font-size: var(--text-xs); }
+.overview-ended-output pre { margin: 0; overflow-x: auto; color: var(--ink); font-family: "JetBrains Mono", monospace; font-size: var(--text-xs); white-space: pre; }
+.agent-card-ended { display: grid; gap: 2px; min-width: 0; }
+.agent-card-ended-reason { margin: 0; color: var(--red-ink); font-size: var(--text-base); }
+.agent-card-ended-label { color: var(--muted); font-size: var(--text-xs); }
+.agent-card-ended pre { margin: 0; overflow-x: auto; color: var(--ink); font-family: "JetBrains Mono", monospace; font-size: var(--text-xs); white-space: pre; }
 /* The status cell carries BOTH the mark and the word, because they render the
    same field and two columns for one datum is what the column picker made
    absurd (PRD #745 M12). The mark needs to be a block for its 8px box to apply
@@ -1674,6 +1687,8 @@ button.deck-attention-name { text-decoration: underline; text-underline-offset: 
 .overview-row .agent-state-mark { display: block; margin: 0; }
 .overview-agent-name { min-width: 0; display: flex; align-items: baseline; gap: 6px; }
 .overview-agent-name strong { overflow: hidden; font-size: var(--text-base); font-weight: 680; text-overflow: ellipsis; white-space: nowrap; }
+/* Issue #2454 (Qodo on PR #2460): the name keeps room for a few characters however many badges share its cell; the badges give way first. */
+.overview-agent-name strong { min-width: 5ch; }
 .overview-role-index { flex: 0 0 auto; color: var(--faint); font-family: "JetBrains Mono", monospace; font-size: var(--text-base); font-style: normal; }
 .overview-role-name { overflow: hidden; color: var(--faint); font-size: var(--text-base); font-style: normal; text-overflow: ellipsis; white-space: nowrap; }
 /* Scoped to the overview on purpose: `.coordinator-badge` is also used by
@@ -1850,23 +1865,23 @@ button.deck-attention-name { text-decoration: underline; text-underline-offset: 
 .agent-stop-control:hover, .agent-stop-control:focus-visible { background: var(--red-soft); }
 .agent-generate-config-control { height: 26px; display: flex; align-items: center; gap: 5px; padding: 0 8px; font-size: var(--text-base); font-weight: 650; border: 1px solid var(--line-strong); border-radius: 4px; color: var(--ink); background: transparent; cursor: pointer; white-space: nowrap; }
 .agent-generate-config-control:hover, .agent-generate-config-control:focus-visible { background: var(--paper-sunken); }
-/* The overview's entry control. `margin-left: auto` puts it at the end of the
-   name cell rather than beside the name, so a long display name is still
-   clamped by its own `text-overflow` and the control never moves. */
-.overview-open-agent { flex: 0 0 auto; margin-left: auto; width: 20px; height: 20px; display: grid; place-items: center; border: 1px solid transparent; border-radius: 4px; color: var(--faint); background: transparent; cursor: pointer; }
-.overview-open-agent:hover, .overview-open-agent:focus-visible, .overview-row.is-openable:hover .overview-open-agent { color: var(--teal); border-color: var(--teal-focus); background: var(--teal-soft); }
+/* The row's controls (Close, and the ⋯ menu while the cards are shown).
+   `margin-left: auto` puts them at the end of the name cell rather than beside
+   the name, so a long display name is still clamped by its own `text-overflow`
+   and the controls never move: nothing that comes and goes is drawn among them
+   (issue #2454 moved Needs you beside the name). */
+.overview-row-actions { flex: 0 0 auto; margin-left: auto; display: flex; align-items: center; gap: 6px; }
 .overview-stop-agent { flex: 0 0 auto; width: 20px; height: 20px; display: grid; place-items: center; border: 1px solid transparent; border-radius: 4px; color: var(--faint); background: transparent; cursor: pointer; }
 .overview-stop-agent:hover, .overview-stop-agent:focus-visible { color: var(--red); border-color: currentColor; }
-/* PRD #2119 — Generate config beside it: the same small control, in the neutral accent rather than the stop's red. */
-.overview-generate-config { flex: 0 0 auto; width: 20px; height: 20px; display: grid; place-items: center; border: 1px solid transparent; border-radius: 4px; color: var(--faint); background: transparent; cursor: pointer; }
-.overview-generate-config:hover, .overview-generate-config:focus-visible { color: var(--teal); border-color: currentColor; }
 .overview-close-orchestration { margin-left: 6px; }
-/* A click anywhere on the row opens the pane too, so the row reads as one
-   target: a pointer over all of it, and while it is hovered the control lights
-   exactly as it does under the pointer itself. The control is what carries the
-   hover here rather than the row's background, because a failed row's red
-   background already wins over `.overview-row:hover` and would show nothing. */
+/* A click anywhere on the row opens the pane, so the row reads as one target: a
+   pointer over all of it. It is also the keyboard route (issue #2454), so it
+   shows where focus is with an inset ring — inset, so the ring is not clipped by
+   the group around the row, and drawn as an outline rather than a background,
+   because a failed row's red background would hide one. */
 .overview-row.is-openable { cursor: pointer; }
+.overview-row.is-openable:focus { outline: none; }
+.overview-row.is-openable:focus-visible { outline: 2px solid var(--teal-focus); outline-offset: -2px; }
 
 /* PRD #802 M6 — the voice surface: ONE RESERVED ROW at the bottom.
 
@@ -2181,7 +2196,8 @@ button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-
 .agent-card-confirm-buttons, .agent-card-reply-buttons { display: flex; flex-wrap: wrap; gap: 7px; }
 .agent-card-reply textarea { width: 100%; min-height: 70px; padding: 7px; border: 1px solid var(--line-strong); border-radius: 5px; color: var(--ink); background: var(--paper); font: inherit; font-size: var(--text-base); resize: vertical; }
 .agent-card-gone { margin: 0; padding: 14px; border: 1px dashed var(--line); border-radius: 6px; color: var(--muted); text-align: center; }
-.overview-needs-you { flex: 0 0 auto; width: 20px; height: 20px; display: grid; place-items: center; border-radius: 4px; color: var(--amber); background: var(--amber-soft); }
+/* Issue #2454 — the daemon's Needs you as a name-cell badge, shaped like `.overview-lease` and the ORCHESTRATOR badge beside it. */
+.overview-needs-you { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; padding: 1px 4px; border-radius: 2px; color: var(--amber); background: var(--amber-soft); font-size: var(--text-xs); font-weight: 800; letter-spacing: .08em; text-transform: uppercase; white-space: nowrap; }
 .overview-card-menu { position: relative; flex: 0 0 auto; }
 .overview-card-menu-button { width: 20px; height: 20px; display: grid; place-items: center; border: 1px solid transparent; border-radius: 4px; color: var(--faint); background: transparent; cursor: pointer; }
 .overview-card-menu-button:hover, .overview-card-menu-button:focus-visible, .overview-card-menu-button[aria-expanded="true"] { color: var(--teal); border-color: var(--teal-focus); background: var(--teal-soft); }

@@ -73,7 +73,7 @@ test.describe("the New agent flow", () => {
     await page.keyboard.press("Escape");
     await expect(overlay).toHaveCount(0);
     const remoteGroup = page.locator(`[data-testid="daemon-group"][data-daemon-id="${REMOTE_DECK}"]`);
-    await expect(remoteGroup.getByRole("button", { name: "Open scratch agent", exact: true })).toBeVisible();
+    await expect(remoteGroup.getByRole("row", { name: "Open scratch agent", exact: true })).toBeVisible();
   });
 
   /**
@@ -101,7 +101,7 @@ test.describe("the New agent flow", () => {
     await expect(overlay).toHaveCount(0);
 
     const remoteGroup = page.locator(`[data-testid="daemon-group"][data-daemon-id="${REMOTE_DECK}"]`);
-    await expect(remoteGroup.getByRole("button", { name: "Open scratch agent", exact: true })).toBeVisible();
+    await expect(remoteGroup.getByRole("row", { name: "Open scratch agent", exact: true })).toBeVisible();
     await remoteGroup.getByRole("button", { name: "Close scratch agent", exact: true }).click();
     const confirm = page.getByRole("alertdialog");
     await expect(confirm).toContainText("Close scratch?");
@@ -109,7 +109,7 @@ test.describe("the New agent flow", () => {
     await confirm.getByRole("button", { name: "Close agent" }).click();
 
     await expect(confirm).toHaveCount(0);
-    await expect(remoteGroup.getByRole("button", { name: "Open scratch agent", exact: true })).toHaveCount(0);
+    await expect(remoteGroup.getByRole("row", { name: "Open scratch agent", exact: true })).toHaveCount(0);
   });
 
   /**
@@ -136,7 +136,7 @@ test.describe("the New agent flow", () => {
     await expect(overlay).toHaveCount(0);
 
     const remoteGroup = page.locator(`[data-testid="daemon-group"][data-daemon-id="${REMOTE_DECK}"]`);
-    await expect(remoteGroup.getByRole("button", { name: "Open planner agent", exact: true })).toBeVisible();
+    await expect(remoteGroup.getByRole("row", { name: "Open planner agent", exact: true })).toBeVisible();
     await remoteGroup.getByRole("button", { name: "Close demo-project-orchestrator-1 orchestration" }).click();
     const confirm = page.getByRole("alertdialog");
     await expect(confirm).toContainText("This stops every role of this orchestration");
@@ -144,8 +144,8 @@ test.describe("the New agent flow", () => {
     await confirm.getByRole("button", { name: "Close all 2 roles" }).click();
 
     await expect(confirm).toHaveCount(0);
-    await expect(remoteGroup.getByRole("button", { name: "Open planner agent", exact: true })).toHaveCount(0);
-    await expect(remoteGroup.getByRole("button", { name: "Open builder agent", exact: true })).toHaveCount(0);
+    await expect(remoteGroup.getByRole("row", { name: "Open planner agent", exact: true })).toHaveCount(0);
+    await expect(remoteGroup.getByRole("row", { name: "Open builder agent", exact: true })).toHaveCount(0);
   });
 
   /**
@@ -226,8 +226,8 @@ test.describe("the New agent flow", () => {
     await page.keyboard.press("Escape");
     await expect(overlay).toHaveCount(0);
     const remoteGroup = page.locator(`[data-testid="daemon-group"][data-daemon-id="${REMOTE_DECK}"]`);
-    await expect(remoteGroup.getByRole("button", { name: "Open planner agent", exact: true })).toBeVisible();
-    await expect(remoteGroup.getByRole("button", { name: "Open builder agent", exact: true })).toBeVisible();
+    await expect(remoteGroup.getByRole("row", { name: "Open planner agent", exact: true })).toBeVisible();
+    await expect(remoteGroup.getByRole("row", { name: "Open builder agent", exact: true })).toBeVisible();
   });
 
   /**

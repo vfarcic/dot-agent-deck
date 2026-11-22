@@ -45,6 +45,21 @@ pub(crate) fn release_script_recording(
     .into_bytes()
 }
 
+/// A stand-in for the resource collector's release binary (issue #2064): a
+/// script that answers `--version` as dot-agent-deck-collector `version`,
+/// and fails on any other invocation, as [`release_script`] does for the CLI.
+pub(crate) fn collector_script(version: &str) -> Vec<u8> {
+    format!(
+        "#!/bin/sh\nif [ \"$#\" -eq 1 ] && [ \"$1\" = \"--version\" ]; then\n  echo 'dot-agent-deck-collector {version}'\n  exit 0\nfi\necho 'unexpected invocation' >&2\nexit 64\n"
+    )
+    .into_bytes()
+}
+
+/// This platform's collector release asset, on the platforms that ship one.
+pub(crate) fn collector_asset() -> Option<&'static str> {
+    Platform::current().and_then(Platform::collector_asset)
+}
+
 /// `bytes`' SHA-256, as `checksums.txt` lists it.
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
@@ -76,17 +91,30 @@ impl FakeReleases {
     /// Serve `latest` as the newest stable release, its CLI asset as `asset`,
     /// and `manifest` as its `checksums.txt`.
     pub(crate) fn start(latest: &str, asset: Vec<u8>, manifest: String) -> Self {
+        Self::start_with(latest, asset, Vec::new(), manifest)
+    }
+
+    /// [`Self::start`], also serving each of `others` (an asset name and its
+    /// bytes), such as the collector's asset.
+    pub(crate) fn start_with(
+        latest: &str,
+        asset: Vec<u8>,
+        others: Vec<(String, Vec<u8>)>,
+        manifest: String,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake release server");
         let port = listener.local_addr().unwrap().port();
         let latest = Arc::new(Mutex::new(latest.to_string()));
         let shared = latest.clone();
         let asset = Arc::new(asset);
+        let others = Arc::new(others);
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 let latest = shared.lock().unwrap().clone();
                 let asset = asset.clone();
+                let others = others.clone();
                 let manifest = manifest.clone();
-                std::thread::spawn(move || serve(stream, &latest, &asset, &manifest));
+                std::thread::spawn(move || serve(stream, &latest, &asset, &others, &manifest));
             }
         });
         Self { port, latest }
@@ -128,7 +156,13 @@ impl FakeReleases {
     }
 }
 
-fn serve(mut stream: TcpStream, latest: &str, asset: &[u8], manifest: &str) {
+fn serve(
+    mut stream: TcpStream,
+    latest: &str,
+    asset: &[u8],
+    others: &[(String, Vec<u8>)],
+    manifest: &str,
+) {
     let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
     let mut request_line = String::new();
     if reader.read_line(&mut request_line).is_err() {
@@ -154,6 +188,8 @@ fn serve(mut stream: TcpStream, latest: &str, asset: &[u8], manifest: &str) {
             ("200 OK", manifest.as_bytes().to_vec())
         } else if name == cli_asset() {
             ("200 OK", asset.to_vec())
+        } else if let Some((_, bytes)) = others.iter().find(|(other, _)| other == name) {
+            ("200 OK", bytes.clone())
         } else {
             ("404 Not Found", Vec::new())
         }
