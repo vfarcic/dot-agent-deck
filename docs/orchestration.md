@@ -523,6 +523,8 @@ The deck marks the `clear = true` workers in the orchestrator's instructions as 
 
 With `clear = true` (the default), the deck replaces the worker's agent in the same pane and queues the task for the replacement. Its card in the TUI or row in the desktop app keeps the same name, and its previous conversation is gone. With `clear = false`, the task goes to the running agent's inbox and the worker keeps its conversation. A `clear = true` worker whose agent has exited is started again on its next task; restart a `clear = false` worker before delegating to it again.
 
+When the orchestrator hands tasks to several `clear = true` workers at once, the deck starts their fresh agents one at a time, at least 3 seconds apart, so their first requests do not all reach the provider in the same second and trip its rate limit. A worker given a task with no other worker starting just before it starts at once; of three handed tasks together, the second starts at least 3 seconds after the first and the third at least 3 seconds after the second, plus however long each one's previous agent takes to stop. Until its turn comes, a waiting worker's card in the TUI and its row in the desktop app still show its previous agent, which is replaced when the worker starts. The spacing applies across every orchestration on the daemon, because they share the provider account. Set `DOT_AGENT_DECK_ROLE_START_SPACING_MS` in the daemon's environment to change it, or to `0` to turn it off ([Configuration](configuration.md#daemon-behaviour)).
+
 If the replacement cannot start, or exits before taking the task, the orchestrator is told. See [A delegated worker never came up](#a-delegated-worker-never-came-up).
 
 ### Delivery in the TUI and desktop app

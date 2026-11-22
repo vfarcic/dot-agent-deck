@@ -9132,6 +9132,11 @@ pub struct AgentPtyRegistry {
     /// publishes the agent, so no agent can join the registry after the
     /// snapshot the client confirmed. See [`Self::freeze_admission`].
     admission_frozen: AtomicBool,
+    /// Issue #2110: spaces the `clear = true` restarts of the delegate path,
+    /// so workers handed tasks together do not all start in one second. One
+    /// per daemon, since the provider limit it spreads is the account's. See
+    /// [`crate::role_start_pacing`].
+    role_start_pacer: crate::role_start_pacing::RoleStartPacer,
     /// Issue #424 F1 + PRD #1631: what each pane's input box is holding — the
     /// human-input sequence [`Self::user_typed_since_question`] reads, and each
     /// pane's input stream, whose paste framing and turn clock
@@ -11626,6 +11631,7 @@ impl AgentPtyRegistry {
             change_notify: Arc::new(Notify::new()),
             shutting_down: AtomicBool::new(false),
             admission_frozen: AtomicBool::new(false),
+            role_start_pacer: crate::role_start_pacing::RoleStartPacer::default(),
             pane_input: Arc::new(Mutex::new(PaneInputState::default())),
             held_display: Arc::new(Notify::new()),
             pty_write_stall_bound_ms: AtomicU64::new(PTY_WRITE_STALL_BOUND.as_millis() as u64),
@@ -15319,6 +15325,12 @@ impl AgentPtyRegistry {
     /// doesn't increment this.
     pub fn detach_count(&self) -> u64 {
         self.detach_count.load(Ordering::Relaxed)
+    }
+
+    /// Issue #2110: the daemon's pacer for worker starts. See
+    /// [`crate::role_start_pacing`].
+    pub fn role_start_pacer(&self) -> &crate::role_start_pacing::RoleStartPacer {
+        &self.role_start_pacer
     }
 
     /// Spawn a new agent and return its registry id.
