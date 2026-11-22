@@ -15699,11 +15699,22 @@ pub fn run_tui(
             // Infer the agent type once so both the daemon registry and the
             // local placeholder identify a recognized command immediately.
             let agent_type = AgentType::from_command(cmd);
+            // Issue #2421: a saved name the rename gate would apply rides on
+            // the start itself, so the daemon names the agent as it creates
+            // it. A start that outlasts the controller's bound on its reply
+            // still creates the agent, and that agent reaches the dashboard
+            // from the daemon's record; renamed only after a successful start,
+            // it reached it under its command. `resolve_display_name` keeps an
+            // applied label as it is, so the pane's own name is the same one.
+            let saved_label = match RenameOutcome::applied(&saved_pane.name) {
+                RenameOutcome::Applied(label) => Some(label),
+                RenameOutcome::Cleared | RenameOutcome::Rejected => None,
+            };
             match pane.create_pane_with_options(
                 cmd,
                 Some(&saved_pane.dir),
                 AgentSpawnOptions {
-                    display_name: None,
+                    display_name: saved_label.as_deref(),
                     tab_membership: None,
                     rows,
                     cols,
@@ -15741,7 +15752,11 @@ pub fn run_tui(
                         );
                     }
                     if !saved_pane.name.is_empty() {
-                        if let Err(e) = pane.rename_pane(&new_id, &saved_pane.name) {
+                        // A name the start did not carry — blank, or one the
+                        // gate refuses — goes through the rename as before.
+                        if saved_label.is_none()
+                            && let Err(e) = pane.rename_pane(&new_id, &saved_pane.name)
+                        {
                             ui.session_warnings.push(format!(
                                 "Warning: failed to rename pane '{}': {e}",
                                 saved_pane.name

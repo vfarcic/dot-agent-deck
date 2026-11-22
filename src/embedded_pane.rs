@@ -2082,9 +2082,13 @@ impl EmbeddedPaneController {
                     Err(_) => {
                         return Err(ClientError::Io(std::io::Error::new(
                             std::io::ErrorKind::TimedOut,
+                            // Issue #2421: the daemon may still finish the
+                            // start, as the desktop app tells its user too.
                             format!(
-                                "start_agent timed out after {}ms",
-                                CREATE_PANE_START_TIMEOUT.as_millis()
+                                "the daemon did not answer the start within {}s; the agent \
+                                 may still appear, so check the dashboard before starting \
+                                 it again",
+                                CREATE_PANE_START_TIMEOUT.as_secs()
                             ),
                         )));
                     }
@@ -2957,10 +2961,18 @@ const HYDRATE_ATTACH_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Bounded wait for the `start_agent` RPC inside `create_stream_pane`. The
 /// daemon allocates a PTY and spawns the child process before replying,
-/// which is heavier than `list_agents` but should still complete within a
-/// few seconds on a healthy host. Without this bound a wedged same-UID
+/// which is heavier than `list_agents`. Without this bound a wedged same-UID
 /// daemon would pin the TUI's blocking `block_on` indefinitely.
-pub(crate) const CREATE_PANE_START_TIMEOUT: Duration = Duration::from_secs(5);
+///
+/// Fifteen seconds, the desktop app's bound on the same start
+/// (`ORCHESTRATION_ROLE_START_TIMEOUT`, its `DECK_REPLY_TIMEOUT`), so the two
+/// clients give up on one start at the same moment (CLAUDE.md rule 22). It was
+/// five, and issue #2421 measured a start that outlasted that: a daemon's first
+/// installed Claude Code spawn copies the deck's own binary as its editor
+/// helper before it replies, which took 9 s on a loaded machine. Giving up does
+/// not stop the start — the daemon still creates the agent — so a restore that
+/// gave up came back as an unnamed, unfocused card.
+pub(crate) const CREATE_PANE_START_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// What an OpenCode start's reply may spend outside its `--version` probe
 /// ([`crate::opencode_version::PROBE_TIMEOUT`]) and still arrive inside
