@@ -211,6 +211,8 @@ pub mod repo_identity;
 pub mod report_recovery;
 pub mod retained_store;
 pub mod roles_cli;
+// Issue #1897: each agent run in a cgroup of its own, where systemd delegated one.
+pub mod run_cgroup;
 pub mod schedule_cli;
 // PRD #1885: a schedule's last fire, when it was refused as not approved.
 pub mod schedule_outcome;

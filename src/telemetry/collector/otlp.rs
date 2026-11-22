@@ -665,7 +665,7 @@ mod tests {
             ("service.name", "dot-agent-deck-collector"),
             ("service.version", env!("DAD_VERSION")),
             ("host.name", "studio"),
-            ("deck.collector.schema_version", "1"),
+            ("deck.collector.schema_version", "2"),
             ("team", "x"),
         ]);
         let mut run = base.clone();

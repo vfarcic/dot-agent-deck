@@ -36,6 +36,7 @@ mod linux {
     use bytes::Bytes;
     use clap::{Parser, Subcommand};
     use dot_agent_deck::telemetry::collector::aggregate::{Aggregator, ProcessSample, Sample};
+    use dot_agent_deck::telemetry::collector::cgroup::{self, RunCgroups};
     use dot_agent_deck::telemetry::collector::config::{Export, Settings};
     use dot_agent_deck::telemetry::collector::discovery::{self, Discovery, FIRST_SIGHT_WAIT};
     use dot_agent_deck::telemetry::collector::disk::{
@@ -369,6 +370,9 @@ mod linux {
         /// without `--all-users`.
         users: Users,
         run_worktrees: RunWorktrees,
+        /// Issue #1897: the cgroup figures of runs the deck started in a
+        /// cgroup of their own.
+        run_cgroups: RunCgroups,
         /// `None` when no lookup thread could start: then no run has a
         /// worktree and no disk is walked.
         discovery: Option<Discovery>,
@@ -439,6 +443,7 @@ mod linux {
                     all: cli.all_users,
                 },
                 run_worktrees: RunWorktrees::default(),
+                run_cgroups: RunCgroups::default(),
                 discovery,
                 disks,
                 last_incomplete_log: None,
@@ -518,13 +523,15 @@ mod linux {
         fn request(&mut self, sample: &Sample, usage: &[WorktreeUsage]) -> Request {
             self.log_incomplete();
             self.log_walk_failures();
-            let request = build_request(
+            let mut request = build_request(
                 sample,
                 self.run_worktrees.get(),
                 usage,
                 &self.settings,
                 self.host.as_deref(),
             );
+            let cgroups = self.run_cgroups.update(sample, cgroup::read);
+            cgroup::add_to_request(&mut request, sample, &cgroups, self.settings.temporality);
             self.run_worktrees.forget_ended(sample);
             request
         }

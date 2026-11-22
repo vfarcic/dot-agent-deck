@@ -2212,6 +2212,11 @@ fn spawn_with_dir(
     // single-process kill (logged) instead of failing an otherwise-healthy spawn.
     let child_pid = child.process_id();
     let process_group = crate::platform::proc::AgentProcessGroup::adopt(child_pid);
+    // Issue #1897: and into its own cgroup, where the daemon has a delegated
+    // subtree, as early as the spawn allows. Infallible and a no-op elsewhere.
+    if let Some(pid) = child_pid {
+        crate::run_cgroup::place(pid, run_id_of(&opts.env));
+    }
 
     // Wrap the freshly-spawned child in an RAII guard *before* any fallible
     // step below: a failure in `take_writer` / `try_clone_reader` (or a
@@ -2265,6 +2270,17 @@ fn spawn_with_dir(
         launch_dir,
         launch_dir_moved_from,
     })
+}
+
+/// The run id the spawn's environment gives the agent, if any: the last
+/// non-blank [`crate::telemetry::shim::RUN_ID_ENV`], as the agent would read
+/// it.
+fn run_id_of(env: &[(String, String)]) -> Option<&str> {
+    env.iter()
+        .rev()
+        .find(|(k, _)| k == crate::telemetry::shim::RUN_ID_ENV)
+        .map(|(_, v)| v.as_str())
+        .filter(|v| !v.is_empty())
 }
 
 /// Cap on the per-agent scrollback buffer (bytes). Keeps reattach affordable

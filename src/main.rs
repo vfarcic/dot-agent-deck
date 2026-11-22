@@ -4698,6 +4698,11 @@ async fn run_daemon_serve_cli(
     // and assumes nothing for this daemon's life. A production build reads no
     // variable.
     dot_agent_deck::composer_probe::install::capture_assumption();
+    // Issue #1897: decided before any agent starts, so every agent of a
+    // daemon whose unit systemd delegated starts in a cgroup of its own; any
+    // other daemon starts them as before. It runs `systemctl show` once, so
+    // off the executor.
+    let _ = tokio::task::spawn_blocking(dot_agent_deck::run_cgroup::init).await;
     let mut initial = AppState::default();
     initial.hook_binaries = hook_binaries;
     let state = Arc::new(RwLock::new(initial));
