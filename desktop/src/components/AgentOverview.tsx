@@ -45,6 +45,7 @@ import { needsYouSentence, type PlacedCard } from "../lib/agentCards";
 import { OverviewModeSwitch } from "./OverviewModeSwitch";
 import { AgentCardsDeckBody, AgentCardsToolbar } from "./AgentCardsGrid";
 import { AgentCardOverlay } from "./AgentCardOverlay";
+import { AgentCardBatchDialog } from "./AgentCardBatchDialog";
 import { OverviewRowCard } from "./OverviewRowMenu";
 
 /**
@@ -1880,7 +1881,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     const shown = cardsOnScreen(deck);
     const deckId = deck.snapshot.connection.deckId;
     if (shown === undefined || deckId === undefined) return undefined;
-    return <AgentCardsDeckBody deckId={deckId} cards={shown} tree={cards.treeFor(deckId)} openCards={cards.openCards} needsYouOnly={cards.needsYouOnly} controls={cardControls} results={cards.resultsFor} openTarget={cardOpenTarget} endedRoles={deck.snapshot.endedRoles} />;
+    return <AgentCardsDeckBody deckId={deckId} cards={shown} tree={cards.treeFor(deckId)} openCards={cards.openCards} needsYouOnly={cards.needsYouOnly} controls={cardControls} results={cards.resultsFor} openTarget={cardOpenTarget} endedRoles={deck.snapshot.endedRoles} selection={cards.batchFor(deckId) ? cards.selection : undefined} />;
   };
   const openCardReference = useContext(OpenCardReference);
   /* Issue #2418 — whether the dashboard filter keeps a card off the Cards
@@ -2389,7 +2390,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
             `.map`, and `DaemonBody` below took a `fleetSize` for its note
             density and nothing else.
           */}
-          {cards.mode === "cards" && <AgentCardsToolbar cards={decks.flatMap((deck) => cardsOnScreen(deck) ?? [])} needsYouOnly={cards.needsYouOnly} controls={cards.controls} />}
+          {cards.mode === "cards" && <AgentCardsToolbar cards={decks.flatMap((deck) => cardsOnScreen(deck) ?? [])} needsYouOnly={cards.needsYouOnly} controls={cards.clickControls} selection={cards.selection} />}
           {/* PRD #2374 — in the Cards view every deck keeps its own section and
               header, with the daemon's own controls; a deck whose daemon has
               cards shows them as the section's body, and one with no cards (or
@@ -2442,6 +2443,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
         </section>
       </main>
       {cards.overlay && <AgentCardOverlay {...cards.overlay} notice={cards.notice} controls={cards.clickControls} ended={overlayEnded} />}
+      {cards.batch && <AgentCardBatchDialog view={cards.batch} controls={cards.clickControls} />}
       {interruptedDialogView}
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}
       {upgrade && <UpgradeDialog target={upgrade} runtime={runtime} onClose={() => setUpgrade(undefined)} />}

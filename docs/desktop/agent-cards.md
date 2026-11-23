@@ -119,6 +119,24 @@ The text an action sends is shown exactly as it is sent, set off as a quotation 
 
 An action is always sent to the agent whose card it is on, and only to that agent, with the text the card showed you. The agent is told that you pressed it on its card; when the text is, or quotes, what the agent itself wrote on the card (an action or answer it worded, or an answer that repeats its question), the agent is told that too, and gets that text marked as untrusted, so it does not take its own words for yours or for a message from the deck. If the agent was replaced (its pane restarted) after you opened its card, or the deck's daemon was restarted, the action is refused rather than sent to whichever agent has its place now.
 
+## Send one action to many agents
+
+You can send one action to many agents at once, for example **Go ahead** to every agent in an orchestration, or **Close** to a handful of finished agents. Every such batch shows you who gets what before anything is sent.
+
+There are two ways to start one:
+
+- **From a card with agents under it.** Open the card's overlay. Below its actions, a section named after the card and the agents under it has a button for each action that card or any agent under it offers. Pressing one starts a batch for that card and every agent under it, however deep, whether or not its tree is open.
+- **From a selection.** Press **Select** in the Cards toolbar. Each card gets a checkbox, and the toolbar shows how many cards are selected and a button for each action the selected cards offer. Selecting a closed card selects every agent under it as well, and clearing it clears them; with its tree open, its checkbox selects that card alone, so you can pick agents inside the tree one by one. Press **Select** again to stop selecting and clear the selection.
+
+Either way, a confirmation opens before anything is sent, even for an action that would otherwise send straight away. It lists:
+
+- each agent that gets the action, with the exact text it will receive, shown as a quotation in the same way as in the card overlay (each agent may get different text, for example an action an agent worded itself);
+- each agent that is skipped, and why: its agent is not running, its card does not offer that action, the action is disabled on it, or the agent is no longer there.
+
+Press **Send** to send it to the agents listed as getting it, or **Cancel** to send nothing. After **Send**, the dialog shows what happened for each agent: **Delivered**, **Closed**, or **Failed** with the reason. One agent failing does not stop the others. An agent whose action changed after the confirmation opened, or whose daemon restarted, is not sent anything, not even the new text; it is marked **Failed**, and the others still get theirs. Each delivery is recorded on that agent's own card, under **Sent from this card**, as if you had pressed the action on that card.
+
+Some actions are not offered for a batch: **Open**, a reply in your own words, and the answers to one agent's own question are pressed on each card. A batch reaches the agents of one daemon or of several, when your selection spans daemons. A daemon from an earlier release does not offer batches: its cards have no checkbox and its overlays no batch section, and you act on its agents one card at a time.
+
 ## By voice
 
 With voice control on, you can say:
@@ -135,13 +153,14 @@ With voice control on, you can say:
 | "close the card" | Closes the card overlay. |
 | "open the coder" | Opens that agent's terminal, as clicking its name on its card does. |
 | "press go ahead on the coder's card", "answer main to the coder", "press close on the coder's card" | Presses that action or answer, named by the label on its button. Close opens the card at its confirm step, as the card's **×** does. |
+| "go ahead on everything under the dispatcher", "close every agent under the planner" | Starts a batch for that agent and every agent under it, and opens its confirmation. Nothing is sent until you press **Send**. |
 | "reply to the coder use the main branch" | Opens that agent's card with your words in its **Reply** box, for you to read, change and send with **Send reply**. |
 
 When the agent reported more than one pull request, or more than one issue, voice opens the first one the deck could check; click a badge to open another. If the dashboard's filter hides the card whose tree you asked to open, the app opens it anyway and tells you to clear the filter to see it.
 
 With **All daemons** selected, you can name an agent on any daemon the Dashboard shows. When the name fits agents on more than one daemon, the app asks which; add the daemon's name, as in "show the coder's card on build box", to pick it straight away (see [Naming an agent](voice.md#naming-an-agent)).
 
-Voice sends an action straight away only when its text comes from your catalog. Anything with text the agent wrote opens the card at a step showing exactly what would be sent, and the voice row says so; press **Send** to send it. That includes an action the agent suggested that is not in your catalog and every answer to one of its questions: an answer the agent gave no text of its own sends `Answer to your question "<question>": <answer>`, which repeats the agent's question and answer words. An action that asks you to confirm, and closing an agent, are never done by voice alone either: the card opens at its confirm step and you press the button yourself. A spoken reply is not sent by voice alone, as dictating to an agent's terminal types your words without pressing Enter: you see what was heard before it goes.
+Voice sends an action straight away only when its text comes from your catalog. Anything with text the agent wrote opens the card at a step showing exactly what would be sent, and the voice row says so; press **Send** to send it. That includes an action the agent suggested that is not in your catalog and every answer to one of its questions: an answer the agent gave no text of its own sends `Answer to your question "<question>": <answer>`, which repeats the agent's question and answer words. An action that asks you to confirm, and closing an agent, are never done by voice alone either: the card opens at its confirm step and you press the button yourself. A batch is never sent by voice alone: voice opens its confirmation, and you press **Send**. Selecting cards with their checkboxes is done by hand; by voice, you name the agent whose tree the batch reaches. A spoken reply is not sent by voice alone, as dictating to an agent's terminal types your words without pressing Enter: you see what was heard before it goes.
 
 ## Which agents publish a card
 
@@ -197,7 +216,7 @@ Agents can also report fields and actions that are not in the catalog. You see t
 
 ## In the TUI
 
-The TUI does not show cards, and it does not draw the tree. Its dashboard keeps showing each agent's status as before. Opening an agent's pane in the TUI (`Enter` on its card, or its number) counts as opening it, so it clears the same **Needs you** in `card list` and in the desktop app. From any shell on the machine, `dot-agent-deck card list` prints every card as JSON, with the same status, needs-you reasons and actions the app shows, and `dot-agent-deck card act` presses one action. Each card in the list also carries the tree the app draws: `parent` names the key of the card that started it (a card with no `parent` is in the top row), `kind` says whether it is a dispatcher, orchestrator, role or agent, `rollup` counts the agents under it by status with the most urgent one and how many need you, and `checked_refs` lists the pull requests and issues the agent reported, each with what the agent wrote and what the deck found, including an issue's `labels`. The cards are listed in the tree's order, each one before the agents it started.
+The TUI does not show cards, and it does not draw the tree. Its dashboard keeps showing each agent's status as before. Opening an agent's pane in the TUI (`Enter` on its card, or its number) counts as opening it, so it clears the same **Needs you** in `card list` and in the desktop app. From any shell on the machine, `dot-agent-deck card list` prints every card as JSON, with the same status, needs-you reasons and actions the app shows, and `dot-agent-deck card act` presses one action. Sending one action to many agents at once is done in the desktop app; from a shell, `card act` acts on one card at a time. Each card in the list also carries the tree the app draws: `parent` names the key of the card that started it (a card with no `parent` is in the top row), `kind` says whether it is a dispatcher, orchestrator, role or agent, `rollup` counts the agents under it by status with the most urgent one and how many need you, and `checked_refs` lists the pull requests and issues the agent reported, each with what the agent wrote and what the deck found, including an issue's `labels`. The cards are listed in the tree's order, each one before the agents it started.
 
 ```sh
 dot-agent-deck card act --entry <key> --action <id> --token <token> --instance <instance_id>

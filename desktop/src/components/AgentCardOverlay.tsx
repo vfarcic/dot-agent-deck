@@ -11,7 +11,7 @@ import type { AgentCardAction, AgentCardCheckedRef, EndedRole } from "../types";
 import { CardReference, cardRef, ExactText, ExactTextNote, IssueLabelChip, SourceBadge, type ReferenceControls } from "./AgentCard";
 
 /** The members the overlay's controls dispatch through. */
-export type CardOverlayControls = Pick<VoiceActionContext, "showAgentCard" | "stepAgentCard" | "closeAgentCard" | "runCardAction" | "replyToAgentCard" | "confirmCardAction" | "openCardReference"> & Partial<Pick<VoiceActionContext, "reportRefused">>;
+export type CardOverlayControls = Pick<VoiceActionContext, "showAgentCard" | "stepAgentCard" | "closeAgentCard" | "runCardAction" | "replyToAgentCard" | "confirmCardAction" | "openCardReference"> & Partial<Pick<VoiceActionContext, "reportRefused" | "runCardActionBatch">>;
 
 /**
  * PRD #2374 — the one card overlay, opened from a card or a table row's Show
@@ -29,7 +29,7 @@ export type CardOverlayControls = Pick<VoiceActionContext, "showAgentCard" | "st
  * `card` is `undefined` once the agent it showed is gone: the overlay says so
  * and keeps its navigation, so the next card is one key away.
  */
-export function AgentCardOverlay({ card, lastName, position, count, step, results, tree, notice, controls, ended }: {
+export function AgentCardOverlay({ card, lastName, position, count, step, results, tree, notice, controls, ended, batch }: {
   card: PlacedCard | undefined;
   /** The name of the card that was open, for the closed notice. */
   lastName: string;
@@ -45,6 +45,12 @@ export function AgentCardOverlay({ card, lastName, position, count, step, result
   controls: CardOverlayControls;
   /** Issue #1965 — the exited orchestration role this card is for: the overlay says why and shows its last output in full. */
   ended?: EndedRole;
+  /**
+   * Issue #2399 — the actions this card can send to itself and every card
+   * under it (`under` of them), when its daemon does batches and it has cards
+   * under it. Each opens the batch's confirmation; nothing is sent from here.
+   */
+  batch?: { choices: readonly { id: string; label: string }[]; under: number };
 }) {
   const ref = useInertBackground<HTMLElement>(true, OVERLAY_LAYER.dialog, () => { controls.closeAgentCard(); });
   const [reply, setReply] = useState("");
@@ -301,6 +307,25 @@ export function AgentCardOverlay({ card, lastName, position, count, step, result
                 ))}
               </div>
             </section>
+
+            {batch && controls.runCardActionBatch && batch.choices.length > 0 && (
+              <section className="agent-card-section agent-card-batch" aria-label={`Send to ${name} and every agent under it`} data-testid="agent-card-batch">
+                <h3>{name} and the {batch.under} {batch.under === 1 ? "agent" : "agents"} under it</h3>
+                <p className="agent-card-hint">Sends one action to all of them. You see who gets what, and who is skipped and why, before anything is sent.</p>
+                <div className="agent-card-actions">
+                  {batch.choices.map((choice) => (
+                    <button
+                      key={choice.id}
+                      type="button"
+                      className="button secondary compact"
+                      data-testid={`agent-card-batch-action-${domIdentity(choice.id)}`}
+                      title={displayTitle(`Review ${choice.label} for ${name} and every agent under it before sending it`)}
+                      onClick={() => VOICE_ACTIONS.runCardActionBatch.run(controls as Pick<VoiceActionContext, "runCardActionBatch">, { ...cardRef(card), cardActionId: choice.id })}
+                    >{displayText(choice.label, DISPLAY_LIMITS.name)}</button>
+                  ))}
+                </div>
+              </section>
+            )}
 
             {(entry.recent_deliveries?.length ?? 0) > 0 && (
               <section className="agent-card-section" aria-label="Sent from this card" data-testid="agent-card-deliveries">

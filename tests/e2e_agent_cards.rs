@@ -36,6 +36,317 @@ use spec::spec;
 
 const WAIT: Duration = Duration::from_secs(20);
 
+/// Issue #2399's additive wire contract. Raw JSON keeps the synthetic tests
+/// buildable before the new verb exists; an old daemon must fail explicitly.
+fn card_batch(endpoint: &impl Endpoint, mode: &str, entries: &[Value], request_id: &str) -> Value {
+    let response = inbox::attach(
+        endpoint,
+        json!({
+            "op": "invoke-card-action-batch", "mode": mode, "action_id": "batch-go",
+            "request_id": request_id, "entries": entries,
+        }),
+    );
+    assert_eq!(
+        response["ok"], true,
+        "batch {mode} must be supported: {response:#}"
+    );
+    let result = response["card_action_batch"].clone();
+    assert!(
+        result["entries"].is_array(),
+        "per-entry batch outcomes: {response:#}"
+    );
+    result
+}
+
+fn batch_target(pane: &Pane) -> Value {
+    json!({"pane_id": pane.id, "agent_id": pane.agent})
+}
+
+fn batch_outcome<'a>(result: &'a Value, pane: &Pane) -> &'a Value {
+    result["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["pane_id"] == pane.id && entry["agent_id"] == pane.agent)
+        .unwrap_or_else(|| panic!("batch must name {}: {result:#}", key(pane)))
+}
+
+fn publish_batch_action(endpoint: &impl Endpoint, pane: &Pane, prompt: &str) {
+    publish(
+        endpoint,
+        pane,
+        endpoint.cwd(),
+        &json!({
+            "status": "waiting", "actions": [{"name": "batch-go", "label": "Go ahead", "prompt": prompt}]
+        }),
+    );
+}
+
+/// Only included, token-bound entries are sent back after the user confirms.
+fn confirmed_batch(preview: &Value) -> Vec<Value> {
+    preview["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["outcome"] == "included")
+        .map(|entry| {
+            json!({
+                "pane_id": entry["pane_id"], "agent_id": entry["agent_id"],
+                "action_token": entry["action_token"], "instance_id": entry["instance_id"],
+            })
+        })
+        .collect()
+}
+
+fn assert_batch_delivery(endpoint: &impl Endpoint, pane: &Pane, result: &Value, prompt: &str) {
+    assert_eq!(result["outcome"], "delivered", "{result:#}");
+    let id = result["message_id"]
+        .as_str()
+        .expect("each delivery names its message");
+    route::fetched(endpoint, pane, id, prompt, "");
+    assert!(
+        common::wait_until(common::load_scaled(WAIT), || {
+            inbox::screen(endpoint, pane).contains(prompt)
+        }),
+        "the stand-in's PTY must show the received prompt: {}",
+        inbox::screen(endpoint, pane)
+    );
+    let entry = wait_entry(
+        endpoint,
+        &key(pane),
+        "recording its own batch delivery",
+        |entry| {
+            entry["recent_deliveries"]
+                .as_array()
+                .is_some_and(|deliveries| {
+                    deliveries.iter().any(|delivery| {
+                        delivery["message_id"] == id
+                            && delivery["action_id"] == "batch-go"
+                            && delivery["state"] == "delivered"
+                    })
+                })
+        },
+    );
+    assert!(
+        entry["recent_deliveries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|delivery| { delivery["message_id"] == id && delivery["text"] == prompt }),
+        "each card preserves the exact text it received: {entry:#}"
+    );
+}
+
+/// Scenario: Preview an action on two running cards with different texts, a stopped card, a card without that action and an unknown entry. The daemon advertises the batch capability, returns the exact prompt and admission handles for each included card, explains each skip, and sends nothing.
+#[spec("agent-report/batch/001")]
+#[test]
+fn agent_report_batch_001_preview_lists_exact_text_and_skip_reasons() {
+    let (daemon, _cfg) = daemon_with_config("");
+    let hello = inbox::attach(
+        &daemon,
+        json!({"op":"hello", "client_version":dot_agent_deck::daemon_protocol::PROTOCOL_VERSION}),
+    );
+    let first = route::start(&daemon, "batch-first", json!({}));
+    let second = route::start(&daemon, "batch-second", json!({}));
+    let stopped = route::start(&daemon, "batch-stopped", json!({}));
+    let unoffered = route::start(&daemon, "batch-unoffered", json!({}));
+    publish_batch_action(
+        &daemon,
+        &first,
+        "BATCH-FIRST-2399: continue the first task.",
+    );
+    publish_batch_action(
+        &daemon,
+        &second,
+        "BATCH-SECOND-2399: continue the second task.",
+    );
+    publish_batch_action(&daemon, &stopped, "BATCH-STOPPED-2399: never send this.");
+    assert!(
+        std::process::Command::new("kill")
+            .args(["-TERM", &stopped.pid.to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    wait_entry(&daemon, &key(&stopped), "stopped", |entry| {
+        entry["status"] == "stopped"
+    });
+    assert!(
+        hello["capabilities"]
+            .as_array()
+            .is_some_and(|caps| caps.iter().any(|cap| cap == "agent-cards-batch")),
+        "daemon must advertise agent-cards-batch: {hello:#}"
+    );
+    let missing = json!({"pane_id":"batch-gone", "agent_id":"missing-generation"});
+    let result = card_batch(
+        &daemon,
+        "preview",
+        &[
+            batch_target(&first),
+            batch_target(&second),
+            batch_target(&stopped),
+            batch_target(&unoffered),
+            missing,
+        ],
+        "batch-preview-001",
+    );
+    assert_eq!(result["entries"].as_array().unwrap().len(), 5);
+    for (pane, prompt) in [
+        (&first, "BATCH-FIRST-2399: continue the first task."),
+        (&second, "BATCH-SECOND-2399: continue the second task."),
+    ] {
+        let included = batch_outcome(&result, pane);
+        assert_eq!(included["outcome"], "included", "{included:#}");
+        assert_eq!(included["prompt"], prompt);
+        let (token, instance) = listed_handle(&daemon, &key(pane), "batch-go");
+        assert_eq!(included["action_token"], token);
+        assert_eq!(included["instance_id"], instance);
+    }
+    for (pane, code) in [(&stopped, "agent_stopped"), (&unoffered, "unknown_action")] {
+        let skipped = batch_outcome(&result, pane);
+        assert_eq!(skipped["outcome"], "skipped", "{skipped:#}");
+        assert_eq!(skipped["code"], code);
+        assert!(
+            !skipped["message"].as_str().unwrap_or_default().is_empty(),
+            "a readable reason: {skipped:#}"
+        );
+    }
+    let unknown = result["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["pane_id"] == "batch-gone")
+        .unwrap();
+    assert_eq!(unknown["outcome"], "skipped", "{unknown:#}");
+    assert_eq!(unknown["code"], "unknown_entry", "{unknown:#}");
+    assert!(!unknown["message"].as_str().unwrap_or_default().is_empty());
+    for pane in [&first, &second, &stopped, &unoffered] {
+        assert!(
+            inbox_of(&daemon, &pane.id).is_empty(),
+            "preview sends nothing to {}",
+            key(pane)
+        );
+    }
+}
+
+/// Scenario: Preview an action on two stand-ins and a card that does not offer it, then execute only the confirmed entries. Each included stand-in displays its own prompt in its PTY and its card records the delivery, while the skipped stand-in receives nothing.
+#[spec("agent-report/batch/002")]
+#[test]
+fn agent_report_batch_002_execute_delivers_to_each_confirmed_card() {
+    let (daemon, _cfg) = daemon_with_config("");
+    let first = route::start(&daemon, "batch-deliver-first", json!({}));
+    let second = route::start(&daemon, "batch-deliver-second", json!({}));
+    let skipped = route::start(&daemon, "batch-deliver-skipped", json!({}));
+    for (pane, prompt) in [
+        (&first, "BATCH-DELIVER-FIRST-2399"),
+        (&second, "BATCH-DELIVER-SECOND-2399"),
+    ] {
+        publish_batch_action(&daemon, pane, prompt);
+        route::fetch_enable(pane);
+    }
+    let preview = card_batch(
+        &daemon,
+        "preview",
+        &[
+            batch_target(&first),
+            batch_target(&second),
+            batch_target(&skipped),
+        ],
+        "batch-preview-002",
+    );
+    assert_eq!(batch_outcome(&preview, &skipped)["outcome"], "skipped");
+    let confirmed = confirmed_batch(&preview);
+    assert_eq!(confirmed.len(), 2);
+    let result = card_batch(&daemon, "execute", &confirmed, "batch-execute-002");
+    assert_eq!(result["entries"].as_array().unwrap().len(), 2);
+    assert_batch_delivery(
+        &daemon,
+        &first,
+        batch_outcome(&result, &first),
+        "BATCH-DELIVER-FIRST-2399",
+    );
+    assert_batch_delivery(
+        &daemon,
+        &second,
+        batch_outcome(&result, &second),
+        "BATCH-DELIVER-SECOND-2399",
+    );
+    assert!(
+        inbox_of(&daemon, &skipped.id).is_empty(),
+        "skipped card receives nothing"
+    );
+    assert!(
+        inbox::bytes(&skipped).is_empty(),
+        "skipped stand-in receives no PTY input"
+    );
+    for (pane, other) in [
+        (&first, "BATCH-DELIVER-SECOND-2399"),
+        (&second, "BATCH-DELIVER-FIRST-2399"),
+    ] {
+        assert!(
+            !inbox_of(&daemon, &pane.id)
+                .iter()
+                .any(|message| message["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(other))),
+            "no cross-delivery"
+        );
+    }
+}
+
+/// Scenario: Preview three cards, then let one replace its action definition and confirm another with a stale daemon instance. Execute reports each failure with its reason, delivers the unaffected card's reviewed text, and sends neither the old nor the replacement text to either failed card.
+#[spec("agent-report/batch/003")]
+#[test]
+fn agent_report_batch_003_stale_entries_do_not_block_other_deliveries() {
+    let (daemon, _cfg) = daemon_with_config("");
+    let good = route::start(&daemon, "batch-good", json!({}));
+    let changed = route::start(&daemon, "batch-changed", json!({}));
+    let replaced = route::start(&daemon, "batch-replaced", json!({}));
+    for pane in [&good, &changed, &replaced] {
+        publish_batch_action(&daemon, pane, "BATCH-REVIEWED-2399");
+    }
+    route::fetch_enable(&good);
+    let preview = card_batch(
+        &daemon,
+        "preview",
+        &[
+            batch_target(&changed),
+            batch_target(&good),
+            batch_target(&replaced),
+        ],
+        "batch-preview-003",
+    );
+    let mut confirmed = confirmed_batch(&preview);
+    assert_eq!(confirmed.len(), 3);
+    publish_batch_action(&daemon, &changed, "BATCH-REPLACEMENT-2399-MUST-NOT-SEND");
+    confirmed
+        .iter_mut()
+        .find(|entry| entry["agent_id"] == replaced.agent)
+        .unwrap()["instance_id"] = json!("old-daemon-instance");
+    let result = card_batch(&daemon, "execute", &confirmed, "batch-execute-003");
+    assert_eq!(result["entries"].as_array().unwrap().len(), 3);
+    for (pane, code) in [(&changed, "stale_action"), (&replaced, "daemon_replaced")] {
+        let failed = batch_outcome(&result, pane);
+        assert_eq!(failed["outcome"], "failed", "{failed:#}");
+        assert_eq!(failed["code"], code);
+        assert!(!failed["message"].as_str().unwrap_or_default().is_empty());
+        assert!(
+            inbox_of(&daemon, &pane.id).is_empty(),
+            "failed entry sends nothing"
+        );
+        assert!(
+            inbox::bytes(pane).is_empty(),
+            "failed entry receives no PTY input"
+        );
+    }
+    assert_batch_delivery(
+        &daemon,
+        &good,
+        batch_outcome(&result, &good),
+        "BATCH-REVIEWED-2399",
+    );
+}
+
 /// The user config every test's daemon reads: the deck's default catalog plus
 /// one action that asks for confirmation.
 const DEPLOY_PROMPT: &str = "DEPLOY-PROMPT-7f3a: deploy it, then update your card.";

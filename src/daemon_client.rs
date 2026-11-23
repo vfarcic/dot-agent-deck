@@ -1559,6 +1559,11 @@ pub struct AgentCardsAnswer {
     /// the list is in the tree's order. `false` for an older daemon, whose
     /// cards a client draws as roots with no roll-up.
     pub tree: bool,
+    /// Issue #2399: the daemon advertised
+    /// [`crate::daemon_protocol::CAP_AGENT_CARDS_BATCH`], so a client may offer
+    /// batch actions on these cards. `false` for an older daemon, which is
+    /// never sent a batch ([`DaemonClient::invoke_card_action_batch`]).
+    pub batch: bool,
 }
 
 /// Issue #2418: the client side of the tree's gate. Against a daemon whose
@@ -1579,7 +1584,8 @@ pub fn tree_gate(
             entry.checked_refs.clear();
         }
     }
-    AgentCardsAnswer { list, tree }
+    let batch = capabilities.supports(crate::daemon_protocol::CAP_AGENT_CARDS_BATCH);
+    AgentCardsAnswer { list, tree, batch }
 }
 
 /// PRD #1790 stage 2 (verification finding A): an interrupted work request a
@@ -4441,6 +4447,55 @@ impl DaemonClient {
             .ok_or_else(|| ClientError::Malformed("invoke-card-action answered no result".into()))
     }
 
+    /// Issue #2399: preview or execute one action on many cards in one
+    /// request. `instance_id` is the daemon process that listed the cards:
+    /// the connection is bound to it, as [`Self::invoke_card_action`]'s is, so
+    /// a successor is sent nothing and the call fails with
+    /// [`ClientError::DaemonRestarted`]. An execution's entries carry the
+    /// `action_token` and `instance_id` their preview answered, and the
+    /// daemon checks each as a single press. **Withheld unless the daemon's
+    /// `Hello` on the same connection advertised
+    /// [`crate::daemon_protocol::CAP_AGENT_CARDS_BATCH`]**, answering
+    /// [`GatedQuery::Unsupported`] without sending anything.
+    pub async fn invoke_card_action_batch(
+        &self,
+        instance_id: &str,
+        mode: crate::agent_cards::CardBatchMode,
+        action_id: &str,
+        request_id: &str,
+        entries: Vec<crate::agent_cards::CardBatchEntry>,
+    ) -> Result<GatedQuery<crate::agent_cards::CardBatchResult>, ClientError> {
+        let bound = self.bound_to(Incarnation::from(Some(instance_id.to_string())));
+        let Some((mut rd, mut wr, _)) = bound
+            .follow_on_connection(crate::daemon_protocol::CAP_AGENT_CARDS_BATCH)
+            .await?
+        else {
+            return Ok(GatedQuery::Unsupported);
+        };
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::InvokeCardActionBatch {
+                mode,
+                action_id: action_id.to_string(),
+                request_id: request_id.to_string(),
+                entries,
+            },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error
+                    .unwrap_or_else(|| "invoke-card-action-batch failed".into()),
+            ));
+        }
+        resp.card_action_batch
+            .map(GatedQuery::Answered)
+            .ok_or_else(|| {
+                ClientError::Malformed("invoke-card-action-batch answered no result".into())
+            })
+    }
+
     /// Stop agent `id`. On a gated handle the request goes only to a daemon
     /// admitted on its own connection (PRD #1666 part 2): agent ids are a
     /// per-daemon counter, so a replacement the client would refuse may hold an
@@ -7239,6 +7294,54 @@ mod tests {
         });
     }
 
+    /// Issue #2399 — the daemon advertises `agent-cards-batch`, and a batch
+    /// goes only on a connection whose `Hello` named it and
+    /// `hello-follow-on`: against a daemon that lists cards but does not,
+    /// nothing follows the Hello and its list is not read as batch-capable.
+    #[cfg(unix)]
+    #[test]
+    fn a_card_batch_is_sent_only_to_a_daemon_that_advertises_it() {
+        use crate::daemon_protocol::{
+            CAP_AGENT_CARDS, CAP_AGENT_CARDS_BATCH, CAP_AGENT_CARDS_TREE, CAP_HELLO_FOLLOW_ON,
+            DAEMON_CAPABILITIES,
+        };
+        assert!(DAEMON_CAPABILITIES.contains(&CAP_AGENT_CARDS_BATCH));
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        runtime.block_on(async {
+            for advertised in [
+                None,
+                Some(&[CAP_AGENT_CARDS, CAP_AGENT_CARDS_TREE, CAP_HELLO_FOLLOW_ON][..]),
+                Some(&[CAP_AGENT_CARDS_BATCH][..]),
+            ] {
+                assert_eq!(
+                    agent_card_request_inner(advertised, 4).await,
+                    (false, 0),
+                    "{advertised:?}: Unsupported, and nothing follows the Hello"
+                );
+            }
+            let tree = Some(&[CAP_AGENT_CARDS, CAP_AGENT_CARDS_TREE, CAP_HELLO_FOLLOW_ON][..]);
+            assert_eq!(
+                agent_card_request_inner(tree, 5).await,
+                (false, 1),
+                "listed, but not batch-capable"
+            );
+            let batch = Some(
+                &[
+                    CAP_AGENT_CARDS,
+                    CAP_AGENT_CARDS_TREE,
+                    CAP_AGENT_CARDS_BATCH,
+                    CAP_HELLO_FOLLOW_ON,
+                ][..],
+            );
+            assert_eq!(agent_card_request_inner(batch, 4).await, (true, 1));
+            assert_eq!(agent_card_request_inner(batch, 5).await, (true, 1));
+        });
+    }
+
     /// Issue #2418 (T8) — [`tree_gate`] keeps the tree fields from a daemon
     /// that advertises the tree and drops them from one that does not, so a
     /// client never draws a parent or roll-up the daemon did not vouch for.
@@ -7426,6 +7529,13 @@ mod tests {
                                 )),
                                 ..AttachResponse::ok()
                             },
+                            "invoke-card-action-batch" => AttachResponse {
+                                card_action_batch: Some(crate::agent_cards::CardBatchResult {
+                                    request_id: "b".into(),
+                                    entries: Vec::new(),
+                                }),
+                                ..AttachResponse::ok()
+                            },
                             _ => AttachResponse::err("malformed request"),
                         }
                     };
@@ -7449,6 +7559,27 @@ mod tests {
             1 => matches!(
                 client.agent_card_catalog().await,
                 Ok(GatedQuery::Answered(_))
+            ),
+            // Issue #2399: a batch, and a list read as batch-capable.
+            4 => matches!(
+                client
+                    .invoke_card_action_batch(
+                        "test-instance",
+                        crate::agent_cards::CardBatchMode::Preview,
+                        "merge",
+                        "b",
+                        vec![crate::agent_cards::CardBatchEntry {
+                            pane_id: "p".into(),
+                            agent_id: "1".into(),
+                            ..Default::default()
+                        }],
+                    )
+                    .await,
+                Ok(GatedQuery::Answered(_))
+            ),
+            5 => matches!(
+                client.list_agent_cards_tree().await,
+                Ok(GatedQuery::Answered(AgentCardsAnswer { batch: true, .. }))
             ),
             _ => matches!(
                 client

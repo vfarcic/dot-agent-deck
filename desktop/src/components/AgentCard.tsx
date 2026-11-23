@@ -15,7 +15,7 @@ import { PullRequestBadge } from "./PullRequestBadge";
  * optional `revealAgent`) are the dashboard's, so the card's name opens the
  * agent through `openAgent` exactly as a table row does (issue #2418, D12).
  */
-export type CardControls = Pick<VoiceActionContext, "showAgentCard" | "runCardAction" | "setCardTree" | "openCardReference" | "navigate"> & Partial<Pick<VoiceActionContext, "reportRefused" | "revealAgent">>;
+export type CardControls = Pick<VoiceActionContext, "showAgentCard" | "runCardAction" | "setCardTree" | "openCardReference" | "navigate"> & Partial<Pick<VoiceActionContext, "reportRefused" | "revealAgent" | "toggleCardSelected">>;
 
 /** The card a control names: its deck, agent and the daemon process that listed it. */
 export function cardRef(card: PlacedCard): { deckId: string; agentId: string; incarnation: string } {
@@ -230,6 +230,8 @@ export interface CardPlace {
   faded: boolean;
   /** Whether the deck's daemon builds the tree: an older one's cards carry no roll-up or checked references. */
   tree: boolean;
+  /** Issue #2399 — while the Cards view is selecting, whether this card is selected; absent otherwise, and the card has no checkbox. */
+  selected?: boolean;
 }
 
 /**
@@ -289,7 +291,7 @@ export function AgentCard({ card, controls, results, place, openTarget, ended }:
   const metaTitle = `${place.kind} · ${statusText}${endedText ? ` · ${endedText}` : ""} — show ${name}'s card`;
   return (
     <article
-      className={`agent-card tone-${tone}${entry.needs_you ? " needs-you" : ""}${place.faded ? " is-faded" : ""}`}
+      className={`agent-card tone-${tone}${entry.needs_you ? " needs-you" : ""}${place.faded ? " is-faded" : ""}${place.selected ? " is-selected" : ""}`}
       data-testid={`agent-card-${domIdentity(placedCardKey(card))}`}
       data-card-key={entry.key}
       data-depth={place.depth}
@@ -300,6 +302,18 @@ export function AgentCard({ card, controls, results, place, openTarget, ended }:
       onClick={() => VOICE_ACTIONS.showAgentCard.run(controls, ref)}
     >
       <header className="agent-card-header">
+        {place.selected !== undefined && controls.toggleCardSelected && (
+          <span className="agent-card-control agent-card-select" onClick={(event) => event.stopPropagation()}>
+            <input
+              type="checkbox"
+              data-testid="agent-card-select"
+              aria-label={`Select ${name}`}
+              title={place.hasChildren && !place.open ? `Select ${name} and every card under it` : `Select ${name}`}
+              checked={place.selected}
+              onChange={() => VOICE_ACTIONS.toggleCardSelected.run(controls as Pick<VoiceActionContext, "toggleCardSelected">, ref)}
+            />
+          </span>
+        )}
         <span className="agent-card-control" onClick={(event) => event.stopPropagation()}>
           <button
             type="button"

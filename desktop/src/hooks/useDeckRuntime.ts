@@ -18,7 +18,7 @@ import type { QuestionSelectionDto, QuestionTextSlotDto, VoiceQuestionTarget } f
 const EMPTY_TERMINAL_DATA: Record<string, TerminalBuffer> = {};
 import { acceptCardsSnapshot, reconcileCards, type CardsConnection } from "../lib/agentCards";
 import { useInterruptedWork } from "./useInterruptedWork";
-import { type AgentCardsSnapshot, type AgentCardTarget, type AgentTarget, type CardActionOptions, type CleanupWarningEntry, type DeckAction, type DeckFleet, type DeckListingOptions, type DeckRuntimeState, type DeckSnapshot, type DesktopFeatures, type InboxActionVerb, type RuntimeMode, type TerminalBuffer } from "../types";
+import { type AgentCardsSnapshot, type AgentCardTarget, type AgentTarget, type CardActionOptions, type CardBatchOptions, type CleanupWarningEntry, type DeckAction, type DeckFleet, type DeckListingOptions, type DeckRuntimeState, type DeckSnapshot, type DesktopFeatures, type InboxActionVerb, type RuntimeMode, type TerminalBuffer } from "../types";
 
 /**
  * The snapshot a runtime starts with, before any deck has answered. Lifted out
@@ -666,6 +666,9 @@ export function useDeckRuntime(): DeckRuntimeState {
   const invokeCardAction = useMemo(() => (typeof bridge.invokeCardAction === "function"
     ? (target: AgentCardTarget, actionId: string, options: CardActionOptions) => bridge.invokeCardAction!(target, actionId, options)
     : undefined), [bridge]);
+  const invokeCardActionBatch = useMemo(() => (typeof bridge.invokeCardActionBatch === "function"
+    ? (deckId: string, actionId: string, options: CardBatchOptions) => bridge.invokeCardActionBatch!(deckId, actionId, options)
+    : undefined), [bridge]);
 
   return {
     appliedGeometry,
@@ -687,6 +690,7 @@ export function useDeckRuntime(): DeckRuntimeState {
     ...(agentOpened ? { agentOpened } : {}),
     ...(cardsOffered ? { agentCards, consumeAgentCards } : {}),
     ...(invokeCardAction ? { invokeCardAction } : {}),
+    ...(invokeCardActionBatch ? { invokeCardActionBatch } : {}),
     ...(interruptedWork ? { interruptedWork } : {}),
     sendTerminalInput,
     resizeTerminal,

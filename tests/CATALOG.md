@@ -15304,6 +15304,35 @@ The TUI renders no cards in this slice (the desktop app does; `docs/desktop/agen
 - **Does not assert:** a client on another machine: the client reaches the daemon over its local attach socket, not over a remote deck's SSH tunnel (`fleet/observe/002` covers that transport; this test does not list cards through it), so the daemon's host and the client's are one machine told apart only by their `PATH`s.
 - **Platform coverage:** mac+linux.
 
+#### agent-report/batch
+
+##### agent-report/batch/001 — Preview names each included prompt and each skipped reason without sending.
+
+- **Test:** `agent_report_batch_001_preview_lists_exact_text_and_skip_reasons` in `tests/e2e_agent_cards.rs`.
+- **Layer:** L2 headless daemon, lane 1.
+- **Agent:** four routing stand-ins; no real agent.
+- **Asserts:** the handshake advertises `agent-cards-batch`; preview returns two distinct exact prompts with the listed definition token and daemon instance, skips a stopped agent, a card that does not offer the action and an unknown entry with readable reasons, and posts no inbox message.
+- **Does not assert:** desktop confirmation or execution (002 and 003).
+- **Platform coverage:** mac+linux.
+
+##### agent-report/batch/002 — Execute delivers each confirmed prompt to its own agent and card.
+
+- **Test:** `agent_report_batch_002_execute_delivers_to_each_confirmed_card` in `tests/e2e_agent_cards.rs`.
+- **Layer:** L2 headless daemon with PTY stand-ins, lane 1.
+- **Agent:** three routing stand-ins; no real agent.
+- **Asserts:** execution of the included preview entries returns their individual message ids, each included stand-in fetches and displays its own exact prompt in its PTY and its own card records the delivered text; the skipped stand-in receives no message or PTY input, and neither included stand-in receives the other's text.
+- **Does not assert:** a real agent acting on the prompt (live/003).
+- **Platform coverage:** mac+linux.
+
+##### agent-report/batch/003 — A stale entry fails without blocking the other entries.
+
+- **Test:** `agent_report_batch_003_stale_entries_do_not_block_other_deliveries` in `tests/e2e_agent_cards.rs`.
+- **Layer:** L2 headless daemon with PTY stand-ins, lane 1.
+- **Agent:** three routing stand-ins; no real agent.
+- **Asserts:** after preview, one action's text changes and another entry's confirmed daemon instance is stale; execution reports `stale_action` and `daemon_replaced` separately with readable reasons, sends nothing to those entries and still delivers the unaffected entry's reviewed text, visible in its PTY and recorded on its card.
+- **Does not assert:** admission-cap saturation (existing single-action unit coverage).
+- **Platform coverage:** mac+linux.
+
 #### agent-report/live
 
 ##### agent-report/live/001 — A real agent publishes its card and acts on a card action.
@@ -15318,6 +15347,15 @@ The TUI renders no cards in this slice (the desktop app does; `docs/desktop/agen
 - **Agent:** Claude Code (interactive Haiku; onboarding and trust seeded, `--allowedTools Bash Read Write`); the daemon's `gh` is the host's, logged in with the token `gh auth token` prints on the host, which the pane's own environment does not carry.
 - **Asserts:** told to create a uniquely named sentinel file and publish its card with `pull-request` = `https://github.com/vfarcic/dot-agent-deck/pull/2378`, the agent creates the sentinel, its card shows that claim as written, and `checked_refs` shows the deck's check: `vfarcic/dot-agent-deck` #2378, the canonical link, `checked`, `merged`, not stale. Skips (a failure under `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1`) when the host's `gh` is not logged in or the deck's lookup reads `no_github_access`.
 - **Does not assert:** the desktop's badge for the reference (`desktop/agent-cards/*`); the TUI draws no cards.
+- **Platform coverage:** mac+linux.
+
+##### agent-report/live/003 — A reviewed batch makes an interactive agent create its sentinel.
+
+- **Test:** `live_003_a_batch_action_makes_an_interactive_agent_write_its_sentinel` in `tests/e2e_agent_cards_live.rs`.
+- **Layer:** L2 PTY-attached, lane 2; developer machine only.
+- **Agent:** interactive Claude Code on Haiku, with seeded trust and onboarding; one `cat` stand-in card without the action.
+- **Asserts:** Haiku publishes the user-catalog action; batch preview includes its exact prompt and skips the other card with a reason without creating the sentinel; execution creates the unique sentinel, its name appears in the attached agent pane, and Haiku's card records the delivered message while the skipped card has no delivery.
+- **Does not assert:** native desktop transport or microphone capture.
 - **Platform coverage:** mac+linux.
 
 ### Docs cross-reference skips
@@ -16799,6 +16837,48 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 - **Layer:** desktop browser (production build, `vite preview`) at 375 and 1440 px.
 - **Asserts:** the long name's first character starts inside its button's content box, its text is cut with `overflow: hidden` and `text-overflow: ellipsis`, and its box ends before Close; Close has a positive width and lies wholly inside the card. The labels line stays 18 px high, shows at least one but fewer than eight labels in their original order, draws each visible chip whole inside the line and clear of `+N`, counts the hidden labels with `+N`, and shows the first label's repository colour. A single valid 50-character label wider than the line is hidden whole and counted by `+1`; any drawn chip has `scrollWidth <= clientWidth`. No root moves or resizes, and the page does not scroll sideways.
 - **Does not assert:** the pixels of the ellipsis glyph; the `agent-cards` screenshot scenario's image.
+
+##### desktop/agent-cards/028 — Selecting a closed root includes its whole subtree.
+
+- **Test:** vitest `desktop/agent-cards/028: …` in `desktop/src/components/AgentCardsBatch.test.tsx`.
+- **Layer:** desktop component (jsdom).
+- **Asserts:** selection mode lets the user select a closed root, counts the root, child and grandchild without opening them, leaves the unrelated root unselected, previews precisely the selected subtree and clears the selection when the root is unchecked.
+- **Does not assert:** browser geometry (033).
+
+##### desktop/agent-cards/029 — An overlay batch reaches the card's whole subtree.
+
+- **Test:** vitest `desktop/agent-cards/029: …` in `desktop/src/components/AgentCardsBatch.test.tsx`.
+- **Layer:** desktop component (jsdom).
+- **Asserts:** the root's overlay offers a batch action which previews the root and its nested descendants, excluding the unrelated root, opens confirmation and executes nothing.
+- **Does not assert:** daemon admission checks (agent-report/batch/003).
+
+##### desktop/agent-cards/030 — A batch always confirms the daemon's exact per-agent text.
+
+- **Test:** vitest `desktop/agent-cards/030: …` in `desktop/src/components/AgentCardsBatch.test.tsx`.
+- **Layer:** desktop component (jsdom).
+- **Asserts:** even `confirm=false` opens a confirmation showing each included agent's exact daemon-previewed text as a quote, without a text input, and the skipped agent's reason; no execution occurs before Send or after Cancel; a later Send submits only the included preview entries with their definition tokens and daemon instances.
+- **Does not assert:** transport to a real daemon (agent-report/batch/002).
+
+##### desktop/agent-cards/031 — Partial results name each delivered and failed agent.
+
+- **Test:** vitest `desktop/agent-cards/031: …` in `desktop/src/components/AgentCardsBatch.test.tsx`.
+- **Layer:** desktop component (jsdom).
+- **Asserts:** after Send, the root's row says Delivered and the child's row says Failed with the daemon's changed-action reason; the batch uses its own request rather than single-card invocations.
+- **Does not assert:** a real stale definition (agent-report/batch/003).
+
+##### desktop/agent-cards/032 — Voice starts a batch by opening its confirmation.
+
+- **Test:** vitest `desktop/agent-cards/032: …` in `desktop/src/components/AgentCardsVoice.test.tsx`.
+- **Layer:** desktop shell (jsdom), real voice panel and dispatch seam with synthetic resolved speech.
+- **Asserts:** the `run_card_action_batch` command invokes the voice-enabled `runCardActionBatch` entry on the overview with an agent reference and card action; spoken Go ahead on the parent's subtree previews both agents, shows the daemon's exact text in confirmation, and executes nothing; Cancel sends nothing.
+- **Does not assert:** microphone capture, transcription or model classification.
+
+##### desktop/agent-cards/033 — A closed subtree's batch confirmation fits at the Cards tree's widths.
+
+- **Test:** Playwright `desktop/agent-cards/033 — a closed subtree's batch confirmation fits and works at <width>px` in `desktop/e2e/agent-cards-tree.spec.ts`.
+- **Layer:** desktop browser at 375, 768, 1024, 1440 and 1920 px, using the production build and tree fixture.
+- **Asserts:** a closed root selects seven nested agents without expanding; the preview's seven quoted prompts wrap without horizontal clipping and can each be scrolled into view, the dialog fits the window and Send and Cancel are in view, Cancel dismisses without showing results, and a subsequent Send shows results without sideways page scrolling.
+- **Does not assert:** actual daemon delivery (agent-report/batch/002); a real agent (agent-report/live/003).
 
 ## Desktop native driver scenarios
 

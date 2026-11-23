@@ -2840,6 +2840,35 @@ try_saying  = "press {action} on {agent}'s card"
   name = "action"
   kind = "card_action"
 
+# Issue #2399 — a batch: one card action sent to an agent and every agent
+# under it (a dispatcher's units, an orchestrator's roles). Like every batch it
+# only OPENS the confirmation, which lists who gets what and who is skipped and
+# why; the user presses Send by hand (PRD #802 D5).
+[[commands]]
+id          = "run_card_action_batch"
+description = """Send one of the card actions to an agent AND every agent under it on the agent
+dashboard — a dispatcher and all its units, an orchestrator and all its roles — after the user
+reviews it. Use when the user names an action and a group: "go ahead on everything under the
+dispatcher", "send go ahead to the whole orchestration", "close every agent under the planner".
+Set `agent` to the user's words for the agent at the top and `action` to the button's label as the
+user said it. It only opens a confirmation listing each agent, the exact text it gets and which are
+skipped; nothing is sent until the user presses Send. One agent's own button is
+`run_card_action`."""
+invoke      = "runCardActionBatch"
+screens     = ["overview"]
+unavailable_hint = "a card action is sent to a group from the agent dashboard's cards"
+report      = "Review {action} for {agent} and every agent under it, then press Send."
+asks_to     = "send one card action to an agent and every agent under it"
+try_saying  = "{action} on everything under {agent}"
+
+  [[commands.params]]
+  name = "agent"
+  kind = "agent_ref"
+
+  [[commands.params]]
+  name = "action"
+  kind = "card_action"
+
 [[commands]]
 id          = "reply_to_agent_card"
 description = """Write a reply to an agent from its card with the user's own words: they are put in

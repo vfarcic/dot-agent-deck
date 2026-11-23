@@ -39,6 +39,60 @@ import { expect, test, type Page } from "@playwright/test";
 const WIDTHS = [375, 768, 1024, 1440, 1920] as const;
 const TOLERANCE = 0.5;
 
+for (const width of WIDTHS) {
+  /// Scenario: At this window width, select a closed root containing six nested cards and start a batch. The preview shows the seven agents, wraps each exact prompt within the dialog and keeps Send and Cancel usable; Cancel sends nothing, and a subsequent Send opens the results.
+  test(`desktop/agent-cards/033 — a closed subtree's batch confirmation fits and works at ${width}px`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 900 });
+    await openCardsTree(page);
+    await pushCards(page, `
+      next.batch = true;
+      for (const entry of next.entries) {
+        entry.actions = [{ id: "batch-go", label: "Go ahead", kind: "prompt",
+          prompt: "BATCH-BROWSER-2399 for " + entry.name + ": " + "Review this exact instruction before sending. ".repeat(20),
+          prompt_source: "catalog", text_input: false, confirm: false, confirm_detail: null, icon: null,
+          placement: "detail", custom: false, source: "catalog", enabled: true, disabled_reason: null,
+          last_delivery: null, token: "tok-batch-" + entry.agent_id }, ...entry.actions];
+      }
+    `);
+    const root = await cardNamed(page, "issue-queue");
+    await expect(page.locator("article[data-card-key][data-depth='1']")).toHaveCount(0);
+    await page.getByTestId("agent-cards-select").click();
+    await root.getByRole("checkbox", { name: "Select issue-queue" }).check();
+    await expect(page.getByTestId("agent-cards-selection-count")).toHaveText("7 selected");
+    await expect(page.locator("article[data-card-key][data-depth='1']")).toHaveCount(0);
+    await page.getByTestId("agent-cards-batch-action-batch-go").click();
+    const dialog = page.getByTestId("agent-cards-batch-confirm");
+    await expect(dialog).toBeVisible();
+    await expect(dialog.getByTestId("agent-cards-batch-entry")).toHaveCount(7);
+    await expect(dialog.getByRole("textbox")).toHaveCount(0);
+    const bounds = await dialog.boundingBox();
+    expect(bounds).not.toBeNull();
+    expect(bounds!.x).toBeGreaterThanOrEqual(0);
+    expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(width + TOLERANCE);
+    expect(bounds!.y).toBeGreaterThanOrEqual(0);
+    expect(bounds!.y + bounds!.height).toBeLessThanOrEqual(900 + TOLERANCE);
+    const send = dialog.getByRole("button", { name: "Send", exact: true });
+    const cancel = dialog.getByRole("button", { name: "Cancel", exact: true });
+    await expect(send).toBeInViewport();
+    await expect(cancel).toBeInViewport();
+    const prompts = dialog.getByTestId("agent-cards-batch-prompt");
+    await expect(prompts).toHaveCount(7);
+    for (let index = 0; index < 7; index++) {
+      const prompt = prompts.nth(index);
+      await prompt.scrollIntoViewIfNeeded();
+      await expect(prompt).toBeInViewport();
+      expect(await prompt.evaluate((node) => node.scrollWidth <= node.clientWidth), "the quote wraps without horizontal clipping").toBe(true);
+    }
+    await cancel.click();
+    await expect(dialog).toHaveCount(0);
+    await expect(page.getByTestId("agent-cards-batch-results")).toHaveCount(0);
+    await page.getByTestId("agent-cards-batch-action-batch-go").click();
+    await page.getByTestId("agent-cards-batch-confirm").getByRole("button", { name: "Send", exact: true }).click();
+    await expect(page.getByTestId("agent-cards-batch-results")).toBeVisible();
+    await expectNoSidewaysScroll(page);
+  });
+}
+
 /// Scenario: an agent offers a daemon-valid multiline prompt whose final instruction lies below the overlay viewport. Pressing its action sends nothing, a separate review shows the entire prompt, and only the review's Send delivers it.
 test("desktop/agent-cards/024 — an offscreen prompt suffix requires the review step before sending (R2-A1)", async ({ page }) => {
   await page.setViewportSize({ width: 1024, height: 900 });

@@ -1521,6 +1521,11 @@ mod tests {
                 ),
                 ("open_card_issue", "openCardIssue", vec!["overview"]),
                 ("run_card_action", "runCardAction", vec!["overview"]),
+                (
+                    "run_card_action_batch",
+                    "runCardActionBatch",
+                    vec!["overview"]
+                ),
                 ("reply_to_agent_card", "replyToAgentCard", vec!["overview"]),
             ]
         );
@@ -2514,6 +2519,7 @@ mod tests {
                 "open_card_pull_request",
                 "open_card_issue",
                 "run_card_action",
+                "run_card_action_batch",
                 "reply_to_agent_card"
             ]
         );

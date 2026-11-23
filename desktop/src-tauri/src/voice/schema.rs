@@ -486,6 +486,7 @@ mod tests {
                 "open_card_pull_request".to_string(),
                 "open_card_issue".to_string(),
                 "run_card_action".to_string(),
+                "run_card_action_batch".to_string(),
                 "reply_to_agent_card".to_string(),
                 "none".to_string(),
             ]
@@ -610,6 +611,7 @@ mod tests {
                 "open_card_pull_request",
                 "open_card_issue",
                 "run_card_action",
+                "run_card_action_batch",
                 "reply_to_agent_card",
                 "none"
             ]
@@ -855,6 +857,7 @@ mod tests {
                 ("open_card_pull_request".to_string(), false),
                 ("open_card_issue".to_string(), false),
                 ("run_card_action".to_string(), false),
+                ("run_card_action_batch".to_string(), false),
                 ("reply_to_agent_card".to_string(), false),
             ]
         );
@@ -948,6 +951,7 @@ mod tests {
                 ("open_card_pull_request".to_string(), true),
                 ("open_card_issue".to_string(), true),
                 ("run_card_action".to_string(), true),
+                ("run_card_action_batch".to_string(), true),
                 ("reply_to_agent_card".to_string(), true),
             ]
         );
@@ -1033,6 +1037,7 @@ mod tests {
                 ("open_card_pull_request".to_string(), false),
                 ("open_card_issue".to_string(), false),
                 ("run_card_action".to_string(), false),
+                ("run_card_action_batch".to_string(), false),
                 ("reply_to_agent_card".to_string(), false),
             ]
         );

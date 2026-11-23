@@ -143,6 +143,11 @@ pub const CODE_REQUEST_REUSED: &str = "request_reused";
 pub const CODE_BUSY: &str = "busy";
 /// The `disabled_reason` of a prompt action whose agent is not running.
 pub const REASON_AGENT_STOPPED: &str = "agent_stopped";
+/// Issue #2399: a batch skips a card whose agent is not running with this
+/// code (the same word as [`REASON_AGENT_STOPPED`]).
+pub const CODE_AGENT_STOPPED: &str = REASON_AGENT_STOPPED;
+/// Issue #2399: the most distinct cards one batch request may name.
+pub const MAX_BATCH_ENTRIES: usize = 256;
 
 /// Metadata keys of the [`crate::event::EventType::AgentCard`] doorbell.
 pub const AGENT_CARD_KEY_METADATA_KEY: &str = "agent_card_key";
@@ -1036,6 +1041,107 @@ impl CardActionResult {
 
     pub fn is_refused(&self) -> bool {
         self.outcome == "refused"
+    }
+}
+
+/// Issue #2399: what an `invoke-card-action-batch` asks the daemon to do with
+/// its entries. `preview` sends nothing and answers, per entry, whether it is
+/// included (with the exact text it would get) or skipped and why; `execute`
+/// sends to the entries the user confirmed from that preview.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CardBatchMode {
+    Preview,
+    Execute,
+}
+
+/// Issue #2399: one card a batch names — its pane and the agent generation
+/// the client showed, as a single [`CardActionRequest`] names one. An
+/// `execute` entry also carries the `action_token` and `instance_id` its
+/// preview answered, which the daemon checks exactly as a single press's.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CardBatchEntry {
+    pub pane_id: String,
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub action_token: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub instance_id: String,
+}
+
+/// Issue #2399: `invoke-card-action-batch`'s answer, one outcome per distinct
+/// entry the request named, in the request's order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CardBatchResult {
+    pub request_id: String,
+    pub entries: Vec<CardBatchOutcome>,
+}
+
+/// A batch preview included this entry.
+pub const BATCH_INCLUDED: &str = "included";
+/// A batch preview skipped this entry; `code` and `message` say why.
+pub const BATCH_SKIPPED: &str = "skipped";
+/// A batch execution sent this entry its text (`message_id` names it).
+pub const BATCH_DELIVERED: &str = "delivered";
+/// A batch execution closed this entry's agent.
+pub const BATCH_CLOSED: &str = "closed";
+/// A batch execution did nothing for this entry; `code` and `message` say why.
+pub const BATCH_FAILED: &str = "failed";
+
+/// Issue #2399: what happened, or would happen, to one entry of a batch.
+/// `outcome` is [`BATCH_INCLUDED`] or [`BATCH_SKIPPED`] for a preview, and
+/// [`BATCH_DELIVERED`], [`BATCH_CLOSED`] or [`BATCH_FAILED`] for an execution.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CardBatchOutcome {
+    pub pane_id: String,
+    pub agent_id: String,
+    pub outcome: String,
+    /// The card's name, as its entry gives it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// An included entry's action label and kind (`prompt`, `close`,
+    /// `close_keep_worktree`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// The exact text an included prompt action sends this entry, and who
+    /// wrote it (as [`CardAction::prompt_source`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_source: Option<String>,
+    /// What an included entry's execution must send back: the definition's
+    /// token and the daemon process that previewed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kept_worktree: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+impl CardBatchOutcome {
+    fn of(target: &CardBatchEntry, outcome: &str) -> Self {
+        CardBatchOutcome {
+            pane_id: target.pane_id.clone(),
+            agent_id: target.agent_id.clone(),
+            outcome: outcome.to_string(),
+            ..CardBatchOutcome::default()
+        }
+    }
+
+    fn with_reason(mut self, code: &str, message: impl Into<String>) -> Self {
+        let message: String = message.into();
+        self.code = Some(code.to_string());
+        self.message = Some(message.chars().take(MAX_RESULT_MESSAGE_CHARS).collect());
+        self
     }
 }
 
@@ -3124,6 +3230,260 @@ where
         work,
     )
     .await
+}
+
+/// Issue #2399: check a batch request as a whole before anything about it is
+/// read or done: its request id (with room for each entry's own id, see
+/// [`batch_entry_request_id`]), its action id, and its entries' number and
+/// identifier sizes. `Err` is the sentence the request is refused with.
+pub fn check_batch(
+    request_id: &str,
+    action_id: &str,
+    entries: &[CardBatchEntry],
+) -> Result<(), String> {
+    const ENTRY_SUFFIX_BYTES: usize = 4; // ":255"
+    if !is_request_id(request_id) || request_id.len() > MAX_REQUEST_ID_BYTES - ENTRY_SUFFIX_BYTES {
+        return Err(format!(
+            "the batch request id must be 1 to {} letters, digits, '.', '_', ':' or '-'",
+            MAX_REQUEST_ID_BYTES - ENTRY_SUFFIX_BYTES
+        ));
+    }
+    if action_id.is_empty() || action_id.len() > MAX_REQUEST_FIELD_BYTES {
+        return Err(format!(
+            "the action id must be 1 to {MAX_REQUEST_FIELD_BYTES} bytes"
+        ));
+    }
+    let distinct = distinct_batch_entries(entries).len();
+    if distinct == 0 {
+        return Err("the batch names no cards".into());
+    }
+    if distinct > MAX_BATCH_ENTRIES {
+        return Err(format!(
+            "a batch may name at most {MAX_BATCH_ENTRIES} cards; this one names {distinct}"
+        ));
+    }
+    for entry in entries {
+        for (what, value) in [
+            ("pane id", &entry.pane_id),
+            ("agent id", &entry.agent_id),
+            ("action token", &entry.action_token),
+            ("instance id", &entry.instance_id),
+        ] {
+            if value.len() > MAX_REQUEST_FIELD_BYTES {
+                return Err(format!(
+                    "a batch entry's {what} is longer than {MAX_REQUEST_FIELD_BYTES} bytes"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The entries of a batch, each card once: the first naming of a pane and
+/// agent generation wins, and the request's order is kept.
+fn distinct_batch_entries(entries: &[CardBatchEntry]) -> Vec<&CardBatchEntry> {
+    let mut seen = std::collections::HashSet::new();
+    entries
+        .iter()
+        .filter(|entry| seen.insert((entry.pane_id.as_str(), entry.agent_id.as_str())))
+        .collect()
+}
+
+/// The request id one entry of an executed batch is invoked under: the
+/// batch's own, then the entry's place among the distinct entries. Repeating
+/// the same execution therefore repeats each entry's single press, which
+/// answers as the first did and sends nothing again.
+fn batch_entry_request_id(request_id: &str, index: usize) -> String {
+    format!("{request_id}:{index}")
+}
+
+/// Issue #2399: what a batch preview answers for one entry, read from the
+/// cards as the daemon just computed them. The checks are a single press's
+/// own ([`invoke_once`]), less the ones a preview cannot make (the token and
+/// instance it is about to hand out, and the user's confirmation, which the
+/// batch's own confirmation is): a card the list does not hold, an action the
+/// card does not offer, an action the app does rather than the daemon, a
+/// reply (whose words are the user's own, one card at a time), and a disabled
+/// action — a stopped agent's prompt action among them — are skipped with
+/// the code a press would be refused with.
+fn preview_entry(
+    list: &AgentCardList,
+    action_id: &str,
+    target: &CardBatchEntry,
+) -> CardBatchOutcome {
+    let key = entry_key(&target.pane_id, &target.agent_id);
+    let skipped = || CardBatchOutcome::of(target, BATCH_SKIPPED);
+    let Some(entry) = list.entries.iter().find(|e| e.key == key) else {
+        let pane_held = list.entries.iter().any(|e| e.pane_id == target.pane_id);
+        let refusal = no_such_card("", &key, &target.pane_id, pane_held);
+        return skipped().with_reason(
+            refusal.code.as_deref().unwrap_or(CODE_UNKNOWN_ENTRY),
+            refusal.message.unwrap_or_default(),
+        );
+    };
+    let mut skipped = skipped();
+    skipped.name = Some(entry.name.clone());
+    let Some(action) = entry.action(action_id) else {
+        return skipped.with_reason(
+            CODE_UNKNOWN_ACTION,
+            format!("{}'s card does not offer this action", entry.name),
+        );
+    };
+    if action.kind == "open" {
+        return skipped.with_reason(
+            CODE_CLIENT_SIDE_ACTION,
+            "opening an agent is done one card at a time",
+        );
+    }
+    if action.text_input {
+        return skipped.with_reason(
+            CODE_TEXT_REQUIRED,
+            format!(
+                "{} sends your own words, so it is sent from each card",
+                action.label
+            ),
+        );
+    }
+    if !action.enabled {
+        return if action.disabled_reason.as_deref() == Some(REASON_AGENT_STOPPED) {
+            skipped.with_reason(CODE_AGENT_STOPPED, "the agent is not running")
+        } else {
+            skipped.with_reason(
+                CODE_ACTION_DISABLED,
+                format!("{} is not available on this card now", action.label),
+            )
+        };
+    }
+    let prompt = match action.kind.as_str() {
+        "close" | "close_keep_worktree" => None,
+        _ => match action.prompt.as_ref() {
+            Some(prompt) if !prompt.trim().is_empty() => Some(prompt.clone()),
+            _ => {
+                return skipped.with_reason(
+                    CODE_ACTION_DISABLED,
+                    format!("{} has no text to send on this card", action.label),
+                );
+            }
+        },
+    };
+    CardBatchOutcome {
+        name: Some(entry.name.clone()),
+        label: Some(action.label.clone()),
+        kind: Some(action.kind.clone()),
+        prompt_source: prompt.as_ref().and(action.prompt_source.clone()),
+        prompt,
+        action_token: Some(action.token.clone()),
+        instance_id: Some(list.instance_id.clone()),
+        ..CardBatchOutcome::of(target, BATCH_INCLUDED)
+    }
+}
+
+/// Issue #2399: a batch preview of `action_id` over `entries`, read from a
+/// fresh computation of the cards. Sends nothing and remembers nothing.
+pub fn preview_batch(
+    list: &AgentCardList,
+    request_id: &str,
+    action_id: &str,
+    entries: &[CardBatchEntry],
+) -> CardBatchResult {
+    CardBatchResult {
+        request_id: request_id.to_string(),
+        entries: distinct_batch_entries(entries)
+            .into_iter()
+            .map(|target| preview_entry(list, action_id, target))
+            .collect(),
+    }
+}
+
+/// What one executed entry's single press answered, as the batch reports it.
+fn execution_outcome(target: &CardBatchEntry, result: CardActionResult) -> CardBatchOutcome {
+    match result.outcome.as_str() {
+        "sent" => CardBatchOutcome {
+            name: result.message,
+            message_id: result.message_id,
+            ..CardBatchOutcome::of(target, BATCH_DELIVERED)
+        },
+        "closed" => CardBatchOutcome {
+            name: result.message,
+            kept_worktree: result.kept_worktree,
+            ..CardBatchOutcome::of(target, BATCH_CLOSED)
+        },
+        _ => CardBatchOutcome::of(target, BATCH_FAILED).with_reason(
+            result.code.as_deref().unwrap_or(CODE_DELIVERY_REFUSED),
+            result
+                .message
+                .unwrap_or_else(|| "the deck did not act on this card".into()),
+        ),
+    }
+}
+
+/// Issue #2399: execute a confirmed batch, one entry after another, each as
+/// the single press `invoke_one` performs — the same checks (instance,
+/// card, definition token, admission caps), the same delivery and the same
+/// record on its own card. The user's confirmation of the batch is each
+/// press's `confirm`. An entry that is refused fails on its own: the entries
+/// after it are still invoked.
+pub async fn execute_batch<I, Fut>(
+    request_id: &str,
+    action_id: &str,
+    entries: &[CardBatchEntry],
+    mut invoke_one: I,
+) -> CardBatchResult
+where
+    I: FnMut(CardActionRequest) -> Fut,
+    Fut: std::future::Future<Output = CardActionResult>,
+{
+    let mut outcomes = Vec::new();
+    for (index, target) in distinct_batch_entries(entries).into_iter().enumerate() {
+        let result = invoke_one(CardActionRequest {
+            pane_id: target.pane_id.clone(),
+            agent_id: target.agent_id.clone(),
+            action_id: action_id.to_string(),
+            action_token: target.action_token.clone(),
+            instance_id: target.instance_id.clone(),
+            request_id: batch_entry_request_id(request_id, index),
+            confirm: true,
+            text: None,
+        })
+        .await;
+        outcomes.push(execution_outcome(target, result));
+    }
+    CardBatchResult {
+        request_id: request_id.to_string(),
+        entries: outcomes,
+    }
+}
+
+/// Issue #2399: answer an `invoke-card-action-batch`. `close` makes the stop
+/// each close entry performs, as [`invoke`]'s `close`. `Err` is a refusal of
+/// the request as a whole ([`check_batch`]), before anything was read or done.
+pub async fn invoke_batch<C, F, Fut>(
+    registry: &Arc<AgentPtyRegistry>,
+    state: &crate::state::SharedState,
+    mode: CardBatchMode,
+    request_id: &str,
+    action_id: &str,
+    entries: &[CardBatchEntry],
+    close: C,
+) -> Result<CardBatchResult, String>
+where
+    C: Fn() -> F,
+    F: FnOnce(String, bool) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = CloseOutcome> + Send + 'static,
+{
+    check_batch(request_id, action_id, entries)?;
+    Ok(match mode {
+        CardBatchMode::Preview => {
+            let list = refresh(registry, state).await;
+            preview_batch(&list, request_id, action_id, entries)
+        }
+        CardBatchMode::Execute => {
+            execute_batch(request_id, action_id, entries, |request| {
+                invoke(registry, state, request, close())
+            })
+            .await
+        }
+    })
 }
 
 /// Run `work` for `request_id` unless a request with that id ran or is
@@ -5923,5 +6283,354 @@ mod tests {
         assert_eq!(split_key("a/b/c"), Some(("a/b", "c")));
         assert_eq!(split_key("p3"), None);
         assert_eq!(split_key("/a"), None);
+    }
+}
+
+/// Issue #2399: the batch's classification and its partial failures, without
+/// a daemon: a preview reads a card list, and an execution's single presses
+/// are a stand-in.
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+
+    const INSTANCE: &str = "daemon-batch";
+
+    fn action(
+        id: &str,
+        kind: &str,
+        prompt: Option<&str>,
+        enabled: bool,
+        reason: Option<&str>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "id": id, "label": format!("Label {id}"), "kind": kind, "prompt": prompt,
+            "prompt_source": prompt.map(|_| "catalog"), "text_input": id == "reply",
+            "confirm": false, "placement": "detail", "custom": false, "source": "catalog",
+            "enabled": enabled, "disabled_reason": reason, "token": format!("tok-{id}"),
+        })
+    }
+
+    fn card(
+        pane: &str,
+        agent: &str,
+        status: &str,
+        actions: Vec<serde_json::Value>,
+    ) -> AgentCardEntry {
+        serde_json::from_value(serde_json::json!({
+            "key": entry_key(pane, agent), "instance_id": INSTANCE, "pane_id": pane, "agent_id": agent,
+            "name": format!("name-{pane}"), "status": status, "needs_you": false, "needs_you_reasons": [],
+            "group": {"id": "standalone", "kind": "standalone"}, "actions": actions,
+            "primary_action_id": "open", "facts": {"source": "deck"},
+            "revision": 1, "updated_at": "2026-11-23T00:00:00Z",
+        }))
+        .unwrap()
+    }
+
+    fn list() -> AgentCardList {
+        let go = |text: &str| action("go", "prompt", Some(text), true, None);
+        AgentCardList {
+            instance_id: INSTANCE.into(),
+            revision: 3,
+            catalog_errors: vec![],
+            entries: vec![
+                card(
+                    "p1",
+                    "a1",
+                    "idle",
+                    vec![go("first text"), action("close", "close", None, true, None)],
+                ),
+                card("p2", "a2", "idle", vec![go("second text")]),
+                card(
+                    "p3",
+                    "a3",
+                    "stopped",
+                    vec![action(
+                        "go",
+                        "prompt",
+                        Some("never"),
+                        false,
+                        Some(REASON_AGENT_STOPPED),
+                    )],
+                ),
+                card(
+                    "p4",
+                    "a4",
+                    "idle",
+                    vec![action("open", "open", None, true, None)],
+                ),
+                card(
+                    "p5",
+                    "a5",
+                    "idle",
+                    vec![action("go", "prompt", Some("x"), false, Some("busy"))],
+                ),
+                card(
+                    "p6",
+                    "a6",
+                    "idle",
+                    vec![
+                        action("go", "prompt", Some("   "), true, None),
+                        action("reply", "prompt", None, true, None),
+                    ],
+                ),
+            ],
+        }
+    }
+
+    fn target(pane: &str, agent: &str) -> CardBatchEntry {
+        CardBatchEntry {
+            pane_id: pane.into(),
+            agent_id: agent.into(),
+            ..CardBatchEntry::default()
+        }
+    }
+
+    fn outcome<'a>(result: &'a CardBatchResult, pane: &str) -> &'a CardBatchOutcome {
+        result.entries.iter().find(|e| e.pane_id == pane).unwrap()
+    }
+
+    #[test]
+    fn a_preview_includes_each_card_with_its_own_exact_text_token_and_instance() {
+        let result = preview_batch(
+            &list(),
+            "b1",
+            "go",
+            &[target("p1", "a1"), target("p2", "a2")],
+        );
+        assert_eq!(result.request_id, "b1");
+        for (pane, text) in [("p1", "first text"), ("p2", "second text")] {
+            let entry = outcome(&result, pane);
+            assert_eq!(entry.outcome, BATCH_INCLUDED);
+            assert_eq!(entry.prompt.as_deref(), Some(text));
+            assert_eq!(entry.prompt_source.as_deref(), Some("catalog"));
+            assert_eq!(entry.action_token.as_deref(), Some("tok-go"));
+            assert_eq!(entry.instance_id.as_deref(), Some(INSTANCE));
+            assert_eq!(entry.name.as_deref(), Some(format!("name-{pane}").as_str()));
+            assert_eq!(entry.code, None);
+        }
+    }
+
+    #[test]
+    fn a_preview_skips_each_card_a_single_press_would_refuse_with_its_code_and_a_reason() {
+        let mut cards = list();
+        // A pane whose agent was replaced, and a pane nobody holds.
+        cards.entries.push(card("p7", "a7-new", "idle", vec![]));
+        let result = preview_batch(
+            &cards,
+            "b2",
+            "go",
+            &[
+                target("p3", "a3"),
+                target("p4", "a4"),
+                target("p5", "a5"),
+                target("p6", "a6"),
+                target("p7", "a7-old"),
+                target("gone", "x"),
+            ],
+        );
+        for (pane, code) in [
+            ("p3", CODE_AGENT_STOPPED),
+            ("p4", CODE_UNKNOWN_ACTION),
+            ("p5", CODE_ACTION_DISABLED),
+            ("p6", CODE_ACTION_DISABLED),
+            ("p7", CODE_STALE_ENTRY),
+            ("gone", CODE_UNKNOWN_ENTRY),
+        ] {
+            let entry = outcome(&result, pane);
+            assert_eq!(entry.outcome, BATCH_SKIPPED, "{pane}");
+            assert_eq!(entry.code.as_deref(), Some(code), "{pane}");
+            assert!(
+                entry.message.as_deref().is_some_and(|m| !m.is_empty()),
+                "{pane}"
+            );
+            assert_eq!(entry.prompt, None, "{pane}: a skipped card shows no text");
+            assert_eq!(
+                entry.action_token, None,
+                "{pane}: and gets no handle to execute with"
+            );
+        }
+        let open = preview_batch(&cards, "b3", "open", &[target("p4", "a4")]);
+        assert_eq!(
+            open.entries[0].code.as_deref(),
+            Some(CODE_CLIENT_SIDE_ACTION)
+        );
+        let reply = preview_batch(&cards, "b4", "reply", &[target("p6", "a6")]);
+        assert_eq!(reply.entries[0].code.as_deref(), Some(CODE_TEXT_REQUIRED));
+    }
+
+    #[test]
+    fn a_preview_includes_a_close_without_text_and_names_each_card_once() {
+        let result = preview_batch(
+            &list(),
+            "b5",
+            "close",
+            &[target("p1", "a1"), target("p1", "a1"), target("p2", "a2")],
+        );
+        assert_eq!(result.entries.len(), 2, "a card named twice is one entry");
+        let close = outcome(&result, "p1");
+        assert_eq!(close.outcome, BATCH_INCLUDED);
+        assert_eq!(close.kind.as_deref(), Some("close"));
+        assert_eq!(close.prompt, None);
+        assert_eq!(close.action_token.as_deref(), Some("tok-close"));
+        assert_eq!(
+            outcome(&result, "p2").code.as_deref(),
+            Some(CODE_UNKNOWN_ACTION)
+        );
+    }
+
+    #[test]
+    fn a_batch_request_is_refused_whole_when_its_ids_or_size_are_out_of_bounds() {
+        let one = [target("p1", "a1")];
+        assert!(check_batch("b", "go", &one).is_ok());
+        assert!(check_batch("", "go", &one).is_err());
+        assert!(check_batch("bad id", "go", &one).is_err());
+        assert!(check_batch(&"r".repeat(MAX_REQUEST_ID_BYTES - 4), "go", &one).is_ok());
+        assert!(
+            check_batch(&"r".repeat(MAX_REQUEST_ID_BYTES - 3), "go", &one).is_err(),
+            "room for each entry's own id"
+        );
+        assert!(check_batch("b", "", &one).is_err());
+        assert!(check_batch("b", "go", &[]).is_err());
+        let many: Vec<_> = (0..=MAX_BATCH_ENTRIES)
+            .map(|i| target(&format!("p{i}"), "a"))
+            .collect();
+        assert!(check_batch("b", "go", &many[..MAX_BATCH_ENTRIES]).is_ok());
+        assert!(check_batch("b", "go", &many).is_err());
+        let repeated = vec![target("p1", "a1"); MAX_BATCH_ENTRIES + 1];
+        assert!(
+            check_batch("b", "go", &repeated).is_ok(),
+            "the distinct cards count"
+        );
+        let mut long = target("p1", "a1");
+        long.action_token = "t".repeat(MAX_REQUEST_FIELD_BYTES + 1);
+        assert!(check_batch("b", "go", &[long]).is_err());
+    }
+
+    #[tokio::test]
+    async fn an_execution_presses_each_entry_once_confirmed_and_a_refusal_fails_alone() {
+        let entries = vec![
+            CardBatchEntry {
+                action_token: "t1".into(),
+                instance_id: INSTANCE.into(),
+                ..target("p1", "a1")
+            },
+            CardBatchEntry {
+                action_token: "stale".into(),
+                instance_id: INSTANCE.into(),
+                ..target("p2", "a2")
+            },
+            CardBatchEntry {
+                action_token: "t1".into(),
+                instance_id: INSTANCE.into(),
+                ..target("p1", "a1")
+            },
+            CardBatchEntry {
+                action_token: "t3".into(),
+                instance_id: INSTANCE.into(),
+                ..target("p3", "a3")
+            },
+            CardBatchEntry {
+                action_token: "t4".into(),
+                instance_id: INSTANCE.into(),
+                ..target("p4", "a4")
+            },
+        ];
+        let mut pressed = Vec::new();
+        let result = execute_batch("batch-7", "go", &entries, |request| {
+            pressed.push(request.clone());
+            async move {
+                match request.pane_id.as_str() {
+                    "p2" => CardActionResult::refused(
+                        &request.request_id,
+                        CODE_STALE_ACTION,
+                        "action go changed",
+                    ),
+                    "p4" => CardActionResult {
+                        request_id: request.request_id.clone(),
+                        outcome: "closed".into(),
+                        message_id: None,
+                        kept_worktree: Some("/w/p4".into()),
+                        code: None,
+                        message: Some("name-p4".into()),
+                        entry_revision: Some(9),
+                    },
+                    _ => CardActionResult {
+                        request_id: request.request_id.clone(),
+                        outcome: "sent".into(),
+                        message_id: Some(format!("m-{}", request.pane_id)),
+                        kept_worktree: None,
+                        code: None,
+                        message: Some(format!("name-{}", request.pane_id)),
+                        entry_revision: Some(2),
+                    },
+                }
+            }
+        })
+        .await;
+        assert_eq!(
+            pressed
+                .iter()
+                .map(|r| (
+                    r.pane_id.as_str(),
+                    r.request_id.as_str(),
+                    r.action_token.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("p1", "batch-7:0", "t1"),
+                ("p2", "batch-7:1", "stale"),
+                ("p3", "batch-7:2", "t3"),
+                ("p4", "batch-7:3", "t4")
+            ],
+            "each distinct entry is pressed once, in order, under its own id and with its own token"
+        );
+        assert!(pressed.iter().all(|r| r.confirm
+            && r.text.is_none()
+            && r.action_id == "go"
+            && r.instance_id == INSTANCE));
+        assert_eq!(result.entries.len(), 4);
+        let delivered = outcome(&result, "p1");
+        assert_eq!(delivered.outcome, BATCH_DELIVERED);
+        assert_eq!(delivered.message_id.as_deref(), Some("m-p1"));
+        let failed = outcome(&result, "p2");
+        assert_eq!(failed.outcome, BATCH_FAILED);
+        assert_eq!(failed.code.as_deref(), Some(CODE_STALE_ACTION));
+        assert_eq!(failed.message.as_deref(), Some("action go changed"));
+        assert_eq!(failed.message_id, None);
+        assert_eq!(
+            outcome(&result, "p3").outcome,
+            BATCH_DELIVERED,
+            "an entry after a failure still goes"
+        );
+        let closed = outcome(&result, "p4");
+        assert_eq!(closed.outcome, BATCH_CLOSED);
+        assert_eq!(closed.kept_worktree.as_deref(), Some("/w/p4"));
+    }
+
+    #[test]
+    fn the_batch_wire_reads_the_desktop_s_snake_case_entries_and_lowercase_modes() {
+        let request: crate::daemon_protocol::AttachRequest = serde_json::from_value(serde_json::json!({
+            "op": "invoke-card-action-batch", "mode": "execute", "action_id": "go", "request_id": "r",
+            "entries": [{"pane_id": "p", "agent_id": "a", "action_token": "t", "instance_id": "i"}],
+        }))
+        .unwrap();
+        let crate::daemon_protocol::AttachRequest::InvokeCardActionBatch { mode, entries, .. } =
+            request
+        else {
+            panic!("the batch variant");
+        };
+        assert_eq!(mode, CardBatchMode::Execute);
+        assert_eq!(entries[0].action_token, "t");
+        let preview = serde_json::to_value(CardBatchEntry {
+            pane_id: "p".into(),
+            agent_id: "a".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            preview,
+            serde_json::json!({"pane_id": "p", "agent_id": "a"}),
+            "a preview entry carries no empty handles"
+        );
     }
 }

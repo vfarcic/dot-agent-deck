@@ -1870,6 +1870,10 @@ pub(crate) struct DesktopAgentCards {
     /// drops them otherwise). `false` for an older daemon, whose cards the
     /// webview draws as roots with no roll-up.
     tree: bool,
+    /// Issue #2399: the daemon advertised batch card actions, so the webview
+    /// may offer them (`agent_card_invoke_batch`). `false` for an older
+    /// daemon, which the shared client never sends a batch.
+    batch: bool,
 }
 
 impl DesktopAgentCards {
@@ -1882,6 +1886,7 @@ impl DesktopAgentCards {
             entries: list.entries,
             catalog_errors: list.catalog_errors,
             tree: answer.tree,
+            batch: answer.batch,
         }
     }
 }
@@ -2108,6 +2113,67 @@ async fn agent_card_invoke(
             &request_id,
             "unsupported",
             "this deck's daemon does not support agent cards; upgrade it to act on cards",
+        ),
+    })
+}
+
+/// Issue #2399: preview or execute action `action_id` on many cards of deck
+/// `deck_id` in one request (`mode` `preview` or `execute`). `instance_id` is
+/// the daemon process that listed the cards; the shared client binds the call
+/// to it and withholds it from a daemon that does not advertise batches. An
+/// execution's `entries` carry the token and instance their preview
+/// answered, and the daemon checks each as a single press. The answer is the
+/// daemon's, one outcome per entry; a replaced or older daemon answers every
+/// entry `failed` with `daemon_replaced` / `unsupported`, nothing sent.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn agent_card_invoke_batch(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    deck_id: String,
+    instance_id: String,
+    action_id: String,
+    mode: dot_agent_deck::agent_cards::CardBatchMode,
+    request_id: String,
+    entries: Vec<dot_agent_deck::agent_cards::CardBatchEntry>,
+) -> Result<dot_agent_deck::agent_cards::CardBatchResult, String> {
+    ensure_main_webview(&webview)?;
+    let scope = crate::dto::DeckScope::resolve(Some(&deck_id))?;
+    let daemon = state.daemon.trusted(scope.endpoint()).await?;
+    daemon.require_compatible()?;
+    let every = |code: &str, message: &str| dot_agent_deck::agent_cards::CardBatchResult {
+        request_id: request_id.clone(),
+        entries: entries
+            .iter()
+            .map(|entry| dot_agent_deck::agent_cards::CardBatchOutcome {
+                pane_id: entry.pane_id.clone(),
+                agent_id: entry.agent_id.clone(),
+                outcome: dot_agent_deck::agent_cards::BATCH_FAILED.into(),
+                code: Some(code.into()),
+                message: Some(message.into()),
+                ..Default::default()
+            })
+            .collect(),
+    };
+    let answer = match daemon
+        .client
+        .invoke_card_action_batch(&instance_id, mode, &action_id, &request_id, entries.clone())
+        .await
+    {
+        Ok(answer) => answer,
+        Err(ClientError::DaemonRestarted | ClientError::DaemonUnnamed) => {
+            return Ok(every(
+                dot_agent_deck::agent_cards::CODE_DAEMON_REPLACED,
+                "the deck's daemon was restarted after these cards were read; nothing was sent",
+            ));
+        }
+        Err(error) => return Err(safe_message(error.to_string())),
+    };
+    Ok(match answer {
+        GatedQuery::Answered(result) => result,
+        GatedQuery::Unsupported => every(
+            "unsupported",
+            "this deck's daemon does not support batch card actions; upgrade it to act on several cards at once",
         ),
     })
 }
@@ -7709,6 +7775,7 @@ pub fn run() {
             agent_cards_consume,
             agent_cards_list,
             agent_card_invoke,
+            agent_card_invoke_batch,
             interrupted_work_list,
             interrupted_work_show,
             interrupted_work_reclaim,

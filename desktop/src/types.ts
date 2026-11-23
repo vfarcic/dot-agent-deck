@@ -933,6 +933,62 @@ export interface AgentCardsSnapshot {
    * daemon, whose cards are drawn as roots with no roll-up.
    */
   tree?: boolean;
+  /**
+   * Issue #2399 — the daemon advertised batch card actions, so the Cards view
+   * may offer one action to many of these cards (`invokeCardActionBatch`).
+   * `false` (or absent) for an older daemon, which is never sent a batch.
+   */
+  batch?: boolean;
+}
+
+/**
+ * Issue #2399 — one card a batch names, in the daemon's own words: its pane
+ * and the agent generation shown. An `execute` entry also carries the
+ * `action_token` and `instance_id` its preview answered.
+ */
+export interface CardBatchEntry {
+  pane_id: string;
+  agent_id: string;
+  action_token?: string;
+  instance_id?: string;
+}
+
+/**
+ * Issue #2399 — how one batch is asked for: `preview` sends nothing and
+ * answers what each card would get; `execute` sends to the entries the user
+ * confirmed from that preview. `instanceId` is the daemon process that listed
+ * the cards (the call is bound to it); `requestId` names the batch.
+ */
+export interface CardBatchOptions {
+  mode: "preview" | "execute";
+  entries: CardBatchEntry[];
+  requestId: string;
+  instanceId?: string;
+}
+
+/**
+ * Issue #2399 — what happened, or would happen, to one card of a batch, as the
+ * daemon answered: `included` (with the exact `prompt` it gets) or `skipped`
+ * for a preview; `delivered`, `closed` or `failed` for an execution. A skip or
+ * a failure carries a stable `code` and a sentence to show.
+ */
+export interface CardBatchOutcome extends CardBatchEntry {
+  outcome: "included" | "skipped" | "delivered" | "closed" | "failed" | string;
+  name?: string;
+  label?: string;
+  kind?: string;
+  prompt?: string;
+  prompt_source?: string;
+  message_id?: string;
+  kept_worktree?: string;
+  code?: string;
+  message?: string;
+}
+
+/** Issue #2399 — the daemon's answer to one batch: an outcome per card it named. */
+export interface CardBatchResult {
+  request_id: string;
+  entries: CardBatchOutcome[];
 }
 
 /**
@@ -2016,6 +2072,8 @@ export interface DeckRuntimeState {
   consumeAgentCards?: () => void;
   /** PRD #2374 — invoke one action of one card; the daemon resolves, refuses or performs it. */
   invokeCardAction?: (target: AgentCardTarget, actionId: string, options: CardActionOptions) => Promise<CardActionResult>;
+  /** Issue #2399 — preview or execute one action on many cards of one deck; the daemon checks and performs each as a single press. */
+  invokeCardActionBatch?: (deckId: string, actionId: string, options: CardBatchOptions) => Promise<CardBatchResult>;
   /**
    * PRD #1790 stage 2 — each deck's interrupted work (what a restart of its
    * daemon left behind), the dialog that lists it, and the calls that act on

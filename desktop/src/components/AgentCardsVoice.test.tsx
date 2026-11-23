@@ -150,7 +150,7 @@ function settingsStore() {
 }
 
 /** The real shell on the dashboard, a daemon list with one card per fixture agent, and one utterance resolved to `outcome`. */
-function renderSpoken(outcome: VoiceResultDto["outcome"], { secondDeck, entries }: { secondDeck?: string; entries?: (agents: { id: string }[]) => AgentCardEntry[] } = {}) {
+function renderSpoken(outcome: VoiceResultDto["outcome"], { secondDeck, entries, batch = false }: { secondDeck?: string; entries?: (agents: { id: string }[]) => AgentCardEntry[]; batch?: boolean } = {}) {
   let started = false;
   let delivered = false;
   const status = (state: VoiceStatusDto["state"]): VoiceStatusDto => ({ state, capturedMs: 900, maxMs: 30_000, capped: false, available: true, backend: "remote" });
@@ -161,6 +161,11 @@ function renderSpoken(outcome: VoiceResultDto["outcome"], { secondDeck, entries 
   const card = cardFor(agent.id, "voice-card-agent");
   const settings = settingsStore();
   const invokeCardAction = vi.fn(async (_target: unknown, _actionId: string, options?: { requestId?: string }) => ({ request_id: options?.requestId ?? "r", outcome: "sent" as const, message_id: "m-voice-1" }));
+  const invokeCardActionBatch = vi.fn(async (_deckId: string, _actionId: string, options: { mode: string; requestId: string; entries: { pane_id: string; agent_id: string }[] }) => ({
+    request_id: options.requestId,
+    entries: options.entries.map((target) => ({ ...target, name: target.agent_id === agent.id ? "parent-card" : "child-card",
+      outcome: options.mode === "preview" ? "included" : "delivered", prompt: "VOICE-BATCH-2399: go ahead.", action_token: "tok-voice-batch", instance_id: INSTANCE })),
+  }));
   const runtime = {
     mode: "fixture",
     desktopFeatures: fixtureDesktopFeatures("?experimental=1"),
@@ -180,10 +185,11 @@ function renderSpoken(outcome: VoiceResultDto["outcome"], { secondDeck, entries 
     getSettings: settings.getSettings,
     saveSettings: settings.saveSettings,
     agentCards: {
-      [FIXTURE_DAEMON_ID]: { deckId: FIXTURE_DAEMON_ID, instanceId: INSTANCE, revision: 3, entries: entries ? entries(snapshot.agents) : [card], catalogErrors: [], tree: entries !== undefined },
+      [FIXTURE_DAEMON_ID]: { deckId: FIXTURE_DAEMON_ID, instanceId: INSTANCE, revision: 3, entries: entries ? entries(snapshot.agents) : [card], catalogErrors: [], tree: entries !== undefined, batch },
       ...(secondDeck === undefined ? {} : { [secondDeck]: { deckId: secondDeck, instanceId: "build-instance", revision: 1, entries: [card], catalogErrors: [] } }),
     },
     invokeCardAction,
+    invokeCardActionBatch,
     resolveVoice,
     voiceStatus: vi.fn(async () => {
       if (started && !delivered) { delivered = true; return status("done"); }
@@ -194,7 +200,7 @@ function renderSpoken(outcome: VoiceResultDto["outcome"], { secondDeck, entries 
     voiceCancel: vi.fn(async () => status("idle")),
   } as unknown as DeckRuntimeState;
   render(createElement(DeckShell, { runtime, initialView: { kind: "overview" } }));
-  return { agent, card, invokeCardAction, resolveVoice };
+  return { agent, card, invokeCardAction, invokeCardActionBatch, resolveVoice };
 }
 
 async function speak(resolveVoice: ReturnType<typeof vi.fn>) {
@@ -228,6 +234,37 @@ describe("desktop/agent-cards/008 — the cards by voice (PRD #2374)", () => {
     act(() => setDashboardFilter(clearDashboardFilter()));
     vi.unstubAllGlobals();
     window.localStorage.clear();
+  });
+
+  /// Scenario: Say to run Go ahead on a parent's whole subtree. The registered voice command opens a daemon-previewed batch confirmation with the exact text, and delivers nothing until a hand presses Send.
+  it("desktop/agent-cards/032: voice starts a batch by opening its confirmation, never by sending", async () => {
+    const agent = createFixtureSnapshot("connected").agents[0];
+    const spoken = renderSpoken({
+      kind: "dispatch", transcript: "go ahead on the parent's whole subtree", action: "run_card_action_batch", invoke: "runCardActionBatch",
+      params: [
+        { name: "agent", kind: "agent_ref", spoken: "the parent", value: agent.id, label: "parent-card" },
+        { name: "action", kind: "card_action", spoken: "go ahead", value: "Go ahead", label: "Go ahead" },
+      ], sentence: "Review the batch before sending.",
+    } as VoiceResultDto["outcome"], { entries: treeEntries, batch: true });
+    await speak(spoken.resolveVoice);
+    const dialog = await screen.findByTestId("agent-cards-batch-confirm");
+    expect(within(dialog).getAllByTestId("agent-cards-batch-prompt").map((node) => node.textContent)).toEqual([
+      "VOICE-BATCH-2399: go ahead.", "VOICE-BATCH-2399: go ahead.",
+    ]);
+    expect(spoken.invokeCardActionBatch).toHaveBeenCalledTimes(1);
+    expect(spoken.invokeCardActionBatch).toHaveBeenCalledWith(FIXTURE_DAEMON_ID, "go-ahead", expect.objectContaining({
+      mode: "preview", entries: treeEntries(createFixtureSnapshot("connected").agents).map(({ pane_id, agent_id }) => ({ pane_id, agent_id })),
+    }));
+    expect(spoken.invokeCardAction).not.toHaveBeenCalled();
+    const registry = VOICE_ACTIONS as unknown as Record<string, { voice?: boolean }>;
+    expect(registry.runCardActionBatch?.voice).toBe(true);
+    const row = commandRows().filter((row) => row.invoke === "runCardActionBatch");
+    expect(row.map((row) => row.id)).toEqual(["run_card_action_batch"]);
+    expect(row[0].screens).toContain("overview");
+    expect(row[0].params).toEqual([{ name: "agent", kind: "agent_ref" }, { name: "action", kind: "card_action" }]);
+    fireEvent.click(within(dialog).getByRole("button", { name: /^Cancel$/ }));
+    expect(spoken.invokeCardActionBatch).toHaveBeenCalledTimes(1);
+    expect(spoken.invokeCardAction).not.toHaveBeenCalled();
   });
 
   /// Scenario: read the action registry and the command table the crate embeds. The card controls and shared name-open entry are voice-enabled on overview with the expected row ids and parameter names; the confirm step's send and the row menu are kept off voice with a reason and no row.

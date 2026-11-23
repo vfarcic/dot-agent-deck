@@ -53,6 +53,9 @@ import type { HandoffEdge,
   AgentCardTarget,
   CardActionOptions,
   CardActionResult,
+  CardBatchOptions,
+  CardBatchOutcome,
+  CardBatchResult,
   DisconnectedReason,
   EvidenceItem,
   HostMetricsReport,
@@ -2497,6 +2500,15 @@ export interface DeckBridge {
    */
   invokeCardAction?(target: AgentCardTarget, actionId: string, options: CardActionOptions): Promise<CardActionResult>;
   /**
+   * Issue #2399 — preview or execute one action on many cards of deck
+   * `deckId` in one request (`agent_card_invoke_batch`). A preview sends
+   * nothing and answers, per card, the exact text it would get or why it is
+   * skipped; an execution sends to the confirmed entries, each carrying the
+   * token and instance its preview answered, and the daemon checks each as a
+   * single press. Bound to `options.instanceId`, like {@link invokeCardAction}.
+   */
+  invokeCardActionBatch?(deckId: string, actionId: string, options: CardBatchOptions): Promise<CardBatchResult>;
+  /**
    * PRD #1790 stage 2 — one deck's interrupted work (`interrupted_work_list`):
    * what a restart of its daemon left behind, from daemon process
    * `target.instance`, with each item's Git and pull request facts when `git`
@@ -2537,6 +2549,7 @@ export function normalizeAgentCards(value: unknown): AgentCardsSnapshot | null {
     entries: record.entries as AgentCardEntry[],
     catalogErrors: Array.isArray(record.catalogErrors) ? record.catalogErrors.filter((e): e is string => typeof e === "string") : [],
     tree: record.tree === true,
+    batch: record.batch === true,
   };
 }
 
@@ -3370,6 +3383,30 @@ class FixtureDeckBridge implements DeckBridge {
   }
   async interruptedWorkDismiss(target: InterruptedTarget, ids: string[]): Promise<InterruptedReply<DismissOutcome>> {
     return this.interrupted.dismiss(target, ids);
+  }
+  /**
+   * Issue #2399 — the preview answers a batch as a daemon would, from the
+   * cards it shows: a preview includes each card offering the action enabled,
+   * with that card's own exact text, and skips the rest with a reason; an
+   * execution delivers to every confirmed entry. Nothing changes in the
+   * fixture's state.
+   */
+  async invokeCardActionBatch(deckId: string, actionId: string, options: CardBatchOptions): Promise<CardBatchResult> {
+    const shown = this.treeCards ?? this.sceneCards();
+    const cards = shown && shown.deckId === deckId ? shown.entries : [];
+    const entries = options.entries.map((target): CardBatchOutcome => {
+      const card = cards.find((candidate) => candidate.pane_id === target.pane_id && candidate.agent_id === target.agent_id);
+      const base = { pane_id: target.pane_id, agent_id: target.agent_id, ...(card ? { name: card.name } : {}) };
+      if (options.mode === "execute") {
+        return card ? { ...base, outcome: "delivered", message_id: `m-fixture-batch-${target.agent_id}` } : { ...base, outcome: "failed", code: "unknown_entry", message: "there is no such card" };
+      }
+      const action = card?.actions.find((candidate) => candidate.id === actionId);
+      if (!card) return { ...base, outcome: "skipped", code: "unknown_entry", message: "there is no such card" };
+      if (!action) return { ...base, outcome: "skipped", code: "unknown_action", message: `${card.name}'s card does not offer this action` };
+      if (!action.enabled) return { ...base, outcome: "skipped", code: action.disabled_reason ?? "action_disabled", message: "the agent is not running" };
+      return { ...base, outcome: "included", label: action.label, kind: action.kind, ...(action.prompt ? { prompt: action.prompt, prompt_source: action.prompt_source ?? "catalog" } : {}), action_token: action.token, instance_id: shown?.instanceId ?? card.instance_id };
+    });
+    return { request_id: options.requestId, entries };
   }
   /** The preview answers a card action as a daemon that queued it would; nothing changes in the fixture's state. */
   async invokeCardAction(_target: AgentCardTarget, actionId: string, options: CardActionOptions): Promise<CardActionResult> {
@@ -6178,6 +6215,18 @@ export class TauriDeckBridge implements DeckBridge {
     return listen<unknown>("desktop://agent-cards", (event) => {
       const snapshot = normalizeAgentCards(event.payload);
       if (snapshot) listener(snapshot);
+    });
+  }
+
+  async invokeCardActionBatch(deckId: string, actionId: string, options: CardBatchOptions): Promise<CardBatchResult> {
+    const invoke = await this.getInvoke();
+    return invoke<CardBatchResult>("agent_card_invoke_batch", {
+      deckId,
+      instanceId: options.instanceId ?? "",
+      actionId,
+      mode: options.mode,
+      requestId: options.requestId,
+      entries: options.entries,
     });
   }
 

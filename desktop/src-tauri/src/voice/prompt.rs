@@ -802,6 +802,7 @@ pub(crate) mod tests {
                 "open_card_pull_request".to_string(),
                 "open_card_issue".to_string(),
                 "run_card_action".to_string(),
+                "run_card_action_batch".to_string(),
                 "reply_to_agent_card".to_string(),
                 "none".to_string(),
             ]

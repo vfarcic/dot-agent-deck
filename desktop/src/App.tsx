@@ -250,6 +250,7 @@ const SWITCH_DECK_INVOKE: keyof typeof VOICE_ACTIONS = "switchDeck";
 /** Issue #1496 — the one entry whose params are the dashboard filter's facets. */
 const FILTER_DASHBOARD_INVOKE: keyof typeof VOICE_ACTIONS = "filterDashboard";
 const RUN_CARD_ACTION_INVOKE: keyof typeof VOICE_ACTIONS = "runCardAction";
+const RUN_CARD_ACTION_BATCH_INVOKE: keyof typeof VOICE_ACTIONS = "runCardActionBatch";
 const REPLY_TO_AGENT_CARD_INVOKE: keyof typeof VOICE_ACTIONS = "replyToAgentCard";
 /** The Settings sheet as `SettingsSheet` renders it, for asking the fence's stack whether anything is drawn over it. */
 const SETTINGS_PANEL = "[data-testid='settings-panel']";
@@ -1422,7 +1423,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       /* The action's label as the user said it (a `card_action`, held to the
          transcript), and a reply's words (a `reply_text`: the transcript's
          own slice), each for its own row only. */
-      ...(outcome.invoke === RUN_CARD_ACTION_INVOKE && namedCardAction ? { cardActionLabel: namedCardAction.value } : {}),
+      ...((outcome.invoke === RUN_CARD_ACTION_INVOKE || outcome.invoke === RUN_CARD_ACTION_BATCH_INVOKE) && namedCardAction ? { cardActionLabel: namedCardAction.value } : {}),
       ...(outcome.invoke === REPLY_TO_AGENT_CARD_INVOKE && namedReplyText ? { cardReplyText: namedReplyText.value } : {}),
     };
     let moved = false;

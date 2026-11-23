@@ -2296,6 +2296,41 @@ button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-
 /* Full screen at narrow widths: the overlay is the whole window, its body scrolls. */
 @media (max-width: 640px) { .agent-card-backdrop { padding: 0; } .agent-card-overlay { width: 100%; height: 100%; max-height: none; border-radius: 0; border: 0; } }
 
+/* Issue #2399 — batch card actions: the selection line under the toolbar, a
+   card's checkbox, and the batch's confirmation and results. The dialog never
+   grows past the window: its list scrolls, and Cancel and Send stay in view.
+   Each exact prompt wraps inside it rather than scrolling sideways. */
+.agent-cards-selection { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; margin-top: 8px; }
+.agent-cards-selection-count { color: var(--muted); font-size: var(--text-sm); font-weight: 700; }
+.agent-cards-selection-hint { color: var(--faint); font-size: var(--text-sm); }
+.agent-cards-select.is-on { color: var(--teal); border-color: var(--teal-edge); background: var(--teal-wash); }
+.agent-card-select { flex: none; display: inline-flex; align-items: center; }
+.agent-card-select input { margin: 0; width: 14px; height: 14px; accent-color: var(--teal); cursor: pointer; }
+.agent-card.is-selected { outline: 2px solid var(--teal-focus); outline-offset: 1px; }
+.agent-card-batch .agent-card-actions { display: flex; flex-wrap: wrap; gap: 7px; }
+.agent-cards-batch-backdrop { padding-top: 6vh; }
+.agent-cards-batch { width: min(640px, 100%); max-height: 100%; min-width: 0; display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--dialog-edge); border-radius: 7px; background: var(--paper-strong); box-shadow: 0 18px 50px rgb(var(--scrim-rgb) / .24); }
+.agent-cards-batch:focus { outline: none; }
+.agent-cards-batch-header { flex: none; padding: 14px 16px 8px; display: grid; gap: 4px; border-bottom: 1px solid var(--line); }
+.agent-cards-batch-header h2 { margin: 0; font-size: var(--text-xl); overflow-wrap: anywhere; }
+.agent-cards-batch-scope { margin: 0; color: var(--muted); font-size: var(--text-sm); overflow-wrap: anywhere; }
+.agent-cards-batch-body { flex: 1 1 auto; min-height: 0; overflow-x: hidden; overflow-y: auto; padding: 10px 16px; display: grid; align-content: start; gap: 8px; }
+.agent-cards-batch-body h3 { margin: 4px 0 0; font-size: var(--text-base); }
+.agent-cards-batch-list { margin: 0; padding: 0; list-style: none; display: grid; gap: 8px; min-width: 0; }
+.agent-cards-batch-entry { min-width: 0; display: grid; gap: 4px; padding: 7px 8px; border: 1px solid var(--line); border-radius: 5px; }
+.agent-cards-batch-entry.is-skipped { color: var(--muted); }
+.agent-cards-batch-entry.is-failed { border-color: var(--red); }
+.agent-cards-batch-who { margin: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
+.agent-cards-batch-name { overflow-wrap: anywhere; }
+.agent-cards-batch-outcome { font-size: var(--text-sm); font-weight: 700; }
+.agent-cards-batch-entry.is-failed .agent-cards-batch-outcome { color: var(--red); }
+.agent-cards-batch-entry.is-done .agent-cards-batch-outcome { color: var(--teal); }
+.agent-cards-batch-reason, .agent-cards-batch-what { margin: 0; font-size: var(--text-sm); overflow-wrap: anywhere; }
+.agent-cards-batch-prompt { min-width: 0; }
+.agent-cards-batch-error { margin: 0; color: var(--red); overflow-wrap: anywhere; }
+.agent-cards-batch-buttons { flex: none; padding: 10px 16px 14px; display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 7px; border-top: 1px solid var(--line); }
+@media (max-width: 640px) { .agent-cards-batch-backdrop { padding: 0; } .agent-cards-batch { width: 100%; height: 100%; max-height: none; border-radius: 0; border: 0; } }
+
 /* PRD #1790 stage 2 — a deck's interrupted work: its banner, the dialog, and the restart notice's hint line. */
 .interrupted-banner { margin: 8px 16px 0; padding: 6px 10px; display: flex; align-items: center; gap: 9px; border: 1px solid var(--amber-edge); border-radius: var(--radius); color: var(--amber-ink); background: var(--amber-soft); font-size: var(--text-base); }
 .interrupted-banner > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
