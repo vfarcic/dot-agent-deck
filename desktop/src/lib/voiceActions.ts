@@ -1405,6 +1405,42 @@ export const VOICE_ACTIONS = {
     },
   },
 
+  /* PRD #1790 stage 3 — Restore. Voice never starts an agent (PRD #802 D5):
+     this asks the restore question about the item the words name, and the
+     agent starts on the person's own click or key on it. The Restore button
+     and `s` open the same question through this entry. With the
+     experimental flag off the dialog refuses it, saying so. */
+  askRestoreInterrupted: {
+    label: "Ask to restore an interrupted agent",
+    voice: true,
+    needs: ["interruptedDialog"],
+    run: (context: Pick<VoiceActionContext, "interruptedDialog"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target?: { filterText?: string }) => {
+      const refused = context.interruptedDialog.askRestore(target?.filterText);
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  restoreAndContinueInterrupted: {
+    label: "Restore the agent the question names, and let it continue",
+    no_voice: "Restore and continue starts an agent that spends credits and may push or send; voice has no confirm-before-acting step yet (PRD #802 D5), so `restore_interrupted` asks the question on screen and stops — the click or `c` that starts the agent is the person's own",
+    needs: ["interruptedDialog"],
+    run: (context: Pick<VoiceActionContext, "interruptedDialog">) => { context.interruptedDialog.restoreAndContinue(); },
+  },
+
+  restoreOnlyInterrupted: {
+    label: "Restore the agent the question names, waiting",
+    no_voice: "Restore only starts an agent that spends credits and may push or send once told to continue; voice has no confirm-before-acting step yet (PRD #802 D5), so `restore_interrupted` asks the question on screen and stops — the click or `o` that starts the agent is the person's own",
+    needs: ["interruptedDialog"],
+    run: (context: Pick<VoiceActionContext, "interruptedDialog">) => { context.interruptedDialog.restoreOnly(); },
+  },
+
+  startOverInterrupted: {
+    label: "Start the agent the question names over in its worktree",
+    no_voice: "Start over starts an agent that spends credits and may push or send, with its saved task; voice has no confirm-before-acting step yet (PRD #802 D5), so `restore_interrupted` asks the question on screen and stops — the click or `w` that starts the agent is the person's own",
+    needs: ["interruptedDialog"],
+    run: (context: Pick<VoiceActionContext, "interruptedDialog">) => { context.interruptedDialog.startOver(); },
+  },
+
   backInterruptedWork: {
     label: "Back to the interrupted work list",
     no_voice: "backs out of an item's details or a confirmation to the list; voice's `close` does the same while the dialog is the topmost overlay, which is what the dialog's Escape does",

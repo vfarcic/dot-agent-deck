@@ -490,11 +490,18 @@ fn focus(deck: &common::TuiDeck, agent: Agent) {
     grid(deck, "focus the restored interactive agent", |frame| {
         frame.contains("[Command Mode Ctrl+D]")
     });
-    let ready = match agent {
-        Agent::Claude => "? for shortcuts",
-        Agent::Codex => "Ask Codex to do anything",
-    };
-    grid(deck, "interactive composer", |frame| frame.contains(ready));
+    grid(deck, "interactive composer", |frame| match agent {
+        Agent::Claude => {
+            frame.contains("? for shortcuts")
+                || (frame.contains("[Screen Reader Mode: on via flag]")
+                    && frame.lines().any(|line| {
+                        line.split('│')
+                            .nth(1)
+                            .is_some_and(|pane| pane.trim() == "$")
+                    }))
+        }
+        Agent::Codex => frame.contains("Ask Codex to do anything"),
+    });
 }
 
 fn prompt(

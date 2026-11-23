@@ -1625,6 +1625,10 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       showReports: (said) => reach((open) => open.showReports(said)),
       nextReports: () => reach((open) => open.nextReports()),
       previousReports: () => reach((open) => open.previousReports()),
+      askRestore: (said) => reach((open) => open.askRestore(said)),
+      restoreAndContinue: () => reach((open) => open.restoreAndContinue()),
+      restoreOnly: () => reach((open) => open.restoreOnly()),
+      startOver: () => reach((open) => open.startOver()),
       back: () => { reach((open) => open.back()); },
       close: () => { reach((open) => open.close()); },
     };
@@ -1874,7 +1878,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   const interruptedDeck = interruptedOpen ? interrupted?.decks[interruptedOpen.deckId] : undefined;
   const interruptedDeckName = interruptedOpen ? decks.find((deck) => deck.snapshot.connection.deckId === interruptedOpen.deckId) : undefined;
   const interruptedDialogView = interrupted && interruptedOpen && interruptedDeck && interruptedDeck.instance === interruptedOpen.instance
-    ? <InterruptedWorkDialog key={`${interruptedOpen.deckId}:${interruptedOpen.instance}`} deckLabel={interruptedDeckName ? deckName(interruptedDeckName.snapshot.connection) : ""} deck={interruptedDeck} target={interruptedOpen} runtime={interrupted} controlsRef={interruptedControls} />
+    ? <InterruptedWorkDialog key={`${interruptedOpen.deckId}:${interruptedOpen.instance}`} deckLabel={interruptedDeckName ? deckName(interruptedDeckName.snapshot.connection) : ""} deck={interruptedDeck} target={interruptedOpen} runtime={interrupted} controlsRef={interruptedControls} restoreShown={desktopFeaturesOf(runtime).showAgentRestore} />
     : undefined;
   const cardsBodyFor = (deck: (typeof decks)[number]): ReactNode | undefined => {
     const shown = cardsOnScreen(deck);

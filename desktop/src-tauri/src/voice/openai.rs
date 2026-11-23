@@ -355,6 +355,7 @@ mod tests {
                 "show_interrupted_reports",
                 "next_interrupted_reports",
                 "previous_interrupted_reports",
+                "restore_interrupted",
                 "switch_deck",
                 "voice_off",
                 "list_commands",

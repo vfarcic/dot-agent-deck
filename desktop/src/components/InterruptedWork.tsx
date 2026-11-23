@@ -6,9 +6,11 @@ import {
   DAEMON_FAILED, DISMISS_ACTION, DISMISS_ALL_ACTION, INTERRUPTED_NO_NEXT_PAGE, INTERRUPTED_UNREAD, INTERRUPTED_NO_PREVIOUS_PAGE, INTERRUPTED_NO_REPORTS, INTERRUPTED_WAIT, INTERRUPTED_WORK_TITLE, ITEM_CUT, LABEL_BRANCH, LABEL_GIT, LABEL_ISSUE,
   LABEL_LAST_ENTRY, LABEL_NESTED_WORKTREE, LABEL_PROGRESS, LABEL_REPORT, LABEL_STARTED_BY, LABEL_WORKTREE, LIST_INCOMPLETE, LIST_REFRESH_FAILED, MAX_SHOWN_REPORTS, NOTHING_INTERRUPTED, OTHER_AGENTS_GROUP, RECLAIM_ACTION, RECLAIM_EXPLANATION,
   REFUSED_NOT_LISTED, REFUSED_PLAIN_AGENT, REPORT_CUT, REPORT_UNREADABLE, UNSUPPORTED,
+  LABEL_AGENT, LABEL_ATTEMPT, LABEL_FOLDER, RESTORE_ACTION, RESTORE_AND_CONTINUE, RESTORE_AND_CONTINUE_EXPLANATION, RESTORE_NEEDS_EXPERIMENTAL, RESTORE_ONLY, RESTORE_ONLY_EXPLANATION, RESTORE_UNSUPPORTED, START_OVER,
   detailsItem, directoryLabel, dismissAllQuestion, dismissMessage, dismissOneQuestion, displayValue, formatTime, gitFactsLine, interruptedFooter, itemName, keptUntil, kindLabel, lastEntryLine, mayHaveInterrupted, omittedSentence, orderedItems, progressFact,
   progressLine, publishInterruptedDialog, reclaimMessage, reportLines, reportRangeSentence, resolveSpokenItem, unpushedSentence, wouldRemove,
-  type InterruptedDialogControls, type InterruptedItem, type InterruptedShow, type InterruptedTarget, type ReclaimOutcome,
+  agentName, offersChoice, restoreAgent, restoreGitNote, restoreMessage, restoreQuestion, restoreReasonSentence, restoreVerdictSentence, restoredCleanly, startOverMessage, startOverQuestion,
+  type InterruptedDialogControls, type InterruptedItem, type InterruptedShow, type InterruptedTarget, type ReclaimOutcome, type RestoreMode, type RestoreVerdict,
 } from "../lib/interruptedWork";
 import { VOICE_ACTIONS, type VoiceActionContext } from "../lib/voiceActions";
 
@@ -37,7 +39,9 @@ type View =
   | { kind: "details"; id: string; show?: InterruptedShow; asked: boolean; failed?: string; trail: number[] }
   | { kind: "reclaim"; id: string; dry?: ReclaimOutcome }
   | { kind: "dismissOne"; id: string }
-  | { kind: "dismissAll"; ids: string[] };
+  | { kind: "dismissAll"; ids: string[] }
+  /* PRD #1790 stage 3 — the restore question about item `id`'s agent `attempt` (none from a daemon that lists no agents). */
+  | { kind: "restore"; id: string; attempt?: string; name: string; verdict: RestoreVerdict };
 
 /** Why a request failed, as the TUI says it. */
 function failure(error: unknown): string {
@@ -122,7 +126,7 @@ function usePresented(key: string | undefined, question: RefObject<HTMLElement |
  * pending, and the list is refreshed when it answers, though this dialog was
  * closed meanwhile (reviewer 2).
  */
-export function InterruptedWorkDialog({ deckLabel, deck, target, runtime, controlsRef }: { deckLabel: string; deck: InterruptedDeck; target: InterruptedTarget; runtime: InterruptedWorkRuntime; controlsRef?: MutableRefObject<InterruptedDialogControls | undefined> }) {
+export function InterruptedWorkDialog({ deckLabel, deck, target, runtime, controlsRef, restoreShown = false }: { deckLabel: string; deck: InterruptedDeck; target: InterruptedTarget; runtime: InterruptedWorkRuntime; controlsRef?: MutableRefObject<InterruptedDialogControls | undefined>; restoreShown?: boolean }) {
   const ordered = useMemo(() => orderedItems(deck.list), [deck.list]);
   const [selectedId, setSelectedId] = useState<string | undefined>(() => ordered[0]?.id);
   const lastIndex = useRef(0);
@@ -147,7 +151,7 @@ export function InterruptedWorkDialog({ deckLabel, deck, target, runtime, contro
   const item = (id: string) => deck.list?.items.find((candidate) => candidate.id === id);
   const busy = dryRun !== undefined || runtime.busy(target);
   /* An item that is no longer listed takes its details or confirmation with it, unless an action on it is in flight. */
-  const gone = (view.kind === "details" || view.kind === "reclaim" || view.kind === "dismissOne") && item(view.id) === undefined;
+  const gone = (view.kind === "details" || view.kind === "reclaim" || view.kind === "dismissOne" || view.kind === "restore") && item(view.id) === undefined;
   useEffect(() => {
     if (!gone || busy) return;
     ops.current.show = undefined;
@@ -273,6 +277,68 @@ export function InterruptedWorkDialog({ deckLabel, deck, target, runtime, contro
     return undefined;
   };
 
+  /**
+   * PRD #1790 stage 3 — open the restore question about the item `said`
+   * names, or the selected one (the details' item in its details), as the
+   * TUI's `s`: about its first agent that is offered a choice, else its first
+   * agent. Nothing is sent. Behind the experimental flag (the seam: with it
+   * off this refuses, and neither the button nor `s` reaches here); a daemon
+   * that answered it does not restore agents is asked nothing again.
+   */
+  const askRestore = (said?: string): string | undefined => {
+    if (!restoreShown) return RESTORE_NEEDS_EXPERIMENTAL;
+    if (busy) return INTERRUPTED_WAIT;
+    const chosen = resolve(said);
+    if (typeof chosen === "string") return chosen;
+    abandonDryRun();
+    ops.current.show = undefined;
+    setSelectedId(chosen.id);
+    if (deck.restoreUnsupported) {
+      setMessage(RESTORE_UNSUPPORTED);
+      setView(LIST);
+      return RESTORE_UNSUPPORTED;
+    }
+    setMessage(undefined);
+    const agent = restoreAgent(chosen);
+    setView({ kind: "restore", id: chosen.id, attempt: agent?.attempt, name: agent ? agentName(agent, chosen) : itemName(chosen), verdict: agent?.restore ?? { kind: "unknown" } });
+    return undefined;
+  };
+
+  /**
+   * One of the question's choices, once: `mode` restores with the
+   * conversation, `undefined` starts over. The daemon starts the agent. A
+   * clean answer closes the dialog on the dashboard, where the agent is back;
+   * anything else is said here, on the list (the TUI's overlay does both).
+   */
+  const confirmRestore = (mode: RestoreMode | undefined): string | undefined => {
+    const offered = view.kind === "restore" && (mode === undefined ? view.verdict.kind === "start_over" : view.verdict.kind === "resume");
+    if (view.kind !== "restore" || !offered || view.attempt === undefined || busy) return "There is no restore to confirm.";
+    const { id, attempt } = view;
+    let clean = false;
+    const leave = () => {
+      if (clean) runtime.closeDialog();
+      else setView((open) => (open.kind === "restore" && open.id === id ? LIST : open));
+    };
+    setMessage(undefined);
+    if (mode === undefined) {
+      void mutation(runtime.startOver(target, id, attempt), (reply) => {
+        if (reply.outcome === "unsupported") return RESTORE_UNSUPPORTED;
+        clean = restoredCleanly(reply.answer.started ? [reply.answer.started] : [], Boolean(reply.answer.refused));
+        return startOverMessage(reply.answer);
+      }, leave);
+    } else {
+      void mutation(runtime.restore(target, id, attempt, mode), (reply) => {
+        if (reply.outcome === "unsupported") return RESTORE_UNSUPPORTED;
+        clean = restoredCleanly(reply.answer.restored, reply.answer.refused.length > 0);
+        return restoreMessage(reply.answer);
+      }, leave);
+    }
+    return undefined;
+  };
+  const restoreAndContinue = () => confirmRestore("continue");
+  const restoreOnly = () => confirmRestore("only");
+  const startOver = () => confirmRestore(undefined);
+
   /** Ask for the page of `id`'s reports from `from`; `trail` is the pages before it, kept once that page is shown. */
   const requestPage = (id: string, from: number, trail: number[]) => {
     const op = nextOp();
@@ -346,7 +412,7 @@ export function InterruptedWorkDialog({ deckLabel, deck, target, runtime, contro
   };
   const select = (id: string) => setSelectedId(id);
 
-  const controls: InterruptedDialogControls = { reclaim, confirmReclaim, dismiss, askDismiss, confirmDismiss, dismissAll, confirmDismissAll, select, openDetails, showReports, nextReports, previousReports, back, close };
+  const controls: InterruptedDialogControls = { reclaim, confirmReclaim, dismiss, askDismiss, confirmDismiss, dismissAll, confirmDismissAll, select, openDetails, showReports, nextReports, previousReports, askRestore, restoreAndContinue, restoreOnly, startOver, back, close };
   const latest = useRef(controls);
   latest.current = controls;
   useEffect(() => {
@@ -364,6 +430,10 @@ export function InterruptedWorkDialog({ deckLabel, deck, target, runtime, contro
       showReports: (said) => latest.current.showReports(said),
       nextReports: () => latest.current.nextReports(),
       previousReports: () => latest.current.previousReports(),
+      askRestore: (said) => latest.current.askRestore(said),
+      restoreAndContinue: () => latest.current.restoreAndContinue(),
+      restoreOnly: () => latest.current.restoreOnly(),
+      startOver: () => latest.current.startOver(),
       back: () => latest.current.back(),
       close: () => latest.current.close(),
     };
@@ -405,6 +475,10 @@ export function InterruptedWorkDialog({ deckLabel, deck, target, runtime, contro
     : view.kind === "dismissOne" ? `dismissOne:${view.id}`
       : view.kind === "reclaim" && view.dry && wouldRemove(view.dry) && !busy ? `reclaim:${view.id}` : undefined;
   const presented = usePresented(asking, question);
+  /* PRD #1790 stage 3 — the restore question, while it offers a choice and nothing is in flight: its choices act only once it has been presented, as `y` does. */
+  const restoreAsk = useRef<HTMLDivElement>(null);
+  const restoreAsking = view.kind === "restore" && offersChoice(view.verdict) && !busy ? `restore:${view.id}:${view.attempt ?? ""}` : undefined;
+  const restorePresented = usePresented(restoreAsking, restoreAsk);
 
   const registry = { interruptedDialog: controls };
   const onKeyDown = (event: KeyboardEvent<HTMLElement>) => {
@@ -469,8 +543,26 @@ export function InterruptedWorkDialog({ deckLabel, deck, target, runtime, contro
           else VOICE_ACTIONS.confirmReclaimInterrupted.run(registry);
           return true;
         }
+        /*
+          PRD #1790 stage 3 — `s` asks whether to restore the selected item's
+          agent (the details' item), as the TUI's `s`; in the question, `c`,
+          `o` and `w` are its choices, each only where it is offered and
+          only once the question has been presented. Behind the flag.
+        */
+        case "s":
+          if (!restoreShown || (view.kind !== "list" && view.kind !== "details")) return false;
+          VOICE_ACTIONS.askRestoreInterrupted.run(registry, {});
+          return true;
+        case "c": case "o": case "w": {
+          if (view.kind !== "restore") return false;
+          if (!restorePresented) return true;
+          if (event.key === "c" && view.verdict.kind === "resume") VOICE_ACTIONS.restoreAndContinueInterrupted.run(registry);
+          else if (event.key === "o" && view.verdict.kind === "resume") VOICE_ACTIONS.restoreOnlyInterrupted.run(registry);
+          else if (event.key === "w" && view.verdict.kind === "start_over") VOICE_ACTIONS.startOverInterrupted.run(registry);
+          return true;
+        }
         case "n": case "N":
-          if (confirming) { VOICE_ACTIONS.backInterruptedWork.run(registry); return true; }
+          if (confirming || view.kind === "restore") { VOICE_ACTIONS.backInterruptedWork.run(registry); return true; }
           if (event.key === "n" && view.kind === "details" && typeof view.show?.next_reports_from === "number") { VOICE_ACTIONS.nextInterruptedReports.run(registry); return true; }
           return false;
         case "p": if (view.kind !== "details" || !view.show?.reports_from) return false; VOICE_ACTIONS.previousInterruptedReports.run(registry); return true;
@@ -503,8 +595,9 @@ export function InterruptedWorkDialog({ deckLabel, deck, target, runtime, contro
           <button type="button" className="icon-button" aria-label="Close" title="Close (Escape)" data-testid="interrupted-close" onClick={() => VOICE_ACTIONS.closeInterruptedWork.run(registry)}><X size={15} /></button>
         </header>
         {message && <p className="interrupted-message" role="status" data-testid="interrupted-message">{message}</p>}
-        {view.kind === "list" && <ListView deck={deck} ordered={ordered} selected={selected} busy={busy} registry={registry} listRef={listRef} />}
-        {view.kind === "details" && <DetailsView view={view} item={detailsItem(view.show?.item, item(view.id))} registry={registry} />}
+        {view.kind === "list" && <ListView deck={deck} ordered={ordered} selected={selected} busy={busy} registry={registry} listRef={listRef} restoreShown={restoreShown} />}
+        {view.kind === "details" && <DetailsView view={view} item={detailsItem(view.show?.item, item(view.id))} busy={busy} registry={registry} restoreShown={restoreShown} />}
+        {view.kind === "restore" && <RestoreView view={view} item={item(view.id)} busy={busy} registry={registry} question={restoreAsk} presented={restorePresented} />}
         {view.kind === "reclaim" && <ReclaimView view={view} item={item(view.id)} busy={busy} registry={registry} question={question} presented={presented} />}
         {view.kind === "dismissOne" && confirmItem && (
           <div className="interrupted-confirm" role="alertdialog" aria-labelledby="interrupted-dismiss-question" data-testid="interrupted-dismiss-one" data-presented={presented ? "true" : undefined}>
@@ -531,7 +624,7 @@ export function InterruptedWorkDialog({ deckLabel, deck, target, runtime, contro
 
 type Registry = { interruptedDialog: InterruptedDialogControls };
 
-function ListView({ deck, ordered, selected, busy, registry, listRef }: { deck: InterruptedDeck; ordered: InterruptedItem[]; selected?: InterruptedItem; busy: boolean; registry: Registry; listRef: RefObject<HTMLUListElement | null> }) {
+function ListView({ deck, ordered, selected, busy, registry, listRef, restoreShown }: { deck: InterruptedDeck; ordered: InterruptedItem[]; selected?: InterruptedItem; busy: boolean; registry: Registry; listRef: RefObject<HTMLUListElement | null>; restoreShown: boolean }) {
   /* Reviewer 7, auditor 4: the daemon's error text is escaped like every other failure. */
   if (!deck.list) return <p className="interrupted-note" data-testid="interrupted-unavailable">{deck.failed !== undefined ? failure(new Error(deck.failed)) : UNSUPPORTED}</p>;
   const firstAgent = ordered.findIndex((candidate) => candidate.kind === "agent");
@@ -556,6 +649,7 @@ function ListView({ deck, ordered, selected, busy, registry, listRef }: { deck: 
       {selected && (
         <div className="interrupted-actions">
           <button type="button" className="button secondary compact" data-testid="interrupted-details" onClick={() => VOICE_ACTIONS.showInterruptedDetails.run(registry, { itemId: selected.id })}>Details</button>
+          {restoreShown && <RestoreButton busy={busy} registry={registry} />}
           {selected.kind !== "agent" && <button type="button" className="button secondary compact" data-testid="interrupted-reclaim" disabled={busy} title={`${RECLAIM_ACTION}: ${RECLAIM_EXPLANATION}`} onClick={() => VOICE_ACTIONS.reclaimInterrupted.run(registry, {})}>{RECLAIM_ACTION}</button>}
           <button type="button" className="button secondary compact" data-testid="interrupted-dismiss" disabled={busy} onClick={() => VOICE_ACTIONS.dismissSelectedInterrupted.run(registry)}>{DISMISS_ACTION}</button>
           <button type="button" className="button secondary compact" data-testid="interrupted-dismiss-all-open" disabled={busy} onClick={() => VOICE_ACTIONS.dismissAllInterrupted.run(registry)}>{DISMISS_ALL_ACTION}</button>
@@ -585,7 +679,28 @@ function ItemRow({ item, selected, registry }: { item: InterruptedItem; selected
   );
 }
 
-function DetailsView({ view, item, registry }: { view: Extract<View, { kind: "details" }>; item?: InterruptedItem; registry: Registry }) {
+/** PRD #1790 stage 3 — Restore, in the list and in an item's details: opens the restore question, as `s` does. */
+function RestoreButton({ busy, registry }: { busy: boolean; registry: Registry }) {
+  return <button type="button" className="button secondary compact" data-testid="interrupted-restore" disabled={busy} onClick={() => VOICE_ACTIONS.askRestoreInterrupted.run(registry, {})}>{RESTORE_ACTION}</button>;
+}
+
+/** PRD #1790 stage 3 — each of an item's agents and whether it can come back, as the TUI's details and the CLI's `interrupted show` list them. */
+function AgentFacts({ item }: { item: InterruptedItem }) {
+  if (!item.agents?.length && !item.agents_omitted) return null;
+  return (
+    <ul className="interrupted-agents" data-testid="interrupted-agents">
+      {item.agents?.map((agent) => (
+        <li key={agent.attempt} data-testid="interrupted-agent">
+          <span>{LABEL_AGENT}: {displayValue(agent.name ?? "")}{agent.role ? ` (${displayValue(agent.role)})` : ""} · {LABEL_ATTEMPT}: {displayValue(agent.attempt)}{agent.folder ? ` · ${LABEL_FOLDER}: ${displayValue(agent.folder)}` : ""}</span>
+          <span className="interrupted-note">{restoreVerdictSentence(agent.restore)}</span>
+        </li>
+      ))}
+      {(item.agents_omitted ?? 0) > 0 && <li className="interrupted-note">{omittedSentence(item.agents_omitted ?? 0)}</li>}
+    </ul>
+  );
+}
+
+function DetailsView({ view, item, busy, registry, restoreShown }: { view: Extract<View, { kind: "details" }>; item?: InterruptedItem; busy: boolean; registry: Registry; restoreShown: boolean }) {
   if (!item) return null;
   const show = view.asked ? view.show : undefined;
   const total = item.reports.length + (item.reports_omitted ?? 0);
@@ -604,11 +719,13 @@ function DetailsView({ view, item, registry }: { view: Extract<View, { kind: "de
         {item.git && fact(LABEL_GIT, gitFactsLine(item.git))}
         {item.reports.map((report) => <div key={report.report_id} className="interrupted-fact" data-testid="interrupted-report-entry"><dt>{LABEL_REPORT}</dt><dd>{displayValue(report.report_id)}, {keptUntil(report.kept_until_ms)}</dd></div>)}
       </dl>
+      {restoreShown && <AgentFacts item={item} />}
       {show && (from > 0 || typeof show.next_reports_from === "number") && item.reports.length > 0 && <p className="interrupted-note" data-testid="interrupted-report-range">{reportRangeSentence(from + 1, from + item.reports.length, total)}</p>}
       {item.cut && <p className="interrupted-note">{ITEM_CUT}</p>}
       {view.failed && <p className="interrupted-message" role="status" data-testid="interrupted-report-failed">{view.failed}</p>}
       <div className="interrupted-actions">
         <button type="button" className="button secondary compact" data-testid="interrupted-back" onClick={() => VOICE_ACTIONS.backInterruptedWork.run(registry)}>Back</button>
+        {restoreShown && <RestoreButton busy={busy} registry={registry} />}
         {!view.asked && item.reports.length > 0 && <button type="button" className="button secondary compact" data-testid="interrupted-show-reports" onClick={() => VOICE_ACTIONS.showInterruptedReports.run(registry, {})}>Show reports</button>}
         {show && from > 0 && <button type="button" className="button secondary compact" data-testid="interrupted-previous-reports" onClick={() => VOICE_ACTIONS.previousInterruptedReports.run(registry)}>Previous reports</button>}
         {show && typeof show.next_reports_from === "number" && <button type="button" className="button secondary compact" data-testid="interrupted-next-reports" onClick={() => VOICE_ACTIONS.nextInterruptedReports.run(registry)}>Next reports</button>}
@@ -644,6 +761,58 @@ function ReclaimView({ view, item, busy, registry, question, presented }: { view
       <div className="interrupted-actions">
         <button type="button" className="button secondary" data-testid="interrupted-back" onClick={() => VOICE_ACTIONS.backInterruptedWork.run(registry)}>Back</button>
         {asks && <button type="button" className="button danger" data-testid="interrupted-reclaim-confirm" onClick={() => VOICE_ACTIONS.confirmReclaimInterrupted.run(registry)}>{RECLAIM_ACTION}</button>}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * PRD #1790 stage 3 — the restore question, in the TUI's words: for an agent
+ * that can be restored, Restore and continue and Restore only, each with what
+ * it does; for one that can only start over, why, and Start over in this
+ * worktree instead; for any other, only why. An open pull request on the
+ * item's branch, as the list's Git facts say, is named. A choice stays on
+ * screen, disabled, while its answer is awaited.
+ */
+function RestoreView({ view, item, busy, registry, question, presented }: { view: Extract<View, { kind: "restore" }>; item?: InterruptedItem; busy: boolean; registry: Registry; question: RefObject<HTMLDivElement | null>; presented: boolean }) {
+  const { verdict, name } = view;
+  const note = offersChoice(verdict) ? restoreGitNote(item?.git) : undefined;
+  return (
+    <div className="interrupted-confirm" role="alertdialog" aria-labelledby="interrupted-restore-title" data-testid="interrupted-restore-question" data-presented={presented ? "true" : undefined}>
+      {item && <h3 id="interrupted-restore-title">{RESTORE_ACTION} {itemName(item)} · {kindLabel(item.kind)}</h3>}
+      <div ref={question}>
+        {verdict.kind === "resume" && (
+          <>
+            <p className="interrupted-verdict">{restoreQuestion(name)}</p>
+            <div className="interrupted-restore-choice">
+              <button type="button" className="button primary" data-testid="interrupted-restore-continue" disabled={busy} onClick={() => VOICE_ACTIONS.restoreAndContinueInterrupted.run(registry)}>{RESTORE_AND_CONTINUE}</button>
+              <p className="interrupted-note">{RESTORE_AND_CONTINUE_EXPLANATION}</p>
+            </div>
+            <div className="interrupted-restore-choice">
+              <button type="button" className="button secondary" data-testid="interrupted-restore-only" disabled={busy} onClick={() => VOICE_ACTIONS.restoreOnlyInterrupted.run(registry)}>{RESTORE_ONLY}</button>
+              <p className="interrupted-note">{RESTORE_ONLY_EXPLANATION}</p>
+            </div>
+          </>
+        )}
+        {verdict.kind === "start_over" && (
+          <>
+            <p className="interrupted-verdict">{startOverQuestion(name)}</p>
+            <p>{restoreReasonSentence(verdict.reason)}</p>
+            <div className="interrupted-restore-choice">
+              <button type="button" className="button secondary" data-testid="interrupted-start-over" disabled={busy} onClick={() => VOICE_ACTIONS.startOverInterrupted.run(registry)}>{START_OVER}</button>
+            </div>
+          </>
+        )}
+        {!offersChoice(verdict) && (
+          <>
+            <p className="interrupted-verdict">{name}</p>
+            <p>{restoreVerdictSentence(verdict)}</p>
+          </>
+        )}
+        {note && <p className="interrupted-note" data-testid="interrupted-restore-pr-open">{note}</p>}
+      </div>
+      <div className="interrupted-actions">
+        <button type="button" className="button secondary" data-testid="interrupted-back" onClick={() => VOICE_ACTIONS.backInterruptedWork.run(registry)}>Back</button>
       </div>
     </div>
   );

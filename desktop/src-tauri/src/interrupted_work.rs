@@ -10,8 +10,14 @@
 //! ([`DaemonClient::list_interrupted_work`] and its siblings); those answer
 //! [`InterruptedWorkReply::Unsupported`], which the webview shows as nothing.
 //!
-//! The desktop is the person's client: reclaim and dismiss carry no pane
-//! claim (decision D4), as the TUI's do.
+//! The desktop is the person's client: reclaim, dismiss, restore and start
+//! over carry no pane claim (decision D4), as the TUI's do.
+//!
+//! PRD #1790 stage 3: restore and start-over are the daemon's — it starts the
+//! agent, as it does for the TUI and the CLI, so every client restores the
+//! same way. The shared client withholds both from a daemon that does not
+//! also advertise `restore-agents`. The experimental flag gates the
+//! webview's controls, not these: the flag is a presentation switch.
 
 use std::future::Future;
 use std::time::Duration;
@@ -19,7 +25,7 @@ use std::time::Duration;
 use dot_agent_deck::daemon_client::{ClientError, DaemonClient, GatedQuery};
 use dot_agent_deck::interrupted_work::{
     DismissOutcome, DismissStopReason, DismissStopped, InterruptedList, InterruptedShow,
-    ReclaimOutcome, dismiss_batches,
+    ReclaimOutcome, RestoreMode, RestoreOutcome, StartOverOutcome, dismiss_batches,
 };
 
 use crate::dto::InterruptedWorkReply;
@@ -34,6 +40,10 @@ pub(crate) const SHOW_TIMEOUT: Duration = Duration::from_secs(15);
 pub(crate) const RECLAIM_TIMEOUT: Duration = Duration::from_secs(120);
 /// The bound on a dismissal.
 pub(crate) const DISMISS_TIMEOUT: Duration = Duration::from_secs(15);
+/// PRD #1790 stage 3: the bound on a restore or a start-over, dry runs
+/// included. The daemon answers once each agent confirmed its conversation
+/// or was stopped; the TUI waits the same.
+pub(crate) const RESTORE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// `request`'s answer within `timeout`, as the webview reads it.
 async fn reply<T>(
@@ -99,6 +109,45 @@ pub(crate) async fn reclaim(
         RECLAIM_TIMEOUT,
         instance,
         client.reclaim_interrupted(id, dry_run, None, Some(instance)),
+    )
+    .await
+}
+
+/// PRD #1790 stage 3: restore the attempts `agents` of item `id` with their
+/// conversations, posting `mode`'s restart note first, or with `dry_run` ask
+/// what that would do. No pane claim: the person's client.
+pub(crate) async fn restore(
+    client: &DaemonClient,
+    instance: &str,
+    id: &str,
+    agents: Vec<String>,
+    mode: RestoreMode,
+    dry_run: bool,
+) -> Result<InterruptedWorkReply<RestoreOutcome>, String> {
+    reply(
+        "RestoreInterrupted",
+        RESTORE_TIMEOUT,
+        instance,
+        client.restore_interrupted(id, agents, mode, dry_run, None, Some(instance)),
+    )
+    .await
+}
+
+/// PRD #1790 stage 3: start attempt `agent` of item `id` over in its folder,
+/// without its conversation, or with `dry_run` ask what that would do. No
+/// pane claim.
+pub(crate) async fn start_over(
+    client: &DaemonClient,
+    instance: &str,
+    id: &str,
+    agent: &str,
+    dry_run: bool,
+) -> Result<InterruptedWorkReply<StartOverOutcome>, String> {
+    reply(
+        "StartOverInterrupted",
+        RESTORE_TIMEOUT,
+        instance,
+        client.start_over_interrupted(id, agent, dry_run, None, Some(instance)),
     )
     .await
 }

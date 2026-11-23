@@ -755,12 +755,12 @@ describe("TauriDeckBridge", () => {
     const { TauriDeckBridge } = await import("./bridge");
     const bridge = new TauriDeckBridge();
 
-    invoke.mockResolvedValueOnce({ showDeck: true, showProjects: false, showPrompts: true, showOrchestrations: false, showAgentProfiles: true, showAgentDetails: true });
-    await expect(bridge.desktopFeatures()).resolves.toEqual({ showDeck: true, showProjects: false, showPrompts: true, showOrchestrations: false, showAgentProfiles: true, showAgentDetails: true });
+    invoke.mockResolvedValueOnce({ showDeck: true, showProjects: false, showPrompts: true, showOrchestrations: false, showAgentProfiles: true, showAgentDetails: true, showAgentRestore: true });
+    await expect(bridge.desktopFeatures()).resolves.toEqual({ showDeck: true, showProjects: false, showPrompts: true, showOrchestrations: false, showAgentProfiles: true, showAgentDetails: true, showAgentRestore: true });
     expect(invoke).toHaveBeenLastCalledWith("desktop_features");
 
     invoke.mockResolvedValueOnce({ showDeck: "yes", showProjects: 1 });
-    await expect(bridge.desktopFeatures()).resolves.toEqual({ showDeck: false, showProjects: false, showPrompts: false, showOrchestrations: false, showAgentProfiles: false, showAgentDetails: false });
+    await expect(bridge.desktopFeatures()).resolves.toEqual({ showDeck: false, showProjects: false, showPrompts: false, showOrchestrations: false, showAgentProfiles: false, showAgentDetails: false, showAgentRestore: false });
     await bridge.dispose();
   });
 
@@ -1748,6 +1748,84 @@ describe("TauriDeckBridge", () => {
     const carried = mapDesktopSnapshot(structuredClone(snapshot), { ...mapped, branch: "main" });
     expect(carried.branch).toBeUndefined();
   });
+
+  /** Scenario: the person's restore confirmation targets a specific daemon process, interrupted item and attempt. The bridge passes Continue and Only as distinct wire values and returns that process's final outcome. */
+  it.each(["continue", "only"] as const)("journal/restore/009 sends one %s restore to the named daemon", async (mode) => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    const target = { deckId: "deck-remote", instance: "restore-process" };
+    const answer = { dry_run: false, restored: [{ attempt: "restore-desktop/8", agent_id: "41", pane_id: "pane-41", name: "restore-second", first_message_posted: true, recorded: true }], refused: [] };
+    const reply = { outcome: "answered", instance: target.instance, answer };
+    invoke.mockResolvedValueOnce(reply);
+    expect(await bridge.interruptedWorkRestore(target, "w-abcdefgh-0000000000000003", ["restore-desktop/8"], mode, false)).toEqual(reply);
+    expect(invoke.mock.calls).toEqual([["interrupted_work_restore", {
+      deckId: "deck-remote", instanceId: "restore-process",
+      id: "w-abcdefgh-0000000000000003", agents: ["restore-desktop/8"], mode, dryRun: false,
+    }]]);
+  });
+
+  /** Scenario: Start over sends the one displayed attempt to the selected daemon, without a resume mode, caller identity or session id. Its final answer comes back with the daemon process it belongs to. */
+  it("journal/restore/009 sends one Start-over bridge request", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    const target = { deckId: "deck-remote", instance: "restore-process" };
+    const reply = { outcome: "answered", instance: target.instance, answer: { dry_run: false, started: { attempt: "restore-desktop/8", agent_id: "41", pane_id: "pane-41", name: "restore-second", first_message_posted: true, recorded: true }, refused: null } };
+    invoke.mockResolvedValueOnce(reply);
+    expect(await bridge.interruptedWorkStartOver(target, "w-abcdefgh-0000000000000003", "restore-desktop/8", false)).toEqual(reply);
+    expect(invoke.mock.calls).toEqual([["interrupted_work_start_over", {
+      deckId: "deck-remote", instanceId: "restore-process",
+      id: "w-abcdefgh-0000000000000003", agent: "restore-desktop/8", dryRun: false,
+    }]]);
+  });
+
+  /** Scenario: a dry run reports the attempts a restore would bring back or that Start over would start one, while starting no pane. A newer daemon's additional outcome fields survive the webview envelope. */
+  it("journal/restore/009 preserves dry-run and additive outcome fields", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    const target = { deckId: "deck-remote", instance: "restore-process" };
+    // Deliberately generic metadata: no open-PR field is committed yet.
+    const restored = { outcome: "answered", instance: target.instance, answer: {
+      dry_run: true, restored: [], refused: [], would_restore: ["restore-desktop/8"],
+      future_metadata: { value: "from a newer daemon" },
+    } };
+    invoke.mockResolvedValueOnce(restored);
+    expect(await bridge.interruptedWorkRestore(target, "w", ["restore-desktop/8"], "only", true)).toEqual(restored);
+    const started = { outcome: "answered", instance: target.instance, answer: {
+      dry_run: true, started: null, refused: null, would_start: true,
+      future_metadata: { value: "from a newer daemon" },
+    } };
+    invoke.mockResolvedValueOnce(started);
+    expect(await bridge.interruptedWorkStartOver(target, "w", "restore-desktop/8", true)).toEqual(started);
+    expect(invoke.mock.calls).toEqual([
+      ["interrupted_work_restore", { deckId: target.deckId, instanceId: target.instance, id: "w", agents: ["restore-desktop/8"], mode: "only", dryRun: true }],
+      ["interrupted_work_start_over", { deckId: target.deckId, instanceId: target.instance, id: "w", agent: "restore-desktop/8", dryRun: true }],
+    ]);
+  });
+
+  /** Scenario: a daemon with no restore capability answers unsupported, and an unreadable bridge reply is handled as unsupported instead of being mistaken for a completed restore. */
+  it("journal/restore/009 reads unsupported and malformed restore replies safely", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    const target = { deckId: "deck-remote", instance: "restore-process" };
+    for (const raw of [{ outcome: "unsupported" }, { ok: true }, null, { outcome: "answered", instance: "restore-process", answer: {} }]) {
+      invoke.mockResolvedValueOnce(raw);
+      expect(await bridge.interruptedWorkRestore(target, "w", ["restore-desktop/8"], "only", false)).toEqual({ outcome: "unsupported" });
+      invoke.mockResolvedValueOnce(raw);
+      expect(await bridge.interruptedWorkStartOver(target, "w", "restore-desktop/8", false)).toEqual({ outcome: "unsupported" });
+    }
+  });
+
+  /** Scenario: the app hides Restore when desktop_features is old, malformed or false. Only the literal true field enables it, and the fixture's experimental switch mirrors that decision. */
+  it("journal/restore/009 defaults the desktop restore feature off", async () => {
+    const { normalizeDesktopFeatures, fixtureDesktopFeatures } = await import("./bridge");
+    for (const raw of [null, {}, { showAgentRestore: false }, { showAgentRestore: "true" }]) {
+      expect(normalizeDesktopFeatures(raw).showAgentRestore).toBe(false);
+    }
+    expect(normalizeDesktopFeatures({ showAgentRestore: true }).showAgentRestore).toBe(true);
+    expect(fixtureDesktopFeatures("").showAgentRestore).toBe(false);
+    expect(fixtureDesktopFeatures("?experimental=0").showAgentRestore).toBe(false);
+    expect(fixtureDesktopFeatures("?experimental=1").showAgentRestore).toBe(true);
+  });
 });
 
 describe("FixtureDeckBridge scenarios", () => {
@@ -1783,13 +1861,13 @@ describe("FixtureDeckBridge scenarios", () => {
     const { createDeckBridge } = await import("./bridge");
     const bridge = createDeckBridge("fixture");
 
-    await expect(bridge.desktopFeatures()).resolves.toEqual({ showDeck: false, showProjects: false, showPrompts: false, showOrchestrations: false, showAgentProfiles: false, showAgentDetails: false });
+    await expect(bridge.desktopFeatures()).resolves.toEqual({ showDeck: false, showProjects: false, showPrompts: false, showOrchestrations: false, showAgentProfiles: false, showAgentDetails: false, showAgentRestore: false });
 
     window.history.replaceState({}, "", "/?fixture=1&experimental=1");
-    await expect(bridge.desktopFeatures()).resolves.toEqual({ showDeck: true, showProjects: true, showPrompts: true, showOrchestrations: true, showAgentProfiles: true, showAgentDetails: true });
+    await expect(bridge.desktopFeatures()).resolves.toEqual({ showDeck: true, showProjects: true, showPrompts: true, showOrchestrations: true, showAgentProfiles: true, showAgentDetails: true, showAgentRestore: true });
 
     window.history.replaceState({}, "", "/?fixture=1&experimental=0");
-    await expect(bridge.desktopFeatures()).resolves.toEqual({ showDeck: false, showProjects: false, showPrompts: false, showOrchestrations: false, showAgentProfiles: false, showAgentDetails: false });
+    await expect(bridge.desktopFeatures()).resolves.toEqual({ showDeck: false, showProjects: false, showPrompts: false, showOrchestrations: false, showAgentProfiles: false, showAgentDetails: false, showAgentRestore: false });
   });
 
   /**

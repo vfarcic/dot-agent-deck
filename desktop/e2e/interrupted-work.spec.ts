@@ -297,3 +297,97 @@ test.describe("Interrupted work", () => {
     await expect(page.getByTestId("interrupted-dialog").getByRole("heading", { name: "Interrupted work" })).toBeVisible();
   });
 });
+
+async function openRestorePreview(page: Page, enabled = true) {
+  await page.goto(`/?fixture=1&interrupted=restore${enabled ? "&experimental=1" : ""}`);
+  await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
+  await page.getByTestId("open-overview").click();
+  await expect(page.getByTestId("interrupted-banner")).toContainText("2 interrupted items from before the restart");
+  await page.keyboard.press("I");
+  const dialog = page.getByTestId("interrupted-dialog");
+  await expect(dialog.getByTestId("interrupted-row")).toHaveCount(2);
+  return dialog;
+}
+
+test.describe("journal/restore/009 — desktop restore in the browser", () => {
+  for (const [key, name, button] of [
+    ["c", "Restore and continue", "interrupted-restore-continue"],
+    ["o", "Restore only", "interrupted-restore-only"],
+  ] as const) {
+    /** Scenario: open Interrupted work with I, select fix-login and press s. After inspecting the resume question, choose c or o: the dialog closes on the dashboard, the banner count falls, and the reopened list no longer has the item. */
+    test(`journal/restore/009 ${key} confirms ${name}`, async ({ page }) => {
+      const dialog = await openRestorePreview(page);
+      await dialog.getByTestId("interrupted-row").filter({ hasText: "fix-login" }).click();
+      await page.keyboard.press("s");
+      const question = dialog.getByTestId("interrupted-restore-question");
+      await expect(question).toContainText("Restore fix-login with its conversation?");
+      await expect(question).toContainText("It checks what already happened and carries on where it stopped.");
+      await expect(question).toContainText("It comes back and waits until you tell it to continue.");
+      await expect(question.getByTestId(button)).toHaveText(name);
+      await expect(question.getByTestId("interrupted-start-over")).toHaveCount(0);
+      await expect(question).toHaveAttribute("data-presented", "true");
+      await page.keyboard.press(key);
+      // Adapted to the landed TUI behaviour: a clean restore closes the
+      // dialog on the dashboard, where the agent is back, as the TUI's overlay
+      // closes. Reopening it shows the item left the list.
+      await expect(dialog).toHaveCount(0);
+      await expect(page.getByTestId("interrupted-banner")).toContainText("1 interrupted item from before the restart");
+      await page.keyboard.press("I");
+      await expect(dialog.getByTestId("interrupted-row").filter({ hasText: "fix-login" })).toHaveCount(0);
+      await expect(dialog.getByTestId("interrupted-row")).toHaveCount(1);
+    });
+  }
+
+  /** Scenario: select the Pi whose conversation cannot be restored and click Restore. Its question explains the gap and offers Start over instead of either resume choice; w closes the dialog and removes that stopped item from the list. */
+  test("journal/restore/009 w starts over only when the verdict offers it", async ({ page }) => {
+    const dialog = await openRestorePreview(page);
+    await dialog.getByTestId("interrupted-row").filter({ hasText: "scratch-pi" }).click();
+    await dialog.getByTestId("interrupted-restore").click();
+    const question = dialog.getByTestId("interrupted-restore-question");
+    await expect(question).toContainText("Start scratch-pi over in this worktree, without its conversation?");
+    await expect(question).toContainText("The agent cannot be restored with its conversation yet.");
+    await expect(question.getByTestId("interrupted-start-over")).toHaveText("Start over in this worktree");
+    await expect(question.getByTestId("interrupted-restore-continue")).toHaveCount(0);
+    await expect(question.getByTestId("interrupted-restore-only")).toHaveCount(0);
+    await expect(question).toHaveAttribute("data-presented", "true");
+    await page.keyboard.press("w");
+    // Adapted as above: a clean start-over closes the dialog; reopened, it lists the other item only.
+    await expect(dialog).toHaveCount(0);
+    await expect(page.getByTestId("interrupted-banner")).toContainText("1 interrupted item from before the restart");
+    await page.keyboard.press("I");
+    await expect(dialog.getByTestId("interrupted-row").filter({ hasText: "scratch-pi" })).toHaveCount(0);
+    await expect(dialog.getByTestId("interrupted-row")).toHaveCount(1);
+  });
+
+  /** Scenario: press s and immediately c in one key burst. The question paints without starting the agent; Escape, q and n each return to the list with its two items still present. */
+  test("journal/restore/009 shows the question before accepting a confirm and permits every back key", async ({ page }) => {
+    const dialog = await openRestorePreview(page);
+    for (const back of ["Escape", "q", "n"]) {
+      // Dispatch in one browser event-loop turn, as the Stage 2 D/y guard test
+      // does for an unpresented question; do not insert a wait between keys.
+      await page.evaluate(() => {
+        const node = document.querySelector('[data-testid="interrupted-dialog"]')!;
+        for (const key of ["s", "c", "c"]) node.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true }));
+      });
+      await expect(dialog.getByTestId("interrupted-restore-question")).toBeVisible();
+      await page.keyboard.press(back);
+      await expect(dialog.getByTestId("interrupted-restore-question")).toHaveCount(0);
+      await expect(dialog.getByTestId("interrupted-row")).toHaveCount(2);
+    }
+  });
+
+  /** Scenario: without experimental features, the stopped agents remain listed but list and details have no Restore button. Pressing s opens no question and leaves the list unchanged. */
+  test("journal/restore/009 hides Restore and ignores s without experimental features", async ({ page }) => {
+    const dialog = await openRestorePreview(page, false);
+    await expect(dialog.getByTestId("interrupted-restore")).toHaveCount(0);
+    await page.keyboard.press("s");
+    await expect(dialog.getByTestId("interrupted-restore-question")).toHaveCount(0);
+    await expect(dialog.getByTestId("interrupted-row")).toHaveCount(2);
+    await dialog.getByTestId("interrupted-details").click();
+    await expect(dialog.getByTestId("interrupted-details-view")).toBeVisible();
+    await expect(dialog.getByTestId("interrupted-restore")).toHaveCount(0);
+    await page.keyboard.press("s");
+    await expect(dialog.getByTestId("interrupted-restore-question")).toHaveCount(0);
+    await expect(dialog.getByTestId("interrupted-details-view")).toBeVisible();
+  });
+});

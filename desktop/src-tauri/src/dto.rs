@@ -2295,6 +2295,9 @@ pub struct DesktopFeatures {
     pub show_orchestrations: bool,
     pub show_agent_profiles: bool,
     pub show_agent_details: bool,
+    /// PRD #1790 stage 3: the interrupted work dialog's Restore, its
+    /// question and the spoken restore (`features::show_agent_restore`).
+    pub show_agent_restore: bool,
 }
 
 impl DesktopFeatures {
@@ -2309,6 +2312,7 @@ impl DesktopFeatures {
             show_orchestrations: features::show_desktop_orchestrations(),
             show_agent_profiles: features::show_desktop_agent_profiles(),
             show_agent_details: features::show_desktop_agent_details(),
+            show_agent_restore: features::show_agent_restore(),
         }
     }
 }
@@ -6403,6 +6407,7 @@ mod tests {
                 show_orchestrations: false,
                 show_agent_profiles: false,
                 show_agent_details: false,
+                show_agent_restore: false,
             }
         );
 
@@ -6416,6 +6421,7 @@ mod tests {
                 show_orchestrations: true,
                 show_agent_profiles: true,
                 show_agent_details: true,
+                show_agent_restore: true,
             }
         );
     }
@@ -6431,6 +6437,7 @@ mod tests {
             show_orchestrations: false,
             show_agent_profiles: true,
             show_agent_details: false,
+            show_agent_restore: true,
         })
         .expect("serialises");
         assert_eq!(
@@ -6442,6 +6449,7 @@ mod tests {
                 "showOrchestrations": false,
                 "showAgentProfiles": true,
                 "showAgentDetails": false,
+                "showAgentRestore": true,
             })
         );
     }

@@ -8,7 +8,7 @@ import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, LOCAL_ENDPOINT_SELECT
 import { AGENTS_STOPPED_BY_RESTART } from "../lib/agentIdentity";
 import {
   DISMISSED, INTERRUPTED_UNREAD, INTERRUPTED_WORK_TITLE, LIST_INCOMPLETE, LIST_REFRESH_FAILED, NOTHING_INTERRUPTED, OTHER_AGENTS_GROUP, RECLAIM_KEPT_DIRTY, RECLAIM_REMOVED, RECLAIM_WOULD_REMOVE, REFUSED_AMBIGUOUS, REFUSED_INCOMPLETE_READ, REFUSED_NOT_LISTED, dismissAllQuestion, gitFactsLine, interruptedFooter, reportRangeSentence,
-  type DismissOutcome, type InterruptedItem, type InterruptedList, type InterruptedReply, type InterruptedShow, type InterruptedTarget, type ReclaimOutcome,
+  type DismissOutcome, type InterruptedItem, type InterruptedList, type InterruptedReply, type InterruptedShow, type InterruptedTarget, type ReclaimOutcome, type RestoreMode, type RestoreOutcome, type StartOverOutcome,
 } from "../lib/interruptedWork";
 import { VOICE_ACTIONS, INTERRUPTED_RECLAIM_CHECKING, type VoiceOverviewChannel, type VoiceOverviewContext } from "../lib/voiceActions";
 import { useInterruptedWork } from "../hooks/useInterruptedWork";
@@ -420,6 +420,47 @@ describe("interrupted work by voice", () => {
     await act(async () => { VOICE_ACTIONS.dismissAllInterrupted.run({ ...published(), reportRefused }); });
     expect(screen.getByTestId("interrupted-dismiss-all-question")).toHaveTextContent(dismissAllQuestion(3));
     expect(calls.some((call) => call.verb === "dismiss")).toBe(false);
+  });
+
+  /** Scenario: restore is a spoken action that asks a question on the dashboard. Each of the three choices that starts an agent has a written reason for requiring a person's confirmation on screen. */
+  it("journal/restore/010 registers the ask and keeps the three confirms off voice", () => {
+    expect(VOICE_ACTIONS.askRestoreInterrupted.voice).toBe(true);
+    const row = rowFor("restore_interrupted");
+    expect(row).toBeDefined();
+    expect(row).toMatch(/^invoke\s*=\s*"askRestoreInterrupted"/m);
+    expect(row).toMatch(/^screens\s*=\s*\["overview"\]/m);
+    expect(row).toMatch(/name\s*=\s*"item"/);
+    expect(row).toMatch(/kind\s*=\s*"filter_text"/);
+    expect(row).toMatch(/optional\s*=\s*true/);
+    expect(row).toContain("restore the agent");
+    expect(row).toContain("bring back");
+    expect(row).toContain("conversation");
+    for (const name of ["restoreAndContinueInterrupted", "restoreOnlyInterrupted", "startOverInterrupted"] as const) {
+      const action = VOICE_ACTIONS[name] as { voice?: true; no_voice?: string };
+      expect(action.voice, name).not.toBe(true);
+      expect(action.no_voice, name).toMatch(/starts an agent/);
+      expect(action.no_voice, name).toMatch(/spends credits/);
+      expect(action.no_voice, name).toMatch(/confirm-before-acting/);
+      expect(action.no_voice, name).toContain("restore_interrupted");
+      expect(commands, name).not.toMatch(new RegExp(`^invoke\\s*=\\s*"${name}"`, "m"));
+    }
+  });
+
+  /** Scenario: the documented restore phrases target the same ask action, and a restore said in an agent pane is unavailable. This checks fixture declarations; it does not run the model that interprets speech. */
+  it("journal/restore/010 keeps each documented phrase fixture", () => {
+    const fixtures = readFileSync(resolve("src-tauri/src/voice/phrase_fixtures.toml"), "utf8");
+    for (const [utterance, screenName, outcome] of [
+      ["restore the agent", "overview", "dispatch"],
+      ["bring back fix-login", "overview", "dispatch"],
+      ["resume fix-login's conversation", "overview", "dispatch"],
+      ["restore the agent", "agent", "unavailable"],
+    ] as const) {
+      const row = fixtures.split(/^\[\[fixtures\]\]\s*$/m).find((part) =>
+        part.includes(`utterance = "${utterance}"`) && part.includes(`screen = "${screenName}"`));
+      expect(row, `${screenName}: ${utterance}`).toBeDefined();
+      expect(row).toContain('action = "restore_interrupted"');
+      expect(row).toContain(`outcome = "${outcome}"`);
+    }
   });
 });
 
@@ -1255,5 +1296,237 @@ describe("a request to show interrupted work that the person moved on from (PR #
     await waitFor(() => expect(within(screen.getByTestId("interrupted-dialog")).queryAllByTestId("interrupted-row").map((row) => row.getAttribute("data-item-id"))).toEqual([TEAM_ID]));
     expect(dialog).toBeDefined();
     expect(voice.reportRefused).not.toHaveBeenCalled();
+  });
+});
+
+const RESTORE_ATTEMPT = "restore-desktop/8";
+const RESTORE_OTHER = "restore-desktop/7";
+const DESKTOP_RESTORE_STILL_RUNNING = "Refused: the agent's old process, or a process it started, is still running. Stop it first, so two agents do not write to one conversation.";
+type DesktopRestoreKind = "resume" | "start_over" | "none";
+
+function desktopRestoreItem(kind: DesktopRestoreKind = "resume", first = false): InterruptedItem {
+  const base = first ? unit() : agent();
+  return {
+    ...base,
+    name: first ? "restore-first" : "restore-second",
+    agents: [{
+      attempt: first ? RESTORE_OTHER : RESTORE_ATTEMPT,
+      name: first ? "restore-first" : "restore-second",
+      agent_type: kind === "resume" ? "claude_code" : "pi",
+      folder: base.worktree,
+      restore: kind === "resume" ? { kind } : {
+        kind, reason: kind === "none" ? "orchestration-later" : "agent-cannot-resume",
+      },
+    }],
+  };
+}
+
+// A final domain refusal keeps the row visible when the pending promise is
+// released. The successful spawn/list transition is covered by the browser test.
+function desktopRestoreBridge(kind: DesktopRestoreKind = "resume") {
+  const state = { list: { items: [desktopRestoreItem("resume", true), desktopRestoreItem(kind)] } };
+  const recorded = recordingBridge(state);
+  const held: (() => void)[] = [];
+  const bridge = {
+    ...recorded.bridge,
+    interruptedWorkRestore: vi.fn(async (target: InterruptedTarget, id: string, agents: string[], mode: RestoreMode, dryRun: boolean): Promise<InterruptedReply<RestoreOutcome>> => {
+      recorded.calls.push({ verb: "restore", target, args: [id, agents, mode, dryRun] });
+      await new Promise<void>((done) => { held.push(done); });
+      return answered(target, { dry_run: false, restored: [], refused: [{ attempt: RESTORE_ATTEMPT, reason: "still-running", message: DESKTOP_RESTORE_STILL_RUNNING }] });
+    }),
+    interruptedWorkStartOver: vi.fn(async (target: InterruptedTarget, id: string, attempt: string, dryRun: boolean): Promise<InterruptedReply<StartOverOutcome>> => {
+      recorded.calls.push({ verb: "start-over", target, args: [id, attempt, dryRun] });
+      await new Promise<void>((done) => { held.push(done); });
+      return answered(target, { dry_run: false, started: null, refused: { attempt: RESTORE_ATTEMPT, reason: "still-running", message: DESKTOP_RESTORE_STILL_RUNNING } });
+    }),
+  } satisfies DeckBridge;
+  return {
+    bridge,
+    calls: recorded.calls,
+    actions: () => recorded.calls.filter((call) => call.verb === "restore" || call.verb === "start-over"),
+    release: () => held.splice(0).forEach((done) => done()),
+  };
+}
+
+function RestoreOverview({ bridge, enabled = true, voiceChannel }: { bridge: DeckBridge; enabled?: boolean; voiceChannel?: VoiceOverviewChannel }) {
+  const deck = deckOf("restore-process");
+  const interruptedWork = useInterruptedWork(bridge, [deck]);
+  return <AgentOverview runtime={{ ...baseRuntime(deck), desktopFeatures: fixtureDesktopFeatures(enabled ? "?experimental=1" : ""), ...(interruptedWork ? { interruptedWork } : {}) }} onNavigate={vi.fn()} voiceChannel={voiceChannel} />;
+}
+
+async function restoreKey(dialog: HTMLElement, key: string) {
+  await act(async () => { fireEvent.keyDown(dialog, { key }); });
+}
+
+describe("journal/restore/009 — the desktop restore question", () => {
+  /** Scenario: select the second stopped agent and press s from the list or its details. The question names that agent, shows precisely its available choices and explanations, and starts nothing. */
+  it.each([
+    ["resume", false], ["resume", true], ["start_over", false], ["start_over", true],
+  ] as const)("journal/restore/009 asks from %s, details=%s, with the TUI's words", async (kind, details) => {
+    const recorded = desktopRestoreBridge(kind);
+    render(<RestoreOverview bridge={recorded.bridge} />);
+    const dialog = await openDialog();
+    await act(async () => { fireEvent.click(rowOf(AGENT_ID)); });
+    if (details) await act(async () => { fireEvent.click(within(dialog).getByTestId("interrupted-details")); });
+    expect(within(dialog).getByTestId("interrupted-restore")).toHaveTextContent("Restore");
+    await restoreKey(dialog, "s");
+    const question = within(dialog).getByTestId("interrupted-restore-question");
+    expect(question).toHaveTextContent("restore-second");
+    if (kind === "resume") {
+      expect(question).toHaveTextContent("Restore restore-second with its conversation?");
+      expect(question).toHaveTextContent("It checks what already happened and carries on where it stopped.");
+      expect(question).toHaveTextContent("It comes back and waits until you tell it to continue.");
+      expect(within(question).getByTestId("interrupted-restore-continue")).toHaveTextContent("Restore and continue");
+      expect(within(question).getByTestId("interrupted-restore-only")).toHaveTextContent("Restore only");
+      expect(within(question).queryByTestId("interrupted-start-over")).toBeNull();
+    } else {
+      expect(question).toHaveTextContent("Start restore-second over in this worktree, without its conversation?");
+      expect(question).toHaveTextContent("The agent cannot be restored with its conversation yet.");
+      expect(within(question).getByTestId("interrupted-start-over")).toHaveTextContent("Start over in this worktree");
+      expect(within(question).queryByTestId("interrupted-restore-continue")).toBeNull();
+      expect(within(question).queryByTestId("interrupted-restore-only")).toBeNull();
+    }
+    for (const unavailable of kind === "resume" ? ["w"] : ["c", "o"]) {
+      await restoreKey(dialog, unavailable);
+      expect(within(dialog).getByTestId("interrupted-restore-question")).toBeInTheDocument();
+    }
+    expect(recorded.actions()).toEqual([]);
+  });
+
+  /** Scenario: ask about the second item, then confirm by c, o or w, or the matching button. While its answer is held, more confirm keys and clicks send no second request, and the first request names the selected item's attempt and serving daemon. */
+  it.each([
+    ["resume", "c", "interrupted-restore-continue", "continue"],
+    ["resume", "o", "interrupted-restore-only", "only"],
+    ["start_over", "w", "interrupted-start-over", undefined],
+  ] as const)("journal/restore/009 confirms %s with %s exactly once while pending", async (kind, key, testId, mode) => {
+    for (const byButton of [false, true]) {
+      const recorded = desktopRestoreBridge(kind);
+      const mounted = render(<RestoreOverview bridge={recorded.bridge} />);
+      const dialog = await openDialog();
+      await act(async () => { fireEvent.click(rowOf(AGENT_ID)); });
+      await act(async () => { fireEvent.click(within(dialog).getByTestId("interrupted-restore")); });
+      const question = within(dialog).getByTestId("interrupted-restore-question");
+      // Match the Stage 2 presentation barrier. A key burst must not confirm a
+      // question that has not painted; use its established data-presented seam.
+      await waitFor(() => expect(question).toHaveAttribute("data-presented", "true"));
+      const button = within(question).getByTestId(testId);
+      if (byButton) await act(async () => { fireEvent.click(button); });
+      else await restoreKey(dialog, key);
+      await waitFor(() => expect(recorded.actions()).toHaveLength(1));
+      expect(button).toBeDisabled();
+      for (const again of [key, "c", "o", "w", "s"]) await restoreKey(dialog, again);
+      await act(async () => { fireEvent.click(button); });
+      const target = { deckId: deckOf("restore-process").connection.deckId!, instance: "restore-process" };
+      expect(recorded.actions()).toEqual([{
+        verb: mode ? "restore" : "start-over", target,
+        args: mode ? [AGENT_ID, [RESTORE_ATTEMPT], mode, false] : [AGENT_ID, RESTORE_ATTEMPT, false],
+      }]);
+      await act(async () => { recorded.release(); });
+      expect(await within(dialog).findByTestId("interrupted-message")).toHaveTextContent(DESKTOP_RESTORE_STILL_RUNNING);
+      mounted.unmount();
+    }
+  });
+
+  /** Scenario: s opens a question, and Escape, q, n or Back returns to the list with the stopped agents still listed. A choice that was not offered sends nothing. */
+  it.each(["Escape", "q", "n", "button"])("journal/restore/009 backs out with %s without acting", async (back) => {
+    const recorded = desktopRestoreBridge();
+    render(<RestoreOverview bridge={recorded.bridge} />);
+    const dialog = await openDialog();
+    await restoreKey(dialog, "s");
+    await restoreKey(dialog, "w");
+    expect(recorded.actions()).toEqual([]);
+    if (back === "button") await act(async () => { fireEvent.click(within(dialog).getByTestId("interrupted-back")); });
+    else await restoreKey(dialog, back);
+    expect(within(dialog).queryByTestId("interrupted-restore-question")).toBeNull();
+    expect(within(dialog).getAllByTestId("interrupted-row")).toHaveLength(2);
+    expect(recorded.actions()).toEqual([]);
+  });
+
+  /** Scenario: s and c arrive before the restore question is presented. The question remains on screen and no restore is sent until the user sees it and confirms again. */
+  it("journal/restore/009 does not confirm a question in the opening key burst", async () => {
+    const recorded = desktopRestoreBridge();
+    render(<RestoreOverview bridge={recorded.bridge} />);
+    const dialog = await openDialog();
+    await act(async () => {
+      for (const key of ["s", "c", "c"]) fireEvent.keyDown(dialog, { key });
+    });
+    expect(within(dialog).getByTestId("interrupted-restore-question")).toBeInTheDocument();
+    expect(recorded.actions()).toEqual([]);
+  });
+
+  /** Scenario: with experimental features off, both list and details hide Restore, and s leaves the visible view unchanged and starts nothing. The daemon still lists the agent's recorded restore verdict. */
+  it("journal/restore/009 keeps the restore seam inert with the flag off", async () => {
+    const recorded = desktopRestoreBridge();
+    render(<RestoreOverview bridge={recorded.bridge} enabled={false} />);
+    const dialog = await openDialog();
+    for (const details of [false, true]) {
+      if (details) await act(async () => { fireEvent.click(within(dialog).getByTestId("interrupted-details")); });
+      expect(within(dialog).queryByTestId("interrupted-restore")).toBeNull();
+      const before = dialog.textContent;
+      await restoreKey(dialog, "s");
+      expect(dialog.textContent).toBe(before);
+      expect(within(dialog).queryByTestId("interrupted-restore-question")).toBeNull();
+    }
+    expect(recorded.actions()).toEqual([]);
+  });
+
+  /** Scenario: the dialog lists an orchestration agent that cannot yet come back. Its reason is visible in details, and s never offers a resume or Start-over confirm for that agent. */
+  it("journal/restore/009 does not offer a confirm for a none verdict", async () => {
+    const recorded = desktopRestoreBridge("none");
+    render(<RestoreOverview bridge={recorded.bridge} />);
+    const dialog = await openDialog();
+    await act(async () => { fireEvent.click(rowOf(AGENT_ID)); });
+    await act(async () => { fireEvent.click(within(dialog).getByTestId("interrupted-details")); });
+    expect(dialog).toHaveTextContent("Orchestrations come back in a later version.");
+    await restoreKey(dialog, "s");
+    expect(within(dialog).queryByTestId("interrupted-restore-continue")).toBeNull();
+    expect(within(dialog).queryByTestId("interrupted-restore-only")).toBeNull();
+    expect(within(dialog).queryByTestId("interrupted-start-over")).toBeNull();
+    expect(recorded.actions()).toEqual([]);
+  });
+});
+
+describe("journal/restore/010 — spoken restore asks and stops", () => {
+  /** Scenario: with the interrupted dialog open, voice chooses the second stopped item by its name, place or current selection. The named question appears and no agent is started before a person's confirmation. */
+  it.each([undefined, "restore second", "the second one"])("journal/restore/010 asks about the selected/spoken item: %s", async (said) => {
+    const recorded = desktopRestoreBridge();
+    const voice = voiced(recorded.bridge);
+    render(<voice.Voiced />);
+    const dialog = await openDialog();
+    if (said === undefined) await act(async () => { fireEvent.click(rowOf(AGENT_ID)); });
+    await act(async () => { VOICE_ACTIONS.askRestoreInterrupted.run(voice.context(), said === undefined ? {} : { filterText: said }); });
+    expect(within(dialog).getByTestId("interrupted-restore-question")).toHaveTextContent("Restore restore-second with its conversation?");
+    expect(voice.reportRefused).not.toHaveBeenCalled();
+    expect(recorded.actions()).toEqual([]);
+    // Repeating the spoken ask is still not a confirm.
+    await act(async () => { VOICE_ACTIONS.askRestoreInterrupted.run(voice.context(), {}); });
+    expect(recorded.actions()).toEqual([]);
+  });
+
+  /** Scenario: a spoken restore naming an absent item starts nothing and opens no confirmation. The voice surface reports why the request was refused. */
+  it("journal/restore/010 refuses an unknown item", async () => {
+    const recorded = desktopRestoreBridge();
+    const voice = voiced(recorded.bridge);
+    render(<voice.Voiced />);
+    const dialog = await openDialog();
+    await act(async () => { VOICE_ACTIONS.askRestoreInterrupted.run(voice.context(), { filterText: "missing item" }); });
+    expect(voice.reportRefused).toHaveBeenCalledWith(expect.any(String));
+    expect(within(dialog).queryByTestId("interrupted-restore-question")).toBeNull();
+    expect(recorded.actions()).toEqual([]);
+  });
+
+  /** Scenario: a spoken restore made with experimental features off opens no question and starts nothing, even though the daemon lists resumable agents. */
+  it("journal/restore/010 keeps the spoken restore seam hidden with the flag off", async () => {
+    const recorded = desktopRestoreBridge();
+    const channel: VoiceOverviewChannel = { current: undefined };
+    render(<RestoreOverview bridge={recorded.bridge} enabled={false} voiceChannel={channel} />);
+    const dialog = await openDialog();
+    const reportRefused = vi.fn();
+    await act(async () => {
+      VOICE_ACTIONS.askRestoreInterrupted.run({ ...(channel.current as VoiceOverviewContext), reportRefused }, {});
+    });
+    expect(reportRefused).toHaveBeenCalledWith(expect.stringMatching(/experimental|enabled|available/i));
+    expect(within(dialog).queryByTestId("interrupted-restore-question")).toBeNull();
+    expect(recorded.actions()).toEqual([]);
   });
 });

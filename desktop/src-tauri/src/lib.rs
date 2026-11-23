@@ -2052,6 +2052,55 @@ async fn interrupted_work_dismiss(
     crate::interrupted_work::dismiss(&daemon.client, &instance_id, ids).await
 }
 
+/// PRD #1790 stage 3: restore the attempts `agents` of interrupted item `id`
+/// on deck `deck_id` with their conversations, or with `dry_run` ask what
+/// that would do. The daemon starts the agent. Sent with no pane claim; not
+/// gated on the experimental flag, which gates the webview's controls.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn interrupted_work_restore(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    deck_id: String,
+    instance_id: String,
+    id: String,
+    agents: Vec<String>,
+    mode: dot_agent_deck::interrupted_work::RestoreMode,
+    dry_run: bool,
+) -> Result<
+    crate::dto::InterruptedWorkReply<dot_agent_deck::interrupted_work::RestoreOutcome>,
+    String,
+> {
+    ensure_main_webview(&webview)?;
+    let scope = crate::dto::DeckScope::resolve(Some(&deck_id))?;
+    let daemon = state.daemon.trusted(scope.endpoint()).await?;
+    daemon.require_compatible()?;
+    crate::interrupted_work::restore(&daemon.client, &instance_id, &id, agents, mode, dry_run).await
+}
+
+/// PRD #1790 stage 3: start attempt `agent` of interrupted item `id` on deck
+/// `deck_id` over in its folder, without its conversation, or with `dry_run`
+/// ask what that would do. Sent with no pane claim.
+#[tauri::command]
+async fn interrupted_work_start_over(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    deck_id: String,
+    instance_id: String,
+    id: String,
+    agent: String,
+    dry_run: bool,
+) -> Result<
+    crate::dto::InterruptedWorkReply<dot_agent_deck::interrupted_work::StartOverOutcome>,
+    String,
+> {
+    ensure_main_webview(&webview)?;
+    let scope = crate::dto::DeckScope::resolve(Some(&deck_id))?;
+    let daemon = state.daemon.trusted(scope.endpoint()).await?;
+    daemon.require_compatible()?;
+    crate::interrupted_work::start_over(&daemon.client, &instance_id, &id, &agent, dry_run).await
+}
+
 /// PRD #2374: invoke action `action_id` of the card of agent `agent_id` in
 /// `pane_id` on deck `deck_id`. `instance_id` is the daemon process that
 /// listed the card and `action_token` the version of the action the user was
@@ -7713,6 +7762,8 @@ pub fn run() {
             interrupted_work_show,
             interrupted_work_reclaim,
             interrupted_work_dismiss,
+            interrupted_work_restore,
+            interrupted_work_start_over,
             desktop_new_agent_options,
             desktop_bootstrap,
             desktop_reconnect_deck,
