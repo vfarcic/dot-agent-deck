@@ -5,6 +5,7 @@ import { createFixtureFleet, createFixtureStartedAgent, FIXTURE_DAEMON_ID, FIXTU
 import { deckName } from "../lib/displayText";
 import { clearDashboardFilter, setDashboardFilter } from "../lib/dashboardFilter";
 import { DEFAULT_DESKTOP_FEATURES, type AgentCardAction, type AgentCardEntry, type DeckRuntimeState } from "../types";
+import { BATCH_NOT_KNOWN } from "../hooks/useAgentCardsView";
 import { AgentOverview } from "./AgentOverview";
 
 const INSTANCE = "daemon-instance-batch";
@@ -302,6 +303,27 @@ describe("batch card actions (#2399)", () => {
     await act(async () => { fireEvent.click(screen.getByTestId("agent-cards-batch-action-batch-go")); });
     expect(screen.getByTestId("agent-cards-batch-confirm")).toHaveAttribute("data-stage", "review");
     expect(calls.invokeCardActionBatch).toHaveBeenLastCalledWith(FIXTURE_DAEMON_ID, "batch-go", expect.objectContaining({ mode: "preview" }));
+    expect(calls.invokeCardAction).not.toHaveBeenCalled();
+  });
+
+  /// Scenario: Send a reviewed batch whose execution fails in the window with an error the desktop bridge could not place before or after the request left. Each agent's row says "No answer" with that error and that it is not known whether the agent got it, never "Failed" or "Nothing was sent", and nothing is sent again.
+  it("desktop/agent-cards/039: an execution that fails unplaced ends as no answer, not as failed", async () => {
+    const calls = setup();
+    const dialog = await startSelectedBatch();
+    calls.invokeCardActionBatch.mockImplementationOnce(() => Promise.reject(new Error("the window lost the bridge")) as never);
+    await act(async () => { fireEvent.click(within(dialog).getByRole("button", { name: /^Send$/ })); });
+    const results = screen.getByTestId("agent-cards-batch-results");
+    const rows = within(results).getAllByTestId("agent-cards-batch-entry");
+    expect(rows).toHaveLength(2);
+    for (const row of rows) {
+      expect(row).toHaveAttribute("data-outcome", "unknown");
+      expect(within(row).getByText("No answer", { exact: true })).toBeInTheDocument();
+      expect(within(row).getByText(`the window lost the bridge; ${BATCH_NOT_KNOWN}`)).toBeInTheDocument();
+      expect(within(row).queryByText("Failed", { exact: true })).toBeNull();
+    }
+    expect(within(results).getByRole("status")).toHaveTextContent("0 of 2 confirmed sent; 2 not answered, may still be delivered");
+    expect(within(results).queryByText(/[Nn]othing was sent/)).toBeNull();
+    expect(calls.invokeCardActionBatch).toHaveBeenCalledTimes(2);
     expect(calls.invokeCardAction).not.toHaveBeenCalled();
   });
 });

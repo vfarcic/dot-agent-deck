@@ -51,6 +51,16 @@ struct Script {
     silent_batch: bool,
     /// Every `invoke-card-action-batch` request, as sent.
     batch_requests: Vec<serde_json::Value>,
+    /// Issue #2399: an `invoke-card-action-batch` is read and the connection
+    /// closed without an answer — a deck that goes away mid-batch.
+    drop_batch: bool,
+    /// Issue #2399: a `Hello` that asks to be followed by a request is read
+    /// and the connection closed — a deck that goes away before a request
+    /// is written.
+    drop_follow_on_hello: bool,
+    /// Issue #2399: an `invoke-card-action-batch` is answered with this
+    /// refusal of the whole request.
+    refuse_batch: Option<&'static str>,
 }
 
 /// A deck whose daemon restarts at its socket as the same build. Every request
@@ -198,6 +208,15 @@ impl RestartingDeck {
                                 if script.lock().unwrap().silent_batch {
                                     std::future::pending::<()>().await;
                                 }
+                                if script.lock().unwrap().drop_batch {
+                                    return;
+                                }
+                            }
+                            if op == "hello"
+                                && request["follow_on"] == true
+                                && script.lock().unwrap().drop_follow_on_hello
+                            {
+                                return;
                             }
                             if op == "stop-agent" {
                                 script.lock().unwrap().stop_requests.push(request.clone());
@@ -277,6 +296,13 @@ impl RestartingDeck {
                                         .unwrap_or_else(|| {
                                             AttachResponse::with_id("m-config".into())
                                         })
+                                } else if let Some(refusal) = script
+                                    .lock()
+                                    .unwrap()
+                                    .refuse_batch
+                                    .filter(|_| op == "invoke-card-action-batch")
+                                {
+                                    AttachResponse::err(refusal)
                                 } else {
                                     with_live(serve(&op), live)
                                 };
@@ -1477,4 +1503,155 @@ async fn a_card_batch_the_deck_never_answers_ends_unknown_at_its_bound_and_is_no
         "the preview's bound is the round trip's: {waited:?}"
     );
     assert_eq!(deck.script.lock().unwrap().batch_requests.len(), 2);
+}
+
+/// Two batch entries for agents `1` and `2`, as their preview on process `a`
+/// answered them.
+fn batch_entries() -> Vec<dot_agent_deck::agent_cards::CardBatchEntry> {
+    ["1", "2"]
+        .iter()
+        .map(|id| dot_agent_deck::agent_cards::CardBatchEntry {
+            pane_id: format!("pane-{id}"),
+            agent_id: (*id).to_string(),
+            action_token: "token".into(),
+            instance_id: "a".into(),
+        })
+        .collect()
+}
+
+/// Scenario (issue #2399): the user sends "Go ahead" to two agents on a deck
+/// that reads the batch request and then closes the connection without
+/// answering. Each agent's result is "unknown" with a sentence saying the
+/// connection broke after the request was sent and it is not known whether
+/// the agent got it, never "failed"; the request was sent once and not again.
+#[tokio::test]
+async fn a_card_batch_whose_connection_breaks_after_sending_ends_unknown_and_is_not_resent() {
+    use dot_agent_deck::agent_cards::CardBatchMode;
+    let _selection = crate::dto::SELECTION_LOCK.lock().await;
+    let deck = RestartingDeck::start("batch-dropped", "a");
+    deck.script.lock().unwrap().drop_batch = true;
+    let _local = select(&deck);
+    let state = DesktopState::default();
+    let wire = crate::dto::deck_wire_id(&deck.endpoint());
+    state
+        .daemon
+        .trusted(&deck.endpoint())
+        .await
+        .expect("precondition: the deck is trusted");
+
+    let result = crate::agent_card_invoke_batch_on(
+        &state,
+        &wire,
+        "a",
+        "go",
+        CardBatchMode::Execute,
+        "batch-dropped-1",
+        batch_entries(),
+    )
+    .await
+    .expect("an execution whose connection broke still answers each entry");
+
+    assert_eq!(result.request_id, "batch-dropped-1");
+    let agents: Vec<_> = result
+        .entries
+        .iter()
+        .map(|entry| entry.agent_id.as_str())
+        .collect();
+    assert_eq!(agents, ["1", "2"], "every entry sent is answered");
+    for entry in &result.entries {
+        assert_eq!(entry.outcome, crate::CARD_BATCH_UNKNOWN, "{entry:?}");
+        assert_eq!(
+            entry.code.as_deref(),
+            Some(crate::CODE_CARD_BATCH_CONNECTION_LOST)
+        );
+        let message = entry.message.as_deref().unwrap_or_default();
+        assert!(
+            message.starts_with("the connection to the deck broke after the request was sent")
+                && message.contains("not known whether this agent got it"),
+            "{message}"
+        );
+        assert!(!message.contains("nothing was sent"), "{message}");
+    }
+    let script = deck.script.lock().unwrap();
+    assert_eq!(
+        script.batch_requests.len(),
+        1,
+        "the batch is not sent again"
+    );
+    assert_eq!(script.batch_requests[0]["mode"], "execute");
+}
+
+/// Scenario (issue #2399): the user sends "Go ahead" to two agents on a deck
+/// that closes the connection on the `Hello` the batch would follow, so the
+/// request is never written. Each agent's result is "failed", saying nothing
+/// was sent, and no batch request reached the deck. A deck that reads the
+/// request and refuses it whole also answers each agent "failed": it ran none.
+#[tokio::test]
+async fn a_card_batch_refused_before_sending_fails_and_sends_nothing() {
+    use dot_agent_deck::agent_cards::{BATCH_FAILED, CardBatchMode};
+    let _selection = crate::dto::SELECTION_LOCK.lock().await;
+    let deck = RestartingDeck::start("batch-unsent", "a");
+    let _local = select(&deck);
+    let state = DesktopState::default();
+    let wire = crate::dto::deck_wire_id(&deck.endpoint());
+    state
+        .daemon
+        .trusted(&deck.endpoint())
+        .await
+        .expect("precondition: the deck is trusted");
+    deck.script.lock().unwrap().drop_follow_on_hello = true;
+
+    let result = crate::agent_card_invoke_batch_on(
+        &state,
+        &wire,
+        "a",
+        "go",
+        CardBatchMode::Execute,
+        "batch-unsent-1",
+        batch_entries(),
+    )
+    .await
+    .expect("an execution that was not sent still answers each entry");
+    assert_eq!(result.entries.len(), 2);
+    for entry in &result.entries {
+        assert_eq!(entry.outcome, BATCH_FAILED, "{entry:?}");
+        assert_eq!(entry.code.as_deref(), Some(crate::CODE_CARD_BATCH_NOT_SENT));
+        let message = entry.message.as_deref().unwrap_or_default();
+        assert!(message.ends_with("; nothing was sent"), "{message}");
+    }
+    assert!(
+        deck.script.lock().unwrap().batch_requests.is_empty(),
+        "no batch request was written"
+    );
+
+    // Control: the same deck reads the request and refuses it whole.
+    {
+        let mut script = deck.script.lock().unwrap();
+        script.drop_follow_on_hello = false;
+        script.refuse_batch = Some("invoke-card-action-batch: request_invalid");
+    }
+    let result = crate::agent_card_invoke_batch_on(
+        &state,
+        &wire,
+        "a",
+        "go",
+        CardBatchMode::Execute,
+        "batch-unsent-2",
+        batch_entries(),
+    )
+    .await
+    .expect("a refused execution still answers each entry");
+    for entry in &result.entries {
+        assert_eq!(entry.outcome, BATCH_FAILED, "{entry:?}");
+        assert_eq!(
+            entry.code.as_deref(),
+            Some(crate::CODE_CARD_BATCH_DECK_REFUSED)
+        );
+        let message = entry.message.as_deref().unwrap_or_default();
+        assert!(
+            message.contains("request_invalid") && message.ends_with("; nothing was delivered"),
+            "{message}"
+        );
+    }
+    assert_eq!(deck.script.lock().unwrap().batch_requests.len(), 1);
 }

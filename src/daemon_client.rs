@@ -4457,6 +4457,16 @@ impl DaemonClient {
     /// `Hello` on the same connection advertised
     /// [`crate::daemon_protocol::CAP_AGENT_CARDS_BATCH`]**, answering
     /// [`GatedQuery::Unsupported`] without sending anything.
+    ///
+    /// What a failure means depends on when it happened, as for
+    /// [`Self::restart_daemon`]. Up to and including the `Hello` on the
+    /// connection the request goes out on, the request was not sent: those
+    /// failures are themselves. From the first byte of the request on, the
+    /// daemon may run it whatever becomes of the reply, so a broken connection
+    /// and a cut-off, unreadable or empty reply are all
+    /// [`ClientError::Unanswered`]. A daemon's refusal of the whole request
+    /// ([`ClientError::Server`]) is an answer: the daemon checks a batch before
+    /// it runs any entry.
     pub async fn invoke_card_action_batch(
         &self,
         instance_id: &str,
@@ -4482,7 +4492,8 @@ impl DaemonClient {
                 entries,
             },
         )
-        .await?;
+        .await
+        .map_err(|error| ClientError::Unanswered(error.to_string()))?;
         if !resp.ok {
             return Err(ClientError::Server(
                 resp.error
@@ -4492,7 +4503,7 @@ impl DaemonClient {
         resp.card_action_batch
             .map(GatedQuery::Answered)
             .ok_or_else(|| {
-                ClientError::Malformed("invoke-card-action-batch answered no result".into())
+                ClientError::Unanswered("invoke-card-action-batch answered no result".into())
             })
     }
 

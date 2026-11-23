@@ -16915,6 +16915,13 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 - **Asserts:** while held, the dialog stays in Sending and `Escape` is refused; after the bound's answer, each agent's row reads "No answer" with the sentence that the deck may still deliver it, never "Failed", "Nothing was sent" or "Sent to all"; the execution is not sent again; `Escape` closes the results and a new batch's preview can start (#2399 re-review).
 - **Does not assert:** the bound itself, which the Rust transport test `a_card_batch_the_deck_never_answers_ends_unknown_at_its_bound_and_is_not_resent` in `desktop/src-tauri/src/restart_binding_tests.rs` pins against a fake deck that takes the request and never answers.
 
+##### desktop/agent-cards/039 — An execution that fails in a way the desktop cannot place ends as "No answer", not "Failed".
+
+- **Test:** vitest `desktop/agent-cards/039: …` in `desktop/src/components/AgentCardsBatch.test.tsx`.
+- **Layer:** desktop overview (jsdom), stubbed batch bridge whose execution rejects (an error the desktop bridge did not turn into per-entry outcomes).
+- **Asserts:** each agent's row reads "No answer" with the error and the sentence that it is not known whether the agent got it, never "Failed" or "Nothing was sent"; the execution is not sent again (#2399 re-review).
+- **Does not assert:** the bridge's own classification of a failure before or after the request was written, which the Rust transport tests `a_card_batch_whose_connection_breaks_after_sending_ends_unknown_and_is_not_resent` and `a_card_batch_refused_before_sending_fails_and_sends_nothing` in `desktop/src-tauri/src/restart_binding_tests.rs` pin.
+
 ## Desktop native driver scenarios
 
 These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[spec]` scanner, and run in CI's advisory `desktop-driver` job. `docs/develop/desktop-gui.md` ("The driver tier") describes the harness.

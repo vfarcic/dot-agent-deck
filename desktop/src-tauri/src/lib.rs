@@ -2201,14 +2201,45 @@ pub(crate) fn card_batch_no_answer_message(waited: Duration) -> String {
     )
 }
 
+/// The code an executed entry carries beside [`CARD_BATCH_UNKNOWN`] when the
+/// connection broke after the request was sent: the daemon closed it, the
+/// reply was cut off, or it could not be read.
+pub(crate) const CODE_CARD_BATCH_CONNECTION_LOST: &str = "connection_lost";
+/// The code an executed entry carries beside `failed` when the request never
+/// left the desktop: the deck could not be reached, its `Hello` failed, or the
+/// desktop refused it before sending.
+pub(crate) const CODE_CARD_BATCH_NOT_SENT: &str = "not_sent";
+/// The code an executed entry carries beside `failed` when the daemon refused:
+/// the `Hello` the request would have followed, or the whole request, which
+/// it checks before it runs any entry.
+pub(crate) const CODE_CARD_BATCH_DECK_REFUSED: &str = "deck_refused";
+
+/// What an executed entry says when the connection broke after the request
+/// was sent (`detail` is the transport's own words).
+pub(crate) fn card_batch_connection_lost_message(detail: &str) -> String {
+    format!(
+        "the connection to the deck broke after the request was sent ({detail}), so it is not known whether this agent got it. Check the agent before sending again"
+    )
+}
+
 /// [`agent_card_invoke_batch`] minus the webview.
 ///
 /// The daemon's answer is waited for at most [`card_batch_reply_timeout`].
-/// When that runs out, a preview fails (it sent nothing), and an execution
-/// answers every entry it sent [`CARD_BATCH_UNKNOWN`]: the request reached the
-/// daemon, which may be delivering it still, so "not sent" would be a claim
-/// nobody can make. Nothing is sent again: the user decides, from the cards,
-/// whether to.
+/// A preview sends nothing, so any failure is an error. An execution answers
+/// every entry, and which outcome depends on whether the request left:
+///
+/// - before it was written (the deck could not be reached or trusted, its
+///   `Hello` failed, it is a successor of the daemon that listed the cards),
+///   and when the daemon refused the whole request, every entry is `failed`:
+///   no entry ran.
+/// - after it was written (the connection broke, the reply was cut off or
+///   unreadable, or the bound ran out) every entry is [`CARD_BATCH_UNKNOWN`]:
+///   the daemon may have delivered it, or be delivering it still, so "not
+///   sent" would be a claim nobody can make. The client says which by
+///   answering [`ClientError::Unanswered`] for every failure after the first
+///   byte of the request.
+///
+/// Nothing is sent again: the user decides, from the cards, whether to.
 async fn agent_card_invoke_batch_on(
     state: &DesktopState,
     deck_id: &str,
@@ -2218,9 +2249,7 @@ async fn agent_card_invoke_batch_on(
     request_id: &str,
     entries: Vec<dot_agent_deck::agent_cards::CardBatchEntry>,
 ) -> Result<dot_agent_deck::agent_cards::CardBatchResult, String> {
-    let scope = crate::dto::DeckScope::resolve(Some(deck_id))?;
-    let daemon = state.daemon.trusted(scope.endpoint()).await?;
-    daemon.require_compatible()?;
+    use dot_agent_deck::agent_cards::CardBatchMode;
     let every =
         |outcome: &str, code: &str, message: &str| dot_agent_deck::agent_cards::CardBatchResult {
             request_id: request_id.to_string(),
@@ -2231,12 +2260,28 @@ async fn agent_card_invoke_batch_on(
                     agent_id: entry.agent_id.clone(),
                     outcome: outcome.into(),
                     code: Some(code.into()),
-                    message: Some(message.into()),
+                    message: Some(safe_message(message)),
                     ..Default::default()
                 })
                 .collect(),
         };
     let failed = dot_agent_deck::agent_cards::BATCH_FAILED;
+    // The request was not written: a preview fails, an execution's entries
+    // are each `failed` with `code`.
+    let not_sent = |code: &str, error: &str| match mode {
+        CardBatchMode::Preview => Err(safe_message(error)),
+        CardBatchMode::Execute => Ok(every(failed, code, &format!("{error}; nothing was sent"))),
+    };
+    let daemon = match crate::dto::DeckScope::resolve(Some(deck_id)) {
+        Ok(scope) => match state.daemon.trusted(scope.endpoint()).await {
+            Ok(daemon) => daemon,
+            Err(error) => return not_sent(CODE_CARD_BATCH_NOT_SENT, &error),
+        },
+        Err(error) => return not_sent(CODE_CARD_BATCH_NOT_SENT, &error),
+    };
+    if let Err(error) = daemon.require_compatible() {
+        return not_sent(CODE_CARD_BATCH_NOT_SENT, &error);
+    }
     let deadline = card_batch_reply_timeout(mode, entries.len());
     let reply = daemon.client.invoke_card_action_batch(
         instance_id,
@@ -2254,14 +2299,40 @@ async fn agent_card_invoke_batch_on(
                 "the deck's daemon was restarted after these cards were read; nothing was sent",
             ));
         }
-        Ok(Err(error)) => return Err(safe_message(error.to_string())),
+        Ok(Err(ClientError::Unanswered(detail))) => {
+            return match mode {
+                CardBatchMode::Preview => Err(safe_message(format!(
+                    "the connection to the deck broke during the preview ({detail})"
+                ))),
+                CardBatchMode::Execute => Ok(every(
+                    CARD_BATCH_UNKNOWN,
+                    CODE_CARD_BATCH_CONNECTION_LOST,
+                    &card_batch_connection_lost_message(&detail),
+                )),
+            };
+        }
+        // The daemon refused the `Hello` or the request: either way it ran no
+        // entry, though the request itself may have reached it.
+        Ok(Err(error @ ClientError::Server(_))) => {
+            return match mode {
+                CardBatchMode::Preview => Err(safe_message(error.to_string())),
+                CardBatchMode::Execute => Ok(every(
+                    failed,
+                    CODE_CARD_BATCH_DECK_REFUSED,
+                    &format!("{error}; nothing was delivered"),
+                )),
+            };
+        }
+        // Every failure after the request's first byte is `Unanswered`, so
+        // what is left failed before it: connecting, or the `Hello`.
+        Ok(Err(error)) => return not_sent(CODE_CARD_BATCH_NOT_SENT, &error.to_string()),
         Err(_) => {
             return match mode {
-                dot_agent_deck::agent_cards::CardBatchMode::Preview => Err(safe_message(format!(
+                CardBatchMode::Preview => Err(safe_message(format!(
                     "the daemon took the connection but did not answer the preview within {}s",
                     deadline.as_secs()
                 ))),
-                dot_agent_deck::agent_cards::CardBatchMode::Execute => Ok(every(
+                CardBatchMode::Execute => Ok(every(
                     CARD_BATCH_UNKNOWN,
                     CODE_CARD_BATCH_NO_ANSWER,
                     &card_batch_no_answer_message(deadline),

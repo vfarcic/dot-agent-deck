@@ -38,6 +38,8 @@ const NO_BATCH_BRIDGE = "This window cannot send an action to several agents at 
 const NOTHING_SELECTED = "No card is selected.";
 /** …when the batch on screen is asked to close while it is being sent: its results would be lost while the daemons still act. */
 export const BATCH_STILL_SENDING = "The batch is still being sent, so it stays open: the result for each agent shows here when every daemon has answered.";
+/** What follows the error on each agent's row when a batch's execution failed in a way the desktop could not place before or after the request left. */
+export const BATCH_NOT_KNOWN = "it is not known whether this agent got it. Check the agent before sending again";
 /** …when another batch is asked for while one is being sent. */
 export const ANOTHER_BATCH_SENDING = "A batch is still being sent; wait for its results before starting another.";
 
@@ -562,8 +564,12 @@ export function useAgentCardsView({ runtime, decks, openAgent, openReference, hi
           });
           return { deckId: group.deckId, instanceId: group.instanceId, entries: answer.entries };
         } catch (cause) {
-          const message = cause instanceof Error ? cause.message : String(cause);
-          return { deckId: group.deckId, instanceId: group.instanceId, entries: included.map((entry) => ({ pane_id: entry.pane_id, agent_id: entry.agent_id, outcome: "failed", message })) };
+          /* The bridge answers every entry for each failure it can place,
+             before the request left (`failed`) or after (`unknown`). What
+             reaches here it could not place, so no entry says it was not
+             sent: whether it was is not known. */
+          const message = `${cause instanceof Error ? cause.message : String(cause)}; ${BATCH_NOT_KNOWN}`;
+          return { deckId: group.deckId, instanceId: group.instanceId, entries: included.map((entry) => ({ pane_id: entry.pane_id, agent_id: entry.agent_id, outcome: "unknown", message })) };
         }
       })).then((results) => {
         batchSending.current = false;
