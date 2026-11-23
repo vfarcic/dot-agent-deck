@@ -2178,3 +2178,96 @@ fn journal_restore_034_an_unrecorded_fence_survives_its_daemon() {
     );
     drop(other);
 }
+
+/// The fence markers in the state directory's claims folder, as written.
+fn fence_markers(state: &Path) -> Vec<Value> {
+    let dir = state.join("restore-claims");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    entries
+        .map(|entry| entry.expect("a claims folder entry"))
+        .filter(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            name.starts_with("fence-") && name.ends_with(".json")
+        })
+        .map(|entry| serde_json::from_slice(&std::fs::read(entry.path()).unwrap()).unwrap())
+        .collect()
+}
+
+/// Scenario: Two scripted Claudes ran in conversations of their own, in folders of their own. After a restart into a daemon that can neither prove a stop, record a failure, nor rewrite a fence it placed, restoring the first comes back in the second one's conversation and leaves a child running, so it is refused not-stopped, and only the fence written before the agent started is on disk. After that daemon restarts with the child still running, restoring the second from the new daemon and from a second one is refused session-in-use, and once the child is gone it restores.
+#[cfg(target_os = "linux")]
+#[spec("journal/restore/035")]
+#[test]
+fn journal_restore_035_a_fence_written_before_the_spawn_survives_every_later_write_failing() {
+    let mut decks = Decks::start();
+    let first = decks.start_pane("restore-prespawn-a-035");
+    // Every later fresh start is in a conversation of its own.
+    std::fs::write(decks.root.join("session-taken"), "").unwrap();
+    let folder = decks.folder("restore-prespawn-b-035");
+    let second = decks.start_pane_with("restore-prespawn-b-035", &folder, &decks.command());
+    assert_eq!(first["session"], SESSION, "premise: {first}");
+    let reported = string(&second, "session");
+    assert_ne!(reported, SESSION, "premise: {second}");
+    let first = string(&decks.attempt(&string(&first, "agent")), "attempt");
+    let second = string(&decks.attempt(&string(&second, "agent")), "attempt");
+    decks.restart_with(&[
+        ("DOT_AGENT_DECK_TEST_RESTORE_SKIP_SWEEP", "1"),
+        ("DOT_AGENT_DECK_TEST_RESTORE_REFUSE_FAILURE", "1"),
+        ("DOT_AGENT_DECK_TEST_RESTORE_REFUSE_NARROW", "1"),
+    ]);
+    let other = decks.another_daemon();
+    let first_id = string(&decks.item_for(&first), "id");
+    let second_id = string(&decks.item_for(&second), "id");
+    // The first comes back in the second's conversation and leaves a child.
+    std::fs::write(decks.root.join("wrong-session"), &reported).unwrap();
+    std::fs::write(decks.root.join("survive-stop"), "").unwrap();
+    let reply = final_reply(&decks, restore_request(&first_id, &first));
+    assert_refused(&reply, &first, "not-stopped");
+    let survivor = survivor(&decks, "survivor.json");
+    for sentinel in ["wrong-session", "survive-stop"] {
+        std::fs::remove_file(decks.root.join(sentinel)).unwrap();
+    }
+    assert!(
+        journal::all(&journal::lines(&decks.state), "restore_failed", |_| true).is_empty(),
+        "premise: the failure could not be recorded"
+    );
+    let markers = fence_markers(&decks.state);
+    assert_eq!(markers.len(), 1, "premise: one fence: {markers:?}");
+    let marker = &markers[0];
+    assert!(
+        marker["pid"].is_null() && marker["to"].is_null(),
+        "premise: never narrowed to the agent it started: {marker}"
+    );
+    assert!(marker["pane"].is_string(), "{marker}");
+    assert_eq!(marker["unknown"], true, "{marker}");
+    assert_eq!(marker["sessions"], json!([SESSION]), "{marker}");
+    // The daemon that ran the restore goes away; the fence does not.
+    decks.restart();
+    assert!(
+        running(survivor.pid, survivor.start),
+        "premise: it outlives the daemon"
+    );
+    for daemon in [&decks.live, &other] {
+        let reply = final_reply_on(daemon, restore_request(&second_id, &second));
+        assert_refused(&reply, &second, "session-in-use");
+    }
+    assert_eq!(decks.starts().len(), 3, "nothing more started");
+    assert!(decks.inbox(None).is_empty(), "nothing was sent");
+    let (pid, start) = (survivor.pid, survivor.start);
+    drop(survivor);
+    assert!(
+        common::wait_until(common::load_scaled(Duration::from_secs(10)), || {
+            !running(pid, start)
+        }),
+        "the test's own child is gone"
+    );
+    let reply = final_reply_on(&other, restore_request(&second_id, &second));
+    assert_eq!(
+        restored_count(&reply),
+        1,
+        "the fence lifts once its agent is gone: {reply}"
+    );
+    assert!(fence_markers(&decks.state).is_empty(), "and is removed");
+    drop(other);
+}

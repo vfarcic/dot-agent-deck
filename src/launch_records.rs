@@ -148,6 +148,12 @@ pub struct LaunchRecord {
     /// reads it, so a later process given the same pid is not taken for it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid_start: Option<u64>,
+    /// PRD #1790 round 6: the pane the agent was started in, so a restore's
+    /// fence placed before the spawn can find the agent it started.
+    /// Absent from the file when unknown, and from every record written
+    /// before it existed (still schema v1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane: Option<String>,
 }
 
 /// PRD #1790 stage 3: why [`process_gone`] cannot say the agent a record
@@ -684,6 +690,7 @@ mod tests {
             ts_ms,
             pid: None,
             pid_start: None,
+            pane: None,
         }
     }
 

@@ -190,6 +190,8 @@ pub use unix::{
     process_start_of, process_table, process_table_async, send_sigterm_to_child_group,
     terminate_child_with_grace_and_wait, terminate_pid,
 };
+#[cfg(unix)]
+pub(crate) use unix::{answer_signal_request, signal_group};
 #[cfg(windows)]
 pub use windows::{
     AgentProcessGroup, PinnedProcess, current_ppid, executable_of, force_kill_child_and_wait,

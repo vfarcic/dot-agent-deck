@@ -1721,6 +1721,7 @@ fn a_dismissal_of_items_with_oversized_names_fits_its_reply() {
                     ts_ms: 1,
                     pid: None,
                     pid_start: None,
+                    pane: None,
                 },
             )
             .expect("write a launch record");

@@ -61,32 +61,117 @@ pub(crate) fn pid_to_pgid(pid: u32) -> Option<libc::pid_t> {
     }
 }
 
+/// PRD #1790 round 6 (B2): what [`signal_child_pgroup_or_fallback`] has
+/// asked of the child it is about to signal, for the moment it reads that
+/// child's pid. A child whose numeric signals are held by an authority (a
+/// restored agent's, `agent_pty::SignalAuthority`) sends the signal itself,
+/// with that authority held, from its `process_id`
+/// ([`answer_signal_request`]), and then answers no pid, so the pid it is
+/// sent to is read and signalled in one hold of the authority.
+#[derive(Clone, Copy)]
+enum SignalRequest {
+    Idle,
+    Asked(libc::c_int),
+    Answered(bool),
+}
+
+thread_local! {
+    static SIGNAL_REQUEST: std::cell::Cell<SignalRequest> =
+        const { std::cell::Cell::new(SignalRequest::Idle) };
+}
+
+/// Puts the thread's signal request back to idle however the pid read ends,
+/// a panic included, so a later ordinary pid read is never taken for one.
+struct RequestReset;
+
+impl Drop for RequestReset {
+    fn drop(&mut self) {
+        SIGNAL_REQUEST.set(SignalRequest::Idle);
+    }
+}
+
+/// PRD #1790 round 6 (B2): answer the signal [`signal_child_pgroup_or_fallback`]
+/// asked for while it reads a child's pid, when it is asking: `send` sends
+/// it and says whether it landed, as that function would. `false` when no
+/// signal is being asked for: the pid read is an ordinary one.
+pub(crate) fn answer_signal_request(send: impl FnOnce(libc::c_int) -> bool) -> bool {
+    let SignalRequest::Asked(signal) = SIGNAL_REQUEST.get() else {
+        return false;
+    };
+    // Answered before `send` runs, so a pid it reads is an ordinary read.
+    SIGNAL_REQUEST.set(SignalRequest::Answered(true));
+    let landed = send(signal);
+    SIGNAL_REQUEST.set(SignalRequest::Answered(landed));
+    true
+}
+
+/// PRD #1790 round 6 (B2): send `signal` to the process group `pid` leads,
+/// as [`signal_child_pgroup_or_fallback`] does once it has the pid; for a
+/// child that sends its own signals ([`answer_signal_request`]). A pid that
+/// cannot name a group is not signalled, and answers `false`.
+pub(crate) fn signal_group(pid: u32, signal: libc::c_int, phase: &'static str) -> bool {
+    let Some(pgid) = pid_to_pgid(pid) else {
+        tracing::warn!(
+            pid,
+            signal,
+            phase = %phase,
+            "signal_group: pgid unavailable; nothing was signalled"
+        );
+        return false;
+    };
+    killpg_reporting(pgid, signal, phase)
+}
+
+/// `killpg(pgid, signal)`, answering `true` when it fired or the group was
+/// already gone (`ESRCH`), and `false` (logged) on any other error.
+fn killpg_reporting(pgid: libc::pid_t, signal: libc::c_int, phase: &'static str) -> bool {
+    // SAFETY: `killpg(2)` is async-signal-safe; the pgid was validated via
+    // `pid_to_pgid` and is the child's own PID (portable-pty `setsid`'d it,
+    // making it the group leader), so this cannot affect any other agent's
+    // group.
+    let rc = unsafe { libc::killpg(pgid, signal) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        let benign = err.raw_os_error() == Some(libc::ESRCH);
+        if !benign {
+            tracing::warn!(pgid, signal, phase = %phase, error = %err, "killpg failed");
+        }
+        return benign;
+    }
+    true
+}
+
 /// Low-level shared helper. Send `signal` to the child's process group,
 /// falling back to `portable_pty::Child::kill` when `pid_to_pgid` rejects the
 /// raw pid (F1-followup defensive boundary check). `phase` is included in
 /// `tracing::warn!` payloads so a wedged child can be traced back to whichever
 /// phase issued the kill. Returns `true` if the `killpg` syscall actually fired
 /// (or the `child.kill` fallback was used), `false` if the syscall reported an
-/// error other than ESRCH.
+/// error other than ESRCH. A child that sends its own signals answers the
+/// request while its pid is read ([`answer_signal_request`]), and its answer
+/// is returned.
 fn signal_child_pgroup_or_fallback(
     child: &mut Box<dyn portable_pty::Child + Send + Sync>,
     signal: libc::c_int,
     phase: &'static str,
 ) -> bool {
-    let raw_pid = child.process_id();
-    let Some(raw) = raw_pid else {
-        // PRD #1790 round 5 (N1): a child with no pid is one whose signals
-        // were retired (`AgentPtyRegistry::disarm_child`), whose `kill`
-        // sends nothing. Nothing is signalled by number.
-        tracing::debug!(signal, phase = %phase, "no pid: the child's signals are retired");
-        let _ = child.kill();
-        return true;
+    let raw_pid = {
+        let _reset = RequestReset;
+        SIGNAL_REQUEST.set(SignalRequest::Asked(signal));
+        let raw_pid = child.process_id();
+        if let SignalRequest::Answered(landed) = SIGNAL_REQUEST.get() {
+            return landed;
+        }
+        raw_pid
     };
-    let pgid = pid_to_pgid(raw);
+    let pgid = raw_pid.and_then(pid_to_pgid);
     let Some(pgid) = pgid else {
         // PRD #92 F8 followup (auditor #2 — option b documented):
-        // pid_to_pgid rejected the raw pid (it was outside the safe
-        // `(0, i32::MAX]` range). The `(0, i32::MAX]` boundary check is defense-in-depth against a future
+        // pid_to_pgid rejected the raw pid (either `process_id()` returned
+        // `None` or the pid was outside the safe `(0, i32::MAX]` range). The
+        // portable-pty `Child` trait allows `None` here, but the Unix backend
+        // used by this codebase always returns `Some` in practice. The
+        // `(0, i32::MAX]` boundary check is defense-in-depth against a future
         // portable-pty bug; on real Linux/macOS PIDs it never fails. The
         // fallback below uses `portable_pty::Child::kill`, which sends SIGHUP
         // — strictly weaker than the requested `signal` (typically SIGTERM or
@@ -100,25 +185,13 @@ fn signal_child_pgroup_or_fallback(
             ?raw_pid,
             signal,
             phase = %phase,
-            reason = "pid_to_pgid-rejected",
+            reason = if raw_pid.is_none() { "process_id-returned-none" } else { "pid_to_pgid-rejected" },
             "signal_child_pgroup_or_fallback: pgid unavailable — falling back to portable_pty::Child::kill (SIGHUP, single-PID; descendants will leak)"
         );
         let _ = child.kill();
         return true;
     };
-    // SAFETY: `killpg(2)` is async-signal-safe; the pgid we just validated via
-    // `pid_to_pgid` is the child's own PID (portable-pty `setsid`'d it, making
-    // it the group leader), so this cannot affect any other agent's group.
-    let rc = unsafe { libc::killpg(pgid, signal) };
-    if rc != 0 {
-        let err = std::io::Error::last_os_error();
-        let benign = err.raw_os_error() == Some(libc::ESRCH);
-        if !benign {
-            tracing::warn!(pgid, signal, phase = %phase, error = %err, "killpg failed");
-        }
-        return benign;
-    }
-    true
+    killpg_reporting(pgid, signal, phase)
 }
 
 /// Forcefully terminate the child *and every descendant in its process group*

@@ -11253,35 +11253,95 @@ pub enum DispatchDirRefusal {
     BeingRemoved(PathBuf),
 }
 
-/// PRD #1790 round 5 (N1): a child whose signals are retired
-/// ([`AgentPtyRegistry::disarm_child`]). It answers no process id and its
-/// `kill` sends nothing, so every teardown path that would signal it — a
-/// close, a retried close of an unconfirmed child, a shutdown — signals
-/// nothing (`signal_child_pgroup_or_fallback` falls back to `kill` without a
-/// pid); waiting for and reaping it go to the child it wraps.
+/// PRD #1790 round 6 (B2): the authority over every numeric signal the
+/// registry sends one restored agent's child, held by that child
+/// ([`UnderAuthority`]) wherever it is: in the registry, or checked out of it
+/// by a close, a retried close or a shutdown. Each of those signals is sent
+/// with the authority held, its pid read in the same hold. A restore's stop
+/// holds it across its identity-checked sweep and then retires it
+/// ([`Self::retire_after`]), so a concurrent teardown either signalled
+/// before the sweep began or finds the signals retired and sends nothing.
+#[cfg(unix)]
+#[derive(Debug, Default)]
+pub(crate) struct SignalAuthority {
+    retired: std::sync::Mutex<bool>,
+    /// The same, for an ordinary pid read, which never waits for a sweep.
+    retired_seen: AtomicBool,
+}
+
+#[cfg(unix)]
+impl SignalAuthority {
+    fn hold(&self) -> std::sync::MutexGuard<'_, bool> {
+        self.retired.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Run `sweep` with the authority held, then retire every numeric
+    /// signal of the child before letting it go. Answers the sweep's answer.
+    pub(crate) fn retire_after<T>(&self, sweep: impl FnOnce() -> T) -> T {
+        let mut held = self.hold();
+        let out = sweep();
+        *held = true;
+        self.retired_seen.store(true, Ordering::SeqCst);
+        out
+    }
+
+    /// Whether the signals are retired, without waiting for the authority.
+    fn retired(&self) -> bool {
+        self.retired_seen.load(Ordering::SeqCst)
+    }
+}
+
+/// PRD #1790 round 6 (B2): a child whose numeric signals go through a
+/// [`SignalAuthority`]. Every registry teardown signal reaches it through
+/// `signal_child_pgroup_or_fallback`, which asks for the signal while it
+/// reads the pid; this child sends it itself, holding the authority
+/// (nothing once retired), and answers no pid. Its own `kill` is held the
+/// same way. An ordinary pid read answers the pid until the signals are
+/// retired, and none after. Waiting for and reaping go to the child it
+/// wraps.
 #[cfg(unix)]
 #[derive(Debug)]
-struct SignalsRetired(Box<dyn portable_pty::Child + Send + Sync>);
+struct UnderAuthority {
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    authority: Arc<SignalAuthority>,
+}
 
-/// A killer that sends nothing: [`SignalsRetired`]'s, and the stand-in
-/// [`AgentPtyRegistry::disarm_child`] holds for the moment it swaps a child.
+#[cfg(unix)]
+impl UnderAuthority {
+    fn signal(&self, signal: libc::c_int) -> bool {
+        let retired = self.authority.hold();
+        if *retired {
+            tracing::debug!(signal, "the child's signals are retired; nothing was sent");
+            return true;
+        }
+        match self.child.process_id() {
+            Some(pid) => {
+                crate::platform::proc::signal_group(pid, signal, "under-restore-authority")
+            }
+            None => true,
+        }
+    }
+}
+
+/// The stand-in [`AgentPtyRegistry::put_signals_under_authority`] holds for
+/// the moment it wraps a child, under the registry lock: nothing reads it.
 #[cfg(unix)]
 #[derive(Debug)]
-struct NoSignal;
+struct NoChild;
 
 #[cfg(unix)]
-impl portable_pty::ChildKiller for NoSignal {
+impl portable_pty::ChildKiller for NoChild {
     fn kill(&mut self) -> std::io::Result<()> {
         Ok(())
     }
 
     fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
-        Box::new(NoSignal)
+        Box::new(NoChild)
     }
 }
 
 #[cfg(unix)]
-impl portable_pty::Child for NoSignal {
+impl portable_pty::Child for NoChild {
     fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
         Ok(None)
     }
@@ -11295,29 +11355,68 @@ impl portable_pty::Child for NoSignal {
     }
 }
 
+/// [`UnderAuthority`]'s killer, held by the same authority.
 #[cfg(unix)]
-impl portable_pty::ChildKiller for SignalsRetired {
+#[derive(Debug)]
+struct KillerUnderAuthority {
+    killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
+    authority: Arc<SignalAuthority>,
+}
+
+#[cfg(unix)]
+impl portable_pty::ChildKiller for KillerUnderAuthority {
     fn kill(&mut self) -> std::io::Result<()> {
-        Ok(())
+        let retired = self.authority.hold();
+        if *retired {
+            return Ok(());
+        }
+        self.killer.kill()
     }
 
     fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
-        Box::new(NoSignal)
+        Box::new(KillerUnderAuthority {
+            killer: self.killer.clone_killer(),
+            authority: Arc::clone(&self.authority),
+        })
     }
 }
 
 #[cfg(unix)]
-impl portable_pty::Child for SignalsRetired {
+impl portable_pty::ChildKiller for UnderAuthority {
+    fn kill(&mut self) -> std::io::Result<()> {
+        let retired = self.authority.hold();
+        if *retired {
+            return Ok(());
+        }
+        self.child.kill()
+    }
+
+    fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+        Box::new(KillerUnderAuthority {
+            killer: self.child.clone_killer(),
+            authority: Arc::clone(&self.authority),
+        })
+    }
+}
+
+#[cfg(unix)]
+impl portable_pty::Child for UnderAuthority {
     fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
-        self.0.try_wait()
+        self.child.try_wait()
     }
 
     fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
-        self.0.wait()
+        self.child.wait()
     }
 
     fn process_id(&self) -> Option<u32> {
-        None
+        if crate::platform::proc::answer_signal_request(|signal| self.signal(signal)) {
+            return None;
+        }
+        if self.authority.retired() {
+            return None;
+        }
+        self.child.process_id()
     }
 }
 
@@ -16577,6 +16676,7 @@ impl AgentPtyRegistry {
                 // PRD #1790 stage 3: the child's identity, so a restore can
                 // tell whether this agent is gone.
                 child.process_id().map(|pid| (pid, child_started)),
+                journal_pane.clone(),
             )
         });
         let agent = RunningAgent {
@@ -16703,7 +16803,17 @@ impl AgentPtyRegistry {
         // (file I/O, so after the registry lock is released).
         if let (
             Some(work),
-            Some((command, shell, agent_type, cwd, cwd_moved_from, name, membership, identity)),
+            Some((
+                command,
+                shell,
+                agent_type,
+                cwd,
+                cwd_moved_from,
+                name,
+                membership,
+                identity,
+                pane,
+            )),
         ) = (&work, &launch_record)
         {
             self.work.launch_recorded(
@@ -16719,6 +16829,7 @@ impl AgentPtyRegistry {
                     membership: membership.as_ref(),
                     pid: identity.map(|(pid, _)| pid),
                     pid_start: identity.and_then(|(_, started)| started),
+                    pane: pane.as_deref(),
                 },
             );
         }
@@ -19722,38 +19833,32 @@ impl AgentPtyRegistry {
             })
     }
 
+    /// PRD #1790 round 6 (B2): put every numeric signal this registry sends
+    /// `id`'s child under a new [`SignalAuthority`], and answer that child's
+    /// pid and start time as it was spawned ([`RunningAgent::child_started`])
+    /// with the authority, read in the same hold of the registry. The
+    /// authority goes with the child wherever a teardown takes it. `None`
+    /// when `id` is not a running agent now.
+    #[cfg(unix)]
+    pub(crate) fn put_signals_under_authority(
+        &self,
+        id: &str,
+    ) -> Option<(u32, Option<u64>, Arc<SignalAuthority>)> {
+        let mut inner = self.inner.lock();
+        let agent = inner.agents.get_mut(id)?;
+        let pid = agent.child.process_id()?;
+        let authority = Arc::new(SignalAuthority::default());
+        let child = std::mem::replace(&mut agent.child, Box::new(NoChild));
+        agent.child = Box::new(UnderAuthority {
+            child,
+            authority: Arc::clone(&authority),
+        });
+        Some((pid, agent.child_started, authority))
+    }
+
     /// PRD #1666 part 3, round 5-wake: the pid of `id`'s child and when that
     /// child started, read as it was spawned ([`RunningAgent::child_started`]),
     /// so a caller can tell the child from a later process reusing its pid.
-    /// PRD #1790 round 5 (N1): retire every signal this registry would send
-    /// `id`'s child from now on ([`SignalsRetired`]), whether it is running or
-    /// its close left its exit unconfirmed. A restore's stop calls this once
-    /// its identity-checked sweep has ended, so the close after it reaps and
-    /// retires the agent without signalling a process group by a number the
-    /// sweep may have seen pass to another process. `false` when the registry
-    /// holds no child for `id` now.
-    #[cfg(unix)]
-    pub(crate) fn disarm_child(&self, id: &str) -> bool {
-        fn disarm(child: &mut Box<dyn portable_pty::Child + Send + Sync>) {
-            let wrapped = std::mem::replace(child, Box::new(NoSignal));
-            *child = Box::new(SignalsRetired(wrapped));
-        }
-        let mut inner = self.inner.lock();
-        if let Some(agent) = inner.agents.get_mut(id) {
-            disarm(&mut agent.child);
-            return true;
-        }
-        if let Some(pending) = inner
-            .unconfirmed_agents
-            .get_mut(id)
-            .and_then(|entry| entry.child.as_mut())
-        {
-            disarm(&mut pending.child);
-            return true;
-        }
-        false
-    }
-
     pub(crate) fn child_identity(&self, id: &str) -> Option<(u32, Option<u64>)> {
         let inner = self.inner.lock();
         inner

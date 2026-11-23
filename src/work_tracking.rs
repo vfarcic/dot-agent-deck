@@ -110,6 +110,8 @@ pub struct LaunchDetails<'a> {
     /// ([`crate::launch_records::LaunchRecord::pid`]).
     pub pid: Option<u32>,
     pub pid_start: Option<u64>,
+    /// The pane it was started in ([`crate::launch_records::LaunchRecord::pane`]).
+    pub pane: Option<&'a str>,
 }
 
 /// How a generation's end reads in the journal.
@@ -1052,6 +1054,7 @@ impl WorkTracker {
             ts_ms: crate::launch_records::now_ms(),
             pid: launch.pid,
             pid_start: launch.pid.and(launch.pid_start),
+            pane: launch.pane.map(str::to_string),
         };
         if let Err(error) = crate::launch_records::write(state_dir, &record) {
             tracing::warn!(

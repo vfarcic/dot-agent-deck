@@ -618,9 +618,11 @@ fn epoch_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// Every regular file under `dir`, links not followed, whose bytes hold
-/// `needle`, leaving out the agents' own native session storage
-/// (`.claude`, `.codex`). A file that cannot be read is listed too, so it is
+/// Every regular file under `dir`, at any depth and with every directory
+/// scanned (`.claude` and `.codex` included: the agents' own native session
+/// storage lives in the fixture's separate home, not here), links not
+/// followed, whose bytes hold `needle`. It fails closed: a directory, a
+/// directory entry or a file that cannot be read is listed too, so it is
 /// not taken to hold nothing.
 fn files_holding(dir: &Path, needle: &[u8]) -> Vec<PathBuf> {
     let mut found = Vec::new();
@@ -630,12 +632,12 @@ fn files_holding(dir: &Path, needle: &[u8]) -> Vec<PathBuf> {
             found.push(dir);
             continue;
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = entry.file_name();
-            if name == ".claude" || name == ".codex" {
+        for entry in entries {
+            let Ok(entry) = entry else {
+                found.push(dir.clone());
                 continue;
-            }
+            };
+            let path = entry.path();
             let Ok(kind) = entry.file_type() else {
                 found.push(path);
                 continue;
@@ -667,8 +669,9 @@ fn exercise(agent: Agent, name: &str, tui_restore: bool) {
     // Separate random draws: the filename cannot reveal the codename. No
     // prompt asks for the codename to be written anywhere: the
     // acknowledgement holds the fixed text `OK`. Before the recall turn the
-    // test checks that no file in the agent's work folder holds the codename
-    // (a note the agent kept on its own would), and the recall turn's tool
+    // test checks that no regular file anywhere under the agent's work
+    // folder holds the codename (a note the agent kept on its own would;
+    // [`files_holding`]), and the recall turn's tool
     // calls are checked for a visible look into the agent's stored
     // transcript. Together they narrow where the recalled codename can come
     // from; they are not a sandbox proof: a copy outside the work folder, or
@@ -822,8 +825,10 @@ fn exercise(agent: Agent, name: &str, tui_restore: bool) {
     let recall = format!(
         "What is the project codename I told you earlier in this conversation? Please write just the codename into the file {recall_name} using your shell tool, answering from our conversation without looking anything up. Then finish your turn."
     );
-    // Round 5 (audit suggestion on 331efc9c): nothing in the work folder
-    // holds the codename the recall turn could read instead of remembering.
+    // Round 5 (audit suggestion on 331efc9c), round 6: no regular file
+    // anywhere under the work folder, `.claude` and `.codex` included, holds
+    // the codename the recall turn could read instead of remembering; one
+    // that cannot be read counts as holding it ([`files_holding`]).
     let copies = files_holding(&fixture.repo, word.as_bytes());
     assert!(
         copies.is_empty(),
@@ -888,7 +893,7 @@ fn exercise(agent: Agent, name: &str, tui_restore: bool) {
     // success or panic. No process-name kill, host session or credential edit.
 }
 
-/// Scenario: In an attached TUI, a real interactive Haiku is told a unique project codename and writes an acknowledgement, then the test stops its daemon by pid and starts a replacement sharing the same state directory and isolated HOME. The person presses I, s and c to restore and continue; the agent receives the restart note first and, with no copy of the codename in any file of its work folder and no visible look into its stored transcript, writes the codename into a new file without rewriting its acknowledgement, while its new journal attempt keeps the old session id and the named card shows a live status.
+/// Scenario: In an attached TUI, a real interactive Haiku is told a unique project codename and writes an acknowledgement, then the test stops its daemon by pid and starts a replacement sharing the same state directory and isolated HOME. The person presses I, s and c to restore and continue; the agent receives the restart note first and, with no copy of the codename in any regular file anywhere under its work folder and no visible look into its stored transcript, writes the codename into a new file without rewriting its acknowledgement, while its new journal attempt keeps the old session id and the named card shows a live status.
 #[spec("journal/restore/016")]
 #[test]
 fn journal_restore_016_real_claude_recalls_its_conversation_after_tui_restore() {
@@ -897,7 +902,7 @@ fn journal_restore_016_real_claude_recalls_its_conversation_after_tui_restore() 
     exercise(Agent::Claude, "haiku-016", true);
 }
 
-/// Scenario: A real interactive Codex on the harness's cheap mini model is told a unique project codename under an attached TUI before its daemon is stopped by pid. After restart, a human CLI restore with --continue --yes brings back the same native session, delivers the restart note before the recall request, and, with no copy of the codename in any file of its work folder and no visible look into its stored transcript, writes the codename into a new file while leaving the first acknowledgement unchanged and showing a live named card.
+/// Scenario: A real interactive Codex on the harness's cheap mini model is told a unique project codename under an attached TUI before its daemon is stopped by pid. After restart, a human CLI restore with --continue --yes brings back the same native session, delivers the restart note before the recall request, and, with no copy of the codename in any regular file anywhere under its work folder and no visible look into its stored transcript, writes the codename into a new file while leaving the first acknowledgement unchanged and showing a live named card.
 #[spec("journal/restore/017")]
 #[test]
 // Quarantined (CLAUDE.md rule 6): Codex sends its first hook only with its
