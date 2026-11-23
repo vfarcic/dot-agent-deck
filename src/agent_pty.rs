@@ -3827,6 +3827,15 @@ fn pump_reader(
         );
         termination
     });
+    // Issue #1965: an orchestration role that exited on its own keeps how its
+    // pane ended and what it last showed, so both clients can say which role
+    // died and why instead of losing it with the live records.
+    if registered_at_eof
+        && let (Some(registry), Some(termination)) = (registry.upgrade(), termination.as_ref())
+    {
+        registry.record_pane_ending(&agent_id, Some(termination.wire()));
+        registry.announce_ended_role(&agent_id);
+    }
     // PRD #1889: the attempt this generation was ends, as the deck observed
     // it. Best effort at a shutdown: this thread is detached, and the next
     // run's startup recovery ends whatever it did not reach.
@@ -4100,6 +4109,12 @@ pub struct RunningAgent {
     /// accepted from the generation's own child, under the same-user trust
     /// boundary (`crate::hook_provenance`), not one only the wrapper can make.
     pub wrapper_child_exit: Option<String>,
+    /// Issue #1965: how this generation's pane ended and the last lines it
+    /// showed, settled once by its reader after EOF for an orchestration role
+    /// ([`AgentPtyRegistry::record_pane_ending`]). Read by
+    /// [`AgentPtyRegistry::ended_roles`] while the exited entry stays
+    /// registered.
+    pub ending: Option<crate::ended_role::PaneEnding>,
     /// PRD #1666 part 3, round 5-wake (plan rev 2 §6): what removed this
     /// generation, shared with its reader, which reads it once the stream
     /// ends.
@@ -9117,6 +9132,11 @@ pub struct AgentPtyRegistry {
     /// publishes the agent, so no agent can join the registry after the
     /// snapshot the client confirmed. See [`Self::freeze_admission`].
     admission_frozen: AtomicBool,
+    /// Issue #2110: spaces the `clear = true` restarts of the delegate path,
+    /// so workers handed tasks together do not all start in one second. One
+    /// per daemon, since the provider limit it spreads is the account's. See
+    /// [`crate::role_start_pacing`].
+    role_start_pacer: crate::role_start_pacing::RoleStartPacer,
     /// Issue #424 F1 + PRD #1631: what each pane's input box is holding — the
     /// human-input sequence [`Self::user_typed_since_question`] reads, and each
     /// pane's input stream, whose paste framing and turn clock
@@ -9183,6 +9203,10 @@ pub struct AgentPtyRegistry {
     /// registry with no owning daemon (in-process unit tests), in which case
     /// no injection happens and children resolve the endpoint the old way.
     hook_socket: Mutex<Option<PathBuf>>,
+    /// Issue #1965: where an orchestration role's exit is announced
+    /// ([`crate::event::BroadcastMsg::RoleEnded`]). `None` for a registry with
+    /// no owning daemon (in-process unit tests), where nothing is announced.
+    ended_role_broadcast: Mutex<Option<tokio::sync::broadcast::Sender<crate::event::BroadcastMsg>>>,
     /// PRD #1589 D8: the attach endpoint this registry's daemon serves, pinned
     /// into every child as `DOT_AGENT_DECK_ATTACH_SOCKET` so an agent's
     /// attach-socket call (`close`, `daemon stop`, `list-agents`) reaches the
@@ -9490,6 +9514,26 @@ pub(crate) const FAULT_SPAWN_BEFORE_PUBLISH: &str = "spawn-before-publish";
 /// PRD #1666 part 3, round 5: a spawn's fault point before its reservation:
 /// `Fail` makes it fail ((f1)'s seam).
 pub(crate) const FAULT_SPAWN_FAILS: &str = "spawn-fails";
+
+/// TEST knob, read only by a build with the `e2e` feature: every fresh spawn
+/// waits this many milliseconds before it starts, as the first installed
+/// spawn of a daemon does while it copies its editor helper (issue #2421), so
+/// a test can make a client's start outlast the client's bound on its reply.
+/// A respawn does not wait.
+pub const ENV_TEST_SPAWN_DELAY_MS: &str = "DOT_AGENT_DECK_TEST_SPAWN_DELAY_MS";
+
+#[cfg(feature = "e2e")]
+fn test_spawn_delay() -> Option<Duration> {
+    std::env::var(ENV_TEST_SPAWN_DELAY_MS)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+}
+
+#[cfg(not(feature = "e2e"))]
+fn test_spawn_delay() -> Option<Duration> {
+    None
+}
 
 /// PRD #1666 part 3, round 5: the replacement's abort fault point: `Fail`
 /// drops its ticket with no transition ((f5a)'s seam).
@@ -11587,6 +11631,7 @@ impl AgentPtyRegistry {
             change_notify: Arc::new(Notify::new()),
             shutting_down: AtomicBool::new(false),
             admission_frozen: AtomicBool::new(false),
+            role_start_pacer: crate::role_start_pacing::RoleStartPacer::default(),
             pane_input: Arc::new(Mutex::new(PaneInputState::default())),
             held_display: Arc::new(Notify::new()),
             pty_write_stall_bound_ms: AtomicU64::new(PTY_WRITE_STALL_BOUND.as_millis() as u64),
@@ -11612,6 +11657,7 @@ impl AgentPtyRegistry {
                     .unwrap_or(REPAINT_NUDGE_GAP.as_millis() as u64),
             ),
             hook_socket: Mutex::new(None),
+            ended_role_broadcast: Mutex::new(None),
             attach_endpoint: Mutex::new(AttachEndpoint::NotConfigured),
             dispatched_units: crate::lock_rank::RankedMutex::new(
                 crate::dispatched_units::DispatchedUnits::default(),
@@ -15281,6 +15327,12 @@ impl AgentPtyRegistry {
         self.detach_count.load(Ordering::Relaxed)
     }
 
+    /// Issue #2110: the daemon's pacer for worker starts. See
+    /// [`crate::role_start_pacing`].
+    pub fn role_start_pacer(&self) -> &crate::role_start_pacing::RoleStartPacer {
+        &self.role_start_pacer
+    }
+
     /// Spawn a new agent and return its registry id.
     pub fn spawn_agent(self: &Arc<Self>, opts: SpawnOptions<'_>) -> Result<String, AgentPtyError> {
         self.spawn_agent_with_dir(opts, None, Admission::Fresh)
@@ -15383,6 +15435,13 @@ impl AgentPtyRegistry {
         // reservation ((f1)'s seam).
         if self.fault_point(FAULT_SPAWN_FAILS) {
             return Err(AgentPtyError::Spawn("injected spawn failure (test)".into()));
+        }
+        // Issue #2421's test seam: a fresh spawn as slow as a first installed
+        // one on a loaded machine.
+        if matches!(admission, Admission::Fresh)
+            && let Some(delay) = test_spawn_delay()
+        {
+            std::thread::sleep(delay);
         }
 
         // Capture the caller-supplied `DOT_AGENT_DECK_PANE_ID` *before*
@@ -16395,6 +16454,7 @@ impl AgentPtyRegistry {
             child_role,
             child_started,
             wrapper_child_exit: None,
+            ending: None,
             removal,
             input_mode: Arc::default(),
             ingress: crate::ingress_ledger::IngressLedger::new(),
@@ -17564,6 +17624,8 @@ impl AgentPtyRegistry {
             child_started: _,
             // The replacement's wrapper reports its own child's exit.
             wrapper_child_exit: _,
+            // The replacement's reader settles its own pane's ending.
+            ending: _,
             // Held by the ticket above, which settles it.
             removal: _,
             // The replacement's evidence starts empty.
@@ -19584,6 +19646,140 @@ impl AgentPtyRegistry {
             }))
     }
 
+    /// Issue #1965: settle how `agent_id`'s pane ended and the last lines its
+    /// screen showed, for an orchestration role whose entry is still
+    /// registered. Called once by the pane's reader after EOF, off any async
+    /// runtime: replaying the scrollback costs up to tens of milliseconds for
+    /// a full ring (`crate::pane_screen_text`), which is paid with no registry
+    /// lock held. A second call, an entry a close already removed, and a pane
+    /// that is no orchestration role leave everything as it was.
+    pub fn record_pane_ending(
+        &self,
+        agent_id: &str,
+        termination: Option<crate::inbox_display::PaneTermination>,
+    ) {
+        let (bytes, rows, cols) = {
+            let inner = self.inner.lock();
+            let Some(agent) = inner.agents.get(agent_id) else {
+                return;
+            };
+            if agent.ending.is_some()
+                || !matches!(
+                    agent.tab_membership,
+                    Some(TabMembership::Orchestration { .. })
+                )
+            {
+                return;
+            }
+            (agent.bus.snapshot(), agent.pty_rows, agent.pty_cols)
+        };
+        let last_output = crate::pane_screen_text::visible_tail_lines(
+            &bytes,
+            rows,
+            cols,
+            crate::ended_role::MAX_LAST_OUTPUT_LINES,
+        );
+        let mut inner = self.inner.lock();
+        if let Some(agent) = inner.agents.get_mut(agent_id)
+            && agent.ending.is_none()
+        {
+            agent.ending = Some(crate::ended_role::PaneEnding {
+                termination,
+                last_output,
+            });
+        }
+    }
+
+    /// Issue #1965: where [`Self::announce_ended_role`] sends. Installed once
+    /// by the daemon.
+    pub fn set_ended_role_broadcast(
+        &self,
+        tx: tokio::sync::broadcast::Sender<crate::event::BroadcastMsg>,
+    ) {
+        *self.ended_role_broadcast.lock().unwrap() = Some(tx);
+    }
+
+    /// Issue #1965: tell every attached client that `agent_id`'s role exited,
+    /// with what [`Self::record_pane_ending`] settled — the record
+    /// [`Self::ended_roles`] lists for its pane. Nothing for an agent that is no
+    /// longer listed there (closed, handed over, no role, or a live successor
+    /// already in its pane), or with no daemon to send through.
+    pub fn announce_ended_role(&self, agent_id: &str) {
+        let Some(tx) = self.ended_role_broadcast.lock().unwrap().clone() else {
+            return;
+        };
+        if let Some(role) = self
+            .ended_roles()
+            .into_iter()
+            .find(|role| role.agent_id == agent_id)
+        {
+            let _ = tx.send(crate::event::BroadcastMsg::RoleEnded(role));
+        }
+    }
+
+    /// Issue #1965: every orchestration role whose agent exited on its own and
+    /// whose pane is still its own — not closed (a close removes the entry),
+    /// not handed to a successor, and with no live agent under the same pane
+    /// id. These are the roles [`Self::agent_records`] no longer lists, which
+    /// both clients would otherwise lose. Sorted by agent id, as the records
+    /// are.
+    pub fn ended_roles(&self) -> Vec<crate::ended_role::EndedRole> {
+        let inner = self.inner.lock();
+        // One pass, so the listing stays linear in the registry however many
+        // exited entries it holds.
+        let live_panes: std::collections::HashSet<&str> = inner
+            .agents
+            .values()
+            .filter(|other| !other.exited.load(Ordering::SeqCst))
+            .filter_map(|other| other.pane_id_env.as_deref())
+            .collect();
+        let pane_has_live_agent = |pane_id: &str| live_panes.contains(pane_id);
+        let mut ended: Vec<(u64, crate::ended_role::EndedRole)> = inner
+            .agents
+            .iter()
+            .filter(|(_, agent)| agent.exited.load(Ordering::SeqCst) && !agent.pane_handed_over)
+            .filter_map(|(id, agent)| {
+                let pane_id = agent.pane_id_env.as_deref()?;
+                let Some(TabMembership::Orchestration {
+                    name,
+                    role_index,
+                    role_name,
+                    orchestration_id,
+                    display_title,
+                    ..
+                }) = agent.tab_membership.as_ref()
+                else {
+                    return None;
+                };
+                if pane_has_live_agent(pane_id) {
+                    return None;
+                }
+                let ending = agent.ending.clone().unwrap_or_default();
+                Some((
+                    id.parse::<u64>().unwrap_or(0),
+                    crate::ended_role::EndedRole {
+                        pane_id: pane_id.to_string(),
+                        agent_id: id.clone(),
+                        role_index: *role_index,
+                        role_name: role_name.clone(),
+                        orchestration_id: orchestration_id.clone(),
+                        orchestration_name: name.clone(),
+                        display_title: display_title.clone(),
+                        termination: ending.termination,
+                        last_output: ending.last_output,
+                    },
+                ))
+            })
+            .collect();
+        ended.sort_by_key(|(id, _)| *id);
+        // Two exited generations of one pane: the newest says how it ends now.
+        let mut seen = std::collections::HashSet::new();
+        let mut newest_first: Vec<_> = ended.into_iter().rev().map(|(_, role)| role).collect();
+        newest_first.retain(|role| seen.insert(role.pane_id.clone()));
+        newest_first.reverse();
+        newest_first
+    }
+
     /// PRD #1589: the registered agent records, including exited ones, plus
     /// unconfirmed generations, each with whether its child has exited — the
     /// membership a close enumerates, under one acquisition. A close has to see
@@ -20525,6 +20721,7 @@ impl AgentPtyRegistry {
                 child_role: ChildRole::PaneCommand,
                 child_started: None,
                 wrapper_child_exit: None,
+                ending: None,
                 removal: Arc::default(),
                 input_mode: Arc::default(),
                 ingress: crate::ingress_ledger::IngressLedger::new(),
@@ -24245,6 +24442,108 @@ mod spawn_tests {
              that follows must find nothing registered and must not fabricate a crashed record"
         );
 
+        registry.shutdown_all();
+    }
+
+    /// Issue #1965: an orchestration role whose command exits on its own is
+    /// reported by `ended_roles` with the exit code the deck saw and the last
+    /// lines its pane showed; a live role, an exited pane that is no role, and
+    /// a role after its pane is closed are not.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ended_roles_report_an_exited_role_with_its_exit_code_and_last_output() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (tx, mut rx) = tokio::sync::broadcast::channel(64);
+        registry.set_ended_role_broadcast(tx);
+        let role = |command: &'static str, pane: &str, index: usize, name: &str| SpawnOptions {
+            command: Some(command),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.to_string())],
+            tab_membership: Some(TabMembership::Orchestration {
+                name: "mixed".to_string(),
+                role_index: index,
+                role_name: name.to_string(),
+                is_start_role: index == 0,
+                orchestration_cwd: None,
+                display_title: None,
+                orchestration_id: Some("orch-1965".to_string()),
+            }),
+            ..SpawnOptions::default()
+        };
+        registry
+            .spawn_agent(role("cat", "role-pane-0", 0, "coder"))
+            .expect("spawn the live role");
+        let dead_id = registry
+            .spawn_agent(role(
+                "sh -c 'echo ended-role-sentinel-1965; exit 3'",
+                "role-pane-1",
+                1,
+                "reviewer",
+            ))
+            .expect("spawn the role that dies");
+        registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/usr/bin/true"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "plain-pane".to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn a plain pane that exits");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let ended = loop {
+            let ended = registry.ended_roles();
+            if ended.iter().any(|role| role.termination.is_some())
+                || tokio::time::Instant::now() >= deadline
+            {
+                break ended;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(
+            ended.len(),
+            1,
+            "only the exited role is reported: {ended:?}"
+        );
+        let reviewer = &ended[0];
+        assert_eq!(reviewer.pane_id, "role-pane-1");
+        assert_eq!(reviewer.agent_id, dead_id);
+        assert_eq!(reviewer.role_index, 1);
+        assert_eq!(reviewer.role_name, "reviewer");
+        assert_eq!(reviewer.orchestration_id.as_deref(), Some("orch-1965"));
+        assert!(
+            matches!(
+                reviewer.termination,
+                Some(crate::inbox_display::PaneTermination::PaneCommandExited { code: 3, .. })
+            ),
+            "the exit code the deck saw: {:?}",
+            reviewer.termination
+        );
+        assert_eq!(reviewer.reason(), "its command exited (code 3)");
+        assert!(
+            reviewer
+                .last_output
+                .iter()
+                .any(|line| line.contains("ended-role-sentinel-1965")),
+            "the pane's last output: {:?}",
+            reviewer.last_output
+        );
+
+        // Every attached client was told, once, with the same record.
+        let mut announced = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let crate::event::BroadcastMsg::RoleEnded(role) = msg {
+                announced.push(role);
+            }
+        }
+        assert_eq!(
+            announced,
+            vec![reviewer.clone()],
+            "the role_ended broadcast"
+        );
+
+        registry.close_agent(&dead_id).expect("close the dead role");
+        assert!(
+            registry.ended_roles().is_empty(),
+            "a closed role's pane is gone, and so is its report"
+        );
         registry.shutdown_all();
     }
 

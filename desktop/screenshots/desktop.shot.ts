@@ -43,7 +43,7 @@ desktopScenario("antigravity-needs-input", async (page) => {
   });
   await page.goto("/?fixture=1&state=docs-antigravity");
   await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
-  await page.getByRole("button", { name: "Open probe agent" }).click();
+  await page.getByRole("row", { name: "Open probe agent" }).click({ position: { x: 4, y: 4 } });
   await expect(page.getByTestId("agent-pane-overlay")).toBeVisible();
   const tile = page.getByTestId("agent-tile-antigravity");
   await expect(tile).toBeVisible();
@@ -93,14 +93,17 @@ desktopScenario("dashboard-filter", async (page) => {
 // PRD #2374 — desktop-only: the TUI has no cards view. The `docs` state's
 // four agents as the daemon's cards (`docsAgentCards` in the fixture), served
 // only with `cards=1`, shown through the Dashboard's Table | Cards switch.
+// Issue #2418: two roots, the orchestrator's tree opened to show its two roles.
 desktopScenario("agent-cards", async (page) => {
   await page.goto("/?fixture=1&state=docs&cards=1");
   await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
   await page.getByTestId("open-overview").click();
   await page.getByTestId("overview-mode-cards").click();
-  await expect(page.getByTestId("agent-cards-group")).toHaveCount(2);
+  await expect(page.locator("article[data-card-key][data-depth='0']")).toHaveCount(2);
+  await page.getByRole("button", { name: "Open Plan / architecture's tree" }).click();
   await expect(page.locator("article[data-card-key]")).toHaveCount(4);
-  await expect(page.getByTestId("agent-card-primary").first()).toHaveText("Go ahead");
+  await expect(page.getByTestId("agent-card-issue-label").first()).toHaveText("enhancement");
+  await expect(page.getByRole("button", { name: "Close Plan / architecture", exact: true })).toBeVisible();
 });
 
 // PRD #1258 — the same fixed host the TUI `host-metrics` image shows
@@ -118,12 +121,14 @@ desktopScenario("host-metrics", async (page) => {
 });
 
 // PRD #2119 — the Generate config confirmation the TUI `generate-config` image
-// shows, opened from the Plan / architecture row's button: the fixture's
-// `docs-generate` state, whose one agent has a pane.
+// shows, opened from the Plan / architecture agent's pane (issue #2454 took the
+// button off the Dashboard row): the fixture's `docs-generate` state, whose one
+// agent has a pane.
 desktopScenario("generate-config", async (page) => {
   await overview(page, "docs-generate");
   await expect(page.locator(".overview-row")).toHaveCount(1);
-  await page.getByRole("button", { name: "Generate config with Plan / architecture agent" }).click();
+  await page.getByRole("row", { name: "Open Plan / architecture agent" }).click({ position: { x: 4, y: 4 } });
+  await page.getByTestId("agent-pane-overlay").getByRole("button", { name: "Generate config", exact: true }).click();
   const dialog = page.getByRole("alertdialog", { name: "Generate .dot-agent-deck.toml" });
   await expect(dialog).toBeVisible();
   await expect(dialog).toContainText("No orchestration config found for this project.");
@@ -224,7 +229,7 @@ desktopScenario("star-prompt", async (page) => {
 
 desktopScenario("agent-pane", async (page) => {
   await overview(page, "docs");
-  await page.getByRole("button", { name: "Open Desktop implementation agent" }).click();
+  await page.getByRole("row", { name: "Open Desktop implementation agent" }).click({ position: { x: 4, y: 4 } });
   await expect(page.getByTestId("agent-pane-overlay")).toBeVisible();
   await expect(page.locator(".xterm-screen canvas").first()).toBeVisible();
   await expect(page.getByTestId("agent-pane-overlay").getByRole("button", { name: "Close agent", exact: true })).toBeVisible();
@@ -371,7 +376,7 @@ desktopScenario("voice-typing-mode", async (page) => {
   await page.goto("/?fixture=1&state=docs&voice=type%20on");
   await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
   await page.getByTestId("open-overview").click();
-  await page.getByRole("button", { name: "Open Desktop implementation agent" }).click();
+  await page.getByRole("row", { name: "Open Desktop implementation agent" }).click({ position: { x: 4, y: 4 } });
   await expect(page.getByTestId("agent-pane-overlay")).toBeVisible();
   await expect(page.locator(".xterm-screen canvas").first()).toBeVisible();
   await page.getByTestId("voice-trigger").click();
@@ -425,7 +430,7 @@ desktopScenario("voice-question", async (page) => {
   await page.goto("/?fixture=1&state=docs-question&voice=go%20ahead");
   await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
   await page.getByTestId("open-overview").click();
-  await page.getByRole("button", { name: "Open Desktop implementation agent" }).click();
+  await page.getByRole("row", { name: "Open Desktop implementation agent" }).click({ position: { x: 4, y: 4 } });
   await expect(page.getByTestId("agent-pane-overlay")).toBeVisible();
   await expect(page.locator(".xterm-screen canvas").first()).toBeVisible();
   await page.getByTestId("voice-trigger").click();
