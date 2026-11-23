@@ -1212,7 +1212,7 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 
 - **Layer:** L1 `TestBackend` through `run_interrupted_work_seam` (`tests/render_interrupted_work.rs`); list and details. The desktop app's half is in `desktop/src/components/InterruptedWork.test.tsx` and `desktop/e2e/interrupted-work.spec.ts`.
 - **Agent:** none; an injected item with no agents, as a daemon that lists none returns (PR #2497 review, Qodo).
-- **Asserts:** with the daemon restoring agents or not, neither the list's nor the details' hints offer `s`, pressing `s` leaves the frame as it was and sends nothing; in the desktop app the Restore button is absent in both views, `s` opens no question, and a spoken restore opens none and answers `This item lists no agent to restore.`
+- **Asserts:** with the daemon restoring agents or not, neither the list's nor the details' hints offer `s`, pressing `s` leaves the frame as it was and sends nothing; in the desktop app the Restore button is absent in both views, `s` opens no question, and a spoken restore opens none and answers `This item lists no agent to restore.`; a spoken restore of such an item while the details' report page is loading, or a reclaim question waits on its dry run, leaves that view, its pending answer and the selection as they were, and so does one on a daemon that answered it does not restore agents (PR #2497 review, Qodo).
 - **Does not assert:** an item whose agents are all brought back (`journal/restore/043`).
 - **Platform coverage:** mac+linux.
 

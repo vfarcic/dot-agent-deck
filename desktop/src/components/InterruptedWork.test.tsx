@@ -7,7 +7,7 @@ import { createFixtureSnapshot } from "../data/fixture";
 import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, LOCAL_ENDPOINT_SELECTION, type DeckBridge, type DesktopSettingsDto } from "../lib/bridge";
 import { AGENTS_STOPPED_BY_RESTART } from "../lib/agentIdentity";
 import {
-  DISMISSED, INTERRUPTED_UNREAD, INTERRUPTED_WORK_TITLE, LIST_INCOMPLETE, LIST_REFRESH_FAILED, NOTHING_INTERRUPTED, OTHER_AGENTS_GROUP, RECLAIM_KEPT_DIRTY, RECLAIM_REMOVED, RECLAIM_WOULD_REMOVE, NO_AGENT_TO_RESTORE, REFUSED_AMBIGUOUS, REFUSED_INCOMPLETE_READ, REFUSED_NOT_LISTED, dismissAllQuestion, gitFactsLine, interruptedFooter, reportRangeSentence,
+  DISMISSED, INTERRUPTED_UNREAD, INTERRUPTED_WORK_TITLE, LIST_INCOMPLETE, LIST_REFRESH_FAILED, NOTHING_INTERRUPTED, OTHER_AGENTS_GROUP, RECLAIM_KEPT_DIRTY, RECLAIM_REMOVED, RECLAIM_WOULD_REMOVE, NO_AGENT_TO_RESTORE, RESTORE_UNSUPPORTED, INTERRUPTED_WAIT, REFUSED_AMBIGUOUS, REFUSED_INCOMPLETE_READ, REFUSED_NOT_LISTED, dismissAllQuestion, gitFactsLine, interruptedFooter, reportRangeSentence,
   type DismissOutcome, type InterruptedItem, type InterruptedList, type InterruptedReply, type InterruptedShow, type InterruptedTarget, type ReclaimOutcome, type RestoreMode, type RestoreOutcome, type StartOverOutcome,
 } from "../lib/interruptedWork";
 import { VOICE_ACTIONS, INTERRUPTED_RECLAIM_CHECKING, type VoiceOverviewChannel, type VoiceOverviewContext } from "../lib/voiceActions";
@@ -1552,5 +1552,90 @@ describe("journal/restore/044 — an item that lists no agent offers no restore"
     expect(voice.reportRefused).toHaveBeenCalledWith(NO_AGENT_TO_RESTORE);
     expect(within(dialog).queryByTestId("interrupted-restore-question")).toBeNull();
     expect(calls.filter((call) => call.verb === "restore" || call.verb === "start-over")).toEqual([]);
+  });
+});
+
+/** `recordingBridge` whose report pages and reclaim dry runs wait until released, so a spoken ask can arrive while one is pending. */
+function heldPagesBridge(state: { list: InterruptedList }, restore?: () => InterruptedReply<RestoreOutcome>) {
+  const recorded = recordingBridge(state);
+  const base = recorded.bridge as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>;
+  const held: (() => void)[] = [];
+  const hold = <A extends unknown[]>(verb: string) => vi.fn(async (...args: A) => {
+    await new Promise<void>((done) => { held.push(done); });
+    return base[verb](...args);
+  });
+  const bridge = {
+    ...base,
+    interruptedWorkShow: hold("interruptedWorkShow"),
+    interruptedWorkReclaim: hold("interruptedWorkReclaim"),
+    ...(restore ? { interruptedWorkRestore: vi.fn(async () => restore()) } : {}),
+  } as unknown as DeckBridge;
+  return { bridge, calls: recorded.calls, release: async () => { await act(async () => { held.splice(0).forEach((done) => done()); }); } };
+}
+
+const isSelected = (id: string) => rowOf(id).classList.contains("is-selected");
+
+describe("a refused spoken restore leaves the open dialog as it was (PR #2497 review, Qodo)", () => {
+  /** Scenario: open the fix-login unit's details and ask for its reports; while the page is loading, voice asks to restore scratch-shell, an item that lists no agent. The voice surface answers that there is no agent, the report page still arrives, and fix-login stays selected. */
+  it("journal/restore/044 keeps a loading report page and the selection", async () => {
+    const { bridge, calls, release } = heldPagesBridge({ list: three() });
+    const voice = voiced(bridge);
+    render(<voice.Voiced />);
+    const dialog = await openDialog();
+    await act(async () => { fireEvent.click(rowOf(UNIT_ID)); });
+    await act(async () => { fireEvent.click(within(dialog).getByTestId("interrupted-details")); });
+    await act(async () => { fireEvent.click(within(dialog).getByTestId("interrupted-show-reports")); });
+    await act(async () => { VOICE_ACTIONS.askRestoreInterrupted.run(voice.context(), { filterText: "scratch-shell" }); });
+    expect(voice.reportRefused).toHaveBeenCalledWith(NO_AGENT_TO_RESTORE);
+    expect(within(dialog).queryByTestId("interrupted-restore-question")).toBeNull();
+    await release();
+    expect(await within(dialog).findByTestId("interrupted-report-body")).toHaveTextContent("[UNTRUSTED-WORKER-REPORT:");
+    await act(async () => { fireEvent.click(within(dialog).getByTestId("interrupted-back")); });
+    expect(isSelected(UNIT_ID)).toBe(true);
+    expect(isSelected(AGENT_ID)).toBe(false);
+    expect(calls.filter((call) => call.verb === "restore" || call.verb === "start-over")).toEqual([]);
+  });
+
+  /** Scenario: ask to reclaim the fix-login unit; while its dry run is pending, voice asks to restore scratch-shell, an item that lists no agent. The ask is refused with the wait sentence, the reclaim question still gets its dry-run answer, and fix-login stays selected. */
+  it("journal/restore/044 keeps a reclaim question's pending dry run and the selection", async () => {
+    const { bridge, release } = heldPagesBridge({ list: three() });
+    const voice = voiced(bridge);
+    render(<voice.Voiced />);
+    const dialog = await openDialog();
+    await act(async () => { fireEvent.click(rowOf(UNIT_ID)); });
+    await act(async () => { fireEvent.click(within(dialog).getByTestId("interrupted-reclaim")); });
+    await act(async () => { VOICE_ACTIONS.askRestoreInterrupted.run(voice.context(), { filterText: "scratch-shell" }); });
+    expect(voice.reportRefused).toHaveBeenCalledWith(INTERRUPTED_WAIT);
+    expect(within(dialog).queryByTestId("interrupted-restore-question")).toBeNull();
+    await release();
+    expect(await within(dialog).findByTestId("interrupted-reclaim-verdict")).toHaveTextContent(RECLAIM_WOULD_REMOVE);
+    await act(async () => { fireEvent.click(within(dialog).getByTestId("interrupted-back")); });
+    expect(isSelected(UNIT_ID)).toBe(true);
+    expect(isSelected(AGENT_ID)).toBe(false);
+  });
+
+  /** Scenario: a restore answered that the daemon does not restore agents; then, while restore-first's report page is loading in its details, voice asks to restore restore-second. The dialog says the daemon does not restore agents, and the details stay open, get their page, and keep restore-first selected. */
+  it("journal/restore/010 a daemon that does not restore agents keeps a loading report page and the selection", async () => {
+    const state = { list: { items: [desktopRestoreItem("resume", true), desktopRestoreItem("resume")] } };
+    const { bridge, release } = heldPagesBridge(state, () => ({ outcome: "unsupported" }));
+    const voice = voiced(bridge);
+    render(<voice.Voiced />);
+    const dialog = await openDialog();
+    await act(async () => { fireEvent.click(rowOf(AGENT_ID)); });
+    await restoreKey(dialog, "s");
+    await waitFor(() => expect(within(dialog).getByTestId("interrupted-restore-question")).toHaveAttribute("data-presented", "true"));
+    await restoreKey(dialog, "c");
+    await waitFor(() => expect(within(dialog).getByTestId("interrupted-message")).toHaveTextContent(RESTORE_UNSUPPORTED));
+    await act(async () => { fireEvent.click(rowOf(UNIT_ID)); });
+    await act(async () => { fireEvent.click(within(dialog).getByTestId("interrupted-details")); });
+    await act(async () => { fireEvent.click(within(dialog).getByTestId("interrupted-show-reports")); });
+    await act(async () => { VOICE_ACTIONS.askRestoreInterrupted.run(voice.context(), { filterText: "restore-second" }); });
+    expect(voice.reportRefused).toHaveBeenCalledWith(RESTORE_UNSUPPORTED);
+    expect(within(dialog).getByTestId("interrupted-message")).toHaveTextContent(RESTORE_UNSUPPORTED);
+    await release();
+    expect(await within(dialog).findByTestId("interrupted-report-body")).toHaveTextContent("[UNTRUSTED-WORKER-REPORT:");
+    await act(async () => { fireEvent.click(within(dialog).getByTestId("interrupted-back")); });
+    expect(isSelected(UNIT_ID)).toBe(true);
+    expect(isSelected(AGENT_ID)).toBe(false);
   });
 });

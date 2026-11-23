@@ -359,16 +359,22 @@ export function InterruptedWorkDialog({ deckLabel, deck, target, runtime, contro
     if (busy) return INTERRUPTED_WAIT;
     const chosen = resolve(said);
     if (typeof chosen === "string") return chosen;
+    /*
+     * PR #2497 review: every refusal is decided before anything changes, as
+     * in `reclaim`, so a refused ask leaves the open view, its pending dry run
+     * or report page, and the selection as they were. An item that lists no
+     * agent has nothing to ask about (the TUI's `s` does nothing for one); a
+     * daemon that does not restore agents is only said, since a click has no
+     * other place to hear it.
+     */
+    if (!hasRestoreAgent(chosen)) return NO_AGENT_TO_RESTORE;
+    if (deck.restoreUnsupported) {
+      setMessage(RESTORE_UNSUPPORTED);
+      return RESTORE_UNSUPPORTED;
+    }
     abandonDryRun();
     ops.current.show = undefined;
     setSelectedId(chosen.id);
-    if (deck.restoreUnsupported) {
-      setMessage(RESTORE_UNSUPPORTED);
-      setView(LIST);
-      return RESTORE_UNSUPPORTED;
-    }
-    /* PR #2497 review: an item that lists no agent has nothing to ask about; the TUI's `s` does nothing for one. */
-    if (!hasRestoreAgent(chosen)) return NO_AGENT_TO_RESTORE;
     setMessage(undefined);
     const agent = restoreAgent(chosen);
     setView({ kind: "restore", id: chosen.id, attempt: agent?.attempt, name: agent ? agentName(agent, chosen) : itemName(chosen), verdict: agent?.restore ?? { kind: "unknown" } });
