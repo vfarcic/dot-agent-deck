@@ -56,9 +56,7 @@ use super::filter::grounded_filter_text;
 use super::meaning::{Ballot, MeaningRequest, MeaningVerdict, Place, Strictness, every_action};
 use super::resolver::IntentStep;
 use super::resolver::{IntentAnswer, IntentError, IntentRequest, IntentResolver};
-use super::schema::{
-    DECK_HIDDEN_HINT, LABELS_WITHHELD_HINT, annotate_for, hidden_by_flag, needs_labels,
-};
+use super::schema::{LABELS_WITHHELD_HINT, annotate_for, needs_labels};
 use super::table::{CommandRow, CommandTable, ParamKind, Requirement, Screen, spoken_words};
 use super::{
     DesktopAgent, Transcript, VoiceChoice, VoiceDeck, VoiceDictationTarget, VoiceDirectories,
@@ -878,20 +876,6 @@ impl VoiceOutcome {
         }
     }
 
-    /// The action exists and needs names the voice settings withhold (PRD
-    /// #1223, audit finding A1) — [`VoiceOutcome::unavailable`]'s shape with
-    /// [`LABELS_WITHHELD_HINT`] in place of the row's own hint.
-    /// Issue #1198 — a pick of the row whose screen the experimental flag
-    /// hides, refused with [`DECK_HIDDEN_HINT`] rather than dispatched.
-    fn hidden_by_flag(transcript: Transcript, row: &CommandRow) -> Self {
-        Self::Unavailable {
-            sentence: format!("Not here — {DECK_HIDDEN_HINT}."),
-            action: row.id.clone(),
-            hint: DECK_HIDDEN_HINT.to_string(),
-            transcript,
-        }
-    }
-
     /// PRD #1541 — a typing-mode prompt command asked for outside typing mode:
     /// [`VoiceOutcome::unavailable`]'s shape with [`TYPING_MODE_FIRST_HINT`]
     /// in place of the row's own hint, and a sentence that is not "Not here",
@@ -912,6 +896,9 @@ impl VoiceOutcome {
         }
     }
 
+    /// The action exists and needs names the voice settings withhold (PRD
+    /// #1223, audit finding A1) — [`VoiceOutcome::unavailable`]'s shape with
+    /// [`LABELS_WITHHELD_HINT`] in place of the row's own hint.
     fn labels_withheld(transcript: Transcript, row: &CommandRow) -> Self {
         Self::Unavailable {
             sentence: format!("Not here — {LABELS_WITHHELD_HINT}."),
@@ -1031,7 +1018,6 @@ pub async fn handle_utterance(
         // The deck SHOWN — the experimental configuration, and the one the
         // phrase fixtures and this module's tests resolve against. The shipped
         // app calls `handle_utterance_with` with the flag's own answer.
-        true,
     )
     .await
 }
@@ -1059,14 +1045,6 @@ pub async fn handle_utterance(
 /// question about the screen, not about what the model was told. That is also
 /// why the command table still carries a `callable` flag per row, and the
 /// voice panel's disclosure says so.
-///
-/// # `show_deck` (issue #1198)
-///
-/// `false` while the experimental flag hides the deck: the row that goes there
-/// is offered `callable: false` with [`DECK_HIDDEN_HINT`], and picked anyway it
-/// is [`VoiceOutcome::Unavailable`] with that hint. Held to the transcript
-/// first, like every row, so a pick the user did not ask for is still answered
-/// as that. `desktop_voice_resolve` passes `features::show_desktop_deck()`.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_utterance_with(
     resolver: &dyn IntentResolver,
@@ -1078,7 +1056,6 @@ pub async fn handle_utterance_with(
     new_agent: Option<&VoiceNewAgent>,
     transcript: Transcript,
     labels: LabelSharing,
-    show_deck: bool,
 ) -> VoiceResult {
     handle_utterance_with_dictation(
         resolver,
@@ -1091,7 +1068,6 @@ pub async fn handle_utterance_with(
         None,
         transcript,
         labels,
-        show_deck,
     )
     .await
 }
@@ -1116,7 +1092,6 @@ pub async fn handle_utterance_with_dictation(
     dictation: Option<&VoiceDictationTarget>,
     transcript: Transcript,
     labels: LabelSharing,
-    show_deck: bool,
 ) -> VoiceResult {
     handle_utterance_with_modes(
         resolver,
@@ -1130,7 +1105,6 @@ pub async fn handle_utterance_with_dictation(
         VoiceReadingState::default(),
         transcript,
         labels,
-        show_deck,
     )
     .await
 }
@@ -1159,7 +1133,6 @@ pub async fn handle_utterance_with_modes(
     reading: VoiceReadingState,
     transcript: Transcript,
     labels: LabelSharing,
-    show_deck: bool,
 ) -> VoiceResult {
     let backend = resolver.backend_name();
     let finish = |outcome, resolve_ms| VoiceResult {
@@ -1208,7 +1181,6 @@ pub async fn handle_utterance_with_modes(
         new_agent,
         transcript,
         labels,
-        show_deck,
     )
     .await
 }
@@ -1248,7 +1220,6 @@ pub async fn handle_utterance_after_local_intercepts(
         new_agent,
         transcript,
         LabelSharing::Shared,
-        true,
     )
     .await
 }
@@ -1268,7 +1239,6 @@ async fn after_local_intercepts(
     new_agent: Option<&VoiceNewAgent>,
     transcript: Transcript,
     labels: LabelSharing,
-    show_deck: bool,
 ) -> VoiceResult {
     let withheld = labels == LabelSharing::Withheld;
     let backend = resolver.backend_name();
@@ -1278,7 +1248,7 @@ async fn after_local_intercepts(
         backend,
     };
 
-    let commands = annotate_for(table, screen, directories, new_agent, labels, show_deck);
+    let commands = annotate_for(table, screen, directories, new_agent, labels);
     // Every deck, including the ones a new agent cannot start on (issue
     // #1491): the Daemon selector switches to any of them, so the model has
     // to see them all to answer `switch_deck` with the one the user meant.
@@ -1360,7 +1330,6 @@ async fn after_local_intercepts(
                     directories,
                     new_agent,
                     withheld,
-                    show_deck,
                 };
                 let outcome = one_of_outcome(&context, transcript, &rows).await;
                 return result(outcome, Some(millis(started.elapsed())));
@@ -1376,7 +1345,6 @@ async fn after_local_intercepts(
                     directories,
                     new_agent,
                     withheld,
-                    show_deck,
                 };
                 let outcome = chain_outcome(&context, transcript, &rows).await;
                 return result(outcome, Some(millis(started.elapsed())));
@@ -1421,7 +1389,6 @@ async fn after_local_intercepts(
         new_agent,
         transcript: &transcript,
         withheld,
-        show_deck,
         answer: &answer,
         row,
     };
@@ -1501,7 +1468,6 @@ struct ChainContext<'c> {
     directories: Option<&'c VoiceDirectories>,
     new_agent: Option<&'c VoiceNewAgent>,
     withheld: bool,
-    show_deck: bool,
 }
 
 /// The words of a refusal after its "Heard: “…” — " and without its full
@@ -1544,7 +1510,6 @@ async fn settle_step(
         new_agent: context.new_agent,
         transcript: &said,
         withheld: context.withheld,
-        show_deck: context.show_deck,
         answer: &answer,
         row,
     };
@@ -1869,7 +1834,6 @@ struct Picked<'p> {
     new_agent: Option<&'p VoiceNewAgent>,
     transcript: &'p Transcript,
     withheld: bool,
-    show_deck: bool,
     answer: &'p IntentAnswer,
     row: &'p CommandRow,
 }
@@ -1887,7 +1851,6 @@ fn decide(picked: &Picked<'_>, judged: &Judged<'_>) -> VoiceOutcome {
         directories,
         new_agent,
         withheld,
-        show_deck,
         answer,
         row,
         ..
@@ -1921,8 +1884,8 @@ fn decide(picked: &Picked<'_>, judged: &Judged<'_>) -> VoiceOutcome {
     // for.
     if !asked
         && read_as.is_none()
-        && !((hidden_by_flag(row, show_deck) || !row.callable(screen, directories, new_agent))
-            && redirect_targets(table, row, transcript.text(), show_deck)
+        && !(!row.callable(screen, directories, new_agent)
+            && redirect_targets(table, row, transcript.text())
                 .into_iter()
                 .any(|target| judged.reaches(target)))
     {
@@ -1938,36 +1901,6 @@ fn decide(picked: &Picked<'_>, judged: &Judged<'_>) -> VoiceOutcome {
     // pick is not one for the row that runs instead, and a `no` or a missing
     // answer for that row refuses (PRD #1733's audit, A1).
     let reaches = |target: &CommandRow| judged.reaches(target);
-
-    // Issue #1198: the deck is hidden, so the row that goes there is refused
-    // with that reason — ahead of the screen check, whose own hint ("opens
-    // from the rail") would name a door the rail does not have.
-    if hidden_by_flag(row, show_deck) {
-        // A bare "go back" with the Daemons screen hidden is `close`'s, which
-        // its own description already says ("a bare go back means THIS one
-        // ONLY when `open_deck` is not callable") and which the model was
-        // measured ignoring for that sentence — 3 times in 8 on `main`, every
-        // time once issue #1495 lengthened `open_agent`'s description. Only
-        // for words that name nothing the Daemons screen alone is (so "back to
-        // the deck" still hears why it is hidden) and that the meaning check
-        // finds ask for `close`, so this reaches nothing those words could
-        // not.
-        if let Some(close) = table.row(CLOSE_ROW).filter(|close| {
-            !names_the_daemons_screen(transcript.text())
-                && close.callable(screen, directories, new_agent)
-                && reaches(close)
-        }) {
-            return VoiceOutcome::Dispatch {
-                sentence: report(close, &[]),
-                transcript,
-                action: close.id.clone(),
-                invoke: close.invoke.clone(),
-                params: Vec::new(),
-                then_submit: false,
-            };
-        }
-        return VoiceOutcome::hidden_by_flag(transcript, row);
-    }
 
     // The screen AND the row's `requires` (PRD #1223): a directory row picked
     // with the dialog closed, or `go_to_parent` at a root, is refused here with
@@ -2009,11 +1942,7 @@ fn decide(picked: &Picked<'_>, judged: &Judged<'_>) -> VoiceOutcome {
         // here ([`go_up_elsewhere`]).
         if let Some(target) = go_up_elsewhere(&row.id, transcript.text())
             .and_then(|id| table.row(id))
-            .filter(|target| {
-                target.callable(screen, directories, new_agent)
-                    && !hidden_by_flag(target, show_deck)
-                    && reaches(target)
-            })
+            .filter(|target| target.callable(screen, directories, new_agent) && reaches(target))
         {
             return VoiceOutcome::Dispatch {
                 sentence: report(target, &[]),
@@ -2035,11 +1964,7 @@ fn decide(picked: &Picked<'_>, judged: &Judged<'_>) -> VoiceOutcome {
             .unavailable_redirects
             .as_deref()
             .and_then(|id| table.row(id))
-            .filter(|target| {
-                target.callable(screen, directories, new_agent)
-                    && !hidden_by_flag(target, show_deck)
-                    && reaches(target)
-            })
+            .filter(|target| target.callable(screen, directories, new_agent) && reaches(target))
         else {
             return VoiceOutcome::unavailable(transcript, row);
         };
@@ -4635,7 +4560,7 @@ impl Judged<'_> {
     }
 }
 
-/// The rows a pick of `row` that cannot run here (or is hidden) may be
+/// The rows a pick of `row` that cannot run here may be
 /// answered as instead: `close` for a "go back" to the Daemons screen or a
 /// close of the pull request page; the other half of a bare "go up"
 /// ([`go_up_elsewhere`]); and the row's `unavailable_redirects` target.
@@ -4643,10 +4568,9 @@ fn redirect_targets<'t>(
     table: &'t CommandTable,
     row: &CommandRow,
     text: &str,
-    show_deck: bool,
 ) -> Vec<&'t CommandRow> {
     let mut targets = Vec::new();
-    if row.id == OPEN_DECK_ROW || row.id == OPEN_PR_ROW || hidden_by_flag(row, show_deck) {
+    if row.id == OPEN_DECK_ROW || row.id == OPEN_PR_ROW {
         targets.extend(table.row(CLOSE_ROW));
     }
     targets.extend(go_up_elsewhere(&row.id, text).and_then(|id| table.row(id)));
@@ -7627,7 +7551,6 @@ fn word_subset(reference_words: &BTreeSet<String>, name: &str) -> bool {
 mod tests {
     use super::*;
 
-    use crate::voice::schema::DECK_HIDDEN_HINT;
     /// The labels of an ambiguous resolver answer, or `None` for any other —
     /// what the assertions written before PRD #1261 carried candidates as.
     trait AmbiguousLabels {
@@ -10446,7 +10369,6 @@ mod tests {
             new_agent,
             Transcript::new(said),
             labels,
-            true,
         )
         .await
         .outcome
@@ -15127,7 +15049,6 @@ mod tests {
                 Some(&target),
                 Transcript::new(said),
                 LabelSharing::Shared,
-                true,
             )
             .await;
             assert!(
@@ -15179,7 +15100,6 @@ mod tests {
             Some(&typing_target()),
             Transcript::new(said),
             LabelSharing::Shared,
-            true,
         )
         .await
     }
@@ -15420,7 +15340,6 @@ mod tests {
                 None,
                 Transcript::new(said),
                 LabelSharing::Withheld,
-                true,
             )
             .await;
             assert!(
@@ -15455,7 +15374,6 @@ mod tests {
             None,
             Transcript::new(said),
             LabelSharing::Withheld,
-            true,
         )
         .await;
         assert!(
@@ -15612,7 +15530,6 @@ mod tests {
                 Some(&target),
                 Transcript::new(said),
                 LabelSharing::Shared,
-                true,
             )
             .await;
             assert_eq!(
@@ -15649,7 +15566,6 @@ mod tests {
                     Some(&target),
                     Transcript::new(said),
                     LabelSharing::Shared,
-                    true,
                 )
                 .await
                 .outcome
@@ -17003,67 +16919,10 @@ mod tests {
         assert!(outcome.is_dispatch(), "{outcome:?}");
     }
 
-    /// Scenario: on the overview with the deck hidden (issue #1198), the user
-    /// says "take me back to the deck" and the model answers `open_deck`
-    /// anyway. It is refused as unavailable, naming the flag, rather than
-    /// dispatched — and a pick the user did not ask for is still refused as
-    /// that first. A bare "go back" picked the same way closes what is on top
-    /// instead, since it names nothing the hidden screen alone is.
-    #[tokio::test]
-    async fn voice_outcome_refuses_the_deck_while_it_is_hidden() {
-        // Every sentence here is read as asking for the Daemons screen and
-        // for closing what is on top, except "open docs", which asks for
-        // neither.
-        let ask = |said: &'static str| async move {
-            let resolver = StubResolver::new()
-                .answering(said, IntentAnswer::new("open_deck"))
-                .judging_everything(said != "open docs");
-            handle_utterance_with(
-                &resolver,
-                table(),
-                Screen::Overview,
-                &fleet(),
-                &decks(),
-                None,
-                None,
-                Transcript::new(said),
-                LabelSharing::Shared,
-                false,
-            )
-            .await
-            .outcome
-        };
-        let outcome = ask("take me back to the deck").await;
-        assert_eq!(
-            outcome,
-            VoiceOutcome::Unavailable {
-                sentence: format!("Not here — {DECK_HIDDEN_HINT}."),
-                action: "open_deck".to_string(),
-                hint: DECK_HIDDEN_HINT.to_string(),
-                transcript: Transcript::new("take me back to the deck"),
-            }
-        );
-        assert!(
-            matches!(ask("open docs").await, VoiceOutcome::ActionUngrounded { action, .. } if action == "open_deck")
-        );
-        // A bare "go back" names nothing the Daemons screen alone is, and with
-        // that screen hidden it is `close`'s — which `close`'s description
-        // already says and the model was measured ignoring (issue #1495).
-        for said in ["go back", "take me back"] {
-            assert!(
-                matches!(&ask(said).await, VoiceOutcome::Dispatch { action, .. } if action == "close"),
-                "{said:?}"
-            );
-        }
-        assert!(matches!(
-            ask("back to the terminals").await,
-            VoiceOutcome::Unavailable { action, .. } if action == "open_deck"
-        ));
-    }
-
-    /// Scenario: the five phrase fixtures the A1 fix turned red (2026-10-20):
-    /// "go back" picked as the hidden Daemons screen, and four daemon choices
-    /// picked as the Daemon selector over the open New agent dialog. Each
+    /// Scenario: four of the phrase fixtures the A1 fix turned red
+    /// (2026-10-20): daemon choices picked as the Daemon selector over the open
+    /// New agent dialog (the fifth, "go back" picked as the hidden Daemons
+    /// screen, went with that screen's flag in issue #1308). Each
     /// reaches its target only by the target's own `yes`, so both votes list
     /// the target in the words those sentences ask for — going back for
     /// `close`, choosing which daemon to use for `choose_deck` — under
@@ -17075,42 +16934,31 @@ mod tests {
         let form = new_agent_form();
         let cases = [
             (
-                "go back",
-                IntentAnswer::new("open_deck"),
-                None,
-                false,
-                CLOSE_ROW,
-            ),
-            (
                 "use the build box deck",
                 IntentAnswer::new("switch_deck").with_param("deck", "build box"),
                 Some(&VoiceNewAgent { form: None }),
-                true,
                 "choose_deck",
             ),
             (
                 "switch to the local deck",
                 IntentAnswer::new("switch_deck").with_param("deck", "local"),
                 Some(&form),
-                true,
                 "choose_deck",
             ),
             (
                 "deck build box",
                 IntentAnswer::new("switch_deck").with_param("deck", "build box"),
                 Some(&form),
-                true,
                 "choose_deck",
             ),
             (
                 "Daemon BuildBoxDeck.",
                 IntentAnswer::new("switch_deck").with_param("deck", "BuildBoxDeck"),
                 Some(&form),
-                true,
                 "choose_deck",
             ),
         ];
-        for (said, answer, new_agent, show_deck, target) in cases {
+        for (said, answer, new_agent, target) in cases {
             let line = format!(
                 "- {target}: {}. About: ",
                 table().row(target).expect("a shipped row").asks_to
@@ -17131,7 +16979,6 @@ mod tests {
                     new_agent,
                     Transcript::new(said),
                     LabelSharing::Shared,
-                    show_deck,
                 )
                 .await
                 .outcome;
@@ -17678,7 +17525,6 @@ mod tests {
             None,
             Transcript::new(said),
             LabelSharing::Shared,
-            true,
         )
         .await
         .outcome
@@ -17820,7 +17666,6 @@ mod tests {
                 None,
                 Transcript::new("switch deck to zephyr prod"),
                 labels,
-                true,
             )
             .await;
             let (data, commands) = resolver.sent();
@@ -20001,7 +19846,6 @@ mod tests {
             reading,
             Transcript::new(said),
             LabelSharing::Shared,
-            true,
         )
         .await
         .outcome

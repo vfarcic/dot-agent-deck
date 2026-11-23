@@ -2588,7 +2588,7 @@ export function normalizePromptLibrary(value: unknown): DeckPromptLibrary {
 export function fixtureDesktopFeatures(search = window.location.search): DesktopFeatures {
   const requested = new URLSearchParams(search).get("experimental")?.trim().toLowerCase();
   if (requested !== "1" && requested !== "true") return { ...DEFAULT_DESKTOP_FEATURES };
-  return { showDeck: true, showProjects: true, showOrchestrations: true, showAgentProfiles: true, showAgentDetails: true };
+  return { showProjects: true, showOrchestrations: true, showAgentProfiles: true, showAgentDetails: true };
 }
 
 

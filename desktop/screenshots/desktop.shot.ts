@@ -333,6 +333,19 @@ desktopScenario("local-cli-upgrade", async (page) => {
   await expect(page.getByTestId("self-upgrade-then")).toBeVisible();
 });
 
+// Issue #1310 — the prompt library over the shipped Daemons screen, with one prompt
+// typed in so the editor is not empty.
+desktopScenario("prompt-library", async (page) => {
+  await page.goto("/?fixture=1&state=docs");
+  await page.getByTestId("open-prompts").click();
+  const library = page.getByTestId("prompt-library-panel");
+  await expect(library).toBeVisible();
+  await library.getByRole("button", { name: "Add prompt" }).click();
+  await library.getByLabel("Prompt name").fill("Fix a failing test");
+  await library.getByLabel("Prompt body").fill("Run the failing test alone, find the cause, fix it, and rerun the test's module before you commit.");
+  await library.getByLabel("Prompt note").fill("For a single red test in CI.");
+});
+
 desktopScenario("settings-voice", async (page) => {
   await page.goto("/?fixture=1&state=docs");
   await page.getByTestId("open-settings").click();

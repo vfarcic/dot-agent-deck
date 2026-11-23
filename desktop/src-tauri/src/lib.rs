@@ -4031,9 +4031,6 @@ async fn desktop_voice_resolve(
         },
         voice::Transcript::new(utterance),
         settings.labels,
-        // Issue #1198: the deck is an experimental surface, so voice neither
-        // offers nor dispatches the way there while it is hidden.
-        dot_agent_deck::features::show_desktop_deck(),
     )
     .await
 }
@@ -4069,7 +4066,6 @@ async fn resolve_declared_utterance(
     declared: VoiceDeclaration<'_>,
     transcript: voice::Transcript,
     labels: crate::settings::LabelSharing,
-    show_deck: bool,
 ) -> Result<voice::VoiceResult, String> {
     let mut decks = voice_decks(observed, declared.deck_step, agents_deck);
     with_other_agents(&mut decks, declared.other_agents);
@@ -4090,7 +4086,6 @@ async fn resolve_declared_utterance(
         declared.reading,
         transcript,
         labels,
-        show_deck,
     )
     .await;
     voice::address_deck_switch(&mut result.outcome, |deck_id| {
@@ -5465,9 +5460,6 @@ async fn desktop_voice_commands(
             .voice
             .unwrap_or_default()
             .labels,
-        // Issue #1198: the list marks the deck's row unavailable while the deck
-        // is hidden, for the same reason the resolver refuses it.
-        dot_agent_deck::features::show_desktop_deck(),
     ))
 }
 
@@ -8455,7 +8447,6 @@ mod tests {
             },
             voice::Transcript::new(said),
             crate::settings::LabelSharing::Shared,
-            true,
         )
         .await
     }

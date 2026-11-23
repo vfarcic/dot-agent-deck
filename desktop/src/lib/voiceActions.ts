@@ -973,12 +973,6 @@ export const VOICE_ACTIONS = {
     },
   },
 
-  /**
-   * Voice-reachable, and the one row whose screen issue #1198 hides by
-   * default: while the flag is off the crate offers it `callable: false`
-   * (`voice::schema::hidden_by_flag`) and `DeckShell` refuses it at dispatch,
-   * so the row stays in the table and the door stays shut.
-   */
   openDeck: {
     label: "Go back to the Daemons screen",
     voice: true,
@@ -1134,14 +1128,14 @@ export const VOICE_ACTIONS = {
 
   openAgentProfiles: {
     label: "Open agent profiles",
-    no_voice: "hidden unless the experimental flag is on (issue #1198), and voice has no per-panel flag gate — `schema::hidden_by_flag` and `DeckShell`'s dispatch gate know only `open_deck`'s — so a row today would be a spoken door to a panel the flag is meant to hide. That gate is the whole reason: opening the form changes nothing until the user edits and saves a profile, so this gets a row when the panel graduates from the flag or the gate is generalised to a per-row feature (PRD #1195 M4, deferred D3)",
+    no_voice: "hidden unless the experimental flag is on (issue #1198), and voice has no flag gate at all since `open_deck`'s went with the deck's flag (issue #1308) — so a row today would be a spoken door to a panel the flag is meant to hide. That gate is the whole reason: opening the form changes nothing until the user edits and saves a profile, so this gets a row when the panel graduates from the flag or the gate is generalised to a per-row feature (PRD #1195 M4, deferred D3)",
     needs: ["openOverlay"],
     run: (context: Pick<VoiceActionContext, "openOverlay">) => context.openOverlay("profiles"),
   },
 
   openOrchestrationOrder: {
     label: "Edit orchestration order",
-    no_voice: "hidden unless the experimental flag is on (issue #1198), and voice has no per-panel flag gate — `schema::hidden_by_flag` and `DeckShell`'s dispatch gate know only `open_deck`'s — so a row today would be a spoken door to a panel the flag is meant to hide. That gate is the whole reason: opening the editor launches nothing, since only its own Activate orchestration starts one, so this gets a row on the same terms as `openAgentProfiles`; activating by voice would be a separate row, weighed against PRD #802 D5 (PRD #1195 M4, deferred D3)",
+    no_voice: "hidden unless the experimental flag is on (issue #1198), and voice has no flag gate at all since `open_deck`'s went with the deck's flag (issue #1308) — so a row today would be a spoken door to a panel the flag is meant to hide. That gate is the whole reason: opening the editor launches nothing, since only its own Activate orchestration starts one, so this gets a row on the same terms as `openAgentProfiles`; activating by voice would be a separate row, weighed against PRD #802 D5 (PRD #1195 M4, deferred D3)",
     needs: ["openOverlay"],
     run: (context: Pick<VoiceActionContext, "openOverlay">) => context.openOverlay("orchestration"),
   },

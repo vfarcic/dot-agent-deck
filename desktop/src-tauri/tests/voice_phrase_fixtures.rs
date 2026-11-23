@@ -61,7 +61,6 @@ use dot_agent_deck_desktop::voice::{
     handle_utterance_after_local_intercepts, handle_utterance_with_dictation,
     meaning::{Place, every_action},
     resolver::{MeaningFuture, ResolveFuture},
-    schema::DECK_HIDDEN_HINT,
     table,
     test_support::{
         api_preset, api_resolver, facets_fleet, in_orchestration, in_titled_orchestration,
@@ -110,9 +109,6 @@ struct PhraseFixture {
     name: String,
     utterance: String,
     screen: String,
-    /// Hide the experimental deck as the shipped desktop does by default.
-    #[serde(default)]
-    deck_hidden: bool,
     action: String,
     outcome: OutcomeKind,
     /// Safety controls assert that nothing runs, regardless of whether the
@@ -1627,13 +1623,6 @@ fn validate_fixtures(fixtures: &FixtureManifest, world: &PlantedWorld) {
                 fixture.name
             );
         }
-        if fixture.deck_hidden {
-            assert_eq!(
-                fixture.screen, "overview",
-                "{}: deck-hidden phrase fixtures exercise the shipped overview",
-                fixture.name
-            );
-        }
         if fixture.pending_action {
             assert_eq!(
                 fixture.action, PENDING_OPEN_SETTINGS_ACTION,
@@ -1820,7 +1809,6 @@ async fn run_fixtures(fixtures: FixtureManifest) {
                 fixture.typing_mode.then_some(&typing_target),
                 transcript,
                 Default::default(),
-                !fixture.deck_hidden,
             ),
         )
         .await;
@@ -1964,14 +1952,6 @@ async fn run_fixtures(fixtures: FixtureManifest) {
                             .sentence()
                             .contains(&format!("Preselected daemon: {label}."))
                     });
-                // Compared against the hint itself rather than against words
-                // it once contained: #1045 renamed the screen "Daemons", and a
-                // `contains("deck")` check went red on every deck-hidden
-                // fixture with the refusal reading exactly as intended.
-                let hidden_deck_explained = !fixture.deck_hidden
-                    || fixture.action != "open_deck"
-                    || matches!(&answer.outcome, VoiceOutcome::Unavailable { hint, .. }
-                        if hint == DECK_HIDDEN_HINT);
                 // A tie the model settled itself, on one of the decks tied.
                 let settled_tie = fixture.tie_may_be_settled
                     && actual_outcome == OutcomeKind::Dispatch
@@ -2006,7 +1986,6 @@ async fn run_fixtures(fixtures: FixtureManifest) {
                     && deck_named
                     && deck_eligible
                     && unavailable_named
-                    && hidden_deck_explained
                 {
                     Ok(())
                 } else {
@@ -2028,8 +2007,6 @@ async fn run_fixtures(fixtures: FixtureManifest) {
                             "a deck the dialog disables was preselected; "
                         } else if !unavailable_named {
                             "the report does not say the named deck cannot take a new agent; "
-                        } else if !hidden_deck_explained {
-                            "the refusal does not explain that the deck is experimental; "
                         } else {
                             ""
                         },

@@ -682,10 +682,10 @@ export type NewAgentOptions =
  * It is the DESKTOP process's flag and belongs to the app, not to a deck — do
  * not confuse it with {@link NewAgentOptions}' per-deck `experimental`. All
  * `false` is the shipped default. The agent overview, the agent overlay and
- * Settings have no field because they are never gated.
+ * Settings have no field because they are never gated, and the deck and the
+ * prompt library have none since they left the flag (issues #1308, #1310).
  */
 export interface DesktopFeatures {
-  showDeck: boolean;
   showProjects: boolean;
   showOrchestrations: boolean;
   showAgentProfiles: boolean;
@@ -698,7 +698,6 @@ export interface DesktopFeatures {
 
 /** Every experimental surface hidden — the shipped default, and what fixture mode answers unless `?experimental=1`. */
 export const DEFAULT_DESKTOP_FEATURES: DesktopFeatures = {
-  showDeck: false,
   showProjects: false,
   showOrchestrations: false,
   showAgentProfiles: false,
@@ -2200,7 +2199,7 @@ export interface DeckRuntimeState {
 /**
  * The features a runtime carries, with a missing answer read as the shipped
  * default (issue #1198). Every gated call site reads through this, so it reads
- * `features.showDeck` rather than guarding `undefined` itself.
+ * `features.showProjects` rather than guarding `undefined` itself.
  */
 export function desktopFeaturesOf(runtime: Pick<DeckRuntimeState, "desktopFeatures">): DesktopFeatures {
   return runtime.desktopFeatures ?? DEFAULT_DESKTOP_FEATURES;

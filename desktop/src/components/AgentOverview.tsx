@@ -1702,10 +1702,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     return () => { voiceChannel.current = undefined; };
   });
   const voiceContext = useMemo(() => ({ navigate: onNavigate, openNewAgent, revealAgent, showHostMetrics, showDashboardCounters }), [onNavigate, openNewAgent, revealAgent, showHostMetrics, showDashboardCounters]);
-  /* Issue #1198 — the deck is an experimental surface, so every "Open deck"
-     door on this screen exists only while it is shown. `undefined` removes
-     the top bar's button and each deck group's alike. */
-  const openDeck = desktopFeaturesOf(runtime).showDeck ? () => VOICE_ACTIONS.openDeck.run(voiceContext) : undefined;
+  const openDeck = () => VOICE_ACTIONS.openDeck.run(voiceContext);
   /*
     PRD #2274 — the empty-agents note offers Add a daemon only while the local
     daemon is the only one configured: one prompt where a new user already
