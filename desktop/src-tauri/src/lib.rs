@@ -2229,9 +2229,9 @@ pub(crate) fn card_batch_no_answer_message(waited: Duration) -> String {
     )
 }
 
-/// The code an executed entry carries beside [`CARD_BATCH_UNKNOWN`] when the
-/// connection broke after the request was sent: the daemon closed it, the
-/// reply was cut off, or it could not be read.
+/// The code an executed entry carries beside [`CARD_BATCH_UNKNOWN`] when no
+/// readable answer came back after the request was sent: the daemon closed
+/// the connection, the reply was cut off, or it arrived and could not be read.
 pub(crate) const CODE_CARD_BATCH_CONNECTION_LOST: &str = "connection_lost";
 /// The code an executed entry carries beside `failed` when the request never
 /// left the desktop: the deck could not be reached, its `Hello` failed, or the
@@ -2244,11 +2244,13 @@ pub(crate) const CODE_CARD_BATCH_NOT_SENT: &str = "not_sent";
 /// beside `skipped`.
 pub(crate) const CODE_CARD_BATCH_DECK_REFUSED: &str = "deck_refused";
 
-/// What an executed entry says when the connection broke after the request
-/// was sent (`detail` is the transport's own words).
+/// What an executed entry says when the deck's answer was lost or could not be
+/// read after the request was sent: the connection broke, the reply was cut
+/// off, or it arrived and could not be decoded (`detail` is the client's own
+/// words).
 pub(crate) fn card_batch_connection_lost_message(detail: &str) -> String {
     format!(
-        "the connection to the deck broke after the request was sent ({detail}), so it is not known whether this agent got it. Check the agent before sending again"
+        "the deck's answer was lost or could not be read after the request was sent ({detail}), so it is not known whether this agent got it. Check the agent before sending again"
     )
 }
 
@@ -2387,7 +2389,7 @@ async fn agent_card_invoke_batch_on(
         Ok(Err(ClientError::Unanswered(detail))) => {
             return match mode {
                 CardBatchMode::Preview => Err(safe_message(format!(
-                    "the connection to the deck broke during the preview ({detail})"
+                    "the deck's answer to the preview was lost or could not be read ({detail})"
                 ))),
                 CardBatchMode::Execute => Ok(every(
                     CARD_BATCH_UNKNOWN,

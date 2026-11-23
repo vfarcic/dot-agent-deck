@@ -1660,8 +1660,9 @@ async fn a_card_batch_whose_connection_breaks_after_sending_ends_unknown_and_is_
         );
         let message = entry.message.as_deref().unwrap_or_default();
         assert!(
-            message.starts_with("the connection to the deck broke after the request was sent")
-                && message.contains("not known whether this agent got it"),
+            message.starts_with(
+                "the deck's answer was lost or could not be read after the request was sent"
+            ) && message.contains("not known whether this agent got it"),
             "{message}"
         );
         assert!(!message.contains("nothing was sent"), "{message}");
