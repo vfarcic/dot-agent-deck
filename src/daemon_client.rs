@@ -8615,6 +8615,8 @@ mod tests {
                                 cut: false,
                                 progress: Default::default(),
                                 git: None,
+                                agents: Vec::new(),
+                                agents_omitted: 0,
                             };
                             let response = match op.as_str() {
                                 "hello" => AttachResponse {

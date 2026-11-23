@@ -25,6 +25,23 @@
 //!    user's own, so signals, the exit status and the terminal are the
 //!    program's own.
 //!
+//! PRD #1790 stage 3: the shim is also how a restored agent is resumed into
+//! its conversation, so the daemon installs it whether or not telemetry is
+//! on (Unix), and Claude Code goes through it too, unchanged unless a resume
+//! is asked for. With telemetry off its directory goes on no ordinary
+//! spawn's `PATH`, only on a restore spawn's. A restore spawn carries a
+//! one-shot request in its environment ([`RESUME_AGENT_ENV`],
+//! [`RESUME_SESSION_ENV`], [`RESUME_TOKEN_ENV`]). When this program is the
+//! one it names, the shim removes the request from the program's environment,
+//! so nothing the agent starts is resumed into the same conversation, and
+//! either puts the agent's resume arguments in front of its own as separate
+//! argv entries ([`crate::agent_registry::ResumeSpec`]) and creates the
+//! token's acknowledgement in [`RESUME_ACKS_DIR`], or, for an id that is not
+//! of the agent's syntax or arguments that choose another conversation or
+//! command, writes `<token>.refused` with the reason and runs the program
+//! unchanged. A token whose acknowledgement exists already was used, and is
+//! not resumed again. A request for another program is left for it.
+//!
 //! Anything that goes wrong in step 2 runs the program unchanged: the shim
 //! never stops an agent from starting. The one refusal is a process tree that
 //! has passed through the shim [`MAX_HOPS`] times, which would otherwise keep
@@ -43,7 +60,51 @@ use super::config::EnvMap;
 pub const SUBCOMMAND: &str = "__telemetry-shim";
 
 /// The programs the shim stands in front of.
-pub const PROGRAMS: [&str; 2] = ["codex", "devin"];
+pub const PROGRAMS: [&str; 3] = ["claude", "codex", "devin"];
+
+/// PRD #1790 stage 3: the program a restore spawn asks to resume, by the
+/// name the shim stands in front of ([`crate::agent_registry::ResumeSpec`]).
+pub const RESUME_AGENT_ENV: &str = "DOT_AGENT_DECK_RESUME_AGENT";
+/// The conversation id to resume it into.
+pub const RESUME_SESSION_ENV: &str = "DOT_AGENT_DECK_RESUME_SESSION";
+/// The request's one-shot token, the name of its acknowledgement.
+pub const RESUME_TOKEN_ENV: &str = "DOT_AGENT_DECK_RESUME_TOKEN";
+/// The request's variables, removed from the environment of the program the
+/// request was for.
+pub const RESUME_ENV_KEYS: [&str; 3] = [RESUME_AGENT_ENV, RESUME_SESSION_ENV, RESUME_TOKEN_ENV];
+
+/// The directory beside the shim's, in the deck's telemetry directory, that
+/// holds resume acknowledgements: `<token>` when the shim resumed the agent,
+/// `<token>.refused` holding the reason when it did not.
+pub const RESUME_ACKS_DIR: &str = "resume-acks";
+/// The suffix of a refused request's acknowledgement.
+pub const REFUSED_SUFFIX: &str = ".refused";
+/// A refusal's reason: the agent's own arguments choose another
+/// conversation, or a command a resume cannot be combined with.
+pub const REFUSED_ARGS_CONFLICT: &str = "resume-args-conflict";
+/// A refusal's reason: the id is not of the agent's own syntax.
+pub const REFUSED_SESSION_ID_INVALID: &str = "session-id-invalid";
+/// A refusal's reason: the program has no resume by id.
+pub const REFUSED_AGENT_CANNOT_RESUME: &str = "agent-cannot-resume";
+
+/// The longest resume token the shim accepts.
+const MAX_TOKEN_LEN: usize = 64;
+
+/// The resume acknowledgements' directory for the shim directory `shim_dir`
+/// ([`install`]'s answer).
+pub fn resume_acks_dir(shim_dir: &Path) -> Option<PathBuf> {
+    shim_dir.parent().map(|dir| dir.join(RESUME_ACKS_DIR))
+}
+
+/// Whether `token` may name a resume acknowledgement: a plain file name of
+/// ASCII letters, digits, `-` and `_`, not too long.
+pub fn is_resume_token(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= MAX_TOKEN_LEN
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
 
 /// The shim directory's name inside the deck's telemetry directory.
 pub const DIR_NAME: &str = "bin";
@@ -115,7 +176,7 @@ fn script(deck: &str, dir: &str, name: &str) -> String {
     let quote = super::launch::shell_quote;
     format!(
         "#!/bin/sh\n\
-         # Written by dot-agent-deck: switches on this agent's own telemetry, then runs it.\n\
+         # Written by dot-agent-deck: applies the deck's launch additions (telemetry, a restore), then runs the agent.\n\
          exec {} {SUBCOMMAND} {name} {} -- \"$@\"\n",
         quote(deck),
         quote(dir),
@@ -143,11 +204,33 @@ pub fn run_if_invoked() -> Option<ExitCode> {
     Some(run(&name, Path::new(&dir), args.collect()))
 }
 
-/// What the shim runs: the real program, and its arguments.
+/// What the shim runs: the real program, its arguments, and the variables
+/// removed from its environment.
 #[derive(Debug, PartialEq, Eq)]
 struct Plan {
     program: PathBuf,
     args: Vec<OsString>,
+    remove_env: Vec<OsString>,
+}
+
+/// A restore spawn's one-shot resume request, as the shim's environment
+/// carries it: `None` fields are unset.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct ResumeRequest {
+    agent: Option<String>,
+    session: Option<String>,
+    token: Option<String>,
+}
+
+impl ResumeRequest {
+    fn from_env(env: &EnvMap) -> Self {
+        let get = |key: &str| env.get(key).filter(|v| !v.is_empty()).cloned();
+        ResumeRequest {
+            agent: get(RESUME_AGENT_ENV),
+            session: get(RESUME_SESSION_ENV),
+            token: get(RESUME_TOKEN_ENV),
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -156,13 +239,17 @@ fn run(name: &str, dir: &Path, args: Vec<OsString>) -> ExitCode {
     let path = std::env::var_os("PATH");
     let guard = std::env::var_os(GUARD_ENV);
     let env = super::config::process_env();
-    let plan = match plan(
+    // The request is read whether or not the telemetry decision can read the
+    // whole environment exactly: its own values are plain ASCII.
+    let resume = ResumeRequest::from_env(&env);
+    let plan = match plan_with(
         name,
         dir,
         args,
         path.as_deref(),
         guard.as_deref(),
         exact_env().then_some(&env),
+        &resume,
         std::process::id(),
     ) {
         Ok(plan) => plan,
@@ -177,11 +264,15 @@ fn run(name: &str, dir: &Path, args: Vec<OsString>) -> ExitCode {
             return ExitCode::from(126);
         }
     };
-    let e = std::process::Command::new(&plan.program)
+    let mut command = std::process::Command::new(&plan.program);
+    command
         .arg0(name)
         .args(&plan.args)
-        .env(GUARD_ENV, guarded(guard.as_deref(), name))
-        .exec();
+        .env(GUARD_ENV, guarded(guard.as_deref(), name));
+    for key in &plan.remove_env {
+        command.env_remove(key);
+    }
+    let e = command.exec();
     eprintln!("{name}: {e}");
     ExitCode::from(if e.kind() == std::io::ErrorKind::NotFound {
         127
@@ -222,7 +313,8 @@ enum Refused {
 /// The shim's plan for `name` called with `args`, with `PATH` = `path`,
 /// [`GUARD_ENV`] = `guard` and the environment `env` — `None` when it cannot
 /// be read exactly, which adds nothing; the program will have process id
-/// `pid`.
+/// `pid`. A resume request is read from `env` ([`plan_with`]).
+#[cfg_attr(not(test), allow(dead_code))]
 fn plan(
     name: &str,
     dir: &Path,
@@ -230,6 +322,23 @@ fn plan(
     path: Option<&OsStr>,
     guard: Option<&OsStr>,
     env: Option<&EnvMap>,
+    pid: u32,
+) -> Result<Plan, Refused> {
+    let resume = env.map(ResumeRequest::from_env).unwrap_or_default();
+    plan_with(name, dir, args, path, guard, env, &resume, pid)
+}
+
+/// [`plan`], with the resume request `resume` read separately from the
+/// environment the telemetry decision reads.
+#[allow(clippy::too_many_arguments)]
+fn plan_with(
+    name: &str,
+    dir: &Path,
+    args: Vec<OsString>,
+    path: Option<&OsStr>,
+    guard: Option<&OsStr>,
+    env: Option<&EnvMap>,
+    resume: &ResumeRequest,
     pid: u32,
 ) -> Result<Plan, Refused> {
     let shimmed = guard.map(|g| g.to_string_lossy().into_owned());
@@ -241,6 +350,16 @@ fn plan(
         return Err(Refused::TooManyHops);
     }
     let program = resolve(name, path, dir).ok_or(Refused::NotFound)?;
+    // A request for this program is consumed here, resumed or refused; one
+    // for another program is left in the environment for it.
+    let (resumed, remove_env) = if resume.agent.as_deref() == Some(name) {
+        (
+            resume_args(name, dir, &args, resume),
+            RESUME_ENV_KEYS.iter().map(OsString::from).collect(),
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
     let added = match env {
         Some(env) if !shimmed.contains(&name) && launcher_is_certain(name, &program) => {
             additions(name, dir, &args, env, pid)
@@ -257,14 +376,83 @@ fn plan(
             0
         },
     );
+    // PRD #1790 stage 3: the resume arguments go first of all, in front of
+    // the embedded-mode pair too: Codex's `resume` is a subcommand.
     Ok(Plan {
         program,
-        args: args
+        args: resumed
             .into_iter()
+            .chain(args)
             .chain(added.into_iter().map(OsString::from))
             .chain(rest)
             .collect(),
+        remove_env,
     })
+}
+
+/// The arguments that resume `name` as `request` asks, or none. Resumes only
+/// for a token that can name an acknowledgement, and only once per token: the
+/// acknowledgement is created exclusively before the arguments are given. An
+/// id that is not of the agent's syntax, or the agent's own `args` choosing
+/// another conversation or command, writes the refused acknowledgement and
+/// gives none.
+fn resume_args(
+    name: &str,
+    dir: &Path,
+    args: &[OsString],
+    request: &ResumeRequest,
+) -> Vec<OsString> {
+    let Some(token) = request.token.as_deref().filter(|t| is_resume_token(t)) else {
+        return Vec::new();
+    };
+    let Some(acks) = resume_acks_dir(dir) else {
+        return Vec::new();
+    };
+    let spec = crate::agent_registry::ALL
+        .iter()
+        .filter_map(|spec| spec.resume)
+        .find(|resume| resume.program == name);
+    let session = request.session.as_deref().unwrap_or_default();
+    let refusal = match spec {
+        None => Some(REFUSED_AGENT_CANNOT_RESUME),
+        Some(spec) if !spec.valid_session_id(session) => Some(REFUSED_SESSION_ID_INVALID),
+        Some(spec) if spec.conflicts(args) => Some(REFUSED_ARGS_CONFLICT),
+        Some(_) => None,
+    };
+    if let Some(reason) = refusal {
+        let _ = write_ack(&acks, &format!("{token}{REFUSED_SUFFIX}"), reason);
+        return Vec::new();
+    }
+    match (spec, write_ack(&acks, token, name)) {
+        (Some(spec), Ok(())) => spec.args(session),
+        _ => Vec::new(),
+    }
+}
+
+/// Create `<acks>/<file>` exclusively, owner-only, holding `body` and a
+/// newline, in an owner-only `acks`. An existing file is an error and is
+/// left as it is.
+#[cfg(unix)]
+fn write_ack(acks: &Path, file: &str, body: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    crate::platform::fsperm::ensure_owner_only_dir(acks)?;
+    let mut ack = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .mode(0o600)
+        .open(acks.join(file))?;
+    ack.write_all(format!("{body}\n").as_bytes())?;
+    ack.sync_all()
+}
+
+#[cfg(not(unix))]
+fn write_ack(_acks: &Path, _file: &str, _body: &str) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "the launch shim runs on Unix only",
+    ))
 }
 
 /// The arguments the deck puts in front of `name`'s own `args`, or none —
@@ -462,6 +650,7 @@ fn is_executable_file(path: &Path) -> bool {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use spec::spec;
     use std::os::unix::fs::PermissionsExt;
 
     const RUN: &str = "0123456789abcdef0123456789abcdef";
@@ -488,7 +677,201 @@ mod tests {
         args.iter().map(OsString::from).collect()
     }
 
-    /// A telemetry directory holding a shim directory with both scripts, and
+    const RESUME_ID: &str = "01234567-89ab-4cde-8fab-0123456789ab";
+    const RESUME_ENV_KEYS: [&str; 3] = [
+        "DOT_AGENT_DECK_RESUME_AGENT",
+        "DOT_AGENT_DECK_RESUME_SESSION",
+        "DOT_AGENT_DECK_RESUME_TOKEN",
+    ];
+
+    fn resume_env(program: &str, id: &str, token: &str) -> EnvMap {
+        env(&[
+            (RESUME_ENV_KEYS[0], program),
+            (RESUME_ENV_KEYS[1], id),
+            (RESUME_ENV_KEYS[2], token),
+        ])
+    }
+
+    fn assert_resume_env_removed(plan: &Plan) {
+        for key in RESUME_ENV_KEYS {
+            assert!(
+                plan.remove_env.contains(&OsString::from(key)),
+                "child retains {key}: {plan:?}"
+            );
+        }
+    }
+
+    /// Scenario: Launch Claude or Codex through the shim with a one-shot resume request, including a shell-script launcher and Codex's embedded arguments. The child receives separate resume arguments, loses the request environment and gets a private exclusive acknowledgement; unrelated launches pass through.
+    #[spec("journal/restore/004")]
+    #[test]
+    fn journal_restore_004_the_shim_resumes_once_before_user_and_embedded_args() {
+        for (program, prefix) in [("claude", "--resume"), ("codex", "resume")] {
+            let f = fixture();
+            // A wrapper is deliberately not a telemetry-certain launcher.
+            crate::test_isolation::write_script(f.real.join(program), b"#!/bin/sh\nexit 0\n")
+                .unwrap();
+            let request = resume_env(program, RESUME_ID, "restore-token");
+            let mut input = if program == "codex" {
+                crate::wrap::CODEX_EMBEDDED_ARGS.to_vec()
+            } else {
+                Vec::new()
+            };
+            input.extend(["--model", "mini"]);
+            let planned = f.plan(program, &input, &request).unwrap();
+            let mut expected = os(&[prefix, RESUME_ID]);
+            expected.extend(os(&input));
+            assert_eq!(planned.program, f.real.join(program));
+            assert_eq!(planned.args, expected, "{program}");
+            assert_resume_env_removed(&planned);
+            let acks = f.telemetry.join("resume-acks");
+            let ack = acks.join("restore-token");
+            assert!(ack.is_file(), "shim did not acknowledge {program}");
+            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&acks), 0o700);
+            assert_eq!(mode(&ack), 0o600);
+            assert!(!acks.join("restore-token.refused").exists());
+
+            // O_EXCL: a second plan cannot overwrite the first acknowledgement.
+            std::fs::write(&ack, "first-owner").unwrap();
+            let repeated = f.plan(program, &input, &request).unwrap();
+            assert_eq!(std::fs::read_to_string(&ack).unwrap(), "first-owner");
+            assert_eq!(
+                repeated.args,
+                os(&input),
+                "a consumed token must not inject again"
+            );
+            assert_resume_env_removed(&repeated);
+        }
+        for program in ["claude", "codex"] {
+            let f = fixture();
+            executable(&f.real.join(program));
+            let plain = f.plan(program, &["--model", "mini"], &env(&[])).unwrap();
+            assert_eq!(plain.args, os(&["--model", "mini"]));
+            assert!(!f.telemetry.join("resume-acks").exists());
+            let other = if program == "claude" {
+                "codex"
+            } else {
+                "claude"
+            };
+            let unmatched = f
+                .plan(
+                    program,
+                    &["--model", "mini"],
+                    &resume_env(other, RESUME_ID, "not-mine"),
+                )
+                .unwrap();
+            assert_eq!(unmatched.args, os(&["--model", "mini"]));
+            assert!(
+                unmatched.remove_env.is_empty(),
+                "a launcher for another program must preserve the request"
+            );
+            assert!(!f.telemetry.join("resume-acks").exists());
+        }
+        let f = fixture();
+        executable(&f.real.join("claude"));
+        let plain = f
+            .plan("claude", &["--model", "haiku"], &f.env(&[]))
+            .unwrap();
+        assert_eq!(
+            plain.args,
+            os(&["--model", "haiku"]),
+            "ordinary Claude gains no telemetry args"
+        );
+    }
+
+    /// Scenario: Ask the shim to resume with an invalid id or launch options that select another conversation or command. It starts the original command unchanged, removes the one-shot environment and writes a refusal with the reason instead of a success acknowledgement.
+    #[spec("journal/restore/005")]
+    #[test]
+    fn journal_restore_005_conflicts_and_bad_ids_write_refused_acks() {
+        for (program, args, id, reason) in [
+            (
+                "claude",
+                vec!["--continue"],
+                RESUME_ID,
+                "resume-args-conflict",
+            ),
+            (
+                "claude",
+                vec!["--resume", RESUME_ID],
+                RESUME_ID,
+                "resume-args-conflict",
+            ),
+            (
+                "claude",
+                vec!["--resume=some-name"],
+                RESUME_ID,
+                "resume-args-conflict",
+            ),
+            (
+                "claude",
+                vec!["--session-id", RESUME_ID],
+                RESUME_ID,
+                "resume-args-conflict",
+            ),
+            (
+                "claude",
+                vec!["--fork-session"],
+                RESUME_ID,
+                "resume-args-conflict",
+            ),
+            (
+                "claude",
+                vec!["-p", "hello"],
+                RESUME_ID,
+                "resume-args-conflict",
+            ),
+            (
+                "codex",
+                vec!["exec", "hello"],
+                RESUME_ID,
+                "resume-args-conflict",
+            ),
+            (
+                "codex",
+                vec!["resume", RESUME_ID],
+                RESUME_ID,
+                "resume-args-conflict",
+            ),
+            (
+                "codex",
+                vec!["hello world"],
+                RESUME_ID,
+                "resume-args-conflict",
+            ),
+            (
+                "codex",
+                vec!["--model", "mini", "hello"],
+                RESUME_ID,
+                "resume-args-conflict",
+            ),
+            ("claude", vec![], "--continue", "session-id-invalid"),
+            (
+                "codex",
+                vec![],
+                "01234567-89AB-4CDE-8FAB-0123456789AB",
+                "session-id-invalid",
+            ),
+            ("claude", vec![], "$(touch sentinel)", "session-id-invalid"),
+        ] {
+            let f = fixture();
+            executable(&f.real.join(program));
+            let planned = f
+                .plan(program, &args, &resume_env(program, id, "refused-token"))
+                .unwrap();
+            assert_eq!(planned.args, os(&args), "{program} {args:?} {id}");
+            assert_resume_env_removed(&planned);
+            let acks = f.telemetry.join("resume-acks");
+            assert!(!acks.join("refused-token").exists());
+            let refusal = acks.join("refused-token.refused");
+            assert_eq!(std::fs::read_to_string(&refusal).unwrap().trim(), reason);
+            assert_eq!(
+                std::fs::metadata(&refusal).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    /// A telemetry directory holding the launch shim scripts, and
     /// a directory with the real programs.
     struct Fixture {
         _root: tempfile::TempDir,
@@ -546,9 +929,13 @@ mod tests {
         }
     }
 
+    /// Scenario: Install the launch shim and inspect its directory and scripts. Claude, Codex and Devin scripts are present with owner-only permissions.
     #[test]
     fn the_shim_directory_and_its_scripts_are_owner_only() {
         let f = fixture();
+        for name in ["claude", "codex", "devin"] {
+            assert!(f.shim.join(name).is_file(), "missing {name} shim");
+        }
         assert_eq!(f.shim, f.telemetry.join(DIR_NAME));
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&f.shim), 0o700);
@@ -746,6 +1133,7 @@ mod tests {
                 Ok(Plan {
                     program: f.real.join(name),
                     args: os(&args),
+                    remove_env: Vec::new(),
                 })
             );
         };
@@ -784,6 +1172,7 @@ mod tests {
             Ok(Plan {
                 program: f.real.join("codex"),
                 args: os(&args),
+                remove_env: Vec::new(),
             })
         );
         // A failure inside the decision: Devin's file cannot be written.
@@ -1025,7 +1414,8 @@ mod tests {
             inexact,
             Ok(Plan {
                 program: wrapper,
-                args: os(&args)
+                args: os(&args),
+                remove_env: Vec::new(),
             }),
             "an environment it cannot read exactly"
         );

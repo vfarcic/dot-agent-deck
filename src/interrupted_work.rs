@@ -140,6 +140,109 @@ pub struct InterruptedItem {
     /// otherwise, so the plain list's shape does not change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git: Option<GitFacts>,
+    /// PRD #1790 stage 3: the agents that served the item, one per distinct
+    /// attempt, at most [`MAX_ITEM_AGENTS`], each with whether it can be
+    /// restored. Empty from a daemon before stage 3.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agents: Vec<ItemAgent>,
+    /// The item's agents left out of [`Self::agents`] past
+    /// [`MAX_ITEM_AGENTS`].
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub agents_omitted: usize,
+}
+
+/// PRD #1790 stage 3: the most agents one item lists.
+pub const MAX_ITEM_AGENTS: usize = 16;
+
+/// PRD #1790 stage 3: one agent of an interrupted item.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ItemAgent {
+    /// The attempt (`<run>/<agent id>`): what a restore or start-over names.
+    pub attempt: AttemptId,
+    /// Its pane's display name, from its launch record.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// The agent it ran, from its launch record or the session it reported.
+    #[serde(default)]
+    pub agent_type: Option<crate::event::AgentType>,
+    /// Its role, for an orchestration's agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// The folder it ran in, from its launch record; not checked to exist.
+    #[serde(default)]
+    pub folder: Option<String>,
+    /// Whether it can be restored, from the journal and the launch records
+    /// alone: the folder, the old process and the saved task are checked
+    /// when a restore or start-over is asked for.
+    pub restore: RestoreVerdict,
+}
+
+/// PRD #1790 stage 3: whether an agent can be restored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RestoreVerdict {
+    /// The deck holds a conversation id the agent can be resumed into.
+    Resume,
+    /// It cannot be resumed, but its command and folder can start it again
+    /// without its conversation.
+    StartOver { reason: RestoreReason },
+    /// Neither.
+    #[serde(rename = "none")]
+    NotRestorable { reason: RestoreReason },
+    /// A verdict of a newer daemon's.
+    #[serde(other)]
+    Unknown,
+}
+
+impl RestoreVerdict {
+    /// Why it cannot be resumed; `None` for [`RestoreVerdict::Resume`].
+    pub fn reason(self) -> Option<RestoreReason> {
+        match self {
+            RestoreVerdict::Resume => None,
+            RestoreVerdict::StartOver { reason } | RestoreVerdict::NotRestorable { reason } => {
+                Some(reason)
+            }
+            RestoreVerdict::Unknown => Some(RestoreReason::Unknown),
+        }
+    }
+}
+
+/// PRD #1790 stage 3: why an agent cannot be resumed. The wire codes are
+/// kebab-case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RestoreReason {
+    /// The agent is one the deck cannot resume by id yet, or an
+    /// unrecognised command.
+    AgentCannotResume,
+    /// The agent never reported a conversation id the deck kept.
+    NoSessionId,
+    /// The conversation id the deck holds is not of the agent's own syntax.
+    SessionIdInvalid,
+    /// No launch record says how the agent was started.
+    NoLaunchRecord,
+    /// More than one launch record could be the agent's, or the journal
+    /// holds its attempt under more than one piece of work, or two of the
+    /// item's agents were in one conversation.
+    AmbiguousRecord,
+    /// The folder it started in had been moved away.
+    FolderMoved,
+    /// Its launch record names no folder it started in.
+    FolderUnknown,
+    /// It served an orchestration, or a unit run by more than one agent,
+    /// which a later stage restores.
+    OrchestrationLater,
+    /// An orchestration's worker that starts fresh for each task.
+    ClearWorker,
+    /// The pane ran the default shell, not an agent.
+    DefaultShell,
+    /// The journal or launch-record read was incomplete.
+    IncompleteRead,
+    /// A restart did not stop it: it ended on its own, or is still running.
+    NotInterrupted,
+    /// A reason of a newer daemon's.
+    #[serde(other)]
+    Unknown,
 }
 
 /// How far an item's work got, from its journal lines alone: how many
@@ -1108,6 +1211,61 @@ pub fn still_interrupted(
         && !works.iter().any(|w| index.has_live_attempt(w))
 }
 
+/// PRD #1790 stage 3: the action that opens the restore question.
+pub const RESTORE_ACTION: &str = "Restore";
+/// The question's choice that restores the agent and lets it carry on.
+pub const RESTORE_AND_CONTINUE: &str = "Restore and continue";
+/// The question's choice that restores the agent and lets it wait.
+pub const RESTORE_ONLY: &str = "Restore only";
+/// The question's choice for an agent that cannot be resumed.
+pub const START_OVER: &str = "Start over in this worktree";
+/// What [`RESTORE_AND_CONTINUE`] does, under the question.
+pub const RESTORE_AND_CONTINUE_EXPLANATION: &str =
+    "It checks what already happened and carries on where it stopped.";
+/// What [`RESTORE_ONLY`] does, under the question.
+pub const RESTORE_ONLY_EXPLANATION: &str = "It comes back and waits until you tell it to continue.";
+
+/// The restore question for the agent or item called `name`.
+pub fn restore_question(name: &str) -> String {
+    format!("Restore {name} with its conversation?")
+}
+
+/// The note a restored agent receives first after [`RESTORE_AND_CONTINUE`].
+pub const RESTART_NOTE_CONTINUE: &str = "The deck restarted and resumed this session. If your previous turn was cut off before it finished, first check the current state — `git status`, `git log`, whether anything was already pushed, opened or sent — then continue from where you stopped without repeating what already happened. If your previous turn had finished, do nothing and wait for the next message.";
+/// The note a restored agent receives first after [`RESTORE_ONLY`].
+pub const RESTART_NOTE_ONLY: &str = "The deck restarted and resumed this session. Your previous turn may have been cut off before it finished. Do nothing until you are told to continue; when you are, first check the current state — `git status`, `git log`, whether anything was already pushed, opened or sent — and do not repeat what already happened.";
+
+/// Why an agent is not offered a resume, in the words every client shows.
+pub fn restore_reason_sentence(reason: RestoreReason) -> &'static str {
+    match reason {
+        RestoreReason::AgentCannotResume => {
+            "The agent cannot be restored with its conversation yet."
+        }
+        RestoreReason::NoSessionId => "The deck does not know which conversation the agent was in.",
+        RestoreReason::SessionIdInvalid => {
+            "The conversation id the deck holds for the agent is not one it can resume."
+        }
+        RestoreReason::NoLaunchRecord => "The deck has no record of how the agent was started.",
+        RestoreReason::AmbiguousRecord => {
+            "The deck's records do not say for certain how the agent was started."
+        }
+        RestoreReason::FolderMoved => {
+            "The agent's folder was moved, is gone, or others can write to it."
+        }
+        RestoreReason::FolderUnknown => "The deck does not know which folder the agent ran in.",
+        RestoreReason::OrchestrationLater => "Orchestrations come back in a later version.",
+        RestoreReason::ClearWorker => {
+            "This worker starts fresh for each task and comes back with its orchestration."
+        }
+        RestoreReason::DefaultShell => {
+            "The pane ran a shell, not an agent, so there is no conversation to restore."
+        }
+        RestoreReason::IncompleteRead => "The deck could not read its whole work journal.",
+        RestoreReason::NotInterrupted => "The restart did not stop this agent.",
+        RestoreReason::Unknown => "The agent cannot be restored.",
+    }
+}
+
 /// The list.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InterruptedList {
@@ -1189,6 +1347,9 @@ pub fn derive_with_home(
         }
     }
 
+    // A launch-record read that skipped a record may have skipped the one
+    // that would make an agent's record ambiguous.
+    let incomplete = read.stats.truncated || launches.truncated || launches.skipped > 0;
     let mut items = Vec::new();
     for (root, works) in &roots.under {
         if index.closed_by_person(root) {
@@ -1200,7 +1361,14 @@ pub fn derive_with_home(
         if !interrupted && reports.is_empty() {
             continue;
         }
-        items.push(index.item(root, works, roots.launcher.get(root), reports, home));
+        items.push(index.item(
+            root,
+            works,
+            roots.launcher.get(root),
+            reports,
+            home,
+            incomplete,
+        ));
     }
     items.sort_by(|a, b| {
         b.last_entry
@@ -1210,7 +1378,7 @@ pub fn derive_with_home(
     });
     InterruptedList {
         items,
-        incomplete: read.stats.truncated || launches.truncated,
+        incomplete,
         omitted: 0,
     }
 }
@@ -1297,6 +1465,14 @@ fn cut_fields(item: &mut InterruptedItem) {
     cut |= cut_to(&mut item.last_entry.kind, MAX_FIELD_BYTES);
     for role in &mut item.progress.roles {
         cut |= cut_to(role, MAX_FIELD_BYTES);
+    }
+    for agent in &mut item.agents {
+        for field in [&mut agent.name, &mut agent.role, &mut agent.folder]
+            .into_iter()
+            .flatten()
+        {
+            cut |= cut_to(field, MAX_FIELD_BYTES);
+        }
     }
     for report in &mut item.reports {
         for field in [&mut report.task_id, &mut report.unit_id]
@@ -1498,6 +1674,12 @@ struct Index<'a> {
     lines: &'a JournalRead,
     /// Launch records joined to the journal, by attempt.
     records: HashMap<&'a AttemptId, &'a LaunchRecord>,
+    /// Attempts with a launch record that could not be joined: more than one
+    /// record, or a record whose work the journal does not hold the attempt
+    /// under alone.
+    ambiguous: HashSet<&'a AttemptId>,
+    /// The role each attempt's first `attempt_started` names.
+    role_of: HashMap<&'a AttemptId, &'a String>,
 }
 
 /// Each work's root, each root's works and each root's launcher work.
@@ -1524,6 +1706,8 @@ impl<'a> Index<'a> {
             last_line: HashMap::new(),
             lines: read,
             records: HashMap::new(),
+            ambiguous: HashSet::new(),
+            role_of: HashMap::new(),
         };
         let mut seen: HashSet<&WorkId> = HashSet::new();
         let mut ends: HashMap<&AttemptId, bool> = HashMap::new();
@@ -1558,6 +1742,7 @@ impl<'a> Index<'a> {
                     }
                     works_of.entry(attempt).or_default().insert(work);
                     if let Some(role) = role {
+                        index.role_of.entry(attempt).or_insert(role);
                         let roles = index.roles_of.entry(work).or_default();
                         if !roles.iter().any(|(_, seen)| *seen == role) {
                             roles.push((at, role));
@@ -1620,10 +1805,11 @@ impl<'a> Index<'a> {
             by_attempt.entry(&record.attempt).or_default().push(record);
         }
         for (attempt, records) in by_attempt {
-            let [record] = records.as_slice() else {
+            let Some((journal_attempt, works)) = works_of.get_key_value(attempt) else {
                 continue;
             };
-            let Some((journal_attempt, works)) = works_of.get_key_value(attempt) else {
+            let [record] = records.as_slice() else {
+                self.ambiguous.insert(*journal_attempt);
                 continue;
             };
             let holds = works.contains(&&record.work);
@@ -1636,6 +1822,8 @@ impl<'a> Index<'a> {
             });
             if holds && others_are_delegations {
                 self.records.insert(*journal_attempt, *record);
+            } else {
+                self.ambiguous.insert(*journal_attempt);
             }
         }
     }
@@ -1803,6 +1991,7 @@ impl<'a> Index<'a> {
         launcher: Option<&&'a WorkId>,
         reports: Vec<ItemReport>,
         home: &Path,
+        incomplete: bool,
     ) -> InterruptedItem {
         let opened = self.opened.get(root);
         let kind = match opened.map(|o| o.launch) {
@@ -1867,6 +2056,7 @@ impl<'a> Index<'a> {
             ts_ms: last.map_or(0, |line| line.ts_ms),
         };
         let progress = self.progress(&ordered);
+        let (agents, agents_omitted) = self.agents(kind, &ordered, incomplete);
         InterruptedItem {
             id: root.clone(),
             kind,
@@ -1882,7 +2072,142 @@ impl<'a> Index<'a> {
             cut: false,
             progress,
             git: None,
+            agents,
+            agents_omitted,
         }
+    }
+
+    /// PRD #1790 stage 3: the item's agents, one per distinct attempt in the
+    /// order its works (`ordered`, root first) name them, at most
+    /// [`MAX_ITEM_AGENTS`], and how many were left out. Each verdict comes
+    /// from the journal and the launch records alone.
+    fn agents(
+        &self,
+        kind: ItemKind,
+        ordered: &[&'a WorkId],
+        incomplete: bool,
+    ) -> (Vec<ItemAgent>, usize) {
+        let mut attempts: Vec<&'a AttemptId> = Vec::new();
+        for work in ordered {
+            for attempt in self.attempts(work) {
+                if !attempts.contains(&attempt) {
+                    attempts.push(attempt);
+                }
+            }
+        }
+        // Stage 3 restores a single agent: a plain agent, or a unit or issue
+        // dispatch one agent ran with nothing delegated and no orchestration.
+        let team = ordered.iter().any(|w| {
+            self.opened
+                .get(*w)
+                .is_some_and(|o| matches!(o.launch, Launch::Orchestration | Launch::Delegation))
+        });
+        let single = !team
+            && match kind {
+                ItemKind::Agent => true,
+                ItemKind::Unit | ItemKind::IssueDispatch => attempts.len() == 1,
+                ItemKind::Orchestration => false,
+            };
+        let omitted = attempts.len().saturating_sub(MAX_ITEM_AGENTS);
+        attempts.truncate(MAX_ITEM_AGENTS);
+        let mut sessions: Vec<Option<&str>> = Vec::new();
+        let mut agents: Vec<ItemAgent> = attempts
+            .iter()
+            .map(|attempt| {
+                let (agent, session) = self.agent(attempt, single, incomplete);
+                sessions.push(session);
+                agent
+            })
+            .collect();
+        // Two agents resumed into one conversation would both write to it.
+        for (at, session) in sessions.iter().enumerate() {
+            let Some(session) = session else { continue };
+            if sessions
+                .iter()
+                .enumerate()
+                .any(|(other, s)| other != at && s.as_ref() == Some(session))
+            {
+                agents[at].restore = RestoreVerdict::NotRestorable {
+                    reason: RestoreReason::AmbiguousRecord,
+                };
+            }
+        }
+        (agents, omitted)
+    }
+
+    /// One agent of an item, and the session it would be resumed into when
+    /// its verdict is [`RestoreVerdict::Resume`].
+    fn agent(
+        &self,
+        attempt: &'a AttemptId,
+        single: bool,
+        incomplete: bool,
+    ) -> (ItemAgent, Option<&'a str>) {
+        let record = self.records.get(attempt).copied();
+        let session = crate::work_journal::latest_session_of(&self.lines.lines, attempt);
+        let agent_type = record
+            .and_then(|r| r.agent_type.clone())
+            .or_else(|| session.map(|(_, agent)| agent.clone()))
+            .or_else(|| {
+                record.and_then(|r| crate::event::AgentType::from_command(r.command.as_deref()))
+            });
+        let none = |reason| RestoreVerdict::NotRestorable { reason };
+        let start_over = |reason| RestoreVerdict::StartOver { reason };
+        let interrupted = matches!(
+            self.attempt_state.get(attempt),
+            Some(AttemptState::Ended { interrupted: true } | AttemptState::Open { live: false })
+        );
+        let mut resumed = None;
+        let restore = if incomplete {
+            none(RestoreReason::IncompleteRead)
+        } else if !single {
+            none(RestoreReason::OrchestrationLater)
+        } else if !interrupted {
+            none(RestoreReason::NotInterrupted)
+        } else if self.ambiguous.contains(attempt) {
+            none(RestoreReason::AmbiguousRecord)
+        } else if let Some(record) = record {
+            let resume = agent_type
+                .as_ref()
+                .and_then(|agent| crate::agent_registry::spec(agent).resume);
+            if record.cwd.is_none() {
+                none(if record.cwd_moved_from.is_some() {
+                    RestoreReason::FolderMoved
+                } else {
+                    RestoreReason::FolderUnknown
+                })
+            } else if record.command.is_none()
+                && matches!(agent_type, None | Some(crate::event::AgentType::None))
+            {
+                start_over(RestoreReason::DefaultShell)
+            } else if let Some(resume) = resume {
+                match session {
+                    None => start_over(RestoreReason::NoSessionId),
+                    Some((id, _)) if !resume.valid_session_id(id) => {
+                        start_over(RestoreReason::SessionIdInvalid)
+                    }
+                    Some((id, _)) => {
+                        resumed = Some(id);
+                        RestoreVerdict::Resume
+                    }
+                }
+            } else {
+                start_over(RestoreReason::AgentCannotResume)
+            }
+        } else {
+            none(RestoreReason::NoLaunchRecord)
+        };
+        let agent = ItemAgent {
+            attempt: attempt.clone(),
+            name: record.and_then(|r| r.name.clone()),
+            agent_type,
+            role: record
+                .and_then(|r| r.role.clone())
+                .or_else(|| self.role_of.get(attempt).map(|role| (*role).clone())),
+            folder: record.and_then(|r| r.cwd.clone()),
+            restore,
+        };
+        (agent, resumed)
     }
 }
 

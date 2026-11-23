@@ -16438,6 +16438,9 @@ impl AgentPtyRegistry {
                 launch_dir_moved_from,
                 display_name.clone(),
                 tab_membership.clone(),
+                // PRD #1790 stage 3: the child's identity, so a restore can
+                // tell whether this agent is gone.
+                child.process_id().map(|pid| (pid, child_started)),
             )
         });
         let agent = RunningAgent {
@@ -16564,7 +16567,7 @@ impl AgentPtyRegistry {
         // (file I/O, so after the registry lock is released).
         if let (
             Some(work),
-            Some((command, shell, agent_type, cwd, cwd_moved_from, name, membership)),
+            Some((command, shell, agent_type, cwd, cwd_moved_from, name, membership, identity)),
         ) = (&work, &launch_record)
         {
             self.work.launch_recorded(
@@ -16578,6 +16581,8 @@ impl AgentPtyRegistry {
                     cwd_moved_from: cwd_moved_from.as_deref(),
                     name: name.as_deref(),
                     membership: membership.as_ref(),
+                    pid: identity.map(|(pid, _)| pid),
+                    pid_start: identity.and_then(|(_, started)| started),
                 },
             );
         }

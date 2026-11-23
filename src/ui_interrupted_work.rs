@@ -125,7 +125,8 @@ pub(super) enum Answer {
     Shown {
         tag: Tag,
         id: String,
-        result: Result<Option<InterruptedShow>, String>,
+        /// Boxed: a page is far larger than the other answers.
+        result: Box<Result<Option<InterruptedShow>, String>>,
     },
     Reclaimed {
         tag: Tag,
@@ -443,7 +444,11 @@ async fn ask(tag: Tag, sent: InterruptedSeamSent) -> Answer {
                 client().show_interrupted_page(&id, None, Some(reports_from), instance),
             )
             .await;
-            Answer::Shown { tag, id, result }
+            Answer::Shown {
+                tag,
+                id,
+                result: Box::new(result),
+            }
         }
         InterruptedSeamRequest::Reclaim { id, dry_run } => {
             let result = bounded(
@@ -623,7 +628,7 @@ pub(super) fn apply(ui: &mut UiState, answer: Answer) {
             if *open != id {
                 return;
             }
-            let why = match result {
+            let why = match *result {
                 Ok(Some(shown)) => {
                     *show = Some(Box::new(shown));
                     *scroll = 0;
@@ -1892,7 +1897,7 @@ pub(super) fn seam_answer(
             InterruptedSeamKind::Show => Answer::Shown {
                 tag,
                 id: id.clone(),
-                result: none(&result),
+                result: Box::new(none(&result)),
             },
             InterruptedSeamKind::Reclaim => Answer::Reclaimed {
                 tag,
@@ -1914,7 +1919,7 @@ pub(super) fn seam_answer(
         InterruptedSeamStep::Shown(show) => Answer::Shown {
             tag,
             id,
-            result: Ok(Some(show.clone())),
+            result: Box::new(Ok(Some(show.clone()))),
         },
         InterruptedSeamStep::Reclaimed(outcome) => Answer::Reclaimed {
             tag,

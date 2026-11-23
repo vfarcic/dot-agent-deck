@@ -540,7 +540,7 @@ The deck asks for the approval itself when it refuses to start an unapproved orc
 
 ### Work journal (PRD #1889)
 
-The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/work-journal.md`): a work per launch with its parent, refs and workspace, an attempt per agent generation, `DOT_AGENT_DECK_WORK_ID` in every spawned agent, and restart recovery. All entries are lane 1 with token-free stand-ins; they read the journal files and the stand-in's own environment from outside the daemon (`tests/support/work_journal.rs`). The `deck.work.id` telemetry attribute is covered by `telemetry/otlp/003`.
+The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/work-journal.md`): a work per launch with its parent, refs and workspace, an attempt per agent generation, `DOT_AGENT_DECK_WORK_ID` in every spawned agent, and restart recovery. Lane-1 lifecycle tests use token-free stand-ins and read journal files and the stand-in's own environment from outside the daemon (`tests/support/work_journal.rs`). The interrupted-work and restore sub-areas also include L1 unit and render tests; each entry names its layer and agent. The `deck.work.id` telemetry attribute is covered by `telemetry/otlp/003`.
 
 #### journal/launch
 
@@ -875,6 +875,56 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 - **Agent:** synthetic: a `--single --command <script> --agent opencode` unit whose script ignores SIGTERM, writes a ready file once its trap is set and records that it got the signal, so the stopping daemon waits out its grace while the dispatch goes on.
 - **Asserts:** the CLI is answered and the unit's agent runs, with its attempt in the journal and its TERM trap set, while the seam holds its first prompt; the seam never wrote `dispatch-seed.timed-out`, read before the stop and again once the stopped daemon exited, so the test fails rather than passes when a delay let the seam give up and the unit finish starting (PR #2431 round 6); the stop drains the agent (the script got SIGTERM) before the seam is released, so posting the prompt fails; after the restart the unit's worktree and branch `agent/dispatch-interrupted-cut` are on disk, and `interrupted list --json` lists a `unit` item naming that worktree; `interrupted reclaim <id>` exits 0 with `RECLAIM_REMOVED`, removes the worktree and keeps the branch, since its ownership marker names this launch (PR #2431 round 5).
 - **Does not assert:** the window before the unit's agent is published (`dispatch::tests::a_shutdown_before_the_unit_is_published_keeps_it_as_interrupted_work`); an agent closed by a person before the stop, which rolls back as an ordinary failed start (`dispatch::tests::a_close_before_a_shutdown_at_publication_rolls_the_unit_back`, `…_at_the_first_prompt_rolls_the_unit_back`, `spawn::tests::a_role_closed_before_a_shutdown_leaves_the_ordinary_failed_spawn`); an orchestration-shaped unit or a scheduled issue dispatch cut short the same way (`work_tracking::tests::a_launch_the_shutdown_cut_short_stays_open_once_something_of_it_was_written` holds their journal half).
+- **Platform coverage:** mac+linux.
+
+#### journal/restore
+
+##### journal/restore/001 — A single interrupted agent offers conversation restore.
+
+- **Layer:** L1 pure-data unit (`src/interrupted_work_tests.rs`).
+- **Agent:** none; in-memory Claude and Codex journal records.
+- **Asserts:** single pane, dispatch and issue-dispatch items list their attempt, name, type and folder with a `resume` verdict; the latest session by sequence wins even when the reader order differs; older replies without the additive fields still read; a team with twenty attempts lists sixteen distinct agents and reports four omitted.
+- **Does not assert:** filesystem checks, process liveness, or starting an agent.
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/002 — Unsupported single agents offer Start over and team roles wait for a later version.
+
+- **Layer:** L1 pure-data unit (`src/interrupted_work_tests.rs`).
+- **Agent:** none; synthetic records for the supported agent types.
+- **Asserts:** Pi, OpenCode, Devin and Antigravity yield `start_over` with `agent-cannot-resume`; a default shell yields `default-shell`; orchestration roles, multi-attempt dispatches and a single-attempt unit with a delegation yield `none` with `orchestration-later`, listing each distinct attempt once.
+- **Does not assert:** start-over execution or saved-task delivery.
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/003 — Bad or incomplete evidence refuses restore with a specific reason.
+
+- **Layer:** L1 pure-data unit (`src/interrupted_work_tests.rs`).
+- **Agent:** none.
+- **Asserts:** duplicate or wrongly joined records and an attempt shared between plain works yield `ambiguous-record`; moved folders and missing records yield `folder-moved` and `no-launch-record`; absent and invalid session ids offer Start over with `no-session-id` and `session-id-invalid`; journal truncation, launch truncation and skipped launch records yield `incomplete-read` and mark the list incomplete.
+- **Does not assert:** restore-time safety checks or filesystem ownership.
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/004 — The launch shim injects resume arguments once and acknowledges them privately.
+
+- **Layer:** L1 unit (`src/telemetry/shim.rs`), real temporary files, no child launched; registry inputs also pinned by `journal_restore_resume_specs_define_literal_arguments_and_safe_inputs` in `src/agent_registry.rs`.
+- **Agent:** synthetic executable files and shell-script launchers named Claude or Codex.
+- **Asserts:** Claude gets `--resume <uuid>` and Codex gets `resume <uuid>` before user and embedded args; matching requests remove their one-shot variables from the child plan; private acknowledgement creation is exclusive; unmatched and absent requests pass through, and ordinary Claude gets no telemetry args. The existing installation tests also require Claude, Codex and Devin shims with telemetry on or off, while ordinary spawn PATH remains conditional on telemetry.
+- **Does not assert:** `exec` applying the child plan, agent session confirmation, or a real conversation.
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/005 — Invalid sessions and conflicting launch arguments produce refusal acknowledgements.
+
+- **Layer:** L1 unit (`src/telemetry/shim.rs` and registry inputs in `src/agent_registry.rs`).
+- **Agent:** synthetic executable files; no agent launched.
+- **Asserts:** Claude conversation-selecting and print arguments and Codex subcommands or prompts leave argv unchanged and write a private `resume-args-conflict` refusal; invalid ids write `session-id-invalid`; each refusal removes the one-shot environment. Registry inputs require canonical lowercase UUIDs, reject leading dashes and shell text, preserve supported option/value pairs, and expose no resume specification for GAP agents.
+- **Does not assert:** daemon handling of refused acknowledgements.
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/006 — Launch process identities survive storage and guard against two transcript writers.
+
+- **Layer:** L1 unit (`src/launch_records.rs`), temporary files and the test's own process identity.
+- **Agent:** none.
+- **Asserts:** additive `pid` and `pid_start` fields round-trip in v1; legacy records still read with absent fields and serialize without them; live matching identity gives `still-running`, missing or partial identity gives `old-process-unknown`, and an impossible OS pid is gone.
+- **Does not assert:** orphaned descendants in an old process session or the spawn write site.
 - **Platform coverage:** mac+linux.
 
 #### journal/compat

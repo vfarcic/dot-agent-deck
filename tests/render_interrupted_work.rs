@@ -87,6 +87,8 @@ fn item(id: &str, kind: ItemKind, name: &str) -> InterruptedItem {
             ..Progress::default()
         },
         git: None,
+        agents: Vec::new(),
+        agents_omitted: 0,
     }
 }
 

@@ -1537,6 +1537,8 @@ fn show_reads_any_one_of_the_items_reports_by_its_id() {
         cut: false,
         progress: crate::interrupted_work::Progress::default(),
         git: None,
+        agents: Vec::new(),
+        agents_omitted: 0,
     };
     for n in 1..=20 {
         item.reports.push(ItemReport {
@@ -1717,6 +1719,8 @@ fn a_dismissal_of_items_with_oversized_names_fits_its_reply() {
                     orchestration: None,
                     orchestration_id: None,
                     ts_ms: 1,
+                    pid: None,
+                    pid_start: None,
                 },
             )
             .expect("write a launch record");
@@ -1914,6 +1918,8 @@ fn show_pages_reach_every_kept_report_beyond_the_metadata_cap() {
         cut: false,
         progress: crate::interrupted_work::Progress::default(),
         git: None,
+        agents: Vec::new(),
+        agents_omitted: 0,
     };
     for n in 1..=total {
         item.reports.push(ItemReport {
@@ -2138,6 +2144,8 @@ fn a_report_page_past_the_end_up_to_usize_max_is_clamped() {
         cut: false,
         progress: Progress::default(),
         git: None,
+        agents: Vec::new(),
+        agents_omitted: 0,
     };
     let body = |report_id: &str| ShownReport {
         report_id: report_id.to_string(),

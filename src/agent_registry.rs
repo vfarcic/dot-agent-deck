@@ -367,7 +367,159 @@ pub struct AgentSpec {
     /// 7501 sequence ([`crate::status_osc`]), and the daemon reads it from the
     /// pane's output. `None` leaves the reader off, which costs a pane nothing.
     pub status_osc7501: Option<StatusOsc7501>,
+    /// PRD #1790 stage 3: how this agent is resumed into a conversation it
+    /// was in, by the id the deck holds for it. `None` for an agent the deck
+    /// cannot resume today (a documented gap: OpenCode, Pi, Devin,
+    /// Antigravity) and the placeholder; such an agent's restore offers a
+    /// fresh start instead.
+    pub resume: Option<&'static ResumeSpec>,
 }
+
+/// PRD #1790 stage 3 ([`AgentSpec::resume`]): where an agent's resume
+/// arguments go in front of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumePlacement {
+    /// An option whose value is the session id: these tokens, then the id.
+    Flag(&'static [&'static str]),
+    /// A subcommand whose first argument is the session id.
+    Subcommand(&'static str),
+}
+
+/// PRD #1790 stage 3: one agent's resume-by-id, as the launch shim applies it
+/// ([`crate::telemetry::shim`]). The shim puts the arguments in front of the
+/// agent's own as separate argv entries, never as shell text, and only when
+/// the id is one the agent's own syntax allows ([`Self::valid_session_id`])
+/// and the agent's own arguments choose no other conversation or command
+/// ([`Self::conflicts`]).
+#[derive(Debug)]
+pub struct ResumeSpec {
+    /// The program name the shim stands in front of for this agent.
+    pub program: &'static str,
+    pub placement: ResumePlacement,
+    valid_id: fn(&str) -> bool,
+    conflicting: fn(&[std::ffi::OsString]) -> bool,
+}
+
+impl ResumeSpec {
+    /// Whether `id` is a session id of this agent's own syntax.
+    pub fn valid_session_id(&self, id: &str) -> bool {
+        (self.valid_id)(id)
+    }
+
+    /// Whether the agent's own `args` already choose a conversation, or a
+    /// mode or command a resume cannot be combined with.
+    pub fn conflicts(&self, args: &[std::ffi::OsString]) -> bool {
+        (self.conflicting)(args)
+    }
+
+    /// The arguments that resume `id`, as separate argv entries.
+    pub fn args(&self, id: &str) -> Vec<std::ffi::OsString> {
+        let mut out: Vec<std::ffi::OsString> = match self.placement {
+            ResumePlacement::Flag(tokens) => tokens.iter().map(Into::into).collect(),
+            ResumePlacement::Subcommand(name) => vec![name.into()],
+        };
+        out.push(id.into());
+        out
+    }
+}
+
+/// A canonical UUID in lowercase hex, `8-4-4-4-12`, and nothing else: the
+/// session ids Claude Code and Codex report and resume by.
+pub fn is_canonical_uuid(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    bytes.len() == 36
+        && bytes.iter().enumerate().all(|(at, b)| match at {
+            8 | 13 | 18 | 23 => *b == b'-',
+            _ => b.is_ascii_digit() || (b'a'..=b'f').contains(b),
+        })
+}
+
+/// Claude Code's options that choose a conversation, or a non-interactive
+/// run a resume cannot be combined with.
+const CLAUDE_CONFLICTS: [&str; 8] = [
+    "-c",
+    "--continue",
+    "-r",
+    "--resume",
+    "--session-id",
+    "--fork-session",
+    "-p",
+    "--print",
+];
+
+fn claude_resume_conflicts(args: &[std::ffi::OsString]) -> bool {
+    args.iter().any(|arg| {
+        let arg = arg.to_string_lossy();
+        CLAUDE_CONFLICTS.iter().any(|flag| {
+            arg == *flag || (flag.starts_with("--") && arg.starts_with(&format!("{flag}=")))
+        })
+    })
+}
+
+/// Codex's options that take a value as the next argument (`codex --help`,
+/// codex-cli 0.169).
+const CODEX_VALUE_OPTIONS: [&str; 20] = [
+    "-c",
+    "--config",
+    "--enable",
+    "--disable",
+    "--remote",
+    "--remote-auth-token-env",
+    "-i",
+    "--image",
+    "-m",
+    "--model",
+    "--local-provider",
+    "-p",
+    "--profile",
+    "-s",
+    "--sandbox",
+    "-C",
+    "--cd",
+    "--add-dir",
+    "-a",
+    "--ask-for-approval",
+];
+
+/// Codex resumes through a subcommand, so its own arguments may hold neither
+/// a subcommand nor a prompt: any positional argument conflicts. An option
+/// it does not know is taken to take no value, so a value after one reads as
+/// a positional and refuses, never the other way round.
+fn codex_resume_conflicts(args: &[std::ffi::OsString]) -> bool {
+    let mut args = args.iter().map(|arg| arg.to_string_lossy());
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            return args.next().is_some();
+        }
+        if !arg.starts_with('-') || arg == "-" {
+            return true;
+        }
+        if arg.contains('=') {
+            continue;
+        }
+        if CODEX_VALUE_OPTIONS.contains(&arg.as_ref()) {
+            // The value is the option's, whatever it looks like.
+            let _ = args.next();
+        }
+    }
+    false
+}
+
+/// Claude Code: `claude --resume <id> <its own arguments>`.
+pub static CLAUDE_RESUME: ResumeSpec = ResumeSpec {
+    program: "claude",
+    placement: ResumePlacement::Flag(&["--resume"]),
+    valid_id: is_canonical_uuid,
+    conflicting: claude_resume_conflicts,
+};
+
+/// Codex: `codex resume <id> <its own options>`.
+pub static CODEX_RESUME: ResumeSpec = ResumeSpec {
+    program: "codex",
+    placement: ResumePlacement::Subcommand("resume"),
+    valid_id: is_canonical_uuid,
+    conflicting: codex_resume_conflicts,
+};
 
 /// PRD #211 ([`AgentSpec::status_osc7501`]): how one agent reports its status
 /// through OSC 7501.
@@ -964,6 +1116,7 @@ pub static CLAUDE_CODE: AgentSpec = AgentSpec {
     first_hook: FirstHook::BeforePrompt,
     questions: Some(&CLAUDE_CODE_QUESTIONS),
     status_osc7501: None,
+    resume: Some(&CLAUDE_RESUME),
 };
 
 /// PRD #1666 part 2 (`inbox/doorbell/008`): do `rows`, one trimmed screen row
@@ -1044,6 +1197,7 @@ pub static OPEN_CODE: AgentSpec = AgentSpec {
     first_hook: FirstHook::BeforePrompt,
     questions: Some(&OPEN_CODE_QUESTIONS),
     status_osc7501: None,
+    resume: None,
 };
 
 /// Pi — bundled-extension strategy (shipped, PRD #201).
@@ -1087,6 +1241,7 @@ pub static PI: AgentSpec = AgentSpec {
     first_hook: FirstHook::BeforePrompt,
     questions: None,
     status_osc7501: None,
+    resume: None,
 };
 
 /// Codex — stdout-wrapper strategy (PRD #20 M7). The first agent to use the
@@ -1147,6 +1302,7 @@ pub static CODEX: AgentSpec = AgentSpec {
     first_hook: FirstHook::WithFirstPrompt,
     questions: Some(&CODEX_QUESTIONS),
     status_osc7501: None,
+    resume: Some(&CODEX_RESUME),
 };
 
 /// PRD #1666 S7 (decision A): whether `rows` — a pane's screen, one trimmed
@@ -1362,6 +1518,7 @@ pub static DEVIN: AgentSpec = AgentSpec {
     first_hook: FirstHook::BeforePrompt,
     questions: Some(&DEVIN_QUESTIONS),
     status_osc7501: None,
+    resume: None,
 };
 
 /// Google's Antigravity CLI (`agy`, PRD #211) — native-hooks strategy, like
@@ -1442,6 +1599,7 @@ pub static ANTIGRAVITY: AgentSpec = AgentSpec {
         app: "antigravity",
         enable_env: ("AGY_CLI_OSC7501", "on"),
     }),
+    resume: None,
 };
 
 /// Neutral entry for the "no recognized agent" placeholder. Not a real agent:
@@ -1472,6 +1630,7 @@ pub static NONE: AgentSpec = AgentSpec {
     first_hook: FirstHook::BeforePrompt,
     questions: None,
     status_osc7501: None,
+    resume: None,
 };
 
 /// All SHIPPED, detectable agents, in a stable order. Excludes the neutral
@@ -1657,6 +1816,84 @@ mod tests {
     // Pure-data registry lookups — plain `#[test]` unit tests (no `#[spec]` /
     // CATALOG reproducer needed; these assert compiled-in data, not runtime
     // TUI behaviour).
+
+    /// Scenario: Read the resume table for each supported agent and check the literal resume arguments, canonical UUID validation and conflicting launch options. Agents with documented gaps have no resume specification.
+    #[test]
+    fn journal_restore_resume_specs_define_literal_arguments_and_safe_inputs() {
+        use std::ffi::OsString;
+        const ID: &str = "01234567-89ab-4cde-8fab-0123456789ab";
+        let claude: &ResumeSpec = spec(&AgentType::ClaudeCode).resume.as_ref().unwrap();
+        let codex: &ResumeSpec = spec(&AgentType::Codex).resume.as_ref().unwrap();
+        assert_eq!(claude.program, "claude");
+        assert_eq!(claude.placement, ResumePlacement::Flag(&["--resume"]));
+        assert_eq!(codex.program, "codex");
+        assert_eq!(codex.placement, ResumePlacement::Subcommand("resume"));
+        let os = |args: &[&str]| args.iter().map(OsString::from).collect::<Vec<_>>();
+        for resume in [claude, codex] {
+            assert!(resume.valid_session_id(ID));
+            for invalid in [
+                "",
+                "-01234567-89ab-4cde-8fab-0123456789ab",
+                "01234567-89AB-4CDE-8FAB-0123456789AB",
+                "0123456789ab4cde8fab0123456789ab",
+                "01234567-89ab-4cde-8fab-0123456789ag",
+                "01234567-89ab-4cde-8fab-0123456789ab extra",
+                "$(touch sentinel)",
+                "01234567-89ab-4cde-8fab-0123456789ab\n",
+            ] {
+                assert!(
+                    !resume.valid_session_id(invalid),
+                    "{} accepted {invalid:?}",
+                    resume.program
+                );
+            }
+            assert!(!resume.conflicts(&os(&[])));
+            assert!(!resume.conflicts(&os(&["--model", "mini"])));
+        }
+        for args in [
+            vec!["-c"],
+            vec!["--continue"],
+            vec!["-r", ID],
+            vec!["--resume", ID],
+            vec!["--resume=another"],
+            vec!["--session-id", ID],
+            vec!["--fork-session"],
+            vec!["-p", "hello"],
+            vec!["--print"],
+        ] {
+            assert!(claude.conflicts(&os(&args)), "Claude accepted {args:?}");
+        }
+        for args in [
+            vec!["resume", ID],
+            vec!["exec", "hello"],
+            vec!["review"],
+            vec!["hello world"],
+            vec!["--", "hello"],
+            vec!["--model", "mini", "hello"],
+        ] {
+            assert!(codex.conflicts(&os(&args)), "Codex accepted {args:?}");
+        }
+        for args in [
+            vec!["-c", "model=\"mini\""],
+            vec!["--config", "model=\"mini\""],
+            vec!["--dangerously-bypass-approvals-and-sandbox"],
+            vec!["-C", "/some/folder"],
+        ] {
+            assert!(!codex.conflicts(&os(&args)), "Codex refused {args:?}");
+        }
+        for agent in [
+            AgentType::OpenCode,
+            AgentType::Pi,
+            AgentType::Devin,
+            AgentType::Antigravity,
+            AgentType::None,
+        ] {
+            assert!(
+                spec(&agent).resume.is_none(),
+                "{agent:?} is a documented gap"
+            );
+        }
+    }
 
     /// Every shipped agent's registry label equals what the `Display` impl
     /// rendered before centralisation, and the neutral placeholder is still

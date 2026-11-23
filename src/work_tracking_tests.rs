@@ -1894,6 +1894,8 @@ fn launch_records_are_kept_while_the_read_skipped_an_unknown_kind() {
         orchestration: None,
         orchestration_id: None,
         ts_ms: 0,
+        pid: None,
+        pid_start: None,
     };
     crate::launch_records::write(state.path(), &record).unwrap();
     let planted = state
@@ -2571,6 +2573,8 @@ fn pending_cleanup_reads_real_held_free_and_missing_run_locks() {
             orchestration: None,
             orchestration_id: None,
             ts_ms: crate::launch_records::now_ms(),
+            pid: None,
+            pid_start: None,
         },
     )
     .unwrap();

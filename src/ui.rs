@@ -30526,6 +30526,9 @@ pub fn render_restart_notice_key_sequence_to_buffers(
 /// key pressed, a daemon answer delivered where the background request would
 /// deliver it, or the event stream attaching to a daemon process.
 #[doc(hidden)]
+// A test seam built a handful of steps at a time: the size of a step does not
+// matter, and boxing the large variants would only add noise to every test.
+#[allow(clippy::large_enum_variant)]
 pub enum InterruptedSeamStep {
     Key(KeyEvent),
     /// These steps, one after another, with no frame drawn before, between or

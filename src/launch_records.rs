@@ -139,6 +139,68 @@ pub struct LaunchRecord {
     pub orchestration_id: Option<String>,
     /// When it was written, in milliseconds since the Unix epoch.
     pub ts_ms: u64,
+    /// PRD #1790 stage 3: the process id of the agent's child, as the
+    /// daemon spawned it. Absent from the file when unknown, and from every
+    /// record written before it existed (still schema v1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    /// When that process started, as [`crate::platform::proc::process_start_of`]
+    /// reads it, so a later process given the same pid is not taken for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_start: Option<u64>,
+}
+
+/// PRD #1790 stage 3: why [`process_gone`] cannot say the agent a record
+/// launched is gone. Its `Display` is the reason's wire code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessNotGone {
+    /// A process with the record's pid and start time is running.
+    StillRunning,
+    /// The record holds no process identity (written before stage 3), or
+    /// this platform cannot read a process's start time.
+    OldProcessUnknown,
+}
+
+impl ProcessNotGone {
+    /// The reason's wire code.
+    pub fn code(self) -> &'static str {
+        match self {
+            ProcessNotGone::StillRunning => "still-running",
+            ProcessNotGone::OldProcessUnknown => "old-process-unknown",
+        }
+    }
+}
+
+impl std::fmt::Display for ProcessNotGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.code())
+    }
+}
+
+/// PRD #1790 stage 3: whether the agent `record` launched is gone, so a
+/// resumed copy would not write to one conversation beside it. `Ok` when no
+/// process with the record's pid and start time exists; a pid now held by a
+/// process that started at another time is another process. A record without
+/// both fields proves nothing and is refused as unknown, as is every record on
+/// a platform that cannot read a start time.
+///
+/// It checks the agent's own process only: a child of it still running in
+/// its session is the restore verb's to look for.
+pub fn process_gone(record: &LaunchRecord) -> Result<(), ProcessNotGone> {
+    let (Some(pid), Some(started)) = (record.pid, record.pid_start) else {
+        return Err(ProcessNotGone::OldProcessUnknown);
+    };
+    if !cfg!(any(target_os = "linux", target_os = "macos")) {
+        return Err(ProcessNotGone::OldProcessUnknown);
+    }
+    // A pid the OS cannot hold (`pid_t` is signed) names no process.
+    if i32::try_from(pid).is_err() {
+        return Ok(());
+    }
+    match crate::platform::proc::process_start_of(pid) {
+        Some(now) if now == started => Err(ProcessNotGone::StillRunning),
+        _ => Ok(()),
+    }
 }
 
 /// Milliseconds since the Unix epoch, now.
@@ -495,6 +557,66 @@ fn prune_limited(
 mod tests {
     use super::*;
     use crate::deck_identity::DeckId;
+    use spec::spec;
+
+    /// Scenario: Write and read an agent launch with its process identity, then read the same v1 record with those additive fields absent. Restore refuses a still-running process and an unknown old process, and allows a process that is gone.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[spec("journal/restore/006")]
+    #[test]
+    fn journal_restore_006_launch_process_identity_round_trips_and_prevents_two_writers() {
+        let state = tempfile::tempdir().unwrap();
+        let mut r = record(&work(), 7, 42);
+        r.pid = Some(std::process::id());
+        r.pid_start = Some(
+            crate::platform::proc::process_start_of(std::process::id())
+                .expect("the test process is live"),
+        );
+        write(state.path(), &r).unwrap();
+        assert_eq!(read_all(state.path()).unwrap(), vec![r.clone()]);
+        let encoded = serde_json::to_value(&r).unwrap();
+        assert_eq!(encoded["v"], 1, "pid fields are additive in schema v1");
+        assert_eq!(encoded["pid"], std::process::id());
+        assert_eq!(encoded["pid_start"], r.pid_start.unwrap());
+        assert_eq!(
+            process_gone(&r).map_err(|reason| reason.to_string()),
+            Err("still-running".into())
+        );
+
+        let mut v1 = encoded;
+        v1.as_object_mut().unwrap().remove("pid");
+        v1.as_object_mut().unwrap().remove("pid_start");
+        let legacy: LaunchRecord = serde_json::from_value(v1).unwrap();
+        assert_eq!(legacy.pid, None);
+        assert_eq!(legacy.pid_start, None);
+        assert_eq!(
+            process_gone(&legacy).map_err(|reason| reason.to_string()),
+            Err("old-process-unknown".into())
+        );
+        write(state.path(), &legacy).unwrap();
+        assert_eq!(read_all(state.path()).unwrap(), vec![legacy.clone()]);
+        let absent = serde_json::to_value(&legacy).unwrap();
+        assert!(absent.get("pid").is_none());
+        assert!(absent.get("pid_start").is_none());
+
+        // A partial process identity is also too little evidence to resume.
+        let mut partial = legacy;
+        partial.pid = r.pid;
+        assert_eq!(
+            process_gone(&partial).map_err(|reason| reason.to_string()),
+            Err("old-process-unknown".into())
+        );
+        partial.pid = None;
+        partial.pid_start = r.pid_start;
+        assert_eq!(
+            process_gone(&partial).map_err(|reason| reason.to_string()),
+            Err("old-process-unknown".into())
+        );
+
+        // u32::MAX cannot name an OS pid (pid_t is signed).
+        r.pid = Some(u32::MAX);
+        r.pid_start = Some(1);
+        assert!(process_gone(&r).is_ok());
+    }
 
     fn work() -> WorkId {
         WorkId::mint(&DeckId::parse("abcdefgh").unwrap()).unwrap()
@@ -515,6 +637,8 @@ mod tests {
             orchestration: Some("tdd".into()),
             orchestration_id: Some("orch-1".into()),
             ts_ms,
+            pid: None,
+            pid_start: None,
         }
     }
 

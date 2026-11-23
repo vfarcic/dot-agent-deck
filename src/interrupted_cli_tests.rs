@@ -23,6 +23,8 @@ fn item(id: &str, kind: ItemKind, name: &str) -> InterruptedItem {
         cut: false,
         progress: Default::default(),
         git: None,
+        agents: Vec::new(),
+        agents_omitted: 0,
     }
 }
 
