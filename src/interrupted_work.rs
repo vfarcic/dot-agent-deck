@@ -1392,6 +1392,10 @@ pub const START_OVER_NEEDS_YES: &str =
 pub const RESTORE_DAEMON_REPLACED: &str = "Refused: the deck daemon was restarted or replaced while you were answering, so nothing was started. Ask again.";
 /// The running daemon does not advertise the restore verbs.
 pub const RESTORE_UNSUPPORTED: &str = "The running deck daemon does not support restoring agents. Stop it with `dot-agent-deck daemon restart`, then start one from this build: open the TUI, or press Start daemon in the desktop app.";
+/// PR #2497 review: restore asked for an item that lists no agent. The TUI
+/// offers neither `s` nor its hint for such an item; the desktop's voice
+/// command answers with this.
+pub const NO_AGENT_TO_RESTORE: &str = "This item lists no agent to restore.";
 
 /// PRD #1790 stage 3: which note a restored agent receives first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

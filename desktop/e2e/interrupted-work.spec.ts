@@ -310,6 +310,31 @@ async function openRestorePreview(page: Page, fixture = "restore") {
   return dialog;
 }
 
+test.describe("journal/restore/044 — no restore for an item without an agent", () => {
+  /** Scenario: open Interrupted work on the three items that list no agent, select each in the list and in its details, and press s. No Restore button is shown and no restore question opens, as the TUI offers no s for them. */
+  test("journal/restore/044 hides Restore and leaves s inert", async ({ page }) => {
+    await openDashboard(page);
+    await page.getByTestId("interrupted-banner-show").click();
+    const dialog = page.getByTestId("interrupted-dialog");
+    const rows = dialog.getByTestId("interrupted-row");
+    await expect(rows).toHaveCount(3);
+    for (let at = 0; at < 3; at += 1) {
+      await rows.nth(at).click();
+      await expect(dialog.getByTestId("interrupted-details")).toBeVisible();
+      await expect(dialog.getByTestId("interrupted-restore")).toHaveCount(0);
+      await page.keyboard.press("s");
+      await expect(dialog.getByTestId("interrupted-restore-question")).toHaveCount(0);
+      await dialog.getByTestId("interrupted-details").click();
+      await expect(dialog.getByTestId("interrupted-details-view")).toBeVisible();
+      await expect(dialog.getByTestId("interrupted-restore")).toHaveCount(0);
+      await page.keyboard.press("s");
+      await expect(dialog.getByTestId("interrupted-restore-question")).toHaveCount(0);
+      await expect(dialog.getByTestId("interrupted-details-view")).toBeVisible();
+      await dialog.getByTestId("interrupted-back").click();
+    }
+  });
+});
+
 test.describe("journal/restore/009 — desktop restore in the browser", () => {
   for (const [key, name, button] of [
     ["c", "Restore and continue", "interrupted-restore-continue"],

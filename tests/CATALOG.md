@@ -1208,6 +1208,22 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 - **Does not assert:** daemon execution (`journal/restore/042`); the desktop app's rendering, which reads the same verdict and sentence (`interruptedWork.test.ts`, `journal/restore/009`).
 - **Platform coverage:** mac+linux.
 
+##### journal/restore/044 — An item that lists no agent offers no restore.
+
+- **Layer:** L1 `TestBackend` through `run_interrupted_work_seam` (`tests/render_interrupted_work.rs`); list and details. The desktop app's half is in `desktop/src/components/InterruptedWork.test.tsx` and `desktop/e2e/interrupted-work.spec.ts`.
+- **Agent:** none; an injected item with no agents, as a daemon that lists none returns (PR #2497 review, Qodo).
+- **Asserts:** with the daemon restoring agents or not, neither the list's nor the details' hints offer `s`, pressing `s` leaves the frame as it was and sends nothing; in the desktop app the Restore button is absent in both views, `s` opens no question, and a spoken restore opens none and answers `This item lists no agent to restore.`
+- **Does not assert:** an item whose agents are all brought back (`journal/restore/043`).
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/045 — An interrupted list the deck cannot read at startup defers no saved pane.
+
+- **Layer:** L1 unit of `saved_restore_deferral_from` (`tests/session_restore_precedence.rs`), the decision the daemon-empty saved-workspace restore in `src/ui.rs` takes from the daemon's answer.
+- **Agent:** none; in-memory answers and launch records.
+- **Asserts:** no answer within the bound, a failed request, or launch records that cannot be read each defer nothing and name a reason (the caller logs it with `warn!` and starts every saved pane fresh, PR #2497 review); a daemon that does not list interrupted work or offers no resume defers nothing without a reason; a readable answer offering a resume defers by it.
+- **Does not assert:** the match between a saved pane and a launch record (`journal/restore/018`); the `warn!` line itself or a real slow daemon.
+- **Platform coverage:** mac+linux.
+
 #### journal/compat
 
 ##### journal/compat/001 — Lines of a newer schema or an unknown kind are skipped and kept.

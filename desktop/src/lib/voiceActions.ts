@@ -1408,8 +1408,8 @@ export const VOICE_ACTIONS = {
   /* PRD #1790 stage 3 — Restore. Voice never starts an agent (PRD #802 D5):
      this asks the restore question about the item the words name, and the
      agent starts on the person's own click or key on it. The Restore button
-     and `s` open the same question through this entry. With the
-     experimental flag off the dialog refuses it, saying so. */
+     and `s` open the same question through this entry; for an item that
+     lists no agent the dialog asks nothing and says so. */
   askRestoreInterrupted: {
     label: "Ask to restore an interrupted agent",
     voice: true,

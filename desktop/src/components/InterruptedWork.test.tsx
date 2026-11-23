@@ -7,7 +7,7 @@ import { createFixtureSnapshot } from "../data/fixture";
 import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, LOCAL_ENDPOINT_SELECTION, type DeckBridge, type DesktopSettingsDto } from "../lib/bridge";
 import { AGENTS_STOPPED_BY_RESTART } from "../lib/agentIdentity";
 import {
-  DISMISSED, INTERRUPTED_UNREAD, INTERRUPTED_WORK_TITLE, LIST_INCOMPLETE, LIST_REFRESH_FAILED, NOTHING_INTERRUPTED, OTHER_AGENTS_GROUP, RECLAIM_KEPT_DIRTY, RECLAIM_REMOVED, RECLAIM_WOULD_REMOVE, REFUSED_AMBIGUOUS, REFUSED_INCOMPLETE_READ, REFUSED_NOT_LISTED, dismissAllQuestion, gitFactsLine, interruptedFooter, reportRangeSentence,
+  DISMISSED, INTERRUPTED_UNREAD, INTERRUPTED_WORK_TITLE, LIST_INCOMPLETE, LIST_REFRESH_FAILED, NOTHING_INTERRUPTED, OTHER_AGENTS_GROUP, RECLAIM_KEPT_DIRTY, RECLAIM_REMOVED, RECLAIM_WOULD_REMOVE, NO_AGENT_TO_RESTORE, REFUSED_AMBIGUOUS, REFUSED_INCOMPLETE_READ, REFUSED_NOT_LISTED, dismissAllQuestion, gitFactsLine, interruptedFooter, reportRangeSentence,
   type DismissOutcome, type InterruptedItem, type InterruptedList, type InterruptedReply, type InterruptedShow, type InterruptedTarget, type ReclaimOutcome, type RestoreMode, type RestoreOutcome, type StartOverOutcome,
 } from "../lib/interruptedWork";
 import { VOICE_ACTIONS, INTERRUPTED_RECLAIM_CHECKING, type VoiceOverviewChannel, type VoiceOverviewContext } from "../lib/voiceActions";
@@ -1521,5 +1521,36 @@ describe("journal/restore/010 — spoken restore asks and stops", () => {
     expect(voice.reportRefused).toHaveBeenCalledWith(expect.any(String));
     expect(within(dialog).queryByTestId("interrupted-restore-question")).toBeNull();
     expect(recorded.actions()).toEqual([]);
+  });
+});
+
+describe("journal/restore/044 — an item that lists no agent offers no restore", () => {
+  /** Scenario: open Interrupted work on items that list no agent and select each, in the list and in its details. No Restore button is drawn and s opens no question, as the TUI offers no s for such an item. */
+  it.each([false, true])("journal/restore/044 hides Restore and leaves s inert, details=%s", async (details) => {
+    const { bridge, calls } = recordingBridge({ list: three() });
+    render(<RestoreOverview bridge={bridge} />);
+    const dialog = await openDialog();
+    for (const id of [AGENT_ID, UNIT_ID, TEAM_ID]) {
+      await act(async () => { fireEvent.click(rowOf(id)); });
+      if (details) await act(async () => { fireEvent.click(within(dialog).getByTestId("interrupted-details")); });
+      expect(within(dialog).queryByTestId("interrupted-restore")).toBeNull();
+      await restoreKey(dialog, "s");
+      expect(within(dialog).queryByTestId("interrupted-restore-question")).toBeNull();
+      if (details) await act(async () => { fireEvent.click(within(dialog).getByTestId("interrupted-back")); });
+    }
+    expect(calls.filter((call) => call.verb === "restore" || call.verb === "start-over")).toEqual([]);
+  });
+
+  /** Scenario: with an item that lists no agent selected, voice asks to restore it. No question opens, nothing is started, and the voice surface answers that the item lists no agent to restore. */
+  it("journal/restore/044 a spoken restore answers that there is no agent", async () => {
+    const { bridge, calls } = recordingBridge({ list: three() });
+    const voice = voiced(bridge);
+    render(<voice.Voiced />);
+    const dialog = await openDialog();
+    await act(async () => { fireEvent.click(rowOf(UNIT_ID)); });
+    await act(async () => { VOICE_ACTIONS.askRestoreInterrupted.run(voice.context(), {}); });
+    expect(voice.reportRefused).toHaveBeenCalledWith(NO_AGENT_TO_RESTORE);
+    expect(within(dialog).queryByTestId("interrupted-restore-question")).toBeNull();
+    expect(calls.filter((call) => call.verb === "restore" || call.verb === "start-over")).toEqual([]);
   });
 });

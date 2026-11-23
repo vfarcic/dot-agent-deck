@@ -13880,10 +13880,16 @@ const SAVED_RESTORE_LIST_TIMEOUT: std::time::Duration = std::time::Duration::fro
 
 /// PRD #1790 stage 3: what [`should_defer_saved_agent_restore`] decides
 /// from — the attached daemon's interrupted work list and the launch records
-/// in this user's state directory — or `None` when no saved pane could be
-/// left for the restore question: no plain saved pane has a command, the
-/// daemon did not answer within its bound or cannot list interrupted work,
-/// or it offers no resume.
+/// in this user's state directory — or `None` when no saved pane is left for
+/// the restore question.
+///
+/// It defers only when it can read the list. When the daemon does not answer
+/// within [`SAVED_RESTORE_LIST_TIMEOUT`], the request fails or the launch
+/// records cannot be read, every saved pane starts as it did before PRD #1790
+/// stage 3, fresh, and a `warn!` names the reason (PR #2497 review): holding
+/// back saved panes on a list nobody read would drop them silently. The
+/// person then closes the fresh pane and restores the agent from Interrupted
+/// work, as `docs/session-management.md` says.
 ///
 /// The launch records are read locally, but only a record whose work id and
 /// attempt are those of an item and agent this daemon listed can match: a
@@ -13903,20 +13909,70 @@ fn saved_restore_deferral(
     {
         return None;
     }
-    let handle = tokio::runtime::Handle::try_current().ok()?;
-    let client = crate::daemon_client::DaemonClient::new(
-        crate::endpoint_resolve::client_attach_socket_path(),
-    )
-    .with_protocol_gate();
-    let answered = handle.block_on(async {
-        tokio::time::timeout(
-            SAVED_RESTORE_LIST_TIMEOUT,
-            client.list_interrupted_work(false, None),
-        )
-        .await
-    });
-    let Ok(Ok(crate::daemon_client::GatedQuery::Answered(list))) = answered else {
-        return None;
+    let answered = tokio::runtime::Handle::try_current()
+        .map_err(|error| format!("no async runtime to ask the daemon on: {error}"))
+        .map(|handle| {
+            let client = crate::daemon_client::DaemonClient::new(
+                crate::endpoint_resolve::client_attach_socket_path(),
+            )
+            .with_protocol_gate();
+            handle.block_on(async {
+                tokio::time::timeout(
+                    SAVED_RESTORE_LIST_TIMEOUT,
+                    client.list_interrupted_work(false, None),
+                )
+                .await
+                .ok()
+            })
+        });
+    match answered.and_then(|answered| {
+        saved_restore_deferral_from(answered, || {
+            crate::launch_records::read_all(&config::state_dir())
+        })
+    }) {
+        Ok(deferral) => deferral,
+        Err(reason) => {
+            tracing::warn!(
+                reason = %reason,
+                "saved workspace: no saved pane was deferred for the restore question because \
+                 the interrupted work list could not be read; saved panes start fresh"
+            );
+            None
+        }
+    }
+}
+
+/// PRD #1790 stage 3 (PR #2497 review): [`saved_restore_deferral`]'s
+/// decision from the daemon's answer, `None` when it gave none within its
+/// bound. `Ok(Some(..))` defers by what was read; `Ok(None)` has nothing to
+/// defer, because the daemon does not list interrupted work or offers no
+/// resume; `Err` names why the list or the launch records could not be read,
+/// and defers nothing either.
+pub fn saved_restore_deferral_from(
+    answered: Option<
+        Result<
+            crate::daemon_client::GatedQuery<crate::interrupted_work::InterruptedList>,
+            crate::daemon_client::ClientError,
+        >,
+    >,
+    read_launches: impl FnOnce() -> std::io::Result<Vec<crate::launch_records::LaunchRecord>>,
+) -> Result<
+    Option<(
+        crate::interrupted_work::InterruptedList,
+        Vec<crate::launch_records::LaunchRecord>,
+    )>,
+    String,
+> {
+    let list = match answered {
+        None => {
+            return Err(format!(
+                "the daemon did not answer within {}s",
+                SAVED_RESTORE_LIST_TIMEOUT.as_secs()
+            ));
+        }
+        Some(Err(error)) => return Err(error.to_string()),
+        Some(Ok(crate::daemon_client::GatedQuery::Unsupported)) => return Ok(None),
+        Some(Ok(crate::daemon_client::GatedQuery::Answered(list))) => list,
     };
     let offers_resume = list.items.iter().any(|item| {
         item.agents
@@ -13924,10 +13980,11 @@ fn saved_restore_deferral(
             .any(|agent| agent.restore == crate::interrupted_work::RestoreVerdict::Resume)
     });
     if !offers_resume {
-        return None;
+        return Ok(None);
     }
-    let launches = crate::launch_records::read_all(&config::state_dir()).ok()?;
-    Some((list, launches))
+    let launches = read_launches()
+        .map_err(|error| format!("the deck's launch records could not be read: {error}"))?;
+    Ok(Some((list, launches)))
 }
 
 /// PRD #89 M2b.3 — rebuild one saved orchestration tab on the daemon-empty
@@ -15879,8 +15936,9 @@ pub fn run_tui(
         // into the unconditional read without entangling the gate. Two loads by
         // design; see the note at the top-of-function read.
         let saved = config::SavedSession::load();
-        // PRD #1790 stage 3: with restore on, a saved agent the daemon can
-        // resume is left for the restore question rather than started blank.
+        // PRD #1790 stage 3: a saved agent the daemon can resume is left for
+        // the restore question rather than started blank, when the deck can
+        // read the interrupted work list now; otherwise it starts fresh.
         let restore_deferral = saved_restore_deferral(&saved);
         // PRD #89 M2b.3 — the first orchestration tab rebuilt from the snapshot,
         // so we can land on it (start cursor) after the loop rather than snapping

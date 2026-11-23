@@ -1334,7 +1334,7 @@ pub(super) fn press(ui: &mut UiState, press: Press) {
 
 /// PRD #1790 stage 3: `s` — ask whether to restore the selected item's agent
 /// (in the details, the item shown). Nothing is sent: the question's own keys
-/// act. A daemon known not to restore agents is asked nothing, and the list
+/// act. An item that lists no agent is asked nothing. A daemon known not to restore agents is asked nothing, and the list
 /// says so; while a reclaim, dismissal or restore is in flight nothing opens.
 fn ask_restore(ui: &mut UiState) {
     let iw = &mut ui.interrupted;
@@ -1346,7 +1346,9 @@ fn ask_restore(ui: &mut UiState) {
         View::Details { id, .. } => iw.item(id),
         _ => None,
     };
-    let Some(item) = item else {
+    // PR #2497 review: an item that lists no agent has nothing to ask about,
+    // so `s` does nothing for it, as its hints offer no `s`.
+    let Some(item) = item.filter(|item| !item.agents.is_empty()) else {
         return;
     };
     if iw.restore_capable == Some(false) {

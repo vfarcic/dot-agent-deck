@@ -2498,3 +2498,36 @@ fn journal_restore_043_a_partly_restored_item_offers_only_the_agent_still_interr
         "c restores the agent still interrupted, alone"
     );
 }
+
+/// Scenario: Open the interrupted list on an item that lists no agent, from a daemon that restores agents and from one that does not, and press s in the list and in its details. Neither hint offers s, the frame after s is the frame before it, and nothing is sent, as the desktop app hides Restore for such an item.
+#[spec("journal/restore/044")]
+#[test]
+fn journal_restore_044_an_item_with_no_agent_offers_no_restore() {
+    let listed = item(AGENT_ID, ItemKind::Agent, "no-agent-item");
+    assert!(listed.agents.is_empty(), "the fixture lists no agent");
+    for capable in [true, false] {
+        for details in [false, true] {
+            let mut steps = vec![InterruptedSeamStep::RestoreCapability(capable), ch('I')];
+            if details {
+                steps.push(key(KeyCode::Enter));
+            }
+            let (before, _) = run(&only(listed.clone()), &steps);
+            let before = before.last().unwrap().clone();
+            assert!(
+                !before.contains("s restore"),
+                "no s hint (capable={capable}, details={details}):\n{before}"
+            );
+            steps.push(ch('s'));
+            let (after, sent) = run(&only(listed.clone()), &steps);
+            assert_eq!(
+                after.last().unwrap(),
+                &before,
+                "s does nothing (capable={capable}, details={details})"
+            );
+            assert!(
+                restore_actions(&sent).is_empty(),
+                "s sends nothing: {sent:?}"
+            );
+        }
+    }
+}

@@ -185,3 +185,65 @@ fn journal_restore_018_saved_panes_defer_only_an_exact_restorable_launch() {
         "matching an attempt under the wrong work must not hide a saved pane"
     );
 }
+
+/// Scenario: On a daemon-empty TUI startup, the interrupted work list the saved-workspace restore asks for does not answer within its bound, fails, or answers while the launch records cannot be read. No saved pane is deferred and each case names its reason, so every saved pane starts fresh as before; a daemon that does not list interrupted work, or offers no resume, defers nothing without a reason, and a readable answer offering a resume defers by it.
+#[spec("journal/restore/045")]
+#[test]
+fn journal_restore_045_an_unread_interrupted_list_defers_no_saved_pane() {
+    use dot_agent_deck::daemon_client::{ClientError, GatedQuery};
+    use dot_agent_deck::ui::saved_restore_deferral_from;
+
+    let resumable: InterruptedList = serde_json::from_value(json!({
+        "items":[{
+            "id":"w-abcdefgh-0000000000000045", "kind":"agent", "name":"saved-agent",
+            "worktree":"/home/me/code/restore-app",
+            "last_entry":{"kind":"attempt_ended", "ts_ms":1795400000000_u64},
+            "agents":[{"attempt":"restore-saved/45", "restore":{"kind":"resume"}}]
+        }],
+        "incomplete":false, "omitted":0
+    }))
+    .unwrap();
+    assert_eq!(resumable.items[0].agents[0].restore, RestoreVerdict::Resume);
+    let unread = || -> std::io::Result<Vec<LaunchRecord>> {
+        panic!("the launch records are read only once the list offers a resume")
+    };
+
+    let timed_out = saved_restore_deferral_from(None, unread)
+        .expect_err("no answer within the bound is a reason, not a deferral");
+    assert!(timed_out.contains("did not answer"), "{timed_out}");
+
+    let failed =
+        saved_restore_deferral_from(Some(Err(ClientError::Server("list failed".into()))), unread)
+            .expect_err("a failed request defers nothing");
+    assert!(failed.contains("list failed"), "{failed}");
+
+    let records_unreadable =
+        saved_restore_deferral_from(Some(Ok(GatedQuery::Answered(resumable.clone()))), || {
+            Err(std::io::Error::other("records unreadable"))
+        })
+        .expect_err("unreadable launch records defer nothing");
+    assert!(
+        records_unreadable.contains("records unreadable"),
+        "{records_unreadable}"
+    );
+
+    assert_eq!(
+        saved_restore_deferral_from(Some(Ok(GatedQuery::Unsupported)), unread),
+        Ok(None),
+        "a daemon without interrupted work has nothing to defer"
+    );
+    assert_eq!(
+        saved_restore_deferral_from(
+            Some(Ok(GatedQuery::Answered(InterruptedList::default()))),
+            unread
+        ),
+        Ok(None),
+        "no resume offered: nothing to defer"
+    );
+    let deferral =
+        saved_restore_deferral_from(Some(Ok(GatedQuery::Answered(resumable.clone()))), || {
+            Ok(Vec::new())
+        })
+        .expect("a readable answer offering a resume");
+    assert_eq!(deferral, Some((resumable, Vec::new())));
+}

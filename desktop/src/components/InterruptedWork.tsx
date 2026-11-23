@@ -6,7 +6,7 @@ import {
   DAEMON_FAILED, DISMISS_ACTION, DISMISS_ALL_ACTION, INTERRUPTED_NO_NEXT_PAGE, INTERRUPTED_UNREAD, INTERRUPTED_NO_PREVIOUS_PAGE, INTERRUPTED_NO_REPORTS, INTERRUPTED_WAIT, INTERRUPTED_WORK_TITLE, ITEM_CUT, LABEL_BRANCH, LABEL_GIT, LABEL_ISSUE,
   LABEL_LAST_ENTRY, LABEL_NESTED_WORKTREE, LABEL_PROGRESS, LABEL_REPORT, LABEL_STARTED_BY, LABEL_WORKTREE, LIST_INCOMPLETE, LIST_REFRESH_FAILED, MAX_SHOWN_REPORTS, NOTHING_INTERRUPTED, OTHER_AGENTS_GROUP, RECLAIM_ACTION, RECLAIM_EXPLANATION,
   REFUSED_NOT_LISTED, REFUSED_PLAIN_AGENT, REPORT_CUT, REPORT_UNREADABLE, UNSUPPORTED,
-  LABEL_AGENT, LABEL_ATTEMPT, LABEL_FOLDER, RESTORE_ACTION, RESTORE_AND_CONTINUE, RESTORE_AND_CONTINUE_EXPLANATION, RESTORE_ONLY, RESTORE_ONLY_EXPLANATION, RESTORE_UNSUPPORTED, START_OVER,
+  LABEL_AGENT, LABEL_ATTEMPT, LABEL_FOLDER, RESTORE_ACTION, RESTORE_AND_CONTINUE, RESTORE_AND_CONTINUE_EXPLANATION, RESTORE_ONLY, RESTORE_ONLY_EXPLANATION, RESTORE_UNSUPPORTED, START_OVER, NO_AGENT_TO_RESTORE,
   detailsItem, directoryLabel, dismissAllQuestion, dismissMessage, dismissOneQuestion, displayValue, formatTime, gitFactsLine, interruptedFooter, itemName, keptUntil, kindLabel, lastEntryLine, mayHaveInterrupted, omittedSentence, orderedItems, progressFact,
   progressLine, publishInterruptedDialog, reclaimMessage, reportLines, reportRangeSentence, resolveSpokenItem, unpushedSentence, wouldRemove,
   agentName, offersChoice, restoreAgent, restoreGitNote, restoreMessage, restoreQuestion, restoreReasonSentence, restoreVerdictSentence, restoredCleanly, startOverMessage, startOverQuestion,
@@ -367,6 +367,8 @@ export function InterruptedWorkDialog({ deckLabel, deck, target, runtime, contro
       setView(LIST);
       return RESTORE_UNSUPPORTED;
     }
+    /* PR #2497 review: an item that lists no agent has nothing to ask about; the TUI's `s` does nothing for one. */
+    if (!hasRestoreAgent(chosen)) return NO_AGENT_TO_RESTORE;
     setMessage(undefined);
     const agent = restoreAgent(chosen);
     setView({ kind: "restore", id: chosen.id, attempt: agent?.attempt, name: agent ? agentName(agent, chosen) : itemName(chosen), verdict: agent?.restore ?? { kind: "unknown" } });
@@ -620,6 +622,7 @@ export function InterruptedWorkDialog({ deckLabel, deck, target, runtime, contro
         */
         case "s":
           if (view.kind !== "list" && view.kind !== "details") return false;
+          if (!hasRestoreAgent(view.kind === "list" ? selected : item(view.id))) return false;
           VOICE_ACTIONS.askRestoreInterrupted.run(registry, {});
           return true;
         case "c": case "o": case "w": {
@@ -718,7 +721,7 @@ function ListView({ deck, ordered, selected, busy, registry, listRef }: { deck: 
       {selected && (
         <div className="interrupted-actions">
           <button type="button" className="button secondary compact" data-testid="interrupted-details" onClick={() => VOICE_ACTIONS.showInterruptedDetails.run(registry, { itemId: selected.id })}>Details</button>
-          <RestoreButton busy={busy} registry={registry} />
+          {hasRestoreAgent(selected) && <RestoreButton busy={busy} registry={registry} />}
           {selected.kind !== "agent" && <button type="button" className="button secondary compact" data-testid="interrupted-reclaim" disabled={busy} title={`${RECLAIM_ACTION}: ${RECLAIM_EXPLANATION}`} onClick={() => VOICE_ACTIONS.reclaimInterrupted.run(registry, {})}>{RECLAIM_ACTION}</button>}
           <button type="button" className="button secondary compact" data-testid="interrupted-dismiss" disabled={busy} onClick={() => VOICE_ACTIONS.dismissSelectedInterrupted.run(registry)}>{DISMISS_ACTION}</button>
           <button type="button" className="button secondary compact" data-testid="interrupted-dismiss-all-open" disabled={busy} onClick={() => VOICE_ACTIONS.dismissAllInterrupted.run(registry)}>{DISMISS_ALL_ACTION}</button>
@@ -748,7 +751,12 @@ function ItemRow({ item, selected, registry }: { item: InterruptedItem; selected
   );
 }
 
-/** PRD #1790 stage 3 — Restore, in the list and in an item's details: opens the restore question, as `s` does. */
+/** PR #2497 review — whether `item` lists an agent the restore question could ask about; Restore and `s` are offered only then, as in the TUI. */
+function hasRestoreAgent(item?: InterruptedItem): boolean {
+  return (item?.agents?.length ?? 0) > 0;
+}
+
+/** PRD #1790 stage 3 — Restore, in the list and in an item's details: opens the restore question, as `s` does. Shown only for an item with an agent. */
 function RestoreButton({ busy, registry }: { busy: boolean; registry: Registry }) {
   return <button type="button" className="button secondary compact" data-testid="interrupted-restore" disabled={busy} onClick={() => VOICE_ACTIONS.askRestoreInterrupted.run(registry, {})}>{RESTORE_ACTION}</button>;
 }
@@ -794,7 +802,7 @@ function DetailsView({ view, item, busy, registry }: { view: Extract<View, { kin
       {view.failed && <p className="interrupted-message" role="status" data-testid="interrupted-report-failed">{view.failed}</p>}
       <div className="interrupted-actions">
         <button type="button" className="button secondary compact" data-testid="interrupted-back" onClick={() => VOICE_ACTIONS.backInterruptedWork.run(registry)}>Back</button>
-        <RestoreButton busy={busy} registry={registry} />
+        {hasRestoreAgent(item) && <RestoreButton busy={busy} registry={registry} />}
         {!view.asked && item.reports.length > 0 && <button type="button" className="button secondary compact" data-testid="interrupted-show-reports" onClick={() => VOICE_ACTIONS.showInterruptedReports.run(registry, {})}>Show reports</button>}
         {show && from > 0 && <button type="button" className="button secondary compact" data-testid="interrupted-previous-reports" onClick={() => VOICE_ACTIONS.previousInterruptedReports.run(registry)}>Previous reports</button>}
         {show && typeof show.next_reports_from === "number" && <button type="button" className="button secondary compact" data-testid="interrupted-next-reports" onClick={() => VOICE_ACTIONS.nextInterruptedReports.run(registry)}>Next reports</button>}
