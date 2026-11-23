@@ -950,3 +950,9 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 [[profile.default.overrides]]
 filter = 'test(/^doorbell_010_live_(kept_draft|spaces_only|spaces_moved_back|blanks_enter|reviewer_sequence)/)'
 slow-timeout = { period = "60s", terminate-after = 5 }
+
+# Two real turns plus startup, restart and receipt in the agent-restore tests.
+# Both daemon lifetimes have a 900-second cap, beyond this 840-second bound.
+[[profile.default.overrides]]
+filter = 'test(/^journal_restore_01[67]_/)'
+slow-timeout = { period = "60s", terminate-after = 14 }

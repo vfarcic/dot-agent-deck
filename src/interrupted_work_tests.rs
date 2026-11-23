@@ -1705,6 +1705,7 @@ fn a_failed_resume_offers_start_over_and_a_restore_or_start_over_leaves_the_list
             work: w.clone(),
             attempt: a.clone(),
             failure: RestoreFailure::SessionMismatch,
+            shim: None,
         },
     );
     let list = derive_in(&j, vec![restore_record(&w, &a, AgentType::ClaudeCode)], &[]);

@@ -701,8 +701,12 @@ fn codex_resume_conflicts(args: &[std::ffi::OsString]) -> bool {
 }
 
 /// Codex's subcommands that manage it rather than start or continue a
-/// session (`codex --help`, codex-cli 0.169).
-const CODEX_MANAGING_SUBCOMMANDS: [&str; 20] = [
+/// session (`codex --help`, codex-cli 0.169). The services count:
+/// `app-server`, `exec-server` and `remote-control` start no conversation
+/// from their arguments, and the deck itself runs `codex app-server` in a
+/// Codex pane before the agent starts (its hooks trust probe), which once
+/// spent a restore's one-shot resume request as a refusal.
+const CODEX_MANAGING_SUBCOMMANDS: [&str; 23] = [
     "login",
     "logout",
     "mcp",
@@ -723,6 +727,9 @@ const CODEX_MANAGING_SUBCOMMANDS: [&str; 20] = [
     "sandbox",
     "cloud",
     "queue",
+    "app-server",
+    "exec-server",
+    "remote-control",
 ];
 
 /// Whether Codex's own `args` start no session: `--help`/`-h` or
@@ -2237,6 +2244,43 @@ mod tests {
             vec!["--", "--version"],
         ] {
             assert!(!codex.inspects(&os(&args)), "Codex: {args:?}");
+        }
+    }
+
+    /// PRD #1790 stage 3, lane-2 `journal/restore/017`'s failed run: the
+    /// launch it restored, after the shell's word splitting, chooses no
+    /// conversation and is not an inspection, and its Codex session id (a
+    /// UUIDv7) is of Codex's syntax. The deck's own hooks trust probe in the
+    /// same pane, `codex app-server`, is a service that starts no
+    /// conversation: the shim must leave the resume request for the launch,
+    /// not refuse it there (which spent the one-shot request).
+    #[test]
+    fn codex_restore_launch_resumes_and_its_app_server_probe_inspects() {
+        use std::ffi::OsString;
+        let codex = spec(&AgentType::Codex).resume.unwrap();
+        let os = |args: &[&str]| args.iter().map(OsString::from).collect::<Vec<_>>();
+        let launch = os(&[
+            "--model",
+            "gpt-5.6-luna",
+            "--sandbox",
+            "workspace-write",
+            "--ask-for-approval",
+            "never",
+            "-c",
+            "model_reasoning_effort=\"low\"",
+        ]);
+        assert!(!codex.conflicts(&launch));
+        assert!(!codex.inspects(&launch));
+        let embedded = [crate::wrap::CODEX_EMBEDDED_ARGS.as_slice(), &["-s", "x"]].concat();
+        assert!(!codex.conflicts(&os(&embedded)));
+        assert!(codex.valid_session_id("01a206e2-2b6a-7412-9069-33b41fd7962e"));
+        for args in [
+            vec!["app-server"],
+            vec!["exec-server"],
+            vec!["remote-control"],
+            vec!["-c", "x=1", "app-server", "--listen", "stdio://"],
+        ] {
+            assert!(codex.inspects(&os(&args)), "Codex: {args:?}");
         }
     }
 

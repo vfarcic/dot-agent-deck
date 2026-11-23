@@ -548,6 +548,35 @@ pub enum RestoreFailure {
     Unknown,
 }
 
+/// PRD #1790 stage 3: what the launch shim had done with a restore's
+/// one-shot resume request when the restore gave up
+/// ([`Event::RestoreFailed`]'s `shim`), so a failure can be told apart
+/// after the fact: a refusal names its reason, as the shim wrote it
+/// (`crate::telemetry::shim`'s `REFUSED_*`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ShimOutcome {
+    /// No call of the program reached the shim with the request.
+    NotReached,
+    /// A call claimed the request and published no outcome: it is still
+    /// deciding, or failed after claiming. Never a resume.
+    Pending,
+    /// The shim gave the agent its resume arguments.
+    Resumed,
+    /// Refused: the program's own arguments choose another conversation or
+    /// a command a resume cannot be combined with.
+    ResumeArgsConflict,
+    /// Refused: the id is not of the agent's own syntax.
+    SessionIdInvalid,
+    /// Refused: the program has no resume by id.
+    AgentCannotResume,
+    /// Refused, with a reason the deck could not read.
+    Refused,
+    /// An outcome of a newer daemon's.
+    #[serde(other)]
+    Unknown,
+}
+
 /// External references of a work. Every field is optional.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Refs {
@@ -680,6 +709,11 @@ pub enum Event {
         work: WorkId,
         attempt: AttemptId,
         failure: RestoreFailure,
+        /// What the launch shim had done with the resume request when the
+        /// restore gave up; absent for a restore with no request, and from
+        /// a build before it was recorded. Additive under `v:1`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        shim: Option<ShimOutcome>,
     },
 }
 

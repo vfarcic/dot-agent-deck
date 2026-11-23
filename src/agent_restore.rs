@@ -104,7 +104,7 @@ use crate::interrupted_work::{
 };
 use crate::launch_records::{LaunchRecord, ProcessNotGone};
 use crate::work_journal::{
-    AttemptId, CloseHow, Event, RestoreFailure, RestoredHow, WorkId, WorkJournal,
+    AttemptId, CloseHow, Event, RestoreFailure, RestoredHow, ShimOutcome, WorkId, WorkJournal,
 };
 
 /// How long a restore waits for the restored agent to confirm its
@@ -879,10 +879,18 @@ async fn start(
             )
             .await;
             daemon.registry.unwatch_restore_session(&pane_id);
-            if let Err(failure) = confirmed {
+            if let Err(Unconfirmed {
+                failure,
+                shim: shim_outcome,
+                seen,
+            }) = confirmed
+            {
                 tracing::info!(
                     attempt = %target.attempt,
                     ?failure,
+                    shim = ?shim_outcome,
+                    requested = %session,
+                    seen = ?seen,
                     "restore: the agent did not come back into its conversation; stopping it"
                 );
                 crate::spawn::close_started_agents(
@@ -898,6 +906,7 @@ async fn start(
                         work: record.work.clone(),
                         attempt: target.attempt.clone(),
                         failure,
+                        shim: shim_outcome,
                     }],
                 )
                 .await;
@@ -969,6 +978,18 @@ async fn record_blocking(journal: &WorkJournal, events: Vec<Event>) -> bool {
     .unwrap_or(false)
 }
 
+/// Why [`confirm`] gave up: the failure the journal records, what the shim
+/// had done with the request then ([`crate::telemetry::shim::ack_outcome`],
+/// `None` without a request), and for a different conversation the one the
+/// agent reported.
+#[cfg(unix)]
+#[derive(Debug)]
+struct Unconfirmed {
+    failure: RestoreFailure,
+    shim: Option<ShimOutcome>,
+    seen: Option<String>,
+}
+
 /// Wait at most `bound` for the agent `agent_id` in `pane` to report its
 /// first attested session, and answer whether it is `session`. Gives up
 /// early on a refused acknowledgement from the shim (`ack`: the held
@@ -984,9 +1005,14 @@ async fn confirm(
     session: &str,
     ack: Option<(&crate::platform::trusted_dir::TrustedDir, &str)>,
     bound: Duration,
-) -> Result<(), RestoreFailure> {
-    use crate::telemetry::shim::{AckState, ack_state};
+) -> Result<(), Unconfirmed> {
+    use crate::telemetry::shim::{AckState, ack_outcome, ack_state};
     let deadline = Instant::now() + bound;
+    let give_up = |failure, seen| Unconfirmed {
+        failure,
+        shim: ack.map(|(acks, token)| ack_outcome(acks, token)),
+        seen,
+    };
     loop {
         if let Some((generation, seen)) = registry.restore_session_seen(pane)
             && generation == agent_id
@@ -994,26 +1020,29 @@ async fn confirm(
             return if seen == session {
                 Ok(())
             } else {
-                Err(RestoreFailure::SessionMismatch)
+                Err(give_up(RestoreFailure::SessionMismatch, Some(seen)))
             };
         }
         if let Some((acks, token)) = ack
             && ack_state(acks, token) == AckState::Refused
         {
-            return Err(RestoreFailure::Refused);
+            return Err(give_up(RestoreFailure::Refused, None));
         }
         if registry.agent_record_any(agent_id).is_none() || registry.pane_occupant_has_exited(pane)
         {
-            return Err(RestoreFailure::Exited);
+            return Err(give_up(RestoreFailure::Exited, None));
         }
         if Instant::now() >= deadline {
             let applied =
                 ack.is_some_and(|(acks, token)| ack_state(acks, token) == AckState::Resumed);
-            return Err(if applied {
-                RestoreFailure::TimedOut
-            } else {
-                RestoreFailure::ShimNotReached
-            });
+            return Err(give_up(
+                if applied {
+                    RestoreFailure::TimedOut
+                } else {
+                    RestoreFailure::ShimNotReached
+                },
+                None,
+            ));
         }
         tokio::time::sleep(CONFIRM_POLL).await;
     }

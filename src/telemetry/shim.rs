@@ -620,6 +620,36 @@ pub(crate) fn ack_state(acks: &crate::platform::trusted_dir::TrustedDir, token: 
     }
 }
 
+/// What the shim did with `token`, for the journal's record of a restore
+/// that did not take ([`crate::work_journal::ShimOutcome`]): [`ack_state`],
+/// with a refusal's reason read from its acknowledgement (a regular file, at
+/// most a line's worth, never through a link).
+#[cfg(unix)]
+pub(crate) fn ack_outcome(
+    acks: &crate::platform::trusted_dir::TrustedDir,
+    token: &str,
+) -> crate::work_journal::ShimOutcome {
+    use crate::work_journal::ShimOutcome;
+    use std::io::Read;
+    match ack_state(acks, token) {
+        AckState::Unclaimed => ShimOutcome::NotReached,
+        AckState::Pending => ShimOutcome::Pending,
+        AckState::Resumed => ShimOutcome::Resumed,
+        AckState::Refused => {
+            let mut body = String::new();
+            let read = acks
+                .open_regular(format!("{token}{REFUSED_SUFFIX}"))
+                .and_then(|file| file.take(128).read_to_string(&mut body));
+            match read.map(|_| body.trim()) {
+                Ok(REFUSED_ARGS_CONFLICT) => ShimOutcome::ResumeArgsConflict,
+                Ok(REFUSED_SESSION_ID_INVALID) => ShimOutcome::SessionIdInvalid,
+                Ok(REFUSED_AGENT_CANNOT_RESUME) => ShimOutcome::AgentCannotResume,
+                _ => ShimOutcome::Refused,
+            }
+        }
+    }
+}
+
 /// Audit S3: a fresh token, unpredictable (16 bytes of OS randomness) and
 /// bound to a lifetime: `<expiry>-<32 hex>`, the expiry in seconds since the
 /// Unix epoch, `lifetime` from `now` and at most
@@ -1126,6 +1156,47 @@ mod tests {
         }
     }
 
+    /// PRD #1790 stage 3, lane-2 `journal/restore/017`'s failed run: in a
+    /// restored Codex pane the deck's wrapper runs `codex app-server` (its
+    /// hooks trust probe) before the agent itself. That call starts no
+    /// conversation, so it must leave the one-shot request unclaimed: before
+    /// this, the shim refused it there (`app-server` read as a prompt),
+    /// consuming the token, and the real launch then started a new
+    /// conversation that the daemon stopped as `not-resumed`.
+    #[test]
+    fn a_codex_app_server_call_leaves_the_resume_for_the_launch() {
+        let f = fixture();
+        executable(&f.real.join("codex"));
+        let id = "01a206e2-2b6a-7412-9069-33b41fd7962e";
+        let request = resume_env("codex", id, "restore-token");
+        let acks = f.telemetry.join("resume-acks");
+        let probe = f.plan("codex", &["app-server"], &request).unwrap();
+        assert_eq!(probe.args, os(&["app-server"]));
+        assert!(
+            !acks.join("restore-token.refused").exists()
+                && !acks.join("restore-token.claim").exists(),
+            "the probe spent the resume request"
+        );
+        let launch = [
+            "-c",
+            "shell_environment_policy.set={}",
+            "--model",
+            "gpt-5.6-luna",
+            "--sandbox",
+            "workspace-write",
+            "--ask-for-approval",
+            "never",
+            "-c",
+            "model_reasoning_effort=\"low\"",
+        ];
+        let planned = f.plan("codex", &launch, &request).unwrap();
+        let mut expected = os(&["resume", id]);
+        expected.extend(os(&launch));
+        assert_eq!(planned.args, expected);
+        assert!(acks.join("restore-token").is_file());
+        assert!(!acks.join("restore-token.refused").exists());
+    }
+
     /// PRD #1790 stage 3 (audit S2): a refusal consumes the token as a resume
     /// does, so the same token with arguments that would resume gets nothing,
     /// and the daemon reads it refused.
@@ -1143,6 +1214,23 @@ mod tests {
         let held = open_acks(&f.shim, false).unwrap();
         assert_eq!(ack_state(&held, "replayed-token"), AckState::Refused);
         assert_eq!(ack_state(&held, "never-used"), AckState::Unclaimed);
+        use crate::work_journal::ShimOutcome;
+        assert_eq!(
+            ack_outcome(&held, "replayed-token"),
+            ShimOutcome::ResumeArgsConflict
+        );
+        assert_eq!(ack_outcome(&held, "never-used"), ShimOutcome::NotReached);
+        let bad_id = resume_env("claude", "not-a-uuid", "bad-id-token");
+        f.plan("claude", &[], &bad_id).unwrap();
+        assert_eq!(
+            ack_outcome(&held, "bad-id-token"),
+            ShimOutcome::SessionIdInvalid
+        );
+        let resumed = resume_env("claude", RESUME_ID, "resumed-token");
+        f.plan("claude", &[], &resumed).unwrap();
+        assert_eq!(ack_outcome(&held, "resumed-token"), ShimOutcome::Resumed);
+        std::fs::write(acks.join("odd-token.refused"), "something else\n").unwrap();
+        assert_eq!(ack_outcome(&held, "odd-token"), ShimOutcome::Refused);
     }
 
     /// PRD #1790 stage 3 (audit S2): of calls racing on one token with

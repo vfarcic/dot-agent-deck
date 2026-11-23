@@ -983,6 +983,22 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 - **Does not assert:** agent recall or compliance with the note (lane 2, 016/017), staying in the same TUI process across changing fixture socket paths, saved-workspace dedupe (018), or desktop controls.
 - **Platform coverage:** mac+linux.
 
+##### journal/restore/016 — Real Claude recalls its conversation after Restore and continue from the attached TUI.
+
+- **Layer:** L2 PTY-attached `TuiDeck` and vt100 grid, lane 2 (`tests/e2e_agent_restore_live.rs`); developer machine only, never CI or RWX.
+- **Agent:** real interactive Claude Code on `claude-haiku-4-5-20251001`; isolated credentials, onboarding and folder trust seeded with `seed_claude_worker_home`, real deck hooks installed, `--allowedTools Bash Read Write`; no print mode or positional seed prompt. `check_claude_available` and `skip_unless!` skip missing CLI/auth, or fail under `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1`.
+- **Asserts:** the attached person sends a directive to remember a unique random word and append one acknowledgement line; after the real daemon is stopped by its own pid, a new daemon shares the journal state and isolated HOME. A fresh attached TUI shows the interrupted item; `I`, `s`, `c` restores its conversation. The restored generation receives exactly the agreed Continue restart note as its first and sole inbox message before recall, acknowledges its receipt and finishes its turn. The new attempt's highest-sequence native session equals the original; a human recall prompt, which never repeats the remembered word, makes the agent write it into a new uniquely named file. The original acknowledgement's exact bytes, inode, mtime and ctime remain unchanged after note delivery and recall, and the original named card shows live Idle status. Exactly one resumed agent is present.
+- **Does not assert:** restoring an unfinished tool call, automated continuation of a cut-off turn, staying in one TUI process across changed fixture endpoints, desktop controls, or the bogus-id picker path. Recall is an observable memory test with an explicit instruction against searching disk, not a sandbox proof that the agent cannot read its own session files. Acknowledged inbox history proves note receipt/order, not a quoted transcript of the model's reasoning.
+- **Platform coverage:** mac+linux intended; lane 2 is run locally. Both daemon lifetimes use a 900-second cap and owned-pid cleanup.
+
+##### journal/restore/017 — Real Codex recalls its conversation after the human CLI restores and continues it.
+
+- **Layer:** L2 real interactive Codex under an attached TUI, lane 2 (`tests/e2e_agent_restore_live.rs`); the restore choice uses the real CLI `interrupted restore <item> --agent <old-attempt> --continue --yes` without a pane identity. Developer machine only, never CI or RWX.
+- **Agent:** real Codex on `common::codex_test_model()`, the harness's auth-appropriate cheap mini model, with workspace-write sandbox, low reasoning effort and approvals set to never. Existing `check_codex_available` verifies the installed CLI, persisted auth and a bounded live model request; `skip_unless!` produces a clean skip when unauthenticated and a failure under `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1`. A refused configured model remains the harness's deliberate hard failure.
+- **Asserts:** the same unique conversation-memory, unchanged acknowledgement, first acknowledged restart-note, new-attempt/same-native-session, exactly-one-agent and attached live-card checks as 016, exercising Codex's `resume <session>` launch through the saved command. Native SessionStart, UserPromptSubmit and Stop hooks must be trusted before startup, and both lifetimes share the scratch CODEX_HOME and HOME.
+- **Does not assert:** Claude resume syntax (016), Codex picker navigation, remote state, orchestration/report-route recovery, or a start-over fallback. A passing 017 is required before Codex graduates from conditional support; the test's existence alone is no graduation evidence.
+- **Platform coverage:** mac+linux intended; lane 2 is run locally. The real CLI must preserve its native thread id and reach the composer after resume; no unmeasured `tui.resume_cwd` setting is added.
+
 ##### journal/restore/018 — Saved-workspace startup leaves a matching resumable agent for the question.
 
 - **Layer:** L1 unit of the TUI's saved-pane startup predicate, extending `tests/session_restore_precedence.rs` around the real SavedSession::load call in `src/ui.rs`.
