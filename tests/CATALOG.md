@@ -1152,6 +1152,46 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 - **Does not assert:** a spawn that fails before its fork (the marker lifts and the restore answers `spawn-failed`: unit-level); a child whose pid or start time could not be read (the marker stays as placed).
 - **Platform coverage:** linux.
 
+##### journal/restore/037 — An agent left out of the bounded list still makes a shared conversation ambiguous.
+
+- **Layer:** L1 pure-data unit (`src/interrupted_work_tests.rs`), an in-memory journal and launch records.
+- **Agent:** none: seventeen recorded Claude Code attempts of one plain pane.
+- **Asserts:** the item lists sixteen agents and one omitted; the first, whose conversation only the omitted seventeenth shares, is `none` / `ambiguous-record` rather than `resume`; the others are `resume` (PR #2497 review: the duplicate-session check runs over every attempt before the list is bounded).
+- **Does not assert:** an act-time refusal of such a restore (the verdict is what offers it).
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/038 — A restored agent's left-behind child keeps its conversation.
+
+- **Layer:** L2 headless `daemon serve`, restarted twice, plus a second daemon on the same state directory, lane 1 (`tests/e2e_agent_restore.rs`); Linux-only session scan. Unit companion: `a_confirmed_successor_owns_its_conversation_before_its_own_report`.
+- **Agent:** synthetic `claude`, two panes in one conversation in folders of their own; the first restored with `survive-stop`, so it leaves a capped child in its session, out of its process group.
+- **Asserts:** the first restores; once its daemon stopped it, with the child still running, a restore of the second item, in another folder, from the next daemon and from a second one, is refused `session-in-use` and starts nothing; once the child is gone it restores (PR #2497 review, Greptile P1: a successful successor holds its confirmed conversation until its launch is proven gone, not until its attempt ends or its daemon goes).
+- **Does not assert:** a successor that reported another conversation while it ran (unit-level); a child that left the session (`setsid`, a documented residual).
+- **Platform coverage:** linux.
+
+##### journal/restore/039 — Restoring both agents of one item restores both.
+
+- **Layer:** L2 headless `daemon serve`, restarted, lane 1 (`tests/e2e_agent_restore.rs`); the second pane's attempt is moved onto the first pane's work in the dead run's journal and in its launch record: the shape a plain pane whose agent was replaced in place leaves when the deck goes away before the replaced attempt's end is written, which no public request makes in one test.
+- **Agent:** synthetic `claude`, two attempts in folders and conversations of their own.
+- **Asserts:** the item lists both agents with `resume`; one restore request selecting both answers two restored agents, each `recorded` and with its first message posted, and no refusal; each came back once; the item leaves the list (PR #2497 review, Qodo: the item closes once, after every selected agent was handled).
+- **Does not assert:** two agents of one item in the same folder (the second is refused `directory-in-use` beside the first's successor); a partial success.
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/040 — A start over whose saved task cannot be posted starts nothing.
+
+- **Layer:** L2 headless `daemon serve`, restarted, lane 1 (`tests/e2e_agent_restore.rs`); the e2e-only `DOT_AGENT_DECK_TEST_RESTORE_REFUSE_TASK=1` refuses the saved task's post after the spawn.
+- **Agent:** synthetic `claude` as a dispatched single-agent unit with a saved task.
+- **Asserts:** Start over is refused `task-not-delivered` with the sentence naming the saved task; the agent it started is stopped; nothing is sent; the item stays listed with its verdict unchanged (PR #2497 review, Qodo).
+- **Does not assert:** an inbox that refuses the task before the spawn (`task-unsafe`, `journal/restore/014`).
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/041 — A start over that reports the old conversation is not fresh.
+
+- **Layer:** L2 headless `daemon serve`, restarted, lane 1 (`tests/e2e_agent_restore.rs`), through the launch shim's `opencode`.
+- **Agent:** synthetic agent typed OpenCode (the `claude` stand-in under the name `opencode`), whose every fresh start reports the old conversation, then one in a new conversation.
+- **Asserts:** Start over is refused `not-fresh`, the agent it started is stopped, nothing is sent and the item stays listed; started over again in a new conversation, it is started and the item's close is recorded (PR #2497 review, Qodo: for an agent started without a new id that reports before its prompt, the first report is compared with the old conversation).
+- **Does not assert:** an agent that reports no conversation in time (`not-fresh`, by the same bound); Codex, whose first report comes with its first prompt and is not waited for.
+- **Platform coverage:** mac+linux.
+
 #### journal/compat
 
 ##### journal/compat/001 — Lines of a newer schema or an unknown kind are skipped and kept.

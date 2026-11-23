@@ -696,6 +696,7 @@ const RESTORE_REFUSAL_SENTENCES: Record<string, string> = {
   "directory-in-use": "Refused: newer work is running in this agent's folder now. Stop it first, so two agents do not work in one folder.",
   "note-refused": "Refused: the deck's inbox cannot take the restart note now, so nothing was started. Try again in a minute.",
   "note-not-delivered": "The agent came back into its conversation, but the deck could not give it its restart note, so it stopped the agent again. The item is still listed; try again.",
+  "task-not-delivered": "The agent started over, but the deck could not give it its saved task, so it stopped the agent again. The item is still listed; try again.",
   "not-recorded": "The agent started, but the deck could not record it in its work journal, so it stopped the agent again. The item is still listed; try again.",
   "restore-busy": "Refused: another restore or start over is in progress. Try again in a moment.",
 };

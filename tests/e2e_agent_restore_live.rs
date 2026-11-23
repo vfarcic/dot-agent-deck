@@ -23,9 +23,53 @@ use std::time::{Duration, Instant};
 const HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
 // An independent literal: a wording regression must not change the oracle.
 const CONTINUE_NOTE: &str = "The deck restarted and resumed this session. If your previous turn was cut off before it finished, first check the current state — `git status`, `git log`, whether anything was already pushed, opened or sent — then continue from where you stopped without repeating what already happened. If your previous turn had finished, do nothing and wait for the next message.";
+// One budget for the whole test, and every per-step wait below is the
+// smaller of its own bound and what is left of it, so a slow run that is
+// still inside each step's bound fails with that step's diagnostics rather
+// than being killed by nextest (PR #2497 review). The arithmetic:
+// `.config/nextest.toml` ends `journal_restore_01[67]_` at 14 x 60 s = 840 s;
+// each fixture daemon's lifetime cap is 900 s
+// (`DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS`, below CLAUDE.md rule 14's
+// `DEAD_PID_MIN_AGE`), and the first daemon starts with the test. The budget
+// is 780 s, which leaves 60 s under nextest's limit for the waits that do not
+// go through it (the harness's own boot and prompt-submission bounds, the
+// scoped teardown). Without the budget the steps alone could take five turns
+// of 240 s, a session flush of 75 s and several controls of 90 s each.
+const TEST_BUDGET: Duration = Duration::from_secs(780);
 const TURN: Duration = Duration::from_secs(240);
 const SESSION_FLUSH: Duration = Duration::from_secs(75);
 const CONTROL: Duration = Duration::from_secs(90);
+
+thread_local! {
+    /// When this thread's test runs out of [`TEST_BUDGET`].
+    static DEADLINE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// `step`, or what is left of the test's budget when that is less (never
+/// zero, so a wait still looks once).
+fn within(step: Duration) -> Duration {
+    DEADLINE.with(|deadline| match deadline.get() {
+        Some(deadline) => step
+            .min(deadline.saturating_duration_since(Instant::now()))
+            .max(Duration::from_millis(1)),
+        None => step,
+    })
+}
+
+/// A real agent's turn.
+fn turn() -> Duration {
+    within(TURN)
+}
+
+/// The journal's flush of a session report.
+fn session_flush() -> Duration {
+    within(SESSION_FLUSH)
+}
+
+/// A control-plane step: the CLI, the TUI's grid, the daemon's records.
+fn control() -> Duration {
+    within(CONTROL)
+}
 
 #[derive(Clone, Copy)]
 enum Agent {
@@ -192,7 +236,7 @@ impl LiveRestore {
         // The real install command completes Codex's app-server migration and
         // native-hook trust probe before an interactive Codex uses this HOME.
         // Modelled on support/codex_inbox_live::prepare, with no TuiDeck HOME.
-        let deadline = Instant::now() + CONTROL;
+        let deadline = Instant::now() + control();
         loop {
             let mut install = fixture.command();
             install.args(["hooks", "install", "--agent", hook_agent]);
@@ -321,7 +365,7 @@ impl LiveRestore {
     fn session(&self, attempt: &Value) -> String {
         let found = RefCell::new(None);
         assert!(
-            common::wait_until(SESSION_FLUSH, || {
+            common::wait_until(session_flush(), || {
                 *found.borrow_mut() = journal::lines(&self.state)
                     .iter()
                     .filter(|line| {
@@ -351,7 +395,7 @@ impl LiveRestore {
     fn item(&self, attempt: &str) -> Value {
         let mut cli = self.command();
         cli.args(["interrupted", "list", "--json", "--no-git"]);
-        let output = succeeded(bounded(cli, CONTROL));
+        let output = succeeded(bounded(cli, control()));
         let list: Value = serde_json::from_slice(&output.stdout).unwrap();
         list["items"]
             .as_array()
@@ -369,7 +413,7 @@ impl LiveRestore {
     fn restored(&self) -> Value {
         let found = RefCell::new(None);
         assert!(
-            common::wait_until(CONTROL, || {
+            common::wait_until(control(), || {
                 let records = self.records();
                 assert!(
                     records.len() <= 1,
@@ -388,7 +432,7 @@ impl LiveRestore {
 
     fn wait_idle(&self, id: &str, attached: &common::TuiDeck) {
         assert!(
-            common::wait_until(TURN, || self
+            common::wait_until(turn(), || self
                 .records()
                 .iter()
                 .any(|record| { record["id"] == id && record["live"]["status"] == "Idle" })),
@@ -403,7 +447,7 @@ impl LiveRestore {
         let id = string(restored, "id");
         let pane = string(restored, "pane_id_env");
         assert!(
-            common::wait_until(TURN, || {
+            common::wait_until(turn(), || {
                 let reply = inbox::attach(
                     &self.live,
                     json!({"op":"list-inbox", "pane_id":pane, "bodies":true}),
@@ -506,7 +550,7 @@ fn spawn(home: &Path, state: &Path, path: &str, log: &Path) -> common::DaemonPro
 
 fn grid(deck: &common::TuiDeck, what: &str, predicate: impl Fn(&str) -> bool) {
     assert!(
-        deck.wait_for_grid_predicate_within(CONTROL, |frame| predicate(frame)),
+        deck.wait_for_grid_predicate_within(control(), |frame| predicate(frame)),
         "{what}:\n{}",
         deck.snapshot_grid()
     );
@@ -565,7 +609,7 @@ fn prompt(
     grid(deck, "Codex rendered the human prompt", |frame| {
         frame.contains(probe)
     });
-    let deadline = Instant::now() + CONTROL;
+    let deadline = Instant::now() + control();
     loop {
         if !deck.snapshot_grid().contains("Waiting for startup") {
             deck.send_keys(b"\r");
@@ -665,6 +709,7 @@ fn nonce() -> String {
 }
 
 fn exercise(agent: Agent, name: &str, tui_restore: bool) {
+    DEADLINE.with(|deadline| deadline.set(Some(Instant::now() + TEST_BUDGET)));
     let mut fixture = LiveRestore::new(agent, name);
     // Separate random draws: the filename cannot reveal the codename. No
     // prompt asks for the codename to be written anywhere: the
@@ -700,7 +745,7 @@ fn exercise(agent: Agent, name: &str, tui_restore: bool) {
         &first_prompt,
         &ack_name,
     );
-    common::wait_for_file_trimmed_eq(&ack_path, "OK", TURN).unwrap_or_else(|observed| {
+    common::wait_for_file_trimmed_eq(&ack_path, "OK", turn()).unwrap_or_else(|observed| {
         panic!(
             "initial acknowledgement missing: {observed}\npane:\n{}",
             attached.snapshot_grid()
@@ -767,7 +812,7 @@ fn exercise(agent: Agent, name: &str, tui_restore: bool) {
         eprintln!(
             "restore human CLI: interrupted restore {item_id} --agent {old_attempt} --continue --yes"
         );
-        let outcome = bounded(restore, CONTROL);
+        let outcome = bounded(restore, control());
         if !outcome.status.success() {
             eprintln!(
                 "restore failure journal: {}\nlive records: {:?}\npane:\n{}\nrestore diagnostics:\n{}",
@@ -843,7 +888,7 @@ fn exercise(agent: Agent, name: &str, tui_restore: bool) {
         &recall,
         &recall_name,
     );
-    common::wait_for_file_trimmed_eq(&recall_path, &word, TURN).unwrap_or_else(|observed| {
+    common::wait_for_file_trimmed_eq(&recall_path, &word, turn()).unwrap_or_else(|observed| {
         panic!(
             "restored agent lost its conversation: {observed}\n{}",
             attached.snapshot_grid()

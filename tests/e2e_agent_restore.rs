@@ -224,6 +224,23 @@ impl Decks {
         journal::wait_for(&self.state, "the fixture attempt", |lines| {
             journal::attempt_of(lines, &agent).cloned()
         });
+        // The stand-in's ready file says its hook was sent, not that the
+        // daemon journalled the conversation it named: a restart before
+        // that leaves the attempt with no conversation to resume (seen as a
+        // `not-restorable` under load in `journal/restore/013`). Agent ids
+        // restart in each daemon, so the line is matched by the agent's
+        // number and the conversation it reported, not by an earlier run's
+        // attempt of the same number.
+        let suffix = format!("/{agent}");
+        journal::wait_for(&self.state, "the fixture's conversation", |lines| {
+            journal::find(lines, "attempt_session", |line| {
+                line["session"] == started["session"]
+                    && line["attempt"]
+                        .as_str()
+                        .is_some_and(|attempt| attempt.ends_with(&suffix))
+            })
+            .cloned()
+        });
         started
     }
 
@@ -2338,4 +2355,283 @@ fn journal_restore_036_a_spawn_refused_after_its_fork_keeps_its_fence() {
         "the fence lifts once its agent's session is gone: {reply}"
     );
     assert!(fence_markers(&decks.state).is_empty(), "and is removed");
+}
+
+/// Scenario: Two scripted Claudes were in one conversation in folders of their own. After a restart, the first is restored and leaves a child in its session outside its process group; then its daemon is stopped, which stops the restored agent but not that child. Restoring the second, from the next daemon and from a second one, is refused session-in-use while the child runs, starts nothing, and restores once the child is gone.
+#[cfg(target_os = "linux")]
+#[spec("journal/restore/038")]
+#[test]
+fn journal_restore_038_a_restored_agents_left_behind_child_keeps_its_conversation() {
+    let mut decks = Decks::start();
+    let [first, second] = two_in_one_conversation(&mut decks, "038", &[]);
+    let first_id = string(&decks.item_for(&first), "id");
+    let second_id = string(&decks.item_for(&second), "id");
+    // The restored first leaves a child in its session, in a group of its own.
+    std::fs::write(decks.root.join("survive-stop"), "").unwrap();
+    let reply = final_reply(&decks, restore_request(&first_id, &first));
+    assert_eq!(restored_count(&reply), 1, "the first comes back: {reply}");
+    let survivor = survivor(&decks, "survivor.json");
+    std::fs::remove_file(decks.root.join("survive-stop")).unwrap();
+    let edge = journal::wait_for(&decks.state, "the restore's successor link", |lines| {
+        journal::find(lines, "attempt_restored", |_| true).cloned()
+    });
+    assert_eq!(edge["session"], SESSION, "premise: {edge}");
+    // Its daemon goes away and stops the restored agent; the child stays.
+    decks.restart();
+    assert!(
+        running(survivor.pid, survivor.start),
+        "premise: the child outlives the restored agent's daemon"
+    );
+    let other = decks.another_daemon();
+    for daemon in [&decks.live, &other] {
+        let reply = final_reply_on(daemon, restore_request(&second_id, &second));
+        assert_refused(&reply, &second, "session-in-use");
+    }
+    assert_eq!(decks.starts().len(), 3, "nothing more started");
+    let (pid, start) = (survivor.pid, survivor.start);
+    drop(survivor);
+    assert!(
+        common::wait_until(common::load_scaled(Duration::from_secs(10)), || {
+            !running(pid, start)
+        }),
+        "the test's own child is gone"
+    );
+    let reply = final_reply_on(&other, restore_request(&second_id, &second));
+    assert_eq!(
+        restored_count(&reply),
+        1,
+        "the conversation is free once nothing of the restored agent is left: {reply}"
+    );
+    drop(other);
+}
+
+/// Every journal line of `attempt`, and its launch record, moved to the work
+/// `to`: the shape a plain pane whose agent was replaced in place leaves
+/// when the deck goes away before the replaced attempt's end is written (two
+/// interrupted attempts of one work), which no public request makes in one
+/// test.
+fn move_attempt(state: &Path, attempt: &str, to: &str) {
+    let mut moved = 0;
+    let rewrite = |path: &Path, moved: &mut usize| {
+        let text = std::fs::read_to_string(path).unwrap();
+        let mut changed = false;
+        let lines: Vec<String> = text
+            .split_inclusive('\n')
+            .map(|line| {
+                let Ok(mut value) = serde_json::from_str::<Value>(line.trim_end()) else {
+                    return line.to_string();
+                };
+                if value["attempt"] != attempt {
+                    return line.to_string();
+                }
+                value["work"] = json!(to);
+                changed = true;
+                *moved += 1;
+                let end = if line.ends_with('\n') { "\n" } else { "" };
+                format!("{value}{end}")
+            })
+            .collect();
+        if changed {
+            std::fs::write(path, lines.concat()).unwrap();
+        }
+    };
+    for path in journal::files(state) {
+        rewrite(&path, &mut moved);
+    }
+    assert!(moved >= 2, "premise: its start and end were journalled");
+    let records = state.join("launch-records");
+    let mut found = 0;
+    for entry in std::fs::read_dir(&records).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|ext| ext == "json") {
+            let before = found;
+            rewrite(&path, &mut found);
+            if found > before {
+                break;
+            }
+        }
+    }
+    assert_eq!(found, 1, "premise: one launch record of {attempt}");
+}
+
+/// Scenario: A plain pane's work holds two interrupted attempts of a scripted Claude, in folders and conversations of their own, so its one interrupted item lists two agents. Restore of that item, both agents selected, brings both back in one request, each into its own conversation, records the item's close, and the item leaves the list.
+#[spec("journal/restore/039")]
+#[test]
+fn journal_restore_039_restoring_both_agents_of_one_item_restores_both() {
+    let mut decks = Decks::start();
+    let first = decks.start_pane("restore-two-a-039");
+    let folder = decks.folder("restore-two-b-039");
+    let second = decks.start_pane_with("restore-two-b-039", &folder, &decks.command());
+    assert_ne!(first["session"], second["session"], "premise: {second}");
+    let first = decks.attempt(&string(&first, "agent"));
+    let second = decks.attempt(&string(&second, "agent"));
+    decks.restart();
+    move_attempt(
+        &decks.state,
+        &string(&second, "attempt"),
+        &string(&first, "work"),
+    );
+    let (first, second) = (string(&first, "attempt"), string(&second, "attempt"));
+    let item = decks.item_for(&first);
+    let id = string(&item, "id");
+    let agents = item["agents"].as_array().unwrap();
+    assert_eq!(agents.len(), 2, "premise: one item, two agents: {item}");
+    for agent in agents {
+        assert_eq!(
+            agent["restore"],
+            json!({"kind":"resume"}),
+            "premise: {item}"
+        );
+    }
+    let reply = final_reply(
+        &decks,
+        json!({"op":"restore-interrupted", "id":id, "agents":[first, second],
+               "mode":"continue", "dry_run":false}),
+    );
+    let outcome = &reply["interrupted_restore"];
+    assert_eq!(outcome["refused"], json!([]), "{reply}");
+    let restored = outcome["restored"].as_array().unwrap();
+    assert_eq!(restored.len(), 2, "both come back: {reply}");
+    for agent in restored {
+        assert_eq!(agent["recorded"], true, "{reply}");
+        assert_eq!(agent["first_message_posted"], true, "{reply}");
+    }
+    assert_eq!(decks.starts().len(), 4, "each came back once");
+    decks.assert_gone_from_list(&id);
+}
+
+/// A dispatched single-agent unit run by the scripted Claude with [`TASK`]
+/// as its saved task: its attempt.
+fn dispatched_unit(decks: &Decks, name: &str) -> String {
+    let caller = route::start(
+        &decks.live,
+        &format!("restore-dispatcher-{name}"),
+        json!({"cwd":decks.repo}),
+    );
+    inbox::status(&decks.live, &caller, "session_start", "codex");
+    inbox::status(&decks.live, &caller, "thinking", "codex");
+    let before = route::messages(&decks.live, &caller).len();
+    route::cli(
+        &decks.live,
+        &caller,
+        &decks.repo,
+        &[
+            "dispatch",
+            name,
+            "--single",
+            "--command",
+            &decks.command(),
+            "--agent",
+            "claude",
+            "--task",
+            TASK,
+        ],
+    );
+    assert!(
+        common::wait_until(
+            common::load_scaled(Duration::from_secs(20)),
+            || route::messages(&decks.live, &caller).len() > before
+        ),
+        "dispatch must finish before restart"
+    );
+    let starts = decks.starts();
+    assert_eq!(starts.len(), 1, "single unit started once: {starts:?}");
+    let unit = decks.wait_start(&string(&starts[0], "pane"));
+    string(&decks.attempt(&string(&unit, "agent")), "attempt")
+}
+
+/// Scenario: Restart a dispatched single-agent unit into a daemon whose inbox refuses the saved task once the agent is started. Start over starts the agent, cannot give it its task, stops it again and is refused task-not-delivered; nothing was sent and the item stays listed as it was.
+#[spec("journal/restore/040")]
+#[test]
+fn journal_restore_040_a_start_over_whose_task_cannot_be_posted_starts_nothing() {
+    let mut decks = Decks::start();
+    let attempt = dispatched_unit(&decks, "restore-task-040");
+    decks.restart_with(&[("DOT_AGENT_DECK_TEST_RESTORE_REFUSE_TASK", "1")]);
+    let item = decks.item_for(&attempt);
+    assert_eq!(item["kind"], "unit", "premise: {item}");
+    let id = string(&item, "id");
+    let reply = final_reply(&decks, start_over_request(&id, &attempt));
+    assert_eq!(start_over_refusal(&reply), "task-not-delivered", "{reply}");
+    assert!(
+        reply["interrupted_start_over"]["refused"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("saved task")),
+        "{reply}"
+    );
+    assert_eq!(
+        decks.starts().len(),
+        2,
+        "premise: it was started: {:?}",
+        decks.starts()
+    );
+    assert!(
+        common::wait_until(common::load_scaled(Duration::from_secs(10)), || {
+            common::agent_records_on(&decks.live.attach_socket).is_empty()
+        }),
+        "an agent without its task is stopped again"
+    );
+    assert!(decks.inbox(None).is_empty(), "nothing was sent");
+    let kept = decks.item_for(&attempt);
+    assert_eq!(kept["id"], id, "the item stays listed");
+    assert_eq!(
+        kept["agents"][0]["restore"], item["agents"][0]["restore"],
+        "with its verdict unchanged: {kept}"
+    );
+}
+
+/// Scenario: A scripted OpenCode-typed agent ran in a known conversation. After a restart, Start over starts it through the launch shim, and it reports that same conversation as its first, so it is stopped before anything is sent, the answer is not-fresh, and the item stays listed. Started over again when it comes up in a new conversation, it is started.
+#[spec("journal/restore/041")]
+#[test]
+fn journal_restore_041_a_start_over_that_reports_the_old_conversation_is_not_fresh() {
+    let mut decks = Decks::start();
+    std::os::unix::fs::symlink(decks.bin.join("claude"), decks.bin.join("opencode")).unwrap();
+    // Every fresh start reports SESSION, the start over's among them.
+    std::fs::write(decks.root.join("fixed-session"), "").unwrap();
+    let name = "restore-oc-reuse-041";
+    let folder = decks.folder(name);
+    let reply = inbox::attach(
+        &decks.live,
+        json!({
+            "op":"start-agent",
+            "command":common::capability_export_command("exec opencode --model restore-synthetic"),
+            "cwd":folder, "display_name":name, "agent_type":"open_code", "rows":40, "cols":140,
+            "env":[["DOT_AGENT_DECK_PANE_ID", name]]
+        }),
+    );
+    assert_eq!(reply["ok"], true, "fixture launch: {reply}");
+    let original = decks.wait_start(name);
+    assert_eq!(original["session"], SESSION, "premise: {original}");
+    let attempt = string(&decks.attempt(&string(&reply, "id")), "attempt");
+    journal::wait_for(&decks.state, "the old conversation", |lines| {
+        journal::find(lines, "attempt_session", |line| {
+            line["attempt"] == attempt.as_str() && line["session"] == SESSION
+        })
+        .cloned()
+    });
+    decks.restart();
+    let item = decks.item_for(&attempt);
+    let id = string(&item, "id");
+    assert_eq!(
+        item["agents"][0]["restore"]["kind"], "start_over",
+        "premise: {item}"
+    );
+    let reply = final_reply(&decks, start_over_request(&id, &attempt));
+    assert_eq!(start_over_refusal(&reply), "not-fresh", "{reply}");
+    assert_eq!(decks.starts().len(), 2, "premise: it was started");
+    assert!(
+        common::wait_until(common::load_scaled(Duration::from_secs(10)), || {
+            common::agent_records_on(&decks.live.attach_socket).is_empty()
+        }),
+        "an agent back in its old conversation is stopped"
+    );
+    assert!(decks.inbox(None).is_empty(), "nothing was sent");
+    assert_eq!(decks.item_for(&attempt)["id"], id, "the item stays listed");
+    // In a conversation of its own, the same start over is started.
+    std::fs::write(decks.root.join("session-taken"), "").unwrap();
+    std::fs::remove_file(decks.root.join("fixed-session")).unwrap();
+    let reply = final_reply(&decks, start_over_request(&id, &attempt));
+    let started = &reply["interrupted_start_over"]["started"];
+    assert!(started.is_object(), "{reply}");
+    assert_eq!(started["recorded"], true, "{reply}");
+    decks.assert_gone_from_list(&id);
 }

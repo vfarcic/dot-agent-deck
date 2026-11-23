@@ -46,7 +46,9 @@
 //! 7. no other agent the deck runs is in the same conversation, nor being
 //!    restored into it (`session-in-use`, [`Sessions::in_use`],
 //!    [`InFlight`], [`claim`]): an agent a restore confirmed counts as in
-//!    its conversation from the durable successor link alone (audit B1), and
+//!    its conversation from the durable successor link alone (audit B1),
+//!    and, once it ended or its daemon is gone, until its launch is proven
+//!    gone ([`launch_gone`]: a child it left in its session counts), and
 //!    an agent a failed restore could not be proven to stop fences the
 //!    conversations it may be writing to, from every item, until it is
 //!    proven gone ([`Sessions::fenced`], audit B2); and no newer live work
@@ -116,8 +118,10 @@
 //! `restore_failed` for the attempt (so the list offers Start over from then
 //! on) and answers `not-resumed`, or `not-stopped` when the stop could not be
 //! confirmed. A confirmed restore posts the restart note as the agent's first
-//! inbox message (reason `restart note`), then writes `closed how=restored`
-//! on the item's works and `attempt_restored{how: resumed}`. A note that
+//! inbox message (reason `restart note`), then writes
+//! `attempt_restored{how: resumed}`, and `closed how=restored` on the
+//! item's works once every agent the request selected was handled
+//! ([`close_item`]). A note that
 //! cannot be posted after all stops the agent again and leaves the item
 //! listed as it was (`note-not-delivered`).
 //!
@@ -136,7 +140,8 @@
 //! audit B3). Antigravity and a plain shell carry no request and are not
 //! checked. A dispatched unit's saved task is posted as its first inbox
 //! message (reason `saved task`), and no restart note: the agent is new and
-//! has no conversation to be told about. Then
+//! has no conversation to be told about; one that cannot be posted stops the
+//! agent again and leaves the item listed (`task-not-delivered`). Then
 //! `attempt_restored{how: started_over}` and `closed how=started_over`.
 //!
 //! **Stopping an agent it started** ([`stop_proven`], audit F4, F4a,
@@ -160,8 +165,11 @@
 //! acknowledgement, so it is not confirmed (`not-resumed`, `not-fresh`). A
 //! Claude Code start over is confirmed by the first conversation the launch
 //! reports; for Codex, OpenCode, Pi and Devin the check is of the arguments
-//! the shim sees, so a script of the user's named after the agent that
-//! selects a conversation itself is not checked (round-4 F3/B1). For every
+//! the shim sees, and, for the last three when the old conversation is
+//! known, of the first conversation the launch reports ([`confirm_fresh`]),
+//! so a script of the user's named after Codex, or after one of the others
+//! when the old conversation is not known, that selects a conversation
+//! itself is not checked (round-4 F3/B1). For every
 //! agent, a program the user's command or script starts after the first one
 //! (a second Claude Code in a conversation it chose, say) is not checked: the
 //! deck verifies the first conversation the launch reports (round 5, B3). An
@@ -232,14 +240,24 @@ fn confirm_timeout() -> Duration {
     CONFIRM_TIMEOUT
 }
 
-/// Whether the restart note's post fails on purpose: in an e2e build only,
-/// when `DOT_AGENT_DECK_TEST_RESTORE_REFUSE_NOTE` is `1`, so lane 1 can reach
-/// the path a full inbox takes after the agent confirmed (review R#4).
-fn note_post_refused_for_test() -> bool {
+/// Whether the first message's post fails on purpose: in an e2e build only,
+/// the restart note's when `DOT_AGENT_DECK_TEST_RESTORE_REFUSE_NOTE` is `1`
+/// and a start over's saved task's when
+/// `DOT_AGENT_DECK_TEST_RESTORE_REFUSE_TASK` is `1`, so lane 1 can reach the
+/// path a full inbox takes after the agent started (review R#4, Qodo #2).
+fn seed_post_refused_for_test(reason: &str) -> bool {
     #[cfg(feature = "e2e")]
-    if std::env::var("DOT_AGENT_DECK_TEST_RESTORE_REFUSE_NOTE").as_deref() == Ok("1") {
-        return true;
+    {
+        let var = match reason {
+            RESTART_NOTE_REASON => "DOT_AGENT_DECK_TEST_RESTORE_REFUSE_NOTE",
+            SAVED_TASK_REASON => "DOT_AGENT_DECK_TEST_RESTORE_REFUSE_TASK",
+            _ => return false,
+        };
+        if std::env::var(var).as_deref() == Ok("1") {
+            return true;
+        }
     }
+    let _ = reason;
     false
 }
 
@@ -897,21 +915,44 @@ impl<'a> Sessions<'a> {
     /// is live, is in `session` now: an agent the deck runs (a copy restored
     /// before, say) that a resume would write beside. A restored agent is in
     /// the conversation its restore confirmed (audit B1) until it reports
-    /// another one itself.
-    fn in_use(&self, attempt: &AttemptId, session: &str, live: &dyn Fn(&str) -> bool) -> bool {
+    /// another one itself while it runs. Once it ended or its run is gone, it
+    /// still holds that conversation until its launch is proven gone
+    /// ([`launch_gone`] over its one record in `launches`; none, or more
+    /// than one, holds it): a child it left in its session, outside the
+    /// process group a stop or shutdown signals, may still write there (the
+    /// same standard as [`Sessions::fenced`], review Greptile P1).
+    fn in_use(
+        &self,
+        attempt: &AttemptId,
+        session: &str,
+        live: &dyn Fn(&str) -> bool,
+        launches: &[LaunchRecord],
+    ) -> bool {
         let running = |other: &AttemptId| {
             other != attempt && !self.ended.contains(other) && live(other.run())
+        };
+        let left_behind = |to: &AttemptId| {
+            if to == attempt {
+                return false;
+            }
+            let mut records = launches.iter().filter(|r| r.attempt == *to);
+            match (records.next(), records.next()) {
+                (Some(record), None) => launch_gone(record).is_err(),
+                _ => true,
+            }
         };
         self.latest
             .iter()
             .any(|(other, report)| report.session == session && running(other))
             || self.edges.iter().any(|(to, confirmed)| {
                 *confirmed == session
-                    && running(to)
-                    && self
-                        .latest
-                        .get(to)
-                        .is_none_or(|report| report.session == session)
+                    && if running(to) {
+                        self.latest
+                            .get(to)
+                            .is_none_or(|report| report.session == session)
+                    } else {
+                        left_behind(to)
+                    }
             })
     }
 
@@ -1290,7 +1331,7 @@ fn check_agent(
             if !resume.valid_session_id(session) {
                 return Err(RestoreRefusal::SessionIdInvalid);
             }
-            if sessions.in_use(&agent.attempt, session, live)
+            if sessions.in_use(&agent.attempt, session, live, launches)
                 || sessions.fenced(session, agent_type.as_ref(), launches)
                 || markers.fenced(session, agent_type.as_ref(), &gone)
             {
@@ -1615,6 +1656,7 @@ pub async fn restore(
     } else {
         None
     };
+    let mut closing: Option<Closing> = None;
     for target in targets {
         let target = match target {
             Ok(target) => target,
@@ -1631,8 +1673,29 @@ pub async fn restore(
         }
         match start(&daemon, &journal, &item.id, target, Some(mode), dry_run).await {
             Started::Would(attempt) => outcome.would_restore.push(attempt),
-            Started::Done(agent) => outcome.restored.push(agent),
+            Started::Done(agent, done) => {
+                outcome.restored.push(agent);
+                closing = Some(match closing {
+                    None => done,
+                    Some(mut both) => {
+                        for work in done.works {
+                            if !both.works.contains(&work) {
+                                both.works.push(work);
+                            }
+                        }
+                        both
+                    }
+                });
+            }
             Started::Refused(refused) => outcome.refused.push(refused),
+        }
+    }
+    // Review (Qodo #5): every selected agent was handled; the item closes
+    // once, for all of them, when any came back.
+    if let Some(closing) = closing {
+        let recorded = close_item(&journal, &closing.works, closing.how).await;
+        for agent in &mut outcome.restored {
+            agent.recorded = recorded;
         }
     }
     outcome
@@ -1724,12 +1787,15 @@ pub async fn start_over(
             item: item_id,
             ..StartOverOutcome::default()
         },
-        Started::Done(agent) => StartOverOutcome {
-            dry_run,
-            started: Some(agent),
-            item: item_id,
-            ..StartOverOutcome::default()
-        },
+        Started::Done(mut agent, closing) => {
+            agent.recorded = close_item(&journal, &closing.works, closing.how).await;
+            StartOverOutcome {
+                dry_run,
+                started: Some(agent),
+                item: item_id,
+                ..StartOverOutcome::default()
+            }
+        }
         Started::Refused(refusal) => refused(refusal, item_id),
     }
 }
@@ -1776,7 +1842,7 @@ async fn acting_lock(_journal: &WorkJournal) -> Result<(), RestoreRefusal> {
 /// What starting one agent came to.
 enum Started {
     Would(AttemptId),
-    Done(RestoredAgent),
+    Done(RestoredAgent, Closing),
     Refused(RestoreRefused),
 }
 
@@ -2236,12 +2302,23 @@ async fn start(
             if let (Some(fresh), Some((_, acks)), Some(token)) =
                 (fresh_spec, shim.as_ref(), token.as_deref())
             {
+                // Review (Qodo #4): an agent started without a new id, of a
+                // kind that reports its conversation before its prompt, is
+                // checked against the old one when the deck knows it.
+                let old_session = target.old_session.as_deref().filter(|_| {
+                    new_session.is_none()
+                        && target.agent_type.as_ref().is_some_and(|agent| {
+                            crate::agent_registry::spec(agent).first_hook
+                                == crate::agent_registry::FirstHook::BeforePrompt
+                        })
+                });
                 let checked = confirm_fresh(
                     daemon.registry,
                     &pane_id,
                     &agent_id,
                     (acks, token),
                     new_session.as_deref(),
+                    old_session,
                     confirm_timeout(),
                 )
                 .await;
@@ -2275,7 +2352,7 @@ async fn start(
     };
     let first_message_posted = match &first {
         Some((reason, body)) => {
-            !(*reason == RESTART_NOTE_REASON && note_post_refused_for_test())
+            !seed_post_refused_for_test(reason)
                 && crate::spawn::post_seed(daemon.registry, &pane_id, &agent_id, reason, body)
                     .is_ok()
         }
@@ -2283,15 +2360,22 @@ async fn start(
     };
     // Review R#4: a restored agent that did not get its restart note does not
     // know the deck restarted. It is stopped again, and the item stays listed
-    // as it was, for the person to try again.
-    if how == RestoredHow::Resumed && !first_message_posted {
+    // as it was, for the person to try again. Review (Qodo #2): the same for
+    // a started-over unit that did not get its saved task: it would sit
+    // there with nothing to do while its work was closed as started over.
+    if !first_message_posted {
+        let refusal = match how {
+            RestoredHow::Resumed => RestoreRefusal::NoteNotDelivered,
+            RestoredHow::StartedOver => RestoreRefusal::TaskNotDelivered,
+        };
         tracing::warn!(
             attempt = %target.attempt,
-            "restore: the restart note could not be posted; stopping the restored agent"
+            ?refusal,
+            "restore: the first message could not be posted; stopping the started agent"
         );
         let known = confirmed_session.is_some();
         let fence = Fence::new(confirmed_session).unknown_unless(known);
-        return fail(None, fence, RestoreRefusal::NoteNotDelivered).await;
+        return fail(None, fence, refusal).await;
     }
     // Audit B1: the successor link, with the conversation it was confirmed
     // in, is written and waited for before the closing events and before
@@ -2329,23 +2413,45 @@ async fn start(
     if let Some(placed) = placed.lock().unwrap_or_else(|e| e.into_inner()).take() {
         lift_marker(placed, state_dir, &target.attempt);
     }
+    // Review (Qodo #5): the item's works are closed by the caller once every
+    // agent the request selected was handled ([`close_item`]): closing them
+    // here would leave the next selected agent of the same item refused as
+    // no longer listed. The successor link written above already holds this
+    // agent's conversation, and the request's restore lock keeps any other
+    // request from acting meanwhile.
+    drop((held, claims));
+    Started::Done(
+        RestoredAgent {
+            attempt: target.attempt,
+            agent_id,
+            pane_id,
+            name: record.name.clone(),
+            first_message_posted,
+            recorded: false,
+        },
+        Closing { works, how: close },
+    )
+}
+
+/// What a start that succeeded leaves its caller to close: the item's works,
+/// as the start's own fresh read found them, and how.
+struct Closing {
+    works: Vec<WorkId>,
+    how: CloseHow,
+}
+
+/// Write `closed` with `how` on each of `works`, the item's, once every agent
+/// of a request was handled: answers whether it was recorded, so the item
+/// leaves the list. Blocking on the journal.
+async fn close_item(journal: &WorkJournal, works: &[WorkId], how: CloseHow) -> bool {
     let events: Vec<Event> = works
         .iter()
         .map(|work| Event::Closed {
             work: work.clone(),
-            how: close,
+            how,
         })
         .collect();
-    let recorded = record_blocking(journal, events).await;
-    drop((held, claims));
-    Started::Done(RestoredAgent {
-        attempt: target.attempt,
-        agent_id,
-        pane_id,
-        name: record.name.clone(),
-        first_message_posted,
-        recorded,
-    })
+    record_blocking(journal, events).await
 }
 
 /// Round-4 B2: the conversations an agent a failed start could not be
@@ -2905,6 +3011,14 @@ struct Unfresh {
 /// not reached (the agent reported a conversation first, or nothing came in
 /// time), refused the new id, the agent exited, or it reported another
 /// conversation than the new one.
+///
+/// Review (Qodo #4): for an agent started without a new id, `old_session`
+/// is the conversation the interrupted agent was last in, given when the
+/// deck knows it and the agent reports a conversation before its prompt
+/// ([`crate::agent_registry::FirstHook::BeforePrompt`]). The shim's
+/// acknowledgement is then not enough: the agent's first report is waited
+/// for, and one naming `old_session` (a launcher that chose it after the
+/// shim's check), or none in time, is `not-fresh`.
 #[cfg(unix)]
 async fn confirm_fresh(
     registry: &AgentPtyRegistry,
@@ -2912,6 +3026,7 @@ async fn confirm_fresh(
     agent_id: &str,
     ack: (&crate::platform::trusted_dir::TrustedDir, &str),
     new_session: Option<&str>,
+    old_session: Option<&str>,
     bound: Duration,
 ) -> Result<Option<String>, Unfresh> {
     use crate::telemetry::shim::{AckState, ack_outcome, ack_state};
@@ -2937,7 +3052,16 @@ async fn confirm_fresh(
             return Err(Unfresh { reason, seen });
         }
         match (state, new_session, seen) {
-            (AckState::Resumed, None, seen) => return Ok(seen),
+            (AckState::Resumed, None, Some(seen)) => {
+                return if old_session == Some(seen.as_str()) {
+                    Err(not_fresh(Some(seen)))
+                } else {
+                    Ok(Some(seen))
+                };
+            }
+            // Nothing to tell it from the old conversation by: the
+            // acknowledgement is the check.
+            (AckState::Resumed, None, None) if old_session.is_none() => return Ok(None),
             (AckState::Resumed, Some(new), Some(seen)) => {
                 return if seen == new {
                     Ok(Some(seen))
@@ -3114,10 +3238,10 @@ mod tests {
             ..JournalRead::default()
         };
         let live = |run: &str| run == "r-live";
-        assert!(!Sessions::of(&read).in_use(&target, SESSION, &live));
+        assert!(!Sessions::of(&read).in_use(&target, SESSION, &live, &[]));
         read.lines.push(line("r-live", 4, session(&live_copy)));
-        assert!(Sessions::of(&read).in_use(&target, SESSION, &live));
-        assert!(!Sessions::of(&read).in_use(&target, SESSION, &|_: &str| false));
+        assert!(Sessions::of(&read).in_use(&target, SESSION, &live, &[]));
+        assert!(!Sessions::of(&read).in_use(&target, SESSION, &|_: &str| false, &[]));
     }
 
     /// PRD #1790 stage 3 (audit F5): a selection is bounded before anything
@@ -3709,8 +3833,9 @@ mod tests {
 
     /// PRD #1790 stage 3 (audit B1): a restored agent is in the conversation
     /// its restore confirmed, from the durable successor link alone, before
-    /// its own session report exists; it stops being so once it ended, its
-    /// run is gone, or it reports another conversation.
+    /// its own session report exists; it stops being so once it reports
+    /// another conversation while it runs, or, once it ended or its run is
+    /// gone, only once its launch is proven gone (review Greptile P1).
     #[test]
     fn a_confirmed_successor_owns_its_conversation_before_its_own_report() {
         use crate::work_journal::{EndHow, JournalRead, Line};
@@ -3739,9 +3864,59 @@ mod tests {
             lines: vec![line("r-live", 1, edge)],
             ..JournalRead::default()
         };
-        assert!(Sessions::of(&read).in_use(&b, SESSION, &live));
-        assert!(!Sessions::of(&read).in_use(&b, OTHER, &live));
-        assert!(!Sessions::of(&read).in_use(&b, SESSION, &|_: &str| false));
+        let record = |pid: Option<u32>, pid_start: Option<u64>| LaunchRecord {
+            v: crate::launch_records::SCHEMA_VERSION,
+            work: work.clone(),
+            attempt: successor.clone(),
+            command: None,
+            shell: None,
+            agent_type: None,
+            cwd: Some("/w".into()),
+            cwd_moved_from: None,
+            name: None,
+            role: None,
+            orchestration: None,
+            orchestration_id: None,
+            ts_ms: 1,
+            pid,
+            pid_start,
+            launch_nonce: None,
+        };
+        assert!(Sessions::of(&read).in_use(&b, SESSION, &live, &[]));
+        assert!(!Sessions::of(&read).in_use(&b, OTHER, &live, &[]));
+        assert!(
+            !Sessions::of(&read).in_use(&successor, SESSION, &|_: &str| false, &[]),
+            "its own conversation is not in use by itself"
+        );
+        // Its run is gone: it holds the conversation until its launch is
+        // proven gone.
+        let dead = |_: &str| false;
+        assert!(
+            Sessions::of(&read).in_use(&b, SESSION, &dead, &[]),
+            "no record to check"
+        );
+        assert!(
+            Sessions::of(&read).in_use(&b, SESSION, &dead, &[record(None, None)]),
+            "a process it cannot check"
+        );
+        #[cfg(target_os = "linux")]
+        {
+            let me = std::process::id();
+            let start = crate::platform::proc::process_start_of(me);
+            assert!(
+                Sessions::of(&read).in_use(&b, SESSION, &dead, &[record(Some(me), start)]),
+                "a process of its launch still running"
+            );
+            assert!(
+                !Sessions::of(&read).in_use(
+                    &b,
+                    SESSION,
+                    &dead,
+                    &[record(Some(i32::MAX as u32), Some(1))]
+                ),
+                "a launch proven gone lets it go"
+            );
+        }
         // It reports another conversation: it left this one.
         read.lines.push(line(
             "r-live",
@@ -3753,20 +3928,30 @@ mod tests {
                 agent: crate::event::AgentType::ClaudeCode,
             },
         ));
-        assert!(!Sessions::of(&read).in_use(&b, SESSION, &live));
-        assert!(Sessions::of(&read).in_use(&b, OTHER, &live));
+        assert!(!Sessions::of(&read).in_use(&b, SESSION, &live, &[]));
+        assert!(Sessions::of(&read).in_use(&b, OTHER, &live, &[]));
         read.lines.push(line(
             "r-live",
             3,
             Event::AttemptEnded {
-                work,
-                attempt: successor,
+                work: work.clone(),
+                attempt: successor.clone(),
                 how: EndHow::Exited,
                 code: None,
                 cause: None,
             },
         ));
-        assert!(!Sessions::of(&read).in_use(&b, OTHER, &live));
+        assert!(!Sessions::of(&read).in_use(&b, OTHER, &live, &[]));
+        // Ended: what it left behind may still be in the conversation its
+        // restore confirmed.
+        assert!(Sessions::of(&read).in_use(&b, SESSION, &live, &[]));
+        #[cfg(target_os = "linux")]
+        assert!(!Sessions::of(&read).in_use(
+            &b,
+            SESSION,
+            &live,
+            &[record(Some(i32::MAX as u32), Some(1))]
+        ));
     }
 
     /// PRD #1790 stage 3 (audit B2): an agent a failed restore could not be
@@ -4539,7 +4724,7 @@ mod tests {
         let sessions = Sessions::of(&read);
         let second = AttemptId::parse("r-dead/9").unwrap();
         assert!(
-            sessions.in_use(&second, SESSION, &|_: &str| true),
+            sessions.in_use(&second, SESSION, &|_: &str| true, &[]),
             "the confirmed successor still owns its conversation"
         );
         assert!(

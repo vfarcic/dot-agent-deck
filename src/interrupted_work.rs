@@ -1468,6 +1468,10 @@ pub enum RestoreRefusal {
     /// restart note could not be posted, so it was stopped again and the
     /// item stays listed.
     NoteNotDelivered,
+    /// Review (Qodo #2): a dispatched unit was started over, but its saved
+    /// task could not be posted to it, so it was stopped again and the item
+    /// stays listed.
+    TaskNotDelivered,
     /// Audit B1: the agent started, but the deck could not record it as the
     /// one that took the old one's place, so it stopped the agent again
     /// and the item stays listed.
@@ -1565,6 +1569,9 @@ pub fn restore_refusal_sentence(reason: RestoreRefusal) -> &'static str {
         }
         RestoreRefusal::NoteNotDelivered => {
             "The agent came back into its conversation, but the deck could not give it its restart note, so it stopped the agent again. The item is still listed; try again."
+        }
+        RestoreRefusal::TaskNotDelivered => {
+            "The agent started over, but the deck could not give it its saved task, so it stopped the agent again. The item is still listed; try again."
         }
         RestoreRefusal::NotRecorded => {
             "The agent started, but the deck could not record it in its work journal, so it stopped the agent again. The item is still listed; try again."
@@ -2544,25 +2551,26 @@ impl<'a> Index<'a> {
                 ItemKind::Orchestration => false,
             };
         let omitted = attempts.len().saturating_sub(MAX_ITEM_AGENTS);
-        attempts.truncate(MAX_ITEM_AGENTS);
-        let mut sessions: Vec<Option<&str>> = Vec::new();
-        let mut agents: Vec<ItemAgent> = attempts
-            .iter()
-            .map(|attempt| {
-                let (agent, session) = self.agent(attempt, single, incomplete);
-                sessions.push(session);
-                agent
-            })
-            .collect();
+        // Review (Qodo #6): the duplicate check runs over every attempt of
+        // the item, the ones left out of the list included, so an omitted
+        // agent in the same conversation still makes a listed one ambiguous.
+        let mut agents: Vec<ItemAgent> = Vec::with_capacity(attempts.len().min(MAX_ITEM_AGENTS));
+        let mut sessions: Vec<Option<&str>> = Vec::with_capacity(attempts.len());
+        for (at, attempt) in attempts.iter().enumerate() {
+            let (agent, session) = self.agent(attempt, single, incomplete);
+            sessions.push(session);
+            if at < MAX_ITEM_AGENTS {
+                agents.push(agent);
+            }
+        }
         // Two agents resumed into one conversation would both write to it.
-        for (at, session) in sessions.iter().enumerate() {
-            let Some(session) = session else { continue };
-            if sessions
-                .iter()
-                .enumerate()
-                .any(|(other, s)| other != at && s.as_ref() == Some(session))
-            {
-                agents[at].restore = RestoreVerdict::NotRestorable {
+        let mut resumers: HashMap<&str, usize> = HashMap::new();
+        for session in sessions.iter().flatten() {
+            *resumers.entry(session).or_default() += 1;
+        }
+        for (agent, session) in agents.iter_mut().zip(&sessions) {
+            if session.is_some_and(|session| resumers.get(session).is_some_and(|n| *n > 1)) {
+                agent.restore = RestoreVerdict::NotRestorable {
                     reason: RestoreReason::AmbiguousRecord,
                 };
             }

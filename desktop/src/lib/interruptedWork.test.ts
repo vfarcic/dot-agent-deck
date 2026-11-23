@@ -207,8 +207,8 @@ describe("the interrupted work wording", () => {
     // 28 + the 8 refusals of the full review and audit (bad-selection,
     // command-reopens, not-fresh, not-stopped, pr-open, directory-in-use,
     // note-refused, note-not-delivered) + not-recorded (round 3, audit B1)
-    // + restore-busy (round 5).
-    expect(arms).toHaveLength(38);
+    // + restore-busy (round 5) + task-not-delivered (PR #2497 review).
+    expect(arms).toHaveLength(39);
     for (const [, variant, literal, constant] of arms) {
       const code = variant.replace(/([a-z0-9])([A-Z])/g, "$1-$2").toLowerCase();
       const sentence = literal === undefined ? rustStrings().get(constant) : JSON.parse(`"${literal}"`) as string;

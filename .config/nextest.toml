@@ -952,7 +952,11 @@ filter = 'test(/^doorbell_010_live_(kept_draft|spaces_only|spaces_moved_back|bla
 slow-timeout = { period = "60s", terminate-after = 5 }
 
 # Two real turns plus startup, restart and receipt in the agent-restore tests.
-# Both daemon lifetimes have a 900-second cap, beyond this 840-second bound.
+# 14 x 60 s = 840 s. The test derives every per-step wait from one 780-second
+# budget (`TEST_BUDGET` in tests/e2e_agent_restore_live.rs), so a slow run
+# fails a step with its own diagnostics before this bound kills it; the 60 s
+# left covers the harness's own bounds and teardown. Both daemon lifetimes
+# have a 900-second cap, beyond this 840-second bound.
 [[profile.default.overrides]]
 filter = 'test(/^journal_restore_01[67]_/)'
 slow-timeout = { period = "60s", terminate-after = 14 }

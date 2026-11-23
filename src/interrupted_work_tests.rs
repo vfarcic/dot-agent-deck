@@ -129,6 +129,53 @@ fn journal_restore_001_agent_lists_are_bounded_with_an_omitted_count() {
     assert_eq!(attempts.len(), 16, "distinct attempts, not duplicate rows");
 }
 
+/// Scenario: List an interrupted plain agent whose pane ran seventeen attempts, each in a conversation of its own except the seventeenth, which is in the first one's conversation. Only sixteen agents are listed, and the first is not offered a resume, because the agent left out of the list shares its conversation.
+#[spec("journal/restore/037")]
+#[test]
+fn journal_restore_037_an_agent_left_out_of_the_list_still_makes_a_shared_conversation_ambiguous() {
+    use crate::event::AgentType;
+    let session = |n: u64| format!("{n:08x}-0000-4cde-8fab-0123456789ab");
+    let mut j = Journal::default();
+    let w = work(1);
+    j.opened(
+        &w,
+        Launch::Pane,
+        None,
+        pane_refs("pane-1"),
+        Some("/home/someone/code/p"),
+    );
+    let mut records = Vec::new();
+    let count = MAX_ITEM_AGENTS as u64 + 1;
+    for n in 1..=count {
+        let a = attempt(OLD, n);
+        j.started(&w, &a);
+        // The last attempt, the one the list leaves out, is in the first's
+        // conversation.
+        let id = if n == count { session(1) } else { session(n) };
+        restore_session(&mut j, &w, &a, AgentType::ClaudeCode, &id);
+        j.ended(&w, &a, EndHow::Interrupted);
+        records.push(restore_record(&w, &a, AgentType::ClaudeCode));
+    }
+    let list = derive_in(&j, records, &[]);
+    let item = &list.items[0];
+    assert_eq!(item.agents.len(), MAX_ITEM_AGENTS);
+    assert_eq!(item.agents_omitted, 1);
+    assert_eq!(
+        item.agents[0].attempt.to_string(),
+        attempt(OLD, 1).to_string()
+    );
+    assert_eq!(
+        item.agents[0].restore,
+        RestoreVerdict::NotRestorable {
+            reason: RestoreReason::AmbiguousRecord
+        },
+        "the omitted agent shares its conversation"
+    );
+    for agent in &item.agents[1..] {
+        assert_eq!(agent.restore, RestoreVerdict::Resume, "{}", agent.attempt);
+    }
+}
+
 /// Scenario: List interrupted agents that cannot resume, Codex and a default shell among them, and list a team's roles and multi-attempt units. Fresh starts are offered for the unsupported single agents; team roles and units outside the single-agent scope say orchestration-later.
 #[spec("journal/restore/002")]
 #[test]
