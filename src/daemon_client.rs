@@ -4465,8 +4465,10 @@ impl DaemonClient {
     /// daemon may run it whatever becomes of the reply, so a broken connection
     /// and a cut-off, unreadable or empty reply are all
     /// [`ClientError::Unanswered`]. A daemon's refusal of the whole request
-    /// ([`ClientError::Server`]) is an answer: the daemon checks a batch before
-    /// it runs any entry.
+    /// ([`ClientError::Server`]) is an answer that no entry ran: the daemon
+    /// refuses a batch whole only before it runs any entry, and once an
+    /// execution starts it answers per entry, an entry it cannot account for
+    /// being [`crate::agent_cards::BATCH_UNKNOWN`].
     pub async fn invoke_card_action_batch(
         &self,
         instance_id: &str,

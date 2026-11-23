@@ -2152,14 +2152,17 @@ async fn agent_card_invoke_batch(
 }
 
 /// Issue #2399 re-review: the outcome of an executed entry whose fate the
-/// bridge cannot confirm. Only this bridge says it, never a daemon. It carries
+/// bridge cannot confirm — the same word as the daemon's
+/// [`dot_agent_deck::agent_cards::BATCH_UNKNOWN`], which a daemon answers for
+/// an entry of a batch it started and cannot account for (codes `interrupted`
+/// and `answer_not_kept`). From this bridge it carries
 /// [`CODE_CARD_BATCH_NO_ANSWER`] when [`card_batch_reply_timeout`] ran out, and
 /// [`CODE_CARD_BATCH_CONNECTION_LOST`] when the connection broke after the
 /// request was written. The entry may have been delivered, may still be, or
 /// may not be: a timeout can be spent before the request was written, so it is
 /// not proof the request was sent either. It is neither `failed` ("not sent")
 /// nor `delivered`.
-pub(crate) const CARD_BATCH_UNKNOWN: &str = "unknown";
+pub(crate) const CARD_BATCH_UNKNOWN: &str = dot_agent_deck::agent_cards::BATCH_UNKNOWN;
 /// The code an entry carries beside [`CARD_BATCH_UNKNOWN`] when the bound ran
 /// out with no answer, whether or not the request had been written by then.
 pub(crate) const CODE_CARD_BATCH_NO_ANSWER: &str = "no_answer";
@@ -2234,9 +2237,11 @@ pub(crate) const CODE_CARD_BATCH_CONNECTION_LOST: &str = "connection_lost";
 /// left the desktop: the deck could not be reached, its `Hello` failed, or the
 /// desktop refused it before sending.
 pub(crate) const CODE_CARD_BATCH_NOT_SENT: &str = "not_sent";
-/// The code an executed entry carries beside `failed` when the daemon refused:
-/// the `Hello` the request would have followed, or the whole request, which
-/// it checks before it runs any entry.
+/// The code an entry carries when the daemon refused: the `Hello` the request
+/// would have followed, or the whole request. The daemon refuses a whole
+/// request only before it runs any entry; once an execution starts it answers
+/// per entry. An executed entry carries it beside `failed`, a previewed one
+/// beside `skipped`.
 pub(crate) const CODE_CARD_BATCH_DECK_REFUSED: &str = "deck_refused";
 
 /// What an executed entry says when the connection broke after the request
@@ -2253,19 +2258,24 @@ pub(crate) fn card_batch_connection_lost_message(detail: &str) -> String {
 /// establishment gate, and a handshake when the held link is stale), then the
 /// batch exchange — runs against one deadline, [`card_batch_reply_timeout`]
 /// from when it starts (PR #2491 review). A preview sends nothing, so a deck
-/// that cannot be reached or does not answer is an error, and a deck that
-/// refuses the preview (the `Hello`, a replaced daemon, an older daemon, or
-/// the request as a whole) answers every entry `skipped` with the deck's
-/// reason, so the user reads why rather than that nobody answered. An
-/// execution answers every entry, and which outcome depends on what the
-/// bridge can place:
+/// that cannot be reached, cannot be trusted or does not answer is an error,
+/// and a deck that answered and declined the preview answers every entry
+/// `skipped` with the reason, so the user reads why rather than that nobody
+/// answered: a handshake classified incompatible, a `Hello` on another
+/// attach protocol or one the desktop does not admit, a replaced daemon, an
+/// older daemon without batches, or the request refused whole. An execution
+/// answers every entry, and which outcome depends on what the bridge can
+/// place:
 ///
 /// - a failure known to come before the request was written (the deck could
-///   not be reached or trusted, its `Hello` failed, it is a successor of the
-///   daemon that listed the cards), and the daemon refusing the whole
-///   request, make every entry `failed`: no entry ran. The deadline running
-///   out while the link is still being acquired is one of these: the request
-///   is written only after the link is held.
+///   not be reached or trusted, its `Hello` failed or was declined, it is a
+///   successor of the daemon that listed the cards), and the daemon refusing
+///   the whole request, make every entry `failed`: no entry ran. The daemon
+///   refuses a whole request only before it runs any entry; an execution it
+///   started answers per entry, an entry it cannot account for being
+///   `unknown` with its own code, and that answer is passed on as it is. The
+///   deadline running out while the link is still being acquired is one of
+///   these: the request is written only after the link is held.
 /// - a failure after it was written (the connection broke, the reply was cut
 ///   off or unreadable) makes every entry [`CARD_BATCH_UNKNOWN`] with
 ///   [`CODE_CARD_BATCH_CONNECTION_LOST`]: the daemon may have delivered it, or
@@ -2325,6 +2335,17 @@ async fn agent_card_invoke_batch_on(
         )),
         CardBatchMode::Execute => Ok(every(failed, code, &format!("{reason}; {unsent}"))),
     };
+    // The deck answered and declined to take the request on this link: a
+    // preview's entries are each `skipped` with the reason, an execution's
+    // each `failed`, not sent.
+    let declined = |error: &str| match mode {
+        CardBatchMode::Preview => Ok(every(
+            dot_agent_deck::agent_cards::BATCH_SKIPPED,
+            CODE_CARD_BATCH_DECK_REFUSED,
+            &format!("{error}; nothing is sent to this agent"),
+        )),
+        CardBatchMode::Execute => not_sent(CODE_CARD_BATCH_NOT_SENT, error),
+    };
     let daemon = match crate::dto::DeckScope::resolve(Some(deck_id)) {
         Ok(scope) => {
             match tokio::time::timeout_at(until, state.daemon.trusted(scope.endpoint())).await {
@@ -2343,8 +2364,9 @@ async fn agent_card_invoke_batch_on(
         }
         Err(error) => return not_sent(CODE_CARD_BATCH_NOT_SENT, &error),
     };
+    // The handshake was answered and classified incompatible.
     if let Err(error) = daemon.require_compatible() {
-        return not_sent(CODE_CARD_BATCH_NOT_SENT, &error);
+        return declined(&error);
     }
     let reply = daemon.client.invoke_card_action_batch(
         instance_id,
@@ -2374,8 +2396,16 @@ async fn agent_card_invoke_batch_on(
                 )),
             };
         }
+        // The `Hello` on the request's own connection was answered on another
+        // attach protocol, or one this desktop does not admit: nothing was
+        // sent.
+        Ok(Err(error @ (ClientError::ProtocolMismatch { .. } | ClientError::NotAdmitted(_)))) => {
+            return declined(&error.to_string());
+        }
         // The daemon refused the `Hello` or the request: either way it ran no
-        // entry, though the request itself may have reached it.
+        // entry, though the request itself may have reached it. The daemon
+        // refuses a batch whole only before it runs any entry; once it runs
+        // one, its answer is per entry and arrives as `Answered` below.
         Ok(Err(error @ ClientError::Server(_))) => {
             return refused(
                 CODE_CARD_BATCH_DECK_REFUSED,

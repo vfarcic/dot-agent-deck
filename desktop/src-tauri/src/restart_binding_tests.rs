@@ -61,6 +61,16 @@ struct Script {
     /// Issue #2399: an `invoke-card-action-batch` is answered with this
     /// refusal of the whole request.
     refuse_batch: Option<&'static str>,
+    /// PR #2491 review: an `invoke-card-action-batch` is answered with this
+    /// per-entry result.
+    batch_answer: Option<dot_agent_deck::agent_cards::CardBatchResult>,
+    /// PR #2491 review: every `Hello` names this attach protocol, when set —
+    /// a deck the establishment handshake classifies incompatible.
+    hello_protocol: Option<u32>,
+    /// PR #2491 review: a `Hello` that asks to be followed by a request names
+    /// this attach protocol, when set, while the establishment `Hello` names
+    /// this build's.
+    follow_on_hello_protocol: Option<u32>,
 }
 
 /// A deck whose daemon restarts at its socket as the same build. Every request
@@ -268,6 +278,17 @@ impl RestartingDeck {
                                         );
                                     }
                                 }
+                                {
+                                    let script = script.lock().unwrap();
+                                    let protocol = if request["follow_on"] == true {
+                                        script.follow_on_hello_protocol.or(script.hello_protocol)
+                                    } else {
+                                        script.hello_protocol
+                                    };
+                                    if let Some(protocol) = protocol {
+                                        hello.server_version = Some(protocol);
+                                    }
+                                }
                                 if let Some(advertise) = script.lock().unwrap().answer_capability {
                                     let capabilities = hello.capabilities.get_or_insert_default();
                                     capabilities.retain(|cap| cap != dot_agent_deck::daemon_protocol::CAP_ANSWER_SETTLEMENT);
@@ -303,6 +324,17 @@ impl RestartingDeck {
                                     .filter(|_| op == "invoke-card-action-batch")
                                 {
                                     AttachResponse::err(refusal)
+                                } else if let Some(answer) = script
+                                    .lock()
+                                    .unwrap()
+                                    .batch_answer
+                                    .clone()
+                                    .filter(|_| op == "invoke-card-action-batch")
+                                {
+                                    AttachResponse {
+                                        card_action_batch: Some(answer),
+                                        ..AttachResponse::ok()
+                                    }
                                 } else {
                                     with_live(serve(&op), live)
                                 };
@@ -1855,4 +1887,183 @@ async fn a_card_batch_preview_the_deck_refuses_skips_each_agent_with_the_deck_s_
         assert!(!message.contains("did not answer"), "{message}");
     }
     assert_eq!(deck.script.lock().unwrap().batch_requests.len(), 1);
+}
+
+/// Scenario (PR #2491 review): the user sends "Go ahead" to two agents, and
+/// the deck starts the batch: it posts to the first agent and its run is cut
+/// short before it can say what became of the second, or it answers a repeat
+/// of a batch whose outcomes it did not keep. The first agent reads as the
+/// deck answered it, and an agent the deck cannot account for reads "unknown"
+/// with the deck's own code and sentence, never "failed" and never "nothing
+/// was delivered".
+#[tokio::test]
+async fn a_card_batch_the_deck_started_and_cannot_account_for_reads_unknown_not_failed() {
+    use dot_agent_deck::agent_cards::{
+        BATCH_DELIVERED, BATCH_FAILED, BATCH_UNKNOWN, CODE_BATCH_ANSWER_NOT_KEPT,
+        CODE_BATCH_INTERRUPTED, CardBatchMode, CardBatchOutcome, CardBatchResult,
+    };
+    let _selection = crate::dto::SELECTION_LOCK.lock().await;
+    let deck = RestartingDeck::start("batch-unaccounted", "a");
+    let _local = select(&deck);
+    let state = DesktopState::default();
+    let wire = crate::dto::deck_wire_id(&deck.endpoint());
+    let unknown = |pane: &str, agent: &str, code: &str| {
+        CardBatchOutcome {
+        pane_id: pane.into(),
+        agent_id: agent.into(),
+        outcome: BATCH_UNKNOWN.into(),
+        code: Some(code.into()),
+        message: Some("it is not known whether this agent got it; check its card's delivery history before sending again".into()),
+        ..Default::default()
+    }
+    };
+    for (request_id, answer) in [
+        (
+            "batch-cut-short",
+            vec![
+                CardBatchOutcome {
+                    pane_id: "pane-1".into(),
+                    agent_id: "1".into(),
+                    outcome: BATCH_DELIVERED.into(),
+                    message_id: Some("m-1".into()),
+                    state: Some("queued".into()),
+                    ..Default::default()
+                },
+                unknown("pane-2", "2", CODE_BATCH_INTERRUPTED),
+            ],
+        ),
+        (
+            "batch-not-kept",
+            vec![
+                unknown("pane-1", "1", CODE_BATCH_ANSWER_NOT_KEPT),
+                unknown("pane-2", "2", CODE_BATCH_ANSWER_NOT_KEPT),
+            ],
+        ),
+    ] {
+        deck.script.lock().unwrap().batch_answer = Some(CardBatchResult {
+            request_id: request_id.into(),
+            entries: answer.clone(),
+        });
+        let result = crate::agent_card_invoke_batch_on(
+            &state,
+            &wire,
+            "a",
+            "go",
+            CardBatchMode::Execute,
+            request_id,
+            batch_entries(),
+        )
+        .await
+        .expect("an execution the deck started answers each entry");
+        assert_eq!(
+            result.entries, answer,
+            "{request_id}: passed on as the deck answered it"
+        );
+        for entry in &result.entries {
+            assert_ne!(entry.outcome, BATCH_FAILED, "{request_id}: {entry:?}");
+            let message = entry.message.as_deref().unwrap_or_default();
+            assert!(
+                !message.contains("nothing was delivered"),
+                "{request_id}: {message}"
+            );
+        }
+        assert_eq!(
+            result
+                .entries
+                .iter()
+                .filter(|e| e.outcome == crate::CARD_BATCH_UNKNOWN)
+                .count(),
+            answer.iter().filter(|e| e.outcome == BATCH_UNKNOWN).count(),
+            "{request_id}: the deck's unknown is the bridge's"
+        );
+    }
+    assert_eq!(
+        deck.script.lock().unwrap().batch_requests.len(),
+        2,
+        "each sent once"
+    );
+}
+
+/// Scenario (PR #2491 review): the user previews "Go ahead" on two agents of a
+/// deck that answers and declines it before the request: its handshake names
+/// another attach protocol, so the app classifies it incompatible, or only
+/// the `Hello` on the request's own connection does. Each agent is skipped
+/// with that reason, rather than read as a deck that could not be reached or
+/// did not answer, and no batch request is written. Sending to them is still
+/// "failed", nothing sent.
+#[tokio::test]
+async fn a_card_batch_preview_a_deck_declines_at_its_handshake_skips_each_agent_with_the_reason() {
+    use dot_agent_deck::agent_cards::{BATCH_FAILED, BATCH_SKIPPED, CardBatchMode};
+    use dot_agent_deck::daemon_protocol::PROTOCOL_VERSION;
+    let _selection = crate::dto::SELECTION_LOCK.lock().await;
+    for (tag, at_establishment) in [
+        ("batch-declined-establishment", true),
+        ("batch-declined-follow-on", false),
+    ] {
+        let deck = RestartingDeck::start(tag, "a");
+        {
+            let mut script = deck.script.lock().unwrap();
+            if at_establishment {
+                script.hello_protocol = Some(PROTOCOL_VERSION + 1);
+            } else {
+                script.follow_on_hello_protocol = Some(PROTOCOL_VERSION + 1);
+            }
+        }
+        let _local = select(&deck);
+        let state = DesktopState::default();
+        let wire = crate::dto::deck_wire_id(&deck.endpoint());
+        let preview = crate::agent_card_invoke_batch_on(
+            &state,
+            &wire,
+            "a",
+            "go",
+            CardBatchMode::Preview,
+            &format!("{tag}-preview"),
+            batch_entries(),
+        )
+        .await
+        .expect("a declined preview answers each entry");
+        assert_eq!(preview.entries.len(), 2, "{tag}");
+        for entry in &preview.entries {
+            assert_eq!(entry.outcome, BATCH_SKIPPED, "{tag}: {entry:?}");
+            assert_eq!(
+                entry.code.as_deref(),
+                Some(crate::CODE_CARD_BATCH_DECK_REFUSED),
+                "{tag}"
+            );
+            let message = entry.message.as_deref().unwrap_or_default();
+            assert!(
+                message.contains(&format!("attach protocol v{}", PROTOCOL_VERSION + 1))
+                    && message.ends_with("; nothing is sent to this agent"),
+                "{tag}: {message}"
+            );
+            assert!(
+                !message.contains("could not be reached"),
+                "{tag}: {message}"
+            );
+        }
+        let executed = crate::agent_card_invoke_batch_on(
+            &state,
+            &wire,
+            "a",
+            "go",
+            CardBatchMode::Execute,
+            &format!("{tag}-execute"),
+            batch_entries(),
+        )
+        .await
+        .expect("a declined execution answers each entry");
+        for entry in &executed.entries {
+            assert_eq!(entry.outcome, BATCH_FAILED, "{tag}: {entry:?}");
+            assert_eq!(
+                entry.code.as_deref(),
+                Some(crate::CODE_CARD_BATCH_NOT_SENT),
+                "{tag}"
+            );
+        }
+        assert!(
+            deck.script.lock().unwrap().batch_requests.is_empty(),
+            "{tag}: no batch request was written"
+        );
+    }
 }

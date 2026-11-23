@@ -340,10 +340,12 @@ export function useAgentCardsView({ runtime, decks, openAgent, openReference, hi
     setNotice(undefined);
     setBatch({ actionId, label, scope, stage: "previewing", groups: [], results: [] });
     /* Each daemon's preview settles on its own (PR #2491 review): one that
-       cannot be reached or does not answer leaves its agents skipped with
-       its error, and the other daemons' agents proceed. One that refuses the
-       preview answers it, each agent skipped with the daemon's reason, so it
-       is not read as unanswered. Send sends only to agents a preview
+       cannot be reached, is not trusted or does not answer leaves its agents
+       skipped with its error, and the other daemons' agents proceed. One that
+       answered and declined the preview (its handshake classified
+       incompatible, a refused `Hello`, a replaced or older daemon, the
+       request refused whole) has it answered by the bridge, each agent
+       skipped with the reason, so it is not read as unanswered. Send sends only to agents a preview
        included, so none of them is sent to. When no daemon answered, there
        is nothing to review, and the error is the batch's. */
     const parts = [...groups.values()];

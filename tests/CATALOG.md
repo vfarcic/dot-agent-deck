@@ -16957,6 +16957,13 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 - **Asserts:** the headlines read "1 queued for the agent of 2; 1 not answered, may still be delivered" and "1 closed of 3; 1 failed; 1 not answered, may still be closed", and the close batch's headline says neither "sent" nor "delivered" (PR #2491 review).
 - **Does not assert:** the wording of a batch whose rows mix prompt and close actions.
 
+##### desktop/agent-cards/045 — An agent the daemon cannot account for after starting a batch reads No answer, never Failed.
+
+- **Test:** vitest `desktop/agent-cards/045: …` in `desktop/src/components/AgentCardsBatch.test.tsx`.
+- **Layer:** desktop overview (jsdom), stubbed batch bridge whose execution answers one entry queued and the other `unknown` / `interrupted` with the daemon's sentence, as a daemon whose run of the batch was cut short answers.
+- **Asserts:** the queued agent reads "Queued for the agent"; the other reads "No answer" with the daemon's sentence; no row reads "Failed", the headline counts no failure, and nothing says that nothing was delivered or sent (PR #2491 review).
+- **Does not assert:** the daemon's answer itself, which `a_batch_cut_short_after_its_first_post_answers_each_entry_and_none_failed` in `src/agent_cards.rs` (`batch_tests`) pins, nor the bridge passing it on, which `a_card_batch_the_deck_started_and_cannot_account_for_reads_unknown_not_failed` in `desktop/src-tauri/src/restart_binding_tests.rs` pins.
+
 ## Desktop native driver scenarios
 
 These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[spec]` scanner, and run in CI's advisory `desktop-driver` job. `docs/develop/desktop-gui.md` ("The driver tier") describes the harness.

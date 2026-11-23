@@ -481,4 +481,28 @@ describe("batch card actions (#2399)", () => {
     expect(headline).toHaveTextContent("1 closed of 3; 1 failed; 1 not answered, may still be closed");
     expect(headline).not.toHaveTextContent(/sent|delivered/i);
   });
+
+  /// Scenario: Send a reviewed batch to two agents whose daemon posts to the first and is then interrupted before it can say what became of the second, so it answers the second `unknown` with code `interrupted`. The first agent's row reads "Queued for the agent"; the second reads "No answer" with the daemon's sentence, never "Failed" and never that nothing was delivered.
+  it("desktop/agent-cards/045: an agent the daemon cannot account for after starting a batch reads No answer, never Failed", async () => {
+    const calls = setup();
+    const dialog = await startSelectedBatch();
+    const INTERRUPTED = "the deck was interrupted while running this batch, so it is not known whether this agent got it; check its card's delivery history before sending again";
+    calls.invokeCardActionBatch.mockImplementationOnce(async (_deckId: string, _actionId: string, options: BatchOptions) => ({
+      request_id: options.requestId,
+      entries: [
+        { ...INCLUDED[0], outcome: "delivered", message_id: "m-root", state: "queued" },
+        { pane_id: INCLUDED[1].pane_id, agent_id: INCLUDED[1].agent_id, outcome: "unknown", code: "interrupted", message: INTERRUPTED },
+      ],
+    }) as never);
+    await act(async () => { fireEvent.click(within(dialog).getByRole("button", { name: /^Send$/ })); });
+    const results = screen.getByTestId("agent-cards-batch-results");
+    const rows = within(results).getAllByTestId("agent-cards-batch-entry");
+    expect(rows.map((row) => row.getAttribute("data-outcome"))).toEqual(["delivered", "unknown"]);
+    expect(within(rows[0]).getByText("Queued for the agent", { exact: true })).toBeInTheDocument();
+    expect(within(rows[1]).getByText("No answer", { exact: true })).toBeInTheDocument();
+    expect(within(rows[1]).getByText(INTERRUPTED)).toBeInTheDocument();
+    expect(within(results).queryByText(/^Failed$/)).toBeNull();
+    expect(results).not.toHaveTextContent(/nothing was delivered|nothing was sent/);
+    expect(within(results).getByRole("status")).not.toHaveTextContent(/failed/);
+  });
 });

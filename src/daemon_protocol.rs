@@ -3620,10 +3620,13 @@ pub enum AttachRequest {
     /// caps, delivery and the card's `recent_deliveries`), so an entry whose
     /// action changed since its preview fails alone and the others still go.
     /// `request_id` names the batch; a repeat of an execution sends nothing
-    /// again while each entry's answer is remembered (up to
-    /// [`crate::agent_cards::REQUEST_ID_MEMORY`], sooner when newer answers
-    /// need the room), as for a single press. The reply rides back on
-    /// [`AttachResponse::card_action_batch`].
+    /// again while the batch is remembered (up to
+    /// [`crate::agent_cards::REQUEST_ID_MEMORY`], sooner when newer batches
+    /// need the room), and is answered with the first execution's outcomes.
+    /// The reply rides back on [`AttachResponse::card_action_batch`]. A
+    /// refusal of the whole request (`ok: false`) comes only before any entry
+    /// ran; an execution that started answers per entry, an entry the daemon
+    /// cannot account for being [`crate::agent_cards::BATCH_UNKNOWN`].
     /// **Withheld unless the daemon advertises [`CAP_AGENT_CARDS_BATCH`]** on
     /// the connection that carries it, so no [`PROTOCOL_VERSION`] bump.
     InvokeCardActionBatch {
