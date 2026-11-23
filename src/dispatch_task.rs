@@ -147,6 +147,102 @@ pub fn is_task_file_name(name: &str) -> bool {
         .is_some_and(|work| WorkId::parse(work).is_some())
 }
 
+/// PRD #1790 stage 3: the most bytes a saved task [`read_saved`] reads.
+pub const MAX_SAVED_TASK_BYTES: u64 = 1024 * 1024;
+
+/// PRD #1790 stage 3: why [`read_saved`] gave no task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SavedTaskError {
+    /// No file of that name (or no `.dot-agent-deck` directory).
+    NotSaved,
+    /// The directory or the file cannot be trusted: a symlink, not a regular
+    /// file or directory, another account's, writable by others (the file:
+    /// open to others at all), too large, or not text.
+    Unsafe,
+}
+
+/// PRD #1790 stage 3: `work`'s saved task in `worktree`, read the way the
+/// module docs say a reader must: `.dot-agent-deck` opened without following
+/// a symlink, owned by this account and writable by no other (its private
+/// group excepted); the file opened relative to that descriptor without
+/// following a symlink, a regular file owned by this account with no group
+/// or other permission bits, at most [`MAX_SAVED_TASK_BYTES`], and UTF-8.
+/// Nothing is created or changed. Unix only: elsewhere every task is
+/// [`SavedTaskError::Unsafe`].
+#[cfg(unix)]
+pub fn read_saved(worktree: &Path, work: &WorkId) -> Result<String, SavedTaskError> {
+    use std::io::Read as _;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    let open_error = |e: io::Error| match e.kind() {
+        io::ErrorKind::NotFound => SavedTaskError::NotSaved,
+        _ => SavedTaskError::Unsafe,
+    };
+    let dir = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(worktree.join(CONTEXT_DIR_NAME))
+        .map_err(open_error)?;
+    let meta = dir.metadata().map_err(|_| SavedTaskError::Unsafe)?;
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    let private = if meta.mode() & 0o020 != 0 {
+        crate::platform::paths::effective_private_group()
+    } else {
+        None
+    };
+    if !meta.is_dir()
+        || crate::orchestrator_context::project_root_refusal(
+            meta.uid(),
+            meta.gid(),
+            meta.mode() & 0o7777,
+            euid,
+            private,
+        )
+        .is_some()
+    {
+        return Err(SavedTaskError::Unsafe);
+    }
+    let name = std::ffi::CString::new(file_name(work)).map_err(|_| SavedTaskError::Unsafe)?;
+    // SAFETY: a directory descriptor we hold and a NUL-terminated name; the
+    // result is a fresh descriptor we take sole ownership of, or -1.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(open_error(io::Error::last_os_error()));
+    }
+    // SAFETY: `fd` was just returned by `openat` and is owned by nothing else.
+    let file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    let meta = file.metadata().map_err(|_| SavedTaskError::Unsafe)?;
+    if !meta.file_type().is_file()
+        || meta.uid() != euid
+        || meta.mode() & 0o077 != 0
+        || meta.len() > MAX_SAVED_TASK_BYTES
+    {
+        return Err(SavedTaskError::Unsafe);
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_SAVED_TASK_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| SavedTaskError::Unsafe)?;
+    if bytes.len() as u64 > MAX_SAVED_TASK_BYTES {
+        return Err(SavedTaskError::Unsafe);
+    }
+    String::from_utf8(bytes).map_err(|_| SavedTaskError::Unsafe)
+}
+
+/// [`read_saved`] off Unix: no saved task is read there.
+#[cfg(not(unix))]
+pub fn read_saved(_worktree: &Path, _work: &WorkId) -> Result<String, SavedTaskError> {
+    Err(SavedTaskError::Unsafe)
+}
+
 /// Save `task` as `work`'s dispatched task in `worktree`, only once git
 /// ignores it there. Answers the file's path. See the module docs.
 pub fn save(worktree: &Path, work: &WorkId, task: &str) -> io::Result<PathBuf> {

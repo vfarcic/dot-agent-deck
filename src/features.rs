@@ -182,6 +182,16 @@ pub fn show_desktop_agent_details() -> bool {
     experimental_enabled()
 }
 
+/// Production wrapper for PRD #1790 stage 3's **agent restore** surfaces: the
+/// clients' Restore action and question, Start over, and the CLI's
+/// `interrupted restore` / `start-over` and the per-agent verdicts `interrupted
+/// show` prints. One wrapper per feature (CLAUDE.md #9), so `grep
+/// show_agent_restore` finds every gate. A presentation switch: the daemon
+/// advertises and serves the restore verbs whatever it says.
+pub fn show_agent_restore() -> bool {
+    experimental_enabled()
+}
+
 /// Guards [`init_and_watch`] so the periodic watcher thread is spawned at
 /// most once per process (reviewer #4 / audit INFO-3): a second call is a
 /// no-op rather than leaking a duplicate poll thread.

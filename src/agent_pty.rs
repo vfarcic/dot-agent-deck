@@ -9137,6 +9137,12 @@ pub struct AgentPtyRegistry {
     /// per daemon, since the provider limit it spreads is the account's. See
     /// [`crate::role_start_pacing`].
     role_start_pacer: crate::role_start_pacing::RoleStartPacer,
+    /// PRD #1790 stage 3: the panes a restore is waiting on, each with the
+    /// first attested session its agent reported: `(agent id, session)`.
+    /// Keyed by the pane id the restore mints before it spawns, so a hook
+    /// that lands before the spawn returns is not missed. See
+    /// [`Self::watch_restore_session`].
+    restore_watches: Mutex<HashMap<String, Option<(String, String)>>>,
     /// Issue #424 F1 + PRD #1631: what each pane's input box is holding — the
     /// human-input sequence [`Self::user_typed_since_question`] reads, and each
     /// pane's input stream, whose paste framing and turn clock
@@ -11632,6 +11638,7 @@ impl AgentPtyRegistry {
             shutting_down: AtomicBool::new(false),
             admission_frozen: AtomicBool::new(false),
             role_start_pacer: crate::role_start_pacing::RoleStartPacer::default(),
+            restore_watches: Mutex::new(HashMap::new()),
             pane_input: Arc::new(Mutex::new(PaneInputState::default())),
             held_display: Arc::new(Notify::new()),
             pty_write_stall_bound_ms: AtomicU64::new(PTY_WRITE_STALL_BOUND.as_millis() as u64),
@@ -11979,12 +11986,57 @@ impl AgentPtyRegistry {
         session: &str,
         agent: &crate::event::AgentType,
     ) {
+        if let Some(pane) = pane {
+            self.note_restore_session(pane, agent_id, session);
+        }
         let inner = self.inner.lock();
         let reserved =
             !inner.agents.contains_key(agent_id) && inner.pending_spawns.contains_key(agent_id);
         self.work
             .session_seen(agent_id, pane, session, agent, reserved);
         drop(inner);
+    }
+
+    /// PRD #1790 stage 3: start recording the first attested session the
+    /// agent in `pane` reports ([`Self::session_seen`]), for a restore that
+    /// is about to spawn into it. Ended by [`Self::unwatch_restore_session`].
+    pub fn watch_restore_session(&self, pane: &str) {
+        self.restore_watches
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(pane.to_string(), None);
+    }
+
+    /// PRD #1790 stage 3: the first attested session the agent in the watched
+    /// `pane` reported, as `(agent id, session)`; `None` until one did, or
+    /// for a pane no restore watches.
+    pub fn restore_session_seen(&self, pane: &str) -> Option<(String, String)> {
+        self.restore_watches
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(pane)
+            .cloned()
+            .flatten()
+    }
+
+    /// PRD #1790 stage 3: stop watching `pane`.
+    pub fn unwatch_restore_session(&self, pane: &str) {
+        self.restore_watches
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(pane);
+    }
+
+    /// Keep the first session reported in a watched pane; later ones and
+    /// unwatched panes change nothing.
+    fn note_restore_session(&self, pane: &str, agent_id: &str, session: &str) {
+        let mut watches = self
+            .restore_watches
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(slot @ None) = watches.get_mut(pane) {
+            *slot = Some((agent_id.to_string(), session.to_string()));
+        }
     }
 
     /// TEST: the agent ids of the spawns the registry holds a reservation

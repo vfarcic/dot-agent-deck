@@ -927,6 +927,46 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 - **Does not assert:** orphaned descendants in an old process session or the spawn write site.
 - **Platform coverage:** mac+linux.
 
+##### journal/restore/011 — Restore and continue confirms the conversation before sending the first message.
+
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_agent_restore.rs`); the real CLI outside a pane, no terminal on stdin; restart by SIGTERM to the owned daemon pid and a new daemon on the same state directory.
+- **Agent:** synthetic executable named `claude` on PATH, recording argv and reporting a real hook-protocol `SessionStart` through the deck's hook CLI. No agent credential.
+- **Asserts:** show names the agent and attempt and says `Can be restored with its conversation.`; without `--yes` a nonterminal restore refuses and names `--yes`; with `DOT_AGENT_DECK_EXPERIMENTAL=0`, restore and start-over refuse and name the flag; dry-run starts nothing and keeps the item. Restore and continue launches the original command once in its folder with separate `--resume`, UUID arguments, removes all three one-shot resume variables from the child, shows the same name on an independent dashboard pane, sends exactly the continue note as its first inbox message with deck reason `restart note`, and removes the interrupted item.
+- **Does not assert:** genuine agent conversation recall (lane 2, 016/017); TUI or desktop confirmation controls (007–010/015); Restore-only delivery (015); unsupported launch shapes.
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/012 — A different conversation is stopped before any mail and offers Start over.
+
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_agent_restore.rs`); public attach request and inbox history, with the real CLI for the resulting show.
+- **Agent:** synthetic `claude` acknowledges the resume arguments but reports a different canonical session UUID.
+- **Asserts:** final `interrupted_restore` has an empty `restored` array and one refused attempt with reason `not-resumed` and a message explaining the conversation; the new card is gone and the process no longer exists; no inbox message was posted, including recent history; the original item stays listed with verdict `start_over`, and show offers `Start over in this worktree`.
+- **Does not assert:** timeout, missing shim acknowledgement, or early-exit failure variants; real-agent behavior.
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/013 — An old session descendant blocks a second writer.
+
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_agent_restore.rs`); Linux-only session-descendant process guard.
+- **Agent:** synthetic `claude` leaves a child in the original session but a different process group, ignoring TERM/HUP. The child independently enforces a 180-second SIGALRM lifetime cap; fixture cleanup signals only its exact pid while its recorded start identity still matches.
+- **Asserts:** the child survives shutdown; restore returns `still-running`, launches nothing, posts nothing and keeps the interrupted item.
+- **Does not assert:** macOS descendant scanning (not implemented); the direct pid guard and missing identity fields (006).
+- **Platform coverage:** linux.
+
+##### journal/restore/014 — Start over replays a safe saved task without a restart note.
+
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_agent_restore.rs`); real `dispatch --single --command … --agent claude --task …`, restart, and real `interrupted start-over` CLI; public attach refusal and inbox history.
+- **Agent:** synthetic routing dispatcher and synthetic `claude` single unit.
+- **Asserts:** the actual dispatch saved the multiline sentinel task verbatim; replacing that task by a symlink refuses `task-unsafe`, starts nothing, posts nothing and keeps the item; restoring its original safe file then starting over with `--agent <attempt> --yes` runs the recorded command in the worktree without resume arguments, delivers exactly the saved task as the first inbox message under deck reason `saved task`, delivers neither restart note, and removes the item.
+- **Does not assert:** other unsafe task file kinds or modes; plain-agent start-over without a saved task; orchestrations; a real agent spending a turn on the task.
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/015 — Restore only through the attached TUI creates a named pane with its first restart note.
+
+- **Layer:** L2 PTY-attached `TuiDeck` and vt100 grid, lane 1 (`tests/e2e_agent_restore.rs`, extending the 011 fixture).
+- **Agent:** private synthetic executable named `claude`, no real agent or credential; same capped fixture as 011.
+- **Asserts:** the original agent is visible on an attached TUI before daemon restart; a new TUI attached to the replacement daemon opens `I`, sees the stopped agent, presses `s` and sees the question and both exact restore choices. No agent starts merely from asking; `o` starts exactly one resumed pane whose box title has the original name, whose recorded argv has the separate resume UUID, and whose first and sole inbox message is exactly the Restore-only note with deck reason `restart note`; the item leaves the interrupted list.
+- **Does not assert:** agent recall or compliance with the note (lane 2, 016/017), staying in the same TUI process across changing fixture socket paths, saved-workspace dedupe (018), or desktop controls.
+- **Platform coverage:** mac+linux.
+
 #### journal/compat
 
 ##### journal/compat/001 — Lines of a newer schema or an unknown kind are skipped and kept.

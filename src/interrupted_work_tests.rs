@@ -1628,3 +1628,59 @@ fn dismiss_batches_fit_the_daemons_count_and_byte_limits() {
     }
     assert_eq!(batches.concat(), long);
 }
+
+/// PRD #1790 stage 3: a resume that did not take (`restore_failed`) leaves
+/// the agent listed with Start over offered; a restored or started-over item
+/// (`closed how=restored|started_over`) is no longer listed.
+#[test]
+fn a_failed_resume_offers_start_over_and_a_restore_or_start_over_leaves_the_list() {
+    use crate::event::AgentType;
+    use crate::work_journal::{RestoreFailure, RestoredHow};
+    let build = || {
+        let mut j = Journal::default();
+        let (w, a) = (work(1), attempt(OLD, 1));
+        j.opened(
+            &w,
+            Launch::Pane,
+            None,
+            Refs::default(),
+            Some("/home/someone/code/p"),
+        )
+        .started(&w, &a);
+        restore_session(&mut j, &w, &a, AgentType::ClaudeCode, RESTORE_SESSION);
+        j.ended(&w, &a, EndHow::Interrupted);
+        (j, w, a)
+    };
+    let (mut j, w, a) = build();
+    j.push(
+        LIVE,
+        Event::RestoreFailed {
+            work: w.clone(),
+            attempt: a.clone(),
+            failure: RestoreFailure::SessionMismatch,
+        },
+    );
+    let list = derive_in(&j, vec![restore_record(&w, &a, AgentType::ClaudeCode)], &[]);
+    assert_eq!(list.items.len(), 1);
+    assert_eq!(
+        restore_verdict(&list.items[0].agents[0]),
+        serde_json::json!({"kind": "start_over", "reason": "not-resumed"})
+    );
+    for (how, restored) in [
+        (CloseHow::Restored, RestoredHow::Resumed),
+        (CloseHow::StartedOver, RestoredHow::StartedOver),
+    ] {
+        let (mut j, w, a) = build();
+        j.closed(&w, how).push(
+            LIVE,
+            Event::AttemptRestored {
+                work: w.clone(),
+                from: a.clone(),
+                to: attempt(LIVE, 1),
+                how: restored,
+            },
+        );
+        let list = derive_in(&j, vec![restore_record(&w, &a, AgentType::ClaudeCode)], &[]);
+        assert!(list.items.is_empty(), "{how:?}: {list:?}");
+    }
+}

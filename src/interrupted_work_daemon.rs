@@ -195,14 +195,14 @@ pub const MAX_DISMISS_BYTES: usize = crate::close_agents::MAX_SELECTOR_BYTES;
 const GH: &str = "gh";
 
 /// One fresh read of everything the list is derived from.
-struct Snapshot {
-    list: InterruptedList,
-    read: JournalRead,
+pub(crate) struct Snapshot {
+    pub(crate) list: InterruptedList,
+    pub(crate) read: JournalRead,
     kept: Vec<KeptReport>,
 }
 
 /// The journal and the report store a request reads.
-fn sources(
+pub(crate) fn sources(
     registry: &AgentPtyRegistry,
 ) -> Result<(WorkJournal, Option<Arc<RetainedStore>>), String> {
     let journal = registry
@@ -215,7 +215,10 @@ fn sources(
 
 /// Read the journal, the launch records and the kept reports, and derive
 /// the list. Blocking.
-fn snapshot(journal: &WorkJournal, retained: Option<&RetainedStore>) -> std::io::Result<Snapshot> {
+pub(crate) fn snapshot(
+    journal: &WorkJournal,
+    retained: Option<&RetainedStore>,
+) -> std::io::Result<Snapshot> {
     let read = journal.read()?;
     let incomplete_launches = LaunchRead {
         truncated: true,
@@ -1033,7 +1036,7 @@ pub async fn dismiss(
 
 /// Write `closed how=<how>` on every work, waiting for each write; `true`
 /// when all were written. Blocking.
-fn close_all(journal: &WorkJournal, works: &[WorkId], how: CloseHow) -> bool {
+pub(crate) fn close_all(journal: &WorkJournal, works: &[WorkId], how: CloseHow) -> bool {
     let mut all = true;
     for work in works {
         if let Err(error) = journal.try_record(Event::Closed {

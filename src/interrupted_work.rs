@@ -240,6 +240,9 @@ pub enum RestoreReason {
     IncompleteRead,
     /// A restart did not stop it: it ended on its own, or is still running.
     NotInterrupted,
+    /// A restore with its conversation was tried and did not take, so it
+    /// can only be started over.
+    NotResumed,
     /// A reason of a newer daemon's.
     #[serde(other)]
     Unknown,
@@ -1262,8 +1265,291 @@ pub fn restore_reason_sentence(reason: RestoreReason) -> &'static str {
         }
         RestoreReason::IncompleteRead => "The deck could not read its whole work journal.",
         RestoreReason::NotInterrupted => "The restart did not stop this agent.",
+        RestoreReason::NotResumed => {
+            "The deck tried to restore the agent's conversation and could not."
+        }
         RestoreReason::Unknown => "The agent cannot be restored.",
     }
+}
+
+/// PRD #1790 stage 3: what every client says of an agent that can be
+/// restored with its conversation.
+pub const RESTORE_VERDICT_RESUME: &str = "Can be restored with its conversation.";
+/// The label of one of an item's agents, where a client lists them.
+pub const LABEL_AGENT: &str = "Agent";
+/// The label of the attempt id a restore or start-over names.
+pub const LABEL_ATTEMPT: &str = "Attempt";
+
+/// What every client says of an agent's verdict: [`RESTORE_VERDICT_RESUME`],
+/// or why it cannot be resumed and, when it can be started again, that
+/// [`START_OVER`] is offered.
+pub fn restore_verdict_sentence(verdict: RestoreVerdict) -> String {
+    match verdict {
+        RestoreVerdict::Resume => RESTORE_VERDICT_RESUME.to_string(),
+        RestoreVerdict::StartOver { reason } => format!(
+            "{} It can be started again without it: {START_OVER}.",
+            restore_reason_sentence(reason)
+        ),
+        RestoreVerdict::NotRestorable { reason } => restore_reason_sentence(reason).to_string(),
+        RestoreVerdict::Unknown => restore_reason_sentence(RestoreReason::Unknown).to_string(),
+    }
+}
+
+/// The question a client asks before it starts an agent over.
+pub fn start_over_question(name: &str) -> String {
+    format!("Start {name} over in this worktree, without its conversation?")
+}
+
+/// A restore's answer for one agent brought back.
+pub fn restored_sentence(name: &str) -> String {
+    format!("Restored {name} with its conversation.")
+}
+
+/// A start-over's answer for the agent started again.
+pub fn started_over_sentence(name: &str) -> String {
+    format!("Started {name} over in this worktree.")
+}
+
+/// A dry run's answer for an agent a restore would bring back.
+pub const RESTORE_WOULD: &str = "Restore would bring the agent back with its conversation.";
+/// A dry run's answer for an agent a start-over would start again.
+pub const START_OVER_WOULD: &str =
+    "Start over would start the agent again in this worktree, without its conversation.";
+/// A restored agent the deck could not give its restart note.
+pub const RESTART_NOTE_NOT_SENT: &str = "The deck could not give the restored agent its restart note, so it does not know the deck restarted. Tell it before it continues.";
+/// A started-over agent the deck could not give its saved task.
+pub const SAVED_TASK_NOT_SENT: &str =
+    "The deck could not give the new agent its saved task. Give it the task yourself.";
+/// The item's close could not be recorded, so it may be listed again.
+pub const RESTORE_NOT_RECORDED: &str =
+    "The deck could not record this, so the item may be listed again. Dismiss it if it is.";
+/// Nothing was restored.
+pub const NOTHING_RESTORED: &str = "Nothing was restored.";
+/// A restore asked for with no terminal to confirm on and no `--yes`.
+pub const RESTORE_NEEDS_YES: &str =
+    "Refused: there is no terminal to confirm on, so nothing was restored. Add --yes to restore.";
+/// A start-over asked for with no terminal to confirm on and no `--yes`.
+pub const START_OVER_NEEDS_YES: &str =
+    "Refused: there is no terminal to confirm on, so nothing was started. Add --yes to start over.";
+/// The restore surfaces are experimental and the flag is off.
+pub const RESTORE_NEEDS_EXPERIMENTAL: &str = "Restoring agents is experimental and turned off. Turn it on with `[features] experimental = true` in .dot-agent-deck.toml, or set DOT_AGENT_DECK_EXPERIMENTAL=1.";
+/// The running daemon does not advertise the restore verbs.
+pub const RESTORE_UNSUPPORTED: &str = "The running deck daemon cannot restore agents. Stop it with `dot-agent-deck daemon restart`, then start one from this build: open the TUI, or press Start daemon in the desktop app.";
+
+/// PRD #1790 stage 3: which note a restored agent receives first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreMode {
+    /// [`RESTORE_AND_CONTINUE`]: [`RESTART_NOTE_CONTINUE`].
+    Continue,
+    /// [`RESTORE_ONLY`]: [`RESTART_NOTE_ONLY`].
+    Only,
+}
+
+impl RestoreMode {
+    /// The restart note this mode posts.
+    pub fn note(self) -> &'static str {
+        match self {
+            RestoreMode::Continue => RESTART_NOTE_CONTINUE,
+            RestoreMode::Only => RESTART_NOTE_ONLY,
+        }
+    }
+}
+
+/// PRD #1790 stage 3: why a restore or start-over did not act. The wire
+/// codes are kebab-case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RestoreRefusal {
+    /// The request came from an agent in a deck pane.
+    AgentCaller,
+    /// The request named nothing it could act on.
+    BadRequest,
+    /// This platform has no way to restore an agent.
+    Unsupported,
+    /// The work journal could not be read.
+    Unreadable,
+    /// The journal or launch-record read was incomplete.
+    IncompleteRead,
+    /// No interrupted item matches, or it is no longer interrupted.
+    NotListed,
+    /// More than one interrupted item matches.
+    Ambiguous,
+    /// The attempt named is not one of the item's agents.
+    NotAnAgent,
+    /// The agent's verdict does not offer what was asked.
+    NotRestorable,
+    /// The records do not say for certain how the agent was started.
+    AmbiguousRecord,
+    /// No launch record says how the agent was started.
+    NoLaunchRecord,
+    /// The folder it started in was moved away.
+    FolderMoved,
+    /// Its record names no folder.
+    FolderUnknown,
+    /// The folder is not on disk.
+    FolderMissing,
+    /// The folder, or its path, is one another account can change.
+    FolderUnsafe,
+    /// The deck holds no conversation id for it.
+    NoSessionId,
+    /// The conversation id is not of the agent's own syntax.
+    SessionIdInvalid,
+    /// The agent's old process, or a process it left in its session, is
+    /// still running.
+    StillRunning,
+    /// The record does not say which process the agent was, so the deck
+    /// cannot tell it is gone.
+    OldProcessUnknown,
+    /// A restore or start-over of the same agent is already running.
+    AlreadyRestoring,
+    /// The deck is shutting down or restarting.
+    ShuttingDown,
+    /// The agent could not be started.
+    SpawnFailed,
+    /// The agent started but did not come back into its conversation, so it
+    /// was stopped before anything was sent to it.
+    NotResumed,
+    /// The saved task cannot be trusted: a symlink, not a regular file,
+    /// another account's, readable or writable by others, or too large.
+    TaskUnsafe,
+    /// A dispatched unit's saved task is not there.
+    NoSavedTask,
+    /// A refusal of a newer daemon's.
+    #[serde(other)]
+    Unknown,
+}
+
+/// The sentence every client shows for a restore or start-over refusal.
+pub fn restore_refusal_sentence(reason: RestoreRefusal) -> &'static str {
+    match reason {
+        RestoreRefusal::AgentCaller => {
+            "Refused: this request came from an agent in a deck pane, and restoring agents is left to the person. Do it from the deck or from a terminal."
+        }
+        RestoreRefusal::BadRequest => "Refused: name the agent to start over.",
+        RestoreRefusal::Unsupported => "Refused: the deck cannot restore agents on this system.",
+        RestoreRefusal::Unreadable => REFUSED_UNREADABLE,
+        RestoreRefusal::IncompleteRead => {
+            "Refused: the deck could not read its whole work journal, so it cannot be sure how the agent was started."
+        }
+        RestoreRefusal::NotListed => REFUSED_NOT_LISTED,
+        RestoreRefusal::Ambiguous => REFUSED_AMBIGUOUS,
+        RestoreRefusal::NotAnAgent => "Refused: that agent is not one of this item's.",
+        RestoreRefusal::NotRestorable => {
+            "Refused: this agent cannot be brought back that way. Show the item to see what it offers."
+        }
+        RestoreRefusal::AmbiguousRecord => {
+            "Refused: the deck's records do not say for certain how the agent was started."
+        }
+        RestoreRefusal::NoLaunchRecord => {
+            "Refused: the deck has no record of how the agent was started."
+        }
+        RestoreRefusal::FolderMoved => "Refused: the agent's folder was moved away.",
+        RestoreRefusal::FolderUnknown => {
+            "Refused: the deck does not know which folder the agent ran in."
+        }
+        RestoreRefusal::FolderMissing => "Refused: the agent's folder is not on disk.",
+        RestoreRefusal::FolderUnsafe => {
+            "Refused: another account could change the agent's folder, or the path to it."
+        }
+        RestoreRefusal::NoSessionId => {
+            "Refused: the deck does not know which conversation the agent was in."
+        }
+        RestoreRefusal::SessionIdInvalid => {
+            "Refused: the conversation id the deck holds for the agent is not one it can resume."
+        }
+        RestoreRefusal::StillRunning => {
+            "Refused: the agent's old process, or a process it started, is still running. Stop it first, so two agents do not write to one conversation."
+        }
+        RestoreRefusal::OldProcessUnknown => {
+            "Refused: the deck cannot tell whether the agent's old process is gone, because an older version of the deck started it. Start it over instead."
+        }
+        RestoreRefusal::AlreadyRestoring => {
+            "Refused: this agent is already being restored or started over."
+        }
+        RestoreRefusal::ShuttingDown => "Refused: the deck is shutting down or restarting.",
+        RestoreRefusal::SpawnFailed => "Refused: the deck could not start the agent.",
+        RestoreRefusal::NotResumed => {
+            "The agent started but did not come back into its conversation, so the deck stopped it before sending it anything. You can start it over in this worktree instead."
+        }
+        RestoreRefusal::TaskUnsafe => {
+            "Refused: the saved task file cannot be trusted (it is a link, not a plain file, another account's, open to other accounts, or too large)."
+        }
+        RestoreRefusal::NoSavedTask => "Refused: the unit's saved task is not there.",
+        RestoreRefusal::Unknown => REFUSED_UNKNOWN,
+    }
+}
+
+/// PRD #1790 stage 3: one agent a restore or start-over started.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoredAgent {
+    /// The interrupted attempt it brings back.
+    pub attempt: AttemptId,
+    /// The new agent's registry id.
+    pub agent_id: String,
+    /// The new agent's pane.
+    pub pane_id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Its first message (the restart note, or the saved task) was posted.
+    #[serde(default)]
+    pub first_message_posted: bool,
+    /// The item's close was recorded, so it leaves the list.
+    #[serde(default)]
+    pub recorded: bool,
+}
+
+/// PRD #1790 stage 3: one refusal of a restore or start-over.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreRefused {
+    /// The attempt refused; `null` for a refusal of the whole request.
+    #[serde(default)]
+    pub attempt: Option<AttemptId>,
+    pub reason: RestoreRefusal,
+    /// [`restore_refusal_sentence`], for a client that does not know the code.
+    pub message: String,
+}
+
+impl RestoreRefused {
+    pub fn new(attempt: Option<AttemptId>, reason: RestoreRefusal) -> Self {
+        Self {
+            attempt,
+            reason,
+            message: restore_refusal_sentence(reason).to_string(),
+        }
+    }
+}
+
+/// PRD #1790 stage 3: the answer to a restore
+/// ([`crate::daemon_protocol::AttachRequest::RestoreInterrupted`]): final,
+/// after each agent confirmed its conversation or was stopped.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreOutcome {
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub restored: Vec<RestoredAgent>,
+    #[serde(default)]
+    pub refused: Vec<RestoreRefused>,
+    /// With `dry_run`: the attempts a restore would bring back.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub would_restore: Vec<AttemptId>,
+}
+
+/// PRD #1790 stage 3: the answer to a start-over
+/// ([`crate::daemon_protocol::AttachRequest::StartOverInterrupted`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartOverOutcome {
+    #[serde(default)]
+    pub dry_run: bool,
+    /// The agent started; `null` when refused, and on a dry run.
+    #[serde(default)]
+    pub started: Option<RestoredAgent>,
+    #[serde(default)]
+    pub refused: Option<RestoreRefused>,
+    /// With `dry_run`: a start-over would start the agent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub would_start: bool,
 }
 
 /// The list.
@@ -1680,6 +1966,9 @@ struct Index<'a> {
     ambiguous: HashSet<&'a AttemptId>,
     /// The role each attempt's first `attempt_started` names.
     role_of: HashMap<&'a AttemptId, &'a String>,
+    /// PRD #1790 stage 3: attempts a resume was tried for and did not take
+    /// (`restore_failed`).
+    restore_failed: HashSet<&'a AttemptId>,
 }
 
 /// Each work's root, each root's works and each root's launcher work.
@@ -1708,6 +1997,7 @@ impl<'a> Index<'a> {
             records: HashMap::new(),
             ambiguous: HashSet::new(),
             role_of: HashMap::new(),
+            restore_failed: HashSet::new(),
         };
         let mut seen: HashSet<&WorkId> = HashSet::new();
         let mut ends: HashMap<&AttemptId, bool> = HashMap::new();
@@ -1767,7 +2057,12 @@ impl<'a> Index<'a> {
                     destination: *destination,
                 }),
                 Event::Closed { how, .. } => index.closes.entry(work).or_default().push(*how),
-                Event::AttemptSession { .. } | Event::Linked { .. } => {}
+                Event::RestoreFailed { attempt, .. } => {
+                    index.restore_failed.insert(attempt);
+                }
+                Event::AttemptSession { .. }
+                | Event::Linked { .. }
+                | Event::AttemptRestored { .. } => {}
             }
         }
         let mut live_runs: HashMap<&str, bool> = HashMap::new();
@@ -1875,8 +2170,15 @@ impl<'a> Index<'a> {
 
     fn closed_by_person(&self, work: &WorkId) -> bool {
         self.closes.get(work).is_some_and(|hows| {
-            hows.iter()
-                .any(|how| matches!(how, CloseHow::Dismissed | CloseHow::Reclaimed))
+            hows.iter().any(|how| {
+                matches!(
+                    how,
+                    CloseHow::Dismissed
+                        | CloseHow::Reclaimed
+                        | CloseHow::Restored
+                        | CloseHow::StartedOver
+                )
+            })
         })
     }
 
@@ -2185,6 +2487,9 @@ impl<'a> Index<'a> {
                     None => start_over(RestoreReason::NoSessionId),
                     Some((id, _)) if !resume.valid_session_id(id) => {
                         start_over(RestoreReason::SessionIdInvalid)
+                    }
+                    Some(_) if self.restore_failed.contains(attempt) => {
+                        start_over(RestoreReason::NotResumed)
                     }
                     Some((id, _)) => {
                         resumed = Some(id);

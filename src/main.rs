@@ -964,6 +964,51 @@ enum InterruptedCmd {
         #[arg(long, requires = "all")]
         yes: bool,
     },
+    /// Restore an item's agent with its conversation (experimental). It
+    /// comes back as a pane of its own, in the folder it ran in, and is told
+    /// the deck restarted.
+    Restore {
+        /// The item's id, or its unique name, branch or id suffix.
+        id: String,
+        /// The agent to restore, by the attempt `interrupted show` prints
+        /// (repeatable). Without it, every agent of the item that can be
+        /// restored.
+        #[arg(long = "agent", value_name = "ATTEMPT")]
+        agents: Vec<String>,
+        /// It checks what already happened and carries on where it stopped.
+        #[arg(
+            long = "continue",
+            conflicts_with = "only",
+            required_unless_present = "only"
+        )]
+        continue_: bool,
+        /// It comes back and waits until you tell it to continue.
+        #[arg(long)]
+        only: bool,
+        /// Check everything and say what restoring would do; start nothing.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        /// Restore without asking.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Start an item's agent over in the folder it ran in, without its
+    /// conversation (experimental). A dispatched unit gets its saved task
+    /// again.
+    StartOver {
+        /// The item's id, or its unique name, branch or id suffix.
+        id: String,
+        /// The agent to start over, by the attempt `interrupted show` prints.
+        #[arg(long = "agent", value_name = "ATTEMPT")]
+        agent: String,
+        /// Check everything and say what starting over would do; start
+        /// nothing.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        /// Start over without asking.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 /// PRD #2374: `dot-agent-deck card …`. See [`dot_agent_deck::agent_cards_cli`].
@@ -1893,7 +1938,14 @@ fn main() -> ExitCode {
     // Review-fix F8: also match the `--continue=<value>` form (e.g. a wrapper
     // that passed `--continue=true`) so it keeps the friendly message instead of
     // falling through to clap's generic error.
-    if std::env::args().any(|a| a == "--continue" || a.starts_with("--continue=")) {
+    // PRD #1790 stage 3: only the deck's own flags, before any subcommand, are
+    // the stale invocation; `interrupted restore … --continue` is a flag of
+    // that subcommand.
+    if std::env::args()
+        .skip(1)
+        .take_while(|a| a.starts_with('-'))
+        .any(|a| a == "--continue" || a.starts_with("--continue="))
+    {
         eprintln!(
             "error: the `--continue` flag has been removed. Auto-restore is now the default — \
              just run `dot-agent-deck` (no flag) and your previous session is restored \
@@ -4394,6 +4446,17 @@ async fn run_interrupted_cli(cmd: InterruptedCmd) -> ExitCode {
     use std::io::{BufRead, IsTerminal, Write};
     let client = DaemonClient::new(client_attach_socket_path());
     let identity = || dot_agent_deck::close_cli::ambient_identity();
+    // PRD #1790 stage 3: the restore surfaces read the experimental flag, as
+    // the TUI and the daemon do, from the launch project's config (env wins).
+    dot_agent_deck::features::init_and_watch(&launch_project_dir());
+    let mut ask = |question: &str| {
+        eprint!("{question}");
+        let _ = std::io::stderr().flush();
+        let mut answer = String::new();
+        std::io::stdin().lock().read_line(&mut answer).is_ok()
+            && matches!(answer.trim(), "y" | "Y" | "yes" | "Yes" | "YES")
+    };
+    let terminal = std::io::stdin().is_terminal();
     let output = match cmd {
         InterruptedCmd::List { json, no_git } => cli::run_list(&client, json, !no_git).await,
         InterruptedCmd::Show {
@@ -4408,19 +4471,63 @@ async fn run_interrupted_cli(cmd: InterruptedCmd) -> ExitCode {
         InterruptedCmd::Dismiss { ids, all, yes } => match identity() {
             Ok(identity) => {
                 let args = cli::DismissArgs { ids, all, yes };
-                let mut ask = |question: &str| {
-                    eprint!("{question}");
-                    let _ = std::io::stderr().flush();
-                    let mut answer = String::new();
-                    std::io::stdin().lock().read_line(&mut answer).is_ok()
-                        && matches!(answer.trim(), "y" | "Y" | "yes" | "Yes" | "YES")
-                };
-                let confirm = if std::io::stdin().is_terminal() {
+                let confirm = if terminal {
                     cli::Confirm::Ask(&mut ask)
                 } else {
                     cli::Confirm::NoTerminal
                 };
                 cli::run_dismiss(&client, &args, &identity, confirm).await
+            }
+            Err(message) => cli::identity_error_output(message),
+        },
+        InterruptedCmd::Restore {
+            id,
+            agents,
+            continue_: _,
+            only,
+            dry_run,
+            yes,
+        } => match identity() {
+            Ok(identity) => {
+                let args = cli::RestoreArgs {
+                    id,
+                    agents,
+                    mode: if only {
+                        dot_agent_deck::interrupted_work::RestoreMode::Only
+                    } else {
+                        dot_agent_deck::interrupted_work::RestoreMode::Continue
+                    },
+                    dry_run,
+                    yes,
+                };
+                let confirm = if terminal {
+                    cli::Confirm::Ask(&mut ask)
+                } else {
+                    cli::Confirm::NoTerminal
+                };
+                cli::run_restore(&client, &args, &identity, confirm).await
+            }
+            Err(message) => cli::identity_error_output(message),
+        },
+        InterruptedCmd::StartOver {
+            id,
+            agent,
+            dry_run,
+            yes,
+        } => match identity() {
+            Ok(identity) => {
+                let args = cli::StartOverArgs {
+                    id,
+                    agent,
+                    dry_run,
+                    yes,
+                };
+                let confirm = if terminal {
+                    cli::Confirm::Ask(&mut ask)
+                } else {
+                    cli::Confirm::NoTerminal
+                };
+                cli::run_start_over(&client, &args, &identity, confirm).await
             }
             Err(message) => cli::identity_error_output(message),
         },

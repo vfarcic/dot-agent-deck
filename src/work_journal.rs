@@ -151,7 +151,7 @@ const MAX_LISTED: usize = 65_536;
 
 const MAINTENANCE_LOCK: &str = "maintenance.lock";
 
-const KNOWN_KINDS: [&str; 7] = [
+const KNOWN_KINDS: [&str; 9] = [
     "opened",
     "attempt_started",
     "attempt_session",
@@ -159,6 +159,8 @@ const KNOWN_KINDS: [&str; 7] = [
     "linked",
     "reported",
     "closed",
+    "attempt_restored",
+    "restore_failed",
 ];
 
 // ---------------------------------------------------------------------------
@@ -500,6 +502,50 @@ pub enum CloseHow {
     /// removed, its branch kept). Written as [`CloseHow::Dismissed`] is, and
     /// read by an older daemon the same way.
     Reclaimed,
+    /// PRD #1790 stage 3: a person restored the work's agent with its
+    /// conversation, and the restored agent confirmed it is back in it.
+    /// Written as [`CloseHow::Dismissed`] is, after the confirmation, and
+    /// read by an older daemon the same way.
+    Restored,
+    /// PRD #1790 stage 3: a person started the work's agent over, without its
+    /// conversation, in the folder it ran in. Written as
+    /// [`CloseHow::Dismissed`] is, once the new agent started, and read by an
+    /// older daemon the same way.
+    StartedOver,
+}
+
+/// PRD #1790 stage 3: how an [`Event::AttemptRestored`] brought an attempt
+/// back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoredHow {
+    /// Resumed into its conversation.
+    Resumed,
+    /// Started over without its conversation.
+    StartedOver,
+}
+
+/// PRD #1790 stage 3: why an [`Event::RestoreFailed`] resume did not take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreFailure {
+    /// The restored agent reported a conversation other than the one asked
+    /// for.
+    SessionMismatch,
+    /// The launch refused the resume (its command chooses another
+    /// conversation or command, or the id is not of the agent's syntax).
+    Refused,
+    /// The agent exited before it confirmed its conversation.
+    Exited,
+    /// The launch never reached the deck's resume step (the command calls
+    /// the agent by an absolute path, replaces `PATH`, or a wrapper dropped
+    /// the arguments), and no confirmation came.
+    ShimNotReached,
+    /// The resume was applied but no confirmation came in time.
+    TimedOut,
+    /// A failure of a newer daemon's.
+    #[serde(other)]
+    Unknown,
 }
 
 /// External references of a work. Every field is optional.
@@ -614,6 +660,27 @@ pub enum Event {
         work: WorkId,
         how: CloseHow,
     },
+    /// PRD #1790 stage 3: the attempt `from` was brought back as the new
+    /// attempt `to` (the minimal successor link a later stage builds on;
+    /// never a reuse of the old ids). `work` is `from`'s work. Written once
+    /// the restore is confirmed or the start-over started, beside the
+    /// [`CloseHow::Restored`] or [`CloseHow::StartedOver`] closes. Additive
+    /// under `v:1`: a reader that predates it skips the kind.
+    AttemptRestored {
+        work: WorkId,
+        from: AttemptId,
+        to: AttemptId,
+        how: RestoredHow,
+    },
+    /// PRD #1790 stage 3: a resume of `attempt` was tried and did not take,
+    /// so the agent it started was stopped before anything was sent to it.
+    /// The interrupted work list offers that attempt Start over from then on.
+    /// Additive under `v:1`.
+    RestoreFailed {
+        work: WorkId,
+        attempt: AttemptId,
+        failure: RestoreFailure,
+    },
 }
 
 impl Event {
@@ -626,7 +693,9 @@ impl Event {
             | Event::AttemptEnded { work, .. }
             | Event::Linked { work, .. }
             | Event::Reported { work, .. }
-            | Event::Closed { work, .. } => work,
+            | Event::Closed { work, .. }
+            | Event::AttemptRestored { work, .. }
+            | Event::RestoreFailed { work, .. } => work,
         }
     }
 
@@ -640,6 +709,8 @@ impl Event {
             Event::Linked { .. } => "linked",
             Event::Reported { .. } => "reported",
             Event::Closed { .. } => "closed",
+            Event::AttemptRestored { .. } => "attempt_restored",
+            Event::RestoreFailed { .. } => "restore_failed",
         }
     }
 }
@@ -842,7 +913,7 @@ fn validate(line: &Line, homes: &HomeSpellings) -> Result<(), Refusal> {
                 plain("unit_id", unit_id)?;
             }
         }
-        Event::Closed { .. } => {}
+        Event::Closed { .. } | Event::AttemptRestored { .. } | Event::RestoreFailed { .. } => {}
     }
     Ok(())
 }
