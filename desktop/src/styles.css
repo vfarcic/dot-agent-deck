@@ -2322,6 +2322,8 @@ button.pr-badge:hover, button.pr-badge:focus-visible { border-color: var(--teal-
 .agent-cards-batch-entry.is-failed { border-color: var(--red); }
 .agent-cards-batch-who { margin: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
 .agent-cards-batch-name { overflow-wrap: anywhere; }
+.agent-cards-batch-daemon { color: var(--muted); font-size: var(--text-sm); overflow-wrap: anywhere; }
+.agent-cards-batch-refusal { margin: 0; color: var(--muted); overflow-wrap: anywhere; }
 .agent-cards-batch-outcome { font-size: var(--text-sm); font-weight: 700; }
 .agent-cards-batch-entry.is-failed .agent-cards-batch-outcome { color: var(--red); }
 .agent-cards-batch-entry.is-done .agent-cards-batch-outcome { color: var(--teal); }

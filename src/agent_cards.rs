@@ -148,6 +148,13 @@ pub const REASON_AGENT_STOPPED: &str = "agent_stopped";
 pub const CODE_AGENT_STOPPED: &str = REASON_AGENT_STOPPED;
 /// Issue #2399: the most distinct cards one batch request may name.
 pub const MAX_BATCH_ENTRIES: usize = 256;
+/// Issue #2399 audit S2: the most entries one batch request may carry,
+/// repeats included. A repeated card is acted on once, so repeats buy a
+/// sender nothing; this budget keeps them from making a request that names
+/// few cards arbitrarily long to scan and hold while it runs. Twice the
+/// distinct cap leaves room for a client that joins overlapping subtrees
+/// without removing the overlap.
+pub const MAX_BATCH_RAW_ENTRIES: usize = 2 * MAX_BATCH_ENTRIES;
 
 /// Metadata keys of the [`crate::event::EventType::AgentCard`] doorbell.
 pub const AGENT_CARD_KEY_METADATA_KEY: &str = "agent_card_key";
@@ -3253,13 +3260,16 @@ pub fn check_batch(
             "the action id must be 1 to {MAX_REQUEST_FIELD_BYTES} bytes"
         ));
     }
-    let distinct = distinct_batch_entries(entries).len();
-    if distinct == 0 {
+    if entries.is_empty() {
         return Err("the batch names no cards".into());
     }
-    if distinct > MAX_BATCH_ENTRIES {
+    /* Audit S2: the raw budget first, then every identifier's size, and only
+    then the distinct count, which hashes the identifiers and stops at the
+    first card over the cap. */
+    if entries.len() > MAX_BATCH_RAW_ENTRIES {
         return Err(format!(
-            "a batch may name at most {MAX_BATCH_ENTRIES} cards; this one names {distinct}"
+            "a batch request may carry at most {MAX_BATCH_RAW_ENTRIES} entries, repeats included; this one carries {}",
+            entries.len()
         ));
     }
     for entry in entries {
@@ -3274,6 +3284,16 @@ pub fn check_batch(
                     "a batch entry's {what} is longer than {MAX_REQUEST_FIELD_BYTES} bytes"
                 ));
             }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    for entry in entries {
+        if seen.insert((entry.pane_id.as_str(), entry.agent_id.as_str()))
+            && seen.len() > MAX_BATCH_ENTRIES
+        {
+            return Err(format!(
+                "a batch may name at most {MAX_BATCH_ENTRIES} cards; this one names more"
+            ));
         }
     }
     Ok(())
@@ -3291,8 +3311,10 @@ fn distinct_batch_entries(entries: &[CardBatchEntry]) -> Vec<&CardBatchEntry> {
 
 /// The request id one entry of an executed batch is invoked under: the
 /// batch's own, then the entry's place among the distinct entries. Repeating
-/// the same execution therefore repeats each entry's single press, which
-/// answers as the first did and sends nothing again.
+/// the same execution therefore repeats each entry's single press, which,
+/// while its answer is remembered (up to [`REQUEST_ID_MEMORY`], sooner when
+/// newer answers need the room), answers as the first did and sends nothing
+/// again. A repeat after that is a new press.
 fn batch_entry_request_id(request_id: &str, index: usize) -> String {
     format!("{request_id}:{index}")
 }
@@ -6499,11 +6521,48 @@ mod batch_tests {
         let repeated = vec![target("p1", "a1"); MAX_BATCH_ENTRIES + 1];
         assert!(
             check_batch("b", "go", &repeated).is_ok(),
-            "the distinct cards count"
+            "repeats within the raw budget count once against the distinct cap"
         );
         let mut long = target("p1", "a1");
         long.action_token = "t".repeat(MAX_REQUEST_FIELD_BYTES + 1);
         assert!(check_batch("b", "go", &[long]).is_err());
+    }
+
+    /// Audit S2: repeats of one card are bounded by the raw budget, refused
+    /// before any card is counted; identifiers are sized before they are
+    /// hashed; and the distinct count stops at the first card over the cap.
+    #[test]
+    fn a_batch_request_over_the_raw_entry_budget_is_refused_before_its_cards_are_counted() {
+        let at_budget = vec![target("p1", "a1"); MAX_BATCH_RAW_ENTRIES];
+        assert!(check_batch("b", "go", &at_budget).is_ok());
+        let over_budget = vec![target("p1", "a1"); MAX_BATCH_RAW_ENTRIES + 1];
+        let refused = check_batch("b", "go", &over_budget).unwrap_err();
+        assert!(
+            refused.contains(&format!("at most {MAX_BATCH_RAW_ENTRIES} entries")),
+            "{refused}"
+        );
+
+        // An oversized identifier after the distinct cap is reached is still
+        // what refuses the request: sizes are checked before anything is hashed.
+        let mut sized_first: Vec<_> = (0..=MAX_BATCH_ENTRIES)
+            .map(|i| target(&format!("p{i}"), "a"))
+            .collect();
+        sized_first.push(CardBatchEntry {
+            pane_id: "p".repeat(MAX_REQUEST_FIELD_BYTES + 1),
+            ..target("x", "a")
+        });
+        let refused = check_batch("b", "go", &sized_first).unwrap_err();
+        assert!(refused.contains("pane id is longer"), "{refused}");
+
+        // Over the distinct cap, within the raw budget: refused without a full count.
+        let distinct: Vec<_> = (0..MAX_BATCH_RAW_ENTRIES)
+            .map(|i| target(&format!("p{i}"), "a"))
+            .collect();
+        let refused = check_batch("b", "go", &distinct).unwrap_err();
+        assert_eq!(
+            refused,
+            format!("a batch may name at most {MAX_BATCH_ENTRIES} cards; this one names more")
+        );
     }
 
     #[tokio::test]

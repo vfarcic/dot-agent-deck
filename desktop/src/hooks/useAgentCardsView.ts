@@ -36,6 +36,10 @@ const noBatches = (name: string) => `${name}'s daemon cannot send an action to s
 const NO_BATCH_BRIDGE = "This window cannot send an action to several agents at once.";
 /** …when a selection batch is asked for with nothing selected. */
 const NOTHING_SELECTED = "No card is selected.";
+/** …when the batch on screen is asked to close while it is being sent: its results would be lost while the daemons still act. */
+export const BATCH_STILL_SENDING = "The batch is still being sent, so it stays open: the result for each agent shows here when every daemon has answered.";
+/** …when another batch is asked for while one is being sent. */
+export const ANOTHER_BATCH_SENDING = "A batch is still being sent; wait for its results before starting another.";
 
 /** The card members the overview serves, every one of them. */
 type AgentCardControls = Pick<VoiceActionContext, "setOverviewMode" | "showAgentCard" | "stepAgentCard" | "setNeedsYouFilter" | "closeAgentCard" | "runCardAction" | "replyToAgentCard" | "confirmCardAction" | "toggleOverviewRowMenu" | "setCardTree" | "openCardReference" | "runCardActionBatch" | "toggleCardSelecting" | "toggleCardSelected" | "runSelectionBatch" | "sendCardBatch" | "closeCardBatch">;
@@ -71,6 +75,8 @@ export interface CardBatchView {
   results: CardBatchGroup[];
   /** Why the preview could not be read. */
   error?: string;
+  /** Why the last attempt to close it was refused (it was being sent), shown in the dialog. */
+  refusal?: string;
 }
 
 /** Issue #2399 — the Cards view's selection: whether it is on, and the cards in it by placed key. */
@@ -231,6 +237,9 @@ export function useAgentCardsView({ runtime, decks, openAgent, openReference, hi
   const [batch, setBatch] = useState<CardBatchView>();
   /* Bumped by every batch started or closed, so a late answer to an earlier one changes nothing. */
   const batchRun = useRef(0);
+  /* Whether a batch is being sent, set in the same tick as Send so a close or
+     a new batch asked for before the next render is refused too. */
+  const batchSending = useRef(false);
   /* The latest committed state, for members a dispatch calls after a render. */
   const latest = useRef({ placed, open, shown, treeFor, openReference, hiddenByFilter, openCards, selecting, selected, batch, batchFor });
   latest.current = { placed, open, shown, treeFor, openReference, hiddenByFilter, openCards, selecting, selected, batch, batchFor };
@@ -303,6 +312,9 @@ export function useAgentCardsView({ runtime, decks, openAgent, openReference, hi
      and sends nothing. */
   const startBatch = useCallback((cards: readonly PlacedCard[], actionId: string, label: string, scope: string): string | undefined => {
     if (!invokeBatch) return NO_BATCH_BRIDGE;
+    /* A batch being sent keeps the screen until its results are in: a new one
+       would replace it and lose what each agent got. */
+    if (batchSending.current) return ANOTHER_BATCH_SENDING;
     const groups = new Map<string, { deckId: string; instanceId: string; cards: PlacedCard[] }>();
     for (const card of cards) {
       const groupKey = `${card.deckId}\u0000${card.entry.instance_id}`;
@@ -490,7 +502,7 @@ export function useAgentCardsView({ runtime, decks, openAgent, openReference, hi
       // Leaving the selection clears it.
       if (!on) setSelected(new Set());
     },
-    toggleCardSelected: (ref) => {
+    toggleCardSelected: (ref, want) => {
       if (!latest.current.shown) return CARDS_HIDDEN;
       const card = find(ref);
       if (!card) return CARD_GONE;
@@ -500,31 +512,45 @@ export function useAgentCardsView({ runtime, decks, openAgent, openReference, hi
       const closed = !latest.current.openCards.has(cardKey);
       const keys = (closed ? cardSubtree(latest.current.placed, card, latest.current.treeFor(card.deckId)) : [card]).map(placedCardKey);
       setSelecting(true);
+      /* The selection is the Cards view's: selecting by voice from the table shows that view. */
+      remember("cards");
       setSelected((current) => {
         const next = new Set(current);
-        if (current.has(cardKey)) keys.forEach((each) => next.delete(each));
-        else keys.forEach((each) => next.add(each));
+        /* A checkbox flips; voice says which it wants ("select", "unselect"), so saying it twice changes nothing. */
+        if (want ?? !current.has(cardKey)) keys.forEach((each) => next.add(each));
+        else keys.forEach((each) => next.delete(each));
         return next;
       });
       return undefined;
     },
-    runSelectionBatch: (actionId) => {
+    runSelectionBatch: (wanted) => {
       if (!latest.current.shown) return CARDS_HIDDEN;
       const { placed: listed, selected: chosen, batchFor: does } = latest.current;
       const cards = listed.filter((card) => chosen.has(placedCardKey(card)) && does(card.deckId));
       if (cards.length === 0) return NOTHING_SELECTED;
-      const choice = batchChoices(cards).find((candidate) => candidate.id === actionId);
+      const choices = batchChoices(cards);
+      let choice = wanted.actionId !== undefined ? choices.find((candidate) => candidate.id === wanted.actionId) : undefined;
+      /* A spoken label is matched the way a single card's is, against each selected card's own buttons. */
+      if (wanted.actionId === undefined && wanted.label !== undefined) {
+        for (const each of cards) {
+          const spoken = actionBySpokenLabel(each.entry, wanted.label);
+          choice = spoken ? choices.find((candidate) => candidate.id === spoken.id) : undefined;
+          if (choice) break;
+        }
+        if (!choice) return `None of the selected cards has an action called "${displayText(wanted.label, DISPLAY_LIMITS.name)}", so nothing was sent.`;
+      }
       if (!choice) return "None of the selected cards offers that action any more, so nothing was sent.";
       return startBatch(cards, choice.id, choice.label, `${cards.length} selected ${cards.length === 1 ? "agent" : "agents"}`);
     },
     sendCardBatch: () => {
       const current = latest.current.batch;
-      if (!current || current.stage !== "review" || !invokeBatch) return;
+      if (!current || current.stage !== "review" || !invokeBatch || batchSending.current) return;
       const run = ++batchRun.current;
       const confirmed = current.groups
         .map((group) => ({ group, included: group.entries.filter((entry) => entry.outcome === "included") }))
         .filter(({ included }) => included.length > 0);
       if (confirmed.length === 0) return;
+      batchSending.current = true;
       setBatch({ ...current, stage: "sending" });
       void Promise.all(confirmed.map(async ({ group, included }): Promise<CardBatchGroup> => {
         try {
@@ -539,11 +565,23 @@ export function useAgentCardsView({ runtime, decks, openAgent, openReference, hi
           const message = cause instanceof Error ? cause.message : String(cause);
           return { deckId: group.deckId, instanceId: group.instanceId, entries: included.map((entry) => ({ pane_id: entry.pane_id, agent_id: entry.agent_id, outcome: "failed", message })) };
         }
-      })).then((results) => { if (batchRun.current === run) setBatch((shown) => shown && { ...shown, stage: "done", results }); });
+      })).then((results) => {
+        batchSending.current = false;
+        if (batchRun.current === run) setBatch((shown) => shown && { ...shown, stage: "done", results, refusal: undefined });
+      });
     },
     closeCardBatch: () => {
+      /* Refused while it is being sent, by every route that comes here
+         (Cancel is disabled; Escape and voice's `close` get this sentence):
+         the daemons go on acting, and closing would lose the result for each
+         agent. */
+      if (batchSending.current) {
+        setBatch((current) => current && { ...current, refusal: BATCH_STILL_SENDING });
+        return BATCH_STILL_SENDING;
+      }
       batchRun.current += 1;
       setBatch(undefined);
+      return undefined;
     },
     setCardTree: (ref, wantOpen) => {
       if (!latest.current.shown) return CARDS_HIDDEN;

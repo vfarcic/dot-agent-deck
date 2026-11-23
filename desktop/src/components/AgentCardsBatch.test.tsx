@@ -1,7 +1,8 @@
 import "../styles.css";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createFixtureFleet, createFixtureStartedAgent, FIXTURE_DAEMON_ID } from "../data/fixture";
+import { createFixtureFleet, createFixtureStartedAgent, FIXTURE_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID } from "../data/fixture";
+import { deckName } from "../lib/displayText";
 import { clearDashboardFilter, setDashboardFilter } from "../lib/dashboardFilter";
 import { DEFAULT_DESKTOP_FEATURES, type AgentCardAction, type AgentCardEntry, type DeckRuntimeState } from "../types";
 import { AgentOverview } from "./AgentOverview";
@@ -89,6 +90,50 @@ async function startSelectedBatch() {
   return screen.getByTestId("agent-cards-batch-confirm");
 }
 
+/*
+ * Issue #2399 review 1 / audit S1 — two daemons whose cards have the SAME pane
+ * and agent ids (they are daemon-local) and different names. Execution fails
+ * on the local daemon with no `name`, the daemon's normal failure shape.
+ */
+const REMOTE_INSTANCE = "daemon-instance-batch-remote";
+const SHARED = { pane_id: "pane-shared", agent_id: "shared" };
+
+function setupTwoDaemons() {
+  const [local, remote] = createFixtureFleet("fleet");
+  const fleet = [
+    { ...local, connection: { ...local.connection, incarnation: INSTANCE } },
+    { ...remote, connection: { ...remote.connection, incarnation: REMOTE_INSTANCE } },
+  ];
+  const localCard = entry("shared", "local-coder", { key: "pane-shared/shared", pane_id: SHARED.pane_id });
+  const remoteCard = entry("shared", "remote-coder", { key: "pane-shared/shared", pane_id: SHARED.pane_id, instance_id: REMOTE_INSTANCE });
+  const invokeCardActionBatch = vi.fn(async (deckId: string, _actionId: string, options: BatchOptions) => {
+    const onLocal = deckId === FIXTURE_DAEMON_ID;
+    const name = onLocal ? "local-coder" : "remote-coder";
+    return {
+      request_id: options.requestId,
+      entries: options.mode === "preview"
+        ? [{ ...SHARED, name, outcome: "included", prompt: `${name}: go ahead.`, action_token: `tok-${name}`, instance_id: onLocal ? INSTANCE : REMOTE_INSTANCE }]
+        : [onLocal
+          ? { ...SHARED, outcome: "failed", code: "stale_action", message: "The action changed after you reviewed it." }
+          : { ...SHARED, name, outcome: "delivered", message_id: "m-remote" }],
+    };
+  });
+  const live = {
+    mode: "fixture", snapshot: fleet[0], fleet, terminalData: {}, clearError: vi.fn(), runAction: vi.fn(),
+    sendTerminalInput: vi.fn(async () => undefined), resizeTerminal: vi.fn(async () => undefined), setShownTerminals: vi.fn(async () => undefined),
+    reconnect: vi.fn(async () => undefined), listProjects: vi.fn(async () => ({ projects: [] })), resolveProject: vi.fn(async () => { throw new Error("unresolved"); }),
+    getSettings: vi.fn(), saveSettings: vi.fn(), testEndpoint: vi.fn(), secretStatus: vi.fn(), storeSecret: vi.fn(), forgetSecret: vi.fn(),
+    setZoom: vi.fn(async (level: number) => level), desktopFeatures: { ...DEFAULT_DESKTOP_FEATURES },
+    agentCards: {
+      [FIXTURE_DAEMON_ID]: { deckId: FIXTURE_DAEMON_ID, instanceId: INSTANCE, revision: 1, entries: [localCard], catalogErrors: [], tree: true, batch: true },
+      [FIXTURE_REMOTE_DAEMON_ID]: { deckId: FIXTURE_REMOTE_DAEMON_ID, instanceId: REMOTE_INSTANCE, revision: 1, entries: [remoteCard], catalogErrors: [], tree: true, batch: true },
+    },
+    invokeCardAction: vi.fn(), invokeCardActionBatch,
+  } as unknown as DeckRuntimeState;
+  render(<AgentOverview runtime={live} onNavigate={vi.fn()} />);
+  return { invokeCardActionBatch, localName: deckName(fleet[0].connection), remoteName: deckName(fleet[1].connection) };
+}
+
 const targets = (cards: AgentCardEntry[]) => cards.map(({ pane_id, agent_id }) => ({ pane_id, agent_id }));
 
 beforeEach(() => {
@@ -171,6 +216,50 @@ describe("batch card actions (#2399)", () => {
     expect(within(child!).getByText("Failed", { exact: true })).toBeInTheDocument();
     expect(within(child!).getByText("The action changed after you reviewed it.")).toBeInTheDocument();
     expect(calls.invokeCardActionBatch).toHaveBeenCalledTimes(2);
+    expect(calls.invokeCardAction).not.toHaveBeenCalled();
+  });
+
+  /// Scenario: Select one card on each of two daemons whose cards share the same pane and agent ids but have different names, and send a batch. The confirmation and results name each agent with its own daemon, and the local daemon's nameless failure is shown under the local agent's name, never the remote one's, with no duplicate rows.
+  it("desktop/agent-cards/034: a batch across two daemons keeps each agent's daemon, even with the same ids", async () => {
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const calls = setupTwoDaemons();
+    fireEvent.click(screen.getByTestId("agent-cards-select"));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select local-coder" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select remote-coder" }));
+    expect(screen.getByTestId("agent-cards-selection-count")).toHaveTextContent("2 selected");
+    await act(async () => { fireEvent.click(screen.getByTestId("agent-cards-batch-action-batch-go")); });
+    const dialog = screen.getByTestId("agent-cards-batch-confirm");
+    const rowFor = (scope: HTMLElement, name: string) => within(scope).getAllByTestId("agent-cards-batch-entry").filter((row) => within(row).queryByText(name, { exact: true }));
+    expect(within(dialog).getAllByTestId("agent-cards-batch-entry")).toHaveLength(2);
+    expect(within(rowFor(dialog, "local-coder")[0]).getByTestId("agent-cards-batch-daemon")).toHaveTextContent(`on ${calls.localName}`);
+    expect(within(rowFor(dialog, "remote-coder")[0]).getByTestId("agent-cards-batch-daemon")).toHaveTextContent(`on ${calls.remoteName}`);
+    expect(within(rowFor(dialog, "local-coder")[0]).getByTestId("agent-cards-batch-prompt").textContent).toBe("local-coder: go ahead.");
+
+    await act(async () => { fireEvent.click(within(dialog).getByRole("button", { name: /^Send$/ })); });
+    const results = screen.getByTestId("agent-cards-batch-results");
+    expect(within(results).getAllByTestId("agent-cards-batch-entry")).toHaveLength(2);
+    const failed = rowFor(results, "local-coder");
+    const delivered = rowFor(results, "remote-coder");
+    expect(failed).toHaveLength(1);
+    expect(delivered).toHaveLength(1);
+    expect(failed[0]).toHaveAttribute("data-outcome", "failed");
+    expect(within(failed[0]).getByTestId("agent-cards-batch-daemon")).toHaveTextContent(`on ${calls.localName}`);
+    expect(within(failed[0]).getByText("The action changed after you reviewed it.")).toBeInTheDocument();
+    expect(delivered[0]).toHaveAttribute("data-outcome", "delivered");
+    expect(within(delivered[0]).getByTestId("agent-cards-batch-daemon")).toHaveTextContent(`on ${calls.remoteName}`);
+    expect(calls.invokeCardActionBatch).toHaveBeenCalledWith(FIXTURE_DAEMON_ID, "batch-go", expect.objectContaining({ mode: "execute", instanceId: INSTANCE }));
+    expect(calls.invokeCardActionBatch).toHaveBeenCalledWith(FIXTURE_REMOTE_DAEMON_ID, "batch-go", expect.objectContaining({ mode: "execute", instanceId: REMOTE_INSTANCE }));
+    expect(errors.mock.calls.filter((call) => String(call[0]).includes("same key"))).toEqual([]);
+    errors.mockRestore();
+  });
+
+  /// Scenario: With a batch confirmation open and nothing being sent, press Escape. The dialog closes and nothing is sent, as Cancel does.
+  it("desktop/agent-cards/037: Escape dismisses a batch confirmation that is not being sent", async () => {
+    const calls = setup();
+    const dialog = await startSelectedBatch();
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    expect(screen.queryByTestId("agent-cards-batch-confirm")).toBeNull();
+    expect(calls.invokeCardActionBatch).toHaveBeenCalledTimes(1);
     expect(calls.invokeCardAction).not.toHaveBeenCalled();
   });
 });

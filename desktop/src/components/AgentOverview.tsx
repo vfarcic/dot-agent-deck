@@ -1903,6 +1903,12 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
      with the same members a table row's click uses, so the two cannot open
      different things. */
   const cardControls = useMemo(() => ({ ...cards.clickControls, navigate: voiceContext.navigate, revealAgent: voiceContext.revealAgent }), [cards.clickControls, voiceContext]);
+  /* Issue #2399 review — the batch dialog names each agent's daemon the way
+     the dashboard's section header does, when a batch reaches more than one. */
+  const batchDaemonName = useCallback((deckId: string) => {
+    const deck = decks.find((candidate) => candidate.snapshot.connection.deckId === deckId);
+    return deck ? deckName(deck.snapshot.connection) : deckId;
+  }, [decks]);
   const cardOpenTarget = useCallback((card: PlacedCard): AgentViewTarget => {
     const agent = decks.find((deck) => deck.snapshot.connection.deckId === card.deckId)?.agents.find((candidate) => candidate.id === card.entry.agent_id);
     return agent
@@ -2443,7 +2449,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
         </section>
       </main>
       {cards.overlay && <AgentCardOverlay {...cards.overlay} notice={cards.notice} controls={cards.clickControls} ended={overlayEnded} />}
-      {cards.batch && <AgentCardBatchDialog view={cards.batch} controls={cards.clickControls} />}
+      {cards.batch && <AgentCardBatchDialog view={cards.batch} controls={cards.clickControls} daemonName={batchDaemonName} />}
       {interruptedDialogView}
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}
       {upgrade && <UpgradeDialog target={upgrade} runtime={runtime} onClose={() => setUpgrade(undefined)} />}

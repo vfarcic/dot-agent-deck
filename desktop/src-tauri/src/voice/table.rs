@@ -1526,6 +1526,13 @@ mod tests {
                     "runCardActionBatch",
                     vec!["overview"]
                 ),
+                ("select_agent_card", "selectAgentCard", vec!["overview"]),
+                ("unselect_agent_card", "unselectAgentCard", vec!["overview"]),
+                (
+                    "run_card_action_on_selection",
+                    "runSelectionBatch",
+                    vec!["overview"]
+                ),
                 ("reply_to_agent_card", "replyToAgentCard", vec!["overview"]),
             ]
         );
@@ -2520,6 +2527,9 @@ mod tests {
                 "open_card_issue",
                 "run_card_action",
                 "run_card_action_batch",
+                "select_agent_card",
+                "unselect_agent_card",
+                "run_card_action_on_selection",
                 "reply_to_agent_card"
             ]
         );

@@ -412,6 +412,9 @@ mod tests {
                 "open_card_issue",
                 "run_card_action",
                 "run_card_action_batch",
+                "select_agent_card",
+                "unselect_agent_card",
+                "run_card_action_on_selection",
                 "reply_to_agent_card",
                 "none"
             ]

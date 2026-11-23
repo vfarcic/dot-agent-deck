@@ -215,7 +215,8 @@ user's own words ("dispatcher", "the Claude agent", "the newest agent", "the one
 scroll"), except for an agent named by what it is doing now (its status or its tool), such as
 "the one that's stuck" or "whichever is waiting": for that one, the `label` of the agent whose
 `status` or `tool` fits, never the user's words. A request for an agent's CARD ("show the coder's
-card") is `show_agent_card`, not this one."""
+card") is `show_agent_card`, not this one, and selecting an agent's card for a batch ("select the
+coder's card", "add the tester to the selection") is `select_agent_card`."""
 invoke      = "openAgent"
 screens     = ["deck", "overview"]
 unavailable_hint = "opening an agent works from the Daemons screen or the agent dashboard"
@@ -2864,6 +2865,66 @@ try_saying  = "{action} on everything under {agent}"
   [[commands.params]]
   name = "agent"
   kind = "agent_ref"
+
+  [[commands.params]]
+  name = "action"
+  kind = "card_action"
+
+# Issue #2399 review — the Cards view's selection by voice: select and
+# unselect named agents (a closed card takes everything under it along, as its
+# checkbox does), then send one action to the selection. Selecting sends
+# nothing; the action, like every batch, only OPENS the confirmation.
+[[commands]]
+id          = "select_agent_card"
+description = """Select one agent's card on the agent dashboard for a batch, so a later action can be
+sent to every selected agent at once. A card whose tree is closed takes every agent under it along.
+Use only when the user says card, selection or batch — "select the coder's card", "add the tester
+to the selection", "select the reviewer for the batch". A bare "select the coder" opens that agent
+and is `open_agent`. Set `agent` to the user's words for the agent. It sends nothing. Sending an
+action to the selection is `run_card_action_on_selection`; to an agent and everything under it in
+one go, `run_card_action_batch`."""
+invoke      = "selectAgentCard"
+screens     = ["overview"]
+unavailable_hint = "cards are selected on the agent dashboard's cards"
+report      = "Selected {agent}'s card."
+asks_to     = "select an agent's card for a batch"
+try_saying  = "select {agent}'s card"
+
+  [[commands.params]]
+  name = "agent"
+  kind = "agent_ref"
+
+[[commands]]
+id          = "unselect_agent_card"
+description = """Take one agent's card out of the batch selection on the agent dashboard; a card
+whose tree is closed takes every agent under it out too. Use for unselect the coder's card,
+deselect the tester's card, remove the reviewer from the selection. Set `agent` to the user's words
+for the agent. It sends nothing."""
+invoke      = "unselectAgentCard"
+screens     = ["overview"]
+unavailable_hint = "cards are unselected on the agent dashboard's cards"
+report      = "Took {agent}'s card out of the selection."
+asks_to     = "take an agent's card out of the batch selection"
+try_saying  = "unselect {agent}'s card"
+
+  [[commands.params]]
+  name = "agent"
+  kind = "agent_ref"
+
+[[commands]]
+id          = "run_card_action_on_selection"
+description = """Send one of the card actions to every SELECTED agent on the agent dashboard, after
+the user reviews it. Use when the user names an action and the selection: "go ahead on the
+selected agents", "send go ahead to the selection", "close the selected ones". Set `action` to the
+button's label as the user said it. It only opens a confirmation listing each agent, the exact text
+it gets and which are skipped; nothing is sent until the user presses Send. Selecting agents is
+`select_agent_card`; an agent and everything under it is `run_card_action_batch`."""
+invoke      = "runSelectionBatch"
+screens     = ["overview"]
+unavailable_hint = "an action is sent to the selected cards from the agent dashboard's cards"
+report      = "Review {action} for the selected agents, then press Send."
+asks_to     = "send one card action to every selected agent"
+try_saying  = "{action} on the selected agents"
 
   [[commands.params]]
   name = "action"

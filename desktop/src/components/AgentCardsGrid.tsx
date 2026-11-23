@@ -61,7 +61,7 @@ export function AgentCardsToolbar({ cards, needsYouOnly, controls, selection }: 
               className="button secondary compact"
               data-testid={`agent-cards-batch-action-${domIdentity(choice.id)}`}
               title={displayTitle(`Review ${choice.label} for the ${count} selected ${count === 1 ? "agent" : "agents"} before sending it`)}
-              onClick={() => VOICE_ACTIONS.runSelectionBatch.run(controls, choice.id)}
+              onClick={() => VOICE_ACTIONS.runSelectionBatch.run(controls, { cardActionId: choice.id })}
             >{displayText(choice.label, DISPLAY_LIMITS.name)}</button>
           ))}
         </div>

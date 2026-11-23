@@ -16880,6 +16880,34 @@ The desktop half of PRD #2374's agent cards, and of issue #2418's Cards tree. Th
 - **Asserts:** a closed root selects seven nested agents without expanding; the preview's seven quoted prompts wrap without horizontal clipping and can each be scrolled into view, the dialog fits the window and Send and Cancel are in view, Cancel dismisses without showing results, and a subsequent Send shows results without sideways page scrolling.
 - **Does not assert:** actual daemon delivery (agent-report/batch/002); a real agent (agent-report/live/003).
 
+##### desktop/agent-cards/034 — A batch across two daemons keeps each agent's daemon, even with the same ids.
+
+- **Test:** vitest `desktop/agent-cards/034: …` in `desktop/src/components/AgentCardsBatch.test.tsx`.
+- **Layer:** desktop overview (jsdom), two connected fixture daemons whose cards share a pane and agent id, with a stubbed batch bridge.
+- **Asserts:** selecting one card on each daemon previews each daemon's own entry; every confirmation and result row names its daemon; the local daemon's nameless `failed` result is shown under the local agent's name and the remote delivery under the remote agent's; each daemon is executed with its own instance; React reports no duplicate keys (#2399 review 1, audit S1).
+- **Does not assert:** a real daemon pair (agent-report/batch/001–003 run one daemon).
+
+##### desktop/agent-cards/035 — A batch being sent cannot be dismissed or replaced.
+
+- **Test:** vitest `desktop/agent-cards/035: …` in `desktop/src/components/AgentCardsBatchVoice.test.tsx`.
+- **Layer:** desktop shell (jsdom), real voice panel and dispatch seam with synthetic resolved speech, and a batch bridge that holds the execution until released.
+- **Asserts:** while the execution is held, a spoken `close` ("never mind", through `closeTopmost` and the overlay stack) leaves the dialog sending and the voice report and the dialog both say it is still sending; `Escape` leaves it open; Cancel is disabled; a spoken new batch is refused and previews nothing; once released, both agents' results are shown and `Escape` closes them (#2399 review 2 and 4).
+- **Does not assert:** microphone capture, transcription or model classification; daemon-side execution.
+
+##### desktop/agent-cards/036 — Voice builds a selection by name and starts a batch on it.
+
+- **Test:** vitest `desktop/agent-cards/036: …` in `desktop/src/components/AgentCardsBatchVoice.test.tsx`.
+- **Layer:** desktop shell (jsdom), real voice panel and dispatch seam with synthetic resolved speech.
+- **Asserts:** spoken `select_agent_card` on two of three unrelated roots checks exactly those (saying one twice keeps it selected); spoken `run_card_action_on_selection` previews exactly the selected cards and executes nothing; `unselect_agent_card` takes one out and the next preview names the rest; the three registry entries are `voice: true` with matching `commands.toml` rows, and Send stays `no_voice` (#2399 review 3).
+- **Does not assert:** that the model picks these rows for the words (the voice crate's tests).
+
+##### desktop/agent-cards/037 — Escape dismisses a batch confirmation that is not being sent.
+
+- **Test:** vitest `desktop/agent-cards/037: …` in `desktop/src/components/AgentCardsBatch.test.tsx`.
+- **Layer:** desktop overview (jsdom), stubbed batch bridge.
+- **Asserts:** `Escape` in an open confirmation closes it and sends nothing, as Cancel does (#2399 review 4).
+- **Does not assert:** the sending case (desktop/agent-cards/035).
+
 ## Desktop native driver scenarios
 
 These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[spec]` scanner, and run in CI's advisory `desktop-driver` job. `docs/develop/desktop-gui.md` ("The driver tier") describes the harness.

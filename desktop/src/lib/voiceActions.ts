@@ -685,14 +685,24 @@ export type VoiceActionContext = {
   runCardActionBatch: (target: AgentCardRef, action: { actionId?: string; label?: string }) => string | undefined;
   /** Turn the Cards view's selection on or off; turning it off clears the selection. */
   toggleCardSelecting: () => void;
-  /** Select or unselect one card; a closed card takes every card under it along. */
-  toggleCardSelected: (target: AgentCardRef) => string | undefined;
-  /** Start a batch of one action on the selected cards: opens the confirmation. Sends nothing. */
-  runSelectionBatch: (actionId: string) => string | undefined;
+  /**
+   * Select or unselect one card; a closed card takes every card under it
+   * along. `want` says which (voice's "select" / "unselect"); without it the
+   * card flips, as its checkbox does.
+   */
+  toggleCardSelected: (target: AgentCardRef, want?: boolean) => string | undefined;
+  /**
+   * Start a batch of one action on the selected cards, by the action's id (a
+   * button) or its label as spoken: opens the confirmation. Sends nothing.
+   */
+  runSelectionBatch: (action: { actionId?: string; label?: string }) => string | undefined;
   /** The batch confirmation's Send: execute the entries the preview included. */
   sendCardBatch: () => void;
-  /** Close the batch confirmation, or its results, sending nothing. */
-  closeCardBatch: () => void;
+  /**
+   * Close the batch confirmation, or its results, sending nothing. Refused,
+   * with the sentence returned, while the batch is being sent.
+   */
+  closeCardBatch: () => string | undefined;
 };
 
 /** PRD #2374 — one card, named the way the dashboard's agents are: deck, agent id and the daemon process that listed it. */
@@ -756,6 +766,7 @@ export const CARD_FILTER_UNHEARD = "Say whether you want only the cards that nee
 export const CARD_ACTION_UNHEARD = "Say which of the card's actions to press, by the label on its button.";
 export const CARD_REPLY_UNHEARD = "Say what to reply.";
 export const CARD_BATCH_UNHEARD = "Say which action to send to the card and every card under it, by the label on its button.";
+export const CARD_SELECTION_BATCH_UNHEARD = "Say which action to send to the selected cards, by the label on its button.";
 
 /** The card a target names: its deck, agent and, where known, the daemon process that listed it. */
 function cardRefOf(target: AgentCardRef): AgentCardRef {
@@ -1616,14 +1627,14 @@ export const VOICE_ACTIONS = {
 
   toggleCardSelecting: {
     label: "Turn the Cards view's selection on or off",
-    no_voice: "selection is pointing at cards on screen, one checkbox at a time; voice names the cards a batch reaches instead, by naming the card whose tree it covers (`run_card_action_batch`)",
+    no_voice: "the toolbar's Select button only shows or hides the checkboxes, and leaving clears them; voice selects a named card directly (`select_agent_card`, which turns the selection on) and takes one back out (`unselect_agent_card`), so a spoken switch for the checkboxes themselves would add a step and reach nothing new",
     needs: ["toggleCardSelecting"],
     run: (context: Pick<VoiceActionContext, "toggleCardSelecting">) => context.toggleCardSelecting(),
   },
 
   toggleCardSelected: {
     label: "Select or unselect one card for a batch",
-    no_voice: "a card's checkbox is pointing at it on screen; voice reaches a card and everything under it by naming it (`run_card_action_batch`), which is what selecting a closed card selects",
+    no_voice: "a card's checkbox, which flips; voice says which it wants instead, through `select_agent_card` and `unselect_agent_card` (the same member with `want` set), so saying it twice does not undo it",
     needs: ["toggleCardSelected"],
     run: (context: Pick<VoiceActionContext, "toggleCardSelected"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: AgentCardRef) => {
       const refused = context.toggleCardSelected(cardRefOf(target));
@@ -1631,12 +1642,41 @@ export const VOICE_ACTIONS = {
     },
   },
 
+  /* Issue #2399 review — voice builds the same selection the checkboxes do,
+     one named card at a time, across trees and across the daemons voice
+     reaches, and starts a batch on it. Selecting a closed
+     card takes everything under it along, as its checkbox does. */
+  selectAgentCard: {
+    label: "Select one card for a batch",
+    voice: true,
+    needs: ["toggleCardSelected"],
+    run: (context: Pick<VoiceActionContext, "toggleCardSelected"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: AgentCardRef) => {
+      const refused = context.toggleCardSelected(cardRefOf(target), true);
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  unselectAgentCard: {
+    label: "Take one card out of the batch selection",
+    voice: true,
+    needs: ["toggleCardSelected"],
+    run: (context: Pick<VoiceActionContext, "toggleCardSelected"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: AgentCardRef) => {
+      const refused = context.toggleCardSelected(cardRefOf(target), false);
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
   runSelectionBatch: {
     label: "Send one action to the selected cards, after confirming",
-    no_voice: "it acts on a selection made by pointing at checkboxes, which voice does not make; `run_card_action_batch` starts the same confirmation on a card voice names and every card under it",
+    voice: true,
     needs: ["runSelectionBatch"],
-    run: (context: Pick<VoiceActionContext, "runSelectionBatch"> & Partial<Pick<VoiceActionContext, "reportRefused">>, actionId: string) => {
-      const refused = context.runSelectionBatch(actionId);
+    run: (context: Pick<VoiceActionContext, "runSelectionBatch"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: Pick<VoiceDispatchTarget, "cardActionId" | "cardActionLabel">) => {
+      const refused = target.cardActionId === undefined && target.cardActionLabel === undefined
+        ? CARD_SELECTION_BATCH_UNHEARD
+        : context.runSelectionBatch({
+          ...(target.cardActionId !== undefined ? { actionId: target.cardActionId } : {}),
+          ...(target.cardActionLabel !== undefined ? { label: target.cardActionLabel } : {}),
+        });
       if (refused !== undefined) context.reportRefused?.(refused);
     },
   },
@@ -1650,7 +1690,7 @@ export const VOICE_ACTIONS = {
 
   closeCardBatch: {
     label: "Close the batch confirmation or its results",
-    no_voice: "a dismissal of a dialog voice only ever opens (PRD #802 D5); it sends nothing, and Escape, Cancel and Close do it by hand",
+    no_voice: "the dialog's Cancel, Close and `Escape`; the dialog is on the overlay stack, so voice's `close` (\"cancel\", \"never mind\") closes it as the thing on top, through `closeTopmost` — a row of its own would be a second reading of words `close` already answers. It is voice-reachable through that entry, and refused by every route while the batch is being sent",
     needs: ["closeCardBatch"],
     run: (context: Pick<VoiceActionContext, "closeCardBatch">) => context.closeCardBatch(),
   },
