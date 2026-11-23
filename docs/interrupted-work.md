@@ -157,6 +157,8 @@ The TUI and the desktop app use the same words and the same keys. Open the **Int
 | `w` | In the question, **Start over in this worktree**, when it is offered |
 | `Esc`, `q` or `n` | Leave the question without restoring anything |
 
+The question names the agent, and for an agent that can only start over it says why. In the TUI, the item's details list each of its agents with whether it can be restored, and the question also says `Its branch has an open pull request, which the agent may change.` when the list found an open pull request on the item's branch. When the restore works, the TUI closes the list and shows the restored agent on the dashboard; when it does not, the list says why. If the daemon the TUI is attached to is from a version that cannot restore agents, the TUI says so and restores nothing.
+
 In the desktop app the dialog also has a **Restore** button, and the question shows **Restore and continue**, **Restore only**, **Start over in this worktree** (when it is offered) and **Back** as buttons. With several daemons, the agent comes back on the daemon whose dialog you used.
 
 By voice ([Voice Control](desktop/voice.md#interrupted-work)), say **"restore the agent"**, **"bring back fix-login"** or **"resume fix-login's conversation"** to open the question for that item. Choosing **Restore and continue**, **Restore only** or **Start over in this worktree** is done on screen, since each starts an agent that spends credits and may push or send.
@@ -204,6 +206,7 @@ Some ways of starting an agent cannot be restored, even for Claude Code and Code
 - **A restored unit no longer reports to its dispatcher.** A dispatched unit or issue dispatch comes back as an agent of its own: the dispatcher that started it is not told when it finishes. Read what it did in its pane, and tell the dispatcher yourself if it needs to know.
 - **Claude Code may ask for permissions it did not ask for before.** An agent started to skip permission prompts can ask for them again after it is restored. Answer them in its pane.
 - **A prompt in the agent's command is sent again.** If the agent was started with a prompt on its command line, such as `claude "fix the login tests"`, Claude Code receives that prompt again as a new message when it is restored. Agents the deck starts normally take their task as a message instead, so this applies only to a command you wrote that way. Codex with a prompt on its command line is not restored; Start over is offered.
+- **Starting the TUI again does not start a restorable agent blank.** When the TUI starts with a daemon that runs no agents, it normally starts the panes of your last session again. With restore on, a saved pane whose agent can be restored with its conversation, in the same folder with the same command, is not started again: restore it from **Interrupted work** instead, so you do not get a blank copy beside the restored one. A saved pane whose agent can only start over starts as before.
 - **The old agent must be gone.** The deck restores an agent only when it can confirm the agent it stopped is no longer running, so that two copies of it do not write to one conversation.
 
 ### When an agent is not restored

@@ -27,6 +27,13 @@ There is no fallback that types a resume command into a started agent (the 2026-
 
 The table is `AgentSpec.resume` in `src/agent_registry.rs`: Claude Code and Codex carry a `ResumeSpec`; OpenCode, Pi, Devin and Antigravity do not, so their verdict is `start_over` with `agent-cannot-resume`, and the user page names what each is missing (CLAUDE.md rule 20). Codex stays listed as resumable only while its real-agent test passes.
 
+## The TUI
+
+- **Capability.** The TUI asks the attached daemon for its interrupted work with `DaemonClient::list_interrupted_work_restorable`, which answers whether the same `Hello` advertised `restore-agents`. `s` on a daemon known not to says `RESTORE_UNSUPPORTED` and sends nothing; before a list has answered, the client's own capability gate on the restore request is the check, and its `Unsupported` answer is remembered the same way. The L1 seam sets that knowledge with `InterruptedSeamStep::RestoreCapability`.
+- **One request.** `s` opens the question and sends nothing. `c`, `o` and `w` count only once a flushed frame showed every row of the question (the stage 2 presentation barrier, `refuse_undrawn_choice`), and only for a choice the verdict offers; the request is the human one, with no caller claim, and a restore or start-over in flight keeps every action waiting until it answers. The open pull request note comes from the list's Git facts (`restore_git_note`), not from a dry run.
+- **The restored pane.** `agent_restore::start` announces the new dashboard pane with `spawn::surface_attach_started_agent`, as an attach start does, so an attached TUI titles the card with the agent's name; a start that is not confirmed is closed through `close_started_agents`, which announces the removal.
+- **Saved-workspace restore (brief §11-Q1, option b).** With `show_agent_restore()` on, the daemon-empty restore of the saved session leaves out a plain saved pane whose folder and exact command equal a launch record joined, by work id and attempt, to an agent the attached daemon lists with a `resume` verdict (`ui::should_defer_saved_agent_restore`, catalog `journal/restore/018`). The list is asked for with a 5-second bound; the launch records are read from the local state directory, and a record of another deck's does not match, since a work id carries its state directory's deck id and 64 random bits, and a match needs both. A daemon that does not answer in time leaves every saved pane to start as before.
+
 ## Hazards worth knowing
 
 - **Claude Code's `--resume <id>` doubles as a search term**: an id it cannot find may open a picker rather than exit. No matching `SessionStart` arrives, so the confirmation times out and the agent is stopped, but the pane shows the picker until then.

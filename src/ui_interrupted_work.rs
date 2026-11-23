@@ -38,7 +38,8 @@ use super::*;
 use crate::daemon_client::{ClientError, DaemonClient, GatedQuery, Incarnation};
 use crate::interrupted_work::{
     self as words, DismissOutcome, GitFacts, InterruptedItem, InterruptedList, InterruptedShow,
-    ItemKind, ReclaimOutcome, ReclaimVerdict,
+    ItemAgent, ItemKind, ReclaimOutcome, ReclaimVerdict, RestoreMode, RestoreOutcome,
+    RestoreVerdict, StartOverOutcome,
 };
 
 /// The bound on a list request. A list opened from the overlay asks for the
@@ -51,6 +52,10 @@ const SHOW_TIMEOUT: Duration = Duration::from_secs(15);
 const RECLAIM_TIMEOUT: Duration = Duration::from_secs(120);
 /// The bound on a dismissal.
 const DISMISS_TIMEOUT: Duration = Duration::from_secs(15);
+/// PRD #1790 stage 3: the bound on a restore or start-over, which answers
+/// once its agent confirmed its conversation or was stopped (the daemon's
+/// own confirmation bound is 30 seconds).
+const RESTORE_TIMEOUT: Duration = Duration::from_secs(120);
 /// The overlay's widest.
 const POPUP_MAX_WIDTH: u16 = 100;
 
@@ -73,6 +78,15 @@ pub enum Press {
     DismissAll,
     /// `y` in a confirmation.
     Yes,
+    /// PRD #1790 stage 3, `s` in the list or details (experimental): ask
+    /// whether to restore the selected item's agent.
+    Restore,
+    /// `c` in the restore question: Restore and continue.
+    RestoreContinue,
+    /// `o` in the restore question: Restore only.
+    RestoreOnly,
+    /// `w` in the restore question: Start over in this worktree, when offered.
+    StartOver,
     /// Back to the list from details or a confirmation.
     Back,
     Close,
@@ -103,6 +117,16 @@ pub(super) enum View {
     /// Dismiss all's confirmation, naming exactly the items listed when it was
     /// asked, so one that appears meanwhile is not dismissed unseen.
     DismissAll { ids: Vec<String>, scroll: usize },
+    /// PRD #1790 stage 3: the restore question for one agent of the item
+    /// `id`, as it was listed when asked: its attempt (`None` for an item that
+    /// lists no agent), its name and its verdict, which decides the choices.
+    Restore {
+        id: String,
+        attempt: Option<String>,
+        name: String,
+        verdict: RestoreVerdict,
+        scroll: usize,
+    },
 }
 
 /// Which daemon process and which request an answer belongs to. An answer is
@@ -121,6 +145,9 @@ pub(super) enum Answer {
     Listed {
         tag: Tag,
         result: Result<Option<InterruptedList>, String>,
+        /// PRD #1790 stage 3: whether the daemon that listed it advertised
+        /// `restore-agents` on the same `Hello`; `None` when not known.
+        restore: Option<bool>,
     },
     Shown {
         tag: Tag,
@@ -138,6 +165,17 @@ pub(super) enum Answer {
         tag: Tag,
         result: Result<Option<DismissOutcome>, String>,
     },
+    /// PRD #1790 stage 3: `Ok(None)`, the daemon cannot restore agents.
+    Restored {
+        tag: Tag,
+        id: String,
+        result: Result<Option<RestoreOutcome>, String>,
+    },
+    StartedOver {
+        tag: Tag,
+        id: String,
+        result: Result<Option<StartOverOutcome>, String>,
+    },
 }
 
 impl Answer {
@@ -146,7 +184,9 @@ impl Answer {
             Answer::Listed { tag, .. }
             | Answer::Shown { tag, .. }
             | Answer::Reclaimed { tag, .. }
-            | Answer::Dismissed { tag, .. } => *tag,
+            | Answer::Dismissed { tag, .. }
+            | Answer::Restored { tag, .. }
+            | Answer::StartedOver { tag, .. } => *tag,
         }
     }
 }
@@ -226,6 +266,11 @@ pub(super) struct InterruptedWork {
     /// in one frame, so a question taller than the popup can be scrolled
     /// through and then answered. Re-wrapped rows (a resize) start unseen.
     question_seen: Vec<(String, bool)>,
+    /// PRD #1790 stage 3: whether the daemon process the list came from
+    /// advertises `restore-agents`, as its list answer said; `None` before
+    /// one said. Checked before a restore or start-over is sent: a daemon
+    /// known not to is sent nothing, and the overlay says so.
+    restore_capable: Option<bool>,
     /// The L1 seam's record of every request sent, in order; `None` in
     /// production, where each is sent to the daemon instead.
     recorder: Option<Vec<Recorded>>,
@@ -261,6 +306,7 @@ impl Default for InterruptedWork {
             list_op: None,
             show_op: None,
             question_seen: Vec::new(),
+            restore_capable: None,
             recorder: None,
             tx,
             rx,
@@ -306,6 +352,9 @@ impl InterruptedWork {
         match &self.view {
             View::Reclaim { dry: Some(dry), .. } => !self.busy() && would_remove(dry),
             View::DismissAll { ids, .. } => !self.busy() && !ids.is_empty(),
+            View::Restore { verdict, .. } => {
+                !self.busy() && self.restore_capable != Some(false) && offers_choice(*verdict)
+            }
             _ => false,
         }
     }
@@ -325,6 +374,46 @@ impl InterruptedWork {
             self.pending = None;
         }
     }
+}
+
+/// Whether the restore question offers a choice for `verdict`: Restore and
+/// continue and Restore only for a resume, Start over in this worktree
+/// instead for an agent that can only start over.
+fn offers_choice(verdict: RestoreVerdict) -> bool {
+    matches!(
+        verdict,
+        RestoreVerdict::Resume | RestoreVerdict::StartOver { .. }
+    )
+}
+
+/// The agent of `item` the restore question asks about: the first one a
+/// restore or start-over is offered for, else the first listed.
+fn restore_target(item: &InterruptedItem) -> Option<&ItemAgent> {
+    item.agents
+        .iter()
+        .find(|agent| offers_choice(agent.restore))
+        .or_else(|| item.agents.first())
+}
+
+/// The sentence for a restore's or start-over's outcome, as the CLI prints
+/// it, on one line.
+fn restore_message(output: crate::roles_cli::CliOutput) -> String {
+    format!("{}\n{}", output.stdout, output.stderr)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Whether a restore or start-over brought its agent back with nothing left
+/// to tell: the overlay then closes on the dashboard that shows it.
+fn restored_cleanly(restored: &[words::RestoredAgent], refused: bool) -> bool {
+    !refused
+        && !restored.is_empty()
+        && restored
+            .iter()
+            .all(|agent| agent.first_message_posted && agent.recorded)
 }
 
 fn would_remove(outcome: &ReclaimOutcome) -> bool {
@@ -434,10 +523,22 @@ async fn ask(tag: Tag, sent: InterruptedSeamSent) -> Answer {
     let InterruptedSeamSent { instance, request } = sent;
     let instance = instance.as_deref();
     match request {
-        InterruptedSeamRequest::List { git } => Answer::Listed {
-            tag,
-            result: bounded(LIST_TIMEOUT, client().list_interrupted_work(git, instance)).await,
-        },
+        InterruptedSeamRequest::List { git } => {
+            let answered = bounded(
+                LIST_TIMEOUT,
+                client().list_interrupted_work_restorable(git, instance),
+            )
+            .await;
+            let restore = answered
+                .as_ref()
+                .ok()
+                .and_then(|answer| answer.as_ref().map(|(_, restore)| *restore));
+            Answer::Listed {
+                tag,
+                result: answered.map(|answer| answer.map(|(list, _)| list)),
+                restore,
+            }
+        }
         InterruptedSeamRequest::Show { id, reports_from } => {
             let result = bounded(
                 SHOW_TIMEOUT,
@@ -471,6 +572,29 @@ async fn ask(tag: Tag, sent: InterruptedSeamSent) -> Answer {
             )
             .await,
         },
+        // PRD #1790 stage 3: sent with no caller claim — the TUI is the
+        // person's client, as for reclaim (decision D4).
+        InterruptedSeamRequest::RestoreInterrupted {
+            id,
+            agents,
+            mode,
+            dry_run,
+        } => {
+            let result = bounded(
+                RESTORE_TIMEOUT,
+                client().restore_interrupted(&id, agents, mode, dry_run, None, instance),
+            )
+            .await;
+            Answer::Restored { tag, id, result }
+        }
+        InterruptedSeamRequest::StartOverInterrupted { id, agent, dry_run } => {
+            let result = bounded(
+                RESTORE_TIMEOUT,
+                client().start_over_interrupted(&id, &agent, dry_run, None, instance),
+            )
+            .await;
+            Answer::StartedOver { tag, id, result }
+        }
     }
 }
 
@@ -553,11 +677,16 @@ pub(super) fn apply(ui: &mut UiState, answer: Answer) {
         return;
     }
     match answer {
-        Answer::Listed { result, .. } => {
+        Answer::Listed {
+            result, restore, ..
+        } => {
             if iw.list_op != Some(tag.op) {
                 return;
             }
             iw.list_op = None;
+            if let Some(restore) = restore {
+                iw.restore_capable = Some(restore);
+            }
             // The selection follows its item, not its row.
             let selected_id = iw.selected_item().map(|item| item.id.as_str().to_string());
             match result {
@@ -600,7 +729,9 @@ pub(super) fn apply(ui: &mut UiState, answer: Answer) {
             let count = ordered.len();
             iw.selected = still.unwrap_or_else(|| iw.selected.min(count.saturating_sub(1)));
             let gone = match &iw.view {
-                View::Details { id, .. } | View::Reclaim { id, .. } => iw.item(id).is_none(),
+                View::Details { id, .. } | View::Reclaim { id, .. } | View::Restore { id, .. } => {
+                    iw.item(id).is_none()
+                }
                 View::DismissAll { .. } | View::List => false,
             };
             if gone && !iw.busy() {
@@ -737,7 +868,76 @@ pub(super) fn apply(ui: &mut UiState, answer: Answer) {
             iw.message = Some(message);
             request_list(iw, false);
         }
+        Answer::Restored { id, result, .. } => {
+            let outcome = result.map(|answer| {
+                answer.map(|outcome| {
+                    let clean = restored_cleanly(&outcome.restored, !outcome.refused.is_empty());
+                    let said = crate::interrupted_cli::render_restore(&outcome);
+                    (clean, restore_message(said))
+                })
+            });
+            restore_answered(ui, tag, &id, outcome);
+        }
+        Answer::StartedOver { id, result, .. } => {
+            let outcome = result.map(|answer| {
+                answer.map(|outcome| {
+                    let started: Vec<_> = outcome.started.iter().cloned().collect();
+                    let clean = restored_cleanly(&started, outcome.refused.is_some());
+                    let said = crate::interrupted_cli::render_start_over(&outcome);
+                    (clean, restore_message(said))
+                })
+            });
+            restore_answered(ui, tag, &id, outcome);
+        }
     }
+}
+
+/// PRD #1790 stage 3: apply a restore's or start-over's answer — whether it
+/// brought its agent back with nothing left to say, and its sentence; `Ok(None)`
+/// when the daemon cannot restore agents. A clean restore closes the overlay
+/// on the dashboard, where the agent is back; anything else is said in the
+/// list. Either way the list is asked for again.
+fn restore_answered(
+    ui: &mut UiState,
+    tag: Tag,
+    id: &str,
+    outcome: Result<Option<(bool, String)>, String>,
+) {
+    let iw = &mut ui.interrupted;
+    if iw.pending.map(|p| p.op) != Some(tag.op) {
+        return;
+    }
+    iw.pending = None;
+    let open = matches!(&iw.view, View::Restore { id: open, .. } if open == id);
+    let clean = match outcome {
+        Ok(Some((clean, message))) => {
+            iw.message = Some(message);
+            clean
+        }
+        Ok(None) => {
+            iw.restore_capable = Some(false);
+            iw.message = Some(words::RESTORE_UNSUPPORTED.to_string());
+            false
+        }
+        Err(message) => {
+            iw.message = Some(message);
+            false
+        }
+    };
+    if open {
+        iw.view = View::List;
+        if clean && ui.mode == UiMode::InterruptedWork {
+            ui.mode = UiMode::Normal;
+        }
+    }
+    request_list(&mut ui.interrupted, false);
+}
+
+/// PRD #1790 stage 3: what the attached daemon process said of
+/// `restore-agents` (the L1 seam hands it in; in production a list answer
+/// carries it).
+pub(super) fn learn_restore_capability(ui: &mut UiState, supported: bool) {
+    ui.interrupted.restore_capable = Some(supported);
 }
 
 /// The sentence for a dismissal's outcome: a refusal of one of its ids, or
@@ -867,10 +1067,13 @@ pub(super) fn handle_key(key: KeyEvent, ui: &mut UiState, kb: &KeybindingConfig)
             _ if shifted('d') => Some(Press::DismissAll),
             KeyCode::Char('r') => Some(Press::Reclaim),
             KeyCode::Char('d') => Some(Press::Dismiss),
+            // PRD #1790 stage 3: experimental, gated here and in the hints.
+            KeyCode::Char('s') if crate::features::show_agent_restore() => Some(Press::Restore),
             _ => None,
         },
         View::Details { .. } => match key.code {
             KeyCode::Esc | KeyCode::Char('q') => Some(Press::Back),
+            KeyCode::Char('s') if crate::features::show_agent_restore() => Some(Press::Restore),
             KeyCode::Enter => Some(Press::Open),
             KeyCode::Char('n') => Some(Press::NextReports),
             KeyCode::Char('p') => Some(Press::PreviousReports),
@@ -886,6 +1089,19 @@ pub(super) fn handle_key(key: KeyEvent, ui: &mut UiState, kb: &KeybindingConfig)
             }
             KeyCode::Char('y') | KeyCode::Char('Y') => Some(Press::Yes),
             // A confirmation longer than its popup scrolls to its question.
+            KeyCode::Down | KeyCode::Char('j') => Some(Press::Down),
+            KeyCode::Up | KeyCode::Char('k') => Some(Press::Up),
+            KeyCode::PageDown => Some(Press::PageDown),
+            KeyCode::PageUp => Some(Press::PageUp),
+            _ => None,
+        },
+        View::Restore { .. } => match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('n') | KeyCode::Char('N') => {
+                Some(Press::Back)
+            }
+            KeyCode::Char('c') => Some(Press::RestoreContinue),
+            KeyCode::Char('o') => Some(Press::RestoreOnly),
+            KeyCode::Char('w') => Some(Press::StartOver),
             KeyCode::Down | KeyCode::Char('j') => Some(Press::Down),
             KeyCode::Up | KeyCode::Char('k') => Some(Press::Up),
             KeyCode::PageDown => Some(Press::PageDown),
@@ -920,6 +1136,10 @@ pub(super) fn press(ui: &mut UiState, press: Press) {
         if ui.mode == UiMode::InterruptedWork {
             ui.mode = UiMode::Normal;
         }
+        return;
+    }
+    if press == Press::Restore {
+        ask_restore(ui);
         return;
     }
     let iw = &mut ui.interrupted;
@@ -1053,7 +1273,106 @@ pub(super) fn press(ui: &mut UiState, press: Press) {
             Press::Back => iw.view = View::List,
             _ => {}
         },
+        View::Restore {
+            id,
+            attempt,
+            verdict,
+            ..
+        } => match press {
+            _ if scrolls => {
+                if let View::Restore { scroll, .. } = &mut iw.view {
+                    *scroll = scrolled(*scroll, press);
+                }
+            }
+            // A restore in flight still reports its sentence in the list.
+            Press::Back => iw.view = View::List,
+            Press::RestoreContinue | Press::RestoreOnly | Press::StartOver => {
+                let Some(attempt) = attempt else {
+                    return;
+                };
+                if !iw.asks() {
+                    return;
+                }
+                let request = match (press, verdict) {
+                    (Press::RestoreContinue, RestoreVerdict::Resume) => {
+                        InterruptedSeamRequest::RestoreInterrupted {
+                            id,
+                            agents: vec![attempt],
+                            mode: RestoreMode::Continue,
+                            dry_run: false,
+                        }
+                    }
+                    (Press::RestoreOnly, RestoreVerdict::Resume) => {
+                        InterruptedSeamRequest::RestoreInterrupted {
+                            id,
+                            agents: vec![attempt],
+                            mode: RestoreMode::Only,
+                            dry_run: false,
+                        }
+                    }
+                    (Press::StartOver, RestoreVerdict::StartOver { .. }) => {
+                        InterruptedSeamRequest::StartOverInterrupted {
+                            id,
+                            agent: attempt,
+                            dry_run: false,
+                        }
+                    }
+                    // A choice the question does not offer starts nothing.
+                    _ => return,
+                };
+                let tag = iw.next_tag();
+                iw.pending = Some(Pending {
+                    op: tag.op,
+                    dry_run: false,
+                });
+                if !send(iw, tag, request) {
+                    iw.pending = None;
+                }
+            }
+            _ => {}
+        },
     }
+}
+
+/// PRD #1790 stage 3: `s` — ask whether to restore the selected item's agent
+/// (in the details, the item shown). Nothing is sent: the question's own keys
+/// act. A daemon known not to restore agents is asked nothing, and the list
+/// says so; while a reclaim, dismissal or restore is in flight nothing opens.
+fn ask_restore(ui: &mut UiState) {
+    let iw = &mut ui.interrupted;
+    if iw.busy() {
+        return;
+    }
+    let item = match &iw.view {
+        View::List => iw.selected_item(),
+        View::Details { id, .. } => iw.item(id),
+        _ => None,
+    };
+    let Some(item) = item else {
+        return;
+    };
+    if iw.restore_capable == Some(false) {
+        iw.show_op = None;
+        iw.view = View::List;
+        iw.message = Some(words::RESTORE_UNSUPPORTED.to_string());
+        return;
+    }
+    let target = restore_target(item);
+    let view = View::Restore {
+        id: item.id.as_str().to_string(),
+        attempt: target.map(|agent| agent.attempt.as_str().to_string()),
+        name: target
+            .and_then(|agent| agent.name.as_deref())
+            .map(clean)
+            .unwrap_or_else(|| item_name(item)),
+        verdict: target.map_or(RestoreVerdict::Unknown, |agent| agent.restore),
+        scroll: 0,
+    };
+    iw.show_op = None;
+    iw.view = view;
+    // A question that just appeared waits for its own frame.
+    ui.confirm_choices_drawn = None;
+    ui.interrupted.question_seen.clear();
 }
 
 /// Ask for the page of the item `id`'s kept reports, and their text, that
@@ -1466,6 +1785,40 @@ fn details_body(
         }
         None => {}
     }
+    // PRD #1790 stage 3: each agent and whether it can come back, as the
+    // CLI's `interrupted show` lists them — behind the experimental flag.
+    if crate::features::show_agent_restore() {
+        for agent in &item.agents {
+            let mut name = agent.name.as_deref().map(clean).unwrap_or_default();
+            if let Some(role) = &agent.role {
+                name.push_str(&format!(" ({})", clean(role)));
+            }
+            let mut said = format!(
+                "{}: {name} · {}: {}",
+                words::LABEL_AGENT,
+                words::LABEL_ATTEMPT,
+                clean(agent.attempt.as_str())
+            );
+            if let Some(folder) = &agent.folder {
+                said.push_str(&format!(" · {}: {}", words::LABEL_FOLDER, clean(folder)));
+            }
+            lines.extend(wrapped(&said, width, "    ", text_primary()));
+            lines.extend(wrapped(
+                &words::restore_verdict_sentence(agent.restore),
+                width,
+                "      ",
+                text_dim(),
+            ));
+        }
+        if item.agents_omitted > 0 {
+            lines.extend(wrapped(
+                &words::omitted_sentence(item.agents_omitted),
+                width,
+                "    ",
+                text_dim(),
+            ));
+        }
+    }
     if item.cut {
         lines.extend(wrapped(words::ITEM_CUT, width, "    ", text_dim()));
     }
@@ -1619,6 +1972,114 @@ fn dismiss_all_body(
     (lines, question)
 }
 
+/// PRD #1790 stage 3: the restore question's body, and the rows of the
+/// question and its choices when it asks. A resume offers Restore and
+/// continue and Restore only, each with what it does; an agent that can only
+/// start over is offered Start over in this worktree instead, with why; any
+/// other verdict is only said. An open pull request on the item's branch, as
+/// the list's Git facts say, is named as the CLI names it.
+fn restore_body(
+    iw: &InterruptedWork,
+    id: &str,
+    name: &str,
+    verdict: RestoreVerdict,
+    width: usize,
+) -> (Vec<Line<'static>>, Question) {
+    let mut lines = Vec::new();
+    let item = iw.item(id);
+    if let Some(item) = item {
+        lines.push(row(
+            format!(
+                "  {} {} · {}",
+                words::RESTORE_ACTION,
+                item_name(item),
+                words::kind_label(item.kind)
+            ),
+            width,
+            heading(),
+        ));
+        lines.push(Line::from(""));
+    }
+    let asks = iw.asks();
+    let mut question: Question = Vec::new();
+    let mut ask = |lines: &mut Vec<Line<'static>>, text: &str, indent: &str, style: Style| {
+        for row in crate::upgrade_dialog::wrap(text, width.saturating_sub(indent.len()).max(1)) {
+            if asks {
+                question.push((lines.len(), row.clone()));
+            }
+            lines.push(Line::styled(format!("{indent}{row}"), style));
+        }
+    };
+    let choice = |key: char, label: &str| format!("{key}  {label}");
+    match verdict {
+        RestoreVerdict::Resume => {
+            ask(&mut lines, &words::restore_question(name), "  ", heading());
+            lines.push(Line::from(""));
+            ask(
+                &mut lines,
+                &choice('c', words::RESTORE_AND_CONTINUE),
+                "  ",
+                text_primary(),
+            );
+            lines.extend(wrapped(
+                words::RESTORE_AND_CONTINUE_EXPLANATION,
+                width,
+                "       ",
+                text_dim(),
+            ));
+            ask(
+                &mut lines,
+                &choice('o', words::RESTORE_ONLY),
+                "  ",
+                text_primary(),
+            );
+            lines.extend(wrapped(
+                words::RESTORE_ONLY_EXPLANATION,
+                width,
+                "       ",
+                text_dim(),
+            ));
+        }
+        RestoreVerdict::StartOver { reason } => {
+            ask(
+                &mut lines,
+                &words::start_over_question(name),
+                "  ",
+                heading(),
+            );
+            lines.extend(wrapped(
+                words::restore_reason_sentence(reason),
+                width,
+                "  ",
+                text_primary(),
+            ));
+            lines.push(Line::from(""));
+            ask(
+                &mut lines,
+                &choice('w', words::START_OVER),
+                "  ",
+                text_primary(),
+            );
+        }
+        RestoreVerdict::NotRestorable { .. } | RestoreVerdict::Unknown => {
+            lines.push(row(format!("  {name}"), width, text_primary()));
+            lines.extend(wrapped(
+                &words::restore_verdict_sentence(verdict),
+                width,
+                "  ",
+                notice(),
+            ));
+        }
+    }
+    if offers_choice(verdict)
+        && let Some(note) = words::restore_git_note(item.and_then(|item| item.git.as_ref()))
+    {
+        lines.push(Line::from(""));
+        lines.extend(wrapped(note, width, "  ", notice()));
+    }
+    (lines, question)
+}
+
 /// The hints under the body; `overflow`: the body is longer than its room.
 fn hints(iw: &InterruptedWork, overflow: bool) -> String {
     let lower = |word: &str| word.to_lowercase();
@@ -1632,6 +2093,9 @@ fn hints(iw: &InterruptedWork, overflow: bool) -> String {
                 if item.kind != ItemKind::Agent {
                     parts.push(format!("r {}", lower(words::RECLAIM_ACTION)));
                 }
+                if crate::features::show_agent_restore() && !item.agents.is_empty() {
+                    parts.push(format!("s {}", lower(words::RESTORE_ACTION)));
+                }
                 parts.push(format!("d {}", lower(words::DISMISS_ACTION)));
                 parts.push(format!("D {}", lower(words::DISMISS_ALL_ACTION)));
             }
@@ -1644,6 +2108,11 @@ fn hints(iw: &InterruptedWork, overflow: bool) -> String {
             let mut parts = Vec::new();
             if !asked && iw.item(id).is_some_and(|item| !item.reports.is_empty()) {
                 parts.push("Enter show reports".to_string());
+            }
+            if crate::features::show_agent_restore()
+                && iw.item(id).is_some_and(|item| !item.agents.is_empty())
+            {
+                parts.push(format!("s {}", lower(words::RESTORE_ACTION)));
             }
             if let Some(show) = show.as_deref().filter(|_| *asked) {
                 if show.next_reports_from.is_some() {
@@ -1663,7 +2132,19 @@ fn hints(iw: &InterruptedWork, overflow: bool) -> String {
         View::DismissAll { .. } if iw.asks() => {
             format!("  y {} · n back{scroll}", lower(words::DISMISS_ALL_ACTION))
         }
-        View::Reclaim { .. } | View::DismissAll { .. } => format!("  Esc back{scroll}"),
+        View::Restore { verdict, .. } if iw.asks() => match verdict {
+            RestoreVerdict::StartOver { .. } => {
+                format!("  w {} · n back{scroll}", lower(words::START_OVER))
+            }
+            _ => format!(
+                "  c {} · o {} · n back{scroll}",
+                lower(words::RESTORE_AND_CONTINUE),
+                lower(words::RESTORE_ONLY)
+            ),
+        },
+        View::Reclaim { .. } | View::DismissAll { .. } | View::Restore { .. } => {
+            format!("  Esc back{scroll}")
+        }
     }
 }
 
@@ -1705,6 +2186,12 @@ pub(super) fn render_overlay(
         }
         View::DismissAll { ids, .. } => {
             let (body, question) = dismiss_all_body(iw, ids.len(), width);
+            (body, None, question)
+        }
+        View::Restore {
+            id, name, verdict, ..
+        } => {
+            let (body, question) = restore_body(iw, id, name, *verdict, width);
             (body, None, question)
         }
     };
@@ -1754,7 +2241,8 @@ pub(super) fn render_overlay(
         }
         View::Details { scroll, .. }
         | View::Reclaim { scroll, .. }
-        | View::DismissAll { scroll, .. } => {
+        | View::DismissAll { scroll, .. }
+        | View::Restore { scroll, .. } => {
             *scroll = (*scroll).min(last_screenful);
             *scroll
         }
@@ -1882,6 +2370,8 @@ pub(super) fn seam_answer(
     let (id, dry_run) = match &recorded.sent.request {
         InterruptedSeamRequest::Show { id, .. } => (id.clone(), false),
         InterruptedSeamRequest::Reclaim { id, dry_run } => (id.clone(), *dry_run),
+        InterruptedSeamRequest::RestoreInterrupted { id, .. }
+        | InterruptedSeamRequest::StartOverInterrupted { id, .. } => (id.clone(), false),
         _ => (String::new(), false),
     };
     // A failed (`Err`) or unsupported (`Ok`) answer of the request's kind.
@@ -1893,6 +2383,7 @@ pub(super) fn seam_answer(
             InterruptedSeamKind::List => Answer::Listed {
                 tag,
                 result: none(&result),
+                restore: None,
             },
             InterruptedSeamKind::Show => Answer::Shown {
                 tag,
@@ -1909,12 +2400,23 @@ pub(super) fn seam_answer(
                 tag,
                 result: none(&result),
             },
+            InterruptedSeamKind::Restore => Answer::Restored {
+                tag,
+                id: id.clone(),
+                result: none(&result),
+            },
+            InterruptedSeamKind::StartOver => Answer::StartedOver {
+                tag,
+                id: id.clone(),
+                result: none(&result),
+            },
         }
     };
     Some(match step {
         InterruptedSeamStep::Listed(list) => Answer::Listed {
             tag,
             result: Ok(Some(list.clone())),
+            restore: None,
         },
         InterruptedSeamStep::Shown(show) => Answer::Shown {
             tag,
@@ -1931,6 +2433,16 @@ pub(super) fn seam_answer(
             tag,
             result: Ok(Some(outcome.clone())),
         },
+        InterruptedSeamStep::Restored(outcome) => Answer::Restored {
+            tag,
+            id,
+            result: Ok(Some(outcome.clone())),
+        },
+        InterruptedSeamStep::StartedOver(outcome) => Answer::StartedOver {
+            tag,
+            id,
+            result: Ok(Some(outcome.clone())),
+        },
         InterruptedSeamStep::Failed(_, message) => failed(Err(message.clone())),
         InterruptedSeamStep::Unsupported(_) => failed(Ok(())),
         _ => return None,
@@ -1944,6 +2456,8 @@ fn seam_kind(step: &InterruptedSeamStep) -> Option<InterruptedSeamKind> {
         InterruptedSeamStep::Shown(_) => InterruptedSeamKind::Show,
         InterruptedSeamStep::Reclaimed(_) => InterruptedSeamKind::Reclaim,
         InterruptedSeamStep::Dismissed(_) => InterruptedSeamKind::Dismiss,
+        InterruptedSeamStep::Restored(_) => InterruptedSeamKind::Restore,
+        InterruptedSeamStep::StartedOver(_) => InterruptedSeamKind::StartOver,
         InterruptedSeamStep::Failed(kind, _) | InterruptedSeamStep::Unsupported(kind) => *kind,
         _ => return None,
     })

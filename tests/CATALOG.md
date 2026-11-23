@@ -927,6 +927,22 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 - **Does not assert:** orphaned descendants in an old process session or the spawn write site.
 - **Platform coverage:** mac+linux.
 
+##### journal/restore/007 — The TUI asks with the offered restore choices and hides the surface when disabled.
+
+- **Layer:** L1 `TestBackend` and insta through `run_interrupted_work_seam` (`tests/render_interrupted_work.rs`); list and details entry points.
+- **Agent:** none; injected Claude resume and Pi Start-over verdicts.
+- **Asserts:** `s` opens the question for the selected name without acting; a resumable agent shows exactly `Restore and continue` and `Restore only`; a gap agent offers `Start over in this worktree` instead; wording equals the shared Rust constants. With experimental features off, the same key leaves the rendered list/details unchanged, no restore hint or choice is drawn in the dashboard/footer/details, and no action request is recorded.
+- **Does not assert:** daemon execution or genuine conversation recall; the resulting snapshots need review at promotion.
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/008 — TUI confirmation sends the shown attempt once and honours daemon capability.
+
+- **Layer:** L1 production-key/render seam and recorded human-client requests (`tests/render_interrupted_work.rs`).
+- **Agent:** none; two listed agents with distinct work and attempt ids, injected capability state.
+- **Asserts:** selecting the second row and pressing `s` only asks; `c` sends exactly one RestoreInterrupted with mode `continue`, `o` with `only`, and `w` sends StartOverInterrupted for the Start-over attempt. Every action targets the shown second item, uses `dry_run=false`, and repeats while pending send nothing extra. `Esc`, `q` and `n` go back and permit reopening without acting; unoffered choices send nothing; without `restore-agents`, neither action reaches the daemon and an on-screen explanation names the daemon's lack of restore support.
+- **Does not assert:** live daemon replies, reconnect/stale-answer behavior, desktop or voice (009/010).
+- **Platform coverage:** mac+linux.
+
 ##### journal/restore/011 — Restore and continue confirms the conversation before sending the first message.
 
 - **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_agent_restore.rs`); the real CLI outside a pane, no terminal on stdin; restart by SIGTERM to the owned daemon pid and a new daemon on the same state directory.
@@ -965,6 +981,14 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 - **Agent:** private synthetic executable named `claude`, no real agent or credential; same capped fixture as 011.
 - **Asserts:** the original agent is visible on an attached TUI before daemon restart; a new TUI attached to the replacement daemon opens `I`, sees the stopped agent, presses `s` and sees the question and both exact restore choices. No agent starts merely from asking; `o` starts exactly one resumed pane whose box title has the original name, whose recorded argv has the separate resume UUID, and whose first and sole inbox message is exactly the Restore-only note with deck reason `restart note`; the item leaves the interrupted list.
 - **Does not assert:** agent recall or compliance with the note (lane 2, 016/017), staying in the same TUI process across changing fixture socket paths, saved-workspace dedupe (018), or desktop controls.
+- **Platform coverage:** mac+linux.
+
+##### journal/restore/018 — Saved-workspace startup leaves a matching resumable agent for the question.
+
+- **Layer:** L1 unit of the TUI's saved-pane startup predicate, extending `tests/session_restore_precedence.rs` around the real SavedSession::load call in `src/ui.rs`.
+- **Agent:** none; in-memory saved pane, interrupted list and launch records.
+- **Asserts:** on a daemon-empty startup with experimental features on, a saved pane is deferred exactly when its directory and verbatim command match a launch record joined by both item work id and resumable attempt id; name changes do not defeat the match. Flag off, Start-over verdict, different directory or command, missing item/record, or wrong-work/wrong-attempt record preserves ordinary saved-pane startup. The existing daemon-hydration-wins gate remains structural.
+- **Does not assert:** an actual PTY launch on this predicate (the production call site must use it); remote transport of the daemon's matching launch data; process liveness or the agent's actual resume (006/011/015).
 - **Platform coverage:** mac+linux.
 
 #### journal/compat

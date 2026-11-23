@@ -2129,3 +2129,349 @@ fn interrupted_037_a_failed_refresh_says_the_list_may_be_out_of_date() {
         shown[5]
     );
 }
+
+use dot_agent_deck::features::{self, Features};
+use dot_agent_deck::interrupted_work::{
+    ItemAgent, RESTORE_ACTION, RESTORE_AND_CONTINUE, RESTORE_AND_CONTINUE_EXPLANATION,
+    RESTORE_ONLY, RESTORE_ONLY_EXPLANATION, RestoreMode, RestoreReason, RestoreVerdict, START_OVER,
+    restore_question, restore_reason_sentence, restore_verdict_sentence, start_over_question,
+};
+use std::sync::{Mutex, MutexGuard};
+
+const RESTORE_ATTEMPT_A: &str = "restore-seam/7";
+const RESTORE_ATTEMPT_B: &str = "restore-seam/8";
+static RESTORE_FLAG_LOCK: Mutex<()> = Mutex::new(());
+
+// Restore the global even when an assertion panics. All flag-mutating tests in
+// this target take this lock; nextest also isolates each test in its own process.
+struct RestoreFlag {
+    old: Features,
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl RestoreFlag {
+    fn set(enabled: bool) -> Self {
+        let lock = RESTORE_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let old = features::current();
+        features::set_for_test(Features::test_with(enabled));
+        Self { old, _lock: lock }
+    }
+}
+
+impl Drop for RestoreFlag {
+    fn drop(&mut self) {
+        features::set_for_test(self.old);
+    }
+}
+
+fn restore_fixture(id: &str, attempt: &str, name: &str, resume: bool) -> InterruptedItem {
+    let mut listed = item(id, ItemKind::Agent, name);
+    listed.worktree = Some("/home/me/code/restore-app".into());
+    listed.agents = vec![ItemAgent {
+        attempt: dot_agent_deck::work_journal::AttemptId::parse(attempt).unwrap(),
+        name: Some(name.into()),
+        agent_type: Some(if resume {
+            dot_agent_deck::event::AgentType::ClaudeCode
+        } else {
+            dot_agent_deck::event::AgentType::Pi
+        }),
+        role: None,
+        folder: listed.worktree.clone(),
+        restore: if resume {
+            RestoreVerdict::Resume
+        } else {
+            RestoreVerdict::StartOver {
+                reason: RestoreReason::AgentCannotResume,
+            }
+        },
+    }];
+    listed
+}
+
+fn restore_actions(requests: &[InterruptedSeamRequest]) -> Vec<InterruptedSeamRequest> {
+    requests
+        .iter()
+        .filter(|request| {
+            matches!(
+                request,
+                InterruptedSeamRequest::RestoreInterrupted { .. }
+                    | InterruptedSeamRequest::StartOverInterrupted { .. }
+            )
+        })
+        .cloned()
+        .collect()
+}
+
+fn expected_restore(id: &str, attempt: &str, mode: RestoreMode) -> InterruptedSeamRequest {
+    InterruptedSeamRequest::RestoreInterrupted {
+        id: id.into(),
+        agents: vec![attempt.into()],
+        mode,
+        dry_run: false,
+    }
+}
+
+fn expected_start_over(id: &str, attempt: &str) -> InterruptedSeamRequest {
+    InterruptedSeamRequest::StartOverInterrupted {
+        id: id.into(),
+        agent: attempt.into(),
+        dry_run: false,
+    }
+}
+
+fn no_restore_hint(frame: &str) {
+    // Existing chrome spells key hints with the key first and a lowercase verb.
+    let lower = frame.to_lowercase();
+    for forbidden in [
+        "s restore",
+        "restore s",
+        "restore and continue",
+        "restore only",
+    ] {
+        assert!(
+            !lower.contains(forbidden),
+            "flag off hides {forbidden:?}:\n{frame}"
+        );
+    }
+}
+
+/// Scenario: Open the interrupted list and press s on a resumable Claude, then on an agent that can only start over, inspecting both the list and details entry points. A non-restorable or newer verdict offers no confirmation; with experimental features off, s opens no question and neither view draws a restore hint.
+#[spec("journal/restore/007")]
+#[test]
+fn journal_restore_007_the_question_offers_only_the_selected_agents_choices() {
+    let _flag = RestoreFlag::set(true);
+    assert_eq!(RESTORE_ACTION, "Restore");
+    assert_eq!(RESTORE_AND_CONTINUE, "Restore and continue");
+    assert_eq!(RESTORE_ONLY, "Restore only");
+    assert_eq!(START_OVER, "Start over in this worktree");
+    for (resume, snapshot) in [
+        (true, "restore_question_resume"),
+        (false, "restore_question_start_over"),
+    ] {
+        let listed = restore_fixture(AGENT_ID, RESTORE_ATTEMPT_A, "restore-scratch", resume);
+        for details in [false, true] {
+            let mut steps = vec![InterruptedSeamStep::RestoreCapability(true), ch('I')];
+            if details {
+                steps.push(key(KeyCode::Enter));
+            }
+            steps.push(ch('s'));
+            let (shown, sent) = run(&only(listed.clone()), &steps);
+            at(&shown[shown.len() - 2], "s restore");
+            let question = shown.last().unwrap();
+            at(question, "restore-scratch");
+            if resume {
+                at(question, &restore_question("restore-scratch"));
+                at(question, RESTORE_AND_CONTINUE);
+                at(question, RESTORE_ONLY);
+                at(question, RESTORE_AND_CONTINUE_EXPLANATION);
+                at(question, RESTORE_ONLY_EXPLANATION);
+                assert!(
+                    !question.contains(START_OVER),
+                    "resume has two choices:\n{question}"
+                );
+            } else {
+                at(question, &start_over_question("restore-scratch"));
+                at(
+                    question,
+                    restore_reason_sentence(RestoreReason::AgentCannotResume),
+                );
+                at(question, START_OVER);
+                assert!(
+                    !question.contains(RESTORE_AND_CONTINUE) && !question.contains(RESTORE_ONLY),
+                    "the docs offer Start over instead for a gap agent:\n{question}"
+                );
+            }
+            assert!(restore_actions(&sent).is_empty(), "s only asks: {sent:?}");
+            if !details {
+                insta::assert_snapshot!(snapshot, question);
+            }
+        }
+    }
+
+    for verdict in [
+        RestoreVerdict::NotRestorable {
+            reason: RestoreReason::OrchestrationLater,
+        },
+        RestoreVerdict::Unknown,
+    ] {
+        let mut listed = restore_fixture(AGENT_ID, RESTORE_ATTEMPT_A, "restore-scratch", true);
+        listed.agents[0].restore = verdict;
+        let (shown, sent) = run(
+            &only(listed),
+            &[
+                InterruptedSeamStep::RestoreCapability(true),
+                ch('I'),
+                key(KeyCode::Enter),
+                ch('s'),
+                ch('c'),
+                ch('o'),
+                ch('w'),
+            ],
+        );
+        let frame = shown.last().unwrap();
+        at(frame, &restore_verdict_sentence(verdict));
+        assert!(
+            !frame.contains(RESTORE_AND_CONTINUE) && !frame.contains(RESTORE_ONLY),
+            "{frame}"
+        );
+        assert!(
+            restore_actions(&sent).is_empty(),
+            "non-restorable: {sent:?}"
+        );
+    }
+
+    features::set_for_test(Features::test_with(false));
+    let listed = only(restore_fixture(
+        AGENT_ID,
+        RESTORE_ATTEMPT_A,
+        "restore-scratch",
+        true,
+    ));
+    for details in [false, true] {
+        let mut steps = vec![InterruptedSeamStep::RestoreCapability(true), ch('I')];
+        if details {
+            steps.push(key(KeyCode::Enter));
+        }
+        steps.push(ch('s'));
+        let (shown, sent) = run(&listed, &steps);
+        no_restore_hint(&shown[0]);
+        let before = &shown[shown.len() - 2];
+        let after = shown.last().unwrap();
+        no_restore_hint(before);
+        no_restore_hint(after);
+        assert_eq!(before, after, "s is inert when the flag is off");
+        assert!(restore_actions(&sent).is_empty(), "{sent:?}");
+    }
+}
+
+/// Scenario: Select the second interrupted agent and confirm with c or o, or choose w for an agent that must start over; only that item's shown attempt is sent once, even after more action keys while it is pending. Escape, q and n return without acting, and a daemon missing restore-agents receives no restore or start-over request and leaves an explanation on screen.
+#[spec("journal/restore/008")]
+#[test]
+fn journal_restore_008_confirmations_target_one_attempt_once_and_honour_capabilities() {
+    let _flag = RestoreFlag::set(true);
+    let list_for = |resume| InterruptedList {
+        items: vec![
+            restore_fixture(AGENT_ID, RESTORE_ATTEMPT_A, "restore-first", true),
+            restore_fixture(NEW_ID, RESTORE_ATTEMPT_B, "restore-second", resume),
+        ],
+        incomplete: false,
+        omitted: 0,
+    };
+
+    for (confirm, resume, expected) in [
+        (
+            'c',
+            true,
+            expected_restore(NEW_ID, RESTORE_ATTEMPT_B, RestoreMode::Continue),
+        ),
+        (
+            'o',
+            true,
+            expected_restore(NEW_ID, RESTORE_ATTEMPT_B, RestoreMode::Only),
+        ),
+        ('w', false, expected_start_over(NEW_ID, RESTORE_ATTEMPT_B)),
+    ] {
+        let (shown, sent) = run(
+            &list_for(resume),
+            &[
+                InterruptedSeamStep::RestoreCapability(true),
+                ch('I'),
+                ch('j'),
+                ch('s'),
+                ch(confirm),
+                // No daemon result arrives: the first action is still pending.
+                ch(confirm),
+                ch('s'),
+                ch('c'),
+                ch('o'),
+                ch('w'),
+            ],
+        );
+        at(&shown[4], "restore-second");
+        assert_eq!(
+            restore_actions(&sent),
+            vec![expected],
+            "repeat keys: {sent:?}"
+        );
+    }
+
+    let (shown, sent) = run(
+        &list_for(true),
+        &[
+            InterruptedSeamStep::RestoreCapability(true),
+            ch('I'),
+            ch('j'),
+            InterruptedSeamStep::Burst(vec![ch('s'), ch('c'), ch('c')]),
+        ],
+    );
+    at(shown.last().unwrap(), &restore_question("restore-second"));
+    assert!(
+        restore_actions(&sent).is_empty(),
+        "unpresented question: {sent:?}"
+    );
+
+    for cancel in [KeyCode::Esc, KeyCode::Char('q'), KeyCode::Char('n')] {
+        let (shown, sent) = run(
+            &list_for(true),
+            &[
+                InterruptedSeamStep::RestoreCapability(true),
+                ch('I'),
+                ch('j'),
+                ch('s'),
+                key(cancel),
+                ch('s'),
+            ],
+        );
+        let back = &shown[5];
+        at(back, INTERRUPTED_WORK_TITLE);
+        assert!(
+            !back.contains(&restore_question("restore-second")),
+            "back: {back}"
+        );
+        at(&shown[6], &restore_question("restore-second"));
+        assert!(
+            restore_actions(&sent).is_empty(),
+            "cancel sends nothing: {sent:?}"
+        );
+    }
+
+    // A choice that is not offered cannot accidentally start anything.
+    for (resume, keys) in [(true, vec!['w']), (false, vec!['c', 'o'])] {
+        let mut steps = vec![
+            InterruptedSeamStep::RestoreCapability(true),
+            ch('I'),
+            ch('j'),
+            ch('s'),
+        ];
+        steps.extend(keys.into_iter().map(ch));
+        let (_, sent) = run(&list_for(resume), &steps);
+        assert!(
+            restore_actions(&sent).is_empty(),
+            "unoffered choice: {sent:?}"
+        );
+    }
+
+    for resume in [true, false] {
+        let (shown, sent) = run(
+            &list_for(resume),
+            &[
+                InterruptedSeamStep::RestoreCapability(false),
+                ch('I'),
+                ch('j'),
+                ch('s'),
+                ch('c'),
+                ch('o'),
+                ch('w'),
+            ],
+        );
+        assert!(
+            restore_actions(&sent).is_empty(),
+            "unsupported daemon: {sent:?}"
+        );
+        let said = shown.last().unwrap().to_lowercase();
+        assert!(
+            said.contains("daemon") && said.contains("restor") && said.contains("support"),
+            "the screen explains that the daemon cannot restore agents:\n{said}"
+        );
+    }
+}

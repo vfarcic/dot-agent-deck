@@ -1348,7 +1348,7 @@ pub const START_OVER_NEEDS_YES: &str =
 /// The restore surfaces are experimental and the flag is off.
 pub const RESTORE_NEEDS_EXPERIMENTAL: &str = "Restoring agents is experimental and turned off. Turn it on with `[features] experimental = true` in .dot-agent-deck.toml, or set DOT_AGENT_DECK_EXPERIMENTAL=1.";
 /// The running daemon does not advertise the restore verbs.
-pub const RESTORE_UNSUPPORTED: &str = "The running deck daemon cannot restore agents. Stop it with `dot-agent-deck daemon restart`, then start one from this build: open the TUI, or press Start daemon in the desktop app.";
+pub const RESTORE_UNSUPPORTED: &str = "The running deck daemon does not support restoring agents. Stop it with `dot-agent-deck daemon restart`, then start one from this build: open the TUI, or press Start daemon in the desktop app.";
 
 /// PRD #1790 stage 3: which note a restored agent receives first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -852,6 +852,20 @@ async fn start(
         pane_id: pane_id.clone(),
         role_name: None,
     };
+    // Every attached client is told of the new dashboard pane, titled with
+    // its name, as an attach start announces its pane (PRD #1223): a TUI that
+    // asked the restore question otherwise drew the agent only from its own
+    // hooks, under its agent type rather than its name. A start that is then
+    // not confirmed is closed through `close_started_agents`, which announces
+    // the removal.
+    if let Some(started_record) = daemon.registry.agent_record_any(&agent_id) {
+        crate::spawn::surface_attach_started_agent(
+            daemon.event_tx,
+            &started_record,
+            record.command.as_deref(),
+            Some(daemon.registry.inbox()),
+        );
+    }
 
     let (how, close, first) = match (&target.session, mode) {
         (Some(session), Some(mode)) => {

@@ -13847,6 +13847,96 @@ pub fn should_apply_snapshot(state: &AppState) -> bool {
     state.managed_pane_ids.is_empty()
 }
 
+/// PRD #1790 stage 3 (brief §11-Q1, option b; catalog `journal/restore/018`):
+/// whether the daemon-empty saved-workspace restore leaves `saved` for the
+/// restore question instead of starting its command again as a blank agent.
+/// True only with [`crate::features::show_agent_restore`] on, for a saved
+/// pane whose folder and exact command are those of a launch record that
+/// `interrupted` lists as an agent offered a resume, joined by both the
+/// item's work id and the agent's attempt. A Start-over or any other
+/// verdict, a different folder or command, or a record of another attempt
+/// or work starts the pane as before. It starts nothing and checks no
+/// process: the daemon's own checks run when the restore is asked for.
+///
+/// A presentation decision of the TUI's: no daemon logic reads the flag.
+pub fn should_defer_saved_agent_restore(
+    saved: &config::SavedPane,
+    interrupted: &crate::interrupted_work::InterruptedList,
+    launches: &[crate::launch_records::LaunchRecord],
+) -> bool {
+    if !crate::features::show_agent_restore() {
+        return false;
+    }
+    interrupted.items.iter().any(|item| {
+        item.agents.iter().any(|agent| {
+            agent.restore == crate::interrupted_work::RestoreVerdict::Resume
+                && launches.iter().any(|record| {
+                    record.work == item.id
+                        && record.attempt == agent.attempt
+                        && record.cwd.as_deref() == Some(saved.dir.as_str())
+                        && record.command.as_deref() == Some(saved.command.as_str())
+                })
+        })
+    })
+}
+
+/// The bound on the interrupted work list the saved-workspace restore asks
+/// for before it starts saved panes ([`saved_restore_deferral`]).
+const SAVED_RESTORE_LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// PRD #1790 stage 3: what [`should_defer_saved_agent_restore`] decides
+/// from — the attached daemon's interrupted work list and the launch records
+/// in this user's state directory — or `None` when no saved pane could be
+/// left for the restore question: the flag is off, no plain saved pane has a
+/// command, the daemon did not answer within its bound or cannot list
+/// interrupted work, or it offers no resume.
+///
+/// The launch records are read locally, but only a record whose work id and
+/// attempt are those of an item and agent this daemon listed can match: a
+/// work id carries the deck id of the state directory that minted it and 64
+/// random bits, so a record of another deck's (a remote daemon's) matches
+/// nothing.
+fn saved_restore_deferral(
+    saved: &config::SavedSession,
+) -> Option<(
+    crate::interrupted_work::InterruptedList,
+    Vec<crate::launch_records::LaunchRecord>,
+)> {
+    if !crate::features::show_agent_restore()
+        || !saved
+            .panes
+            .iter()
+            .any(|pane| pane.orchestration.is_none() && !pane.command.is_empty())
+    {
+        return None;
+    }
+    let handle = tokio::runtime::Handle::try_current().ok()?;
+    let client = crate::daemon_client::DaemonClient::new(
+        crate::endpoint_resolve::client_attach_socket_path(),
+    )
+    .with_protocol_gate();
+    let answered = handle.block_on(async {
+        tokio::time::timeout(
+            SAVED_RESTORE_LIST_TIMEOUT,
+            client.list_interrupted_work(false, None),
+        )
+        .await
+    });
+    let Ok(Ok(crate::daemon_client::GatedQuery::Answered(list))) = answered else {
+        return None;
+    };
+    let offers_resume = list.items.iter().any(|item| {
+        item.agents
+            .iter()
+            .any(|agent| agent.restore == crate::interrupted_work::RestoreVerdict::Resume)
+    });
+    if !offers_resume {
+        return None;
+    }
+    let launches = crate::launch_records::read_all(&config::state_dir()).ok()?;
+    Some((list, launches))
+}
+
 /// PRD #89 M2b.3 — rebuild one saved orchestration tab on the daemon-empty
 /// restore path: the orchestrator and role panes in saved order, the saved
 /// prompt replayed to the start role, the start cursor. Answers the tab's
@@ -15796,6 +15886,9 @@ pub fn run_tui(
         // into the unconditional read without entangling the gate. Two loads by
         // design; see the note at the top-of-function read.
         let saved = config::SavedSession::load();
+        // PRD #1790 stage 3: with restore on, a saved agent the daemon can
+        // resume is left for the restore question rather than started blank.
+        let restore_deferral = saved_restore_deferral(&saved);
         // PRD #89 M2b.3 — the first orchestration tab rebuilt from the snapshot,
         // so we can land on it (start cursor) after the loop rather than snapping
         // back to the dashboard — mirroring the hydration block's landing logic.
@@ -15900,6 +15993,11 @@ pub fn run_tui(
             if let Some(ref mode_name) = saved_pane.mode {
                 ui.session_warnings
                     .push(legacy_mode_restore_warning(&saved_pane.name, mode_name));
+            }
+            if let Some((interrupted, launches)) = &restore_deferral
+                && should_defer_saved_agent_restore(saved_pane, interrupted, launches)
+            {
+                continue;
             }
             let cmd = if saved_pane.command.is_empty() {
                 None
@@ -22376,10 +22474,11 @@ fn refuse_undrawn_choice(key: &KeyEvent, ui: &UiState) -> Option<Action> {
         }
         // PRD #1790 stage 2: reclaim's and dismiss all's `y` only once
         // flushed frames showed every row of the question, in one frame or
-        // over several as it was scrolled through.
+        // over several as it was scrolled through. Stage 3: so do the restore
+        // question's `c`, `o` and `w`.
         UiMode::InterruptedWork => {
             let refused = interrupted_work_view::asks(ui)
-                && matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y'))
+                && matches!(key.code, KeyCode::Char('y' | 'Y' | 'c' | 'o' | 'w'))
                 && !interrupted_work_view::question_shown(ui);
             return refused.then_some(Action::Continue);
         }
@@ -30554,6 +30653,15 @@ pub enum InterruptedSeamStep {
     /// The TUI's event stream attached to the daemon process of this name
     /// (the seam starts attached to [`INTERRUPTED_SEAM_FIRST_DAEMON`]).
     Attach(String),
+    /// PRD #1790 stage 3: the newest restore request answered this.
+    Restored(crate::interrupted_work::RestoreOutcome),
+    /// PRD #1790 stage 3: the newest start-over request answered this.
+    StartedOver(crate::interrupted_work::StartOverOutcome),
+    /// PRD #1790 stage 3: whether the attached daemon process advertises
+    /// [`crate::daemon_protocol::CAP_RESTORE_AGENTS`], as a list answer from
+    /// it says in production: what the TUI checks before it sends a restore
+    /// or start-over.
+    RestoreCapability(bool),
 }
 
 /// PRD #1790 stage 2 L1 seam: the daemon process the seam starts attached to.
@@ -30568,6 +30676,8 @@ pub enum InterruptedSeamKind {
     Show,
     Reclaim,
     Dismiss,
+    Restore,
+    StartOver,
 }
 
 /// PRD #1790 stage 2: a request the TUI sends the daemon about interrupted
@@ -30575,10 +30685,35 @@ pub enum InterruptedSeamKind {
 #[doc(hidden)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InterruptedSeamRequest {
-    List { git: bool },
-    Show { id: String, reports_from: usize },
-    Reclaim { id: String, dry_run: bool },
-    Dismiss { ids: Vec<String>, all: bool },
+    List {
+        git: bool,
+    },
+    Show {
+        id: String,
+        reports_from: usize,
+    },
+    Reclaim {
+        id: String,
+        dry_run: bool,
+    },
+    Dismiss {
+        ids: Vec<String>,
+        all: bool,
+    },
+    /// PRD #1790 stage 3: restore the item's agents `agents` (their
+    /// attempts) with their conversations; sent with no caller claim.
+    RestoreInterrupted {
+        id: String,
+        agents: Vec<String>,
+        mode: crate::interrupted_work::RestoreMode,
+        dry_run: bool,
+    },
+    /// PRD #1790 stage 3: start the item's agent `agent` over.
+    StartOverInterrupted {
+        id: String,
+        agent: String,
+        dry_run: bool,
+    },
 }
 
 impl InterruptedSeamRequest {
@@ -30588,6 +30723,8 @@ impl InterruptedSeamRequest {
             InterruptedSeamRequest::Show { .. } => InterruptedSeamKind::Show,
             InterruptedSeamRequest::Reclaim { .. } => InterruptedSeamKind::Reclaim,
             InterruptedSeamRequest::Dismiss { .. } => InterruptedSeamKind::Dismiss,
+            InterruptedSeamRequest::RestoreInterrupted { .. } => InterruptedSeamKind::Restore,
+            InterruptedSeamRequest::StartOverInterrupted { .. } => InterruptedSeamKind::StartOver,
         }
     }
 }
@@ -30794,6 +30931,9 @@ fn seam_interrupted_step(
         }
         InterruptedSeamStep::Attach(process) => {
             *attached = crate::daemon_client::Incarnation::from(Some(process.clone()));
+        }
+        InterruptedSeamStep::RestoreCapability(supported) => {
+            interrupted_work_view::learn_restore_capability(ui, *supported);
         }
         InterruptedSeamStep::AnswerTo(index, answer) => {
             if let Some(answer) = interrupted_work_view::seam_answer(ui, Some(*index), answer) {
