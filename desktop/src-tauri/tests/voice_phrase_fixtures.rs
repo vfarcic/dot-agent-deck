@@ -138,8 +138,10 @@ struct PhraseFixture {
     #[serde(default)]
     names_unavailable_deck: bool,
     /// Whether the New agent dialog's directory browser is showing the
-    /// planted listing for this fixture (PRD #1223). Absent means the dialog
-    /// is closed, which is every fixture that predates the directory rows.
+    /// planted listing for this fixture (PRD #1223). Implies the dialog is
+    /// open, and it is declared open (with no live form), as the app declares
+    /// it. Absent means the dialog is closed, which is every fixture that
+    /// predates the directory rows.
     #[serde(default)]
     listing: bool,
     /// The planted listing plus two children named like instructions to the
@@ -440,9 +442,13 @@ fn offered_values(outcome: &VoiceOutcome) -> Option<Vec<String>> {
 /// keyed API backend with the deck shown or hidden as each fixture specifies.
 #[tokio::test]
 // Quarantined (CLAUDE.md rule 6), owner vfarcic; local-only, never in CI. It
-// was red on every one of five full runs on 2026-11-19, not intermittently:
-// some phrases are misread most of the time (rates on #2138), so it stays
-// ignored until those are fixed and the rest is deterministic enough.
+// was red on every one of five full runs on 2026-11-19 and on all four on
+// 2026-11-21, not intermittently: some phrases are still misread most of the
+// time — `choose-deck-over-a-live-form`, `open-dir-transcribed-dots`,
+// `dictate-a-submit-word-in-passing-finished` and
+// `dismiss-antigravity-notice-by-its-label` each failed in at least three of
+// those four (rates on #2138) — so it stays ignored until those are fixed and
+// the rest is deterministic enough.
 #[ignore = "quarantined: vfarcic, #2138"]
 async fn voice_desktop_phrases_001_phrase_fixtures_match_the_default_backend() {
     run_fixtures(manifest()).await;
@@ -453,8 +459,9 @@ async fn voice_desktop_phrases_001_phrase_fixtures_match_the_default_backend() {
 /// and hostile observed names must never cause an unasked action to run.
 #[tokio::test]
 // Quarantined (CLAUDE.md rule 6), owner vfarcic; local-only, never in CI. It
-// fails intermittently from live-model variance: 5 of 8 full runs were green
-// on 2026-11-19, each red one a different single fixture (rates on #2138).
+// was green in 5 of 8 full runs on 2026-11-19 and in none of 4 on 2026-11-21:
+// `paraphrase-start-new-agent-begin` ("begin execution") was answered `none`
+// in all four, which is a misread, not variance (rates on #2138).
 #[ignore = "quarantined: vfarcic, #2138"]
 async fn voice_desktop_phrases_002_paraphrase_fixtures_match_the_default_backend() {
     run_fixtures(paraphrase_manifest()).await;
@@ -1785,9 +1792,15 @@ async fn run_fixtures(fixtures: FixtureManifest) {
             fixture.listing.then_some(&directories)
         };
         let dialog_only = VoiceNewAgent { form: None };
+        // A listing is the dialog's own browser, so it is declared with the
+        // dialog, as `NewAgentDialog.tsx` declares it: `newAgent` whenever
+        // the dialog is mounted, `directories` beside it while a listing
+        // shows. Declared without it (until issue #2138), `open_new_agent`
+        // was callable over the listing — a state the app cannot produce —
+        // and "browse docs" opened the dialog in 8 of 20 runs.
         let fixture_new_agent = if fixture.form {
             Some(&new_agent_form)
-        } else if fixture.dialog {
+        } else if fixture.dialog || fixture.listing || fixture.hostile_listing {
             Some(&dialog_only)
         } else {
             None

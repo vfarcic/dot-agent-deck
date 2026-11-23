@@ -3321,6 +3321,17 @@ pub enum BroadcastMsg {
     /// [`crate::daemon_protocol::CAP_TRUST_REQUESTS`].
     #[serde(rename = "trust_requests")]
     TrustRequests(crate::daemon_protocol::TrustRequestList),
+    /// Issue #1965: an orchestration role's agent exited on its own, and this
+    /// is how its pane ended and what it last showed. Sent once per exited
+    /// generation, when its pane's reader has settled it, so a client can
+    /// show which role died and why without waiting for its next listing.
+    /// `ListAgents`' `ended_roles` carries the same record for a client that
+    /// connects later.
+    ///
+    /// Additive, so no `PROTOCOL_VERSION` bump: a client predating it reads the
+    /// tag as [`Self::Unknown`] and the stream survives.
+    #[serde(rename = "role_ended")]
+    RoleEnded(crate::ended_role::EndedRole),
     /// A `kind` tag this build has never heard of (issue #801 item 3, applied
     /// by PRD #741 M8).
     ///

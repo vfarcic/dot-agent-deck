@@ -1138,6 +1138,11 @@ pub struct AgentListing {
     /// client may read it — and, in particular, that it is comparable only
     /// against earlier values from the same connection.
     pub schedule_revision: Option<u64>,
+    /// Issue #1965: the orchestration roles whose agent exited and whose pane
+    /// is still open, sanitised at the wire boundary
+    /// ([`crate::ended_role::EndedRole::sanitized`]). Empty from a daemon that
+    /// does not report them.
+    pub ended_roles: Vec<crate::ended_role::EndedRole>,
     /// PRD #1666 part 2 (G-fix4): the daemon process that answered, from the
     /// `Hello` on the listing's own connection — what a client binds an action
     /// on one of these records to ([`DaemonClient::bound_to`]). `None` from an
@@ -1542,6 +1547,39 @@ pub enum GatedQuery<T> {
     /// The daemon does not advertise the verb — including a daemon that
     /// advertises no capabilities at all — so the request was never sent.
     Unsupported,
+}
+
+/// Issue #2418: the agent cards a daemon listed, and whether it builds the
+/// card tree.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentCardsAnswer {
+    pub list: crate::agent_cards::AgentCardList,
+    /// The daemon advertised [`crate::daemon_protocol::CAP_AGENT_CARDS_TREE`]:
+    /// each entry's `parent`, `rollup` and `checked_refs` are its own, and
+    /// the list is in the tree's order. `false` for an older daemon, whose
+    /// cards a client draws as roots with no roll-up.
+    pub tree: bool,
+}
+
+/// Issue #2418: the client side of the tree's gate. Against a daemon whose
+/// `capabilities` do not name [`crate::daemon_protocol::CAP_AGENT_CARDS_TREE`],
+/// any `parent`, `kind`, `rollup` or `checked_refs` an entry carries is dropped
+/// rather than drawn: those names mean the tree only from a daemon that says
+/// it builds one.
+pub fn tree_gate(
+    mut list: crate::agent_cards::AgentCardList,
+    capabilities: &DaemonCapabilities,
+) -> AgentCardsAnswer {
+    let tree = capabilities.supports(crate::daemon_protocol::CAP_AGENT_CARDS_TREE);
+    if !tree {
+        for entry in &mut list.entries {
+            entry.parent = None;
+            entry.kind = None;
+            entry.rollup = None;
+            entry.checked_refs.clear();
+        }
+    }
+    AgentCardsAnswer { list, tree }
 }
 
 /// PRD #1790 stage 2 (verification finding A): an interrupted work request a
@@ -2147,6 +2185,12 @@ impl DaemonClient {
             ));
         }
         let schedule_revision = resp.schedule_revision;
+        let ended_roles: Vec<crate::ended_role::EndedRole> = resp
+            .ended_roles
+            .unwrap_or_default()
+            .into_iter()
+            .map(crate::ended_role::EndedRole::sanitized)
+            .collect();
         if let Some(mut records) = resp.agent_records {
             for rec in &mut records {
                 sanitize_record_tab_membership(rec);
@@ -2154,6 +2198,7 @@ impl DaemonClient {
             return Ok(AgentListing {
                 records,
                 schedule_revision,
+                ended_roles,
                 incarnation,
             });
         }
@@ -2194,6 +2239,7 @@ impl DaemonClient {
                 })
                 .collect(),
             schedule_revision,
+            ended_roles,
             incarnation,
         })
     }
@@ -4284,20 +4330,35 @@ impl DaemonClient {
     /// [`crate::daemon_protocol::CAP_HELLO_FOLLOW_ON`], left open for one card
     /// request, or `None` when the daemon advertises either not — and then
     /// nothing follows the `Hello`. On a gated or bound handle the `Hello` is
-    /// the handle's own protocol check.
+    /// the handle's own protocol check. Also answers what that `Hello`
+    /// advertised.
     async fn agent_cards_connection(
         &self,
-    ) -> Result<Option<(TransportReadHalf, TransportWriteHalf)>, ClientError> {
+    ) -> Result<Option<(TransportReadHalf, TransportWriteHalf, DaemonCapabilities)>, ClientError>
+    {
+        self.follow_on_connection(crate::daemon_protocol::CAP_AGENT_CARDS)
+            .await
+    }
+
+    /// A connection whose own `Hello` advertised `capability` and
+    /// [`crate::daemon_protocol::CAP_HELLO_FOLLOW_ON`], left open for one
+    /// request, or `None` when the daemon advertises either not — and then
+    /// nothing follows the `Hello` ([`Self::agent_cards_connection`]). Also
+    /// answers what that `Hello` advertised.
+    async fn follow_on_connection(
+        &self,
+        capability: &str,
+    ) -> Result<Option<(TransportReadHalf, TransportWriteHalf, DaemonCapabilities)>, ClientError>
+    {
         let supported = |caps: &DaemonCapabilities| {
-            caps.supports(crate::daemon_protocol::CAP_AGENT_CARDS)
-                && caps.supports(crate::daemon_protocol::CAP_HELLO_FOLLOW_ON)
+            caps.supports(capability) && caps.supports(crate::daemon_protocol::CAP_HELLO_FOLLOW_ON)
         };
         if self.protocol_gate || self.bound.is_some() {
             if !supported(&self.capabilities().await?) {
                 return Ok(None);
             }
             let (rd, wr, caps, _) = self.protocol_hello(true).await?;
-            return Ok(supported(&caps).then_some((rd, wr)));
+            return Ok(supported(&caps).then_some((rd, wr, caps)));
         }
         let (mut rd, mut wr) = self.connect().await?;
         let hello = issue_command(
@@ -4318,7 +4379,7 @@ impl DaemonClient {
             ));
         }
         let caps = DaemonCapabilities::from_hello(&hello);
-        Ok(supported(&caps).then_some((rd, wr)))
+        Ok(supported(&caps).then_some((rd, wr, caps)))
     }
 
     /// PRD #2374: every live agent card, as the daemon computed it, in
@@ -4328,7 +4389,19 @@ impl DaemonClient {
     pub async fn list_agent_cards(
         &self,
     ) -> Result<GatedQuery<crate::agent_cards::AgentCardList>, ClientError> {
-        let Some((mut rd, mut wr)) = self.agent_cards_connection().await? else {
+        Ok(match self.list_agent_cards_tree().await? {
+            GatedQuery::Answered(cards) => GatedQuery::Answered(cards.list),
+            GatedQuery::Unsupported => GatedQuery::Unsupported,
+        })
+    }
+
+    /// Issue #2418: [`Self::list_agent_cards`], with whether the daemon
+    /// builds the card tree ([`crate::daemon_protocol::CAP_AGENT_CARDS_TREE`],
+    /// read from the `Hello` on the list's own connection). Gated by
+    /// [`tree_gate`], so a daemon that does not advertise the tree hands the
+    /// caller no tree fields to draw from.
+    pub async fn list_agent_cards_tree(&self) -> Result<GatedQuery<AgentCardsAnswer>, ClientError> {
+        let Some((mut rd, mut wr, caps)) = self.agent_cards_connection().await? else {
             return Ok(GatedQuery::Unsupported);
         };
         let resp = issue_command(&mut rd, &mut wr, &AttachRequest::ListAgentCards).await?;
@@ -4339,8 +4412,43 @@ impl DaemonClient {
             ));
         }
         resp.agent_cards
-            .map(GatedQuery::Answered)
+            .map(|list| GatedQuery::Answered(tree_gate(list, &caps)))
             .ok_or_else(|| ClientError::Malformed("list-agent-cards answered no cards".into()))
+    }
+
+    /// Issue #2454: tell the daemon the user opened the agent in `pane_id`
+    /// (`agent_id` naming the generation shown, when known), which deals with
+    /// the reason its card report raised. **Withheld unless the daemon's
+    /// `Hello` on the same connection advertised
+    /// [`crate::daemon_protocol::CAP_AGENT_OPENED`]**, answering
+    /// [`GatedQuery::Unsupported`] without sending anything: an older daemon's
+    /// cards keep the reason until the agent publishes again.
+    pub async fn agent_opened(
+        &self,
+        pane_id: &str,
+        agent_id: Option<&str>,
+    ) -> Result<GatedQuery<()>, ClientError> {
+        let Some((mut rd, mut wr, _)) = self
+            .follow_on_connection(crate::daemon_protocol::CAP_AGENT_OPENED)
+            .await?
+        else {
+            return Ok(GatedQuery::Unsupported);
+        };
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::AgentOpened {
+                pane_id: pane_id.to_string(),
+                agent_id: agent_id.map(str::to_string),
+            },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error.unwrap_or_else(|| "agent-opened failed".into()),
+            ));
+        }
+        Ok(GatedQuery::Answered(()))
     }
 
     /// PRD #2374: the resolved agent-card catalog. Withheld like
@@ -4348,7 +4456,7 @@ impl DaemonClient {
     pub async fn agent_card_catalog(
         &self,
     ) -> Result<GatedQuery<crate::card_catalog::ResolvedCatalog>, ClientError> {
-        let Some((mut rd, mut wr)) = self.agent_cards_connection().await? else {
+        let Some((mut rd, mut wr, _)) = self.agent_cards_connection().await? else {
             return Ok(GatedQuery::Unsupported);
         };
         let resp = issue_command(&mut rd, &mut wr, &AttachRequest::AgentCardCatalog).await?;
@@ -4382,7 +4490,7 @@ impl DaemonClient {
         text: Option<&str>,
     ) -> Result<GatedQuery<crate::agent_cards::CardActionResult>, ClientError> {
         let bound = self.bound_to(Incarnation::from(Some(target.instance_id.clone())));
-        let Some((mut rd, mut wr)) = bound.agent_cards_connection().await? else {
+        let Some((mut rd, mut wr, _)) = bound.agent_cards_connection().await? else {
             return Ok(GatedQuery::Unsupported);
         };
         let resp = issue_command(
@@ -5151,6 +5259,12 @@ impl EventSubscription {
                         // `trust_requests_of` does for `Hello`.
                         Ok(BroadcastMsg::TrustRequests(list)) => {
                             return Ok(Some(BroadcastMsg::TrustRequests(list.sanitized())));
+                        }
+                        // Issue #1965: an exited role carries the pane's last
+                        // output, which is untrusted text bound for a card;
+                        // sanitised here, as `list_agents_detailed` does.
+                        Ok(BroadcastMsg::RoleEnded(role)) => {
+                            return Ok(Some(BroadcastMsg::RoleEnded(role.sanitized())));
                         }
                         Ok(msg) => return Ok(Some(msg)),
                         Err(e) => {
@@ -7170,6 +7284,125 @@ mod tests {
         });
     }
 
+    /// Issue #2418 (T8) — the daemon advertises `agent-cards-tree` beside
+    /// `agent-cards`, and a client reads the tree only from a daemon whose
+    /// `Hello` on the list's own connection named it: against one that
+    /// lists cards but does not, the list is answered and is not a tree.
+    #[cfg(unix)]
+    #[test]
+    fn the_card_tree_is_read_only_from_a_daemon_that_advertises_it() {
+        use crate::daemon_protocol::{
+            CAP_AGENT_CARDS, CAP_AGENT_CARDS_TREE, CAP_HELLO_FOLLOW_ON, DAEMON_CAPABILITIES,
+        };
+        assert!(DAEMON_CAPABILITIES.contains(&CAP_AGENT_CARDS));
+        assert!(DAEMON_CAPABILITIES.contains(&CAP_AGENT_CARDS_TREE));
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        runtime.block_on(async {
+            let cards = Some(&[CAP_AGENT_CARDS, CAP_HELLO_FOLLOW_ON][..]);
+            assert_eq!(agent_card_request_inner(cards, 0).await, (true, 1));
+            assert_eq!(
+                agent_card_request_inner(cards, 3).await,
+                (false, 1),
+                "listed, but not a tree"
+            );
+            let tree = Some(&[CAP_AGENT_CARDS, CAP_HELLO_FOLLOW_ON, CAP_AGENT_CARDS_TREE][..]);
+            assert_eq!(agent_card_request_inner(tree, 3).await, (true, 1));
+            // The tree capability alone lists nothing.
+            let alone = Some(&[CAP_AGENT_CARDS_TREE, CAP_HELLO_FOLLOW_ON][..]);
+            assert_eq!(agent_card_request_inner(alone, 3).await, (false, 0));
+        });
+    }
+
+    /// Issue #2418 (T8) — [`tree_gate`] keeps the tree fields from a daemon
+    /// that advertises the tree and drops them from one that does not, so a
+    /// client never draws a parent or roll-up the daemon did not vouch for.
+    #[test]
+    fn the_tree_gate_drops_tree_fields_a_daemon_did_not_advertise() {
+        use crate::daemon_protocol::{CAP_AGENT_CARDS, CAP_AGENT_CARDS_TREE};
+        let entry: crate::agent_cards::AgentCardEntry = serde_json::from_value(serde_json::json!({
+            "key": "p/2", "instance_id": "i", "pane_id": "p", "agent_id": "2",
+            "name": "coder", "status": "working", "needs_you": false,
+            "needs_you_reasons": [],
+            "group": {"id": "standalone", "kind": "standalone"},
+            "primary_action_id": "open",
+            "facts": {"source": "deck"},
+            "parent": "d/1",
+            "rollup": {"total": 1, "worst": "idle", "counts": {"idle": 1}, "needs_you": 0},
+            "checked_refs": [{"field": "pull-request", "kind": "pull_request", "claim": "#3",
+                              "result": {"status": "pending"}}],
+            "revision": 1, "updated_at": "2026-11-20T10:00:00Z",
+        }))
+        .expect("an entry with the tree fields decodes");
+        let list = crate::agent_cards::AgentCardList {
+            instance_id: "i".into(),
+            revision: 1,
+            entries: vec![entry],
+            catalog_errors: Vec::new(),
+        };
+        let caps = |list: &[&str]| {
+            DaemonCapabilities::from_hello(&AttachResponse {
+                capabilities: Some(list.iter().map(|c| c.to_string()).collect()),
+                ..AttachResponse::hello(PROTOCOL_VERSION)
+            })
+        };
+        let kept = tree_gate(
+            list.clone(),
+            &caps(&[CAP_AGENT_CARDS, CAP_AGENT_CARDS_TREE]),
+        );
+        assert!(kept.tree);
+        assert_eq!(kept.list, list);
+        let dropped = tree_gate(list.clone(), &caps(&[CAP_AGENT_CARDS]));
+        assert!(!dropped.tree);
+        let e = &dropped.list.entries[0];
+        assert!(e.parent.is_none() && e.rollup.is_none() && e.checked_refs.is_empty());
+        assert_eq!(e.status, "working", "the rest of the entry is untouched");
+        let older = tree_gate(list, &DaemonCapabilities::absent());
+        assert!(!older.tree);
+    }
+
+    /// Issue #2418 review (desktop 6) — a card's `kind` is a tree field like
+    /// `parent`: [`tree_gate`] keeps it from a daemon that advertises the tree
+    /// and drops it from one that does not.
+    #[test]
+    fn the_tree_gate_drops_a_kind_the_daemon_did_not_advertise() {
+        use crate::daemon_protocol::{CAP_AGENT_CARDS, CAP_AGENT_CARDS_TREE};
+        let entry: crate::agent_cards::AgentCardEntry = serde_json::from_value(serde_json::json!({
+            "key": "d/1", "instance_id": "i", "pane_id": "d", "agent_id": "1",
+            "name": "dispatcher", "status": "idle", "needs_you": false,
+            "needs_you_reasons": [],
+            "group": {"id": "dispatcher:d/1", "kind": "dispatcher"},
+            "primary_action_id": "open",
+            "facts": {"source": "deck"},
+            "kind": "dispatcher",
+            "revision": 1, "updated_at": "2026-11-20T10:00:00Z",
+        }))
+        .expect("an entry with a kind decodes");
+        assert_eq!(entry.kind.as_deref(), Some("dispatcher"));
+        let list = crate::agent_cards::AgentCardList {
+            instance_id: "i".into(),
+            revision: 1,
+            entries: vec![entry],
+            catalog_errors: Vec::new(),
+        };
+        let caps = |list: &[&str]| {
+            DaemonCapabilities::from_hello(&AttachResponse {
+                capabilities: Some(list.iter().map(|c| c.to_string()).collect()),
+                ..AttachResponse::hello(PROTOCOL_VERSION)
+            })
+        };
+        let kept = tree_gate(
+            list.clone(),
+            &caps(&[CAP_AGENT_CARDS, CAP_AGENT_CARDS_TREE]),
+        );
+        assert_eq!(kept.list.entries[0].kind.as_deref(), Some("dispatcher"));
+        let dropped = tree_gate(list, &caps(&[CAP_AGENT_CARDS]));
+        assert!(dropped.list.entries[0].kind.is_none());
+    }
+
     /// PRD #2374 (review B3) — `invoke_card_action` binds itself to the
     /// daemon process that listed the card: against a daemon whose `Hello`
     /// names another process, nothing follows the `Hello` and the call fails
@@ -7286,6 +7519,11 @@ mod tests {
         let client = DaemonClient::new(path);
         let answered = match method {
             0 => matches!(client.list_agent_cards().await, Ok(GatedQuery::Answered(_))),
+            // Issue #2418: answered AND read as a tree.
+            3 => matches!(
+                client.list_agent_cards_tree().await,
+                Ok(GatedQuery::Answered(AgentCardsAnswer { tree: true, .. }))
+            ),
             1 => matches!(
                 client.agent_card_catalog().await,
                 Ok(GatedQuery::Answered(_))

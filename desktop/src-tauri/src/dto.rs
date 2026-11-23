@@ -155,6 +155,51 @@ pub struct DesktopSnapshot {
     /// [`HostMetricsReportDto::NotAvailable`], never absent and never zeros.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_metrics: Option<HostMetricsReportDto>,
+    /// Issue #1965: the orchestration roles whose agent exited and whose pane
+    /// nobody closed yet, from the same `ListAgents` reply as [`Self::agents`]
+    /// (which no longer lists them). Empty from a daemon that does not report
+    /// them, and on every path that issued no `ListAgents`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ended_roles: Vec<DesktopEndedRole>,
+}
+
+/// Issue #1965: one orchestration role whose agent exited, as the overview
+/// draws it: which role, why, and the last lines its pane showed. `reason` and
+/// `headline` are the daemon crate's own words
+/// ([`dot_agent_deck::ended_role::EndedRole::reason`]), so the desktop and the
+/// TUI cannot say it differently.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopEndedRole {
+    pub pane_id: String,
+    pub agent_id: String,
+    pub role_index: usize,
+    pub role_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orchestration_id: Option<String>,
+    pub orchestration_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_title: Option<String>,
+    pub reason: String,
+    pub headline: String,
+    pub last_output: Vec<String>,
+}
+
+impl From<dot_agent_deck::ended_role::EndedRole> for DesktopEndedRole {
+    fn from(ended: dot_agent_deck::ended_role::EndedRole) -> Self {
+        Self {
+            reason: ended.reason(),
+            headline: ended.headline(),
+            pane_id: ended.pane_id,
+            agent_id: ended.agent_id,
+            role_index: ended.role_index,
+            role_name: ended.role_name,
+            orchestration_id: ended.orchestration_id,
+            orchestration_name: ended.orchestration_name,
+            display_title: ended.display_title,
+            last_output: ended.last_output,
+        }
+    }
 }
 
 /// PRD #1258 M4: a deck's host sample as the webview reads it.
@@ -3546,6 +3591,7 @@ pub(crate) fn disconnected_snapshot(
         all_decks: all_decks_applied(),
         // Nothing answered, so nothing was asked.
         host_metrics: None,
+        ended_roles: Vec::new(),
     }
 }
 

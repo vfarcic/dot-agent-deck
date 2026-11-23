@@ -2254,6 +2254,40 @@ screen = "deck"
 action = "generate_config"
 outcome = "unavailable"
 
+# Issue #2148: Retry and Cancel on a deck message waiting on the user, by the
+# agent it was sent to, on the Daemons screen where the tiles list them. Each
+# opens a confirmation; the dashboard draws no deck message.
+[[fixtures]]
+name = "retry-inbox-message-to-the-tester"
+utterance = "retry the message to the tester"
+screen = "deck"
+action = "retry_inbox_message"
+outcome = "dispatch"
+resolved_agent = "agent-tester"
+
+[[fixtures]]
+name = "retry-inbox-message-resend"
+utterance = "resend the tester's deck message"
+screen = "deck"
+action = "retry_inbox_message"
+outcome = "dispatch"
+resolved_agent = "agent-tester"
+
+[[fixtures]]
+name = "cancel-inbox-message-to-the-tester"
+utterance = "cancel the message to the tester"
+screen = "deck"
+action = "cancel_inbox_message"
+outcome = "dispatch"
+resolved_agent = "agent-tester"
+
+[[fixtures]]
+name = "cancel-inbox-message-unavailable"
+utterance = "cancel the message to the tester"
+screen = "overview"
+action = "cancel_inbox_message"
+outcome = "unavailable"
+
 [[fixtures]]
 name = "close-orchestration"
 utterance = "close the build orchestration"

@@ -698,7 +698,7 @@ const PINNED_TS_FIELDS: [(&str, &str, &str); 33] = [
 /// the role-order key moved to `ORCHESTRATION_STORAGE_KEY`. The old one stays
 /// pinned as `LEGACY_WORKFLOW_STORAGE_KEY` because `App.tsx` still reads it once,
 /// to migrate a saved order, and then removes it.
-const PINNED_STORAGE_KEYS: [(&str, &str, bool); 8] = [
+const PINNED_STORAGE_KEYS: [(&str, &str, bool); 9] = [
     (
         "FIXTURE_SETTINGS_KEY",
         "dot-agent-deck.desktop-settings",
@@ -753,6 +753,12 @@ const PINNED_STORAGE_KEYS: [(&str, &str, bool); 8] = [
         "dot-agent-deck.overview.mode",
         false,
     ),
+    // Issue #2418 — which cards' trees are open in the Cards view, per window,
+    // mirroring the mode key above: it describes this display and holds the
+    // cards' identities (a deck's opaque token, a daemon instance id and a card
+    // key of pane and agent ids), no credential and no project content. Keys
+    // of cards their daemon no longer lists are pruned.
+    ("CARDS_OPEN_STORAGE_KEY", "dot-agent-deck.cards.open", false),
 ];
 
 /// The namespace every stored key shares, used to find a literal that looks

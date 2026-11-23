@@ -1,4 +1,4 @@
-import { createFixtureFleet, docsAgentCards, DOCS_TRUST_ORCHESTRATION, DOCS_TRUST_REMOVED_ROLES, DOCS_TRUST_ROLES, createFixtureStartedAgent, FIXTURE_RESTART_AFTER_MS, restartedFixtureSnapshot, DEFAULT_PROFILES, FIXTURE_APP_VERSION, FIXTURE_DAEMON_VERSION, FIXTURE_UPGRADE_STEP_MS, FIXTURE_DEFAULT_COMMANDS, FIXTURE_EXPERIMENTAL_DECKS, FIXTURE_HOMES, fixtureAgentRegistry, fixtureDirectoryTree, fixtureProjectOrchestrations, FIXTURE_ROLE_COMMANDS, fixtureVoiceCommands, nextFixtureAgentId, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureQuestion, resolveFixtureVoice, type FixtureState } from "../data/fixture";
+import { createFixtureFleet, docsAgentCards, treeAgentCards, DOCS_TRUST_ORCHESTRATION, DOCS_TRUST_REMOVED_ROLES, DOCS_TRUST_ROLES, createFixtureStartedAgent, FIXTURE_RESTART_AFTER_MS, restartedFixtureSnapshot, DEFAULT_PROFILES, FIXTURE_APP_VERSION, FIXTURE_DAEMON_VERSION, FIXTURE_UPGRADE_STEP_MS, FIXTURE_DEFAULT_COMMANDS, FIXTURE_EXPERIMENTAL_DECKS, FIXTURE_HOMES, fixtureAgentRegistry, fixtureDirectoryTree, fixtureProjectOrchestrations, FIXTURE_ROLE_COMMANDS, fixtureVoiceCommands, nextFixtureAgentId, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureQuestion, resolveFixtureVoice, type FixtureState } from "../data/fixture";
 import { voicePagesDirectory, voicePagesOrchestrations } from "../data/fixtureCrowded";
 import { actionErrorFrom, LaunchCleanupError, startDaemonErrorFrom } from "./actionError";
 import { PartialSettingsSaveError, partialSettingsSave } from "./settingsError";
@@ -27,6 +27,7 @@ import { NOTICE_THANKS, noticeStartFrom, type NoticeChoice, type NoticeStart } f
 import { DEFAULT_DESKTOP_FEATURES, UNREPORTED } from "../types";
 import type { HandoffEdge,
   AgentBackground,
+  EndedRole,
   AgentBlocked,
   AgentInbox,
   HookBinaryNotice,
@@ -259,6 +260,8 @@ export interface DesktopSnapshotDto {
    * connected deck is kept.
    */
   hostMetrics?: HostMetricsReport;
+  /** Issue #1965 — see `DeckSnapshot.endedRoles`. Absent when there are none. */
+  endedRoles?: EndedRole[];
 }
 
 /** One configured-but-unaddressed deck (PRD #742 M12). */
@@ -2474,6 +2477,14 @@ export interface DeckBridge {
    */
   generateConfig?(deckId: string, agentId: string, paneId: string, incarnation?: string): Promise<GenerateConfigResult>;
   /**
+   * Issue #2454 — tell the daemon that owns the agent that the user opened it
+   * (`desktop_agent_opened`), which clears the "Needs you" its card report
+   * raised (waiting, done or failed). Best effort, bound to the daemon process
+   * that listed the agent. Optional: a bridge without it (the browser preview)
+   * sends nothing.
+   */
+  agentOpened?(deckId: string, agentId: string, paneId: string, incarnation?: string): Promise<void>;
+  /**
    * PRD #2374 — tell the app's backend that this webview consumes agent cards
    * (`agent_cards_consume`), called once, by the surface that renders them.
    * Until it is called the backend subscribes to no card doorbell,
@@ -2544,6 +2555,7 @@ export function normalizeAgentCards(value: unknown): AgentCardsSnapshot | null {
     revision: typeof record.revision === "number" ? record.revision : 0,
     entries: record.entries as AgentCardEntry[],
     catalogErrors: Array.isArray(record.catalogErrors) ? record.catalogErrors.filter((e): e is string => typeof e === "string") : [],
+    tree: record.tree === true,
   };
 }
 
@@ -3255,6 +3267,8 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
     // PRD #1258 M4: a connected deck keeps its last host answer through a
     // snapshot that carries none; a deck that is not connected shows none.
     ...(hostMetrics === undefined ? {} : { hostMetrics }),
+    // Issue #1965: only a connected deck's reply says which roles exited.
+    ...(dto.connection.status === "connected" && dto.endedRoles?.length ? { endedRoles: dto.endedRoles } : {}),
     connection: {
       status: dto.connection.status === "incompatible" ? "error" : dto.connection.status,
       deckId: dto.connection.deckId,
@@ -3334,18 +3348,41 @@ class FixtureDeckBridge implements DeckBridge {
   /**
    * PRD #2374 — the `agent-cards` docs scene's card list: served only for
    * `/?fixture=1&state=docs&cards=1`, so no other fixture scene shows cards,
-   * needs-you bells or row menus. Every other deck and scene answers as a
-   * daemon without cards does.
+   * needs-you bells or row menus; issue #2418's tree scene, with eight roots
+   * and their trees, for `cards=tree`. Every other deck and scene answers as
+   * a daemon without cards does.
    */
   async agentCards(deckId: string): Promise<AgentCardsSnapshot | null> {
-    const params = new URLSearchParams(window.location.search);
-    if (this.fixtureState !== "docs" || params.get("cards") !== "1") return null;
-    const cards = docsAgentCards();
-    return cards.deckId === deckId ? cards : null;
+    const cards = this.sceneCards();
+    return cards && cards.deckId === deckId ? cards : null;
   }
-  /** The preview's cards never change, so there is nothing to push. */
-  async subscribeAgentCards(): Promise<Unsubscribe> {
-    return () => undefined;
+  /**
+   * The docs and tree scenes' cards, as last pushed. Issue #2418 review: the
+   * tree scenes (`cards=tree`, `cards=tree-nested`) let a browser test push a
+   * changed list through `window.__dadFixtureCards`, so it can watch the view
+   * follow a live update; the preview itself never changes them.
+   */
+  private treeCards?: AgentCardsSnapshot;
+  private cardListeners = new Set<(snapshot: AgentCardsSnapshot) => void>();
+  private sceneCards(): AgentCardsSnapshot | null {
+    const scene = new URLSearchParams(window.location.search).get("cards");
+    if (this.fixtureState !== "docs") return null;
+    if (scene === "1") return docsAgentCards();
+    if (scene !== "tree" && scene !== "tree-nested") return null;
+    if (!this.treeCards) {
+      this.treeCards = treeAgentCards(scene);
+      const push = (next: AgentCardsSnapshot) => {
+        this.treeCards = next;
+        for (const listener of this.cardListeners) listener(next);
+      };
+      (window as Window & { __dadFixtureCards?: unknown }).__dadFixtureCards = { snapshot: () => structuredClone(this.treeCards), push };
+    }
+    return this.treeCards;
+  }
+  async subscribeAgentCards(listener: (snapshot: AgentCardsSnapshot) => void): Promise<Unsubscribe> {
+    this.sceneCards();
+    this.cardListeners.add(listener);
+    return () => { this.cardListeners.delete(listener); };
   }
   /**
    * PRD #1790 stage 2 — the preview's interrupted work, served only with
@@ -6170,6 +6207,12 @@ export class TauriDeckBridge implements DeckBridge {
   async generateConfig(deckId: string, agentId: string, paneId: string, incarnation?: string): Promise<GenerateConfigResult> {
     const invoke = await this.getInvoke();
     return invoke<GenerateConfigResult>("desktop_generate_config", { deckId, agentId, paneId, incarnation: incarnation ?? null });
+  }
+
+  /** Issue #2454: the deck, pane, agent and process of the agent the user opened. */
+  async agentOpened(deckId: string, agentId: string, paneId: string, incarnation?: string): Promise<void> {
+    const invoke = await this.getInvoke();
+    await invoke<null>("desktop_agent_opened", { deckId, agentId, paneId, incarnation: incarnation ?? null });
   }
 
   async consumeAgentCards(): Promise<void> {

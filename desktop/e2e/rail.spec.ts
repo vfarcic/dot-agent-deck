@@ -1,5 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
-import { enterDeck, selectOverview } from "./support/overview";
+import { enterDeck, selectOverview, ROW_EDGE } from "./support/overview";
 
 /** The navigation rail as a user sees it in the built browser app. */
 function rail(page: Page) {
@@ -40,7 +40,7 @@ test.describe("desktop navigation rail", () => {
     await expect(rail(page).locator("nav button")).toHaveText(entries);
     await expect(rail(page).locator("[aria-current='page']")).toHaveText("Dashboard");
 
-    await page.getByRole("button", { name: "Open Plan / architecture agent" }).click();
+    await page.getByRole("row", { name: "Open Plan / architecture agent" }).click({ position: ROW_EDGE });
     await expect(page.getByTestId("agent-pane-overlay")).toBeVisible();
     await expect(rail(page)).toHaveCount(1);
     await expect(rail(page).locator("nav button")).toHaveText(entries);
@@ -83,7 +83,7 @@ test.describe("desktop navigation rail", () => {
   test("returns from an agent pane to the overview with experimental off", async ({ page }) => {
     await page.goto("/?fixture=1&state=connected");
     await expect(page.getByTestId("overview-table-region")).toBeVisible();
-    await page.getByRole("button", { name: "Open Plan / architecture agent" }).click();
+    await page.getByRole("row", { name: "Open Plan / architecture agent" }).click({ position: ROW_EDGE });
     await expect(page.getByTestId("agent-pane-overlay")).toBeVisible();
     await page.keyboard.press("Escape");
     await expect(page.getByTestId("agent-pane-overlay")).toHaveCount(0);

@@ -39,7 +39,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use dot_agent_deck::self_upgrade::{
     CopyKind, Host, Installation, OtherCopy, Outcome, PlanAction, PlanLine, PlanOptions,
     ProvenanceCheck, ReleaseSource, Releases, SystemHost, UPDATE_RECHECK_INTERVAL, UpgradeError,
-    UpgradePlan, agent_hooks, detect, discover, execute, plan,
+    UpgradePlan, agent_hooks, collector, detect, discover, execute, plan,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State, Webview};
@@ -666,9 +666,19 @@ pub(crate) async fn desktop_self_upgrade_run<R: tauri::Runtime>(
         handle
             .block_on(execute::execute(&host, &run_plan, &source, &staging_root))
             .map(|outcome| {
+                // Issue #2064: a release collector beside the CLI moves with it.
+                let mut after = handle
+                    .block_on(collector::after_upgrade(
+                        &host,
+                        &run_plan,
+                        &outcome,
+                        &source,
+                        &staging_root,
+                    ))
+                    .lines;
                 // R-3: a CLI the upgrade installed refreshes the agents' hooks.
-                let hooks = agent_hooks::after_upgrade(&host, &run_plan, &outcome);
-                (outcome, hooks)
+                after.extend(agent_hooks::after_upgrade(&host, &run_plan, &outcome));
+                (outcome, after)
             })
     })
     .await
@@ -2116,7 +2126,18 @@ mod tests {
             let script_path = dir.path().join(asset);
             std::fs::write(&script_path, &script).unwrap();
             let sha256 = dot_agent_deck::self_upgrade::verify::file_sha256(&script_path).unwrap();
-            let manifest = format!("{sha256}  {asset}\n").into_bytes();
+            // Issue #2064: the release's collector, on the platforms that
+            // ship one, answering `--version` as the collector at `LATEST`.
+            let collector_asset = Platform::current().and_then(Platform::collector_asset);
+            let collector = Self::collector_script(LATEST);
+            let mut manifest = format!("{sha256}  {asset}\n");
+            if let Some(name) = collector_asset {
+                manifest.push_str(&format!(
+                    "{}  {name}\n",
+                    dot_agent_deck::self_upgrade::verify::sha256_hex(&collector)
+                ));
+            }
+            let manifest = manifest.into_bytes();
 
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let base = format!("http://{}", listener.local_addr().unwrap());
@@ -2144,6 +2165,7 @@ mod tests {
                     let body = match path.strip_prefix(&format!("/download/v{LATEST}/")) {
                         Some("checksums.txt") => Some(&manifest),
                         Some(name) if name == asset => Some(&script),
+                        Some(name) if Some(name) == collector_asset => Some(&collector),
                         _ => None,
                     };
                     let (status, body) = match body {
@@ -2164,6 +2186,15 @@ mod tests {
                 stop,
                 server: Some(server),
             }
+        }
+
+        /// A collector that answers `--version` as the collector at
+        /// `version`, and fails on any other invocation.
+        fn collector_script(version: &str) -> Vec<u8> {
+            format!(
+                "#!/bin/sh\nif [ \"$*\" = \"--version\" ]; then\n  echo 'dot-agent-deck-collector {version}'\n  exit 0\nfi\nexit 64\n"
+            )
+            .into_bytes()
         }
 
         /// Every invocation of the release's CLI so far, one per line.
@@ -2323,6 +2354,84 @@ mod tests {
             .filter_map(|line| line["text"].as_str())
             .collect();
         assert!(texts.contains(&agent_hooks::NOT_INSTALLED), "{answer}");
+    }
+
+    /// Issue #2064, on the real entry point: Upgrade on a CLI in a writable
+    /// folder that also holds an old release collector, whose user service a
+    /// stand-in `systemctl` in the login `PATH` reports running it, replaces
+    /// the collector with the release's, restarts the service and says both,
+    /// ahead of the hooks' report.
+    #[cfg(unix)]
+    #[test]
+    fn self_upgrade_042_the_run_command_upgrades_a_collector_beside_the_cli() {
+        use std::os::unix::fs::PermissionsExt;
+        if Platform::current()
+            .and_then(Platform::collector_asset)
+            .is_none()
+        {
+            println!("SKIP: the collector ships for Linux only");
+            return;
+        }
+        let release = FakeRelease::start();
+        let bin = release.dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let target = bin.join("dot-agent-deck");
+        let beside = bin.join(collector::COLLECTOR_BINARY);
+        let executable = |path: &Path, bytes: &[u8]| {
+            std::fs::write(path, bytes).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        executable(&beside, &FakeRelease::collector_script(CURRENT));
+        let log = release.dir.path().join("systemctl.log");
+        let quoted = |path: &Path| format!("'{}'", path.to_str().unwrap().replace('\'', r"'\''"));
+        let show = format!(
+            "LoadState=loaded\\nActiveState=active\\nExecStart={{ path={} ; }}\\n",
+            beside.display()
+        );
+        executable(
+            &bin.join("systemctl"),
+            format!(
+                "#!/bin/sh\necho \"$*\" >> {}\ncase \"$*\" in\n  '--user show '*) printf '%b' {} ;;\n  '--user try-restart '*) exit 0 ;;\n  *) exit 1 ;;\nesac\n",
+                quoted(&log),
+                quoted(Path::new(&show)),
+            )
+            .as_bytes(),
+        );
+        let state = release.state(
+            &target,
+            PlanAction::ReplaceBinary {
+                target: target.clone(),
+                asset: Platform::current().unwrap().cli_asset().into(),
+            },
+        );
+
+        let answer = run_over_ipc(state);
+        assert_eq!(answer["ok"], true, "{answer}");
+        assert_eq!(
+            std::fs::read(&beside).unwrap(),
+            FakeRelease::collector_script(LATEST),
+            "{answer}"
+        );
+        let texts: Vec<&str> = answer["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|line| line["text"].as_str())
+            .collect();
+        let at = |needle: &str| {
+            texts
+                .iter()
+                .position(|text| text.contains(needle))
+                .unwrap_or_else(|| panic!("missing {needle:?}: {answer}"))
+        };
+        assert!(at("Upgraded the resource collector at") < at("Restarted the"));
+        assert!(at("Restarted the") < at(FakeRelease::REFRESHED));
+        let ran = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            ran.lines()
+                .any(|line| line == format!("--user try-restart {}", collector::COLLECTOR_SERVICE)),
+            "{ran}"
+        );
     }
 
     /// One CLI install method beside the app, on one platform: the machine,

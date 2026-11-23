@@ -884,6 +884,8 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     let telemetry = crate::telemetry::start_for_daemon(&event_tx, &pty_registry);
     // PRD #1666 S3: every inbox state change reaches attached clients.
     pty_registry.inbox().set_broadcast(event_tx.clone());
+    // Issue #1965: an orchestration role's exit reaches attached clients.
+    pty_registry.set_ended_role_broadcast(event_tx.clone());
     // PRD #2374: agent cards ring their doorbells on the same fan-out, and
     // offer "close, keeping the worktree" for agents with a dispatched one.
     pty_registry
@@ -1176,7 +1178,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // repository; the `git` probes that find each session's branch still run
     // for every live session with a working directory, once an interval and
     // sooner after a turn ends.
-    let pull_request_handle = {
+    let (pull_request_handle, reference_check_handle) = {
         let registry = pty_registry.clone();
         let monitor_state = state.clone();
         let monitor_event_tx = event_tx.clone();
@@ -1185,15 +1187,29 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
                 .ok()
                 .as_deref(),
         );
-        tokio::spawn(async move {
+        // Issue #2418: the job bound the daemon's background GitHub lookups
+        // share; a clone goes to each monitor that runs `git` or `gh` for one.
+        let github_jobs = crate::pull_request::new_job_bound();
+        // Issue #2418 (D4): the deck's own check of the pull requests and
+        // issues agents report on their cards, on the same bound and
+        // interval. It runs `git` for a folder and `gh` for a reference only
+        // while a card names one.
+        let references = tokio::spawn(crate::reference_check::run_reference_monitor(
+            registry.clone(),
+            interval,
+            github_jobs.clone(),
+        ));
+        let badge = tokio::spawn(async move {
             crate::pull_request::run_pull_request_monitor(
                 registry,
                 monitor_state,
                 monitor_event_tx,
                 interval,
+                github_jobs,
             )
             .await;
-        })
+        });
+        (badge, references)
     };
 
     let result = run_hook_loop(
@@ -1219,6 +1235,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     input_held_handle.abort();
     opencode_mode_handle.abort();
     pull_request_handle.abort();
+    reference_check_handle.abort();
     scheduler_handle.abort();
     inbox_ticker.abort();
     agent_cards_watcher.abort();

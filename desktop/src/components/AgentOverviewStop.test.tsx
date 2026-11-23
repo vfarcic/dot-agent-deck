@@ -61,7 +61,14 @@ describe("desktop/config-gen/002: generating configuration from an agent", () =>
   const sent = "Config request sent to the agent's inbox.";
   const upgrade = "This daemon is too old to generate a config. Upgrade the daemon to use Generate config.";
   const failed = "Failed to send config prompt: daemon refused the target";
-  const open = () => fireEvent.click(within(row(FIXTURE_REMOTE_DAEMON_ID, "41")).getByRole("button", { name: /Generate config/i }));
+  /* Issue #2454 removed the row's Generate config icon: the dashboard reaches
+     the same confirmation by voice (and the agent's pane keeps its button), so
+     these drive it through the overview's own voice member. */
+  const channel: { current: Record<string, unknown> | undefined } = { current: undefined };
+  const open = () => act(() => {
+    const voice = channel.current as { confirmGenerateConfig: (target: object) => string | undefined };
+    expect(voice.confirmGenerateConfig({ deckId: FIXTURE_REMOTE_DAEMON_ID, agentId: "41", from: "overview", incarnation: "listed-process-a" })).toBeUndefined();
+  });
   const generation = (outcome: GenerationResult["outcome"] = "sent", message = sent) => {
     const generateConfig = vi.fn(async (): Promise<GenerationResult> => outcome === "sent" ? { outcome, message, messageId: "m-config" } : { outcome, message });
     return { generateConfig, rt: { ...runtime(vi.fn()), generateConfig } };
@@ -71,7 +78,7 @@ describe("desktop/config-gen/002: generating configuration from an agent", () =>
   it("keeps the latest overview result when an older request fails late", async () => {
     const pending: Array<(result: GenerationResult) => void> = [];
     const generateConfig = vi.fn(() => new Promise<GenerationResult>((resolve) => { pending.push(resolve); }));
-    render(<AgentOverview runtime={{ ...runtime(vi.fn()), generateConfig }} onNavigate={vi.fn()} />);
+    render(<AgentOverview runtime={{ ...runtime(vi.fn()), generateConfig }} onNavigate={vi.fn()} voiceChannel={channel as never} />);
     open();
     fireEvent.click(within(confirmation()!).getByRole("button", { name: "Yes" }));
     fireEvent.click(within(confirmation()!).getByRole("button", { name: "No" }));
@@ -87,16 +94,15 @@ describe("desktop/config-gen/002: generating configuration from an agent", () =>
     expect(screen.getByText(sent)).toBeVisible();
   });
 
-  /** Scenario: Ask the remote planner to create or update a config, including an unknown file state. Its row and neutral Yes/No confirmation say Update only for an existing file, an unknown state asks to check for the file and create or update it without claiming either, and No sends nothing. */
+  /** Scenario: Ask the remote planner, by voice from the dashboard, to create or update a config, including an unknown file state. Its row has no Generate config icon (issue #2454); the neutral Yes/No confirmation says Update only for an existing file, an unknown state asks to check for the file and create or update it without claiming either, and No sends nothing. */
   it.each([undefined, false, true])("offers a neutral Yes/No confirmation and No sends nothing (existing config: %s)", (exists) => {
     const { rt, generateConfig } = generation();
     rt.fleet = rt.fleet.map((deck) => ({ ...deck, agents: deck.agents.map((agent) => ({ ...agent, projectConfigExists: exists })) }));
     const navigate = vi.fn();
-    render(<AgentOverview runtime={rt} onNavigate={navigate} />);
+    render(<AgentOverview runtime={rt} onNavigate={navigate} voiceChannel={channel as never} />);
     const verb = exists ? "Update" : "Generate";
-    const button = within(row(FIXTURE_REMOTE_DAEMON_ID, "41")).getByRole("button", { name: `${verb} config with planner agent` });
-    expect(button).toHaveAttribute("title", `${verb} config with planner`);
-    fireEvent.click(button);
+    expect(within(row(FIXTURE_REMOTE_DAEMON_ID, "41")).queryByRole("button", { name: /config with/i })).toBeNull();
+    open();
     const dialog = screen.getByRole("alertdialog", { name: `${verb} .dot-agent-deck.toml` });
     if (exists) {
       expect(dialog).toHaveTextContent(/instruct your agent to analyze the project and update the existing config/i);
@@ -122,10 +128,10 @@ describe("desktop/config-gen/002: generating configuration from an agent", () =>
   it("sends the captured agent binding, focuses its pane, and shows success", async () => {
     const { rt, generateConfig } = generation();
     const navigate = vi.fn();
-    const view = render(<AgentOverview runtime={rt} onNavigate={navigate} />);
+    const view = render(<AgentOverview runtime={rt} onNavigate={navigate} voiceChannel={channel as never} />);
     open();
     const successor = fleetWithOrchestration().map((deck) => ({ ...deck, agents: deck.agents.map((agent) => ({ ...agent, incarnation: "successor-process-b" })) }));
-    view.rerender(<AgentOverview runtime={{ ...rt, ...runtime(rt.runAction, successor), generateConfig }} onNavigate={navigate} />);
+    view.rerender(<AgentOverview runtime={{ ...rt, ...runtime(rt.runAction, successor), generateConfig }} onNavigate={navigate} voiceChannel={channel as never} />);
     await act(async () => fireEvent.click(within(screen.getByRole("alertdialog", { name: title })).getByRole("button", { name: "Yes" })));
     expect(generateConfig).toHaveBeenCalledExactlyOnceWith(FIXTURE_REMOTE_DAEMON_ID, "41", "pane-41", "listed-process-a");
     expect(navigate).toHaveBeenCalledWith(expect.objectContaining({ kind: "agent", deckId: FIXTURE_REMOTE_DAEMON_ID, agentId: "41", incarnation: "listed-process-a" }));
@@ -138,13 +144,13 @@ describe("desktop/config-gen/002: generating configuration from an agent", () =>
     let settle!: (result: GenerationResult) => void;
     const generateConfig = vi.fn(() => new Promise<GenerationResult>((resolve) => { settle = resolve; }));
     const navigate = vi.fn();
-    render(<AgentOverview runtime={{ ...runtime(vi.fn()), generateConfig }} onNavigate={navigate} />);
+    render(<AgentOverview runtime={{ ...runtime(vi.fn()), generateConfig }} onNavigate={navigate} voiceChannel={channel as never} />);
     open();
     fireEvent.click(within(confirmation()!).getByRole("button", { name: "Yes" }));
     expect(generateConfig).toHaveBeenCalledTimes(1);
     fireEvent.click(within(confirmation()!).getByRole("button", { name: "No" }));
     expect(confirmation()).toBeNull();
-    fireEvent.click(within(row(FIXTURE_REMOTE_DAEMON_ID, "42")).getByRole("button", { name: "Open builder agent" }));
+    fireEvent.click(row(FIXTURE_REMOTE_DAEMON_ID, "42"));
     expect(navigate).toHaveBeenLastCalledWith(expect.objectContaining({ kind: "agent", agentId: "42" }));
     navigate.mockClear();
 
@@ -158,7 +164,7 @@ describe("desktop/config-gen/002: generating configuration from an agent", () =>
   it.each([["unsupported", upgrade], ["failed", failed]] as const)("shows the shared %s outcome", async (outcome, message) => {
     const { rt, generateConfig } = generation(outcome, message);
     const navigate = vi.fn();
-    render(<AgentOverview runtime={rt} onNavigate={navigate} />);
+    render(<AgentOverview runtime={rt} onNavigate={navigate} voiceChannel={channel as never} />);
     open();
     await act(async () => fireEvent.click(within(screen.getByRole("alertdialog", { name: title })).getByRole("button", { name: "Yes" })));
     expect(generateConfig).toHaveBeenCalledTimes(1);
